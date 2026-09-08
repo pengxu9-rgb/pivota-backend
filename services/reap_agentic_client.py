@@ -45,6 +45,12 @@ checked against the request every time -- `variant_matches_request` -- and a sub
 refusal. Same family as `defaultVariant` being availability-ordered, and the reason nothing in
 this module reads a status code as an answer.
 
+SEARCH IS QUERY-SENSITIVE, AND THAT BITES BEFORE ANY MATCHER RUNS. For one product: the
+brand-led phrasing returns the merchant, the bare product name returns other merchants' listings
+and not ours, and the fully specific phrasing returns nothing. `resolve_our_row` therefore tries
+several phrasings, brand-led first, and records what it tried. On the strength of a single
+bare-name search I previously reported that flowerbeauty.com was not in Reap's index. It is.
+
 REAP'S IDS ARE SESSION HANDLES, NOT IDENTITY. Five searches for the same product on one day
 returned five different `prd_...` ids, each with its own `var_...` set. All stayed resolvable and
 quotable for hours, so they are durable enough to carry through a checkout -- but a stored
@@ -252,7 +258,8 @@ class ProductMatch:
 
 
 def match_product(
-    search_payload: Any, *, merchant_domain: str, product_name: str
+    search_payload: Any, *, merchant_domain: str, product_name: str,
+    also_accept_domains: Sequence[str] = (),
 ) -> ProductMatch:
     """Pick the one Reap product that is our row, or refuse.
 
@@ -275,10 +282,19 @@ def match_product(
     if not wanted:
         return ProductMatch(ok=False, reason="no_product_name_supplied")
 
+    # `also_accept_domains` is the hook a stored mapping plugs into, and it is deliberately a
+    # PARAMETER rather than a table in this file. Measured: 8 of 78 merchant names in Reap's
+    # index carry a subdomain (`us.refybeauty.com`, `shop.simon.com`, `jbbwell.myshopify.com`,
+    # ...), each of which fails against its apex spelling. Whether that bites depends on how our
+    # merchant table spells those hosts, which this module cannot see -- so the caller supplies
+    # the aliases it knows about, and the comparison itself stays exact. Loosening the comparison
+    # to make these pass would also admit `notcosrx.com` for `cosrx.com`.
+    accepted = [merchant_domain, *(also_accept_domains or ())]
     same_merchant = [
         p for p in products
         if isinstance(p, dict)
-        and merchant_domain_matches((p.get("merchant") or {}).get("name"), merchant_domain)
+        and any(merchant_domain_matches((p.get("merchant") or {}).get("name"), d)
+                for d in accepted)
     ]
     if not same_merchant:
         return ProductMatch(ok=False, reason="merchant_not_in_results")
@@ -362,6 +378,31 @@ def select_option_ids(detail_product: Any, wanted_labels: Sequence[str]) -> Opti
         axis = axis if isinstance(axis, dict) else {}
         axis_name = str(axis.get("name") or "").strip() or "?"
         values = axis.get("values") if isinstance(axis.get("values"), list) else []
+        if len(values) == 1 and isinstance(values[0], dict):
+            # A SINGLE-VALUE AXIS IS DETERMINED. There is nothing for a title to choose between,
+            # so requiring the title to match its label protects nothing and refuses real rows:
+            # measured on flowerbeauty.com's "Petal Pout Lip Color", where Reap indexes the
+            # per-shade page as its own product with one `Shade` axis carrying one value,
+            # `"Flamingo Flirt - Cream"` -- a label our title ("Flamingo Flirt") cannot match
+            # because it carries a finish suffix we do not store.
+            #
+            # Structural, like the option-less rule, and safe for the same reason: product
+            # identity is already pinned by (merchant, exact product name), and with one value
+            # there is no sibling to be substituted for. Note that `chosen` records REAP's label,
+            # not our title, so the substitution check downstream compares against what we
+            # actually asked for.
+            single = values[0]
+            option_id = str(single.get("optionId") or "").strip()
+            if not option_id:
+                return OptionMatch(ok=False, reason=f"value_has_no_option_id:{axis_name}")
+            option_ids.append(option_id)
+            chosen[axis_name] = str(single.get("label"))
+            availability = single.get("available")
+            chosen_available[axis_name] = availability if isinstance(availability, bool) else None
+            if availability is False:
+                unavailable.append(axis_name)
+            continue
+
         hit = None
         for value in values:
             value = value if isinstance(value, dict) else {}
@@ -440,6 +481,46 @@ def variant_title_tokens(title: Any) -> List[str]:
 
 
 # --- request bodies: every field name taken from the spec, none invented --------------------
+
+
+#: How many search phrasings `resolve_our_row` will try before giving up. Bounded because
+#: search takes up to ~9 s: three attempts is a ~27 s worst case before the quote's own 13-16 s,
+#: which is already at the edge of what a serving path can spend. Raise it in a batch job, not
+#: in a request path.
+MAX_SEARCH_ATTEMPTS = 3
+
+
+def search_queries(
+    *, product_name: str, brand: Optional[str] = None, category: Optional[str] = None
+) -> List[str]:
+    """The phrasings to try, best first.
+
+    REAP'S SEARCH IS QUERY-SENSITIVE, and this bites before any matcher runs. Measured on one
+    product: "Flower Beauty lip color" returns flowerbeauty.com; "Petal Pout Lip Color" -- the
+    bare product name, which is what this module used to send -- returns two hits, NEITHER from
+    flowerbeauty.com; "Flower Beauty Petal Pout" returns six, none; and the fully specific
+    "Petal Pout Lip Color Flamingo Flirt" returns zero. So a `merchant_not_in_results` refusal
+    is evidence about the QUERY at least as much as about the index: on the strength of the bare
+    name I previously concluded flowerbeauty.com was not indexed by Reap at all, and it is.
+
+    Brand-led first, because that is the phrasing that worked. Deduplicated, order preserved.
+    """
+    name = str(product_name or "").strip()
+    brand_text = str(brand or "").strip()
+    category_text = str(category or "").strip()
+    if not name and not brand_text:
+        raise ReapRequestError("a search needs at least a product name or a brand")
+    ordered = [
+        f"{brand_text} {name}".strip() if brand_text else "",
+        name,
+        f"{brand_text} {category_text}".strip() if brand_text and category_text else "",
+    ]
+    out: List[str] = []
+    for query in ordered:
+        query = query.strip()
+        if query and query not in out:
+            out.append(query)
+    return out
 
 
 def build_search_request(
@@ -741,6 +822,9 @@ class VariantResolution:
     single_variant_product: bool = False
     #: Set when the quote leg reported 503. See `ReapResponse.merchant_probably_not_completable`.
     merchant_probably_not_completable: bool = False
+    #: Every search phrasing attempted, in order. On a refusal this says whether the query was
+    #: ever the problem -- which, for this API, it often is.
+    queries_tried: List[str] = field(default_factory=list)
 
 
 async def resolve_our_row(
@@ -748,9 +832,13 @@ async def resolve_our_row(
     merchant_domain: str,
     product_name: str,
     variant_title: Optional[str] = None,
+    brand: Optional[str] = None,
+    category: Optional[str] = None,
     our_price: Optional[float] = None,
     currency: Optional[str] = None,
     country: Optional[str] = None,
+    also_accept_domains: Sequence[str] = (),
+    max_search_attempts: int = MAX_SEARCH_ATTEMPTS,
     timeout_seconds: Optional[float] = None,
 ) -> VariantResolution:
     """search -> details -> variant, for one of our catalog rows. Fails closed at every step.
@@ -763,26 +851,46 @@ async def resolve_our_row(
     between candidates -- a "closest price" rule would have chosen the $140.00 Fenty gift-tray
     bundle over the $140.00 Standard perfume, which is the exact trap this design avoids.
     """
-    found = await search_products(
-        query=product_name, merchant_name=None, country=country, currency=currency,
-        timeout_seconds=timeout_seconds,
-    )
-    if not found.ok:
-        return VariantResolution(ok=False, reason=found.error or "search_failed")
+    # Several phrasings, because Reap's search is query-sensitive and a bare product name is the
+    # phrasing measured to MISS. `merchant_not_in_results` on one query is not evidence the
+    # merchant is absent from the index -- I drew exactly that wrong conclusion about
+    # flowerbeauty.com from a single bare-name search.
+    queries = search_queries(product_name=product_name, brand=brand, category=category)
+    tried: List[str] = []
+    found: Optional[ReapResponse] = None
+    match: Optional[ProductMatch] = None
+    for query in queries[:max(1, int(max_search_attempts))]:
+        tried.append(query)
+        found = await search_products(
+            query=query, merchant_name=None, country=country, currency=currency,
+            timeout_seconds=timeout_seconds,
+        )
+        if not found.ok:
+            # A transport or status failure is not a phrasing problem; retrying phrasings would
+            # just spend the budget on the same error.
+            return VariantResolution(ok=False, reason=found.error or "search_failed",
+                                     queries_tried=tried,
+                                     merchant_probably_not_completable=found.merchant_probably_not_completable)
+        match = match_product(found.data, merchant_domain=merchant_domain,
+                              product_name=product_name,
+                              also_accept_domains=also_accept_domains)
+        if match.ok:
+            break
 
-    match = match_product(found.data, merchant_domain=merchant_domain, product_name=product_name)
-    if not match.ok:
+    if found is None or match is None or not match.ok:
         return VariantResolution(
-            ok=False, reason=f"search:{match.reason}",
-            warnings=found.warnings, candidates=match.candidates,
+            ok=False, reason=f"search:{match.reason if match else 'no_query_attempted'}",
+            queries_tried=tried,
+            warnings=found.warnings if found else [],
+            candidates=match.candidates if match else [],
         )
 
     detail = await product_details([match.product_id or ""], timeout_seconds=timeout_seconds)
     if not detail.ok:
-        return VariantResolution(ok=False, reason=detail.error or "details_failed", warnings=found.warnings)
+        return VariantResolution(ok=False, reason=detail.error or "details_failed", warnings=found.warnings, queries_tried=tried)
     product, err = details_for(detail.data, match.product_id or "")
     if product is None:
-        return VariantResolution(ok=False, reason=f"details:{err}", warnings=found.warnings)
+        return VariantResolution(ok=False, reason=f"details:{err}", warnings=found.warnings, queries_tried=tried)
 
     axes = product.get("options") if isinstance(product.get("options"), list) else []
     if not axes:
@@ -800,12 +908,12 @@ async def resolve_our_row(
         variant_id = str(default.get("id") or "").strip()
         if not variant_id.startswith(VARIANT_ID_PREFIX):
             return VariantResolution(ok=False, reason="single_variant_product_has_no_variant_id",
-                                     warnings=found.warnings)
+                                     warnings=found.warnings, queries_tried=tried)
         price = _price_of(default)
         return VariantResolution(
             ok=True, variant_id=variant_id, product_id=match.product_id, price=price,
             available=default.get("available"), single_variant_product=True,
-            resolved_at=time.time(),
+            resolved_at=time.time(), queries_tried=tried,
             price_disagrees=_disagrees(price, our_price), warnings=found.warnings,
         )
 
@@ -816,7 +924,7 @@ async def resolve_our_row(
         # the $95 Mini for the $140 Standard and returned ok=True.
         return VariantResolution(
             ok=False, reason=f"options:{options.reason}",
-            matched_options=options.chosen, warnings=found.warnings,
+            matched_options=options.chosen, warnings=found.warnings, queries_tried=tried,
         )
 
     if options.unavailable_axes:
@@ -832,7 +940,7 @@ async def resolve_our_row(
             ok=False,
             reason=f"options:value_unavailable_at_reap:{axis}:{options.chosen.get(axis)}",
             matched_options=options.chosen, chosen_available=options.chosen_available,
-            available=False, warnings=found.warnings,
+            available=False, warnings=found.warnings, queries_tried=tried,
         )
 
     resolved = await resolve_variant(
@@ -844,13 +952,13 @@ async def resolve_our_row(
         # fix), 400 AGENTIC_REQUEST_REJECTED is Reap declining to resolve (theirs). Both are
         # carried through in the status so the distinction survives to whoever reads it.
         return VariantResolution(ok=False, reason=resolved.error or "variant_failed",
-                                 warnings=found.warnings)
+                                 warnings=found.warnings, queries_tried=tried)
 
     variant = resolved.data
     variant_id = str(variant.get("id") or "").strip()
     if not variant_id.startswith(VARIANT_ID_PREFIX):
         return VariantResolution(ok=False, reason="resolved_id_not_in_reap_namespace",
-                                 warnings=found.warnings)
+                                 warnings=found.warnings, queries_tried=tried)
 
     # A 200 is not evidence Reap did what we asked. See `variant_matches_request`.
     mismatch = variant_matches_request(variant, options.chosen)
@@ -858,7 +966,7 @@ async def resolve_our_row(
         return VariantResolution(ok=False, reason=f"variant:{mismatch}",
                                  matched_options=options.chosen,
                                  chosen_available=options.chosen_available,
-                                 warnings=found.warnings)
+                                 warnings=found.warnings, queries_tried=tried)
 
     price = _price_of(variant)
     return VariantResolution(
@@ -866,7 +974,7 @@ async def resolve_our_row(
         available=variant.get("available"), price_disagrees=_disagrees(price, our_price),
         resolved_at=time.time(),
         matched_options=options.chosen, chosen_available=options.chosen_available,
-        warnings=found.warnings,
+        warnings=found.warnings, queries_tried=tried,
     )
 
 

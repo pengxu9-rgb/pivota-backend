@@ -203,8 +203,11 @@ def test_an_unmatched_axis_refuses_and_names_the_axis():
 
 def test_a_second_axis_that_the_title_does_not_name_refuses():
     product = json.loads(json.dumps(FENTY_DETAILS["products"][0]))
+    # TWO values, so the axis is genuinely undetermined. A single-value axis is determined by
+    # construction and is handled by its own rule below.
     product["options"].append({"name": "Color", "values": [
         {"optionId": "opt_rose", "label": "Rose", "available": True},
+        {"optionId": "opt_blue", "label": "Blue", "available": True},
     ]})
     got = rc.select_option_ids(product, rc.variant_title_tokens("Standard"))
     assert not got.ok and got.unmatched_axes == ["Color"]
@@ -216,6 +219,7 @@ def test_a_shopify_style_two_axis_title_resolves_both():
     product = json.loads(json.dumps(FENTY_DETAILS["products"][0]))
     product["options"].append({"name": "Color", "values": [
         {"optionId": "opt_rose", "label": "Rose", "available": True},
+        {"optionId": "opt_blue", "label": "Blue", "available": True},
     ]})
     got = rc.select_option_ids(product, rc.variant_title_tokens("Standard / Rose"))
     assert got.ok and got.option_ids == ["opt_standard", "opt_rose"]
@@ -901,3 +905,227 @@ def test_different_carts_never_share_a_key():
     a = {"items": [{"variantId": "var_x", "quantity": 1}], "email": "b@example.com"}
     b = {"items": [{"variantId": "var_x", "quantity": 2}], "email": "b@example.com"}
     assert rc.idempotency_key("quotes", a, now=1.0) != rc.idempotency_key("quotes", b, now=1.0)
+
+
+# --- a single-value axis is determined ----------------------------------------------------------
+#
+# Measured on flowerbeauty.com "Petal Pout Lip Color": Reap indexes the per-shade page as its own
+# product, with ONE `Shade` axis carrying ONE value, `"Flamingo Flirt - Cream"`. Our row's title
+# is "Flamingo Flirt" — no finish suffix — so exact label matching refuses a row that has exactly
+# one possible answer. Refusing there protects nothing.
+
+FLOWER_DETAILS = {
+    "products": [{
+        "id": "prd_petalpout", "merchant": {"name": "flowerbeauty.com"},
+        "name": "Petal Pout Lip Color", "media": [],
+        "options": [{"name": "Shade", "values": [
+            {"optionId": "opt_flamingo", "label": "Flamingo Flirt - Cream", "available": True},
+        ]}],
+        "defaultVariant": {"id": "var_flamingo", "name": "Flamingo Flirt - Cream",
+                           "options": [{"name": "Shade", "value": "Flamingo Flirt - Cream"}],
+                           "price": {"amount": 8.00, "currency": "USD"},
+                           "available": True, "media": []},
+    }],
+    "errors": [],
+}
+
+FLOWER_SEARCH = {
+    "id": "qry_3",
+    "products": [{"id": "prd_petalpout", "merchant": {"name": "flowerbeauty.com"},
+                  "name": "Petal Pout Lip Color",
+                  "priceRange": {"min": {"amount": 8.0, "currency": "USD"},
+                                 "max": {"amount": 8.0, "currency": "USD"}}}],
+    "pagination": {"nextCursor": None, "hasNextPage": False, "returnedCount": 1},
+    "warnings": [],
+}
+
+FLOWER_VARIANT = {
+    "id": "var_flamingo", "name": "Flamingo Flirt - Cream",
+    "options": [{"name": "Shade", "value": "Flamingo Flirt - Cream"}],
+    "price": {"amount": 8.00, "currency": "USD"}, "available": True, "media": [],
+}
+
+
+def test_an_axis_with_one_value_is_determined_even_when_the_label_differs():
+    got = rc.select_option_ids(FLOWER_DETAILS["products"][0],
+                               rc.variant_title_tokens("Flamingo Flirt"))
+    assert got.ok and got.option_ids == ["opt_flamingo"]
+    # `chosen` records REAP's label, not our title — which is what makes the substitution check
+    # downstream compare against the thing we actually asked Reap for.
+    assert got.chosen == {"Shade": "Flamingo Flirt - Cream"}
+
+
+def test_a_single_value_axis_needs_no_title_at_all():
+    got = rc.select_option_ids(FLOWER_DETAILS["products"][0], ["anything"])
+    assert got.ok and got.option_ids == ["opt_flamingo"]
+
+
+def test_a_single_value_axis_still_reports_unavailability():
+    """The rule determines WHICH value, not whether Reap will sell it."""
+    product = json.loads(json.dumps(FLOWER_DETAILS["products"][0]))
+    product["options"][0]["values"][0]["available"] = False
+    got = rc.select_option_ids(product, ["Flamingo Flirt"])
+    assert got.ok and got.unavailable_axes == ["Shade"]
+
+
+def test_the_flowerbeauty_row_resolves_end_to_end(monkeypatch):
+    fake = _chain(monkeypatch, search=FLOWER_SEARCH, details=FLOWER_DETAILS,
+                  variant=FLOWER_VARIANT)
+    got = _run(rc.resolve_our_row(
+        merchant_domain="flowerbeauty.com", product_name="Petal Pout Lip Color",
+        variant_title="Flamingo Flirt", our_price=8.00,
+    ))
+    assert got.ok and got.variant_id == "var_flamingo"
+    assert got.price == (8.0, "USD") and got.price_disagrees is False
+    assert fake.variant_body == {"productId": "prd_petalpout", "optionIds": ["opt_flamingo"]}
+
+
+def test_the_substitution_guard_compares_against_reaps_label_not_our_title(monkeypatch):
+    """Because we send Reap's optionId, the response echoes Reap's label. Comparing it against
+    OUR title would refuse every correctly-resolved single-value axis — the guard has to check
+    what we asked for, which is the label, not what our catalog happens to call it."""
+    substituted = json.loads(json.dumps(FLOWER_VARIANT))
+    substituted["options"] = [{"name": "Shade", "value": "Petal Pink - Matte"}]
+    _chain(monkeypatch, search=FLOWER_SEARCH, details=FLOWER_DETAILS, variant=substituted)
+    got = _run(rc.resolve_our_row(
+        merchant_domain="flowerbeauty.com", product_name="Petal Pout Lip Color",
+        variant_title="Flamingo Flirt",
+    ))
+    assert not got.ok
+    assert got.reason.startswith("variant:substituted_on_axis:Shade:asked=Flamingo Flirt - Cream")
+
+
+# --- search is query-sensitive, and that bites before any matcher runs ---------------------------
+#
+# Measured on one product: "Flower Beauty lip color" returns flowerbeauty.com; "Petal Pout Lip
+# Color" -- the bare product name this module used to send -- returns two hits, NEITHER from
+# flowerbeauty.com; "Flower Beauty Petal Pout" returns six, none; the fully specific "Petal Pout
+# Lip Color Flamingo Flirt" returns zero. On the strength of the bare name alone I previously
+# concluded flowerbeauty.com was not in Reap's index at all. It is.
+
+def test_the_brand_led_phrasing_is_tried_first():
+    assert rc.search_queries(product_name="Petal Pout Lip Color", brand="Flower Beauty")[0] \
+        == "Flower Beauty Petal Pout Lip Color"
+
+
+def test_the_bare_name_is_still_tried_as_a_fallback():
+    assert "Petal Pout Lip Color" in rc.search_queries(
+        product_name="Petal Pout Lip Color", brand="Flower Beauty")
+
+
+def test_a_brand_and_category_phrasing_is_the_last_resort():
+    queries = rc.search_queries(product_name="Petal Pout Lip Color", brand="Flower Beauty",
+                                category="lip color")
+    assert queries[-1] == "Flower Beauty lip color"
+
+
+def test_queries_are_deduplicated_without_reordering():
+    """With no brand there is only one phrasing, and trying it twice spends a ~9 s search slot
+    to learn nothing."""
+    assert rc.search_queries(product_name="Snail Mucin") == ["Snail Mucin"]
+
+
+def test_a_first_query_that_misses_the_merchant_is_retried_with_another(monkeypatch):
+    """The whole point. A `merchant_not_in_results` on one phrasing is evidence about the QUERY
+    at least as much as about the index."""
+    seen = []
+
+    async def fake(path, body, **kw):
+        if path.endswith("/search"):
+            seen.append(body["query"])
+            # The bare name misses the merchant; the brand-led one finds it.
+            if body["query"] == "Petal Pout Lip Color":
+                return rc.ReapResponse(ok=True, status=200, data={
+                    "products": [{"id": "prd_other", "merchant": {"name": "someothershop.com"},
+                                  "name": "Petal Pout Lip Color"}],
+                    "warnings": []})
+            return rc.ReapResponse(ok=True, status=200, data=FLOWER_SEARCH)
+        if path.endswith("/details"):
+            return rc.ReapResponse(ok=True, status=200, data=FLOWER_DETAILS)
+        return rc.ReapResponse(ok=True, status=200, data=FLOWER_VARIANT)
+    monkeypatch.setattr(rc, "_post", fake)
+
+    got = _run(rc.resolve_our_row(
+        merchant_domain="flowerbeauty.com", product_name="Petal Pout Lip Color",
+        brand="Flower Beauty", variant_title="Flamingo Flirt", our_price=8.00,
+    ))
+    assert got.ok and got.variant_id == "var_flamingo"
+    assert seen[0] == "Flower Beauty Petal Pout Lip Color"
+    assert got.queries_tried == ["Flower Beauty Petal Pout Lip Color"]
+
+
+def test_the_bare_name_alone_would_have_missed_this_row(monkeypatch):
+    """The regression this guards: without a brand there is one phrasing, and it is the one
+    measured to miss. The refusal must record what was tried so the reason is legible."""
+    async def fake(path, body, **kw):
+        return rc.ReapResponse(ok=True, status=200, data={
+            "products": [{"id": "prd_other", "merchant": {"name": "someothershop.com"},
+                          "name": "Petal Pout Lip Color"}], "warnings": []})
+    monkeypatch.setattr(rc, "_post", fake)
+    got = _run(rc.resolve_our_row(
+        merchant_domain="flowerbeauty.com", product_name="Petal Pout Lip Color",
+        variant_title="Flamingo Flirt"))
+    assert not got.ok and got.reason == "search:merchant_not_in_results"
+    assert got.queries_tried == ["Petal Pout Lip Color"]
+
+
+def test_the_search_budget_is_bounded(monkeypatch):
+    """Search takes up to ~9 s. Three attempts is already a ~27 s worst case before the quote's
+    own 13-16 s, so the loop must not simply try everything."""
+    calls = []
+
+    async def fake(path, body, **kw):
+        calls.append(body.get("query"))
+        return rc.ReapResponse(ok=True, status=200, data={"products": [], "warnings": []})
+    monkeypatch.setattr(rc, "_post", fake)
+    _run(rc.resolve_our_row(
+        merchant_domain="flowerbeauty.com", product_name="Petal Pout Lip Color",
+        brand="Flower Beauty", category="lip color", max_search_attempts=2))
+    assert len(calls) == 2
+
+
+def test_a_transport_failure_does_not_burn_the_phrasing_budget(monkeypatch):
+    """A 500 or a timeout is not a phrasing problem; retrying phrasings spends the budget on the
+    same error and delays the refusal by two more search timeouts."""
+    calls = []
+
+    async def fake(path, body, **kw):
+        calls.append(body.get("query"))
+        return rc.ReapResponse(ok=False, error="transport_error:ReadTimeout")
+    monkeypatch.setattr(rc, "_post", fake)
+    got = _run(rc.resolve_our_row(
+        merchant_domain="flowerbeauty.com", product_name="Petal Pout Lip Color",
+        brand="Flower Beauty", category="lip color"))
+    assert not got.ok and got.reason == "transport_error:ReadTimeout"
+    assert len(calls) == 1
+
+
+# --- the subdomain merchants: a mapping the CALLER supplies, not a looser comparison -------------
+#
+# 8 of 78 merchant names in Reap's index carry a subdomain (`us.refybeauty.com`,
+# `shop.simon.com`, `jbbwell.myshopify.com`, ...), each failing against its apex spelling.
+
+def test_an_alias_lets_a_subdomain_merchant_match(monkeypatch):
+    payload = {"products": [{"id": "prd_x", "merchant": {"name": "us.refybeauty.com"},
+                             "name": "Wet Brush"}], "warnings": []}
+    match = rc.match_product(payload, merchant_domain="refybeauty.com",
+                             product_name="Wet Brush",
+                             also_accept_domains=["us.refybeauty.com"])
+    assert match.ok and match.product_id == "prd_x"
+
+
+def test_without_the_alias_the_subdomain_merchant_still_refuses():
+    """The comparison itself stays exact. Loosening it to admit `us.refybeauty.com` for
+    `refybeauty.com` would also admit `notcosrx.com` for `cosrx.com`."""
+    payload = {"products": [{"id": "prd_x", "merchant": {"name": "us.refybeauty.com"},
+                             "name": "Wet Brush"}], "warnings": []}
+    match = rc.match_product(payload, merchant_domain="refybeauty.com", product_name="Wet Brush")
+    assert not match.ok and match.reason == "merchant_not_in_results"
+
+
+def test_an_alias_does_not_admit_a_confusable():
+    payload = {"products": [{"id": "prd_x", "merchant": {"name": "cosrx.com.evil.io"},
+                             "name": "Snail Mucin"}], "warnings": []}
+    match = rc.match_product(payload, merchant_domain="cosrx.com", product_name="Snail Mucin",
+                             also_accept_domains=["us.cosrx.com", "shop.cosrx.com"])
+    assert not match.ok

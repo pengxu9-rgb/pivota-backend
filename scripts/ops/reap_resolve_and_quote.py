@@ -51,6 +51,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 # so the mapping can be checked by eye. It is NOT sent: Reap's namespace is `var_...`, and
 # sending our id was the central defect of the client this replaces.
 MERCHANT_DOMAIN = "fentybeauty.com"
+BRAND = "Fenty Beauty"
 PRODUCT_NAME = "Fenty Eau de Parfum"
 VARIANT_TITLE = "Standard"
 OUR_PRICE = 140.00
@@ -95,7 +96,7 @@ def main() -> int:
         return 2
 
     resolved = asyncio.run(rc.resolve_our_row(
-        merchant_domain=MERCHANT_DOMAIN, product_name=PRODUCT_NAME,
+        merchant_domain=MERCHANT_DOMAIN, product_name=PRODUCT_NAME, brand=BRAND,
         variant_title=VARIANT_TITLE, our_price=OUR_PRICE, country="US", currency="USD",
     ))
 
@@ -110,6 +111,7 @@ def main() -> int:
     print(f"price disagrees : {resolved.price_disagrees}")
     print(f"asked-for avail : {resolved.chosen_available}   (the value WE ASKED FOR)")
     print(f"resolved at     : {resolved.resolved_at}")
+    print(f"queries tried   : {resolved.queries_tried}")
     if resolved.warnings:
         print(f"warnings        : {resolved.warnings}")
     if resolved.candidates:
@@ -119,9 +121,13 @@ def main() -> int:
         print("\n--- WHAT THIS TELLS US " + "-" * 48)
         step = (resolved.reason or "").split(":")[0]
         print({
-            "search": "Reap's index did not yield this merchant's product. Not a code bug --\n"
-                      "  either the merchant is not indexed, or their display name does not\n"
-                      "  contain our domain's stem and needs a stored mapping.",
+            "search": ("Reap's index did not yield this merchant's product under any phrasing\n"
+                       "  tried (listed above). Reap's search is QUERY-SENSITIVE: the bare\n"
+                       "  product name is measured to miss products the brand-led phrasing\n"
+                       "  finds. A refusal here is evidence about the QUERY at least as much as\n"
+                       "  about the index — do not conclude the merchant is unindexed from it.\n"
+                       "  If `merchant.name` carries a subdomain (8 of 78 do), pass it via\n"
+                       "  `also_accept_domains` rather than loosening the comparison."),
             "options": ("The product was found. Two different refusals live here:\n"
                         "  value_unavailable_at_reap — the variant EXISTS and our row is right;\n"
                         "    Reap will not sell that value today, and asking /variant for it\n"
