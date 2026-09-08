@@ -70,14 +70,44 @@ filter anywhere in this file, on purpose.
 
 ── THE ONE KNOWN DIVERGENCE FROM INGESTION, STATED RATHER THAN HIDDEN ──────────────────────────
 
-`ingestion.py` classifies with a fourth argument — `handle=v["source_handle"]` — which this script
-cannot pass from the columns it selects, because catalog_skus has no handle column; the handle
-survives only inside `sku_payload.source_handle`, and only on rows ingestion itself wrote (which are
-already stamped). Passing a handle can only move a row TOWARDS `product_derived`, never away, so
-omitting it is the less conservative call and must be measured rather than assumed. It is: the
-report carries `already_stamped_disagree_explained_by_handle`, computed by re-classifying every
-disagreeing row WITH its stored handle. If that number equals `already_stamped_disagree`, every
-disagreement is this divergence and nothing else.
+`ingestion.py` classifies with a fourth argument — `handle=v["source_handle"]` (ingestion.py:325).
+This script does not pass it. It COULD: catalog_skus has no handle column, but the handle survives
+in `sku_payload.source_handle`, which the page SELECT already reads.
+
+An earlier version of this note justified the omission by saying the handle exists only on rows
+ingestion wrote, "which are already stamped". THAT IS FALSE, and the dates say so: ingestion began
+writing `source_handle` on 2026-09-04 (`8c9c1f26e`) and `variant_id_provenance` on 2026-09-08
+(`d466bc6ee`). Every row ingested in those four days carries a handle and NO stamp — it is exactly
+this script's population. The divergence is real and reaches rows this run writes.
+
+The convention stands anyway, for a better reason: **the stamp must answer the question the way the
+money reader asks it.** `services/checkout_preflight.py:189` — the gate that decides whether an
+offer may be handed to a buyer — calls
+
+    variant_id_provenance(variant_id, product_id=..., product_key=...)
+
+with no handle. A cached answer that used a fourth input the reader does not have would be a
+DIFFERENT predicate wearing the same key, and the first time the two disagreed the stamp would be
+the wrong one. Reproducibility from the row's own columns is the property that makes the cache
+sound; that is what `classify()` refuses to give up.
+
+Passing a handle can only move a row TOWARDS `product_derived`, never away (the handle is just a
+third candidate parent in `_is_restatement_of`), so the omission is the LESS conservative call and
+is measured rather than assumed, on both halves of the table:
+
+  * on rows already stamped — `already_stamped_disagree_explained_by_handle`. If it equals
+    `already_stamped_disagree`, every disagreement is this divergence and nothing else.
+  * on the rows THIS RUN WRITES — `stamped_would_differ_with_handle`, and its subset
+    `stamped_would_differ_with_handle_from_merchant_issued`.
+
+**The second is a stop condition.** `merchant_issued` is the only verdict any money path acts on,
+so a row we stamp `merchant_issued` that the handle would call `product_derived` is the only kind
+of difference that could over-promise. If that counter is non-zero in the dry run, do not apply:
+either the handle belongs in the classification — in which case `checkout_preflight` is asking the
+question wrong too, and that is the bug to fix — or those rows need looking at individually.
+(There is deliberately no `..._to_merchant_issued` counter: the handle can only add a restatement
+parent, so no row can move INTO `merchant_issued` by gaining one. Such a counter could never leave
+zero, and a permanently-zero counter reads as evidence when it is not.)
 
     python3 scripts/backfill_variant_id_provenance_stamps.py                # dry run, counts only
     python3 scripts/backfill_variant_id_provenance_stamps.py --report       # identity table
@@ -85,6 +115,17 @@ disagreement is this divergence and nothing else.
         --expect-contract stamp-v1-sku-key-cursor
     python3 scripts/backfill_variant_id_provenance_stamps.py --apply \
         --expect-contract stamp-v1-sku-key-cursor
+
+STOP CONDITION, read off the dry run before applying: if
+`stamped_would_differ_with_handle_from_merchant_issued` is non-zero, DO NOT APPLY. Those are rows
+this script would stamp `merchant_issued` that `ingestion.py`'s four-argument call would call
+`product_derived`, and `merchant_issued` is the verdict the checkout preflight spends money on.
+See the handle section above for what to do about it.
+
+If a run dies mid-scan it still prints a fenced report — `mode: "failed"` — and still writes its
+audit row; both carry `resume_after`. Committed pages are durable, so resume from that cursor
+rather than re-running the table. A report carrying `resume_after_to_recover_rollbacks` means a
+page was LOST: resume from that key instead, because `resume_after` is already past it.
 
 Running it twice stamps nothing the second time: the UPDATE's own `IS NULL` predicate is the
 idempotency, not a flag we carry.
@@ -168,13 +209,39 @@ SELECT_PAGE_SQL = """
 #:
 #: `databases` returns no rowcount from `execute()` on asyncpg, so "did this land" is spelled
 #: RETURNING and read with `fetch_val`.
+#:
+#: ── `updated_at` IS DELIBERATELY NOT BUMPED ────────────────────────────────────────────────────
+#: The obvious `updated_at = NOW()` — every sibling backfill has one, including
+#: `scripts/backfill_variant_identity_skus.py:246` — is WRONG here, and it is wrong precisely
+#: BECAUSE readers depend on this column. It is not decoration this script may set freely; two
+#: live readers treat it as "when did this row's commercial content last change", and a stamp is
+#: metadata ABOUT the variant id string, not a change to the thing being sold:
+#:
+#:   1. `services/merchant_catalog_listing_fallback_service.py:55-67` emits
+#:      `GREATEST(o.updated_at, s.updated_at, p.updated_at)` as a listing's `updated_at`, which
+#:      `services/merchant_commerce_readiness_service.py:173-181` turns into a SEVEN-DAY
+#:      freshness clock and `:232` into the `catalog_freshness_stale` blocker. Touching ~22,000
+#:      rows would clear that blocker for every affected merchant and restart the clock at the
+#:      backfill date — a stale catalog reported fresh, which is the dangerous direction.
+#:      The same GREATEST is the ORDER BY of a `ROW_NUMBER() PARTITION BY s.sku_key` at :60-68,
+#:      so a uniform bump also collapses "newest offer represents this SKU" into "lowest
+#:      offer_id does".
+#:   2. `services/pivot_query_service.py:1541-1551` sorts recall candidates by
+#:      `sku_updated_at DESC` under BOTH a per-product cap (`RECALL_MAX_SKUS_PER_PRODUCT`, 12)
+#:      and a `LIMIT`. Under a truncation the sort key decides which SKUs are served at all, so
+#:      flattening it is not a reordering.
+#:
+#: Checked and NOT affected: the agent_pdp_view reconciler watermark
+#: (`jobs/agent_pdp_view_reconciler_cron.py:121-141`) joins only catalog_products/catalog_offers,
+#: the stale-row reaper (`services/catalog_sync_service.py:2319-2331`) selects by membership not
+#: timestamps, and `services/catalog_trust_policy.py:687-733` reads none of this.
+#: `tests/...::test_a_stamp_does_not_touch_updated_at` pins the omission.
 STAMP_SQL = """
     UPDATE catalog_skus
        SET sku_payload = COALESCE(sku_payload, '{}'::jsonb) || jsonb_build_object(
                'variant_id_provenance', CAST(:provenance AS text),
                'provenance_stamped_by', CAST(:source_system AS text)
-           ),
-           updated_at = NOW()
+           )
      WHERE sku_key = :sku_key
        AND (sku_payload->>'variant_id_provenance') IS NULL
        AND (sku_payload IS NULL OR jsonb_typeof(sku_payload) = 'object')
@@ -185,9 +252,12 @@ STAMP_SQL = """
 def classify(row: Dict[str, Any], *, with_handle: bool = False) -> str:
     """The repo's classifier, called — never re-implemented.
 
-    `with_handle` re-asks the question the way `ingestion.py` asks it, using the handle that
-    survives in `sku_payload.source_handle`. Used ONLY to explain a disagreement, never to decide
-    what to stamp: the stamp must be reproducible from the row's own columns.
+    `with_handle` re-asks the question the way `ingestion.py:325` asks it, using the handle that
+    survives in `sku_payload.source_handle`. Used ONLY to MEASURE the divergence — to explain a
+    disagreement on an already-stamped row, and to count it on rows this run is about to write.
+    Never to decide what to stamp: the stamp must be reproducible from the row's own columns, and
+    must match how `services/checkout_preflight.py:189` asks the question. See the module
+    docstring's section on this.
     """
     return variant_id_provenance(
         row.get("source_variant_id"),
@@ -209,6 +279,8 @@ def _new_counts() -> collections.Counter:
         "rows_scanned", "rows_already_stamped", "rows_unstamped",
         "already_stamped_agree", "already_stamped_disagree",
         "already_stamped_disagree_explained_by_handle",
+        "stamped_would_differ_with_handle",
+        "stamped_would_differ_with_handle_from_merchant_issued",
         "skipped_payload_not_object", "stamped",
         "raced_already_stamped", "row_errors",
         "page_rollbacks", "rows_lost_to_page_rollback", "stopped_at_limit",
@@ -335,10 +407,27 @@ async def run(
     state = {"cursor": after or "", "mode": mode or ("apply" if apply else "dry_run")}
     try:
         await _scan(counts, tally, audit, apply=apply, limit=limit, page=page, state=state)
-    except Exception:
+    except Exception as exc:
         # Seal the report, the resume cursor and the audit row before the exception leaves.
-        # Committed pages are already durable; losing the cursor is what makes recovery manual.
-        await _finish(counts, tally, audit, apply=apply, state=state)
+        # Committed pages are already durable; losing the cursor is what makes recovery manual —
+        # the operator's alternative is re-scanning 30,000 rows to find the ~500 that are left.
+        #
+        # The sealed report rides OUT ON THE EXCEPTION, because `raise` discards a return value
+        # and `main()` is the only thing that can print it. Sealing must not be able to replace
+        # the original failure: if the run died because the connection went away, the audit
+        # INSERT dies too, and a bare `await _finish(...)` here would raise that instead —
+        # substituting a write error for the real cause. So it is guarded, and the original
+        # exception propagates either way.
+        try:
+            report = await _finish(
+                counts, tally, audit, apply=apply, state=state, error=repr(exc)[:500]
+            )
+            setattr(exc, "stamp_report", report)
+        except Exception:  # noqa: BLE001 — never mask the cause with a failure to report it
+            logger.exception(
+                "could not seal the report after a mid-run failure; resume_after was %r",
+                state.get("cursor"),
+            )
         raise
     return await _finish(counts, tally, audit, apply=apply, state=state)
 
@@ -401,6 +490,17 @@ async def _scan(counts, tally, audit, *, apply, limit, page, state) -> None:
 
             counts["rows_unstamped"] += 1
             tally.unstamped_by_class[provenance] += 1
+            if row.get("source_handle"):
+                # The divergence from ingestion, measured on the population it can still affect:
+                # rows this run is about to STAMP that carry a handle. (The `already_stamped_*`
+                # counters above measure it on rows already stamped, which is the other half.)
+                with_handle = classify(row, with_handle=True)
+                if with_handle != provenance:
+                    counts["stamped_would_differ_with_handle"] += 1
+                    if provenance == "merchant_issued":
+                        # The stop condition. `merchant_issued` is the only verdict any money
+                        # path acts on, so this is the only difference that could over-promise.
+                        counts["stamped_would_differ_with_handle_from_merchant_issued"] += 1
             pending.append((row, provenance))
 
         if apply:
@@ -414,16 +514,44 @@ async def _scan(counts, tally, audit, *, apply, limit, page, state) -> None:
 
         state["cursor"] = last_key
         if stopped:
+            # `last_key` may still equal `page_start` here — --limit can stop on a page's FIRST
+            # row, having processed nothing. That is not a stalled cursor, it is a bounded run
+            # ending; the guard below must not fire on it, and we return anyway.
             return
+        # PROGRESS OR RAISE. Note 1 in the module docstring says paging with `>=` "loops forever";
+        # nothing made that loud. With `>=` the tail page returns the single row the cursor
+        # already names, `last_key` comes back equal to `page_start`, and this `while True` spins
+        # on one row until the job is killed — no error, no output, a report that never prints.
+        # With the correct `>` a processed row's key is strictly greater than the cursor by the
+        # SELECT's own predicate, so equality here is unreachable and this can only fire on a
+        # regression to the comparison, the ORDER BY, or the cursor column.
+        if last_key == page_start:
+            raise RuntimeError(
+                "keyset cursor did not advance past "
+                f"{page_start!r} after processing {len(rows)} row(s): the scan would loop "
+                "forever. Check that SELECT_PAGE_SQL still pages on `sku_key > :after` "
+                "ordered by sku_key."
+            )
 
 
-async def _finish(counts, tally, audit, *, apply: bool, state) -> Dict[str, Any]:
+async def _finish(
+    counts, tally, audit, *, apply: bool, state, error: Optional[str] = None
+) -> Dict[str, Any]:
     counts["applied"] = 1 if apply else 0
     report: Dict[str, Any] = dict(counts)
     # Which question this run answered. Without it `stamped` is ambiguous — it is rows WRITTEN
     # under --apply and rows that WOULD BE written otherwise, and `--report` produces a plan it
     # will never execute. `applied` alone does not separate --report from a plain dry run.
-    report["mode"] = state.get("mode") or ("apply" if apply else "dry_run")
+    #
+    # `failed` overrides the mode rather than sitting beside it: a report from a run that died
+    # mid-scan describes a PARTIAL table, and anything reading `mode: apply` would take its
+    # counts for a census of the whole one.
+    report["mode"] = "failed" if error else (
+        state.get("mode") or ("apply" if apply else "dry_run")
+    )
+    if error:
+        report["error"] = error
+        report["mode_attempted"] = state.get("mode") or ("apply" if apply else "dry_run")
     report["resume_after"] = state["cursor"]
     # Present ONLY when a page was lost, and then it is the resume point that recovers those
     # rows. `resume_after` is past them by construction, so a report carrying this key must not
@@ -442,6 +570,15 @@ async def _finish(counts, tally, audit, *, apply: bool, state) -> Dict[str, Any]
         audit.record_info({k: v for k, v in ints.items() if v > 0})
         audit.reasons["zero_counters"] = sorted(k for k, v in ints.items() if v == 0)
         audit.reasons["class_stamped_this_run"] = dict(tally.stamped_by_class)
+        # THE RESUME CURSOR BELONGS IN THE AUDIT ROW, not only in the printed report. On the
+        # failure path the report reaches stdout and stdout reaches Cloud Logging, which drops
+        # lines; the audit row is the copy that is still there tomorrow. Assigned rather than
+        # passed through `record_info`, which is numeric and drops <= 0 — a cursor is neither.
+        audit.reasons["resume_after"] = state["cursor"]
+        if state.get("first_rollback_after") is not None:
+            audit.reasons["resume_after_to_recover_rollbacks"] = state["first_rollback_after"]
+        if error:
+            audit.reasons["run_failed"] = error
         audit.record_applied(int(counts["stamped"]))
         await write_writer_audit_log(audit)
         report["batch_id"] = audit.batch_id
@@ -533,15 +670,38 @@ def main(argv: Optional[List[str]] = None) -> int:
         finally:
             await database.disconnect()
 
-    report = asyncio.run(_go())
+    def _emit(report: Dict[str, Any]) -> None:
+        # ONE LINE, fenced — see REPORT_BEGIN. Printed on every mode, including --report, so the
+        # human table and the machine-readable numbers can never drift apart.
+        print(
+            REPORT_BEGIN + json.dumps(report, sort_keys=True, default=str) + REPORT_END,
+            flush=True,
+        )
+
+    try:
+        report = asyncio.run(_go())
+    except Exception as exc:
+        # A FAILED RUN STILL PRINTS A REPORT. Without this the only output of a mid-run failure
+        # is a traceback in Cloud Logging, and the pages that DID commit are unrecoverable
+        # except by re-scanning the table: `resume_after` — the one number that makes recovery
+        # cheap — was computed, written to the audit row, and then never shown to the operator
+        # who has to type it. Exit code is non-zero, so the job is still a failed job.
+        report = getattr(exc, "stamp_report", None)
+        report = dict(report) if isinstance(report, dict) else {
+            # The seal itself failed (see run()); say so rather than printing a report shaped
+            # like a run that measured zero of everything.
+            "resume_after": None,
+            "sealed": False,
+        }
+        report["mode"] = "failed"
+        report.setdefault("error", repr(exc)[:500])
+        _emit(report)
+        logger.error("run failed: %s", repr(exc)[:500])
+        return 1
+
     if args.report:
         print(_render_identity_table(report), flush=True)
-    # ONE LINE, fenced — see REPORT_BEGIN. Printed on every mode, including --report, so the
-    # human table and the machine-readable numbers can never drift apart.
-    print(
-        REPORT_BEGIN + json.dumps(report, sort_keys=True, default=str) + REPORT_END,
-        flush=True,
-    )
+    _emit(report)
     return 0
 
 

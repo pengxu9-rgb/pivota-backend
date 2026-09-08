@@ -56,6 +56,9 @@ SCAN_FLOOR = "zzz:"
 SOURCE_SYSTEM = "variant_id_provenance_stamp_v1"
 WRITER_NAME = "backfill_variant_id_provenance_stamps"
 
+#: The CLI tests at the bottom of this file run the script as a real subprocess, from here.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 
 async def _ddl(database):
     """Build from the REAL models. Never drop; never hand-write DDL for a db.catalog table."""
@@ -335,19 +338,33 @@ async def test_running_it_twice_stamps_nothing_the_second_time(db):
     assert second["already_stamped_disagree"] == 0
 
 
-async def test_limit_bounds_the_rows_stamped_and_resume_after_continues_from_there(db):
+async def test_limit_bounds_the_rows_stamped_not_the_rows_scanned(db):
     """A pilot wants N WRITES, and `resume_after` must point at the last row it looked at — not
-    at the last row its final page returned, which would skip the remainder of that page."""
-    for i in range(9):
+    at the last row its final page returned, which would skip the remainder of that page.
+
+    THE TWO ROWS THAT ARE ALREADY STAMPED ARE THE POINT. With every seeded row unstamped,
+    `rows_scanned` and `stamped` are the same number, and a mutant bounding the SCAN instead of
+    the WRITES produces identical output — it survived. Stamped rows are scanned and not
+    written, so the two counts separate (5 scanned, 3 stamped) and only the correct predicate
+    reports both.
+    """
+    for i in range(2):        # sort first: already carry a stamp, must be scanned past
+        await _sku(db, vid=f"{MERCHANT_VID}{i}",
+                   payload={"variant_id_provenance": "merchant_issued"})
+    for i in range(2, 9):     # seven unstamped rows, of which the pilot may write only three
         await _sku(db, vid=f"{MERCHANT_VID}{i}")
 
     pilot = await _run(limit=3, page=5, **_scoped())
     assert pilot["stamped"] == 3
     assert pilot["stopped_at_limit"] == 1
-    assert pilot["rows_scanned"] == 3
+    assert pilot["rows_scanned"] == 5, (
+        "--limit must bound the rows STAMPED; scanning stopped at 3 rows, which is the "
+        "scan-bounded reading of --limit"
+    )
+    assert pilot["rows_already_stamped"] == 2
 
     rest = await _run(after=pilot["resume_after"], page=5)
-    assert rest["stamped"] == 6
+    assert rest["stamped"] == 4
     assert await db.fetch_val(
         "SELECT count(*) FROM catalog_skus WHERE product_key = :pk"
         "   AND sku_payload->>'variant_id_provenance' IS NOT NULL",
@@ -601,3 +618,400 @@ async def test_one_bad_row_rolls_back_to_its_savepoint_and_its_page_still_commit
             assert payload is None
         else:
             assert payload["variant_id_provenance"] == "merchant_issued"
+
+
+# ---------------------------------------------------------------------------
+# the resume cursor, and what a mid-run failure leaves behind
+# ---------------------------------------------------------------------------
+
+
+async def test_the_audit_row_and_the_resume_cursor_survive_an_error_mid_run(db):
+    """An exception used to lose the report, the resume cursor AND the audit row.
+
+    `run()` sealed the report into a return value it then discarded with `raise`, `main()`
+    never reached its print, and `audit.reasons` never carried `resume_after` — so the pages
+    that HAD committed were recoverable only by re-scanning 30,000 rows to find the ~500 left.
+    Modelled on `tests/test_backfill_variant_identity_skus_postgres.py`'s F3.
+
+    The failure lands on the THIRD page, so there are committed pages behind it and unscanned
+    rows ahead of it: the only shape where the cursor is worth anything.
+    """
+    import scripts.backfill_variant_id_provenance_stamps as stamps
+
+    keys = [await _sku(db, vid=f"{MERCHANT_VID}{i}") for i in range(9)]
+    real_fetch_all = stamps.database.fetch_all
+    pages = {"n": 0}
+
+    async def _dies_on_the_third_page(query, values=None):
+        pages["n"] += 1
+        if pages["n"] == 3:
+            raise RuntimeError("simulated mid-run failure")
+        return await real_fetch_all(query, values)
+
+    stamps.database.fetch_all = _dies_on_the_third_page
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            await _run(page=3, **_scoped())
+    finally:
+        stamps.database.fetch_all = real_fetch_all
+
+    assert pages["n"] == 3
+
+    # 1. The rows two committed pages wrote are durable — the failure did not undo them.
+    for key in keys[:6]:
+        assert (await _payload(db, key))["variant_id_provenance"] == "merchant_issued", key
+    for key in keys[6:]:
+        assert await _payload(db, key) is None, key
+
+    # 2. The report rode out ON THE EXCEPTION, because `raise` discards a return value.
+    report = getattr(caught.value, "stamp_report", None)
+    assert isinstance(report, dict), "the sealed report did not reach the caller"
+    assert report["mode"] == "failed"
+    assert report["mode_attempted"] == "apply"
+    assert "simulated mid-run failure" in report["error"]
+    assert report["stamped"] == 6, "only durably committed rows may be reported as stamped"
+    assert report["resume_after"] == keys[5]
+
+    # 3. And the audit row carries the cursor too. stdout goes to Cloud Logging, which drops
+    #    lines; this is the copy that is still there tomorrow.
+    row = dict(await db.fetch_one(
+        "SELECT * FROM writer_audit_log WHERE writer_name = :w ORDER BY id DESC LIMIT 1",
+        {"w": WRITER_NAME},
+    ))
+    assert row["applied_rows"] == 6
+    reasons = json.loads(row["reasons"]) if isinstance(row["reasons"], str) else row["reasons"]
+    assert reasons["resume_after"] == keys[5]
+    assert "simulated mid-run failure" in reasons["run_failed"]
+
+    # 4. Resuming from it finishes the job, touching nothing already done.
+    rest = await _run(after=report["resume_after"], page=10)
+    assert rest["stamped"] == 3
+    assert rest["rows_already_stamped"] == 0
+
+
+async def test_a_failure_to_seal_the_report_does_not_replace_the_original_exception(db):
+    """The seal runs INSIDE the failure path, so it can fail too — and if the run died because
+    the connection went away, the audit INSERT dies the same way. Reporting the write error
+    instead of the cause would point the operator at the wrong thing entirely."""
+    import scripts.backfill_variant_id_provenance_stamps as stamps
+
+    await _sku(db, vid=MERCHANT_VID)
+    real_fetch_all = stamps.database.fetch_all
+    real_write = stamps.write_writer_audit_log
+
+    async def _boom(query, values=None):
+        raise RuntimeError("the original cause")
+
+    async def _seal_also_fails(audit):
+        raise RuntimeError("the audit insert failed too")
+
+    stamps.database.fetch_all = _boom
+    stamps.write_writer_audit_log = _seal_also_fails
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            await _run(**_scoped())
+    finally:
+        stamps.database.fetch_all = real_fetch_all
+        stamps.write_writer_audit_log = real_write
+
+    assert "the original cause" in str(caught.value)
+    assert "audit insert" not in str(caught.value)
+
+
+async def test_a_keyset_cursor_that_stops_advancing_raises_instead_of_spinning_forever(db):
+    """Note 1 of the module docstring says paging with `>=` "loops forever". Nothing made that
+    loud, and a silent infinite loop is the worst failure this script has: no error, no output,
+    a report that never prints, and a Cloud Run job burning until someone kills it.
+
+    This does not describe the mutant — it EXECUTES it, swapping the real `>` for `>=`. The
+    fetch counter is what makes a regression FAIL rather than hang the gate: without the guard
+    the `while True` would call `fetch_all` forever, and the bound turns that into a red test.
+    """
+    import scripts.backfill_variant_id_provenance_stamps as stamps
+
+    for i in range(9):
+        await _sku(db, vid=f"{MERCHANT_VID}{i}")
+
+    real_sql = stamps.SELECT_PAGE_SQL
+    real_fetch_all = stamps.database.fetch_all
+    calls = {"n": 0}
+
+    async def _bounded(query, values=None):
+        calls["n"] += 1
+        if calls["n"] > 40:
+            raise AssertionError(
+                "the scan is spinning: the keyset progress guard did not fire and this run "
+                "would never terminate"
+            )
+        return await real_fetch_all(query, values)
+
+    stamps.SELECT_PAGE_SQL = real_sql.replace("sku_key > :after", "sku_key >= :after")
+    stamps.database.fetch_all = _bounded
+    try:
+        with pytest.raises(RuntimeError, match="did not advance"):
+            await _run(page=4, **_scoped())
+    finally:
+        stamps.SELECT_PAGE_SQL = real_sql
+        stamps.database.fetch_all = real_fetch_all
+
+    assert calls["n"] <= 40
+
+
+# ---------------------------------------------------------------------------
+# the handle divergence, measured on the rows this run writes
+# ---------------------------------------------------------------------------
+
+
+async def test_a_handle_only_in_the_payload_is_measured_on_unstamped_rows_never_stamped(db):
+    """The divergence from `ingestion.py` reaches rows THIS SCRIPT WRITES, not only rows that
+    are already stamped.
+
+    The docstring used to justify omitting the handle by saying it only appears on rows
+    ingestion wrote, "which are already stamped". False: ingestion began writing
+    `source_handle` on 2026-09-04 (8c9c1f26e) and `variant_id_provenance` on 2026-09-08
+    (d466bc6ee), so four days of rows carry a handle and no stamp — exactly this population.
+
+    What is stamped stays the no-handle answer, because that is the question the money reader
+    `services/checkout_preflight.py:189` asks. The difference is COUNTED instead.
+    """
+    # numeric id + numeric handle it restates by a 3-digit ordinal: merchant_issued without
+    # the handle, product_derived with it. The `parent + a small ordinal` case
+    # `services/variant_identity._is_restatement_of` documents.
+    money = await _sku(
+        db, vid="43062643884185",
+        payload={"source_handle": "43062643884"},
+        sku_key=PK + "::v:handle-money",
+    )
+    # unverifiable without the handle, product_derived with it. Differs, but not FROM
+    # merchant_issued — so it must move only the broader counter.
+    quiet = await _sku(
+        db, vid="ruby-woo-2",
+        payload={"source_handle": "ruby-woo"},
+        sku_key=PK + "::v:handle-quiet",
+    )
+    # carries a handle that changes nothing: must not be counted at all. A DIFFERENT numeric id
+    # from `money`'s — `idx_catalog_skus_source_identity_v2` is unique on
+    # (merchant_id, platform, product_key, source_variant_id), so two rows cannot share one.
+    same = await _sku(
+        db, vid="43062643884186",
+        payload={"source_handle": "ruby-woo"},
+        sku_key=PK + "::v:handle-same",
+    )
+
+    report = await _run(**_scoped())
+
+    assert report["stamped"] == 3
+    assert report["stamped_would_differ_with_handle"] == 2, "both diverging rows must count"
+    assert report["stamped_would_differ_with_handle_from_merchant_issued"] == 1, (
+        "only the row we stamp merchant_issued is the stop condition; the unverifiable one "
+        "cannot over-promise at a checkout"
+    )
+
+    # The stamp itself is the no-handle answer on every one of them.
+    assert (await _payload(db, money))["variant_id_provenance"] == "merchant_issued"
+    assert (await _payload(db, quiet))["variant_id_provenance"] == "unverifiable"
+    assert (await _payload(db, same))["variant_id_provenance"] == "merchant_issued"
+    # and the handle each row carried is still there.
+    assert (await _payload(db, money))["source_handle"] == "43062643884"
+
+
+async def test_the_disagreement_sample_is_capped_while_its_count_stays_exact(db):
+    """The report must survive Cloud Logging, which truncates a long line — so the sample is
+    bounded and the COUNT is not. Nothing pinned the bound: every other test seeds one
+    disagreement, so a mutant removing the cap check carried all of them and stayed green.
+    """
+    import scripts.backfill_variant_id_provenance_stamps as stamps
+
+    over = stamps.DISAGREEMENT_SAMPLE_CAP + 7
+    for i in range(over):
+        await _sku(
+            # `product_key` + a small ordinal: product_derived, and a DISTINCT id per row —
+            # `idx_catalog_skus_source_identity_v2` is unique on
+            # (merchant_id, platform, product_key, source_variant_id).
+            db, vid=f"{DERIVED_RESTATED_VID}-{i}",                   # classifier: product_derived
+            payload={"variant_id_provenance": "merchant_issued"},   # stored: disagrees
+            sku_key=f"{PK}::v:disagree-{i:03d}",
+        )
+
+    report = await _run(**_scoped())
+
+    assert report["already_stamped_disagree"] == over, "the count is exact regardless of the cap"
+    assert len(report["disagreement_sample"]) == stamps.DISAGREEMENT_SAMPLE_CAP
+    assert report["stamped"] == 0
+
+
+async def test_a_stamp_does_not_touch_updated_at(db):
+    """`updated_at = NOW()` here would be a FALSE freshness signal on ~22,000 rows.
+
+    `services/merchant_catalog_listing_fallback_service.py:55-67` takes
+    `GREATEST(o.updated_at, s.updated_at, p.updated_at)`, and
+    `services/merchant_commerce_readiness_service.py:173-181,232` turns it into a seven-day
+    clock behind the `catalog_freshness_stale` blocker — a stale catalog would be reported
+    fresh. `services/pivot_query_service.py:1541-1551` sorts recall candidates by
+    `sku_updated_at DESC` under a per-product cap AND a LIMIT, where the sort key decides which
+    SKUs are served at all. A provenance stamp is metadata about the id string; it is not a
+    change to the thing being sold, and must not claim to be one.
+
+    Every sibling backfill bumps this column, so the omission looks like a mistake and would be
+    "fixed" by the next reader. This is why it is not.
+    """
+    key = await _sku(db, vid=MERCHANT_VID)
+    before = await db.fetch_val(
+        "SELECT updated_at FROM catalog_skus WHERE sku_key = :k", {"k": key}
+    )
+
+    report = await _run(**_scoped())
+    assert report["stamped"] == 1
+    assert (await _payload(db, key))["variant_id_provenance"] == "merchant_issued"
+
+    after = await db.fetch_val(
+        "SELECT updated_at FROM catalog_skus WHERE sku_key = :k", {"k": key}
+    )
+    assert after == before, (
+        "the stamp moved catalog_skus.updated_at; that clears the catalog_freshness_stale "
+        "blocker and flattens the recall tie-break"
+    )
+
+
+# ---------------------------------------------------------------------------
+# main() itself — nothing above this line executes the CLI
+# ---------------------------------------------------------------------------
+
+
+def _cli(*args, expect_code=0):
+    """Drive the script AS THE OPERATOR DOES: a real process, real stdout, real exit code.
+
+    In-process is not an option for the run path — `main()` calls `asyncio.run()`, which
+    refuses to nest inside the loop these async tests already run in. And the fenced-line
+    assertion is only worth anything if it reads what `main()` ACTUALLY PRINTED: a test that
+    rebuilds the line from a report dict tests the test, and passes against a `main` that
+    pretty-prints (`tests/test_backfill_variant_identity_skus.py` records that exact escape).
+    """
+    import subprocess
+    import sys
+
+    proc = subprocess.run(
+        [sys.executable, "-B", "scripts/backfill_variant_id_provenance_stamps.py", *args],
+        cwd=_REPO_ROOT, capture_output=True, text=True, timeout=300,
+        env={**os.environ},
+    )
+    assert proc.returncode == expect_code, (
+        f"exit {proc.returncode} (wanted {expect_code}) for {args}\n"
+        f"--- stdout ---\n{proc.stdout[-2000:]}\n--- stderr ---\n{proc.stderr[-3000:]}"
+    )
+    return proc.stdout
+
+
+def _one_fenced_report(out):
+    """Exactly one fenced line, parsed from stdout — the whole contract at once.
+
+    A `json.dumps(..., indent=2)` mutant fails HERE and only here: the report spans many lines,
+    the line carrying REPORT_BEGIN is a bare `STAMPREPORT>>>{`, and it neither ends with the
+    closing fence nor parses. Nothing else in this file can see that.
+    """
+    import scripts.backfill_variant_id_provenance_stamps as stamps
+
+    fenced = [ln for ln in out.splitlines() if stamps.REPORT_BEGIN in ln]
+    assert len(fenced) == 1, f"{len(fenced)} fenced lines in stdout, wanted 1: {out[-2000:]!r}"
+    line = fenced[0]
+    assert line.startswith(stamps.REPORT_BEGIN), f"the fence does not open the line: {line!r}"
+    assert line.endswith(stamps.REPORT_END), (
+        "the report does not close on the line it opened on — a multi-line report arrives "
+        f"from Cloud Logging with arbitrary keys silently missing: {line!r}"
+    )
+    return json.loads(line[len(stamps.REPORT_BEGIN):-len(stamps.REPORT_END)])
+
+
+def test_the_cli_refuses_an_apply_that_cannot_prove_which_build_answered_it():
+    """`run_oneoff_job.sh` runs `backend:latest` and nothing about the typed command says which
+    build answered it. These three refusals are argparse-level, so they happen before any
+    connection — which is why this one test needs no database."""
+    import scripts.backfill_variant_id_provenance_stamps as stamps
+
+    for argv in (
+        ["--apply"],                                              # no token at all
+        ["--apply", "--expect-contract", "stamp-v0-something"],   # a token from another build
+        ["--apply", "--expect-contract", ""],                     # empty is not "unset"
+    ):
+        with pytest.raises(SystemExit) as caught:
+            stamps.main(argv)
+        assert caught.value.code == 2, argv
+
+    # --report is read-only by definition; silently honouring --apply beside it would write
+    # under a flag whose help says it does not.
+    with pytest.raises(SystemExit) as caught:
+        stamps.main(["--report", "--apply", "--expect-contract", stamps.CONTRACT])
+    assert caught.value.code == 2
+
+    # and the token that IS the contract is accepted by the parser (it gets as far as the run).
+    assert stamps.CONTRACT == "stamp-v1-sku-key-cursor"
+
+
+async def test_main_prints_one_fenced_report_per_mode_and_report_ignores_limit(db):
+    """Every mode, driven through `main()`, asserting on what the process actually printed."""
+    await _sku(db, vid=MERCHANT_VID)
+    await _sku(db, vid=UNVERIFIABLE_VID)
+
+    dry = _one_fenced_report(_cli("--after", SCAN_FLOOR))
+    assert dry["mode"] == "dry_run"
+    assert dry["applied"] == 0
+    assert dry["stamped"] == 2
+    assert await db.fetch_val(
+        "SELECT count(*) FROM catalog_skus WHERE product_key = :pk AND sku_payload IS NOT NULL",
+        {"pk": PK},
+    ) == 0, "a dry run through main() wrote something"
+
+    # --report is read-only AND ignores --limit: it exists to census the whole table, so a
+    # --limit that quietly bounded it would report a partial census as a complete one.
+    out = _cli("--report", "--after", SCAN_FLOOR, "--limit", "1")
+    rep = _one_fenced_report(out)
+    assert rep["mode"] == "report"
+    assert rep["applied"] == 0
+    assert rep["stamped"] == 2, "--report honoured --limit"
+    assert rep["stopped_at_limit"] == 0
+    # the human table prints beside the machine line, never instead of it
+    assert "variant id provenance x platform" in out
+
+    live = _one_fenced_report(
+        _cli("--apply", "--expect-contract", "stamp-v1-sku-key-cursor", "--after", SCAN_FLOOR)
+    )
+    assert live["mode"] == "apply"
+    assert live["applied"] == 1
+    assert live["stamped"] == 2
+    assert await db.fetch_val(
+        "SELECT count(*) FROM catalog_skus WHERE product_key = :pk"
+        "   AND sku_payload->>'variant_id_provenance' IS NOT NULL",
+        {"pk": PK},
+    ) == 2
+
+    # --limit DOES bound a real run, so the flag is not inert — only --report ignores it.
+    await _clear(db)
+    for i in range(4):
+        await _sku(db, vid=f"{MERCHANT_VID}{i}")
+    pilot = _one_fenced_report(_cli("--after", SCAN_FLOOR, "--limit", "2"))
+    assert pilot["stamped"] == 2
+    assert pilot["stopped_at_limit"] == 1
+
+
+async def test_main_still_prints_a_fenced_report_when_the_run_dies(db):
+    """A failed run's `resume_after` is the number that makes recovery cheap, and printing it
+    is the only way the operator who must type it ever sees it. Before this, a mid-run failure
+    produced a traceback and nothing else.
+
+    Driven by pointing the script at a DATABASE_URL that cannot resolve, so the failure is real
+    rather than injected — main() must still fence a report and still exit non-zero.
+    """
+    import subprocess
+    import sys
+
+    proc = subprocess.run(
+        [sys.executable, "-B", "scripts/backfill_variant_id_provenance_stamps.py",
+         "--after", SCAN_FLOOR],
+        cwd=_REPO_ROOT, capture_output=True, text=True, timeout=300,
+        env={**os.environ,
+             "DATABASE_URL": "postgresql://pgtest@127.0.0.1:1/no_such_database_at_all"},
+    )
+    assert proc.returncode != 0, "a failed run must still be a failed job"
+    report = _one_fenced_report(proc.stdout)
+    assert report["mode"] == "failed"
+    assert report["error"]
