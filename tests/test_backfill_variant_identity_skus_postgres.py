@@ -131,13 +131,41 @@ def _variant(**kw):
     return v
 
 
+_SHARED_TABLES = (
+    "catalog_offers", "catalog_skus", "catalog_products",
+    "external_product_seeds", "writer_audit_log",
+)
+
+
+async def _drop_all(database):
+    for t in _SHARED_TABLES:
+        await database.execute(f"DROP TABLE IF EXISTS {t} CASCADE")
+
+
 @pytest.fixture
 async def db():
+    """LEAVE THE SHARED DATABASE AS WE FOUND IT.
+
+    The dialect gate runs every tests/test_*_postgres.py against ONE Postgres, so a fixture
+    that creates cut-down tables and leaves them behind hands the next file a stunted schema.
+    This one did exactly that and broke `test_connection_layer_postgres.py`, whose INSERT
+    needs catalog_products.catalog_track — a column this fixture has no reason to declare.
+    Three review passes missed it because they ran this file alone; only the gate runs it
+    alongside the others.
+
+    Dropping on the way out is the precedent (test_external_seed_destination_liveness_postgres
+    does the same), and it is the right shape: the next file creates what it needs rather than
+    inheriting whatever the last one happened to declare.
+    """
     from db.database import database
     await database.connect()
+    await _drop_all(database)
     await _ddl(database)
-    yield database
-    await database.disconnect()
+    try:
+        yield database
+    finally:
+        await _drop_all(database)
+        await database.disconnect()
 
 
 async def _run(**kw):
