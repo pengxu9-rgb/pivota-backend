@@ -8,6 +8,8 @@ reached main. Each one is written so it fails if the fix is reverted.
 import collections
 import inspect
 import json
+import re
+import sys
 
 import pytest
 
@@ -313,18 +315,54 @@ def test_the_report_is_printed_as_exactly_one_fenced_line():
     assert backfill.REPORT_BEGIN and backfill.REPORT_END
 
 
-def test_a_report_round_trips_through_the_sentinels(capsys):
-    """The positive counterpart: prove a caller can actually recover the report, rather than
-    only that the string 'indent' is absent."""
-    import json as _json
-    import re as _re
+class _FakeDB:
+    """main() connects and disconnects; nothing here touches a database."""
 
-    report = {"skus": 78, "offers": 78, "resume_after": "ext:zzz::abcd1234", "applied": 1}
-    print(backfill.REPORT_BEGIN + _json.dumps(report, sort_keys=True) + backfill.REPORT_END)
+    async def connect(self):
+        pass
+
+    async def disconnect(self):
+        pass
+
+
+def test_main_prints_exactly_one_fenced_line(monkeypatch, capsys):
+    """Drive main() ITSELF.
+
+    A first version of this test built its own line and asserted the sentinels delimited it —
+    which tests the test. A mutant printing REPORT_BEGIN + "\n" + json + "\n" + REPORT_END has
+    no `indent=`, has both sentinels, and passed 31/31 while reproducing the 2026-09-08 failure
+    exactly: the report arriving with lines dropped and `offers` silently absent.
+    """
+    async def _fake_run(**kw):
+        return {"skus": 78, "offers": 78, "resume_after": "ext:z::a", "applied": 1}
+
+    monkeypatch.setattr(backfill, "database", _FakeDB())
+    monkeypatch.setattr(backfill, "run", _fake_run)
+    monkeypatch.setattr(sys, "argv", ["backfill"])
+
+    assert backfill.main() == 0
     out = capsys.readouterr().out
-    assert out.count("\n") == 1, "the report spans more than one line"
-    m = _re.search(
-        _re.escape(backfill.REPORT_BEGIN) + r"(\{.*\})" + _re.escape(backfill.REPORT_END), out
+    assert out.count("\n") == 1, f"report spans {out.count(chr(10))} lines: {out!r}"
+    m = re.search(
+        re.escape(backfill.REPORT_BEGIN) + r"(\{.*\})" + re.escape(backfill.REPORT_END), out
     )
-    assert m, "the sentinels do not delimit the report"
-    assert _json.loads(m.group(1)) == report
+    assert m, f"the sentinels do not delimit the report: {out!r}"
+    assert json.loads(m.group(1))["offers"] == 78
+
+
+def test_the_two_fences_are_distinct_and_the_documented_strip_is_anchored():
+    """Pin the VALUES, not just their presence. With both fences equal to one token the
+    documented `sed 's/TOKEN//g'` strips every occurrence, so a report whose data contains the
+    token comes back corrupted; and a mutant renaming them to "RPT" leaves every documented
+    extraction command returning nothing while the shape assertions stay green."""
+    assert backfill.REPORT_BEGIN == "BFREPORT>>>"
+    assert backfill.REPORT_END == "<<<BFREPORT"
+    assert backfill.REPORT_BEGIN != backfill.REPORT_END
+
+    payload = {"resume_after": "ext::BFREPORT::x", "offers": 3}
+    line = backfill.REPORT_BEGIN + json.dumps(payload, sort_keys=True) + backfill.REPORT_END
+    recovered = re.sub(
+        re.escape(backfill.REPORT_END) + r"$", "",
+        re.sub(r"^" + re.escape(backfill.REPORT_BEGIN), "", line),
+    )
+    assert json.loads(recovered) == payload

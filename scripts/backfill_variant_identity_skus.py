@@ -123,9 +123,17 @@ WRITER_NAME = "backfill_variant_identity_skus"
 CONTRACT = "backfill-v2-identity-index"
 
 #: Sentinels around the one-line report, so a caller can extract it from a log that has had
-#: other lines dropped:  ... | grep -o 'BFREPORT{.*}BFREPORT' | sed 's/BFREPORT//g'
-REPORT_BEGIN = "BFREPORT"
-REPORT_END = "BFREPORT"
+#: other lines dropped:
+#:
+#:     ... | grep -o 'BFREPORT>>>{.*}<<<BFREPORT' \
+#:         | sed 's/^BFREPORT>>>//; s/<<<BFREPORT$//' | python3 -m json.tool
+#:
+#: DISTINCT, and the strip is ANCHORED. A first version used the same token for both fences and
+#: documented `sed 's/BFREPORT//g'`, which strips every occurrence anywhere in the line — so a
+#: report whose data contained the token (a product_key, a batch id) came back silently
+#: corrupted, and an unanchored global strip is the kind of thing nobody re-reads once it works.
+REPORT_BEGIN = "BFREPORT>>>"
+REPORT_END = "<<<BFREPORT"
 
 
 def _is_unique_violation(exc: Exception) -> bool:

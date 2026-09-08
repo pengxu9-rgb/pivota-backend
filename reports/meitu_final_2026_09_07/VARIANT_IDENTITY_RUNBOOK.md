@@ -351,32 +351,79 @@ grep -c 'name:' reports/meitu_final_2026_09_07/gateway_env_after.yaml
 
 ---
 
-## 4. The wider backfill (already shipped in #2113)
+## 4. The wider backfill (#2113 wrote it; #2118 made it safe to run)
 
-`scripts/backfill_variant_identity_skus.py` exists and does exactly what is needed: it writes the
-**SKU + offer pair** in ingestion's shape (`derive_variant_sku_key` / `derive_offer_id`), refuses
-ids it cannot place as merchant-issued, refuses to let a variant inherit the product's price, and
-stamps `source_system` + `variant_id_provenance` on every row.
+`scripts/backfill_variant_identity_skus.py` writes the **SKU + offer pair** in ingestion's shape
+(`derive_variant_sku_key` / `derive_offer_id`), refuses ids it cannot place as merchant-issued,
+refuses to let a variant inherit the product's price, and stamps `source_system` +
+`variant_id_provenance` on every row.
 
 It exists because `services/catalog_variant_promoter` writes SKUs and **no** offers: measured
 2026-09-07, 5,271 promoter-built `<pk>::v::<id>` SKUs on the external track carry **0** offers,
-while 1,583 of 1,583 ingestion-built `<pk>::v:<id>` SKUs carry one. The price gate and recall both
-read `catalog_offers`, so a promoter SKU is inert.
+while 1,583 of 1,583 ingestion-built `<pk>::v:<id>` SKUs carry one. Recall joins offers on
+`sku_key`, so a promoter SKU is inert. (The *price* gate is product-grain `EXISTS` and does not
+flip — an earlier version of this section said it did.)
 
-Dry run (safe, default):
+**As shipped in #2113 it would have crashed on 30% of its own plan.** Three adversarial review
+rounds found: `ON CONFLICT (sku_key)` missing the second unique index, an `ORDER BY` used as a
+suppression filter (which would have resurrected withdrawn offers), an unscoped seed join, an
+`offer_id` that moved between runs, and a unique-violation handler matching on exception *text*
+that also swallowed "no unique constraint matching the ON CONFLICT specification". All fixed in
+#2118 (`aa5802e6c`). Do not run a build older than that.
+
+### Invoking it
+
+`run_oneoff_job.sh` takes a **Python program via `-c`**, not a script path. `--apply` also
+requires the contract token, so a stale image fails on the argument instead of silently running
+the pre-#2118 copy. And the report must be **extracted**: Cloud Logging drops lines, so read the
+fenced single line rather than the surrounding log.
+
+Dry run (safe, writes nothing):
 
 ```bash
-TASK_TIMEOUT=1800s scripts/ops/run_oneoff_job.sh scripts/backfill_variant_identity_skus.py
+bash scripts/ops/run_oneoff_job.sh -c "import runpy,sys; sys.argv=['bf']; runpy.run_path('scripts/backfill_variant_identity_skus.py', run_name='__main__')" \
+  | grep -o 'BFREPORT>>>{.*}<<<BFREPORT' \
+  | sed 's/^BFREPORT>>>//; s/<<<BFREPORT$//' | python3 -m json.tool
 ```
 
-Apply — WRITES TO PROD:
+Apply — **WRITES TO PROD**. Start bounded:
 
 ```bash
-TASK_TIMEOUT=1800s scripts/ops/run_oneoff_job.sh scripts/backfill_variant_identity_skus.py --apply
+bash scripts/ops/run_oneoff_job.sh -c "import runpy,sys; sys.argv=['bf','--apply','--limit','50','--expect-contract','backfill-v2-identity-index']; runpy.run_path('scripts/backfill_variant_identity_skus.py', run_name='__main__')" \
+  | grep -o 'BFREPORT>>>{.*}<<<BFREPORT' \
+  | sed 's/^BFREPORT>>>//; s/<<<BFREPORT$//' | python3 -m json.tool
 ```
 
-Take the dry-run counts first and compare them against the apply counts; the script reads back
-after write. Consider `--limit 200` for a first, bounded apply.
+Resume from a previous run's `resume_after` with `--after <key>`.
+
+### Reading the result
+
+**Read `offers`, not `skus`, and verify in SQL.** A run whose pairs all rolled back would still
+report products planned. Every written row carries
+`source_system = 'variant_identity_backfill_v1'`, so the batch is countable and reversible:
+
+```sql
+SELECT count(*) offers, count(DISTINCT product_key) products
+FROM catalog_offers WHERE source_system = 'variant_identity_backfill_v1';
+-- and: no offer may hang off a sku_key that does not exist
+SELECT count(*) FROM catalog_offers o WHERE o.source_system = 'variant_identity_backfill_v1'
+  AND NOT EXISTS (SELECT 1 FROM catalog_skus s WHERE s.sku_key = o.sku_key);
+```
+
+A `writer_audit_log` row with `writer_name = 'backfill_variant_identity_skus'` is written on
+every applied run, including one that ends in an exception.
+
+### Progress, 2026-09-08
+
+| run | pairs | products | adoptions |
+|---|---|---|---|
+| pilot `--limit 50` | 78 | 50 | 0 |
+| adoption window `--limit 50` | 153 | 50 | 148 |
+| **remaining** | **~5,813** | **3,165** | — |
+
+Observed write rate ~10 ms/pair (per-pair transactions, so a 120-variant product is 120 short
+transactions, not one long one — `DB_STATEMENT_TIMEOUT_SECONDS=30` is not the binding limit).
+39 of the remaining products carry more than 12 planned variants; the widest is 120.
 
 **This does nothing for Flower Beauty** (no seed variants — see 2.0). It is for the ~4,467
 external-referral products that do carry crawled ids.
