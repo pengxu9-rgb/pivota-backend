@@ -631,7 +631,12 @@ def _collect_reconcile_catalog_offers() -> List[Tuple[str, str]]:
         (f"{origin}.{name}", getattr(module, name)) for name in (
             "ORPHAN_SELECT_SQL", "DUPLICATE_SELECT_SQL",
             "DUPLICATE_GROUP_COUNT_SQL", "CASCADE_SELECT_SQL",
-            "SUPPRESS_OFFERS_SQL", "REVERT_BATCH_SQL", "REVERT_PREVIEW_SQL",
+            "SUPPRESS_OFFERS_SQL",
+            # The revert: its per-row decision (a CASE over two anti-joins and
+            # an EXISTS on the shelf tuple, with two array binds), the UPDATE
+            # that moves what the decision cleared, and the audit-row read that
+            # sizes `healed_since_batch`.
+            "REVERT_CANDIDATES_SQL", "REVERT_BATCH_SQL", "BATCH_AUDIT_SQL",
         )
     ]
 
@@ -818,7 +823,7 @@ _MIN_STATEMENTS = {
     "scripts/report_inci_ingestion_quality.py": 6,
     "scripts/reattribute_orphaned_enrichment.py": 8,
     "scripts/capture_us_market_offers.py": 5,
-    "scripts/reconcile_catalog_offers.py": 7,
+    "scripts/reconcile_catalog_offers.py": 8,
     "scripts/dispose_sentinel_orphans.py": 8,
     "scripts/report_quality_scale_population.py": 5,
     "scripts/repair_a9_4_orphaned_quality_snapshots.py": 3,

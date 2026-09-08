@@ -47,13 +47,20 @@ So an unresolvable `sku_key` is an INPUT ERROR and exits non-zero with the key
 named, counted as `offers_refused_no_sku`. Build the canonical chain first (the
 external-seed mirror, or the enrichment apply), then attach.
 
-The orphan check reuses `fetch_existing_catalog_sku_keys` from
-`services/catalog_offer_writer_guard` — the same read the shared
-`guard_catalog_offer_rows` chokepoint makes. It deliberately does NOT call the
-full guard: that also rejects a null price as `zero_or_missing_price`, which
-would silently retire the destination-only offer this tool documents above.
-Whether a destination-only offer should still be allowed is a separate policy
-question and not one an orphan fix gets to decide by accident.
+The orphan check reuses `fetch_live_catalog_sku_keys` from
+`services/catalog_offer_writer_guard` — the read `guard_catalog_offer_rows`
+makes under `live_only=True`, and the same question `capture_us_market_offers`
+asks. LIVE, not merely existing: a `::canonical` row that exists but is
+suppressed is an identity somebody withdrew, and a live retailer offer hung on
+it is supply no sku-joined read lane can surface — the same state as an orphan,
+reached through a row that happens to exist. The first cut asked the existence
+question, so a suppressed canonical SKU let the offer through.
+
+It deliberately does NOT call the full guard: that also rejects a null price as
+`zero_or_missing_price`, which would silently retire the destination-only offer
+this tool documents above. Whether a destination-only offer should still be
+allowed is a separate policy question and not one an orphan fix gets to decide
+by accident.
 
 Usage:
   python3 scripts/attach_retailer_offer.py \
@@ -83,7 +90,7 @@ from services.agent_pdp_view_assembler import (  # noqa: E402
 from services.catalog_offer_writer_guard import (  # noqa: E402
     ORPHAN_NO_SKU,
     WriterAuditAccumulator,
-    fetch_existing_catalog_sku_keys,
+    fetch_live_catalog_sku_keys,
     make_batch_id,
     write_writer_audit_log,
 )
@@ -196,23 +203,25 @@ async def _resolve_content_key(product_key: str) -> Optional[str]:
 
 
 class OrphanOfferRefused(Exception):
-    """The offer names a sku_key with no catalog_skus row behind it."""
+    """The offer names a sku_key with no LIVE catalog_skus row behind it —
+    either no row at all, or one that is suppressed."""
 
     def __init__(self, sku_key: str):
         self.sku_key = sku_key
         super().__init__(
-            f"{ORPHAN_NO_SKU}: no catalog_skus row for sku_key={sku_key!r}. "
-            "This offer would be invisible to every sku-joined read lane. "
-            "Materialize the product's canonical SKU chain first "
-            "(the external-seed mirror, or the enrichment apply), then re-run."
+            f"{ORPHAN_NO_SKU}: no live catalog_skus row for sku_key={sku_key!r} "
+            "(missing, or suppressed). This offer would be invisible to every "
+            "sku-joined read lane. Materialize the product's canonical SKU chain "
+            "first (the external-seed mirror, or the enrichment apply), then re-run."
         )
 
 
 async def sku_exists(sku_key: str, *, db: Any = None) -> bool:
-    """Does the offer's sku_key name a real row? The same read the shared
-    `guard_catalog_offer_rows` chokepoint makes — see the module docstring for
-    why the full guard is not used here."""
-    found = await fetch_existing_catalog_sku_keys([sku_key], db=db)
+    """Does the offer's sku_key name a LIVE row? The read the shared
+    `guard_catalog_offer_rows` chokepoint makes under `live_only=True` — see the
+    module docstring for why the full guard is not used here, and for why the
+    question is "live" rather than "exists"."""
+    found = await fetch_live_catalog_sku_keys([sku_key], db=db)
     return sku_key in found
 
 
@@ -280,9 +289,11 @@ async def _drive(args: argparse.Namespace) -> int:
     exit_code = 0
     await database.connect()
     try:
-        # THE DRY RUN MAKES THE SAME CHECK. A plan that reported "would attach"
-        # for an offer --apply then refuses is the failure mode this whole change
-        # is about: a writer whose report and whose writes disagree.
+        # THE DRY RUN MAKES THE SAME CHECK, and it is deliberately NOT gated on
+        # `args.apply`. A plan that reported "would attach" for an offer --apply
+        # then refuses is the failure mode this whole change is about: a writer
+        # whose report and whose writes disagree. Pinned by a test that drives a
+        # dry run and expects exit 2.
         if not await sku_exists(row["sku_key"]):
             report["offers_refused_no_sku"] = 1
             report["refusal"] = ORPHAN_NO_SKU

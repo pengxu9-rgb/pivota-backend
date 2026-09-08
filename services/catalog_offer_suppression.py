@@ -40,13 +40,21 @@ would un-gate whatever the reconciler had decided about them, silently, because
 the two lanes' labels are identical by design. The stamp is what tells them
 apart. Pinned by a test.
 
-ROWS THIS MODULE SUPPRESSED BEFORE THE STAMP EXISTED carry no `cascade_lane` and
-are therefore no longer revertible through here. That is the fail-closed
-direction and it is deliberate: an un-stamped `product_suppressed` row cannot be
-distinguished from a reconciler row, and resurrecting somebody else's decision is
-worse than leaving a tombstone standing. `reconcile_catalog_offers
+A `product_suppressed` ROW WITHOUT THE STAMP is not revertible through here.
+That is the fail-closed direction and it is deliberate: an un-stamped row cannot
+be distinguished from a reconciler row, and resurrecting somebody else's
+decision is worse than leaving a tombstone standing. `reconcile_catalog_offers
 --revert-batch` reverts the reconciler's; a row from neither lane needs a
 deliberate operator UPDATE.
+
+THAT POPULATION IS EMPTY TODAY, and this is not a migration concern. The module
+and the stamp shipped in the same change (#2143), so no row was ever cascaded
+by this module without it; and the 2026-09-08 prod inventory that sized this
+work carried NO `catalog_offers.suppression_reason` of `product_suppressed` or
+`orphan_no_sku` at all — neither had ever been written as an offer's reason
+before that change (`orphan_no_sku` existed only as the guard's refusal
+vocabulary). The paragraph above describes what the revert would do to such a
+row, not rows that exist.
 """
 
 from __future__ import annotations

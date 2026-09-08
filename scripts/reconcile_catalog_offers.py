@@ -58,6 +58,16 @@ Usage
   python3 scripts/reconcile_catalog_offers.py --apply --limit 500
   python3 scripts/reconcile_catalog_offers.py --apply --pass duplicates
   python3 scripts/reconcile_catalog_offers.py --apply --revert-batch <batch_id>
+  python3 scripts/reconcile_catalog_offers.py --apply --revert-batch <batch_id> --pass cascade
+
+A REVERT PUTS BACK ONLY WHAT WOULD NOT RE-CREATE ONE OF THE THREE STATES. The
+first cut restored every row of the batch unconditionally, and measured on the
+gate fixture that put all three invariants straight back to 1: a cascaded offer
+came back live under a product that was STILL suppressed, a duplicate's loser
+rejoined a shelf whose keeper was still live, and an orphan came back on a key
+that still had no SKU. `--revert-batch` now decides per row (see
+REVERT_CANDIDATES_SQL) and reports what it skipped and why; `--pass` scopes it
+to one reason's rows.
 """
 
 from __future__ import annotations
@@ -100,6 +110,16 @@ REASON_DUPLICATE = "duplicate_offer"
 REASON_PRODUCT_SUPPRESSED = PRODUCT_SUPPRESSED_REASON
 
 PASSES = ("orphans", "duplicates", "cascade")
+
+#: Which reason each pass writes — and therefore which rows `--revert-batch
+#: --pass <name>` is scoped to. One table, read by both directions, so the label
+#: a pass sets and the label its revert looks for cannot drift apart.
+PASS_REASONS = {
+    "orphans": REASON_ORPHAN,
+    "duplicates": REASON_DUPLICATE,
+    "cascade": REASON_PRODUCT_SUPPRESSED,
+}
+ALL_REASONS = tuple(PASS_REASONS[name] for name in PASSES)
 
 #: The report is ONE LINE and fenced. `scripts/ops/run_oneoff_job.sh` retrieves a
 #: job's output from Cloud Logging, which DROPS LINES — a pretty-printed report
@@ -235,8 +255,89 @@ SUPPRESS_OFFERS_SQL = """
     RETURNING offer_id
 """
 
-#: Revert OUR batch only, and only rows still carrying the reason we set. An
-#: offer another lane re-tombstoned after us keeps its gate.
+#: THE REVERT'S DECISION, one row per offer still carrying this batch's stamp,
+#: with a `blocker` naming why the row must NOT be restored — or NULL when it
+#: may be. Both the dry run and `--apply` read THIS statement and nothing else
+#: decides; the UPDATE below moves exactly the ids this SELECT cleared, so the
+#: plan and the run cannot disagree about a row.
+#:
+#: THE THREE STANDING CHECKS ARE THE RECONCILER'S OWN PREDICATES, INVERTED.
+#: Measured before they existed: reverting a batch restored a cascaded offer
+#: under a product that was STILL suppressed (`suppressed_product_with_live_offer`
+#: 0 -> 1 against threshold 0), put a duplicate's loser back beside its still-live
+#: keeper (`duplicate_offers_per_sku_channel_market` 0 -> 1) and put an orphan
+#: back on a key that still had no SKU (`offers_without_sku` 0 -> 1). A revert
+#: exists to undo a sweep that was WRONG, and a row whose defect still stands
+#: was not swept wrongly — restoring it re-creates the state the next nightly
+#: run would gate again. So:
+#:
+#:   sku_still_missing         the offer's sku_key has no catalog_skus row
+#:                             (orphan_no_sku's cause still holds)
+#:   product_still_suppressed  catalog_products.suppressed_at is still set
+#:                             (product_suppressed's cause still holds)
+#:   live_rival_on_shelf       another LIVE offer holds the same
+#:                             (sku_key, channel, market) shelf. This SUBSUMES
+#:                             "the keeper is still live": the keeper sits on
+#:                             this shelf, and so does any row a writer put
+#:                             there since, which a keeper-only check would
+#:                             miss and then rebuild the group against.
+#:
+#: The checks are applied to EVERY reason, not each to "its" reason: an orphan
+#: whose SKU has since appeared is still not restorable under a product that is
+#: suppressed, and two cascaded rows on one shelf are still a duplicate group.
+#:
+#: Two more blockers are about scope, not defects: `reason_out_of_scope` (the
+#: row carries one of this script's three labels but `--pass` did not select it)
+#: and `retombstoned_by_another_lane` (the row still carries our stamp — the
+#: other lane's UPDATE merges metadata with `||` — but its reason is no longer
+#: ours; their decision stands). `already_live` should not occur: both things
+#: that lift a tombstone strip the stamp with it.
+#:
+#: ORDER BY is the duplicate pass's keeper election (newest updated_at, then
+#: lowest offer_id), per shelf, because the caller restores AT MOST ONE ROW PER
+#: SHELF: two restorable rows on one shelf would be a duplicate group the moment
+#: both came back, and the CASE cannot see its own siblings. The caller walks
+#: the rows in this order and marks the later ones `sibling_restored_first`.
+#: NOTE WHAT `updated_at` IS BY NOW: the sweep's own UPDATE stamped it, so rows
+#: one pass gated in one statement carry the SAME timestamp and the offer_id
+#: tie-break is what actually decides between them (measured: two cascaded rows
+#: on one shelf, o:dead_a Jan / o:dead_b Sep before the sweep, restore
+#: o:dead_a). The original freshness is gone; determinism is what is kept.
+#:
+#: LEFT JOIN on catalog_products: an offer with no product row has nothing to be
+#: suppressed by and passes that check; whether such a row should exist at all
+#: is not this script's question.
+REVERT_CANDIDATES_SQL = """
+    SELECT co.offer_id, co.suppression_reason, co.sku_key, co.channel, co.market,
+           CASE
+             WHEN co.suppressed_at IS NULL THEN 'already_live'
+             WHEN NOT (co.suppression_reason = ANY(:all_reasons))
+                  THEN 'retombstoned_by_another_lane'
+             WHEN NOT (co.suppression_reason = ANY(:reasons))
+                  THEN 'reason_out_of_scope'
+             WHEN NOT EXISTS (
+                    SELECT 1 FROM catalog_skus s WHERE s.sku_key = co.sku_key
+                  ) THEN 'sku_still_missing'
+             WHEN cp.suppressed_at IS NOT NULL THEN 'product_still_suppressed'
+             WHEN EXISTS (
+                    SELECT 1 FROM catalog_offers k
+                     WHERE k.sku_key = co.sku_key
+                       AND k.channel = co.channel
+                       AND k.market = co.market
+                       AND k.offer_id <> co.offer_id
+                       AND k.suppressed_at IS NULL
+                  ) THEN 'live_rival_on_shelf'
+             ELSE NULL
+           END AS blocker
+      FROM catalog_offers co
+      LEFT JOIN catalog_products cp ON cp.product_key = co.product_key
+     WHERE co.suppression_metadata->>'reconcile_batch_id' = CAST(:batch_id AS text)
+     ORDER BY co.sku_key, co.channel, co.market, co.updated_at DESC, co.offer_id ASC
+"""
+
+#: Restore the ids REVERT_CANDIDATES_SQL cleared — and only while they still
+#: carry our stamp and are still gated, so a row another lane touched between
+#: the SELECT and this UPDATE is left alone. The stamp goes with the tombstone.
 REVERT_BATCH_SQL = """
     UPDATE catalog_offers
        SET suppressed_at = NULL,
@@ -245,27 +346,31 @@ REVERT_BATCH_SQL = """
                                                        - 'reconcile_pass'
                                                        - 'reconcile_keeper_offer_id',
            updated_at = NOW()
-     WHERE suppression_metadata->>'reconcile_batch_id' = CAST(:batch_id AS text)
+     WHERE offer_id = ANY(:offer_ids)
+       AND suppression_metadata->>'reconcile_batch_id' = CAST(:batch_id AS text)
        AND suppressed_at IS NOT NULL
-       AND suppression_reason = ANY(:reasons)
     RETURNING offer_id
 """
 
-#: The DRY-RUN twin of REVERT_BATCH_SQL, and a MODULE-LEVEL CONSTANT rather than
-#: a literal inside `revert_batch()`. The repo's PREPARE sweep
-#: (tests/test_repo_sql_prepare_postgres.py) follows `database.<accessor>(NAME,
-#: ...)` by AST and can only ask Postgres to plan a statement it can name; a
-#: statement built in a function body is invisible to it. Its predicate is
-#: REVERT_BATCH_SQL's WHERE, verbatim, so the count a plan reports is the count
-#: the UPDATE would move.
-REVERT_PREVIEW_SQL = """
-    SELECT offer_id
-      FROM catalog_offers
-     WHERE suppression_metadata->>'reconcile_batch_id' = CAST(:batch_id AS text)
-       AND suppressed_at IS NOT NULL
-       AND suppression_reason = ANY(:reasons)
-     ORDER BY offer_id
+#: How many rows the batch suppressed WHEN IT RAN, from the audit row the run
+#: wrote. The difference between that and the rows still carrying the stamp is
+#: `healed_since_batch`: rows something lifted in the meantime and un-stamped —
+#: `capture_us_market_offers`' refresh does that for `orphan_no_sku` once the
+#: SKU exists, and an earlier `--revert-batch` of the same batch does it for what
+#: it restored. Without this number `would_restore` is simply smaller than the
+#: run's `suppressed` with nothing saying why. A batch id with no audit row (a
+#: dry run's, or a typo) reports null rather than a guess.
+BATCH_AUDIT_SQL = """
+    SELECT applied_rows
+      FROM writer_audit_log
+     WHERE writer_name = CAST(:writer AS text)
+       AND batch_id = CAST(:batch_id AS text)
+     ORDER BY id DESC
+     LIMIT 1
 """
+
+#: The blocker the CALLER assigns, for the sibling case the SQL cannot see.
+SIBLING_RESTORED_FIRST = "sibling_restored_first"
 
 
 def _limit_bind(limit: int) -> Optional[int]:
@@ -402,19 +507,60 @@ async def run_cascade_pass(
     )
 
 
-async def revert_batch(batch_id: str, *, apply: bool) -> Dict[str, Any]:
-    reasons = [REASON_ORPHAN, REASON_DUPLICATE, REASON_PRODUCT_SUPPRESSED]
-    if not apply:
-        rows = [dict(row) for row in (await database.fetch_all(
-            REVERT_PREVIEW_SQL, {"batch_id": batch_id, "reasons": reasons},
-        ) or [])]
-        return {"batch_id": batch_id, "would_restore": len(rows),
-                "restored": 0, "sample": [str(r["offer_id"]) for r in rows[:5]]}
+async def revert_batch(
+    batch_id: str, *, apply: bool, passes: Tuple[str, ...] = (),
+) -> Dict[str, Any]:
+    """Restore this batch's rows whose defect no longer stands. See
+    REVERT_CANDIDATES_SQL for the decision; this walks its rows, restores at most
+    one per shelf, and reports every skip under the reason the row carries.
+
+    `passes` scopes the revert to those passes' reasons; empty means all three.
+    """
+    reasons = [PASS_REASONS[name] for name in passes] if passes else list(ALL_REASONS)
     rows = [dict(row) for row in (await database.fetch_all(
-        REVERT_BATCH_SQL, {"batch_id": batch_id, "reasons": reasons},
+        REVERT_CANDIDATES_SQL,
+        {"batch_id": batch_id, "reasons": reasons, "all_reasons": list(ALL_REASONS)},
     ) or [])]
-    return {"batch_id": batch_id, "would_restore": len(rows),
-            "restored": len(rows), "sample": [str(r["offer_id"]) for r in rows[:5]]}
+
+    restorable: List[str] = []
+    skipped: Dict[str, Dict[str, int]] = {}
+    shelves_taken: Set[Tuple[Any, Any, Any]] = set()
+    for row in rows:
+        blocker = row.get("blocker")
+        shelf = (row["sku_key"], row["channel"], row["market"])
+        if blocker is None and shelf in shelves_taken:
+            blocker = SIBLING_RESTORED_FIRST
+        if blocker is None:
+            restorable.append(str(row["offer_id"]))
+            shelves_taken.add(shelf)
+            continue
+        reason = str(row.get("suppression_reason") or "(null)")
+        per_reason = skipped.setdefault(reason, {})
+        per_reason[blocker] = per_reason.get(blocker, 0) + 1
+
+    audit_row = await database.fetch_one(
+        BATCH_AUDIT_SQL, {"writer": WRITER_NAME, "batch_id": batch_id},
+    )
+    recorded = int(audit_row["applied_rows"]) if audit_row is not None else None
+    report: Dict[str, Any] = {
+        "batch_id": batch_id,
+        "reasons": reasons,
+        "batch_rows_recorded": recorded,
+        "stamped_rows": len(rows),
+        "healed_since_batch": (recorded - len(rows)) if recorded is not None else None,
+        "would_restore": len(restorable),
+        "restored": 0,
+        "skipped": skipped,
+        "skipped_total": sum(sum(v.values()) for v in skipped.values()),
+        "sample": restorable[:5],
+    }
+    if not apply or not restorable:
+        return report
+    moved = await database.fetch_all(
+        REVERT_BATCH_SQL, {"offer_ids": restorable, "batch_id": batch_id},
+    )
+    report["restored"] = len(moved or [])
+    return report
 
 
 async def run(
@@ -432,11 +578,21 @@ async def run(
     }
 
     if revert:
-        report["revert"] = await revert_batch(revert, apply=apply)
-        report["passes"] = []
+        # `passes` here is the revert's SCOPE (which reasons), not passes to run.
+        # An explicit `--pass` narrows it; the default (all three) is spelled as
+        # the empty tuple so the report's `passes` says what the operator asked.
+        scope = passes if passes != PASSES else ()
+        report["revert"] = await revert_batch(revert, apply=apply, passes=scope)
+        report["passes"] = list(scope)
         if apply:
-            audit.record_applied(int(report["revert"]["restored"]))
-            audit.record_info({"reverted_batch_rows": int(report["revert"]["restored"])})
+            restored = int(report["revert"]["restored"])
+            audit.record_applied(restored)
+            audit.record_info({"reverted_batch_rows": restored,
+                               "reverted_skipped_rows": int(report["revert"]["skipped_total"])})
+            # Which batch, so the audit trail can be followed from the revert
+            # back to the sweep it undid (and so a later revert can tell an
+            # earlier one's restores apart from the capture lane's lifts).
+            audit.reasons["reverted_batch_id"] = revert
             await write_writer_audit_log(audit)
         return report
 
@@ -496,14 +652,14 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--limit", type=int, default=0,
                    help="cap rows per pass (0 = every row)")
     p.add_argument("--pass", dest="passes", action="append", choices=PASSES,
-                   help="run only this pass; repeatable. Default: all three")
+                   help="run only this pass; repeatable. Default: all three. "
+                        "With --revert-batch: restore only that pass's rows")
     p.add_argument("--revert-batch", default="",
-                   help="restore the offers one batch_id suppressed")
+                   help="restore the offers one batch_id suppressed, where the "
+                        "defect no longer stands; the report says what was skipped")
     args = p.parse_args(argv)
     if args.limit < 0:
         p.error("--limit must be >= 0")
-    if args.revert_batch and args.passes:
-        p.error("--revert-batch runs alone")
     return args
 
 
