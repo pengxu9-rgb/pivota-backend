@@ -21,7 +21,7 @@ import logging
 from typing import Any, Dict, Optional
 
 from services.catalog_enrichment_agent.bulk_writer import bulk_upsert
-from services.catalog_enrichment_agent.ingestion import AGENT_VERSION
+from services.catalog_enrichment_agent.ingestion import AGENT_VERSION, derive_offer_id
 from services.catalog_offer_writer_guard import (
     WriterAuditAccumulator,
     guard_catalog_offer_rows,
@@ -110,6 +110,30 @@ _PDP_UPSERT_SQL = """
                   updated_at = NOW()
                 """
 
+# THE ARBITER IS THE IDENTITY INDEX, NOT THE PK. catalog_skus has TWO unique
+# constraints — the PK `sku_key` and `idx_catalog_skus_source_identity_v2
+# (merchant_id, platform, product_key, source_variant_id)` (migration 123) — and
+# Postgres infers ONE; it does not fall through to the other. This upsert named
+# the PK, so a re-ingest of a product whose variant already exists under
+# `services/catalog_variant_promoter`'s spelling of the SAME identity
+# (`<pk>::v::<vid>` vs this lane's `<pk>::v:<vid>`) inserted a rival row, the
+# identity index raised 23505, and the row was logged-and-skipped: the SKU was
+# never refreshed and its offers pointed at a key that does not exist. 4,286
+# promoter rows were adopted by the 2026-09-08 variant-identity backfill and now
+# carry live offers, so this is a live production case, not a hypothetical.
+#
+# The DO UPDATE deliberately touches NO identity column: not `sku_key`, not
+# `product_key`, not `merchant_id`/`platform`/`source_variant_id`. Renaming a
+# primary key here would orphan every catalog_offers row keyed on the old one
+# (catalog_offers has no FK to catch it). `_adopt_existing_sku_identities` is
+# what makes the planned row agree with the row already holding the identity,
+# before we ever get here.
+#
+# Keep prose OUT of the span between `VALUES` and `ON CONFLICT`:
+# `bulk_writer.split_upsert_sql` partitions on exactly those two markers, so a
+# comment placed there is swallowed into the VALUES tuple and breaks the bulk
+# path. `CAST(... AS jsonb)` rather than `::jsonb` for the same family of reason
+# — a `::` cast reads as a bind param to the multi-row rewriter.
 _SKU_UPSERT_SQL = """
                     INSERT INTO catalog_skus
                       (sku_key, product_key, merchant_id, platform,
@@ -125,16 +149,34 @@ _SKU_UPSERT_SQL = """
                        CAST(:visible_option_labels AS jsonb),
                        CAST(:ingredient_ids AS jsonb),
                        CAST(:sku_payload AS jsonb), :readiness_tier)
-                    ON CONFLICT (sku_key) DO UPDATE SET
+                    ON CONFLICT (merchant_id, platform, product_key, source_variant_id)
+                    DO UPDATE SET
                       source_domain = EXCLUDED.source_domain,
                       barcode = EXCLUDED.barcode,
                       title = EXCLUDED.title,
                       image_url = EXCLUDED.image_url,
                       ingredient_ids = EXCLUDED.ingredient_ids,
-                      sku_payload = EXCLUDED.sku_payload,
+                      -- MERGE, never replace. The row we land on may be one the
+                      -- variant-identity backfill stamped with `variant_id_provenance`
+                      -- / `source_system`, or one the promoter stamped with its own
+                      -- provenance; `EXCLUDED.sku_payload` would erase both. COALESCE
+                      -- because `NULL || jsonb` is NULL and the column is nullable.
+                      sku_payload = COALESCE(catalog_skus.sku_payload, CAST('{}' AS jsonb))
+                                    || EXCLUDED.sku_payload,
                       readiness_tier = EXCLUDED.readiness_tier,
                       updated_at = NOW()
                     """
+
+#: Resolve planned SKU identities against the rows that already hold them, in ONE
+#: round trip. Keyed on `product_key` (`idx_catalog_skus_product_key`) rather than
+#: a row-constructor `IN`, because the 4-tuple is matched in Python afterwards and
+#: this shape is one the PREPARE gate can plan. Every SKU a plan writes names a
+#: product_key, and a product's SKU count is small, so the over-read is bounded.
+_SKU_IDENTITY_LOOKUP_SQL = """
+                SELECT sku_key, merchant_id, platform, product_key, source_variant_id
+                FROM catalog_skus
+                WHERE product_key = ANY(:product_keys)
+                """
 
 _OFFER_UPSERT_SQL = """
                     INSERT INTO catalog_offers
@@ -322,6 +364,158 @@ def _filter_children_of_skipped(
         if s.get("attached_product_key") not in skipped_product_keys
     ]
     return skus, offers, seeds
+
+
+async def _adopt_existing_sku_identities(
+    skus: list,
+    offers: list,
+    *,
+    database: Any,
+) -> Dict[str, int]:
+    """Make each planned SKU row agree with the row that ALREADY holds its identity.
+
+    catalog_skus is keyed twice: by `sku_key` (PK) and by the identity tuple
+    (merchant_id, platform, product_key, source_variant_id) —
+    `idx_catalog_skus_source_identity_v2`. Two writers spell the same identity
+    with different keys: this lane's `ingestion.derive_variant_sku_key` produces
+    `<pk>::v:<vid>`, `services/catalog_variant_promoter._derive_sku_key` produces
+    `<pk>::v::<vid>`. Where the promoter's row already exists, inserting ours is
+    not a second variant, it is a rival spelling of the same one.
+
+    So we resolve the planned tuples in ONE query and, where the identity is held
+    under a DIFFERENT key, rewrite the PLANNED row to that key and re-key the
+    offers that named it. Adoption -- not renaming the stored row -- is the only
+    safe direction: catalog_offers has no foreign key to catalog_skus, so a
+    `sku_key` rewrite in the DO UPDATE would silently orphan the live offers
+    hanging off the 4,286 rows the 2026-09-08 variant-identity backfill adopted.
+
+    THE OFFER ID LANDS ON THE BACKFILL'S OWN. Both writers derive it from the same
+    triple: `derive_offer_id(product_key, sku_key, destination)`. Ingestion stores
+    that destination in `source_ref` (`ingestion._build_offer_inserts`), and
+    `scripts/backfill_variant_identity_skus.py` derives its offer id from
+    `(product_key, written_key, destination)` where `written_key` is the ADOPTED
+    key and the same destination is written to `source_ref`. Re-keying to the
+    adopted key with the offer's own `source_ref` therefore reproduces the
+    backfill's offer_id exactly, so the offer UPSERTs that row instead of standing
+    a second, differently-keyed offer beside it.
+
+    Best-effort by construction: a failed lookup logs and changes nothing, which
+    leaves the pre-existing behaviour (the upsert's own conflict handling) intact.
+    """
+    counts = {"skus_adopted_existing_identity": 0, "offers_rekeyed_to_adopted_sku": 0}
+    if not skus:
+        return counts
+    product_keys = sorted({
+        str(row.get("product_key") or "") for row in skus if row.get("product_key")
+    })
+    if not product_keys:
+        return counts
+    try:
+        rows = await database.fetch_all(
+            _SKU_IDENTITY_LOOKUP_SQL, {"product_keys": product_keys}
+        )
+    except Exception as exc:  # noqa: BLE001 — the upsert still has its own conflict handling
+        logger.warning(
+            "sku identity pre-resolve failed for %d product_key(s) — writing planned "
+            "keys unchanged: %s", len(product_keys), str(exc)[:200],
+        )
+        return counts
+
+    def _identity(row: Dict[str, Any]) -> tuple:
+        return (
+            str(row.get("merchant_id") or ""),
+            str(row.get("platform") or ""),
+            str(row.get("product_key") or ""),
+            str(row.get("source_variant_id") or ""),
+        )
+
+    held_by_identity: Dict[tuple, str] = {}
+    for row in rows or []:
+        data = dict(row)
+        held_by_identity[_identity(data)] = str(data.get("sku_key") or "")
+    if not held_by_identity:
+        return counts
+
+    adopted: Dict[str, str] = {}
+    for sku in skus:
+        planned_key = str(sku.get("sku_key") or "")
+        held_key = held_by_identity.get(_identity(sku))
+        if not held_key or held_key == planned_key:
+            continue
+        logger.info(
+            "apply_ingest_plan: identity (merchant_id=%s, platform=%s, product_key=%s, "
+            "source_variant_id=%s) is already held by sku_key=%s — adopting it instead "
+            "of inserting the planned %s",
+            sku.get("merchant_id"), sku.get("platform"), sku.get("product_key"),
+            sku.get("source_variant_id"), held_key, planned_key,
+        )
+        sku["sku_key"] = held_key
+        adopted[planned_key] = held_key
+        counts["skus_adopted_existing_identity"] += 1
+    if not adopted:
+        return counts
+
+    for offer in offers:
+        held_key = adopted.get(str(offer.get("sku_key") or ""))
+        if not held_key:
+            continue
+        offer["sku_key"] = held_key
+        offer["offer_id"] = derive_offer_id(
+            str(offer.get("product_key") or ""),
+            held_key,
+            str(offer.get("source_ref") or ""),
+        )
+        counts["offers_rekeyed_to_adopted_sku"] += 1
+    return counts
+
+
+def _is_unique_violation(exc: BaseException) -> bool:
+    """True for a Postgres unique violation (SQLSTATE 23505).
+
+    Matched the way `routes/billing_routes._is_unique_violation` does — on the
+    driver's `sqlstate`/`pgcode`, with the class name as fallback, NEVER on the
+    message text (a text match would swallow every other constraint failure and
+    report it as an identity conflict). The cause/context chain is walked because
+    a wrapper can hide the driver error.
+    """
+    seen: set = set()
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        code = getattr(cur, "sqlstate", None) or getattr(cur, "pgcode", None)
+        if code == "23505":
+            return True
+        if "uniqueviolation" in type(cur).__name__.lower():
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
+def _note_sku_write_failure(
+    exc: BaseException, row: Dict[str, Any], counts: Dict[str, int]
+) -> None:
+    """Classify ONE failed catalog_skus upsert; never raises, never aborts a batch.
+
+    The identity arbiter plus `_adopt_existing_sku_identities` closes the common
+    collision, but the table's OTHER unique constraint is still reachable from the
+    opposite direction: the same `sku_key` under a DIFFERENT identity tuple — a
+    product whose merchant_id was re-resolved (W2 remapping, a claimed-attach)
+    keeps its derived key while its tuple moves. That row cannot be written
+    without deciding which of two real rows wins, so it is counted and logged with
+    BOTH keys rather than guessed at.
+    """
+    if _is_unique_violation(exc):
+        counts["skus_identity_conflict"] = counts.get("skus_identity_conflict", 0) + 1
+        logger.error(
+            "catalog_skus upsert refused (unique violation, SQLSTATE 23505): "
+            "sku_key=%s vs identity=(merchant_id=%s, platform=%s, product_key=%s, "
+            "source_variant_id=%s) — the key and the identity tuple name different "
+            "rows; row skipped, batch continues: %s",
+            row.get("sku_key"), row.get("merchant_id"), row.get("platform"),
+            row.get("product_key"), row.get("source_variant_id"), str(exc)[:200],
+        )
+        return
+    logger.exception("insert sku failed for sku_key=%s — %s", row.get("sku_key"), exc)
 
 
 async def _apply_inci_rows(
@@ -585,14 +779,25 @@ async def apply_ingest_plan(
         skipped_product_keys, skus=skus, offers=offers, seeds=seeds
     )
 
+    # 2b. Adopt any identity another writer already holds under a different
+    #     sku_key, and re-key that SKU's offers, BEFORE the upserts run.
+    counts["skus_identity_conflict"] = 0
+    counts.update(await _adopt_existing_sku_identities(skus, offers, database=database))
+
     async with database.transaction():
         # 3. catalog_skus — INSERT one synthetic 'canonical' SKU per PDP.
         for sku in skus:
             try:
-                await database.execute(_SKU_UPSERT_SQL, sku)
+                # SAVEPOINT per row. The residual dual-unique trap raises 23505,
+                # and an error inside a Postgres transaction ABORTS it — every
+                # later statement (the whole offers stage) would then fail with
+                # 25P02, so "logged and skipped" was only ever true off Postgres.
+                # The nested transaction rolls back this row alone.
+                async with database.transaction():
+                    await database.execute(_SKU_UPSERT_SQL, sku)
                 counts["skus"] += 1
             except Exception as exc:  # noqa: BLE001
-                logger.exception("insert sku failed for sku_key=%s — %s", sku.get("sku_key"), exc)
+                _note_sku_write_failure(exc, sku, counts)
 
         accepted_offers, skip_reasons, _rejected_offers = await guard_catalog_offer_rows(offers)
         if skip_reasons:
@@ -737,8 +942,17 @@ async def _apply_ingest_plan_batched(
         skipped_product_keys, skus=skus, offers=offers, seeds=seeds
     )
 
-    # 3. catalog_skus.
-    counts["skus"], _, _ = await bulk_upsert(database, _SKU_UPSERT_SQL, skus, label="skus")
+    # 3. catalog_skus — same identity adoption as the per-row path (ONE helper), then
+    #    the same upsert. `bulk_upsert` classifies a failed multi-row chunk as a data
+    #    error (a 23505 is not a transport error) and replays the chunk row by row, so
+    #    only the genuinely-conflicting row is skipped; `on_row_error` is where that
+    #    row's SQLSTATE gets classified and counted.
+    counts["skus_identity_conflict"] = 0
+    counts.update(await _adopt_existing_sku_identities(skus, offers, database=database))
+    counts["skus"], _, _ = await bulk_upsert(
+        database, _SKU_UPSERT_SQL, skus, label="skus",
+        on_row_error=lambda row, exc: _note_sku_write_failure(exc, row, counts),
+    )
 
     # 4. catalog_offers — SAME guard + audit as the per-row path.
     accepted_offers, skip_reasons, _rejected_offers = await guard_catalog_offer_rows(offers)

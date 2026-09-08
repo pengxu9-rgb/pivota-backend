@@ -31,8 +31,8 @@ What this service does NOT do:
     representative of the whole group (verified empirically: the 43
     Tom Ford rows have IDENTICAL variants arrays). Re-running the
     extractor on every member would just produce duplicate upserts;
-    the unique index on (merchant_id, platform, source_variant_id)
-    would dedup but it's wasted work.
+    the unique index on (merchant_id, platform, product_key,
+    source_variant_id) would dedup but it's wasted work.
   - Touch Shopify Default-Title placeholders. MOYU 26-Foundation-Brush
     case: each row has one variant with title='Default Title' / options
     'Default Title'. Already correctly modeled by Stage 2b-i as
@@ -116,6 +116,9 @@ class GroupOutcome:
     variants_promoted: int
     skipped_reason: Optional[str] = None
     sample_variant_titles: List[str] = field(default_factory=list)
+    #: Rows refused by the OTHER unique constraint — same sku_key, different
+    #: identity tuple. Counted rather than fatal; see the upsert loop.
+    skus_identity_conflict: int = 0
 
 
 @dataclass
@@ -125,6 +128,7 @@ class PromoterReport:
     groups_skipped_no_real_variants: int = 0
     groups_skipped_no_primary: int = 0
     skus_upserted_total: int = 0
+    skus_identity_conflict_total: int = 0
     per_group: List[GroupOutcome] = field(default_factory=list)
 
 
@@ -367,6 +371,15 @@ SELECT_GROUPS_TO_PROCESS_SQL = """
 """
 
 
+# THE 3-COLUMN INDEX THIS USED TO NAME NO LONGER EXISTS. Migration 123
+# (`db/migrations/123_catalog_skus_4col_unique_index.sql`) created
+# `idx_catalog_skus_source_identity_v2 (merchant_id, platform, product_key,
+# source_variant_id)` and DROPPED the old `(merchant_id, platform,
+# source_variant_id)`. Postgres answers an ON CONFLICT clause matching no unique
+# index with SQLSTATE 42P10 at PARSE time, so this statement — and with it
+# `promote_variants_all` — has been unexecutable ever since. Nothing caught it:
+# the SQLite suite drives a fake DB and asserted on the string, and a string
+# assertion cannot tell a live index from a plausible-looking dead one.
 UPSERT_SKU_SQL = """
     INSERT INTO catalog_skus (
         sku_key, product_key, merchant_id, platform,
@@ -383,11 +396,15 @@ UPSERT_SKU_SQL = """
         CAST(:sku_payload AS jsonb),
         'commerce_ready', NOW()
     )
-    ON CONFLICT (merchant_id, platform, source_variant_id)
+    ON CONFLICT (merchant_id, platform, product_key, source_variant_id)
     DO UPDATE SET
-        sku_key = EXCLUDED.sku_key,
-        product_key = EXCLUDED.product_key,
-        source_product_id = EXCLUDED.source_product_id,
+        -- NO `sku_key =`, NO `product_key =`, NO `source_product_id =`. Repointing
+        -- the arbiter without dropping these would have been worse than the outage
+        -- it fixes: on the 4,286 rows the 2026-09-08 variant-identity backfill
+        -- ADOPTED, a re-promotion would rename the primary key back to this lane's
+        -- `<pk>::v::<vid>` spelling under the live offers keyed on it
+        -- (catalog_offers has no FK to catch that), and rewrite the product_key of
+        -- a row another writer placed.
         sku = EXCLUDED.sku,
         barcode = EXCLUDED.barcode,
         title = EXCLUDED.title,
@@ -395,9 +412,36 @@ UPSERT_SKU_SQL = """
         image_url = EXCLUDED.image_url,
         visible_option_labels = EXCLUDED.visible_option_labels,
         visible_attributes = EXCLUDED.visible_attributes,
-        sku_payload = EXCLUDED.sku_payload,
+        -- MERGE, never replace: the row we land on may carry the backfill's
+        -- `variant_id_provenance` / `source_system` stamps, or an ingest lane's
+        -- `agent_version` / `canonical_url`. COALESCE because `NULL || jsonb` is
+        -- NULL and the column is nullable.
+        sku_payload = COALESCE(catalog_skus.sku_payload, CAST('{}' AS jsonb))
+                      || EXCLUDED.sku_payload,
         updated_at = NOW()
 """
+
+
+def _is_unique_violation(exc: BaseException) -> bool:
+    """True for a Postgres unique violation (SQLSTATE 23505).
+
+    Same test as `routes/billing_routes._is_unique_violation` and
+    `services/catalog_enrichment_agent/apply._is_unique_violation`: the driver's
+    `sqlstate`/`pgcode`, class name as fallback, NEVER the message text — a text
+    match would fold every other constraint failure into this one bucket. The
+    cause/context chain is walked because a wrapper can hide the driver error.
+    """
+    seen: set = set()
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        code = getattr(cur, "sqlstate", None) or getattr(cur, "pgcode", None)
+        if code == "23505":
+            return True
+        if "uniqueviolation" in type(cur).__name__.lower():
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
 
 
 def _extract_variants_for_primary(primary: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -452,29 +496,49 @@ async def promote_variants_for_group(
     sample_titles = [r.title for r in rows_to_upsert[:5]]
 
     promoted = 0
+    identity_conflicts = 0
     if apply and rows_to_upsert:
         async with database.transaction():
             for r in rows_to_upsert:
-                await database.execute(
-                    UPSERT_SKU_SQL,
-                    {
-                        "sku_key": r.sku_key,
-                        "product_key": r.product_key,
-                        "merchant_id": r.merchant_id,
-                        "platform": r.platform,
-                        "source_product_id": r.source_product_id,
-                        "source_variant_id": r.source_variant_id,
-                        "sku": r.sku,
-                        "barcode": r.barcode,
-                        "title": r.title,
-                        "currency": r.currency,
-                        "image_url": r.image_url,
-                        "visible_option_labels": json.dumps(r.visible_option_labels),
-                        "visible_attributes": json.dumps(r.visible_attributes),
-                        "sku_payload": json.dumps(r.sku_payload, default=str),
-                    },
-                )
-                promoted += 1
+                params = {
+                    "sku_key": r.sku_key,
+                    "product_key": r.product_key,
+                    "merchant_id": r.merchant_id,
+                    "platform": r.platform,
+                    "source_product_id": r.source_product_id,
+                    "source_variant_id": r.source_variant_id,
+                    "sku": r.sku,
+                    "barcode": r.barcode,
+                    "title": r.title,
+                    "currency": r.currency,
+                    "image_url": r.image_url,
+                    "visible_option_labels": json.dumps(r.visible_option_labels),
+                    "visible_attributes": json.dumps(r.visible_attributes),
+                    "sku_payload": json.dumps(r.sku_payload, default=str),
+                }
+                try:
+                    # SAVEPOINT per row. The identity arbiter closes the collision
+                    # that matters, but catalog_skus' OTHER unique constraint is
+                    # still reachable from the opposite direction -- this row's
+                    # `sku_key` already held by a DIFFERENT identity tuple -- and a
+                    # 23505 ABORTS the enclosing Postgres transaction. Without the
+                    # savepoint one such variant takes the whole group down with it.
+                    async with database.transaction():
+                        await database.execute(UPSERT_SKU_SQL, params)
+                    promoted += 1
+                except Exception as exc:  # noqa: BLE001
+                    if not _is_unique_violation(exc):
+                        raise
+                    identity_conflicts += 1
+                    logger.error(
+                        "catalog_skus upsert refused (unique violation, SQLSTATE "
+                        "23505): sku_key=%s vs identity=(merchant_id=%s, platform=%s, "
+                        "product_key=%s, source_variant_id=%s) -- the key and the "
+                        "identity tuple name different rows; variant skipped, group "
+                        "continues: %s",
+                        r.sku_key, r.merchant_id, r.platform, r.product_key,
+                        r.source_variant_id, str(exc)[:200],
+                    )
 
     return GroupOutcome(
         product_group_id=group_id,
@@ -482,6 +546,7 @@ async def promote_variants_for_group(
         variants_found=len(raw_variants),
         variants_promoted=promoted if apply else len(rows_to_upsert),
         sample_variant_titles=sample_titles,
+        skus_identity_conflict=identity_conflicts,
     )
 
 
@@ -493,7 +558,26 @@ async def promote_variants_all(
     limit: int = 100,
 ) -> PromoterReport:
     """Iterate every multi-member product_group (or scope by group_id
-    / merchant_id) and promote variants from the primary."""
+    / merchant_id) and promote variants from the primary.
+
+    THIS ENTRY POINT HAS BEEN UNEXECUTABLE SINCE MIGRATION 123. `UPSERT_SKU_SQL`
+    named `ON CONFLICT (merchant_id, platform, source_variant_id)`, an index that
+    `db/migrations/123_catalog_skus_4col_unique_index.sql` dropped when it created
+    `idx_catalog_skus_source_identity_v2`. Postgres refuses an ON CONFLICT clause
+    matching no unique constraint at parse time (SQLSTATE 42P10), so every
+    `apply=True` run has raised on its first variant since that migration landed;
+    `apply=False` never reaches the statement, which is why the outage was quiet.
+
+    AND THE TABLE HAS MOVED UNDER IT. The 2026-09-08 variant-identity backfill
+    (`scripts/backfill_variant_identity_skus.py`) ADOPTED 4,286 rows this promoter
+    had written — it conflicts on the same identity index, takes `RETURNING
+    sku_key`, and hangs a live `catalog_offers` row off whichever key already held
+    the identity. Those offers are keyed on THIS lane's `<pk>::v::<vid>` spelling,
+    with no foreign key to protect them, so the repointed upsert deliberately
+    updates no identity column: a `sku_key = EXCLUDED.sku_key` here would rename
+    primary keys out from under live supply, and a `sku_payload = EXCLUDED...`
+    would erase the backfill's `variant_id_provenance` / `source_system` stamps.
+    """
     report = PromoterReport()
 
     # Build the group fetch SQL based on scope
@@ -524,5 +608,6 @@ async def promote_variants_all(
         else:
             report.groups_promoted += 1
             report.skus_upserted_total += outcome.variants_promoted
+        report.skus_identity_conflict_total += outcome.skus_identity_conflict
 
     return report

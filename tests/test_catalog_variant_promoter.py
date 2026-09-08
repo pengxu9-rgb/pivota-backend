@@ -319,8 +319,24 @@ async def test_promote_apply_upserts_per_real_variant(monkeypatch) -> None:
     assert "external_product_seeds" not in sql_joined
     assert "seed_data" not in sql_joined
     assert "product_payload" not in sql_joined
-    # ON CONFLICT clause present so re-runs are idempotent
-    assert "ON CONFLICT (merchant_id, platform, source_variant_id)" in sql_joined
+    # ON CONFLICT clause present so re-runs are idempotent — and it must name the
+    # index that EXISTS. Migration 123 replaced the 3-column
+    # (merchant_id, platform, source_variant_id) index with the 4-column
+    # idx_catalog_skus_source_identity_v2, and Postgres rejects an ON CONFLICT
+    # clause matching no unique constraint at parse time (42P10), so the old
+    # target made `promote_variants_all` unexecutable. This assertion is a string
+    # check on a fake DB and could not have caught that; the executing proof is
+    # tests/test_sku_identity_upserts_postgres.py.
+    assert (
+        "ON CONFLICT (merchant_id, platform, product_key, source_variant_id)"
+        in sql_joined
+    )
+    # And the DO UPDATE must rename nothing: the 4,286 rows the 2026-09-08
+    # variant-identity backfill adopted carry live catalog_offers keyed on their
+    # sku_key, and catalog_offers has no FK to catch a rename.
+    for renamed in ("sku_key = EXCLUDED", "product_key = EXCLUDED",
+                    "source_product_id = EXCLUDED"):
+        assert renamed not in sql_joined, renamed
 
 
 @pytest.mark.asyncio
