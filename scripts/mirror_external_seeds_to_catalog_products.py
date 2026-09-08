@@ -575,7 +575,7 @@ async def _upsert_canonical_sku_for_mirror_row(
     # repaired row, on every run, forever. Under the PK arbiter all three
     # callers address the same row and the second one simply refreshes it.
     #
-    # The siblings moved because they had a MEASURED collision. The variant lanes
+    # The siblings move (PR #2135) because they have a MEASURED collision. The variant lanes
     # spell one identity two ways (`<pk>::v:<vid>` vs `<pk>::v::<vid>`), and
     # 4,971 of 16,431 planned rows raised 23505 on the index the clause did not
     # name — prod 2026-09-07, recorded in
@@ -597,15 +597,15 @@ async def _upsert_canonical_sku_for_mirror_row(
     # later is keyed on `derive_mirror_sku_key(product_key)`
     # (services/external_offer_dual_write.py) rather than on anything this
     # statement returns — so the offer would hang on a `::canonical` key that
-    # does not exist, and nothing would raise. The siblings could move only
-    # because they gained `_adopt_existing_sku_identities` to re-key the offer
+    # does not exist, and nothing would raise. The siblings can move only
+    # because PR #2135 gives them `_adopt_existing_sku_identities` to re-key the offer
     # first; this lane has no such helper, and adding one is not this change.
     #
     # MEASURED ON PROD 2026-09-08, rather than assumed. Of 24,558
     # `platform='external_seed'` SKUs, 11,908 carry `source_variant_id =
     # product_key`, and ALL 11,908 are held under `product_key || '::canonical'`.
     # Rows holding that tuple under any other `sku_key`: ZERO. So the collision
-    # the siblings had does not exist on this lane, and the PK arbiter has never
+    # the siblings have does not exist on this lane, and the PK arbiter has never
     # cost a row. (The variant lanes structurally cannot mint one either: their
     # `source_variant_id` is a merchant-issued variant id while `product_key` is
     # minted by us, so no crawl can hand it back. The one lane that could is
@@ -661,8 +661,9 @@ async def _upsert_canonical_sku_for_mirror_row(
           -- Path C overlap; it is not a repair of live backfill damage.
           --
           -- COALESCE because `NULL || jsonb` is NULL and the column is nullable.
-          -- Same form and same reason as
-          -- `catalog_enrichment_agent/apply._SKU_UPSERT_SQL`.
+          -- Same form and same reason as PR #2135 gives
+          -- `catalog_enrichment_agent/apply._SKU_UPSERT_SQL` (on main that
+          -- statement still REPLACES the payload).
           sku_payload = COALESCE(catalog_skus.sku_payload, CAST('{}' AS jsonb))
                         || EXCLUDED.sku_payload,
           -- `readiness_tier` IS REFRESHED HERE, where the sibling
