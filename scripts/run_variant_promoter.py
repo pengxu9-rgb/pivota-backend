@@ -61,6 +61,9 @@ async def _drive(args: argparse.Namespace) -> dict:
         "totals": {
             "groups_considered": report.groups_considered,
             "groups_promoted": report.groups_promoted,
+            # Groups written on the redirect lane, where no tier can move. Groups
+            # WRITTEN is this plus groups_promoted.
+            "groups_tier_held": report.groups_tier_held,
             "groups_skipped_no_real_variants": report.groups_skipped_no_real_variants,
             "groups_skipped_no_primary": report.groups_skipped_no_primary,
             "skus_upserted_total": report.skus_upserted_total,

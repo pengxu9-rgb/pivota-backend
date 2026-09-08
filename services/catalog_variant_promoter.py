@@ -154,7 +154,14 @@ class GroupOutcome:
 @dataclass
 class PromoterReport:
     groups_considered: int = 0
+    #: Groups where at least one row's tier could move. A group on the redirect lane
+    #: is written but never promoted; it is `groups_tier_held`, not this.
     groups_promoted: int = 0
+    #: Groups written on a lane whose offered tier is the ladder floor, so nothing
+    #: in them was promoted. Same split as `skus_tier_held_total`, one level up:
+    #: `groups_promoted: N` beside `skus_upserted_total: 0` was the same
+    #: overstatement the SKU-grain split exists to remove.
+    groups_tier_held: int = 0
     groups_skipped_no_real_variants: int = 0
     groups_skipped_no_primary: int = 0
     skus_upserted_total: int = 0
@@ -565,7 +572,9 @@ UPSERT_SKU_SQL = """
         -- the promoter resolves onto it through the identity index, DO UPDATEs the
         -- content, counts `variants_promoted`, and leaves the tier exactly where it
         -- was — measured `promoted=1, tier_after='referral_only'`, on 4,474 such
-        -- rows. "Promoted" has to mean the tier moved.
+        -- rows. "Promoted" has to mean the write is on a lane where the tier CAN
+        -- move; a money-lane row already at 'commerce_ready' still counts, because
+        -- the write could have raised it (see GroupOutcome.variants_tier_held).
         --
         -- UPWARD-ONLY, on `services.index_graduation_ladder.OBSERVED_READINESS_LADDER`
         -- (referral_only -> knowledge_ready -> commerce_ready). A tier is never
@@ -881,7 +890,12 @@ async def promote_variants_all(
         elif outcome.skipped_reason == "no_real_variants":
             report.groups_skipped_no_real_variants += 1
         else:
-            report.groups_promoted += 1
+            # A group counts as promoted only if a row in it could be. On the
+            # redirect lane every row is `variants_tier_held`, so the group is too.
+            if outcome.variants_promoted > 0:
+                report.groups_promoted += 1
+            else:
+                report.groups_tier_held += 1
             report.skus_upserted_total += outcome.variants_promoted
             report.skus_tier_held_total += outcome.variants_tier_held
         report.skus_identity_conflict_total += outcome.skus_identity_conflict

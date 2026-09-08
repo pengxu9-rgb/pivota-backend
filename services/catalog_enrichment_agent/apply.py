@@ -559,9 +559,16 @@ async def _adopt_existing_sku_identities(
         `catalog_products.merchant_id`. Offer readers join on `product_key` /
         `sku_key` and take the merchant from the offer row alone
         (`pivot_query_service`, `agent_pdp_view_assembler`,
-        `merchant_catalog_listing_fallback_service`, `catalog_invariant_checks`,
-        `routes/agent_shop_gateway`, `routes/employee_products`). The one query
-        that reads an offer's merchant against another table is
+        `payment_offer_evidence_service`, `catalog_invariant_checks`,
+        `routes/agent_shop_gateway`, `routes/employee_products`;
+        `merchant_catalog_listing_fallback_service` filters on the PRODUCT's
+        merchant and never reads the offer's). Two readers scope by the SKU's own
+        merchant — `agent_center_bd_report_service` (the representative SKU for a
+        BD report) and `routes/audit_runs_routes` (audit targets) — so a canonical
+        row parked under the sentinel is invisible to the brand tenant in both;
+        that is the pre-existing state of those rows, not something this branch
+        changes, and `backfill_seller_of_record` is the lane that re-keys them.
+        The one query that reads an offer's merchant against another table is
         `scripts/repair_orphan_shopify_offers` (`products_cache.merchant_id =
         o.merchant_id`), which is scoped to `source_system='shopify_products_sync'`
         and so never sees a Path C offer. Counted `offers_kept_plan_seller_on_adoption`

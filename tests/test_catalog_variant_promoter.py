@@ -488,6 +488,41 @@ async def test_promote_prefers_path_b_seed_when_both_paths_have_data(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_promote_all_does_not_count_a_tier_held_group_as_promoted(monkeypatch) -> None:
+    """THE GROUP COUNT IS SPLIT THE SAME WAY THE SKU COUNT IS. A group on the
+    redirect lane is WRITTEN — every row `variants_tier_held`, none promoted — and
+    `groups_promoted` used to count it anyway, so a run over an all-external-seed
+    corpus said `groups_promoted: N` two lines above `skus_upserted_total: 0`. A
+    group is promoted only if a row in it could be."""
+    outcomes = {
+        "pg_held": promoter.GroupOutcome(
+            product_group_id="pg_held", primary_product_key="pk_held", variants_found=2, variants_promoted=0, variants_tier_held=2),
+        "pg_money": promoter.GroupOutcome(
+            product_group_id="pg_money", primary_product_key="pk_money", variants_found=2, variants_promoted=2, variants_tier_held=0),
+        "pg_skip": promoter.GroupOutcome(
+            product_group_id="pg_skip", primary_product_key="pk_skip", variants_found=0, variants_promoted=0,
+            skipped_reason="no_real_variants"),
+    }
+
+    async def fake_fetch_all(sql, params=None):
+        return [{"group_id": g} for g in outcomes]
+
+    async def fake_promote(group_id, apply):
+        return outcomes[group_id]
+
+    monkeypatch.setattr(promoter.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(promoter, "promote_variants_for_group", fake_promote)
+
+    report = await promoter.promote_variants_all(limit=0)
+    assert report.groups_considered == 3
+    assert report.groups_promoted == 1, "a tier-held group was counted as promoted"
+    assert report.groups_tier_held == 1
+    assert report.groups_skipped_no_real_variants == 1
+    assert report.skus_upserted_total == 2
+    assert report.skus_tier_held_total == 2
+
+
+@pytest.mark.asyncio
 async def test_promote_all_iterates_groups_with_scope(monkeypatch) -> None:
     """promote_variants_all takes merchant_id / product_group_id /
     limit. Pin that the SQL builder respects scope."""
