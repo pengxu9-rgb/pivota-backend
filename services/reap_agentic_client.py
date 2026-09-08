@@ -1012,3 +1012,89 @@ def quote_tax(quote_payload: Any) -> Optional[Tuple[float, str]]:
     breakdown = data.get("amountBreakdown") if isinstance(data.get("amountBreakdown"), dict) else {}
     tax = breakdown.get("tax") if isinstance(breakdown.get("tax"), dict) else {}
     return _price_of({"price": tax.get("amount")})
+
+
+# --- what a refusal means -------------------------------------------------------------------
+#
+# An ORDERED LIST of (prefix, explanation), not a dict. That is not a style preference: the
+# probe script held this as a dict literal, I added a second `"options"` key to it, and Python
+# silently kept the LAST one -- so the careful explanation I had just written was dead code and
+# the script printed a placeholder for the one refusal that most needs explaining. A duplicate
+# key in a dict literal is not an error in any linter we run. A list cannot hide one, because
+# `explain_refusal` returns the FIRST match and a test asserts every reason resolves to distinct
+# non-placeholder copy.
+#
+# Longest prefixes first, so a specific reason wins over its step.
+REFUSAL_EXPLANATIONS: List[Tuple[str, str]] = [
+    ("options:value_unavailable_at_reap",
+     "The variant EXISTS and our row is right. Reap declines to sell that value today, and\n"
+     "asking /variant for it returns 200 with an available sibling -- so we stop before the\n"
+     "call. The referral link still works, and NOTHING about our row should be corrected: this\n"
+     "is the case where a naive price comparison would 'fix' a correct price to a wrong one."),
+    ("options:axes_not_determined_by_title",
+     "The product was found; our variant title did not pin every option axis. This one is ours\n"
+     "to fix -- either our title lacks a qualifier Reap's label carries, or the product has an\n"
+     "axis our catalog does not record. Defaulting here is what would substitute a cheaper\n"
+     "sibling for the variant we meant."),
+    ("options:no_variant_title_supplied",
+     "The product has option axes and we passed no variant title, so there is nothing to\n"
+     "resolve against. Pass the title from the row."),
+    ("options:product_has_no_option_axes",
+     "Unexpected: a product with no axes should have been handled by the single-variant path.\n"
+     "If you see this, the details response changed shape."),
+    ("options:ambiguous_on_axis",
+     "Two different labels on ONE axis both matched our title. The title genuinely does not\n"
+     "determine that axis; taking the first would be a guess."),
+    ("search:merchant_not_in_results",
+     "Reap's index did not yield this merchant's product under any phrasing tried (listed\n"
+     "above). Reap's search is QUERY-SENSITIVE: the bare product name is measured to miss\n"
+     "products the brand-led phrasing finds, so this is evidence about the QUERY at least as\n"
+     "much as about the index. DO NOT conclude the merchant is unindexed from it -- that is\n"
+     "exactly how flowerbeauty.com got written off. If `merchant.name` carries a subdomain\n"
+     "(8 of 78 do), pass it via `also_accept_domains` rather than loosening the comparison."),
+    ("search:ambiguous_name_match",
+     "More than one product on the right merchant has exactly our product name. Refusing beats\n"
+     "picking: the candidates are listed above."),
+    ("search:no_exact_name_match",
+     "The merchant was found but no product name matched exactly. Candidates are listed above --\n"
+     "check whether Reap's name carries a qualifier ours does not, or vice versa."),
+    ("search:product_id_not_in_reap_namespace",
+     "The matched product's id is not a Reap `prd_...`. Refused before going further: an id from\n"
+     "the wrong namespace is how the predecessor of this module failed."),
+    ("search:no_products_returned",
+     "The search returned zero products for every phrasing tried."),
+    ("variant:substituted_on_axis",
+     "Reap returned 200 for a DIFFERENT variant than the one we asked for. This is the silent\n"
+     "substitution; the reason line names what we asked for and what came back. Refusing is\n"
+     "correct -- quoting it would price the wrong physical object."),
+    ("variant:response_missing_axis",
+     "Reap's variant response did not carry an axis we asked about, so we cannot confirm it is\n"
+     "the variant we wanted."),
+    ("details:", "The product id resolved but details refused it. The code shown is Reap's."),
+    ("single_variant_product_has_no_variant_id",
+     "An option-less product whose `defaultVariant.id` is not a Reap `var_...`. Do not send it."),
+    ("resolved_id_not_in_reap_namespace",
+     "Reap returned an id that is not a `var_...`. Refused rather than passed into a quote."),
+    ("reap_status_503",
+     "Reap's search index is far wider than its checkout coverage. Measured: the merchants that\n"
+     "503 on a quote are the ones that are not UCP merchants. Treat as per-merchant, not as an\n"
+     "outage -- but n is small, so record it rather than suppressing the merchant."),
+    ("transport_error",
+     "A network failure, not a verdict about the merchant or the product. Retry."),
+    ("reap_client_not_configured",
+     "REAP_API_BASE_URL and REAP_API_KEY are not both set. Nothing was sent."),
+]
+
+
+def explain_refusal(reason: Optional[str]) -> str:
+    """One paragraph on what a `VariantResolution.reason` actually means, or a fallback.
+
+    Lives here rather than in the probe script because it is a statement about REAP'S
+    behaviour -- the same vocabulary any caller has to interpret -- and because a copy that
+    sits next to the code emitting the reasons is the copy that gets updated when they change.
+    """
+    text = str(reason or "")
+    for prefix, explanation in REFUSAL_EXPLANATIONS:
+        if text.startswith(prefix):
+            return explanation
+    return "Unrecognised refusal. Read the reason string above and the module that emits it."

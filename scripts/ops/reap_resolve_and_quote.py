@@ -119,30 +119,7 @@ def main() -> int:
 
     if not resolved.ok:
         print("\n--- WHAT THIS TELLS US " + "-" * 48)
-        step = (resolved.reason or "").split(":")[0]
-        print({
-            "search": ("Reap's index did not yield this merchant's product under any phrasing\n"
-                       "  tried (listed above). Reap's search is QUERY-SENSITIVE: the bare\n"
-                       "  product name is measured to miss products the brand-led phrasing\n"
-                       "  finds. A refusal here is evidence about the QUERY at least as much as\n"
-                       "  about the index — do not conclude the merchant is unindexed from it.\n"
-                       "  If `merchant.name` carries a subdomain (8 of 78 do), pass it via\n"
-                       "  `also_accept_domains` rather than loosening the comparison."),
-            "options": ("The product was found. Two different refusals live here:\n"
-                        "  value_unavailable_at_reap — the variant EXISTS and our row is right;\n"
-                        "    Reap will not sell that value today, and asking /variant for it\n"
-                        "    returns 200 with an available sibling. The referral link still\n"
-                        "    works and nothing about our row should be corrected.\n"
-                        "  axes_not_determined_by_title — our title did not pin every axis.\n"
-                        "    That one is ours to fix."),
-            "details": "The product id resolved but details refused it. The code above is Reap's.",
-            "options": "See below.",
-            "variant": "Reap returned 200 for a DIFFERENT variant than the one we asked for.\n"
-                       "  This is the silent substitution: an unavailable option resolves to an\n"
-                       "  available sibling with no warning. The reason line names what we asked\n"
-                       "  for and what came back. Refusing is correct — quoting it would price\n"
-                       "  the wrong physical object.",
-        }.get(step, "  Transport or configuration — see the reason above."))
+        print("  " + rc.explain_refusal(resolved.reason).replace("\n", "\n  "))
         return 3
 
     if resolved.price_disagrees:

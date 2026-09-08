@@ -1129,3 +1129,71 @@ def test_an_alias_does_not_admit_a_confusable():
     match = rc.match_product(payload, merchant_domain="cosrx.com", product_name="Snail Mucin",
                              also_accept_domains=["us.cosrx.com", "shop.cosrx.com"])
     assert not match.ok
+
+
+# --- every refusal has copy, and none of it is a placeholder ------------------------------------
+#
+# This exists because the probe script held these explanations in a DICT LITERAL, I added a
+# second "options" key to it, and Python silently kept the last one — so the careful paragraph I
+# had just written was dead and the script printed "See below." for the one refusal that most
+# needs explaining. No linter we run flags a duplicate key in a dict literal. The table is now an
+# ordered list, which cannot hide one, and these tests keep the copy tracking the vocabulary.
+
+#: Every reason string `resolve_our_row` can return, gathered by hand from the module. If a new
+#: refusal is added without copy, `test_every_reason_has_its_own_explanation` fails.
+ALL_REASONS = [
+    "search:no_products_returned", "search:no_exact_name_match", "search:ambiguous_name_match",
+    "search:merchant_not_in_results", "search:product_id_not_in_reap_namespace",
+    "options:product_has_no_option_axes", "options:no_variant_title_supplied",
+    "options:axes_not_determined_by_title", "options:ambiguous_on_axis:Size",
+    "options:value_unavailable_at_reap:Size:Standard",
+    "variant:substituted_on_axis:Size:asked=Standard:got=Mini",
+    "variant:response_missing_axis:Size",
+    "details:PRODUCT_NOT_FOUND", "single_variant_product_has_no_variant_id",
+    "resolved_id_not_in_reap_namespace", "reap_status_503",
+    "transport_error:ReadTimeout", "reap_client_not_configured",
+]
+
+
+@pytest.mark.parametrize("reason", ALL_REASONS)
+def test_every_reason_has_its_own_explanation(reason):
+    text = rc.explain_refusal(reason)
+    assert text and "Unrecognised refusal" not in text
+    # The placeholder that actually shipped, plus the usual stand-ins. Note "..." is NOT in this
+    # list: legitimate copy names Reap's id prefixes as `var_...` and `prd_...`, and a check that
+    # fires on those trains people to weaken the check rather than fix the copy.
+    for placeholder in ("See below", "TODO", "TBD", "FIXME", "XXX"):
+        assert placeholder not in text
+
+
+def test_the_two_options_refusals_do_not_share_copy():
+    """The duplicate-key bug in one assertion. These say opposite things — one means our row is
+    right and Reap declines to sell it, the other means our title is inadequate — so identical
+    copy for both is the failure, not merely untidy."""
+    unavailable = rc.explain_refusal("options:value_unavailable_at_reap:Size:Standard")
+    unmatched = rc.explain_refusal("options:axes_not_determined_by_title")
+    assert unavailable != unmatched
+    assert "our row is right" in unavailable
+    assert "ours\nto fix" in unmatched
+
+
+def test_a_specific_reason_beats_its_step_prefix():
+    """Ordering, not dict lookup: `options:value_unavailable_at_reap` must not be answered by a
+    generic `options:` entry that happens to be listed first."""
+    assert rc.explain_refusal("options:value_unavailable_at_reap:Size:Standard") \
+        != rc.explain_refusal("options:no_variant_title_supplied")
+
+
+def test_no_two_entries_share_a_prefix_relationship_in_the_wrong_order():
+    """A longer prefix listed AFTER a shorter one it extends is unreachable — the list form's
+    equivalent of the duplicate key, and just as silent."""
+    prefixes = [p for p, _ in rc.REFUSAL_EXPLANATIONS]
+    for i, longer in enumerate(prefixes):
+        for shorter in prefixes[:i]:
+            assert not longer.startswith(shorter), \
+                f"{longer!r} is unreachable: {shorter!r} is listed before it"
+
+
+def test_an_unknown_reason_says_so_rather_than_guessing():
+    assert "Unrecognised" in rc.explain_refusal("something_new_we_have_not_seen")
+    assert "Unrecognised" in rc.explain_refusal(None)
