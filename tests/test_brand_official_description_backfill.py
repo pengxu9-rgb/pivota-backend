@@ -480,6 +480,10 @@ def _row(pk, ck, handle, title="Artist Eye Palette Core Mood"):
     }
 
 
+async def _none_meta(domain, **k):
+    return None
+
+
 def _harness(monkeypatch, rows, *, body_map, pdp=None, blurb=_BLURB, truncated=False):
     """Drive run() against stubs, recording what each content_key was refreshed AS."""
     db = _FakeDB(rows)
@@ -507,6 +511,9 @@ def _harness(monkeypatch, rows, *, body_map, pdp=None, blurb=_BLURB, truncated=F
     monkeypatch.setattr(bf, "_load_body_map", _load)
     monkeypatch.setattr(bf, "fetch_pdp_description", _pdp)
     monkeypatch.setattr(bf, "fetch_shop_description", _blurb)
+    # The JSON fallback must never reach the network from a test: stubbed to "nothing there"
+    # so a test that hands the homepage stub None is testing an UNAVAILABLE blurb, as it says.
+    monkeypatch.setattr(bf, "fetch_shop_description_from_meta", _none_meta)
     monkeypatch.setattr(bf, "refresh_agent_pdp_view_for_content_key", _refresh)
     monkeypatch.setattr(bf, "compute_lifecycle_stage", lambda row: "published")
     return db, refreshed, fetched
@@ -819,6 +826,7 @@ def test_a_blurb_too_short_to_clear_the_floor_counts_as_NO_blurb(monkeypatch):
         return "Glossier"
 
     monkeypatch.setattr(bf, "fetch_shop_description", _short)
+    monkeypatch.setattr(bf, "fetch_shop_description_from_meta", _none_meta)
     _real_sleep = asyncio.sleep
     monkeypatch.setattr(bf.asyncio, "sleep", lambda *_a, **_k: _real_sleep(0))
     assert asyncio.run(bf._load_shop_blurb("glossier.com")) is None
@@ -845,3 +853,79 @@ def test_a_value_that_does_not_contain_the_title_is_never_an_echo():
     length of copy that has nothing to do with the title and refuse short genuine descriptions."""
     assert bf._is_title_echo("A watery lip tint with a glassy finish.", "Totally Different") is False
     assert bf._is_title_echo("", "Some Title") is False
+
+
+# --- the blurb is fetched FIRST, and has a JSON fallback --------------------------------------
+
+_REAL_SLEEP = asyncio.sleep
+
+
+async def _no_sleep(*_a, **_k):
+    await _REAL_SLEEP(0)
+
+
+def test_the_blurb_is_the_first_request_to_the_host_not_the_last(monkeypatch):
+    """Measured 2026-09-08 on jsmbeauty.sg: fetched AFTER sixty product pages, the homepage was
+    refused on three consecutive runs (`blurb_unavailable`, fill=0, every candidate dropped as
+    'boilerplate'); a cold job fetched it fine. The blurb must go out before any PDP fetch."""
+    rows = [_row("pk1", "ck1", "h1"), _row("pk2", "ck2", "h2")]
+    _, _, fetched = _harness(
+        monkeypatch, rows, body_map={"h1": "tiny", "h2": "tiny"},
+        pdp={"h1": _LONG_META, "h2": _LONG_META + " Two."})
+
+    async def _blurb_recording(domain, **k):
+        fetched.append(("blurb", domain))
+        return _BLURB
+
+    monkeypatch.setattr(bf, "fetch_shop_description", _blurb_recording)
+    assert asyncio.run(bf.run(apply=False, domains_filter=[], max_products=10,
+                              pdp_fallback=True)) == 0
+    assert fetched and fetched[0] == ("blurb", "jsmbeauty.sg"), fetched
+    assert [f for f in fetched if f[0] == "blurb"] == [("blurb", "jsmbeauty.sg")], (
+        "one blurb request per domain, not one per candidate")
+
+
+def test_a_body_only_run_never_asks_the_host_for_its_blurb(monkeypatch):
+    rows = [_row("pk1", "ck1", "h1")]
+    _, _, fetched = _harness(monkeypatch, rows, body_map={"h1": _LONG_BODY})
+
+    async def _blurb_recording(domain, **k):
+        fetched.append(("blurb", domain))
+        return _BLURB
+
+    monkeypatch.setattr(bf, "fetch_shop_description", _blurb_recording)
+    assert asyncio.run(bf.run(apply=False, domains_filter=[], max_products=10,
+                              pdp_fallback=False)) == 0
+    assert fetched == []
+
+
+def test_the_blurb_falls_back_to_meta_json_when_the_homepage_is_refused(monkeypatch):
+    """`/meta.json` `description` is `shop.description` — the identical string the homepage
+    meta carries (135 chars on jsmbeauty.sg, measured 2026-09-08) — served from a JSON door a
+    store keeps open when it starts refusing its themed homepage."""
+    calls = []
+
+    async def _home(domain, **k):
+        calls.append("home"); return None
+
+    async def _meta(domain, **k):
+        calls.append("meta"); return _BLURB
+
+    monkeypatch.setattr(bf, "fetch_shop_description", _home)
+    monkeypatch.setattr(bf, "fetch_shop_description_from_meta", _meta)
+    monkeypatch.setattr(bf.asyncio, "sleep", _no_sleep)
+    assert asyncio.run(bf._load_shop_blurb("jsmbeauty.sg")) == _BLURB
+    assert calls == ["home", "home", "home", "meta"], "homepage first, JSON only after it fails"
+
+
+def test_a_short_meta_json_description_does_not_arm_the_comparison(monkeypatch):
+    async def _home(domain, **k):
+        return None
+
+    async def _meta(domain, **k):
+        return "Glossier"
+
+    monkeypatch.setattr(bf, "fetch_shop_description", _home)
+    monkeypatch.setattr(bf, "fetch_shop_description_from_meta", _meta)
+    monkeypatch.setattr(bf.asyncio, "sleep", _no_sleep)
+    assert asyncio.run(bf._load_shop_blurb("glossier.com")) is None
