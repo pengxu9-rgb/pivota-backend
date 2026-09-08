@@ -131,6 +131,22 @@ def _clean_domain(domain: str) -> str:
     return d.split("/")[0]
 
 
+def _same_storefront_host(requested: str, actual: Optional[str]) -> bool:
+    """Is `actual` (a redirect chain's final host) the SAME storefront we asked?
+
+    Only the `www.` prefix is treated as noise. A SUBDOMAIN is not: `uk.brand.com` and
+    `shop.brand.com` are separate Shopify stores with their own `shop.description`, their own
+    catalogue and their own currency, which is precisely the confusion a host pin exists to
+    refuse. Suffix matching (`endswith(host)`) would accept both, and would additionally accept
+    `evilbrand.com` for `brand.com`.
+    """
+    a = str(actual or "").strip().lower().rstrip(".")
+    r = str(requested or "").strip().lower().rstrip(".")
+    if not a or not r:
+        return False
+    return a.removeprefix("www.") == r.removeprefix("www.")
+
+
 _ISO_CURRENCY = re.compile(r"^[A-Z]{3}$")
 
 
@@ -795,6 +811,13 @@ async def fetch_shop_description_from_meta(
     blurb. This is the fallback for that moment, not a replacement: `fetch_shop_description`
     stays first because a theme can override `shop.description` on the homepage, and it is the
     HOMEPAGE string a PDP without its own SEO copy repeats. Returns None on any failure.
+
+    NOT THE SAME STRING AS THE THEME RENDERS, and the caller must be told. `/meta.json` returns
+    `shop.description` RAW, while the homepage meta and the PDP og tag both pass it through the
+    theme (escaping, truncation, `| append: shop.name`), so the two can differ by exactly the
+    filters that make the PDP comparison an EXACT match. Callers that use this to arm an
+    equality test must treat the result as unverified — see `_load_shop_blurb` in
+    scripts/backfill_brand_official_descriptions.py.
     """
     host = _clean_domain(domain)
     if not host:
@@ -816,9 +839,29 @@ async def fetch_shop_description_from_meta(
         )
         if resp.status_code != 200:
             return None
+        # THE ANSWER MUST COME FROM THE HOST WE ASKED. `follow_redirects=True` with no check
+        # will happily read `/meta.json` off whatever storefront the redirect chain ends on --
+        # and a regional redirect (brand.com -> uk.brand.com, or an apex parked on a partner's
+        # shop) lands on a DIFFERENT Shopify store with a different `shop.description`. That
+        # string would then arm an equality comparison for a domain whose theme never renders
+        # it: not merely useless, but the exact "non-empty blurb that matches nothing" shape
+        # that switches OFF this lane's fail-closed refusal. www<->apex is the same storefront
+        # and is allowed; anything else is not.
+        if not _same_storefront_host(host, getattr(resp.url, "host", None)):
+            logger.debug(
+                "fetch_shop_description_from_meta: %s redirected off-host to %s — refusing",
+                host, getattr(resp.url, "host", None),
+            )
+            return None
         data = resp.json()
         desc = data.get("description") if isinstance(data, dict) else None
-        desc = " ".join(str(desc or "").split())
+        # A STRING OR NOTHING. `str(desc)` of a list renders `['a', 'b']` -- punctuation and all,
+        # comfortably over the 50-char floor -- and a dict renders its repr. Both would be
+        # published-shaped garbage rather than the shop blurb, and neither can ever equal a PDP
+        # meta description, so both arrive as an unmatchable "blurb" instead of an absent one.
+        if not isinstance(desc, str):
+            return None
+        desc = " ".join(desc.split())
         return desc or None
     except Exception as exc:  # noqa: BLE001 — same contract as fetch_shop_description
         logger.debug("fetch_shop_description_from_meta failed for %s: %s", host, str(exc)[:160])

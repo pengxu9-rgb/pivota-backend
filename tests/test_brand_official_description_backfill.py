@@ -113,6 +113,10 @@ _BLURB = ("Discover JUNGSAEMMOOL, the epitome of Korean makeup and cosmetic prod
           "blending artistry with skincare for every day.")
 _BOGOS = ("This product is used for the app BOGOS.io Free Gift BOGO Bundle to work. "
           "Please do not delete/edit it, or email us at: help@bogos.io.")
+# What `/meta.json` returns for a storefront whose HOMEPAGE description is 8 characters: the raw
+# `shop.description`, over the floor, and a string that storefront's theme renders on no PDP.
+_GLOSSIER_META = ("Glossier is a New York City beauty brand creating products inspired by real "
+                  "life, for skin first and makeup second.")
 
 
 def test_a_value_equal_to_the_shops_own_blurb_is_dropped():
@@ -622,7 +626,7 @@ def test_the_blurb_fetch_is_retried_before_it_is_believed(monkeypatch):
     monkeypatch.setattr(bf, "fetch_shop_description", _flaky)
     monkeypatch.setattr(bf.asyncio, "sleep", lambda *_a, **_k: _real_sleep(0))
 
-    assert asyncio.run(bf._load_shop_blurb("jsmbeauty.sg")) == _BLURB
+    assert asyncio.run(bf._load_shop_blurb("jsmbeauty.sg")) == (_BLURB, True)
     assert len(calls) == 2, "a transient failure must not be taken as 'no blurb'"
 
 
@@ -816,7 +820,15 @@ def test_a_blurb_too_short_to_clear_the_floor_counts_as_NO_blurb(monkeypatch):
     """MEASURED: glossier.com's homepage description is "Glossier" -- 8 characters. Accepting it
     arms mechanism 1 in name only, since no candidate over the 50-char floor can ever equal it,
     AND switches off the fail-closed refusal -- so singletons pass with nothing checking them.
-    That is the hole this guard exists to close, reached through a different door."""
+    That is the hole this guard exists to close, reached through a different door.
+
+    THE HOMEPAGE STUB IS THE WHOLE POINT and this test had lost it: when #2129 added the
+    `/meta.json` fallback, a short homepage stopped meaning "no blurb" -- it means "fall through
+    to the JSON door", which on glossier.com returns the real, long `shop.description`. Stubbing
+    that door to None (as this test was edited to do) kept it green while deleting the case it
+    names. It is stubbed here to the string the real endpoint returns, and the answer is an
+    UNVERIFIED blurb, which `blurb_arming` refuses to let lift the singleton refusal.
+    """
     real = "A watery lip tint that layers into a vivid stain without drying the lips out."
     assert bf.drop_shared_boilerplate({"a": real}, "Glossier") == {}, \
         "an 8-char site name must not count as an armed blurb comparison"
@@ -825,11 +837,21 @@ def test_a_blurb_too_short_to_clear_the_floor_counts_as_NO_blurb(monkeypatch):
     async def _short(domain, **k):
         return "Glossier"
 
+    async def _meta(domain, **k):
+        return _GLOSSIER_META
+
     monkeypatch.setattr(bf, "fetch_shop_description", _short)
-    monkeypatch.setattr(bf, "fetch_shop_description_from_meta", _none_meta)
+    monkeypatch.setattr(bf, "fetch_shop_description_from_meta", _meta)
     _real_sleep = asyncio.sleep
     monkeypatch.setattr(bf.asyncio, "sleep", lambda *_a, **_k: _real_sleep(0))
-    assert asyncio.run(bf._load_shop_blurb("glossier.com")) is None
+
+    blurb, verified = asyncio.run(bf._load_shop_blurb("glossier.com"))
+    assert blurb == _GLOSSIER_META
+    assert verified is False, (
+        "an 8-char homepage falls through to /meta.json, whose raw shop.description the theme "
+        "never renders — that string must not be presented as a verified blurb")
+    assert bf.drop_shared_boilerplate({"a": real}, blurb, blurb_verified=verified) == {}, \
+        "a blurb the theme does not render must not lift the fail-closed singleton refusal"
 
 
 def test_the_title_echo_threshold_is_pinned_at_its_boundary():
@@ -914,7 +936,8 @@ def test_the_blurb_falls_back_to_meta_json_when_the_homepage_is_refused(monkeypa
     monkeypatch.setattr(bf, "fetch_shop_description", _home)
     monkeypatch.setattr(bf, "fetch_shop_description_from_meta", _meta)
     monkeypatch.setattr(bf.asyncio, "sleep", _no_sleep)
-    assert asyncio.run(bf._load_shop_blurb("jsmbeauty.sg")) == _BLURB
+    assert asyncio.run(bf._load_shop_blurb("jsmbeauty.sg")) == (_BLURB, False), \
+        "the JSON door bypasses the theme, so what it returns is UNVERIFIED"
     assert calls == ["home", "home", "home", "meta"], "homepage first, JSON only after it fails"
 
 
@@ -928,4 +951,268 @@ def test_a_short_meta_json_description_does_not_arm_the_comparison(monkeypatch):
     monkeypatch.setattr(bf, "fetch_shop_description", _home)
     monkeypatch.setattr(bf, "fetch_shop_description_from_meta", _meta)
     monkeypatch.setattr(bf.asyncio, "sleep", _no_sleep)
-    assert asyncio.run(bf._load_shop_blurb("glossier.com")) is None
+    assert asyncio.run(bf._load_shop_blurb("glossier.com")) == (None, False)
+
+
+# --- an UNVERIFIED blurb must corroborate before it lifts the refusal ---------------------------
+
+
+def test_the_homepage_door_is_the_only_VERIFIED_one(monkeypatch):
+    """`verified` names a PROPERTY, not a door: the homepage blurb and the PDP meta are rendered
+    by the SAME theme and parsed by the SAME extractor, so every filter the theme applies
+    (escaping, truncation at 320 chars, `| append: shop.name`) applies to both sides of the exact
+    comparison and cancels. `/meta.json` returns `shop.description` raw and cancels nothing."""
+    async def _home(domain, **k):
+        return _BLURB
+
+    monkeypatch.setattr(bf, "fetch_shop_description", _home)
+    monkeypatch.setattr(bf, "fetch_shop_description_from_meta", _none_meta)
+    monkeypatch.setattr(bf.asyncio, "sleep", _no_sleep)
+    assert asyncio.run(bf._load_shop_blurb("jsmbeauty.sg")) == (_BLURB, True)
+
+
+def test_an_unverified_blurb_that_matches_NOTHING_does_not_lift_the_refusal():
+    """THE DEFECT #2129 SHIPPED, at the unit that decides it. A `/meta.json` blurb is non-empty
+    and clears the floor, so the pre-existing `if not blurb: continue` refusal was lifted by it
+    — while the exact comparison it was supposed to arm can never fire, because the theme does
+    not render that string. Every singleton on the domain was admitted, INCLUDING the storefront
+    blurb served on a PDP with no SEO description, which is what mechanism 1 exists to catch,
+    and the run printed `boilerplate=0 blurb_unavailable=0`.
+
+    Two candidates, DELIBERATELY DIFFERENT strings so repetition cannot fire and only the
+    arming rule can explain the verdict."""
+    real = "A watery lip tint that layers into a vivid stain without drying the lips out."
+    other = "A cushion foundation with buildable coverage and a satin finish that lasts all day."
+
+    kept = bf.drop_shared_boilerplate(
+        {"a": real, "b": other}, _GLOSSIER_META, blurb_verified=False,
+        handles={"a": "ha", "b": "hb"})
+    assert kept == {}, "an unverified, uncorroborated blurb must not admit singletons"
+
+    # ...and the SAME string from the homepage door does lift it, so this is about verification
+    # and not about the string.
+    assert bf.drop_shared_boilerplate(
+        {"a": real, "b": other}, _GLOSSIER_META, blurb_verified=True,
+        handles={"a": "ha", "b": "hb"}) == {"a": real, "b": other}
+
+
+def test_a_THEME_FILTER_is_enough_to_break_the_match_and_must_not_be_forgiven():
+    """WHY `verified` is a property of the DOOR and not a judgement about the string. The homepage
+    and the PDP are rendered by the same theme, so a filter such as `| append: ' | Shop All'`
+    lands on BOTH sides of the comparison and cancels. `/meta.json` is upstream of the theme, so
+    the same filter puts the raw string permanently out of reach of every PDP on the domain.
+
+    That is a one-token difference from the corroborating case above, and under #2129 it was the
+    difference between "the guard works" and "every singleton on this storefront is published
+    unchecked" — with `boilerplate=0 blurb_unavailable=0` in the log either way."""
+    themed = _BLURB + " | Shop All"          # what the PDP serves
+    raw = _BLURB                             # what /meta.json returns
+    real = "A watery lip tint that layers into a vivid stain without drying the lips out."
+
+    kept = bf.drop_shared_boilerplate(
+        {"blurbed": themed, "genuine": real}, raw, blurb_verified=False,
+        handles={"blurbed": "h1", "genuine": "h2"})
+    assert kept == {}, (
+        "the raw blurb matches no PDP, so it corroborates nothing and guards nothing — "
+        "including the storefront blurb sitting in the candidate set")
+
+    # The theme-rendered blurb from the HOMEPAGE door carries the same filter and does match.
+    assert bf.drop_shared_boilerplate(
+        {"blurbed": themed, "genuine": real}, themed, blurb_verified=True,
+        handles={"blurbed": "h1", "genuine": "h2"}) == {"genuine": real}
+
+
+def test_an_unverified_blurb_still_DROPS_a_candidate_it_matches():
+    """A hit is a true positive whatever door the blurb came through — the exact match is armed
+    unconditionally. Measured on jsmbeauty.sg 2026-09-08, `/meta.json` `description` and the
+    homepage meta are the identical 135 characters, and refusing to use it would throw the
+    measured win away for nothing."""
+    kept = bf.drop_shared_boilerplate({"a": _BLURB}, _BLURB, blurb_verified=False)
+    assert kept == {}, "the storefront's own blurb must never become a product description"
+
+
+def test_an_unverified_blurb_that_CORROBORATES_lifts_the_refusal_for_the_others():
+    """The jsmbeauty.sg shape, and the reason the fallback is worth keeping: one candidate equals
+    the `/meta.json` string byte for byte, which PROVES the theme renders it on a PDP. That is
+    the evidence the homepage door would have supplied, so the rest of the domain's singletons
+    are guarded again and admitted."""
+    real = "A watery lip tint that layers into a vivid stain without drying the lips out."
+    kept = bf.drop_shared_boilerplate(
+        {"blurbed": _BLURB, "genuine": real}, _BLURB, blurb_verified=False,
+        handles={"blurbed": "h1", "genuine": "h2"})
+    assert kept == {"genuine": real}, (
+        "a corroborated blurb both drops its own match and guards the rest")
+
+
+def test_the_corroboration_survives_case_and_whitespace():
+    """`/meta.json` is raw and the PDP is themed; a newline or a capital is exactly the kind of
+    difference between the two doors, and `_norm_copy` is what both sides go through."""
+    on_pdp = "  DISCOVER JUNGSAEMMOOL, the epitome of Korean\n  makeup and cosmetic products, " \
+             "blending artistry with skincare for every day.  "
+    real = "A watery lip tint that layers into a vivid stain without drying the lips out."
+    kept = bf.drop_shared_boilerplate(
+        {"blurbed": on_pdp, "genuine": real}, _BLURB, blurb_verified=False,
+        handles={"blurbed": "h1", "genuine": "h2"})
+    assert kept == {"genuine": real}
+
+
+def test_an_unverified_uncorroborated_blurb_is_COUNTED_and_announced_SEPARATELY(monkeypatch):
+    """The operator action differs. `blurb_unavailable` means the host refused us and a retry may
+    fix it; this one means we DID get a string and it is demonstrably not what the theme serves —
+    no retry changes that. Reported under its own key so a run cannot show `blurb_unavailable=0`
+    while every singleton on the domain was refused (the exact silence #2129 shipped)."""
+    rows = [_row("pk1", "ck1", "h1"), _row("pk2", "ck2", "h2")]
+
+    async def _home(domain, **k):
+        return None
+
+    async def _meta(domain, **k):
+        return _GLOSSIER_META
+
+    db, refreshed, _ = _harness(
+        monkeypatch, rows, body_map={"h1": "tiny", "h2": "tiny"},
+        pdp={"h1": _LONG_META, "h2": _LONG_META + " Two."})
+    monkeypatch.setattr(bf, "fetch_shop_description", _home)
+    monkeypatch.setattr(bf, "fetch_shop_description_from_meta", _meta)
+    monkeypatch.setattr(bf.asyncio, "sleep", _no_sleep)
+    printed = []
+    monkeypatch.setattr("builtins.print", lambda *a, **k: printed.append(" ".join(map(str, a))))
+
+    assert asyncio.run(bf.run(apply=True, domains_filter=[], max_products=10,
+                              pdp_fallback=True)) == 0
+
+    assert db.updates == [], "an unguarded candidate must not be written"
+    done = [ln for ln in printed if ln.startswith("[done]")]
+    assert done and "'blurb_unverified_uncorroborated': 1" in done[0], done
+    assert "'blurb_unavailable': 0" in done[0], (
+        "a blurb we DID receive must not be reported as unavailable")
+    assert any("/meta.json" in ln for ln in printed), "the refusal must be announced"
+
+
+def test_a_meta_json_blurb_the_theme_DOES_render_still_fills_the_domain(monkeypatch):
+    """END TO END, the measured jsmbeauty.sg win #2129 was for: the homepage is refused, the JSON
+    door answers with the same string, one PDP serves it verbatim — and the rest of the domain
+    fills. The corroboration rule must not cost this."""
+    rows = [_row("pk1", "ck1", "h1"), _row("pk2", "ck2", "h2")]
+
+    async def _home(domain, **k):
+        return None
+
+    async def _meta(domain, **k):
+        return _BLURB
+
+    db, _, _ = _harness(
+        monkeypatch, rows, body_map={"h1": "tiny", "h2": "tiny"},
+        pdp={"h1": _BLURB, "h2": _LONG_META})
+    monkeypatch.setattr(bf, "fetch_shop_description", _home)
+    monkeypatch.setattr(bf, "fetch_shop_description_from_meta", _meta)
+    monkeypatch.setattr(bf.asyncio, "sleep", _no_sleep)
+
+    assert asyncio.run(bf.run(apply=True, domains_filter=[], max_products=10,
+                              pdp_fallback=True)) == 0
+
+    assert [u["product_key"] for u in db.updates] == ["pk2"], (
+        "the blurb-carrying PDP is dropped and the genuine one is kept")
+
+
+def test_the_call_site_passes_the_VERIFICATION_not_just_the_string(monkeypatch):
+    """A call site that dropped `blurb_verified=` would default it to True and re-open the hole
+    while every unit test of `drop_shared_boilerplate` stayed green — the shape that let #2129's
+    defect ship. Driven through run(): the SAME string admits or refuses depending only on which
+    door supplied it."""
+    rows = [_row("pk1", "ck1", "h1"), _row("pk2", "ck2", "h2")]
+
+    async def _none_home(domain, **k):
+        return None
+
+    async def _home(domain, **k):
+        return _GLOSSIER_META
+
+    async def _meta(domain, **k):
+        return _GLOSSIER_META
+
+    monkeypatch.setattr(bf.asyncio, "sleep", _no_sleep)
+    body = {"h1": "tiny", "h2": "tiny"}
+    pdp = {"h1": _LONG_META, "h2": _LONG_META + " Two."}
+
+    db_meta, _, _ = _harness(monkeypatch, rows, body_map=body, pdp=pdp)
+    monkeypatch.setattr(bf, "fetch_shop_description", _none_home)
+    monkeypatch.setattr(bf, "fetch_shop_description_from_meta", _meta)
+    assert asyncio.run(bf.run(apply=True, domains_filter=[], max_products=10,
+                              pdp_fallback=True)) == 0
+    assert db_meta.updates == [], "via /meta.json: unverified, uncorroborated -> refused"
+
+    db_home, _, _ = _harness(monkeypatch, rows, body_map=body, pdp=pdp)
+    monkeypatch.setattr(bf, "fetch_shop_description", _home)
+    assert asyncio.run(bf.run(apply=True, domains_filter=[], max_products=10,
+                              pdp_fallback=True)) == 0
+    assert sorted(u["product_key"] for u in db_home.updates) == ["pk1", "pk2"], \
+        "via the homepage: verified -> the same two candidates are admitted"
+
+
+# --- the blurb is not fetched for a domain that will never use it -------------------------------
+
+
+def test_a_domain_whose_bodies_all_clear_the_floor_never_asks_for_a_blurb(monkeypatch):
+    """P2, a cost gate. `body_map` is already in hand and answers "will any row reach the PDP
+    fallback?" exactly. Without this, a `--pdp-fallback` sweep pays 3 homepage attempts +
+    /meta.json + robots.txt + ~4.5 s of pacing on every candidate-free domain, against a
+    merchant host, for a blurb handed to an empty candidate set."""
+    rows = [_row("pk1", "ck1", "h1"), _row("pk2", "ck2", "h2")]
+    db, _, fetched = _harness(
+        monkeypatch, rows, body_map={"h1": _LONG_BODY, "h2": _LONG_BODY + " Two."})
+
+    async def _blurb_recording(domain, **k):
+        fetched.append(("blurb", domain))
+        return _BLURB
+
+    async def _meta_recording(domain, **k):
+        fetched.append(("meta", domain))
+        return _BLURB
+
+    monkeypatch.setattr(bf, "fetch_shop_description", _blurb_recording)
+    monkeypatch.setattr(bf, "fetch_shop_description_from_meta", _meta_recording)
+
+    assert asyncio.run(bf.run(apply=True, domains_filter=[], max_products=10,
+                              pdp_fallback=True)) == 0
+
+    assert fetched == [], "no row needed the PDP fallback, so no blurb request was owed"
+    assert sorted(u["product_key"] for u in db.updates) == ["pk1", "pk2"], \
+        "and the body copy is still filled"
+
+
+def test_a_row_MISSING_from_the_feed_does_not_buy_a_blurb_request(monkeypatch):
+    """A row whose handle is not in the feed is skipped BEFORE `resolve_description`, so it never
+    reaches the PDP fallback and must not be the reason a host is asked for its blurb."""
+    rows = [_row("pk1", "ck1", "h1"), _row("pk2", "ck2", "missing")]
+    _, _, fetched = _harness(monkeypatch, rows, body_map={"h1": _LONG_BODY})
+
+    async def _blurb_recording(domain, **k):
+        fetched.append(("blurb", domain))
+        return _BLURB
+
+    monkeypatch.setattr(bf, "fetch_shop_description", _blurb_recording)
+
+    assert asyncio.run(bf.run(apply=False, domains_filter=[], max_products=10,
+                              pdp_fallback=True)) == 0
+    assert fetched == []
+
+
+def test_ONE_short_body_is_enough_to_buy_the_blurb(monkeypatch):
+    """The gate is `any`, not `all`: a single row under the floor will reach the PDP, and a PDP
+    candidate with no blurb behind it is refused as boilerplate. Pinning the negative alone would
+    be satisfied by never fetching the blurb at all."""
+    rows = [_row("pk1", "ck1", "h1"), _row("pk2", "ck2", "h2")]
+    db, _, fetched = _harness(
+        monkeypatch, rows, body_map={"h1": _LONG_BODY, "h2": "tiny"}, pdp={"h2": _LONG_META})
+
+    async def _blurb_recording(domain, **k):
+        fetched.append(("blurb", domain))
+        return _BLURB
+
+    monkeypatch.setattr(bf, "fetch_shop_description", _blurb_recording)
+
+    assert asyncio.run(bf.run(apply=True, domains_filter=[], max_products=10,
+                              pdp_fallback=True)) == 0
+    assert ("blurb", "jsmbeauty.sg") in fetched
+    assert sorted(u["product_key"] for u in db.updates) == ["pk1", "pk2"]
