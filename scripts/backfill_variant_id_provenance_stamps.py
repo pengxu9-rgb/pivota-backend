@@ -81,8 +81,8 @@ writing `source_handle` on 2026-09-04 (`8c9c1f26e`) and `variant_id_provenance` 
 this script's population. The divergence is real and reaches rows this run writes.
 
 The convention stands anyway, for a better reason: **the stamp must answer the question the way the
-money reader asks it.** `services/checkout_preflight.py:189` — the gate that decides whether an
-offer may be handed to a buyer — calls
+money reader asks it.** `services/checkout_preflight.preflight()` — the gate that decides whether
+an offer may be handed to a buyer — calls (at :189, inside the `try` that opens at :185)
 
     variant_id_provenance(variant_id, product_id=..., product_key=...)
 
@@ -122,10 +122,22 @@ this script would stamp `merchant_issued` that `ingestion.py`'s four-argument ca
 `product_derived`, and `merchant_issued` is the verdict the checkout preflight spends money on.
 See the handle section above for what to do about it.
 
-If a run dies mid-scan it still prints a fenced report — `mode: "failed"` — and still writes its
-audit row; both carry `resume_after`. Committed pages are durable, so resume from that cursor
-rather than re-running the table. A report carrying `resume_after_to_recover_rollbacks` means a
-page was LOST: resume from that key instead, because `resume_after` is already past it.
+If a run dies mid-scan ON AN EXCEPTION it still prints a fenced report — `mode: "failed"` — and
+still writes its audit row; both carry `resume_after`. Committed pages are durable, so resume from
+that cursor rather than re-running the table. A report carrying `resume_after_to_recover_rollbacks`
+means a page was LOST: resume from that key instead, because `resume_after` is already past it.
+
+THAT PROMISE IS NARROWER THAN IT SOUNDS. Both `run()` and `main()` catch `Exception`, not
+`BaseException`, and a SIGTERM — which is what a Cloud Run task timeout sends, and what
+`gcloud run jobs executions cancel` sends — raises nothing at all in a process with the default
+handler: it just ends. So a run killed that way writes NO audit row and prints NOTHING; the
+last thing in Cloud Logging is the page it was on. (MEASURED, not reasoned: a SIGTERM delivered
+while page 2 was in flight left no `STAMPREPORT` line on stdout, zero `writer_audit_log` rows,
+and exit 143 — while page 1's three rows stayed committed and correctly stamped.) Nothing is LOST
+by it, because the UPDATE's own `IS NULL` predicate is the idempotency: a rescan from `--after ""`
+stamps only the rows the killed run did not reach, and reports the rest as `rows_already_stamped`.
+That rescan, not a cursor, is the recovery from a timeout. Size `--limit` so a run fits inside the
+task timeout with room, and the exception path above stays the only one that needs a cursor.
 
 Running it twice stamps nothing the second time: the UPDATE's own `IS NULL` predicate is the
 idempotency, not a flag we carry.
@@ -256,8 +268,8 @@ def classify(row: Dict[str, Any], *, with_handle: bool = False) -> str:
     survives in `sku_payload.source_handle`. Used ONLY to MEASURE the divergence — to explain a
     disagreement on an already-stamped row, and to count it on rows this run is about to write.
     Never to decide what to stamp: the stamp must be reproducible from the row's own columns, and
-    must match how `services/checkout_preflight.py:189` asks the question. See the module
-    docstring's section on this.
+    must match how `services/checkout_preflight.preflight()` asks the question (:189). See
+    the module docstring's section on this.
     """
     return variant_id_provenance(
         row.get("source_variant_id"),
@@ -681,11 +693,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         report = asyncio.run(_go())
     except Exception as exc:
-        # A FAILED RUN STILL PRINTS A REPORT. Without this the only output of a mid-run failure
-        # is a traceback in Cloud Logging, and the pages that DID commit are unrecoverable
-        # except by re-scanning the table: `resume_after` — the one number that makes recovery
-        # cheap — was computed, written to the audit row, and then never shown to the operator
-        # who has to type it. Exit code is non-zero, so the job is still a failed job.
+        # A RUN THAT FAILS ON AN EXCEPTION STILL PRINTS A REPORT. Without this the only output of
+        # a mid-run failure is a traceback in Cloud Logging, and the pages that DID commit are
+        # unrecoverable except by re-scanning the table: `resume_after` — the one number that
+        # makes recovery cheap — was computed, written to the audit row, and then never shown to
+        # the operator who has to type it. Exit code is non-zero, so the job is still a failed
+        # job. `Exception`, not `BaseException`, on purpose and with a known cost: a SIGTERM
+        # (Cloud Run task timeout) ends the process without reaching here, so nothing prints —
+        # the module docstring says what the recovery is in that case (a rescan; the UPDATE is
+        # idempotent).
+        #
+        # The sealed report is read off the exception, where run() left it. The fallback below
+        # is for a failure BEFORE run() (an unresolvable DATABASE_URL) or a seal that itself
+        # failed; printing it when a sealed report exists would drop the cursor on the floor.
+        # `tests/...::test_main_prints_the_sealed_report_with_the_cursor_when_the_run_dies_mid_scan`
+        # pins that this branch reads the attribute rather than always printing the fallback.
         report = getattr(exc, "stamp_report", None)
         report = dict(report) if isinstance(report, dict) else {
             # The seal itself failed (see run()); say so rather than printing a report shaped
