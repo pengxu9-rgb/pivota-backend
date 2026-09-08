@@ -86,6 +86,7 @@ from services.outbound_links_service import (
     parse_redirect_token_verified,
     shopify_cart_base_url,
 )
+from services import checkout_preflight
 from services import live_offer_verification
 from services.shopify_variant_identity import (
     sole_stamped_variant_id,
@@ -4405,6 +4406,38 @@ async def _handle_offers_resolve(
                     seed_data=seed_data,
                     offer_variant_id=_seed_offer_variant_id(v) or None,
                 )
+                # PREFLIGHT. This is the last moment we control before a buyer is handed a
+                # PRE-FILLED CART keyed on `cart_variant_id` — so a wrong or dead variant here
+                # does not merely bounce them, it puts the wrong thing in a real cart. Off by
+                # default; in shadow it records what enforcement WOULD have refused and changes
+                # nothing; in enforce it drops the offer rather than publish a cart for
+                # something the merchant no longer sells. Never raises: a verifier that can
+                # break offer resolution is worse than the staleness it checks.
+                if not await _preflight_allows_external_offer({
+                    "offer_id": offer_id,
+                    "product_key": row_dict.get("attached_product_key") or None,
+                    "source_product_id": row_dict.get("external_product_id") or None,
+                    "sku_key": sku_id or None,
+                    "merchant_id": redirect_identity["merchant_id"],
+                    "currency": currency,
+                    "merchant_effective_price": price_amount,
+                    "suppressed_at": row_dict.get("suppressed_at"),
+                    "suppression_reason": row_dict.get("suppression_reason"),
+                    # The SAME url the redirect is about to be built from, so the preflight
+                    # verifies the claim we are actually publishing rather than a different
+                    # one — the trap `_target` documents upstream.
+                    "execution_spec": {
+                        "pdp_url": str(canonical_url or destination_url),
+                        "variant_id": redirect_identity.get("cart_variant_id") or vid,
+                    },
+                    "source": {
+                        "seed_data": seed_data,
+                        "canonical_url": canonical_url,
+                        "destination_url": destination_url,
+                    },
+                }):
+                    continue
+
                 # T2-12: mint the join key HERE, not inside the builder, and hand the same one
                 # to both. The id has to be identical on the surface_click_events row, on the
                 # merchant's order, and on the `cart_url` / `pdp_url` we publish below — if the
@@ -8251,6 +8284,33 @@ def resolve_cart_permalink(
         variant_id=cart_variant_id,
         quantity=quantity,
     )
+
+
+async def _preflight_allows_external_offer(offer: Dict[str, Any]) -> bool:
+    """May this external offer be published as a buyable link?
+
+    Named and extracted so the decision can be TESTED rather than asserted about: the inline
+    version could only be pinned by grepping the route's source, which is the text-ratchet
+    problem this repo keeps re-learning. It is also the single place the mode is interpreted, so
+    the call sites cannot drift apart on what shadow means.
+
+    Fail-open when disabled, fail-open in shadow, and on an unexpected exception the answer
+    follows the operator's own instruction: under `enforce` they asked us to refuse what cannot
+    be verified, and an exception IS "could not verify". `checkout_preflight.preflight` is total
+    — it catches its own failures and returns `unverifiable` — so reaching the handler at all
+    means something structural.
+    """
+    if not checkout_preflight.is_enabled():
+        return True
+    try:
+        verdict = await checkout_preflight.preflight_and_record(offer)
+        return verdict.allows_checkout
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[offers.resolve] preflight raised for %s (mode=%s): %s",
+            offer.get("offer_id"), checkout_preflight.mode(), repr(exc)[:200],
+        )
+        return checkout_preflight.mode() != checkout_preflight.MODE_ENFORCE
 
 
 def _redirect_token_from_url(redirect_url: str) -> str:

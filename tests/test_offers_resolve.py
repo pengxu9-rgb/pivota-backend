@@ -4110,3 +4110,93 @@ def test_host_diverse_head_treats_hostless_offers_as_distinct() -> None:
         {"offer_id": "of:e", "url": "https://three.example/p"},
     ]
     assert [o["offer_id"] for o in _host_diverse_head(mixed, 3)] == ["of:a", "of:b", "of:c"]
+
+
+def test_enforced_preflight_drops_the_seed_offer_from_the_resolve_lane(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """The CALL SITE, not the helper.
+
+    `_preflight_allows_external_offer` is unit-tested, but a mutation deleting the `continue`
+    that consumes it at the seed lane's loop would survive those tests entirely — the decision
+    would be computed and thrown away, which is the shape of every "gate that does not gate" bug
+    in this repo. This drives the real loop: with the preflight enforcing and refusing, the seed
+    offer must disappear from the response, and with it in shadow it must still be published.
+
+    That offer is the one handed over as a PRE-FILLED CART keyed on the variant id the
+    2026-09-08 backfill wrote, so publishing one the merchant no longer sells puts the wrong
+    thing in a real cart rather than merely bouncing the buyer.
+    """
+    import routes.agent_shop_gateway as gateway
+    from services import checkout_preflight as cp
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM catalog_products" in q and "JOIN catalog_offers" in q:
+            return [_CATALOG_OFFER_ROW]
+        return _sig_lane_fetch_all(query, values)
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
+
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(
+        gateway, "_make_external_redirect_url",
+        AsyncMock(return_value="https://example.com/r?token=x"))
+
+    seen = {"n": 0}
+
+    async def refusing_preflight(offer):
+        seen["n"] += 1
+        return cp.PreflightVerdict(
+            outcome=cp.BLOCK, reason=cp.R_GONE, would_block=True, mode=cp.mode())
+
+    monkeypatch.setattr(cp, "preflight_and_record", refusing_preflight)
+
+    def _seed_offers():
+        res = client.post(
+            "/agent/shop/v1/invoke",
+            json={"operation": "offers.resolve",
+                  "payload": {"product": {"product_id": "sig_test_mirror_1"}, "limit": 10,
+                              "market": "US", "tool": "*", "commerce_surface": "agent_api"},
+                  "metadata": {"source": "creator-agent-ui"}},
+        )
+        assert res.status_code == 200
+        return [o for o in (res.json().get("offers") or [])
+                if str(o.get("offer_id") or "").startswith("of:external_seed:")]
+
+    # OFF: the lane is untouched and nothing is asked. This is the baseline the other two
+    # modes are compared against, so it is taken FIRST.
+    monkeypatch.delenv("CHECKOUT_PREFLIGHT_MODE", raising=False)
+    baseline = _seed_offers()
+    assert baseline, "off must leave the lane untouched"
+    assert seen["n"] == 0, "off must not spend a request"
+
+    # SHADOW: the verdict is computed, and the buyer's payload is BYTE-IDENTICAL to off.
+    # Asserting only that the offer is still present would pass for a shadow mode that
+    # quietly rewrote the redirect, which is the thing a measurement must never do.
+    # Control: two OFF calls, to separate "shadow changed it" from per-request non-determinism
+    # (each resolve mints a fresh click_id, so affiliate_url differs call to call by design).
+    baseline_2 = _seed_offers()
+    _volatile = {k for o1, o2 in zip(baseline, baseline_2) for k in o1 if o1[k] != o2[k]}
+    # A control that excludes too much proves nothing, so pin WHAT it excludes: only the
+    # click-id-bearing links may differ between two identical calls. If this set ever grows,
+    # the comparison below has stopped being evidence and this assertion is the tripwire.
+    assert _volatile <= {"affiliate_url", "cart_url", "pdp_url", "execution_spec", "click_id"}, (
+        f"unexpected per-call variation, the shadow comparison is no longer meaningful: {_volatile}")
+
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
+    shadow = _seed_offers()
+    assert seen["n"] > 0, "shadow must still ASK — otherwise it measures nothing"
+    assert len(shadow) == len(baseline)
+    for off_o, sh_o in zip(baseline, shadow):
+        stable_off = {k: v for k, v in off_o.items() if k not in _volatile}
+        stable_sh = {k: v for k, v in sh_o.items() if k not in _volatile}
+        assert stable_sh == stable_off, (
+            f"shadow changed the buyer-facing payload (ignoring per-call fields {_volatile})")
+
+    # ENFORCE: the same verdict now removes it.
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "enforce")
+    assert _seed_offers() == [], "an enforced refusal must remove the seed offer"

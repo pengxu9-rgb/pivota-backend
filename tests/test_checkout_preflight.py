@@ -336,3 +336,73 @@ async def test_off_writes_no_observation(monkeypatch):
     monkeypatch.setattr(cp, "database", _Counting())
     await cp.preflight_and_record(_offer())
     assert wrote["n"] == 0
+
+
+# ---------------------------------------------------------------------------
+# The call site: offers.resolve's external-seed lane
+#
+# This is the last moment we control before a buyer is handed a PRE-FILLED CART keyed on the
+# variant id the 2026-09-08 backfill wrote. A wrong variant there does not merely bounce them;
+# it puts the wrong thing in a real cart.
+# ---------------------------------------------------------------------------
+
+
+async def _allows(monkeypatch, **verdict_kw):
+    from routes.agent_shop_gateway import _preflight_allows_external_offer
+
+    async def _fake(offer):
+        return cp.PreflightVerdict(**verdict_kw)
+
+    monkeypatch.setattr(cp, "preflight_and_record", _fake)
+    return await _preflight_allows_external_offer({"offer_id": "of:external_seed:s:1"})
+
+
+async def test_the_lane_is_untouched_when_the_preflight_is_off(monkeypatch):
+    """Off must cost the resolve path nothing — not even the call."""
+    from routes.agent_shop_gateway import _preflight_allows_external_offer
+
+    called = {"n": 0}
+
+    async def _count(offer):
+        called["n"] += 1
+        return cp.PreflightVerdict(outcome=cp.BLOCK, reason=cp.R_GONE, would_block=True,
+                                   mode=cp.MODE_ENFORCE)
+
+    monkeypatch.setattr(cp, "preflight_and_record", _count)
+    assert await _preflight_allows_external_offer({"offer_id": "x"}) is True
+    assert called["n"] == 0
+
+
+async def test_shadow_publishes_the_offer_it_would_have_refused(monkeypatch):
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
+    assert await _allows(monkeypatch, outcome=cp.BLOCK, reason=cp.R_GONE,
+                         would_block=True, mode=cp.MODE_SHADOW) is True
+
+
+async def test_enforce_drops_an_offer_the_merchant_no_longer_sells(monkeypatch):
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "enforce")
+    assert await _allows(monkeypatch, outcome=cp.BLOCK, reason=cp.R_GONE,
+                         would_block=True, mode=cp.MODE_ENFORCE) is False
+
+
+async def test_enforce_publishes_a_verified_offer(monkeypatch):
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "enforce")
+    assert await _allows(monkeypatch, outcome=cp.OK, reason=cp.R_OK,
+                         would_block=False, mode=cp.MODE_ENFORCE) is True
+
+
+async def test_a_structural_exception_follows_the_operators_instruction(monkeypatch):
+    """`preflight` is total, so an exception here is structural. Under enforce the operator has
+    said refuse what cannot be verified, and an exception IS "could not verify"; under shadow a
+    measurement must never change what a buyer sees."""
+    from routes.agent_shop_gateway import _preflight_allows_external_offer
+
+    async def _raise(offer):
+        raise RuntimeError("structural")
+
+    monkeypatch.setattr(cp, "preflight_and_record", _raise)
+
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
+    assert await _preflight_allows_external_offer({"offer_id": "x"}) is True
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "enforce")
+    assert await _preflight_allows_external_offer({"offer_id": "x"}) is False
