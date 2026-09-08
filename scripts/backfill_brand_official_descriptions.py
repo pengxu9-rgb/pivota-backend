@@ -296,16 +296,15 @@ def _are_sibling_editions(a: tuple, b: tuple) -> bool:
     """
     (ha, ta), (hb, tb) = a, b
     base_a, base_b = _base_title(ta), _base_title(tb)
-    # At least one title must actually have CARRIED an edition tag: two products that merely
-    # have the same name (and handles "x" / "x-1") are not editions of each other. The handle
-    # signal never stands alone either -- `bundle`, `kit`, `set`, `gwp` are also the vocabulary
-    # of app-generated pages (`<handle>-bundle` with the product name interpolated into a
-    # template repeats exactly twice per product: a family of two, every time) -- but that is
-    # enforced ONCE, at family level, by `_is_one_product_family`'s exactly-one-base rule: a
-    # pair with no tagged member has two bases. A second check here would be a second guard
-    # on the same door, and two guards pin neither.
-    tagged = base_a != _norm_copy(ta) or base_b != _norm_copy(tb)
-    if base_a and base_a == base_b and tagged:
+    # "At least one title carried an edition tag" -- two products that merely share a name
+    # (handles "x" / "x-1") are not editions, and the handle signal never stands alone either:
+    # `bundle`, `kit`, `set`, `gwp` are also the vocabulary of app-generated pages
+    # (`<handle>-bundle` with the product name interpolated repeats exactly twice per product,
+    # a family of two every time). Both are enforced ONCE, at family level, by
+    # `_is_one_product_family`'s exactly-one-base rule: a pair with no tagged member has two
+    # bases. A per-pair check here would be a second guard on the same door, and two guards
+    # pin neither (the mutant that dropped it survived every test).
+    if base_a and base_a == base_b:
         return True
     return _handles_are_editions(ha, hb)
 
