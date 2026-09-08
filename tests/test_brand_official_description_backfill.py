@@ -258,14 +258,43 @@ def test_every_observed_edition_tag_is_stripped_the_same_way(tag):
     assert kept == {"a": _GLAZE, "b": _GLAZE}
 
 
-def test_a_handle_that_is_the_other_plus_an_edition_affix_is_a_sibling_even_without_titles():
-    """The second signal, for rows whose title is missing or was rewritten upstream."""
+def test_a_handle_affix_alone_never_makes_a_sibling():
+    """Post-merge review of #2127: the handle-only signal was the unmeasured half of the rule,
+    and its vocabulary (`bundle`, `kit`, `set`, `gwp`) is also what app-generated pages use.
+    Without a tagged title, an edition affix is not evidence."""
     for other in ("new-classic-glaze-lipstick-special-set", "summer-edition-new-classic-glaze-lipstick",
                   "new-classic-glaze-lipstick-9-9-exclusive"):
         kept = bf.drop_shared_boilerplate(
             {"a": _GLAZE, "b": _GLAZE}, _BLURB,
             handles={"a": "new-classic-glaze-lipstick", "b": other})
-        assert kept == {"a": _GLAZE, "b": _GLAZE}, other
+        assert kept == {}, other
+    # ...and WITH the tag, the affix still helps when the base titles differ.
+    kept = bf.drop_shared_boilerplate(
+        {"a": _GLAZE, "b": _GLAZE}, _BLURB,
+        handles={"a": "new-classic-glaze-lipstick", "b": "new-classic-glaze-lipstick-special-set"},
+        titles={"a": "New Classic Glaze Lipstick", "b": "[Special Set] New Classic Glaze Lipstick Set"})
+    assert kept == {"a": _GLAZE, "b": _GLAZE}
+
+
+def test_a_bundle_app_page_with_the_product_name_interpolated_is_STILL_boilerplate():
+    """A "Bundle & Save" app emits one `<handle>-bundle` page per product from one template:
+    every string repeats exactly twice, so the family cap never fires and the affix word is
+    in the edition list. Before the fix this was admitted and auto-published as brand copy."""
+    for pk, name in (("rosy", "Rosy Glow Lipstick"), ("velvet", "Velvet Matte Lipstick")):
+        meta = (f"Buy the {name} bundle and save 10% today at our store. Limited time offer, "
+                "while stocks last, free shipping on every bundle order.")
+        h = name.lower().replace(" ", "-")
+        kept = bf.drop_shared_boilerplate(
+            {pk: meta, pk + "_b": meta}, _BLURB,
+            handles={pk: h, pk + "_b": h + "-bundle"}, titles={pk: name, pk + "_b": name})
+        assert kept == {}, name
+    # gwp-<handle> is BOGOS's own prefix
+    assert bf.drop_shared_boilerplate(
+        {"x": _BOGOS, "gx": _BOGOS}, _BLURB,
+        handles={"x": "x", "gx": "gwp-x"}, titles={"x": "X", "gx": "X"}) == {}
+    # `-refill` behind an edition word is a different product, whichever side of `-kit`
+    assert not bf._are_sibling_editions(("x", "X"), ("x-kit-refill", "[Kit] X Refill"))
+    assert not bf._handles_are_editions("x", "x--set")
 
 
 def test_the_app_vendor_text_on_gwp_products_is_STILL_dropped():
@@ -283,12 +312,32 @@ def test_the_app_vendor_text_on_gwp_products_is_STILL_dropped():
 
 
 def test_a_family_over_the_cap_is_not_a_family_even_at_the_boundary():
-    cands = {f"pk{i}": _GLAZE for i in range(bf._MAX_EDITION_FAMILY + 1)}
-    handles = {k: f"tag-{k}-new-classic-glaze-lipstick" for k in cands}
-    titles = {k: f"[TAG {k}] New Classic Glaze Lipstick" for k in cands}
+    assert bf._MAX_EDITION_FAMILY == 4                       # the NUMBER, not just the method
+    cands = {f"pk{i}": _GLAZE for i in range(5)}
+    handles = {"pk0": "new-classic-glaze-lipstick",
+               **{f"pk{i}": f"tag-{i}-new-classic-glaze-lipstick" for i in range(1, 5)}}
+    titles = {"pk0": "New Classic Glaze Lipstick",
+              **{f"pk{i}": f"[TAG {i}] New Classic Glaze Lipstick" for i in range(1, 5)}}
     assert bf.drop_shared_boilerplate(cands, _BLURB, handles=handles, titles=titles) == {}
-    within = {k: v for k, v in list(cands.items())[: bf._MAX_EDITION_FAMILY]}
+    within = {k: v for k, v in list(cands.items())[:4]}      # base + 3 editions
     assert bf.drop_shared_boilerplate(within, _BLURB, handles=handles, titles=titles) == within
+
+
+def test_a_family_with_no_base_product_is_a_mechanism_at_any_size():
+    """Post-merge review of #2127: the BOGOS string on 2, 3 or 4 `gwp-*` pages all titled
+    `[GWP] Free Gift` was ADMITTED -- every pair had equal base titles and a tag -- and only the
+    cap at 5 refused it. Editions are editions OF something: exactly one untagged base."""
+    for n in (2, 3, 4):
+        cands = {f"pk{i}": _BOGOS for i in range(n)}
+        handles = {f"pk{i}": f"gwp-item-{i}_freegift" for i in range(n)}
+        titles = {f"pk{i}": "[GWP] Free Gift" for i in range(n)}
+        assert bf.drop_shared_boilerplate(cands, _BLURB, handles=handles, titles=titles) == {}, n
+    # two bases and one edition is not one product either
+    assert bf.drop_shared_boilerplate(
+        {"a": _GLAZE, "b": _GLAZE, "c": _GLAZE}, _BLURB,
+        handles={"a": "x", "b": "y", "c": "x-set"},
+        titles={"a": "New Classic Glaze Lipstick", "b": "New Classic Glaze Lipstick",
+                "c": "[Special Set] New Classic Glaze Lipstick"}) == {}
 
 
 def test_the_shop_blurb_is_STILL_dropped_when_siblings_share_it():
@@ -363,6 +412,20 @@ def test_a_title_echo_shared_by_siblings_is_STILL_an_echo():
         titles={"a": "Glossy Pink Makeup Bag + Deluxe Samples",
                 "b": "[Special Set] Glossy Pink Makeup Bag + Deluxe Samples"})
     assert kept == {}
+
+
+def test_the_echo_verdict_does_not_depend_on_candidate_order_when_two_rows_share_a_handle():
+    """Post-merge review of #2127: `seen` keeps the first (handle, title) per handle, and the
+    echo check read titles from `seen`, so a second row behind the same handle had its own
+    title judged only when it sorted first. Base b8e0b9929 caught the echo in both orders."""
+    echo = "Kylie Cosmetics - Glossy Pink Makeup Bag + Deluxe Samples"
+    titles = {"pk1": "A Completely Different Product Name For The Bag",
+              "pk2": "Glossy Pink Makeup Bag + Deluxe Samples"}
+    handles = {"pk1": "glossy-pink-makeup-bag", "pk2": "glossy-pink-makeup-bag"}
+    forward = bf.drop_shared_boilerplate({"pk1": echo, "pk2": echo}, _BLURB, handles=handles, titles=titles)
+    backward = bf.drop_shared_boilerplate({"pk2": echo, "pk1": echo}, _BLURB, handles=handles, titles=titles)
+    assert forward == backward
+    assert "pk2" not in forward                              # its own title's echo is caught
 
 
 # ---------------------------------------------------------------------------

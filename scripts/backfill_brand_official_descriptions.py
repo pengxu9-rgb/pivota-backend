@@ -265,7 +265,12 @@ def _base_title(title: Optional[str]) -> str:
 def _is_edition_affix(tokens: list) -> bool:
     """A short affix carrying an edition word: `special-set`, `summer-edition`, `9-9-exclusive`;
     not `refill`, not `1`, and not a six-word collaboration name (the title rule covers that)."""
-    return 0 < len(tokens) <= _MAX_AFFIX_TOKENS and any(t in _EDITION_WORDS for t in tokens)
+    if not tokens or any(t == "" for t in tokens):      # `x--set` is not an edition of `x`
+        return False
+    # The edition word is the affix's HEAD -- what the whole affix says the page is: `special
+    # -set`, `summer-edition`, `9-9-exclusive`. `kit-refill` says "refill", a different product
+    # that happens to mention a kit; an edition word buried before another noun is not one.
+    return len(tokens) <= _MAX_AFFIX_TOKENS and tokens[-1] in _EDITION_WORDS
 
 
 def _handles_are_editions(a: str, b: str) -> bool:
@@ -292,7 +297,13 @@ def _are_sibling_editions(a: tuple, b: tuple) -> bool:
     (ha, ta), (hb, tb) = a, b
     base_a, base_b = _base_title(ta), _base_title(tb)
     # At least one title must actually have CARRIED an edition tag: two products that merely
-    # have the same name (and handles "x" / "x-1") are not editions of each other.
+    # have the same name (and handles "x" / "x-1") are not editions of each other. The handle
+    # signal never stands alone either -- `bundle`, `kit`, `set`, `gwp` are also the vocabulary
+    # of app-generated pages (`<handle>-bundle` with the product name interpolated into a
+    # template repeats exactly twice per product: a family of two, every time) -- but that is
+    # enforced ONCE, at family level, by `_is_one_product_family`'s exactly-one-base rule: a
+    # pair with no tagged member has two bases. A second check here would be a second guard
+    # on the same door, and two guards pin neither.
     tagged = base_a != _norm_copy(ta) or base_b != _norm_copy(tb)
     if base_a and base_a == base_b and tagged:
         return True
@@ -308,6 +319,11 @@ def _is_one_product_family(pages: Dict[str, tuple]) -> bool:
     if not 1 < len(pages) <= _MAX_EDITION_FAMILY:
         return False
     members = list(pages.values())
+    # Exactly ONE member is the base product (an untagged title). A set of pages that are ALL
+    # tagged the same way -- four `[GWP] Free Gift` pages carrying an app's "do not delete"
+    # text -- has no product they are editions OF; that is a mechanism at small N.
+    if sum(1 for _h, t in members if _base_title(t) == _norm_copy(t)) != 1:
+        return False
     return all(_are_sibling_editions(members[i], members[j])
                for i in range(len(members)) for j in range(i + 1, len(members)))
 
@@ -376,9 +392,16 @@ def drop_shared_boilerplate(
     # Each page keeps its (handle, title) so a shared value can be asked whether its pages are
     # editions of ONE product.
     seen: Dict[str, Dict[str, tuple]] = {}
+    # EVERY candidate title per value, not one per handle: `seen` keeps the first row behind a
+    # handle, so a second row behind the same handle with a different title would have its own
+    # echo judged only when it happened to sort first -- an order-dependent verdict, which the
+    # #2097 determinism invariant forbids.
+    all_titles: Dict[str, set] = {}
     for pk, v in candidates.items():
         h = handles.get(pk, pk)
-        seen.setdefault(_norm_copy(v), {}).setdefault(h, (h, titles.get(pk)))
+        n = _norm_copy(v)
+        seen.setdefault(n, {}).setdefault(h, (h, titles.get(pk)))
+        all_titles.setdefault(n, set()).add(titles.get(pk) or "")
     # A blurb under the floor is treated as ABSENT, not as an armed comparison: no candidate that
     # cleared the floor can equal it, so it would disarm the refusal below while guarding nothing.
     blurb = _norm_copy(shop_blurb) if len(shop_blurb or "") >= MIN_DESC_LEN else ""
@@ -395,8 +418,7 @@ def drop_shared_boilerplate(
         # (3) the title with a brand bolted on. A value admitted as ONE product's copy is judged
         # against every name that product goes by: the base product's echo, rendered again on
         # its edition page, is still nothing but the title.
-        family_titles = [t for _h, t in seen[n].values()] or [titles.get(pk)]
-        if any(_is_title_echo(v, t) for t in family_titles):
+        if any(_is_title_echo(v, t) for t in all_titles[n] if t):
             continue
         kept[pk] = v
     return kept
