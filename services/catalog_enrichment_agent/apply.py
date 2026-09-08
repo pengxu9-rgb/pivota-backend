@@ -163,7 +163,14 @@ _SKU_UPSERT_SQL = """
                       -- because `NULL || jsonb` is NULL and the column is nullable.
                       sku_payload = COALESCE(catalog_skus.sku_payload, CAST('{}' AS jsonb))
                                     || EXCLUDED.sku_payload,
-                      readiness_tier = EXCLUDED.readiness_tier,
+                      -- `readiness_tier` IS INSERT-ONLY, deliberately (the promoter
+                      -- writes it the same way). This lane's plan rows carry
+                      -- 'referral_only', and the row we now land on may be one the
+                      -- promoter or the variant-identity backfill wrote as
+                      -- 'commerce_ready'; a `readiness_tier = EXCLUDED.readiness_tier`
+                      -- here would DOWNGRADE a purchasable SKU on every content
+                      -- re-sync. A tier is promoted by the lane that can prove the
+                      -- checkout, never by a description refresh.
                       updated_at = NOW()
                     """
 
@@ -172,10 +179,63 @@ _SKU_UPSERT_SQL = """
 #: a row-constructor `IN`, because the 4-tuple is matched in Python afterwards and
 #: this shape is one the PREPARE gate can plan. Every SKU a plan writes names a
 #: product_key, and a product's SKU count is small, so the over-read is bounded.
+#:
+#: `suppressed_at IS NULL` IS LOAD-BEARING. A suppressed row is one a withdrawal
+#: took out of supply; adopting its key would resurrect it under a fresh title and
+#: hang live offers off it. Excluding it here means the planned row is never
+#: rewritten onto it — and `_adopt_existing_sku_identities` then sees the identity
+#: as unheld, which is exactly the state `_SKU_SUPPRESSED_IDENTITY_SQL` below is
+#: read to explain (the identity index covers suppressed rows too, so the INSERT
+#: could not have landed anyway).
 _SKU_IDENTITY_LOOKUP_SQL = """
                 SELECT sku_key, merchant_id, platform, product_key, source_variant_id
                 FROM catalog_skus
                 WHERE product_key = ANY(:product_keys)
+                  AND suppressed_at IS NULL
+                """
+
+#: The MIRROR of the lookup above, from the key side: which planned `sku_key`s are
+#: already held, and under WHICH identity tuple. Needed because the two unique
+#: constraints fail in opposite directions — the identity lookup finds the row that
+#: holds our tuple, this one finds the row that holds our primary key while
+#: describing a different tuple (a legacy `source_variant_id = 'default'`, or a
+#: `catalog_skus.merchant_id` that drifted from its product's). That row is the one
+#: `_SKU_IDENTITY_HEAL_SQL` repairs. Top-level literal with a `= ANY(:sku_keys)`
+#: predicate so the repo PREPARE gate can plan it.
+_SKU_KEY_HOLDER_LOOKUP_SQL = """
+                SELECT sku_key, merchant_id, platform, product_key, source_variant_id
+                FROM catalog_skus
+                WHERE sku_key = ANY(:sku_keys)
+                  AND suppressed_at IS NULL
+                """
+
+#: The rows the two lookups above deliberately cannot see. Read ONLY to classify:
+#: a planned row whose identity (or whose key) is held by a SUPPRESSED row cannot
+#: be written at all — both unique constraints cover suppressed rows — so it is
+#: counted as `skus_skipped_suppressed_identity` and its offers are dropped, rather
+#: than sent into a doomed INSERT and mis-reported as an identity conflict.
+_SKU_SUPPRESSED_IDENTITY_SQL = """
+                SELECT sku_key, merchant_id, platform, product_key, source_variant_id
+                FROM catalog_skus
+                WHERE product_key = ANY(:product_keys)
+                  AND suppressed_at IS NOT NULL
+                """
+
+#: Heal a stored row whose IDENTITY TUPLE has drifted from the plan's, in place,
+#: keeping its primary key. The plan's tuple is the truth: `_prepare_seller_of_record`
+#: pins every plan row's merchant to the `catalog_products` row that already exists,
+#: and `product_key`/`platform`/`source_variant_id` come off the PDP being ingested.
+#: The stored row keeps its `sku_key`, so the live `catalog_offers` rows keyed on it
+#: (there is no FK) stay attached to a row that exists — which is the whole reason
+#: this is an UPDATE of the tuple rather than a re-key of the row.
+_SKU_IDENTITY_HEAL_SQL = """
+                UPDATE catalog_skus
+                SET merchant_id = :merchant_id,
+                    platform = :platform,
+                    product_key = :product_key,
+                    source_variant_id = :source_variant_id,
+                    updated_at = NOW()
+                WHERE sku_key = :sku_key
                 """
 
 _OFFER_UPSERT_SQL = """
@@ -371,102 +431,343 @@ async def _adopt_existing_sku_identities(
     offers: list,
     *,
     database: Any,
-) -> Dict[str, int]:
-    """Make each planned SKU row agree with the row that ALREADY holds its identity.
+) -> tuple[list, list, Dict[str, int]]:
+    """Reconcile every planned catalog_skus row with the rows that ALREADY hold its
+    key or its identity, BEFORE the upsert runs. Returns
+    `(skus, offers, counts)` — the lists are FILTERED, never the caller's originals.
 
     catalog_skus is keyed twice: by `sku_key` (PK) and by the identity tuple
     (merchant_id, platform, product_key, source_variant_id) —
-    `idx_catalog_skus_source_identity_v2`. Two writers spell the same identity
-    with different keys: this lane's `ingestion.derive_variant_sku_key` produces
-    `<pk>::v:<vid>`, `services/catalog_variant_promoter._derive_sku_key` produces
-    `<pk>::v::<vid>`. Where the promoter's row already exists, inserting ours is
-    not a second variant, it is a rival spelling of the same one.
+    `idx_catalog_skus_source_identity_v2`. Postgres INFERS one arbiter from an
+    `ON CONFLICT` clause and never falls through to the other, so whichever
+    constraint the statement does not name is a hard 23505. Both directions are
+    live: two writers spell the same identity with different keys (this lane's
+    `ingestion.derive_variant_sku_key` gives `<pk>::v:<vid>`,
+    `services/catalog_variant_promoter._derive_sku_key` gives `<pk>::v::<vid>`),
+    and stored rows carry tuples that have since drifted from their product's
+    (a legacy `source_variant_id = 'default'`, a `merchant_id` re-resolved by W2).
 
-    So we resolve the planned tuples in ONE query and, where the identity is held
-    under a DIFFERENT key, rewrite the PLANNED row to that key and re-key the
-    offers that named it. Adoption -- not renaming the stored row -- is the only
-    safe direction: catalog_offers has no foreign key to catalog_skus, so a
-    `sku_key` rewrite in the DO UPDATE would silently orphan the live offers
-    hanging off the 4,286 rows the 2026-09-08 variant-identity backfill adopted.
+    FOUR OUTCOMES, in this precedence:
+
+    (c) the plan's key is held by a row with a DIFFERENT tuple **and** the plan's
+        identity is held by ANOTHER row. Two real rows, and no move satisfies both
+        constraints: adopting the identity holder would leave the key holder still
+        claiming a key this product derives, healing the key holder's tuple would
+        collide with the identity holder. Counted `skus_identity_conflict`, logged
+        with both rows, and REFUSED — the only outcome that does not guess which of
+        two real rows the plan means.
+    (a) the identity is held by a live row under a DIFFERENT key → adopt that key.
+        Adoption, not renaming the stored row, is the only safe direction:
+        catalog_offers has no foreign key to catalog_skus, so a `sku_key` rewrite
+        would silently orphan the live offers hanging off the 4,286 rows the
+        2026-09-08 variant-identity backfill adopted.
+    (d) the identity (or the key) is held by a SUPPRESSED row. Both unique
+        constraints cover suppressed rows, so the INSERT cannot land; and writing
+        onto a row a withdrawal took out of supply would resurrect it. The single
+        guard is `AND suppressed_at IS NULL` in `_SKU_IDENTITY_LOOKUP_SQL` — a
+        suppressed row is never a candidate for (a) — and
+        `_SKU_SUPPRESSED_IDENTITY_SQL` is read only to say WHY the identity came
+        back unheld, so the outcome is `skus_skipped_suppressed_identity` rather
+        than a mis-reported identity conflict.
+    (b) the identity is unheld and the plan's key is held by a live row with a
+        DIFFERENT tuple → HEAL that row's tuple to the plan's, in place, keeping
+        its key (`_SKU_IDENTITY_HEAL_SQL`). The plan's tuple is the truth: it is
+        pinned to the existing `catalog_products` row by `_prepare_seller_of_record`.
+        Without this the row 23505s on INSERT, is counted-and-skipped FOREVER, and
+        its offers are written onto a stale row — which is precisely what
+        `ON CONFLICT (sku_key) DO UPDATE` used to refresh for free.
 
     THE OFFER ID LANDS ON THE BACKFILL'S OWN. Both writers derive it from the same
     triple: `derive_offer_id(product_key, sku_key, destination)`. Ingestion stores
     that destination in `source_ref` (`ingestion._build_offer_inserts`), and
     `scripts/backfill_variant_identity_skus.py` derives its offer id from
     `(product_key, written_key, destination)` where `written_key` is the ADOPTED
-    key and the same destination is written to `source_ref`. Re-keying to the
-    adopted key with the offer's own `source_ref` therefore reproduces the
-    backfill's offer_id exactly, so the offer UPSERTs that row instead of standing
-    a second, differently-keyed offer beside it.
+    key. Re-keying to the adopted key with the offer's own `source_ref` therefore
+    reproduces the backfill's offer_id exactly, so the offer UPSERTs that row
+    instead of standing a second, differently-keyed offer beside it.
 
-    Best-effort by construction: a failed lookup logs and changes nothing, which
-    leaves the pre-existing behaviour (the upsert's own conflict handling) intact.
+    An offer whose SKU was refused is DROPPED (`offers_dropped_for_refused_sku`):
+    catalog_offers has no FK, so an offer naming a sku_key we did not write is a
+    fake offer, not a pending one.
+
+    Best-effort by construction: a failed lookup logs and adopts nothing, which
+    leaves the pre-existing behaviour (the upsert's own conflict handling plus the
+    executors' refused-row filter) intact.
     """
-    counts = {"skus_adopted_existing_identity": 0, "offers_rekeyed_to_adopted_sku": 0}
+    counts = {
+        "skus_adopted_existing_identity": 0,
+        "offers_rekeyed_to_adopted_sku": 0,
+        "skus_identity_healed": 0,
+        "skus_identity_conflict": 0,
+        "skus_skipped_suppressed_identity": 0,
+        "skus_deduped_same_identity": 0,
+        "offers_dropped_for_refused_sku": 0,
+    }
     if not skus:
-        return counts
+        return skus, offers, counts
+
+    #: planned sku_key -> the key the row will actually be written under. Chained,
+    #: because a de-duplicated row's survivor may itself go on to adopt another key.
+    remap: Dict[str, str] = {}
+    #: planned sku_keys whose row will NOT be written at all.
+    refused: set = set()
+
+    # 1. DE-DUPLICATE BY IDENTITY. Two planned rows carrying the same tuple are one
+    #    SKU: the second silently UPDATEs the first through the identity arbiter, so
+    #    `counts["skus"]` would report two writes where one row exists. Keep the
+    #    first, count the rest, and point the loser's offers at the survivor's key
+    #    (same identity == same row, so those offers are not orphans).
+    deduped: list = []
+    first_key_for_identity: Dict[tuple, str] = {}
+    for sku in skus:
+        identity = _identity_tuple(sku)
+        planned_key = str(sku.get("sku_key") or "")
+        kept_key = first_key_for_identity.get(identity)
+        if kept_key is None:
+            first_key_for_identity[identity] = planned_key
+            deduped.append(sku)
+            continue
+        counts["skus_deduped_same_identity"] += 1
+        if planned_key and planned_key != kept_key:
+            remap[planned_key] = kept_key
+        logger.info(
+            "apply_ingest_plan: two planned SKUs share identity (merchant_id=%s, "
+            "platform=%s, product_key=%s, source_variant_id=%s) — keeping sku_key=%s, "
+            "dropping the duplicate planned %s (its offers follow the survivor)",
+            sku.get("merchant_id"), sku.get("platform"), sku.get("product_key"),
+            sku.get("source_variant_id"), kept_key, planned_key,
+        )
+    skus = deduped
+
     product_keys = sorted({
         str(row.get("product_key") or "") for row in skus if row.get("product_key")
     })
+    planned_keys = sorted({
+        str(row.get("sku_key") or "") for row in skus if row.get("sku_key")
+    })
     if not product_keys:
-        return counts
+        return skus, _resolve_offer_keys(offers, remap, refused, counts), counts
+
     try:
-        rows = await database.fetch_all(
+        identity_rows = await database.fetch_all(
             _SKU_IDENTITY_LOOKUP_SQL, {"product_keys": product_keys}
+        )
+        key_rows = await database.fetch_all(
+            _SKU_KEY_HOLDER_LOOKUP_SQL, {"sku_keys": planned_keys}
+        )
+        suppressed_rows = await database.fetch_all(
+            _SKU_SUPPRESSED_IDENTITY_SQL, {"product_keys": product_keys}
         )
     except Exception as exc:  # noqa: BLE001 — the upsert still has its own conflict handling
         logger.warning(
             "sku identity pre-resolve failed for %d product_key(s) — writing planned "
             "keys unchanged: %s", len(product_keys), str(exc)[:200],
         )
-        return counts
-
-    def _identity(row: Dict[str, Any]) -> tuple:
-        return (
-            str(row.get("merchant_id") or ""),
-            str(row.get("platform") or ""),
-            str(row.get("product_key") or ""),
-            str(row.get("source_variant_id") or ""),
-        )
+        return skus, _resolve_offer_keys(offers, remap, refused, counts), counts
 
     held_by_identity: Dict[tuple, str] = {}
-    for row in rows or []:
+    for row in identity_rows or []:
         data = dict(row)
-        held_by_identity[_identity(data)] = str(data.get("sku_key") or "")
-    if not held_by_identity:
-        return counts
+        held_by_identity[_identity_tuple(data)] = str(data.get("sku_key") or "")
+    identity_of_key: Dict[str, tuple] = {}
+    for row in key_rows or []:
+        data = dict(row)
+        identity_of_key[str(data.get("sku_key") or "")] = _identity_tuple(data)
+    suppressed_identities: set = set()
+    suppressed_keys: set = set()
+    for row in suppressed_rows or []:
+        data = dict(row)
+        suppressed_identities.add(_identity_tuple(data))
+        suppressed_keys.add(str(data.get("sku_key") or ""))
 
-    adopted: Dict[str, str] = {}
+    kept: list = []
     for sku in skus:
         planned_key = str(sku.get("sku_key") or "")
-        held_key = held_by_identity.get(_identity(sku))
-        if not held_key or held_key == planned_key:
-            continue
-        logger.info(
-            "apply_ingest_plan: identity (merchant_id=%s, platform=%s, product_key=%s, "
-            "source_variant_id=%s) is already held by sku_key=%s — adopting it instead "
-            "of inserting the planned %s",
-            sku.get("merchant_id"), sku.get("platform"), sku.get("product_key"),
-            sku.get("source_variant_id"), held_key, planned_key,
+        identity = _identity_tuple(sku)
+        held_key = held_by_identity.get(identity)
+        holder_identity = identity_of_key.get(planned_key)
+        key_taken_by_another = (
+            holder_identity is not None and holder_identity != identity
         )
-        sku["sku_key"] = held_key
-        adopted[planned_key] = held_key
-        counts["skus_adopted_existing_identity"] += 1
-    if not adopted:
-        return counts
 
-    for offer in offers:
-        held_key = adopted.get(str(offer.get("sku_key") or ""))
-        if not held_key:
+        # (c) both constraints point at DIFFERENT existing rows.
+        if held_key and held_key != planned_key and key_taken_by_another:
+            counts["skus_identity_conflict"] += 1
+            refused.add(planned_key)
+            logger.error(
+                "catalog_skus row refused (identity conflict): planned sku_key=%s is "
+                "held by identity=%s while this row's identity (merchant_id=%s, "
+                "platform=%s, product_key=%s, source_variant_id=%s) is held by "
+                "sku_key=%s — two existing rows, no move satisfies both unique "
+                "constraints; row skipped, its offers dropped",
+                planned_key, holder_identity, sku.get("merchant_id"),
+                sku.get("platform"), sku.get("product_key"),
+                sku.get("source_variant_id"), held_key,
+            )
             continue
-        offer["sku_key"] = held_key
-        offer["offer_id"] = derive_offer_id(
-            str(offer.get("product_key") or ""),
-            held_key,
-            str(offer.get("source_ref") or ""),
+
+        # (a) the identity is already held, under another key — adopt it.
+        if held_key:
+            if held_key != planned_key:
+                logger.info(
+                    "apply_ingest_plan: identity (merchant_id=%s, platform=%s, "
+                    "product_key=%s, source_variant_id=%s) is already held by "
+                    "sku_key=%s — adopting it instead of inserting the planned %s",
+                    sku.get("merchant_id"), sku.get("platform"),
+                    sku.get("product_key"), sku.get("source_variant_id"),
+                    held_key, planned_key,
+                )
+                sku["sku_key"] = held_key
+                remap[planned_key] = held_key
+                counts["skus_adopted_existing_identity"] += 1
+            kept.append(sku)
+            continue
+
+        # (d) the identity looked UNHELD only because a SUPPRESSED row holds it (or
+        #     holds our key). Both unique constraints cover suppressed rows, so the
+        #     INSERT cannot land — and writing onto a row a withdrawal took out of
+        #     supply would resurrect it. The GUARD is the `suppressed_at IS NULL` in
+        #     `_SKU_IDENTITY_LOOKUP_SQL`, which is why this branch sits BELOW the
+        #     adoption above: `held_key` can only ever name a live row, and this
+        #     lookup exists to EXPLAIN the resulting hole, not to close it twice.
+        if identity in suppressed_identities or planned_key in suppressed_keys:
+            counts["skus_skipped_suppressed_identity"] += 1
+            refused.add(planned_key)
+            logger.warning(
+                "catalog_skus row refused (suppressed row holds it): planned "
+                "sku_key=%s, identity=(merchant_id=%s, platform=%s, product_key=%s, "
+                "source_variant_id=%s) — a suppressed row holds that key or identity "
+                "and both unique constraints cover suppressed rows; row skipped, its "
+                "offers dropped rather than hung off a withdrawn SKU",
+                planned_key, sku.get("merchant_id"), sku.get("platform"),
+                sku.get("product_key"), sku.get("source_variant_id"),
+            )
+            continue
+
+        # (b) the identity is unheld and our key is held by a drifted row — heal it.
+        if key_taken_by_another:
+            healed = await _heal_drifted_sku_identity(
+                sku, planned_key, holder_identity, database=database
+            )
+            if healed:
+                counts["skus_identity_healed"] += 1
+        kept.append(sku)
+
+    return kept, _resolve_offer_keys(offers, remap, refused, counts), counts
+
+
+def _identity_tuple(row: Dict[str, Any]) -> tuple:
+    """The 4 columns `idx_catalog_skus_source_identity_v2` is built on, stringified
+    so a planned row (Python str) and a fetched row compare equal."""
+    return (
+        str(row.get("merchant_id") or ""),
+        str(row.get("platform") or ""),
+        str(row.get("product_key") or ""),
+        str(row.get("source_variant_id") or ""),
+    )
+
+
+async def _heal_drifted_sku_identity(
+    sku: Dict[str, Any],
+    planned_key: str,
+    stored_identity: tuple,
+    *,
+    database: Any,
+) -> bool:
+    """Point a stored row's identity tuple back at the plan's, keeping its key.
+
+    Best-effort: a failed UPDATE leaves the planned row alone, so the upsert's own
+    23505 handling (counted, skipped, offers dropped) still applies — the same
+    outcome as before this healing existed."""
+    try:
+        await database.execute(
+            _SKU_IDENTITY_HEAL_SQL,
+            {
+                "sku_key": planned_key,
+                "merchant_id": sku.get("merchant_id"),
+                "platform": sku.get("platform"),
+                "product_key": sku.get("product_key"),
+                "source_variant_id": sku.get("source_variant_id"),
+            },
         )
-        counts["offers_rekeyed_to_adopted_sku"] += 1
-    return counts
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "catalog_skus identity heal failed for sku_key=%s (stored identity %s "
+            "-> planned (merchant_id=%s, platform=%s, product_key=%s, "
+            "source_variant_id=%s)) — leaving the row to the upsert's own conflict "
+            "handling: %s",
+            planned_key, stored_identity, sku.get("merchant_id"),
+            sku.get("platform"), sku.get("product_key"),
+            sku.get("source_variant_id"), str(exc)[:200],
+        )
+        return False
+    logger.warning(
+        "catalog_skus identity healed: sku_key=%s carried %s, re-pointed to the "
+        "plan's (merchant_id=%s, platform=%s, product_key=%s, source_variant_id=%s) "
+        "— the plan's tuple is pinned to catalog_products by "
+        "_prepare_seller_of_record, and the key is kept so live offers stay attached",
+        planned_key, stored_identity, sku.get("merchant_id"), sku.get("platform"),
+        sku.get("product_key"), sku.get("source_variant_id"),
+    )
+    return True
+
+
+def _resolve_offer_keys(
+    offers: list, remap: Dict[str, str], refused: set, counts: Dict[str, int]
+) -> list:
+    """Point every offer at the key its SKU was actually written under, and drop the
+    offers of SKUs that were not written at all."""
+    if not remap and not refused:
+        return offers
+    kept: list = []
+    for offer in offers:
+        planned_key = str(offer.get("sku_key") or "")
+        target = planned_key
+        seen: set = set()
+        while target in remap and target not in seen:
+            seen.add(target)
+            target = remap[target]
+        if target in refused or planned_key in refused:
+            counts["offers_dropped_for_refused_sku"] += 1
+            logger.warning(
+                "catalog_offers row dropped: its SKU (sku_key=%s) was not written "
+                "— an offer naming a sku_key that does not exist is a fake offer",
+                planned_key,
+            )
+            continue
+        if target != planned_key:
+            offer["sku_key"] = target
+            offer["offer_id"] = derive_offer_id(
+                str(offer.get("product_key") or ""),
+                target,
+                str(offer.get("source_ref") or ""),
+            )
+            counts["offers_rekeyed_to_adopted_sku"] += 1
+        kept.append(offer)
+    return kept
+
+
+def _drop_offers_of_refused_skus(
+    offers: list, refused_sku_keys: set, counts: Dict[str, int]
+) -> list:
+    """Post-write filter for the SKUs the pre-resolve could not foresee (a race, a
+    suppressed row under another product's key, any write failure at all). Same
+    rule as `_filter_children_of_skipped` applies to a skipped PDP: catalog_offers
+    has NO foreign key, so an offer whose SKU was refused is an orphan the database
+    will never catch."""
+    if not refused_sku_keys:
+        return offers
+    kept = [o for o in offers if str(o.get("sku_key") or "") not in refused_sku_keys]
+    dropped = len(offers) - len(kept)
+    if dropped:
+        counts["offers_dropped_for_refused_sku"] = (
+            counts.get("offers_dropped_for_refused_sku", 0) + dropped
+        )
+        logger.warning(
+            "catalog_offers: %d offer(s) dropped because their SKU was refused by "
+            "the write (sku_key(s)=%s)", dropped, sorted(refused_sku_keys),
+        )
+    return kept
 
 
 def _is_unique_violation(exc: BaseException) -> bool:
@@ -779,13 +1080,19 @@ async def apply_ingest_plan(
         skipped_product_keys, skus=skus, offers=offers, seeds=seeds
     )
 
-    # 2b. Adopt any identity another writer already holds under a different
-    #     sku_key, and re-key that SKU's offers, BEFORE the upserts run.
+    # 2b. Reconcile every planned SKU with the rows that already hold its key or
+    #     its identity (adopt / heal / refuse), and re-key or drop its offers,
+    #     BEFORE the upserts run.
     counts["skus_identity_conflict"] = 0
-    counts.update(await _adopt_existing_sku_identities(skus, offers, database=database))
+    counts["offers_dropped_for_refused_sku"] = 0
+    skus, offers, adoption_counts = await _adopt_existing_sku_identities(
+        skus, offers, database=database
+    )
+    counts.update(adoption_counts)
 
     async with database.transaction():
         # 3. catalog_skus — INSERT one synthetic 'canonical' SKU per PDP.
+        refused_sku_keys: set = set()
         for sku in skus:
             try:
                 # SAVEPOINT per row. The residual dual-unique trap raises 23505,
@@ -798,6 +1105,13 @@ async def apply_ingest_plan(
                 counts["skus"] += 1
             except Exception as exc:  # noqa: BLE001
                 _note_sku_write_failure(exc, sku, counts)
+                refused_sku_keys.add(str(sku.get("sku_key") or ""))
+
+        # A SKU that was refused must not leave an offer behind. catalog_offers has
+        # NO foreign key to catalog_skus, so an offer naming a sku_key we did not
+        # write is not a pending offer, it is a fake one — the same orphan rule
+        # `_filter_children_of_skipped` applies to the children of a skipped PDP.
+        offers = _drop_offers_of_refused_skus(offers, refused_sku_keys, counts)
 
         accepted_offers, skip_reasons, _rejected_offers = await guard_catalog_offer_rows(offers)
         if skip_reasons:
@@ -948,10 +1262,22 @@ async def _apply_ingest_plan_batched(
     #    only the genuinely-conflicting row is skipped; `on_row_error` is where that
     #    row's SQLSTATE gets classified and counted.
     counts["skus_identity_conflict"] = 0
-    counts.update(await _adopt_existing_sku_identities(skus, offers, database=database))
-    counts["skus"], _, _ = await bulk_upsert(
+    counts["offers_dropped_for_refused_sku"] = 0
+    skus, offers, adoption_counts = await _adopt_existing_sku_identities(
+        skus, offers, database=database
+    )
+    counts.update(adoption_counts)
+    counts["skus"], _, sku_skipped_rows = await bulk_upsert(
         database, _SKU_UPSERT_SQL, skus, label="skus",
         on_row_error=lambda row, exc: _note_sku_write_failure(exc, row, counts),
+    )
+    # `bulk_upsert`'s THIRD return is the orphan guard — the same use the PDP stage
+    # above makes of it via `_filter_children_of_skipped`. A SKU the replay skipped
+    # was not written, so its offers would name a sku_key that does not exist.
+    offers = _drop_offers_of_refused_skus(
+        offers,
+        {str(r.get("sku_key") or "") for r in sku_skipped_rows},
+        counts,
     )
 
     # 4. catalog_offers — SAME guard + audit as the per-row path.
