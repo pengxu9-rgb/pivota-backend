@@ -593,6 +593,13 @@ def _collect_us_market_capture() -> List[Tuple[str, str]]:
     return [
         (f"{origin}.{name}", getattr(module, name)) for name in (
             "CANDIDATES_SQL", "OFFER_UPSERT_SQL",
+            # The SKU precondition, added when this lane was found to have
+            # minted 529 live orphan offers. MINT_CANONICAL_SKU_SQL is an
+            # INSERT ... SELECT with an ON CONFLICT on a FOUR-column index and a
+            # WHERE on the DO UPDATE, and SUPPRESSED_IDENTITY_PROBE_SQL compares
+            # two columns of the same row inside `= ANY(:binds)` — both are
+            # shapes Postgres can refuse to plan and SQLite types not at all.
+            "MINT_CANONICAL_SKU_SQL", "SUPPRESSED_IDENTITY_PROBE_SQL",
         )
     ]
 
@@ -760,7 +767,7 @@ _MIN_STATEMENTS = {
     "scripts/report_agent_depth_scorecard.py": 6,
     "scripts/report_inci_ingestion_quality.py": 6,
     "scripts/reattribute_orphaned_enrichment.py": 8,
-    "scripts/capture_us_market_offers.py": 2,
+    "scripts/capture_us_market_offers.py": 4,
     "scripts/dispose_sentinel_orphans.py": 8,
     "scripts/report_quality_scale_population.py": 5,
     "scripts/repair_a9_4_orphaned_quality_snapshots.py": 3,

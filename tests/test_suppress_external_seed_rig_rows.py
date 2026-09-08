@@ -66,6 +66,12 @@ class _Db:
         if "FROM product_group_members" in sql and "ANY(:pids)" in sql:
             pids = set(params["pids"])
             return [r for r in self.pgm_banned if r["platform_product_id"] in pids]
+        # The offer cascade. It is an UPDATE ... RETURNING, so it arrives on
+        # fetch_all rather than execute — `databases` + asyncpg gives no rowcount
+        # and the ids are the only way to count what moved. A fake that returned
+        # [] here would report "0 offers cascaded" for a run that gated them all.
+        if "UPDATE catalog_offers" in sql and "suppressed_at = NOW()" in sql:
+            return [{"offer_id": f"offer::{pk}"} for pk in params["product_keys"]]
         return []
 
     async def fetch_one(self, sql, params=None):
@@ -236,6 +242,17 @@ class TestApply:
         report = json.loads(out[out.rindex('{\n  "run_id"'):])
         assert report["sentinel_rows_remaining_total"] == 0
         assert report["pgm"] == {"moved": 1, "retired": 0}
+        # 6) the tombstone CASCADED to the rows' offers. catalog_offers carries
+        # its own suppressed_at and every offer-grain read lane filters on THAT
+        # column, so a retired rig row whose offers stay live is still priced
+        # supply. Keyed on the product keys, not on merchant_id — the re-key on
+        # the line after the tombstone moves these rows off the sentinel bucket.
+        cascade_sql = [f for f in db.fetched
+                       if f.startswith("UPDATE catalog_offers SET suppressed_at = NOW()")]
+        assert len(cascade_sql) == 1
+        assert "suppression_reason = CAST(:reason AS text)" in cascade_sql[0]
+        assert "suppressed_at IS NULL" in cascade_sql[0]
+        assert report["offers_cascaded"] == len(self._db().rows)
 
     @pytest.mark.asyncio
     async def test_cascade_residue_rolls_the_whole_step_back(self, wire):

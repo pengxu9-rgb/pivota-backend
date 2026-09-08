@@ -37,6 +37,38 @@ SAFETY RULES:
     --apply would write. --apply also republishes each touched content_key via
     the canonical refresh and recomputes serving eligibility.
 
+THE SKU PRECONDITION (added 2026-09-08). This lane wrote 529 LIVE ORPHAN OFFERS
+on prod — rows naming `<product_key>::canonical` with no `catalog_skus` row
+behind it — because `plan_offer` DERIVES that sku_key and the upsert then
+ASSUMES the mirror already wrote it. It often has not: the candidate query
+selects any product carrying a foreign-priced offer, and several lanes
+(Path C ingest, the crawl onboarder, the enrichment apply) produce a
+catalog_products row and a catalog_offers row without ever minting the mirror's
+canonical SKU spelling. An orphan offer is invisible to every sku-joined read
+lane (`pivot_query_service` INNER JOINs `catalog_skus`) while still counting as
+supply to everything that reads `catalog_offers` alone.
+
+THE FIX IS TO WRITE THE SKU, NOT TO REFUSE THE OFFER, and the choice is
+different from the one `scripts/attach_retailer_offer.py` makes. Here the SKU is
+fully derivable from data we already hold and have already validated: the
+catalog_products row supplies merchant_id, platform, source_product_id, title
+and source_domain, and the identity is the product itself (one canonical
+"the product is the variant" SKU, `source_variant_id = product_key`) — the same
+shape ingestion writes. Refusing instead would drop US-buyability for the entire
+`no_us_offer` cohort this lane exists to recover, over a row we can write
+correctly. `attach_retailer_offer` refuses because its product_key is
+operator-supplied and its merchant is the RETAILER, so it has no such identity
+to mint; see that file.
+
+`ON CONFLICT` targets the IDENTITY INDEX (merchant_id, platform, product_key,
+source_variant_id) and never `(sku_key)` — #2135's rationale: the identity tuple
+is what "the same variant" means, so an existing row under another lane's
+spelling must be ADOPTED (its sku_key comes back from RETURNING and the offer is
+written against THAT key), not shadowed by a rival row for the same variant.
+When the mint returns nothing the identity exists on a SUPPRESSED row, and the
+offer is REFUSED and counted as `offers_refused_no_sku` — attaching live supply
+to a gated identity creates supply nothing can surface.
+
 Usage
 -----
   python3 scripts/capture_us_market_offers.py                 # dry run
@@ -58,13 +90,29 @@ from urllib.parse import urlsplit
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from db.database import database  # noqa: E402
+from services.catalog_offer_writer_guard import (  # noqa: E402
+    ORPHAN_NO_SKU,
+    WriterAuditAccumulator,
+    fetch_existing_catalog_sku_keys,
+    guard_catalog_offer_rows,
+    make_batch_id,
+    write_writer_audit_log,
+)
 from services.external_offer_dual_write import (  # noqa: E402
     derive_mirror_sku_key,
 )
+from services.variant_identity import PRODUCT_DERIVED  # noqa: E402
 
 REFRESH_SOURCE = "us_market_offer_capture"
 SOURCE_SYSTEM = "us_market_capture"
 OFFER_ID_PREFIX = "offer:us_market:"
+
+#: One line, fenced. `scripts/ops/run_oneoff_job.sh` reads a job's output from
+#: Cloud Logging, which DROPS LINES — a multi-line report arrives with arbitrary
+#: keys missing and nothing saying so. The per-domain progress prints stay (they
+#: are progress, not the result); this line is the result.
+REPORT_BEGIN = "USMKTREPORT>>>"
+REPORT_END = "<<<USMKTREPORT"
 REQUEST_GAP_SECONDS = 0.6
 # Re-verify the session is still presenting USD every N product reads; a
 # decayed localization cookie would silently relabel home-currency prices as
@@ -131,6 +179,58 @@ OFFER_UPSERT_SQL = """
       -- written before a re-key keeps the stale merchant forever.
       merchant_id = EXCLUDED.merchant_id,
       updated_at = NOW()
+"""
+
+
+# The canonical SKU this lane's offer needs behind it, written in the SHAPE
+# INGESTION WRITES (services/external_offer_dual_write + the Path B mirror):
+# one synthetic "the product is the variant" row per product, with
+# `source_variant_id = product_key`.
+#
+# INSERT ... SELECT FROM catalog_products for the same reason the offer upsert
+# does it: every identity column is read from the catalog row AT WRITE TIME, so a
+# product that was re-keyed (or vanished) during the minutes of HTTP probing
+# between the scan and the write yields NO row rather than a SKU minted under a
+# stale seller. `merchant_id`, `platform` and `source_product_id` are NOT NULL on
+# catalog_skus, so a bind-carried snapshot of them is exactly the ADR-009 orphan
+# this lane already produced once.
+#
+# ON CONFLICT targets the 4-column identity index, never the sku_key primary key
+# — see the module docstring. DO UPDATE touches only `updated_at`: adopting
+# another lane's existing identity row must not restamp its title, payload or
+# provenance with ours. The WHERE makes a SUPPRESSED identity return NOTHING, and
+# the caller turns that into a refusal.
+MINT_CANONICAL_SKU_SQL = """
+    INSERT INTO catalog_skus
+      (sku_key, product_key, merchant_id, platform,
+       source_product_id, source_variant_id, source_domain,
+       sku, barcode, title, currency, image_url,
+       visible_attributes, visible_option_labels, ingredient_ids,
+       sku_payload, readiness_tier, updated_at)
+    SELECT
+       CAST(:sku_key AS text), cp.product_key, cp.merchant_id, cp.platform,
+       cp.source_product_id, cp.product_key, cp.source_domain,
+       NULL, NULL, cp.title, 'USD', NULL,
+       '{}'::jsonb, '[]'::jsonb, '[]'::jsonb,
+       CAST(:sku_payload AS jsonb), 'referral_only', NOW()
+      FROM catalog_products cp
+     WHERE cp.product_key = CAST(:product_key AS text)
+    ON CONFLICT (merchant_id, platform, product_key, source_variant_id) DO UPDATE SET
+       updated_at = NOW()
+     WHERE catalog_skus.suppressed_at IS NULL
+       AND catalog_skus.suppression_reason IS NULL
+    RETURNING sku_key
+"""
+
+# The DRY-RUN twin of the refusal above. A plan that reported only "N SKUs to
+# mint" would silently promise offers that --apply then refuses, so the identities
+# already sitting on a suppressed row are counted read-only here too.
+SUPPRESSED_IDENTITY_PROBE_SQL = """
+    SELECT s.product_key
+      FROM catalog_skus s
+     WHERE s.product_key = ANY(:product_keys)
+       AND s.source_variant_id = s.product_key
+       AND (s.suppressed_at IS NOT NULL OR s.suppression_reason IS NOT NULL)
 """
 
 
@@ -328,6 +428,110 @@ async def capture_domain(domain: str, candidates: List[Dict[str, Any]],
             "planned": planned, "skipped": skipped}
 
 
+def _sku_payload(product_key: str, batch_id: str) -> str:
+    """The provenance blob for a minted canonical SKU.
+
+    `variant_id_provenance` is PRODUCT_DERIVED and nothing else: this identity is
+    the product key, not an id the merchant issued. Stamping it `merchant_issued`
+    to make the provenance share look better is the exact fabrication the
+    `variant_id_provenance` vocabulary exists to prevent, and the new
+    `skus_without_merchant_issued_identity_share` invariant would then read a
+    number this writer invented.
+    """
+    return json.dumps(
+        {
+            "synthetic_canonical_variant": True,
+            "source": SOURCE_SYSTEM,
+            "variant_id_provenance": PRODUCT_DERIVED,
+            "batch_id": batch_id,
+        },
+        ensure_ascii=False,
+    )
+
+
+async def ensure_skus_for_planned(
+    planned: List[Dict[str, Any]], *, apply: bool, batch_id: str,
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """Guarantee every planned offer names an EXISTING catalog_skus row.
+
+    Returns the rows that may be written (with `sku_key` rewritten to whatever
+    the identity actually resolved to) plus the counters.
+
+    THE ORDER IS: look, then mint only what is missing, then let the shared guard
+    have the last word.
+
+      1. `fetch_existing_catalog_sku_keys` — the planned key may already exist,
+         in which case there is nothing to mint. This also avoids the one case
+         `ON CONFLICT` cannot help with: a row that already OWNS the sku_key
+         under a DIFFERENT identity tuple (a re-key moved the merchant) would hit
+         the sku_key PRIMARY KEY, which is not the arbiter, and raise.
+      2. mint the rest, adopting the returned key.
+      3. `guard_catalog_offer_rows`, the shared chokepoint that already knows how
+         to say ORPHAN_NO_SKU. THIS LANE BYPASSED IT ENTIRELY — it builds and
+         executes its own INSERT and never went near the guard, which is why the
+         guard's existence did not stop 529 live orphans. Running it here as the
+         final gate means a future mint bug is refused rather than written, and
+         refused with the vocabulary every other writer already reports.
+    """
+    counts = {"skus_existing": 0, "skus_to_mint": 0, "skus_minted": 0,
+              "skus_adopted_other_key": 0, "offers_refused_no_sku": 0}
+    if not planned:
+        return [], counts
+
+    existing = await fetch_existing_catalog_sku_keys([r["sku_key"] for r in planned])
+    missing = [r for r in planned if r["sku_key"] not in existing]
+    counts["skus_existing"] = len(planned) - len(missing)
+    counts["skus_to_mint"] = len(missing)
+
+    if not apply:
+        # Read-only: the identities that ALREADY exist suppressed are the ones
+        # --apply will refuse. Reporting them here keeps the plan and the run
+        # from disagreeing about how many offers land.
+        rows = await database.fetch_all(
+            SUPPRESSED_IDENTITY_PROBE_SQL,
+            {"product_keys": sorted({r["product_key"] for r in missing})},
+        )
+        blocked = {str(row["product_key"]) for row in (rows or [])}
+        counts["offers_refused_no_sku"] = sum(
+            1 for r in missing if r["product_key"] in blocked
+        )
+        return [r for r in planned if r["product_key"] not in blocked], counts
+
+    accepted: List[Dict[str, Any]] = []
+    for row in planned:
+        if row["sku_key"] in existing:
+            accepted.append(row)
+            continue
+        written_key = await database.fetch_val(
+            MINT_CANONICAL_SKU_SQL,
+            {"sku_key": row["sku_key"], "product_key": row["product_key"],
+             "sku_payload": _sku_payload(row["product_key"], batch_id)},
+        )
+        if written_key is None:
+            # Either the product vanished between the scan and now (the
+            # INSERT ... SELECT yielded no row) or the identity lives on a
+            # suppressed SKU. Both are "no live identity to hang this on".
+            counts["offers_refused_no_sku"] += 1
+            print(f"  [SKIP] no live SKU identity for {row['product_key'][:60]}",
+                  flush=True)
+            continue
+        counts["skus_minted"] += 1
+        if str(written_key) != row["sku_key"]:
+            # The identity already existed under another lane's spelling. Adopt
+            # it — writing our spelling would be a second identity row for one
+            # variant, which is what the 4-column index exists to forbid.
+            counts["skus_adopted_other_key"] += 1
+            row = dict(row, sku_key=str(written_key))
+        accepted.append(row)
+
+    guarded, reasons, rejected = await guard_catalog_offer_rows(accepted)
+    if rejected:
+        counts["offers_refused_no_sku"] += int(reasons.get(ORPHAN_NO_SKU, 0))
+        for bad in rejected:
+            print(f"  [REFUSE] {bad.get('offer_id')}: {bad.get('reasons')}", flush=True)
+    return guarded, counts
+
+
 async def apply_offers(planned: List[Dict[str, Any]]) -> Dict[str, Any]:
     from services.agent_pdp_view_assembler import (
         refresh_agent_pdp_view_for_content_key,
@@ -390,17 +594,59 @@ async def _drive(apply: bool, only_domain: Optional[str],
     print(f"PLAN: {len(all_planned)} US offers", flush=True)
     for row in all_planned:
         print(f"  {row['product_key'][:60]:<62} ${row['list_price']:.2f}")
-    if not apply:
-        print("DRY-RUN — pass --apply to write the planned offers.")
-        return 0
 
+    audit = WriterAuditAccumulator(
+        writer_name=SOURCE_SYSTEM, batch_id=make_batch_id(SOURCE_SYSTEM)
+    )
+    report: Dict[str, Any] = {
+        "writer": SOURCE_SYSTEM,
+        "batch_id": audit.batch_id,
+        "applied": 1 if apply else 0,
+        "candidates": len(rows),
+        "domains": len(by_domain),
+        "pre_skipped": pre_reasons,
+        "planned": len(all_planned),
+    }
+
+    # The SKU precondition runs in BOTH modes: a dry run that skipped it would
+    # report a plan of N offers while --apply writes fewer, which is the same
+    # class of lie as a dropped report line.
     await database.connect()
     try:
-        summary = await apply_offers(all_planned)
+        writable, sku_counts = await ensure_skus_for_planned(
+            all_planned, apply=apply, batch_id=audit.batch_id
+        )
+        report.update(sku_counts)
+        report["writable"] = len(writable)
+        if not apply:
+            report["written"] = 0
+            report["republish_failed"] = 0
+        else:
+            summary = await apply_offers(writable)
+            report["written"] = summary["written"]
+            report["republish_failed"] = len(summary["republish_failed"])
+            report["republish_failed_keys"] = summary["republish_failed"][:5]
+            audit.record_applied(summary["written"])
+            audit.record_skips({
+                k: v for k, v in sku_counts.items()
+                if k == "offers_refused_no_sku" and v > 0
+            })
+            audit.record_info({
+                k: v for k, v in sku_counts.items()
+                if k != "offers_refused_no_sku" and v > 0
+            })
+            audit.reasons["zero_counters"] = sorted(
+                k for k, v in sku_counts.items() if v == 0
+            )
+            await write_writer_audit_log(audit)
     finally:
         await database.disconnect()
-    print(f"DONE: {json.dumps(summary)}")
-    return 1 if summary["republish_failed"] else 0
+
+    if not apply:
+        print("DRY-RUN — pass --apply to write the planned offers.")
+    print(REPORT_BEGIN + json.dumps(report, sort_keys=True, default=str) + REPORT_END,
+          flush=True)
+    return 1 if report.get("republish_failed") else 0
 
 
 def main() -> int:
