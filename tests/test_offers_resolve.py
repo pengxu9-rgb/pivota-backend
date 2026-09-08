@@ -4110,3 +4110,340 @@ def test_host_diverse_head_treats_hostless_offers_as_distinct() -> None:
         {"offer_id": "of:e", "url": "https://three.example/p"},
     ]
     assert [o["offer_id"] for o in _host_diverse_head(mixed, 3)] == ["of:a", "of:b", "of:c"]
+
+
+def test_enforced_preflight_degrades_the_cart_handoff_in_the_resolve_lane(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """The CALL SITE, on the population the gate actually applies to.
+
+    Two things this pins that unit tests on the helper cannot:
+
+    1. A mutation deleting the `continue` that consumes the verdict survives every helper test
+       — the decision computed and thrown away, which is the shape of every gate-that-does-not-
+       gate bug in this repo.
+    2. The gate only runs where a PRE-FILLED CART is handed over. The stock harness seed is
+       referral-only (`cart_prefilled: False`, `rail: 'referral'`), so an earlier version of
+       this test drove a population the gate is deliberately blind to and would have passed
+       with the wiring removed entirely. The seed here is stamped so `sole_stamped_variant_id`
+       answers and `cart_variant_id` is set.
+    """
+    import copy
+
+    import routes.agent_shop_gateway as gateway
+    from services import checkout_preflight as cp
+
+    CART_VID = "43062643884185"
+
+    def _stamped(rows):
+        """One snapshot variant carrying a NUMERIC shopify_variant_id — the only shape that
+        makes storefront_is_shopify true AND sole_stamped_variant_id answer."""
+        out = []
+        for r in rows or []:
+            if isinstance(r, dict) and isinstance(r.get("seed_data"), dict):
+                r = copy.deepcopy(r)
+                snap = r["seed_data"].setdefault("snapshot", {})
+                snap["storefront_platform"] = "shopify"
+                snap["variants"] = [{
+                    "shopify_variant_id": CART_VID,
+                    "variant_id": "SKU_SIG_1",
+                    "title": "Sig Brand Treatment 50ml",
+                    "price_amount": 45.0,
+                    "price_currency": "USD",
+                    "availability": "in_stock",
+                }]
+            out.append(r)
+        return out
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM catalog_products" in q and "JOIN catalog_offers" in q:
+            return [_CATALOG_OFFER_ROW]
+        return _stamped(_sig_lane_fetch_all(query, values))
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
+
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(
+        gateway, "_make_external_redirect_url",
+        AsyncMock(return_value="https://example.com/r?token=x"))
+
+    asked = []
+
+    async def refusing_preflight(offer):
+        asked.append(offer)
+        return cp.PreflightVerdict(
+            outcome=cp.BLOCK, reason=cp.R_GONE, would_block=True, mode=cp.mode())
+
+    monkeypatch.setattr(cp, "preflight_and_record", refusing_preflight)
+
+    def _seed_offers():
+        res = client.post(
+            "/agent/shop/v1/invoke",
+            json={"operation": "offers.resolve",
+                  "payload": {"product": {"product_id": "sig_test_mirror_1"}, "limit": 10,
+                              "market": "US", "tool": "*", "commerce_surface": "agent_api"},
+                  "metadata": {"source": "creator-agent-ui"}},
+        )
+        assert res.status_code == 200
+        return [o for o in (res.json().get("offers") or [])
+                if str(o.get("offer_id") or "").startswith("of:external_seed:")]
+
+    # NORMALISE, do not exclude. A first cut subtracted every field that differed between two
+    # identical calls, which swept up `execution_spec` wholesale — and cart_url/pdp_url live
+    # INSIDE it, so a mutant rewriting cart_url in shadow passed. Only the click id and the
+    # expiry legitimately vary per call.
+    _VOLATILE = re.compile(r"clk_[0-9a-f]+")
+
+    def _stable(obj):
+        if isinstance(obj, str):
+            return _VOLATILE.sub("clk_X", obj)
+        if isinstance(obj, dict):
+            return {k: _stable(v) for k, v in obj.items()
+                    if k not in {"click_id", "expires_at"}}
+        if isinstance(obj, list):
+            return [_stable(v) for v in obj]
+        return obj
+
+    # OFF: the baseline. No call at all, so no HTTP and no observation row.
+    monkeypatch.delenv("CHECKOUT_PREFLIGHT_MODE", raising=False)
+    baseline = _seed_offers()
+    assert baseline, "off must leave the lane untouched"
+    assert asked == [], "off must not spend a request"
+    assert _stable(baseline) == _stable(_seed_offers()), (
+        "two identical OFF calls differ after normalisation — the shadow comparison below "
+        "cannot be evidence")
+
+    # The gate must be asking about the CART variant, not the seed's SKU. Asking about
+    # `vid` (a plain SKU) is the round-5 fallback this file forbids and would refuse live
+    # referral links while poisoning the shadow number.
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
+    shadow = _seed_offers()
+    assert asked, "shadow must ASK on a cart-prefilled handoff — otherwise it measures nothing"
+    assert asked[0]["execution_spec"]["variant_id"] == CART_VID, (
+        f"preflight asked about {asked[0]['execution_spec']['variant_id']!r}, not the cart "
+        "variant the redirect will use")
+    assert _stable(shadow) == _stable(baseline), (
+        "shadow changed the buyer-facing payload — including anything nested in "
+        "execution_spec, where cart_url and pdp_url live")
+
+    # ENFORCE: the same verdict now takes the CART away — and only the cart. Deleting the
+    # offer would hide a still-reachable PDP; the refusal is evidence about the variant, not
+    # about the product page.
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "enforce")
+    enforced = _seed_offers()
+    assert enforced, "an enforced refusal must not delete the offer"
+    assert all(o.get("cart_prefilled") is False for o in enforced), (
+        "the refused handoff must degrade to a referral")
+    assert any(o.get("cart_prefilled") for o in baseline), (
+        "the baseline must actually have been cart-prefilled, or this proves nothing")
+
+
+def test_a_referral_only_offer_is_not_gated(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """The population the gate is deliberately blind to.
+
+    `cart_variant_id` is None whenever we cannot name the variant with evidence, and the
+    redirect degrades to an honest referral. Asking the merchant about the seed's `vid` there
+    means asking about a plain SKU — `variant_absent` — which would refuse live referral links
+    and fill the shadow report with refusals that are artifacts of the question. The stock
+    harness seed is exactly that shape, so this uses it unmodified.
+    """
+    import routes.agent_shop_gateway as gateway
+    from services import checkout_preflight as cp
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM catalog_products" in q and "JOIN catalog_offers" in q:
+            return [_CATALOG_OFFER_ROW]
+        return _sig_lane_fetch_all(query, values)
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
+
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(
+        gateway, "_make_external_redirect_url",
+        AsyncMock(return_value="https://example.com/r?token=x"))
+
+    asked = []
+
+    async def refusing_preflight(offer):
+        asked.append(offer)
+        return cp.PreflightVerdict(
+            outcome=cp.BLOCK, reason=cp.R_GONE, would_block=True, mode=cp.mode())
+
+    monkeypatch.setattr(cp, "preflight_and_record", refusing_preflight)
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "enforce")
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={"operation": "offers.resolve",
+              "payload": {"product": {"product_id": "sig_test_mirror_1"}, "limit": 10,
+                          "market": "US", "tool": "*", "commerce_surface": "agent_api"},
+              "metadata": {"source": "creator-agent-ui"}},
+    )
+    assert res.status_code == 200
+    offers = [o for o in (res.json().get("offers") or [])
+              if str(o.get("offer_id") or "").startswith("of:external_seed:")]
+    assert offers, "a referral-only offer must survive even a REFUSING preflight under enforce"
+    assert all(o.get("cart_prefilled") is False for o in offers), "fixture is referral-only"
+    assert asked == [], "the gate must not ask about a variant the redirect declined to use"
+
+
+def _preflight_harness(monkeypatch, *, rows, stamped=True):
+    """offers.resolve with N seed rows and a counting preflight. Returns the ask log."""
+    import copy
+
+    import routes.agent_shop_gateway as gateway
+    from services import checkout_preflight as cp
+
+    CART_VID = "43062643884185"
+
+    def _prep(fetched):
+        out = []
+        for i, r in enumerate(fetched or []):
+            if isinstance(r, dict) and isinstance(r.get("seed_data"), dict):
+                r = copy.deepcopy(r)
+                # DISTINCT question per row. Every row being a copy of one seed made the memo
+                # dedup them to a single ask, which MASKED the budget: dropping `available()`
+                # at the call site still produced one ask and the test passed. The budget and
+                # the memo must be separable, so each row gets its own pdp_url and its own
+                # cart variant.
+                r["id"] = f"{r.get('id')}_{i}"
+                r["external_product_id"] = f"{r.get('external_product_id')}_{i}"
+                for _k in ("destination_url", "canonical_url"):
+                    r[_k] = f"{r[_k]}-{i}"
+                if stamped:
+                    snap = r["seed_data"].setdefault("snapshot", {})
+                    snap["storefront_platform"] = "shopify"
+                    snap["variants"] = [{
+                        "shopify_variant_id": f"{CART_VID}{i}", "variant_id": "SKU_SIG_1",
+                        "title": "T", "price_amount": 45.0, "price_currency": "USD",
+                        "availability": "in_stock"}]
+                # the CANDIDATE list the loop iterates is seed_data["variants"], which is a
+                # different key from snapshot.variants that cart_variant_id comes from
+                r["seed_data"]["variants"] = [
+                    {"variant_id": f"SKU_{n}", "title": f"V{n}", "price_amount": 45.0,
+                     "price_currency": "USD", "availability": "in_stock"}
+                    for n in range(rows["variants_per_row"])
+                ]
+            out.append(r)
+        return out
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM catalog_products" in q and "JOIN catalog_offers" in q:
+            return [_CATALOG_OFFER_ROW]
+        fetched = _sig_lane_fetch_all(query, values)
+        if fetched and isinstance(fetched[0], dict) and "seed_data" in fetched[0]:
+            fetched = fetched * rows["n_rows"]
+        return _prep(fetched)
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
+
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(
+        gateway, "_make_external_redirect_url",
+        AsyncMock(return_value="https://example.com/r?token=x"))
+
+    asked = []
+
+    async def counting(offer):
+        asked.append(offer)
+        return cp.PreflightVerdict(outcome=cp.OK, reason=cp.R_OK, would_block=False,
+                                   mode=cp.mode())
+
+    monkeypatch.setattr(cp, "preflight_and_record", counting)
+    return asked
+
+
+def test_the_budget_is_one_per_request_not_one_per_seed_row(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """`_PreflightBudget()` was constructed inside `for row in seed_rows`, so it reset on every
+    row: six rows under a cap of two ran six preflights, and 240 rows x 8 is 1,920 asks. One
+    budget for the whole request is the only thing that bounds a resolve."""
+    asked = _preflight_harness(monkeypatch, rows={"n_rows": 4, "variants_per_row": 1})
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MAX_PER_REQUEST", "1")
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={"operation": "offers.resolve",
+              "payload": {"product": {"product_id": "sig_test_mirror_1"}, "limit": 20,
+                          "market": "US", "tool": "*", "commerce_surface": "agent_api"},
+              "metadata": {"source": "creator-agent-ui"}},
+    )
+    assert res.status_code == 200
+    # Each row carries a DISTINCT question, so the memo cannot account for the limit — only
+    # the budget can. Without that, dropping `available()` at the call site still produced a
+    # single ask and this test passed.
+    assert len(asked) == 1, (
+        f"cap of 1 across the whole request, but the preflight was asked {len(asked)} times — "
+        "the budget is resetting per seed row, or is not consulted at all")
+
+
+def test_one_row_asks_once_however_many_variants_it_has(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """`cart_variant_id` comes from snapshot.variants (a ROW property) while the gate sits
+    inside `for v in matched_variants` — so every candidate asks the merchant the IDENTICAL
+    question. Twelve variants burned the cap on eight duplicates and multiplied that row's
+    contribution to the shadow denominator eightfold."""
+    asked = _preflight_harness(monkeypatch, rows={"n_rows": 1, "variants_per_row": 6})
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MAX_PER_REQUEST", "50")
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={"operation": "offers.resolve",
+              "payload": {"product": {"product_id": "sig_test_mirror_1"}, "limit": 20,
+                          "market": "US", "tool": "*", "commerce_surface": "agent_api"},
+              "metadata": {"source": "creator-agent-ui"}},
+    )
+    assert res.status_code == 200
+    assert len(asked) <= 1, (
+        f"one distinct question, asked {len(asked)} times — the verdict is not memoised")
+
+
+def test_a_refused_cart_prefill_degrades_to_a_referral_rather_than_deleting_the_offer(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """The merchant saying this VARIANT is gone is evidence about the cart prefill, not about
+    the product page. Deleting the offer would hide a still-reachable PDP and silently shrink
+    results — the gate-that-deletes-supply shape. It ships as an honest referral instead."""
+    import routes.agent_shop_gateway as gateway
+    from services import checkout_preflight as cp
+
+    _preflight_harness(monkeypatch, rows={"n_rows": 1, "variants_per_row": 1})
+
+    async def refusing(offer):
+        return cp.PreflightVerdict(outcome=cp.BLOCK, reason=cp.R_GONE, would_block=True,
+                                   mode=cp.mode())
+
+    monkeypatch.setattr(cp, "preflight_and_record", refusing)
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "enforce")
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={"operation": "offers.resolve",
+              "payload": {"product": {"product_id": "sig_test_mirror_1"}, "limit": 20,
+                          "market": "US", "tool": "*", "commerce_surface": "agent_api"},
+              "metadata": {"source": "creator-agent-ui"}},
+    )
+    assert res.status_code == 200
+    offers = [o for o in (res.json().get("offers") or [])
+              if str(o.get("offer_id") or "").startswith("of:external_seed:")]
+    assert offers, "a refused cart prefill must not delete the offer"
+    assert all(o.get("cart_prefilled") is False for o in offers), (
+        "the refused offer must ship as a referral, not a cart")
