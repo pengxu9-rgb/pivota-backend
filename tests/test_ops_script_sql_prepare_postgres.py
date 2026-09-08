@@ -597,6 +597,22 @@ def _collect_us_market_capture() -> List[Tuple[str, str]]:
     ]
 
 
+def _collect_variant_id_provenance_stamps() -> List[Tuple[str, str]]:
+    """The stamping backfill WRITES, and its UPDATE builds jsonb with `jsonb_build_object` —
+    the exact variadic-`"any"` shape that made #1703's statement unplannable on every row while
+    the script exited 0 having written nothing. Both constants are registered here rather than
+    driven, because driving the scan against a recorder yields only the SELECT: the UPDATE is
+    reached only once a page comes back non-empty."""
+    import scripts.backfill_variant_id_provenance_stamps as module
+
+    origin = "backfill_variant_id_provenance_stamps"
+    return [
+        (f"{origin}.{name}", getattr(module, name)) for name in (
+            "SELECT_PAGE_SQL", "STAMP_SQL",
+        )
+    ]
+
+
 def _collect_a9_4_quality_repair() -> List[Tuple[str, str]]:
     """The repair REWRITES a merchant column, so an unplannable statement here
     aborts mid-repair and leaves the cohort half-restored — the worst of both
@@ -740,6 +756,7 @@ _COVERED_SCRIPTS: Dict[str, Callable[[], List[Tuple[str, str]]]] = {
     "scripts/dispose_sentinel_orphans.py": _collect_dispose_sentinel_orphans,
     "scripts/report_quality_scale_population.py": _collect_quality_scale_population,
     "scripts/repair_a9_4_orphaned_quality_snapshots.py": _collect_a9_4_quality_repair,
+    "scripts/backfill_variant_id_provenance_stamps.py": _collect_variant_id_provenance_stamps,
 }
 
 # What each collector yields TODAY, not a slack lower bound. Guards the failure
@@ -764,6 +781,7 @@ _MIN_STATEMENTS = {
     "scripts/dispose_sentinel_orphans.py": 8,
     "scripts/report_quality_scale_population.py": 5,
     "scripts/repair_a9_4_orphaned_quality_snapshots.py": 3,
+    "scripts/backfill_variant_id_provenance_stamps.py": 2,
 }
 
 
