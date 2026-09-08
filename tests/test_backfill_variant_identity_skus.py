@@ -295,3 +295,36 @@ def test_the_scan_is_ordered_so_limit_and_resume_are_reproducible():
     sql = _sql(SELECT_PRODUCTS_SQL)
     assert "order by cp.product_key" in sql
     assert "cp.product_key > :after" in sql
+
+
+# ---------------------------------------------------------------------------
+# The report has to survive the transport that carries it
+# ---------------------------------------------------------------------------
+
+
+def test_the_report_is_printed_as_exactly_one_fenced_line():
+    """run_oneoff_job.sh reads the job's output from Cloud Logging, which drops lines. The
+    2026-09-08 pilot printed a pretty-printed report whose `offers` line was dropped, leaving
+    `skus: 78` visible and no offers count at all — which reads as the orphan-SKU state this
+    script exists to prevent. A single line cannot be partially dropped."""
+    src = inspect.getsource(backfill.main)
+    assert "indent=" not in src, "a multi-line report can arrive with keys silently missing"
+    assert "REPORT_BEGIN" in src and "REPORT_END" in src
+    assert backfill.REPORT_BEGIN and backfill.REPORT_END
+
+
+def test_a_report_round_trips_through_the_sentinels(capsys):
+    """The positive counterpart: prove a caller can actually recover the report, rather than
+    only that the string 'indent' is absent."""
+    import json as _json
+    import re as _re
+
+    report = {"skus": 78, "offers": 78, "resume_after": "ext:zzz::abcd1234", "applied": 1}
+    print(backfill.REPORT_BEGIN + _json.dumps(report, sort_keys=True) + backfill.REPORT_END)
+    out = capsys.readouterr().out
+    assert out.count("\n") == 1, "the report spans more than one line"
+    m = _re.search(
+        _re.escape(backfill.REPORT_BEGIN) + r"(\{.*\})" + _re.escape(backfill.REPORT_END), out
+    )
+    assert m, "the sentinels do not delimit the report"
+    assert _json.loads(m.group(1)) == report
