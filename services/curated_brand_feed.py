@@ -21,7 +21,7 @@ import html
 import json
 import logging
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import httpx
 
@@ -1225,6 +1225,68 @@ def drop_shade_listings(products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return fold_shade_listings(products)[0]
 
 
+class CurrencyNotProven(RuntimeError):
+    """A storefront's own currency could not be proven, or is not the one asked for.
+
+    Raised INSTEAD of ingesting, because the alternative is silent and wrong: a record
+    that never learned its currency arrives at `ingestion._currency_of` with None and
+    is stamped the DEFAULT, `USD`. That default is correct for the US corpus it was
+    written for and is a mispricing everywhere else -- an SGD 30.00 lip tint served as
+    USD 30.00 is a 1.35x overstatement carrying no signal that it is wrong.
+
+    The failure is not hypothetical and not rare. Measured 2026-09-07 while probing the
+    three Singapore storefronts: `/meta.json` on cocomo.sg answered 429 with a
+    "Verifying your connection..." bot-check HTML page (the shop had just served four
+    pages of `/products.json`), so `fetch_shopify_shop_locale` returned
+    `{'currency': None}` -- a store that prices in SGD, one throttled request away from
+    1,000 USD-stamped rows. `fetch_shopify_shop_locale` is best-effort BY DESIGN and
+    must stay so; what was missing is a caller that can say "I know this is an SGD
+    store, refuse the run if you cannot see SGD".
+
+    NEVER a conversion. This raises; it does not rewrite an amount into another
+    currency. See services/region_pricing (ADR-024 commitment 5).
+    """
+
+
+def _vendor_token(value: Optional[str]) -> str:
+    """Comparison form of a Shopify `vendor` string: casefolded, whitespace collapsed.
+
+    Deliberately NOT `catalog_identity.normalize_title`: that one is tuned for product
+    titles (it keeps hyphens because 'Anti-Aging Serum' is a real distinction) and a
+    vendor field is a short label where the only variation worth absorbing is case and
+    stray spacing. Anything looser would be a hazard on a multi-brand retailer feed,
+    which is the whole reason this exists -- cocomo.sg lists 224 vendors, and a filter
+    that matched approximately would quietly pull in a neighbour brand's products under
+    the target brand's name.
+    """
+    return " ".join(str(value or "").split()).casefold()
+
+
+def filter_products_by_vendor(
+    products: List[Dict[str, Any]], vendors: "Sequence[str]"
+) -> List[Dict[str, Any]]:
+    """Keep only the products whose Shopify `vendor` is one of `vendors`. Pure.
+
+    A multi-brand RETAILER feed is not a brand feed. `records_for_brand`'s existing
+    `brand` argument is a brand_override -- it RENAMES every product it sees -- so
+    pointing it at cocomo.sg with brand='VELY VELY' would not select VELY VELY's 24
+    products, it would relabel all 1,000 of that retailer's products (MEDICUBE, ANUA,
+    BEAUTY OF JOSEON, ...) as VELY VELY and deposit them as brand-official anchors.
+    Selection and renaming are different operations and this is the selecting one.
+
+    Matching is exact after `_vendor_token` normalisation. An empty/None `vendors`
+    returns the list unchanged -- "no filter asked for", which is what every existing
+    single-brand caller means.
+    """
+    wanted = {_vendor_token(v) for v in (vendors or []) if str(v or "").strip()}
+    if not wanted:
+        return list(products)
+    return [
+        p for p in products
+        if isinstance(p, dict) and _vendor_token(p.get("vendor")) in wanted
+    ]
+
+
 async def records_for_brand(
     *,
     domain: str,
@@ -1237,6 +1299,8 @@ async def records_for_brand(
     # variant, which moves recall fan-out and offer aggregation for every row the
     # caller ingests. `base_listings_only` implies it for the rows the fold builds.
     emit_real_variants: bool = False,
+    only_vendors: Optional[Sequence[str]] = None,
+    require_currency: Optional[str] = None,
     enrich_missing_inci: bool = False,
     max_pdp_inci_fetches: int = 300,
     # 0.0 since the shared politeness gate owns pacing. This ad-hoc sleep predates it and now
@@ -1251,11 +1315,62 @@ async def records_for_brand(
     a SECOND, polite try: fetch the product's own PDP and recover the metafield /
     accordion INCI via `fetch_pdp_inci` (the cohort keeps INCI out of body_html).
     Additive — body_html INCI stays the first try and is never overwritten here;
-    the fetch is capped, delayed, and best-effort (a miss leaves raw_inci None)."""
+    the fetch is capped, delayed, and best-effort (a miss leaves raw_inci None).
+
+    `only_vendors` selects a subset of a MULTI-BRAND retailer feed by Shopify `vendor`
+    (see `filter_products_by_vendor`) — the selecting operation, as distinct from
+    `brand`, which renames. Applied BEFORE the shade fold, so a fold never matches a
+    base across a brand boundary.
+
+    `require_currency` (an ISO-4217 code) refuses the whole brand with
+    `CurrencyNotProven` unless the storefront's own `/meta.json` proves that currency.
+    Opt-in: omitted, behaviour is exactly what it was — best-effort, `None` on a miss,
+    and `USD` from the ingest lane's default.
+    """
     products = await fetch_shopify_products(domain, max_products=max_products)
     # ONCE per brand, not per product: it is one storefront-wide setting and a per-product fetch
     # would multiply outbound requests by the catalogue size against a single host.
     locale = await fetch_shopify_shop_locale(domain)
+    if require_currency:
+        expected = str(require_currency).strip().upper()
+        actual = locale.get("currency")
+        if actual != expected:
+            # BEFORE the records are built, so a refused brand cannot half-ingest.
+            raise CurrencyNotProven(
+                f"{domain}: expected currency {expected}, storefront /meta.json proved "
+                f"{actual or 'nothing'}. Refusing rather than ingesting — the ingest lane "
+                f"defaults an unknown currency to USD, and this run cannot show the prices "
+                f"are in {expected}. If /meta.json was unreadable, retry: a 429 bot-check "
+                f"page reads exactly like a missing file. If {actual or 'the proven value'} "
+                f"is genuinely right, pass --require-currency {actual or '<code>'} instead."
+            )
+    if only_vendors is not None:
+        # A filter that was ASKED FOR but normalises to nothing is refused, not skipped.
+        # `--only-vendor "$VENDOR"` with the variable unset, or a jsonl row
+        # `"only_vendors": [""]`, would otherwise pass an empty set to the filter, which
+        # returns the whole feed — and the brand override then relabels every product of a
+        # 224-vendor retailer as the target brand, signalled only by a "1000 -> 1000" line.
+        wanted = [v for v in only_vendors if str(v or "").strip()]
+        if not wanted:
+            raise ValueError(
+                f"{domain}: --only-vendor was given but every entry is blank "
+                f"({list(only_vendors)!r}). Name the vendor, or drop the flag to ingest "
+                f"the whole feed deliberately."
+            )
+        only_vendors = wanted
+        before = len(products)
+        products = filter_products_by_vendor(products, only_vendors)
+        if not products:
+            # LOUD, not empty. An unmatched vendor filter otherwise reports the same
+            # "0 products" a non-Shopify storefront does, and the operator reads a typo
+            # ("Vely Vely " with a stray character) as "this brand has nothing here".
+            raise ValueError(
+                f"{domain}: --only-vendor {list(only_vendors)!r} matched 0 of {before} "
+                f"products. Check the spelling against the feed's own `vendor` values."
+            )
+        records_for_brand.last_vendor_filter_report = {  # type: ignore[attr-defined]
+            "vendors": list(only_vendors), "before": before, "after": len(products),
+        }
     if base_listings_only:
         products, fold_report = fold_shade_listings(products)
         records_for_brand.last_fold_report = fold_report  # type: ignore[attr-defined]

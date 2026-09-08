@@ -1571,3 +1571,233 @@ def test_a_duplicated_native_variant_id_is_emitted_once():
     vs = shopify_product_to_record(
         twice, domain="x.com", category_path="x", emit_native_variants=True)["pdp"]["variants"]
     assert [v["variant_id"] for v in vs] == ["39406294532166", "39406294532168"]
+# -- multi-brand retailer feeds: SELECT a vendor, don't RENAME every product ---------------------
+
+
+def _retailer_feed():
+    """A cocomo.sg-shaped feed: several vendors, one of them the target."""
+    return [
+        _product(vendor="VELY VELY", title="[VELY VELY] Dewy Glow Lip Gloss 4ml", handle="vv-gloss"),
+        _product(vendor="MEDICUBE", title="Zero Pore Pad 2.0", handle="mc-pad"),
+        _product(vendor="ANUA", title="Heartleaf 77 Toner", handle="anua-toner"),
+        _product(vendor="vely  vely", title="[VELY VELY] Ampoule Blusher", handle="vv-blush"),
+    ]
+
+
+def test_the_vendor_filter_selects_only_the_named_brand():
+    kept = cbf.filter_products_by_vendor(_retailer_feed(), ["VELY VELY"])
+    assert [p["handle"] for p in kept] == ["vv-gloss", "vv-blush"]
+
+
+def test_the_vendor_filter_normalises_case_and_spacing_only():
+    """'vely  vely' is the same vendor; a NEIGHBOUR brand never is. A looser match on a
+    224-vendor retailer feed would deposit another brand's products as this brand's."""
+    feed = _retailer_feed() + [_product(vendor="VELY VELY BEAUTY", handle="other")]
+    kept = cbf.filter_products_by_vendor(feed, ["  Vely Vely  "])
+    assert [p["handle"] for p in kept] == ["vv-gloss", "vv-blush"]
+
+
+def test_no_vendor_filter_asked_for_keeps_every_product():
+    """Every existing single-brand caller passes nothing and must be unaffected."""
+    feed = _retailer_feed()
+    assert cbf.filter_products_by_vendor(feed, []) == feed
+    assert cbf.filter_products_by_vendor(feed, None) == feed
+
+
+@pytest.mark.asyncio
+async def test_records_for_brand_filters_by_vendor_before_it_renames(monkeypatch):
+    """THE SEAM, and the trap it exists for. `brand` is a brand_override: it RENAMES every
+    product the feed yields. Pointing it at a retailer without a filter deposits that
+    retailer's whole catalogue under the target brand's name -- 1,000 cocomo.sg products
+    (MEDICUBE, ANUA, BEAUTY OF JOSEON, ...) as brand-official 'VELY VELY' anchors."""
+    async def _products(domain, **kw):
+        return _retailer_feed()
+
+    monkeypatch.setattr(cbf, "fetch_shopify_products", _products)
+
+    recs = await cbf.records_for_brand(
+        domain="cocomo.sg", category_path="beauty/makeup",
+        brand="VELY VELY", only_vendors=["VELY VELY"],
+    )
+
+    assert [r["pdp"]["product_name"] for r in recs] == [
+        "[VELY VELY] Dewy Glow Lip Gloss 4ml", "[VELY VELY] Ampoule Blusher",
+    ]
+    assert {r["pdp"]["brand"] for r in recs} == {"VELY VELY"}
+
+
+@pytest.mark.asyncio
+async def test_a_vendor_filter_that_matches_nothing_is_loud(monkeypatch):
+    """It must not read as 'this brand has nothing here'. An empty return is what a
+    non-Shopify storefront already yields, so a typo would be indistinguishable from a
+    legitimately absent brand -- and the operator would move on."""
+    async def _products(domain, **kw):
+        return _retailer_feed()
+
+    monkeypatch.setattr(cbf, "fetch_shopify_products", _products)
+
+    with pytest.raises(ValueError, match="matched 0 of 4"):
+        await cbf.records_for_brand(
+            domain="cocomo.sg", category_path="beauty/makeup", only_vendors=["Vely-Vely"],
+        )
+
+
+# -- an unproven currency must refuse, never fall back to USD ------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.live_locale
+@pytest.mark.parametrize(
+    "proved, label",
+    [
+        (None, "unreadable /meta.json — measured 2026-09-07: cocomo.sg answered the "
+               "meta.json GET with a 429 bot-check page while serving /products.json fine"),
+        ("USD", "a storefront that really does price in USD"),
+        ("MYR", "the neighbouring-market mistake"),
+    ],
+)
+async def test_a_currency_we_cannot_prove_refuses_instead_of_defaulting_to_usd(
+    monkeypatch, proved, label
+):
+    """`ingestion._currency_of` defaults to USD for a record that carries no currency. That
+    default is right for the US corpus it preserves and is a silent mispricing for an SGD
+    store: SGD 30.00 served as USD 30.00, 1.35x overstated, with nothing marking it wrong.
+    So an operator who KNOWS the market can demand it, and the run stops rather than guesses."""
+    async def _products(domain, **kw):
+        return [_product()]
+
+    async def _locale(domain, **kw):
+        return {"currency": proved}
+
+    monkeypatch.setattr(cbf, "fetch_shopify_products", _products)
+    monkeypatch.setattr(cbf, "fetch_shopify_shop_locale", _locale)
+
+    with pytest.raises(cbf.CurrencyNotProven, match="SGD"):
+        await cbf.records_for_brand(
+            domain="cocomo.sg", category_path="beauty/makeup", require_currency="SGD",
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.live_locale
+async def test_the_proven_currency_passes_the_gate_and_reaches_the_record(monkeypatch):
+    """The gate must not be a wall: a storefront that proves what was asked for ingests,
+    and the record carries that currency rather than the lane's USD default."""
+    async def _products(domain, **kw):
+        return [_product()]
+
+    async def _locale(domain, **kw):
+        return {"currency": "SGD"}
+
+    monkeypatch.setattr(cbf, "fetch_shopify_products", _products)
+    monkeypatch.setattr(cbf, "fetch_shopify_shop_locale", _locale)
+
+    recs = await cbf.records_for_brand(
+        domain="jsmbeauty.sg", category_path="beauty/makeup", require_currency="sgd",
+    )
+
+    assert {r["pdp"]["currency"] for r in recs} == {"SGD"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.live_locale
+async def test_the_currency_gate_refuses_before_any_record_is_built(monkeypatch):
+    """A refusal that happened after the mapping would still be safe here, but the lane
+    also fetches PDPs for INCI — a brand we are going to refuse must cost the merchant
+    nothing, and must not half-ingest under a partial-failure path."""
+    built = []
+
+    async def _products(domain, **kw):
+        return [_product()]
+
+    async def _locale(domain, **kw):
+        return {"currency": None}
+
+    monkeypatch.setattr(cbf, "fetch_shopify_products", _products)
+    monkeypatch.setattr(cbf, "fetch_shopify_shop_locale", _locale)
+    monkeypatch.setattr(
+        cbf, "shopify_product_to_record",
+        lambda *a, **kw: built.append(1),
+    )
+
+    with pytest.raises(cbf.CurrencyNotProven):
+        await cbf.records_for_brand(
+            domain="cocomo.sg", category_path="beauty/makeup", require_currency="SGD",
+        )
+    assert built == [], "no record may be built for a brand the gate refuses"
+
+
+@pytest.mark.asyncio
+@pytest.mark.live_locale
+async def test_omitting_the_currency_gate_leaves_the_old_behaviour_exactly(monkeypatch):
+    """Opt-in. Every brand already onboarded ran without it and must keep running: an
+    unreadable /meta.json still yields records, still currency-less, still USD downstream."""
+    async def _products(domain, **kw):
+        return [_product()]
+
+    async def _locale(domain, **kw):
+        return {"currency": None}
+
+    monkeypatch.setattr(cbf, "fetch_shopify_products", _products)
+    monkeypatch.setattr(cbf, "fetch_shopify_shop_locale", _locale)
+
+    recs = await cbf.records_for_brand(domain="flowerbeauty.com", category_path="beauty/makeup")
+
+    assert len(recs) == 1
+    assert recs[0]["pdp"]["currency"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_blank_vendor_filter_is_refused_not_ignored(monkeypatch):
+    """`--only-vendor "$VENDOR"` with the variable unset, or a jsonl row `[""]`, used to
+    normalise to an EMPTY set, which `filter_products_by_vendor` reads as "no filter" —
+    the whole retailer feed came through and the brand override relabelled it. Asking
+    for a filter and naming nothing is an error."""
+    async def _products(domain, **kw):
+        return _retailer_feed()
+
+    monkeypatch.setattr(cbf, "fetch_shopify_products", _products)
+
+    for blank in ([""], ["   "], ["", " "]):
+        with pytest.raises(ValueError, match="every entry is blank"):
+            await cbf.records_for_brand(
+                domain="cocomo.sg", category_path="beauty/makeup",
+                brand="VELY VELY", only_vendors=blank,
+            )
+
+
+@pytest.mark.asyncio
+async def test_the_vendor_filter_runs_before_the_shade_fold(monkeypatch):
+    """The fold matches on normalised TITLE only and never consults `vendor`. Filtering
+    after folding lets a neighbour brand's "<base> - <shade>" row fold into the target
+    brand's base and ship as its SKU + priced offer. Filter first, so no fold can cross a
+    brand boundary."""
+    feed = [
+        {"id": 7001, "handle": "dewy-glow-lip-gloss", "title": "Dewy Glow Lip Gloss",
+         "vendor": "VELY VELY", "product_type": "Lip Gloss", "body_html": "<p>x</p>",
+         "images": [{"src": "https://cdn.x/a.jpg"}],
+         "variants": [{"id": 44922188071158, "price": "21.90", "option1": "Default Title",
+                       "available": True}]},
+        {"id": 7002, "handle": "dewy-glow-lip-gloss-coral", "title": "Dewy Glow Lip Gloss - Coral",
+         "vendor": "MEDICUBE", "product_type": "Lip Gloss", "body_html": "<p>y</p>",
+         "images": [{"src": "https://cdn.x/b.jpg"}],
+         "variants": [{"id": 44922188071999, "price": "22.90", "option1": "Coral",
+                       "available": True}]},
+    ]
+
+    async def _products(domain, **kw):
+        return feed
+
+    async def _locale(domain, **kw):
+        return {"currency": "SGD"}
+
+    monkeypatch.setattr(cbf, "fetch_shopify_products", _products)
+    monkeypatch.setattr(cbf, "fetch_shopify_shop_locale", _locale)
+
+    recs = await cbf.records_for_brand(
+        domain="cocomo.sg", category_path="beauty/makeup", brand="VELY VELY",
+        only_vendors=["VELY VELY"], base_listings_only=True,
+    )
+    assert [r["pdp"]["product_name"] for r in recs] == ["Dewy Glow Lip Gloss"]
+    # Fold-then-filter would have folded MEDICUBE's Coral into this base as a variant.
+    assert [v["title"] for v in recs[0]["pdp"]["variants"]] == []

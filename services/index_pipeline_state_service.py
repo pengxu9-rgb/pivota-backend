@@ -23,7 +23,10 @@ from services.agent_decision_gates import (
     evaluate_agent_decision_gates,
 )
 from services.priced_offer_sql import priced_offer_exists_sql
-from services.region_pricing import has_offer_priced_for_region_sql
+from services.region_pricing import (
+    has_offer_priced_for_any_region_sql,
+    has_offer_priced_for_region_sql,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -561,6 +564,42 @@ _HAS_PRICE_EXISTS = priced_offer_exists_sql("cp.product_key")
 # has_offer_priced_for_region_sql directly rather than reading this bit.
 _HAS_US_OFFER_EXISTS = has_offer_priced_for_region_sql("cp.product_key", "US")
 
+# The regions this deployment is willing to serve a priced offer for. DEFAULT "US",
+# so with nothing set the column below is the byte-identical string
+# `_HAS_US_OFFER_EXISTS` is — asserted in tests/test_region_pricing.py.
+#
+# WHY THIS IS CONFIGURATION AND NOT A CONSTANT. `no_us_offer` is a real, ENABLED
+# blocker in production, measured 2026-09-07: 398 of cocomo.sg's 399 rows and the
+# residual 12 of jsmbeauty.sg's 170 are blocked by it, and every one of them is a
+# correctly-ingested SGD row from a Singapore storefront whose UCP checkout reaches
+# ready_for_complete. The gate is doing exactly what it was written to do — it was
+# written for "the US K-beauty wedge" (services/agent_decision_gates) — so the
+# defect is not in the predicate, it is that a single deployment-wide US answer is
+# baked into a per-row bit. ADR-024 Phase 2a un-bakes that consumer by consumer;
+# this is one env var, not that refactor, and it changes nothing until an operator
+# names a second region.
+#
+# NOT DERIVED FROM THE ROW. A row's own market cannot be read here: catalog_offers
+# .market is a NOT NULL DEFAULT 'US' that no external-seed writer sets (mig 149),
+# so it says 'US' for the SGD rows too. Currency is the only truthful signal, and
+# this asks the only question currency can answer — "is this priced in something
+# one of our served regions expects" — never "convert it".
+_SERVING_REGIONS_ENV = "PIVOTA_SERVING_PRICING_REGIONS"
+
+
+def serving_pricing_regions() -> List[str]:
+    """The configured served regions, e.g. ['US'] or ['US', 'SG']. Never empty."""
+    import os
+
+    raw = os.getenv(_SERVING_REGIONS_ENV, "") or ""
+    regions = [part.strip().upper() for part in raw.split(",") if part.strip()]
+    return regions or ["US"]
+
+
+_HAS_SERVING_REGION_OFFER_EXISTS = has_offer_priced_for_any_region_sql(
+    "cp.product_key", serving_pricing_regions()
+)
+
 _ELIGIBILITY_COLUMNS = f"""
     cp.content_key,
     cp.product_key,
@@ -611,6 +650,14 @@ _ELIGIBILITY_COLUMNS = f"""
     -- value is TRUE/FALSE and never NULL — an ABSENT key then unambiguously means
     -- "not computed by this query" rather than "no US offer".
     {_HAS_US_OFFER_EXISTS}      AS has_us_offer,
+    -- The same question asked of every region this deployment serves, not of the US
+    -- alone. Identical to has_us_offer until an operator sets PIVOTA_SERVING_PRICING
+    -- _REGIONS; it is what the agent-decision gate reads, so an SGD row can stop
+    -- being blocked as `no_us_offer` without anyone converting an amount.
+    -- has_us_offer stays beside it and stays literally about the US: it is a
+    -- meaningful stored fact, and overloading its name with a configurable answer
+    -- is how a column starts lying.
+    {_HAS_SERVING_REGION_OFFER_EXISTS}      AS has_serving_region_offer,
     -- Category concern list (skin concern for skincare, hair concern for
     -- haircare); both read the shared concerns_json. The category-attributes
     -- gate selects which category_kind this blocks for.
@@ -816,6 +863,7 @@ SELECT
     -- The two columns BELOW remain column-independent placeholders: beauty
     -- concerns/actives are computed only on the Postgres path.
     {_HAS_US_OFFER_EXISTS} AS has_us_offer,
+    {_HAS_SERVING_REGION_OFFER_EXISTS} AS has_serving_region_offer,
     NULL AS has_category_concern,
     NULL AS has_key_actives,
     EXISTS (

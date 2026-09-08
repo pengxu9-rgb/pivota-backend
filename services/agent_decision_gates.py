@@ -68,11 +68,29 @@ def evaluate_agent_decision_gates(
     if not enabled:
         return None
 
-    # US-buyable offer -- powered by catalog_offers.market (mig 149) today.
-    if not row.get("has_us_offer"):
+    # A priced offer in a currency one of the SERVED regions expects.
+    #
+    # Reads `has_serving_region_offer`, which equals `has_us_offer` unless an operator
+    # has named more regions in PIVOTA_SERVING_PRICING_REGIONS (see
+    # index_pipeline_state_service.serving_pricing_regions). FALLS BACK to has_us_offer
+    # so a caller that computed only the older column keeps its old verdict rather than
+    # reading a missing key as False and blocking every row it fetched.
+    #
+    # The detail string used to say "market='US'". The SQL has NEVER asked that: it asks
+    # `currency = 'USD'` (services/region_pricing), and it was moved off `market`
+    # precisely because `market` is a NOT NULL DEFAULT 'US' that no writer sets. An
+    # operator reading the old text would go looking at the one column that carries no
+    # signal — and on the SG cohort, where every row IS market='US', would have
+    # concluded the gate was broken rather than doing its job.
+    has_priced_offer = row.get(
+        "has_serving_region_offer", row.get("has_us_offer")
+    )
+    if not has_priced_offer:
         return (
             BLOCKER_NO_US_OFFER,
-            "no catalog_offers row with market='US' and list_price > 0",
+            "no unsuppressed catalog_offers row priced > 0 in a currency any served "
+            "region expects (services/region_pricing; the test is on currency, "
+            "NOT on catalog_offers.market)",
         )
 
     use_evidence = evidence_gates_enabled() if evidence_gates is None else evidence_gates
