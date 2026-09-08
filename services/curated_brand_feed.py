@@ -904,10 +904,12 @@ def shopify_product_to_record(
         None if product.get(FOLDED_INTO_KEY)
         else (str(variant.get("barcode") or "").strip() or None)
     )
-    # Every sellable variant, when the product has more than one: the ingest
-    # writes one SKU + offer per entry beside the canonical SKU, so a folded
-    # shade line (see fold_shade_listings) keeps its purchasable SKUs. Single-
-    # variant products emit nothing here — the canonical SKU already is the row.
+    # Every sellable variant: the ingest writes one SKU + offer per entry beside
+    # the canonical SKU, so a folded shade line (see fold_shade_listings) keeps
+    # its purchasable SKUs. Since #2120 a single-variant product emits its one
+    # variant too -- the canonical SKU's source_variant_id is a storage token the
+    # gateway refuses to spend against, so the merchant's own id has to ride here
+    # for #2113 (SKU) and #2123 (seed) to keep it.
     sellable = [
         v for v in variants
         if isinstance(v, dict) and (_to_float(v.get("price")) or 0.0) >= MIN_SELLABLE_PRICE

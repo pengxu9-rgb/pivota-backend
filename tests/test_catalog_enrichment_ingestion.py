@@ -1034,6 +1034,41 @@ def test_a_lone_merchant_issued_variant_reaches_the_seed_and_the_synthetic_does_
     assert "zero_variants" not in set(status.blocker_anomaly_types or [])
 
 
+def test_a_lone_variant_with_no_price_of_its_own_leaves_the_priced_synthetic_on_the_seed():
+    """Review of #2123: the offer writer refuses to project a None-priced variant offer, but
+    the seed writer wrote `price_amount: null` for the same variant where the synthetic
+    canonical had carried the offer price. Same guard, same outcome: SKU lands, seed keeps
+    the priced synthetic."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    result = ing.ingest_validated_record(_lone_real_variant_record())
+    assert [s["source_variant_id"] for s in result["variant_skus"]] == ["54057345745090"]
+    variants = _seed_variants_of(result)
+    assert len(variants) == 1 and variants[0]["variant_id"].endswith("::canonical")
+    assert variants[0]["price_amount"] == 24.0
+    assert all(v["price_amount"] is not None for v in variants)
+
+
+def test_a_lone_variant_with_an_axis_publishes_a_one_entry_option_and_a_titleless_one_none():
+    """`_drop_options_that_do_not_distinguish` was written for n >= 2; with one variant the
+    all-or-nothing rule holds trivially. Pin both outcomes so the picker shape is a decision:
+    an axis the fold named survives as a one-choice selector; a variant titled like its
+    parent (the Shopify `Default Title` shape, Petal Pout's case) gets no axis at all and stays
+    hidden from the selector -- the seed still gains the real id, which is what the money
+    path needed."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    with_axis = _variant_record(1)
+    with_axis["pdp"]["variants"][0]["option_name"] = "Color"
+    v = _seed_variants_of(ing.ingest_validated_record(with_axis))[0]
+    assert v["options"] == [{"name": "Color", "value": "Ruby Woo"}]
+
+    titleless = _variant_record(1)
+    titleless["pdp"]["variants"][0]["title"] = titleless["pdp"]["product_name"]
+    v = _seed_variants_of(ing.ingest_validated_record(titleless))[0]
+    assert v["variant_id"] == "54057345745090" and v["options"] == []
+
+
 def test_a_lone_variant_titled_like_its_parent_is_still_kept_when_the_id_is_the_merchants():
     """The gate is provenance, not title: forty real single-variant Shopify products in the
     corpus carry a variant title equal to the parent title. A title test would drop them."""

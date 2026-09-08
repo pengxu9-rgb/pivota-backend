@@ -712,6 +712,13 @@ def _build_seed_inserts(
                 )
                 if single and provenance != MERCHANT_ISSUED:
                     continue
+                if single and variant_own_price(v) is None:
+                    # Mirror of the offer writer's guard: a lone variant with no price
+                    # of its own would put `price_amount: null` on the seed the PDP
+                    # reads, where the synthetic canonical carries the offer price.
+                    # The SKU row still lands (its identity is real); the seed keeps
+                    # the priced synthetic, exactly as before #2123.
+                    continue
                 v_in_stock = bool(v.get("in_stock"))
                 shade = str(v.get("title") or "").strip()
                 image_url = str(v.get("image_url") or "").strip() or None
@@ -803,10 +810,11 @@ def _seed_variant_options(
     TOLD about. The mapper's fallback title is the product name, and
     "Default Title" is what a shop with no axis returns; either would render as a
     selector entry naming no choice. An absent `option_name` is not a shade
-    signal either — `_build_seed_inserts` runs on any record with two or more
-    variants, including hand-validated JSONL for a lane that never folded
-    anything, and guessing "Shade" there published a volume axis as
-    "Shade: 30 ml". Only the fold knows the axis, and it always names it.
+    signal either — `_build_seed_inserts` runs on any record carrying a real
+    variant (two or more, or one the merchant issued, since #2123), including
+    hand-validated JSONL for a lane that never folded anything, and guessing
+    "Shade" there published a volume axis as "Shade: 30 ml". Only the fold knows
+    the axis, and it always names it.
     """
     value = (shade or "").strip()
     if not value:
