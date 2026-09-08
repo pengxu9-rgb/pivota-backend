@@ -258,7 +258,14 @@ class _FakeTxn:
         return False
 
 
-def _install_fake_db(monkeypatch) -> List[Dict[str, Any]]:
+def _install_fake_db(monkeypatch, catalog_track=None) -> List[Dict[str, Any]]:
+    """`catalog_track` is EXPLICIT per test because two different things now read
+    it: `promoted_readiness_tier` decides the tier offered, and the group outcome
+    splits `variants_promoted` from `variants_tier_held` on whether that tier can
+    move at all. The DEFAULT is a primary carrying no track — the redirect lane, and
+    the fixture `test_promote_does_not_claim_commerce_ready_off_the_money_lane`
+    needs; a test whose subject is the promotion COUNT passes the money lane so it
+    keeps counting promotions."""
     executed: List[Dict[str, Any]] = []
 
     async def fake_fetch_one(sql, params=None):
@@ -269,6 +276,7 @@ def _install_fake_db(monkeypatch) -> List[Dict[str, Any]]:
             "platform": "external_seed",
             "source_product_id": "ext_pk_x",
             "parent_title": "Foundation",
+            "catalog_track": catalog_track,
             "product_payload": None,
             "seed_data": {"snapshot": {"variants": [
                 _tomford_variant("V1"), _tomford_variant("V2"), _moyu_default_variant(),
@@ -296,20 +304,42 @@ def _install_fake_db(monkeypatch) -> List[Dict[str, Any]]:
 @pytest.mark.asyncio
 async def test_promote_dry_run_does_not_execute(monkeypatch) -> None:
     """Default invocation (apply=False) never writes."""
-    executed = _install_fake_db(monkeypatch)
+    executed = _install_fake_db(monkeypatch, catalog_track="internal_merchant")
     out = await promoter.promote_variants_for_group(group_id="pg_x", apply=False)
     assert executed == []
     # Two real variants found (V1, V2); MOYU default filtered out
     assert out.variants_found == 3
     assert out.variants_promoted == 2  # would-promote count, not actually written
+    # money lane: the tier can move, so nothing is held. A BOUND — unchanged by the
+    # tier-held split — so `getattr`, or it would die on the harness rather than on
+    # the behaviour when run against a promoter that predates the counter.
+    assert getattr(out, "variants_tier_held", 0) == 0
     assert out.skipped_reason is None
+
+
+@pytest.mark.asyncio
+async def test_the_dry_run_predicts_the_tier_held_split_too(monkeypatch) -> None:
+    """A PREVIEW THAT OVERSTATES IS THE SAME LIE AS A REPORT THAT DOES. The same
+    fixture on the REDIRECT lane: `promoted_readiness_tier` offers 'referral_only',
+    which is the FLOOR of `index_graduation_ladder.OBSERVED_READINESS_LADDER`, so
+    `UPSERT_SKU_SQL`'s upward-only CASE cannot raise any stored tier and an INSERT
+    mints the floor. Nothing on this lane can be promoted, so a dry run must not
+    say two rows would be — it says two rows would be WRITTEN with the tier held."""
+    executed = _install_fake_db(monkeypatch)  # no catalog_track — the redirect lane
+    out = await promoter.promote_variants_for_group(group_id="pg_x", apply=False)
+    assert executed == []
+    assert out.variants_found == 3
+    assert out.variants_promoted == 0, (
+        "the dry run claimed a promotion on a lane where the tier cannot move"
+    )
+    assert out.variants_tier_held == 2
 
 
 @pytest.mark.asyncio
 async def test_promote_apply_upserts_per_real_variant(monkeypatch) -> None:
     """Apply path: one UPSERT per real variant. NO writes to
     catalog_products / seed_data / product_payload."""
-    executed = _install_fake_db(monkeypatch)
+    executed = _install_fake_db(monkeypatch, catalog_track="internal_merchant")
     out = await promoter.promote_variants_for_group(group_id="pg_x", apply=True)
     assert out.variants_promoted == 2
     upserts = [e for e in executed if "INSERT INTO catalog_skus" in e["sql"]]
@@ -349,17 +379,23 @@ async def test_promote_does_not_claim_commerce_ready_off_the_money_lane(monkeypa
     external-seed SKU rows holding 'commerce_ready' that should hold
     'referral_only', and names this writer. This fixture's primary carries no
     `catalog_track` at all, which `promoted_readiness_tier` treats as the redirect
-    lane on purpose: over-claiming a tier fabricates a purchasable SKU, while
-    under-claiming one only understates a row another lane can still promote.
+    lane on purpose: the function is an ALLOWLIST of `internal_merchant`, so an
+    unknown, absent or not-yet-invented track gets the floor. Over-claiming a tier
+    fabricates a purchasable SKU; under-claiming one only understates a row another
+    lane can still promote.
 
     A behavioural pin on the params, not a string check on the SQL — the executing
     proof of the tier's UPWARD-ONLY move is
     tests/test_sku_identity_upserts_postgres.py, which needs a real Postgres."""
     executed = _install_fake_db(monkeypatch)
-    await promoter.promote_variants_for_group(group_id="pg_x", apply=True)
+    out = await promoter.promote_variants_for_group(group_id="pg_x", apply=True)
     upserts = [e for e in executed if "INSERT INTO catalog_skus" in e["sql"]]
     assert upserts, "nothing was written; this test would be vacuous"
     assert {e["params"]["readiness_tier"] for e in upserts} == {"referral_only"}
+    # ...and the rows are not counted as promotions: 'referral_only' is the ladder
+    # FLOOR, so the upward-only CASE moved nothing.
+    assert out.variants_promoted == 0
+    assert out.variants_tier_held == len(upserts)
 
 
 @pytest.mark.asyncio
@@ -423,6 +459,8 @@ async def test_promote_prefers_path_b_seed_when_both_paths_have_data(monkeypatch
             "product_key": "p_x",
             "merchant_id": "m", "platform": "x", "source_product_id": "s",
             "parent_title": "X",
+            # the money lane, so `variants_promoted` below still counts promotions
+            "catalog_track": "internal_merchant",
             "product_payload": {"variants": [_moyu_default_variant()]},  # 1 default
             "seed_data": {"snapshot": {"variants": [_tomford_variant("real_1"), _tomford_variant("real_2")]}},
         }

@@ -905,11 +905,14 @@ async def test_a_claimed_attach_refreshes_the_stored_sku_without_moving_its_merc
     # `.get` on the NEW counter, deliberately: a KeyError is a harness death, and a
     # test that dies on the harness proves nothing about the behaviour above it.
     assert counts.get("skus_adopted_stored_merchant") == 1
-    # the offer follows its SKU's seller rather than naming one the SKU is not
-    # filed under
+    # The offer keeps the seller the PLAN carries (`_prepare_seller_of_record`
+    # rewrites pdps and skus, never offers) — the adoption is SKU-side only. On
+    # this path that is also the stored SKU's merchant, so nothing diverges here;
+    # the case where it does is the external_seed canonical one below.
     offer = dict(await db.fetch_one(
         "SELECT * FROM catalog_offers WHERE sku_key = :k", {"k": key}))
     assert offer["merchant_id"] == MERCHANT
+    assert counts.get("offers_kept_plan_seller_on_adoption", 0) == 0
 
     # RUNS 2 AND 3. The plan is rebuilt exactly as the nightly job would rebuild it.
     for run in (2, 3):
@@ -980,7 +983,19 @@ async def test_an_external_seed_canonical_row_is_adopted_not_refused(db):
     stored merchant is rule 1 ("existing rows win") one table further down: the row
     already exists under that bucket, so nothing NEW is created there and the
     ADR-009 D2 tripwire — which fires in `_prepare_seller_of_record`, on the plan —
-    has nothing to say about it."""
+    has nothing to say about it.
+
+    AND THE OFFER MUST NOT FOLLOW. Round 4 re-pointed the offer's `merchant_id` at
+    the adopted merchant too, which on THIS case is the sentinel itself:
+    `_OFFER_UPSERT_SQL` conflicts on `offer_id` and never updates `merchant_id`, so
+    that re-point does not move a row — it INSERTS a BRAND-NEW `catalog_offers` row
+    under `merchant_id='external_seed'`, on every mirror refresh, which is the
+    write ADR-009 D2 bans outright and which
+    `scripts/verify_seller_rekey.orphan_failures` reports as
+    `orphan_residue:catalog_offers=N` once `catalog_products` is clean of the
+    bucket. A fix that makes the bucket it is draining self-sustaining is not a
+    fix. So the SKU adoption is key/identity resolution only; the offer keeps the
+    per-brand `merch_obs_…` seller the plan carries."""
     canonical_key = f"{PK}::canonical"
     await _seed_product(db, merchant=OBSERVED_MERCHANT)
     await _seed_sku(
@@ -1012,16 +1027,53 @@ async def test_an_external_seed_canonical_row_is_adopted_not_refused(db):
     sku = dict(rows[0])
     assert sku["title"] == "Gate Lipstick (re-ingest)"
     assert sku["merchant_id"] == EXTERNAL_SEED_MERCHANT, "the stored row's merchant moved"
-    # AND THE OFFER FOLLOWS ITS SKU. An offer filed under a seller its own SKU is
-    # not filed under is what every merchant-scoped join reads as two different
-    # sellers for one row.
+
+    # AND THE OFFER DID NOT FOLLOW IT INTO THE SENTINEL BUCKET.
     offer = dict(await db.fetch_one(
         "SELECT * FROM catalog_offers WHERE sku_key = :k", {"k": canonical_key}))
-    assert offer["merchant_id"] == EXTERNAL_SEED_MERCHANT, (
-        "the offer kept the plan's seller while its SKU adopted the stored one"
+    assert offer["merchant_id"] == OBSERVED_MERCHANT, (
+        "the SKU's adoption re-pointed its OFFER into ADR-009 D2's banned "
+        "'external_seed' bucket — a NEW row there on every mirror refresh"
     )
     assert counts.get("skus_adopted_stored_merchant") == 1
-    assert counts.get("offers_rekeyed_to_stored_merchant") == 1
+    assert counts.get("offers_kept_plan_seller_on_adoption") == 1
+
+    # THE INVARIANT, ASKED OF THE REPO'S OWN CHECKER rather than restated here.
+    # Three steps, none of which can pass vacuously:
+    #
+    #  1. the banned id is `services.seller_identity`'s, not a literal typed here;
+    #  2. `verify_seller_rekey.SELLER_COLUMNS_SQL` really does classify
+    #     catalog_offers as a PRODUCT-SCOPED table (it carries product_key and
+    #     sku_key), which is what puts it in the "ownership" bucket rather than the
+    #     reported-only "history" one;
+    #  3. `orphan_failures` really does FAIL such a row once catalog_products is
+    #     clean — asserted on the shape this write WOULD have produced, so the zero
+    #     below means something.
+    #
+    # Scoped to this fixture's product keys on purpose: the dialect gate shares one
+    # database, and a global count would report another file's rows.
+    from scripts.verify_seller_rekey import SELLER_COLUMNS_SQL, orphan_failures
+    from services.seller_identity import BANNED_BUCKET_MERCHANT_ID
+
+    assert EXTERNAL_SEED_MERCHANT == BANNED_BUCKET_MERCHANT_ID
+    classified = {
+        dict(r)["table_name"]: bool(dict(r)["product_scoped"])
+        for r in await db.fetch_all(SELLER_COLUMNS_SQL)
+    }
+    assert classified.get("catalog_offers") is True, (
+        "catalog_offers is no longer an ownership table for the ADR-009 checker; "
+        "this assertion's premise is gone"
+    )
+    assert orphan_failures(
+        {"ownership": {"catalog_products": 0, "catalog_offers": 1}}
+    ) == ["orphan_residue:catalog_offers=1"], (
+        "orphan_failures no longer fails a sentinel offer; the zero below is vacuous"
+    )
+    assert await db.fetch_val(
+        "SELECT count(*) FROM catalog_offers "
+        " WHERE product_key = ANY(:pks) AND merchant_id = :banned",
+        {"pks": [PK, PK_OTHER, LONG_PK], "banned": BANNED_BUCKET_MERCHANT_ID},
+    ) == 0, "the adoption made ADR-009 D2's banned bucket self-sustaining"
 
 
 async def test_the_adoption_does_not_follow_its_key_into_another_product(db):
@@ -1308,6 +1360,126 @@ async def test_a_suppressed_key_holder_neither_refuses_the_adoption_nor_is_heale
     assert withdrawn["product_key"] == PK_OTHER, "the heal moved a withdrawn row"
     assert withdrawn["source_variant_id"] == "default", "the heal re-pointed it"
     assert withdrawn["title"] == "Withdrawn elsewhere"
+
+
+async def test_a_suppressed_row_holding_only_the_KEY_is_a_skip_not_a_23505(db):
+    """THE OTHER HALF OF PREDICATE (d), and the half nothing reached.
+
+    Branch (d) fires on `identity in suppressed_identities OR planned_key in
+    suppressed_keys`. Every existing test drives the FIRST disjunct — a suppressed
+    row carrying the plan's identity tuple — so deleting the second left the file
+    48/48 green. This builds the input only the second can catch.
+
+    The suppressed row here is under THIS product (so the suppressed lookup, which
+    is scoped by product_key, sees it) and holds the plan's `sku_key`, but its
+    `source_variant_id` is the legacy 'default', so its identity tuple is NOT the
+    plan's. Both live lookups filter `suppressed_at IS NULL`, so:
+
+      - `_SKU_IDENTITY_LOOKUP_SQL` finds nothing -> `held_key` is None -> no (a);
+      - `_SKU_KEY_HOLDER_LOOKUP_SQL` finds nothing -> `holder_identity` is None ->
+        `key_taken_by_another` is False, so (c), (b0) and (b) are all out of reach.
+
+    So without the key half the planned row walks straight to the upsert and takes
+    a 23505 on the PRIMARY KEY the withdrawn row holds — reported as
+    `skus_identity_conflict`, which says "two live rows disagree" about a case that
+    is nothing of the sort. The withdrawal is the whole story, and the count has to
+    say so: an operator triaging `skus_identity_conflict` looks for the rival row,
+    and there isn't one."""
+    key = _ingestion_key()
+    await _seed_product(db)
+    await _seed_sku(
+        db, sku_key=key, vid="default", suppressed=True,
+        payload={"agent_version": "withdrawn"}, title="Ruby (withdrawn)",
+    )
+
+    planned = _planned_sku()
+    counts = await _apply(
+        _plan([planned], [_planned_offer(sku_key=planned["sku_key"])]), batch=False
+    )
+
+    assert counts["skus_skipped_suppressed_identity"] == 1, (
+        "a withdrawn row holding the planned KEY was reported as something else"
+    )
+    assert counts["skus_identity_conflict"] == 0, (
+        "the withdrawal was reported as a conflict between two live rows"
+    )
+    assert counts["skus"] == 0 and counts["offers"] == 0
+    assert counts["offers_dropped_for_refused_sku"] == 1
+    assert counts["skus_identity_healed"] == 0
+
+    rows = await db.fetch_all(
+        "SELECT * FROM catalog_skus WHERE product_key = :pk", {"pk": PK})
+    assert len(rows) == 1, "a rival row was inserted beside the withdrawn one"
+    sku = dict(rows[0])
+    assert sku["title"] == "Ruby (withdrawn)", "the withdrawn row was refreshed"
+    assert sku["suppressed_at"] is not None, "the withdrawn row was resurrected"
+    assert sku["source_variant_id"] == "default", "the heal re-pointed a withdrawn row"
+    assert await db.fetch_val(
+        "SELECT count(*) FROM catalog_offers WHERE product_key = :pk", {"pk": PK}
+    ) == 0
+
+
+async def test_two_planned_rows_that_ADOPT_onto_one_row_are_one_write(db):
+    """STEP 1 DE-DUPLICATES THE PLAN; THE ADOPTIONS RE-WRITE IT AFTERWARDS.
+
+    Step 1 collapses planned rows sharing the identity the plan CARRIES. (a) and
+    (b0) then rewrite that identity in opposite directions — one row adopts the
+    stored KEY, the other adopts the stored MERCHANT — so two rows step 1 saw as
+    distinct come out naming the SAME stored row. The executor upserts it twice and
+    `counts["skus"]` reports two writes where one row exists: exactly the lie step 1
+    exists to prevent, one resolution later.
+
+    NOT REACHABLE FROM `ingest_validated_jsonl` TODAY — `_prepare_seller_of_record`
+    rule 1 pins every plan row of a product_key to that product's merchant, so no
+    two planned rows can differ on `merchant_id` alone. This drives
+    `apply_ingest_plan` with an EMPTY `pdps` list, which is what makes rule 1 a
+    no-op (it derives its product_keys from the pdps), so the two merchants survive
+    into the arbiter. A bound on a resolution step, pinned rather than assumed."""
+    stored_key = _ingestion_key()
+    promoter_key = _promoter_key()
+    await _seed_product(db, merchant=MERCHANT)
+    await _seed_sku(db, sku_key=stored_key, payload={"agent_version": "stored"},
+                    title="Ruby (stored)")
+
+    # X holds the stored KEY and differs only on merchant -> (b0) adopts MERCHANT.
+    x = _planned_sku(merchant=OTHER_MERCHANT, title="Ruby (X)")
+    # Y already carries MERCHANT under the promoter spelling, so the stored row
+    # holds its IDENTITY -> (a) adopts `stored_key`.
+    y = _planned_sku(sku_key=promoter_key, merchant=MERCHANT, title="Ruby (Y)")
+    assert x["sku_key"] == stored_key and y["sku_key"] != stored_key
+
+    counts = await _apply(
+        _plan(
+            [x, y],
+            [_planned_offer(sku_key=stored_key),
+             _planned_offer(sku_key=promoter_key, dest=DEST + "?v=2")],
+        ),
+        batch=False,
+    )
+
+    # the premise: both adoptions fired, and step 1 did NOT collapse them (the
+    # plan's carried identities differ on merchant_id)
+    assert counts["skus_adopted_stored_merchant"] == 1, "(b0) did not fire"
+    assert counts["skus_adopted_existing_identity"] == 1, "(a) did not fire"
+    assert counts["skus_deduped_same_identity"] == 0, (
+        "step 1 collapsed them, so this test is not about the post-adoption dedupe"
+    )
+
+    # THE BEHAVIOUR FIRST, the new counter after and with `.get`: a test that dies
+    # on a KeyError for a counter a mutant removed has proved nothing.
+    assert counts["skus"] == 1, "counts['skus'] overstated the rows written"
+    assert counts.get("skus_deduped_after_adoption") == 1
+    rows = await db.fetch_all(
+        "SELECT * FROM catalog_skus WHERE product_key = :pk", {"pk": PK})
+    assert len(rows) == 1, "a rival row was inserted"
+    assert dict(rows[0])["sku_key"] == stored_key
+    assert dict(rows[0])["merchant_id"] == MERCHANT, "the stored row's merchant moved"
+    # the loser's offer follows the survivor's key, so it is not an orphan
+    keys = sorted(dict(r)["sku_key"] for r in await db.fetch_all(
+        "SELECT sku_key FROM catalog_offers WHERE product_key = :pk", {"pk": PK}))
+    assert keys == [stored_key, stored_key]
+    assert counts["offers"] == 2
+    assert counts["offers_dropped_for_refused_sku"] == 0
 
 
 # --- (i) readiness_tier ------------------------------------------------------
@@ -1669,6 +1841,12 @@ async def test_the_promoter_moves_the_tier_up_on_an_adopted_row(db):
     outcome = await promoter.promote_variants_for_group(group_id=GROUP_ID, apply=True)
 
     assert outcome.variants_promoted == 1
+    # A BOUND, not a fix: the money lane's count is unchanged by the round-5 split,
+    # so this passes before and after it. `getattr` because a bound test that dies
+    # with an AttributeError on the pre-image has proved nothing about the pre-image.
+    assert getattr(outcome, "variants_tier_held", 0) == 0, (
+        "a money-lane row whose tier really moved was filed as tier-held"
+    )
     assert outcome.skus_identity_conflict == 0
     row = dict(await db.fetch_one(
         "SELECT * FROM catalog_skus WHERE sku_key = :k", {"k": ingestion_key}))
@@ -1690,7 +1868,15 @@ async def test_the_promoter_does_not_mint_commerce_ready_on_the_referral_lane(db
     Making the tier upward-only WITHOUT this gate would have turned the promoter
     into the writer that RE-MINTS that leak the moment #2139's repair landed. An
     external_referral product is a redirect to somebody else's storefront, which is
-    what `ingestion.OFFER_READINESS_TIER` already says for the same lane."""
+    what `ingestion.OFFER_READINESS_TIER` already says for the same lane.
+
+    AND THE ROW IS NOT COUNTED A PROMOTION. 'referral_only' is the FLOOR of
+    `index_graduation_ladder.OBSERVED_READINESS_LADDER`, so on this lane
+    `UPSERT_SKU_SQL`'s upward-only CASE cannot raise any stored tier and an INSERT
+    mints the floor — nothing here was promoted, whatever the write did to the
+    row's content. Round 4 still counted it in `variants_promoted`, which is the
+    same lie the INSERT-only `readiness_tier` told: the headline number claiming
+    promotions that never happened."""
     import services.catalog_variant_promoter as promoter
 
     await _seed_product(db, payload=_payload_with_variants(),
@@ -1699,12 +1885,19 @@ async def test_the_promoter_does_not_mint_commerce_ready_on_the_referral_lane(db
 
     outcome = await promoter.promote_variants_for_group(group_id=GROUP_ID, apply=True)
 
-    assert outcome.variants_promoted == 1
+    assert outcome.variants_promoted == 0, (
+        "a redirect-lane write whose tier could not move was counted a promotion"
+    )
+    assert outcome.variants_tier_held == 1
     assert await db.fetch_val(
         "SELECT readiness_tier FROM catalog_skus WHERE sku_key = :k",
         {"k": _promoter_key()}) == "referral_only", (
         "the promoter re-minted the commerce_ready leak #2139 repairs"
     )
+    # ...and the write DID happen — this is a tier held, not a row skipped.
+    assert await db.fetch_val(
+        "SELECT title FROM catalog_skus WHERE sku_key = :k",
+        {"k": _promoter_key()}) == "Ruby"
 
 
 async def test_the_promoter_never_demotes_a_stored_commerce_ready_row(db):
@@ -1724,7 +1917,10 @@ async def test_the_promoter_never_demotes_a_stored_commerce_ready_row(db):
 
     outcome = await promoter.promote_variants_for_group(group_id=GROUP_ID, apply=True)
 
-    assert outcome.variants_promoted == 1
+    # the redirect lane again: the write lands, the tier is held (here at a value
+    # ABOVE the offered floor), and nothing is reported as promoted
+    assert outcome.variants_promoted == 0
+    assert outcome.variants_tier_held == 1
     row = dict(await db.fetch_one(
         "SELECT * FROM catalog_skus WHERE sku_key = :k", {"k": ingestion_key}))
     assert row["readiness_tier"] == "commerce_ready", "a re-projection demoted a SKU"
@@ -1732,16 +1928,32 @@ async def test_the_promoter_never_demotes_a_stored_commerce_ready_row(db):
 
 
 def test_promoted_readiness_tier_treats_an_unknown_track_as_the_redirect_lane():
-    """The asymmetry, stated. Over-claiming a tier fabricates a purchasable SKU;
-    under-claiming one only understates a row another lane can still promote. A row
-    handed to the promoter without a `catalog_track` therefore gets the floor."""
+    """AN ALLOWLIST, WHICH IS WHAT THE NAME OF THIS TEST ALREADY CLAIMED. Round 4
+    wrote a DENYLIST OF ONE — `if not track or track == 'external_referral'` — so
+    'citation' and 'marketplace' came out `commerce_ready`, contradicting this test's
+    own name and the docstring above the function. `catalog_track` is
+    `VARCHAR(32) NOT NULL DEFAULT 'internal_merchant'`, so NULL is impossible and
+    today's two column writers spell only the two lanes; but the repo's
+    `catalog_track` vocabulary is already wider than its writers
+    (`pivot_query_service` emits 'citation' for an offer-free, deliberately
+    un-buyable serving item), and the next track is added by someone who is not
+    reading the promoter.
+
+    The asymmetry decides the default: over-claiming a tier fabricates a purchasable
+    SKU, under-claiming one only understates a row another lane can still promote.
+    So `commerce_ready` for `internal_merchant` and NOTHING else."""
     from services.catalog_variant_promoter import promoted_readiness_tier
 
     assert promoted_readiness_tier("internal_merchant") == "commerce_ready"
+    assert promoted_readiness_tier(" INTERNAL_MERCHANT ") == "commerce_ready"
     assert promoted_readiness_tier("external_referral") == "referral_only"
     assert promoted_readiness_tier("EXTERNAL_REFERRAL ") == "referral_only"
     assert promoted_readiness_tier(None) == "referral_only"
     assert promoted_readiness_tier("") == "referral_only"
+    # THE MUTANT THIS KILLS: a denylist of 'external_referral' returns
+    # 'commerce_ready' for every one of these.
+    for unknown in ("citation", "marketplace", "internal_merchan", "wholesale", "x"):
+        assert promoted_readiness_tier(unknown) == "referral_only", unknown
 
 
 async def test_the_promoters_tier_move_is_the_repos_ladder_and_only_upward(db):

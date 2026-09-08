@@ -114,7 +114,20 @@ class GroupOutcome:
     product_group_id: str
     primary_product_key: str
     variants_found: int
+    #: Rows written on a lane where the write can actually PROMOTE — the money
+    #: lane. See `variants_tier_held` for what this deliberately excludes.
     variants_promoted: int
+    #: Rows written whose `readiness_tier` did NOT move and could not have.
+    #:
+    #: On the redirect lane `promoted_readiness_tier` offers 'referral_only', the
+    #: FLOOR of `index_graduation_ladder.OBSERVED_READINESS_LADDER`, so
+    #: `UPSERT_SKU_SQL`'s upward-only CASE is a no-op by construction: an existing
+    #: row keeps whatever tier it had, and an INSERT mints the floor. Counting
+    #: those in `variants_promoted` is the same lie the INSERT-only
+    #: `readiness_tier` told before this PR — "promoted" has to mean the tier moved
+    #: or the lane could move it. The content re-projection still lands (title, sku,
+    #: options, payload merge); this counter says so without claiming a promotion.
+    variants_tier_held: int = 0
     skipped_reason: Optional[str] = None
     sample_variant_titles: List[str] = field(default_factory=list)
     #: Rows refused by the OTHER unique constraint — same sku_key, different
@@ -145,6 +158,10 @@ class PromoterReport:
     groups_skipped_no_real_variants: int = 0
     groups_skipped_no_primary: int = 0
     skus_upserted_total: int = 0
+    #: See `GroupOutcome.variants_tier_held`. Rows written on a lane whose offered
+    #: tier is the ladder floor, so nothing was promoted. NOT included in
+    #: `skus_upserted_total`: read the two together to get rows written.
+    skus_tier_held_total: int = 0
     #: See `GroupOutcome.skus_identity_conflict` — these are permanent refusals, not
     #: retriable ones.
     skus_identity_conflict_total: int = 0
@@ -436,10 +453,15 @@ SELECT_GROUPS_TO_PROCESS_SQL = """
 """
 
 
-#: The track a redirect row carries — `ingestion.DEFAULT_CATALOG_TRACK`,
+#: The ONE track that may claim a checkout — an ALLOWLIST of one, deliberately;
+#: see `promoted_readiness_tier`. `catalog_products.catalog_track` is
+#: `String(32), nullable=False, server_default="internal_merchant"` (db/catalog.py),
+#: so this is both the schema default and the money lane. The redirect lane's own
+#: spelling ('external_referral' — `ingestion.DEFAULT_CATALOG_TRACK`,
 #: `mirror_external_seeds_to_catalog_products.CATALOG_TRACK`,
-#: `index_graduation_ladder._OBSERVED_CATALOG_TRACK` all spell it this way.
-_EXTERNAL_REFERRAL_TRACK = "external_referral"
+#: `index_graduation_ladder._OBSERVED_CATALOG_TRACK`) is deliberately NOT named
+#: here: naming it would make this a denylist again the day a third track lands.
+_INTERNAL_MERCHANT_TRACK = "internal_merchant"
 
 
 def promoted_readiness_tier(catalog_track: Optional[str]) -> str:
@@ -461,14 +483,29 @@ def promoted_readiness_tier(catalog_track: Optional[str]) -> str:
     `commerce_ready` means a checkout can be proved. An `external_referral` product
     is a redirect to somebody else's storefront, which is exactly what
     `ingestion.OFFER_READINESS_TIER` says by writing 'referral_only' for the same
-    lane. An UNKNOWN track (no column in the row handed to this function) is
-    treated as the redirect lane too: over-claiming a tier fabricates a purchasable
-    SKU, under-claiming one only understates a row another lane can still promote.
+    lane.
+
+    AN ALLOWLIST, NOT A DENYLIST — the round-4 cut of this function was
+    `if not track or track == 'external_referral': referral_only; else
+    commerce_ready`, which is a denylist of ONE. It contradicted the paragraph
+    below it: 'citation' and 'marketplace' are not `external_referral`, so they
+    came out `commerce_ready` while the docstring claimed an unknown track gets the
+    floor. `catalog_products.catalog_track` is `VARCHAR(32) NOT NULL DEFAULT
+    'internal_merchant'` and today's two column writers spell it
+    `internal_merchant` or `external_referral` — but the repo's `catalog_track`
+    VOCABULARY is already wider than its writers (`pivot_query_service` emits
+    'citation' on the serving side for an offer-free, deliberately un-buyable
+    item), and the next track added is added by someone who is not reading this
+    file. An allowlist makes that person's default the floor.
+
+    So: `commerce_ready` ONLY for `internal_merchant`. Everything else — the
+    redirect lane, an unknown track, a track that does not exist yet, or no column
+    at all in the row handed to this function — gets the floor. The asymmetry is
+    the whole reason: over-claiming a tier fabricates a purchasable SKU,
+    under-claiming one only understates a row another lane can still promote.
     """
     track = str(catalog_track or "").strip().lower()
-    if not track or track == _EXTERNAL_REFERRAL_TRACK:
-        return "referral_only"
-    return "commerce_ready"
+    return "commerce_ready" if track == _INTERNAL_MERCHANT_TRACK else "referral_only"
 
 
 # THE 3-COLUMN INDEX THIS USED TO NAME NO LONGER EXISTS. Migration 123
@@ -658,7 +695,17 @@ async def promote_variants_for_group(
     # and a redirect is not a checkout.
     readiness_tier = promoted_readiness_tier(primary.get("catalog_track"))
 
+    # AND WHETHER A WRITE ON THIS LANE CAN PROMOTE ANYTHING. The offered tier is
+    # decided once for the group, so this is too: 'referral_only' is the FLOOR of
+    # `index_graduation_ladder.OBSERVED_READINESS_LADDER`, so `UPSERT_SKU_SQL`'s
+    # upward-only CASE cannot move a stored tier and an INSERT mints the floor.
+    # Every row written on that lane is `variants_tier_held`, never
+    # `variants_promoted` — the content re-projection lands, the tier does not
+    # move, and the counter says which.
+    tier_can_move = readiness_tier != "referral_only"
+
     promoted = 0
+    tier_held = 0
     identity_conflicts = 0
     write_failures = 0
     if apply and rows_to_upsert:
@@ -698,7 +745,10 @@ async def promote_variants_for_group(
                     # savepoint one such variant takes the whole group down with it.
                     async with database.transaction():
                         await database.execute(UPSERT_SKU_SQL, params)
-                    promoted += 1
+                    if tier_can_move:
+                        promoted += 1
+                    else:
+                        tier_held += 1
                 except Exception as exc:  # noqa: BLE001
                     if not _is_unique_violation(exc):
                         # ONE BAD VARIANT IS NOT A BAD RUN. This used to re-raise,
@@ -733,7 +783,15 @@ async def promote_variants_for_group(
         product_group_id=group_id,
         primary_product_key=primary["product_key"],
         variants_found=len(raw_variants),
-        variants_promoted=promoted if apply else len(rows_to_upsert),
+        # The dry run predicts the SAME split the apply path reports — a preview
+        # that says "2 promoted" for a lane on which nothing can be promoted is the
+        # very claim this counter exists to stop making.
+        variants_promoted=(
+            promoted if apply else (len(rows_to_upsert) if tier_can_move else 0)
+        ),
+        variants_tier_held=(
+            tier_held if apply else (0 if tier_can_move else len(rows_to_upsert))
+        ),
         sample_variant_titles=sample_titles,
         skus_identity_conflict=identity_conflicts,
         skus_write_failed=write_failures,
@@ -780,10 +838,20 @@ async def promote_variants_all(
     AND `variants_promoted` NO LONGER MEANS 'commerce_ready'. The tier a promoted
     row may claim comes from its PRODUCT's `catalog_track`
     (`promoted_readiness_tier`): this entry point's candidate query admits
-    external-seed products, so on the redirect lane a promotion writes
-    'referral_only'. On the money lane the tier now MOVES — upward only — where it
-    was INSERT-only before, and a promotion could leave a 'referral_only' row
-    exactly where it found it while counting itself.
+    external-seed products, so on the redirect lane a write offers 'referral_only'.
+    On the money lane the tier now MOVES — upward only — where it was INSERT-only
+    before, and a promotion could leave a 'referral_only' row exactly where it
+    found it while counting itself.
+
+    SO THE COUNT IS SPLIT. `referral_only` is the FLOOR of the repo's ladder, so on
+    the redirect lane the upward-only CASE cannot move any stored tier and an
+    INSERT mints the floor: NOTHING on that lane is ever promoted, whatever the
+    write did to the row's content. Those rows are `variants_tier_held` /
+    `skus_tier_held_total`; `variants_promoted` / `skus_upserted_total` now count
+    only rows on a lane whose write can actually raise the tier. Rows WRITTEN is
+    the two added together — a reader watching only `skus_upserted_total` on an
+    external-seed corpus will now correctly see zero promotions rather than a
+    headline number that never promoted anything.
     """
     report = PromoterReport()
 
@@ -815,6 +883,7 @@ async def promote_variants_all(
         else:
             report.groups_promoted += 1
             report.skus_upserted_total += outcome.variants_promoted
+            report.skus_tier_held_total += outcome.variants_tier_held
         report.skus_identity_conflict_total += outcome.skus_identity_conflict
         report.skus_write_failed_total += outcome.skus_write_failed
         report.skus_deduped_same_identity_total += outcome.skus_deduped_same_identity
