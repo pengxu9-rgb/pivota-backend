@@ -407,3 +407,133 @@ async def test_a_signature_less_evidence_row_is_counted_and_the_rest_persist(
     )
     assert summary["evidence_items_skipped_unidentified"] == 1
     assert [p.get("observation_id") for p in inserted] == ["ok"]
+
+
+# ---------------------------------------------------------------------------
+# NOT-COMPARABLE MEANS NOT COMPARABLE — categorical movements included.
+#
+# The degrade loop used to run BEFORE the four categorical movements were
+# appended, so on a pair whose basis had changed the payload shipped
+# `verdict: changed / is_material: True / "Not yet visible -> Agent-ready"`
+# directly beside three score movements reading `unknown` / `not_comparable`,
+# and `material_movements: 1` under a headline saying no movement can be
+# claimed either way. A categorical label is DERIVED from the scores under the
+# run's methodology, so a methodology change makes it exactly as unclaimable.
+# ---------------------------------------------------------------------------
+
+
+def _delta_side(*, verdict: str, visibility: int) -> dict:
+    """A report in the shape build_reaudit_delta reads, pinned to one prompt
+    set so the pair fails comparability on the MEASUREMENT BASIS (the model)
+    and not on the question set."""
+    from tests.basis_fixtures import with_provider_models
+
+    return with_provider_models({
+        "prompt_basis": {"selected_set_id": "sel_pinned"},
+        "verdict": {
+            "label": verdict,
+            "visibility_score": visibility,
+            "attribution_score": 40,
+            "category_visibility_score": 50,
+        },
+        "merchant_view": {
+            "headline": {
+                "verdict_label": verdict,
+                "scores": {"visibility": visibility, "attribution": 40,
+                           "category_visibility": 50},
+            },
+            "next_best_action": {
+                "primary_gap": "get_indexed",
+                "tracking_metrics": ["First-party citation rate."],
+            },
+        },
+    })
+
+
+async def _model_generation_changed_bases(report, monkeypatch):
+    """(current, prior) bases that differ ONLY in the model that answered —
+    the 2026-09-01 condition the contract was written for. Built by the real
+    writer, then the prior side's model rolled back by hand, so the pair is
+    non-comparable for one nameable reason."""
+    import db.merchant_official_domains as mod
+    from tests.basis_fixtures import writer_basis
+
+    async def _domains(merchant_id):
+        return []
+
+    monkeypatch.setattr(mod, "list_official_domains", _domains)
+    current = await writer_basis(report)
+    prior = dict(current)
+    prior["providers_and_models"] = {
+        provider: {**spec, "model_id": f"{spec.get('model_id')}-previous"}
+        for provider, spec in (current.get("providers_and_models") or {}).items()
+    }
+    assert prior["providers_and_models"], (
+        "the fixture has no providers_and_models, so this pair would be "
+        "non-comparable for a reason the test does not intend"
+    )
+    return current, prior
+
+
+async def test_a_non_comparable_pair_claims_no_categorical_movement_either(
+    monkeypatch,
+):
+    from services.audit_delta import build_reaudit_delta
+
+    current = _delta_side(verdict="Agent-ready", visibility=62)
+    prior = _delta_side(verdict="Not yet visible", visibility=41)
+    current_basis, prior_basis = await _model_generation_changed_bases(
+        current, monkeypatch
+    )
+
+    delta = build_reaudit_delta(
+        current_report=current, prior_report=prior, prior_row={"run_id": "p"},
+        days_since=30, current_basis=current_basis, prior_basis=prior_basis,
+    )
+
+    # The reason is the measurement basis, not the question set: the prompt
+    # set id is identical on both sides.
+    assert delta["measurement_basis"]["reason"] == "measurement_basis_changed"
+    # The verdict genuinely changed, and it is still not claimable.
+    by_signal = {m["signal"]: m for m in delta["movements"]}
+    assert (by_signal["verdict"]["from"], by_signal["verdict"]["to"]) == (
+        "Not yet visible", "Agent-ready",
+    )
+    for signal, movement in by_signal.items():
+        assert movement["is_material"] is False, signal
+        assert movement["direction"] == "unknown", signal
+        assert movement["detection"]["verdict"] == "not_comparable", signal
+    # ...and the headline agrees with every movement beside it.
+    assert delta["headline"].startswith("Not comparable to your last audit")
+    assert "Material change" not in delta["headline"]
+
+    # The RETAINED path re-derives the same payload from the persisted delta.
+    retained = _since_last_audit({"reaudit_delta": delta})
+    assert retained["material_movements"] == 0
+    assert retained["headline"].startswith("Not comparable to your last audit")
+    assert all(m["is_material"] is False for m in retained["movements"])
+    assert all(m["direction"] == "unknown" for m in retained["movements"])
+
+
+def test_a_retained_categorical_change_on_a_stale_basis_is_not_a_movement():
+    """The counter and the headline are produced by the SAME function and had
+    to be made to agree there: a delta persisted under an older contract
+    carries `is_material: True` on its categoricals, and `_since_last_audit`
+    skipped every non-score signal."""
+    persisted = {
+        "is_first_audit": False,
+        "days_since_last": 30,
+        "headline": "Material change since your last audit 30 days ago: "
+                    "changed: Verdict.",
+        "measurement_basis": {"same": False,
+                              "reason": "measurement_basis_changed"},
+        "movements": [
+            {"signal": "verdict", "label": "Verdict", "from": "Not yet visible",
+             "to": "Agent-ready", "direction": "changed", "is_material": True},
+        ],
+    }
+    out = _since_last_audit({"reaudit_delta": persisted})
+    assert out["material_movements"] == 0
+    assert out["movements"][0]["direction"] == "unknown"
+    assert out["movements"][0]["detection"]["verdict"] == "not_comparable"
+    assert out["headline"].startswith("Not comparable to your last audit")

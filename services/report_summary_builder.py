@@ -771,6 +771,18 @@ def _since_last_audit(report: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     comparable = basis.get("contract_version") == "2" and basis.get("same") is True
     for m in movements:
         if m.get("signal") not in SCORE_SIGNALS:
+            # CATEGORICAL movements degrade too. They are exact string matches,
+            # which is why they were skipped here — but the label being exact
+            # does not make it basis-free: `verdict` is computed from the very
+            # scores this loop has just refused to compare, and primary_gap /
+            # controller_archetype / top_controller are model output. Left
+            # untouched, a persisted `verdict: changed, is_material: True`
+            # survived into `material_movements` and contradicted the
+            # not-comparable headline stamped ten lines below.
+            if not comparable:
+                m["is_material"] = False
+                m["direction"] = "unknown"
+                m["detection"] = {"verdict": "not_comparable"}
             continue
         before, after = m.get("from"), m.get("to")
         numeric = type(before) in (int, float) and type(after) in (int, float)

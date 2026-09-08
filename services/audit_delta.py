@@ -59,14 +59,14 @@ MATERIAL_SCORE_DELTA_SAME_BASIS = MATERIAL_SCORE_DELTA
 # WHY A PAIR IS NOT COMPARABLE, IN THE MERCHANT'S WORDS.
 #
 # Keyed by the machine-readable `reason` `_measurement_basis` stamps on every
-# not-comparable verdict. The degrade block below already turns every score
-# movement into direction="unknown"/verdict="not_comparable" when
-# `basis["same"] is not True` — but the HEADLINE is the only line most readers
-# see, and `_headline` has no not-comparable branch: with nothing material left
-# to name it fell through to "No material change since your last audit N days
-# ago — keep the current plan running." That sentence is two false claims (we
-# measured no change; therefore your plan is working) on a pair we have just
-# said we cannot compare, and it is written into report_jsonb. A
+# not-comparable verdict. The degrade block below turns EVERY movement — score
+# and categorical alike — into direction="unknown"/verdict="not_comparable"
+# when `basis["same"] is not True` — but the HEADLINE is the only line most
+# readers see, and `_headline` has no not-comparable branch: with nothing
+# material left to name it fell through to "No material change since your last
+# audit N days ago — keep the current plan running." That sentence is two false
+# claims (we measured no change; therefore your plan is working) on a pair we
+# have just said we cannot compare, and it is written into report_jsonb. A
 # METHODOLOGY_VERSION bump makes it every merchant's next re-audit.
 NOT_COMPARABLE_REASONS = {
     "prompt_basis_missing": (
@@ -156,8 +156,9 @@ def build_reaudit_delta(
         }
 
     # Resolve the measurement basis BEFORE diffing scores: if this run and the
-    # prior one were measured on the same pinned prompt set, a smaller move counts
-    # as material (W2). Categorical movements are exact-match and unaffected.
+    # prior one were measured on the same pinned prompt set, a smaller move
+    # counts as material (W2). Categorical movements are exact string matches,
+    # but that does NOT make them basis-free — see the degrade block below.
     basis = _measurement_basis(
         current_report, prior_report, current, prior, current_basis, prior_basis,
     )
@@ -180,12 +181,6 @@ def build_reaudit_delta(
             )
         )
 
-    comparable = basis.get("same") is True
-    if not comparable:
-        for movement in movements:
-            movement.update(is_material=False, direction="unknown")
-            movement["detection"]["verdict"] = "not_comparable"
-
     prior_stable = _stable_fields(prior)
     current_stable = _stable_fields(current)
     for signal in ("primary_gap", "controller_archetype", "top_controller", "verdict"):
@@ -196,6 +191,40 @@ def build_reaudit_delta(
                 current=current_stable.get(signal),
             )
         )
+
+    # THE DEGRADE RUNS OVER EVERY MOVEMENT, categoricals included, and it runs
+    # AFTER they are appended. It used to sit above this loop, so the four
+    # categorical signals never reached it: a pair whose basis said
+    # "measurement_basis_changed" shipped `verdict: changed`, `is_material:
+    # True`, "Not yet visible -> Agent-ready" sitting directly beside three
+    # score movements reading `unknown` / `not_comparable`, and the
+    # `material_movements` counter on the summary contradicted the
+    # not-comparable headline above it.
+    #
+    # A CATEGORICAL LABEL IS NOT A BASIS-FREE OBSERVATION. Each of the four is
+    # derived from this run's model output under this run's methodology:
+    # `verdict` is a band label computed from the scores we have just refused
+    # to compare; `primary_gap` and `controller_archetype` come out of the
+    # next-best-action layer the LLM wrote; `top_controller` is the first host
+    # the models cited, which the 2026-09-01 model-generation change moved
+    # (multi-host 50% -> 86%) with no merchant behaviour change at all. So
+    # "the label changed" carries exactly the ambiguity the contract's "no
+    # numerical comparison without a complete basis" rule exists to refuse —
+    # we cannot tell the merchant's store from the measurement. Fail closed.
+    #
+    # A categorical read from a TABLE rather than from a model output (say
+    # "official domain verified") would be a real exception to this and could
+    # stay claimable; none of today's four is one, so there is no exception
+    # branch to write.
+    comparable = basis.get("same") is True
+    if not comparable:
+        for movement in movements:
+            movement.update(is_material=False, direction="unknown")
+            detection = movement.get("detection")
+            if not isinstance(detection, dict):
+                detection = {}
+                movement["detection"] = detection
+            detection["verdict"] = "not_comparable"
 
     return {
         "is_first_audit": False,
@@ -542,6 +571,12 @@ def _categorical_movement(
     prior: Optional[str],
     current: Optional[str],
 ) -> Dict[str, Any]:
+    """The CLAIMABLE form of a categorical signal — what it says when the two
+    runs were measured the same way. Every caller must send the result through
+    the not-comparable degrade in `build_reaudit_delta` (or the equivalent in
+    `report_summary_builder._since_last_audit`) first: these labels are derived
+    from the run's own model output under the run's own methodology, so a
+    methodology change moves them for reasons that are not the merchant's."""
     changed = bool(prior and current and prior != current)
     return {
         "signal": signal,
