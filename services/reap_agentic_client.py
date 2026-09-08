@@ -513,15 +513,28 @@ def search_queries(
     the merchant entirely, and only "Flower Beauty lip color" surfaced it. An earlier version
     generated that phrasing ONLY when a caller supplied `category` -- so a caller without a
     category (most of them) lost the phrasing most likely to work, and a resolver that had the
-    right rule refused the row anyway. When there is no category, the brand alone takes the slot:
-    Reap answers it with a slice of that merchant's catalogue, which `match_product` then filters
-    on exact name, so it is a broader net rather than a looser match.
+    right rule refused the row anyway.
 
-    AND THE SAME PHRASING IS NOT REPEATABLE. Reap's search is non-deterministic: the identical
-    query returned zero hits for this merchant twice at ~19:15 and ~19:20 and then returned the
-    product at ~19:45. `queries_tried` records which phrasings were sent, but it cannot promise
-    that re-sending one gets the same answer -- so no single pass, however many phrasings it
-    tries, establishes that something is absent from the index.
+    WHEN THERE IS NO CATEGORY, THE BRAND ALONE TAKES THE SLOT -- AND THAT FALLBACK IS UNVERIFIED
+    AGAINST THE LIVE API. The reasoning is that Reap answers a bare brand with a slice of that
+    merchant's catalogue, which `match_product` then filters on exact name, making it a broader
+    net rather than a looser match. That is a PREDICTION about Reap's behaviour, not an
+    observation: every live run that found this merchant used `<brand> <category>`. Do not read
+    this paragraph as evidence the fallback works. If it turns out not to, the fix is for callers
+    to supply a category -- which for our rows is derivable from the catalog -- and not to widen
+    the matching.
+
+    AND THE SAME PHRASING IS NOT REPEATABLE, WHICH MAKES THE WHOLE LADDER NECESSARY RATHER THAN
+    BELT-AND-BRACES. Reap's search is non-deterministic: the identical query returned zero hits
+    for this merchant twice at ~19:15 and ~19:20 and then returned the product at ~19:45. Two
+    runs of the SAME row against the SAME code an hour apart succeeded on DIFFERENT rungs -- the
+    second phrasing once, the third the next time. So the later phrasings are not tie-breakers
+    for an unusual row; they are what makes any given run land at all, and a caller that supplies
+    less than the full ladder is not trading a little recall, it is coin-flipping.
+
+    It also means `queries_tried` records what was SENT, never what re-sending would return, and
+    that no single pass -- however many phrasings -- establishes that something is absent from
+    the index. A `merchant_not_in_results` refusal is provisional and worth retrying later.
     """
     name = str(product_name or "").strip()
     brand_text = str(brand or "").strip()

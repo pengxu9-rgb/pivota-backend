@@ -1208,6 +1208,10 @@ def test_an_unknown_reason_says_so_rather_than_guessing():
 # right rule refused the row anyway.
 
 def test_the_third_phrasing_falls_back_to_the_brand_alone_without_a_category():
+    """NOTE what this test does and does not establish. It pins that the slot is FILLED rather
+    than dropped — the measured bug was a caller losing the rung entirely. Whether a bare brand
+    query actually surfaces the merchant is a prediction about Reap that no test here can check:
+    every live run that found flowerbeauty.com used `<brand> <category>`."""
     queries = rc.search_queries(product_name="Petal Pout Lip Color", brand="Flower Beauty")
     assert len(queries) == 3
     assert queries[-1] == "Flower Beauty"
@@ -1256,3 +1260,32 @@ def test_the_brand_only_phrasing_actually_reaches_the_resolver(monkeypatch):
 def test_the_default_budget_is_large_enough_for_all_three_phrasings():
     """A three-phrasing strategy behind a two-attempt cap is a strategy that does not exist."""
     assert rc.MAX_SEARCH_ATTEMPTS >= 3
+
+
+def test_the_full_ladder_is_sent_when_earlier_rungs_miss(monkeypatch):
+    """Reap's search is non-deterministic, and two runs of the SAME row against the SAME code an
+    hour apart succeeded on DIFFERENT rungs — the second phrasing once, the third the next time.
+    So the later phrasings are not tie-breakers for an unusual row; they are what makes any given
+    run land at all. A resolver that stops early is not trading a little recall, it is
+    coin-flipping."""
+    seen = []
+
+    async def fake(path, body, **kw):
+        if path.endswith("/search"):
+            seen.append(body["query"])
+            if body["query"] != "Flower Beauty lip color":
+                return rc.ReapResponse(ok=True, status=200, data={"products": [], "warnings": []})
+            return rc.ReapResponse(ok=True, status=200, data=FLOWER_SEARCH)
+        if path.endswith("/details"):
+            return rc.ReapResponse(ok=True, status=200, data=FLOWER_DETAILS)
+        return rc.ReapResponse(ok=True, status=200, data=FLOWER_VARIANT)
+    monkeypatch.setattr(rc, "_post", fake)
+
+    got = _run(rc.resolve_our_row(
+        merchant_domain="flowerbeauty.com", product_name="Petal Pout Lip Color",
+        brand="Flower Beauty", category="lip color", variant_title="Flamingo Flirt",
+        our_price=8.00,
+    ))
+    assert got.ok and got.variant_id == "var_flamingo"
+    assert seen == ["Flower Beauty Petal Pout Lip Color", "Petal Pout Lip Color",
+                    "Flower Beauty lip color"]
