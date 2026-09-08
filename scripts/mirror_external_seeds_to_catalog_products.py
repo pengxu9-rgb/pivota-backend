@@ -532,6 +532,72 @@ async def _upsert_canonical_sku_for_mirror_row(
         "external_product_id": row_dict.get("external_product_id"),
         "destination_url": row_dict.get("destination_url"),
     }
+    # WHY THE ARBITER STAYS ON THE PRIMARY KEY HERE, when the two sibling
+    # catalog_skus upserts moved to the identity index in f846ad546
+    # (`catalog_enrichment_agent/apply._SKU_UPSERT_SQL`,
+    # `catalog_variant_promoter.UPSERT_SKU_SQL`).
+    #
+    # catalog_skus carries TWO unique constraints — the PK `sku_key` and
+    # `idx_catalog_skus_source_identity_v2 (merchant_id, platform, product_key,
+    # source_variant_id)`, which migration 123 created while DROPPING the old
+    # 3-column `(merchant_id, platform, source_variant_id)`. Postgres INFERS one
+    # arbiter from an ON CONFLICT clause and never falls through to the other, so
+    # which one a statement names is semantics, not style.
+    #
+    # For THIS writer the two name the same row. `merchant_id` and `platform` are
+    # already encoded in `product_key` (storage format
+    # `prod::{merchant_id}::{platform}::{source_product_id}`, see
+    # services/seller_identity.py), `source_variant_id` IS `product_key`, and
+    # `sku_key` is `product_key || '::canonical'`. The 4-tuple and the PK are
+    # therefore in bijection across every row this lane can emit: a re-run lands
+    # on its own row under either arbiter, and no two of its own rows collide.
+    #
+    # The siblings moved because they had a MEASURED collision. The variant lanes
+    # spell one identity two ways (`<pk>::v:<vid>` vs `<pk>::v::<vid>`), and
+    # 4,971 of 16,431 planned rows raised 23505 on the index the clause did not
+    # name — prod 2026-09-07, recorded in
+    # scripts/backfill_variant_identity_skus.py's docstring. Those are VARIANT
+    # rows. This lane writes only the canonical row, a disjoint population, and
+    # no equivalent collision is known for it.
+    #
+    # Repointing here would make a failure silent rather than fix one. The only
+    # shape in which the two arbiters diverge is a FOREIGN row holding this
+    # tuple under a different `sku_key`. Under the PK arbiter that raises 23505,
+    # which every caller notices: `_apply` logs "chain write failed" and moves
+    # on, backfill_canonical_chain_for_path_b_mirror counts a chain failure, and
+    # repair_external_seed_offer_mainline has no guard at all so the run stops.
+    # Loud in all three. Under the identity arbiter it would instead upsert onto
+    # the foreign row and keep THAT row's key, while the offer written one line
+    # later is keyed on `derive_mirror_sku_key(product_key)`
+    # (services/external_offer_dual_write.py) rather than on anything this
+    # statement returns — so the offer would hang on a `::canonical` key that
+    # does not exist, and nothing would raise. The siblings could move only
+    # because they gained `_adopt_existing_sku_identities` to re-key the offer
+    # first; this lane has no such helper, and adding one is not this change.
+    #
+    # MEASURED ON PROD 2026-09-08, rather than assumed. Of 24,558
+    # `platform='external_seed'` SKUs, 11,908 carry `source_variant_id =
+    # product_key`, and ALL 11,908 are held under `product_key || '::canonical'`.
+    # Rows holding that tuple under any other `sku_key`: ZERO. So the collision
+    # the siblings had does not exist on this lane, and the PK arbiter has never
+    # cost a row. (The variant lanes structurally cannot mint one either: their
+    # `source_variant_id` is a merchant-issued variant id while `product_key` is
+    # minted by us, so no crawl can hand it back. The one lane that could is
+    # `scripts/backfill_catalog_skus_default_variant_id.py`, which runs
+    # `SET source_variant_id = product_key WHERE source_variant_id = 'default'`
+    # across every row without touching `sku_key`.)
+    #
+    # THE SAME MEASUREMENT FOUND A SECOND, OPPOSITE REASON NOT TO REPOINT. Three
+    # live rows hold `product_key || '::canonical'` as their key while carrying a
+    # `source_variant_id` that is NOT the product_key — the residual dual-unique
+    # trap, one key under an identity this lane does not spell. The PK arbiter
+    # finds them by key and refreshes them. The identity arbiter would find no
+    # matching tuple, attempt an INSERT, and hit the PRIMARY KEY: 23505 on all
+    # three, every run, forever. Repointing would not merely forgo a fix — it
+    # would break rows that work today.
+    #
+    # Re-run the census before changing any of this; the probe is five read-only
+    # SELECTs over catalog_skus and takes seconds via scripts/ops/run_oneoff_job.sh.
     await database.execute(
         """
         INSERT INTO catalog_skus
@@ -553,7 +619,26 @@ async def _upsert_canonical_sku_for_mirror_row(
           image_url = EXCLUDED.image_url,
           currency = EXCLUDED.currency,
           ingredient_ids = EXCLUDED.ingredient_ids,
-          sku_payload = EXCLUDED.sku_payload,
+          -- MERGE, never replace. This lane's own four keys are always present
+          -- in EXCLUDED, so they still win; what a replace additionally did was
+          -- erase every key some OTHER writer had stamped on the row.
+          --
+          -- Scope, measured on prod 2026-09-08 rather than asserted: of 11,911
+          -- `::canonical` rows on this platform, ZERO carry the 2026-09-08
+          -- variant-identity backfill's `variant_id_provenance` or
+          -- `source_system` — that backfill writes `::v:` variant keys, not this
+          -- one — so the replace was erasing nothing of that kind today. What it
+          -- DID share the key space with is Path C: 8,447 of those rows are
+          -- mirror-written and 3,462 carry the enrichment agent's
+          -- `agent_version` (and its `strong_identifier_kind`). This is a guard
+          -- against the next writer to stamp a canonical row, and a fix for the
+          -- Path C overlap; it is not a repair of live backfill damage.
+          --
+          -- COALESCE because `NULL || jsonb` is NULL and the column is nullable.
+          -- Same form and same reason as
+          -- `catalog_enrichment_agent/apply._SKU_UPSERT_SQL`.
+          sku_payload = COALESCE(catalog_skus.sku_payload, CAST('{}' AS jsonb))
+                        || EXCLUDED.sku_payload,
           readiness_tier = EXCLUDED.readiness_tier,
           updated_at = NOW()
         """,
@@ -563,14 +648,25 @@ async def _upsert_canonical_sku_for_mirror_row(
             "merchant_id": merchant_id,
             "platform": PLATFORM,
             "source_product_id": row_dict.get("external_product_id"),
-            # Phase 7d fix: the catalog_skus unique index
-            # `idx_catalog_skus_source_identity` is on
-            # (merchant_id, platform, source_variant_id) — only 3
-            # columns. A literal 'canonical' here makes every Path B
-            # sku collide with the first inserted one. Match Path C
-            # agent's convention (product_key as source_variant_id;
-            # sku_key = source_variant_id + '::canonical') so each
-            # product has a distinct identity tuple.
+            # The identity index is `idx_catalog_skus_source_identity_v2`
+            # (merchant_id, platform, product_key, source_variant_id).
+            # Migration 123 added `product_key` to it and DROPPED the
+            # 3-column predecessor this comment used to cite, so the
+            # original reason for the convention has expired: a literal
+            # 'canonical' would no longer collide, because product_key
+            # now separates the rows by itself.
+            #
+            # The convention stays regardless, and is not free to change.
+            # Path C's canonical row spells it the same way
+            # (catalog_enrichment_agent/ingestion._build_sku_insert), so
+            # the two lanes converge on one row instead of standing two
+            # rival spellings of one product. More load-bearing:
+            # `services/variant_identity.variant_id_provenance` classifies
+            # an id that restates the product key as PRODUCT_DERIVED, and
+            # the gateway's `isRestatedProductId` guard refuses to spend
+            # money against exactly this shape. A literal 'canonical'
+            # would be a token neither of them recognises — it would read
+            # as an ordinary variant id and lose the refusal.
             "source_variant_id": product_key,
             "sku": row_dict.get("external_product_id"),
             "barcode": None,
