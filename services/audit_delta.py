@@ -89,6 +89,25 @@ _NOT_COMPARABLE_FALLBACK = (
 )
 
 
+def _not_comparable_reason(basis: Optional[Mapping[str, Any]]) -> str:
+    """The prose reason a pair cannot be compared, or the fallback when the
+    verdict carried no machine-readable `reason`. ONE lookup, shared by every
+    line that has to say WHY (the headline and the tracking read), so the two
+    can never name different reasons for the same refusal."""
+    reason = None
+    if isinstance(basis, Mapping):
+        reason = NOT_COMPARABLE_REASONS.get(str(basis.get("reason") or ""))
+    return reason or _NOT_COMPARABLE_FALLBACK
+
+
+def not_comparable_note(basis: Optional[Mapping[str, Any]]) -> str:
+    """The `tracked_metric_results` note for a pair we refused to compare."""
+    return (
+        f"Not comparable to your last audit: {_not_comparable_reason(basis)}. "
+        "No movement can be claimed either way."
+    )
+
+
 def not_comparable_headline(
     basis: Optional[Mapping[str, Any]],
     days_since: Optional[int],
@@ -105,12 +124,9 @@ def not_comparable_headline(
     merchant to keep or change a plan — the whole point is that this pair
     licenses no conclusion about their store.
     """
-    reason = None
-    if isinstance(basis, Mapping):
-        reason = NOT_COMPARABLE_REASONS.get(str(basis.get("reason") or ""))
     return (
         f"Not comparable to your last audit{_day_phrase(days_since)}: "
-        f"{reason or _NOT_COMPARABLE_FALLBACK}. No movement can be claimed "
+        f"{_not_comparable_reason(basis)}. No movement can be claimed "
         "either way — read this run as a fresh baseline."
     )
 
@@ -246,9 +262,25 @@ def build_reaudit_delta(
         # (explicit refresh / generator version bump) and score movement partly
         # reflects the new questions; same=None means one side predates stamping.
         "measurement_basis": basis,
-        "tracked_metric_results": [
-            _tracked_metric_result(metric, movements) for metric in metrics
-        ],
+        # THE TRACKING READ IS THE SAME CLAIM ONE LAYER DOWN. Every tracked
+        # metric is derived from the movements the degrade block above just
+        # stamped direction="unknown"/verdict="not_comparable", but
+        # `_tracked_metric_result` only knows "moved" / "unchanged": with
+        # nothing material left it returned status="unchanged" with the note
+        # "…; no material movement" for every metric. Both renderers print
+        # that verbatim — "Tracking read: AI visibility rate: unchanged" —
+        # directly beneath the "Not comparable" headline, which is exactly the
+        # false no-change claim the headline branch above exists to refuse.
+        # So on a not-comparable pair the tracking read goes through the same
+        # `_not_measurable` the first-audit branch uses, naming the reason.
+        "tracked_metric_results": (
+            [_tracked_metric_result(metric, movements) for metric in metrics]
+            if comparable
+            else [
+                _not_measurable(metric, not_comparable_note(basis))
+                for metric in metrics
+            ]
+        ),
     }
 
 

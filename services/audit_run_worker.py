@@ -846,8 +846,8 @@ async def _process_one_audit_run_inner(
                         "evidence_persistence_degraded": bool(
                             canonical.get("evidence_persistence_degraded")
                         ),
-                        "evidence_persistence_failed_total": canonical.get(
-                            "evidence_persistence_failed_total", 0
+                        "evidence_persistence_failed_or_skipped_total": canonical.get(
+                            "evidence_persistence_failed_or_skipped_total", 0
                         ),
                         "projections_failed": projections.get(
                             "projections_failed", 0
@@ -2121,9 +2121,20 @@ async def _persist_url_recovery(*, run_id, merchant_id, brand_report):
     failures = {
         key: int(canonical.get(key) or 0) for key in _URL_EVIDENCE_FAILURE_KEYS
     }
-    canonical["evidence_persistence_failed_total"] = sum(failures.values())
+    # NAMED FOR WHAT IT COUNTS. This was `evidence_persistence_failed_total`
+    # while every key it summed was an insert FAILURE; it now also sums
+    # `evidence_items_skipped_unidentified`, which is a row dropped before the
+    # insert ever ran. A reader who took the old name literally would have
+    # concluded the inserts were fine. Renamed rather than commented because
+    # nothing in services/ or tests/ reads the old key. It IS persisted, into
+    # `partial_result_jsonb.verifying` below, so runs written before this
+    # change carry the old key there and a query over historical rows must
+    # accept both.
+    canonical["evidence_persistence_failed_or_skipped_total"] = sum(
+        failures.values()
+    )
     canonical["evidence_persistence_degraded"] = bool(
-        canonical["evidence_persistence_failed_total"]
+        canonical["evidence_persistence_failed_or_skipped_total"]
     )
     if canonical["evidence_persistence_degraded"]:
         logger.warning(

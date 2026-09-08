@@ -1230,6 +1230,19 @@ def _per_sku_reports(brand_report: Mapping[str, Any]) -> List[Mapping[str, Any]]
     saw only one of them recorded NULL set ids for every legacy run while the
     delta happily resolved an id from the same report. Two such bases then
     compared NULL == NULL on the pinned-set fields.
+
+    PREFERENCE ORDER DIFFERS FROM `audit_delta._basis_rows`, DELIBERATELY NOT
+    CHANGED HERE. This reader takes `per_sku_reports` first and falls back to
+    `per_product`; `_basis_rows` takes `per_product` first and falls back to
+    `per_sku_reports`. On every shape either lane actually sees the two agree,
+    because a report carries one key or the other, never both — the orders can
+    only diverge on a hybrid report no writer emits. Aligning them is still
+    the right end state (one order, one place), but doing it inside this PR
+    would change which row a hybrid resolves from with no test able to prove
+    the change is inert, and this PR's whole point is that the writer and the
+    reader must not disagree. The set-id path is already converged:
+    `_prompt_basis_blocks` delegates to `audit_delta.prompt_basis_blocks`.
+    Follow-up: give `_per_sku_reports` and `_basis_rows` one shared helper.
     """
     reports = brand_report.get("per_sku_reports")
     if not isinstance(reports, list):

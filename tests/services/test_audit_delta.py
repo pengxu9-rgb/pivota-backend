@@ -491,6 +491,54 @@ def test_not_comparable_headline_names_the_reason_when_one_is_known():
     assert NOT_COMPARABLE_REASONS["prompt_basis_missing"] in unpinned["headline"]
 
 
+def test_not_comparable_pair_tracking_read_is_not_measurable_not_unchanged():
+    """The headline branch above is only half the claim. `tracked_metric_results`
+    is derived from the SAME movements the degrade block stamped
+    `not_comparable`, and `_tracked_metric_result` only knows "moved" /
+    "unchanged": with nothing material left every metric came back
+    status="unchanged", note "…; no material movement". Both renderers print
+    that verbatim — "Tracking read: AI visibility rate: unchanged" — directly
+    beneath a "Not comparable" headline. Same false no-change claim, one layer
+    down."""
+    from services.audit_delta import NOT_COMPARABLE_REASONS
+
+    delta = _not_comparable_delta()
+    tracked = delta["tracked_metric_results"]
+
+    assert tracked, "the fixture's tracking metrics must survive the branch"
+    assert {row["status"] for row in tracked} == {"not_measurable"}
+    for row in tracked:
+        assert NOT_COMPARABLE_REASONS["measurement_basis_missing"] in row["note"]
+        assert "no material movement" not in row["note"]
+
+    # And the reason travels: a changed prompt set says so.
+    changed = _not_comparable_delta(
+        current_report=_report(visibility=63,
+                               prompt_basis={"selected_set_id": "sel_new"}),
+        prior_report=_report(visibility=41,
+                             prompt_basis={"selected_set_id": "sel_old"}),
+        current_basis=_basis(),
+        prior_basis=_basis(),
+    )
+    assert all(
+        NOT_COMPARABLE_REASONS["prompt_set_changed"] in row["note"]
+        and row["status"] == "not_measurable"
+        for row in changed["tracked_metric_results"]
+    )
+
+    # A COMPARABLE pair is untouched: the ordinary tracking read still reads
+    # "unchanged" with the mapped-signal note.
+    flat = compare_pinned_runs(
+        current_report=_report(),
+        prior_report=_report(),
+        prior_row={"run_id": "prior"},
+        days_since=30,
+    )
+    citation = _metric(flat, "First-party citation rate")
+    assert citation["status"] == "unchanged"
+    assert "no material movement" in citation["note"]
+
+
 def test_a_comparable_pair_still_gets_the_ordinary_headline():
     """The guard above must not swallow the real verdicts."""
     moved = compare_pinned_runs(

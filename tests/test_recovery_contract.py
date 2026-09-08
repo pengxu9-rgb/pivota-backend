@@ -146,7 +146,7 @@ async def test_one_failed_evidence_insert_does_not_fail_and_refund_the_run(
     )
     canonical, projections = await _persist_url_recovery(
         run_id="r", merchant_id="m", brand_report={})
-    assert canonical["evidence_persistence_failed_total"] == 1
+    assert canonical["evidence_persistence_failed_or_skipped_total"] == 1
     assert canonical["evidence_persistence_degraded"] is True
     assert projections["projections_built"] == 6
 
@@ -601,7 +601,7 @@ async def test_a_producer_that_stamps_no_observation_ids_flips_the_degraded_dial
     `_persist_url_recovery` summed — and a transient insert error loses one
     row out of hundreds while a producer bug that stops stamping observation
     ids loses EVERY selection_response in the run. The quiet failure read
-    `evidence_persistence_failed_total: 0`, `degraded: False`, and completed
+    `evidence_persistence_failed_or_skipped_total: 0`, `degraded: False`, and completed
     with no selection evidence at all.
     """
     from services.audit_run_worker import _persist_url_recovery
@@ -616,7 +616,7 @@ async def test_a_producer_that_stamps_no_observation_ids_flips_the_degraded_dial
     canonical, _ = await _persist_url_recovery(
         run_id="r", merchant_id="m", brand_report={})
 
-    assert canonical["evidence_persistence_failed_total"] == 412
+    assert canonical["evidence_persistence_failed_or_skipped_total"] == 412
     assert canonical["evidence_persistence_degraded"] is True
 
 

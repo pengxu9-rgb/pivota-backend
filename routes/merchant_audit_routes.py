@@ -1721,6 +1721,26 @@ def _strip_actions_for_free_tier(shaped: Dict[str, Any]) -> Dict[str, Any]:
     # deterministic fallback is already suppressed), so it is the paid
     # artifact as a unit; keeping `why_you_lose` back out of it would leak the
     # brief's framing of the fix while claiming the fix was locked.
+    #
+    # `product["what_ai_actually_said"]` STAYS FREE — a decision, not an
+    # oversight. `_ask_sku_slice` derives it from `opportunity.per_prompt`,
+    # and `opportunity` IS locked on the report envelope
+    # (_LOCKED_PER_SKU_ACTION_KEYS), so the asymmetry needs stating: the three
+    # fields the slice keeps are the buyer's QUERY TEXT, an EXCERPT of what
+    # the model answered, and the COMPETITOR it substituted. That is evidence
+    # — the same "what's wrong" layer this paywall leaves free everywhere else
+    # (scores, verdict, per-SKU findings, share-of-voice, revenue_recovery
+    # stage findings). None of it tells the merchant what to DO. `opportunity`
+    # is locked wholesale on the envelope because that object ALSO carries the
+    # derived recommendation the win plan is built from; the /ask slice
+    # already dropped that half and kept only the receipts. Locking the
+    # receipts too would paywall the diagnosis, which is the half we give away
+    # to sell the other one.
+    #
+    # And the whole /ask strip is DORMANT today: `_ACTIONS_PAYWALL_ENABLED`
+    # reads AUDIT_ACTIONS_PAYWALL_ENABLED and defaults to "false", and
+    # `_apply_actions_paywall` returns `shaped` untouched when the flag is
+    # off — so none of this runs until that env var is set to "true".
     overview = shaped.get("overview")
     if isinstance(overview, dict):
         overview_actions = overview.get("top_actions")
