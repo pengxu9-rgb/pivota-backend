@@ -33,6 +33,9 @@ PK = "ext:pgtest-lipstick::deadbeef"
 SPID = "pgtest-lipstick"
 DEST = "https://brand.example/products/pgtest-lipstick"
 VID = "43062643884185"
+#: writer_audit_log is shared by every module in the gate run, and at least one of them
+#: (reconcile_catalog_offers) leaves its own row behind — so every read is scoped to this writer.
+WRITER_NAME = "backfill_variant_identity_skus"
 #: asyncpg binds timestamptz from a datetime, never a string.
 _SUPPRESSED = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
 
@@ -108,7 +111,15 @@ async def _clear(database):
         "DELETE FROM external_product_seeds WHERE external_product_id = :e", {"e": SPID}
     )
     await database.execute("DELETE FROM writer_audit_log WHERE writer_name = :w",
-                           {"w": "backfill_variant_identity_skus"})
+                           {"w": WRITER_NAME})
+
+
+async def _audit_row(database):
+    """This module's latest writer_audit_log row (never another module's leftover)."""
+    return dict(await database.fetch_one(
+        "SELECT * FROM writer_audit_log WHERE writer_name = :w ORDER BY id DESC LIMIT 1",
+        {"w": WRITER_NAME},
+    ))
 
 
 async def _seed(database, *, variants, offers, suppressed=None):
@@ -326,8 +337,8 @@ async def test_a_priceless_variant_gets_no_row_at_all(db):
 async def test_the_run_is_recorded_in_writer_audit_log(db):
     await _seed(db, variants=[_variant()], offers=[{}])
     report = await _run()
-    row = dict(await db.fetch_one("SELECT * FROM writer_audit_log"))
-    assert row["writer_name"] == "backfill_variant_identity_skus"
+    row = await _audit_row(db)
+    assert row["writer_name"] == WRITER_NAME
     assert row["batch_id"] == report["batch_id"]
     assert row["applied_rows"] == 2
 
@@ -417,7 +428,7 @@ async def test_a_run_whose_every_pair_is_refused_does_not_read_as_success(db):
     assert report["skus"] == 0, "a rolled-back pair must not be counted as written"
     assert report["rolled_back_offer_refused_by_guard"] == 1
     assert await db.fetch_val("SELECT count(*) FROM catalog_skus") == 0
-    assert dict(await db.fetch_one("SELECT * FROM writer_audit_log"))["applied_rows"] == 0
+    assert (await _audit_row(db))["applied_rows"] == 0
 
 
 async def test_an_offer_is_never_attached_to_a_suppressed_sku(db):
@@ -455,8 +466,8 @@ async def test_the_audit_row_and_cursor_survive_an_error_mid_run(db):
     finally:
         backfill.guard_catalog_offer_rows = real
     assert calls["n"] == 1
-    row = dict(await db.fetch_one("SELECT * FROM writer_audit_log"))
-    assert row["writer_name"] == "backfill_variant_identity_skus"
+    row = await _audit_row(db)
+    assert row["writer_name"] == WRITER_NAME
 
 
 async def test_a_missing_arbiter_index_is_not_swallowed_as_a_collision(db):
