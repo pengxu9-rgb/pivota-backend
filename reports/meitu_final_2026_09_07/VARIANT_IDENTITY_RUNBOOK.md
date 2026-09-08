@@ -159,10 +159,11 @@ If `skus` is 49 rather than 234, the image does not have the feed fix — stop a
 > Do NOT run this from a laptop. `flowerbeauty.com` answers **429** to this office's egress
 > (Cloudflare); the local run returns `0 products` and reads exactly like an empty storefront.
 
-> **After #2123 (seed row gains the lone real id):** the re-run below backfills the seed variant, but Petal Pout
-> Lip Color is a `Default Title` single-variant product, so its seed variant carries `options: []` and the gateway
-> still hides it from the selector. The seed gains the merchant's variant id — which is what the money path
-> needed — and `hidden_from_selector` is expected to stay `true`. Do not read that as the backfill having failed.
+> **After #2123/#2124 (seed row gains the lone real id):** the re-run below backfills the seed variant for
+> Petal Pout Lip Color. Its lone variant is a NAMED shade (`Flamingo Flirt - Cream`, variant `17281773207622`,
+> see `report.md` and `sku_list.csv`), so it should acquire a one-entry `options` axis and become visible in the
+> selector. If §2.5 still shows `hidden_from_selector: true`, that is NOT expected — check the axis name the feed
+> emitted (`option_name`) before reading it as the gateway's placeholder rule.
 
 ### 2.3 Apply — WRITES TO PROD
 

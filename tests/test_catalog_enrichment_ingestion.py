@@ -1047,15 +1047,34 @@ def test_a_lone_variant_with_no_price_of_its_own_leaves_the_priced_synthetic_on_
     assert len(variants) == 1 and variants[0]["variant_id"].endswith("::canonical")
     assert variants[0]["price_amount"] == 24.0
     assert all(v["price_amount"] is not None for v in variants)
+    # The RULE is variant_own_price, not `price is None` (mutant C of the review survived):
+    # priced only under `price_amount` -> real id kept; `price: 0` -> synthetic.
+    kept = _seed_variants_of(ing.ingest_validated_record(_lone_real_variant_record(price_amount="27.50")))
+    assert [(v["variant_id"], v["price_amount"]) for v in kept] == [("54057345745090", 27.5)]
+    zero = _seed_variants_of(ing.ingest_validated_record(_lone_real_variant_record(price=0)))
+    assert len(zero) == 1 and zero[0]["variant_id"].endswith("::canonical")
+
+
+def test_an_unpriced_lone_variant_beside_an_unpriced_offer_keeps_the_real_id():
+    """The fall-through only trades identity for a PRICED synthetic; when the offer carries no
+    price either, a null-priced synthetic would be strictly worse than a null-priced real id.
+    Unreachable from the curated feed (MIN_SELLABLE_PRICE), pinned for hand-authored JSONL."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    record = _lone_real_variant_record()
+    record["offers"][0]["price"] = None
+    variants = _seed_variants_of(ing.ingest_validated_record(record))
+    assert [v["variant_id"] for v in variants] == ["54057345745090"]
 
 
 def test_a_lone_variant_with_an_axis_publishes_a_one_entry_option_and_a_titleless_one_none():
     """`_drop_options_that_do_not_distinguish` was written for n >= 2; with one variant the
     all-or-nothing rule holds trivially. Pin both outcomes so the picker shape is a decision:
-    an axis the fold named survives as a one-choice selector; a variant titled like its
-    parent (the Shopify `Default Title` shape, Petal Pout's case) gets no axis at all and stays
-    hidden from the selector -- the seed still gains the real id, which is what the money
-    path needed."""
+    an axis the fold named survives as a one-choice selector (Petal Pout's case -- its lone
+    variant is the named shade `Flamingo Flirt - Cream`); a variant titled like its parent,
+    and the literal Shopify `Default Title` placeholder, get no axis at all and stay hidden
+    from the selector -- the seed still gains the real id, which is what the money path
+    needed."""
     from services.catalog_enrichment_agent import ingestion as ing
 
     with_axis = _variant_record(1)
@@ -1066,6 +1085,12 @@ def test_a_lone_variant_with_an_axis_publishes_a_one_entry_option_and_a_titleles
     titleless = _variant_record(1)
     titleless["pdp"]["variants"][0]["title"] = titleless["pdp"]["product_name"]
     v = _seed_variants_of(ing.ingest_validated_record(titleless))[0]
+    assert v["variant_id"] == "54057345745090" and v["options"] == []
+
+    placeholder = _variant_record(1)
+    placeholder["pdp"]["variants"][0]["title"] = "Default Title"
+    placeholder["pdp"]["variants"][0]["option_name"] = ""
+    v = _seed_variants_of(ing.ingest_validated_record(placeholder))[0]
     assert v["variant_id"] == "54057345745090" and v["options"] == []
 
 

@@ -696,6 +696,10 @@ def _build_seed_inserts(
         real_variants = pdp_payload.get("variants") or []
         if real_variants:
             single = len(real_variants) < 2
+            # The lone-variant fall-through below trades the real id for the synthetic
+            # only when the synthetic actually carries a price; a null-priced synthetic
+            # is strictly worse than a null-priced real variant.
+            synthetic_priced = variant_own_price({"price": price}) is not None
             product_id = canonical_product_name(
                 pdp_payload["brand"], pdp_payload["product_name"]
             )
@@ -712,12 +716,14 @@ def _build_seed_inserts(
                 )
                 if single and provenance != MERCHANT_ISSUED:
                     continue
-                if single and variant_own_price(v) is None:
+                if single and synthetic_priced and variant_own_price(v) is None:
                     # Mirror of the offer writer's guard: a lone variant with no price
                     # of its own would put `price_amount: null` on the seed the PDP
                     # reads, where the synthetic canonical carries the offer price.
                     # The SKU row still lands (its identity is real); the seed keeps
-                    # the priced synthetic, exactly as before #2123.
+                    # the priced synthetic, exactly as before #2123. Multi-variant
+                    # seeds still carry a null for an unpriced shade: there is no
+                    # per-shade substitute, and dropping it would delete selector data.
                     continue
                 v_in_stock = bool(v.get("in_stock"))
                 shade = str(v.get("title") or "").strip()
@@ -811,7 +817,7 @@ def _seed_variant_options(
     "Default Title" is what a shop with no axis returns; either would render as a
     selector entry naming no choice. An absent `option_name` is not a shade
     signal either — `_build_seed_inserts` runs on any record carrying a real
-    variant (two or more, or one the merchant issued, since #2123), including
+    variant (two or more, or one the merchant issued and priced, since #2123/#2124), including
     hand-validated JSONL for a lane that never folded anything, and guessing
     "Shade" there published a volume axis as "Shade: 30 ml". Only the fold knows
     the axis, and it always names it.
