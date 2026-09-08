@@ -173,14 +173,25 @@ def _norm_copy(value: str) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
 
 
-async def _load_shop_blurb(domain: str, attempts: int = 3) -> Optional[str]:
-    """The storefront's blurb, retried like `_load_body_map` and for the same reason.
+async def _load_shop_blurb(domain: str, attempts: int = 3) -> Tuple[Optional[str], bool]:
+    """The storefront's blurb and whether it is VERIFIED -> (blurb|None, verified).
 
-    `fetch_shop_description` swallows every failure into None, exactly as `fetch_shopify_products`
-    does -- and `_load_body_map` already retries 3x because a transient failure there silently
-    marks a whole domain 'not_in_feed'. Here the silent failure is in the DANGEROUS direction: an
-    unavailable blurb disarms mechanism 1, and the counters would print `boilerplate=0` as though
-    nothing had happened. Retry first; `drop_shared_boilerplate` handles a genuine absence.
+    Retried like `_load_body_map` and for the same reason: `fetch_shop_description` swallows every
+    failure into None, exactly as `fetch_shopify_products` does, and here the silent failure is in
+    the DANGEROUS direction -- an unavailable blurb disarms mechanism 1 and the counters would
+    print `boilerplate=0` as though nothing had happened. Retry first; `drop_shared_boilerplate`
+    handles a genuine absence.
+
+    VERIFIED MEANS "RENDERED BY THE SAME THEME AS THE PDP". Mechanism 1 is an EXACT string
+    comparison, and the homepage door is self-calibrating: `fetch_shop_description` and
+    `fetch_pdp_description` both read a themed page through `description_from_pdp_html`, so
+    whatever the theme does to `shop.description` (HTML-escaping, truncation at 320 chars,
+    `| append: shop.name`) it does to BOTH sides and the two cancel. `/meta.json` does not go
+    through the theme at all: it returns `shop.description` raw. The string it hands back is
+    therefore a plausible-but-unproven stand-in, and the difference is not cosmetic --
+    a non-empty blurb that can never match anything is the one input that ARMS nothing while
+    switching OFF the fail-closed singleton refusal. So the JSON door reports `verified=False`
+    and `drop_shared_boilerplate` decides what an unverified blurb may lift.
     """
     for attempt in range(1, attempts + 1):
         blurb = await fetch_shop_description(domain)
@@ -189,7 +200,7 @@ async def _load_shop_blurb(domain: str, attempts: int = 3) -> Optional[str]:
         # 50-char floor can ever equal it) while simultaneously switching OFF the fail-closed
         # refusal below, so singletons on that domain would pass with nothing checking them.
         if blurb and len(blurb) >= MIN_DESC_LEN:
-            return blurb
+            return blurb, True
         if attempt < attempts:
             await asyncio.sleep(0.5 * attempt)
     # THE JSON DOOR WHEN THE HTML DOOR IS SHUT. Measured 2026-09-08 on jsmbeauty.sg: three runs
@@ -197,11 +208,13 @@ async def _load_shop_blurb(domain: str, attempts: int = 3) -> Optional[str]:
     # fetched the same homepage and parsed the same 135-char blurb — the homepage is refused
     # once the run has pulled dozens of product pages from the host, the JSON endpoints are not.
     # `/meta.json` `description` IS `shop.description`, the string a theme substitutes for a
-    # missing product SEO description, so the comparison it arms is the same comparison.
+    # missing product SEO description, so the comparison it arms is the same comparison --
+    # WHEN the theme passes it through untouched, which is exactly what we cannot check from
+    # here. Hence `verified=False`.
     meta_blurb = await fetch_shop_description_from_meta(domain)
     if meta_blurb and len(meta_blurb) >= MIN_DESC_LEN:
-        return meta_blurb
-    return None
+        return meta_blurb, False
+    return None, False
 
 
 # A candidate whose only content beyond the product's own title is this much or less is a
@@ -352,10 +365,43 @@ def _is_one_product_family(pages: Dict[str, tuple]) -> bool:
                for i in range(len(members)) for j in range(i + 1, len(members)))
 
 
+def blurb_arming(
+    candidates: Dict[str, str],
+    shop_blurb: Optional[str],
+    blurb_verified: bool = True,
+) -> Tuple[str, bool]:
+    """-> (the normalised blurb or "", whether it LIFTS the fail-closed singleton refusal).
+
+    ONE implementation, used by `drop_shared_boilerplate` to decide and by `run` to report, so
+    the counter an operator reads can never disagree with the verdict the rows got. (Two copies
+    of this rule would be two guards on one door; see `_are_sibling_editions`.)
+
+    A VERIFIED blurb -- one the storefront's own theme rendered, see `_load_shop_blurb` -- arms
+    mechanism 1 outright: it is the string a PDP without SEO copy repeats, byte for byte.
+
+    An UNVERIFIED blurb (`/meta.json`, raw `shop.description`, no theme) still ARMS THE EXACT
+    MATCH -- a hit is a true positive whatever the door, and on jsmbeauty.sg the two strings are
+    byte-identical -- but it does NOT lift the refusal on its own. It lifts the refusal only when
+    it CORROBORATES: some candidate in this run's census equals it, which proves the theme does
+    render this exact string on a PDP. Measured counter-example, and the reason this exists:
+    glossier.com's homepage description is "Glossier" (8 chars, under the floor), so #2129's
+    fallback reaches `/meta.json` and gets the real, long `shop.description` -- a string that
+    domain's theme never renders on a PDP. `blurb` is then non-empty, matches nothing, and the
+    pre-#2129 code would admit EVERY singleton on the domain, including the storefront blurb
+    served on a PDP with no SEO description, while printing `boilerplate=0 blurb_unavailable=0`.
+    """
+    blurb = _norm_copy(shop_blurb) if len(shop_blurb or "") >= MIN_DESC_LEN else ""
+    armed = bool(blurb) and (
+        blurb_verified or any(_norm_copy(v) == blurb for v in candidates.values())
+    )
+    return blurb, armed
+
+
 def drop_shared_boilerplate(
     candidates: Dict[str, str],
     shop_blurb: Optional[str] = None,
     *,
+    blurb_verified: bool = True,
     handles: Optional[Dict[str, str]] = None,
     titles: Optional[Dict[str, str]] = None,
 ) -> Dict[str, str]:
@@ -393,6 +439,9 @@ def drop_shared_boilerplate(
     AN UNAVAILABLE BLURB DISARMS THE FALLBACK FOR SINGLETONS, rather than letting them through.
     With `shop_blurb=None` mechanism 1 is off, so a value with no sibling has nothing checking it
     at all -- and a homepage 403 would silently re-open exactly the hole this exists to close.
+    `blurb_verified=False` says the blurb did not come from the theme that renders the PDPs, and
+    is treated the same way UNLESS it corroborates; `blurb_arming` holds that rule and the
+    measured glossier.com case that makes it necessary.
 
     MEASURED COST, because "the safe direction" is not the same as "free". Over 39 candidates on
     7 storefronts (2026-09-06), 21 were dropped and 4 of those were genuine per-product copy
@@ -432,16 +481,20 @@ def drop_shared_boilerplate(
         all_titles.setdefault(n, set()).add(titles.get(pk) or "")
     # A blurb under the floor is treated as ABSENT, not as an armed comparison: no candidate that
     # cleared the floor can equal it, so it would disarm the refusal below while guarding nothing.
-    blurb = _norm_copy(shop_blurb) if len(shop_blurb or "") >= MIN_DESC_LEN else ""
+    # An UNVERIFIED blurb is the same hazard through a different door -- see `blurb_arming`.
+    blurb, armed = blurb_arming(candidates, shop_blurb, blurb_verified)
 
     kept = {}
     for pk, v in candidates.items():
         n = _norm_copy(v)
         if len(seen[n]) > 1 and not _is_one_product_family(seen[n]):
             continue                               # (2) shared across UNRELATED product pages
+        # (1) THE EXACT MATCH FIRES WHATEVER THE DOOR. An unverified blurb that DOES equal a
+        # candidate has proved itself on that candidate; refusing to use it would throw away the
+        # measured jsmbeauty.sg win (`/meta.json` byte-identical to the homepage) for nothing.
         if blurb and n == blurb:                   # (1) the storefront's own blurb
             continue
-        if not blurb:                              # (1) unavailable -> nothing guards a singleton
+        if not armed:                              # (1) unarmed -> nothing guards a singleton
             continue
         # (3) the title with a brand bolted on. A value admitted as ONE product's copy is judged
         # against every name that product goes by: the base product's echo, rendered again on
@@ -525,6 +578,7 @@ async def run(apply: bool, domains_filter: List[str], max_products: int,
 
     totals = {"filled": 0, "published": 0, "validated": 0, "no_body": 0, "from_pdp": 0,
               "not_in_feed": 0, "boilerplate": 0, "blurb_unavailable": 0,
+              "blurb_unverified_uncorroborated": 0,
               "update_failed": 0, "refresh_failed": 0}
     # content_key -> did ANY row behind it come from PDP meta. A flat list cannot carry this:
     # the refresh runs in its own loop below, and an earlier version read a LEAKED `r` from the
@@ -562,7 +616,24 @@ async def run(apply: bool, domains_filter: List[str], max_products: int,
         # unavailable blurb does not merely lose mechanism 1; it disarms the fallback for every
         # singleton, so the whole PDP pass silently fills nothing. Asked for only when the PDP
         # fallback can use it, so a body-only run still costs the host nothing extra.
-        blurb: Optional[str] = (await _load_shop_blurb(domain)) if domain_pdp_fallback else None
+        #
+        # ...AND ONLY WHEN A ROW WILL ACTUALLY NEED IT. `body_map` is already in hand and it
+        # answers "will any row here reach the PDP fallback?" exactly: `resolve_description`
+        # consults the PDP only for a row whose body copy is under the floor. Without this gate a
+        # `--pdp-fallback` sweep pays 3 homepage attempts + /meta.json + robots.txt + ~4.5 s of
+        # pacing on EVERY domain whose rows all have usable body copy -- a per-domain cost, on a
+        # merchant host, for a blurb that is then handed to `drop_shared_boilerplate` with an
+        # empty candidate set. A row that is not in the feed at all (body is None) is skipped
+        # before `resolve_description`, so it does not count as needing the blurb.
+        needs_blurb = any(
+            len(body_map.get(r["_handle"]) or "") < MIN_DESC_LEN
+            for r in drows
+            if body_map.get(r["_handle"]) is not None
+        )
+        blurb: Optional[str] = None
+        blurb_verified = False
+        if domain_pdp_fallback and needs_blurb:
+            blurb, blurb_verified = await _load_shop_blurb(domain)
         for r in drows:
             body = body_map.get(r["_handle"])
             if body is None:
@@ -577,14 +648,29 @@ async def run(apply: bool, domains_filter: List[str], max_products: int,
             (candidates if from_pdp_row else resolved)[str(r["product_key"])] = body
 
         if candidates:
-            if not blurb:
+            # THE SAME PREDICATE THE ROWS ARE JUDGED BY, so the counters cannot drift from the
+            # verdict. `blurb_unavailable` and `blurb_unverified_uncorroborated` are two DISTINCT
+            # operator actions: the first says the host refused us and a retry may fix it; the
+            # second says we did get a string, from `/meta.json`, that this storefront's theme
+            # demonstrably does not render on any of its PDPs — no retry will change that, and
+            # the domain's singletons stay refused on purpose.
+            _, armed = blurb_arming(candidates, blurb, blurb_verified)
+            if not armed:
                 # Not a warning to skim past: with mechanism 1 off, every singleton candidate is
                 # dropped below, so this line explains a sudden `boilerplate` spike.
-                print(f"  WARN {domain}: shop blurb unavailable — the blurb comparison is "
-                      f"disarmed and unrepeated candidates will be refused")
-                totals["blurb_unavailable"] += 1
+                if blurb:
+                    print(f"  WARN {domain}: the shop blurb came from /meta.json (raw "
+                          f"shop.description, not rendered by the theme) and matches no candidate "
+                          f"— the blurb comparison is unverified, so unrepeated candidates will "
+                          f"be refused")
+                    totals["blurb_unverified_uncorroborated"] += 1
+                else:
+                    print(f"  WARN {domain}: shop blurb unavailable — the blurb comparison is "
+                          f"disarmed and unrepeated candidates will be refused")
+                    totals["blurb_unavailable"] += 1
             kept = drop_shared_boilerplate(
                 candidates, blurb,
+                blurb_verified=blurb_verified,
                 handles={str(r["product_key"]): r["_handle"] for r in drows},
                 titles={str(r["product_key"]): r.get("title") for r in drows},
             )

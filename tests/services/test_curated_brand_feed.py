@@ -1801,3 +1801,168 @@ async def test_the_vendor_filter_runs_before_the_shade_fold(monkeypatch):
     assert [r["pdp"]["product_name"] for r in recs] == ["Dewy Glow Lip Gloss"]
     # Fold-then-filter would have folded MEDICUBE's Coral into this base as a variant.
     assert [v["title"] for v in recs[0]["pdp"]["variants"]] == []
+
+
+# -- the /meta.json blurb door -------------------------------------------------------------------
+#
+# `fetch_shop_description_from_meta` had no unit test at all. It is read by
+# scripts/backfill_brand_official_descriptions.py to ARM an exact-match guard that decides whether
+# PDP meta copy is auto-published as brand-official description, so anything it returns other than
+# this storefront's own `shop.description` is a defect with a publication consequence.
+
+
+class _MetaResp:
+    """A minimal httpx-shaped response. `url` carries the FINAL host of the redirect chain."""
+
+    def __init__(self, *, status_code=200, payload=None, text=None, host="jsmbeauty.sg"):
+        self.status_code = status_code
+        self.headers = {"content-type": "application/json"}
+        self._payload = payload
+        self._text = text
+        self.url = type("_U", (), {"host": host})()
+
+    def json(self):
+        if self._text is not None:
+            import json as _j
+
+            return _j.loads(self._text)          # a Cloudflare HTML body raises here, as live
+        return self._payload
+
+
+def _install_meta_client(monkeypatch, resp):
+    import httpx
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url):
+            return resp
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Client())
+    _silence_politeness(monkeypatch)
+
+
+_SHOP_BLURB = ("Discover JUNGSAEMMOOL, the epitome of Korean makeup and cosmetic products, "
+               "blending artistry with skincare for every day.")
+
+
+@pytest.mark.asyncio
+async def test_the_meta_json_blurb_is_read_and_whitespace_collapsed(monkeypatch):
+    """The positive case, so every refusal below is a refusal and not a function that never
+    worked. `/meta.json` is raw JSON, so a merchant's newlines reach us verbatim; the backfill
+    compares it with `_norm_copy`, but the value is also what a human reads in a log."""
+    _install_meta_client(monkeypatch, _MetaResp(
+        payload={"description": "  Discover JUNGSAEMMOOL,\n  the epitome of Korean makeup.  "}))
+
+    assert await cbf.fetch_shop_description_from_meta("jsmbeauty.sg") == \
+        "Discover JUNGSAEMMOOL, the epitome of Korean makeup."
+
+
+@pytest.mark.asyncio
+async def test_a_404_meta_json_is_no_blurb_not_an_exception(monkeypatch):
+    """A non-Shopify host, or one that has disabled the endpoint. The caller's contract is
+    "None on any failure" -- raising here would abort a whole backfill domain."""
+    _install_meta_client(monkeypatch, _MetaResp(status_code=404, payload={}))
+
+    assert await cbf.fetch_shop_description_from_meta("jsmbeauty.sg") is None
+
+
+@pytest.mark.asyncio
+async def test_an_HTML_200_challenge_page_is_not_a_blurb(monkeypatch):
+    """A Cloudflare interstitial answers 200 with HTML. This is the exact condition the JSON door
+    exists to route around, so it is also the one most likely to be met -- and `resp.json()` on
+    that body raises inside the same try, which must read as "no blurb"."""
+    _install_meta_client(monkeypatch, _MetaResp(
+        text="<!DOCTYPE html><html><head><title>Just a moment...</title></head></html>"))
+
+    assert await cbf.fetch_shop_description_from_meta("jsmbeauty.sg") is None
+
+
+@pytest.mark.parametrize("desc", [
+    ["Line one of the description", "Line two of the description, also long"],
+    {"value": "A description hidden one level down inside an object, over fifty chars"},
+    12345678901234567890,
+    None,
+])
+@pytest.mark.asyncio
+async def test_a_non_STRING_description_is_refused_rather_than_stringified(monkeypatch, desc):
+    """`str(desc)` of a list renders `['Line one...', 'Line two...']` -- brackets, quotes and
+    all, comfortably over the backfill's 50-char floor. It could never equal a PDP's meta
+    description, so it would arrive as a non-empty blurb that matches nothing: precisely the
+    input that arms no comparison while switching OFF the fail-closed refusal that protects
+    every unrepeated candidate on the domain."""
+    _install_meta_client(monkeypatch, _MetaResp(payload={"description": desc}))
+
+    assert await cbf.fetch_shop_description_from_meta("jsmbeauty.sg") is None
+
+
+@pytest.mark.asyncio
+async def test_a_redirect_to_a_DIFFERENT_storefront_is_refused(monkeypatch):
+    """`follow_redirects=True` with no check reads `/meta.json` off whatever host the chain ends
+    on. A regional redirect (brand.com -> uk.brand.com) lands on a different Shopify store with
+    a different `shop.description` -- a blurb for a storefront whose theme never renders it."""
+    _install_meta_client(monkeypatch, _MetaResp(
+        payload={"description": _SHOP_BLURB}, host="uk.jsmbeauty.sg"))
+
+    assert await cbf.fetch_shop_description_from_meta("jsmbeauty.sg") is None
+
+
+@pytest.mark.parametrize("requested,final", [
+    ("jsmbeauty.sg", "www.jsmbeauty.sg"),
+    ("www.jsmbeauty.sg", "jsmbeauty.sg"),
+    ("jsmbeauty.sg", "JSMBeauty.sg"),
+])
+@pytest.mark.asyncio
+async def test_the_www_and_apex_forms_are_the_SAME_storefront(monkeypatch, requested, final):
+    """The host pin must not cost the ordinary case: almost every storefront redirects one of
+    these to the other, and both serve one `shop.description`. A pin that refused them would
+    silently disarm the guard on most domains -- the same outcome by the opposite mistake."""
+    _install_meta_client(monkeypatch, _MetaResp(
+        payload={"description": _SHOP_BLURB}, host=final))
+
+    assert await cbf.fetch_shop_description_from_meta(requested) == _SHOP_BLURB
+
+
+def test_a_suffix_match_is_not_a_host_match():
+    """The pin compares whole hosts. `endswith` would accept `uk.brand.com` for `brand.com` --
+    the case above -- and also `evilbrand.com` for `brand.com`."""
+    assert cbf._same_storefront_host("brand.com", "evilbrand.com") is False
+    assert cbf._same_storefront_host("brand.com", "uk.brand.com") is False
+    assert cbf._same_storefront_host("brand.com", "brand.com.co") is False
+    assert cbf._same_storefront_host("brand.com", None) is False
+    assert cbf._same_storefront_host("brand.com", "brand.com") is True
+
+
+@pytest.mark.asyncio
+async def test_a_politeness_gate_that_REFUSES_yields_no_blurb(monkeypatch):
+    """`crawl_politeness.before_request` can raise (robots.txt disallow, a budget refusal). The
+    request must not go out, and the failure must reach the caller as "no blurb" rather than as
+    an exception that aborts the domain -- and certainly not as a fetch that skipped the gate."""
+    import httpx
+
+    fetched = []
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url):
+            fetched.append(url)
+            return _MetaResp(payload={"description": _SHOP_BLURB})
+
+    async def _refuse(*a, **kw):
+        raise RuntimeError("robots.txt disallows /meta.json")
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Client())
+    monkeypatch.setattr(cbf.crawl_politeness, "before_request", _refuse)
+    monkeypatch.setattr(cbf.crawl_politeness, "note_response", lambda *a, **kw: None)
+
+    assert await cbf.fetch_shop_description_from_meta("jsmbeauty.sg") is None
+    assert fetched == [], "the gate refused, so no request may reach the merchant host"
