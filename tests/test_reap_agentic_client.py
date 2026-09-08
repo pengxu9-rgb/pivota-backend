@@ -1207,14 +1207,19 @@ def test_an_unknown_reason_says_so_rather_than_guessing():
 # without one (most of them) lost the phrasing most likely to work, and a resolver holding the
 # right rule refused the row anyway.
 
-def test_the_third_phrasing_falls_back_to_the_brand_alone_without_a_category():
-    """NOTE what this test does and does not establish. It pins that the slot is FILLED rather
-    than dropped — the measured bug was a caller losing the rung entirely. Whether a bare brand
-    query actually surfaces the merchant is a prediction about Reap that no test here can check:
-    every live run that found flowerbeauty.com used `<brand> <category>`."""
-    queries = rc.search_queries(product_name="Petal Pout Lip Color", brand="Flower Beauty")
-    assert len(queries) == 3
-    assert queries[-1] == "Flower Beauty"
+def test_there_is_no_brand_only_rung():
+    """MEASURED, not reasoned. An earlier version filled the third slot with the brand alone when
+    no category was given, and I described it in a docstring as returning "a slice of that
+    merchant's catalogue" — a prediction written as an observation. Ten live passes across four
+    brands: "Flower Beauty" -> 5 hits, none theirs, the same resellers every pass; "Refy" -> 3,
+    none theirs; "Fenty Beauty" -> ZERO, while "Fenty Eau de Parfum" returns seven products;
+    "COSRX" -> its own store on one pass of two, and not the product we wanted.
+
+    Reap's search is PRODUCT-TEXT retrieval, not merchant retrieval — there is no merchant
+    dimension on it anywhere, which is also why `merchantPreference` is non-functional. A rung
+    that cannot fire is worse than no rung: it costs a ~9 s search and reads like coverage."""
+    assert rc.search_queries(product_name="Petal Pout Lip Color", brand="Flower Beauty") == [
+        "Flower Beauty Petal Pout Lip Color", "Petal Pout Lip Color"]
 
 
 def test_a_category_still_wins_the_third_slot_when_given():
@@ -1231,35 +1236,50 @@ def test_no_brand_means_no_broad_phrasing():
         == ["Petal Pout Lip Color"]
 
 
-def test_the_brand_only_phrasing_actually_reaches_the_resolver(monkeypatch):
-    """The seam. A strategy that generates the right third query proves nothing if the resolver
-    stops at two — and the measured failure was exactly a row refused with the winning phrasing
-    never sent."""
-    seen = []
-
+def test_a_caller_without_a_category_is_told_its_recall_was_degraded(monkeypatch):
+    """A short ladder must not produce a refusal that reads like an absence. The rung that found
+    flowerbeauty.com on both live runs is `<brand> <category>`; without it, `merchant_not_in_
+    results` says very little — and that is exactly the inference that got that merchant written
+    off in a report."""
     async def fake(path, body, **kw):
-        if path.endswith("/search"):
-            seen.append(body["query"])
-            if body["query"] != "Flower Beauty":
-                return rc.ReapResponse(ok=True, status=200, data={"products": [], "warnings": []})
-            return rc.ReapResponse(ok=True, status=200, data=FLOWER_SEARCH)
-        if path.endswith("/details"):
-            return rc.ReapResponse(ok=True, status=200, data=FLOWER_DETAILS)
-        return rc.ReapResponse(ok=True, status=200, data=FLOWER_VARIANT)
+        # Resellers, not the merchant — which is exactly what a bare-brand query returns.
+        return rc.ReapResponse(ok=True, status=200, data={"products": [
+            {"id": "prd_r", "merchant": {"name": "emergscent.com"},
+             "name": "Petal Pout Lip Color"}], "warnings": []})
     monkeypatch.setattr(rc, "_post", fake)
 
+    short = _run(rc.resolve_our_row(
+        merchant_domain="flowerbeauty.com", product_name="Petal Pout Lip Color",
+        brand="Flower Beauty", variant_title="Flamingo Flirt"))
+    full = _run(rc.resolve_our_row(
+        merchant_domain="flowerbeauty.com", product_name="Petal Pout Lip Color",
+        brand="Flower Beauty", category="lip color", variant_title="Flamingo Flirt"))
+    category_only = _run(rc.resolve_our_row(
+        merchant_domain="flowerbeauty.com", product_name="Petal Pout Lip Color",
+        category="lip color", variant_title="Flamingo Flirt"))
+
+    assert short.reason == "search:merchant_not_in_results" and short.recall_degraded is True
+    assert full.reason == "search:merchant_not_in_results" and full.recall_degraded is False
+    # A category with no brand is just as short a ladder: the rung is `<brand> <category>`, so
+    # either half missing means it was never sent. A flag keyed on the category alone reads as
+    # healthy here and is wrong in the direction that hides the problem.
+    assert category_only.recall_degraded is True
+    assert category_only.queries_tried == ["Petal Pout Lip Color"]
+
+
+def test_the_degraded_flag_is_not_set_on_a_success(monkeypatch):
+    _chain(monkeypatch, search=FLOWER_SEARCH, details=FLOWER_DETAILS, variant=FLOWER_VARIANT)
     got = _run(rc.resolve_our_row(
         merchant_domain="flowerbeauty.com", product_name="Petal Pout Lip Color",
-        brand="Flower Beauty", variant_title="Flamingo Flirt", our_price=8.00,
-    ))
-    assert got.ok and got.variant_id == "var_flamingo"
-    assert seen == ["Flower Beauty Petal Pout Lip Color", "Petal Pout Lip Color", "Flower Beauty"]
-    assert got.queries_tried == seen
+        brand="Flower Beauty", category="lip color", variant_title="Flamingo Flirt"))
+    assert got.ok and got.recall_degraded is False
 
 
 def test_the_default_budget_is_large_enough_for_all_three_phrasings():
-    """A three-phrasing strategy behind a two-attempt cap is a strategy that does not exist."""
+    """A three-phrasing strategy behind a two-attempt cap is a strategy that does not exist, and
+    which rung succeeds varies between runs — so the cap must clear the whole ladder."""
     assert rc.MAX_SEARCH_ATTEMPTS >= 3
+    assert len(rc.search_queries(product_name="x", brand="b", category="c")) <= rc.MAX_SEARCH_ATTEMPTS
 
 
 def test_the_full_ladder_is_sent_when_earlier_rungs_miss(monkeypatch):

@@ -53,6 +53,9 @@ bare-name search I previously reported that flowerbeauty.com was not in Reap's i
 The identical query is also not repeatable -- it returned nothing for that merchant twice and
 then returned the product half an hour later -- so no single pass, however many phrasings it
 tries, can establish that something is ABSENT from the index. Refusals here are provisional.
+And the search has no merchant dimension at all -- it is product-text retrieval, which is why
+`merchantPreference` does nothing and why a bare brand query returns resellers or nothing rather
+than the brand's own store. A query has to name a product.
 
 REAP'S IDS ARE SESSION HANDLES, NOT IDENTITY. Five searches for the same product on one day
 returned five different `prd_...` ids, each with its own `var_...` set. All stayed resolvable and
@@ -508,42 +511,41 @@ def search_queries(
 
     Brand-led first, because that is the phrasing that worked. Deduplicated, order preserved.
 
-    THE THIRD SLOT IS THE RECALL PLAY, and it is the one that found the merchant. Measured on
-    flowerbeauty.com's "Petal Pout Lip Color": the brand-led and bare-name phrasings both missed
-    the merchant entirely, and only "Flower Beauty lip color" surfaced it. An earlier version
-    generated that phrasing ONLY when a caller supplied `category` -- so a caller without a
-    category (most of them) lost the phrasing most likely to work, and a resolver that had the
-    right rule refused the row anyway.
+    THE THIRD SLOT IS THE RECALL PLAY, AND IT NEEDS A CATEGORY. Measured on flowerbeauty.com's
+    "Petal Pout Lip Color": the brand-led and bare-name phrasings both missed the merchant, and
+    only "Flower Beauty lip color" surfaced it. Worse, WHICH RUNG SUCCEEDS VARIES BETWEEN RUNS --
+    the same row against the same code an hour apart landed on the second phrasing once and the
+    third the next time. So the later rungs are not tie-breakers for an awkward row; they are
+    what makes any given run land at all, and a caller supplying less than the full ladder is not
+    trading a little recall, it is coin-flipping.
 
-    WHEN THERE IS NO CATEGORY, THE BRAND ALONE TAKES THE SLOT -- AND THAT FALLBACK IS UNVERIFIED
-    AGAINST THE LIVE API. The reasoning is that Reap answers a bare brand with a slice of that
-    merchant's catalogue, which `match_product` then filters on exact name, making it a broader
-    net rather than a looser match. That is a PREDICTION about Reap's behaviour, not an
-    observation: every live run that found this merchant used `<brand> <category>`. Do not read
-    this paragraph as evidence the fallback works. If it turns out not to, the fix is for callers
-    to supply a category -- which for our rows is derivable from the catalog -- and not to widen
-    the matching.
+    THERE IS NO BRAND-ONLY FALLBACK, BECAUSE A BARE BRAND IS NOT A QUERY THIS API UNDERSTANDS.
+    An earlier version filled the third slot with the brand alone when no category was given. I
+    described that as returning "a slice of that merchant's catalogue" -- a prediction I wrote as
+    if it were an observation. Measured over ten passes across four brands: "Flower Beauty" -> 5
+    hits, none from flowerbeauty.com, the same five resellers every pass; "Refy" -> 3 hits, none
+    theirs; "Fenty Beauty" -> ZERO hits, while "Fenty Eau de Parfum" returns seven products;
+    "COSRX" -> the brand's own store on one pass out of two, and not the product we wanted. The
+    rung fired, cost a ~9 s search, and `match_product`'s exact-domain filter emptied it every
+    time.
 
-    AND THE SAME PHRASING IS NOT REPEATABLE, WHICH MAKES THE WHOLE LADDER NECESSARY RATHER THAN
-    BELT-AND-BRACES. Reap's search is non-deterministic: the identical query returned zero hits
-    for this merchant twice at ~19:15 and ~19:20 and then returned the product at ~19:45. Two
-    runs of the SAME row against the SAME code an hour apart succeeded on DIFFERENT rungs -- the
-    second phrasing once, the third the next time. So the later phrasings are not tie-breakers
-    for an unusual row; they are what makes any given run land at all, and a caller that supplies
-    less than the full ladder is not trading a little recall, it is coin-flipping.
+    The mechanism, which is worth more than the measurement: Reap's search is PRODUCT-TEXT
+    retrieval, not merchant retrieval. There is no merchant dimension on it anywhere -- which is
+    also why `merchantPreference` is non-functional. A query has to name a product.
 
-    It also means `queries_tried` records what was SENT, never what re-sending would return, and
-    that no single pass -- however many phrasings -- establishes that something is absent from
-    the index. A `merchant_not_in_results` refusal is provisional and worth retrying later.
+    So a caller without a category gets two rungs and materially worse recall, and
+    `VariantResolution.recall_degraded` says so rather than leaving a refusal looking like an
+    absence. For our rows the category is derivable from the catalog; supplying it is the fix.
+    Loosening `match_product` is not.
     """
     name = str(product_name or "").strip()
     brand_text = str(brand or "").strip()
     category_text = str(category or "").strip()
     if not name and not brand_text:
         raise ReapRequestError("a search needs at least a product name or a brand")
-    broad = ""
-    if brand_text:
-        broad = f"{brand_text} {category_text}".strip() if category_text else brand_text
+    # No brand-only rung: measured to return resellers or nothing, never the merchant's own
+    # store, for every brand whose rows we have resolved.
+    broad = f"{brand_text} {category_text}".strip() if (brand_text and category_text) else ""
     ordered = [
         f"{brand_text} {name}".strip() if brand_text else "",
         name,
@@ -859,6 +861,11 @@ class VariantResolution:
     #: Every search phrasing attempted, in order. On a refusal this says whether the query was
     #: ever the problem -- which, for this API, it often is.
     queries_tried: List[str] = field(default_factory=list)
+    #: True when the caller supplied no brand+category, so the recall ladder was short. The rung
+    #: that found flowerbeauty.com on two of two live runs is `<brand> <category>`; without it a
+    #: `merchant_not_in_results` refusal says much less than it appears to, and must not be read
+    #: as the merchant being absent from the index.
+    recall_degraded: bool = False
 
 
 async def resolve_our_row(
@@ -890,6 +897,7 @@ async def resolve_our_row(
     # merchant is absent from the index -- I drew exactly that wrong conclusion about
     # flowerbeauty.com from a single bare-name search.
     queries = search_queries(product_name=product_name, brand=brand, category=category)
+    degraded = not (str(brand or "").strip() and str(category or "").strip())
     tried: List[str] = []
     found: Optional[ReapResponse] = None
     match: Optional[ProductMatch] = None
@@ -903,7 +911,7 @@ async def resolve_our_row(
             # A transport or status failure is not a phrasing problem; retrying phrasings would
             # just spend the budget on the same error.
             return VariantResolution(ok=False, reason=found.error or "search_failed",
-                                     queries_tried=tried,
+                                     queries_tried=tried, recall_degraded=degraded,
                                      merchant_probably_not_completable=found.merchant_probably_not_completable)
         match = match_product(found.data, merchant_domain=merchant_domain,
                               product_name=product_name,
@@ -914,7 +922,7 @@ async def resolve_our_row(
     if found is None or match is None or not match.ok:
         return VariantResolution(
             ok=False, reason=f"search:{match.reason if match else 'no_query_attempted'}",
-            queries_tried=tried,
+            queries_tried=tried, recall_degraded=degraded,
             warnings=found.warnings if found else [],
             candidates=match.candidates if match else [],
         )
@@ -1084,7 +1092,9 @@ REFUSAL_EXPLANATIONS: List[Tuple[str, str]] = [
      "above). Reap's search is QUERY-SENSITIVE: the bare product name is measured to miss\n"
      "products the brand-led phrasing finds, so this is evidence about the QUERY at least as\n"
      "much as about the index. DO NOT conclude the merchant is unindexed from it -- that is\n"
-     "exactly how flowerbeauty.com got written off. Reap's search is also NON-DETERMINISTIC:\n"
+     "exactly how flowerbeauty.com got written off. If `recall_degraded` is set, no category was\n"
+     "supplied and the rung that found that merchant on both live runs -- `<brand> <category>` --\n"
+     "was never sent, so this refusal says very little. Reap's search is also NON-DETERMINISTIC:\n"
      "the identical query returned nothing for that merchant twice and then returned the\n"
      "product half an hour later, so a single pass establishes nothing about absence. If\n"
      "`merchant.name` carries a subdomain (8 of 78 do), pass it via `also_accept_domains`\n"

@@ -114,6 +114,10 @@ def main() -> int:
     print(f"asked-for avail : {resolved.chosen_available}   (the value WE ASKED FOR)")
     print(f"resolved at     : {resolved.resolved_at}")
     print(f"queries tried   : {resolved.queries_tried}")
+    if resolved.recall_degraded:
+        print("  ^ RECALL DEGRADED: no brand+category, so the `<brand> <category>` rung was\n"
+              "    never sent. That is the rung that found flowerbeauty.com on both live runs.\n"
+              "    A refusal above says much less than it appears to.")
     if resolved.warnings:
         print(f"warnings        : {resolved.warnings}")
     if resolved.candidates:
