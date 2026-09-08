@@ -20,6 +20,8 @@ Completed runs with missing or outdated recovery projections are rebuilt read-on
 
 Numerical movements require two complete comparable basis records and a current comparison-contract stamp. Old stored materiality flags and unguarded summary deltas are not accepted. The existing 15-point rule is a materiality heuristic, not a statistical significance test.
 
+`report_summary.score.delta` is permanently `null`. The key stays present because consumers read it; the value is gone because the run-over-run number that fed it (`brand_rollup.tracking.history.delta_from_most_recent`) is unqualified — no measurement basis, and old-semantics scores against a displayed score that unmeasured-dimension exclusions may have changed. The qualified comparison is `report_summary.since_last_audit`, which carries the basis verdict. `since_last_audit` is **not** a passthrough of the persisted `reaudit_delta`: both its movements and its headline are re-derived against the current contract, so a delta persisted as "improved" is re-served as not-comparable when its recorded basis cannot support the claim. A not-comparable pair's headline states that it is not comparable, names the recorded reason, and never recommends keeping or changing a plan.
+
 ## Catalog and domains
 
 The audit picker uses tenant-scoped `catalog_products` with pagination, matching the audit readiness source. Storefront metadata is optional enrichment. Requested product count and saved result count have distinct labels; missing per-product completion reasons are not invented.

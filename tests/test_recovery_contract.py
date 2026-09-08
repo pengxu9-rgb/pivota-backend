@@ -285,3 +285,73 @@ async def test_the_scheduler_registers_the_flag_checking_tick(monkeypatch):
     assert "run_official_domain_liveness_tick" in source
     assert 'id="official_domain_liveness"' in source
     assert await job.run_official_domain_liveness_tick() == {"skipped": True}
+
+
+def test_a_non_json_probe_run_id_still_yields_an_observation_id():
+    """`_probe_run_id` is whatever the probe layer put there — a UUID and a
+    datetime are both routine, and json.dumps serializes neither. The raise
+    escaped response_observations into the caller's try, which also stamps
+    run_facts, so ONE such id silently dropped run_facts for the whole run."""
+    import uuid
+    from datetime import datetime, timezone
+
+    for probe_run_id in (uuid.uuid4(), datetime.now(timezone.utc)):
+        rows = observations([{
+            "query": "best serum", "axis_metadata": {"axis": "category"},
+            "_provider": "gemini", "_probe_run_id": probe_run_id,
+            "grounding_sources": [], "parsed": {"brand_mentioned": True},
+        }])
+        assert len(rows) == 1
+        assert len(rows[0]["observation_id"]) == 64
+
+    # Distinct probe runs must still get distinct ids — `default=str` must not
+    # collapse them into one.
+    a, b = uuid.uuid4(), uuid.uuid4()
+    ids = {
+        observations([{"query": "q", "axis_metadata": {"axis": "category"},
+                       "_provider": "gemini", "_probe_run_id": pid,
+                       "grounding_sources": []}])[0]["observation_id"]
+        for pid in (a, b)
+    }
+    assert len(ids) == 2
+
+
+def test_a_failed_observation_stamp_does_not_take_run_facts_with_it():
+    """STRUCTURAL, because the assembly path this guards is a single 400-line
+    function with no seam. The selection-observation loop shared one try with
+    the run_facts stamp; they have no dependency on each other, so a failure in
+    one must not erase the other. Pinned the way the charged-iff-delivered
+    refund exit is pinned — by the shape of the source."""
+    import services.agent_center_bd_report_service as acbd
+
+    source = inspect.getsource(acbd)
+    marker = 'brand_rollup["run_facts"] = aggregate_run_facts('
+    loop = '_r["selection_observations"] = response_observations('
+    assert marker in source and loop in source
+    # The observation loop's own except must sit BETWEEN the loop and the
+    # run_facts stamp — i.e. they are not in one try block any more.
+    between = source[source.index(loop):source.index(marker)]
+    assert "_selection_observation_failures += 1" in between
+
+
+def test_the_recovery_postgres_step_runs_after_the_gate_it_must_not_mask():
+    """The new step creates its own database and runs its own pytest. Placed
+    before the preflight/discover/execute/assert chain, a failure in it aborts
+    the job before the dialect gate those four steps exist to enforce has run
+    — a red build that proves nothing about the gate and points elsewhere."""
+    import yaml
+    from pathlib import Path
+
+    workflow = yaml.safe_load(
+        Path(".github/workflows/postgres-dialect-gate.yml").read_text()
+    )
+    names = [s.get("name") for s in
+             workflow["jobs"]["postgres-dialect-gate"]["steps"]]
+    assert names.index("Assert the gate actually gated") < names.index(
+        "Recovery report JSONB to authenticated HTTP"
+    )
+    step = next(s for s in workflow["jobs"]["postgres-dialect-gate"]["steps"]
+                if s.get("name") == "Recovery report JSONB to authenticated HTTP")
+    # It keeps its own junit assertion: a SKIPPED recovery test is a failure.
+    assert "pytest-recovery-postgres.xml" in step["run"]
+    assert "did not execute" in step["run"]

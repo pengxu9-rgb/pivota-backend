@@ -4086,6 +4086,29 @@ def _build_ask_context(report: Dict[str, Any], product_key: Optional[str]) -> Di
     return ctx
 
 
+def _recovery_has_content(recovery: Any) -> bool:
+    """Does the recovery projection actually say anything about this merchant?
+
+    A projection is ALWAYS a populated dict — it carries its audience, builder
+    version and three stage scaffolds even for an empty report. So "is this
+    truthy" answers yes on a report with nothing in it, which is why the /ask
+    409 went dead. What makes it answerable is a finding or an action in some
+    stage; a selection measurement with no observations is the module's own
+    "unavailable" shape and grounds nothing.
+    """
+    if not isinstance(recovery, dict):
+        return False
+    for stage in recovery.get("stages") or []:
+        if isinstance(stage, dict) and (
+            stage.get("findings") or stage.get("actions")
+        ):
+            return True
+    selection = recovery.get("selection")
+    if isinstance(selection, dict) and selection.get("observations"):
+        return True
+    return False
+
+
 _ASK_SYSTEM_PROMPT = (
     "You are Pivota's AI-commerce-readiness assistant, helping a merchant "
     "understand their audit. Answer the QUESTION using ONLY the facts in "
@@ -4132,17 +4155,31 @@ async def answer_merchant_audit_question(
             detail="This audit doesn't have a report to answer from yet.",
         )
 
+    # The recovery projection is EXTRA grounding, not a replacement. It carries
+    # no narrative overview, no whats_working / where_youre_losing, no honest
+    # limits and no per-SKU slice, and it ignores product_key entirely — so
+    # swapping it in for _build_ask_context dropped everything the merchant's
+    # `product_key` selects while that key still keyed the debit. It also made
+    # `if not context` dead (a projection is always a populated dict), so an
+    # audit that used to 409 for free began charging a credit for a contentless
+    # context. Merge the two, and gate the 409 on what they actually contain.
     from services.revenue_recovery_report import recovery_from_report
-    context = recovery_from_report(
+    context = _build_ask_context(report, body.product_key)
+    recovery = recovery_from_report(
         report, run_id=body.run_id,
         catalog_available=False if run.get("subject_type") == "merchant_url" else None,
     )
-    context = await _apply_actions_paywall(context, merchant_id)
-    if not context:
+    if not context and not _recovery_has_content(recovery):
         raise HTTPException(
             status_code=409,
             detail="This audit doesn't have enough detail to answer questions yet.",
         )
+    # Flat merge, not a nested key: _strip_actions_for_free_tier reads
+    # `stages[].actions` and `selection_gap` at the TOP level of what it is
+    # handed, so nesting the projection would hide the paid layer from the
+    # paywall it was just wired through.
+    context.update(recovery)
+    context = await _apply_actions_paywall(context, merchant_id)
 
     # Cost gate. Price one ungrounded Deepseek probe; gate free tiers up-front so
     # we never do the work for a merchant who can't pay. Paid tiers run on

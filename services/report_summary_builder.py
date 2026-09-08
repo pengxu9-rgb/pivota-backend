@@ -229,26 +229,23 @@ def _score_block(
         subscores.append(
             {"key": key, "raw": value, "display": _display_score(value)}
         )
-    history = _as_dict(_as_dict(brand_rollup.get("tracking")).get("history"))
-    delta_map = _as_dict(history.get("delta_from_most_recent"))
-    delta = None
-    if delta_map.get("visibility") is not None:
-        delta = {
-            "raw": delta_map.get("visibility"),
-            "previous_audit_run_id": _as_dict(
-                history.get("most_recent_audit")
-            ).get("run_id"),
-            "days_since_last_audit": delta_map.get("days_since_last_audit"),
-        }
     out = _score_payload(raw)
     out["band_thresholds"] = [t / 10.0 for t in _BAND_THRESHOLDS]
     out["subscores"] = subscores
-    # The persisted run-over-run delta compares OLD-semantics numbers; once
-    # exclusions actually change the displayed score the comparison is
-    # apples-to-oranges, so it's dropped rather than shown wrong.
-    out["delta"] = (
-        None  # Unqualified legacy deltas are not comparable; use since_last_audit.
-    )
+    # `score.delta` IS GONE, and it is `None` rather than absent because the
+    # key is a cross-repo contract field consumers still read (see
+    # docs/audits/revenue-recovery-contract.md).
+    #
+    # It used to be built here from brand_rollup.tracking.history's
+    # `delta_from_most_recent`. That number is an UNQUALIFIED before/after: it
+    # carries no measurement basis, so it cannot say whether the two runs were
+    # measured the same way, and it compares OLD-semantics scores against a
+    # displayed score that unmeasured-dimension exclusions may have changed.
+    # The qualified comparison lives in `since_last_audit`, which does carry
+    # the basis verdict. The computation that fed this stayed behind for a
+    # while after the value was hard-wired to None — dead code that read like
+    # a live feature.
+    out["delta"] = None
     out["weakest_dimension"] = weakest
     out["unmeasured_excluded"] = list(excluded_applied)
     out["explainer"] = _score_explainer(weakest, excluded_applied)

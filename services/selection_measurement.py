@@ -69,7 +69,14 @@ def response_observations(runs, *, sku_key, merchant_host, merchant_brand, merch
         source_visible = bool(facts.brand_mentioned_runs) if has_sources and not failed else None
         identity = [sku_key, run.get("_probe_run_id"), index, provider, query]
         out.append({
-            "observation_id": hashlib.sha256(json.dumps(identity).encode()).hexdigest(),
+            # `default=str` because `_probe_run_id` is whatever the probe layer
+            # put there — a UUID or a datetime are both routine and neither is
+            # JSON-serializable. Without it json.dumps raises TypeError, and
+            # this loop's caller wraps the run_facts stamp in the SAME try, so
+            # one such id silently dropped run_facts for the entire run.
+            "observation_id": hashlib.sha256(
+                json.dumps(identity, default=str).encode()
+            ).hexdigest(),
             "product_key": sku_key, "query": query, "provider": provider,
             "tier": selection_tier(query, axis, merchant_brand),
             "status": "provider_failed" if failed else "answered",
