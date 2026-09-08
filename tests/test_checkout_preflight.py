@@ -406,3 +406,50 @@ async def test_a_structural_exception_follows_the_operators_instruction(monkeypa
     assert await _preflight_allows_external_offer({"offer_id": "x"}) is True
     monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "enforce")
     assert await _preflight_allows_external_offer({"offer_id": "x"}) is False
+
+
+def test_the_report_names_what_it_does_not_cover():
+    """A refusal rate is only meaningful with its denominator named, and this one is narrower
+    than "external offers" in two ways at once: three other hand-over paths publish the same
+    pre-filled cart_url and are not gated, and within the gated lane only cart-prefilled
+    handoffs are asked about. A reader taking it as "how often an external offer is stale"
+    would be wrong twice, so the scope travels with the number."""
+    assert "cart-prefilled" in cp.REPORT_SCOPE
+    assert "not gated" in cp.REPORT_SCOPE
+
+
+# ---------------------------------------------------------------------------
+# The per-request budget
+# ---------------------------------------------------------------------------
+
+
+def test_the_budget_bounds_a_wide_result_set(monkeypatch):
+    """A resolve can consider 40-2,880 candidates. A per-call timeout alone leaves the request
+    unbounded, so the count cap is what stops a wide result set from spending 2,880 x 4s."""
+    from routes.agent_shop_gateway import _PreflightBudget
+
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MAX_PER_REQUEST", "3")
+    b = _PreflightBudget()
+    for _ in range(3):
+        assert b.available() is True
+        b.spend()
+    assert b.available() is False, "the count cap must stop the gate for the rest of the request"
+
+
+def test_the_budget_bounds_a_few_slow_merchants(monkeypatch):
+    """The other failure shape: few candidates, each slow. Zero seconds means the very first
+    check is already over budget."""
+    from routes.agent_shop_gateway import _PreflightBudget
+
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_REQUEST_BUDGET_SECONDS", "0")
+    assert _PreflightBudget().available() is False
+
+
+def test_a_malformed_budget_falls_back_rather_than_raising(monkeypatch):
+    """A typo in an env var must not take down offer resolution."""
+    from routes.agent_shop_gateway import _PreflightBudget
+
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MAX_PER_REQUEST", "not a number")
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_REQUEST_BUDGET_SECONDS", "")
+    b = _PreflightBudget()
+    assert b.available() is True

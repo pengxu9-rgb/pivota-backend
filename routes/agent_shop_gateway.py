@@ -4371,6 +4371,14 @@ async def _handle_offers_resolve(
                     # costs a shortcut, never a sale.
                     _open_recovery_tasks = []
 
+            # An aggregate bound for the WHOLE resolve, not just per call. A resolve can
+            # consider 40-2,880 candidates; at up to 4s each plus an awaited INSERT on the
+            # shared pool, a per-call timeout alone leaves the request unbounded. Past either
+            # limit the preflight stops running and offers pass unverified — which under
+            # `enforce` is a FAIL-OPEN, and is the reason enforce must not be armed until this
+            # lane either samples deliberately or the budget covers a realistic result set.
+            _preflight_budget = _PreflightBudget()
+
             for v in matched_variants:
                 vid = _seed_offer_variant_id(v) or (sku_id or "∅")
                 offer_id = f"of:external_seed:{seed_id}:{vid}"
@@ -4406,37 +4414,53 @@ async def _handle_offers_resolve(
                     seed_data=seed_data,
                     offer_variant_id=_seed_offer_variant_id(v) or None,
                 )
-                # PREFLIGHT. This is the last moment we control before a buyer is handed a
-                # PRE-FILLED CART keyed on `cart_variant_id` — so a wrong or dead variant here
-                # does not merely bounce them, it puts the wrong thing in a real cart. Off by
-                # default; in shadow it records what enforcement WOULD have refused and changes
-                # nothing; in enforce it drops the offer rather than publish a cart for
-                # something the merchant no longer sells. Never raises: a verifier that can
-                # break offer resolution is worse than the staleness it checks.
-                if not await _preflight_allows_external_offer({
-                    "offer_id": offer_id,
-                    "product_key": row_dict.get("attached_product_key") or None,
-                    "source_product_id": row_dict.get("external_product_id") or None,
-                    "sku_key": sku_id or None,
-                    "merchant_id": redirect_identity["merchant_id"],
-                    "currency": currency,
-                    "merchant_effective_price": price_amount,
-                    "suppressed_at": row_dict.get("suppressed_at"),
-                    "suppression_reason": row_dict.get("suppression_reason"),
-                    # The SAME url the redirect is about to be built from, so the preflight
-                    # verifies the claim we are actually publishing rather than a different
-                    # one — the trap `_target` documents upstream.
-                    "execution_spec": {
-                        "pdp_url": str(canonical_url or destination_url),
-                        "variant_id": redirect_identity.get("cart_variant_id") or vid,
-                    },
-                    "source": {
-                        "seed_data": seed_data,
-                        "canonical_url": canonical_url,
-                        "destination_url": destination_url,
-                    },
-                }):
-                    continue
+                # PREFLIGHT — ONLY where we hand over a PRE-FILLED CART.
+                #
+                # `cart_variant_id` is None whenever we cannot name the variant with evidence
+                # (sole_stamped_variant_id declines on every multi-variant product), and the
+                # redirect then degrades to an honest referral. A first cut of this asked the
+                # preflight about `cart_variant_id or vid`, which reintroduced exactly the
+                # fallback the ROUND-5 CORRECTION below forbids: `vid` comes from
+                # _seed_offer_variant_id (variant_id | variantId | sku | sku_id | id), and a
+                # plain numeric SKU satisfies extract_shopify_numeric_variant_id by design. So
+                # on referral-only offers — the majority — it asked the merchant about a number
+                # Shopify never issued as a variant id, got `variant_absent`, and would have
+                # refused live referral links while poisoning the shadow number with a refusal
+                # rate that was an artifact of the question.
+                #
+                # Passing variant_id=None instead does not fix it: `_check_one` answers
+                # `ambiguous_variant` (UNVERIFIED) on any multi-variant product, which is the
+                # same false refusal wearing a different reason. So the gate applies to exactly
+                # the population it protects — cart-prefilled handoffs, where a wrong variant
+                # puts the wrong thing in a real cart — and referral links are left alone.
+                # `shadow_report` therefore measures cart handoffs, NOT all external offers.
+                _cart_vid = redirect_identity.get("cart_variant_id")
+                if _cart_vid and _preflight_budget.available():
+                    _preflight_budget.spend()
+                    if not await _preflight_allows_external_offer({
+                        "offer_id": offer_id,
+                        "product_key": row_dict.get("attached_product_key") or None,
+                        "source_product_id": row_dict.get("external_product_id") or None,
+                        "sku_key": sku_id or None,
+                        "merchant_id": redirect_identity["merchant_id"],
+                        "currency": currency,
+                        "merchant_effective_price": price_amount,
+                        "suppressed_at": row_dict.get("suppressed_at"),
+                        "suppression_reason": row_dict.get("suppression_reason"),
+                        # The SAME url the redirect is about to be built from, so the preflight
+                        # verifies the claim we are actually publishing rather than a different
+                        # one — the trap `_target` documents upstream.
+                        "execution_spec": {
+                            "pdp_url": str(canonical_url or destination_url),
+                            "variant_id": _cart_vid,
+                        },
+                        "source": {
+                            "seed_data": seed_data,
+                            "canonical_url": canonical_url,
+                            "destination_url": destination_url,
+                        },
+                    }):
+                        continue
 
                 # T2-12: mint the join key HERE, not inside the builder, and hand the same one
                 # to both. The id has to be identical on the surface_click_events row, on the
@@ -8284,6 +8308,35 @@ def resolve_cart_permalink(
         variant_id=cart_variant_id,
         quantity=quantity,
     )
+
+
+class _PreflightBudget:
+    """Bounds how much of a single resolve the preflight may consume.
+
+    Two limits because they fail differently: a COUNT cap bounds a wide result set even when
+    every merchant answers instantly, and a WALL-CLOCK cap bounds a few slow ones. Exhausting
+    either stops the gate for the rest of that request.
+    """
+
+    def __init__(self) -> None:
+        self._started = time.monotonic()
+        self._spent = 0
+        try:
+            self._max_calls = max(0, int(os.getenv("CHECKOUT_PREFLIGHT_MAX_PER_REQUEST") or 8))
+        except (TypeError, ValueError):
+            self._max_calls = 8
+        try:
+            self._budget_s = max(0.0, float(os.getenv("CHECKOUT_PREFLIGHT_REQUEST_BUDGET_SECONDS") or 6.0))
+        except (TypeError, ValueError):
+            self._budget_s = 6.0
+
+    def available(self) -> bool:
+        if self._spent >= self._max_calls:
+            return False
+        return (time.monotonic() - self._started) < self._budget_s
+
+    def spend(self) -> None:
+        self._spent += 1
 
 
 async def _preflight_allows_external_offer(offer: Dict[str, Any]) -> bool:

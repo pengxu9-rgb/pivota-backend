@@ -330,6 +330,21 @@ SHADOW_REPORT_SQL = """
 """
 
 
+#: What the observations actually cover. Carried IN the report because a refusal rate is only
+#: meaningful with its denominator named, and this one is narrower than "external offers":
+#:   * only offers.resolve's external-seed lane is wired today. find_products_multi's seed lane
+#:     (search cards), _build_prefetched_external_seed_wrappers and mint_external_seed_links
+#:     publish the SAME pre-filled cart_url and are NOT gated — the search lane is the larger
+#:     surface, and gating the shared chokepoint is follow-up work;
+#:   * within that lane, only CART-PREFILLED handoffs are asked about. Referral-only offers are
+#:     left alone deliberately (see the call site), so they appear in no row at all.
+#: A reader who takes this rate as "how often an external offer is stale" will be wrong twice.
+REPORT_SCOPE = (
+    "offers.resolve external-seed lane, cart-prefilled handoffs only; "
+    "search/prefetch/mint lanes not gated"
+)
+
+
 async def shadow_report(window_days: int = 7) -> Dict[str, Any]:
     """What enforcement WOULD have refused, and why. This is the evidence that decides whether
     `enforce` is armed — read it rather than the 31.1% from the pre-backfill sample."""
@@ -338,6 +353,7 @@ async def shadow_report(window_days: int = 7) -> Dict[str, Any]:
     total = sum(int(r["n"]) for r in by_reason)
     blocked = sum(int(r["would_block"]) for r in by_reason)
     return {
+        "scope": REPORT_SCOPE,
         "window_days": int(window_days),
         "observations": total,
         "would_block": blocked,
