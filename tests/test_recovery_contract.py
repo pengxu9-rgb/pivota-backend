@@ -1,3 +1,4 @@
+import inspect
 import json
 from pathlib import Path
 
@@ -93,28 +94,134 @@ def test_missing_full_basis_fails_closed():
     assert measurement_basis_between(report, report)["same"] is None
 
 
-async def test_url_persistence_requires_evidence_and_projection_success(monkeypatch):
+def _url_persistence_stubs(monkeypatch, *, canonical=None, projections=None):
+    """Stub the two persistence calls _persist_url_recovery makes."""
     import services.audit_evidence_builder as evidence
     import services.audit_projection_builder as projection
-    from services.audit_run_worker import _persist_url_recovery
     seen = []
+
     async def persist(**kw):
         assert kw["brand_report"]["catalog_dimensions_available"] is False
         seen.append("evidence")
-        return {"evidence_items_failed": 0}
+        return dict(canonical if canonical is not None else {"evidence_items_failed": 0})
+
     async def project(**kw):
         assert kw["strict"] is True
         seen.append("projection")
-        return {"projections_built": 6, "projections_failed": 0}
+        return dict(projections if projections is not None
+                    else {"projections_built": 6, "projections_failed": 0,
+                          "readback_mismatches": 0})
+
     monkeypatch.setattr(evidence, "persist_canonical_evidence", persist)
     monkeypatch.setattr(projection, "build_and_persist_all_projections", project)
-    await _persist_url_recovery(run_id="r", merchant_id="m", brand_report={})
+    return seen
+
+
+async def test_url_persistence_happy_path_runs_both_halves(monkeypatch):
+    from services.audit_run_worker import _persist_url_recovery
+    seen = _url_persistence_stubs(monkeypatch)
+    canonical, projections = await _persist_url_recovery(
+        run_id="r", merchant_id="m", brand_report={})
     assert seen == ["evidence", "projection"]
-    async def fail(**kw):
-        return {"projections_built": 5, "projections_failed": 1}
-    monkeypatch.setattr(projection, "build_and_persist_all_projections", fail)
-    with pytest.raises(RuntimeError):
+    assert canonical["evidence_persistence_degraded"] is False
+
+
+@pytest.mark.parametrize("counter", [
+    "evidence_items_failed", "findings_failed", "actions_failed",
+])
+async def test_one_failed_evidence_insert_does_not_fail_and_refund_the_run(
+    monkeypatch, counter,
+):
+    """M10. The caller runs _fail_run_and_refund AFTER the report is already
+    persisted, so a raise here marks a DELIVERED audit failed, makes it
+    unreachable through get_audit_run (completed stage only) and refunds it.
+    response_observations deposits one selection_response row per product x
+    provider x response, each its own insert — one transient failure out of
+    hundreds must not do that. It is counted and returned instead."""
+    from services.audit_run_worker import _persist_url_recovery
+    _url_persistence_stubs(
+        monkeypatch,
+        canonical={"evidence_items_inserted": 412, counter: 1},
+    )
+    canonical, projections = await _persist_url_recovery(
+        run_id="r", merchant_id="m", brand_report={})
+    assert canonical["evidence_persistence_failed_total"] == 1
+    assert canonical["evidence_persistence_degraded"] is True
+    assert projections["projections_built"] == 6
+
+
+async def test_a_partial_projection_failure_still_completes(monkeypatch):
+    """Some projections written is a served report; refunding it is worse."""
+    from services.audit_run_worker import _persist_url_recovery
+    _url_persistence_stubs(
+        monkeypatch,
+        projections={"projections_built": 5, "projections_failed": 1,
+                     "readback_mismatches": 0},
+    )
+    _, projections = await _persist_url_recovery(
+        run_id="r", merchant_id="m", brand_report={})
+    assert projections["projections_failed"] == 1
+
+
+async def test_total_projection_failure_fails_and_refunds(monkeypatch):
+    """M9 half one: nothing written, so there is no recovery surface to read."""
+    from services.audit_run_worker import _persist_url_recovery
+    _url_persistence_stubs(
+        monkeypatch,
+        projections={"projections_built": 0, "projections_failed": 6,
+                     "readback_mismatches": 0},
+    )
+    with pytest.raises(RuntimeError, match="wrote nothing"):
         await _persist_url_recovery(run_id="r", merchant_id="m", brand_report={})
+
+
+async def test_a_readback_mismatch_fails_and_refunds(monkeypatch):
+    """M9 half two. The row the database holds is not the row we built, so the
+    audit we would serve is not the audit we believe we stored — fatal even
+    though five other projections persisted."""
+    from services.audit_run_worker import _persist_url_recovery
+    _url_persistence_stubs(
+        monkeypatch,
+        projections={"projections_built": 5, "projections_failed": 1,
+                     "readback_mismatches": 1},
+    )
+    with pytest.raises(RuntimeError, match="read-back"):
+        await _persist_url_recovery(run_id="r", merchant_id="m", brand_report={})
+
+
+async def test_strict_projection_readback_is_counted_separately(monkeypatch):
+    """The mismatch counter has to come from the BUILDER, not the stub above:
+    deleting the read-back check must break something."""
+    import services.audit_projection_builder as pb
+    import db.audit_evidence as ae
+
+    async def fetch_run(*, run_id):
+        return {"run_id": run_id, "merchant_id": "m"}
+
+    async def rows(**kw):
+        return [{"finding_id": "f1", "finding_type": "not_selected",
+                 "severity": "high", "short_summary": "s"}]
+
+    async def none_rows(**kw):
+        return []
+
+    async def upsert(**kw):
+        return True
+
+    async def stored_is_wrong(**kw):
+        return {"payload_jsonb": {"audience": "tampered"}}
+
+    monkeypatch.setattr("db.merchant_audit_runs.fetch_audit_run_by_id", fetch_run)
+    monkeypatch.setattr(ae, "list_evidence_for_run", none_rows)
+    monkeypatch.setattr(ae, "list_findings_for_run", rows)
+    monkeypatch.setattr(ae, "list_actions_for_run", none_rows)
+    monkeypatch.setattr(ae, "upsert_projection", upsert)
+    monkeypatch.setattr(ae, "fetch_projection", stored_is_wrong)
+
+    summary = await pb.build_and_persist_all_projections(
+        audit_run_id="r", strict=True)
+    assert summary["projections_built"] == 0
+    assert summary["readback_mismatches"] == summary["projections_failed"] > 0
 
 
 async def test_domain_tick_seeds_before_checking_liveness(monkeypatch):
@@ -136,3 +243,45 @@ async def test_domain_tick_seeds_before_checking_liveness(monkeypatch):
     monkeypatch.setattr(job, "refresh_official_domain_liveness", sweep)
     result = await job.run_official_domain_liveness_tick()
     assert seen == ["seed", "sweep"] and result["seed_failed"] == 0
+
+
+async def test_domain_tick_is_dormant_unless_explicitly_armed(monkeypatch):
+    """OPT-IN, not opt-out.
+
+    audit_scheduler registers this tick every 6h on any worker with
+    worker_enabled and the prod worker deploys, so a "true" default armed it
+    on merge. Its first run seeds merchant_official_domains for EVERY merchant
+    and official_domains is a comparability field — it moves attribution and
+    makes the next re-audit of each of those merchants non-comparable.
+    """
+    import jobs.official_domain_liveness as job
+
+    monkeypatch.delenv("OFFICIAL_DOMAIN_LIVENESS_ENABLED", raising=False)
+
+    async def never(*a, **kw):  # pragma: no cover - must not be reached
+        raise AssertionError("the dormant tick touched the database")
+
+    monkeypatch.setattr(job.database, "fetch_all", never)
+    monkeypatch.setattr(job, "seed_inferred_domains", never)
+    monkeypatch.setattr(job, "refresh_official_domain_liveness", never)
+
+    assert job.liveness_job_enabled() is False
+    assert await job.run_official_domain_liveness_tick() == {"skipped": True}
+
+    # A value that is not "true" is not arming, either.
+    for value in ("", "false", "0", "yes"):
+        monkeypatch.setenv("OFFICIAL_DOMAIN_LIVENESS_ENABLED", value)
+        assert job.liveness_job_enabled() is False, value
+        assert await job.run_official_domain_liveness_tick() == {"skipped": True}
+
+
+async def test_the_scheduler_registers_the_flag_checking_tick(monkeypatch):
+    """The gate has to be on the callable the scheduler actually holds."""
+    import services.audit_scheduler as sched
+    import jobs.official_domain_liveness as job
+
+    monkeypatch.delenv("OFFICIAL_DOMAIN_LIVENESS_ENABLED", raising=False)
+    source = inspect.getsource(sched)
+    assert "run_official_domain_liveness_tick" in source
+    assert 'id="official_domain_liveness"' in source
+    assert await job.run_official_domain_liveness_tick() == {"skipped": True}

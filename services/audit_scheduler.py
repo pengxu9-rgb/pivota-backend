@@ -1126,6 +1126,13 @@ async def start_scheduler() -> None:
             misfire_grace_time=120,
         )
 
+        # B1 official-domain seeding + liveness. DORMANT unless
+        # OFFICIAL_DOMAIN_LIVENESS_ENABLED is set (the tick checks the flag
+        # itself, like identity_reconcile_sweep below): the first prod run
+        # seeds merchant_official_domains for EVERY merchant, and
+        # official_domains is a comparability field, so it moves attribution
+        # and makes the next re-audit of every merchant non-comparable.
+        # Arm it after a dry run has sized the seed.
         from jobs.official_domain_liveness import run_official_domain_liveness_tick
         _add_job(
             run_official_domain_liveness_tick, "interval", hours=6,

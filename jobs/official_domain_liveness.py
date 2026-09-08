@@ -10,9 +10,28 @@ from services.official_domain_liveness import seed_inferred_domains, refresh_off
 logger = logging.getLogger(__name__)
 _cursor = ""
 
+# DORMANT BY DEFAULT — same posture as ENABLE_IDENTITY_RECONCILE_SWEEP and
+# merchant_order_create_reconcile in services/audit_scheduler.py, and for the
+# same reason. audit_scheduler registers this tick every 6h on any worker with
+# worker_enabled, the prod worker deploys, and staging shares the prod
+# Postgres. Its first run seeds `merchant_official_domains` rows for EVERY
+# merchant in the catalog — and `official_domains` is a comparability field
+# (db.audit_basis.COMPARABILITY_FIELDS), so seeding moves attribution and
+# turns the next re-audit of every merchant into a non-comparable pair.
+# Defaulting this to "true" armed all of that on merge. Arm it deliberately,
+# after a dry run has sized the seed: set OFFICIAL_DOMAIN_LIVENESS_ENABLED=true
+# on the worker service.
+_ENABLED_ENV = "OFFICIAL_DOMAIN_LIVENESS_ENABLED"
+
+
+def liveness_job_enabled() -> bool:
+    """Read the arming flag at CALL time, never at import."""
+    return os.getenv(_ENABLED_ENV, "false").strip().lower() == "true"
+
+
 async def run_official_domain_liveness_tick():
     global _cursor
-    if os.getenv("OFFICIAL_DOMAIN_LIVENESS_ENABLED", "true").lower() != "true":
+    if not liveness_job_enabled():
         return {"skipped": True}
     started = time.monotonic()
     summary = {"merchants_seeded": 0, "seed_failed": 0, "deadline_hit": False}
