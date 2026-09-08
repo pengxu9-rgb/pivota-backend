@@ -140,6 +140,10 @@ class _OfferRefused(Exception):
     """The guard rejected this variant's offer, so its SKU must not be committed alone."""
 
 
+class _OfferOwnedByOther(Exception):
+    """This offer_id already exists and another writer owns it."""
+
+
 class _SkuSuppressed(Exception):
     """The identity exists on a suppressed SKU; an offer there could never be served."""
 
@@ -171,6 +175,10 @@ SELECT_PRODUCTS_SQL = """
      AND eps.status = 'active'
     WHERE cp.platform = 'external_seed'
       AND cp.suppressed_at IS NULL
+      -- BOTH columns: recall gates suppression_reason too, and catalog_trust_policy
+      -- tombstones on the reason ALONE (a reason without a timestamp is a
+      -- threshold-0 class in catalog_invariant_checks).
+      AND cp.suppression_reason IS NULL
       AND cp.product_key > :after
     ORDER BY cp.product_key
     LIMIT :page
@@ -224,6 +232,7 @@ UPSERT_SKU_SQL = """
         barcode     = coalesce(catalog_skus.barcode, EXCLUDED.barcode),
         updated_at  = NOW()
     WHERE catalog_skus.suppressed_at IS NULL
+      AND catalog_skus.suppression_reason IS NULL
     RETURNING sku_key
 """
 
@@ -247,7 +256,12 @@ UPSERT_OFFER_SQL = """
         list_price               = EXCLUDED.list_price,
         merchant_effective_price = EXCLUDED.merchant_effective_price,
         estimated_best_price     = EXCLUDED.estimated_best_price,
-        availability             = EXCLUDED.availability,
+        -- Only when the VARIANT itself said something. _availability_of falls back to the
+        -- chosen offer's value, so on an UPDATE a variant that carries no availability of its
+        -- own would overwrite a measured out_of_stock with an inherited in_stock.
+        availability             = CASE WHEN :variant_spoke
+                                       THEN EXCLUDED.availability
+                                       ELSE catalog_offers.availability END,
         -- Re-stamped on the update path too, so a row this batch last touched says so (M1).
         source_system            = EXCLUDED.source_system,
         offer_payload            = catalog_offers.offer_payload || EXCLUDED.offer_payload,
@@ -289,6 +303,11 @@ def normalize_availability(raw: Any, fallback: Optional[str] = None) -> str:
         return "unknown"
     fb = str(fallback or "").strip().lower()
     return _AVAILABILITY.get(fb, "unknown")
+
+
+def _variant_stated_availability(variant: Dict[str, Any]) -> bool:
+    """Did this variant carry availability of its own, or are we inheriting the offer's?"""
+    return variant.get("availability") not in (None, "") or "in_stock" in variant
 
 
 def _availability_of(variant: Dict[str, Any], fallback: Optional[str]) -> str:
@@ -387,7 +406,8 @@ def plan_for_product(
 
 
 async def run(
-    *, apply: bool, limit: int = 0, after: str = "", page: int = 500
+    *, apply: bool, limit: int = 0, after: str = "", page: int = 500,
+    adopt_existing_offers: bool = False,
 ) -> Dict[str, Any]:
     counts: collections.Counter = collections.Counter()
     # Pre-seed every outcome so the report distinguishes "zero" from "never measured". A bare
@@ -399,6 +419,7 @@ async def run(
         "skipped_not_merchant_issued", "skipped_no_variant_price",
         "skipped_no_live_offer", "skipped_multi_merchant_product",
         "skipped_no_destination_url", "skipped_currency_disagrees_with_offer",
+        "skipped_offer_owned_by_other_writer", "skipped_suppressed_sku",
         "adopted_existing_sku_row", "rolled_back_offer_refused_by_guard",
         "skipped_unique_violation",
     ):
@@ -415,6 +436,7 @@ async def run(
         return await _scan(
             counts, audit, apply=apply, limit=limit, page=page,
             cursor=cursor, touched=touched, state=state,
+            adopt_existing_offers=adopt_existing_offers,
         )
     except Exception:
         # Seal the report and the audit row before the exception leaves, then let it leave.
@@ -423,7 +445,8 @@ async def run(
         raise
 
 
-async def _scan(counts, audit, *, apply, limit, page, cursor, touched, state):
+async def _scan(counts, audit, *, apply, limit, page, cursor, touched, state,
+                adopt_existing_offers=False):
     while True:
         rows = await database.fetch_all(
             SELECT_PRODUCTS_SQL, {"after": cursor, "page": int(page)}
@@ -541,6 +564,7 @@ async def _scan(counts, audit, *, apply, limit, page, cursor, touched, state):
                             "availability": _availability_of(
                                 meta["variant"], chosen.get("availability")
                             ),
+                            "variant_spoke": _variant_stated_availability(meta["variant"]),
                             "currency": meta["currency"],
                             "list_price": meta["price"],
                             "merchant_effective_price": meta["price"],
@@ -565,6 +589,24 @@ async def _scan(counts, audit, *, apply, limit, page, cursor, touched, state):
                                 "destination_url": destination,
                             }),
                         }
+                        # derive_offer_id uses the same (product_key, sku_key, destination)
+                        # triple ingestion does, so an id CAN land on a row another writer
+                        # owns; DO UPDATE would then revert a price the nightly refresh had
+                        # moved since the crawl and re-stamp source_system as ours. Measured
+                        # 2026-09-07: 0 of 6,090 planned ids exist at all — but an ingest run
+                        # between measurement and execution creates the case, so refuse by
+                        # default rather than rely on a count that is only true today.
+                        owner = await database.fetch_val(
+                            "SELECT coalesce(source_system, '') FROM catalog_offers"
+                            " WHERE offer_id = :oid",
+                            {"oid": offer_params["offer_id"]},
+                        )
+                        if (
+                            owner is not None
+                            and str(owner) != SOURCE_SYSTEM
+                            and not adopt_existing_offers
+                        ):
+                            raise _OfferOwnedByOther(str(owner))
                         accepted, reasons, _rejected = await guard_catalog_offer_rows(
                             [offer_params]
                         )
@@ -592,6 +634,9 @@ async def _scan(counts, audit, *, apply, limit, page, cursor, touched, state):
                     counts["rolled_back_offer_refused_by_guard"] += 1
                 except _SkuSuppressed:
                     counts["skipped_suppressed_sku"] += 1
+                except _OfferOwnedByOther as owned:
+                    counts["skipped_offer_owned_by_other_writer"] += 1
+                    counts["owner_" + (str(owned) or "unknown")] += 1
                 except Exception as exc:  # noqa: BLE001
                     # The one path ON CONFLICT still cannot cover: the supplied sku_key
                     # collides with the PK while the identity tuple does NOT match, so
@@ -654,6 +699,12 @@ def main() -> int:
     ap.add_argument("--after", default="", help="resume: only product_key > this")
     ap.add_argument("--page", type=int, default=500, help="scan page size")
     ap.add_argument(
+        "--adopt-existing-offers",
+        action="store_true",
+        help="overwrite an offer another writer owns. Off by default: DO UPDATE would revert "
+             "a price the nightly refresh moved since the crawl and re-stamp its source_system.",
+    )
+    ap.add_argument(
         "--expect-contract",
         default="",
         help=f"required with --apply; must be {CONTRACT!r}. Its purpose is to fail on a stale "
@@ -673,7 +724,8 @@ def main() -> int:
         await database.connect()
         try:
             return await run(
-                apply=args.apply, limit=args.limit, after=args.after, page=args.page
+                apply=args.apply, limit=args.limit, after=args.after, page=args.page,
+                adopt_existing_offers=args.adopt_existing_offers,
             )
         finally:
             await database.disconnect()

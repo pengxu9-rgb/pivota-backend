@@ -49,7 +49,7 @@ async def _ddl(database):
         CREATE TABLE catalog_products (
           product_key text PRIMARY KEY, merchant_id text, platform text,
           source_product_id text, source_domain text, title text,
-          product_payload jsonb, suppressed_at timestamptz)
+          product_payload jsonb, suppressed_at timestamptz, suppression_reason text)
     """)
     await database.execute("""
         CREATE TABLE external_product_seeds (
@@ -170,7 +170,8 @@ async def db():
 
 async def _run(**kw):
     import scripts.backfill_variant_identity_skus as backfill
-    return await backfill.run(**{"apply": True, "limit": 0, "after": "", "page": 100, **kw})
+    return await backfill.run(**{"apply": True, "limit": 0, "after": "", "page": 100,
+                                 "adopt_existing_offers": False, **kw})
 
 
 # ---------------------------------------------------------------------------
@@ -477,3 +478,70 @@ async def test_a_destination_that_lives_only_in_source_ref_is_still_carried(db):
     o = dict(await db.fetch_one("SELECT * FROM catalog_offers WHERE source_system=:s",
                                 {"s": "variant_identity_backfill_v1"}))
     assert json.loads(o["offer_payload"])["destination_url"] == DEST
+
+
+async def test_an_offer_another_writer_owns_is_not_overwritten(db):
+    """derive_offer_id uses the same triple ingestion does, so an id can land on a row
+    another writer owns; DO UPDATE would revert a price the nightly refresh had moved and
+    re-stamp source_system as ours. 0 of 6,090 today — but an ingest run between measurement
+    and execution creates the case, so refuse rather than trust a count."""
+    import scripts.backfill_variant_identity_skus as backfill
+    from services.catalog_enrichment_agent.ingestion import (
+        derive_offer_id, derive_variant_sku_key,
+    )
+    await _seed(db, variants=[_variant()], offers=[{}])
+    sk = derive_variant_sku_key(PK, VID)
+    oid = derive_offer_id(PK, sk, DEST)
+    await db.execute(
+        """INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id,
+             catalog_track, availability, currency, list_price, source_system, market,
+             offer_payload, created_at, updated_at)
+           VALUES (:oid,:sk,:pk,'m_seller','external_referral','out_of_stock','USD',
+             99.0,'nightly_refresh','US','{}'::jsonb,NOW(),NOW())""",
+        {"oid": oid, "sk": sk, "pk": PK},
+    )
+    report = await _run()
+    assert report["skipped_offer_owned_by_other_writer"] == 1
+    assert report["skus"] == 0
+    row = dict(await db.fetch_one("SELECT * FROM catalog_offers WHERE offer_id=:o", {"o": oid}))
+    assert row["source_system"] == "nightly_refresh"
+    assert float(row["list_price"]) == 99.0          # the refresh's price, not the snapshot's
+    assert row["availability"] == "out_of_stock"
+
+    # ...and the opt-in does adopt it
+    report2 = await _run(adopt_existing_offers=True)
+    assert report2["skus"] == 1
+    row2 = dict(await db.fetch_one("SELECT * FROM catalog_offers WHERE offer_id=:o", {"o": oid}))
+    assert row2["source_system"] == "variant_identity_backfill_v1"
+
+
+async def test_a_silent_variant_never_overwrites_a_measured_availability(db):
+    """_availability_of falls back to the chosen offer's value, so on an UPDATE a variant
+    that states nothing would flip a measured out_of_stock to an inherited in_stock."""
+    from services.catalog_enrichment_agent.ingestion import (
+        derive_offer_id, derive_variant_sku_key,
+    )
+    await _seed(db, variants=[_variant()], offers=[{}])
+    await _run()
+    sk = await db.fetch_val(
+        "SELECT sku_key FROM catalog_skus WHERE source_variant_id=:v", {"v": VID})
+    oid = derive_offer_id(PK, sk, DEST)
+    await db.execute("UPDATE catalog_offers SET availability='out_of_stock' WHERE offer_id=:o",
+                     {"o": oid})
+    # a re-run whose variant says nothing about availability must leave that alone
+    await db.execute(
+        "UPDATE external_product_seeds SET seed_data=CAST(:sd AS jsonb)",
+        {"sd": json.dumps({"snapshot": {"variants": [
+            {"variant_id": VID, "title": "Ruby", "price_amount": "24.00", "currency": "USD"}]}})},
+    )
+    await _run()
+    assert await db.fetch_val(
+        "SELECT availability FROM catalog_offers WHERE offer_id=:o", {"o": oid}) == "out_of_stock"
+
+
+async def test_a_product_suppressed_by_reason_alone_is_skipped(db):
+    """catalog_trust_policy tombstones on the reason ALONE; a reason without a timestamp is a
+    threshold-0 class in catalog_invariant_checks."""
+    await _seed(db, variants=[_variant()], offers=[{}])
+    await db.execute("UPDATE catalog_products SET suppression_reason='withdrawn'")
+    assert (await _run())["skus"] == 0
