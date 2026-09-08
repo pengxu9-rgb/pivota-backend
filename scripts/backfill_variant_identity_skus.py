@@ -57,9 +57,9 @@ refusal is counted in the report and in `writer_audit_log`; none is silent.
 
     python3 scripts/backfill_variant_identity_skus.py                    # dry run, no token needed
     python3 scripts/backfill_variant_identity_skus.py --apply --limit 50 \
-        --expect-contract backfill-v2-identity-index
+        --expect-contract backfill-v3-bound-identity
     python3 scripts/backfill_variant_identity_skus.py --apply --after ext:foo::abc123 \
-        --expect-contract backfill-v2-identity-index
+        --expect-contract backfill-v3-bound-identity
 
 `--apply` refuses to run without the contract token, so a stale image fails on the argument
 rather than silently running the merged first draft. See CONTRACT below.
@@ -119,11 +119,17 @@ WRITER_NAME = "backfill_variant_identity_skus"
 #: which version answered it. Measured 2026-09-07: the image's copy was byte-identical to the
 #: broken draft while this fixed copy sat unmerged on a branch.
 #:
-#: `--apply` therefore requires `--expect-contract backfill-v2-identity-index`. The old draft has
+#: `--apply` therefore requires `--expect-contract backfill-v3-bound-identity`. The old draft has
 #: no such flag, so argparse refuses it outright — a stale image fails loudly on the argument
 #: instead of silently running the version that crashes on 30% of its plan. Bump the token whenever
 #: a change would make an in-flight operator's command mean something different.
-CONTRACT = "backfill-v2-identity-index"
+#:
+#: v2 -> v3 (PR #2141): the plan now dedupes on the BOUND `source_variant_id` (varchar(128)), so
+#: an operator's command means something different than it did under v2. Under v2 the same
+#: command reported `skus: N` for a plan that collapsed two identities into one stored row and
+#: could write the SECOND shade's price over the first's; a stale image answering the v3 command
+#: with the v2 code would report that miscount under a token that promises the dedupe.
+CONTRACT = "backfill-v3-bound-identity"
 
 #: Sentinels around the one-line report, so a caller can extract it from a log that has had
 #: other lines dropped:

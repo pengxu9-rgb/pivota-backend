@@ -145,10 +145,35 @@ def test_offer_upsert_restamps_source_system_on_the_update_path():
 def test_apply_refuses_to_run_without_the_contract_token():
     """A stale image runs the MERGED first draft, which has all four blockers and no such flag.
     argparse then refuses the command instead of silently running the broken version."""
-    assert backfill.CONTRACT == "backfill-v2-identity-index"
+    assert backfill.CONTRACT == "backfill-v3-bound-identity"
     src = _write_path_source()
     assert "--expect-contract" in src
     assert "args.apply and args.expect_contract != CONTRACT" in src
+
+
+def test_the_docstring_command_names_the_current_contract_token():
+    """The token is only a stale-image tripwire if the command an operator COPIES carries it.
+    A bump that misses the docstring hands the operator a command that fails on the current
+    image — the opposite failure, and one that trains them to drop the flag."""
+    for line in backfill.__doc__.splitlines():
+        if "--expect-contract" in line:
+            assert backfill.CONTRACT in line, (
+                f"docstring command names a stale token: {line.strip()!r}"
+            )
+
+
+def test_apply_with_the_previous_contract_token_is_refused(monkeypatch):
+    """EXECUTED, not read. v2 promised a plan that did not dedupe on the bound
+    `source_variant_id`; v3 does. An operator whose command still says v2 must be refused at
+    argparse rather than reaching the writer — and argparse must refuse it BEFORE any event
+    loop or database connect, which is why this test can assert on a bare main()."""
+    monkeypatch.setattr(
+        sys, "argv",
+        ["backfill", "--apply", "--expect-contract", "backfill-v2-identity-index"],
+    )
+    with pytest.raises(SystemExit) as excinfo:
+        backfill.main()
+    assert excinfo.value.code == 2, "the stale token must fail the command, not run it"
 
 
 # ---------------------------------------------------------------------------

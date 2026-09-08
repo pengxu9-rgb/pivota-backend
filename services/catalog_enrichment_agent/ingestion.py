@@ -321,7 +321,9 @@ def _build_variant_sku_inserts(
     )
     single = len(variants) < 2
     rows: List[Dict[str, Any]] = []
-    seen: set = set()
+    #: sku_key -> the (full, bound) merchant variant id that first claimed it, so the drop
+    #: below can name what it collapsed into rather than just how many.
+    seen: Dict[str, Tuple[str, str]] = {}
     for v in variants:
         vid = str(v.get("variant_id") or "").strip()
         if not vid:
@@ -346,8 +348,24 @@ def _build_variant_sku_inserts(
         stored_vid = vid[:SOURCE_VARIANT_ID_MAX]
         sku_key = derive_variant_sku_key(product_key, stored_vid)
         if sku_key in seen:
+            # SAY SO. Until this branch existed the pair reached apply, where
+            # `_adopt_existing_sku_identities` counted it as `skus_deduped_same_identity` and
+            # logged both keys; dropping it at build time is correct but it also removed the
+            # only record that a shade vanished. This is reachable today with no 128-char id
+            # at all — `derive_variant_sku_key` normalises the id to a 60-char token, so
+            # `ABC_1` and `abc-1` are one key — and the symptom is silent: one shade missing
+            # from the PDP selector and from recall, with healthy-looking counts. Mirrors the
+            # backfill's warning at scripts/backfill_variant_identity_skus.py.
+            kept_vid, kept_stored = seen[sku_key]
+            logger.warning(
+                "variant dropped (same SKU identity as an earlier variant of %s): merchant "
+                "variant id %r (source_variant_id=%r) derives sku_key=%r, already claimed by "
+                "%r (source_variant_id=%r); writing it would DO UPDATE the earlier row, not "
+                "add a variant",
+                product_key, vid, stored_vid, sku_key, kept_vid, kept_stored,
+            )
             continue
-        seen.add(sku_key)
+        seen[sku_key] = (vid, stored_vid)
         shade = str(v.get("title") or "").strip()
         shade_token = _normalize_token(shade).replace(" ", "_").strip("_")
         labels = [f"shade_{shade_token}"] if shade_token else []
