@@ -42,13 +42,27 @@
 #   scripts/ops/run_oneoff_job.sh scripts/partner_settlement_dry_run.py --billing-run-id 28 --json
 #   SECRETS=DATABASE_URL=DATABASE_URL:latest,REDIS_URL=REDIS_URL:latest \
 #     scripts/ops/run_oneoff_job.sh scripts/some_script.py --apply
+#   # a Node one-off on another service's image (COMMAND, IMAGE, SERVICE_ACCOUNT, SECRETS and
+#   # ENV_VARS all move together — see the COMMAND note below):
+#   COMMAND=node IMAGE=us-west1-docker.pkg.dev/pivota-shared/pivota/gateway:<sha> \
+#     SERVICE_ACCOUNT=sa-gateway@pivota-prod.iam.gserviceaccount.com \
+#     SECRETS=DATABASE_URL=DATABASE_URL_NOVERIFY:latest ENV_VARS=NODE_ENV=production \
+#     scripts/ops/run_oneoff_job.sh scripts/some-script.js --market US
 #
-# Environment overrides: PROJECT, REGION, IMAGE, SERVICE_ACCOUNT, SECRETS, ENV_VARS, TASK_TIMEOUT,
-# JOB_PREFIX, NETWORK, SUBNET. SECRETS and ENV_VARS are passed to gcloud verbatim and are themselves
-# comma-separated, so no name or value in them may contain a comma.
+# Environment overrides: PROJECT, REGION, IMAGE, COMMAND, SERVICE_ACCOUNT, SECRETS, ENV_VARS,
+# TASK_TIMEOUT, JOB_PREFIX, NETWORK, SUBNET. SECRETS and ENV_VARS are passed to gcloud verbatim and
+# are themselves comma-separated, so no name or value in them may contain a comma.
 #
 # SUBNET=pivota-crawl IS REQUIRED FOR ANYTHING THAT FETCHES FROM A MERCHANT. See the note beside
 # the variable: the default subnet's NAT address is the one payment partners allowlist.
+#
+# COMMAND is the container entrypoint the args are handed to. It defaults to `python` because IMAGE
+# defaults to the backend image, and THE TWO ARE A PAIR: the backend image carries no `node` and the
+# gateway image (node:20-bookworm-slim) carries no `python`, so overriding one without the other
+# fails inside the container, where it reads as a job crash rather than as the configuration mistake
+# it is. SERVICE_ACCOUNT, SECRETS and ENV_VARS travel with them — another service's image wants its
+# own identity and its own secret NAMES (gateway mounts DATABASE_URL_NOVERIFY, not DATABASE_URL),
+# and the ENV_VARS default is the backend's Python DB knobs, which mean nothing to a Node process.
 #
 # NEVER use this for a script that writes to a database it should not: it mounts PRODUCTION
 # credentials. Read the target script's own docstring first.
@@ -57,6 +71,13 @@ set -euo pipefail
 PROJECT="${PROJECT:-pivota-prod}"
 REGION="${REGION:-us-west1}"
 IMAGE="${IMAGE:-us-west1-docker.pkg.dev/pivota-shared/pivota/backend:latest}"
+# Paired with IMAGE — see the header. `python` is right only for the default backend image.
+# `${COMMAND-python}`, NOT `${COMMAND:-python}`: the `:-` form treats UNSET and EMPTY alike, so an
+# explicitly-blank COMMAND (an unset shell variable expanded by a caller) would silently become
+# `python` and the empty-check below could never fire. Defaulting only when unset keeps that check
+# live, which matters most in exactly the case it exists for — a caller who set IMAGE to a Node
+# image and lost COMMAND, where `python` crashes inside the container as an opaque job failure.
+COMMAND="${COMMAND-python}"
 SERVICE_ACCOUNT="${SERVICE_ACCOUNT:-sa-worker@$PROJECT.iam.gserviceaccount.com}"
 SECRETS="${SECRETS:-DATABASE_URL=DATABASE_URL:latest}"
 # PIVOTA_ENV is REQUIRED, not decorative. A Cloud Run Job injects CLOUD_RUN_JOB /
@@ -92,6 +113,16 @@ usage(){ awk 'NR<3{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; }
 
 case "${1-}" in
   -h|--help|"") usage >&2; exit 2 ;;
+esac
+
+# `--command` is itself a comma-separated LIST to gcloud, so a COMMAND carrying a comma would
+# silently become a multi-token entrypoint and run something other than what was asked for. Refuse
+# it here rather than let it reach the container. Empty is refused separately: whatever gcloud does
+# with a blank --command, a caller who reached here with one has lost a variable, and the honest
+# response is to say so rather than to guess an entrypoint on their behalf.
+case "$COMMAND" in
+  "")  echo "run_oneoff_job: COMMAND is empty; unset it to get the default (python) rather than blanking it" >&2; exit 2 ;;
+  *,*) echo "run_oneoff_job: COMMAND '$COMMAND' contains a comma; gcloud --command splits on commas and would build a multi-token entrypoint" >&2; exit 2 ;;
 esac
 
 # An empty argument cannot be expressed: gcloud drops it at either end of the list and shifts argv
@@ -144,7 +175,7 @@ trap 'cleanup; exit 143' TERM
 # then runs an unrelated job in the same shell sends it out of the crawl IP with nothing in the
 # terminal saying so, and `cleanup` deletes the job on exit so no state survives to check. One
 # word, no policy — an allowlist here would reject a legitimate future subnet.
-echo "==> job $JOB  image ${IMAGE##*/}  subnet $SUBNET  secrets ${SECRETS%%=*}..." >&2
+echo "==> job $JOB  image ${IMAGE##*/}  command $COMMAND  subnet $SUBNET  secrets ${SECRETS%%=*}..." >&2
 gcloud run jobs create "$JOB" --project "$PROJECT" --region "$REGION" \
   --image "$IMAGE" \
   --service-account "$SERVICE_ACCOUNT" \
@@ -152,7 +183,7 @@ gcloud run jobs create "$JOB" --project "$PROJECT" --region "$REGION" \
   --set-secrets "$SECRETS" \
   --set-env-vars "$ENV_VARS" \
   --max-retries 0 --task-timeout "$TASK_TIMEOUT" \
-  --command python --args="^$DELIM^$JOINED" \
+  --command "$COMMAND" --args="^$DELIM^$JOINED" \
   --quiet >/dev/null 2>"$ERRLOG" || {
     echo "==> could not CREATE the job (gcloud exited non-zero); it never ran:" >&2
     cat "$ERRLOG" >&2
