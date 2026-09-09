@@ -88,6 +88,12 @@ from services.outbound_links_service import (
 )
 from services import checkout_preflight
 from services import live_offer_verification
+from services.handover_variant_identity import (
+    HandoverVariant,
+    HandoverVariantResolver,
+    handover_coverage_fields,
+    handover_coverage_message,
+)
 from services.shopify_variant_identity import (
     sole_stamped_variant_id,
     storefront_is_shopify,
@@ -4303,11 +4309,22 @@ async def _handle_offers_resolve(
     # INCREMENTED these — five writes, zero reads, discarded at function exit — while a comment
     # claimed they gave the rate a denominator. They did not, and a counter nobody reads is
     # indistinguishable from one that is always zero.
-    _preflight_stats: Dict[str, int] = {"candidates": 0, "cart_prefilled": 0, "asked": 0,
-                                        "memo_hits": 0, "skipped_by_budget": 0,
+    _preflight_stats: Dict[str, int] = {"candidates": 0, "gated": 0, "cart_prefilled": 0,
+                                        "asked": 0, "memo_hits": 0, "skipped_by_budget": 0,
                                         "degraded_to_referral": 0}
+    # ONE resolver for the WHOLE request, for the same reason the budget and the memo are one:
+    # `_append_external_offers_from_seed_rows` is called from three sites, and a resolver built
+    # per call would re-ask for product keys the previous call already loaded. It holds only a
+    # memo and counters; every lookup failure inside it answers "no id", never a wrong one.
+    _handover_resolver = HandoverVariantResolver()
 
     async def _append_external_offers_from_seed_rows(seed_rows: List[Any]) -> None:
+        # ONE statement for every product key this batch is about to hand over, BEFORE the
+        # loop. Inside the loop it would be a query per card, which is the shape the
+        # `list_open_recovery_tasks` note below already had to be corrected for.
+        await _handover_resolver.prime(
+            _row_to_dict(r).get("attached_product_key") for r in seed_rows
+        )
         for row in seed_rows:
             row_dict = _row_to_dict(row)
             blocked, gate_status = await should_block_external_referral_runtime(
@@ -4366,6 +4383,11 @@ async def _handle_offers_resolve(
             # stamping one merchant's key onto another's link. merchant_id and
             # shop_domain come from attached_product_key, which is per-row, so
             # deriving them without a variant is correct.
+            # DELIBERATELY no `handover=` here. This derivation is read for `merchant_id` and
+            # `shop_domain` only — the cart identity is derived per variant below — and asking
+            # the resolver here would add one `handover_considered` per row for a decision
+            # nothing publishes, which is the counter-inflation `preflight_coverage_fields`
+            # had to be corrected for from the other direction.
             _seed_identity = _external_seed_redirect_identity(
                 row=row_dict, seed_data=seed_data, offer_variant_id=None,
             )
@@ -4424,23 +4446,48 @@ async def _handle_offers_resolve(
                 if isinstance(availability, str):
                     in_stock = availability.lower() not in {"out_of_stock", "outofstock", "sold_out"}
 
+                # RESOLVED ONCE and read twice — by the identity below and by the preflight
+                # gate under it. Two calls would count this hand-over twice in the coverage
+                # line and, worse, could answer differently if either input drifted.
+                #
+                # `offer_variant_id` is the variant this candidate IS, so a product with
+                # several live merchant-issued SKUs can still be named when the hand-over
+                # points at exactly one of them. `choose` requires string equality against a
+                # stored merchant-issued id — it will not rank candidates, and it refuses
+                # outright when the name matches none of them or more than one.
+                _handover = _handover_resolver.choose(
+                    product_key=row_dict.get("attached_product_key"),
+                    seed_data=seed_data,
+                    offer_variant_id=_seed_offer_variant_id(v) or None,
+                )
                 redirect_identity = _external_seed_redirect_identity(
                     row=row_dict,
                     seed_data=seed_data,
                     offer_variant_id=_seed_offer_variant_id(v) or None,
+                    handover=_handover,
                 )
-                # PREFLIGHT — ONLY where we hand over a PRE-FILLED CART, and ONCE per
-                # distinct question.
+                # PREFLIGHT — wherever we can NAME the variant, and ONCE per distinct question.
                 #
-                # `cart_variant_id` is None whenever we cannot name the variant with evidence
-                # (sole_stamped_variant_id declines on every multi-variant product), and the
-                # redirect then degrades to an honest referral. A first cut asked about
-                # `cart_variant_id or vid`, which reintroduced exactly the fallback the
-                # ROUND-5 CORRECTION below forbids: `vid` comes from _seed_offer_variant_id
-                # (variant_id | variantId | sku | sku_id | id), and a plain numeric SKU
-                # satisfies extract_shopify_numeric_variant_id by design. On referral-only
-                # offers — the majority — it asked about a number Shopify never issued, got
-                # `variant_absent`, and would have refused live referral links. Passing
+                # #2151 MOVED THIS GATE OFF `cart_variant_id`, and the move is the point of the
+                # change, so read why. `cart_variant_id` is the intersection of two independent
+                # facts: we can name the merchant's variant, AND the storefront is one we can
+                # build a Shopify cart permalink on. The second fact is stored on 0 of 11,834
+                # active seeds (`snapshot.storefront_platform`, measured on prod 2026-09-08),
+                # so keying the gate on the intersection kept the shadow report's denominator
+                # empty even for the 3,875 seeds whose variant we CAN now name. The question
+                # the preflight asks the merchant — "does this variant still exist, is it in
+                # stock" — needs only the first fact. So it is asked on the resolved hand-over
+                # id, and the cart, which needs both, is still decided by
+                # `resolve_cart_permalink` and nothing else.
+                #
+                # A first cut asked about `cart_variant_id or vid`, which reintroduced exactly
+                # the fallback the ROUND-5 CORRECTION below forbids: `vid` comes from
+                # _seed_offer_variant_id (variant_id | variantId | sku | sku_id | id), and a
+                # plain numeric SKU satisfies extract_shopify_numeric_variant_id by design. On
+                # referral-only offers — the majority — it asked about a number Shopify never
+                # issued, got `variant_absent`, and would have refused live referral links.
+                # `_handover_id` is NOT that: it is only ever a `catalog_skus` id the classifier
+                # placed as merchant-issued, or a storefront-stamped one. Passing
                 # variant_id=None does not fix it either: `_check_one` answers
                 # `ambiguous_variant` on any multi-variant product, the same false refusal
                 # under another name.
@@ -4449,21 +4496,28 @@ async def _handle_offers_resolve(
                 # telling us this variant is gone is evidence about the CART PREFILL, not
                 # about the product page — dropping the row would hide a still-reachable PDP
                 # and silently shrink results, which is the "gate that deletes supply" shape
-                # this repo has been bitten by. So the offer ships as an honest referral.
+                # this repo has been bitten by. So the offer ships as an honest referral. Where
+                # there was no cart to begin with, a refusal changes nothing at all, which is
+                # why widening the gate's population adds no new way to refuse supply.
+                _handover_id = _handover.variant_id if _handover is not None else None
                 _cart_vid = redirect_identity.get("cart_variant_id")
-                # `candidates` is every seed offer considered; `cart_prefilled` is the subset
-                # the gate applies to. Coverage MUST be measured against the second: dividing
-                # by the first mixes in referral-only offers the gate is blind to by design —
-                # the majority — so a request the gate covered 6-of-6 reported 0.333 and a
-                # referral-only one reported 0.000. Week one of shadow would have read "the
-                # gate covers almost nothing", which is a statement about the denominator.
+                # `candidates` is every seed offer considered; `gated` is the subset the gate
+                # applies to. Coverage MUST be measured against the second: dividing by the
+                # first mixes in offers the gate is blind to by design — the majority — so a
+                # request the gate covered 6-of-6 reported 0.333 and a referral-only one
+                # reported 0.000. Week one of shadow would have read "the gate covers almost
+                # nothing", which is a statement about the denominator. `cart_prefilled` is
+                # kept as its own counter because it is a different question (how many
+                # hand-overs actually got a cart) and folding the two lost it.
                 _preflight_stats["candidates"] += 1
+                if _cart_vid:
+                    _preflight_stats["cart_prefilled"] += 1
                 # `is_enabled()` here, not only inside the helper. The helper short-circuits so
                 # no request is spent when off — but the COUNTERS still moved, so an off
                 # request attached coverage fields describing work nobody did.
-                if _cart_vid and checkout_preflight.is_enabled():
-                    _preflight_stats["cart_prefilled"] += 1
-                    _q = (str(canonical_url or destination_url), str(_cart_vid))
+                if _handover_id and checkout_preflight.is_enabled():
+                    _preflight_stats["gated"] += 1
+                    _q = (str(canonical_url or destination_url), str(_handover_id))
                     if _q in _preflight_memo:
                         _preflight_stats["memo_hits"] += 1
                         _allowed = _preflight_memo[_q]
@@ -4482,9 +4536,13 @@ async def _handle_offers_resolve(
                             "suppression_reason": row_dict.get("suppression_reason"),
                             # The SAME url the redirect is about to be built from, so the
                             # preflight verifies the claim we are actually publishing.
+                            # The SAME id the gate keyed on, which is the id we would hand a
+                            # buyer. Passing `_cart_vid` here would ask about None on every
+                            # storefront we cannot build a cart for — and `_check_one` answers
+                            # `ambiguous_variant` to that, a refusal about nothing.
                             "execution_spec": {
                                 "pdp_url": str(canonical_url or destination_url),
-                                "variant_id": _cart_vid,
+                                "variant_id": _handover_id,
                             },
                             "source": {
                                 "seed_data": seed_data,
@@ -4494,11 +4552,24 @@ async def _handle_offers_resolve(
                         })
                         _preflight_memo[_q] = _allowed
                     else:
-                        # Budget exhausted. The offer ships UNVERIFIED — under `enforce` that
-                        # is a FAIL-OPEN, counted here so the shadow report's denominator
-                        # shows how much of the request the gate actually covered.
+                        # Budget exhausted. #2151 DECIDED THIS EXPLICITLY, and the decision is
+                        # FAIL CLOSED: exhausting the budget is "we could not ask the
+                        # merchant", which is precisely `unverifiable`, and
+                        # `checkout_preflight`'s whole contract is that under `enforce` an
+                        # unverifiable answer refuses. The previous unconditional `True` was a
+                        # fail-open that the mode could not override, so an operator who had
+                        # armed enforcement still shipped unverified carts on any request wide
+                        # enough to run out of budget.
+                        #
+                        # It is MODE-RESPECTING rather than a hard False, because a hard False
+                        # would make `shadow` change what the buyer is handed, and shadow's
+                        # one guarantee is that it never does. This is the same rule
+                        # `_preflight_allows_external_offer` already applies to an exception,
+                        # which is the other way of not getting an answer.
                         _preflight_stats["skipped_by_budget"] += 1
-                        _allowed = True
+                        _allowed = (
+                            checkout_preflight.mode() != checkout_preflight.MODE_ENFORCE
+                        )
                     if not _allowed:
                         _preflight_stats["degraded_to_referral"] += 1
                         redirect_identity = dict(redirect_identity)
@@ -5930,14 +6001,22 @@ async def _handle_offers_resolve(
     # The values ride in the MESSAGE as well as in `extra`: no formatter in this repo renders
     # `extra`, so a record carrying them only there prints as the bare string
     # "offers.resolve.summary". See preflight_coverage_fields' NOTE ON OBSERVABILITY.
+    # #2151: the hand-over counters are emitted whether or not the preflight ran, and
+    # whether or not anything resolved. They are the answer to "why is the preflight
+    # denominator what it is", and on a corpus where most seeds have no merchant-issued
+    # identity at all, the REFUSAL counts are the informative half.
+    _handover_fields = handover_coverage_fields(_handover_resolver.stats)
     _summary_msg = "offers.resolve.summary" + (
-        " preflight mode=%s cart_prefilled=%d asked=%d memo_hits=%d skipped_by_budget=%d"
-        " answered_fraction=%.3f" % (
-            _coverage["preflight_mode"], _coverage["preflight_cart_prefilled"],
+        " preflight mode=%s gated=%d cart_prefilled=%d asked=%d memo_hits=%d"
+        " skipped_by_budget=%d degraded_to_referral=%d answered_fraction=%.3f" % (
+            _coverage["preflight_mode"], _coverage["preflight_gated"],
+            _coverage["preflight_cart_prefilled"],
             _coverage["preflight_asked"], _coverage["preflight_memo_hits"],
-            _coverage["preflight_skipped_by_budget"], _coverage["preflight_answered_fraction"],
+            _coverage["preflight_skipped_by_budget"],
+            _coverage["preflight_degraded_to_referral"],
+            _coverage["preflight_answered_fraction"],
         ) if _coverage else ""
-    )
+    ) + handover_coverage_message(_handover_fields)
     logger.info(
         _summary_msg,
         extra={
@@ -5955,6 +6034,7 @@ async def _handle_offers_resolve(
             # finding. Folded into THIS record rather than a second line so coverage carries
             # the request's identity, mode and latency alongside it.
             **_coverage,
+            **_handover_fields,
         },
     )
 
@@ -8184,6 +8264,7 @@ def _external_seed_redirect_identity(
     row: Dict[str, Any],
     seed_data: Dict[str, Any],
     offer_variant_id: Optional[str] = None,
+    handover: Optional[HandoverVariant] = None,
 ) -> Dict[str, Optional[str]]:
     """Derive the attribution identity for an external-seed redirect.
 
@@ -8304,9 +8385,22 @@ def _external_seed_redirect_identity(
         #
         # When the platform label is EVIDENCE-DERIVED, the stamped id is the only value we
         # have any evidence for, so it is used unconditionally or the permalink is declined.
-        # Stamped from the storefront's own /products/x.js — the only Shopify-issued id we
-        # have for a crawl seed. None when the product has more than one variant.
-        cart_variant_id = sole_stamped_variant_id(seed_data)
+        #
+        # #2151: the STAMP IS NOT THE ONLY EVIDENCE ANY MORE, and measured on prod
+        # 2026-09-08 it was never any evidence at all — `snapshot.variants[].shopify_variant_id`
+        # is present on 0 of 11,834 active seeds, because its producer
+        # (scripts/backfill_shopify_variant_ids.py) has never run at scale. The identity the
+        # 2026-09-08 backfill recovered lives in `catalog_skus.source_variant_id`, and
+        # `services/handover_variant_identity` resolves it there under the same refusals this
+        # branch has always applied (merchant-issued only, never a guess between candidates).
+        #
+        # `handover` is THE decision when a caller supplied one — it already contains the
+        # seed-stamp path as its own zero-candidate case, so there is no `or` here and no
+        # second decision-maker. A caller that did not wire a resolver keeps the previous
+        # behaviour byte for byte, which is what every pre-#2151 test asserts.
+        cart_variant_id = (
+            handover.variant_id if handover is not None else sole_stamped_variant_id(seed_data)
+        )
     elif platform == "shopify":
         # Writer-verified Shopify attachment. `attached_variant_id` is INTENDED to be catalog
         # identity (catalog_skus.source_variant_id), which for platform='shopify' is the
@@ -8317,9 +8411,20 @@ def _external_seed_redirect_identity(
         # variant_id/sku. So this is the one branch here whose input is operator-typed.
         # extract_shopify_numeric_variant_id bounds the damage to all-digit values, and the
         # branch is strictly narrower than the pre-round-5 behaviour it replaced — but if a
-        # wrong-cart report ever traces back here, this is why. The offer/SKU chain is
-        # deliberately NOT consulted.
-        cart_variant_id = extract_shopify_numeric_variant_id(attached_variant_id)
+        # wrong-cart report ever traces back here, this is why.
+        #
+        # #2151: the SKU chain is consulted now, and it is consulted FIRST. That is the
+        # opposite of what the sentence above used to say, and the reason is the sentence
+        # above it: this is the one branch whose input is operator-typed, with no catalog
+        # lookup behind it. A `catalog_skus` row that `services/variant_identity` calls
+        # MERCHANT_ISSUED is better provenance than a string somebody pasted into an attach
+        # form, so it wins where it exists. Where it does not, the operator value is still
+        # used exactly as before — this is a widening, never a narrowing, so no hand-over
+        # that worked yesterday stops working.
+        cart_variant_id = (
+            (handover.variant_id if handover is not None else None)
+            or extract_shopify_numeric_variant_id(attached_variant_id)
+        )
 
     return {
         "merchant_id": merchant_id,
@@ -8382,6 +8487,13 @@ def preflight_coverage_fields(stats: Dict[str, int]) -> Dict[str, Any]:
     `offers.resolve.summary` record, which already carries the request's identity and latency. A
     second bare line would have had neither, and nothing to join it to.
 
+    #2151 MOVED THE DENOMINATOR. It was `cart_prefilled`, and that was right while the gate
+    keyed on `cart_variant_id`; the gate now keys on the RESOLVED HAND-OVER ID, because a cart
+    needs storefront evidence the catalog does not carry and the merchant question does not
+    need it. `gated` is that population. `cart_prefilled` survives as its own counter — how
+    many hand-overs actually got a cart — which is a different question that folding the two
+    together would have silently lost.
+
     NOTE ON OBSERVABILITY -- read before trusting these numbers. (1) They are NOT in
     `checkout_preflight_observations`; that table holds one row per ask and none of these
     counters. An earlier docstring claimed otherwise. (2) The record they ride on is a
@@ -8395,7 +8507,7 @@ def preflight_coverage_fields(stats: Dict[str, int]) -> Dict[str, Any]:
     can join) is the named follow-up; until it lands, the shadow report's would_block_rate has
     no coverage denominator anyone can read in prod.
     """
-    covered = stats.get("cart_prefilled", 0)
+    covered = stats.get("gated", 0)
     if not covered:
         # Not "nothing happened" — the gate applied to nothing on this request, which is the
         # normal case for a referral-only resolve. Keying this on `candidates` put a coverage
@@ -8405,7 +8517,8 @@ def preflight_coverage_fields(stats: Dict[str, int]) -> Dict[str, Any]:
     return {
         "preflight_mode": checkout_preflight.mode(),
         "preflight_candidates": stats.get("candidates", 0),
-        "preflight_cart_prefilled": covered,
+        "preflight_gated": covered,
+        "preflight_cart_prefilled": stats.get("cart_prefilled", 0),
         "preflight_asked": stats.get("asked", 0),
         "preflight_memo_hits": stats.get("memo_hits", 0),
         "preflight_skipped_by_budget": stats.get("skipped_by_budget", 0),
@@ -9040,6 +9153,12 @@ async def mint_external_seed_links(body: ExternalSeedLinksRequest) -> Dict[str, 
     default_market = str(body.market or "US").strip().upper() or "US"
     default_tool = str(body.tool or "*").strip() or "*"
     links: List[Dict[str, Any]] = []
+    # #2151: same hand-over identity as every other lane. Primed ONCE for the whole body —
+    # the request is capped at EXTERNAL_SEED_LINKS_MAX_CANDIDATES, so this is one bounded
+    # statement, not fifty. A caller that sends no attached_product_key gets exactly today's
+    # behaviour: `choose` answers `no_attached_product_key`, which carries no id.
+    _handover_resolver = HandoverVariantResolver()
+    await _handover_resolver.prime(c.attached_product_key for c in body.candidates)
     # ONE MINT PER CANDIDATE, DELIBERATELY NO CACHE. The signed token carries per-seed context
     # (seedId, merchant/product/variant identity, shop domain), so two candidates that share
     # a destination are still two different tokens. Review of the first cut reproduced a
@@ -9056,7 +9175,12 @@ async def mint_external_seed_links(body: ExternalSeedLinksRequest) -> Dict[str, 
         row = candidate.model_dump()
         seed_data = _ensure_seed_data_obj(candidate.seed_data) or {}
         redirect_identity = _external_seed_redirect_identity(
-            row=row, seed_data=seed_data, offer_variant_id=candidate.variant_id
+            row=row, seed_data=seed_data, offer_variant_id=candidate.variant_id,
+            handover=_handover_resolver.choose(
+                product_key=candidate.attached_product_key,
+                seed_data=seed_data,
+                offer_variant_id=candidate.variant_id,
+            ),
         )
         redirect_url = await _make_external_redirect_url(
             market=market,
@@ -9157,6 +9281,11 @@ async def _build_prefetched_external_seed_wrappers(
 
     wrappers: List[Dict[str, Any]] = []
     redirect_cache: Dict[str, Optional[str]] = {}
+    # #2151: one bounded lookup for the whole prefetched batch, before the loop.
+    _handover_resolver = HandoverVariantResolver()
+    await _handover_resolver.prime(
+        c.get("attached_product_key") for c in candidates if isinstance(c, dict)
+    )
     for candidate in candidates:
         destination_url = str(
             candidate.get("destination_url")
@@ -9175,10 +9304,16 @@ async def _build_prefetched_external_seed_wrappers(
         # Hoisted out of the mint branch: the attributed `destination_url` below needs the same
         # identity (shop_domain / platform / cart variant) whether we mint here or were handed a
         # link the caller already minted from these same inputs.
+        _candidate_seed_data = _ensure_seed_data_obj(candidate.get("seed_data")) or {}
         redirect_identity = _external_seed_redirect_identity(
             row=candidate,
-            seed_data=_ensure_seed_data_obj(candidate.get("seed_data")) or {},
+            seed_data=_candidate_seed_data,
             offer_variant_id=candidate.get("variant_id"),
+            handover=_handover_resolver.choose(
+                product_key=candidate.get("attached_product_key"),
+                seed_data=_candidate_seed_data,
+                offer_variant_id=candidate.get("variant_id"),
+            ),
         )
         if not redirect_url:
             # ADR-009 D3: seller_ref/seed_kind ride in the token ctx, so a cache
@@ -11458,6 +11593,13 @@ async def _handle_find_products_multi_inner(
 
         seen_external_ids: set[str] = set()
         external_redirect_cache: Dict[str, Optional[str]] = {}
+        # #2151: one bounded lookup for the ranked set, before the build loop — the loop is
+        # under a wall-clock budget (`seed_build_deadline`), so a per-card query here would
+        # spend that budget on round trips instead of on cards.
+        _handover_resolver = HandoverVariantResolver()
+        await _handover_resolver.prime(
+            dict(c.row or {}).get("attached_product_key") for c in ranked_seed_candidates
+        )
         seed_budget_ms = int(FIND_PRODUCTS_MULTI_SEED_BUDGET_MS or 0)
         seed_build_deadline = (
             time.perf_counter() + (seed_budget_ms / 1000.0)
@@ -11519,6 +11661,11 @@ async def _handle_find_products_multi_inner(
                 row=row_dict,
                 seed_data=seed_data,
                 offer_variant_id=getattr(candidate, "variant_id", None),
+                handover=_handover_resolver.choose(
+                    product_key=row_dict.get("attached_product_key"),
+                    seed_data=seed_data,
+                    offer_variant_id=getattr(candidate, "variant_id", None),
+                ),
             )
             # ADR-009 D3: include seller_ref/seed_kind in the cache key so a cache
             # hit never reuses a redirect built for a different seller.

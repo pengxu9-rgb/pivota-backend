@@ -4523,7 +4523,14 @@ def test_a_referral_only_request_attaches_no_coverage(
     assert not any(k.startswith("preflight_") for k in vars(rec)), (
         "the gate applied to nothing on this request; a coverage field here is a 0.000 that "
         "someone will read as 'the gate covers nothing'")
-    assert rec.getMessage() == "offers.resolve.summary"
+    assert " preflight " not in rec.getMessage(), (
+        "the preflight half of the message must be absent for the same reason the fields are")
+    # #2151: the HAND-OVER half is present, and deliberately so. It is the answer to "why did
+    # the gate apply to nothing", and suppressing it on exactly the requests where everything
+    # was refused would hide the only population worth reading. It carries no preflight_ field
+    # and no fraction anyone can mistake for gate coverage.
+    assert "handover considered=12" in rec.getMessage()
+    assert "resolved=0" in rec.getMessage()
 
 
 def test_a_mixed_request_counts_only_cart_prefilled_rows_in_the_denominator(

@@ -479,26 +479,51 @@ def test_a_malformed_budget_falls_back_rather_than_raising(monkeypatch):
 
 
 def test_coverage_is_measured_against_the_population_the_gate_applies_to():
-    """The denominator is `cart_prefilled`, NOT `candidates`.
+    """The denominator is `gated`, NOT `candidates`.
 
-    Candidates counts every seed offer considered, including referral-only ones the gate is
-    blind to by design — and those are the majority. A first version divided by candidates and
-    also left memo hits out of the numerator, so a request whose six cart handoffs were all
-    answered (one ask + five memo hits) reported 0.333, and a referral-only request reported
-    0.000. Both errors push the same way: a working gate reads as absent, and week one of
-    shadow would have been dismissed on the strength of it.
+    Candidates counts every seed offer considered, including ones the gate is blind to by
+    design — and those are the majority. A first version divided by candidates and also left
+    memo hits out of the numerator, so a request whose six gated handoffs were all answered
+    (one ask + five memo hits) reported 0.333, and an ungated request reported 0.000. Both
+    errors push the same way: a working gate reads as absent, and week one of shadow would
+    have been dismissed on the strength of it.
+
+    #2151 renamed the denominator from `cart_prefilled` to `gated` because the gate moved off
+    `cart_variant_id` and onto the resolved hand-over id — a cart needs storefront evidence the
+    merchant question does not. `cart_prefilled` stays as its own counter, and it is now
+    strictly the SMALLER of the two: every prefilled cart is gated, and on today's corpus
+    almost nothing that is gated gets a cart.
     """
     from routes.agent_shop_gateway import preflight_coverage_fields
 
     f = preflight_coverage_fields({
-        "candidates": 40, "cart_prefilled": 6, "asked": 1, "memo_hits": 5,
+        "candidates": 40, "gated": 6, "cart_prefilled": 2, "asked": 1, "memo_hits": 5,
         "skipped_by_budget": 0, "degraded_to_referral": 2,
     })
     assert f["preflight_answered_fraction"] == 1.0, (
-        "six cart handoffs, all answered — dividing by candidates would say 0.15")
-    assert f["preflight_cart_prefilled"] == 6
+        "six gated handoffs, all answered — dividing by candidates would say 0.15")
+    assert f["preflight_gated"] == 6
+    assert f["preflight_cart_prefilled"] == 2, (
+        "the cart count is its own fact, not the gate's denominator")
     assert f["preflight_candidates"] == 40, "the wider count is still reported, just not the base"
     assert f["preflight_memo_hits"] == 5
+
+
+def test_the_gate_denominator_is_not_the_cart_count():
+    """The mutant this pins: revert `covered` to `cart_prefilled`.
+
+    On the population this lane actually serves the two differ by two orders of magnitude —
+    3,875 seeds have a resolvable merchant-issued variant and 0 have the stored storefront
+    evidence a cart needs (prod, 2026-09-08) — so a coverage line built on the cart count
+    reports "the gate applied to nothing" on a request where it applied to everything.
+    """
+    from routes.agent_shop_gateway import preflight_coverage_fields
+
+    f = preflight_coverage_fields({
+        "candidates": 10, "gated": 4, "cart_prefilled": 0, "asked": 4, "memo_hits": 0,
+    })
+    assert f, "a gated request must report coverage even when no cart could be built"
+    assert f["preflight_answered_fraction"] == 1.0
 
 
 def test_a_partly_covered_request_reports_the_shortfall():
@@ -507,7 +532,7 @@ def test_a_partly_covered_request_reports_the_shortfall():
     from routes.agent_shop_gateway import preflight_coverage_fields
 
     f = preflight_coverage_fields({
-        "candidates": 40, "cart_prefilled": 20, "asked": 8, "memo_hits": 2,
+        "candidates": 40, "gated": 20, "cart_prefilled": 20, "asked": 8, "memo_hits": 2,
         "skipped_by_budget": 10, "degraded_to_referral": 0,
     })
     assert f["preflight_answered_fraction"] == 0.5
@@ -521,7 +546,7 @@ def test_a_referral_only_request_reports_no_coverage_at_all():
     from routes.agent_shop_gateway import preflight_coverage_fields
 
     assert preflight_coverage_fields(
-        {"candidates": 40, "cart_prefilled": 0, "asked": 0, "memo_hits": 0}) == {}
+        {"candidates": 40, "gated": 0, "cart_prefilled": 0, "asked": 0, "memo_hits": 0}) == {}
 
 
 def test_coverage_carries_the_mode_it_was_measured_under(monkeypatch):
@@ -529,7 +554,7 @@ def test_coverage_carries_the_mode_it_was_measured_under(monkeypatch):
     from routes.agent_shop_gateway import preflight_coverage_fields
 
     monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
-    f = preflight_coverage_fields({"candidates": 2, "cart_prefilled": 2, "asked": 2})
+    f = preflight_coverage_fields({"candidates": 2, "gated": 2, "cart_prefilled": 2, "asked": 2})
     assert f["preflight_mode"] == "shadow"
 
 
