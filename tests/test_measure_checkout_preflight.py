@@ -632,3 +632,39 @@ def test_an_aborted_run_exits_non_zero(monkeypatch, capsys):
     monkeypatch.setattr(sweep.database, "disconnect", noop)
     assert sweep.main() == 1
     assert "aborted_on_block" in capsys.readouterr().out
+
+
+def test_every_report_is_one_fenced_line():
+    """MUTANT: pretty-print the report with indent=2.
+
+    OBSERVED IN PRODUCTION, on the first dry runs of this script. `run_oneoff_job.sh` reads a
+    job's output from Cloud Logging, which drops lines, so a multi-line report arrives with
+    arbitrary keys missing while the job still exits 0. Of five pages, one report arrived empty
+    and another as `{\\n  "mode": "dry_run",\\n}` — a fragment that parses as a plausible answer
+    with no refusals in it. The fence is what lets a reader tell a whole report from a survivor.
+    """
+    import inspect
+
+    src = inspect.getsource(sweep)
+    assert "indent=2" not in src, "a multi-line report cannot survive the log transport"
+    # Every print of a report is fenced, on one line, and json.dumps defaults to no newlines.
+    for line in src.splitlines():
+        if line.strip().startswith("print(") and "REPORT_BEGIN" not in line:
+            raise AssertionError(f"unfenced report print: {line.strip()}")
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_is_fenced_too(monkeypatch, capsys):
+    """The guards are the most likely output to be read in a hurry, and an operator who sees
+    nothing must be able to tell "refused" from "the line was dropped"."""
+    import sys as _sys
+
+    monkeypatch.delenv("CHECKOUT_PREFLIGHT_ALLOW_EGRESS", raising=False)
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
+    monkeypatch.setattr(_sys, "argv", ["measure_checkout_preflight.py"])
+    assert sweep.main() == 2
+    out = capsys.readouterr().out
+    assert sweep.REPORT_BEGIN in out and sweep.REPORT_END in out
+    body = out.split(sweep.REPORT_BEGIN)[1].split(sweep.REPORT_END)[0]
+    assert "\n" not in body, "a fenced report must be one line"
+    assert json.loads(body)["error"] == "egress_fence_closed"

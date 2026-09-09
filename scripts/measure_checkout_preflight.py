@@ -85,6 +85,17 @@ _ABORT_DISTINCT_HOSTS = int(os.getenv("PREFLIGHT_SWEEP_ABORT_DISTINCT_HOSTS", "4
 #: see the subnet note in the module docstring.
 PAYMENT_EGRESS_IP = os.getenv("PIVOTA_PAYMENT_EGRESS_IP", "8.231.167.230")
 
+#: ONE LINE, FENCED, and this is not style. `scripts/ops/run_oneoff_job.sh` reads a job's output
+#: from Cloud Logging, which DROPS LINES — so a pretty-printed multi-line report arrives with
+#: arbitrary keys missing, or not at all, while the job still exits 0. Observed on the first
+#: production dry runs of this very script: of five pages, one report arrived empty and another
+#: as `{\n  "mode": "dry_run",\n}` — a valid-looking fragment an operator would read as a
+#: complete answer with no refusals. `scripts/capture_us_market_offers.py` already carries this
+#: scar and its fix; this is the same fix. The fence is what lets a reader tell a whole report
+#: from a surviving fragment of one.
+REPORT_BEGIN = "PREFLIGHTSWEEP>>>"
+REPORT_END = "<<<PREFLIGHTSWEEP"
+
 #: Verdict reasons that mean WE could not ask, as opposed to a merchant answering. A run of these
 #: is what a block looks like from in here.
 _LOOKS_LIKE_A_BLOCK = frozenset({
@@ -408,7 +419,9 @@ def main() -> int:
     args = parser.parse_args()
 
     def _refuse(error: str, detail: str) -> int:
-        print(json.dumps({"error": error, "detail": detail}, indent=2), flush=True)
+        print(REPORT_BEGIN + json.dumps(
+            {"phase": "refused", "error": error, "detail": detail}, ensure_ascii=False)
+            + REPORT_END, flush=True)
         return 2
 
     # REFUSE RATHER THAN MEASURE NOTHING. With the fence shut every ask answers `not_yet_checked`
@@ -445,8 +458,10 @@ def main() -> int:
     # and a TASK_TIMEOUT kill loses it while the rows are already committed — leaving exactly the
     # partial run the tag exists to exclude, untaggable. `--limit 400` at a 20s deadline can
     # exceed a 2400s task timeout, so this is the likely case, not the unlucky one.
-    print(json.dumps({"run_id": run_id, "mode": "apply" if args.apply else "dry_run",
-                      "egress_ip": ip, "limit": args.limit, "after": args.after}), flush=True)
+    print(REPORT_BEGIN + json.dumps(
+        {"phase": "start", "run_id": run_id, "mode": "apply" if args.apply else "dry_run",
+         "egress_ip": ip, "limit": args.limit, "after": args.after},
+        ensure_ascii=False) + REPORT_END, flush=True)
 
     async def _main() -> Dict[str, Any]:
         await database.connect()
@@ -457,7 +472,9 @@ def main() -> int:
 
     summary = asyncio.run(_main())
     summary["egress_ip"] = ip
-    print(json.dumps(summary, indent=2, ensure_ascii=False), flush=True)
+    summary["phase"] = "final"
+    print(REPORT_BEGIN + json.dumps(summary, ensure_ascii=False, sort_keys=True)
+          + REPORT_END, flush=True)
     # Non-zero on abort so a wrapper cannot read a partial sweep as a completed one. The rows are
     # already committed, so the run_id above is how you exclude them.
     return 1 if summary.get("aborted_on_block") else 0
