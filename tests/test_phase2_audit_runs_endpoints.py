@@ -1125,3 +1125,14 @@ def test_enqueue_failure_refunds_consumer_and_diagnostic_charge_together(client,
     response=client.post('/api/audits',json={'merchant_id':'merch-A','product_keys':['pk-1'],'consumer_answer_queries':['best serum']})
     assert response.status_code==503,response.text
     assert sum(row['amount'] for row in stub.credits)==sum(row['amount'] for row in stub.debits)
+
+
+def test_unadmitted_consumer_provider_cannot_quote_or_debit(client, stub, monkeypatch):
+    monkeypatch.setenv('PIVOTA_CONSUMER_ANSWER_ENABLED','true')
+    monkeypatch.delenv('PIVOTA_CONSUMER_ANSWER_PROVIDERS',raising=False)
+    base={'merchant_id':'merch-A','providers':['claude'],'consumer_answer_queries':['best serum']}
+    for path, body in [('/api/audits/preview',{**base,'scope':{'sku_keys':['pk-1']}}),
+                       ('/api/audits',{**base,'product_keys':['pk-1']})]:
+        response=client.post(path,json=body)
+        assert response.status_code == 422, response.text
+    assert not stub.debits and not stub.enqueued

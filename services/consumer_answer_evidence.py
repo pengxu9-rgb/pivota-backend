@@ -2,11 +2,12 @@
 import hashlib
 import json
 import re
+from urllib.parse import urlparse
 from services.brand_alias import text_mentions_brand
 
 SYSTEM = "Answer the shopping question using live web search when useful. Give a helpful answer in ordinary prose with sources. Do not produce audit scores or diagnostic JSON."
 
-PREDICATE = "complete_consumer_answer_brand_literal_v1"
+PREDICATE = "cited_consumer_answer_brand_literal_v2"
 
 
 def answer_mention(run, merchant_brand):
@@ -29,6 +30,16 @@ def answer_mention(run, merchant_brand):
     expected_prompt = hashlib.sha256(json.dumps([SYSTEM, run.get("query")], ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
     if not isinstance(answer.get("model"), str) or not answer["model"].strip() or answer.get("prompt_sha256") != expected_prompt:
         return None, "answer_provenance_missing"
+    # Revalidate retained evidence too; never trust old complete=True alone.
+    sources = run.get("grounding_sources") or run.get("cited_sources") or []
+    def valid_source(source):
+        try:
+            uri = urlparse(source.get("uri", "")) if isinstance(source, dict) else None
+            return uri is not None and uri.scheme in ("http", "https") and bool(uri.hostname)
+        except ValueError:
+            return False
+    if not isinstance(sources, list) or not any(valid_source(source) for source in sources):
+        return None, "answer_sources_missing"
     if not isinstance(merchant_brand, str) or not merchant_brand.strip():
         return None, "brand_missing"
     # Only the verified literal brand, not inferred vendors/domain aliases.

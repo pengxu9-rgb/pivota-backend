@@ -1,6 +1,6 @@
 """Frozen supplemental capture jobs shared by quoting and resumable execution.
 
-Not connected to merchant launch yet. A checkpoint must durably store the entire
+Connected to merchant preview and launch. A checkpoint must durably store the entire
 state before returning; callers must enforce the existing tenant worker lease.
 """
 import hashlib
@@ -92,4 +92,12 @@ def plan_for_launch(*, product_keys, queries, providers):
         return None
     if os.getenv('PIVOTA_CONSUMER_ANSWER_ENABLED') != 'true':
         raise ValueError('Consumer answer capture is not enabled')
+    # Admission is explicit operational configuration, not a quota guarantee.
+    # Claude has not passed the real Vertex availability check yet.
+    admitted = {p.strip() for p in os.getenv(
+        'PIVOTA_CONSUMER_ANSWER_PROVIDERS', 'gemini,chatgpt').split(',') if p.strip()}
+    if not admitted.issubset(PROVIDERS):
+        raise ValueError('Invalid consumer provider admission configuration')
+    if any(p not in admitted for p in providers):
+        raise ValueError('Consumer answer provider is not available; remove it before requesting a quote')
     return build_plan(product_keys=product_keys, queries=queries, providers=providers)

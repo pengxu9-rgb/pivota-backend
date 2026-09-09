@@ -62,3 +62,12 @@ async def test_mutated_plan_cannot_execute():
     async def unexpected(*args): raise AssertionError('must not run')
     with pytest.raises(ValueError):
         await execute_plan(frozen,retained=None,checkpoint=unexpected,probe=unexpected)
+
+
+def test_unverified_provider_rejected_before_launch_quote(monkeypatch):
+    from services.consumer_capture_plan import plan_for_launch
+    monkeypatch.setenv('PIVOTA_CONSUMER_ANSWER_ENABLED','true')
+    monkeypatch.delenv('PIVOTA_CONSUMER_ANSWER_PROVIDERS',raising=False)
+    with pytest.raises(ValueError, match='not available'):
+        plan_for_launch(product_keys=['sku'],queries=['best serum'],providers=['claude'])
+    assert plan_for_launch(product_keys=['sku'],queries=['best serum'],providers=['gemini'])

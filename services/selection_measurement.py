@@ -22,7 +22,7 @@ from services.audit_facts import (
 from services.brand_alias import text_mentions_brand
 from services.consumer_answer_evidence import answer_mention, PREDICATE as CONSUMER_PREDICATE
 
-VERSION = "2"
+VERSION = "3"
 MENTION_PREDICATE = "explicit_answer_brand_mentioned_v1"
 TIERS = ("branded", "unbranded", "dupe")
 DIAGNOSTIC_SCAN_MODES = {
@@ -155,7 +155,7 @@ def selection_measurement(observations):
         "providers": dict(Counter(r.get("provider", "unknown") for r in rows)),
         "unavailable_reason": None if rows else "This report did not retain response-level observations.",
         "interval_method": "Wilson 95%, conditional on observed responses",
-        "limitation": "Describes this sample only. Repeated queries and providers may be correlated; these intervals do not establish improvement or population coverage. Unknown answers are excluded, not counted as misses.",
+        "limitation": "Describes completed, cited answers in this sample only; answers without verifiable citations are excluded and may differ systematically. Repeated queries and providers may be correlated; these intervals do not establish improvement or population coverage. Unknown answers are excluded, not counted as misses.",
     }
 
 
