@@ -79,6 +79,13 @@ R_DISABLED = "preflight_off"
 #: are really our own empty cache, which is exactly the "denominator is empty by construction"
 #: mistake this gate already made once.
 R_NOT_YET_CHECKED = "not_yet_checked"
+#: Split out of R_UNVERIFIABLE for the same reason R_NOT_YET_CHECKED was: no merchant was
+#: contacted, and no merchant could have been. `_target` returns no URL for a PDP that is not
+#: `/products/<handle>`-shaped, or for a seed carrying no url at all, and that happens BEFORE the
+#: cache read. Left inside `could_not_ask_merchant` it was the ONLY reason in the answered
+#: denominator under the shipping config, so the rate built to escape a by-construction 1.0 read
+#: 1.0 by construction — on rows where nobody was asked.
+R_NO_VERIFIABLE_URL = "no_verifiable_url"
 
 #: Every reason `preflight` can return WITHOUT a merchant ever being contacted. This is a set, not
 #: a single constant, because review caught the answered rate excluding only `not_yet_checked` and
@@ -90,9 +97,17 @@ R_NOT_YET_CHECKED = "not_yet_checked"
 NO_CONTACT_REASONS = frozenset({
     R_NOT_YET_CHECKED,        # the fence held; our cache was cold
     R_NO_MERCHANT_VARIANT,    # refused at step 1, no request made
+    R_NO_VERIFIABLE_URL,      # no `/products/<handle>` url to ask about; decided before the cache
     R_SUPPRESSED,             # refused at step 2, no request made
-    R_DISABLED,               # the gate was off
+    R_DISABLED,               # the gate was off — and `record` drops these before they land, so
+                              # this member is dead in the table today and kept for completeness
 })
+#: Deliberately OUT, and each for a reason worth stating because the next person will be tempted:
+#: R_GONE, R_OUT_OF_STOCK and R_OK all require a DOCUMENT, and under a closed fence a document
+#: means somebody contacted that merchant. R_UNVERIFIABLE stays in the answered denominator too:
+#: after this split it means the merchant was asked and did not usefully answer, except on the
+#: exception path, where contact is genuinely ambiguous — the conservative side of that is to
+#: count it as a merchant failure rather than silently shrink the denominator.
 
 _DEFAULT_DEADLINE_S = 4.0
 
@@ -238,7 +253,10 @@ async def preflight(offer: Dict[str, Any]) -> PreflightVerdict:
     # Passed the already-read value rather than re-reading: the rule three lines up is the whole
     # reason `current_mode` exists, and a warning that disagreed with the verdict beside it would
     # be worse than no warning.
-    _warn_if_enforcing_blind(current_mode)
+    try:
+        _warn_if_enforcing_blind(current_mode)
+    except Exception:  # noqa: BLE001 - a log line may not break the checkout it describes
+        pass
     quoted_price, quoted_currency = _quoted(offer)
 
     def _finish(outcome: str, reason: str, **kw) -> PreflightVerdict:
@@ -337,6 +355,8 @@ async def preflight(offer: Dict[str, Any]) -> PreflightVerdict:
     # say how much of the refusal rate is merchants and how much is homework.
     if verdict.reason == live_offer_verification.NO_CACHED_EVIDENCE:
         return _finish(UNVERIFIABLE, R_NOT_YET_CHECKED, **common)
+    if verdict.reason == live_offer_verification.NO_VERIFIABLE_URL:
+        return _finish(UNVERIFIABLE, R_NO_VERIFIABLE_URL, **common)
     return _finish(UNVERIFIABLE, R_UNVERIFIABLE, **common)
 
 
@@ -461,7 +481,8 @@ REPORT_SCOPE = (
     "default) `web` never asks a merchant, so an uncached document answers not_yet_checked and "
     "would_block_rate is 1.0 BY CONSTRUCTION; read would_block_rate_answered, whose denominator "
     "drops EVERY reason decided without contacting a merchant (not_yet_checked, "
-    "no_merchant_issued_variant_id, suppressed, preflight_off — see NO_CONTACT_REASONS) so it is "
+    "no_merchant_issued_variant_id, no_verifiable_url, suppressed, preflight_off — see "
+    "NO_CONTACT_REASONS) so it is "
     "the merchants' verdict over the questions that actually reached one, while no_contact and "
     "not_yet_checked measure our own coverage"
 )

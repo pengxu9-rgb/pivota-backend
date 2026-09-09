@@ -993,3 +993,117 @@ async def test_the_blind_enforce_warning_returns_when_the_state_does(monkeypatch
 
     monkeypatch.delenv("CHECKOUT_PREFLIGHT_ALLOW_EGRESS", raising=False)
     assert await warns() is True, "re-entering the dangerous state must warn AGAIN"
+
+
+@pytest.mark.asyncio
+async def test_an_offer_with_no_askable_url_is_not_counted_as_a_merchant_refusal(monkeypatch):
+    """MUTANT: leave `no_verifiable_url` inside R_UNVERIFIABLE.
+
+    `_target` returns nothing for a PDP that is not `/products/<handle>`-shaped, or for a seed with
+    no url at all, and it does so BEFORE the cache read — no merchant is contacted and none could
+    be. Under the shipping config (fence closed, nothing warming the cache) every other
+    document-requiring reason is unreachable, so this was the ONLY reason left in the answered
+    denominator: the rate built to escape a by-construction 1.0 read 1.0 by construction, over
+    rows where nobody was asked.
+    """
+    from services import checkout_preflight as cp
+
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
+    verdict = await cp.preflight(_offer(
+        execution_spec={"pdp_url": "https://brand.example/collections/all", "variant_id": REAL_VID}))
+    assert verdict.reason == cp.R_NO_VERIFIABLE_URL
+    assert cp.R_NO_VERIFIABLE_URL in cp.NO_CONTACT_REASONS
+
+    no_url = await cp.preflight(_offer(execution_spec={"variant_id": REAL_VID}))
+    assert no_url.reason == cp.R_NO_VERIFIABLE_URL
+
+
+def test_only_reasons_that_cannot_have_touched_a_merchant_are_no_contact():
+    """MUTANT: add R_UNVERIFIABLE, R_OUT_OF_STOCK or R_GONE to NO_CONTACT_REASONS.
+
+    The set decides the answered denominator, so a reason wrongly IN it shrinks the denominator and
+    flatters the merchants; wrongly OUT keeps the by-construction defect. Both directions are
+    pinned here because only the second was pinned before.
+    """
+    from services import checkout_preflight as cp
+
+    for r in (cp.R_NOT_YET_CHECKED, cp.R_NO_MERCHANT_VARIANT, cp.R_NO_VERIFIABLE_URL,
+              cp.R_SUPPRESSED, cp.R_DISABLED):
+        assert r in cp.NO_CONTACT_REASONS, f"{r} is decided without contacting a merchant"
+    for r in (cp.R_GONE, cp.R_OUT_OF_STOCK, cp.R_OK, cp.R_UNVERIFIABLE):
+        assert r not in cp.NO_CONTACT_REASONS, (
+            f"{r} requires a document, so a merchant was contacted to produce it")
+
+
+def test_the_report_scope_names_the_set_that_defines_its_denominator():
+    """MUTANT: delete the scope paragraph, or stop naming NO_CONTACT_REASONS in it.
+
+    REPORT_SCOPE ships INSIDE the report and is the definition of the denominator the enforcement
+    decision is read against. This file already pins a docstring this way for the coverage fields;
+    the same precedent applies to the number that decides whether to arm.
+    """
+    from services import checkout_preflight as cp
+
+    scope = cp.REPORT_SCOPE
+    assert "NO_CONTACT_REASONS" in scope, "the reader must be able to find the set"
+    assert "would_block_rate_answered" in scope
+    assert "1.0 BY CONSTRUCTION" in scope, "the trap must be named, not implied"
+    for r in sorted(cp.NO_CONTACT_REASONS - {cp.R_DISABLED}):
+        assert r in scope, f"{r} is excluded from the denominator but not disclosed"
+
+
+@pytest.mark.asyncio
+async def test_the_warning_uses_the_mode_the_verdict_was_decided_on(monkeypatch, caplog):
+    """MUTANT: `_warn_if_enforcing_blind` re-reads `mode()` instead of the passed value.
+
+    Three lines above it the module says to read the flag ONCE, because a mid-call flip made a
+    verdict and its record disagree. A warning that disagreed with the verdict printed beside it
+    would be worse than no warning.
+    """
+    from services import checkout_preflight as cp
+
+    _stub_verdict(monkeypatch, status=lov.UNVERIFIED, reason=lov.NO_CACHED_EVIDENCE)
+    monkeypatch.setattr(cp, "_WARNED_BLIND_ENFORCE", False)
+    monkeypatch.delenv("CHECKOUT_PREFLIGHT_ALLOW_EGRESS", raising=False)
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
+
+    calls = []
+    real = cp._warn_if_enforcing_blind
+    monkeypatch.setattr(cp, "_warn_if_enforcing_blind",
+                        lambda m: calls.append(m) or real(m))
+    await cp.preflight(_offer())
+    assert calls == ["shadow"], "the warning must be handed the mode the verdict used"
+
+    # ...and it must USE that value rather than re-reading the env. Call the real function with
+    # the mode the verdict was decided on while the env says something else: a re-read would warn,
+    # the passed value must not. Replacing the whole function (as an earlier version of this test
+    # did) cannot see the difference, which is why that mutant survived.
+    monkeypatch.setattr(cp, "_warn_if_enforcing_blind", real)
+    monkeypatch.setattr(cp, "_WARNED_BLIND_ENFORCE", False)
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "enforce")
+    with caplog.at_level(logging.WARNING):
+        real(cp.MODE_SHADOW)
+    assert "ENFORCING" not in " ".join(r.getMessage() for r in caplog.records), (
+        "the env said enforce, the verdict said shadow — the verdict wins")
+
+    caplog.clear()
+    monkeypatch.setattr(cp, "_WARNED_BLIND_ENFORCE", False)
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
+    with caplog.at_level(logging.WARNING):
+        real(cp.MODE_ENFORCE)
+    assert "ENFORCING" in " ".join(r.getMessage() for r in caplog.records), (
+        "and the passed enforce still warns even when the env has since flipped away")
+
+
+@pytest.mark.asyncio
+async def test_the_warning_can_never_break_the_checkout_it_describes(monkeypatch):
+    """`preflight`'s docstring says it never raises. The warning sat outside the try."""
+    from services import checkout_preflight as cp
+
+    def boom(_mode):
+        raise RuntimeError("logging blew up")
+
+    monkeypatch.setattr(cp, "_warn_if_enforcing_blind", boom)
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
+    _stub_verdict(monkeypatch, status=lov.VERIFIED, reason="ok", in_stock=True)
+    assert (await cp.preflight(_offer())).outcome == cp.OK

@@ -78,6 +78,10 @@ UNVERIFIED = "unverified"
 #: branches on it to tell "nobody warmed this URL" from "the merchant did not answer", and a bare
 #: literal compared across a module boundary is a coupling nobody can see.
 NO_CACHED_EVIDENCE = "no_cached_evidence"
+#: Returned when the offer carries no `/products/<handle>`-shaped url to ask about. Exported for
+#: the same reason: `checkout_preflight` must be able to tell a no-contact refusal from a merchant
+#: one, and this is decided before the cache is even read.
+NO_VERIFIABLE_URL = "no_verifiable_url"
 GONE = "gone"
 
 _DEFAULT_TOP_K = 3
@@ -380,7 +384,7 @@ async def _check_one(
     """
     js_url, variant_id = _target(offer)
     if not js_url:
-        return Verdict(UNVERIFIED, "no_verifiable_url")
+        return Verdict(UNVERIFIED, NO_VERIFIABLE_URL)
 
     # S3: `gone` DELETES a merchant from the shortlist, so it may only be concluded from positive
     # evidence that this is a Shopify storefront. `/products/<slug>` in a path is a URL SHAPE, not
@@ -604,8 +608,17 @@ def apply_verdicts(
     kept: List[Tuple[int, Dict[str, Any]]] = []
     for index, offer in enumerate(offers):
         verdict = verdicts.get(index)
-        if verdict is None:
-            # Never checked (outside top-K). Not a claim either way.
+        if verdict is None or verdict.reason == NO_CACHED_EVIDENCE:
+            # Never checked. Not a claim either way — so it is NOT stamped, exactly as an offer
+            # outside top-K is not stamped.
+            #
+            # `no_cached_evidence` belongs here and not below. Review found it taking the
+            # `unverified` path, which stamps `stock_verified: false`,
+            # `verification_confidence: "unverified"`, `rank_one_unverified: true` and nulls
+            # `expected_item_total` — an agent-visible downgrade of every offer, caused by OUR
+            # cold cache, on a flag whose name says "enabled". "Nobody asked" is not "we asked
+            # and got nothing", which is the same distinction the preflight draws between
+            # not_yet_checked and could_not_ask_merchant.
             kept.append((2, offer))
             continue
         if verdict.status == GONE:

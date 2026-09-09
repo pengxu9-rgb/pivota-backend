@@ -1307,3 +1307,67 @@ async def test_a_lane_that_may_crawl_still_crawls(monkeypatch):
                            "variant_id": "41234567890123"},
     }])
     assert reached, "an opted-in lane must be allowed to ask"
+
+
+@pytest.mark.parametrize("raw,allowed", [
+    ("true", True), ("1", True), ("yes", True), ("on", True), ("TRUE", True),
+    ("false", False), ("0", False), ("", False), ("maybe", False), ("  ", False),
+])
+def test_the_request_path_fence_opens_only_on_an_affirmative_value(monkeypatch, raw, allowed):
+    """MUTANT: `bool(os.getenv(...))`, which opens the fence on the string "false".
+
+    The preflight's twin of this predicate is pinned; this one was not, so a typo could have put
+    the search lane back on the payment address silently.
+    """
+    monkeypatch.setenv("LIVE_OFFER_VERIFICATION_ALLOW_REQUEST_PATH_EGRESS", raw)
+    assert lov.request_path_egress_allowed() is allowed
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_cache_only_beats_the_flag_in_both_directions(monkeypatch):
+    """MUTANT: collapse the three-state `Optional[bool]` either way.
+
+    `None` means "ask the flag"; an explicit value means the caller knows better — which is how a
+    batch lane on `pivota-crawl` crawls while the request-path default stays closed, and how a
+    request-path caller can fence itself even where the flag is open.
+    """
+    seen = []
+
+    async def spy(offer, **kw):
+        seen.append(kw.get("cache_only"))
+        return lov.Verdict(lov.UNVERIFIED, lov.NO_CACHED_EVIDENCE)
+
+    monkeypatch.setattr(lov, "_check_one", spy)
+    offers = [{"offer_id": "o", "execution_spec": {
+        "pdp_url": "https://brand.example/products/thing", "variant_id": "41234567890123"}}]
+
+    monkeypatch.setenv("LIVE_OFFER_VERIFICATION_ALLOW_REQUEST_PATH_EGRESS", "true")
+    await lov.verify_offers(offers)
+    await lov.verify_offers(offers, cache_only=True)
+    monkeypatch.delenv("LIVE_OFFER_VERIFICATION_ALLOW_REQUEST_PATH_EGRESS", raising=False)
+    await lov.verify_offers(offers)
+    await lov.verify_offers(offers, cache_only=False)
+    assert seen == [False, True, True, False], (
+        "None follows the flag; an explicit value overrides it, both ways")
+
+
+def test_an_unasked_offer_is_not_stamped_as_unverified(monkeypatch):
+    """MUTANT: let `no_cached_evidence` take the `unverified` path in `apply_verdicts`.
+
+    That path stamps `stock_verified: false`, `verification_confidence: "unverified"` and
+    `rank_one_unverified: true`, and nulls `expected_item_total` — an agent-visible downgrade of
+    every offer, caused by OUR cold cache, on a flag whose name says "enabled". "Nobody asked" is
+    not "we asked and got nothing"; an unasked offer must look exactly like one outside top-K.
+    """
+    offers = [{"offer_id": "o0"}, {"offer_id": "o1"}]
+    cold = lov.apply_verdicts(
+        offers, {0: lov.Verdict(lov.UNVERIFIED, lov.NO_CACHED_EVIDENCE)})
+    assert len(cold) == 2
+    by_id = {o["offer_id"]: o for o in cold}
+    assert "verification" not in by_id["o0"], "an unasked offer carries no verification claim"
+    assert by_id["o0"].get("rank_one_unverified") is not True
+    assert by_id["o0"].get("stock_verified") is not False
+
+    # ...while a real unverified answer IS still stamped, or the demotion would be lost.
+    asked = lov.apply_verdicts(offers, {0: lov.Verdict(lov.UNVERIFIED, "http_503")})
+    assert asked[0].get("rank_one_unverified") is True or "verification" in asked[0]
