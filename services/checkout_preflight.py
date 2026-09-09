@@ -80,6 +80,20 @@ R_DISABLED = "preflight_off"
 #: mistake this gate already made once.
 R_NOT_YET_CHECKED = "not_yet_checked"
 
+#: Every reason `preflight` can return WITHOUT a merchant ever being contacted. This is a set, not
+#: a single constant, because review caught the answered rate excluding only `not_yet_checked` and
+#: still calling itself "the merchant's verdict": `no_merchant_issued_variant_id` is decided at
+#: step 1 before any request, and on the union population it dominates. Measured on the shape prod
+#: will produce in week one, the difference is 0.99 against a true merchant refusal rate of 0.20 —
+#: the same unreadable-by-construction defect one class down, and the reader who sees 0.99 vetoes
+#: enforcement. Anything added here must be a reason that CANNOT have touched a merchant.
+NO_CONTACT_REASONS = frozenset({
+    R_NOT_YET_CHECKED,        # the fence held; our cache was cold
+    R_NO_MERCHANT_VARIANT,    # refused at step 1, no request made
+    R_SUPPRESSED,             # refused at step 2, no request made
+    R_DISABLED,               # the gate was off
+})
+
 _DEFAULT_DEADLINE_S = 4.0
 
 
@@ -117,7 +131,7 @@ def egress_allowed() -> bool:
 _WARNED_BLIND_ENFORCE = False
 
 
-def _warn_if_enforcing_blind() -> None:
+def _warn_if_enforcing_blind(current_mode: str) -> None:
     """`enforce` + a closed fence + a cold cache withdraws EVERY cart, on zero merchant evidence.
 
     The two flags are independent and both re-read per call, so this combination can be reached by
@@ -129,7 +143,14 @@ def _warn_if_enforcing_blind() -> None:
     `setup_structured_logging()` is never called, so structured fields are dark.
     """
     global _WARNED_BLIND_ENFORCE
-    if _WARNED_BLIND_ENFORCE or mode() != MODE_ENFORCE or egress_allowed():
+    dangerous = current_mode == MODE_ENFORCE and not egress_allowed()
+    if not dangerous:
+        # Latch on the STATE, not once-ever. Review found the first version silent forever after
+        # one warning, so opening the fence and closing it again re-entered the dangerous state
+        # with no signal — and the message text is the only signal there is.
+        _WARNED_BLIND_ENFORCE = False
+        return
+    if _WARNED_BLIND_ENFORCE:
         return
     _WARNED_BLIND_ENFORCE = True
     logger.warning(
@@ -212,9 +233,12 @@ async def preflight(offer: Dict[str, Any]) -> PreflightVerdict:
     """Verify ONE offer against the merchant. Never raises: a preflight that throws would take
     down the checkout it is supposed to protect, which in shadow would be absurd."""
     started = time.monotonic()
-    _warn_if_enforcing_blind()
     # Read ONCE. Every decision in this call, and the verdict it returns, refer to the same mode.
     current_mode = mode()
+    # Passed the already-read value rather than re-reading: the rule three lines up is the whole
+    # reason `current_mode` exists, and a warning that disagreed with the verdict beside it would
+    # be worse than no warning.
+    _warn_if_enforcing_blind(current_mode)
     quoted_price, quoted_currency = _quoted(offer)
 
     def _finish(outcome: str, reason: str, **kw) -> PreflightVerdict:
@@ -435,9 +459,11 @@ REPORT_SCOPE = (
     "rate is over questions ASKED, not over candidates offered; "
     "THIRD class, and it dominates until a warm lane runs: with the egress fence closed (the "
     "default) `web` never asks a merchant, so an uncached document answers not_yet_checked and "
-    "would_block_rate is 1.0 BY CONSTRUCTION — read would_block_rate_answered, which drops "
-    "not_yet_checked from both sides, and treat the two as the merchant's verdict and our own "
-    "coverage respectively"
+    "would_block_rate is 1.0 BY CONSTRUCTION; read would_block_rate_answered, whose denominator "
+    "drops EVERY reason decided without contacting a merchant (not_yet_checked, "
+    "no_merchant_issued_variant_id, suppressed, preflight_off — see NO_CONTACT_REASONS) so it is "
+    "the merchants' verdict over the questions that actually reached one, while no_contact and "
+    "not_yet_checked measure our own coverage"
 )
 
 
@@ -458,10 +484,12 @@ def _summarise_shadow_rows(
     # just the numerator — leaving it in the denominator would understate the merchant refusal
     # rate by exactly the size of our own cold cache.
     cold = sum(int(r["n"]) for r in by_reason if r.get("reason") == R_NOT_YET_CHECKED)
-    cold_blocked = sum(
-        int(r["would_block"]) for r in by_reason if r.get("reason") == R_NOT_YET_CHECKED
+    # The answered denominator drops EVERY no-contact reason, not just the cold-cache one.
+    no_contact = sum(int(r["n"]) for r in by_reason if r.get("reason") in NO_CONTACT_REASONS)
+    no_contact_blocked = sum(
+        int(r["would_block"]) for r in by_reason if r.get("reason") in NO_CONTACT_REASONS
     )
-    answered = total - cold
+    answered = total - no_contact
     return {
         "scope": REPORT_SCOPE,
         "window_days": int(window_days),
@@ -474,8 +502,11 @@ def _summarise_shadow_rows(
         # The merchant's verdict, over the questions that reached a merchant.
         "answered": answered,
         "would_block_rate_answered": (
-            round((blocked - cold_blocked) / answered, 4) if answered else None
+            round((blocked - no_contact_blocked) / answered, 4) if answered else None
         ),
+        # Everything refused without a request. `not_yet_checked` is the part of it we can fix by
+        # warming; the rest is missing identity and suppression.
+        "no_contact": no_contact,
         # Our own coverage: the share of gated hand-overs nobody has warmed yet.
         "not_yet_checked": cold,
         "not_yet_checked_rate": (round(cold / total, 4) if total else None),

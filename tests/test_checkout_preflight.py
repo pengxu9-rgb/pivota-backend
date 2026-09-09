@@ -10,11 +10,13 @@ The second thing under test is that shadow is genuinely inert for the buyer whil
 decision rests on is measuring the wrong thing.
 """
 
+import asyncio
+import asyncio.base_events
 import logging
 import os
+import socket
 from decimal import Decimal
 
-import asyncio
 import pytest
 
 from services import checkout_preflight as cp
@@ -42,6 +44,11 @@ def _offer(**kw):
 @pytest.fixture(autouse=True)
 def _default_off(monkeypatch):
     monkeypatch.delenv("CHECKOUT_PREFLIGHT_MODE", raising=False)
+    # The fence's PRODUCTION default belongs here too. Leaving it to each test to remember means
+    # a developer with the variable exported in their shell runs a different suite than CI does,
+    # and the one thing this file must not get wrong is whether the default egresses.
+    monkeypatch.delenv("CHECKOUT_PREFLIGHT_ALLOW_EGRESS", raising=False)
+    monkeypatch.setattr(cp, "_WARNED_BLIND_ENFORCE", False)
 
 
 def _stub_verdict(monkeypatch, **kw):
@@ -641,10 +648,15 @@ class _Boom(AssertionError):
 async def test_the_preflight_does_not_touch_a_merchant_by_default(monkeypatch):
     """MUTANT: `cache_only=False`, or default `CHECKOUT_PREFLIGHT_ALLOW_EGRESS` to true.
 
-    Pinned at the SOCKET, not at `_check_one`'s signature. Asserting the keyword was passed would
-    pass for a `_check_one` that accepted the flag and ignored it, and the whole point of this
-    change is that no packet leaves `web` for a merchant. So the test makes any outbound client
-    construction raise, and a green run means nothing tried.
+    Pinned at the SOCKET — literally, via `socket.getaddrinfo` and the loop's `create_connection`,
+    not only at `httpx.AsyncClient` and `crawl_politeness.before_request`. Review pointed out that
+    those two are module attributes: a leak that binds the client at import
+    (`from httpx import AsyncClient as _Client`) and paces itself inline is a real merchant fetch
+    that walks straight past both seams. Name resolution does not.
+
+    Asserting the keyword was passed would be weaker still — it would pass for a `_check_one` that
+    accepted the flag and ignored it — and the whole point of this change is that no packet leaves
+    `web` for a merchant.
 
     The politeness and robots calls matter as much as the fetch: they are outbound requests to
     the merchant's host too, which is why the fence sits above all three.
@@ -667,6 +679,20 @@ async def test_the_preflight_does_not_touch_a_merchant_by_default(monkeypatch):
 
     monkeypatch.setattr(
         live_offer_verification.crawl_politeness, "before_request", explode_async
+    )
+
+    # The layer neither of the above can be bypassed at: nothing reaches a merchant without
+    # resolving its name first.
+    def explode_dns(host, *a, **k):
+        raise _Boom(f"the preflight resolved a merchant host: {host!r}")
+
+    monkeypatch.setattr(socket, "getaddrinfo", explode_dns)
+
+    async def explode_connect(self, protocol_factory, host=None, *a, **k):
+        raise _Boom(f"the preflight opened a connection to {host!r}")
+
+    monkeypatch.setattr(
+        asyncio.base_events.BaseEventLoop, "create_connection", explode_connect
     )
 
     verdict = await checkout_preflight.preflight(_offer())
@@ -797,6 +823,9 @@ async def test_a_warm_document_does_not_let_the_currency_lane_out(monkeypatch):
 
     monkeypatch.setattr(lov.crawl_politeness, "before_request", record_politeness)
 
+    resolved = []
+    monkeypatch.setattr(socket, "getaddrinfo", lambda host, *a, **k: resolved.append(host))
+
     verdict = await checkout_preflight.preflight(offer)
     # DRAIN, do not just yield once. The currency refresh is `asyncio.ensure_future`, so its body
     # has not run when `preflight` returns and a single `sleep(0)` is not enough to guarantee it
@@ -809,6 +838,7 @@ async def test_a_warm_document_does_not_let_the_currency_lane_out(monkeypatch):
 
     assert opened == [], f"the preflight opened HTTP clients from the money path: {opened}"
     assert reached == [], f"the preflight contacted merchant hosts: {reached}"
+    assert resolved == [], f"the preflight resolved merchant hostnames: {resolved}"
     assert verdict.reason != checkout_preflight.R_NOT_YET_CHECKED, (
         "the warm document must have been USED — otherwise the fence short-circuited above the "
         "currency lane and this test never reached the line the leak was on")
@@ -905,3 +935,61 @@ async def test_enforcing_with_the_fence_closed_says_so_out_loud(monkeypatch, cap
     with caplog.at_level(logging.WARNING):
         await cp.preflight(_offer())
     assert "ENFORCING" not in " ".join(r.getMessage() for r in caplog.records)
+
+
+def test_the_answered_rate_excludes_every_reason_decided_without_a_merchant():
+    """MUTANT: drop only `not_yet_checked` from the answered denominator.
+
+    `no_merchant_issued_variant_id` is decided at step 1 with NO request made, and on the union
+    population it dominates. Counting it as a merchant refusal is the same
+    unreadable-by-construction defect one class down: on the shape prod produces in week one it
+    reads 0.99 against a true merchant refusal rate of 0.20, and the reader who sees 0.99 vetoes
+    enforcement — the exact decision this report exists to inform.
+    """
+    from services import checkout_preflight as cp
+
+    rows = [
+        {"reason": cp.R_NOT_YET_CHECKED, "n": 600, "would_block": 600},
+        {"reason": cp.R_NO_MERCHANT_VARIANT, "n": 380, "would_block": 380},
+        {"reason": cp.R_SUPPRESSED, "n": 10, "would_block": 10},
+        {"reason": cp.R_GONE, "n": 2, "would_block": 2},
+        {"reason": cp.R_OK, "n": 8, "would_block": 0},
+    ]
+    out = cp._summarise_shadow_rows(rows, window_days=7)
+    assert out["observations"] == 1000
+    assert out["would_block"] == 992
+    assert out["would_block_rate"] == 0.992
+    assert out["no_contact"] == 990
+    assert out["answered"] == 10, "only 10 questions actually reached a merchant"
+    assert out["would_block_rate_answered"] == 0.2, (
+        "2 of those 10 were refused — not 0.99")
+
+
+@pytest.mark.asyncio
+async def test_the_blind_enforce_warning_returns_when_the_state_does(monkeypatch, caplog):
+    """MUTANT: latch the warning once-ever instead of on the state.
+
+    Opening the fence and closing it again re-enters the dangerous state. The message text is the
+    only signal there is, so a latch that never resets means the second entry is silent — and
+    after log retention there is nothing at all.
+    """
+    from services import checkout_preflight as cp
+
+    _stub_verdict(monkeypatch, status=lov.UNVERIFIED, reason=lov.NO_CACHED_EVIDENCE)
+
+    async def warns() -> bool:
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            await cp.preflight(_offer())
+        return "ENFORCING" in " ".join(r.getMessage() for r in caplog.records)
+
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "enforce")
+    monkeypatch.delenv("CHECKOUT_PREFLIGHT_ALLOW_EGRESS", raising=False)
+    assert await warns() is True, "first entry into the dangerous state must warn"
+    assert await warns() is False, "and must not repeat on every request"
+
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_ALLOW_EGRESS", "true")
+    assert await warns() is False, "safe again"
+
+    monkeypatch.delenv("CHECKOUT_PREFLIGHT_ALLOW_EGRESS", raising=False)
+    assert await warns() is True, "re-entering the dangerous state must warn AGAIN"

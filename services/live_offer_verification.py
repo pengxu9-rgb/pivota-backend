@@ -34,9 +34,18 @@ DEGRADATION IS NEVER SILENT (audit F3):
   * `unverified` — timed out, blocked, or not a storefront we can read. Keep the snapshot, but the
                    caller must demote it and must not return it as rank 1.
 
-REQUEST-PATH TRAFFIC ON THE SHARED CRAWL IP. This is the primary consumer of the egress isolation
-in §3.2, so every fetch goes through `crawl_politeness` with the BOUNDED wait — never `max_wait=0`.
-An unbounded pace wait here would be #1854's P1 re-introduced on a live path.
+REQUEST-PATH TRAFFIC LEAVES BY THE PAYMENT ADDRESS, NOT THE CRAWL ONE. This paragraph used to
+claim the opposite — "the shared crawl IP" — and that was never true of the request path. Every
+caller of this module on a request runs inside `web`, and `web` is on the `default` subnet, whose
+NAT holds 8.231.167.230, the address payment partners allowlist. `pivota-crawl` and its
+34.82.199.35 belong to `catalog-intelligence` and to one-off jobs that pass SUBNET=pivota-crawl.
+So a fetch from here shares IP reputation AND the NAT port pool with the payment path, and port
+exhaustion is per-IP.
+
+That is why both request-path lanes are now fenced by default — `verify_offers` below and
+`checkout_preflight` — and why arming either is a deliberate act rather than a flag flip. Every
+fetch still goes through `crawl_politeness` with the BOUNDED wait, never `max_wait=0`; an
+unbounded pace wait here would be #1854's P1 re-introduced on a live path.
 """
 
 from __future__ import annotations
@@ -499,11 +508,25 @@ async def _check_one(
     )
 
 
+def request_path_egress_allowed() -> bool:
+    """May a REQUEST-PATH lane in this process fetch a merchant? Default NO.
+
+    Separate from `checkout_preflight`'s own flag on purpose: these are two lanes with different
+    owners, different populations and different blast radii, and one switch that opened both would
+    make arming the cheap one silently arm the expensive one. Both default closed.
+
+    Read per call so it can be shut off on a running service without a deploy.
+    """
+    raw = str(os.getenv("LIVE_OFFER_VERIFICATION_ALLOW_REQUEST_PATH_EGRESS", "")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 async def verify_offers(
     offers: List[Dict[str, Any]],
     *,
     top_k: Optional[int] = None,
     deadline_s: Optional[float] = None,
+    cache_only: Optional[bool] = None,
 ) -> Dict[int, Verdict]:
     """Verify the first `top_k` offers in parallel within `deadline_s`. Keyed by list index.
 
@@ -525,8 +548,13 @@ async def verify_offers(
     # The gate is handed the BATCH budget, not its own 10s default. `await_slot` refuses before
     # reserving, so a host that cannot be served inside this turn says so immediately instead of
     # consuming a slot it will be cancelled out of.
+    # `None` means "ask the flag", so an explicit False from a lane that KNOWS it may crawl (a
+    # batch on `pivota-crawl`) still works, and the request path gets the closed default without
+    # every caller having to remember it.
+    fenced = (not request_path_egress_allowed()) if cache_only is None else bool(cache_only)
     tasks = {
-        asyncio.ensure_future(_check_one(o, max_wait=budget)): i for i, o in targets
+        asyncio.ensure_future(_check_one(o, max_wait=budget, cache_only=fenced)): i
+        for i, o in targets
     }
 
     # `asyncio.wait`, not `wait_for(gather(...))`. A gather that times out cancels EVERY task, so

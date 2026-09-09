@@ -17,6 +17,22 @@ from typing import Any, Dict, List
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _this_file_is_about_the_crawl_itself(monkeypatch):
+    """Open the request-path egress fence for this whole file.
+
+    `verify_offers` is fenced CLOSED by default, because its only request-path caller runs in
+    `web`, which egresses by 8.231.167.230 — the address payment partners allowlist. Almost every
+    test here exists to exercise what happens when we DO fetch: pacing, robots, redirects,
+    timeouts, currency. Fencing them would not make them safer, it would make them vacuous.
+
+    So the fence is opened here explicitly, and `test_the_request_path_is_fenced_by_default` below
+    is the one test that asserts the default with the fixture undone.
+    """
+    monkeypatch.setenv("LIVE_OFFER_VERIFICATION_ALLOW_REQUEST_PATH_EGRESS", "true")
+
+
 from services import crawl_politeness as _cp_module
 from services import live_offer_verification as lov
 
@@ -1233,3 +1249,61 @@ def test_a_variant_with_no_price_is_never_price_verified(monkeypatch: pytest.Mon
     assert out[0].status == lov.VERIFIED, "stock is still established"
     assert out[0].live_price is None
     assert out[0].price_verified is False, "a missing amount cannot be a verified price"
+
+
+@pytest.mark.asyncio
+async def test_the_request_path_is_fenced_by_default(monkeypatch):
+    """MUTANT: default `verify_offers` to egress-allowed.
+
+    The search lane's only request-path caller is `_handle_offers_resolve`, inside `web`, on the
+    `default` subnet whose NAT is the payment address. `_host_diverse_head` guarantees the offers
+    sit on DISTINCT hosts and each costs a robots.txt plus a /meta.json, so arming the lane alone
+    put the exact traffic shape that trips a 15-minute cross-domain block onto the payment IP.
+
+    Two flags now, deliberately: one turns the lane on, one lets it leave the process.
+    """
+    import httpx
+
+    monkeypatch.delenv("LIVE_OFFER_VERIFICATION_ALLOW_REQUEST_PATH_EGRESS", raising=False)
+    lov.reset_for_tests()
+    assert lov.request_path_egress_allowed() is False
+
+    def explode(*a, **k):
+        raise AssertionError("the search lane opened an HTTP client from the money path")
+
+    monkeypatch.setattr(httpx, "AsyncClient", explode)
+
+    async def explode_async(*a, **k):
+        raise AssertionError("the search lane contacted a merchant host")
+
+    monkeypatch.setattr(lov.crawl_politeness, "before_request", explode_async)
+
+    verdicts = await lov.verify_offers([{
+        "offer_id": "o1",
+        "execution_spec": {"pdp_url": "https://brand.example/products/thing",
+                           "variant_id": "41234567890123"},
+    }])
+    assert verdicts, "the lane must still answer, not vanish"
+    assert all(v.reason == lov.NO_CACHED_EVIDENCE for v in verdicts.values())
+
+
+@pytest.mark.asyncio
+async def test_a_lane_that_may_crawl_still_crawls(monkeypatch):
+    """The fence must not make the search lane unusable from a process that SHOULD egress."""
+    monkeypatch.setenv("LIVE_OFFER_VERIFICATION_ALLOW_REQUEST_PATH_EGRESS", "true")
+    lov.reset_for_tests()
+    assert lov.request_path_egress_allowed() is True
+
+    reached = []
+
+    async def record(url, **k):
+        reached.append(url)
+        raise lov.crawl_politeness.CrawlPaced("stop here; contact is what we are asserting")
+
+    monkeypatch.setattr(lov.crawl_politeness, "before_request", record)
+    await lov.verify_offers([{
+        "offer_id": "o1",
+        "execution_spec": {"pdp_url": "https://brand.example/products/thing",
+                           "variant_id": "41234567890123"},
+    }])
+    assert reached, "an opted-in lane must be allowed to ask"
