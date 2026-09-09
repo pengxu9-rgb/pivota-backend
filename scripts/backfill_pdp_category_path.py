@@ -9,11 +9,12 @@ For each catalog_products row where category_path IS NULL:
   - On first match, populate category_path + category_label_source='regex_backfill'
     + category_confidence=0.85.
 
-`--include-shallow` widens that to rows whose path is too SHALLOW to be routable (fewer than
-MIN_ROUTABLE_DEPTH segments). Recall binds a hard prefix like `beauty/makeup/lip/`, and
+`--include-shallow` widens that to rows whose path is an INTERIOR NODE of the taxonomy — one that
+some canonical path strictly extends. Recall binds a hard prefix like `beauty/makeup/lip/`, and
 `beauty/makeup` is an ANCESTOR of that prefix rather than a descendant, so a row filed there can
-never match. Measured on prod 2026-09-09: 6,459 of 15,516 products (41.6%) sit at depth <= 2 or
-NULL and 4,517 of those are serving_eligible — eligible and unreachable at the same time.
+never match. Routability is NOT a depth: `fashion/shoes` and `electronics/ereader` are 2-segment
+LEAVES and route fine. Measured on prod 2026-09-09: 6,459 of 15,516 products (41.6%) sit at depth
+<= 2 or NULL and 4,517 of those are serving_eligible — eligible and unreachable at the same time.
 
 A write only lands when it strictly DEEPENS the row, so the widened mode cannot make anything
 worse and stays idempotent across re-runs.
@@ -50,25 +51,57 @@ CONFIDENCE_REGEX_BACKFILL = 0.85
 LABEL_SOURCE = "regex_backfill"
 
 
-# A path with fewer than this many segments cannot satisfy recall, which binds a hard prefix like
-# `beauty/makeup/lip/`: `beauty/makeup` is an ANCESTOR of that prefix, not a descendant, so a row
-# filed there can never match however good its content is.
-MIN_ROUTABLE_DEPTH = 3
+# ROUTABILITY IS NOT A DEPTH. A row is unreachable when its path is an INTERIOR node of the
+# taxonomy — some canonical path strictly extends it — because recall binds a hard prefix: a "matte
+# lipstick" query resolves `beauty/makeup/lip/`, and `beauty/makeup` is an ancestor of that prefix,
+# not a descendant, so a row filed there can never match.
+#
+# An earlier version of this used `depth < 3`, which is WRONG: `fashion/shoes` and
+# `electronics/ereader` are 2-segment LEAVES that recall routes perfectly well, and the depth rule
+# would have selected them, dropped their leaf echo, and let a title regex re-verticalise them into
+# beauty ("Cream Suede Loafers" -> beauty/skincare/moisturize/cream, depth 4 > 2, so the write
+# would land). Nothing in prod holds those paths today, but the rule was wrong in principle and
+# rows written to them would be re-selected on every run.
+_TAXONOMY_PATHS = frozenset(path for _label, path, _pattern in CATEGORY_PATTERNS)
+_INTERIOR_NODES = frozenset(
+    "/".join(path.split("/")[:i])
+    for path in _TAXONOMY_PATHS
+    for i in range(1, len(path.split("/")))
+)
+# Widest SQL net that still contains every interior node; Python then decides precisely. Selecting
+# a superset in SQL and filtering here keeps the taxonomy in ONE place (the classifier module)
+# instead of duplicating it into a query.
+MAX_INTERIOR_DEPTH = max((len(p.split("/")) for p in _INTERIOR_NODES), default=0)
 
 _DEPTH_SQL = "COALESCE(array_length(string_to_array(category_path, '/'), 1), 0)"
+
+
+def _is_interior_node(path: Optional[str]) -> bool:
+    """True when `path` is a taxonomy node something else extends — i.e. unreachable by prefix."""
+    text = str(path or "").strip().strip("/")
+    if not text:
+        return True  # NULL/blank: nothing to route on at all
+    return text in _INTERIOR_NODES
 
 
 async def _fetch_batch(
     limit: int, after_key: Optional[str], *, include_shallow: bool = False
 ) -> List[dict]:
-    """NULL category_path by default; optionally also rows too SHALLOW to be routable.
+    """NULL category_path by default; optionally also rows too shallow to be routable.
 
     The default is unchanged deliberately — this script has been run against NULLs before and
-    widening its silent blast radius would be a nasty surprise. `--include-shallow` opts in.
+    widening its silent blast radius would surprise whoever runs it next. `--include-shallow`
+    opts in, and selects a depth-bounded SUPERSET that `_is_interior_node` then narrows.
     """
+    # The parameter dict must contain EXACTLY the placeholders the predicate uses. Binding
+    # :max_depth unconditionally made the DEFAULT path raise ArgumentError from
+    # text().bindparams() before any SQL ran — and routes/admin_catalog_debug.py calls this with
+    # no flag, so the ops backfill endpoint 500'd. Build both together.
+    params: Dict[str, Any] = {"limit": limit, "after_key": after_key}
     predicate = "category_path IS NULL"
     if include_shallow:
-        predicate = "(category_path IS NULL OR %s < :min_depth)" % _DEPTH_SQL
+        predicate = "(category_path IS NULL OR %s <= :max_depth)" % _DEPTH_SQL
+        params["max_depth"] = MAX_INTERIOR_DEPTH
     rows = await database.fetch_all(
         """
         SELECT
@@ -85,7 +118,7 @@ async def _fetch_batch(
         ORDER BY product_key ASC
         LIMIT :limit
         """,
-        {"limit": limit, "after_key": after_key, "min_depth": MIN_ROUTABLE_DEPTH},
+        params,
     )
     return [dict(row) for row in rows or []]
 
@@ -97,7 +130,7 @@ def _depth(path: Optional[str]) -> int:
 
 async def _apply_update(
     product_key: str, category_path: str, *, previous_path: Optional[str] = None
-) -> None:
+) -> bool:
     """Write the new path, but NEVER make a row shallower than it already is.
 
     Two guards, both in SQL so a concurrent writer cannot slip between the read and the write:
@@ -106,7 +139,10 @@ async def _apply_update(
       - the previous-value check is optimistic concurrency: if anything changed the row since this
         batch read it, this update declines rather than clobbering that decision.
     """
-    await database.execute(
+    # RETURNING + fetch_val, NOT execute(): `databases` over asyncpg reports NO rowcount for an
+    # UPDATE, so a guard that declined a write would have been indistinguishable from one that
+    # landed and `matched` would have counted intentions rather than changes.
+    landed = await database.fetch_val(
         """
         UPDATE catalog_products
         SET category_path = :path,
@@ -115,6 +151,7 @@ async def _apply_update(
         WHERE product_key = :key
           AND category_path IS NOT DISTINCT FROM CAST(:previous AS varchar)
           AND :new_depth > """ + _DEPTH_SQL + """
+        RETURNING product_key
         """,
         {
             "key": product_key,
@@ -125,6 +162,7 @@ async def _apply_update(
             "source": LABEL_SOURCE,
         },
     )
+    return landed is not None
 
 
 def _classification_inputs(row: Dict[str, Any]):
@@ -177,12 +215,15 @@ async def run_category_path_backfill(
     unmatched = 0
     not_deeper = 0
     not_deeper_by_path: Dict[str, int] = {}
+    skipped_routable = 0
+    declined = 0  # guard refused the write (row changed under us, or not actually deeper)
     # A row moving beauty/makeup -> beauty/skincare/... is not merely deeper, it is RE-VERTICALISED.
     # category_kind is derived from this path and drives claim-safety, required disclaimers and the
     # serving gate, so a branch change is a different and larger decision than a deepening. Counted
     # separately so an operator can see how much of a run is which before applying.
     branch_changes = 0
     branch_change_pairs: Dict[str, int] = {}
+    branch_change_samples: List[Dict[str, Any]] = []
     after_key: Optional[str] = None
     matched_by_label: Dict[str, int] = {}
     matched_by_path: Dict[str, int] = {}
@@ -205,6 +246,11 @@ async def run_category_path_backfill(
             total += 1
             after_key = str(row.get("product_key") or "")
             current_path = row.get("category_path")
+            # SQL selected a depth-bounded SUPERSET; only interior nodes are actually unreachable.
+            # A 2-segment LEAF like fashion/shoes routes fine and must be left alone.
+            if not _is_interior_node(current_path):
+                skipped_routable += 1
+                continue
             row_category, row_product_type = _classification_inputs(row)
             hit = resolve_path_from_row(
                 category=row_category,
@@ -240,6 +286,18 @@ async def run_category_path_backfill(
             if before_branch and after_branch and before_branch != after_branch:
                 branch_changes += 1
                 _increment(branch_change_pairs, "%s -> %s" % (current_path, path))
+                # Sampled SEPARATELY. matched_samples is the first N matches and contained no
+                # branch change at all, so "these are misfiled non-beauty rows" rested on pair
+                # counts with nothing to inspect. A title regex can be wrong in this direction
+                # too ("LED Ring Light" -> fashion/accessories/jewelry via `ring\b`).
+                if len(branch_change_samples) < sample_limit:
+                    branch_change_samples.append({
+                        "product_key": row.get("product_key"),
+                        "brand": row.get("brand"),
+                        "title": row.get("title"),
+                        "category_path_before": current_path,
+                        "category_path": path,
+                    })
             matched += 1
             _increment(matched_by_label, label)
             _increment(matched_by_path, path)
@@ -272,6 +330,7 @@ async def run_category_path_backfill(
         "unmatched": unmatched,
         "not_deeper": not_deeper,
         "branch_changes": branch_changes,
+        "branch_change_samples": branch_change_samples,
         "branch_change_pairs": dict(
             sorted(branch_change_pairs.items(), key=lambda kv: (-kv[1], kv[0]))[:25]
         ),
@@ -279,7 +338,9 @@ async def run_category_path_backfill(
             sorted(not_deeper_by_path.items(), key=lambda kv: (-kv[1], kv[0]))[:20]
         ),
         "include_shallow": include_shallow,
-        "min_routable_depth": MIN_ROUTABLE_DEPTH,
+        "max_interior_depth": MAX_INTERIOR_DEPTH,
+        "skipped_already_routable": skipped_routable,
+        "declined_by_guard": declined,
         "total": total,
         "dry_run": dry_run,
         "batch_size": batch_size,
@@ -327,9 +388,9 @@ def main() -> int:
         "--include-shallow",
         action="store_true",
         help=(
-            "also process rows whose category_path is too SHALLOW to be routable "
-            "(fewer than %d segments), not just NULL ones. A write only lands when it "
-            "strictly deepens the row." % MIN_ROUTABLE_DEPTH
+            "also process rows whose category_path is an INTERIOR node of the taxonomy "
+            "(something extends it, so prefix recall cannot reach it), not just NULL ones. "
+            "A write only lands when it strictly deepens the row."
         ),
     )
     args = parser.parse_args()
