@@ -82,3 +82,12 @@ def test_old_canonical_measurement_is_not_recertified_by_projection_rebuild():
     assert bucket['brand_mentioned']['unknown'] == 1
     assert bucket['source_visible']['n'] == 1
     assert old['tiers']['unbranded']['brand_mentioned']['n'] == 1
+
+
+def test_gateway_fixture_survives_retained_report_revalidation():
+    import json
+    from pathlib import Path
+    from services.selection_measurement import report_observations
+    item=json.loads(Path('tests/fixtures_consumer_answer_gateway.json').read_text())
+    rows=response_observations([item],sku_key='fixture-sku',merchant_host='anua.com',merchant_brand='Anua')
+    assert report_observations({'per_sku_reports':[{'selection_observations':rows}]})[0]['brand_mentioned'] is True

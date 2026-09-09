@@ -59,7 +59,8 @@ def response_observations(runs, *, sku_key, merchant_host, merchant_brand, merch
         query = str(run.get("normalized_query") or run.get("query") or "").strip()
         meta = run.get("axis_metadata") or {}
         axis = str(meta.get("axis") or "").lower() if isinstance(meta, dict) else ""
-        provider = str(run.get("_provider") or run.get("provider") or "unknown")
+        answer_provider = run.get("answer", {}).get("provider") if isinstance(run.get("answer"), dict) else None
+        provider = str(run.get("_provider") or run.get("provider") or answer_provider or "unknown")
         failed = run_errored(run)
         parsed = run.get("parsed") if isinstance(run.get("parsed"), dict) else {}
         # A provider may explicitly report this boolean. correct_sku=False,
