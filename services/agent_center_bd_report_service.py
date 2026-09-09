@@ -3447,6 +3447,7 @@ def _flatten_probe_runs(per_sku_probe_runs: Any) -> List[Dict[str, Any]]:
                 if not isinstance(run, dict):
                     continue
                 row = dict(run)
+                row["_scan_mode"] = probe.get("scan_mode") or row.get("_scan_mode")
                 row.setdefault("_provider", probe.get("provider"))
                 row.setdefault("_probe_run_id", probe_run_id or f"{probe.get('provider') or 'probe'}:{idx}")
                 out.append(row)

@@ -707,3 +707,50 @@ def test_the_boot_line_shows_the_liveness_flag_raw_and_resolved(
     # The parsed posture must agree with the job's own gate, not with a
     # second reading of the environment written into the log line.
     assert (posture == "ON") is job.liveness_job_enabled()
+
+
+@pytest.mark.parametrize("mention", [True, False])
+@pytest.mark.parametrize("provenance", [
+    {"evidence_kind": "merchant_context_diagnostic"},
+    {"prompt_contract": "merchant_context_diagnostic_v1"},
+])
+def test_diagnostic_self_report_is_not_consumer_answer(mention, provenance):
+    rows = observations([{
+        **provenance, "query": "best serum", "axis_metadata": {"axis": "category"},
+        "parsed": {"brand_mentioned": mention, "evidence_kind": "consumer_answer"},
+        "grounding_sources": [{"uri": "https://anua.com", "title": "Anua"}],
+    }])
+    assert rows[0]["brand_mentioned"] is None
+    assert rows[0]["source_visible"] is True
+    metric = selection_measurement(rows)["tiers"]["unbranded"]
+    assert metric["brand_mentioned"]["n"] == 0
+    assert metric["brand_mentioned"]["unknown"] == 1
+    assert metric["source_visible"]["n"] == 1
+
+
+def test_legacy_probe_mode_survives_flattening_and_rejects_diagnostic_boolean():
+    from services.agent_center_bd_report_service import _flatten_probe_runs
+    from services.selection_measurement import DIAGNOSTIC_SCAN_MODES
+    for mode in DIAGNOSTIC_SCAN_MODES:
+        rows = _flatten_probe_runs([{
+            "scan_mode": mode, "provider": "gemini", "raw_runs": [{
+                "query": "best serum", "axis_metadata": {"axis": "category"},
+                "parsed": {"brand_mentioned": True},
+                "grounding_sources": [{"uri": "https://anua.com", "title": "Anua"}],
+            }],
+        }])
+        assert rows[0]["_scan_mode"] == mode
+        result = observations(rows)[0]
+        assert result["brand_mentioned"] is None
+        assert result["source_visible"] is True
+
+
+@pytest.mark.parametrize("mode", [[], {}, 3, True])
+def test_malformed_probe_mode_keeps_observation_but_not_answer_claim(mode):
+    rows = observations([{
+        "scan_mode": mode, "query": "best serum",
+        "axis_metadata": {"axis": "category"},
+        "parsed": {"brand_mentioned": True}, "grounding_sources": [],
+    }])
+    assert len(rows) == 1
+    assert rows[0]["brand_mentioned"] is None

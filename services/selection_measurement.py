@@ -23,6 +23,11 @@ from services.brand_alias import text_mentions_brand
 VERSION = "1"
 MENTION_PREDICATE = "explicit_answer_brand_mentioned_v1"
 TIERS = ("branded", "unbranded", "dupe")
+DIAGNOSTIC_SCAN_MODES = {
+    "open_product_visibility_test", "merchant_store_attribution_test",
+    "pivota_pdp_attribution_test", "search_grounded_product_discovery_test",
+    "category_visibility_test",
+}
 
 
 def selection_tier(query: str, axis: str, brand: str | None) -> str:
@@ -59,7 +64,14 @@ def response_observations(runs, *, sku_key, merchant_host, merchant_brand, merch
         # product_visible=False, missing citations and truncated snippets do NOT
         # establish brand absence. Do not parse raw model envelopes as prose.
         mention = parsed.get("brand_mentioned")
-        if type(mention) is not bool or failed:
+        # Merchant-context prompts request diagnostic JSON. Even an explicit
+        # model-supplied boolean in that JSON is not consumer-answer evidence.
+        modes = (run.get("_scan_mode"), run.get("scan_mode"))
+        invalid_mode = any(mode is not None and not isinstance(mode, str) for mode in modes)
+        diagnostic = (run.get("evidence_kind") == "merchant_context_diagnostic"
+                      or run.get("prompt_contract") == "merchant_context_diagnostic_v1"
+                      or any(isinstance(mode, str) and mode in DIAGNOSTIC_SCAN_MODES for mode in modes))
+        if type(mention) is not bool or failed or diagnostic or invalid_mode:
             mention = None
         facts = compute_run_facts(
             [run], merchant_host=merchant_host, merchant_brand=merchant_brand,
