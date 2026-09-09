@@ -41,6 +41,14 @@ LONG_PK = "ext:" + ("pgtest-long-" + "z" * 200)[:200] + "::deadbeef"
 #: MERCHANT_ISSUED), and one `catalog_skus` identity between them.
 VID_LONG_A = "8" * 128 + "1"
 VID_LONG_B = "8" * 128 + "2"
+#: writer_audit_log is shared by every module in the gate run, and at least one of them
+#: (reconcile_catalog_offers) leaves its own row behind — so every read is scoped to this writer.
+#: A literal rather than an import of `scripts.backfill_variant_identity_skus.WRITER_NAME`:
+#: that module mutates sys.path and imports db/ and services/ at load, and every other
+#: reference to it in this file is deferred into a function so the skipif above can keep it
+#: out of a non-Postgres run. `_run()` asserts this literal still equals the script's constant,
+#: so a rename there fails loudly instead of scoping every read to a name nobody writes.
+WRITER_NAME = "backfill_variant_identity_skus"
 #: asyncpg binds timestamptz from a datetime, never a string.
 _SUPPRESSED = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
 
@@ -118,7 +126,19 @@ async def _clear(database):
         "DELETE FROM external_product_seeds WHERE external_product_id = :e", {"e": SPID}
     )
     await database.execute("DELETE FROM writer_audit_log WHERE writer_name = :w",
-                           {"w": "backfill_variant_identity_skus"})
+                           {"w": WRITER_NAME})
+
+
+async def _audit_row(database):
+    """This module's latest writer_audit_log row (never another module's leftover)."""
+    row = await database.fetch_one(
+        "SELECT * FROM writer_audit_log WHERE writer_name = :w ORDER BY id DESC LIMIT 1",
+        {"w": WRITER_NAME},
+    )
+    # Without this, a WRITER_NAME that matches nothing surfaces as `TypeError: 'NoneType'
+    # object is not iterable` from dict() — which names neither the table nor the writer.
+    assert row is not None, f"no writer_audit_log row for {WRITER_NAME}"
+    return dict(row)
 
 
 async def _seed(database, *, variants, offers, suppressed=None, pk=PK):
@@ -188,6 +208,9 @@ async def test_the_identity_index_the_conflict_target_needs_actually_exists(db):
 
 async def _run(**kw):
     import scripts.backfill_variant_identity_skus as backfill
+    # Pins the module constant above to the name the script actually writes: a rename there
+    # would otherwise scope every read here to a writer nobody records.
+    assert backfill.WRITER_NAME == WRITER_NAME
     return await backfill.run(**{"apply": True, "limit": 0, "after": "", "page": 100,
                                  "adopt_existing_offers": False, **kw})
 
@@ -384,10 +407,15 @@ async def test_a_priceless_variant_gets_no_row_at_all(db):
 async def test_the_run_is_recorded_in_writer_audit_log(db):
     await _seed(db, variants=[_variant()], offers=[{}])
     report = await _run()
-    row = dict(await db.fetch_one("SELECT * FROM writer_audit_log"))
-    assert row["writer_name"] == "backfill_variant_identity_skus"
+    row = await _audit_row(db)
+    assert row["writer_name"] == WRITER_NAME
     assert row["batch_id"] == report["batch_id"]
     assert row["applied_rows"] == 2
+    # `_audit_row` takes the LATEST row, so it cannot see a duplicated ledger write. One run
+    # is one row.
+    n = await db.fetch_val(
+        "SELECT count(*) FROM writer_audit_log WHERE writer_name = :w", {"w": WRITER_NAME})
+    assert n == 1
 
 
 # ---------------------------------------------------------------------------
@@ -475,7 +503,7 @@ async def test_a_run_whose_every_pair_is_refused_does_not_read_as_success(db):
     assert report["skus"] == 0, "a rolled-back pair must not be counted as written"
     assert report["rolled_back_offer_refused_by_guard"] == 1
     assert await db.fetch_val("SELECT count(*) FROM catalog_skus") == 0
-    assert dict(await db.fetch_one("SELECT * FROM writer_audit_log"))["applied_rows"] == 0
+    assert (await _audit_row(db))["applied_rows"] == 0
 
 
 async def test_an_offer_is_never_attached_to_a_suppressed_sku(db):
@@ -513,8 +541,8 @@ async def test_the_audit_row_and_cursor_survive_an_error_mid_run(db):
     finally:
         backfill.guard_catalog_offer_rows = real
     assert calls["n"] == 1
-    row = dict(await db.fetch_one("SELECT * FROM writer_audit_log"))
-    assert row["writer_name"] == "backfill_variant_identity_skus"
+    row = await _audit_row(db)
+    assert row["writer_name"] == WRITER_NAME
 
 
 async def test_a_missing_arbiter_index_is_not_swallowed_as_a_collision(db):
