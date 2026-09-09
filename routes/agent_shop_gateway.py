@@ -5919,8 +5919,17 @@ async def _handle_offers_resolve(
     # decides whether the top few are still true. It runs AFTER the truncation on purpose — the
     # 1.5s budget is per turn, so verifying anything the caller will not see spends it for nothing.
     #
-    # Default OFF. Arming it adds request-path egress to third parties on the shared crawl NAT IP,
-    # which is exactly the traffic the dedicated crawl subnet exists to isolate.
+    # Default OFF, and DOUBLY so since review: this comment used to say the egress went out "on
+    # the shared crawl NAT IP", which was the reverse of the truth and read as an all-clear. This
+    # code runs in `web`, `web` is on the `default` subnet, and that subnet's NAT holds
+    # 8.231.167.230 — the address payment partners allowlist. `_host_diverse_head` above
+    # guarantees the offers are on DISTINCT hosts, and each one costs a robots.txt plus a
+    # /meta.json, so arming this alone put the exact ~50-requests-over-37-Cloudflare-domains
+    # pattern that trips a 15-minute IP-level block onto the payment address.
+    #
+    # So `verify_offers` is now fenced by default too: `LIVE_OFFER_VERIFICATION_ENABLED` turns the
+    # lane on, and `LIVE_OFFER_VERIFICATION_ALLOW_REQUEST_PATH_EGRESS` is what lets it leave the
+    # process. Both are needed, deliberately.
     #
     # Failure here must never cost the turn: a verifier that raised would turn the 31.1%
     # wrong-spec problem into a 100% no-answer problem, which is strictly worse.

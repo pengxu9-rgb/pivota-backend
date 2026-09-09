@@ -73,6 +73,41 @@ R_UNVERIFIABLE = "could_not_ask_merchant"
 R_NO_MERCHANT_VARIANT = "no_merchant_issued_variant_id"
 R_SUPPRESSED = "suppressed"
 R_DISABLED = "preflight_off"
+#: NOT `R_UNVERIFIABLE`. Both block, and conflating them would make the shadow report unreadable:
+#: "could_not_ask_merchant" is a fact about the MERCHANT, this is a fact about US — nobody has
+#: warmed this URL yet. Week one of shadow is otherwise a wall of merchant-shaped refusals that
+#: are really our own empty cache, which is exactly the "denominator is empty by construction"
+#: mistake this gate already made once.
+R_NOT_YET_CHECKED = "not_yet_checked"
+#: Split out of R_UNVERIFIABLE for the same reason R_NOT_YET_CHECKED was: no merchant was
+#: contacted, and no merchant could have been. `_target` returns no URL for a PDP that is not
+#: `/products/<handle>`-shaped, or for a seed carrying no url at all, and that happens BEFORE the
+#: cache read. Left inside `could_not_ask_merchant` it was the ONLY reason in the answered
+#: denominator under the shipping config, so the rate built to escape a by-construction 1.0 read
+#: 1.0 by construction — on rows where nobody was asked.
+R_NO_VERIFIABLE_URL = "no_verifiable_url"
+
+#: Every reason `preflight` can return WITHOUT a merchant ever being contacted. This is a set, not
+#: a single constant, because review caught the answered rate excluding only `not_yet_checked` and
+#: still calling itself "the merchant's verdict": `no_merchant_issued_variant_id` is decided at
+#: step 1 before any request, and on the union population it dominates. Measured on the shape prod
+#: will produce in week one, the difference is 0.99 against a true merchant refusal rate of 0.20 —
+#: the same unreadable-by-construction defect one class down, and the reader who sees 0.99 vetoes
+#: enforcement. Anything added here must be a reason that CANNOT have touched a merchant.
+NO_CONTACT_REASONS = frozenset({
+    R_NOT_YET_CHECKED,        # the fence held; our cache was cold
+    R_NO_MERCHANT_VARIANT,    # refused at step 1, no request made
+    R_NO_VERIFIABLE_URL,      # no `/products/<handle>` url to ask about; decided before the cache
+    R_SUPPRESSED,             # refused at step 2, no request made
+    R_DISABLED,               # the gate was off — and `record` drops these before they land, so
+                              # this member is dead in the table today and kept for completeness
+})
+#: Deliberately OUT, and each for a reason worth stating because the next person will be tempted:
+#: R_GONE, R_OUT_OF_STOCK and R_OK all require a DOCUMENT, and under a closed fence a document
+#: means somebody contacted that merchant. R_UNVERIFIABLE stays in the answered denominator too:
+#: after this split it means the merchant was asked and did not usefully answer, except on the
+#: exception path, where contact is genuinely ambiguous — the conservative side of that is to
+#: count it as a merchant failure rather than silently shrink the denominator.
 
 _DEFAULT_DEADLINE_S = 4.0
 
@@ -86,6 +121,59 @@ def mode() -> str:
 
 def is_enabled() -> bool:
     return mode() != MODE_OFF
+
+
+def egress_allowed() -> bool:
+    """May THIS process fetch a merchant to answer a preflight? Default NO.
+
+    `checkout_preflight` runs inside `web`, and `web` is on the `default` subnet, whose NAT holds
+    8.231.167.230 — the address payment partners allowlist. Merchant fetches from there share both
+    the IP's reputation and its NAT port pool with the payment path, and port exhaustion is
+    per-IP. `infra/gcp/setup_egress_nat.sh` records the measurement: ~50 requests over 37
+    Cloudflare-fronted domains in about a minute tripped a cross-domain IP-level 429 lasting ~15
+    minutes.
+
+    The default is CLOSED, so arming the gate cannot start crawling from the money path by
+    accident — that has to be a deliberate, separate act. A process that legitimately egresses
+    (a warm/measurement lane running on `pivota-crawl`) sets this true for itself.
+
+    Read per call, like `mode()`, so it can be shut off on a running service without a deploy.
+    """
+    raw = str(os.getenv("CHECKOUT_PREFLIGHT_ALLOW_EGRESS", "")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+_WARNED_BLIND_ENFORCE = False
+
+
+def _warn_if_enforcing_blind(current_mode: str) -> None:
+    """`enforce` + a closed fence + a cold cache withdraws EVERY cart, on zero merchant evidence.
+
+    The two flags are independent and both re-read per call, so this combination can be reached by
+    flipping one variable on a running service. This module's own design note says the mode is the
+    whole safety story precisely so it is "one value and not a scatter of booleans"; adding a
+    second boolean that can silently null the product needs to say so out loud at least once.
+
+    In the log MESSAGE, not `extra=`: the root logger is WARNING in prod and
+    `setup_structured_logging()` is never called, so structured fields are dark.
+    """
+    global _WARNED_BLIND_ENFORCE
+    dangerous = current_mode == MODE_ENFORCE and not egress_allowed()
+    if not dangerous:
+        # Latch on the STATE, not once-ever. Review found the first version silent forever after
+        # one warning, so opening the fence and closing it again re-entered the dangerous state
+        # with no signal — and the message text is the only signal there is.
+        _WARNED_BLIND_ENFORCE = False
+        return
+    if _WARNED_BLIND_ENFORCE:
+        return
+    _WARNED_BLIND_ENFORCE = True
+    logger.warning(
+        "checkout preflight is ENFORCING with its egress fence CLOSED "
+        "(CHECKOUT_PREFLIGHT_ALLOW_EGRESS unset): every hand-over whose document is not already "
+        "cached in THIS process will be refused as not_yet_checked and its cart withdrawn, on no "
+        "merchant evidence. Warm the cache from a lane that may crawl, or set the mode to shadow."
+    )
 
 
 def deadline_seconds() -> float:
@@ -162,6 +250,13 @@ async def preflight(offer: Dict[str, Any]) -> PreflightVerdict:
     started = time.monotonic()
     # Read ONCE. Every decision in this call, and the verdict it returns, refer to the same mode.
     current_mode = mode()
+    # Passed the already-read value rather than re-reading: the rule three lines up is the whole
+    # reason `current_mode` exists, and a warning that disagreed with the verdict beside it would
+    # be worse than no warning.
+    try:
+        _warn_if_enforcing_blind(current_mode)
+    except Exception:  # noqa: BLE001 - a log line may not break the checkout it describes
+        pass
     quoted_price, quoted_currency = _quoted(offer)
 
     def _finish(outcome: str, reason: str, **kw) -> PreflightVerdict:
@@ -204,6 +299,10 @@ async def preflight(offer: Dict[str, Any]) -> PreflightVerdict:
 
         # 3. Ask the merchant. Reuses the search path's checker so there is one crawler, one
         #    cache and one politeness budget — but the verdict is read with checkout's rules.
+        # ONLY REACHABLE WITH THE FENCE OPEN. Under the default closed fence `_check_one` makes
+        # no outbound request at all, so none of the budgets below are in play; they bound the
+        # opted-in lane on `pivota-crawl`. Left in place because that lane is the one that will
+        # hit them.
         # `max_wait` bounds only the politeness stall inside `_check_one`; the robots fetch
         # (5 s), the pacing wait (4 s) and a redirect-chasing fetch (1.2 s per operation, up to
         # 3 redirects) are each bounded separately, so together they could hold the money
@@ -212,7 +311,10 @@ async def preflight(offer: Dict[str, Any]) -> PreflightVerdict:
         # is an `Exception`, so it lands on UNVERIFIABLE below -- fail-closed.
         budget = deadline_seconds()
         verdict = await asyncio.wait_for(
-            live_offer_verification._check_one(offer, max_wait=budget), timeout=budget
+            live_offer_verification._check_one(
+                offer, max_wait=budget, cache_only=not egress_allowed()
+            ),
+            timeout=budget,
         )
     except Exception as exc:  # noqa: BLE001
         # Fail-closed on our OWN failure too. An exception here means we did not establish the
@@ -245,6 +347,16 @@ async def preflight(offer: Dict[str, Any]) -> PreflightVerdict:
         return _finish(OK, R_OK, **common)
     # `unverified` — the merchant did not answer, or is not a storefront we can read. At search
     # time this demotes; here it blocks.
+    #
+    # ...unless nobody ever asked. Under the egress fence a cold URL is not evidence about the
+    # merchant at all, and reporting it as one would inflate `could_not_ask_merchant` with our own
+    # unwarmed cache. It still BLOCKS — the gate's asymmetry is unchanged, and an unverified
+    # hand-over is refused whatever the reason — but it is counted apart so the shadow report can
+    # say how much of the refusal rate is merchants and how much is homework.
+    if verdict.reason == live_offer_verification.NO_CACHED_EVIDENCE:
+        return _finish(UNVERIFIABLE, R_NOT_YET_CHECKED, **common)
+    if verdict.reason == live_offer_verification.NO_VERIFIABLE_URL:
+        return _finish(UNVERIFIABLE, R_NO_VERIFIABLE_URL, **common)
     return _finish(UNVERIFIABLE, R_UNVERIFIABLE, **common)
 
 
@@ -364,24 +476,67 @@ REPORT_SCOPE = (
     "do not call merchant-issued is blocked at step 1 with no request made, and a storefront we "
     "cannot read answers unverifiable — group by reason before reading the rate; "
     "within a request, the first N distinct (pdp_url, variant) questions in seed-row order — "
-    "rate is over questions ASKED, not over candidates offered"
+    "rate is over questions ASKED, not over candidates offered; "
+    "THIRD class, and it dominates until a warm lane runs: with the egress fence closed (the "
+    "default) `web` never asks a merchant, so an uncached document answers not_yet_checked and "
+    "would_block_rate is 1.0 BY CONSTRUCTION; read would_block_rate_answered, whose denominator "
+    "drops EVERY reason decided without contacting a merchant (not_yet_checked, "
+    "no_merchant_issued_variant_id, no_verifiable_url, suppressed, preflight_off — see "
+    "NO_CONTACT_REASONS) so it is "
+    "the merchants' verdict over the questions that actually reached one, while no_contact and "
+    "not_yet_checked measure our own coverage"
 )
 
 
-async def shadow_report(window_days: int = 7) -> Dict[str, Any]:  # noqa: D401
-    """What enforcement WOULD have refused, and why. This is the evidence that decides whether
-    `enforce` is armed — read it rather than the 31.1% from the pre-backfill sample."""
-    rows = await database.fetch_all(SHADOW_REPORT_SQL, {"days": int(window_days)})
-    by_reason: List[Dict[str, Any]] = [dict(r) for r in rows or []]
+def _summarise_shadow_rows(
+    by_reason: List[Dict[str, Any]], *, window_days: int
+) -> Dict[str, Any]:
+    """The arithmetic, split out from the query so it can be tested without a database.
+
+    Not cosmetic: the interesting part of this report is which rows go in which denominator, and
+    while that lived inside the DB call the only way to pin it was a Postgres round trip — so
+    dropping a rate, or leaving `not_yet_checked` in the answered denominator, was invisible.
+    """
     total = sum(int(r["n"]) for r in by_reason)
     blocked = sum(int(r["would_block"]) for r in by_reason)
+    # TWO RATES, because they answer different questions and the raw one is unreadable on its own
+    # while the fence is closed. `not_yet_checked` means WE never asked; counting it as a refusal
+    # makes the headline 1.0 and says nothing about any merchant. Dropped from BOTH sides, not
+    # just the numerator — leaving it in the denominator would understate the merchant refusal
+    # rate by exactly the size of our own cold cache.
+    cold = sum(int(r["n"]) for r in by_reason if r.get("reason") == R_NOT_YET_CHECKED)
+    # The answered denominator drops EVERY no-contact reason, not just the cold-cache one.
+    no_contact = sum(int(r["n"]) for r in by_reason if r.get("reason") in NO_CONTACT_REASONS)
+    no_contact_blocked = sum(
+        int(r["would_block"]) for r in by_reason if r.get("reason") in NO_CONTACT_REASONS
+    )
+    answered = total - no_contact
     return {
         "scope": REPORT_SCOPE,
         "window_days": int(window_days),
         "observations": total,
         "would_block": blocked,
         # None, not 0.0, on an empty window: 0/0 must not read as "nothing would be refused",
-        # which is precisely the number someone would arm enforcement on.
+        # which is precisely the number someone would arm enforcement on. The answered rate needs
+        # the same guard for the same reason, and on day one of shadow it is the LIKELY state.
         "would_block_rate": (round(blocked / total, 4) if total else None),
+        # The merchant's verdict, over the questions that reached a merchant.
+        "answered": answered,
+        "would_block_rate_answered": (
+            round((blocked - no_contact_blocked) / answered, 4) if answered else None
+        ),
+        # Everything refused without a request. `not_yet_checked` is the part of it we can fix by
+        # warming; the rest is missing identity and suppression.
+        "no_contact": no_contact,
+        # Our own coverage: the share of gated hand-overs nobody has warmed yet.
+        "not_yet_checked": cold,
+        "not_yet_checked_rate": (round(cold / total, 4) if total else None),
         "by_reason": by_reason,
     }
+
+
+async def shadow_report(window_days: int = 7) -> Dict[str, Any]:  # noqa: D401
+    """What enforcement WOULD have refused, and why. This is the evidence that decides whether
+    `enforce` is armed — read it rather than the 31.1% from the pre-backfill sample."""
+    rows = await database.fetch_all(SHADOW_REPORT_SQL, {"days": int(window_days)})
+    return _summarise_shadow_rows([dict(r) for r in rows or []], window_days=window_days)
