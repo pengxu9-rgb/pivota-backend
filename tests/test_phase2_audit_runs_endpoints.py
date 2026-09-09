@@ -1083,3 +1083,45 @@ def test_list_subject_type_defaults_to_all(client, stub):
     res = client.get("/api/audits")
     assert res.status_code == 200
     assert stub.recent_subject_type is None
+
+
+def test_consumer_preview_matches_total_debit_and_does_not_pollute_base_cache(client, stub, monkeypatch):
+    monkeypatch.setenv('PIVOTA_CONSUMER_ANSWER_ENABLED','true')
+    stub.preview_sku_keys=['pk-1','pk-2']
+    base={'merchant_id':'merch-A','providers':['gemini']}
+    preview={**base,'scope':{'sku_keys':['pk-1','pk-2']}}
+    before=client.post('/api/audits/preview',json=preview).json()
+    queries=['best serum','Anua alternative']
+    quoted=client.post('/api/audits/preview',json={**preview,'consumer_answer_queries':queries})
+    assert quoted.status_code==200,quoted.text
+    after=client.post('/api/audits/preview',json=preview).json()
+    assert before['estimated_audit_credits']==after['estimated_audit_credits']
+    response=client.post('/api/audits',json={**base,'product_keys':['pk-1','pk-2'],'consumer_answer_queries':queries})
+    assert response.status_code==202,response.text
+    launch=stub.enqueued[-1]['request_options_jsonb']['launch']
+    assert launch['consumer_capture_plan']['sha256']==quoted.json()['consumer_capture']['plan_sha256']
+    assert stub.debits[-1]['amount']==quoted.json()['estimated_audit_credits']
+    assert stub.debits[-1]['amount']>before['estimated_audit_credits']
+
+
+def test_disabled_consumer_capture_cannot_debit(client, stub, monkeypatch):
+    monkeypatch.delenv('PIVOTA_CONSUMER_ANSWER_ENABLED',raising=False)
+    response=client.post('/api/audits',json={'merchant_id':'merch-A','product_keys':['pk-1'],'consumer_answer_queries':['best serum']})
+    assert response.status_code==422
+    assert not stub.debits and not stub.enqueued
+
+
+def test_changed_consumer_questions_change_launch_dedupe_key(client, stub, monkeypatch):
+    monkeypatch.setenv('PIVOTA_CONSUMER_ANSWER_ENABLED','true')
+    for query in ['best serum','best moisturizer']:
+        response=client.post('/api/audits',json={'merchant_id':'merch-A','product_keys':['pk-1'],'consumer_answer_queries':[query]})
+        assert response.status_code==202,response.text
+    assert stub.idem_lookups[-1]!=stub.idem_lookups[-2]
+
+
+def test_enqueue_failure_refunds_consumer_and_diagnostic_charge_together(client, stub, monkeypatch):
+    monkeypatch.setenv('PIVOTA_CONSUMER_ANSWER_ENABLED','true')
+    stub.enqueue_returns=None
+    response=client.post('/api/audits',json={'merchant_id':'merch-A','product_keys':['pk-1'],'consumer_answer_queries':['best serum']})
+    assert response.status_code==503,response.text
+    assert sum(row['amount'] for row in stub.credits)==sum(row['amount'] for row in stub.debits)

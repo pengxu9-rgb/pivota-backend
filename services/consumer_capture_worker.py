@@ -58,3 +58,24 @@ async def capture_for_leased_run(*, run_id, merchant_id, worker_id, plan, retain
             allow_local_mock=False,
         )
     return await execute_plan(plan, retained=retained, checkpoint=checkpoint, probe=probe)
+
+
+def observations_for_capture(plan, state, *, merchant_brand, merchant_host):
+    from services.selection_measurement import response_observations
+    rows = []
+    for job in plan['jobs']:
+        saved = state['jobs'].get(job['id']) or {}
+        result = saved.get('result') if isinstance(saved.get('result'), dict) else {}
+        raw_runs = result.get('raw_runs')
+        # Exactly one requested response per job; malformed/missing results
+        # remain failed observations instead of silently disappearing.
+        raw = dict(raw_runs[0]) if isinstance(raw_runs, list) and len(raw_runs)==1 and isinstance(raw_runs[0], dict) else {'raw':'__error__:consumer_capture_unavailable'}
+        if raw.get('query') not in (None, job['query']):
+            raw = {'raw':'__error__:consumer_capture_query_mismatch'}
+        raw.update(query=job['query'], _provider=job['provider'], _probe_run_id=job['id'],
+                   axis_metadata={'axis':'category'})
+        if raw.get('evidence_kind') != 'consumer_answer':
+            raw = {**raw, 'raw':'__error__:consumer_capture_contract_missing', 'evidence_kind':'consumer_answer'}
+        rows.extend(response_observations([raw], sku_key=job['product_key'], merchant_host=merchant_host,
+                                          merchant_brand=merchant_brand))
+    return rows

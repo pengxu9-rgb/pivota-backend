@@ -5,6 +5,7 @@ state before returning; callers must enforce the existing tenant worker lease.
 """
 import hashlib
 import json
+import os
 from collections import Counter
 from services.credit_consumption_service import estimate_probe_credits
 
@@ -17,7 +18,7 @@ def build_plan(*, product_keys, queries, providers):
             raise ValueError('Invalid consumer capture scope')
         if any(not isinstance(v, str) or not v.strip() or len(v) > 1000 for v in values):
             raise ValueError('Invalid consumer capture entry')
-        return list(dict.fromkeys(v.strip() for v in values))
+        return sorted(set(v.strip() for v in values))
     products, questions, engines = strings(product_keys, 50), strings(queries, 8), strings(providers, 3)
     if any(p not in PROVIDERS for p in engines):
         raise ValueError('Consumer capture requires supported real providers')
@@ -84,3 +85,11 @@ async def execute_plan(plan, *, retained, checkpoint, probe):
             state['jobs'][job['id']] = {'status': 'completed', 'result': result}
         await checkpoint(json.loads(json.dumps(state)))
     return state
+
+
+def plan_for_launch(*, product_keys, queries, providers):
+    if not queries:
+        return None
+    if os.getenv('PIVOTA_CONSUMER_ANSWER_ENABLED') != 'true':
+        raise ValueError('Consumer answer capture is not enabled')
+    return build_plan(product_keys=product_keys, queries=queries, providers=providers)

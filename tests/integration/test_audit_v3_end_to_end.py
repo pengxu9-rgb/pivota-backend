@@ -696,3 +696,49 @@ async def test_v3_audit_concurrent_idempotency_single_debit(audit_harness):
     assert sorted(body["idempotent_replay"] for body in bodies) == [False, True]
     assert len(store.rows) == 1
     assert [debit["kind"] for debit in store.debits] == ["audit"]
+
+
+@pytest.mark.asyncio
+async def test_consumer_capture_launch_worker_and_report_are_connected(audit_harness,monkeypatch):
+    import hashlib,json
+    from services import consumer_capture_worker as capture
+    from services.consumer_answer_evidence import SYSTEM
+    store,app,worker=audit_harness
+    monkeypatch.setenv('PIVOTA_CONSUMER_ANSWER_ENABLED','true')
+    original=capture.agent_center_llm_client.probe
+    calls=[]
+    async def probe(**kw):
+        if kw['scan_mode']!='consumer_answer_test':
+            return await original(**kw)
+        calls.append(kw)
+        query=kw['context']['queries'][0]; text='A useful shopping answer.'
+        return {'provider':kw['provider'],'raw_runs':[{
+            'query':query,'evidence_kind':'consumer_answer','prompt_contract':'consumer_query_v1',
+            'answer':{'text':text,'sha256':hashlib.sha256(text.encode()).hexdigest(),
+                      'prompt_sha256':hashlib.sha256(json.dumps([SYSTEM,query],ensure_ascii=False,separators=(',',':')).encode()).hexdigest(),
+                      'complete':True,'status':'complete','provider':kw['provider'],'model':'fixture',
+                      'finish_reason':'STOP' if kw['provider']=='gemini' else 'completed'},
+            'grounding_sources':[],
+        }]}
+    async def checkpoint(**kw):
+        partial=store.rows[kw['run_id']]['partial_result_jsonb']
+        assert partial.get('consumer_capture')==kw['previous']
+        assert partial['launch']['consumer_capture_plan']['sha256']==kw['plan_sha256']
+        partial['consumer_capture']=deepcopy(kw['state'])
+    monkeypatch.setattr(capture.agent_center_llm_client,'probe',probe)
+    monkeypatch.setattr(capture,'save_checkpoint',checkpoint)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://test') as client:
+        created=await client.post('/api/audits',json={'merchant_id':'merch-A','product_keys':['pk-1'],
+            'providers':['gemini'],'consumer_answer_queries':['best serum']})
+        assert created.status_code==202,created.text
+        assert await worker.process_one_audit_run() is True
+        fetched=await client.get('/api/audits/'+created.json()['run_id'])
+    assert fetched.status_code==200,fetched.text
+    assert fetched.json()['stage']=='completed'
+    report=fetched.json()['report_jsonb']
+    assert len(calls)==1
+    assert calls[0]['context']=={'queries':['best serum']}
+    assert len(report['consumer_selection_observations'])==1
+    assert report['consumer_selection_observations'][0]['evidence_kind']=='consumer_answer'
+    assert len(report['per_sku_reports'])==1
+    assert set(report['per_sku_reports'][0]['scores'])=={'identity','content_richness','routability','citation'}

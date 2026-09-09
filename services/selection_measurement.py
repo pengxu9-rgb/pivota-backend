@@ -162,7 +162,9 @@ def selection_measurement(observations):
 def report_observations(report: Mapping[str, Any]):
     """Read retained observations without inventing historical answer evidence."""
     rows = []
-    for sku in report.get("per_sku_reports") or []:
+    containers = list(report.get("per_sku_reports") or [])
+    containers.append({"selection_observations": report.get("consumer_selection_observations") or []})
+    for sku in containers:
         if not isinstance(sku, dict):
             continue
         for original in sku.get("selection_observations") or []:

@@ -621,6 +621,31 @@ async def _process_one_audit_run_inner(
                         audit_run_id=run_id,
                         prior_runs=prior_runs,
                     )
+                consumer_plan = launch_options.get("consumer_capture_plan")
+                if consumer_plan:
+                    from services.consumer_capture_worker import (
+                        capture_for_leased_run, observations_for_capture, CaptureCheckpointRejected,
+                    )
+                    latest = await mar.fetch_audit_run_by_id(run_id=run_id)
+                    partial = (latest or {}).get("partial_result_jsonb") or {}
+                    try:
+                        captured = await capture_for_leased_run(
+                            run_id=run_id, merchant_id=merchant_id, worker_id=WORKER_ID,
+                            plan=consumer_plan, retained=partial.get("consumer_capture"),
+                        )
+                    except CaptureCheckpointRejected:
+                        # Another owner/cancellation must not trigger our refund
+                        # path or let this stale worker advance the report.
+                        logger.warning("consumer capture checkpoint rejected run_id=%s", run_id)
+                        return True
+                    brand_report["consumer_selection_observations"] = observations_for_capture(
+                        consumer_plan, captured, merchant_brand=str(merchant_name), merchant_host=merchant_domain,
+                    )
+                    brand_report["consumer_capture_summary"] = {
+                        "plan_sha256": consumer_plan["sha256"],
+                        "attempted": len(consumer_plan["jobs"]),
+                        "uncertain": sum(v.get("status") == "started" for v in captured["jobs"].values()),
+                    }
             finally:
                 heartbeat_task.cancel()
                 # Don't await — fire-and-forget cancellation.
