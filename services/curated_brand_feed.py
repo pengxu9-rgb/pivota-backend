@@ -29,7 +29,16 @@ from services import storefront_currency
 
 from services.retailer_ingest.sitemap_crawler import _looks_like_inci_list
 from services import crawl_politeness
+from services.pdp_category_classifier import fold_category_from_variants
 from services.variant_identity import MERCHANT_ISSUED, variant_id_provenance
+
+# Provenance for a row whose category came from the operator's --category flag rather than from
+# the product itself. It is a per-DOMAIN default, so it cannot be right for every product in a
+# catalogue that spans lipstick, mascara and moisturiser — naming it keeps that visible in the
+# data instead of laundering it through the generic enrichment-agent source.
+CATEGORY_SOURCE_FEED_DEFAULT = "curated_feed_flag"
+# Deliberately low: this value is a fallback, not a classification.
+CATEGORY_CONFIDENCE_FEED_DEFAULT = 0.3
 
 logger = logging.getLogger("curated_brand_feed")
 
@@ -1072,11 +1081,48 @@ def shopify_product_to_record(
         else [t.strip() for t in str(raw_tags or "").split(",") if t.strip()]
     )
     canonical_url = f"https://{host}/products/{handle}"
+    # PER-PRODUCT category, not the per-domain --category flag.
+    #
+    # `category_path` here is one value chosen by an operator for a whole storefront, and a brand
+    # catalogue spans lipstick, mascara, foundation and skincare, so no single value can be right
+    # for every row. Stamping it wholesale is what put 3,536 of this lane's 3,557 prod rows at
+    # DEPTH 2 (`beauty/makeup`), where recall — which resolves a hard prefix like
+    # `beauty/makeup/lip/` — cannot reach them: measured 2026-09-09, a "matte lipstick" query
+    # returned 33 rows and not one of MAC's 286, Stila's 124 or Tarte's 249.
+    #
+    # `category` is passed as None ON PURPOSE. The flag is the FALLBACK, not an input to the
+    # classification — feeding it in would let a depth-2 value match a pattern and short-circuit
+    # before the title is ever tried, re-deriving the bug from inside the fix.
+    #
+    # Regex + variant only (no LLM): this is a pure mapping function and must not make network
+    # calls. Measured against the 3,557 rows this lane already wrote, it resolves 72.8% — and
+    # that is a FLOOR, because those rows carry a product_type back-derived from the flag
+    # (`"makeup"`), whereas a live feed carries the storefront's own. The remaining tail keeps
+    # the flag value and can be lifted later by fold_category_with_llm_fallback or by
+    # scripts/backfill_pdp_category_path.py.
+    resolved = fold_category_from_variants(
+        category=None,
+        product_type=product.get("product_type"),
+        title=title,
+        variants=variants,
+    )
+    if resolved is not None:
+        (_category_label, resolved_path), category_source, category_confidence = resolved
+    else:
+        resolved_path = category_path
+        category_source = CATEGORY_SOURCE_FEED_DEFAULT
+        category_confidence = CATEGORY_CONFIDENCE_FEED_DEFAULT
     return {
         "pdp": {
             "brand": brand,
             "product_name": title,
-            "category_path": category_path,
+            "category_path": resolved_path,
+            # Honest provenance. Every Path-C row previously landed
+            # category_label_source='enrichment_agent_v1' / confidence 0.7 regardless of where the
+            # category actually came from, which claimed the agent had decided something an
+            # operator had typed.
+            "category_label_source": category_source,
+            "category_confidence": category_confidence,
             # Brand-authored body copy when present (it becomes the row's
             # description and feeds the lifecycle candidate gate + taxonomy
             # extractors); product_type alone otherwise. Rows minted without

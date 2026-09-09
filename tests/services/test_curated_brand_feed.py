@@ -21,12 +21,65 @@ def _product(**over):
     return base
 
 
+def test_category_is_classified_per_product_not_stamped_from_the_flag():
+    """The defect this guards: one --category value stamped across a whole storefront put 3,536
+    of 3,557 prod rows at depth 2 (`beauty/makeup`), which recall cannot reach because it
+    resolves a hard prefix like `beauty/makeup/lip/`. Different products from the SAME call must
+    land on different leaf paths."""
+    lipstick = shopify_product_to_record(
+        _product(title="Retro Matte Lipstick", handle="retro-matte", product_type=None),
+        domain="maccosmetics.com", category_path="beauty/makeup")
+    mascara = shopify_product_to_record(
+        _product(title="Extended Play Gigablack Lash Mascara", handle="gigablack",
+                 product_type=None),
+        domain="maccosmetics.com", category_path="beauty/makeup")
+
+    assert lipstick["pdp"]["category_path"] == "beauty/makeup/lip/lipstick"
+    assert mascara["pdp"]["category_path"] == "beauty/makeup/eye/mascara"
+    # The control that makes this test able to fail: the two rows came from ONE category_path
+    # argument, so an implementation that passed the flag through would make them equal.
+    assert lipstick["pdp"]["category_path"] != mascara["pdp"]["category_path"]
+    # And both are deeper than the flag, which is the property recall actually needs.
+    for rec in (lipstick, mascara):
+        assert len(rec["pdp"]["category_path"].split("/")) > len("beauty/makeup".split("/"))
+
+
+def test_unclassifiable_product_keeps_the_flag_but_says_so():
+    """The fallback must stay honest: it is the operator's per-domain guess, not a classification,
+    and it must not borrow the confidence of one."""
+    rec = shopify_product_to_record(
+        _product(title="Mystery Widget 3000", handle="mystery", product_type=None,
+                 tags=[]),
+        domain="x.com", category_path="beauty/makeup")
+    pdp = rec["pdp"]
+    assert pdp["category_path"] == "beauty/makeup"
+    assert pdp["category_label_source"] == cbf.CATEGORY_SOURCE_FEED_DEFAULT
+    assert pdp["category_confidence"] == cbf.CATEGORY_CONFIDENCE_FEED_DEFAULT
+    # Not the classified confidence, and not the historic blanket 0.7.
+    assert pdp["category_confidence"] < 0.7
+
+
+def test_flag_is_not_fed_into_the_classifier():
+    """Passing the flag in as `category` would let a depth-2 value match a pattern and
+    short-circuit before the title is tried — re-deriving the bug from inside the fix. A flag
+    that names a category must not override a title that names a more specific one."""
+    rec = shopify_product_to_record(
+        _product(title="Retro Matte Lipstick", handle="rml", product_type=None),
+        domain="x.com", category_path="beauty/makeup/eye/mascara")
+    assert rec["pdp"]["category_path"] == "beauty/makeup/lip/lipstick"
+
+
 def test_maps_shopify_product_to_validated_record():
     rec = shopify_product_to_record(_product(), domain="cosrx.com", category_path="beauty/skincare/cleanser")
     pdp, offers = rec["pdp"], rec["offers"]
     assert pdp["brand"] == "COSRX"
     assert pdp["product_name"] == "Snail Mucin Gel Cleanser"
-    assert pdp["category_path"] == "beauty/skincare/cleanser"
+    # NOT the "beauty/skincare/cleanser" passed in: the mapper classifies PER PRODUCT and the
+    # canonical taxonomy path for a cleanser is beauty/skincare/CLEANSE/cleanser. The argument is
+    # a per-domain fallback, so a caller-supplied path that disagrees with the product loses.
+    assert pdp["category_path"] == "beauty/skincare/cleanse/cleanser"
+    assert pdp["category_label_source"] == "merchant_payload"
+    assert pdp["category_confidence"] == 1.0
     assert pdp["barcode"] == "8809416470016"  # GTIN carried (strongest deposit basis)
     assert pdp["source_domain"] == "cosrx.com"
     assert pdp["tags"] == ["k-beauty", "cleanser"]
@@ -1966,3 +2019,50 @@ async def test_a_politeness_gate_that_REFUSES_yields_no_blurb(monkeypatch):
 
     assert await cbf.fetch_shop_description_from_meta("jsmbeauty.sg") is None
     assert fetched == [], "the gate refused, so no request may reach the merchant host"
+
+
+# --- the seam the mapper's work has to survive -----------------------------------------------
+# _build_pdp_payload is a WHITELIST: a key absent from it is dropped no matter what the record
+# carried. The currency passthrough was already lost that way once. These pin that the category
+# classification and its provenance actually reach the row insert.
+
+def test_pdp_payload_whitelist_carries_category_provenance():
+    from services.catalog_enrichment_agent.ingestion import _build_pdp_payload
+    rec = shopify_product_to_record(
+        _product(title="Retro Matte Lipstick", handle="rml", product_type=None),
+        domain="maccosmetics.com", category_path="beauty/makeup")
+    payload = _build_pdp_payload(rec)
+    assert payload["category_path"] == "beauty/makeup/lip/lipstick"
+    assert payload["category_label_source"] == "merchant_payload"
+    assert payload["category_confidence"] == 1.0
+
+
+def test_row_insert_prefers_lane_provenance_over_the_blanket_default():
+    """Before this change every Path-C row claimed enrichment_agent_v1 / 0.7 regardless of where
+    the category came from. The lane's own determination must win, and the default must still
+    apply for lanes that do not classify."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    classified = ing._build_pdp_payload(shopify_product_to_record(
+        _product(title="Retro Matte Lipstick", handle="rml", product_type=None),
+        domain="x.com", category_path="beauty/makeup"))
+    assert classified["category_label_source"] == "merchant_payload"
+
+    # A lane that supplies nothing keeps the historic default rather than writing None.
+    bare = ing._build_pdp_payload({
+        "pdp": {"brand": "B", "product_name": "P", "category_path": "beauty/makeup"},
+        "offers": [],
+    })
+    assert bare["category_label_source"] is None
+    assert bare["category_confidence"] is None
+
+
+def test_category_confidence_coercion_rejects_junk_but_keeps_zero():
+    from services.catalog_enrichment_agent.ingestion import _category_confidence_or_none
+    assert _category_confidence_or_none(None) is None
+    assert _category_confidence_or_none("not-a-number") is None
+    assert _category_confidence_or_none(float("nan")) is None
+    assert _category_confidence_or_none(0.0) == 0.0      # a real confidence, not "missing"
+    assert _category_confidence_or_none("0.85") == 0.85
+    assert _category_confidence_or_none(7) == 1.0        # clamped
+    assert _category_confidence_or_none(-3) == 0.0
