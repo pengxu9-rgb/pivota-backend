@@ -649,3 +649,50 @@ def test_fold_handles_none_variants() -> None:
     assert result is not None
     (label, _path), _, _ = result
     assert label == "Foundation"
+
+
+# --- --include-shallow: the widened mode -----------------------------------------------------
+
+def test_depth_counts_segments_and_treats_blank_as_zero():
+    from scripts.backfill_pdp_category_path import _depth
+    assert _depth(None) == 0
+    assert _depth("") == 0
+    assert _depth("beauty") == 1
+    assert _depth("beauty/makeup") == 2
+    assert _depth("beauty/makeup/lip/lipstick") == 4
+
+
+def test_classification_inputs_drop_the_echo_of_the_stored_leaf():
+    """category/product_type are derived from category_path's leaf by the ingest writer, so on a
+    shallow row they echo the value being replaced. resolve_path_from_row tries category FIRST, so
+    feeding the echo back would let the bad path re-derive itself and short-circuit the title."""
+    from scripts.backfill_pdp_category_path import _classification_inputs
+    cat, ptype = _classification_inputs({
+        "category_path": "beauty/makeup", "category": "makeup",
+        "product_type": "Makeup", "title": "Retro Matte Lipstick"})
+    assert cat is None
+    assert ptype is None  # matched case-insensitively
+
+
+def test_classification_inputs_keep_what_the_merchant_actually_said():
+    """Only an exact echo is dropped. A real merchant product_type is the most authoritative
+    signal available and must survive."""
+    from scripts.backfill_pdp_category_path import _classification_inputs
+    cat, ptype = _classification_inputs({
+        "category_path": "beauty/makeup", "category": "makeup",
+        "product_type": "Lipstick", "title": "Retro Matte"})
+    assert cat is None
+    assert ptype == "Lipstick"
+
+
+def test_shallow_predicate_is_opt_in():
+    """The default must stay NULL-only: this script has been run before, and silently widening its
+    blast radius would surprise whoever runs it next."""
+    import inspect
+    from scripts.backfill_pdp_category_path import _fetch_batch, MIN_ROUTABLE_DEPTH
+    src = inspect.getsource(_fetch_batch)
+    assert "category_path IS NULL" in src
+    assert "include_shallow" in src
+    assert MIN_ROUTABLE_DEPTH == 3
+    # the shallow clause must be reachable ONLY through the flag
+    assert src.index("predicate = \"category_path IS NULL\"") < src.index("if include_shallow:")
