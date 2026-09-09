@@ -336,12 +336,33 @@ SHADOW_REPORT_SQL = """
 #:     (search cards), _build_prefetched_external_seed_wrappers and mint_external_seed_links
 #:     publish the SAME pre-filled cart_url and are NOT gated — the search lane is the larger
 #:     surface, and gating the shared chokepoint is follow-up work;
-#:   * within that lane, only CART-PREFILLED handoffs are asked about. Referral-only offers are
-#:     left alone deliberately (see the call site), so they appear in no row at all.
+#:   * within that lane, the asked population is a UNION: handoffs whose merchant-issued
+#:     variant we could name, PLUS handoffs that would hand the buyer a cart. #2151 moved this
+#:     off "cart-prefilled" alone, because a cart also needs storefront evidence stored on 0 of
+#:     11,824 active seeds and keying on it left this denominator empty by construction; it is
+#:     a union rather than a swap because the attach lane ships carts built from an
+#:     operator-typed `attached_variant_id` for which no `catalog_skus` row exists, and keying
+#:     on the resolved id alone would have stopped gating the only carts that exist today.
+#:     BOTH HALVES MATTER TO THIS RATE. The second half admits handoffs carrying an id this
+#:     backend would NOT call merchant-issued, and those are refused at step 1 of `preflight`
+#:     with `no_merchant_issued_variant_id` before any merchant is contacted — so they inflate
+#:     `would_block` with a statement about OUR OWN operator data, not about the merchant's
+#:     stock. Group by reason before reading the rate;
+#:   * the widened population is dominated by storefronts `live_offer_verification._check_one`
+#:     STRUCTURALLY CANNOT READ. `storefront_is_shopify` is false on every active seed, so a
+#:     host that does not answer a parseable `/products/<handle>.js` yields
+#:     `not_a_known_shopify_storefront` -> UNVERIFIED -> UNVERIFIABLE -> would_block=True. Read
+#:     `would_block_rate` WITHOUT separating that class out and it approaches 1.0 for a reason
+#:     that is about our own evidence, not about the merchant's stock.
 #: A reader who takes this rate as "how often an external offer is stale" will be wrong twice.
 REPORT_SCOPE = (
-    "offers.resolve external-seed lane, cart-prefilled handoffs only; "
+    "offers.resolve external-seed lane; the asked population is the UNION of handoffs with a "
+    "resolved merchant-issued variant id and handoffs that would hand the buyer a cart "
+    "(see #2151) — so it is neither 'cart-prefilled only' nor 'resolved-identity only'; "
     "search/prefetch/mint lanes not gated; "
+    "two classes inflate would_block for reasons that are about US, not the merchant: an id we "
+    "do not call merchant-issued is blocked at step 1 with no request made, and a storefront we "
+    "cannot read answers unverifiable — group by reason before reading the rate; "
     "within a request, the first N distinct (pdp_url, variant) questions in seed-row order — "
     "rate is over questions ASKED, not over candidates offered"
 )

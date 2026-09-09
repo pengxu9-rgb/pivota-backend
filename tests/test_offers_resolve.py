@@ -4481,7 +4481,7 @@ def test_the_resolve_emits_its_preflight_coverage(
     rec = next((r for r in caplog.records
                 if getattr(r, "event", None) == "offers.resolve.summary"), None)
     assert rec is not None, "the summary record is the carrier for coverage"
-    assert getattr(rec, "preflight_cart_prefilled", 0) > 0, (
+    assert getattr(rec, "preflight_gated", 0) > 0, (
         "the request ended without reading its own counters — the coverage denominator does "
         "not exist")
     assert hasattr(rec, "preflight_answered_fraction")
@@ -4523,13 +4523,20 @@ def test_a_referral_only_request_attaches_no_coverage(
     assert not any(k.startswith("preflight_") for k in vars(rec)), (
         "the gate applied to nothing on this request; a coverage field here is a 0.000 that "
         "someone will read as 'the gate covers nothing'")
-    assert rec.getMessage() == "offers.resolve.summary"
+    assert " preflight " not in rec.getMessage(), (
+        "the preflight half of the message must be absent for the same reason the fields are")
+    # #2151: the HAND-OVER half is present, and deliberately so. It is the answer to "why did
+    # the gate apply to nothing", and suppressing it on exactly the requests where everything
+    # was refused would hide the only population worth reading. It carries no preflight_ field
+    # and no fraction anyone can mistake for gate coverage.
+    assert "handover considered=12" in rec.getMessage()
+    assert "resolved=0" in rec.getMessage()
 
 
-def test_a_mixed_request_counts_only_cart_prefilled_rows_in_the_denominator(
+def test_a_mixed_request_counts_only_gated_rows_in_the_denominator(
     monkeypatch: pytest.MonkeyPatch, client: TestClient, caplog
 ) -> None:
-    """candidates counts every seed offer; cart_prefilled only the ones the gate applies to."""
+    """candidates counts every seed offer; `gated` only the ones the gate applies to."""
     import logging
 
     asked = _preflight_harness(monkeypatch, rows={"n_rows": 4, "variants_per_row": 3},
@@ -4541,12 +4548,14 @@ def test_a_mixed_request_counts_only_cart_prefilled_rows_in_the_denominator(
     rec = _summary_record(caplog)
     assert rec is not None and asked
     assert rec.preflight_candidates == 12
-    assert rec.preflight_cart_prefilled == 6
-    assert rec.preflight_candidates > rec.preflight_cart_prefilled
+    assert rec.preflight_gated == 6
+    assert rec.preflight_carts_built == 6
+    assert rec.preflight_candidates > rec.preflight_gated
     assert rec.preflight_answered_fraction == 1.0
     # and the values are in the MESSAGE, not only in `extra`, which no formatter here renders
     msg = rec.getMessage()
-    assert "cart_prefilled=6" in msg and "answered_fraction=1.000" in msg and "mode=shadow" in msg
+    assert "gated=6" in msg and "carts_built=6" in msg
+    assert "answered_fraction=1.000" in msg and "mode=shadow" in msg
 
 
 def test_no_coverage_line_when_the_preflight_is_off(
