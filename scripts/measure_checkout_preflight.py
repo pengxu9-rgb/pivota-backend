@@ -96,6 +96,7 @@ SELECT_SEEDS_SQL = """
     SELECT e.id,
            e.attached_product_key,
            e.external_product_id,
+           e.attached_variant_id,
            e.seed_data,
            COALESCE(NULLIF(e.canonical_url, ''), e.destination_url) AS url
     FROM external_product_seeds e
@@ -127,12 +128,24 @@ def _seed_data_of(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 def _merchant_id_of(product_key: Any) -> Optional[str]:
-    """`prod::{merchant_id}::{platform}::{handle}` — the same parse the route does."""
+    """The merchant id embedded in a `prod::{merchant}::{platform}::{handle}` key, or None.
+
+    NOT a copy of the route's parser, and the earlier docstring claiming it was is the reason to
+    say so: the route has its own tolerances. This is deliberately strict — four `::` segments
+    with a `prod` head — because a wrong value in this column is worse than a null one. Live rows
+    fill it with a merchant id, so anything else here makes the two sources unjoinable per
+    merchant, which is most of what the source split is for.
+    """
     parts = str(product_key or "").split("::")
-    return parts[1][:64] if len(parts) >= 2 and parts[1] else None
+    if len(parts) < 4 or parts[0] != "prod" or not parts[1]:
+        return None
+    return parts[1][:64]
 
 
-def _offer_for(row: Dict[str, Any], variant_id: str, seed_data: Dict[str, Any]) -> Dict[str, Any]:
+def _offer_for(
+    row: Dict[str, Any], variant_id: str, seed_data: Dict[str, Any],
+    *, product_key: Optional[str] = None,
+) -> Dict[str, Any]:
     """The offer shape `checkout_preflight` reads, built from the seed the route would serve.
 
     `source.seed_data` is load-bearing and not decoration: `_check_one` refuses to conclude `gone`
@@ -142,13 +155,16 @@ def _offer_for(row: Dict[str, Any], variant_id: str, seed_data: Dict[str, Any]) 
     """
     return {
         "offer_id": f"sweep:{row['id']}",
-        "product_key": row.get("attached_product_key") or None,
+        # The key the RESOLVER used, not the row column. `_handover_product_key` falls back to
+        # the seed document, so reading the column here recorded `product_key: None` for
+        # hand-overs the resolver had keyed perfectly well.
+        "product_key": product_key or row.get("attached_product_key") or None,
         "source_product_id": row.get("external_product_id") or None,
         "sku_key": None,
         # The ROUTE's vocabulary — the pivota merchant id embedded in the product key — not the
         # hostname. Writing a hostname into a column the live rows fill with a merchant id makes
         # the two sources unjoinable per merchant, which is most of what the split is for.
-        "merchant_id": _merchant_id_of(row.get("attached_product_key")),
+        "merchant_id": _merchant_id_of(product_key or row.get("attached_product_key")),
         "currency": None,
         "merchant_effective_price": None,
         "execution_spec": {"pdp_url": row.get("url"), "variant_id": variant_id},
@@ -161,6 +177,43 @@ def _handover_key(row: Dict[str, Any], seed_data: Dict[str, Any]) -> Optional[st
     from routes.agent_shop_gateway import _handover_product_key
 
     return _handover_product_key(row, seed_data)
+
+
+def _route_variants(seed_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The variant entries the route walks, from the route.
+
+    The route resolves PER VARIANT and the first cut of this script resolved once per row with
+    `offer_variant_id=None`. Review showed that answers differently in BOTH directions: a product
+    with two live merchant-issued SKUs is refused here as `multiple_merchant_issued_skus` while
+    the route names each of them by exact match, and a product with one candidate whose seed names
+    a DIFFERENT id is refused by the route as a contradiction while this script happily returned
+    the candidate. Under-measuring one cohort and over-measuring another is precisely the
+    population drift the lane exists to avoid.
+    """
+    from routes.agent_shop_gateway import _seed_variants
+
+    variants = _seed_variants(seed_data)
+    # The route caps what it walks; an uncapped sweep would ask about hand-overs no request can
+    # produce, and one 200-variant product would dominate a page.
+    return (variants[:12] or [{}])
+
+
+def _cart_lane_variant_id(row: Dict[str, Any], seed_data: Dict[str, Any]) -> Optional[str]:
+    """The OTHER half of the route's gate: `_gate_vid = _handover_id or _cart_vid`.
+
+    The attach branch ships `_catalog_vid or _operator_vid` for a seed the route labels shopify,
+    and the route gates that cart even when no `catalog_skus` row resolved — 67.1% of the corpus
+    has no such row, and the route's own comment calls this "the only carts that exist today".
+    Measuring only the resolved half reports a refusal rate for the cohort that is not shipping
+    carts and stays silent about the one that is.
+    """
+    from routes.agent_shop_gateway import extract_shopify_numeric_variant_id
+
+    snapshot = seed_data.get("snapshot") if isinstance(seed_data, dict) else None
+    platform = str((snapshot or {}).get("storefront_platform") or "").strip().lower()
+    if platform != "shopify":
+        return None
+    return extract_shopify_numeric_variant_id(row.get("attached_variant_id")) or None
 
 
 async def run(limit: int, after: Optional[str], apply: bool, run_id: str) -> Dict[str, Any]:
@@ -179,6 +232,11 @@ async def run(limit: int, after: Optional[str], apply: bool, run_id: str) -> Dic
     # catalog had CONSIDERED and REFUSED candidates, which is the conditional fallback the
     # resolver explicitly forbids. A measurement whose population diverges from the gate it
     # informs is worse than no measurement, and reimplementation is how it diverges.
+    from routes.agent_shop_gateway import (  # noqa: PLC0415 - route-local readers, by design
+        _seed_offer_variant_id,
+        _seed_variant_identity_claim,
+    )
+
     prepared: List[Tuple[Dict[str, Any], Dict[str, Any], Optional[str]]] = []
     skipped: Counter = Counter()
     for row in rows:
@@ -195,32 +253,48 @@ async def run(limit: int, after: Optional[str], apply: bool, run_id: str) -> Dic
     reasons: Counter = Counter()
     lanes: Counter = Counter()
     per_host_blocks: Counter = Counter()
-    block_streak: List[str] = []
+    block_window: List[str] = []
     aborted = False
     abort_hosts: List[str] = []
     asked = 0
     last_call = 0.0
 
     for row, seed_data, key in prepared:
-        handover = resolver.choose(
-            product_key=key,
-            product_id=row.get("external_product_id"),
-            seed_data=seed_data,
-            offer_variant_id=None,
-        )
-        if not handover.variant_id:
+        # PER VARIANT, exactly as the route does, passing the same two ids: the broad one may
+        # MATCH a candidate, the narrow one may CONTRADICT it.
+        gate_vid: Optional[str] = None
+        gate_lane = "no_identity"
+        for v in _route_variants(seed_data):
+            handover = resolver.choose(
+                product_key=key,
+                product_id=row.get("external_product_id"),
+                seed_data=seed_data,
+                offer_variant_id=_seed_offer_variant_id(v) or None,
+                named_variant_id=_seed_variant_identity_claim(v),
+            )
+            if handover.variant_id:
+                gate_vid, gate_lane = handover.variant_id, handover.reason
+                break
+            gate_lane = handover.reason
+        if not gate_vid:
+            # The route's gate is a UNION, so the cart lane is asked before giving up.
+            cart_vid = _cart_lane_variant_id(row, seed_data)
+            if cart_vid:
+                gate_vid, gate_lane = cart_vid, "cart_operator_id"
+        if not gate_vid:
             # NOT an outcome. These are the hand-overs the gate is blind to by design, and
             # folding them into the refusal rate reports our coverage as the merchants' verdict.
-            skipped[handover.reason] += 1
+            skipped[gate_lane] += 1
             continue
-        lanes[handover.reason] += 1
+        lanes[gate_lane] += 1
+        handover_variant_id = gate_vid
 
         gap = GLOBAL_MIN_INTERVAL_S - (time.monotonic() - last_call)
         if gap > 0:
             await asyncio.sleep(gap)
         last_call = time.monotonic()
 
-        offer = _offer_for(row, handover.variant_id, seed_data)
+        offer = _offer_for(row, handover_variant_id, seed_data, product_key=key)
         host = urlparse(str(row.get("url") or "")).hostname or "unknown"
         if apply:
             verdict = await checkout_preflight.preflight_and_record(
@@ -234,22 +308,32 @@ async def run(limit: int, after: Optional[str], apply: bool, run_id: str) -> Dic
 
         if verdict.reason in _LOOKS_LIKE_A_BLOCK:
             per_host_blocks[host] += 1
-            block_streak.append(host)
+            # A BOUNDED SLIDING WINDOW OF THE LAST N BLOCKED HOSTS, and nothing cleverer.
+            #
             # ONE DEAD STOREFRONT IS NOT AN IP BLOCK, and seeds are id-ordered which clusters a
-            # brand's rows together — so a bare consecutive count aborts on ordinary catalog rot
-            # and reports one dead merchant as a 100% refusal rate. The variant backfill needed
-            # exactly this distinction and the first cut of this script only claimed to have it:
-            # `per_host_blocks` was computed and never read. A block is cross-domain.
-            if len(block_streak) >= CONSECUTIVE_BLOCK_ABORT:
-                if len(set(block_streak[-CONSECUTIVE_BLOCK_ABORT:])) >= _ABORT_DISTINCT_HOSTS:
-                    aborted = True
-                    abort_hosts = sorted(set(block_streak[-CONSECUTIVE_BLOCK_ABORT:]))
-                    break
-                # Same host over and over: drop it from the streak and keep going, so one dead
-                # brand cannot halt a healthy sweep.
-                block_streak = [h for h in block_streak if h != block_streak[-1]]
+            # brand's rows together, so a bare consecutive count aborts on ordinary catalog rot
+            # and reports one dead merchant as a 100% refusal rate. But the first attempt at the
+            # distinction was worse than none: it pruned `block_streak[-1]`, which is whatever
+            # host just ARRIVED, so a dead brand's rows sat in the window permanently and every
+            # genuinely new blocked host was the one thrown away. A real cross-domain block could
+            # then never be detected — review reproduced 40 distinct blocked hosts after a
+            # 9-row dead prefix with `aborted_on_block: false`, a clean `would_block_rate: 1.0`,
+            # exit 0, and a resume cursor, while still firing a request per row into a live 429.
+            #
+            # A window needs no pruning rule: a dead brand ages out on its own as new hosts
+            # arrive, and a spread of hosts fills it. That is the whole heuristic.
+            block_window.append(host)
+            if len(block_window) > CONSECUTIVE_BLOCK_ABORT:
+                block_window.pop(0)
+            if (len(block_window) >= CONSECUTIVE_BLOCK_ABORT
+                    and len(set(block_window)) >= _ABORT_DISTINCT_HOSTS):
+                aborted = True
+                abort_hosts = sorted(set(block_window))
+                break
         else:
-            block_streak = []
+            # One good answer clears it. A dead handle between two live ones is ordinary catalog
+            # rot (6.7% of a live sample), not evidence about our address.
+            block_window = []
 
     # THE ANSWERED DENOMINATOR, not every refusal. `checkout_preflight.NO_CONTACT_REASONS` exists
     # because counting refusals decided without contacting a merchant reads 0.99 where the
@@ -288,12 +372,23 @@ async def run(limit: int, after: Optional[str], apply: bool, run_id: str) -> Dic
 
 
 async def _egress_ip() -> Optional[str]:
-    """Which address this process actually leaves by. One request, to an IP echo, no data sent."""
+    """Which address this process actually leaves by, or None. One request, no data sent.
+
+    RETURNS AN IP OR NOTHING. The first cut returned `.text.strip()` unchecked, so an HTML error
+    body from the echo service — `<html><body>503 Service Unavailable</body></html>` — was not
+    equal to the payment address and therefore counted as proof it was safe to sweep. That string
+    is the only thing standing between "SUBNET forgotten" and a corpus crawl out of the
+    payment-allowlisted IP, so anything that is not a parseable address must read as unknown.
+    """
+    import ipaddress
+
     import httpx
 
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            return (await client.get("https://api.ipify.org")).text.strip()
+            resp = await client.get("https://api.ipify.org")
+            resp.raise_for_status()
+            return str(ipaddress.ip_address(resp.text.strip()))
     except Exception:  # noqa: BLE001
         return None
 
@@ -345,6 +440,13 @@ def main() -> int:
         ))
 
     run_id = args.run_id or f"sweep-{int(time.time())}-{uuid.uuid4().hex[:8]}"
+
+    # PRINTED BEFORE THE FIRST ROW. The summary at the end is the only other place this appears,
+    # and a TASK_TIMEOUT kill loses it while the rows are already committed — leaving exactly the
+    # partial run the tag exists to exclude, untaggable. `--limit 400` at a 20s deadline can
+    # exceed a 2400s task timeout, so this is the likely case, not the unlucky one.
+    print(json.dumps({"run_id": run_id, "mode": "apply" if args.apply else "dry_run",
+                      "egress_ip": ip, "limit": args.limit, "after": args.after}), flush=True)
 
     async def _main() -> Dict[str, Any]:
         await database.connect()

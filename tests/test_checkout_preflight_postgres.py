@@ -244,3 +244,59 @@ async def test_the_two_sources_are_reported_apart(db):
     by = {r["reason"]: r for r in report["by_reason"]}
     assert int(by[cp.R_GONE]["n"]) == 3, "one line for merchant_says_gone across both sources"
     assert int(by[cp.R_OK]["n"]) == 3
+
+
+async def test_the_schema_guard_adds_the_columns_to_an_old_table(db):
+    """EXECUTED, not grepped. prod's table predates `source`/`run_id`, and `create_all` does not
+    ALTER an existing table — so without the heal every INSERT fails on an unknown column and
+    `record()` swallows it, which is how shadow mode would have gone quiet.
+
+    A substring assertion on schema_guard.py's text is satisfied by `run_idx`; this asserts the
+    columns actually appear on a real table that did not have them.
+    """
+    from db.schema_guard import ensure_required_schema_light
+
+    await db.execute("ALTER TABLE checkout_preflight_observations DROP COLUMN IF EXISTS source")
+    await db.execute("ALTER TABLE checkout_preflight_observations DROP COLUMN IF EXISTS run_id")
+    missing = await db.fetch_all(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_name = 'checkout_preflight_observations'")
+    assert "source" not in {dict(r)["column_name"] for r in missing}
+
+    await ensure_required_schema_light()
+
+    cols = {dict(r)["column_name"] for r in await db.fetch_all(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_name = 'checkout_preflight_observations'")}
+    assert "source" in cols and "run_id" in cols
+
+    # ...and the heal is idempotent, because it runs on every boot.
+    await ensure_required_schema_light()
+
+    # ...and a write now lands, which is the thing that was silently failing.
+    await cp.record(
+        cp.PreflightVerdict(outcome=cp.OK, reason=cp.R_OK, would_block=False, mode=cp.MODE_SHADOW),
+        _offer(), source=cp.SOURCE_SWEEP, run_id="heal-check")
+    row = dict(await db.fetch_one(
+        "SELECT source, run_id FROM checkout_preflight_observations WHERE run_id = 'heal-check'"))
+    assert row["source"] == cp.SOURCE_SWEEP
+
+
+async def test_the_folded_report_keeps_the_latency_it_measured(db):
+    """MUTANT: drop avg_latency_ms in the fold.
+
+    The SQL still computes it and the fold silently discarded it, losing the only signal that
+    says whether a refusal was slow (a timeout we caused) or instant (a merchant saying no).
+    Weighted across sources, or a 3-row sweep bucket outvotes a 3000-row live one.
+    """
+    for source, n, latency in ((cp.SOURCE_LIVE, 3, 100), (cp.SOURCE_SWEEP, 1, 900)):
+        for _ in range(n):
+            await cp.record(
+                cp.PreflightVerdict(outcome=cp.BLOCK, reason=cp.R_GONE, would_block=True,
+                                    mode=cp.MODE_SHADOW, latency_ms=latency),
+                _offer(), source=source)
+
+    report = await cp.shadow_report(window_days=7)
+    gone = {r["reason"]: r for r in report["by_reason"]}[cp.R_GONE]
+    assert gone["n"] == 4
+    assert gone["avg_latency_ms"] == 300, "weighted: (3*100 + 1*900) / 4"

@@ -521,9 +521,18 @@ def _summarise_shadow_rows(
     folded: Dict[str, Dict[str, Any]] = {}
     for r in by_reason:
         key = str(r.get("reason") or "")
-        acc = folded.setdefault(key, {"reason": key, "n": 0, "would_block": 0})
+        acc = folded.setdefault(
+            key, {"reason": key, "n": 0, "would_block": 0, "_lat": 0.0})
         acc["n"] += int(r["n"])
         acc["would_block"] += int(r["would_block"])
+        # Weighted, because folding two sources' averages unweighted would let a 3-row sweep
+        # bucket outvote a 3000-row live one. Dropping it entirely — which the first fold did —
+        # loses the only signal that says whether a refusal was slow or instant.
+        if r.get("avg_latency_ms") is not None:
+            acc["_lat"] += float(r["avg_latency_ms"]) * int(r["n"])
+    for acc in folded.values():
+        lat = acc.pop("_lat")
+        acc["avg_latency_ms"] = round(lat / acc["n"]) if acc["n"] and lat else None
     by_reason = sorted(folded.values(), key=lambda r: -r["n"])
 
     total = sum(int(r["n"]) for r in by_reason)

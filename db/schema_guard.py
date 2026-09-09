@@ -465,6 +465,16 @@ async def ensure_required_schema_light() -> None:
                         """
                     )
                 )
+                # The index too, or an existing prod table never gets it: create_all only
+                # builds indexes on a table it creates, and db/migrations/ does not run here.
+                await database.execute(
+                    text(
+                        """
+                        CREATE INDEX IF NOT EXISTS idx_checkout_preflight_obs_run
+                          ON checkout_preflight_observations (run_id);
+                        """
+                    )
+                )
             except Exception:  # noqa: BLE001
                 # Best-effort like every sibling; must not starve what follows.
                 pass

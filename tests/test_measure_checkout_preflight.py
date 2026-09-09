@@ -7,6 +7,7 @@ our own fence being shut. So the guards get as much attention as the arithmetic.
 
 from __future__ import annotations
 
+import json
 import pytest
 
 from services import checkout_preflight as cp
@@ -313,12 +314,10 @@ def test_the_observation_columns_live_in_the_model_not_only_the_migration():
         "an existing prod row has no source; without a default the ALTER cannot be NOT NULL")
 
 
-def test_the_schema_guard_heals_a_table_that_predates_the_columns():
-    """create_all does not ALTER an existing table, and prod's already exists."""
-    src = open("db/schema_guard.py", encoding="utf-8").read()
-    assert "checkout_preflight_observations" in src
-    assert "ADD COLUMN IF NOT EXISTS source" in src
-    assert "ADD COLUMN IF NOT EXISTS run_id" in src
+# The schema_guard heal is asserted by EXECUTING it, in
+# tests/test_checkout_preflight_postgres.py::test_the_schema_guard_adds_the_columns_to_an_old_table.
+# A grep for "ADD COLUMN IF NOT EXISTS run_id" is a substring ratchet that `run_idx` satisfies,
+# and the thing being claimed is that a real table gains real columns.
 
 
 def test_the_offer_names_the_merchant_the_way_the_route_does():
@@ -337,35 +336,100 @@ def test_the_offer_names_the_merchant_the_way_the_route_does():
 
 
 @pytest.mark.asyncio
-async def test_a_dead_host_is_dropped_from_the_streak_not_merely_tolerated(monkeypatch):
-    """MUTANT: leave the dead host in the streak instead of pruning it.
+async def test_a_dead_prefix_does_not_mask_a_real_block(monkeypatch):
+    """MUTANT: prune `block_streak[-1]` instead of using a bounded window.
 
-    Without pruning, one dead brand's rows stay in the window and a couple of unrelated blips on
-    OTHER hosts push the distinct count over the threshold — so the sweep still aborts because of
-    the dead brand, just more slowly and with a misleading `aborted_on_hosts`.
+    THE ROUND-2 P1, and it was worse than having no distinction at all. `[-1]` is whatever host
+    just ARRIVED, so once a dead brand's rows filled the streak they stayed forever and every
+    genuinely new blocked host was the one thrown away. Review reproduced 40 distinct blocked
+    hosts after a 9-row dead prefix with `aborted_on_block: false`, a clean `would_block_rate` of
+    1.0, exit 0 and a resume cursor — while still firing one request per row into a live 429.
+
+    A sliding window needs no pruning rule: the dead brand ages out as new hosts arrive.
     """
-    # 6 rows on one dead host, then 3 single blips on three other hosts, then healthy rows.
-    urls = (["https://dead.example/products/x"] * 6
-            + [f"https://blip{i}.example/products/x" for i in range(3)]
-            + ["https://good.example/products/x"] * 5)
-    rows = [_row(id=f"eps_{i}", external_product_id=f"p{i}", url=u) for i, u in enumerate(urls)]
-    blocked_upto = 9
+    urls = (["https://dead.example/products/x"] * 9
+            + [f"https://shop{i}.example/products/x" for i in range(40)])
+    rows = [_row(id=f"eps_{i:03d}", external_product_id=f"p{i}", url=u)
+            for i, u in enumerate(urls)]
+    _wire(monkeypatch, rows, {f"p{i}": VID for i in range(len(urls))},
+          lambda offer: _async(_v(cp.R_UNVERIFIABLE, cp.UNVERIFIABLE)))
+    monkeypatch.setattr(sweep, "CONSECUTIVE_BLOCK_ABORT", 10)
+    monkeypatch.setattr(sweep, "_ABORT_DISTINCT_HOSTS", 4)
+    out = await sweep.run(limit=100, after=None, apply=False, run_id="t")
+    assert out["aborted_on_block"] is True, (
+        "a dead prefix must not make the sweep blind to a cross-domain block behind it")
+    assert out["gated"] < len(urls), "and it must stop rather than walk the whole page"
 
+
+@pytest.mark.asyncio
+async def test_one_good_answer_clears_the_window(monkeypatch):
+    """MUTANT: never clear the window on a good answer.
+
+    A dead handle between two live ones is ordinary catalog rot — 6.7% of a live sample — not
+    evidence about our address. Without the clear, scattered rot accumulates distinct hosts across
+    an entire healthy sweep and eventually trips the abort.
+    """
+    urls = [f"https://shop{i}.example/products/x" for i in range(40)]
+    rows = [_row(id=f"eps_{i:03d}", external_product_id=f"p{i}", url=u)
+            for i, u in enumerate(urls)]
     calls = {"n": 0}
 
-    async def verdicts(offer):
+    async def alternating(offer):
         calls["n"] += 1
-        bad = calls["n"] <= blocked_upto
+        bad = calls["n"] % 2 == 1
         return _v(cp.R_UNVERIFIABLE if bad else cp.R_OK,
                   cp.UNVERIFIABLE if bad else cp.OK)
 
-    _wire(monkeypatch, rows, {f"p{i}": VID for i in range(len(urls))}, verdicts)
+    _wire(monkeypatch, rows, {f"p{i}": VID for i in range(len(urls))}, alternating)
     monkeypatch.setattr(sweep, "CONSECUTIVE_BLOCK_ABORT", 5)
-    monkeypatch.setattr(sweep, "_ABORT_DISTINCT_HOSTS", 4)
-    out = await sweep.run(limit=50, after=None, apply=False, run_id="t")
-    assert out["aborted_on_block"] is False, (
-        "one dead brand plus three unrelated blips is not a cross-domain block")
-    assert out["gated"] == len(urls)
+    monkeypatch.setattr(sweep, "_ABORT_DISTINCT_HOSTS", 3)
+    out = await sweep.run(limit=100, after=None, apply=False, run_id="t")
+    assert out["aborted_on_block"] is False
+    assert out["gated"] == len(urls), "every row on a healthy sweep must still be asked"
+
+
+@pytest.mark.asyncio
+async def test_the_egress_probe_returns_an_address_or_nothing(monkeypatch):
+    """MUTANT: return the response body unchecked.
+
+    An HTML error page from the echo service is not equal to the payment address, so unchecked it
+    counted as proof it was safe to sweep. That string is the only thing between "SUBNET
+    forgotten" and a corpus crawl out of the payment IP, so anything unparseable must read as
+    unknown — and unknown refuses.
+    """
+    import httpx
+
+    class _Resp:
+        def __init__(self, text, status=200):
+            self.text = text
+            self.status_code = status
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise httpx.HTTPStatusError("boom", request=None, response=None)
+
+    def _client_returning(resp):
+        class _C:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def get(self, url):
+                return resp
+
+        return lambda **kw: _C()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _client_returning(_Resp("34.82.199.35")))
+    assert await sweep._egress_ip() == "34.82.199.35"
+
+    for junk in ("<html><body>503 Service Unavailable</body></html>", "", "not-an-ip", "1.2.3"):
+        monkeypatch.setattr(httpx, "AsyncClient", _client_returning(_Resp(junk)))
+        assert await sweep._egress_ip() is None, f"{junk!r} is not an address"
+
+    monkeypatch.setattr(httpx, "AsyncClient", _client_returning(_Resp("34.82.199.35", 503)))
+    assert await sweep._egress_ip() is None, "a 503 body is not an address either"
 
 
 def test_it_refuses_to_sweep_out_of_the_payment_address(monkeypatch, capsys):
@@ -397,3 +461,174 @@ def test_it_refuses_when_it_cannot_tell_which_address_it_has(monkeypatch, capsys
     monkeypatch.setattr(sweep, "_egress_ip", lambda: _async(None))
     assert sweep.main() == 2
     assert "egress_ip_unknown" in capsys.readouterr().out
+
+
+def test_the_population_is_resolved_per_variant_like_the_route():
+    """MUTANT: resolve once per row with `offer_variant_id=None`.
+
+    Review showed that answers differently in BOTH directions against the real resolver: a product
+    with two live merchant-issued SKUs is refused as `multiple_merchant_issued_skus` while the
+    route names each by exact match, and a product with one candidate whose seed names a DIFFERENT
+    id is refused by the route as a contradiction while the once-per-row call returned the
+    candidate. Under-measuring one cohort while over-measuring another is the population drift
+    this lane exists to avoid.
+    """
+    import inspect
+
+    src = inspect.getsource(sweep.run)
+    assert "_route_variants(seed_data)" in src, "the route walks variants; so must this"
+    assert "offer_variant_id=_seed_offer_variant_id(v)" in src
+    assert "named_variant_id=_seed_variant_identity_claim(v)" in src
+
+
+def test_the_cart_lane_is_measured_too():
+    """MUTANT: measure only the resolved half of `_gate_vid = _handover_id or _cart_vid`.
+
+    The attach branch ships `_catalog_vid or _operator_vid` for a seed labelled shopify and the
+    route gates that cart even with no `catalog_skus` row — 67.1% of the corpus has none, and the
+    route's own comment calls this cohort the only carts that exist today. Measuring the resolved
+    half alone reports a refusal rate for the cohort that is NOT shipping carts and says nothing
+    about the one that is.
+    """
+    shopify = {"snapshot": {"storefront_platform": "shopify"}}
+    assert sweep._cart_lane_variant_id({"attached_variant_id": VID}, shopify) == VID
+    # ...and only where the route would: a seed it does not call shopify ships no permalink.
+    assert sweep._cart_lane_variant_id({"attached_variant_id": VID}, {"snapshot": {}}) is None
+    assert sweep._cart_lane_variant_id({"attached_variant_id": None}, shopify) is None
+
+
+def test_a_recorded_row_names_the_key_the_resolver_used():
+    """MUTANT: read `attached_product_key` off the row instead.
+
+    `_handover_product_key` falls back to the seed document, so the column is empty for
+    hand-overs the resolver keyed perfectly well — and those rows were being written with a null
+    product key, unjoinable to anything.
+    """
+    row = _row(attached_product_key=None)
+    offer = sweep._offer_for(row, VID, {"snapshot": {}}, product_key="prod::m_b::shopify::x")
+    assert offer["product_key"] == "prod::m_b::shopify::x"
+    assert offer["merchant_id"] == "m_b"
+
+
+def test_a_malformed_product_key_yields_no_merchant_rather_than_a_wrong_one():
+    """A wrong value in this column is worse than a null one: live rows fill it with a merchant
+    id, so anything else makes the two sources unjoinable per merchant."""
+    for bad in (None, "", "garbage", "a::b", "notprod::m::shopify::x"):
+        assert sweep._merchant_id_of(bad) is None, bad
+    assert sweep._merchant_id_of("prod::m_brand::shopify::serum") == "m_brand"
+
+
+@pytest.mark.asyncio
+async def test_the_cart_lane_reaches_the_merchant_through_run(monkeypatch):
+    """MUTANT: never consult the cart lane inside `run`.
+
+    Testing `_cart_lane_variant_id` alone passes for a `run` that never calls it — the helper and
+    its use are two different claims, and the second is the one that decides what gets measured.
+    """
+    row = _row(external_product_id="p0", attached_product_key=None,
+               attached_variant_id=VID,
+               seed_data={"snapshot": {"storefront_platform": "shopify"}})
+    asked = []
+
+    async def verdicts(offer):
+        asked.append(offer["execution_spec"]["variant_id"])
+        return _v(cp.R_OK)
+
+    # The resolver declines: this is the 67.1% with no catalog row, which is the whole cohort.
+    _wire(monkeypatch, [row], {}, verdicts)
+    out = await sweep.run(limit=10, after=None, apply=False, run_id="t")
+    assert asked == [VID], "a seed the resolver declines but the route ships a cart for"
+    assert out["by_lane"] == {"cart_operator_id": 1}
+
+
+@pytest.mark.asyncio
+async def test_the_pacing_floor_is_honoured(monkeypatch):
+    """MUTANT: delete the pacing sleep.
+
+    One ask is up to three outbound requests, against a measured cross-domain threshold of about
+    50 a minute. Unpaced, a sweep is the incident.
+    """
+    rows = [_row(id=f"eps_{i}", external_product_id=f"p{i}") for i in range(3)]
+    slept = []
+
+    async def fake_sleep(sec):
+        slept.append(sec)
+
+    _wire(monkeypatch, rows, {f"p{i}": VID for i in range(3)},
+          lambda offer: _async(_v(cp.R_OK)))
+    monkeypatch.setattr(sweep, "GLOBAL_MIN_INTERVAL_S", 4.0)
+    monkeypatch.setattr(sweep.asyncio, "sleep", fake_sleep)
+    await sweep.run(limit=10, after=None, apply=False, run_id="t")
+    assert len([s for s in slept if s > 0]) >= 2, f"asks were not paced: {slept}"
+
+
+@pytest.mark.asyncio
+async def test_a_seed_document_that_arrives_as_text_is_still_read(monkeypatch):
+    """MUTANT: treat a JSON string as unreadable.
+
+    `databases`+asyncpg hands JSONB back as a dict OR a string depending on the codec. Treated as
+    unreadable, every such row is skipped and the sweep reports a clean run over a fraction of the
+    corpus — the failure this whole lane is built against, and one this repo has hit before.
+    """
+    row = _row(external_product_id="p0",
+               seed_data=json.dumps({"snapshot": {"storefront_platform": "shopify"}}))
+    asked = []
+
+    async def verdicts(offer):
+        asked.append(1)
+        return _v(cp.R_OK)
+
+    _wire(monkeypatch, [row], {"p0": VID}, verdicts)
+    out = await sweep.run(limit=10, after=None, apply=False, run_id="t")
+    assert asked, f"a text seed_data was skipped: {out['not_gated']}"
+    assert out["gated"] == 1
+
+
+@pytest.mark.asyncio
+async def test_the_cursor_starts_past_the_row_it_names(monkeypatch):
+    """MUTANT: `>=` instead of `>`.
+
+    The resume cursor is the LAST row of the previous page, so `>=` re-asks it forever — a sweep
+    that never advances while reporting a full page of work each time, and paying a merchant
+    request for every repeat.
+    """
+    seen = {}
+
+    async def fetch_all(sql, values=None):
+        if "catalog_skus" in str(sql):
+            return []
+        seen["sql"] = str(sql)
+        seen["values"] = dict(values or {})
+        return []
+
+    monkeypatch.setattr(sweep.database, "fetch_all", fetch_all)
+    await sweep.run(limit=10, after="eps_5", apply=False, run_id="t")
+    assert "e.id > :after" in seen["sql"], seen["sql"]
+    assert "e.id >= :after" not in seen["sql"]
+
+
+def test_an_aborted_run_exits_non_zero(monkeypatch, capsys):
+    """MUTANT: always exit 0.
+
+    A wrapper chaining pages reads the exit code. Zero on an abort means the next page starts from
+    a cursor the aborted run never reached, and the block is walked straight back into.
+    """
+    import sys as _sys
+
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_ALLOW_EGRESS", "true")
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
+    monkeypatch.setattr(_sys, "argv", ["measure_checkout_preflight.py"])
+    monkeypatch.setattr(sweep, "_egress_ip", lambda: _async("34.82.199.35"))
+
+    async def aborted(**kw):
+        return {"aborted_on_block": True, "gated": 3}
+
+    monkeypatch.setattr(sweep, "run", aborted)
+
+    async def noop():
+        return None
+
+    monkeypatch.setattr(sweep.database, "connect", noop)
+    monkeypatch.setattr(sweep.database, "disconnect", noop)
+    assert sweep.main() == 1
+    assert "aborted_on_block" in capsys.readouterr().out
