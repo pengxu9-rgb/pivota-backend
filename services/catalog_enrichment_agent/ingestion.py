@@ -217,14 +217,16 @@ def _build_pdp_payload(record: Dict[str, Any]) -> Dict[str, Any]:
         "brand": proper_case_brand(pdp.get("brand")),
         "product_name": str(pdp.get("product_name") or "").strip(),
         "category_path": str(pdp.get("category_path") or "").strip(),
-        # Category provenance from the producing lane, when it has any. This payload is a
-        # WHITELIST -- a field absent here is dropped no matter what the record carried -- so
-        # curated_brand_feed's per-product classification would have been silently discarded
-        # without these two lines, exactly as the currency passthrough was before it.
-        # None when the lane does not classify; the defaults below still apply then.
-        "category_label_source": (
-            str(pdp.get("category_label_source") or "").strip() or None
-        ),
+        # Category confidence from the producing lane, when it has any. This payload is a
+        # WHITELIST -- a field absent here is dropped no matter what the record carried -- so a
+        # lane's classification would be silently discarded without this line, exactly as the
+        # currency passthrough was before it. None when the lane does not classify; the default
+        # below applies then.
+        #
+        # category_label_source is deliberately NOT threaded through. It reads as provenance but
+        # doubles as a LANE IDENTIFIER -- pdp_scope_classifier and CANONICAL_SCOPE_PREDICATE grant
+        # canonical scope on `== 'enrichment_agent_v1'` -- so letting a lane overwrite it would
+        # silently forfeit Rule-1 protection for those rows. Confidence carries provenance instead.
         "category_confidence": _category_confidence_or_none(
             pdp.get("category_confidence")
         ),
@@ -535,9 +537,7 @@ def _build_pdp_insert(
             if pdp_payload.get("category_confidence") is not None
             else DEFAULT_CATEGORY_CONFIDENCE
         ),
-        "category_label_source": (
-            pdp_payload.get("category_label_source") or DEFAULT_CATEGORY_LABEL_SOURCE
-        ),
+        "category_label_source": DEFAULT_CATEGORY_LABEL_SOURCE,
         "canonical_url": canonical_url or None,
         "image_url": image_url or None,
         "product_payload": json.dumps({"enrichment_meta": enrichment_meta}),

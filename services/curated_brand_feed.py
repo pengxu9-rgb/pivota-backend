@@ -29,16 +29,73 @@ from services import storefront_currency
 
 from services.retailer_ingest.sitemap_crawler import _looks_like_inci_list
 from services import crawl_politeness
-from services.pdp_category_classifier import fold_category_from_variants
+from services.pdp_category_classifier import CATEGORY_PATTERNS, classify
 from services.variant_identity import MERCHANT_ISSUED, variant_id_provenance
 
-# Provenance for a row whose category came from the operator's --category flag rather than from
-# the product itself. It is a per-DOMAIN default, so it cannot be right for every product in a
-# catalogue that spans lipstick, mascara and moisturiser — naming it keeps that visible in the
-# data instead of laundering it through the generic enrichment-agent source.
-CATEGORY_SOURCE_FEED_DEFAULT = "curated_feed_flag"
-# Deliberately low: this value is a fallback, not a classification.
+# Confidence by WHERE the category came from. The `--category` flag is a per-DOMAIN default and
+# cannot be right for every product in a catalogue spanning lipstick, mascara and moisturiser, so
+# it scores lowest; a merchant-declared product_type is the strongest signal available here.
+#
+# `category_label_source` is deliberately NOT set by this lane. It reads as provenance but is
+# also a LANE IDENTIFIER: pdp_scope_classifier and CANONICAL_SCOPE_PREDICATE grant canonical
+# scope on `== 'enrichment_agent_v1'`, so relabelling these rows would forfeit Rule-1 protection
+# and the recall boost that depends on it. Confidence carries the provenance instead.
+CATEGORY_CONFIDENCE_MERCHANT_TYPE = 0.9
+CATEGORY_CONFIDENCE_TITLE_ONLY = 0.6
 CATEGORY_CONFIDENCE_FEED_DEFAULT = 0.3
+
+
+def _title_matches(title: Optional[str]) -> int:
+    """How many DISTINCT taxonomy paths a title matches.
+
+    CATEGORY_PATTERNS is first-match-wins and ordered, so a title naming two categories silently
+    resolves to whichever appears earlier. "Powder Kiss Lipstick" matches Powder before Lipstick
+    and lands in beauty/makeup/face/powder — MAC's flagship lipstick, reachable by a "setting
+    powder" search. A title that names more than one category is not evidence; it is a coin flip.
+    """
+    text = str(title or "")
+    if not text:
+        return 0
+    return len({path for _label, path, pattern in CATEGORY_PATTERNS if pattern.search(text)})
+
+
+def _resolve_category(
+    *, product_type: Optional[str], title: Optional[str], flag_path: str
+):
+    """(path, confidence) for one product. Three guards, cheapest first.
+
+    Returns the flag unchanged whenever the product's own fields do not clearly say otherwise —
+    wrong-but-shallow is recoverable by a later lane, wrong-but-deep is not, because every
+    correction lane selects `category_path IS NULL` and would never revisit the row.
+    """
+    # 1. A merchant-declared product_type is authoritative and unambiguous by construction.
+    hit = classify(product_type)
+    confidence = CATEGORY_CONFIDENCE_MERCHANT_TYPE
+    if hit is None:
+        # 2. Fall back to the title, but only when it names exactly ONE category.
+        if _title_matches(title) != 1:
+            return flag_path, CATEGORY_CONFIDENCE_FEED_DEFAULT
+        hit = classify(title)
+        confidence = CATEGORY_CONFIDENCE_TITLE_ONLY
+    if hit is None:
+        return flag_path, CATEGORY_CONFIDENCE_FEED_DEFAULT
+    resolved = hit[1]
+    # 3. AREA veto, compared on the first two segments (vertical + area) rather than the whole
+    # flag. The operator said this storefront is `beauty/makeup`; a regex dragging a row into
+    # `beauty/skincare/...` disagrees with a human about the whole shop, so decline and keep the
+    # flag ("Strobe Cream" -> beauty/skincare/moisturize/cream is a MAC highlighter).
+    #
+    # Comparing the FULL flag as a prefix was too crude in both directions: it rejected
+    # `beauty/skincare/cleanser` -> `beauty/skincare/cleanse/cleanser`, which is a canonicalisation
+    # of a non-taxonomy flag and exactly what we want, and it let a LEAF flag veto every
+    # per-product disagreement, which defeats the point of classifying per product. Comparing one
+    # segment is too weak the other way: `beauty/makeup` -> `beauty/skincare/...` shares `beauty`.
+    flag_parts = [p for p in str(flag_path or "").strip().strip("/").split("/") if p]
+    if flag_parts:
+        n = min(2, len(flag_parts))
+        if resolved.split("/")[:n] != flag_parts[:n]:
+            return flag_path, CATEGORY_CONFIDENCE_FEED_DEFAULT
+    return resolved, confidence
 
 logger = logging.getLogger("curated_brand_feed")
 
@@ -1087,41 +1144,24 @@ def shopify_product_to_record(
     # catalogue spans lipstick, mascara, foundation and skincare, so no single value can be right
     # for every row. Stamping it wholesale is what put 3,536 of this lane's 3,557 prod rows at
     # DEPTH 2 (`beauty/makeup`), where recall — which resolves a hard prefix like
-    # `beauty/makeup/lip/` — cannot reach them: measured 2026-09-09, a "matte lipstick" query
-    # returned 33 rows and not one of MAC's 286, Stila's 124 or Tarte's 249.
+    # `beauty/makeup/lip/` — cannot reach them.
     #
-    # `category` is passed as None ON PURPOSE. The flag is the FALLBACK, not an input to the
-    # classification — feeding it in would let a depth-2 value match a pattern and short-circuit
-    # before the title is ever tried, re-deriving the bug from inside the fix.
-    #
-    # Regex + variant only (no LLM): this is a pure mapping function and must not make network
-    # calls. Measured against the 3,557 rows this lane already wrote, it resolves 72.8% — and
-    # that is a FLOOR, because those rows carry a product_type back-derived from the flag
-    # (`"makeup"`), whereas a live feed carries the storefront's own. The remaining tail keeps
-    # the flag value and can be lifted later by fold_category_with_llm_fallback or by
-    # scripts/backfill_pdp_category_path.py.
-    resolved = fold_category_from_variants(
-        category=None,
+    # _resolve_category is deliberately CONSERVATIVE: it keeps the flag unless the product's own
+    # fields clearly say otherwise. Wrong-but-shallow is recoverable; wrong-but-deep is not,
+    # because every correction lane selects `category_path IS NULL` and never revisits a row that
+    # already has a path.
+    resolved_path, category_confidence = _resolve_category(
         product_type=product.get("product_type"),
         title=title,
-        variants=variants,
+        flag_path=category_path,
     )
-    if resolved is not None:
-        (_category_label, resolved_path), category_source, category_confidence = resolved
-    else:
-        resolved_path = category_path
-        category_source = CATEGORY_SOURCE_FEED_DEFAULT
-        category_confidence = CATEGORY_CONFIDENCE_FEED_DEFAULT
     return {
         "pdp": {
             "brand": brand,
             "product_name": title,
             "category_path": resolved_path,
-            # Honest provenance. Every Path-C row previously landed
-            # category_label_source='enrichment_agent_v1' / confidence 0.7 regardless of where the
-            # category actually came from, which claimed the agent had decided something an
-            # operator had typed.
-            "category_label_source": category_source,
+            # Confidence reflects WHERE the category came from; see the constants above for why
+            # category_label_source is left alone.
             "category_confidence": category_confidence,
             # Brand-authored body copy when present (it becomes the row's
             # description and feeds the lifecycle candidate gate + taxonomy
