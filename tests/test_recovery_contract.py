@@ -72,7 +72,8 @@ def test_real_report_json_round_trip_has_same_recovery_and_no_url_routing_score(
     from_db = build_revenue_recovery_projection(evidence=[], findings=db_rows, actions=[], audit_run_row={"run_id": "run"})
     direct = recovery_from_report(report, run_id="run", catalog_available=False)
     assert direct == from_db
-    assert from_db["selection"]["tiers"]["dupe"]["brand_mentioned"]["n"] == 1
+    assert from_db["selection"]["tiers"]["dupe"]["brand_mentioned"]["n"] == 0
+    assert from_db["selection"]["tiers"]["dupe"]["brand_mentioned"]["unknown"] == 1
     assert all(d["dimension"] != "routability" for d in direct["headline"]["dimensions"])
     evidence = [e for e in extract_evidence_items(report) if e["evidence_type"] == "selection_response"]
     assert len(evidence) == 1 and _evidence_signature(evidence[0]).startswith("selection_response:")

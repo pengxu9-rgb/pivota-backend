@@ -1488,6 +1488,9 @@ async def get_audit_run(
                 from services.revenue_recovery_report import recovery_from_report
                 from services.audit_projection_builder import coerce_jsonb_to_dict
                 report = coerce_jsonb_to_dict(row.get("report_jsonb"))
+                # A stale cache cannot establish the new evidence contract.
+                # Without the retained report, keep the original report fallback.
+                proj = None
                 if report:
                     payload = recovery_from_report(
                         report, run_id=run_id,

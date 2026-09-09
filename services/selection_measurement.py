@@ -7,6 +7,7 @@ queries/providers may correlate, so they do not license before/after claims.
 """
 from __future__ import annotations
 
+from copy import deepcopy
 import hashlib
 import json
 import math
@@ -21,7 +22,7 @@ from services.audit_facts import (
 from services.brand_alias import text_mentions_brand
 from services.consumer_answer_evidence import answer_mention, PREDICATE as CONSUMER_PREDICATE
 
-VERSION = "1"
+VERSION = "2"
 MENTION_PREDICATE = "explicit_answer_brand_mentioned_v1"
 TIERS = ("branded", "unbranded", "dupe")
 DIAGNOSTIC_SCAN_MODES = {
@@ -104,7 +105,8 @@ def response_observations(runs, *, sku_key, merchant_host, merchant_brand, merch
             "mention_basis": mention_basis,
             "answer_unknown_reason": answer_unknown_reason,
             "evidence_kind": run.get("evidence_kind"),
-            **({"answer_evidence": run.get("answer"), "cited_sources": run.get("grounding_sources") or []}
+            **({"answer_evidence": run.get("answer"), "cited_sources": run.get("grounding_sources") or [],
+                "prompt_contract": run.get("prompt_contract"), "measured_brand": merchant_brand}
                if run.get("evidence_kind") == "consumer_answer" else {}),
         })
     return out
@@ -157,5 +159,41 @@ def selection_measurement(observations):
 
 
 def report_observations(report: Mapping[str, Any]):
-    return [r for sku in report.get("per_sku_reports") or [] if isinstance(sku, dict)
-            for r in sku.get("selection_observations") or [] if isinstance(r, dict)]
+    """Read retained observations without inventing historical answer evidence."""
+    rows = []
+    for sku in report.get("per_sku_reports") or []:
+        if not isinstance(sku, dict):
+            continue
+        for original in sku.get("selection_observations") or []:
+            if not isinstance(original, dict):
+                continue
+            row = dict(original)
+            mention, reason = answer_mention(
+                {**row, "answer": row.get("answer_evidence")}, row.get("measured_brand"),
+            )
+            if row.get("status") != "answered":
+                mention, reason = None, "incompatible_or_failed_probe"
+            row.update(brand_mentioned=mention,
+                       mention_basis=CONSUMER_PREDICATE if mention is not None else "unavailable",
+                       answer_unknown_reason=reason)
+            rows.append(row)
+    return rows
+
+
+def upgrade_retained_measurement(value):
+    """Old canonical findings must not acquire new validity from a cache rebuild."""
+    if not isinstance(value, dict):
+        return selection_measurement([])
+    result = deepcopy(value)
+    if result.get("version") == VERSION:
+        return result
+    for bucket in (result.get("tiers") or {}).values():
+        if not isinstance(bucket, dict):
+            continue
+        attempted = bucket.get("attempted", 0)
+        failed = bucket.get("provider_failed", 0)
+        unknown = max(0, attempted - failed) if isinstance(attempted, int) and isinstance(failed, int) else 0
+        bucket["brand_mentioned"] = {**_estimate(0, 0), "unknown": unknown}
+    result.update(version=VERSION, answers=[], mention_predicate=CONSUMER_PREDICATE,
+                  limitation="Historical answer provenance was not retained; answer mentions are unknown. " + str(result.get("limitation") or ""))
+    return result

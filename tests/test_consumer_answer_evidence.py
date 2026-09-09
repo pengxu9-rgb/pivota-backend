@@ -48,3 +48,37 @@ def test_consumer_metrics_do_not_mix_in_diagnostic_denominators():
     assert result['observations'] == 1
     assert result['excluded_diagnostics'] == 1
     assert result['tiers']['unbranded']['brand_mentioned']['n'] == 1
+
+
+def test_retained_legacy_boolean_becomes_unknown_without_mutating_report():
+    from services.selection_measurement import report_observations
+    old={'observation_id':'old','status':'answered','brand_mentioned':True,'source_visible':True}
+    report={'per_sku_reports':[{'selection_observations':[old]}]}
+    result=report_observations(report)[0]
+    assert result['brand_mentioned'] is None
+    assert result['source_visible'] is True
+    assert old['brand_mentioned'] is True
+
+
+def test_retained_consumer_answer_is_revalidated_against_body():
+    from services.selection_measurement import report_observations
+    rows=response_observations([run()],sku_key='sku',merchant_host='anua.com',merchant_brand='Anua')
+    report={'per_sku_reports':[{'selection_observations':rows}]}
+    assert report_observations(report)[0]['brand_mentioned'] is True
+    rows[0]['answer_evidence']['text']='tampered'
+    assert report_observations(report)[0]['brand_mentioned'] is None
+
+
+def test_old_canonical_measurement_is_not_recertified_by_projection_rebuild():
+    from services.selection_measurement import selection_measurement
+    from services.audit_projection_builder import build_revenue_recovery_projection
+    old=selection_measurement([{'observation_id':'legacy','tier':'unbranded','status':'answered','brand_mentioned':True,'source_visible':True}])
+    old['version']='1'
+    result=build_revenue_recovery_projection(evidence=[],actions=[],findings=[{
+        'finding_type':'recovery_measurement','payload':{'selection':old},
+    }])['selection']
+    bucket=result['tiers']['unbranded']
+    assert bucket['brand_mentioned']['n'] == 0
+    assert bucket['brand_mentioned']['unknown'] == 1
+    assert bucket['source_visible']['n'] == 1
+    assert old['tiers']['unbranded']['brand_mentioned']['n'] == 1
