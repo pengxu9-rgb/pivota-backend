@@ -19,6 +19,7 @@ from services.audit_facts import (
     run_errored, run_is_internal_comparison,
 )
 from services.brand_alias import text_mentions_brand
+from services.consumer_answer_evidence import answer_mention, PREDICATE as CONSUMER_PREDICATE
 
 VERSION = "1"
 MENTION_PREDICATE = "explicit_answer_brand_mentioned_v1"
@@ -73,6 +74,13 @@ def response_observations(runs, *, sku_key, merchant_host, merchant_brand, merch
                       or any(isinstance(mode, str) and mode in DIAGNOSTIC_SCAN_MODES for mode in modes))
         if type(mention) is not bool or failed or diagnostic or invalid_mode:
             mention = None
+        mention_basis = MENTION_PREDICATE if mention is not None else "unavailable"
+        answer_unknown_reason = None
+        if run.get("evidence_kind") == "consumer_answer":
+            mention, answer_unknown_reason = answer_mention(run, merchant_brand)
+            if failed or diagnostic or invalid_mode:
+                mention, answer_unknown_reason = None, "incompatible_or_failed_probe"
+            mention_basis = CONSUMER_PREDICATE if mention is not None else "unavailable"
         facts = compute_run_facts(
             [run], merchant_host=merchant_host, merchant_brand=merchant_brand,
             merchant_vendors=merchant_vendors,
@@ -93,7 +101,11 @@ def response_observations(runs, *, sku_key, merchant_host, merchant_brand, merch
             "tier": selection_tier(query, axis, merchant_brand),
             "status": "provider_failed" if failed else "answered",
             "brand_mentioned": mention, "source_visible": source_visible,
-            "mention_basis": MENTION_PREDICATE if mention is not None else "unavailable",
+            "mention_basis": mention_basis,
+            "answer_unknown_reason": answer_unknown_reason,
+            "evidence_kind": run.get("evidence_kind"),
+            **({"answer_evidence": run.get("answer"), "cited_sources": run.get("grounding_sources") or []}
+               if run.get("evidence_kind") == "consumer_answer" else {}),
         })
     return out
 
@@ -113,6 +125,11 @@ def selection_measurement(observations):
     unique = {r["observation_id"]: r for r in observations or []
               if isinstance(r, dict) and r.get("observation_id")}
     rows = list(unique.values())
+    consumer_rows = [r for r in rows if r.get("evidence_kind") == "consumer_answer"]
+    # Never blend prompted diagnostics and natural answers into one rate.
+    excluded_diagnostics = len(rows) - len(consumer_rows) if consumer_rows else 0
+    if consumer_rows:
+        rows = consumer_rows
     tiers = {}
     for tier in TIERS:
         group = [r for r in rows if r.get("tier") == tier]
@@ -123,7 +140,13 @@ def selection_measurement(observations):
                              "unknown": len(group) - bucket["provider_failed"] - len(eligible)}
         tiers[tier] = bucket
     return {
-        "version": VERSION, "mention_predicate": MENTION_PREDICATE,
+        "version": VERSION, "mention_predicate": CONSUMER_PREDICATE if consumer_rows else MENTION_PREDICATE,
+        "excluded_diagnostics": excluded_diagnostics,
+        "answers": [{"observation_id": r["observation_id"], "query": r.get("query"),
+                     "provider": r.get("provider"), "brand_mentioned": r.get("brand_mentioned"),
+                     "unknown_reason": r.get("answer_unknown_reason"),
+                     "evidence": r.get("answer_evidence"), "cited_sources": r.get("cited_sources") or []}
+                    for r in consumer_rows],
         "unit": "product_provider_query_response", "tiers": tiers,
         "observations": len(rows), "unclassified": sum(r.get("tier") not in TIERS for r in rows),
         "providers": dict(Counter(r.get("provider", "unknown") for r in rows)),
