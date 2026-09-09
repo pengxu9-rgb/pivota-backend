@@ -22,7 +22,12 @@ pytestmark = pytest.mark.skipif(
     reason="needs a real Postgres DATABASE_URL — production-dialect gate",
 )
 
-MIGRATION = "db/migrations/219_checkout_preflight_observations.sql"
+MIGRATIONS = (
+    "db/migrations/219_checkout_preflight_observations.sql",
+    # 220 adds `source`. Applied here rather than hand-declared for the reason the docstring below
+    # gives: a fixture that redeclares columns tests the fixture.
+    "db/migrations/220_checkout_preflight_observation_source.sql",
+)
 
 
 async def _apply_migration(database):
@@ -35,11 +40,12 @@ async def _apply_migration(database):
     """
     from db.sql_migrations import split_statements
 
-    with open(MIGRATION, "r", encoding="utf-8") as fh:
-        sql = fh.read()
     for _ in range(2):
-        for statement in split_statements(sql):
-            await database.execute(statement)
+        for path in MIGRATIONS:
+            with open(path, "r", encoding="utf-8") as fh:
+                sql = fh.read()
+            for statement in split_statements(sql):
+                await database.execute(statement)
 
 
 @pytest.fixture
@@ -185,3 +191,56 @@ async def test_a_not_yet_checked_row_round_trips_and_lands_in_its_own_denominato
     assert report["answered"] == 2
     assert report["would_block_rate_answered"] == 0.5
     assert report["not_yet_checked_rate"] == 0.6
+
+
+async def test_a_live_row_keeps_its_meaning_without_being_told(db):
+    """Migration 220 is additive and DEFAULTED, so rows written before it are `live`.
+
+    Everything in this table before the sweep existed came from the request path. A migration that
+    made the column NOT NULL with no default would have failed on a populated prod table; one that
+    defaulted to the sweep value would silently relabel real traffic as a corpus scan.
+    """
+    await cp.record(
+        cp.PreflightVerdict(outcome=cp.BLOCK, reason=cp.R_GONE, would_block=True,
+                            mode=cp.MODE_SHADOW), _offer())
+    assert await db.fetch_val("SELECT source FROM checkout_preflight_observations") == cp.SOURCE_LIVE
+
+
+async def test_the_two_sources_are_reported_apart(db):
+    """The whole reason 220 exists, executed against the real GROUP BY.
+
+    Live rows describe DEMAND, sweep rows describe the CATALOG. A single rate over both answers
+    neither question — and because a sweep writes thousands of rows in minutes while live traffic
+    trickles, the combined number is really just the last sweep wearing a disguise.
+    """
+    for reason, blocked in ((cp.R_GONE, True), (cp.R_OK, False), (cp.R_OK, False)):
+        await cp.record(
+            cp.PreflightVerdict(outcome=(cp.BLOCK if blocked else cp.OK), reason=reason,
+                                would_block=blocked, mode=cp.MODE_SHADOW, latency_ms=5),
+            _offer(), source=cp.SOURCE_LIVE)
+    for reason, blocked in ((cp.R_GONE, True), (cp.R_GONE, True), (cp.R_OUT_OF_STOCK, True),
+                            (cp.R_OK, False)):
+        await cp.record(
+            cp.PreflightVerdict(outcome=(cp.BLOCK if blocked else cp.OK), reason=reason,
+                                would_block=blocked, mode=cp.MODE_SHADOW, latency_ms=5),
+            _offer(), source=cp.SOURCE_SWEEP)
+
+    report = await cp.shadow_report(window_days=7)
+    assert sorted(report["sources"]) == [cp.SOURCE_LIVE, cp.SOURCE_SWEEP]
+
+    live = report["by_source"][cp.SOURCE_LIVE]
+    assert live["observations"] == 3 and live["would_block"] == 1
+    assert live["would_block_rate"] == round(1 / 3, 4)
+
+    swept = report["by_source"][cp.SOURCE_SWEEP]
+    assert swept["observations"] == 4 and swept["would_block"] == 3
+    assert swept["would_block_rate"] == 0.75
+
+    # The combined view still exists, and still folds each reason to ONE line rather than listing
+    # it once per source.
+    assert report["observations"] == 7
+    reasons = [r["reason"] for r in report["by_reason"]]
+    assert len(reasons) == len(set(reasons)), f"a reason is listed twice: {reasons}"
+    by = {r["reason"]: r for r in report["by_reason"]}
+    assert int(by[cp.R_GONE]["n"]) == 3, "one line for merchant_says_gone across both sources"
+    assert int(by[cp.R_OK]["n"]) == 3
