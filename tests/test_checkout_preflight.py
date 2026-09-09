@@ -624,3 +624,120 @@ def test_the_coverage_docstring_describes_the_union_the_gate_actually_uses():
     doc = inspect.getdoc(preflight_coverage_fields) or ""
     assert "UNION" in doc, "the gated population is a union, and the docstring has to say so"
     assert "_handover_id or _cart_vid" in doc, "named, so a reader can find it in the code"
+
+
+# ---------------------------------------------------------------------------------------------
+# The egress fence. `checkout_preflight` runs in `web`, which is on the `default` subnet, whose
+# NAT holds the address payment partners allowlist.
+# ---------------------------------------------------------------------------------------------
+
+class _Boom(AssertionError):
+    """Raised by the fake transport. Reaching it IS the failure."""
+
+
+@pytest.mark.asyncio
+async def test_the_preflight_does_not_touch_a_merchant_by_default(monkeypatch):
+    """MUTANT: `cache_only=False`, or default `CHECKOUT_PREFLIGHT_ALLOW_EGRESS` to true.
+
+    Pinned at the SOCKET, not at `_check_one`'s signature. Asserting the keyword was passed would
+    pass for a `_check_one` that accepted the flag and ignored it, and the whole point of this
+    change is that no packet leaves `web` for a merchant. So the test makes any outbound client
+    construction raise, and a green run means nothing tried.
+
+    The politeness and robots calls matter as much as the fetch: they are outbound requests to
+    the merchant's host too, which is why the fence sits above all three.
+    """
+    import httpx
+
+    from services import checkout_preflight, live_offer_verification
+
+    monkeypatch.delenv("CHECKOUT_PREFLIGHT_ALLOW_EGRESS", raising=False)
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
+    live_offer_verification.reset_for_tests()
+
+    def explode(*a, **k):
+        raise _Boom("the preflight opened an HTTP client from the money path")
+
+    monkeypatch.setattr(httpx, "AsyncClient", explode)
+
+    async def explode_async(*a, **k):
+        raise _Boom("the preflight called out to the merchant's host")
+
+    monkeypatch.setattr(
+        live_offer_verification.crawl_politeness, "before_request", explode_async
+    )
+
+    verdict = await checkout_preflight.preflight(_offer())
+    assert verdict.outcome == checkout_preflight.UNVERIFIABLE
+    assert verdict.reason == checkout_preflight.R_NOT_YET_CHECKED, (
+        "a cold URL is a fact about US, not about the merchant")
+
+
+@pytest.mark.asyncio
+async def test_a_cold_url_is_not_reported_as_the_merchant_refusing(monkeypatch):
+    """MUTANT: fold `no_cached_evidence` into R_UNVERIFIABLE.
+
+    Both block, so no behaviour test separates them — only the REASON does, and the reason is the
+    entire value of week one of shadow. Conflated, the report says the merchants refused
+    everything when in fact we never asked, which is the same shape as the empty denominator this
+    gate already shipped once.
+    """
+    from services import checkout_preflight, live_offer_verification
+
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
+    monkeypatch.delenv("CHECKOUT_PREFLIGHT_ALLOW_EGRESS", raising=False)
+
+    async def cold(offer, **kw):
+        assert kw.get("cache_only") is True
+        return live_offer_verification.Verdict(
+            live_offer_verification.UNVERIFIED, "no_cached_evidence")
+
+    async def merchant_silent(offer, **kw):
+        return live_offer_verification.Verdict(
+            live_offer_verification.UNVERIFIED, "http_503")
+
+    monkeypatch.setattr(live_offer_verification, "_check_one", cold)
+    assert (await checkout_preflight.preflight(_offer())).reason == checkout_preflight.R_NOT_YET_CHECKED
+
+    monkeypatch.setattr(live_offer_verification, "_check_one", merchant_silent)
+    assert (await checkout_preflight.preflight(_offer())).reason == checkout_preflight.R_UNVERIFIABLE
+
+
+@pytest.mark.asyncio
+async def test_a_lane_that_may_crawl_can_opt_in(monkeypatch):
+    """The fence must not make the gate unusable from a process that SHOULD egress — the warm and
+    measurement lanes run on `pivota-crawl`, whose NAT is not the payment address."""
+    from services import checkout_preflight, live_offer_verification
+
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_ALLOW_EGRESS", "true")
+    seen = {}
+
+    async def fake(offer, **kw):
+        seen.update(kw)
+        return live_offer_verification.Verdict(
+            live_offer_verification.VERIFIED, "ok", in_stock=True)
+
+    monkeypatch.setattr(live_offer_verification, "_check_one", fake)
+    verdict = await checkout_preflight.preflight(_offer())
+    assert seen.get("cache_only") is False, "an opted-in lane must be allowed to ask"
+    assert verdict.outcome == checkout_preflight.OK
+
+
+@pytest.mark.parametrize("raw,allowed", [
+    ("true", True), ("1", True), ("yes", True), ("on", True), ("TRUE", True),
+    ("false", False), ("0", False), ("", False), ("maybe", False), ("  ", False),
+])
+def test_the_fence_opens_only_on_an_affirmative_value(monkeypatch, raw, allowed):
+    """A typo must fail CLOSED. `bool(os.getenv(...))` would open the fence on "false"."""
+    from services import checkout_preflight
+
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_ALLOW_EGRESS", raw)
+    assert checkout_preflight.egress_allowed() is allowed
+
+
+def test_the_fence_is_closed_when_the_variable_is_absent(monkeypatch):
+    from services import checkout_preflight
+
+    monkeypatch.delenv("CHECKOUT_PREFLIGHT_ALLOW_EGRESS", raising=False)
+    assert checkout_preflight.egress_allowed() is False

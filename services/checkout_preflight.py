@@ -73,6 +73,12 @@ R_UNVERIFIABLE = "could_not_ask_merchant"
 R_NO_MERCHANT_VARIANT = "no_merchant_issued_variant_id"
 R_SUPPRESSED = "suppressed"
 R_DISABLED = "preflight_off"
+#: NOT `R_UNVERIFIABLE`. Both block, and conflating them would make the shadow report unreadable:
+#: "could_not_ask_merchant" is a fact about the MERCHANT, this is a fact about US — nobody has
+#: warmed this URL yet. Week one of shadow is otherwise a wall of merchant-shaped refusals that
+#: are really our own empty cache, which is exactly the "denominator is empty by construction"
+#: mistake this gate already made once.
+R_NOT_YET_CHECKED = "not_yet_checked"
 
 _DEFAULT_DEADLINE_S = 4.0
 
@@ -86,6 +92,26 @@ def mode() -> str:
 
 def is_enabled() -> bool:
     return mode() != MODE_OFF
+
+
+def egress_allowed() -> bool:
+    """May THIS process fetch a merchant to answer a preflight? Default NO.
+
+    `checkout_preflight` runs inside `web`, and `web` is on the `default` subnet, whose NAT holds
+    8.231.167.230 — the address payment partners allowlist. Merchant fetches from there share both
+    the IP's reputation and its NAT port pool with the payment path, and port exhaustion is
+    per-IP. `infra/gcp/setup_egress_nat.sh` records the measurement: ~50 requests over 37
+    Cloudflare-fronted domains in about a minute tripped a cross-domain IP-level 429 lasting ~15
+    minutes.
+
+    The default is CLOSED, so arming the gate cannot start crawling from the money path by
+    accident — that has to be a deliberate, separate act. A process that legitimately egresses
+    (a warm/measurement lane running on `pivota-crawl`) sets this true for itself.
+
+    Read per call, like `mode()`, so it can be shut off on a running service without a deploy.
+    """
+    raw = str(os.getenv("CHECKOUT_PREFLIGHT_ALLOW_EGRESS", "")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 def deadline_seconds() -> float:
@@ -212,7 +238,10 @@ async def preflight(offer: Dict[str, Any]) -> PreflightVerdict:
         # is an `Exception`, so it lands on UNVERIFIABLE below -- fail-closed.
         budget = deadline_seconds()
         verdict = await asyncio.wait_for(
-            live_offer_verification._check_one(offer, max_wait=budget), timeout=budget
+            live_offer_verification._check_one(
+                offer, max_wait=budget, cache_only=not egress_allowed()
+            ),
+            timeout=budget,
         )
     except Exception as exc:  # noqa: BLE001
         # Fail-closed on our OWN failure too. An exception here means we did not establish the
@@ -245,6 +274,14 @@ async def preflight(offer: Dict[str, Any]) -> PreflightVerdict:
         return _finish(OK, R_OK, **common)
     # `unverified` — the merchant did not answer, or is not a storefront we can read. At search
     # time this demotes; here it blocks.
+    #
+    # ...unless nobody ever asked. Under the egress fence a cold URL is not evidence about the
+    # merchant at all, and reporting it as one would inflate `could_not_ask_merchant` with our own
+    # unwarmed cache. It still BLOCKS — the gate's asymmetry is unchanged, and an unverified
+    # hand-over is refused whatever the reason — but it is counted apart so the shadow report can
+    # say how much of the refusal rate is merchants and how much is homework.
+    if verdict.reason == "no_cached_evidence":
+        return _finish(UNVERIFIABLE, R_NOT_YET_CHECKED, **common)
     return _finish(UNVERIFIABLE, R_UNVERIFIABLE, **common)
 
 

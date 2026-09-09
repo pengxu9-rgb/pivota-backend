@@ -349,8 +349,22 @@ def _target(offer: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
 
 
 async def _check_one(
-    offer: Dict[str, Any], *, max_wait: Optional[float] = None
+    offer: Dict[str, Any], *, max_wait: Optional[float] = None, cache_only: bool = False
 ) -> Verdict:
+    """`cache_only` FORBIDS this call from touching a merchant. It is an EGRESS fence, not a
+    performance hint, and the caller that sets it cannot be made to egress by any answer here.
+
+    prod runs two NAT addresses: `default` holds 8.231.167.230, the address payment partners
+    allowlist, and `pivota-crawl` holds 34.82.199.35. Every user-facing service — `web` included,
+    which is where `checkout_preflight` runs — is on `default`. So a merchant fetch from the
+    request path leaves by the payment address, and NAT port exhaustion is per-IP, which means a
+    burst of them can starve payment egress even with clean reputation.
+
+    A cache miss under this flag answers `no_cached_evidence`, which is deliberately NOT the same
+    as `_target` failing or a merchant refusing. The caller must be able to tell "nobody has asked
+    this merchant yet" apart from "we asked and did not get an answer", because those two produce
+    the same BLOCK and completely different follow-up work.
+    """
     js_url, variant_id = _target(offer)
     if not js_url:
         return Verdict(UNVERIFIED, "no_verifiable_url")
@@ -364,6 +378,11 @@ async def _check_one(
     shopify_evidenced = storefront_is_shopify(seed.get("seed_data") or seed)
 
     doc = await _cache_get(_cache_key(js_url))
+    if doc is None and cache_only:
+        # The ONLY early return between here and the fetch. Everything below this line is the
+        # egress path, so the fence has to sit above all of it — including the politeness and
+        # robots calls, which are themselves outbound requests to the merchant's host.
+        return Verdict(UNVERIFIED, "no_cached_evidence")
     if doc is None:
         try:
             # S1: the gate is given the CALLER'S remaining budget, not its own 10s default.
