@@ -41,8 +41,11 @@ import os
 
 import pytest
 
+DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
+_IS_PG = DATABASE_URL.startswith("postgres")
+
 pytestmark = pytest.mark.skipif(
-    not str(os.getenv("DATABASE_URL") or "").startswith("postgres"),
+    not _IS_PG,
     reason="needs a real Postgres DATABASE_URL — production-dialect gate",
 )
 
@@ -54,7 +57,20 @@ SKU = PK + "::canonical"
 CONTENT_KEY = "ck_skuprecond_pg"
 DOMAIN = "brand.example"
 
-_WRITERS = ("us_market_capture", "retailer_offer_attach_v1")
+#: Every `writer_audit_log.writer_name` this module's runs record — the two
+#: writers under test AND the reconciler, which the tombstone tests drive with
+#: `apply=True` and which stamps its own row per run. The gate shares one
+#: database across every module, so `_clear` deletes by these names and nothing
+#: else; a name missing here is a row that outlives the module (the
+#: `reconcile_catalog_offers` residue that #2149's comment misattributed to the
+#: reconcile module came from HERE). Literals, not imports: all three scripts
+#: mutate sys.path and import db/ at load, so every reference to them in this
+#: file is deferred into a function and the skipif above keeps them out of a
+#: non-Postgres run. `test_the_writer_tuple_names_what_the_three_scripts_write`
+#: pins each literal to the script's constant, and the module-end check below
+#: reads the scripts' constants directly, so dropping an entry here fails THIS
+#: module by writer name rather than poisoning a neighbour on the next run.
+_WRITERS = ("us_market_capture", "retailer_offer_attach_v1", "reconcile_catalog_offers")
 
 #: The identity index the ON CONFLICT target names. Asserted, not assumed: if
 #: create_all ever stops building it, every adoption case below would still pass
@@ -150,6 +166,46 @@ def _planned(sku_key=SKU):
     }
 
 
+def _script_writer_names():
+    """The names the three scripts actually stamp, read from the scripts."""
+    from scripts.attach_retailer_offer import SOURCE_SYSTEM as attach_writer
+    from scripts.capture_us_market_offers import SOURCE_SYSTEM as capture_writer
+    from scripts.reconcile_catalog_offers import WRITER_NAME as reconcile_writer
+
+    return (capture_writer, attach_writer, reconcile_writer)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _nothing_outlives_this_module():
+    """No writer_audit_log row this module caused may outlive it — #2142/#2146's
+    module-end check, scoped by WRITER NAME rather than a table-wide count,
+    because the table is shared and a neighbour's rows are not this module's to
+    judge. Runs after the last test's `db` teardown, on its own sync engine
+    because the async pool is closed by then. The writer list comes from the
+    scripts, NOT from `_WRITERS`: a name dropped from `_WRITERS` stops `_clear`
+    deleting it, and this check is what turns that into a failure naming the
+    writer — measured 2 leftover `reconcile_catalog_offers` rows before that
+    entry existed."""
+    yield
+    if not _IS_PG:
+        return
+    from sqlalchemy import create_engine, text
+
+    engine = create_engine(DATABASE_URL)
+    try:
+        with engine.begin() as conn:
+            residue = dict(conn.execute(
+                text("SELECT writer_name, count(*) FROM writer_audit_log "
+                     "WHERE writer_name = ANY(:w) GROUP BY writer_name"),
+                {"w": list(_script_writer_names())},
+            ).all())
+    finally:
+        engine.dispose()
+    assert not residue, (
+        f"this module left writer_audit_log rows behind for the next gate run: {residue}"
+    )
+
+
 @pytest.fixture
 async def db():
     from db.database import database
@@ -165,6 +221,15 @@ async def db():
         await _clear(database)
         if not was_connected and database.is_connected:
             await database.disconnect()
+
+
+def test_the_writer_tuple_names_what_the_three_scripts_write():
+    """`_WRITERS` is what `_clear` deletes by. A rename in any of the three
+    scripts would otherwise leave `_clear` scoped to a name nobody writes, and
+    only the module-end check would notice, after every test had run with rows
+    piling up under the new name. This fails at the rename, not at the end."""
+    assert set(_WRITERS) == set(_script_writer_names())
+    assert len(_WRITERS) == len(set(_WRITERS))
 
 
 async def test_the_identity_index_the_conflict_target_names_exists(db):
