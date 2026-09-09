@@ -65,6 +65,10 @@ logger = logging.getLogger(__name__)
 
 VERIFIED = "verified"
 UNVERIFIED = "unverified"
+#: Reason returned when a `cache_only` caller misses. Exported because `checkout_preflight`
+#: branches on it to tell "nobody warmed this URL" from "the merchant did not answer", and a bare
+#: literal compared across a module boundary is a coupling nobody can see.
+NO_CACHED_EVIDENCE = "no_cached_evidence"
 GONE = "gone"
 
 _DEFAULT_TOP_K = 3
@@ -382,7 +386,7 @@ async def _check_one(
         # The ONLY early return between here and the fetch. Everything below this line is the
         # egress path, so the fence has to sit above all of it — including the politeness and
         # robots calls, which are themselves outbound requests to the merchant's host.
-        return Verdict(UNVERIFIED, "no_cached_evidence")
+        return Verdict(UNVERIFIED, NO_CACHED_EVIDENCE)
     if doc is None:
         try:
             # S1: the gate is given the CALLER'S remaining budget, not its own 10s default.
@@ -467,7 +471,19 @@ async def _check_one(
     # not an error — a JPY shop and a USD-presentment offer are both correct — it simply means
     # this source cannot speak to that offer's price.
     host = crawl_politeness.host_of(js_url)
-    shop_currency = await _shop_currency(host) if host else None
+    # THE FENCE APPLIES HERE TOO, and the first cut of it did not — review proved a cache HIT
+    # still fetched `robots.txt` and `/meta.json` from the merchant, from `web`, on the payment
+    # NAT. `_shop_currency` keys a DIFFERENT cache (`lov:cur:{host}`), so a warm document says
+    # nothing about whether that one is warm, and its refresh is fire-and-forget — it escapes the
+    # caller's `wait_for` and outlives the HTTP response. With 8 asks per resolve against
+    # deliberately DISTINCT hosts, one request could emit 16 outbound merchant requests.
+    #
+    # Skipping it costs the preflight NOTHING: `checkout_preflight` pins `price_verified=False`
+    # at the pass-through whatever this says, because a shop-currency inference is not a quote
+    # from the merchant's checkout. So under the fence we decline to infer rather than decline to
+    # answer — `comparable` goes False, which is exactly what it already was for every shop whose
+    # currency we had not cached.
+    shop_currency = await _shop_currency(host) if host and not cache_only else None
     offer_currency = str(offer.get("currency") or "").strip().upper() or None
     comparable = bool(
         live is not None and shop_currency and offer_currency and shop_currency == offer_currency

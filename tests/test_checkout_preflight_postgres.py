@@ -147,3 +147,41 @@ async def test_an_empty_window_reports_no_rate_rather_than_zero(db):
     report = await cp.shadow_report(window_days=7)
     assert report["observations"] == 0
     assert report["would_block_rate"] is None
+
+
+async def test_a_not_yet_checked_row_round_trips_and_lands_in_its_own_denominator(db, monkeypatch):
+    """The new reason has to survive the INSERT and reach the report as ITSELF.
+
+    Two ways this breaks that no in-memory test can see. The column is `VARCHAR(64) NOT NULL`
+    with no CHECK today, but a future enum or length change would reject the value at write time
+    — in prod, inside the one code path that exists to measure things, and `record` swallows its
+    own failures, so the row would vanish silently. And the aggregation runs in SQL, so the split
+    between the two denominators is only really exercised against a real database.
+    """
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
+    for reason, blocked in (
+        (cp.R_NOT_YET_CHECKED, True), (cp.R_NOT_YET_CHECKED, True), (cp.R_NOT_YET_CHECKED, True),
+        (cp.R_GONE, True), (cp.R_OK, False),
+    ):
+        await cp.record(
+            cp.PreflightVerdict(
+                outcome=(cp.OK if not blocked else cp.UNVERIFIABLE), reason=reason,
+                would_block=blocked, latency_ms=1, mode=cp.MODE_SHADOW),
+            _offer())
+
+    stored = await db.fetch_val(
+        "SELECT count(*) FROM checkout_preflight_observations WHERE reason = :r",
+        {"r": cp.R_NOT_YET_CHECKED})
+    assert stored == 3, "the reason must survive the write unchanged"
+
+    report = await cp.shadow_report(window_days=7)
+    assert report["observations"] == 5
+    # The raw rate still counts everything, and on a cold cache it is dominated by our own
+    # homework — which is exactly why it must not be the only number in the report.
+    assert report["would_block"] == 4
+    assert report["would_block_rate"] == 0.8
+    # The merchant's actual verdict: of the two that reached a merchant, one was refused.
+    assert report["not_yet_checked"] == 3
+    assert report["answered"] == 2
+    assert report["would_block_rate_answered"] == 0.5
+    assert report["not_yet_checked_rate"] == 0.6

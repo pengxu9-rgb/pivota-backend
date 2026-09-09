@@ -10,9 +10,11 @@ The second thing under test is that shadow is genuinely inert for the buyer whil
 decision rests on is measuring the wrong thing.
 """
 
+import logging
 import os
 from decimal import Decimal
 
+import asyncio
 import pytest
 
 from services import checkout_preflight as cp
@@ -741,3 +743,165 @@ def test_the_fence_is_closed_when_the_variable_is_absent(monkeypatch):
 
     monkeypatch.delenv("CHECKOUT_PREFLIGHT_ALLOW_EGRESS", raising=False)
     assert checkout_preflight.egress_allowed() is False
+
+
+@pytest.mark.asyncio
+async def test_a_warm_document_does_not_let_the_currency_lane_out(monkeypatch):
+    """MUTANT: fence only the `doc is None` branch (the shipped first cut).
+
+    THE COLD PATH WAS NEVER THE WHOLE FENCE. `_shop_currency` keys a DIFFERENT cache
+    (`lov:cur:{host}`), so a warm DOCUMENT says nothing about whether that one is warm — and on a
+    document hit the old code fell through to a `robots.txt` fetch and a `/meta.json` fetch,
+    from `web`, on the payment NAT. Worse, the refresh is fire-and-forget, so it escaped the
+    caller's `wait_for` and outlived the response.
+
+    So this test warms the document cache first, which is the state the whole warm-lane plan
+    creates on purpose, and then asserts nothing outbound happens.
+    """
+    import httpx
+
+    from services import checkout_preflight, live_offer_verification as lov
+
+    monkeypatch.delenv("CHECKOUT_PREFLIGHT_ALLOW_EGRESS", raising=False)
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
+    lov.reset_for_tests()
+
+    # Storefront evidence on purpose: without it `_check_one` short-circuits on
+    # `not_a_known_shopify_storefront` BEFORE reaching the currency lane, and the test would pass
+    # without ever visiting the line the leak was on.
+    offer = _offer(source={"seed_data": {"snapshot": {"storefront_platform": "shopify"}}})
+    js_url, _ = lov._target(offer)
+    assert js_url, "the fixture must be verifiable, or this test proves nothing"
+    # The document must contain a MATCHING variant, in the parsed shape `_check_one` reads
+    # (`shopify_variant_id`, a string). A non-matching one returns `variant_absent` at :454 —
+    # before the currency lane — so the first draft of this test warmed a document that made the
+    # leak unreachable and the mutant survived. The point of the test is the code AFTER the match.
+    await lov._cache_put(lov._cache_key(js_url), {
+        "variants": [{"shopify_variant_id": REAL_VID, "available": True,
+                      "price": Decimal("24.00")}],
+    }, ttl=300)
+
+    opened = []
+    real_client = httpx.AsyncClient
+
+    def record_client(*a, **k):
+        opened.append(k)
+        return real_client(*a, **k)
+
+    monkeypatch.setattr(httpx, "AsyncClient", record_client)
+
+    reached = []
+
+    async def record_politeness(url, **k):
+        reached.append(url)
+
+    monkeypatch.setattr(lov.crawl_politeness, "before_request", record_politeness)
+
+    verdict = await checkout_preflight.preflight(offer)
+    # DRAIN, do not just yield once. The currency refresh is `asyncio.ensure_future`, so its body
+    # has not run when `preflight` returns and a single `sleep(0)` is not enough to guarantee it
+    # has — a version of this test that yielded once let the reintroduced leak pass.
+    for _ in range(3):
+        pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        if not pending:
+            break
+        await asyncio.wait(pending, timeout=1.0)
+
+    assert opened == [], f"the preflight opened HTTP clients from the money path: {opened}"
+    assert reached == [], f"the preflight contacted merchant hosts: {reached}"
+    assert verdict.reason != checkout_preflight.R_NOT_YET_CHECKED, (
+        "the warm document must have been USED — otherwise the fence short-circuited above the "
+        "currency lane and this test never reached the line the leak was on")
+
+
+def test_the_report_separates_our_cold_cache_from_the_merchants_verdict():
+    """MUTANT: drop `would_block_rate_answered`, or leave not_yet_checked in its denominator.
+
+    With the fence closed `would_block_rate` is 1.0 BY CONSTRUCTION — the same
+    empty-denominator shape this gate already shipped once, in a new form. The answered rate must
+    drop `not_yet_checked` from BOTH sides; leaving it in the denominator would understate the
+    merchant refusal rate by exactly the size of our own cold cache.
+    """
+    from services import checkout_preflight as cp
+
+    rows = [
+        {"reason": cp.R_NOT_YET_CHECKED, "n": 80, "would_block": 80},
+        {"reason": cp.R_GONE, "n": 5, "would_block": 5},
+        {"reason": cp.R_OK, "n": 15, "would_block": 0},
+    ]
+    out = cp._summarise_shadow_rows(rows, window_days=7)
+    assert out["observations"] == 100
+    assert out["would_block_rate"] == 0.85, "the raw rate still reports everything, unchanged"
+    assert out["not_yet_checked"] == 80
+    assert out["answered"] == 20
+    assert out["would_block_rate_answered"] == 0.25, (
+        "5 of the 20 questions that reached a merchant were refused")
+
+
+def test_the_answered_rate_is_none_rather_than_zero_when_nothing_was_answered():
+    """0/0 must not read as 'the merchants refused nothing' — that is the number someone arms
+    enforcement on. This is the state on day one of shadow, so it is not hypothetical."""
+    from services import checkout_preflight as cp
+
+    out = cp._summarise_shadow_rows(
+        [{"reason": cp.R_NOT_YET_CHECKED, "n": 40, "would_block": 40}], window_days=7)
+    assert out["would_block_rate"] == 1.0
+    assert out["answered"] == 0
+    assert out["would_block_rate_answered"] is None
+    assert out["not_yet_checked_rate"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_a_not_yet_checked_observation_is_actually_persisted(monkeypatch):
+    """MUTANT: `record()` early-returns on R_NOT_YET_CHECKED, or rewrites it to R_UNVERIFIABLE.
+
+    Both survive every behavioural test, because the outcome and `would_block` are identical
+    either way — only the stored REASON differs, and that reason is the whole point of the split.
+    Dropped, the report loses the coverage denominator; rewritten, our cold cache is laundered
+    into the merchant refusal rate.
+    """
+    from services import checkout_preflight as cp
+
+    captured = {}
+
+    async def fake_execute(sql, params):
+        captured.update(params)
+
+    monkeypatch.setattr(cp.database, "execute", fake_execute)
+    verdict = cp.PreflightVerdict(
+        outcome=cp.UNVERIFIABLE, reason=cp.R_NOT_YET_CHECKED, would_block=True, mode="shadow")
+    await cp.record(verdict, _offer())
+    assert captured.get("reason") == cp.R_NOT_YET_CHECKED, (
+        "the observation must carry the reason it was decided on")
+    assert captured.get("would_block") is True
+
+
+@pytest.mark.asyncio
+async def test_enforcing_with_the_fence_closed_says_so_out_loud(monkeypatch, caplog):
+    """MUTANT: drop the interlock warning.
+
+    `mode` and the fence are independent env vars, both re-read per call, so enforce-with-a-cold-
+    cache is one flag away and withdraws EVERY cart on no merchant evidence. In the log MESSAGE,
+    not `extra=`: the root logger is WARNING in prod and `setup_structured_logging()` is never
+    called, so structured fields are dark.
+    """
+    from services import checkout_preflight as cp
+
+    monkeypatch.setattr(cp, "_WARNED_BLIND_ENFORCE", False)
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "enforce")
+    monkeypatch.delenv("CHECKOUT_PREFLIGHT_ALLOW_EGRESS", raising=False)
+    _stub_verdict(monkeypatch, status=lov.UNVERIFIED, reason=lov.NO_CACHED_EVIDENCE)
+
+    with caplog.at_level(logging.WARNING):
+        await cp.preflight(_offer())
+    blob = " ".join(r.getMessage() for r in caplog.records)
+    assert "ENFORCING" in blob and "CHECKOUT_PREFLIGHT_ALLOW_EGRESS" in blob, (
+        f"no interlock warning in the message text: {blob[:300]}")
+
+    # ...and it does NOT fire in shadow, or it becomes noise nobody reads.
+    monkeypatch.setattr(cp, "_WARNED_BLIND_ENFORCE", False)
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        await cp.preflight(_offer())
+    assert "ENFORCING" not in " ".join(r.getMessage() for r in caplog.records)
