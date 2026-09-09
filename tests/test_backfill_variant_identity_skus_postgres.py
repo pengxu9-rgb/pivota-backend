@@ -41,8 +41,10 @@ LONG_PK = "ext:" + ("pgtest-long-" + "z" * 200)[:200] + "::deadbeef"
 #: MERCHANT_ISSUED), and one `catalog_skus` identity between them.
 VID_LONG_A = "8" * 128 + "1"
 VID_LONG_B = "8" * 128 + "2"
-#: writer_audit_log is shared by every module in the gate run, and at least one of them
-#: (reconcile_catalog_offers) leaves its own row behind — so every read is scoped to this writer.
+#: writer_audit_log is shared by every module in the gate run, and rows under OTHER writer
+#: names can be present when this module runs (measured: two `reconcile_catalog_offers` rows,
+#: stamped by the reconciler while test_catalog_offer_writer_sku_precondition_postgres.py drove
+#: it — that module's residue, not the reconcile module's) — so every read is scoped to this writer.
 #: A literal rather than an import of `scripts.backfill_variant_identity_skus.WRITER_NAME`:
 #: that module mutates sys.path and imports db/ and services/ at load, and every other
 #: reference to it in this file is deferred into a function so the skipif above can keep it
