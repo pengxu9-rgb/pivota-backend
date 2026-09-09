@@ -77,15 +77,31 @@ gates the write, not the crawl, so an unpinned dry run bursts just as hard as a 
 ENV_VARS REPLACES the runner's defaults rather than adding to them, so re-list PIVOTA_ENV and
 the DB timeouts whenever you set a pacing variable.
 
-RESUME FROM THE DATABASE, NOT FROM THE LOG. `next_cursor` in the report below is correct, but
-the runner reads a job's output from Cloud Logging, which drops lines; a sweep that parsed the
-cursor out of the log read a truncated report as a finished cohort and stopped with thousands
-of rows left. The frontier is recoverable from the table itself, because the sweep walks in id
-order:
+RESUME FROM THE DATABASE WHEN THE LOG IS GONE — BUT KNOW WHAT YOU GET. `next_cursor` below is
+the real frontier: the last candidate WALKED, stamped or not. Prefer it. The problem is that the
+runner reads a job's output from Cloud Logging, which drops lines, and a sweep that parsed the
+cursor out of the log read a truncated report as a finished cohort and stopped with thousands of
+rows left. When that happens the table can still get you moving again:
 
     SELECT max(id) FROM external_product_seeds
      WHERE status='active'
        AND seed_data->'snapshot'->>'storefront_platform_source' = 'products_js_v1';
+
+THAT IS NOT THE FRONTIER. It is the last row successfully STAMPED, because this column is
+written only by the UPDATE below and only when a variant actually matched. The two diverge
+whenever a batch's tail produced no stamps, which is routine at a 6.7% dead-handle rate plus
+every `no_confident_match`. So it is a conservative LOWER BOUND, and resuming from it re-fetches
+that run's unproductive tail from the merchants a second time.
+
+Two consequences worth stating plainly, because the second one loses rows:
+
+  * If the unstampable tail is ever as long as `--limit`, the value stops advancing and the
+    sweep re-crawls one dead window forever — the exact pathology `--after` was added to end
+    (see the ORDER BY comment: four consecutive runs, same three dead rows, zero stamped). A
+    driver using this query MUST stop when the value fails to advance rather than loop.
+  * It is only valid if nothing has stamped AHEAD of the sweep. A `--domain ... --apply` pass
+    stamps rows anywhere in the id space, so `max(id)` can land past rows the sweep never
+    walked and skip them silently. Do not interleave a domain-scoped apply with a cursor sweep.
 """
 
 from __future__ import annotations

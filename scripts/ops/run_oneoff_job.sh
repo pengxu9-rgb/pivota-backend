@@ -139,7 +139,12 @@ trap cleanup EXIT
 trap 'cleanup; exit 130' INT
 trap 'cleanup; exit 143' TERM
 
-echo "==> job $JOB  image ${IMAGE##*/}  secrets ${SECRETS%%=*}..." >&2
+# The SUBNET is echoed because it decides which address the job leaves by, and an INHERITED
+# value is otherwise invisible: an operator who exported SUBNET=pivota-crawl for a crawl and
+# then runs an unrelated job in the same shell sends it out of the crawl IP with nothing in the
+# terminal saying so, and `cleanup` deletes the job on exit so no state survives to check. One
+# word, no policy — an allowlist here would reject a legitimate future subnet.
+echo "==> job $JOB  image ${IMAGE##*/}  subnet $SUBNET  secrets ${SECRETS%%=*}..." >&2
 gcloud run jobs create "$JOB" --project "$PROJECT" --region "$REGION" \
   --image "$IMAGE" \
   --service-account "$SERVICE_ACCOUNT" \
