@@ -56,11 +56,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from services.outbound_links_service import extract_shopify_numeric_variant_id
-from services.variant_identity import (
-    MERCHANT_ISSUED,
-    is_merchant_issued_variant_id,
-    variant_id_provenance,
-)
+from services.variant_identity import MERCHANT_ISSUED, is_merchant_issued_variant_id
 
 logger = logging.getLogger("handover_variant_identity")
 
@@ -93,6 +89,13 @@ X_NOT_MERCHANT_ISSUED = "not_merchant_issued"
 X_STAMP_VETO = "stamp_vetoed"
 X_PAYLOAD_DISAGREES = "stored_id_disagrees_with_payload"
 
+#: Distinguishes "the caller did not distinguish matching from contradicting" from "the caller
+#: looked and found NO identity claim". `None` cannot carry that difference, and conflating them
+#: is what let a barcode veto a stamp: the route passes the empty string when a variant entry
+#: carries only a `sku`, and that must mean "nothing claims to be a variant id here", not "fall
+#: back to the broad chain".
+_UNSET = object()
+
 _DEFAULT_TIMEOUT_S = 0.5
 #: A resolve can touch hundreds of seed rows; the lookup is ONE statement over an indexed
 #: column, but the IN-list still has to be bounded or a wide request writes an unbounded query.
@@ -115,8 +118,11 @@ class Candidate:
     """One live `catalog_skus` row whose id we can positively place as the merchant's.
 
     TWO SPELLINGS, and only ONE of them decides anything. `variant_id` is the CANONICAL form
-    every consumer gets and the only one `answers_to` compares; `stored_variant_id` is the
-    column's own value, kept so a wrong cart can be traced back to the row that spelled it. They differ only for
+    every consumer gets and the only one `answers_to` compares. `stored_variant_id` is the
+    column's own value and is read by NO production code — an earlier note claimed you could
+    grep a wrong cart back to it, which was false, because neither it nor `sku_key` is emitted
+    anywhere. It is kept because a debugger stepping through a wrong hand-over needs to see
+    what the row actually said, and for nothing else. They differ only for
     `gid://shopify/ProductVariant/<n>`, which `services.variant_identity` admits as identity and
     which every other reader in this lane has always normalised away
     (`outbound_links_service.extract_shopify_numeric_variant_id`, `shopify_variant_identity._numeric_id`).
@@ -302,7 +308,9 @@ def choose_handover_variant(
     *,
     seed_data: Any = None,
     offer_variant_id: Any = None,
+    named_variant_id: Any = _UNSET,
     product_key: Any = None,
+    product_id: Any = None,
     primed: bool = True,
     lookup_ok: bool = True,
 ) -> HandoverVariant:
@@ -316,15 +324,26 @@ def choose_handover_variant(
         return HandoverVariant(None, R_NOT_PRIMED)
 
     live = list(candidates or [])
+    #: What the hand-over may be MATCHED against — the broad chain, `sku` included, because a
+    #: SKU equal to a stored `source_variant_id` IS that variant.
     wanted = _norm(offer_variant_id)
-    # PARENT-AWARE, and computed ONCE for both paths below. `variant_identity` checks
-    # derivation before shape, so this predicate needs the product it is relative to or it
-    # calls a restated product id "merchant-issued" — round 2 found exactly that, refusing a
-    # good candidate as contradicted by a name the module itself calls a forgery.
+    #: What the hand-over may CONTRADICT with — a value that claims to be a variant id.
+    #: Defaults to `wanted` so a caller that does not distinguish the two keeps one behaviour,
+    #: but the gateway passes the narrower `_seed_variant_identity_claim`: on this corpus an
+    #: 8+-digit `sku` is routinely a barcode, and a barcode refusing a variant we DID resolve
+    #: is a refusal built out of an absence of information. See round-3 P2-8.
+    claimed = wanted if named_variant_id is _UNSET else _norm(named_variant_id)
+    # PARENT-AWARE ON BOTH PATHS, and computed ONCE. `variant_identity` checks derivation
+    # before shape, so this predicate needs the products it is relative to or it calls a
+    # restated product id "merchant-issued" — round 2 found exactly that, refusing a good
+    # candidate as contradicted by a name the module itself calls a forgery. Round 3 found the
+    # ZERO-candidate path still half-blind, passing `product_key` and no `product_id`, so one
+    # string got two verdicts depending on whether catalog happened to hold a row: the parents
+    # now come from the candidate when there is one and from the CALLER when there is not.
     named_identity = names_a_merchant_issued_variant(
-        wanted,
+        claimed,
         product_key=(live[0].product_key if live else _norm(product_key)),
-        product_id=(live[0].source_product_id if live else None),
+        product_id=(live[0].source_product_id if live else _norm(product_id)),
     )
 
     if live:
@@ -368,7 +387,12 @@ def choose_handover_variant(
     # hand-over id that `checkout_preflight` would then refuse as
     # `no_merchant_issued_variant_id`, a refusal this resolver had caused. One rule for both
     # sources, or the module's own guarantee is only true of half its answers.
-    if not (stamped and names_a_merchant_issued_variant(stamped, product_key=product_key)):
+    if not (
+        stamped
+        and names_a_merchant_issued_variant(
+            stamped, product_key=product_key, product_id=product_id
+        )
+    ):
         return HandoverVariant(None, R_NO_IDENTITY, None, None, 0)
 
     canonical_stamp = canonical_variant_id(stamped)
@@ -380,7 +404,7 @@ def choose_handover_variant(
     # cart for the one they did not name. Nothing takes this path on today's corpus (0 of
     # 11,834 seeds are stamped); it goes live the moment `backfill_shopify_variant_ids.py` runs,
     # which is the stated plan, so the rule belongs here now rather than after the incident.
-    if named_identity and canonical_variant_id(wanted) != canonical_stamp:
+    if named_identity and canonical_variant_id(claimed) != canonical_stamp:
         return HandoverVariant(None, R_CONTRADICTED, None, None, 0)
     return HandoverVariant(canonical_stamp, R_SEED_STAMP, SOURCE_SEED_STAMP, None, 0)
 
@@ -500,6 +524,14 @@ class HandoverVariantResolver:
         return await database.fetch_all(sql, dict(zip(names, keys)))
 
     def candidates_for(self, product_key: Any) -> List[Candidate]:
+        """Read the memo. TEST-ONLY today, and deliberately so rather than deleted.
+
+        `tests/test_handover_variant_identity_postgres.py::test_another_products_row_is_never_borrowed`
+        asserts on the buckets directly, because the alternative — asserting only through
+        `choose` — cannot tell "this product's row was never loaded" from "it was loaded and
+        refused", which is exactly the confusion the `not_primed` / `no_merchant_issued_sku`
+        split exists to prevent.
+        """
         return list(self._by_key.get(_norm(product_key)) or [])
 
     def choose(
@@ -508,6 +540,8 @@ class HandoverVariantResolver:
         product_key: Any,
         seed_data: Any = None,
         offer_variant_id: Any = None,
+        named_variant_id: Any = _UNSET,
+        product_id: Any = None,
     ) -> HandoverVariant:
         """The per-hand-over answer. Pure — `prime` already did every await."""
         self.stats["handover_considered"] += 1
@@ -521,7 +555,8 @@ class HandoverVariantResolver:
             # nothing resolved, so the coverage line can still tell this apart from a product
             # that simply has no merchant-issued SKU.
             answer = choose_handover_variant(
-                (), seed_data=seed_data, offer_variant_id=offer_variant_id
+                (), seed_data=seed_data, offer_variant_id=offer_variant_id,
+                named_variant_id=named_variant_id, product_id=product_id,
             )
             if not answer.resolved:
                 answer = HandoverVariant(None, R_NO_PRODUCT_KEY)
@@ -534,7 +569,9 @@ class HandoverVariantResolver:
             self._by_key.get(key),
             seed_data=seed_data,
             offer_variant_id=offer_variant_id,
+            named_variant_id=named_variant_id,
             product_key=key,
+            product_id=product_id,
             primed=key in self._primed,
             lookup_ok=key not in self._failed,
         )

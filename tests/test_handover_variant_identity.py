@@ -285,11 +285,13 @@ async def test_a_key_with_no_rows_is_primed_and_empty_not_unknown():
 
 
 async def test_a_failed_batch_does_not_silence_seeds_that_needed_no_lookup():
-    """MUTANT: latch the failure for the whole resolver instead of per key.
+    """A standalone seed carries no `attached_product_key`, so no lookup was ever made on its
+    behalf, and a failed batch must not silence its seed-stamp hand-over.
 
-    A standalone seed carries no `attached_product_key`, so no lookup was ever made on its
-    behalf. Letting one slow statement suppress its seed-stamp hand-over would be a regression
-    caused by caution about an unrelated row.
+    NOT a mutant pin, and the docstring used to say it was. Review falsified that: `choose`
+    takes the no-product-key branch BEFORE it consults `_failed`, so this case is identical
+    under a latch and under the per-key set. The latch is pinned by
+    `test_one_failed_batch_does_not_condemn_a_key_that_loaded_fine`, which uses two keys.
     """
     r = _FakeResolver({}, raises=True)
     await r.prime([PK])
@@ -421,7 +423,8 @@ def test_a_gid_is_folded_to_the_one_spelling_every_consumer_reads():
     cand = candidate_from_row(_row(source_variant_id=gid, sku_payload=None))
     assert cand is not None
     assert cand.variant_id == VID, "the canonical form"
-    assert cand.stored_variant_id == gid, "and the column's own spelling is kept for matching"
+    assert cand.stored_variant_id == gid, (
+        "the column's own spelling is kept for a debugger, not for matching — see Candidate")
     assert choose_handover_variant([cand]).variant_id == VID
     assert choose_handover_variant([cand], offer_variant_id=gid).variant_id == VID, (
         "named in either spelling, it is still the same variant")
@@ -1088,3 +1091,155 @@ def test_the_row_column_wins_over_a_stale_snapshot_copy_of_the_key(monkeypatch, 
     assert _resolve(client).status_code == 200
     assert seen["cart_variant_id"] == CATALOG_VID, (
         "the row's own column is the key the identity parse used, so it is the key we look up")
+
+
+# ---------------------------------------------------------------------------------------------
+# Round 3.
+# ---------------------------------------------------------------------------------------------
+
+def test_an_operator_cart_with_no_catalog_row_is_still_gated(monkeypatch, client):
+    """MUTANT: gate on `_handover_id` alone instead of the union.
+
+    THIS IS THE ROUND-3 P1, and it is a SWAP rather than a widening. The two values are not
+    nested populations: an attach-lane seed with an operator-typed `attached_variant_id` and no
+    merchant-issued `catalog_skus` row — 67.1% of the corpus has no such row — still builds a
+    real Shopify cart permalink, and keying the gate on the resolved id alone stopped gating it.
+    Under `enforce` the merchant saying "that variant is gone" no longer withdrew that cart,
+    which is a regression against the merge base on the ONE cohort that ships prefilled carts
+    today.
+    """
+    import routes.agent_shop_gateway as gateway
+
+    asked = []
+
+    async def counting_preflight(offer):
+        asked.append(offer)
+        return True
+
+    shopify_pk = "prod::m_brand::shopify::brand-serum"
+    row = _seed_row(attached_product_key=shopify_pk)
+    row["attached_variant_id"] = CATALOG_VID
+
+    seen = _wire(monkeypatch, seed_row=row, sku_rows=[])
+    monkeypatch.setattr(gateway, "_preflight_allows_external_offer", counting_preflight)
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
+    assert _resolve(client).status_code == 200
+
+    assert seen["cart_variant_id"] == CATALOG_VID, "a real cart is built from the operator id"
+    assert len(asked) == 1, "and the gate must be asked about it"
+    assert asked[0]["execution_spec"]["variant_id"] == CATALOG_VID
+
+
+def test_a_barcode_sku_may_match_a_variant_but_may_not_refuse_one(monkeypatch, client):
+    """MUTANT: use the broad `_seed_offer_variant_id` chain for the contradiction check.
+
+    `_seed_offer_variant_id` reads `variant_id | variantId | sku | sku_id | id`. On this corpus
+    an 8+-digit `sku` is routinely an EAN-13 or UPC-12 barcode, which `variant_identity` calls
+    merchant-issued by shape alone. `stamp_variant_ids` writes only `shopify_variant_id` and
+    leaves `sku` untouched, so after `backfill_shopify_variant_ids.py` runs the two sit side by
+    side in ONE snapshot entry — and the broad chain would have made the barcode veto the very
+    stamp the backfill was run to produce.
+    """
+    seen = _wire(
+        monkeypatch,
+        seed_row=_seed_row(
+            snapshot_extra={"storefront_platform": "shopify"},
+            variants=[{"sku": "4901234567894", "title": "30ml", "price_amount": 19.0,
+                       "price_currency": "USD", "availability": "in_stock"}],
+        ),
+        sku_rows=[_row(source_variant_id=CATALOG_VID, sku_payload=None)],
+    )
+    assert _resolve(client, sku_id="4901234567894").status_code == 200
+    assert seen["cart_variant_id"] == CATALOG_VID, (
+        "a barcode names no variant; it is an absence of information, not a disagreement")
+
+
+def test_a_barcode_sku_on_the_seed_stamp_path_does_not_veto_the_stamp():
+    """The same rule on the other path — the one that goes live when the storefront backfill
+    runs, which is exactly when a stamp and a barcode start sharing one snapshot entry."""
+    seed = _seed({"shopify_variant_id": VID, "sku": "4901234567894"})
+    got = choose_handover_variant(
+        [], seed_data=seed, offer_variant_id="4901234567894", named_variant_id="")
+    assert got.variant_id == VID and got.reason == R_SEED_STAMP
+
+    # ...and a value that DOES claim to be a variant id still contradicts.
+    claimed = choose_handover_variant(
+        [], seed_data=seed, offer_variant_id=VID_B, named_variant_id=VID_B)
+    assert claimed.variant_id is None and claimed.reason == R_CONTRADICTED
+
+
+def test_the_zero_candidate_path_knows_the_products_own_id_too():
+    """MUTANT: pass `product_id=None` when there are no candidates.
+
+    Round 3 found one string getting two verdicts depending on whether catalog happened to hold
+    a row: `product_id` came from the candidate and from nowhere else, so the seed-stamp path
+    called a restated `source_product_id` merchant-issued while the catalog path called it a
+    forgery. Same product, same string, opposite answers.
+    """
+    seed = _seed({"shopify_variant_id": VID})
+    got = choose_handover_variant(
+        [], seed_data=seed, offer_variant_id="80072940", named_variant_id="80072940",
+        product_key="prod::m::external_seed::80072940", product_id="80072940")
+    assert got.variant_id == VID and got.reason == R_SEED_STAMP, (
+        "the name restates the product's own id, so it is not identity and cannot contradict")
+
+
+def test_the_predicate_canonicalises_before_it_classifies():
+    """MUTANT: classify the raw string.
+
+    `_RE_GID` accepts any gid, so a gid wrapping a FIVE-digit number reads as merchant-issued
+    raw and is refused once canonicalised — and the canonical form is the value that actually
+    ships, which `checkout_preflight` then classifies itself. Admitting the raw form produces a
+    hand-over the preflight refuses as `no_merchant_issued_variant_id`: a refusal this resolver
+    would have caused. Round 3 found this property asserted in a test MESSAGE and pinned by no
+    assertion.
+    """
+    from services.handover_variant_identity import names_a_merchant_issued_variant
+
+    short_gid = "gid://shopify/ProductVariant/12345"
+    assert not names_a_merchant_issued_variant(short_gid), (
+        "the id that ships is '12345', and five digits is not a Shopify variant id")
+    assert candidate_from_row(_row(source_variant_id=short_gid, sku_payload=None)) is None
+
+    derived_gid = "gid://shopify/ProductVariant/" + VID
+    assert not names_a_merchant_issued_variant(derived_gid, product_id=VID), (
+        "canonicalised, it restates the product's own id — raw, the gid prefix hides that")
+
+
+def test_the_admitted_candidate_carries_the_products_own_id(monkeypatch):
+    """MUTANT: `source_product_id=""` in `candidate_from_row`.
+
+    The read side is pinned by the parent-awareness test, which hand-builds its Candidates — so
+    the WRITE was unpinned, and the field's whole justification (`onboard_external_brand_from_crawl`
+    restates `source_product_id` while `ingestion.py` restates `product_key`) rested on a line
+    no test executed.
+    """
+    cand = candidate_from_row(_row(source_product_id="brand-serum-77"))
+    assert cand is not None and cand.source_product_id == "brand-serum-77"
+
+    # ...and it reaches the contradiction guard, which is the only thing it is for.
+    restating = candidate_from_row(_row(source_product_id="80072940"))
+    assert restating is not None
+    assert choose_handover_variant(
+        [restating], offer_variant_id="80072940").reason == R_SOLE
+
+
+async def test_the_resolver_threads_the_products_own_id_into_the_decision():
+    """MUTANT: drop `product_id=product_id` from `HandoverVariantResolver.choose`.
+
+    The decision function's parent-awareness is pinned directly, and it survived a resolver
+    that never passed the parent — which is the same "pinned the read, not the write" gap
+    round 3 found on `Candidate.source_product_id`. The route reads
+    `row_dict["external_product_id"]` and hands it here; nothing else can.
+    """
+    r = _FakeResolver({})
+    await r.prime([PK])
+    got = r.choose(
+        product_key=PK,
+        product_id="80072940",
+        seed_data=_seed({"shopify_variant_id": VID}),
+        offer_variant_id="80072940",
+        named_variant_id="80072940",
+    )
+    assert got.variant_id == VID and got.reason == R_SEED_STAMP, (
+        "the name restates the product's own id, so it cannot contradict the stamp")

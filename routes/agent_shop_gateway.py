@@ -3394,6 +3394,27 @@ def _seed_offer_variant_id(v: Dict[str, Any]) -> str:
     return str(raw).strip()
 
 
+def _seed_variant_identity_claim(v: Dict[str, Any]) -> str:
+    """The subset of `_seed_offer_variant_id`'s chain that CLAIMS to be a variant id.
+
+    `sku` and `sku_id` are deliberately absent. A stock-keeping string is not a claim about
+    which variant the merchant issued — and on this corpus it is routinely an EAN-13 or UPC-12
+    barcode, which is 8+ digits and therefore reads as a Shopify variant id to
+    `services/variant_identity` by shape alone.
+
+    That distinction only matters in ONE direction, and round 3 of review found the direction
+    that bites. Matching may use the broad chain: a SKU string that happens to equal a stored
+    `source_variant_id` IS that variant, and treating the equality as a coincidence would throw
+    away real hand-overs. CONTRADICTING may not: a barcode that names no variant is an ABSENCE
+    of information, and letting it refuse a variant we did resolve would have made the
+    seed-stamp rule veto precisely the hand-overs `backfill_shopify_variant_ids.py` is run to
+    enable — `stamp_variant_ids` writes only `shopify_variant_id` and leaves `sku` untouched,
+    so the two would sit side by side in one snapshot entry and disagree.
+    """
+    raw = v.get("variant_id") or v.get("variantId") or v.get("id") or ""
+    return str(raw).strip()
+
+
 def _classify_db_reason_code(exc: Exception) -> str:
     msg = str(exc or "").lower()
     exc_type = type(exc).__name__.lower()
@@ -4467,8 +4488,12 @@ async def _handle_offers_resolve(
                 # outright when the name matches none of them or more than one.
                 _handover = _handover_resolver.choose(
                     product_key=_handover_product_key(row_dict, seed_data),
+                    product_id=row_dict.get("external_product_id"),
                     seed_data=seed_data,
                     offer_variant_id=_seed_offer_variant_id(v) or None,
+                    # NARROWER on purpose — see `_seed_variant_identity_claim`. A SKU may match
+                    # a candidate; it may not refuse one.
+                    named_variant_id=_seed_variant_identity_claim(v),
                 )
                 redirect_identity = _external_seed_redirect_identity(
                     row=row_dict,
@@ -4508,9 +4533,24 @@ async def _handle_offers_resolve(
                 # and silently shrink results, which is the "gate that deletes supply" shape
                 # this repo has been bitten by. So the offer ships as an honest referral. Where
                 # there was no cart to begin with, a refusal changes nothing at all, which is
-                # why widening the gate's population adds no new way to refuse supply.
+                # why the added population brings no new way to refuse supply.
+                #
+                # THE GATE'S POPULATION IS A UNION, NOT A REPLACEMENT. Round 3 of review found
+                # the first cut keying it on `_handover_id` ALONE, which is a SWAP: the two
+                # values are not nested. An attach-lane seed with an operator-typed
+                # `attached_variant_id` and no merchant-issued `catalog_skus` row — 67.1% of the
+                # corpus has no such row — still builds a real Shopify cart from
+                # `_catalog_vid or _operator_vid`, and that cart stopped being gated at all.
+                # Under `enforce` the merchant saying "that variant is gone" no longer withdrew
+                # it, which is a safety REGRESSION against the merge base, on the one cohort
+                # that ships prefilled carts today. The union restores it and keeps the
+                # widening.
                 _handover_id = _handover.variant_id if _handover is not None else None
                 _cart_vid = redirect_identity.get("cart_variant_id")
+                # The id the gate asks about: the resolved one when we have it, otherwise the
+                # one the buyer would actually be handed. Never both, never None while a cart
+                # exists.
+                _gate_vid = _handover_id or _cart_vid
                 # `candidates` is every seed offer considered; `gated` is the subset the gate
                 # applies to. Coverage MUST be measured against the second: dividing by the
                 # first mixes in offers the gate is blind to by design — the majority — so a
@@ -4523,9 +4563,9 @@ async def _handle_offers_resolve(
                 # `is_enabled()` here, not only inside the helper. The helper short-circuits so
                 # no request is spent when off — but the COUNTERS still moved, so an off
                 # request attached coverage fields describing work nobody did.
-                if _handover_id and checkout_preflight.is_enabled():
+                if _gate_vid and checkout_preflight.is_enabled():
                     _preflight_stats["gated"] += 1
-                    _q = (str(canonical_url or destination_url), str(_handover_id))
+                    _q = (str(canonical_url or destination_url), str(_gate_vid))
                     if _q in _preflight_memo:
                         _preflight_stats["memo_hits"] += 1
                         _allowed = _preflight_memo[_q]
@@ -4545,12 +4585,13 @@ async def _handle_offers_resolve(
                             # The SAME url the redirect is about to be built from, so the
                             # preflight verifies the claim we are actually publishing.
                             # The SAME id the gate keyed on, which is the id we would hand a
-                            # buyer. Passing `_cart_vid` here would ask about None on every
+                            # buyer. Passing only `_cart_vid` would ask about None on every
                             # storefront we cannot build a cart for — and `_check_one` answers
-                            # `ambiguous_variant` to that, a refusal about nothing.
+                            # `ambiguous_variant` to that, a refusal about nothing. Passing only
+                            # `_handover_id` skipped the attach-lane cart entirely (round 3).
                             "execution_spec": {
                                 "pdp_url": str(canonical_url or destination_url),
-                                "variant_id": _handover_id,
+                                "variant_id": _gate_vid,
                             },
                             "source": {
                                 "seed_data": seed_data,
@@ -8458,12 +8499,19 @@ def _external_seed_redirect_identity(
         # would receive, so the honest answer is a referral; catalog says nothing, and the
         # operator value is used exactly as before.
         #
-        # ONE PREDICATE, not two. Round 2 found this branch asking
-        # `extract_shopify_numeric_variant_id`, which accepts ANY digit string, while the
-        # resolver required 8+ digits or a gid — so a 5-digit operator SKU could veto a real
-        # catalog id, under a comment claiming both branches applied the same rule.
+        # ONE PREDICATE DECIDES THE VETO — and, precisely, only the veto. Round 2 found this
+        # branch asking `extract_shopify_numeric_variant_id`, which accepts ANY digit string,
+        # while the resolver required 8+ digits or a gid, so a 5-digit operator SKU could veto a
+        # real catalog id under a comment claiming both applied the same rule.
         # `names_a_merchant_issued_variant` is that rule, parent-aware, shared with the
-        # resolver's own admission and contradiction checks.
+        # resolver's admission and contradiction checks.
+        #
+        # `extract_shopify_numeric_variant_id` IS STILL HERE, deliberately, and round 3 was
+        # right that the earlier wording hid it: it decides what value SHIPS when catalog is
+        # silent, and that is the pre-#2151 behaviour this branch preserves byte for byte. So a
+        # 5-digit operator SKU can still become `cart_variant_id` on a product with no catalog
+        # row — as it always could — but it can no longer withdraw one we resolved. Two
+        # questions, two predicates, on purpose.
         _operator_vid = extract_shopify_numeric_variant_id(attached_variant_id)
         _catalog_vid = handover.variant_id if handover is not None else None
         _operator_is_identity = names_a_merchant_issued_variant(
