@@ -73,6 +73,13 @@ R_UNVERIFIABLE = "could_not_ask_merchant"
 R_NO_MERCHANT_VARIANT = "no_merchant_issued_variant_id"
 R_SUPPRESSED = "suppressed"
 R_DISABLED = "preflight_off"
+
+#: WHERE an observation came from. Live rows are biased toward what agents actually ask for; sweep
+#: rows are unbiased over the catalog but say nothing about demand. Averaging them answers neither
+#: question, and "the merchants refuse 20% of what buyers ask for" is the only one of the two that
+#: justifies arming a gate on the checkout path.
+SOURCE_LIVE = "live"
+SOURCE_SWEEP = "measurement_sweep"
 #: NOT `R_UNVERIFIABLE`. Both block, and conflating them would make the shadow report unreadable:
 #: "could_not_ask_merchant" is a fact about the MERCHANT, this is a fact about US — nobody has
 #: warmed this URL yet. Week one of shadow is otherwise a wall of merchant-shaped refusals that
@@ -362,13 +369,13 @@ async def preflight(offer: Dict[str, Any]) -> PreflightVerdict:
 
 INSERT_OBSERVATION_SQL = """
     INSERT INTO checkout_preflight_observations (
-        observation_id, mode, outcome, would_block, reason,
+        observation_id, source, run_id, mode, outcome, would_block, reason,
         merchant_id, product_key, sku_key, offer_id,
         live_status, in_stock, price_verified,
         quoted_price, quoted_currency, live_price, live_currency,
         latency_ms, detail
     ) VALUES (
-        :observation_id, :mode, :outcome, :would_block, :reason,
+        :observation_id, :source, :run_id, :mode, :outcome, :would_block, :reason,
         :merchant_id, :product_key, :sku_key, :offer_id,
         :live_status, :in_stock, :price_verified,
         :quoted_price, :quoted_currency, :live_price, :live_currency,
@@ -377,7 +384,13 @@ INSERT_OBSERVATION_SQL = """
 """
 
 
-async def record(verdict: PreflightVerdict, offer: Dict[str, Any]) -> None:
+async def record(
+    verdict: PreflightVerdict,
+    offer: Dict[str, Any],
+    *,
+    source: str = SOURCE_LIVE,
+    run_id: Optional[str] = None,
+) -> None:
     """Persist one observation. Swallows its own failures.
 
     A measurement that can break a checkout is not worth having, and in shadow the checkout is
@@ -395,6 +408,8 @@ async def record(verdict: PreflightVerdict, offer: Dict[str, Any]) -> None:
     try:
         await database.execute(INSERT_OBSERVATION_SQL, {
             "observation_id": uuid.uuid4().hex,
+            "source": str(source or SOURCE_LIVE)[:32],
+            "run_id": (str(run_id)[:64] if run_id else None),
             "mode": verdict.mode,
             "outcome": verdict.outcome,
             "would_block": bool(verdict.would_block),
@@ -417,15 +432,18 @@ async def record(verdict: PreflightVerdict, offer: Dict[str, Any]) -> None:
         logger.warning("checkout preflight observation not recorded: %s", repr(exc)[:200])
 
 
-async def preflight_and_record(offer: Dict[str, Any]) -> PreflightVerdict:
+async def preflight_and_record(
+    offer: Dict[str, Any], *, source: str = SOURCE_LIVE, run_id: Optional[str] = None
+) -> PreflightVerdict:
     """The call sites use this. One verdict, one row, and the caller reads `allows_checkout`."""
     verdict = await preflight(offer)
-    await record(verdict, offer)
+    await record(verdict, offer, source=source, run_id=run_id)
     return verdict
 
 
 SHADOW_REPORT_SQL = """
-    SELECT reason,
+    SELECT source,
+           reason,
            count(*) AS n,
            count(*) FILTER (WHERE would_block) AS would_block,
            round(avg(latency_ms)) AS avg_latency_ms
@@ -437,7 +455,7 @@ SHADOW_REPORT_SQL = """
     -- fails with "the server expects 1 argument, 2 were passed". Same class as the migration
     -- runner matching CONCURRENTLY inside prose.
     WHERE created_at > NOW() - make_interval(days => :days)
-    GROUP BY reason
+    GROUP BY source, reason
     ORDER BY n DESC
 """
 
@@ -497,6 +515,26 @@ def _summarise_shadow_rows(
     while that lived inside the DB call the only way to pin it was a Postgres round trip — so
     dropping a rate, or leaving `not_yet_checked` in the answered denominator, was invisible.
     """
+    # FOLD BY REASON FIRST. The query groups by (source, reason), so a reason seen from both
+    # sources arrives as two rows and would be listed twice in `by_reason` — a reader scanning the
+    # breakdown would see "merchant_says_gone" on two lines and no indication why.
+    folded: Dict[str, Dict[str, Any]] = {}
+    for r in by_reason:
+        key = str(r.get("reason") or "")
+        acc = folded.setdefault(
+            key, {"reason": key, "n": 0, "would_block": 0, "_lat": 0.0})
+        acc["n"] += int(r["n"])
+        acc["would_block"] += int(r["would_block"])
+        # Weighted, because folding two sources' averages unweighted would let a 3-row sweep
+        # bucket outvote a 3000-row live one. Dropping it entirely — which the first fold did —
+        # loses the only signal that says whether a refusal was slow or instant.
+        if r.get("avg_latency_ms") is not None:
+            acc["_lat"] += float(r["avg_latency_ms"]) * int(r["n"])
+    for acc in folded.values():
+        lat = acc.pop("_lat")
+        acc["avg_latency_ms"] = round(lat / acc["n"]) if acc["n"] and lat else None
+    by_reason = sorted(folded.values(), key=lambda r: -r["n"])
+
     total = sum(int(r["n"]) for r in by_reason)
     blocked = sum(int(r["would_block"]) for r in by_reason)
     # TWO RATES, because they answer different questions and the raw one is unreadable on its own
@@ -538,5 +576,19 @@ def _summarise_shadow_rows(
 async def shadow_report(window_days: int = 7) -> Dict[str, Any]:  # noqa: D401
     """What enforcement WOULD have refused, and why. This is the evidence that decides whether
     `enforce` is armed — read it rather than the 31.1% from the pre-backfill sample."""
-    rows = await database.fetch_all(SHADOW_REPORT_SQL, {"days": int(window_days)})
-    return _summarise_shadow_rows([dict(r) for r in rows or []], window_days=window_days)
+    rows = [dict(r) for r in (await database.fetch_all(
+        SHADOW_REPORT_SQL, {"days": int(window_days)})) or []]
+    # PER SOURCE, and the combined figure is deliberately NOT the headline. Live rows describe
+    # demand, sweep rows describe the catalog, and one rate over both answers neither question —
+    # the arithmetic would be dominated by whichever sweep ran most recently.
+    out = _summarise_shadow_rows(rows, window_days=window_days)
+    sources = sorted({str(r.get("source") or SOURCE_LIVE) for r in rows})
+    out["by_source"] = {
+        src: _summarise_shadow_rows(
+            [r for r in rows if str(r.get("source") or SOURCE_LIVE) == src],
+            window_days=window_days,
+        )
+        for src in sources
+    }
+    out["sources"] = sources
+    return out

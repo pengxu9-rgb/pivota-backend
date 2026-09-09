@@ -22,7 +22,12 @@ pytestmark = pytest.mark.skipif(
     reason="needs a real Postgres DATABASE_URL — production-dialect gate",
 )
 
-MIGRATION = "db/migrations/219_checkout_preflight_observations.sql"
+MIGRATIONS = (
+    "db/migrations/219_checkout_preflight_observations.sql",
+    # 220 adds `source`. Applied here rather than hand-declared for the reason the docstring below
+    # gives: a fixture that redeclares columns tests the fixture.
+    "db/migrations/220_checkout_preflight_observation_source.sql",
+)
 
 
 async def _apply_migration(database):
@@ -35,11 +40,12 @@ async def _apply_migration(database):
     """
     from db.sql_migrations import split_statements
 
-    with open(MIGRATION, "r", encoding="utf-8") as fh:
-        sql = fh.read()
     for _ in range(2):
-        for statement in split_statements(sql):
-            await database.execute(statement)
+        for path in MIGRATIONS:
+            with open(path, "r", encoding="utf-8") as fh:
+                sql = fh.read()
+            for statement in split_statements(sql):
+                await database.execute(statement)
 
 
 @pytest.fixture
@@ -185,3 +191,112 @@ async def test_a_not_yet_checked_row_round_trips_and_lands_in_its_own_denominato
     assert report["answered"] == 2
     assert report["would_block_rate_answered"] == 0.5
     assert report["not_yet_checked_rate"] == 0.6
+
+
+async def test_a_live_row_keeps_its_meaning_without_being_told(db):
+    """Migration 220 is additive and DEFAULTED, so rows written before it are `live`.
+
+    Everything in this table before the sweep existed came from the request path. A migration that
+    made the column NOT NULL with no default would have failed on a populated prod table; one that
+    defaulted to the sweep value would silently relabel real traffic as a corpus scan.
+    """
+    await cp.record(
+        cp.PreflightVerdict(outcome=cp.BLOCK, reason=cp.R_GONE, would_block=True,
+                            mode=cp.MODE_SHADOW), _offer())
+    assert await db.fetch_val("SELECT source FROM checkout_preflight_observations") == cp.SOURCE_LIVE
+
+
+async def test_the_two_sources_are_reported_apart(db):
+    """The whole reason 220 exists, executed against the real GROUP BY.
+
+    Live rows describe DEMAND, sweep rows describe the CATALOG. A single rate over both answers
+    neither question — and because a sweep writes thousands of rows in minutes while live traffic
+    trickles, the combined number is really just the last sweep wearing a disguise.
+    """
+    for reason, blocked in ((cp.R_GONE, True), (cp.R_OK, False), (cp.R_OK, False)):
+        await cp.record(
+            cp.PreflightVerdict(outcome=(cp.BLOCK if blocked else cp.OK), reason=reason,
+                                would_block=blocked, mode=cp.MODE_SHADOW, latency_ms=5),
+            _offer(), source=cp.SOURCE_LIVE)
+    for reason, blocked in ((cp.R_GONE, True), (cp.R_GONE, True), (cp.R_OUT_OF_STOCK, True),
+                            (cp.R_OK, False)):
+        await cp.record(
+            cp.PreflightVerdict(outcome=(cp.BLOCK if blocked else cp.OK), reason=reason,
+                                would_block=blocked, mode=cp.MODE_SHADOW, latency_ms=5),
+            _offer(), source=cp.SOURCE_SWEEP)
+
+    report = await cp.shadow_report(window_days=7)
+    assert sorted(report["sources"]) == [cp.SOURCE_LIVE, cp.SOURCE_SWEEP]
+
+    live = report["by_source"][cp.SOURCE_LIVE]
+    assert live["observations"] == 3 and live["would_block"] == 1
+    assert live["would_block_rate"] == round(1 / 3, 4)
+
+    swept = report["by_source"][cp.SOURCE_SWEEP]
+    assert swept["observations"] == 4 and swept["would_block"] == 3
+    assert swept["would_block_rate"] == 0.75
+
+    # The combined view still exists, and still folds each reason to ONE line rather than listing
+    # it once per source.
+    assert report["observations"] == 7
+    reasons = [r["reason"] for r in report["by_reason"]]
+    assert len(reasons) == len(set(reasons)), f"a reason is listed twice: {reasons}"
+    by = {r["reason"]: r for r in report["by_reason"]}
+    assert int(by[cp.R_GONE]["n"]) == 3, "one line for merchant_says_gone across both sources"
+    assert int(by[cp.R_OK]["n"]) == 3
+
+
+async def test_the_schema_guard_adds_the_columns_to_an_old_table(db):
+    """EXECUTED, not grepped. prod's table predates `source`/`run_id`, and `create_all` does not
+    ALTER an existing table — so without the heal every INSERT fails on an unknown column and
+    `record()` swallows it, which is how shadow mode would have gone quiet.
+
+    A substring assertion on schema_guard.py's text is satisfied by `run_idx`; this asserts the
+    columns actually appear on a real table that did not have them.
+    """
+    from db.schema_guard import ensure_required_schema_light
+
+    await db.execute("ALTER TABLE checkout_preflight_observations DROP COLUMN IF EXISTS source")
+    await db.execute("ALTER TABLE checkout_preflight_observations DROP COLUMN IF EXISTS run_id")
+    missing = await db.fetch_all(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_name = 'checkout_preflight_observations'")
+    assert "source" not in {dict(r)["column_name"] for r in missing}
+
+    await ensure_required_schema_light()
+
+    cols = {dict(r)["column_name"] for r in await db.fetch_all(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_name = 'checkout_preflight_observations'")}
+    assert "source" in cols and "run_id" in cols
+
+    # ...and the heal is idempotent, because it runs on every boot.
+    await ensure_required_schema_light()
+
+    # ...and a write now lands, which is the thing that was silently failing.
+    await cp.record(
+        cp.PreflightVerdict(outcome=cp.OK, reason=cp.R_OK, would_block=False, mode=cp.MODE_SHADOW),
+        _offer(), source=cp.SOURCE_SWEEP, run_id="heal-check")
+    row = dict(await db.fetch_one(
+        "SELECT source, run_id FROM checkout_preflight_observations WHERE run_id = 'heal-check'"))
+    assert row["source"] == cp.SOURCE_SWEEP
+
+
+async def test_the_folded_report_keeps_the_latency_it_measured(db):
+    """MUTANT: drop avg_latency_ms in the fold.
+
+    The SQL still computes it and the fold silently discarded it, losing the only signal that
+    says whether a refusal was slow (a timeout we caused) or instant (a merchant saying no).
+    Weighted across sources, or a 3-row sweep bucket outvotes a 3000-row live one.
+    """
+    for source, n, latency in ((cp.SOURCE_LIVE, 3, 100), (cp.SOURCE_SWEEP, 1, 900)):
+        for _ in range(n):
+            await cp.record(
+                cp.PreflightVerdict(outcome=cp.BLOCK, reason=cp.R_GONE, would_block=True,
+                                    mode=cp.MODE_SHADOW, latency_ms=latency),
+                _offer(), source=source)
+
+    report = await cp.shadow_report(window_days=7)
+    gone = {r["reason"]: r for r in report["by_reason"]}[cp.R_GONE]
+    assert gone["n"] == 4
+    assert gone["avg_latency_ms"] == 300, "weighted: (3*100 + 1*900) / 4"
