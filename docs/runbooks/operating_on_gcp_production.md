@@ -100,6 +100,9 @@ gcloud run jobs create "$JOB" --project pivota-prod --region us-west1 \
   --image us-west1-docker.pkg.dev/pivota-shared/pivota/backend:latest \
   --service-account sa-worker@pivota-prod.iam.gserviceaccount.com \
   --network default --subnet default --vpc-egress all-traffic \
+  `# ^ if this job FETCHES FROM A MERCHANT, use --subnet pivota-crawl instead: the default` \
+  `# subnet egresses from 8.231.167.230, the payment-allowlisted address, and NAT port` \
+  `# exhaustion is per-IP. pivota-crawl egresses from 34.82.199.35.` \
   --set-secrets DATABASE_URL=DATABASE_URL:latest \
   --set-env-vars PIVOTA_ENV=production \
   --max-retries 0 --task-timeout 600s \
@@ -136,7 +139,7 @@ occur in the payload. Note that non-zero is not the container's OWN code —
 failure surfaces as 1 alike; that is why the helper prints gcloud's stderr on
 failure rather than discarding it.
 Reach for the raw form above when you need to change something it does not expose
-(`SECRETS`, `IMAGE`, `TASK_TIMEOUT`, `SERVICE_ACCOUNT` and `JOB_PREFIX` are
+(`SECRETS`, `IMAGE`, `TASK_TIMEOUT`, `SERVICE_ACCOUNT`, `JOB_PREFIX`, `NETWORK` and `SUBNET` are
 environment overrides).
 
 Three things that are easy to get wrong:

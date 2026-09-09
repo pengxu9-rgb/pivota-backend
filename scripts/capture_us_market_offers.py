@@ -83,6 +83,16 @@ Usage
   python3 scripts/capture_us_market_offers.py                 # dry run
   python3 scripts/capture_us_market_offers.py --apply
   python3 scripts/capture_us_market_offers.py --apply --domain palmofferonia.com
+
+THROUGH THE JOB RUNNER, PASS SUBNET=pivota-crawl. This script fetches `/`, `/localization`,
+`/cart.js` and `/products/<handle>.js` from 36 merchant storefronts at REQUEST_GAP_SECONDS=0.6,
+which is close to the shape that was measured tripping a cross-domain IP-level 429 lasting ~15
+minutes (~50 requests over 37 Cloudflare-fronted domains in about a minute). prod's `default`
+subnet egresses from 8.231.167.230, the address given to payment partners for allowlisting, and
+NAT port exhaustion is per-IP — so a burst here can starve payment egress even with clean
+reputation. `pivota-crawl` egresses from 34.82.199.35 instead:
+
+  SUBNET=pivota-crawl scripts/ops/run_oneoff_job.sh scripts/capture_us_market_offers.py --apply
 """
 
 from __future__ import annotations

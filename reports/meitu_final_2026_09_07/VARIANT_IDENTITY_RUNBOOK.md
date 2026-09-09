@@ -137,10 +137,19 @@ gcloud artifacts docker images list us-west1-docker.pkg.dev/pivota-shared/pivota
 
 `deploy-prod` auto-deploys `web` on merge, which is what republishes `:latest`.
 
+> **`SUBNET=pivota-crawl` on both runs below, and it is not optional.** This step uses the job
+> runner *specifically* to obtain merchant egress — the note further down says not to run it from
+> a laptop because `flowerbeauty.com` answers 429 to this office's address. But the runner's
+> default subnet egresses from `8.231.167.230`, the address given to payment partners for
+> allowlisting, and NAT port exhaustion is per-IP, so paging `/products.json` for 49 products and
+> ~185 SKUs there can starve payment egress. `pivota-crawl` egresses from `34.82.199.35`, which is
+> reserved for exactly this. The override landed with the crawl-subnet change; if your checkout
+> predates it, `scripts/ops/run_oneoff_job.sh` will ignore `SUBNET` and you must rebase first.
+
 ### 2.2 Dry run in prod (SAFE — no writes)
 
 ```bash
-scripts/ops/run_oneoff_job.sh scripts/onboard_curated_brands.py \
+SUBNET=pivota-crawl scripts/ops/run_oneoff_job.sh scripts/onboard_curated_brands.py \
   --domain flowerbeauty.com \
   --category "beauty/makeup/lips" \
   --max-products 500 \
@@ -168,7 +177,7 @@ If `skus` is 49 rather than 234, the image does not have the feed fix — stop a
 ### 2.3 Apply — WRITES TO PROD
 
 ```bash
-scripts/ops/run_oneoff_job.sh scripts/onboard_curated_brands.py \
+SUBNET=pivota-crawl scripts/ops/run_oneoff_job.sh scripts/onboard_curated_brands.py \
   --domain flowerbeauty.com \
   --category "beauty/makeup/lips" \
   --max-products 500 \

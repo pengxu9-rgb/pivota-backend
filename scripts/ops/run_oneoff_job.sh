@@ -44,8 +44,11 @@
 #     scripts/ops/run_oneoff_job.sh scripts/some_script.py --apply
 #
 # Environment overrides: PROJECT, REGION, IMAGE, SERVICE_ACCOUNT, SECRETS, ENV_VARS, TASK_TIMEOUT,
-# JOB_PREFIX. SECRETS and ENV_VARS are passed to gcloud verbatim and are themselves comma-separated,
-# so no name or value in them may contain a comma.
+# JOB_PREFIX, NETWORK, SUBNET. SECRETS and ENV_VARS are passed to gcloud verbatim and are themselves
+# comma-separated, so no name or value in them may contain a comma.
+#
+# SUBNET=pivota-crawl IS REQUIRED FOR ANYTHING THAT FETCHES FROM A MERCHANT. See the note beside
+# the variable: the default subnet's NAT address is the one payment partners allowlist.
 #
 # NEVER use this for a script that writes to a database it should not: it mounts PRODUCTION
 # credentials. Read the target script's own docstring first.
@@ -67,6 +70,21 @@ SECRETS="${SECRETS:-DATABASE_URL=DATABASE_URL:latest}"
 ENV_VARS="${ENV_VARS:-PIVOTA_ENV=production,DB_STATEMENT_TIMEOUT_SECONDS=30,DB_COMMAND_TIMEOUT_SECONDS=600}"
 TASK_TIMEOUT="${TASK_TIMEOUT:-600s}"
 JOB_PREFIX="${JOB_PREFIX:-oneoff}"
+# WHICH EGRESS ADDRESS THIS JOB LEAVES BY, and it is not a cosmetic choice. prod has TWO
+# NATs: `pivota-nat` covers the `default` subnet and holds 8.231.167.230, the address given to
+# payment partners for allowlisting, and `pivota-crawl-nat` covers `pivota-crawl` and holds
+# 34.82.199.35. `catalog-intelligence` already runs on the crawl subnet for exactly this
+# reason; web/worker/gateway/proof-issuer stay on default.
+#
+# The default stays `default`, so every existing caller is unchanged. Anything that CRAWLS A
+# MERCHANT must pass SUBNET=pivota-crawl — infra/gcp/setup_egress_nat.sh states the rule and
+# the measurement behind it: ~50 requests over 37 Cloudflare-fronted domains in ~1 minute trip
+# a cross-domain IP-level 429 lasting ~15 minutes, and NAT port exhaustion is per-IP, so a
+# burst crawl on the payment address can starve payment egress even with clean reputation.
+# Before this override the runner hardcoded `default`, so there was no way to obey that rule
+# from a one-off job at all.
+NETWORK="${NETWORK:-default}"
+SUBNET="${SUBNET:-default}"
 
 # Print the whole header comment, however long it grows. A hardcoded line range
 # silently truncates the moment the header changes — which it already has once.
@@ -121,11 +139,16 @@ trap cleanup EXIT
 trap 'cleanup; exit 130' INT
 trap 'cleanup; exit 143' TERM
 
-echo "==> job $JOB  image ${IMAGE##*/}  secrets ${SECRETS%%=*}..." >&2
+# The SUBNET is echoed because it decides which address the job leaves by, and an INHERITED
+# value is otherwise invisible: an operator who exported SUBNET=pivota-crawl for a crawl and
+# then runs an unrelated job in the same shell sends it out of the crawl IP with nothing in the
+# terminal saying so, and `cleanup` deletes the job on exit so no state survives to check. One
+# word, no policy — an allowlist here would reject a legitimate future subnet.
+echo "==> job $JOB  image ${IMAGE##*/}  subnet $SUBNET  secrets ${SECRETS%%=*}..." >&2
 gcloud run jobs create "$JOB" --project "$PROJECT" --region "$REGION" \
   --image "$IMAGE" \
   --service-account "$SERVICE_ACCOUNT" \
-  --network default --subnet default --vpc-egress all-traffic \
+  --network "$NETWORK" --subnet "$SUBNET" --vpc-egress all-traffic \
   --set-secrets "$SECRETS" \
   --set-env-vars "$ENV_VARS" \
   --max-retries 0 --task-timeout "$TASK_TIMEOUT" \
