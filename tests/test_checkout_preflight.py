@@ -410,23 +410,39 @@ async def test_a_structural_exception_follows_the_operators_instruction(monkeypa
 
 async def test_the_report_names_what_it_does_not_cover(monkeypatch):
     """A refusal rate is only meaningful with its denominator named, and this one is narrower
-    than "external offers" in two ways at once: three other hand-over paths publish the same
-    pre-filled cart_url and are not gated, and within the gated lane only cart-prefilled
-    handoffs are asked about. A reader taking it as "how often an external offer is stale"
-    would be wrong twice.
+    than "external offers" in several ways at once: three other hand-over paths publish the
+    same pre-filled cart_url and are not gated; the gated population is a UNION, so it is
+    neither "cart-prefilled only" nor "resolved-identity only"; and two classes inflate
+    `would_block` for reasons about our own data rather than the merchant's stock. A reader
+    taking the rate as "how often an external offer is stale" would be wrong several times.
 
     Asserted on the RETURNED REPORT, not on the constant: a first version checked
     `cp.REPORT_SCOPE` directly, so deleting `scope` from the output dict left it green while
-    the number travelled naked."""
+    the number travelled naked.
+
+    THE PHRASES ARE CHOSEN SO THE OLD STRING FAILS. Round 4 of review reverted `REPORT_SCOPE`
+    verbatim to its pre-#2151 wording and 200 tests stayed green: the old assertion was
+    `"cart-prefilled" in scope`, which the corrected string satisfied by NEGATING it
+    ("NOT only cart-prefilled ones"). An assertion a sentence can satisfy by saying the
+    opposite is not an assertion about meaning.
+    """
     class _Rows:
         async def fetch_all(self, *a, **k):
             return []
 
     monkeypatch.setattr(cp, "database", _Rows())
     report = await cp.shadow_report(window_days=7)
+    scope = report.get("scope", "")
     assert "scope" in report, "the report must carry its own denominator"
-    assert "cart-prefilled" in report["scope"]
-    assert "not gated" in report["scope"]
+    assert "not gated" in scope, "the three ungated lanes are still named"
+    assert "UNION" in scope, (
+        "the gated population is a union of named-variant and would-build-a-cart handoffs; "
+        "any string calling it one of the two alone describes a denominator we do not use")
+    assert "group by reason" in scope, (
+        "would_block is inflated by classes that never reach a merchant; the reader has to be "
+        "told before the rate is read")
+    # NOT `"cart-prefilled" not in scope` — this string names that phrase in order to deny it,
+    # and an assertion that cannot tell naming from denying is the one round 4 reverted past.
 
 
 # ---------------------------------------------------------------------------
@@ -489,10 +505,12 @@ def test_coverage_is_measured_against_the_population_the_gate_applies_to():
     have been dismissed on the strength of it.
 
     #2151 renamed the denominator from `cart_prefilled` to `gated` because the gate moved off
-    `cart_variant_id` and onto the resolved hand-over id — a cart needs storefront evidence the
-    merchant question does not. `cart_prefilled` stays as its own counter, and it is now
-    strictly the SMALLER of the two: every prefilled cart is gated, and on today's corpus
-    almost nothing that is gated gets a cart.
+    `cart_variant_id` and onto the UNION `_handover_id or _cart_vid` — a cart needs storefront
+    evidence the merchant question does not, but the attach lane ships carts we have no catalog
+    row for. `cart_prefilled` stays as its own counter and is strictly the SMALLER of the two:
+    every prefilled cart is gated (which was FALSE for one commit, until round 3 of review made
+    the gate a union rather than a swap), and on today's corpus almost nothing that is gated
+    gets a cart.
     """
     from routes.agent_shop_gateway import preflight_coverage_fields
 

@@ -4550,6 +4550,15 @@ async def _handle_offers_resolve(
                 # The id the gate asks about: the resolved one when we have it, otherwise the
                 # one the buyer would actually be handed. Never both, never None while a cart
                 # exists.
+                #
+                # The `or` half can be a value this module would NOT call identity — the attach
+                # branch ships `extract_shopify_numeric_variant_id(attached_variant_id)`, which
+                # accepts any digit string, when catalog says nothing. That is deliberate and it
+                # costs no merchant request: `checkout_preflight.preflight` classifies the id
+                # FIRST and answers `BLOCK / no_merchant_issued_variant_id` before any egress.
+                # So under `enforce` a cart built from a number Shopify never issued is
+                # withdrawn without asking anyone, which is exactly the right outcome and is the
+                # behaviour the merge base already had.
                 _gate_vid = _handover_id or _cart_vid
                 # `candidates` is every seed offer considered; `gated` is the subset the gate
                 # applies to. Coverage MUST be measured against the second: dividing by the
@@ -8360,17 +8369,29 @@ def _external_seed_redirect_identity(
     # the pipe form is a never-persisted transport (Trap T1). The old parse only
     # handled pipe, so on every real (double-colon) seed merchant/platform/
     # product stayed None → surface_click_events.merchant_id NULL. Handle both.
+    # The BARE source product id, kept beside the full key. `variant_identity` compares a
+    # variant id against its parent with `startswith`, so the full `prod::m::platform::<spid>`
+    # key never matches a bare `<spid>` — passing the key twice, as the first cut of the attach
+    # branch did, is a parent pair that catches half of what it looks like it catches, which is
+    # exactly the defect round 2 added `Candidate.source_product_id` to fix in the resolver.
+    source_product_id: Optional[str] = None
     if attached_key.startswith("prod::"):
         parts = attached_key.split("::")
         if len(parts) >= 4:
             merchant_id = parts[1].strip() or None
             platform = parts[2].strip() or None
             canonical_product_id = attached_key
+            # Rejoined, because a source product id may itself contain the separator.
+            source_product_id = "::".join(parts[3:]).strip() or None
     elif attached_key.count("|") >= 2:
-        merchant_part, platform_part, _rest = attached_key.split("|", 2)
+        merchant_part, platform_part, rest = attached_key.split("|", 2)
         merchant_id = merchant_part.strip() or None
         platform = (platform_part.strip() or None)
         canonical_product_id = attached_key
+        source_product_id = rest.strip() or None
+    source_product_id = source_product_id or str(
+        row.get("external_product_id") or seed_data.get("external_product_id") or ""
+    ).strip() or None
 
     attached_variant_id = str(
         row.get("attached_variant_id") or seed_data.get("attached_variant_id") or ""
@@ -8515,7 +8536,7 @@ def _external_seed_redirect_identity(
         _operator_vid = extract_shopify_numeric_variant_id(attached_variant_id)
         _catalog_vid = handover.variant_id if handover is not None else None
         _operator_is_identity = names_a_merchant_issued_variant(
-            attached_variant_id, product_key=attached_key, product_id=canonical_product_id
+            attached_variant_id, product_key=attached_key, product_id=source_product_id
         )
         if (
             _catalog_vid
@@ -9285,6 +9306,13 @@ async def mint_external_seed_links(body: ExternalSeedLinksRequest) -> Dict[str, 
             row=row, seed_data=seed_data, offer_variant_id=candidate.variant_id,
             handover=_handover_resolver.choose(
                 product_key=_handover_product_key(row, seed_data),
+                # The BARE product id. `product_key` alone cannot catch a variant id that
+                # restates it (`startswith` never matches a full key against a bare id), and a
+                # lane that is parent-blind admits a stamp that restates the product as
+                # identity. Zero cost today — 0 seeds are stamped — and live the moment
+                # `backfill_shopify_variant_ids.py` runs, which is the same argument that put
+                # the contradiction rule in now.
+                product_id=candidate.external_product_id,
                 seed_data=seed_data,
                 offer_variant_id=candidate.variant_id,
             ),
@@ -9419,6 +9447,7 @@ async def _build_prefetched_external_seed_wrappers(
             offer_variant_id=candidate.get("variant_id"),
             handover=_handover_resolver.choose(
                 product_key=_handover_product_key(candidate, _candidate_seed_data),
+                product_id=candidate.get("external_product_id"),
                 seed_data=_candidate_seed_data,
                 offer_variant_id=candidate.get("variant_id"),
             ),
@@ -11772,6 +11801,10 @@ async def _handle_find_products_multi_inner(
                 offer_variant_id=getattr(candidate, "variant_id", None),
                 handover=_handover_resolver.choose(
                     product_key=_handover_product_key(row_dict, seed_data),
+                    product_id=(
+                        row_dict.get("external_product_id")
+                        or seed_data.get("external_product_id")
+                    ),
                     seed_data=seed_data,
                     offer_variant_id=getattr(candidate, "variant_id", None),
                 ),

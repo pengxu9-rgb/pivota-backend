@@ -13,6 +13,7 @@ matter there and a decision test must not need a database to say what it means.
 """
 
 import json
+import os
 
 import pytest
 
@@ -631,12 +632,14 @@ def _wire(monkeypatch, *, seed_row, sku_rows):
     return seen
 
 
-def _resolve(client, sku_id="SKU-30ML"):
+def _resolve(client, sku_id="SKU-30ML", product_id=None):
+    """`sku_id` filters `matched_variants` to the one candidate naming it; `product_id` instead
+    lets the whole variant list through, which is how a multi-variant hand-over is exercised."""
+    product = {"product_id": product_id} if product_id else {"sku_id": sku_id}
     return client.post(
         "/agent/shop/v1/invoke",
         json={"operation": "offers.resolve",
-              "payload": {"product": {"sku_id": sku_id}, "limit": 10, "market": "US",
-                          "tool": "*"},
+              "payload": {"product": product, "limit": 10, "market": "US", "tool": "*"},
               "metadata": {"source": "creator-agent-ui"}},
     )
 
@@ -1243,3 +1246,120 @@ async def test_the_resolver_threads_the_products_own_id_into_the_decision():
     )
     assert got.variant_id == VID and got.reason == R_SEED_STAMP, (
         "the name restates the product's own id, so it cannot contradict the stamp")
+
+
+async def test_an_operator_cart_from_a_non_identity_value_is_refused_without_asking_anyone():
+    """The `or` half of `_gate_vid` can be a value this module would not call identity — the
+    attach branch ships any digit string when catalog is silent. That must cost NO merchant
+    request: `checkout_preflight.preflight` classifies the id before any egress and blocks.
+
+    Pinned here rather than trusted, because the union was added in round 3 and the obvious
+    worry about it is that it sends `_check_one` off to compare a 5-digit number against a
+    storefront that will never match it.
+    """
+    from services import checkout_preflight, live_offer_verification
+
+    asked = []
+
+    async def never(*a, **kw):
+        asked.append(kw)
+        raise AssertionError("no merchant request may be made for a non-identity id")
+
+    original = live_offer_verification._check_one
+    live_offer_verification._check_one = never
+    prior = os.environ.get("CHECKOUT_PREFLIGHT_MODE")
+    os.environ["CHECKOUT_PREFLIGHT_MODE"] = "enforce"
+    try:
+        verdict = await checkout_preflight.preflight({
+            "offer_id": "of:test:1",
+            "product_key": PK,
+            "source_product_id": SPID,
+            "execution_spec": {"pdp_url": "https://brand.com/products/serum",
+                               "variant_id": "12345"},
+        })
+    finally:
+        live_offer_verification._check_one = original
+        if prior is None:
+            os.environ.pop("CHECKOUT_PREFLIGHT_MODE", None)
+        else:
+            os.environ["CHECKOUT_PREFLIGHT_MODE"] = prior
+
+    assert asked == [], "the id was classified first; no merchant was contacted"
+    assert verdict.outcome == checkout_preflight.BLOCK
+    assert verdict.reason == checkout_preflight.R_NO_MERCHANT_VARIANT
+    assert not verdict.allows_checkout
+
+
+def test_the_attach_branch_is_given_the_bare_product_id_not_the_key_twice(monkeypatch, client):
+    """MUTANT: `product_id=canonical_product_id` (which IS `attached_key`).
+
+    `variant_identity` compares a variant id to its parent with `startswith`, so the full
+    `prod::m::platform::<spid>` key never matches a bare `<spid>` — passing the key as BOTH
+    parents is a pair that catches half of what it looks like it catches. Round 2 added
+    `Candidate.source_product_id` to the resolver for exactly this reason; round 4 found the
+    attach branch still doing it, so the one shared predicate gave one string two verdicts.
+
+    Concretely: an operator pastes the PRODUCT id into the attach form. The resolver, given the
+    bare id, calls it a restatement and resolves the catalog row; the attach branch, given the
+    key twice, called it identity and withdrew the cart. Fail-closed, but it loses a hand-over
+    we had resolved.
+    """
+    # NUMERIC, because that is the only shape where the two parent pairs disagree: a
+    # non-numeric operator value is UNVERIFIABLE under both and never vetoes anything, so a
+    # test built on one would pass under the mutant. The merchant's own numeric product id
+    # pasted into the attach form is a real shape — `ingestion.py` restates exactly it.
+    spid = "80072940"
+    shopify_pk = f"prod::m_brand::shopify::{spid}"
+    row = _seed_row(attached_product_key=shopify_pk)
+    row["attached_variant_id"] = spid
+    row["external_product_id"] = spid
+
+    seen = _wire(
+        monkeypatch, seed_row=row,
+        sku_rows=[_row(product_key=shopify_pk, source_product_id=spid,
+                       source_variant_id=CATALOG_VID, sku_payload=None)])
+    assert _resolve(client).status_code == 200
+    assert seen["cart_variant_id"] == CATALOG_VID, (
+        "the operator value restates the product's own id, so it is not identity and may not "
+        "veto the catalog row")
+
+
+def test_the_preflight_memo_is_keyed_on_the_variant_as_well_as_the_page(monkeypatch, client):
+    """MUTANT: `_q = (pdp_url,)`, dropping the variant.
+
+    Pre-existing shape, but the union puts more distinct ids through this key than before: two
+    candidates on one `canonical_url` naming different variants are two different questions, and
+    collapsing them makes one merchant answer stand for both — under `enforce`, one variant's
+    `gone` withdraws the other's working cart.
+    """
+    import routes.agent_shop_gateway as gateway
+
+    asked = []
+
+    async def counting_preflight(offer):
+        asked.append(offer["execution_spec"]["variant_id"])
+        return True
+
+    _wire(
+        monkeypatch,
+        seed_row=_seed_row(
+            snapshot_extra={"storefront_platform": "shopify"},
+            variants=[
+                {"variant_id": CATALOG_VID, "title": "30ml", "price_amount": 19.0,
+                 "price_currency": "USD", "availability": "in_stock"},
+                {"variant_id": OTHER_VID, "title": "50ml", "price_amount": 29.0,
+                 "price_currency": "USD", "availability": "in_stock"},
+            ],
+        ),
+        sku_rows=[
+            _row(sku_key="a", source_variant_id=CATALOG_VID, sku_payload=None),
+            _row(sku_key="b", source_variant_id=OTHER_VID, sku_payload=None),
+        ],
+    )
+    monkeypatch.setattr(gateway, "_preflight_allows_external_offer", counting_preflight)
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MAX_PER_REQUEST", "8")
+    assert _resolve(client, product_id="sig_handover_memo").status_code == 200
+
+    assert sorted(asked) == sorted([CATALOG_VID, OTHER_VID]), (
+        "one page, two variants, two questions — the memo may not collapse them")
