@@ -114,8 +114,9 @@ _SELECT = """
 class Candidate:
     """One live `catalog_skus` row whose id we can positively place as the merchant's.
 
-    TWO SPELLINGS, deliberately. `stored_variant_id` is the column's own value; `variant_id` is
-    the one CANONICAL form every consumer gets. They differ only for
+    TWO SPELLINGS, and only ONE of them decides anything. `variant_id` is the CANONICAL form
+    every consumer gets and the only one `answers_to` compares; `stored_variant_id` is the
+    column's own value, kept so a wrong cart can be traced back to the row that spelled it. They differ only for
     `gid://shopify/ProductVariant/<n>`, which `services.variant_identity` admits as identity and
     which every other reader in this lane has always normalised away
     (`outbound_links_service.extract_shopify_numeric_variant_id`, `shopify_variant_identity._numeric_id`).
@@ -131,14 +132,24 @@ class Candidate:
     variant_id: str
     stamped: bool
     stored_variant_id: str = ""
+    #: The OTHER parent `variant_id_provenance` compares against. Carried because the
+    #: contradiction check has to ask exactly the question admission asked, and admission passes
+    #: both — `ingestion.py` restates `product_key` while `onboard_external_brand_from_crawl`
+    #: restates `source_product_id`, so a predicate holding only one of them calls half the
+    #: forgeries identity.
+    source_product_id: str = ""
 
     def answers_to(self, name: str) -> bool:
-        """True when `name` is this variant, in either spelling. Equality, never a preference."""
-        if not name:
-            return False
-        return name in (self.variant_id, self.stored_variant_id) or (
-            canonical_variant_id(name) == self.variant_id
-        )
+        """True when `name` is this variant, in EITHER spelling. Equality, never a preference.
+
+        One comparison, not two. A first version also checked `name in (self.variant_id,
+        self.stored_variant_id)`; review showed that clause is subsumed — `variant_id` is
+        already canonical and `stored_variant_id` is only ever the gid whose canonical form IS
+        `variant_id` — and removing it left every test green, which is the definition of dead
+        code dressed as a guard. `stored_variant_id` is kept as the column's own value for
+        diagnostics (`sku_key` and it are what you grep for), not as a matching input.
+        """
+        return bool(name) and canonical_variant_id(name) == self.variant_id
 
 
 @dataclass(frozen=True)
@@ -158,6 +169,39 @@ class HandoverVariant:
 
 def _norm(value: Any) -> str:
     return str(value or "").strip()
+
+
+def names_a_merchant_issued_variant(
+    value: Any,
+    *,
+    product_key: Optional[Any] = None,
+    product_id: Optional[Any] = None,
+    handle: Optional[Any] = None,
+) -> bool:
+    """THE question "is this string a variant id the MERCHANT issued?", asked in ONE place.
+
+    Round 2 of review found it being asked in three, with three different predicates, in a
+    module whose whole argument is that there should be one — and the divergences were real
+    defects, not tidiness:
+
+      * admission classified the id PARENT-AWARE (`product_key`/`product_id` passed), while the
+        contradiction guard classified the hand-over's NAME parent-free. `variant_identity`
+        checks derivation BEFORE shape, so a numeric product id restated as a variant name read
+        as merchant-issued to one and product-derived to the other, and a good candidate was
+        refused as "contradicted" by a name the module itself calls a forgery;
+      * the route's attach branch asked `extract_shopify_numeric_variant_id`, which accepts ANY
+        digit string, so a 5-digit operator SKU could veto a real catalog id — under a comment
+        claiming the two branches applied the same rule.
+
+    The id is canonicalised BEFORE classification, so `gid://shopify/ProductVariant/<n>` and
+    `<n>` cannot get different answers about the same variant.
+    """
+    canonical = canonical_variant_id(value)
+    if not canonical:
+        return False
+    return is_merchant_issued_variant_id(
+        canonical, product_key=product_key, product_id=product_id, handle=handle
+    )
 
 
 def canonical_variant_id(value: Any) -> str:
@@ -223,9 +267,9 @@ def candidate_from_row(row: Any, rejects: Optional[Dict[str, int]] = None) -> Op
         return None
 
     product_key = _norm(d.get("product_key"))
-    if variant_id_provenance(
+    if not names_a_merchant_issued_variant(
         svid, product_key=product_key, product_id=d.get("source_product_id")
-    ) != MERCHANT_ISSUED:
+    ):
         if rejects is not None:
             rejects[X_NOT_MERCHANT_ISSUED] = rejects.get(X_NOT_MERCHANT_ISSUED, 0) + 1
         return None
@@ -249,6 +293,7 @@ def candidate_from_row(row: Any, rejects: Optional[Dict[str, int]] = None) -> Op
         variant_id=canonical_variant_id(svid),
         stamped=bool(stamp),
         stored_variant_id=svid,
+        source_product_id=_norm(d.get("source_product_id")),
     )
 
 
@@ -257,6 +302,7 @@ def choose_handover_variant(
     *,
     seed_data: Any = None,
     offer_variant_id: Any = None,
+    product_key: Any = None,
     primed: bool = True,
     lookup_ok: bool = True,
 ) -> HandoverVariant:
@@ -271,6 +317,15 @@ def choose_handover_variant(
 
     live = list(candidates or [])
     wanted = _norm(offer_variant_id)
+    # PARENT-AWARE, and computed ONCE for both paths below. `variant_identity` checks
+    # derivation before shape, so this predicate needs the product it is relative to or it
+    # calls a restated product id "merchant-issued" — round 2 found exactly that, refusing a
+    # good candidate as contradicted by a name the module itself calls a forgery.
+    named_identity = names_a_merchant_issued_variant(
+        wanted,
+        product_key=(live[0].product_key if live else _norm(product_key)),
+        product_id=(live[0].source_product_id if live else None),
+    )
 
     if live:
         # THE NAME IS CHECKED BEFORE THE COUNT, and that order is the fix for the first cut's
@@ -288,7 +343,7 @@ def choose_handover_variant(
                 R_EXACT if len(live) > 1 else R_SOLE,
                 SOURCE_CATALOG_SKU, hits[0].sku_key, len(live),
             )
-        if not hits and wanted and is_merchant_issued_variant_id(wanted):
+        if not hits and named_identity:
             return HandoverVariant(None, R_CONTRADICTED, None, None, len(live))
 
     if len(live) == 1:
@@ -313,11 +368,21 @@ def choose_handover_variant(
     # hand-over id that `checkout_preflight` would then refuse as
     # `no_merchant_issued_variant_id`, a refusal this resolver had caused. One rule for both
     # sources, or the module's own guarantee is only true of half its answers.
-    if stamped and is_merchant_issued_variant_id(stamped):
-        return HandoverVariant(
-            canonical_variant_id(stamped), R_SEED_STAMP, SOURCE_SEED_STAMP, None, 0
-        )
-    return HandoverVariant(None, R_NO_IDENTITY, None, None, 0)
+    if not (stamped and names_a_merchant_issued_variant(stamped, product_key=product_key)):
+        return HandoverVariant(None, R_NO_IDENTITY, None, None, 0)
+
+    canonical_stamp = canonical_variant_id(stamped)
+    # AND THE SAME CONTRADICTION RULE. Round 2 found it guarding the catalog path only, so the
+    # disagreement refused one branch up was resolved in the stamp's favour on the other —
+    # `sole_stamped_variant_id` reads `shopify_variant_id` while `_seed_offer_variant_id` reads
+    # `variant_id | variantId | sku | sku_id | id`, so ONE snapshot entry can carry two
+    # merchant-issued ids that disagree with no data corruption at all, and the buyer got a
+    # cart for the one they did not name. Nothing takes this path on today's corpus (0 of
+    # 11,834 seeds are stamped); it goes live the moment `backfill_shopify_variant_ids.py` runs,
+    # which is the stated plan, so the rule belongs here now rather than after the incident.
+    if named_identity and canonical_variant_id(wanted) != canonical_stamp:
+        return HandoverVariant(None, R_CONTRADICTED, None, None, 0)
+    return HandoverVariant(canonical_stamp, R_SEED_STAMP, SOURCE_SEED_STAMP, None, 0)
 
 
 class HandoverVariantResolver:
@@ -336,10 +401,13 @@ class HandoverVariantResolver:
     def __init__(self, *, timeout_s: Optional[float] = None, max_keys: Optional[int] = None) -> None:
         self._by_key: Dict[str, List[Candidate]] = {}
         self._primed: set = set()
-        #: Keys whose batch RAISED. Per key rather than one latch: a latch made a single slow
-        #: statement suppress the seed-stamp path for standalone seeds in the same request,
-        #: which never needed the lookup at all — a failure about one product key is not
-        #: evidence about another.
+        #: Keys whose batch RAISED. Per key rather than one latch, because a failure about one
+        #: product key is not evidence about another: three lanes prime this resolver, and a
+        #: latch let one slow statement refuse every ATTACHED seed the later lanes loaded fine.
+        #: (An earlier version of this note named standalone seeds as the cohort a latch would
+        #: silence. That was wrong twice over — review falsified it — because `choose` takes the
+        #: no-product-key branch before it consults `_failed` at all, so a standalone seed is
+        #: unaffected under either design. The real cohort is a keyed seed in a later batch.)
         self._failed: set = set()
         self.stats: Dict[str, int] = {
             "handover_considered": 0,
@@ -359,7 +427,11 @@ class HandoverVariantResolver:
             timeout_s = _env_float("HANDOVER_VARIANT_LOOKUP_TIMEOUT_SECONDS", _DEFAULT_TIMEOUT_S)
         if max_keys is None:
             max_keys = _env_int("HANDOVER_VARIANT_LOOKUP_MAX_KEYS", _DEFAULT_MAX_KEYS)
-        self._timeout_s = max(0.0, float(timeout_s))
+        # A CONFIGURED ZERO IS NOT "no limit". `asyncio.wait_for(..., timeout=None)` waits
+        # forever, so `self._timeout_s or None` turned the most natural spelling of "do not
+        # wait" into an unbounded await on a serving path whose comment promises a bound. Zero
+        # or negative falls back to the default rather than removing the guard.
+        self._timeout_s = float(timeout_s) if float(timeout_s) > 0 else _DEFAULT_TIMEOUT_S
         self._max_keys = max(0, int(max_keys))
 
     async def prime(self, product_keys: Iterable[Any]) -> None:
@@ -367,11 +439,10 @@ class HandoverVariantResolver:
 
         Fail-soft on the DB call ONLY, and the softness is a refusal, not a pass: the keys in
         the failed batch are recorded in `_failed`, and `choose` answers `sku_lookup_failed`
-        with no id for each of them until a later `prime` loads them. PER KEY, never one latch
-        — a failure about one product key is not evidence about another, and a latch made a
-        single slow statement silence standalone seeds that needed no lookup at all. An earlier
-        shape of this in the same route caught the DERIVATION too, which turned a programming
-        error into a feature that silently never ran.
+        with no id for each of them until a later `prime` loads them. PER KEY, never one latch —
+        see the note on `_failed` for the cohort that actually costs. An earlier shape of this
+        in the same route caught the DERIVATION too, which turned a programming error into a
+        feature that silently never ran.
         """
         wanted: List[str] = []
         for key in product_keys or ():
@@ -385,7 +456,7 @@ class HandoverVariantResolver:
             return
 
         try:
-            rows = await asyncio.wait_for(self._fetch(wanted), timeout=self._timeout_s or None)
+            rows = await asyncio.wait_for(self._fetch(wanted), timeout=self._timeout_s)
         except Exception as exc:  # noqa: BLE001
             self._failed.update(wanted)
             logger.warning(
@@ -463,6 +534,7 @@ class HandoverVariantResolver:
             self._by_key.get(key),
             seed_data=seed_data,
             offer_variant_id=offer_variant_id,
+            product_key=key,
             primed=key in self._primed,
             lookup_ok=key not in self._failed,
         )

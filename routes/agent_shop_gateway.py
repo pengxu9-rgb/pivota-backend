@@ -91,8 +91,10 @@ from services import live_offer_verification
 from services.handover_variant_identity import (
     HandoverVariant,
     HandoverVariantResolver,
+    canonical_variant_id,
     handover_coverage_fields,
     handover_coverage_message,
+    names_a_merchant_issued_variant,
 )
 from services.shopify_variant_identity import (
     sole_stamped_variant_id,
@@ -4482,7 +4484,7 @@ async def _handle_offers_resolve(
                 # build a Shopify cart permalink on. The second fact is stored on 0 of 11,834
                 # active seeds (`snapshot.storefront_platform`, measured on prod 2026-09-08),
                 # so keying the gate on the intersection kept the shadow report's denominator
-                # empty even for the 3,875 seeds whose variant we CAN now name. The question
+                # empty even for the 3,871 seeds whose variant we CAN now name. The question
                 # the preflight asks the merchant — "does this variant still exist, is it in
                 # stock" — needs only the first fact. So it is asked on the resolved hand-over
                 # id, and the cart, which needs both, is still decided by
@@ -4518,8 +4520,6 @@ async def _handle_offers_resolve(
                 # kept as its own counter because it is a different question (how many
                 # hand-overs actually got a cart) and folding the two lost it.
                 _preflight_stats["candidates"] += 1
-                if _cart_vid:
-                    _preflight_stats["cart_prefilled"] += 1
                 # `is_enabled()` here, not only inside the helper. The helper short-circuits so
                 # no request is spent when off — but the COUNTERS still moved, so an off
                 # request attached coverage fields describing work nobody did.
@@ -4582,6 +4582,13 @@ async def _handle_offers_resolve(
                         _preflight_stats["degraded_to_referral"] += 1
                         redirect_identity = dict(redirect_identity)
                         redirect_identity["cart_variant_id"] = None
+
+                # COUNTED AFTER THE GATE, not before it. Its comment defines it as "how many
+                # hand-overs actually got a cart"; counted at `_cart_vid` above it also counted
+                # the ones this very request then withdrew, so the number contradicted its own
+                # definition by exactly `degraded_to_referral`.
+                if redirect_identity.get("cart_variant_id"):
+                    _preflight_stats["cart_prefilled"] += 1
 
                 # T2-12: mint the join key HERE, not inside the builder, and hand the same one
                 # to both. The id has to be identical on the surface_click_events row, on the
@@ -8437,23 +8444,36 @@ def _external_seed_redirect_identity(
         # wrong-cart report ever traces back here, this is why.
         #
         # #2151: the SKU chain is consulted now, and it is consulted FIRST. That is the
-        # opposite of what the sentence above used to say, and the reason is the sentence
-        # above it: this is the one branch whose input is operator-typed, with no catalog
-        # lookup behind it. A `catalog_skus` row that `services/variant_identity` calls
-        # MERCHANT_ISSUED is better provenance than a string somebody pasted into an attach
-        # form, so it wins where it exists. Where it does not, the operator value is still
-        # used exactly as before — this is a widening, never a narrowing, so no hand-over
-        # that worked yesterday stops working.
+        # opposite of what the sentence above used to say, and the reason is the sentence above
+        # it: this is the one branch whose input is operator-typed, with no catalog lookup
+        # behind it. A `catalog_skus` row that `services/variant_identity` calls MERCHANT_ISSUED
+        # is better provenance than a string somebody pasted into an attach form.
+        #
+        # THREE ANSWERS, and the middle one is the round-1 P1. The first cut let a lone catalog
+        # row win unconditionally: an operator had attached the $140 Standard, catalog held one
+        # merchant-issued row for the $95 Mini, and the buyer's prefilled cart named the Mini —
+        # the wrong-size hazard this lane refuses on the other branch, reached through the one
+        # door left open. So: they agree, or catalog speaks alone, and we use the id; they are
+        # two DIFFERENT merchant-issued ids, and we do not know which physical thing the buyer
+        # would receive, so the honest answer is a referral; catalog says nothing, and the
+        # operator value is used exactly as before.
+        #
+        # ONE PREDICATE, not two. Round 2 found this branch asking
+        # `extract_shopify_numeric_variant_id`, which accepts ANY digit string, while the
+        # resolver required 8+ digits or a gid — so a 5-digit operator SKU could veto a real
+        # catalog id, under a comment claiming both branches applied the same rule.
+        # `names_a_merchant_issued_variant` is that rule, parent-aware, shared with the
+        # resolver's own admission and contradiction checks.
         _operator_vid = extract_shopify_numeric_variant_id(attached_variant_id)
         _catalog_vid = handover.variant_id if handover is not None else None
-        if _operator_vid and _catalog_vid and _operator_vid != _catalog_vid:
-            # CONTRADICTION, so silence. Round-1 review of #2151 found the first cut letting a
-            # LONE catalog row win here unconditionally: an operator had attached the $140
-            # Standard, catalog held one merchant-issued row for the $95 Mini, and the buyer's
-            # prefilled cart named the Mini. That is the wrong-size hazard this whole lane
-            # refuses on the other branch, reached through the one door left open. Two
-            # merchant-issued ids disagreeing about one hand-over means we do not know which
-            # physical thing the buyer would receive, and the honest answer is a referral.
+        _operator_is_identity = names_a_merchant_issued_variant(
+            attached_variant_id, product_key=attached_key, product_id=canonical_product_id
+        )
+        if (
+            _catalog_vid
+            and _operator_is_identity
+            and canonical_variant_id(attached_variant_id) != _catalog_vid
+        ):
             cart_variant_id = None
         else:
             cart_variant_id = _catalog_vid or _operator_vid

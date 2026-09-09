@@ -190,7 +190,7 @@ def test_two_candidates_and_no_name_refuses_rather_than_picking_one():
 def test_two_candidates_and_an_exact_name_resolves_that_one():
     """String equality against a STORED merchant-issued id is identity, not inference.
 
-    1,011 of the 3,875 resolvable seeds (prod, 2026-09-08) land here — they are multi-variant
+    1,011 of the 3,871 resolvable seeds (prod, 2026-09-08) land here — they are multi-variant
     products whose hand-over names one variant — so refusing this case would throw away a
     quarter of the recovered identity.
     """
@@ -845,7 +845,7 @@ def test_the_shopify_attach_branch_has_three_answers_and_the_middle_one_is_silen
     none_stored = _wire(monkeypatch, seed_row=row_disagreeing, sku_rows=[])
     assert _resolve(client).status_code == 200
     assert none_stored["cart_variant_id"] == "99999999999999", (
-        "no catalog row: unchanged behaviour, so this is a widening and not a narrowing")
+        "no catalog row: unchanged behaviour")
 
 
 def test_a_key_carried_only_inside_seed_data_is_still_looked_up(monkeypatch, client):
@@ -899,3 +899,192 @@ def test_the_lookup_is_one_statement_for_the_whole_seed_batch(monkeypatch, clien
     assert len(sku_queries) == 1, f"one statement for the batch, got {len(sku_queries)}"
     assert set(sku_queries[0].values()) == {PK, PK + "-two"}, (
         "both keys must travel in the SAME statement, as bound values")
+
+
+# ---------------------------------------------------------------------------------------------
+# Round 2. Three spellings of one question became one; these hold it that way.
+# ---------------------------------------------------------------------------------------------
+
+def test_the_seed_stamp_path_obeys_the_contradiction_rule_too():
+    """MUTANT: keep the name check inside `if live:`.
+
+    THIS IS THE ROUND-2 P1. `sole_stamped_variant_id` reads `shopify_variant_id` while
+    `_seed_offer_variant_id` reads `variant_id | variantId | sku | sku_id | id` — two different
+    functions over the SAME variant dict — so one snapshot entry can carry two merchant-issued
+    ids that disagree, with no data corruption at all. With the rule on the catalog path only,
+    the disagreement refused one branch up was resolved in the stamp's favour, and the buyer got
+    a cart for the variant they did not name.
+
+    Nothing takes this path on today's corpus (0 of 11,834 seeds are stamped). It goes live the
+    moment `scripts/backfill_shopify_variant_ids.py` runs at scale, which is the stated plan.
+    """
+    seed = _seed({"shopify_variant_id": VID, "variant_id": VID_B})
+    got = choose_handover_variant([], seed_data=seed, offer_variant_id=VID_B)
+    assert got.variant_id is None and got.reason == R_CONTRADICTED
+
+    agreeing = choose_handover_variant([], seed_data=seed, offer_variant_id=VID)
+    assert agreeing.variant_id == VID and agreeing.reason == R_SEED_STAMP
+
+    unnamed = choose_handover_variant([], seed_data=seed)
+    assert unnamed.variant_id == VID, "no name is not a disagreement"
+
+
+def test_the_contradiction_predicate_is_parent_aware_like_the_admission_one():
+    """MUTANT: `is_merchant_issued_variant_id(wanted)` with no parents.
+
+    `variant_identity` checks DERIVATION BEFORE SHAPE, so the same string is `product_derived`
+    with a parent and `merchant_issued` without one. Admission passed the parent; the
+    contradiction guard did not — so a numeric product id restated as the snapshot variant's
+    `sku` (the shape `ingestion.py` and `onboard_external_brand_from_crawl` both mint) refused
+    a perfectly good candidate as "contradicted" by a name the module itself calls a forgery.
+    """
+    numeric_pk = "prod::m_brand::external_seed::80072940"
+    cand = Candidate(sku_key=numeric_pk + "::v:" + VID, product_key=numeric_pk,
+                     variant_id=VID, stamped=True, stored_variant_id=VID,
+                     source_product_id="80072940")
+    got = choose_handover_variant([cand], offer_variant_id="80072940")
+    assert got.variant_id == VID and got.reason == R_SOLE, (
+        "the name restates the product's own id, so it is not identity and cannot contradict")
+
+    # ...and the SAME string, with no product to be relative to, IS identity — which is the
+    # whole reason the two predicates could disagree.
+    assert choose_handover_variant(
+        [Candidate(sku_key="k", product_key="prod::m::x::handle", variant_id=VID,
+                   stamped=True, stored_variant_id=VID, source_product_id="handle")],
+        offer_variant_id="80072940",
+    ).reason == R_CONTRADICTED
+
+
+def test_one_predicate_answers_the_identity_question_everywhere():
+    """The three call sites agree because there is one function, and it is parent-aware.
+
+    Pinned as a property rather than through its callers, because the failure mode round 2
+    found was two call sites disagreeing about ONE string, which no single-caller test can see.
+    """
+    from services.handover_variant_identity import names_a_merchant_issued_variant
+
+    assert names_a_merchant_issued_variant(VID)
+    assert names_a_merchant_issued_variant("gid://shopify/ProductVariant/" + VID), (
+        "canonicalised before classification, so the two spellings cannot get two answers")
+    assert not names_a_merchant_issued_variant("12345"), "5 digits is not a Shopify id"
+    assert not names_a_merchant_issued_variant("SKU-30ML")
+    assert not names_a_merchant_issued_variant(VID, product_key=VID), (
+        "an id that restates the product it belongs to is a forgery, whatever its shape")
+    assert not names_a_merchant_issued_variant("80072940", product_id="80072940")
+    assert not names_a_merchant_issued_variant("")
+
+
+def test_a_short_operator_sku_cannot_veto_a_real_catalog_id(monkeypatch, client):
+    """MUTANT: `extract_shopify_numeric_variant_id(attached_variant_id)` as the veto predicate.
+
+    That accepts ANY digit string, so a 5-digit operator SKU withdrew a cart the catalog row
+    could have built — while a comment claimed the branch applied the resolver's rule. A value
+    that is not identity cannot disagree with identity.
+    """
+    shopify_pk = "prod::m_brand::shopify::brand-serum"
+    row = _seed_row(attached_product_key=shopify_pk)
+    row["attached_variant_id"] = "12345"
+    seen = _wire(
+        monkeypatch, seed_row=row,
+        sku_rows=[_row(product_key=shopify_pk, source_variant_id=CATALOG_VID, sku_payload=None)])
+    assert _resolve(client).status_code == 200
+    assert seen["cart_variant_id"] == CATALOG_VID
+
+
+async def test_the_row_counters_count_rows():
+    """MUTANT: `self.stats["handover_rows_scanned"] += 0` (and the same for rejected).
+
+    Both survived round 2's mutation because the only test touching them fed
+    `handover_coverage_fields` a hand-built dict — it pinned the formatter, not the counter.
+    These two are the only production evidence that the stamp veto and the truncation guard
+    ever fire, which is the whole justification for keeping them.
+    """
+    r = _FakeResolver({PK: [
+        _row(sku_key="a"),
+        _row(sku_key="b", source_variant_id=PK, sku_payload=None),
+        _row(sku_key="c", sku_payload=json.dumps({"variant_id_provenance": "product_derived"})),
+    ]})
+    await r.prime([PK])
+    assert r.stats["handover_rows_scanned"] == 3
+    assert r.stats["handover_rows_rejected"] == 2
+    f = handover_coverage_fields({**r.stats, "handover_considered": 1})
+    assert f["handover_rows_scanned"] == 3 and f["handover_rows_rejected"] == 2
+    assert f["handover_rows_stamp_vetoed"] == 1
+
+
+async def test_a_configured_zero_timeout_is_not_an_unbounded_await():
+    """MUTANT: `timeout=self._timeout_s or None`.
+
+    `asyncio.wait_for(..., timeout=None)` waits forever, so the most natural spelling of "do
+    not wait" removed the only wall-clock bound on a serving path — the inverse of what the
+    operator asked for, silently.
+    """
+    import asyncio as _asyncio
+
+    class _SlowResolver(HandoverVariantResolver):
+        async def _fetch(self, keys):
+            await _asyncio.sleep(5)
+            return []
+
+    r = _SlowResolver(timeout_s=0)
+    await r.prime([PK])
+    assert r.choose(product_key=PK).reason == R_LOOKUP_FAILED, (
+        "a configured 0 must fall back to the default bound, never to no bound")
+
+
+def test_the_cart_counter_does_not_count_a_cart_the_gate_withdrew(monkeypatch, client, caplog):
+    """MUTANT: increment `cart_prefilled` at `_cart_vid`, before the gate runs.
+
+    Its comment defines it as "how many hand-overs actually got a cart". Counted before the
+    gate it also counts the ones this very request then degraded to a referral, so the number
+    contradicts its own definition by exactly `degraded_to_referral` — and that is the number
+    someone reads to decide whether arming `enforce` cost anything.
+    """
+    import logging
+
+    import routes.agent_shop_gateway as gateway
+
+    async def refusing(offer):
+        return False
+
+    _wire(
+        monkeypatch,
+        seed_row=_seed_row(snapshot_extra={"storefront_platform": "shopify"}),
+        sku_rows=[_row(source_variant_id=CATALOG_VID, sku_payload=None)],
+    )
+    monkeypatch.setattr(gateway, "_preflight_allows_external_offer", refusing)
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "enforce")
+    with caplog.at_level(logging.INFO):
+        assert _resolve(client).status_code == 200
+
+    rec = next(r for r in caplog.records
+               if r.getMessage().startswith("offers.resolve.summary"))
+    assert rec.preflight_gated == 1
+    assert rec.preflight_degraded_to_referral == 1
+    assert rec.preflight_carts_built == 0, (
+        "the gate withdrew the only cart on this request; counting it is a false claim")
+
+
+def test_the_row_column_wins_over_a_stale_snapshot_copy_of_the_key(monkeypatch, client):
+    """MUTANT: `seed_data.get(...) or row.get(...)` in `_handover_product_key`.
+
+    `_external_seed_redirect_identity` parses merchant, platform and product from the ROW first.
+    If the resolver preferred the snapshot, a row whose column holds key A while a stale
+    snapshot holds key B would have merchant and product parsed for A and the variant looked up
+    for B — B's variant id published as A's cart. The two reads have to agree, and nothing but
+    a test holds them together.
+    """
+    other_pk = "prod::m_other::external_seed::other-serum"
+    row = _seed_row(snapshot_extra={"storefront_platform": "shopify"})
+    row["seed_data"]["attached_product_key"] = other_pk
+
+    seen = _wire(
+        monkeypatch, seed_row=row,
+        sku_rows=[
+            _row(source_variant_id=CATALOG_VID, sku_payload=None),
+            _row(product_key=other_pk, sku_key="other", source_variant_id=OTHER_VID,
+                 sku_payload=None),
+        ])
+    assert _resolve(client).status_code == 200
+    assert seen["cart_variant_id"] == CATALOG_VID, (
+        "the row's own column is the key the identity parse used, so it is the key we look up")
