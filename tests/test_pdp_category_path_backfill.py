@@ -685,14 +685,58 @@ def test_classification_inputs_keep_what_the_merchant_actually_said():
     assert ptype == "Lipstick"
 
 
-def test_shallow_predicate_is_opt_in():
-    """The default must stay NULL-only: this script has been run before, and silently widening its
-    blast radius would surprise whoever runs it next."""
-    import inspect
-    from scripts.backfill_pdp_category_path import _fetch_batch, MIN_ROUTABLE_DEPTH
-    src = inspect.getsource(_fetch_batch)
-    assert "category_path IS NULL" in src
-    assert "include_shallow" in src
-    assert MIN_ROUTABLE_DEPTH == 3
-    # the shallow clause must be reachable ONLY through the flag
-    assert src.index("predicate = \"category_path IS NULL\"") < src.index("if include_shallow:")
+async def _drive_fetch(monkeypatch, *, include_shallow):
+    """Capture the SQL and params _fetch_batch actually hands the driver.
+
+    The previous version of this test read the SOURCE TEXT of _fetch_batch and asserted strings
+    were present. It passed against a build whose DEFAULT path raised ArgumentError before any SQL
+    ran, because a bound parameter (:max_depth) was supplied that the default predicate never
+    references — and routes/admin_catalog_debug.py calls that default path over HTTP. Source
+    inspection cannot see a query/params mismatch; driving the call can.
+    """
+    import scripts.backfill_pdp_category_path as bf
+    seen = {}
+
+    async def fake_fetch_all(query, values=None):
+        seen["query"] = str(query)
+        seen["values"] = dict(values or {})
+        return []
+
+    monkeypatch.setattr(bf.database, "fetch_all", fake_fetch_all)
+    await bf._fetch_batch(10, None, include_shallow=include_shallow)
+    return seen
+
+
+def test_default_mode_binds_only_what_the_predicate_uses(monkeypatch):
+    """Regression: every :placeholder in the SQL must exist in params, and vice versa.
+    SQLAlchemy's text().bindparams() raises on an extra one, which crashed the default path."""
+    import asyncio, re
+    seen = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+        _drive_fetch(monkeypatch, include_shallow=False))
+    placeholders = set(re.findall(r":([a-z_]+)", seen["query"]))
+    assert placeholders == set(seen["values"]), (placeholders, set(seen["values"]))
+    assert "max_depth" not in seen["values"]
+    assert "category_path IS NULL" in seen["query"]
+
+
+def test_shallow_mode_binds_its_own_placeholder(monkeypatch):
+    import asyncio, re
+    seen = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+        _drive_fetch(monkeypatch, include_shallow=True))
+    placeholders = set(re.findall(r":([a-z_]+)", seen["query"]))
+    assert placeholders == set(seen["values"]), (placeholders, set(seen["values"]))
+    assert seen["values"]["max_depth"] >= 1
+
+
+def test_two_segment_leaves_are_routable_and_must_not_be_rewritten():
+    """`depth < 3` was the wrong rule: these are LEAVES that prefix recall reaches."""
+    from scripts.backfill_pdp_category_path import _is_interior_node
+    assert _is_interior_node("fashion/shoes") is False
+    assert _is_interior_node("electronics/ereader") is False
+    # ...while a genuine interior node is not routable, whatever its depth
+    assert _is_interior_node("beauty/makeup") is True
+    assert _is_interior_node("beauty/makeup/lip") is True
+    assert _is_interior_node("beauty") is True
+    assert _is_interior_node(None) is True
+    # a full leaf is left alone
+    assert _is_interior_node("beauty/makeup/lip/lipstick") is False
