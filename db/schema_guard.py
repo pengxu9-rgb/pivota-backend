@@ -447,6 +447,28 @@ async def ensure_required_schema_light() -> None:
             except Exception:  # noqa: BLE001
                 # Best-effort like every sibling; must not starve what follows.
                 pass
+            # mig 220: source + run_id on the preflight observations. `web` deploys
+            # with SKIP_HEAVY_STARTUP_INIT, so db/migrations/ never runs there and
+            # db/catalog.py's model is what builds the table — but only on a database
+            # that does not have it YET. An existing prod table predates these two
+            # columns and create_all will not alter it, so without this heal
+            # `record()` fails every INSERT on an unknown column and swallows the
+            # error, and shadow mode stops recording with only a dropped log line to
+            # show for it. Two columns in the migration, two here.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS checkout_preflight_observations
+                          ADD COLUMN IF NOT EXISTS source VARCHAR(32) NOT NULL DEFAULT 'live',
+                          ADD COLUMN IF NOT EXISTS run_id VARCHAR(64) NULL;
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                # Best-effort like every sibling; must not starve what follows.
+                pass
+
             # mig 213: trust provenance on the commerce ledger. Early and
             # wrapped like mig 212: the SQLAlchemy INSERT names every modeled
             # column, so a deploy that skips db/migrations/ would fail every

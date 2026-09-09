@@ -13,9 +13,16 @@
 --
 -- ADDITIVE AND DEFAULTED, so every row already in the table keeps its meaning: everything written
 -- before this migration came from the request path, which is exactly what 'live' means.
+-- NOTE this file is NOT what creates these columns on production. `web` deploys with
+-- SKIP_HEAVY_STARTUP_INIT, so db/migrations/ never runs there; db/catalog.py's model plus
+-- metadata.create_all builds the table, and db/schema_guard.py self-heals an existing one. All
+-- three carry these columns. This file is for environments that do run migrations, and for the
+-- dialect gate.
 ALTER TABLE checkout_preflight_observations
-  ADD COLUMN IF NOT EXISTS source VARCHAR(32) NOT NULL DEFAULT 'live';
+  ADD COLUMN IF NOT EXISTS source VARCHAR(32) NOT NULL DEFAULT 'live',
+  ADD COLUMN IF NOT EXISTS run_id VARCHAR(64) NULL;
 
--- The report groups by (source, reason) over a window, so the window predicate leads.
-CREATE INDEX IF NOT EXISTS idx_checkout_preflight_obs_source_created
-  ON checkout_preflight_observations (source, created_at DESC);
+-- Excluding one bad run from a window is the query this index exists for; the report itself is
+-- served by idx_checkout_preflight_obs_created_at, which already leads on the window predicate.
+CREATE INDEX IF NOT EXISTS idx_checkout_preflight_obs_run
+  ON checkout_preflight_observations (run_id);

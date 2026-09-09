@@ -10,11 +10,18 @@ merchant at all. With the fence closed every live observation answers `not_yet_c
 a COVERAGE number and says nothing about any merchant. This lane is where the merchant half of the
 evidence comes from: it opens the fence for ITSELF, on the crawl subnet, and walks the catalog.
 
-RUN IT ON THE CRAWL SUBNET, AND IT REFUSES OTHERWISE. `SUBNET=pivota-crawl` puts egress on
-34.82.199.35 instead of the payment address; `CHECKOUT_PREFLIGHT_ALLOW_EGRESS=true` opens the
-fence for this process only. The script EXITS 2 if the fence is shut, rather than sweeping the
-whole corpus and reporting a tidy 100% `not_yet_checked` — a measurement that cannot fail is worse
-than no measurement, and that exact shape has already been shipped twice in this subsystem.
+RUN IT ON THE CRAWL SUBNET, AND IT CHECKS. `SUBNET=pivota-crawl` puts egress on 34.82.199.35
+instead of the payment address; `CHECKOUT_PREFLIGHT_ALLOW_EGRESS=true` opens the fence for this
+process only. THREE refusals, all before the first row:
+
+  * the fence is shut — every ask would answer `not_yet_checked` and the sweep would report a
+    tidy 100% refusal rate that is really our own cache. A measurement that cannot fail is worse
+    than no measurement, and that exact shape has been shipped twice in this subsystem already.
+  * the mode is off — `record` drops every row, so the report would describe an empty table.
+  * THE EGRESS LEAVES BY THE PAYMENT ADDRESS. An earlier version of this paragraph promised the
+    script "refuses otherwise" while nothing in it looked at the address at all, and `SUBNET`
+    defaults to `default` — so the documented command with SUBNET forgotten swept the whole
+    corpus out of 8.231.167.230. It now asks what address it actually has, once, and refuses.
 
     SUBNET=pivota-crawl TASK_TIMEOUT=2400s \
     ENV_VARS="PIVOTA_ENV=production,DB_STATEMENT_TIMEOUT_SECONDS=30,DB_COMMAND_TIMEOUT_SECONDS=600,CHECKOUT_PREFLIGHT_MODE=shadow,CHECKOUT_PREFLIGHT_ALLOW_EGRESS=true,CHECKOUT_PREFLIGHT_DEADLINE_SECONDS=20" \
@@ -49,6 +56,7 @@ import json
 import os
 import sys
 import time
+import uuid
 from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -60,14 +68,22 @@ if str(ROOT) not in sys.path:
 
 from db.database import database  # noqa: E402
 from services import checkout_preflight  # noqa: E402
-from services.shopify_variant_identity import (  # noqa: E402
-    sole_stamped_variant_id,
-    storefront_is_shopify,
-)
-from services.variant_identity import variant_id_provenance  # noqa: E402
+from services.handover_variant_identity import HandoverVariantResolver  # noqa: E402
 
-GLOBAL_MIN_INTERVAL_S = float(os.getenv("PREFLIGHT_SWEEP_GLOBAL_INTERVAL_S", "1.5"))
+#: 4s, not the backfill's 1.5s, because ONE ask here is up to THREE outbound requests: the
+#: robots.txt `crawl_politeness` fetches, the `/products/<handle>.js` itself, and a
+#: fire-and-forget `/meta.json` for the shop currency. At 1.5s that is ~120 requests a minute
+#: against a measured cross-domain threshold of roughly 50, so the floor that looked twice as
+#: safe as the threshold was actually more than twice over it.
+GLOBAL_MIN_INTERVAL_S = float(os.getenv("PREFLIGHT_SWEEP_GLOBAL_INTERVAL_S", "4.0"))
 CONSECUTIVE_BLOCK_ABORT = int(os.getenv("PREFLIGHT_SWEEP_ABORT_AFTER_BLOCKS", "10"))
+#: How many DISTINCT hosts must be in the streak before it counts as our IP rather than their
+#: shop. One is a dead storefront; a spread is a block.
+_ABORT_DISTINCT_HOSTS = int(os.getenv("PREFLIGHT_SWEEP_ABORT_DISTINCT_HOSTS", "4"))
+
+#: The address payment partners allowlist. If a sweep leaves by this one, the run is refused —
+#: see the subnet note in the module docstring.
+PAYMENT_EGRESS_IP = os.getenv("PIVOTA_PAYMENT_EGRESS_IP", "8.231.167.230")
 
 #: Verdict reasons that mean WE could not ask, as opposed to a merchant answering. A run of these
 #: is what a block looks like from in here.
@@ -76,41 +92,28 @@ _LOOKS_LIKE_A_BLOCK = frozenset({
     checkout_preflight.R_NOT_YET_CHECKED,
 })
 
-_SNAPSHOT_VARIANTS_SAFE = (
-    "CASE WHEN jsonb_typeof(e.seed_data->'snapshot'->'variants') = 'array' "
-    "THEN e.seed_data->'snapshot'->'variants' ELSE '[]'::jsonb END"
-)
-
-SELECT_SEEDS_SQL = f"""
+SELECT_SEEDS_SQL = """
     SELECT e.id,
            e.attached_product_key,
            e.external_product_id,
            e.seed_data,
-           COALESCE(NULLIF(e.canonical_url, ''), e.destination_url) AS url,
-           {_SNAPSHOT_VARIANTS_SAFE} AS variants
+           COALESCE(NULLIF(e.canonical_url, ''), e.destination_url) AS url
     FROM external_product_seeds e
     WHERE e.status = 'active'
       AND jsonb_typeof(e.seed_data) = 'object'
       AND COALESCE(NULLIF(e.canonical_url, ''), e.destination_url) ~ '/products/'
-      {{cursor_clause}}
+      {cursor_clause}
     ORDER BY e.id
     LIMIT :limit
 """
 
-#: Only LIVE rows on LIVE products, and only ids the classifier calls merchant-issued — the same
-#: admission rule `services/handover_variant_identity` applies. A suppressed row is not a
-#: hand-over candidate, so counting it would measure a cart nobody can be given.
-SELECT_SKUS_SQL = """
-    SELECT s.product_key, s.source_product_id, s.source_variant_id
-    FROM catalog_skus s
-    JOIN catalog_products p ON p.product_key = s.product_key
-    WHERE s.product_key = ANY(:keys)
-      AND s.suppressed_at IS NULL
-      AND p.suppressed_at IS NULL
-"""
-
-
 def _seed_data_of(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """None means "unreadable — skip", never "empty, safe to ask about".
+
+    `databases`+asyncpg hands JSONB back as a dict OR a JSON string depending on the codec, and a
+    row that arrives as a string and is treated as an empty dict would have every admission rule
+    silently answer "no evidence" — a sweep that skips real hand-overs while reporting a clean run.
+    """
     raw = row.get("seed_data")
     if isinstance(raw, dict):
         return raw
@@ -123,27 +126,10 @@ def _seed_data_of(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return None
 
 
-async def _sole_merchant_issued_by_product(keys: List[str]) -> Dict[str, str]:
-    """product_key -> the ONE merchant-issued variant id, for products that have exactly one.
-
-    More than one candidate is not a tie to break. The hand-over is at PRODUCT grain — the buyer
-    has not chosen a variant — so two live merchant-issued SKUs mean we cannot know which cart to
-    build, and the resolver refuses. Measuring a guess here would report a gate that does not
-    exist.
-    """
-    if not keys:
-        return {}
-    rows = await database.fetch_all(SELECT_SKUS_SQL, {"keys": list(keys)})
-    found: Dict[str, List[str]] = {}
-    for r in rows or []:
-        d = dict(r)
-        vid = str(d.get("source_variant_id") or "")
-        cls = variant_id_provenance(
-            vid, product_key=d.get("product_key"), product_id=d.get("source_product_id")
-        )
-        if cls == "merchant_issued":
-            found.setdefault(str(d["product_key"]), []).append(vid)
-    return {k: v[0] for k, v in found.items() if len(v) == 1}
+def _merchant_id_of(product_key: Any) -> Optional[str]:
+    """`prod::{merchant_id}::{platform}::{handle}` — the same parse the route does."""
+    parts = str(product_key or "").split("::")
+    return parts[1][:64] if len(parts) >= 2 and parts[1] else None
 
 
 def _offer_for(row: Dict[str, Any], variant_id: str, seed_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -159,7 +145,10 @@ def _offer_for(row: Dict[str, Any], variant_id: str, seed_data: Dict[str, Any]) 
         "product_key": row.get("attached_product_key") or None,
         "source_product_id": row.get("external_product_id") or None,
         "sku_key": None,
-        "merchant_id": (urlparse(row.get("url") or "").hostname or "")[:64] or None,
+        # The ROUTE's vocabulary — the pivota merchant id embedded in the product key — not the
+        # hostname. Writing a hostname into a column the live rows fill with a merchant id makes
+        # the two sources unjoinable per merchant, which is most of what the split is for.
+        "merchant_id": _merchant_id_of(row.get("attached_product_key")),
         "currency": None,
         "merchant_effective_price": None,
         "execution_spec": {"pdp_url": row.get("url"), "variant_id": variant_id},
@@ -167,27 +156,14 @@ def _offer_for(row: Dict[str, Any], variant_id: str, seed_data: Dict[str, Any]) 
     }
 
 
-def gated_variant_id(
-    row: Dict[str, Any], seed_data: Dict[str, Any], catalog: Dict[str, str]
-) -> Tuple[Optional[str], str]:
-    """(variant_id, lane) for a seed the gate would apply to, or (None, why-not).
+def _handover_key(row: Dict[str, Any], seed_data: Dict[str, Any]) -> Optional[str]:
+    """The key the route resolves on, taken from the route rather than restated here."""
+    from routes.agent_shop_gateway import _handover_product_key
 
-    The two lanes in the order the route prefers them, so this measures the id a buyer would
-    actually be handed rather than whichever we happen to find first.
-    """
-    key = str(row.get("attached_product_key") or "")
-    from_catalog = catalog.get(key)
-    if from_catalog:
-        return from_catalog, "catalog"
-    if storefront_is_shopify(seed_data):
-        stamped = sole_stamped_variant_id(seed_data)
-        if stamped:
-            return stamped, "seed_stamp"
-        return None, "shopify_but_no_sole_stamp"
-    return None, "no_identity"
+    return _handover_product_key(row, seed_data)
 
 
-async def run(limit: int, after: Optional[str], apply: bool) -> Dict[str, Any]:
+async def run(limit: int, after: Optional[str], apply: bool, run_id: str) -> Dict[str, Any]:
     cursor_clause = "AND e.id > :after" if after else ""
     values: Dict[str, Any] = {"limit": max(1, int(limit))}
     if after:
@@ -196,43 +172,59 @@ async def run(limit: int, after: Optional[str], apply: bool) -> Dict[str, Any]:
             await database.fetch_all(SELECT_SEEDS_SQL.format(cursor_clause=cursor_clause), values)
             or []]
 
-    catalog = await _sole_merchant_issued_by_product(
-        [str(r.get("attached_product_key")) for r in rows if r.get("attached_product_key")]
-    )
-
-    outcomes: Counter = Counter()
-    reasons: Counter = Counter()
-    lanes: Counter = Counter()
+    # THE REAL RESOLVER, not a restatement of it. Review found the first cut reimplementing the
+    # admission rules and getting five of them wrong — it passed raw gids through where the
+    # resolver canonicalises, skipped the stamp veto and the truncated-id check, accepted a seed
+    # stamp the resolver's own predicate calls a forgery, and fell back to the stamp lane after
+    # catalog had CONSIDERED and REFUSED candidates, which is the conditional fallback the
+    # resolver explicitly forbids. A measurement whose population diverges from the gate it
+    # informs is worse than no measurement, and reimplementation is how it diverges.
+    prepared: List[Tuple[Dict[str, Any], Dict[str, Any], Optional[str]]] = []
     skipped: Counter = Counter()
-    per_host_blocks: Counter = Counter()
-    consecutive_blocks = 0
-    aborted = False
-    asked = 0
-    last_call = 0.0
-
     for row in rows:
         seed_data = _seed_data_of(row)
         if seed_data is None:
             skipped["unreadable_seed_data"] += 1
             continue
-        variant_id, lane = gated_variant_id(row, seed_data, catalog)
-        if not variant_id:
-            # NOT an outcome. These are the hand-overs the gate is blind to by design, and folding
-            # them into the refusal rate is the denominator mistake this subsystem keeps making.
-            skipped[lane] += 1
+        prepared.append((row, seed_data, _handover_key(row, seed_data)))
+
+    resolver = HandoverVariantResolver()
+    await resolver.prime([k for _, _, k in prepared if k])
+
+    outcomes: Counter = Counter()
+    reasons: Counter = Counter()
+    lanes: Counter = Counter()
+    per_host_blocks: Counter = Counter()
+    block_streak: List[str] = []
+    aborted = False
+    abort_hosts: List[str] = []
+    asked = 0
+    last_call = 0.0
+
+    for row, seed_data, key in prepared:
+        handover = resolver.choose(
+            product_key=key,
+            product_id=row.get("external_product_id"),
+            seed_data=seed_data,
+            offer_variant_id=None,
+        )
+        if not handover.variant_id:
+            # NOT an outcome. These are the hand-overs the gate is blind to by design, and
+            # folding them into the refusal rate reports our coverage as the merchants' verdict.
+            skipped[handover.reason] += 1
             continue
-        lanes[lane] += 1
+        lanes[handover.reason] += 1
 
         gap = GLOBAL_MIN_INTERVAL_S - (time.monotonic() - last_call)
         if gap > 0:
             await asyncio.sleep(gap)
         last_call = time.monotonic()
 
-        offer = _offer_for(row, variant_id, seed_data)
-        host = str(offer.get("merchant_id") or "unknown")
+        offer = _offer_for(row, handover.variant_id, seed_data)
+        host = urlparse(str(row.get("url") or "")).hostname or "unknown"
         if apply:
             verdict = await checkout_preflight.preflight_and_record(
-                offer, source=checkout_preflight.SOURCE_SWEEP
+                offer, source=checkout_preflight.SOURCE_SWEEP, run_id=run_id
             )
         else:
             verdict = await checkout_preflight.preflight(offer)
@@ -241,27 +233,52 @@ async def run(limit: int, after: Optional[str], apply: bool) -> Dict[str, Any]:
         reasons[verdict.reason] += 1
 
         if verdict.reason in _LOOKS_LIKE_A_BLOCK:
-            consecutive_blocks += 1
             per_host_blocks[host] += 1
-            if consecutive_blocks >= CONSECUTIVE_BLOCK_ABORT:
-                aborted = True
-                break
+            block_streak.append(host)
+            # ONE DEAD STOREFRONT IS NOT AN IP BLOCK, and seeds are id-ordered which clusters a
+            # brand's rows together — so a bare consecutive count aborts on ordinary catalog rot
+            # and reports one dead merchant as a 100% refusal rate. The variant backfill needed
+            # exactly this distinction and the first cut of this script only claimed to have it:
+            # `per_host_blocks` was computed and never read. A block is cross-domain.
+            if len(block_streak) >= CONSECUTIVE_BLOCK_ABORT:
+                if len(set(block_streak[-CONSECUTIVE_BLOCK_ABORT:])) >= _ABORT_DISTINCT_HOSTS:
+                    aborted = True
+                    abort_hosts = sorted(set(block_streak[-CONSECUTIVE_BLOCK_ABORT:]))
+                    break
+                # Same host over and over: drop it from the streak and keep going, so one dead
+                # brand cannot halt a healthy sweep.
+                block_streak = [h for h in block_streak if h != block_streak[-1]]
         else:
-            consecutive_blocks = 0
+            block_streak = []
 
-    blocked = sum(n for r, n in reasons.items() if r != checkout_preflight.R_OK)
+    # THE ANSWERED DENOMINATOR, not every refusal. `checkout_preflight.NO_CONTACT_REASONS` exists
+    # because counting refusals decided without contacting a merchant reads 0.99 where the
+    # merchants actually refused 0.20 — and the first cut of this script reintroduced that defect
+    # one level down, under a comment claiming the denominator was right. The JSON printed here is
+    # the only thing an operator reads from a one-off job.
+    no_contact = sum(n for r, n in reasons.items() if r in checkout_preflight.NO_CONTACT_REASONS)
+    answered = asked - no_contact
+    answered_blocked = sum(
+        n for r, n in reasons.items()
+        if r != checkout_preflight.R_OK and r not in checkout_preflight.NO_CONTACT_REASONS
+    )
     return {
         "mode": "apply" if apply else "dry_run",
+        "run_id": run_id,
         "preflight_mode": checkout_preflight.mode(),
         "egress_allowed": checkout_preflight.egress_allowed(),
         "aborted_on_block": aborted,
+        "aborted_on_hosts": abort_hosts,
         "next_cursor": (rows[-1]["id"] if rows and not aborted else None),
         "seeds_seen": len(rows),
-        "asked": asked,
-        "would_block": blocked,
-        # Over ASKED, never over seeds_seen: dividing by the second mixes in the hand-overs the
-        # gate is blind to and reports our own coverage as the merchants' verdict.
-        "would_block_rate": (round(blocked / asked, 4) if asked else None),
+        "gated": asked,
+        # What the MERCHANTS said, over the asks that reached one. This is the number the
+        # enforcement decision is read from.
+        "answered": answered,
+        "would_block": answered_blocked,
+        "would_block_rate": (round(answered_blocked / answered, 4) if answered else None),
+        # And our own coverage, kept beside it rather than folded in.
+        "no_contact": no_contact,
         "by_outcome": dict(outcomes),
         "by_reason": dict(reasons),
         "by_lane": dict(lanes),
@@ -270,44 +287,77 @@ async def run(limit: int, after: Optional[str], apply: bool) -> Dict[str, Any]:
     }
 
 
+async def _egress_ip() -> Optional[str]:
+    """Which address this process actually leaves by. One request, to an IP echo, no data sent."""
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            return (await client.get("https://api.ipify.org")).text.strip()
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--limit", type=int, default=200)
     parser.add_argument("--after", type=str, default=None, help="resume past this seed id")
-    parser.add_argument("--apply", action="store_true", help="record observations; omit for a dry run")
+    parser.add_argument("--apply", action="store_true",
+                        help="record observations; omit for a dry run")
+    parser.add_argument("--run-id", type=str, default=None,
+                        help="tag every row of this pass; defaults to a fresh id")
+    parser.add_argument("--allow-payment-egress", action="store_true",
+                        help=argparse.SUPPRESS)
     args = parser.parse_args()
+
+    def _refuse(error: str, detail: str) -> int:
+        print(json.dumps({"error": error, "detail": detail}, indent=2), flush=True)
+        return 2
 
     # REFUSE RATHER THAN MEASURE NOTHING. With the fence shut every ask answers `not_yet_checked`
     # and the sweep would produce a clean, complete, worthless report — and someone would read its
-    # 100% refusal rate as a fact about merchants. Exit before the first row, not after the last.
+    # refusal rate as a fact about merchants. Exit before the first row, not after the last.
     if not checkout_preflight.egress_allowed():
-        print(json.dumps({
-            "error": "egress_fence_closed",
-            "detail": (
-                "CHECKOUT_PREFLIGHT_ALLOW_EGRESS is not set, so this process may not fetch a "
-                "merchant and every ask would answer not_yet_checked. Set it, and run with "
-                "SUBNET=pivota-crawl so the egress does not leave by the payment address."
-            ),
-        }, indent=2), flush=True)
-        return 2
+        return _refuse("egress_fence_closed", (
+            "CHECKOUT_PREFLIGHT_ALLOW_EGRESS is not set, so this process may not fetch a merchant "
+            "and every ask would answer not_yet_checked. Set it, and run with SUBNET=pivota-crawl."
+        ))
     if not checkout_preflight.is_enabled():
-        print(json.dumps({
-            "error": "preflight_mode_off",
-            "detail": "CHECKOUT_PREFLIGHT_MODE is off; set it to shadow to record observations.",
-        }, indent=2), flush=True)
-        return 2
+        return _refuse("preflight_mode_off",
+                       "CHECKOUT_PREFLIGHT_MODE is off; set it to shadow to record observations.")
+
+    # AND CHECK THE ADDRESS, rather than claiming to. The docstring used to say this script
+    # "refuses otherwise" while nothing here looked at the subnet at all — SUBNET defaults to
+    # `default`, so the documented command with SUBNET forgotten sweeps the whole corpus out of
+    # the payment-allowlisted address. That is the incident the fence exists to prevent.
+    ip = asyncio.run(_egress_ip())
+    if ip == PAYMENT_EGRESS_IP and not args.allow_payment_egress:
+        return _refuse("egress_leaves_by_the_payment_address", (
+            f"this process egresses from {ip}, the address payment partners allowlist. "
+            "Re-run with SUBNET=pivota-crawl so it leaves by the crawl NAT instead."
+        ))
+    if ip is None:
+        return _refuse("egress_ip_unknown", (
+            "could not determine this process's egress address, so it cannot be shown NOT to be "
+            "the payment one. Refusing rather than guessing."
+        ))
+
+    run_id = args.run_id or f"sweep-{int(time.time())}-{uuid.uuid4().hex[:8]}"
 
     async def _main() -> Dict[str, Any]:
         await database.connect()
         try:
-            return await run(limit=args.limit, after=args.after, apply=args.apply)
+            return await run(limit=args.limit, after=args.after, apply=args.apply, run_id=run_id)
         finally:
             await database.disconnect()
 
     summary = asyncio.run(_main())
+    summary["egress_ip"] = ip
     print(json.dumps(summary, indent=2, ensure_ascii=False), flush=True)
+    # Non-zero on abort so a wrapper cannot read a partial sweep as a completed one. The rows are
+    # already committed, so the run_id above is how you exclude them.
     return 1 if summary.get("aborted_on_block") else 0
 
 

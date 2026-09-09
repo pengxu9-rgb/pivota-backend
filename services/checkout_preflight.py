@@ -369,13 +369,13 @@ async def preflight(offer: Dict[str, Any]) -> PreflightVerdict:
 
 INSERT_OBSERVATION_SQL = """
     INSERT INTO checkout_preflight_observations (
-        observation_id, source, mode, outcome, would_block, reason,
+        observation_id, source, run_id, mode, outcome, would_block, reason,
         merchant_id, product_key, sku_key, offer_id,
         live_status, in_stock, price_verified,
         quoted_price, quoted_currency, live_price, live_currency,
         latency_ms, detail
     ) VALUES (
-        :observation_id, :source, :mode, :outcome, :would_block, :reason,
+        :observation_id, :source, :run_id, :mode, :outcome, :would_block, :reason,
         :merchant_id, :product_key, :sku_key, :offer_id,
         :live_status, :in_stock, :price_verified,
         :quoted_price, :quoted_currency, :live_price, :live_currency,
@@ -385,7 +385,11 @@ INSERT_OBSERVATION_SQL = """
 
 
 async def record(
-    verdict: PreflightVerdict, offer: Dict[str, Any], *, source: str = SOURCE_LIVE
+    verdict: PreflightVerdict,
+    offer: Dict[str, Any],
+    *,
+    source: str = SOURCE_LIVE,
+    run_id: Optional[str] = None,
 ) -> None:
     """Persist one observation. Swallows its own failures.
 
@@ -405,6 +409,7 @@ async def record(
         await database.execute(INSERT_OBSERVATION_SQL, {
             "observation_id": uuid.uuid4().hex,
             "source": str(source or SOURCE_LIVE)[:32],
+            "run_id": (str(run_id)[:64] if run_id else None),
             "mode": verdict.mode,
             "outcome": verdict.outcome,
             "would_block": bool(verdict.would_block),
@@ -428,11 +433,11 @@ async def record(
 
 
 async def preflight_and_record(
-    offer: Dict[str, Any], *, source: str = SOURCE_LIVE
+    offer: Dict[str, Any], *, source: str = SOURCE_LIVE, run_id: Optional[str] = None
 ) -> PreflightVerdict:
     """The call sites use this. One verdict, one row, and the caller reads `allows_checkout`."""
     verdict = await preflight(offer)
-    await record(verdict, offer, source=source)
+    await record(verdict, offer, source=source, run_id=run_id)
     return verdict
 
 

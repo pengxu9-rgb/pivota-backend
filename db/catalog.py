@@ -533,6 +533,17 @@ checkout_preflight_observations = Table(
     # running the dialect gate in order, where another file's create_all builds this table
     # first and a tz-aware bind then fails with "can't subtract offset-naive and offset-aware".
     Column("created_at", DateTime(timezone=True), server_default=func.now(), nullable=False),
+    # WHERE the row came from, and WHICH run wrote it. Both live in the MODEL and not only in
+    # db/migrations/220, because `web` deploys with SKIP_HEAVY_STARTUP_INIT and never runs the
+    # migration directory at all — `metadata.create_all` above is what actually builds this table
+    # on production, exactly as the `created_at` note explains. A column added to the migration
+    # alone would not exist in prod, and `record()` swallows its own failures, so shadow mode
+    # would stop recording with nothing but a dropped log line to show for it.
+    Column("source", String(32), nullable=False, server_default="live"),
+    # Nullable and untagged for live traffic; a sweep stamps every row of one pass with the same
+    # value so a run that aborted part-way can be excluded from the window instead of poisoning
+    # it. Without it a partial sweep is indistinguishable from a good one.
+    Column("run_id", String(64), nullable=True, index=True),
     Column("mode", String(16), nullable=False),
     Column("outcome", String(16), nullable=False),
     # The decision the ENFORCING gate WOULD have made, recorded while it is not enforcing.

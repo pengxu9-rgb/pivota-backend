@@ -33,51 +33,59 @@ def _shopify_seed(variants):
     return {"snapshot": {"storefront_platform": "shopify", "variants": variants}}
 
 
-# --- which hand-overs the sweep is allowed to ask about -----------------------------------------
+# --- which hand-overs the sweep is allowed to ask about ---------------------------------------
+#
+# These go through the REAL resolver on purpose. Review found the first cut restating its
+# admission rules and getting five of them wrong, so a test that restated them too would have
+# agreed with the bug.
 
-def test_the_catalog_lane_wins_over_the_seed_stamp():
-    """The route prefers the catalog id, so the sweep must measure the id a buyer would be handed.
+def test_the_population_is_the_resolvers_and_not_a_restatement():
+    """MUTANT: hand-roll the admission rules again.
 
-    Measuring the other one would report a refusal rate for a cart nobody is ever given.
+    `HandoverVariantResolver` canonicalises gids, vetoes a stamp the classifier calls a forgery,
+    refuses a truncated id, refuses more than one live candidate, and forbids falling back to the
+    seed stamp after catalog CONSIDERED and REFUSED candidates. Every one of those was wrong in
+    the restated version, and each wrong one measures a hand-over the gate would never make.
     """
-    seed = _shopify_seed([{"shopify_variant_id": OTHER_VID}])
-    got, lane = sweep.gated_variant_id(_row(), seed, {PK: VID})
-    assert (got, lane) == (VID, "catalog")
+    import inspect
+
+    src = inspect.getsource(sweep)
+    assert "HandoverVariantResolver" in src
+    for restated in ("variant_id_provenance", "sole_stamped_variant_id", "storefront_is_shopify"):
+        assert restated not in src, (
+            f"{restated} is an admission rule; calling it here restates the resolver")
 
 
-def test_the_seed_stamp_is_used_when_catalog_is_silent():
-    seed = _shopify_seed([{"shopify_variant_id": VID}])
-    assert sweep.gated_variant_id(_row(), seed, {}) == (VID, "seed_stamp")
-
-
-def test_a_seed_with_no_identity_is_not_asked_about():
-    """MUTANT: sweep every seed rather than the gated population.
+@pytest.mark.asyncio
+async def test_a_seed_the_resolver_declines_is_never_asked_about(monkeypatch):
+    """MUTANT: ask anyway when the resolver returns no id.
 
     These are the hand-overs the gate is blind to BY DESIGN. Folding them into the denominator
-    reports our own coverage as the merchants' verdict — the denominator mistake this subsystem
-    has now shipped three times.
+    reports our own coverage as the merchants' verdict.
     """
-    got, lane = sweep.gated_variant_id(_row(), {"snapshot": {}}, {})
-    assert got is None and lane == "no_identity"
+    rows = [_row(id="eps_1"), _row(id="eps_2")]
+    monkeypatch.setattr(sweep, "GLOBAL_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(sweep.database, "fetch_all", _fake_fetch(rows))
+    monkeypatch.setattr(sweep, "_handover_key", lambda r, sd: PK)
 
+    class _Declines:
+        async def prime(self, keys):
+            return None
 
-def test_a_multi_variant_product_is_not_asked_about():
-    """MUTANT: pick the first stamped id on a multi-variant product.
+        def choose(self, **kw):
+            from services.handover_variant_identity import HandoverVariant
 
-    The hand-over is at PRODUCT grain — the buyer has not chosen — so a product with two variants
-    has no single cart to build and the resolver declines. Guessing here would measure a gate that
-    does not exist, and the guess is the wrong-size hazard the whole variant programme is about.
-    """
-    seed = _shopify_seed([{"shopify_variant_id": VID}, {"shopify_variant_id": OTHER_VID}])
-    got, lane = sweep.gated_variant_id(_row(), seed, {})
-    assert got is None and lane == "shopify_but_no_sole_stamp"
+            return HandoverVariant(variant_id=None, reason="no_merchant_issued_sku")
 
+    monkeypatch.setattr(sweep, "HandoverVariantResolver", lambda: _Declines())
 
-def test_a_storefront_we_cannot_prove_is_shopify_is_not_asked_about():
-    seed = {"snapshot": {"variants": [{"shopify_variant_id": VID}]}}
-    seed["snapshot"].pop("storefront_platform", None)
-    got, lane = sweep.gated_variant_id(_row(), seed, {})
-    assert got == VID or lane in ("no_identity", "seed_stamp")
+    async def boom(offer):
+        raise AssertionError("a declined hand-over must never reach a merchant")
+
+    monkeypatch.setattr(cp, "preflight", boom)
+    out = await sweep.run(limit=10, after=None, apply=False, run_id="t")
+    assert out["gated"] == 0
+    assert out["not_gated"] == {"no_merchant_issued_sku": 2}
 
 
 # --- the offer handed to the gate ---------------------------------------------------------------
@@ -128,131 +136,133 @@ def test_it_refuses_to_run_with_the_gate_off(monkeypatch, capsys):
 
 # --- the arithmetic -----------------------------------------------------------------------------
 
-@pytest.mark.asyncio
-async def test_the_rate_is_over_what_was_asked_not_over_what_was_seen(monkeypatch):
-    """MUTANT: divide by `seeds_seen`.
-
-    Half of these seeds have no identity, so the gate never applies to them. Dividing by the seeds
-    walked would report 0.25 where the merchants refused 0.5 of what they were actually asked.
-    """
-    rows = [
-        _row(id="eps_1", seed_data=_shopify_seed([{"shopify_variant_id": VID}])),
-        _row(id="eps_2", seed_data=_shopify_seed([{"shopify_variant_id": OTHER_VID}])),
-        _row(id="eps_3", seed_data={"snapshot": {}}),
-        _row(id="eps_4", seed_data={"snapshot": {}}),
-    ]
+def _wire(monkeypatch, rows, gated, verdict_fn):
     monkeypatch.setattr(sweep, "GLOBAL_MIN_INTERVAL_S", 0.0)
     monkeypatch.setattr(sweep.database, "fetch_all", _fake_fetch(rows))
+    monkeypatch.setattr(sweep, "_handover_key", lambda r, sd: PK)
+    monkeypatch.setattr(sweep, "HandoverVariantResolver", _resolver_yielding(gated))
+    monkeypatch.setattr(cp, "preflight", verdict_fn)
 
-    seen = []
 
-    async def fake_preflight(offer):
-        seen.append(offer["execution_spec"]["variant_id"])
-        blocked = offer["execution_spec"]["variant_id"] == OTHER_VID
-        return cp.PreflightVerdict(
-            outcome=(cp.BLOCK if blocked else cp.OK),
-            reason=(cp.R_GONE if blocked else cp.R_OK),
-            would_block=blocked, mode="shadow")
+def _v(reason, outcome=None):
+    return cp.PreflightVerdict(
+        outcome=(outcome or (cp.OK if reason == cp.R_OK else cp.BLOCK)),
+        reason=reason, would_block=(reason != cp.R_OK), mode="shadow")
 
-    monkeypatch.setattr(cp, "preflight", fake_preflight)
-    out = await sweep.run(limit=10, after=None, apply=False)
-    assert out["seeds_seen"] == 4
-    assert out["asked"] == 2, "only the two with identity are gated"
+
+@pytest.mark.asyncio
+async def test_the_rate_excludes_refusals_no_merchant_was_asked_about(monkeypatch):
+    """MUTANT: count every reason != R_OK as blocked, over everything gated.
+
+    THE DEFECT THIS SUBSYSTEM KEEPS REPEATING, now four times. `NO_CONTACT_REASONS` exists because
+    a rate that counts refusals decided WITHOUT contacting a merchant reads 0.99 where the
+    merchants refused 0.20. The first cut of this script fixed the seeds-walked denominator and
+    reintroduced the same defect one level down, under a comment claiming it was right — and the
+    JSON printed here is the only thing an operator reads from a one-off job.
+    """
+    rows = [_row(id=f"eps_{i}", external_product_id=f"p{i}") for i in range(10)]
+    gated = {f"p{i}": VID for i in range(10)}
+    # 6 refused before any merchant was contacted, 1 of the remaining 4 refused BY a merchant.
+    order = ([cp.R_NO_MERCHANT_VARIANT] * 4 + [cp.R_NOT_YET_CHECKED] * 2
+             + [cp.R_GONE] + [cp.R_OK] * 3)
+    seq = iter(order)
+
+    async def verdicts(offer):
+        return _v(next(seq))
+
+    _wire(monkeypatch, rows, gated, verdicts)
+    out = await sweep.run(limit=20, after=None, apply=False, run_id="t")
+    assert out["gated"] == 10
+    assert out["no_contact"] == 6
+    assert out["answered"] == 4, "only four asks reached a merchant"
     assert out["would_block"] == 1
-    assert out["would_block_rate"] == 0.5
-    assert out["not_gated"] == {"no_identity": 2}
+    assert out["would_block_rate"] == 0.25, "not 0.7"
 
 
 @pytest.mark.asyncio
-async def test_a_run_of_unanswerable_asks_aborts_the_sweep(monkeypatch):
-    """MUTANT: never abort.
+async def test_the_rate_is_none_when_no_merchant_answered(monkeypatch):
+    """0/0 must not read as "the merchants refused nothing" — the state on a fully cold run."""
+    rows = [_row(id=f"eps_{i}", external_product_id=f"p{i}") for i in range(3)]
+    _wire(monkeypatch, rows, {f"p{i}": VID for i in range(3)},
+          lambda offer: _async(_v(cp.R_NOT_YET_CHECKED, cp.UNVERIFIABLE)))
+    out = await sweep.run(limit=20, after=None, apply=False, run_id="t")
+    assert out["answered"] == 0 and out["would_block_rate"] is None
 
-    A live IP block presents as a run of `could_not_ask_merchant`, and continuing through it both
-    wastes the window and fills the table with refusals that are about our address, not the
-    merchants'.
+
+@pytest.mark.asyncio
+async def test_one_dead_storefront_does_not_abort_the_sweep(monkeypatch):
+    """MUTANT: abort on a bare consecutive count.
+
+    Seeds are id-ordered and ids embed the brand, so one dead storefront's rows are CONTIGUOUS.
+    A bare count aborts on ordinary catalog rot and reports one dead merchant as a 100% refusal
+    rate — the exact shape this script exists to prevent, and the first cut computed
+    `per_host_blocks` and then never read it.
     """
-    rows = [_row(id=f"eps_{i}", seed_data=_shopify_seed([{"shopify_variant_id": VID}]))
-            for i in range(30)]
-    monkeypatch.setattr(sweep, "GLOBAL_MIN_INTERVAL_S", 0.0)
+    rows = [_row(id=f"eps_{i}", external_product_id=f"p{i}",
+                 url="https://dead.example/products/x") for i in range(20)]
+    _wire(monkeypatch, rows, {f"p{i}": VID for i in range(20)},
+          lambda offer: _async(_v(cp.R_UNVERIFIABLE, cp.UNVERIFIABLE)))
     monkeypatch.setattr(sweep, "CONSECUTIVE_BLOCK_ABORT", 5)
-    monkeypatch.setattr(sweep.database, "fetch_all", _fake_fetch(rows))
+    out = await sweep.run(limit=50, after=None, apply=False, run_id="t")
+    assert out["aborted_on_block"] is False, "one host is a dead shop, not our IP being blocked"
+    assert out["gated"] == 20
 
-    async def always_blocked(offer):
-        return cp.PreflightVerdict(
-            outcome=cp.UNVERIFIABLE, reason=cp.R_UNVERIFIABLE, would_block=True, mode="shadow")
 
-    monkeypatch.setattr(cp, "preflight", always_blocked)
-    out = await sweep.run(limit=100, after=None, apply=False)
+@pytest.mark.asyncio
+async def test_a_spread_of_hosts_refusing_together_does_abort(monkeypatch):
+    """...and the cross-domain shape, which IS our IP, still stops the sweep."""
+    rows = [_row(id=f"eps_{i}", external_product_id=f"p{i}",
+                 url=f"https://shop{i}.example/products/x") for i in range(20)]
+    _wire(monkeypatch, rows, {f"p{i}": VID for i in range(20)},
+          lambda offer: _async(_v(cp.R_UNVERIFIABLE, cp.UNVERIFIABLE)))
+    monkeypatch.setattr(sweep, "CONSECUTIVE_BLOCK_ABORT", 5)
+    monkeypatch.setattr(sweep, "_ABORT_DISTINCT_HOSTS", 4)
+    out = await sweep.run(limit=50, after=None, apply=False, run_id="t")
     assert out["aborted_on_block"] is True
-    assert out["asked"] == 5
+    assert len(out["aborted_on_hosts"]) >= 4
     assert out["next_cursor"] is None, "an aborted run has no trustworthy resume point"
 
 
 @pytest.mark.asyncio
-async def test_one_good_answer_clears_the_block_streak(monkeypatch):
-    """A dead handle between two live ones is not a block. Counting it as one would abort a healthy
-    sweep on ordinary catalog rot, which is 6.7% of a live sample."""
-    rows = [_row(id=f"eps_{i}", seed_data=_shopify_seed([{"shopify_variant_id": VID}]))
-            for i in range(9)]
-    monkeypatch.setattr(sweep, "GLOBAL_MIN_INTERVAL_S", 0.0)
-    monkeypatch.setattr(sweep, "CONSECUTIVE_BLOCK_ABORT", 3)
-    monkeypatch.setattr(sweep.database, "fetch_all", _fake_fetch(rows))
+async def test_apply_records_under_the_sweep_source_and_a_run_id(monkeypatch):
+    """MUTANT: record with the default source, or without a run id.
 
-    calls = {"n": 0}
-
-    async def alternating(offer):
-        calls["n"] += 1
-        bad = calls["n"] % 2 == 1
-        return cp.PreflightVerdict(
-            outcome=(cp.UNVERIFIABLE if bad else cp.OK),
-            reason=(cp.R_UNVERIFIABLE if bad else cp.R_OK),
-            would_block=bad, mode="shadow")
-
-    monkeypatch.setattr(cp, "preflight", alternating)
-    out = await sweep.run(limit=100, after=None, apply=False)
-    assert out["aborted_on_block"] is False
-    assert out["asked"] == 9
-
-
-@pytest.mark.asyncio
-async def test_apply_records_under_the_sweep_source_not_live(monkeypatch):
-    """MUTANT: record with the default source.
-
-    Live rows describe demand, sweep rows describe the catalog. Written as `live`, one sweep would
-    swamp the number that actually justifies arming a gate on the checkout path.
+    Live rows describe demand and sweep rows describe the catalog; written as `live`, one sweep
+    swamps the number that justifies arming a gate. And without a run id a sweep that aborted
+    part-way is indistinguishable from a good one inside the window — the rows are already
+    committed by then.
     """
-    rows = [_row(seed_data=_shopify_seed([{"shopify_variant_id": VID}]))]
-    monkeypatch.setattr(sweep, "GLOBAL_MIN_INTERVAL_S", 0.0)
-    monkeypatch.setattr(sweep.database, "fetch_all", _fake_fetch(rows))
-
+    rows = [_row(external_product_id="p0")]
     got = {}
 
-    async def fake_record(offer, *, source=cp.SOURCE_LIVE):
-        got["source"] = source
-        return cp.PreflightVerdict(outcome=cp.OK, reason=cp.R_OK, would_block=False, mode="shadow")
+    async def fake_record(offer, *, source=cp.SOURCE_LIVE, run_id=None):
+        got.update(source=source, run_id=run_id)
+        return _v(cp.R_OK)
 
+    _wire(monkeypatch, rows, {"p0": VID}, lambda offer: _async(_v(cp.R_OK)))
     monkeypatch.setattr(cp, "preflight_and_record", fake_record)
-    await sweep.run(limit=10, after=None, apply=True)
+    await sweep.run(limit=10, after=None, apply=True, run_id="sweep-123")
     assert got["source"] == cp.SOURCE_SWEEP
+    assert got["run_id"] == "sweep-123"
 
 
 @pytest.mark.asyncio
 async def test_a_dry_run_records_nothing(monkeypatch):
-    rows = [_row(seed_data=_shopify_seed([{"shopify_variant_id": VID}]))]
-    monkeypatch.setattr(sweep, "GLOBAL_MIN_INTERVAL_S", 0.0)
-    monkeypatch.setattr(sweep.database, "fetch_all", _fake_fetch(rows))
+    rows = [_row(external_product_id="p0")]
 
     async def boom(*a, **k):
         raise AssertionError("a dry run must not write an observation")
 
+    _wire(monkeypatch, rows, {"p0": VID}, lambda offer: _async(_v(cp.R_OK)))
     monkeypatch.setattr(cp, "preflight_and_record", boom)
+    out = await sweep.run(limit=10, after=None, apply=False, run_id="t")
+    assert out["mode"] == "dry_run" and out["gated"] == 1
 
-    async def ok(offer):
-        return cp.PreflightVerdict(outcome=cp.OK, reason=cp.R_OK, would_block=False, mode="shadow")
 
-    monkeypatch.setattr(cp, "preflight", ok)
-    out = await sweep.run(limit=10, after=None, apply=False)
-    assert out["mode"] == "dry_run" and out["asked"] == 1
+def _async(value):
+    async def _coro():
+        return value
+    return _coro()
 
 
 def _fake_fetch(rows):
@@ -261,3 +271,129 @@ def _fake_fetch(rows):
             return []
         return rows
     return fetch_all
+
+
+def _resolver_yielding(by_seed):
+    """A stub resolver that answers per seed id, so a test can control the gated population
+    without restating the admission rules it is not testing."""
+    from services.handover_variant_identity import HandoverVariant
+
+    class _Stub:
+        def __init__(self):
+            self.seen = []
+
+        async def prime(self, keys):
+            self.seen = list(keys)
+
+        def choose(self, *, product_key=None, product_id=None, seed_data=None, **kw):
+            vid = by_seed.get(str(product_id))
+            return HandoverVariant(
+                variant_id=vid, reason=("catalog" if vid else "no_merchant_issued_sku"))
+
+    return _Stub
+
+
+def test_the_observation_columns_live_in_the_model_not_only_the_migration():
+    """MUTANT: declare `source`/`run_id` in db/migrations/220 alone.
+
+    THE P0 THIS PR SHIPPED FIRST. `web` deploys with SKIP_HEAVY_STARTUP_INIT, so db/migrations/
+    never runs there — `db/catalog.py`'s model plus `metadata.create_all` is what actually builds
+    this table on production, which the model's own `created_at` comment already explains. A
+    column added to the migration alone does not exist in prod, `record()` swallows the resulting
+    UndefinedColumnError, and shadow mode stops recording with nothing but a dropped log line.
+    Shadow is armed right now, so this fails closed on the one thing it is there to measure.
+    """
+    from db.catalog import checkout_preflight_observations as t
+
+    cols = {c.name: c for c in t.columns}
+    assert "source" in cols, "the model is what builds the prod table"
+    assert "run_id" in cols
+    assert cols["source"].nullable is False
+    assert cols["source"].server_default is not None, (
+        "an existing prod row has no source; without a default the ALTER cannot be NOT NULL")
+
+
+def test_the_schema_guard_heals_a_table_that_predates_the_columns():
+    """create_all does not ALTER an existing table, and prod's already exists."""
+    src = open("db/schema_guard.py", encoding="utf-8").read()
+    assert "checkout_preflight_observations" in src
+    assert "ADD COLUMN IF NOT EXISTS source" in src
+    assert "ADD COLUMN IF NOT EXISTS run_id" in src
+
+
+def test_the_offer_names_the_merchant_the_way_the_route_does():
+    """MUTANT: write the URL hostname into `merchant_id`.
+
+    Live rows carry the pivota merchant id parsed from the product key. A hostname in the same
+    indexed column makes the two sources unjoinable per merchant, which is most of what the
+    source split is for — and it is the kind of divergence nobody notices until a per-merchant
+    read silently returns nothing.
+    """
+    offer = sweep._offer_for(
+        _row(attached_product_key="prod::m_brand::shopify::serum"), VID, {"snapshot": {}})
+    assert offer["merchant_id"] == "m_brand"
+    assert sweep._merchant_id_of(None) is None
+    assert sweep._merchant_id_of("garbage") is None
+
+
+@pytest.mark.asyncio
+async def test_a_dead_host_is_dropped_from_the_streak_not_merely_tolerated(monkeypatch):
+    """MUTANT: leave the dead host in the streak instead of pruning it.
+
+    Without pruning, one dead brand's rows stay in the window and a couple of unrelated blips on
+    OTHER hosts push the distinct count over the threshold — so the sweep still aborts because of
+    the dead brand, just more slowly and with a misleading `aborted_on_hosts`.
+    """
+    # 6 rows on one dead host, then 3 single blips on three other hosts, then healthy rows.
+    urls = (["https://dead.example/products/x"] * 6
+            + [f"https://blip{i}.example/products/x" for i in range(3)]
+            + ["https://good.example/products/x"] * 5)
+    rows = [_row(id=f"eps_{i}", external_product_id=f"p{i}", url=u) for i, u in enumerate(urls)]
+    blocked_upto = 9
+
+    calls = {"n": 0}
+
+    async def verdicts(offer):
+        calls["n"] += 1
+        bad = calls["n"] <= blocked_upto
+        return _v(cp.R_UNVERIFIABLE if bad else cp.R_OK,
+                  cp.UNVERIFIABLE if bad else cp.OK)
+
+    _wire(monkeypatch, rows, {f"p{i}": VID for i in range(len(urls))}, verdicts)
+    monkeypatch.setattr(sweep, "CONSECUTIVE_BLOCK_ABORT", 5)
+    monkeypatch.setattr(sweep, "_ABORT_DISTINCT_HOSTS", 4)
+    out = await sweep.run(limit=50, after=None, apply=False, run_id="t")
+    assert out["aborted_on_block"] is False, (
+        "one dead brand plus three unrelated blips is not a cross-domain block")
+    assert out["gated"] == len(urls)
+
+
+def test_it_refuses_to_sweep_out_of_the_payment_address(monkeypatch, capsys):
+    """MUTANT: drop the egress-address check.
+
+    `SUBNET` defaults to `default`, so the documented command with SUBNET forgotten sweeps the
+    whole corpus out of 8.231.167.230 — the address payment partners allowlist, and the incident
+    the fence exists to prevent. An earlier docstring claimed this script "refuses otherwise"
+    while nothing in it looked at the address at all.
+    """
+    import sys as _sys
+
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_ALLOW_EGRESS", "true")
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
+    monkeypatch.setattr(_sys, "argv", ["measure_checkout_preflight.py"])
+    monkeypatch.setattr(sweep, "_egress_ip", lambda: _async(sweep.PAYMENT_EGRESS_IP))
+    assert sweep.main() == 2
+    assert "egress_leaves_by_the_payment_address" in capsys.readouterr().out
+
+
+def test_it_refuses_when_it_cannot_tell_which_address_it_has(monkeypatch, capsys):
+    """Unknown is not "probably fine". A sweep that cannot show it is NOT on the payment address
+    must not run, or the guard is decorative."""
+    import sys as _sys
+
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_ALLOW_EGRESS", "true")
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
+    monkeypatch.setattr(_sys, "argv", ["measure_checkout_preflight.py"])
+    monkeypatch.setattr(sweep, "_egress_ip", lambda: _async(None))
+    assert sweep.main() == 2
+    assert "egress_ip_unknown" in capsys.readouterr().out

@@ -1107,3 +1107,26 @@ async def test_the_warning_can_never_break_the_checkout_it_describes(monkeypatch
     monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
     _stub_verdict(monkeypatch, status=lov.VERIFIED, reason="ok", in_stock=True)
     assert (await cp.preflight(_offer())).outcome == cp.OK
+
+
+@pytest.mark.asyncio
+async def test_the_run_id_reaches_the_observation(monkeypatch):
+    """MUTANT: write NULL for run_id.
+
+    A sweep that aborted part-way has already committed its rows. Without the tag those rows are
+    indistinguishable from a good run inside the window, and the only remedy is to throw the whole
+    window away.
+    """
+    from services import checkout_preflight as cp
+
+    captured = {}
+
+    async def fake_execute(sql, params):
+        captured.update(params)
+
+    monkeypatch.setattr(cp.database, "execute", fake_execute)
+    await cp.record(
+        cp.PreflightVerdict(outcome=cp.OK, reason=cp.R_OK, would_block=False, mode="shadow"),
+        _offer(), source=cp.SOURCE_SWEEP, run_id="sweep-42")
+    assert captured["run_id"] == "sweep-42"
+    assert captured["source"] == cp.SOURCE_SWEEP
