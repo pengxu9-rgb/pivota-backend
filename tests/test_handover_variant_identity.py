@@ -1363,3 +1363,59 @@ def test_the_preflight_memo_is_keyed_on_the_variant_as_well_as_the_page(monkeypa
 
     assert sorted(asked) == sorted([CATALOG_VID, OTHER_VID]), (
         "one page, two variants, two questions — the memo may not collapse them")
+
+
+async def test_the_prefetch_lane_reads_the_product_id_its_own_payloads_carry(monkeypatch):
+    """MUTANT: `product_id=candidate.get("external_product_id")` alone.
+
+    `_build_prefetched_external_seed_wrappers` takes caller-supplied dicts, and this lane's own
+    convention is a three-key chain — `_normalize_prefetched_external_seed_candidates` reads
+    `product_id | id | external_product_id`, and the row the loop builds spells the same
+    fallback. Reading only the one key handed the resolver `None` here while lanes 1, 3 and 4
+    passed a real id, so one seed got two answers depending on which lane resolved it: the
+    zero-candidate path admits a stamp restating the product id, because `product_key` alone
+    cannot catch a restatement (`startswith` never matches a full key against a bare id).
+
+    Driven through the real lane, because the value is decided in the wiring and nowhere else.
+    """
+    import routes.agent_shop_gateway as gateway
+
+    seen = []
+    original = gateway.HandoverVariantResolver.choose
+
+    def recording_choose(self, **kwargs):
+        seen.append(kwargs)
+        return original(self, **kwargs)
+
+    async def no_rows(query, values=None):
+        return []
+
+    monkeypatch.setattr(gateway.HandoverVariantResolver, "choose", recording_choose)
+    monkeypatch.setattr(gateway.database, "fetch_all", no_rows)
+    monkeypatch.setattr(
+        gateway, "_make_external_redirect_url",
+        lambda **kw: _completed("https://example.com/r?token=x"))
+
+    await gateway._build_prefetched_external_seed_wrappers({
+        "external_seed_candidates": [{
+            # The canonical prefetch payload: `product_id`, no `external_product_id`.
+            "product_id": "80072940",
+            "external_seed_id": "eps_prefetch",
+            "attached_product_key": PK,
+            "destination_url": "https://brand.com/products/serum",
+            "canonical_url": "https://brand.com/products/serum",
+            "seed_data": {"snapshot": {"variants": [{"shopify_variant_id": VID}]}},
+        }],
+    })
+
+    assert seen, "the lane never reached the resolver — this test would prove nothing"
+    assert seen[0]["product_id"] == "80072940", (
+        "the lane must read the product id its own payloads carry, not only the one key")
+
+
+def _completed(value):
+    import asyncio
+
+    fut = asyncio.get_event_loop().create_future()
+    fut.set_result(value)
+    return fut

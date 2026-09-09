@@ -606,3 +606,21 @@ def test_the_clock_starts_at_the_first_question_not_at_construction(monkeypatch)
     b.spend()
     _t.sleep(0.1)
     assert b.available() is False, "once spent, the clock runs"
+
+
+def test_the_coverage_docstring_describes_the_union_the_gate_actually_uses():
+    """The docstring of a live function may not state as fact the thing round 3 called a
+    safety regression.
+
+    Round 5 found this paragraph still saying the gate keys on the resolved hand-over id alone,
+    while its own test twin two hundred lines up said "the UNION" — code and test asserting
+    opposite things about one line. An earlier fix attempt missed it because the `.replace` it
+    used did not match and nothing asserted that it had, which is the same class of silence.
+    """
+    import inspect
+
+    from routes.agent_shop_gateway import preflight_coverage_fields
+
+    doc = inspect.getdoc(preflight_coverage_fields) or ""
+    assert "UNION" in doc, "the gated population is a union, and the docstring has to say so"
+    assert "_handover_id or _cart_vid" in doc, "named, so a reader can find it in the code"

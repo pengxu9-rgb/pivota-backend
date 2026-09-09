@@ -8609,11 +8609,20 @@ def preflight_coverage_fields(stats: Dict[str, int]) -> Dict[str, Any]:
     second bare line would have had neither, and nothing to join it to.
 
     #2151 MOVED THE DENOMINATOR. It was `cart_prefilled`, and that was right while the gate
-    keyed on `cart_variant_id`; the gate now keys on the RESOLVED HAND-OVER ID, because a cart
-    needs storefront evidence the catalog does not carry and the merchant question does not
-    need it. `gated` is that population. `cart_prefilled` survives as its own counter — how
-    many hand-overs actually got a cart — which is a different question that folding the two
-    together would have silently lost.
+    keyed on `cart_variant_id`. The gate now keys on the UNION `_handover_id or _cart_vid` —
+    wherever we can name the merchant's variant OR would hand the buyer a cart. A UNION and not
+    a replacement, because the two are not nested: a cart needs storefront evidence the catalog
+    does not carry and the merchant question does not need it, but the attach lane ships carts
+    for which no `catalog_skus` row exists. `gated` is that population, and every cart gated
+    before this PR is still gated. `cart_prefilled` survives as its own counter — how many
+    hand-overs actually got a cart — which is a different question that folding the two together
+    would have silently lost.
+
+    (An earlier revision of this paragraph said the gate keys on the resolved hand-over id
+    alone. That was true for one commit and round 3 of review called it a safety regression;
+    the sentence outlived the fix, which is the stale-doc failure this file has been bitten by
+    before. Its test twin in `tests/test_checkout_preflight.py` said the opposite for a while,
+    which is how it was found.)
 
     NOTE ON OBSERVABILITY -- read before trusting these numbers. (1) They are NOT in
     `checkout_preflight_observations`; that table holds one row per ask and none of these
@@ -9447,7 +9456,17 @@ async def _build_prefetched_external_seed_wrappers(
             offer_variant_id=candidate.get("variant_id"),
             handover=_handover_resolver.choose(
                 product_key=_handover_product_key(candidate, _candidate_seed_data),
-                product_id=candidate.get("external_product_id"),
+                # THIS LANE'S OWN CHAIN, not the bare key. `_build_prefetched_external_seed_wrappers`
+                # takes caller-supplied dicts, and its canonical payload carries `id` and
+                # `product_id` rather than `external_product_id` — the row it builds below
+                # spells the same fallback. Reading only the one key handed the resolver None
+                # here while lanes 1, 3 and 4 passed a real id, so one seed got two answers
+                # depending on which lane resolved it.
+                product_id=(
+                    candidate.get("external_product_id")
+                    or candidate.get("product_id")
+                    or candidate.get("id")
+                ),
                 seed_data=_candidate_seed_data,
                 offer_variant_id=candidate.get("variant_id"),
             ),
