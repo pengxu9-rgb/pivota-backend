@@ -503,8 +503,9 @@ def test_coverage_is_measured_against_the_population_the_gate_applies_to():
     assert f["preflight_answered_fraction"] == 1.0, (
         "six gated handoffs, all answered — dividing by candidates would say 0.15")
     assert f["preflight_gated"] == 6
-    assert f["preflight_cart_prefilled"] == 2, (
-        "the cart count is its own fact, not the gate's denominator")
+    assert f["preflight_carts_built"] == 2, (
+        "the cart count is its own fact, not the gate's denominator — and it is RENAMED, "
+        "because its meaning changed and a silent redefinition reads as a regression")
     assert f["preflight_candidates"] == 40, "the wider count is still reported, just not the base"
     assert f["preflight_memo_hits"] == 5
 

@@ -160,7 +160,11 @@ def _resolver():
 
     # No timeout cap: a shared gate database under a full run is slower than a serving path,
     # and a 0.5s ceiling here would make this file flake on the gate's own load rather than
-    # test anything. The timeout itself is pinned on SQLite.
+    # test anything. The wall-clock bound itself is exercised in
+    # `tests/test_handover_variant_identity.py::test_the_lookup_is_bounded_by_a_wall_clock_timeout`,
+    # against a deliberately slow `_fetch`. (An earlier version of this comment claimed that
+    # pin already existed when it did not — review caught it by deleting `asyncio.wait_for`
+    # and watching 250 tests stay green.)
     return HandoverVariantResolver(timeout_s=30.0)
 
 

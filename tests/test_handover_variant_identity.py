@@ -21,6 +21,7 @@ from services.handover_variant_identity import (
     HandoverVariant,
     HandoverVariantResolver,
     R_AMBIGUOUS,
+    R_CONTRADICTED,
     R_EXACT,
     R_LOOKUP_FAILED,
     R_NOT_PRIMED,
@@ -93,10 +94,14 @@ def test_an_unverifiable_id_is_never_a_candidate():
 
 
 def test_the_gid_form_is_admitted():
-    """`gid://shopify/ProductVariant/<n>` is the same identity in Shopify's newer spelling."""
+    """`gid://shopify/ProductVariant/<n>` is the same identity in Shopify's newer spelling.
+
+    Admitted, and FOLDED — see `test_a_gid_is_folded_to_the_one_spelling_every_consumer_reads`
+    for why the fold is not cosmetic.
+    """
     gid = "gid://shopify/ProductVariant/41234567890123"
     cand = candidate_from_row(_row(source_variant_id=gid, sku_payload=None))
-    assert cand is not None and cand.variant_id == gid
+    assert cand is not None and cand.stored_variant_id == gid
 
 
 def test_the_stamp_may_veto_but_may_not_authorise():
@@ -308,17 +313,153 @@ async def test_the_key_cap_degrades_hand_overs_and_cannot_publish_one():
     assert r.choose(product_key="prod::b::external_seed::b").reason == R_NOT_PRIMED
 
 
-async def test_the_in_list_is_built_from_generated_names_never_from_the_keys():
+async def test_the_in_list_is_built_from_generated_names_never_from_the_keys(monkeypatch):
     """`attached_product_key` is caller-influenced data. A key interpolated into the SQL would
     be an injection site on a serving path, so the placeholders are positional names and the
-    keys only ever travel as bound values."""
-    from services.handover_variant_identity import _SELECT
+    keys only ever travel as bound values.
 
+    The FIRST version of this test rebuilt the statement from `_SELECT` itself and asserted on
+    its own string; review replaced `_fetch`'s body with literal interpolation and it stayed
+    green. It has to drive the real `_fetch` and read what the database was actually handed.
+    """
+    from db import database as db_module
+
+    seen = {}
+
+    async def recording_fetch_all(query, values=None):
+        seen["query"] = str(query)
+        seen["values"] = values
+        return []
+
+    monkeypatch.setattr(db_module.database, "fetch_all", recording_fetch_all)
+    hostile = "prod::m::external_seed::x'); DROP TABLE catalog_skus; --"
     r = HandoverVariantResolver()
-    sql = _SELECT.format(placeholders=", ".join(":" + n for n in ("pk0", "pk1")))
-    assert ":pk0, :pk1" in sql
-    assert "'" not in sql, "no literal quoting anywhere in the statement"
-    assert r  # the resolver itself builds nothing else
+    await r.prime([PK, hostile])
+
+    assert hostile not in seen["query"], "the key must never appear in the statement text"
+    assert "DROP TABLE" not in seen["query"]
+    assert ":pk0" in seen["query"] and ":pk1" in seen["query"]
+    assert set(seen["values"].values()) == {PK, hostile}, "keys travel only as bound values"
+
+
+async def test_a_key_that_failed_then_loaded_answers_from_the_load(monkeypatch):
+    """MUTANT: drop `self._failed.difference_update(wanted)` from `prime`.
+
+    Three lanes prime the same resolver. A key whose first batch timed out kept answering
+    `sku_lookup_failed` even with its candidates sitting in `_by_key` — fail-closed, so never a
+    wrong cart, but it threw away a hand-over the second lookup had already paid for.
+    """
+    r = _FakeResolver({PK: [_row()]}, raises=True)
+    await r.prime([PK])
+    assert r.choose(product_key=PK).reason == R_LOOKUP_FAILED
+    r._raises = False
+    await r.prime([PK])
+    assert r.choose(product_key=PK).variant_id == VID
+
+
+async def test_one_failed_batch_does_not_condemn_a_key_that_loaded_fine(monkeypatch):
+    """MUTANT: latch the failure resolver-wide (`self._latched = True`).
+
+    Review falsified the first version of this pin: its second assertion used
+    `choose(product_key=None)`, which takes the no-key early branch and never consults
+    `_failed` under EITHER design, so the mutant survived 250/250. The distinguishing case is
+    two DIFFERENT keys — one whose batch raised, one whose batch succeeded.
+    """
+    r = _FakeResolver({"prod::ok::external_seed::k": [_row(product_key="prod::ok::external_seed::k")]},
+                      raises=True)
+    await r.prime([PK])
+    r._raises = False
+    await r.prime(["prod::ok::external_seed::k"])
+
+    assert r.choose(product_key=PK).reason == R_LOOKUP_FAILED, "the failed key stays refused"
+    assert r.choose(product_key="prod::ok::external_seed::k").variant_id == VID, (
+        "a failure about one product key is not evidence about another")
+
+
+async def test_the_lookup_is_bounded_by_a_wall_clock_timeout(monkeypatch):
+    """MUTANT: remove `asyncio.wait_for` from `prime`.
+
+    Review found this entirely unpinned while a gate-file comment claimed it was pinned. This
+    lane is an agent-facing serving path; without the bound a slow statement holds offer
+    resolution for the full statement timeout, for a read that only decorates.
+    """
+    import asyncio as _asyncio
+
+    class _SlowResolver(HandoverVariantResolver):
+        async def _fetch(self, keys):
+            await _asyncio.sleep(5)
+            return []
+
+    r = _SlowResolver(timeout_s=0.05)
+    await r.prime([PK])
+    assert r.choose(product_key=PK).reason == R_LOOKUP_FAILED, (
+        "an unbounded lookup would have blocked here for five seconds and then answered")
+
+
+async def test_two_candidates_sharing_one_id_are_not_treated_as_an_exact_hit():
+    """MUTANT: `len(hits) >= 1`.
+
+    Two rows spelling the same identity is a data defect (`::v:` vs `::v::`, the two lanes'
+    infixes), and picking one makes the reported `sku_key` arbitrary. Refusing keeps the
+    ambiguity visible.
+    """
+    got = choose_handover_variant(
+        [_cand(VID, sku_key="a"), _cand(VID, sku_key="b")], offer_variant_id=VID)
+    assert got.variant_id is None and got.reason == R_AMBIGUOUS
+
+
+def test_a_gid_is_folded_to_the_one_spelling_every_consumer_reads():
+    """MUTANT: return `svid` unnormalised.
+
+    `variant_identity` admits `gid://shopify/ProductVariant/<n>` as identity, and every other
+    reader in this lane folds it away. Unfolded it reaches `offer_spec["variant_id"]`, which is
+    documented one line above itself as "the NUMERIC storefront variant id", and it reaches
+    `live_offer_verification._check_one`, which string-compares against `parse_product_js`'s
+    bare-numeric ids and so can never match — turning a live variant into `variant_absent`.
+    """
+    gid = "gid://shopify/ProductVariant/" + VID
+    cand = candidate_from_row(_row(source_variant_id=gid, sku_payload=None))
+    assert cand is not None
+    assert cand.variant_id == VID, "the canonical form"
+    assert cand.stored_variant_id == gid, "and the column's own spelling is kept for matching"
+    assert choose_handover_variant([cand]).variant_id == VID
+    assert choose_handover_variant([cand], offer_variant_id=gid).variant_id == VID, (
+        "named in either spelling, it is still the same variant")
+
+
+def test_a_hand_over_naming_a_different_merchant_issued_id_refuses_even_against_one_candidate():
+    """MUTANT: return the sole candidate before comparing it to the name.
+
+    THIS IS THE ROUND-1 P1. An operator attached the $140 Standard; catalog held exactly one
+    merchant-issued row, for the $95 Mini; the first cut prefilled the Mini. One catalog row
+    being alone is not evidence that the name is wrong — it is two merchant-issued ids
+    disagreeing, and naming either is the guess this module refuses everywhere else.
+    """
+    got = choose_handover_variant([_cand(VID)], offer_variant_id=VID_B)
+    assert got.variant_id is None
+    assert got.reason == R_CONTRADICTED and got.candidates == 1
+
+
+def test_a_name_that_is_not_itself_merchant_issued_cannot_contradict():
+    """The seed lane passes `_seed_offer_variant_id`, which reads
+    variant_id | variantId | sku | sku_id | id — routinely a SKU string. A SKU naming no
+    variant is an ABSENCE of information, not a disagreement, and treating it as one would
+    have thrown away most of the 2,864 sole-candidate seeds."""
+    got = choose_handover_variant([_cand(VID)], offer_variant_id="SKU-30ML")
+    assert got.variant_id == VID and got.reason == R_SOLE
+
+
+def test_a_seed_stamp_too_short_for_the_classifier_is_not_handed_over():
+    """`sole_stamped_variant_id` gates on any digit string; `variant_identity` requires 8+.
+
+    A snapshot stamped "12345" used to become a hand-over id that `checkout_preflight` then
+    refused as `no_merchant_issued_variant_id` — a refusal this resolver had caused. One rule
+    for both sources, or the module's guarantee is only true of half its answers.
+    """
+    short = choose_handover_variant([], seed_data=_seed({"shopify_variant_id": "12345"}))
+    assert short.variant_id is None and short.reason == R_NO_IDENTITY
+    good = choose_handover_variant([], seed_data=_seed({"shopify_variant_id": VID}))
+    assert good.variant_id == VID and good.reason == R_SEED_STAMP
 
 
 async def test_the_counters_count_what_happened():
@@ -373,8 +514,11 @@ def test_the_numbers_are_in_the_message_text_not_only_in_extra():
     f = handover_coverage_fields({
         "handover_considered": 9, "handover_resolved": 4, "handover_resolved_catalog": 3,
         "handover_resolved_seed_stamp": 1, "handover_refused_ambiguous": 2,
-        "handover_no_identity": 2, "handover_no_product_key": 1,
+        "handover_contradicted": 1, "handover_no_identity": 2, "handover_no_product_key": 1,
         "handover_lookup_failed": 0, "handover_not_primed": 0,
+        "handover_rows_scanned": 20, "handover_rows_rejected": 11,
+        "handover_reject_" + X_STAMP_VETO: 3,
+        "handover_reject_" + X_PAYLOAD_DISAGREES: 2,
     })
     msg = handover_coverage_message(f)
     for key, value in f.items():
@@ -383,6 +527,12 @@ def test_the_numbers_are_in_the_message_text_not_only_in_extra():
         assert "=%d" % value in msg or ("%s=%d" % (key.replace("handover_", ""), value)) in msg
     assert "considered=9" in msg and "catalog=3" in msg and "ambiguous=2" in msg
     assert "resolved_fraction=0.444" in msg
+    # The row counters were incremented in `prime` and emitted NOWHERE — the exact "a counter
+    # nobody reads" defect the route comment warns about, and the only production evidence that
+    # the two future-writer guards ever fire.
+    assert "rows_scanned=20" in msg and "rows_rejected=11" in msg
+    assert "stamp_vetoed=3" in msg and "payload_disagreed=2" in msg
+    assert "contradicted=1" in msg
     assert handover_coverage_message({}) == ""
 
 
@@ -393,7 +543,6 @@ def test_the_numbers_are_in_the_message_text_not_only_in_extra():
 # ---------------------------------------------------------------------------------------------
 
 from datetime import datetime, timezone  # noqa: E402
-from unittest.mock import AsyncMock  # noqa: E402
 
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -660,27 +809,63 @@ def test_a_failed_sku_lookup_degrades_the_hand_over_and_serves_the_offer(monkeyp
     assert res.json()["offers_count"] >= 1, "the offer survives; only the cart is withdrawn"
 
 
-def test_the_shopify_attach_branch_prefers_catalog_identity_to_an_operator_typed_value(
+def test_the_shopify_attach_branch_has_three_answers_and_the_middle_one_is_silence(
     monkeypatch, client
 ):
-    """`attached_variant_id` is whatever an operator pasted into an attach form — the one input
-    on this path with no catalog lookup behind it. A `catalog_skus` row the classifier places as
-    merchant-issued is better provenance, so it wins where it exists; where it does not, the
-    operator value is used exactly as before."""
+    """MUTANT (the round-1 P1): `handover.variant_id or extract_shopify_numeric_variant_id(...)`.
+
+    `attached_variant_id` is whatever an operator pasted into an attach form — the one input on
+    this path with no catalog lookup behind it. The first cut let a catalog row win
+    unconditionally, so an operator who attached the $140 Standard got the $95 Mini prefilled
+    the moment catalog held one merchant-issued row for it, and the test that pinned that
+    override would have kept it forever. Three cases, one test, so no two can drift:
+
+      agree      -> the id;
+      disagree   -> NOTHING, because two merchant-issued ids disagreeing about one hand-over
+                    means we do not know which physical thing the buyer would receive;
+      no catalog -> the operator value, exactly as before this PR.
+    """
     shopify_pk = "prod::m_brand::shopify::brand-serum"
     row = _seed_row(attached_product_key=shopify_pk)
-    row["attached_variant_id"] = "99999999999999"
+    row["attached_variant_id"] = CATALOG_VID
+    agree = _wire(
+        monkeypatch, seed_row=row,
+        sku_rows=[_row(product_key=shopify_pk, source_variant_id=CATALOG_VID, sku_payload=None)])
+    assert _resolve(client).status_code == 200
+    assert agree["cart_variant_id"] == CATALOG_VID
+
+    row_disagreeing = dict(row, attached_variant_id="99999999999999")
+    disagree = _wire(
+        monkeypatch, seed_row=row_disagreeing,
+        sku_rows=[_row(product_key=shopify_pk, source_variant_id=CATALOG_VID, sku_payload=None)])
+    assert _resolve(client).status_code == 200
+    assert disagree["cart_variant_id"] is None, (
+        "the operator named one variant and catalog holds another — naming either is a guess")
+
+    none_stored = _wire(monkeypatch, seed_row=row_disagreeing, sku_rows=[])
+    assert _resolve(client).status_code == 200
+    assert none_stored["cart_variant_id"] == "99999999999999", (
+        "no catalog row: unchanged behaviour, so this is a widening and not a narrowing")
+
+
+def test_a_key_carried_only_inside_seed_data_is_still_looked_up(monkeypatch, client):
+    """MUTANT: read `attached_product_key` from the row only.
+
+    `_external_seed_redirect_identity` has always taken it from the row OR from `seed_data`, so
+    a resolver primed from the row alone gives such a seed a parsed merchant and platform and
+    NO catalog lookup — a half-wiring that reads exactly like "this product has no identity"
+    and would never be noticed, because the honest-absence answer looks identical.
+    """
+    row = _seed_row(snapshot_extra={"storefront_platform": "shopify"},
+                    attached_product_key=None)
+    row.pop("attached_product_key")
+    row["seed_data"]["attached_product_key"] = PK
+
     seen = _wire(
-        monkeypatch,
-        seed_row=row,
-        sku_rows=[_row(product_key=shopify_pk, source_variant_id=CATALOG_VID, sku_payload=None)],
-    )
+        monkeypatch, seed_row=row,
+        sku_rows=[_row(source_variant_id=CATALOG_VID, sku_payload=None)])
     assert _resolve(client).status_code == 200
     assert seen and seen["cart_variant_id"] == CATALOG_VID
-
-    seen2 = _wire(monkeypatch, seed_row=row, sku_rows=[])
-    assert _resolve(client).status_code == 200
-    assert seen2["cart_variant_id"] == "99999999999999", "no catalog row: unchanged behaviour"
 
 
 def test_the_lookup_is_one_statement_for_the_whole_seed_batch(monkeypatch, client):

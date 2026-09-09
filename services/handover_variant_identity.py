@@ -55,7 +55,12 @@ import os
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
-from services.variant_identity import MERCHANT_ISSUED, variant_id_provenance
+from services.outbound_links_service import extract_shopify_numeric_variant_id
+from services.variant_identity import (
+    MERCHANT_ISSUED,
+    is_merchant_issued_variant_id,
+    variant_id_provenance,
+)
 
 logger = logging.getLogger("handover_variant_identity")
 
@@ -70,6 +75,14 @@ R_SOLE = "sole_merchant_issued_sku"
 R_EXACT = "exact_merchant_issued_sku"
 R_SEED_STAMP = "seed_stamped_sole_variant"
 R_AMBIGUOUS = "multiple_merchant_issued_skus"
+#: The hand-over names a merchant-issued id, and NO live `catalog_skus` row carries it. Two
+#: merchant-issued ids disagreeing about one hand-over is a contradiction, and naming either is
+#: a guess — so this refuses even when there is exactly ONE candidate. Review of the first cut
+#: found the sole-candidate path returning BEFORE any comparison with the name, so a lone
+#: catalog row silently overrode an operator-attached variant: a $95 Mini prefilled for the
+#: $140 Standard the offer actually named, which is the wrong-size hazard this module exists
+#: to refuse, reached through the one door it had left open.
+R_CONTRADICTED = "hand_over_names_a_different_merchant_issued_id"
 R_NO_IDENTITY = "no_merchant_issued_sku"
 R_NO_PRODUCT_KEY = "no_attached_product_key"
 R_NOT_PRIMED = "not_primed"
@@ -99,12 +112,33 @@ _SELECT = """
 
 @dataclass(frozen=True)
 class Candidate:
-    """One live `catalog_skus` row whose id we can positively place as the merchant's."""
+    """One live `catalog_skus` row whose id we can positively place as the merchant's.
+
+    TWO SPELLINGS, deliberately. `stored_variant_id` is the column's own value; `variant_id` is
+    the one CANONICAL form every consumer gets. They differ only for
+    `gid://shopify/ProductVariant/<n>`, which `services.variant_identity` admits as identity and
+    which every other reader in this lane has always normalised away
+    (`outbound_links_service.extract_shopify_numeric_variant_id`, `shopify_variant_identity._numeric_id`).
+    Review of the first cut found the raw gid reaching `offer_spec["variant_id"]` — documented
+    one line above itself as "the NUMERIC storefront variant id" — and reaching the preflight,
+    where `live_offer_verification._check_one` string-compares it against `parse_product_js`'s
+    bare-numeric ids and so can NEVER match. Normalising once, here, is the only place that
+    cannot drift.
+    """
 
     sku_key: str
     product_key: str
     variant_id: str
     stamped: bool
+    stored_variant_id: str = ""
+
+    def answers_to(self, name: str) -> bool:
+        """True when `name` is this variant, in either spelling. Equality, never a preference."""
+        if not name:
+            return False
+        return name in (self.variant_id, self.stored_variant_id) or (
+            canonical_variant_id(name) == self.variant_id
+        )
 
 
 @dataclass(frozen=True)
@@ -124,6 +158,21 @@ class HandoverVariant:
 
 def _norm(value: Any) -> str:
     return str(value or "").strip()
+
+
+def canonical_variant_id(value: Any) -> str:
+    """ONE spelling for a variant id that two writers may spell two ways.
+
+    `gid://shopify/ProductVariant/41234567890123` and `41234567890123` are the same variant, and
+    `services.variant_identity` calls both MERCHANT_ISSUED. Everything downstream of this module
+    — the cart permalink builder, the preflight's storefront comparison, the `variant_id` we
+    publish on the offer spec — wants the bare numeric, so the fold happens once here rather
+    than at each of them.
+    """
+    raw = _norm(value)
+    if not raw:
+        return ""
+    return extract_shopify_numeric_variant_id(raw) or raw
 
 
 def _payload(raw: Any) -> Dict[str, Any]:
@@ -197,8 +246,9 @@ def candidate_from_row(row: Any, rejects: Optional[Dict[str, int]] = None) -> Op
     return Candidate(
         sku_key=_norm(d.get("sku_key")),
         product_key=product_key,
-        variant_id=svid,
+        variant_id=canonical_variant_id(svid),
         stamped=bool(stamp),
+        stored_variant_id=svid,
     )
 
 
@@ -220,18 +270,32 @@ def choose_handover_variant(
         return HandoverVariant(None, R_NOT_PRIMED)
 
     live = list(candidates or [])
+    wanted = _norm(offer_variant_id)
+
+    if live:
+        # THE NAME IS CHECKED BEFORE THE COUNT, and that order is the fix for the first cut's
+        # one real hole. A `len(live) == 1` shortcut placed above this returned the lone
+        # candidate without ever comparing it to the name the hand-over carries, so a single
+        # catalog row overrode a DIFFERENT merchant-issued id the caller had explicitly
+        # attached. Only a name that is ITSELF merchant-issued can contradict: the seed lane
+        # routinely passes a SKU string here (`_seed_offer_variant_id` reads
+        # variant_id | variantId | sku | sku_id | id), and a SKU naming no variant is an
+        # absence of information, not a disagreement.
+        hits = [c for c in live if c.answers_to(wanted)]
+        if len(hits) == 1:
+            return HandoverVariant(
+                hits[0].variant_id,
+                R_EXACT if len(live) > 1 else R_SOLE,
+                SOURCE_CATALOG_SKU, hits[0].sku_key, len(live),
+            )
+        if not hits and wanted and is_merchant_issued_variant_id(wanted):
+            return HandoverVariant(None, R_CONTRADICTED, None, None, len(live))
+
     if len(live) == 1:
         one = live[0]
         return HandoverVariant(one.variant_id, R_SOLE, SOURCE_CATALOG_SKU, one.sku_key, 1)
 
     if len(live) > 1:
-        wanted = _norm(offer_variant_id)
-        if wanted:
-            hits = [c for c in live if c.variant_id == wanted]
-            if len(hits) == 1:
-                return HandoverVariant(
-                    hits[0].variant_id, R_EXACT, SOURCE_CATALOG_SKU, hits[0].sku_key, len(live)
-                )
         # Two or more live merchant-issued SKUs and the hand-over names none of them. There is
         # no ordering over these that is anything but a guess — see the module docstring.
         return HandoverVariant(None, R_AMBIGUOUS, None, None, len(live))
@@ -242,9 +306,17 @@ def choose_handover_variant(
     # the serving-path import graph for callers that only want the pure decision.
     from services.shopify_variant_identity import sole_stamped_variant_id
 
-    stamped = sole_stamped_variant_id(seed_data)
-    if stamped:
-        return HandoverVariant(stamped, R_SEED_STAMP, SOURCE_SEED_STAMP, None, 0)
+    stamped = _norm(sole_stamped_variant_id(seed_data))
+    # THE SAME BAR THE CATALOG ROWS CLEAR. `sole_stamped_variant_id` gates on
+    # `shopify_variant_identity._numeric_id`, which accepts ANY digit string, while
+    # `variant_identity` requires 8+ digits — so a snapshot stamped `"12345"` used to become a
+    # hand-over id that `checkout_preflight` would then refuse as
+    # `no_merchant_issued_variant_id`, a refusal this resolver had caused. One rule for both
+    # sources, or the module's own guarantee is only true of half its answers.
+    if stamped and is_merchant_issued_variant_id(stamped):
+        return HandoverVariant(
+            canonical_variant_id(stamped), R_SEED_STAMP, SOURCE_SEED_STAMP, None, 0
+        )
     return HandoverVariant(None, R_NO_IDENTITY, None, None, 0)
 
 
@@ -275,6 +347,7 @@ class HandoverVariantResolver:
             "handover_resolved_catalog": 0,
             "handover_resolved_seed_stamp": 0,
             "handover_refused_ambiguous": 0,
+            "handover_contradicted": 0,
             "handover_no_identity": 0,
             "handover_no_product_key": 0,
             "handover_not_primed": 0,
@@ -292,10 +365,13 @@ class HandoverVariantResolver:
     async def prime(self, product_keys: Iterable[Any]) -> None:
         """Load every not-yet-loaded key, in one statement, under one timeout.
 
-        Fail-soft on the DB call ONLY, and the softness is a refusal, not a pass: a failed
-        lookup latches `_lookup_failed`, and every `choose` after it answers `sku_lookup_failed`
-        with no id. An earlier shape of this in the same route caught the DERIVATION too, which
-        turned a programming error into a feature that silently never ran.
+        Fail-soft on the DB call ONLY, and the softness is a refusal, not a pass: the keys in
+        the failed batch are recorded in `_failed`, and `choose` answers `sku_lookup_failed`
+        with no id for each of them until a later `prime` loads them. PER KEY, never one latch
+        — a failure about one product key is not evidence about another, and a latch made a
+        single slow statement silence standalone seeds that needed no lookup at all. An earlier
+        shape of this in the same route caught the DERIVATION too, which turned a programming
+        error into a feature that silently never ran.
         """
         wanted: List[str] = []
         for key in product_keys or ():
@@ -322,6 +398,10 @@ class HandoverVariantResolver:
         # (-> no_merchant_issued_sku) rather than "never asked" (-> not_primed). The two are
         # different facts and the coverage line has to be able to tell them apart.
         self._primed.update(wanted)
+        # AND CLEAR THE FAILURE. A key that timed out in one lane and loaded in the next kept
+        # answering `sku_lookup_failed` with its candidates sitting in `_by_key` — fail-closed,
+        # so never a wrong cart, but it threw away a hand-over the second lookup had paid for.
+        self._failed.difference_update(wanted)
         rejects: Dict[str, int] = {}
         for row in rows or ():
             self.stats["handover_rows_scanned"] += 1
@@ -399,6 +479,8 @@ class HandoverVariantResolver:
             return
         if answer.reason == R_AMBIGUOUS:
             self.stats["handover_refused_ambiguous"] += 1
+        elif answer.reason == R_CONTRADICTED:
+            self.stats["handover_contradicted"] += 1
         elif answer.reason == R_LOOKUP_FAILED:
             self.stats["handover_lookup_failed"] += 1
         elif answer.reason == R_NOT_PRIMED:
@@ -421,6 +503,17 @@ def handover_coverage_fields(stats: Optional[Dict[str, int]]) -> Dict[str, Any]:
     considered = stats["handover_considered"]
     out: Dict[str, Any] = {
         "handover_considered": considered,
+        # READ, not merely incremented. Review found these written in `prime` and present in no
+        # emitted field — the defect the neighbouring comment in `_handle_offers_resolve` was
+        # written about ("a counter nobody reads is indistinguishable from one that is always
+        # zero"). They also carry the only production evidence for the two guards justified as
+        # bounds on future writers: a stamp veto or a payload disagreement showing up in prod is
+        # how anyone would ever learn a writer had started emitting one.
+        "handover_rows_scanned": stats.get("handover_rows_scanned", 0),
+        "handover_rows_rejected": stats.get("handover_rows_rejected", 0),
+        "handover_rows_stamp_vetoed": stats.get("handover_reject_" + X_STAMP_VETO, 0),
+        "handover_rows_payload_disagreed": stats.get("handover_reject_" + X_PAYLOAD_DISAGREES, 0),
+        "handover_contradicted": stats.get("handover_contradicted", 0),
         "handover_resolved": stats.get("handover_resolved", 0),
         "handover_resolved_catalog": stats.get("handover_resolved_catalog", 0),
         "handover_resolved_seed_stamp": stats.get("handover_resolved_seed_stamp", 0),
@@ -446,14 +539,17 @@ def handover_coverage_message(fields: Dict[str, Any]) -> str:
         return ""
     return (
         " handover considered=%d resolved=%d catalog=%d seed_stamp=%d ambiguous=%d"
-        " no_identity=%d no_product_key=%d lookup_failed=%d not_primed=%d"
+        " contradicted=%d no_identity=%d no_product_key=%d lookup_failed=%d not_primed=%d"
+        " rows_scanned=%d rows_rejected=%d stamp_vetoed=%d payload_disagreed=%d"
         " resolved_fraction=%.3f"
     ) % (
         fields["handover_considered"], fields["handover_resolved"],
         fields["handover_resolved_catalog"], fields["handover_resolved_seed_stamp"],
-        fields["handover_refused_ambiguous"], fields["handover_no_identity"],
-        fields["handover_no_product_key"],
+        fields["handover_refused_ambiguous"], fields["handover_contradicted"],
+        fields["handover_no_identity"], fields["handover_no_product_key"],
         fields["handover_lookup_failed"], fields["handover_not_primed"],
+        fields["handover_rows_scanned"], fields["handover_rows_rejected"],
+        fields["handover_rows_stamp_vetoed"], fields["handover_rows_payload_disagreed"],
         fields["handover_resolved_fraction"],
     )
 

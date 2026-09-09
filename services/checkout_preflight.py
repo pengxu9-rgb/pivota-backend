@@ -336,12 +336,25 @@ SHADOW_REPORT_SQL = """
 #:     (search cards), _build_prefetched_external_seed_wrappers and mint_external_seed_links
 #:     publish the SAME pre-filled cart_url and are NOT gated — the search lane is the larger
 #:     surface, and gating the shared chokepoint is follow-up work;
-#:   * within that lane, only CART-PREFILLED handoffs are asked about. Referral-only offers are
-#:     left alone deliberately (see the call site), so they appear in no row at all.
+#:   * within that lane, only handoffs whose MERCHANT-ISSUED VARIANT WE COULD NAME are asked
+#:     about. #2151 moved this off "cart-prefilled": a cart also needs storefront evidence that
+#:     is stored on 0 of 11,834 active seeds, so keying the gate on it left this denominator
+#:     empty by construction — which is the defect #2151 exists to fix, and leaving this string
+#:     saying "cart-prefilled handoffs only" would have shipped the same defect one layer up,
+#:     in a field `shadow_report` emits to whoever decides whether to arm `enforce`;
+#:   * the widened population is dominated by storefronts `live_offer_verification._check_one`
+#:     STRUCTURALLY CANNOT READ. `storefront_is_shopify` is false on every active seed, so a
+#:     host that does not answer a parseable `/products/<handle>.js` yields
+#:     `not_a_known_shopify_storefront` -> UNVERIFIED -> UNVERIFIABLE -> would_block=True. Read
+#:     `would_block_rate` WITHOUT separating that class out and it approaches 1.0 for a reason
+#:     that is about our own evidence, not about the merchant's stock.
 #: A reader who takes this rate as "how often an external offer is stale" will be wrong twice.
 REPORT_SCOPE = (
-    "offers.resolve external-seed lane, cart-prefilled handoffs only; "
+    "offers.resolve external-seed lane, handoffs with a resolved merchant-issued variant id "
+    "(NOT only cart-prefilled ones — see #2151); "
     "search/prefetch/mint lanes not gated; "
+    "storefronts we cannot read answer unverifiable and count as would_block — separate that "
+    "class before reading the rate; "
     "within a request, the first N distinct (pdp_url, variant) questions in seed-row order — "
     "rate is over questions ASKED, not over candidates offered"
 )

@@ -4296,13 +4296,20 @@ async def _handle_offers_resolve(
     # question. `_append_external_offers_from_seed_rows` is a closure over this scope, so all
     # three of its call sites share these without threading a parameter.
     #
-    # The memo matters as much as the cap. `cart_variant_id` comes from
-    # `sole_stamped_variant_id(seed_data)`, which is a property of the ROW, while the gate sits
-    # inside `for v in matched_variants` — so every candidate in a row asks the merchant the
-    # IDENTICAL question. One row with 12 variants burned 8 asks on duplicates, published
-    # candidates 9-12 unverified under enforce, and multiplied that row's contribution to the
-    # shadow denominator eightfold. Keyed on the question actually asked, (pdp_url, variant),
-    # so it also dedups across rows that resolve to the same product.
+    # The memo matters as much as the cap. It was introduced when the gate's id came from
+    # `sole_stamped_variant_id(seed_data)`, a property of the ROW, while the gate sat inside
+    # `for v in matched_variants` — so every candidate in a row asked the merchant the IDENTICAL
+    # question. One row with 12 variants burned 8 asks on duplicates, published candidates 9-12
+    # unverified under enforce, and multiplied that row's contribution to the shadow denominator
+    # eightfold.
+    #
+    # #2151 CHANGED WHAT IT DEDUPS, and the difference is worth stating rather than leaving the
+    # old sentence to rot. The gate now keys on the resolved hand-over id, which VARIES PER
+    # VARIANT on the exact-match path (8.5% of seeds) — so a row with two named variants is two
+    # genuinely different questions and correctly costs two asks where it used to cost one. What
+    # the memo still collapses is the sole-candidate and seed-stamp cases, where the id remains a
+    # property of the row, plus any repeat across rows resolving to the same product. Keyed on
+    # the question actually asked, (pdp_url, variant).
     _preflight_budget = _PreflightBudget()
     _preflight_memo: Dict[Tuple[str, str], bool] = {}
     # READ at the end of the request by `_emit_preflight_coverage`. A first version only
@@ -4323,7 +4330,8 @@ async def _handle_offers_resolve(
         # loop. Inside the loop it would be a query per card, which is the shape the
         # `list_open_recovery_tasks` note below already had to be corrected for.
         await _handover_resolver.prime(
-            _row_to_dict(r).get("attached_product_key") for r in seed_rows
+            _handover_product_key(_row_to_dict(r), _ensure_seed_data_obj(_row_to_dict(r).get("seed_data")))
+            for r in seed_rows
         )
         for row in seed_rows:
             row_dict = _row_to_dict(row)
@@ -4456,7 +4464,7 @@ async def _handle_offers_resolve(
                 # stored merchant-issued id — it will not rank candidates, and it refuses
                 # outright when the name matches none of them or more than one.
                 _handover = _handover_resolver.choose(
-                    product_key=row_dict.get("attached_product_key"),
+                    product_key=_handover_product_key(row_dict, seed_data),
                     seed_data=seed_data,
                     offer_variant_id=_seed_offer_variant_id(v) or None,
                 )
@@ -6007,10 +6015,10 @@ async def _handle_offers_resolve(
     # identity at all, the REFUSAL counts are the informative half.
     _handover_fields = handover_coverage_fields(_handover_resolver.stats)
     _summary_msg = "offers.resolve.summary" + (
-        " preflight mode=%s gated=%d cart_prefilled=%d asked=%d memo_hits=%d"
+        " preflight mode=%s gated=%d carts_built=%d asked=%d memo_hits=%d"
         " skipped_by_budget=%d degraded_to_referral=%d answered_fraction=%.3f" % (
             _coverage["preflight_mode"], _coverage["preflight_gated"],
-            _coverage["preflight_cart_prefilled"],
+            _coverage["preflight_carts_built"],
             _coverage["preflight_asked"], _coverage["preflight_memo_hits"],
             _coverage["preflight_skipped_by_budget"],
             _coverage["preflight_degraded_to_referral"],
@@ -8259,6 +8267,21 @@ def _build_external_seed_filter_product(
     )
 
 
+def _handover_product_key(row: Any, seed_data: Any) -> Optional[str]:
+    """The key the resolver looks up, read from the SAME two places the identity parse reads it.
+
+    `_external_seed_redirect_identity` takes `attached_product_key` from the row OR from
+    `seed_data`; the first cut of #2151 primed from the row only, so a seed carrying the key
+    solely inside its snapshot got a parsed merchant and platform but no catalog lookup at all —
+    a silent half-wiring that reads exactly like "this product has no identity".
+    """
+    row = row if isinstance(row, dict) else {}
+    seed_data = seed_data if isinstance(seed_data, dict) else {}
+    return str(
+        row.get("attached_product_key") or seed_data.get("attached_product_key") or ""
+    ).strip() or None
+
+
 def _external_seed_redirect_identity(
     *,
     row: Dict[str, Any],
@@ -8421,10 +8444,19 @@ def _external_seed_redirect_identity(
         # form, so it wins where it exists. Where it does not, the operator value is still
         # used exactly as before — this is a widening, never a narrowing, so no hand-over
         # that worked yesterday stops working.
-        cart_variant_id = (
-            (handover.variant_id if handover is not None else None)
-            or extract_shopify_numeric_variant_id(attached_variant_id)
-        )
+        _operator_vid = extract_shopify_numeric_variant_id(attached_variant_id)
+        _catalog_vid = handover.variant_id if handover is not None else None
+        if _operator_vid and _catalog_vid and _operator_vid != _catalog_vid:
+            # CONTRADICTION, so silence. Round-1 review of #2151 found the first cut letting a
+            # LONE catalog row win here unconditionally: an operator had attached the $140
+            # Standard, catalog held one merchant-issued row for the $95 Mini, and the buyer's
+            # prefilled cart named the Mini. That is the wrong-size hazard this whole lane
+            # refuses on the other branch, reached through the one door left open. Two
+            # merchant-issued ids disagreeing about one hand-over means we do not know which
+            # physical thing the buyer would receive, and the honest answer is a referral.
+            cart_variant_id = None
+        else:
+            cart_variant_id = _catalog_vid or _operator_vid
 
     return {
         "merchant_id": merchant_id,
@@ -8476,10 +8508,10 @@ def resolve_cart_permalink(
 def preflight_coverage_fields(stats: Dict[str, int]) -> Dict[str, Any]:
     """Coverage of the population the gate ACTUALLY applies to, or {} when it applied to none.
 
-    `answered_fraction` divides by `cart_prefilled`, not by `candidates`. A first version used
-    candidates, which counts every seed offer considered — including referral-only ones the gate
-    is deliberately blind to, and they are the majority. It also put memo hits in the denominator
-    and not the numerator, so a request whose six cart handoffs were all answered from one ask
+    `answered_fraction` divides by `gated`, not by `candidates`. A first version used
+    candidates, which counts every seed offer considered — including offers the gate is
+    deliberately blind to, and they are the majority. It also put memo hits in the denominator
+    and not the numerator, so a request whose six gated handoffs were all answered from one ask
     plus five memo hits reported 0.333. Both errors push the same way: they make a working gate
     look absent.
 
@@ -8518,7 +8550,11 @@ def preflight_coverage_fields(stats: Dict[str, int]) -> Dict[str, Any]:
         "preflight_mode": checkout_preflight.mode(),
         "preflight_candidates": stats.get("candidates", 0),
         "preflight_gated": covered,
-        "preflight_cart_prefilled": stats.get("cart_prefilled", 0),
+        # RENAMED from `preflight_cart_prefilled`, because its meaning changed. It used to BE
+        # the denominator; it is now "how many hand-overs actually got a cart", a number that
+        # drops to roughly zero on today's corpus. Keeping the old name would have shown a
+        # log-based dashboard a real-looking regression instead of a rename.
+        "preflight_carts_built": stats.get("cart_prefilled", 0),
         "preflight_asked": stats.get("asked", 0),
         "preflight_memo_hits": stats.get("memo_hits", 0),
         "preflight_skipped_by_budget": stats.get("skipped_by_budget", 0),
@@ -9158,7 +9194,10 @@ async def mint_external_seed_links(body: ExternalSeedLinksRequest) -> Dict[str, 
     # statement, not fifty. A caller that sends no attached_product_key gets exactly today's
     # behaviour: `choose` answers `no_attached_product_key`, which carries no id.
     _handover_resolver = HandoverVariantResolver()
-    await _handover_resolver.prime(c.attached_product_key for c in body.candidates)
+    await _handover_resolver.prime(
+        _handover_product_key(c.model_dump(), _ensure_seed_data_obj(c.seed_data))
+        for c in body.candidates
+    )
     # ONE MINT PER CANDIDATE, DELIBERATELY NO CACHE. The signed token carries per-seed context
     # (seedId, merchant/product/variant identity, shop domain), so two candidates that share
     # a destination are still two different tokens. Review of the first cut reproduced a
@@ -9177,7 +9216,7 @@ async def mint_external_seed_links(body: ExternalSeedLinksRequest) -> Dict[str, 
         redirect_identity = _external_seed_redirect_identity(
             row=row, seed_data=seed_data, offer_variant_id=candidate.variant_id,
             handover=_handover_resolver.choose(
-                product_key=candidate.attached_product_key,
+                product_key=_handover_product_key(row, seed_data),
                 seed_data=seed_data,
                 offer_variant_id=candidate.variant_id,
             ),
@@ -9284,7 +9323,8 @@ async def _build_prefetched_external_seed_wrappers(
     # #2151: one bounded lookup for the whole prefetched batch, before the loop.
     _handover_resolver = HandoverVariantResolver()
     await _handover_resolver.prime(
-        c.get("attached_product_key") for c in candidates if isinstance(c, dict)
+        _handover_product_key(c, _ensure_seed_data_obj(c.get("seed_data")))
+        for c in candidates if isinstance(c, dict)
     )
     for candidate in candidates:
         destination_url = str(
@@ -9310,7 +9350,7 @@ async def _build_prefetched_external_seed_wrappers(
             seed_data=_candidate_seed_data,
             offer_variant_id=candidate.get("variant_id"),
             handover=_handover_resolver.choose(
-                product_key=candidate.get("attached_product_key"),
+                product_key=_handover_product_key(candidate, _candidate_seed_data),
                 seed_data=_candidate_seed_data,
                 offer_variant_id=candidate.get("variant_id"),
             ),
@@ -11598,7 +11638,8 @@ async def _handle_find_products_multi_inner(
         # spend that budget on round trips instead of on cards.
         _handover_resolver = HandoverVariantResolver()
         await _handover_resolver.prime(
-            dict(c.row or {}).get("attached_product_key") for c in ranked_seed_candidates
+            _handover_product_key(dict(c.row or {}), dict(c.seed_data or {}))
+            for c in ranked_seed_candidates
         )
         seed_budget_ms = int(FIND_PRODUCTS_MULTI_SEED_BUDGET_MS or 0)
         seed_build_deadline = (
@@ -11662,7 +11703,7 @@ async def _handle_find_products_multi_inner(
                 seed_data=seed_data,
                 offer_variant_id=getattr(candidate, "variant_id", None),
                 handover=_handover_resolver.choose(
-                    product_key=row_dict.get("attached_product_key"),
+                    product_key=_handover_product_key(row_dict, seed_data),
                     seed_data=seed_data,
                     offer_variant_id=getattr(candidate, "variant_id", None),
                 ),
