@@ -38,6 +38,7 @@ from db.database import database  # noqa: E402
 from services.category_path_aliases import (  # noqa: E402
     ALIASES,
     ANCESTOR_NODES,
+    TAXONOMY_GAPS,
     TAXONOMY_LEAVES,
 )
 from services.pdp_category_classifier import CATEGORY_PATTERNS  # noqa: E402
@@ -163,6 +164,10 @@ async def main() -> int:
                     {"p": path},
                 )
             report["retracted_merge_instructions"] = sorted(retracted)
+            # `delete_paths` above already listed these under the opposite meaning ("reported, not
+            # deleted"); drop them from it so one path is not described two contradictory ways.
+            report["delete_paths"] = [x for x in report["delete_paths"] if x not in set(retracted)]
+            report["delete"] = len(report["delete_paths"])
             report["deleted"] = 0
             report["note"] = (
                 "extra rows are reported, not deleted — they may belong to the other service; "

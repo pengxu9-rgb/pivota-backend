@@ -221,9 +221,15 @@ TAXONOMY_GAPS: Dict[str, str] = {
     # version of this map collapsed them, in production. They are gaps, not aliases, and not
     # leaves either:
     #
-    #   MERGING them is what the gateway forbids, and the industry standard agrees — Google and
-    #   Shopify both file kits BY DOMAIN (`Anti-Aging Skin Care Kits`, `Facial Cleansing Kits`
-    #   under Skin Care), not in one global sets bucket. A skincare set is not a makeup set.
+    #   MERGING them is what the gateway forbids. The industry standard carries BOTH shapes, and
+    #   an earlier version of this comment cherry-picked one of them:
+    #     global  Google 6069 `Cosmetics > Cosmetic Sets`, 475 `Bath & Body Gift Sets`
+    #             Shopify hb-3-2-3 `Cosmetics > Cosmetic Sets`
+    #     domain  Google 7429 `Skin Care > Anti-Aging Skin Care Kits`, 7467 `Facial Cleansing Kits`
+    #             Shopify hb-3-2-9-25 `Skin Care > Skin Care Kits & Sets`
+    #   So "not in one global bucket" was false. What the standard actually does is keep BOTH: a
+    #   global set node AND a per-domain kit node. That is the shape to converge on — and it is
+    #   the third option, below — but it is not merging everything into one.
     #
     #   MAKING THEM LEAVES looked right and is worse. They are 3 segments, so recall's prefix
     #   would be the PARENT — `beauty/skincare/`, `beauty/makeup/` — and a "makeup set" query
@@ -231,10 +237,15 @@ TAXONOMY_GAPS: Dict[str, str] = {
     #   nail-polish` and `beauty/makeup/lips/lip-gloss` into "reachable", blinding the
     #   off-taxonomy invariant across two whole subtrees to make one cohort look fixed.
     #
-    # So they stay off-taxonomy and stay COUNTED, which is what that invariant is for. Closing
-    # them means a 4-segment leaf per family (`beauty/skincare/sets/gift-set` and friends) so the
-    # browse bucket stays tight — a taxonomy decision, and one to make WITH the gateway now that
-    # both read `category_taxonomy`.
+    # So they stay off-taxonomy and stay COUNTED, which is what that invariant is for.
+    #
+    # THE THIRD OPTION, which is where this should land: keep `beauty/sets/gift-set` as the global
+    # bucket AND add a 4-segment leaf per domain — `beauty/skincare/sets/kit` and friends. Four
+    # segments keeps the browse prefix tight (`beauty/skincare/sets/`), and it makes today's
+    # 3-segment rows STRICT ANCESTORS of it, so #2122 admits them with no data move at all. It is
+    # deferred here for a concrete reason, not a vague one: TAXONOMY_LEAVES derives from
+    # CATEGORY_PATTERNS, so each new leaf needs a regex that out-ranks the existing "Gift Set"
+    # pattern — a classifier-ordering problem to solve deliberately, not alongside a retraction.
     "beauty/skincare/sets": "INTENTIONALLY_DISTINCT in PIVOTA-Agent; needs a 4-segment leaf",
     "beauty/bodycare/sets": "INTENTIONALLY_DISTINCT in PIVOTA-Agent; needs a 4-segment leaf",
     "beauty/makeup/sets": "INTENTIONALLY_DISTINCT in PIVOTA-Agent; needs a 4-segment leaf",

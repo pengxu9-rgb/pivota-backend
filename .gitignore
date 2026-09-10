@@ -65,3 +65,6 @@ infra/gcp/*.local.*
 # run and the apply; nothing downstream reads them, so they must not reach main.
 reports/pdp_overlay_backfill/
 reports/meitu_final_2026_09_07/gateway_env_before.yaml
+
+# local virtualenv symlink — committed by accident in #2164
+.venv

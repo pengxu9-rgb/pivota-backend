@@ -22,10 +22,19 @@ and Shopify both categorise kits BY DOMAIN — `Anti-Aging Skin Care Kits`, `Fac
 under Skin Care — rather than in one global sets bucket. A skincare set and a makeup set are not
 the same shelf. The non-standard part was this repo having a single `beauty/sets/gift-set`.
 
-⚠️ VENDORED, NOT IMPORTED, and that is a known weakness: nothing here notices when the gateway
-edits its list. `taxonomy_code_vs_table_drift` watches the shared `category_taxonomy` table, which
-is the real fix; this file exists so the constraint is enforceable TODAY, before the gateway reads
-that table. Regenerate with:
+⚠️ VENDORED, AND NOTHING NOTICES WHEN THE GATEWAY EDITS ITS LIST. Re-vendor by hand.
+
+An earlier version of this docstring pointed at `taxonomy_code_vs_table_drift` as the mitigation.
+That was wrong and worth stating plainly: PIVOTA-Agent has no reader and no writer for
+`category_taxonomy` — every row in that table today was written by this repo's seeder — so a
+gateway edit to `INTENTIONALLY_DISTINCT` can never surface in the drift check. A mitigation that
+cannot fire is worse than none, because it stops anyone looking.
+
+The durable fix is a `do_not_merge` marker column on `category_taxonomy` plus a gateway write
+path, so this list stops being a copy. That is a migration and a cross-repo change; until then,
+this file is the enforceable form and the count is pinned by a test so a bad re-vendor is loud.
+
+Regenerate with:
 
     node -e "console.log(JSON.stringify(require('./src/services/beautyTaxonomy.js').INTENTIONALLY_DISTINCT,null,2))"
 """

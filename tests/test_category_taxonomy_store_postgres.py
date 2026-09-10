@@ -299,3 +299,109 @@ def test_an_alias_the_code_ALSO_has_is_not_reported_as_stale(pg_engine):
     out = _drift()
     assert out["detail"]["stale_table_aliases"] == []
     assert out["count"] == 0
+
+
+# --- the seeder's APPLY path, executed --------------------------------------------------------
+
+
+def _run_seeder(apply: bool):
+    """Execute scripts/seed_category_taxonomy.py in-process against the throwaway DB.
+
+    NOTHING TESTED THIS BEFORE, and that is how a `NameError` shipped: `TAXONOMY_GAPS` was used in
+    the retraction branch and never imported. `--dry-run` never reaches that branch, so the
+    cautious path — the one an operator runs first — could not see it. Under `--apply` every
+    upsert ran, then the script died before printing its report, and the stale alias row it
+    claimed to retract survived.
+    """
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "_seed_taxonomy_under_test", root / "scripts" / "seed_category_taxonomy.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    argv = sys.argv
+    sys.argv = ["seed", "--apply"] if apply else ["seed", "--dry-run"]
+    try:
+        spec.loader.exec_module(module)
+        return asyncio.run(module.main())
+    finally:
+        sys.argv = argv
+
+
+def test_the_seeder_APPLY_path_runs_without_crashing(pg_engine):
+    """The regression test for the NameError. `--dry-run` passing proves nothing about `--apply`."""
+    with pg_engine.begin() as conn:
+        _reset(conn)
+    assert _run_seeder(apply=True) == 0
+    from sqlalchemy import text
+
+    with pg_engine.begin() as conn:
+        n = conn.execute(text("SELECT count(*) FROM category_taxonomy")).scalar()
+    assert n > 100, "the seeder reported success but wrote almost nothing: %s" % n
+
+
+def test_the_seeder_RETRACTS_a_stale_merge_instruction(pg_engine):
+    """A path this repo now declares a GAP, sitting in the table as an alias, says "merge this" to
+    anyone reading the shared vocabulary. Retracting it cannot orphan a row — it only stops a
+    rewrite — so it is the one deletion the seeder is allowed to perform."""
+    from sqlalchemy import text
+
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _row(conn, "beauty/sets/gift-set", is_leaf=True)
+        _row(conn, "beauty/skincare/sets", alias_of="beauty/sets/gift-set")
+        assert conn.execute(
+            text("SELECT alias_of FROM category_taxonomy WHERE path='beauty/skincare/sets'")
+        ).scalar() == "beauty/sets/gift-set"
+
+    assert _run_seeder(apply=True) == 0
+
+    with pg_engine.begin() as conn:
+        left = conn.execute(
+            text("SELECT count(*) FROM category_taxonomy"
+                 " WHERE path='beauty/skincare/sets' AND alias_of IS NOT NULL")
+        ).scalar()
+    assert left == 0, "the merge instruction survived the retraction"
+
+
+def test_the_seeder_does_NOT_delete_a_canonical_row_it_does_not_recognise(pg_engine):
+    """The control, and the reason the retraction is scoped rather than a general delete. A
+    canonical path this repo does not know may be one the gateway wrote; removing it would orphan
+    its rows, which is the failure the shared table exists to prevent."""
+    from sqlalchemy import text
+
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _row(conn, "beauty/oral-care/toothpaste", is_leaf=True)
+
+    assert _run_seeder(apply=True) == 0
+
+    with pg_engine.begin() as conn:
+        survived = conn.execute(
+            text("SELECT count(*) FROM category_taxonomy WHERE path='beauty/oral-care/toothpaste'")
+        ).scalar()
+    assert survived == 1, "a foreign canonical row was deleted"
+
+
+def test_a_stale_alias_the_code_simply_FORGOT_is_also_drift(pg_engine):
+    """Not only the declared-GAP case. Any alias in the table that the code does not have is a
+    live merge instruction nobody owns; narrowing the check to GAPS alone would let a forgotten
+    one sit there being acted on. (Kills the mutant that adds `and src in TAXONOMY_GAPS`.)
+
+    ⚠️ This also means the table currently cannot hold a gateway-authored alias without going red.
+    That is correct TODAY — PIVOTA-Agent has no reader or writer for this table, so every row in
+    it was written by this repo's seeder. When the gateway gains a write path, this check needs a
+    foreign-author allowance, and that is a deliberate decision, not an oversight."""
+    with pg_engine.begin() as conn:
+        _seed_from_code(conn)
+        _row(conn, "beauty/skincare/serums", alias_of="beauty/skincare/treat/serum")
+    out = _drift()
+    assert out["count"] > 0
+    stale = out["detail"]["stale_table_aliases"]
+    assert any("beauty/skincare/serums" in x for x in stale), out["detail"]
+    assert not any("declared GAP" in x for x in stale), (
+        "this path is not a declared gap; only retracted merges should say so"
+    )
