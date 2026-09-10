@@ -273,3 +273,219 @@ def test_an_UNREADABLE_table_is_reported_not_treated_as_agreement(pg_engine):
     out = _drift()
     assert out["count"] == 1
     assert out["detail"]["table_readable"] is False
+
+
+def test_a_STALE_ALIAS_left_in_the_table_is_drift(pg_engine):
+    """The direction the first version of the drift check could not see: it iterated the CODE's
+    alias map, so an alias row the table has and the code does not was invisible.
+
+    That row is not inert. It says "merge this", and once the gateway reads this table it will —
+    which is exactly how seven INTENTIONALLY_DISTINCT paths were collapsed on 2026-09-10. A path
+    this repo has since declared a GAP is the case that matters, so it is named in the output."""
+    with pg_engine.begin() as conn:
+        _seed_from_code(conn)
+        _row(conn, "beauty/skincare/sets", alias_of="beauty/sets/gift-set")
+    out = _drift()
+    assert out["count"] > 0
+    stale = out["detail"]["stale_table_aliases"]
+    assert any("beauty/skincare/sets" in x for x in stale), out["detail"]
+    assert any("declared GAP" in x for x in stale), "a retracted merge must say so"
+
+
+def test_an_alias_the_code_ALSO_has_is_not_reported_as_stale(pg_engine):
+    """The control. Without it, "every alias is stale" would pass the test above."""
+    with pg_engine.begin() as conn:
+        _seed_from_code(conn)
+    out = _drift()
+    assert out["detail"]["stale_table_aliases"] == []
+    assert out["count"] == 0
+
+
+# --- the seeder's APPLY path, executed --------------------------------------------------------
+
+
+def _run_seeder(apply: bool):
+    """Execute the seeder's apply path against OUR OWN connection.
+
+    NOTHING TESTED THIS BEFORE, and that is how a `NameError` shipped: `TAXONOMY_GAPS` was used in
+    the retraction branch and never imported. `--dry-run` never reaches that branch, so the
+    cautious path an operator runs first could not see it; under `--apply` every upsert ran, the
+    script died before printing its report, and the stale alias row it claimed to retract survived.
+
+    Calls `run_seed(db, ...)` and NOT `main()`, because main() connects and disconnects the
+    shared global `database` and these gate files share one. That is hygiene, not a bug fix.
+
+    ⚠️ I ORIGINALLY CLAIMED IT FIXED A LEAK IT DID NOT. `test_commerce_ledger_retention_postgres`
+    counting 6 events where it expected 5 looked like my disconnect and I wrote that down. It
+    reproduces at the merge base, alone, on a fresh database: the test pins NOW = 2026-09-04T12:00Z
+    and calls `report_ledger_retention` with no clock, so its fixture crossed the 7-day horizon at
+    2026-09-10T12:00Z. Fixed separately. A causal story that fits the timing is not a cause.
+    """
+    import importlib.util
+    from pathlib import Path
+
+    from databases import Database
+
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "_seed_taxonomy_under_test", root / "scripts" / "seed_category_taxonomy.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    async def go():
+        db = Database(DATABASE_URL)
+        await db.connect()
+        try:
+            return await module.run_seed(db, apply=apply)
+        finally:
+            await db.disconnect()
+
+    return asyncio.run(go())
+
+
+def test_the_seeder_APPLY_path_runs_without_crashing(pg_engine):
+    """The regression test for the NameError. `--dry-run` passing proves nothing about `--apply`."""
+    with pg_engine.begin() as conn:
+        _reset(conn)
+    report = _run_seeder(apply=True)
+    assert report["insert"] > 100, report
+    from sqlalchemy import text
+
+    with pg_engine.begin() as conn:
+        n = conn.execute(text("SELECT count(*) FROM category_taxonomy")).scalar()
+    assert n > 100, "the seeder reported success but wrote almost nothing: %s" % n
+
+
+def test_the_seeder_RETRACTS_a_stale_merge_instruction(pg_engine):
+    """A path this repo now declares a GAP, sitting in the table as an alias, says "merge this" to
+    anyone reading the shared vocabulary. Retracting it cannot orphan a row — it only stops a
+    rewrite — so it is the one deletion the seeder is allowed to perform."""
+    from sqlalchemy import text
+
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _row(conn, "beauty/sets/gift-set", is_leaf=True)
+        _row(conn, "beauty/skincare/sets", alias_of="beauty/sets/gift-set")
+        assert conn.execute(
+            text("SELECT alias_of FROM category_taxonomy WHERE path='beauty/skincare/sets'")
+        ).scalar() == "beauty/sets/gift-set"
+
+    _run_seeder(apply=True)
+
+    with pg_engine.begin() as conn:
+        left = conn.execute(
+            text("SELECT count(*) FROM category_taxonomy"
+                 " WHERE path='beauty/skincare/sets' AND alias_of IS NOT NULL")
+        ).scalar()
+    assert left == 0, "the merge instruction survived the retraction"
+
+
+def test_the_seeder_does_NOT_delete_a_canonical_row_it_does_not_recognise(pg_engine):
+    """The control, and the reason the retraction is scoped rather than a general delete. A
+    canonical path this repo does not know may be one the gateway wrote; removing it would orphan
+    its rows, which is the failure the shared table exists to prevent."""
+    from sqlalchemy import text
+
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _row(conn, "beauty/oral-care/toothpaste", is_leaf=True)
+
+    _run_seeder(apply=True)
+
+    with pg_engine.begin() as conn:
+        survived = conn.execute(
+            text("SELECT count(*) FROM category_taxonomy WHERE path='beauty/oral-care/toothpaste'")
+        ).scalar()
+    assert survived == 1, "a foreign canonical row was deleted"
+
+
+def test_a_stale_alias_the_code_simply_FORGOT_is_also_drift(pg_engine):
+    """Not only the declared-GAP case. Any alias in the table that the code does not have is a
+    live merge instruction nobody owns; narrowing the check to GAPS alone would let a forgotten
+    one sit there being acted on. (Kills the mutant that adds `and src in TAXONOMY_GAPS`.)
+
+    ⚠️ This also means the table currently cannot hold a gateway-authored alias without going red.
+    That is correct TODAY — PIVOTA-Agent has no reader or writer for this table, so every row in
+    it was written by this repo's seeder. When the gateway gains a write path, this check needs a
+    foreign-author allowance, and that is a deliberate decision, not an oversight."""
+    with pg_engine.begin() as conn:
+        _seed_from_code(conn)
+        _row(conn, "beauty/oral-care/rinse", alias_of="beauty/skincare/cleanse/cleanser")
+    out = _drift()
+    assert out["count"] > 0
+    stale = out["detail"]["stale_table_aliases"]
+    assert any("beauty/oral-care/rinse" in x for x in stale), out["detail"]
+    assert not any("declared GAP" in x for x in stale), (
+        "this path is not a declared gap; only retracted merges should say so"
+    )
+
+
+def test_DRY_RUN_writes_absolutely_nothing(pg_engine):
+    """The path the docstring tells an operator to run FIRST, and nothing pinned it.
+
+    The mutant that makes `run_seed` ignore its `apply` argument and always write survived the
+    whole suite, because every other test here calls it with apply=True. A seeder whose dry run
+    writes is worse than one with no dry run at all: it is the mode people reach for precisely
+    when they are not sure."""
+    from sqlalchemy import text
+
+    with pg_engine.begin() as conn:
+        _reset(conn)
+    report = _run_seeder(apply=False)
+    assert report["mode"] == "dry_run"
+    assert report["insert"] > 100, "dry run should still REPORT the work"
+    with pg_engine.begin() as conn:
+        assert conn.execute(text("SELECT count(*) FROM category_taxonomy")).scalar() == 0
+
+
+def test_DRY_RUN_does_not_retract_but_still_reports_it(pg_engine):
+    """A dry run that describes the table differently from the apply it previews is not a preview.
+
+    These two used to disagree: `retracted_merge_instructions` was computed only inside the apply
+    branch, so a dry run listed the same rows under `delete_paths` ("reported, not deleted") while
+    the apply retracted them — and with a foreign canonical row present the counts diverged
+    outright."""
+    from sqlalchemy import text
+
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _row(conn, "beauty/sets/gift-set", is_leaf=True)
+        _row(conn, "beauty/skincare/sets", alias_of="beauty/sets/gift-set")
+
+    dry = _run_seeder(apply=False)
+    assert dry["retracted_merge_instructions"] == ["beauty/skincare/sets"]
+    assert dry["deleted"] == 0
+    with pg_engine.begin() as conn:
+        assert conn.execute(
+            text("SELECT count(*) FROM category_taxonomy WHERE path='beauty/skincare/sets'")
+        ).scalar() == 1, "dry run must not delete"
+
+    wet = _run_seeder(apply=True)
+    assert wet["retracted_merge_instructions"] == dry["retracted_merge_instructions"], (
+        "the preview must name the same rows the apply acts on"
+    )
+    assert wet["deleted"] == 1
+    # THE SHAPE, not just the one key someone remembered. `deleted` went missing from the dry-run
+    # report and the assertion above could only catch it because it names that key literally; the
+    # NEXT key added inside `if apply:` would reintroduce the same defect silently. A preview whose
+    # report has different FIELDS from the apply is not a preview of it, whatever the values say.
+    assert set(dry) == set(wet), (
+        f"report shape must not depend on mode; differs by {sorted(set(dry) ^ set(wet))}"
+    )
+    with pg_engine.begin() as conn:
+        assert conn.execute(
+            text("SELECT count(*) FROM category_taxonomy WHERE path='beauty/skincare/sets'")
+        ).scalar() == 0
+
+
+def test_a_retracted_path_is_not_ALSO_listed_as_an_undeleted_extra(pg_engine):
+    """One path, one meaning. It used to appear under `delete_paths` ("reported, not deleted") and
+    under `retracted_merge_instructions` (deleted) in the same report."""
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _row(conn, "beauty/sets/gift-set", is_leaf=True)
+        _row(conn, "beauty/skincare/sets", alias_of="beauty/sets/gift-set")
+    report = _run_seeder(apply=False)
+    assert "beauty/skincare/sets" not in report["delete_paths"]
+    assert "beauty/skincare/sets" in report["retracted_merge_instructions"]

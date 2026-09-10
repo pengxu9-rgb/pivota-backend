@@ -43,7 +43,6 @@ def test_gaps_and_aliases_are_disjoint():
 def test_resolve_snaps_the_measured_near_misses():
     """The real prod cohorts, by row count."""
     assert resolve("beauty/skincare/treat/toner") == "beauty/skincare/tone/toner"
-    assert resolve("beauty/skincare/sets") == "beauty/sets/gift-set"                  # 49
     assert resolve("beauty/makeup/lips/lip-balm") == "beauty/makeup/lip/balm"         # 12
     assert resolve("beauty/makeup/lips/lip-gloss") == "beauty/makeup/lip/gloss"       # 9
     assert resolve("beauty/body-care/deodorant") == "beauty/body/care"                # 11
@@ -180,8 +179,8 @@ def test_the_map_covers_the_measured_production_cohort():
     """117 distinct off-taxonomy paths were measured on prod 2026-09-09. Each is either aliased or
     declared a gap; a path in neither would be silently left broken by a map that claims to have
     considered it. The counts are pinned so that trimming the map is a visible decision."""
-    assert len(ALIASES) == 91, "alias count changed; re-measure before editing the expectation"
-    assert len(TAXONOMY_GAPS) == 26
+    assert len(ALIASES) == 84, "alias count changed; re-measure before editing the expectation"
+    assert len(TAXONOMY_GAPS) == 33
     assert len(ALIASES) + len(TAXONOMY_GAPS) == 117
 
 
@@ -189,7 +188,7 @@ def test_the_map_covers_the_measured_production_cohort():
     "path,rows",
     [
         ("beauty/skincare/treat/toner", 316),
-        ("beauty/skincare/sets", 49),
+        ("beauty/skincare/sets", 49),   # a declared gap now, not an alias
         ("beauty/makeup/nails/nail-polish", 37),
         ("beauty/skincare/eye-care", 31),
     ],
@@ -197,3 +196,102 @@ def test_the_map_covers_the_measured_production_cohort():
 def test_the_biggest_cohorts_are_each_decided(path, rows):
     """Named individually so the four largest cannot fall out of the map unnoticed."""
     assert path in ALIASES or path in TAXONOMY_GAPS, (path, rows)
+
+
+# --- the cross-repo constraint this map violated in production ---------------------------------
+
+
+def test_no_alias_collapses_a_path_the_GATEWAY_keeps_distinct():
+    """THE CHECK THAT WAS MISSING, and the reason 7 path families were merged in prod 2026-09-10.
+
+    PIVOTA-Agent's `beautyTaxonomy.js` carries three tables: canonical paths, aliases, and
+    INTENTIONALLY_DISTINCT — "kept here so a future pass does not 'helpfully' collapse them". I
+    diffed this map against the first two, found one conflict, and shipped. The third table is the
+    one whose entire purpose is to say NO, and nothing compared against it.
+    """
+    from services.gateway_intentionally_distinct import INTENTIONALLY_DISTINCT
+
+    from services.category_path_aliases import gateway_collisions
+
+    collides = gateway_collisions(ALIASES)
+    assert not collides, (
+        "PIVOTA-Agent keeps these distinct; aliasing them away merges rows it relies on: %s"
+        % collides
+    )
+
+
+def test_the_gateway_distinct_paths_are_GAPS_not_aliases_and_not_leaves():
+    """Removing the aliases is not enough, and making them LEAVES is worse than leaving them.
+
+    They are 3 segments, so recall's prefix would be their PARENT — `beauty/skincare/`,
+    `beauty/makeup/` — and a "makeup set" query would browse every makeup row. Measured while
+    trying it: `beauty/makeup/nails/nail-polish` and `beauty/makeup/lips/lip-gloss` both became
+    "reachable", blinding the off-taxonomy invariant across two subtrees in order to make one
+    cohort look fixed. So they stay off-taxonomy and stay COUNTED, which is what that invariant is
+    for; closing them needs a 4-segment leaf per family, decided with the gateway."""
+    from services.gateway_intentionally_distinct import INTENTIONALLY_DISTINCT
+
+    for path in (
+        "beauty/skincare/sets",
+        "beauty/bodycare/sets",
+        "beauty/makeup/sets",
+        "beauty/skincare/eye/balm",
+        "beauty/skincare/hand/cream",
+        "beauty/skincare/moisturizer/balm",
+        "beauty/skincare/oil",
+    ):
+        assert path in INTENTIONALLY_DISTINCT, path
+        assert path in TAXONOMY_GAPS, "%s must be a declared gap" % path
+        assert path not in ALIASES, "%s must not be merged" % path
+        assert path not in TAXONOMY_LEAVES, "%s as a leaf over-broadens its parent prefix" % path
+        assert resolve(path) is None, "a gap has no honest target"
+
+
+def test_declaring_them_did_not_widen_any_query_prefix():
+    """The control for the test above, and the measurement that rejected the leaf approach. If any
+    of these ever becomes a leaf, its parent turns into a live browse prefix and whole subtrees
+    stop being visible to `serving_eligible_off_taxonomy_path`."""
+    from services.category_path_aliases import LEAF_PARENTS
+
+    for parent in ("beauty/skincare", "beauty/makeup", "beauty/bodycare"):
+        assert parent not in LEAF_PARENTS, (
+            "%s is a query prefix; every path under it is now 'reachable' and invisible to the "
+            "off-taxonomy check" % parent
+        )
+    assert not has_category_door("beauty/makeup/nails/nail-polish")
+    assert not has_category_door("beauty/makeup/lips/lip-gloss")
+
+
+def test_the_collision_check_ACTUALLY_FIRES_on_a_colliding_map():
+    """The mechanism, not the current state. Deleting the import-time assert left every other test
+    in this file green, because they all only inspect a map that happens to be clean — the exact
+    shape of an absence assertion that passes when the mechanism is absent too."""
+    from services.category_path_aliases import gateway_collisions
+
+    bad = dict(ALIASES)
+    bad["beauty/skincare/sets"] = "beauty/sets/gift-set"
+    assert gateway_collisions(bad) == ["beauty/skincare/sets"]
+    # ...and the control: a path the gateway does NOT keep distinct is not flagged
+    ok = dict(ALIASES)
+    ok["beauty/skincare/totally-made-up"] = "beauty/sets/gift-set"
+    assert gateway_collisions(ok) == []
+
+
+def test_the_vendored_distinct_list_is_not_EMPTY_or_TRUNCATED():
+    """An empty list makes the collision check pass on any map at all. Pinned by count and by the
+    entries this repo actually collided with, so a bad regeneration is loud."""
+    from services.gateway_intentionally_distinct import (
+        GATEWAY_SOURCE_COMMIT,
+        INTENTIONALLY_DISTINCT,
+    )
+
+    assert len(INTENTIONALLY_DISTINCT) == 16, "re-vendored? update the count deliberately"
+    assert GATEWAY_SOURCE_COMMIT, "record which gateway commit this was copied from"
+    for path in (
+        "beauty/skincare/sets",
+        "beauty/makeup/sets",
+        "beauty/skincare/eye/balm",
+        "beauty/skincare/hand/cream",
+        "beauty/skincare/oil",
+    ):
+        assert path in INTENTIONALLY_DISTINCT, path

@@ -36,6 +36,9 @@ from __future__ import annotations
 
 from typing import Dict, Optional
 
+from services.gateway_intentionally_distinct import (
+    INTENTIONALLY_DISTINCT as GATEWAY_INTENTIONALLY_DISTINCT,
+)
 from services.pdp_category_classifier import CATEGORY_PATTERNS
 
 TAXONOMY_LEAVES = frozenset(path for _label, path, _pattern in CATEGORY_PATTERNS)
@@ -82,7 +85,6 @@ _alias(
     "beauty/skincare/treat/treatment",
     "beauty/skincare/eye-care",
     "beauty/skincare/eye-cream",
-    "beauty/skincare/eye/balm",
     "beauty/skincare/eye-patches",
     "beauty/skincare/eye/brightener",
     "beauty/skincare/eye/treatment",
@@ -116,13 +118,11 @@ _alias(
 _alias(
     "beauty/skincare/moisturize/oil",
     "beauty/skincare/face-oil",
-    "beauty/skincare/oil",
     "beauty/skincare/oil/carrier",
 )
 
 _alias(
     "beauty/skincare/moisturize/cream",
-    "beauty/skincare/moisturizer/balm",
     "beauty/skincare/moisturizer/gel",
     "beauty/skincare/moisturizers",
     "beauty/skincare/moisturizer/lotion",
@@ -130,7 +130,6 @@ _alias(
     "beauty/skincare/moisturizer/night_cream",
     "beauty/skincare/moisturizer/tinted",
     "beauty/skincare/face/lotion",
-    "beauty/skincare/hand/cream",
     "beauty/skincare/hand/nail",
 )
 
@@ -200,11 +199,8 @@ _alias(
 # SETS. A kit is a kit whatever shelf its contents come from.
 _alias(
     "beauty/sets/gift-set",
-    "beauty/skincare/sets",
     "beauty/skincare/bundle",
     "beauty/skincare/toner/set",
-    "beauty/bodycare/sets",
-    "beauty/makeup/sets",
     "beauty/mystery-box",
     "beauty/makeup/eyes/lip",
 )
@@ -220,6 +216,45 @@ _alias(
 # Kept as data, not a comment, so the count in the report cannot drift from the list.
 
 TAXONOMY_GAPS: Dict[str, str] = {
+    # ⚠️ THE SEVEN PIVOTA-Agent LISTS AS `INTENTIONALLY_DISTINCT`. Its comment on that list reads
+    # "kept here so a future pass does not 'helpfully' collapse them" — and on 2026-09-10 the first
+    # version of this map collapsed them, in production. They are gaps, not aliases, and not
+    # leaves either:
+    #
+    #   MERGING them is what the gateway forbids — and the cost is CONVERGENCE, not serving:
+    #   its alias tables have no runtime callers, so the harm is that its reconciler and this
+    #   repo's backfill rewrite the same rows in opposite directions, last schedule wins. The industry standard carries BOTH shapes, and
+    #   an earlier version of this comment cherry-picked one of them:
+    #     global  Google 6069 `Cosmetics > Cosmetic Sets`, 475 `Bath & Body Gift Sets`
+    #             Shopify hb-3-2-3 `Cosmetics > Cosmetic Sets`
+    #     domain  Google 7429 `Skin Care > Anti-Aging Skin Care Kits`, 7467 `Facial Cleansing Kits`
+    #             Shopify hb-3-2-9-25 `Skin Care > Skin Care Kits & Sets`
+    #   So "not in one global bucket" was false. What the standard actually does is keep BOTH: a
+    #   global set node AND a per-domain kit node. That is the shape to converge on — and it is
+    #   the third option, below — but it is not merging everything into one.
+    #
+    #   MAKING THEM LEAVES looked right and is worse. They are 3 segments, so recall's prefix
+    #   would be the PARENT — `beauty/skincare/`, `beauty/makeup/` — and a "makeup set" query
+    #   would browse every makeup row. Measured: adding them turned `beauty/makeup/nails/
+    #   nail-polish` and `beauty/makeup/lips/lip-gloss` into "reachable", blinding the
+    #   off-taxonomy invariant across two whole subtrees to make one cohort look fixed.
+    #
+    # So they stay off-taxonomy and stay COUNTED, which is what that invariant is for.
+    #
+    # THE THIRD OPTION, which is where this should land: keep `beauty/sets/gift-set` as the global
+    # bucket AND add a 4-segment leaf per domain — `beauty/skincare/sets/kit` and friends. Four
+    # segments keeps the browse prefix tight (`beauty/skincare/sets/`), and it makes today's
+    # 3-segment rows STRICT ANCESTORS of it, so #2122 admits them with no data move at all. It is
+    # deferred here for a concrete reason, not a vague one: TAXONOMY_LEAVES derives from
+    # CATEGORY_PATTERNS, so each new leaf needs a regex that out-ranks the existing "Gift Set"
+    # pattern — a classifier-ordering problem to solve deliberately, not alongside a retraction.
+    "beauty/skincare/sets": "INTENTIONALLY_DISTINCT in PIVOTA-Agent; needs a 4-segment leaf",
+    "beauty/bodycare/sets": "INTENTIONALLY_DISTINCT in PIVOTA-Agent; needs a 4-segment leaf",
+    "beauty/makeup/sets": "INTENTIONALLY_DISTINCT in PIVOTA-Agent; needs a 4-segment leaf",
+    "beauty/skincare/eye/balm": "INTENTIONALLY_DISTINCT in PIVOTA-Agent; do not fold into treat/",
+    "beauty/skincare/hand/cream": "INTENTIONALLY_DISTINCT in PIVOTA-Agent; do not fold into moisturize/",
+    "beauty/skincare/moisturizer/balm": "INTENTIONALLY_DISTINCT in PIVOTA-Agent; do not fold into moisturize/",
+    "beauty/skincare/oil": "INTENTIONALLY_DISTINCT in PIVOTA-Agent; do not fold into moisturize/oil",
     "beauty/makeup/nails/nail-polish": "no nail-colour leaf (devices/nail is a device)",
     "beauty/makeup/nails/cuticle-oil": "no nail-colour leaf",
     "beauty/makeup/nails/nail-polish-remover": "no nail-colour leaf",
@@ -254,6 +289,26 @@ TAXONOMY_GAPS: Dict[str, str] = {
 # The failure being repaired is "somebody wrote a path that is not in the taxonomy". A map that can
 # do the same thing while repairing it is worthless, so the targets are checked at import.
 
+# ⚠️ THE CHECK THAT WAS MISSING. PIVOTA-Agent keeps a list of paths deliberately NOT merged; on
+# 2026-09-10 this map collapsed seven of them in production, because the diff I ran compared this
+# map against the gateway's CANONICAL paths and its ALIAS table and never against the third table —
+# the one whose whole purpose is to say NO. Asserted at import, so it fails collection, not review.
+def gateway_collisions(aliases: Dict[str, str]) -> list:
+    """Paths in `aliases` that PIVAgent keeps deliberately separate. A FUNCTION, not an inline
+    assert, so a test can hand it a colliding map and watch it fire — an assertion that only ever
+    sees a clean map proves the map is clean, never that the check works."""
+    return sorted(set(aliases) & set(GATEWAY_INTENTIONALLY_DISTINCT))
+
+
+assert GATEWAY_INTENTIONALLY_DISTINCT, (
+    "the vendored do-not-merge list is EMPTY, so the collision check below cannot fire; "
+    "regenerate it from PIVOTA-Agent src/services/beautyTaxonomy.js"
+)
+_COLLIDES = gateway_collisions(ALIASES)
+assert not _COLLIDES, (
+    "these paths are INTENTIONALLY_DISTINCT in PIVOTA-Agent and must not be aliased away: %s"
+    % _COLLIDES
+)
 assert not (set(ALIASES) & set(TAXONOMY_GAPS)), "a path is both aliased and declared a gap"
 _BAD = sorted(set(ALIASES.values()) - TAXONOMY_LEAVES)
 assert not _BAD, "alias target is not a taxonomy leaf: %s" % _BAD
