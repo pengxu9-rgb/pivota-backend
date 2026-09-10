@@ -2187,6 +2187,7 @@ async def run_catalog_invariant_checks(db: Any) -> Dict[str, Any]:
     results: List[Dict[str, Any]] = []
     violated = 0
     warned = 0
+    errored = 0
     for check in _CHECKS:
         entry: Dict[str, Any] = {
             "name": check["name"],
@@ -2229,5 +2230,30 @@ async def run_catalog_invariant_checks(db: Any) -> Dict[str, Any]:
         except Exception as exc:  # noqa: BLE001 — one bad check must not sink the sweep
             logger.exception("catalog_invariants: check %s failed", check["name"])
             entry["error"] = str(exc)
+            errored += 1
         results.append(entry)
-    return {"violated_count": violated, "warned_count": warned, "checks": results}
+    # ERRORED IS ITS OWN COUNTER, and until 2026-09-10 it was no counter at all.
+    #
+    # ⚠️ IT IS NOT A FOURTH EXCLUSIVE STATE, and an earlier version of this comment implied it was.
+    # The tally above runs BEFORE sampling, deliberately (see the 2026-09-02 note): the COUNT is
+    # the verdict, so a sample fetch that raises must not erase a real violation from the totals.
+    # The consequence is that a check which raises while SAMPLING is counted in both `violated` and
+    # `errored` — 21 of 27 in a probe where every `fetch_all` raised. That is intended: the finding
+    # is real and the error is only in fetching examples of it. What is NOT intended is reading the
+    # summary as 27 checks partitioned four ways; `errored` overlaps the other two by design.
+    #
+    # A check that raises gets `error` and NO `count`, `threshold` or `violated` key. The summary
+    # counted violations and warnings only, so a broken check read exactly like a passing one:
+    # "27 checks, 0 violated". Measured on 2026-09-10, three share-based checks had been raising
+    # AttributeError in a unit fake since the day they merged and the file was green throughout;
+    # a fourth followed. Nothing anywhere — no alert policy, no log metric — mentioned the state.
+    #
+    # An unrunnable check is not a passing check. It is the same defect as a green light over a
+    # broken thing, which is the entire subject of this module.
+    return {
+        "violated_count": violated,
+        "warned_count": warned,
+        "errored_count": errored,
+        "errored": sorted(c["name"] for c in results if c.get("error")),
+        "checks": results,
+    }
