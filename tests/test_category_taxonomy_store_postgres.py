@@ -305,37 +305,47 @@ def test_an_alias_the_code_ALSO_has_is_not_reported_as_stale(pg_engine):
 
 
 def _run_seeder(apply: bool):
-    """Execute scripts/seed_category_taxonomy.py in-process against the throwaway DB.
+    """Execute the seeder's apply path against OUR OWN connection.
 
     NOTHING TESTED THIS BEFORE, and that is how a `NameError` shipped: `TAXONOMY_GAPS` was used in
     the retraction branch and never imported. `--dry-run` never reaches that branch, so the
-    cautious path — the one an operator runs first — could not see it. Under `--apply` every
-    upsert ran, then the script died before printing its report, and the stale alias row it
-    claimed to retract survived.
+    cautious path an operator runs first could not see it; under `--apply` every upsert ran, the
+    script died before printing its report, and the stale alias row it claimed to retract survived.
+
+    Calls `run_seed(db, ...)` and NOT `main()`. main() connects and disconnects the shared global
+    `database`, and these gate files share one database — a test that closes the global seam
+    breaks whichever unrelated module runs next. It did: an earlier version of this helper made
+    tests/test_commerce_ledger_retention_postgres.py count 6 events where it expected 5.
     """
     import importlib.util
-    import sys
     from pathlib import Path
+
+    from databases import Database
 
     root = Path(__file__).resolve().parents[1]
     spec = importlib.util.spec_from_file_location(
         "_seed_taxonomy_under_test", root / "scripts" / "seed_category_taxonomy.py"
     )
     module = importlib.util.module_from_spec(spec)
-    argv = sys.argv
-    sys.argv = ["seed", "--apply"] if apply else ["seed", "--dry-run"]
-    try:
-        spec.loader.exec_module(module)
-        return asyncio.run(module.main())
-    finally:
-        sys.argv = argv
+    spec.loader.exec_module(module)
+
+    async def go():
+        db = Database(DATABASE_URL)
+        await db.connect()
+        try:
+            return await module.run_seed(db, apply=apply)
+        finally:
+            await db.disconnect()
+
+    return asyncio.run(go())
 
 
 def test_the_seeder_APPLY_path_runs_without_crashing(pg_engine):
     """The regression test for the NameError. `--dry-run` passing proves nothing about `--apply`."""
     with pg_engine.begin() as conn:
         _reset(conn)
-    assert _run_seeder(apply=True) == 0
+    report = _run_seeder(apply=True)
+    assert report["insert"] > 100, report
     from sqlalchemy import text
 
     with pg_engine.begin() as conn:
@@ -357,7 +367,7 @@ def test_the_seeder_RETRACTS_a_stale_merge_instruction(pg_engine):
             text("SELECT alias_of FROM category_taxonomy WHERE path='beauty/skincare/sets'")
         ).scalar() == "beauty/sets/gift-set"
 
-    assert _run_seeder(apply=True) == 0
+    _run_seeder(apply=True)
 
     with pg_engine.begin() as conn:
         left = conn.execute(
@@ -377,7 +387,7 @@ def test_the_seeder_does_NOT_delete_a_canonical_row_it_does_not_recognise(pg_eng
         _reset(conn)
         _row(conn, "beauty/oral-care/toothpaste", is_leaf=True)
 
-    assert _run_seeder(apply=True) == 0
+    _run_seeder(apply=True)
 
     with pg_engine.begin() as conn:
         survived = conn.execute(
@@ -397,11 +407,11 @@ def test_a_stale_alias_the_code_simply_FORGOT_is_also_drift(pg_engine):
     foreign-author allowance, and that is a deliberate decision, not an oversight."""
     with pg_engine.begin() as conn:
         _seed_from_code(conn)
-        _row(conn, "beauty/skincare/serums", alias_of="beauty/skincare/treat/serum")
+        _row(conn, "beauty/oral-care/rinse", alias_of="beauty/skincare/cleanse/cleanser")
     out = _drift()
     assert out["count"] > 0
     stale = out["detail"]["stale_table_aliases"]
-    assert any("beauty/skincare/serums" in x for x in stale), out["detail"]
+    assert any("beauty/oral-care/rinse" in x for x in stale), out["detail"]
     assert not any("declared GAP" in x for x in stale), (
         "this path is not a declared gap; only retracted merges should say so"
     )

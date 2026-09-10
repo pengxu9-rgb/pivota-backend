@@ -93,19 +93,21 @@ def _desired() -> list[dict]:
     return rows
 
 
-async def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--apply", action="store_true")
-    parser.add_argument("--dry-run", action="store_true")
-    args = parser.parse_args()
-    apply = args.apply and not args.dry_run
+async def run_seed(db, apply: bool) -> dict:
+    """The whole job, against an INJECTED connection.
 
+    Separated from `main()` so a test can execute the apply path without connecting or
+    disconnecting the shared global `database`. The first version could only be tested by running
+    `main()`, which does both — and these Postgres gate files share one database, so a test that
+    disconnects the global seam breaks whichever unrelated module runs next. It also meant the
+    apply path went untested, which is how a NameError in the retraction branch shipped: the
+    branch is unreachable under --dry-run.
+    """
     rows = _desired()
-    await database.connect()
-    try:
+    if True:
         existing = {
             r["path"]: dict(r)
-            for r in (await database.fetch_all(
+            for r in (await db.fetch_all(
                 "SELECT path, label, is_leaf, alias_of FROM category_taxonomy"
             ) or [])
         }
@@ -131,7 +133,7 @@ async def main() -> int:
             # Canonical rows FIRST: an alias inserted before its target violates the self-FK.
             for record in [r for r in rows if r["alias_of"] is None] + \
                           [r for r in rows if r["alias_of"]]:
-                await database.execute(
+                await db.execute(
                     """
                     INSERT INTO category_taxonomy (path, label, is_leaf, alias_of, note, updated_at)
                     VALUES (:path, :label, :is_leaf, :alias_of, :note, now())
@@ -159,7 +161,7 @@ async def main() -> int:
                 if path in TAXONOMY_GAPS and existing[path].get("alias_of")
             ]
             for path in retracted:
-                await database.execute(
+                await db.execute(
                     "DELETE FROM category_taxonomy WHERE path = :p AND alias_of IS NOT NULL",
                     {"p": path},
                 )
@@ -173,10 +175,22 @@ async def main() -> int:
                 "extra rows are reported, not deleted — they may belong to the other service; "
                 "the exception is an alias row for a path now declared a GAP, which is retracted"
             )
-        print(json.dumps(report, indent=2, sort_keys=True))
-        return 0
+        return report
+
+
+async def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+
+    await database.connect()
+    try:
+        report = await run_seed(database, apply=args.apply and not args.dry_run)
     finally:
         await database.disconnect()
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0
 
 
 if __name__ == "__main__":
