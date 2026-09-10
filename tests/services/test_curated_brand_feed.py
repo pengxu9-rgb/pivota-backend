@@ -23,50 +23,53 @@ def _product(**over):
 
 def test_category_is_classified_per_product_not_stamped_from_the_flag():
     """The defect this guards: one --category value stamped across a whole storefront put 3,536
-    of 3,557 prod rows at depth 2 (`beauty/makeup`), which recall cannot reach because it
-    resolves a hard prefix like `beauty/makeup/lip/`. Different products from the SAME call must
-    land on different leaf paths."""
+    of 3,557 prod rows at depth 2 (`beauty/makeup`), which recall cannot reach because it resolves
+    a hard prefix like `beauty/makeup/lip/`. Different products from the SAME call must land on
+    different leaf paths."""
     lipstick = shopify_product_to_record(
-        _product(title="Retro Matte Lipstick", handle="retro-matte", product_type=None),
+        _product(title="Retro Matte Lipstick", handle="retro-matte", product_type="Lipstick"),
         domain="maccosmetics.com", category_path="beauty/makeup")
     mascara = shopify_product_to_record(
-        _product(title="Extended Play Gigablack Lash Mascara", handle="gigablack",
-                 product_type=None),
+        _product(title="Gigablack Lash", handle="gigablack", product_type="Mascara"),
         domain="maccosmetics.com", category_path="beauty/makeup")
 
     assert lipstick["pdp"]["category_path"] == "beauty/makeup/lip/lipstick"
     assert mascara["pdp"]["category_path"] == "beauty/makeup/eye/mascara"
-    # The control that makes this test able to fail: the two rows came from ONE category_path
-    # argument, so an implementation that passed the flag through would make them equal.
+    # The control that lets this test fail: both rows came from ONE category_path argument, so an
+    # implementation passing the flag through would make them equal.
     assert lipstick["pdp"]["category_path"] != mascara["pdp"]["category_path"]
-    # And both are deeper than the flag, which is the property recall actually needs.
     for rec in (lipstick, mascara):
         assert len(rec["pdp"]["category_path"].split("/")) > len("beauty/makeup".split("/"))
 
-
 def test_unclassifiable_product_keeps_the_flag_but_says_so():
     """The fallback must stay honest: it is the operator's per-domain guess, not a classification,
-    and it must not borrow the confidence of one."""
+    and must not borrow the confidence of one."""
     rec = shopify_product_to_record(
-        _product(title="Mystery Widget 3000", handle="mystery", product_type=None,
-                 tags=[]),
+        _product(title="Mystery Widget 3000", handle="mystery", product_type=None, tags=[]),
         domain="x.com", category_path="beauty/makeup")
     pdp = rec["pdp"]
     assert pdp["category_path"] == "beauty/makeup"
     assert pdp["category_confidence"] == cbf.CATEGORY_CONFIDENCE_FEED_DEFAULT
-    # Not a classified confidence, and not the historic blanket 0.7.
-    assert pdp["category_confidence"] < 0.7
+    assert pdp["category_confidence"] < 0.7   # not the historic blanket value either
 
-
-def test_flag_is_not_fed_into_the_classifier():
-    """Passing the flag in as `category` would let a depth-2 value match a pattern and
-    short-circuit before the title is tried — re-deriving the bug from inside the fix. A flag
-    that names a category must not override a title that names a more specific one."""
-    rec = shopify_product_to_record(
-        _product(title="Retro Matte Lipstick", handle="rml", product_type=None),
-        domain="x.com", category_path="beauty/makeup/eye/mascara")
-    assert rec["pdp"]["category_path"] == "beauty/makeup/lip/lipstick"
-
+def test_a_title_is_never_classified():
+    """Titles are marketing prose. `Powder Kiss Lipstick` and `Powder Kiss Liquid Lipcolour` are
+    real MAC LIP products that a title regex resolves to `beauty/makeup/face/powder`, because
+    "Powder" precedes "Lipstick" in CATEGORY_PATTERNS and "Lipcolour" matches nothing. An earlier
+    cut accepted a title when it matched exactly ONE path, which only narrowed the failure to the
+    single-wrong-match case — still wrong, and still permanent, because no correction lane
+    revisits a row that already carries a path."""
+    for title in ("Powder Kiss Lipstick", "Powder Kiss Liquid Lipcolour",
+                  "Powder Kiss Velvet Blur Slim Stick", "Strobe Cream"):
+        path, conf = cbf._resolve_category(
+            product_type=None, title=title, flag_path="beauty/makeup")
+        assert path == "beauty/makeup", title
+        assert conf == cbf.CATEGORY_CONFIDENCE_FEED_DEFAULT, title
+    # ...and the merchant's own product_type resolves the same product correctly
+    path, conf = cbf._resolve_category(
+        product_type="Lipstick", title="Powder Kiss Lipstick", flag_path="beauty/makeup")
+    assert path == "beauty/makeup/lip/lipstick"
+    assert conf == cbf.CATEGORY_CONFIDENCE_MERCHANT_TYPE
 
 def test_maps_shopify_product_to_validated_record():
     rec = shopify_product_to_record(_product(), domain="cosrx.com", category_path="beauty/skincare/cleanser")
@@ -2027,31 +2030,31 @@ async def test_a_politeness_gate_that_REFUSES_yields_no_blurb(monkeypatch):
 def test_pdp_payload_whitelist_carries_category_provenance():
     from services.catalog_enrichment_agent.ingestion import _build_pdp_payload
     rec = shopify_product_to_record(
-        _product(title="Retro Matte Lipstick", handle="rml", product_type=None),
+        _product(title="Retro Matte Lipstick", handle="rml", product_type="Lipstick"),
         domain="maccosmetics.com", category_path="beauty/makeup")
     payload = _build_pdp_payload(rec)
     assert payload["category_path"] == "beauty/makeup/lip/lipstick"
-    assert payload["category_confidence"] == cbf.CATEGORY_CONFIDENCE_TITLE_ONLY
-
+    assert payload["category_confidence"] == cbf.CATEGORY_CONFIDENCE_MERCHANT_TYPE
 
 def test_row_insert_prefers_lane_provenance_over_the_blanket_default():
-    """Before this change every Path-C row claimed enrichment_agent_v1 / 0.7 regardless of where
-    the category came from. The lane's own determination must win, and the default must still
-    apply for lanes that do not classify."""
+    """Drives _build_pdp_INSERT, not just _build_pdp_payload. The previous version named the
+    insert but only exercised the payload, so reverting the insert to the blanket 0.7 passed."""
     from services.catalog_enrichment_agent import ingestion as ing
-
-    classified = ing._build_pdp_payload(shopify_product_to_record(
-        _product(title="Retro Matte Lipstick", handle="rml", product_type=None),
-        domain="x.com", category_path="beauty/makeup"))
-    assert classified["category_confidence"] == cbf.CATEGORY_CONFIDENCE_TITLE_ONLY
-
-    # A lane that supplies nothing gets None here, so the ingest default applies downstream.
-    bare = ing._build_pdp_payload({
-        "pdp": {"brand": "B", "product_name": "P", "category_path": "beauty/makeup"},
-        "offers": [],
-    })
-    assert bare["category_confidence"] is None
-
+    rec = shopify_product_to_record(
+        _product(title="Retro Matte Lipstick", handle="rml", product_type="Lipstick"),
+        domain="x.com", category_path="beauty/makeup")
+    payload = ing._build_pdp_payload(rec)
+    row = ing._build_pdp_insert(
+        pdp_payload=payload,
+        offers=rec["offers"],
+        source_jsonl=None,
+        seller={"merchant_id": "m", "platform": "shopify"},
+    )
+    assert row["category_path"] == "beauty/makeup/lip/lipstick"
+    assert row["category_confidence"] == cbf.CATEGORY_CONFIDENCE_MERCHANT_TYPE
+    assert row["category_confidence"] != ing.DEFAULT_CATEGORY_CONFIDENCE
+    # the lane identifier is NOT overwritten - see test below
+    assert row["category_label_source"] == ing.DEFAULT_CATEGORY_LABEL_SOURCE
 
 def test_category_label_source_is_not_overwritten_by_the_lane():
     """It reads as provenance but doubles as a LANE IDENTIFIER: pdp_scope_classifier and
@@ -2066,57 +2069,50 @@ def test_category_label_source_is_not_overwritten_by_the_lane():
     assert "category_label_source" not in ing._build_pdp_payload(rec)
 
 
-def test_an_ambiguous_title_is_not_evidence():
-    """CATEGORY_PATTERNS is first-match-wins and ordered, so a title naming two categories
-    resolves to whichever appears earlier. 'Powder Kiss Lipstick' matched Powder before Lipstick
-    and landed MAC's flagship lipstick in beauty/makeup/face/powder — reachable by a 'setting
-    powder' search. Wrong-but-deep is worse than wrong-but-shallow, because every correction lane
-    selects `category_path IS NULL` and would never revisit it."""
-    path, conf = cbf._resolve_category(
-        product_type=None, title="Powder Kiss Lipstick", flag_path="beauty/makeup")
-    assert path == "beauty/makeup"
-    assert conf == cbf.CATEGORY_CONFIDENCE_FEED_DEFAULT
-    # a merchant-declared type resolves it, and outranks the title
-    path, conf = cbf._resolve_category(
-        product_type="Lipstick", title="Powder Kiss Lipstick", flag_path="beauty/makeup")
-    assert path == "beauty/makeup/lip/lipstick"
-    assert conf == cbf.CATEGORY_CONFIDENCE_MERCHANT_TYPE
-
+def test_an_ambiguous_product_type_is_not_evidence():
+    """CATEGORY_PATTERNS is first-match-wins and ORDERED, so a product_type naming two categories
+    is decided by pattern order, not by the merchant. `Blush & Highlighter` resolves to
+    highlighter and `Bronzer & Blush` to blush — neither is the merchant's statement."""
+    for ptype in ("Blush & Highlighter", "Bronzer & Blush", "Lip & Cheek"):
+        path, conf = cbf._resolve_category(
+            product_type=ptype, title="x", flag_path="beauty/makeup")
+        assert path == "beauty/makeup", ptype
+        assert conf == cbf.CATEGORY_CONFIDENCE_FEED_DEFAULT, ptype
+    # a single-category product_type is accepted
+    assert cbf._pattern_matches("Lipstick") == 1
 
 def test_a_resolved_path_may_not_leave_the_flags_area():
-    """The operator said this storefront is beauty/makeup. A regex dragging a row into
-    beauty/skincare is disagreeing with a human about the whole shop. 'Strobe Cream' is a MAC
-    highlighter, not a moisturiser."""
-    for title in ("Strobe Cream", "Studio Radiance Serum-Powered Foundation"):
-        path, conf = cbf._resolve_category(
-            product_type=None, title=title, flag_path="beauty/makeup")
-        assert path == "beauty/makeup", title
-        assert conf == cbf.CATEGORY_CONFIDENCE_FEED_DEFAULT
+    """The operator described the whole storefront. A classification leaving the area they named
+    disagrees with a human about the shop."""
+    path, conf = cbf._resolve_category(
+        product_type="Moisturizer", title="Strobe Cream", flag_path="beauty/makeup")
+    assert path == "beauty/makeup"
+    assert conf == cbf.CATEGORY_CONFIDENCE_FEED_DEFAULT
     # ...but a flag one level up permits the same resolution
     path, _ = cbf._resolve_category(
-        product_type=None, title="Strobe Cream", flag_path="beauty")
+        product_type="Moisturizer", title="Strobe Cream", flag_path="beauty")
     assert path == "beauty/skincare/moisturize/cream"
 
-
-def test_the_area_veto_compares_two_segments_not_the_whole_flag():
-    """Comparing the FULL flag as a prefix was wrong in both directions."""
-    # too strict: a non-taxonomy flag must still be canonicalisable within its own area
+def test_the_veto_compares_a_recognised_flag_in_full_and_an_approximation_by_area():
+    """Comparing every flag in full is wrong in one direction and every flag by area is wrong in
+    the other."""
+    # recognised taxonomy node -> compared in FULL, so it protects its own sub-area
+    path, _ = cbf._resolve_category(
+        product_type="Powder", title="x", flag_path="beauty/makeup/lip")
+    assert path == "beauty/makeup/lip"
+    # unrecognised approximation -> only vertical + area bind, so canonicalisation is allowed
     path, conf = cbf._resolve_category(
-        product_type="Cleanser", title="Snail Mucin Gel Cleanser",
-        flag_path="beauty/skincare/cleanser")
+        product_type="Cleanser", title="x", flag_path="beauty/skincare/cleanser")
     assert path == "beauty/skincare/cleanse/cleanser"
     assert conf == cbf.CATEGORY_CONFIDENCE_MERCHANT_TYPE
-    # too strict: a LEAF flag must not veto every per-product disagreement, which is the whole
-    # point of classifying per product
+    # one segment would be too weak: beauty/makeup -> beauty/skincare shares `beauty`
     path, _ = cbf._resolve_category(
-        product_type=None, title="Retro Matte Lipstick",
-        flag_path="beauty/makeup/eye/mascara")
-    assert path == "beauty/makeup/lip/lipstick"
-    # too weak the other way: one segment would let beauty/makeup -> beauty/skincare through
-    path, _ = cbf._resolve_category(
-        product_type=None, title="Strobe Cream", flag_path="beauty/makeup")
+        product_type="Moisturizer", title="x", flag_path="beauty/makeup")
     assert path == "beauty/makeup"
-
+    # flags are normalised: case and stray slashes must not silently veto everything
+    path, _ = cbf._resolve_category(
+        product_type="Lipstick", title="x", flag_path="BEAUTY/MAKEUP/")
+    assert path == "beauty/makeup/lip/lipstick"
 
 def test_category_confidence_coercion_rejects_junk_but_keeps_zero():
     from services.catalog_enrichment_agent.ingestion import _category_confidence_or_none

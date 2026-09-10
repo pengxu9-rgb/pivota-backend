@@ -41,61 +41,71 @@ from services.variant_identity import MERCHANT_ISSUED, variant_id_provenance
 # scope on `== 'enrichment_agent_v1'`, so relabelling these rows would forfeit Rule-1 protection
 # and the recall boost that depends on it. Confidence carries the provenance instead.
 CATEGORY_CONFIDENCE_MERCHANT_TYPE = 0.9
-CATEGORY_CONFIDENCE_TITLE_ONLY = 0.6
 CATEGORY_CONFIDENCE_FEED_DEFAULT = 0.3
 
+# Every path the classifier can emit, plus every node on the way to one. Decides whether a
+# --category flag is something the taxonomy RECOGNISES (compare it in full) or an operator's
+# free-text approximation (compare only the vertical + area it implies).
+_TAXONOMY_PATHS = frozenset(path for _label, path, _pattern in CATEGORY_PATTERNS)
+_TAXONOMY_NODES = _TAXONOMY_PATHS | frozenset(
+    "/".join(path.split("/")[:i])
+    for path in _TAXONOMY_PATHS
+    for i in range(1, len(path.split("/")))
+)
 
-def _title_matches(title: Optional[str]) -> int:
-    """How many DISTINCT taxonomy paths a title matches.
 
-    CATEGORY_PATTERNS is first-match-wins and ordered, so a title naming two categories silently
-    resolves to whichever appears earlier. "Powder Kiss Lipstick" matches Powder before Lipstick
-    and lands in beauty/makeup/face/powder — MAC's flagship lipstick, reachable by a "setting
-    powder" search. A title that names more than one category is not evidence; it is a coin flip.
+def _pattern_matches(text: Optional[str]) -> int:
+    """How many DISTINCT taxonomy paths a string matches.
+
+    CATEGORY_PATTERNS is first-match-wins and ORDERED, so a string naming two categories resolves
+    to whichever pattern appears earlier. `Blush & Highlighter` resolves to highlighter and
+    `Bronzer & Blush` to blush — decided by pattern order, not by the merchant. A string naming
+    more than one category is not evidence; it is a coin flip.
     """
-    text = str(title or "")
-    if not text:
+    value = str(text or "")
+    if not value:
         return 0
-    return len({path for _label, path, pattern in CATEGORY_PATTERNS if pattern.search(text)})
+    return len({path for _label, path, pattern in CATEGORY_PATTERNS if pattern.search(value)})
 
 
 def _resolve_category(
     *, product_type: Optional[str], title: Optional[str], flag_path: str
 ):
-    """(path, confidence) for one product. Three guards, cheapest first.
+    """(path, confidence) for one product, from the MERCHANT'S OWN product_type only.
 
-    Returns the flag unchanged whenever the product's own fields do not clearly say otherwise —
-    wrong-but-shallow is recoverable by a later lane, wrong-but-deep is not, because every
-    correction lane selects `category_path IS NULL` and would never revisit the row.
+    `title` is accepted and deliberately IGNORED, so the signature documents the decision at every
+    call site. A title is marketing prose, and matching regexes against it misfiles products
+    permanently: `Powder Kiss Lipstick` and `Powder Kiss Liquid Lipcolour` are real MAC LIP
+    products that resolve to `beauty/makeup/face/powder`, because "Powder" precedes "Lipstick" in
+    CATEGORY_PATTERNS and "Lipcolour" matches nothing at all. An earlier cut accepted a title when
+    it matched exactly one path, which only narrowed the failure to the single-wrong-match case.
+
+    Permanent is the operative word: every correction lane selects `category_path IS NULL`, so a
+    row already carrying a path is never revisited by them. A row left on the operator's flag is
+    at least an INTERIOR node, which the widened backfill (`--include-shallow`) does revisit; a
+    row misfiled onto a deep leaf is revisited by nothing.
     """
-    # 1. A merchant-declared product_type is authoritative and unambiguous by construction.
+    # A product_type naming two categories is decided by pattern order, not by the merchant.
+    if _pattern_matches(product_type) != 1:
+        return flag_path, CATEGORY_CONFIDENCE_FEED_DEFAULT
     hit = classify(product_type)
-    confidence = CATEGORY_CONFIDENCE_MERCHANT_TYPE
-    if hit is None:
-        # 2. Fall back to the title, but only when it names exactly ONE category.
-        if _title_matches(title) != 1:
-            return flag_path, CATEGORY_CONFIDENCE_FEED_DEFAULT
-        hit = classify(title)
-        confidence = CATEGORY_CONFIDENCE_TITLE_ONLY
     if hit is None:
         return flag_path, CATEGORY_CONFIDENCE_FEED_DEFAULT
     resolved = hit[1]
-    # 3. AREA veto, compared on the first two segments (vertical + area) rather than the whole
-    # flag. The operator said this storefront is `beauty/makeup`; a regex dragging a row into
-    # `beauty/skincare/...` disagrees with a human about the whole shop, so decline and keep the
-    # flag ("Strobe Cream" -> beauty/skincare/moisturize/cream is a MAC highlighter).
-    #
-    # Comparing the FULL flag as a prefix was too crude in both directions: it rejected
-    # `beauty/skincare/cleanser` -> `beauty/skincare/cleanse/cleanser`, which is a canonicalisation
-    # of a non-taxonomy flag and exactly what we want, and it let a LEAF flag veto every
-    # per-product disagreement, which defeats the point of classifying per product. Comparing one
-    # segment is too weak the other way: `beauty/makeup` -> `beauty/skincare/...` shares `beauty`.
-    flag_parts = [p for p in str(flag_path or "").strip().strip("/").split("/") if p]
+
+    # AREA veto. The operator described the whole storefront; a classification leaving the area
+    # they named disagrees with a human about the shop, so keep the flag.
+    flag_norm = str(flag_path or "").strip().strip("/").lower()
+    flag_parts = [p for p in flag_norm.split("/") if p]
     if flag_parts:
-        n = min(2, len(flag_parts))
-        if resolved.split("/")[:n] != flag_parts[:n]:
+        # A flag the taxonomy RECOGNISES is compared in full, so `beauty/makeup/lip` protects its
+        # own sub-area. An unrecognised flag like `beauty/skincare/cleanser` is an approximation,
+        # and comparing it in full would block the very canonicalisation we want
+        # (`-> beauty/skincare/cleanse/cleanser`), so only its vertical + area bind.
+        n = len(flag_parts) if flag_norm in _TAXONOMY_NODES else min(2, len(flag_parts))
+        if [p.lower() for p in resolved.split("/")[:n]] != flag_parts[:n]:
             return flag_path, CATEGORY_CONFIDENCE_FEED_DEFAULT
-    return resolved, confidence
+    return resolved, CATEGORY_CONFIDENCE_MERCHANT_TYPE
 
 logger = logging.getLogger("curated_brand_feed")
 
