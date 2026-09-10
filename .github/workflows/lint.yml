@@ -70,8 +70,19 @@ jobs:
       # fine, so seven uncompilable files once merged past the linter added to stop them. The
       # rule is selected now, and this is the belt-and-braces that cannot be turned off from
       # ruff.toml at all.
+      # Run WITHOUT the repo's pytest config and conftests. Both test files are stdlib-only by
+      # design, so this job needs no application dependencies -- but the repo ini declares a
+      # `filterwarnings` entry naming `pydantic.warnings`, and pytest resolves that at startup,
+      # so plain `pytest` exits 4 with ModuleNotFoundError before collecting anything.
+      # `tests/conftest.py` imports application modules for the same reason. Installing the full
+      # requirements here would make the gate job as slow and as fragile as the sweep it left.
       - name: Every Python file must still compile, and the baseline may only shrink
-        run: python -m pytest tests/test_every_python_file_compiles.py tests/test_lint_baseline_only_shrinks.py -q --no-header
+        run: |
+          printf '[pytest]\n' > /tmp/gate-pytest.ini
+          python -m pytest \
+            tests/test_every_python_file_compiles.py \
+            tests/test_lint_baseline_only_shrinks.py \
+            -q --no-header -c /tmp/gate-pytest.ini --noconftest -p no:cacheprovider
 
       # THE NEGATIVE CONTROL. Everything above can be green because the gate works, or because
       # the gate is off. Only this distinguishes them, and it is the experiment nobody ran

@@ -34,9 +34,12 @@ on:
       - '.github/workflows/gate-enforcement-audit.yml'
       - 'ruff.toml'
 
+# `administration: read` IS NOT A VALID GITHUB_TOKEN SCOPE, and naming it made GitHub reject
+# this whole workflow: the first version ran ZERO jobs and reported failure with no annotation.
+# Branch protection therefore cannot be read with the default token at all — it needs a PAT with
+# Administration: read, supplied as GATE_AUDIT_TOKEN.
 permissions:
   contents: read
-  administration: read
 
 jobs:
   audit:
@@ -47,15 +50,24 @@ jobs:
 
       - name: The lint gate must be a required status check
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GATE_AUDIT_TOKEN }}
         run: |
           set -uo pipefail
           branch=main
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::error::GATE_AUDIT_TOKEN is not set, so this audit cannot read branch"
+            echo "::error::protection and cannot tell whether the lint gate is enforced."
+            echo "::error::That is an UNKNOWN state, and reporting green over an unknown state"
+            echo "::error::is the exact defect this workflow exists to catch, so it fails."
+            echo "::error::Fix: add a fine-grained PAT with Administration: read as the repo"
+            echo "::error::secret GATE_AUDIT_TOKEN — or delete this workflow deliberately."
+            exit 1
+          fi
           if ! gh api "repos/${GITHUB_REPOSITORY}/branches/${branch}/protection" > protection.json 2> api_err.txt; then
             echo "::error::Cannot READ branch protection for ${branch}, so this audit cannot tell"
             echo "::error::whether the lint gate is enforced. That is an unknown state, not a pass."
-            echo "::error::Grant the workflow `administration: read` (or a PAT), or delete this"
-            echo "::error::workflow deliberately. Do not leave it skipping."
+            echo "::error::The token lacks Administration: read on this repo. Fix the PAT, or delete"
+            echo "::error::this workflow deliberately. Do not leave it skipping."
             sed 's/^/  /' api_err.txt
             exit 1
           fi
