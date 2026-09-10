@@ -4,14 +4,17 @@ from sqlalchemy import (
     REAL,
     BigInteger,
     Boolean,
+    CheckConstraint,
     Column,
     DateTime,
+    ForeignKey,
     Index,
     Integer,
     Numeric,
     String,
     Table,
     Text,
+    text,
 )
 from sqlalchemy.sql import expression, func
 
@@ -763,4 +766,53 @@ agent_pdp_view = Table(
         "brand",
         postgresql_where=Column("brand").isnot(None),
     ),
+)
+
+# --- category_taxonomy: ONE vocabulary, read by BOTH services ----------------------------------
+#
+# WHY A TABLE AND NOT A CONSTANT. `category_path` is written and read by two repositories over one
+# database — pivota-backend's CATEGORY_PATTERNS and PIVOTA-Agent's src/services/beautyTaxonomy.js.
+# Each held its own vocabulary, neither imported the other, and on 2026-09-10 they disagreed about
+# where a toner lives: the gateway wrote 315 rows to `beauty/skincare/tone/toner` on purpose while
+# this repo's taxonomy named `beauty/skincare/treat/toner` and could not reach any of them. This
+# repo's own invariant then counted those rows as corruption. Two vocabularies over one column
+# means every disagreement presents as data corruption to whichever side is reading.
+#
+# The rows are the shared place. Both services load and cache this table; nobody has to vendor a
+# copy of the other's file, and `serving_eligible_off_taxonomy_path` can join against it directly
+# instead of against one repo's opinion.
+#
+# SHAPE. Three kinds of row, distinguished without a type column:
+#   canonical leaf   alias_of IS NULL, is_leaf = true    a path recall builds a prefix for
+#   interior node    alias_of IS NULL, is_leaf = false    an ancestor; reachable only via #2122
+#   alias            alias_of IS NOT NULL                 a spelling that means another path
+#
+# The self-FK is what stops an alias pointing at nothing, which is exactly how the 117 orphan paths
+# came to exist. `alias_of` on a row whose target is itself an alias is refused by the CHECK below:
+# one hop only, so resolution cannot loop or need a recursive query on a hot path.
+#
+# ⚠️ IN THE MODEL, not only in db/migrations/221 — `web` deploys with SKIP_HEAVY_STARTUP_INIT and
+# never runs the migration directory, so `metadata.create_all` is what actually builds this on
+# production. See the note on checkout_preflight_observations.created_at above.
+category_taxonomy = Table(
+    "category_taxonomy",
+    metadata,
+    Column("path", String(255), primary_key=True),
+    Column("label", String(128), nullable=False),
+    Column("is_leaf", Boolean, nullable=False, server_default=text("false")),
+    # Self-referential: the canonical path this spelling resolves to. NULL means "this IS canonical".
+    Column("alias_of", String(255), ForeignKey("category_taxonomy.path"), nullable=True),
+    # Free text, because the reason a path was chosen is the part that gets lost. The toner row
+    # carries the Google/Shopify citation; without it the next person re-litigates it.
+    Column("note", Text, nullable=True),
+    Column("updated_at", DateTime(timezone=True), server_default=func.now(), nullable=False),
+    CheckConstraint(
+        "alias_of IS NULL OR is_leaf = false",
+        name="ck_category_taxonomy_alias_is_not_a_leaf",
+    ),
+    CheckConstraint(
+        "alias_of IS NULL OR alias_of <> path",
+        name="ck_category_taxonomy_alias_not_self",
+    ),
+    extend_existing=True,
 )

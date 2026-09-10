@@ -965,7 +965,83 @@ async def _run_no_path_share(db: Any) -> Dict[str, Any]:
     return await _run_taxonomy_share(db, _NO_PATH_SQL, "no_path")
 
 
+async def _run_taxonomy_code_vs_table_drift(db: Any) -> Dict[str, Any]:
+    """Does this repo's in-code vocabulary still match the shared `category_taxonomy` table?
+
+    THE TABLE EXISTS BECAUSE TWO REPOS KEPT TWO VOCABULARIES over one column and each read the
+    other's rows as corruption. Moving the vocabulary into data does not by itself stop that: both
+    services deploy independently of a row change, so code and table WILL drift. The difference is
+    that drift is now observable, and this is what observes it.
+
+    Counts paths in exactly one of the two, in either direction:
+      * in code, absent from the table  — this service will classify rows onto a path the other
+        service does not recognise. Exactly how the 315 toners happened.
+      * in the table, absent from code  — most likely the OTHER service added a category and this
+        one cannot classify into it, so the rows arrive and are never matched here.
+
+    Threshold 0: there is no acceptable number. If the table is unreachable the check reports the
+    error rather than 0 — an unreadable shared vocabulary is not agreement.
+    """
+    from services.category_path_aliases import ALIASES, ANCESTOR_NODES, TAXONOMY_LEAVES
+    from services.category_taxonomy_store import TaxonomyUnavailable, load
+
+    try:
+        table = await load(db, refresh=True)
+    except TaxonomyUnavailable as exc:
+        return {
+            "count": 1,
+            "sample_keys": [],
+            "detail": {"error": str(exc), "table_readable": False},
+        }
+    code_canonical = set(TAXONOMY_LEAVES) | set(ANCESTOR_NODES)
+    table_canonical = set(table["leaves"]) | set(table["interior"])
+    only_code = sorted(code_canonical - table_canonical)
+    only_table = sorted(table_canonical - code_canonical)
+    # An alias disagreement is as bad as a missing path: the same spelling resolving two ways is
+    # how one service repairs what the other just wrote.
+    alias_conflicts = sorted(
+        "%s: code=%s table=%s" % (src, tgt, table["aliases"].get(src))
+        for src, tgt in ALIASES.items()
+        if table["aliases"].get(src) not in (None, tgt)
+    )
+    violations = only_code + only_table + alias_conflicts
+    return {
+        "count": len(violations),
+        "sample_keys": violations[:_SAMPLE_LIMIT],
+        "detail": {
+            "in_code_not_in_table": only_code[:20],
+            "in_table_not_in_code": only_table[:20],
+            "alias_conflicts": alias_conflicts[:20],
+            "code_paths": len(code_canonical),
+            "table_paths": len(table_canonical),
+            "table_readable": True,
+        },
+    }
+
+
 _CHECKS: List[Dict[str, Any]] = [
+    {
+        # THE DETECTOR THAT MAKES THE SHARED TABLE SAFE. Moving the vocabulary into
+        # `category_taxonomy` gives both services one place to read; it does not stop them
+        # deploying independently of a row change. Code and table will drift. The 2026-09-10
+        # incident was drift that nobody could see — this repo classifying onto `treat/toner`
+        # while the gateway wrote `tone/toner`, each reading the other's rows as corruption.
+        #
+        # Threshold 0, in both directions. A path this repo knows and the table does not means we
+        # are about to write something the other service cannot read; a path the table knows and
+        # this repo does not means the other service already is.
+        "name": "taxonomy_code_vs_table_drift",
+        "description": (
+            "paths present in this repo's CATEGORY_PATTERNS/alias map but not in the shared "
+            "category_taxonomy table, or the reverse, or an alias resolving two different ways — "
+            "two vocabularies over one column is how a deliberate write becomes 'corruption'"
+        ),
+        "env": "CATALOG_INVARIANT_TAXONOMY_DRIFT_THRESHOLD",
+        "default_threshold": 0,
+        "count_sql": None,
+        "sample_sql": None,
+        "runner": _run_taxonomy_code_vs_table_drift,
+    },
     {
         # P1a (#1648). `suppressed_at` is THE gate column — every SQL lane, IPS
         # (`index_pipeline_state_service`: `row_suppressed = suppressed_at is
