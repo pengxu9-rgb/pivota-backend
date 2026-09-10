@@ -632,3 +632,73 @@ def test_an_aborted_run_exits_non_zero(monkeypatch, capsys):
     monkeypatch.setattr(sweep.database, "disconnect", noop)
     assert sweep.main() == 1
     assert "aborted_on_block" in capsys.readouterr().out
+
+
+def test_every_report_is_one_fenced_line(monkeypatch, capsys):
+    """MUTANT: pretty-print the report; put the fences on their own lines; use indent=4.
+
+    BEHAVIOURAL, because the first version of this test grepped the module source for `indent=2`
+    and for `print(` lines lacking the sentinel — and review showed that ratchet passes the exact
+    production defect one digit different (`indent=4`), passes fences on separate lines, passes a
+    `sys.stdout.write`, and FAILS a benign reformat that wraps a correct `print(` onto two source
+    lines. It tested the spelling, not the output.
+
+    `tests/test_backfill_variant_identity_skus.py` already learned this and names the same mutant:
+    "REPORT_BEGIN + newline + json + newline + REPORT_END has no `indent=`, has both sentinels,
+    and passed 31/31 while reproducing the failure exactly."
+
+    So: run `main()` and count the lines it actually printed.
+    """
+    import re
+    import sys as _sys
+
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_ALLOW_EGRESS", "true")
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
+    monkeypatch.setattr(_sys, "argv", ["measure_checkout_preflight.py"])
+    monkeypatch.setattr(sweep, "_egress_ip", lambda: _async("34.82.199.35"))
+
+    async def fake_run(**kw):
+        return {"aborted_on_block": False, "gated": 7, "answered": 7, "would_block": 2,
+                "would_block_rate": 0.2857, "no_contact": 0, "by_reason": {"ok": 5},
+                "next_cursor": "eps_z"}
+
+    async def noop():
+        return None
+
+    monkeypatch.setattr(sweep, "run", fake_run)
+    monkeypatch.setattr(sweep.database, "connect", noop)
+    monkeypatch.setattr(sweep.database, "disconnect", noop)
+    assert sweep.main() == 0
+
+    out = capsys.readouterr().out
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    assert len(lines) == 2, f"report spans {len(lines)} lines, not 2: {out!r}"
+
+    pattern = re.escape(sweep.REPORT_BEGIN) + r"(\{.*\})" + re.escape(sweep.REPORT_END)
+    phases = []
+    for ln in lines:
+        m = re.fullmatch(pattern, ln)
+        assert m, f"the sentinels do not delimit this line: {ln!r}"
+        phases.append(json.loads(m.group(1))["phase"])
+    assert phases == ["start", "final"], phases
+
+    final = json.loads(re.fullmatch(pattern, lines[1]).group(1))
+    assert final["would_block_rate"] == 0.2857, "the payload must survive intact"
+    assert final["egress_ip"] == "34.82.199.35"
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_is_fenced_too(monkeypatch, capsys):
+    """The guards are the most likely output to be read in a hurry, and an operator who sees
+    nothing must be able to tell "refused" from "the line was dropped"."""
+    import sys as _sys
+
+    monkeypatch.delenv("CHECKOUT_PREFLIGHT_ALLOW_EGRESS", raising=False)
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
+    monkeypatch.setattr(_sys, "argv", ["measure_checkout_preflight.py"])
+    assert sweep.main() == 2
+    out = capsys.readouterr().out
+    assert sweep.REPORT_BEGIN in out and sweep.REPORT_END in out
+    body = out.split(sweep.REPORT_BEGIN)[1].split(sweep.REPORT_END)[0]
+    assert "\n" not in body, "a fenced report must be one line"
+    assert json.loads(body)["error"] == "egress_fence_closed"
