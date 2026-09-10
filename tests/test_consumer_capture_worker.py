@@ -44,3 +44,16 @@ async def test_zero_row_checkpoint_is_rejected(monkeypatch,plan):
     monkeypatch.setattr(worker.database,'fetch_one',fetch)
     with pytest.raises(worker.CaptureCheckpointRejected):
         await worker.save_checkpoint(run_id='r',merchant_id='m',worker_id='w',plan_sha256=plan['sha256'],previous=None,state={})
+
+
+@pytest.mark.parametrize('version,required',[('consumer_capture_v1',False),('consumer_capture_v2',True)])
+async def test_worker_preserves_new_and_queued_legacy_execution(monkeypatch,version,required):
+    plan=build_plan(product_keys=['sku'],queries=['q'],providers=['chatgpt'],version=version)
+    calls=[]
+    async def save(**kwargs):pass
+    async def probe(**kwargs):calls.append(kwargs);return {'raw_runs':[]}
+    monkeypatch.setattr(worker,'save_checkpoint',save)
+    monkeypatch.setattr(worker.agent_center_llm_client,'probe',probe)
+    await worker.capture_for_leased_run(run_id='r',merchant_id='m',worker_id='w',plan=plan)
+    assert (calls[0]['context'].get('consumer_execution_profile')=='openai_web_required_v2') is required
+    assert calls[0]['model']==('chat-latest' if required else None)

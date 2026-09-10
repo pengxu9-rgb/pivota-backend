@@ -12,7 +12,7 @@ from services.credit_consumption_service import estimate_probe_credits
 PROVIDERS = frozenset({'gemini', 'chatgpt', 'claude'})
 
 
-def build_plan(*, product_keys, queries, providers):
+def build_plan(*, product_keys, queries, providers, version='consumer_capture_v2'):
     def strings(values, limit):
         if not isinstance(values, list) or not values or len(values) > limit:
             raise ValueError('Invalid consumer capture scope')
@@ -26,15 +26,18 @@ def build_plan(*, product_keys, queries, providers):
     for product in products:
         for provider in engines:
             for query in questions:
-                identity = json.dumps([product, provider, query], ensure_ascii=False, separators=(',', ':'))
+                profile = 'openai_web_required_v2' if version == 'consumer_capture_v2' and provider == 'chatgpt' else None
+                identity_parts = [product, provider, query] + ([profile] if profile else [])
+                identity = json.dumps(identity_parts, ensure_ascii=False, separators=(',', ':'))
                 jobs.append({'id': hashlib.sha256(identity.encode()).hexdigest(),
-                             'product_key': product, 'provider': provider, 'query': query})
+                             'product_key': product, 'provider': provider, 'query': query,
+                             **({'execution_profile':profile} if profile else {})})
     digest = hashlib.sha256(json.dumps(jobs, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
-    return {'version': 'consumer_capture_v1', 'sha256': digest, 'jobs': jobs}
+    return {'version': version, 'sha256': digest, 'jobs': jobs}
 
 
 def validate_plan(plan):
-    if not isinstance(plan, dict) or plan.get('version') != 'consumer_capture_v1':
+    if not isinstance(plan, dict) or plan.get('version') not in {'consumer_capture_v1','consumer_capture_v2'}:
         raise ValueError('Unsupported consumer capture plan')
     jobs = plan.get('jobs')
     if not isinstance(jobs, list) or not jobs or len(jobs) > 1200:
@@ -43,7 +46,10 @@ def validate_plan(plan):
     for job in jobs:
         if not isinstance(job, dict) or any(not isinstance(job.get(k), str) or not job[k].strip() or len(job[k]) > 1000 for k in ('product_key', 'provider', 'query')):
             raise ValueError('Invalid consumer capture job')
-        identity = json.dumps([job['product_key'], job['provider'], job['query']], ensure_ascii=False, separators=(',', ':'))
+        profile = 'openai_web_required_v2' if plan['version']=='consumer_capture_v2' and job['provider']=='chatgpt' else None
+        if job.get('execution_profile') != profile:
+            raise ValueError('Consumer execution profile changed')
+        identity = json.dumps([job['product_key'], job['provider'], job['query']] + ([profile] if profile else []), ensure_ascii=False, separators=(',', ':'))
         expected = hashlib.sha256(identity.encode()).hexdigest()
         if job.get('id') != expected or expected in seen or job['provider'] not in PROVIDERS:
             raise ValueError('Invalid or duplicate consumer capture job')
@@ -58,7 +64,9 @@ def quote_plan(plan):
     counts = Counter(job['provider'] for job in plan['jobs'])
     credits, usd = estimate_probe_credits([(provider, count, True) for provider, count in sorted(counts.items())])
     return {'plan_sha256': plan['sha256'], 'probe_count': len(plan['jobs']),
-            'credits': credits, 'estimated_usd_cogs': usd}
+            'credits': credits, 'estimated_usd_cogs': usd,
+            'execution_profiles': sorted({job.get('execution_profile','consumer_query_v1') for job in plan['jobs']}),
+            'pricing_basis': 'fixed_probe_credits_not_token_settlement'}
 
 
 async def execute_plan(plan, *, retained, checkpoint, probe):

@@ -22,7 +22,7 @@ from services.audit_facts import (
 from services.brand_alias import text_mentions_brand
 from services.consumer_answer_evidence import answer_mention, PREDICATE as CONSUMER_PREDICATE
 
-VERSION = "3"
+VERSION = "4"
 MENTION_PREDICATE = "explicit_answer_brand_mentioned_v1"
 TIERS = ("branded", "unbranded", "dupe")
 DIAGNOSTIC_SCAN_MODES = {
@@ -133,20 +133,25 @@ def selection_measurement(observations):
     excluded_diagnostics = len(rows) - len(consumer_rows) if consumer_rows else 0
     if consumer_rows:
         rows = consumer_rows
+    conditions = Counter((r.get('provider','unknown'), r.get('prompt_contract','unknown')) for r in consumer_rows)
+    mixed = {provider for provider, _ in conditions if sum(p == provider for p, _ in conditions) > 1}
     tiers = {}
     for tier in TIERS:
         group = [r for r in rows if r.get("tier") == tier]
         bucket = {"attempted": len(group), "provider_failed": sum(r.get("status") == "provider_failed" for r in group)}
         for field in ("brand_mentioned", "source_visible"):
-            eligible = [r[field] for r in group if r.get("status") == "answered" and type(r.get(field)) is bool]
+            eligible = [r[field] for r in group if r.get("status") == "answered" and type(r.get(field)) is bool
+                        and not (field == 'brand_mentioned' and r.get('provider') in mixed)]
             bucket[field] = {**_estimate(sum(eligible), len(eligible)),
                              "unknown": len(group) - bucket["provider_failed"] - len(eligible)}
         tiers[tier] = bucket
     return {
         "version": VERSION, "mention_predicate": CONSUMER_PREDICATE if consumer_rows else MENTION_PREDICATE,
         "excluded_diagnostics": excluded_diagnostics,
+        "execution_conditions": [{"provider":provider,"contract":contract,"observations":count} for (provider,contract),count in sorted(conditions.items())],
+        "mixed_execution_providers": sorted(mixed),
         "answers": [{"observation_id": r["observation_id"], "query": r.get("query"),
-                     "provider": r.get("provider"), "brand_mentioned": r.get("brand_mentioned"),
+                     "provider": r.get("provider"), "prompt_contract": r.get("prompt_contract"), "brand_mentioned": r.get("brand_mentioned"),
                      "unknown_reason": r.get("answer_unknown_reason"),
                      "evidence": r.get("answer_evidence"), "cited_sources": r.get("cited_sources") or []}
                     for r in consumer_rows],

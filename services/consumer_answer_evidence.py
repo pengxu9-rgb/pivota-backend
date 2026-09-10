@@ -5,13 +5,16 @@ import re
 from urllib.parse import urlparse
 from services.brand_alias import text_mentions_brand
 
+REQUIRED_CONTRACT = "consumer_query_openai_web_required_v2"
+REQUIRED_EXECUTION = {"model":"chat-latest","tool":"web_search_preview","tool_choice":"required","max_output_tokens":900}
+
 SYSTEM = "Answer the shopping question using live web search when useful. Give a helpful answer in ordinary prose with sources. Do not produce audit scores or diagnostic JSON."
 
 PREDICATE = "cited_consumer_answer_brand_literal_v2"
 
 
 def answer_mention(run, merchant_brand):
-    if run.get("evidence_kind") != "consumer_answer" or run.get("prompt_contract") != "consumer_query_v1":
+    if run.get("evidence_kind") != "consumer_answer" or run.get("prompt_contract") not in {"consumer_query_v1", REQUIRED_CONTRACT}:
         return None, "consumer_contract_missing"
     answer = run.get("answer")
     if not isinstance(answer, dict):
@@ -27,7 +30,12 @@ def answer_mention(run, merchant_brand):
         return None, "answer_missing"
     if hashlib.sha256(text.encode()).hexdigest() != answer.get("sha256"):
         return None, "answer_hash_mismatch"
-    expected_prompt = hashlib.sha256(json.dumps([SYSTEM, run.get("query")], ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+    prompt_parts = [SYSTEM, run.get("query")]
+    if run.get("prompt_contract") == REQUIRED_CONTRACT:
+        if provider != 'chatgpt' or answer.get('execution') != REQUIRED_EXECUTION or type(answer.get('web_search_requests')) is not int or answer['web_search_requests'] < 1:
+            return None, 'answer_execution_mismatch'
+        prompt_parts.append(REQUIRED_EXECUTION)
+    expected_prompt = hashlib.sha256(json.dumps(prompt_parts, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
     if not isinstance(answer.get("model"), str) or not answer["model"].strip() or answer.get("prompt_sha256") != expected_prompt:
         return None, "answer_provenance_missing"
     # Revalidate retained evidence too; never trust old complete=True alone.

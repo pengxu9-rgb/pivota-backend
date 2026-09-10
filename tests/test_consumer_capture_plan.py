@@ -71,3 +71,14 @@ def test_unverified_provider_rejected_before_launch_quote(monkeypatch):
     with pytest.raises(ValueError, match='not available'):
         plan_for_launch(product_keys=['sku'],queries=['best serum'],providers=['claude'])
     assert plan_for_launch(product_keys=['sku'],queries=['best serum'],providers=['gemini'])
+
+
+def test_required_profile_is_frozen_in_quote_and_dedupe_identity():
+    from services.consumer_capture_plan import validate_plan
+    args=dict(product_keys=['sku'],queries=['best serum'],providers=['chatgpt'])
+    old=build_plan(**args,version='consumer_capture_v1');new=build_plan(**args)
+    validate_plan(old);validate_plan(new)
+    assert old['sha256'] != new['sha256']
+    assert quote_plan(new)['execution_profiles']==['openai_web_required_v2']
+    new['jobs'][0]['execution_profile']='auto'
+    with pytest.raises(ValueError,match='profile changed'):validate_plan(new)

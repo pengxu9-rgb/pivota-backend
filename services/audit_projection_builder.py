@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 # surfaces. Cached `report_projections` rows built at 1.0.0 still hold the
 # NO_FINDINGS all-clear and the bare headline_score, so they must be
 # re-rendered rather than served — the version is what lets a reader tell.
-_BUILDER_VERSION = "1.3.1"
+_BUILDER_VERSION = "1.4.0"
 
 
 # Audience constants (mirror db.audit_evidence values; kept as

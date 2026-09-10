@@ -104,3 +104,27 @@ def test_completed_preamble_without_citations_is_unmeasured():
 def test_invalid_citation_does_not_qualify_answer(uri):
     item=run();item['grounding_sources']=[{'uri':uri}]
     assert answer_mention(item,'Anua')[0] is None
+
+
+def required_run():
+    from services.consumer_answer_evidence import REQUIRED_CONTRACT, REQUIRED_EXECUTION
+    item=run();item['prompt_contract']=REQUIRED_CONTRACT
+    item['answer'].update(execution=REQUIRED_EXECUTION.copy(),web_search_requests=1)
+    item['answer']['prompt_sha256']=hashlib.sha256(json.dumps([SYSTEM,item['query'],REQUIRED_EXECUTION],separators=(',',':')).encode()).hexdigest()
+    return item
+
+
+def test_required_execution_is_independently_revalidated():
+    item=required_run()
+    assert answer_mention(item,'Anua')==(True,None)
+    item['answer']['execution']['tool_choice']='auto'
+    assert answer_mention(item,'Anua')==(None,'answer_execution_mismatch')
+
+
+def test_mixed_auto_and_required_are_not_combined_for_same_provider():
+    from services.selection_measurement import selection_measurement
+    a=run();b=required_run();b['_probe_run_id']='second'
+    rows=response_observations([a,b],sku_key='sku',merchant_host='anua.com',merchant_brand='Anua')
+    result=selection_measurement(rows)
+    assert result['mixed_execution_providers']==['chatgpt']
+    assert result['tiers']['unbranded']['brand_mentioned']['n']==0

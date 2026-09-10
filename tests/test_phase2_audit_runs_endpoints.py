@@ -1136,3 +1136,19 @@ def test_unadmitted_consumer_provider_cannot_quote_or_debit(client, stub, monkey
         response=client.post(path,json=body)
         assert response.status_code == 422, response.text
     assert not stub.debits and not stub.enqueued
+
+
+def test_required_search_quote_matches_frozen_launch(client, stub, monkeypatch):
+    stub.preview_sku_keys=['pk-1']
+    monkeypatch.setenv('PIVOTA_CONSUMER_ANSWER_ENABLED','true')
+    monkeypatch.setenv('PIVOTA_CONSUMER_ANSWER_PROVIDERS','gemini,chatgpt')
+    base={'merchant_id':'merch-A','providers':['chatgpt'],'consumer_answer_queries':['best serum']}
+    quoted=client.post('/api/audits/preview',json={**base,'scope':{'sku_keys':['pk-1']}})
+    assert quoted.status_code==200,quoted.text
+    assert quoted.json()['consumer_capture']['execution_profiles']==['openai_web_required_v2']
+    launched=client.post('/api/audits',json={**base,'product_keys':['pk-1']})
+    assert launched.status_code==202,launched.text
+    frozen=stub.enqueued[-1]['request_options_jsonb']['launch']['consumer_capture_plan']
+    assert frozen['sha256']==quoted.json()['consumer_capture']['plan_sha256']
+    assert frozen['jobs'][0]['execution_profile']=='openai_web_required_v2'
+    assert stub.debits[-1]['amount']==quoted.json()['estimated_audit_credits']

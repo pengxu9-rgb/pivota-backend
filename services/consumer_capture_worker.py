@@ -54,7 +54,9 @@ async def capture_for_leased_run(*, run_id, merchant_id, worker_id, plan, retain
         return await agent_center_llm_client.probe(
             scan_mode='consumer_answer_test', scan_target_id=f"{run_id}:consumer:{job['id']}",
             merchant_id=merchant_id, store_id=f'{merchant_id}_audit',
-            context={'queries':[job['query']]}, provider=job['provider'], max_runs=1,
+            context={'queries':[job['query']], **({'consumer_execution_profile':job['execution_profile']} if job.get('execution_profile') else {})},
+            model='chat-latest' if job.get('execution_profile') == 'openai_web_required_v2' else None,
+            provider=job['provider'], max_runs=1,
             allow_local_mock=False,
         )
     return await execute_plan(plan, retained=retained, checkpoint=checkpoint, probe=probe)
@@ -72,6 +74,8 @@ def observations_for_capture(plan, state, *, merchant_brand, merchant_host):
         raw = dict(raw_runs[0]) if isinstance(raw_runs, list) and len(raw_runs)==1 and isinstance(raw_runs[0], dict) else {'raw':'__error__:consumer_capture_unavailable'}
         if raw.get('query') not in (None, job['query']):
             raw = {'raw':'__error__:consumer_capture_query_mismatch'}
+        if job.get('execution_profile') == 'openai_web_required_v2' and raw.get('prompt_contract') != 'consumer_query_openai_web_required_v2':
+            raw = {'raw':'__error__:consumer_capture_execution_mismatch'}
         raw.update(query=job['query'], _provider=job['provider'], _probe_run_id=job['id'],
                    axis_metadata={'axis':'category'})
         if raw.get('evidence_kind') != 'consumer_answer':
