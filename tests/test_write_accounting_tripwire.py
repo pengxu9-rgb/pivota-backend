@@ -5,9 +5,15 @@ its return value is reading a number that does not exist.
 (or the last inserted id, never a count). Raw asyncpg's own `execute` DOES return a status string
 like "UPDATE 3", which is why this only flags the shared `database` instance. A hit is a place where a declined
 write is indistinguishable from a landed one, and where a report can say "deleted 12" because
-someone assigned `deleted_2pct` and believed it. Statements with RETURNING are excluded: `databases`
-implements execute() as fetchval, so those resolve to the returned value and are the correct
-pattern, not a defect.
+someone assigned `deleted_2pct` and believed it.
+
+RETURNING is excluded ONLY when the value is used as a value. `databases` implements execute() as
+fetchval — the FIRST COLUMN of the FIRST ROW — so `INSERT ... RETURNING id` genuinely resolves to
+the id and is the fix this tripwire recommends. But `DELETE ... RETURNING 1` accumulated into a
+total resolves to the literal 1 forever, which is the SAME defect wearing the recommended fix's
+clothes. The first version of this file excluded RETURNING wholesale and so certified
+routes/products_cache_maintenance.py — which reported at most 2 duplicates removed however many it
+deleted — as correct. Review caught it; both sites are fixed (fetch_all + len) in the same commit.
 
 That class shipped twice in one day on 2026-09-09: the relationship-graph backfill reported
 `declined_by_guard: 0` unconditionally because the call site discarded the landed flag, and the
@@ -16,17 +22,21 @@ review before that had to point out `matched` was counting intentions rather tha
 THE FIX at a call site is `RETURNING <col>` + `fetch_val`/`fetch_one`, then test the result.
 
 This is a RATCHET, not a clean-up mandate. 47 sites existed when it was written; the watermark
-stops the 48th. Lower it whenever you convert one — the test tells you when it is stale, because a
-watermark that drifts above reality silently stops protecting anything.
+stops the 48th. It is asserted EXACTLY, in both directions: raising the number is as much a change
+as adding a call site, and an earlier version that allowed a band of 5 would have let the watermark
+itself drift from 47 to 52 with every test still green.
 """
 
 from __future__ import annotations
 
 import ast
+import functools
 import pathlib
 import re
+import warnings
 
-# MEASURED, not estimated: 47 on 2026-09-09 after excluding RETURNING sites (see _RETURNING_SQL).
+# MEASURED, not estimated: 47 on 2026-09-09, after excluding RETURNING sites whose value is not
+# consumed as a number (see _used_arithmetically).
 # Two of the 47 live in tests/test_wallet_admin_missing_row_postgres.py, which consumes the value
 # deliberately to PIN this behaviour — left in the count rather than special-cased, because an
 # exclusion list that grows is how a ratchet stops meaning anything.
@@ -36,8 +46,8 @@ WATERMARK = 47
 _SKIP_PARTS = {".claude", "node_modules", ".venv", "__pycache__", ".git", "build", "dist"}
 _WRITE_SQL = re.compile(r"\b(UPDATE|DELETE|INSERT)\b", re.IGNORECASE)
 # `databases` implements execute() as fetchval on the asyncpg backend, so a statement with
-# RETURNING genuinely DOES resolve to the returned value. Those call sites are correct — they are
-# the FIX this tripwire recommends — and flagging them would make the ratchet mostly noise.
+# RETURNING DOES resolve to the returned value — but to ONE value, not a count. See
+# _used_arithmetically for why that is an exclusion and not a blanket pass.
 _RETURNING_SQL = re.compile(r"\bRETURNING\b", re.IGNORECASE)
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -83,7 +93,7 @@ def _enclosing_scope_map(tree):
     def walk(node, scope):
         for child in ast.iter_child_nodes(node):
             inner = child if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) else scope
-            scope_of[child] = inner if inner is not scope else scope
+            scope_of[child] = inner
             walk(child, inner)
 
     scope_of[tree] = tree
@@ -91,48 +101,101 @@ def _enclosing_scope_map(tree):
     return scope_of
 
 
+def _used_arithmetically(name, scope, after_line):
+    """Is `name` read as a NUMBER — added, subtracted, summed?
+
+    This is what separates a correct `RETURNING id` from the defect. `databases.execute()` is
+    `fetchval`: the FIRST COLUMN of the FIRST ROW. Asking for an id back and using it as an id is
+    right. Asking for `RETURNING 1` and ADDING it to a running total is the same defect as reading a
+    rowcount that does not exist — the answer is the literal 1, so the accumulator reports the number
+    of STATEMENTS, not the number of rows. routes/products_cache_maintenance.py did exactly that and
+    the first version of this file pinned it as correct.
+    """
+    for node in ast.walk(scope):
+        reads = None
+        if isinstance(node, ast.AugAssign) and isinstance(node.op, (ast.Add, ast.Sub)):
+            reads = node.value
+        elif isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub)):
+            reads = node
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "sum"
+        ):
+            reads = node
+        if reads is None or getattr(node, "lineno", 0) <= after_line:
+            continue
+        for ref in ast.walk(reads):
+            if isinstance(ref, ast.Name) and ref.id == name and isinstance(ref.ctx, ast.Load):
+                return True
+    return False
+
+
+def _violations_in_source(source, path):
+    """The whole rule, over one module's text. Separated so tests can probe it with fixtures
+    instead of depending on whichever real call sites happen to exist today."""
+    found = []
+    try:
+        with warnings.catch_warnings():
+            # Some repo files carry invalid escape sequences; parsing them is not this test's
+            # business to report, and the warning noise hides real output.
+            warnings.simplefilter("ignore", DeprecationWarning)
+            warnings.simplefilter("ignore", SyntaxWarning)
+            tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return found
+    scope_of = _enclosing_scope_map(tree)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        value = node.value
+        if not (isinstance(value, ast.Await) and isinstance(value.value, ast.Call)):
+            continue
+        call = value.value
+        if not _is_shared_database_execute(call):
+            continue
+        sql = _sql_text(call)
+        if not _WRITE_SQL.search(sql):
+            continue
+        targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
+        if not targets:
+            continue
+        name = targets[0]
+        scope = scope_of.get(node, tree)
+        if _RETURNING_SQL.search(sql) and not _used_arithmetically(name, scope, node.lineno):
+            # RETURNING resolves through execute(), and the value is used as a value, not a count.
+            continue
+        # Only a CONSUMED value is a defect. An assignment nobody reads is merely misleading,
+        # and flagging it would bury the real ones.
+        consumed = any(
+            isinstance(ref, ast.Name)
+            and ref.id == name
+            and isinstance(ref.ctx, ast.Load)
+            and ref.lineno > node.lineno
+            for ref in ast.walk(scope)
+        )
+        if consumed:
+            found.append((str(path), node.lineno, name))
+    return found
+
+
+@functools.lru_cache(maxsize=1)
 def _violations():
-    """(path, lineno, variable) for each CONSUMED return value of a shared-database write."""
+    """(path, lineno, variable) for each CONSUMED return value of a shared-database write.
+
+    Cached: four tests call this and each call walks every .py in the repo (~5s).
+    """
     found = []
     for path in sorted(_REPO_ROOT.rglob("*.py")):
         if any(part in _SKIP_PARTS for part in path.parts):
             continue
-        try:
-            tree = ast.parse(path.read_text(encoding="utf-8", errors="ignore"))
-        except (SyntaxError, ValueError):
-            continue
-        scope_of = _enclosing_scope_map(tree)
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Assign):
-                continue
-            value = node.value
-            if not (isinstance(value, ast.Await) and isinstance(value.value, ast.Call)):
-                continue
-            call = value.value
-            if not _is_shared_database_execute(call):
-                continue
-            sql = _sql_text(call)
-            if not _WRITE_SQL.search(sql):
-                continue
-            if _RETURNING_SQL.search(sql):
-                continue  # RETURNING resolves through execute(); this is the correct pattern
-            targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
-            if not targets:
-                continue
-            name = targets[0]
-            scope = scope_of.get(node, tree)
-            # Only a CONSUMED value is a defect. An assignment nobody reads is merely misleading,
-            # and flagging it would bury the real ones.
-            consumed = any(
-                isinstance(ref, ast.Name)
-                and ref.id == name
-                and isinstance(ref.ctx, ast.Load)
-                and ref.lineno > node.lineno
-                for ref in ast.walk(scope)
+        found.extend(
+            _violations_in_source(
+                path.read_text(encoding="utf-8", errors="ignore"),
+                path.relative_to(_REPO_ROOT),
             )
-            if consumed:
-                found.append((str(path.relative_to(_REPO_ROOT)), node.lineno, name))
-    return sorted(set(found))
+        )
+    return tuple(sorted(set(found)))
 
 
 def test_no_new_reads_of_a_nonexistent_write_rowcount():
@@ -151,14 +214,24 @@ def test_no_new_reads_of_a_nonexistent_write_rowcount():
     )
 
 
-def test_the_watermark_is_not_stale():
-    """A ratchet that drifts above reality silently stops protecting anything: once the watermark
-    exceeds the real count, several new violations can land before it trips."""
+def test_the_watermark_is_exact():
+    """EXACT, not a band. The first version allowed WATERMARK - 5, which meant the number itself
+    could be raised from 47 to 52 and every test still passed — five new violations could then land
+    silently. A ratchet whose own setting is unpinned is not a ratchet. When this fails because the
+    count legitimately moved, change the number and say why in the commit."""
     violations = _violations()
-    assert len(violations) >= WATERMARK - 5, (
-        "Only %d violations remain but WATERMARK is %d — lower it to %d so the ratchet keeps "
-        "biting. (Slack of 5 so ordinary refactors do not fail the build.)"
-        % (len(violations), WATERMARK, len(violations))
+    assert len(violations) == WATERMARK, (
+        "%d sites consume the return of a shared-database write; WATERMARK says %d.\n"
+        "If you FIXED some, lower it to %d. If you added some, that is the defect: `databases` over "
+        "asyncpg returns NO rowcount for UPDATE/DELETE/INSERT, so a declined write looks exactly "
+        "like a landed one. Use `RETURNING <col>` + fetch_val/fetch_one and test the result.\n"
+        "Current sites (last 8):\n  %s"
+        % (
+            len(violations),
+            WATERMARK,
+            len(violations),
+            "\n  ".join("%s:%d (%s)" % v for v in violations[-8:]),
+        )
     )
 
 
@@ -172,17 +245,57 @@ def test_the_scanner_actually_detects_the_pattern():
     assert any(f.startswith("routes/") for f in files), files
 
 
-def test_returning_statements_are_not_flagged():
-    """`databases` implements execute() as fetchval, so a statement with RETURNING genuinely does
-    resolve to the returned value — that is the FIX this tripwire recommends, and flagging it would
-    make the ratchet mostly noise. Three real call sites depend on this, plus the postgres test
-    that deliberately pins the behaviour."""
-    violations = {(v[0], v[1]) for v in _violations()}
+_FIXTURE_CORRECT = """
+async def log_it(self):
+    row_id = await self.database.execute("INSERT INTO t (a) VALUES (1) RETURNING id", {})
+    return row_id
+"""
+
+_FIXTURE_ARITHMETIC = """
+async def compact(self):
+    deleted = await self.database.execute("DELETE FROM t WHERE x RETURNING 1", {})
+    removed = 0
+    removed += int(deleted or 0)
+    return removed
+"""
+
+_FIXTURE_NO_RETURNING = """
+async def touch(self):
+    n = await self.database.execute("UPDATE t SET a = 1", {})
+    return n
+"""
+
+
+def test_a_returning_value_used_as_a_value_is_not_flagged():
+    """`databases` implements execute() as fetchval, so `RETURNING id` genuinely does resolve to the
+    id — that is the FIX this tripwire recommends, and flagging it would make the ratchet noise."""
+    assert _violations_in_source(_FIXTURE_CORRECT, "f.py") == []
+
+
+def test_a_returning_value_ADDED_TO_A_TOTAL_is_flagged():
+    """The control, and a real defect this file used to certify as correct.
+
+    fetchval returns the first column of the first row, so `RETURNING 1` is the literal 1 forever.
+    Accumulating it counts STATEMENTS, not rows. routes/products_cache_maintenance.py reported at
+    most 2 duplicates removed however many it deleted; the previous version of this test asserted
+    those two lines "must not be flagged". Both are fixed (fetch_all + len) in the same commit."""
+    hits = _violations_in_source(_FIXTURE_ARITHMETIC, "f.py")
+    assert [h[2] for h in hits] == ["deleted"], hits
+
+
+def test_a_write_with_no_returning_at_all_is_flagged():
+    """The other control: without it, a scanner that flagged nothing would pass both tests above."""
+    assert [h[2] for h in _violations_in_source(_FIXTURE_NO_RETURNING, "f.py")] == ["n"]
+
+
+def test_the_real_returning_call_sites_stay_unflagged():
+    """The two surviving in-repo RETURNING consumers, both `INSERT ... RETURNING id` used as an id.
+    (The two `RETURNING 1` sites in products_cache_maintenance.py no longer call execute() at all.)"""
+    violations = {(str(v[0]), v[1]) for v in _violations()}
     for path, line in (
-        ("routes/products_cache_maintenance.py", 44),
-        ("routes/products_cache_maintenance.py", 63),
         ("services/agent_integration_bridge.py", 86),
+        ("services/payment_routing_service.py", 1377),
     ):
-        assert not any(p == path and abs(l - line) <= 3 for p, l in violations), (
-            "%s:%d uses RETURNING and must not be flagged" % (path, line)
+        assert not any(p == path and abs(l - line) <= 4 for p, l in violations), (
+            "%s:%d returns an id and uses it as an id; it must not be flagged" % (path, line)
         )

@@ -41,7 +41,7 @@ async def compact_products_cache(merchant_id: str):
         )
 
         # Delete duplicates by JSON id first
-        delete_by_id = await database.execute(
+        deleted_by_id_rows = await database.fetch_all(
             """
             WITH ranked AS (
               SELECT ctid, ROW_NUMBER() OVER (
@@ -60,7 +60,7 @@ async def compact_products_cache(merchant_id: str):
         )
 
         # Delete duplicates by JSON sku when id is absent
-        delete_by_sku = await database.execute(
+        deleted_by_sku_rows = await database.fetch_all(
             """
             WITH ranked AS (
               SELECT ctid, ROW_NUMBER() OVER (
@@ -78,14 +78,11 @@ async def compact_products_cache(merchant_id: str):
             {"m": merchant_id},
         )
 
-        # Count removed: database.execute returns last status; we can't easily count here without RETURNING rows.
-        # Provide a generic note; user can re-check counts via /products/v2
-        removed = 0
-        try:
-            removed += int(delete_by_id or 0)
-            removed += int(delete_by_sku or 0)
-        except Exception:
-            pass
+        # `RETURNING 1` through database.execute() resolves to fetchval — the FIRST COLUMN of the
+        # FIRST ROW, i.e. the literal 1 — so the old `removed += int(delete_by_id or 0)` reported at
+        # most 2 no matter how many duplicates were deleted, and 0 was indistinguishable from "the
+        # statement deleted one row". fetch_all returns every RETURNING row, so len() is the count.
+        removed = len(deleted_by_id_rows or []) + len(deleted_by_sku_rows or [])
 
         return CompactResult(
             merchant_id=merchant_id,
