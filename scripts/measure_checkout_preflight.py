@@ -127,8 +127,17 @@ SELECT_SEEDS_SQL = """
            e.external_product_id,
            e.attached_variant_id,
            e.seed_data,
-           COALESCE(NULLIF(e.canonical_url, ''), e.destination_url) AS url
+           COALESCE(NULLIF(e.canonical_url, ''), e.destination_url) AS url,
+           -- THE MERCHANT COMES FROM THE PRODUCT, not from the product KEY. An external-seed key
+           -- is `prod::external_seed::external_seed::<handle>`, so its second segment is a
+           -- literal, and parsing it recorded the constant "external_seed" on 734 of the first
+           -- 769 observations. `catalog_products.merchant_id` carries the real one — 410 distinct
+           -- across the external-seed corpus, and the segment only coincides with it on 1,365 of
+           -- 13,896 rows. LEFT so a seed with no attached product is still swept.
+           p.merchant_id AS catalog_merchant_id,
+           p.pivota_signature_id AS signature_id
     FROM external_product_seeds e
+    LEFT JOIN catalog_products p ON p.product_key = e.attached_product_key
     WHERE e.status = 'active'
       AND jsonb_typeof(e.seed_data) = 'object'
       AND COALESCE(NULLIF(e.canonical_url, ''), e.destination_url) ~ '/products/'
@@ -156,17 +165,25 @@ def _seed_data_of(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _merchant_id_of(product_key: Any) -> Optional[str]:
-    """The merchant id embedded in a `prod::{merchant}::{platform}::{handle}` key, or None.
+def _merchant_id_of(row: Dict[str, Any], product_key: Any) -> Optional[str]:
+    """The merchant this offer belongs to: the PRODUCT's column first, the key only as a fallback.
 
-    NOT a copy of the route's parser, and the earlier docstring claiming it was is the reason to
-    say so: the route has its own tolerances. This is deliberately strict — four `::` segments
-    with a `prod` head — because a wrong value in this column is worse than a null one. Live rows
-    fill it with a merchant id, so anything else here makes the two sources unjoinable per
-    merchant, which is most of what the source split is for.
+    The first version parsed the key alone and was wrong for the cohort this lane actually sweeps.
+    An external-seed key is `prod::external_seed::external_seed::<handle>`, so its second segment
+    is a literal — and the first 769 observations recorded `merchant_id = "external_seed"` on 734
+    of them, which I then reported as "the corpus carries no merchant identity". It does:
+    `catalog_products.merchant_id` holds 410 distinct merchants across the external-seed corpus,
+    and the key segment coincides with it on only 1,365 of 13,896 rows.
+
+    That was worth more than the aggregate it hid. Re-joined after the fact, the same 769 rows
+    span 83 merchants and the refusals are heavily CONCENTRATED — one merchant refused 69 of 98,
+    another 25 of 27, while several refused none of 27-40. A blended 21% describes no merchant.
     """
+    from_catalog = str(row.get("catalog_merchant_id") or "").strip()
+    if from_catalog:
+        return from_catalog[:64]
     parts = str(product_key or "").split("::")
-    if len(parts) < 4 or parts[0] != "prod" or not parts[1]:
+    if len(parts) < 4 or parts[0] != "prod" or not parts[1] or parts[1] == "external_seed":
         return None
     return parts[1][:64]
 
@@ -193,7 +210,7 @@ def _offer_for(
         # The ROUTE's vocabulary — the pivota merchant id embedded in the product key — not the
         # hostname. Writing a hostname into a column the live rows fill with a merchant id makes
         # the two sources unjoinable per merchant, which is most of what the split is for.
-        "merchant_id": _merchant_id_of(product_key or row.get("attached_product_key")),
+        "merchant_id": _merchant_id_of(row, product_key or row.get("attached_product_key")),
         "currency": None,
         "merchant_effective_price": None,
         "execution_spec": {"pdp_url": row.get("url"), "variant_id": variant_id},

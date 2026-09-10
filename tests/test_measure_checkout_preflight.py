@@ -320,6 +320,34 @@ def test_the_observation_columns_live_in_the_model_not_only_the_migration():
 # and the thing being claimed is that a real table gains real columns.
 
 
+def test_the_merchant_comes_from_the_product_not_the_key():
+    """MUTANT: parse the merchant out of the product key.
+
+    THE DEFECT THE FIRST PRODUCTION RUN SHIPPED. An external-seed key is
+    `prod::external_seed::external_seed::<handle>`, so its second segment is a literal — 734 of the
+    first 769 observations recorded `merchant_id = "external_seed"`, and I reported that as "the
+    corpus carries no merchant identity". It does: `catalog_products.merchant_id` holds 410
+    distinct merchants across that corpus, and the key segment matches it on 1,365 of 13,896 rows.
+
+    Re-joined afterwards the same 769 rows span 83 merchants and the refusals are concentrated —
+    one merchant refused 69 of 98, another 25 of 27, several refused none of 27-40. The blended
+    rate described no merchant at all, which is why this column has to be right.
+    """
+    row = _row(attached_product_key="prod::external_seed::external_seed::brand-x")
+    row["catalog_merchant_id"] = "merch_obs_754ebc89aff23454"
+    offer = sweep._offer_for(row, VID, {"snapshot": {}},
+                             product_key=row["attached_product_key"])
+    assert offer["merchant_id"] == "merch_obs_754ebc89aff23454"
+
+    # The literal is never recorded, even with no catalog row to fall back to.
+    bare = _row(attached_product_key="prod::external_seed::external_seed::brand-x")
+    assert sweep._merchant_id_of(bare, bare["attached_product_key"]) is None
+
+    # A real merchant-scoped key still works when the product row is missing.
+    shop = _row(attached_product_key="prod::m_brand::shopify::serum")
+    assert sweep._merchant_id_of(shop, shop["attached_product_key"]) == "m_brand"
+
+
 def test_the_offer_names_the_merchant_the_way_the_route_does():
     """MUTANT: write the URL hostname into `merchant_id`.
 
@@ -328,11 +356,11 @@ def test_the_offer_names_the_merchant_the_way_the_route_does():
     source split is for — and it is the kind of divergence nobody notices until a per-merchant
     read silently returns nothing.
     """
-    offer = sweep._offer_for(
-        _row(attached_product_key="prod::m_brand::shopify::serum"), VID, {"snapshot": {}})
+    row = _row(attached_product_key="prod::m_brand::shopify::serum")
+    offer = sweep._offer_for(row, VID, {"snapshot": {}})
     assert offer["merchant_id"] == "m_brand"
-    assert sweep._merchant_id_of(None) is None
-    assert sweep._merchant_id_of("garbage") is None
+    assert sweep._merchant_id_of({}, None) is None
+    assert sweep._merchant_id_of({}, "garbage") is None
 
 
 @pytest.mark.asyncio
@@ -514,8 +542,8 @@ def test_a_malformed_product_key_yields_no_merchant_rather_than_a_wrong_one():
     """A wrong value in this column is worse than a null one: live rows fill it with a merchant
     id, so anything else makes the two sources unjoinable per merchant."""
     for bad in (None, "", "garbage", "a::b", "notprod::m::shopify::x"):
-        assert sweep._merchant_id_of(bad) is None, bad
-    assert sweep._merchant_id_of("prod::m_brand::shopify::serum") == "m_brand"
+        assert sweep._merchant_id_of({}, bad) is None, bad
+    assert sweep._merchant_id_of({}, "prod::m_brand::shopify::serum") == "m_brand"
 
 
 @pytest.mark.asyncio
