@@ -1,3 +1,7 @@
 pytest>=7.4
 pytest-asyncio>=0.23
 ruff==0.16.6
+# The lint gate's own tests parse .github/workflows/lint.yml. requirements-dev.txt is what
+# lint.yml installs, and it is deliberately tiny -- app dependencies are what make the sweep
+# slow and fragile -- but 'stdlib-only' stopped being true the moment a test read a workflow.
+pyyaml>=6.0

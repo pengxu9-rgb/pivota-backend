@@ -407,3 +407,48 @@ def test_the_lint_workflow_cannot_be_skipped_or_made_advisory():
         "job which stops reporting BLOCKS the merge; a path filter makes it legitimately absent "
         "and the gate silently optional on exactly the PRs it is not watching."
     )
+
+
+def test_the_gate_tests_import_nothing_the_lint_job_does_not_install():
+    """The lint job installs requirements-dev.txt and NOTHING else, on purpose — application
+    dependencies are what make the sweep slow and fragile, and a gate job should have as few
+    reasons to fail as possible.
+
+    That makes every import in these two files a dependency of the gate itself, and it has
+    already bitten twice: first the repo pytest ini naming `pydantic.warnings` (fixed with
+    `-c` and `--noconftest`), then this file importing `yaml` to read lint.yml — which passed
+    locally, where the whole application is installed, and failed in the one job that matters.
+    "Stdlib-only" stopped being true the moment a test read a workflow.
+
+    So the invariant is checked rather than remembered."""
+    import ast
+    import sys
+
+    declared = set()
+    for line in (_ROOT / "requirements-dev.txt").read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        declared.add(re.split(r"[<>=!\[;]", line)[0].strip().lower())
+    # Distribution name -> the module it provides, where they differ.
+    provides = {"pyyaml": "yaml", "pytest-asyncio": "pytest_asyncio"}
+    importable = {provides.get(d, d.replace("-", "_")) for d in declared}
+
+    for name in ("test_lint_baseline_only_shrinks.py", "test_every_python_file_compiles.py"):
+        tree = ast.parse((_ROOT / "tests" / name).read_text())
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(a.name.split(".")[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+                imported.add(node.module.split(".")[0])
+        undeclared = sorted(
+            m for m in imported
+            if m not in sys.stdlib_module_names and m not in importable
+        )
+        assert not undeclared, (
+            "tests/%s imports %s, which requirements-dev.txt does not declare. The lint job "
+            "installs only that file, so this passes locally — where the whole application is "
+            "installed — and fails the required check. Add it there, or use the stdlib."
+            % (name, undeclared)
+        )
