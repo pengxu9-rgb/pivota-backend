@@ -384,15 +384,23 @@ def test_the_interior_list_reaches_the_sql():
     assert "category_path IS NULL" in check["count_sql"]
 
 
-def test_relgraph_freshness_check_compares_the_ledger_to_the_data():
-    """A 'did it run' signal read as 'is it working'. The check is only meaningful if it reads
-    BOTH tables; one alone is the thing that was already green."""
-    check = _check("relationship_graph_ledger_passes_over_frozen_data")
+def test_relgraph_noop_check_compares_a_pass_to_what_it_applied():
+    """A 'did it run' signal read as 'is it working'. Only meaningful if it compares the PASS to
+    the run's own applied_count.
+
+    An earlier cut compared the ledger to max(created_at) on product_relationship_edges — a VIEW
+    over relationship_candidate_labels whose created_at is the LABEL's creation time, and which the
+    renewal script never moves. That version fired on a healthy fortnight of renewals with no new
+    approvals. The behaviour is pinned for real in
+    tests/test_green_over_broken_detectors_postgres.py, which EXECUTES the query both ways."""
+    check = _check("relationship_graph_runs_pass_without_applying")
     assert check["warn_only"] is True
     sql = check["count_sql"]
     assert "relationship_graph_routine_runs" in sql
-    assert "product_relationship_edges" in sql
-    assert "status = 'passed'" in sql
+    assert "applied_count" in sql
+    assert "product_relationship_edges" not in sql, (
+        "must not depend on the view's created_at semantics"
+    )
 
 
 def test_every_check_has_a_description_and_a_threshold_env():

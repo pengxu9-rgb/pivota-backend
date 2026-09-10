@@ -38,13 +38,17 @@ logger = logging.getLogger(__name__)
 
 _SAMPLE_LIMIT = 5
 
-# --- routability, derived from the classifier's own taxonomy ------------------
+# --- interior taxonomy nodes, derived from the classifier's own taxonomy ------
 #
 # Recall binds a HARD PREFIX: a "matte lipstick" query resolves `beauty/makeup/lip/`, so a row
-# filed at `beauty/makeup` is an ANCESTOR of that prefix, not a descendant, and can never match
-# however good its content is. A row can therefore be `serving_eligible` and unreachable at the
-# same time, which is a state nothing in this repo could previously see — measured 2026-09-09,
-# 4,517 rows were in it.
+# filed at `beauty/makeup` is an ANCESTOR of that prefix and cannot satisfy it DIRECTLY. It is
+# still reachable — #2122 admits an ancestor row whose own text names the query's category — but
+# only on that weaker path, and without the depth score, so it sorts behind every depth-matched
+# competitor. Measured 2026-09-09: 4,588 serving-eligible rows are in that state.
+#
+# ⚠️ An earlier version of this banner said such a row "can never match" and was "unreachable".
+# That was WRONG: it came from reading page 1 of a 33-result query and treating absence there as
+# absence. Page 2 returns MAC's depth-2 lipsticks. Do not restate the stronger claim.
 #
 # Routability is NOT a depth. `fashion/shoes` and `electronics/ereader` are 2-segment LEAVES that
 # route perfectly well, so the test is whether some canonical path strictly EXTENDS this one.
@@ -1822,32 +1826,38 @@ _CHECKS: List[Dict[str, Any]] = [
     },
     {
         # THE LEDGER IS NOT THE DATA. relationship_graph_routine_runs recorded
-        # `sync_routine: passed` every day through 2026-09-09 while
-        # product_relationship_edges had not gained a row since 2026-06-11: the
-        # daily job selects a 24h window, finds nothing changed, and passes
-        # under --allow-empty-selection. A green run ledger over a frozen table
-        # is indistinguishable from a healthy one unless something compares
-        # them, which is what this does.
+        # `sync_routine: passed` every day through 2026-09-09 while the graph
+        # gained nothing: the daily job selects a 24h window, finds nothing
+        # changed, and passes under --allow-empty-selection. A green run ledger
+        # is indistinguishable from a working one unless something compares the
+        # run to its OUTPUT, which is what this does.
         #
         # Generalise the shape, not the instance: any "did it run" signal read
         # as "is it working" has this failure mode.
         #
-        # warn_only because the remediation is not in this repo — the builder
-        # lives in PIVOTA-Agent and its GitHub path has been failing with
-        # ECONNRESET to prod Postgres since 2026-08-26. This check is what makes
-        # that visible from the side that can see both tables.
-        "name": "relationship_graph_ledger_passes_over_frozen_data",
+        # ⚠️ KEYED ON THE LEDGER'S OWN applied_count, deliberately. A first cut
+        # compared the ledger to `max(created_at)` on product_relationship_edges
+        # — which is a VIEW over relationship_candidate_labels
+        # (PIVOTA-Agent migration 051: label_state IN ('human_approved',
+        # 'ai_approved') AND not expired). `created_at` there is the CANDIDATE
+        # LABEL's creation time, and the renewal script moves
+        # last_verified_at/expires_at and never created_at. So that version
+        # would have fired on a perfectly healthy fortnight of renewals with no
+        # new approvals: a "no new approvals" signal wearing a "frozen data"
+        # name. applied_count is what the run itself claims it changed, so
+        # comparing it to `passed` needs no assumption about the view at all.
+        "name": "relationship_graph_runs_pass_without_applying",
         "description": (
-            "sync_routine has passed within 48h but product_relationship_edges "
-            "has not gained a row in 14 days — a green ledger over stale data"
+            "sync_routine has passed within 48h but no passing run in 14 days "
+            "applied anything — a green ledger over work that did not happen"
         ),
-        "env": "CATALOG_INVARIANT_RELGRAPH_FROZEN_THRESHOLD",
+        "env": "CATALOG_INVARIANT_RELGRAPH_NOOP_THRESHOLD",
         "default_threshold": 0,
         "warn_only": True,
-        # 1 when the contradiction holds, 0 otherwise — a boolean invariant
-        # expressed as a count so it uses the same threshold machinery as the
-        # rest. A missing table raises, and the runner reports that as
-        # {"error": ...} rather than sinking the sweep.
+        # 1 when the contradiction holds, 0 otherwise — a boolean invariant as a
+        # count so it uses the same threshold machinery as every other check. A
+        # missing table raises, and the runner reports that as {"error": ...}
+        # rather than sinking the sweep.
         "count_sql": """
             SELECT CASE WHEN
                 EXISTS (
@@ -1856,14 +1866,19 @@ _CHECKS: List[Dict[str, Any]] = [
                     AND completed_at > now() - interval '48 hours'
                 )
                 AND NOT EXISTS (
-                  SELECT 1 FROM product_relationship_edges
-                  WHERE created_at > now() - interval '14 days'
+                  SELECT 1 FROM relationship_graph_routine_runs
+                  WHERE status = 'passed'
+                    AND completed_at > now() - interval '14 days'
+                    AND coalesce(applied_count, 0) > 0
                 )
             THEN 1 ELSE 0 END AS c
         """,
         "sample_sql": """
-            SELECT max(created_at)::text AS subject_key
-            FROM product_relationship_edges
+            SELECT (max(completed_at)::text || ' applied=' ||
+                    coalesce(max(applied_count), 0)::text) AS subject_key
+            FROM relationship_graph_routine_runs
+            WHERE status = 'passed'
+              AND completed_at > now() - interval '14 days'
         """,
     },
 ]

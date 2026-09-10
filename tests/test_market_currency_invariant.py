@@ -416,16 +416,16 @@ class TestReportOnlyTier:
         #       score, so they sort behind depth-matched rows. A quality signal,
         #       not a correctness violation: warn_only is permanent here, since
         #       there is no count at which this should fail a build.
-        #   relationship_graph_ledger_passes_over_frozen_data — fires TODAY
-        #       (returns 1). The remediation is not in this repo: the builder
-        #       lives in PIVOTA-Agent and its GitHub path has been failing with
+        #   relationship_graph_runs_pass_without_applying — fires TODAY. The
+        #       remediation is not in this repo: the builder lives in
+        #       PIVOTA-Agent and its GitHub path has been failing with
         #       ECONNRESET to prod Postgres since 2026-08-26. Reporting a
         #       contradiction we cannot yet fix here is the whole point.
         expected = [
             CHECK_NAME,
             "skus_without_merchant_issued_identity_share",
             "serving_eligible_on_interior_taxonomy_node",
-            "relationship_graph_ledger_passes_over_frozen_data",
+            "relationship_graph_runs_pass_without_applying",
         ]
         assert [c["name"] for c in _CHECKS if c.get("warn_only")] == expected
 

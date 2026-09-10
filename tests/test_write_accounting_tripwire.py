@@ -3,9 +3,11 @@ its return value is reading a number that does not exist.
 
 `databases` over asyncpg gives no rowcount for UPDATE/DELETE/INSERT — `execute()` resolves to None
 (or the last inserted id, never a count). Raw asyncpg's own `execute` DOES return a status string
-like "UPDATE 3", which is why this only flags the shared `database` instance. Every hit is a place
-where a declined write is indistinguishable from a landed one, and where a report says "deleted 12"
-because someone assigned `deleted_2pct` and believed it.
+like "UPDATE 3", which is why this only flags the shared `database` instance. A hit is a place where a declined
+write is indistinguishable from a landed one, and where a report can say "deleted 12" because
+someone assigned `deleted_2pct` and believed it. Statements with RETURNING are excluded: `databases`
+implements execute() as fetchval, so those resolve to the returned value and are the correct
+pattern, not a defect.
 
 That class shipped twice in one day on 2026-09-09: the relationship-graph backfill reported
 `declined_by_guard: 0` unconditionally because the call site discarded the landed flag, and the
@@ -13,8 +15,8 @@ review before that had to point out `matched` was counting intentions rather tha
 
 THE FIX at a call site is `RETURNING <col>` + `fetch_val`/`fetch_one`, then test the result.
 
-This is a RATCHET, not a clean-up mandate. 51 sites existed when it was written; the watermark
-stops the 52nd. Lower it whenever you convert one — the test tells you when it is stale, because a
+This is a RATCHET, not a clean-up mandate. 47 sites existed when it was written; the watermark
+stops the 48th. Lower it whenever you convert one — the test tells you when it is stale, because a
 watermark that drifts above reality silently stops protecting anything.
 """
 
@@ -24,11 +26,19 @@ import ast
 import pathlib
 import re
 
-# Measured 2026-09-09 across the repo. LOWER THIS when you convert a site; never raise it.
-WATERMARK = 51
+# MEASURED, not estimated: 47 on 2026-09-09 after excluding RETURNING sites (see _RETURNING_SQL).
+# Two of the 47 live in tests/test_wallet_admin_missing_row_postgres.py, which consumes the value
+# deliberately to PIN this behaviour — left in the count rather than special-cased, because an
+# exclusion list that grows is how a ratchet stops meaning anything.
+# LOWER THIS when you convert a site; never raise it.
+WATERMARK = 47
 
 _SKIP_PARTS = {".claude", "node_modules", ".venv", "__pycache__", ".git", "build", "dist"}
 _WRITE_SQL = re.compile(r"\b(UPDATE|DELETE|INSERT)\b", re.IGNORECASE)
+# `databases` implements execute() as fetchval on the asyncpg backend, so a statement with
+# RETURNING genuinely DOES resolve to the returned value. Those call sites are correct — they are
+# the FIX this tripwire recommends — and flagging them would make the ratchet mostly noise.
+_RETURNING_SQL = re.compile(r"\bRETURNING\b", re.IGNORECASE)
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
@@ -101,8 +111,11 @@ def _violations():
             call = value.value
             if not _is_shared_database_execute(call):
                 continue
-            if not _WRITE_SQL.search(_sql_text(call)):
+            sql = _sql_text(call)
+            if not _WRITE_SQL.search(sql):
                 continue
+            if _RETURNING_SQL.search(sql):
+                continue  # RETURNING resolves through execute(); this is the correct pattern
             targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
             if not targets:
                 continue
@@ -157,3 +170,19 @@ def test_the_scanner_actually_detects_the_pattern():
     files = {v[0] for v in violations}
     assert any(f.startswith("services/claim_state.py") for f in files), files
     assert any(f.startswith("routes/") for f in files), files
+
+
+def test_returning_statements_are_not_flagged():
+    """`databases` implements execute() as fetchval, so a statement with RETURNING genuinely does
+    resolve to the returned value — that is the FIX this tripwire recommends, and flagging it would
+    make the ratchet mostly noise. Three real call sites depend on this, plus the postgres test
+    that deliberately pins the behaviour."""
+    violations = {(v[0], v[1]) for v in _violations()}
+    for path, line in (
+        ("routes/products_cache_maintenance.py", 44),
+        ("routes/products_cache_maintenance.py", 63),
+        ("services/agent_integration_bridge.py", 86),
+    ):
+        assert not any(p == path and abs(l - line) <= 3 for p, l in violations), (
+            "%s:%d uses RETURNING and must not be flagged" % (path, line)
+        )
