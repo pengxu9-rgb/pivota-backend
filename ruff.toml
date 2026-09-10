@@ -54,6 +54,18 @@ select = ["F821", "F404", "F822", "F823", "F702", "F704", "F706", "E9"]
 #   `request`). Wrapped in `except Exception: pass`, so traffic taxonomy has never been stamped on
 #   this route. Fix = add `http_request: Request` to the signature; needs a route-behaviour check.
 "routes/agent_shop_gateway.py" = ["F821"]
+# routes/shopify_manual.py, routes/shopify_setup.py — `store_info` is never bound; both build a
+#   `merchant_info` dict from `store_info.get("platform"/"domain"/"api_key")`. `shopify_setup`
+#   NameErrors on EVERY call; `shopify_manual` whenever `merchant` is truthy. Not baselined out of
+#   caution — the fix is known: those three keys are exactly the unified store row returned by
+#   `services/merchant_store_service.get_primary_store` (platform / domain / api_key), which is
+#   also what `create_shopify_order` resolves credentials through
+#   (routes/order_routes.py:6282). An earlier version of this PR "fixed" it by reading
+#   `merchant_onboarding.mcp_*` instead, which is the LEGACY FALLBACK that service only uses when
+#   no `merchant_stores` row exists — so it would have reported a store-backed merchant as not
+#   ready while order creation succeeded. Correct fix, its own PR, with a test.
+"routes/shopify_manual.py" = ["F821"]
+"routes/shopify_setup.py" = ["F821"]
 # services/pdp_governance_service.py:2747 — `_subject_from_product_key` is not defined anywhere in
 #   the repository and never has been (since 0a08d8091, 2026-04-25). The sibling
 #   `_subject_from_external_seed` exists at :1059. Whether the call should be re-pointed at it or

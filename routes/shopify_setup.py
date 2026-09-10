@@ -130,12 +130,8 @@ async def test_shopify_connection(
     return {
         "merchant_id": merchant_id,
         "mcp_connected": True,
-        # `store_info` was never bound, so this admin route raised NameError on EVERY call —
-        # `merchant` is checked for existence three lines up and then never used. The output keys
-        # name the columns exactly (db/merchant_onboarding.py), so this is the field mapping the
-        # response already claims to return.
-        "mcp_platform": merchant.get("mcp_platform"),
-        "mcp_shop_domain": merchant.get("mcp_shop_domain"),
-        "has_access_token": bool(merchant.get("mcp_access_token")),
-        "ready_for_shopify": bool(merchant.get("mcp_access_token"))
+        "mcp_platform": store_info.get("platform"),
+        "mcp_shop_domain": store_info.get("domain"),
+        "has_access_token": bool(store_info.get("api_key")),
+        "ready_for_shopify": True and store_info.get("api_key")
     }

@@ -2212,7 +2212,15 @@ async def run_catalog_invariant_checks(db: Any) -> Dict[str, Any]:
             entry["error"] = str(exc)
             errored += 1
         results.append(entry)
-    # ERRORED IS ITS OWN VERDICT, and until 2026-09-10 it was no verdict at all.
+    # ERRORED IS ITS OWN COUNTER, and until 2026-09-10 it was no counter at all.
+    #
+    # ⚠️ IT IS NOT A FOURTH EXCLUSIVE STATE, and an earlier version of this comment implied it was.
+    # The tally above runs BEFORE sampling, deliberately (see the 2026-09-02 note): the COUNT is
+    # the verdict, so a sample fetch that raises must not erase a real violation from the totals.
+    # The consequence is that a check which raises while SAMPLING is counted in both `violated` and
+    # `errored` — 21 of 27 in a probe where every `fetch_all` raised. That is intended: the finding
+    # is real and the error is only in fetching examples of it. What is NOT intended is reading the
+    # summary as 27 checks partitioned four ways; `errored` overlaps the other two by design.
     #
     # A check that raises gets `error` and NO `count`, `threshold` or `violated` key. The summary
     # counted violations and warnings only, so a broken check read exactly like a passing one:

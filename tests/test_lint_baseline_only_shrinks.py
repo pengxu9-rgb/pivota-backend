@@ -1,7 +1,7 @@
 """The lint baseline is a ratchet: four files may still carry an undefined name, and no more.
 
 WHY. Adding a linter to a repository that never had one means either fixing everything at once or
-recording what is already broken. This repo recorded two files (ruff.toml `[lint.per-file-ignores]`),
+recording what is already broken. This repo recorded four files (ruff.toml `[lint.per-file-ignores]`),
 each holding a REAL undefined name whose fix needs a decision the linter PR could not make.
 
 A baseline nobody counts is an exemption list, and an exemption list grows. This asserts the shape
@@ -20,13 +20,15 @@ import tomllib
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _RUFF = _ROOT / "ruff.toml"
 
-# The files carrying a pre-existing undefined name. ONLY EVER REMOVE FROM THIS.
-# Started at four; shopify_manual.py and shopify_setup.py came off once review pointed out that
-# both were GUARANTEED 500s on registered routes — "guessing the keys would swap one silent bug
-# for another" is not a reason to keep a route that cannot answer at all, and the key names were
-# one read of db/merchant_onboarding.py away.
+# The four files carrying a pre-existing undefined name on 2026-09-10. ONLY EVER REMOVE FROM THIS.
+# The two shopify entries went off this list and came back: an earlier version of this PR "fixed"
+# them by reading `merchant_onboarding.mcp_*`, which review showed is the LEGACY FALLBACK source,
+# not the `merchant_stores` row that order creation actually uses. A wrong fix to a live route is
+# worse than a documented 500. See ruff.toml for the correct fix, which is its own PR.
 _BASELINE = {
     "routes/agent_shop_gateway.py",
+    "routes/shopify_manual.py",
+    "routes/shopify_setup.py",
     "services/pdp_governance_service.py",
 }
 

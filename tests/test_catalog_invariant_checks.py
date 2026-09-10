@@ -586,3 +586,36 @@ async def test_a_clean_sweep_reports_ZERO_errored():
     report = await run_catalog_invariant_checks(_RaisingDb([]))
     assert report["errored_count"] == 0
     assert report["errored"] == []
+
+
+class _SampleRaisesDb:
+    """Counts fine, then raises while fetching example rows — the 2026-09-02 incident's shape."""
+
+    async def fetch_one(self, sql, values=None):
+        return {"c": 10**9}
+
+    async def fetch_all(self, sql, values=None):
+        raise RuntimeError("sample fetch exploded")
+
+    async def fetch_val(self, sql, values=None):
+        return 0
+
+
+async def test_a_check_that_raises_while_SAMPLING_stays_violated_and_is_also_errored():
+    """`errored` OVERLAPS `violated`, on purpose, and the overlap needs pinning because the
+    obvious reading of the summary line is a four-way partition.
+
+    The tally runs before sampling deliberately: the COUNT is the verdict, so a sample fetch that
+    raises must not erase a real violation from the totals — that regression is what the
+    2026-09-02 note in the runner describes. So a check over threshold whose sample fetch dies is
+    BOTH violated and errored, and a reader adding the three numbers will over-count."""
+    from services.catalog_invariant_checks import run_catalog_invariant_checks
+
+    report = await run_catalog_invariant_checks(_SampleRaisesDb())
+    both = [
+        c["name"] for c in report["checks"]
+        if c.get("violated") and c.get("error")
+    ]
+    assert both, "a sample-raise should leave the violation standing AND record the error"
+    assert report["violated_count"] >= len(both)
+    assert set(both).issubset(set(report["errored"]))

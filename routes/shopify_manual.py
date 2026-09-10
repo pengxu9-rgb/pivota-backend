@@ -48,13 +48,9 @@ async def manually_create_shopify_order(
     merchant_info = {
         "merchant_id": order["merchant_id"],
         "mcp_connected": True if merchant else False,
-        # `store_info` was never bound — a guaranteed NameError whenever `merchant` was truthy,
-        # on a route with no try/except around it. The record IS the merchant row, and the output
-        # keys here name the columns exactly (db/merchant_onboarding.py: mcp_platform,
-        # mcp_shop_domain, mcp_access_token), so the mapping is the field names, not a guess.
-        "mcp_platform": merchant.get("mcp_platform") if merchant else None,
-        "mcp_shop_domain": merchant.get("mcp_shop_domain") if merchant else None,
-        "has_access_token": bool(merchant.get("mcp_access_token")) if merchant else False
+        "mcp_platform": store_info.get("platform") if merchant else None,
+        "mcp_shop_domain": store_info.get("domain") if merchant else None,
+        "has_access_token": bool(store_info.get("api_key")) if merchant else False
     }
     
     # Try to create Shopify order

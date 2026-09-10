@@ -772,14 +772,22 @@ async def mark_order_shipped(
     if not ok:
         return False
     row = await database.fetch_one(
-        "SELECT merchant_id FROM orders WHERE order_id = :order_id LIMIT 1",
+        "SELECT merchant_id, payment_status FROM orders WHERE order_id = :order_id LIMIT 1",
         {"order_id": order_id},
     )
 
     # Best-effort invitation scheduling: enqueue a job for a worker service to send the email.
     try:
         merchant_id = str((row["merchant_id"] if row else "") or "").strip()
-        if merchant_id:
+        # PAID, like the two sibling sites. This one never checked, and it did not matter while
+        # the enqueue was dead — the missing import above meant every call raised NameError into
+        # the `except` below. Making the site live without the check would have let a merchant
+        # shipping an UNPAID order queue an invitation job. Two gates downstream still refuse it
+        # (`buyer_submit_enabled()` defaults off, and `_order_is_paid` 403s at send time), so the
+        # worst case was a junk pending row — but a site that relies on a downstream refusal is
+        # not guarded, it is lucky, and its two siblings guard it here.
+        paid = str((row["payment_status"] if row else "") or "").strip().lower() == "paid"
+        if paid and merchant_id:
             # Same local import as the two sites above — db/ -> services/ is a cycle at module
             # scope. This one was missing too, so the `except Exception: pass` below swallowed a
             # NameError on every call and no invitation was ever enqueued from this path either.
