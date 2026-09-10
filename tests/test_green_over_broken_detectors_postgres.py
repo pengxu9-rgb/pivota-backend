@@ -163,7 +163,8 @@ def test_every_path_lands_in_EXACTLY_ONE_cohort(pg_engine):
         "beauty/makeup/lip",            # leaf-parent
         "beauty/makeup",                # pure ancestor
         "beauty",                       # root ancestor
-        "beauty/skincare/tone/toner",   # sibling typo
+        "beauty/skincare/tone/toner",   # a real leaf since 2026-09-10 (industry standard)
+        "beauty/skincare/treat/toner",  # the sibling typo, now that tone/ is canonical
         "Beauty/Makeup",                # mixed case
         "Beauty/Makeup/Lip/Lipstick",   # mixed-case leaf
         "/beauty/makeup/lip/lipstick",  # leading slash
@@ -195,7 +196,20 @@ def test_the_cohorts_match_what_RECALL_does_not_what_looks_tidy(pg_engine):
         "beauty/makeup": "ancestor_only",
         "beauty": "ancestor_only",
         # NO door at all
-        "beauty/skincare/tone/toner": "off_taxonomy",
+        # ⚠️ FLIPPED 2026-09-10. `tone/toner` is the CANONICAL leaf — Google Product Taxonomy
+        # 5976 and Shopify hb-3-2-9-17 both make Toners & Astringents a direct child of Skin
+        # Care, and it is what PIVOTA-Agent has written since 2026-08-04. This file previously
+        # asserted it was off-taxonomy, which is how 315 deliberate rows got called corrupt.
+        "beauty/skincare/tone/toner": "reachable",
+        # ...and `treat/toner` is STILL reachable, by the wrong door. `treat` is the parent of
+        # exfoliant/mask/serum/treatment, so the path matches `LIKE 'beauty/skincare/treat/%'` and
+        # scores +90 on a SERUM query — while a TONER query now builds `beauty/skincare/tone/` and
+        # misses it entirely. ⚠️ THIS COHORT IS INVISIBLE TO ALL FOUR INVARIANTS: "reachable by a
+        # prefix that means something else" is a fifth state none of them names, and the ~316 rows
+        # on this path are in it until PIVOTA-Agent's reconciler converges them. Recorded here
+        # rather than papered over, because a partition that looks exhaustive is not the same as
+        # one that is complete.
+        "beauty/skincare/treat/toner": "reachable",
         "beauty/makeup/lips/lip-gloss": "off_taxonomy",
         "wellness/supplements": "off_taxonomy",
         # ...and these are why lower()/btrim had to go. A case-sensitive LIKE does not match
@@ -336,9 +350,10 @@ def test_the_runner_proves_the_partition_adds_up(pg_engine):
     assert d["partition_is_exhaustive"] is True, d
     assert d["partition_total"] == d["serving_eligible_rows"] == 5
     assert d["buckets"] == {
-        "prefix_reachable": 1,
+        # lipstick leaf + tone/toner (a real leaf since 2026-09-10)
+        "prefix_reachable": 2,
         "ancestor_only": 1,
-        "off_taxonomy": 2,   # the typo AND the mixed-case row
+        "off_taxonomy": 1,   # the mixed-case row: case-sensitive LIKE gives it no door
         "no_path": 1,
     }, d["buckets"]
 
