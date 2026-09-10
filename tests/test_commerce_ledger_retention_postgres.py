@@ -222,7 +222,11 @@ async def test_the_retention_report_reads_and_does_not_write():
     await _seed()
     before = await _ids("commerce_interaction_events", "event_id")
 
-    report = await report_ledger_retention(horizon_days=7)
+    # now=NOW, like every other call in this file. Without it the horizon is measured from wall
+    # time against fixture dates pinned in 2026-09, so the assertions below were true only until
+    # real time caught up — which it did at 2026-09-10T12:00Z, turning this file red on branches
+    # that never touched the ledger.
+    report = await report_ledger_retention(horizon_days=7, now=NOW)
     assert report["events_total"] == 5
     assert report["by_merchant"]["merch_a"]["events"] == 4
     assert report["by_merchant"]["merch_b"]["events"] == 1
@@ -281,3 +285,22 @@ async def test_the_windowed_funnel_select_uses_the_recency_index():
 
     assert _RECENCY_INDEX in plan, plan
     assert "Seq Scan" not in plan, plan
+
+
+async def test_the_report_reads_the_INJECTED_clock_not_wall_time():
+    """The regression test for a time bomb, and the reason `now` exists.
+
+    The sibling `sweep_synthetic_events` has always taken `now`; this function did not, so its
+    result moved with the calendar while the fixtures stayed put. Pinning two different clocks
+    over the same rows proves the parameter is actually consulted — asserting only the NOW case
+    would pass just as well if `now` were ignored."""
+    from services.commerce_ledger_retention import report_ledger_retention
+
+    await _build()
+    await _seed()
+
+    # At NOW, the fresh event (NOW - 1 day) sits inside the 7-day horizon and is not counted.
+    assert (await report_ledger_retention(horizon_days=7, now=NOW))["events_total"] == 5
+    # A fortnight later it has aged out of it, and the same rows count 6.
+    later = NOW + timedelta(days=14)
+    assert (await report_ledger_retention(horizon_days=7, now=later))["events_total"] == 6
