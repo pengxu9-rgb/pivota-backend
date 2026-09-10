@@ -19,7 +19,16 @@ That class shipped twice in one day on 2026-09-09: the relationship-graph backfi
 `declined_by_guard: 0` unconditionally because the call site discarded the landed flag, and the
 review before that had to point out `matched` was counting intentions rather than changes.
 
-THE FIX at a call site is `RETURNING <col>` + `fetch_val`/`fetch_one`, then test the result.
+THE FIX DEPENDS ON WHAT YOU WANTED, and getting this wrong is how the products_cache bug happened:
+
+  * a LANDED FLAG ("did anything change?") -> `RETURNING <col>` + `fetch_val`/`fetch_one`, then test
+    the result for None.
+  * a ROW COUNT ("how many changed?") -> `RETURNING 1` + `fetch_all`, then `len(rows)`; or
+    `WITH d AS (DELETE ... RETURNING 1) SELECT count(*) FROM d` + `fetch_val`.
+
+`fetch_val` on a count is the SAME defect this file catches: it returns the first column of the
+first row, so it answers 1 for any non-empty result. An earlier version of this docstring
+recommended it for both cases.
 
 This is a RATCHET, not a clean-up mandate. 47 sites existed when it was written; the watermark
 stops the 48th. It is asserted EXACTLY, in both directions: raising the number is as much a change
@@ -102,7 +111,13 @@ def _enclosing_scope_map(tree):
 
 
 def _used_arithmetically(name, scope, after_line):
-    """Is `name` read as a NUMBER — added, subtracted, summed?
+    """Is `name` ACCUMULATED — added, subtracted, summed?
+
+    Deliberately narrow. It catches the accumulator shape (`total += x`, `a + x`, `sum([...])`) and
+    NOT every numeric read: `return {"deleted": x}` and `return f"deleted {x}"` are the same defect
+    and are missed, while `if x > 0` and `1 if x else 0` are legitimate landed-flag reads of
+    fetchval that must not be flagged. Widening this to "used as a number" would need a way to tell
+    those two apart, which the AST alone does not give. A ratchet over a known shape, not a proof.
 
     This is what separates a correct `RETURNING id` from the defect. `databases.execute()` is
     `fetchval`: the FIRST COLUMN of the FIRST ROW. Asking for an id back and using it as an id is
@@ -204,7 +219,9 @@ def test_no_new_reads_of_a_nonexistent_write_rowcount():
         "%d sites consume the return of database.execute() on a write, above the watermark of %d.\n"
         "`databases` over asyncpg returns NO rowcount for UPDATE/DELETE/INSERT, so this value is "
         "not a count and a declined write looks exactly like a landed one.\n"
-        "Use `RETURNING <col>` + fetch_val/fetch_one and test the result.\n"
+        "For a LANDED FLAG: `RETURNING <col>` + fetch_val/fetch_one, then test for None.\n"
+        "For a ROW COUNT: `RETURNING 1` + fetch_all, then len(rows) — fetch_val answers 1 for any\n"
+        "non-empty result, which is the same defect wearing the fix's clothes.\n"
         "New or moved sites:\n  %s"
         % (
             len(violations),

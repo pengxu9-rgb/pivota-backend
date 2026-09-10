@@ -80,8 +80,9 @@ async def compact_products_cache(merchant_id: str):
 
         # `RETURNING 1` through database.execute() resolves to fetchval — the FIRST COLUMN of the
         # FIRST ROW, i.e. the literal 1 — so the old `removed += int(delete_by_id or 0)` reported at
-        # most 2 no matter how many duplicates were deleted, and 0 was indistinguishable from "the
-        # statement deleted one row". fetch_all returns every RETURNING row, so len() is the count.
+        # most 2 no matter how many duplicates were deleted. (Zero WAS distinguishable: fetchval
+        # returns None for an empty result. What collapsed was 1 from N.) fetch_all returns every
+        # RETURNING row, so len() is the actual count.
         removed = len(deleted_by_id_rows or []) + len(deleted_by_sku_rows or [])
 
         return CompactResult(
