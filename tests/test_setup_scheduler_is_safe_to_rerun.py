@@ -40,7 +40,15 @@ SCRIPT = REPO / "infra" / "gcp" / "setup_scheduler.sh"
 
 # Everything that exists in prod today. `describe` succeeding is how the script decides
 # create-vs-update and, previously, nothing else.
+#
+# ONE ENTRY IS AHEAD OF PROD: `relgraph-health-cron` is defined by the script but not yet
+# provisioned (see the job's comment in setup_scheduler.sh — the PAUSED blast radius means new
+# triggers are created by hand, as #1892/#1894/#1895 were). It is listed here because these tests
+# are about RERUN SAFETY — that ARM and DISARM stay surgical once a trigger exists — and a
+# permanently-absent entry would make every future run of this script look like it touches an extra
+# trigger, which is the assertion below, not a real finding. REMOVE THIS NOTE once it is live.
 EXISTING_TRIGGERS = {
+    "relgraph-health-cron",
     "relgraph-sync-cron", "reviews-invitation-send-cron",
     "commerce-index-relgraph-cron", "commerce-index-search-index-cron",
     "commerce-index-checkout-validation-cron", "commerce-index-insight-refresh-cron",

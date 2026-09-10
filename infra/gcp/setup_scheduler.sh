@@ -335,6 +335,36 @@ mkjob relgraph-sync "$GATEWAY_IMAGE" "$SA" \
   --task-timeout 14400s \
   --command npm --args "run,relgraph:sync-routine:cron"
 
+echo "== job: relgraph-health (was GH Actions cron 0 10 * * *)"
+# THE SECOND HALF OF THE 2026-08-25 MIGRATION, finished 2026-09-09.
+#
+# external-seed-sentinel-nongrowth below was moved off its GitHub workflow the day the Railway
+# DATABASE_URL was decommissioned. `Relationship Graph Serving Guard Audit` was missed. It broke the
+# next morning and stayed broken for two weeks, then stopped firing altogether — so the graph had NO
+# daily health signal of any kind, while `relgraph-sync` above kept passing and made the ledger look
+# green. That combination is the exact defect this job exists to report.
+#
+# It could not be repaired in GitHub. prod Postgres is private-only: `pivota-pg` has
+# `ipv4Enabled: false`, one RFC1918 address (10.25.0.2) and no authorized networks, so a
+# GitHub-hosted runner has no route to it and the `read ECONNRESET` in those runs is GitHub's
+# network resetting traffic to a non-routable address. Repairing it there would have meant putting a
+# public IP back on the production database.
+#
+# Two checks in one execution (PIVOTA-Agent scripts/run-relgraph-health-job.js): the serving guard,
+# whose thresholds used to live as an inline `node -e` in the workflow YAML and are now code with
+# tests; and the no-op-run detector, which catches the ledger passing while nothing is applied.
+# Thresholds come through ENV because gcloud splits --args on commas.
+#
+# Exit 1 = a threshold was breached, and that fails the execution and pages via the "prod: Cloud Run
+# job failing" alert policy, the same replacement for the GH failure email the sentinel uses. Exit 2
+# = the job itself failed. GATEWAY_TAG must be at or after PIVOTA-Agent #2171, which adds the script;
+# an older image will exit non-zero with "Cannot find module" until one carrying it is rolled here.
+mkjob relgraph-health "$GATEWAY_IMAGE" "$SA" \
+  --set-secrets "DATABASE_URL=DATABASE_URL_NOVERIFY:latest" \
+  --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=relgraph-health,PIVOTA_COMMIT_SHA=$GATEWAY_TAG,DB_POOL_MAX=3,RELGRAPH_MARKET=US,RELGRAPH_MAX_SUPPRESSED_ROWS=0,RELGRAPH_MAX_SUPPRESSED_PCT=0" \
+  --task-timeout 1800s \
+  --command npm --args "run,relgraph:health-job"
+
 echo "== job: external-seed-sentinel-nongrowth (GH Actions cron 23 10 * * *)"
 # ADR-009 data-side ratchet, migrated from PIVOTA-Agent's scheduled GitHub workflow
 # when the Railway DATABASE_URL secret it ran on was decommissioned (2026-08-25).
@@ -748,6 +778,9 @@ fi
 
 echo "== scheduler triggers"
 sched relgraph-sync-cron "37 10 * * *" relgraph-sync
+# 10:00 UTC, the slot the retired GitHub workflow held, and 37 minutes BEFORE relgraph-sync so a
+# health verdict describes the state the previous day's sync left behind rather than racing it.
+sched relgraph-health-cron "0 10 * * *" relgraph-health
 sched external-seed-sentinel-nongrowth-cron "23 10 * * *" external-seed-sentinel-nongrowth
 sched pdp-identity-graph-backfill-cron "40 3 * * 1" pdp-identity-graph-backfill
 if [ "$EXTERNAL_SEED_DESTINATION_SWEEP" = true ]; then
