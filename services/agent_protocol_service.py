@@ -4,6 +4,7 @@ CRUD and management for agent protocol configurations
 REUSES existing agent_protocols table (Phase 4)
 """
 
+from datetime import datetime
 from typing import Dict, List, Optional, Any
 import logging
 import json

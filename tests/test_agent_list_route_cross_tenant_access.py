@@ -35,6 +35,7 @@ shape:
   * Both directions: the stranger is refused, and staff plus the owner keep
     exactly what the endpoint is for.
 """
+from typing import Tuple
 from __future__ import annotations
 
 from datetime import datetime

@@ -75,11 +75,18 @@ async def run_catalog_invariant_sweep_tick() -> None:
                     "catalog_invariant check ERRORED: %s — %s",
                     check.get("name"), check.get("error"),
                 )
+        # ERRORED IS IN THE SUMMARY LINE. It was not, so "27 checks, 0 violated" was the whole
+        # story even when a check had been unable to run for weeks — the per-check ERROR above
+        # scrolls past, the summary is what anyone greps, and an unrunnable check read as a
+        # passing one.
+        errored = int(report.get("errored_count", 0))
         logger.info(
-            "catalog_invariant_sweep: %d checks, %d violated, %d reporting",
+            "catalog_invariant_sweep: %d checks, %d violated, %d reporting, %d ERRORED%s",
             len(report.get("checks", [])),
             int(report.get("violated_count", 0)),
             int(report.get("warned_count", 0)),
+            errored,
+            (" [%s]" % ", ".join(report.get("errored", []))) if errored else "",
         )
     except Exception:
         logger.exception("catalog_invariant_sweep: tick failed")

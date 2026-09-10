@@ -438,7 +438,7 @@ async def estimate_settlement(
             return EstimateResponse(
                 ok=False,
                 rule=rule,
-                charge={"currency": charge_currency, "gross": str(gross), "net_after_fees": str(net_charge)},
+                charge={"currency": charge_currency, "gross": str(gross_total), "net_after_fees": str(net_charge)},
                 settlement={
                     "currency": settlement_currency,
                     "net": None,

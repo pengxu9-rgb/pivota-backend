@@ -728,6 +728,13 @@ async def update_fulfillment_info(
                 ful = str((row["fulfillment_status"] if row else "") or "").strip().lower()
                 merchant_id = str((row["merchant_id"] if row else "") or "").strip()
                 if paid and merchant_id and ful in {"shipped", "delivered"}:
+                    # Imported HERE, not at module scope: db/ -> services/ is a cycle. The name
+                    # was simply never imported, so every paid+shipped order raised NameError into
+                    # the enclosing except and no invitation was ever enqueued from this path.
+                    from services.reviews_invitation_send_jobs_service import (
+                        enqueue_invitation_send_job_from_order,
+                    )
+
                     await enqueue_invitation_send_job_from_order(
                         merchant_id=merchant_id,
                         order_id=order_id,
@@ -773,6 +780,13 @@ async def mark_order_shipped(
     try:
         merchant_id = str((row["merchant_id"] if row else "") or "").strip()
         if merchant_id:
+            # Same local import as the two sites above — db/ -> services/ is a cycle at module
+            # scope. This one was missing too, so the `except Exception: pass` below swallowed a
+            # NameError on every call and no invitation was ever enqueued from this path either.
+            from services.reviews_invitation_send_jobs_service import (
+                enqueue_invitation_send_job_from_order,
+            )
+
             await enqueue_invitation_send_job_from_order(
                 merchant_id=merchant_id,
                 order_id=order_id,

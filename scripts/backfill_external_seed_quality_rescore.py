@@ -64,6 +64,7 @@ Locally, point DATABASE_URL at a database you have a URL for and run it directly
 
 Full pattern and its footguns: docs/runbooks/operating_on_gcp_production.md.
 """
+from typing import Dict
 from __future__ import annotations
 
 import argparse

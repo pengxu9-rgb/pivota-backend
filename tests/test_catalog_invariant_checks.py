@@ -525,3 +525,64 @@ def test_every_check_has_a_description_and_a_threshold_env():
         assert check.get("description"), check["name"]
         assert check.get("env"), check["name"]
         assert "default_threshold" in check, check["name"]
+
+
+# --- an unrunnable check is not a passing check ------------------------------------------------
+
+
+class _RaisingDb:
+    """A database that fails the way a real one does when a check's SQL is wrong: it raises."""
+
+    def __init__(self, fail_names):
+        self._fail = set(fail_names)
+
+    def _name_for(self, sql):
+        for check in _CHECKS:
+            if check.get("count_sql") == sql or check.get("sample_sql") == sql:
+                return check["name"]
+        return None
+
+    async def fetch_one(self, sql, values=None):
+        if self._name_for(sql) in self._fail:
+            raise RuntimeError("relation does not exist")
+        return {"c": 0}
+
+    async def fetch_all(self, sql, values=None):
+        if self._name_for(sql) in self._fail:
+            raise RuntimeError("relation does not exist")
+        return []
+
+    async def fetch_val(self, sql, values=None):
+        return 0
+
+
+async def test_a_check_that_RAISES_is_counted_and_named():
+    """Until 2026-09-10 a raising check produced `error` and no `count`/`violated` key, so the
+    summary said "27 checks, 0 violated" and looked exactly like a healthy sweep. Three share
+    checks had been in that state since the day they merged.
+
+    An unrunnable check is not a passing check — it is a green light over a broken thing, which is
+    what this whole module is about."""
+    from services.catalog_invariant_checks import run_catalog_invariant_checks
+
+    target = next(c["name"] for c in _CHECKS if c.get("count_sql"))
+    report = await run_catalog_invariant_checks(_RaisingDb([target]))
+
+    assert report["errored_count"] == 1, report.get("errored")
+    assert report["errored"] == [target]
+    # An error is not a violation: the errored check must appear in NEITHER tally. (Other checks
+    # may legitimately violate against this fake — `taxonomy_code_vs_table_drift` reports an
+    # unreadable shared vocabulary, which is exactly what an empty fake presents — so assert about
+    # the target rather than about a global zero.)
+    entry = next(c for c in report["checks"] if c["name"] == target)
+    assert "violated" not in entry and "count" not in entry
+    assert target not in [c["name"] for c in report["checks"] if c.get("violated")]
+
+
+async def test_a_clean_sweep_reports_ZERO_errored():
+    """The control. A report that always claimed errors would pass the test above."""
+    from services.catalog_invariant_checks import run_catalog_invariant_checks
+
+    report = await run_catalog_invariant_checks(_RaisingDb([]))
+    assert report["errored_count"] == 0
+    assert report["errored"] == []

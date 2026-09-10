@@ -22,6 +22,7 @@ Evidence:
   - resolved_merchant_id (round-trip match)
 """
 
+from typing import Optional
 from __future__ import annotations
 
 import logging

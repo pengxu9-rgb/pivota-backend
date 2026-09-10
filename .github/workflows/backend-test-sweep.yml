@@ -145,6 +145,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt -r requirements-dev.txt
 
+      # BEFORE THE TESTS, because a name that cannot resolve is not a test failure — it is a
+      # crash on whichever branch happens to reach it, and this repo had no linter at all until
+      # 2026-09-10. The gap was not theoretical: `scripts/seed_category_taxonomy.py` shipped a
+      # NameError in a branch only reachable under `--apply` (`--dry-run` passed, no test imported
+      # the script), and `services/pdp_governance_service.py:2747` has called a function that has
+      # never existed in this repository since 2026-04-25, inside a `try/except` that logs a
+      # fallback. Neither is findable by pytest; both take ruff about two seconds.
+      #
+      # Narrow on purpose — F821 + E9, no style rules. The four files still carrying a
+      # pre-existing undefined name are baselined in ruff.toml with a reason each, and
+      # tests/test_lint_baseline_only_shrinks.py stops that list growing.
+      - name: Lint for names that cannot resolve
+        run: ruff check --output-format=github .
+
       # THE QUARANTINE. Visible, justified, and meant to SHRINK.
       #
       # Kept in the workflow rather than a dotfile precisely so it is reviewed:

@@ -1,0 +1,49 @@
+# Ruff — the repository had NO linter of any kind until 2026-09-10.
+#
+# WHY THIS EXISTS. `scripts/seed_category_taxonomy.py` shipped a `NameError` in a branch only
+# reachable under `--apply`; `--dry-run` passed, no test imported the script, and a mutation sweep
+# over that code "passed" because the code was already dead. It reached review and production
+# review twice. A linter finds it in two seconds, and nothing in fourteen CI workflows ran one.
+#
+# The first run found 36 undefined names, 24 of them in production code — including
+# `services/pdp_governance_service.py:2747` calling a function that has never existed in this
+# repository, inside a `try/except` that logs "falling back to synthesized subject". It has been
+# taking that fallback on every candidate merge since 2026-04-25.
+#
+# DELIBERATELY NARROW. This is a correctness gate, not a style gate: nobody needs a 1,200-file
+# formatting diff today. Style rules can be added later; the point now is that a name which cannot
+# resolve must not merge.
+
+line-length = 120
+exclude = [".venv", "venv", "node_modules", ".git", "__pycache__", "build", "dist", ".claude"]
+
+[lint]
+# F821 undefined name   — the class that shipped
+# E9   syntax/IO errors  — a file that cannot be parsed at all
+select = ["F821", "E9"]
+# ⚠️ F811 (redefinition) IS NOT ON YET, and it should be next. Enabling it reports 83 findings,
+# 51 auto-fixable, almost all in tests — and a redefined test function is the "green over broken"
+# shape in its purest form: the first definition never runs and nothing says so. Left off only
+# because 83 fixes do not belong in the PR that introduces the linter. Turn it on next.
+
+[lint.per-file-ignores]
+# ⚠️ A BASELINE, NOT AN EXEMPTION. Each of these is a REAL undefined name that needs a decision
+# this linter PR is not the place to make, and each is one small PR. The count is asserted in
+# tests/test_lint_baseline_only_shrinks.py so the list can only get shorter.
+#
+# routes/agent_shop_gateway.py:14461 — `http_request.state.traffic_taxonomy = ...` inside
+#   `create_creator_task`, whose signature has no such parameter (it takes a pydantic body named
+#   `request`). Wrapped in `except Exception: pass`, so traffic taxonomy has never been stamped on
+#   this route. Fix = add `http_request: Request` to the signature; needs a route-behaviour check.
+"routes/agent_shop_gateway.py" = ["F821"]
+# routes/shopify_manual.py, routes/shopify_setup.py — both build a `merchant_info` dict from
+#   `store_info.get(...)` after fetching `merchant = await get_merchant_onboarding(...)`. Every
+#   access is guarded `if merchant else None`, so the intent is clearly `merchant`, but the key
+#   names differ between the two callers and guessing them would swap one silent bug for another.
+"routes/shopify_manual.py" = ["F821"]
+"routes/shopify_setup.py" = ["F821"]
+# services/pdp_governance_service.py:2747 — `_subject_from_product_key` is not defined anywhere in
+#   the repository and never has been (since 0a08d8091, 2026-04-25). The sibling
+#   `_subject_from_external_seed` exists at :1059. Whether the call should be re-pointed at it or
+#   the function written is a product question about candidate merges.
+"services/pdp_governance_service.py" = ["F821"]

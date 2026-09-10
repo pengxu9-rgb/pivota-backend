@@ -32,6 +32,7 @@ feedback_llm_call_multipliers.md / incident #280 — the same class of
 risk that took backend down already).
 """
 
+from typing import List
 from __future__ import annotations
 
 import logging
