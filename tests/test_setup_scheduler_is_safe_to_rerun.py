@@ -42,11 +42,17 @@ SCRIPT = REPO / "infra" / "gcp" / "setup_scheduler.sh"
 # create-vs-update and, previously, nothing else.
 #
 # ONE ENTRY IS AHEAD OF PROD: `relgraph-health-cron` is defined by the script but not yet
-# provisioned (see the job's comment in setup_scheduler.sh — the PAUSED blast radius means new
-# triggers are created by hand, as #1892/#1894/#1895 were). It is listed here because these tests
-# are about RERUN SAFETY — that ARM and DISARM stay surgical once a trigger exists — and a
-# permanently-absent entry would make every future run of this script look like it touches an extra
-# trigger, which is the assertion below, not a real finding. REMOVE THIS NOTE once it is live.
+# provisioned. It is listed here because these tests are about RERUN SAFETY — that ARM and DISARM
+# stay surgical once a trigger exists — and a permanently-absent entry would make every run of the
+# script look like it touches an extra trigger, which is the assertion below, not a real finding.
+# Verified: without this entry, test_arm_changes_exactly_one_trigger and its disarm partner FAIL.
+# Adding it does not blunt them — a foreign trigger added to the script still fails both.
+#
+# (An earlier version of this note said new triggers are "created by hand". That contradicts
+# `sched()`, which creates them PAUSED precisely so running this script is safe; the hand step is
+# `ARM=relgraph-health-cron`, and only after a gateway image carrying PIVOTA-Agent #2171's script is
+# rolled onto the job — an older image fails with npm's `Missing script`.)
+# REMOVE THIS NOTE once it is live.
 EXISTING_TRIGGERS = {
     "relgraph-health-cron",
     "relgraph-sync-cron", "reviews-invitation-send-cron",
