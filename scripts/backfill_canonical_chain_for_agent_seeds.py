@@ -37,6 +37,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import asyncpg  # noqa: E402
 
+from services.catalog_enrichment_agent.apply import (  # noqa: E402
+    _MERCHANT_UPSERT_SQL,
+)
 from services.catalog_enrichment_agent.ingestion import (  # noqa: E402
     AGENT_VERSION,
     _build_merchant_upserts,
@@ -137,24 +140,16 @@ def _seed_to_offer_dict(seed_row: Dict[str, Any]) -> Dict[str, Any]:
 
 
 async def _upsert_merchant(row: Dict[str, Any]) -> None:
-    await _db.execute(
-        """
-        INSERT INTO catalog_merchants
-          (merchant_id, merchant_name, primary_platform, status,
-           source_system, source_ref, metadata_json)
-        VALUES
-          (:merchant_id, :merchant_name, :primary_platform, :status,
-           :source_system, :source_ref, CAST(:metadata_json AS jsonb))
-        ON CONFLICT (merchant_id) DO UPDATE SET
-          merchant_name = COALESCE(EXCLUDED.merchant_name, catalog_merchants.merchant_name),
-          primary_platform = COALESCE(EXCLUDED.primary_platform, catalog_merchants.primary_platform),
-          status = EXCLUDED.status,
-          source_ref = COALESCE(EXCLUDED.source_ref, catalog_merchants.source_ref),
-          metadata_json = EXCLUDED.metadata_json,
-          updated_at = NOW()
-        """,
-        row,
-    )
+    """Shares `apply._MERCHANT_UPSERT_SQL` rather than restating it.
+
+    This was a verbatim copy, and the copy is how the metadata_json clobber
+    survived its first fix: the same rows (`_build_merchant_upserts` feeds both,
+    so both write the same `agent_seed::<slug>` population) reached one statement
+    that merged the column and one that replaced it, and whichever ran last won.
+    The row dict this takes is already exactly the parameter set that statement
+    binds, so there was never anything to diverge FOR.
+    """
+    await _db.execute(_MERCHANT_UPSERT_SQL, row)
 
 
 async def _upsert_sku(row: Dict[str, Any]) -> None:
