@@ -93,6 +93,24 @@ PAYMENT_EGRESS_IP = os.getenv("PIVOTA_PAYMENT_EGRESS_IP", "8.231.167.230")
 #: complete answer with no refusals. `scripts/capture_us_market_offers.py` already carries this
 #: scar and its fix; this is the same fix. The fence is what lets a reader tell a whole report
 #: from a surviving fragment of one.
+#:
+#: DROPPING IS NOT THE ONLY MECHANISM. Cloud Run parses a line that is bare serialized JSON into
+#: `jsonPayload`, and `run_oneoff_job.sh` renders `value(textPayload,jsonPayload.message)` — so a
+#: JSON line with no `message` key renders as an empty row and vanishes. The start line was
+#: previously bare JSON and so was probably never visible through the wrapper at all, which
+#: defeats the point of printing it (surviving a TASK_TIMEOUT kill so a partial run's `run_id`
+#: can be excluded). The sentinel prefix makes the line non-JSON, so it lands in `textPayload`.
+#:
+#: TO EXTRACT, and note this script prints TWO fenced lines where its siblings print one — the
+#: report is the one whose `phase` is `final`:
+#:
+#:     ... | grep -o 'PREFLIGHTSWEEP>>>{.*}<<<PREFLIGHTSWEEP' \
+#:         | sed 's/^PREFLIGHTSWEEP>>>//; s/<<<PREFLIGHTSWEEP$//' \
+#:         | python3 -m json.tool --json-lines
+#:
+#: `tail -1` is NOT a substitute for reading `phase`: on a run whose final line was dropped it
+#: hands you the start line, which carries `mode`, `run_id` and `egress_ip` and no refusals — a
+#: fragment that reads as a completed sweep that found nothing wrong.
 REPORT_BEGIN = "PREFLIGHTSWEEP>>>"
 REPORT_END = "<<<PREFLIGHTSWEEP"
 
@@ -420,8 +438,8 @@ def main() -> int:
 
     def _refuse(error: str, detail: str) -> int:
         print(REPORT_BEGIN + json.dumps(
-            {"phase": "refused", "error": error, "detail": detail}, ensure_ascii=False)
-            + REPORT_END, flush=True)
+            {"phase": "refused", "error": error, "detail": detail},
+            ensure_ascii=False, sort_keys=True) + REPORT_END, flush=True)
         return 2
 
     # REFUSE RATHER THAN MEASURE NOTHING. With the fence shut every ask answers `not_yet_checked`
@@ -461,7 +479,7 @@ def main() -> int:
     print(REPORT_BEGIN + json.dumps(
         {"phase": "start", "run_id": run_id, "mode": "apply" if args.apply else "dry_run",
          "egress_ip": ip, "limit": args.limit, "after": args.after},
-        ensure_ascii=False) + REPORT_END, flush=True)
+        ensure_ascii=False, sort_keys=True) + REPORT_END, flush=True)
 
     async def _main() -> Dict[str, Any]:
         await database.connect()

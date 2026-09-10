@@ -634,23 +634,57 @@ def test_an_aborted_run_exits_non_zero(monkeypatch, capsys):
     assert "aborted_on_block" in capsys.readouterr().out
 
 
-def test_every_report_is_one_fenced_line():
-    """MUTANT: pretty-print the report with indent=2.
+def test_every_report_is_one_fenced_line(monkeypatch, capsys):
+    """MUTANT: pretty-print the report; put the fences on their own lines; use indent=4.
 
-    OBSERVED IN PRODUCTION, on the first dry runs of this script. `run_oneoff_job.sh` reads a
-    job's output from Cloud Logging, which drops lines, so a multi-line report arrives with
-    arbitrary keys missing while the job still exits 0. Of five pages, one report arrived empty
-    and another as `{\\n  "mode": "dry_run",\\n}` — a fragment that parses as a plausible answer
-    with no refusals in it. The fence is what lets a reader tell a whole report from a survivor.
+    BEHAVIOURAL, because the first version of this test grepped the module source for `indent=2`
+    and for `print(` lines lacking the sentinel — and review showed that ratchet passes the exact
+    production defect one digit different (`indent=4`), passes fences on separate lines, passes a
+    `sys.stdout.write`, and FAILS a benign reformat that wraps a correct `print(` onto two source
+    lines. It tested the spelling, not the output.
+
+    `tests/test_backfill_variant_identity_skus.py` already learned this and names the same mutant:
+    "REPORT_BEGIN + newline + json + newline + REPORT_END has no `indent=`, has both sentinels,
+    and passed 31/31 while reproducing the failure exactly."
+
+    So: run `main()` and count the lines it actually printed.
     """
-    import inspect
+    import re
+    import sys as _sys
 
-    src = inspect.getsource(sweep)
-    assert "indent=2" not in src, "a multi-line report cannot survive the log transport"
-    # Every print of a report is fenced, on one line, and json.dumps defaults to no newlines.
-    for line in src.splitlines():
-        if line.strip().startswith("print(") and "REPORT_BEGIN" not in line:
-            raise AssertionError(f"unfenced report print: {line.strip()}")
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_ALLOW_EGRESS", "true")
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
+    monkeypatch.setattr(_sys, "argv", ["measure_checkout_preflight.py"])
+    monkeypatch.setattr(sweep, "_egress_ip", lambda: _async("34.82.199.35"))
+
+    async def fake_run(**kw):
+        return {"aborted_on_block": False, "gated": 7, "answered": 7, "would_block": 2,
+                "would_block_rate": 0.2857, "no_contact": 0, "by_reason": {"ok": 5},
+                "next_cursor": "eps_z"}
+
+    async def noop():
+        return None
+
+    monkeypatch.setattr(sweep, "run", fake_run)
+    monkeypatch.setattr(sweep.database, "connect", noop)
+    monkeypatch.setattr(sweep.database, "disconnect", noop)
+    assert sweep.main() == 0
+
+    out = capsys.readouterr().out
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    assert len(lines) == 2, f"report spans {len(lines)} lines, not 2: {out!r}"
+
+    pattern = re.escape(sweep.REPORT_BEGIN) + r"(\{.*\})" + re.escape(sweep.REPORT_END)
+    phases = []
+    for ln in lines:
+        m = re.fullmatch(pattern, ln)
+        assert m, f"the sentinels do not delimit this line: {ln!r}"
+        phases.append(json.loads(m.group(1))["phase"])
+    assert phases == ["start", "final"], phases
+
+    final = json.loads(re.fullmatch(pattern, lines[1]).group(1))
+    assert final["would_block_rate"] == 0.2857, "the payload must survive intact"
+    assert final["egress_ip"] == "34.82.199.35"
 
 
 @pytest.mark.asyncio
