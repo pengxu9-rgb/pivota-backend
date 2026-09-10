@@ -4,6 +4,13 @@ WHAT THIS IS. A client for Reap's agentic module: `products/search` -> `products
 `products/variant` -> `quotes`. Reap then opens a hosted approval page where THE BUYER enters
 THEIR OWN card, and the outcome is read back by polling `GET /agentic/checkouts/{id}`.
 
+THE CHECKOUT LEG IS A MOVING TARGET AND THIS MODULE DELIBERATELY DOES NOT TOUCH IT. As of 9 Sep
+`POST /agentic/checkouts` requires an `enrollmentId` and no longer accepts `owner`; enrollment is
+now a discriminated union whose card-on-file branches take a `cardId`, and a new
+`/cards/{id}/reveal-pan` path has appeared. Those are the ISSUANCE rail, which is dormant by
+design under the 6 Sep constraint -- see below -- and nothing here should grow a path into them.
+The quote leg is unchanged across that revision.
+
     Pivota never deposits, prefunds, custodies, or is liable for a balance (constraint, 6 Sep).
 
 That constraint is why this rail is the right one: the money leg is entirely between the buyer
@@ -693,10 +700,20 @@ def build_quote_request(
     THERE IS NO ATTRIBUTION FIELD. Not "it does not survive checkout" -- it is not in the
     schema, and Reap accepts unknown keys silently with a 200 and drops them. So sending one
     would produce a request that looks like it carries attribution, a response that looks like a
-    success, and no attribution anywhere. The only join available to us is client-side:
-    `owner.reference` at checkout creation plus a query string on our own `returnUrl`, matched
-    afterwards against Reap's `orderId` by polling, since agentic resources have no webhooks.
-    That is a commercial conversation with Reap, and no code in this file can substitute for it.
+    success, and no attribution anywhere.
+
+    AND THE ONE CLIENT-SIDE JOIN MOVED ON 9 SEP. This docstring previously said the join was
+    `owner.reference` on the checkout body plus a query string on our own `returnUrl`. `owner` is
+    NO LONGER A FIELD ON `POST /agentic/checkouts`: the endpoint now requires `enrollmentId` and
+    has dropped `owner` entirely, and the owner reference has moved to `POST /agentic/enrollments`
+    under a different key (`owner.id`, not `owner.reference`). So the identifier we would join on
+    is now attached to an ENROLLMENT -- a longer-lived object than one purchase -- and whether it
+    survives to an order is a fresh question, not the answered one this paragraph used to imply.
+
+    Note the version did not move: `info.version` is still 1.0.0 and `Reap-Version` is still
+    pinned to the same single value, so nothing in the request we send would have told us. The
+    quote endpoints this module actually calls are byte-identical between the 8 Sep and 9 Sep
+    specs -- verified by diffing them, not assumed -- which is why this module needs no change.
     """
     address = str(email or "").strip()
     if not address or "@" not in address:
