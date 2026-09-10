@@ -409,12 +409,13 @@ class TestReportOnlyTier:
         #       no provenance marker at all, so an enforcing check would ship
         #       permanently red and a threshold raised to today's count would
         #       bless the exact rows that arc exists to fix.
-        #   serving_eligible_but_unroutable             — 4,588 of 10,509
-        #       serving-eligible rows (43.7%) are filed on an INTERIOR taxonomy
-        #       node today, so prefix recall cannot reach them. The widened
-        #       category backfill is what converges the cohort; until it runs,
-        #       enforcing would ship permanently red and a threshold at 4,588
-        #       would bless every one of them.
+        #   serving_eligible_on_interior_taxonomy_node  — 4,588 of 10,509
+        #       serving-eligible rows (43.7%) sit on an INTERIOR taxonomy node.
+        #       They ARE reachable, via #2122 ancestor admission, but only when
+        #       their own text names the category and never with the depth
+        #       score, so they sort behind depth-matched rows. A quality signal,
+        #       not a correctness violation: warn_only is permanent here, since
+        #       there is no count at which this should fail a build.
         #   relationship_graph_ledger_passes_over_frozen_data — fires TODAY
         #       (returns 1). The remediation is not in this repo: the builder
         #       lives in PIVOTA-Agent and its GitHub path has been failing with
@@ -423,7 +424,7 @@ class TestReportOnlyTier:
         expected = [
             CHECK_NAME,
             "skus_without_merchant_issued_identity_share",
-            "serving_eligible_but_unroutable",
+            "serving_eligible_on_interior_taxonomy_node",
             "relationship_graph_ledger_passes_over_frozen_data",
         ]
         assert [c["name"] for c in _CHECKS if c.get("warn_only")] == expected

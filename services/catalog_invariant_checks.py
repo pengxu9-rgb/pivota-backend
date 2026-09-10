@@ -1750,30 +1750,50 @@ _CHECKS: List[Dict[str, Any]] = [
         "runner": _run_identity_provenance_share,
     },
     {
-        # GREEN OVER BROKEN. Every field this row exposes says healthy: it is
-        # serving_eligible, it has content, it passed quality. And recall binds
-        # a HARD PREFIX — `beauty/makeup/lip/` for a "matte lipstick" query —
-        # so a row filed at the ANCESTOR `beauty/makeup` can never match it.
-        # Eligible and unreachable at once, with no field that disagrees.
+        # A row filed on an INTERIOR taxonomy node is reachable, but only on the
+        # weaker of the two paths recall offers, and it is worth counting how
+        # much of the served catalogue depends on that.
         #
-        # Measured on prod 2026-09-09: a "matte lipstick" query returned 33
-        # products and NOT ONE of MAC's 286, Stila's 124, Tarte's 249,
-        # JUNGSAEMMOOL's 171 or MAKE UP FOR EVER's 74. 4,517 serving-eligible
-        # rows were in this state. Nothing in this repo could see it, because
-        # every existing signal was green.
+        # Recall binds a hard prefix — `beauty/makeup/lip/` for a "matte
+        # lipstick" query — and a row at the ancestor `beauty/makeup` cannot
+        # satisfy it directly. #2122 admits such a row anyway, on two
+        # conditions: its path is a strict ancestor of the prefix, AND its OWN
+        # TEXT carries a span that resolves to that category. The score is
+        # deliberately not raised ("admitted so it can compete, not promoted"),
+        # so it ranks below every row with a real depth match.
         #
-        # `warn_only` for the same reason market_currency_disagreement is: the
-        # cohort exists TODAY, so an enforcing check at 0 ships permanently
-        # red, and a threshold set to 4,517 blesses the exact rows the fix is
-        # for and hands the next writer that much head-room. PROMOTION IS ONE
-        # DELETED KEY — remove `warn_only` in the change that converges the
-        # cohort (the widened backfill); the threshold is already correct.
-        "name": "serving_eligible_but_unroutable",
+        # Two consequences, both real and neither fatal:
+        #   1. reachability rests entirely on the row's TITLE. MAC's
+        #      "M·A·Cximal Silky Matte Lipstick" is admitted because it says
+        #      lipstick; a MAC row whose title does not name its category is
+        #      not.
+        #   2. it never earns the depth score, so it sorts behind depth-matched
+        #      competitors. Measured on prod 2026-09-09: "a long-wearing matte
+        #      lipstick" returns MAC's own flagship lipsticks on PAGE 2, below
+        #      Pixi, Tom Ford and Fenty. A caller that reads only page 1 sees
+        #      none of them.
+        #
+        # 4,588 of 10,509 serving-eligible rows (43.7%) are in this state, so
+        # nearly half the served catalogue is competing with a handicap it did
+        # not choose.
+        #
+        # ⚠️ AN EARLIER VERSION OF THIS CHECK WAS NAMED `..._but_unroutable` AND
+        # CLAIMED THESE ROWS "can never match". That was wrong, and wrong in the
+        # way this module exists to prevent: the claim came from reading page 1
+        # of a 33-result query and treating absence there as absence. Page 2 has
+        # them. Do not restate the stronger claim.
+        #
+        # `warn_only`, and permanently so unless the taxonomy work converges the
+        # cohort: this is a QUALITY signal, not a correctness violation, and
+        # there is no count at which it becomes a build failure.
+        "name": "serving_eligible_on_interior_taxonomy_node",
         "description": (
             "row is serving_eligible but its category_path is an INTERIOR "
-            "taxonomy node (or NULL) — prefix recall can never reach it"
+            "taxonomy node (or NULL) — reachable only via #2122 ancestor "
+            "admission, which needs the category word in the row's own text "
+            "and never earns the depth score"
         ),
-        "env": "CATALOG_INVARIANT_UNROUTABLE_THRESHOLD",
+        "env": "CATALOG_INVARIANT_INTERIOR_NODE_THRESHOLD",
         "default_threshold": 0,
         "warn_only": True,
         "count_sql": """

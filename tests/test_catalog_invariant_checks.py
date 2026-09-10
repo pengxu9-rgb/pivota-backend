@@ -341,10 +341,11 @@ def _check(name):
     return matches[0]
 
 
-def test_unroutable_check_is_registered_and_reports_without_failing_the_sweep():
-    """The cohort exists TODAY (4,517 rows on 2026-09-09), so this must report its real number
-    without shipping permanently red. Promotion is one deleted key."""
-    check = _check("serving_eligible_but_unroutable")
+def test_interior_node_check_is_registered_and_reports_without_failing_the_sweep():
+    """This is a QUALITY signal, not a correctness violation: the rows ARE reachable, via #2122
+    ancestor admission. There is no count at which it should fail a build, so warn_only is the
+    permanent tier here rather than a staging post."""
+    check = _check("serving_eligible_on_interior_taxonomy_node")
     assert check["warn_only"] is True
     assert check["default_threshold"] == 0   # never a blessed non-zero count
     assert "serving_eligible" in check["count_sql"]
@@ -353,8 +354,8 @@ def test_unroutable_check_is_registered_and_reports_without_failing_the_sweep():
 
 def test_the_interior_node_list_is_derived_and_excludes_leaves():
     """THE MECHANISM. If this list were empty the check would match nothing and look green
-    forever — the exact failure mode it exists to detect. And if it wrongly contained LEAVES,
-    the check would flag rows that route perfectly well.
+    forever. And if it wrongly contained LEAVES, the check would flag rows that match the
+    query prefix directly and have no handicap at all.
 
     Routability is not a depth: `fashion/shoes` and `electronics/ereader` are 2-segment leaves.
     """
@@ -375,7 +376,7 @@ def test_the_interior_node_list_is_derived_and_excludes_leaves():
 
 def test_the_interior_list_reaches_the_sql():
     """Deriving the set is useless if the query does not use it."""
-    check = _check("serving_eligible_but_unroutable")
+    check = _check("serving_eligible_on_interior_taxonomy_node")
     assert "'beauty/makeup'" in check["count_sql"]
     assert "'beauty/makeup'" in check["sample_sql"]
     assert "'fashion/shoes'" not in check["count_sql"]
@@ -401,3 +402,16 @@ def test_every_check_has_a_description_and_a_threshold_env():
         assert check.get("description"), check["name"]
         assert check.get("env"), check["name"]
         assert "default_threshold" in check, check["name"]
+
+
+def test_the_description_does_not_claim_the_rows_are_unreachable():
+    """An earlier version of this check was named `..._but_unroutable` and said the rows "can
+    never match". They can: #2122 admits an ancestor row whose own text carries the category
+    word, and prod returns MAC's depth-2 lipsticks on page 2 of a lipstick query. The claim came
+    from reading page 1 and treating absence there as absence, which is the exact reasoning this
+    module exists to catch. Pin the weaker, true claim so it cannot drift back."""
+    check = _check("serving_eligible_on_interior_taxonomy_node")
+    blob = (check["name"] + " " + check["description"]).lower()
+    for banned in ("unroutable", "unreachable", "never reach", "can never"):
+        assert banned not in blob, "overclaims reachability: %r" % banned
+    assert "ancestor" in blob, "must say HOW the row is still reachable"
