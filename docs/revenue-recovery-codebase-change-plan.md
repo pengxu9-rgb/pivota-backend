@@ -159,13 +159,41 @@ and (d) **liveness-checked**. The liveness module already exists and already enc
 *"`unverifiable` is a first-class outcome and it must never buy a retirement"* (213 of 286 hosts in its
 own audit answered with Cloudflare challenges).
 
-### B2. Wire the redirect resolver into the destination lane, before classification
+### B2. Wire the redirect resolver into the destination lane `[VERIFIED 2026-09-02 — ALREADY DONE; this item was wrong]`
 
-**Files:** [services/grounding_redirect_resolver.py](../services/grounding_redirect_resolver.py) →
-[services/audit_evidence_builder.py:1010](../services/audit_evidence_builder.py)
+**Files:** [services/grounding_redirect_resolver.py](../services/grounding_redirect_resolver.py) ·
+[services/agent_center_bd_report_service.py:5212](../services/agent_center_bd_report_service.py) ·
+[services/audit_facts.py:100](../services/audit_facts.py)
 
-**100% of Gemini responses** carry an unresolved `vertexaisearch.cloud.google.com` URL. Classifying
-before resolving discards the entire Gemini destination signal. The module exists; this is wiring.
+**Do not build this. It is already wired, and the number that motivated it was mine, not the pipeline's.**
+
+`resolve_grounding_redirects_in_runs` is called at `load_per_sku_probe_runs:5212` — exactly what feeds
+`build_authority_map` (`:13394` → `:13522`) → `authority_map.hosts[].evidence_urls` →
+`citation_observations.evidence_url`. `load_per_sku_probe_runs` is the only source of runs on that path
+(call sites `:7289`, `:13394`), `audit_evidence_builder` is the only writer of `citation_observations`, and
+`AUDIT_RESOLVE_GROUNDING_REDIRECTS` defaults to `true`. Verified end to end against a stubbed 302: both
+`grounding_sources[].uri` and `grounding_chunks[]` are rewritten in place.
+
+**Two corrections to what this document previously claimed:**
+
+1. *"100% of Gemini responses carry an unresolved redirector, so classifying before resolving discards the
+   entire Gemini destination signal."* That 100% came from `scripts/geo_cohort_spike.js` — the scratch
+   runner built for the cohort measurements, which does not resolve. It says nothing about Pivota's
+   pipeline, which does. Conflating the measurement instrument with the system under measurement is
+   precisely the error this document warns about elsewhere.
+2. *"the module exists; this is wiring."* It was wired in the commit that introduced it.
+
+**The host was never at risk regardless.** `_grounding_source_host` (`audit_facts.py:100`) derives the
+publisher host from the chunk `title` when the URI is a redirector, so `cited_host` is correct with or
+without HTTP resolution. Verified: a still-redirected source titled `oliveyoung.com` yields
+`oliveyoung.com`; a redirector with **no** title yields `None`, so the citation is dropped rather than
+mis-attributed to `vertexaisearch.cloud.google.com`.
+
+**Residual — real, small, and degradation rather than a wiring gap.** When a redirect cannot be resolved
+(network failure, or Google expiring the token, which the module's own docstring says happens "after a
+while"), `evidence_url` keeps the opaque redirector while `cited_host` stays correct. A merchant clicking
+that evidence link gets nothing. Worth a follow-up that drops an unresolvable redirector from
+`evidence_urls` or records the failure. It does not block B3.
 
 ### B3. Primary commerce destination `[highest-value unbuilt item]`
 
