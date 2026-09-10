@@ -8,8 +8,24 @@ A baseline nobody counts is an exemption list, and an exemption list grows. This
 of it, so adding a fifth file is a visible act rather than a quiet one — and so that removing the
 last entry is a test that fails and tells you to delete itself.
 
-The linter itself runs in CI (`.github/workflows/backend-test-sweep.yml`); this file is about the
-baseline, not about whether the code lints.
+THIS FILE IS ABOUT ruff.toml. NOTHING ELSE. That boundary was learned expensively.
+
+An earlier version also asserted that the CI step invoking ruff existed, ran the whole tree,
+carried the right flags, sat in a job with no `if:`, and was not excluded from pytest. Five
+adversarial review passes each found a real, executed bypass of those assertions, and each fix
+was defeated one layer out by the next pass — because a pytest file can only model the layers
+that live inside the write set of the PR it is gating, and there are nine of them. Three of
+those tests asserted the conditions under which they themselves ran, which is undecidable from
+here: violate one and the assertion is never evaluated.
+
+Those tests are gone. `.github/workflows/lint.yml` now owns that question and answers it by
+OBSERVATION rather than modelling: no `paths:` filter, a required status check (so a job that
+stops reporting blocks the merge instead of passing), and a negative control that plants a
+canary in each tree and runs the real command in the real shell. `gate-enforcement-audit.yml`
+watches the one layer no PR can touch — whether `lint` is required at all.
+
+What is left here is the part that converged: the baseline is a ratchet over a TOML file, and
+one layer is exactly what a unit test can model soundly.
 """
 
 from __future__ import annotations
@@ -34,10 +50,8 @@ _BASELINE = {
     "services/pdp_governance_service.py",
 }
 
-
 def _ignores() -> dict:
     return tomllib.loads(_RUFF.read_text())["lint"]["per-file-ignores"]
-
 
 def test_the_baseline_has_not_grown():
     """A fifth file means somebody merged a new undefined name and silenced it instead."""
@@ -48,7 +62,6 @@ def test_the_baseline_has_not_grown():
         "broken when the linter arrived — fix the name instead, or make adding it a deliberate, "
         "reviewed change to _BASELINE with a reason." % added
     )
-
 
 def test_removing_a_file_from_the_baseline_updates_this_test():
     """The other direction, and the point of the ratchet. When a file is fixed it leaves
@@ -62,14 +75,12 @@ def test_removing_a_file_from_the_baseline_updates_this_test():
         % fixed
     )
 
-
 def test_the_baseline_only_silences_F821():
     """Scope creep in an exemption is how a style waiver becomes a correctness waiver."""
     for path, codes in _ignores().items():
         assert codes == ["F821"], (
             "%s silences %s; the baseline exists only for pre-existing undefined names" % (path, codes)
         )
-
 
 def test_the_gate_cannot_be_switched_off_from_the_config():
     """THE BYPASSES THE FIRST VERSION MISSED. It asserted the shape of `per-file-ignores` and
@@ -131,7 +142,6 @@ def test_the_gate_cannot_be_switched_off_from_the_config():
         extra = sorted(set(lint.get(key, [])) - allowed_exclude)
         assert not extra, "[lint].%s adds %s; same bypass" % (key, extra)
 
-
 def test_ruff_toml_is_the_ONLY_ruff_config_in_the_tree():
     """A SECOND config file beats this one, and this test never opens it.
 
@@ -157,7 +167,6 @@ def test_ruff_toml_is_the_ONLY_ruff_config_in_the_tree():
         "One config, or the ratchet is guarding a file the linter no longer reads." % sorted(others)
     )
 
-
 def test_no_baselined_path_is_also_excluded():
     """The specific trick: leave the entry in `per-file-ignores` so this file is satisfied, and
     ALSO exclude the path so ruff never reads it. The baseline then looks maintained while the
@@ -168,7 +177,6 @@ def test_no_baselined_path_is_also_excluded():
         assert path not in excluded, (
             "%s is baselined AND excluded — pick one; excluding it hides future findings too" % path
         )
-
 
 def test_the_selected_rules_are_still_the_correctness_ones():
     """A later edit that drops F821 from `select` would make the whole gate vacuous while every
@@ -188,7 +196,6 @@ def test_the_selected_rules_are_still_the_correctness_ones():
         "F404 was unselected once and seven uncompilable files merged green; it stays"
     )
     assert "E9" in select
-
 
 # --- the two MECHANISM-level guards, added after a third review pass ------------------------
 #
@@ -211,14 +218,12 @@ def test_the_selected_rules_are_still_the_correctness_ones():
 #
 # Neither subsumes the other, and both were measured against real bypasses before being written.
 
-
 def _ruff_argv() -> list:
     import shutil
     import sys
 
     exe = shutil.which("ruff")
     return [exe] if exe else [sys.executable, "-m", "ruff"]
-
 
 def test_ruff_ITSELF_still_reports_an_undefined_name():
     """THE BEHAVIOURAL CHECK. Every other test here reads ruff.toml and reasons about it; this
@@ -249,7 +254,6 @@ def test_ruff_ITSELF_still_reports_an_undefined_name():
         % (proc.returncode, proc.stdout[-2000:], proc.stderr[-2000:])
     )
 
-
 def test_ruff_toml_has_no_key_this_ratchet_has_not_CONSIDERED():
     """THE ALLOWLIST, and the answer to whack-a-mole.
 
@@ -275,7 +279,6 @@ def test_ruff_toml_has_no_key_this_ratchet_has_not_CONSIDERED():
         "ruff.toml [lint] has key(s) %s that no test in this file evaluates; same reasoning as "
         "above. Add an assertion, then add the key to `allowed_lint`." % unknown
     )
-
 
 def test_the_baseline_hides_exactly_the_nine_names_it_documents():
     """A whole-file `per-file-ignores` entry is blind to the NEXT undefined name in that file.
@@ -328,7 +331,6 @@ def test_the_baseline_hides_exactly_the_nine_names_it_documents():
             sorted(expected.items()), sorted(found.items()))
     )
 
-
 def test_the_ruff_version_is_pinned():
     """The gate's meaning is a function of the ruff version. 0.16 still honours the deprecated
     top-level `ignore` with a warning; a later one may not, and a later one may change what
@@ -345,315 +347,108 @@ def test_the_ruff_version_is_pinned():
     )
 
 
-# --- the gate has to actually RUN ------------------------------------------------------------
+# --- the one workflow assertion that is NOT self-referential -----------------------------
 #
-# Everything above this line polices ruff.toml. None of it noticed that the CI step invoking ruff
-# could simply be deleted: measured, removing the whole `Lint for names that cannot resolve` step
-# left every test in this file and in test_every_python_file_compiles.py green. So did dropping
-# the single word `--ignore-noqa`, which silently restores the `# noqa: F821` bypass a previous
-# review pass found and which is proven load-bearing (with a `# noqa: F821` appended to a source
-# file: with the flag ruff finds 1 error, without it "All checks passed").
+# #2167 asserted properties of the job it ran in, which is undecidable from inside: violate the
+# condition and the assertion is never evaluated. Those tests are gone.
 #
-# A ratchet on the config of a step that no longer exists is decoration.
+# This one is different in kind, and that difference is the whole reason it is allowed back.
+# It asserts a property of `.github/workflows/lint.yml` — a DIFFERENT file from the job this
+# test runs in — and it runs in two jobs (the sweep, and lint.yml itself). Skipping lint.yml
+# therefore does not silence it; the sweep still evaluates it.
+#
+# Why it is needed at all: lint.yml's protection is "a required check that never reports blocks
+# the merge". The other half of that asymmetry is that a job SKIPPED by `if:` reports SUCCESS,
+# and CI Entrypoint tolerates a skip by design. So `if: false` on the lint job is a one-line,
+# fully-green bypass that no amount of workflow structure closes. Nothing else covers it.
 
-_SWEEP = _ROOT / ".github/workflows/backend-test-sweep.yml"
 
-
-def _sweep_job() -> dict:
+def test_the_lint_workflow_cannot_be_skipped_or_made_advisory():
+    """`if: false` on the lint job is green everywhere. This is what objects."""
     import yaml
 
-    return yaml.safe_load(_SWEEP.read_text())["jobs"]["sweep"]
-
-
-def _lint_step() -> dict:
-    lint = [s for s in _sweep_job()["steps"] if "ruff check" in str(s.get("run", ""))]
-    assert len(lint) == 1, (
-        "expected exactly one `ruff check` step in the sweep job, found %d. The linter gate is "
-        "this step; deleting it leaves every assertion in this file passing over nothing." % len(lint)
+    path = _ROOT / ".github/workflows/lint.yml"
+    assert path.exists(), (
+        "`.github/workflows/lint.yml` is gone. It is the linter gate; if it was renamed, point "
+        "this test at the new file and make sure branch protection follows."
     )
-    return lint[0]
+    wf = yaml.safe_load(path.read_text())
+    job = wf["jobs"]["lint"]
+
+    for key in ("if", "continue-on-error"):
+        assert key not in job, (
+            "the `lint` job grew `%s: %r`. A skipped job reports SUCCESS to branch protection "
+            "and CI Entrypoint tolerates a skip, so this is a one-line bypass that leaves every "
+            "check green. Deleting the workflow would at least BLOCK the merge; this would not."
+            % (key, job.get(key))
+        )
+    for step in job["steps"]:
+        for key in ("if", "continue-on-error"):
+            assert key not in step, (
+                "step %r has `%s`; the same bypass one level down — a lint step that cannot "
+                "fail is not a gate." % (step.get("name") or step.get("uses"), key)
+            )
+
+    # The negative control is what distinguishes "green because the gate works" from "green
+    # because the gate is off". Losing it silently would be losing the point of the workflow.
+    names = [s.get("name") or s.get("uses") for s in job["steps"]]
+    assert any("PROVE" in str(n) for n in names), (
+        "the negative-control step is gone from lint.yml. Everything else in that job passes "
+        "just as happily when the linter is disabled; that step is the only thing that tells "
+        "the two apart. Steps present: %s" % names
+    )
+
+    # No `paths:` filter, or the check stops reporting on the PRs that need it and branch
+    # protection's "never reported = blocked" turns into "not expected = merged".
+    on = wf[True] if True in wf else wf["on"]
+    assert "pull_request" in on, "lint.yml must run on pull_request or it gates nothing"
+    assert not (on.get("pull_request") or {}).get("paths"), (
+        "lint.yml grew a `paths:` filter. Its entire design is that it always runs, so that a "
+        "job which stops reporting BLOCKS the merge; a path filter makes it legitimately absent "
+        "and the gate silently optional on exactly the PRs it is not watching."
+    )
 
 
-def test_THE_COMMAND_CI_RUNS_still_fails_on_an_undefined_name():
-    """THE ONE THAT MATTERS, and the gap the previous canary left wide open.
+def test_the_gate_tests_import_nothing_the_lint_job_does_not_install():
+    """The lint job installs requirements-dev.txt and NOTHING else, on purpose — application
+    dependencies are what make the sweep slow and fragile, and a gate job should have as few
+    reasons to fail as possible.
 
-    `test_ruff_ITSELF_still_reports_an_undefined_name` builds its OWN argv, so it is structurally
-    incapable of noticing what the workflow tells ruff to do. And the string assertions below
-    ("contains --ignore-noqa", "ends with .") constrain almost nothing. Five different edits to
-    that one `run:` line disabled the gate with all seventeen tests green:
+    That makes every import in these two files a dependency of the gate itself, and it has
+    already bitten twice: first the repo pytest ini naming `pydantic.warnings` (fixed with
+    `-c` and `--noconftest`), then this file importing `yaml` to read lint.yml — which passed
+    locally, where the whole application is installed, and failed in the one job that matters.
+    "Stdlib-only" stopped being true the moment a test read a workflow.
 
-        --config 'lint.ignore=["F821"]'   inline config beats ruff.toml, and is not ruff.toml
-        --exit-zero                       report everything, fail on nothing
-        ... tests/.                       still "ends with a dot"; lints one directory
-        ruff ... || echo deferred         plus a trailing line, so the step's exit code is echo's
-        # ruff check --ignore-noqa ...    the asserted flag, in a comment, on the line above
-
-    So this test stops reasoning about the command and RUNS it — the workflow's own `run:` body,
-    verbatim, against a planted canary. One probe catches all five.
-
-    The canary carries `# noqa: F821`, so dropping `--ignore-noqa` fails here too (verified: with
-    the flag ruff finds it, without the flag it does not).
-
-    It has to be a real file: `--stdin-filename` would not notice `tests/.`, which is the whole
-    point. The write is to the repository root, which no `per-file-ignores` entry covers, and it
-    is removed in a `finally` — this checkout is SHARED with other sessions and a stray file here
-    has been swept into an unrelated commit before."""
-    import subprocess
-
-    run = _lint_step()["run"]
-
-    # ONE CANARY AT ONE PATH PROVES NOTHING ABOUT THE OTHER TREES. The previous version planted a
-    # single file at the repository root, so every SCOPED narrowing passed it while production
-    # went unlinted -- measured, all green:
-    #     --exclude services,routes            (routes/ + services/ held 24 of the 36 findings)
-    #     --extend-exclude services
-    #     --config 'lint.per-file-ignores = {"services/*.py" = ["F821"], ...}'
-    #     --respect-gitignore                  (a CLI flag beats respect-gitignore=false in the file)
-    # That is `tests/.` one flag over. So the canary is planted in EACH tree the gate has to
-    # cover, one at a time, and the command must fail for every one of them.
-    trees = ["", "services", "routes", "scripts", "db", "jobs"]
-
-    # CI installs ruff with pip so it is on PATH; a local venv puts it beside the interpreter.
-    # Without this the command exits 127 (`ruff: command not found`) and the CONTROL below fails
-    # loudly -- which is how this was caught -- rather than the probe passing for the wrong reason.
-    import os
+    So the invariant is checked rather than remembered."""
+    import ast
     import sys
 
-    env = dict(os.environ)
-    env["PATH"] = str(pathlib.Path(sys.executable).parent) + os.pathsep + env.get("PATH", "")
+    declared = set()
+    for line in (_ROOT / "requirements-dev.txt").read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        declared.add(re.split(r"[<>=!\[;]", line)[0].strip().lower())
+    # Distribution name -> the module it provides, where they differ.
+    provides = {"pyyaml": "yaml", "pytest-asyncio": "pytest_asyncio"}
+    importable = {provides.get(d, d.replace("-", "_")) for d in declared}
 
-    def _run() -> int:
-        return subprocess.run(
-            ["bash", "-c", run], cwd=str(_ROOT), capture_output=True, text=True, env=env
-        ).returncode
-
-    paths = [(_ROOT / t / "zz_lint_canary_probe.py") for t in trees]
-    for c in paths:
-        assert not c.exists(), "%s already exists; refusing to clobber it" % c
-
-    def _cleanup() -> None:
-        for c in paths:
-            c.unlink(missing_ok=True)
-
-    try:
-        # CONTROL FIRST. If the command exits non-zero on a clean tree, every assertion below
-        # would pass for the wrong reason and this test would be measuring nothing. It has
-        # already earned its place: it caught this probe invoking a `ruff` that was not on PATH.
-        clean = _run()
-        assert clean == 0, (
-            "the CI lint command already fails on a clean tree (exit %s), so this test cannot "
-            "tell a working gate from a broken one. If you have an undefined name in your "
-            "working tree, that is the thing to fix. Command:\n%s" % (clean, run)
+    for name in ("test_lint_baseline_only_shrinks.py", "test_every_python_file_compiles.py"):
+        tree = ast.parse((_ROOT / "tests" / name).read_text())
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(a.name.split(".")[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+                imported.add(node.module.split(".")[0])
+        undeclared = sorted(
+            m for m in imported
+            if m not in sys.stdlib_module_names and m not in importable
         )
-        for tree, canary in zip(trees, paths):
-            canary.write_text(
-                "def zz_canary():\n    return totally_undefined_name(1)  # noqa: F821\n"
-            )
-            try:
-                rc = _run()
-            finally:
-                canary.unlink(missing_ok=True)
-            assert rc != 0, (
-                "THE GATE IS OFF FOR %s/. The exact command CI runs exited 0 with an undefined "
-                "name in that tree. A correct ruff.toml does not help if the COMMAND excludes "
-                "the directory, runs from another cwd, or scopes its rules. Command:\n%s"
-                % (tree or "<repo root>", run)
-            )
-    finally:
-        _cleanup()
-
-
-def test_ci_still_runs_ruff_over_the_whole_tree():
-    """Pins the invocation, not just the config it reads."""
-    lint = [_lint_step()]
-    assert len(lint) == 1, (
-        "expected exactly one `ruff check` step in the sweep job, found %d. The linter gate is "
-        "this step; deleting it leaves every assertion in this file passing over nothing." % len(lint)
-    )
-    run = lint[0]["run"]
-    assert "--ignore-noqa" in run, (
-        "--ignore-noqa is missing from `%s`. Without it a `# noqa: F821` on the line, or a "
-        "file-level `# ruff: noqa`, silences the gate — and no test here can see a comment in a "
-        "source file. The ruff.toml baseline is the one sanctioned way to carry a known name."
-        % run.strip()
-    )
-    assert run.strip().endswith("."), (
-        "the lint step must check the WHOLE tree (`ruff check ... .`), not a path list that can "
-        "quietly stop covering a directory; got `%s`" % run.strip()
-    )
-    assert "continue-on-error" not in lint[0], "a lint step that cannot fail is not a gate"
-
-
-def test_the_sweep_job_has_no_condition_that_can_skip_it():
-    """`CI Entrypoint` TOLERATES a skipped sweep by design — a job-level `if:` that evaluates
-    false makes the required check go green having run neither the linter, nor this ratchet, nor
-    the compile test. That is the seventh way to switch off a gate whose whole claim is that it
-    cannot be switched off, and it needs no edit to ruff.toml at all."""
-    job = _sweep_job()
-    # THE ALLOWLIST AGAIN, because `if:` was only the spelling I thought of. Measured against the
-    # entrypoint's own matcher, each of these drops `sweep` from the set of gates it enforces,
-    # with no `if:` anywhere and every test here green:
-    #   strategy: {matrix: …}        the check-run name gains a matrix suffix -> not derivable
-    #   strategy: {matrix: {s: []}}  WORST: zero job instances, and NO warning is emitted
-    #   name: … ${{ … }}             dynamic name -> not derivable
-    #   continue-on-error: true      at JOB level; the step-level check below does not see it
-    allowed = {"runs-on", "timeout-minutes", "steps"}
-    unknown = sorted(set(job) - allowed)
-    assert not unknown, (
-        "the sweep job grew key(s) %s. This job carries the linter, this ratchet and the compile "
-        "test, and `CI Entrypoint` cannot enforce a job whose check-run name it cannot derive — "
-        "a matrix or a dynamic `name:` silently removes it from the required set, and an EMPTY "
-        "matrix runs it zero times without even a warning. Decide what the key does to "
-        "enforcement, then add it here." % unknown
-    )
-    assert "if" not in job, (
-        "the sweep job grew `if: %r`. A false condition skips the linter, this ratchet and the "
-        "compile test, and the required check tolerates a skip — so the gate disappears with a "
-        "green tick. If a condition is genuinely needed, make CI Entrypoint enforce this job."
-        % job.get("if")
-    )
-    lint = [s for s in job["steps"] if "ruff check" in str(s.get("run", ""))]
-    assert "if" not in lint[0], (
-        "the lint STEP grew `if: %r`; same bypass one level down" % lint[0].get("if")
-    )
-
-
-def test_the_sweep_does_not_skip_the_gate_test_files():
-    """One line in the sweep's own pytest denylist deletes this ratchet.
-
-    `--ignore=tests/test_lint_baseline_only_shrinks.py` and the whole file stops running: the
-    baseline can then grow, ruff.toml can gain any key, and the lint step can be defanged, with
-    nothing to object. The FLOOR assertion cannot see it — it allows ~482 tests of slack against
-    ~16,182 executed, and this file is 15.
-
-    Same class as the bypass the lint-step pin closed, one file over: a gate that polices a
-    command nobody runs.
-    """
-    import shlex
-    import subprocess
-
-    step = [s for s in _sweep_job()["steps"] if s.get("id") == "sweep"]
-    assert len(step) == 1, "the sweep's pytest step (id: sweep) is gone or duplicated"
-    run = step[0]["run"]
-
-    # ASK PYTEST, DO NOT GREP THE STRING. The previous version looked for the literal filename on
-    # an --ignore/--ignore-glob/--deselect line, which a glob never contains and -k is not even
-    # on the list. Both of these dropped all 15 tests with the whole suite green:
-    #     --ignore-glob='tests/test_lint*'
-    #     -k 'not lint_baseline'
-    # A collection run answers the actual question -- "does the sweep still execute these?" --
-    # and is immune to however the exclusion is spelled, including a conftest `collect_ignore`.
-    argv = shlex.split(" ".join(
-        ln for ln in run.splitlines()
-        if ln.strip() and not ln.strip().startswith("#") and "set -o" not in ln
-    ).replace("\\", " "))
-    argv = [a for a in argv if a not in ("|", "tee", "sweep.log", "2>&1")]
-    argv = argv[argv.index("pytest") + 1:] if "pytest" in argv else argv
-    argv = [a for a in argv if not a.startswith("--junitxml") and a != "-q"]
-    argv = argv[:argv.index("2>&1")] if "2>&1" in argv else argv
-
-    proc = subprocess.run(
-        [__import__("sys").executable, "-m", "pytest", "--collect-only", "-q", *argv],
-        cwd=str(_ROOT), capture_output=True, text=True,
-    )
-    collected = proc.stdout
-    for name in ("tests/test_lint_baseline_only_shrinks.py", "tests/test_every_python_file_compiles.py"):
-        assert name in collected, (
-            "the sweep's own pytest invocation no longer COLLECTS %s.\n"
-            "These two files are what stops the linter being switched off; excluding them — by "
-            "--ignore, a glob, -k, a conftest collect_ignore, or moving the file — switches it "
-            "off one level up, and the FLOOR guard has ~482 tests of slack to hide 15 in.\n"
-            "argv used: %s\nstderr:\n%s" % (name, argv, proc.stderr[-1500:])
-        )
-
-
-def test_the_lint_step_and_its_neighbours_cannot_move_the_ground_under_it():
-    """`run:` IS NOT THE WHOLE COMMAND, which is the assumption the CI probe bakes in.
-
-    Measured, all green before this test existed:
-
-      * `working-directory: tests` on the lint step. The probe runs `bash -c run` from the repo
-        root, so it cannot see the step's own cwd; `ruff check … .` then lints `tests/` and
-        every production tree is unguarded. One added line.
-      * the same thing workflow-wide, via top-level `defaults: {run: {working-directory: …}}`.
-      * a PRECEDING step that puts a stub `ruff` on `$GITHUB_PATH`, or appends
-        `[lint] ignore = ["F821"]` to ruff.toml at runtime — the ratchet reads the file in git,
-        never the one ruff is handed.
-
-    So: the lint step may carry only a name and a command, no workflow-level or job-level `run`
-    defaults may exist, and the set of steps in this job is itself pinned. Adding a step to the
-    job that carries the gate is a reviewed act, not a quiet one."""
-    workflow = __import__("yaml").safe_load(_SWEEP.read_text())
-    job = workflow["jobs"]["sweep"]
-
-    allowed_step_keys = {"name", "run"}
-    # AND THE COMMAND ITSELF, EXACTLY. The canary probe proves the command still catches an
-    # undefined name in each tree, but it cannot see a flag that is inert TODAY and arms later:
-    # `--respect-gitignore` on the CLI overrides `respect-gitignore = false` in ruff.toml, does
-    # nothing until someone adds a source path to .gitignore, and then silently removes it from
-    # the gate. Scoped narrowings (`--exclude services,routes`, `--extend-exclude`, an inline
-    # `--config` of per-file-ignores) are caught by the per-tree canaries; this closes the whole
-    # class, including the next flag nobody has thought of. One line, pinned; changing it is a
-    # reviewed act.
-    expected_run = "ruff check --ignore-noqa --output-format=github ."
-    assert _lint_step()["run"].strip() == expected_run, (
-        "the lint command changed.\n  expected: %s\n  actual:   %s\n"
-        "Every ruff CLI flag can override ruff.toml, so the command is pinned rather than "
-        "pattern-matched. If the change is intended, update this string — and check the "
-        "per-tree canary probe still fails for services/, routes/, scripts/, db/ and jobs/."
-        % (expected_run, _lint_step()["run"].strip())
-    )
-
-    unknown = sorted(set(_lint_step()) - allowed_step_keys)
-    assert not unknown, (
-        "the lint step grew key(s) %s. `working-directory` alone points `ruff check .` at "
-        "another directory and leaves every production tree unlinted, and the CI probe runs the "
-        "`run:` body from the repository root so it cannot see it. Decide what the key does, "
-        "assert it, then allow it here." % unknown
-    )
-
-    for scope, obj in (("workflow", workflow), ("job", job)):
-        assert "defaults" not in obj, (
-            "%s-level `defaults` can set `run.working-directory` for every step, which moves the "
-            "linter's cwd without touching the lint step at all" % scope
-        )
-
-    # The steps of the job that carries the linter, this ratchet and the compile test.
-    expected_steps = [
-        "actions/checkout@v4",
-        "actions/setup-python@v5",
-        "actions/setup-node@v6",
-        "Run Shopify Web Pixel mapper contract",
-        "Install dependencies",
-        "Lint for names that cannot resolve",
-        "Run the uncovered suite",
-        "Assert the sweep actually ran",
-    ]
-    actual = [s.get("name") or s.get("uses") for s in job["steps"]]
-    assert actual == expected_steps, (
-        "the sweep job's steps changed:\n  expected %s\n  actual   %s\nA step inserted before "
-        "the linter can shim `ruff` onto $GITHUB_PATH or rewrite ruff.toml at runtime, and the "
-        "probe that runs the lint command cannot see either. If the change is legitimate, say so "
-        "by updating this list." % (expected_steps, actual)
-    )
-
-
-def test_the_sweep_still_triggers_on_python_and_on_the_lint_config():
-    """P3 ADDED `**/*.py` AND `ruff.toml` TO `paths:`; nothing stopped them being removed again.
-
-    `CI Entrypoint` derives what it expects from each workflow's own `on:`, and tolerates a
-    skipped job by design — so deleting a path filter does not fail anything, it just quietly
-    stops the gate being expected. Reducing `on:` to `workflow_dispatch` does the same, wholesale.
-    """
-    on = __import__("yaml").safe_load(_SWEEP.read_text())[True]
-    assert "pull_request" in on, (
-        "the sweep no longer runs on pull_request, so the linter gates nothing on a PR"
-    )
-    paths = on["pull_request"].get("paths") or []
-    for required in ("**/*.py", "*.py", "ruff.toml"):
-        assert required in paths, (
-            "`%s` is no longer in the sweep's paths. Without it a PR touching only those files "
-            "runs neither the linter nor the compile test, and the required check goes green "
-            "having enforced nothing — which is how the root modules and, before them, "
-            "dashboard/ and orchestrator/ went unwatched." % required
+        assert not undeclared, (
+            "tests/%s imports %s, which requirements-dev.txt does not declare. The lint job "
+            "installs only that file, so this passes locally — where the whole application is "
+            "installed — and fails the required check. Add it there, or use the stdlib."
+            % (name, undeclared)
         )

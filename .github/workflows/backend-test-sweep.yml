@@ -182,13 +182,11 @@ jobs:
       # still carrying a pre-existing undefined name are baselined in ruff.toml with a reason
       # each, and tests/test_lint_baseline_only_shrinks.py stops that list growing, stops a
       # second ruff config appearing, and stops the four other keys that switch the gate off.
-      - name: Lint for names that cannot resolve
-        # --ignore-noqa: a `# noqa: F821` or a file-level `# ruff: noqa` otherwise silences this
-        # with nothing watching. The baseline in ruff.toml is the ONE reviewed way to carry a
-        # known undefined name; a comment on the line is not, because nobody reads a diff for the
-        # absence of a lint error. Verified: the tree is clean under --ignore-noqa, so no existing
-        # suppression is load-bearing.
-        run: ruff check --ignore-noqa --output-format=github .
+      # The linter moved to .github/workflows/lint.yml, which has NO `paths:` filter and is
+      # meant to be a REQUIRED check. Running it here too would give one gate two owners that
+      # can disagree -- and this job is path-filtered and skippable, which is exactly the
+      # property the move exists to escape. The gate's own tests still run in the sweep below,
+      # and again in lint.yml, because they are stdlib-only and cost 0.5s.
 
       # THE QUARANTINE. Visible, justified, and meant to SHRINK.
       #
