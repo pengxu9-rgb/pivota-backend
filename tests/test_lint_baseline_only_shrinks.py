@@ -15,6 +15,7 @@ baseline, not about whether the code lints.
 from __future__ import annotations
 
 import pathlib
+import re
 import tomllib
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -173,6 +174,13 @@ def test_the_selected_rules_are_still_the_correctness_ones():
     """A later edit that drops F821 from `select` would make the whole gate vacuous while every
     test here still passed — the baseline would be silencing a rule that no longer runs."""
     select = tomllib.loads(_RUFF.read_text())["lint"]["select"]
+    # THE WHOLE LIST. Asserting only F821/F404/E9 let the other five be deleted silently: ruff
+    # still exits 1 on an undefined name, so the canary does not move and nothing else noticed.
+    # Correctness rules leave by review, not by omission.
+    assert set(select) == {"F821", "F404", "F822", "F823", "F702", "F704", "F706", "E9"}, (
+        "the selected rule set changed to %s. Adding is fine — say so here. REMOVING one is the "
+        "gate getting quietly narrower, which is what this file exists to prevent." % sorted(select)
+    )
     assert "F821" in select, "the rule the baseline exists for is no longer selected"
     # F404 is here because its ABSENCE let seven SyntaxErrors through the linter that was added to
     # stop them: a misplaced `from __future__` import parses fine, so only F404 objects.
@@ -284,11 +292,16 @@ def test_the_baseline_hides_exactly_the_nine_names_it_documents():
     import json
     import subprocess
 
+    # THE NAMES, not a tally. A count is blind to an offsetting edit: review fixed
+    # `_subject_from_product_key` (repointing it at the real `_subject_from_external_seed`) and
+    # appended a DIFFERENT undefined name in the same file, and the count test passed — one
+    # defect retired, one introduced, net zero, silently. What the baseline documents is these
+    # specific names.
     expected = {
-        "routes/agent_shop_gateway.py": 1,       # :14461 http_request
-        "routes/shopify_manual.py": 3,           # :51-53  store_info
-        "routes/shopify_setup.py": 4,            # :133-136 store_info
-        "services/pdp_governance_service.py": 1,  # :2747  _subject_from_product_key
+        "routes/agent_shop_gateway.py": ["http_request"],                    # :14461
+        "routes/shopify_manual.py": ["store_info"] * 3,                      # :51-53
+        "routes/shopify_setup.py": ["store_info"] * 4,                       # :133-136
+        "services/pdp_governance_service.py": ["_subject_from_product_key"],  # :2747
     }
     proc = subprocess.run(
         _ruff_argv() + [
@@ -303,12 +316,15 @@ def test_the_baseline_hides_exactly_the_nine_names_it_documents():
     found = {}
     for item in json.loads(proc.stdout or "[]"):
         rel = str(pathlib.Path(item["filename"]).resolve().relative_to(_ROOT))
-        found[rel] = found.get(rel, 0) + 1
-    assert found == expected, (
-        "the F821s hidden by the baseline are no longer the nine documented in ruff.toml.\n"
+        # "Undefined name `store_info`" — the identifier is what the baseline documents.
+        name = re.search(r"`([^`]+)`", item.get("message", ""))
+        found.setdefault(rel, []).append(name.group(1) if name else item.get("message", "?"))
+    found = {k: sorted(v) for k, v in found.items()}
+    assert found == {k: sorted(v) for k, v in expected.items()}, (
+        "the F821s hidden by the baseline are no longer the nine names documented in ruff.toml.\n"
         "  expected: %s\n  found:    %s\n"
-        "A file whose count went UP has a new undefined name that the whole-file exemption "
-        "silenced. A file whose count went DOWN is progress — lower the number here." % (
+        "A NEW name is a fresh defect that the whole-file exemption silenced. A name that is GONE "
+        "is progress — remove it here too, and from ruff.toml." % (
             sorted(expected.items()), sorted(found.items()))
     )
 
@@ -349,10 +365,80 @@ def _sweep_job() -> dict:
     return yaml.safe_load(_SWEEP.read_text())["jobs"]["sweep"]
 
 
+def _lint_step() -> dict:
+    lint = [s for s in _sweep_job()["steps"] if "ruff check" in str(s.get("run", ""))]
+    assert len(lint) == 1, (
+        "expected exactly one `ruff check` step in the sweep job, found %d. The linter gate is "
+        "this step; deleting it leaves every assertion in this file passing over nothing." % len(lint)
+    )
+    return lint[0]
+
+
+def test_THE_COMMAND_CI_RUNS_still_fails_on_an_undefined_name():
+    """THE ONE THAT MATTERS, and the gap the previous canary left wide open.
+
+    `test_ruff_ITSELF_still_reports_an_undefined_name` builds its OWN argv, so it is structurally
+    incapable of noticing what the workflow tells ruff to do. And the string assertions below
+    ("contains --ignore-noqa", "ends with .") constrain almost nothing. Five different edits to
+    that one `run:` line disabled the gate with all seventeen tests green:
+
+        --config 'lint.ignore=["F821"]'   inline config beats ruff.toml, and is not ruff.toml
+        --exit-zero                       report everything, fail on nothing
+        ... tests/.                       still "ends with a dot"; lints one directory
+        ruff ... || echo deferred         plus a trailing line, so the step's exit code is echo's
+        # ruff check --ignore-noqa ...    the asserted flag, in a comment, on the line above
+
+    So this test stops reasoning about the command and RUNS it — the workflow's own `run:` body,
+    verbatim, against a planted canary. One probe catches all five.
+
+    The canary carries `# noqa: F821`, so dropping `--ignore-noqa` fails here too (verified: with
+    the flag ruff finds it, without the flag it does not).
+
+    It has to be a real file: `--stdin-filename` would not notice `tests/.`, which is the whole
+    point. The write is to the repository root, which no `per-file-ignores` entry covers, and it
+    is removed in a `finally` — this checkout is SHARED with other sessions and a stray file here
+    has been swept into an unrelated commit before."""
+    import subprocess
+
+    run = _lint_step()["run"]
+    canary = _ROOT / "zz_lint_canary_probe.py"
+    assert not canary.exists(), "%s already exists; refusing to clobber it" % canary
+
+    # CI installs ruff with pip so it is on PATH; a local venv puts it beside the interpreter.
+    # Without this the command exits 127 (`ruff: command not found`) and the CONTROL below fails
+    # loudly -- which is how this was caught -- rather than the probe passing for the wrong reason.
+    import os
+    import sys
+
+    env = dict(os.environ)
+    env["PATH"] = str(pathlib.Path(sys.executable).parent) + os.pathsep + env.get("PATH", "")
+
+    def _run() -> int:
+        return subprocess.run(
+            ["bash", "-c", run], cwd=str(_ROOT), capture_output=True, text=True, env=env
+        ).returncode
+
+    try:
+        # CONTROL FIRST. If the command exits non-zero on a clean tree, the assertion below would
+        # pass for the wrong reason and this test would be measuring nothing.
+        clean = _run()
+        assert clean == 0, (
+            "the CI lint command already fails on a clean tree (exit %s), so this test cannot "
+            "tell a working gate from a broken one. Command:\n%s" % (clean, run)
+        )
+        canary.write_text("def zz_canary():\n    return totally_undefined_name(1)  # noqa: F821\n")
+        assert _run() != 0, (
+            "THE GATE IS OFF. The exact command CI runs exited 0 with an undefined name in the "
+            "tree. It is not enough that ruff.toml is correct or that the step exists — this is "
+            "the command, and it does not fail. Command:\n%s" % run
+        )
+    finally:
+        canary.unlink(missing_ok=True)
+
+
 def test_ci_still_runs_ruff_over_the_whole_tree():
     """Pins the invocation, not just the config it reads."""
-    steps = _sweep_job()["steps"]
-    lint = [s for s in steps if "ruff check" in str(s.get("run", ""))]
+    lint = [_lint_step()]
     assert len(lint) == 1, (
         "expected exactly one `ruff check` step in the sweep job, found %d. The linter gate is "
         "this step; deleting it leaves every assertion in this file passing over nothing." % len(lint)
@@ -377,6 +463,22 @@ def test_the_sweep_job_has_no_condition_that_can_skip_it():
     the compile test. That is the seventh way to switch off a gate whose whole claim is that it
     cannot be switched off, and it needs no edit to ruff.toml at all."""
     job = _sweep_job()
+    # THE ALLOWLIST AGAIN, because `if:` was only the spelling I thought of. Measured against the
+    # entrypoint's own matcher, each of these drops `sweep` from the set of gates it enforces,
+    # with no `if:` anywhere and every test here green:
+    #   strategy: {matrix: …}        the check-run name gains a matrix suffix -> not derivable
+    #   strategy: {matrix: {s: []}}  WORST: zero job instances, and NO warning is emitted
+    #   name: … ${{ … }}             dynamic name -> not derivable
+    #   continue-on-error: true      at JOB level; the step-level check below does not see it
+    allowed = {"runs-on", "timeout-minutes", "steps"}
+    unknown = sorted(set(job) - allowed)
+    assert not unknown, (
+        "the sweep job grew key(s) %s. This job carries the linter, this ratchet and the compile "
+        "test, and `CI Entrypoint` cannot enforce a job whose check-run name it cannot derive — "
+        "a matrix or a dynamic `name:` silently removes it from the required set, and an EMPTY "
+        "matrix runs it zero times without even a warning. Decide what the key does to "
+        "enforcement, then add it here." % unknown
+    )
     assert "if" not in job, (
         "the sweep job grew `if: %r`. A false condition skips the linter, this ratchet and the "
         "compile test, and the required check tolerates a skip — so the gate disappears with a "
@@ -386,4 +488,31 @@ def test_the_sweep_job_has_no_condition_that_can_skip_it():
     lint = [s for s in job["steps"] if "ruff check" in str(s.get("run", ""))]
     assert "if" not in lint[0], (
         "the lint STEP grew `if: %r`; same bypass one level down" % lint[0].get("if")
+    )
+
+
+def test_the_sweep_does_not_skip_the_gate_test_files():
+    """One line in the sweep's own pytest denylist deletes this ratchet.
+
+    `--ignore=tests/test_lint_baseline_only_shrinks.py` and the whole file stops running: the
+    baseline can then grow, ruff.toml can gain any key, and the lint step can be defanged, with
+    nothing to object. The FLOOR assertion cannot see it — it allows ~482 tests of slack against
+    ~16,182 executed, and this file is 15.
+
+    Same class as the bypass the lint-step pin closed, one file over: a gate that polices a
+    command nobody runs.
+    """
+    step = [s for s in _sweep_job()["steps"] if s.get("id") == "sweep"]
+    assert len(step) == 1, "the sweep's pytest step (id: sweep) is gone or duplicated"
+    run = step[0]["run"]
+    for name in ("test_lint_baseline_only_shrinks.py", "test_every_python_file_compiles.py"):
+        for flag in ("--ignore", "--ignore-glob", "--deselect"):
+            bad = [ln.strip() for ln in run.splitlines() if flag in ln and name in ln]
+            assert not bad, (
+                "the sweep excludes the lint gate's own tests via %s: %s. These two files are "
+                "what stops the linter being switched off; excluding them is switching it off "
+                "one level up." % (flag, bad)
+            )
+    assert "tests" in run.split(), (
+        "the sweep no longer passes `tests` to pytest, so the gate's own tests may not run at all"
     )

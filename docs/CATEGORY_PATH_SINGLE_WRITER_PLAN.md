@@ -40,18 +40,31 @@ re-mirror or brand re-onboard.
 | **ingest** | `catalog_sync_service.py:1506` (merchant webhook), `mirror_external_seeds_to_catalog_products.py:1599` (15-min, insert-only) | the only two lanes every product actually arrives through |
 | **ingest, unvalidated** | `catalog_enrichment_agent/apply.py:87` | one operator string per brand, free-form, overwrites on conflict |
 | **duplicate ingest, other language** | `sync-external-seeds-to-catalog.cjs:1863`, `sync-ulta-external-seeds-to-catalog.cjs:641` | re-implement the mirror in Node, with a sixth vocabulary of 25 hardcoded literals |
-| **repair** | `backfill_pdp_category_path.py`, `..._llm.py`, `run_pdp_label_agent.py`, `standardize_off_taxonomy_category_paths.py`, `reconcile-catalog-category-taxonomy.cjs`, `apply-reviewed-external-seed-category-patch.cjs`, one 2026-05 one-off | seven lanes that exist because the five above write wrong values |
+| **repair** | `backfill_pdp_category_path.py`, `..._llm.py`, `run_pdp_label_agent.py`, `standardize_off_taxonomy_category_paths.py`, `reconcile-catalog-category-taxonomy.cjs`, `apply-reviewed-external-seed-category-patch.cjs`, `reports/markato_expansion_status_20260524/wave12_apiceuticals_batch_20260525/apply_wave12_category_path_repair.cjs:299` (a 2026-05 one-off, in the Node repo) | seven lanes that exist because the five above write wrong values |
 
-Six of the twelve validate against **nothing**; three of those six overwrite on conflict. The six
-that do validate use four different in-repo constant sets, plus the Node sync's undeclared 25.
+Six of the twelve validate against **nothing**; **four** of those six overwrite on conflict —
+`apply.py:87`, both Node syncs, and the 2026-05 one-off, which was missed on the first count
+because it was the one writer left unnamed. The six that do validate use four different in-repo
+constant sets, plus TWO more in the Node repo: the syncs' 25 undeclared inline literals, and
+`beautyTaxonomy.js:37`'s `CANONICAL_CATEGORY_PATHS` (25 entries, which only the reconciler reads —
+neither sync requires the module). Four plus two is the "six vocabularies" above; an earlier
+version of this line listed five and contradicted its own headline.
 
 > **The count was 13 until review recounted it.** The table enumerated twelve and the prose said
 > thirteen, the repair row listed seven lanes and called itself nine, and "the four above" was
 > five. Every file:line in the table checks out — the arithmetic over them did not. In a document
 > whose whole argument is that the writer set is too large to reason about, the size of that set
 > is the load-bearing number, so: twelve writers, seven of them repair lanes, five of them
-> ingest-or-sync. Re-derived from the sixteen Python files that touch both `catalog_products` and
-> `category_path`; the nine not listed here (`backfill_resolved_vertical.py`,
+> ingest-or-sync. (A later pass corrected this correction twice more: the overwriter count above
+> was three and is four, and the vocabulary line totalled five against a headline of six. The
+> file:line references have survived every pass; the arithmetic over them has not.)
+>
+> Re-derived by reading the **47 non-test Python files** that touch `catalog_products`, plus the
+> Node repo. An earlier version of this paragraph said "sixteen", which was this note's own seven
+> writers plus nine named readers — the set I had already looked at, quoted as if it were the
+> search space. The conclusion survives the full sweep; understating the space searched by
+> threefold, in a document whose thesis is that the writer set is under-enumerated, is the wrong
+> error to make. The nine readers originally named (`backfill_resolved_vertical.py`,
 > `backfill_category_kind.py`, `source_pdp_content_repair.py`,
 > `onboard_external_brand_from_crawl.py`, `backfill_fashion_fields.py`,
 > `backfill_pdp_lifecycle_stage.py`, `backfill_brand_official_descriptions.py`,
@@ -104,8 +117,11 @@ cleanup takes as long as it takes.
   dependency across two repos and one data change. The existing drift invariant is the detector
   for getting that wrong.
 * **Writers that emit a rejected path start failing loudly.** That is the point, but
-  `sync-external-seeds-to-catalog.cjs:1806` wraps ~500 rows in one `BEGIN`, so one bad path aborts
-  the batch until it handles the error per row.
+  `sync-external-seeds-to-catalog.cjs:1803` wraps a whole batch in one `BEGIN`, so one bad path
+  aborts the batch until it handles the error per row. And the batch is normally EVERYTHING:
+  `normalizeBatchSize:90` returns 0 unless `--batch-size` is passed, and `chunkArray:96` then
+  returns a single chunk of all rows. 500 is the cap when a size IS given, not the default —
+  an earlier version of this line said "~500 rows" and understated the blast radius.
 * **`_upsert_by_pk`'s NULL-on-miss survives a FK** (NULL passes). Separate one-line fix at
   `catalog_sync_service.py:1532`.
 * **`INTENTIONALLY_DISTINCT` stops being a code review** and becomes a row-level decision: those
