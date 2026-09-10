@@ -1,7 +1,10 @@
 """ADR-012 Phase 0b — internal-consistency invariants for the serving surface.
 
-Each invariant is a Postgres count of rows where the SERVED state contradicts
-upstream truth. These are direct correctness checks, deliberately independent
+Most invariants are a Postgres count of rows where the SERVED state contradicts
+upstream truth. A few report a SHARE instead — `count` is then tenths of a
+percent, with the numerator and denominator in `detail`; those declare a
+`runner` and set `count_sql`/`sample_sql` to None, so a share is never restated
+in SQL where it could drift from the Python that computes it. These are direct correctness checks, deliberately independent
 of the completeness-style quality score (which has never caught this class:
 stale-served quarantined stores, shell PDPs, public rows with no offer).
 
@@ -70,43 +73,57 @@ _INTERIOR_NODES_SQL = ", ".join("'%s'" % node for node in sorted(_INTERIOR_NODES
 assert all(
     re.fullmatch(r"[a-z0-9/_-]+", path) for path in _TAXONOMY_PATHS
 ), "taxonomy leaf outside the safe alphabet; do not inline it into SQL"
-_LEAF_PATHS_SQL = ", ".join("'%s'" % path for path in sorted(_TAXONOMY_PATHS))
 
-# Recall's category prefix is EXACTLY the leaf's parent plus a slash — see
-# `category_path_prefix_for_query`, which returns 'beauty/makeup/lip/'. So a row
-# stored WITH that trailing slash ('beauty/makeup/lip/') satisfies
-# `LIKE 'beauty/makeup/lip/%'` directly (the % matches the empty string), earns
-# the +90 depth score, and is NOT handicapped — even though btrim()ing the
-# slash away makes it look like the interior node 'beauty/makeup/lip'.
-# Measured on prod 2026-09-09: ZERO rows are in that state, so this exclusion
-# changes no current number. It is here because the predicate should say what
-# it means, not because it moved the baseline.
-_INTERIOR_HANDICAP_SQL = """
-                cp.category_path IS NULL
-                OR btrim(cp.category_path) = ''
-                OR (
-                  lower(btrim(cp.category_path, '/')) IN (%s)
-                  AND NOT (
-                    cp.category_path LIKE '%%%%/'
-                    AND array_length(
-                          string_to_array(btrim(lower(cp.category_path), '/'), '/'), 1) = 3
-                  )
-                )
-""" % _INTERIOR_NODES_SQL
+# The prefixes RECALL ACTUALLY ASKS FOR. `category_path_prefix_for_query` returns the LEAF'S PARENT
+# plus a slash — 'beauty/makeup/lip/' for a lipstick query — and pivot_query_service.py:1144 tests
+# `p.category_path LIKE :category_path_prefix`. 23 of them.
+_LEAF_PARENTS = frozenset(
+    path.rsplit("/", 1)[0] if "/" in path else path for path in _TAXONOMY_PATHS
+)
 
-# STRICTLY WORSE than an interior node, and until 2026-09-09 invisible: a path
-# that is neither a real leaf nor an ancestor of one. `beauty/skincare/tone/
-# toner` (315 rows) against the real `beauty/skincare/treat/toner`;
-# `beauty/makeup/lips/lip-gloss` against `beauty/makeup/lip/gloss`. One wrong
-# segment. Such a row cannot match the hard prefix, AND #2122 cannot rescue it
-# either — that rule needs the stored path to be a strict ANCESTOR of the
-# prefix, and a sibling typo is not an ancestor. So it has no category recall at
-# all and falls back to the trigram text scan.
-_OFF_TAXONOMY_SQL = """
-                coalesce(btrim(cp.category_path), '') <> ''
-                AND lower(btrim(cp.category_path, '/')) NOT IN (%s)
-                AND lower(btrim(cp.category_path, '/')) NOT IN (%s)
-""" % (_INTERIOR_NODES_SQL, _LEAF_PATHS_SQL)
+# ⚠️ NO lower(), NO btrim(). THIS IS THE POINT, and round 2 of review is what taught it.
+#
+# The first version normalised the stored path before testing it. Recall does not: both doors are
+# case-sensitive and neither trims (`LIKE :prefix` at pivot_query_service.py:1144, and #2122's
+# `SUBSTR(:prefix, 1, LENGTH(path)+1) = path || '/'` at :1205-1208). So `Beauty/Makeup` has NO door
+# at all — not even #2122 — and a normalising check filed it under "degraded but rescuable", while a
+# mixed-case LEAF fell into no cohort whatsoever and was reported healthy. A detector that
+# normalises what the system under test does not is measuring a different system.
+#
+# Measured on prod 2026-09-09: ZERO rows are mixed-case, leading-slash or trailing-slash, so this
+# corrects no current number. It corrects the QUESTION, and the first writer to store 'Beauty/...'
+# now lands in the cohort that describes what actually happens to it.
+
+# 1. REACHABLE. The row satisfies some query's hard prefix directly and earns the +90 depth score.
+#    Tested exactly as recall tests it. Note this also admits a row DEEPER than a leaf
+#    ('beauty/makeup/lip/lip_oil'): it matches 'beauty/makeup/lip/%' and is reached. The first
+#    version called 98 such rows unreachable.
+# Built by CONCATENATION, never %-formatting. A LIKE pattern is the one place where writing the
+# SQL through `%` means writing `'%%%%'` to get one wildcard, and every later `%` on the composite
+# halves it again. Review found the first version reaching asyncpg as `LIKE '%%/'` — harmless, since
+# Postgres treats two wildcards as one, but it is a coin-flip away from matching nothing. No format
+# strings here, so the pattern in the source is the pattern that runs.
+_PREFIX_REACHABLE_SQL = "(" + " OR ".join(
+    "cp.category_path LIKE '" + parent + "/%'" for parent in sorted(_LEAF_PARENTS)
+) + ")"
+
+# 2. ANCESTOR-ONLY. Not reachable by prefix, but an exact strict ancestor of one, so #2122 can admit
+#    it IF the row's own text names the category — below every depth-matched competitor, because it
+#    never earns the +90. `_INTERIOR_NODES` is precisely that ancestor set.
+_ANCESTOR_SQL = "cp.category_path IN (" + _INTERIOR_NODES_SQL + ")"
+
+# 3. NO PATH. A DIFFERENT DOOR, which the first version wrongly folded in with the ancestors: a row
+#    with no path is not admitted by #2122 at all (that rule requires
+#    `NULLIF(TRIM(path),'') IS NOT NULL`). It reaches a query only through the brand-gated
+#    `missing_taxonomy` escape at pivot_query_service.py:1353. Different door, different fix,
+#    counted separately.
+_NO_PATH_SQL = "coalesce(btrim(cp.category_path), '') = ''"
+
+# 4. OFF-TAXONOMY. Neither reachable nor an ancestor: NO door at all.
+_UNREACHED_SQL = "NOT (" + _NO_PATH_SQL + ") AND NOT " + _PREFIX_REACHABLE_SQL
+_ANCESTOR_ONLY_SQL = _UNREACHED_SQL + " AND " + _ANCESTOR_SQL
+_OFF_TAXONOMY_SQL = _UNREACHED_SQL + " AND NOT " + _ANCESTOR_SQL
+
 
 # The canonical row->listing join, from services/identity_join_sql. Bound here
 # because Python 3.11 f-string replacement fields cannot span lines, and both
@@ -897,6 +914,26 @@ async def _run_taxonomy_share(db: Any, predicate: str, label: str) -> Dict[str, 
         """
         % (predicate, _SAMPLE_LIMIT)
     )
+    # THE WHOLE PARTITION, every run. A share is only interpretable next to the other buckets, and
+    # the sweep's `violated` log line carries `count` and the description but not much else — so a
+    # reader who sees 402 needs the numerator, the denominator, and what the other 60% are doing.
+    # It also makes the partition self-checking: these four are exhaustive and disjoint by
+    # construction, and `partition_total` says so out loud rather than leaving it to a test.
+    buckets = {}
+    for name, predicate in (
+        ("prefix_reachable", _PREFIX_REACHABLE_SQL + " AND NOT (" + _NO_PATH_SQL + ")"),
+        ("ancestor_only", _ANCESTOR_ONLY_SQL),
+        ("off_taxonomy", _OFF_TAXONOMY_SQL),
+        ("no_path", _NO_PATH_SQL),
+    ):
+        buckets[name] = int(
+            await db.fetch_val(
+                "SELECT count(*) AS c FROM catalog_products cp"
+                " JOIN index_pipeline_state ips ON ips.content_key = cp.content_key"
+                " WHERE ips.serving_eligible AND (%s)" % predicate
+            )
+            or 0
+        )
     return {
         "count": share_tenths,
         "sample_keys": [r["subject_key"] for r in rows],
@@ -907,16 +944,25 @@ async def _run_taxonomy_share(db: Any, predicate: str, label: str) -> Dict[str, 
             "serving_eligible_rows": total,
             "share_pct": None if total == 0 else round(100.0 * matched / total, 2),
             "serving_set_empty": total == 0,
+            "buckets": buckets,
+            "partition_total": sum(buckets.values()),
+            # If these disagree, the four predicates have stopped partitioning the serving set and
+            # every share on this page is describing an overlapping or incomplete population.
+            "partition_is_exhaustive": sum(buckets.values()) == total,
         },
     }
 
 
-async def _run_interior_node_share(db: Any) -> Dict[str, Any]:
-    return await _run_taxonomy_share(db, _INTERIOR_HANDICAP_SQL, "interior_or_null")
+async def _run_ancestor_only_share(db: Any) -> Dict[str, Any]:
+    return await _run_taxonomy_share(db, _ANCESTOR_ONLY_SQL, "ancestor_only")
 
 
 async def _run_off_taxonomy_share(db: Any) -> Dict[str, Any]:
     return await _run_taxonomy_share(db, _OFF_TAXONOMY_SQL, "off_taxonomy")
+
+
+async def _run_no_path_share(db: Any) -> Dict[str, Any]:
+    return await _run_taxonomy_share(db, _NO_PATH_SQL, "no_path")
 
 
 _CHECKS: List[Dict[str, Any]] = [
@@ -1866,110 +1912,105 @@ _CHECKS: List[Dict[str, Any]] = [
         "runner": _run_identity_provenance_share,
     },
     {
-        # A row filed on an INTERIOR taxonomy node is reachable, but only on the
-        # weaker of the two paths recall offers, and it is worth counting how
-        # much of the served catalogue depends on that.
+        # RECALL HAS FOUR DOORS AND THESE CHECKS COUNT WHO IS BEHIND WHICH ONE. Serving-eligible
+        # rows partition exhaustively into:
         #
-        # Recall binds a hard prefix — `beauty/makeup/lip/` for a "matte
-        # lipstick" query — and a row at the ancestor `beauty/makeup` cannot
-        # satisfy it directly. #2122 admits such a row anyway, on two
-        # conditions: its path is a strict ancestor of the prefix, AND its OWN
-        # TEXT carries a span that resolves to that category. The score is
-        # deliberately not raised ("admitted so it can compete, not promoted"),
-        # so it ranks below every row with a real depth match.
+        #   prefix_reachable  5,211  49.6%  matches a query prefix directly, earns the +90
+        #   ancestor_only     4,004  38.1%  #2122 only: needs the category word in its own text,
+        #                                   never earns the depth score, sorts behind every
+        #                                   depth-matched competitor
+        #   off_taxonomy        710   6.8%  NO door
+        #   no_path             584   5.6%  brand-gated `missing_taxonomy` escape only
+        #                    ------  -----
+        #                    10,509   100%   (measured on prod 2026-09-09; the runner re-checks
+        #                                     that the four still sum to the denominator)
         #
-        # Two consequences, both real and neither fatal:
-        #   1. reachability rests entirely on the row's TITLE. MAC's
-        #      "M·A·Cximal Silky Matte Lipstick" is admitted because it says
-        #      lipstick; a MAC row whose title does not name its category is
-        #      not.
-        #   2. it never earns the depth score, so it sorts behind depth-matched
-        #      competitors. Measured on prod 2026-09-09: "a long-wearing matte
-        #      lipstick" returns MAC's own flagship lipsticks on PAGE 2, below
-        #      Pixi, Tom Ford and Fenty. A caller that reads only page 1 sees
-        #      none of them.
-        #
-        # 4,588 of 10,509 serving-eligible rows (43.7%) are in this state, so
-        # nearly half the served catalogue is competing with a handicap it did
-        # not choose.
-        #
-        # ⚠️ AN EARLIER VERSION OF THIS CHECK WAS NAMED `..._but_unroutable` AND
-        # CLAIMED THESE ROWS "can never match". That was wrong, and wrong in the
-        # way this module exists to prevent: the claim came from reading page 1
-        # of a 33-result query and treating absence there as absence. Page 2 has
-        # them. Do not restate the stronger claim.
-        #
-        # A RATCHET, not a report. `warn_only` at threshold 0 would print the
-        # real number every run and alarm on nothing — a metric wearing a
-        # detector's name, which is the exact category error this check exists
-        # to catch. Enforcing at the MEASURED count instead: the cohort is
-        # tolerated, its growth is not.
-        #
-        # ⚠️ THIS WILL TRIP ON THE NEXT CURATED-BRAND INGEST, and that is
-        # intended. scripts/onboard_curated_brands stamps one --category across
-        # a whole storefront, so every row it writes lands on an interior node
-        # (PR #2158, parked). Onboarding a brand through that lane while it
-        # still does so should require a deliberate decision, not happen
-        # quietly. Lower the threshold as the taxonomy work converges; raising
-        # it is how a ratchet stops meaning anything.
-        "name": "serving_eligible_on_interior_taxonomy_node",
+        # ⚠️ THIS DOES NOT CLAIM ANY ROW IS UNREACHABLE. An earlier version did, and it was wrong in
+        # the way this module exists to prevent: the claim came from reading page 1 of a 33-result
+        # query. Page 2 had the rows. Every cohort above except off_taxonomy has a door; what they
+        # lack is the depth score.
+        "name": "serving_eligible_ancestor_only_taxonomy_node",
         "description": (
-            "SHARE (tenths of a percent) of serving-eligible rows whose "
-            "category_path is an INTERIOR taxonomy node or NULL — reachable "
-            "only via #2122 ancestor admission, which needs the category word "
-            "in the row's own text and never earns the depth score"
+            "SHARE (tenths of a percent) of serving-eligible rows whose category_path is a strict "
+            "ANCESTOR of a query prefix but does not match one — admitted only by #2122, which "
+            "needs the category word in the row's own text and never earns the depth score"
         ),
-        "env": "CATALOG_INVARIANT_INTERIOR_NODE_SHARE_TENTHS",
-        # Measured on prod 2026-09-09: 4,588 of 10,509 serving-eligible rows = 43.66% = 437 tenths.
-        # Enforcing at 450 (45.0%) — about 140 rows of headroom at today's denominator. Enough that
-        # ordinary promotion churn does not trip it, far less than a curated storefront ingest,
-        # which files hundreds of rows on a single interior node and moves the share several points.
-        "default_threshold": 450,
+        "env": "CATALOG_INVARIANT_ANCESTOR_ONLY_SHARE_TENTHS",
+        # Measured 2026-09-09: 4,004 of 10,509 = 38.10% = 381 tenths. Enforcing at 400 (40.0%).
+        #
+        # WHAT 400 ACTUALLY CATCHES, stated because the previous version promised something its
+        # number could not deliver. At today's denominator it trips when roughly 330 more rows land
+        # on an ancestor node. Concretely, against the curated ingests this lane has run:
+        #   Flower Beauty  49 rows -> 384   no trip
+        #   Stila         124 rows -> 388   no trip
+        #   Tarte         231 rows -> 394   no trip
+        #   315 rows (the toner cohort's size) -> 399   no trip, barely
+        # So it does NOT catch one small storefront, and claiming otherwise would be the third
+        # overclaim in this file's history. It catches a multi-hundred-row regression, or two
+        # storefronts back to back. A tighter number is not available: promoting ~100 ancestor rows
+        # is ordinary churn and moves this 7 tenths, so anything under ~390 would flap and get
+        # raised, which is how a ratchet dies. Lower it as #2158/#2159 converge the taxonomy.
+        "default_threshold": 400,
         # No count_sql/sample_sql: the share and its denominator are computed in Python and must not
         # be restated in SQL. Same shape as skus_without_merchant_issued_identity_share.
         "count_sql": None,
         "sample_sql": None,
-        "runner": _run_interior_node_share,
+        "runner": _run_ancestor_only_share,
     },
     {
-        # THE COHORT THE FIRST VERSION OF THIS CHECK COULD NOT SEE, and it is
-        # strictly worse than the one it did see. Review asked what happens to a
-        # path that is neither interior nor a leaf; the answer, measured on prod
-        # 2026-09-09, is 808 serving-eligible rows (7.7%) with NO category
-        # recall at all.
+        # THE ONLY COHORT WITH NO DOOR, and the one the first version of this work could not see.
+        # Review asked what happens to a path that is neither a leaf nor an ancestor of one.
         #
-        # They are one wrong segment from a real path:
-        #   beauty/skincare/tone/toner     315 rows  real: beauty/skincare/treat/toner
-        #   beauty/skincare/sets            49 rows
-        #   beauty/makeup/nails/nail-polish 37 rows
-        #   beauty/makeup/lips/lip-balm     12 rows  real: beauty/makeup/lip/balm
-        #   beauty/makeup/lips/lip-gloss     9 rows  real: beauty/makeup/lip/gloss
+        #   beauty/skincare/tone/toner       315 rows   real: beauty/skincare/treat/toner
+        #   beauty/skincare/sets              49 rows
+        #   beauty/makeup/nails/nail-polish   37 rows
+        #   beauty/skincare/eye-care          31 rows
+        #   beauty/makeup/lips/lip-balm       12 rows   real: beauty/makeup/lip/balm
+        #   beauty/makeup/lips/lip-gloss       9 rows   real: beauty/makeup/lip/gloss
         #
-        # An interior row at least has #2122: its path is a strict ANCESTOR of
-        # the query prefix, so if its own title names the category it is
-        # admitted (below the depth-matched rows, but present). A sibling typo
-        # is not an ancestor of anything, so that door is shut too. These rows
-        # reach a category query only if the trigram text scan happens to pick
-        # them up.
+        # One wrong segment. It cannot match the hard prefix, and #2122 cannot rescue it either —
+        # that rule needs the stored path to be a strict ANCESTOR of the prefix, and a sibling typo
+        # is not an ancestor. Category recall never returns it; it surfaces only if the trigram text
+        # scan happens to pick it up.
         #
-        # `onboard_curated_brands --category` does no validation against
-        # CATEGORY_PATTERNS, which is how a path like `beauty/skincare/tone/
-        # toner` gets written 315 times. Validating at the writer is the actual
-        # fix and belongs with #2158/#2159; this counts the cohort meanwhile so
-        # it cannot grow silently the way it grew to 808.
+        # `onboard_curated_brands --category` validates nothing against CATEGORY_PATTERNS, which is
+        # how one typo got written 315 times. Validating at the writer is the actual fix and belongs
+        # with #2158/#2159; this counts the cohort meanwhile so it cannot grow silently again.
         "name": "serving_eligible_off_taxonomy_path",
         "description": (
-            "SHARE (tenths of a percent) of serving-eligible rows on a "
-            "category_path that is NEITHER a taxonomy leaf NOR an ancestor of "
-            "one — no hard-prefix match and no #2122 ancestor admission, so no "
-            "category recall at all"
+            "SHARE (tenths of a percent) of serving-eligible rows on a category_path that is "
+            "NEITHER matched by a query prefix NOR a strict ancestor of one — no depth match and "
+            "no #2122 admission, so category recall never returns them"
         ),
         "env": "CATALOG_INVARIANT_OFF_TAXONOMY_SHARE_TENTHS",
-        # Measured on prod 2026-09-09: 808 of 10,509 = 7.69% = 77 tenths. Enforcing at 85 (8.5%).
-        "default_threshold": 85,
+        # Measured 2026-09-09: 710 of 10,509 = 6.76% = 68 tenths. Enforcing at 75 (7.5%), which
+        # trips on roughly 80 more rows — smaller than any of the typo cohorts above, so a newly
+        # mis-filed storefront does trip this one.
+        "default_threshold": 75,
         "count_sql": None,
         "sample_sql": None,
         "runner": _run_off_taxonomy_share,
+    },
+    {
+        # A DIFFERENT DOOR, which is why it is not folded in with the ancestors: #2122 explicitly
+        # requires `NULLIF(TRIM(p.category_path, '')) IS NOT NULL`, so a row with no path is not
+        # admitted by it at all. It reaches a query only through the brand-gated `missing_taxonomy`
+        # escape (pivot_query_service.py:1353) — i.e. only when the query names the brand.
+        #
+        # The first version counted these 584 rows inside the interior cohort and described the
+        # whole 4,588 as "reachable via #2122 ancestor admission". That was false for 584 of them.
+        "name": "serving_eligible_with_no_category_path",
+        "description": (
+            "SHARE (tenths of a percent) of serving-eligible rows with a NULL or blank "
+            "category_path — no prefix match and no #2122 admission (that rule requires a "
+            "non-empty path); reachable only through the brand-gated missing_taxonomy escape"
+        ),
+        "env": "CATALOG_INVARIANT_NO_CATEGORY_PATH_SHARE_TENTHS",
+        # Measured 2026-09-09: 584 of 10,509 = 5.56% = 56 tenths. Enforcing at 62 (6.2%).
+        "default_threshold": 62,
+        "count_sql": None,
+        "sample_sql": None,
+        "runner": _run_no_path_share,
     },
 ]
 
