@@ -1,0 +1,104 @@
+name: Lint
+
+# THE GATE THAT CANNOT BE SWITCHED OFF FROM INSIDE A PR — and why the previous attempt could.
+#
+# #2167 added this repository's first linter and, with it, ~550 lines of pytest asserting that
+# the linter could not be disabled. Five adversarial review passes each found a real, executed
+# bypass that left the whole suite green. That was not bad luck. The gate's behaviour is decided
+# at nine layers — ruff's rules, its config discovery, the argv, the step's cwd/PATH/env, the
+# job wiring, the trigger filter, pytest collection, the entrypoint's derivation, and branch
+# protection — and a pytest file can only model the first eight, all of which live inside the
+# write set of the PR being gated. Worse, three of those tests asserted the conditions under
+# which they themselves ran: violate one and the assertion is never evaluated. Every pass
+# allowlisted the layer where the last bypass was found, and the next pass moved one layer out.
+#
+# So this workflow stops modelling and relies on two things a PR cannot edit:
+#
+#   1. NO `paths:` FILTER, AND IT IS A REQUIRED CHECK. GitHub blocks a required check that never
+#      reports, but PASSES a job skipped by `if:`. That asymmetry is the whole design: deleting
+#      this workflow, renaming the job, giving it a matrix, computing its `name`, or adding a
+#      path filter all make `lint` stop reporting — and the PR is then blocked, with no test
+#      needed and nothing to enumerate. Those were six of the five passes' bypasses, closed by
+#      construction rather than by anticipation.
+#      ⚠️ This only holds while `lint` is in the branch's required contexts. It is NOT, as of
+#      this workflow's creation — only `CI Entrypoint` is, and that check derives what it
+#      expects from the PR head, so it cannot pin anything. gate-enforcement-audit.yml exists
+#      to fail daily until someone sets it, because a gate whose enforcement is unverified is
+#      the exact failure this repository keeps having.
+#
+#   2. A NEGATIVE CONTROL INSIDE THE JOB. The previous design's canary ran `bash -c` from a
+#      pytest process, so it could not see the step's cwd (`working-directory: tests` defeated
+#      it), the real PATH (a preceding step could shim `ruff`), or a scoped `--exclude`. This
+#      one plants a canary in each tree and runs THE SAME COMMAND IN THE SAME SHELL. It models
+#      no layer; it observes the deployed one.
+#
+# Deliberately tiny. A gate job should have zero degrees of freedom — the 631-line sweep is
+# where "one more key" hides.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lint-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # Pinned, and asserted pinned by tests/test_lint_baseline_only_shrinks.py. The gate's
+      # meaning is a function of the ruff version: 0.16 still honours the deprecated top-level
+      # `ignore` with a warning rather than an error, and a later one may not.
+      - name: Install the linter
+        run: pip install "ruff==0.16.6" "pytest==8.3.4"
+
+      - name: Lint for names that cannot resolve
+        run: ruff check --ignore-noqa .
+
+      # F404 is why this exists alongside ruff: a misplaced `from __future__` import PARSES
+      # fine, so seven uncompilable files once merged past the linter added to stop them. The
+      # rule is selected now, and this is the belt-and-braces that cannot be turned off from
+      # ruff.toml at all.
+      - name: Every Python file must still compile, and the baseline may only shrink
+        run: python -m pytest tests/test_every_python_file_compiles.py tests/test_lint_baseline_only_shrinks.py -q --no-header
+
+      # THE NEGATIVE CONTROL. Everything above can be green because the gate works, or because
+      # the gate is off. Only this distinguishes them, and it is the experiment nobody ran
+      # across five review passes.
+      #
+      # Per TREE, not one canary at one path: a scoped `--exclude services,routes` passed a
+      # root-only canary while the two directories holding 24 of the original 36 findings went
+      # unlinted. The canary carries `# noqa: F821`, so dropping `--ignore-noqa` fails here too.
+      - name: PROVE the linter still fails on an undefined name
+        run: |
+          set -uo pipefail
+          fail=0
+          for tree in . services routes scripts db jobs; do
+            canary="${tree}/zz_lint_canary_probe.py"
+            printf 'def zz_canary():\n    return totally_undefined_name(1)  # noqa: F821\n' > "$canary"
+            if ruff check --ignore-noqa . > /dev/null 2>&1; then
+              echo "::error::THE GATE IS OFF for ${tree}/ — ruff exited 0 with an undefined name there."
+              fail=1
+            else
+              echo "ok: an undefined name in ${tree}/ is still caught"
+            fi
+            rm -f "$canary"
+          done
+          # And the control: with every canary gone the same command must PASS, or the check
+          # above proves nothing (a command that always fails looks identical to a working gate).
+          if ! ruff check --ignore-noqa . > /dev/null 2>&1; then
+            echo "::error::the lint command fails on a clean tree; the probe above is meaningless."
+            fail=1
+          fi
+          exit "$fail"

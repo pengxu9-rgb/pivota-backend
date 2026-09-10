@@ -4,9 +4,17 @@
 
 ## The problem in one line
 
-`catalog_products.category_path` has **12 writers across two repositories, validating against six
-different vocabularies or none at all**, and seven of those writers exist only to repair what the
-other five wrote.
+`catalog_products.category_path` is written from **two repositories, by more lanes than anyone
+can hold in their head, validating against several different vocabularies or against nothing at
+all** — and most of those lanes exist only to repair what the others wrote.
+
+The exact counts are in [the table below](#the-writers), which is the only place they appear.
+That is deliberate, and it is the fifth version of this sentence: every `file:line` in this
+document has survived four review passes, while the numbers over them were wrong four times
+(13 writers over a table of 12; "nine repair lanes" listing seven; "three of six overwrite"
+that is four; a vocabulary line totalling five under a headline of six). The enumeration was
+never the problem. Re-typing an aggregate by hand, with nothing linking it to the list, was.
+A number that is not written twice cannot disagree with itself.
 
 ## Why patching a lane cannot work
 
@@ -33,16 +41,17 @@ check, the alias map, the invariant's predicate — and each improvement remaine
 another lane touched the row. The 245-row backfill of 2026-09-10 will be undone by the next seed
 re-mirror or brand re-onboard.
 
-## The 12 writers
+## The writers
+<a id="the-writers"></a>
 
 | kind | writers | what they are |
 |---|---|---|
 | **ingest** | `catalog_sync_service.py:1506` (merchant webhook), `mirror_external_seeds_to_catalog_products.py:1599` (15-min, insert-only) | the only two lanes every product actually arrives through |
 | **ingest, unvalidated** | `catalog_enrichment_agent/apply.py:87` | one operator string per brand, free-form, overwrites on conflict |
 | **duplicate ingest, other language** | `sync-external-seeds-to-catalog.cjs:1863`, `sync-ulta-external-seeds-to-catalog.cjs:641` | re-implement the mirror in Node, with a sixth vocabulary of 25 hardcoded literals |
-| **repair** | `backfill_pdp_category_path.py`, `..._llm.py`, `run_pdp_label_agent.py`, `standardize_off_taxonomy_category_paths.py`, `reconcile-catalog-category-taxonomy.cjs`, `apply-reviewed-external-seed-category-patch.cjs`, `reports/markato_expansion_status_20260524/wave12_apiceuticals_batch_20260525/apply_wave12_category_path_repair.cjs:299` (a 2026-05 one-off, in the Node repo) | seven lanes that exist because the five above write wrong values |
+| **repair** | `backfill_pdp_category_path.py`, `..._llm.py`, `run_pdp_label_agent.py`, `standardize_off_taxonomy_category_paths.py`, `reconcile-catalog-category-taxonomy.cjs`, `apply-reviewed-external-seed-category-patch.cjs`, `reports/markato_expansion_status_20260524/wave12_apiceuticals_batch_20260525/apply_wave12_category_path_repair.cjs:299` (a 2026-05 one-off, in the Node repo) | lanes that exist because the writers above write wrong values |
 
-Six of the twelve validate against **nothing**; **four** of those six overwrite on conflict —
+Six validate against **nothing**; **four** of those six overwrite on conflict —
 `apply.py:87`, both Node syncs, and the 2026-05 one-off, which was missed on the first count
 because it was the one writer left unnamed. The six that do validate use four different in-repo
 constant sets, plus TWO more in the Node repo: 25 undeclared inline literals in
@@ -53,27 +62,16 @@ validates against and `src/services/externalSeedProducts.js:90` also reads at se
 true statement is the narrower one, that neither SYNC requires the module. Four plus two is the
 "six vocabularies" above; a version of this line listed five and contradicted its own headline.
 
-> **The count was 13 until review recounted it.** The table enumerated twelve and the prose said
-> thirteen, the repair row listed seven lanes and called itself nine, and "the four above" was
-> five. Every file:line in the table checks out — the arithmetic over them did not. In a document
-> whose whole argument is that the writer set is too large to reason about, the size of that set
-> is the load-bearing number, so: twelve writers, seven of them repair lanes, five of them
-> ingest-or-sync. (A later pass corrected this correction twice more: the overwriter count above
-> was three and is four, and the vocabulary line totalled five against a headline of six. The
-> file:line references have survived every pass; the arithmetic over them has not.)
+> **THE COUNTS USED TO BE WRITTEN TWICE, AND THE SECOND COPY WAS WRONG FOUR TIMES.** The table
+> enumerated twelve while the prose said thirteen; the repair row listed seven lanes and called
+> itself nine; "the four above" was five; "three of those six overwrite" is four; and a
+> vocabulary line totalled five under a headline of six. Every `file:line` survived all of it.
 >
-> Re-derived by reading the **47 non-test Python files that touch both `catalog_products` and
-> `category_path`** (216 touch the table at all; 50 touch both, 47 outside `reports/`), plus the
-> Node repo. A previous version of this sentence fixed the number and dropped half the predicate
-> that produced it. An earlier version of this paragraph said "sixteen", which was this note's own seven
-> writers plus nine named readers — the set I had already looked at, quoted as if it were the
-> search space. The conclusion survives the full sweep; understating the space searched by
-> threefold, in a document whose thesis is that the writer set is under-enumerated, is the wrong
-> error to make. The nine readers originally named (`backfill_resolved_vertical.py`,
-> `backfill_category_kind.py`, `source_pdp_content_repair.py`,
-> `onboard_external_brand_from_crawl.py`, `backfill_fashion_fields.py`,
-> `backfill_pdp_lifecycle_stage.py`, `backfill_brand_official_descriptions.py`,
-> `agent_center_bd_report_service.py`, `db/catalog.py`) read the column or declare the table.
+> The counts now live in the table and nowhere else, so there is no second copy to disagree.
+> Re-derived by reading the **non-test Python files that touch both `catalog_products` and
+> `category_path`** (215 touch the table at all; 50 touch both; 3 of those 50 are under
+> `reports/`), plus the Node repo. An earlier version of this sentence quoted this note's own
+> writers-plus-named-readers as if it were the search space.
 
 Stamps with **no writer anywhere in either repo, on any branch**: `codex_review_v1` (225 serving
 rows), `regex_backfill_v2` (106), every `manual_*` (18). A writer-side fence cannot reach these.
@@ -96,10 +94,10 @@ constants, not a contract.
    webhook instead of being clobbered by it, and two conflicting repairs become two visible rows
    rather than a silent last-write-wins.
 3. **A foreign key** from the column to `category_taxonomy(path)`. This is the only point all
-   twelve writers pass through — including the ones nobody can find — so it is the only fence
+   every writer passes through — including the ones nobody can find — so it is the only fence
    that actually fences.
 
-The seven repair lanes stop being writers. Their logic becomes either a better classifier or an
+The repair lanes stop being writers. Their logic becomes either a better classifier or an
 override row.
 
 ## Migration
