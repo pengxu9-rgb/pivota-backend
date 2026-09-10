@@ -11,9 +11,9 @@ duration. A test that actually waited a second per assertion would be deleted th
 someone ran the suite.
 """
 
-from typing import Optional
 from __future__ import annotations
 
+from typing import Optional
 import asyncio
 from types import SimpleNamespace
 from typing import Any, Dict, List

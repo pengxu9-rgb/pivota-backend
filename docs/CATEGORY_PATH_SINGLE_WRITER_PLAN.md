@@ -76,7 +76,8 @@ override row.
 
 | phase | change | gate |
 |---|---|---|
-| **0** | linter in CI; `error_count` on the invariant runner, asserted zero over all of `_CHECKS` | none — do first, everything after is unverifiable without it |
+| **0** | linter in CI (+ a compile check no config can disable); `errored_count` on the invariant runner and in the sweep summary | none — do first, everything after is unverifiable without it |
+| **0b** | make the unit fake exercise every check, so `errored_count` is asserted zero over all of `_CHECKS`. It is **5 today** against `tests/test_catalog_invariant_checks.py`'s `FakeDb`, and that file is green | needs one shared DB fake; see the safety-net audit |
 | **1** | `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY (category_path) REFERENCES category_taxonomy(path) NOT VALID` | new writes gated immediately; existing rows untouched |
 | **2** | drain the backlog: 84 declared gaps, 21 gateway spellings with no backend entry, every unknown string → NULL, alias, or promoted leaf. Then `VALIDATE CONSTRAINT` | the drift invariant is the progress meter |
 | **3** | `category_path_overrides`; repoint the repair lanes at it; make the served value a COALESCE | |

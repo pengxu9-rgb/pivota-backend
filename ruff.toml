@@ -18,13 +18,31 @@ line-length = 120
 exclude = [".venv", "venv", "node_modules", ".git", "__pycache__", "build", "dist", ".claude"]
 
 [lint]
-# F821 undefined name   — the class that shipped
-# E9   syntax/IO errors  — a file that cannot be parsed at all
-select = ["F821", "E9"]
-# ⚠️ F811 (redefinition) IS NOT ON YET, and it should be next. Enabling it reports 83 findings,
-# 51 auto-fixable, almost all in tests — and a redefined test function is the "green over broken"
-# shape in its purest form: the first definition never runs and nothing says so. Left off only
-# because 83 fixes do not belong in the PR that introduces the linter. Turn it on next.
+# Rules for "this file is broken", not for style.
+#
+# F821 undefined name                  — the class that shipped
+# F404 late `from __future__` import   — SEE BELOW. Added after the first version of this PR
+#                                        introduced seven of them and this linter passed.
+# F822 undefined name in __all__
+# F823 local referenced before assignment
+# F702/F704/F706 continue/yield/return outside their construct
+# E9   I/O errors reading a file
+#
+# ⚠️ E9 IS NOT WHAT CATCHES AN UNPARSEABLE FILE, and the first version of this file claimed it
+# was. Ruff reports a genuine syntax error unconditionally, whatever is selected; E999 is not a
+# selectable rule in 0.16. And a misplaced `__future__` import is not a parse error at all — ruff
+# parses it happily. It is F404, which was not selected, which is how seven SyntaxErrors merged
+# past the linter introduced to stop exactly that. The belt-and-braces is
+# tests/test_every_python_file_compiles.py, which cannot be switched off from this file.
+select = ["F821", "F404", "F822", "F823", "F702", "F704", "F706", "E9"]
+# ⚠️ F811 (redefinition) IS NOT ON YET, and it is the highest-value thing to turn on next.
+# 83 findings, and an earlier version of this comment described them wrongly as "almost all in
+# tests". Measured: 75 in routes/, 3 in services/, 2 in main.py, 3 in tests/ — and ZERO redefined
+# test functions. The real population is duplicate ROUTE HANDLERS: `fulfill_amazon_order` is
+# defined twice in routes/admin_amazon_fulfillment.py (:78 and :559) on the same decorator path,
+# and there are ~27 more. Starlette serves the first registration, so the second definition is
+# dead production code that may have diverged from the one being served. Left off because 83
+# fixes do not belong in the PR that introduces the linter, but this is where the bodies are.
 
 [lint.per-file-ignores]
 # ⚠️ A BASELINE, NOT AN EXEMPTION. Each of these is a REAL undefined name that needs a decision
@@ -36,12 +54,6 @@ select = ["F821", "E9"]
 #   `request`). Wrapped in `except Exception: pass`, so traffic taxonomy has never been stamped on
 #   this route. Fix = add `http_request: Request` to the signature; needs a route-behaviour check.
 "routes/agent_shop_gateway.py" = ["F821"]
-# routes/shopify_manual.py, routes/shopify_setup.py — both build a `merchant_info` dict from
-#   `store_info.get(...)` after fetching `merchant = await get_merchant_onboarding(...)`. Every
-#   access is guarded `if merchant else None`, so the intent is clearly `merchant`, but the key
-#   names differ between the two callers and guessing them would swap one silent bug for another.
-"routes/shopify_manual.py" = ["F821"]
-"routes/shopify_setup.py" = ["F821"]
 # services/pdp_governance_service.py:2747 — `_subject_from_product_key` is not defined anywhere in
 #   the repository and never has been (since 0a08d8091, 2026-04-25). The sibling
 #   `_subject_from_external_seed` exists at :1059. Whether the call should be re-pointed at it or

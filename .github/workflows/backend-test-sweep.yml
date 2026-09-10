@@ -103,6 +103,10 @@ on:
       - 'infra/**'
       - 'main.py'
       - 'requirements*.txt'
+      # ruff.toml decides what the lint step even looks at. Without it here, a PR that touches
+      # ONLY the linter config never runs this workflow — so widening `exclude`, or adding
+      # `ignore = ["F821"]`, would land without the gate or its ratchet ever executing.
+      - 'ruff.toml'
       # Same shape, one directory over: tests/test_no_scheduled_workflow_reaches_cloud_sql.py
       # parses EVERY workflow off disk to stop a new scheduled lane from being
       # given a production DSN a GitHub runner cannot route to. Adding such a

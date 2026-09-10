@@ -1,6 +1,6 @@
-from typing import Mapping
 from __future__ import annotations
 
+from typing import Mapping
 import json
 from typing import Any, Dict, List
 
