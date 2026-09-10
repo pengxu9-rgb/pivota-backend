@@ -335,11 +335,6 @@ mkjob relgraph-sync "$GATEWAY_IMAGE" "$SA" \
   --task-timeout 14400s \
   --command npm --args "run,relgraph:sync-routine:cron"
 
-# The three CRITICAL_REASONS the retired workflow hardcoded. Bound to a variable because
-# --set-env-vars is itself comma-separated: the list is joined with `;` here and the script splits
-# on either separator, which is the only way to carry a multi-value list through this flag.
-RELGRAPH_CRITICAL_REASONS="ai_approved_dupe_quarantined;candidate_ref_unresolvable_nested_product_prefix;anchor_ref_unresolvable_nested_product_prefix"
-
 echo "== job: relgraph-health (was GH Actions cron 0 10 * * *)"
 # THE SECOND HALF OF THE 2026-08-25 MIGRATION, finished 2026-09-09.
 #
@@ -350,7 +345,9 @@ echo "== job: relgraph-health (was GH Actions cron 0 10 * * *)"
 # ⚠️ NOT "no signal at all" — an earlier version of this comment said that and it was false, in the
 # overclaiming way this whole change is meant to stop. `relgraph-sync` runs `serving_guard_audit`
 # itself, at 1% / 25 rows with critical-reason gating on by default
-# (run-relationship-graph-routine-job.js). That is real coverage. What this job adds is a TIGHTER
+# — the defaults live in run-relationship-graph-SYNC-routine.js:23-36, which forwards them;
+# run-relationship-graph-routine-job.js itself defaults them to null and gates only when
+# passed, so do not read that file alone and conclude the opposite. That is real coverage. What this job adds is a TIGHTER
 # gate (0 rows / 0%), the expiry alarm, and the no-op detector — the last being the one that would
 # have noticed relgraph-sync passing every day over a graph that gained nothing.
 #
@@ -366,12 +363,24 @@ echo "== job: relgraph-health (was GH Actions cron 0 10 * * *)"
 # detector, which catches the ledger passing while nothing is applied. Thresholds come through ENV
 # because gcloud splits --args on commas.
 #
-# EVERY THRESHOLD THE RETIRED WORKFLOW SET IS NAMED BELOW, even where the script already defaults to
-# the same value. Review found the first version of this block set neither the critical reasons nor
-# the expiry thresholds, so those checks would have run green having evaluated nothing — a job whose
-# purpose is to report exactly that, committing it. The script now defaults them too (#2171), so
-# these are belt and braces; the belt is that a reader of this file can see what is enforced without
-# opening another repo.
+# THE THRESHOLDS THE RETIRED WORKFLOW SET. Review found the first version of this block set neither
+# the critical reasons nor the expiry thresholds, so those checks would have run green having
+# evaluated nothing — a job whose purpose is to report exactly that, committing it.
+#
+# The two numeric ones are passed. THE CRITICAL-REASON LIST DELIBERATELY IS NOT, and passing it
+# would be strictly LESS safe. `--set-env-vars` is comma-separated, so a three-item list has to
+# travel joined by something else (`;`, or gcloud's `^DELIM^` form). PIVOTA-Agent's parser falls
+# back to its built-in three ONLY when the parsed list comes out EMPTY. A future image that split on
+# `,` alone would parse `a;b;c` as ONE bogus reason — length 1, so the fallback is bypassed, and the
+# check matches nothing and passes every run. Silently. Not passing it means the only path is the
+# script's own default, which cannot be mis-parsed. The list is written here so a reader of this
+# file still knows what is enforced:
+#
+#     ai_approved_dupe_quarantined
+#     candidate_ref_unresolvable_nested_product_prefix
+#     anchor_ref_unresolvable_nested_product_prefix
+#
+# To override, set RELGRAPH_CRITICAL_REASONS on the job by hand; the parser accepts `,` or `;`.
 #
 # RELGRAPH_FAIL_ON_NOOP is deliberately NOT set, so the no-op detector REPORTS in the execution log
 # and does not page. The serving-guard thresholds were already enforcing before the move and stay
@@ -381,11 +390,11 @@ echo "== job: relgraph-health (was GH Actions cron 0 10 * * *)"
 # Exit 1 = a threshold was breached, and that fails the execution and pages via the "prod: Cloud Run
 # job failing" alert policy, the same replacement for the GH failure email the sentinel uses. Exit 2
 # = the job itself failed. GATEWAY_TAG must be at or after PIVOTA-Agent #2171, which adds the script;
-# an older image fails with npm's `Missing script: relgraph:health-job` (not "Cannot find module" —
+# an older image fails with npm's `Missing script: "relgraph:health-job"` (not "Cannot find module" —
 # the entrypoint is `npm run`), twice, given --max-retries 1.
 mkjob relgraph-health "$GATEWAY_IMAGE" "$SA" \
   --set-secrets "DATABASE_URL=DATABASE_URL_NOVERIFY:latest" \
-  --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=relgraph-health,PIVOTA_COMMIT_SHA=$GATEWAY_TAG,DB_POOL_MAX=3,RELGRAPH_MARKET=US,RELGRAPH_MAX_SUPPRESSED_ROWS=0,RELGRAPH_MAX_SUPPRESSED_PCT=0,RELGRAPH_CRITICAL_REASONS=$RELGRAPH_CRITICAL_REASONS,RELGRAPH_MAX_EXPIRING_14D_PCT=30,RELGRAPH_MIN_TOTAL_ROWS=500" \
+  --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=relgraph-health,PIVOTA_COMMIT_SHA=$GATEWAY_TAG,DB_POOL_MAX=3,RELGRAPH_MARKET=US,RELGRAPH_MAX_SUPPRESSED_ROWS=0,RELGRAPH_MAX_SUPPRESSED_PCT=0,RELGRAPH_MAX_EXPIRING_14D_PCT=30,RELGRAPH_MIN_TOTAL_ROWS=500" \
   --task-timeout 1800s \
   --command npm --args "run,relgraph:health-job"
 
