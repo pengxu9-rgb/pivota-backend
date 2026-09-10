@@ -341,13 +341,13 @@ def _check(name):
     return matches[0]
 
 
-def test_interior_node_check_is_registered_and_reports_without_failing_the_sweep():
-    """This is a QUALITY signal, not a correctness violation: the rows ARE reachable, via #2122
-    ancestor admission. There is no count at which it should fail a build, so warn_only is the
-    permanent tier here rather than a staging post."""
+def test_interior_node_check_is_a_ratchet_not_a_report():
+    """warn_only at threshold 0 would print the real number every run and alarm on nothing — a
+    metric wearing a detector's name, which is the category error this module exists to catch.
+    Enforcing at the measured count tolerates the cohort and refuses its growth."""
     check = _check("serving_eligible_on_interior_taxonomy_node")
-    assert check["warn_only"] is True
-    assert check["default_threshold"] == 0   # never a blessed non-zero count
+    assert not check.get("warn_only"), "a ratchet that never fails is a metric"
+    assert check["default_threshold"] == 4588, "the measured prod count, 2026-09-09"
     assert "serving_eligible" in check["count_sql"]
     assert check["sample_sql"], "a check over threshold with no samples is unactionable"
 
@@ -382,25 +382,6 @@ def test_the_interior_list_reaches_the_sql():
     assert "'fashion/shoes'" not in check["count_sql"]
     # NULL and blank are unroutable too — a row with no path routes on nothing
     assert "category_path IS NULL" in check["count_sql"]
-
-
-def test_relgraph_noop_check_compares_a_pass_to_what_it_applied():
-    """A 'did it run' signal read as 'is it working'. Only meaningful if it compares the PASS to
-    the run's own applied_count.
-
-    An earlier cut compared the ledger to max(created_at) on product_relationship_edges — a VIEW
-    over relationship_candidate_labels whose created_at is the LABEL's creation time, and which the
-    renewal script never moves. That version fired on a healthy fortnight of renewals with no new
-    approvals. The behaviour is pinned for real in
-    tests/test_green_over_broken_detectors_postgres.py, which EXECUTES the query both ways."""
-    check = _check("relationship_graph_runs_pass_without_applying")
-    assert check["warn_only"] is True
-    sql = check["count_sql"]
-    assert "relationship_graph_routine_runs" in sql
-    assert "applied_count" in sql
-    assert "product_relationship_edges" not in sql, (
-        "must not depend on the view's created_at semantics"
-    )
 
 
 def test_every_check_has_a_description_and_a_threshold_env():

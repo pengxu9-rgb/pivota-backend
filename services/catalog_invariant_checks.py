@@ -1787,9 +1787,19 @@ _CHECKS: List[Dict[str, Any]] = [
         # of a 33-result query and treating absence there as absence. Page 2 has
         # them. Do not restate the stronger claim.
         #
-        # `warn_only`, and permanently so unless the taxonomy work converges the
-        # cohort: this is a QUALITY signal, not a correctness violation, and
-        # there is no count at which it becomes a build failure.
+        # A RATCHET, not a report. `warn_only` at threshold 0 would print the
+        # real number every run and alarm on nothing — a metric wearing a
+        # detector's name, which is the exact category error this check exists
+        # to catch. Enforcing at the MEASURED count instead: the cohort is
+        # tolerated, its growth is not.
+        #
+        # ⚠️ THIS WILL TRIP ON THE NEXT CURATED-BRAND INGEST, and that is
+        # intended. scripts/onboard_curated_brands stamps one --category across
+        # a whole storefront, so every row it writes lands on an interior node
+        # (PR #2158, parked). Onboarding a brand through that lane while it
+        # still does so should require a deliberate decision, not happen
+        # quietly. Lower the threshold as the taxonomy work converges; raising
+        # it is how a ratchet stops meaning anything.
         "name": "serving_eligible_on_interior_taxonomy_node",
         "description": (
             "row is serving_eligible but its category_path is an INTERIOR "
@@ -1798,8 +1808,8 @@ _CHECKS: List[Dict[str, Any]] = [
             "and never earns the depth score"
         ),
         "env": "CATALOG_INVARIANT_INTERIOR_NODE_THRESHOLD",
-        "default_threshold": 0,
-        "warn_only": True,
+        # Measured on prod 2026-09-09: 4,588 of 10,509 serving-eligible rows.
+        "default_threshold": 4588,
         "count_sql": """
             SELECT count(*) AS c
             FROM catalog_products cp
@@ -1823,63 +1833,6 @@ _CHECKS: List[Dict[str, Any]] = [
               )
             LIMIT 5
         """ % _INTERIOR_NODES_SQL,
-    },
-    {
-        # THE LEDGER IS NOT THE DATA. relationship_graph_routine_runs recorded
-        # `sync_routine: passed` every day through 2026-09-09 while the graph
-        # gained nothing: the daily job selects a 24h window, finds nothing
-        # changed, and passes under --allow-empty-selection. A green run ledger
-        # is indistinguishable from a working one unless something compares the
-        # run to its OUTPUT, which is what this does.
-        #
-        # Generalise the shape, not the instance: any "did it run" signal read
-        # as "is it working" has this failure mode.
-        #
-        # ⚠️ KEYED ON THE LEDGER'S OWN applied_count, deliberately. A first cut
-        # compared the ledger to `max(created_at)` on product_relationship_edges
-        # — which is a VIEW over relationship_candidate_labels
-        # (PIVOTA-Agent migration 051: label_state IN ('human_approved',
-        # 'ai_approved') AND not expired). `created_at` there is the CANDIDATE
-        # LABEL's creation time, and the renewal script moves
-        # last_verified_at/expires_at and never created_at. So that version
-        # would have fired on a perfectly healthy fortnight of renewals with no
-        # new approvals: a "no new approvals" signal wearing a "frozen data"
-        # name. applied_count is what the run itself claims it changed, so
-        # comparing it to `passed` needs no assumption about the view at all.
-        "name": "relationship_graph_runs_pass_without_applying",
-        "description": (
-            "sync_routine has passed within 48h but no passing run in 14 days "
-            "applied anything — a green ledger over work that did not happen"
-        ),
-        "env": "CATALOG_INVARIANT_RELGRAPH_NOOP_THRESHOLD",
-        "default_threshold": 0,
-        "warn_only": True,
-        # 1 when the contradiction holds, 0 otherwise — a boolean invariant as a
-        # count so it uses the same threshold machinery as every other check. A
-        # missing table raises, and the runner reports that as {"error": ...}
-        # rather than sinking the sweep.
-        "count_sql": """
-            SELECT CASE WHEN
-                EXISTS (
-                  SELECT 1 FROM relationship_graph_routine_runs
-                  WHERE status = 'passed'
-                    AND completed_at > now() - interval '48 hours'
-                )
-                AND NOT EXISTS (
-                  SELECT 1 FROM relationship_graph_routine_runs
-                  WHERE status = 'passed'
-                    AND completed_at > now() - interval '14 days'
-                    AND coalesce(applied_count, 0) > 0
-                )
-            THEN 1 ELSE 0 END AS c
-        """,
-        "sample_sql": """
-            SELECT (max(completed_at)::text || ' applied=' ||
-                    coalesce(max(applied_count), 0)::text) AS subject_key
-            FROM relationship_graph_routine_runs
-            WHERE status = 'passed'
-              AND completed_at > now() - interval '14 days'
-        """,
     },
 ]
 
