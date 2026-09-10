@@ -45,10 +45,13 @@ re-mirror or brand re-onboard.
 Six of the twelve validate against **nothing**; **four** of those six overwrite on conflict —
 `apply.py:87`, both Node syncs, and the 2026-05 one-off, which was missed on the first count
 because it was the one writer left unnamed. The six that do validate use four different in-repo
-constant sets, plus TWO more in the Node repo: the syncs' 25 undeclared inline literals, and
-`beautyTaxonomy.js:37`'s `CANONICAL_CATEGORY_PATHS` (25 entries, which only the reconciler reads —
-neither sync requires the module). Four plus two is the "six vocabularies" above; an earlier
-version of this line listed five and contradicted its own headline.
+constant sets, plus TWO more in the Node repo: 25 undeclared inline literals in
+`sync-external-seeds-to-catalog.cjs` (28 occurrences, 25 distinct — `sync-ulta-…` has NONE, and
+an earlier version of this line said "the syncs'", attributing to both), and
+`beautyTaxonomy.js:37`'s `CANONICAL_CATEGORY_PATHS`, 25 entries, which `reconcile-catalog-category-taxonomy.cjs`
+validates against and `src/services/externalSeedProducts.js:90` also reads at serve time — the
+true statement is the narrower one, that neither SYNC requires the module. Four plus two is the
+"six vocabularies" above; a version of this line listed five and contradicted its own headline.
 
 > **The count was 13 until review recounted it.** The table enumerated twelve and the prose said
 > thirteen, the repair row listed seven lanes and called itself nine, and "the four above" was
@@ -59,8 +62,10 @@ version of this line listed five and contradicted its own headline.
 > was three and is four, and the vocabulary line totalled five against a headline of six. The
 > file:line references have survived every pass; the arithmetic over them has not.)
 >
-> Re-derived by reading the **47 non-test Python files** that touch `catalog_products`, plus the
-> Node repo. An earlier version of this paragraph said "sixteen", which was this note's own seven
+> Re-derived by reading the **47 non-test Python files that touch both `catalog_products` and
+> `category_path`** (216 touch the table at all; 50 touch both, 47 outside `reports/`), plus the
+> Node repo. A previous version of this sentence fixed the number and dropped half the predicate
+> that produced it. An earlier version of this paragraph said "sixteen", which was this note's own seven
 > writers plus nine named readers — the set I had already looked at, quoted as if it were the
 > search space. The conclusion survives the full sweep; understating the space searched by
 > threefold, in a document whose thesis is that the writer set is under-enumerated, is the wrong
