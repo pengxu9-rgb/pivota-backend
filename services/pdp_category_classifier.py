@@ -123,7 +123,23 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         r"\b(cleanser|cleansing|face wash|facial wash|"
         r"cleansing milk|cleansing foam|cleansing gel|face wipes?|cleansing wipes?|wipes?|wash)\b",
         re.IGNORECASE)),
-    ("Toner", "beauty/skincare/treat/toner", re.compile(
+    # TONER GETS ITS OWN BUCKET, not a slot inside `treat/`. Two reasons, and they agree:
+    #
+    # 1. INDUSTRY STANDARD. Google Product Taxonomy 5976 and Shopify's standard taxonomy
+    #    hb-3-2-9-17 both put `Toners & Astringents` as a DIRECT CHILD of Skin Care — a sibling of
+    #    Facial Cleansers, Lotion & Moisturizer, Sunscreen, Skin Care Masks & Peels and Acne
+    #    Treatments & Kits. Neither nests it under a treatments node; in both, "treatments",
+    #    "masks" and "toners" are three peers.
+    # 2. RECALL. PIVOTA-Agent measured it (src/services/beautyTaxonomy.js): folding toner into
+    #    `treat/` puts it in one bucket with serum(520) + mask(421) + exfoliant(123), which is the
+    #    broad-bucket shape behind the 2026-07-31 junk recall.
+    #
+    # ⚠️ THIS MATCHES THE GATEWAY ON PURPOSE. PIVOTA-Agent has declared `tone/toner` canonical
+    # since 2026-08-04 and its browse leg queries `category_path LIKE 'beauty/skincare/tone/%'`,
+    # while this file named `treat/toner` and nothing here could reach the 315 prod rows sitting on
+    # the gateway's path. Two taxonomies over one column, each calling the other's rows corrupt.
+    # Do not retarget this leaf without changing beautyTaxonomy.js in the same breath.
+    ("Toner", "beauty/skincare/tone/toner", re.compile(
         r"\b(toner|tonic|mist|pad|skin booster)\b", re.IGNORECASE)),
     # Mask is SPLIT in two. Everything here names an unambiguous mask FORM, so
     # it wins over "essence" below: "Real Rice Essence Sheet Mask" is a mask.
