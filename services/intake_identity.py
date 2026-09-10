@@ -114,8 +114,35 @@ def canonical_gtin(value: Optional[str]) -> Optional[str]:
     malformed inputs through unchanged, so we drop those rather than store a
     junk match key (mirrors agent_pdp_view_assembler.pick_gtin13)."""
     from services.catalog_identity import normalize_gtin
+    from services.strong_identifier import normalize_strong_identifier
 
-    norm = normalize_gtin(value)
+    # DELEGATE to services.strong_identifier — do not re-implement.
+    #
+    # A previous version of this function grew its own `set(norm) == {"0"}`
+    # reject. That was a SECOND, WEAKER COPY of a rule this repo already had:
+    # `_normalize_digit_identifier` carries the identical all-zero idiom AND a
+    # length gate AND a placeholder list ("n/a", "none", "unknown", "-", "0").
+    #
+    # Weaker mattered. `normalize_gtin` zero-PADS to 14, so every short
+    # placeholder a supplier drops in a barcode field becomes a structurally
+    # valid GTIN-14:
+    #     '1'         -> '00000000000001'
+    #     '1234'      -> '00000000001234'
+    #     '123456789' -> '00000123456789'
+    # The bespoke guard caught only all-zeros and let the rest through into
+    # Tier-0 exact matching, which is GLOBAL by design (a GS1 GTIN identifies
+    # one physical product across every merchant) and ATTACHES rather than
+    # flags. Two merchants whose feeds both say `1` were measured attaching to
+    # each other's identity. The shared primitive's length gate {8,12,13,14}
+    # rejects the whole family.
+    #
+    # Note a check-digit test would NOT substitute: '00000000000000' is
+    # check-digit VALID, so the explicit all-zero reject is still required —
+    # which is exactly why it already lives in the shared helper.
+    si = normalize_strong_identifier(value, "gtin")
+    if si is None:
+        return None
+    norm = normalize_gtin(si.value)
     return norm if norm and len(norm) == 14 else None
 
 
@@ -465,7 +492,7 @@ async def resolve_or_attach_content_identity(
                         "matched_content_key": matched_ck,
                         "incoming_content_key": content_key,
                         "distinct_content_keys": sorted(c for c in distinct_cks if c),
-                        "deposit_basis": _deposit_basis(brand, title, gtin, matched_ck),
+                        "deposit_basis": _deposit_basis(brand, title, gtin14, matched_ck),
                     }
                     await _flag_review(
                         door, ctx, matched_ck, "gtin_match_brand_title_drift", detail
@@ -484,7 +511,7 @@ async def resolve_or_attach_content_identity(
                     detail={
                         **_base_detail(),
                         "matched_product_key": row.get("product_key"),
-                        "deposit_basis": _deposit_basis(brand, title, gtin, matched_ck),
+                        "deposit_basis": _deposit_basis(brand, title, gtin14, matched_ck),
                     },
                     gtin=gtin14, attach=_attach_info(row, merchant_id),
                 )
@@ -535,7 +562,7 @@ async def resolve_or_attach_content_identity(
                 detail={
                     **_base_detail(),
                     "matched_product_key": row.get("product_key"),
-                    "deposit_basis": _deposit_basis(brand, title, gtin, ck),
+                    "deposit_basis": _deposit_basis(brand, title, gtin14, ck),
                 },
                 gtin=gtin14, attach=_attach_info(row, merchant_id),
             )
@@ -578,7 +605,7 @@ async def resolve_or_attach_content_identity(
                             **_base_detail(),
                             "matched_product_key": row.get("product_key"),
                             "matcher_evidence": match.get("evidence"),
-                            "deposit_basis": _deposit_basis(brand, title, gtin, ck),
+                            "deposit_basis": _deposit_basis(brand, title, gtin14, ck),
                         },
                         gtin=gtin14, attach=_attach_info(row, merchant_id),
                     )
@@ -614,7 +641,7 @@ async def resolve_or_attach_content_identity(
                             **_base_detail(),
                             "matched_product_key": row.get("product_key"),
                             "matcher_evidence": match.get("evidence"),
-                            "deposit_basis": _deposit_basis(brand, title, gtin, ck),
+                            "deposit_basis": _deposit_basis(brand, title, gtin14, ck),
                         },
                         gtin=gtin14, attach=_attach_info(row, merchant_id),
                     )
@@ -675,7 +702,7 @@ async def resolve_or_attach_content_identity(
             door=door, merchant_ctx=ctx, gtin=gtin14,
             detail={
                 **_base_detail(),
-                "deposit_basis": _deposit_basis(brand, title, gtin, content_key),
+                "deposit_basis": _deposit_basis(brand, title, gtin14, content_key),
             },
         )
     except Exception as exc:  # noqa: BLE001 — fail-open: never block intake
