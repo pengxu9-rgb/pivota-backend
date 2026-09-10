@@ -409,7 +409,23 @@ class TestReportOnlyTier:
         #       no provenance marker at all, so an enforcing check would ship
         #       permanently red and a threshold raised to today's count would
         #       bless the exact rows that arc exists to fix.
-        expected = [CHECK_NAME, "skus_without_merchant_issued_identity_share"]
+        #   serving_eligible_but_unroutable             — 4,588 of 10,509
+        #       serving-eligible rows (43.7%) are filed on an INTERIOR taxonomy
+        #       node today, so prefix recall cannot reach them. The widened
+        #       category backfill is what converges the cohort; until it runs,
+        #       enforcing would ship permanently red and a threshold at 4,588
+        #       would bless every one of them.
+        #   relationship_graph_ledger_passes_over_frozen_data — fires TODAY
+        #       (returns 1). The remediation is not in this repo: the builder
+        #       lives in PIVOTA-Agent and its GitHub path has been failing with
+        #       ECONNRESET to prod Postgres since 2026-08-26. Reporting a
+        #       contradiction we cannot yet fix here is the whole point.
+        expected = [
+            CHECK_NAME,
+            "skus_without_merchant_issued_identity_share",
+            "serving_eligible_but_unroutable",
+            "relationship_graph_ledger_passes_over_frozen_data",
+        ]
         assert [c["name"] for c in _CHECKS if c.get("warn_only")] == expected
 
     @pytest.mark.asyncio

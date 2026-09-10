@@ -13,12 +13,14 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Any, Dict, List
 
 from sqlalchemy import Boolean, String, and_, column, func, not_, select, table
 
 from db.catalog import catalog_products
 from services.index_pipeline_state_service import QUALITY_SCORE_THRESHOLD
+from services.pdp_category_classifier import CATEGORY_PATTERNS
 from services.offer_currency_policy import is_quarantined_row
 from services.pdp_renderability import compile_pg, pdp_renderable_expression
 from services.identity_join_sql import identity_listing_lateral_sql
@@ -35,6 +37,32 @@ from services.source_quarantine import (
 logger = logging.getLogger(__name__)
 
 _SAMPLE_LIMIT = 5
+
+# --- routability, derived from the classifier's own taxonomy ------------------
+#
+# Recall binds a HARD PREFIX: a "matte lipstick" query resolves `beauty/makeup/lip/`, so a row
+# filed at `beauty/makeup` is an ANCESTOR of that prefix, not a descendant, and can never match
+# however good its content is. A row can therefore be `serving_eligible` and unreachable at the
+# same time, which is a state nothing in this repo could previously see — measured 2026-09-09,
+# 4,517 rows were in it.
+#
+# Routability is NOT a depth. `fashion/shoes` and `electronics/ereader` are 2-segment LEAVES that
+# route perfectly well, so the test is whether some canonical path strictly EXTENDS this one.
+# Derived from CATEGORY_PATTERNS rather than restated here, per the banner above _CHECKS: the
+# taxonomy lives in the classifier and a second copy would drift.
+_TAXONOMY_PATHS = frozenset(path for _label, path, _pattern in CATEGORY_PATTERNS)
+_INTERIOR_NODES = frozenset(
+    "/".join(path.split("/")[:i])
+    for path in _TAXONOMY_PATHS
+    for i in range(1, len(path.split("/")))
+)
+# Inlined as a literal list because these are compile-time constants from our own source, not
+# input: every value matches ^[a-z0-9/_-]+$, asserted below so a future taxonomy entry containing
+# a quote cannot turn this into injection.
+assert all(
+    re.fullmatch(r"[a-z0-9/_-]+", node) for node in _INTERIOR_NODES
+), "taxonomy node outside the safe alphabet; do not inline it into SQL"
+_INTERIOR_NODES_SQL = ", ".join("'%s'" % node for node in sorted(_INTERIOR_NODES))
 
 # The canonical row->listing join, from services/identity_join_sql. Bound here
 # because Python 3.11 f-string replacement fields cannot span lines, and both
@@ -1720,6 +1748,103 @@ _CHECKS: List[Dict[str, Any]] = [
         "count_sql": None,
         "sample_sql": None,
         "runner": _run_identity_provenance_share,
+    },
+    {
+        # GREEN OVER BROKEN. Every field this row exposes says healthy: it is
+        # serving_eligible, it has content, it passed quality. And recall binds
+        # a HARD PREFIX — `beauty/makeup/lip/` for a "matte lipstick" query —
+        # so a row filed at the ANCESTOR `beauty/makeup` can never match it.
+        # Eligible and unreachable at once, with no field that disagrees.
+        #
+        # Measured on prod 2026-09-09: a "matte lipstick" query returned 33
+        # products and NOT ONE of MAC's 286, Stila's 124, Tarte's 249,
+        # JUNGSAEMMOOL's 171 or MAKE UP FOR EVER's 74. 4,517 serving-eligible
+        # rows were in this state. Nothing in this repo could see it, because
+        # every existing signal was green.
+        #
+        # `warn_only` for the same reason market_currency_disagreement is: the
+        # cohort exists TODAY, so an enforcing check at 0 ships permanently
+        # red, and a threshold set to 4,517 blesses the exact rows the fix is
+        # for and hands the next writer that much head-room. PROMOTION IS ONE
+        # DELETED KEY — remove `warn_only` in the change that converges the
+        # cohort (the widened backfill); the threshold is already correct.
+        "name": "serving_eligible_but_unroutable",
+        "description": (
+            "row is serving_eligible but its category_path is an INTERIOR "
+            "taxonomy node (or NULL) — prefix recall can never reach it"
+        ),
+        "env": "CATALOG_INVARIANT_UNROUTABLE_THRESHOLD",
+        "default_threshold": 0,
+        "warn_only": True,
+        "count_sql": """
+            SELECT count(*) AS c
+            FROM catalog_products cp
+            JOIN index_pipeline_state ips ON ips.content_key = cp.content_key
+            WHERE ips.serving_eligible
+              AND (
+                cp.category_path IS NULL
+                OR btrim(cp.category_path) = ''
+                OR lower(btrim(cp.category_path, '/')) IN (%s)
+              )
+        """ % _INTERIOR_NODES_SQL,
+        "sample_sql": """
+            SELECT cp.product_key AS subject_key
+            FROM catalog_products cp
+            JOIN index_pipeline_state ips ON ips.content_key = cp.content_key
+            WHERE ips.serving_eligible
+              AND (
+                cp.category_path IS NULL
+                OR btrim(cp.category_path) = ''
+                OR lower(btrim(cp.category_path, '/')) IN (%s)
+              )
+            LIMIT 5
+        """ % _INTERIOR_NODES_SQL,
+    },
+    {
+        # THE LEDGER IS NOT THE DATA. relationship_graph_routine_runs recorded
+        # `sync_routine: passed` every day through 2026-09-09 while
+        # product_relationship_edges had not gained a row since 2026-06-11: the
+        # daily job selects a 24h window, finds nothing changed, and passes
+        # under --allow-empty-selection. A green run ledger over a frozen table
+        # is indistinguishable from a healthy one unless something compares
+        # them, which is what this does.
+        #
+        # Generalise the shape, not the instance: any "did it run" signal read
+        # as "is it working" has this failure mode.
+        #
+        # warn_only because the remediation is not in this repo — the builder
+        # lives in PIVOTA-Agent and its GitHub path has been failing with
+        # ECONNRESET to prod Postgres since 2026-08-26. This check is what makes
+        # that visible from the side that can see both tables.
+        "name": "relationship_graph_ledger_passes_over_frozen_data",
+        "description": (
+            "sync_routine has passed within 48h but product_relationship_edges "
+            "has not gained a row in 14 days — a green ledger over stale data"
+        ),
+        "env": "CATALOG_INVARIANT_RELGRAPH_FROZEN_THRESHOLD",
+        "default_threshold": 0,
+        "warn_only": True,
+        # 1 when the contradiction holds, 0 otherwise — a boolean invariant
+        # expressed as a count so it uses the same threshold machinery as the
+        # rest. A missing table raises, and the runner reports that as
+        # {"error": ...} rather than sinking the sweep.
+        "count_sql": """
+            SELECT CASE WHEN
+                EXISTS (
+                  SELECT 1 FROM relationship_graph_routine_runs
+                  WHERE status = 'passed'
+                    AND completed_at > now() - interval '48 hours'
+                )
+                AND NOT EXISTS (
+                  SELECT 1 FROM product_relationship_edges
+                  WHERE created_at > now() - interval '14 days'
+                )
+            THEN 1 ELSE 0 END AS c
+        """,
+        "sample_sql": """
+            SELECT max(created_at)::text AS subject_key
+            FROM product_relationship_edges
+        """,
     },
 ]
 

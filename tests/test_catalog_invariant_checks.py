@@ -330,3 +330,74 @@ async def test_a_failing_sample_fetch_does_not_erase_the_verdict_from_the_tally(
     # Both verdicts are in the total; the entries and the tally agree.
     assert report["violated_count"] == 2
     assert report["violated_count"] == sum(1 for c in report["checks"] if c.get("violated"))
+
+
+# --- green-over-broken detectors ---------------------------------------------------------------
+
+def _check(name):
+    from services.catalog_invariant_checks import _CHECKS
+    matches = [c for c in _CHECKS if c["name"] == name]
+    assert len(matches) == 1, "expected exactly one %r check, got %d" % (name, len(matches))
+    return matches[0]
+
+
+def test_unroutable_check_is_registered_and_reports_without_failing_the_sweep():
+    """The cohort exists TODAY (4,517 rows on 2026-09-09), so this must report its real number
+    without shipping permanently red. Promotion is one deleted key."""
+    check = _check("serving_eligible_but_unroutable")
+    assert check["warn_only"] is True
+    assert check["default_threshold"] == 0   # never a blessed non-zero count
+    assert "serving_eligible" in check["count_sql"]
+    assert check["sample_sql"], "a check over threshold with no samples is unactionable"
+
+
+def test_the_interior_node_list_is_derived_and_excludes_leaves():
+    """THE MECHANISM. If this list were empty the check would match nothing and look green
+    forever — the exact failure mode it exists to detect. And if it wrongly contained LEAVES,
+    the check would flag rows that route perfectly well.
+
+    Routability is not a depth: `fashion/shoes` and `electronics/ereader` are 2-segment leaves.
+    """
+    from services.catalog_invariant_checks import _INTERIOR_NODES, _TAXONOMY_PATHS
+
+    assert _INTERIOR_NODES, "empty interior set: the check would silently match nothing"
+    # interior nodes something extends
+    assert "beauty/makeup" in _INTERIOR_NODES
+    assert "beauty/makeup/lip" in _INTERIOR_NODES
+    assert "beauty" in _INTERIOR_NODES
+    # 2-segment LEAVES must be absent, or the check would flag routable rows
+    assert "fashion/shoes" in _TAXONOMY_PATHS
+    assert "fashion/shoes" not in _INTERIOR_NODES
+    assert "electronics/ereader" not in _INTERIOR_NODES
+    # no full leaf is ever an interior node
+    assert not (_TAXONOMY_PATHS & _INTERIOR_NODES)
+
+
+def test_the_interior_list_reaches_the_sql():
+    """Deriving the set is useless if the query does not use it."""
+    check = _check("serving_eligible_but_unroutable")
+    assert "'beauty/makeup'" in check["count_sql"]
+    assert "'beauty/makeup'" in check["sample_sql"]
+    assert "'fashion/shoes'" not in check["count_sql"]
+    # NULL and blank are unroutable too — a row with no path routes on nothing
+    assert "category_path IS NULL" in check["count_sql"]
+
+
+def test_relgraph_freshness_check_compares_the_ledger_to_the_data():
+    """A 'did it run' signal read as 'is it working'. The check is only meaningful if it reads
+    BOTH tables; one alone is the thing that was already green."""
+    check = _check("relationship_graph_ledger_passes_over_frozen_data")
+    assert check["warn_only"] is True
+    sql = check["count_sql"]
+    assert "relationship_graph_routine_runs" in sql
+    assert "product_relationship_edges" in sql
+    assert "status = 'passed'" in sql
+
+
+def test_every_check_has_a_description_and_a_threshold_env():
+    """Cheap structural guard: a check added without these is invisible in the sweep output."""
+    from services.catalog_invariant_checks import _CHECKS
+    for check in _CHECKS:
+        assert check.get("description"), check["name"]
+        assert check.get("env"), check["name"]
+        assert "default_threshold" in check, check["name"]
