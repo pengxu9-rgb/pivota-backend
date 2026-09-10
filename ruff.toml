@@ -15,6 +15,10 @@
 # resolve must not merge.
 
 line-length = 120
+# A .gitignore'd source file must still be linted. `respect-gitignore` defaults TRUE, so adding a
+# path to .gitignore silently removes it from the gate — a bypass with nothing watching it, since
+# .gitignore is not something a reviewer reads as lint config.
+respect-gitignore = false
 exclude = [".venv", "venv", "node_modules", ".git", "__pycache__", "build", "dist", ".claude"]
 
 [lint]
@@ -40,7 +44,7 @@ select = ["F821", "F404", "F822", "F823", "F702", "F704", "F706", "E9"]
 # tests". Measured: 75 in routes/, 3 in services/, 2 in main.py, 3 in tests/ — and ZERO redefined
 # test functions. The real population is duplicate ROUTE HANDLERS: `fulfill_amazon_order` is
 # defined twice in routes/admin_amazon_fulfillment.py (:78 and :559) on the same decorator path,
-# and there are ~27 more. Starlette serves the first registration, so the second definition is
+# and there are 21 more (22 decorated duplicates in total). Starlette serves the first registration, so the second definition is
 # dead production code that may have diverged from the one being served. Left off because 83
 # fixes do not belong in the PR that introduces the linter, but this is where the bodies are.
 

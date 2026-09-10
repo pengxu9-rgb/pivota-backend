@@ -107,6 +107,20 @@ on:
       # ONLY the linter config never runs this workflow — so widening `exclude`, or adding
       # `ignore = ["F821"]`, would land without the gate or its ratchet ever executing.
       - 'ruff.toml'
+      # The OTHER files that can change what the linter sees. A second ruff config anywhere in
+      # the tree takes precedence over ruff.toml (a root `.ruff.toml`) or captures a subtree (a
+      # nested `pyproject.toml`/`.ruff.toml`), and .gitignore used to be able to hide a source
+      # file from it. Each is a silent bypass if this workflow does not even run.
+      - '.ruff.toml'
+      - 'pyproject.toml'
+      - '**/pyproject.toml'
+      - '**/.ruff.toml'
+      - '.gitignore'
+      # Root modules with no directory prefix: openapi_config.py is imported by main.py:455 and
+      # proof_issuer_main.py is deployed by deploy-prod.yml, yet a PR touching only them ran
+      # neither the linter nor the compile test.
+      - '*.py'
+      - 'reports/**'
       # Same shape, one directory over: tests/test_no_scheduled_workflow_reaches_cloud_sql.py
       # parses EVERY workflow off disk to stop a new scheduled lane from being
       # given a production DSN a GitHub runner cannot route to. Adding such a
@@ -157,11 +171,17 @@ jobs:
       # never existed in this repository since 2026-04-25, inside a `try/except` that logs a
       # fallback. Neither is findable by pytest; both take ruff about two seconds.
       #
-      # Narrow on purpose — F821 + E9, no style rules. The four files still carrying a
-      # pre-existing undefined name are baselined in ruff.toml with a reason each, and
-      # tests/test_lint_baseline_only_shrinks.py stops that list growing.
+      # Narrow on purpose — eight "this file is broken" rules, no style rules. The four files
+      # still carrying a pre-existing undefined name are baselined in ruff.toml with a reason
+      # each, and tests/test_lint_baseline_only_shrinks.py stops that list growing, stops a
+      # second ruff config appearing, and stops the four other keys that switch the gate off.
       - name: Lint for names that cannot resolve
-        run: ruff check --output-format=github .
+        # --ignore-noqa: a `# noqa: F821` or a file-level `# ruff: noqa` otherwise silences this
+        # with nothing watching. The baseline in ruff.toml is the ONE reviewed way to carry a
+        # known undefined name; a comment on the line is not, because nobody reads a diff for the
+        # absence of a lint error. Verified: the tree is clean under --ignore-noqa, so no existing
+        # suppression is load-bearing.
+        run: ruff check --ignore-noqa --output-format=github .
 
       # THE QUARANTINE. Visible, justified, and meant to SHRINK.
       #

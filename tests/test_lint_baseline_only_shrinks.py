@@ -1,4 +1,4 @@
-"""The lint baseline is a ratchet: four files may still carry an undefined name, and no more.
+"""The lint baseline is a ratchet, and the only sanctioned way to carry a known undefined name.
 
 WHY. Adding a linter to a repository that never had one means either fixing everything at once or
 recording what is already broken. This repo recorded four files (ruff.toml `[lint.per-file-ignores]`),
@@ -19,6 +19,7 @@ import tomllib
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _RUFF = _ROOT / "ruff.toml"
+_SKIP_DIRS = {".venv", "venv", "node_modules", ".git", "__pycache__", "build", "dist", ".claude"}
 
 # The four files carrying a pre-existing undefined name on 2026-09-10. ONLY EVER REMOVE FROM THIS.
 # The two shopify entries went off this list and came back: an earlier version of this PR "fixed"
@@ -80,6 +81,24 @@ def test_the_gate_cannot_be_switched_off_from_the_config():
     config = tomllib.loads(_RUFF.read_text())
     lint = config.get("lint", {})
 
+    # Three more keys that switch the gate off from inside this very file, all of which the
+    # first version of this test ignored: a glob-keyed extend-per-file-ignores, a `builtins` list
+    # that declares the undefined name defined, and an `include` that narrows the file set to
+    # nothing Python.
+    for key in ("extend-per-file-ignores",):
+        for path, codes in (lint.get(key) or {}).items():
+            assert "F821" not in codes, "[lint].%s silences F821 for %s" % (key, path)
+    assert not config.get("builtins") and not lint.get("builtins"), (
+        "`builtins` declares names defined that are not; it makes F821 unable to fire"
+    )
+    assert not config.get("include"), (
+        "`include` narrows the file set; `[]` or a non-Python glob makes the gate scan nothing"
+    )
+    assert config.get("respect-gitignore") is False, (
+        "respect-gitignore must stay off: otherwise adding a source path to .gitignore removes "
+        "it from the gate, and .gitignore is not read as lint config by any reviewer"
+    )
+
     assert "F821" not in lint.get("ignore", []), (
         "`ignore` overrides `select`; F821 there makes the entire gate vacuous"
     )
@@ -102,6 +121,32 @@ def test_the_gate_cannot_be_switched_off_from_the_config():
     for key in ("exclude", "extend-exclude"):
         extra = sorted(set(lint.get(key, [])) - allowed_exclude)
         assert not extra, "[lint].%s adds %s; same bypass" % (key, extra)
+
+
+def test_ruff_toml_is_the_ONLY_ruff_config_in_the_tree():
+    """A SECOND config file beats this one, and this test never opens it.
+
+    Measured bypasses, all silent before this test existed: a root `.ruff.toml` (ruff prefers it
+    over `ruff.toml`, so a copy minus F821 disables the gate while every assertion here still
+    reads the untouched `ruff.toml`); a nested `services/.ruff.toml` or `services/pyproject.toml`
+    with its own `select`, which captures that whole subtree; and the existing
+    `integrations/commerce-agents/pyproject.toml` growing a `[tool.ruff]` table.
+
+    So the invariant is not "ruff.toml says the right thing" — it is "ruff.toml is the only thing
+    saying anything"."""
+    others = []
+    for path in _ROOT.rglob("*"):
+        if any(part in _SKIP_DIRS for part in path.parts):
+            continue
+        if path.name in {".ruff.toml"} or (path.name == "ruff.toml" and path != _RUFF):
+            others.append(str(path.relative_to(_ROOT)))
+        elif path.name == "pyproject.toml":
+            if "[tool.ruff" in path.read_text(encoding="utf-8", errors="ignore"):
+                others.append(str(path.relative_to(_ROOT)) + " ([tool.ruff])")
+    assert not others, (
+        "these files also configure ruff and take precedence over or narrow ruff.toml: %s. "
+        "One config, or the ratchet is guarding a file the linter no longer reads." % sorted(others)
+    )
 
 
 def test_no_baselined_path_is_also_excluded():
