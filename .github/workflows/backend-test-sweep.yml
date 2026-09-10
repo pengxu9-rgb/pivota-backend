@@ -120,6 +120,13 @@ on:
       # proof_issuer_main.py is deployed by deploy-prod.yml, yet a PR touching only them ran
       # neither the linter nor the compile test.
       - '*.py'
+      # AND EVERY OTHER .py, wherever it lands. The list above enumerates the 22 top-level
+      # packages that exist TODAY, which means a PR introducing a NEW one -- `api/`, `workers/`,
+      # an `alembic/versions/` tree -- matches no filter, runs neither the linter nor the compile
+      # test, and `CI Entrypoint` goes green having enforced nothing against it. Verified against
+      # the entrypoint's own matcher: `api/new_module.py` matched nothing before this line.
+      # Enumerating packages is the same hand-maintained-list failure this whole job replaced.
+      - '**/*.py'
       - 'reports/**'
       # Same shape, one directory over: tests/test_no_scheduled_workflow_reaches_cloud_sql.py
       # parses EVERY workflow off disk to stop a new scheduled lane from being

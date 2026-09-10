@@ -53,6 +53,17 @@ select = ["F821", "F404", "F822", "F823", "F702", "F704", "F706", "E9"]
 # this linter PR is not the place to make, and each is one small PR. The count is asserted in
 # tests/test_lint_baseline_only_shrinks.py so the list can only get shorter.
 #
+# ⚠️ AND `per-file-ignores` IS WHOLE-FILE. Two of these four are big and busy —
+# routes/agent_shop_gateway.py is 16,040 lines, services/pdp_governance_service.py 5,936 — so
+# naming them here exempts ~22,000 lines from F821 forever, not just the nine names below.
+# Measured in review: appending a brand-new function with an undefined name to
+# agent_shop_gateway.py left ruff green and every ratchet test passing.
+#
+# That hole is why `test_the_baseline_hides_exactly_the_nine_names_it_documents` exists: it
+# re-runs ruff with this table neutralised and asserts the findings are exactly the nine listed
+# below, per file. A tenth is a new defect wearing an old exemption, and it fails. The blanket is
+# a COUNT. Fixing any of the four is still the real answer, and the count only goes down.
+#
 # routes/agent_shop_gateway.py:14461 — `http_request.state.traffic_taxonomy = ...` inside
 #   `create_creator_task`, whose signature has no such parameter (it takes a pydantic body named
 #   `request`). Wrapped in `except Exception: pass`, so traffic taxonomy has never been stamped on

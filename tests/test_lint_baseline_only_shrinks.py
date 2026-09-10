@@ -91,7 +91,10 @@ def test_the_gate_cannot_be_switched_off_from_the_config():
     assert not config.get("builtins") and not lint.get("builtins"), (
         "`builtins` declares names defined that are not; it makes F821 unable to fire"
     )
-    assert not config.get("include"), (
+    # ⚠️ THIS WAS `assert not config.get("include")` AND `include = []` PASSED IT — the exact
+    # value the message names as the attack. `not []` is True. Presence is the invariant, not
+    # truthiness; `include = []` makes ruff report "No Python files found" and exit 0.
+    assert "include" not in config, (
         "`include` narrows the file set; `[]` or a non-Python glob makes the gate scan nothing"
     )
     assert config.get("respect-gitignore") is False, (
@@ -99,12 +102,17 @@ def test_the_gate_cannot_be_switched_off_from_the_config():
         "it from the gate, and .gitignore is not read as lint config by any reviewer"
     )
 
-    assert "F821" not in lint.get("ignore", []), (
-        "`ignore` overrides `select`; F821 there makes the entire gate vacuous"
-    )
-    assert not lint.get("extend-select-ignore") and not lint.get("extend-ignore"), (
-        "an extend-*-ignore of F821 has the same effect as `ignore`"
-    )
+    # BOTH SPELLINGS OF EACH. Ruff 0.16 still honours the deprecated TOP-LEVEL linter settings,
+    # emitting a warning and not an error — so `ignore = ["F821"]` on line 1 of ruff.toml makes
+    # the gate vacuous while a check that reads only `lint.ignore` sees nothing. Measured: ruff
+    # exits 0 with a live NameError in the tree, and every test in this file stayed green.
+    for table, label in ((lint, "[lint]."), (config, "top-level ")):
+        assert "F821" not in (table.get("ignore") or []), (
+            "%signore overrides `select`; F821 there makes the entire gate vacuous" % label
+        )
+        assert not table.get("extend-select-ignore") and not table.get("extend-ignore"), (
+            "%sextend-*-ignore of F821 has the same effect as `ignore`" % label
+        )
 
     # Exclusions are how a file leaves the gate WITHOUT appearing in the baseline. Pin the list
     # so widening it is a reviewed change, not a one-word edit.
@@ -172,3 +180,210 @@ def test_the_selected_rules_are_still_the_correctness_ones():
         "F404 was unselected once and seven uncompilable files merged green; it stays"
     )
     assert "E9" in select
+
+
+# --- the two MECHANISM-level guards, added after a third review pass ------------------------
+#
+# Everything above enumerates ruff keys BY NAME, and three passes of review have now found keys
+# the enumeration did not know about: `extend-per-file-ignores`, `builtins`, `include`,
+# `respect-gitignore`, the deprecated top-level `ignore`, and `extend`. Enumeration loses that
+# game by construction — ruff has more settings than this file can track, and each new one is a
+# silent bypass until someone thinks of it.
+#
+# So the two tests below do not name keys at all. They are the reason a fourth spelling does not
+# need to be guessed:
+#
+#   * the CANARY asks ruff itself whether an undefined name is still an error. It catches any
+#     setting that changes the VERDICT, whatever it is called — `extend` inheriting a `builtins`
+#     list, a top-level `ignore`, a rule set swapped wholesale.
+#   * the ALLOWLIST catches any setting that changes WHICH FILES are read. The canary is
+#     structurally blind to those (`--stdin-filename` bypasses file discovery, so `include = []`
+#     does not move it), and they are the more dangerous half: a file outside the gate has no
+#     findings to suppress.
+#
+# Neither subsumes the other, and both were measured against real bypasses before being written.
+
+
+def _ruff_argv() -> list:
+    import shutil
+    import sys
+
+    exe = shutil.which("ruff")
+    return [exe] if exe else [sys.executable, "-m", "ruff"]
+
+
+def test_ruff_ITSELF_still_reports_an_undefined_name():
+    """THE BEHAVIOURAL CHECK. Every other test here reads ruff.toml and reasons about it; this
+    one asks the linter.
+
+    `extend = "some-file.toml"` inherits every key ruff.toml does not set — including a
+    `builtins` list that declares the undefined name defined — from a file that can have ANY
+    name, so `test_ruff_toml_is_the_ONLY_ruff_config_in_the_tree` (which globs for three known
+    filenames) cannot see it. Measured: ruff exits 0 with a live NameError in the tree and all
+    eleven tests in this file pass. This one fails.
+
+    Uses `--stdin-filename` so nothing is written to the working tree: the checkout is shared,
+    and a stray canary file has been swept into an unrelated commit here before.
+    """
+    import subprocess
+
+    canary = "def f():\n    return totally_undefined_name(1)\n"
+    proc = subprocess.run(
+        _ruff_argv() + ["check", "--ignore-noqa", "--stdin-filename", "services/zz_lint_canary.py", "-"],
+        input=canary,
+        capture_output=True,
+        text=True,
+        cwd=str(_ROOT),
+    )
+    assert proc.returncode == 1 and "F821" in proc.stdout, (
+        "ruff did NOT report an undefined name under this repository's config. The gate is "
+        "vacuous however green it looks. ruff said (exit %s):\n%s\n%s"
+        % (proc.returncode, proc.stdout[-2000:], proc.stderr[-2000:])
+    )
+
+
+def test_ruff_toml_has_no_key_this_ratchet_has_not_CONSIDERED():
+    """THE ALLOWLIST, and the answer to whack-a-mole.
+
+    A denylist of dangerous keys is only as good as the last review; this inverts it. Any key not
+    listed here fails the test until someone decides what it does to the gate and adds it — which
+    is the reviewed act the ratchet exists to force.
+
+    It is what catches the FILE-SET bypasses the canary above cannot see, `include` and
+    `extend-exclude` among them, and it caught `extend` retroactively."""
+    config = tomllib.loads(_RUFF.read_text())
+    allowed_top = {"line-length", "respect-gitignore", "exclude", "lint"}
+    allowed_lint = {"select", "per-file-ignores"}
+
+    unknown = sorted(set(config) - allowed_top)
+    assert not unknown, (
+        "ruff.toml has top-level key(s) %s that no test in this file evaluates. Ruff has more "
+        "settings than a denylist can track — `extend` alone inherits EVERY unset key from a "
+        "file of any name, which defeats the only-one-config test. Decide what the key does to "
+        "the gate, assert it, and add it to `allowed_top` here." % unknown
+    )
+    unknown = sorted(set(config.get("lint", {})) - allowed_lint)
+    assert not unknown, (
+        "ruff.toml [lint] has key(s) %s that no test in this file evaluates; same reasoning as "
+        "above. Add an assertion, then add the key to `allowed_lint`." % unknown
+    )
+
+
+def test_the_baseline_hides_exactly_the_nine_names_it_documents():
+    """A whole-file `per-file-ignores` entry is blind to the NEXT undefined name in that file.
+
+    Two of the four baselined files are large and busy — `routes/agent_shop_gateway.py` is 16,040
+    lines and `services/pdp_governance_service.py` 5,936 — so the baseline currently exempts
+    ~22,000 lines from F821 forever, not just the nine names it documents. Measured: appending a
+    brand-new function with an undefined name to `agent_shop_gateway.py` left ruff green and
+    every test here passing.
+
+    So the baseline is a COUNT, not a blanket. Lifting `[lint.per-file-ignores]` must yield
+    exactly these nine findings; a tenth is a new defect wearing an old exemption. When one is
+    fixed the number here goes down, which is the same ratchet direction as the file list."""
+    import json
+    import subprocess
+
+    expected = {
+        "routes/agent_shop_gateway.py": 1,       # :14461 http_request
+        "routes/shopify_manual.py": 3,           # :51-53  store_info
+        "routes/shopify_setup.py": 4,            # :133-136 store_info
+        "services/pdp_governance_service.py": 1,  # :2747  _subject_from_product_key
+    }
+    proc = subprocess.run(
+        _ruff_argv() + [
+            "check", "--ignore-noqa", "--select", "F821", "--output-format", "json",
+            # Neutralise ONLY the baseline; everything else about the config stands.
+            "--config", "lint.per-file-ignores = {}",
+            *expected,
+        ],
+        capture_output=True, text=True, cwd=str(_ROOT),
+    )
+    assert proc.returncode in (0, 1), "ruff failed to run: %s" % proc.stderr[-2000:]
+    found = {}
+    for item in json.loads(proc.stdout or "[]"):
+        rel = str(pathlib.Path(item["filename"]).resolve().relative_to(_ROOT))
+        found[rel] = found.get(rel, 0) + 1
+    assert found == expected, (
+        "the F821s hidden by the baseline are no longer the nine documented in ruff.toml.\n"
+        "  expected: %s\n  found:    %s\n"
+        "A file whose count went UP has a new undefined name that the whole-file exemption "
+        "silenced. A file whose count went DOWN is progress — lower the number here." % (
+            sorted(expected.items()), sorted(found.items()))
+    )
+
+
+def test_the_ruff_version_is_pinned():
+    """The gate's meaning is a function of the ruff version. 0.16 still honours the deprecated
+    top-level `ignore` with a warning; a later one may not, and a later one may change what
+    `select` covers. `ruff>=` is a one-character edit that makes the gate mean something
+    different on a day nobody touched it."""
+    import re
+
+    req = (_ROOT / "requirements-dev.txt").read_text()
+    lines = [ln.strip() for ln in req.splitlines() if re.match(r"^\s*ruff\b", ln)]
+    assert len(lines) == 1, "expected exactly one ruff requirement, got %s" % lines
+    assert re.match(r"^ruff==\d+\.\d+\.\d+$", lines[0]), (
+        "ruff must be pinned with `==` (got %r): the linter's version decides what the gate "
+        "catches, and requirements-dev.txt is what CI installs before running it" % lines[0]
+    )
+
+
+# --- the gate has to actually RUN ------------------------------------------------------------
+#
+# Everything above this line polices ruff.toml. None of it noticed that the CI step invoking ruff
+# could simply be deleted: measured, removing the whole `Lint for names that cannot resolve` step
+# left every test in this file and in test_every_python_file_compiles.py green. So did dropping
+# the single word `--ignore-noqa`, which silently restores the `# noqa: F821` bypass a previous
+# review pass found and which is proven load-bearing (with a `# noqa: F821` appended to a source
+# file: with the flag ruff finds 1 error, without it "All checks passed").
+#
+# A ratchet on the config of a step that no longer exists is decoration.
+
+_SWEEP = _ROOT / ".github/workflows/backend-test-sweep.yml"
+
+
+def _sweep_job() -> dict:
+    import yaml
+
+    return yaml.safe_load(_SWEEP.read_text())["jobs"]["sweep"]
+
+
+def test_ci_still_runs_ruff_over_the_whole_tree():
+    """Pins the invocation, not just the config it reads."""
+    steps = _sweep_job()["steps"]
+    lint = [s for s in steps if "ruff check" in str(s.get("run", ""))]
+    assert len(lint) == 1, (
+        "expected exactly one `ruff check` step in the sweep job, found %d. The linter gate is "
+        "this step; deleting it leaves every assertion in this file passing over nothing." % len(lint)
+    )
+    run = lint[0]["run"]
+    assert "--ignore-noqa" in run, (
+        "--ignore-noqa is missing from `%s`. Without it a `# noqa: F821` on the line, or a "
+        "file-level `# ruff: noqa`, silences the gate — and no test here can see a comment in a "
+        "source file. The ruff.toml baseline is the one sanctioned way to carry a known name."
+        % run.strip()
+    )
+    assert run.strip().endswith("."), (
+        "the lint step must check the WHOLE tree (`ruff check ... .`), not a path list that can "
+        "quietly stop covering a directory; got `%s`" % run.strip()
+    )
+    assert "continue-on-error" not in lint[0], "a lint step that cannot fail is not a gate"
+
+
+def test_the_sweep_job_has_no_condition_that_can_skip_it():
+    """`CI Entrypoint` TOLERATES a skipped sweep by design — a job-level `if:` that evaluates
+    false makes the required check go green having run neither the linter, nor this ratchet, nor
+    the compile test. That is the seventh way to switch off a gate whose whole claim is that it
+    cannot be switched off, and it needs no edit to ruff.toml at all."""
+    job = _sweep_job()
+    assert "if" not in job, (
+        "the sweep job grew `if: %r`. A false condition skips the linter, this ratchet and the "
+        "compile test, and the required check tolerates a skip — so the gate disappears with a "
+        "green tick. If a condition is genuinely needed, make CI Entrypoint enforce this job."
+        % job.get("if")
+    )
+    lint = [s for s in job["steps"] if "ruff check" in str(s.get("run", ""))]
+    assert "if" not in lint[0], (
+        "the lint STEP grew `if: %r`; same bypass one level down" % lint[0].get("if")
+    )

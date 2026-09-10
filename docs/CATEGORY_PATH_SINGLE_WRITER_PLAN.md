@@ -4,9 +4,9 @@
 
 ## The problem in one line
 
-`catalog_products.category_path` has **13 writers across two repositories, validating against six
-different vocabularies or none at all**, and nine of those writers exist only to repair what the
-other four wrote.
+`catalog_products.category_path` has **12 writers across two repositories, validating against six
+different vocabularies or none at all**, and seven of those writers exist only to repair what the
+other five wrote.
 
 ## Why patching a lane cannot work
 
@@ -33,17 +33,29 @@ check, the alias map, the invariant's predicate — and each improvement remaine
 another lane touched the row. The 245-row backfill of 2026-09-10 will be undone by the next seed
 re-mirror or brand re-onboard.
 
-## The 13 writers
+## The 12 writers
 
 | kind | writers | what they are |
 |---|---|---|
 | **ingest** | `catalog_sync_service.py:1506` (merchant webhook), `mirror_external_seeds_to_catalog_products.py:1599` (15-min, insert-only) | the only two lanes every product actually arrives through |
 | **ingest, unvalidated** | `catalog_enrichment_agent/apply.py:87` | one operator string per brand, free-form, overwrites on conflict |
 | **duplicate ingest, other language** | `sync-external-seeds-to-catalog.cjs:1863`, `sync-ulta-external-seeds-to-catalog.cjs:641` | re-implement the mirror in Node, with a sixth vocabulary of 25 hardcoded literals |
-| **repair** | `backfill_pdp_category_path.py`, `..._llm.py`, `run_pdp_label_agent.py`, `standardize_off_taxonomy_category_paths.py`, `reconcile-catalog-category-taxonomy.cjs`, `apply-reviewed-external-seed-category-patch.cjs`, one 2026-05 one-off | nine lanes that exist because the four above write wrong values |
+| **repair** | `backfill_pdp_category_path.py`, `..._llm.py`, `run_pdp_label_agent.py`, `standardize_off_taxonomy_category_paths.py`, `reconcile-catalog-category-taxonomy.cjs`, `apply-reviewed-external-seed-category-patch.cjs`, one 2026-05 one-off | seven lanes that exist because the five above write wrong values |
 
-Six of the thirteen validate against **nothing**; three of those six overwrite on conflict. The six
+Six of the twelve validate against **nothing**; three of those six overwrite on conflict. The six
 that do validate use four different in-repo constant sets, plus the Node sync's undeclared 25.
+
+> **The count was 13 until review recounted it.** The table enumerated twelve and the prose said
+> thirteen, the repair row listed seven lanes and called itself nine, and "the four above" was
+> five. Every file:line in the table checks out — the arithmetic over them did not. In a document
+> whose whole argument is that the writer set is too large to reason about, the size of that set
+> is the load-bearing number, so: twelve writers, seven of them repair lanes, five of them
+> ingest-or-sync. Re-derived from the sixteen Python files that touch both `catalog_products` and
+> `category_path`; the nine not listed here (`backfill_resolved_vertical.py`,
+> `backfill_category_kind.py`, `source_pdp_content_repair.py`,
+> `onboard_external_brand_from_crawl.py`, `backfill_fashion_fields.py`,
+> `backfill_pdp_lifecycle_stage.py`, `backfill_brand_official_descriptions.py`,
+> `agent_center_bd_report_service.py`, `db/catalog.py`) read the column or declare the table.
 
 Stamps with **no writer anywhere in either repo, on any branch**: `codex_review_v1` (225 serving
 rows), `regex_backfill_v2` (106), every `manual_*` (18). A writer-side fence cannot reach these.
@@ -66,10 +78,10 @@ constants, not a contract.
    webhook instead of being clobbered by it, and two conflicting repairs become two visible rows
    rather than a silent last-write-wins.
 3. **A foreign key** from the column to `category_taxonomy(path)`. This is the only point all
-   thirteen writers pass through — including the ones nobody can find — so it is the only fence
+   twelve writers pass through — including the ones nobody can find — so it is the only fence
    that actually fences.
 
-The nine repair lanes stop being writers. Their logic becomes either a better classifier or an
+The seven repair lanes stop being writers. Their logic becomes either a better classifier or an
 override row.
 
 ## Migration
