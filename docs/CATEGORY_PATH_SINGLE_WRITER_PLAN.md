@@ -8,13 +8,18 @@
 can hold in their head, validating against several different vocabularies or against nothing at
 all** — and most of those lanes exist only to repair what the others wrote.
 
-The exact counts are in [the table below](#the-writers), which is the only place they appear.
-That is deliberate, and it is the fifth version of this sentence: every `file:line` in this
-document has survived four review passes, while the numbers over them were wrong four times
-(13 writers over a table of 12; "nine repair lanes" listing seven; "three of six overwrite"
-that is four; a vocabulary line totalling five under a headline of six). The enumeration was
-never the problem. Re-typing an aggregate by hand, with nothing linking it to the list, was.
-A number that is not written twice cannot disagree with itself.
+The lanes are enumerated in [the table below](#the-writers). **Count them there rather than
+trusting a number in this prose** — every `file:line` in this document has survived five review
+passes, while the aggregates over them were wrong four times (13 writers over a table of 12;
+"nine repair lanes" listing seven; "three of six overwrite" that is four; a vocabulary line
+totalling five under a headline of six). The enumeration was never the problem. Re-typing an
+aggregate by hand, with nothing linking it to the list, was.
+
+The headline counts are gone for that reason. Some aggregates below are still hand-written
+(which of the lanes validate against nothing, which overwrite, the file populations) because
+they are not derivable from the table alone — a fifth pass caught the previous version of this
+paragraph claiming the de-duplication was total when it was partial. Treat any number in prose
+as a claim; the table and the `file:line` references are the record.
 
 ## Why patching a lane cannot work
 
@@ -69,8 +74,9 @@ true statement is the narrower one, that neither SYNC requires the module. Four 
 >
 > The counts now live in the table and nowhere else, so there is no second copy to disagree.
 > Re-derived by reading the **non-test Python files that touch both `catalog_products` and
-> `category_path`** (215 touch the table at all; 50 touch both; 3 of those 50 are under
-> `reports/`), plus the Node repo. An earlier version of this sentence quoted this note's own
+> `category_path`** (re-measured 2026-09-10 over tracked files: 215 touch the table at all, 50 touch
+> both, and 3 of those 50 are under `reports/`, so 47 outside it — an earlier count said 216,
+> the difference being untracked scratch files in the shared checkout), plus the Node repo. An earlier version of this sentence quoted this note's own
 > writers-plus-named-readers as if it were the search space.
 
 Stamps with **no writer anywhere in either repo, on any branch**: `codex_review_v1` (225 serving

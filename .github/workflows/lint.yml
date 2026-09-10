@@ -20,6 +20,15 @@ name: Lint
 #      path filter all make `lint` stop reporting — and the PR is then blocked, with no test
 #      needed and nothing to enumerate. Those were six of the five passes' bypasses, closed by
 #      construction rather than by anticipation.
+#      ⚠️ THE OTHER HALF OF THAT ASYMMETRY IS THE REMAINING HOLE, and saying so is the point:
+#      a job SKIPPED by `if:` reports Success, and CI Entrypoint tolerates a skip by design
+#      (ci-entrypoint.yml). So `if: false` on this job is a one-line, fully-green bypass that
+#      NOTHING here closes by construction. tests/test_lint_baseline_only_shrinks.py asserts
+#      against it — soundly this time, because that test asserts properties of a DIFFERENT file
+#      than the job it runs in, and it also runs in the sweep. Disabling the gate now takes
+#      disabling two jobs, which is conspicuous rather than impossible. In-job content is closed
+#      by REVIEW, not by construction; a CODEOWNERS entry on .github/workflows/ is what would
+#      make that a mechanism, and this repo has neither CODEOWNERS nor required approvals.
 #      ⚠️ This only holds while `lint` is in the branch's required contexts. It is NOT, as of
 #      this workflow's creation — only `CI Entrypoint` is, and that check derives what it
 #      expects from the PR head, so it cannot pin anything. gate-enforcement-audit.yml exists
@@ -57,11 +66,14 @@ jobs:
         with:
           python-version: '3.11'
 
-      # Pinned, and asserted pinned by tests/test_lint_baseline_only_shrinks.py. The gate's
-      # meaning is a function of the ruff version: 0.16 still honours the deprecated top-level
-      # `ignore` with a warning rather than an error, and a later one may not.
+      # FROM requirements-dev.txt, not a second literal. The first version wrote
+      # `pip install ruff==0.16.6` here while `test_the_ruff_version_is_pinned` asserted the pin
+      # in requirements-dev.txt -- two copies, one asserted, free to diverge, and the gate tests
+      # shell out to whichever `ruff` is on PATH. That is "one gate, two owners that disagree",
+      # committed in the file whose comment says the move avoids exactly that. The file is three
+      # lines and pulls in no application dependencies.
       - name: Install the linter
-        run: pip install "ruff==0.16.6" "pytest==8.3.4"
+        run: pip install -r requirements-dev.txt
 
       - name: Lint for names that cannot resolve
         run: ruff check --ignore-noqa .
@@ -82,7 +94,7 @@ jobs:
           python -m pytest \
             tests/test_every_python_file_compiles.py \
             tests/test_lint_baseline_only_shrinks.py \
-            -q --no-header -c /tmp/gate-pytest.ini --noconftest -p no:cacheprovider
+            -q --no-header -c /tmp/gate-pytest.ini --rootdir=. --noconftest -p no:cacheprovider
 
       # THE NEGATIVE CONTROL. Everything above can be green because the gate works, or because
       # the gate is off. Only this distinguishes them, and it is the experiment nobody ran
@@ -95,9 +107,25 @@ jobs:
         run: |
           set -uo pipefail
           fail=0
-          for tree in . services routes scripts db jobs; do
+          # DERIVED, not a hand-written list. The first version probed six trees out of the
+          # twenty-two top-level packages that contain Python, so a ruff.toml `exclude` over any
+          # of the other sixteen was caught only by the pytest allowlist -- the layer this
+          # control exists so as not to depend on. A hand-maintained list of directories is the
+          # same failure the sweep's own header describes.
+          trees=". $(find . -mindepth 1 -maxdepth 1 -type d \
+                      ! -name '.*' ! -name 'node_modules' ! -name 'venv' \
+                      -exec sh -c 'find "$1" -name "*.py" -print -quit | grep -q .' _ {} \; \
+                      -print | sed 's|^\./||' | sort)"
+          echo "probing trees: $(echo ${trees} | tr '\n' ' ')"
+          for tree in ${trees}; do
             canary="${tree}/zz_lint_canary_probe.py"
-            printf 'def zz_canary():\n    return totally_undefined_name(1)  # noqa: F821\n' > "$canary"
+            if ! printf 'def zz_canary():\n    return totally_undefined_name(1)  # noqa: F821\n' > "$canary" 2>/dev/null; then
+              # Not a disabled gate -- a probe that could not run. Say which, or the next person
+              # debugs the wrong thing.
+              echo "::error::could not write the canary to ${canary}; this probe proved nothing."
+              fail=1
+              continue
+            fi
             if ruff check --ignore-noqa . > /dev/null 2>&1; then
               echo "::error::THE GATE IS OFF for ${tree}/ — ruff exited 0 with an undefined name there."
               fail=1

@@ -68,3 +68,9 @@ reports/meitu_final_2026_09_07/gateway_env_before.yaml
 
 # local virtualenv symlink — committed by accident in #2164
 .venv
+
+# The lint gate plants this in every Python tree to prove the linter still bites, and
+# removes it. Ignored so a crashed run cannot leave it to be swept into an unrelated commit --
+# this checkout is shared, and that has happened here before. Ignoring it does NOT remove it
+# from the gate: ruff.toml sets respect-gitignore = false.
+zz_lint_canary_probe.py

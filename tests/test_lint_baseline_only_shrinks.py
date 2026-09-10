@@ -345,3 +345,65 @@ def test_the_ruff_version_is_pinned():
         "ruff must be pinned with `==` (got %r): the linter's version decides what the gate "
         "catches, and requirements-dev.txt is what CI installs before running it" % lines[0]
     )
+
+
+# --- the one workflow assertion that is NOT self-referential -----------------------------
+#
+# #2167 asserted properties of the job it ran in, which is undecidable from inside: violate the
+# condition and the assertion is never evaluated. Those tests are gone.
+#
+# This one is different in kind, and that difference is the whole reason it is allowed back.
+# It asserts a property of `.github/workflows/lint.yml` — a DIFFERENT file from the job this
+# test runs in — and it runs in two jobs (the sweep, and lint.yml itself). Skipping lint.yml
+# therefore does not silence it; the sweep still evaluates it.
+#
+# Why it is needed at all: lint.yml's protection is "a required check that never reports blocks
+# the merge". The other half of that asymmetry is that a job SKIPPED by `if:` reports SUCCESS,
+# and CI Entrypoint tolerates a skip by design. So `if: false` on the lint job is a one-line,
+# fully-green bypass that no amount of workflow structure closes. Nothing else covers it.
+
+
+def test_the_lint_workflow_cannot_be_skipped_or_made_advisory():
+    """`if: false` on the lint job is green everywhere. This is what objects."""
+    import yaml
+
+    path = _ROOT / ".github/workflows/lint.yml"
+    assert path.exists(), (
+        "`.github/workflows/lint.yml` is gone. It is the linter gate; if it was renamed, point "
+        "this test at the new file and make sure branch protection follows."
+    )
+    wf = yaml.safe_load(path.read_text())
+    job = wf["jobs"]["lint"]
+
+    for key in ("if", "continue-on-error"):
+        assert key not in job, (
+            "the `lint` job grew `%s: %r`. A skipped job reports SUCCESS to branch protection "
+            "and CI Entrypoint tolerates a skip, so this is a one-line bypass that leaves every "
+            "check green. Deleting the workflow would at least BLOCK the merge; this would not."
+            % (key, job.get(key))
+        )
+    for step in job["steps"]:
+        for key in ("if", "continue-on-error"):
+            assert key not in step, (
+                "step %r has `%s`; the same bypass one level down — a lint step that cannot "
+                "fail is not a gate." % (step.get("name") or step.get("uses"), key)
+            )
+
+    # The negative control is what distinguishes "green because the gate works" from "green
+    # because the gate is off". Losing it silently would be losing the point of the workflow.
+    names = [s.get("name") or s.get("uses") for s in job["steps"]]
+    assert any("PROVE" in str(n) for n in names), (
+        "the negative-control step is gone from lint.yml. Everything else in that job passes "
+        "just as happily when the linter is disabled; that step is the only thing that tells "
+        "the two apart. Steps present: %s" % names
+    )
+
+    # No `paths:` filter, or the check stops reporting on the PRs that need it and branch
+    # protection's "never reported = blocked" turns into "not expected = merged".
+    on = wf[True] if True in wf else wf["on"]
+    assert "pull_request" in on, "lint.yml must run on pull_request or it gates nothing"
+    assert not (on.get("pull_request") or {}).get("paths"), (
+        "lint.yml grew a `paths:` filter. Its entire design is that it always runs, so that a "
+        "job which stops reporting BLOCKS the merge; a path filter makes it legitimately absent "
+        "and the gate silently optional on exactly the PRs it is not watching."
+    )

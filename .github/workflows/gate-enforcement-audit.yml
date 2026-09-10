@@ -22,17 +22,19 @@ name: Gate Enforcement Audit
 # hat. If `administration: read` is insufficient here, the fix is to grant it or to delete
 # this workflow deliberately — not to let it degrade quietly.
 
+# ⚠️ NO `pull_request:` TRIGGER, DELIBERATELY, AND THIS WAS A REAL BUG NOT A PREFERENCE.
+# The first version also ran on PRs touching the gate, reasoning that removing lint.yml should
+# surface the question immediately. But `CI Entrypoint` — the ONE required check on main —
+# derives its expected set from every workflow with a matching `pull_request` trigger and treats
+# a failure as fatal. This job is DESIGNED to fail until GATE_AUDIT_TOKEN exists, so that
+# trigger turned an intended daily reminder into a hard merge block: it red-lit its own PR, and
+# would have made every future PR touching lint.yml, this file, or ruff.toml unmergeable —
+# including a PR trying to fix this workflow. A watchdog must not be able to block the thing it
+# watches. The daily schedule is the signal; it gates nothing, which is the correct severity.
 on:
   schedule:
     - cron: '17 6 * * *'
   workflow_dispatch:
-  # Also on any change to the gate itself, so removing lint.yml surfaces the question
-  # immediately rather than at 06:17 tomorrow.
-  pull_request:
-    paths:
-      - '.github/workflows/lint.yml'
-      - '.github/workflows/gate-enforcement-audit.yml'
-      - 'ruff.toml'
 
 # `administration: read` IS NOT A VALID GITHUB_TOKEN SCOPE, and naming it made GitHub reject
 # this whole workflow: the first version ran ZERO jobs and reported failure with no annotation.
@@ -46,8 +48,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
-
+      # No checkout: this job reads the GitHub API, not the tree.
       - name: The lint gate must be a required status check
         env:
           GH_TOKEN: ${{ secrets.GATE_AUDIT_TOKEN }}
@@ -87,3 +88,9 @@ jobs:
             exit 1
           fi
           echo "ok: \`lint\` is enforced on ${branch}"
+          # ⚠️ READS CLASSIC BRANCH PROTECTION ONLY. `main` is classic today (the /rulesets
+          # endpoint returns []), but if protection ever migrates to a ruleset this endpoint
+          # 404s and the job fails permanently WHILE the gate is actually fine — the inverse of
+          # its purpose, and the kind of stale detector this repo already has several of. The
+          # failure is loud and says this, so it degrades to a false alarm rather than a false
+          # green; extend it to /rulesets when that migration happens.
