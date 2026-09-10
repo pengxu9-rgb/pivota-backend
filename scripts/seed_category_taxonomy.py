@@ -146,9 +146,27 @@ async def main() -> int:
             # Deletions are REPORTED, never performed. A path this repo stopped knowing about may
             # be one the gateway still writes; removing it would make its rows orphans, which is
             # the failure this table exists to prevent.
+            #
+            # ONE EXCEPTION, and it is the opposite risk: an ALIAS row for a path this repo now
+            # declares a GAP. That row says "merge this", it was written by this seeder, and
+            # leaving it means the gateway starts merging on it the moment it reads this table —
+            # which is precisely how seven INTENTIONALLY_DISTINCT paths were collapsed on
+            # 2026-09-10. Retracting a merge instruction cannot orphan a row; it only stops a
+            # rewrite. Canonical rows are still never deleted.
+            retracted = [
+                path for path in existing
+                if path in TAXONOMY_GAPS and existing[path].get("alias_of")
+            ]
+            for path in retracted:
+                await database.execute(
+                    "DELETE FROM category_taxonomy WHERE path = :p AND alias_of IS NOT NULL",
+                    {"p": path},
+                )
+            report["retracted_merge_instructions"] = sorted(retracted)
             report["deleted"] = 0
             report["note"] = (
-                "extra rows are reported, not deleted — they may belong to the other service"
+                "extra rows are reported, not deleted — they may belong to the other service; "
+                "the exception is an alias row for a path now declared a GAP, which is retracted"
             )
         print(json.dumps(report, indent=2, sort_keys=True))
         return 0

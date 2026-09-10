@@ -982,7 +982,12 @@ async def _run_taxonomy_code_vs_table_drift(db: Any) -> Dict[str, Any]:
     Threshold 0: there is no acceptable number. If the table is unreachable the check reports the
     error rather than 0 — an unreadable shared vocabulary is not agreement.
     """
-    from services.category_path_aliases import ALIASES, ANCESTOR_NODES, TAXONOMY_LEAVES
+    from services.category_path_aliases import (
+        ALIASES,
+        ANCESTOR_NODES,
+        TAXONOMY_GAPS,
+        TAXONOMY_LEAVES,
+    )
     from services.category_taxonomy_store import TaxonomyUnavailable, load
 
     try:
@@ -1004,7 +1009,17 @@ async def _run_taxonomy_code_vs_table_drift(db: Any) -> Dict[str, Any]:
         for src, tgt in ALIASES.items()
         if table["aliases"].get(src) not in (None, tgt)
     )
-    violations = only_code + only_table + alias_conflicts
+    # AND aliases the TABLE has that the code does not — the direction the first version of this
+    # check could not see, because it only iterated the code's own map. A stale alias row is not
+    # inert: once the gateway reads this table it will merge on it, which is exactly how seven
+    # INTENTIONALLY_DISTINCT paths were collapsed. A path this repo has since declared a GAP is
+    # the common case and is called out by name, because "stop merging this" is the whole point.
+    stale_aliases = sorted(
+        "%s -> %s (table only%s)" % (src, tgt, "; now a declared GAP here" if src in TAXONOMY_GAPS else "")
+        for src, tgt in table["aliases"].items()
+        if src not in ALIASES
+    )
+    violations = only_code + only_table + alias_conflicts + stale_aliases
     return {
         "count": len(violations),
         "sample_keys": violations[:_SAMPLE_LIMIT],
@@ -1012,6 +1027,7 @@ async def _run_taxonomy_code_vs_table_drift(db: Any) -> Dict[str, Any]:
             "in_code_not_in_table": only_code[:20],
             "in_table_not_in_code": only_table[:20],
             "alias_conflicts": alias_conflicts[:20],
+            "stale_table_aliases": stale_aliases[:20],
             "code_paths": len(code_canonical),
             "table_paths": len(table_canonical),
             "table_readable": True,

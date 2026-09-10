@@ -273,3 +273,29 @@ def test_an_UNREADABLE_table_is_reported_not_treated_as_agreement(pg_engine):
     out = _drift()
     assert out["count"] == 1
     assert out["detail"]["table_readable"] is False
+
+
+def test_a_STALE_ALIAS_left_in_the_table_is_drift(pg_engine):
+    """The direction the first version of the drift check could not see: it iterated the CODE's
+    alias map, so an alias row the table has and the code does not was invisible.
+
+    That row is not inert. It says "merge this", and once the gateway reads this table it will —
+    which is exactly how seven INTENTIONALLY_DISTINCT paths were collapsed on 2026-09-10. A path
+    this repo has since declared a GAP is the case that matters, so it is named in the output."""
+    with pg_engine.begin() as conn:
+        _seed_from_code(conn)
+        _row(conn, "beauty/skincare/sets", alias_of="beauty/sets/gift-set")
+    out = _drift()
+    assert out["count"] > 0
+    stale = out["detail"]["stale_table_aliases"]
+    assert any("beauty/skincare/sets" in x for x in stale), out["detail"]
+    assert any("declared GAP" in x for x in stale), "a retracted merge must say so"
+
+
+def test_an_alias_the_code_ALSO_has_is_not_reported_as_stale(pg_engine):
+    """The control. Without it, "every alias is stale" would pass the test above."""
+    with pg_engine.begin() as conn:
+        _seed_from_code(conn)
+    out = _drift()
+    assert out["detail"]["stale_table_aliases"] == []
+    assert out["count"] == 0
