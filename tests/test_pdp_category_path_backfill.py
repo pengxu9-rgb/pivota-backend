@@ -694,22 +694,22 @@ async def _drive_fetch(monkeypatch, *, include_shallow):
     return seen
 
 
-def test_default_mode_binds_only_what_the_predicate_uses(monkeypatch):
+@pytest.mark.asyncio
+async def test_default_mode_binds_only_what_the_predicate_uses(monkeypatch):
     """Regression: every :placeholder in the SQL must exist in params, and vice versa.
     SQLAlchemy's text().bindparams() raises on an extra one, which crashed the default path."""
-    import asyncio, re
-    seen = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
-        _drive_fetch(monkeypatch, include_shallow=False))
+    import re
+    seen = await _drive_fetch(monkeypatch, include_shallow=False)
     placeholders = set(re.findall(r":([a-z_]+)", seen["query"]))
     assert placeholders == set(seen["values"]), (placeholders, set(seen["values"]))
     assert "max_depth" not in seen["values"]
     assert "category_path IS NULL" in seen["query"]
 
 
-def test_shallow_mode_binds_its_own_placeholder(monkeypatch):
-    import asyncio, re
-    seen = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
-        _drive_fetch(monkeypatch, include_shallow=True))
+@pytest.mark.asyncio
+async def test_shallow_mode_binds_its_own_placeholder(monkeypatch):
+    import re
+    seen = await _drive_fetch(monkeypatch, include_shallow=True)
     placeholders = set(re.findall(r":([a-z_]+)", seen["query"]))
     assert placeholders == set(seen["values"]), (placeholders, set(seen["values"]))
     assert seen["values"]["max_depth"] >= 1
@@ -727,3 +727,100 @@ def test_two_segment_leaves_are_routable_and_must_not_be_rewritten():
     assert _is_interior_node(None) is True
     # a full leaf is left alone
     assert _is_interior_node("beauty/makeup/lip/lipstick") is False
+
+
+@pytest.mark.asyncio
+async def test_apply_update_reports_whether_the_write_landed(monkeypatch):
+    """RETURNING exists so the caller can tell a landed write from a declined one — `databases`
+    over asyncpg reports no rowcount. A previous cut discarded the return value, leaving `matched`
+    counting intentions and `declined_by_guard` a hard-coded 0: a fabricated number, worse than
+    no number."""
+    import scripts.backfill_pdp_category_path as bf
+    captured = {}
+
+    async def fake_fetch_val(query, values=None):
+        captured["query"] = str(query)
+        return captured["result"]
+
+    monkeypatch.setattr(bf.database, "fetch_val", fake_fetch_val)
+
+    captured["result"] = "ext:some-product"
+    assert await bf._apply_update("k", "beauty/makeup/lip/lipstick") is True
+    assert "RETURNING" in captured["query"].upper()
+
+    captured["result"] = None          # guard declined: row changed, or not actually deeper
+    assert await bf._apply_update("k", "beauty/makeup/lip/lipstick") is False
+
+
+def test_unrecognised_paths_are_not_reported_as_already_routable():
+    """A path absent from the taxonomy is skipped, but calling it 'already routable' asserts
+    something we cannot know."""
+    from scripts.backfill_pdp_category_path import _is_interior_node, _TAXONOMY_PATHS
+    assert "beauty/bogus" not in _TAXONOMY_PATHS
+    assert _is_interior_node("beauty/bogus") is False   # skipped, never rewritten
+    assert "fashion/shoes" in _TAXONOMY_PATHS           # a genuine leaf
+
+
+@pytest.mark.asyncio
+async def test_declined_writes_are_counted_by_the_runner(monkeypatch):
+    """Testing _apply_update alone is not enough: the bug was the CALL SITE discarding its return,
+    which left declined_by_guard a hard-coded 0 while matched counted intentions. Drive the runner
+    with a DB that always declines and assert the report tells the truth."""
+    import scripts.backfill_pdp_category_path as bf
+
+    row = {
+        "product_key": "ext:brand-retro-matte-lipstick::abc",
+        "pivota_signature_id": "sig_x",
+        "brand": "MAC",
+        "category": None,
+        "category_path": "beauty/makeup",
+        "product_type": None,
+        "title": "Retro Matte Lipstick",
+    }
+    batches = [[row], []]
+
+    async def fake_fetch_all(query, values=None):
+        return batches.pop(0) if batches else []
+
+    async def fake_fetch_val(query, values=None):
+        return None  # the guard declines every write
+
+    monkeypatch.setattr(bf.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(bf.database, "fetch_val", fake_fetch_val)
+    monkeypatch.setattr(bf.database, "is_connected", True, raising=False)
+
+    report = await bf.run_category_path_backfill(include_shallow=True, dry_run=False)
+    assert report["declined_by_guard"] == 1, report
+    assert report["matched"] == 0, report
+
+
+@pytest.mark.asyncio
+async def test_landed_writes_are_counted_as_matched(monkeypatch):
+    """The control: same path, but the DB accepts. Without this, the test above would also pass
+    against an implementation that counted nothing at all."""
+    import scripts.backfill_pdp_category_path as bf
+
+    row = {
+        "product_key": "ext:brand-retro-matte-lipstick::abc",
+        "pivota_signature_id": "sig_x",
+        "brand": "MAC",
+        "category": None,
+        "category_path": "beauty/makeup",
+        "product_type": None,
+        "title": "Retro Matte Lipstick",
+    }
+    batches = [[row], []]
+
+    async def fake_fetch_all(query, values=None):
+        return batches.pop(0) if batches else []
+
+    async def fake_fetch_val(query, values=None):
+        return row["product_key"]  # the write lands
+
+    monkeypatch.setattr(bf.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(bf.database, "fetch_val", fake_fetch_val)
+    monkeypatch.setattr(bf.database, "is_connected", True, raising=False)
+
+    report = await bf.run_category_path_backfill(include_shallow=True, dry_run=False)
+    assert report["matched"] == 1, report
+    assert report["declined_by_guard"] == 0, report

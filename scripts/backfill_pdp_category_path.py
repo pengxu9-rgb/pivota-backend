@@ -217,6 +217,8 @@ async def run_category_path_backfill(
     not_deeper_by_path: Dict[str, int] = {}
     skipped_routable = 0
     declined = 0  # guard refused the write (row changed under us, or not actually deeper)
+    declined_by_path: Dict[str, int] = {}
+    unknown_path = 0  # not NULL, not an interior node, and not in the taxonomy at all
     # A row moving beauty/makeup -> beauty/skincare/... is not merely deeper, it is RE-VERTICALISED.
     # category_kind is derived from this path and drives claim-safety, required disclaimers and the
     # serving gate, so a branch change is a different and larger decision than a deepening. Counted
@@ -249,7 +251,13 @@ async def run_category_path_backfill(
             # SQL selected a depth-bounded SUPERSET; only interior nodes are actually unreachable.
             # A 2-segment LEAF like fashion/shoes routes fine and must be left alone.
             if not _is_interior_node(current_path):
-                skipped_routable += 1
+                # Distinguish a real taxonomy LEAF (correctly left alone) from a path we simply do
+                # not recognise. Both are skipped, but counting them together would report an
+                # unknown path as "already routable", which is a claim we cannot make.
+                if str(current_path or "").strip().strip("/") in _TAXONOMY_PATHS:
+                    skipped_routable += 1
+                else:
+                    unknown_path += 1
                 continue
             row_category, row_product_type = _classification_inputs(row)
             hit = resolve_path_from_row(
@@ -280,7 +288,16 @@ async def run_category_path_backfill(
                 continue
             label, path = hit
             if not dry_run:
-                await _apply_update(row["product_key"], path, previous_path=current_path)
+                # The return value is the WHOLE POINT of _apply_update's RETURNING clause:
+                # `databases` over asyncpg reports no rowcount, so discarding it would leave
+                # `matched` counting intentions and `declined_by_guard` a hard-coded 0 — a
+                # fabricated number, which is worse than no number.
+                if not await _apply_update(
+                    row["product_key"], path, previous_path=current_path
+                ):
+                    declined += 1
+                    _increment(declined_by_path, str(current_path or "(null)"))
+                    continue
             before_branch = str(current_path or "").split("/")[0].strip().lower()
             after_branch = str(path or "").split("/")[0].strip().lower()
             if before_branch and after_branch and before_branch != after_branch:
@@ -341,6 +358,10 @@ async def run_category_path_backfill(
         "max_interior_depth": MAX_INTERIOR_DEPTH,
         "skipped_already_routable": skipped_routable,
         "declined_by_guard": declined,
+        "declined_by_current_path": dict(
+            sorted(declined_by_path.items(), key=lambda kv: (-kv[1], kv[0]))[:20]
+        ),
+        "skipped_unrecognised_path": unknown_path,
         "total": total,
         "dry_run": dry_run,
         "batch_size": batch_size,
