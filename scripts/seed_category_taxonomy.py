@@ -106,81 +106,88 @@ async def run_seed(db, apply: bool) -> dict:
     branch is unreachable under --dry-run.
     """
     rows = _desired()
-    if True:
-        existing = {
-            r["path"]: dict(r)
-            for r in (await db.fetch_all(
-                "SELECT path, label, is_leaf, alias_of FROM category_taxonomy"
-            ) or [])
-        }
-        wanted = {r["path"]: r for r in rows}
-        to_insert = sorted(set(wanted) - set(existing))
-        # A merge instruction this repo has retracted: the path is now a declared GAP but the table
-        # still holds it as an alias saying "merge this". Computed in BOTH modes, because a dry run
-        # that describes the table differently from the apply it previews is not a preview — with a
-        # foreign canonical row present the two used to disagree (dry-run "delete: 3", apply
-        # "deleted 0"). Only the EXECUTION is gated on --apply.
-        retracted = sorted(
-            path for path in existing
-            if path in TAXONOMY_GAPS and existing[path].get("alias_of")
-        )
-        to_delete = sorted(set(existing) - set(wanted) - set(retracted))
-        to_update = sorted(
-            p for p in set(wanted) & set(existing)
-            if (existing[p]["is_leaf"], existing[p]["alias_of"], existing[p]["label"])
-            != (wanted[p]["is_leaf"], wanted[p]["alias_of"], wanted[p]["label"])
-        )
-        report = {
-            "mode": "apply" if apply else "dry_run",
-            "retracted_merge_instructions": retracted,
-            # Reported, never performed: a canonical path this repo stopped knowing may be one the
-            # gateway wrote, and deleting it would orphan its rows.
-            "note": (
-                "extra rows are reported, not deleted — they may belong to the other service; "
-                "the exception is an alias row for a path now declared a GAP, which is retracted"
-            ),
-            "desired_rows": len(rows),
-            "existing_rows": len(existing),
-            "insert": len(to_insert),
-            "update": len(to_update),
-            "delete": len(to_delete),
-            "delete_paths": to_delete[:20],
-        }
+    existing = {
+        r["path"]: dict(r)
+        for r in (await db.fetch_all(
+            "SELECT path, label, is_leaf, alias_of FROM category_taxonomy"
+        ) or [])
+    }
+    wanted = {r["path"]: r for r in rows}
+    to_insert = sorted(set(wanted) - set(existing))
+    # A merge instruction this repo has retracted: the path is now a declared GAP but the table
+    # still holds it as an alias saying "merge this". Computed in BOTH modes, because a dry run
+    # that describes the table differently from the apply it previews is not a preview — with a
+    # foreign canonical row present the two used to disagree (dry-run "delete: 3", apply
+    # "deleted 0"). Only the EXECUTION is gated on --apply.
+    retracted = sorted(
+        path for path in existing
+        if path in TAXONOMY_GAPS and existing[path].get("alias_of")
+    )
+    to_delete = sorted(set(existing) - set(wanted) - set(retracted))
+    to_update = sorted(
+        p for p in set(wanted) & set(existing)
+        if (existing[p]["is_leaf"], existing[p]["alias_of"], existing[p]["label"])
+        != (wanted[p]["is_leaf"], wanted[p]["alias_of"], wanted[p]["label"])
+    )
+    report = {
+        "mode": "apply" if apply else "dry_run",
+        "retracted_merge_instructions": retracted,
+        # Reported, never performed: a canonical path this repo stopped knowing may be one the
+        # gateway wrote, and deleting it would orphan its rows.
+        "note": (
+            "extra rows are reported, not deleted — they may belong to the other service; "
+            "the exception is an alias row for a path now declared a GAP, which is retracted"
+        ),
+        "desired_rows": len(rows),
+        "existing_rows": len(existing),
+        "insert": len(to_insert),
+        "update": len(to_update),
+        "delete": len(to_delete),
+        "delete_paths": to_delete[:20],
+        # PRESENT IN BOTH MODES, always. It was set only inside `if apply:`, so a dry-run
+        # report simply had no `deleted` key -- the same shape divergence the retraction
+        # computation above was moved out of the branch to fix, reintroduced one line later
+        # by the fix itself. A caller reading report["deleted"] gets a KeyError under the
+        # mode operators are told to run FIRST. The count is factual in each mode: a dry run
+        # deleted nothing; `retracted_merge_instructions` is what it WOULD delete, and the
+        # test asserts the apply names exactly that same list.
+        "deleted": 0,
+    }
 
-        if apply:
-            # Canonical rows FIRST: an alias inserted before its target violates the self-FK.
-            for record in [r for r in rows if r["alias_of"] is None] + \
-                          [r for r in rows if r["alias_of"]]:
-                await db.execute(
-                    """
-                    INSERT INTO category_taxonomy (path, label, is_leaf, alias_of, note, updated_at)
-                    VALUES (:path, :label, :is_leaf, :alias_of, :note, now())
-                    ON CONFLICT (path) DO UPDATE SET
-                      label = EXCLUDED.label,
-                      is_leaf = EXCLUDED.is_leaf,
-                      alias_of = EXCLUDED.alias_of,
-                      note = COALESCE(EXCLUDED.note, category_taxonomy.note),
-                      updated_at = now()
-                    """,
-                    record,
-                )
-            # Deletions are REPORTED, never performed. A path this repo stopped knowing about may
-            # be one the gateway still writes; removing it would make its rows orphans, which is
-            # the failure this table exists to prevent.
-            #
-            # ONE EXCEPTION, and it is the opposite risk: an ALIAS row for a path this repo now
-            # declares a GAP. That row says "merge this", it was written by this seeder, and
-            # leaving it means the gateway starts merging on it the moment it reads this table —
-            # which is precisely how seven INTENTIONALLY_DISTINCT paths were collapsed on
-            # 2026-09-10. Retracting a merge instruction cannot orphan a row; it only stops a
-            # rewrite. Canonical rows are still never deleted.
-            for path in retracted:
-                await db.execute(
-                    "DELETE FROM category_taxonomy WHERE path = :p AND alias_of IS NOT NULL",
-                    {"p": path},
-                )
-            report["deleted"] = len(retracted)
-        return report
+    if apply:
+        # Canonical rows FIRST: an alias inserted before its target violates the self-FK.
+        for record in [r for r in rows if r["alias_of"] is None] + \
+                      [r for r in rows if r["alias_of"]]:
+            await db.execute(
+                """
+                INSERT INTO category_taxonomy (path, label, is_leaf, alias_of, note, updated_at)
+                VALUES (:path, :label, :is_leaf, :alias_of, :note, now())
+                ON CONFLICT (path) DO UPDATE SET
+                  label = EXCLUDED.label,
+                  is_leaf = EXCLUDED.is_leaf,
+                  alias_of = EXCLUDED.alias_of,
+                  note = COALESCE(EXCLUDED.note, category_taxonomy.note),
+                  updated_at = now()
+                """,
+                record,
+            )
+        # Deletions are REPORTED, never performed. A path this repo stopped knowing about may
+        # be one the gateway still writes; removing it would make its rows orphans, which is
+        # the failure this table exists to prevent.
+        #
+        # ONE EXCEPTION, and it is the opposite risk: an ALIAS row for a path this repo now
+        # declares a GAP. That row says "merge this", it was written by this seeder, and
+        # leaving it means the gateway starts merging on it the moment it reads this table —
+        # which is precisely how seven INTENTIONALLY_DISTINCT paths were collapsed on
+        # 2026-09-10. Retracting a merge instruction cannot orphan a row; it only stops a
+        # rewrite. Canonical rows are still never deleted.
+        for path in retracted:
+            await db.execute(
+                "DELETE FROM category_taxonomy WHERE path = :p AND alias_of IS NOT NULL",
+                {"p": path},
+            )
+        report["deleted"] = len(retracted)
+    return report
 
 
 async def main() -> int:

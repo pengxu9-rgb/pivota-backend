@@ -466,6 +466,13 @@ def test_DRY_RUN_does_not_retract_but_still_reports_it(pg_engine):
         "the preview must name the same rows the apply acts on"
     )
     assert wet["deleted"] == 1
+    # THE SHAPE, not just the one key someone remembered. `deleted` went missing from the dry-run
+    # report and the assertion above could only catch it because it names that key literally; the
+    # NEXT key added inside `if apply:` would reintroduce the same defect silently. A preview whose
+    # report has different FIELDS from the apply is not a preview of it, whatever the values say.
+    assert set(dry) == set(wet), (
+        f"report shape must not depend on mode; differs by {sorted(set(dry) ^ set(wet))}"
+    )
     with pg_engine.begin() as conn:
         assert conn.execute(
             text("SELECT count(*) FROM category_taxonomy WHERE path='beauty/skincare/sets'")
