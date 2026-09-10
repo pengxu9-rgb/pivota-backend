@@ -380,10 +380,23 @@ def test_serum_resolves(title: str) -> None:
 
 @pytest.mark.parametrize("title", TONER_FIXTURES)
 def test_toner_resolves(title: str) -> None:
+    """`tone/toner`, NOT `treat/toner`. Google Product Taxonomy 5976 and Shopify hb-3-2-9-17 both
+    make `Toners & Astringents` a direct child of Skin Care — a peer of cleansers, moisturizers and
+    treatments, never nested inside a treatments node. It also matches PIVOTA-Agent, which has
+    declared `tone/toner` canonical since 2026-08-04 because folding toner into `treat/` recreates
+    the serum+mask+exfoliant bucket behind the 2026-07-31 junk recall."""
     hit = classify(title)
     assert hit is not None
     assert hit[0] == "Toner"
-    assert hit[1] == "beauty/skincare/treat/toner"
+    assert hit[1] == "beauty/skincare/tone/toner"
+
+
+def test_toner_does_not_land_in_the_broad_treat_bucket() -> None:
+    """The control. `treat/` holds serum, mask, exfoliant and treatment; a toner joining them is
+    the exact regression this leaf exists to prevent, and it is invisible from the toner test alone
+    (both paths are 4 segments under skincare)."""
+    hit = classify("I'm From Rice Toner")
+    assert hit is not None and not hit[1].startswith("beauty/skincare/treat/")
 
 
 @pytest.mark.parametrize("title", TREATMENT_FIXTURES)
