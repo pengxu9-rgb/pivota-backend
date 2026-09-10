@@ -10,9 +10,11 @@ WHAT GOES IN, and why it is not just this repo's constants:
   aliases   services/category_path_aliases.ALIASES — spellings measured in production that mean
             one of the above
 
-PIVOTA-Agent's `src/services/beautyTaxonomy.js` is the OTHER author. Its 25 canonical paths and 22
-aliases were diffed against this set on 2026-09-10 and, after this repo adopted `tone/toner`, the
-two disagree on nothing. They will drift again — that is what
+PIVOTA-Agent's `src/services/beautyTaxonomy.js` is the OTHER author. It has THREE tables, and
+saying "the two disagree on nothing" after checking two of them is exactly the mistake that merged
+seven path families in production. Its 25 canonical paths and 22 aliases agree with this set; its
+INTENTIONALLY_DISTINCT list is the third, and services/gateway_intentionally_distinct.py is
+asserted against it at import. They will drift again — that is what
 `taxonomy_code_vs_table_drift` is for, and why the gateway must be pointed at this table rather
 than re-seeded from it.
 
@@ -113,7 +115,16 @@ async def run_seed(db, apply: bool) -> dict:
         }
         wanted = {r["path"]: r for r in rows}
         to_insert = sorted(set(wanted) - set(existing))
-        to_delete = sorted(set(existing) - set(wanted))
+        # A merge instruction this repo has retracted: the path is now a declared GAP but the table
+        # still holds it as an alias saying "merge this". Computed in BOTH modes, because a dry run
+        # that describes the table differently from the apply it previews is not a preview — with a
+        # foreign canonical row present the two used to disagree (dry-run "delete: 3", apply
+        # "deleted 0"). Only the EXECUTION is gated on --apply.
+        retracted = sorted(
+            path for path in existing
+            if path in TAXONOMY_GAPS and existing[path].get("alias_of")
+        )
+        to_delete = sorted(set(existing) - set(wanted) - set(retracted))
         to_update = sorted(
             p for p in set(wanted) & set(existing)
             if (existing[p]["is_leaf"], existing[p]["alias_of"], existing[p]["label"])
@@ -121,6 +132,13 @@ async def run_seed(db, apply: bool) -> dict:
         )
         report = {
             "mode": "apply" if apply else "dry_run",
+            "retracted_merge_instructions": retracted,
+            # Reported, never performed: a canonical path this repo stopped knowing may be one the
+            # gateway wrote, and deleting it would orphan its rows.
+            "note": (
+                "extra rows are reported, not deleted — they may belong to the other service; "
+                "the exception is an alias row for a path now declared a GAP, which is retracted"
+            ),
             "desired_rows": len(rows),
             "existing_rows": len(existing),
             "insert": len(to_insert),
@@ -156,25 +174,12 @@ async def run_seed(db, apply: bool) -> dict:
             # which is precisely how seven INTENTIONALLY_DISTINCT paths were collapsed on
             # 2026-09-10. Retracting a merge instruction cannot orphan a row; it only stops a
             # rewrite. Canonical rows are still never deleted.
-            retracted = [
-                path for path in existing
-                if path in TAXONOMY_GAPS and existing[path].get("alias_of")
-            ]
             for path in retracted:
                 await db.execute(
                     "DELETE FROM category_taxonomy WHERE path = :p AND alias_of IS NOT NULL",
                     {"p": path},
                 )
-            report["retracted_merge_instructions"] = sorted(retracted)
-            # `delete_paths` above already listed these under the opposite meaning ("reported, not
-            # deleted"); drop them from it so one path is not described two contradictory ways.
-            report["delete_paths"] = [x for x in report["delete_paths"] if x not in set(retracted)]
-            report["delete"] = len(report["delete_paths"])
-            report["deleted"] = 0
-            report["note"] = (
-                "extra rows are reported, not deleted — they may belong to the other service; "
-                "the exception is an alias row for a path now declared a GAP, which is retracted"
-            )
+            report["deleted"] = len(retracted)
         return report
 
 

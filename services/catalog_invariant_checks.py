@@ -1010,10 +1010,14 @@ async def _run_taxonomy_code_vs_table_drift(db: Any) -> Dict[str, Any]:
         if table["aliases"].get(src) not in (None, tgt)
     )
     # AND aliases the TABLE has that the code does not — the direction the first version of this
-    # check could not see, because it only iterated the code's own map. A stale alias row is not
-    # inert: once the gateway reads this table it will merge on it, which is exactly how seven
-    # INTENTIONALLY_DISTINCT paths were collapsed. A path this repo has since declared a GAP is
-    # the common case and is called out by name, because "stop merging this" is the whole point.
+    # check could not see, because it only iterated the code's own map.
+    #
+    # ⚠️ BE PRECISE ABOUT THE RISK. `category_taxonomy` has NO runtime reader on either side today:
+    # this repo's only caller of `category_taxonomy_store.load` is this check, and PIVOTA-Agent has
+    # no SQL against the table at all. The seven paths were collapsed through this repo's in-code
+    # ALIASES via the backfill, NOT through a table row. So a stale alias here is a loaded gun with
+    # nobody yet holding it: harmless until the first reader exists, and the reason to clear it
+    # BEFORE building one, not evidence that something is acting on it now.
     stale_aliases = sorted(
         "%s -> %s (table only%s)" % (src, tgt, "; now a declared GAP here" if src in TAXONOMY_GAPS else "")
         for src, tgt in table["aliases"].items()

@@ -17,10 +17,29 @@ serving-eligible rows behind those seven paths in production.
   beauty/skincare/moisturizer/balm  -> beauty/skincare/moisturize/cream
   beauty/skincare/oil               -> beauty/skincare/moisturize/oil
 
-The gateway is right, and so is the industry standard it happens to match: Google Product Taxonomy
-and Shopify both categorise kits BY DOMAIN — `Anti-Aging Skin Care Kits`, `Facial Cleansing Kits`
-under Skin Care — rather than in one global sets bucket. A skincare set and a makeup set are not
-the same shelf. The non-standard part was this repo having a single `beauty/sets/gift-set`.
+WHAT ACTUALLY ENFORCES THIS, because I described it wrongly at first. I wrote that "the gateway
+relies on these paths being distinct at serve time". It does not. `CATEGORY_PATH_ALIASES`,
+`toCanonicalCategoryPath` and `INTENTIONALLY_DISTINCT` have ZERO runtime callers in PIVOTA-Agent —
+the only importer is the offline `scripts/reconcile-catalog-category-taxonomy.cjs`, and the serve
+path takes `CANONICAL_CATEGORY_PATHS` alone.
+
+So this is a WRITER-side rule, and the real cost of violating it is not a broken read: it is that
+the reconciler and this repo's backfill would rewrite the same rows in opposite directions, on
+whichever schedule ran last. The correct reason to respect the list is convergence, not serving —
+and the list is still the other repo's decision to make about its own data.
+
+The gateway is right that these are different shelves. ⚠️ THE STANDARD CARRIES BOTH SHAPES, and
+an earlier version of this paragraph cherry-picked one of them:
+
+    global   Google 475 `Bath & Body Gift Sets`, 6069 `Cosmetic Sets`
+             Shopify hb-3-2-2, hb-3-2-3
+    domain   Google 7429 `Anti-Aging Skin Care Kits`, 7467 `Facial Cleansing Kits`
+             Shopify hb-3-2-9-25 `Skin Care Kits & Sets`, hb-3-2-6-8 `Makeup Kits & Sets`
+
+So "not in one global sets bucket" was false; both exist, side by side. This repo having
+`beauty/sets/gift-set` is not the non-standard part — having ONLY it is. See the same correction
+in services/category_path_aliases.py, which this file previously contradicted while shipping in
+the same commit.
 
 ⚠️ VENDORED, AND NOTHING NOTICES WHEN THE GATEWAY EDITS ITS LIST. Re-vendor by hand.
 

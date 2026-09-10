@@ -221,7 +221,9 @@ TAXONOMY_GAPS: Dict[str, str] = {
     # version of this map collapsed them, in production. They are gaps, not aliases, and not
     # leaves either:
     #
-    #   MERGING them is what the gateway forbids. The industry standard carries BOTH shapes, and
+    #   MERGING them is what the gateway forbids — and the cost is CONVERGENCE, not serving:
+    #   its alias tables have no runtime callers, so the harm is that its reconciler and this
+    #   repo's backfill rewrite the same rows in opposite directions, last schedule wins. The industry standard carries BOTH shapes, and
     #   an earlier version of this comment cherry-picked one of them:
     #     global  Google 6069 `Cosmetics > Cosmetic Sets`, 475 `Bath & Body Gift Sets`
     #             Shopify hb-3-2-3 `Cosmetics > Cosmetic Sets`

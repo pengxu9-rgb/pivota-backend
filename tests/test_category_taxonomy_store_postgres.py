@@ -312,10 +312,14 @@ def _run_seeder(apply: bool):
     cautious path an operator runs first could not see it; under `--apply` every upsert ran, the
     script died before printing its report, and the stale alias row it claimed to retract survived.
 
-    Calls `run_seed(db, ...)` and NOT `main()`. main() connects and disconnects the shared global
-    `database`, and these gate files share one database — a test that closes the global seam
-    breaks whichever unrelated module runs next. It did: an earlier version of this helper made
-    tests/test_commerce_ledger_retention_postgres.py count 6 events where it expected 5.
+    Calls `run_seed(db, ...)` and NOT `main()`, because main() connects and disconnects the
+    shared global `database` and these gate files share one. That is hygiene, not a bug fix.
+
+    ⚠️ I ORIGINALLY CLAIMED IT FIXED A LEAK IT DID NOT. `test_commerce_ledger_retention_postgres`
+    counting 6 events where it expected 5 looked like my disconnect and I wrote that down. It
+    reproduces at the merge base, alone, on a fresh database: the test pins NOW = 2026-09-04T12:00Z
+    and calls `report_ledger_retention` with no clock, so its fixture crossed the 7-day horizon at
+    2026-09-10T12:00Z. Fixed separately. A causal story that fits the timing is not a cause.
     """
     import importlib.util
     from pathlib import Path
@@ -415,3 +419,66 @@ def test_a_stale_alias_the_code_simply_FORGOT_is_also_drift(pg_engine):
     assert not any("declared GAP" in x for x in stale), (
         "this path is not a declared gap; only retracted merges should say so"
     )
+
+
+def test_DRY_RUN_writes_absolutely_nothing(pg_engine):
+    """The path the docstring tells an operator to run FIRST, and nothing pinned it.
+
+    The mutant that makes `run_seed` ignore its `apply` argument and always write survived the
+    whole suite, because every other test here calls it with apply=True. A seeder whose dry run
+    writes is worse than one with no dry run at all: it is the mode people reach for precisely
+    when they are not sure."""
+    from sqlalchemy import text
+
+    with pg_engine.begin() as conn:
+        _reset(conn)
+    report = _run_seeder(apply=False)
+    assert report["mode"] == "dry_run"
+    assert report["insert"] > 100, "dry run should still REPORT the work"
+    with pg_engine.begin() as conn:
+        assert conn.execute(text("SELECT count(*) FROM category_taxonomy")).scalar() == 0
+
+
+def test_DRY_RUN_does_not_retract_but_still_reports_it(pg_engine):
+    """A dry run that describes the table differently from the apply it previews is not a preview.
+
+    These two used to disagree: `retracted_merge_instructions` was computed only inside the apply
+    branch, so a dry run listed the same rows under `delete_paths` ("reported, not deleted") while
+    the apply retracted them — and with a foreign canonical row present the counts diverged
+    outright."""
+    from sqlalchemy import text
+
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _row(conn, "beauty/sets/gift-set", is_leaf=True)
+        _row(conn, "beauty/skincare/sets", alias_of="beauty/sets/gift-set")
+
+    dry = _run_seeder(apply=False)
+    assert dry["retracted_merge_instructions"] == ["beauty/skincare/sets"]
+    assert dry["deleted"] == 0
+    with pg_engine.begin() as conn:
+        assert conn.execute(
+            text("SELECT count(*) FROM category_taxonomy WHERE path='beauty/skincare/sets'")
+        ).scalar() == 1, "dry run must not delete"
+
+    wet = _run_seeder(apply=True)
+    assert wet["retracted_merge_instructions"] == dry["retracted_merge_instructions"], (
+        "the preview must name the same rows the apply acts on"
+    )
+    assert wet["deleted"] == 1
+    with pg_engine.begin() as conn:
+        assert conn.execute(
+            text("SELECT count(*) FROM category_taxonomy WHERE path='beauty/skincare/sets'")
+        ).scalar() == 0
+
+
+def test_a_retracted_path_is_not_ALSO_listed_as_an_undeleted_extra(pg_engine):
+    """One path, one meaning. It used to appear under `delete_paths` ("reported, not deleted") and
+    under `retracted_merge_instructions` (deleted) in the same report."""
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _row(conn, "beauty/sets/gift-set", is_leaf=True)
+        _row(conn, "beauty/skincare/sets", alias_of="beauty/sets/gift-set")
+    report = _run_seeder(apply=False)
+    assert "beauty/skincare/sets" not in report["delete_paths"]
+    assert "beauty/skincare/sets" in report["retracted_merge_instructions"]
