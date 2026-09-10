@@ -67,6 +67,46 @@ assert all(
     re.fullmatch(r"[a-z0-9/_-]+", node) for node in _INTERIOR_NODES
 ), "taxonomy node outside the safe alphabet; do not inline it into SQL"
 _INTERIOR_NODES_SQL = ", ".join("'%s'" % node for node in sorted(_INTERIOR_NODES))
+assert all(
+    re.fullmatch(r"[a-z0-9/_-]+", path) for path in _TAXONOMY_PATHS
+), "taxonomy leaf outside the safe alphabet; do not inline it into SQL"
+_LEAF_PATHS_SQL = ", ".join("'%s'" % path for path in sorted(_TAXONOMY_PATHS))
+
+# Recall's category prefix is EXACTLY the leaf's parent plus a slash — see
+# `category_path_prefix_for_query`, which returns 'beauty/makeup/lip/'. So a row
+# stored WITH that trailing slash ('beauty/makeup/lip/') satisfies
+# `LIKE 'beauty/makeup/lip/%'` directly (the % matches the empty string), earns
+# the +90 depth score, and is NOT handicapped — even though btrim()ing the
+# slash away makes it look like the interior node 'beauty/makeup/lip'.
+# Measured on prod 2026-09-09: ZERO rows are in that state, so this exclusion
+# changes no current number. It is here because the predicate should say what
+# it means, not because it moved the baseline.
+_INTERIOR_HANDICAP_SQL = """
+                cp.category_path IS NULL
+                OR btrim(cp.category_path) = ''
+                OR (
+                  lower(btrim(cp.category_path, '/')) IN (%s)
+                  AND NOT (
+                    cp.category_path LIKE '%%%%/'
+                    AND array_length(
+                          string_to_array(btrim(lower(cp.category_path), '/'), '/'), 1) = 3
+                  )
+                )
+""" % _INTERIOR_NODES_SQL
+
+# STRICTLY WORSE than an interior node, and until 2026-09-09 invisible: a path
+# that is neither a real leaf nor an ancestor of one. `beauty/skincare/tone/
+# toner` (315 rows) against the real `beauty/skincare/treat/toner`;
+# `beauty/makeup/lips/lip-gloss` against `beauty/makeup/lip/gloss`. One wrong
+# segment. Such a row cannot match the hard prefix, AND #2122 cannot rescue it
+# either — that rule needs the stored path to be a strict ANCESTOR of the
+# prefix, and a sibling typo is not an ancestor. So it has no category recall at
+# all and falls back to the trigram text scan.
+_OFF_TAXONOMY_SQL = """
+                coalesce(btrim(cp.category_path), '') <> ''
+                AND lower(btrim(cp.category_path, '/')) NOT IN (%s)
+                AND lower(btrim(cp.category_path, '/')) NOT IN (%s)
+""" % (_INTERIOR_NODES_SQL, _LEAF_PATHS_SQL)
 
 # The canonical row->listing join, from services/identity_join_sql. Bound here
 # because Python 3.11 f-string replacement fields cannot span lines, and both
@@ -805,6 +845,78 @@ async def _run_identity_provenance_share(db: Any) -> Dict[str, Any]:
         "sample_keys": [lane["lane"] for lane in ranked[:_SAMPLE_LIMIT]],
         "detail": outcome["detail"],
     }
+
+
+_SERVING_ELIGIBLE_DENOMINATOR_SQL = """
+    SELECT count(*) AS c
+    FROM catalog_products cp
+    JOIN index_pipeline_state ips ON ips.content_key = cp.content_key
+    WHERE ips.serving_eligible
+"""
+
+
+async def _run_taxonomy_share(db: Any, predicate: str, label: str) -> Dict[str, Any]:
+    """A SHARE, in TENTHS OF A PERCENT, not a row count.
+
+    WHY NOT A COUNT. The first version of the interior-node check enforced at the measured 4,588
+    rows. Review pointed out that is a hair trigger on a cohort that is 43.7% of the served
+    catalogue: `nightly_index_health` recomputes serving_eligible for every row every 7,200s from
+    ~13 inputs, so one row promoted onto an interior node moves 4,588 to 4,589 and trips it, and any
+    suppression moves it down and (by this module's own convention) mandates lowering it. A number
+    that must be edited most days is not a ratchet, it is a chore, and a chore gets raised.
+
+    A share is stable under catalogue growth — which is the thing we WANT to happen — and still
+    moves several points when a curated ingest files a whole storefront on one node, which is the
+    thing we want to catch. Tenths of a percent, so ±1 row is rounding noise rather than a trip.
+
+    The raw count and the denominator ride along in `detail` so the number is auditable and nobody
+    has to re-derive it from a percentage.
+    """
+    total = await db.fetch_val(_SERVING_ELIGIBLE_DENOMINATOR_SQL)
+    total = int(total or 0)
+    matched = await db.fetch_val(
+        """
+        SELECT count(*) AS c
+        FROM catalog_products cp
+        JOIN index_pipeline_state ips ON ips.content_key = cp.content_key
+        WHERE ips.serving_eligible AND (%s)
+        """
+        % predicate
+    )
+    matched = int(matched or 0)
+    # An EMPTY serving set is not 0% healthy — there is nothing being served. Report it as such
+    # rather than letting 0/0 read as a clean bill of health.
+    share_tenths = 0 if total == 0 else int(round(1000.0 * matched / total))
+    rows = await db.fetch_all(
+        """
+        SELECT cp.product_key AS subject_key
+        FROM catalog_products cp
+        JOIN index_pipeline_state ips ON ips.content_key = cp.content_key
+        WHERE ips.serving_eligible AND (%s)
+        LIMIT %d
+        """
+        % (predicate, _SAMPLE_LIMIT)
+    )
+    return {
+        "count": share_tenths,
+        "sample_keys": [r["subject_key"] for r in rows],
+        "detail": {
+            "unit": "tenths_of_a_percent_of_serving_eligible",
+            "label": label,
+            "matched_rows": matched,
+            "serving_eligible_rows": total,
+            "share_pct": None if total == 0 else round(100.0 * matched / total, 2),
+            "serving_set_empty": total == 0,
+        },
+    }
+
+
+async def _run_interior_node_share(db: Any) -> Dict[str, Any]:
+    return await _run_taxonomy_share(db, _INTERIOR_HANDICAP_SQL, "interior_or_null")
+
+
+async def _run_off_taxonomy_share(db: Any) -> Dict[str, Any]:
+    return await _run_taxonomy_share(db, _OFF_TAXONOMY_SQL, "off_taxonomy")
 
 
 _CHECKS: List[Dict[str, Any]] = [
@@ -1802,37 +1914,62 @@ _CHECKS: List[Dict[str, Any]] = [
         # it is how a ratchet stops meaning anything.
         "name": "serving_eligible_on_interior_taxonomy_node",
         "description": (
-            "row is serving_eligible but its category_path is an INTERIOR "
-            "taxonomy node (or NULL) — reachable only via #2122 ancestor "
-            "admission, which needs the category word in the row's own text "
-            "and never earns the depth score"
+            "SHARE (tenths of a percent) of serving-eligible rows whose "
+            "category_path is an INTERIOR taxonomy node or NULL — reachable "
+            "only via #2122 ancestor admission, which needs the category word "
+            "in the row's own text and never earns the depth score"
         ),
-        "env": "CATALOG_INVARIANT_INTERIOR_NODE_THRESHOLD",
-        # Measured on prod 2026-09-09: 4,588 of 10,509 serving-eligible rows.
-        "default_threshold": 4588,
-        "count_sql": """
-            SELECT count(*) AS c
-            FROM catalog_products cp
-            JOIN index_pipeline_state ips ON ips.content_key = cp.content_key
-            WHERE ips.serving_eligible
-              AND (
-                cp.category_path IS NULL
-                OR btrim(cp.category_path) = ''
-                OR lower(btrim(cp.category_path, '/')) IN (%s)
-              )
-        """ % _INTERIOR_NODES_SQL,
-        "sample_sql": """
-            SELECT cp.product_key AS subject_key
-            FROM catalog_products cp
-            JOIN index_pipeline_state ips ON ips.content_key = cp.content_key
-            WHERE ips.serving_eligible
-              AND (
-                cp.category_path IS NULL
-                OR btrim(cp.category_path) = ''
-                OR lower(btrim(cp.category_path, '/')) IN (%s)
-              )
-            LIMIT 5
-        """ % _INTERIOR_NODES_SQL,
+        "env": "CATALOG_INVARIANT_INTERIOR_NODE_SHARE_TENTHS",
+        # Measured on prod 2026-09-09: 4,588 of 10,509 serving-eligible rows = 43.66% = 437 tenths.
+        # Enforcing at 450 (45.0%) — about 140 rows of headroom at today's denominator. Enough that
+        # ordinary promotion churn does not trip it, far less than a curated storefront ingest,
+        # which files hundreds of rows on a single interior node and moves the share several points.
+        "default_threshold": 450,
+        # No count_sql/sample_sql: the share and its denominator are computed in Python and must not
+        # be restated in SQL. Same shape as skus_without_merchant_issued_identity_share.
+        "count_sql": None,
+        "sample_sql": None,
+        "runner": _run_interior_node_share,
+    },
+    {
+        # THE COHORT THE FIRST VERSION OF THIS CHECK COULD NOT SEE, and it is
+        # strictly worse than the one it did see. Review asked what happens to a
+        # path that is neither interior nor a leaf; the answer, measured on prod
+        # 2026-09-09, is 808 serving-eligible rows (7.7%) with NO category
+        # recall at all.
+        #
+        # They are one wrong segment from a real path:
+        #   beauty/skincare/tone/toner     315 rows  real: beauty/skincare/treat/toner
+        #   beauty/skincare/sets            49 rows
+        #   beauty/makeup/nails/nail-polish 37 rows
+        #   beauty/makeup/lips/lip-balm     12 rows  real: beauty/makeup/lip/balm
+        #   beauty/makeup/lips/lip-gloss     9 rows  real: beauty/makeup/lip/gloss
+        #
+        # An interior row at least has #2122: its path is a strict ANCESTOR of
+        # the query prefix, so if its own title names the category it is
+        # admitted (below the depth-matched rows, but present). A sibling typo
+        # is not an ancestor of anything, so that door is shut too. These rows
+        # reach a category query only if the trigram text scan happens to pick
+        # them up.
+        #
+        # `onboard_curated_brands --category` does no validation against
+        # CATEGORY_PATTERNS, which is how a path like `beauty/skincare/tone/
+        # toner` gets written 315 times. Validating at the writer is the actual
+        # fix and belongs with #2158/#2159; this counts the cohort meanwhile so
+        # it cannot grow silently the way it grew to 808.
+        "name": "serving_eligible_off_taxonomy_path",
+        "description": (
+            "SHARE (tenths of a percent) of serving-eligible rows on a "
+            "category_path that is NEITHER a taxonomy leaf NOR an ancestor of "
+            "one — no hard-prefix match and no #2122 ancestor admission, so no "
+            "category recall at all"
+        ),
+        "env": "CATALOG_INVARIANT_OFF_TAXONOMY_SHARE_TENTHS",
+        # Measured on prod 2026-09-09: 808 of 10,509 = 7.69% = 77 tenths. Enforcing at 85 (8.5%).
+        "default_threshold": 85,
+        "count_sql": None,
+        "sample_sql": None,
+        "runner": _run_off_taxonomy_share,
     },
 ]
 

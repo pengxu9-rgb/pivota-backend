@@ -341,15 +341,47 @@ def _check(name):
     return matches[0]
 
 
-def test_interior_node_check_is_a_ratchet_not_a_report():
+def test_both_taxonomy_checks_are_ratchets_not_reports():
     """warn_only at threshold 0 would print the real number every run and alarm on nothing — a
     metric wearing a detector's name, which is the category error this module exists to catch.
-    Enforcing at the measured count tolerates the cohort and refuses its growth."""
-    check = _check("serving_eligible_on_interior_taxonomy_node")
-    assert not check.get("warn_only"), "a ratchet that never fails is a metric"
-    assert check["default_threshold"] == 4588, "the measured prod count, 2026-09-09"
-    assert "serving_eligible" in check["count_sql"]
-    assert check["sample_sql"], "a check over threshold with no samples is unactionable"
+
+    A SHARE, not a row count. The first version enforced at the measured 4,588 rows; review pointed
+    out that is a hair trigger on 43.7% of the served catalogue, since nightly_index_health
+    recomputes serving_eligible every 7,200s and one promotion moves 4,588 to 4,589. A number that
+    must be edited most days gets raised instead of respected."""
+    for name, baseline, threshold in (
+        ("serving_eligible_on_interior_taxonomy_node", 437, 450),
+        ("serving_eligible_off_taxonomy_path", 77, 85),
+    ):
+        check = _check(name)
+        assert not check.get("warn_only"), "%s: a ratchet that never fails is a metric" % name
+        assert check["default_threshold"] == threshold, name
+        # Headroom, but not so much that the alarm is decorative: the baseline must still be
+        # recognisably below the threshold, and the threshold must still be reachable.
+        assert baseline < threshold <= baseline * 1.15, (
+            "%s: threshold %d is not a ratchet over a baseline of %d"
+            % (name, threshold, baseline)
+        )
+        assert check["count_sql"] is None and check["sample_sql"] is None, (
+            "%s computes a share in Python; restating it in SQL is how the two drift" % name
+        )
+        assert callable(check.get("runner")), name
+
+
+def test_the_two_taxonomy_cohorts_are_disjoint_by_construction():
+    """Interior and off-taxonomy must not double-count a row, or the two shares describe an
+    overlapping population and neither number means what it says. The predicates are built from
+    complementary set membership; this pins that they stay so."""
+    from services.catalog_invariant_checks import (
+        _INTERIOR_HANDICAP_SQL,
+        _OFF_TAXONOMY_SQL,
+    )
+
+    # off-taxonomy excludes BOTH the interior nodes and the leaves; interior includes NULL/blank,
+    # which off-taxonomy explicitly excludes.
+    assert "NOT IN" in _OFF_TAXONOMY_SQL
+    assert "<> ''" in _OFF_TAXONOMY_SQL, "off-taxonomy must exclude the blank/NULL cohort"
+    assert "IS NULL" in _INTERIOR_HANDICAP_SQL
 
 
 def test_the_interior_node_list_is_derived_and_excludes_leaves():
@@ -374,14 +406,25 @@ def test_the_interior_node_list_is_derived_and_excludes_leaves():
     assert not (_TAXONOMY_PATHS & _INTERIOR_NODES)
 
 
-def test_the_interior_list_reaches_the_sql():
-    """Deriving the set is useless if the query does not use it."""
-    check = _check("serving_eligible_on_interior_taxonomy_node")
-    assert "'beauty/makeup'" in check["count_sql"]
-    assert "'beauty/makeup'" in check["sample_sql"]
-    assert "'fashion/shoes'" not in check["count_sql"]
-    # NULL and blank are unroutable too — a row with no path routes on nothing
-    assert "category_path IS NULL" in check["count_sql"]
+def test_the_interior_list_reaches_the_predicate():
+    """Deriving the set is useless if the query does not use it.
+
+    (These are string assertions on purpose — they only pin that the derivation is WIRED IN.
+    Whether the predicate counts correctly is proved by executing it, in
+    tests/test_green_over_broken_detectors_postgres.py, because a string test cannot tell `IN`
+    from `NOT IN`. That was the finding that produced the Postgres gate.)"""
+    from services.catalog_invariant_checks import (
+        _INTERIOR_HANDICAP_SQL,
+        _OFF_TAXONOMY_SQL,
+    )
+
+    assert "'beauty/makeup'" in _INTERIOR_HANDICAP_SQL
+    assert "'fashion/shoes'" not in _INTERIOR_HANDICAP_SQL
+    # NULL and blank belong to the interior cohort — a row with no path routes on nothing
+    assert "category_path IS NULL" in _INTERIOR_HANDICAP_SQL
+    # the off-taxonomy predicate needs BOTH lists, or it cannot tell a typo from a real leaf
+    assert "'beauty/makeup'" in _OFF_TAXONOMY_SQL
+    assert "'fashion/shoes'" in _OFF_TAXONOMY_SQL
 
 
 def test_every_check_has_a_description_and_a_threshold_env():
