@@ -312,7 +312,10 @@ async def test_the_retention_report_counts_real_history_and_deletes_nothing(
         before_events = await _event_ids(test_database)
         before_interactions = await _interaction_ids(test_database)
 
-        report = await retention.report_ledger_retention(horizon_days=7)
+        # now=NOW. The comment below — "the fresh probe row is not" — was true only until real
+        # time reached FRESH + 7 days, i.e. 2026-09-10T12:00Z, at which point this file went red
+        # on every branch. Same defect as the Postgres twin; both callers needed the clock.
+        report = await retention.report_ledger_retention(horizon_days=7, now=NOW)
 
         # Everything OLD is behind a 7-day horizon; the fresh probe row is not.
         assert report["horizon_days"] == 7
