@@ -93,3 +93,14 @@ async def test_an_empty_cohort_when_nothing_was_re_keyed(monkeypatch):
     monkeypatch.setattr(cbf, "fetch_shopify_products", fake_fetch)
     monkeypatch.setattr(cbf, "fetch_shopify_shop_locale", fake_locale)
     assert await build_cohort("cosrx.com", "COSRX", "beauty/skincare") == []
+
+
+def test_a_jsonb_value_is_bound_as_text_however_the_driver_returned_it():
+    """`CAST(:metadata AS jsonb)` wants TEXT. asyncpg hands a jsonb column back as a
+    dict and the manifest round-trips it as one; binding that to a text cast fails in
+    `revert` — the one path that must not fail."""
+    from scripts.retire_superseded_brand_keys import _as_json_text
+    assert _as_json_text(None) is None
+    assert _as_json_text('{"a": 1}') == '{"a": 1}'
+    assert _as_json_text({"run_id": "x", "n": 2}) == '{"run_id": "x", "n": 2}'
+    assert _as_json_text([1, 2]) == "[1, 2]"

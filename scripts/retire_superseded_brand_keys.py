@@ -108,6 +108,13 @@ UPDATE external_product_seeds SET status = :status, updated_at = NOW() WHERE id 
 """
 
 
+def _as_json_text(value: Any) -> Optional[str]:
+    """A jsonb bind value as TEXT, or None. See the note in `revert`."""
+    if value is None or isinstance(value, str):
+        return value
+    return json.dumps(value)
+
+
 async def build_cohort(domain: str, brand: str, category_path: str) -> List[Dict[str, Any]]:
     """(stale_key, new_key, brand, title) for every record the fix re-keyed.
 
@@ -218,7 +225,11 @@ async def revert(manifest_path: str) -> None:
             await database.execute(UNSUPPRESS_SQL, {
                 "key": row["product_key"], "reason": row["prior_suppression_reason"],
                 "suppressed_at": row["prior_suppressed_at"],
-                "metadata": row["prior_suppression_metadata"],
+                # `CAST(:metadata AS jsonb)` wants TEXT. The driver hands a jsonb column
+                # back as a dict, the manifest round-trips it as one, and binding a dict
+                # to a text cast fails -- in `revert`, which is the one path that must
+                # not fail. Serialise anything that is not already a string.
+                "metadata": _as_json_text(row["prior_suppression_metadata"]),
             })
         for s in m.get("seeds") or []:
             await database.execute(REACTIVATE_SEED_SQL, {"id": s["id"], "status": s["prior_status"]})
