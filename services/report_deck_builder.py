@@ -263,6 +263,10 @@ def build_report_deck(
         fill = slide.background.fill
         fill.solid()
         fill.fore_color.rgb = rgb(bg)
+        text_box(slide, 0.9, 7.1, 11.5, 0.25, [(
+            "Diagnostic record: product identity, excerpts and recommendations are unverified; not consumer answer measurement.",
+            9, False, _ICE if bg == _NAVY else _MUTED, 0,
+        )])
         return slide
 
     def text_box(
