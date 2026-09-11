@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
@@ -22,6 +23,7 @@ from services.agent_decision_gates import (
     agent_decision_gates_enabled,
     evaluate_agent_decision_gates,
 )
+from services.category_path_aliases import resolve as resolve_category_path
 from services.priced_offer_sql import priced_offer_exists_sql
 from services.region_pricing import (
     has_offer_priced_for_any_region_sql,
@@ -195,6 +197,70 @@ def _extract_domain(url: str) -> Optional[str]:
         return host or None
     except Exception:  # noqa: BLE001
         return None
+
+
+def _leaf_category_required_for_serving() -> bool:
+    """OFF by default, and DO NOT TURN IT ON YET. The number is now measured.
+
+    This flag DELISTS rows, so it was written needing a count before anyone flipped it. That count
+    was taken against production on 2026-09-11 (in-VPC one-off job; the DB is on a private address,
+    see docs and pivota-backend#2172):
+
+        multi-segment rows            12,799   (serving-eligible 7,901)
+        ... that do NOT resolve()      4,154   (serving-eligible 2,987)
+
+    So flipping this today removes 2,987 of 7,901 serving rows -- 37.8% of the served index. By
+    writer:
+
+        enrichment_agent_v1        2,708      <-- one writer is almost the whole number
+        reviewed_ext_seed_mirror     206
+        codex_review_v1               71
+        regex_backfill                 2
+
+    AND THE CAUSE IS NOT BAD DATA, IT IS A BRANCH NODE. `enrichment_agent_v1` writes two-segment
+    paths that name a real branch of the taxonomy but not a leaf -- `beauty/makeup` (1,843 rows,
+    1,667 serving) and `beauty/skincare` (1,693 rows, 1,039 serving). Those rows are browsable
+    (`has_category_door` is True for both); they simply have no leaf. Delisting them would be
+    punishing a writer for being imprecise, not for being wrong, and would take a third of the index
+    off the shelf to do it.
+
+    THE ORDER IS: fix `enrichment_agent_v1` to emit a leaf, re-run the backfill in
+    scripts/backfill_pdp_category_path.py (which this change teaches to revisit bare domains), take
+    the count again, and only then flip this. Flipping first is an outage.
+    """
+    return str(os.getenv("CATEGORY_LEAF_REQUIRED_FOR_SERVING", "") or "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _has_resolvable_leaf_category(category_path: Optional[str]) -> bool:
+    """A row is categorised only when its path resolves to a taxonomy LEAF.
+
+    THIS IS THE ONE FENCE THAT REACHES EVERY WRITER. `category_path` is written by at least four
+    committed lanes across two repos and two languages -- the external-seed mirror, the Ulta
+    retailer mirror, the reviewed-category patch script, the enrichment agent -- plus at least one
+    out-of-repo actor (`category_label_source = 'codex_review_v1'` appears in prod and in ZERO
+    commits in either repository, i.e. hand-run SQL). No writer-side guard can reach that last one.
+    This predicate runs once per row, here, wherever the row came from.
+
+    USE resolve(), NOT has_category_door(). That is the whole bug:
+
+        resolve("beauty")            -> None
+        has_category_door("beauty")  -> True
+
+    `ANCESTOR_NODES` is built with `range(1, len(parts))`, so i == 1 is included and EVERY top-level
+    domain -- `beauty`, `fashion`, `electronics` -- is a taxonomy node with a "category door". A row
+    parked on a bare domain therefore passes every off-taxonomy health check while being unretrievable
+    by category at serving. That is why this cohort survived a taxonomy standardisation pass: nothing
+    was measuring it. Measured on the live index, 16 of 50 rows returned for "eau de parfum" sit on
+    bare `beauty`, including the whole Ariana Grande fragrance line and every PixiPerfume row.
+
+    Generic by construction: it asks for a leaf, so `fashion` and `electronics` are caught on the
+    same rule without naming them.
+    """
+    if not category_path:
+        return False
+    return resolve_category_path(str(category_path).strip()) is not None
 
 
 def _classify_product(
@@ -377,6 +443,14 @@ def _classify_product(
     elif domain_has_regression:
         blocker_code = "extractor_regression"
         blocker_detail = f"domain {domain!r} has regression alert in domain_extractor_baselines"
+    elif _leaf_category_required_for_serving() and not _has_resolvable_leaf_category(
+        row.get("category_path")
+    ):
+        blocker_code = "no_leaf_category"
+        blocker_detail = (
+            f"category_path {row.get('category_path')!r} does not resolve to a taxonomy LEAF; "
+            "a row that has not been categorised cannot be retrieved by category"
+        )
     elif agent_decision_gates_enabled():
         # Additive agent-decision-grade gates (PR4), only after all PDP gates
         # pass. Flag-gated, so default behavior is unchanged. Picked up by the
@@ -612,6 +686,7 @@ _ELIGIBILITY_COLUMNS = f"""
     cp.suppressed_at,
     cp.canonical_url,
     cp.category_kind,
+    cp.category_path,
     pqs.content_quality_score,
     pqs.model_readiness_score,
     pqs.conversion_potential_score,

@@ -4,7 +4,8 @@ from regex patterns ported from
 PIVOTA-Agent-mainline-verify/src/services/externalSeedProducts.js
 (BEAUTY_CATEGORY_PATTERNS).
 
-For each catalog_products row where category_path IS NULL:
+For each catalog_products row that has not been CATEGORISED -- category_path IS NULL, or a path
+that names only a top-level domain such as `beauty`:
   - Run regex against (category, product_type, title) in priority order.
   - On first match, populate category_path + category_label_source='regex_backfill'
     + category_confidence=0.85.
@@ -31,6 +32,7 @@ from db.database import database
 from services.pdp_category_classifier import (  # noqa: E402
     CATEGORY_PATTERNS,  # re-exported for the test that pins drift
     classify,  # noqa: F401  (re-exported for tests)
+    is_categorised_path,  # noqa: F401  (re-exported for tests)
     resolve_path_from_row,
 )
 
@@ -51,7 +53,7 @@ async def _fetch_batch(limit: int, after_key: Optional[str]) -> List[dict]:
           product_type,
           title
         FROM catalog_products
-        WHERE category_path IS NULL
+        WHERE (category_path IS NULL OR POSITION('/' IN category_path) = 0)
           AND (CAST(:after_key AS text) IS NULL OR product_key > CAST(:after_key AS text))
         ORDER BY product_key ASC
         LIMIT :limit
@@ -68,7 +70,8 @@ async def _apply_update(product_key: str, category_path: str) -> None:
         SET category_path = :path,
             category_confidence = :confidence,
             category_label_source = :source
-        WHERE product_key = :key AND category_path IS NULL
+        WHERE product_key = :key
+          AND (category_path IS NULL OR POSITION('/' IN category_path) = 0)
         """,
         {
             "key": product_key,

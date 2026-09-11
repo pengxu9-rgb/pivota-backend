@@ -356,6 +356,33 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
 ]
 
 
+# THE ONE DEFINITION OF "THIS ROW HAS BEEN CATEGORISED".
+#
+# A path names a category only once it says something past the top-level domain. `beauty` is a
+# NAMESPACE, not an answer to "what is this" -- and treating it as an answer is what stranded an
+# entire cohort. Measured on the live index: of 50 rows returned for "eau de parfum", 16 sit on bare
+# `beauty`, including the whole Ariana Grande fragrance line, Cosmic Kylie Jenner and every
+# PixiPerfume. Serving drops them as `category_mismatch`, and the backfill below never revisits them
+# because `category_path IS NULL` reads them as already done. A useless answer counted as an answer
+# in both directions at once.
+#
+# It also explains why the cohort survived a taxonomy standardisation pass: `beauty` IS on the
+# taxonomy, so an off-taxonomy health check counts it healthy. Nothing was watching non-leaf paths.
+#
+# Exported so the backfill, the serving gate and any future writer share one rule rather than each
+# re-deciding what "categorised" means. PIVOTA-Agent's serving-side twin is
+# `categoryPathIsCategorised` in src/server.js; the drift test below pins them to the same rule.
+MIN_CATEGORISED_PATH_SEGMENTS = 2
+
+
+def is_categorised_path(category_path: Optional[str]) -> bool:
+    """True when the path names a category, not merely a top-level domain."""
+    if not category_path:
+        return False
+    segments = [seg for seg in str(category_path).strip().strip("/").split("/") if seg]
+    return len(segments) >= MIN_CATEGORISED_PATH_SEGMENTS
+
+
 def classify(text: Optional[str]) -> Optional[Tuple[str, str]]:
     """Return (category_label, category_path) on first matching pattern, else None."""
     if not text:
