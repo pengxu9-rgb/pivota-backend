@@ -3502,9 +3502,23 @@ def _offers_scope_or_none(raw: Any) -> Optional[str]:
     here as a "scope" pointing at a merchant that does not exist. Treat it as unscoped (same
     rule as the gateway's services/sourcingSentinel), so seed products resolve by identity
     instead of dying inside a fake merchant's empty catalog.
+
+    A HOST IS NOT A MERCHANT SCOPE EITHER, and that is no longer hypothetical. Seed and
+    retailer offers advertise `merchant_id` so an agent can NAME the seller, and the seed
+    lane's identity is a destination host (`rovectin.com`) because a seed has no
+    `catalog_merchants` row. Callers echo advertised fields back, so that host arrives here
+    as a "scope" — and `catalog_products.merchant_id` is always `merch_obs_…`, never a host,
+    so scoping to it matches zero rows, disables the canonical-context prefetch, and returns
+    an empty list for the agent's most obvious follow-up call. Naming the merchant and then
+    refusing to answer about it is worse than not naming it.
+
+    So the rule is a SHAPE, not a list of known sentinels: a real Pivota merchant id has no
+    dot in it. One more sentinel would have been the third patch to the same allowlist.
     """
     s = str(raw or "").strip()
     if not s or s.lower() in {"external_seed", "external seed"}:
+        return None
+    if "." in s:
         return None
     return s
 
@@ -3696,6 +3710,15 @@ def _build_internal_offer_summary(
     offer_id = f"of:internal_checkout:{merchant_id}:{product_id}:{variant_id or '∅'}"
     return {
         "offer_id": offer_id,
+        # BOTH SPELLINGS. `offerToSignal` in the gateway
+        # (PIVOTA-Agent src/agentSignals/offerToSignal.js:90-97) reads TOP-LEVEL `merchant_id` /
+        # `merchant_name` and projects neither `seller` nor `internal_checkout_items`. This lane
+        # emitted the merchant only as `seller` and inside `internal_checkout_items[0]`, so its
+        # offers reached an agent as `merchant_id: null` — a row in a cross-merchant list with no
+        # seller to name and no way to attribute it. The catalog_offers arm already emits both
+        # (see its SHAPE note); this is the "separate change" that note defers to.
+        "merchant_id": merchant_id or None,
+        "merchant_name": seller or None,
         "seller": seller,
         "price": price_amount,
         "currency": currency,
@@ -4814,9 +4837,39 @@ async def _handle_offers_resolve(
                     )
                 )
 
+                # The SELLER'S IDENTITY, not ours. A seed has no `catalog_merchants` row, so
+                # its merchant is the destination host — rovectin.com, stylekorean.com.
+                #
+                # ⚠️ THE TWO LANES DO NOT AGREE ON THE IDENTIFIER, and an earlier version of this
+                # comment claimed they did. The catalog_offers arm DEDUPES on host but sets
+                # `merchant_id` from `catalog_offers.merchant_id` joined to `catalog_merchants` —
+                # a real merchant id. So one list can carry ids from two namespaces. They agree
+                # on the dedupe KEY, not on the identifier, and `_offers_scope_or_none` is what
+                # stops the difference hurting a caller who echoes one back.
+                #
+                # `external_seed` would still be wrong here: every seed would collapse to one
+                # merchant and destroy the comparison this list exists for. (An earlier comment
+                # cited src/server.js:1998 as the gateway substituting a host label for that id —
+                # that is the PDP `resolveOfferSellerName` path, not `offerToSignal`, which does
+                # no substitution at all. The conclusion holds; the citation did not.)
+                # `normalize_shop_host`, and the SAME url the link resolves to — both
+                # deliberately, and both were wrong in the first cut. A bare `.strip().lower()`
+                # ships `merchant_id: "https://x.com/"` beside `merchant_domain: "x.com"` for
+                # any seed whose `domain` column holds a URL; and `_seed_domain_from_url` on the
+                # RAW `destination_url` names a host the buyer never lands on whenever a
+                # `canonical_url` overrides it — which the two comments above this block already
+                # warn about in those exact words. This matches `merchant_domain` at :4729.
+                seed_merchant_id = (
+                    normalize_shop_host(row_dict.get("domain") or seed_data.get("domain"))
+                    or _seed_domain_from_url(str(canonical_url or destination_url))
+                    or None
+                )
                 external_offers.append(
                     {
                         "offer_id": offer_id,
+                        # Both spellings — see the note in `_build_internal_offer_summary`.
+                        "merchant_id": seed_merchant_id,
+                        "merchant_name": seller or None,
                         "seller": seller,
                         "price": price_amount,
                         "currency": currency,
