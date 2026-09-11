@@ -370,3 +370,15 @@ async def test_probe_successful_runs_records_succeeded_telemetry(
     assert capture_record["status"] == "succeeded"
     assert capture_record["error_message"] is None
     assert capture_record["input_tokens"] == 900
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('estimate', [0.036491, 0.005976, None])
+async def test_versioned_gateway_cost_not_repriced_or_double_charged(capture_record, estimate):
+    import time
+    from services import agent_center_llm_client as client
+    await client._record_probe_telemetry(provider='chatgpt',scan_mode='consumer_answer_test',
+        status='succeeded',started_at_perf=time.perf_counter(),result={
+            'usage':{'input_tokens':4494,'output_tokens':103,'cost_usd_estimate':estimate,
+                     'cost_basis':'published_list_price_upper_bound_2026_09_09','cost_settled':False}})
+    assert capture_record['cost_usd'] == estimate

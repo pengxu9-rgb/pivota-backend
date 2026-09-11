@@ -381,6 +381,19 @@ def audit_harness(monkeypatch):
     from utils import auth as auth_module
 
     store = _AuditStore()
+    from contextlib import asynccontextmanager
+    from services import consumer_capture_settlement as settlement
+    @asynccontextmanager
+    async def transaction():
+        yield
+    async def finalize_row(query, values):
+        ok = await store.transition_stage(run_id=values['run_id'], from_stage='verifying',
+                                         to_stage='completed', worker_id=values['worker_id'])
+        return {'run_id': values['run_id']} if ok else None
+    from types import SimpleNamespace
+    monkeypatch.setattr(settlement, 'database', SimpleNamespace(transaction=transaction, fetch_one=finalize_row))
+    monkeypatch.setattr(settlement, 'credit', store.credit)
+
     monkeypatch.setattr(
         audit_runs_routes.settings, "deepseek_api_key", "test-deepseek-key",
         raising=False,
@@ -696,3 +709,109 @@ async def test_v3_audit_concurrent_idempotency_single_debit(audit_harness):
     assert sorted(body["idempotent_replay"] for body in bodies) == [False, True]
     assert len(store.rows) == 1
     assert [debit["kind"] for debit in store.debits] == ["audit"]
+
+
+@pytest.mark.asyncio
+async def test_consumer_capture_launch_worker_and_report_are_connected(audit_harness,monkeypatch):
+    import hashlib,json
+    from services import consumer_capture_worker as capture
+    from services.consumer_answer_evidence import SYSTEM
+    store,app,worker=audit_harness
+    monkeypatch.setenv('PIVOTA_CONSUMER_ANSWER_ENABLED','true')
+    original=capture.agent_center_llm_client.probe
+    calls=[]
+    async def probe(**kw):
+        if kw['scan_mode']!='consumer_answer_test':
+            return await original(**kw)
+        calls.append(kw)
+        query=kw['context']['queries'][0]; text='A useful shopping answer.'
+        return {'provider':kw['provider'],'raw_runs':[{
+            'query':query,'evidence_kind':'consumer_answer','prompt_contract':'consumer_query_v1',
+            'answer':{'text':text,'sha256':hashlib.sha256(text.encode()).hexdigest(),
+                      'prompt_sha256':hashlib.sha256(json.dumps([SYSTEM,query],ensure_ascii=False,separators=(',',':')).encode()).hexdigest(),
+                      'complete':True,'status':'complete','provider':kw['provider'],'model':'fixture',
+                      'finish_reason':'STOP' if kw['provider']=='gemini' else 'completed'},
+            'grounding_sources':[],
+        }]}
+    async def checkpoint(**kw):
+        partial=store.rows[kw['run_id']]['partial_result_jsonb']
+        assert partial.get('consumer_capture')==kw['previous']
+        assert partial['launch']['consumer_capture_plan']['sha256']==kw['plan_sha256']
+        partial['consumer_capture']=deepcopy(kw['state'])
+    monkeypatch.setattr(capture.agent_center_llm_client,'probe',probe)
+    monkeypatch.setattr(capture,'save_checkpoint',checkpoint)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://test') as client:
+        created=await client.post('/api/audits',json={'merchant_id':'merch-A','product_keys':['pk-1'],
+            'providers':['gemini'],'consumer_answer_queries':['best serum']})
+        assert created.status_code==202,created.text
+        assert await worker.process_one_audit_run() is True
+        fetched=await client.get('/api/audits/'+created.json()['run_id'])
+    assert fetched.status_code==200,fetched.text
+    assert fetched.json()['stage']=='completed'
+    report=fetched.json()['report_jsonb']
+    assert len(calls)==1
+    assert calls[0]['context']=={'queries':['best serum']}
+    assert len(report['consumer_selection_observations'])==1
+    assert report['consumer_selection_observations'][0]['evidence_kind']=='consumer_answer'
+    assert len(report['per_sku_reports'])==1
+    assert set(report['per_sku_reports'][0]['scores'])=={'identity','content_richness','routability','citation'}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_fails", [False, True])
+async def test_required_web_retained_response_through_launch_replay_worker_and_report(audit_harness, monkeypatch, provider_fails):
+    """Real retained provider response; in-memory ledger, no new provider charge."""
+    import json
+    from pathlib import Path
+    from services import consumer_capture_worker as capture
+    fixture = json.loads((Path(__file__).parents[1] / 'fixtures_consumer_required_web.json').read_text())
+    store, app, worker = audit_harness
+    monkeypatch.setenv('PIVOTA_CONSUMER_ANSWER_ENABLED', 'true')
+    monkeypatch.setenv('PIVOTA_CONSUMER_ANSWER_PROVIDERS', 'gemini,chatgpt')
+    original = capture.agent_center_llm_client.probe
+    calls = []
+
+    async def probe(**kwargs):
+        if kwargs['scan_mode'] != 'consumer_answer_test':
+            return await original(**kwargs)
+        calls.append(kwargs)
+        assert kwargs['context'] == {'queries': [fixture['query']], 'consumer_execution_profile': 'openai_web_required_v2'}
+        if provider_fails:
+            raise TimeoutError('provider unavailable')
+        return deepcopy(fixture['result'])
+
+    async def checkpoint(**kwargs):
+        partial = store.rows[kwargs['run_id']]['partial_result_jsonb']
+        assert partial.get('consumer_capture') == kwargs['previous']
+        assert partial['launch']['consumer_capture_plan']['sha256'] == kwargs['plan_sha256']
+        partial['consumer_capture'] = deepcopy(kwargs['state'])
+
+    monkeypatch.setattr(capture.agent_center_llm_client, 'probe', probe)
+    monkeypatch.setattr(capture, 'save_checkpoint', checkpoint)
+    payload = {'merchant_id': 'merch-A', 'product_keys': ['pk-1'], 'providers': ['chatgpt'],
+               'consumer_answer_queries': [fixture['query']]}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+        first = await client.post('/api/audits', json=payload)
+        assert first.status_code == 202, first.text
+        replay = await client.post('/api/audits', json=payload)
+        assert replay.status_code == 202, replay.text
+        assert replay.json()['run_id'] == first.json()['run_id']
+        assert replay.json()['idempotent_replay'] is True
+        assert len(store.debits) == 1
+        assert await worker.process_one_audit_run() is True
+        fetched = await client.get('/api/audits/' + first.json()['run_id'])
+    assert fetched.status_code == 200, fetched.text
+    assert fetched.json()['stage'] == 'completed'
+    observations = fetched.json()['report_jsonb']['consumer_selection_observations']
+    assert len(calls) == len(observations) == 1
+    if provider_fails:
+        assert observations[0]['status'] == 'provider_failed'
+        assert observations[0]['brand_mentioned'] is None
+    else:
+        assert observations[0]['status'] == 'answered'
+        assert observations[0]['prompt_contract'] == 'consumer_query_openai_web_required_v2'
+        assert type(observations[0]['brand_mentioned']) is bool
+    refunded = sum(c['amount'] for c in store.credits)
+    expected = store.rows[first.json()['run_id']]['partial_result_jsonb']['launch']['consumer_capture_quote']['credits'] if provider_fails else 0
+    assert refunded == expected
+    assert store.balance['credits'] == store.initial_credits - store.debits[0]['amount'] + refunded
