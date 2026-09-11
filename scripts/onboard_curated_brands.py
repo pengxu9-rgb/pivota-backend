@@ -79,6 +79,25 @@ async def _run(args: argparse.Namespace) -> int:
             )
             records_for_brand.last_vendor_filter_report = None  # type: ignore[attr-defined]
         print(f"  {b['domain']}: {len(recs)} products")
+        # A brand-family storefront must not ingest silently. misshaus.com shipped 17
+        # A'pieu products into the index branded "Missha" because nothing printed the
+        # disagreement at run time.
+        census = getattr(records_for_brand, "last_brand_census", None)
+        if census and census.get("kept_vendor_count"):
+            print(
+                f"    brand: '{census['brand_override']}' does NOT own "
+                f"{census['kept_vendor_count']} product(s) on this storefront — "
+                f"keeping each product's own vendor:"
+            )
+            for vname, info in sorted(
+                census["vendors"].items(), key=lambda kv: -kv[1]["count"]
+            ):
+                if info["reason"] == "vendor_disagrees":
+                    print(f"      {info['count']:>4}  {vname} (kept as its own brand)")
+            print(
+                "      pass --only-vendor to ingest just one brand from this feed."
+            )
+            records_for_brand.last_brand_census = None  # type: ignore[attr-defined]
         fold = getattr(records_for_brand, "last_fold_report", None) if args.base_listings_only else None
         if fold:
             print(

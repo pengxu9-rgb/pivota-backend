@@ -17,6 +17,7 @@ caller runs `ingest_validated_jsonl` + `apply_ingest_plan` (gated).
 from __future__ import annotations
 
 import asyncio
+import collections
 import html
 import json
 import logging
@@ -923,6 +924,89 @@ def _to_float(value: Any) -> Optional[float]:
         return None
 
 
+def _brand_key(value: Optional[str]) -> str:
+    """Alphanumeric-only comparison form of a brand/vendor label.
+
+    Tighter than `_vendor_token` (which only casefolds) because the comparison here is
+    "are these two labels the same BRAND", and the spellings that must compare equal
+    differ by punctuation and spacing: `A'PIEU`/`Apieu`, `MISSHA US`/`Missha`.
+    `_vendor_token` is left alone — it backs `filter_products_by_vendor`, where exact
+    selection is the point and loose matching is the documented hazard.
+    """
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+
+
+def _looks_like_a_brand_name(value: Optional[str]) -> bool:
+    """Does this vendor string read as a NAME rather than a supplier/SKU code?
+
+    The test is one alphabetic run of three or more characters: `APIEU`, `CHOGONGJIN`
+    and `Time Revolution` pass; `VC-B004` (sukoshi.com's vendor on 11 measured rows)
+    and `3M`-style stubs do not. Deliberately crude — it decides only whether a vendor
+    is allowed to OVERRULE the operator's brand, and a false negative just keeps
+    today's behaviour.
+    """
+    return any(len(run) >= 3 for run in re.findall(r"[^\W\d_]+", str(value or ""), re.UNICODE))
+
+
+def resolve_record_brand(
+    vendor: Optional[str], brand_override: Optional[str], domain: Optional[str]
+) -> Tuple[str, str]:
+    """Decide the brand for ONE product, returning `(brand, reason)`.
+
+    `brand_override` is a per-DOMAIN claim by the operator; `vendor` is the storefront's
+    own per-PRODUCT claim. They disagree on brand-family storefronts: misshaus.com
+    publishes 125 products of which 17 carry `vendor: "APIEU"` (Able C&C owns both
+    labels). Renaming those to "Missha" is not a spelling normalisation, it is an
+    assertion that A'pieu's products are Missha's — and it was measured live on
+    2026-09-11 doing exactly that: 15 A'pieu rows in the index branded `Missha`, which
+    also made them invisible to brand-strict recall (`external_seed_brand_strict_rows: 0`
+    on a search for `A'PIEU` that nonetheless returned all 15).
+
+    So the override still wins everywhere it is a NORMALISATION, and loses where it
+    would be a RELABEL:
+      * no vendor              -> override           (nothing to contradict it)
+      * same brand, differently spelt -> override    (`MISSHA US` -> `Missha`)
+      * vendor names the STORE -> override           (`thefaceshopny` on thefaceshopny.com)
+      * genuine disagreement   -> VENDOR             (`APIEU` on misshaus.com)
+
+    Containment, not equality, decides "same brand": `missha` is a substring of
+    `misshaus`. It is deliberately narrow — both sides are short brand labels, and the
+    cost of a false "same" is only today's behaviour, while the cost of a false
+    "different" is a wrong brand on the row. Guarded by a 3-character floor so a
+    2-letter vendor cannot be a substring of half the brands in the catalogue.
+    """
+    v_raw = str(vendor or "").strip()
+    o_raw = str(brand_override or "").strip()
+    if not o_raw:
+        return v_raw, "vendor_only"
+    if not v_raw:
+        return o_raw, "override_no_vendor"
+    v, o = _brand_key(v_raw), _brand_key(o_raw)
+    if not v:
+        return o_raw, "override_no_vendor"
+    # Containment subsumes equality (`v == o` implies `v in o`), including below the
+    # 3-char floor: two equal sub-floor keys cannot carry a 3-letter run either, so
+    # they fall to `_looks_like_a_brand_name` and return the same string anyway. A
+    # separate equality arm here was provably unreachable — it changed no output under
+    # mutation — and is deliberately absent rather than kept as untested reassurance.
+    if len(v) >= 3 and len(o) >= 3 and (v in o or o in v):
+        return o_raw, "override_same_brand"
+    host_label = _brand_key(_clean_domain(domain or "").split(".")[0])
+    if host_label and len(v) >= 3 and (v in host_label or host_label in v):
+        # The vendor field is the STORE's name, not a brand — the override is the only
+        # brand claim available and is what the operator came to assert. Measured:
+        # metro.com.sg publishes `vendor: "Metro Singapore Departmental Store -
+        # Celebrating 69 Years in SG"`, which contains the host label and names no brand.
+        return o_raw, "override_vendor_is_store"
+    if not _looks_like_a_brand_name(v_raw):
+        # A SUPPLIER CODE is not a brand. sukoshi.com publishes `vendor: "VC-B004"` on
+        # products whose brand appears only in the title; adopting that verbatim would
+        # put "VC-B004" in the brand column, which is worse than the override it
+        # replaced. The override at least names a real brand.
+        return o_raw, "override_vendor_is_not_a_name"
+    return v_raw, "vendor_disagrees"
+
+
 def shopify_product_to_record(
     product: Dict[str, Any],
     *,
@@ -947,7 +1031,13 @@ def shopify_product_to_record(
     handle = str(product.get("handle") or "").strip()
     if not title or not handle:
         return None
-    brand = str(brand_override or product.get("vendor") or "").strip()
+    # NOT `brand_override or vendor`: that renames across a brand boundary. See
+    # `resolve_record_brand` — the override normalises spelling, it does not relabel
+    # a sibling brand the storefront names itself.
+    brand, _brand_reason = resolve_record_brand(
+        product.get("vendor"), brand_override, host
+    )
+    brand = str(brand or "").strip()
     if not brand:
         return None
     variants = product.get("variants")
@@ -1106,7 +1196,11 @@ def shopify_product_to_record(
         },
         "offers": [
             {
-                "merchant_inferred": brand,
+                # The MERCHANT is the storefront, which is not always the brand: once
+                # `resolve_record_brand` can keep a sibling brand's own vendor (APIEU on
+                # misshaus.com), `brand` names the maker and the override names the shop.
+                # Identical on every single-brand feed, where the two are the same string.
+                "merchant_inferred": str(brand_override or "").strip() or brand,
                 "canonical_url": canonical_url,
                 "destination_url": canonical_url,
                 "image_url": str(image.get("src") or "").strip(),
@@ -1462,6 +1556,27 @@ async def records_for_brand(
         records_for_brand.last_vendor_filter_report = {  # type: ignore[attr-defined]
             "vendors": list(only_vendors), "before": before, "after": len(products),
         }
+    # A brand-family storefront (misshaus.com: 89 MISSHA + 17 APIEU + 7 CHOGONGJIN)
+    # is not visibly different from a single-brand one until something counts the
+    # vendors. Computed from the SAME resolver the record builder uses, so the report
+    # cannot drift from the decision it describes.
+    brand_census: Dict[str, Dict[str, Any]] = {}
+    for _p in products:
+        if not isinstance(_p, dict):
+            continue
+        _v = str(_p.get("vendor") or "").strip()
+        _resolved, _why = resolve_record_brand(_v, brand, domain)
+        _slot = brand_census.setdefault(
+            _v or "(no vendor)", {"count": 0, "resolved_brand": _resolved, "reason": _why}
+        )
+        _slot["count"] += 1
+    records_for_brand.last_brand_census = {  # type: ignore[attr-defined]
+        "brand_override": brand,
+        "vendors": brand_census,
+        "kept_vendor_count": sum(
+            v["count"] for v in brand_census.values() if v["reason"] == "vendor_disagrees"
+        ),
+    }
     if base_listings_only:
         products, fold_report = fold_shade_listings(products)
         records_for_brand.last_fold_report = fold_report  # type: ignore[attr-defined]
@@ -1491,4 +1606,27 @@ async def records_for_brand(
                     pair["rec"]["pdp"]["raw_inci"] = inci
                 if pdp_delay_s and i + 1 < min(len(pairs), max_pdp_inci_fetches):
                     await asyncio.sleep(pdp_delay_s)
+    # ONE spelling per brand. misshaus.com publishes both `APIEU` (16 products) and
+    # `Apieu` (1); kept verbatim they are two brands to every consumer that groups by
+    # the brand string, which splits a brand's catalogue for exactly the reason this
+    # fix exists. Fold each `_brand_key` group onto its most common raw spelling —
+    # a no-op for the override groups, whose members already share one string.
+    spellings: Dict[str, "collections.Counter[str]"] = {}
+    for rec in records:
+        b = str((rec.get("pdp") or {}).get("brand") or "")
+        if b:
+            spellings.setdefault(_brand_key(b), collections.Counter())[b] += 1
+    canonical = {
+        k: c.most_common(1)[0][0] for k, c in spellings.items() if len(c) > 1
+    }
+    if canonical:
+        for rec in records:
+            pdp = rec.get("pdp") or {}
+            b = str(pdp.get("brand") or "")
+            want = canonical.get(_brand_key(b))
+            if want and want != b:
+                pdp["brand"] = want
+        records_for_brand.last_brand_spelling_folds = canonical  # type: ignore[attr-defined]
+    else:
+        records_for_brand.last_brand_spelling_folds = {}  # type: ignore[attr-defined]
     return records
