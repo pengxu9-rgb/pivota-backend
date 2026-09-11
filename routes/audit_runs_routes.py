@@ -78,6 +78,7 @@ from services.provider_credit_rates import (
     provider_prompt_fraction,
 )
 from services.credit_consumption_service import estimate_probe_credits
+from services.consumer_capture_plan import plan_for_launch, quote_plan
 from utils.auth import get_current_merchant
 
 logger = logging.getLogger(__name__)
@@ -148,6 +149,7 @@ class CreateAuditRequest(BaseModel):
             "never billed for a tier the worker won't run."
         ),
     )
+    consumer_answer_queries: Optional[List[str]] = Field(default=None, max_length=8)
     custom_prompts: Optional[List[str]] = Field(
         default=None,
         max_length=10,
@@ -228,6 +230,7 @@ class AuditPreviewRequest(BaseModel):
     # CreateAuditRequest so preview and launch always price the same count.
     prompts_per_sku: Optional[int] = Field(default=None, ge=1, le=200)
     audit_tier: str = Field(default="standard", max_length=16)
+    consumer_answer_queries: Optional[List[str]] = Field(default=None, max_length=8)
     custom_prompts: Optional[List[str]] = Field(default=None, max_length=10)
     coverage_profile: str = Field(
         default_factory=default_coverage_profile,
@@ -782,6 +785,7 @@ async def _build_preview(
     prompts_per_sku: int,
     custom_prompts: Optional[List[str]],
     coverage: Dict[str, Any],
+    consumer_answer_queries: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     providers = list(coverage.get("providers") or [])
     # Default answer-quality verify to the engine's supported verifier(s) for the
@@ -850,6 +854,12 @@ async def _build_preview(
         }
         _PREVIEW_CACHE[cache_key] = (now, cost_part)
 
+    consumer_plan = plan_for_launch(product_keys=sku_keys, queries=consumer_answer_queries, providers=providers)
+    supplement = quote_plan(consumer_plan) if consumer_plan else None
+    cost_part = dict(cost_part)
+    if supplement:
+        cost_part["consumer_capture"] = supplement
+        cost_part["estimated_audit_credits"] += supplement["credits"]
     balance = await get_balance(merchant_id)
     requirements = _credit_requirements(
         sku_count=int(cost_part["sku_count"]),
@@ -859,6 +869,8 @@ async def _build_preview(
         verify_sample=cost_part.get("verify_sample") or {},
         custom_prompts=custom_prompts,
     )
+    if supplement:
+        requirements["audit"] += supplement["credits"]
     gaps = _credit_gaps(requirements=requirements, balance=balance)
     # A PAID tier can launch on overage — the launch gate only hard-blocks the
     # FREE tier (`if gaps and not paid_tier`, below). So the preview must report
@@ -925,6 +937,7 @@ async def preview_audit_run(
             ),
             custom_prompts=body.custom_prompts,
             coverage=coverage,
+            **({"consumer_answer_queries": body.consumer_answer_queries} if body.consumer_answer_queries else {}),
         )
         preview["audit_tier"] = audit_tier
         return preview
@@ -1007,13 +1020,21 @@ async def create_audit_run(
         force=body.force,
     )
 
+    try:
+        consumer_plan = plan_for_launch(
+            product_keys=body.product_keys, queries=body.consumer_answer_queries,
+            providers=list(_resolve_audit_coverage(coverage_profile=body.coverage_profile, providers=body.providers).get("providers") or []),
+        ) if body.consumer_answer_queries else None
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    consumer_scope = body.subject_type + ":" + consumer_plan["sha256"] if consumer_plan else body.subject_type
     # Idempotency dedupe (unless force=true).
     debit_idempotency_key: Optional[str]
     if not body.force:
         idempotency_key = compute_audit_idempotency_key(
             merchant_id=body.merchant_id,
             product_keys=body.product_keys,
-            subject_type=body.subject_type,
+            subject_type=consumer_scope,
         )
         existing = await find_in_flight_by_idempotency_key(
             idempotency_key=idempotency_key,
@@ -1034,7 +1055,7 @@ async def create_audit_run(
         debit_idempotency_key = compute_audit_idempotency_key(
             merchant_id=body.merchant_id,
             product_keys=body.product_keys,
-            subject_type=body.subject_type,
+            subject_type=consumer_scope,
         )
 
     # Tier resolution BEFORE metering: billing, launch options, and the worker
@@ -1073,6 +1094,10 @@ async def create_audit_run(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=str(exc),
         ) from exc
+    if consumer_plan:
+        consumer_quote = quote_plan(consumer_plan)
+        audit_required += consumer_quote["credits"]
+        audit_usd_cogs += consumer_quote["estimated_usd_cogs"]
     requirements = {
         "audit": audit_required,
         "prompt": len(_normalize_nonempty(body.custom_prompts)),
@@ -1179,6 +1204,7 @@ async def create_audit_run(
             requested_by_user_id=auth_merchant_id,
             request_options_jsonb={
                 "launch": {
+                    **({"consumer_capture_plan": consumer_plan, "consumer_capture_quote": consumer_quote} if consumer_plan else {}),
                     "audit_mode": "per_sku",
                     "coverage_profile": coverage.get("profile"),
                     "coverage_profile_label": coverage.get("label"),
@@ -1488,6 +1514,9 @@ async def get_audit_run(
                 from services.revenue_recovery_report import recovery_from_report
                 from services.audit_projection_builder import coerce_jsonb_to_dict
                 report = coerce_jsonb_to_dict(row.get("report_jsonb"))
+                # A stale cache cannot establish the new evidence contract.
+                # Without the retained report, keep the original report fallback.
+                proj = None
                 if report:
                     payload = recovery_from_report(
                         report, run_id=run_id,

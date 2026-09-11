@@ -333,3 +333,12 @@ def test_deck_no_progress_slide_on_first_audit():
                      "summary": {"won": 0, "progress": 0, "no_change": 0, "no_longer_grounded": 0},
                      "wins": [], "in_progress": []}
     assert not any("What moved since last audit" in x for x in _slide_texts(build_report_deck(s)))
+
+
+def test_every_exported_slide_labels_diagnostic_evidence():
+    from pptx import Presentation
+    deck = Presentation(io.BytesIO(build_report_deck(_summary())))
+    assert len(deck.slides) > 0
+    for slide in deck.slides:
+        text = "\n".join(shape.text for shape in slide.shapes if shape.has_text_frame)
+        assert "not consumer answer measurement" in text
