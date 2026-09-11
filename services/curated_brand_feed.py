@@ -29,7 +29,83 @@ from services import storefront_currency
 
 from services.retailer_ingest.sitemap_crawler import _looks_like_inci_list
 from services import crawl_politeness
+from services.pdp_category_classifier import CATEGORY_PATTERNS, classify
 from services.variant_identity import MERCHANT_ISSUED, variant_id_provenance
+
+# Confidence by WHERE the category came from. The `--category` flag is a per-DOMAIN default and
+# cannot be right for every product in a catalogue spanning lipstick, mascara and moisturiser, so
+# it scores lowest; a merchant-declared product_type is the strongest signal available here.
+#
+# `category_label_source` is deliberately NOT set by this lane. It reads as provenance but is
+# also a LANE IDENTIFIER: pdp_scope_classifier and CANONICAL_SCOPE_PREDICATE grant canonical
+# scope on `== 'enrichment_agent_v1'`, so relabelling these rows would forfeit Rule-1 protection
+# and the recall boost that depends on it. Confidence carries the provenance instead.
+CATEGORY_CONFIDENCE_MERCHANT_TYPE = 0.9
+CATEGORY_CONFIDENCE_FEED_DEFAULT = 0.3
+
+# Every path the classifier can emit, plus every node on the way to one. Decides whether a
+# --category flag is something the taxonomy RECOGNISES (compare it in full) or an operator's
+# free-text approximation (compare only the vertical + area it implies).
+_TAXONOMY_PATHS = frozenset(path for _label, path, _pattern in CATEGORY_PATTERNS)
+_TAXONOMY_NODES = _TAXONOMY_PATHS | frozenset(
+    "/".join(path.split("/")[:i])
+    for path in _TAXONOMY_PATHS
+    for i in range(1, len(path.split("/")))
+)
+
+
+def _pattern_matches(text: Optional[str]) -> int:
+    """How many DISTINCT taxonomy paths a string matches.
+
+    CATEGORY_PATTERNS is first-match-wins and ORDERED, so a string naming two categories resolves
+    to whichever pattern appears earlier. `Blush & Highlighter` resolves to highlighter and
+    `Bronzer & Blush` to blush — decided by pattern order, not by the merchant. A string naming
+    more than one category is not evidence; it is a coin flip.
+    """
+    value = str(text or "")
+    if not value:
+        return 0
+    return len({path for _label, path, pattern in CATEGORY_PATTERNS if pattern.search(value)})
+
+
+def _resolve_category(
+    *, product_type: Optional[str], title: Optional[str], flag_path: str
+):
+    """(path, confidence) for one product, from the MERCHANT'S OWN product_type only.
+
+    `title` is accepted and deliberately IGNORED, so the signature documents the decision at every
+    call site. A title is marketing prose, and matching regexes against it misfiles products
+    permanently: `Powder Kiss Lipstick` and `Powder Kiss Liquid Lipcolour` are real MAC LIP
+    products that resolve to `beauty/makeup/face/powder`, because "Powder" precedes "Lipstick" in
+    CATEGORY_PATTERNS and "Lipcolour" matches nothing at all. An earlier cut accepted a title when
+    it matched exactly one path, which only narrowed the failure to the single-wrong-match case.
+
+    Permanent is the operative word: every correction lane selects `category_path IS NULL`, so a
+    row already carrying a path is never revisited by them. A row left on the operator's flag is
+    at least an INTERIOR node, which the widened backfill (`--include-shallow`) does revisit; a
+    row misfiled onto a deep leaf is revisited by nothing.
+    """
+    # A product_type naming two categories is decided by pattern order, not by the merchant.
+    if _pattern_matches(product_type) != 1:
+        return flag_path, CATEGORY_CONFIDENCE_FEED_DEFAULT
+    hit = classify(product_type)
+    if hit is None:
+        return flag_path, CATEGORY_CONFIDENCE_FEED_DEFAULT
+    resolved = hit[1]
+
+    # AREA veto. The operator described the whole storefront; a classification leaving the area
+    # they named disagrees with a human about the shop, so keep the flag.
+    flag_norm = str(flag_path or "").strip().strip("/").lower()
+    flag_parts = [p for p in flag_norm.split("/") if p]
+    if flag_parts:
+        # A flag the taxonomy RECOGNISES is compared in full, so `beauty/makeup/lip` protects its
+        # own sub-area. An unrecognised flag like `beauty/skincare/cleanser` is an approximation,
+        # and comparing it in full would block the very canonicalisation we want
+        # (`-> beauty/skincare/cleanse/cleanser`), so only its vertical + area bind.
+        n = len(flag_parts) if flag_norm in _TAXONOMY_NODES else min(2, len(flag_parts))
+        if [p.lower() for p in resolved.split("/")[:n]] != flag_parts[:n]:
+            return flag_path, CATEGORY_CONFIDENCE_FEED_DEFAULT
+    return resolved, CATEGORY_CONFIDENCE_MERCHANT_TYPE
 
 logger = logging.getLogger("curated_brand_feed")
 
@@ -1072,11 +1148,31 @@ def shopify_product_to_record(
         else [t.strip() for t in str(raw_tags or "").split(",") if t.strip()]
     )
     canonical_url = f"https://{host}/products/{handle}"
+    # PER-PRODUCT category, not the per-domain --category flag.
+    #
+    # `category_path` here is one value chosen by an operator for a whole storefront, and a brand
+    # catalogue spans lipstick, mascara, foundation and skincare, so no single value can be right
+    # for every row. Stamping it wholesale is what put 3,536 of this lane's 3,557 prod rows at
+    # DEPTH 2 (`beauty/makeup`), where recall — which resolves a hard prefix like
+    # `beauty/makeup/lip/` — cannot reach them.
+    #
+    # _resolve_category is deliberately CONSERVATIVE: it keeps the flag unless the product's own
+    # fields clearly say otherwise. Wrong-but-shallow is recoverable; wrong-but-deep is not,
+    # because every correction lane selects `category_path IS NULL` and never revisits a row that
+    # already has a path.
+    resolved_path, category_confidence = _resolve_category(
+        product_type=product.get("product_type"),
+        title=title,
+        flag_path=category_path,
+    )
     return {
         "pdp": {
             "brand": brand,
             "product_name": title,
-            "category_path": category_path,
+            "category_path": resolved_path,
+            # Confidence reflects WHERE the category came from; see the constants above for why
+            # category_label_source is left alone.
+            "category_confidence": category_confidence,
             # Brand-authored body copy when present (it becomes the row's
             # description and feeds the lifecycle candidate gate + taxonomy
             # extractors); product_type alone otherwise. Rows minted without
