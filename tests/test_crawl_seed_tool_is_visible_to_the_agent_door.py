@@ -1,7 +1,7 @@
 """The crawl lane wrote a PROVENANCE string into the column the agent door filters recall on.
 
 `external_product_seeds.tool` is a recall scope. PIVOTA-Agent's external-seed arm accepts exactly
-`shopping_agents`, `creator_agents` and `*` (src/server.js:16841-16847; the legacy `''` scope sits
+`shopping_agents`, `creator_agents` and `*` (src/server.js:16851-16857; the legacy `''` scope sits
 behind PIVOT_BEAUTY_LEGACY_TOOL_SCOPE_RECALL_ENABLED, default false). This lane wrote
 `external_brand_crawl`, so every row it ever onboarded was invisible to that arm — a halving of
 recall, not a blackout, because the canonical arm has no `tool` filter. That is why it survived.

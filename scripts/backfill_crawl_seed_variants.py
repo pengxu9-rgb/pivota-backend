@@ -83,7 +83,14 @@ async def run(*, tool: str, epid_prefix: str, limit: int, apply: bool) -> None:
                    price_amount, price_currency, availability,
                    updated_at, seed_data
             FROM external_product_seeds
-            WHERE tool = $1
+            -- PROVENANCE IS THE ID PREFIX, NOT `tool`. `tool` is the agent door's RECALL
+            -- SCOPE: onboard_external_brand_from_crawl.py now writes `*` there (the column
+            -- default, and the only value the door accepts), so a `tool = 'external_brand_crawl'`
+            -- predicate silently stops matching every row written from that change onward — and
+            -- would match NOTHING at all once the deferred backfill rewrites the existing rows.
+            -- `_seed_id()` builds the primary key as f"{TOOL}::{epid}" and that has not moved,
+            -- so the prefix is the durable way to name this lane's cohort.
+            WHERE id LIKE $1 || '::%'
               AND status = 'active'
               AND jsonb_typeof(seed_data) = 'object'
               AND ($2 = '' OR external_product_id LIKE $3)

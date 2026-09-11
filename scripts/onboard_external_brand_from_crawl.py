@@ -113,7 +113,7 @@ TOOL = "external_brand_crawl"
 #
 # `external_product_seeds.tool` is the column the agent door filters recall on. The gateway
 # accepts exactly `shopping_agents`, `creator_agents` and `*`
-# (PIVOTA-Agent src/server.js:16841-16847; the legacy `''` scope is behind
+# (PIVOTA-Agent src/server.js:16851-16857; the legacy `''` scope is behind
 # PIVOT_BEAUTY_LEGACY_TOOL_SCOPE_RECALL_ENABLED, default false). Writing the provenance string
 # "external_brand_crawl" into that column put every row this script has ever onboarded OUTSIDE
 # the door's IN-list, so the whole external-seed recall arm skipped them. They could still be
@@ -122,6 +122,16 @@ TOOL = "external_brand_crawl"
 #
 # The column's own default is `'*'` (db/migrations/044_external_product_seeds.sql:12), which is
 # in the accept-list. This lane overrode a correct default with a provenance value.
+#
+# ONE NEW FAILURE MODE COMES WITH THAT, and it did not exist before. `external_brand_crawl` was
+# this lane's private namespace, so the partial unique index could never bite it. `'*'` is the
+# DEFAULT, so it is shared: an INSERT here now collides with any active seed another lane wrote
+# for the same (market, external_product_id) without setting `tool`. The arbiter is
+# ON CONFLICT (id), NOT that index, so such a collision raises 23505 and aborts the run rather
+# than updating. Neither in-repo writer is a realistic source today —
+# catalog_enrichment_agent/apply.py binds its own `:tool` under a different id namespace, and
+# seed_data_writer.py omits the NOT NULL `market`/`destination_url` so it is update-only — but
+# the shape is the catalog_skus two-index hazard, and a loud abort is the good version of it.
 #
 # TOOL still names the PROVENANCE, and must: `_seed_id()` builds the seed's primary key as
 # f"{TOOL}::{epid}", and `source_system` / `reason` record who wrote the row. Changing TOOL
@@ -448,6 +458,13 @@ async def _upsert_seed(
           -- while stored-only enrichment keys the cohort never writes survive.
           seed_data=COALESCE(external_product_seeds.seed_data, '{}'::jsonb) || EXCLUDED.seed_data,
           status='active', updated_at=NOW()
+          -- ⚠️ `tool` IS DELIBERATELY NOT IN THIS SET LIST, so re-crawling an already-onboarded
+          -- brand does NOT heal a row still holding the old provenance value. The fix above
+          -- reaches new epids only; existing rows need the deferred backfill. Adding
+          -- tool=EXCLUDED.tool here is NOT the cheap remedy: the arbiter is ON CONFLICT (id),
+          -- so the UPDATE would move `tool` into the partial unique index
+          -- (market, tool, external_product_id) WHERE status='active' and raise 23505 wherever
+          -- a '*' row already exists for that (market, epid). Measure the collision set first.
         """,
         {"id": _seed_id(p["external_product_id"]), "epid": p["external_product_id"],
          # SEED_TOOL_SCOPE, not TOOL — see the constant. TOOL stays in `_seed_id` above, which
