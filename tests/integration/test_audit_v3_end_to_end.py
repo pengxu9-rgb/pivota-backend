@@ -742,3 +742,63 @@ async def test_consumer_capture_launch_worker_and_report_are_connected(audit_har
     assert report['consumer_selection_observations'][0]['evidence_kind']=='consumer_answer'
     assert len(report['per_sku_reports'])==1
     assert set(report['per_sku_reports'][0]['scores'])=={'identity','content_richness','routability','citation'}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_fails", [False, True])
+async def test_required_web_retained_response_through_launch_replay_worker_and_report(audit_harness, monkeypatch, provider_fails):
+    """Real retained provider response; in-memory ledger, no new provider charge."""
+    import json
+    from pathlib import Path
+    from services import consumer_capture_worker as capture
+    fixture = json.loads((Path(__file__).parents[1] / 'fixtures_consumer_required_web.json').read_text())
+    store, app, worker = audit_harness
+    monkeypatch.setenv('PIVOTA_CONSUMER_ANSWER_ENABLED', 'true')
+    monkeypatch.setenv('PIVOTA_CONSUMER_ANSWER_PROVIDERS', 'gemini,chatgpt')
+    original = capture.agent_center_llm_client.probe
+    calls = []
+
+    async def probe(**kwargs):
+        if kwargs['scan_mode'] != 'consumer_answer_test':
+            return await original(**kwargs)
+        calls.append(kwargs)
+        assert kwargs['context'] == {'queries': [fixture['query']], 'consumer_execution_profile': 'openai_web_required_v2'}
+        if provider_fails:
+            raise TimeoutError('provider unavailable')
+        return deepcopy(fixture['result'])
+
+    async def checkpoint(**kwargs):
+        partial = store.rows[kwargs['run_id']]['partial_result_jsonb']
+        assert partial.get('consumer_capture') == kwargs['previous']
+        assert partial['launch']['consumer_capture_plan']['sha256'] == kwargs['plan_sha256']
+        partial['consumer_capture'] = deepcopy(kwargs['state'])
+
+    monkeypatch.setattr(capture.agent_center_llm_client, 'probe', probe)
+    monkeypatch.setattr(capture, 'save_checkpoint', checkpoint)
+    payload = {'merchant_id': 'merch-A', 'product_keys': ['pk-1'], 'providers': ['chatgpt'],
+               'consumer_answer_queries': [fixture['query']]}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+        first = await client.post('/api/audits', json=payload)
+        assert first.status_code == 202, first.text
+        replay = await client.post('/api/audits', json=payload)
+        assert replay.status_code == 202, replay.text
+        assert replay.json()['run_id'] == first.json()['run_id']
+        assert replay.json()['idempotent_replay'] is True
+        assert len(store.debits) == 1
+        assert await worker.process_one_audit_run() is True
+        fetched = await client.get('/api/audits/' + first.json()['run_id'])
+    assert fetched.status_code == 200, fetched.text
+    assert fetched.json()['stage'] == 'completed'
+    observations = fetched.json()['report_jsonb']['consumer_selection_observations']
+    assert len(calls) == len(observations) == 1
+    if provider_fails:
+        assert observations[0]['status'] == 'provider_failed'
+        assert observations[0]['brand_mentioned'] is None
+    else:
+        assert observations[0]['status'] == 'answered'
+        assert observations[0]['prompt_contract'] == 'consumer_query_openai_web_required_v2'
+        assert type(observations[0]['brand_mentioned']) is bool
+    # Characterizes current billing, not launch approval: even a failed
+    # supplemental provider call retains the charge when diagnostics succeed.
+    assert store.balance['credits'] == store.initial_credits - store.debits[0]['amount']
+    assert not store.credits
