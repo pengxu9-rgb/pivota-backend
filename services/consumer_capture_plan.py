@@ -63,7 +63,16 @@ def quote_plan(plan):
     validate_plan(plan)
     counts = Counter(job['provider'] for job in plan['jobs'])
     credits, usd = estimate_probe_credits([(provider, count, True) for provider, count in sorted(counts.items())])
-    return {'plan_sha256': plan['sha256'], 'probe_count': len(plan['jobs']),
+    # Freeze deterministic per-job allocations; their sum equals the quote.
+    allocations = {}
+    previous = 0
+    specs = []
+    for job in plan['jobs']:
+        specs.append((job['provider'], 1, True))
+        cumulative, _ = estimate_probe_credits(specs)
+        allocations[job['id']] = cumulative - previous
+        previous = cumulative
+    return {'job_credits': allocations, 'plan_sha256': plan['sha256'], 'probe_count': len(plan['jobs']),
             'credits': credits, 'estimated_usd_cogs': usd,
             'execution_profiles': sorted({job.get('execution_profile','consumer_query_v1') for job in plan['jobs']}),
             'pricing_basis': 'fixed_probe_credits_not_token_settlement'}

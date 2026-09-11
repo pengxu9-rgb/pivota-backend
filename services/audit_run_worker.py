@@ -1088,13 +1088,20 @@ async def _process_one_audit_run_inner(
             # line, projections are warm + verifications are
             # enqueued. The transition is the atomic "this audit
             # is done" commit point.
-            ok = await mar.transition_stage(
-                run_id=run_id,
-                from_stage=mar.STAGE_VERIFYING,
-                to_stage=mar.STAGE_COMPLETED,
-                worker_id=WORKER_ID,
-                cost_summary_jsonb=cost_summary,
-            )
+            if launch_options.get("consumer_capture_plan"):
+                from services.consumer_capture_settlement import complete_with_refund
+                ok = await complete_with_refund(
+                    run_id=run_id, merchant_id=merchant_id, worker_id=WORKER_ID,
+                    launch=launch_options, report=brand_report, cost_summary=cost_summary,
+                )
+            else:
+                ok = await mar.transition_stage(
+                    run_id=run_id,
+                    from_stage=mar.STAGE_VERIFYING,
+                    to_stage=mar.STAGE_COMPLETED,
+                    worker_id=WORKER_ID,
+                    cost_summary_jsonb=cost_summary,
+                )
             if not ok:
                 return True
             current_stage = mar.STAGE_COMPLETED

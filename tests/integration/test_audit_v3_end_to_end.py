@@ -381,6 +381,19 @@ def audit_harness(monkeypatch):
     from utils import auth as auth_module
 
     store = _AuditStore()
+    from contextlib import asynccontextmanager
+    from services import consumer_capture_settlement as settlement
+    @asynccontextmanager
+    async def transaction():
+        yield
+    async def finalize_row(query, values):
+        ok = await store.transition_stage(run_id=values['run_id'], from_stage='verifying',
+                                         to_stage='completed', worker_id=values['worker_id'])
+        return {'run_id': values['run_id']} if ok else None
+    from types import SimpleNamespace
+    monkeypatch.setattr(settlement, 'database', SimpleNamespace(transaction=transaction, fetch_one=finalize_row))
+    monkeypatch.setattr(settlement, 'credit', store.credit)
+
     monkeypatch.setattr(
         audit_runs_routes.settings, "deepseek_api_key", "test-deepseek-key",
         raising=False,
@@ -798,7 +811,7 @@ async def test_required_web_retained_response_through_launch_replay_worker_and_r
         assert observations[0]['status'] == 'answered'
         assert observations[0]['prompt_contract'] == 'consumer_query_openai_web_required_v2'
         assert type(observations[0]['brand_mentioned']) is bool
-    # Characterizes current billing, not launch approval: even a failed
-    # supplemental provider call retains the charge when diagnostics succeed.
-    assert store.balance['credits'] == store.initial_credits - store.debits[0]['amount']
-    assert not store.credits
+    refunded = sum(c['amount'] for c in store.credits)
+    expected = store.rows[first.json()['run_id']]['partial_result_jsonb']['launch']['consumer_capture_quote']['credits'] if provider_fails else 0
+    assert refunded == expected
+    assert store.balance['credits'] == store.initial_credits - store.debits[0]['amount'] + refunded
