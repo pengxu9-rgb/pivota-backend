@@ -200,20 +200,33 @@ def _extract_domain(url: str) -> Optional[str]:
 
 
 def _leaf_category_required_for_serving() -> bool:
-    """OFF by default, and that is deliberate -- this flag DELISTS rows.
+    """OFF by default, and DO NOT TURN IT ON YET. The number is now measured.
 
-    The predicate below is correct and the enforcement is the point of the whole exercise, but
-    turning it on without knowing how many rows it removes is the same mistake in the other
-    direction: a row that is wrongly categorised still sells, and emptying the index to punish bad
-    metadata helps nobody. The count needs one query before this is flipped:
+    This flag DELISTS rows, so it was written needing a count before anyone flipped it. That count
+    was taken against production on 2026-09-11 (in-VPC one-off job; the DB is on a private address,
+    see docs and pivota-backend#2172):
 
-        SELECT count(*) FILTER (WHERE serving_eligible),
-               count(*) FILTER (WHERE serving_eligible AND NOT <leaf predicate>)
-        FROM index_pipeline_state ...
+        multi-segment rows            12,799   (serving-eligible 7,901)
+        ... that do NOT resolve()      4,154   (serving-eligible 2,987)
 
-    grouped by `category_label_source`, which also tells you which writer to fix first. Flip this to
-    `1` once that number is known and the backfill in scripts/backfill_pdp_category_path.py has run
-    over the affected cohort -- in that order, or the flip is an outage.
+    So flipping this today removes 2,987 of 7,901 serving rows -- 37.8% of the served index. By
+    writer:
+
+        enrichment_agent_v1        2,708      <-- one writer is almost the whole number
+        reviewed_ext_seed_mirror     206
+        codex_review_v1               71
+        regex_backfill                 2
+
+    AND THE CAUSE IS NOT BAD DATA, IT IS A BRANCH NODE. `enrichment_agent_v1` writes two-segment
+    paths that name a real branch of the taxonomy but not a leaf -- `beauty/makeup` (1,843 rows,
+    1,667 serving) and `beauty/skincare` (1,693 rows, 1,039 serving). Those rows are browsable
+    (`has_category_door` is True for both); they simply have no leaf. Delisting them would be
+    punishing a writer for being imprecise, not for being wrong, and would take a third of the index
+    off the shelf to do it.
+
+    THE ORDER IS: fix `enrichment_agent_v1` to emit a leaf, re-run the backfill in
+    scripts/backfill_pdp_category_path.py (which this change teaches to revisit bare domains), take
+    the count again, and only then flip this. Flipping first is an outage.
     """
     return str(os.getenv("CATEGORY_LEAF_REQUIRED_FOR_SERVING", "") or "").strip().lower() in {
         "1", "true", "yes", "on",
