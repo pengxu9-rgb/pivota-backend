@@ -3696,6 +3696,15 @@ def _build_internal_offer_summary(
     offer_id = f"of:internal_checkout:{merchant_id}:{product_id}:{variant_id or '∅'}"
     return {
         "offer_id": offer_id,
+        # BOTH SPELLINGS. `offerToSignal` in the gateway
+        # (PIVOTA-Agent src/agentSignals/offerToSignal.js:90-97) reads TOP-LEVEL `merchant_id` /
+        # `merchant_name` and projects neither `seller` nor `internal_checkout_items`. This lane
+        # emitted the merchant only as `seller` and inside `internal_checkout_items[0]`, so its
+        # offers reached an agent as `merchant_id: null` — a row in a cross-merchant list with no
+        # seller to name and no way to attribute it. The catalog_offers arm already emits both
+        # (see its SHAPE note); this is the "separate change" that note defers to.
+        "merchant_id": merchant_id or None,
+        "merchant_name": seller or None,
         "seller": seller,
         "price": price_amount,
         "currency": currency,
@@ -4814,9 +4823,23 @@ async def _handle_offers_resolve(
                     )
                 )
 
+                # The SELLER'S IDENTITY, not ours. For a seed the merchant is the destination
+                # host — rovectin.com, stylekorean.com — which is exactly what the dedupe in the
+                # catalog_offers arm keys on, so the two lanes now agree on what "a merchant" is.
+                # `external_seed` would be useless here: the gateway substitutes a host label for
+                # that id anyway (src/server.js:1998), and every seed would collapse to one
+                # merchant, destroying the comparison this list exists for.
+                seed_merchant_id = (
+                    str(row_dict.get("domain") or seed_data.get("domain") or "").strip().lower()
+                    or _seed_domain_from_url(destination_url)
+                    or None
+                )
                 external_offers.append(
                     {
                         "offer_id": offer_id,
+                        # Both spellings — see the note in `_build_internal_offer_summary`.
+                        "merchant_id": seed_merchant_id,
+                        "merchant_name": seller or None,
                         "seller": seller,
                         "price": price_amount,
                         "currency": currency,
