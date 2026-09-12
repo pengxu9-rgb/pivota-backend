@@ -81,17 +81,17 @@ _DEPTH_SQL = "COALESCE(array_length(string_to_array(category_path, '/'), 1), 0)"
 def _is_interior_node(path: Optional[str]) -> bool:
     """True when `path` is a taxonomy node something else extends — i.e. unreachable by prefix."""
     text = str(path or "").strip().strip("/")
-    if not text:
-        return True  # NULL/blank: nothing to route on at all
+    if not text or "/" not in text:
+        return True  # Retain main's NULL/blank/bare-domain repair eligibility.
     return text in _INTERIOR_NODES
 
 
 async def _fetch_batch(
     limit: int, after_key: Optional[str], *, include_shallow: bool = False
 ) -> List[dict]:
-    """NULL category_path by default; optionally also rows too shallow to be routable.
+    """NULL and single-segment paths by default; optionally other interior nodes.
 
-    The default is unchanged deliberately — this script has been run against NULLs before and
+    The default retains the current main branch's bare-domain repair. Broader interior nodes need
     widening its silent blast radius would surprise whoever runs it next. `--include-shallow`
     opts in, and selects a depth-bounded SUPERSET that `_is_interior_node` then narrows.
     """
@@ -100,7 +100,7 @@ async def _fetch_batch(
     # text().bindparams() before any SQL ran — and routes/admin_catalog_debug.py calls this with
     # no flag, so the ops backfill endpoint 500'd. Build both together.
     params: Dict[str, Any] = {"limit": limit, "after_key": after_key}
-    predicate = "category_path IS NULL"
+    predicate = "(category_path IS NULL OR POSITION('/' IN category_path) = 0)"
     if include_shallow:
         predicate = "(category_path IS NULL OR %s <= :max_depth)" % _DEPTH_SQL
         params["max_depth"] = MAX_INTERIOR_DEPTH
@@ -141,6 +141,8 @@ async def _apply_update(
       - the previous-value check is optimistic concurrency: if anything changed the row since this
         batch read it, this update declines rather than clobbering that decision.
     """
+    # enrichment_agent_v1 doubles as a canonical-scope lane identifier. A category
+    # repair must preserve it; replacing it with regex_backfill can demote the row.
     # RETURNING + fetch_val, NOT execute(): `databases` over asyncpg reports NO rowcount for an
     # UPDATE, so a guard that declined a write would have been indistinguishable from one that
     # landed and `matched` would have counted intentions rather than changes.
@@ -149,7 +151,11 @@ async def _apply_update(
         UPDATE catalog_products
         SET category_path = :path,
             category_confidence = :confidence,
-            category_label_source = :source
+            category_label_source = CASE
+                WHEN category_label_source = 'enrichment_agent_v1'
+                THEN category_label_source
+                ELSE :source
+            END
         WHERE product_key = :key
           AND category_path IS NOT DISTINCT FROM CAST(:previous AS varchar)
           AND :new_depth > """ + _DEPTH_SQL + """

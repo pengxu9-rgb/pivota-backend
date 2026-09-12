@@ -717,6 +717,7 @@ async def test_default_mode_binds_only_what_the_predicate_uses(monkeypatch):
     assert placeholders == set(seen["values"]), (placeholders, set(seen["values"]))
     assert "max_depth" not in seen["values"]
     assert "category_path IS NULL" in seen["query"]
+    assert "POSITION('/' IN category_path) = 0" in seen["query"]
 
 
 @pytest.mark.asyncio
