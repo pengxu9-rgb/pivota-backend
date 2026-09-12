@@ -2,6 +2,7 @@
 
 import os
 import uuid
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -16,7 +17,8 @@ async def seed_db():
     import asyncpg
     from databases import Database
 
-    if "test" not in URL.rsplit("/", 1)[-1]:
+    dbname = urlsplit(URL).path.rsplit("/", 1)[-1]
+    if "test" not in dbname and dbname != "pivota_dialect_check":
         pytest.skip("repair fixture requires a test database")
     schema = "test_seed_scope_" + uuid.uuid4().hex
     conn = await asyncpg.connect(URL)

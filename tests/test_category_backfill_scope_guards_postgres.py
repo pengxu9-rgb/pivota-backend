@@ -2,6 +2,7 @@
 
 import os
 import uuid
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -17,7 +18,8 @@ async def backfill_db(monkeypatch):
     from databases import Database
     from scripts import backfill_pdp_category_path as backfill
 
-    if "test" not in URL.rsplit("/", 1)[-1]:
+    dbname = urlsplit(URL).path.rsplit("/", 1)[-1]
+    if "test" not in dbname and dbname != "pivota_dialect_check":
         pytest.skip("backfill fixtures require a test database")
     schema = "test_category_guards_" + uuid.uuid4().hex
     conn = await asyncpg.connect(URL)

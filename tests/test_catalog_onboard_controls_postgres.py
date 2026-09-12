@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -18,7 +19,8 @@ async def queue_db():
     import asyncpg
     from databases import Database
 
-    if "test" not in URL.rsplit("/", 1)[-1]:
+    dbname = urlsplit(URL).path.rsplit("/", 1)[-1]
+    if "test" not in dbname and dbname != "pivota_dialect_check":
         pytest.skip("synthetic queue tests require a test database")
     connection = await asyncpg.connect(URL)
     try:
