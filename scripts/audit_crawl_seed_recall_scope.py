@@ -51,6 +51,14 @@ def snapshot(row: Any) -> dict:
     return result
 
 
+def has_scope_identity(row: dict) -> bool:
+    # Migration 044 deliberately excludes NULL external_product_id from its
+    # active unique index. Such a row cannot earn collision protection and is
+    # not a safe recall-scope repair candidate.
+    return all(isinstance(row.get(key), str) and row[key].strip()
+               for key in ("market", "external_product_id"))
+
+
 async def collisions(db: Any, row: dict) -> list[str]:
     rows = await db.fetch_all(COLLISION_SQL, {
         "id": row["id"], "market": row["market"],
@@ -68,6 +76,9 @@ async def audit(db: Any, ids: list[str]) -> dict:
             blocked.append({"id": seed_id, "reason": "not_found"})
             continue
         before = snapshot(row)
+        if not has_scope_identity(before):
+            blocked.append({"id": seed_id, "reason": "missing_scope_identity", "before": before})
+            continue
         if before["tool"] == NEW_TOOL and before["status"] == "active":
             already_visible.append(seed_id)
             continue
@@ -99,7 +110,7 @@ async def apply_plan(db: Any, plan: dict) -> dict:
         seed_id = before.get("id")
         if (seed_id not in requested or seed_id in seen or set(before) != set(FIELDS)
                 or before.get("tool") != OLD_TOOL or before.get("status") != "active"
-                or change.get("after_tool") != NEW_TOOL):
+                or change.get("after_tool") != NEW_TOOL or not has_scope_identity(before)):
             raise ValueError("plan contains an invalid, duplicated, or out-of-scope change")
         seen.add(seed_id)
     applied = []

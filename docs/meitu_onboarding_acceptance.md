@@ -25,7 +25,7 @@ Review their actual subset/role/currency intent. Do not automatically rewrite in
 ## Acceptance matrix and evidence
 
 1. Use Flower Beauty and Stila US rows to verify merchant variant IDs and product-level lip categories. Choose currently sold exact lines/shades; the Meitu 2017-era line name is not proof that a listing still exists.
-2. Use A'PIEU at sukoshi.com and sentisenti.com to verify the same currently identified item has two seller identities, two destinations, reseller authority and one correct product identity. Matching brand alone is insufficient.
+2. Use the live-proven A'PIEU Honey & Milk Lip Oil (5g), GTIN `8809530070499`, at asianbeautyessentials.com (variant `43603819692287`) and eyurs.com (variant `41807436316855`). Fresh public observations exhausted 677/434 products and selected 17/3 A'PIEU products, with native USD at both sellers. Complete extraction and distinct seller identities are proven in local plans. Post-deployment canonical attachment, search/PDP/offer visibility and second-ingest idempotence remain pending; matching brand alone is insufficient.
 3. Use VELY VELY from the SG roster at cocomo.sg for a large retailer scan. Prove exhaustion beyond the initial pages, exact vendor selection, native SGD price and SG destination eligibility.
 4. Use 3CE and a non-Shopify candidate retailer for the alternative extractor path. If the retailer cannot offer the requested currency/market/line, record unsupported/failed, then choose a reviewed replacement case. Do not convert a native price or relabel the serving market to force a pass.
 
@@ -65,7 +65,7 @@ Put only reviewed exact IDs into a JSON array. Prepare a read-only plan:
 python -m scripts.audit_crawl_seed_recall_scope --seed-ids-file reviewed-ids.json --output scope-plan.json
 ```
 
-The plan records before values and blocks target-scope collisions, missing rows and non-active/non-crawl rows. Blocked cohorts cannot apply; narrow and audit again. After the plan is reviewed and execution is authorized, a separate invocation can apply it:
+The plan records before values and blocks target-scope collisions, missing rows, missing market/external-product identity and non-active/non-crawl rows. Verify migration 044's valid unique index `idx_external_product_seeds_active_unique` on `(market, tool, external_product_id)` with its active/non-NULL predicate before any apply: row locks protect existing rows, while that index makes a concurrent target-scope insert fail the repair atomically. The exact post-precheck concurrent insert interleaving is covered by a real PostgreSQL regression. Blocked cohorts cannot apply; narrow and audit again. After the plan is reviewed and execution is authorized, a separate invocation can apply it:
 
 ```sh
 python -m scripts.audit_crawl_seed_recall_scope --apply-plan scope-plan.json --output scope-result.json

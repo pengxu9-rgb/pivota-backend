@@ -46,3 +46,8 @@ def test_collapsed_sellers_stale_or_missing_surface_cannot_pass():
 def test_sg_case_cannot_pass_us_currency_or_partition():
     case = dict(MANIFEST["cases"][0], market="SG", currency="SGD")
     assert evaluate({"cases": [case]}, evidence(), now=NOW)["failed"] == 1
+
+
+def test_exact_gtin_canary_cannot_pass_a_different_same_brand_item():
+    case = dict(MANIFEST["cases"][0], target_gtin="8809530070499")
+    assert evaluate({"cases": [case]}, evidence(), now=NOW)["failed"] == 1

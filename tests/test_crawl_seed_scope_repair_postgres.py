@@ -25,10 +25,10 @@ async def seed_db():
     await conn.execute("""
         CREATE TABLE external_product_seeds (
             id text PRIMARY KEY, market text NOT NULL, tool text NOT NULL,
-            external_product_id text NOT NULL, status text NOT NULL,
+            external_product_id text NULL, status text NOT NULL,
             updated_at timestamptz NOT NULL DEFAULT NOW());
         CREATE UNIQUE INDEX seed_active_scope ON external_product_seeds
-            (market, tool, external_product_id) WHERE status='active';
+            (market, tool, external_product_id) WHERE status='active' AND external_product_id IS NOT NULL;
     """)
     db = Database(URL, server_settings={"search_path": schema})
     await db.connect()
@@ -103,3 +103,42 @@ async def test_edited_plan_cannot_change_identity_or_target_scope(seed_db):
     with pytest.raises(ValueError, match="invalid"):
         await repair.apply_plan(seed_db, plan)
     assert (await seed_db.fetch_one(repair.ROW_SQL, {"id": seed_id}))["tool"] == repair.OLD_TOOL
+
+
+async def test_null_identity_outside_partial_unique_index_is_not_repairable(seed_db):
+    seed_id = await insert(seed_db, "missing-identity")
+    await seed_db.execute("UPDATE external_product_seeds SET external_product_id=NULL WHERE id=:id", {"id": seed_id})
+    plan = await repair.audit(seed_db, [seed_id])
+    assert not plan["changes"] and plan["blocked"][0]["reason"] == "missing_scope_identity"
+    with pytest.raises(ValueError, match="blocked"):
+        await repair.apply_plan(seed_db, plan)
+
+
+async def test_concurrent_insert_after_collision_check_rolls_back_entire_repair(seed_db, monkeypatch):
+    import asyncpg
+
+    first = await insert(seed_db, "a")
+    last = await insert(seed_db, "z")
+    plan = await repair.audit(seed_db, [first, last])
+    check = repair.collisions
+
+    async def race(db, row):
+        result = await check(db, row)
+        if row["id"] == last:
+            # An independent connection, not a child task inheriting databases'
+            # transaction ContextVar. Commit a real target-scope phantom.
+            connection = await asyncpg.connect(URL, **seed_db.options)
+            try:
+                await connection.execute(
+                    "INSERT INTO external_product_seeds(id,market,tool,external_product_id,status) "
+                    "VALUES($1,'US','*','z','active')", repair.PREFIX + "concurrent")
+            finally:
+                await connection.close()
+        return result
+
+    monkeypatch.setattr(repair, "collisions", race)
+    with pytest.raises(asyncpg.UniqueViolationError):
+        await repair.apply_plan(seed_db, plan)
+    assert (await seed_db.fetch_one(repair.ROW_SQL, {"id": first}))["tool"] == repair.OLD_TOOL
+    assert (await seed_db.fetch_one(repair.ROW_SQL, {"id": last}))["tool"] == repair.OLD_TOOL
+    assert (await seed_db.fetch_one(repair.ROW_SQL, {"id": repair.PREFIX + "concurrent"}))["tool"] == "*"

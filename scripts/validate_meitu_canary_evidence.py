@@ -46,6 +46,8 @@ def evaluate(manifest: dict, evidence: dict, *, now=None) -> dict:
             key = product.get("product_key")
             if not key or product.get("brand") not in case["accepted_brands"]:
                 reasons.append("missing product identity or wrong brand")
+            if case.get("target_gtin") and str(product.get("gtin")) != str(case["target_gtin"]):
+                reasons.append("product is not the exact GTIN selected for this canary")
             if product.get("market") != case["market"] or product.get("currency") != case["currency"]:
                 reasons.append("wrong or unproven market/currency")
             if (not product.get("variant_id") or product.get("variant_id_provenance") != "merchant_issued"
