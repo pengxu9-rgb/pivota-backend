@@ -95,6 +95,21 @@ SYNTHETIC_MERCHANT_ID = "external_seed"
 SYNTHETIC_PLATFORM = "external_seed"
 DEFAULT_CATEGORY_CONFIDENCE = 0.7
 DEFAULT_CATEGORY_LABEL_SOURCE = "enrichment_agent_v1"
+def _category_confidence_or_none(value):
+    """Coerce a lane-supplied category confidence, or None to fall back to the default.
+
+    Returns None rather than 0.0 on junk: 0.0 is a legitimate confidence and would be persisted
+    as one, silently replacing the default with a claim the lane never made.
+    """
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed != parsed:  # NaN
+        return None
+    return max(0.0, min(1.0, parsed))
 DEFAULT_TRUTH_TIER = "primary"
 DEFAULT_READINESS_TIER = "referral_only"
 DEFAULT_CATALOG_TRACK = "external_referral"
@@ -201,6 +216,19 @@ def _build_pdp_payload(record: Dict[str, Any]) -> Dict[str, Any]:
         "brand": proper_case_brand(pdp.get("brand")),
         "product_name": str(pdp.get("product_name") or "").strip(),
         "category_path": str(pdp.get("category_path") or "").strip(),
+        # Category confidence from the producing lane, when it has any. This payload is a
+        # WHITELIST -- a field absent here is dropped no matter what the record carried -- so a
+        # lane's classification would be silently discarded without this line, exactly as the
+        # currency passthrough was before it. None when the lane does not classify; the default
+        # below applies then.
+        #
+        # category_label_source is deliberately NOT threaded through. It reads as provenance but
+        # doubles as a LANE IDENTIFIER -- pdp_scope_classifier and CANONICAL_SCOPE_PREDICATE grant
+        # canonical scope on `== 'enrichment_agent_v1'` -- so letting a lane overwrite it would
+        # silently forfeit Rule-1 protection for those rows. Confidence carries provenance instead.
+        "category_confidence": _category_confidence_or_none(
+            pdp.get("category_confidence")
+        ),
         "attribute_summary": str(pdp.get("attribute_summary") or "").strip(),
         "gtin": str(gtin_raw).strip() if gtin_raw else None,
         "upc": str(upc_raw).strip() if upc_raw else None,
@@ -509,7 +537,15 @@ def _build_pdp_insert(
             title=pdp_payload["product_name"],
             tags=pdp_payload.get("tags"),
         ),
-        "category_confidence": DEFAULT_CATEGORY_CONFIDENCE,
+        # Prefer what the producing lane actually determined; the constants are the fallback for
+        # lanes that do not classify. They were previously unconditional, so every Path-C row
+        # claimed the enrichment agent had chosen its category at 0.7 confidence even when the
+        # value came from a per-domain command-line flag.
+        "category_confidence": (
+            pdp_payload.get("category_confidence")
+            if pdp_payload.get("category_confidence") is not None
+            else DEFAULT_CATEGORY_CONFIDENCE
+        ),
         "category_label_source": DEFAULT_CATEGORY_LABEL_SOURCE,
         "canonical_url": canonical_url or None,
         "image_url": image_url or None,

@@ -1078,26 +1078,78 @@ def resolve_record_brand(
     return v_raw, "vendor_disagrees"
 
 
-def product_category_path(*, title: Optional[str], product_type: Optional[str], fallback: str) -> str:
-    """Use the shared taxonomy on this product's evidence, never store-wide copy/tags.
+# Reuses PR #2158's confidence contract and distinct-path ambiguity guard. The
+# source label remains enrichment_agent_v1: it is also a canonical-scope lane ID.
+CATEGORY_CONFIDENCE_MERCHANT_TYPE = 0.9
+CATEGORY_CONFIDENCE_EXPLICIT_TITLE = 0.8
+CATEGORY_CONFIDENCE_FEED_DEFAULT = 0.3
 
-    Unknown products retain the operator's coarse path; no category is fabricated.
-    Non-beauty feed routing is unchanged by this beauty-cohort repair.
+# Generic shelves are not assertions of a purchasable product class. In particular,
+# the shared legacy regex maps Lip Care to balm, contradicting the measured lip oil.
+_GENERIC_PRODUCT_TYPES = frozenset({
+    "beauty", "cosmetics", "makeup", "make up", "skin care", "skincare",
+    "face care", "hair care", "haircare", "lip care", "lip treatment", "lip treatments",
+})
+_GENERIC_LIP_TYPES = frozenset({"lip care", "lip treatment", "lip treatments"})
+_TOOL_NOUN_SUFFIX = re.compile(r"\bbrush(?:es)?(?:\s+#?\d{1,4})?\s*$", re.I)
+# Formula names ending in an included applicator are not tool names. This is a
+# noun/suffix exception, not a general pass of marketing titles through the taxonomy.
+_TOOL_FORMULA_CONTEXT = re.compile(r"[+&/]|\b(?:and|with|includes?|including|for|using|built[- ]in)\b|brush[- ]on", re.I)
+
+
+def _pattern_matches(text: Optional[str]) -> int:
+    """PR #2158 guard: first-match-wins is not evidence when multiple paths match."""
+    from services.pdp_category_classifier import CATEGORY_PATTERNS
+    return len({path for _label, path, pattern in CATEGORY_PATTERNS if pattern.search(str(text or ""))})
+
+
+def _resolve_category(*, product_type: Optional[str], title: Optional[str], flag_path: str) -> Tuple[str, float]:
+    """One category evidence policy shared by feed mapping and repair planning.
+
+    Retain #2158's ambiguity guard, conservative marketing-title behavior and
+    confidence semantics. Deliberately replace its storefront-area veto: strong
+    per-product evidence can disagree with a COARSE storefront shelf (MISSHA tools
+    were all labelled skincare). An explicit taxonomy leaf remains protected.
+    Title evidence has only two narrow doors: a tool noun suffix without formula
+    context, and an explicit lip-oil title refining the measured generic lip shelves.
     """
-    if str(fallback or "").split("/", 1)[0] != "beauty":
-        return fallback
-    from services.pdp_category_classifier import classify, resolve_path_from_row
-    # Live same-GTIN canary: Asian Beauty Essentials labels Honey & Milk Lip Oil
-    # "Lip Care", while Eyurs labels it "Lip Treatments". Those are broad shelves,
-    # not evidence that an explicitly named lip oil is balm. Restrict this exception
-    # to generic labels; specific competing types (Lip Balm/Lipstick) keep priority.
-    generic_type = " ".join(str(product_type or "").casefold().split())
-    if generic_type in {"lip care", "lip treatment", "lip treatments"}:
+    from services.pdp_category_classifier import CATEGORY_PATTERNS, classify
+    fallback = str(flag_path or "").strip().strip("/").lower()
+    if fallback.split("/", 1)[0] != "beauty":
+        return flag_path, CATEGORY_CONFIDENCE_FEED_DEFAULT
+    leaves = {path for _label, path, _pattern in CATEGORY_PATTERNS}
+
+    def accept(path: str, confidence: float) -> Tuple[str, float]:
+        if not path.startswith("beauty/") or (fallback in leaves and path != fallback):
+            return fallback, CATEGORY_CONFIDENCE_FEED_DEFAULT
+        return path, confidence
+
+    ptype = " ".join(str(product_type or "").casefold().split())
+    matches = _pattern_matches(product_type)
+    if matches > 1:
+        return fallback, CATEGORY_CONFIDENCE_FEED_DEFAULT
+    if ptype in _GENERIC_LIP_TYPES:
         title_hit = classify(title)
-        if title_hit and title_hit[1] == "beauty/makeup/lip/oil":
-            return title_hit[1]
-    hit = resolve_path_from_row(category=None, product_type=product_type, title=title)
-    return hit[1] if hit else fallback
+        if title_hit and title_hit[1] == "beauty/makeup/lip/oil" and _pattern_matches(title) == 1:
+            return accept(title_hit[1], CATEGORY_CONFIDENCE_EXPLICIT_TITLE)
+    if ptype not in _GENERIC_PRODUCT_TYPES and matches == 1:
+        hit = classify(product_type)
+        if hit:
+            return accept(hit[1], CATEGORY_CONFIDENCE_MERCHANT_TYPE)
+    # An unclassifiable multi-use label (e.g. Lip & Cheek) is not permission to
+    # choose a competing category from its title.
+    if matches == 0 and re.search(r"[&/]|\band\b", ptype):
+        return fallback, CATEGORY_CONFIDENCE_FEED_DEFAULT
+    if _TOOL_NOUN_SUFFIX.search(str(title or "")) and not _TOOL_FORMULA_CONTEXT.search(str(title or "")):
+        return accept("beauty/tools/brush", CATEGORY_CONFIDENCE_EXPLICIT_TITLE)
+    # Powder Kiss Liquid Lipcolour / Slim Stick and Strobe Cream are explicitly
+    # not classified from their marketing titles; shallow backfill owns the residue.
+    return fallback, CATEGORY_CONFIDENCE_FEED_DEFAULT
+
+
+def product_category_path(*, title: Optional[str], product_type: Optional[str], fallback: str) -> str:
+    """Path-only wrapper for the review-only repair planner; no second classifier."""
+    return _resolve_category(product_type=product_type, title=title, flag_path=fallback)[0]
 
 
 def shopify_product_to_record(
@@ -1259,14 +1311,15 @@ def shopify_product_to_record(
         else [t.strip() for t in str(raw_tags or "").split(",") if t.strip()]
     )
     canonical_url = f"https://{host}/products/{handle}"
-    category_path = product_category_path(
-        title=title, product_type=product.get("product_type"), fallback=category_path,
+    category_path, category_confidence = _resolve_category(
+        title=title, product_type=product.get("product_type"), flag_path=category_path,
     )
     return {
         "pdp": {
             "brand": brand,
             "product_name": title,
             "category_path": category_path,
+            "category_confidence": category_confidence,
             # Brand-authored body copy when present (it becomes the row's
             # description and feeds the lifecycle candidate gate + taxonomy
             # extractors); product_type alone otherwise. Rows minted without

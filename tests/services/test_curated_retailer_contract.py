@@ -275,4 +275,5 @@ def test_lip_oil_exception_does_not_overrule_specific_competing_types(product_ty
 
 def test_generic_lip_care_does_not_assume_every_product_is_an_oil():
     rec = map_record("retailer.com", title="Honey & Milk Moisture", product_type="Lip Care")
-    assert rec["pdp"]["category_path"] == "beauty/makeup/lip/balm"
+    assert rec["pdp"]["category_path"] == "beauty/skincare"
+    assert rec["pdp"]["category_confidence"] == feed.CATEGORY_CONFIDENCE_FEED_DEFAULT
