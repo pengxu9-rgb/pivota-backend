@@ -181,3 +181,44 @@ async def test_repeated_page_cannot_consume_budget_as_new_products(monkeypatch):
     install_http(monkeypatch, [page, page])
     with pytest.raises(feed.CrawlIncomplete, match="did not advance"):
         await feed.fetch_shopify_products("retailer.com", max_products=10)
+
+
+def test_category_repair_plan_is_guarded_and_matches_fresh_ingest():
+    from scripts.plan_curated_category_repair import plan_category_repair
+    row = {"product_key": "existing-brush", "title": "Artistool Foundation Brush #101",
+           "product_type": "", "category_path": "beauty/skincare"}
+    plan = plan_category_repair([row])
+    fresh = map_record("misshaus.com", title=row["title"], product_type="")
+    assert plan["mode"] == "review_only" and plan["proposed_changes"] == 1
+    assert plan["changes"][0]["expected_category_path"] == "beauty/skincare"
+    assert plan["changes"][0]["proposed_category_path"] == fresh["pdp"]["category_path"]
+    assert row["category_path"] == "beauty/skincare"  # input snapshot remains untouched
+    with pytest.raises(ValueError, match="duplicate product_key"):
+        plan_category_repair([row, row])
+
+
+def test_cli_prints_crawl_failure_and_never_applies_prefix(monkeypatch, capsys):
+    from scripts import onboard_curated_brands as cli
+    failed = feed.CrawlIncomplete("throttled", status="failed", next_page=2, scanned_products=250, selected_products=10)
+    monkeypatch.setattr(cli, "records_for_brand", AsyncMock(side_effect=failed))
+    apply = AsyncMock()
+    monkeypatch.setattr(cli, "apply_ingest_plan", apply)
+    assert cli.main(["--domain", "retailer.com", "--category", "beauty", "--source-role", "retailer", "--apply"]) == 2
+    assert json.loads(capsys.readouterr().err)["crawl"]["next_page"] == 2
+    apply.assert_not_called()
+
+
+def test_native_variant_ids_are_scoped_to_their_actual_retailer():
+    records = [feed.shopify_product_to_record(
+        product(), domain=host, category_path="beauty", source_role="retailer", currency="USD",
+        brand_override="A'PIEU", emit_native_variants=True,
+    ) for host in ["sukoshi.com", "sentisenti.com"]]
+    plan = ingest_validated_jsonl(records)
+    native = [s for s in plan["skus"] if s["source_variant_id"] == "45000000000001"]
+    assert len(native) == 2 and len({s["sku_key"] for s in native}) == 2
+    assert {s["source_domain"] for s in native} == {"sukoshi.com", "sentisenti.com"}
+    native_offers = [o for o in plan["offers"] if o["sku_key"] in {s["sku_key"] for s in native}]
+    assert len(native_offers) == 2
+    assert {o["merchant_id"] for o in native_offers} == {
+        "agent_seed::retailer::sukoshi.com", "agent_seed::retailer::sentisenti.com",
+    }

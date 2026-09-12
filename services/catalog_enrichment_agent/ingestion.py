@@ -274,9 +274,15 @@ _SKU_KEY_MAX = 255
 SOURCE_VARIANT_ID_MAX = 128
 
 
-def derive_variant_sku_key(product_key: str, variant_id: str) -> str:
+def derive_variant_sku_key(product_key: str, variant_id: str, *, seller_scope: Optional[str] = None) -> str:
     """One SKU per real variant, keyed on the merchant's own variant id so
     re-runs UPSERT; distinct from the canonical '::canonical' SKU."""
+    if seller_scope:
+        # Two retailer stores may use the same native variant ID. Scope the new
+        # retailer lane's SKU key by its host while storing the native ID unchanged.
+        # Official-mode callers retain exactly their established keys.
+        scoped = f"{seller_scope}|{variant_id}"
+        variant_id = "retailer-" + hashlib.sha256(scoped.encode("utf-8")).hexdigest()[:32]
     token = _normalize_token(str(variant_id)).replace(" ", "-")[:60] or "v"
     budget = _SKU_KEY_MAX - len(product_key) - len(VARIANT_SKU_INFIX)
     if budget < len(token):
@@ -348,7 +354,10 @@ def _build_variant_sku_inserts(
         # same way it always dropped two ids that normalise to one token. Provenance
         # above is asked of the id the MERCHANT issued, never of the bound copy.
         stored_vid = vid[:SOURCE_VARIANT_ID_MAX]
-        sku_key = derive_variant_sku_key(product_key, stored_vid)
+        sku_key = derive_variant_sku_key(
+            product_key, stored_vid,
+            seller_scope=pdp_payload.get("source_domain") if pdp_payload.get("source_role") == "retailer" else None,
+        )
         if sku_key in seen:
             # SAY SO. Until this branch existed the pair reached apply, where
             # `_adopt_existing_sku_identities` counted it as `skus_deduped_same_identity` and

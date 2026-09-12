@@ -1078,6 +1078,19 @@ def resolve_record_brand(
     return v_raw, "vendor_disagrees"
 
 
+def product_category_path(*, title: Optional[str], product_type: Optional[str], fallback: str) -> str:
+    """Use the shared taxonomy on this product's evidence, never store-wide copy/tags.
+
+    Unknown products retain the operator's coarse path; no category is fabricated.
+    Non-beauty feed routing is unchanged by this beauty-cohort repair.
+    """
+    if str(fallback or "").split("/", 1)[0] != "beauty":
+        return fallback
+    from services.pdp_category_classifier import resolve_path_from_row
+    hit = resolve_path_from_row(category=None, product_type=product_type, title=title)
+    return hit[1] if hit else fallback
+
+
 def shopify_product_to_record(
     product: Dict[str, Any],
     *,
@@ -1237,13 +1250,9 @@ def shopify_product_to_record(
         else [t.strip() for t in str(raw_tags or "").split(",") if t.strip()]
     )
     canonical_url = f"https://{host}/products/{handle}"
-    if str(category_path or "").startswith("beauty"):
-        from services.pdp_category_classifier import resolve_path_from_row
-        own_category = resolve_path_from_row(
-            category=None, product_type=product.get("product_type"), title=title,
-        )
-        if own_category:
-            category_path = own_category[1]
+    category_path = product_category_path(
+        title=title, product_type=product.get("product_type"), fallback=category_path,
+    )
     return {
         "pdp": {
             "brand": brand,

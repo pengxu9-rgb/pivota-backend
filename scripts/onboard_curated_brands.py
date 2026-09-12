@@ -29,7 +29,7 @@ if str(ROOT) not in sys.path:
 
 from services.catalog_enrichment_agent.apply import apply_ingest_plan  # noqa: E402
 from services.catalog_enrichment_agent.ingestion import ingest_validated_jsonl  # noqa: E402
-from services.curated_brand_feed import records_for_brand  # noqa: E402
+from services.curated_brand_feed import CrawlIncomplete, records_for_brand  # noqa: E402
 
 
 def _read_brand_list(args: argparse.Namespace) -> List[Dict[str, Any]]:
@@ -144,11 +144,11 @@ async def _run(args: argparse.Namespace) -> int:
 def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     g = p.add_mutually_exclusive_group(required=True)
-    g.add_argument("--domain", help="single brand storefront domain (e.g. kosas.com)")
+    g.add_argument("--domain", help="storefront domain (retailers require --source-role retailer)")
     g.add_argument("--file", help="JSONL of {domain, category_path, brand?} rows")
     p.add_argument("--category", help="category_path (default/override for rows without one)")
     p.add_argument("--brand", help="brand name override (single --domain mode)")
-    p.add_argument("--max-products", type=int, default=500, help="cap products per brand")
+    p.add_argument("--max-products", type=int, default=500, help="selected product budget; cap refuses partial ingestion")
     p.add_argument(
         "--fold-shades", "--base-listings-only",
         dest="base_listings_only",
@@ -179,8 +179,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         help=(
             "keep only products whose Shopify `vendor` is this (repeatable). For a "
             "MULTI-BRAND RETAILER feed — cocomo.sg lists 224 vendors and 1,000 products, "
-            "of which 24 are VELY VELY. Note --brand is an override that RENAMES every "
-            "product; this one SELECTS. Matching is exact after case/whitespace "
+            "of which 24 are VELY VELY. Use --source-role retailer; --brand normalizes the selected "
+            "brand spelling; this flag SELECTS. Matching is exact after case/whitespace "
             "normalisation, and a filter matching nothing is an error, not an empty run."
         ),
     )
@@ -201,7 +201,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="Whole-feed scan budget, independent of selected-brand --max-products")
     p.add_argument("--apply", action="store_true", help="ingest (else dry-run plan)")
     args = p.parse_args(argv)
-    return asyncio.run(_run(args))
+    try:
+        return asyncio.run(_run(args))
+    except CrawlIncomplete as exc:
+        print(json.dumps({"crawl": exc.as_dict()}), file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
