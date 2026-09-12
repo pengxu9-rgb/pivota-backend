@@ -224,3 +224,30 @@ def test_observed_stock_reaches_native_and_canonical_offers_without_invented_qua
     assert {offer["availability"] for offer in plan["offers"]} == {expected}
     assert {offer["inventory_quantity"] for offer in plan["offers"]} == {quantity}
     assert {seed["availability"] for seed in plan["seeds"]} == {expected}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stored", [None, {"product_group_id": ""}, {"product_group_id": "pg_different"}])
+async def test_primary_group_requires_persisted_matching_membership(stored):
+    pdp = ing.ingest_validated_jsonl([record()])["pdps"][0]
+    database = AsyncMock()
+    database.fetch_one.return_value = stored
+    assert not await writer._ensure_primary_retailer_group(pdp, database=database, target="pg_expected")
+    database.execute.assert_awaited_once()
+    assert database.execute.await_args.args[1]["product_group_id"] == "pg_expected"
+
+
+@pytest.mark.asyncio
+async def test_primary_group_preserves_existing_curated_membership_without_resolution():
+    pdp = ing.ingest_validated_jsonl([record()])["pdps"][0]
+    database = AsyncMock()
+    database.fetch_one.return_value = {"product_group_id": "pg_curated"}
+    assert await writer._ensure_primary_retailer_group(pdp, database=database)
+    assert "DO NOTHING" in database.execute.await_args.args[0]
+
+
+def test_primary_apply_group_failure_is_incomplete_even_with_all_row_counts():
+    from services.catalog_enrichment_agent.primary_ingestion import PrimaryIngestionIncomplete, require_primary_apply
+    counts = {"pdps": 1, "skus": 2, "offers": 2}
+    with pytest.raises(PrimaryIngestionIncomplete):
+        require_primary_apply({"planned": counts}, {**counts, "product_groups_failed": 1})

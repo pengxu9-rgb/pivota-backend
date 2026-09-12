@@ -438,3 +438,49 @@ async def test_fail_open_mints_on_internal_error(quiet, monkeypatch):
     assert out["content_key"] == CK
     assert out["gtin"] == GTIN14
     assert out["evidence"]["evidence"]["reason"] == "error"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("door,strict,failed", [
+    (ii.DOOR_CATALOG_ENRICHMENT, True, True),
+    (ii.DOOR_CATALOG_ENRICHMENT, False, False),
+    (ii.DOOR_URL_AUDIT, True, False),
+])
+async def test_group_lookup_error_is_strict_only_for_selected_primary_enrichment(quiet, monkeypatch, door, strict, failed):
+    from unittest.mock import AsyncMock
+    monkeypatch.setattr(ii, "_rows_by_gtin", AsyncMock(return_value=[_row(gtin=GTIN14)]))
+    monkeypatch.setattr(ii, "_existing_pg_for_listing", AsyncMock(side_effect=RuntimeError("group lookup unavailable")))
+    out = await ii.resolve_or_attach_content_identity(
+        BRAND, TITLE, gtin=GTIN_RAW, door=door, merchant_ctx=_ctx(strict_group_resolution=strict),
+    )
+    assert (out["evidence"]["evidence"].get("reason") == "error") is failed
+    if failed:
+        assert out["product_group_id"] is None
+    else:
+        assert out["action"] == ii.ACTION_ATTACH
+        assert out["product_group_id"] == make_singleton_product_group_id(CK)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("existing_group", [None, "pg_existing_curated_group"])
+async def test_primary_group_absence_is_legitimate_and_existing_group_is_preserved(quiet, monkeypatch, existing_group):
+    from unittest.mock import AsyncMock
+    from services.catalog_enrichment_agent.apply import _apply_pdp_identity_gate
+    monkeypatch.setattr(ii, "_rows_by_gtin", AsyncMock(return_value=[_row(gtin=GTIN14)]))
+    monkeypatch.setattr(ii, "_existing_pg_for_listing", AsyncMock(return_value=existing_group))
+    pdp = {**_row(gtin=GTIN14), "product_key": "ext:retailer:review"}
+    targets = {}
+    assert await _apply_pdp_identity_gate(pdp, identity_gate_on=True, group_targets=targets)
+    assert targets[pdp["product_key"]] == (existing_group or make_singleton_product_group_id(CK))
+
+
+@pytest.mark.asyncio
+async def test_primary_writer_refuses_actual_nested_group_lookup_error(quiet, monkeypatch):
+    from unittest.mock import AsyncMock
+    from services.catalog_enrichment_agent.apply import _apply_pdp_identity_gate
+    monkeypatch.setattr(ii, "_rows_by_gtin", AsyncMock(return_value=[_row(gtin=GTIN14)]))
+    monkeypatch.setattr(ii, "_existing_pg_for_listing", AsyncMock(side_effect=RuntimeError("group lookup unavailable")))
+    pdp = {**_row(gtin=GTIN14), "product_key": "ext:retailer:review"}
+    targets = {}
+    assert not await _apply_pdp_identity_gate(pdp, identity_gate_on=True, group_targets=targets)
+    assert not targets

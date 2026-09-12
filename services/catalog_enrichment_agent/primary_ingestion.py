@@ -90,7 +90,7 @@ def require_primary_apply(plan_report: Dict[str, Any], applied: Dict[str, Any]) 
     # A lost native variant is a partial ingest even if a canonical SKU survived.
     deduped = max(0, int(applied.get("skus_deduped_same_identity") or 0))
     unexplained_skus = max(0, missing["skus"] - deduped)
-    incomplete = missing["pdps"] or missing["offers"] or unexplained_skus or (expected["skus"] and not counts["skus"])
+    incomplete = int(applied.get("product_groups_failed") or 0) or missing["pdps"] or missing["offers"] or unexplained_skus or (expected["skus"] and not counts["skus"])
     report = {
         **plan_report,
         "status": "partial" if incomplete else "applied",

@@ -42,6 +42,8 @@ async def primary_db(db):
         await c.execute((Path(__file__).parents[1] / "db/migrations/158_catalog_onboard_queue.sql").read_text())
     finally:
         await c.close()
+    await db.execute("ALTER TABLE product_group_members ADD COLUMN IF NOT EXISTS updated_at timestamptz DEFAULT now()")
+    await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS test_primary_pgm_identity ON product_group_members(merchant_id, platform, platform_product_id)")
     # Expand the narrow seed fixture using the production writer bind columns.
     # Never drop shared dialect-test tables or erase another fixture's rows.
     from tests.test_sku_identity_upserts_postgres import _full_row
@@ -274,4 +276,41 @@ async def test_enabled_identity_two_identical_native_listings_replay_without_sel
         await db.execute("DELETE FROM external_product_seeds WHERE attached_product_key=ANY(:k)", {"k": keys})
         await db.execute("DELETE FROM intake_identity_events WHERE product_key=ANY(:k)", {"k": keys})
         await db.execute("DELETE FROM product_group_members WHERE merchant_id=ANY(:s)", {"s": sellers})
+        await db.execute("DELETE FROM catalog_merchants WHERE merchant_id=ANY(:s)", {"s": sellers})
+
+
+@pytest.mark.parametrize("batch_mode", [False, True])
+async def test_primary_group_write_failure_cannot_complete_or_publish_children(primary_db, monkeypatch, batch_mode):
+    from services.catalog_enrichment_agent.ingestion import ingest_validated_jsonl
+    from services.catalog_enrichment_agent.primary_ingestion import require_primary_plan, require_primary_apply, PrimaryIngestionIncomplete
+    from tests.services.test_retailer_adversarial_acceptance import record
+
+    db = primary_db
+    planned = ingest_validated_jsonl([record("group-failure-review.example")])
+    report = require_primary_plan(planned)
+    keys = [p["product_key"] for p in planned["pdps"]]
+    sellers = [m["merchant_id"] for m in planned["merchants"]]
+
+    class RefuseGroupWrite:
+        is_connected = True
+        def __getattr__(self, name):
+            return getattr(db, name)
+        async def execute(self, query, values=None):
+            if "INSERT INTO product_group_members" in str(query):
+                raise RuntimeError("test injected membership write denial")
+            return await db.execute(query, values)
+
+    try:
+        counts = await writer.apply_ingest_plan(planned, batch_label="group-failure-review", db=RefuseGroupWrite(), batch=batch_mode)
+        assert counts["pdps"] == 1
+        assert counts["product_groups_failed"] == 1
+        assert counts["skus"] == counts["offers"] == counts["seeds"] == 0
+        with pytest.raises(PrimaryIngestionIncomplete):
+            require_primary_apply(report, counts)
+        assert await db.fetch_val("SELECT count(*) FROM catalog_offers WHERE product_key=ANY(:k)", {"k": keys}) == 0
+        assert await db.fetch_val("SELECT count(*) FROM product_group_members WHERE merchant_id=ANY(:s)", {"s": sellers}) == 0
+    finally:
+        for table in ("catalog_offers", "catalog_skus", "catalog_products"):
+            await db.execute(f"DELETE FROM {table} WHERE product_key=ANY(:k)", {"k": keys})
+        await db.execute("DELETE FROM external_product_seeds WHERE attached_product_key=ANY(:k)", {"k": keys})
         await db.execute("DELETE FROM catalog_merchants WHERE merchant_id=ANY(:s)", {"s": sellers})
