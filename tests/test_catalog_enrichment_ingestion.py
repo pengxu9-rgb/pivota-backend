@@ -38,6 +38,7 @@ def _record(*, brand: str = "MAC", product_name: str = "Ruby Woo Matte Lipstick"
             "brand": brand,
             "product_name": product_name,
             "category_path": "beauty/makeup/lip/lipstick",
+            "currency": "USD",  # Explicit observation supplied by this fixture.
             "attribute_summary": "matte, retro red",
             # W2: the seller of record derives from the PDP's own source_domain
             # (real enrichment payloads always carry it — the crawler knows
@@ -499,7 +500,7 @@ def test_offer_handles_out_of_stock_and_missing_price():
     result = ingest_validated_record(record)
     assert result is not None
     offer = result["offers"][0]
-    assert offer["availability"] == "unknown"
+    assert offer["availability"] == "out_of_stock"
     assert offer["list_price"] is None
     assert offer["inventory_quantity"] == 0
     assert offer["price_confidence"] is None
@@ -792,7 +793,7 @@ def _variant_record(n_variants=2):
     ]
     return {
         "pdp": {"brand": "MAC Cosmetics", "product_name": "Retro Matte Lipstick",
-                "category_path": "beauty/makeup", "attribute_summary": "matte lipstick",
+                "category_path": "beauty/makeup", "attribute_summary": "matte lipstick", "currency": "USD",
                 "source_domain": "maccosmetics.com", "variants": variants},
         "offers": [{"merchant_inferred": "MAC Cosmetics",
                     "canonical_url": "https://maccosmetics.com/products/retro-matte-lipstick",
@@ -822,7 +823,7 @@ def test_variants_become_shade_skus_and_offers_beside_the_canonical():
     assert len(offers) == 4
     by_sku = {o["sku_key"]: o for o in offers}
     assert by_sku[vskus[1]["sku_key"]]["list_price"] == 25.0
-    assert by_sku[vskus[1]["sku_key"]]["availability"] == "unknown"   # in_stock False
+    assert by_sku[vskus[1]["sku_key"]]["availability"] == "out_of_stock"   # in_stock False
     assert by_sku[vskus[0]["sku_key"]]["availability"] == "in_stock"
     assert len({o["offer_id"] for o in offers}) == 4
 
@@ -1180,7 +1181,7 @@ def test_a_variant_sku_key_is_derived_from_the_id_the_row_stores():
     a, b = "8" * 128 + "1", "8" * 128 + "2"
     rows = ing._build_variant_sku_inserts(
         product_key=long_pk,
-        pdp_payload={"brand": "MAC Cosmetics", "product_name": "Retro Matte Lipstick",
+        pdp_payload={"brand": "MAC Cosmetics", "product_name": "Retro Matte Lipstick", "currency": "USD",
                      "source_domain": "maccosmetics.com",
                      "variants": [{"variant_id": a, "title": "Ruby Woo"},
                                   {"variant_id": b, "title": "Bronx"}]},
@@ -1214,7 +1215,7 @@ def test_the_dropped_same_identity_variant_is_logged_with_both_ids(caplog):
     with caplog.at_level(logging.WARNING, logger="catalog_enrichment_agent.ingestion"):
         rows = ing._build_variant_sku_inserts(
             product_key="ext:mac-retro-matte::deadbeef",
-            pdp_payload={"brand": "MAC Cosmetics", "product_name": "Retro Matte Lipstick",
+            pdp_payload={"brand": "MAC Cosmetics", "product_name": "Retro Matte Lipstick", "currency": "USD",
                          "source_domain": "maccosmetics.com",
                          "variants": [{"variant_id": "ABC_1", "title": "Ruby Woo"},
                                       {"variant_id": "abc-1", "title": "Bronx"}]},
@@ -1417,20 +1418,9 @@ def test_the_pdp_payload_whitelist_does_not_drop_the_currency():
     assert "market" not in payload
 
 
-def test_a_record_with_no_currency_is_still_USD_and_US():
-    """The POSITIVE counterpart and the backward-compatibility guarantee: every record built
-    before this change carries no currency and must land exactly as it did. Verified against the
-    live lane too -- flowerbeauty.com and maccosmetics.com both report USD/US."""
-    from services.catalog_enrichment_agent.ingestion import ingest_validated_record
-
-    out = ingest_validated_record(_record())
-
-    assert {o["currency"] for o in out["offers"]} == {"USD"}
-    assert out["sku"]["currency"] == "USD"
-    assert {s["price_currency"] for s in out["seeds"]} == {"USD"}
-    assert {s["market"] for s in out["seeds"]} == {"US"}   # unchanged: not this lane's axis
-    assert _seed_variant_currencies(out) == {"USD"}
-    assert _seed_variant_currencies(out, "currency") == {"USD"}
+def test_a_record_with_no_currency_is_refused_before_planning():
+    with pytest.raises(ValueError, match="currency_unproven"):
+        ingest_validated_record(_record(currency=None))
 
 
 @pytest.mark.parametrize(
@@ -1438,14 +1428,15 @@ def test_a_record_with_no_currency_is_still_USD_and_US():
     ["", "  ", "sgd dollars", "S", "SGDX", "$", "12", None, 5, ["SGD"], {"c": "SGD"}, "SG D",
      "USD DROP TABLE catalog_offers", "US" + chr(0) + "D"],
 )
-def test_a_merchant_supplied_currency_that_is_not_ISO_falls_back_to_USD(bad):
+def test_a_merchant_supplied_currency_that_is_not_ISO_is_refused(bad):
     """`/meta.json` is MERCHANT-CONTROLLED and its value lands in a currency column that is a
     join key for price comparison. Anything that is not ISO-4217 alpha-3 is refused rather than
     written through -- including an embedded NUL, which Postgres rejects with 22P05, and a
     non-string, which would otherwise reach `.upper()`."""
     from services.catalog_enrichment_agent.ingestion import _currency_of
 
-    assert _currency_of({"currency": bad}) == "USD"
+    with pytest.raises(ValueError, match="currency_unproven"):
+        _currency_of({"currency": bad})
 
 
 @pytest.mark.parametrize("good,expected", [("sgd", "SGD"), ("SGD", "SGD"), (" jpy ", "JPY")])
@@ -1613,7 +1604,7 @@ def test_a_seed_row_never_disagrees_with_its_own_seed_data():
     assert "seed_data" in updated, "the premise: seed_data is refreshed on every re-ingest"
     assert "price_currency" in updated, "so the column it must agree with has to be refreshed too"
 
-    for first, second in (("SGD", None), (None, "SGD")):
+    for first, second in (("SGD", "USD"), ("USD", "SGD")):
         run1 = ingest_validated_record(_sgd_record(currency=first))["seeds"][0]
         run2 = ingest_validated_record(_sgd_record(currency=second))["seeds"][0]
         assert run1["id"] == run2["id"], "stable ids are why the conflict arm is reached at all"
@@ -1871,7 +1862,7 @@ def test_the_mapper_and_the_ingestion_agree_on_the_seam_between_them():
     assert report["shades"] == 3, "fold refused — the rest of this test would be vacuous"
 
     rec = shopify_product_to_record(out[0], domain="maccosmetics.com",
-                                    category_path="beauty/makeup", emit_variants=True)
+                                    category_path="beauty/makeup", emit_variants=True, currency="USD")
     rec["offers"][0]["validated_at"] = "shopify_products_json"
     seed = json.loads(ing.ingest_validated_record(rec)["seeds"][0]["seed_data"])
 

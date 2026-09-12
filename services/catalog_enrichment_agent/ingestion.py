@@ -18,7 +18,8 @@ This revision writes the full chain at ingestion time so agent PDPs are
 shaped identically to merchant-sync PDPs.
 
 Idempotency contract:
-- A PDP is identified by (brand_normalized, canonical_product_name).
+- An official PDP keeps its historical (brand_normalized, canonical_product_name) key.
+- An explicit retailer PDP is keyed by its storefront listing URL; content identity is separate.
 - An SKU is identified by (product_key + '::canonical') — one per PDP.
 - An offer is identified by a deterministic id derived from
   (product_key, sku_key, destination_url) so re-runs UPSERT cleanly.
@@ -43,7 +44,7 @@ from services.beauty_external_ranking import (
     normalize_external_seed_structured_ingredient_ids,
 )
 from services.category_kind import resolve_category_kind
-from services.catalog_identity import make_content_key
+from services.catalog_identity import make_content_key, validated_source_gtin
 from services.catalog_sync_service import make_pivota_canonical_fields
 from services.seller_identity import (
     BANNED_BUCKET_MERCHANT_ID,
@@ -95,6 +96,21 @@ SYNTHETIC_MERCHANT_ID = "external_seed"
 SYNTHETIC_PLATFORM = "external_seed"
 DEFAULT_CATEGORY_CONFIDENCE = 0.7
 DEFAULT_CATEGORY_LABEL_SOURCE = "enrichment_agent_v1"
+def _category_confidence_or_none(value):
+    """Coerce a lane-supplied category confidence, or None to fall back to the default.
+
+    Returns None rather than 0.0 on junk: 0.0 is a legitimate confidence and would be persisted
+    as one, silently replacing the default with a claim the lane never made.
+    """
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed != parsed:  # NaN
+        return None
+    return max(0.0, min(1.0, parsed))
 DEFAULT_TRUTH_TIER = "primary"
 DEFAULT_READINESS_TIER = "referral_only"
 DEFAULT_CATALOG_TRACK = "external_referral"
@@ -140,10 +156,31 @@ def derive_product_key(brand: Optional[str], product_name: Optional[str]) -> str
     return f"ext:{prefix}::{digest}"
 
 
+def retailer_listing_identity(source_domain: str, canonical_url: str) -> str:
+    """A retailer listing belongs to its storefront URL, independently of content identity."""
+    from urllib.parse import urlsplit
+
+    host = str(source_domain or "").lower().removeprefix("www.")
+    parsed = urlsplit(str(canonical_url or ""))
+    url_host = (parsed.hostname or "").lower().removeprefix("www.")
+    if (not host or host != url_host or parsed.scheme not in {"http", "https"}
+            or parsed.username or parsed.password or parsed.port or not parsed.path.strip("/")):
+        raise ValueError("retailer_listing_identity_unproven: source storefront URL must match its host")
+    return host + parsed.path.rstrip("/")
+
+
 def _normalize_url(url: Optional[str]) -> str:
     if not url:
         return ""
     return str(url).strip()
+
+
+def _observed_stock(value: Any) -> Optional[bool]:
+    return value if isinstance(value, bool) else None
+
+
+def _availability(value: Any) -> str:
+    return "in_stock" if value is True else "out_of_stock" if value is False else "unknown"
 
 
 def _validated_offers(record: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -158,17 +195,19 @@ def _validated_offers(record: Dict[str, Any]) -> List[Dict[str, Any]]:
             continue
         offers.append({
             "merchant_inferred": str(offer.get("merchant_inferred") or "").strip(),
+            "seller_domain": str(offer.get("seller_domain") or "").strip() or None,
             "canonical_url": canonical_url,
             "destination_url": destination_url or canonical_url,
             "image_url": _normalize_url(offer.get("image_url")),
             "price": offer.get("price"),
-            "in_stock": bool(offer.get("in_stock") or False),
+            "in_stock": _observed_stock(offer.get("in_stock")),
             "validated_at": str(offer.get("validated_at") or "").strip() or None,
         })
     return offers
 
 
 def _build_pdp_payload(record: Dict[str, Any]) -> Dict[str, Any]:
+    from services.category_path_aliases import resolve
     pdp = record.get("pdp") or {}
     if not isinstance(pdp, dict):
         return {}
@@ -200,6 +239,22 @@ def _build_pdp_payload(record: Dict[str, Any]) -> Dict[str, Any]:
         "brand": proper_case_brand(pdp.get("brand")),
         "product_name": str(pdp.get("product_name") or "").strip(),
         "category_path": str(pdp.get("category_path") or "").strip(),
+        "category_resolution_status": "resolved" if resolve(pdp.get("category_path")) else "unresolved",
+        "category_input_path": pdp.get("category_input_path") or pdp.get("category_path"),
+        "category_source_product_type": pdp.get("category_source_product_type"),
+        # Category confidence from the producing lane, when it has any. This payload is a
+        # WHITELIST -- a field absent here is dropped no matter what the record carried -- so a
+        # lane's classification would be silently discarded without this line, exactly as the
+        # currency passthrough was before it. None when the lane does not classify; the default
+        # below applies then.
+        #
+        # category_label_source is deliberately NOT threaded through. It reads as provenance but
+        # doubles as a LANE IDENTIFIER -- pdp_scope_classifier and CANONICAL_SCOPE_PREDICATE grant
+        # canonical scope on `== 'enrichment_agent_v1'` -- so letting a lane overwrite it would
+        # silently forfeit Rule-1 protection for those rows. Confidence carries provenance instead.
+        "category_confidence": _category_confidence_or_none(
+            pdp.get("category_confidence")
+        ),
         "attribute_summary": str(pdp.get("attribute_summary") or "").strip(),
         "gtin": str(gtin_raw).strip() if gtin_raw else None,
         "upc": str(upc_raw).strip() if upc_raw else None,
@@ -214,6 +269,7 @@ def _build_pdp_payload(record: Dict[str, Any]) -> Dict[str, Any]:
             "mpn": str(mpn_raw).strip() if mpn_raw else None,
         },
         "source_domain": source_domain,
+        "source_role": pdp.get("source_role"),
         # The storefront's own currency. This payload is a WHITELIST -- a field absent here is
         # dropped no matter what the record carried -- so omitting it made the passthrough a
         # silent no-op even with every consumer reading it. Validated at the point of USE
@@ -272,9 +328,15 @@ _SKU_KEY_MAX = 255
 SOURCE_VARIANT_ID_MAX = 128
 
 
-def derive_variant_sku_key(product_key: str, variant_id: str) -> str:
+def derive_variant_sku_key(product_key: str, variant_id: str, *, seller_scope: Optional[str] = None) -> str:
     """One SKU per real variant, keyed on the merchant's own variant id so
     re-runs UPSERT; distinct from the canonical '::canonical' SKU."""
+    if seller_scope:
+        # Two retailer stores may use the same native variant ID. Scope the new
+        # retailer lane's SKU key by its host while storing the native ID unchanged.
+        # Official-mode callers retain exactly their established keys.
+        scoped = f"{seller_scope}|{variant_id}"
+        variant_id = "retailer-" + hashlib.sha256(scoped.encode("utf-8")).hexdigest()[:32]
     token = _normalize_token(str(variant_id)).replace(" ", "-")[:60] or "v"
     budget = _SKU_KEY_MAX - len(product_key) - len(VARIANT_SKU_INFIX)
     if budget < len(token):
@@ -346,7 +408,10 @@ def _build_variant_sku_inserts(
         # same way it always dropped two ids that normalise to one token. Provenance
         # above is asked of the id the MERCHANT issued, never of the bound copy.
         stored_vid = vid[:SOURCE_VARIANT_ID_MAX]
-        sku_key = derive_variant_sku_key(product_key, stored_vid)
+        sku_key = derive_variant_sku_key(
+            product_key, stored_vid,
+            seller_scope=pdp_payload.get("source_domain") if pdp_payload.get("source_role") == "retailer" else None,
+        )
         if sku_key in seen:
             # SAY SO. Until this branch existed the pair reached apply, where
             # `_adopt_existing_sku_identities` counted it as `skus_deduped_same_identity` and
@@ -456,19 +521,30 @@ def _build_pdp_insert(
         # promote a different offer.
         canonical_url = offers[0].get("canonical_url") or offers[0].get("destination_url") or ""
         image_url = offers[0].get("image_url") or ""
+    if pdp_payload.get("source_role") == "retailer":
+        # Listing identity and shared content identity are different axes. Native
+        # Shopify IDs are local to a store; title/GTIN cannot own a seller's row.
+        listing = retailer_listing_identity(pdp_payload.get("source_domain"), canonical_url)
+        digest = hashlib.sha256(listing.encode("utf-8")).hexdigest()[:32]
+        source_product_id = "retailer:" + digest
+        product_key = "ext:" + source_product_id
+        pivota_fields = make_pivota_canonical_fields(
+            SYNTHETIC_MERCHANT_ID, SYNTHETIC_PLATFORM, source_product_id,
+        )
     enrichment_meta = {
         "agent_version": AGENT_VERSION,
         "source_jsonl": source_jsonl or None,
         "candidate_attribute_summary": pdp_payload.get("attribute_summary") or None,
         "offer_count": len(offers),
+        "category_resolution_status": pdp_payload.get("category_resolution_status"),
+        "category_input_path": pdp_payload.get("category_input_path"),
+        "category_source_product_type": pdp_payload.get("category_source_product_type"),
     }
     return {
         "product_key": product_key,
-        # W2: seller of record (retailer domains key on etld1 alone;
-        # brand-direct on (brand, etld1)). product_key and the pivota_* sig
-        # fields keep their historical derivation inputs above — sigs are
-        # write-once (T5) and keys are opaque plumbing (D4.2); only the
-        # ownership column changes.
+        # Seller of record: retailer domains key on etld1, brand-direct on
+        # (brand, etld1). Official keys/signatures retain historical inputs;
+        # explicit retailer listings use the distinct URL identity above.
         "merchant_id": seller["merchant_id"],
         "platform": SYNTHETIC_PLATFORM,
         "source_product_id": source_product_id,
@@ -483,6 +559,14 @@ def _build_pdp_insert(
         "title": pdp_payload["product_name"],
         "description": pdp_payload.get("attribute_summary") or None,
         "brand": pdp_payload["brand"],
+        # Preserve captured strong identity through the pure plan to the apply
+        # gate. Without this column, native SKUs retained their barcode but the
+        # PDP identity resolver never received it. Use the same canonicalizer
+        # as the gate after checking the source GS1 shape/check digit; missing,
+        # all-zero and invalid identifiers remain absent.
+        # `gtin` already has a SQL bind in both apply executors; do not forward
+        # the input-only `barcode` alias as an extra row/bind field.
+        "gtin": validated_source_gtin(pdp_payload.get("gtin") or pdp_payload.get("barcode")),
         "product_type": pdp_payload.get("category_path", "").split("/")[-1] or None,
         "category": pdp_payload.get("category_path", "").split("/")[-1] or None,
         "category_path": pdp_payload.get("category_path") or None,
@@ -498,7 +582,15 @@ def _build_pdp_insert(
             title=pdp_payload["product_name"],
             tags=pdp_payload.get("tags"),
         ),
-        "category_confidence": DEFAULT_CATEGORY_CONFIDENCE,
+        # Prefer what the producing lane actually determined; the constants are the fallback for
+        # lanes that do not classify. They were previously unconditional, so every Path-C row
+        # claimed the enrichment agent had chosen its category at 0.7 confidence even when the
+        # value came from a per-domain command-line flag.
+        "category_confidence": (
+            pdp_payload.get("category_confidence")
+            if pdp_payload.get("category_confidence") is not None
+            else DEFAULT_CATEGORY_CONFIDENCE
+        ),
         "category_label_source": DEFAULT_CATEGORY_LABEL_SOURCE,
         "canonical_url": canonical_url or None,
         "image_url": image_url or None,
@@ -528,10 +620,10 @@ def _build_pdp_insert(
         # Stage 1 (mig 083): content-derived identity. Path C is the
         # path most likely to share a content_key with Path A/B rows
         # (same physical product enriched by the agent + scraped by
-        # the mirror + sold via a connected merchant). Agent payloads
-        # typically don't carry GTIN at the candidate stage — gtin
-        # arrives later via offers. Stage 2 auto-grouper will pick up
-        # cross-path matches via brand+title alone.
+        # the mirror + sold via a connected merchant). This is still a
+        # pure-plan candidate key, not proof of cross-retailer attachment.
+        # Captured GTIN is carried separately above for the flag-gated
+        # apply resolver; no DB matching or product/signature rekey here.
         "content_key": make_content_key(
             pdp_payload.get("brand"),
             pdp_payload.get("product_name"),
@@ -554,6 +646,9 @@ def _lifecycle_stage_for_agent_pdp(
     """Compute the lifecycle stage for a Path C agent-ingested row.
     Reuses the same compute_lifecycle_stage gates as Path A/B —
     inputs reshape to the row dict the gate expects."""
+    from services.category_path_aliases import resolve
+    if not resolve(pdp_payload.get("category_path")):
+        return "draft"
     # The taxonomy v1 derivation runs again here to get list values
     # (the main return path serializes to JSON strings for the runner;
     # the gate needs Python lists).
@@ -613,26 +708,16 @@ def _taxonomy_v1_payload(pdp_payload: Dict[str, Any], offers: List[Dict[str, Any
     }
 
 
-DEFAULT_CURRENCY = "USD"
-
 _ISO_CURRENCY = re.compile(r"^[A-Z]{3}$")
 
 
 def _currency_of(pdp_payload: Dict[str, Any]) -> str:
-    """The record's own currency, or USD.
-
-    Every currency in this module was the literal "USD", in seven places, and nothing ever read
-    one off the record -- so a Singapore storefront pricing in SGD was ingested as USD. Measured
-    2026-09-06 on jsmbeauty.sg: 170 offers, `{'USD': 170}`, against a storefront whose meta.json
-    says SGD/SG and whose LIP-PRESSION Glowy Tint is SGD 30.00. A currency is a join key for
-    price comparison and ranking, so a wrong one is not a display bug.
-
-    USD REMAINS THE DEFAULT, deliberately: every record built before this change carries no
-    currency, and defaulting preserves exactly what those rows already have. Validated because
-    the value originates in merchant-controlled JSON.
-    """
-    raw = str((pdp_payload or {}).get("currency") or "").strip().upper()
-    return raw if _ISO_CURRENCY.match(raw) else DEFAULT_CURRENCY
+    """Return explicitly observed currency; unknown money cannot become USD."""
+    value = (pdp_payload or {}).get("currency")
+    raw = value.strip().upper() if isinstance(value, str) else ""
+    if not _ISO_CURRENCY.fullmatch(raw):
+        raise ValueError("currency_unproven: explicit storefront currency is required before ingestion")
+    return raw
 
 
 def _build_seed_inserts(
@@ -663,10 +748,10 @@ def _build_seed_inserts(
             continue
         seen_urls.add(destination_url)
         seed_id = derive_seed_id(product_key, destination_url)
-        merchant_slug = _normalize_token(offer.get("merchant_inferred") or "merchant").replace(" ", "-") or "merchant"
+        merchant_slug = _normalize_token(offer.get("seller_domain") or offer.get("merchant_inferred") or "merchant").replace(" ", "-") or "merchant"
         external_product_id = f"{merchant_slug}:{seed_id.split(':')[-1]}"
-        in_stock = bool(offer.get("in_stock") or False)
-        availability = "in_stock" if in_stock else "out_of_stock"
+        in_stock = _observed_stock(offer.get("in_stock"))
+        availability = _availability(in_stock)
         price = offer.get("price")
         # One synthetic variant — the audit only requires a non-empty
         # variant list with currency matching the row's price_currency.
@@ -761,7 +846,7 @@ def _build_seed_inserts(
                     # seeds still carry a null for an unpriced shade: there is no
                     # per-shade substitute, and dropping it would delete selector data.
                     continue
-                v_in_stock = bool(v.get("in_stock"))
+                v_in_stock = _observed_stock(v.get("in_stock"))
                 shade = str(v.get("title") or "").strip()
                 image_url = str(v.get("image_url") or "").strip() or None
                 built.append({
@@ -776,7 +861,7 @@ def _build_seed_inserts(
                     # column directly) and search would price one shade differently.
                     "price_amount": variant_own_price(v),
                     "price": variant_own_price(v),
-                    "availability": "in_stock" if v_in_stock else "out_of_stock",
+                    "availability": _availability(v_in_stock),
                     "in_stock": v_in_stock,
                     "image_url": image_url,
                     "options": _seed_variant_options(
@@ -946,11 +1031,19 @@ def derive_offer_id(product_key: str, sku_key: str, destination_url: str) -> str
     return f"offer:{AGENT_VERSION}:{digest}"
 
 
-def derive_merchant_id(merchant_inferred: Optional[str], domain: Optional[str]) -> str:
+def derive_merchant_id(merchant_inferred: Optional[str], domain: Optional[str], *,
+                       seller_domain: Optional[str] = None) -> str:
     """Stable merchant_id derived from the validated retailer name (or
     domain as fallback). Format: 'agent_seed::<slug>'. Two offers from
     the same retailer collapse to the same merchant_id, which is what
     Phase 6's seller_count rule needs to compute pdp_scope correctly."""
+    if seller_domain:
+        # Explicit retailer identity cannot collapse across same-named stores or
+        # punctuation-equivalent hosts. Existing official IDs take the old branch.
+        host = _domain_of(f"https://{seller_domain}")
+        if not host or host != domain:
+            raise ValueError("retailer seller_domain must match its offer URL host")
+        return f"{MERCHANT_ID_PREFIX}retailer::{host}"
     raw = merchant_inferred or domain or "unknown"
     slug = _normalize_token(raw).replace(" ", "-") or "unknown"
     return f"{MERCHANT_ID_PREFIX}{slug[:80]}"
@@ -1043,7 +1136,7 @@ def _build_merchant_upserts(
     for offer in offers:
         merchant_inferred = str(offer.get("merchant_inferred") or "").strip() or None
         domain = _domain_of(offer.get("canonical_url") or offer.get("destination_url"))
-        merchant_id = derive_merchant_id(merchant_inferred, domain)
+        merchant_id = derive_merchant_id(merchant_inferred, domain, seller_domain=offer.get("seller_domain"))
         if merchant_id in seen:
             continue
         seen[merchant_id] = {
@@ -1067,12 +1160,13 @@ def _build_offer_inserts(
     sku_key: str,
     offers: List[Dict[str, Any]],
     source_domain: Optional[str] = None,
-    currency: str = DEFAULT_CURRENCY,
+    currency: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """One catalog_offers row per validated offer. merchant_id resolves
     to the per-retailer synthetic id (see derive_merchant_id), which is
     what makes Phase 6 seller_count meaningful for the canonical
     classification."""
+    currency = _currency_of({"currency": currency})
     rows: List[Dict[str, Any]] = []
     seen_offer_ids: set = set()
     for offer in offers:
@@ -1086,8 +1180,8 @@ def _build_offer_inserts(
         seen_offer_ids.add(offer_id)
         merchant_inferred = str(offer.get("merchant_inferred") or "").strip() or None
         domain = _domain_of(canonical_url or destination_url)
-        merchant_id = derive_merchant_id(merchant_inferred, domain)
-        availability = "in_stock" if offer.get("in_stock") else "unknown"
+        merchant_id = derive_merchant_id(merchant_inferred, domain, seller_domain=offer.get("seller_domain"))
+        availability = _availability(_observed_stock(offer.get("in_stock")))
         price = offer.get("price")
         try:
             price_value = float(price) if price is not None else None
@@ -1104,7 +1198,7 @@ def _build_offer_inserts(
             "offer_mode": OFFER_MODE,
             "channel": "default",
             "availability": availability,
-            "inventory_quantity": 999 if offer.get("in_stock") else 0,
+            "inventory_quantity": 0 if offer.get("in_stock") is False else None,
             "currency": currency,
             "list_price": price_value,
             "merchant_effective_price": price_value,
@@ -1168,6 +1262,7 @@ def ingest_validated_record(record: Dict[str, Any], *, source_jsonl: Optional[st
         # Record without any validated offer is not actionable —
         # we don't create empty PDPs.
         return None
+    _currency_of(pdp_payload)  # Fail the pure plan before any row can be applied.
     # W2 (ADR-011 R5 closure): resolve the seller of record BEFORE building any
     # row. Retailer domains key on etld1 alone; brand-direct keys on
     # (brand, etld1). Unresolvable -> the record is BLOCKED (skipped loudly and
@@ -1181,6 +1276,11 @@ def ingest_validated_record(record: Dict[str, Any], *, source_jsonl: Optional[st
         seller = resolve_seed_seller_identity(
             brand=pdp_payload.get("brand"), domain=pdp_payload.get("source_domain")
         )
+        if pdp_payload.get("source_role") == "retailer":
+            from services.seller_identity import make_observed_retailer_id
+            seller = {**seller, "kind": "retailer",
+                      "merchant_id": make_observed_retailer_id(seller["registrable"]),
+                      "merchant_name": seller["registrable"]}
     except ValueError as exc:
         return {"skipped_reason": f"seller_of_record_unresolved: {exc}"}
     pdp_row = _build_pdp_insert(
@@ -1230,6 +1330,9 @@ def ingest_validated_record(record: Dict[str, Any], *, source_jsonl: Optional[st
         seller=seller,
         canonical_url=pdp_row.get("canonical_url"),
     )
+    if pdp_payload.get("source_role") == "retailer":
+        for row in [sku_row, *variant_sku_rows]:
+            row["source_product_id"] = pdp_row["source_product_id"]
     variant_offer_rows: List[Dict[str, Any]] = []
     if variant_sku_rows and offers:
         primary = offers[0]
@@ -1246,7 +1349,7 @@ def ingest_validated_record(record: Dict[str, Any], *, source_jsonl: Optional[st
             variant_offer_rows.extend(_build_offer_inserts(
                 product_key=pdp_row["product_key"],
                 sku_key=vsku["sku_key"],
-                offers=[dict(primary, price=price, in_stock=bool(v.get("in_stock")))],
+                offers=[dict(primary, price=price, in_stock=_observed_stock(v.get("in_stock")))],
                 source_domain=pdp_row.get("source_domain"),
                 # THE EIGHTH SITE. There were seven "USD" literals, and introducing the parameter
                 # created an eighth CALL that silently took the default -- so a shade line landed

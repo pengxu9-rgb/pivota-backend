@@ -1,0 +1,591 @@
+[
+  {
+    "domain": "stilacosmetics.com",
+    "observed_at": "2026-09-12T16:15:49.418880+00:00",
+    "source_url": "https://stilacosmetics.com/products/stay-all-day-chroma-flash-liquid-eye-liner",
+    "product": {
+      "id": 14660519821677,
+      "title": "Stay All Day® Chroma-Flash Liquid Eye Liner",
+      "handle": "stay-all-day-chroma-flash-liquid-eye-liner",
+      "vendor": "Stila Cosmetics",
+      "product_type": "Blush",
+      "body_html": "<p>These liquid eye liners hit a whole new eye dimension with a stunning shade-shifting formula. Richly pigmented with chameleon-like pearls and a metallic chrome finish for colors that play out right before your eyes. Bold and brilliant for a flash of drama and transforming hues that hit different at every angle. Choose from three multi-shade/multi-hued experiences.</p>\n<ul>\n<li>Vivid color-shifting effects last all day.</li>\n<li>Long-wearing and resistant to smudging, flaking, and fading.</li>\n<li>Glides on effortlessly for smooth, skip-free application. Allow time to dry and set.</li>\n<li>Pro-precision brush lets you create perfect lines and eye effects.</li>\n<li>Lightweight and comfortable wear. </li>\n</ul>\n<p>Clinical Test Results:  </p>\n<ul>\n<li>97%* said eye liner feels lightweight and is comfortable to wear.</li>\n<li>94%* said the easy-glide applicator makes application effortless.</li>\n<li>94%* said the color shift with the formula is easy to see and pleasant.</li>\n<li>91%* said eye liner made eyes looks brighter and vibrant. NEW</li>\n</ul>\n<p>*Based on a survey of 35 subjects.</p>\n<p>0.04 fl. oz./1.2 mL</p>\n<p>CAUTION: In case of irritation or discomfort, discontinue use.</p>",
+      "variants": [
+        {
+          "id": 53071008334189,
+          "title": "Dragonfly (Blue Green, Vivid Green, Gold)",
+          "option1": "Dragonfly (Blue Green, Vivid Green, Gold)",
+          "option2": null,
+          "option3": null,
+          "sku": "SE38050001",
+          "requires_shipping": true,
+          "taxable": true,
+          "featured_image": {
+            "id": 55385320161645,
+            "product_id": 14660519821677,
+            "position": 39,
+            "created_at": "2026-03-03T14:08:43-08:00",
+            "updated_at": "2026-03-06T10:47:55-08:00",
+            "alt": "#color_dragonfly-blue-green-vivid-green-gold",
+            "width": 2000,
+            "height": 2000,
+            "src": "https://cdn.shopify.com/s/files/1/2220/7229/files/Chroma_Flash_PDP_Dragonfly_Open_713777ec-c4fc-49a0-aa30-acc44e8b49a2.jpg?v=1772822875",
+            "variant_ids": [
+              53071008334189
+            ]
+          },
+          "available": true,
+          "price": "27.00",
+          "grams": 0,
+          "compare_at_price": null,
+          "position": 1,
+          "product_id": 14660519821677,
+          "created_at": "2026-03-03T14:01:21-08:00",
+          "updated_at": "2026-09-12T09:15:50-07:00"
+        },
+        {
+          "id": 53071008366957,
+          "title": "Unicorn (Fuchsia, Bronze, Green)",
+          "option1": "Unicorn (Fuchsia, Bronze, Green)",
+          "option2": null,
+          "option3": null,
+          "sku": "SE38040001",
+          "requires_shipping": true,
+          "taxable": true,
+          "featured_image": {
+            "id": 55385321341293,
+            "product_id": 14660519821677,
+            "position": 50,
+            "created_at": "2026-03-03T14:09:29-08:00",
+            "updated_at": "2026-03-06T11:00:22-08:00",
+            "alt": "#color_unicorn-fuchsia-bronze-green",
+            "width": 2000,
+            "height": 2000,
+            "src": "https://cdn.shopify.com/s/files/1/2220/7229/files/Chroma_Flash_PDP_Unicorn_Open_b4a55da7-49c3-4519-a675-5ffcc988bd9c.jpg?v=1772823622",
+            "variant_ids": [
+              53071008366957
+            ]
+          },
+          "available": true,
+          "price": "27.00",
+          "grams": 0,
+          "compare_at_price": null,
+          "position": 2,
+          "product_id": 14660519821677,
+          "created_at": "2026-03-03T14:01:21-08:00",
+          "updated_at": "2026-09-12T09:15:50-07:00"
+        },
+        {
+          "id": 51828447543661,
+          "title": "Firefly (Golden Copper, Lime Green, Pink Topaz)",
+          "option1": "Firefly (Golden Copper, Lime Green, Pink Topaz)",
+          "option2": null,
+          "option3": null,
+          "sku": "SE38030001",
+          "requires_shipping": true,
+          "taxable": true,
+          "featured_image": {
+            "id": 53468870050157,
+            "product_id": 14660519821677,
+            "position": 1,
+            "created_at": "2025-03-25T18:18:08-07:00",
+            "updated_at": "2025-09-29T23:49:27-07:00",
+            "alt": "#color_firefly-golden-copper-lime-green-pink-topaz",
+            "width": 1308,
+            "height": 1308,
+            "src": "https://cdn.shopify.com/s/files/1/2220/7229/files/NSE38030001_-_Firefly_OPEN_SHADOW.jpg?v=1759214967",
+            "variant_ids": [
+              51828447543661
+            ]
+          },
+          "available": true,
+          "price": "27.00",
+          "grams": 0,
+          "compare_at_price": null,
+          "position": 3,
+          "product_id": 14660519821677,
+          "created_at": "2025-03-07T11:48:18-08:00",
+          "updated_at": "2026-09-12T09:15:50-07:00"
+        },
+        {
+          "id": 51828440301933,
+          "title": "Mermaid (Sapphire, Teal, Magenta)",
+          "option1": "Mermaid (Sapphire, Teal, Magenta)",
+          "option2": null,
+          "option3": null,
+          "sku": "SE38020001",
+          "requires_shipping": true,
+          "taxable": true,
+          "featured_image": {
+            "id": 53468858712429,
+            "product_id": 14660519821677,
+            "position": 15,
+            "created_at": "2025-03-25T18:16:17-07:00",
+            "updated_at": "2026-03-06T10:43:32-08:00",
+            "alt": "#color_mermaid-sapphire-teal-magenta",
+            "width": 1347,
+            "height": 1348,
+            "src": "https://cdn.shopify.com/s/files/1/2220/7229/files/NSE38020001_-_Mermaid_OPEN_-_SHADOW.jpg?v=1772822612",
+            "variant_ids": [
+              51828440301933
+            ]
+          },
+          "available": true,
+          "price": "27.00",
+          "grams": 0,
+          "compare_at_price": null,
+          "position": 4,
+          "product_id": 14660519821677,
+          "created_at": "2025-03-07T11:42:53-08:00",
+          "updated_at": "2026-09-12T09:15:50-07:00"
+        },
+        {
+          "id": 51828440269165,
+          "title": "Peacock (Emerald, Sapphire, Vivid Violet)",
+          "option1": "Peacock (Emerald, Sapphire, Vivid Violet)",
+          "option2": null,
+          "option3": null,
+          "sku": "SE38010001",
+          "requires_shipping": true,
+          "taxable": true,
+          "featured_image": {
+            "id": 53468851798381,
+            "product_id": 14660519821677,
+            "position": 27,
+            "created_at": "2025-03-25T18:13:26-07:00",
+            "updated_at": "2026-03-06T10:43:32-08:00",
+            "alt": "#color_peacock-emerald-sapphire-vivid-violet",
+            "width": 1342,
+            "height": 1342,
+            "src": "https://cdn.shopify.com/s/files/1/2220/7229/files/NSE38010001_-_Peacock_OPEN_-_SHADOW.jpg?v=1772822612",
+            "variant_ids": [
+              51828440269165
+            ]
+          },
+          "available": true,
+          "price": "27.00",
+          "grams": 0,
+          "compare_at_price": null,
+          "position": 5,
+          "product_id": 14660519821677,
+          "created_at": "2025-03-07T11:42:53-08:00",
+          "updated_at": "2026-09-12T09:15:50-07:00"
+        }
+      ]
+    }
+  },
+  {
+    "domain": "stilacosmetics.com",
+    "observed_at": "2026-09-12T16:15:49.418880+00:00",
+    "source_url": "https://stilacosmetics.com/products/blush-bronze-hydro-blur-cheek-duo",
+    "product": {
+      "id": 6837467971687,
+      "title": "Blush & Bronze Hydro-Blur Cheek Duo",
+      "handle": "blush-bronze-hydro-blur-cheek-duo",
+      "vendor": "Stila Cosmetics",
+      "product_type": "Eye Liner",
+      "body_html": "<p><span style=\"color: #ff2a00;\"><strong></strong></span>Dual-ended and double-duty essential for color, contour, and bronzing perfection. <br></p>\n<p>This peak of cheek essential delivers color, contouring and bronzing in one dual-ended stick. A creamy-gel formula formulated with Stila’s Hydro-Blur Blend creates a dewy, glassy skin look and a seamless finish.  Sheer, buildable and versatile for blush and define perfection.</p>\n<p>CLINICAL TEST RESULTS: *<br>97% said it helps define and add color. <br>97% said it is easy to apply and to blend with fingertips. <br>94% said it blends seamlessly into skin.<br>94% said it doesn't look heavy or cakey. <br>94% said it feels lightweight on skin.<br>94% said it doesn't leave a sticky after-feel. <br>94% said it gives skin a healthy glow. <br>90% said it provides a seamless radiant color and delivers a touch of sun-kissed radiance. <br>90% said it doesn't look streaky and patchy. <br><br>*Based on a clinical &amp; consumer panel study of 32 subjects.</p>\n<p>0.33 oz</p>\n",
+      "variants": [
+        {
+          "id": 40242784927847,
+          "title": "apricot (Warm Peach) & golden (Light with Neutral Undertones)",
+          "option1": "apricot (Warm Peach) & golden (Light with Neutral Undertones)",
+          "option2": null,
+          "option3": null,
+          "sku": "SE15010001",
+          "requires_shipping": true,
+          "taxable": true,
+          "featured_image": {
+            "id": 32636149268583,
+            "product_id": 6837467971687,
+            "position": 1,
+            "created_at": "2024-08-19T12:29:10-07:00",
+            "updated_at": "2024-08-19T12:29:11-07:00",
+            "alt": "#color_apricot-warm-peach-golden-light-with-neutral-undertones",
+            "width": 2000,
+            "height": 2000,
+            "src": "https://cdn.shopify.com/s/files/1/2220/7229/files/SE15010001_-_Apricot_Golden_PRODUCT.jpg?v=1724095751",
+            "variant_ids": [
+              40242784927847
+            ]
+          },
+          "available": true,
+          "price": "32.00",
+          "grams": 0,
+          "compare_at_price": "32.00",
+          "position": 1,
+          "product_id": 6837467971687,
+          "created_at": "2023-10-17T15:04:20-07:00",
+          "updated_at": "2026-09-12T09:15:50-07:00"
+        },
+        {
+          "id": 40242784960615,
+          "title": "grapefruit (Soft Pink) & caramel (Light with Warm Undertones)",
+          "option1": "grapefruit (Soft Pink) & caramel (Light with Warm Undertones)",
+          "option2": null,
+          "option3": null,
+          "sku": "SE15020001",
+          "requires_shipping": true,
+          "taxable": true,
+          "featured_image": {
+            "id": 32636149301351,
+            "product_id": 6837467971687,
+            "position": 7,
+            "created_at": "2024-08-19T12:29:10-07:00",
+            "updated_at": "2025-09-30T01:07:37-07:00",
+            "alt": "#color_grapefruit-soft-pink-caramel-light-with-warm-undertones",
+            "width": 2000,
+            "height": 2000,
+            "src": "https://cdn.shopify.com/s/files/1/2220/7229/files/SE15020001_-_Grapefruit_Caramel_PRODUCT.jpg?v=1759219657",
+            "variant_ids": [
+              40242784960615
+            ]
+          },
+          "available": true,
+          "price": "32.00",
+          "grams": 0,
+          "compare_at_price": null,
+          "position": 2,
+          "product_id": 6837467971687,
+          "created_at": "2023-10-17T15:04:21-07:00",
+          "updated_at": "2026-09-12T09:15:50-07:00"
+        },
+        {
+          "id": 40242784993383,
+          "title": "papaya (Vibrant Coral) & tan (Medium with Neutral Undertones)",
+          "option1": "papaya (Vibrant Coral) & tan (Medium with Neutral Undertones)",
+          "option2": null,
+          "option3": null,
+          "sku": "SE15030001",
+          "requires_shipping": true,
+          "taxable": true,
+          "featured_image": {
+            "id": 32636197929063,
+            "product_id": 6837467971687,
+            "position": 15,
+            "created_at": "2024-08-19T12:29:10-07:00",
+            "updated_at": "2025-09-30T01:07:37-07:00",
+            "alt": "#color_papaya-vibrant-coral-tan-medium-with-neutral-undertones",
+            "width": 2000,
+            "height": 2000,
+            "src": "https://cdn.shopify.com/s/files/1/2220/7229/files/SE15030001_-_Papaya_Tan_PRODUCT.jpg?v=1759219657",
+            "variant_ids": [
+              40242784993383
+            ]
+          },
+          "available": true,
+          "price": "32.00",
+          "grams": 0,
+          "compare_at_price": null,
+          "position": 3,
+          "product_id": 6837467971687,
+          "created_at": "2023-10-17T15:04:21-07:00",
+          "updated_at": "2026-09-12T09:15:50-07:00"
+        },
+        {
+          "id": 40242785026151,
+          "title": "guava (Vivid Pink) & mocha (Medium with Warm Undertones)",
+          "option1": "guava (Vivid Pink) & mocha (Medium with Warm Undertones)",
+          "option2": null,
+          "option3": null,
+          "sku": "SE15040001",
+          "requires_shipping": true,
+          "taxable": true,
+          "featured_image": {
+            "id": 32636149399655,
+            "product_id": 6837467971687,
+            "position": 22,
+            "created_at": "2024-08-19T12:29:10-07:00",
+            "updated_at": "2025-09-30T01:07:37-07:00",
+            "alt": "#color_guava-vivid-pink-mocha-medium-with-warm-undertones",
+            "width": 2000,
+            "height": 2000,
+            "src": "https://cdn.shopify.com/s/files/1/2220/7229/files/SE15040001_-_Guava_Mocha_PRODUCT.jpg?v=1759219657",
+            "variant_ids": [
+              40242785026151
+            ]
+          },
+          "available": true,
+          "price": "32.00",
+          "grams": 0,
+          "compare_at_price": null,
+          "position": 4,
+          "product_id": 6837467971687,
+          "created_at": "2023-10-17T15:04:21-07:00",
+          "updated_at": "2026-09-12T09:15:50-07:00"
+        },
+        {
+          "id": 40242785058919,
+          "title": "cranberry (Cool Red) & mahogany (Deep with Warm Undertones)",
+          "option1": "cranberry (Cool Red) & mahogany (Deep with Warm Undertones)",
+          "option2": null,
+          "option3": null,
+          "sku": "SE15050001",
+          "requires_shipping": true,
+          "taxable": true,
+          "featured_image": {
+            "id": 32636149432423,
+            "product_id": 6837467971687,
+            "position": 29,
+            "created_at": "2024-08-19T12:29:10-07:00",
+            "updated_at": "2025-09-30T01:07:37-07:00",
+            "alt": "#color_cranberry-cool-red-mahogany-deep-with-warm-undertones",
+            "width": 2000,
+            "height": 2000,
+            "src": "https://cdn.shopify.com/s/files/1/2220/7229/files/SE15050001_-_Cranberry_Mahogany_PRODUCT.jpg?v=1759219657",
+            "variant_ids": [
+              40242785058919
+            ]
+          },
+          "available": true,
+          "price": "32.00",
+          "grams": 0,
+          "compare_at_price": null,
+          "position": 5,
+          "product_id": 6837467971687,
+          "created_at": "2023-10-17T15:04:21-07:00",
+          "updated_at": "2026-09-12T09:15:50-07:00"
+        },
+        {
+          "id": 40242785091687,
+          "title": "dragon fruit (Rich Berry) & cocoa (Deep with Neutral Undertones)",
+          "option1": "dragon fruit (Rich Berry) & cocoa (Deep with Neutral Undertones)",
+          "option2": null,
+          "option3": null,
+          "sku": "SE15060001",
+          "requires_shipping": true,
+          "taxable": true,
+          "featured_image": {
+            "id": 32636149465191,
+            "product_id": 6837467971687,
+            "position": 37,
+            "created_at": "2024-08-19T12:29:10-07:00",
+            "updated_at": "2025-09-30T01:07:37-07:00",
+            "alt": "#color_dragon-fruit-rich-berry-cocoa-deep-with-neutral-undertones",
+            "width": 2000,
+            "height": 2000,
+            "src": "https://cdn.shopify.com/s/files/1/2220/7229/files/SE15060001_-_Dragon_Fruit_Cocoa_PRODUCT.jpg?v=1759219657",
+            "variant_ids": [
+              40242785091687
+            ]
+          },
+          "available": true,
+          "price": "32.00",
+          "grams": 0,
+          "compare_at_price": null,
+          "position": 6,
+          "product_id": 6837467971687,
+          "created_at": "2023-10-17T15:04:21-07:00",
+          "updated_at": "2026-09-12T09:15:50-07:00"
+        }
+      ]
+    }
+  },
+  {
+    "domain": "flowerbeauty.com",
+    "observed_at": "2026-09-12T16:15:49.418874+00:00",
+    "source_url": "https://flowerbeauty.com/products/plump-up-gloss-stick",
+    "product": {
+      "id": 7138931834950,
+      "title": "Plump Up Gloss Stick",
+      "handle": "plump-up-gloss-stick",
+      "vendor": "FLOWER Beauty",
+      "product_type": "Lip Color",
+      "body_html": "<div class=\"ewa-rteLine\" data-mce-fragment=\"1\">Plump Up Gloss Stick is an all-in-one gloss-balm hybrid that nourishes, hydrates, and comfortably plumps lips while delivering buildable color with a dewy, shinny finish. The ultra-cushiony formula melts onto lips, providing a tingle-free, visibly plumped effect. An infusion of hyaluronic acid, castor oil, &amp; vitamin E condition and moisturize lips, helping to visibly smooth the look of lines.</div>\n<div class=\"ewa-rteLine\" data-mce-fragment=\"1\"><br data-mce-fragment=\"1\"></div>\n<div class=\"ewa-rteLine\" data-mce-fragment=\"1\">• Comfortably Plumps Lips</div>\n<div class=\"ewa-rteLine\" data-mce-fragment=\"1\">• Sweet Vanilla Scented</div>\n<div class=\"ewa-rteLine\" data-mce-fragment=\"1\">• Cruelty Free</div>\n<div class=\"ewa-rteLine\" data-mce-fragment=\"1\">• Vegan</div>\n<div class=\"ewa-rteLine\" data-mce-fragment=\"1\">• Gluten Free </div>",
+      "variants": [
+        {
+          "id": 40643709042758,
+          "title": "Icy",
+          "option1": "Icy",
+          "option2": null,
+          "option3": null,
+          "sku": "",
+          "requires_shipping": true,
+          "taxable": true,
+          "featured_image": {
+            "id": 30234566099014,
+            "product_id": 7138931834950,
+            "position": 7,
+            "created_at": "2023-07-06T05:31:40-04:00",
+            "updated_at": "2023-08-11T03:25:21-04:00",
+            "alt": "Icy-Packshot-1",
+            "width": 900,
+            "height": 1125,
+            "src": "https://cdn.shopify.com/s/files/1/0070/1707/0662/files/flower_pdp_lips_plump-up-gloss-stick_icy_packshot-1.jpg?v=1691738721",
+            "variant_ids": [
+              40643709042758
+            ]
+          },
+          "available": true,
+          "price": "11.99",
+          "grams": 1,
+          "compare_at_price": null,
+          "position": 1,
+          "product_id": 7138931834950,
+          "created_at": "2023-07-06T05:31:41-04:00",
+          "updated_at": "2026-09-12T12:15:50-04:00"
+        },
+        {
+          "id": 40643709075526,
+          "title": "Toasty",
+          "option1": "Toasty",
+          "option2": null,
+          "option3": null,
+          "sku": "",
+          "requires_shipping": true,
+          "taxable": true,
+          "featured_image": {
+            "id": 30234566459462,
+            "product_id": 7138931834950,
+            "position": 16,
+            "created_at": "2023-07-06T05:31:41-04:00",
+            "updated_at": "2023-08-11T03:25:21-04:00",
+            "alt": "Toasty-Packshot-1",
+            "width": 900,
+            "height": 1125,
+            "src": "https://cdn.shopify.com/s/files/1/0070/1707/0662/files/flower_pdp_lips_plump-up-gloss-stick_toasty_packshot-1.jpg?v=1691738721",
+            "variant_ids": [
+              40643709075526
+            ]
+          },
+          "available": true,
+          "price": "11.99",
+          "grams": 1,
+          "compare_at_price": null,
+          "position": 2,
+          "product_id": 7138931834950,
+          "created_at": "2023-07-06T05:31:41-04:00",
+          "updated_at": "2026-09-12T12:15:50-04:00"
+        },
+        {
+          "id": 40643709108294,
+          "title": "Spicy",
+          "option1": "Spicy",
+          "option2": null,
+          "option3": null,
+          "sku": "",
+          "requires_shipping": true,
+          "taxable": true,
+          "featured_image": {
+            "id": 30234566426694,
+            "product_id": 7138931834950,
+            "position": 13,
+            "created_at": "2023-07-06T05:31:41-04:00",
+            "updated_at": "2023-08-11T03:25:21-04:00",
+            "alt": "Spicy-Packshot-1",
+            "width": 900,
+            "height": 1125,
+            "src": "https://cdn.shopify.com/s/files/1/0070/1707/0662/files/flower_pdp_lips_plump-up-gloss-stick_spicy_packshot-1.jpg?v=1691738721",
+            "variant_ids": [
+              40643709108294
+            ]
+          },
+          "available": true,
+          "price": "11.99",
+          "grams": 1,
+          "compare_at_price": null,
+          "position": 3,
+          "product_id": 7138931834950,
+          "created_at": "2023-07-06T05:31:41-04:00",
+          "updated_at": "2026-09-12T12:15:50-04:00"
+        },
+        {
+          "id": 40643709141062,
+          "title": "Sizzle",
+          "option1": "Sizzle",
+          "option2": null,
+          "option3": null,
+          "sku": "",
+          "requires_shipping": true,
+          "taxable": true,
+          "featured_image": {
+            "id": 30234565967942,
+            "product_id": 7138931834950,
+            "position": 10,
+            "created_at": "2023-07-06T05:31:40-04:00",
+            "updated_at": "2023-08-11T03:25:21-04:00",
+            "alt": "Sizzle-Packshot-1",
+            "width": 900,
+            "height": 1125,
+            "src": "https://cdn.shopify.com/s/files/1/0070/1707/0662/files/flower_pdp_lips_plump-up-gloss-stick_sizzle_packshot-1.jpg?v=1691738721",
+            "variant_ids": [
+              40643709141062
+            ]
+          },
+          "available": true,
+          "price": "11.99",
+          "grams": 1,
+          "compare_at_price": null,
+          "position": 4,
+          "product_id": 7138931834950,
+          "created_at": "2023-07-06T05:31:41-04:00",
+          "updated_at": "2026-09-12T12:15:50-04:00"
+        },
+        {
+          "id": 40643709173830,
+          "title": "Heated",
+          "option1": "Heated",
+          "option2": null,
+          "option3": null,
+          "sku": "",
+          "requires_shipping": true,
+          "taxable": true,
+          "featured_image": {
+            "id": 30234565902406,
+            "product_id": 7138931834950,
+            "position": 1,
+            "created_at": "2023-07-06T05:31:40-04:00",
+            "updated_at": "2023-07-06T05:31:43-04:00",
+            "alt": "Heated-Packshot",
+            "width": 900,
+            "height": 1125,
+            "src": "https://cdn.shopify.com/s/files/1/0070/1707/0662/files/flower_pdp_lip_plump-up-gloss-stick_heated_packshot-1.jpg?v=1688635903",
+            "variant_ids": [
+              40643709173830
+            ]
+          },
+          "available": true,
+          "price": "11.99",
+          "grams": 1,
+          "compare_at_price": null,
+          "position": 5,
+          "product_id": 7138931834950,
+          "created_at": "2023-07-06T05:31:41-04:00",
+          "updated_at": "2026-09-12T12:15:50-04:00"
+        },
+        {
+          "id": 40643709206598,
+          "title": "Fiery",
+          "option1": "Fiery",
+          "option2": null,
+          "option3": null,
+          "sku": "",
+          "requires_shipping": true,
+          "taxable": true,
+          "featured_image": {
+            "id": 30234566262854,
+            "product_id": 7138931834950,
+            "position": 4,
+            "created_at": "2023-07-06T05:31:40-04:00",
+            "updated_at": "2023-08-11T03:25:21-04:00",
+            "alt": "Fiery-Packshot-1",
+            "width": 900,
+            "height": 1125,
+            "src": "https://cdn.shopify.com/s/files/1/0070/1707/0662/files/flower_pdp_lips_plump-up-gloss-stick_fiery_packshot-1.jpg?v=1691738721",
+            "variant_ids": [
+              40643709206598
+            ]
+          },
+          "available": true,
+          "price": "11.99",
+          "grams": 1,
+          "compare_at_price": null,
+          "position": 6,
+          "product_id": 7138931834950,
+          "created_at": "2023-07-06T05:31:41-04:00",
+          "updated_at": "2026-09-12T12:15:50-04:00"
+        }
+      ]
+    }
+  }
+]

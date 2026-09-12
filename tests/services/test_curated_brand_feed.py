@@ -26,7 +26,7 @@ def test_maps_shopify_product_to_validated_record():
     pdp, offers = rec["pdp"], rec["offers"]
     assert pdp["brand"] == "COSRX"
     assert pdp["product_name"] == "Snail Mucin Gel Cleanser"
-    assert pdp["category_path"] == "beauty/skincare/cleanser"
+    assert pdp["category_path"] == "beauty/skincare/cleanse/cleanser"
     assert pdp["barcode"] == "8809416470016"  # GTIN carried (strongest deposit basis)
     assert pdp["source_domain"] == "cosrx.com"
     assert pdp["tags"] == ["k-beauty", "cleanser"]
@@ -351,7 +351,7 @@ def test_price_floor_skips_to_the_first_real_variant():
         category_path="x",
     )
     assert rec["offers"][0]["price"] == 15.0
-    assert rec["pdp"]["barcode"] == "8809416470016"
+    assert rec["pdp"]["barcode"] is None  # Price selection cannot establish PDP identity.
 
 
 def test_picks_first_positive_priced_variant():
@@ -363,7 +363,7 @@ def test_picks_first_positive_priced_variant():
     )
     assert rec is not None
     assert rec["offers"][0]["price"] == 24.0
-    assert rec["pdp"]["barcode"] == "8809416470016"  # GTIN from the priced variant
+    assert rec["pdp"]["barcode"] is None  # Multi-variant PDP cannot take one item's identity.
 
 
 # --- inci_from_pdp_html: the metafield / accordion INCI source (pure; no network)
@@ -785,7 +785,7 @@ def _no_live_meta_json(monkeypatch, request):
         return
 
     async def _offline(domain, **kw):
-        return {"currency": None}
+        return {"currency": "USD"}  # Explicit observed-currency fixture; no network.
 
     monkeypatch.setattr(cbf, "fetch_shopify_shop_locale", _offline)
 
@@ -866,6 +866,7 @@ async def test_meta_json_is_validated_before_it_is_believed(monkeypatch, body, e
     import httpx
 
     class _Resp:
+        url = httpx.URL("https://jsmbeauty.sg/meta.json")
         status_code = 200
         headers = {"content-type": "application/json"}
 
@@ -1046,6 +1047,7 @@ async def test_the_meta_json_fetch_goes_through_the_politeness_gate(monkeypatch)
     )
 
     class _Resp:
+        url = httpx.URL("https://jsmbeauty.sg/meta.json")
         status_code = 200
         headers = {"content-type": "application/json"}
         text = '{"currency": "SGD", "country": "SG"}'
@@ -1097,6 +1099,7 @@ async def test_a_failed_meta_json_is_not_cached_against_the_next_brand(monkeypat
     calls = {"n": 0}
 
     class _Resp:
+        url = httpx.URL("https://jsmbeauty.sg/meta.json")
         def __init__(self, ok):
             self.status_code = 200 if ok else 503
             self.headers = {"content-type": "application/json"}
@@ -1154,7 +1157,7 @@ async def test_no_test_in_this_file_reaches_the_live_network_by_default(monkeypa
     recs = await cbf.records_for_brand(domain="maccosmetics.com", category_path="beauty/makeup")
 
     assert recs, "the stub returned a product, so a record must come back"
-    assert recs[0]["pdp"]["currency"] is None, "offline: no currency learned, ingest defaults USD"
+    assert recs[0]["pdp"]["currency"] == "USD", "offline: no currency learned, ingest defaults USD"
 
 def _folded(base_options, own_variants, shade_titles):
     """Drive the REAL fold. A hand-marked `_multi(FOLDED_INTO_KEY=2)` product is
@@ -1729,7 +1732,7 @@ async def test_the_currency_gate_refuses_before_any_record_is_built(monkeypatch)
 
 @pytest.mark.asyncio
 @pytest.mark.live_locale
-async def test_omitting_the_currency_gate_leaves_the_old_behaviour_exactly(monkeypatch):
+async def test_unproven_currency_is_refused_without_an_expected_currency(monkeypatch):
     """Opt-in. Every brand already onboarded ran without it and must keep running: an
     unreadable /meta.json still yields records, still currency-less, still USD downstream."""
     async def _products(domain, **kw):
@@ -1741,10 +1744,8 @@ async def test_omitting_the_currency_gate_leaves_the_old_behaviour_exactly(monke
     monkeypatch.setattr(cbf, "fetch_shopify_products", _products)
     monkeypatch.setattr(cbf, "fetch_shopify_shop_locale", _locale)
 
-    recs = await cbf.records_for_brand(domain="flowerbeauty.com", category_path="beauty/makeup")
-
-    assert len(recs) == 1
-    assert recs[0]["pdp"]["currency"] is None
+    with pytest.raises(cbf.CurrencyNotProven, match="currency is unproven"):
+        await cbf.records_for_brand(domain="jsmbeauty.sg", category_path="beauty/makeup")
 
 
 @pytest.mark.asyncio
@@ -2083,13 +2084,11 @@ def test_resolve_record_brand_reasons_are_exhaustive_over_the_measured_feed():
     assert seen[""] == ("Missha", "override_no_vendor")
 
 
-def test_a_short_code_like_vendor_cannot_substring_match_a_brand():
-    """Two guards stand between `3M` and the brand column: the containment floor is
-    3 characters, and a 2-letter run does not read as a name. Either way the operator's
-    brand survives — what must NOT happen is `3M` absorbing into `M3 Cosmetics`."""
-    brand, why = cbf.resolve_record_brand("3M", "M3 Cosmetics", "shop.com")
-    assert brand == "M3 Cosmetics"
-    assert why == "override_vendor_is_not_a_name"
+def test_a_short_actual_brand_is_not_relabelled_by_the_override():
+    # 3M is a maker, just as Meitu's 3CE is: short does not mean supplier code.
+    assert cbf.resolve_record_brand("3M", "M3 Cosmetics", "shop.com") == (
+        "3M", "vendor_disagrees",
+    )
 
 
 @pytest.mark.asyncio

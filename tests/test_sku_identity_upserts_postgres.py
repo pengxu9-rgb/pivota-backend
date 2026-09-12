@@ -2181,7 +2181,7 @@ async def test_the_ingest_row_stores_the_id_its_key_was_derived_from(db):
     await _seed_product(db, pk=LONG_PK, spid="sku-identity-long")
     rows = ing._build_variant_sku_inserts(
         product_key=LONG_PK,
-        pdp_payload={"brand": "Gate", "product_name": "Lipstick",
+        pdp_payload={"brand": "Gate", "product_name": "Lipstick", "currency": "USD",
                      "source_domain": "brand.example",
                      "variants": [{"variant_id": VID_LONG_A, "title": "Ruby"},
                                   {"variant_id": VID_LONG_B, "title": "Coral"}]},

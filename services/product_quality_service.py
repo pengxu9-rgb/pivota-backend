@@ -866,6 +866,9 @@ async def full_quality_eval(
     rules_version: str = DEFAULT_QUALITY_RULES_VERSION,
     model_version: str = "none",
     score_source_backed_components: Optional[bool] = None,
+    *,
+    db: Any = None,
+    recompute_eligibility: bool = True,
 ) -> Dict[str, Any]:
     """
     Full evaluation entrypoint.
@@ -905,9 +908,14 @@ async def full_quality_eval(
         "details": result,
     }
 
-    await database.execute(product_quality_snapshot.insert().values(row))
+    write_db = db or database
+    await write_db.execute(product_quality_snapshot.insert().values(row))
+    # Curated ingestion rebuilds APV before its strict eligibility handoff.
+    # Existing callers retain the original best-effort hook.
+    if not recompute_eligibility:
+        return result
     try:
-        catalog_row = await database.fetch_one(
+        catalog_row = await write_db.fetch_one(
             """
             SELECT content_key
             FROM catalog_products
@@ -929,6 +937,7 @@ async def full_quality_eval(
             await recompute_serving_eligibility(
                 content_key,
                 reason="quality_snapshot",
+                **({"db": db} if db is not None else {}),
             )
     except Exception as exc:  # noqa: BLE001
         logger.warning({

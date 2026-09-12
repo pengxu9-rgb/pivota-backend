@@ -356,10 +356,12 @@ def _attach_info(row: Dict[str, Any], merchant_id: Optional[str]) -> Dict[str, A
     }
 
 
-async def _attach_pg(row: Dict[str, Any], content_key: Optional[str]) -> Optional[str]:
+async def _attach_pg(row: Dict[str, Any], content_key: Optional[str], *, strict: bool = False) -> Optional[str]:
     try:
         existing = await _existing_pg_for_listing(row)
     except Exception as exc:  # noqa: BLE001 — pg lookup is best-effort
+        if strict:
+            raise
         logger.warning("intake_identity pg lookup failed: %s", str(exc)[:200])
         existing = None
     return existing or _singleton_pg(content_key)
@@ -425,6 +427,9 @@ async def resolve_or_attach_content_identity(
     brand+title identity. Never raises.
     """
     ctx = dict(merchant_ctx or {})
+    # Only the selected primary enrichment writer opts into this contract.
+    # A successful lookup returning no membership still permits a singleton.
+    strict_pg = door == DOOR_CATALOG_ENRICHMENT and ctx.get("strict_group_resolution") is True
     merchant_id = str(ctx.get("merchant_id") or "") or None
 
     from services.catalog_identity import make_content_key
@@ -472,14 +477,14 @@ async def resolve_or_attach_content_identity(
                     )
                     return await _finish(
                         action=ACTION_FLAG, content_key=matched_ck,
-                        product_group_id=await _attach_pg(row, matched_ck),
+                        product_group_id=await _attach_pg(row, matched_ck, strict=strict_pg),
                         matcher="gtin_match_brand_title_drift", door=door,
                         merchant_ctx=ctx, detail=detail, gtin=gtin14,
                         attach=_attach_info(row, merchant_id),
                     )
                 return await _finish(
                     action=ACTION_ATTACH, content_key=matched_ck,
-                    product_group_id=await _attach_pg(row, matched_ck),
+                    product_group_id=await _attach_pg(row, matched_ck, strict=strict_pg),
                     matcher="gtin_match", door=door, merchant_ctx=ctx,
                     detail={
                         **_base_detail(),
@@ -530,7 +535,7 @@ async def resolve_or_attach_content_identity(
             ck = row.get("content_key") or content_key
             return await _finish(
                 action=ACTION_ATTACH, content_key=ck,
-                product_group_id=await _attach_pg(row, ck),
+                product_group_id=await _attach_pg(row, ck, strict=strict_pg),
                 matcher="content_key", door=door, merchant_ctx=ctx,
                 detail={
                     **_base_detail(),
@@ -571,7 +576,7 @@ async def resolve_or_attach_content_identity(
                     ck = row["content_key"]
                     return await _finish(
                         action=ACTION_ATTACH, content_key=ck,
-                        product_group_id=await _attach_pg(row, ck),
+                        product_group_id=await _attach_pg(row, ck, strict=strict_pg),
                         matcher="canonical_url_match", door=door,
                         merchant_ctx=ctx,
                         detail={
@@ -607,7 +612,7 @@ async def resolve_or_attach_content_identity(
                     ck = row["content_key"]
                     return await _finish(
                         action=ACTION_ATTACH, content_key=ck,
-                        product_group_id=await _attach_pg(row, ck),
+                        product_group_id=await _attach_pg(row, ck, strict=strict_pg),
                         matcher="source_product_id_match", door=door,
                         merchant_ctx=ctx,
                         detail={

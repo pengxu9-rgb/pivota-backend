@@ -784,7 +784,9 @@ LEFT JOIN LATERAL (
     WHERE merchant_id = cp.merchant_id
       AND platform = cp.platform
       AND platform_product_id = cp.source_product_id
-    ORDER BY snapshot_date DESC
+    -- NOW() is transaction-stable: a replay can create equal timestamps with
+    -- different scores. The latest inserted snapshot must win that tie.
+    ORDER BY snapshot_date DESC, id DESC
     LIMIT 1
 ) pqs ON TRUE
 LEFT JOIN agent_pdp_view apv
@@ -872,7 +874,7 @@ SELECT
         WHERE pqs.merchant_id = cp.merchant_id
           AND pqs.platform = cp.platform
           AND pqs.platform_product_id = cp.source_product_id
-        ORDER BY pqs.snapshot_date DESC
+        ORDER BY pqs.snapshot_date DESC, pqs.id DESC
         LIMIT 1
     ) AS content_quality_score,
     (
@@ -881,7 +883,7 @@ SELECT
         WHERE pqs.merchant_id = cp.merchant_id
           AND pqs.platform = cp.platform
           AND pqs.platform_product_id = cp.source_product_id
-        ORDER BY pqs.snapshot_date DESC
+        ORDER BY pqs.snapshot_date DESC, pqs.id DESC
         LIMIT 1
     ) AS model_readiness_score,
     (
@@ -890,7 +892,7 @@ SELECT
         WHERE pqs.merchant_id = cp.merchant_id
           AND pqs.platform = cp.platform
           AND pqs.platform_product_id = cp.source_product_id
-        ORDER BY pqs.snapshot_date DESC
+        ORDER BY pqs.snapshot_date DESC, pqs.id DESC
         LIMIT 1
     ) AS conversion_potential_score,
     (
@@ -899,7 +901,7 @@ SELECT
         WHERE pqs.merchant_id = cp.merchant_id
           AND pqs.platform = cp.platform
           AND pqs.platform_product_id = cp.source_product_id
-        ORDER BY pqs.snapshot_date DESC
+        ORDER BY pqs.snapshot_date DESC, pqs.id DESC
         LIMIT 1
     ) AS quality_rules_version,
     (
@@ -908,7 +910,7 @@ SELECT
         WHERE pqs.merchant_id = cp.merchant_id
           AND pqs.platform = cp.platform
           AND pqs.platform_product_id = cp.source_product_id
-        ORDER BY pqs.snapshot_date DESC
+        ORDER BY pqs.snapshot_date DESC, pqs.id DESC
         LIMIT 1
     ) AS quality_scored_at,
     apv.image_url,
@@ -1082,25 +1084,25 @@ WHERE content_key = :content_key
 """
 
 
-def _is_sqlite_database() -> bool:
-    db_url = str(getattr(database, "url", "") or "").lower()
+def _is_sqlite_database(db: Any = None) -> bool:
+    db_url = str(getattr(db or database, "url", "") or "").lower()
     return db_url.startswith(("sqlite://", "sqlite+aiosqlite://"))
 
 
-async def _fetch_regression_domains() -> Set[str]:
-    rows = await database.fetch_all(
+async def _fetch_regression_domains(*, db: Any = None) -> Set[str]:
+    rows = await (db or database).fetch_all(
         "SELECT domain FROM domain_extractor_baselines "
         "WHERE alert_state = 'regression'"
     )
     return {dict(row)["domain"] for row in rows}
 
 
-async def _fetch_eligibility_inputs(content_key: str) -> List[Dict[str, Any]]:
+async def _fetch_eligibility_inputs(content_key: str, *, db: Any = None) -> List[Dict[str, Any]]:
     """Fetch the current eligibility signal rows for one content_key."""
     if not content_key:
         return []
-    query = _SINGLE_QUERY_SQLITE if _is_sqlite_database() else _SINGLE_QUERY
-    rows = await database.fetch_all(query, {"content_key": content_key})
+    query = _SINGLE_QUERY_SQLITE if _is_sqlite_database(db) else _SINGLE_QUERY
+    rows = await (db or database).fetch_all(query, {"content_key": content_key})
     return [dict(row) for row in rows]
 
 
@@ -1133,11 +1135,13 @@ async def _fetch_eligibility_inputs_for_content_keys(
 async def _upsert_index_pipeline_state(
     content_key: str,
     state: Dict[str, Any],
+    *,
+    db: Any = None,
 ) -> None:
     """Upsert one classified state row into index_pipeline_state."""
     upsert_values = dict(state)
     upsert_values["content_key"] = content_key
-    await database.execute(_UPSERT_QUERY, upsert_values)
+    await (db or database).execute(_UPSERT_QUERY, upsert_values)
 
 
 async def _fetch_serving_eligible_index_rows(
@@ -1356,6 +1360,8 @@ async def recompute_serving_eligibility(
     content_key: str,
     *,
     reason: Optional[str] = None,
+    db: Any = None,
+    strict: bool = False,
 ) -> bool:
     """Re-evaluate serving_eligible for one content_key and upsert.
 
@@ -1363,18 +1369,27 @@ async def recompute_serving_eligibility(
     result + UPSERT. Safe under concurrent callers; the UPSERT handles
     last-writer-wins and subsequent callers see the latest data.
 
+    With strict=True, missing inputs and execution errors raise; a successfully
+    computed policy rejection still returns False. db pins every core read/write
+    to the caller's connection. Legacy defaults remain best-effort.
+
     Returns the computed serving_eligible boolean, or False if the row didn't
     exist / couldn't be evaluated. Never raises: failures are logged and the
     row stays in its current state for the nightly safety net to catch.
     """
     try:
-        rows = await _fetch_eligibility_inputs(content_key)
+        db_args = {"db": db} if db is not None else {}
+        rows = await _fetch_eligibility_inputs(content_key, **db_args)
         if not rows:
+            if strict:
+                raise ValueError("eligibility_inputs_missing")
             return False
 
-        regression_domains = await _fetch_regression_domains()
+        regression_domains = await _fetch_regression_domains(**db_args)
         new_state = _classify_content_key_rows(rows, regression_domains)
         if new_state is None:
+            if strict:
+                raise ValueError("eligibility_classification_missing")
             return False
 
         # Capture prior eligibility AND the prior sig (one cheap PK lookup) to
@@ -1383,7 +1398,7 @@ async def recompute_serving_eligibility(
         # after a takedown the newly-classified sig may differ from the sig that
         # was actually advertised — the engines must re-crawl the URL that WAS
         # public, not the survivor's.
-        prev_row = await database.fetch_one(
+        prev_row = await (db or database).fetch_one(
             "SELECT serving_eligible, pivota_signature_id FROM index_pipeline_state "
             "WHERE content_key = :ck",
             {"ck": content_key},
@@ -1391,30 +1406,36 @@ async def recompute_serving_eligibility(
         prev_eligible = bool(prev_row and prev_row["serving_eligible"])
         prev_sig = str((prev_row and prev_row["pivota_signature_id"]) or "")
 
-        await _upsert_index_pipeline_state(content_key, new_state)
+        await _upsert_index_pipeline_state(content_key, new_state, **db_args)
 
         # IndexNow, both directions — non-blocking + best-effort, never affects
         # the recompute result. IndexNow has no "removed" verb: resubmitting the
         # URL asks the engine to re-crawl, see the 404/410, and drop it — which
         # is exactly what a takedown needs instead of waiting for organic
         # re-crawl while Search Console accumulates 404 churn.
-        if new_state.get("serving_eligible") and not prev_eligible:
-            # Newly citable: ask engines (Bing → ChatGPT search, Yandex, …) to
-            # crawl the canonical PDP.
-            sig = new_state.get("pivota_signature_id")
-            if sig and str(sig).startswith("sig_"):
-                from services.catalog_sync_service import pivota_canonical_pdp_url
-                from services.indexnow import schedule_submit_url
+        try:
+            if new_state.get("serving_eligible") and not prev_eligible:
+                # Newly citable: ask engines (Bing → ChatGPT search, Yandex, …) to
+                # crawl the canonical PDP.
+                sig = new_state.get("pivota_signature_id")
+                if sig and str(sig).startswith("sig_"):
+                    from services.catalog_sync_service import pivota_canonical_pdp_url
+                    from services.indexnow import schedule_submit_url
 
-                schedule_submit_url(pivota_canonical_pdp_url(str(sig)))
-        elif prev_eligible and not new_state.get("serving_eligible"):
-            # Taken down: ask engines to re-crawl the previously-advertised URL
-            # so the dead page leaves their index promptly.
-            if prev_sig.startswith("sig_"):
-                from services.catalog_sync_service import pivota_canonical_pdp_url
-                from services.indexnow import schedule_submit_url
+                    schedule_submit_url(pivota_canonical_pdp_url(str(sig)))
+            elif prev_eligible and not new_state.get("serving_eligible"):
+                # Taken down: ask engines to re-crawl the previously-advertised URL
+                # so the dead page leaves their index promptly.
+                if prev_sig.startswith("sig_"):
+                    from services.catalog_sync_service import pivota_canonical_pdp_url
+                    from services.indexnow import schedule_submit_url
 
-                schedule_submit_url(pivota_canonical_pdp_url(prev_sig))
+                    schedule_submit_url(pivota_canonical_pdp_url(prev_sig))
+        except Exception as exc:  # notifications never redefine the persisted policy result
+            logger.warning({
+                "event": "serving_eligibility_indexnow_failed",
+                "content_key": content_key, "error": str(exc),
+            })
 
         if reason:
             logger.info({
@@ -1432,4 +1453,6 @@ async def recompute_serving_eligibility(
             "reason": reason,
             "error": str(exc),
         })
+        if strict:
+            raise
         return False

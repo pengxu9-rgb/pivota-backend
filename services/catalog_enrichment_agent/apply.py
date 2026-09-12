@@ -368,7 +368,10 @@ async def _derive_seed_seller_for_plan_row(seed: Dict[str, Any]) -> tuple[Option
     )
 
 
-async def _apply_pdp_identity_gate(pdp: Dict[str, Any], *, identity_gate_on: bool) -> bool:
+async def _apply_pdp_identity_gate(
+    pdp: Dict[str, Any], *, identity_gate_on: bool,
+    group_targets: Optional[Dict[str, str]] = None,
+) -> bool:
     """Shared pre-insert step for a PDP row (both executors). Mutates `pdp` in
     place: canonicalizes the source barcode into the `gtin` match-attribute column
     (ADR-011 — never folded into content_key) and, when the identity gate is on,
@@ -401,15 +404,35 @@ async def _apply_pdp_identity_gate(pdp: Dict[str, Any], *, identity_gate_on: boo
             "platform": pdp.get("platform"),
             "source_domain": pdp.get("source_domain"),
             "product_key": pdp.get("product_key"),
+            "strict_group_resolution": True,
         },
     )
-    if ident.get("action") == ACTION_SKIP:
+    # The shared resolver serves legacy doors that may return an error-shaped
+    # MINT. This primary writer cannot publish that substituted identity.
+    from services.intake_identity import ACTION_ATTACH, ACTION_FLAG, ACTION_MINT
+    evidence = ident.get("evidence") if isinstance(ident, dict) else None
+    detail = evidence.get("evidence") if isinstance(evidence, dict) else None
+    failed = isinstance(detail, dict) and detail.get("reason") == "error"
+    action = ident.get("action") if isinstance(ident, dict) else None
+    content_key = ident.get("content_key") if isinstance(ident, dict) else None
+    if (failed or action not in {ACTION_SKIP, ACTION_ATTACH, ACTION_FLAG, ACTION_MINT}
+            or (action != ACTION_SKIP and (not isinstance(content_key, str) or not content_key.strip()))):
+        logger.error("apply_ingest_plan: identity resolution incomplete for product_key=%s; refusing PDP and children",
+                     pdp.get("product_key"))
+        return False
+    if action == ACTION_SKIP:
         logger.info(
             "apply_ingest_plan: identity gate skipped product_key=%s "
             "(brand conflict — review enqueued)", pdp.get("product_key"),
         )
         return False
-    pdp["content_key"] = ident.get("content_key") or pdp.get("content_key")
+    if str(pdp.get("product_key") or "").startswith("ext:retailer:") and group_targets is not None:
+        target = ident.get("product_group_id")
+        if not isinstance(target, str) or not target.strip():
+            logger.error("primary retailer identity returned no group for product_key=%s", pdp.get("product_key"))
+            return False
+        group_targets[pdp["product_key"]] = target
+    pdp["content_key"] = content_key
     return True
 
 
@@ -432,6 +455,43 @@ async def _ensure_singleton_pg(pdp: Dict[str, Any]) -> None:
     except Exception as exc:  # noqa: BLE001
         logger.warning("singleton pg mint failed for product_key=%s — %s",
                        pdp.get("product_key"), str(exc)[:200])
+
+
+async def _ensure_primary_retailer_group(
+    pdp: Dict[str, Any], *, database: Any, target: Optional[str] = None,
+) -> bool:
+    """Persist primary retailer group evidence on the writer's own DB, or refuse.
+
+    Existing membership is never overwritten. A selected resolver's group must
+    match what was persisted; flag-off callers accept an existing curated group.
+    """
+    from services.product_group_autogrouper import (
+        _UPSERT_SINGLETON_MEMBER_SQL, make_singleton_product_group_id,
+    )
+
+    try:
+        group_id = target or make_singleton_product_group_id(pdp.get("content_key"))
+        params = {
+            "product_group_id": group_id,
+            "merchant_id": str(pdp.get("merchant_id") or ""),
+            "platform": str(pdp.get("platform") or ""),
+            "platform_product_id": str(pdp.get("source_product_id") or ""),
+        }
+        await database.execute(_UPSERT_SINGLETON_MEMBER_SQL, params)
+        stored = await database.fetch_one(
+            """SELECT product_group_id FROM product_group_members
+               WHERE merchant_id=:merchant_id AND platform=:platform
+                 AND platform_product_id=:platform_product_id""",
+            {k: v for k, v in params.items() if k != "product_group_id"},
+        )
+        actual = str(dict(stored).get("product_group_id") or "").strip() if stored else ""
+        if not actual or (target and actual != target):
+            raise ValueError("primary group membership missing or disagrees with resolved identity")
+        return True
+    except Exception as exc:  # noqa: BLE001 — counted refusal, never a success substitute
+        logger.error("primary retailer group persistence failed for product_key=%s: %s",
+                     pdp.get("product_key"), str(exc)[:200])
+        return False
 
 
 def _filter_children_of_skipped(
@@ -1378,7 +1438,84 @@ async def _prepare_seller_of_record(plan: Dict[str, Any], database: Any) -> Dict
     return plan
 
 
+async def _refuse_parallel_retailer_listings(plan: Dict[str, Any], database: Any) -> None:
+    """A new listing key must not silently leave an older same-URL row eligible.
+
+    The reviewed cohort migration owns retiring old children and seed rows. Both
+    executors refuse before any merchant or catalog write when that work remains.
+    """
+    from services.catalog_enrichment_agent.ingestion import retailer_listing_identity
+
+    listings = {}
+    for pdp in plan.get("pdps") or []:
+        if str(pdp.get("product_key") or "").startswith("ext:retailer:"):
+            identity = retailer_listing_identity(pdp.get("source_domain"), pdp.get("canonical_url"))
+            listings[identity] = pdp["product_key"]
+    if not listings:
+        return
+    rows = await database.fetch_all(
+        """
+        SELECT product_key, source_domain, canonical_url FROM catalog_products
+        WHERE lower(split_part(regexp_replace(canonical_url,
+                             '^https?://(www[.])?', '', 'i'), '/', 1)) = ANY(:hosts)
+        """, {"hosts": sorted({listing.split("/", 1)[0] for listing in listings})},
+    )
+    from urllib.parse import urlsplit
+
+    for row in rows or []:
+        row = dict(row)
+        # The candidate's URL owns this comparison. Missing source metadata on
+        # an unrelated old listing must not block every product on its host.
+        url = row.get("canonical_url") or ""
+        identity = retailer_listing_identity(urlsplit(url).hostname, url)
+        if identity in listings and row.get("product_key") != listings[identity]:
+            raise ValueError(
+                "retailer_listing_migration_required: existing product "
+                f"{row.get('product_key')} owns {identity}; migrate/rekey or remove its full legacy chain before onboarding"
+            )
+
+
 async def apply_ingest_plan(
+    plan: Dict[str, Any],
+    *,
+    batch_label: str,
+    db: Any = None,
+    batch: bool = False,
+    primary_readiness: bool = False,
+) -> Dict[str, Any]:
+    """Persist an ingest plan, optionally handing curated rows to serving policy.
+
+    Curated CLI/queue callers select primary_readiness explicitly. Every other
+    existing door retains the original counts and best-effort persistence path.
+    A failed handoff leaves its persisted counts on the typed exception so an
+    operator can retry the same identities without calling a partial run done.
+    """
+    from db.database import database as global_db
+    from services.catalog_enrichment_agent.primary_ingestion import require_primary_plan, require_primary_apply
+
+    preflight = require_primary_plan(plan) if primary_readiness else None
+    counts = await _apply_ingest_plan(plan, batch_label=batch_label, db=db, batch=batch)
+    if not primary_readiness:
+        return counts
+    from services.catalog_enrichment_agent.primary_readiness import (
+        PrimaryReadinessIncomplete, materialize_primary_readiness,
+    )
+    try:
+        require_primary_apply(preflight, counts)
+        if int(counts.get("seeds") or 0) != len(plan.get("seeds") or []):
+            raise ValueError("incomplete_primary_seed_writes")
+    except Exception as exc:
+        report = {"status": "failed", "failed_stage": "persistence", "error": str(exc)[:300]}
+        raise PrimaryReadinessIncomplete(report, counts) from exc
+    try:
+        counts["primary_readiness"] = await materialize_primary_readiness(plan, db=db or global_db)
+    except PrimaryReadinessIncomplete as exc:
+        exc.persisted_counts = dict(counts)
+        raise
+    return counts
+
+
+async def _apply_ingest_plan(
     plan: Dict[str, Any],
     *,
     batch_label: str,
@@ -1398,6 +1535,7 @@ async def apply_ingest_plan(
     if not getattr(database, "is_connected", False):
         await database.connect()
 
+    await _refuse_parallel_retailer_listings(plan, database)
     plan = await _prepare_seller_of_record(plan, database)
 
     if batch:
@@ -1431,12 +1569,14 @@ async def apply_ingest_plan(
     )
 
     identity_gate_on = intake_identity_enabled(DOOR_CATALOG_ENRICHMENT)
+    group_targets: Dict[str, str] = {}
+    counts["product_groups_failed"] = 0
     counts["pdps_skipped_identity"] = 0
     skipped_product_keys: set = set()
 
     # 2. catalog_products — UPSERT by product_key.
     for pdp in pdps:
-        if not await _apply_pdp_identity_gate(pdp, identity_gate_on=identity_gate_on):
+        if not await _apply_pdp_identity_gate(pdp, identity_gate_on=identity_gate_on, group_targets=group_targets):
             counts["pdps_skipped_identity"] += 1
             skipped_product_keys.add(pdp.get("product_key"))
             continue
@@ -1446,7 +1586,14 @@ async def apply_ingest_plan(
         except Exception as exc:  # noqa: BLE001
             logger.exception("insert pdp failed for product_key=%s — %s", pdp.get("product_key"), exc)
 
-        await _ensure_singleton_pg(pdp)
+        if str(pdp.get("product_key") or "").startswith("ext:retailer:"):
+            if not await _ensure_primary_retailer_group(
+                pdp, database=database, target=group_targets.get(pdp["product_key"]),
+            ):
+                counts["product_groups_failed"] += 1
+                skipped_product_keys.add(pdp.get("product_key"))
+        else:
+            await _ensure_singleton_pg(pdp)
 
     skus, offers, seeds = _filter_children_of_skipped(
         skipped_product_keys, skus=skus, offers=offers, seeds=seeds
@@ -1584,13 +1731,15 @@ async def _apply_ingest_plan_batched(
     )
 
     identity_gate_on = intake_identity_enabled(DOOR_CATALOG_ENRICHMENT)
+    group_targets: Dict[str, str] = {}
+    counts["product_groups_failed"] = 0
     skipped_product_keys: set = set()
 
     # 2. catalog_products — run the per-row identity gate first (it may SKIP rows
     #    and may itself round-trip when enabled), then bulk-upsert the survivors.
     insertable_pdps = []
     for pdp in pdps:
-        if not await _apply_pdp_identity_gate(pdp, identity_gate_on=identity_gate_on):
+        if not await _apply_pdp_identity_gate(pdp, identity_gate_on=identity_gate_on, group_targets=group_targets):
             counts["pdps_skipped_identity"] += 1
             skipped_product_keys.add(pdp.get("product_key"))
             continue
@@ -1612,6 +1761,14 @@ async def _apply_ingest_plan_batched(
         make_singleton_product_group_id,
     )
 
+    for pdp in inserted_pdps:
+        if str(pdp.get("product_key") or "").startswith("ext:retailer:"):
+            if not await _ensure_primary_retailer_group(
+                pdp, database=database, target=group_targets.get(pdp["product_key"]),
+            ):
+                counts["product_groups_failed"] += 1
+                skipped_product_keys.add(pdp.get("product_key"))
+
     singleton_rows = [
         {
             "product_group_id": make_singleton_product_group_id(str(p.get("content_key")).strip()),
@@ -1620,6 +1777,7 @@ async def _apply_ingest_plan_batched(
             "platform_product_id": str(p.get("source_product_id") or ""),
         }
         for p in inserted_pdps if (p.get("content_key") or "").strip()
+        and not str(p.get("product_key") or "").startswith("ext:retailer:")
     ]
     try:
         await bulk_upsert(database, _UPSERT_SINGLETON_MEMBER_SQL, singleton_rows, label="pg_singleton")

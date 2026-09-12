@@ -649,3 +649,213 @@ def test_fold_handles_none_variants() -> None:
     assert result is not None
     (label, _path), _, _ = result
     assert label == "Foundation"
+
+
+# --- --include-shallow: the widened mode -----------------------------------------------------
+
+def test_depth_counts_segments_and_treats_blank_as_zero():
+    from scripts.backfill_pdp_category_path import _depth
+    assert _depth(None) == 0
+    assert _depth("") == 0
+    assert _depth("beauty") == 1
+    assert _depth("beauty/makeup") == 2
+    assert _depth("beauty/makeup/lip/lipstick") == 4
+
+
+def test_classification_inputs_drop_the_echo_of_the_stored_leaf():
+    """category/product_type are derived from category_path's leaf by the ingest writer, so on a
+    shallow row they echo the value being replaced. resolve_path_from_row tries category FIRST, so
+    feeding the echo back would let the bad path re-derive itself and short-circuit the title."""
+    from scripts.backfill_pdp_category_path import _classification_inputs
+    cat, ptype = _classification_inputs({
+        "category_path": "beauty/makeup", "category": "makeup",
+        "product_type": "Makeup", "title": "Retro Matte Lipstick"})
+    assert cat is None
+    assert ptype is None  # matched case-insensitively
+
+
+def test_classification_inputs_keep_what_the_merchant_actually_said():
+    """Only an exact echo is dropped. A real merchant product_type is the most authoritative
+    signal available and must survive."""
+    from scripts.backfill_pdp_category_path import _classification_inputs
+    cat, ptype = _classification_inputs({
+        "category_path": "beauty/makeup", "category": "makeup",
+        "product_type": "Lipstick", "title": "Retro Matte"})
+    assert cat is None
+    assert ptype == "Lipstick"
+
+
+async def _drive_fetch(monkeypatch, *, include_shallow):
+    """Capture the SQL and params _fetch_batch actually hands the driver.
+
+    The previous version of this test read the SOURCE TEXT of _fetch_batch and asserted strings
+    were present. It passed against a build whose DEFAULT path raised ArgumentError before any SQL
+    ran, because a bound parameter (:max_depth) was supplied that the default predicate never
+    references — and routes/admin_catalog_debug.py calls that default path over HTTP. Source
+    inspection cannot see a query/params mismatch; driving the call can.
+    """
+    import scripts.backfill_pdp_category_path as bf
+    seen = {}
+
+    async def fake_fetch_all(query, values=None):
+        seen["query"] = str(query)
+        seen["values"] = dict(values or {})
+        return []
+
+    monkeypatch.setattr(bf.database, "fetch_all", fake_fetch_all)
+    await bf._fetch_batch(10, None, include_shallow=include_shallow)
+    return seen
+
+
+@pytest.mark.asyncio
+async def test_default_mode_binds_only_what_the_predicate_uses(monkeypatch):
+    """Regression: every :placeholder in the SQL must exist in params, and vice versa.
+    SQLAlchemy's text().bindparams() raises on an extra one, which crashed the default path."""
+    import re
+    seen = await _drive_fetch(monkeypatch, include_shallow=False)
+    placeholders = set(re.findall(r":([a-z_]+)", seen["query"]))
+    assert placeholders == set(seen["values"]), (placeholders, set(seen["values"]))
+    assert "max_depth" not in seen["values"]
+    assert "category_path IS NULL" in seen["query"]
+    assert "POSITION('/' IN category_path) = 0" in seen["query"]
+
+
+@pytest.mark.asyncio
+async def test_shallow_mode_binds_its_own_placeholder(monkeypatch):
+    import re
+    seen = await _drive_fetch(monkeypatch, include_shallow=True)
+    placeholders = set(re.findall(r":([a-z_]+)", seen["query"]))
+    assert placeholders == set(seen["values"]), (placeholders, set(seen["values"]))
+    assert seen["values"]["max_depth"] >= 1
+
+
+def test_two_segment_leaves_are_routable_and_must_not_be_rewritten():
+    """`depth < 3` was the wrong rule: these are LEAVES that prefix recall reaches."""
+    from scripts.backfill_pdp_category_path import _is_interior_node
+    assert _is_interior_node("fashion/shoes") is False
+    assert _is_interior_node("electronics/ereader") is False
+    # ...while a genuine interior node is not routable, whatever its depth
+    assert _is_interior_node("beauty/makeup") is True
+    assert _is_interior_node("beauty/makeup/lip") is True
+    assert _is_interior_node("beauty") is True
+    assert _is_interior_node(None) is True
+    # a full leaf is left alone
+    assert _is_interior_node("beauty/makeup/lip/lipstick") is False
+
+
+@pytest.mark.asyncio
+async def test_apply_update_reports_whether_the_write_landed(monkeypatch):
+    """RETURNING exists so the caller can tell a landed write from a declined one — `databases`
+    over asyncpg reports no rowcount. A previous cut discarded the return value, leaving `matched`
+    counting intentions and `declined_by_guard` a hard-coded 0: a fabricated number, worse than
+    no number."""
+    import scripts.backfill_pdp_category_path as bf
+    captured = {}
+
+    async def fake_fetch_val(query, values=None):
+        captured["query"] = str(query)
+        return captured["result"]
+
+    monkeypatch.setattr(bf.database, "fetch_val", fake_fetch_val)
+
+    captured["result"] = "ext:some-product"
+    assert await bf._apply_update("k", "beauty/makeup/lip/lipstick") is True
+    assert "RETURNING" in captured["query"].upper()
+
+    captured["result"] = None          # guard declined: row changed, or not actually deeper
+    assert await bf._apply_update("k", "beauty/makeup/lip/lipstick") is False
+
+
+def test_unrecognised_paths_are_not_reported_as_already_routable():
+    """A path absent from the taxonomy is skipped, but calling it 'already routable' asserts
+    something we cannot know."""
+    from scripts.backfill_pdp_category_path import _is_interior_node, _TAXONOMY_PATHS
+    assert "beauty/bogus" not in _TAXONOMY_PATHS
+    assert _is_interior_node("beauty/bogus") is False   # skipped, never rewritten
+    assert "fashion/shoes" in _TAXONOMY_PATHS           # a genuine leaf
+
+
+@pytest.mark.asyncio
+async def test_declined_writes_are_counted_by_the_runner(monkeypatch):
+    """Testing _apply_update alone is not enough: the bug was the CALL SITE discarding its return,
+    which left declined_by_guard a hard-coded 0 while matched counted intentions. Drive the runner
+    with a DB that always declines and assert the report tells the truth."""
+    import scripts.backfill_pdp_category_path as bf
+
+    row = {
+        "product_key": "ext:brand-retro-matte-lipstick::abc",
+        "pivota_signature_id": "sig_x",
+        "brand": "MAC",
+        "category": None,
+        "category_path": "beauty/makeup",
+        "product_type": None,
+        "title": "Retro Matte Lipstick",
+    }
+    batches = [[row], []]
+
+    async def fake_fetch_all(query, values=None):
+        return batches.pop(0) if batches else []
+
+    async def fake_fetch_val(query, values=None):
+        return None  # the guard declines every write
+
+    monkeypatch.setattr(bf.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(bf.database, "fetch_val", fake_fetch_val)
+    monkeypatch.setattr(bf.database, "is_connected", True, raising=False)
+
+    report = await bf.run_category_path_backfill(include_shallow=True, dry_run=False)
+    assert report["declined_by_guard"] == 1, report
+    assert report["matched"] == 0, report
+
+
+@pytest.mark.asyncio
+async def test_landed_writes_are_counted_as_matched(monkeypatch):
+    """The control: same path, but the DB accepts. Without this, the test above would also pass
+    against an implementation that counted nothing at all."""
+    import scripts.backfill_pdp_category_path as bf
+
+    row = {
+        "product_key": "ext:brand-retro-matte-lipstick::abc",
+        "pivota_signature_id": "sig_x",
+        "brand": "MAC",
+        "category": None,
+        "category_path": "beauty/makeup",
+        "product_type": None,
+        "title": "Retro Matte Lipstick",
+    }
+    batches = [[row], []]
+
+    async def fake_fetch_all(query, values=None):
+        return batches.pop(0) if batches else []
+
+    async def fake_fetch_val(query, values=None):
+        return row["product_key"]  # the write lands
+
+    monkeypatch.setattr(bf.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(bf.database, "fetch_val", fake_fetch_val)
+    monkeypatch.setattr(bf.database, "is_connected", True, raising=False)
+
+    report = await bf.run_category_path_backfill(include_shallow=True, dry_run=False)
+    assert report["matched"] == 1, report
+    assert report["declined_by_guard"] == 0, report
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("before,ptype,changed", [
+    ("beauty/makeup", "Moisturizer", 1),
+    ("beauty/makeup", "Lipstick", 0),
+    ("beauty", "Lipstick", 0),
+    ("beauty/makeup", "Handbag", 1),
+])
+async def test_dry_run_reports_sibling_category_moves(monkeypatch, before, ptype, changed):
+    import scripts.backfill_pdp_category_path as bf
+    batches = [[{"product_key": "k", "category_path": before,
+                 "product_type": ptype, "title": "Opaque product"}], []]
+    async def fetch(*args, **kwargs):
+        return batches.pop(0) if batches else []
+    monkeypatch.setattr(bf.database, "fetch_all", fetch)
+    monkeypatch.setattr(bf.database, "is_connected", True, raising=False)
+    report = await bf.run_category_path_backfill(include_shallow=True, dry_run=True)
+    assert report["matched"] == 1
+    assert report["branch_changes"] == changed
+    assert len(report["branch_change_samples"]) == changed

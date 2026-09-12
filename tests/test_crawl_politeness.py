@@ -793,7 +793,7 @@ _GATED_CRAWL_LANES = {
     # at the theme's markup).
     # 6 since fetch_shop_description_from_meta (2026-09-08): the /meta.json blurb door, gated
     # exactly like the homepage one it falls back from.
-    "services/curated_brand_feed.py": 6,
+    "services/curated_brand_feed.py": 7,  # includes optional bounded product identity recovery
     "services/bd_cold_start_service.py": 2,      # Shopify .json + the generic PDP-HTML fallback
     "services/executor_agents/sitemap_freshness.py": 2,  # sitemap + child indexes
 }
@@ -1012,7 +1012,8 @@ def test_a_batch_only_lane_opts_into_waiting(monkeypatch: pytest.MonkeyPatch, la
     if lane == "curated_feed":
         from services import curated_brand_feed as m
         _http_stub(monkeypatch, m, status=404, text="")
-        asyncio.run(m.fetch_shopify_products("shop.example", max_products=1))
+        with pytest.raises(m.CrawlIncomplete):
+            asyncio.run(m.fetch_shopify_products("shop.example", max_products=1))
     else:
         from services.executor_agents import sitemap_freshness as m
         _http_stub(monkeypatch, m, status=404, text="")
