@@ -274,14 +274,34 @@ class TestPrepareSellerOfRecord:
         assert plan["pdps"][0]["merchant_id"] == "merch_obs_eeee0000eeee0000"
         assert len(db.executed) == 1      # observed row inserted
 
-    def test_prepare_runs_before_the_batched_dispatch(self):
-        # Moving the prepare call below `if batch:` would silently regress the
-        # batched executor with zero behavioral test failures.
-        import inspect
+    @pytest.mark.asyncio
+    async def test_prepare_runs_before_the_batched_dispatch(self, monkeypatch):
+        # Exercise the public entrypoint and the REAL preparation. The batch
+        # boundary must receive the adopted seller and cleaned merchant plan;
+        # dispatching first or skipping preparation makes these assertions fail.
         from services.catalog_enrichment_agent import apply as apply_mod
 
-        src = inspect.getsource(apply_mod.apply_ingest_plan)
-        assert src.index("_prepare_seller_of_record") < src.index("if batch:")
+        db = _FakeDb(claims={"ulta.com": "merch_tenant_1"}, claimed_merchant_rows={"merch_tenant_1"})
+        db.is_connected = True
+        plan = _plan(merchant_id="merch_obs_dddd0000dddd0000", ensure_id="merch_obs_dddd0000dddd0000")
+        dispatched = []
+
+        async def batch_dispatch(prepared, *, batch_label, database):
+            assert database is db
+            assert batch_label == "seller_order_regression"
+            assert prepared["pdps"][0]["merchant_id"] == "merch_tenant_1"
+            assert prepared["skus"][0]["merchant_id"] == "merch_tenant_1"
+            assert prepared["merchants"] == []
+            dispatched.append(prepared)
+            return {"pdps": 1, "skus": 1}
+
+        monkeypatch.setattr(apply_mod, "_apply_ingest_plan_batched", batch_dispatch)
+        result = await apply_mod.apply_ingest_plan(
+            plan, batch_label="seller_order_regression", db=db, batch=True,
+        )
+        assert result == {"pdps": 1, "skus": 1}
+        assert len(dispatched) == 1
+        assert db.executed == []  # Claim adopted; no unused observed seller minted.
 
 
 class TestLiveProducersCarrySourceDomain:
