@@ -6,7 +6,7 @@ import pytest
 from fastapi import HTTPException
 pytestmark = pytest.mark.skipif(os.getenv('RUN_RECOVERY_POSTGRES') != '1', reason='local PostgreSQL required')
 
-async def test_outreach_products_persist_replay_and_dismiss_independently():
+async def test_outreach_products_persist_replay_and_dismiss_independently(monkeypatch):
     from db.database import database
     from db import merchant_tasks as tasks
     from routes.merchant_audit_routes import _OutreachPitchBody, mark_outreach_pitch_sent, _TaskDismissBody, dismiss_merchant_task
@@ -30,8 +30,15 @@ async def test_outreach_products_persist_replay_and_dismiss_independently():
                   'per_sku_reports': [{'sku_key': 'sku-b', 'run_facts': {'prompts': [{'query': 'best mascara', 'endorsed_by': ['review.example']}]}}]}
         from services.task_queue_service import _reconcile_dropped_pending_tasks
         assert await _reconcile_dropped_pending_tasks(merchant_id=merchant, audit_run_id=str(uuid4()), covered_product_keys={'sku-a','sku-b'}) == 0
-        result = await reverify_outreach_records(merchant_id=merchant, run_id=str(uuid4()), audit_report=report)
-        assert result == {'checked': 2, 'flipped': 1}
+        from services.audit_run_worker import _materialize_tasks_and_executors
+        from services.executor_agents import dispatcher
+        async def no_external_execution(context, *, agent_names=None):
+            assert agent_names == dispatcher.URL_AUDIT_EXECUTORS
+            return {'dispatched_count': 0}
+        monkeypatch.setattr(dispatcher, 'dispatch_agents', no_external_execution)
+        result = await _materialize_tasks_and_executors(merchant_id=merchant, run_id=str(uuid4()), brand_report=report,
+            integration_state=None, dispatch_only=True, agent_names=dispatcher.URL_AUDIT_EXECUTORS)
+        assert result['outreach_cited'] == 1 and result['tasks_materialized'] == 0
         assert (await tasks.fetch_task(task_id=a['task_id']))['status'] == 'pending'
         assert (await tasks.fetch_task(task_id=b['task_id']))['status'] == 'done'
         with pytest.raises(HTTPException) as exc:

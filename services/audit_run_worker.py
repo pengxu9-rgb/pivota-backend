@@ -1802,15 +1802,12 @@ async def _materialize_tasks_and_executors(
     summary: Dict[str, Any] = {
         "tasks_materialized": 0, "executors_dispatched": 0,
     }
-    # W5: dispatch_only (URL-audit) skips task-queue materialization + outreach
-    # reverification — the url-audit's advisory plan already lives in each
-    # per_sku report's next_best_action, and those paths are connected-store
-    # oriented. Only the report-only executor dispatch below runs.
+    # URL audits retain their advisory plan without materializing store tasks.
+    # Existing merchant outreach is rechecked for both URL and catalog audits.
     if not dispatch_only:
         try:
             from services.task_queue_service import (
                 materialize_tasks_from_audit,
-                reverify_outreach_records,
             )
             tasks_summary = await materialize_tasks_from_audit(
                 merchant_id=merchant_id,
@@ -1824,18 +1821,21 @@ async def _materialize_tasks_and_executors(
                     or tasks_summary.get("count")
                     or 0
                 )
-            # Outreach Step 2 — close the loop: flip any pitched host that now
-            # cites us to 'cited' (the proof). Best-effort; never sinks the audit.
-            outreach_summary = await reverify_outreach_records(
-                merchant_id=merchant_id, run_id=run_id, audit_report=brand_report,
-            )
-            if isinstance(outreach_summary, dict) and outreach_summary.get("flipped"):
-                summary["outreach_cited"] = outreach_summary["flipped"]
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "audit_run_worker: task materialization failed "
                 "for run_id=%s: %s", run_id, exc,
             )
+
+    try:
+        from services.task_queue_service import reverify_outreach_records
+        outreach_summary = await reverify_outreach_records(
+            merchant_id=merchant_id, run_id=run_id, audit_report=brand_report,
+        )
+        if isinstance(outreach_summary, dict) and outreach_summary.get("flipped"):
+            summary["outreach_cited"] = outreach_summary["flipped"]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("audit_run_worker: outreach reverify failed run=%s: %s", run_id, exc)
 
     try:
         from services.executor_agents.base import ExecutorContext
