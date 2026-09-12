@@ -101,16 +101,17 @@ def normalize_curated_brand_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         normalized["retailer_name"] = domain
     for name, default in (
         ("emit_real_variants", True), ("base_listings_only", False),
-        ("enrich_missing_inci", True),
+        ("enrich_missing_inci", True), ("enrich_missing_gtin", False),
     ):
         value = payload.get(name, default)
         if not isinstance(value, bool):
             raise ValueError(f"{name} must be a boolean")
         normalized[name] = value
-    for name, default in (("max_products", 500), ("max_scan_products", 10000), ("max_pdp_inci_fetches", 300)):
+    for name, default in (("max_products", 500), ("max_scan_products", 10000), ("max_pdp_inci_fetches", 300),
+                          ("max_pdp_identity_fetches", 100)):
         value = payload.get(name, default)
-        if type(value) is not int or value < (0 if name == "max_pdp_inci_fetches" else 1):
-            raise ValueError(f"{name} must be a {'nonnegative' if name == 'max_pdp_inci_fetches' else 'positive'} integer")
+        if type(value) is not int or value < (0 if name.startswith("max_pdp_") else 1):
+            raise ValueError(f"{name} must be a {'nonnegative' if name.startswith('max_pdp_') else 'positive'} integer")
         normalized[name] = value
     return normalized
 
@@ -124,6 +125,11 @@ def curated_brand_work_key(payload: Dict[str, Any], *, source: str = "curated_li
     effective = normalize_curated_brand_payload(payload)
     for name in ("brand", "retailer_name"):
         effective[name] = (effective[name] or "").casefold()
+    # Preserve pre-recovery v2 keys when this optional observation is disabled.
+    # A dormant budget has no effect on the work being requested.
+    if not effective["enrich_missing_gtin"]:
+        effective.pop("enrich_missing_gtin")
+        effective.pop("max_pdp_identity_fetches")
     effective["source"] = source
     encoded = json.dumps(effective, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     digest = hashlib.sha256(encoded.encode()).hexdigest()

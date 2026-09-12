@@ -793,7 +793,7 @@ _GATED_CRAWL_LANES = {
     # at the theme's markup).
     # 6 since fetch_shop_description_from_meta (2026-09-08): the /meta.json blurb door, gated
     # exactly like the homepage one it falls back from.
-    "services/curated_brand_feed.py": 6,
+    "services/curated_brand_feed.py": 7,  # includes optional bounded product identity recovery
     "services/bd_cold_start_service.py": 2,      # Shopify .json + the generic PDP-HTML fallback
     "services/executor_agents/sitemap_freshness.py": 2,  # sitemap + child indexes
 }

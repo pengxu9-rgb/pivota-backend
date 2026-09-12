@@ -23,6 +23,7 @@ import json
 import logging
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from urllib.parse import quote, urljoin, urlsplit
 
 import httpx
 
@@ -338,6 +339,146 @@ async def fetch_shopify_products(
         raise
     except Exception as exc:
         raise incomplete(f"{type(exc).__name__}: {str(exc)[:160]}") from exc
+
+
+def _native_shopify_id(value: Any) -> Optional[str]:
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        return None
+    text = str(value).strip()
+    return text if len(text) <= 30 and re.fullmatch(r"[0-9]+", text) and int(text) > 0 else None
+
+
+def _missing_barcode(variant: Dict[str, Any]) -> bool:
+    return variant.get("barcode") is None or str(variant["barcode"]).strip() == ""
+
+
+def validated_source_gtin(value: Any) -> Optional[str]:
+    """Only GS1-shaped, check-digit-valid observations earn a recovered match key.
+
+    canonical_gtin owns normalization; its legacy padding alone also accepts a
+    one-digit supplier code, so this new observation boundary validates first.
+    Existing feed barcodes are not rewritten or reinterpreted here.
+    """
+    from services.intake_identity import canonical_gtin
+
+    if not isinstance(value, str):
+        return None
+    digits = re.sub(r"[\s-]+", "", value)
+    if not re.fullmatch(r"[0-9]+", digits) or len(digits) not in {8, 12, 13, 14}:
+        return None
+    weighted = sum(int(d) * (3 if i % 2 == 0 else 1) for i, d in enumerate(reversed(digits[:-1])))
+    if (10 - weighted % 10) % 10 != int(digits[-1]):
+        return None
+    return canonical_gtin(digits)
+
+
+async def _fetch_missing_variant_gtins(
+    product: Dict[str, Any], *, domain: str, client: httpx.AsyncClient,
+) -> Tuple[Dict[str, str], int]:
+    """Return only validated (native variant ID -> GTIN), never detail-page copy.
+
+    A product recovery uses at most three HTTP requests (two same-storefront
+    redirects). Check each redirect before following, including www/apex aliases,
+    and never visit another region/store. Price units differ on .js, so no price,
+    product fields, or new variant identities may escape this helper.
+    """
+    requests = 0
+    host = _clean_domain(domain)
+    product_id = _native_shopify_id(product.get("id"))
+    handle = str(product.get("handle") or "").strip()
+    vendor = _vendor_token(product.get("vendor"))
+    variants = product.get("variants") or []
+    source_ids = [_native_shopify_id(v.get("id")) for v in variants if isinstance(v, dict)]
+    wanted = {
+        _native_shopify_id(v.get("id")) for v in variants
+        if isinstance(v, dict) and _missing_barcode(v)
+        and variant_id_provenance(str(v.get("id") or ""), product_id=product_id, handle=handle) == MERCHANT_ISSUED
+    } - {None}
+    if (not host or not product_id or not handle or not vendor or not wanted
+            or any(source_ids.count(vid) != 1 for vid in wanted)):
+        return {}, requests
+    url = f"https://{host}/products/{quote(handle, safe='')}.js"
+    try:
+        for redirect in range(3):
+            await crawl_politeness.before_request(url, user_agent=_UA, max_wait=10.0)
+            requests += 1
+            response = await client.get(url)
+            crawl_politeness.note_response(url, response.status_code,
+                                           retry_after=response.headers.get("retry-after"))
+            if not _same_storefront_host(host, getattr(getattr(response, "url", None), "host", None)):
+                return {}, requests
+            if response.status_code in {301, 302, 303, 307, 308}:
+                location = response.headers.get("location")
+                target = urlsplit(urljoin(url, location or ""))
+                if (not location or redirect == 2 or target.scheme != "https"
+                        or target.username or target.password or target.port not in (None, 443)
+                        or not _same_storefront_host(host, target.hostname)):
+                    return {}, requests
+                url = target.geturl()
+                continue
+            if response.status_code != 200:
+                return {}, requests
+            detail = response.json()
+            if (not isinstance(detail, dict) or _native_shopify_id(detail.get("id")) != product_id
+                    or str(detail.get("handle") or "").strip() != handle
+                    or _vendor_token(detail.get("vendor")) != vendor
+                    or not isinstance(detail.get("variants"), list)):
+                return {}, requests
+            detail_variants = detail["variants"]
+            if not all(isinstance(v, dict) for v in detail_variants):
+                return {}, requests
+            detail_ids = [_native_shopify_id(v.get("id")) for v in detail_variants]
+            recovered = {}
+            for variant in detail_variants:
+                vid = _native_shopify_id(variant.get("id"))
+                if vid not in wanted or detail_ids.count(vid) != 1:
+                    continue
+                gtin = validated_source_gtin(variant.get("barcode"))
+                if gtin:
+                    recovered[vid] = gtin
+            return recovered, requests
+    except Exception as exc:
+        logger.debug("GTIN recovery refused for %s/%s: %s", host, handle, type(exc).__name__)
+    return {}, requests
+
+
+async def recover_missing_variant_gtins(
+    products: List[Dict[str, Any]], *, domain: str, max_fetches: int = 100,
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """Recover selected products only, before shade folding changes product identity.
+
+    attempted/recovered/failed/capped count PRODUCTS; recovered_gtins counts variant
+    barcodes and http_requests includes bounded redirect hops. A failed observation
+    never changes its product. Each attempt has at most three requests with the
+    client's ten-second timeout, paced by the shared merchant crawl gate.
+    """
+    if type(max_fetches) is not int or max_fetches < 0:
+        raise ValueError("max_pdp_identity_fetches must be a nonnegative integer")
+    copied = [dict(p, variants=[dict(v) if isinstance(v, dict) else v for v in (p.get("variants") or [])])
+              for p in products]
+    candidates = [p for p in copied if any(isinstance(v, dict) and _missing_barcode(v)
+                                          for v in p["variants"])]
+    report = {"attempted": 0, "recovered": 0, "failed": 0,
+              "capped": max(0, len(candidates) - max_fetches), "recovered_gtins": 0, "http_requests": 0}
+    if not candidates or not max_fetches:
+        return copied, report
+    async with httpx.AsyncClient(follow_redirects=False, timeout=httpx.Timeout(10.0, connect=5.0),
+                                 headers={"User-Agent": _UA, "Accept": "application/json"}) as client:
+        for product in candidates[:max_fetches]:
+            report["attempted"] += 1
+            recovered, requests = await _fetch_missing_variant_gtins(product, domain=domain, client=client)
+            report["http_requests"] += requests
+            applied = 0
+            for variant in product["variants"]:
+                if not isinstance(variant, dict):
+                    continue
+                gtin = recovered.get(_native_shopify_id(variant.get("id")))
+                if gtin and _missing_barcode(variant):
+                    variant["barcode"] = gtin
+                    applied += 1
+            report["recovered_gtins"] += applied
+            report["recovered" if applied else "failed"] += 1
+    return copied, report
 
 
 def _first(seq: Any) -> Optional[Dict[str, Any]]:
@@ -1666,6 +1807,8 @@ async def records_for_brand(
     max_scan_products: int = 10000,
     enrich_missing_inci: bool = False,
     max_pdp_inci_fetches: int = 300,
+    enrich_missing_gtin: bool = False,
+    max_pdp_identity_fetches: int = 100,
     # 0.0 since the shared politeness gate owns pacing. This ad-hoc sleep predates it and now
     # STACKS on top: every INCI fetch already waits its per-host interval, so a 0.3s sleep on
     # each of 300 fetches added ~90s of pure duplication. Left as a parameter rather than deleted
@@ -1679,6 +1822,11 @@ async def records_for_brand(
     accordion INCI via `fetch_pdp_inci` (the cohort keeps INCI out of body_html).
     Additive — body_html INCI stays the first try and is never overwritten here;
     the fetch is capped, delayed, and best-effort (a miss leaves raw_inci None).
+
+    `enrich_missing_gtin` optionally recovers validated missing variant barcodes
+    from identity-matched product .js responses, before folding. The product-attempt
+    budget is `max_pdp_identity_fetches`; batch crawl_report.gtin_recovery records
+    attempts, successes, failures, capped products and actual HTTP requests.
 
     `source_role="retailer"` uses storefront seller identity and reseller INCI authority,
     and refuses unproven currency. Official-mode identity stays backward compatible.
@@ -1695,6 +1843,10 @@ async def records_for_brand(
     """
     if source_role not in {"brand_official", "retailer"}:
         raise ValueError("source_role must be brand_official or retailer")
+    if not isinstance(enrich_missing_gtin, bool):
+        raise ValueError("enrich_missing_gtin must be a boolean")
+    if type(max_pdp_identity_fetches) is not int or max_pdp_identity_fetches < 0:
+        raise ValueError("max_pdp_identity_fetches must be a nonnegative integer")
     fetch_options: Dict[str, Any] = {"max_products": max_products}
     if only_vendors is not None or source_role == "retailer":
         fetch_options.update(only_vendors=only_vendors, max_scan_products=max_scan_products)
@@ -1747,6 +1899,10 @@ async def records_for_brand(
         records_for_brand.last_vendor_filter_report = {  # type: ignore[attr-defined]
             "vendors": list(only_vendors), "before": before, "after": len(products),
         }
+    identity_report = None
+    if enrich_missing_gtin:
+        products, identity_report = await recover_missing_variant_gtins(
+            products, domain=domain, max_fetches=max_pdp_identity_fetches)
     # A brand-family storefront (misshaus.com: 89 MISSHA + 17 APIEU + 7 CHOGONGJIN)
     # is not visibly different from a single-brand one until something counts the
     # vendors. Computed from the SAME resolver the record builder uses, so the report
@@ -1822,4 +1978,6 @@ async def records_for_brand(
     else:
         records_for_brand.last_brand_spelling_folds = {}  # type: ignore[attr-defined]
     report = {**crawl_report, "emitted_records": len(records)} if crawl_report is not None else None
+    if report is not None and identity_report is not None:
+        report["gtin_recovery"] = identity_report
     return CuratedRecordBatch(records, crawl_report=report)

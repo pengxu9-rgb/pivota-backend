@@ -81,6 +81,8 @@ async def _run(args: argparse.Namespace) -> int:
             source_role=source_role,
             retailer_name=retailer_name,
             max_scan_products=b.get("max_scan_products") or args.max_scan_products,
+            enrich_missing_gtin=b.get("enrich_missing_gtin", args.enrich_missing_gtin),
+            max_pdp_identity_fetches=b.get("max_pdp_identity_fetches", args.max_pdp_identity_fetches),
         )
         crawl_report = getattr(recs, "crawl_report", None)
         if crawl_report:
@@ -207,6 +209,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--retailer-name", help="Retailer display name; defaults to its host")
     p.add_argument("--max-scan-products", type=int, default=10000,
                    help="Whole-feed scan budget, independent of selected-brand --max-products")
+    p.add_argument("--enrich-missing-gtin", action="store_true",
+                   help="Recover missing barcodes from identity-matched product .js; opt-in, no price changes")
+    p.add_argument("--max-pdp-identity-fetches", type=int, default=100,
+                   help="Selected-product recovery attempt budget (0 disables requests; up to two redirects each)")
     p.add_argument("--apply", action="store_true", help="ingest (else dry-run plan)")
     args = p.parse_args(argv)
     try:

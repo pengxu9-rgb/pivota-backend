@@ -128,7 +128,8 @@ def test_worker_forwards_all_supported_controls(monkeypatch):
 
     monkeypatch.setattr(w, "records_for_brand", records)
     payload = _job(max_products=700, max_scan_products=12000, base_listings_only=True,
-                   emit_real_variants=True, enrich_missing_inci=False, max_pdp_inci_fetches=0)
+                   emit_real_variants=True, enrich_missing_inci=False, max_pdp_inci_fetches=0,
+                   enrich_missing_gtin=True, max_pdp_identity_fetches=7)
     result = asyncio.run(w._process_curated_brand(payload, apply=False, db=None))
     assert result["records"] == 0
     assert calls == [{
@@ -136,7 +137,7 @@ def test_worker_forwards_all_supported_controls(monkeypatch):
         "source_role": "retailer", "retailer_name": "retailer.example", "only_vendors": ["cosrx"],
         "require_currency": "USD", "emit_real_variants": True, "base_listings_only": True,
         "enrich_missing_inci": False, "max_pdp_inci_fetches": 0, "max_products": 700,
-        "max_scan_products": 12000,
+        "max_scan_products": 12000, "enrich_missing_gtin": True, "max_pdp_identity_fetches": 7,
     }]
 
 
