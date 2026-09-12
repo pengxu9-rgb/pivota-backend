@@ -1,5 +1,6 @@
 """Complete a consumer audit and refund undelivered supplemental work atomically."""
 import json
+from decimal import Decimal
 from db.database import database
 from services.consumer_capture_plan import validate_plan
 from services.merchant_credit_balance_service import credit
@@ -34,7 +35,7 @@ def refund_due(launch, report):
         raise ValueError('Consumer refund exceeds launch debit')
     return {'quoted_credits': total, 'refunded_credits': amount,
             'charged_credits': total - amount, 'failed_jobs': failed,
-            'purchased_credits': min(amount, int(debit.get('purchased_credits') or 0))}
+            'purchased_credits': min(amount, Decimal(str(debit.get('purchased_credits') or 0)))}
 
 
 async def complete_with_refund(*, run_id, merchant_id, worker_id, launch, report, cost_summary):

@@ -31,6 +31,8 @@ Resume semantics:
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 import logging
 import asyncio
 import os
@@ -1320,7 +1322,7 @@ async def _refund_launch_debits(
         if not kind or amount <= 0:
             continue
         try:
-            purchased_credits = int(item.get("purchased_credits") or 0)
+            purchased_credits = Decimal(str(item.get("purchased_credits") or 0))
         except (TypeError, ValueError):
             purchased_credits = 0
         try:

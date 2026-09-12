@@ -661,8 +661,8 @@ def _audit_metering(
 
 def _balance_public_shape(balance: Dict[str, Any]) -> Dict[str, Any]:
     return {
-        "credits": int(balance.get("credits") or 0),
-        "allowance_credits": int(balance.get("allowance_credits") or 0),
+        "credits": float(balance.get("credits") or 0),
+        "allowance_credits": float(balance.get("allowance_credits") or 0),
         "plan_tier": str(balance.get("plan_tier") or "free"),
     }
 
@@ -671,7 +671,7 @@ def _credit_gaps(
     *, requirements: Dict[str, int], balance: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
     required = sum(int(value) for value in requirements.values())
-    available = int(balance.get("credits") or 0)
+    available = float(balance.get("credits") or 0)
     if required <= available:
         return []
     return [{
@@ -1173,7 +1173,7 @@ async def create_audit_run(
                 audit_required,
                 bool(audit_debit.get("replay")),
                 audit_usd_cogs,
-                int(audit_debit.get("purchased_credits_debited") or 0),
+                Decimal(str(audit_debit.get("purchased_credits_debited") or 0)),
             ))
         prompt_required = int(requirements["prompt"])
         if prompt_required:
@@ -1189,7 +1189,7 @@ async def create_audit_run(
                 prompt_required,
                 bool(prompt_debit.get("replay")),
                 Decimal("0"),
-                int(prompt_debit.get("purchased_credits_debited") or 0),
+                Decimal(str(prompt_debit.get("purchased_credits_debited") or 0)),
             ))
 
         # Use origin/main's race-safe enqueue (returns run_id +
@@ -1258,7 +1258,7 @@ async def create_audit_run(
                             "kind": kind,
                             "amount": int(amount),
                             "replay": bool(replay),
-                            "purchased_credits": int(purchased_credits),
+                            "purchased_credits": float(purchased_credits),
                         }
                         for (
                             kind,

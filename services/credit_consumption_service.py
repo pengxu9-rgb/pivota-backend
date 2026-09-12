@@ -105,7 +105,7 @@ async def consume(
         credits, estimated_cogs = estimate_probe_credits(probes)
         if usd_cogs is None:
             usd_cogs = estimated_cogs
-    credits = int(credits)
+    credits = Decimal(str(credits))
     if credits <= 0:
         return {"credits": 0, "category": category, "skipped": True}
 
@@ -138,7 +138,7 @@ async def refund(
 ) -> Dict[str, Any]:
     """Refund a prior consume (failure path), idempotent on source_event_id."""
     category = category_for(operation_type)
-    credits = int(credits)
+    credits = Decimal(str(credits))
     if credits <= 0:
         return {"credits": 0, "category": category, "skipped": True}
 
@@ -175,6 +175,8 @@ async def merchant_is_paid_tier(merchant_id: str, *, conn: Any = None) -> bool:
             WHERE us.merchant_id = :merchant_id
               AND us.status IN ('active', 'trialing')
               AND sp.status = 'active'
+              AND (us.current_period_start IS NULL OR us.current_period_start <= NOW())
+              AND (us.current_period_end IS NULL OR us.current_period_end > NOW())
               AND COALESCE(sp.monthly_credit_allowance, 0) > 0
             LIMIT 1
             """,
