@@ -62,7 +62,7 @@ def patched(monkeypatch: pytest.MonkeyPatch):
     async def fake_paid(merchant_id: str, **_kw):
         return state["paid"]
 
-    async def fake_exec(summary):
+    async def fake_exec(summary, **kw):
         return state.get("exec")
 
     async def fake_consume(merchant_id, operation_type, idempotency_key, **kw):
@@ -83,6 +83,17 @@ def patched(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(mar, "merchant_is_paid_tier", fake_paid)
     monkeypatch.setattr(mar, "generate_executive_summary", fake_exec)
     monkeypatch.setattr(mar, "consume_credits", fake_consume)
+    async def measured(**kw):
+        if state.get("consume_raises"):
+            raise state["consume_raises"]
+        value = await kw["generate"]()
+        if not value:
+            raise ValueError("No summary")
+        result = {"bullets": value[0]}
+        kw["prepare"](result)
+        await fake_consume(kw["merchant_id"], kw["operation_type"], kw["operation_key"], credits=0.12, usd_cogs=0.00075)
+        return {**result, "credits_charged": 0.12}
+    monkeypatch.setattr(mar, "run_measured_generation", measured)
     return state
 
 
@@ -117,12 +128,12 @@ def test_paid_tier_meters_actual_tokens_at_1_6x(patched):
     res = _client().post("/api/merchant-center/audit/url-readiness/r-1/deck")
     assert res.status_code == 200
     assert res.headers["x-pivota-billing-mode"] == "metered"
-    assert res.headers["x-pivota-credits-charged"] == "1"
+    assert res.headers["x-pivota-credits-charged"] == "0.12"
     assert _slide_count(res.content) == 5  # full deck incl. exec summary
     (call,) = patched["consumed"]
     assert call["operation_type"] == "report_deck_export"
-    assert call["idempotency_key"] == "report_deck:r-1"
-    assert call["credits"] == 1
+    assert call["idempotency_key"] == "report_deck_v2:r-1"
+    assert call["credits"] == 0.12
     assert call["usd_cogs"] > 0
 
 

@@ -1,4 +1,5 @@
 import pytest
+from decimal import Decimal
 from services.consumer_capture_plan import build_plan, quote_plan
 from services.consumer_capture_settlement import refund_due
 
@@ -39,3 +40,9 @@ def test_invalid_quote_cannot_credit_more_than_debited():
     launch['debited'][0]['amount'] = 0
     with pytest.raises(ValueError):
         refund_due(launch, report)
+
+
+def test_refund_preserves_fractional_carryover_source():
+    launch, _ = case()
+    launch['debited'][0]['purchased_credits'] = '0.7'
+    assert refund_due(launch, {})['purchased_credits'] == Decimal('0.7')

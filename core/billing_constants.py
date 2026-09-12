@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 # All values from build brief §4 + §8. Customer-facing surfaces NEVER reference these directly.
 
 CREDIT_TO_USD_CENTS = 1
@@ -29,9 +31,9 @@ CREDIT_COST_RATIO_OVERRIDES: dict[str, float] = {
 }
 
 
-def overage_revenue_cents(overage_credits: int) -> int:
+def overage_revenue_cents(overage_credits: int | Decimal) -> int:
     """Cents charged for overage credits. Build brief §6.1 formula:
     overage_revenue_usd = overage_credits × overage_rate_per_credit_usd
     Returns rounded cents (banker's rounding via round())."""
 
-    return round(overage_credits * OVERAGE_RATE_PER_CREDIT_USD_CENTS)
+    return round(Decimal(str(overage_credits)) * Decimal(str(OVERAGE_RATE_PER_CREDIT_USD_CENTS)))
