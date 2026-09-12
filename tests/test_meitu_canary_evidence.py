@@ -19,7 +19,12 @@ def evidence():
             "category_path": "beauty/makeup/lip/lipstick", "inci_source": "reseller_listing"}
             for host in ["one.example", "two.example"]],
         "search_product_keys": ["pk"], "pdp_product_keys": ["pk"], "offer_product_keys": ["pk"],
-        "second_ingest_added_product_keys": [], "identity_failures": []}}
+        "offers": [{"product_key": "pk", "merchant_id": f"merchant_{host}", "seller_host": host,
+                    "variant_id": "123456", "currency": "USD", "market": "US",
+                    "destination_url": f"https://{host}/products/lipstick"}
+                   for host in ["one.example", "two.example"]],
+        "second_ingest_added_product_keys": [], "second_ingest_added_sku_keys": [],
+        "second_ingest_added_offer_keys": [], "identity_failures": []}}
 
 
 def test_missing_observations_are_pending_never_success():
@@ -51,3 +56,22 @@ def test_sg_case_cannot_pass_us_currency_or_partition():
 def test_exact_gtin_canary_cannot_pass_a_different_same_brand_item():
     case = dict(MANIFEST["cases"][0], target_gtin="8809530070499")
     assert evaluate({"cases": [case]}, evidence(), now=NOW)["failed"] == 1
+
+
+def test_shared_product_does_not_prove_second_retailer_offer():
+    data = evidence()
+    data["same_brand"]["offers"].pop()
+    assert evaluate(MANIFEST, data, now=NOW)["failed"] == 1
+
+
+def test_wrong_retailer_destination_cannot_pass():
+    data = evidence()
+    data["same_brand"]["offers"][1]["destination_url"] = "https://one.example/products/lipstick"
+    assert evaluate(MANIFEST, data, now=NOW)["failed"] == 1
+
+
+def test_reingest_must_not_duplicate_skus_or_offers():
+    for field in ("second_ingest_added_sku_keys", "second_ingest_added_offer_keys"):
+        data = evidence()
+        data["same_brand"][field] = ["duplicate"]
+        assert evaluate(MANIFEST, data, now=NOW)["failed"] == 1

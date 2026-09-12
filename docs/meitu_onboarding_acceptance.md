@@ -39,7 +39,7 @@ python -m scripts.onboard_external_brand_from_crawl --file reviewed-sg-cohort.js
 
 No `--apply` is present. Keep its publication gate enabled. A future authorized controlled ingest should first use `--no-serving`, inspect all materialized identities/offers and price/market values, and separately establish serving eligibility before promotion. Do not feed a 2026-09-04 snapshot as if extracted today. The stored `cohort_meitu_sg_tier1.json` contains historical hints and incomplete image/description fields; it is not a ready-to-apply canary.
 
-Record fresh deployed backend/gateway revisions and source artifact references with complete scan counts, exact product/variant/merchant keys, returned currencies and market. Capture actual search, PDP and offers responses, plus a controlled second-ingest key diff and identity failure list. The evidence schema is documented in `scripts/validate_meitu_canary_evidence.py`. Screen the resulting observations with:
+Record fresh deployed backend/gateway revisions and source artifact references with complete scan counts, exact product/variant/merchant keys, returned currencies and market. Capture actual search, PDP and offers responses, plus a controlled second-ingest product/SKU/offer key diff and identity failure list. The saved offers must identify each retailer, native variant, market, currency and actual retailer destination; a shared canonical product key alone does not prove that both offers resolve. The evidence schema is documented in `scripts/validate_meitu_canary_evidence.py`. Screen the resulting observations with:
 
 ```sh
 python -m scripts.validate_meitu_canary_evidence --manifest data/review_canaries/meitu_brand_retailer_matrix.json --evidence fresh-observations.json --output acceptance.json

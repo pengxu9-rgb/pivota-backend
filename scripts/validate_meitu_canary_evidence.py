@@ -4,7 +4,9 @@ Evidence is a JSON object keyed by manifest case_id. Each case supplies observed
 backend_revision, gateway_revision, crawl {status, selected_products}, products
 [{product_key, brand, seller_host, merchant_id, currency, market, variant_id, variant_id_provenance, gtin,
 category_path, inci_source}], search_product_keys, pdp_product_keys,
-offer_product_keys, second_ingest_added_product_keys and identity_failures.
+offer_product_keys, offers [{product_key, merchant_id, seller_host, variant_id,
+currency, market, destination_url}], second_ingest_added_product_keys,
+second_ingest_added_sku_keys, second_ingest_added_offer_keys and identity_failures.
 Missing observations are pending, never passing. A pass certifies the supplied
 evidence meets this contract; source artifact provenance must still be reviewed.
 """
@@ -14,6 +16,7 @@ import argparse
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 def evaluate(manifest: dict, evidence: dict, *, now=None) -> dict:
@@ -60,6 +63,15 @@ def evaluate(manifest: dict, evidence: dict, *, now=None) -> dict:
             host, merchant = product.get("seller_host"), product.get("merchant_id")
             if host not in case["seller_hosts"] or not merchant:
                 reasons.append("wrong or missing seller identity")
+            # A shared canonical product key cannot prove that BOTH retailers have
+            # resolvable offers. Require the actual seller/variant/currency tuple.
+            matching_offers = [offer for offer in (observed.get("offers") or [])
+                if all(offer.get(field) == product.get(field) for field in
+                       ("product_key", "merchant_id", "seller_host", "variant_id", "currency", "market"))]
+            if not any(urlsplit(str(offer.get("destination_url") or "")).scheme == "https"
+                       and (urlsplit(str(offer.get("destination_url") or "")).hostname or "").removeprefix("www.") == host
+                       for offer in matching_offers):
+                reasons.append("missing seller-specific resolvable offer and destination")
             seller_ids.setdefault(host, set()).add(merchant)
             if product.get("gtin"):
                 seller_items.setdefault(host, set()).add((key, str(product["gtin"])))
@@ -75,8 +87,9 @@ def evaluate(manifest: dict, evidence: dict, *, now=None) -> dict:
             item_sets = [seller_items.get(host, set()) for host in case["seller_hosts"]]
             if not set.intersection(*item_sets):
                 reasons.append("no shared canonical product and GTIN across requested retailers")
-        if observed.get("second_ingest_added_product_keys") != []:
-            reasons.append("idempotent re-ingest not demonstrated")
+        if any(observed.get(field) != [] for field in
+               ("second_ingest_added_product_keys", "second_ingest_added_sku_keys", "second_ingest_added_offer_keys")):
+            reasons.append("idempotent product, SKU and offer re-ingest not demonstrated")
         if observed.get("identity_failures") != []:
             reasons.append("identity failures present or not measured")
         results.append({"case_id": case["case_id"], "status": "failed" if reasons else "passed",
