@@ -18,7 +18,7 @@ async def test_outreach_products_persist_replay_and_dismiss_independently():
         await tasks.ensure_merchant_tasks_table()
         await database.execute('ALTER TABLE merchant_tasks ADD COLUMN IF NOT EXISTS recovery_key TEXT NULL')
         async def mark(sku):
-            return await mark_outreach_pitch_sent(_OutreachPitchBody(host='review.example',query='best mascara',sku_key=sku), merchant_id=merchant)
+            return await mark_outreach_pitch_sent(_OutreachPitchBody(host='review.example',query='best mascara',sku_key=sku, audit_run_id=str(uuid4())), merchant_id=merchant)
         a, b = await mark('sku-a'), await mark('sku-b')
         assert a['task_id'] != b['task_id']
         assert (await mark('sku-b'))['task_id'] == b['task_id']
@@ -28,6 +28,8 @@ async def test_outreach_products_persist_replay_and_dismiss_independently():
         from services.task_queue_service import reverify_outreach_records
         report = {'authority_map': {'host_attribution_summary': {'endorsement_hosts': ['review.example']}},
                   'per_sku_reports': [{'sku_key': 'sku-b', 'run_facts': {'prompts': [{'query': 'best mascara', 'endorsed_by': ['review.example']}]}}]}
+        from services.task_queue_service import _reconcile_dropped_pending_tasks
+        assert await _reconcile_dropped_pending_tasks(merchant_id=merchant, audit_run_id=str(uuid4()), covered_product_keys={'sku-a','sku-b'}) == 0
         result = await reverify_outreach_records(merchant_id=merchant, run_id=str(uuid4()), audit_report=report)
         assert result == {'checked': 2, 'flipped': 1}
         assert (await tasks.fetch_task(task_id=a['task_id']))['status'] == 'pending'

@@ -712,6 +712,11 @@ async def _reconcile_dropped_pending_tasks(
     )
     closed = 0
     for task in stale:
+        # Merchant-recorded outreach can retain the originating audit ID.
+        # It is tracked by reverify_outreach_records, not a regenerated action
+        # that disappears when the next audit produces a different plan.
+        if task.get("lever") == "outreach_pitch":
+            continue
         evidence = task.get("evidence") or {}
         # Match on normalized identifiers (incl. the canonical sig_<hex>), so a
         # legacy task keyed by the canonical URL still resolves to a product the
