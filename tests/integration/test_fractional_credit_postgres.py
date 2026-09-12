@@ -73,10 +73,11 @@ async def test_credit_contract(scenario):
         await database.disconnect()
 
 
-@pytest.mark.parametrize("scenario", ["replay", "concurrent", "provider_failure", "over_cap", "save_failure", "render_failure", "disabled"])
+@pytest.mark.parametrize("scenario", ["replay", "concurrent", "provider_failure", "over_cap", "save_failure", "render_failure", "disabled", "small_balance", "insufficient_actual"])
 async def test_measured_result_and_debit_commit_together(scenario):
     from db.database import database
     from services.merchant_measured_generation import run_measured_generation
+    from services.merchant_credit_balance_service import InsufficientCreditsError
     url = urlparse(os.environ["DATABASE_URL"])
     assert url.hostname in {"127.0.0.1", "localhost"} and url.path == "/recovery_contract_test"
     merchant = "measured-" + uuid4().hex
@@ -100,11 +101,15 @@ async def test_measured_result_and_debit_commit_together(scenario):
     try:
         await database.execute("INSERT INTO merchant_onboarding (merchant_id) VALUES (:m)", {"m": merchant})
         await database.execute("INSERT INTO merchant_credit_balance (merchant_id,credits,purchased_credits) VALUES (:m,10,10)", {"m": merchant})
+        if scenario in {"small_balance", "insufficient_actual"}:
+            await database.execute("UPDATE merchant_credit_balance SET credits=:n,purchased_credits=:n WHERE merchant_id=:m", {"m": merchant, "n": Decimal("0.01" if scenario == "small_balance" else "0.001")})
         if scenario == "disabled":
             await database.execute("UPDATE merchant_metering_controls SET enabled=FALSE WHERE policy_version='measured_text_v1'")
         if scenario == "concurrent":
             result = await asyncio.wait_for(asyncio.gather(*(asyncio.create_task(run(), context=Context()) for _ in range(2))), 10)
             assert sorted(r["credits_charged"] for r in result) == [0, 0.00552]
+        elif scenario == "small_balance":
+            assert (await run())["credits_charged"] == 0.00552
         elif scenario == "replay":
             assert (await run())["credits_charged"] == 0.00552
             assert (await run())["credits_charged"] == 0
@@ -114,11 +119,11 @@ async def test_measured_result_and_debit_commit_together(scenario):
                     await run()
                     raise RuntimeError("failure after saving result")
         else:
-            with pytest.raises((RuntimeError, ValueError)):
+            with pytest.raises((RuntimeError, ValueError, InsufficientCreditsError)):
                 await run()
         assert calls == (0 if scenario == "disabled" else 1)
-        success = scenario in {"replay", "concurrent"}
-        assert await database.fetch_val("SELECT credits FROM merchant_credit_balance WHERE merchant_id=:m", {"m": merchant}) == Decimal("9.99448" if success else "10")
+        success = scenario in {"replay", "concurrent", "small_balance"}
+        assert await database.fetch_val("SELECT credits FROM merchant_credit_balance WHERE merchant_id=:m", {"m": merchant}) == Decimal("0.00448" if scenario == "small_balance" else "0.001" if scenario == "insufficient_actual" else "9.99448" if success else "10")
         for table in ("agent_center_usage_events", "merchant_llm_operations"):
             assert await database.fetch_val(f"SELECT COUNT(*) FROM {table} WHERE merchant_id=:m", {"m": merchant}) == int(success)
     finally:

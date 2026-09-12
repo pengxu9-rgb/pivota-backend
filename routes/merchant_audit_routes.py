@@ -3157,7 +3157,7 @@ async def export_url_audit_deck(
             billing_mode = "metered"
             credits_charged = result["credits_charged"]
         except InsufficientCreditsError:
-            raise HTTPException(status_code=402, detail={"code": "insufficient_credits", "credits_required": 1, "message": "Keep 1 credit available; only actual usage is charged."})
+            raise HTTPException(status_code=402, detail={"code": "insufficient_credits", "max_credits": 1, "message": "Not enough credits for the actual usage. No credits charged."})
         except Exception:
             logger.warning("Measured deck summary unavailable; exporting without AI summary", exc_info=True)
             deck = None
@@ -4305,7 +4305,7 @@ async def answer_merchant_audit_question(
             generate=lambda: generate_measured_text(system_prompt=_ASK_SYSTEM_PROMPT, user_message=user_message),
         )
     except InsufficientCreditsError:
-        raise HTTPException(status_code=402, detail="Keep 1 credit available for the maximum cost; only actual usage is charged.")
+        raise HTTPException(status_code=402, detail="Not enough credits for the actual usage. No credits charged; top up to continue.")
     except Exception:
         logger.warning("merchant audit measured ask failed run=%s", body.run_id, exc_info=True)
         raise HTTPException(status_code=503, detail="Couldn't generate an answer. No credits were charged; please try again.")

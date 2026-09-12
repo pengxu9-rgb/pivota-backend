@@ -74,14 +74,17 @@ async def run_measured_generation(
         await wallet.ensure_row(merchant_id, conn=database)
         await wallet.apply_subscription_allowance(merchant_id, conn=database)
         available = await database.fetch_val("SELECT credits FROM merchant_credit_balance WHERE merchant_id=:m FOR UPDATE", {"m": merchant_id})
-        if available < max_credits:
-            raise wallet.InsufficientCreditsError(merchant_id, category, max_credits, available)
+        if available <= 0:
+            raise wallet.InsufficientCreditsError(merchant_id, category, Decimal("0.00000001"), available)
+        available_cap = min(max_credits, available)
         result, receipt = await generate()
         if prepare:
             prepare(result)
         amount = Decimal(receipt["credits"])
         if not amount.is_finite() or amount < 0 or amount > max_credits:
             raise ValueError("Measured cost exceeds the authorized cap; no charge")
+        if amount > available_cap:
+            raise wallet.InsufficientCreditsError(merchant_id, category, amount, available)
         await wallet.debit(merchant_id, category, amount, "measured:" + operation_key,
                            usd_cogs=receipt["usd_cogs"], conn=database)
         await database.execute("""INSERT INTO merchant_llm_operations

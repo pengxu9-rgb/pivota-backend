@@ -1,6 +1,6 @@
 # Fractional merchant text metering rollout
 
-Pricing: verified model usage cost × 1.6 / USD 0.01 per credit, persisted with eight decimal places. Audits keep frozen fixed quotes. Text generation has a maximum charge of 1 credit, requires that amount in the existing wallet, and never initiates an external overage card charge inside its result transaction.
+Pricing: verified model usage cost × 1.6 / USD 0.01 per credit, persisted with eight decimal places. Audits keep frozen fixed quotes. Text generation has a maximum charge of 1 credit, uses fractional balances below that cap, and never initiates an external overage card charge inside its result transaction.
 
 1. Apply migration 222 in a transaction using the established production migration runner. It preserves existing integer values and starts `merchant_metering_controls.measured_text_v1` disabled. If the five-second lock timeout fires, investigate and retry; do not remove the lock guard.
 2. Deploy web, worker and proof-issuer through the normal exact-SHA test gates. Until activation, new paid text generation is temporarily unavailable; deck export falls back to the existing report without the AI summary. Existing saved measured results remain readable. Follow-up actions must not create empty tasks due to a disabled metering policy.

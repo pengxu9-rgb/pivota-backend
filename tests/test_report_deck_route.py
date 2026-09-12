@@ -156,7 +156,7 @@ def test_paid_tier_empty_wallet_402(patched):
     assert res.status_code == 402
     detail = res.json()["detail"]
     assert detail["code"] == "insufficient_credits"
-    assert detail["credits_required"] == 1
+    assert detail["max_credits"] == 1
 
 
 def test_renderer_unavailable_503_never_debits(patched, monkeypatch):
