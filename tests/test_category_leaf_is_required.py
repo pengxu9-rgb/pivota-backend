@@ -22,7 +22,6 @@ can produce one.
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 import pytest
@@ -34,7 +33,6 @@ from services.pdp_category_classifier import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-BACKFILL = REPO_ROOT / "scripts" / "backfill_pdp_category_path.py"
 
 
 @pytest.mark.parametrize(
@@ -73,28 +71,35 @@ def test_the_classifier_can_never_emit_a_non_leaf_path():
     assert offenders == [], f"CATEGORY_PATTERNS would mint uncategorised paths: {offenders}"
 
 
-def test_the_backfill_revisits_non_leaf_rows_not_just_nulls():
-    """`WHERE category_path IS NULL` is why the cohort is permanently stranded.
+@pytest.mark.asyncio
+async def test_the_backfill_revisits_non_leaf_rows_not_just_nulls(monkeypatch):
+    """Exercise the assembled SQL rather than regex-matching Python source.
 
-    A row stamped `beauty` looks done to the backfill and unservable to search at the same time.
-    Pinned on the SQL because there is no test database here to drive the script against, and the
-    predicate is the whole fix.
+    The widened backfill builds its SELECT predicate separately and replaces the
+    old UPDATE shape with an exact previous-value/depth guard. Real execution and
+    concurrent changes are covered by test_category_backfill_scope_guards_postgres.
     """
-    src = BACKFILL.read_text(encoding="utf-8")
-    select_and_update = re.findall(
-        r"WHERE[^\"]*?category_path[^\"]*?(?=\n\s*\"\"\"|\n\s*ORDER BY|\n\s*LIMIT)",
-        src,
-        re.DOTALL,
-    )
-    assert select_and_update, "the backfill must still filter on category_path"
-    for clause in select_and_update:
-        assert "POSITION('/' IN category_path) = 0" in clause, (
-            "both the SELECT and the UPDATE must treat a single-segment path as uncategorised; "
-            f"found: {clause.strip()!r}"
-        )
-    # And the UPDATE must keep the same guard, or a concurrent writer's real path can be clobbered
-    # between the read and the write.
-    assert src.count("POSITION('/' IN category_path) = 0") >= 2
+    from scripts import backfill_pdp_category_path as backfill
+    from sqlalchemy import text
+
+    calls = []
+    async def capture(query, values=None):
+        calls.append((str(query), dict(values or {})))
+        # The real driver rejects extra/missing bound parameters too.
+        text(str(query)).bindparams(**(values or {}))
+        return [] if len(calls) == 1 else None
+    monkeypatch.setattr(backfill.database, "fetch_all", capture)
+    monkeypatch.setattr(backfill.database, "fetch_val", capture)
+    await backfill._fetch_batch(10, None)
+    select, _ = calls[0]
+    assert "category_path IS NULL" in select
+    assert "POSITION('/' IN category_path) = 0" in select
+    assert await backfill._apply_update(
+        "bare", "beauty/fragrance/perfume", previous_path="beauty") is False
+    update, params = calls[1]
+    assert "category_path IS NOT DISTINCT FROM CAST(:previous AS varchar)" in update
+    assert ":new_depth >" in update
+    assert params["previous"] == "beauty" and params["new_depth"] == 3
 
 
 def test_the_rule_is_stated_once():
