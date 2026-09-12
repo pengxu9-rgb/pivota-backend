@@ -1214,3 +1214,20 @@ def test_dedicated_url_quote_route_never_enqueues_even_without_quote_flag(client
     assert response.status_code == 200, response.text
     assert response.json()['status'] == 'quoted'
     assert not client.credit_ops and not client.enqueued
+
+
+@pytest.mark.parametrize('consumer', [False, True])
+def test_metered_quote_is_available_with_zero_credits_but_start_is_blocked(client, monkeypatch, consumer):
+    monkeypatch.setenv('PIVOTA_CONSUMER_ANSWER_ENABLED', 'true')
+    client.state['used'] = 5
+    client.state['balance'] = {'credits': 0, 'plan_tier': 'free'}
+    body = {**_BODY, **({'consumer_answer_queries': ['Best mascara?']} if consumer else {})}
+    response = client.post(_URL + '/quote', json=body)
+    assert response.status_code == 200, response.text
+    quote = response.json()
+    assert quote['status'] == 'quoted' and quote['base_credits'] > 0
+    assert quote['credits'] == quote['base_credits'] + (quote['consumer_capture']['credits'] if consumer else 0)
+    assert not client.credit_ops and not client.enqueued
+    start = client.post(_URL, json={**body, 'accepted_quote': quote['quote_id']})
+    assert start.status_code == 402, start.text
+    assert not client.credit_ops and not client.enqueued
