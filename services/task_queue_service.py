@@ -472,7 +472,8 @@ async def reverify_outreach_records(
     own listing and not a competitor's store) that ALSO cited the merchant's own
     SKU (cites_exact_sku / cites_near_variant). If the pitched host now cites us,
     flip the record to cited (evidence.outreach.status='cited' + cited_run_id /
-    verified_at) and mark the task done — the honest proof the outreach worked.
+    verified_at) and mark the task done. This records a source observation, not causal proof
+    that the outreach changed the model response.
     Best-effort: never raises into the audit worker."""
     from datetime import datetime, timezone
 
@@ -518,6 +519,25 @@ async def reverify_outreach_records(
             host = _norm_host(outreach.get("host"))
             if not host or host not in citing_hosts:
                 continue
+            # A brand-level host match cannot complete another product's pitch.
+            # Saved per-product prompt facts provide the required scope; missing
+            # older facts leave the task pending rather than assuming success.
+            sku_key = outreach.get("sku_key") or evidence.get("product_key")
+            if sku_key:
+                product_ids = _product_id_variants(sku_key)
+                query = str(outreach.get("query") or "").strip().casefold()
+                scoped_match = False
+                for row in (audit_report.get("per_sku_reports") or []):
+                    if not isinstance(row, dict) or not (product_ids & _covered_product_keys({"per_sku_reports": [row]})):
+                        continue
+                    facts = row.get("run_facts") or {}
+                    for prompt in facts.get("prompts", []):
+                        if (isinstance(prompt, dict)
+                                and str(prompt.get("query") or "").strip().casefold() == query
+                                and host in {_norm_host(h) for h in prompt.get("endorsed_by", [])}):
+                            scoped_match = True
+                if not scoped_match:
+                    continue
             # read-modify-write: update_task_status OVERWRITES evidence_jsonb wholesale.
             outreach["status"] = "cited"
             outreach["cited_run_id"] = run_id

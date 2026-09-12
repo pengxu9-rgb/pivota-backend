@@ -25,12 +25,19 @@ async def test_outreach_products_persist_replay_and_dismiss_independently():
         rows = await database.fetch_all('SELECT * FROM merchant_tasks WHERE merchant_id=:m', {'m': merchant})
         assert len(rows) == 2
         assert len({r['recovery_key'] for r in rows}) == 2
+        from services.task_queue_service import reverify_outreach_records
+        report = {'authority_map': {'host_attribution_summary': {'endorsement_hosts': ['review.example']}},
+                  'per_sku_reports': [{'sku_key': 'sku-b', 'run_facts': {'prompts': [{'query': 'best mascara', 'endorsed_by': ['review.example']}]}}]}
+        result = await reverify_outreach_records(merchant_id=merchant, run_id=str(uuid4()), audit_report=report)
+        assert result == {'checked': 2, 'flipped': 1}
+        assert (await tasks.fetch_task(task_id=a['task_id']))['status'] == 'pending'
+        assert (await tasks.fetch_task(task_id=b['task_id']))['status'] == 'done'
         with pytest.raises(HTTPException) as exc:
             await dismiss_merchant_task(a['task_id'], _TaskDismissBody(reason='test cleanup'), merchant_id='another-merchant')
         assert exc.value.status_code == 404
         await dismiss_merchant_task(a['task_id'], _TaskDismissBody(reason='isolated acceptance'), merchant_id=merchant)
         assert (await tasks.fetch_task(task_id=a['task_id']))['status'] == 'dismissed'
-        assert (await tasks.fetch_task(task_id=b['task_id']))['status'] == 'pending'
+        assert (await tasks.fetch_task(task_id=b['task_id']))['status'] == 'done'
     finally:
         await database.execute('DELETE FROM merchant_tasks WHERE merchant_id=:m', {'m': merchant})
         await database.disconnect()

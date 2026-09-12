@@ -214,3 +214,17 @@ async def test_reverify_against_REAL_authority_map_flips(monkeypatch):
     )
     assert out == {"checked": 1, "flipped": 1}
     assert updates[0]["evidence"]["outreach"]["status"] == "cited"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('observed_sku,observed_query,expected', [('sku-a','best collagen',1),('sku-b','best collagen',0),('sku-a','different question',0)])
+async def test_product_pitch_requires_matching_product_and_question(monkeypatch, observed_sku, observed_query, expected):
+    task = _outreach_task('target', 'goodhousekeeping.com')
+    task['evidence_jsonb']['outreach']['sku_key'] = 'sku-a'
+    updates=[]
+    _patch(monkeypatch,[task],updates.append)
+    report=_report([_host_row('goodhousekeeping.com')])
+    report['per_sku_reports']=[{'sku_key':observed_sku,'run_facts':{'prompts':[{'query':observed_query,'endorsed_by':['goodhousekeeping.com']}]}}]
+    result=await reverify_outreach_records(merchant_id='m1',run_id='new-run',audit_report=report)
+    assert result['flipped']==expected
+    assert len(updates)==expected
