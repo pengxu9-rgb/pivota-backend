@@ -1219,12 +1219,37 @@ CATEGORY_CONFIDENCE_FEED_DEFAULT = 0.3
 _GENERIC_PRODUCT_TYPES = frozenset({
     "beauty", "cosmetics", "makeup", "make up", "skin care", "skincare",
     "face care", "hair care", "haircare", "lip care", "lip treatment", "lip treatments",
+    "lip color", "lip colour",
 })
 _GENERIC_LIP_TYPES = frozenset({"lip care", "lip treatment", "lip treatments"})
 _TOOL_NOUN_SUFFIX = re.compile(r"\bbrush(?:es)?(?:\s+#?\d{1,4})?\s*$", re.I)
 # Formula names ending in an included applicator are not tool names. This is a
 # noun/suffix exception, not a general pass of marketing titles through the taxonomy.
 _TOOL_FORMULA_CONTEXT = re.compile(r"[+&/]|\b(?:and|with|includes?|including|for|using|built[- ]in)\b|brush[- ]on", re.I)
+
+
+# Direct product nouns, not a general title classifier. These two families
+# exposed swapped Stila merchant types in the 2026-09-12 source review. A hybrid
+# naming both families keeps its type; shade names like "Blush" are not proof.
+_EXPLICIT_PRODUCT_FAMILIES = {
+    "eye_liner": re.compile(r"\beye[\s-]*liner\b", re.I),
+    "cheek": re.compile(r"\b(?:cheek\s+(?:duo|stick|cream|colou?r|palette)|(?:liquid|powder|cream)\s+blush)\b", re.I),
+}
+_TYPE_FAMILIES = {
+    "beauty/makeup/eye/eyeliner": "eye_liner",
+    "beauty/makeup/face/blush": "cheek",
+    "beauty/makeup/face/bronzer": "cheek",
+}
+_AMBIGUOUS_PRODUCT_TYPE_KEYS = frozenset({"lipglossoil", "lipglossliptint"})
+
+
+def _title_contradicts_product_type(title: Optional[str], path: str) -> bool:
+    claimed = _TYPE_FAMILIES.get(path)
+    if not claimed:
+        return False
+    explicit = {family for family, pattern in _EXPLICIT_PRODUCT_FAMILIES.items()
+                if pattern.search(str(title or ""))}
+    return bool(explicit and claimed not in explicit)
 
 
 def _pattern_matches(text: Optional[str]) -> int:
@@ -1250,11 +1275,19 @@ def _resolve_category(*, product_type: Optional[str], title: Optional[str], flag
     leaves = {path for _label, path, _pattern in CATEGORY_PATTERNS}
 
     def accept(path: str, confidence: float) -> Tuple[str, float]:
+        if _title_contradicts_product_type(title, path):
+            # Refuse even when the caller supplied that same leaf: conflicting
+            # product evidence cannot become a resolved category by repetition.
+            return "", CATEGORY_CONFIDENCE_FEED_DEFAULT
         if not path.startswith("beauty/") or (fallback in leaves and path != fallback):
             return fallback, CATEGORY_CONFIDENCE_FEED_DEFAULT
         return path, confidence
 
     ptype = " ".join(str(product_type or "").casefold().split())
+    if re.sub(r"[^a-z0-9]", "", ptype) in _AMBIGUOUS_PRODUCT_TYPE_KEYS:
+        # Shared regexes currently recognize only one half of these merchant
+        # alternatives. One regex hit is not a unique class assertion.
+        return "", CATEGORY_CONFIDENCE_FEED_DEFAULT
     # Exact merchant product types observed on the primary retailer feed. Lip
     # Scrub belongs to the existing lip-care leaf despite also matching the
     # generic exfoliator regex; Sun Protection names sunscreen, not an SPF claim
@@ -1291,7 +1324,10 @@ def _resolve_category(*, product_type: Optional[str], title: Optional[str], flag
 
 def product_category_path(*, title: Optional[str], product_type: Optional[str], fallback: str) -> str:
     """Path-only wrapper for the review-only repair planner; no second classifier."""
-    return _resolve_category(product_type=product_type, title=title, flag_path=fallback)[0]
+    path = _resolve_category(product_type=product_type, title=title, flag_path=fallback)[0]
+    # The repair planner expresses abstention as no change, never a blank-path
+    # update. Fresh mapping consumes the unresolved result directly above.
+    return path or fallback
 
 
 def shopify_product_to_record(

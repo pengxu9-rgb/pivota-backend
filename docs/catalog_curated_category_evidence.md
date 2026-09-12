@@ -24,8 +24,9 @@ Two deliberate differences from #2158 resolve independently measured defects:
    storefront default such as `beauty/skincare` is not evidence that every item is
    skincare. An unambiguous merchant `Brush` type may resolve to `beauty/tools/brush`.
    The old area veto would preserve the measured MISSHA error. An explicitly supplied
-   taxonomy leaf remains protected; non-beauty feed routing is unchanged.
-2. **Titles have only two bounded exceptions**, with confidence 0.8. A tool noun
+   taxonomy leaf remains protected unless the direct contradiction guard below
+   refuses the evidence; non-beauty feed routing is unchanged.
+2. **Titles assign categories only through two bounded exceptions**, with confidence 0.8. A tool noun
    suffix such as Layering Fit Brush or Foundation Brush #101 may resolve a row whose
    type is broad/unclassified. Formula contexts, included applicators and joined
    bundles (`with`, `and`, `+`, `&`, `/`) do not qualify. A specific competing formula
@@ -47,4 +48,36 @@ The snapshot planner can separately challenge a known wrong leaf with
 the original merchant title, product_type, source_url and observed_at. It records
 that evidence plus the expected old path, and never proposes a coarse downgrade.
 This is still a review-only manifest: it does not update any database row. Ordinary
-feed mapping and the shallow backfill continue to protect existing specific leaves.
+feed mapping and the shallow backfill protect existing specific leaves except for
+the explicit primary-mapper evidence refusals described below.
+
+## Contradictory merchant types
+
+The 2026-09-12 public source review found Stila's **Blush & Bronze Hydro-Blur Cheek
+Duo** labelled `Eye Liner`, and **Stay All Day Chroma-Flash Liquid Eye Liner** labelled
+`Blush`. Their own titles and descriptions establish the contradiction; trusting
+the type would deepen a broad category to the wrong leaf.
+
+The mapper now refuses a narrow conflict between explicit eyeliner and cheek
+product nouns in the title and the competing merchant type. This is an abstention,
+not title-based reassignment. Even repeating the wrong leaf as the caller's category
+does not make the product resolved. Fresh mapping leaves `category_path` unresolved;
+primary plan acceptance blocks it. Title-only shade labels such as `Blush` are not
+sufficient contradiction evidence. A hybrid explicitly naming both families keeps
+its supported type. Serum Concealer, Sun Serum and Lip & Cheek Cream also retain
+their valid merchant categories. Cross-sell/body copy is not a category assignment
+input to this guard.
+
+`Lip Color` and `Lip Colour` are generic shelves, not proof of lipstick. The captured
+Flower **Plump Up Gloss Stick** demonstrates the distinction: its own description
+calls it a gloss-balm hybrid. Literal merchant alternatives `Lip Gloss/Oil` and
+`Lip Gloss (Lip Tint)` also abstain even when legacy regexes recognize just one part.
+These inputs cannot gain a specific category through first-match ordering.
+
+The repair wrapper represents these abstentions as **no change**. It never proposes
+an empty replacement category. Exact-product cleanup manifests require their own
+review of source URL/native identity, expected old category and update timestamp;
+no category change implies a currency conversion or market migration. Source
+fixtures and regression controls are in
+`tests/fixtures/category_type_conflicts_public_observations.json` and
+`tests/services/test_curated_category_evidence.py`.

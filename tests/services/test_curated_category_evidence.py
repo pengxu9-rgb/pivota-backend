@@ -92,3 +92,61 @@ def test_manual_records_without_lane_confidence_retain_legacy_default():
     row = ing._build_pdp_insert(pdp_payload=ing._build_pdp_payload(rec), offers=rec["offers"], source_jsonl=None,
                                 seller={"merchant_id":"m","platform":"shopify"})
     assert row["category_confidence"] == ing.DEFAULT_CATEGORY_CONFIDENCE
+
+
+@pytest.mark.parametrize("observation_index", [0, 1, 2])
+def test_captured_merchant_type_contradictions_cannot_publish_a_specific_category(observation_index):
+    import json
+    from pathlib import Path
+    from scripts.plan_curated_category_repair import plan_category_repair
+    from services.catalog_enrichment_agent.primary_ingestion import inspect_primary_plan
+
+    observations = json.loads((Path(__file__).parents[1] / "fixtures/category_type_conflicts_public_observations.json").read_text())
+    assert len(observations) == 3
+    for observed in [observations[observation_index]]:
+        for shelf in ("beauty", "beauty/makeup"):
+            rec = feed.shopify_product_to_record(observed["product"], domain=observed["domain"],
+                                                category_path=shelf, currency="USD", emit_native_variants=True)
+            assert rec["pdp"]["category_path"] is None
+            assert rec["pdp"]["category_resolution_status"] == "unresolved"
+            planned = ing.ingest_validated_jsonl([rec])
+            assert inspect_primary_plan(planned)["status"] == "blocked"
+            assert planned["pdps"][0]["pdp_lifecycle_stage"] == "draft"
+            assert plan_category_repair([{"product_key": "review", "title": observed["product"]["title"],
+                                         "product_type": observed["product"]["product_type"],
+                                         "category_path": shelf}])["changes"] == []
+
+
+@pytest.mark.parametrize("ptype", ["Lip Gloss/Oil", "Lip Gloss / Oil", "Lip Gloss (Lip Tint)", "Lip Gloss / Lip Tint"])
+def test_explicit_competing_lip_types_cannot_pass_as_one_regex_hit(ptype):
+    rec = record(title="Dewy Glow Lip Gloss", product_type=ptype)
+    assert rec["pdp"]["category_resolution_status"] == "unresolved"
+
+
+@pytest.mark.parametrize("title,ptype,want", [
+    ("Convertible Color Dual Lip & Cheek Cream", "Blush", "beauty/makeup/face/blush"),
+    ("Liquid Eyeliner & Cream Blush Duo", "Eye Liner", "beauty/makeup/eye/eyeliner"),
+    ("Eye Liner & Cream Blush Duo", "Eye Liner", "beauty/makeup/eye/eyeliner"),
+    ("Liquid Eye Liner + Cheek Palette", "Blush", "beauty/makeup/face/blush"),
+    ("Liquid Eyeliner & Cream Blush Duo", "Blush", "beauty/makeup/face/blush"),
+    ("Get Real Serum Concealer", "Face Concealer", "beauty/makeup/face/concealer"),
+    ("Collagen Sun Serum", "chemical-sunscreen", "beauty/skincare/sun/sunscreen"),
+    ("Blush", "Eye Liner", "beauty/makeup/eye/eyeliner"),
+    ("Stay All Day Eyeliner in Blush", "Eye Liner", "beauty/makeup/eye/eyeliner"),
+    ("Liquid Eyeliner", "Eye Liner", "beauty/makeup/eye/eyeliner"),
+])
+def test_specific_types_and_legitimate_hybrids_keep_their_supported_category(title, ptype, want):
+    assert record(title=title, product_type=ptype)["pdp"]["category_path"] == want
+
+
+def test_repeating_wrong_leaf_cannot_override_direct_product_contradiction():
+    rec = record(title="Stay All Day Chroma-Flash Liquid Eye Liner", product_type="Blush", category="beauty/makeup/face/blush")
+    assert rec["pdp"]["category_resolution_status"] == "unresolved"
+
+
+def test_cross_sell_body_does_not_reclassify_the_actual_product():
+    product = {"title": "Liquid Eyeliner", "product_type": "Eye Liner", "handle": "liner", "vendor": "Stila",
+               "body_html": "<p>Complete the look with our Cream Blush and Cheek Duo.</p>",
+               "variants": [{"price": "20", "available": True}]}
+    rec = feed.shopify_product_to_record(product, domain="stilacosmetics.com", category_path="beauty", currency="USD")
+    assert rec["pdp"]["category_path"] == "beauty/makeup/eye/eyeliner"
