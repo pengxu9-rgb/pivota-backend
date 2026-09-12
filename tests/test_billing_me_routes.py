@@ -975,3 +975,39 @@ def test_checkout_does_not_swallow_unrelated_stripe_errors(monkeypatch) -> None:
         )
     assert type(exc.value).__name__ == "InvalidRequestError"
     assert fake.v1.customers.created == 0                       # no recreate for unrelated errors
+
+
+def test_fractional_credit_fields_remain_json_numbers(fake_db, monkeypatch):
+    from decimal import Decimal
+    from services.billing import monthly_brand_statements_service as statements
+    async def snapshot(merchant_id):
+        return {'consumed_credits': Decimal('0.00552'), 'available_credits': Decimal('0.99448'),
+                'purchased_credits': Decimal('0.99448'), 'period_start': date(2026, 9, 1)}
+    monkeypatch.setattr(statements, 'current_period_usage_snapshot', snapshot)
+    client, app = _build_client()
+    try:
+        response = client.get('/api/billing/me/current-period')
+    finally:
+        app.dependency_overrides.clear()
+    assert response.status_code == 200
+    body = response.json()
+    assert type(body['consumed_credits']) is float
+    assert body['consumed_credits'] == 0.00552
+    assert body['available_credits'] == body['purchased_credits'] == 0.99448
+    assert body['period_start'] == '2026-09-01'
+
+
+def test_fractional_statement_credits_remain_json_numbers(fake_db, monkeypatch):
+    from decimal import Decimal
+    from services.billing import monthly_brand_statements_service as statements
+    async def rows(**kw):
+        return [{'overage_credits': Decimal('0.0672'), 'status': 'frozen'}]
+    monkeypatch.setattr(statements, 'list_merchant_statement_rows', rows)
+    client, app = _build_client()
+    try:
+        response = client.get('/api/billing/me/statements')
+    finally:
+        app.dependency_overrides.clear()
+    assert response.status_code == 200
+    value = response.json()['statements'][0]['overage_credits']
+    assert type(value) is float and value == 0.0672

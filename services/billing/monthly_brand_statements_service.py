@@ -49,12 +49,12 @@ async def current_period_usage_snapshot(merchant_id: str) -> dict[str, Any]:
         from services import merchant_credit_balance_service
 
         wallet = await merchant_credit_balance_service.get_balance(merchant_id)
-        purchased_credits = int(wallet.get("purchased_credits") or 0)
+        purchased_credits = Decimal(str(wallet.get("purchased_credits") or 0))
         # `credits` is the total spendable balance = remaining monthly allowance
         # + purchased top-ups (debits drain allowance first). It is NOT additive
         # with `allowance_credits`/`consumed_credits`, which describe allowance
         # usage; it is the actual number of credits the merchant can spend now.
-        available_credits = int(wallet.get("credits") or 0)
+        available_credits = Decimal(str(wallet.get("credits") or 0))
     except Exception:
         # Wallet read is a display enrichment; never fail the snapshot on it.
         purchased_credits = 0
@@ -64,6 +64,7 @@ async def current_period_usage_snapshot(merchant_id: str) -> dict[str, Any]:
         merchant_id=merchant_id,
         period_start=period_start,
         period_end=period_end,
+        live_only=True,
     )
     if not subscription:
         return {
@@ -157,7 +158,7 @@ async def list_merchant_statement_rows(
                 "calendar_month": _row_get(row, "calendar_month"),
                 "tier_name": _row_get(row, "tier_name"),
                 "subscription_revenue_usd_cents": subscription_revenue_raw_cents,
-                "overage_credits": int(_row_get(row, "overage_credits") or 0),
+                "overage_credits": Decimal(str(_row_get(row, "overage_credits") or 0)),
                 "overage_revenue_usd_cents": overage_revenue_raw_cents,
                 "status": _row_get(row, "status"),
                 "frozen_at": _row_get(row, "frozen_at"),
@@ -238,7 +239,7 @@ async def assemble_for_month(merchant_id: str, calendar_month: date) -> int:
         )
         credits_consumed = max(
             0,
-            -sum(int(_row_get(row, "credits_delta") or 0) for row in credit_events),
+            -sum(Decimal(str(_row_get(row, "credits_delta") or 0)) for row in credit_events),
         )
         subscription = await _latest_active_subscription(
             merchant_id=merchant_id,
@@ -485,7 +486,7 @@ async def _period_consumed_credits_from_usage(
         period_start=period_start,
         period_end=period_end,
     )
-    return max(0, -sum(int(_row_get(row, "credits_delta") or 0) for row in rows))
+    return max(0, -sum(Decimal(str(_row_get(row, "credits_delta") or 0)) for row in rows))
 
 
 async def _latest_active_subscription(
@@ -493,6 +494,7 @@ async def _latest_active_subscription(
     merchant_id: str,
     period_start: date,
     period_end: date,
+    live_only: bool = False,
 ) -> Any | None:
     # If a brand has multiple active subscription rows in a month, prefer the
     # latest period/start timestamp. That approximates upgrades until PR #6
@@ -509,6 +511,11 @@ async def _latest_active_subscription(
         JOIN subscription_plans sp ON sp.id = us.plan_id
         WHERE us.merchant_id = :merchant_id
           AND us.status IN ('active', 'trialing', 'past_due')
+          AND (NOT :live_only OR (
+            us.status IN ('active', 'trialing') AND sp.status = 'active'
+            AND (us.current_period_start IS NULL OR us.current_period_start <= NOW())
+            AND (us.current_period_end IS NULL OR us.current_period_end > NOW())
+          ))
           AND (us.current_period_start IS NULL OR us.current_period_start < :period_end)
           AND (us.current_period_end IS NULL OR us.current_period_end > :period_start)
         -- Prefer the richest active plan when a merchant holds more than one
@@ -525,6 +532,7 @@ async def _latest_active_subscription(
         """,
         {
             "merchant_id": merchant_id,
+            "live_only": live_only,
             "period_start": period_start,
             "period_end": period_end,
         },

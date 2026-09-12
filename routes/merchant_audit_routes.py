@@ -98,16 +98,13 @@ from services.merchant_narrative_builder import (
 )
 from services.merchant_narrative_builder import repair_stored_narrative
 from services.report_summary_builder import build_report_summary
-from services.provider_credit_rates import credits_for_tokens
+from services.merchant_measured_generation import (generate_measured_text, run_measured_generation, MeteringTemporarilyUnavailable)
 from services.report_deck_builder import (
-    DECK_LLM_PROVIDER,
-    DECK_TOKEN_PRICE_MULTIPLE,
     build_report_deck,
     generate_executive_summary,
 )
 from services.llm_providers.deepseek_probe import (
     DeepseekProbeError,
-    answer_grounded_question,
 )
 from utils.auth import get_current_merchant
 from utils.logger import logger
@@ -2647,7 +2644,7 @@ async def run_merchant_url_audit(
                 **({"consumer_capture_plan": consumer_plan, "consumer_capture_quote": consumer_quote,
                     "debited": [{"kind": "audit", "amount": metered_credits,
                                  "replay": bool(debit_result.get("replay")),
-                                 "purchased_credits": int((debit_result.get("debit") or {}).get("purchased_credits_debited") or 0)}]}
+                                 "purchased_credits": float((debit_result.get("debit") or {}).get("purchased_credits_debited") or 0)}]}
                    if consumer_plan else {}),
             }
         },
@@ -2706,7 +2703,7 @@ async def _merchant_audit_context(merchant_id: str) -> Dict[str, Any]:
         tier = str(bal.get("plan_tier") or "free").lower()
         ctx["plan_tier"] = tier
         ctx["is_paid"] = tier != "free"
-        ctx["credits"] = int(bal.get("credits") or 0)
+        ctx["credits"] = float(bal.get("credits") or 0)
     except Exception:  # noqa: BLE001 - context is advisory; never block the GET
         logger.warning("merchant_audit_context: balance lookup failed", exc_info=True)
     try:
@@ -3099,8 +3096,7 @@ async def export_url_audit_deck(
       - Free tier: a single watermarked preview slide (cover + score). No LLM
         runs and nothing is billed — the preview is the distribution hook.
       - Paid tier: the full deck. Its one LLM step (the executive-summary
-        slide) bills on ACTUAL token usage at DECK_TOKEN_PRICE_MULTIPLE (1.6x
-        measured token COGS -> credits, ceil, min 1). When the LLM is
+        slide) bills measured model cost × 1.6 as fractional credits. When the LLM is
         unavailable the deck ships without that slide and costs 0 credits —
         never charge for work that didn't run.
       - Idempotency: one charge per run (key report_deck:{run_id}); re-exports
@@ -3143,73 +3139,32 @@ async def export_url_audit_deck(
     paid = await merchant_is_paid_tier(merchant_id)
     billing_mode = "preview_only"
     credits_charged = 0
-    executive_bullets = None
-    llm_tokens = None
-
+    deck = None
     if paid:
         billing_mode = "included"
-        # The deck's only LLM step. Failure -> deck ships without the slide,
-        # nothing billed (never charge for work that didn't run).
+        def render_summary(result):
+            nonlocal deck
+            deck = build_report_deck(summary, executive_bullets=result["bullets"], preview_only=False)
+            if deck is None:
+                raise ValueError("Deck renderer unavailable")
         try:
-            generated = await generate_executive_summary(summary)
-        except Exception:  # noqa: BLE001
-            logger.warning("deck executive summary failed", exc_info=True)
-            generated = None
-        if generated:
-            executive_bullets, in_tok, out_tok = generated
-            llm_tokens = (in_tok, out_tok)
-
-    # Render BEFORE any debit: if python-pptx is missing this 503s with no
-    # money moved ("never charge for work that didn't run" applies to the
-    # deck itself, not just the LLM step — review fix, PR #1411 round 2).
-    deck = build_report_deck(
-        summary,
-        executive_bullets=executive_bullets,
-        preview_only=not paid,
-    )
-    if deck is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={
-                "code": "deck_renderer_unavailable",
-                "message": "Deck export isn't available on this deployment yet.",
-            },
-        )
-
-    if paid and llm_tokens:
-        in_tok, out_tok = llm_tokens
-        credits, usd_cogs = credits_for_tokens(
-            DECK_LLM_PROVIDER,
-            input_tokens=in_tok,
-            output_tokens=out_tok,
-            multiple=DECK_TOKEN_PRICE_MULTIPLE,
-        )
-        if credits > 0:
-            try:
-                result = await consume_credits(
-                    merchant_id,
-                    "report_deck_export",
-                    f"report_deck:{run_id}",
-                    credits=credits,
-                    usd_cogs=usd_cogs,
-                )
-            except InsufficientCreditsError:
-                # NOTE: fires for merchants the balance layer treats as
-                # non-overage; plan-tier merchants may instead accrue overage
-                # per the billing system's paid-tier semantics.
-                raise HTTPException(
-                    status_code=status.HTTP_402_PAYMENT_REQUIRED,
-                    detail={
-                        "code": "insufficient_credits",
-                        "message": (
-                            "Not enough credits to export the deck — top up "
-                            "or upgrade your plan."
-                        ),
-                        "credits_required": credits,
-                    },
-                )
+            result = await run_measured_generation(
+                merchant_id=merchant_id, operation_key=f"report_deck_v2:{run_id}",
+                operation_type="report_deck_export",
+                generate=lambda: generate_executive_summary(summary, measured=True),
+                prepare=render_summary,
+            )
             billing_mode = "metered"
-            credits_charged = int(result.get("credits") or 0)
+            credits_charged = result["credits_charged"]
+        except InsufficientCreditsError:
+            raise HTTPException(status_code=402, detail={"code": "insufficient_credits", "max_credits": 1, "message": "Not enough credits for the actual usage. No credits charged."})
+        except Exception:
+            logger.warning("Measured deck summary unavailable; exporting without AI summary", exc_info=True)
+            deck = None
+    if deck is None:
+        deck = build_report_deck(summary, executive_bullets=None, preview_only=not paid)
+    if deck is None:
+        raise HTTPException(status_code=503, detail={"code": "deck_renderer_unavailable", "message": "Deck export is unavailable. No credits charged."})
     filename = f"pivota-ai-readiness-{run_id}.pptx"
     return Response(
         content=deck,
@@ -4336,74 +4291,25 @@ async def answer_merchant_audit_question(
     context.update(recovery)
     context = await _apply_actions_paywall(context, merchant_id)
 
-    # Cost gate. Price one ungrounded Deepseek probe; gate free tiers up-front so
-    # we never do the work for a merchant who can't pay. Paid tiers run on
-    # overage (like the audit path), so they skip the pre-flight block.
-    cost_credits, _ = estimate_probe_credits(_ASK_PROBE_SPEC)
-    is_paid = await merchant_is_paid_tier(merchant_id)
-    if cost_credits > 0 and not is_paid:
-        balance = await get_balance(merchant_id)
-        if int(balance.get("credits") or 0) < cost_credits:
-            raise HTTPException(
-                status_code=402,
-                detail="Not enough credits to ask a question. Top up to continue.",
-            )
-
     context_json = json.dumps(context, default=str)[:_ASK_CONTEXT_MAX_CHARS]
     user_message = (
         f"CONTEXT:\n{context_json}\n\nQUESTION: {body.question.strip()}\n\n"
         'Answer as JSON: {"answer": "..."}.'
     )
-
+    idem = "ask_v2:" + hashlib.sha256(
+        json.dumps([merchant_id, body.run_id, body.product_key, body.question.strip()]).encode()
+    ).hexdigest()
     try:
-        answer = await answer_grounded_question(
-            system_prompt=_ASK_SYSTEM_PROMPT,
-            user_message=user_message,
+        result = await run_measured_generation(
+            merchant_id=merchant_id, operation_key=idem, operation_type="ask",
+            generate=lambda: generate_measured_text(system_prompt=_ASK_SYSTEM_PROMPT, user_message=user_message),
         )
-    except DeepseekProbeError as exc:
-        # No charge on failure — the merchant gets nothing, so they pay nothing.
-        logger.warning("merchant audit ask failed (run=%s): %s", body.run_id, exc)
-        raise HTTPException(
-            status_code=503,
-            detail="Couldn't generate an answer right now — please try again.",
-        )
-
-    if not answer:
-        answer = (
-            "I don't have enough in this audit to answer that confidently. Try "
-            "asking about your discovery results, the competitors AI named, or "
-            "where AI sends buyers — or re-run the audit for fresh data."
-        )
-
-    # Charge on success. Idempotent on (merchant, run, product, question) so a
-    # retry of the same question replays the debit rather than double-charging.
-    charged = 0
-    if cost_credits > 0:
-        idem = "ask:" + hashlib.sha256(
-            "|".join(
-                [
-                    merchant_id,
-                    body.run_id,
-                    body.product_key or "",
-                    body.question.strip(),
-                ]
-            ).encode("utf-8")
-        ).hexdigest()
-        try:
-            result = await consume_credits(
-                merchant_id, "prompt", idem, probes=_ASK_PROBE_SPEC,
-            )
-            charged = int(result.get("credits") or 0)
-        except InsufficientCreditsError:
-            # Rare race (balance dropped after the pre-flight gate, or a paid
-            # tier with no overage room). The answer is already produced — don't
-            # punish the merchant for our race; log and return it uncharged.
-            logger.warning(
-                "merchant audit ask: debit raced insufficient (merchant=%s run=%s)",
-                merchant_id, body.run_id,
-            )
-
-    return {"answer": answer, "grounded": True, "credits_charged": charged}
+    except InsufficientCreditsError:
+        raise HTTPException(status_code=402, detail="Not enough credits for the actual usage. No credits charged; top up to continue.")
+    except Exception:
+        logger.warning("merchant audit measured ask failed run=%s", body.run_id, exc_info=True)
+        raise HTTPException(status_code=503, detail="Couldn't generate an answer. No credits were charged; please try again.")
+    return {**result, "grounded": True}
 
 
 # ── "Start here" actions — turn a prioritized_actions move into a real follow-up ─
@@ -4411,7 +4317,7 @@ async def answer_merchant_audit_question(
 # visible in the plan, markable done — the hook a future service-connection picks
 # up to auto-distribute) and (2) best-effort drafts the deliverable via grounded
 # Deepseek (the comparison copy / outreach template), so Pivota does the "create"
-# part. Drafting is metered (category="prompt", ~1 credit, charge-on-success); the
+# part. Drafting is metered on actual usage (up to 1 credit, charge-on-success); the
 # task is always created even if drafting is skipped (no credits) or fails.
 
 _ACTION_DRAFT_SYSTEM_PROMPT = (
@@ -4557,127 +4463,121 @@ async def start_merchant_audit_action(
     lever = "outreach" if is_outreach else ((body.growth_phase or "audit_action").strip() or "audit_action")
     title = body.headline.strip()[:300]
 
-    existing = await find_pending_supersede_candidates(
-        merchant_id=merchant_id, lever=lever, title=title,
-    )
-    if existing:
-        ev = existing[0].get("evidence_jsonb") or existing[0].get("evidence") or {}
-        prior_draft = ev.get("draft") if isinstance(ev, dict) else None
-        return {
-            "status": "exists",
-            "task_id": existing[0].get("task_id"),
-            "draft": prior_draft,
-            "placement": (
-                ev.get("placement") if isinstance(ev, dict) else None
-            ) or _action_placement(
-                report,
-                _action_product_key_by_title(report, body.sku_title),
-                is_outreach=is_outreach, channel_host=body.channel_host,
-            ),
-            "credits_charged": 0,
-        }
+    async with database.transaction():
+        await database.execute("SELECT pg_advisory_xact_lock(hashtextextended(:key,0))", {
+            "key": "audit-action:" + json.dumps([merchant_id, lever, title]),
+        })
+        existing = await find_pending_supersede_candidates(
+            merchant_id=merchant_id, lever=lever, title=title,
+        )
+        existing_task_id = None
+        if existing:
+            ev = existing[0].get("evidence_jsonb") or existing[0].get("evidence") or {}
+            prior_draft = ev.get("draft") if isinstance(ev, dict) else None
+            existing_task_id = existing[0].get("task_id")
+            if prior_draft:
+                return {
+                    "status": "exists",
+                    "task_id": existing[0].get("task_id"),
+                    "draft": prior_draft,
+                    "placement": (
+                        ev.get("placement") if isinstance(ev, dict) else None
+                    ) or _action_placement(
+                        report,
+                        _action_product_key_by_title(report, body.sku_title),
+                        is_outreach=is_outreach, channel_host=body.channel_host,
+                    ),
+                    "credits_charged": 0,
+                }
 
-    # Metered draft of the deliverable, grounded in this action's SKU.
-    # Billing invariant (charged iff delivered): CHARGE FIRST, generate
-    # second, refund if generation fails. The previous order (generate →
-    # charge, swallowing InsufficientCreditsError) handed out free drafts
-    # whenever the balance moved between the pre-check and the charge.
-    draft: Optional[str] = None
-    charged = 0
-    product_key = _action_product_key_by_title(report, body.sku_title)
-    context = _build_ask_context(report, product_key)
-    placement = _action_placement(
-        report, product_key,
-        is_outreach=is_outreach, channel_host=body.channel_host,
-    )
-    cost_credits, _ = estimate_probe_credits(_ASK_PROBE_SPEC)
-    can_draft = bool(context)
-    draft_idem = "action_draft:" + hashlib.sha256(
-        "|".join([merchant_id, body.run_id, title, body.channel_host or ""]).encode("utf-8")
-    ).hexdigest()
-    if can_draft and cost_credits > 0:
-        try:
-            res = await consume_credits(
-                merchant_id, "prompt", draft_idem, probes=_ASK_PROBE_SPEC,
-            )
-            charged = int(res.get("credits") or 0)
-        except InsufficientCreditsError:
-            can_draft = False  # can't pay for a draft — still create the task
-
-    if can_draft:
-        ctx_json = json.dumps(context, default=str)[:_ASK_CONTEXT_MAX_CHARS]
-        if is_outreach:
-            system_prompt = _OUTREACH_SYSTEM_PROMPTS[
-                _outreach_kind(body.channel_lever, body.channel_type)
-            ]
-            user_message = (
-                f"CONTEXT (the merchant's audit):\n{ctx_json}\n\n"
-                + (f"TARGET CHANNEL: {body.channel_host}\n" if body.channel_host else "")
-                + (f"CHANNEL TYPE: {body.channel_type}\n" if body.channel_type else "")
-                + (f"SHOPPER QUERY: {body.query.strip()}\n" if body.query else "")
-                + 'Draft the outreach to send. Return JSON {"answer": "..."}.'
-            )
-        else:
-            system_prompt = _ACTION_DRAFT_SYSTEM_PROMPT
-            user_message = (
-                f"CONTEXT (the merchant's audit):\n{ctx_json}\n\nACTION: {title}\n"
-                + (f"FIRST MOVE: {body.first_move.strip()}\n" if body.first_move else "")
-                + 'Draft the deliverable to execute this action. Return JSON {"answer": "..."}.'
-            )
-        try:
-            draft = await answer_grounded_question(
-                system_prompt=system_prompt, user_message=user_message,
-            )
-        except DeepseekProbeError as exc:
-            logger.warning("action draft failed (run=%s): %s", body.run_id, exc)
-            draft = None
-        if not draft and charged > 0:
-            # Charged but nothing delivered — refund (idempotent per action).
+        # Persist the measured draft and debit together; failures need no refund.
+        draft: Optional[str] = None
+        charged = 0
+        product_key = _action_product_key_by_title(report, body.sku_title)
+        context = _build_ask_context(report, product_key)
+        placement = _action_placement(
+            report, product_key,
+            is_outreach=is_outreach, channel_host=body.channel_host,
+        )
+        can_draft = bool(context)
+        draft_idem = "action_draft_v2:" + hashlib.sha256(
+            "|".join([merchant_id, body.run_id, title, body.channel_host or ""]).encode("utf-8")
+        ).hexdigest()
+        if can_draft:
+            ctx_json = json.dumps(context, default=str)[:_ASK_CONTEXT_MAX_CHARS]
+            if is_outreach:
+                system_prompt = _OUTREACH_SYSTEM_PROMPTS[
+                    _outreach_kind(body.channel_lever, body.channel_type)
+                ]
+                user_message = (
+                    f"CONTEXT (the merchant's audit):\n{ctx_json}\n\n"
+                    + (f"TARGET CHANNEL: {body.channel_host}\n" if body.channel_host else "")
+                    + (f"CHANNEL TYPE: {body.channel_type}\n" if body.channel_type else "")
+                    + (f"SHOPPER QUERY: {body.query.strip()}\n" if body.query else "")
+                    + 'Draft the outreach to send. Return JSON {"answer": "..."}.'
+                )
+            else:
+                system_prompt = _ACTION_DRAFT_SYSTEM_PROMPT
+                user_message = (
+                    f"CONTEXT (the merchant's audit):\n{ctx_json}\n\nACTION: {title}\n"
+                    + (f"FIRST MOVE: {body.first_move.strip()}\n" if body.first_move else "")
+                    + 'Draft the deliverable to execute this action. Return JSON {"answer": "..."}.'
+                )
             try:
-                await refund_credits(
-                    merchant_id, "prompt", charged,
-                    source_event_id=f"refund:{draft_idem}",
+                result = await run_measured_generation(
+                    merchant_id=merchant_id, operation_key=draft_idem, operation_type="action_draft",
+                    generate=lambda: generate_measured_text(system_prompt=system_prompt, user_message=user_message),
                 )
-                charged = 0
-            except Exception:  # noqa: BLE001 — surface, don't mask the miss
-                logger.exception(
-                    "action draft refund failed merchant_id=%s run=%s — "
-                    "RECONCILE MANUALLY", merchant_id, body.run_id,
-                )
+                draft = result["answer"]
+                charged = result["credits_charged"]
+            except MeteringTemporarilyUnavailable:
+                raise HTTPException(status_code=503, detail="Billing is being updated. No credits charged; retry shortly.")
+            except InsufficientCreditsError:
+                draft = None  # The merchant can still create a follow-up without a draft.
+            except Exception:
+                logger.warning("measured action draft failed run=%s", body.run_id, exc_info=True)
+                draft = None
 
-    task_body = (body.first_move or "").strip() or title
-    if draft:
-        task_body = (f"{task_body}\n\n— Pivota draft —\n{draft}")[:4000]
+        task_body = (body.first_move or "").strip() or title
+        if draft:
+            task_body = (f"{task_body}\n\n— Pivota draft —\n{draft}")[:4000]
 
-    task_id = await record_task_created(
-        merchant_id=merchant_id,
-        title=title,
-        body=task_body,
-        severity="high",
-        lever=lever,
-        parent_audit_run_id=body.run_id,
-        evidence={
-            "kind": "outreach" if is_outreach else "audit_action",
-            "headline": title,
-            "first_move": body.first_move,
-            "growth_phase": body.growth_phase,
-            "primary_gap": body.primary_gap,
-            "sku_title": body.sku_title,
-            "product_key": product_key,
-            "channel_host": body.channel_host,
-            "channel_lever": body.channel_lever,
-            "channel_type": body.channel_type,
-            "query": body.query,
+        task_evidence = {
+                "kind": "outreach" if is_outreach else "audit_action",
+                "headline": title,
+                "first_move": body.first_move,
+                "growth_phase": body.growth_phase,
+                "primary_gap": body.primary_gap,
+                "sku_title": body.sku_title,
+                "product_key": product_key,
+                "channel_host": body.channel_host,
+                "channel_lever": body.channel_lever,
+                "channel_type": body.channel_type,
+                "query": body.query,
+                "draft": draft,
+                "placement": placement,
+            }
+        if existing_task_id:
+            task_id = existing_task_id
+            if draft:
+                updated = await database.fetch_one("""UPDATE merchant_tasks
+                    SET body=:body, evidence_jsonb=COALESCE(evidence_jsonb,'{}'::jsonb) || CAST(:evidence AS JSONB), updated_at=NOW()
+                    WHERE task_id=:task_id AND merchant_id=:merchant_id AND status='pending'
+                    RETURNING task_id""", {"body": task_body, "evidence": json.dumps(task_evidence, default=str),
+                    "task_id": task_id, "merchant_id": merchant_id})
+                if not updated:
+                    raise HTTPException(status_code=500, detail="Could not save the draft to the existing task.")
+        else:
+            task_id = await record_task_created(
+                merchant_id=merchant_id, title=title, body=task_body, severity="high",
+                lever=lever, parent_audit_run_id=body.run_id, evidence=task_evidence,
+            )
+        if not task_id:
+            raise HTTPException(status_code=500, detail="Could not create the follow-up task.")
+        return {
+            "status": "success",
+            "task_id": task_id,
             "draft": draft,
             "placement": placement,
-        },
-    )
-    if not task_id:
-        raise HTTPException(status_code=500, detail="Could not create the follow-up task.")
-    return {
-        "status": "success",
-        "task_id": task_id,
-        "draft": draft,
-        "placement": placement,
-        "credits_charged": charged,
-    }
+            "credits_charged": charged,
+        }
