@@ -1481,6 +1481,46 @@ async def apply_ingest_plan(
     batch_label: str,
     db: Any = None,
     batch: bool = False,
+    primary_readiness: bool = False,
+) -> Dict[str, Any]:
+    """Persist an ingest plan, optionally handing curated rows to serving policy.
+
+    Curated CLI/queue callers select primary_readiness explicitly. Every other
+    existing door retains the original counts and best-effort persistence path.
+    A failed handoff leaves its persisted counts on the typed exception so an
+    operator can retry the same identities without calling a partial run done.
+    """
+    from db.database import database as global_db
+    from services.catalog_enrichment_agent.primary_ingestion import require_primary_plan, require_primary_apply
+
+    preflight = require_primary_plan(plan) if primary_readiness else None
+    counts = await _apply_ingest_plan(plan, batch_label=batch_label, db=db, batch=batch)
+    if not primary_readiness:
+        return counts
+    from services.catalog_enrichment_agent.primary_readiness import (
+        PrimaryReadinessIncomplete, materialize_primary_readiness,
+    )
+    try:
+        require_primary_apply(preflight, counts)
+        if int(counts.get("seeds") or 0) != len(plan.get("seeds") or []):
+            raise ValueError("incomplete_primary_seed_writes")
+    except Exception as exc:
+        report = {"status": "failed", "failed_stage": "persistence", "error": str(exc)[:300]}
+        raise PrimaryReadinessIncomplete(report, counts) from exc
+    try:
+        counts["primary_readiness"] = await materialize_primary_readiness(plan, db=db or global_db)
+    except PrimaryReadinessIncomplete as exc:
+        exc.persisted_counts = dict(counts)
+        raise
+    return counts
+
+
+async def _apply_ingest_plan(
+    plan: Dict[str, Any],
+    *,
+    batch_label: str,
+    db: Any = None,
+    batch: bool = False,
 ) -> Dict[str, int]:
     """Execute an ingest plan (from `ingest_validated_jsonl`) against the DB in FK
     order. Returns counts. Per-row failures are logged and skipped (never abort the

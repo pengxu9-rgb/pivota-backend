@@ -97,6 +97,9 @@ async def install_job(db, monkeypatch, planned, *, batch=False, records=None):
     real = writer.apply_ingest_plan
 
     async def apply(*args, **kwargs):
+        # These legacy fixtures isolate writer/SKU/queue SQL. The fresh primary
+        # handoff is exercised without mocks in test_curated_primary_readiness_postgres.
+        kwargs["primary_readiness"] = False
         return await real(*args, batch=batch, **kwargs)
 
     monkeypatch.setattr(worker, "apply_ingest_plan", apply)

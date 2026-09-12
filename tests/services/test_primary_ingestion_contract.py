@@ -132,6 +132,7 @@ async def test_absent_gtin_is_valid_but_success_never_claims_search_or_shared_id
     assert outcome["primary_ingestion"]["primary_search_verified"] is False
     assert outcome["primary_ingestion"]["shared_identity_verified"] is False
     assert all(p["gtin"] is None for p in plan["pdps"])
+    assert worker.apply_ingest_plan.await_args.kwargs["primary_readiness"] is True
 
 
 def test_natural_key_sku_adoption_can_reduce_rows_without_losing_offers():
@@ -188,3 +189,22 @@ def test_direct_jsonl_missing_category_cannot_claim_resolved_or_published():
     row = ingestion.ingest_validated_jsonl([record])["pdps"][0]
     assert row["pdp_lifecycle_stage"] == "draft"
     assert json.loads(row["product_payload"])["enrichment_meta"]["category_resolution_status"] == "unresolved"
+
+
+def test_curated_cli_requires_readiness_handoff_and_preserves_database_scope(monkeypatch):
+    from types import SimpleNamespace
+    from db import database as db_module
+    records = captured_records()
+    fetch = AsyncMock(return_value=batch(records))
+    fetch.last_vendor_filter_report = None
+    fetch.last_brand_census = None
+    monkeypatch.setattr(cli, "records_for_brand", fetch)
+    plan = ingestion.ingest_validated_jsonl(records)
+    apply = AsyncMock(return_value={name: len(plan[name]) for name in ("pdps", "skus", "offers")})
+    monkeypatch.setattr(cli, "apply_ingest_plan", apply)
+    database = SimpleNamespace(is_connected=True, disconnect=AsyncMock())
+    monkeypatch.setattr(db_module, "database", database)
+    assert cli.main(["--domain", "eyurs.com", "--category", "beauty", "--apply"]) == 0
+    assert apply.await_args.kwargs["primary_readiness"] is True
+    assert apply.await_args.kwargs["db"] is database
+    database.disconnect.assert_awaited_once()

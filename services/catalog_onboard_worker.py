@@ -221,7 +221,7 @@ async def _process_curated_brand(payload: Dict[str, Any], *, apply: bool, db: An
         preflight = require_primary_plan(plan)
     if apply and plan.get("pdps"):
         out["applied"] = await apply_ingest_plan(
-            plan, batch_label=f"onboard_queue:curated:{payload.get('domain')}", db=db
+            plan, batch_label=f"onboard_queue:curated:{payload.get('domain')}", db=db, primary_readiness=True
         )
         out["primary_ingestion"] = require_primary_apply(preflight, out["applied"])
     return out

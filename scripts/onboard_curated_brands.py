@@ -142,7 +142,7 @@ async def _run(args: argparse.Namespace) -> int:
     if not getattr(database, "is_connected", False):
         await database.connect()
     try:
-        counts = await apply_ingest_plan(plan, batch_label=f"curated_brands:{len(brands)}", db=database)
+        counts = await apply_ingest_plan(plan, batch_label=f"curated_brands:{len(brands)}", db=database, primary_readiness=True)
         result = require_primary_apply(preflight, counts)
         print("primary ingestion: " + json.dumps(result, sort_keys=True))
     finally:
