@@ -3899,9 +3899,9 @@ async def mark_outreach_pitch_sent(
 ) -> Dict[str, Any]:
     """Outreach lifecycle Step 1: a merchant marks a win-plan pitch SENT to an
     independent host. Persists a tracked outreach record (merchant_task,
-    lever='outreach_pitch') keyed to (host, query) so the NEXT audit can
+    lever='outreach_pitch') keyed to (host, query, product) so the NEXT audit can
     re-verify whether that host now cites the merchant — the closed loop that
-    proves the lift. Idempotent: a second mark on the same host+query returns the
+    proves the lift. Idempotent: a second mark on the same host+query+product returns the
     existing record. merchant_id is from the token, so a merchant only records its
     own outreach. The sent-state lives in evidence_jsonb.outreach.status (the task
     `status` enum has no 'sent'); created as a pending tracked row."""
@@ -3921,8 +3921,17 @@ async def mark_outreach_pitch_sent(
     existing = await find_pending_supersede_candidates(
         merchant_id=merchant_id, lever=lever, title=title,
     )
-    if existing:
-        return {"status": "exists", "task_id": existing[0].get("task_id"), "title": title}
+    # Title lookup is only a candidate search: titles are truncated and do
+    # not include the product. Match the retained identity before reusing it.
+    sku_key = (body.sku_key or "").strip() or None
+    for candidate in existing:
+        evidence = candidate.get("evidence_jsonb") or candidate.get("evidence") or {}
+        outreach = evidence.get("outreach") if isinstance(evidence, dict) else None
+        if not isinstance(outreach, dict):
+            continue
+        if (outreach.get("host") == host and outreach.get("query") == query
+                and ((outreach.get("sku_key") or "").strip() or None) == sku_key):
+            return {"status": "exists", "task_id": candidate.get("task_id"), "title": title}
 
     state = (body.state or "draft_ready").strip().lower()
     channel = body.channel or ("submission_form" if state == "submission_only" else "mailto")
@@ -3943,13 +3952,15 @@ async def mark_outreach_pitch_sent(
         assigned_to_human="merchant",
         evidence={
             "kind": "outreach_pitch",
+            "target_host": host,
+            "product_key": sku_key,
             "outreach": {
                 "host": host,
                 "tier": body.tier,
                 "recipient_email": body.recipient_email,
                 "submission_url": body.submission_url,
                 "query": query,
-                "sku_key": body.sku_key,
+                "sku_key": sku_key,
                 "sku_title": body.sku_title,
                 "state": state,
                 "channel": channel,
