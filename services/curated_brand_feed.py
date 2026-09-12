@@ -202,6 +202,8 @@ async def fetch_shopify_shop_locale(
                 crawl_politeness.note_response(
                     url, resp.status_code, retry_after=resp.headers.get("retry-after")
                 )
+                if not _same_storefront_host(host, getattr(getattr(resp, "url", None), "host", None)):
+                    return None
                 if resp.status_code != 200:
                     return None
                 if "application/json" not in (resp.headers.get("content-type") or ""):
@@ -298,6 +300,11 @@ async def fetch_shopify_products(
                     crawl_politeness.note_response(
                         url, resp.status_code, retry_after=resp.headers.get("retry-after")
                     )
+                    actual_host = getattr(getattr(resp, "url", None), "host", None)
+                    if not _same_storefront_host(host, actual_host):
+                        # A regional/sibling store can have a different catalog and
+                        # currency. Never pair its prices with this host's locale.
+                        raise incomplete(f"storefront host changed to {actual_host or '(unknown)'}")
                     if resp.status_code not in {429, 500, 502, 503, 504} or attempt == 2:
                         break
                     await asyncio.sleep(0.5 * (2 ** attempt))

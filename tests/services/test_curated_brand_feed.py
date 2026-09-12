@@ -866,6 +866,7 @@ async def test_meta_json_is_validated_before_it_is_believed(monkeypatch, body, e
     import httpx
 
     class _Resp:
+        url = httpx.URL("https://jsmbeauty.sg/meta.json")
         status_code = 200
         headers = {"content-type": "application/json"}
 
@@ -1046,6 +1047,7 @@ async def test_the_meta_json_fetch_goes_through_the_politeness_gate(monkeypatch)
     )
 
     class _Resp:
+        url = httpx.URL("https://jsmbeauty.sg/meta.json")
         status_code = 200
         headers = {"content-type": "application/json"}
         text = '{"currency": "SGD", "country": "SG"}'
@@ -1097,6 +1099,7 @@ async def test_a_failed_meta_json_is_not_cached_against_the_next_brand(monkeypat
     calls = {"n": 0}
 
     class _Resp:
+        url = httpx.URL("https://jsmbeauty.sg/meta.json")
         def __init__(self, ok):
             self.status_code = 200 if ok else 503
             self.headers = {"content-type": "application/json"}
