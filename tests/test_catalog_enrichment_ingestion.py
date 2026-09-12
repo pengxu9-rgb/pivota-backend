@@ -500,7 +500,7 @@ def test_offer_handles_out_of_stock_and_missing_price():
     result = ingest_validated_record(record)
     assert result is not None
     offer = result["offers"][0]
-    assert offer["availability"] == "unknown"
+    assert offer["availability"] == "out_of_stock"
     assert offer["list_price"] is None
     assert offer["inventory_quantity"] == 0
     assert offer["price_confidence"] is None
@@ -823,7 +823,7 @@ def test_variants_become_shade_skus_and_offers_beside_the_canonical():
     assert len(offers) == 4
     by_sku = {o["sku_key"]: o for o in offers}
     assert by_sku[vskus[1]["sku_key"]]["list_price"] == 25.0
-    assert by_sku[vskus[1]["sku_key"]]["availability"] == "unknown"   # in_stock False
+    assert by_sku[vskus[1]["sku_key"]]["availability"] == "out_of_stock"   # in_stock False
     assert by_sku[vskus[0]["sku_key"]]["availability"] == "in_stock"
     assert len({o["offer_id"] for o in offers}) == 4
 

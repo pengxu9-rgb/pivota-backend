@@ -1325,9 +1325,19 @@ def shopify_product_to_record(
     # NOT `brand_override or vendor`: that renames across a brand boundary. See
     # `resolve_record_brand` — the override normalises spelling, it does not relabel
     # a sibling brand the storefront names itself.
-    brand, _brand_reason = resolve_record_brand(
-        product.get("vendor"), brand_override, host
-    )
+    if source_role == "retailer":
+        vendor = str(product.get("vendor") or "").strip()
+        vendor_key = "".join(c for c in vendor.casefold() if c.isalnum())
+        host_label = _brand_key(host.split(".")[0])
+        if (not _looks_like_a_brand_name(vendor) or not vendor_key
+                or (len(host_label) >= 3 and host_label in vendor_key)):
+            raise ValueError(f"{host}: retailer_maker_unproven: vendor {vendor!r} is not maker evidence")
+        # Only exact normalized maker equivalence permits a spelling override.
+        # Brand-direct store/supplier-code heuristics cannot label retailer stock.
+        override_key = "".join(c for c in str(brand_override or "").casefold() if c.isalnum())
+        brand = brand_override if override_key == vendor_key else vendor
+    else:
+        brand, _brand_reason = resolve_record_brand(product.get("vendor"), brand_override, host)
     brand = str(brand or "").strip()
     if not brand:
         return None
@@ -1364,15 +1374,15 @@ def shopify_product_to_record(
             if _src:
                 image = {"src": _src}
                 break
-    # A FOLDED row is a product LINE, not one physical item: its variants are the
-    # shades, each with its own GTIN. Taking the first shade's barcode as the line's
-    # would publish (say) Ruby Woo's GTIN on "Retro Matte Lipstick", and GTIN is
-    # Tier-0a in identity resolution — it OUTRANKS brand+title, so a retailer's
-    # single-shade PDP carrying that GTIN would attach to the whole line. The stub
-    # the fold replaced carried no barcode; the line keeps none.
+    # A line with multiple native variants is not one physical item, just as a
+    # folded shade line is not. Never promote the first variant's GTIN to Tier-0
+    # PDP identity: array order and stock/price changes must not change identity.
+    # A sole native variant may provide it; all native SKU barcodes remain intact.
     barcode = (
-        None if product.get(FOLDED_INTO_KEY)
-        else (str(variant.get("barcode") or "").strip() or None)
+        str(variants[0].get("barcode") or "").strip() or None
+        if not product.get(FOLDED_INTO_KEY) and len(variants) == 1
+        and isinstance(variants[0], dict)
+        else None
     )
     # Every sellable variant: the ingest writes one SKU + offer per entry beside
     # the canonical SKU, so a folded shade line (see fold_shade_listings) keeps
@@ -1437,7 +1447,7 @@ def shopify_product_to_record(
                 "title": str(v.get("option1") or v.get("title") or "").strip() or None,
                 "option_name": _variant_option_name(v, base_option_name),
                 "price": _to_float(v.get("price")),
-                "in_stock": bool(v.get("available")),
+                "in_stock": v.get("available") if isinstance(v.get("available"), bool) else None,
                 "image_url": (
                     featured_src
                     or str(v.get("image_src") or "").strip()
@@ -1514,7 +1524,7 @@ def shopify_product_to_record(
                 "destination_url": canonical_url,
                 "image_url": str(image.get("src") or "").strip(),
                 "price": price,
-                "in_stock": bool(variant.get("available")),
+                "in_stock": variant.get("available") if isinstance(variant.get("available"), bool) else None,
                 "validated_at": "shopify_products_json",
             }
         ],
@@ -1832,6 +1842,11 @@ async def records_for_brand(
     """
     if source_role not in {"brand_official", "retailer"}:
         raise ValueError("source_role must be brand_official or retailer")
+    if source_role == "retailer" and (
+        not isinstance(only_vendors, (list, tuple)) or not only_vendors
+        or any(not isinstance(v, str) or not v.strip() for v in only_vendors)
+    ):
+        raise ValueError("retailer onboarding requires explicit nonempty only_vendors maker selection")
     if not isinstance(enrich_missing_gtin, bool):
         raise ValueError("enrich_missing_gtin must be a boolean")
     if type(max_pdp_identity_fetches) is not int or max_pdp_identity_fetches < 0:

@@ -86,7 +86,7 @@ def test_actual_short_and_non_latin_vendors_are_preserved(vendor):
 async def test_non_latin_brands_do_not_collapse_in_spelling_fold(monkeypatch):
     monkeypatch.setattr(feed, "fetch_shopify_products", AsyncMock(return_value=[product(vendor="珂润"), product(2, "悦诗风吟")]))
     monkeypatch.setattr(feed, "fetch_shopify_shop_locale", AsyncMock(return_value={"currency": "USD"}))
-    records = await feed.records_for_brand(domain="retailer.com", brand="MISSHA", category_path="beauty", source_role="retailer")
+    records = await feed.records_for_brand(domain="retailer.com", brand="MISSHA", category_path="beauty", source_role="retailer", only_vendors=["珂润", "悦诗风吟"])
     assert {r["pdp"]["brand"] for r in records} == {"珂润", "悦诗风吟"}
 
 
@@ -106,7 +106,7 @@ async def test_controlled_retailer_refuses_unknown_currency_without_opt_in(monke
     monkeypatch.setattr(feed, "fetch_shopify_products", AsyncMock(return_value=[product()]))
     monkeypatch.setattr(feed, "fetch_shopify_shop_locale", AsyncMock(return_value={"currency": currency}))
     with pytest.raises(feed.CurrencyNotProven):
-        await feed.records_for_brand(domain="cocomo.sg", brand="A'PIEU", category_path="beauty", source_role="retailer")
+        await feed.records_for_brand(domain="cocomo.sg", brand="A'PIEU", category_path="beauty", source_role="retailer", only_vendors=["A'PIEU"])
 
 
 @pytest.mark.asyncio
@@ -203,7 +203,7 @@ def test_cli_prints_crawl_failure_and_never_applies_prefix(monkeypatch, capsys):
     monkeypatch.setattr(cli, "records_for_brand", AsyncMock(side_effect=failed))
     apply = AsyncMock()
     monkeypatch.setattr(cli, "apply_ingest_plan", apply)
-    assert cli.main(["--domain", "retailer.com", "--category", "beauty", "--source-role", "retailer", "--apply"]) == 2
+    assert cli.main(["--domain", "retailer.com", "--category", "beauty", "--source-role", "retailer", "--only-vendor", "A'PIEU", "--apply"]) == 2
     assert json.loads(capsys.readouterr().err)["crawl"]["next_page"] == 2
     apply.assert_not_called()
 
@@ -229,7 +229,7 @@ def test_filtered_cli_requires_an_explicit_source_role(monkeypatch, capsys):
     fetch = AsyncMock()
     monkeypatch.setattr(cli, "records_for_brand", fetch)
     assert cli.main(["--domain", "retailer.com", "--category", "beauty", "--only-vendor", "3CE"]) == 2
-    assert "explicit --source-role" in capsys.readouterr().err
+    assert "explicit source_role" in capsys.readouterr().err
     fetch.assert_not_called()
 
 
@@ -246,7 +246,7 @@ async def test_concurrent_record_batches_retain_their_own_scan_evidence(monkeypa
     monkeypatch.setattr(feed, "fetch_shopify_products", fetch)
     monkeypatch.setattr(feed, "fetch_shopify_shop_locale", locale)
     first, second = await asyncio.gather(*[
-        feed.records_for_brand(domain=host, category_path="beauty", source_role="retailer")
+        feed.records_for_brand(domain=host, category_path="beauty", source_role="retailer", only_vendors=["A'PIEU"])
         for host in ["a.com", "b.com"]
     ])
     assert first.crawl_report["scanned_products"] == 10

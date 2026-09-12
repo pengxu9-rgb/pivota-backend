@@ -18,7 +18,8 @@ This revision writes the full chain at ingestion time so agent PDPs are
 shaped identically to merchant-sync PDPs.
 
 Idempotency contract:
-- A PDP is identified by (brand_normalized, canonical_product_name).
+- An official PDP keeps its historical (brand_normalized, canonical_product_name) key.
+- An explicit retailer PDP is keyed by its storefront listing URL; content identity is separate.
 - An SKU is identified by (product_key + '::canonical') — one per PDP.
 - An offer is identified by a deterministic id derived from
   (product_key, sku_key, destination_url) so re-runs UPSERT cleanly.
@@ -155,10 +156,31 @@ def derive_product_key(brand: Optional[str], product_name: Optional[str]) -> str
     return f"ext:{prefix}::{digest}"
 
 
+def retailer_listing_identity(source_domain: str, canonical_url: str) -> str:
+    """A retailer listing belongs to its storefront URL, independently of content identity."""
+    from urllib.parse import urlsplit
+
+    host = str(source_domain or "").lower().removeprefix("www.")
+    parsed = urlsplit(str(canonical_url or ""))
+    url_host = (parsed.hostname or "").lower().removeprefix("www.")
+    if (not host or host != url_host or parsed.scheme not in {"http", "https"}
+            or parsed.username or parsed.password or parsed.port or not parsed.path.strip("/")):
+        raise ValueError("retailer_listing_identity_unproven: source storefront URL must match its host")
+    return host + parsed.path.rstrip("/")
+
+
 def _normalize_url(url: Optional[str]) -> str:
     if not url:
         return ""
     return str(url).strip()
+
+
+def _observed_stock(value: Any) -> Optional[bool]:
+    return value if isinstance(value, bool) else None
+
+
+def _availability(value: Any) -> str:
+    return "in_stock" if value is True else "out_of_stock" if value is False else "unknown"
 
 
 def _validated_offers(record: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -178,7 +200,7 @@ def _validated_offers(record: Dict[str, Any]) -> List[Dict[str, Any]]:
             "destination_url": destination_url or canonical_url,
             "image_url": _normalize_url(offer.get("image_url")),
             "price": offer.get("price"),
-            "in_stock": bool(offer.get("in_stock") or False),
+            "in_stock": _observed_stock(offer.get("in_stock")),
             "validated_at": str(offer.get("validated_at") or "").strip() or None,
         })
     return offers
@@ -499,6 +521,16 @@ def _build_pdp_insert(
         # promote a different offer.
         canonical_url = offers[0].get("canonical_url") or offers[0].get("destination_url") or ""
         image_url = offers[0].get("image_url") or ""
+    if pdp_payload.get("source_role") == "retailer":
+        # Listing identity and shared content identity are different axes. Native
+        # Shopify IDs are local to a store; title/GTIN cannot own a seller's row.
+        listing = retailer_listing_identity(pdp_payload.get("source_domain"), canonical_url)
+        digest = hashlib.sha256(listing.encode("utf-8")).hexdigest()[:32]
+        source_product_id = "retailer:" + digest
+        product_key = "ext:" + source_product_id
+        pivota_fields = make_pivota_canonical_fields(
+            SYNTHETIC_MERCHANT_ID, SYNTHETIC_PLATFORM, source_product_id,
+        )
     enrichment_meta = {
         "agent_version": AGENT_VERSION,
         "source_jsonl": source_jsonl or None,
@@ -510,11 +542,9 @@ def _build_pdp_insert(
     }
     return {
         "product_key": product_key,
-        # W2: seller of record (retailer domains key on etld1 alone;
-        # brand-direct on (brand, etld1)). product_key and the pivota_* sig
-        # fields keep their historical derivation inputs above — sigs are
-        # write-once (T5) and keys are opaque plumbing (D4.2); only the
-        # ownership column changes.
+        # Seller of record: retailer domains key on etld1, brand-direct on
+        # (brand, etld1). Official keys/signatures retain historical inputs;
+        # explicit retailer listings use the distinct URL identity above.
         "merchant_id": seller["merchant_id"],
         "platform": SYNTHETIC_PLATFORM,
         "source_product_id": source_product_id,
@@ -720,8 +750,8 @@ def _build_seed_inserts(
         seed_id = derive_seed_id(product_key, destination_url)
         merchant_slug = _normalize_token(offer.get("seller_domain") or offer.get("merchant_inferred") or "merchant").replace(" ", "-") or "merchant"
         external_product_id = f"{merchant_slug}:{seed_id.split(':')[-1]}"
-        in_stock = bool(offer.get("in_stock") or False)
-        availability = "in_stock" if in_stock else "out_of_stock"
+        in_stock = _observed_stock(offer.get("in_stock"))
+        availability = _availability(in_stock)
         price = offer.get("price")
         # One synthetic variant — the audit only requires a non-empty
         # variant list with currency matching the row's price_currency.
@@ -816,7 +846,7 @@ def _build_seed_inserts(
                     # seeds still carry a null for an unpriced shade: there is no
                     # per-shade substitute, and dropping it would delete selector data.
                     continue
-                v_in_stock = bool(v.get("in_stock"))
+                v_in_stock = _observed_stock(v.get("in_stock"))
                 shade = str(v.get("title") or "").strip()
                 image_url = str(v.get("image_url") or "").strip() or None
                 built.append({
@@ -831,7 +861,7 @@ def _build_seed_inserts(
                     # column directly) and search would price one shade differently.
                     "price_amount": variant_own_price(v),
                     "price": variant_own_price(v),
-                    "availability": "in_stock" if v_in_stock else "out_of_stock",
+                    "availability": _availability(v_in_stock),
                     "in_stock": v_in_stock,
                     "image_url": image_url,
                     "options": _seed_variant_options(
@@ -1151,7 +1181,7 @@ def _build_offer_inserts(
         merchant_inferred = str(offer.get("merchant_inferred") or "").strip() or None
         domain = _domain_of(canonical_url or destination_url)
         merchant_id = derive_merchant_id(merchant_inferred, domain, seller_domain=offer.get("seller_domain"))
-        availability = "in_stock" if offer.get("in_stock") else "unknown"
+        availability = _availability(_observed_stock(offer.get("in_stock")))
         price = offer.get("price")
         try:
             price_value = float(price) if price is not None else None
@@ -1168,7 +1198,7 @@ def _build_offer_inserts(
             "offer_mode": OFFER_MODE,
             "channel": "default",
             "availability": availability,
-            "inventory_quantity": 999 if offer.get("in_stock") else 0,
+            "inventory_quantity": 0 if offer.get("in_stock") is False else None,
             "currency": currency,
             "list_price": price_value,
             "merchant_effective_price": price_value,
@@ -1300,6 +1330,9 @@ def ingest_validated_record(record: Dict[str, Any], *, source_jsonl: Optional[st
         seller=seller,
         canonical_url=pdp_row.get("canonical_url"),
     )
+    if pdp_payload.get("source_role") == "retailer":
+        for row in [sku_row, *variant_sku_rows]:
+            row["source_product_id"] = pdp_row["source_product_id"]
     variant_offer_rows: List[Dict[str, Any]] = []
     if variant_sku_rows and offers:
         primary = offers[0]
@@ -1316,7 +1349,7 @@ def ingest_validated_record(record: Dict[str, Any], *, source_jsonl: Optional[st
             variant_offer_rows.extend(_build_offer_inserts(
                 product_key=pdp_row["product_key"],
                 sku_key=vsku["sku_key"],
-                offers=[dict(primary, price=price, in_stock=bool(v.get("in_stock")))],
+                offers=[dict(primary, price=price, in_stock=_observed_stock(v.get("in_stock")))],
                 source_domain=pdp_row.get("source_domain"),
                 # THE EIGHTH SITE. There were seven "USD" literals, and introducing the parameter
                 # created an eighth CALL that silently took the default -- so a shade line landed

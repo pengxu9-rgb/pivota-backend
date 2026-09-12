@@ -31,13 +31,43 @@ def inspect_primary_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
         reasons.append("category_unresolved")
     if plan.get("skipped"):
         reasons.append("records_skipped")
-    if counts["pdps"] and (not counts["skus"] or not counts["offers"]):
+    if not counts["pdps"]:
+        reasons.append("no_products")
+    if plan.get("skipped_reasons", {}).get("seller_of_record_conflict"):
+        reasons.append("seller_of_record_conflict")
+    # Aggregate counts can hide one product's missing children behind another's.
+    sku_products = {s.get("sku_key"): s.get("product_key") for s in plan.get("skus", [])}
+    linked_products = {
+        o.get("product_key") for o in plan.get("offers", [])
+        if o.get("sku_key") in sku_products
+        and sku_products[o["sku_key"]] == o.get("product_key")
+    }
+    native_keys = set()
+    for sku in plan.get("skus", []):
+        payload = sku.get("sku_payload") or {}
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        if payload.get("variant_id_provenance") == "merchant_issued":
+            native_keys.add(sku.get("sku_key"))
+    native_products = {o.get("product_key") for o in plan.get("offers", [])
+                       if o.get("sku_key") in native_keys
+                       and sku_products.get(o.get("sku_key")) == o.get("product_key")}
+    missing_native = [p.get("product_key") for p in plan.get("pdps", [])
+                      if str(p.get("product_key") or "").startswith("ext:retailer:")
+                      and p.get("product_key") not in native_products]
+    if missing_native:
+        reasons.append("no_native_retailer_commerce_chain")
+    missing_chains = [p.get("product_key") for p in plan.get("pdps", [])
+                      if p.get("product_key") not in linked_products]
+    if missing_chains:
         reasons.append("no_usable_commerce_chain")
     return {
         "status": "blocked" if reasons else "ready_to_apply",
         "planned": counts,
         "unresolved_category_count": len(unresolved),
         "unresolved_product_keys": unresolved,
+        "missing_commerce_product_keys": missing_chains,
+        "missing_native_product_keys": missing_native,
         "skipped_records": int(plan.get("skipped") or 0),
         "reasons": reasons,
         "primary_search_verified": False,

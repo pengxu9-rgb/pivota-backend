@@ -351,7 +351,7 @@ def test_price_floor_skips_to_the_first_real_variant():
         category_path="x",
     )
     assert rec["offers"][0]["price"] == 15.0
-    assert rec["pdp"]["barcode"] == "8809416470016"
+    assert rec["pdp"]["barcode"] is None  # Price selection cannot establish PDP identity.
 
 
 def test_picks_first_positive_priced_variant():
@@ -363,7 +363,7 @@ def test_picks_first_positive_priced_variant():
     )
     assert rec is not None
     assert rec["offers"][0]["price"] == 24.0
-    assert rec["pdp"]["barcode"] == "8809416470016"  # GTIN from the priced variant
+    assert rec["pdp"]["barcode"] is None  # Multi-variant PDP cannot take one item's identity.
 
 
 # --- inci_from_pdp_html: the metafield / accordion INCI source (pure; no network)

@@ -36,7 +36,7 @@ async def test_unknown_currency_stops_main_enumerator_without_expected_currency(
     monkeypatch.setattr(feed, "fetch_shopify_products", AsyncMock(return_value=[]))
     monkeypatch.setattr(feed, "fetch_shopify_shop_locale", AsyncMock(return_value={"currency": None}))
     with pytest.raises(feed.CurrencyNotProven):
-        await feed.records_for_brand(domain="eyurs.com", category_path="beauty", source_role=role)
+        await feed.records_for_brand(domain="eyurs.com", category_path="beauty", source_role=role, only_vendors=["A'PIEU"])
 
 
 def unresolved_record():
@@ -79,10 +79,10 @@ async def test_worker_never_applies_unresolved_category(monkeypatch):
     apply = AsyncMock()
     monkeypatch.setattr(worker, "apply_ingest_plan", apply)
     with pytest.raises(PrimaryIngestionIncomplete) as error:
-        await worker._process_curated_brand({"domain": "eyurs.com", "source_role": "retailer"}, apply=True, db=None)
+        await worker._process_curated_brand({"domain": "eyurs.com", "source_role": "retailer", "only_vendors": ["A'PIEU"]}, apply=True, db=None)
     assert error.value.report["unresolved_category_count"] == 1
     apply.assert_not_awaited()
-    dry = await worker._process_curated_brand({"domain": "eyurs.com", "source_role": "retailer"}, apply=False, db=None)
+    dry = await worker._process_curated_brand({"domain": "eyurs.com", "source_role": "retailer", "only_vendors": ["A'PIEU"]}, apply=False, db=None)
     assert dry["primary_ingestion"]["status"] == "blocked"
 
 

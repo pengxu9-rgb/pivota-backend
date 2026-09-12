@@ -82,6 +82,8 @@ def normalize_curated_brand_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         ):
             raise ValueError("only_vendors must be a nonempty list of nonblank vendor names")
         vendors = sorted({" ".join(v.split()).casefold() for v in vendors})
+    if role == "retailer" and vendors is None:
+        raise ValueError("retailer onboarding requires explicit nonempty only_vendors maker selection")
     currency = payload.get("require_currency")
     if currency is not None:
         if not isinstance(currency, str) or not re.fullmatch(r"[A-Za-z]{3}", currency.strip()):
@@ -205,7 +207,10 @@ async def _process_curated_brand(payload: Dict[str, Any], *, apply: bool, db: An
         if job["require_currency"] and currency != job["require_currency"]:
             raise ValueError(f"{job['domain']}: record currency does not match required currency")
     if not records:
-        return {"records": 0, "applied": None, "note": "no products enumerated", "crawl": crawl_report}
+        if apply:
+            raise ValueError(f"{job['domain']}: no products enumerated; onboarding is incomplete")
+        return {"records": 0, "applied": None, "note": "no products enumerated", "crawl": crawl_report,
+                "primary_ingestion": {"status": "blocked", "reasons": ["no_products"]}}
     from services.catalog_enrichment_agent.primary_ingestion import (
         inspect_primary_plan, require_primary_plan, require_primary_apply,
     )

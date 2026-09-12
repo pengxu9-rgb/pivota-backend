@@ -403,13 +403,26 @@ async def _apply_pdp_identity_gate(pdp: Dict[str, Any], *, identity_gate_on: boo
             "product_key": pdp.get("product_key"),
         },
     )
-    if ident.get("action") == ACTION_SKIP:
+    # The shared resolver serves legacy doors that may return an error-shaped
+    # MINT. This primary writer cannot publish that substituted identity.
+    from services.intake_identity import ACTION_ATTACH, ACTION_FLAG, ACTION_MINT
+    evidence = ident.get("evidence") if isinstance(ident, dict) else None
+    detail = evidence.get("evidence") if isinstance(evidence, dict) else None
+    failed = isinstance(detail, dict) and detail.get("reason") == "error"
+    action = ident.get("action") if isinstance(ident, dict) else None
+    content_key = ident.get("content_key") if isinstance(ident, dict) else None
+    if (failed or action not in {ACTION_SKIP, ACTION_ATTACH, ACTION_FLAG, ACTION_MINT}
+            or (action != ACTION_SKIP and (not isinstance(content_key, str) or not content_key.strip()))):
+        logger.error("apply_ingest_plan: identity resolution incomplete for product_key=%s; refusing PDP and children",
+                     pdp.get("product_key"))
+        return False
+    if action == ACTION_SKIP:
         logger.info(
             "apply_ingest_plan: identity gate skipped product_key=%s "
             "(brand conflict — review enqueued)", pdp.get("product_key"),
         )
         return False
-    pdp["content_key"] = ident.get("content_key") or pdp.get("content_key")
+    pdp["content_key"] = content_key
     return True
 
 
@@ -1378,6 +1391,43 @@ async def _prepare_seller_of_record(plan: Dict[str, Any], database: Any) -> Dict
     return plan
 
 
+async def _refuse_parallel_retailer_listings(plan: Dict[str, Any], database: Any) -> None:
+    """A new listing key must not silently leave an older same-URL row eligible.
+
+    The reviewed cohort migration owns retiring old children and seed rows. Both
+    executors refuse before any merchant or catalog write when that work remains.
+    """
+    from services.catalog_enrichment_agent.ingestion import retailer_listing_identity
+
+    listings = {}
+    for pdp in plan.get("pdps") or []:
+        if str(pdp.get("product_key") or "").startswith("ext:retailer:"):
+            identity = retailer_listing_identity(pdp.get("source_domain"), pdp.get("canonical_url"))
+            listings[identity] = pdp["product_key"]
+    if not listings:
+        return
+    rows = await database.fetch_all(
+        """
+        SELECT product_key, source_domain, canonical_url FROM catalog_products
+        WHERE lower(split_part(regexp_replace(canonical_url,
+                             '^https?://(www[.])?', '', 'i'), '/', 1)) = ANY(:hosts)
+        """, {"hosts": sorted({listing.split("/", 1)[0] for listing in listings})},
+    )
+    from urllib.parse import urlsplit
+
+    for row in rows or []:
+        row = dict(row)
+        # The candidate's URL owns this comparison. Missing source metadata on
+        # an unrelated old listing must not block every product on its host.
+        url = row.get("canonical_url") or ""
+        identity = retailer_listing_identity(urlsplit(url).hostname, url)
+        if identity in listings and row.get("product_key") != listings[identity]:
+            raise ValueError(
+                "retailer_listing_migration_required: existing product "
+                f"{row.get('product_key')} owns {identity}; migrate/rekey or remove its full legacy chain before onboarding"
+            )
+
+
 async def apply_ingest_plan(
     plan: Dict[str, Any],
     *,
@@ -1398,6 +1448,7 @@ async def apply_ingest_plan(
     if not getattr(database, "is_connected", False):
         await database.connect()
 
+    await _refuse_parallel_retailer_listings(plan, database)
     plan = await _prepare_seller_of_record(plan, database)
 
     if batch:

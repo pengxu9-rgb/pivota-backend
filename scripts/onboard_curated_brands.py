@@ -33,6 +33,7 @@ from services.catalog_enrichment_agent.primary_ingestion import (  # noqa: E402
     inspect_primary_plan, require_primary_plan, require_primary_apply,
 )
 from services.curated_brand_feed import CrawlIncomplete, records_for_brand  # noqa: E402
+from services.catalog_onboard_worker import normalize_curated_brand_payload  # noqa: E402
 
 
 def _read_brand_list(args: argparse.Namespace) -> List[Dict[str, Any]]:
@@ -46,11 +47,12 @@ def _read_brand_list(args: argparse.Namespace) -> List[Dict[str, Any]]:
                 continue
             try:
                 row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if row.get("domain") and (row.get("category_path") or args.category):
-                row.setdefault("category_path", args.category)
-                brands.append(row)
+            except json.JSONDecodeError as exc:
+                raise ValueError("invalid JSON in brand roster") from exc
+            if not isinstance(row, dict) or not row.get("domain"):
+                raise ValueError("every brand roster row requires a domain")
+            row.setdefault("category_path", args.category)
+            brands.append(row)
     return brands
 
 
@@ -60,36 +62,32 @@ async def _run(args: argparse.Namespace) -> int:
         print("no brands to onboard (need --domain or --file rows with domain+category)", file=sys.stderr)
         return 2
 
+    # Normalize the whole roster before the first fetch. Per-row controls and
+    # unsupported markets must have the same contract as unattended queue work.
+    defaults = {
+        "source_role": args.source_role,
+        "retailer_name": args.retailer_name,
+        "only_vendors": args.only_vendor or None,
+        "require_currency": args.require_currency,
+        "max_products": args.max_products,
+        "base_listings_only": args.base_listings_only,
+        "emit_real_variants": args.emit_real_variants,
+        "max_scan_products": args.max_scan_products,
+        "enrich_missing_gtin": args.enrich_missing_gtin,
+        "max_pdp_identity_fetches": args.max_pdp_identity_fetches,
+    }
+    brands = [normalize_curated_brand_payload({
+        **{k: v for k, v in defaults.items() if v is not None}, **b,
+    }) for b in brands]
     all_records: List[Dict[str, Any]] = []
     for b in brands:
-        only_vendors = b.get("only_vendors", args.only_vendor or None)
-        source_role = b.get("source_role") or args.source_role
-        retailer_name = b.get("retailer_name") or args.retailer_name
-        if (only_vendors is not None or retailer_name) and not source_role:
-            raise ValueError(f"{b['domain']}: vendor-filtered/retailer jobs require explicit --source-role")
-        source_role = source_role or "brand_official"
-        if retailer_name and source_role != "retailer":
-            raise ValueError("retailer_name requires source_role=retailer")
-        recs = await records_for_brand(
-            domain=b["domain"],
-            category_path=b.get("category_path") or args.category or "",
-            brand=b.get("brand"),
-            max_products=args.max_products,
-            base_listings_only=args.base_listings_only,
-            emit_real_variants=args.emit_real_variants,
-            # Per-brand rows win over the flags: a --file run mixes a single-brand
-            # storefront with a retailer feed, and only the row knows which is which.
-            only_vendors=only_vendors,
-            require_currency=b.get("require_currency") or args.require_currency,
-            source_role=source_role,
-            retailer_name=retailer_name,
-            max_scan_products=b.get("max_scan_products") or args.max_scan_products,
-            enrich_missing_gtin=b.get("enrich_missing_gtin", args.enrich_missing_gtin),
-            max_pdp_identity_fetches=b.get("max_pdp_identity_fetches", args.max_pdp_identity_fetches),
-        )
+        recs = await records_for_brand(**{k: v for k, v in b.items() if k != "market"})
         crawl_report = getattr(recs, "crawl_report", None)
-        if crawl_report:
-            print("    crawl: " + json.dumps(crawl_report, sort_keys=True))
+        if not isinstance(crawl_report, dict) or crawl_report.get("status") != "complete":
+            raise ValueError(f"{b['domain']}: crawl completeness was not proven")
+        print("    crawl: " + json.dumps(crawl_report, sort_keys=True))
+        if not recs:
+            raise ValueError(f"{b['domain']}: no products enumerated; cohort cannot be applied")
         vendor_report = getattr(records_for_brand, "last_vendor_filter_report", None)
         if vendor_report and vendor_report.get("vendors"):
             print(
@@ -117,17 +115,13 @@ async def _run(args: argparse.Namespace) -> int:
                 "      pass --only-vendor to ingest just one brand from this feed."
             )
             records_for_brand.last_brand_census = None  # type: ignore[attr-defined]
-        fold = getattr(records_for_brand, "last_fold_report", None) if args.base_listings_only else None
+        fold = getattr(records_for_brand, "last_fold_report", None) if b["base_listings_only"] else None
         if fold:
             print(
                 f"    folded {fold['shades']} shade listing(s) into {fold['bases']} base row(s); "
                 f"{fold['stubs_replaced']} placeholder stub variant(s) replaced by their shades"
             )
         all_records.extend(recs)
-
-    if not all_records:
-        print("no products enumerated (non-Shopify storefronts return none).")
-        return 0
 
     plan = ingest_validated_jsonl(all_records)
     print(

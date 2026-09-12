@@ -216,7 +216,8 @@ def test_worker_keys_preserve_disabled_jobs_and_distinguish_enabled_budget():
 
 
 def test_cli_passes_opt_in_and_zero_budget(monkeypatch):
-    fake = AsyncMock(return_value=[])
+    from tests.services.test_curated_gtin_handoff import captured_records
+    fake = AsyncMock(return_value=feed.CuratedRecordBatch(captured_records(), crawl_report={"status": "complete"}))
     fake.last_vendor_filter_report = None
     fake.last_brand_census = None
     monkeypatch.setattr(cli, 'records_for_brand', fake)
@@ -247,7 +248,8 @@ async def test_shared_gate_refusal_is_counted_without_bypassing_it(monkeypatch):
 
 
 def test_cli_row_can_disable_opt_in_and_preserves_zero_budget(monkeypatch, tmp_path):
-    fake = AsyncMock(return_value=[])
+    from tests.services.test_curated_gtin_handoff import captured_records
+    fake = AsyncMock(return_value=feed.CuratedRecordBatch(captured_records(), crawl_report={"status": "complete"}))
     fake.last_vendor_filter_report = None
     fake.last_brand_census = None
     monkeypatch.setattr(cli, 'records_for_brand', fake)
