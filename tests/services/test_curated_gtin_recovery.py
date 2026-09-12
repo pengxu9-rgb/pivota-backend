@@ -84,7 +84,7 @@ async def test_wrong_product_vendor_handle_or_variant_never_earns_identity(monke
 
 
 @pytest.mark.parametrize('value', [None, True, 8809530070499, '7', '8809530070498',
-    'code8809530070499', '８８０９５３００７０４９９', '0'*15, ''])
+    'code8809530070499', '８８０９５３００７０４９９', '0'*15, '0'*14, '0'*13, ''])
 def test_invalid_source_gtin_is_not_normalized_into_match_key(value):
     assert feed.validated_source_gtin(value) is None
 

@@ -43,8 +43,7 @@ from services.beauty_external_ranking import (
     normalize_external_seed_structured_ingredient_ids,
 )
 from services.category_kind import resolve_category_kind
-from services.catalog_identity import make_content_key
-from services.intake_identity import canonical_gtin
+from services.catalog_identity import make_content_key, validated_source_gtin
 from services.catalog_sync_service import make_pivota_canonical_fields
 from services.seller_identity import (
     BANNED_BUCKET_MERCHANT_ID,
@@ -526,10 +525,11 @@ def _build_pdp_insert(
         # Preserve captured strong identity through the pure plan to the apply
         # gate. Without this column, native SKUs retained their barcode but the
         # PDP identity resolver never received it. Use the same canonicalizer
-        # as the gate; missing/rejected source identifiers remain absent.
+        # as the gate after checking the source GS1 shape/check digit; missing,
+        # all-zero and invalid identifiers remain absent.
         # `gtin` already has a SQL bind in both apply executors; do not forward
         # the input-only `barcode` alias as an extra row/bind field.
-        "gtin": canonical_gtin(pdp_payload.get("gtin") or pdp_payload.get("barcode")),
+        "gtin": validated_source_gtin(pdp_payload.get("gtin") or pdp_payload.get("barcode")),
         "product_type": pdp_payload.get("category_path", "").split("/")[-1] or None,
         "category": pdp_payload.get("category_path", "").split("/")[-1] or None,
         "category_path": pdp_payload.get("category_path") or None,

@@ -82,7 +82,7 @@ async def test_captured_two_retailer_gtin_reaches_identity_gate_without_rekeying
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("source_gtin,expected", [
-    (None, None), ("", None), ("not-a-barcode", None), ("123456789012345", None),
+    (None, None), ("", None), ("00000000000000", None), ("8809530070498", None), ("7", None), ("not-a-barcode", None), ("123456789012345", None),
     ("8809530070499", "08809530070499"), ("08809530070499", "08809530070499"),
 ])
 async def test_plan_uses_existing_gtin_contract_and_flag_off_preserves_it(monkeypatch, source_gtin, expected):

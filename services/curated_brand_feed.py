@@ -27,6 +27,7 @@ from urllib.parse import quote, urljoin, urlsplit
 
 import httpx
 
+from services.catalog_identity import validated_source_gtin
 from services import storefront_currency
 
 from services.retailer_ingest.sitemap_crawler import _looks_like_inci_list
@@ -351,25 +352,6 @@ def _native_shopify_id(value: Any) -> Optional[str]:
 def _missing_barcode(variant: Dict[str, Any]) -> bool:
     return variant.get("barcode") is None or str(variant["barcode"]).strip() == ""
 
-
-def validated_source_gtin(value: Any) -> Optional[str]:
-    """Only GS1-shaped, check-digit-valid observations earn a recovered match key.
-
-    canonical_gtin owns normalization; its legacy padding alone also accepts a
-    one-digit supplier code, so this new observation boundary validates first.
-    Existing feed barcodes are not rewritten or reinterpreted here.
-    """
-    from services.intake_identity import canonical_gtin
-
-    if not isinstance(value, str):
-        return None
-    digits = re.sub(r"[\s-]+", "", value)
-    if not re.fullmatch(r"[0-9]+", digits) or len(digits) not in {8, 12, 13, 14}:
-        return None
-    weighted = sum(int(d) * (3 if i % 2 == 0 else 1) for i, d in enumerate(reversed(digits[:-1])))
-    if (10 - weighted % 10) % 10 != int(digits[-1]):
-        return None
-    return canonical_gtin(digits)
 
 
 async def _fetch_missing_variant_gtins(

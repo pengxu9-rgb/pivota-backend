@@ -25,7 +25,7 @@ from urllib.parse import urlsplit
 
 
 # The observation and acceptance boundaries share the same GS1 validation.
-from services.curated_brand_feed import validated_source_gtin as canonical_gtin
+from services.catalog_identity import validated_source_gtin as canonical_gtin
 
 
 def evaluate(manifest: dict, evidence: dict, *, now=None) -> dict:
