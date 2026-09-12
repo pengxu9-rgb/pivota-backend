@@ -306,9 +306,10 @@ async def run_category_path_backfill(
                     declined += 1
                     _increment(declined_by_path, str(current_path or "(null)"))
                     continue
-            before_branch = str(current_path or "").split("/")[0].strip().lower()
-            after_branch = str(path or "").split("/")[0].strip().lower()
-            if before_branch and after_branch and before_branch != after_branch:
+            before_branch = str(current_path or "").strip().strip("/").lower()
+            after_branch = str(path or "").strip().strip("/").lower()
+            # A deeper sibling (makeup -> skincare) is still a branch change.
+            if before_branch and not after_branch.startswith(before_branch + "/"):
                 branch_changes += 1
                 _increment(branch_change_pairs, "%s -> %s" % (current_path, path))
                 # Sampled SEPARATELY. matched_samples is the first N matches and contained no

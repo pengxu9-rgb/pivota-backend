@@ -838,3 +838,24 @@ async def test_landed_writes_are_counted_as_matched(monkeypatch):
     report = await bf.run_category_path_backfill(include_shallow=True, dry_run=False)
     assert report["matched"] == 1, report
     assert report["declined_by_guard"] == 0, report
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("before,ptype,changed", [
+    ("beauty/makeup", "Moisturizer", 1),
+    ("beauty/makeup", "Lipstick", 0),
+    ("beauty", "Lipstick", 0),
+    ("beauty/makeup", "Handbag", 1),
+])
+async def test_dry_run_reports_sibling_category_moves(monkeypatch, before, ptype, changed):
+    import scripts.backfill_pdp_category_path as bf
+    batches = [[{"product_key": "k", "category_path": before,
+                 "product_type": ptype, "title": "Opaque product"}], []]
+    async def fetch(*args, **kwargs):
+        return batches.pop(0) if batches else []
+    monkeypatch.setattr(bf.database, "fetch_all", fetch)
+    monkeypatch.setattr(bf.database, "is_connected", True, raising=False)
+    report = await bf.run_category_path_backfill(include_shallow=True, dry_run=True)
+    assert report["matched"] == 1
+    assert report["branch_changes"] == changed
+    assert len(report["branch_change_samples"]) == changed
