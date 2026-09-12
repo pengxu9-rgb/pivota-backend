@@ -4470,22 +4470,25 @@ async def start_merchant_audit_action(
         existing = await find_pending_supersede_candidates(
             merchant_id=merchant_id, lever=lever, title=title,
         )
+        existing_task_id = None
         if existing:
             ev = existing[0].get("evidence_jsonb") or existing[0].get("evidence") or {}
             prior_draft = ev.get("draft") if isinstance(ev, dict) else None
-            return {
-                "status": "exists",
-                "task_id": existing[0].get("task_id"),
-                "draft": prior_draft,
-                "placement": (
-                    ev.get("placement") if isinstance(ev, dict) else None
-                ) or _action_placement(
-                    report,
-                    _action_product_key_by_title(report, body.sku_title),
-                    is_outreach=is_outreach, channel_host=body.channel_host,
-                ),
-                "credits_charged": 0,
-            }
+            existing_task_id = existing[0].get("task_id")
+            if prior_draft:
+                return {
+                    "status": "exists",
+                    "task_id": existing[0].get("task_id"),
+                    "draft": prior_draft,
+                    "placement": (
+                        ev.get("placement") if isinstance(ev, dict) else None
+                    ) or _action_placement(
+                        report,
+                        _action_product_key_by_title(report, body.sku_title),
+                        is_outreach=is_outreach, channel_host=body.channel_host,
+                    ),
+                    "credits_charged": 0,
+                }
 
         # Persist the measured draft and debit together; failures need no refund.
         draft: Optional[str] = None
@@ -4539,14 +4542,7 @@ async def start_merchant_audit_action(
         if draft:
             task_body = (f"{task_body}\n\n— Pivota draft —\n{draft}")[:4000]
 
-        task_id = await record_task_created(
-            merchant_id=merchant_id,
-            title=title,
-            body=task_body,
-            severity="high",
-            lever=lever,
-            parent_audit_run_id=body.run_id,
-            evidence={
+        task_evidence = {
                 "kind": "outreach" if is_outreach else "audit_action",
                 "headline": title,
                 "first_move": body.first_move,
@@ -4560,8 +4556,22 @@ async def start_merchant_audit_action(
                 "query": body.query,
                 "draft": draft,
                 "placement": placement,
-            },
-        )
+            }
+        if existing_task_id:
+            task_id = existing_task_id
+            if draft:
+                updated = await database.fetch_one("""UPDATE merchant_tasks
+                    SET body=:body, evidence_jsonb=COALESCE(evidence_jsonb,'{}'::jsonb) || CAST(:evidence AS JSONB), updated_at=NOW()
+                    WHERE task_id=:task_id AND merchant_id=:merchant_id AND status='pending'
+                    RETURNING task_id""", {"body": task_body, "evidence": json.dumps(task_evidence, default=str),
+                    "task_id": task_id, "merchant_id": merchant_id})
+                if not updated:
+                    raise HTTPException(status_code=500, detail="Could not save the draft to the existing task.")
+        else:
+            task_id = await record_task_created(
+                merchant_id=merchant_id, title=title, body=task_body, severity="high",
+                lever=lever, parent_audit_run_id=body.run_id, evidence=task_evidence,
+            )
         if not task_id:
             raise HTTPException(status_code=500, detail="Could not create the follow-up task.")
         return {

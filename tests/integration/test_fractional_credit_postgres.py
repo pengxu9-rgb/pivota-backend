@@ -177,3 +177,44 @@ async def test_action_route_task_failure_rolls_back_measured_charge(monkeypatch,
         for table in ('merchant_llm_operations', 'agent_center_usage_events', 'merchant_onboarding'):
             await database.execute(f'DELETE FROM {table} WHERE merchant_id=:m', {'m': merchant})
         await database.disconnect()
+
+
+async def test_draft_retry_updates_existing_task_without_another_task(monkeypatch):
+    from db.database import database
+    from db import merchant_tasks
+    from routes import merchant_audit_routes as routes
+    url = urlparse(os.environ['DATABASE_URL'])
+    assert url.hostname in {'127.0.0.1', 'localhost'} and url.path == '/recovery_contract_test'
+    merchant = 'retry-' + uuid4().hex
+    calls = 0
+    async def fetch(**kw):
+        return {'merchant_id': merchant, 'report_jsonb': {'per_sku_reports': []}}
+    async def generate(**kw):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ValueError('Temporary provider failure')
+        return {'answer': 'Recovered draft'}, {'credits': '0.00552', 'usd_cogs': '0.0000345'}
+    monkeypatch.setattr(routes, 'fetch_audit_run_by_id', fetch)
+    monkeypatch.setattr(routes, '_build_ask_context', lambda *a: {'context': 'report'})
+    monkeypatch.setattr(routes, 'generate_measured_text', generate)
+    await database.connect()
+    try:
+        await merchant_tasks.ensure_merchant_tasks_table()
+        await database.execute('INSERT INTO merchant_onboarding (merchant_id) VALUES (:m)', {'m': merchant})
+        await database.execute('INSERT INTO merchant_credit_balance (merchant_id,credits,purchased_credits) VALUES (:m,10,10)', {'m': merchant})
+        body = routes.MerchantAuditActionStartRequest(run_id=str(uuid4()), headline='Retry this measured draft')
+        first = await routes.start_merchant_audit_action(body, merchant_id=merchant)
+        assert first['draft'] is None and first['credits_charged'] == 0
+        second = await routes.start_merchant_audit_action(body, merchant_id=merchant)
+        assert second['task_id'] == first['task_id'] and second['draft'] == 'Recovered draft'
+        assert second['credits_charged'] == 0.00552
+        third = await routes.start_merchant_audit_action(body, merchant_id=merchant)
+        assert third['task_id'] == first['task_id'] and third['credits_charged'] == 0
+        assert calls == 2
+        assert await database.fetch_val('SELECT COUNT(*) FROM merchant_tasks WHERE merchant_id=:m', {'m': merchant}) == 1
+        assert await database.fetch_val('SELECT credits FROM merchant_credit_balance WHERE merchant_id=:m', {'m': merchant}) == Decimal('9.99448')
+    finally:
+        for table in ('merchant_tasks', 'merchant_llm_operations', 'agent_center_usage_events', 'merchant_onboarding'):
+            await database.execute(f'DELETE FROM {table} WHERE merchant_id=:m', {'m': merchant})
+        await database.disconnect()
