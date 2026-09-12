@@ -158,6 +158,7 @@ def _validated_offers(record: Dict[str, Any]) -> List[Dict[str, Any]]:
             continue
         offers.append({
             "merchant_inferred": str(offer.get("merchant_inferred") or "").strip(),
+            "seller_domain": str(offer.get("seller_domain") or "").strip() or None,
             "canonical_url": canonical_url,
             "destination_url": destination_url or canonical_url,
             "image_url": _normalize_url(offer.get("image_url")),
@@ -214,6 +215,7 @@ def _build_pdp_payload(record: Dict[str, Any]) -> Dict[str, Any]:
             "mpn": str(mpn_raw).strip() if mpn_raw else None,
         },
         "source_domain": source_domain,
+        "source_role": pdp.get("source_role"),
         # The storefront's own currency. This payload is a WHITELIST -- a field absent here is
         # dropped no matter what the record carried -- so omitting it made the passthrough a
         # silent no-op even with every consumer reading it. Validated at the point of USE
@@ -663,7 +665,7 @@ def _build_seed_inserts(
             continue
         seen_urls.add(destination_url)
         seed_id = derive_seed_id(product_key, destination_url)
-        merchant_slug = _normalize_token(offer.get("merchant_inferred") or "merchant").replace(" ", "-") or "merchant"
+        merchant_slug = _normalize_token(offer.get("seller_domain") or offer.get("merchant_inferred") or "merchant").replace(" ", "-") or "merchant"
         external_product_id = f"{merchant_slug}:{seed_id.split(':')[-1]}"
         in_stock = bool(offer.get("in_stock") or False)
         availability = "in_stock" if in_stock else "out_of_stock"
@@ -946,11 +948,19 @@ def derive_offer_id(product_key: str, sku_key: str, destination_url: str) -> str
     return f"offer:{AGENT_VERSION}:{digest}"
 
 
-def derive_merchant_id(merchant_inferred: Optional[str], domain: Optional[str]) -> str:
+def derive_merchant_id(merchant_inferred: Optional[str], domain: Optional[str], *,
+                       seller_domain: Optional[str] = None) -> str:
     """Stable merchant_id derived from the validated retailer name (or
     domain as fallback). Format: 'agent_seed::<slug>'. Two offers from
     the same retailer collapse to the same merchant_id, which is what
     Phase 6's seller_count rule needs to compute pdp_scope correctly."""
+    if seller_domain:
+        # Explicit retailer identity cannot collapse across same-named stores or
+        # punctuation-equivalent hosts. Existing official IDs take the old branch.
+        host = _domain_of(f"https://{seller_domain}")
+        if not host or host != domain:
+            raise ValueError("retailer seller_domain must match its offer URL host")
+        return f"{MERCHANT_ID_PREFIX}retailer::{host}"
     raw = merchant_inferred or domain or "unknown"
     slug = _normalize_token(raw).replace(" ", "-") or "unknown"
     return f"{MERCHANT_ID_PREFIX}{slug[:80]}"
@@ -1043,7 +1053,7 @@ def _build_merchant_upserts(
     for offer in offers:
         merchant_inferred = str(offer.get("merchant_inferred") or "").strip() or None
         domain = _domain_of(offer.get("canonical_url") or offer.get("destination_url"))
-        merchant_id = derive_merchant_id(merchant_inferred, domain)
+        merchant_id = derive_merchant_id(merchant_inferred, domain, seller_domain=offer.get("seller_domain"))
         if merchant_id in seen:
             continue
         seen[merchant_id] = {
@@ -1086,7 +1096,7 @@ def _build_offer_inserts(
         seen_offer_ids.add(offer_id)
         merchant_inferred = str(offer.get("merchant_inferred") or "").strip() or None
         domain = _domain_of(canonical_url or destination_url)
-        merchant_id = derive_merchant_id(merchant_inferred, domain)
+        merchant_id = derive_merchant_id(merchant_inferred, domain, seller_domain=offer.get("seller_domain"))
         availability = "in_stock" if offer.get("in_stock") else "unknown"
         price = offer.get("price")
         try:
@@ -1181,6 +1191,11 @@ def ingest_validated_record(record: Dict[str, Any], *, source_jsonl: Optional[st
         seller = resolve_seed_seller_identity(
             brand=pdp_payload.get("brand"), domain=pdp_payload.get("source_domain")
         )
+        if pdp_payload.get("source_role") == "retailer":
+            from services.seller_identity import make_observed_retailer_id
+            seller = {**seller, "kind": "retailer",
+                      "merchant_id": make_observed_retailer_id(seller["registrable"]),
+                      "merchant_name": seller["registrable"]}
     except ValueError as exc:
         return {"skipped_reason": f"seller_of_record_unresolved: {exc}"}
     pdp_row = _build_pdp_insert(

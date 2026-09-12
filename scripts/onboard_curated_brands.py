@@ -70,7 +70,13 @@ async def _run(args: argparse.Namespace) -> int:
             # storefront with a retailer feed, and only the row knows which is which.
             only_vendors=b.get("only_vendors") or args.only_vendor or None,
             require_currency=b.get("require_currency") or args.require_currency,
+            source_role=b.get("source_role") or args.source_role,
+            retailer_name=b.get("retailer_name") or args.retailer_name,
+            max_scan_products=b.get("max_scan_products") or args.max_scan_products,
         )
+        crawl_report = getattr(records_for_brand, "last_crawl_report", None)
+        if crawl_report:
+            print("    crawl: " + json.dumps(crawl_report, sort_keys=True))
         vendor_report = getattr(records_for_brand, "last_vendor_filter_report", None)
         if vendor_report and vendor_report.get("vendors"):
             print(
@@ -188,6 +194,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             "Never converts: it refuses."
         ),
     )
+    p.add_argument("--source-role", choices=["brand_official", "retailer"], default="brand_official",
+                   help="Retailer mode separates seller from maker and requires proven currency")
+    p.add_argument("--retailer-name", help="Retailer display name; defaults to its host")
+    p.add_argument("--max-scan-products", type=int, default=10000,
+                   help="Whole-feed scan budget, independent of selected-brand --max-products")
     p.add_argument("--apply", action="store_true", help="ingest (else dry-run plan)")
     args = p.parse_args(argv)
     return asyncio.run(_run(args))

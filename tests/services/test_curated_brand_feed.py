@@ -26,7 +26,7 @@ def test_maps_shopify_product_to_validated_record():
     pdp, offers = rec["pdp"], rec["offers"]
     assert pdp["brand"] == "COSRX"
     assert pdp["product_name"] == "Snail Mucin Gel Cleanser"
-    assert pdp["category_path"] == "beauty/skincare/cleanser"
+    assert pdp["category_path"] == "beauty/skincare/cleanse/cleanser"
     assert pdp["barcode"] == "8809416470016"  # GTIN carried (strongest deposit basis)
     assert pdp["source_domain"] == "cosrx.com"
     assert pdp["tags"] == ["k-beauty", "cleanser"]
@@ -2083,13 +2083,11 @@ def test_resolve_record_brand_reasons_are_exhaustive_over_the_measured_feed():
     assert seen[""] == ("Missha", "override_no_vendor")
 
 
-def test_a_short_code_like_vendor_cannot_substring_match_a_brand():
-    """Two guards stand between `3M` and the brand column: the containment floor is
-    3 characters, and a 2-letter run does not read as a name. Either way the operator's
-    brand survives — what must NOT happen is `3M` absorbing into `M3 Cosmetics`."""
-    brand, why = cbf.resolve_record_brand("3M", "M3 Cosmetics", "shop.com")
-    assert brand == "M3 Cosmetics"
-    assert why == "override_vendor_is_not_a_name"
+def test_a_short_actual_brand_is_not_relabelled_by_the_override():
+    # 3M is a maker, just as Meitu's 3CE is: short does not mean supplier code.
+    assert cbf.resolve_record_brand("3M", "M3 Cosmetics", "shop.com") == (
+        "3M", "vendor_disagrees",
+    )
 
 
 @pytest.mark.asyncio

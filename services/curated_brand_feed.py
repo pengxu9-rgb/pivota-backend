@@ -9,8 +9,8 @@ title/price/image, variant **barcode (GTIN)**, and tags. The records then ingest
 as depositable canonical anchors via the existing FK-order executor.
 
 This is the "crawl the brand before they integrate" engine for the (very common)
-Shopify-hosted D2C brand. Non-Shopify domains return [] (fall back to the audit/
-agent feed). PURE-ish: this module fetches public pages + builds records; the
+Shopify-hosted D2C brand. Non-Shopify/failed or capped scans raise CrawlIncomplete
+so callers cannot ingest a prefix as a completed catalog. PURE-ish: this module fetches public pages + builds records; the
 caller runs `ingest_validated_jsonl` + `apply_ingest_plan` (gated).
 """
 
@@ -219,45 +219,118 @@ async def fetch_shopify_shop_locale(
     return {"currency": cur if _ISO_CURRENCY.match(cur) else None}
 
 
+class CrawlIncomplete(RuntimeError):
+    """A bounded scan did not establish a complete catalog; never ingest its prefix.
+
+    next_page is diagnostic retry position, not an ingestion checkpoint. Callers retry
+    the whole read before writing, so no partial batch can become a successful job.
+    """
+    def __init__(self, message: str, *, status: str, next_page: int,
+                 scanned_products: int, selected_products: int):
+        super().__init__(message)
+        self.status = status
+        self.next_page = next_page
+        self.scanned_products = scanned_products
+        self.selected_products = selected_products
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {"status": self.status, "next_page": self.next_page,
+                "scanned_products": self.scanned_products,
+                "selected_products": self.selected_products, "reason": str(self)}
+
+
+class ShopifyProductBatch(list):
+    """List-compatible result; successful results always represent an exhausted feed."""
+    def __init__(self, products: list, *, scanned_products: int, pages: int):
+        super().__init__(products)
+        self.crawl_report = {"status": "complete", "scanned_products": scanned_products,
+                             "selected_products": len(products), "pages": pages}
+
+
 async def fetch_shopify_products(
     domain: str,
     *,
     max_products: int = 500,
     timeout_s: float = 15.0,
+    only_vendors: Optional[Sequence[str]] = None,
+    max_scan_products: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
-    """Page through `https://{domain}/products.json`. Returns raw Shopify product
-    dicts (up to max_products), or [] if the store isn't Shopify / errors."""
+    """Enumerate to exhaustion, selecting vendors before the product budget.
+
+    max_scan_products bounds the whole retailer scan, independently of the selected
+    max_products budget. A cap or failed page raises CrawlIncomplete, never returns a
+    misleading partial success. One lookahead request may establish exhaustion at an
+    exact budget boundary. Transient errors get three paced attempts per page.
+    """
     host = _clean_domain(domain)
     if not host:
-        return []
+        raise ValueError("a storefront domain is required")
+    scan_limit = max_scan_products if max_scan_products is not None else max_products
+    if max_products < 1 or scan_limit < 1:
+        raise ValueError("product and scan budgets must be positive")
+    if only_vendors is not None and not any(str(v or "").strip() for v in only_vendors):
+        raise ValueError("only_vendors cannot contain only blank values")
     out: List[Dict[str, Any]] = []
+    scanned = 0
+    page = 1
+    seen_pages: set = set()
     timeout = httpx.Timeout(timeout_s, connect=5.0)
     headers = {"User-Agent": _UA, "Accept": "application/json"}
+
+    def incomplete(reason: str, status: str = "failed") -> CrawlIncomplete:
+        return CrawlIncomplete(f"{host}: page {page}: {reason}", status=status,
+                               next_page=page, scanned_products=scanned,
+                               selected_products=len(out))
+
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers=headers) as client:
-            page = 1
-            while len(out) < max_products:
+            while True:
                 url = f"https://{host}/products.json?limit={_PER_PAGE}&page={page}"
-                # Shared politeness gate: merchant storefront, same reserved NAT address as every
-                # other crawl lane. Paging is a loop against ONE host, which is exactly the shape
-                # that earns a per-IP block. max_wait=0 — batch, so wait rather than drop pages.
-                await crawl_politeness.before_request(url, user_agent=_UA, max_wait=0)
-                resp = await client.get(url)
-                crawl_politeness.note_response(
-                    url, resp.status_code, retry_after=resp.headers.get("retry-after")
-                )
-                if resp.status_code != 200 or "application/json" not in (resp.headers.get("content-type") or ""):
-                    break
-                products = (resp.json() or {}).get("products") or []
+                for attempt in range(3):
+                    await crawl_politeness.before_request(url, user_agent=_UA, max_wait=0)
+                    try:
+                        resp = await client.get(url)
+                    except (httpx.TimeoutException, httpx.TransportError):
+                        if attempt == 2:
+                            raise
+                        await asyncio.sleep(0.5 * (2 ** attempt))
+                        continue
+                    crawl_politeness.note_response(
+                        url, resp.status_code, retry_after=resp.headers.get("retry-after")
+                    )
+                    if resp.status_code not in {429, 500, 502, 503, 504} or attempt == 2:
+                        break
+                    await asyncio.sleep(0.5 * (2 ** attempt))
+                if resp.status_code != 200:
+                    raise incomplete(f"HTTP {resp.status_code}")
+                if "application/json" not in (resp.headers.get("content-type") or ""):
+                    raise incomplete("storefront did not return JSON")
+                body = resp.json()
+                if not isinstance(body, dict) or not isinstance(body.get("products"), list):
+                    raise incomplete("invalid products.json envelope")
+                products = body["products"]
+                if not all(isinstance(p, dict) for p in products):
+                    raise incomplete("products.json contains a non-object product")
                 if not products:
-                    break
-                out.extend(products)
+                    return ShopifyProductBatch(out, scanned_products=scanned, pages=page)
+                fingerprint = json.dumps(products, sort_keys=True, default=str)
+                if fingerprint in seen_pages:
+                    raise incomplete("repeated page; pagination did not advance")
+                seen_pages.add(fingerprint)
+                if scanned + len(products) > scan_limit:
+                    raise incomplete(f"scan budget {scan_limit} exhausted", "capped")
+                scanned += len(products)
+                selected = filter_products_by_vendor(products, only_vendors)
+                if len(out) + len(selected) > max_products:
+                    raise incomplete(f"selected-product budget {max_products} exhausted", "capped")
+                out.extend(selected)
                 if len(products) < _PER_PAGE:
-                    break
+                    return ShopifyProductBatch(out, scanned_products=scanned, pages=page)
                 page += 1
-    except Exception as exc:  # noqa: BLE001 — a brand site being down must not break the batch
-        logger.debug("fetch_shopify_products failed for %s: %s", host, str(exc)[:160])
-    return out[:max_products]
+    except CrawlIncomplete:
+        raise
+    except Exception as exc:
+        raise incomplete(f"{type(exc).__name__}: {str(exc)[:160]}") from exc
 
 
 def _first(seq: Any) -> Optional[Dict[str, Any]]:
@@ -933,19 +1006,17 @@ def _brand_key(value: Optional[str]) -> str:
     `_vendor_token` is left alone — it backs `filter_products_by_vendor`, where exact
     selection is the point and loose matching is the documented hazard.
     """
-    return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+    return "".join(c for c in str(value or "").casefold() if c.isalnum())
 
 
 def _looks_like_a_brand_name(value: Optional[str]) -> bool:
-    """Does this vendor string read as a NAME rather than a supplier/SKU code?
+    """Only explicit supplier-code shapes are codes; short/Unicode names are brands.
 
-    The test is one alphabetic run of three or more characters: `APIEU`, `CHOGONGJIN`
-    and `Time Revolution` pass; `VC-B004` (sukoshi.com's vendor on 11 measured rows)
-    and `3M`-style stubs do not. Deliberately crude — it decides only whether a vendor
-    is allowed to OVERRULE the operator's brand, and a false negative just keeps
-    today's behaviour.
+    3CE and Chinese/Korean labels are actual Meitu vendors. Length or ASCII-only
+    checks cannot establish that a merchant's different label is not a brand.
     """
-    return any(len(run) >= 3 for run in re.findall(r"[^\W\d_]+", str(value or ""), re.UNICODE))
+    raw = str(value or "").strip()
+    return bool(raw) and not raw.isdecimal() and not bool(re.fullmatch(r"[A-Za-z]{1,3}-[A-Za-z]?\d{3,}", raw))
 
 
 def resolve_record_brand(
@@ -983,7 +1054,7 @@ def resolve_record_brand(
         return o_raw, "override_no_vendor"
     v, o = _brand_key(v_raw), _brand_key(o_raw)
     if not v:
-        return o_raw, "override_no_vendor"
+        return v_raw, "vendor_disagrees"
     # Containment subsumes equality (`v == o` implies `v in o`), including below the
     # 3-char floor: two equal sub-floor keys cannot carry a 3-letter run either, so
     # they fall to `_looks_like_a_brand_name` and return the same string anyway. A
@@ -1019,6 +1090,8 @@ def shopify_product_to_record(
     # did not fold — `--base-listings-only` runs (MAC) stay byte-identical.
     emit_native_variants: bool = False,
     currency: Optional[str] = None,
+    source_role: str = "brand_official",
+    retailer_name: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Map one Shopify `/products.json` product → a Path-C validated record
     (`{pdp, offers}`). Returns None if it lacks a title/handle (not actionable).
@@ -1026,6 +1099,8 @@ def shopify_product_to_record(
     and carries the variant barcode (GTIN) when present."""
     if not isinstance(product, dict):
         return None
+    if source_role not in {"brand_official", "retailer"}:
+        raise ValueError("source_role must be brand_official or retailer")
     host = _clean_domain(domain)
     title = str(product.get("title") or "").strip()
     handle = str(product.get("handle") or "").strip()
@@ -1162,6 +1237,13 @@ def shopify_product_to_record(
         else [t.strip() for t in str(raw_tags or "").split(",") if t.strip()]
     )
     canonical_url = f"https://{host}/products/{handle}"
+    if str(category_path or "").startswith("beauty"):
+        from services.pdp_category_classifier import resolve_path_from_row
+        own_category = resolve_path_from_row(
+            category=None, product_type=product.get("product_type"), title=title,
+        )
+        if own_category:
+            category_path = own_category[1]
     return {
         "pdp": {
             "brand": brand,
@@ -1178,12 +1260,13 @@ def shopify_product_to_record(
             ),
             "barcode": barcode,  # real GTIN when the brand fills it — strongest deposit basis
             "source_domain": host,
+            "source_role": source_role,
             "tags": tags,
             # Brand-official INCI when the storefront lists it under an Ingredients
             # heading (many don't — None then, ingest skips it). brand_official is
             # the top INCI authority tier (ADR-001) so it outranks reseller lists.
             "raw_inci": inci_from_body_html(product.get("body_html")),
-            "inci_source": "brand_official",
+            "inci_source": "reseller_listing" if source_role == "retailer" else "brand_official",
             # Shopify /products.json exposes no review aggregate — ratings stay null
             # on this lane (captured on the retailer-PDP lane instead).
             "rating_value": None,
@@ -1200,7 +1283,14 @@ def shopify_product_to_record(
                 # `resolve_record_brand` can keep a sibling brand's own vendor (APIEU on
                 # misshaus.com), `brand` names the maker and the override names the shop.
                 # Identical on every single-brand feed, where the two are the same string.
-                "merchant_inferred": str(brand_override or "").strip() or brand,
+                "merchant_inferred": (
+                    str(retailer_name or "").strip() or host
+                    if source_role == "retailer"
+                    else str(brand_override or "").strip() or brand
+                ),
+                # Seller identity must be host-based in retailer mode even when two
+                # storefronts use the same friendly name. Official-mode IDs are untouched.
+                "seller_domain": host if source_role == "retailer" else None,
                 "canonical_url": canonical_url,
                 "destination_url": canonical_url,
                 "image_url": str(image.get("src") or "").strip(),
@@ -1486,6 +1576,9 @@ async def records_for_brand(
     emit_real_variants: bool = False,
     only_vendors: Optional[Sequence[str]] = None,
     require_currency: Optional[str] = None,
+    source_role: str = "brand_official",
+    retailer_name: Optional[str] = None,
+    max_scan_products: int = 10000,
     enrich_missing_inci: bool = False,
     max_pdp_inci_fetches: int = 300,
     # 0.0 since the shared politeness gate owns pacing. This ad-hoc sleep predates it and now
@@ -1502,6 +1595,9 @@ async def records_for_brand(
     Additive — body_html INCI stays the first try and is never overwritten here;
     the fetch is capped, delayed, and best-effort (a miss leaves raw_inci None).
 
+    `source_role="retailer"` uses storefront seller identity and reseller INCI authority,
+    and refuses unproven currency. Official-mode identity stays backward compatible.
+
     `only_vendors` selects a subset of a MULTI-BRAND retailer feed by Shopify `vendor`
     (see `filter_products_by_vendor`) — the selecting operation, as distinct from
     `brand`, which renames. Applied BEFORE the shade fold, so a fold never matches a
@@ -1512,10 +1608,18 @@ async def records_for_brand(
     Opt-in: omitted, behaviour is exactly what it was — best-effort, `None` on a miss,
     and `USD` from the ingest lane's default.
     """
-    products = await fetch_shopify_products(domain, max_products=max_products)
+    if source_role not in {"brand_official", "retailer"}:
+        raise ValueError("source_role must be brand_official or retailer")
+    fetch_options: Dict[str, Any] = {"max_products": max_products}
+    if only_vendors is not None or source_role == "retailer":
+        fetch_options.update(only_vendors=only_vendors, max_scan_products=max_scan_products)
+    products = await fetch_shopify_products(domain, **fetch_options)
+    records_for_brand.last_crawl_report = getattr(products, "crawl_report", None)  # type: ignore[attr-defined]
     # ONCE per brand, not per product: it is one storefront-wide setting and a per-product fetch
     # would multiply outbound requests by the catalogue size against a single host.
     locale = await fetch_shopify_shop_locale(domain)
+    if source_role == "retailer" and not _ISO_CURRENCY.fullmatch(str(locale.get("currency") or "")):
+        raise CurrencyNotProven(f"{domain}: retailer currency is unproven; refusing ingestion")
     if require_currency:
         expected = str(require_currency).strip().upper()
         actual = locale.get("currency")
@@ -1543,7 +1647,7 @@ async def records_for_brand(
                 f"the whole feed deliberately."
             )
         only_vendors = wanted
-        before = len(products)
+        before = (getattr(products, "crawl_report", None) or {}).get("scanned_products", len(products))
         products = filter_products_by_vendor(products, only_vendors)
         if not products:
             # LOUD, not empty. An unmatched vendor filter otherwise reports the same
@@ -1588,6 +1692,7 @@ async def records_for_brand(
             emit_variants=base_listings_only,
             emit_native_variants=emit_real_variants,
             currency=locale.get("currency"),
+            source_role=source_role, retailer_name=retailer_name,
         )
         if not rec:
             continue
