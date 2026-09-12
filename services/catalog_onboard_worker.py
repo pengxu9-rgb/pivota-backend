@@ -206,13 +206,19 @@ async def _process_curated_brand(payload: Dict[str, Any], *, apply: bool, db: An
             raise ValueError(f"{job['domain']}: record currency does not match required currency")
     if not records:
         return {"records": 0, "applied": None, "note": "no products enumerated", "crawl": crawl_report}
+    from services.catalog_enrichment_agent.primary_ingestion import (
+        inspect_primary_plan, require_primary_plan, require_primary_apply,
+    )
     plan = ingest_validated_jsonl(records)
     out = {"records": len(records), "plan_pdps": len(plan.get("pdps") or []), "applied": None,
-           "crawl": crawl_report}
+           "crawl": crawl_report, "primary_ingestion": inspect_primary_plan(plan)}
+    if apply:
+        preflight = require_primary_plan(plan)
     if apply and plan.get("pdps"):
         out["applied"] = await apply_ingest_plan(
             plan, batch_label=f"onboard_queue:curated:{payload.get('domain')}", db=db
         )
+        out["primary_ingestion"] = require_primary_apply(preflight, out["applied"])
     return out
 
 

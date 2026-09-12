@@ -1245,7 +1245,7 @@ def _resolve_category(*, product_type: Optional[str], title: Optional[str], flag
     """
     from services.pdp_category_classifier import CATEGORY_PATTERNS, classify
     fallback = str(flag_path or "").strip().strip("/").lower()
-    if fallback.split("/", 1)[0] != "beauty":
+    if fallback and fallback.split("/", 1)[0] != "beauty":
         return flag_path, CATEGORY_CONFIDENCE_FEED_DEFAULT
     leaves = {path for _label, path, _pattern in CATEGORY_PATTERNS}
 
@@ -1255,6 +1255,18 @@ def _resolve_category(*, product_type: Optional[str], title: Optional[str], flag
         return path, confidence
 
     ptype = " ".join(str(product_type or "").casefold().split())
+    # Exact merchant product types observed on the primary retailer feed. Lip
+    # Scrub belongs to the existing lip-care leaf despite also matching the
+    # generic exfoliator regex; Sun Protection names sunscreen, not an SPF claim
+    # on an unrelated formula. No marketing-title or storefront substitution.
+    explicit_types = {
+        "lip scrub": "beauty/makeup/lip/balm",
+        "sun protection": "beauty/skincare/sun/sunscreen",
+        # Foot Care is a body-care treatment, not footwear or a facial peel.
+        "foot care": "beauty/body/care",
+    }
+    if ptype in explicit_types:
+        return accept(explicit_types[ptype], CATEGORY_CONFIDENCE_MERCHANT_TYPE)
     matches = _pattern_matches(product_type)
     if matches > 1:
         return fallback, CATEGORY_CONFIDENCE_FEED_DEFAULT
@@ -1441,15 +1453,22 @@ def shopify_product_to_record(
         else [t.strip() for t in str(raw_tags or "").split(",") if t.strip()]
     )
     canonical_url = f"https://{host}/products/{handle}"
+    category_input_path = category_path
     category_path, category_confidence = _resolve_category(
         title=title, product_type=product.get("product_type"), flag_path=category_path,
     )
+    from services.category_path_aliases import resolve
+    category_path = resolve(category_path)
+    category_resolution_status = "resolved" if category_path else "unresolved"
     return {
         "pdp": {
             "brand": brand,
             "product_name": title,
             "category_path": category_path,
             "category_confidence": category_confidence,
+            "category_resolution_status": category_resolution_status,
+            "category_input_path": category_input_path,
+            "category_source_product_type": str(product.get("product_type") or "").strip() or None,
             # Brand-authored body copy when present (it becomes the row's
             # description and feeds the lifecycle candidate gate + taxonomy
             # extractors); product_type alone otherwise. Rows minted without
@@ -1473,8 +1492,7 @@ def shopify_product_to_record(
             "rating_value": None,
             "rating_count": None,
             # The STOREFRONT's own currency, from /meta.json. Omitted (None) rather than
-            # defaulted here: the ingest lane owns the fallback, so a record that never learned
-            # its currency is indistinguishable from one that did and is genuinely USD.
+            # defaulted here: direct ingestion also refuses an unknown currency.
             "currency": currency,
             "variants": pdp_variants,
         },
@@ -1704,20 +1722,9 @@ def drop_shade_listings(products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 class CurrencyNotProven(RuntimeError):
     """A storefront's own currency could not be proven, or is not the one asked for.
 
-    Raised INSTEAD of ingesting, because the alternative is silent and wrong: a record
-    that never learned its currency arrives at `ingestion._currency_of` with None and
-    is stamped the DEFAULT, `USD`. That default is correct for the US corpus it was
-    written for and is a mispricing everywhere else -- an SGD 30.00 lip tint served as
-    USD 30.00 is a 1.35x overstatement carrying no signal that it is wrong.
-
-    The failure is not hypothetical and not rare. Measured 2026-09-07 while probing the
-    three Singapore storefronts: `/meta.json` on cocomo.sg answered 429 with a
-    "Verifying your connection..." bot-check HTML page (the shop had just served four
-    pages of `/products.json`), so `fetch_shopify_shop_locale` returned
-    `{'currency': None}` -- a store that prices in SGD, one throttled request away from
-    1,000 USD-stamped rows. `fetch_shopify_shop_locale` is best-effort BY DESIGN and
-    must stay so; what was missing is a caller that can say "I know this is an SGD
-    store, refuse the run if you cannot see SGD".
+    Both the enumerator and direct ingestion refuse unknown currency. A blocked
+    or unreadable /meta.json remains a failed observation; prices are never
+    assigned USD because the source did not prove its currency.
 
     NEVER a conversion. This raises; it does not rewrite an amount into another
     currency. See services/region_pricing (ADR-024 commitment 5).
@@ -1820,8 +1827,8 @@ async def records_for_brand(
 
     `require_currency` (an ISO-4217 code) refuses the whole brand with
     `CurrencyNotProven` unless the storefront's own `/meta.json` proves that currency.
-    Opt-in: omitted, behaviour is exactly what it was — best-effort, `None` on a miss,
-    and `USD` from the ingest lane's default.
+    All runs require a proven currency; this option additionally asserts the
+    exact requested code. No amount is converted or assigned a default currency.
     """
     if source_role not in {"brand_official", "retailer"}:
         raise ValueError("source_role must be brand_official or retailer")
@@ -1839,8 +1846,8 @@ async def records_for_brand(
     # ONCE per brand, not per product: it is one storefront-wide setting and a per-product fetch
     # would multiply outbound requests by the catalogue size against a single host.
     locale = await fetch_shopify_shop_locale(domain)
-    if source_role == "retailer" and not _ISO_CURRENCY.fullmatch(str(locale.get("currency") or "")):
-        raise CurrencyNotProven(f"{domain}: retailer currency is unproven; refusing ingestion")
+    if not _ISO_CURRENCY.fullmatch(str(locale.get("currency") or "")):
+        raise CurrencyNotProven(f"{domain}: storefront currency is unproven; expected {require_currency or 'an explicit currency'}; refusing ingestion")
     if require_currency:
         expected = str(require_currency).strip().upper()
         actual = locale.get("currency")
@@ -1848,9 +1855,8 @@ async def records_for_brand(
             # BEFORE the records are built, so a refused brand cannot half-ingest.
             raise CurrencyNotProven(
                 f"{domain}: expected currency {expected}, storefront /meta.json proved "
-                f"{actual or 'nothing'}. Refusing rather than ingesting — the ingest lane "
-                f"defaults an unknown currency to USD, and this run cannot show the prices "
-                f"are in {expected}. If /meta.json was unreadable, retry: a 429 bot-check "
+                f"{actual or 'nothing'}. Prices cannot be claimed as {expected}. "
+                f"If /meta.json was unreadable, retry: a 429 bot-check "
                 f"page reads exactly like a missing file. If {actual or 'the proven value'} "
                 f"is genuinely right, pass --require-currency {actual or '<code>'} instead."
             )

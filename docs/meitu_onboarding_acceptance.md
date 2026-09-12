@@ -88,3 +88,19 @@ There is no `--apply`. Repeat for `eyurs.com` and review the plans. The final ob
 The existing `ENABLE_INTAKE_IDENTITY_ENRICHMENT` flag defaults off. Inspect the effective deployment setting and its rollout prerequisites; this release does not flip it. Use the sequential per-row apply path for the fresh two-retailer acceptance case. The batch executor resolves its new rows before inserting, so fresh cross-title rows cannot discover one another within that same batch. Existing curated product-group memberships are preserved; deploying the mapper does not merge old split groups.
 
 Evidence must distinguish retailer listing `product_key` from the actual shared `content_key` and `product_group_id`. When the buyer-facing lookup key differs, record `canonical_product_key` for search/PDP/offer-surface observations. Seller-specific offer tuples retain the listing key and native variant. Matching GTINs or a mocked identity-gate test alone do not prove production group convergence. Review any GTIN/title-drift flags and verify actual membership and seller offers after the controlled ingest.
+
+
+## Primary ingestion contract
+
+Unproven currency fails direct JSONL planning and curated enumeration, including official mode without `require_currency`. Currency must be an explicit three-letter observation; there is no USD default or conversion. This validates shape and presence, not membership in an ISO registry.
+
+A caller's broad category shelf stays in `category_input_path` for review. If product evidence cannot resolve a supported leaf, curated mapping emits `category_path=null` and `category_resolution_status=unresolved`; the planned PDP remains draft. Queue and CLI apply refuse the unresolved cohort before database writes. Dry-run plans report blocked categories explicitly. No serving flags or existing production rows are changed.
+
+Queue and CLI apply compare actual PDP/SKU/offer counts with the reviewed plan. Missing PDPs/offers, zero usable SKUs, or unexplained lost SKU rows are partial failure, with counts retained in the queue error. Only explicitly counted natural-key SKU deduplication explains a reduced SKU count. Some rows may already have committed when a write error occurs; the job retries its stable natural keys rather than claiming completion.
+
+GTIN remains optional: a real product without a barcode is not rejected solely for that absence. Optional detail recovery and successful writes do not prove shared identity or search. Reports keep `primary_search_verified=false` and `shared_identity_verified=false`; acceptance requires a primary query with supplemental lanes disabled and each expected seller/native-variant/destination tuple present.
+
+
+Primary feed replay on 2026-09-12 (optional GTIN recovery disabled) read AsianBeautyEssentials 677 products across 3 pages, selected all 17 A'PIEU products, and planned 17 PDPs / 34 SKUs / 34 offers with zero unresolved categories. Eyurs read 434 products across 2 pages, selected 3, and planned 3 PDPs / 6 SKUs / 6 offers. These are source-read and pure-plan outcomes, not production ingestion or search proof.
+
+The last four category cases were resolved from exact merchant product types: `Lip Scrub` maps to the existing lip-care leaf `beauty/makeup/lip/balm` (the taxonomy already includes lip scrubs there), `Sun Protection` maps to sunscreen, and `Foot Care` maps to existing `beauty/body/care`. The original product type is preserved as `category_source_product_type` in record and persisted enrichment metadata. `Footwear`, `Foot Care Shoes`, `Sun Protection Accessories`, and mixed `Lip Scrub & Cleanser` remain unresolved; no broad title classifier was introduced.

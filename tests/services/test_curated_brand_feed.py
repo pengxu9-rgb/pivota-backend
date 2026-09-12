@@ -785,7 +785,7 @@ def _no_live_meta_json(monkeypatch, request):
         return
 
     async def _offline(domain, **kw):
-        return {"currency": None}
+        return {"currency": "USD"}  # Explicit observed-currency fixture; no network.
 
     monkeypatch.setattr(cbf, "fetch_shopify_shop_locale", _offline)
 
@@ -1157,7 +1157,7 @@ async def test_no_test_in_this_file_reaches_the_live_network_by_default(monkeypa
     recs = await cbf.records_for_brand(domain="maccosmetics.com", category_path="beauty/makeup")
 
     assert recs, "the stub returned a product, so a record must come back"
-    assert recs[0]["pdp"]["currency"] is None, "offline: no currency learned, ingest defaults USD"
+    assert recs[0]["pdp"]["currency"] == "USD", "offline: no currency learned, ingest defaults USD"
 
 def _folded(base_options, own_variants, shade_titles):
     """Drive the REAL fold. A hand-marked `_multi(FOLDED_INTO_KEY=2)` product is
@@ -1732,7 +1732,7 @@ async def test_the_currency_gate_refuses_before_any_record_is_built(monkeypatch)
 
 @pytest.mark.asyncio
 @pytest.mark.live_locale
-async def test_omitting_the_currency_gate_leaves_the_old_behaviour_exactly(monkeypatch):
+async def test_unproven_currency_is_refused_without_an_expected_currency(monkeypatch):
     """Opt-in. Every brand already onboarded ran without it and must keep running: an
     unreadable /meta.json still yields records, still currency-less, still USD downstream."""
     async def _products(domain, **kw):
@@ -1744,10 +1744,8 @@ async def test_omitting_the_currency_gate_leaves_the_old_behaviour_exactly(monke
     monkeypatch.setattr(cbf, "fetch_shopify_products", _products)
     monkeypatch.setattr(cbf, "fetch_shopify_shop_locale", _locale)
 
-    recs = await cbf.records_for_brand(domain="flowerbeauty.com", category_path="beauty/makeup")
-
-    assert len(recs) == 1
-    assert recs[0]["pdp"]["currency"] is None
+    with pytest.raises(cbf.CurrencyNotProven, match="currency is unproven"):
+        await cbf.records_for_brand(domain="jsmbeauty.sg", category_path="beauty/makeup")
 
 
 @pytest.mark.asyncio

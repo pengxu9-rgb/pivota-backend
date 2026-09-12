@@ -29,6 +29,9 @@ if str(ROOT) not in sys.path:
 
 from services.catalog_enrichment_agent.apply import apply_ingest_plan  # noqa: E402
 from services.catalog_enrichment_agent.ingestion import ingest_validated_jsonl  # noqa: E402
+from services.catalog_enrichment_agent.primary_ingestion import (  # noqa: E402
+    inspect_primary_plan, require_primary_plan, require_primary_apply,
+)
 from services.curated_brand_feed import CrawlIncomplete, records_for_brand  # noqa: E402
 
 
@@ -132,6 +135,7 @@ async def _run(args: argparse.Namespace) -> int:
         f"offers={len(plan.get('offers') or [])} seeds={len(plan.get('seeds') or [])} "
         f"skipped={plan.get('skipped')}"
     )
+    print("primary ingestion: " + json.dumps(inspect_primary_plan(plan), sort_keys=True))
     if not args.apply:
         pdps = plan.get("pdps") or []
         for p in pdps[:5]:
@@ -139,12 +143,14 @@ async def _run(args: argparse.Namespace) -> int:
         print("  DRY-RUN — re-run with --apply to ingest as depositable anchors.")
         return 0
 
+    preflight = require_primary_plan(plan)
     from db.database import database  # noqa: E402
     if not getattr(database, "is_connected", False):
         await database.connect()
     try:
         counts = await apply_ingest_plan(plan, batch_label=f"curated_brands:{len(brands)}", db=database)
-        print(f"applied: {counts}")
+        result = require_primary_apply(preflight, counts)
+        print("primary ingestion: " + json.dumps(result, sort_keys=True))
     finally:
         if getattr(database, "is_connected", False):
             await database.disconnect()
@@ -199,8 +205,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         metavar="ISO4217",
         help=(
             "refuse the brand unless its /meta.json proves this currency (e.g. SGD). "
-            "Without it an unreadable /meta.json — a 429 bot-check reads exactly like a "
-            "missing one — leaves the record currency-less and the ingest lane stamps USD. "
+            "All runs require observed currency; this additionally asserts the expected code. "
             "Never converts: it refuses."
         ),
     )

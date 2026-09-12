@@ -185,6 +185,7 @@ def _validated_offers(record: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _build_pdp_payload(record: Dict[str, Any]) -> Dict[str, Any]:
+    from services.category_path_aliases import resolve
     pdp = record.get("pdp") or {}
     if not isinstance(pdp, dict):
         return {}
@@ -216,6 +217,9 @@ def _build_pdp_payload(record: Dict[str, Any]) -> Dict[str, Any]:
         "brand": proper_case_brand(pdp.get("brand")),
         "product_name": str(pdp.get("product_name") or "").strip(),
         "category_path": str(pdp.get("category_path") or "").strip(),
+        "category_resolution_status": "resolved" if resolve(pdp.get("category_path")) else "unresolved",
+        "category_input_path": pdp.get("category_input_path") or pdp.get("category_path"),
+        "category_source_product_type": pdp.get("category_source_product_type"),
         # Category confidence from the producing lane, when it has any. This payload is a
         # WHITELIST -- a field absent here is dropped no matter what the record carried -- so a
         # lane's classification would be silently discarded without this line, exactly as the
@@ -500,6 +504,9 @@ def _build_pdp_insert(
         "source_jsonl": source_jsonl or None,
         "candidate_attribute_summary": pdp_payload.get("attribute_summary") or None,
         "offer_count": len(offers),
+        "category_resolution_status": pdp_payload.get("category_resolution_status"),
+        "category_input_path": pdp_payload.get("category_input_path"),
+        "category_source_product_type": pdp_payload.get("category_source_product_type"),
     }
     return {
         "product_key": product_key,
@@ -609,6 +616,9 @@ def _lifecycle_stage_for_agent_pdp(
     """Compute the lifecycle stage for a Path C agent-ingested row.
     Reuses the same compute_lifecycle_stage gates as Path A/B —
     inputs reshape to the row dict the gate expects."""
+    from services.category_path_aliases import resolve
+    if not resolve(pdp_payload.get("category_path")):
+        return "draft"
     # The taxonomy v1 derivation runs again here to get list values
     # (the main return path serializes to JSON strings for the runner;
     # the gate needs Python lists).
@@ -668,26 +678,16 @@ def _taxonomy_v1_payload(pdp_payload: Dict[str, Any], offers: List[Dict[str, Any
     }
 
 
-DEFAULT_CURRENCY = "USD"
-
 _ISO_CURRENCY = re.compile(r"^[A-Z]{3}$")
 
 
 def _currency_of(pdp_payload: Dict[str, Any]) -> str:
-    """The record's own currency, or USD.
-
-    Every currency in this module was the literal "USD", in seven places, and nothing ever read
-    one off the record -- so a Singapore storefront pricing in SGD was ingested as USD. Measured
-    2026-09-06 on jsmbeauty.sg: 170 offers, `{'USD': 170}`, against a storefront whose meta.json
-    says SGD/SG and whose LIP-PRESSION Glowy Tint is SGD 30.00. A currency is a join key for
-    price comparison and ranking, so a wrong one is not a display bug.
-
-    USD REMAINS THE DEFAULT, deliberately: every record built before this change carries no
-    currency, and defaulting preserves exactly what those rows already have. Validated because
-    the value originates in merchant-controlled JSON.
-    """
-    raw = str((pdp_payload or {}).get("currency") or "").strip().upper()
-    return raw if _ISO_CURRENCY.match(raw) else DEFAULT_CURRENCY
+    """Return explicitly observed currency; unknown money cannot become USD."""
+    value = (pdp_payload or {}).get("currency")
+    raw = value.strip().upper() if isinstance(value, str) else ""
+    if not _ISO_CURRENCY.fullmatch(raw):
+        raise ValueError("currency_unproven: explicit storefront currency is required before ingestion")
+    return raw
 
 
 def _build_seed_inserts(
@@ -1130,12 +1130,13 @@ def _build_offer_inserts(
     sku_key: str,
     offers: List[Dict[str, Any]],
     source_domain: Optional[str] = None,
-    currency: str = DEFAULT_CURRENCY,
+    currency: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """One catalog_offers row per validated offer. merchant_id resolves
     to the per-retailer synthetic id (see derive_merchant_id), which is
     what makes Phase 6 seller_count meaningful for the canonical
     classification."""
+    currency = _currency_of({"currency": currency})
     rows: List[Dict[str, Any]] = []
     seen_offer_ids: set = set()
     for offer in offers:
@@ -1231,6 +1232,7 @@ def ingest_validated_record(record: Dict[str, Any], *, source_jsonl: Optional[st
         # Record without any validated offer is not actionable —
         # we don't create empty PDPs.
         return None
+    _currency_of(pdp_payload)  # Fail the pure plan before any row can be applied.
     # W2 (ADR-011 R5 closure): resolve the seller of record BEFORE building any
     # row. Retailer domains key on etld1 alone; brand-direct keys on
     # (brand, etld1). Unresolvable -> the record is BLOCKED (skipped loudly and

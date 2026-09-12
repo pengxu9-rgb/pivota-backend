@@ -94,7 +94,7 @@ async def test_non_latin_brands_do_not_collapse_in_spelling_fold(monkeypatch):
     ("MISSHA Artistool Foundation Brush #101", "", "beauty/tools/brush"),
     ("Honey Milk Lip Oil", "Lip Oil", "beauty/makeup/lip/oil"),
     ("Gentle Cleanser", "Cleanser", "beauty/skincare/cleanse/cleanser"),
-    ("Mystery Item", "", "beauty/skincare"),
+    ("Mystery Item", "", None),
 ])
 def test_category_comes_from_product_not_store(title, product_type, want):
     assert map_record("misshaus.com", title=title, product_type=product_type)["pdp"]["category_path"] == want
@@ -275,5 +275,5 @@ def test_lip_oil_exception_does_not_overrule_specific_competing_types(product_ty
 
 def test_generic_lip_care_does_not_assume_every_product_is_an_oil():
     rec = map_record("retailer.com", title="Honey & Milk Moisture", product_type="Lip Care")
-    assert rec["pdp"]["category_path"] == "beauty/skincare"
+    assert rec["pdp"]["category_path"] is None
     assert rec["pdp"]["category_confidence"] == feed.CATEGORY_CONFIDENCE_FEED_DEFAULT

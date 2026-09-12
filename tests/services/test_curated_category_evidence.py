@@ -30,7 +30,8 @@ def test_one_storefront_has_multiple_product_categories_and_confidence_survives_
                                     "Powder Kiss Velvet Blur Slim Stick", "Strobe Cream"])
 def test_claude_powder_kiss_marketing_negatives_are_preserved(title):
     rec = record(title=title, product_type=None)
-    assert rec["pdp"]["category_path"] == "beauty/makeup"
+    assert rec["pdp"]["category_path"] is None
+    assert rec["pdp"]["category_resolution_status"] == "unresolved"
     assert rec["pdp"]["category_confidence"] == feed.CATEGORY_CONFIDENCE_FEED_DEFAULT
 
 
@@ -65,7 +66,8 @@ def test_narrow_tool_titles_correct_the_measured_missha_error(title, ptype):
                                     "Foundation + Brush", "Powder/Brush", "Foundation & Brush"])
 def test_formula_titles_cannot_enter_the_tool_exception(title):
     rec = record(title=title, product_type="MAKEUP", category="beauty/skincare")
-    assert rec["pdp"]["category_path"] == "beauty/skincare"
+    assert rec["pdp"]["category_path"] is None
+    assert rec["pdp"]["category_resolution_status"] == "unresolved"
     assert rec["pdp"]["category_confidence"] == feed.CATEGORY_CONFIDENCE_FEED_DEFAULT
 
 
