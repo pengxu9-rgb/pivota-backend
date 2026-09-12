@@ -44,6 +44,7 @@ from services.beauty_external_ranking import (
 )
 from services.category_kind import resolve_category_kind
 from services.catalog_identity import make_content_key
+from services.intake_identity import canonical_gtin
 from services.catalog_sync_service import make_pivota_canonical_fields
 from services.seller_identity import (
     BANNED_BUCKET_MERCHANT_ID,
@@ -522,6 +523,13 @@ def _build_pdp_insert(
         "title": pdp_payload["product_name"],
         "description": pdp_payload.get("attribute_summary") or None,
         "brand": pdp_payload["brand"],
+        # Preserve captured strong identity through the pure plan to the apply
+        # gate. Without this column, native SKUs retained their barcode but the
+        # PDP identity resolver never received it. Use the same canonicalizer
+        # as the gate; missing/rejected source identifiers remain absent.
+        # `gtin` already has a SQL bind in both apply executors; do not forward
+        # the input-only `barcode` alias as an extra row/bind field.
+        "gtin": canonical_gtin(pdp_payload.get("gtin") or pdp_payload.get("barcode")),
         "product_type": pdp_payload.get("category_path", "").split("/")[-1] or None,
         "category": pdp_payload.get("category_path", "").split("/")[-1] or None,
         "category_path": pdp_payload.get("category_path") or None,
@@ -575,10 +583,10 @@ def _build_pdp_insert(
         # Stage 1 (mig 083): content-derived identity. Path C is the
         # path most likely to share a content_key with Path A/B rows
         # (same physical product enriched by the agent + scraped by
-        # the mirror + sold via a connected merchant). Agent payloads
-        # typically don't carry GTIN at the candidate stage — gtin
-        # arrives later via offers. Stage 2 auto-grouper will pick up
-        # cross-path matches via brand+title alone.
+        # the mirror + sold via a connected merchant). This is still a
+        # pure-plan candidate key, not proof of cross-retailer attachment.
+        # Captured GTIN is carried separately above for the flag-gated
+        # apply resolver; no DB matching or product/signature rekey here.
         "content_key": make_content_key(
             pdp_payload.get("brand"),
             pdp_payload.get("product_name"),

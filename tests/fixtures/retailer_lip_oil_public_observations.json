@@ -13,9 +13,11 @@
           "id": 43603819692287,
           "barcode": "8809530070499",
           "sku": "APECM09-LipO",
-          "title": "Default Title"
+          "title": "Default Title",
+          "raw_minor_price": 1000
         }
-      ]
+      ],
+      "currency": "USD"
     },
     {
       "url": "https://eyurs.com/products/apieu-honey-milk-lip-oil.js",
@@ -28,9 +30,12 @@
           "id": 41807436316855,
           "barcode": "8809530070499",
           "sku": "APU-HON-OIL",
-          "title": "Default Title"
+          "title": "Default Title",
+          "raw_minor_price": 500
         }
-      ]
+      ],
+      "currency": "USD"
     }
-  ]
+  ],
+  "price_provenance": "Follow-up read-only same-PDP .js observations: minor USD units; USD proved by same-storefront locale canary. These are captured observations, not current stock claims."
 }
