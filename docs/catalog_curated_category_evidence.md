@@ -41,3 +41,10 @@ separate route for unresolved residue; this feed change does not run that backfi
 `scripts/plan_curated_category_repair.py` emits expected-old/proposed-new values from
 an existing catalog snapshot and calls the same resolver. It has no database access
 or apply mode. Deploying these source changes alone does not rewrite historical rows.
+
+The snapshot planner can separately challenge a known wrong leaf with
+`--review-existing-leaves`. Each such row must include `category_evidence` containing
+the original merchant title, product_type, source_url and observed_at. It records
+that evidence plus the expected old path, and never proposes a coarse downgrade.
+This is still a review-only manifest: it does not update any database row. Ordinary
+feed mapping and the shallow backfill continue to protect existing specific leaves.
