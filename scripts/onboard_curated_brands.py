@@ -59,6 +59,14 @@ async def _run(args: argparse.Namespace) -> int:
 
     all_records: List[Dict[str, Any]] = []
     for b in brands:
+        only_vendors = b.get("only_vendors", args.only_vendor or None)
+        source_role = b.get("source_role") or args.source_role
+        retailer_name = b.get("retailer_name") or args.retailer_name
+        if (only_vendors is not None or retailer_name) and not source_role:
+            raise ValueError(f"{b['domain']}: vendor-filtered/retailer jobs require explicit --source-role")
+        source_role = source_role or "brand_official"
+        if retailer_name and source_role != "retailer":
+            raise ValueError("retailer_name requires source_role=retailer")
         recs = await records_for_brand(
             domain=b["domain"],
             category_path=b.get("category_path") or args.category or "",
@@ -68,13 +76,13 @@ async def _run(args: argparse.Namespace) -> int:
             emit_real_variants=args.emit_real_variants,
             # Per-brand rows win over the flags: a --file run mixes a single-brand
             # storefront with a retailer feed, and only the row knows which is which.
-            only_vendors=b.get("only_vendors") or args.only_vendor or None,
+            only_vendors=only_vendors,
             require_currency=b.get("require_currency") or args.require_currency,
-            source_role=b.get("source_role") or args.source_role,
-            retailer_name=b.get("retailer_name") or args.retailer_name,
+            source_role=source_role,
+            retailer_name=retailer_name,
             max_scan_products=b.get("max_scan_products") or args.max_scan_products,
         )
-        crawl_report = getattr(records_for_brand, "last_crawl_report", None)
+        crawl_report = getattr(recs, "crawl_report", None)
         if crawl_report:
             print("    crawl: " + json.dumps(crawl_report, sort_keys=True))
         vendor_report = getattr(records_for_brand, "last_vendor_filter_report", None)
@@ -194,7 +202,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "Never converts: it refuses."
         ),
     )
-    p.add_argument("--source-role", choices=["brand_official", "retailer"], default="brand_official",
+    p.add_argument("--source-role", choices=["brand_official", "retailer"], default=None,
                    help="Retailer mode separates seller from maker and requires proven currency")
     p.add_argument("--retailer-name", help="Retailer display name; defaults to its host")
     p.add_argument("--max-scan-products", type=int, default=10000,
@@ -205,6 +213,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         return asyncio.run(_run(args))
     except CrawlIncomplete as exc:
         print(json.dumps({"crawl": exc.as_dict()}), file=sys.stderr)
+        return 2
+    except ValueError as exc:
+        print(json.dumps({"error": str(exc)}), file=sys.stderr)
         return 2
 
 

@@ -120,8 +120,8 @@ async def test_vendor_selection_scans_past_selected_product_budget(monkeypatch):
     records = await feed.records_for_brand(domain="retailer.com", category_path="beauty", source_role="retailer",
                                           only_vendors=["A'PIEU"], max_products=1, max_scan_products=10)
     assert len(records) == 1 and len(reqs) == 3
-    assert feed.records_for_brand.last_crawl_report == {
-        "status": "complete", "pages": 3, "scanned_products": 5, "selected_products": 1,
+    assert records.crawl_report == {
+        "status": "complete", "pages": 3, "scanned_products": 5, "selected_products": 1, "emitted_records": 1,
     }
 
 
@@ -222,3 +222,33 @@ def test_native_variant_ids_are_scoped_to_their_actual_retailer():
     assert {o["merchant_id"] for o in native_offers} == {
         "agent_seed::retailer::sukoshi.com", "agent_seed::retailer::sentisenti.com",
     }
+
+
+def test_filtered_cli_requires_an_explicit_source_role(monkeypatch, capsys):
+    from scripts import onboard_curated_brands as cli
+    fetch = AsyncMock()
+    monkeypatch.setattr(cli, "records_for_brand", fetch)
+    assert cli.main(["--domain", "retailer.com", "--category", "beauty", "--only-vendor", "3CE"]) == 2
+    assert "explicit --source-role" in capsys.readouterr().err
+    fetch.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_record_batches_retain_their_own_scan_evidence(monkeypatch):
+    import asyncio
+    a_report = {"status": "complete", "scanned_products": 10, "selected_products": 1, "pages": 2}
+    b_report = {"status": "complete", "scanned_products": 20, "selected_products": 1, "pages": 3}
+    async def fetch(domain, **kw):
+        return feed.CuratedRecordBatch([product()], crawl_report=a_report if domain == "a.com" else b_report)
+    async def locale(domain):
+        await asyncio.sleep(0)
+        return {"currency": "USD"}
+    monkeypatch.setattr(feed, "fetch_shopify_products", fetch)
+    monkeypatch.setattr(feed, "fetch_shopify_shop_locale", locale)
+    first, second = await asyncio.gather(*[
+        feed.records_for_brand(domain=host, category_path="beauty", source_role="retailer")
+        for host in ["a.com", "b.com"]
+    ])
+    assert first.crawl_report["scanned_products"] == 10
+    assert second.crawl_report["scanned_products"] == 20
+    assert first.crawl_report is not second.crawl_report

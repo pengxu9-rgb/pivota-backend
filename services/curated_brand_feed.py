@@ -1571,6 +1571,13 @@ def filter_products_by_vendor(
     ]
 
 
+class CuratedRecordBatch(list):
+    """Validated records and their own scan outcome, safe across concurrent calls."""
+    def __init__(self, records: list, *, crawl_report: Optional[Dict[str, Any]] = None):
+        super().__init__(records)
+        self.crawl_report = dict(crawl_report) if crawl_report is not None else None
+
+
 async def records_for_brand(
     *,
     domain: str,
@@ -1623,7 +1630,9 @@ async def records_for_brand(
     if only_vendors is not None or source_role == "retailer":
         fetch_options.update(only_vendors=only_vendors, max_scan_products=max_scan_products)
     products = await fetch_shopify_products(domain, **fetch_options)
-    records_for_brand.last_crawl_report = getattr(products, "crawl_report", None)  # type: ignore[attr-defined]
+    crawl_report = getattr(products, "crawl_report", None)
+    # Compatibility/debug only; callers must use the returned batch's own report.
+    records_for_brand.last_crawl_report = crawl_report  # type: ignore[attr-defined]
     # ONCE per brand, not per product: it is one storefront-wide setting and a per-product fetch
     # would multiply outbound requests by the catalogue size against a single host.
     locale = await fetch_shopify_shop_locale(domain)
@@ -1743,4 +1752,5 @@ async def records_for_brand(
         records_for_brand.last_brand_spelling_folds = canonical  # type: ignore[attr-defined]
     else:
         records_for_brand.last_brand_spelling_folds = {}  # type: ignore[attr-defined]
-    return records
+    report = {**crawl_report, "emitted_records": len(records)} if crawl_report is not None else None
+    return CuratedRecordBatch(records, crawl_report=report)
