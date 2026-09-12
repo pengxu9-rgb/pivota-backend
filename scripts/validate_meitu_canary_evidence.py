@@ -19,24 +19,13 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
 
-def canonical_gtin(value) -> str | None:
-    """Validate a source GS1 barcode and return its zero-padded GTIN-14 identity."""
-    if not isinstance(value, str) or not re.fullmatch(r"[0-9\s-]+", value):
-        return None
-    digits = re.sub(r"[\s-]", "", value)
-    if len(digits) not in (8, 12, 13, 14) or not any(c != "0" for c in digits):
-        return None
-    weighted = sum(int(d) * (3 if i % 2 == 0 else 1)
-                   for i, d in enumerate(reversed(digits[:-1])))
-    if (weighted + int(digits[-1])) % 10:
-        return None
-    return digits.zfill(14)
+# The observation and acceptance boundaries share the same GS1 validation.
+from services.curated_brand_feed import validated_source_gtin as canonical_gtin
 
 
 def evaluate(manifest: dict, evidence: dict, *, now=None) -> dict:
