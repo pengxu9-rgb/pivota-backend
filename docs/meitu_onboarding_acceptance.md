@@ -72,3 +72,19 @@ python -m scripts.audit_crawl_seed_recall_scope --apply-plan scope-plan.json --o
 ```
 
 Apply locks exact rows, compares every recorded before value, checks collisions again and changes only tool/updated_at. Any stale row or uniqueness failure rolls back the whole transaction. Keep both plan and result; before values are retained for a separately reviewed reversal. Re-audit the same IDs afterward and verify their intended agent scope through fresh recall. This procedure does not fix sibling-brand duplicate keys, category errors, missing variants or stale product content; those need separate scoped plans. No production repair was run as part of this change.
+
+## Optional GTIN recovery and canonical attachment
+
+The final live canary found that both retailer bulk feeds omit barcodes while their product `.js` responses expose them. Opt in with `enrich_missing_gtin=true` / `--enrich-missing-gtin` and `max_pdp_identity_fetches` / `--max-pdp-identity-fetches` (default 100). Recovery is disabled by default, runs after vendor selection and before shade folding, and only fills missing barcodes after exact product, handle, vendor and native-variant checks. Same-storefront redirects are bounded; prices, titles and existing identifiers are preserved. The batch's `gtin_recovery` report distinguishes attempted/recovered/failed/capped products and actual detail requests.
+
+A read-only canary command is:
+
+```sh
+python -m scripts.onboard_curated_brands --domain asianbeautyessentials.com --category beauty --brand "A'PIEU" --only-vendor "A'PIEU" --source-role retailer --require-currency USD --emit-real-variants --enrich-missing-gtin --max-pdp-identity-fetches 100 --max-products 100 --max-scan-products 1500
+```
+
+There is no `--apply`. Repeat for `eyurs.com` and review the plans. The final observations recovered valid GTINs for all 17 and 3 selected products, respectively, and both lip-oil PDP plan rows retained `08809530070499`. Their mapped variants were unavailable; this demonstrates identity observation and plan construction, not a purchasable live offer. Choose a currently available shared item for purchase-eligible serving acceptance.
+
+The existing `ENABLE_INTAKE_IDENTITY_ENRICHMENT` flag defaults off. Inspect the effective deployment setting and its rollout prerequisites; this release does not flip it. Use the sequential per-row apply path for the fresh two-retailer acceptance case. The batch executor resolves its new rows before inserting, so fresh cross-title rows cannot discover one another within that same batch. Existing curated product-group memberships are preserved; deploying the mapper does not merge old split groups.
+
+Evidence must distinguish retailer listing `product_key` from the actual shared `content_key` and `product_group_id`. When the buyer-facing lookup key differs, record `canonical_product_key` for search/PDP/offer-surface observations. Seller-specific offer tuples retain the listing key and native variant. Matching GTINs or a mocked identity-gate test alone do not prove production group convergence. Review any GTIN/title-drift flags and verify actual membership and seller offers after the controlled ingest.

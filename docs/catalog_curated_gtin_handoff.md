@@ -34,3 +34,5 @@ The fixture's mocked ATTACH result is not evidence that production attachment
 has happened. Bulk-feed barcode recovery remains a separate prerequisite for
 this strong identity to be available in ordinary feed ingestion. No database
 apply, production mutation or live identity lookup was run for this change.
+
+The final observation boundary shares `catalog_identity.validated_source_gtin` across detail recovery, PDP-row handoff and acceptance screening. It rejects invalid lengths/check digits and all-zero identifiers before normalizing to GTIN-14. The legacy normalization function is unchanged.
