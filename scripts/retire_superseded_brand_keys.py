@@ -204,6 +204,14 @@ async def apply(p: Dict[str, Any], manifest_path: str) -> Dict[str, Any]:
     }
     Path(manifest_path).write_text(json.dumps(manifest, indent=1, default=str))
     print(f"manifest written BEFORE the write: {manifest_path}")
+    # AND to stdout. This script's normal home is a Cloud Run Job, whose filesystem dies
+    # with the container — a manifest that exists only at `manifest_path` is gone the
+    # moment the job ends, which is to say the run is not actually revertible. Printing it
+    # puts the reversal record in Cloud Logging, where it outlives the container. Bounded:
+    # one small object per retired key.
+    print("----8<---- MANIFEST BEGIN ----8<----")
+    print(json.dumps(manifest, default=str))
+    print("----8<---- MANIFEST END ----8<----")
 
     async with database.transaction():
         await database.execute(SUPPRESS_SQL, {"reason": REASON, "metadata": metadata, "keys": keys})
