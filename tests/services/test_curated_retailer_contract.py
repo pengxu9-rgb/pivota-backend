@@ -252,3 +252,27 @@ async def test_concurrent_record_batches_retain_their_own_scan_evidence(monkeypa
     assert first.crawl_report["scanned_products"] == 10
     assert second.crawl_report["scanned_products"] == 20
     assert first.crawl_report is not second.crawl_report
+
+
+def test_same_gtin_live_lip_oil_observations_get_same_category():
+    from pathlib import Path
+    fixture = json.loads((Path(__file__).parents[1] / "fixtures/retailer_lip_oil_public_observations.json").read_text())
+    for observed in fixture["observations"]:
+        assert observed["variants"][0]["barcode"] == fixture["shared_gtin"]
+        rec = map_record("retailer.com", title=observed["title"], product_type=observed["product_type"])
+        assert rec["pdp"]["category_path"] == "beauty/makeup/lip/oil"
+
+
+@pytest.mark.parametrize("product_type,want", [
+    ("Lip Balm", "beauty/makeup/lip/balm"),
+    ("Lipstick", "beauty/makeup/lip/lipstick"),
+    ("Lip Care / Balm", "beauty/makeup/lip/balm"),
+])
+def test_lip_oil_exception_does_not_overrule_specific_competing_types(product_type, want):
+    rec = map_record("retailer.com", title="Honey & Milk Lip Oil", product_type=product_type)
+    assert rec["pdp"]["category_path"] == want
+
+
+def test_generic_lip_care_does_not_assume_every_product_is_an_oil():
+    rec = map_record("retailer.com", title="Honey & Milk Moisture", product_type="Lip Care")
+    assert rec["pdp"]["category_path"] == "beauty/makeup/lip/balm"

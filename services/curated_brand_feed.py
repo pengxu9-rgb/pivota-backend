@@ -1086,7 +1086,16 @@ def product_category_path(*, title: Optional[str], product_type: Optional[str], 
     """
     if str(fallback or "").split("/", 1)[0] != "beauty":
         return fallback
-    from services.pdp_category_classifier import resolve_path_from_row
+    from services.pdp_category_classifier import classify, resolve_path_from_row
+    # Live same-GTIN canary: Asian Beauty Essentials labels Honey & Milk Lip Oil
+    # "Lip Care", while Eyurs labels it "Lip Treatments". Those are broad shelves,
+    # not evidence that an explicitly named lip oil is balm. Restrict this exception
+    # to generic labels; specific competing types (Lip Balm/Lipstick) keep priority.
+    generic_type = " ".join(str(product_type or "").casefold().split())
+    if generic_type in {"lip care", "lip treatment", "lip treatments"}:
+        title_hit = classify(title)
+        if title_hit and title_hit[1] == "beauty/makeup/lip/oil":
+            return title_hit[1]
     hit = resolve_path_from_row(category=None, product_type=product_type, title=title)
     return hit[1] if hit else fallback
 
