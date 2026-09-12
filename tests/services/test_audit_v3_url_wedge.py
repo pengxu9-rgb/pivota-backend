@@ -170,6 +170,21 @@ def client(monkeypatch):
     monkeypatch.setattr(_ccs_mod, "consume", fake_consume)
     monkeypatch.setattr(_ccs_mod, "refund", fake_refund)
 
+    # Route tests stub the atomic boundary; real ledger races/rollback are
+    # covered by test_url_consumer_launch_postgres.
+    import services.url_consumer_launch as url_launch
+    async def fake_atomic(**kwargs):
+        options = kwargs['request_options_jsonb']
+        result = await fake_consume(kwargs['merchant_id'], 'audit', 'url_wedge:' + kwargs['idempotency_key'], credits=kwargs['credits'])
+        options['launch']['debited'] = [{'kind':'audit','amount':kwargs['credits'],'purchased_credits':0}]
+        run_id, replay = await mar.enqueue_audit_run_with_replay(
+            **{k:v for k,v in kwargs.items() if k not in {'credits','usd_cogs'}}, subject_type='merchant_url')
+        if not run_id:
+            credit_ops.clear()  # emulate transaction rollback, not a refund grant
+            raise url_launch.UrlLaunchUnavailable('enqueue failed')
+        return run_id, replay
+    monkeypatch.setattr(url_launch, 'launch_quoted_url_audit', fake_atomic)
+
     app = FastAPI()
     app.include_router(mar.router)
     app.dependency_overrides[auth_module.get_current_merchant] = lambda: "merch-A"
@@ -1099,3 +1114,103 @@ def test_get_succeeded_includes_merchant_context(monkeypatch):
     assert mc["is_paid"] is True
     assert mc["plan_tier"] == "growth"
     assert mc["store_connected"] is True
+
+
+def test_url_consumer_quote_requires_acceptance_and_free_base_stays_free(client, monkeypatch):
+    monkeypatch.setenv('PIVOTA_CONSUMER_ANSWER_ENABLED', 'true')
+    request = {**_BODY, 'consumer_answer_queries': ['What mascara holds a curl?']}
+    quote = client.post(_URL, json={**request, 'quote_only': True})
+    assert quote.status_code == 200, quote.text
+    q = quote.json()
+    assert q['base_credits'] == 0
+    assert q['credits'] == q['consumer_capture']['credits'] > 0
+    assert not client.credit_ops and not client.enqueued
+    rejected = client.post(_URL, json=request)
+    assert rejected.status_code == 409
+    assert not client.credit_ops and not client.enqueued
+    started = client.post(_URL, json={**request, 'accepted_quote': q['quote_id']})
+    assert started.status_code == 200, started.text
+    launch = client.enqueued[-1]['request_options_jsonb']['launch']
+    assert launch['consumer_capture_plan']['sha256'] == q['consumer_capture']['plan_sha256']
+    assert launch['debited'][0]['amount'] == q['credits']
+    assert client.credit_ops[-1]['credits'] == q['credits']
+    assert launch['billing_mode'] == 'credits'
+    assert launch['wedge_base_payload']['credits_charged'] == q['credits']
+
+
+def test_url_consumer_quote_scope_changes_fail_before_debit(client, monkeypatch):
+    monkeypatch.setenv('PIVOTA_CONSUMER_ANSWER_ENABLED', 'true')
+    request = {**_BODY, 'consumer_answer_queries': ['Best mascara?']}
+    q = client.post(_URL, json={**request, 'quote_only': True}).json()
+    for changes in [{'consumer_answer_queries':['Best waterproof mascara?']},
+                    {'brand':'Different'}, {'product_urls':[_BODY['product_urls'][0]]},
+                    {'custom_prompts':['Another diagnostic question']}]:
+        response = client.post(_URL, json={**request, **changes, 'accepted_quote':q['quote_id']})
+        assert response.status_code == 409, response.text
+    assert not client.credit_ops and not client.enqueued
+
+
+def test_url_consumer_unavailable_rejected_before_debit(client, monkeypatch):
+    monkeypatch.delenv('PIVOTA_CONSUMER_ANSWER_ENABLED', raising=False)
+    response = client.post(_URL, json={**_BODY, 'consumer_answer_queries':['Best mascara?'], 'quote_only':True})
+    assert response.status_code == 422
+    assert not client.credit_ops and not client.enqueued
+
+
+def test_url_consumer_balance_checked_even_during_free_allowance(client, monkeypatch):
+    monkeypatch.setenv('PIVOTA_CONSUMER_ANSWER_ENABLED', 'true')
+    request = {**_BODY, 'consumer_answer_queries':['Best mascara?']}
+    q = client.post(_URL, json={**request, 'quote_only':True}).json()
+    client.state['balance']['credits'] = 0
+    response = client.post(_URL, json={**request, 'accepted_quote':q['quote_id']})
+    assert response.status_code == 402
+    assert not client.credit_ops and not client.enqueued
+
+
+def test_url_consumer_enqueue_failure_refunds_total(client, monkeypatch):
+    monkeypatch.setenv('PIVOTA_CONSUMER_ANSWER_ENABLED', 'true')
+    async def unavailable(**kwargs):
+        return None, False
+    monkeypatch.setattr(mar, 'enqueue_audit_run_with_replay', unavailable)
+    request = {**_BODY, 'consumer_answer_queries':['Best mascara?']}
+    q = client.post(_URL, json={**request, 'quote_only':True}).json()
+    response = client.post(_URL, json={**request, 'accepted_quote':q['quote_id']})
+    assert response.status_code == 503
+    assert client.credit_ops == []  # atomic rollback leaves no debit or refund event
+
+
+def test_url_consumer_metered_quote_adds_to_base_and_binds_dedup(client, monkeypatch):
+    monkeypatch.setenv('PIVOTA_CONSUMER_ANSWER_ENABLED', 'true')
+    client.state['used'] = 5
+    request = {**_BODY, 'consumer_answer_queries':['Best mascara?']}
+    q = client.post(_URL, json={**request, 'quote_only':True}).json()
+    assert q['base_credits'] > 0
+    assert q['credits'] == q['base_credits'] + q['consumer_capture']['credits']
+    for _ in range(2):
+        r = client.post(_URL,json={**request,'accepted_quote':q['quote_id']})
+        assert r.status_code == 200, r.text
+    assert client.credit_ops[0]['key'] == client.credit_ops[1]['key']
+    assert client.enqueued[0]['idempotency_key'] == client.enqueued[1]['idempotency_key']
+    # Stub verifies key stability; real ledger concurrency belongs to PostgreSQL tests.
+
+
+def test_url_consumer_does_not_silently_quote_partial_product_scope(client, monkeypatch):
+    monkeypatch.setenv('PIVOTA_CONSUMER_ANSWER_ENABLED', 'true')
+    original = bdcs.fetch_curated_audit_product
+    async def partial(url):
+        if url.endswith('/b'):
+            return None, 'Product unavailable'
+        return await original(url)
+    monkeypatch.setattr(bdcs, 'fetch_curated_audit_product', partial)
+    response = client.post(_URL,json={**_BODY,'consumer_answer_queries':['Best mascara?'],'quote_only':True})
+    assert response.status_code == 422, response.text
+    assert response.json()['detail']['code'] == 'consumer_products_unresolved'
+    assert not client.credit_ops and not client.enqueued
+
+
+def test_dedicated_url_quote_route_never_enqueues_even_without_quote_flag(client, monkeypatch):
+    monkeypatch.setenv('PIVOTA_CONSUMER_ANSWER_ENABLED', 'true')
+    response = client.post(_URL + '/quote', json={**_BODY, 'consumer_answer_queries':['Best mascara?'], 'quote_only':False})
+    assert response.status_code == 200, response.text
+    assert response.json()['status'] == 'quoted'
+    assert not client.credit_ops and not client.enqueued

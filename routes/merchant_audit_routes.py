@@ -1122,6 +1122,10 @@ class MerchantUrlAuditRequest(BaseModel):
     #1 source of bad audits). The merchant knows their catalog; nobody guesses.
     """
 
+    consumer_answer_queries: Optional[List[str]] = Field(default=None, max_length=8)
+    quote_only: bool = False
+    accepted_quote: Optional[str] = Field(default=None, max_length=64)
+
     product_urls: List[str] = Field(
         ...,
         min_length=1,
@@ -1984,6 +1988,19 @@ def _select_wedge_hero_product(
     return hero
 
 
+@router.post("/url-readiness/quote")
+async def quote_merchant_url_audit(
+    body: MerchantUrlAuditRequest,
+    merchant_id: str = Depends(get_current_merchant),
+) -> Dict[str, Any]:
+    # Dedicated route: a newer client talking to an older server gets 404,
+    # never an accidental audit from an ignored quote_only request field.
+    return await run_merchant_url_audit(
+        body=body.model_copy(update={"quote_only": True, "accepted_quote": None}),
+        merchant_id=merchant_id,
+    )
+
+
 @router.post("/url-readiness")
 async def run_merchant_url_audit(
     body: MerchantUrlAuditRequest,
@@ -2476,6 +2493,49 @@ async def run_merchant_url_audit(
         "catalog_dimensions_available": False,
     }
 
+    # The URL lane shares the frozen consumer plan and settlement contract.
+    # Quoting may fetch public product pages, but must not debit or enqueue.
+    from services.consumer_capture_plan import plan_for_launch, quote_plan
+    from decimal import Decimal
+    try:
+        consumer_plan = plan_for_launch(
+            product_keys=[sp["product_key"] for sp in synthetic_products],
+            queries=body.consumer_answer_queries, providers=providers_for_launch,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    consumer_quote = quote_plan(consumer_plan) if consumer_plan else None
+    if consumer_plan and unresolved:
+        raise HTTPException(status_code=422, detail={"code": "consumer_products_unresolved",
+                            "message": "Resolve or remove failed product URLs before quoting answer capture.",
+                            "unresolved_urls": unresolved})
+    base_credits = metered_credits if over_free else 0
+    if consumer_quote:
+        metered_credits = base_credits + consumer_quote["credits"]
+        metered_cogs = Decimal(str(metered_cogs)) + consumer_quote["estimated_usd_cogs"]
+    quote_scope = {
+        "merchant_id": merchant_id, "request": body.model_dump(exclude={"quote_only", "accepted_quote"}),
+        "products": [sp["product_key"] for sp in synthetic_products],
+        "consumer": consumer_quote, "providers": providers_for_launch,
+        "total_credits": metered_credits, "base_credits": base_credits,
+        "brand": merchant_name, "domain": merchant_domain,
+    }
+    quote_id = hashlib.sha256(json.dumps(quote_scope, sort_keys=True, default=str).encode()).hexdigest()
+    if body.quote_only:
+        return {"status": "quoted", "quote_id": quote_id,
+                "credits": metered_credits, "base_credits": base_credits,
+                "consumer_capture": consumer_quote, "providers": providers_for_launch,
+                "product_count": len(synthetic_products), "unresolved_urls": unresolved}
+    if consumer_plan and body.accepted_quote != quote_id:
+        raise HTTPException(status_code=409, detail={"code": "quote_required",
+                            "message": "Review a fresh quote before starting this audit."})
+    if consumer_plan and metered_credits > int(balance.get("credits") or 0):
+        raise HTTPException(status_code=402, detail={"code": "insufficient_credits",
+                            "required": metered_credits, "available": int(balance.get("credits") or 0)})
+    base_payload["credits_charged"] = metered_credits
+    base_payload["billing_mode"] = "credits" if metered_credits else "free"
+    debit_result = {}
+
     # 6. Debit credits for a metered run BEFORE enqueue, keyed on the
     #    deterministic idempotency_key (NOT a run_id). Debiting before enqueue
     #    avoids a race where the worker claims the queued run and starts probing
@@ -2502,15 +2562,17 @@ async def run_merchant_url_audit(
     # Standard requests keep their pre-existing keys unchanged.
     if audit_tier != "standard":
         idem_product_keys = idem_product_keys + [f"tier:{audit_tier}"]
+    if consumer_plan:
+        idem_product_keys.append(f"consumer:{quote_id}")
     idempotency_key = compute_audit_idempotency_key(
         merchant_id=merchant_id,
         product_keys=idem_product_keys,
         subject_type="merchant_url",
     )
-    if over_free and metered_credits > 0:
+    if metered_credits > 0 and not consumer_plan:
         from services import credit_consumption_service as _ccs
         try:
-            await _ccs.consume(
+            debit_result = await _ccs.consume(
                 merchant_id,
                 "audit",
                 idempotency_key=f"url_wedge:{idempotency_key}",
@@ -2536,7 +2598,7 @@ async def run_merchant_url_audit(
     #    products from launch.synthetic_products, runs per-SKU citation probes
     #    (Gemini-only, prompts_per_sku), and finalizes via the minimal
     #    no-executor verify path.
-    run_id, was_existing = await enqueue_audit_run_with_replay(
+    enqueue_args = dict(
         merchant_id=merchant_id,
         product_keys=[sp["product_key"] for sp in synthetic_products],
         subject_type="merchant_url",
@@ -2579,16 +2641,37 @@ async def run_merchant_url_audit(
                 "synthetic_products": synthetic_products,
                 "merchant_name": merchant_name,
                 "merchant_domain": merchant_domain,
-                "billing_mode": "credits" if over_free else "free",
+                "billing_mode": "credits" if metered_credits else "free",
                 "estimated_audit_credits": int(metered_credits),
                 "wedge_base_payload": base_payload,
+                **({"consumer_capture_plan": consumer_plan, "consumer_capture_quote": consumer_quote,
+                    "debited": [{"kind": "audit", "amount": metered_credits,
+                                 "replay": bool(debit_result.get("replay")),
+                                 "purchased_credits": int((debit_result.get("debit") or {}).get("purchased_credits_debited") or 0)}]}
+                   if consumer_plan else {}),
             }
         },
     )
+    if consumer_plan:
+        from services.url_consumer_launch import (
+            launch_quoted_url_audit, UrlLaunchUnavailable, UrlLaunchInsufficientCredits,
+        )
+        try:
+            run_id, was_existing = await launch_quoted_url_audit(
+                **{key: value for key, value in enqueue_args.items() if key != "subject_type"},
+                credits=metered_credits, usd_cogs=metered_cogs,
+            )
+        except UrlLaunchInsufficientCredits as exc:
+            raise HTTPException(status_code=402, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.warning("quoted URL launch rolled back merchant_id=%s", merchant_id, exc_info=True)
+            raise HTTPException(status_code=503, detail="Could not start the audit. No new credits were charged.") from exc
+    else:
+        run_id, was_existing = await enqueue_audit_run_with_replay(**enqueue_args)
     if not run_id:
         # Couldn't persist the run — refund the debit so the merchant isn't
         # charged for an audit that never started.
-        if over_free and metered_credits > 0:
+        if metered_credits > 0:
             from services import credit_consumption_service as _ccs
             try:
                 await _ccs.refund(
