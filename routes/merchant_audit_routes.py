@@ -2323,7 +2323,7 @@ async def run_merchant_url_audit(
              for prov in (providers_for_launch or ["gemini"])]
         )
         available = int(balance.get("credits") or 0)
-        if metered_credits > available and not paid_tier:
+        if metered_credits > available and not paid_tier and not body.quote_only:
             raise HTTPException(
                 status_code=status.HTTP_402_PAYMENT_REQUIRED,
                 detail={
