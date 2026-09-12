@@ -112,6 +112,13 @@ def test_vendor_subset_requires_explicit_source_role():
         w.normalize_curated_brand_payload(payload)
 
 
+def test_retailer_name_cannot_silently_take_brand_official_authority():
+    with pytest.raises(ValueError, match="explicit source_role"):
+        w.normalize_curated_brand_payload({"domain": "retailer.example", "retailer_name": "Eyurs"})
+    with pytest.raises(ValueError, match="only valid"):
+        w.normalize_curated_brand_payload(_job(source_role="brand_official", retailer_name="Eyurs"))
+
+
 def test_worker_forwards_all_supported_controls(monkeypatch):
     calls = []
 

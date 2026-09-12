@@ -68,11 +68,13 @@ def normalize_curated_brand_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     market = str(payload.get("market") or "US").strip().upper()
     if market != "US":
         raise ValueError("curated onboarding supports market US only; use a market-aware ingest lane")
-    if payload.get("only_vendors") is not None and not payload.get("source_role"):
-        raise ValueError("vendor-filtered onboarding requires explicit source_role (retailer or brand_official)")
+    if (payload.get("only_vendors") is not None or payload.get("retailer_name")) and not payload.get("source_role"):
+        raise ValueError("vendor-filtered or retailer-named onboarding requires explicit source_role (retailer or brand_official)")
     role = payload.get("source_role", "brand_official")
     if role not in {"brand_official", "retailer"}:
         raise ValueError("source_role must be brand_official or retailer")
+    if payload.get("retailer_name") and role != "retailer":
+        raise ValueError("retailer_name is only valid with source_role=retailer")
     vendors = payload.get("only_vendors")
     if vendors is not None:
         if not isinstance(vendors, list) or not vendors or any(
