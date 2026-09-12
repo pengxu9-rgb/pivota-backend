@@ -163,6 +163,7 @@ def test_to_validated_record_carries_rating_and_inci():
     }
     rec = sk.to_validated_record(crawled)
     pdp = rec["pdp"]
+    assert pdp["currency"] == "USD"
     assert pdp["rating_value"] == 4.3
     assert pdp["rating_count"] == 215
     assert pdp["raw_inci"] == _INCI
@@ -219,6 +220,7 @@ def test_ingest_plan_plumbs_rating_and_inci_intent():
             "category_path": "beauty/skincare",
             "attribute_summary": "snail essence",
             "source_domain": "cosrx.com",
+            "currency": "USD",  # Explicit observation for this priced fixture.
             "rating_value": 4.3,
             "rating_count": 215,
             "raw_inci": _INCI,
@@ -243,7 +245,7 @@ def test_ingest_plan_skips_inci_when_absent():
     rec = {
         "pdp": {"brand": "COSRX", "product_name": "No Ingredients Listed",
                 "category_path": "beauty/skincare", "attribute_summary": "x",
-                "source_domain": "cosrx.com"},
+                "source_domain": "cosrx.com", "currency": "USD"},
         "offers": [{"merchant_inferred": "COSRX", "canonical_url": "https://cosrx.com/products/y",
                     "destination_url": "https://cosrx.com/products/y", "price": 12.0, "in_stock": True}],
     }
@@ -442,3 +444,32 @@ async def test_apply_inci_rows_real_write_and_isolation(monkeypatch):
     assert params["inci"] == _INCI
     assert params["src"] == "brand_official"
     assert "raw_inci = EXCLUDED.raw_inci" in sql        # real upsert shape
+
+
+@pytest.mark.parametrize("currency", ["USD", "SGD", None])
+def test_source_jsonld_currency_survives_extract_map_plan_without_a_default(currency):
+    # The inline source page explicitly declares its offer currency. The missing
+    # case removes that declaration rather than substituting a fixture default.
+    markup = _ld_block(with_rating=True)
+    product = json.loads(markup.split(">", 1)[1].rsplit("</script>", 1)[0])
+    if currency is None:
+        product["offers"].pop("priceCurrency")
+    else:
+        product["offers"]["priceCurrency"] = currency
+    source_html = '<script type="application/ld+json">' + json.dumps(product) + '</script>'
+    crawled = extract_product(source_html)
+    assert crawled["currency"] == currency
+    crawled["url"] = "https://www.stylekorean.com/product/cosrx-snail-essence/1234"
+    record = sk.to_validated_record(crawled)
+    assert record["pdp"]["currency"] == currency
+    assert record["offers"][0]["currency"] == currency
+    assert record["offers"][0]["list_price"] == 25.0
+    if currency is None:
+        with pytest.raises(ValueError, match="currency_unproven"):
+            ingest_validated_jsonl([record])
+        return
+    plan = ingest_validated_jsonl([record])
+    assert len(plan["pdps"]) == 1 and len(plan["skus"]) == 1
+    assert {row["currency"] for row in plan["skus"]} == {currency}
+    assert {row["currency"] for row in plan["offers"]} == {currency}
+    assert {row["price_currency"] for row in plan["seeds"]} == {currency}

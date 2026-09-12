@@ -34,6 +34,9 @@ def _record(*, brand="Fenty Beauty", domain="fentybeauty.com", name="Gloss Bomb"
             "product_name": name,
             "source_domain": domain,
             "category_path": "beauty/lip",
+            # Currency is explicit fixture evidence; seller-negative cases must
+            # reach seller validation rather than fail on missing money units.
+            "currency": "USD",
         },
         "offers": [
             {
