@@ -56,6 +56,43 @@ def _read_brand_list(args: argparse.Namespace) -> List[Dict[str, Any]]:
     return brands
 
 
+#: Identity fields an acceptance gate has to read off a plan. `product_key` and
+#: `content_key` are the listing/canonical identities; `gtin` and `category_path` are
+#: what the canary validator actually asserts (scripts/validate_meitu_canary_evidence.py
+#: checks the exact GTIN and a `beauty/makeup/lip/` leaf per product); `merchant_id` and
+#: `source_domain` say WHICH seller the row belongs to, which is what makes a two-retailer
+#: plan reviewable. Every name here exists on a planned PDP row — `category_resolution_status`
+#: deliberately does NOT: the mapper stamps it on the record's `pdp`, but _build_pdp_insert
+#: does not carry it onto the planned row, so printing it would show None for every product
+#: and read as "unresolved" when it only means "absent". `inspect_primary_plan`'s
+#: `unresolved_category_count` remains the authority on blocked categories.
+_PLAN_IDENTITY_FIELDS = (
+    "product_key", "brand", "title", "content_key", "gtin",
+    "category_path", "merchant_id", "source_domain", "source_product_id",
+)
+
+
+def _print_plan_identity(plan: Dict[str, Any], *, limit: int) -> None:
+    """Print WHICH products a plan contains, not just how many.
+
+    Counts alone cannot distinguish a stable cohort from one that churned while its
+    size held: a retailer that delists the product a canary selected and lists another
+    the same day still plans the same number of PDPs. Reviewing that plan by eye, or
+    gating on it in a script, needs the per-row identity — so this prints one sorted
+    JSON object per PDP, greppable for an exact GTIN or category leaf.
+
+    It runs for BOTH dry-run and --apply: the apply path re-crawls and re-plans, so the
+    rows it is about to write are not necessarily the rows that were reviewed.
+    """
+    pdps = plan.get("pdps") or []
+    shown = pdps if limit <= 0 or len(pdps) <= limit else pdps[:limit]
+    for row in shown:
+        print("    pdp " + json.dumps({k: row.get(k) for k in _PLAN_IDENTITY_FIELDS}, sort_keys=True))
+    if len(shown) < len(pdps):
+        print(f"    ... {len(pdps) - len(shown)} further PDP row(s) not printed "
+              f"(raise --plan-print-limit, 0 prints all)")
+
+
 async def _run(args: argparse.Namespace) -> int:
     brands = _read_brand_list(args)
     if not brands:
@@ -130,10 +167,8 @@ async def _run(args: argparse.Namespace) -> int:
         f"skipped={plan.get('skipped')}"
     )
     print("primary ingestion: " + json.dumps(inspect_primary_plan(plan), sort_keys=True))
+    _print_plan_identity(plan, limit=args.plan_print_limit)
     if not args.apply:
-        pdps = plan.get("pdps") or []
-        for p in pdps[:5]:
-            print("   ", {k: p.get(k) for k in ("product_key", "brand", "title", "content_key")})
         print("  DRY-RUN — re-run with --apply to ingest as depositable anchors.")
         return 0
 
@@ -212,6 +247,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="Recover missing barcodes from identity-matched product .js; opt-in, no price changes")
     p.add_argument("--max-pdp-identity-fetches", type=int, default=100,
                    help="Selected-product recovery attempt budget (0 disables requests; up to two redirects each)")
+    p.add_argument("--plan-print-limit", type=int, default=50, metavar="N",
+                   help="print identity (product_key/gtin/category_path/...) for at most N planned "
+                        "PDPs; 0 prints every row. Printed for dry-run AND --apply")
     p.add_argument("--apply", action="store_true", help="ingest (else dry-run plan)")
     args = p.parse_args(argv)
     try:
