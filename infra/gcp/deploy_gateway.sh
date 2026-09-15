@@ -80,6 +80,9 @@ case "$CONFIG" in preserve|apply) ;; *) echo "CONFIG must be preserve or apply (
 # --concurrency, --timeout, --ingress, --vpc-egress, --labels, --service-account. Those match live
 # prod today, so nothing drifts; but an operator who widened --max-instances by hand during an
 # incident will have it pulled back silently by the next deploy.
+# CONCURRENCY / MIN_INSTANCES / MAX_INSTANCES override those three for one invocation. The
+# 2026-09-15 pivota-pg CPU incident set the live gateway to concurrency 20 / min 4 by hand; a
+# deploy without CONCURRENCY=20 MIN_INSTANCES=4 would revert that to 80 / 2.
 #
 # PIVOTA_ENV, PIVOTA_SERVICE_NAME and the four GW_POOL_* sizings travel in the env FILE, so under
 # `preserve` they are computed and then not sent. The running service already carries them, and a
@@ -297,7 +300,7 @@ probe_health(){ # url -> echoes the status code
   --service-account "sa-gateway@$PROJECT.iam.gserviceaccount.com" \
   --network default --subnet default --vpc-egress "$VPC_EGRESS" \
   ${CONFIG_ARGS[@]+"${CONFIG_ARGS[@]}"} \
-  --port 8080 --cpu "$CPU" --memory "$MEM" --concurrency 80 --timeout 300 \
+  --port 8080 --cpu "$CPU" --memory "$MEM" --concurrency "${CONCURRENCY:-80}" --timeout 300 \
   --min-instances "${MIN_INSTANCES:-$MIN}" --max-instances "${MAX_INSTANCES:-$MAX}" \
   --no-cpu-throttling --cpu-boost --execution-environment gen2 \
   --ingress "$INGRESS" \
