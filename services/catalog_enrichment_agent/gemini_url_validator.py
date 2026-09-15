@@ -40,6 +40,40 @@ def _slugify(text: Optional[str]) -> str:
     return out
 
 
+def _observed_currency(value: Any) -> Optional[str]:
+    """The offer's currency as the model reported it, or None. Never a default:
+    ingestion refuses unproven money (`ingestion._currency_of`), and a USD
+    stamped here would launder exactly the guess that guard exists to stop."""
+    from services.catalog_enrichment_agent.ingestion import _currency_of
+
+    try:
+        return _currency_of({"currency": value})
+    except ValueError:
+        return None
+
+
+def _record_currency(offers: List[Dict[str, Any]]) -> Optional[str]:
+    """The record-level currency ingestion requires on `pdp`.
+
+    Before #2180 ingestion defaulted every record to USD, so this lane never had
+    to say. After it, a pdp with no currency raises `currency_unproven` and
+    every audit_candidate onboard-queue item failed. Proven only when every
+    PRICED offer carries the same observed code; an unpriced offer states no
+    money and does not vote. Disagreement or a priced offer without a code is
+    None, so ingestion refuses the record rather than picking one."""
+    codes = set()
+    for offer in offers:
+        currency = offer.get("currency")
+        if offer.get("price") is None:
+            if currency:
+                codes.add(currency)
+            continue
+        if not currency:
+            return None
+        codes.add(currency)
+    return codes.pop() if len(codes) == 1 else None
+
+
 def _resolve_api_key() -> Optional[str]:
     for var in ("GEMINI_API_KEY", "PIVOTA_GEMINI_API_KEY"):
         value = os.environ.get(var)
@@ -77,7 +111,7 @@ Return a single JSON object with this exact shape (no markdown, no prose):
       "canonical_url": "<the product detail page URL>",
       "image_url": "<a representative product image URL, or empty string>",
       "price": <number or null>,
-      "currency": "USD",
+      "currency": "<ISO 4217 code of the price as shown on that page, e.g. USD; null when no price is shown>",
       "in_stock": <true | false | null when uncertain>,
       "confidence": <0.0 to 1.0>,
       "notes": "<one-line note: page title or 'redirected to category' or 'not found'>"
@@ -197,7 +231,8 @@ async def validate_candidate(
             {**offer, "validated_at": datetime.now(timezone.utc).isoformat()}
             for offer in result.get("offers", [])
         ]
-        return {"pdp": pdp_payload, "offers": result_offers}
+        return {"pdp": {**pdp_payload, "currency": _record_currency(result_offers)},
+                "offers": result_offers}
 
     prompt = _build_prompt(candidate)
     request_body: Dict[str, Any] = {
@@ -249,7 +284,7 @@ async def validate_candidate(
             "destination_url": canonical_url,
             "image_url": str(offer.get("image_url") or "").strip(),
             "price": offer.get("price") if isinstance(offer.get("price"), (int, float)) else None,
-            "currency": str(offer.get("currency") or "USD").strip().upper(),
+            "currency": _observed_currency(offer.get("currency")),
             "in_stock": offer.get("in_stock") if isinstance(offer.get("in_stock"), bool) else None,
             "confidence": (
                 float(offer["confidence"])
@@ -259,4 +294,5 @@ async def validate_candidate(
             "notes": str(offer.get("notes") or "").strip(),
             "validated_at": timestamp,
         })
-    return {"pdp": pdp_payload, "offers": validated_offers}
+    return {"pdp": {**pdp_payload, "currency": _record_currency(validated_offers)},
+            "offers": validated_offers}

@@ -343,6 +343,13 @@ jobs:
         run: |
           python - <<'PY'
           import os, sys, math, collections, xml.etree.ElementTree as ET
+          # 2026-09-14: 17,479 executed on main at e793a2c15 (#2180, which added
+          # ~200 tests); the 15,700 floor had grown 1,779 of slack (cap 17,270)
+          # and the cap tripped on the push run, so the deploy gate refused and
+          # prod stayed on 1bdfcdd77. Every test PASSED — the failure was only
+          # this assert. Re-floated into the printed window (15,890..17,479) at
+          # the same ~97%-of-measured: ~530 tests of deletion headroom, cap 18,645.
+          #
           # 2026-09-06: 16,182 executed on main; the 14,500 floor had grown 1,682
           # of slack (cap 15,950) and the cap tripped, as designed, on the push
           # run for the Webflow telemetry PR (#2103), after passing advisory on
@@ -426,7 +433,11 @@ jobs:
           # (cap 1,980) -- 13 tests from tripping on the next services test
           # added. Re-floated within its window (1,789..1,967) to 1,900:
           # ~67 of deletion headroom, cap 2,090.
-          SUBTREES = {'tests.services': 1900, 'readiness.tests': 120}
+          # tests.services: 2,328 executed on 2026-09-14 at e793a2c15 against the
+          # 1,900 floor (cap 2,090) -- tripped with the global cap. Re-floated
+          # within its window (2,117..2,328) to 2,260: ~68 of deletion headroom,
+          # cap 2,486.
+          SUBTREES = {'tests.services': 2260, 'readiness.tests': 120}
           try:
               root = ET.parse('sweep.xml').getroot()
           except Exception as e:
