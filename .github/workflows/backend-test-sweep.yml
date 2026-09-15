@@ -368,7 +368,7 @@ jobs:
           # 2026-09-03: 14,027 executed on main; the 12,000 floor had grown 2,027
           # of slack (cap 13,200) and the cap tripped, as designed. Re-floated
           # into the window the assert printed (12,752..14,027).
-          FLOOR = 15700
+          FLOOR = 16950
           # Slack allowance, global and per-subtree: 10% of the floor, but never
           # fewer than ABS_SLACK tests. The absolute term is not decoration — a
           # pure percentage is unusable on a small tree. readiness.tests

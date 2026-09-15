@@ -250,6 +250,16 @@ def test_a_model_reply_without_currency_is_refused_not_stamped_usd(monkeypatch):
         ingest_validated_record(record)
 
 
+def test_the_offline_mock_proves_no_currency():
+    """The mock invents its URL and its literal "USD". If credentials go missing
+    on a worker, that must not become a planned USD record on a fabricated URL."""
+    record = asyncio.run(validate_candidate(dict(_CANDIDATE), api_key=""))
+    assert record["offers"], "the mock should still return its envelope"
+    assert record["pdp"]["currency"] is None
+    with pytest.raises(ValueError, match="currency_unproven"):
+        ingest_validated_record(record)
+
+
 def test_the_prompt_no_longer_dictates_usd():
     """The reply schema used to contain the literal `"currency": "USD"`, so the
     model's "observed" currency was the template's. A code copied from that

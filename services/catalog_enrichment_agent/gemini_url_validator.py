@@ -58,9 +58,12 @@ def _record_currency(offers: List[Dict[str, Any]]) -> Optional[str]:
     Before #2180 ingestion defaulted every record to USD, so this lane never had
     to say. After it, a pdp with no currency raises `currency_unproven` and
     every audit_candidate onboard-queue item failed. Proven only when every
-    PRICED offer carries the same observed code; an unpriced offer states no
-    money and does not vote. Disagreement or a priced offer without a code is
-    None, so ingestion refuses the record rather than picking one."""
+    PRICED offer carries an observed code and every code reported (priced or
+    not) is the same one. An unpriced offer's MISSING code does not veto, but a
+    code it does report counts -- and must agree. Disagreement, a priced offer
+    without a code, or no code at all is None, so ingestion refuses the record
+    rather than picking one. (A record with no price and no code therefore
+    stays refused: nothing on the page proved its money.)"""
     codes = set()
     for offer in offers:
         currency = offer.get("currency")
@@ -231,8 +234,10 @@ async def validate_candidate(
             {**offer, "validated_at": datetime.now(timezone.utc).isoformat()}
             for offer in result.get("offers", [])
         ]
-        return {"pdp": {**pdp_payload, "currency": _record_currency(result_offers)},
-                "offers": result_offers}
+        # The mock INVENTS its offer (URL and a literal "USD"), so it proves no
+        # money: leave the pdp currency unset and let ingestion refuse it, rather
+        # than plan fabricated URLs as USD if credentials go missing on a worker.
+        return {"pdp": {**pdp_payload, "currency": None}, "offers": result_offers}
 
     prompt = _build_prompt(candidate)
     request_body: Dict[str, Any] = {
