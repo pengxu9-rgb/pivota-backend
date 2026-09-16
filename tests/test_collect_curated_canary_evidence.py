@@ -413,9 +413,13 @@ async def test_a_declaration_is_checked_even_when_only_one_variant_is_stored():
 
 
 async def test_the_emitted_offer_carries_the_rows_values_not_the_products():
-    """A collector that rebuilt these fields from the product — or from the host — would make the
-    validator's seller checks true by construction, which is the whole failure mode this pair of
-    scripts exists to remove. Only variant_id was pinned before."""
+    """A collector that rebuilt merchant_id or seller_host from the product — or from the host —
+    would make the validator's seller checks true by construction, which is the whole failure mode
+    this pair of scripts exists to remove. Only variant_id was pinned before.
+
+    currency/market are NOT pinned here and cannot be: the collector derives the product's values
+    FROM its offers, so a single-offer product always agrees with its offer by construction. The
+    binding check on those two is the case comparison in the validator."""
     conn = FakeConn(
         products=[product_row("eyurs.com", "ext:retailer:a")],
         skus=[{"product_key": "ext:retailer:a", "sku_key": "sku_one", "source_variant_id": "45001",

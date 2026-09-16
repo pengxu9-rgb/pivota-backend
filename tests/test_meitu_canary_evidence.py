@@ -201,6 +201,10 @@ def test_the_shipped_manifest_is_evaluable_and_each_case_keeps_its_own_shelf():
     for case in manifest["cases"]:
         for field in ("accepted_brands", "seller_hosts", "market", "currency", "inci_source"):
             assert case.get(field), f"{case['case_id']} is missing {field}"
+        # An undeclared (or typo'd) source_role falls to the WEAKER offer-identity rule, so the
+        # shipped manifest may not rely on the default.
+        assert case.get("source_role") in {"retailer", "brand_official"}, (
+            f"{case['case_id']} must declare source_role; an undeclared role is checked loosely")
         if case.get("target_gtin"):
             assert canonical_gtin(case["target_gtin"]), f"{case['case_id']} target_gtin fails GS1"
         declared = case.get("required_category_prefix")
@@ -446,7 +450,8 @@ def test_a_brand_offer_must_still_be_this_lanes_identity():
     manifest = {"cases": [case]}
     assert evaluate(manifest, evidence(), now=NOW)["passed"] == 1
 
-    for bad in ("external_seed", "merch_unrelated", "agent_seed::retailer::two.example"):
+    for bad in ("external_seed", "merch_unrelated", "agent_seed::retailer::two.example",
+                "agent_x", "agent_seedX::flower"):
         data = evidence()
         data["same_brand"]["offers"][0]["merchant_id"] = bad
         result = evaluate(manifest, data, now=NOW)
@@ -480,3 +485,18 @@ def test_the_mirrored_constants_match_their_real_definitions():
     for host in ("eyurs.com", "EYURS.COM", "www.eyurs.com", "ohlolly.com"):
         assert retailer_merchant_id(host) == derive_merchant_id(
             None, host.lower().removeprefix("www."), seller_domain=host.lower().removeprefix("www."))
+
+
+def test_a_retailer_offer_is_held_to_the_exact_id_not_merely_the_namespace():
+    """The brand rule (namespace + not-another-host) catches every earlier retailer case, so
+    disabling the exact-match rule entirely left no failing test. These two shapes are refused
+    ONLY by exact matching: a brand-lane slug, and a retailer id for a host outside the case."""
+    manifest = {"cases": [RETAILER_CASE]}
+    for wrong in ("agent_seed::3ce", "agent_seed::retailer::somewhere-else.example"):
+        data = _retailer_evidence()
+        data["same_brand"]["offers"][0]["merchant_id"] = wrong
+        result = evaluate(manifest, data, now=NOW)
+        assert result["failed"] == 1, f"retailer case accepted {wrong!r}"
+
+    # And the correct one still passes, so this is not merely a stricter refusal.
+    assert evaluate(manifest, _retailer_evidence(), now=NOW)["passed"] == 1

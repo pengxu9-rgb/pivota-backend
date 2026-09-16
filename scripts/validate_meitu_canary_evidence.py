@@ -26,6 +26,12 @@ distinct from `[]`, which claims the door was asked and returned nothing. The sa
 holds for the second-ingest diffs and `identity_failures`: an empty list is the
 measured claim, `null` is the absence of a measurement.
 
+A case declares `source_role` ("retailer" or "brand_official"). It decides how strictly an
+offer's merchant identity can be checked: a retailer offer's id is derived from its host and
+is matched exactly; a brand offer's is slug-derived and can only be held to this lane's
+namespace. An undeclared role therefore gets the WEAKER rule, which is why the manifest test
+requires every shipped case to declare one.
+
 A case may set `required_category_prefix`. It DEFAULTS to the lip prefix, because the
 Meitu cohort this file was written for is lip-only, and a case that forgets to declare a
 category must not thereby accept any category. A case that legitimately covers another
@@ -184,6 +190,9 @@ def evaluate(manifest: dict, evidence: dict, *, now=None) -> dict:
                 merchant = str(offer.get("merchant_id") or "").strip()
                 if expected_merchant:
                     return merchant == expected_merchant
+                # The banned-bucket test is unreachable while the bucket has no `agent_seed::`
+                # prefix; asserted anyway, as services/seller_identity.py does, so that a future
+                # rename of the bucket cannot quietly make it acceptable here.
                 if not merchant.startswith(AGENT_SEED_PREFIX) or merchant == BANNED_BUCKET_MERCHANT_ID:
                     return False
                 # Even unmatchable, it may not be ANOTHER case host's derived identity: that is a
