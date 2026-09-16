@@ -14,6 +14,11 @@ requires the same observed content_key, product_group_id and valid canonical GTI
 not the same listing product_key. Never derive canonical evidence from titles.
 Missing observations are pending, never passing. A pass certifies the supplied
 evidence meets this contract; source artifact provenance must still be reviewed.
+
+A case may set `required_category_prefix`. It DEFAULTS to the lip prefix, because the
+Meitu cohort this file was written for is lip-only, and a case that forgets to declare a
+category must not thereby accept any category. A case that legitimately covers another
+shelf declares it, and is then held to that shelf just as strictly.
 """
 from __future__ import annotations
 
@@ -26,6 +31,11 @@ from urllib.parse import urlsplit
 
 # The observation and acceptance boundaries share the same GS1 validation.
 from services.catalog_identity import validated_source_gtin as canonical_gtin
+# The shelves a case may declare, from the taxonomy the crawl lane itself resolves against.
+from services.category_path_aliases import LEAF_PARENTS
+
+#: The Meitu cohort is lip-only; a case that declares no shelf is held to this one.
+DEFAULT_CATEGORY_PREFIX = "beauty/makeup/lip/"
 
 
 def evaluate(manifest: dict, evidence: dict, *, now=None) -> dict:
@@ -37,6 +47,17 @@ def evaluate(manifest: dict, evidence: dict, *, now=None) -> dict:
             results.append({"case_id": case["case_id"], "status": "pending", "reasons": ["no fresh observations supplied"]})
             continue
         reasons = []
+        # Default, not free choice: a case that declares no shelf is held to the lip shelf
+        # this cohort exists for. An empty/blank declaration would accept everything, so it
+        # is treated as absent rather than as "any category".
+        category_prefix = str(case.get("required_category_prefix") or "").strip() or DEFAULT_CATEGORY_PREFIX
+        # And a declared shelf must BE a shelf. Unbounded, "beauty/" would admit every leaf in
+        # the taxonomy and "b" would admit other verticals too, so a typo or a lazy case would
+        # silently switch this check off — the same accept-all a blank value would have caused.
+        # LEAF_PARENTS is the set of real shelves (beauty/makeup/lip, beauty/skincare/cleanse);
+        # an ancestor like beauty/skincare is deliberately NOT one.
+        if category_prefix[:-1] not in LEAF_PARENTS or not category_prefix.endswith("/"):
+            reasons.append(f"required_category_prefix {category_prefix!r} is not a taxonomy shelf")
         try:
             when = datetime.fromisoformat(observed["observed_at"].replace("Z", "+00:00"))
             age = (now - when).total_seconds()
@@ -72,8 +93,8 @@ def evaluate(manifest: dict, evidence: dict, *, now=None) -> dict:
             if (not product.get("variant_id") or product.get("variant_id_provenance") != "merchant_issued"
                     or str(product["variant_id"]).startswith(("ext:", "sig_"))):
                 reasons.append("missing merchant-issued variant identity")
-            if not str(product.get("category_path") or "").startswith("beauty/makeup/lip/"):
-                reasons.append("lip canary lacks a product-level lip category")
+            if not str(product.get("category_path") or "").startswith(category_prefix):
+                reasons.append(f"product category is not under the case's shelf {category_prefix}")
             if product.get("inci_source") != case["inci_source"]:
                 reasons.append("incorrect ingredient authority")
             host, merchant = product.get("seller_host"), product.get("merchant_id")
