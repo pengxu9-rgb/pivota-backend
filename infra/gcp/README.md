@@ -408,8 +408,8 @@ forward and restamps `PIVOTA_COMMIT_SHA`, and rewrites no environment variable o
 Railway, no generated files.
 
 It does **not** leave the service SHAPE alone, and the difference matters mid-incident: `preserve`
-reasserts `--concurrency` / `--min-instances` / `--max-instances` from this script's per-env
-constants (prod: 80 / 2 / 20) on every run, so a bare deploy reverts a hand-set concurrency. Pass
+reasserts `--concurrency` / `--min-instances` / `--max-instances` on every run (prod: 80 / 2 / 20 -
+min and max are per-env constants, 80 is one default for both envs), so a bare deploy reverts a hand-set concurrency. Pass
 `CONCURRENCY_LIMIT=` / `MIN_INSTANCES=` / `MAX_INSTANCES=` to carry one through, and read the
 `shape:` line the script prints before it deploys to confirm each one was read — see **Deploy** in
 `docs/runbooks/operating_on_gcp_production.md`.

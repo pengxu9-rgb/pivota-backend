@@ -724,16 +724,31 @@ def test_the_documented_shape_line_is_byte_exact_and_matches_gcloud(tmp_path, ov
     assert (s["argv_c"], s["argv_min"], s["argv_max"]) == (s["c"], s["min"], s["max"])
 
 
-def test_the_runbooks_gateway_command_is_the_one_this_script_accepts():
-    """The runbook's headline gateway invocation, pinned. A command that has drifted from the
-    script's own variable names is a mid-incident dead end - and the misspelt-variable failure it
-    warns about is precisely the one it would then be causing."""
-    doc = RUNBOOK.read_text()
-    assert (
-        "CONFIG=preserve CONCURRENCY_LIMIT=20 MIN_INSTANCES=4 MAX_INSTANCES=20 "
-        "bash infra/gcp/deploy_gateway.sh prod <full sha>"
-    ) in doc
-    # Every name in it is one deploy_gateway.sh actually reads.
-    script = SCRIPT.read_text()
-    for var in ("CONFIG", "CONCURRENCY_LIMIT", "MIN_INSTANCES", "MAX_INSTANCES"):
-        assert var in script, var
+RUNBOOK_GATEWAY_COMMAND = re.compile(
+    r"^(?P<prefix>(?:[A-Z_]+=\S+ )+)bash infra/gcp/deploy_gateway\.sh prod <full sha>$", re.M
+)
+
+
+def test_the_runbooks_gateway_command_is_the_one_this_script_accepts(tmp_path):
+    """The runbook's headline gateway invocation, RUN rather than grepped. A command whose variable
+    names have drifted from the script's is a mid-incident dead end - and the misspelt-variable
+    failure it warns about is precisely the one it would then be causing.
+
+    A `name in script_text` check cannot catch that: the old names survive in comments, and as
+    substrings of a renamed variable. So the prefix is parsed out of the runbook and handed to the
+    real script, and every shape knob must come back tagged with the name that was passed - not
+    `(default)` or `(prod constant)` - and reach gcloud with the documented value.
+    """
+    commands = RUNBOOK_GATEWAY_COMMAND.findall(RUNBOOK.read_text())
+    assert len(commands) == 1, f"expected one documented prod gateway command, found {commands}"
+    prefix = dict(kv.split("=", 1) for kv in commands[0].split())
+    assert prefix.pop("CONFIG") == "preserve"
+    assert set(prefix) == {"CONCURRENCY_LIMIT", "MIN_INSTANCES", "MAX_INSTANCES"}, prefix
+
+    r = _run(tmp_path, "prod", config="preserve", overrides=prefix)
+    assert r.rc == 0, r.err
+    s = _shape(r)
+    assert (s["c_src"], s["min_src"], s["max_src"]) == ("CONCURRENCY_LIMIT", "MIN_INSTANCES", "MAX_INSTANCES")
+    assert (s["argv_c"], s["argv_min"], s["argv_max"]) == (
+        prefix["CONCURRENCY_LIMIT"], prefix["MIN_INSTANCES"], prefix["MAX_INSTANCES"],
+    )

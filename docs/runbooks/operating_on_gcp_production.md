@@ -183,9 +183,11 @@ CONFIG=preserve CONCURRENCY_LIMIT=20 MIN_INSTANCES=4 MAX_INSTANCES=20 bash infra
 **`preserve` does not preserve the shape.** It keeps every environment variable and secret mount
 exactly as the running service has them — that is the whole reason it is the gateway's default — but
 it **REASSERTS** `--cpu`, `--memory`, `--concurrency`, `--min/--max-instances`, `--timeout`,
-`--ingress`, `--vpc-egress`, `--labels` and `--service-account` from the script's own per-env
-constants on every run. So a deploy *without* the prefix silently pulls a hand-set concurrency back
-to the constant. For prod that is **concurrency 80 / min 2 / max 20**.
+`--ingress`, `--vpc-egress`, `--labels` and `--service-account` from the script itself on every
+run. So a deploy *without* the prefix silently pulls a hand-set shape back to the script's values.
+For prod that is **concurrency 80 / min 2 / max 20**: min and max are per-env constants, while 80 is
+a single default shared by staging and prod — which is why the `shape:` line tags it `(default)`
+rather than `(prod constant)`.
 
 That is not hypothetical. The **2026-09-15 pivota-pg CPU incident** was mitigated by setting the
 live gateway to **concurrency 20 / min 4 by hand** — and a bare `CONFIG=preserve
