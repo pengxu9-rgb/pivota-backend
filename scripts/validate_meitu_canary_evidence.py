@@ -45,6 +45,17 @@ from services.catalog_identity import validated_source_gtin as canonical_gtin
 # The shelves a case may declare, from the taxonomy the crawl lane itself resolves against.
 from services.category_path_aliases import LEAF_PARENTS
 
+
+def retailer_merchant_id(host: str) -> str:
+    """The offer merchant id this lane writes for a retailer host.
+
+    Mirrors services/catalog_enrichment_agent/ingestion.derive_merchant_id rather than importing
+    it: this screen is a standalone script and that module pulls the whole ingest chain in. The
+    coupling is pinned by a test that compares this against the real function, so the duplication
+    cannot drift silently.
+    """
+    return f"agent_seed::retailer::{str(host or '').strip().lower()}"
+
 #: The Meitu cohort is lip-only; a case that declares no shelf is held to this one.
 DEFAULT_CATEGORY_PREFIX = "beauty/makeup/lip/"
 
@@ -144,10 +155,19 @@ def evaluate(manifest: dict, evidence: dict, *, now=None) -> dict:
             # that shape. Requiring the two namespaces to be equal made every curated retailer case
             # unpassable by construction. What that clause protected — two sellers collapsing onto
             # one identity — is asserted below, on both sides.
+            #
+            # The offer's merchant id is not free-form either: for a retailer case the writer
+            # derives it FROM THE HOST (`agent_seed::retailer::<host>`,
+            # services/catalog_enrichment_agent/ingestion.derive_merchant_id, pinned by
+            # tests/services/test_curated_retailer_contract.py). Accepting "any non-empty id"
+            # let an offer carry the OTHER seller's id, an unrelated namespace, or the
+            # ADR-009-banned `external_seed` bucket, and still resolve this product.
+            expected_merchant = retailer_merchant_id(host) if case.get("source_role") == "retailer" else None
             matching_offers = [offer for offer in (observed.get("offers") or [])
                 if all(offer.get(field) == product.get(field) for field in
                        ("product_key", "seller_host", "variant_id", "currency", "market"))
-                and str(offer.get("merchant_id") or "").strip()]
+                and (offer.get("merchant_id") == expected_merchant if expected_merchant
+                     else str(offer.get("merchant_id") or "").strip())]
             if not any(urlsplit(str(offer.get("destination_url") or "")).scheme == "https"
                        and (urlsplit(str(offer.get("destination_url") or "")).hostname or "").removeprefix("www.") == host
                        for offer in matching_offers):
@@ -180,7 +200,9 @@ def evaluate(manifest: dict, evidence: dict, *, now=None) -> dict:
             # identity — the exact failure this canary exists to detect — would go unnoticed.
             offer_ids: dict = {}
             for offer in (observed.get("offers") or []):
-                if offer.get("seller_host") and offer.get("merchant_id"):
+                # Scoped to the case's hosts: an unrelated host reusing one of these ids is not
+                # this case's collapse, and counting it produced a false positive.
+                if offer.get("seller_host") in case["seller_hosts"] and offer.get("merchant_id"):
                     offer_ids.setdefault(offer["seller_host"], set()).add(offer["merchant_id"])
             flat = [merchant for values in offer_ids.values() for merchant in values]
             if len(set(flat)) != len(flat):

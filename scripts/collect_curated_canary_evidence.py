@@ -56,7 +56,7 @@ SURFACE_REASON = (
 #: first query, which a fake connection supplying those keys hid completely.
 PRODUCT_SQL = """
 SELECT p.product_key, p.merchant_id, p.platform, p.source_product_id, p.source_domain,
-       p.gtin, p.category_path, p.content_key, p.brand, p.title, p.pivota_signature_id
+       p.gtin, p.category_path, p.content_key, p.brand
   FROM catalog_products p
  WHERE lower(coalesce(p.source_domain, '')) = ANY($1::text[])
    AND p.gtin IS NOT NULL
@@ -168,13 +168,20 @@ async def collect(conn: Any, case: Dict[str, Any], *, now: Optional[datetime] = 
         # merchant variant, which is a measurement no one made.
         variants = [s_ for s_ in skus if str(s_["product_key"]) == key
                     and str(s_.get("source_variant_id") or "") not in ("", key)]
+        declared_variant = str((case.get("observed_source_variants") or {}).get(
+            str(row.get("source_domain") or ""), "") or "").strip()
         variant = variants[0] if len(variants) == 1 else None
+        if variant is not None and declared_variant and \
+                str(variant.get("source_variant_id") or "") != declared_variant:
+            # One stored variant, and it is NOT the one the case says it observes. Reporting the
+            # stored id silently would hide a manifest that has gone stale against the rows.
+            notes.append(f"{key}: case declares variant {declared_variant} but the only stored "
+                         f"variant is {variant.get('source_variant_id')}")
         if len(variants) > 1:
             # The manifest may already name the variant this case observes per host; honour that
             # declaration instead of refusing, but only when the declared id is actually PRESENT
             # among the rows — a declaration that matches nothing is a stale manifest, not evidence.
-            declared = str((case.get("observed_source_variants") or {}).get(
-                str(row.get("source_domain") or ""), "") or "").strip()
+            declared = declared_variant
             chosen = [v for v in variants if str(v.get("source_variant_id") or "") == declared]
             if declared and chosen:
                 variant = chosen[0]

@@ -390,3 +390,19 @@ def test_the_digest_covers_the_rows_not_the_header(monkeypatch):
     changed_rows = {"products": [{"product_key": "b"}], "offers": [], "evidence_provenance": {"collected_at": "t1"}}
     assert content_digest(base) == content_digest(same_rows_later)
     assert content_digest(base) != content_digest(changed_rows)
+
+
+async def test_a_declaration_is_checked_even_when_only_one_variant_is_stored():
+    """A stale manifest against a single stored variant was reported as agreement: the
+    declaration was consulted only when the rows were ambiguous."""
+    skus = [{"product_key": "ext:retailer:a", "sku_key": "s1", "source_variant_id": "45001",
+             "sku_payload": json.dumps({"variant_id_provenance": "merchant_issued"})}]
+    case = dict(CASE, observed_source_variants={"eyurs.com": "43603819692287"})
+    out = await collect(FakeConn(products=[product_row("eyurs.com", "ext:retailer:a")], skus=skus), case)
+    assert out["products"][0]["variant_id"] == "45001", "the stored row is still what is reported"
+    assert any("the only stored variant is 45001" in n for n in out["evidence_provenance"]["notes"])
+
+    # Agreement is silent.
+    agreeing = dict(CASE, observed_source_variants={"eyurs.com": "45001"})
+    out = await collect(FakeConn(products=[product_row("eyurs.com", "ext:retailer:a")], skus=skus), agreeing)
+    assert not any("declares variant" in n for n in out["evidence_provenance"]["notes"])

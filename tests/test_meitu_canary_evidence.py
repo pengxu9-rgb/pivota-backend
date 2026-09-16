@@ -343,3 +343,94 @@ def test_an_offer_in_another_market_or_currency_does_not_resolve_this_product():
         assert result["failed"] == 1, field
         assert any("missing seller-specific resolvable offer" in r
                    for r in result["cases"][0]["reasons"]), field
+
+
+RETAILER_CASE = dict(MANIFEST["cases"][0], source_role="retailer")
+
+
+def _retailer_evidence():
+    """Evidence in the shape the lane actually writes: product under the observed
+    seller-of-record, offer under the host-derived retailer id."""
+    data = evidence()
+    for product, offer in zip(data["same_brand"]["products"], data["same_brand"]["offers"]):
+        product["merchant_id"] = f"merch_obs_{product['seller_host']}"
+        offer["merchant_id"] = f"agent_seed::retailer::{offer['seller_host']}"
+    return data
+
+
+def test_the_expected_offer_identity_matches_what_the_writer_derives():
+    """The validator duplicates the id shape rather than importing the ingest chain; if the real
+    deriver ever changes, this fails instead of the duplication drifting silently."""
+    from services.catalog_enrichment_agent.ingestion import derive_merchant_id
+    from scripts.validate_meitu_canary_evidence import retailer_merchant_id
+
+    for host in ("one.example", "eyurs.com", "ohlolly.com"):
+        assert retailer_merchant_id(host) == derive_merchant_id(None, host, seller_domain=host)
+
+
+def test_a_retailer_offer_must_carry_its_own_hosts_identity():
+    """Each of these passed when any non-empty merchant id was accepted."""
+    manifest = {"cases": [RETAILER_CASE]}
+    assert evaluate(manifest, _retailer_evidence(), now=NOW)["passed"] == 1
+
+    # Cross-wired: host A's offer carries host B's identity.
+    data = _retailer_evidence()
+    data["same_brand"]["offers"][0]["merchant_id"] = "agent_seed::retailer::two.example"
+    data["same_brand"]["offers"][1]["merchant_id"] = "agent_seed::retailer::one.example"
+    assert evaluate(manifest, data, now=NOW)["failed"] == 1, "cross-wired seller identities"
+
+    # The ADR-009-banned shared bucket, which apply.py documents as mintable.
+    data = _retailer_evidence()
+    data["same_brand"]["offers"][0]["merchant_id"] = "external_seed"
+    assert evaluate(manifest, data, now=NOW)["failed"] == 1, "legacy external_seed bucket"
+
+    # An unrelated namespace entirely.
+    data = _retailer_evidence()
+    data["same_brand"]["offers"][0]["merchant_id"] = "merch_totally_unrelated"
+    assert evaluate(manifest, data, now=NOW)["failed"] == 1, "unrelated merchant namespace"
+
+
+def test_a_single_seller_retailer_case_still_checks_the_offer_identity():
+    """The collapse check only runs for multi-seller cases, so without the host-derived check a
+    single-seller case had NO constraint tying an offer to its seller at all."""
+    case = dict(RETAILER_CASE, seller_hosts=["one.example"])
+    data = _retailer_evidence()
+    for field in ("products", "offers"):
+        data["same_brand"][field] = [row for row in data["same_brand"][field]
+                                     if row["seller_host"] == "one.example"]
+    for surface in ("search_product_keys", "pdp_product_keys", "offer_product_keys"):
+        data["same_brand"][surface] = ["pk_one.example"]
+    data["same_brand"]["crawl"]["selected_products"] = 1
+    assert evaluate({"cases": [case]}, data, now=NOW)["passed"] == 1
+
+    data["same_brand"]["offers"][0]["merchant_id"] = "external_seed"
+    assert evaluate({"cases": [case]}, data, now=NOW)["failed"] == 1
+
+
+def test_the_offer_must_belong_to_this_product_and_this_variant():
+    """seller_host and variant_id were both deletable from the tuple without a test failing."""
+    manifest = {"cases": [RETAILER_CASE]}
+
+    # An offer whose seller_host names the other retailer.
+    data = _retailer_evidence()
+    data["same_brand"]["offers"][0]["seller_host"] = "two.example"
+    assert evaluate(manifest, data, now=NOW)["failed"] == 1, "offer filed under the wrong host"
+
+    # An offer hanging off the canonical stub instead of the merchant variant: the
+    # "looks purchasable, isn't" shape this canary exists to catch.
+    data = _retailer_evidence()
+    data["same_brand"]["offers"][0]["variant_id"] = data["same_brand"]["products"][0]["product_key"]
+    assert evaluate(manifest, data, now=NOW)["failed"] == 1, "offer on the canonical stub"
+
+
+def test_an_unrelated_hosts_offer_does_not_trip_the_collapse_check():
+    """The collapse check asks whether THIS case's sellers share an identity. An offer from a
+    host outside the case reusing one of those ids is not this case's collapse, and counting it
+    fails a case whose own sellers are perfectly distinct."""
+    manifest = {"cases": [RETAILER_CASE]}
+    data = _retailer_evidence()
+    stray = dict(data["same_brand"]["offers"][0])
+    stray["seller_host"] = "unrelated.example"
+    data["same_brand"]["offers"].append(stray)
+    result = evaluate(manifest, data, now=NOW)
+    assert result["passed"] == 1, result["cases"][0]["reasons"]
