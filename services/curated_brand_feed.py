@@ -228,19 +228,74 @@ class CrawlIncomplete(RuntimeError):
 
     next_page is diagnostic retry position, not an ingestion checkpoint. Callers retry
     the whole read before writing, so no partial batch can become a successful job.
+
+    `reason_code` names WHY when the cause is known (see classify_transport_failure).
+    `status` is deliberately NOT derived from it: every consumer gates on
+    `status == "complete"`, and an unreachable host is a failed crawl like any other.
     """
     def __init__(self, message: str, *, status: str, next_page: int,
-                 scanned_products: int, selected_products: int):
+                 scanned_products: int, selected_products: int,
+                 reason_code: Optional[str] = None):
         super().__init__(message)
         self.status = status
         self.next_page = next_page
         self.scanned_products = scanned_products
         self.selected_products = selected_products
+        self.reason_code = reason_code
 
     def as_dict(self) -> Dict[str, Any]:
-        return {"status": self.status, "next_page": self.next_page,
-                "scanned_products": self.scanned_products,
-                "selected_products": self.selected_products, "reason": str(self)}
+        out: Dict[str, Any] = {"status": self.status, "next_page": self.next_page,
+                               "scanned_products": self.scanned_products,
+                               "selected_products": self.selected_products, "reason": str(self)}
+        # Additive: existing readers key on status/reason and must not have to know this.
+        if self.reason_code:
+            out["reason_code"] = self.reason_code
+        return out
+
+
+#: Transport-failure signatures → (reason_code, what an operator should conclude).
+#: First match wins, so the specific TLS/DNS cases precede the generic connect failure.
+_UNREACHABLE_SIGNATURES: Tuple[Tuple[str, str, str], ...] = (
+    ("sslv3_alert_handshake_failure", "host_tls_refused",
+     "the host's TLS layer rejected the connection before any HTTP request, which is what an "
+     "edge returns for a hostname it has no certificate for"),
+    ("certificate_verify_failed", "host_tls_untrusted",
+     "the host presented a certificate this client will not trust"),
+    ("tlsv1_alert", "host_tls_refused", "the host rejected the TLS handshake"),
+    ("ssl", "host_tls_error", "the TLS handshake with the host failed"),
+    ("name or service not known", "host_dns_unresolved", "the hostname does not resolve"),
+    ("nodename nor servname", "host_dns_unresolved", "the hostname does not resolve"),
+    ("temporary failure in name resolution", "host_dns_unresolved",
+     "the hostname could not be resolved right now"),
+    ("getaddrinfo", "host_dns_unresolved", "the hostname could not be resolved"),
+    ("connection refused", "host_connection_refused", "the host refused the TCP connection"),
+    ("connection reset", "host_connection_reset", "the host reset the connection"),
+)
+
+
+def classify_transport_failure(exc: BaseException) -> Optional[Tuple[str, str]]:
+    """(reason_code, explanation) when a crawl failed to REACH the host, else None.
+
+    A raw `ConnectError: [SSL: SSLV3_ALERT_HANDSHAKE_FAILURE]` on page 1 reads as a bug in
+    this crawler. It is not: the storefront did not answer, and the useful next step is to
+    check the site, not the code. Not naming that cost a day of diagnosis on the 2026-09-15
+    A'PIEU canary, so the distinction is now recorded in the failure itself.
+
+    This NEVER changes control flow: an unreachable host is still an incomplete crawl that
+    must not ingest a partial prefix, and it keeps the same retry budget — a site that is
+    down now can answer on the next attempt.
+    """
+    if isinstance(exc, CrawlIncomplete):
+        return None
+    if isinstance(exc, httpx.TimeoutException):
+        return ("host_timeout", "the host did not respond within the request timeout")
+    if not isinstance(exc, httpx.TransportError):
+        return None
+    text = f"{type(exc).__name__}: {exc}".lower()
+    for needle, code, explanation in _UNREACHABLE_SIGNATURES:
+        if needle in text:
+            return (code, explanation)
+    return ("host_unreachable", "the host could not be reached")
 
 
 class ShopifyProductBatch(list):
@@ -281,10 +336,11 @@ async def fetch_shopify_products(
     timeout = httpx.Timeout(timeout_s, connect=5.0)
     headers = {"User-Agent": _UA, "Accept": "application/json"}
 
-    def incomplete(reason: str, status: str = "failed") -> CrawlIncomplete:
+    def incomplete(reason: str, status: str = "failed",
+                   reason_code: Optional[str] = None) -> CrawlIncomplete:
         return CrawlIncomplete(f"{host}: page {page}: {reason}", status=status,
                                next_page=page, scanned_products=scanned,
-                               selected_products=len(out))
+                               selected_products=len(out), reason_code=reason_code)
 
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers=headers) as client:
@@ -339,7 +395,18 @@ async def fetch_shopify_products(
     except CrawlIncomplete:
         raise
     except Exception as exc:
-        raise incomplete(f"{type(exc).__name__}: {str(exc)[:160]}") from exc
+        classified = classify_transport_failure(exc)
+        if classified is None:
+            raise incomplete(f"{type(exc).__name__}: {str(exc)[:160]}") from exc
+        code, explanation = classified
+        # The original error text is kept, never replaced: the classification is a reading
+        # of the evidence, and a wrong reading must stay checkable against what was raised.
+        raise incomplete(
+            f"host unreachable ({code}): {explanation}. "
+            f"This is the storefront, not this crawler — check the site before the code. "
+            f"Original: {type(exc).__name__}: {str(exc)[:160]}",
+            reason_code=code,
+        ) from exc
 
 
 def _native_shopify_id(value: Any) -> Optional[str]:
