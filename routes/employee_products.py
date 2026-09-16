@@ -4409,7 +4409,27 @@ async def update_external_seed(
         f"UPDATE external_product_seeds SET {', '.join(set_clauses)} WHERE id = :id",
         updates,
     )
-    return {"status": "success"}
+
+    # An employee price edit has to reach the BUYER's surfaces, not just the seed.
+    # `_refresh_external_seed_by_id` already projects after a re-read; this manual
+    # edit path wrote external_product_seeds and stopped, so a corrected price sat
+    # in the seed while catalog_offers -- which the PDP and the serving gate read --
+    # kept the old one. Same split-brain, different door.
+    #
+    # Best-effort and post-write, exactly like the refresh path: the projection is
+    # a mirror, and failing to mirror must never fail the authorized edit the
+    # employee just made.
+    projected: Dict[str, int] = {}
+    if any(k in updates for k in ("price_amount", "price_currency", "availability")):
+        try:
+            projected = await _project_refreshed_seed_to_serving_surfaces(seed_id)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "employee seed edit: serving-surface projection failed for seed_id=%r",
+                seed_id, exc_info=True,
+            )
+
+    return {"status": "success", "projected": projected}
 
 
 def _same_destination(fetched: Optional[str], served: Optional[str]) -> bool:
