@@ -16,7 +16,8 @@ def evidence():
         "products": [{"product_key": f"pk_{host}", "content_key": "ck", "product_group_id": "pg", "brand": "3CE", "seller_host": host,
             "merchant_id": f"merchant_{host}", "currency": "USD", "market": "US", "variant_id": "123456",
             "variant_id_provenance": "merchant_issued", "gtin": "8809530070499",
-            "category_path": "beauty/makeup/lip/lipstick", "inci_source": "reseller_listing"}
+            "category_path": "beauty/makeup/lip/lipstick", "inci_source": "reseller_listing",
+            "inci_row": {"present": True, "source_system": "reseller_listing", "raw_inci_chars": 412}}
             for host in ["one.example", "two.example"]],
         "search_product_keys": ["pk_one.example", "pk_two.example"],
         "pdp_product_keys": ["pk_one.example", "pk_two.example"],
@@ -26,7 +27,9 @@ def evidence():
                     "destination_url": f"https://{host}/products/lipstick"}
                    for host in ["one.example", "two.example"]],
         "second_ingest_added_product_keys": [], "second_ingest_added_sku_keys": [],
-        "second_ingest_added_offer_keys": [], "identity_failures": []}}
+        "second_ingest_added_offer_keys": [], "identity_failures": [],
+        "evidence_provenance": {"collector": "collect_curated_canary_evidence/v1",
+                                "collected_at": NOW.isoformat(), "backend_revision": "abc"}}}
 
 
 def test_missing_observations_are_pending_never_success():
@@ -224,3 +227,68 @@ def test_the_shipped_lip_case_rejects_a_skincare_product():
     result = evaluate({"cases": [lip_case]}, data, now=NOW)
     assert result["failed"] == 1
     assert any("beauty/makeup/lip/" in r for r in result["cases"][0]["reasons"])
+
+
+def test_evidence_without_collector_provenance_cannot_pass():
+    """Every field here is otherwise typeable by hand; provenance names who produced it."""
+    data = evidence()
+    del data["same_brand"]["evidence_provenance"]
+    result = evaluate(MANIFEST, data, now=NOW)
+    assert result["failed"] == 1
+    assert any("provenance" in reason for reason in result["cases"][0]["reasons"])
+
+    for blanked in ("collector", "collected_at", "backend_revision"):
+        data = evidence()
+        data["same_brand"]["evidence_provenance"][blanked] = "  "
+        assert evaluate(MANIFEST, data, now=NOW)["failed"] == 1, blanked
+
+
+def test_a_declared_ingredient_authority_needs_a_stored_row_behind_it():
+    """The curated mapper stamps inci_source on EVERY retailer record, while the row is written
+    only when the seller published ingredients. Without this, a product whose PDP carries no INCI
+    passes — measured 2026-09-16, the A'PIEU lip oil at eyurs.com is exactly that product."""
+    data = evidence()
+    del data["same_brand"]["products"][0]["inci_row"]
+    assert evaluate(MANIFEST, data, now=NOW)["failed"] == 1
+
+    data = evidence()
+    data["same_brand"]["products"][0]["inci_row"] = {
+        "present": False, "source_system": None, "raw_inci_chars": 0}
+    result = evaluate(MANIFEST, data, now=NOW)
+    assert result["failed"] == 1
+    assert any("no stored ingredient row" in r for r in result["cases"][0]["reasons"])
+
+
+def test_a_stored_row_that_disagrees_with_the_claim_cannot_pass():
+    data = evidence()
+    data["same_brand"]["products"][0]["inci_row"]["source_system"] = "brand_official"
+    result = evaluate(MANIFEST, data, now=NOW)
+    assert result["failed"] == 1
+    assert any("disagrees with the stored row" in r for r in result["cases"][0]["reasons"])
+
+    # A row that exists but holds no text is not authority either.
+    data = evidence()
+    data["same_brand"]["products"][0]["inci_row"]["raw_inci_chars"] = 0
+    assert evaluate(MANIFEST, data, now=NOW)["failed"] == 1
+
+
+def test_an_uncollected_surface_is_not_a_measured_absence():
+    """null means the door was never asked; [] means it was asked and returned nothing. Collapsing
+    them lets a never-measured surface read as a measured result."""
+    data = evidence()
+    data["same_brand"]["search_product_keys"] = None
+    result = evaluate(MANIFEST, data, now=NOW)
+    assert result["failed"] == 1
+    reasons = result["cases"][0]["reasons"]
+    assert any("was not collected" in r for r in reasons), reasons
+    assert not any("product missing from search_product_keys" in r for r in reasons), \
+        "an uncollected surface must not be reported as a measured absence"
+
+
+def test_uncollected_idempotence_and_identity_failures_cannot_pass():
+    """`null` here means the second ingest was never run / failures never measured. An empty list
+    is the claim 'measured, and there were none'."""
+    for field in ("second_ingest_added_product_keys", "identity_failures"):
+        data = evidence()
+        data["same_brand"][field] = None
+        assert evaluate(MANIFEST, data, now=NOW)["failed"] == 1, field

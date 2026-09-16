@@ -15,6 +15,17 @@ not the same listing product_key. Never derive canonical evidence from titles.
 Missing observations are pending, never passing. A pass certifies the supplied
 evidence meets this contract; source artifact provenance must still be reviewed.
 
+Evidence must carry `evidence_provenance {collector, collected_at, backend_revision}`
+and each product an `inci_row {present, source_system, raw_inci_chars}` read from
+`beauty_sku_ingredients`. Both exist because this screen reads a FILE: without them
+`inci_source` was assertable for a product with no stored ingredient row at all.
+`scripts/collect_curated_canary_evidence.py` produces those fields from the database.
+
+A surface array may be `null`, meaning the door was never asked, and that FAILS —
+distinct from `[]`, which claims the door was asked and returned nothing. The same
+holds for the second-ingest diffs and `identity_failures`: an empty list is the
+measured claim, `null` is the absence of a measurement.
+
 A case may set `required_category_prefix`. It DEFAULTS to the lip prefix, because the
 Meitu cohort this file was written for is lip-only, and a case that forgets to declare a
 category must not thereby accept any category. A case that legitimately covers another
@@ -67,6 +78,15 @@ def evaluate(manifest: dict, evidence: dict, *, now=None) -> dict:
             reasons.append("missing or invalid timezone-aware observed_at")
         if not all(observed.get(k) for k in ("backend_revision", "gateway_revision", "source_artifacts")):
             reasons.append("missing deployed revisions or source artifact references")
+        # WHO PRODUCED THIS FILE. Every field here is otherwise a claim a person could type:
+        # `inci_source: reseller_listing` was assertable for a product with no stored ingredient
+        # row at all. Provenance does not make a value true, but it distinguishes a collected
+        # file from an authored one, and names the collector whose output can be re-derived.
+        provenance = observed.get("evidence_provenance")
+        if not isinstance(provenance, dict) or not all(
+                str(provenance.get(field) or "").strip()
+                for field in ("collector", "collected_at", "backend_revision")):
+            reasons.append("evidence lacks collector provenance (collector, collected_at, backend_revision)")
         crawl = observed.get("crawl") or {}
         if crawl.get("status") != "complete" or not isinstance(crawl.get("selected_products"), int) or crawl["selected_products"] <= 0:
             reasons.append("no complete nonempty discovery evidence")
@@ -97,6 +117,18 @@ def evaluate(manifest: dict, evidence: dict, *, now=None) -> dict:
                 reasons.append(f"product category is not under the case's shelf {category_prefix}")
             if product.get("inci_source") != case["inci_source"]:
                 reasons.append("incorrect ingredient authority")
+            # And the authority must be a STORED FACT, not a restatement of intent. The curated
+            # mapper stamps inci_source on every retailer record unconditionally, while the row is
+            # written only when the seller published an ingredient list — so without this, a
+            # product whose PDP carries no INCI passes the check above. Measured 2026-09-16: the
+            # A'PIEU lip oil at eyurs.com is exactly that product.
+            inci_row = product.get("inci_row")
+            if not isinstance(inci_row, dict) or not inci_row.get("present"):
+                reasons.append("no stored ingredient row backs inci_source")
+            elif inci_row.get("source_system") != product.get("inci_source"):
+                reasons.append("declared inci_source disagrees with the stored row's source_system")
+            elif not isinstance(inci_row.get("raw_inci_chars"), int) or inci_row["raw_inci_chars"] <= 0:
+                reasons.append("stored ingredient row carries no INCI text")
             host, merchant = product.get("seller_host"), product.get("merchant_id")
             if host not in case["seller_hosts"] or not merchant:
                 reasons.append("wrong or missing seller identity")
@@ -114,7 +146,14 @@ def evaluate(manifest: dict, evidence: dict, *, now=None) -> dict:
                 seller_items.setdefault(host, set()).add((content_key, group_id, gtin))
             surface_key = product.get("canonical_product_key") or key
             for surface in ("search_product_keys", "pdp_product_keys", "offer_product_keys"):
-                if surface_key not in (observed.get(surface) or []):
+                observed_surface = observed.get(surface)
+                # `null` is NOT `[]`. A collector cannot read a door's answer out of the database,
+                # so it emits null; an empty list would say "the door was asked and returned
+                # nothing", which is a different — and testable — claim. Distinguishing them keeps
+                # a never-measured surface from reading as a measured absence.
+                if observed_surface is None:
+                    reasons.append(f"{surface} was not collected from a live door response")
+                elif surface_key not in observed_surface:
                     reasons.append(f"product missing from {surface}")
         if set(seller_ids) != set(case["seller_hosts"]):
             reasons.append("not every requested retailer has visible evidence")
