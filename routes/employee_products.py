@@ -8,6 +8,7 @@ content-key catalogue endpoints below, whose offers come from
 """
 
 from typing import Any, Dict, List, Optional, Tuple
+from decimal import Decimal, InvalidOperation
 import asyncio
 import csv
 import io
@@ -836,6 +837,117 @@ def _should_replace_localized_copy(
     if market_normalized == "US" and existing_is_non_english and incoming_looks_english:
         return True
     return False
+
+
+def _seed_variant_prices_changed(
+    *,
+    existing: List[Dict[str, Any]],
+    incoming: List[Dict[str, Any]],
+) -> bool:
+    """Did a freshly crawled variant change PRICE on a variant we already hold?
+
+    THE GAP THIS CLOSES. `_should_overwrite_seed_variants` and
+    `_should_replace_seed_variant_content` are the only two reasons a refresh keeps
+    the variants it just crawled, and between them they consider titles, ids,
+    descriptions, market and canonical_url -- never price. So for a product whose
+    shades did not change, a real price move was crawled, scored as "nothing new
+    structurally", and DISCARDED, while the scalar `price_amount` column (written
+    separately) moved. The seed then disagreed with itself, and everything built from
+    the variants -- catalog_offers, and through them the PDP and the served price --
+    stayed at the old number indefinitely.
+
+    Measured on prod 2026-09-16: JUNGSAEMMOOL LIP-PRESSION Metal Serum Gloss carried
+    price_amount 28.8 SGD (refreshed 09-14, matching the merchant's own door) with all
+    12 seed variants AND all 13 catalog_offers still at 28.20 from the 09-08 ingest.
+    A partner reported the 28.20 as a wrong price.
+
+    Compares only ids present on BOTH sides: an added or removed variant is the other
+    two predicates' business, and answering True for it here would make this one fire
+    on structural churn it does not understand. A missing or unparseable price on
+    either side is NOT a change -- absent is not cheaper, and churning the array on
+    unreadable data would replace good variants with worse ones.
+    """
+    if not existing or not incoming:
+        return False
+
+    def _price_of(variant: Dict[str, Any]) -> Optional[Decimal]:
+        for key in ("price_amount", "price", "list_price"):
+            raw = variant.get(key)
+            if raw is None or isinstance(raw, (dict, list)):
+                continue
+            text = str(raw).strip()
+            if not text:
+                continue
+            try:
+                return Decimal(text)
+            except (InvalidOperation, ValueError):
+                continue
+        return None
+
+    def _by_id(variants: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        out: Dict[str, Dict[str, Any]] = {}
+        for v in variants:
+            if not isinstance(v, dict):
+                continue
+            vid = str(v.get("variant_id") or v.get("id") or "").strip()
+            if vid:
+                out.setdefault(vid, v)
+        return out
+
+    existing_by_id = _by_id(existing)
+    incoming_by_id = _by_id(incoming)
+    for vid, incoming_variant in incoming_by_id.items():
+        existing_variant = existing_by_id.get(vid)
+        if existing_variant is None:
+            continue
+        old_price = _price_of(existing_variant)
+        new_price = _price_of(incoming_variant)
+        if old_price is None or new_price is None:
+            continue
+        if old_price != new_price:
+            return True
+    return False
+
+
+def _should_keep_refreshed_seed_variants(
+    *,
+    existing: List[Dict[str, Any]],
+    incoming: List[Dict[str, Any]],
+    product_title: Optional[str],
+    market: Optional[str],
+    previous_canonical_url: Optional[str],
+    refreshed_canonical_url: Optional[str],
+) -> bool:
+    """Should a refresh KEEP the variants it just crawled?
+
+    Extracted from `_refresh_external_seed_by_id` so the decision is reachable by a
+    test. Inline, it was four `elif`s inside a ~500-line function, which meant a test
+    could assert each predicate in isolation while nothing asserted the refresh
+    consulted them -- deleting the price arm left every test green.
+
+    Order is presentational only: each arm assigns the same variants, so the first
+    true reason wins and none of them disagree about the outcome.
+    """
+    if not incoming:
+        return False
+    if _should_overwrite_seed_variants(
+        existing=existing, incoming=incoming, product_title=product_title
+    ):
+        return True
+    if _should_replace_seed_variant_content(
+        existing=existing,
+        incoming=incoming,
+        market=market,
+        previous_canonical_url=previous_canonical_url,
+        refreshed_canonical_url=refreshed_canonical_url,
+    ):
+        return True
+    # A price move is a reason on its own. Without this arm the two predicates above
+    # answer "structurally identical" for an unchanged shade range and the freshly
+    # crawled prices are discarded.
+    if _seed_variant_prices_changed(existing=existing, incoming=incoming):
+        return True
+    return not existing
 
 
 def _should_replace_seed_variant_content(
@@ -4752,18 +4864,14 @@ async def _refresh_external_seed_by_id(
         seed_data["availability"] = snap_availability
     if snap_variants:
         existing_variants = _seed_variants(seed_data)
-        product_title = seed_data.get("title") or snap_title
-        if _should_overwrite_seed_variants(existing=existing_variants, incoming=snap_variants, product_title=product_title):
-            seed_data["variants"] = snap_variants
-        elif _should_replace_seed_variant_content(
+        if _should_keep_refreshed_seed_variants(
             existing=existing_variants,
             incoming=snap_variants,
+            product_title=seed_data.get("title") or snap_title,
             market=market,
             previous_canonical_url=previous_canonical_url,
             refreshed_canonical_url=canonical_url,
         ):
-            seed_data["variants"] = snap_variants
-        elif not existing_variants:
             seed_data["variants"] = snap_variants
 
     pending_row = dict(row)
