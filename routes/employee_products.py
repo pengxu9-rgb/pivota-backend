@@ -839,43 +839,88 @@ def _should_replace_localized_copy(
     return False
 
 
+_SHOPIFY_VARIANT_QUERY_ID = re.compile(r"[?&]variant=(\d+)")
+_SHOPIFY_VARIANT_GID = re.compile(r"ProductVariant/(\d+)")
+_POSITIONAL_OFFER_ID = re.compile(r"^offer_\d+$")
+
+
+def _variant_match_keys(variant: Dict[str, Any]) -> List[str]:
+    """Every key under which a stored and a crawled variant can be recognised as the same shade.
+
+    THE ID SHAPES DO NOT AGREE, and matching on the raw `variant_id` string made this
+    whole merge inert for the product it was written for. The ingestion lane stores the
+    bare Shopify id (`50856826536257`). The crawl extractor, reading a Shopify
+    `ProductGroup` whose per-variant `Offer` carries no `sku`, falls through to the
+    offer's `@id` and emits `/products/<handle>?variant=50856826536257#offer`. Measured
+    against the live jsmbeauty.sg page: 12 crawled variants, 0 raw-id matches, 0 prices
+    moved. So the numeric Shopify id is extracted from the query-string and GID forms,
+    and `sku` is offered as a second key on both sides (the sibling
+    `_distinct_variant_ids` already treats it as identity).
+
+    Positional `offer_N` ids are NEVER a key: they encode the order offers appeared on
+    the page, so a reordered page would write one shade's price onto another.
+    """
+    keys: List[str] = []
+    for field in ("variant_id", "id", "variantId"):
+        raw = variant.get(field)
+        if raw is None or isinstance(raw, (dict, list, bool)):
+            continue
+        text = str(raw).strip()
+        if not text or _POSITIONAL_OFFER_ID.match(text):
+            continue
+        match = _SHOPIFY_VARIANT_QUERY_ID.search(text) or _SHOPIFY_VARIANT_GID.search(text)
+        key = "id:" + (match.group(1) if match else text)
+        if key not in keys:
+            keys.append(key)
+    for field in ("sku", "sku_id"):
+        raw = variant.get(field)
+        if raw is None or isinstance(raw, (dict, list, bool)):
+            continue
+        text = str(raw).strip()
+        if text and ("sku:" + text) not in keys:
+            keys.append("sku:" + text)
+    return keys
+
+
 def _merge_refreshed_variant_prices(
     *,
     existing: List[Dict[str, Any]],
     incoming: List[Dict[str, Any]],
+    accepted_currency: Optional[str],
 ) -> Optional[List[Dict[str, Any]]]:
     """Fold freshly crawled PRICES into the variants we already hold, or None.
 
-    WHY A MERGE AND NOT AN ASSIGNMENT. The first version of this answered a bool and
-    the caller did `seed_data["variants"] = snap_variants`, which is a data-loss bug:
-    the ingestion lane writes fourteen keys per variant (variant_id, id, sku, barcode,
-    title, currency, price_currency, price_amount, price, availability, in_stock,
-    image_url, options, variant_id_provenance) and the crawl extractor emits five.
-    Assigning the crawl wholesale on a one-cent move drops `options` (the shade-selector
-    labels `services/beauty_external_ranking.py` reads) and the per-variant `image_url`.
-    The two structural predicates never fired on same-id/same-title arrays precisely
-    BECAUSE that protected these rows; a price arm that assigns wholesale walks straight
-    through that protection. So: copy what we hold, and move only the price.
+    WHY A MERGE AND NOT AN ASSIGNMENT. Assigning the crawl wholesale drops what the
+    ingestion lane wrote and the crawl does not carry -- `options` (the shade-selector
+    labels `services/beauty_external_ranking.py` reads), per-variant `image_url`, `sku`,
+    `barcode`. So: copy what we hold, and move only the price.
 
-    THE REFUSALS MIRROR THE SCALAR PATH, which already refuses the same readings a few
-    hundred lines below (`skipped_non_positive`, `skipped_currency_mismatch`). Without
-    them the array and the column disagree about the same crawl, which is exactly the
-    "seed disagrees with itself" defect this whole change exists to remove:
-      * a non-positive incoming price -- `_parse_price` returns 0.0 for a price glyph it
-        could not read a number out of, and 0.0 is not a markdown;
-      * a currency that differs from the one we store -- a scraped refresh may not
-        redenominate an offer;
-      * a NaN on either side -- Decimal NaN compares unequal to itself, so it would
-        rewrite the array every night forever.
+    THE CURRENCY AUTHORITY IS THE SCALAR DECISION, NOT THIS FUNCTION. It runs only after
+    `_refresh_external_seed_by_id` has accepted the crawl's product price, and it is
+    handed the currency that decision accepted. The previous version judged currency on
+    its own, and disagreed with the scalar path in both directions: a crawl variant with
+    no currency was accepted here while the scalar path refused the pair
+    (`skipped_incomplete_pair` / `skipped_currency_mismatch`), so the variants moved and
+    the column did not -- the exact "seed disagrees with itself" defect this change
+    exists to remove, reversed. Now a variant moves only when BOTH its stored and its
+    crawled currency are absent or equal to the accepted one.
 
-    Ids present on only ONE side are left alone: an added or removed shade is structural
-    churn the other two predicates own, and this function cannot judge it.
+    Also refused: a non-positive or unreadable crawl price (`_parse_price` returns 0.0 for
+    a glyph it could not read a number from), and NaN/Infinity on either side.
+
+    `list_price` is neither read nor written: it is a compare-at price, not the price.
+
+    A crawl key that maps to more than one crawled variant is ambiguous and ignored.
+    Variants the crawl does not mention are left exactly as they are.
     """
-    if not existing or not incoming:
+    if not existing or not incoming or not accepted_currency:
+        return None
+    accepted = str(accepted_currency).strip().upper()
+    if not accepted:
         return None
 
     def _price_of(variant: Dict[str, Any]) -> Optional[Decimal]:
-        for key in ("price_amount", "price", "list_price"):
+        for key in ("price_amount", "price"):
             raw = variant.get(key)
             if raw is None or isinstance(raw, (dict, list, bool)):
                 continue
@@ -885,7 +930,7 @@ def _merge_refreshed_variant_prices(
             try:
                 parsed = Decimal(text)
             except (InvalidOperation, ValueError):
-                continue
+                return None
             if parsed.is_nan() or parsed.is_infinite():
                 return None
             return parsed
@@ -894,25 +939,26 @@ def _merge_refreshed_variant_prices(
     def _currency_of(variant: Dict[str, Any]) -> Optional[str]:
         for key in ("price_currency", "currency"):
             raw = variant.get(key)
-            if raw is None or isinstance(raw, (dict, list)):
+            if raw is None or isinstance(raw, (dict, list, bool)):
                 continue
             text = str(raw).strip().upper()
             if text:
                 return text
         return None
 
-    def _by_id(variants: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-        out: Dict[str, Dict[str, Any]] = {}
-        for v in variants:
-            if not isinstance(v, dict):
-                continue
-            vid = str(v.get("variant_id") or v.get("id") or "").strip()
-            if vid:
-                out.setdefault(vid, v)
-        return out
-
-    incoming_by_id = _by_id(incoming)
-    if not incoming_by_id:
+    by_key: Dict[str, Dict[str, Any]] = {}
+    ambiguous: set = set()
+    for fresh in incoming:
+        if not isinstance(fresh, dict):
+            continue
+        for key in _variant_match_keys(fresh):
+            if key in by_key and by_key[key] is not fresh:
+                ambiguous.add(key)
+            else:
+                by_key[key] = fresh
+    for key in ambiguous:
+        by_key.pop(key, None)
+    if not by_key:
         return None
 
     merged: List[Dict[str, Any]] = []
@@ -921,8 +967,11 @@ def _merge_refreshed_variant_prices(
         if not isinstance(variant, dict):
             merged.append(variant)
             continue
-        vid = str(variant.get("variant_id") or variant.get("id") or "").strip()
-        fresh = incoming_by_id.get(vid) if vid else None
+        fresh = None
+        for key in _variant_match_keys(variant):
+            if key in by_key:
+                fresh = by_key[key]
+                break
         if fresh is None:
             merged.append(variant)
             continue
@@ -933,9 +982,11 @@ def _merge_refreshed_variant_prices(
             merged.append(variant)
             continue
 
-        old_currency = _currency_of(variant)
-        new_currency = _currency_of(fresh)
-        if old_currency and new_currency and old_currency != new_currency:
+        stored_currency = _currency_of(variant)
+        crawled_currency = _currency_of(fresh)
+        if (stored_currency and stored_currency != accepted) or (
+            crawled_currency and crawled_currency != accepted
+        ):
             merged.append(variant)
             continue
 
@@ -944,13 +995,12 @@ def _merge_refreshed_variant_prices(
             continue
 
         updated = dict(variant)
-        # Write every price key this variant already carries, so the entry cannot end
-        # up disagreeing with itself the way the seed did.
-        for key in ("price_amount", "price", "list_price"):
-            if key in updated:
-                updated[key] = str(new_price)
-        if "price_amount" not in updated:
-            updated["price_amount"] = str(new_price)
+        # Float, matching what the ingestion lane writes, so a refresh does not flip the
+        # type employee/agent responses return for this field. Every price key the
+        # variant already carries moves together.
+        updated["price_amount"] = float(new_price)
+        if "price" in updated:
+            updated["price"] = float(new_price)
         merged.append(updated)
         changed = True
 
@@ -4905,6 +4955,7 @@ async def _refresh_external_seed_by_id(
         seed_data["image_urls"] = snap_image_urls
     if not seed_data.get("availability"):
         seed_data["availability"] = snap_availability
+    variants_awaiting_price_merge: Optional[List[Dict[str, Any]]] = None
     if snap_variants:
         existing_variants = _seed_variants(seed_data)
         if _should_keep_refreshed_seed_variants(
@@ -4918,13 +4969,9 @@ async def _refresh_external_seed_by_id(
             seed_data["variants"] = snap_variants
         else:
             # Structurally identical, so the array we hold is the richer one and stays.
-            # Move only the prices into it -- see _merge_refreshed_variant_prices for why
-            # assigning the crawl here would drop options/image_url on every price move.
-            merged_variants = _merge_refreshed_variant_prices(
-                existing=existing_variants, incoming=snap_variants
-            )
-            if merged_variants is not None:
-                seed_data["variants"] = merged_variants
+            # Its PRICES are merged below, after the product-price decision, so the
+            # variants can never accept a crawl that decision refused.
+            variants_awaiting_price_merge = snap_variants
 
     pending_row = dict(row)
     pending_row["seed_data"] = seed_data
@@ -5026,6 +5073,21 @@ async def _refresh_external_seed_by_id(
             # Currency case-normalization ('usd' -> 'USD') lands here on purpose: the
             # WRITE is desirable, but it is not a price change and must not be counted.
             price_status = "unchanged"
+
+    # VARIANT PRICES FOLLOW THE PRODUCT-PRICE DECISION, never lead it. Only a crawl whose
+    # product price was accepted (or confirmed unchanged) may move variant prices, and
+    # only in the currency that decision accepted. `unchanged` is included on purpose:
+    # the reported case is a seed whose column was ALREADY refreshed (28.8) while its
+    # variants were left at 28.2, so the next crawl reads the same product price and
+    # must still heal the variants.
+    if variants_awaiting_price_merge and price_status in {"applied", "unchanged", "filled"}:
+        merged_variants = _merge_refreshed_variant_prices(
+            existing=_seed_variants(seed_data),
+            incoming=variants_awaiting_price_merge,
+            accepted_currency=next_currency,
+        )
+        if merged_variants is not None:
+            seed_data["variants"] = merged_variants
 
     # KNOWN BEHAVIOUR CHANGE, stated rather than discovered later. The PATCH route
     # above lets an employee set price_amount/price_currency/availability directly.

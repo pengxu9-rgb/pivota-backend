@@ -37,135 +37,238 @@ def test_should_overwrite_seed_variants_does_not_downgrade_titles_even_if_more_v
 
 
 # ---------------------------------------------------------------------------
-# A REFRESHED PRICE MUST REACH THE VARIANTS -- WITHOUT TAKING THE CRAWL WHOLESALE.
+# A REFRESHED PRICE MUST REACH THE VARIANTS -- WITHOUT TAKING THE CRAWL WHOLESALE,
+# AND WITHOUT DISAGREEING WITH THE PRODUCT-PRICE DECISION.
 #
-# The nightly refresh crawls the correct new price and the two structural
-# predicates answer "nothing new" for an unchanged shade range, so the fresh
-# prices were discarded while the scalar price_amount column moved alone.
 # Measured on prod 2026-09-16: JUNGSAEMMOOL LIP-PRESSION Metal Serum Gloss held
-# price_amount 28.8 SGD with all 12 seed variants and all 13 catalog_offers at
-# 28.20 from the 09-08 ingest.
+# price_amount 28.8 SGD with all 12 seed variants and all 13 catalog_offers at 28.20.
 #
-# The first version of this fix ASSIGNED the crawl, which is a data-loss bug: the
-# ingestion lane writes fourteen keys per variant and the crawl emits five.
+# Two earlier versions of this fix were wrong, and the tests below are shaped by why:
+#   * v1 assigned the crawl wholesale, dropping keys the ingestion lane writes;
+#   * v2 merged prices but matched on the RAW variant_id, and the tests fed it a
+#     hand-written crawl dict carrying the bare Shopify id. The real extractor emits
+#     `/products/<handle>?variant=<id>#offer` for this store, so v2 matched nothing
+#     and moved nothing -- while every test passed. The end-to-end tests here run the
+#     REAL `_extract_from_html` on a Shopify ProductGroup page.
 # ---------------------------------------------------------------------------
 
 import asyncio
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
+JSM_URL = "https://jsmbeauty.sg/products/lip-pression-metal-serum-gloss"
+CORE_DROP = "50856826536257"
+CHAI_TEA = "50865870831937"
 
-def _rich(price: str = "28.2", vid: str = "50856826536257", currency: str = "SGD") -> dict:
-    """A variant as the INGESTION lane writes it."""
-    return {
+
+def _stored(price=28.2, vid=CORE_DROP, currency="SGD", shade="Core Drop", **extra) -> dict:
+    """A variant as the INGESTION lane writes it: fourteen keys, float price."""
+    v = {
         "variant_id": vid, "id": vid, "sku": "32168999", "barcode": None,
-        "title": "Core Drop", "currency": currency, "price_currency": currency,
+        "title": shade, "currency": currency, "price_currency": currency,
         "price_amount": price, "price": price, "availability": "in_stock",
-        "in_stock": True, "image_url": "https://cdn.example.com/core-drop.jpg",
-        "options": [{"name": "Color", "value": "Core Drop"}],
+        "in_stock": True, "image_url": f"https://cdn.example.com/{vid}.jpg",
+        "options": [{"name": "Color", "value": shade}],
         "variant_id_provenance": "shopify",
     }
+    v.update(extra)
+    return v
 
 
-def _crawled(price: str = "28.8", vid: str = "50856826536257", currency: str = "SGD") -> dict:
-    """The same variant as the CRAWL EXTRACTOR emits it -- five keys."""
-    return {
-        "variant_id": vid, "title": "Core Drop", "price_amount": price,
-        "price_currency": currency, "availability": "in_stock",
-    }
+def _shopify_product_group_html(prices, currency="SGD") -> str:
+    """A Shopify ProductGroup page as jsmbeauty.sg serves it: per-variant Offers with
+    no `sku`, identified only by `@id`."""
+    variants = []
+    for vid, shade, price in prices:
+        variants.append({
+            "@type": "Product",
+            "name": f"LIP-PRESSION Metal Serum Gloss - {shade}",
+            "offers": {
+                "@type": "Offer",
+                "@id": f"/products/lip-pression-metal-serum-gloss?variant={vid}#offer",
+                "price": price,
+                "priceCurrency": currency,
+                "availability": "http://schema.org/InStock",
+                "url": f"{JSM_URL}?variant={vid}",
+            },
+        })
+    ld = {"@context": "http://schema.org/", "@type": "ProductGroup",
+          "name": "LIP-PRESSION Metal Serum Gloss", "sku": "32168999", "hasVariant": variants}
+    return f'<html><head><script type="application/ld+json">{json.dumps(ld)}</script></head><body></body></html>'
 
 
-def _merge(existing, incoming):
+def _real_crawl(prices, currency="SGD") -> dict:
+    from services.external_offers_service import _extract_from_html
+
+    return _extract_from_html(JSM_URL, _shopify_product_group_html(prices, currency))
+
+
+def _merge(existing, incoming, accepted="SGD"):
     from routes.employee_products import _merge_refreshed_variant_prices
 
-    return _merge_refreshed_variant_prices(existing=existing, incoming=incoming)
+    return _merge_refreshed_variant_prices(existing=existing, incoming=incoming, accepted_currency=accepted)
+
+
+# --- the real extractor's output --------------------------------------------
+
+
+def test_the_real_extractor_emits_the_query_string_id_shape() -> None:
+    """Pins the premise. If the extractor ever starts emitting bare ids, the
+    normalisation below becomes unnecessary -- and this test says so."""
+    crawl = _real_crawl([(CORE_DROP, "Core Drop", "28.80")])
+    assert crawl["variants"][0]["variant_id"] == (
+        f"/products/lip-pression-metal-serum-gloss?variant={CORE_DROP}#offer"
+    )
+
+
+def test_real_crawl_output_matches_stored_bare_shopify_ids() -> None:
+    """THE defect v2 shipped with: raw-id matching found 0 of 12 on the live page."""
+    crawl = _real_crawl([(CORE_DROP, "Core Drop", "28.80"), (CHAI_TEA, "Chai Tea", "28.80")])
+    merged = _merge([_stored(28.2, CORE_DROP), _stored(28.2, CHAI_TEA, shade="Chai Tea")], crawl["variants"])
+
+    assert merged is not None, "the merge must recognise the extractor's id shape"
+    assert merged[0]["price_amount"] == 28.8
+    assert merged[1]["price_amount"] == 28.8
+
+
+# --- what the merge keeps and refuses ---------------------------------------
 
 
 def test_the_price_moves_and_nothing_else_is_lost() -> None:
-    """THE regression the first version shipped: assigning the crawl dropped
-    `options` (shade-selector labels) and per-variant `image_url`, both of which
-    services/beauty_external_ranking.py reads."""
-    merged = _merge([_rich("28.2")], [_crawled("28.8")])
+    crawl = _real_crawl([(CORE_DROP, "Core Drop", "28.80")])
+    merged = _merge([_stored(28.2)], crawl["variants"])
 
-    assert merged is not None
     v = merged[0]
-    assert v["price_amount"] == "28.8"
-    assert v["price"] == "28.8", "every price key the variant carries must move together"
+    assert v["price_amount"] == 28.8 and v["price"] == 28.8
     assert v["options"] == [{"name": "Color", "value": "Core Drop"}]
-    assert v["image_url"] == "https://cdn.example.com/core-drop.jpg"
+    assert v["image_url"] == f"https://cdn.example.com/{CORE_DROP}.jpg"
     assert v["sku"] == "32168999"
-    assert set(_rich().keys()) <= set(v.keys()), "no key the ingestion lane wrote may be dropped"
+    assert set(_stored().keys()) <= set(v.keys()), "no key the ingestion lane wrote may be dropped"
+
+
+def test_the_written_price_stays_a_float() -> None:
+    """The ingestion lane writes floats; a refresh must not flip the type API responses return."""
+    merged = _merge([_stored(28.2)], _real_crawl([(CORE_DROP, "Core Drop", "28.80")])["variants"])
+    assert isinstance(merged[0]["price_amount"], float)
 
 
 def test_the_existing_array_is_not_mutated_in_place() -> None:
-    existing = [_rich("28.2")]
-    _merge(existing, [_crawled("28.8")])
-    assert existing[0]["price_amount"] == "28.2"
+    existing = [_stored(28.2)]
+    _merge(existing, _real_crawl([(CORE_DROP, "Core Drop", "28.80")])["variants"])
+    assert existing[0]["price_amount"] == 28.2
+
+
+def test_match_by_sku_when_ids_do_not_agree() -> None:
+    merged = _merge(
+        [_stored(28.2, vid="stored-internal-id", sku="SKU-9")],
+        [{"variant_id": "some-other-shape", "sku": "SKU-9", "price_amount": 30.0, "price_currency": "SGD"}],
+    )
+    assert merged is not None and merged[0]["price_amount"] == 30.0
+
+
+def test_gid_form_matches_the_bare_id() -> None:
+    merged = _merge(
+        [_stored(28.2)],
+        [{"variant_id": f"gid://shopify/ProductVariant/{CORE_DROP}", "price_amount": 30.0, "price_currency": "SGD"}],
+    )
+    assert merged is not None and merged[0]["price_amount"] == 30.0
+
+
+def test_positional_offer_ids_never_match() -> None:
+    """`offer_N` is page order. A reordered page would write one shade's price onto another."""
+    assert _merge(
+        [_stored(20.0, vid="offer_1"), _stored(10.0, vid="offer_2")],
+        [{"variant_id": "offer_1", "price_amount": 10.0, "price_currency": "SGD"},
+         {"variant_id": "offer_2", "price_amount": 20.0, "price_currency": "SGD"}],
+    ) is None
+
+
+def test_a_crawl_key_shared_by_two_variants_is_ambiguous_and_ignored() -> None:
+    assert _merge(
+        [_stored(28.2, vid="A", sku="SAME")],
+        [{"variant_id": "X", "sku": "SAME", "price_amount": 10.0, "price_currency": "SGD"},
+         {"variant_id": "Y", "sku": "SAME", "price_amount": 99.0, "price_currency": "SGD"}],
+    ) is None
 
 
 def test_a_non_positive_crawl_price_is_refused() -> None:
-    """_parse_price returns 0.0 for a price glyph it could not read a number out of.
-    The scalar path refuses that as skipped_non_positive; so must this."""
-    assert _merge([_rich("28.2")], [_crawled("0")]) is None
-    assert _merge([_rich("28.2")], [_crawled("0.00")]) is None
-    assert _merge([_rich("28.2")], [_crawled("-1")]) is None
+    for bad in ("0", "0.00", "-1"):
+        assert _merge([_stored(28.2)], [{"variant_id": CORE_DROP, "price_amount": bad, "price_currency": "SGD"}]) is None
 
 
-def test_a_currency_change_is_refused_not_redenominated() -> None:
-    """A scraped refresh may not redenominate an offer -- the scalar path refuses
-    this as skipped_currency_mismatch."""
-    assert _merge([_rich("24000", currency="KRW")], [_crawled("24", currency="USD")]) is None
+def test_nan_and_infinity_are_refused_and_never_raise() -> None:
+    for bad in ("NaN", "sNaN", "Infinity"):
+        assert _merge([_stored(28.2)], [{"variant_id": CORE_DROP, "price_amount": bad, "price_currency": "SGD"}]) is None
+    assert _merge([_stored("NaN")], [{"variant_id": CORE_DROP, "price_amount": 28.8, "price_currency": "SGD"}]) is None
 
 
-def test_a_currency_the_crawl_did_not_report_does_not_block_a_price_move() -> None:
-    incoming = _crawled("28.8")
-    incoming.pop("price_currency")
-    merged = _merge([_rich("28.2")], [incoming])
-    assert merged is not None and merged[0]["price_amount"] == "28.8"
+def test_no_accepted_currency_means_no_merge() -> None:
+    """The merge never judges currency on its own: without the product-price decision's
+    accepted currency, it does nothing."""
+    crawl = _real_crawl([(CORE_DROP, "Core Drop", "28.80")])
+    assert _merge([_stored(28.2)], crawl["variants"], accepted=None) is None
 
 
-def test_nan_is_refused_and_never_raises() -> None:
-    """Decimal NaN compares unequal to itself, so it would rewrite the array every
-    night forever; sNaN raises InvalidOperation on compare."""
-    assert _merge([_rich("28.2")], [_crawled("NaN")]) is None
-    assert _merge([_rich("NaN")], [_crawled("28.8")]) is None
-    assert _merge([_rich("28.2")], [_crawled("sNaN")]) is None
-    assert _merge([_rich("28.2")], [_crawled("Infinity")]) is None
+def test_a_crawled_currency_other_than_the_accepted_one_is_refused() -> None:
+    crawl = _real_crawl([(CORE_DROP, "Core Drop", "24")], currency="USD")
+    assert _merge([_stored(24000.0, currency="KRW")], crawl["variants"], accepted="KRW") is None
+
+
+def test_a_stored_currency_other_than_the_accepted_one_is_refused() -> None:
+    assert _merge(
+        [_stored(24000.0, currency="KRW")],
+        [{"variant_id": CORE_DROP, "price_amount": 24.0}],
+        accepted="USD",
+    ) is None
+
+
+def test_a_stored_variant_with_no_currency_key_can_still_move() -> None:
+    """curated_brand_feed writes variants with no currency key at all. Absent is not a
+    mismatch -- treating it as one made the merge inert for that whole lane."""
+    stored = _stored(28.2)
+    stored.pop("currency")
+    stored.pop("price_currency")
+    merged = _merge([stored], _real_crawl([(CORE_DROP, "Core Drop", "28.80")])["variants"])
+    assert merged is not None and merged[0]["price_amount"] == 28.8
+
+
+def test_list_price_is_neither_read_nor_written() -> None:
+    """list_price is a compare-at price, not the price."""
+    stored = _stored(18.0, list_price=30.0)
+    merged = _merge([stored], [{"variant_id": CORE_DROP, "price_amount": 20.0, "price_currency": "SGD"}])
+    assert merged[0]["price_amount"] == 20.0
+    assert merged[0]["list_price"] == 30.0
+    only_list = {"variant_id": CORE_DROP, "list_price": 30.0}
+    assert _merge([only_list], [{"variant_id": CORE_DROP, "price_amount": 20.0}]) is None
 
 
 def test_an_unchanged_price_is_not_a_write() -> None:
-    """CONTROL. Without this the merge could return a new array every night."""
-    assert _merge([_rich("28.2")], [_crawled("28.2")]) is None
-    assert _merge([_rich("28.20")], [_crawled("28.2")]) is None, "formatting is not a price move"
-    assert _merge([_rich("28")], [_crawled("28.000")]) is None
+    assert _merge([_stored(28.8)], _real_crawl([(CORE_DROP, "Core Drop", "28.80")])["variants"]) is None
 
 
 def test_a_price_that_moves_down_counts() -> None:
-    """A markdown is the common case and must not be ignored."""
-    merged = _merge([_rich("28.8")], [_crawled("19.99")])
-    assert merged is not None and merged[0]["price_amount"] == "19.99"
+    merged = _merge([_stored(28.8)], _real_crawl([(CORE_DROP, "Core Drop", "19.99")])["variants"])
+    assert merged is not None and merged[0]["price_amount"] == 19.99
 
 
 def test_a_sub_unit_move_counts() -> None:
-    merged = _merge([_rich("28.20")], [_crawled("28.40")])
-    assert merged is not None and merged[0]["price_amount"] == "28.40"
+    merged = _merge([_stored(28.2)], _real_crawl([(CORE_DROP, "Core Drop", "28.40")])["variants"])
+    assert merged is not None and merged[0]["price_amount"] == 28.4
 
 
 def test_variants_the_crawl_did_not_mention_are_untouched() -> None:
-    existing = [_rich("28.2", "AAA"), _rich("28.2", "BBB")]
-    merged = _merge(existing, [_crawled("31.0", "AAA")])
-    assert merged is not None
-    assert merged[0]["price_amount"] == "31.0"
-    assert merged[1]["price_amount"] == "28.2", "an id the crawl never mentioned must not move"
+    merged = _merge(
+        [_stored(28.2, CORE_DROP), _stored(28.2, CHAI_TEA, shade="Chai Tea")],
+        _real_crawl([(CORE_DROP, "Core Drop", "31.00")])["variants"],
+    )
+    assert merged[0]["price_amount"] == 31.0
+    assert merged[1]["price_amount"] == 28.2
 
 
-def test_an_id_only_the_crawl_knows_is_left_to_the_structural_predicates() -> None:
-    assert _merge([_rich("28.2", "AAA")], [_crawled("99.0", "ZZZ")]) is None
-
-
-# --- the DECISION and the CALL SITE, not just the parts ---------------------
+# --- the structural DECISION ------------------------------------------------
 
 
 def _keep(existing, incoming, title="LIP-PRESSION Metal Serum Gloss"):
@@ -173,14 +276,12 @@ def _keep(existing, incoming, title="LIP-PRESSION Metal Serum Gloss"):
 
     return _should_keep_refreshed_seed_variants(
         existing=existing, incoming=incoming, product_title=title, market="SG",
-        previous_canonical_url="https://jsmbeauty.sg/p", refreshed_canonical_url="https://jsmbeauty.sg/p",
+        previous_canonical_url=JSM_URL, refreshed_canonical_url=JSM_URL,
     )
 
 
 def test_a_price_only_change_does_not_take_the_crawl_wholesale() -> None:
-    """The structural decision must stay structural: a price move is handled by the
-    merge, not by replacing the array."""
-    assert not _keep([_rich("28.2")], [_crawled("28.8")])
+    assert not _keep([_stored(28.2)], _real_crawl([(CORE_DROP, "Core Drop", "28.80")])["variants"])
 
 
 def test_a_structurally_better_crawl_is_still_taken_wholesale() -> None:
@@ -192,62 +293,39 @@ def test_a_structurally_better_crawl_is_still_taken_wholesale() -> None:
     assert _keep(existing, incoming, title="Some Serum 100 ml")
 
 
-def test_a_content_change_on_matching_ids_is_still_taken_wholesale() -> None:
-    """Pins the SECOND structural arm (_should_replace_seed_variant_content), which
-    no other test in this file reaches -- deleting it left every test green."""
+def test_a_localisation_correction_is_still_taken_wholesale() -> None:
+    """Pins the second structural arm (_should_replace_seed_variant_content)."""
     from routes.employee_products import _should_keep_refreshed_seed_variants
 
-    # Arm B is LOCALISATION correction: a US-market row whose stored copy is
-    # non-English and whose refresh came back in English.
-    existing = [{
-        "variant_id": "A", "title": "100 ml",
-        "description": "Diese Feuchtigkeitscreme ist sehr gut fuer die Haut und wird taeglich verwendet.",
-    }]
-    incoming = [{
-        "variant_id": "A", "title": "100 ml",
-        "description": "This moisturiser is very good for the skin and is used every day.",
-    }]
-    structural = _should_keep_refreshed_seed_variants(
-        existing=existing, incoming=incoming, product_title="Some Serum 100 ml",
-        market="US",
-        previous_canonical_url="https://example.com/de/p",
-        refreshed_canonical_url="https://example.com/p",
-    )
-    assert structural is True
+    existing = [{"variant_id": "A", "title": "100 ml",
+                 "description": "Diese Feuchtigkeitscreme ist sehr gut fuer die Haut und wird taeglich verwendet."}]
+    incoming = [{"variant_id": "A", "title": "100 ml",
+                 "description": "This moisturiser is very good for the skin and is used every day."}]
+    assert _should_keep_refreshed_seed_variants(
+        existing=existing, incoming=incoming, product_title="Some Serum 100 ml", market="US",
+        previous_canonical_url="https://example.com/de/p", refreshed_canonical_url="https://example.com/p",
+    ) is True
 
 
-def test_the_real_refresh_moves_the_price_into_the_variants_it_already_held() -> None:
-    """END TO END through `_refresh_external_seed_by_id`.
+# --- END TO END through the real refresh, fed by the real extractor ---------
 
-    Every assertion above drives a helper. Nothing pinned that the refresh CONSULTS
-    them -- reverting the call site left the whole file green.
-    """
+
+def _run_refresh(stored_row: dict, crawl: dict) -> dict:
     import routes.employee_products as mod
 
-    stored = {
-        "id": "eps_jsm_1", "external_product_id": "ext_jsm_1", "market": "SG", "tool": "*",
-        "utm_template": None, "partner_type": None, "disclosure_text": None,
-        "destination_url": "https://jsmbeauty.sg/products/lip-pression-metal-serum-gloss",
-        "canonical_url": "https://jsmbeauty.sg/products/lip-pression-metal-serum-gloss",
-        "domain": "jsmbeauty.sg", "title": "LIP-PRESSION Metal Serum Gloss",
-        "image_url": "https://cdn.example.com/img.jpg",
-        "price_amount": 28.2, "price_currency": "SGD", "availability": "in_stock",
-        "seed_data": {"title": "LIP-PRESSION Metal Serum Gloss", "snapshot": {},
-                      "variants": [_rich("28.2")]},
-        "status": "active", "attached_product_key": None, "attached_variant_id": None,
-    }
     snapshot = SimpleNamespace(
-        canonical_url=stored["canonical_url"], domain="jsmbeauty.sg",
-        title="LIP-PRESSION Metal Serum Gloss", image_url="https://cdn.example.com/img.jpg",
-        price_amount=28.8, price_currency="SGD", availability="in_stock",
-        fetched_at=None, evidence={"variants": [_crawled("28.8")]},
+        canonical_url=crawl.get("canonical_url") or JSM_URL, domain="jsmbeauty.sg",
+        title=crawl.get("title"), image_url=crawl.get("image_url"),
+        price_amount=crawl.get("price_amount"), price_currency=crawl.get("price_currency"),
+        availability=crawl.get("availability") or "in_stock", fetched_at=None,
+        evidence={"variants": crawl.get("variants") or []},
     )
 
     async def fake_fetch_one(_q, values=None):
-        return stored if values and values.get("id") == stored["id"] else None
+        return stored_row if values and values.get("id") == stored_row["id"] else None
 
     async def fake_exec(_q, values):
-        stored.update(values)
+        stored_row.update(values)
 
     mp = pytest.MonkeyPatch()
     try:
@@ -255,14 +333,97 @@ def test_the_real_refresh_moves_the_price_into_the_variants_it_already_held() ->
         mp.setattr(mod.database, "fetch_one", fake_fetch_one)
         mp.setattr(mod, "_execute_seed_data_stmt", fake_exec)
         mp.setattr(mod, "resolve_external_offer", AsyncMock(return_value=snapshot))
-        asyncio.run(mod._refresh_external_seed_by_id(stored["id"], max_wait=0))
+        result = asyncio.run(mod._refresh_external_seed_by_id(stored_row["id"], max_wait=0))
     finally:
         mp.undo()
+    seed_data = stored_row["seed_data"]
+    if isinstance(seed_data, str):
+        seed_data = json.loads(seed_data)
+    return {"result": result, "variants": seed_data.get("variants") or [], "row": stored_row}
 
-    written = stored["seed_data"]
-    variants = written["variants"] if isinstance(written, dict) else []
-    assert variants, "the refresh must still write a variants array"
-    assert str(variants[0]["price_amount"]) == "28.8", "the crawled price must reach the variants"
-    assert variants[0]["options"] == [{"name": "Color", "value": "Core Drop"}], (
-        "the refresh must not replace the rich array with the crawl's five-key shape"
-    )
+
+def _jsm_row(column_price=28.8, variant_price=28.2, column_currency="SGD", variant_currency="SGD") -> dict:
+    return {
+        "id": "eps_jsm_1", "external_product_id": "ext_jsm_1", "market": "SG", "tool": "*",
+        "utm_template": None, "partner_type": None, "disclosure_text": None,
+        "destination_url": JSM_URL, "canonical_url": JSM_URL, "domain": "jsmbeauty.sg",
+        "title": "LIP-PRESSION Metal Serum Gloss", "image_url": "https://cdn.example.com/img.jpg",
+        "price_amount": column_price, "price_currency": column_currency, "availability": "in_stock",
+        "seed_data": {"title": "LIP-PRESSION Metal Serum Gloss", "snapshot": {},
+                      "variants": [_stored(variant_price, currency=variant_currency),
+                                   _stored(variant_price, CHAI_TEA, currency=variant_currency, shade="Chai Tea")]},
+        "status": "active", "attached_product_key": None, "attached_variant_id": None,
+    }
+
+
+def test_the_reported_seed_heals_when_its_column_is_already_fresh() -> None:
+    """The exact prod state: column already 28.8, variants stuck at 28.2. The product
+    price reads `unchanged`, and the variants must still heal."""
+    out = _run_refresh(_jsm_row(28.8, 28.2),
+                       _real_crawl([(CORE_DROP, "Core Drop", "28.80"), (CHAI_TEA, "Chai Tea", "28.80")]))
+
+    assert out["result"]["price_refresh"]["status"] == "unchanged"
+    assert [v["price_amount"] for v in out["variants"]] == [28.8, 28.8]
+    assert out["variants"][0]["options"] == [{"name": "Color", "value": "Core Drop"}]
+
+
+def test_when_the_product_price_is_refused_the_variants_do_not_move() -> None:
+    """Refused pair -> no variant write. The array and the column must never diverge:
+    a crawl in a currency other than the stored one is refused by the scalar path, so
+    the variants stay too."""
+    out = _run_refresh(_jsm_row(28.8, 28.2),
+                       _real_crawl([(CORE_DROP, "Core Drop", "21.00")], currency="USD"))
+
+    assert out["result"]["price_refresh"]["status"] == "skipped_currency_mismatch"
+    assert [v["price_amount"] for v in out["variants"]] == [28.2, 28.2]
+
+
+def test_a_zero_crawl_moves_neither_column_nor_variants() -> None:
+    crawl = _real_crawl([(CORE_DROP, "Core Drop", "0")])
+    crawl["price_amount"] = 0.0
+    out = _run_refresh(_jsm_row(28.8, 28.2), crawl)
+
+    assert out["result"]["price_refresh"]["status"] == "skipped_non_positive"
+    assert [v["price_amount"] for v in out["variants"]] == [28.2, 28.2]
+
+
+def _currencyless(crawl: dict) -> dict:
+    for v in crawl["variants"]:
+        v["price_currency"] = None
+    return crawl
+
+
+def _row_with_currencyless_variants(**kw) -> dict:
+    row = _jsm_row(**kw)
+    for v in row["seed_data"]["variants"]:
+        v.pop("currency")
+        v.pop("price_currency")
+    return row
+
+
+def test_an_incomplete_price_pair_moves_no_variant_even_when_no_variant_has_a_currency() -> None:
+    """THE GATE, isolated. The product price is refused `skipped_incomplete_pair` (the
+    crawl read an amount but no currency). Neither the stored variants (curated lane:
+    no currency key) nor the crawled ones carry a currency, so the merge's own currency
+    check has nothing to object to -- only the product-price gate stops the write.
+    Without it the variants move and the column does not: the seed disagrees with
+    itself again, reversed."""
+    crawl = _currencyless(_real_crawl([(CORE_DROP, "Core Drop", "28.80"), (CHAI_TEA, "Chai Tea", "28.80")]))
+    crawl["price_currency"] = None
+    out = _run_refresh(_row_with_currencyless_variants(column_price=28.2, variant_price=28.2), crawl)
+
+    assert out["result"]["price_refresh"]["status"] == "skipped_incomplete_pair"
+    assert out["row"]["price_amount"] == 28.2
+    assert [v["price_amount"] for v in out["variants"]] == [28.2, 28.2]
+
+
+def test_a_fabricated_currency_mismatch_moves_no_variant_either() -> None:
+    """resolve_external_offer fabricates `USD` when a page shows no currency. The
+    scalar path refuses that against a stored SGD column; variants without a currency
+    of their own must stay put too."""
+    crawl = _currencyless(_real_crawl([(CORE_DROP, "Core Drop", "21.00"), (CHAI_TEA, "Chai Tea", "21.00")]))
+    crawl["price_currency"] = "USD"
+    out = _run_refresh(_row_with_currencyless_variants(column_price=28.8, variant_price=28.2), crawl)
+
+    assert out["result"]["price_refresh"]["status"] == "skipped_currency_mismatch"
+    assert [v["price_amount"] for v in out["variants"]] == [28.2, 28.2]
