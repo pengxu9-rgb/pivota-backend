@@ -839,49 +839,66 @@ def _should_replace_localized_copy(
     return False
 
 
-def _seed_variant_prices_changed(
+def _merge_refreshed_variant_prices(
     *,
     existing: List[Dict[str, Any]],
     incoming: List[Dict[str, Any]],
-) -> bool:
-    """Did a freshly crawled variant change PRICE on a variant we already hold?
+) -> Optional[List[Dict[str, Any]]]:
+    """Fold freshly crawled PRICES into the variants we already hold, or None.
 
-    THE GAP THIS CLOSES. `_should_overwrite_seed_variants` and
-    `_should_replace_seed_variant_content` are the only two reasons a refresh keeps
-    the variants it just crawled, and between them they consider titles, ids,
-    descriptions, market and canonical_url -- never price. So for a product whose
-    shades did not change, a real price move was crawled, scored as "nothing new
-    structurally", and DISCARDED, while the scalar `price_amount` column (written
-    separately) moved. The seed then disagreed with itself, and everything built from
-    the variants -- catalog_offers, and through them the PDP and the served price --
-    stayed at the old number indefinitely.
+    WHY A MERGE AND NOT AN ASSIGNMENT. The first version of this answered a bool and
+    the caller did `seed_data["variants"] = snap_variants`, which is a data-loss bug:
+    the ingestion lane writes fourteen keys per variant (variant_id, id, sku, barcode,
+    title, currency, price_currency, price_amount, price, availability, in_stock,
+    image_url, options, variant_id_provenance) and the crawl extractor emits five.
+    Assigning the crawl wholesale on a one-cent move drops `options` (the shade-selector
+    labels `services/beauty_external_ranking.py` reads) and the per-variant `image_url`.
+    The two structural predicates never fired on same-id/same-title arrays precisely
+    BECAUSE that protected these rows; a price arm that assigns wholesale walks straight
+    through that protection. So: copy what we hold, and move only the price.
 
-    Measured on prod 2026-09-16: JUNGSAEMMOOL LIP-PRESSION Metal Serum Gloss carried
-    price_amount 28.8 SGD (refreshed 09-14, matching the merchant's own door) with all
-    12 seed variants AND all 13 catalog_offers still at 28.20 from the 09-08 ingest.
-    A partner reported the 28.20 as a wrong price.
+    THE REFUSALS MIRROR THE SCALAR PATH, which already refuses the same readings a few
+    hundred lines below (`skipped_non_positive`, `skipped_currency_mismatch`). Without
+    them the array and the column disagree about the same crawl, which is exactly the
+    "seed disagrees with itself" defect this whole change exists to remove:
+      * a non-positive incoming price -- `_parse_price` returns 0.0 for a price glyph it
+        could not read a number out of, and 0.0 is not a markdown;
+      * a currency that differs from the one we store -- a scraped refresh may not
+        redenominate an offer;
+      * a NaN on either side -- Decimal NaN compares unequal to itself, so it would
+        rewrite the array every night forever.
 
-    Compares only ids present on BOTH sides: an added or removed variant is the other
-    two predicates' business, and answering True for it here would make this one fire
-    on structural churn it does not understand. A missing or unparseable price on
-    either side is NOT a change -- absent is not cheaper, and churning the array on
-    unreadable data would replace good variants with worse ones.
+    Ids present on only ONE side are left alone: an added or removed shade is structural
+    churn the other two predicates own, and this function cannot judge it.
     """
     if not existing or not incoming:
-        return False
+        return None
 
     def _price_of(variant: Dict[str, Any]) -> Optional[Decimal]:
         for key in ("price_amount", "price", "list_price"):
             raw = variant.get(key)
-            if raw is None or isinstance(raw, (dict, list)):
+            if raw is None or isinstance(raw, (dict, list, bool)):
                 continue
             text = str(raw).strip()
             if not text:
                 continue
             try:
-                return Decimal(text)
+                parsed = Decimal(text)
             except (InvalidOperation, ValueError):
                 continue
+            if parsed.is_nan() or parsed.is_infinite():
+                return None
+            return parsed
+        return None
+
+    def _currency_of(variant: Dict[str, Any]) -> Optional[str]:
+        for key in ("price_currency", "currency"):
+            raw = variant.get(key)
+            if raw is None or isinstance(raw, (dict, list)):
+                continue
+            text = str(raw).strip().upper()
+            if text:
+                return text
         return None
 
     def _by_id(variants: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
@@ -894,19 +911,50 @@ def _seed_variant_prices_changed(
                 out.setdefault(vid, v)
         return out
 
-    existing_by_id = _by_id(existing)
     incoming_by_id = _by_id(incoming)
-    for vid, incoming_variant in incoming_by_id.items():
-        existing_variant = existing_by_id.get(vid)
-        if existing_variant is None:
+    if not incoming_by_id:
+        return None
+
+    merged: List[Dict[str, Any]] = []
+    changed = False
+    for variant in existing:
+        if not isinstance(variant, dict):
+            merged.append(variant)
             continue
-        old_price = _price_of(existing_variant)
-        new_price = _price_of(incoming_variant)
-        if old_price is None or new_price is None:
+        vid = str(variant.get("variant_id") or variant.get("id") or "").strip()
+        fresh = incoming_by_id.get(vid) if vid else None
+        if fresh is None:
+            merged.append(variant)
             continue
-        if old_price != new_price:
-            return True
-    return False
+
+        old_price = _price_of(variant)
+        new_price = _price_of(fresh)
+        if old_price is None or new_price is None or new_price <= 0:
+            merged.append(variant)
+            continue
+
+        old_currency = _currency_of(variant)
+        new_currency = _currency_of(fresh)
+        if old_currency and new_currency and old_currency != new_currency:
+            merged.append(variant)
+            continue
+
+        if old_price == new_price:
+            merged.append(variant)
+            continue
+
+        updated = dict(variant)
+        # Write every price key this variant already carries, so the entry cannot end
+        # up disagreeing with itself the way the seed did.
+        for key in ("price_amount", "price", "list_price"):
+            if key in updated:
+                updated[key] = str(new_price)
+        if "price_amount" not in updated:
+            updated["price_amount"] = str(new_price)
+        merged.append(updated)
+        changed = True
+
+    return merged if changed else None
 
 
 def _should_keep_refreshed_seed_variants(
@@ -941,11 +989,6 @@ def _should_keep_refreshed_seed_variants(
         previous_canonical_url=previous_canonical_url,
         refreshed_canonical_url=refreshed_canonical_url,
     ):
-        return True
-    # A price move is a reason on its own. Without this arm the two predicates above
-    # answer "structurally identical" for an unchanged shade range and the freshly
-    # crawled prices are discarded.
-    if _seed_variant_prices_changed(existing=existing, incoming=incoming):
         return True
     return not existing
 
@@ -4873,6 +4916,15 @@ async def _refresh_external_seed_by_id(
             refreshed_canonical_url=canonical_url,
         ):
             seed_data["variants"] = snap_variants
+        else:
+            # Structurally identical, so the array we hold is the richer one and stays.
+            # Move only the prices into it -- see _merge_refreshed_variant_prices for why
+            # assigning the crawl here would drop options/image_url on every price move.
+            merged_variants = _merge_refreshed_variant_prices(
+                existing=existing_variants, incoming=snap_variants
+            )
+            if merged_variants is not None:
+                seed_data["variants"] = merged_variants
 
     pending_row = dict(row)
     pending_row["seed_data"] = seed_data

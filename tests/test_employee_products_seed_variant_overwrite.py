@@ -36,122 +36,154 @@ def test_should_overwrite_seed_variants_does_not_downgrade_titles_even_if_more_v
     )
 
 
-
 # ---------------------------------------------------------------------------
-# A PRICE MOVE IS A REASON TO KEEP THE CRAWLED VARIANTS.
+# A REFRESHED PRICE MUST REACH THE VARIANTS -- WITHOUT TAKING THE CRAWL WHOLESALE.
 #
-# The two predicates above consider titles, ids, descriptions, market and
-# canonical_url -- never price. So a refresh of a product whose shades did not
-# change scored the fresh crawl as "nothing new" and DISCARDED it, while the
-# scalar price_amount column (written separately) moved. The seed then disagreed
-# with itself and catalog_offers, built from the variants, stayed stale forever.
-#
+# The nightly refresh crawls the correct new price and the two structural
+# predicates answer "nothing new" for an unchanged shade range, so the fresh
+# prices were discarded while the scalar price_amount column moved alone.
 # Measured on prod 2026-09-16: JUNGSAEMMOOL LIP-PRESSION Metal Serum Gloss held
-# price_amount 28.8 SGD (refreshed 09-14, matching the merchant's own door) with
-# all 12 seed variants and all 13 catalog_offers still at 28.20 from 09-08.
+# price_amount 28.8 SGD with all 12 seed variants and all 13 catalog_offers at
+# 28.20 from the 09-08 ingest.
+#
+# The first version of this fix ASSIGNED the crawl, which is a data-loss bug: the
+# ingestion lane writes fourteen keys per variant and the crawl emits five.
 # ---------------------------------------------------------------------------
 
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
-def _jsm(price: str, vid: str = "50856826536257") -> dict:
-    return {"variant_id": vid, "title": "Core Drop", "price_amount": price, "price_currency": "SGD"}
-
-
-def test_a_price_move_on_a_matching_variant_is_a_change() -> None:
-    from routes.employee_products import _seed_variant_prices_changed
-
-    assert _seed_variant_prices_changed(existing=[_jsm("28.2")], incoming=[_jsm("28.8")])
+import pytest
 
 
-def test_the_structural_predicates_would_have_thrown_that_crawl_away() -> None:
-    """The control that makes the fix necessary rather than merely additive.
-
-    Same ids, same titles, only the price moved -- so the existing overwrite
-    predicate says False. Without the price predicate nothing keeps the crawl.
-    """
-    from routes.employee_products import _should_overwrite_seed_variants
-
-    assert not _should_overwrite_seed_variants(
-        existing=[_jsm("28.2")], incoming=[_jsm("28.8")], product_title="LIP-PRESSION Metal Serum Gloss"
-    )
-
-
-def test_identical_prices_are_not_a_change() -> None:
-    from routes.employee_products import _seed_variant_prices_changed
-
-    assert not _seed_variant_prices_changed(existing=[_jsm("28.2")], incoming=[_jsm("28.2")])
+def _rich(price: str = "28.2", vid: str = "50856826536257", currency: str = "SGD") -> dict:
+    """A variant as the INGESTION lane writes it."""
+    return {
+        "variant_id": vid, "id": vid, "sku": "32168999", "barcode": None,
+        "title": "Core Drop", "currency": currency, "price_currency": currency,
+        "price_amount": price, "price": price, "availability": "in_stock",
+        "in_stock": True, "image_url": "https://cdn.example.com/core-drop.jpg",
+        "options": [{"name": "Color", "value": "Core Drop"}],
+        "variant_id_provenance": "shopify",
+    }
 
 
-def test_decimal_formatting_is_not_a_change() -> None:
-    """28.20 and 28.2 are the same price. Churning the array on formatting would
-    rewrite good variants every single night."""
-    from routes.employee_products import _seed_variant_prices_changed
-
-    assert not _seed_variant_prices_changed(existing=[_jsm("28.20")], incoming=[_jsm("28.2")])
-    assert not _seed_variant_prices_changed(existing=[_jsm("28")], incoming=[_jsm("28.000")])
-
-
-def test_an_unreadable_or_missing_price_is_not_a_change() -> None:
-    """Absent is not cheaper. Replacing good variants because the crawl could not
-    read a price is strictly worse than keeping what we have."""
-    from routes.employee_products import _seed_variant_prices_changed
-
-    assert not _seed_variant_prices_changed(existing=[_jsm("28.2")], incoming=[{"variant_id": "50856826536257"}])
-    assert not _seed_variant_prices_changed(
-        existing=[_jsm("28.2")], incoming=[_jsm("not-a-price")]
-    )
-    assert not _seed_variant_prices_changed(existing=[], incoming=[_jsm("28.8")])
+def _crawled(price: str = "28.8", vid: str = "50856826536257", currency: str = "SGD") -> dict:
+    """The same variant as the CRAWL EXTRACTOR emits it -- five keys."""
+    return {
+        "variant_id": vid, "title": "Core Drop", "price_amount": price,
+        "price_currency": currency, "availability": "in_stock",
+    }
 
 
-def test_ids_present_on_only_one_side_are_left_to_the_other_predicates() -> None:
-    """An added or removed shade is structural churn this predicate does not
-    understand -- answering True for it would fire on cases it cannot judge."""
-    from routes.employee_products import _seed_variant_prices_changed
+def _merge(existing, incoming):
+    from routes.employee_products import _merge_refreshed_variant_prices
 
-    assert not _seed_variant_prices_changed(
-        existing=[_jsm("28.2", "AAA")], incoming=[_jsm("99.0", "BBB")]
-    )
+    return _merge_refreshed_variant_prices(existing=existing, incoming=incoming)
 
 
-def test_one_moved_price_among_many_unchanged_still_counts() -> None:
-    from routes.employee_products import _seed_variant_prices_changed
+def test_the_price_moves_and_nothing_else_is_lost() -> None:
+    """THE regression the first version shipped: assigning the crawl dropped
+    `options` (shade-selector labels) and per-variant `image_url`, both of which
+    services/beauty_external_ranking.py reads."""
+    merged = _merge([_rich("28.2")], [_crawled("28.8")])
 
-    existing = [_jsm("28.2", "A"), _jsm("28.2", "B"), _jsm("28.2", "C")]
-    incoming = [_jsm("28.2", "A"), _jsm("28.2", "B"), _jsm("31.0", "C")]
-    assert _seed_variant_prices_changed(existing=existing, incoming=incoming)
+    assert merged is not None
+    v = merged[0]
+    assert v["price_amount"] == "28.8"
+    assert v["price"] == "28.8", "every price key the variant carries must move together"
+    assert v["options"] == [{"name": "Color", "value": "Core Drop"}]
+    assert v["image_url"] == "https://cdn.example.com/core-drop.jpg"
+    assert v["sku"] == "32168999"
+    assert set(_rich().keys()) <= set(v.keys()), "no key the ingestion lane wrote may be dropped"
 
 
-# The DECISION, not just its parts. Testing each predicate in isolation left a
-# mutant alive: deleting the price arm from the refresh kept every test above
-# green, because nothing asserted the refresh consults it.
+def test_the_existing_array_is_not_mutated_in_place() -> None:
+    existing = [_rich("28.2")]
+    _merge(existing, [_crawled("28.8")])
+    assert existing[0]["price_amount"] == "28.2"
+
+
+def test_a_non_positive_crawl_price_is_refused() -> None:
+    """_parse_price returns 0.0 for a price glyph it could not read a number out of.
+    The scalar path refuses that as skipped_non_positive; so must this."""
+    assert _merge([_rich("28.2")], [_crawled("0")]) is None
+    assert _merge([_rich("28.2")], [_crawled("0.00")]) is None
+    assert _merge([_rich("28.2")], [_crawled("-1")]) is None
+
+
+def test_a_currency_change_is_refused_not_redenominated() -> None:
+    """A scraped refresh may not redenominate an offer -- the scalar path refuses
+    this as skipped_currency_mismatch."""
+    assert _merge([_rich("24000", currency="KRW")], [_crawled("24", currency="USD")]) is None
+
+
+def test_a_currency_the_crawl_did_not_report_does_not_block_a_price_move() -> None:
+    incoming = _crawled("28.8")
+    incoming.pop("price_currency")
+    merged = _merge([_rich("28.2")], [incoming])
+    assert merged is not None and merged[0]["price_amount"] == "28.8"
+
+
+def test_nan_is_refused_and_never_raises() -> None:
+    """Decimal NaN compares unequal to itself, so it would rewrite the array every
+    night forever; sNaN raises InvalidOperation on compare."""
+    assert _merge([_rich("28.2")], [_crawled("NaN")]) is None
+    assert _merge([_rich("NaN")], [_crawled("28.8")]) is None
+    assert _merge([_rich("28.2")], [_crawled("sNaN")]) is None
+    assert _merge([_rich("28.2")], [_crawled("Infinity")]) is None
+
+
+def test_an_unchanged_price_is_not_a_write() -> None:
+    """CONTROL. Without this the merge could return a new array every night."""
+    assert _merge([_rich("28.2")], [_crawled("28.2")]) is None
+    assert _merge([_rich("28.20")], [_crawled("28.2")]) is None, "formatting is not a price move"
+    assert _merge([_rich("28")], [_crawled("28.000")]) is None
+
+
+def test_a_price_that_moves_down_counts() -> None:
+    """A markdown is the common case and must not be ignored."""
+    merged = _merge([_rich("28.8")], [_crawled("19.99")])
+    assert merged is not None and merged[0]["price_amount"] == "19.99"
+
+
+def test_a_sub_unit_move_counts() -> None:
+    merged = _merge([_rich("28.20")], [_crawled("28.40")])
+    assert merged is not None and merged[0]["price_amount"] == "28.40"
+
+
+def test_variants_the_crawl_did_not_mention_are_untouched() -> None:
+    existing = [_rich("28.2", "AAA"), _rich("28.2", "BBB")]
+    merged = _merge(existing, [_crawled("31.0", "AAA")])
+    assert merged is not None
+    assert merged[0]["price_amount"] == "31.0"
+    assert merged[1]["price_amount"] == "28.2", "an id the crawl never mentioned must not move"
+
+
+def test_an_id_only_the_crawl_knows_is_left_to_the_structural_predicates() -> None:
+    assert _merge([_rich("28.2", "AAA")], [_crawled("99.0", "ZZZ")]) is None
+
+
+# --- the DECISION and the CALL SITE, not just the parts ---------------------
 
 
 def _keep(existing, incoming, title="LIP-PRESSION Metal Serum Gloss"):
     from routes.employee_products import _should_keep_refreshed_seed_variants
 
     return _should_keep_refreshed_seed_variants(
-        existing=existing,
-        incoming=incoming,
-        product_title=title,
-        market="SG",
-        previous_canonical_url="https://jsmbeauty.sg/products/lip-pression-metal-serum-gloss",
-        refreshed_canonical_url="https://jsmbeauty.sg/products/lip-pression-metal-serum-gloss",
+        existing=existing, incoming=incoming, product_title=title, market="SG",
+        previous_canonical_url="https://jsmbeauty.sg/p", refreshed_canonical_url="https://jsmbeauty.sg/p",
     )
 
 
-def test_the_refresh_keeps_a_crawl_whose_only_change_is_price() -> None:
-    """The end-to-end property: same ids, same titles, same URL, same market --
-    only the price moved, and the refresh must still take the new variants."""
-    assert _keep([_jsm("28.2")], [_jsm("28.8")])
+def test_a_price_only_change_does_not_take_the_crawl_wholesale() -> None:
+    """The structural decision must stay structural: a price move is handled by the
+    merge, not by replacing the array."""
+    assert not _keep([_rich("28.2")], [_crawled("28.8")])
 
 
-def test_the_refresh_discards_a_crawl_that_changed_nothing() -> None:
-    """CONTROL. Without this, the test above would also pass if the decision
-    returned True unconditionally -- rewriting every seed every night."""
-    assert not _keep([_jsm("28.2")], [_jsm("28.2")])
-
-
-def test_the_refresh_still_keeps_a_structurally_better_crawl() -> None:
-    """The pre-existing reasons must survive the extraction."""
+def test_a_structurally_better_crawl_is_still_taken_wholesale() -> None:
     existing = [{"variant_id": "A", "title": "", "price_amount": "10.0"}]
     incoming = [
         {"variant_id": "A", "title": "100 ml", "price_amount": "10.0"},
@@ -160,9 +192,77 @@ def test_the_refresh_still_keeps_a_structurally_better_crawl() -> None:
     assert _keep(existing, incoming, title="Some Serum 100 ml")
 
 
-def test_the_refresh_fills_an_empty_variant_array() -> None:
-    assert _keep([], [_jsm("28.8")])
+def test_a_content_change_on_matching_ids_is_still_taken_wholesale() -> None:
+    """Pins the SECOND structural arm (_should_replace_seed_variant_content), which
+    no other test in this file reaches -- deleting it left every test green."""
+    from routes.employee_products import _should_keep_refreshed_seed_variants
+
+    # Arm B is LOCALISATION correction: a US-market row whose stored copy is
+    # non-English and whose refresh came back in English.
+    existing = [{
+        "variant_id": "A", "title": "100 ml",
+        "description": "Diese Feuchtigkeitscreme ist sehr gut fuer die Haut und wird taeglich verwendet.",
+    }]
+    incoming = [{
+        "variant_id": "A", "title": "100 ml",
+        "description": "This moisturiser is very good for the skin and is used every day.",
+    }]
+    structural = _should_keep_refreshed_seed_variants(
+        existing=existing, incoming=incoming, product_title="Some Serum 100 ml",
+        market="US",
+        previous_canonical_url="https://example.com/de/p",
+        refreshed_canonical_url="https://example.com/p",
+    )
+    assert structural is True
 
 
-def test_the_refresh_ignores_an_empty_crawl() -> None:
-    assert not _keep([_jsm("28.2")], [])
+def test_the_real_refresh_moves_the_price_into_the_variants_it_already_held() -> None:
+    """END TO END through `_refresh_external_seed_by_id`.
+
+    Every assertion above drives a helper. Nothing pinned that the refresh CONSULTS
+    them -- reverting the call site left the whole file green.
+    """
+    import routes.employee_products as mod
+
+    stored = {
+        "id": "eps_jsm_1", "external_product_id": "ext_jsm_1", "market": "SG", "tool": "*",
+        "utm_template": None, "partner_type": None, "disclosure_text": None,
+        "destination_url": "https://jsmbeauty.sg/products/lip-pression-metal-serum-gloss",
+        "canonical_url": "https://jsmbeauty.sg/products/lip-pression-metal-serum-gloss",
+        "domain": "jsmbeauty.sg", "title": "LIP-PRESSION Metal Serum Gloss",
+        "image_url": "https://cdn.example.com/img.jpg",
+        "price_amount": 28.2, "price_currency": "SGD", "availability": "in_stock",
+        "seed_data": {"title": "LIP-PRESSION Metal Serum Gloss", "snapshot": {},
+                      "variants": [_rich("28.2")]},
+        "status": "active", "attached_product_key": None, "attached_variant_id": None,
+    }
+    snapshot = SimpleNamespace(
+        canonical_url=stored["canonical_url"], domain="jsmbeauty.sg",
+        title="LIP-PRESSION Metal Serum Gloss", image_url="https://cdn.example.com/img.jpg",
+        price_amount=28.8, price_currency="SGD", availability="in_stock",
+        fetched_at=None, evidence={"variants": [_crawled("28.8")]},
+    )
+
+    async def fake_fetch_one(_q, values=None):
+        return stored if values and values.get("id") == stored["id"] else None
+
+    async def fake_exec(_q, values):
+        stored.update(values)
+
+    mp = pytest.MonkeyPatch()
+    try:
+        mp.setattr(mod, "_ensure_external_seeds_table", AsyncMock(return_value=None))
+        mp.setattr(mod.database, "fetch_one", fake_fetch_one)
+        mp.setattr(mod, "_execute_seed_data_stmt", fake_exec)
+        mp.setattr(mod, "resolve_external_offer", AsyncMock(return_value=snapshot))
+        asyncio.run(mod._refresh_external_seed_by_id(stored["id"], max_wait=0))
+    finally:
+        mp.undo()
+
+    written = stored["seed_data"]
+    variants = written["variants"] if isinstance(written, dict) else []
+    assert variants, "the refresh must still write a variants array"
+    assert str(variants[0]["price_amount"]) == "28.8", "the crawled price must reach the variants"
+    assert variants[0]["options"] == [{"name": "Color", "value": "Core Drop"}], (
+        "the refresh must not replace the rich array with the crawl's five-key shape"
+    )
