@@ -271,17 +271,33 @@ _OFFER_UPSERT_SQL = """
                     INSERT INTO catalog_offers
                       (offer_id, sku_key, product_key, merchant_id,
                        catalog_track, truth_tier, readiness_tier, offer_mode,
+                       offer_type, is_first_party,
                        channel, availability, inventory_quantity, currency,
                        list_price, merchant_effective_price, estimated_best_price,
                        price_confidence, source_system, source_ref, source_domain, offer_payload)
                     VALUES
                       (:offer_id, :sku_key, :product_key, :merchant_id,
                        :catalog_track, :truth_tier, :readiness_tier, :offer_mode,
+                       :offer_type, :is_first_party,
                        :channel, :availability, :inventory_quantity, :currency,
                        :list_price, :merchant_effective_price, :estimated_best_price,
                        :price_confidence, :source_system, :source_ref, :source_domain,
                        CAST(:offer_payload AS jsonb))
                     ON CONFLICT (offer_id) DO UPDATE SET
+                      -- BACKFILL-ONLY, never clobber. A re-ingest fills a NULL left by a run
+                      -- that predates this column, but an offer_type another lane (or the
+                      -- classifier) already decided outranks this plan's view of the row.
+                      offer_type = COALESCE(catalog_offers.offer_type, EXCLUDED.offer_type),
+                      -- offer_mode MUST move with the type it is paired to. Backfilling the
+                      -- type alone would leave rows written before this change stranded as
+                      -- (retailer, external_referral) — a pair this writer never emits and
+                      -- the serving arm never selects, so a re-ingest would "heal" a row
+                      -- that stays invisible. Mirrors external_offer_dual_write's pairing.
+                      offer_mode = CASE
+                          WHEN COALESCE(catalog_offers.offer_type, EXCLUDED.offer_type) = 'retailer'
+                              THEN 'redirect'
+                          ELSE catalog_offers.offer_mode
+                      END,
                       availability = EXCLUDED.availability,
                       inventory_quantity = EXCLUDED.inventory_quantity,
                       list_price = EXCLUDED.list_price,
@@ -292,6 +308,38 @@ _OFFER_UPSERT_SQL = """
                       offer_payload = EXCLUDED.offer_payload,
                       updated_at = NOW()
                     """
+
+def _with_offer_write_defaults(rows: list) -> list:
+    """Guarantee every bind `_OFFER_UPSERT_SQL` names, for rows built elsewhere.
+
+    `offer_type` and `is_first_party` became INSERT columns so curated retailer offers land
+    servable (the gateway's catalog_offers arm selects on `offer_type='retailer'`). Any
+    producer that assembles offer rows without them — a caller predating this, a script
+    building a plan by hand — would otherwise fail the whole statement on a missing bind.
+
+    `offer_type` defaults to NULL, which is not a guess but the truth: an unknown seller
+    type stays unknown (`services/offer_seller_identity` refuses to infer one), and the
+    column is nullable precisely to carry that. `is_first_party` defaults FALSE, matching
+    the column's own server default — it is a claim, and an unmade claim is false.
+
+    `market` is deliberately NOT bound by this statement. It is NOT NULL DEFAULT 'US'
+    (db/catalog.py:300), so binding it buys nothing and costs a way to write NULL into a
+    NOT NULL column: each offer writes inside its own SAVEPOINT, so such a row is dropped
+    and merely logged — offers of unrelated producers vanishing while `counts` still reads
+    plausible. CI caught exactly that (18 real-Postgres failures, every one "offers: 0").
+
+    NOTE the asymmetry: `offer_type` uses setdefault (NULL is a legal, meaningful value)
+    while `is_first_party` coerces a present-but-None value too. Rows here are not only
+    plan rows — `tests/test_sku_identity_upserts_postgres._full_row` and any producer that
+    mirrors the bind list supply every name the statement binds with value None, so a
+    setdefault would leave None in a NOT NULL column and drop the row.
+    """
+    for row in rows:
+        row.setdefault("offer_type", None)
+        if row.get("is_first_party") is None:
+            row["is_first_party"] = False
+    return rows
+
 
 _SEED_UPSERT_SQL = """
                 INSERT INTO external_product_seeds
@@ -1638,7 +1686,7 @@ async def _apply_ingest_plan(
             counts["offers_skipped"] = sum(skip_reasons.values())
 
         # 4. catalog_offers — INSERT one row per validated retailer offer.
-        for offer in accepted_offers:
+        for offer in _with_offer_write_defaults(accepted_offers):
             try:
                 # SAVEPOINT per row, for the SAME reason the SKU loop above has
                 # one. This loop runs INSIDE the transaction opened at the top of
@@ -1825,7 +1873,7 @@ async def _apply_ingest_plan_batched(
         audit.record_skips(skip_reasons)
         counts["offers_skipped"] = sum(skip_reasons.values())
     applied_offers, offers_insert_skipped, _osr = await bulk_upsert(
-        database, _OFFER_UPSERT_SQL, accepted_offers, label="offers"
+        database, _OFFER_UPSERT_SQL, _with_offer_write_defaults(accepted_offers), label="offers"
     )
     counts["offers"] = applied_offers
     counts["offers_skipped_insert"] = offers_insert_skipped
