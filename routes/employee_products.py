@@ -960,6 +960,18 @@ def _merge_refreshed_variant_prices(
                 return text
         return None
 
+    # ONE crawled variant against SEVERAL stored shades is the shape a page emits when it
+    # prints a PRODUCT-level price once. Its sku or its url's `?variant=` may still name
+    # one shade (a theme pairing product.price with a variant canonical url), and nothing
+    # here can tell that from a genuine single-variant offer -- so it would write the
+    # product price onto that shade. Only a Shopify-shaped variant id in `variant_id`
+    # itself is trusted in that shape.
+    fresh_dicts = [fresh for fresh in incoming if isinstance(fresh, dict)]
+    if len(fresh_dicts) == 1 and sum(1 for v in existing if isinstance(v, dict)) > 1:
+        only_id = str(fresh_dicts[0].get("variant_id") or "").strip()
+        if not (_SHOPIFY_VARIANT_QUERY_ID.search(only_id) or _SHOPIFY_VARIANT_GID.search(only_id)):
+            return None
+
     by_key: Dict[str, Dict[str, Any]] = {}
     ambiguous: set = set()
     for fresh in incoming:

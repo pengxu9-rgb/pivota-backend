@@ -663,10 +663,21 @@ def _extract_jsonld_variants(parsed_objs: list[Any]) -> list[Dict[str, Any]]:
             break
 
     normalized: list[Dict[str, Any]] = []
+    seen_positional_offers: set[tuple] = set()
     for v in variants:
         vid = str(v.get("variant_id") or "").strip()
         if not vid or vid in seen:
             continue
+        # The node walk visits an Offer twice: inside its Product's `offers[]` (index
+        # N) and again as a standalone Offer node (index 0). A blank-sku Offer therefore
+        # arrived as both `offer_2` and `offer_1` -- two "different" variants carrying
+        # one url and one price, which made the refresh treat that shade as ambiguous.
+        # A positional id adds no identity, so it is keyed by what it does carry.
+        if re.match(r"^offer_\d+$", vid) and v.get("offer_url"):
+            offer_key = (v.get("offer_url"), v.get("price_amount"), v.get("price_currency"))
+            if offer_key in seen_positional_offers:
+                continue
+            seen_positional_offers.add(offer_key)
         seen.add(vid)
         normalized.append(v)
         if len(normalized) >= MAX_VARIANTS:

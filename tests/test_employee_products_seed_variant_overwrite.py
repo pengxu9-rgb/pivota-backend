@@ -478,20 +478,75 @@ def test_dawn_blank_sku_matches_by_the_offer_url_variant_id() -> None:
     assert [v["price_amount"] for v in merged] == [31.0, 30.0], "matched by id, not by page order"
 
 
-def test_a_product_level_sku_on_every_shade_never_fans_one_price_out() -> None:
+def test_a_product_level_sku_on_every_shade_moves_nothing() -> None:
     """Every Offer carries the PRODUCT sku. The extractor collapses them to one crawled
-    variant; if a sku held by all stored shades were a key, that one price would land on
-    all of them."""
+    variant, which at the merge is indistinguishable from a page printing one product
+    price -- so nothing moves. Neither a fan-out onto every shade nor a guess at one."""
     crawl = _dawn_crawl([_dawn_offer("32168999", "111", "30.00"), _dawn_offer("32168999", "222", "31.00")])
-    merged = _merge([_stored(28.0, vid="111"), _stored(29.0, vid="222")], crawl["variants"])
+    assert len(crawl["variants"]) == 1, "premise: the extractor collapses them"
+    assert _merge([_stored(28.0, vid="111"), _stored(29.0, vid="222")], crawl["variants"]) is None
+
+
+def test_one_product_level_offer_never_prices_the_shade_its_url_names() -> None:
+    """Re-review of #2193 v4: a single Offer with the PRODUCT price and a url carrying
+    `?variant=222` (a theme pairing product.price with a variant canonical url) wrote
+    20.00 onto shade 222, stored at 35.00."""
+    crawl = _dawn_crawl([_dawn_offer("SEL-SKU", "222", "20.00")])
+    stored = [_stored(20.0, vid="111", sku="S-1"), _stored(35.0, vid="222", sku="S-2")]
+    assert _merge(stored, crawl["variants"]) is None
+    # The same page shape reaching a stored shade through its sku.
+    stored_by_sku = [_stored(20.0, vid="111", sku="SEL-SKU"), _stored(35.0, vid="222", sku="S-2")]
+    assert _merge(stored_by_sku, crawl["variants"]) is None
+
+
+def test_one_crawled_variant_with_a_shopify_id_still_moves() -> None:
+    """CONTROL for the guard above: a single crawled variant whose OWN id is a Shopify
+    variant id names its shade unambiguously."""
+    crawl = _real_crawl([(CORE_DROP, "Core Drop", "28.80")])
+    merged = _merge([_stored(28.2, CORE_DROP), _stored(28.2, CHAI_TEA, shade="Chai Tea")], crawl["variants"])
     assert merged is not None
-    assert [v["price_amount"] for v in merged] == [30.0, 29.0], "only the shade its url names moves"
+    assert [v["price_amount"] for v in merged] == [28.8, 28.2]
+
+
+def test_a_dawn_page_mixing_blank_and_filled_skus_heals_the_blank_shade() -> None:
+    """The node walk visits each Offer twice; a blank-sku Offer came back as `offer_2`
+    AND `offer_1` with one url, which made its shade ambiguous and inert."""
+    crawl = _dawn_crawl([_dawn_offer("A", "111", "30.00"), _dawn_offer("", "222", "31.00")])
+    assert [v["variant_id"] for v in crawl["variants"]].count("offer_1") + \
+        [v["variant_id"] for v in crawl["variants"]].count("offer_2") == 1, crawl["variants"]
+    merged = _merge([_stored(28.0, vid="111", sku="A"), _stored(28.0, vid="222", sku="B")], crawl["variants"])
+    assert merged is not None
+    assert [v["price_amount"] for v in merged] == [30.0, 31.0]
+
+
+def test_every_price_key_the_variant_carries_moves_together_and_none_is_added() -> None:
+    both = _merge([_stored(28.2)], _real_crawl([(CORE_DROP, "Core Drop", "28.80")])["variants"])
+    assert both[0]["price_amount"] == 28.8 and both[0]["price"] == 28.8
+    only_amount = _stored(28.2)
+    only_amount.pop("price")
+    merged = _merge([only_amount], _real_crawl([(CORE_DROP, "Core Drop", "28.80")])["variants"])
+    assert merged[0]["price_amount"] == 28.8
+    assert "price" not in merged[0], "a key the ingestion lane did not write must not appear"
+
+
+def test_a_structurally_better_crawl_replaces_the_variants_end_to_end() -> None:
+    """The wholesale arm, observed through the refresh itself: the keep predicate is
+    pinned in isolation elsewhere, but deleting the assignment it guards left every
+    refresh test green."""
+    row = _jsm_row(28.8, 28.8)
+    row["seed_data"]["variants"] = []
+    crawl = _real_crawl([(CORE_DROP, "Core Drop", "28.80"), (CHAI_TEA, "Chai Tea", "28.80")])
+    out = _run_refresh(row, crawl)
+    assert [v["variant_id"] for v in out["variants"]] == [v["variant_id"] for v in crawl["variants"]]
 
 
 def test_a_key_two_stored_variants_hold_is_refused() -> None:
+    """TWO crawled variants, so the single-crawled-variant guard cannot be what refuses
+    this: only the stored-side ambiguity guard stops SHARED fanning out onto both."""
     merged = _merge(
-        [_stored(28.2, vid="DUP", sku="A"), _stored(30.0, vid="DUP", sku="B")],
-        [{"variant_id": "DUP", "price_amount": 28.8, "price_currency": "SGD"}],
+        [_stored(28.2, vid="x1", sku="SHARED"), _stored(30.0, vid="x2", sku="SHARED")],
+        [{"variant_id": "SHARED", "price_amount": 28.8, "price_currency": "SGD"},
+         {"variant_id": "OTHER", "price_amount": 99.0, "price_currency": "SGD"}],
     )
     assert merged is None
 
