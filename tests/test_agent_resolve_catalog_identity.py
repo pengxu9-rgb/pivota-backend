@@ -239,3 +239,165 @@ def test_a_failing_catalog_lane_never_costs_the_turn(client, monkeypatch):
     sources = {s["source"]: s for s in meta.get("sources", [])}
     assert sources["catalog_identity_exact"]["status"] == "error"
     assert "catalog_identity_exact" in meta.get("failure_breakdown", {})
+
+
+# --- review follow-ups ------------------------------------------------------
+
+
+def test_the_merchant_scope_is_bound_into_the_lane(client, monkeypatch):
+    """A merchant-scoped resolve must not return another merchant's row.
+
+    The stub MODELS the predicate rather than ignoring it: it applies the merchant
+    filter only when the statement actually carries it. Deleting the predicate from
+    the SQL therefore leaks the foreign row and fails this test -- with a stub that
+    ignored the binds, that mutant survived.
+    """
+    import routes.agent_api as agent_api
+
+    seen: List[Dict[str, Any]] = []
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        vals = dict(values or {})
+        seen.append(vals)
+        if "FROM products_cache" in q:
+            return []
+        if "FROM catalog_skus cs" in q:
+            scoped = "cs.merchant_id = CAST(:merchant_id AS TEXT)" in q
+            if scoped and vals.get("merchant_id") not in (None, MERCHANT):
+                return []
+            return [_row_for(q)]
+        if "FROM catalog_products cp" in q:
+            scoped = "cp.merchant_id = CAST(:merchant_id AS TEXT)" in q
+            if scoped and vals.get("merchant_id") not in (None, MERCHANT):
+                return []
+            return [_row_for(q)]
+        if "FROM product_group_members" in q:
+            return []
+        return []
+
+    async def fake_search(**kwargs):
+        return {"products": []}
+
+    monkeypatch.setattr(agent_api.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_api, "agent_search_products", fake_search)
+
+    # The row belongs to MERCHANT; the caller asks as a different merchant.
+    body = client.get(
+        f"/agent/v1/products/resolve?merchant_id=merch_someone_else&sku_id={VARIANT_ID}&limit=10",
+        headers=HEADERS,
+    ).json()
+    assert body["resolved"] is False, body
+    assert body["reason_code"] == "NO_CANDIDATES"
+
+    # And the scope really was bound, not just absent from the result.
+    catalog_binds = [v for v in seen if "merchant_id" in v and "sku_aliases" in v]
+    assert catalog_binds, "the catalog lane must have run"
+    assert catalog_binds[0]["merchant_id"] == "merch_someone_else"
+
+
+def test_an_alias_cache_hit_skips_the_catalog_lane(client, monkeypatch):
+    """Gated on `not candidates_by_key`, so ANY lane that already produced a
+    candidate ends the turn -- not just the exact one.
+
+    The EXACT query is deliberately empty here and only the ALIAS query returns a
+    row, which is the case the two gates disagree about: `not exact_cache_rows`
+    would run the catalog lane anyway and overwrite an already-resolved candidate.
+    """
+    import routes.agent_api as agent_api
+
+    calls = {"catalog": 0}
+    alias_row = {
+        "merchant_id": MERCHANT, "platform": "shopify",
+        "platform_product_id": "9886499864904",
+        "product_data": {"id": "9886499864904", "title": "Alias Cached Product"},
+    }
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM products_cache" in q:
+            # Both products_cache lanes bind :pid_aliases; only the ALIAS lane also
+            # reaches into the cached JSON, so that is what tells them apart.
+            is_alias_lane = "product_data->>'id' = ANY(:pid_aliases)" in q
+            return [alias_row] if is_alias_lane else []
+        if "FROM catalog_skus cs" in q or "FROM catalog_products cp" in q:
+            calls["catalog"] += 1
+            return [_row_for(q)]
+        return []
+
+    async def fake_search(**kwargs):
+        raise AssertionError("an alias hit must not fall through to search")
+
+    monkeypatch.setattr(agent_api.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_api, "agent_search_products", fake_search)
+
+    body = client.get(
+        "/agent/v1/products/resolve?product_id=9886499864904&limit=10", headers=HEADERS
+    ).json()
+
+    assert body["resolved"] is True, body
+    assert body["candidates"][0]["source"] == "products_cache_alias"
+    assert calls["catalog"] == 0, "an already-resolved turn must not run the catalog lane"
+
+
+def test_a_suppressed_row_is_not_resolvable(client, monkeypatch):
+    """Suppressed/tombstoned rows are refused by every serving path, so handing one
+    back gives the caller an id that get_product and get_offers both decline.
+
+    The stub MODELS the filter: it drops the suppressed row only when the statement
+    actually carries `suppressed_at IS NULL`. Remove the filter and the row leaks.
+    """
+    import routes.agent_api as agent_api
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM products_cache" in q or "FROM product_group_members" in q:
+            return []
+        if "FROM catalog_skus cs" in q:
+            filters_suppressed = "cs.suppressed_at IS NULL" in q and "cp.suppressed_at IS NULL" in q
+            return [] if filters_suppressed else [_row_for(q)]
+        if "FROM catalog_products cp" in q:
+            return [] if "cp.suppressed_at IS NULL" in q else [_row_for(q)]
+        return []
+
+    async def fake_search(**kwargs):
+        return {"products": []}
+
+    monkeypatch.setattr(agent_api.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_api, "agent_search_products", fake_search)
+
+    body = client.get(
+        f"/agent/v1/products/resolve?sku_id={VARIANT_ID}&limit=10", headers=HEADERS
+    ).json()
+    assert body["resolved"] is False, body
+    assert body["reason_code"] == "NO_CANDIDATES"
+
+
+def test_a_catalog_timeout_is_a_db_error_not_a_search_timeout(client, monkeypatch):
+    """A database timeout in this lane must not be reported as an upstream SEARCH
+    timeout -- the top-level `search_timed_out` check matches on that exact string,
+    so mislabelling it told callers search failed when search never ran."""
+    import asyncio as _asyncio
+    import routes.agent_api as agent_api
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM catalog_skus cs" in q:
+            raise _asyncio.TimeoutError()
+        return []
+
+    async def fake_search(**kwargs):
+        return {"products": []}
+
+    monkeypatch.setattr(agent_api.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_api, "agent_search_products", fake_search)
+
+    body = client.get(
+        f"/agent/v1/products/resolve?sku_id={VARIANT_ID}&limit=10", headers=HEADERS
+    ).json()
+
+    meta = body.get("metadata", {})
+    sources = {s["source"]: s for s in meta.get("sources", [])}
+    assert sources["catalog_identity_exact"]["status"] == "error"
+    assert sources["catalog_identity_exact"]["reason_code"] != "upstream_timeout"
+    assert body["reason"] != "search_timeout", body

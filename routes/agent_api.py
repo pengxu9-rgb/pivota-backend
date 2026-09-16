@@ -7123,7 +7123,11 @@ async def agent_resolve_products(
     # that table stores source_product_id (zero carry a sig_/ext:/ck_ shape). Emitting
     # the signature or the product_key here would resolve the candidate and then
     # silently lose canonical_ref.
-    if not exact_cache_rows and (sku_aliases or product_aliases):
+    # Gated on `not candidates_by_key`, matching the alias lane and the search
+    # fallback below. Gating on `exact_cache_rows` alone ran this lane even when the
+    # ALIAS lane had already resolved, and its score 1.0 then overwrote that
+    # candidate's source -- two extra round-trips on a request that was already done.
+    if not candidates_by_key and (sku_aliases or product_aliases):
         catalog_started = time.perf_counter()
         catalog_rows: List[Dict[str, Any]] = []
         try:
@@ -7140,6 +7144,12 @@ async def agent_resolve_products(
                         WHERE (CAST(:merchant_id AS TEXT) IS NULL OR cs.merchant_id = CAST(:merchant_id AS TEXT))
                           AND (cs.source_variant_id = ANY(:sku_aliases) OR cs.sku = ANY(:sku_aliases))
                           AND COALESCE(cp.source_product_id, '') <> ''
+                          -- Suppressed/tombstoned rows are refused by every serving
+                          -- path, so resolving one hands the caller an id that
+                          -- get_product and get_offers will both decline.
+                          AND cs.suppressed_at IS NULL
+                          AND cp.suppressed_at IS NULL
+                        ORDER BY cp.product_key
                         LIMIT 80
                         """,
                         {"merchant_id": merchant_id, "sku_aliases": sku_aliases},
@@ -7163,6 +7173,8 @@ async def agent_resolve_products(
                                OR cp.content_key = ANY(:pid_aliases)
                                OR cp.product_key = ANY(:pid_aliases))
                           AND COALESCE(cp.source_product_id, '') <> ''
+                          AND cp.suppressed_at IS NULL
+                        ORDER BY cp.product_key
                         LIMIT 80
                         """,
                         {"merchant_id": merchant_id, "pid_aliases": product_aliases},
@@ -7188,15 +7200,12 @@ async def agent_resolve_products(
                 row_count=len(catalog_rows),
                 query="catalog_skus_and_products_by_identity",
             )
-        except asyncio.TimeoutError:
-            _record_source(
-                source="catalog_identity_exact",
-                status="error",
-                reason_code="upstream_timeout",
-                source_started=catalog_started,
-                error="TimeoutError",
-                query="catalog_skus_and_products_by_identity",
-            )
+        # NO asyncio.TimeoutError branch. The cache lanes route that same exception
+        # through `_classify_db_reason_code`, which calls it what it is -- a database
+        # query timeout. Reporting `upstream_timeout` here made the response's
+        # top-level reason `UPSTREAM_TIMEOUT` / `search_timeout`, because the
+        # `search_timed_out` check below matches on exactly that string. A caller
+        # would have been told the SEARCH timed out when search never ran.
         except Exception as e:  # noqa: BLE001
             # Never costs the turn: the search fallback below still runs, exactly as
             # it does when the cache lanes fail.
