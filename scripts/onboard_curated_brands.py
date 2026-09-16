@@ -139,34 +139,66 @@ def _effective_print_limit(args: argparse.Namespace) -> int:
     return 0 if args.apply else _PLAN_PRINT_DEFAULT
 
 
-def _select_by_gtin(records: List[Dict[str, Any]], wanted: List[str], *, domain: str) -> List[Dict[str, Any]]:
-    """Keep only the records whose GTIN is one of `wanted`.
+def _canonical_gtins(wanted: List[str]) -> set:
+    """Every requested GTIN, or refuse. A single unusable value is a typo in a command line that
+    decides what gets written to production: ignoring it because a SIBLING matched is how a run
+    certifies a cohort nobody asked for."""
+    canonical = set()
+    for value in wanted:
+        gtin = validated_source_gtin(value)
+        if not gtin:
+            raise ValueError(f"--only-gtin {value!r} is not a valid GS1 GTIN")
+        canonical.add(gtin)
+    if not canonical:
+        raise ValueError("--only-gtin needs at least one valid GS1 GTIN")
+    return canonical
+
+
+def _record_gtins(record: Dict[str, Any]) -> set:
+    """Every GTIN this record can be identified by: the PDP's own, and its variants'.
+
+    `pdp.barcode` is set only for a single-variant, unfolded product (curated_brand_feed), so a
+    multi-variant listing — exactly what --emit-real-variants produces — carries its barcodes on
+    the VARIANTS. Matching the PDP level alone silently refused those products while the help text
+    promised to keep "products carrying this GTIN".
+    """
+    pdp = record.get("pdp") or {}
+    found = {validated_source_gtin(pdp.get("gtin") or pdp.get("barcode"))}
+    for variant in (pdp.get("variants") or []):
+        if isinstance(variant, dict):
+            found.add(validated_source_gtin(variant.get("barcode") or variant.get("gtin")))
+    return {g for g in found if g}
+
+
+def _select_by_gtin(records: List[Dict[str, Any]], canonical: set, *, domain: str) -> tuple:
+    """Keep only the records carrying one of `canonical`; return (kept, gtins that matched).
 
     An acceptance case is about specific products, but the vendor filter is the narrowest tool the
     lane had: a Pyunkang Yul run at eyurs.com selects 10 products, 7 of which carry a merchant
     product_type this taxonomy does not map, so the whole cohort lands `category_unresolved` and
     apply refuses it — over products the case never wanted.
 
-    Matching uses the same GS1 normalisation as the acceptance boundary (validated_source_gtin), so
-    a 13-digit merchant barcode and the 14-digit stored form are the same product here. A record
-    with no usable GTIN cannot match and is dropped.
-
     A filter that matches NOTHING raises, mirroring --only-vendor: an empty run that looks like a
-    clean one is how a canary certifies a cohort it never actually selected.
+    clean one is how a canary certifies a cohort it never actually selected. Which of several
+    requested GTINs went unmatched is decided by the CALLER, across every domain in the run — one
+    roster row may legitimately carry only some of them.
     """
-    canonical = {g for g in (validated_source_gtin(value) for value in wanted) if g}
-    if not canonical:
-        raise ValueError("--only-gtin needs at least one valid GS1 GTIN")
-    kept = [r for r in records
-            if validated_source_gtin((r.get("pdp") or {}).get("gtin")
-                                     or (r.get("pdp") or {}).get("barcode")) in canonical]
+    kept, matched = [], set()
+    for record in records:
+        found = _record_gtins(record) & canonical
+        if found:
+            kept.append(record)
+            matched |= found
     if not kept:
         raise ValueError(f"{domain}: --only-gtin matched none of the selected products")
-    return kept
+    return kept, matched
 
 
 async def _run(args: argparse.Namespace) -> int:
     brands = _read_brand_list(args)
+    # Validated BEFORE the first fetch: a typo'd GTIN should cost nothing and stop everything.
+    wanted_gtins = _canonical_gtins(args.only_gtin) if args.only_gtin else set()
+    matched_gtins: set = set()
     if not brands:
         print("no brands to onboard (need --domain or --file rows with domain+category)", file=sys.stderr)
         return 2
@@ -204,10 +236,12 @@ async def _run(args: argparse.Namespace) -> int:
                 f"{vendor_report['before']} -> {vendor_report['after']} products"
             )
             records_for_brand.last_vendor_filter_report = None  # type: ignore[attr-defined]
-        if args.only_gtin:
+        if wanted_gtins:
             before = len(recs)
-            recs = _select_by_gtin(recs, args.only_gtin, domain=b["domain"])
-            print(f"    gtin filter {sorted(args.only_gtin)}: {before} -> {len(recs)} products")
+            recs, matched = _select_by_gtin(recs, wanted_gtins, domain=b["domain"])
+            matched_gtins |= matched
+            print(f"    gtin filter {sorted(wanted_gtins)}: {before} -> {len(recs)} products "
+                  f"(matched {sorted(matched)})")
         print(f"  {b['domain']}: {len(recs)} products")
         # A brand-family storefront must not ingest silently. misshaus.com shipped 17
         # A'pieu products into the index branded "Missha" because nothing printed the
@@ -236,6 +270,11 @@ async def _run(args: argparse.Namespace) -> int:
             )
         all_records.extend(recs)
 
+    # A requested GTIN that matched nothing ANYWHERE is a request that was silently dropped. Across
+    # the whole run, not per row: a roster row may legitimately carry only some of them.
+    if wanted_gtins - matched_gtins:
+        raise ValueError(f"--only-gtin values matched no product in this run: "
+                         f"{sorted(wanted_gtins - matched_gtins)}")
     plan = ingest_validated_jsonl(all_records)
     print(
         f"plan: pdps={len(plan.get('pdps') or [])} skus={len(plan.get('skus') or [])} "
@@ -331,8 +370,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         help=(
             "keep only products carrying this GTIN (repeatable). Narrows a cohort to the exact "
             "products a case is about, so unrelated products whose merchant product_type this "
-            "taxonomy cannot map do not block the apply. Matched with GS1 normalisation, so 13- "
-            "and 14-digit spellings agree; a filter matching nothing is an error, not an empty run."
+            "taxonomy cannot map do not block the apply. Matches the PDP's own barcode OR any of "
+            "its merchant variants', with GS1 normalisation, so 13- and 14-digit spellings agree. "
+            "Every requested GTIN must be valid and must match somewhere in the run, and a host "
+            "matching none of them is an error, not an empty run. It narrows the PLAN only: the "
+            "crawl still reads the whole feed and GTIN recovery still spends its budget first."
         ),
     )
     p.add_argument("--plan-print-limit", type=int, default=None, metavar="N",

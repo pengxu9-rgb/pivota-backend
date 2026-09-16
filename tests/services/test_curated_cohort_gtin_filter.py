@@ -8,7 +8,7 @@ target cleansing balm resolves cleanly at both hosts.
 """
 import pytest
 
-from scripts.onboard_curated_brands import _select_by_gtin
+from scripts.onboard_curated_brands import _canonical_gtins, _select_by_gtin
 from services import curated_brand_feed as feed
 from services.catalog_enrichment_agent.ingestion import ingest_validated_jsonl
 
@@ -23,7 +23,7 @@ def record(gtin, *, title="Pyunkang Yul Deep Clear Cleansing Balm", product_type
          "handle": title.lower().replace(" ", "-"), "product_type": product_type,
          "body_html": "<p>Ingredients: Water, Glycerin</p>",
          "images": [{"src": "https://cdn.example/i.jpg"}],
-         "variants": [{"id": 40825422381214, "price": "18.00", "available": True,
+         "variants": [{"id": 41793713995959, "price": "18.00", "available": True,
                        "sku": "S1", "barcode": gtin}]},
         domain="eyurs.com", category_path="beauty", brand_override="Pyunkang Yul",
         currency="USD", source_role="retailer", retailer_name="eyurs.com",
@@ -34,7 +34,7 @@ def record(gtin, *, title="Pyunkang Yul Deep Clear Cleansing Balm", product_type
 def test_it_keeps_only_the_named_product():
     records = [record(BALM), record(OTHER, title="Pyunkang Yul 1/3 Cotton Pads",
                                     product_type="Cotton Pads")]
-    kept = _select_by_gtin(records, [BALM], domain="eyurs.com")
+    kept = _select_by_gtin(records, _canonical_gtins([BALM]), domain="eyurs.com")[0]
     assert len(kept) == 1
     assert kept[0]["pdp"]["barcode"] in (BALM, BALM_14)
 
@@ -43,29 +43,41 @@ def test_thirteen_and_fourteen_digit_spellings_are_the_same_product():
     """The merchant publishes 13 digits; the stored form is 14. A filter that treated them as
     different products would silently match nothing and raise on a correct request."""
     records = [record(BALM)]
-    assert len(_select_by_gtin(records, [BALM_14], domain="eyurs.com")) == 1
-    assert len(_select_by_gtin(records, [BALM], domain="eyurs.com")) == 1
+    assert len(_select_by_gtin(records, _canonical_gtins([BALM_14]), domain="eyurs.com")[0]) == 1
+    assert len(_select_by_gtin(records, _canonical_gtins([BALM]), domain="eyurs.com")[0]) == 1
 
 
 def test_a_filter_matching_nothing_is_an_error_not_an_empty_run():
     """Mirrors --only-vendor. An empty cohort that exits 0 is how a canary certifies products it
     never selected."""
     with pytest.raises(ValueError, match="matched none"):
-        _select_by_gtin([record(BALM)], ["08809530070499"], domain="eyurs.com")
+        _select_by_gtin([record(BALM)], _canonical_gtins(["08809530070499"]), domain="eyurs.com")
 
 
 def test_an_invalid_gtin_is_refused_rather_than_matching_nothing():
     with pytest.raises(ValueError, match="valid GS1"):
-        _select_by_gtin([record(BALM)], ["not-a-gtin"], domain="eyurs.com")
+        _canonical_gtins(["not-a-gtin"])
 
 
-def test_a_record_without_a_gtin_cannot_match():
-    """No barcode means no identity to match on; it must not fall through into the cohort."""
+def test_clearing_only_the_pdp_barcode_still_matches_via_the_variant():
+    """The product still carries the GTIN — on its variant — so it is still that product."""
+    pdp_only = record(BALM)
+    pdp_only["pdp"]["barcode"] = None
+    pdp_only["pdp"]["gtin"] = None
+    kept, _ = _select_by_gtin([pdp_only], _canonical_gtins([BALM]), domain="eyurs.com")
+    assert len(kept) == 1
+
+
+def test_a_record_without_any_gtin_cannot_match():
+    """No barcode anywhere means no identity to match on; it must not fall into the cohort."""
     no_gtin = record(BALM)
     no_gtin["pdp"]["barcode"] = None
     no_gtin["pdp"]["gtin"] = None
+    for variant in (no_gtin["pdp"].get("variants") or []):
+        variant["barcode"] = None
+        variant.pop("gtin", None)
     with pytest.raises(ValueError, match="matched none"):
-        _select_by_gtin([no_gtin], [BALM], domain="eyurs.com")
+        _select_by_gtin([no_gtin], _canonical_gtins([BALM]), domain="eyurs.com")
 
 
 def test_narrowing_the_cohort_unblocks_the_plan_the_unmapped_product_was_blocking():
@@ -78,7 +90,7 @@ def test_narrowing_the_cohort_unblocks_the_plan_the_unmapped_product_was_blockin
     assert blocked["status"] == "blocked" and blocked["unresolved_category_count"] == 1
 
     narrowed = inspect_primary_plan(ingest_validated_jsonl(
-        _select_by_gtin(cohort, [BALM], domain="eyurs.com")))
+        _select_by_gtin(cohort, _canonical_gtins([BALM]), domain="eyurs.com")[0]))
     assert narrowed["unresolved_category_count"] == 0
     assert narrowed["status"] == "ready_to_apply", narrowed["reasons"]
 
@@ -108,3 +120,86 @@ def test_the_cli_actually_applies_the_filter(monkeypatch, capsys):
     assert out.count("pdp {") == 1, "the unmapped product must not reach the plan"
     assert BALM_14 in out
     assert '"status": "ready_to_apply"' in out, "the narrowed cohort must no longer be blocked"
+
+
+def multi_variant_record(gtin_a, gtin_b):
+    """What --emit-real-variants produces: barcodes live on the VARIANTS, and the PDP carries none."""
+    return feed.shopify_product_to_record(
+        {"id": 991, "vendor": "Pyunkang Yul", "title": "Pyunkang Yul Essence Toner",
+         "handle": "essence-toner", "product_type": "Toner",
+         "body_html": "<p>Ingredients: Water</p>", "images": [{"src": "https://cdn.example/i.jpg"}],
+         # Distinguishing options are required for the lane to emit native variants at all;
+         # without them the record carries no variants and the test would prove nothing.
+         "variants": [
+             # Realistic merchant ids: variant_identity drops ids it cannot place as
+             # merchant-issued rather than minting them, so a toy id yields no variants at all.
+             {"id": 41679354822839, "price": "17.00", "available": True, "sku": "A",
+              "option1": "100ml", "barcode": gtin_a},
+             {"id": 41679262417079, "price": "23.00", "available": True, "sku": "B",
+              "option1": "200ml", "barcode": gtin_b}]},
+        domain="eyurs.com", category_path="beauty", brand_override="Pyunkang Yul",
+        currency="USD", source_role="retailer", retailer_name="eyurs.com",
+        emit_native_variants=True,
+    )
+
+
+def test_a_multi_variant_product_is_selectable_by_a_variant_gtin():
+    """pdp.barcode is set only for a single-variant, unfolded product, so matching PDP-level
+    identity alone silently refused exactly the products --emit-real-variants creates."""
+    record_mv = multi_variant_record("8809486680353", "8809486680360")
+    assert (record_mv["pdp"].get("barcode") or record_mv["pdp"].get("gtin")) is None, \
+        "precondition: this product carries no PDP-level GTIN"
+
+    kept, matched = _select_by_gtin([record_mv], _canonical_gtins(["8809486680360"]),
+                                    domain="eyurs.com")
+    assert len(kept) == 1 and matched == {"08809486680360"}
+
+
+def test_every_requested_gtin_must_be_valid_even_when_a_sibling_matches():
+    """Ignoring a typo because another value matched is how a run quietly selects a cohort nobody
+    asked for — the failure this flag exists to prevent, in partial form."""
+    with pytest.raises(ValueError, match="not a valid GS1"):
+        _canonical_gtins([BALM, "not-a-gtin"])
+    with pytest.raises(ValueError, match="not a valid GS1"):
+        _canonical_gtins([BALM, "8809486681498"])  # bad checksum
+
+
+def test_a_requested_gtin_that_matches_nothing_in_the_run_fails_the_run(monkeypatch, capsys):
+    from unittest.mock import AsyncMock
+
+    from scripts import onboard_curated_brands as cli
+
+    fetch = AsyncMock(return_value=feed.ShopifyProductBatch([record(BALM)], scanned_products=10, pages=1))
+    fetch.last_vendor_filter_report = fetch.last_brand_census = fetch.last_fold_report = None
+    monkeypatch.setattr(cli, "records_for_brand", fetch)
+
+    rc = cli.main(["--domain", "eyurs.com", "--category", "beauty", "--brand", "Pyunkang Yul",
+                   "--only-vendor", "Pyunkang Yul", "--source-role", "retailer",
+                   "--only-gtin", BALM, "--only-gtin", "08809530070499"])
+    assert rc == 2, "a silently dropped GTIN request must fail the run"
+    assert "matched no product in this run" in capsys.readouterr().err
+
+
+def test_a_roster_host_matching_nothing_fails_rather_than_shrinking_the_cohort(monkeypatch, tmp_path, capsys):
+    """Per-row scoping: deleting the per-row filter (one pass over all records at the end) left
+    every other test green, while letting a second host contribute nothing and pass."""
+    import json as _json
+    from unittest.mock import AsyncMock
+
+    from scripts import onboard_curated_brands as cli
+
+    other = record(OTHER, title="Pyunkang Yul 1/3 Cotton Pads", product_type="Cotton Pads")
+    batches = [feed.ShopifyProductBatch([record(BALM)], scanned_products=10, pages=1),
+               feed.ShopifyProductBatch([other], scanned_products=10, pages=1)]
+    fetch = AsyncMock(side_effect=batches)
+    fetch.last_vendor_filter_report = fetch.last_brand_census = fetch.last_fold_report = None
+    monkeypatch.setattr(cli, "records_for_brand", fetch)
+
+    roster = tmp_path / "roster.jsonl"
+    roster.write_text("\n".join(_json.dumps({"domain": host, "category_path": "beauty",
+                                             "brand": "Pyunkang Yul"})
+                                for host in ("eyurs.com", "ohlolly.com")))
+    rc = cli.main(["--file", str(roster), "--only-vendor", "Pyunkang Yul",
+                   "--source-role", "retailer", "--only-gtin", BALM])
+    assert rc == 2
+    assert "ohlolly.com: --only-gtin matched none" in capsys.readouterr().err
