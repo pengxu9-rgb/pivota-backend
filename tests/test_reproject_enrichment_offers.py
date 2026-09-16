@@ -126,7 +126,11 @@ def test_the_update_is_pinned_to_the_price_it_read() -> None:
 def test_the_total_is_counted_without_the_row_limit() -> None:
     """The count is the whole value of a dry run. Capping the rows and the count
     together reports the same number forever."""
-    assert "LIMIT" not in rep.CANDIDATE_COUNT_SQL
+    # Not "no LIMIT anywhere": the count's correlated LATERAL carries a LIMIT 1, which
+    # picks one seed per product and caps nothing. The property is that the PAGE size
+    # never reaches the count.
+    assert ":page_size" not in rep.CANDIDATE_COUNT_SQL
+    assert ":cursor" not in rep.CANDIDATE_COUNT_SQL
     assert "LIMIT :page_size" in rep.CANDIDATE_SQL
 
 
@@ -221,3 +225,49 @@ async def test_scope_selects_which_half_runs(monkeypatch) -> None:
     assert canonical["repairable"] == 1
     assert variant["repairable"] == 1
     assert both["repairable"] == 2
+
+
+# --- one row per offer, and no arbitrary price ------------------------------
+
+
+def test_a_product_whose_active_seeds_disagree_is_refused() -> None:
+    """66 products carry active seeds that disagree about the price. Picking one is
+    how a repair writes a number nobody asserted."""
+    row = _offer(f"{PK}::canonical", "55.00", seed_price="35.75")
+    row["distinct_prices"] = 3
+    verdict = rep.classify(row)
+    assert verdict["action"] == "skip"
+    assert verdict["reason"] == "ambiguous_seed_price"
+
+
+def test_a_single_agreed_price_is_still_repaired() -> None:
+    """CONTROL: the guard must not refuse everything."""
+    row = _offer(f"{PK}::canonical", "28.20", seed_price="28.80")
+    row["distinct_prices"] = 1
+    assert rep.classify(row)["action"] == "repair"
+
+
+def test_a_missing_distinct_count_is_treated_as_unambiguous() -> None:
+    row = _offer(f"{PK}::canonical", "28.20", seed_price="28.80")
+    assert rep.classify(row)["action"] == "repair"
+
+
+def test_the_ambiguity_column_is_actually_SELECTED() -> None:
+    """The guard reads `distinct_prices`. The first version computed it inside the
+    LATERAL and never added it to the outer SELECT, so classify() read None, defaulted
+    to 1, and the guard never fired -- while the unit test above passed, because it
+    sets the field by hand. A predicate that reads a column the query does not project
+    is not a guard."""
+    assert "s.distinct_prices" in rep.CANDIDATE_SQL
+    assert "AS distinct_prices" in rep.CANDIDATE_SQL
+
+
+def test_the_seed_is_collapsed_to_one_row_per_offer() -> None:
+    """A plain JOIN produced one candidate PER ATTACHED SEED. That made the target
+    arbitrary, attempted the same offer repeatedly, and -- because execute() does not
+    raise when the pinned UPDATE matches nothing -- reported 50 repairs for 27 writes.
+    """
+    assert "JOIN LATERAL" in rep.CANDIDATE_SQL
+    assert "COUNT(DISTINCT ROUND(s2.price_amount" in rep.CANDIDATE_SQL
+    assert "JOIN external_product_seeds s ON" not in rep.CANDIDATE_SQL
+    assert "JOIN external_product_seeds s ON" not in rep.CANDIDATE_COUNT_SQL

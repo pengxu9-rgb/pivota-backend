@@ -80,15 +80,30 @@ CANDIDATE_SQL = """
            co.currency                 AS offer_currency,
            s.price_amount::numeric     AS seed_price,
            s.price_currency            AS seed_currency,
-           s.seed_data                 AS seed_data
+           s.seed_data                 AS seed_data,
+           s.distinct_prices           AS distinct_prices
     FROM catalog_offers co
     JOIN catalog_products cp ON cp.product_key = co.product_key
     JOIN index_pipeline_state ips ON ips.content_key = cp.content_key
-    JOIN external_product_seeds s ON s.attached_product_key = cp.product_key
+    -- ONE row per offer. A plain JOIN here produced one candidate PER ATTACHED SEED,
+    -- and 88 products carry more than one active seed (one carries 31). That had three
+    -- consequences, all measured on a 50-row apply: the target price was whichever seed
+    -- the join happened to yield; the same offer was attempted repeatedly; and because
+    -- `database.execute` does not raise when the pinned UPDATE matches nothing, the
+    -- run reported 50 repairs where only 27 rows changed.
+    JOIN LATERAL (
+        SELECT COUNT(DISTINCT ROUND(s2.price_amount::numeric, 2)) AS distinct_prices,
+               MIN(s2.price_amount::numeric)                      AS price_amount,
+               MIN(s2.price_currency)                             AS price_currency,
+               (ARRAY_AGG(s2.seed_data ORDER BY s2.updated_at DESC))[1] AS seed_data
+        FROM external_product_seeds s2
+        WHERE s2.attached_product_key = cp.product_key
+          AND s2.status = 'active'
+          AND s2.price_amount IS NOT NULL
+    ) s ON TRUE
     WHERE ips.serving_eligible IS TRUE
       AND co.suppressed_at IS NULL
       AND co.source_system = ANY(:sources)
-      AND s.status = 'active'
       AND co.list_price > 0
       AND co.offer_id > :cursor
     ORDER BY co.offer_id
@@ -103,11 +118,17 @@ CANDIDATE_COUNT_SQL = """
     FROM catalog_offers co
     JOIN catalog_products cp ON cp.product_key = co.product_key
     JOIN index_pipeline_state ips ON ips.content_key = cp.content_key
-    JOIN external_product_seeds s ON s.attached_product_key = cp.product_key
+    JOIN LATERAL (
+        SELECT 1
+        FROM external_product_seeds s2
+        WHERE s2.attached_product_key = cp.product_key
+          AND s2.status = 'active'
+          AND s2.price_amount IS NOT NULL
+        LIMIT 1
+    ) s ON TRUE
     WHERE ips.serving_eligible IS TRUE
       AND co.suppressed_at IS NULL
       AND co.source_system = ANY(:sources)
-      AND s.status = 'active'
       AND co.list_price > 0
 """
 
@@ -171,6 +192,16 @@ def _variant_price(variants: List[Dict[str, Any]], variant_id: str) -> Tuple[Opt
 def classify(row: Dict[str, Any]) -> Dict[str, Any]:
     """What should this offer's price be, and if it should not change, why not."""
     sku_key = str(row.get("sku_key") or "")
+    scope_hint = "variant" if "::v:" in sku_key else "canonical"
+    # A product whose ACTIVE seeds disagree about its price has no single answer, and
+    # picking one is how a repair writes a number nobody asserted. 66 products are in
+    # this state. Refuse; a human decides which seed is right.
+    try:
+        distinct_prices = int(row.get("distinct_prices") or 1)
+    except (TypeError, ValueError):
+        distinct_prices = 1
+    if distinct_prices > 1:
+        return {"scope": scope_hint, "action": "skip", "reason": "ambiguous_seed_price"}
     offer_price = _decimal(row.get("offer_price"))
     offer_currency = (str(row.get("offer_currency")).strip().upper() if row.get("offer_currency") else None)
     is_variant = "::v:" in sku_key
