@@ -20,6 +20,7 @@ CASE = {
     "inci_source": "reseller_listing",
     "target_gtin": "08809486681497",
     "required_category_prefix": "beauty/skincare/cleanse/",
+    "source_role": "retailer",
 }
 
 
@@ -229,7 +230,10 @@ async def test_a_complete_file_passes_so_the_incompleteness_test_has_a_control()
         skus=[{"product_key": f"ext:retailer:{k}", "sku_key": f"sku_{k}", "source_variant_id": f"4500{i}",
                "sku_payload": json.dumps({"variant_id_provenance": "merchant_issued"})}
               for i, k in enumerate("ab", start=1)],
-        offers=[{"product_key": f"ext:retailer:{k}", "sku_key": f"sku_{k}", "merchant_id": f"merch_{h}",
+        offers=[{"product_key": f"ext:retailer:{k}", "sku_key": f"sku_{k}",
+                 # The id the writer derives from the host — inventing one here would make the
+                 # validator's seller check pass on evidence the lane could never produce.
+                 "merchant_id": f"agent_seed::retailer::{h}",
                  "currency": "USD", "market": "US", "offer_type": "retailer", "offer_mode": "redirect",
                  "source_domain": h, "destination_url": f"https://{h}/products/x"}
                 for k, h in (("a", "eyurs.com"), ("b", "ohlolly.com"))],
@@ -406,3 +410,28 @@ async def test_a_declaration_is_checked_even_when_only_one_variant_is_stored():
     agreeing = dict(CASE, observed_source_variants={"eyurs.com": "45001"})
     out = await collect(FakeConn(products=[product_row("eyurs.com", "ext:retailer:a")], skus=skus), agreeing)
     assert not any("declares variant" in n for n in out["evidence_provenance"]["notes"])
+
+
+async def test_the_emitted_offer_carries_the_rows_values_not_the_products():
+    """A collector that rebuilt these fields from the product — or from the host — would make the
+    validator's seller checks true by construction, which is the whole failure mode this pair of
+    scripts exists to remove. Only variant_id was pinned before."""
+    conn = FakeConn(
+        products=[product_row("eyurs.com", "ext:retailer:a")],
+        skus=[{"product_key": "ext:retailer:a", "sku_key": "sku_one", "source_variant_id": "45001",
+               "sku_payload": json.dumps({"variant_id_provenance": "merchant_issued"})}],
+        # Deliberately disagreeing with the product on every seller-ish field.
+        offers=[{"product_key": "ext:retailer:a", "sku_key": "sku_one",
+                 # NOT the id host-derivation would produce for this row's source_domain: a
+                 # collector that rebuilt the field from the host would otherwise emit the same
+                 # string and the test would agree with the bug.
+                 "merchant_id": "agent_seed::retailer::stored-value.example",
+                 "currency": "KRW", "market": "KR", "offer_type": "retailer",
+                 "offer_mode": "redirect", "source_domain": "somewhere-else.example",
+                 "destination_url": "https://somewhere-else.example/products/x"}],
+    )
+    offer = (await collect(conn, CASE))["offers"][0]
+    assert offer["merchant_id"] == "agent_seed::retailer::stored-value.example", \
+        "the emitted merchant id must be the ROW's, not one derived from the host"
+    assert offer["seller_host"] == "somewhere-else.example"
+    assert offer["currency"] == "KRW" and offer["market"] == "KR"

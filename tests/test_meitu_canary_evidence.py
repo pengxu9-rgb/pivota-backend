@@ -14,7 +14,9 @@ def evidence():
         "gateway_revision": "def", "source_artifacts": ["saved-live-responses.json"],
         "crawl": {"status": "complete", "selected_products": 2},
         "products": [{"product_key": f"pk_{host}", "content_key": "ck", "product_group_id": "pg", "brand": "3CE", "seller_host": host,
-            "merchant_id": f"merchant_{host}", "currency": "USD", "market": "US", "variant_id": "123456",
+            # Lane-shaped ids: the product carries the observed seller-of-record, the offer the
+            # lane's own agent_seed namespace. Inventing ids here is what hid earlier defects.
+            "merchant_id": f"merch_obs_{host}", "currency": "USD", "market": "US", "variant_id": "123456",
             "variant_id_provenance": "merchant_issued", "gtin": "8809530070499",
             "category_path": "beauty/makeup/lip/lipstick", "inci_source": "reseller_listing",
             "inci_row": {"present": True, "source_system": "reseller_listing", "raw_inci_chars": 412}}
@@ -22,7 +24,7 @@ def evidence():
         "search_product_keys": ["pk_one.example", "pk_two.example"],
         "pdp_product_keys": ["pk_one.example", "pk_two.example"],
         "offer_product_keys": ["pk_one.example", "pk_two.example"],
-        "offers": [{"product_key": f"pk_{host}", "merchant_id": f"merchant_{host}", "seller_host": host,
+        "offers": [{"product_key": f"pk_{host}", "merchant_id": f"agent_seed::{host}", "seller_host": host,
                     "variant_id": "123456", "currency": "USD", "market": "US",
                     "destination_url": f"https://{host}/products/lipstick"}
                    for host in ["one.example", "two.example"]],
@@ -434,3 +436,47 @@ def test_an_unrelated_hosts_offer_does_not_trip_the_collapse_check():
     data["same_brand"]["offers"].append(stray)
     result = evaluate(manifest, data, now=NOW)
     assert result["passed"] == 1, result["cases"][0]["reasons"]
+
+
+def test_a_brand_offer_must_still_be_this_lanes_identity():
+    """A brand offer's id is slug-derived and cannot be matched exactly, but it may not be
+    arbitrary: accepting any non-empty id left brand cases with the hole just closed for
+    retailer ones. Two of the six shipped cases are brand_official."""
+    case = dict(MANIFEST["cases"][0], source_role="brand_official")
+    manifest = {"cases": [case]}
+    assert evaluate(manifest, evidence(), now=NOW)["passed"] == 1
+
+    for bad in ("external_seed", "merch_unrelated", "agent_seed::retailer::two.example"):
+        data = evidence()
+        data["same_brand"]["offers"][0]["merchant_id"] = bad
+        result = evaluate(manifest, data, now=NOW)
+        assert result["failed"] == 1, f"brand case accepted offer merchant {bad!r}"
+
+
+def test_the_banned_shared_bucket_is_refused_for_every_case_shape():
+    """ADR-009 D2 bans the shared external_seed bucket, and apply.py documents rows being minted
+    into it; an offer there is not a seller-specific offer whatever the case's role."""
+    for role in ("retailer", "brand_official", None):
+        case = dict(MANIFEST["cases"][0])
+        if role:
+            case["source_role"] = role
+        data = _retailer_evidence() if role == "retailer" else evidence()
+        data["same_brand"]["offers"][0]["merchant_id"] = "external_seed"
+        assert evaluate({"cases": [case]}, data, now=NOW)["failed"] == 1, role
+
+
+def test_the_mirrored_constants_match_their_real_definitions():
+    """Both strings are copied rather than imported (this screen is standalone); the copies are
+    pinned here so they cannot drift from the writer."""
+    from services.catalog_enrichment_agent.ingestion import MERCHANT_ID_PREFIX, derive_merchant_id
+    from services.seller_identity import BANNED_BUCKET_MERCHANT_ID as REAL_BANNED
+    from scripts.validate_meitu_canary_evidence import (
+        AGENT_SEED_PREFIX, BANNED_BUCKET_MERCHANT_ID, retailer_merchant_id,
+    )
+
+    assert AGENT_SEED_PREFIX == MERCHANT_ID_PREFIX
+    assert BANNED_BUCKET_MERCHANT_ID == REAL_BANNED
+    # Host shapes the writer normalises before building the id.
+    for host in ("eyurs.com", "EYURS.COM", "www.eyurs.com", "ohlolly.com"):
+        assert retailer_merchant_id(host) == derive_merchant_id(
+            None, host.lower().removeprefix("www."), seller_domain=host.lower().removeprefix("www."))

@@ -46,6 +46,13 @@ from services.catalog_identity import validated_source_gtin as canonical_gtin
 from services.category_path_aliases import LEAF_PARENTS
 
 
+#: The lane's own merchant namespace, and the shared bucket ADR-009 D2 bans. Mirrored rather than
+#: imported for the same reason as retailer_merchant_id; both are pinned against the real
+#: definitions by tests.
+AGENT_SEED_PREFIX = "agent_seed::"
+BANNED_BUCKET_MERCHANT_ID = "external_seed"
+
+
 def retailer_merchant_id(host: str) -> str:
     """The offer merchant id this lane writes for a retailer host.
 
@@ -54,7 +61,10 @@ def retailer_merchant_id(host: str) -> str:
     coupling is pinned by a test that compares this against the real function, so the duplication
     cannot drift silently.
     """
-    return f"agent_seed::retailer::{str(host or '').strip().lower()}"
+    # `www.` is stripped by the writer's _domain_of before the id is built, so strip it here too
+    # rather than deriving an id the writer would never produce.
+    clean = str(host or "").strip().lower().removeprefix("www.")
+    return f"{AGENT_SEED_PREFIX}retailer::{clean}"
 
 #: The Meitu cohort is lip-only; a case that declares no shelf is held to this one.
 DEFAULT_CATEGORY_PREFIX = "beauty/makeup/lip/"
@@ -163,11 +173,28 @@ def evaluate(manifest: dict, evidence: dict, *, now=None) -> dict:
             # let an offer carry the OTHER seller's id, an unrelated namespace, or the
             # ADR-009-banned `external_seed` bucket, and still resolve this product.
             expected_merchant = retailer_merchant_id(host) if case.get("source_role") == "retailer" else None
+
+            def seller_identity_holds(offer):
+                """A retailer offer's id is host-derived and can be matched exactly. A brand
+                offer's is slug-derived (`agent_seed::<slug>`) and cannot — but it still may not
+                be arbitrary: it must be THIS lane's namespace, and never the shared
+                `external_seed` bucket ADR-009 D2 bans and apply.py documents as mintable.
+                Accepting "any non-empty id" for brand cases left the same hole this check
+                closed for retailer ones."""
+                merchant = str(offer.get("merchant_id") or "").strip()
+                if expected_merchant:
+                    return merchant == expected_merchant
+                if not merchant.startswith(AGENT_SEED_PREFIX) or merchant == BANNED_BUCKET_MERCHANT_ID:
+                    return False
+                # Even unmatchable, it may not be ANOTHER case host's derived identity: that is a
+                # cross-wired seller, which is the collapse this canary exists to catch.
+                others = {retailer_merchant_id(h) for h in case["seller_hosts"] if h != host}
+                return merchant not in others
+
             matching_offers = [offer for offer in (observed.get("offers") or [])
                 if all(offer.get(field) == product.get(field) for field in
                        ("product_key", "seller_host", "variant_id", "currency", "market"))
-                and (offer.get("merchant_id") == expected_merchant if expected_merchant
-                     else str(offer.get("merchant_id") or "").strip())]
+                and seller_identity_holds(offer)]
             if not any(urlsplit(str(offer.get("destination_url") or "")).scheme == "https"
                        and (urlsplit(str(offer.get("destination_url") or "")).hostname or "").removeprefix("www.") == host
                        for offer in matching_offers):
