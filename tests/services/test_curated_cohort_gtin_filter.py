@@ -203,3 +203,63 @@ def test_a_roster_host_matching_nothing_fails_rather_than_shrinking_the_cohort(m
                    "--source-role", "retailer", "--only-gtin", BALM])
     assert rc == 2
     assert "ohlolly.com: --only-gtin matched none" in capsys.readouterr().err
+
+
+def test_the_default_flag_path_matches_on_the_pdp_barcode():
+    """Every other fixture here passes emit_native_variants=True, so every record also carries the
+    GTIN on a variant — which means the PDP-level read could be deleted with all of them still
+    green. Under the lane's DEFAULT flags a single-variant record has pdp.barcode set and NO
+    variants, and that read is the only thing making --only-gtin work at all."""
+    default_record = feed.shopify_product_to_record(
+        {"id": 771, "vendor": "Pyunkang Yul", "title": "Pyunkang Yul Deep Clear Cleansing Balm",
+         "handle": "deep-clear-cleansing-balm", "product_type": "Cleansing Balm",
+         "body_html": "<p>Ingredients: Water</p>", "images": [{"src": "https://cdn.example/i.jpg"}],
+         "variants": [{"id": 41793713995959, "price": "18.00", "available": True,
+                       "sku": "S1", "barcode": BALM}]},
+        domain="eyurs.com", category_path="beauty", brand_override="Pyunkang Yul",
+        currency="USD", source_role="retailer", retailer_name="eyurs.com",
+    )
+    assert not (default_record["pdp"].get("variants") or []), "precondition: no emitted variants"
+    assert default_record["pdp"]["barcode"], "precondition: the GTIN is at PDP level only"
+
+    kept, matched = _select_by_gtin([default_record], _canonical_gtins([BALM]), domain="eyurs.com")
+    assert len(kept) == 1 and matched == {BALM_14}
+
+
+def test_gtins_may_be_split_across_roster_hosts(monkeypatch, tmp_path, capsys):
+    """The documented reason the unmatched check is run-wide rather than per row: one roster row
+    may legitimately carry only some of the requested GTINs. Without a test, the union
+    accumulation could be replaced by assignment and only produce a FALSE failure."""
+    import json as _json
+    from unittest.mock import AsyncMock
+
+    from scripts import onboard_curated_brands as cli
+
+    first = record(BALM)
+    second = record(OTHER, title="Pyunkang Yul 1/3 Cotton Pads", product_type="Cotton Pads")
+    fetch = AsyncMock(side_effect=[
+        feed.ShopifyProductBatch([first], scanned_products=10, pages=1),
+        feed.ShopifyProductBatch([second], scanned_products=10, pages=1)])
+    fetch.last_vendor_filter_report = fetch.last_brand_census = fetch.last_fold_report = None
+    monkeypatch.setattr(cli, "records_for_brand", fetch)
+
+    roster = tmp_path / "roster.jsonl"
+    roster.write_text("\n".join(_json.dumps({"domain": host, "category_path": "beauty",
+                                             "brand": "Pyunkang Yul"})
+                                for host in ("eyurs.com", "ohlolly.com")))
+    rc = cli.main(["--file", str(roster), "--only-vendor", "Pyunkang Yul",
+                   "--source-role", "retailer", "--only-gtin", BALM, "--only-gtin", OTHER])
+    out = capsys.readouterr()
+    assert rc == 0, out.err
+    assert out.out.count("pdp {") == 2, "each host contributes the GTIN it carries"
+
+
+def test_one_host_matching_several_gtins_reports_all_of_them():
+    """Within a host, `matched |= found` vs `matched = found` differ only when ONE host matches
+    more than one requested GTIN — the roster test has one per host, so it cannot see the
+    difference. Overwriting would forget the earlier match and fail a correct run at the end."""
+    cohort = [record(BALM), record(OTHER, title="Pyunkang Yul 1/3 Cotton Pads",
+                                   product_type="Cotton Pads")]
+    kept, matched = _select_by_gtin(cohort, _canonical_gtins([BALM, OTHER]), domain="eyurs.com")
+    assert len(kept) == 2
+    assert matched == {BALM_14, "08809486680360"}, "every GTIN this host matched must be reported"

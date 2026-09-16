@@ -150,6 +150,9 @@ def _canonical_gtins(wanted: List[str]) -> set:
             raise ValueError(f"--only-gtin {value!r} is not a valid GS1 GTIN")
         canonical.add(gtin)
     if not canonical:
+        # Unreachable from _run (guarded by `if args.only_gtin`, and every element either raises
+        # or is added), but this is a module-level helper: a future caller passing [] should be
+        # told, not handed an empty set that quietly matches nothing downstream.
         raise ValueError("--only-gtin needs at least one valid GS1 GTIN")
     return canonical
 
@@ -159,8 +162,8 @@ def _record_gtins(record: Dict[str, Any]) -> set:
 
     `pdp.barcode` is set only for a single-variant, unfolded product (curated_brand_feed), so a
     multi-variant listing — exactly what --emit-real-variants produces — carries its barcodes on
-    the VARIANTS. Matching the PDP level alone silently refused those products while the help text
-    promised to keep "products carrying this GTIN".
+    the VARIANTS. Matching the PDP level alone refused those products with "matched none" while the help
+    text promised to keep "products carrying this GTIN".
     """
     pdp = record.get("pdp") or {}
     found = {validated_source_gtin(pdp.get("gtin") or pdp.get("barcode"))}
