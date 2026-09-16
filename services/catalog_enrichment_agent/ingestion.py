@@ -137,10 +137,6 @@ OFFER_MODE = "external_referral"
 #: Applied to retailer-typed offers only; brand-direct/unknown rows keep the old value
 #: until that cohort is reviewed on its own.
 OFFER_MODE_REDIRECT = "redirect"
-#: The market this lane partitions on. Seeds and offers MUST agree: a seed stamped US
-#: beside an offer stamped NULL (or anything else) is the same row disagreeing with
-#: itself across two tables, and every serving read partitions on one or the other.
-DEFAULT_MARKET = "US"
 MERCHANT_ID_PREFIX = "agent_seed::"
 MERCHANT_PLATFORM = "external_seed"
 
@@ -743,7 +739,7 @@ def _build_seed_inserts(
     product_key: str,
     pdp_payload: Dict[str, Any],
     offers: List[Dict[str, Any]],
-    market: str = DEFAULT_MARKET,
+    market: str = "US",
 ) -> List[Dict[str, Any]]:
     """Produce one external_product_seeds row per validated offer.
 
@@ -1172,33 +1168,38 @@ def _build_merchant_upserts(
     return list(seen.values())
 
 
-def resolve_offer_type(pdp_payload: Dict[str, Any]) -> Optional[str]:
-    """The seller TYPE this lane can actually evidence, or None.
+def resolve_offer_type(pdp_payload: Dict[str, Any]) -> Dict[str, Any]:
+    """The seller identity this lane can actually evidence: {offer_type, is_first_party}.
 
     `offer_type` decides whether an offer is servable: the gateway's catalog_offers arm
     (routes/agent_shop_gateway.py, `_handle_offers_resolve`) selects on
     `offer_type = 'retailer'`, so a row that leaves it NULL is written and then never
     served — which is what happened to every curated retailer offer before this.
 
-    The evidence order matches scripts/onboard_external_brand_from_crawl.py: an explicit
-    caller value wins; otherwise `source_role='retailer'` IS the positive evidence (the
-    operator named the seller with --source-role, and _build_pdp_insert already mints a
-    `merch_obs_` observed-retailer identity from it); otherwise fall back to the domain
-    verdict. NO default: `derive_offer_seller_identity` returns None rather than guess
-    (services/offer_seller_identity.py "unknown — do not guess"), and inventing
-    'brand_direct' here would label a third-party listing as the brand's own.
+    `source_role='retailer'` IS the positive evidence: the operator named the seller with
+    --source-role, and _build_pdp_insert already mints a `merch_obs_` observed-retailer
+    identity from it. Otherwise the domain verdict decides. NO default:
+    `derive_offer_seller_identity` returns None rather than guess ("unknown — do not
+    guess"), and inventing 'brand_direct' would label a third party's listing as the
+    brand's own.
+
+    `is_first_party` travels WITH the type, as in scripts/attach_retailer_offer.py and
+    services/external_offer_dual_write.py: pivot_query_service derives `official_source`
+    from the stored bit, so a brand_direct offer written without it is never "official".
+
+    There is deliberately no explicit-caller branch: `_build_pdp_payload` is a whitelist
+    that carries neither `offer_type` nor `official_domain`, so such a branch would be
+    unreachable from this lane and would write an unvalidated value outside the
+    brand_direct|retailer vocabulary migration 149 defines.
     """
-    explicit = str(pdp_payload.get("offer_type") or "").strip()
-    if explicit:
-        return explicit
     if pdp_payload.get("source_role") == "retailer":
-        return OFFER_TYPE_RETAILER
-    return derive_offer_seller_identity(
+        return {"offer_type": OFFER_TYPE_RETAILER, "is_first_party": False}
+    verdict = derive_offer_seller_identity(
         domain=pdp_payload.get("source_domain"),
         canonical_url=pdp_payload.get("canonical_url"),
-        official_domain=pdp_payload.get("official_domain"),
         brand=pdp_payload.get("brand"),
-    )["offer_type"]
+    )
+    return {"offer_type": verdict["offer_type"], "is_first_party": bool(verdict["is_first_party"])}
 
 
 def _build_offer_inserts(
@@ -1209,7 +1210,7 @@ def _build_offer_inserts(
     source_domain: Optional[str] = None,
     currency: Optional[str] = None,
     offer_type: Optional[str] = None,
-    market: str = DEFAULT_MARKET,
+    is_first_party: bool = False,
 ) -> List[Dict[str, Any]]:
     """One catalog_offers row per validated offer. merchant_id resolves
     to the per-retailer synthetic id (see derive_merchant_id), which is
@@ -1247,10 +1248,13 @@ def _build_offer_inserts(
             "offer_mode": (
                 OFFER_MODE_REDIRECT if offer_type == OFFER_TYPE_RETAILER else OFFER_MODE
             ),
-            # Persisted, not inferred at read time: the serving side selects on these two
-            # and cannot recover a seller type the writer declined to record.
+            # Persisted, not inferred at read time: the serving side selects on these and
+            # cannot recover a seller identity the writer declined to record. `market` is
+            # deliberately NOT bound — catalog_offers.market is NOT NULL DEFAULT 'US'
+            # (db/catalog.py:300), so the column already stamps the serving partition and
+            # binding it would only add a way to write NULL into a NOT NULL column.
             "offer_type": offer_type,
-            "market": market,
+            "is_first_party": is_first_party,
             "channel": "default",
             "availability": availability,
             "inventory_quantity": 0 if offer.get("in_stock") is False else None,
@@ -1371,7 +1375,7 @@ def ingest_validated_record(record: Dict[str, Any], *, source_jsonl: Optional[st
     # Resolved ONCE for both offer call sites below (canonical + per-variant): two offers
     # of the same listing cannot legitimately disagree about who is selling it, and the
     # variant call site is exactly where a second resolution would silently drift.
-    offer_type = resolve_offer_type(pdp_payload)
+    seller_type = resolve_offer_type(pdp_payload)
     offer_rows = _build_offer_inserts(
         product_key=pdp_row["product_key"],
         sku_key=sku_row["sku_key"],
@@ -1380,7 +1384,8 @@ def ingest_validated_record(record: Dict[str, Any], *, source_jsonl: Optional[st
         # Resolved HERE because this builder is the one consumer without the pdp payload in
         # scope; passing the payload just to read one field would widen its interface.
         currency=_currency_of(pdp_payload),
-        offer_type=offer_type,
+        offer_type=seller_type["offer_type"],
+        is_first_party=seller_type["is_first_party"],
     )
     # Real variants ride beside the canonical SKU: one SKU + one offer each,
     # priced and stocked per variant, at the brand-direct destination.
@@ -1418,7 +1423,8 @@ def ingest_validated_record(record: Dict[str, Any], *, source_jsonl: Optional[st
                 # USD variant offer keeps the whole product on the US surface, now serving SGD
                 # amounts labelled USD. Measured on a 3-shade SGD line: offers {SGD: 1, USD: 3}.
                 currency=_currency_of(pdp_payload),
-                offer_type=offer_type,
+                offer_type=seller_type["offer_type"],
+                is_first_party=seller_type["is_first_party"],
             ))
     seed_rows = _build_seed_inserts(
         product_key=pdp_row["product_key"],
