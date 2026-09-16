@@ -154,6 +154,7 @@ def _run(
     log_output: str = "",
     ported_files: "bool | str" = False,
     curl_out: str = "404",
+    overrides: "dict[str, str] | None" = None,
 ) -> Run:
     """Run the REAL deploy_gateway.sh against stubs.
 
@@ -200,8 +201,14 @@ def _run(
         "STUB_ENV_FILE_COPY": str(tmp_path / "env-vars-file.snapshot"),
     }
     env.pop("CONFIG", None)
+    # The shape overrides are read from the ENVIRONMENT, so an operator who exported the incident
+    # runbook's own `CONCURRENCY=20` in this shell would otherwise inject it into every test here -
+    # and the default tests would pass while asserting nothing about the default.
+    for shape_var in ("CONCURRENCY", "CONCURRENCY_LIMIT", "MIN_INSTANCES", "MAX_INSTANCES"):
+        env.pop(shape_var, None)
     if config is not None:
         env["CONFIG"] = config
+    env.update(overrides or {})
 
     proc = subprocess.run(
         ["bash", str(script), env_arg, tag],
@@ -459,3 +466,91 @@ def test_apply_can_still_create_a_service_from_scratch(tmp_path):
     assert "--env-vars-file" in argv
     # A first revision already holds 100%; shifting traffic to itself is not attempted.
     assert not any("--to-latest" in c for c in r.traffic_calls())
+
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# THE SHAPE OVERRIDES
+#
+# `preserve` keeps env and secrets but REASSERTS the shape, so every gateway deploy re-sends
+# --concurrency/--min-instances/--max-instances. The 2026-09-15 pivota-pg CPU incident was mitigated
+# by hand-setting the live gateway to concurrency 20 / min 4; without these overrides the next
+# scripted deploy would have silently restored 80 / 2 while reporting success.
+#
+# Each knob is pinned in BOTH directions. A test that only checks the default passes when the flag
+# does nothing; a test that only checks the override passes when the default has drifted. Before
+# these existed the whole suite passed identically with the override code removed.
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+
+def test_unset_overrides_keep_the_prod_shape_constants(tmp_path):
+    r = _run(tmp_path, config="preserve")
+    assert r.rc == 0, r.err
+    assert r.flag(r.deploy(), "--concurrency") == "80"
+    assert r.flag(r.deploy(), "--min-instances") == "2"
+    assert r.flag(r.deploy(), "--max-instances") == "20"
+
+
+@pytest.mark.parametrize("name", ["CONCURRENCY", "CONCURRENCY_LIMIT"])
+def test_either_concurrency_name_reaches_gcloud(tmp_path, name):
+    """CONCURRENCY_LIMIT is the repo's vocabulary; CONCURRENCY is the incident runbook's. An
+    operator reaching for this mid-incident must not get 80 because they typed the other one."""
+    r = _run(tmp_path, config="preserve", overrides={name: "20"})
+    assert r.rc == 0, r.err
+    assert r.flag(r.deploy(), "--concurrency") == "20"
+
+
+def test_disagreeing_concurrency_names_are_refused(tmp_path):
+    r = _run(tmp_path, config="preserve", overrides={"CONCURRENCY": "20", "CONCURRENCY_LIMIT": "40"})
+    assert r.rc == 2
+    assert "disagree" in r.err
+    assert not r.calls or all(c[:2] != ["run", "deploy"] for c in r.calls)
+
+
+def test_agreeing_concurrency_names_are_accepted(tmp_path):
+    r = _run(tmp_path, config="preserve", overrides={"CONCURRENCY": "20", "CONCURRENCY_LIMIT": "20"})
+    assert r.rc == 0, r.err
+    assert r.flag(r.deploy(), "--concurrency") == "20"
+
+
+@pytest.mark.parametrize("bad", ["0", "default", "007", "-5", "abc", "20 --min-instances 0"])
+def test_a_concurrency_that_would_silently_widen_is_refused(tmp_path, bad):
+    """`0` reads as UNLIMITED and `default` CLEARS the limit - both restore the 80 this override
+    exists to hold off, while the deploy reports success. They must fail before any revision
+    exists, not after."""
+    r = _run(tmp_path, config="preserve", overrides={"CONCURRENCY": bad})
+    assert r.rc == 2, f"{bad!r} was accepted: {r.err}"
+    assert all(c[:2] != ["run", "deploy"] for c in r.calls)
+
+
+@pytest.mark.parametrize(
+    "overrides,flag,expected",
+    [
+        ({"MIN_INSTANCES": "4"}, "--min-instances", "4"),
+        ({"MIN_INSTANCES": "0"}, "--min-instances", "0"),
+        ({"MAX_INSTANCES": "8"}, "--max-instances", "8"),
+    ],
+)
+def test_instance_overrides_reach_gcloud(tmp_path, overrides, flag, expected):
+    r = _run(tmp_path, config="preserve", overrides=overrides)
+    assert r.rc == 0, r.err
+    assert r.flag(r.deploy(), flag) == expected
+
+
+@pytest.mark.parametrize("overrides", [{"MIN_INSTANCES": "04"}, {"MIN_INSTANCES": "two"}, {"MAX_INSTANCES": "0"}, {"MAX_INSTANCES": "0x10"}])
+def test_malformed_instance_overrides_are_refused(tmp_path, overrides):
+    r = _run(tmp_path, config="preserve", overrides=overrides)
+    assert r.rc == 2, r.err
+    assert all(c[:2] != ["run", "deploy"] for c in r.calls)
+
+
+def test_an_override_reaches_the_candidate_revision_itself(tmp_path):
+    """The candidate IS the revision that gets promoted - `update-traffic --to-latest` carries no
+    shape flags - so an override that only landed on a later call would never take effect."""
+    r = _run(tmp_path, config="preserve", overrides={"CONCURRENCY_LIMIT": "20"})
+    assert r.rc == 0, r.err
+    deploy = r.deploy()
+    assert "--no-traffic" in deploy
+    assert r.flag(deploy, "--concurrency") == "20"
+    assert deploy.count("--concurrency") == 1
+    for call in r.traffic_calls():
+        assert "--concurrency" not in call

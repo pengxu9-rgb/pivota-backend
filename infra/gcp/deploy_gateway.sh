@@ -80,6 +80,10 @@ case "$CONFIG" in preserve|apply) ;; *) echo "CONFIG must be preserve or apply (
 # --concurrency, --timeout, --ingress, --vpc-egress, --labels, --service-account. Those match live
 # prod today, so nothing drifts; but an operator who widened --max-instances by hand during an
 # incident will have it pulled back silently by the next deploy.
+# CONCURRENCY_LIMIT (or its alias CONCURRENCY) / MIN_INSTANCES / MAX_INSTANCES override those three
+# for one invocation, and are validated below. The 2026-09-15 pivota-pg CPU incident set the live
+# gateway to concurrency 20 / min 4 by hand; a deploy without CONCURRENCY_LIMIT=20 MIN_INSTANCES=4
+# would revert that to 80 / 2.
 #
 # PIVOTA_ENV, PIVOTA_SERVICE_NAME and the four GW_POOL_* sizings travel in the env FILE, so under
 # `preserve` they are computed and then not sent. The running service already carries them, and a
@@ -101,6 +105,38 @@ case "$CONFIG" in preserve|apply) ;; *) echo "CONFIG must be preserve or apply (
 : "${PUBLIC:=$([ "$ENV" = prod ] && echo 1 || echo 0)}"
 [ "$PUBLIC" = 1 ] && PUBLIC_FLAG=--allow-unauthenticated || PUBLIC_FLAG=--no-allow-unauthenticated
 GCLOUD="${GCLOUD:-gcloud}"
+# ── SHAPE OVERRIDES ────────────────────────────────────────────────────────────────────────────
+# `CONCURRENCY_LIMIT` is the name the rest of the repo uses (deploy_backend.sh, the proof-issuer
+# job in deploy-prod.yml, the runbook footer prod-deploy-drift.yml prints). `CONCURRENCY` is what
+# the 2026-09-15 incident runbook used. BOTH work: an operator reaching for this mid-incident must
+# not get 80 because they typed the other one and nothing said so.
+: "${CONCURRENCY_LIMIT:=}"
+: "${CONCURRENCY:=}"
+if [ -n "$CONCURRENCY_LIMIT" ] && [ -n "$CONCURRENCY" ] && [ "$CONCURRENCY_LIMIT" != "$CONCURRENCY" ]; then
+  echo "CONCURRENCY_LIMIT='$CONCURRENCY_LIMIT' and CONCURRENCY='$CONCURRENCY' disagree - set one." >&2
+  exit 2
+fi
+CONCURRENCY_VALUE="${CONCURRENCY_LIMIT:-$CONCURRENCY}"
+# Validated, not passed straight through, because two accepted values fail in the UNSAFE direction -
+# the deploy SUCCEEDS carrying a shape the operator did not ask for, at the one moment they are
+# watching a live incident rather than a diff:
+#   `0`       Cloud Run reads as UNLIMITED, so the tightest-looking budget removes the budget;
+#   `default` gcloud accepts and CLEARS the limit back to the server default - i.e. exactly the 80
+#             this override exists to hold off.
+# A leading-zero form (`007`) is refused for the same reason deploy_backend.sh refuses it: gcloud
+# reads it as 7 while a human skimming a diff reads octal. Everything else gcloud rejects itself,
+# and `set -e` aborts before any revision exists.
+[ -z "$CONCURRENCY_VALUE" ] || case "$CONCURRENCY_VALUE" in
+  *[!0-9]*|''|0|0*) echo "CONCURRENCY must be a positive integer with no leading zero (got '$CONCURRENCY_VALUE'). Cloud Run reads 0 as UNLIMITED and 'default' as no limit - both silently restore 80." >&2; exit 2 ;;
+esac
+# min-instances 0 is legitimate (scale to zero); max-instances 0 is not.
+[ -z "${MIN_INSTANCES:-}" ] || case "$MIN_INSTANCES" in
+  0) ;;
+  *[!0-9]*|''|0*) echo "MIN_INSTANCES must be a non-negative integer with no leading zero (got '$MIN_INSTANCES')." >&2; exit 2 ;;
+esac
+[ -z "${MAX_INSTANCES:-}" ] || case "$MAX_INSTANCES" in
+  *[!0-9]*|''|0|0*) echo "MAX_INSTANCES must be a positive integer with no leading zero (got '$MAX_INSTANCES')." >&2; exit 2 ;;
+esac
 REGION=us-west1
 SERVICE="${SERVICE:-gateway}"
 IMAGE="$REGION-docker.pkg.dev/pivota-shared/pivota/gateway:$TAG"
@@ -297,7 +333,7 @@ probe_health(){ # url -> echoes the status code
   --service-account "sa-gateway@$PROJECT.iam.gserviceaccount.com" \
   --network default --subnet default --vpc-egress "$VPC_EGRESS" \
   ${CONFIG_ARGS[@]+"${CONFIG_ARGS[@]}"} \
-  --port 8080 --cpu "$CPU" --memory "$MEM" --concurrency 80 --timeout 300 \
+  --port 8080 --cpu "$CPU" --memory "$MEM" --concurrency "${CONCURRENCY_VALUE:-80}" --timeout 300 \
   --min-instances "${MIN_INSTANCES:-$MIN}" --max-instances "${MAX_INSTANCES:-$MAX}" \
   --no-cpu-throttling --cpu-boost --execution-environment gen2 \
   --ingress "$INGRESS" \
