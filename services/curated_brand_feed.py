@@ -228,19 +228,136 @@ class CrawlIncomplete(RuntimeError):
 
     next_page is diagnostic retry position, not an ingestion checkpoint. Callers retry
     the whole read before writing, so no partial batch can become a successful job.
+
+    `reason_code` names WHY when the cause is known (see classify_transport_failure).
+    `status` is deliberately NOT derived from it: every consumer gates on
+    `status == "complete"`, and an unreachable host is a failed crawl like any other.
     """
     def __init__(self, message: str, *, status: str, next_page: int,
-                 scanned_products: int, selected_products: int):
+                 scanned_products: int, selected_products: int,
+                 reason_code: Optional[str] = None):
         super().__init__(message)
         self.status = status
         self.next_page = next_page
         self.scanned_products = scanned_products
         self.selected_products = selected_products
+        self.reason_code = reason_code
 
     def as_dict(self) -> Dict[str, Any]:
-        return {"status": self.status, "next_page": self.next_page,
-                "scanned_products": self.scanned_products,
-                "selected_products": self.selected_products, "reason": str(self)}
+        out: Dict[str, Any] = {"status": self.status, "next_page": self.next_page,
+                               "scanned_products": self.scanned_products,
+                               "selected_products": self.selected_products, "reason": str(self)}
+        # Additive: existing readers key on status/reason and must not have to know this.
+        if self.reason_code:
+            out["reason_code"] = self.reason_code
+        return out
+
+
+#: Where to look first. A transport failure does not prove whose fault it is, so the
+#: classification says which side the evidence points at and nothing stronger.
+_BLAME_NEXT_STEP = {
+    "host": "verify the storefront from a vantage outside the crawl subnet before suspecting "
+            "this crawler",
+    "client": "suspect this client's egress or TLS configuration before the storefront",
+    "unknown": "the failure happened before any HTTP response; verify reachability from outside "
+               "the crawl subnet before suspecting this crawler",
+}
+
+#: (needle, reason_code, explanation, blame). First match wins, so specific cases precede
+#: general ones. Needles are matched against "TypeName: message", lowercased.
+#:
+#: BLAME IS EVIDENCE, NOT A VERDICT. `SSLV3_ALERT_HANDSHAKE_FAILURE` is what an edge returns
+#: for a hostname it does not serve — and also what a server sends on a cipher-suite mismatch
+#: with a hardened client. `services/official_domain_liveness.py` already records this class
+#: of failure as `unverifiable` rather than a confirmed negative, after 213/286 brand hosts
+#: answered with WAF challenges; this table keeps that posture.
+_TRANSPORT_SIGNATURES: Tuple[Tuple[str, str, str, str], ...] = (
+    # Client-side first: these say our own egress or trust store, and blaming the site here
+    # is the same misdirection this classifier exists to remove, pointed the other way.
+    ("unable to get local issuer", "client_trust_store",
+     "this client could not build a trust chain for the host's certificate, which the error "
+     "attributes to the LOCAL issuer store (a stale CA bundle in the image, or interception)",
+     "client"),
+    ("self-signed certificate", "client_trust_store",
+     "the presented certificate is self-signed, which an intercepting proxy also produces",
+     "client"),
+    ("network is unreachable", "client_egress_unreachable",
+     "this client's network could not route to the host at all", "client"),
+    ("no route to host", "client_egress_unreachable",
+     "this client's network has no route to the host", "client"),
+    # Host-side.
+    ("sslv3_alert_handshake_failure", "host_tls_refused",
+     "the host's TLS layer rejected the handshake before any HTTP request, which is what an "
+     "edge returns for a hostname it has no certificate for — and also what a server sends "
+     "when no cipher suite is shared",
+     "host"),
+    ("tlsv1_alert_protocol_version", "tls_version_mismatch",
+     "the host and this client share no TLS protocol version", "unknown"),
+    ("certificate_verify_failed", "tls_untrusted",
+     "the host's certificate did not verify (expired or wrongly issued at the host, or a "
+     "trust-store problem here)", "unknown"),
+    ("tlsv1_alert", "host_tls_refused", "the host rejected the TLS handshake", "host"),
+    ("[ssl:", "tls_error", "the TLS handshake failed", "unknown"),
+    ("ssl/tls", "tls_error", "the TLS handshake failed", "unknown"),
+    ("_ssl.c", "tls_error", "the TLS handshake failed", "unknown"),
+    ("name or service not known", "host_dns_unresolved", "the hostname does not resolve", "host"),
+    ("nodename nor servname", "host_dns_unresolved", "the hostname does not resolve", "host"),
+    ("no address associated with hostname", "host_dns_unresolved",
+     "the hostname resolves to no address", "host"),
+    ("temporary failure in name resolution", "dns_failure",
+     "the hostname could not be resolved right now, which a resolver problem here also "
+     "produces", "unknown"),
+    ("getaddrinfo", "dns_failure", "the hostname could not be resolved", "unknown"),
+    ("connection refused", "host_connection_refused",
+     "the host refused the TCP connection", "host"),
+    ("connection reset", "connection_reset",
+     "the connection was reset after it was established, which rate limiting also produces",
+     "unknown"),
+    ("server disconnected", "connection_reset",
+     "the host closed an established connection without responding", "unknown"),
+)
+
+#: Failures that are OURS by construction — a malformed request, an unsupported URL scheme,
+#: our proxy, our own connection pool. Classifying these as anything about the host would
+#: send an operator to check a site that was never contacted.
+_CLIENT_SIDE_TYPES = (
+    httpx.LocalProtocolError,
+    httpx.UnsupportedProtocol,
+    httpx.ProxyError,
+    httpx.PoolTimeout,
+)
+
+
+def classify_transport_failure(exc: BaseException) -> Optional[Dict[str, str]]:
+    """{reason_code, explanation, blame} for a transport failure, else None.
+
+    A raw `ConnectError: [SSL: SSLV3_ALERT_HANDSHAKE_FAILURE]` on page 1 reads as a bug in
+    this crawler; it usually means the storefront did not answer. Not naming that cost a day
+    of diagnosis on the 2026-09-15 A'PIEU canary. But the opposite error is just as costly:
+    a proxy failure or a stale CA bundle blamed on the merchant sends an operator to check a
+    site that is perfectly healthy. So this reports WHERE THE EVIDENCE POINTS (`blame`), never
+    a verdict, and returns None for failures that are ours by construction — those keep the
+    raw error, which is the right thing to read when the bug is here.
+
+    This NEVER changes control flow: an unreachable host is still an incomplete crawl that
+    must not ingest a partial prefix, and the retry budget is untouched — a site that is down
+    now can answer on the next attempt.
+    """
+    if isinstance(exc, _CLIENT_SIDE_TYPES):
+        return None
+    if not isinstance(exc, httpx.TransportError):
+        return None
+    text = f"{type(exc).__name__}: {exc}".lower()
+    for needle, code, explanation, blame in _TRANSPORT_SIGNATURES:
+        if needle in text:
+            return {"reason_code": code, "explanation": explanation, "blame": blame}
+    if isinstance(exc, httpx.TimeoutException):
+        return {"reason_code": "timeout",
+                "explanation": "no response arrived within the request timeout",
+                "blame": "unknown"}
+    return {"reason_code": "transport_failure",
+            "explanation": "the connection attempt failed before any HTTP response",
+            "blame": "unknown"}
 
 
 class ShopifyProductBatch(list):
@@ -281,10 +398,11 @@ async def fetch_shopify_products(
     timeout = httpx.Timeout(timeout_s, connect=5.0)
     headers = {"User-Agent": _UA, "Accept": "application/json"}
 
-    def incomplete(reason: str, status: str = "failed") -> CrawlIncomplete:
+    def incomplete(reason: str, status: str = "failed",
+                   reason_code: Optional[str] = None) -> CrawlIncomplete:
         return CrawlIncomplete(f"{host}: page {page}: {reason}", status=status,
                                next_page=page, scanned_products=scanned,
-                               selected_products=len(out))
+                               selected_products=len(out), reason_code=reason_code)
 
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers=headers) as client:
@@ -339,7 +457,24 @@ async def fetch_shopify_products(
     except CrawlIncomplete:
         raise
     except Exception as exc:
-        raise incomplete(f"{type(exc).__name__}: {str(exc)[:160]}") from exc
+        raw = f"{type(exc).__name__}: {str(exc)[:160]}"
+        classified = classify_transport_failure(exc)
+        if classified is None:
+            raise incomplete(raw) from exc
+        # ORDER IS LOAD-BEARING: code and raw error first. The queue stores this text
+        # truncated (db/catalog_onboard_queue.py), and the original error is the part a
+        # reader cannot reconstruct — a classification is a reading of evidence, and a
+        # wrong reading has to stay checkable against what was actually raised.
+        served = ""
+        if scanned:
+            # The host answered before this, so "could not be reached" would be false.
+            served = (f" The host served {scanned} product(s) across {page - 1} page(s) "
+                      f"before this, so this is a failure mid-crawl, not an unreachable host.")
+        raise incomplete(
+            f"{classified['reason_code']}: {raw} — {classified['explanation']}.{served} "
+            f"Next: {_BLAME_NEXT_STEP[classified['blame']]}.",
+            reason_code=classified["reason_code"],
+        ) from exc
 
 
 def _native_shopify_id(value: Any) -> Optional[str]:
