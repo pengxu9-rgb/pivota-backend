@@ -31,6 +31,11 @@ from urllib.parse import urlsplit
 
 # The observation and acceptance boundaries share the same GS1 validation.
 from services.catalog_identity import validated_source_gtin as canonical_gtin
+# The shelves a case may declare, from the taxonomy the crawl lane itself resolves against.
+from services.category_path_aliases import LEAF_PARENTS
+
+#: The Meitu cohort is lip-only; a case that declares no shelf is held to this one.
+DEFAULT_CATEGORY_PREFIX = "beauty/makeup/lip/"
 
 
 def evaluate(manifest: dict, evidence: dict, *, now=None) -> dict:
@@ -45,7 +50,14 @@ def evaluate(manifest: dict, evidence: dict, *, now=None) -> dict:
         # Default, not free choice: a case that declares no shelf is held to the lip shelf
         # this cohort exists for. An empty/blank declaration would accept everything, so it
         # is treated as absent rather than as "any category".
-        category_prefix = str(case.get("required_category_prefix") or "").strip() or "beauty/makeup/lip/"
+        category_prefix = str(case.get("required_category_prefix") or "").strip() or DEFAULT_CATEGORY_PREFIX
+        # And a declared shelf must BE a shelf. Unbounded, "beauty/" would admit every leaf in
+        # the taxonomy and "b" would admit other verticals too, so a typo or a lazy case would
+        # silently switch this check off — the same accept-all a blank value would have caused.
+        # LEAF_PARENTS is the set of real shelves (beauty/makeup/lip, beauty/skincare/cleanse);
+        # an ancestor like beauty/skincare is deliberately NOT one.
+        if category_prefix[:-1] not in LEAF_PARENTS or not category_prefix.endswith("/"):
+            reasons.append(f"required_category_prefix {category_prefix!r} is not a taxonomy shelf")
         try:
             when = datetime.fromisoformat(observed["observed_at"].replace("Z", "+00:00"))
             age = (now - when).total_seconds()
