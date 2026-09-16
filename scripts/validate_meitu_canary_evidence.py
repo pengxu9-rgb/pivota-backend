@@ -15,6 +15,23 @@ not the same listing product_key. Never derive canonical evidence from titles.
 Missing observations are pending, never passing. A pass certifies the supplied
 evidence meets this contract; source artifact provenance must still be reviewed.
 
+Evidence must carry `evidence_provenance {collector, collected_at, backend_revision}`
+and each product an `inci_row {present, source_system, raw_inci_chars}` read from
+`beauty_sku_ingredients`. Both exist because this screen reads a FILE: without them
+`inci_source` was assertable for a product with no stored ingredient row at all.
+`scripts/collect_curated_canary_evidence.py` produces those fields from the database.
+
+A surface array may be `null`, meaning the door was never asked, and that FAILS —
+distinct from `[]`, which claims the door was asked and returned nothing. The same
+holds for the second-ingest diffs and `identity_failures`: an empty list is the
+measured claim, `null` is the absence of a measurement.
+
+A case declares `source_role` ("retailer" or "brand_official"). It decides how strictly an
+offer's merchant identity can be checked: a retailer offer's id is derived from its host and
+is matched exactly; a brand offer's is slug-derived and can only be held to this lane's
+namespace. An undeclared role therefore gets the WEAKER rule, which is why the manifest test
+requires every shipped case to declare one.
+
 A case may set `required_category_prefix`. It DEFAULTS to the lip prefix, because the
 Meitu cohort this file was written for is lip-only, and a case that forgets to declare a
 category must not thereby accept any category. A case that legitimately covers another
@@ -33,6 +50,27 @@ from urllib.parse import urlsplit
 from services.catalog_identity import validated_source_gtin as canonical_gtin
 # The shelves a case may declare, from the taxonomy the crawl lane itself resolves against.
 from services.category_path_aliases import LEAF_PARENTS
+
+
+#: The lane's own merchant namespace, and the shared bucket ADR-009 D2 bans. Mirrored rather than
+#: imported for the same reason as retailer_merchant_id; both are pinned against the real
+#: definitions by tests.
+AGENT_SEED_PREFIX = "agent_seed::"
+BANNED_BUCKET_MERCHANT_ID = "external_seed"
+
+
+def retailer_merchant_id(host: str) -> str:
+    """The offer merchant id this lane writes for a retailer host.
+
+    Mirrors services/catalog_enrichment_agent/ingestion.derive_merchant_id rather than importing
+    it: this screen is a standalone script and that module pulls the whole ingest chain in. The
+    coupling is pinned by a test that compares this against the real function, so the duplication
+    cannot drift silently.
+    """
+    # `www.` is stripped by the writer's _domain_of before the id is built, so strip it here too
+    # rather than deriving an id the writer would never produce.
+    clean = str(host or "").strip().lower().removeprefix("www.")
+    return f"{AGENT_SEED_PREFIX}retailer::{clean}"
 
 #: The Meitu cohort is lip-only; a case that declares no shelf is held to this one.
 DEFAULT_CATEGORY_PREFIX = "beauty/makeup/lip/"
@@ -67,6 +105,15 @@ def evaluate(manifest: dict, evidence: dict, *, now=None) -> dict:
             reasons.append("missing or invalid timezone-aware observed_at")
         if not all(observed.get(k) for k in ("backend_revision", "gateway_revision", "source_artifacts")):
             reasons.append("missing deployed revisions or source artifact references")
+        # WHO PRODUCED THIS FILE. Every field here is otherwise a claim a person could type:
+        # `inci_source: reseller_listing` was assertable for a product with no stored ingredient
+        # row at all. Provenance does not make a value true, but it distinguishes a collected
+        # file from an authored one, and names the collector whose output can be re-derived.
+        provenance = observed.get("evidence_provenance")
+        if not isinstance(provenance, dict) or not all(
+                str(provenance.get(field) or "").strip()
+                for field in ("collector", "collected_at", "backend_revision")):
+            reasons.append("evidence lacks collector provenance (collector, collected_at, backend_revision)")
         crawl = observed.get("crawl") or {}
         if crawl.get("status") != "complete" or not isinstance(crawl.get("selected_products"), int) or crawl["selected_products"] <= 0:
             reasons.append("no complete nonempty discovery evidence")
@@ -95,16 +142,68 @@ def evaluate(manifest: dict, evidence: dict, *, now=None) -> dict:
                 reasons.append("missing merchant-issued variant identity")
             if not str(product.get("category_path") or "").startswith(category_prefix):
                 reasons.append(f"product category is not under the case's shelf {category_prefix}")
-            if product.get("inci_source") != case["inci_source"]:
+            if product.get("inci_source") is not None and product["inci_source"] != case["inci_source"]:
                 reasons.append("incorrect ingredient authority")
+            # And the authority must be a STORED FACT, not a restatement of intent. The curated
+            # mapper stamps inci_source on every retailer record unconditionally, while the row is
+            # written only when the seller published an ingredient list — so without this, a
+            # product whose PDP carries no INCI passes the check above. Measured 2026-09-16: the
+            # A'PIEU lip oil at eyurs.com is exactly that product.
+            inci_row = product.get("inci_row")
+            if not isinstance(inci_row, dict) or not inci_row.get("present"):
+                reasons.append("no stored ingredient row backs inci_source")
+            elif inci_row.get("source_system") != case["inci_source"]:
+                # Compared to the CASE, not to a sibling field: the collector writes both, so
+                # comparing them to each other proves only that it is self-consistent.
+                reasons.append("stored ingredient row's source_system is not the case's authority")
+            elif not isinstance(inci_row.get("raw_inci_chars"), int) or inci_row["raw_inci_chars"] <= 0:
+                reasons.append("stored ingredient row carries no INCI text")
             host, merchant = product.get("seller_host"), product.get("merchant_id")
             if host not in case["seller_hosts"] or not merchant:
                 reasons.append("wrong or missing seller identity")
             # A shared canonical identity cannot prove that BOTH retailers have
             # resolvable offers. Require the actual seller/variant/currency tuple.
+            #
+            # merchant_id is NOT matched product-to-offer: a curated retailer product is written
+            # under the observed seller-of-record (`merch_obs_<hash>`) while its offers keep the
+            # per-host `agent_seed::retailer::<host>` identity — apply.py states outright that
+            # offers are not re-pointed, and tests/services/test_curated_retailer_contract.py pins
+            # that shape. Requiring the two namespaces to be equal made every curated retailer case
+            # unpassable by construction. What that clause protected — two sellers collapsing onto
+            # one identity — is asserted below, on both sides.
+            #
+            # The offer's merchant id is not free-form either: for a retailer case the writer
+            # derives it FROM THE HOST (`agent_seed::retailer::<host>`,
+            # services/catalog_enrichment_agent/ingestion.derive_merchant_id, pinned by
+            # tests/services/test_curated_retailer_contract.py). Accepting "any non-empty id"
+            # let an offer carry the OTHER seller's id, an unrelated namespace, or the
+            # ADR-009-banned `external_seed` bucket, and still resolve this product.
+            expected_merchant = retailer_merchant_id(host) if case.get("source_role") == "retailer" else None
+
+            def seller_identity_holds(offer):
+                """A retailer offer's id is host-derived and can be matched exactly. A brand
+                offer's is slug-derived (`agent_seed::<slug>`) and cannot — but it still may not
+                be arbitrary: it must be THIS lane's namespace, and never the shared
+                `external_seed` bucket ADR-009 D2 bans and apply.py documents as mintable.
+                Accepting "any non-empty id" for brand cases left the same hole this check
+                closed for retailer ones."""
+                merchant = str(offer.get("merchant_id") or "").strip()
+                if expected_merchant:
+                    return merchant == expected_merchant
+                # The banned-bucket test is unreachable while the bucket has no `agent_seed::`
+                # prefix; asserted anyway, as services/seller_identity.py does, so that a future
+                # rename of the bucket cannot quietly make it acceptable here.
+                if not merchant.startswith(AGENT_SEED_PREFIX) or merchant == BANNED_BUCKET_MERCHANT_ID:
+                    return False
+                # Even unmatchable, it may not be ANOTHER case host's derived identity: that is a
+                # cross-wired seller, which is the collapse this canary exists to catch.
+                others = {retailer_merchant_id(h) for h in case["seller_hosts"] if h != host}
+                return merchant not in others
+
             matching_offers = [offer for offer in (observed.get("offers") or [])
                 if all(offer.get(field) == product.get(field) for field in
-                       ("product_key", "merchant_id", "seller_host", "variant_id", "currency", "market"))]
+                       ("product_key", "seller_host", "variant_id", "currency", "market"))
+                and seller_identity_holds(offer)]
             if not any(urlsplit(str(offer.get("destination_url") or "")).scheme == "https"
                        and (urlsplit(str(offer.get("destination_url") or "")).hostname or "").removeprefix("www.") == host
                        for offer in matching_offers):
@@ -114,7 +213,17 @@ def evaluate(manifest: dict, evidence: dict, *, now=None) -> dict:
                 seller_items.setdefault(host, set()).add((content_key, group_id, gtin))
             surface_key = product.get("canonical_product_key") or key
             for surface in ("search_product_keys", "pdp_product_keys", "offer_product_keys"):
-                if surface_key not in (observed.get(surface) or []):
+                observed_surface = observed.get(surface)
+                # `null` is NOT `[]`. A collector cannot read a door's answer out of the database,
+                # so it emits null; an empty list would say "the door was asked and returned
+                # nothing", which is a different — and testable — claim. Distinguishing them keeps
+                # a never-measured surface from reading as a measured absence.
+                if observed_surface is None:
+                    reasons.append(f"{surface} was not collected from a live door response")
+                elif not isinstance(observed_surface, list):
+                    # A bare string would satisfy `in` by substring, and a bool/number raises.
+                    reasons.append(f"{surface} must be a list of keys")
+                elif surface_key not in observed_surface:
                     reasons.append(f"product missing from {surface}")
         if set(seller_ids) != set(case["seller_hosts"]):
             reasons.append("not every requested retailer has visible evidence")
@@ -122,6 +231,18 @@ def evaluate(manifest: dict, evidence: dict, *, now=None) -> dict:
             ids = [merchant for values in seller_ids.values() for merchant in values]
             if len(set(ids)) != len(ids):
                 reasons.append("retailers collapsed onto the same merchant identity")
+            # The same property on the OFFER side. merchant_id is no longer matched
+            # product-to-offer, so without this a collapse of two sellers' OFFERS onto one
+            # identity — the exact failure this canary exists to detect — would go unnoticed.
+            offer_ids: dict = {}
+            for offer in (observed.get("offers") or []):
+                # Scoped to the case's hosts: an unrelated host reusing one of these ids is not
+                # this case's collapse, and counting it produced a false positive.
+                if offer.get("seller_host") in case["seller_hosts"] and offer.get("merchant_id"):
+                    offer_ids.setdefault(offer["seller_host"], set()).add(offer["merchant_id"])
+            flat = [merchant for values in offer_ids.values() for merchant in values]
+            if len(set(flat)) != len(flat):
+                reasons.append("retailer offers collapsed onto the same merchant identity")
             item_sets = [seller_items.get(host, set()) for host in case["seller_hosts"]]
             if not set.intersection(*item_sets):
                 reasons.append("no shared content key, product group and GTIN across requested retailers")
