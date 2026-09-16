@@ -115,7 +115,7 @@ def evaluate(manifest: dict, evidence: dict, *, now=None) -> dict:
                 reasons.append("missing merchant-issued variant identity")
             if not str(product.get("category_path") or "").startswith(category_prefix):
                 reasons.append(f"product category is not under the case's shelf {category_prefix}")
-            if product.get("inci_source") != case["inci_source"]:
+            if product.get("inci_source") is not None and product["inci_source"] != case["inci_source"]:
                 reasons.append("incorrect ingredient authority")
             # And the authority must be a STORED FACT, not a restatement of intent. The curated
             # mapper stamps inci_source on every retailer record unconditionally, while the row is
@@ -125,8 +125,10 @@ def evaluate(manifest: dict, evidence: dict, *, now=None) -> dict:
             inci_row = product.get("inci_row")
             if not isinstance(inci_row, dict) or not inci_row.get("present"):
                 reasons.append("no stored ingredient row backs inci_source")
-            elif inci_row.get("source_system") != product.get("inci_source"):
-                reasons.append("declared inci_source disagrees with the stored row's source_system")
+            elif inci_row.get("source_system") != case["inci_source"]:
+                # Compared to the CASE, not to a sibling field: the collector writes both, so
+                # comparing them to each other proves only that it is self-consistent.
+                reasons.append("stored ingredient row's source_system is not the case's authority")
             elif not isinstance(inci_row.get("raw_inci_chars"), int) or inci_row["raw_inci_chars"] <= 0:
                 reasons.append("stored ingredient row carries no INCI text")
             host, merchant = product.get("seller_host"), product.get("merchant_id")
@@ -153,6 +155,9 @@ def evaluate(manifest: dict, evidence: dict, *, now=None) -> dict:
                 # a never-measured surface from reading as a measured absence.
                 if observed_surface is None:
                     reasons.append(f"{surface} was not collected from a live door response")
+                elif not isinstance(observed_surface, list):
+                    # A bare string would satisfy `in` by substring, and a bool/number raises.
+                    reasons.append(f"{surface} must be a list of keys")
                 elif surface_key not in observed_surface:
                     reasons.append(f"product missing from {surface}")
         if set(seller_ids) != set(case["seller_hosts"]):

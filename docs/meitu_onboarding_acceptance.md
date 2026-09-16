@@ -45,8 +45,12 @@ No `--apply` is present. Keep its publication gate enabled. A future authorized 
 Record fresh deployed backend/gateway revisions and source artifact references with complete scan counts, exact product/variant/merchant keys, returned currencies and market. Capture actual search, PDP and offers responses, plus a controlled second-ingest product/SKU/offer key diff and identity failure list. The saved offers must identify each retailer, native variant, market, currency and actual retailer destination; a shared canonical product key alone does not prove that both offers resolve. The evidence schema is documented in `scripts/validate_meitu_canary_evidence.py`. The database-backed half of that file is produced by `scripts/collect_curated_canary_evidence.py`, not typed:
 
 ```sh
-python -m scripts.collect_curated_canary_evidence --manifest data/review_canaries/meitu_brand_retailer_matrix.json --case-id <case> --output collected.json
+IMAGE=us-west1-docker.pkg.dev/pivota-shared/pivota/backend:<sha> \
+  scripts/ops/run_oneoff_job.sh -m scripts.collect_curated_canary_evidence \
+  --manifest data/review_canaries/meitu_brand_retailer_matrix.json --case-id <case>
 ```
+
+It prints the JSON to **stdout** (the one-off runner deletes the job on every exit path, so a file written inside the container is gone), and prints `NOTE`/`DIGEST`/`SUMMARY` lines to stderr. The digest covers the database-backed subset: compare it against the file you were handed. That is a tamper *check*, not attestation — provenance fields are strings a person can type, and this makes an edit detectable by a reviewer who looks, nothing more. The job refuses to emit at all when it cannot resolve the image's commit sha, rather than producing a file the validator rejects for a reason that looks like a data problem.
 
 It reads products, SKUs (variant id and its provenance, which live inside `sku_payload`), offers and the `beauty_sku_ingredients` row, and stamps `evidence_provenance`. A value it cannot read is emitted as `null` with a reason, never as a plausible default — a default is indistinguishable from a measurement once it is in the JSON. The live surfaces (`search_product_keys`, `pdp_product_keys`, `offer_product_keys`), the crawl report, the second-ingest diffs and `identity_failures` are **not collected**: they are door responses and job outputs, not rows. They stay `null`, which FAILS validation until the actual probes are run and merged — `null` means never asked, `[]` means asked and empty, and collapsing the two is how a never-measured surface reads as a measured result.
 

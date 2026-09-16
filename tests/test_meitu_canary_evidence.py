@@ -259,12 +259,20 @@ def test_a_declared_ingredient_authority_needs_a_stored_row_behind_it():
     assert any("no stored ingredient row" in r for r in result["cases"][0]["reasons"])
 
 
-def test_a_stored_row_that_disagrees_with_the_claim_cannot_pass():
+def test_a_stored_row_that_disagrees_with_the_case_cannot_pass():
+    """Compared against the CASE, not a sibling field: the collector writes both the row and any
+    declared source, so comparing those two to each other proves only self-consistency."""
     data = evidence()
     data["same_brand"]["products"][0]["inci_row"]["source_system"] = "brand_official"
     result = evaluate(MANIFEST, data, now=NOW)
     assert result["failed"] == 1
-    assert any("disagrees with the stored row" in r for r in result["cases"][0]["reasons"])
+    assert any("not the case's authority" in r for r in result["cases"][0]["reasons"])
+
+    # A file that agrees with ITSELF while disagreeing with the case is still refused.
+    data = evidence()
+    data["same_brand"]["products"][0]["inci_source"] = "brand_official"
+    data["same_brand"]["products"][0]["inci_row"]["source_system"] = "brand_official"
+    assert evaluate(MANIFEST, data, now=NOW)["failed"] == 1
 
     # A row that exists but holds no text is not authority either.
     data = evidence()

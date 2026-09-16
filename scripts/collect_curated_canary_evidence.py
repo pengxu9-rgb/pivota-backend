@@ -30,12 +30,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from config.platform import commit_sha
 from services.catalog_identity import validated_source_gtin as canonical_gtin
 
 COLLECTOR = "collect_curated_canary_evidence/v1"
@@ -48,22 +51,28 @@ SURFACE_REASON = (
     "probes against the deployed gateway and merge their ACTUAL returned keys before validating."
 )
 
+#: catalog_products carries NO market/currency columns — those live on the offer and SKU rows
+#: this lane writes (ingestion.py). Selecting them here raised UndefinedColumnError on the very
+#: first query, which a fake connection supplying those keys hid completely.
 PRODUCT_SQL = """
-SELECT p.product_key, p.merchant_id, p.source_domain, p.market, p.currency, p.gtin,
-       p.category_path, p.content_key, p.brand, p.title, p.pivota_signature_id
+SELECT p.product_key, p.merchant_id, p.platform, p.source_product_id, p.source_domain,
+       p.gtin, p.category_path, p.content_key, p.brand, p.title, p.pivota_signature_id
   FROM catalog_products p
  WHERE lower(coalesce(p.source_domain, '')) = ANY($1::text[])
    AND p.gtin IS NOT NULL
+   AND p.suppressed_at IS NULL
 """
 
 SKU_SQL = """
-SELECT s.product_key, s.sku_key, s.source_variant_id, s.sku_payload
+SELECT s.product_key, s.sku_key, s.source_variant_id, s.sku_payload, s.currency
   FROM catalog_skus s
  WHERE s.product_key = ANY($1::text[])
+   AND s.suppressed_at IS NULL
+ ORDER BY s.sku_key
 """
 
 OFFER_SQL = """
-SELECT o.product_key, o.merchant_id, o.currency, o.market, o.offer_type, o.offer_mode,
+SELECT o.product_key, o.sku_key, o.merchant_id, o.currency, o.market, o.offer_type, o.offer_mode,
        o.source_domain, coalesce(o.offer_payload->>'destination_url', o.source_ref) AS destination_url
   FROM catalog_offers o
  WHERE o.product_key = ANY($1::text[]) AND o.suppressed_at IS NULL
@@ -75,10 +84,19 @@ SELECT b.product_key, b.source_system, coalesce(length(b.raw_inci), 0) AS raw_in
  WHERE b.product_key = ANY($1::text[])
 """
 
+#: product_group_members is keyed by the MERCHANT-SCOPED platform identity
+#: (merchant_id, platform, platform_product_id) — migration 045 — not by product_key. Every other
+#: reader in the repo joins it this way (agent_pdp_view_assembler, pdp_identity_recovery); querying
+#: a product_key column that does not exist reported "no group" for products that HAVE one, which
+#: would make every multi-seller case structurally unpassable.
 GROUP_SQL = """
-SELECT product_key, product_group_id
-  FROM product_group_members
- WHERE product_key = ANY($1::text[])
+SELECT p.product_key, m.product_group_id
+  FROM product_group_members m
+  JOIN catalog_products p
+    ON p.merchant_id = m.merchant_id
+   AND p.platform = m.platform
+   AND p.source_product_id = m.platform_product_id
+ WHERE p.product_key = ANY($1::text[])
 """
 
 
@@ -102,6 +120,11 @@ def _payload_variant_provenance(sku_payload: Any) -> Optional[str]:
 async def collect(conn: Any, case: Dict[str, Any], *, now: Optional[datetime] = None) -> Dict[str, Any]:
     """Build one case's evidence from rows. `conn` needs only `fetch(sql, *args)`."""
     now = now or datetime.now(timezone.utc)
+    # The build that produced these rows, resolved the way the image records it: a one-off job
+    # gets NO PIVOTA_COMMIT_SHA from the runner, only the sha baked into /app/.image_commit_sha.
+    # Reading the env alone left backend_revision null, and the validator then refused this
+    # collector's own output — a contract that defeats itself.
+    revision = commit_sha()
     hosts = [str(h).strip().lower() for h in (case.get("seller_hosts") or [])]
     target = canonical_gtin(case.get("target_gtin")) if case.get("target_gtin") else None
     notes: List[str] = []
@@ -123,12 +146,32 @@ async def collect(conn: Any, case: Dict[str, Any], *, now: Optional[datetime] = 
     group_by_key = {str(g["product_key"]): g.get("product_group_id") for g in groups}
     inci_by_key = {str(i["product_key"]): i for i in incis}
 
+    sku_by_key = {str(s_["sku_key"]): s_ for s_ in skus}
+    offers_by_product: Dict[str, List[Dict[str, Any]]] = {}
+    for offer in offers:
+        offers_by_product.setdefault(str(offer["product_key"]), []).append(offer)
+
     products: List[Dict[str, Any]] = []
     for row in rows:
         key = str(row["product_key"])
-        variants = [s for s in skus if str(s["product_key"]) == key
-                    and str(s.get("source_variant_id") or "") not in ("", key)]
-        variant = variants[0] if variants else None
+        own_offers = offers_by_product.get(key, [])
+        # market/currency are facts of the OFFER row, not of catalog_products (which has neither
+        # column). Disagreement between a product's offers is reported, never averaged away.
+        markets = sorted({str(o.get("market")) for o in own_offers if o.get("market")})
+        currencies = sorted({str(o.get("currency")) for o in own_offers if o.get("currency")})
+        if len(markets) > 1 or len(currencies) > 1:
+            notes.append(f"{key}: offers disagree on market/currency {markets}/{currencies}")
+
+        # The canonical SKU restates the product key as its source_variant_id and is not a
+        # merchant variant (the validator rejects exactly that), so it is excluded. More than one
+        # real variant is AMBIGUOUS: picking the first would report an arbitrary id as "the"
+        # merchant variant, which is a measurement no one made.
+        variants = [s_ for s_ in skus if str(s_["product_key"]) == key
+                    and str(s_.get("source_variant_id") or "") not in ("", key)]
+        variant = variants[0] if len(variants) == 1 else None
+        if len(variants) > 1:
+            notes.append(f"{key}: {len(variants)} merchant variants; variant_id not collected "
+                         f"(declare which one the case observes)")
         inci = inci_by_key.get(key)
         products.append({
             "product_key": key,
@@ -137,26 +180,27 @@ async def collect(conn: Any, case: Dict[str, Any], *, now: Optional[datetime] = 
             "brand": row.get("brand"),
             "seller_host": row.get("source_domain"),
             "merchant_id": row.get("merchant_id"),
-            "currency": row.get("currency"),
-            "market": row.get("market"),
+            "currency": currencies[0] if len(currencies) == 1 else None,
+            "market": markets[0] if len(markets) == 1 else None,
             "gtin": row.get("gtin"),
             "category_path": row.get("category_path"),
             "variant_id": (variant or {}).get("source_variant_id"),
             "variant_id_provenance": _payload_variant_provenance((variant or {}).get("sku_payload")),
             # The INCI FACT, not a restatement of intent: source_system is what the row carries,
             # and 0 chars with present=false is the honest answer for a product whose seller
-            # publishes no ingredient list.
+            # publishes no ingredient list. Deliberately NOT accompanied by a separate
+            # `inci_source` field: writing both and then comparing them proves only that this
+            # collector is self-consistent. The validator compares this to the CASE's declaration.
             "inci_row": {
                 "present": bool(inci),
                 "source_system": (inci or {}).get("source_system"),
                 "raw_inci_chars": int((inci or {}).get("raw_inci_chars") or 0),
             },
-            "inci_source": (inci or {}).get("source_system"),
         })
 
     evidence: Dict[str, Any] = {
         "observed_at": now.isoformat().replace("+00:00", "Z"),
-        "backend_revision": os.getenv("PIVOTA_COMMIT_SHA") or None,
+        "backend_revision": revision,
         "gateway_revision": None,
         "source_artifacts": [],
         "crawl": None,
@@ -165,8 +209,11 @@ async def collect(conn: Any, case: Dict[str, Any], *, now: Optional[datetime] = 
             "product_key": str(o["product_key"]),
             "merchant_id": o.get("merchant_id"),
             "seller_host": o.get("source_domain"),
-            "variant_id": next((p["variant_id"] for p in products
-                                if p["product_key"] == str(o["product_key"])), None),
+            # The offer's OWN sku, not the product's: copying the product's variant here makes
+            # the validator's (product_key, variant_id, ...) tuple check true by construction,
+            # whichever SKU the offer row actually references.
+            "sku_key": o.get("sku_key"),
+            "variant_id": (sku_by_key.get(str(o.get("sku_key") or "")) or {}).get("source_variant_id"),
             "currency": o.get("currency"),
             "market": o.get("market"),
             "destination_url": o.get("destination_url"),
@@ -180,11 +227,14 @@ async def collect(conn: Any, case: Dict[str, Any], *, now: Optional[datetime] = 
         "evidence_provenance": {
             "collector": COLLECTOR,
             "collected_at": now.isoformat().replace("+00:00", "Z"),
-            "backend_revision": os.getenv("PIVOTA_COMMIT_SHA") or None,
+            "backend_revision": revision,
             "case_id": case.get("case_id"),
             "queries": [PRODUCT_SQL.strip(), SKU_SQL.strip(), OFFER_SQL.strip(),
                         INCI_SQL.strip(), GROUP_SQL.strip()],
             "products_read": len(rows),
+            "products_by_host": {host: sum(1 for r in rows
+                                           if str(r.get("source_domain") or "").lower() == host)
+                                 for host in hosts},
             "notes": notes,
             "not_collected": {
                 **{surface: SURFACE_REASON for surface in SURFACES},
@@ -203,6 +253,18 @@ async def collect(conn: Any, case: Dict[str, Any], *, now: Optional[datetime] = 
     return evidence
 
 
+def content_digest(evidence: Dict[str, Any]) -> str:
+    """Hash of the DB-backed subset, printed to the job log.
+
+    Provenance fields are three strings anyone can type; this is not a signature and does not
+    make the file trustworthy. What it does buy: a reviewer can compare the digest in the job's
+    Cloud Logging output against the digest of the file they were handed, so an edited file is
+    detectable by someone who bothers to look. Say that plainly rather than implying attestation.
+    """
+    subset = {k: evidence.get(k) for k in ("products", "offers")}
+    return hashlib.sha256(json.dumps(subset, sort_keys=True, default=str).encode()).hexdigest()[:32]
+
+
 async def _main(args: argparse.Namespace) -> int:
     import asyncpg
 
@@ -212,7 +274,10 @@ async def _main(args: argparse.Namespace) -> int:
         raise SystemExit(f"case {args.case_id!r} is not in the manifest ({', '.join(sorted(cases))})")
 
     url = os.environ["DATABASE_URL"].replace("postgresql+asyncpg://", "postgresql://")
-    conn = await asyncpg.connect(url)
+    # The runner's DB_*_TIMEOUT_SECONDS reach db/database.py, not raw asyncpg, and
+    # lower(source_domain) is unindexed — an unbounded sequential scan on the 2-vCPU prod
+    # instance is how this lane has wedged connections before.
+    conn = await asyncpg.connect(url, timeout=30, command_timeout=180)
     try:
         tr = conn.transaction(readonly=True)
         await tr.start()
@@ -223,10 +288,28 @@ async def _main(args: argparse.Namespace) -> int:
     finally:
         await conn.close()
 
-    Path(args.output).write_text(json.dumps({args.case_id: evidence}, indent=2) + "\n")
-    print(json.dumps({"case_id": args.case_id, "products": len(evidence["products"]),
-                      "offers": len(evidence["offers"]), "output": args.output,
-                      "surfaces": "not_collected"}))
+    if not evidence["evidence_provenance"]["backend_revision"]:
+        # Refusing beats emitting a file the validator will reject for a reason that looks like
+        # a data problem rather than "this did not run on a stamped image".
+        print("REFUSED: no commit sha (not a stamped image, and PIVOTA_COMMIT_SHA unset); "
+              "run this on the prod backend image", file=sys.stderr)
+        return 2
+
+    document = {args.case_id: evidence}
+    rendered = json.dumps(document, indent=2, sort_keys=True)
+    # STDOUT, always: under scripts/ops/run_oneoff_job.sh the container is deleted on every exit
+    # path and only stdout/stderr survive in Cloud Logging, so a file written inside it is gone.
+    print(rendered)
+    if args.output:
+        Path(args.output).write_text(rendered + "\n")
+    for note in evidence["evidence_provenance"]["notes"]:
+        print("NOTE " + note, file=sys.stderr)
+    print("DIGEST " + content_digest(evidence), file=sys.stderr)
+    print("SUMMARY " + json.dumps({
+        "case_id": args.case_id, "products": len(evidence["products"]),
+        "offers": len(evidence["offers"]),
+        "products_by_host": evidence["evidence_provenance"]["products_by_host"],
+        "surfaces": "not_collected"}), file=sys.stderr)
     return 0
 
 
@@ -234,7 +317,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--case-id", required=True)
-    parser.add_argument("--output", required=True)
+    parser.add_argument("--output", help="also write the JSON here; stdout always carries it")
     return asyncio.run(_main(parser.parse_args(argv)))
 
 

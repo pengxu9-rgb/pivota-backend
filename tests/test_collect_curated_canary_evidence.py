@@ -24,7 +24,18 @@ CASE = {
 
 
 class FakeConn:
-    """Answers by statement shape, so the collector's real SQL text is exercised."""
+    """Answers by the statement's FROM target.
+
+    Matching on a bare table-name substring is what let the original SQL ship broken: the group
+    query also mentions catalog_products, so a substring match answered it with product rows. This
+    still cannot validate column names — `test_every_selected_column_exists_in_the_schema` and the
+    Postgres EXPLAIN test do that.
+    """
+
+    FROMS = (("FROM catalog_products", "catalog_products"), ("FROM catalog_skus", "catalog_skus"),
+             ("FROM catalog_offers", "catalog_offers"),
+             ("FROM beauty_sku_ingredients", "beauty_sku_ingredients"),
+             ("FROM product_group_members", "product_group_members"))
 
     def __init__(self, products=(), skus=(), offers=(), incis=(), groups=(), group_error=None):
         self.rows = {"catalog_products": list(products), "catalog_skus": list(skus),
@@ -35,17 +46,19 @@ class FakeConn:
 
     async def fetch(self, sql, *args):
         self.seen.append((sql, args))
-        for table, rows in self.rows.items():
-            if table in sql:
+        for needle, table in self.FROMS:
+            if needle in sql:
                 if table == "product_group_members" and self.group_error:
                     raise self.group_error
-                return rows
+                return self.rows[table]
         raise AssertionError(f"unexpected statement: {sql[:60]}")
 
 
 def product_row(host, key, **overrides):
-    row = {"product_key": key, "merchant_id": f"merch_{host}", "source_domain": host,
-           "market": "US", "currency": "USD", "gtin": "08809486681497",
+    # NOTE: no market/currency — catalog_products has neither column. Supplying them here is
+    # what hid a query that could not run at all.
+    row = {"product_key": key, "merchant_id": f"merch_{host}", "platform": "external_seed",
+           "source_product_id": key.split(":")[-1], "source_domain": host, "gtin": "08809486681497",
            "category_path": "beauty/skincare/cleanse/cleanser", "content_key": "ck_shared",
            "brand": "Pyunkang Yul", "title": "Deep Clear Cleansing Balm",
            "pivota_signature_id": "sig_x"}
@@ -67,8 +80,11 @@ async def test_it_reports_the_stored_ingredient_row_it_found():
     out = await collect(conn, CASE)
     product = out["products"][0]
     assert product["inci_row"] == {"present": True, "source_system": "reseller_listing", "raw_inci_chars": 868}
-    assert product["inci_source"] == "reseller_listing"
+    # Deliberately NOT accompanied by a sibling inci_source: the validator compares the stored
+    # row to the CASE, because a collector that writes both proves only its own consistency.
+    assert "inci_source" not in product
     assert product["product_group_id"] == "pg_1"
+    assert product["market"] == "US" and product["currency"] == "USD"
     # Provenance is read out of sku_payload JSON, which arrives as TEXT from asyncpg.
     assert product["variant_id"] == "45001"
     assert product["variant_id_provenance"] == "merchant_issued"
@@ -80,7 +96,7 @@ async def test_a_product_with_no_stored_ingredients_says_so_rather_than_claiming
     conn = FakeConn(products=[product_row("eyurs.com", "ext:retailer:a")])
     product = (await collect(conn, CASE))["products"][0]
     assert product["inci_row"] == {"present": False, "source_system": None, "raw_inci_chars": 0}
-    assert product["inci_source"] is None
+    assert "inci_source" not in product
     assert product["variant_id"] is None and product["variant_id_provenance"] is None
 
 
@@ -138,3 +154,100 @@ async def test_the_canonical_sku_stub_is_not_offered_as_a_merchant_variant():
     )
     product = (await collect(conn, CASE))["products"][0]
     assert product["variant_id"] is None
+
+
+def test_every_selected_column_exists_in_the_schema():
+    """The fake connection cannot see a column name, and that is how the first version shipped
+    selecting catalog_products.market/currency — columns that table does not have. This compares
+    each statement's `alias.column` tokens against the model metadata."""
+    import re
+
+    from db.catalog import beauty_sku_ingredients, catalog_offers, catalog_products, catalog_skus
+    from scripts.collect_curated_canary_evidence import INCI_SQL, OFFER_SQL, PRODUCT_SQL, SKU_SQL
+
+    for sql, alias, table in ((PRODUCT_SQL, "p", catalog_products), (SKU_SQL, "s", catalog_skus),
+                              (OFFER_SQL, "o", catalog_offers), (INCI_SQL, "b", beauty_sku_ingredients)):
+        referenced = set(re.findall(rf"\b{alias}\.([a-z_]+)", sql))
+        known = set(table.c.keys())
+        assert referenced <= known, (
+            f"{table.name}: {sorted(referenced - known)} not in the schema — "
+            f"this raises UndefinedColumnError against the real database")
+        assert referenced, f"no {alias}.column tokens found in the statement for {table.name}"
+
+
+async def test_an_offer_reports_its_own_skus_variant_not_the_products():
+    """Copying the product's variant into the offer makes the validator's
+    (product_key, variant_id, ...) tuple check true by construction."""
+    conn = FakeConn(
+        products=[product_row("eyurs.com", "ext:retailer:a")],
+        skus=[{"product_key": "ext:retailer:a", "sku_key": "sku_one", "source_variant_id": "45001",
+               "sku_payload": json.dumps({"variant_id_provenance": "merchant_issued"})},
+              {"product_key": "ext:retailer:a", "sku_key": "sku_two", "source_variant_id": "45002",
+               "sku_payload": json.dumps({"variant_id_provenance": "merchant_issued"})}],
+        offers=[{"product_key": "ext:retailer:a", "sku_key": "sku_two", "merchant_id": "m",
+                 "currency": "USD", "market": "US", "offer_type": "retailer", "offer_mode": "redirect",
+                 "source_domain": "eyurs.com", "destination_url": "https://eyurs.com/products/x"}],
+    )
+    out = await collect(conn, CASE)
+    assert out["offers"][0]["variant_id"] == "45002", "the offer must report the SKU it references"
+
+
+async def test_more_than_one_merchant_variant_is_ambiguous_not_arbitrary():
+    """Taking variants[0] from an unordered result reports an arbitrary id as THE merchant
+    variant — a measurement nobody made."""
+    conn = FakeConn(
+        products=[product_row("eyurs.com", "ext:retailer:a")],
+        skus=[{"product_key": "ext:retailer:a", "sku_key": "sku_one", "source_variant_id": "45001",
+               "sku_payload": json.dumps({})},
+              {"product_key": "ext:retailer:a", "sku_key": "sku_two", "source_variant_id": "45002",
+               "sku_payload": json.dumps({})}],
+    )
+    out = await collect(conn, CASE)
+    assert out["products"][0]["variant_id"] is None
+    assert any("merchant variants" in note for note in out["evidence_provenance"]["notes"])
+
+
+async def test_offers_that_disagree_about_market_are_reported():
+    conn = FakeConn(
+        products=[product_row("eyurs.com", "ext:retailer:a")],
+        offers=[{"product_key": "ext:retailer:a", "sku_key": "s1", "merchant_id": "m", "currency": "USD",
+                 "market": "US", "offer_type": "retailer", "offer_mode": "redirect",
+                 "source_domain": "eyurs.com", "destination_url": "https://eyurs.com/x"},
+                {"product_key": "ext:retailer:a", "sku_key": "s2", "merchant_id": "m", "currency": "USD",
+                 "market": "KR", "offer_type": "retailer", "offer_mode": "redirect",
+                 "source_domain": "eyurs.com", "destination_url": "https://eyurs.com/y"}],
+    )
+    out = await collect(conn, CASE)
+    assert out["products"][0]["market"] is None
+    assert any("disagree on market" in note for note in out["evidence_provenance"]["notes"])
+
+
+async def test_a_complete_file_passes_so_the_incompleteness_test_has_a_control():
+    """Without this, 'collected evidence does not pass' would hold for any broken collector."""
+    conn = FakeConn(
+        products=[product_row("eyurs.com", "ext:retailer:a"), product_row("ohlolly.com", "ext:retailer:b")],
+        skus=[{"product_key": f"ext:retailer:{k}", "sku_key": f"sku_{k}", "source_variant_id": f"4500{i}",
+               "sku_payload": json.dumps({"variant_id_provenance": "merchant_issued"})}
+              for i, k in enumerate("ab", start=1)],
+        offers=[{"product_key": f"ext:retailer:{k}", "sku_key": f"sku_{k}", "merchant_id": f"merch_{h}",
+                 "currency": "USD", "market": "US", "offer_type": "retailer", "offer_mode": "redirect",
+                 "source_domain": h, "destination_url": f"https://{h}/products/x"}
+                for k, h in (("a", "eyurs.com"), ("b", "ohlolly.com"))],
+        incis=[{"product_key": "ext:retailer:a", "source_system": "reseller_listing", "raw_inci_chars": 868},
+               {"product_key": "ext:retailer:b", "source_system": "reseller_listing", "raw_inci_chars": 869}],
+        groups=[{"product_key": "ext:retailer:a", "product_group_id": "pg"},
+                {"product_key": "ext:retailer:b", "product_group_id": "pg"}],
+    )
+    out = await collect(conn, CASE)
+    out["gateway_revision"] = "gw"
+    out["source_artifacts"] = ["job.log"]
+    out["evidence_provenance"]["backend_revision"] = out["backend_revision"] = "abc"
+    out["crawl"] = {"status": "complete", "selected_products": 2}
+    keys = [p["product_key"] for p in out["products"]]
+    for surface in SURFACES:
+        out[surface] = list(keys)
+    for field in ("second_ingest_added_product_keys", "second_ingest_added_sku_keys",
+                  "second_ingest_added_offer_keys", "identity_failures"):
+        out[field] = []
+    result = evaluate({"cases": [CASE]}, {"two_sellers": out})
+    assert result["passed"] == 1, result["cases"][0]["reasons"]
