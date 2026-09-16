@@ -170,8 +170,22 @@ async def collect(conn: Any, case: Dict[str, Any], *, now: Optional[datetime] = 
                     and str(s_.get("source_variant_id") or "") not in ("", key)]
         variant = variants[0] if len(variants) == 1 else None
         if len(variants) > 1:
-            notes.append(f"{key}: {len(variants)} merchant variants; variant_id not collected "
-                         f"(declare which one the case observes)")
+            # The manifest may already name the variant this case observes per host; honour that
+            # declaration instead of refusing, but only when the declared id is actually PRESENT
+            # among the rows — a declaration that matches nothing is a stale manifest, not evidence.
+            declared = str((case.get("observed_source_variants") or {}).get(
+                str(row.get("source_domain") or ""), "") or "").strip()
+            chosen = [v for v in variants if str(v.get("source_variant_id") or "") == declared]
+            if declared and chosen:
+                variant = chosen[0]
+                notes.append(f"{key}: {len(variants)} merchant variants; selected the one the case "
+                             f"declares in observed_source_variants ({declared})")
+            elif declared:
+                notes.append(f"{key}: case declares variant {declared} but the stored rows carry "
+                             f"{sorted(str(v.get('source_variant_id')) for v in variants)}")
+            else:
+                notes.append(f"{key}: {len(variants)} merchant variants; variant_id not collected "
+                             f"(declare which one the case observes in observed_source_variants)")
         inci = inci_by_key.get(key)
         products.append({
             "product_key": key,

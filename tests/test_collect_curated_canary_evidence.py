@@ -251,3 +251,142 @@ async def test_a_complete_file_passes_so_the_incompleteness_test_has_a_control()
         out[field] = []
     result = evaluate({"cases": [CASE]}, {"two_sellers": out})
     assert result["passed"] == 1, result["cases"][0]["reasons"]
+
+
+def test_the_group_statement_is_also_checked_against_the_schema():
+    """GROUP_SQL was omitted from the parity check, which is exactly the statement whose broken
+    shape (product_group_members.product_key) the first revision shipped."""
+    import re
+
+    from db.catalog import catalog_products
+    from scripts.collect_curated_canary_evidence import GROUP_SQL
+
+    product_tokens = set(re.findall(r"\bp\.([a-z_]+)", GROUP_SQL))
+    assert product_tokens, "no p.column tokens found in GROUP_SQL"
+    assert product_tokens <= set(catalog_products.c.keys()), sorted(product_tokens)
+
+    # product_group_members has no Table(); parse its real columns out of the migration.
+    from pathlib import Path
+
+    ddl = Path(__file__).resolve().parents[1].joinpath("db/migrations/045_product_groups.sql").read_text()
+    create = ddl.split("CREATE TABLE IF NOT EXISTS product_group_members", 1)[1].split(");", 1)[0]
+    declared = set(re.findall(r"^\s*([a-z_]+)\s+[A-Z]", create, re.MULTILINE))
+    declared |= set(re.findall(r"ADD COLUMN IF NOT EXISTS ([a-z_]+)", ddl))
+    member_tokens = set(re.findall(r"\bm\.([a-z_]+)", GROUP_SQL))
+    assert member_tokens, "no m.column tokens found in GROUP_SQL"
+    assert member_tokens <= declared, (
+        f"{sorted(member_tokens - declared)} are not columns of product_group_members "
+        f"(declared: {sorted(declared)})")
+
+
+async def test_the_statements_carry_the_filters_the_collector_depends_on():
+    """The fake ignores WHERE clauses and the parity regex only checks that a token exists, so
+    dropping a filter is invisible to every other test here. These are the filters whose absence
+    changes WHICH rows become evidence."""
+    conn = FakeConn(products=[product_row("eyurs.com", "ext:retailer:a")])
+    await collect(conn, CASE)
+    sent = {sql for sql, _ in conn.seen}
+    products_sql = next(s for s in sent if "FROM catalog_products p" in s)
+    skus_sql = next(s for s in sent if "FROM catalog_skus" in s)
+    offers_sql = next(s for s in sent if "FROM catalog_offers" in s)
+
+    assert "lower(" in products_sql, "host matching must be case-insensitive"
+    assert "p.suppressed_at IS NULL" in products_sql, "a withdrawn product is not evidence"
+    assert "s.suppressed_at IS NULL" in skus_sql, "a withdrawn SKU is not a merchant variant"
+    assert "o.suppressed_at IS NULL" in offers_sql, "a suppressed offer does not resolve"
+    assert "ORDER BY" in skus_sql, "variant selection must not depend on result order"
+
+
+async def test_a_case_declared_variant_disambiguates_but_only_if_it_exists():
+    skus = [{"product_key": "ext:retailer:a", "sku_key": "s1", "source_variant_id": "45001",
+             "sku_payload": json.dumps({"variant_id_provenance": "merchant_issued"})},
+            {"product_key": "ext:retailer:a", "sku_key": "s2", "source_variant_id": "45002",
+             "sku_payload": json.dumps({"variant_id_provenance": "merchant_issued"})}]
+    case = dict(CASE, observed_source_variants={"eyurs.com": "45002"})
+    out = await collect(FakeConn(products=[product_row("eyurs.com", "ext:retailer:a")], skus=skus), case)
+    assert out["products"][0]["variant_id"] == "45002"
+
+    # A declaration matching nothing is a stale manifest, not evidence.
+    stale = dict(CASE, observed_source_variants={"eyurs.com": "99999"})
+    out = await collect(FakeConn(products=[product_row("eyurs.com", "ext:retailer:a")], skus=skus), stale)
+    assert out["products"][0]["variant_id"] is None
+    assert any("but the stored rows carry" in n for n in out["evidence_provenance"]["notes"])
+
+
+def _fake_asyncpg(monkeypatch, rows=None):
+    """A stand-in for the driver so the entrypoint's own logic is testable offline."""
+    import sys
+    import types
+
+    class FakeTx:
+        async def start(self): return None
+        async def rollback(self): return None
+
+    class Conn(FakeConn):
+        def transaction(self, **kw): return FakeTx()
+        async def close(self): return None
+
+    conn = Conn(**(rows or {"products": []}))
+    module = types.ModuleType("asyncpg")
+
+    async def connect(url, **kwargs):
+        conn.connect_kwargs = kwargs
+        conn.url = url
+        return conn
+
+    module.connect = connect
+    monkeypatch.setitem(sys.modules, "asyncpg", module)
+    return conn
+
+
+def test_it_refuses_to_emit_when_it_cannot_identify_the_build(monkeypatch, tmp_path, capsys):
+    """Emitting anyway produces a file the validator rejects for 'missing revisions' — a reason
+    that reads as a data problem rather than 'this did not run on a stamped image'."""
+    import json as _json
+
+    from scripts import collect_curated_canary_evidence as collector
+
+    _fake_asyncpg(monkeypatch)
+    monkeypatch.setattr(collector, "commit_sha", lambda *a, **k: None)
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://u@h/db")
+    manifest = tmp_path / "m.json"
+    manifest.write_text(_json.dumps({"cases": [CASE]}))
+
+    rc = collector.main(["--manifest", str(manifest), "--case-id", CASE["case_id"]])
+    out = capsys.readouterr()
+    assert rc == 2
+    assert out.out.strip() == "", "nothing may be emitted when the build is unidentifiable"
+    assert "REFUSED" in out.err
+
+
+def test_it_prints_the_evidence_to_stdout_because_the_job_container_is_deleted(monkeypatch, tmp_path, capsys):
+    import json as _json
+
+    from scripts import collect_curated_canary_evidence as collector
+
+    conn = _fake_asyncpg(monkeypatch, {"products": [product_row("eyurs.com", "ext:retailer:a")]})
+    monkeypatch.setattr(collector, "commit_sha", lambda *a, **k: "abc123")
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://u@h/db")
+    manifest = tmp_path / "m.json"
+    manifest.write_text(_json.dumps({"cases": [CASE]}))
+
+    rc = collector.main(["--manifest", str(manifest), "--case-id", CASE["case_id"]])
+    out = capsys.readouterr()
+    assert rc == 0
+    document = _json.loads(out.out)
+    assert document[CASE["case_id"]]["evidence_provenance"]["backend_revision"] == "abc123"
+    assert "DIGEST " in out.err and "SUMMARY " in out.err
+    # The driver URL must lose the SQLAlchemy dialect prefix, and carry timeouts.
+    assert conn.url.startswith("postgresql://")
+    assert conn.connect_kwargs.get("timeout") and conn.connect_kwargs.get("command_timeout")
+
+
+def test_the_digest_covers_the_rows_not_the_header(monkeypatch):
+    """A digest over provenance alone would change with the clock and say nothing about content."""
+    from scripts.collect_curated_canary_evidence import content_digest
+
+    base = {"products": [{"product_key": "a"}], "offers": [], "evidence_provenance": {"collected_at": "t1"}}
+    same_rows_later = {"products": [{"product_key": "a"}], "offers": [], "evidence_provenance": {"collected_at": "t2"}}
+    changed_rows = {"products": [{"product_key": "b"}], "offers": [], "evidence_provenance": {"collected_at": "t1"}}
+    assert content_digest(base) == content_digest(same_rows_later)
+    assert content_digest(base) != content_digest(changed_rows)

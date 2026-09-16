@@ -300,3 +300,46 @@ def test_uncollected_idempotence_and_identity_failures_cannot_pass():
         data = evidence()
         data["same_brand"][field] = None
         assert evaluate(MANIFEST, data, now=NOW)["failed"] == 1, field
+
+
+def test_an_offer_keeps_its_own_merchant_namespace():
+    """The curated lane writes the product under the observed seller-of-record (merch_obs_<hash>)
+    and its offers under agent_seed::retailer::<host> — apply.py does not re-point offers, and
+    test_curated_retailer_contract pins that shape. Demanding the two be equal made every curated
+    retailer case unpassable, so the tuple matches on seller_host/variant/currency/market."""
+    data = evidence()
+    for product, offer in zip(data["same_brand"]["products"], data["same_brand"]["offers"]):
+        product["merchant_id"] = f"merch_obs_{product['seller_host']}"
+        offer["merchant_id"] = f"agent_seed::retailer::{offer['seller_host']}"
+    assert evaluate(MANIFEST, data, now=NOW)["passed"] == 1
+
+
+def test_offers_collapsing_onto_one_merchant_identity_still_fail():
+    """That is the property the old product-to-offer equality was really protecting; dropping it
+    from the tuple must not drop it from the contract."""
+    data = evidence()
+    for product, offer in zip(data["same_brand"]["products"], data["same_brand"]["offers"]):
+        product["merchant_id"] = f"merch_obs_{product['seller_host']}"
+        offer["merchant_id"] = "agent_seed::retailer::one.example"
+    result = evaluate(MANIFEST, data, now=NOW)
+    assert result["failed"] == 1
+    assert any("offers collapsed" in r for r in result["cases"][0]["reasons"])
+
+
+def test_an_offer_without_any_merchant_identity_cannot_resolve():
+    data = evidence()
+    for offer in data["same_brand"]["offers"]:
+        offer["merchant_id"] = ""
+    assert evaluate(MANIFEST, data, now=NOW)["failed"] == 1
+
+
+def test_an_offer_in_another_market_or_currency_does_not_resolve_this_product():
+    """market is a hard serving partition: an offer stamped KR does not make a US product
+    resolvable, and a price in another currency is not this product's price."""
+    for field, other in (("market", "KR"), ("currency", "KRW")):
+        data = evidence()
+        data["same_brand"]["offers"][0][field] = other
+        result = evaluate(MANIFEST, data, now=NOW)
+        assert result["failed"] == 1, field
+        assert any("missing seller-specific resolvable offer" in r
+                   for r in result["cases"][0]["reasons"]), field

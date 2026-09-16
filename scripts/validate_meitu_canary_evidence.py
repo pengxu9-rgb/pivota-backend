@@ -136,9 +136,18 @@ def evaluate(manifest: dict, evidence: dict, *, now=None) -> dict:
                 reasons.append("wrong or missing seller identity")
             # A shared canonical identity cannot prove that BOTH retailers have
             # resolvable offers. Require the actual seller/variant/currency tuple.
+            #
+            # merchant_id is NOT matched product-to-offer: a curated retailer product is written
+            # under the observed seller-of-record (`merch_obs_<hash>`) while its offers keep the
+            # per-host `agent_seed::retailer::<host>` identity — apply.py states outright that
+            # offers are not re-pointed, and tests/services/test_curated_retailer_contract.py pins
+            # that shape. Requiring the two namespaces to be equal made every curated retailer case
+            # unpassable by construction. What that clause protected — two sellers collapsing onto
+            # one identity — is asserted below, on both sides.
             matching_offers = [offer for offer in (observed.get("offers") or [])
                 if all(offer.get(field) == product.get(field) for field in
-                       ("product_key", "merchant_id", "seller_host", "variant_id", "currency", "market"))]
+                       ("product_key", "seller_host", "variant_id", "currency", "market"))
+                and str(offer.get("merchant_id") or "").strip()]
             if not any(urlsplit(str(offer.get("destination_url") or "")).scheme == "https"
                        and (urlsplit(str(offer.get("destination_url") or "")).hostname or "").removeprefix("www.") == host
                        for offer in matching_offers):
@@ -166,6 +175,16 @@ def evaluate(manifest: dict, evidence: dict, *, now=None) -> dict:
             ids = [merchant for values in seller_ids.values() for merchant in values]
             if len(set(ids)) != len(ids):
                 reasons.append("retailers collapsed onto the same merchant identity")
+            # The same property on the OFFER side. merchant_id is no longer matched
+            # product-to-offer, so without this a collapse of two sellers' OFFERS onto one
+            # identity — the exact failure this canary exists to detect — would go unnoticed.
+            offer_ids: dict = {}
+            for offer in (observed.get("offers") or []):
+                if offer.get("seller_host") and offer.get("merchant_id"):
+                    offer_ids.setdefault(offer["seller_host"], set()).add(offer["merchant_id"])
+            flat = [merchant for values in offer_ids.values() for merchant in values]
+            if len(set(flat)) != len(flat):
+                reasons.append("retailer offers collapsed onto the same merchant identity")
             item_sets = [seller_items.get(host, set()) for host in case["seller_hosts"]]
             if not set.intersection(*item_sets):
                 reasons.append("no shared content key, product group and GTIN across requested retailers")
