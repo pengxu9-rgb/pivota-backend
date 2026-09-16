@@ -27,6 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from services.catalog_identity import validated_source_gtin  # noqa: E402
 from services.catalog_enrichment_agent.apply import apply_ingest_plan  # noqa: E402
 from services.catalog_enrichment_agent.ingestion import ingest_validated_jsonl  # noqa: E402
 from services.catalog_enrichment_agent.primary_ingestion import (  # noqa: E402
@@ -138,6 +139,32 @@ def _effective_print_limit(args: argparse.Namespace) -> int:
     return 0 if args.apply else _PLAN_PRINT_DEFAULT
 
 
+def _select_by_gtin(records: List[Dict[str, Any]], wanted: List[str], *, domain: str) -> List[Dict[str, Any]]:
+    """Keep only the records whose GTIN is one of `wanted`.
+
+    An acceptance case is about specific products, but the vendor filter is the narrowest tool the
+    lane had: a Pyunkang Yul run at eyurs.com selects 10 products, 7 of which carry a merchant
+    product_type this taxonomy does not map, so the whole cohort lands `category_unresolved` and
+    apply refuses it — over products the case never wanted.
+
+    Matching uses the same GS1 normalisation as the acceptance boundary (validated_source_gtin), so
+    a 13-digit merchant barcode and the 14-digit stored form are the same product here. A record
+    with no usable GTIN cannot match and is dropped.
+
+    A filter that matches NOTHING raises, mirroring --only-vendor: an empty run that looks like a
+    clean one is how a canary certifies a cohort it never actually selected.
+    """
+    canonical = {g for g in (validated_source_gtin(value) for value in wanted) if g}
+    if not canonical:
+        raise ValueError("--only-gtin needs at least one valid GS1 GTIN")
+    kept = [r for r in records
+            if validated_source_gtin((r.get("pdp") or {}).get("gtin")
+                                     or (r.get("pdp") or {}).get("barcode")) in canonical]
+    if not kept:
+        raise ValueError(f"{domain}: --only-gtin matched none of the selected products")
+    return kept
+
+
 async def _run(args: argparse.Namespace) -> int:
     brands = _read_brand_list(args)
     if not brands:
@@ -177,6 +204,10 @@ async def _run(args: argparse.Namespace) -> int:
                 f"{vendor_report['before']} -> {vendor_report['after']} products"
             )
             records_for_brand.last_vendor_filter_report = None  # type: ignore[attr-defined]
+        if args.only_gtin:
+            before = len(recs)
+            recs = _select_by_gtin(recs, args.only_gtin, domain=b["domain"])
+            print(f"    gtin filter {sorted(args.only_gtin)}: {before} -> {len(recs)} products")
         print(f"  {b['domain']}: {len(recs)} products")
         # A brand-family storefront must not ingest silently. misshaus.com shipped 17
         # A'pieu products into the index branded "Missha" because nothing printed the
@@ -292,6 +323,18 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="Recover missing barcodes from identity-matched product .js; opt-in, no price changes")
     p.add_argument("--max-pdp-identity-fetches", type=int, default=100,
                    help="Selected-product recovery attempt budget (0 disables requests; up to two redirects each)")
+    p.add_argument(
+        "--only-gtin",
+        action="append",
+        default=[],
+        metavar="GTIN",
+        help=(
+            "keep only products carrying this GTIN (repeatable). Narrows a cohort to the exact "
+            "products a case is about, so unrelated products whose merchant product_type this "
+            "taxonomy cannot map do not block the apply. Matched with GS1 normalisation, so 13- "
+            "and 14-digit spellings agree; a filter matching nothing is an error, not an empty run."
+        ),
+    )
     p.add_argument("--plan-print-limit", type=int, default=None, metavar="N",
                    help="print identity (product_key/gtin/category_path/variant ids/...) for at "
                         "most N planned PDPs; 0 prints every row. Printed for dry-run AND --apply. "
