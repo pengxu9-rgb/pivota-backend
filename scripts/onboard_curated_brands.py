@@ -72,6 +72,33 @@ _PLAN_IDENTITY_FIELDS = (
 )
 
 
+#: Dry-run default. --apply defaults to printing EVERY row instead (see _effective_print_limit):
+#: on apply the print is the only record of what was about to be written, and a 269-PDP
+#: runbook cohort truncated at 50 leaves 81% of the write undisclosed.
+_PLAN_PRINT_DEFAULT = 50
+
+#: Printed beside the row's own fields but DERIVED from plan["skus"], not read off the PDP row.
+_PLAN_DERIVED_FIELDS = ("variant_ids", "variant_count")
+
+
+def _variant_ids_by_product(plan: Dict[str, Any]) -> Dict[str, List[str]]:
+    """Merchant variant ids per product, from the planned SKUs.
+
+    The canonical SKU restates the product_key as its `source_variant_id`
+    (ingestion.derive_variant_sku_key's sibling path), which is not a merchant variant —
+    and `validate_meitu_canary_evidence.py` rejects exactly that (`variant_id` starting
+    `ext:`/`sig_`, or provenance != merchant_issued). Only the real ones are listed.
+    """
+    out: Dict[str, List[str]] = {}
+    for sku in plan.get("skus") or []:
+        product_key = str(sku.get("product_key") or "")
+        variant_id = str(sku.get("source_variant_id") or "")
+        if not product_key or not variant_id or variant_id == product_key:
+            continue
+        out.setdefault(product_key, []).append(variant_id)
+    return out
+
+
 def _print_plan_identity(plan: Dict[str, Any], *, limit: int) -> None:
     """Print WHICH products a plan contains, not just how many.
 
@@ -83,14 +110,32 @@ def _print_plan_identity(plan: Dict[str, Any], *, limit: int) -> None:
 
     It runs for BOTH dry-run and --apply: the apply path re-crawls and re-plans, so the
     rows it is about to write are not necessarily the rows that were reviewed.
+
+    `ensure_ascii=False` because a gate greps these lines: escaping a Korean or accented
+    title to \\uXXXX makes the very cohort this lane exists for unsearchable.
     """
     pdps = plan.get("pdps") or []
+    variants = _variant_ids_by_product(plan)
     shown = pdps if limit <= 0 or len(pdps) <= limit else pdps[:limit]
     for row in shown:
-        print("    pdp " + json.dumps({k: row.get(k) for k in _PLAN_IDENTITY_FIELDS}, sort_keys=True))
+        disclosed = {k: row.get(k) for k in _PLAN_IDENTITY_FIELDS}
+        ids = variants.get(str(row.get("product_key") or ""), [])
+        # Variant identity is re-keyed or dropped by apply AFTER this print
+        # (apply._resolve_offer_keys / _adopt_existing_sku_identities), so this is the
+        # planned intent, not a guarantee of what lands.
+        disclosed["variant_ids"] = ids[:8]
+        disclosed["variant_count"] = len(ids)
+        print("    pdp " + json.dumps(disclosed, sort_keys=True, ensure_ascii=False))
     if len(shown) < len(pdps):
         print(f"    ... {len(pdps) - len(shown)} further PDP row(s) not printed "
               f"(raise --plan-print-limit, 0 prints all)")
+
+
+def _effective_print_limit(args: argparse.Namespace) -> int:
+    """An explicit --plan-print-limit always wins; otherwise apply discloses everything."""
+    if args.plan_print_limit is not None:
+        return args.plan_print_limit
+    return 0 if args.apply else _PLAN_PRINT_DEFAULT
 
 
 async def _run(args: argparse.Namespace) -> int:
@@ -167,7 +212,7 @@ async def _run(args: argparse.Namespace) -> int:
         f"skipped={plan.get('skipped')}"
     )
     print("primary ingestion: " + json.dumps(inspect_primary_plan(plan), sort_keys=True))
-    _print_plan_identity(plan, limit=args.plan_print_limit)
+    _print_plan_identity(plan, limit=_effective_print_limit(args))
     if not args.apply:
         print("  DRY-RUN — re-run with --apply to ingest as depositable anchors.")
         return 0
@@ -247,9 +292,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="Recover missing barcodes from identity-matched product .js; opt-in, no price changes")
     p.add_argument("--max-pdp-identity-fetches", type=int, default=100,
                    help="Selected-product recovery attempt budget (0 disables requests; up to two redirects each)")
-    p.add_argument("--plan-print-limit", type=int, default=50, metavar="N",
-                   help="print identity (product_key/gtin/category_path/...) for at most N planned "
-                        "PDPs; 0 prints every row. Printed for dry-run AND --apply")
+    p.add_argument("--plan-print-limit", type=int, default=None, metavar="N",
+                   help="print identity (product_key/gtin/category_path/variant ids/...) for at "
+                        "most N planned PDPs; 0 prints every row. Printed for dry-run AND --apply. "
+                        f"Default: {_PLAN_PRINT_DEFAULT} on a dry run, ALL rows with --apply")
     p.add_argument("--apply", action="store_true", help="ingest (else dry-run plan)")
     args = p.parse_args(argv)
     try:
