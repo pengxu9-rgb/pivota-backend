@@ -419,15 +419,20 @@ def _offer_variants_from_node(offers: Any, product_name: Optional[str]) -> list[
         availability_raw = offer.get("availability") or item.get("availability")
         availability = _availability_from_raw(str(availability_raw)) if availability_raw else "unknown"
 
-        variants.append(
-            {
-                "variant_id": str(variant_id),
-                "title": str(title).strip() if title else None,
-                "price_amount": _parse_price(price_raw) if price_raw else None,
-                "price_currency": currency,
-                "availability": availability,
-            }
-        )
+        entry = {
+            "variant_id": str(variant_id),
+            "title": str(title).strip() if title else None,
+            "price_amount": _parse_price(price_raw) if price_raw else None,
+            "price_currency": currency,
+            "availability": availability,
+        }
+        # Additive. A Shopify Dawn-theme Offer with a blank `sku` and no `@id` otherwise
+        # reaches the refresh as a positional `offer_N`, which can never be matched to a
+        # stored shade; its `url` carries `?variant=<id>`, which can.
+        offer_url = offer.get("url") or item.get("url")
+        if isinstance(offer_url, str) and offer_url.strip():
+            entry["offer_url"] = offer_url.strip()
+        variants.append(entry)
 
         if len(variants) >= MAX_VARIANTS:
             break

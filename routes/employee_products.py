@@ -854,8 +854,15 @@ def _variant_match_keys(variant: Dict[str, Any]) -> List[str]:
     offer's `@id` and emits `/products/<handle>?variant=50856826536257#offer`. Measured
     against the live jsmbeauty.sg page: 12 crawled variants, 0 raw-id matches, 0 prices
     moved. So the numeric Shopify id is extracted from the query-string and GID forms,
-    and `sku` is offered as a second key on both sides (the sibling
-    `_distinct_variant_ids` already treats it as identity).
+    and from the crawled Offer's `offer_url`.
+
+    THE CRAWL HAS NO `sku` FIELD. The extractor puts an Offer's sku INTO `variant_id`
+    (Shopify's Dawn theme: per-variant `Product.offers[]`, each with its own `sku`), so
+    an id that is not Shopify-id-shaped is also offered as `sku:<text>` -- on both
+    sides, which is what lets a crawled `JSM-LP-01` meet a stored `sku: JSM-LP-01`.
+    That makes a PRODUCT-level sku, repeated on every stored shade, a key too; the
+    merge refuses any key more than one stored variant holds, so it never fans one
+    price out across shades.
 
     Positional `offer_N` ids are NEVER a key: they encode the order offers appeared on
     the page, so a reordered page would write one shade's price onto another.
@@ -869,9 +876,14 @@ def _variant_match_keys(variant: Dict[str, Any]) -> List[str]:
         if not text or _POSITIONAL_OFFER_ID.match(text):
             continue
         match = _SHOPIFY_VARIANT_QUERY_ID.search(text) or _SHOPIFY_VARIANT_GID.search(text)
-        key = "id:" + (match.group(1) if match else text)
-        if key not in keys:
-            keys.append(key)
+        for key in (("id:" + match.group(1),) if match else ("id:" + text, "sku:" + text)):
+            if key not in keys:
+                keys.append(key)
+    raw_url = variant.get("offer_url")
+    if isinstance(raw_url, str):
+        match = _SHOPIFY_VARIANT_QUERY_ID.search(raw_url)
+        if match and ("id:" + match.group(1)) not in keys:
+            keys.append("id:" + match.group(1))
     for field in ("sku", "sku_id"):
         raw = variant.get(field)
         if raw is None or isinstance(raw, (dict, list, bool)):
@@ -910,7 +922,9 @@ def _merge_refreshed_variant_prices(
 
     `list_price` is neither read nor written: it is a compare-at price, not the price.
 
-    A crawl key that maps to more than one crawled variant is ambiguous and ignored.
+    A key that maps to more than one crawled variant, OR is held by more than one stored
+    variant, is ambiguous and ignored on both sides: otherwise a product-level sku shared
+    by every shade would write one crawled price onto all of them.
     Variants the crawl does not mention are left exactly as they are.
     """
     if not existing or not incoming or not accepted_currency:
@@ -956,6 +970,12 @@ def _merge_refreshed_variant_prices(
                 ambiguous.add(key)
             else:
                 by_key[key] = fresh
+    stored_key_counts: Dict[str, int] = {}
+    for variant in existing:
+        if isinstance(variant, dict):
+            for key in _variant_match_keys(variant):
+                stored_key_counts[key] = stored_key_counts.get(key, 0) + 1
+    ambiguous.update(key for key, count in stored_key_counts.items() if count > 1)
     for key in ambiguous:
         by_key.pop(key, None)
     if not by_key:
@@ -5080,7 +5100,7 @@ async def _refresh_external_seed_by_id(
     # the reported case is a seed whose column was ALREADY refreshed (28.8) while its
     # variants were left at 28.2, so the next crawl reads the same product price and
     # must still heal the variants.
-    if variants_awaiting_price_merge and price_status in {"applied", "unchanged", "filled"}:
+    if variants_awaiting_price_merge and price_status in _PRICE_STATUSES_THAT_RE_READ_THE_STORED_PRICE:
         merged_variants = _merge_refreshed_variant_prices(
             existing=_seed_variants(seed_data),
             incoming=variants_awaiting_price_merge,

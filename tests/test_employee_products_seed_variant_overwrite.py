@@ -207,9 +207,14 @@ def test_nan_and_infinity_are_refused_and_never_raise() -> None:
 
 def test_no_accepted_currency_means_no_merge() -> None:
     """The merge never judges currency on its own: without the product-price decision's
-    accepted currency, it does nothing."""
-    crawl = _real_crawl([(CORE_DROP, "Core Drop", "28.80")])
-    assert _merge([_stored(28.2)], crawl["variants"], accepted=None) is None
+    accepted currency, it does nothing. Neither side carries a currency here -- a stored
+    SGD would refuse the write on its own and hide a missing guard."""
+    stored = _stored(28.2)
+    stored.pop("currency")
+    stored.pop("price_currency")
+    crawl = _currencyless(_real_crawl([(CORE_DROP, "Core Drop", "28.80")]))
+    assert _merge([stored], crawl["variants"], accepted="SGD") is not None, "CONTROL: it would move"
+    assert _merge([stored], crawl["variants"], accepted=None) is None
 
 
 def test_a_crawled_currency_other_than_the_accepted_one_is_refused() -> None:
@@ -426,4 +431,88 @@ def test_a_fabricated_currency_mismatch_moves_no_variant_either() -> None:
     out = _run_refresh(_row_with_currencyless_variants(column_price=28.8, variant_price=28.2), crawl)
 
     assert out["result"]["price_refresh"]["status"] == "skipped_currency_mismatch"
+    assert [v["price_amount"] for v in out["variants"]] == [28.2, 28.2]
+
+
+# --- Shopify Dawn-theme pages: Product.offers[], one Offer per variant --------
+#
+# Re-review of #2193: the ProductGroup shape above was verified, but the more common
+# Dawn shape was inert. The extractor puts each Offer's `sku` INTO `variant_id`, and a
+# blank sku falls through to a positional `offer_N`. Both shapes run through the REAL
+# extractor here.
+
+DAWN_URL = "https://shop.example.com/products/lip-gloss"
+
+
+def _dawn_crawl(offers) -> dict:
+    from services.external_offers_service import _extract_from_html
+
+    ld = {"@context": "http://schema.org/", "@type": "Product", "name": "Lip Gloss", "offers": offers}
+    html = f'<html><head><script type="application/ld+json">{json.dumps(ld)}</script></head></html>'
+    return _extract_from_html(DAWN_URL, html)
+
+
+def _dawn_offer(sku, vid, price) -> dict:
+    offer = {"@type": "Offer", "price": price, "priceCurrency": "SGD", "url": f"{DAWN_URL}?variant={vid}"}
+    if sku is not None:
+        offer["sku"] = sku
+    return offer
+
+
+def test_dawn_per_variant_sku_matches_the_stored_sku() -> None:
+    crawl = _dawn_crawl([_dawn_offer("JSM-LP-01", "111", "30.00"), _dawn_offer("JSM-LP-02", "222", "31.00")])
+    assert crawl["variants"][0]["variant_id"] == "JSM-LP-01", "premise: the sku lands in variant_id"
+    merged = _merge(
+        [_stored(28.0, vid="internal-a", sku="JSM-LP-01"), _stored(28.0, vid="internal-b", sku="JSM-LP-02")],
+        crawl["variants"],
+    )
+    assert merged is not None
+    assert [v["price_amount"] for v in merged] == [30.0, 31.0]
+
+
+def test_dawn_blank_sku_matches_by_the_offer_url_variant_id() -> None:
+    crawl = _dawn_crawl([_dawn_offer("", "111", "30.00"), _dawn_offer(None, "222", "31.00")])
+    assert crawl["variants"][0]["variant_id"] == "offer_1", "premise: positional without the url"
+    merged = _merge([_stored(28.0, vid="222", sku="S-2"), _stored(28.0, vid="111", sku="S-1")], crawl["variants"])
+    assert merged is not None
+    assert [v["price_amount"] for v in merged] == [31.0, 30.0], "matched by id, not by page order"
+
+
+def test_a_product_level_sku_on_every_shade_never_fans_one_price_out() -> None:
+    """Every Offer carries the PRODUCT sku. The extractor collapses them to one crawled
+    variant; if a sku held by all stored shades were a key, that one price would land on
+    all of them."""
+    crawl = _dawn_crawl([_dawn_offer("32168999", "111", "30.00"), _dawn_offer("32168999", "222", "31.00")])
+    merged = _merge([_stored(28.0, vid="111"), _stored(29.0, vid="222")], crawl["variants"])
+    assert merged is not None
+    assert [v["price_amount"] for v in merged] == [30.0, 29.0], "only the shade its url names moves"
+
+
+def test_a_key_two_stored_variants_hold_is_refused() -> None:
+    merged = _merge(
+        [_stored(28.2, vid="DUP", sku="A"), _stored(30.0, vid="DUP", sku="B")],
+        [{"variant_id": "DUP", "price_amount": 28.8, "price_currency": "SGD"}],
+    )
+    assert merged is None
+
+
+def test_the_first_matching_key_wins() -> None:
+    """A stored shade whose id names one crawled variant and whose sku names another
+    takes the id's price: ids are listed first because they are the stronger identity."""
+    merged = _merge(
+        [_stored(28.0, vid="A", sku="S")],
+        [{"variant_id": "A", "price_amount": 10.0, "price_currency": "SGD"},
+         {"variant_id": "Z", "sku": "S", "price_amount": 99.0, "price_currency": "SGD"}],
+    )
+    assert merged is not None and merged[0]["price_amount"] == 10.0
+
+
+def test_a_zero_product_price_stops_non_zero_variant_prices() -> None:
+    """THE GATE, isolated from the merge's own `<= 0` refusal: the product price is 0,
+    the variant prices are not, so only `skipped_non_positive` stops the write."""
+    crawl = _real_crawl([(CORE_DROP, "Core Drop", "28.80"), (CHAI_TEA, "Chai Tea", "28.80")])
+    crawl["price_amount"] = 0.0
+    out = _run_refresh(_jsm_row(28.8, 28.2), crawl)
+
+    assert out["result"]["price_refresh"]["status"] == "skipped_non_positive"
     assert [v["price_amount"] for v in out["variants"]] == [28.2, 28.2]
