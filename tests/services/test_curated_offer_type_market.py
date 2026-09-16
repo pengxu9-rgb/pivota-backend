@@ -11,6 +11,7 @@ import re
 
 import pytest
 
+from db.catalog import catalog_offers
 from services import curated_brand_feed as feed
 from services.catalog_enrichment_agent import ingestion
 from services.catalog_enrichment_agent.apply import _OFFER_UPSERT_SQL, _with_offer_write_defaults
@@ -109,13 +110,31 @@ def test_the_writer_binds_every_column_it_names():
 
 
 def test_rows_from_other_producers_still_satisfy_the_new_binds():
-    """Defaults are NULL, not a guess: an unknown seller type stays unknown."""
+    """An unknown seller type stays unknown; an already-decided value is never replaced."""
     legacy = [{"offer_id": "o1", "sku_key": "s1", "product_key": "p1"}]
     filled = _with_offer_write_defaults(legacy)
-    assert filled[0]["offer_type"] is None and filled[0]["market"] is None
-    # An already-decided value is never overwritten by the default.
+    assert filled[0]["offer_type"] is None
     typed = _with_offer_write_defaults([{"offer_type": "retailer", "market": "KR"}])[0]
     assert typed["offer_type"] == "retailer" and typed["market"] == "KR"
+
+
+def test_defaults_are_storable_against_the_real_column_constraints():
+    """A bind the column rejects is worse than a crash here: each offer writes inside its
+    own SAVEPOINT, so a NOT NULL violation drops that row and only logs — offers of
+    unrelated producers vanish while counts still look plausible. CI caught exactly this
+    (18 Postgres failures, all 'offers: 0'); no local Postgres is needed to pin it."""
+    market_col = catalog_offers.c.market
+    default = _with_offer_write_defaults([{}])[0]
+
+    assert market_col.nullable is False, "market stopped being NOT NULL — revisit the default"
+    assert default["market"] is not None, "a NULL market cannot be stored in this column"
+    assert default["market"] == market_col.server_default.arg, (
+        "the row default must match the column's own server default, or an omitted market "
+        "would be stored differently depending on which writer wrote the row"
+    )
+    # offer_type may legitimately be NULL; that is what nullable means here.
+    assert catalog_offers.c.offer_type.nullable is True
+    assert default["offer_type"] is None
 
 
 def test_reingest_backfills_a_null_but_never_clobbers_a_decided_value():

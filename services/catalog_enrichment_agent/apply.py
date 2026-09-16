@@ -21,7 +21,7 @@ import logging
 from typing import Any, Dict, Optional
 
 from services.catalog_enrichment_agent.bulk_writer import bulk_upsert
-from services.catalog_enrichment_agent.ingestion import AGENT_VERSION, derive_offer_id
+from services.catalog_enrichment_agent.ingestion import AGENT_VERSION, DEFAULT_MARKET, derive_offer_id
 from services.catalog_offer_writer_guard import (
     WriterAuditAccumulator,
     guard_catalog_offer_rows,
@@ -308,13 +308,22 @@ def _with_offer_write_defaults(rows: list) -> list:
     producer that assembles offer rows without them — a caller predating this, a script
     building a plan by hand — would otherwise fail the whole statement on a missing bind.
 
-    The default is NULL, not a guess: an unknown seller type stays unknown
-    (`services/offer_seller_identity` refuses to infer one), and a NULL market keeps the
-    pre-existing behaviour of every other writer that never set it.
+    `offer_type` defaults to NULL, which is not a guess but the truth: an unknown seller
+    type stays unknown (`services/offer_seller_identity` refuses to infer one), and the
+    column is nullable precisely to carry that.
+
+    `market` defaults to DEFAULT_MARKET, NOT None. `catalog_offers.market` is
+    `nullable=False, server_default="US"` (db/catalog.py:300), so a NULL was never a
+    storable value: binding one makes the INSERT raise, and because each offer writes
+    inside its own SAVEPOINT the row is dropped and merely logged — every offer of an
+    unrelated producer silently vanishing while `counts` still reads plausible. This is
+    the same value the column's own server default would have applied when the column was
+    omitted from the INSERT, so no caller's stored market changes.
     """
     for row in rows:
         row.setdefault("offer_type", None)
-        row.setdefault("market", None)
+        if row.get("market") is None:
+            row["market"] = DEFAULT_MARKET
     return rows
 
 
