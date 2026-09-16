@@ -29,6 +29,7 @@ TEXT instead would pass for a flag that is constructed and then never passed.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -119,6 +120,10 @@ class Run:
     @property
     def err(self) -> str:
         return self.proc.stderr
+
+    @property
+    def out(self) -> str:
+        return self.proc.stdout
 
     def _match(self, *head: str) -> list[list[str]]:
         return [c for c in self.calls if tuple(c[: len(head)]) == head]
@@ -554,3 +559,181 @@ def test_an_override_reaches_the_candidate_revision_itself(tmp_path):
     assert deploy.count("--concurrency") == 1
     for call in r.traffic_calls():
         assert "--concurrency" not in call
+
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# THE SHAPE IS ANNOUNCED BEFORE IT IS APPLIED
+#
+# The overrides above are only half a control. A successful run used to print exactly one line -
+# `deployed gateway -> ... (100% traffic)` - which is byte-identical whether CONCURRENCY_LIMIT=20
+# took effect or the operator fat-fingered the prefix and shipped the default 80. Mid-incident that
+# is the difference between a mitigation held and a mitigation silently reverted, with nothing on
+# screen to tell them apart.
+#
+# Every test here asserts the PRINTED value against the RECORDED ARGV of the same run. Asserting the
+# text alone would pass for a line that prints `concurrency=20` while gcloud receives 80 - which is
+# the whole failure the line exists to catch, reproduced inside its own test.
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+SHAPE_RE = re.compile(
+    r"^shape: concurrency=(?P<c>\S+) \((?P<c_src>[^)]*)\) "
+    r"min-instances=(?P<min>\S+) \((?P<min_src>[^)]*)\) "
+    r"max-instances=(?P<max>\S+) \((?P<max_src>[^)]*)\)$",
+    re.M,
+)
+
+
+def _shape(r: Run) -> dict[str, str]:
+    """The printed shape line, and the same three flags as gcloud actually received them.
+
+    Returned together on purpose: every assertion below gets to compare the two halves, and a
+    helper that returned only the text would quietly re-enable the failure mode being tested.
+    """
+    m = SHAPE_RE.search(r.out)
+    assert m, f"no `shape:` line on stdout:\n{r.out}"
+    deploy = r.deploy()
+    return {
+        **m.groupdict(),
+        "argv_c": r.flag(deploy, "--concurrency"),
+        "argv_min": r.flag(deploy, "--min-instances"),
+        "argv_max": r.flag(deploy, "--max-instances"),
+    }
+
+
+def test_the_printed_shape_is_the_shape_gcloud_gets_with_no_overrides(tmp_path):
+    r = _run(tmp_path, config="preserve")
+    assert r.rc == 0, r.err
+    s = _shape(r)
+    assert (s["c"], s["min"], s["max"]) == ("80", "2", "20")
+    assert (s["argv_c"], s["argv_min"], s["argv_max"]) == (s["c"], s["min"], s["max"])
+    # Concurrency's fallback is a literal 80 shared by both environments, not a per-env constant,
+    # and is labelled so - an operator told `prod constant` would go looking for a value the script
+    # does not have.
+    assert s["c_src"] == "default"
+    assert (s["min_src"], s["max_src"]) == ("prod constant", "prod constant")
+
+
+def test_the_printed_shape_is_the_shape_gcloud_gets_with_the_incident_overrides(tmp_path):
+    """The literal 2026-09-15 mitigation shape, and the case that makes the SOURCE tag load-bearing.
+
+    MAX_INSTANCES=20 is also the prod constant, so the printed VALUE is `20` whether the override
+    was read or dropped on the floor. Only the source tag separates "my override landed" from "the
+    default happened to agree with me" - which is the question the operator is actually asking.
+    """
+    r = _run(
+        tmp_path,
+        config="preserve",
+        overrides={"CONCURRENCY_LIMIT": "20", "MIN_INSTANCES": "4", "MAX_INSTANCES": "20"},
+    )
+    assert r.rc == 0, r.err
+    s = _shape(r)
+    assert (s["c"], s["min"], s["max"]) == ("20", "4", "20")
+    assert (s["argv_c"], s["argv_min"], s["argv_max"]) == (s["c"], s["min"], s["max"])
+    assert (s["c_src"], s["min_src"], s["max_src"]) == ("CONCURRENCY_LIMIT", "MIN_INSTANCES", "MAX_INSTANCES")
+
+
+@pytest.mark.parametrize("name", ["CONCURRENCY", "CONCURRENCY_LIMIT"])
+def test_the_printed_source_names_the_concurrency_variable_that_was_read(tmp_path, name):
+    """Both names work, so the line has to say which one it took. An operator who typed the alias
+    and saw the canonical name echoed back would have no way to tell the alias was honoured."""
+    r = _run(tmp_path, config="preserve", overrides={name: "20"})
+    assert r.rc == 0, r.err
+    s = _shape(r)
+    assert s["c"] == s["argv_c"] == "20"
+    assert s["c_src"] == name
+
+
+def test_a_zero_min_instances_prints_as_an_override_not_as_the_constant(tmp_path):
+    """MIN_INSTANCES=0 is a legitimate override (scale to zero) whose value is falsy. Reported as
+    `prod constant` it would read as "your override was ignored" on the one deploy where it was not."""
+    r = _run(tmp_path, config="preserve", overrides={"MIN_INSTANCES": "0"})
+    assert r.rc == 0, r.err
+    s = _shape(r)
+    assert s["min"] == s["argv_min"] == "0"
+    assert s["min_src"] == "MIN_INSTANCES"
+
+
+def test_the_printed_shape_follows_the_environments_own_constants(tmp_path):
+    """Staging's constants differ from prod's in both value and name. Pins the line to the env the
+    script resolved rather than to a prod-shaped string that happens to be right one time in two."""
+    r = _run(tmp_path, "staging", config="preserve")
+    assert r.rc == 0, r.err
+    s = _shape(r)
+    assert (s["min"], s["max"]) == ("1", "4")
+    assert (s["argv_min"], s["argv_max"]) == (s["min"], s["max"])
+    assert (s["min_src"], s["max_src"]) == ("staging constant", "staging constant")
+
+
+def test_the_shape_is_printed_before_the_deploy_it_describes(tmp_path):
+    """Order is the point. Printed after the promote it is a receipt for a shape already serving
+    traffic; printed before, a `(default)` where an override was expected is still cancellable with
+    ^C. `verifying candidate at` is echoed strictly after `run deploy` returns, so it anchors this."""
+    r = _run(tmp_path, config="preserve", overrides={"CONCURRENCY_LIMIT": "20"})
+    assert r.rc == 0, r.err
+    shape_at = r.out.index("shape: concurrency=")
+    assert shape_at < r.out.index("verifying candidate at"), r.out
+    assert shape_at < r.out.index("(100% traffic)"), r.out
+
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# THE RUNBOOK QUOTES THIS LINE, SO THE RUNBOOK IS PINNED TO IT
+#
+# docs/runbooks/operating_on_gcp_production.md teaches the operator to read the `shape:` line by
+# showing two of them verbatim, and its whole argument rests on which SOURCE TAG appears where.
+# Prose about output drifts silently from the output. It drifted once while this was being written:
+# the second block was first pasted from a run that omitted MAX_INSTANCES rather than misspelling
+# it, so it showed `(prod constant)` for a variable the documented command actually sets.
+#
+# A runbook that quotes output the script cannot produce is worse than one that quotes none: it is
+# read mid-incident, and it teaches the operator to accept a line that never appears.
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+RUNBOOK = REPO / "docs" / "runbooks" / "operating_on_gcp_production.md"
+
+# (documented line, the overrides the runbook says produce it). The second is the first with
+# MAX_INSTANCES misspelt - the runbook's point is that every NUMBER is identical and only the tag
+# moves, which is only true if both of these are real.
+RUNBOOK_SHAPE_LINES = [
+    ({"CONCURRENCY_LIMIT": "20", "MIN_INSTANCES": "4", "MAX_INSTANCES": "20"},
+     "shape: concurrency=20 (CONCURRENCY_LIMIT) min-instances=4 (MIN_INSTANCES) max-instances=20 (MAX_INSTANCES)"),
+    ({"CONCURRENCY_LIMIT": "20", "MIN_INSTANCES": "4", "MAX_INSTANCE": "20"},
+     "shape: concurrency=20 (CONCURRENCY_LIMIT) min-instances=4 (MIN_INSTANCES) max-instances=20 (prod constant)"),
+]
+
+
+def test_the_runbook_quotes_the_shape_lines_this_script_actually_prints():
+    """Both blocks must still be in the runbook, in order, exactly as written."""
+    doc = RUNBOOK.read_text()
+    quoted = re.findall(r"^shape: .*$", doc, re.M)
+    assert quoted == [line for _, line in RUNBOOK_SHAPE_LINES], (
+        "docs/runbooks/operating_on_gcp_production.md no longer quotes these lines in this order:\n"
+        + "\n".join(quoted)
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides,documented", RUNBOOK_SHAPE_LINES, ids=["as-documented", "MAX_INSTANCES-misspelt"]
+)
+def test_the_documented_shape_line_is_byte_exact_and_matches_gcloud(tmp_path, overrides, documented):
+    r = _run(tmp_path, "prod", config="preserve", overrides=overrides)
+    assert r.rc == 0, r.err
+    printed = [l for l in r.out.splitlines() if l.startswith("shape:")]
+    assert printed == [documented], f"runbook quotes:\n  {documented}\nscript printed:\n  " + "\n  ".join(printed)
+    # And the documented line is not merely text the script emits - it is the shape gcloud got.
+    s = _shape(r)
+    assert (s["argv_c"], s["argv_min"], s["argv_max"]) == (s["c"], s["min"], s["max"])
+
+
+def test_the_runbooks_gateway_command_is_the_one_this_script_accepts():
+    """The runbook's headline gateway invocation, pinned. A command that has drifted from the
+    script's own variable names is a mid-incident dead end - and the misspelt-variable failure it
+    warns about is precisely the one it would then be causing."""
+    doc = RUNBOOK.read_text()
+    assert (
+        "CONFIG=preserve CONCURRENCY_LIMIT=20 MIN_INSTANCES=4 MAX_INSTANCES=20 "
+        "bash infra/gcp/deploy_gateway.sh prod <full sha>"
+    ) in doc
+    # Every name in it is one deploy_gateway.sh actually reads.
+    script = SCRIPT.read_text()
+    for var in ("CONFIG", "CONCURRENCY_LIMIT", "MIN_INSTANCES", "MAX_INSTANCES"):
+        assert var in script, var
