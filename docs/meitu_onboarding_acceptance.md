@@ -1,6 +1,6 @@
 # Meitu onboarding acceptance and bounded repair
 
-This change repairs queue execution and provides a canary contract. It does not repair production by deployment alone, and the historical Meitu roster is input evidence only. The fixture matrix is `data/review_canaries/meitu_brand_retailer_matrix.json`; its five targets are pending until fresh measurements are supplied. Present stock, matching line/shade, currency and destination eligibility must be proven independently.
+This change repairs queue execution and provides a canary contract. It does not repair production by deployment alone, and the historical Meitu roster is input evidence only. The fixture matrix is `data/review_canaries/meitu_brand_retailer_matrix.json`; its targets are pending until fresh measurements are supplied. Present stock, matching line/shade, currency and destination eligibility must be proven independently.
 
 ## Queue contract
 
@@ -28,6 +28,9 @@ Review their actual subset/role/currency intent. Do not automatically rewrite in
 2. Use the live-proven A'PIEU Honey & Milk Lip Oil (5g), GTIN `8809530070499`, at asianbeautyessentials.com (variant `43603819692287`) and eyurs.com (variant `41807436316855`). Fresh public observations exhausted 677/434 products and selected 17/3 A'PIEU products, with native USD at both sellers. Complete extraction and distinct seller identities are proven in local plans. Post-deployment canonical attachment, search/PDP/offer visibility and second-ingest idempotence remain pending; matching brand alone is insufficient.
 3. Use VELY VELY from the SG roster at cocomo.sg for a large retailer scan. Prove exhaustion beyond the initial pages, exact vendor selection, native SGD price and SG destination eligibility.
 4. Use 3CE and a non-Shopify candidate retailer for the alternative extractor path. If the retailer cannot offer the requested currency/market/line, record unsupported/failed, then choose a reviewed replacement case. Do not convert a native price or relabel the serving market to force a pass.
+5. Use Pyunkang Yul Deep Clear Cleansing Balm, GTIN `08809486681497`, at eyurs.com and ohlolly.com to prove the two-retailer LANE while the lip cohort is blocked. This case is **not** Meitu lip coverage: it is a cleanser, and it declares `required_category_prefix: beauty/skincare/` rather than being silently admitted under the lip shelf. It exists because case 2 is blocked twice over — asianbeautyessentials.com has been unreachable at the TLS layer since 2026-09-14, and its lip oil publishes no INCI at eyurs.com, so `inci_source` could not be a stored fact there. Measured 2026-09-16 on the crawl subnet: eyurs 434 products, ohlolly 510, both Shopify and native USD, the same merchant barcode recovered from each seller's product `.js`, and an INCI list published at both (868/869 chars). Merchant variant IDs are not yet observed; a dry-run must record them before apply. Passing this case proves the lane converges and serves; it says nothing about lip coverage.
+
+A case's `required_category_prefix` **defaults to the lip shelf** when absent. The Meitu cohort is lip-only, so a case that forgets to declare a category must not thereby accept any category; a blank declaration is treated as absent rather than as "accept everything". A case covering another shelf declares it and is then held to that shelf just as strictly.
 
 The curated queue's current Path-C writer is US-partitioned. It deliberately rejects `market=SG`; that protects correctness but does **not** complete SG onboarding. For SG, use the existing explicit market-aware `scripts/onboard_external_brand_from_crawl.py` lane after reviewed extraction. Every extracted row must explicitly carry `market='SG'`, the freshly proven native `price_currency`, `offer_type='retailer'` for retailer observations, current destination URL and real variant data. Use `--extracted-at` to preserve the actual observation time.
 
@@ -45,7 +48,7 @@ Record fresh deployed backend/gateway revisions and source artifact references w
 python -m scripts.validate_meitu_canary_evidence --manifest data/review_canaries/meitu_brand_retailer_matrix.json --evidence fresh-observations.json --output acceptance.json
 ```
 
-Omitting `--evidence` produces five pending cases and exit status 1. The evaluator checks saved evidence only; it does not perform network requests or attest to an artifact's truth. Keep and review the underlying raw responses. Acceptance requires all intended supported cases to pass; unsupported rows remain visible in the denominator.
+Omitting `--evidence` produces one pending case per manifest row and exit status 1. The evaluator checks saved evidence only; it does not perform network requests or attest to an artifact's truth. Keep and review the underlying raw responses. Acceptance requires all intended supported cases to pass; unsupported rows remain visible in the denominator.
 
 ## Existing crawl-seed recall scope
 

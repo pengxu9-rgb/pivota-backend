@@ -125,3 +125,53 @@ def test_buyer_facing_canonical_key_does_not_replace_listing_offer_identity():
     # Canonical visibility cannot stand in for either real listing's offer.
     case["offers"][1]["product_key"] = "sig_shared"
     assert evaluate(MANIFEST, data, now=NOW)["failed"] == 1
+
+
+def _with_category(data, path):
+    for product in data["same_brand"]["products"]:
+        product["category_path"] = path
+    return data
+
+
+def test_a_case_that_declares_no_shelf_is_still_held_to_the_lip_shelf():
+    """The Meitu cohort is lip-only. A case that forgets to declare a category must not
+    thereby accept every category — the default has to be the strict one."""
+    result = evaluate(MANIFEST, _with_category(evidence(), "beauty/skincare/cleanser"), now=NOW)
+    assert result["failed"] == 1
+    assert any("beauty/makeup/lip/" in reason for reason in result["cases"][0]["reasons"])
+
+
+def test_a_case_may_declare_another_shelf_and_is_then_held_to_that_one():
+    case = dict(MANIFEST["cases"][0], required_category_prefix="beauty/skincare/")
+    manifest = {"cases": [case]}
+    assert evaluate(manifest, _with_category(evidence(), "beauty/skincare/cleanser"), now=NOW)["passed"] == 1
+    # Strictly: declaring skincare does not loosen the case into accepting anything else.
+    assert evaluate(manifest, _with_category(evidence(), "beauty/makeup/lip/oil"), now=NOW)["failed"] == 1
+
+
+def test_a_blank_shelf_declaration_is_absent_not_permissive():
+    """'' would make startswith() true for every path, turning a typo into a silent
+    accept-all. Blank is treated as undeclared, so the lip default applies."""
+    for blank in ("", "   ", None):
+        case = dict(MANIFEST["cases"][0], required_category_prefix=blank)
+        result = evaluate({"cases": [case]}, _with_category(evidence(), "beauty/skincare/cleanser"), now=NOW)
+        assert result["failed"] == 1, f"blank prefix {blank!r} accepted a non-lip product"
+
+
+def test_the_shipped_manifest_declares_what_the_validator_reads():
+    """A case missing a field the validator reads fails at evaluate() time with a KeyError
+    rather than as a reasoned verdict, so the shipped file is checked here."""
+    import json
+    from pathlib import Path
+
+    manifest = json.loads(Path("data/review_canaries/meitu_brand_retailer_matrix.json").read_text())
+    ids = [case["case_id"] for case in manifest["cases"]]
+    assert len(ids) == len(set(ids)), "duplicate case_id"
+    for case in manifest["cases"]:
+        for field in ("accepted_brands", "seller_hosts", "market", "currency", "inci_source"):
+            assert case.get(field), f"{case['case_id']} is missing {field}"
+    by_id = {case["case_id"]: case for case in manifest["cases"]}
+    # The lip cohort keeps the default; only the lane-proving case declares another shelf.
+    assert "required_category_prefix" not in by_id["apieu_two_us_retailers"]
+    assert by_id["pyunkang_yul_two_us_retailers"]["required_category_prefix"] == "beauty/skincare/"
+    assert by_id["pyunkang_yul_two_us_retailers"]["seller_hosts"] == ["eyurs.com", "ohlolly.com"]

@@ -14,6 +14,11 @@ requires the same observed content_key, product_group_id and valid canonical GTI
 not the same listing product_key. Never derive canonical evidence from titles.
 Missing observations are pending, never passing. A pass certifies the supplied
 evidence meets this contract; source artifact provenance must still be reviewed.
+
+A case may set `required_category_prefix`. It DEFAULTS to the lip prefix, because the
+Meitu cohort this file was written for is lip-only, and a case that forgets to declare a
+category must not thereby accept any category. A case that legitimately covers another
+shelf declares it, and is then held to that shelf just as strictly.
 """
 from __future__ import annotations
 
@@ -37,6 +42,10 @@ def evaluate(manifest: dict, evidence: dict, *, now=None) -> dict:
             results.append({"case_id": case["case_id"], "status": "pending", "reasons": ["no fresh observations supplied"]})
             continue
         reasons = []
+        # Default, not free choice: a case that declares no shelf is held to the lip shelf
+        # this cohort exists for. An empty/blank declaration would accept everything, so it
+        # is treated as absent rather than as "any category".
+        category_prefix = str(case.get("required_category_prefix") or "").strip() or "beauty/makeup/lip/"
         try:
             when = datetime.fromisoformat(observed["observed_at"].replace("Z", "+00:00"))
             age = (now - when).total_seconds()
@@ -72,8 +81,8 @@ def evaluate(manifest: dict, evidence: dict, *, now=None) -> dict:
             if (not product.get("variant_id") or product.get("variant_id_provenance") != "merchant_issued"
                     or str(product["variant_id"]).startswith(("ext:", "sig_"))):
                 reasons.append("missing merchant-issued variant identity")
-            if not str(product.get("category_path") or "").startswith("beauty/makeup/lip/"):
-                reasons.append("lip canary lacks a product-level lip category")
+            if not str(product.get("category_path") or "").startswith(category_prefix):
+                reasons.append(f"product category is not under the case's shelf {category_prefix}")
             if product.get("inci_source") != case["inci_source"]:
                 reasons.append("incorrect ingredient authority")
             host, merchant = product.get("seller_host"), product.get("merchant_id")

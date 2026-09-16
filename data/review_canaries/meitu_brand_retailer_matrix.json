@@ -102,6 +102,26 @@
       "lane": "reviewed_retailer_extract_then_market_aware_crawl_ingest",
       "source_role": "retailer",
       "note": "Candidate acceptance target only: retailer protocol, present SGD pricing and SG delivery must be freshly proven. If retailer cannot provide the target, report unsupported; do not convert currency or call this case passed."
+    },
+    {
+      "case_id": "pyunkang_yul_two_us_retailers",
+      "accepted_brands": [
+        "Pyunkang Yul"
+      ],
+      "market": "US",
+      "currency": "USD",
+      "seller_hosts": [
+        "eyurs.com",
+        "ohlolly.com"
+      ],
+      "inci_source": "reseller_listing",
+      "lane": "curated_brand_queue",
+      "source_role": "retailer",
+      "required_category_prefix": "beauty/skincare/",
+      "target_product": "Pyunkang Yul Deep Clear Cleansing Balm",
+      "target_gtin": "08809486681497",
+      "note": "Proves the curated two-retailer LANE, not Meitu lip coverage: this is a cleanser, outside the lip-only Meitu cohort, and is declared as such via required_category_prefix. It exists because no lip product is shared by two reachable US Shopify retailers (measured 2026-09-16), while the A'PIEU lip case is blocked on asianbeautyessentials.com being unreachable AND on its lip oil publishing no INCI at eyurs.com, which makes inci_source unbacked there. Post-ingest canonical attachment, search/PDP/offer visibility and idempotent apply remain pending here exactly as for the other cases.",
+      "discovery_evidence": "Fresh public /products.json observations 2026-09-16 on SUBNET=pivota-crawl, image 3ad4f857: eyurs.com 434 products, ohlolly.com 510, both Shopify and native USD. Same merchant barcode 08809486681497 recovered from each seller's product .js, and an INCI list published at both (868 chars eyurs / 869 ohlolly). Merchant variant ids are NOT yet observed, so observed_source_variants is deliberately absent until a dry-run records them."
     }
   ]
 }
