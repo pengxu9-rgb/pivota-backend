@@ -203,6 +203,15 @@ catalog_products = Table(
     Column("content_changed_at", DateTime, server_default=func.now(), nullable=False),
     Column("created_at", DateTime, server_default=func.now(), nullable=False),
     Column("updated_at", DateTime, server_default=func.now(), nullable=False),
+    # mig 223. Mirror provenance lookup: the reconciler and sync_offer_for_seed
+    # both locate a seed's mirror row by (source_ref, source_system). See the
+    # catalog_offers twin below.
+    Index(
+        "idx_catalog_products_source_ref_system",
+        "source_ref",
+        "source_system",
+        postgresql_where=Column("source_ref").isnot(None),
+    ),
     Index(
         "idx_catalog_products_source_identity",
         "merchant_id",
@@ -317,6 +326,17 @@ catalog_offers = Table(
     Column("created_at", DateTime, server_default=func.now(), nullable=False),
     Column("updated_at", DateTime, server_default=func.now(), nullable=False),
     Index("idx_catalog_offers_merchant_track", "merchant_id", "catalog_track"),
+    # mig 223. The external-seed mirror reconciler joins
+    # (source_ref, source_system) to find drifted / missing mirror offers.
+    # Without this the reconciler's first query was a seq scan and it timed out
+    # on prod, so the repair path had never run once. Partial because source_ref
+    # is null on every non-mirror row.
+    Index(
+        "idx_catalog_offers_source_ref_system",
+        "source_ref",
+        "source_system",
+        postgresql_where=Column("source_ref").isnot(None),
+    ),
 )
 
 
