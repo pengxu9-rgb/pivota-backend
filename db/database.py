@@ -760,8 +760,9 @@ if not _install_failed_begin_cleanup():
 # every sibling on the shared Connection blocked on the lock.
 #
 # Where the command timeout is SHORTER than this deadline (some one-off jobs
-# set 60), it fires first and the bare TimeoutError is what surfaces — not
-# CommitOutcomeUnknown.
+# set 60), it fires first; a root COMMIT that fails that way, or loses its
+# connection mid-statement, is reported as CommitOutcomeUnknown too
+# (`_reply_was_lost`).
 #
 # The fix, in the Postgres backend where the asyncpg connection is: the same
 # deadline and terminate as `_abandon_failed_begin` (and as asyncpg's own
@@ -786,6 +787,19 @@ class CommitOutcomeUnknown(TransactionEndTimedOut):
     """A root COMMIT got no answer in time. It may or may not have committed."""
 
 
+def _reply_was_lost(exc: Optional[BaseException]) -> bool:
+    """True if a statement failed WITHOUT the server answering it.
+
+    A client-side timeout (DB_COMMAND_TIMEOUT_SECONDS; TimeoutError is an
+    OSError) or a connection lost mid-statement (ConnectionDoesNotExistError is
+    a PostgresConnectionError). Any other PostgresError is the server's own
+    answer; an InterfaceError is raised before anything is sent.
+    """
+    import asyncpg
+
+    return isinstance(exc, (OSError, asyncpg.PostgresConnectionError))
+
+
 async def _end_within_deadline(xact, action: str) -> None:  # type: ignore[no-untyped-def]
     con = xact._connection
     nested = xact._nested
@@ -793,6 +807,19 @@ async def _end_within_deadline(xact, action: str) -> None:  # type: ignore[no-un
     task = asyncio.ensure_future(getattr(xact, action)())
     done, _ = await asyncio.wait((task,), timeout=deadline)
     if done:
+        exc = None if task.cancelled() else task.exception()
+        if action == "commit" and not nested and _reply_was_lost(exc):
+            # The same unknown outcome as the deadline below, reached first by
+            # DB_COMMAND_TIMEOUT_SECONDS or by the socket dying mid-COMMIT.
+            # Terminated for the same reason: nothing about this session can
+            # be trusted, and asyncpg would otherwise make the release wait for
+            # a cancel acknowledgement the dead socket never sends.
+            con.terminate()
+            raise CommitOutcomeUnknown(
+                f"COMMIT failed without an answer from the server ({type(exc).__name__}) and "
+                "the connection was terminated. The transaction MAY OR MAY NOT have committed. "
+                "Check the data before retrying a non-idempotent write."
+            ) from exc
         return task.result()
     con.terminate()
     task.cancel()
@@ -856,6 +883,84 @@ def _install_bounded_transaction_end() -> bool:
 # COMMIT/ROLLBACK outlives the deadline.
 if not _install_bounded_transaction_end():
     raise RuntimeError("db.database: bounded transaction end failed to install")
+
+
+# ---------------------------------------------------------------------------
+# A release that fails must not strand the `databases` Connection.
+#
+# asyncpg's pool release resets the connection first (and, after a client-side
+# timeout, waits for the server to acknowledge the cancel). If that fails it
+# TERMINATES the connection and re-raises: the slot is back in the pool, and the
+# pool proxy is detached. `databases` 0.7.0's `PostgresConnection.release` sets
+# `self._connection = None` only after the release RETURNS, so it never does.
+# Every later checkout on that `databases` Connection (the one a task's context
+# keeps for the life of the context) then fails with "Connection is already
+# acquired", for good. Reproduced 2026-09-17 with DB_COMMAND_TIMEOUT_SECONDS
+# shorter than the transaction-end deadline and the socket silent during
+# COMMIT: slot returned, next query AssertionError.
+#
+# The fix: when the release failed and the checkout is provably gone (the proxy
+# was detached, which only happens once asyncpg has released or terminated it),
+# forget it — and do NOT raise. A release runs after the caller's own statement
+# has already answered: a COMMIT that succeeded HAS committed, and raising here
+# (from the `finally` that releases after COMMIT) would report it as failed and
+# invite a retry that writes twice. When the caller's statement failed, that
+# error now reaches the caller instead of being replaced by the release's.
+# Cancellation still propagates. A failed release whose checkout is NOT provably
+# gone raises exactly as before.
+def _install_stranded_release_cleanup() -> bool:
+    """Forget a checkout asyncpg terminated during a failed release. Returns True if installed."""
+    import inspect
+
+    import databases.backends.postgres as pg_backend
+
+    PostgresConnection = pg_backend.PostgresConnection
+    if getattr(PostgresConnection.release, "_pivota_stranded_release", False):
+        return True
+
+    # Read off the module, not the method: holder tracking may already wrap it.
+    source = inspect.getsource(pg_backend)
+    for fragment in (
+        "self._connection = await self._database._pool.release(self._connection)",
+        "self._connection = None",
+    ):
+        if fragment not in source:
+            raise RuntimeError(
+                "db.database: refusing to patch databases.backends.postgres.PostgresConnection"
+                f".release — the module no longer contains {fragment!r}. The library changed; "
+                "re-read it and update this patch."
+            )
+
+    inner_release = PostgresConnection.release
+
+    async def release(self) -> None:  # type: ignore[no-untyped-def]
+        proxy = self._connection
+        try:
+            await inner_release(self)
+        except BaseException as exc:
+            if proxy is None or getattr(proxy, "_con", None) is not None:
+                raise  # not provably gone: the old behaviour
+            self._connection = None
+            if not isinstance(exc, Exception):
+                raise
+            logger.warning(
+                "releasing a database connection failed after asyncpg terminated it — "
+                "its pool slot is back; not raised, because the caller's statement had "
+                "already answered",
+                exc_info=True,
+            )
+
+    # Keep the markers of what this wraps (holder tracking's `_pivota_tracked`):
+    # it still runs, and its own install guard reads the marker to stay single.
+    release.__dict__.update(getattr(inner_release, "__dict__", {}))
+    release._pivota_stranded_release = True  # type: ignore[attr-defined]
+    PostgresConnection.release = release  # type: ignore[assignment]
+    return True
+
+
+# Unconditional, like the patches above: inert until a release fails.
+if not _install_stranded_release_cleanup():
+    raise RuntimeError("db.database: stranded-release cleanup failed to install")
 
 
 database = Database(DATABASE_URL, **database_kwargs)

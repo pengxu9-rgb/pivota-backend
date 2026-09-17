@@ -258,3 +258,141 @@ async def test_a_savepoint_release_that_never_answers_loses_the_enclosing_transa
     _assert_terminated_and_released(db)
     await _pool_still_works(db, monkeypatch, 3)
     assert await _rows(db) == [3]
+
+
+# --- the reply lost BEFORE the deadline: command timeout, dropped connection -----------------
+
+
+def _fail_on(monkeypatch, statement: str, exc: BaseException, *, after_server_runs: bool) -> None:
+    """Make `statement` fail without the server's answer — as a command timeout or a lost socket."""
+    import asyncpg.connection
+
+    real = asyncpg.connection.Connection.execute
+
+    async def execute(self, query, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if not query.strip().upper().startswith(statement):
+            return await real(self, query, *args, **kwargs)
+        if after_server_runs:
+            await real(self, query, *args, **kwargs)
+        raise exc
+
+    monkeypatch.setattr(asyncpg.connection.Connection, "execute", execute)
+
+
+def _lost_reply_errors():
+    import asyncpg
+
+    return [
+        pytest.param(asyncio.TimeoutError(), id="command-timeout"),
+        pytest.param(asyncpg.ConnectionDoesNotExistError("connection was closed"), id="socket-lost"),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("server_committed", [True, False], ids=["committed", "not-sent"])
+@pytest.mark.parametrize("exc", _lost_reply_errors())
+async def test_a_commit_whose_reply_is_lost_early_is_outcome_unknown_too(
+    db, monkeypatch, exc, server_committed
+) -> None:
+    """DB_COMMAND_TIMEOUT_SECONDS shorter than the deadline used to surface as a bare TimeoutError."""
+    from db.database import CommitOutcomeUnknown
+
+    _fail_on(monkeypatch, "COMMIT", exc, after_server_runs=server_committed)
+
+    async def write() -> None:
+        async with db.transaction():
+            await db.execute(f"INSERT INTO {TABLE} VALUES (1)")
+
+    with pytest.raises(CommitOutcomeUnknown, match="MAY OR MAY NOT have committed") as excinfo:
+        await _within_deadline(db, write())
+    assert excinfo.value.__cause__ is exc
+
+    _assert_terminated_and_released(db)
+    await _pool_still_works(db, monkeypatch, 2)
+    assert await _rows(db) == ([1, 2] if server_committed else [2])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exc", _lost_reply_errors())
+async def test_a_savepoint_whose_reply_is_lost_early_is_not_called_a_commit(db, monkeypatch, exc) -> None:
+    """Only a ROOT COMMIT has an unknown outcome; a savepoint's enclosing transaction is still open."""
+    from db.database import CommitOutcomeUnknown
+
+    _fail_on(monkeypatch, "RELEASE SAVEPOINT", exc, after_server_runs=False)
+
+    async def nested_write() -> None:
+        async with db.transaction():
+            async with db.transaction():
+                await db.execute(f"INSERT INTO {TABLE} VALUES (1)")
+
+    with pytest.raises(BaseException) as excinfo:
+        await _within_deadline(db, nested_write())
+    assert not isinstance(excinfo.value, CommitOutcomeUnknown), excinfo.value
+    assert excinfo.value is exc, "a savepoint's own failure must reach the caller unchanged"
+
+
+# --- a release that fails must not strand the databases Connection ---------------------------
+
+
+def _fail_release_reset(monkeypatch) -> list:
+    """asyncpg's release resets the connection; make that fail. asyncpg then terminates and re-raises."""
+    import asyncpg.connection
+
+    calls: list = []
+
+    async def reset(self, *, timeout=None):  # type: ignore[no-untyped-def]
+        calls.append(self)
+        raise ConnectionError("simulated: the socket went silent after COMMIT answered")
+
+    monkeypatch.setattr(asyncpg.connection.Connection, "reset", reset)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_a_committed_write_whose_release_fails_reports_success_and_the_connection_stays_usable(
+    db, monkeypatch, caplog
+) -> None:
+    """The COMMIT answered, so it HAS committed: a failure to release must not report otherwise.
+
+    Before: the release error replaced the successful commit (a retry would write twice), and every
+    later query on that databases Connection failed with "Connection is already acquired".
+    """
+    resets = _fail_release_reset(monkeypatch)
+
+    async def task_body() -> list:
+        async with db.transaction():
+            await db.execute(f"INSERT INTO {TABLE} VALUES (1)")
+        monkeypatch.undo()
+        # Same task, same context: the same databases Connection is checked out again.
+        return [await db.fetch_val("SELECT 42")]
+
+    with caplog.at_level("WARNING", logger="db.database"):
+        assert await _within_deadline(db, task_body()) == [42]
+
+    assert len(resets) == 1, "the release reset was never reached — the test proves nothing"
+    assert db.terminated and db.terminated[0].is_closed()
+    assert _in_use(db) == 0
+    assert await _rows(db) == [1]
+    assert any("releasing a database connection failed" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_release_that_did_not_give_the_slot_back_still_raises(db, monkeypatch) -> None:
+    """Control: forgetting a checkout the pool still holds would leak its slot silently."""
+    import asyncpg.pool
+
+    real_release = asyncpg.pool.Pool.release
+
+    async def release(self, connection, *, timeout=None):  # type: ignore[no-untyped-def]
+        raise ConnectionError("simulated: release failed before touching the connection")
+
+    monkeypatch.setattr(asyncpg.pool.Pool, "release", release)
+    conn = db.connection()
+    with pytest.raises(ConnectionError, match="before touching"):
+        async with conn:
+            await conn.fetch_val("SELECT 1")
+    monkeypatch.setattr(asyncpg.pool.Pool, "release", real_release)
+    # The checkout was not forgotten: releasing it for real now returns the slot.
+    assert conn._connection._connection is not None
+    await conn._connection.release()
+    assert _in_use(db) == 0
