@@ -369,6 +369,172 @@ async def ensure_required_schema_light() -> None:
                 # first authorization 500s inside Reap's 1.6s budget, which Reap
                 # renders as a declined card — not a silent wrong answer.
                 pass
+            # mig 224: the Reap AGENTIC rail's two tables — purchases and
+            # enrollments. A DIFFERENT rail from the card one above: the buyer
+            # enrols their OWN card on Reap's hosted page and approves each
+            # purchase there, so nothing here holds money or card data.
+            #
+            # SECOND IN THE BRANCH, AND IN ITS OWN try/except, for the two
+            # reasons the mig-207 block spells out at length. This branch is ONE
+            # try-block, so a statement that raises abandons every statement
+            # after it — being early means nothing downstream can starve these
+            # tables, and being wrapped means a failure HERE cannot starve the
+            # self-heals that follow. Both directions, which position alone
+            # cannot buy.
+            #
+            # These are the whole storage layer for the rail, not a column on an
+            # existing table: prod deploys skip db/migrations/, so without this
+            # block the tables do not exist in production at all and every call
+            # on the rail is an UndefinedTable 500.
+            #
+            # THE COVERAGE GATE CANNOT SEE THIS. tests/test_schema_guard_migration_
+            # coverage.py inspects ADD COLUMN only, so a missing CREATE TABLE
+            # self-heal is invisible to it — exactly the hole the mig-207 comment
+            # names. tests/test_reap_agentic_ledger.py::test_self_heal_* is the
+            # thing that actually checks it, on both dialects.
+            #
+            # Keep this DDL byte-identical to db/migrations/224_reap_agentic_ledger.sql.
+            # A self-heal that disagrees with the migration makes prod behave
+            # unlike every environment where the migration ran.
+            try:
+                await database.execute(
+                    text(
+                        """
+                    CREATE TABLE IF NOT EXISTS reap_agentic_enrollments (
+                        id VARCHAR(64) PRIMARY KEY,
+                        buyer_ref VARCHAR(128) NOT NULL,
+                        agent_id VARCHAR(128),
+                        reap_enrollment_id VARCHAR(128),
+                        status VARCHAR(16) NOT NULL
+                            CHECK (status IN ('pending', 'active', 'dead')),
+                        reap_status VARCHAR(64),
+                        card_network VARCHAR(32),
+                        card_last4 VARCHAR(4)
+                            CHECK (card_last4 IS NULL OR length(card_last4) = 4),
+                        hosted_url TEXT,
+                        hosted_url_expires_at TIMESTAMPTZ,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                    );
+                        """
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS "
+                        "idx_reap_agentic_enrollments_buyer_status "
+                        "ON reap_agentic_enrollments (buyer_ref, status);"
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS "
+                        "uq_reap_agentic_enrollments_reap_id "
+                        "ON reap_agentic_enrollments (reap_enrollment_id) "
+                        "WHERE reap_enrollment_id IS NOT NULL;"
+                    )
+                )
+                # AT MOST ONE ACTIVE ENROLLMENT PER BUYER. With two, "which card
+                # did this buyer authorize?" has no answer. The ledger's
+                # mark_enrollment_active demotes the loser in the same
+                # transaction; this index is what makes that non-optional.
+                await database.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS "
+                        "uq_reap_agentic_enrollments_one_active "
+                        "ON reap_agentic_enrollments (buyer_ref) "
+                        "WHERE status = 'active';"
+                    )
+                )
+                await database.execute(
+                    text(
+                        """
+                    CREATE TABLE IF NOT EXISTS reap_agentic_purchases (
+                        id VARCHAR(64) PRIMARY KEY,
+                        buyer_ref VARCHAR(128) NOT NULL,
+                        agent_id VARCHAR(128),
+                        agent_user_ref_hash VARCHAR(64),
+                        enrollment_id VARCHAR(64),
+                        state VARCHAR(24) NOT NULL CHECK (state IN (
+                            'resolving', 'needs_enrollment', 'quoting', 'awaiting_approval',
+                            'processing', 'completed', 'failed', 'refused', 'expired'
+                        )),
+                        merchant_domain VARCHAR(255),
+                        product_key TEXT,
+                        variant_key TEXT,
+                        product_name TEXT,
+                        variant_title TEXT,
+                        brand TEXT,
+                        category TEXT,
+                        quantity INTEGER NOT NULL DEFAULT 1 CHECK (quantity > 0),
+                        currency VARCHAR(8),
+                        our_price_minor BIGINT,
+                        click_id VARCHAR(128),
+                        return_url TEXT,
+                        reap_product_id VARCHAR(128),
+                        reap_variant_id VARCHAR(128),
+                        reap_quote_id VARCHAR(128),
+                        reap_quote_expires_at TIMESTAMPTZ,
+                        reap_checkout_id VARCHAR(128),
+                        reap_order_id VARCHAR(128),
+                        quoted_total_minor BIGINT,
+                        final_total_minor BIGINT,
+                        shipping_minor BIGINT,
+                        tax_minor BIGINT,
+                        hosted_url TEXT,
+                        hosted_url_expires_at TIMESTAMPTZ,
+                        refusal_reason VARCHAR(64),
+                        queries_tried JSONB,
+                        last_error_code VARCHAR(64),
+                        attempts INTEGER NOT NULL DEFAULT 0,
+                        claimed_by VARCHAR(128),
+                        claimed_at TIMESTAMPTZ,
+                        next_poll_at TIMESTAMPTZ,
+                        shipping_address JSONB,
+                        buyer_email TEXT,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        terminal_at TIMESTAMPTZ
+                    );
+                        """
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS "
+                        "idx_reap_agentic_purchases_state_poll "
+                        "ON reap_agentic_purchases (state, next_poll_at);"
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS "
+                        "idx_reap_agentic_purchases_buyer_created "
+                        "ON reap_agentic_purchases (buyer_ref, created_at);"
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS "
+                        "idx_reap_agentic_purchases_owner_created "
+                        "ON reap_agentic_purchases "
+                        "(agent_id, agent_user_ref_hash, created_at);"
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS "
+                        "uq_reap_agentic_purchases_checkout "
+                        "ON reap_agentic_purchases (reap_checkout_id) "
+                        "WHERE reap_checkout_id IS NOT NULL;"
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                # Best-effort like every sibling, and it must not starve what
+                # follows. The rail itself is loud if this silently fails: every
+                # call against it is an UndefinedTable 500 rather than a wrong
+                # answer, so the failure is visible from the first request.
+                pass
             # mig 212: the recovery key — the join the Prove stage rests on.
             # Early and wrapped for the same reason as mig 210 below: this
             # branch is ONE try, and an unguarded CREATE INDEX further down
@@ -2294,6 +2460,162 @@ async def ensure_required_schema_light() -> None:
             return
 
         if IS_SQLITE:
+            # mig 224: the Reap AGENTIC rail's two tables, SQLite twin.
+            #
+            # THE SQLITE BRANCH HAS ONLY EVER DONE `ADD COLUMN` UNTIL NOW, and
+            # that is not an oversight to copy: every other table reached from a
+            # SQLite database is either in `metadata` (so create_all builds it)
+            # or is created on demand by its own module's `_ensure_*_table`.
+            # These two are neither. They are SQL-ONLY on purpose — a SQLAlchemy
+            # `Table` would make the model the source of truth, because
+            # `metadata.create_all` runs BEFORE db/migrations in main.py — so
+            # without this block a dev or test SQLite database never gets them
+            # at all, and the SQLite half of this rail's tests would be testing
+            # a schema that exists nowhere.
+            #
+            # WHY IT IS NOT BYTE-IDENTICAL TO THE POSTGRES DDL, unlike the two
+            # halves of the mig-224 self-heal above: `now()` is not a SQLite
+            # function (CURRENT_TIMESTAMP is), and JSONB is not a SQLite type
+            # name — declaring it would give the column NUMERIC affinity, which
+            # is the same trap as `CAST(:x AS JSONB)`. TIMESTAMPTZ -> TIMESTAMP
+            # follows the convention the `sqlite_type` map below already states.
+            # Everything that carries MEANING — the CHECK vocabularies, the
+            # NOT NULLs, the partial unique indexes — is identical, because
+            # those are what the tests and the invariants rest on.
+            #
+            # Its own try/except, same contract as the Postgres siblings: a
+            # failure here must not starve the ADD COLUMN heals below.
+            try:
+                await database.execute(
+                    text(
+                        """
+                    CREATE TABLE IF NOT EXISTS reap_agentic_enrollments (
+                        id VARCHAR(64) PRIMARY KEY,
+                        buyer_ref VARCHAR(128) NOT NULL,
+                        agent_id VARCHAR(128),
+                        reap_enrollment_id VARCHAR(128),
+                        status VARCHAR(16) NOT NULL
+                            CHECK (status IN ('pending', 'active', 'dead')),
+                        reap_status VARCHAR(64),
+                        card_network VARCHAR(32),
+                        card_last4 VARCHAR(4)
+                            CHECK (card_last4 IS NULL OR length(card_last4) = 4),
+                        hosted_url TEXT,
+                        hosted_url_expires_at TIMESTAMP,
+                        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                        """
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS "
+                        "idx_reap_agentic_enrollments_buyer_status "
+                        "ON reap_agentic_enrollments (buyer_ref, status);"
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS "
+                        "uq_reap_agentic_enrollments_reap_id "
+                        "ON reap_agentic_enrollments (reap_enrollment_id) "
+                        "WHERE reap_enrollment_id IS NOT NULL;"
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS "
+                        "uq_reap_agentic_enrollments_one_active "
+                        "ON reap_agentic_enrollments (buyer_ref) "
+                        "WHERE status = 'active';"
+                    )
+                )
+                await database.execute(
+                    text(
+                        """
+                    CREATE TABLE IF NOT EXISTS reap_agentic_purchases (
+                        id VARCHAR(64) PRIMARY KEY,
+                        buyer_ref VARCHAR(128) NOT NULL,
+                        agent_id VARCHAR(128),
+                        agent_user_ref_hash VARCHAR(64),
+                        enrollment_id VARCHAR(64),
+                        state VARCHAR(24) NOT NULL CHECK (state IN (
+                            'resolving', 'needs_enrollment', 'quoting', 'awaiting_approval',
+                            'processing', 'completed', 'failed', 'refused', 'expired'
+                        )),
+                        merchant_domain VARCHAR(255),
+                        product_key TEXT,
+                        variant_key TEXT,
+                        product_name TEXT,
+                        variant_title TEXT,
+                        brand TEXT,
+                        category TEXT,
+                        quantity INTEGER NOT NULL DEFAULT 1 CHECK (quantity > 0),
+                        currency VARCHAR(8),
+                        our_price_minor BIGINT,
+                        click_id VARCHAR(128),
+                        return_url TEXT,
+                        reap_product_id VARCHAR(128),
+                        reap_variant_id VARCHAR(128),
+                        reap_quote_id VARCHAR(128),
+                        reap_quote_expires_at TIMESTAMP,
+                        reap_checkout_id VARCHAR(128),
+                        reap_order_id VARCHAR(128),
+                        quoted_total_minor BIGINT,
+                        final_total_minor BIGINT,
+                        shipping_minor BIGINT,
+                        tax_minor BIGINT,
+                        hosted_url TEXT,
+                        hosted_url_expires_at TIMESTAMP,
+                        refusal_reason VARCHAR(64),
+                        queries_tried TEXT,
+                        last_error_code VARCHAR(64),
+                        attempts INTEGER NOT NULL DEFAULT 0,
+                        claimed_by VARCHAR(128),
+                        claimed_at TIMESTAMP,
+                        next_poll_at TIMESTAMP,
+                        shipping_address TEXT,
+                        buyer_email TEXT,
+                        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        terminal_at TIMESTAMP
+                    );
+                        """
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS "
+                        "idx_reap_agentic_purchases_state_poll "
+                        "ON reap_agentic_purchases (state, next_poll_at);"
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS "
+                        "idx_reap_agentic_purchases_buyer_created "
+                        "ON reap_agentic_purchases (buyer_ref, created_at);"
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS "
+                        "idx_reap_agentic_purchases_owner_created "
+                        "ON reap_agentic_purchases "
+                        "(agent_id, agent_user_ref_hash, created_at);"
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS "
+                        "uq_reap_agentic_purchases_checkout "
+                        "ON reap_agentic_purchases (reap_checkout_id) "
+                        "WHERE reap_checkout_id IS NOT NULL;"
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
             # Self-heal EVERY table in REQUIRED_SCHEMA, not a hardcoded subset:
             # /health fails closed on any missing required column, so a spec
             # entry without a matching heal here leaves a fresh sqlite dev/test
