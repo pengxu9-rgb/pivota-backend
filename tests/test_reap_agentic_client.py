@@ -346,19 +346,48 @@ def test_an_unset_client_makes_no_request(monkeypatch):
 # --- the seam: what actually reaches the wire ---------------------------------------------------
 
 class _FakeResponse:
-    def __init__(self, status=200, payload=None, headers=None, content=None):
+    """A STREAMING response, because that is what `_post` now opens.
+
+    `aiter_bytes` yields the body in chunks rather than handing it over whole, so a test can
+    measure what `_read_bounded` actually reads. `chunk_size` is deliberately small: the
+    cumulative check only means anything if the body arrives in more than one piece, and a fake
+    that yields everything at once would let a mutant deleting the running total survive.
+    """
+
+    def __init__(self, status=200, payload=None, headers=None, content=None, chunk_size=64 * 1024):
         self.status_code = status
         self._payload = payload if payload is not None else {}
-        # `headers` and `content` are what the SIZE BOUND reads. The real httpx Response carries
-        # both; the fake has to, or a test of that bound would be testing `getattr`'s default
-        # rather than the guard. `content` defaults to the serialised payload so every existing
-        # test exercises the real length check with a real (tiny) length.
+        # `headers` is what the DECLARED-length check reads; the bytes from `aiter_bytes` are what
+        # the cumulative check reads. The real httpx streaming response carries both.
         self.headers = headers if headers is not None else {}
         self.content = (content if content is not None
                         else json.dumps(self._payload).encode("utf-8"))
+        self._chunk_size = max(1, int(chunk_size))
+        #: How many bytes the caller actually pulled. A real bound STOPS READING; this is how a
+        #: test tells "refused after reading it all" from "refused partway".
+        self.bytes_yielded = 0
+
+    async def aiter_bytes(self):
+        for start in range(0, len(self.content), self._chunk_size):
+            chunk = self.content[start:start + self._chunk_size]
+            self.bytes_yielded += len(chunk)
+            yield chunk
 
     def json(self):
         return self._payload
+
+
+class _StreamContext:
+    """What `client.stream(...)` returns: an async context manager over the response."""
+
+    def __init__(self, response):
+        self._response = response
+
+    async def __aenter__(self):
+        return self._response
+
+    async def __aexit__(self, *a):
+        return False
 
 
 class _Recorder:
@@ -384,14 +413,16 @@ class _Recorder:
     async def __aexit__(self, *a):
         return False
 
-    async def post(self, url, json=None, headers=None):
-        _Recorder.calls.append({"url": url, "body": json, "headers": headers,
+    def stream(self, method, url, json=None, headers=None):
+        _Recorder.calls.append({"method": method, "url": url, "body": json, "headers": headers,
                                 "timeout": self.timeout,
                                 "follow_redirects": self.follow_redirects})
-        payload = _Recorder.next_payload
-        return _FakeResponse(_Recorder.next_status, payload,
-                             headers=_Recorder.next_headers,
-                             content=_Recorder.next_content)
+        response = _FakeResponse(_Recorder.next_status, _Recorder.next_payload,
+                                 headers=_Recorder.next_headers,
+                                 content=_Recorder.next_content,
+                                 chunk_size=_Recorder.next_chunk_size)
+        _Recorder.last_response = response
+        return _StreamContext(response)
 
 
 @pytest.fixture
@@ -402,6 +433,8 @@ def wire(monkeypatch):
     _Recorder.next_payload = {}
     _Recorder.next_headers = None
     _Recorder.next_content = None
+    _Recorder.next_chunk_size = 64 * 1024
+    _Recorder.last_response = None
     monkeypatch.setenv("REAP_API_BASE_URL", "https://sandbox.api.reap.global")
     monkeypatch.setenv("REAP_API_KEY", "sk_test_key")
     # The env var is a FLOOR on the timeout, and a value inherited from the developer's shell
@@ -737,11 +770,22 @@ def test_a_quote_is_GIVEN_a_timeout_long_enough_for_a_real_quote(wire):
     assert wire.calls[0]["timeout"] >= 30.0
 
 
-def test_a_product_call_is_given_the_short_timeout(wire):
-    """Same assertion from the other side: the long bound must not leak onto the fast endpoints,
-    where a 35 s hang would sit in a serving path."""
+def test_a_product_call_is_given_the_shorter_timeout(wire):
+    """Same assertion from the other side: the quote bound must not leak onto the product
+    endpoints. RAISED 12 -> 25 on 18 Sep: a live sandbox run had one `search` exceed 12 s and one
+    `/variant` exceed 30 s, each ending the whole resolution as `transport_error:ReadTimeout` --
+    a refusal that reads like a matching failure and is not one."""
     _run(rc.search_products(query="x"))
-    assert wire.calls[0]["timeout"] == 12.0
+    assert wire.calls[0]["timeout"] == 25.0
+
+
+def test_the_product_timeout_covers_what_the_live_run_measured(wire):
+    """Pinned as a number, not as "greater than the old one": the point of the change is that 12 s
+    was BELOW an observed call and 25 s is above it. A mutant that nudged it back under would
+    otherwise pass a `> 12` assertion."""
+    assert rc._DEFAULT_TIMEOUT_S >= 25.0
+    _run(rc.search_products(query="x"))
+    assert wire.calls[0]["timeout"] >= 25.0
 
 
 def test_the_two_paths_really_do_get_different_timeouts(wire):
@@ -1918,7 +1962,7 @@ def test_an_unusable_env_timeout_is_ignored_rather_than_fatal(wire, monkeypatch,
     monkeypatch.setenv("REAP_API_TIMEOUT_SECONDS", value)
     got = _run(rc.search_products(query="x"))
     assert got.ok
-    assert wire.calls[0]["timeout"] == 12.0
+    assert wire.calls[0]["timeout"] == rc._DEFAULT_TIMEOUT_S == 25.0
 
 
 def test_an_explicit_timeout_still_beats_the_env_floor(wire, monkeypatch):
@@ -2008,3 +2052,526 @@ def test_the_env_timeout_helper_reports_a_usable_floor(monkeypatch):
     assert rc._env_timeout_floor() == 45.5
     monkeypatch.delenv("REAP_API_TIMEOUT_SECONDS", raising=False)
     assert rc._env_timeout_floor() is None
+
+
+# ==================================================================================================
+# SECOND-ROUND ADVERSARIAL REVIEW, PR #2140. Same shape as the block above: reproduce, then pin.
+# ==================================================================================================
+
+
+# --- P0: whole-token matching on a single-value axis ------------------------------------------------
+#
+# The first fix compared our title to Reap's sole label with RAW SUBSTRING containment, which
+# ignores token boundaries completely. Every pair below resolved ok=True with a PASSING
+# substitution guard, because `chosen` recorded Reap's label and Reap then echoed it back.
+
+def _sole(label, option_id="opt_only", available=True):
+    return {"id": "prd_x", "options": [{"name": "Size", "values": [
+        {"optionId": option_id, "label": label, "available": available}]}]}
+
+
+@pytest.mark.parametrize("our_title,reap_label", [
+    ("50ml", "150ml"),            # a 3x quantity, and the prices can plausibly agree
+    ("Red", "Fired Brick"),
+    ("Mini", "Minimalist Set"),
+    ("M", "Jumbo"),               # one letter, inside a word
+    ("S", "Standard"),
+    ("Tan", "Titanium"),
+    ("S/M", "Mini"),              # via the 1-char `/` fragments this used to produce
+])
+def test_a_substring_of_reaps_label_is_not_a_match(our_title, reap_label):
+    got = rc.select_option_ids(_sole(reap_label), rc.variant_title_tokens(our_title))
+    assert not got.ok, f"{our_title!r} must not resolve {reap_label!r}"
+    assert got.reason == "axes_not_determined_by_title"
+    assert got.option_ids == []
+    assert got.chosen == {}
+
+
+def test_the_150ml_row_buys_the_right_bottle_end_to_end(monkeypatch):
+    """THE P0 REPRODUCTION. Our row is "Rose Serum / 50ml / $30 USD". Reap's only value is
+    `150ml`, also $30 — three times the product at the same price, which is exactly the shape a
+    price check cannot catch. Before the fix: ok=True, var_150, price_disagrees=False."""
+    search = {"products": [{"id": "prd_rose", "merchant": {"name": "example.com"},
+                            "name": "Rose Serum"}], "warnings": []}
+    details = {"products": [{"id": "prd_rose", "merchant": {"name": "example.com"},
+                             "name": "Rose Serum",
+                             "options": [{"name": "Size", "values": [
+                                 {"optionId": "opt_150", "label": "150ml",
+                                  "available": True}]}]}], "errors": []}
+    variant = {"id": "var_150", "options": [{"name": "Size", "value": "150ml"}],
+               "price": {"amount": 30.0, "currency": "USD"}, "available": True}
+    fake = _chain(monkeypatch, search=search, details=details, variant=variant)
+    got = _run(rc.resolve_our_row(
+        merchant_domain="example.com", product_name="Rose Serum",
+        variant_title="50ml", our_price=30.00, currency="USD"))
+    assert not got.ok
+    assert got.reason == "options:axes_not_determined_by_title"
+    assert got.variant_id is None
+    assert fake.variant_body is None          # it never even asked
+
+
+# The three reference examples that define the rule. Named as such so the rule is testable in one
+# place rather than inferred from the call site.
+
+def test_the_rule_accepts_our_title_as_a_majority_of_reaps_tokens():
+    """REFERENCE 1. {flamingo, flirt} of {flamingo, flirt, cream}: 2 of 3."""
+    assert rc.title_matches_sole_label("Flamingo Flirt", "Flamingo Flirt - Cream") is True
+
+
+def test_the_rule_accepts_an_exact_match():
+    """REFERENCE 2. Equal sets — the degenerate case, which must not fall through the subset
+    arithmetic."""
+    assert rc.title_matches_sole_label("OS", "OS") is True
+
+
+def test_the_rule_refuses_a_generic_minority_token():
+    """REFERENCE 3, and the one that whole-token SUBSET alone would still have let through:
+    {cream} IS a subset of {flamingo, flirt, cream}. 1 of 3 is not half, so it refuses. "Cream" is
+    a finish, not a shade, and it identifies nothing."""
+    assert rc.title_matches_sole_label("Cream", "Flamingo Flirt - Cream") is False
+
+
+def test_the_rule_accepts_a_title_more_specific_than_reaps_label():
+    """Containment the other way round: our catalog sometimes carries the longer string, and a
+    title that COVERS the whole label is not a weaker claim than one that equals it."""
+    assert rc.title_matches_sole_label("Flamingo Flirt Cream Finish", "Flamingo Flirt") is True
+
+
+def test_the_rule_refuses_an_empty_side():
+    assert rc.title_matches_sole_label("", "Flamingo Flirt") is False
+    assert rc.title_matches_sole_label("Flamingo Flirt", "") is False
+    assert rc.title_matches_sole_label("!!!", "Flamingo Flirt") is False
+
+
+@pytest.mark.parametrize("our_title,reap_label", [
+    ("50", "150ml"),      # a bare number inside an alphanumeric token
+    ("50", "50ml"),       # the same number, still not the same token
+    ("150", "1500ml"),
+])
+def test_a_numeric_fragment_never_matches_inside_a_longer_token(our_title, reap_label):
+    """True by construction under whole-token comparison rather than as a separate rule: `{"50"}`
+    is simply not a subset of `{"150ml"}`. Tested anyway, because it is the property that stops a
+    quantity being silently multiplied."""
+    assert rc.title_matches_sole_label(our_title, reap_label) is False
+
+
+def test_the_real_flowerbeauty_row_still_resolves(monkeypatch):
+    """The regression the whole rule has to keep: tightening this must not refuse the measured
+    row it was relaxed for in the first place."""
+    fake = _chain(monkeypatch, search=FLOWER_SEARCH, details=FLOWER_DETAILS,
+                  variant=FLOWER_VARIANT)
+    got = _run(rc.resolve_our_row(
+        merchant_domain="flowerbeauty.com", product_name="Petal Pout Lip Color",
+        variant_title="Flamingo Flirt", our_price=8.00, currency="USD"))
+    assert got.ok and got.variant_id == "var_flamingo"
+    assert fake.variant_body == {"productId": "prd_petalpout", "optionIds": ["opt_flamingo"]}
+
+
+# --- P0: one-character `/` fragments ----------------------------------------------------------------
+
+def test_one_character_slash_fragments_are_dropped():
+    """"S/M" produced the fragments `S` and `M`, and a single letter cannot identify a variant
+    under any rule. The WHOLE title is exempt — a row whose entire title is "S" is a real size,
+    and dropping it would leave nothing to match on."""
+    assert rc.variant_title_tokens("S/M") == ["S/M"]
+    assert rc.variant_title_tokens("S") == ["S"]
+    assert rc.variant_title_tokens("Standard / Rose") == ["Standard / Rose", "Standard", "Rose"]
+
+
+def test_the_whole_title_is_always_the_first_candidate():
+    """M28. `out = [raw] if raw not in parts else []` -> `[]` survived the first sweep. A
+    single-axis label can legitimately contain a slash, and then the whole title is the ONLY
+    candidate that can match it exactly."""
+    product = {"id": "prd_x", "options": [{"name": "Size", "values": [
+        {"optionId": "opt_both", "label": "Standard / Rose", "available": True},
+        {"optionId": "opt_other", "label": "Petite / Blue", "available": True},
+    ]}]}
+    got = rc.select_option_ids(product, rc.variant_title_tokens("Standard / Rose"))
+    assert got.ok and got.option_ids == ["opt_both"]
+
+
+# --- P0 related: the multi-value branch stays EXACT ---------------------------------------------------
+
+def test_a_multi_value_axis_does_not_accept_a_partial_token_match():
+    """The asymmetry is deliberate. With siblings present, the near-miss strings a relaxed rule
+    would confuse are exactly the ones on the axis: `50ml` beside `150ml`."""
+    product = {"id": "prd_x", "options": [{"name": "Size", "values": [
+        {"optionId": "opt_50", "label": "50ml", "available": True},
+        {"optionId": "opt_150", "label": "150ml", "available": True},
+    ]}]}
+    assert rc.select_option_ids(product, ["50ml"]).option_ids == ["opt_50"]
+    assert rc.select_option_ids(product, ["150ml"]).option_ids == ["opt_150"]
+    # A title that is merely a subset of a sibling's tokens matches NEITHER.
+    assert not rc.select_option_ids(product, ["ml"]).ok
+
+
+def test_a_multi_value_axis_refuses_a_suffixed_label():
+    """What exact matching costs, stated as a test so nobody "fixes" it: with siblings present we
+    refuse rather than guess which one our shorter title meant."""
+    product = {"id": "prd_x", "options": [{"name": "Shade", "values": [
+        {"optionId": "opt_a", "label": "Flamingo Flirt - Cream", "available": True},
+        {"optionId": "opt_b", "label": "Petal Pink - Matte", "available": True},
+    ]}]}
+    assert not rc.select_option_ids(product, ["Flamingo Flirt"]).ok
+
+
+# --- P1: the C1 sweep missed three iterations over partner JSON -----------------------------------
+
+@pytest.mark.parametrize("payload", [
+    {"products": 7},
+    {"products": "prd_x"},
+    {"products": True},
+    {"products": {"id": "prd_x"}},
+])
+def test_a_non_list_products_field_does_not_raise(payload):
+    """`data.get("products") or []` is falsy-safe but not TYPE-safe: a truthy non-iterable raised
+    TypeError straight out of `resolve_our_row`. The per-element isinstance never ran, because the
+    `for` itself is what failed."""
+    product, err = rc.details_for(payload, "prd_x")
+    assert product is None and err == "product_not_in_response"
+
+
+@pytest.mark.parametrize("errors", [True, 7, "PRODUCT_UNAVAILABLE", {"code": "X"}])
+def test_a_non_list_errors_field_does_not_raise(errors):
+    product, err = rc.details_for({"products": [], "errors": errors}, "prd_x")
+    assert product is None and err == "product_not_in_response"
+
+
+@pytest.mark.parametrize("options", [3, True, "Size", {"name": "Size"}])
+def test_a_non_list_options_field_in_a_variant_does_not_raise(options):
+    """In the substitution guard, which is the one place in this module a crash is least
+    affordable: an exception here is a refusal that never happens."""
+    assert rc.variant_matches_request({"id": "var_x", "options": options},
+                                      {"Size": "Standard"}) == "response_missing_axis:Size"
+
+
+def test_a_malformed_details_payload_does_not_crash_the_chain(monkeypatch):
+    async def fake(path, body, **kw):
+        if path.endswith("/search"):
+            return rc.ReapResponse(ok=True, status=200, data=FENTY_SEARCH)
+        return rc.ReapResponse(ok=True, status=200, data={"products": 7, "errors": True})
+    monkeypatch.setattr(rc, "_post", fake)
+    got = _run(rc.resolve_our_row(merchant_domain="fentybeauty.com",
+                                  product_name="Fenty Eau de Parfum", variant_title="Standard"))
+    assert not got.ok and got.reason == "details:product_not_in_response"
+
+
+def test_a_malformed_variant_payload_does_not_crash_the_chain(monkeypatch):
+    _chain(monkeypatch, details=FENTY_DETAILS_STANDARD_AVAILABLE,
+           variant={"id": "var_x", "options": 3})
+    got = _run(rc.resolve_our_row(merchant_domain="fentybeauty.com",
+                                  product_name="Fenty Eau de Parfum", variant_title="Standard"))
+    assert not got.ok and got.reason == "variant:response_missing_axis:Size"
+
+
+# --- P2: kana voicing marks are not diacritics -------------------------------------------------------
+
+@pytest.mark.parametrize("voiced,unvoiced", [
+    ("ゴールド", "コールド"),     # gold vs cold
+    ("パール", "ハール"),         # pearl vs (unvoiced)
+    ("ビッグ", "ヒック"),
+])
+def test_kana_voicing_survives_normalisation(voiced, unvoiced):
+    """Stripping EVERY combining mark after NFKD is right for Latin accents and wrong for kana:
+    the dakuten and handakuten change the CONSONANT. ゴールド (gold) and コールド (cold) normalised
+    alike, so the substitution guard reported "no substitution" for a gold-for-cold swap."""
+    assert rc._norm(voiced) != rc._norm(unvoiced)
+    assert rc.variant_matches_request(
+        {"options": [{"name": "Color", "value": unvoiced}]}, {"Color": voiced}
+    ) == f"substituted_on_axis:Color:asked={voiced}:got={unvoiced}"
+
+
+def test_the_same_voiced_kana_still_matches_itself():
+    """The control: the fix must not make kana stop matching themselves."""
+    assert rc.variant_matches_request(
+        {"options": [{"name": "Color", "value": "ゴールド"}]}, {"Color": "ゴールド"}) is None
+
+
+def test_a_decomposed_dakuten_still_equals_its_precomposed_form():
+    """The recomposition half. A merchant sending a decomposed dakuten (カ + U+3099) means the
+    same character as the precomposed ガ, and NFC puts it back together."""
+    decomposed = "ガ" + "ールド"     # KA + COMBINING VOICED SOUND MARK
+    assert rc._norm(decomposed) == rc._norm("ガールド")
+
+
+def test_the_normalised_form_carries_no_loose_combining_marks():
+    """The assertion that actually pins the NFC step, and the reason it needed finding: the pair
+    tests above pass WITHOUT recomposition, by accident. NFKD leaves the dakuten as a separate
+    U+3099, `\\w` does not match it, and it therefore becomes a SPACE -- so ゴールド normalised to
+    `'コ ールト'`. That still differs from コールド, so the substitution guard looked fine, while
+    the label had silently become three tokens instead of one. Whole-token matching runs on these
+    strings, so a spurious space is a wrong answer waiting to happen.
+
+    Pinned as an exact string: four characters, voicing intact, no spaces."""
+    assert rc._norm("ゴールド") == "ゴールド"
+    assert " " not in rc._norm("ゴールド")
+    assert len(rc._norm("ゴールド").split()) == 1
+
+
+def test_an_interior_cyrillic_combining_mark_is_folded_not_turned_into_a_space():
+    """The Cyrillic half of the strip range (U+0483-U+0489), which the ё tests never reach -- ё
+    decomposes with U+0308, a LATIN combining mark. A mark that is not folded away becomes a
+    space, which splits one token into two; only an INTERIOR mark shows the difference, because a
+    trailing one is absorbed by `.strip()` either way."""
+    assert rc._norm("а҆б") == "аб"
+    assert rc._norm("а҃б") == "аб"
+
+
+def test_latin_accents_still_fold():
+    """The other half of the same rule, unchanged: Latin combining marks ARE diacritics."""
+    assert rc._norm("Crème Brûlée") == rc._norm("Creme Brulee") == "creme brulee"
+    assert rc._norm("Chloé") == rc._norm("Chloe")
+
+
+def test_cyrillic_and_cjk_still_behave():
+    assert rc._norm("標準") != rc._norm("ミニ")
+    assert rc._norm("Чёрный") != rc._norm("Розовый")
+
+
+def test_full_width_still_folds_to_ascii():
+    """NFKD's compatibility folding is still wanted: a merchant's full-width spelling must match
+    our ASCII one."""
+    assert rc._norm("１５０ＭＬ") == rc._norm("150ml") == "150ml"
+
+
+# --- P2: timeout bounds ------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("value", ["inf", "Infinity", "-inf", "nan", "NaN"])
+def test_a_non_finite_env_timeout_is_ignored(value):
+    """`float("inf")` parses, is > 0, and `max(35.0, inf)` is `inf` — so this gave EVERY path an
+    infinite read timeout and a hung partner socket would hold a worker until something else
+    killed it. `nan` failed the `> 0` test by accident rather than by design."""
+    import os
+    os.environ["REAP_API_TIMEOUT_SECONDS"] = value
+    try:
+        assert rc._env_timeout_floor() is None
+    finally:
+        os.environ.pop("REAP_API_TIMEOUT_SECONDS", None)
+
+
+def test_a_huge_env_timeout_is_clamped_not_honoured(wire, monkeypatch):
+    """`=600` applied to ALL paths, and one resolution makes several calls, so a single row could
+    have occupied a worker for the better part of an hour."""
+    monkeypatch.setenv("REAP_API_TIMEOUT_SECONDS", "600")
+    assert rc._env_timeout_floor() == rc._MAX_ENV_TIMEOUT_S == 120.0
+    _run(rc.search_products(query="x"))
+    assert wire.calls[0]["timeout"] == 120.0
+
+
+def test_a_floor_below_the_cap_is_honoured_exactly(wire, monkeypatch):
+    """The control — a clamp that returned the cap unconditionally would pass the test above."""
+    monkeypatch.setenv("REAP_API_TIMEOUT_SECONDS", "90")
+    _run(rc.search_products(query="x"))
+    assert wire.calls[0]["timeout"] == 90.0
+
+
+@pytest.mark.parametrize("value", [0, 0.0, -1, -0.5])
+def test_a_non_positive_explicit_timeout_is_refused_not_ignored(wire, value):
+    """`if timeout_seconds:` treated 0 and 0.0 as "not supplied" and silently fell through to the
+    per-path default, so a caller asking for no timeout got 25 s. It is a caller bug, and a
+    request we quietly reshape is worse than one we refuse."""
+    with pytest.raises(rc.ReapRequestError):
+        _run(rc.search_products(query="x", timeout_seconds=value))
+    assert wire.calls == []
+
+
+def test_a_non_finite_explicit_timeout_is_refused(wire):
+    with pytest.raises(rc.ReapRequestError):
+        _run(rc.search_products(query="x", timeout_seconds=float("inf")))
+    assert wire.calls == []
+
+
+# --- P1: the four guards the first sweep could not kill ----------------------------------------------
+
+def test_a_title_of_only_punctuation_does_not_match_every_single_value_label():
+    """M5. `wanted` is built with an `if _norm(w)` filter. Drop it and a title of "--" yields one
+    candidate that normalises to "", which the old `in` comparison accepted against ANY label —
+    so the most degenerate possible title resolved every single-value product on the index."""
+    got = rc.select_option_ids(_sole("Flamingo Flirt - Cream"), rc.variant_title_tokens("--"))
+    assert not got.ok
+    assert got.reason == "variant_title_unusable"
+    assert got.chosen == {}
+
+
+def test_an_empty_our_domain_does_not_match_a_merchantless_product():
+    """M9. `bool(ours)` in `merchant_domain_matches`. Without it, a row with no merchant domain
+    matches a Reap product that also reports no merchant name — "" == "" — and the merchant
+    filter, which is the correctness boundary of this whole module, passes on absence."""
+    assert rc.merchant_domain_matches("", "") is False
+    assert rc.merchant_domain_matches(None, None) is False
+    payload = {"products": [{"id": "prd_x", "merchant": {}, "name": "Snail Mucin"}]}
+    match = rc.match_product(payload, merchant_domain="", product_name="Snail Mucin")
+    assert not match.ok and match.reason == "merchant_not_in_results"
+
+
+def test_a_search_with_no_product_name_refuses_before_comparing_anything():
+    """M10. Without the `no_product_name_supplied` return, `wanted` is "" and the exact-name
+    comparison below compares "" against every candidate's normalised name — which matches any
+    product whose name is also blank, on the right merchant."""
+    payload = {"products": [{"id": "prd_x", "merchant": {"name": "cosrx.com"}, "name": ""}]}
+    match = rc.match_product(payload, merchant_domain="cosrx.com", product_name="")
+    assert not match.ok and match.reason == "no_product_name_supplied"
+    assert match.product_id is None
+
+
+# --- P2: a supplied title that normalises to nothing --------------------------------------------------
+
+@pytest.mark.parametrize("title", ["!!!", "/", " - ", "---", "***"])
+def test_a_supplied_but_unusable_title_refuses_rather_than_taking_the_untitled_path(title):
+    """Passing no title ASSERTS "this row has no variants". A title that was supplied and
+    normalises to nothing asserts the opposite — the caller believes it constrained the
+    resolution — so falling through to the structural acceptance would resolve the product on an
+    assertion nobody made."""
+    got = rc.select_option_ids(_sole("Flamingo Flirt - Cream"), rc.variant_title_tokens(title))
+    assert not got.ok
+    assert got.reason == "variant_title_unusable"
+    assert got.single_value_axis_accepted_without_title is False
+
+
+def test_the_unusable_title_refusal_reaches_the_resolution(monkeypatch):
+    _chain(monkeypatch, search=FLOWER_SEARCH, details=FLOWER_DETAILS, variant=FLOWER_VARIANT)
+    got = _run(rc.resolve_our_row(
+        merchant_domain="flowerbeauty.com", product_name="Petal Pout Lip Color",
+        variant_title="!!!"))
+    assert not got.ok and got.reason == "options:variant_title_unusable"
+
+
+def test_genuinely_no_title_still_takes_the_structural_path(monkeypatch):
+    """The control, and the distinction being drawn: None and "" are still the untitled path."""
+    for title in (None, ""):
+        _chain(monkeypatch, search=FLOWER_SEARCH, details=FLOWER_DETAILS, variant=FLOWER_VARIANT)
+        got = _run(rc.resolve_our_row(
+            merchant_domain="flowerbeauty.com", product_name="Petal Pout Lip Color",
+            variant_title=title))
+        assert got.ok, title
+        assert got.single_value_axis_accepted_without_title is True
+
+
+def test_the_unusable_title_reason_has_its_own_copy():
+    text = rc.explain_refusal("options:variant_title_unusable")
+    assert "Unrecognised refusal" not in text
+    # It must NOT collapse into the no-title copy: they are different caller mistakes.
+    assert text != rc.explain_refusal("options:no_variant_title_supplied")
+
+
+# --- P2: the response bound is real, not cosmetic ------------------------------------------------------
+
+def test_an_oversized_body_stops_being_read_partway(wire):
+    """C2 made real. `client.post` does not return until the whole body is in memory, so the old
+    checks declined to PARSE a body they had already fully allocated — the expensive half had
+    happened. Streaming plus `_read_bounded` stops the read at the cap, which is what the
+    `bytes_yielded` assertion measures."""
+    wire.next_content = b"x" * (rc.MAX_RESPONSE_BYTES * 4)
+    wire.next_chunk_size = 64 * 1024
+    got = _run(rc.search_products(query="x"))
+    assert not got.ok and got.error == "response_too_large"
+    read = wire.last_response.bytes_yielded
+    assert read <= rc.MAX_RESPONSE_BYTES + 64 * 1024
+    assert read < len(wire.next_content)          # it did NOT read the whole thing
+
+
+def test_a_lying_content_length_does_not_defeat_the_bound(wire):
+    """The declared length is a CLAIM made by the host we are defending against. The cumulative
+    count is the fact. A mutant that keeps only the declared check dies here."""
+    wire.next_headers = {"content-length": "12"}
+    wire.next_content = b"x" * (rc.MAX_RESPONSE_BYTES + 1)
+    got = _run(rc.search_products(query="x"))
+    assert not got.ok and got.error == "response_too_large"
+
+
+def test_an_absent_content_length_does_not_defeat_the_bound(wire):
+    """Chunked responses declare nothing at all."""
+    wire.next_headers = {}
+    wire.next_content = b"x" * (rc.MAX_RESPONSE_BYTES + 1)
+    assert _run(rc.search_products(query="x")).error == "response_too_large"
+
+
+def test_a_declared_oversize_is_refused_before_any_body_is_read(wire):
+    """The cheap check keeps its point: it can refuse before a single byte of body arrives."""
+    wire.next_headers = {"content-length": str(rc.MAX_RESPONSE_BYTES + 1)}
+    wire.next_content = b"x" * 10
+    got = _run(rc.search_products(query="x"))
+    assert not got.ok and got.error == "response_too_large"
+    assert wire.last_response.bytes_yielded == 0
+
+
+def test_a_body_of_exactly_the_cap_is_accepted(wire):
+    """THE BOUNDARY, at exactly MAX_RESPONSE_BYTES rather than near it. `>` versus `>=` is a
+    one-character mutation that no approximate test can see, and it fails in the direction that
+    refuses legitimate responses. The body is padded to the cap to the byte."""
+    prefix = b'{"products":[],"warnings":[],"pad":"'
+    suffix = b'"}'
+    payload = prefix + b"y" * (rc.MAX_RESPONSE_BYTES - len(prefix) - len(suffix)) + suffix
+    assert len(payload) == rc.MAX_RESPONSE_BYTES
+    wire.next_content = payload
+    got = _run(rc.search_products(query="x"))
+    assert got.ok and got.data.get("products") == []
+
+
+def test_one_byte_over_the_cap_is_refused(wire):
+    """The other side of the same boundary, so the pair pins the comparison from both directions
+    rather than just asserting that something large is refused."""
+    prefix = b'{"products":[],"warnings":[],"pad":"'
+    suffix = b'"}'
+    payload = prefix + b"y" * (rc.MAX_RESPONSE_BYTES + 1 - len(prefix) - len(suffix)) + suffix
+    assert len(payload) == rc.MAX_RESPONSE_BYTES + 1
+    wire.next_content = payload
+    got = _run(rc.search_products(query="x"))
+    assert not got.ok and got.error == "response_too_large"
+
+
+def test_the_request_still_reaches_the_wire_unchanged_through_the_stream(wire):
+    """`_post`'s signature and result shape are unchanged by the streaming rewrite; so is what it
+    sends. The method is now explicit, so it is asserted."""
+    _run(rc.request_quote(items=[{"variantId": "var_x", "quantity": 1}], email="b@example.com"))
+    call = wire.calls[0]
+    assert call["method"] == "POST"
+    assert call["url"].endswith("/agentic/quotes")
+    assert call["headers"]["Authorization"] == "Bearer sk_test_key"
+    assert call["body"]["items"] == [{"variantId": "var_x", "quantity": 1}]
+
+
+def test_a_4xx_body_is_never_read_at_all(wire):
+    """Stronger than the old "the body is not returned": on an error status the body is not even
+    pulled off the socket, so a partner error payload echoing a buyer's address never enters this
+    process."""
+    wire.next_status = 422
+    wire.next_content = json.dumps({"echo": {"shippingAddress": GOOD_ADDRESS}}).encode()
+    got = _run(rc.request_quote(items=[{"variantId": "var_x", "quantity": 1}],
+                                email="b@example.com"))
+    assert not got.ok and got.status == 422 and got.data == {}
+    assert wire.last_response.bytes_yielded == 0
+
+
+def test_the_bounded_reader_is_reusable_on_its_own(wire):
+    """`_read_bounded` is the seam the stacked branch's `_get` should adopt rather than growing a
+    second copy of the bound, so it is tested as a unit: response in, bytes or None out."""
+    small = _FakeResponse(200, {"a": 1})
+    assert _run(rc._read_bounded(small)) == small.content
+    big = _FakeResponse(200, content=b"z" * 5000)
+    assert _run(rc._read_bounded(big, max_bytes=100)) is None
+
+
+def test_an_unparseable_body_is_still_reported_as_such(wire):
+    """The rewrite swapped `resp.json()` for `json.loads`, so the failure mode has to survive."""
+    wire.next_content = b"<html>not json</html>"
+    got = _run(rc.search_products(query="x"))
+    assert not got.ok and got.error == "unparseable_response"
+
+
+# --- prose corrections carry assertions where they can ------------------------------------------------
+
+def test_the_inert_guards_are_gone_and_the_behaviour_is_not():
+    """Two guards were removed as inert rather than annotated. Behaviour must be unchanged, which
+    is the only thing that makes "inert" a true description rather than a convenient one."""
+    # `label and` in the multi-value branch: a blank label still never matches.
+    product = {"id": "prd_x", "options": [{"name": "Size", "values": [
+        {"optionId": "opt_blank", "label": "", "available": True},
+        {"optionId": "opt_mini", "label": "Mini", "available": True}]}]}
+    assert rc.select_option_ids(product, ["Mini"]).option_ids == ["opt_mini"]
+    assert not rc.select_option_ids(product, ["Standard"]).ok
+    # `not ours` in `_disagrees`: unknown on either side is still a disagreement.
+    assert rc._disagrees((140.0, "USD"), 140.00, "") is True
+    assert rc._disagrees((140.0, ""), 140.00, "USD") is True
+    assert rc._disagrees((140.0, ""), 140.00, "") is True
+    assert rc._disagrees((140.0, "USD"), 140.00, "USD") is False

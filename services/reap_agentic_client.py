@@ -45,6 +45,14 @@ different size at a 32% lower price while looking entirely successful, and readi
 staleness would have "corrected" a row that was right. `select_option_ids` therefore fails
 closed on every axis it cannot match, and no code path here falls back to a default variant.
 
+    ONE EXCEPTION, STATED HERE BECAUSE IT IS NOT AN EXCEPTION TO THE RULE ABOVE: an axis with
+    exactly ONE value is matched against our title by whole tokens rather than by exact equality
+    (`title_matches_sole_label`), and a product with exactly one such axis resolves with NO title
+    at all -- flagged, never silently. Both are still comparisons or still structural; neither is
+    a default. An earlier draft of this paragraph said the module fails closed on every axis "it
+    cannot match" full stop, and that sentence was true of the code only until the single-value
+    rule landed underneath it.
+
 A 200 IS NOT EVIDENCE REAP DID WHAT WE ASKED. Resolving an option value whose `available` flag
 is false SILENTLY SUBSTITUTES a different variant: asking for `Size=Standard` ($140, unavailable)
 returns 200 with the Mini variant at $95, no warning and no error field. So the response is
@@ -83,6 +91,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -111,13 +120,27 @@ REAP_VERSION = "2025-02-14"
 #: Required by the spec on quote and checkout creation (not on the read-only product endpoints).
 _IDEMPOTENT_PATHS = ("/agentic/quotes", "/agentic/checkouts")
 
-#: Per-path read timeouts. NOT one number: the product endpoints answer in well under a second,
-#: but a quote takes 13-16 s measured across nine merchants, because Reap is talking to the
-#: merchant's own commerce layer while we wait. The 12 s default this module shipped with would
-#: have timed out EVERY quote while every test passed -- a bound that only a live call can find.
-_DEFAULT_TIMEOUT_S = 12.0
+#: Per-path read timeouts. NOT one number: a quote takes 13-16 s measured across nine merchants,
+#: because Reap is talking to the merchant's own commerce layer while we wait. The 12 s default
+#: this module shipped with would have timed out EVERY quote while every test passed -- a bound
+#: that only a live call can find.
+#:
+#: RAISED 18 Sep, from a live sandbox run by the session holding the key. The product endpoints
+#: were described here as answering "in well under a second", and that was measured on a good
+#: day: in today's run ONE `products/search` exceeded 12 s and ONE `products/variant` exceeded
+#: 30 s, and each one ended the whole resolution as `transport_error:ReadTimeout` -- a refusal
+#: that looks like a matching failure and is not. 25 s is affordable because resolution now runs
+#: off the request path; if it ever moves back onto one, this number is the first thing to
+#: revisit. Quotes and checkouts stay at 35 s: nothing in today's run moved them.
+_DEFAULT_TIMEOUT_S = 25.0
 _QUOTE_TIMEOUT_S = 35.0
 _SLOW_PATHS = ("/agentic/quotes", "/agentic/checkouts")
+
+#: Ceiling on `REAP_API_TIMEOUT_SECONDS`. The env var raises a floor across ALL paths and one
+#: resolution makes several calls, so an unbounded value is a multiplied one: `=600` would let a
+#: single row occupy a worker for the better part of an hour. Two minutes is well above every
+#: measured call and still a bound.
+_MAX_ENV_TIMEOUT_S = 120.0
 
 
 def default_timeout_for(path: str) -> float:
@@ -135,7 +158,18 @@ def _env_timeout_floor() -> Optional[float]:
     without the wire. A non-numeric value was worse still: `float("30s")` raised ValueError out
     of `_post`, turning a typo in an env var into an exception in a serving path.
 
-    So it may only ever RAISE a bound, and anything unusable is ignored rather than fatal.
+    So it may only ever RAISE a bound, and a value that is not a usable number is ignored rather
+    than fatal. "Unusable" means: absent, unparseable, non-finite, or <= 0. A value ABOVE
+    `_MAX_ENV_TIMEOUT_S` is not ignored -- it is clamped to it, which is a different thing and is
+    why the docstring no longer says "anything unusable is ignored".
+
+    NON-FINITE IS THE ONE THAT MATTERS. `float("inf")` parses, is > 0, and `max(35.0, inf)` is
+    `inf` -- so `REAP_API_TIMEOUT_SECONDS=inf` gave every path an infinite read timeout, on every
+    call, and a hung partner socket would have held a serving worker until something else killed
+    it. `nan` fails the `> 0` test by accident rather than by design; both are now rejected by
+    name. The clamp exists for the same reason in the merely-large direction: `=600` applied to
+    ALL paths, and one resolution makes several calls, so a single row could have sat for the
+    better part of an hour.
 
     NOTE on the `> 0` test: at `_post`'s call site it is inert, because the floor is applied with
     `max()` against a positive per-path default and a zero or negative value could not lower
@@ -151,7 +185,16 @@ def _env_timeout_floor() -> Optional[float]:
     except (TypeError, ValueError):
         logger.warning("REAP_API_TIMEOUT_SECONDS is not a number; ignoring it")
         return None
-    return value if value > 0 else None
+    if not math.isfinite(value):
+        logger.warning("REAP_API_TIMEOUT_SECONDS is not finite; ignoring it")
+        return None
+    if value <= 0:
+        return None
+    if value > _MAX_ENV_TIMEOUT_S:
+        logger.warning("REAP_API_TIMEOUT_SECONDS above the %ss cap; clamping",
+                       _MAX_ENV_TIMEOUT_S)
+        return _MAX_ENV_TIMEOUT_S
+    return value
 
 #: Reap's own id prefixes, used to reject a value from the wrong namespace before it is sent.
 #: This is the guard that would have caught #2136's central error: our storefront variant id
@@ -281,15 +324,98 @@ def _norm(text: Any) -> str:
     labels are never ASCII. It also mangled accented Latin: "Crème Brûlée" became "cr me br l e"
     and did not match "Creme Brulee".
 
-    NFKD + dropping combining marks makes the accented pair equal; `\\w` under re.UNICODE keeps
-    CJK and Cyrillic as themselves so two different labels stay different.
+    NOT ALL COMBINING MARKS ARE DIACRITICS. The first version of this fix decomposed with NFKD
+    and dropped EVERY combining mark, which is correct for Latin accents and wrong for kana: the
+    dakuten and handakuten are combining marks that change the CONSONANT, not an accent on it.
+    Stripping them made `ゴールド` (gold) and `コールド` (cold) normalise alike, and `パール`
+    (pearl) equal to `ハール` -- so `variant_matches_request` reported "no substitution" for a
+    gold-versus-cold swap. Same class of bug as the one before it, one script further along: a
+    normalisation that erases a distinction the merchant is selling on.
+
+    So only marks in the Latin/Greek/Cyrillic diacritic blocks are dropped (U+0300-U+036F
+    COMBINING DIACRITICAL MARKS, U+0483-U+0489 the Cyrillic set), and the rest is RECOMPOSED with
+    NFC so a decomposed dakuten goes back onto its kana instead of being left loose. `\\w` under
+    re.UNICODE then keeps CJK, kana and Cyrillic as themselves.
+
+    NFKD before that still does the compatibility folding we want -- full-width `１５０ＭＬ`
+    folds to `150ml`, so a merchant's full-width spelling matches our ASCII one.
 
     An empty result is NOT a value. Every site that compares two of these must refuse when either
     side is empty -- `_norm` cannot enforce that for its callers, so the callers do it.
     """
     folded = unicodedata.normalize("NFKD", str(text or ""))
-    folded = "".join(ch for ch in folded if not unicodedata.combining(ch))
+    folded = "".join(ch for ch in folded if not _is_stripped_diacritic(ch))
+    folded = unicodedata.normalize("NFC", folded)
     return re.sub(r"[^\w]+", " ", folded.casefold(), flags=re.UNICODE).strip()
+
+
+#: Combining ranges that are ACCENTS ON A LETTER, and so are folded away for matching. Everything
+#: else that `unicodedata.combining` reports -- the kana voicing marks above all -- is part of the
+#: character's identity and is kept. Listed as ranges rather than as "all combining marks" because
+#: the difference between the two is a wrong physical object.
+_STRIPPED_COMBINING_RANGES = (
+    (0x0300, 0x036F),   # COMBINING DIACRITICAL MARKS (Latin/Greek)
+    (0x0483, 0x0489),   # COMBINING CYRILLIC
+)
+
+
+def _is_stripped_diacritic(ch: str) -> bool:
+    code = ord(ch)
+    return any(low <= code <= high for low, high in _STRIPPED_COMBINING_RANGES)
+
+
+def title_matches_sole_label(our_title: Any, reap_label: Any) -> bool:
+    """Does our variant title describe Reap's ONE value on a single-value axis? WHOLE TOKENS ONLY.
+
+    THE RULE, and the three examples that fix it:
+
+        "Flamingo Flirt"  vs "Flamingo Flirt - Cream"   ACCEPT
+        "OS"              vs "OS"                       ACCEPT
+        "Cream"           vs "Flamingo Flirt - Cream"   REFUSE
+
+    Normalise both sides, split on whitespace into SETS of whole tokens, and refuse unless one
+    non-empty set is a subset of the other. When OUR set is the smaller one it must additionally
+    cover at least HALF of Reap's tokens -- which is what separates the first example (2 of 3)
+    from the third (1 of 3). When Reap's set is the smaller one, our title is merely more specific
+    than their label and that is accepted outright.
+
+    A half-coverage test alone decides all three examples, so that is the whole rule; a
+    leading-tokens-in-order clause was considered and left out because it only ever ACCEPTS more,
+    and there is no measured row that needs it. Consequence, stated so nobody rediscovers it as a
+    bug: a row titled just "Flamingo" against "Flamingo Flirt - Cream" refuses. That is the
+    file's standing answer -- the fix for a legitimate refusal is a stored alias, never a looser
+    comparison, exactly as in `merchant_domain_matches`.
+
+    WHY NOT SUBSTRING, which is what this function replaces. The previous rule asked whether
+    either normalised string CONTAINED the other, and containment on a raw string ignores token
+    boundaries entirely. Measured against it, every one of these resolved ok=True with a passing
+    substitution guard:
+
+        our "50ml" -> Reap "150ml"            (a 3x quantity, at a plausible price)
+        our "Red"  -> Reap "Fired Brick"
+        our "Mini" -> Reap "Minimalist Set"
+        our "Tan"  -> Reap "Titanium"
+        our "S"    -> Reap "Standard"
+        our "M"    -> Reap "Jumbo"
+
+    End to end: a "Rose Serum / 50ml / $30 USD" row against a product whose only value was
+    `150ml`, also $30, resolved ok=True at var_150 with `price_disagrees=False` -- three times the
+    product, the same price, and nothing anywhere reporting a problem. Whole-token comparison also
+    makes "a purely numeric fragment must not match inside a longer alphanumeric token" true by
+    construction rather than as a separate rule: `{"50"}` is simply not a subset of `{"150ml"}`.
+    """
+    ours = set(_norm(our_title).split())
+    theirs = set(_norm(reap_label).split())
+    if not ours or not theirs:
+        # An empty side is not a value and never matches. Same rule as every other comparison
+        # site in this module.
+        return False
+    if ours <= theirs:
+        # Equality lands here too (2n >= n), which is the "OS" vs "OS" case.
+        return 2 * len(ours) >= len(theirs)
+    if theirs < ours:
+        return True
+    return False
 
 
 def _label_of(value: Any) -> str:
@@ -459,13 +585,12 @@ def select_option_ids(detail_product: Any, wanted_labels: Sequence[str]) -> Opti
     answers 200 with an available sibling rather than the id we asked for, so the id we want does
     not exist to be fetched. `resolve_our_row` refuses before making that call.
 
-    A SINGLE-VALUE AXIS IS STILL COMPARED TO OUR TITLE. The previous version accepted such an
-    axis without looking at our title at all, and recorded REAP's label in `chosen`. That made the
-    whole chain circular: `chosen` is what `variant_matches_request` checks the response against,
-    so Reap was being compared to Reap and the guard could not refuse anything. Measured on the
-    real fixture -- a `Size` axis carrying only `Mini` ($95) against our row's title "Standard"
-    ($140) -- the module returned ok=True and resolved the Mini, which is the $95-for-$140
-    substitution this file exists to prevent, arrived at without any substitution taking place.
+    A SINGLE-VALUE AXIS IS STILL COMPARED TO OUR TITLE, BY WHOLE TOKENS. The first version
+    accepted such an axis without looking at our title at all; the second compared them with raw
+    SUBSTRING containment, which ignores token boundaries and accepted "50ml" for "150ml" and
+    "Red" for "Fired Brick". The comparison now lives in `title_matches_sole_label`, which states
+    the rule and the three examples that pin it. Multi-value axes keep EXACT label matching -- see
+    the comment at that branch.
     """
     product = detail_product if isinstance(detail_product, dict) else {}
     options = product.get("options")
@@ -475,7 +600,17 @@ def select_option_ids(detail_product: Any, wanted_labels: Sequence[str]) -> Opti
         # products/variant with an empty option list.
         return OptionMatch(ok=False, reason="product_has_no_option_axes")
 
+    # NOTE the `if _norm(w)` filter, which is load-bearing rather than tidy: a title of "--"
+    # produces one candidate that normalises to "", and an empty token was accepted by every
+    # comparison that used `in`, so it matched ANY single-value label.
     wanted = [_norm(w) for w in wanted_labels if _norm(w)]
+    # A title that was SUPPLIED but normalises to nothing ("!!!", "/", " - ") is not the same
+    # thing as no title. Falling through to the untitled path would silently resolve a product
+    # the caller believes it constrained, so it is its own refusal.
+    supplied_a_title = any(str(w or "").strip() for w in wanted_labels or [])
+    if supplied_a_title and not wanted:
+        return OptionMatch(ok=False, reason="variant_title_unusable")
+
     # The ONE shape where a missing title is not a refusal: one axis, one value. There is then
     # exactly one variant of this product and no choice to get wrong -- structurally the same
     # case as a product with no axes at all, which is already resolved from `defaultVariant`.
@@ -513,8 +648,8 @@ def select_option_ids(detail_product: Any, wanted_labels: Sequence[str]) -> Opti
             # a single-value axis whose label carries a suffix our catalog does not store --
             # measured on flowerbeauty.com's "Petal Pout Lip Color", one `Shade` axis, one value
             # `"Flamingo Flirt - Cream"`, against our title "Flamingo Flirt". Exact label matching
-            # refuses that row for no benefit, so the comparison here is CONTAINMENT either way
-            # round after normalisation.
+            # refuses that row for no benefit, so this branch -- and ONLY this branch -- relaxes
+            # equality, to the whole-token rule in `title_matches_sole_label`.
             #
             # But it is still a comparison. Accepting the label unseen means our title never
             # constrains the result, and the only thing that would have caught a wrong product is
@@ -530,7 +665,7 @@ def select_option_ids(detail_product: Any, wanted_labels: Sequence[str]) -> Opti
                 unmatched.append(axis_name)
                 continue
             if wanted:
-                if not any(token in label_norm or label_norm in token for token in wanted):
+                if not any(title_matches_sole_label(token, label_norm) for token in wanted):
                     unmatched.append(axis_name)
                     continue
             else:
@@ -547,7 +682,10 @@ def select_option_ids(detail_product: Any, wanted_labels: Sequence[str]) -> Opti
             option_ids.append(option_id)
             # `chosen` records REAP's label, because Reap's optionId is what we send and Reap's
             # label is what the response will echo. That is only sound now that the label has
-            # been checked against our title above.
+            # passed `title_matches_sole_label` against our title above -- i.e. that one of the
+            # two whole-token sets is a subset of the other, with our side covering at least half
+            # of Reap's when ours is the smaller. Not "contains", which is what it used to mean
+            # and which accepted "50ml" for "150ml".
             chosen[axis_name] = label_text
             availability = single.get("available")
             chosen_available[axis_name] = availability if isinstance(availability, bool) else None
@@ -556,10 +694,25 @@ def select_option_ids(detail_product: Any, wanted_labels: Sequence[str]) -> Opti
             continue
 
         hit = None
+        # MULTI-VALUE AXES KEEP EXACT MATCHING, deliberately, and the asymmetry with the branch
+        # above is the point. There, one value means there is no sibling to be confused with and
+        # the only risk is refusing a row whose label carries a suffix we do not store. Here there
+        # ARE siblings, and they are precisely the near-miss strings a relaxed rule would confuse:
+        # `Standard` / `Mini` / `Travel` on one axis, or `150ml` beside `50ml`. Whole-token subset
+        # matching would make `{"50ml"}` and `{"150ml"}` no better separated than a human eye, and
+        # `title_matches_sole_label`'s half-coverage allowance would let a two-token title claim a
+        # three-token sibling. Loosening this branch is how the $95 Mini gets bought for the $140
+        # Standard, so it stays exact. Do not "unify" the two.
+        #
+        # There was a `label and` here. It was INERT -- `wanted` holds only non-empty strings, so
+        # `"" in wanted` is already False -- and a mutation sweep could not kill it. Deleted
+        # rather than annotated: a guard that cannot change an outcome reads as protection this
+        # comparison does not have. The blank label it appeared to defend against is refused by
+        # the membership test itself.
         for value in values:
             value = value if isinstance(value, dict) else {}
             label = _norm(value.get("label"))
-            if label and label in wanted:
+            if label in wanted:
                 if hit is not None:
                     # B5. Two VALUES on one axis matched our title. The previous rule only
                     # refused when their normalised labels DIFFERED, so two values carrying the
@@ -609,9 +762,13 @@ def variant_matches_request(variant: Any, chosen: Dict[str, str]) -> Optional[st
     against the request, every time.
     """
     data = variant if isinstance(variant, dict) else {}
+    # C1 (second pass). `data.get("options") or []` is falsy-safe but not TYPE-safe: `{"options": 3}`
+    # made this raise TypeError out of `resolve_our_row` -- a crash from partner JSON in the one
+    # guard the module cannot afford to lose. An unknown shape carries no options, so it refuses.
+    raw_options = data.get("options")
     got = {
         str(o.get("name") or ""): str(o.get("value") or "")
-        for o in data.get("options") or [] if isinstance(o, dict)
+        for o in (raw_options if isinstance(raw_options, list) else []) if isinstance(o, dict)
     }
     for axis, label in chosen.items():
         if axis not in got:
@@ -634,15 +791,26 @@ def variant_title_tokens(title: Any) -> List[str]:
     """Split one of our variant titles into candidate axis labels.
 
     Shopify joins multi-axis titles with " / " ("Standard / Rose"); single-axis titles are the
-    label itself. The whole title is kept as a candidate too, because a single-axis label can
-    legitimately contain a slash.
+    label itself. THE WHOLE TITLE IS ALWAYS THE FIRST CANDIDATE, because a single-axis label can
+    legitimately contain a slash -- "Standard / Rose" may be one label, not two.
+
+    ONE-CHARACTER FRAGMENTS ARE DROPPED. Splitting "S/M" produced the fragments `S` and `M`, and
+    a single letter is not a label: against the substring rule this function fed, `M` matched any
+    label containing the letter m ("Jumbo", "Mini", "Medium"). The whole-token rule in
+    `title_matches_sole_label` would already refuse those, but a one-character fragment cannot
+    identify a variant under ANY rule, so it is not offered as a candidate at all. The whole title
+    is exempt: a row whose entire title is "S" is a real single-axis size, and dropping it would
+    leave nothing to match on.
     """
     raw = str(title or "").strip()
     if not raw:
         return []
-    parts = [p.strip() for p in raw.split("/") if p.strip()]
-    out = [raw] if raw not in parts else []
-    return out + parts
+    out = [raw]
+    for part in raw.split("/"):
+        part = part.strip()
+        if len(part) >= 2 and part not in out:
+            out.append(part)
+    return out
 
 
 # --- request bodies: every field name taken from the spec, none invented --------------------
@@ -907,6 +1075,49 @@ class ReapResponse:
     warnings: List[str] = field(default_factory=list)
 
 
+async def _read_bounded(response: Any, *, max_bytes: int = MAX_RESPONSE_BYTES) -> Optional[bytes]:
+    """Read a STREAMING response body, or return None if it exceeds `max_bytes`.
+
+    Shared deliberately: `_post` uses it, and a sibling `_get` on the stacked branch should use
+    it rather than grow a second copy of the bound. Takes an httpx streaming response (anything
+    with `.headers` and `.aiter_bytes()`); returns the bytes, or None for "too large". It does not
+    parse, does not log the body, and never raises for size -- the caller turns None into
+    `response_too_large` so the refusal vocabulary stays in one place.
+
+    TWO CHECKS, AND THE SECOND IS THE REAL ONE. A declared `Content-Length` is the cheap check and
+    it is worth having, because it can refuse before a single byte of body is read. It is also a
+    CLAIM, made by the host we are defending against: it can be absent (chunked responses declare
+    nothing), or simply wrong. So the cumulative count while reading is what actually enforces the
+    cap, and the read stops the moment it is exceeded rather than finishing and then objecting.
+
+    The previous version had both checks but ran them AFTER `client.post`, which does not return
+    until the whole body is in memory -- so it declined to parse a body it had already fully
+    allocated. That is a cosmetic bound, and it is the one this replaces.
+    """
+    declared = str((response.headers or {}).get("content-length") or "").strip()
+    if declared.isdigit() and int(declared) > max_bytes:
+        return None
+    chunks: List[bytes] = []
+    total = 0
+    iterator = response.aiter_bytes()
+    try:
+        async for chunk in iterator:
+            total += len(chunk)
+            if total > max_bytes:
+                return None
+            chunks.append(chunk)
+    finally:
+        # Abandoning a suspended async generator leaves its cleanup to the garbage collector,
+        # which on an early return means the socket is released whenever the loop next gets
+        # round to it -- and under asyncio that surfaces as "Task was destroyed but it is
+        # pending". Closing it here makes the release deterministic, which for the path that
+        # exists to STOP READING is the whole point.
+        aclose = getattr(iterator, "aclose", None)
+        if aclose is not None:
+            await aclose()
+    return b"".join(chunks)
+
+
 async def _post(path: str, body: Dict[str, Any], *, timeout_seconds: Optional[float] = None) -> ReapResponse:
     """One POST. Returns a result; raises only on misconfiguration.
 
@@ -923,10 +1134,17 @@ async def _post(path: str, body: Dict[str, Any], *, timeout_seconds: Optional[fl
     # REAP_API_BASE_URL and that credential reaching whatever host the typo names.
     url = validate_base_url()
     key = _api_key() or ""
-    if timeout_seconds:
+    # C3. An explicit argument wins -- but `if timeout_seconds:` treated 0 and 0.0 as "not
+    # supplied" and silently fell through to the default, so a caller asking for no timeout got
+    # 25 s. `is not None` distinguishes them, and a non-positive explicit value is a caller bug
+    # rather than a request we should reshape.
+    if timeout_seconds is not None:
         timeout = float(timeout_seconds)
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ReapRequestError(
+                f"timeout_seconds must be a positive finite number, got {timeout_seconds!r}")
     else:
-        # C3. The per-path default is the BASE and the env var may only raise it. See
+        # The per-path default is the BASE and the env var may only raise it. See
         # `_env_timeout_floor` for why it used to be able to lower it, and why that was invisible.
         timeout = default_timeout_for(path)
         floor = _env_timeout_floor()
@@ -942,7 +1160,28 @@ async def _post(path: str, body: Dict[str, Any], *, timeout_seconds: Optional[fl
         # checked against the URL we chose, never against the one a redirect hands us. A redirect
         # must be a visible non-2xx here, not a second request nobody reviewed.
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
-            resp = await client.post(f"{url}{path}", json=body, headers=_headers(key, path, body))
+            # C2 (second pass). STREAMED, because `client.post` returns only once the whole body
+            # is already in memory -- so the size checks that used to sit below it were measuring
+            # an allocation that had already happened. They refused to PARSE an oversized body
+            # while having read all of it, which is the part that costs. `stream` plus
+            # `_read_bounded` makes the bound real: the read stops at the cap.
+            async with client.stream(
+                "POST", f"{url}{path}", json=body, headers=_headers(key, path, body)
+            ) as resp:
+                if resp.status_code >= 400:
+                    # The response BODY is deliberately not logged or returned to a serving
+                    # caller: a partner's error payload can echo the request, and the request can
+                    # contain a buyer's address. Operators reproducing a failure should use the
+                    # probe script, not prod logs. Nothing reads the body here at all.
+                    logger.warning("reap %s rejected: status=%s", path, resp.status_code)
+                    return ReapResponse(
+                        ok=False, status=resp.status_code,
+                        error=f"reap_status_{resp.status_code}",
+                        merchant_probably_not_completable=(
+                            resp.status_code == 503 and path in _SLOW_PATHS),
+                    )
+                raw = await _read_bounded(resp)
+                status = resp.status_code
     except Exception as exc:  # noqa: BLE001
         # The exception TYPE only. Never the request: the body can carry a shipping address and
         # the headers carry the key, and an exception string is the easiest place for either to
@@ -950,33 +1189,16 @@ async def _post(path: str, body: Dict[str, Any], *, timeout_seconds: Optional[fl
         logger.warning("reap %s failed: %s", path, type(exc).__name__)
         return ReapResponse(ok=False, error=f"transport_error:{type(exc).__name__}")
 
-    if resp.status_code >= 400:
-        # The response BODY is deliberately not logged or returned to a serving caller: a
-        # partner's error payload can echo the request, and the request can contain a buyer's
-        # address. Operators reproducing a failure should use the probe script, not prod logs.
-        logger.warning("reap %s rejected: status=%s", path, resp.status_code)
-        return ReapResponse(
-            ok=False, status=resp.status_code, error=f"reap_status_{resp.status_code}",
-            merchant_probably_not_completable=(resp.status_code == 503 and path in _SLOW_PATHS),
-        )
-
-    # C2. Bound the body before parsing it. Nothing upstream limits what a partner can return, and
-    # `resp.json()` on a multi-megabyte document allocates the parsed object graph on top of the
-    # bytes -- in a serving path, from a host we do not run. Both halves are needed: the declared
-    # length is the cheap check and the length actually read is the one that cannot be lied about.
-    declared = str((resp.headers or {}).get("content-length") or "").strip()
-    if declared.isdigit() and int(declared) > MAX_RESPONSE_BYTES:
-        logger.warning("reap %s response declares %s bytes; refusing", path, declared)
-        return ReapResponse(ok=False, status=resp.status_code, error="response_too_large")
-    if len(resp.content or b"") > MAX_RESPONSE_BYTES:
+    if raw is None:
         logger.warning("reap %s response exceeded %s bytes; refusing", path, MAX_RESPONSE_BYTES)
-        return ReapResponse(ok=False, status=resp.status_code, error="response_too_large")
+        return ReapResponse(ok=False, status=status, error="response_too_large")
 
     try:
-        payload = resp.json()
+        payload = json.loads(raw.decode("utf-8"))
     except Exception:  # noqa: BLE001
-        return ReapResponse(ok=False, status=resp.status_code, error="unparseable_response")
+        return ReapResponse(ok=False, status=status, error="unparseable_response")
 
+    resp_status = status
     data = payload if isinstance(payload, dict) else {}
     # C4. `warnings` is whatever the partner sent. A BARE STRING is iterable, so
     # `[str(w) for w in data["warnings"]]` turned `"MERCHANT_NOT_FOUND"` into eighteen
@@ -991,7 +1213,7 @@ async def _post(path: str, body: Dict[str, Any], *, timeout_seconds: Optional[fl
     warnings = [str(w) for w in raw_warnings if w]
     if warnings:
         logger.info("reap %s returned warnings: %s", path, ",".join(sorted(set(warnings))[:5]))
-    return ReapResponse(ok=True, status=resp.status_code, data=data, warnings=warnings)
+    return ReapResponse(ok=True, status=resp_status, data=data, warnings=warnings)
 
 
 async def search_products(**kwargs: Any) -> ReapResponse:
@@ -1025,10 +1247,16 @@ def details_for(details_payload: Any, product_id: str) -> Tuple[Optional[Dict[st
     made a route return a green 200 with `created=0` earlier this month.)
     """
     data = details_payload if isinstance(details_payload, dict) else {}
-    for product in data.get("products") or []:
+    # C1 (second pass). Both of these were `x or []`, which is falsy-safe but not TYPE-safe:
+    # `{"products": 7}` and `{"errors": true}` are truthy non-iterables and each raised TypeError
+    # straight out of `resolve_our_row`. The per-element `isinstance` below never ran, because the
+    # `for` itself is what failed. An unknown shape holds no products and no errors.
+    products = data.get("products")
+    errors = data.get("errors")
+    for product in products if isinstance(products, list) else []:
         if isinstance(product, dict) and str(product.get("id") or "") == product_id:
             return product, None
-    for err in data.get("errors") or []:
+    for err in errors if isinstance(errors, list) else []:
         if isinstance(err, dict) and str(err.get("productId") or "") == product_id:
             return None, str(err.get("code") or "unknown_error")
     return None, "product_not_in_response"
@@ -1078,8 +1306,16 @@ class VariantResolution:
     #: True when the product has no option axes and the single variant was taken from
     #: `defaultVariant`. The ONE legitimate use of that field -- see `resolve_our_row`.
     single_variant_product: bool = False
-    #: True when the option axis resolved structurally rather than by comparison: one axis, one
-    #: value, and no variant title on our row. See `OptionMatch` for why a caller may want to know.
+    #: True when the option axis resolved STRUCTURALLY rather than by comparison: one axis, one
+    #: value, and no variant title on our row.
+    #:
+    #: READ THIS AS A CLAIM THE CALLER MADE, NOT AS A FACT THIS MODULE CHECKED. Passing no variant
+    #: title asserts "this row has no variants"; nothing here can verify that, and if the
+    #: assertion is wrong we have resolved a product whose variant our row never named. A caller
+    #: that cannot make that assertion about its own data must treat `True` here as a REFUSAL.
+    #: Every other acceptance was compared to our title (`title_matches_sole_label`), and a title
+    #: that was supplied but normalises to nothing refuses as `variant_title_unusable` rather
+    #: than arriving here.
     single_value_axis_accepted_without_title: bool = False
     #: Set when the quote leg reported 503. See `ReapResponse.merchant_probably_not_completable`.
     merchant_probably_not_completable: bool = False
@@ -1101,6 +1337,10 @@ async def resolve_our_row(
     brand: Optional[str] = None,
     category: Optional[str] = None,
     our_price: Optional[float] = None,
+    # ONE parameter doing TWO jobs: it is sent as Reap's search-context currency AND used as our
+    # row's currency when comparing prices. That is only correct while the two are the same. The
+    # day we want a USD row priced in a EUR search context, this has to become two parameters --
+    # today it would silently report a currency_mismatch that is our own request's doing.
     currency: Optional[str] = None,
     country: Optional[str] = None,
     also_accept_domains: Sequence[str] = (),
@@ -1288,7 +1528,11 @@ def _disagrees(
         return False
     reap_currency = _norm_currency(price[1])
     ours = _norm_currency(our_currency)
-    if not reap_currency or not ours or reap_currency != ours:
+    # `not ours` used to be a third clause here. It was INERT: when Reap names a currency and we
+    # do not, `reap_currency != ours` is already True, and when Reap names none the first clause
+    # has already fired. A mutation sweep could not kill it. Removed rather than kept as
+    # reassurance -- the unknown-is-a-disagreement property is carried by the two clauses left.
+    if not reap_currency or reap_currency != ours:
         return True
     return abs(price[0] - float(our_price)) >= 0.01
 
@@ -1356,6 +1600,11 @@ REFUSAL_EXPLANATIONS: List[Tuple[str, str]] = [
     ("options:no_variant_title_supplied",
      "The product has option axes and we passed no variant title, so there is nothing to\n"
      "resolve against. Pass the title from the row."),
+    ("options:variant_title_unusable",
+     "A variant title WAS supplied and it normalises to nothing -- \"!!!\", \"/\", \" - \". This is\n"
+     "not the same as passing no title: the caller believes it constrained the resolution, and\n"
+     "falling through to the untitled path would resolve a single-value product on an assertion\n"
+     "nobody made. Fix the row's title; do not clear it to reach the untitled path."),
     ("options:product_has_no_option_axes",
      "Unexpected: a product with no axes should have been handled by the single-variant path.\n"
      "If you see this, the details response changed shape."),
