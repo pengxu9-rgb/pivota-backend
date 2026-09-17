@@ -32,7 +32,7 @@ from services import reap_agentic_client as rc
 
 
 @pytest.fixture(autouse=True)
-def _no_unpatched_httpx(monkeypatch):
+def _no_unpatched_httpx(request, monkeypatch):
     """Make an un-patched `httpx.AsyncClient` construction raise, in EVERY test in this file.
 
     This is here because it already happened. A probe of this module forgot to patch the
@@ -44,7 +44,18 @@ def _no_unpatched_httpx(monkeypatch):
     `wire` (and any test that patches `httpx.AsyncClient` itself) replaces this with the
     recorder, so the guard costs nothing where the transport is already faked. Where it is not,
     the error names the fixture to use.
+
+    `mock_httpx` IS THE ONE EXEMPTION, and it has to be. That fixture builds a REAL
+    `httpx.AsyncClient` over a `MockTransport` -- no sockets, but httpx's own response decoding,
+    which is the thing those tests are about -- by SUBCLASSING whatever `httpx.AsyncClient` is at
+    the time. An autouse fixture runs first, so the subclass would inherit from this guard and
+    raise in its own constructor: the guard would not be catching a mistake, it would be breaking
+    the one set of tests that exercises the real client. Skipping it there is not a hole, because
+    `mock_httpx` installs a transport that cannot reach the network either.
     """
+    if "mock_httpx" in request.fixturenames:
+        return None
+
     import httpx
 
     class _NetworkForbidden:
@@ -5954,8 +5965,14 @@ def test_a_get_stops_reading_AT_the_cap_rather_than_finishing_first(wire, clean_
     assert not got.ok and got.error == "response_too_large"
     assert got.data == {}
     # Stopped at the cap, not at the end of the body.
-    assert wire.last_response.bytes_yielded <= rc.MAX_RESPONSE_BYTES + 64 * 1024
+    assert wire.last_response.bytes_yielded <= rc.MAX_RESPONSE_BYTES + rc._READ_CHUNK_BYTES
     assert wire.last_response.bytes_yielded < len(oversized)
+    # And in bounded STEPS. `_read_bounded` now passes an explicit `chunk_size`, because httpx
+    # decides the step otherwise and a decompressed body can arrive in one enormous piece -- a
+    # cap checked between chunks does nothing if there is only one chunk. The base pins this for
+    # the POST path; the GET path is a second caller of the same helper and gets the same check.
+    assert wire.last_response.requested_chunk_size == rc._READ_CHUNK_BYTES
+    assert wire.last_response.largest_chunk <= rc._READ_CHUNK_BYTES
 
 
 def test_a_get_still_refuses_on_an_honest_declared_length(wire, clean_env):
@@ -6085,8 +6102,11 @@ def test_the_bounded_reader_closes_its_iterator_on_the_early_return(wire, clean_
     closed = []
 
     class _WatchedResponse(_FakeResponse):
-        def aiter_bytes(self):
-            outer = super().aiter_bytes()
+        def aiter_bytes(self, chunk_size=None):
+            # `chunk_size` is forwarded, not swallowed: `_read_bounded` now passes an explicit
+            # one, and a fake that ignored it would let a mutant deleting that argument survive
+            # here even though the base has its own test for it.
+            outer = super().aiter_bytes(chunk_size=chunk_size)
 
             class _Watched:
                 async def __anext__(self):
@@ -6104,3 +6124,80 @@ def test_the_bounded_reader_closes_its_iterator_on_the_early_return(wire, clean_
     response = _WatchedResponse(200, content=b"z" * 5000, chunk_size=64)
     assert _run(rc._read_bounded(response, max_bytes=100)) is None
     assert closed == [True], "the iterator was abandoned rather than closed"
+
+
+# --- the operator scripts after the exact-label change ---------------------------------------------
+#
+# The base replaced the fuzzy sole-label rule with EXACT matching plus explicit aliases, so a row
+# whose Reap label carries a merchant suffix now REFUSES (`options:sole_label_differs`) instead of
+# being guessed at. That is the right call -- guessing is what bought the wrong bottle -- but it
+# means the probe script needs a way to supply the alias, or the refusal is a dead end.
+
+import sys as _sys
+
+
+def _resolve_script():
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "scripts", "ops", "reap_resolve_and_quote.py")
+    spec = importlib.util.spec_from_file_location("reap_resolve_and_quote", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_resolve_script_can_supply_variant_label_aliases(monkeypatch):
+    """`--alias` is repeatable and reaches `resolve_our_row` as `accept_variant_labels`. Without
+    it there is no way to act on a `sole_label_differs` refusal from the command line."""
+    seen = {}
+
+    async def fake_resolve(**kwargs):
+        seen.update(kwargs)
+        return rc.VariantResolution(ok=False, reason="search:merchant_not_in_results")
+
+    module = _resolve_script()
+    monkeypatch.setenv("REAP_API_BASE_URL", "https://sandbox.api.reap.global")
+    monkeypatch.setenv("REAP_API_KEY", "sk_test_key")
+    monkeypatch.setattr(rc, "resolve_our_row", fake_resolve)
+    monkeypatch.setattr(_sys, "argv", ["prog", "--alias", "Flamingo Flirt - Cream",
+                                       "--alias", "Flamingo Flirt Cream"])
+    module.main()
+    assert seen["accept_variant_labels"] == ("Flamingo Flirt - Cream", "Flamingo Flirt Cream")
+    # THE CONTROL: with no flag it passes an empty tuple rather than omitting the argument, so
+    # the module's default and the script's default cannot drift apart unnoticed.
+    seen.clear()
+    monkeypatch.setattr(_sys, "argv", ["prog"])
+    module.main()
+    assert seen["accept_variant_labels"] == ()
+
+
+def test_a_sole_label_refusal_prints_the_alias_to_re_run_with(monkeypatch, capsys):
+    """The refusal carries Reap's label in `candidates`, and that label is the exact string to
+    pass back. Printing the flag spelled out is the difference between a dead end and a loop an
+    operator can close in one more run."""
+    async def fake_resolve(**kwargs):
+        return rc.VariantResolution(
+            ok=False, reason="options:sole_label_differs:Shade",
+            candidates=[{"axis": "Shade", "label": "Flamingo Flirt - Cream"}])
+
+    module = _resolve_script()
+    monkeypatch.setenv("REAP_API_BASE_URL", "https://sandbox.api.reap.global")
+    monkeypatch.setenv("REAP_API_KEY", "sk_test_key")
+    monkeypatch.setattr(rc, "resolve_our_row", fake_resolve)
+    monkeypatch.setattr(_sys, "argv", ["prog"])
+    module.main()
+    out = capsys.readouterr().out
+    assert "--alias 'Flamingo Flirt - Cream'" in out
+    # And it says to check they are the same physical thing first: the whole reason exact
+    # matching replaced the fuzzy rule is that a confident guess bought the wrong bottle.
+    assert "same physical thing" in out
+
+
+def test_the_purchase_steps_script_has_no_alias_option_because_it_resolves_nothing():
+    """Deliberately ABSENT, not overlooked. `reap_purchase_steps.py` starts from a `--quote-id`
+    that a previous run produced; it never calls `resolve_our_row`, so an `--alias` there would
+    be a flag that silently does nothing -- which is worse than not having one."""
+    import inspect
+    source = inspect.getsource(_purchase_steps())
+    assert "resolve_our_row" not in source
+    assert "accept_variant_labels" not in source

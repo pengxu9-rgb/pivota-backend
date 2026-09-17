@@ -74,6 +74,13 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--quote", action="store_true",
                     help="after resolving, also call POST /agentic/quotes")
+    ap.add_argument("--alias", action="append", default=[], metavar="LABEL",
+                    help="a Reap variant label to accept for our title, e.g. "
+                         "--alias 'Flamingo Flirt - Cream'. Repeatable. Needed when Reap's sole "
+                         "label carries a merchant suffix our row does not store: the match is "
+                         "EXACT, so such a row now refuses with `options:sole_label_differs` "
+                         "rather than being guessed at. The refusal prints Reap's label, so the "
+                         "loop is: run once, read the label, re-run with it as --alias.")
     args = ap.parse_args()
 
     from services import reap_agentic_client as rc
@@ -96,10 +103,13 @@ def main() -> int:
               "DO NOT disable the check: a mistyped base URL delivers the API key to the typo.")
         return 2
 
+    if args.alias:
+        print(f"aliases      : {args.alias}   (accepted as our variant title)")
     resolved = asyncio.run(rc.resolve_our_row(
         merchant_domain=MERCHANT_DOMAIN, product_name=PRODUCT_NAME, brand=BRAND,
         category=CATEGORY,
         variant_title=VARIANT_TITLE, our_price=OUR_PRICE, country="US", currency="USD",
+        accept_variant_labels=tuple(args.alias),
     ))
 
     print("\n--- RESOLUTION " + "-" * 56)
@@ -127,6 +137,12 @@ def main() -> int:
         print(f"warnings        : {resolved.warnings}")
     if resolved.candidates:
         print(f"candidates      : {json.dumps(resolved.candidates, indent=2)[:1200]}")
+    if (resolved.reason or "").startswith("options:sole_label_differs"):
+        labels = [c.get("label") for c in resolved.candidates if isinstance(c, dict)
+                  and c.get("label")]
+        if labels:
+            print("\nRE-RUN WITH, once you have checked these are the same physical thing:")
+            print("  " + " ".join(f"--alias {label!r}" for label in labels))
 
     if not resolved.ok:
         print("\n--- WHAT THIS TELLS US " + "-" * 48)
