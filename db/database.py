@@ -883,14 +883,18 @@ async def _end_within_deadline(xact, action: str) -> None:  # type: ignore[no-un
             ) from exc
         return task.result()
     # Cancelling the task makes asyncpg queue a cancel for the running
-    # statement. One shared budget for the task to unwind and the cancel to
-    # land: never trade one hang for another.
+    # statement (its waiter callback runs before the task resumes). One shared
+    # budget for the task to unwind and the cancel to land: never trade one
+    # hang for another. Only a root COMMIT waits for the cancel — for the other
+    # ends, terminating already fixes the outcome (nothing committed), so the
+    # wait would only hold the slot and the lock longer.
     loop = asyncio.get_running_loop()
     until = loop.time() + deadline
     task.cancel()
     await asyncio.wait((task,), timeout=deadline)
-    await asyncio.sleep(0)  # let asyncpg's waiter callbacks queue the cancel
-    settled = task.done() and await _cancel_lands(con, max(0.0, until - loop.time()))
+    settled = False
+    if action == "commit" and not nested and task.done():
+        settled = await _cancel_lands(con, max(0.0, until - loop.time()))
     con.terminate()
     if task.done() and not task.cancelled():
         task.exception()  # consumed: the timeout below is the error that matters
@@ -901,10 +905,11 @@ async def _end_within_deadline(xact, action: str) -> None:  # type: ignore[no-un
         ("rollback", True): "ROLLBACK TO SAVEPOINT",
     }[(action, nested)]
     logger.warning(
-        "no answer to %s within %.1fs — cancel %s, terminated the connection",
+        "no answer to %s within %.1fs — terminated the connection%s",
         statement,
         deadline,
-        "acknowledged" if settled else "NOT acknowledged",
+        ("" if action != "commit" or nested
+         else " (cancel acknowledged)" if settled else " (cancel NOT acknowledged)"),
     )
     if action == "commit" and not nested:
         raise _commit_outcome_unknown(f"COMMIT got no answer within {deadline:.1f}s", settled)

@@ -552,3 +552,82 @@ async def test_when_the_cancel_cannot_land_the_error_says_the_commit_may_still_l
     assert await _rows_once_the_commit_would_have_landed(db) == [1], (
         "the server did not finish the COMMIT — then this test no longer shows why the message warns"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["deadline", "command-timeout"])
+async def test_a_cancel_request_that_fails_fast_is_not_reported_as_settled(db, monkeypatch, path) -> None:
+    """A refused cancel connection (or a TLS error) fails at once instead of hanging.
+
+    Reporting that as settled would say "the data is final" while the COMMIT still lands after —
+    the double write this code exists to prevent. The row appearing later is the proof.
+    """
+    import asyncpg.connect_utils
+    from databases import Database
+
+    import db.database as dbmod
+    from db.database import CommitOutcomeUnknown
+
+    await _make_commit_slow(db)
+
+    async def refused(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise ConnectionRefusedError("simulated: the cancel connection was refused")
+
+    monkeypatch.setattr(asyncpg.connect_utils, "_cancel", refused)
+    target = db
+    if path == "command-timeout":
+        monkeypatch.setattr(dbmod, "DB_POOL_CHECKOUT_TIMEOUT_SECONDS", 5.0)
+        target = Database(DATABASE_URL, min_size=1, max_size=1, command_timeout=0.3)
+        await target.connect()
+    try:
+
+        async def write() -> None:
+            async with target.transaction():
+                await target.execute(f"INSERT INTO {TABLE} VALUES (1)")
+
+        with pytest.raises(CommitOutcomeUnknown, match="MAY STILL BE RUNNING") as excinfo:
+            await _within_deadline(db, write())
+        assert excinfo.value.settled is False
+    finally:
+        if target is not db:
+            await asyncio.wait_for(target.disconnect(), timeout=10)
+    assert await _rows_once_the_commit_would_have_landed(db) == [1], (
+        "the server did not finish the COMMIT — then this test no longer shows why settled must be False"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_rollback_past_the_deadline_does_not_wait_for_a_cancel(db, monkeypatch) -> None:
+    """Terminating already fixes a ROLLBACK's outcome; waiting for its cancel only holds the slot."""
+    import asyncpg.connection
+
+    from db.database import TransactionEndTimedOut
+
+    cancels: list = []
+
+    async def slow_cancel(self, waiter):  # type: ignore[no-untyped-def]
+        cancels.append(self)
+        await db.unhang.wait()
+
+    monkeypatch.setattr(asyncpg.connection.Connection, "_cancel", slow_cancel)
+    real = asyncpg.connection.Connection.execute
+
+    async def execute(self, query, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if query.strip().upper().startswith("ROLLBACK"):
+            return await real(self, "SELECT pg_sleep(5)")  # a real statement, so a real cancel
+        return await real(self, query, *args, **kwargs)
+
+    monkeypatch.setattr(asyncpg.connection.Connection, "execute", execute)
+
+    async def failing_write() -> None:
+        async with db.transaction():
+            raise ValueError("the caller's own error")
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    with pytest.raises(TransactionEndTimedOut):
+        await _within_deadline(db, failing_write())
+    elapsed = loop.time() - started
+    assert cancels, "asyncpg never tried to cancel — the test proves nothing"
+    assert elapsed < DEADLINE * 1.5, f"a ROLLBACK waited {elapsed:.2f}s for a cancel it does not need"
+    _assert_terminated_and_released(db)
