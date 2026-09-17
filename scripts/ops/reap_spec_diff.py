@@ -162,10 +162,27 @@ def diff(pinned: Dict[str, Any], live: Dict[str, Any]) -> List[str]:
 
 def _required_delta(old: Any, new: Any) -> List[str]:
     """Required-key changes across a schema, including inside a `oneOf`."""
+    def branch_identity(node: Any, fallback: str) -> str:
+        """Name a schema branch by WHAT IT IS, not by where it sits in the list.
+
+        A positional label (`oneOf[1]`) is not an identity: inserting one branch at the front --
+        which is exactly what a partner does when they add an enrollment source -- renumbers
+        every branch after it, and the diff then reports a required-field change on each of them
+        while the one real difference scrolls past. The property-name set is stable under
+        insertion, reordering and renaming of the branch itself, and it changes only when the
+        branch's shape changes, which is the thing worth reporting.
+        """
+        if isinstance(node, dict) and isinstance(node.get("properties"), dict):
+            names = ",".join(sorted(node["properties"]))
+            if names:
+                return f"{{{names}}}"
+        return fallback
+
     def required_sets(node: Any, out: List[Tuple[str, frozenset]], label: str = "") -> None:
         if isinstance(node, dict):
             if isinstance(node.get("required"), list):
-                out.append((label or "<body>", frozenset(str(r) for r in node["required"])))
+                out.append((branch_identity(node, label or "<body>"),
+                            frozenset(str(r) for r in node["required"])))
             for branch in ("oneOf", "anyOf", "allOf"):
                 for i, sub in enumerate(node.get(branch) or []):
                     required_sets(sub, out, f"{label}{branch}[{i}]")
@@ -175,16 +192,47 @@ def _required_delta(old: Any, new: Any) -> List[str]:
     after: List[Tuple[str, frozenset]] = []
     required_sets(old, before)
     required_sets(new, after)
+
+    # MATCHED BY IDENTITY, NOT BY POSITION. `zip` lined the two lists up by index, so inserting
+    # one `oneOf` branch -- exactly what a partner does when they add an enrollment source --
+    # shifted every branch after it and reported a required-field change on each, burying the one
+    # real difference in a wall of noise.
+    #
+    # Two passes, and the second matters as much as the first. Pass one pairs branches whose
+    # property sets are identical, which survives insertion and reordering. Note that identities
+    # are NOT unique -- REAP_CARD and BIN_SPONSOR both have exactly {source, cardId} -- so this
+    # is a multiset match against a list of unclaimed branches, not a dict lookup, which would
+    # have silently dropped one of the two. Pass two pairs whatever is left IN ORDER, because a
+    # branch that gained or lost a property has a different identity on each side while still
+    # being the same branch: that is the `enrollmentId` case, and reporting it as one removal
+    # plus one addition would lose the field name, which is the whole reason this exists.
+    unclaimed = list(after)
+    pairs: List[Tuple[str, frozenset, frozenset]] = []
+    leftover_old: List[Tuple[str, frozenset]] = []
+    for label, was in before:
+        for i, (other_label, now) in enumerate(unclaimed):
+            if other_label == label:
+                pairs.append((label, was, now))
+                unclaimed.pop(i)
+                break
+        else:
+            leftover_old.append((label, was))
+
     lines: List[str] = []
-    for (label, was), (_, now) in zip(before, after):
-        if was == now:
-            continue
+    while leftover_old and unclaimed:
+        label, was = leftover_old.pop(0)
+        _, now = unclaimed.pop(0)
+        pairs.append((label, was, now))
+    for label, was in leftover_old:
+        lines.append(f"schema branch REMOVED: {label} (was required: {sorted(was)})")
+    for label, now in unclaimed:
+        lines.append(f"schema branch ADDED: {label} (required: {sorted(now)})")
+
+    for label, was, now in pairs:
         for key in sorted(was - now):
             lines.append(f"REQUIRED FIELD REMOVED from {label}: {key}")
         for key in sorted(now - was):
             lines.append(f"REQUIRED FIELD ADDED to {label}: {key}")
-    if len(before) != len(after):
-        lines.append(f"the number of schema branches changed: {len(before)} -> {len(after)}")
     return lines
 
 

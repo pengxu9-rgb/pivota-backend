@@ -320,20 +320,40 @@ def idempotency_key(
     body: Dict[str, Any],
     *,
     now: Optional[float] = None,
-    bucket_seconds: int = _IDEMPOTENCY_BUCKET_S,
+    bucket_seconds: Optional[int] = _IDEMPOTENCY_BUCKET_S,
 ) -> str:
-    """Deterministic in the request body AND in a coarse time bucket.
+    """Deterministic in the request body, and OPTIONALLY in a coarse time bucket.
 
-    The retry this protects against is the one where we never saw the response: a fresh key there
-    would ask Reap for a second quote for the same cart, and the body-derived part handles that.
-    The bucket handles the opposite error, which the first version of this function had -- the
-    same cart tomorrow is not a retry, and replaying yesterday's key returns yesterday's quote,
-    already expired, with a 200 on it.
+    THE BUCKET IS A QUOTE-SHAPED ANSWER AND IT DOES NOT GENERALISE. For a quote it is right: the
+    retry this protects against is the one where we never saw the response, which the
+    body-derived part handles, and the bucket handles the opposite error -- the same cart
+    tomorrow is not a retry, and replaying yesterday's key returns yesterday's quote, already
+    expired, with a 200 on it.
+
+    For a CHECKOUT it is actively wrong, and wrong in the double-charge direction. The buckets
+    are wall-clock aligned, not relative to the first attempt, so a retry three seconds after an
+    unknown outcome can land on the far side of an edge: measured, t=239999 and t=240002 produce
+    different keys for an identical (quoteId, enrollmentId). That is a SECOND CHECKOUT on one
+    quote -- the exact failure the key exists to prevent, reintroduced by the key. There is also
+    nothing to protect against: a quote is single-use and expires in about five minutes, so a
+    replay 24 hours later cannot return a checkout against a live quote. Pass
+    `bucket_seconds=None` and the time component is omitted entirely.
+
+    `bucket_seconds=None` is not "no expiry" -- Reap's own 24 h retention is the expiry. It is
+    "we are not adding a second, differently-aligned clock on our side".
     """
     canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
-    bucket = int((now if now is not None else time.time()) // max(1, int(bucket_seconds)))
-    material = f"{canonical}|{bucket}"
+    if bucket_seconds is None:
+        material = canonical
+    else:
+        bucket = int((now if now is not None else time.time()) // max(1, int(bucket_seconds)))
+        material = f"{canonical}|{bucket}"
     return f"pivota-{scope}-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+
+
+#: Paths whose idempotency key carries NO time component. See `idempotency_key`: the bucket is a
+#: quote-shaped answer, and on a create that can charge a card it is a double-charge edge.
+_UNBUCKETED_IDEMPOTENT_PATHS = ("/agentic/checkouts", "/agentic/enrollments")
 
 
 def idempotency_material(path: str, body: Dict[str, Any]) -> Dict[str, Any]:
@@ -347,10 +367,12 @@ def idempotency_material(path: str, body: Dict[str, Any]) -> Dict[str, Any]:
     CHECKOUT against the same quote -- which is the one failure an idempotency key exists to
     prevent, reintroduced by the key itself.
 
-    So a checkout is keyed on (quoteId, enrollmentId) and an enrollment on its owner. Both are
-    opaque ids of ours or of Reap's. Note what is deliberately NOT in either: the buyer's email,
-    which the enrollment body may carry. It is PII, it does not identify the enrollment being
-    created, and a key is a value we put in a header on every retry.
+    So a checkout is keyed on (quoteId, enrollmentId) and an enrollment on its owner PLUS the
+    caller's attempt id, which `_headers` merges in -- see `create_enrollment` for why the owner
+    alone is not enough. Everything here is an opaque id of ours or of Reap's. Note what is
+    deliberately NOT in either: the buyer's email, which the enrollment body may carry. It is
+    PII, it does not identify the enrollment being created, and a key is a value we put in a
+    header on every retry.
     """
     data = body if isinstance(body, dict) else {}
     if path == "/agentic/checkouts":
@@ -364,11 +386,23 @@ def idempotency_material(path: str, body: Dict[str, Any]) -> Dict[str, Any]:
     return data
 
 
-def _headers(key: str, path: str, body: Dict[str, Any], *, method: str = "POST") -> Dict[str, str]:
+def _headers(
+    key: str,
+    path: str,
+    body: Dict[str, Any],
+    *,
+    method: str = "POST",
+    idempotency_extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, str]:
     """`method` is not cosmetic. `_IDEMPOTENT_PATHS` is matched by PATH, and `/agentic/enrollments`
     is both a create and a list -- so keying off the path alone would put an Idempotency-Key on
     the GET too. A key on a read is at best noise and at worst asks a partner to replay a
-    24-hour-old list for a poll."""
+    24-hour-old list for a poll.
+
+    `idempotency_extra` carries material that is NOT a field of the request body -- today only
+    the enrollment `attempt_id`, which identifies which of our attempts this is and has no place
+    in a body whose schema does not have it.
+    """
     headers = {
         "Authorization": f"Bearer {key}",
         "Reap-Version": REAP_VERSION,
@@ -377,8 +411,13 @@ def _headers(key: str, path: str, body: Dict[str, Any], *, method: str = "POST")
     if method.upper() == "POST":
         headers["Content-Type"] = "application/json"
         if path in _IDEMPOTENT_PATHS:
+            material = idempotency_material(path, body)
+            if idempotency_extra:
+                material = {**material, **idempotency_extra}
             headers["Idempotency-Key"] = idempotency_key(
-                path.rsplit("/", 1)[-1], idempotency_material(path, body)
+                path.rsplit("/", 1)[-1], material,
+                bucket_seconds=(None if path in _UNBUCKETED_IDEMPOTENT_PATHS
+                                else _IDEMPOTENCY_BUCKET_S),
             )
     return headers
 
@@ -1596,7 +1635,13 @@ async def _read_bounded(response: Any, *, max_bytes: int = MAX_RESPONSE_BYTES) -
     return b"".join(chunks)
 
 
-async def _post(path: str, body: Dict[str, Any], *, timeout_seconds: Optional[float] = None) -> ReapResponse:
+async def _post(
+    path: str,
+    body: Dict[str, Any],
+    *,
+    timeout_seconds: Optional[float] = None,
+    idempotency_extra: Optional[Dict[str, Any]] = None,
+) -> ReapResponse:
     """One POST. Returns a result; raises only on misconfiguration.
 
     A network failure is a result rather than an exception because the caller is a serving path
@@ -1653,7 +1698,8 @@ async def _post(path: str, body: Dict[str, Any], *, timeout_seconds: Optional[fl
             # `_read_bounded` makes the bound real: DECODED bytes are counted as they arrive, in
             # steps of at most 64 KiB, and the read is abandoned once the cap is passed.
             async with client.stream(
-                "POST", f"{url}{path}", json=body, headers=_headers(key, path, body)
+                "POST", f"{url}{path}", json=body,
+                headers=_headers(key, path, body, idempotency_extra=idempotency_extra),
             ) as resp:
                 if resp.status_code >= 400:
                     # The response BODY is deliberately not logged or returned to a serving
@@ -1760,6 +1806,11 @@ def _error_codes(raw: Optional[bytes]) -> Tuple[Optional[str], Optional[str]]:
     against `_ERROR_CODE_RE` first, so a body that puts an address (or anything else) where a
     code belongs yields None rather than a leak. `error.message` is free text and is never read.
     """
+    # `not raw` -- None from an over-cap read, or an empty body -- falls through to the
+    # `except` below and yields the same (None, None). The explicit branch is kept because the
+    # CONTRACT is "None in, no codes out" and a reader should not have to derive that from an
+    # exception handler; it is pinned by `test_the_error_code_reader_has_no_codes_without_bytes`
+    # rather than by a mutant, because a mutant that deletes it changes no behaviour at all.
     if not raw:
         return None, None
     try:
@@ -2403,6 +2454,13 @@ REFUSAL_EXPLANATIONS: List[Tuple[str, str]] = [
      "genuinely Reap's, add it to ALLOWED_HOSTED_URL_SUFFIXES with a document that names it.\n"
      "DO NOT disable the check. This is also the FIRST thing to suspect on a first live run:\n"
      "the two suffixes are taken from a plan, not from a measurement."),
+    ("reap_status_400",
+     "AGENTIC_REQUEST_REJECTED. Reap understood the request and declined it, which is a\n"
+     "different thing from a malformed body (that is a 422). The REASON is in\n"
+     "`error.detail.code` -- pass it to `explain_detail_code`; on the checkout leg it is\n"
+     "usually ENROLLMENT_NOT_ACTIVE. Retrying the request unchanged will not help.\n"
+     "This is the most common failure on the enrollment and checkout legs, and it had no copy\n"
+     "at all until an operator-script run fell through to the catch-all for it."),
     ("reap_status_403",
      "AGENTIC_PAYMENTS_NOT_ENABLED. The agentic module is not enabled on this key. That is an\n"
      "account-level fact, not a per-request one -- retrying will not change it."),
@@ -2485,6 +2543,21 @@ def explain_refusal(reason: Optional[str]) -> str:
 # --- URLs in both directions -----------------------------------------------------------------
 
 
+#: Characters that may not appear ANYWHERE in a URL this module validates or accepts: C0
+#: controls, space, and DEL.
+#:
+#: The check has to run BEFORE the parse, and that ordering is the finding. `urlsplit` SANITISES
+#: -- it strips tab, CR and LF out of the components it returns -- so a validator that parses and
+#: then approves the RAW string has checked a different string from the one it hands on.
+#: Measured: `https://agent.pivota.cc/r?cid=1\r\nX: y` parsed to a clean host, passed every
+#: check, and was returned with the CRLF still in it, to be sent to a partner and, on the inbound
+#: side, handed to a buyer as a link. Refusing outright means the string we validated and the
+#: string we return are the same string, which is the only version of this that can be reasoned
+#: about. A legitimate URL of ours has no business containing a raw control character; anything
+#: that needs one percent-encodes it.
+_URL_FORBIDDEN_CHARS = re.compile(r"[\x00-\x20\x7f]")
+
+
 def return_url_hosts() -> Tuple[str, ...]:
     """Hosts our own `returnUrl` may name. `REAP_RETURN_URL_HOSTS`, comma-separated.
 
@@ -2514,6 +2587,9 @@ def validate_return_url(raw: Any) -> str:
     url = str(raw or "").strip()
     if not url:
         raise ReapRequestError("a hosted flow needs a returnUrl")
+    if _URL_FORBIDDEN_CHARS.search(url):
+        # BEFORE parsing, and this ordering is the whole point -- see `_URL_FORBIDDEN_CHARS`.
+        raise ReapRequestError("returnUrl must not contain control characters or whitespace")
     parsed = urlparse(url)
     if parsed.scheme != "https":
         raise ReapRequestError(f"returnUrl must be https, got {parsed.scheme or 'none'!r}")
@@ -2525,6 +2601,9 @@ def validate_return_url(raw: Any) -> str:
         raise ReapRequestError(
             f"returnUrl host {host!r} is not in REAP_RETURN_URL_HOSTS {allowed}"
         )
+    # `url`, never `parsed.geturl()`. The two are DIFFERENT STRINGS for an input carrying a
+    # control character, and returning the reassembled one would mean we validated a string
+    # nobody sends and sent a string nobody validated. The check above makes them identical.
     return url
 
 
@@ -2538,8 +2617,21 @@ def hosted_url_is_allowed(raw: Any) -> bool:
     url = str(raw or "").strip()
     if not url:
         return False
+    if _URL_FORBIDDEN_CHARS.search(url):
+        return False
     parsed = urlparse(url)
     if parsed.scheme != "https" or parsed.username or parsed.password:
+        return False
+    try:
+        # A malformed port raises out of the property rather than returning None.
+        port = parsed.port
+    except ValueError:
+        return False
+    if port is not None and port != 443:
+        # Pinned to the default. Reap's hosted pages are on 443, and an explicit odd port on a
+        # host that otherwise looks right is the shape of a URL that wants to reach something
+        # else on that machine. If Reap ever serves a hosted page elsewhere, that is a document
+        # to read, not a check to relax quietly.
         return False
     host = (parsed.hostname or "").lower()
     return bool(host) and any(
@@ -2563,11 +2655,44 @@ def hosted_action(payload: Any) -> Optional[Tuple[str, Optional[str]]]:
     action = data.get("nextAction")
     if not isinstance(action, dict):
         return None
+    if action.get("type") != "REDIRECT":
+        # Exact match, and not merely "has a url". Every agentic `nextAction` in the spec is a
+        # REDIRECT, so anything else is either a shape we have never seen or a surface from the
+        # partner's ISSUANCE rail -- which includes reveal-PAN. The caller's next move with this
+        # value is to show it to a buyer as a link, and "it had a url in it" is not a reason to
+        # do that. An action with no type at all is refused for the same reason.
+        return None
     url = str(action.get("url") or "").strip()
     if not hosted_url_is_allowed(url):
         return None
     expires = action.get("expiresAt")
     return url, (str(expires) if isinstance(expires, str) and expires else None)
+
+
+def _next_action_is_unsafe(node: Any) -> bool:
+    """Does this object carry a `nextAction` we refuse to pass on?
+
+    Three ways to fail, and the second two were missed the first time round:
+
+      1. A REDIRECT whose URL is not on an allowlisted host.
+      2. A `nextAction` that is not an object at all. A LIST of actions sailed straight through
+         the old `isinstance(action, dict)` guard untouched -- the check read as "vet it if it
+         is a dict" and therefore as "pass it on if it is not", which is backwards for an
+         untrusted value. Anything we cannot vet, we refuse.
+      3. An action whose `type` is not REDIRECT. Every agentic `nextAction` in the spec is a
+         REDIRECT; the partner's ISSUANCE rail has a reveal-PAN surface, and an action of some
+         other type must never reach a buyer as a link.
+    """
+    if not isinstance(node, dict):
+        return False
+    action = node.get("nextAction")
+    if action is None:
+        return False
+    if not isinstance(action, dict):
+        return True
+    if action.get("type") != "REDIRECT":
+        return True
+    return not hosted_url_is_allowed(action.get("url"))
 
 
 def _refuse_unsafe_hosted_url(result: ReapResponse) -> ReapResponse:
@@ -2576,14 +2701,22 @@ def _refuse_unsafe_hosted_url(result: ReapResponse) -> ReapResponse:
     The response is replaced rather than annotated, and `data` is dropped: a caller handed the
     payload "with a flag on it" reads `nextAction.url` out of it, because that is the field the
     whole call was for. The only way to be sure the URL is not used is for it not to be there.
+
+    EVERY `nextAction` IN THE PAYLOAD, not just the top-level one. `GET /agentic/enrollments`
+    returns `items[]`, and the pinned spec gives every element its own `nextAction.url` -- so a
+    list response was a fifth call site that nothing guarded, and a single poisoned element
+    arrived with `ok=True` and its URL intact in `.data`. A guard applied to four of five sites
+    is not a guard; it is a note about four of them.
     """
     if not result.ok:
         return result
-    action = result.data.get("nextAction") if isinstance(result.data, dict) else None
-    if isinstance(action, dict) and not hosted_url_is_allowed(action.get("url")):
+    data = result.data if isinstance(result.data, dict) else {}
+    items = data.get("items")
+    candidates = [data] + (list(items) if isinstance(items, list) else [])
+    if any(_next_action_is_unsafe(node) for node in candidates):
         # The URL itself is not logged: it came from a partner and it is the untrusted value.
-        logger.warning("reap returned a hosted url outside %s; refusing the response",
-                       ALLOWED_HOSTED_URL_SUFFIXES)
+        logger.warning("reap returned a hosted action we will not pass to a buyer; "
+                       "refusing the response")
         return ReapResponse(ok=False, status=result.status, error="hosted_url_not_allowed")
     return result
 
@@ -2616,7 +2749,7 @@ def _path_id(value: Any, *, what: str, uuid: bool = False) -> str:
     if not text:
         raise ReapRequestError(f"a {what} id is required")
     pattern = _UUID_RE if uuid else _OPAQUE_ID_RE
-    if not pattern.match(text):
+    if not pattern.fullmatch(text):
         # The VALUE is echoed, truncated: it is ours or Reap's, never a credential, and an
         # operator with a malformed id needs to see which one it was.
         raise ReapRequestError(
@@ -2684,13 +2817,32 @@ def build_enrollment_request(
             f"unsupported enrollment fields: {','.join(sorted(str(k) for k in unsupported))}"
         )
 
-    reference = str(owner_id or "").strip()
+    if owner_id is not None and not isinstance(owner_id, str):
+        # `str(owner_id)` used to accept a dict and send `"{'a': 1}"` to a partner as a customer
+        # identifier. A caller passing a non-string here has made a mistake about what this
+        # parameter is, and stringifying it turns that mistake into a plausible-looking id that
+        # will never join back to anything.
+        raise ReapRequestError(
+            f"enrollment owner id must be a string, got {type(owner_id).__name__}"
+        )
+    reference = (owner_id or "").strip()
     if not reference:
         raise ReapRequestError("an enrollment needs an owner id (our client reference)")
+    if _URL_FORBIDDEN_CHARS.search(reference):
+        # It travels in a query string on the list endpoint and in an idempotency header.
+        raise ReapRequestError("enrollment owner id must not contain whitespace or controls")
     owner: Dict[str, Any] = {"type": "CLIENT_REFERENCE", "id": reference}
-    address = str(email or "").strip()
+    if email is not None and not isinstance(email, str):
+        raise ReapRequestError(f"enrollment owner email must be a string, got {type(email).__name__}")
+    address = (email or "").strip()
     if address:
-        if "@" not in address:
+        # `"@" in address` accepted `a@b@c`, `@b.com`, `a@` and `" a@b.com "` -- a check that
+        # fires on nothing a caller is likely to get wrong. This is still not RFC validation and
+        # is not trying to be: it is the set of shapes that are definitely not an address, and
+        # the address itself is REAL BUYER PII being prefilled onto a third party's page.
+        local, _, domain = address.partition("@")
+        if (address.count("@") != 1 or not local or not domain or "." not in domain
+                or _URL_FORBIDDEN_CHARS.search(address)):
             raise ReapRequestError("enrollment owner email is not an email address")
         owner["email"] = address
     return {
@@ -2752,17 +2904,34 @@ async def create_enrollment(
     *,
     owner_id: str,
     return_url: str,
+    attempt_id: str,
     email: Optional[str] = None,
     timeout_seconds: Optional[float] = None,
 ) -> ReapResponse:
     """Start a hosted card-entry flow. Returns an enrollment whose `nextAction.url` a HUMAN opens.
 
+    `attempt_id` IS REQUIRED, and it is the interesting parameter. The idempotency key here is
+    not time-bucketed -- see `idempotency_key` for why a wall-clock bucket is a double-create
+    edge -- so something else has to say "this is a NEW attempt rather than a retry of the last
+    one". The owner alone cannot: Reap retains a key for 24 hours while a hosted enrollment link
+    expires in about fifteen minutes, so keying on the owner would replay the same DEAD
+    enrollment, with its expired `nextAction.url`, to every later attempt by that buyer for the
+    rest of the day. They would click a link that cannot work and we would have no way to give
+    them a live one.
+
+    So the caller supplies the id of the attempt -- our ledger's enrollment row id -- and owns
+    the decision about what counts as a retry. It is validated as an opaque id: it is ours, but
+    it reaches a partner inside a header, and it must not be an email or anything else that
+    identifies a person.
+
     Fast path: the enrollment create is not talking to a merchant's commerce layer the way a
     quote is, so it keeps the default timeout rather than the 35 s quote bound.
     """
+    attempt = _path_id(attempt_id, what="enrollment attempt")
     body = build_enrollment_request(owner_id=owner_id, return_url=return_url, email=email)
     return _refuse_unsafe_hosted_url(
-        await _post("/agentic/enrollments", body, timeout_seconds=timeout_seconds)
+        await _post("/agentic/enrollments", body, timeout_seconds=timeout_seconds,
+                    idempotency_extra={"attemptId": attempt})
     )
 
 
@@ -2795,11 +2964,20 @@ async def list_enrollments(
     params: Dict[str, Any] = {"ownerId": owner, "ownerType": str(owner_type or "CLIENT_REFERENCE")}
     if limit is not None:
         # Clamped rather than refused: the spec's bounds are 1..100 and a caller asking for 500
-        # wants "as many as possible", which is what it gets.
-        params["limit"] = max(1, min(100, int(limit)))
+        # wants "as many as possible", which is what it gets. A non-numeric limit is a DIFFERENT
+        # thing -- a caller mistake, not an out-of-range intention -- and it used to escape as a
+        # bare ValueError while every other caller error in this module is a ReapRequestError.
+        try:
+            params["limit"] = max(1, min(100, int(limit)))
+        except (TypeError, ValueError):
+            raise ReapRequestError(f"enrollment list limit must be an integer, got {limit!r}")
     if cursor:
         params["cursor"] = str(cursor)
-    return await _get("/agentic/enrollments", params=params, timeout_seconds=timeout_seconds)
+    # THE FIFTH `nextAction` SITE. Every element of `items[]` carries its own, per the pinned
+    # spec, and this call was the one that did not go through the guard.
+    return _refuse_unsafe_hosted_url(
+        await _get("/agentic/enrollments", params=params, timeout_seconds=timeout_seconds)
+    )
 
 
 async def create_checkout(
@@ -2881,8 +3059,19 @@ UNKNOWN_STATE = "unknown"
 
 
 def _status_of(payload: Any) -> str:
+    """The `status` string EXACTLY as it arrived, or "" if there is not one.
+
+    NO `.strip()`, NO `.upper()`, and that is a decision rather than an omission. The partner has
+    only ever sent the exact uppercase enum values, so `" COMPLETED"` or `"Completed"` is not a
+    value we are failing to handle -- it is a signal that something upstream is not what we think
+    it is, and normalising it away would hide that while letting an unexpected payload resolve to
+    a TERMINAL state. Unrecognised maps to `unknown`, which is non-terminal, keeps a poller
+    polling and tells a human. Leniency here buys nothing and costs the one distinction the
+    state machines exist to make.
+    """
     data = payload if isinstance(payload, dict) else {}
-    return str(data.get("status") or "").strip().upper()
+    status = data.get("status")
+    return status if isinstance(status, str) else ""
 
 
 def enrollment_state(payload: Any) -> str:

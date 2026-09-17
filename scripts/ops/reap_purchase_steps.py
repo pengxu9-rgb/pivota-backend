@@ -77,12 +77,21 @@ def _load(path: str) -> Dict[str, Any]:
 
 
 def _save(path: str, state: Dict[str, Any]) -> None:
+    """Write the state file 0600, owner-only.
+
+    It holds no credential and no card data, but it does hold a buyer's enrollment and checkout
+    ids and our own client reference for them, and it is written by an operator on a shared box
+    at whatever umask that box happens to have. `os.open` with the mode set is used rather than a
+    `chmod` after the fact, so the file is never briefly world-readable between the two calls.
+    """
     directory = os.path.dirname(os.path.abspath(path))
     if directory:
         os.makedirs(directory, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as handle:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
         json.dump(state, handle, indent=2, sort_keys=True)
         handle.write("\n")
+    os.chmod(path, 0o600)   # in case the file already existed with looser bits
     print(f"\nstate -> {path}")
 
 
@@ -110,14 +119,25 @@ def _client():
 
 
 def _report_failure(rc, result) -> None:
-    """Everything we are willing to say about a failure. The body is NOT one of those things."""
+    """Everything we are willing to say about a failure. The body is NOT one of those things.
+
+    This used to call `explain_refusal(..., detail_code=...)`, which takes no such argument --
+    so EVERY failure path in this script raised TypeError, and the paths that report a failure
+    are exactly the ones nobody exercises until something has already gone wrong. It then
+    iterated the result, which is a string, and would have printed it one character per line.
+    Two explainers, two calls, both printed as strings.
+    """
     print(f"\nok     : {result.ok}")
     print(f"status : {result.status}")
     print(f"error  : {result.error}")
     print(f"code   : {result.error_code}        (error.code)")
     print(f"detail : {result.error_detail_code}  (error.detail.code)")
-    for line in rc.explain_refusal(result.error, detail_code=result.error_detail_code):
-        print(f"\n  {line}")
+    text = rc.explain_refusal(result.error)
+    if text:
+        print("\n  " + text.replace("\n", "\n  "))
+    detail = rc.explain_detail_code(result.error_detail_code)
+    if detail:
+        print("\n  " + detail.replace("\n", "\n  "))
     print("\nThe response BODY is deliberately not captured — only the two machine-readable\n"
           "codes above. A partner's error payload can echo the request, and the request can\n"
           "carry a buyer's address.")
@@ -166,8 +186,14 @@ def cmd_enroll(args) -> int:
         print("\nDRY RUN. Nothing was sent. Re-run with --apply to create this enrollment.")
         return 0
 
+    attempt_id = args.attempt_id or f"ops-{int(time.time())}"
+    print(f"\nattempt id : {attempt_id}   (idempotency material; NOT sent in the body)")
+    print("A NEW attempt id means a NEW enrollment. Reuse one only to retry an attempt whose\n"
+          "outcome you never saw -- the key is not time-bucketed, so reusing it tomorrow would\n"
+          "replay today's enrollment and its long-expired hosted link.")
     result = asyncio.run(rc.create_enrollment(
-        owner_id=args.owner_id, return_url=args.return_url, email=args.email
+        owner_id=args.owner_id, return_url=args.return_url, email=args.email,
+        attempt_id=attempt_id,
     ))
     if not result.ok:
         _report_failure(rc, result)
@@ -183,6 +209,7 @@ def cmd_enroll(args) -> int:
     state["enrollment_id"] = payload.get("id")
     state["enrollment_status"] = payload.get("status")
     state["owner_id"] = args.owner_id
+    state["attempt_id"] = attempt_id
     state["enrolled_at"] = time.time()
     _save(args.state, state)
     print("\nNext: a human opens the URL above, then `poll` until the enrollment is `active`.")
@@ -340,6 +367,10 @@ def main() -> int:
                         help="OUR opaque client reference for this buyer. Not an email, not a "
                              "name — it goes to a third party and comes back in a query string.")
     enroll.add_argument("--email", help="optional, prefills the hosted page. Real buyer PII.")
+    enroll.add_argument("--attempt-id",
+                        help="opaque id for THIS attempt ([A-Za-z0-9_-]{1,64}); in production "
+                             "our ledger's enrollment row id. Defaults to a timestamp, which is "
+                             "right for a probe and wrong for anything that needs to retry.")
     enroll.add_argument("--apply", action="store_true", help="actually create it")
     enroll.set_defaults(func=cmd_enroll)
 
