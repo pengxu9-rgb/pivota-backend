@@ -439,6 +439,8 @@ if IS_POSTGRES:
 # is enforced by the SERVER, so it does NOT bound a COMMIT/ROLLBACK waiting on a
 # socket that has gone silent — only a client-side DB_COMMAND_TIMEOUT_SECONDS
 # would, and even that not while asyncpg waits for a cancel to be acknowledged.
+# The Postgres backend therefore bounds COMMIT/ROLLBACK itself — see
+# `_install_bounded_transaction_end`.
 async def _run_to_completion(make_coro):  # type: ignore[no-untyped-def]
     """Await `make_coro()` to completion even if this task is cancelled meanwhile.
 
@@ -741,6 +743,114 @@ def _install_failed_begin_cleanup() -> bool:
 # asyncpg is a hard requirement (requirements.txt).
 if not _install_failed_begin_cleanup():
     raise RuntimeError("db.database: failed-BEGIN cleanup failed to install")
+
+
+# ---------------------------------------------------------------------------
+# A COMMIT or ROLLBACK must not wait forever for an answer.
+#
+# `Transaction.commit` / `rollback` above run uncancellably, holding the
+# connection's `_transaction_lock` and its pool slot until the statement
+# answers. Nothing else bounds that wait: DB_STATEMENT_TIMEOUT_SECONDS is
+# enforced by the server, prod leaves DB_COMMAND_TIMEOUT_SECONDS unset, and
+# asyncpg waits for a pending cancel to be acknowledged before any
+# command_timeout applies. On a socket that has gone silent (failover, dropped
+# NAT entry) the end never returns: reproduced 2026-09-17 through a TCP proxy
+# that drops traffic — still running after 15s, pool free slots 0, and every
+# sibling on the shared Connection blocked on the lock.
+#
+# The fix, in the Postgres backend where the asyncpg connection is: the same
+# deadline and terminate as `_abandon_failed_begin` (and as asyncpg's own
+# release). The connection is terminated FIRST, then the statement's task
+# cancelled — terminating fails asyncpg's pending waiter, so nothing below
+# depends on a cancel the silent server would have to acknowledge. The pool
+# replaces a terminated connection.
+#
+# What a timeout means for the caller's data:
+#   * root COMMIT: UNKNOWN. The server may have committed before the answer was
+#     lost. `CommitOutcomeUnknown` says so; success is never reported, and the
+#     caller must check before retrying a non-idempotent write.
+#   * RELEASE SAVEPOINT / ROLLBACK TO / root ROLLBACK: nothing is committed.
+#     Terminating ends the session and the server rolls back the whole open
+#     transaction, including levels enclosing a savepoint — so this still
+#     raises (`TransactionEndTimedOut`): the enclosing transaction is gone.
+class TransactionEndTimedOut(RuntimeError):
+    """COMMIT/ROLLBACK (or a savepoint's) got no answer in time; the connection was terminated."""
+
+
+class CommitOutcomeUnknown(TransactionEndTimedOut):
+    """A root COMMIT got no answer in time. It may or may not have committed."""
+
+
+async def _end_within_deadline(xact, action: str) -> None:  # type: ignore[no-untyped-def]
+    con = xact._connection
+    nested = xact._nested
+    deadline = DB_POOL_CHECKOUT_TIMEOUT_SECONDS
+    task = asyncio.ensure_future(getattr(xact, action)())
+    done, _ = await asyncio.wait((task,), timeout=deadline)
+    if done:
+        return task.result()
+    con.terminate()
+    task.cancel()
+    await asyncio.wait((task,), timeout=deadline)  # bounded: never trade one hang for another
+    if task.done() and not task.cancelled():
+        task.exception()  # consumed: the timeout below is the error that matters
+    statement = {
+        ("commit", False): "COMMIT",
+        ("commit", True): "RELEASE SAVEPOINT",
+        ("rollback", False): "ROLLBACK",
+        ("rollback", True): "ROLLBACK TO SAVEPOINT",
+    }[(action, nested)]
+    logger.warning(
+        "no answer to %s within %.1fs — terminated the connection", statement, deadline
+    )
+    if action == "commit" and not nested:
+        raise CommitOutcomeUnknown(
+            f"COMMIT got no answer within {deadline:.1f}s and the connection was terminated. "
+            "The transaction MAY OR MAY NOT have committed — the server can commit and the "
+            "answer still be lost. Check the data before retrying a non-idempotent write."
+        )
+    raise TransactionEndTimedOut(
+        f"{statement} got no answer within {deadline:.1f}s and the connection was terminated. "
+        "Nothing was committed: the server rolls back the whole open transaction "
+        + ("(including the levels enclosing this savepoint) " if nested else "")
+        + "when the session ends."
+    )
+
+
+def _install_bounded_transaction_end() -> bool:
+    """Put a deadline on Postgres COMMIT/ROLLBACK. Returns True if installed."""
+    from databases.backends.postgres import PostgresTransaction
+
+    if getattr(PostgresTransaction.commit, "_pivota_bounded_end", False):
+        return True
+
+    for method in (PostgresTransaction.commit, PostgresTransaction.rollback):
+        _require_source(
+            method,
+            f"databases.backends.postgres.PostgresTransaction.{method.__name__}",
+            (f"await self._transaction.{method.__name__}()",),
+        )
+
+    async def commit(self) -> None:  # type: ignore[no-untyped-def]
+        if self._transaction is None:
+            raise AssertionError("Transaction is not started")
+        await _end_within_deadline(self._transaction, "commit")
+
+    async def rollback(self) -> None:  # type: ignore[no-untyped-def]
+        if self._transaction is None:
+            raise AssertionError("Transaction is not started")
+        await _end_within_deadline(self._transaction, "rollback")
+
+    commit._pivota_bounded_end = True  # type: ignore[attr-defined]
+    PostgresTransaction.commit = commit  # type: ignore[assignment]
+    PostgresTransaction.rollback = rollback  # type: ignore[assignment]
+    return True
+
+
+# Unconditional, like the failed-BEGIN cleanup: inert until a Postgres
+# COMMIT/ROLLBACK outlives the deadline.
+if not _install_bounded_transaction_end():
+    raise RuntimeError("db.database: bounded transaction end failed to install")
 
 
 database = Database(DATABASE_URL, **database_kwargs)
