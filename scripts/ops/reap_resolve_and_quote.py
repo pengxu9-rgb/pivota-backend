@@ -111,6 +111,11 @@ def main() -> int:
     print(f"reap price      : {resolved.price}")
     print(f"reap available  : {resolved.available}")
     print(f"price disagrees : {resolved.price_disagrees}")
+    print(f"currency mismatch: {resolved.currency_mismatch}   (a different problem from staleness)")
+    if resolved.single_value_axis_accepted_without_title:
+        print("axis accepted   : STRUCTURALLY — one axis, one value, and our row has no variant\n"
+              "                  title, so nothing compared Reap's label to ours. Every other\n"
+              "                  acceptance is checked against the title.")
     print(f"asked-for avail : {resolved.chosen_available}   (the value WE ASKED FOR)")
     print(f"resolved at     : {resolved.resolved_at}")
     print(f"queries tried   : {resolved.queries_tried}")

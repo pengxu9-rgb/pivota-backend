@@ -86,6 +86,7 @@ import logging
 import os
 import re
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
@@ -122,12 +123,47 @@ _SLOW_PATHS = ("/agentic/quotes", "/agentic/checkouts")
 def default_timeout_for(path: str) -> float:
     return _QUOTE_TIMEOUT_S if path in _SLOW_PATHS else _DEFAULT_TIMEOUT_S
 
+
+def _env_timeout_floor() -> Optional[float]:
+    """`REAP_API_TIMEOUT_SECONDS` as a FLOOR, or None if it says nothing usable.
+
+    It used to sit AHEAD of the per-path default, which made it a ceiling as well as a floor:
+    setting it to 10 -- a perfectly reasonable-looking number, and above the 12 s product-endpoint
+    default's neighbourhood -- silently cut every quote's 35 s budget to 10 s, and quotes take
+    13-16 s measured. The operator would have been tuning what looked like a global timeout and
+    would instead have broken exactly one endpoint, on the one code path a test cannot reach
+    without the wire. A non-numeric value was worse still: `float("30s")` raised ValueError out
+    of `_post`, turning a typo in an env var into an exception in a serving path.
+
+    So it may only ever RAISE a bound, and anything unusable is ignored rather than fatal.
+
+    NOTE on the `> 0` test: at `_post`'s call site it is inert, because the floor is applied with
+    `max()` against a positive per-path default and a zero or negative value could not lower
+    anything anyway. It is kept because it is THIS function's contract -- "a floor, or None" -- and
+    the next caller need not combine it with `max()`. It is therefore tested here, against the
+    helper, rather than through a transport assertion that cannot observe it.
+    """
+    raw = (os.getenv("REAP_API_TIMEOUT_SECONDS") or "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("REAP_API_TIMEOUT_SECONDS is not a number; ignoring it")
+        return None
+    return value if value > 0 else None
+
 #: Reap's own id prefixes, used to reject a value from the wrong namespace before it is sent.
 #: This is the guard that would have caught #2136's central error: our storefront variant id
 #: (`41669483823149`) does not look like `var_...`, and sending it asks Reap to price something
 #: that does not exist in their catalog.
 VARIANT_ID_PREFIX = "var_"
 PRODUCT_ID_PREFIX = "prd_"
+
+#: Largest response body this module will parse. Every real agentic response measured is a few
+#: kilobytes; a details response for ten products is under 200 KB. 2 MiB is therefore well clear
+#: of anything legitimate and still small enough that parsing one cannot hurt a serving path.
+MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 
 
 class ReapConfigError(RuntimeError):
@@ -169,6 +205,14 @@ def validate_base_url(raw: Optional[str] = None) -> str:
     parsed = urlparse(url)
     if parsed.scheme != "https":
         raise ReapConfigError(f"REAP_API_BASE_URL must be https, got {parsed.scheme or 'none'}")
+    if "@" in (parsed.netloc or ""):
+        # A4. `https://u:p@sandbox.api.reap.global` passes every other check here -- `hostname`
+        # is the allowlisted host -- and httpx then REPLACES our `Authorization: Bearer ...` with
+        # `Basic <u:p>` derived from the URL. The Reap call would 401 and our key would never
+        # arrive, while the userinfo we did not write travels instead. Neither half of that is
+        # something an allowlist should let through, so the URL is refused before the host check.
+        # The value is NOT named in the message: the userinfo is itself a credential.
+        raise ReapConfigError("REAP_API_BASE_URL must not contain userinfo (user:password@host)")
     host = (parsed.hostname or "").lower()
     if not host or not any(
         host == suffix or host.endswith("." + suffix) for suffix in ALLOWED_HOST_SUFFIXES
@@ -225,9 +269,40 @@ def _headers(key: str, path: str, body: Dict[str, Any]) -> Dict[str, str]:
 
 
 def _norm(text: Any) -> str:
-    """Casefold, strip accents-free punctuation and collapse whitespace. Used for MATCHING only;
-    never for anything we send, so a normalisation bug cannot alter a request."""
-    return re.sub(r"[^a-z0-9]+", " ", str(text or "").lower()).strip()
+    """Fold accents, casefold, keep word characters, collapse everything else to single spaces.
+    Used for MATCHING only; never for anything we send, so a normalisation bug cannot alter a
+    request -- but it CAN decide which physical object we quote.
+
+    B3, and it was silent. The previous rule was `[^a-z0-9]+ -> " "` over `.lower()`, which
+    DELETES every character outside ASCII. So every purely non-ASCII label normalised to the
+    empty string and any two of them compared EQUAL: `variant_matches_request` reported a match
+    for 標準 against ミニ and for Чёрный against Розовый -- the exact substitution the guard
+    exists to catch, passed through as agreement, on precisely the merchants (JP, KR, RU) whose
+    labels are never ASCII. It also mangled accented Latin: "Crème Brûlée" became "cr me br l e"
+    and did not match "Creme Brulee".
+
+    NFKD + dropping combining marks makes the accented pair equal; `\\w` under re.UNICODE keeps
+    CJK and Cyrillic as themselves so two different labels stay different.
+
+    An empty result is NOT a value. Every site that compares two of these must refuse when either
+    side is empty -- `_norm` cannot enforce that for its callers, so the callers do it.
+    """
+    folded = unicodedata.normalize("NFKD", str(text or ""))
+    folded = "".join(ch for ch in folded if not unicodedata.combining(ch))
+    return re.sub(r"[^\w]+", " ", folded.casefold(), flags=re.UNICODE).strip()
+
+
+def _label_of(value: Any) -> str:
+    """A value's `label` as text, with ABSENT rendered as absent rather than as the word "None".
+
+    B8. `str(value.get("label"))` on a null label produces the four-character string `"None"`,
+    which then goes into `chosen`, becomes what `variant_matches_request` checks Reap's response
+    against, and would be shown to a human as the option we picked. An empty string here is
+    refused by every caller; `"None"` would have been compared, and could even have matched a
+    Reap label that genuinely reads "None".
+    """
+    label = value.get("label") if isinstance(value, dict) else None
+    return "" if label is None else str(label)
 
 
 def normalise_domain(value: Any) -> str:
@@ -303,12 +378,20 @@ def match_product(
     # the aliases it knows about, and the comparison itself stays exact. Loosening the comparison
     # to make these pass would also admit `notcosrx.com` for `cosrx.com`.
     accepted = [merchant_domain, *(also_accept_domains or ())]
-    same_merchant = [
-        p for p in products
-        if isinstance(p, dict)
-        and any(merchant_domain_matches((p.get("merchant") or {}).get("name"), d)
-                for d in accepted)
-    ]
+    same_merchant = []
+    for candidate in products:
+        if not isinstance(candidate, dict):
+            continue
+        merchant = candidate.get("merchant")
+        # C1. This was `(p.get("merchant") or {}).get("name")`, which is only safe for a dict or a
+        # falsy value. `merchant` is untrusted partner JSON: a bare string or a list is truthy and
+        # has no `.get`, so one malformed row raised AttributeError all the way out of
+        # `resolve_our_row` -- a crash, in a module where every other malformation is a refusal,
+        # and one a partner controls. `isinstance` rather than `try`: an unknown shape has no
+        # merchant name, so the row simply does not match.
+        name = merchant.get("name") if isinstance(merchant, dict) else None
+        if any(merchant_domain_matches(name, d) for d in accepted):
+            same_merchant.append(candidate)
     if not same_merchant:
         return ProductMatch(ok=False, reason="merchant_not_in_results")
 
@@ -349,6 +432,12 @@ class OptionMatch:
     #: Axes whose chosen value Reap marks unavailable. Non-empty means `/variant` MUST NOT be
     #: called: it will substitute an available sibling and answer 200.
     unavailable_axes: List[str] = field(default_factory=list)
+    #: True when the ONLY reason this resolved is structural: the product has exactly one axis
+    #: with exactly one value and our row declares no variant title, so there was nothing to
+    #: disambiguate and nothing to compare. Every other acceptance has been checked against our
+    #: title. Surfaced rather than hidden because a caller showing a buyer what we resolved should
+    #: be able to say which of the two it was.
+    single_value_axis_accepted_without_title: bool = False
 
 
 def select_option_ids(detail_product: Any, wanted_labels: Sequence[str]) -> OptionMatch:
@@ -369,6 +458,14 @@ def select_option_ids(detail_product: Any, wanted_labels: Sequence[str]) -> Opti
     An unavailable axis is fatal to the `/variant` call, not merely informational: measured, Reap
     answers 200 with an available sibling rather than the id we asked for, so the id we want does
     not exist to be fetched. `resolve_our_row` refuses before making that call.
+
+    A SINGLE-VALUE AXIS IS STILL COMPARED TO OUR TITLE. The previous version accepted such an
+    axis without looking at our title at all, and recorded REAP's label in `chosen`. That made the
+    whole chain circular: `chosen` is what `variant_matches_request` checks the response against,
+    so Reap was being compared to Reap and the guard could not refuse anything. Measured on the
+    real fixture -- a `Size` axis carrying only `Mini` ($95) against our row's title "Standard"
+    ($140) -- the module returned ok=True and resolved the Mini, which is the $95-for-$140
+    substitution this file exists to prevent, arrived at without any substitution taking place.
     """
     product = detail_product if isinstance(detail_product, dict) else {}
     options = product.get("options")
@@ -379,7 +476,17 @@ def select_option_ids(detail_product: Any, wanted_labels: Sequence[str]) -> Opti
         return OptionMatch(ok=False, reason="product_has_no_option_axes")
 
     wanted = [_norm(w) for w in wanted_labels if _norm(w)]
-    if not wanted:
+    # The ONE shape where a missing title is not a refusal: one axis, one value. There is then
+    # exactly one variant of this product and no choice to get wrong -- structurally the same
+    # case as a product with no axes at all, which is already resolved from `defaultVariant`.
+    # Anything else without a title is undetermined and refuses, as before.
+    first = options[0] if isinstance(options[0], dict) else {}
+    single_axis_product = (
+        len(options) == 1
+        and isinstance(first.get("values"), list)
+        and len(first.get("values")) == 1
+    )
+    if not wanted and not single_axis_product:
         return OptionMatch(ok=False, reason="no_variant_title_supplied")
 
     chosen: Dict[str, str] = {}
@@ -387,29 +494,61 @@ def select_option_ids(detail_product: Any, wanted_labels: Sequence[str]) -> Opti
     option_ids: List[str] = []
     unmatched: List[str] = []
     unavailable: List[str] = []
+    seen_axis_names: List[str] = []
+    accepted_without_title = False
     for axis in options:
         axis = axis if isinstance(axis, dict) else {}
         axis_name = str(axis.get("name") or "").strip() or "?"
+        if axis_name in seen_axis_names:
+            # B6. `chosen` is a dict keyed on the axis name, and so is the `got` map in
+            # `variant_matches_request`. Two axes called "Size" therefore collapse to one entry --
+            # last write wins -- while BOTH optionIds are still sent. The guard then checks one
+            # axis, cannot see the other, and the axis it does check may be the one we did not
+            # pick. Nothing downstream can recover the lost selection, so refuse here.
+            return OptionMatch(ok=False, reason=f"duplicate_axis_name:{axis_name}")
+        seen_axis_names.append(axis_name)
         values = axis.get("values") if isinstance(axis.get("values"), list) else []
         if len(values) == 1 and isinstance(values[0], dict):
-            # A SINGLE-VALUE AXIS IS DETERMINED. There is nothing for a title to choose between,
-            # so requiring the title to match its label protects nothing and refuses real rows:
-            # measured on flowerbeauty.com's "Petal Pout Lip Color", where Reap indexes the
-            # per-shade page as its own product with one `Shade` axis carrying one value,
-            # `"Flamingo Flirt - Cream"` -- a label our title ("Flamingo Flirt") cannot match
-            # because it carries a finish suffix we do not store.
+            # ONE VALUE ON THIS AXIS. Reap indexes some per-shade pages as their own product with
+            # a single-value axis whose label carries a suffix our catalog does not store --
+            # measured on flowerbeauty.com's "Petal Pout Lip Color", one `Shade` axis, one value
+            # `"Flamingo Flirt - Cream"`, against our title "Flamingo Flirt". Exact label matching
+            # refuses that row for no benefit, so the comparison here is CONTAINMENT either way
+            # round after normalisation.
             #
-            # Structural, like the option-less rule, and safe for the same reason: product
-            # identity is already pinned by (merchant, exact product name), and with one value
-            # there is no sibling to be substituted for. Note that `chosen` records REAP's label,
-            # not our title, so the substitution check downstream compares against what we
-            # actually asked for.
+            # But it is still a comparison. Accepting the label unseen means our title never
+            # constrains the result, and the only thing that would have caught a wrong product is
+            # (merchant, exact product name) -- which does not distinguish a $140 Standard from a
+            # $95 Mini indexed as the sole value of its axis.
             single = values[0]
+            label_text = _label_of(single)
+            label_norm = _norm(label_text)
+            if not label_norm:
+                # B8. A null or blank label is NO label, not the string "None". It cannot be
+                # compared to our title and must not be written into `chosen`, where it would
+                # become what the substitution guard checks the response against.
+                unmatched.append(axis_name)
+                continue
+            if wanted:
+                if not any(token in label_norm or label_norm in token for token in wanted):
+                    unmatched.append(axis_name)
+                    continue
+            else:
+                # No title. The only way to be here is `single_axis_product` -- every other
+                # titleless product already returned `no_variant_title_supplied` above -- so this
+                # is the structural acceptance, and it is FLAGGED rather than silent. There is
+                # deliberately no second `single_axis_product` test here: a guard that cannot be
+                # reached reads as protection that does not exist, and the one above is the real
+                # one. (A mutation sweep found the duplicate and could not kill it.)
+                accepted_without_title = True
             option_id = str(single.get("optionId") or "").strip()
             if not option_id:
                 return OptionMatch(ok=False, reason=f"value_has_no_option_id:{axis_name}")
             option_ids.append(option_id)
-            chosen[axis_name] = str(single.get("label"))
+            # `chosen` records REAP's label, because Reap's optionId is what we send and Reap's
+            # label is what the response will echo. That is only sound now that the label has
+            # been checked against our title above.
+            chosen[axis_name] = label_text
             availability = single.get("available")
             chosen_available[axis_name] = availability if isinstance(availability, bool) else None
             if availability is False:
@@ -421,9 +560,13 @@ def select_option_ids(detail_product: Any, wanted_labels: Sequence[str]) -> Opti
             value = value if isinstance(value, dict) else {}
             label = _norm(value.get("label"))
             if label and label in wanted:
-                if hit is not None and _norm(hit.get("label")) != label:
-                    # Two different labels on ONE axis both matched our title. Refusing beats
-                    # taking the first: the title genuinely does not determine this axis.
+                if hit is not None:
+                    # B5. Two VALUES on one axis matched our title. The previous rule only
+                    # refused when their normalised labels DIFFERED, so two values carrying the
+                    # same label ("Standard" and "STANDARD!", which normalise alike) silently took
+                    # the last one -- a coin flip between two distinct optionIds, resolved in
+                    # favour of whichever Reap happened to list second. Both readings are
+                    # ambiguous: the title does not determine this axis either way.
                     return OptionMatch(ok=False, reason=f"ambiguous_on_axis:{axis_name}")
                 hit = value
         if hit is None:
@@ -433,7 +576,7 @@ def select_option_ids(detail_product: Any, wanted_labels: Sequence[str]) -> Opti
         if not option_id:
             return OptionMatch(ok=False, reason=f"value_has_no_option_id:{axis_name}")
         option_ids.append(option_id)
-        chosen[axis_name] = str(hit.get("label"))
+        chosen[axis_name] = _label_of(hit)
         availability = hit.get("available")
         chosen_available[axis_name] = availability if isinstance(availability, bool) else None
         if availability is False:
@@ -445,7 +588,8 @@ def select_option_ids(detail_product: Any, wanted_labels: Sequence[str]) -> Opti
             unmatched_axes=unmatched, chosen=chosen, chosen_available=chosen_available,
         )
     return OptionMatch(ok=True, option_ids=option_ids, chosen=chosen,
-                       chosen_available=chosen_available, unavailable_axes=unavailable)
+                       chosen_available=chosen_available, unavailable_axes=unavailable,
+                       single_value_axis_accepted_without_title=accepted_without_title)
 
 
 def variant_matches_request(variant: Any, chosen: Dict[str, str]) -> Optional[str]:
@@ -472,7 +616,15 @@ def variant_matches_request(variant: Any, chosen: Dict[str, str]) -> Optional[st
     for axis, label in chosen.items():
         if axis not in got:
             return f"response_missing_axis:{axis}"
-        if _norm(got[axis]) != _norm(label):
+        got_norm = _norm(got[axis])
+        want_norm = _norm(label)
+        # B3. An EMPTY normalised string is not a value and must never count as a match. Under the
+        # old ASCII-only `_norm` every non-Latin label normalised to "" and two of them compared
+        # equal, so this guard reported "match" for 標準 against ミニ. `_norm` no longer erases
+        # them -- but a label that is blank, or made only of punctuation, still normalises to ""
+        # on both sides, and agreeing that nothing equals nothing is how that whole class of bug
+        # passed review. Fail closed on either side being empty, at the site that compares.
+        if not got_norm or not want_norm or got_norm != want_norm:
             # Named in full because this is the case a human has to be able to see at a glance.
             return f"substituted_on_axis:{axis}:asked={label}:got={got[axis]}"
     return None
@@ -641,10 +793,19 @@ def build_quote_items(items: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 f"variantId must be a Reap id ({VARIANT_ID_PREFIX}...), got {variant_id[:12]!r}; "
                 "a storefront variant id is a different namespace and cannot be priced by Reap"
             )
-        try:
-            quantity = int(row.get("quantity", 1))
-        except (TypeError, ValueError):
-            raise ReapRequestError(f"quantity for {variant_id} is not an integer")
+        quantity = row.get("quantity", 1)
+        # C6. This was `int(row.get("quantity", 1))`, which does not validate -- it CONVERTS, and
+        # silently. `int(2.7)` is 2, so a caller that computed a fractional quantity got a cart
+        # line one unit short of what it meant with no error anywhere; `int(True)` is 1, so a
+        # boolean landed in a purchase quantity as "one". A quantity is a count of physical
+        # objects a buyer will be charged for. Anything that is not already an integer is a
+        # caller bug, and correcting it quietly is how the wrong number of items gets bought.
+        if isinstance(quantity, bool) or not isinstance(quantity, int):
+            raise ReapRequestError(
+                f"quantity for {variant_id} must be an int, got "
+                f"{type(quantity).__name__} {quantity!r}; convert it at the call site rather "
+                "than letting this truncate it"
+            )
         if quantity < 1:
             # Refused rather than corrected to 1: a caller that computed 0 meant something, and
             # it was not "one".
@@ -756,14 +917,31 @@ async def _post(path: str, body: Dict[str, Any], *, timeout_seconds: Optional[fl
     """
     if not is_configured():
         return ReapResponse(ok=False, error="reap_client_not_configured")
+    # The allowlist is enforced HERE, on the call, and not only in a helper an operator might run.
+    # This line is the whole point of `validate_base_url`: two lines below, our API key is placed
+    # in a header addressed to `url`. Nothing else in this module stands between a mistyped
+    # REAP_API_BASE_URL and that credential reaching whatever host the typo names.
     url = validate_base_url()
     key = _api_key() or ""
-    timeout = float(timeout_seconds or os.getenv("REAP_API_TIMEOUT_SECONDS") or default_timeout_for(path))
+    if timeout_seconds:
+        timeout = float(timeout_seconds)
+    else:
+        # C3. The per-path default is the BASE and the env var may only raise it. See
+        # `_env_timeout_floor` for why it used to be able to lower it, and why that was invisible.
+        timeout = default_timeout_for(path)
+        floor = _env_timeout_floor()
+        if floor is not None:
+            timeout = max(timeout, floor)
 
     import httpx
 
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        # A2. `follow_redirects=False` explicitly, not by relying on httpx's default. A 3xx from
+        # this API is not a routing detail: following one re-POSTs the body -- which can carry a
+        # buyer's shipping address -- to whatever `Location` names, and the allowlist above is
+        # checked against the URL we chose, never against the one a redirect hands us. A redirect
+        # must be a visible non-2xx here, not a second request nobody reviewed.
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
             resp = await client.post(f"{url}{path}", json=body, headers=_headers(key, path, body))
     except Exception as exc:  # noqa: BLE001
         # The exception TYPE only. Never the request: the body can carry a shipping address and
@@ -782,13 +960,35 @@ async def _post(path: str, body: Dict[str, Any], *, timeout_seconds: Optional[fl
             merchant_probably_not_completable=(resp.status_code == 503 and path in _SLOW_PATHS),
         )
 
+    # C2. Bound the body before parsing it. Nothing upstream limits what a partner can return, and
+    # `resp.json()` on a multi-megabyte document allocates the parsed object graph on top of the
+    # bytes -- in a serving path, from a host we do not run. Both halves are needed: the declared
+    # length is the cheap check and the length actually read is the one that cannot be lied about.
+    declared = str((resp.headers or {}).get("content-length") or "").strip()
+    if declared.isdigit() and int(declared) > MAX_RESPONSE_BYTES:
+        logger.warning("reap %s response declares %s bytes; refusing", path, declared)
+        return ReapResponse(ok=False, status=resp.status_code, error="response_too_large")
+    if len(resp.content or b"") > MAX_RESPONSE_BYTES:
+        logger.warning("reap %s response exceeded %s bytes; refusing", path, MAX_RESPONSE_BYTES)
+        return ReapResponse(ok=False, status=resp.status_code, error="response_too_large")
+
     try:
         payload = resp.json()
     except Exception:  # noqa: BLE001
         return ReapResponse(ok=False, status=resp.status_code, error="unparseable_response")
 
     data = payload if isinstance(payload, dict) else {}
-    warnings = [str(w) for w in data.get("warnings") or [] if w]
+    # C4. `warnings` is whatever the partner sent. A BARE STRING is iterable, so
+    # `[str(w) for w in data["warnings"]]` turned `"MERCHANT_NOT_FOUND"` into eighteen
+    # single-character warnings -- which is not merely ugly: `MERCHANT_NOT_FOUND` is the signal
+    # that a search silently ignored its merchant scope, and nothing reading these would have
+    # recognised it spelled one letter per entry.
+    raw_warnings = data.get("warnings")
+    if isinstance(raw_warnings, str):
+        raw_warnings = [raw_warnings]
+    elif not isinstance(raw_warnings, list):
+        raw_warnings = []
+    warnings = [str(w) for w in raw_warnings if w]
     if warnings:
         logger.info("reap %s returned warnings: %s", path, ",".join(sorted(set(warnings))[:5]))
     return ReapResponse(ok=True, status=resp.status_code, data=data, warnings=warnings)
@@ -862,7 +1062,12 @@ class VariantResolution:
     available: Optional[bool] = None
     #: Set when Reap's price differs from the price on our row. Reported, never acted on here:
     #: a difference is as likely to be our staleness as theirs, and the caller owns that call.
+    #: An unknown currency on either side sets this too -- see `_disagrees`.
     price_disagrees: bool = False
+    #: Set when Reap and our row name DIFFERENT currencies. Split out from `price_disagrees`
+    #: because it is a different problem with a different fix: no refresh of our amount will ever
+    #: make a EUR price agree with a USD one.
+    currency_mismatch: bool = False
     matched_options: Dict[str, str] = field(default_factory=dict)
     #: Axis -> Reap's `available` flag on the value WE ASKED FOR, not on whatever came back.
     chosen_available: Dict[str, Optional[bool]] = field(default_factory=dict)
@@ -873,6 +1078,9 @@ class VariantResolution:
     #: True when the product has no option axes and the single variant was taken from
     #: `defaultVariant`. The ONE legitimate use of that field -- see `resolve_our_row`.
     single_variant_product: bool = False
+    #: True when the option axis resolved structurally rather than by comparison: one axis, one
+    #: value, and no variant title on our row. See `OptionMatch` for why a caller may want to know.
+    single_value_axis_accepted_without_title: bool = False
     #: Set when the quote leg reported 503. See `ReapResponse.merchant_probably_not_completable`.
     merchant_probably_not_completable: bool = False
     #: Every search phrasing attempted, in order. On a refusal this says whether the query was
@@ -905,9 +1113,11 @@ async def resolve_our_row(
     been repaired by renaming a field: it started from our id and there was nowhere to put the
     lookup that turns our id into theirs.
 
-    `our_price` is optional and is used ONLY to set `price_disagrees`. It is never used to pick
-    between candidates -- a "closest price" rule would have chosen the $140.00 Fenty gift-tray
-    bundle over the $140.00 Standard perfume, which is the exact trap this design avoids.
+    `our_price` is optional and is used ONLY to set `price_disagrees` and `currency_mismatch`. It
+    is never used to pick between candidates -- a "closest price" rule would have chosen the
+    $140.00 Fenty gift-tray bundle over the $140.00 Standard perfume, which is the exact trap this
+    design avoids. `currency` is OUR row's currency: passing `our_price` without it is a
+    comparison this module will not make, and it reports a disagreement rather than agreement.
     """
     # Several phrasings, because Reap's search is query-sensitive and a bare product name is the
     # phrasing measured to MISS. `merchant_not_in_results` on one query is not evidence the
@@ -973,7 +1183,9 @@ async def resolve_our_row(
             ok=True, variant_id=variant_id, product_id=match.product_id, price=price,
             available=default.get("available"), single_variant_product=True,
             resolved_at=time.time(), queries_tried=tried,
-            price_disagrees=_disagrees(price, our_price), warnings=found.warnings,
+            price_disagrees=_disagrees(price, our_price, currency),
+            currency_mismatch=_currency_mismatch(price, currency),
+            warnings=found.warnings,
         )
 
     options = select_option_ids(product, variant_title_tokens(variant_title))
@@ -1030,9 +1242,12 @@ async def resolve_our_row(
     price = _price_of(variant)
     return VariantResolution(
         ok=True, variant_id=variant_id, product_id=match.product_id, price=price,
-        available=variant.get("available"), price_disagrees=_disagrees(price, our_price),
+        available=variant.get("available"),
+        price_disagrees=_disagrees(price, our_price, currency),
+        currency_mismatch=_currency_mismatch(price, currency),
         resolved_at=time.time(),
         matched_options=options.chosen, chosen_available=options.chosen_available,
+        single_value_axis_accepted_without_title=options.single_value_axis_accepted_without_title,
         warnings=found.warnings, queries_tried=tried,
     )
 
@@ -1047,9 +1262,52 @@ def _price_of(variant: Any) -> Optional[Tuple[float, str]]:
     return float(amount), str(block.get("currency") or "")
 
 
-def _disagrees(price: Optional[Tuple[float, str]], our_price: Optional[float]) -> bool:
-    return bool(price is not None and our_price is not None
-                and abs(price[0] - float(our_price)) >= 0.01)
+def _norm_currency(value: Any) -> str:
+    """An ISO code for comparison, or "" when there is nothing to compare."""
+    return str(value or "").strip().upper()
+
+
+def _disagrees(
+    price: Optional[Tuple[float, str]],
+    our_price: Optional[float],
+    our_currency: Optional[str] = None,
+) -> bool:
+    """Does Reap's price disagree with our row's? B4: a price is an AMOUNT AND A CURRENCY.
+
+    This compared the two amounts as bare numbers, so Reap's €140.00 "agreed" with our $140.00 --
+    about a 16% real gap in 2026 -- and every cross-currency row in the catalog read as confirmed.
+    Worse in the direction it fails: silence is the answer that means "our row is right", so the
+    one comparison a human would rely on to catch a mispriced row was the one guaranteed to pass.
+
+    Unknown is not agreement either. If either side names no currency there is nothing to compare
+    and the amounts alone do not establish anything, so that is a disagreement -- the caller gets
+    a flag to look at rather than a confirmation it did not earn. (Both sides absent ENTIRELY is
+    different: no `our_price` means the caller asked for no comparison at all.)
+    """
+    if price is None or our_price is None:
+        return False
+    reap_currency = _norm_currency(price[1])
+    ours = _norm_currency(our_currency)
+    if not reap_currency or not ours or reap_currency != ours:
+        return True
+    return abs(price[0] - float(our_price)) >= 0.01
+
+
+def _currency_mismatch(
+    price: Optional[Tuple[float, str]], our_currency: Optional[str] = None
+) -> bool:
+    """True only when both sides name a currency and they are DIFFERENT ones.
+
+    Distinct from `_disagrees` on purpose. "Reap quotes this in EUR and our row is USD" is a fact
+    about the row that no amount comparison can fix, and it should not be reported in the same
+    breath as "our $140.00 is stale against their $149.00". An unknown currency is not a mismatch;
+    it is an unknown, and `_disagrees` is where that is already conservative.
+    """
+    if price is None:
+        return False
+    reap_currency = _norm_currency(price[1])
+    ours = _norm_currency(our_currency)
+    return bool(reap_currency and ours and reap_currency != ours)
 
 
 def quote_total(quote_payload: Any) -> Optional[Tuple[float, str]]:
@@ -1102,8 +1360,19 @@ REFUSAL_EXPLANATIONS: List[Tuple[str, str]] = [
      "Unexpected: a product with no axes should have been handled by the single-variant path.\n"
      "If you see this, the details response changed shape."),
     ("options:ambiguous_on_axis",
-     "Two different labels on ONE axis both matched our title. The title genuinely does not\n"
-     "determine that axis; taking the first would be a guess."),
+     "Two VALUES on one axis both matched our title -- whether under different labels or under\n"
+     "labels that normalise alike. Either way the title does not determine that axis, and the\n"
+     "two values are distinct optionIds: taking one would be a coin flip decided by Reap's\n"
+     "ordering, not a match."),
+    ("options:duplicate_axis_name",
+     "The product reports two option axes with the SAME name. Our selection is keyed on the axis\n"
+     "name -- and so is the check that compares Reap's response to what we asked for -- so one of\n"
+     "the two selections would be lost while both optionIds were still sent, leaving the\n"
+     "substitution guard checking an axis it cannot identify. Nothing downstream can recover it."),
+    ("response_too_large",
+     "Reap's response exceeded the size this module will parse. Not a matching problem: either\n"
+     "the endpoint returned something far larger than anything measured, or the response is not\n"
+     "what we think it is. Reproduce with the probe before changing the bound."),
     ("search:merchant_not_in_results",
      "Reap's index did not yield this merchant's product under any phrasing tried (listed\n"
      "above). Reap's search is QUERY-SENSITIVE: the bare product name is measured to miss\n"

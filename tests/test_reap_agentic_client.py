@@ -225,13 +225,19 @@ def test_a_shopify_style_two_axis_title_resolves_both():
     assert got.ok and got.option_ids == ["opt_standard", "opt_rose"]
 
 
-def test_an_unavailable_option_is_still_selected_and_merely_reported():
+def test_an_unavailable_option_is_still_selected_here_and_refused_one_layer_up():
     """Standard is `available: false` at Reap while the merchant's own storefront still lists it.
-    One third-party negative is not a delisting, so this must not silently substitute an
-    available sibling -- that substitution is exactly the $95-for-$140 error."""
+    One third-party negative is not a delisting, so the MATCHER must still select it rather than
+    quietly move to an available sibling -- that substitution is exactly the $95-for-$140 error.
+
+    Corrected claim: this is not "merely reported". `select_option_ids` selects and flags; the
+    refusal happens in `resolve_our_row`, which will not call `/variant` for a flagged axis
+    (`test_an_unavailable_chosen_value_refuses_without_calling_variant`). The distinction matters
+    because the flag is what the refusal is built on, not a note beside it."""
     product = FENTY_DETAILS["products"][0]
     got = rc.select_option_ids(product, rc.variant_title_tokens("Standard"))
     assert got.ok and got.option_ids == ["opt_standard"]
+    assert got.unavailable_axes == ["Size"]
 
 
 def test_a_single_variant_product_refuses_rather_than_sending_an_empty_option_list():
@@ -312,7 +318,13 @@ def test_the_four_hosts_the_spec_names_are_accepted(url):
     "https://reap.global.evil.example/v1",     # suffix confusion
     "https://evilreap.global/v1",              # no dot before the suffix
 ])
-def test_a_host_we_cannot_justify_is_refused_before_the_key_is_attached(url):
+def test_a_host_we_cannot_justify_fails_the_url_check(url):
+    """RENAMED. This was called `..._is_refused_before_the_key_is_attached`, which claimed
+    something it does not test: it calls `validate_base_url` directly and never goes near `_post`,
+    where the key is actually attached. Replacing `validate_base_url()` with `base_url()` inside
+    `_post` left this test green while our API key went to the typo'd host. The claim in the old
+    name is now made — at the transport — by
+    `test_a_host_outside_the_allowlist_is_refused_at_the_transport_with_no_key_sent`."""
     with pytest.raises(rc.ReapConfigError):
         rc.validate_base_url(url)
 
@@ -334,9 +346,16 @@ def test_an_unset_client_makes_no_request(monkeypatch):
 # --- the seam: what actually reaches the wire ---------------------------------------------------
 
 class _FakeResponse:
-    def __init__(self, status=200, payload=None):
+    def __init__(self, status=200, payload=None, headers=None, content=None):
         self.status_code = status
         self._payload = payload if payload is not None else {}
+        # `headers` and `content` are what the SIZE BOUND reads. The real httpx Response carries
+        # both; the fake has to, or a test of that bound would be testing `getattr`'s default
+        # rather than the guard. `content` defaults to the serialised payload so every existing
+        # test exercises the real length check with a real (tiny) length.
+        self.headers = headers if headers is not None else {}
+        self.content = (content if content is not None
+                        else json.dumps(self._payload).encode("utf-8"))
 
     def json(self):
         return self._payload
@@ -354,6 +373,10 @@ class _Recorder:
         # calls it. A mutation that ignored the helper in `_post` survived a test that checked
         # only the helper.
         self.timeout = kw.get("timeout")
+        # A2. Same reasoning for redirects: the flag is a CONSTRUCTOR argument, so the only place
+        # it can be observed is here. `_MISSING` rather than None, so "not passed at all" is
+        # distinguishable from "passed as None" and a test can pin the explicit False.
+        self.follow_redirects = kw.get("follow_redirects", "_MISSING")
 
     async def __aenter__(self):
         return self
@@ -363,9 +386,12 @@ class _Recorder:
 
     async def post(self, url, json=None, headers=None):
         _Recorder.calls.append({"url": url, "body": json, "headers": headers,
-                                "timeout": self.timeout})
+                                "timeout": self.timeout,
+                                "follow_redirects": self.follow_redirects})
         payload = _Recorder.next_payload
-        return _FakeResponse(_Recorder.next_status, payload)
+        return _FakeResponse(_Recorder.next_status, payload,
+                             headers=_Recorder.next_headers,
+                             content=_Recorder.next_content)
 
 
 @pytest.fixture
@@ -374,8 +400,14 @@ def wire(monkeypatch):
     _Recorder.calls = []
     _Recorder.next_status = 200
     _Recorder.next_payload = {}
+    _Recorder.next_headers = None
+    _Recorder.next_content = None
     monkeypatch.setenv("REAP_API_BASE_URL", "https://sandbox.api.reap.global")
     monkeypatch.setenv("REAP_API_KEY", "sk_test_key")
+    # The env var is a FLOOR on the timeout, and a value inherited from the developer's shell
+    # would silently raise every bound this file asserts on. Cleared so the tests measure the
+    # module, not the machine.
+    monkeypatch.delenv("REAP_API_TIMEOUT_SECONDS", raising=False)
     monkeypatch.setattr(httpx, "AsyncClient", _Recorder)
     return _Recorder
 
@@ -510,11 +542,14 @@ def test_the_chain_resolves_our_standard_row_to_reaps_standard_variant(monkeypat
 def test_our_140_row_does_not_disagree_with_reaps_140_standard(monkeypatch):
     """The whole point of the rebuild's mapping rule. Naively comparing our row to what Reap
     SHOWS (`previewVariant` $95.00, availability-ordered) reads as 32% staleness on a row that is
-    correct. Resolving the variant first makes the prices agree to the cent."""
+    correct. Resolving the variant first makes the prices agree to the cent.
+
+    `currency` is supplied because agreement now requires it: an amount without a currency is not
+    a price, and this module will not confirm a row from a bare number."""
     _chain(monkeypatch, details=FENTY_DETAILS_STANDARD_AVAILABLE)
     got = _run(rc.resolve_our_row(
         merchant_domain="fentybeauty.com", product_name="Fenty Eau de Parfum",
-        variant_title="Standard", our_price=140.00,
+        variant_title="Standard", our_price=140.00, currency="USD",
     ))
     assert got.ok and got.price_disagrees is False
     # `available` is Reap's view of the variant WE ASKED FOR, taken from the response to a
@@ -656,6 +691,7 @@ def test_an_option_less_product_uses_its_default_variant_without_calling_variant
     fake = _chain(monkeypatch, search=SINGLE_VARIANT_SEARCH, details=SINGLE_VARIANT_DETAILS)
     got = _run(rc.resolve_our_row(
         merchant_domain="cosrx.com", product_name="Snail Mucin Essence", our_price=31.80,
+        currency="USD",
     ))
     assert got.ok and got.variant_id == "var_only"
     assert got.single_variant_product is True
@@ -907,12 +943,19 @@ def test_different_carts_never_share_a_key():
     assert rc.idempotency_key("quotes", a, now=1.0) != rc.idempotency_key("quotes", b, now=1.0)
 
 
-# --- a single-value axis is determined ----------------------------------------------------------
+# --- a single-value axis is compared, not assumed ------------------------------------------------
 #
 # Measured on flowerbeauty.com "Petal Pout Lip Color": Reap indexes the per-shade page as its own
 # product, with ONE `Shade` axis carrying ONE value, `"Flamingo Flirt - Cream"`. Our row's title
-# is "Flamingo Flirt" — no finish suffix — so exact label matching refuses a row that has exactly
-# one possible answer. Refusing there protects nothing.
+# is "Flamingo Flirt" — no finish suffix — so EXACT label matching refuses a row that has exactly
+# one possible answer, and loosening it to containment is right.
+#
+# CORRECTED. This section used to say a single-value axis is "determined" and that refusing there
+# "protects nothing", and the code accepted such an axis without looking at our title at all.
+# That is false, and B1 is what it cost: one value on an axis means there is nothing to choose
+# BETWEEN, not that Reap's one value is the thing our row describes. The measured counter-example
+# is a `Size` axis carrying only `Mini` ($95) against our $140 Standard row — accepted, resolved,
+# and then invisible to the substitution guard, because `chosen` had recorded Reap's own label.
 
 FLOWER_DETAILS = {
     "products": [{
@@ -947,17 +990,102 @@ FLOWER_VARIANT = {
 
 
 def test_an_axis_with_one_value_is_determined_even_when_the_label_differs():
+    """The real case, and the reason the comparison is containment rather than equality: our
+    title is a PREFIX of Reap's label, which carries a finish suffix our catalog does not store."""
     got = rc.select_option_ids(FLOWER_DETAILS["products"][0],
                                rc.variant_title_tokens("Flamingo Flirt"))
     assert got.ok and got.option_ids == ["opt_flamingo"]
-    # `chosen` records REAP's label, not our title — which is what makes the substitution check
-    # downstream compare against the thing we actually asked Reap for.
+    # `chosen` records REAP's label, because Reap's optionId is what we send and Reap's label is
+    # what the response echoes. That is sound only because the label was checked against our title
+    # first — before the B1 fix nothing compared them, and `chosen` made the guard downstream
+    # compare Reap to Reap.
     assert got.chosen == {"Shade": "Flamingo Flirt - Cream"}
+    assert got.single_value_axis_accepted_without_title is False
 
 
-def test_a_single_value_axis_needs_no_title_at_all():
+def test_a_single_value_axis_is_still_compared_to_our_title():
+    """B1, INVERTED. This test used to assert the opposite -- that a single-value axis "needs no
+    title at all" -- and it was the false claim that let the defect through review.
+
+    A single-value axis is determined in the sense that there is nothing to choose BETWEEN. It is
+    not determined in the sense that matters: it does not establish that Reap's one value is the
+    thing our row describes. Accepting it unseen meant our title never constrained the result, and
+    `chosen` then recorded Reap's own label, so `variant_matches_request` compared Reap against
+    Reap and could not refuse anything."""
     got = rc.select_option_ids(FLOWER_DETAILS["products"][0], ["anything"])
+    assert not got.ok
+    assert got.reason == "axes_not_determined_by_title"
+    assert got.unmatched_axes == ["Shade"]
+
+
+def test_the_single_value_axis_hole_would_have_resolved_the_95_dollar_mini_for_our_140_row():
+    """THE B1 REPRODUCTION, and the reason this is not a style point. Reap indexes this product
+    with one `Size` axis carrying one value, `Mini` at $95. Our row is the $140 Standard.
+
+    Before the fix this returned ok=True with `opt_mini`, and `chosen` recorded "Mini" — so the
+    substitution guard was then handed "Mini" as the thing we had asked for, saw "Mini" come back,
+    and reported a match. The $95-for-$140 error the whole file is built to prevent, reached
+    without any substitution taking place, because the request had been rewritten to agree with
+    the answer."""
+    mini_only = {"id": "prd_x", "options": [{"name": "Size", "values": [
+        {"label": "Mini", "optionId": "opt_mini", "available": True}]}]}
+    got = rc.select_option_ids(mini_only, rc.variant_title_tokens("Standard"))
+    assert not got.ok
+    assert got.reason == "axes_not_determined_by_title"
+    assert got.option_ids == []
+    assert "Size" not in got.chosen
+
+    # And the circularity it produced: had it been accepted, the guard could never have refused.
+    reap_answered_mini = {"id": "var_mini", "options": [{"name": "Size", "value": "Mini"}]}
+    assert rc.variant_matches_request(reap_answered_mini, {"Size": "Mini"}) is None
+
+
+def test_a_single_value_axis_accepts_when_reaps_label_is_inside_our_title():
+    """Containment BOTH ways round. Our catalog sometimes carries the longer string: a row titled
+    "Flamingo Flirt Cream Finish" against Reap's bare "Flamingo Flirt" is the same product."""
+    product = json.loads(json.dumps(FLOWER_DETAILS["products"][0]))
+    product["options"][0]["values"][0]["label"] = "Flamingo Flirt"
+    got = rc.select_option_ids(product, rc.variant_title_tokens("Flamingo Flirt Cream Finish"))
     assert got.ok and got.option_ids == ["opt_flamingo"]
+
+
+def test_a_single_value_axis_with_no_title_resolves_only_when_there_is_one_axis():
+    """The one shape where a missing title is not a refusal: one axis, one value, so there is
+    exactly one variant and nothing to disambiguate — structurally the same case as a product
+    with no axes at all. The acceptance is FLAGGED, because it is the one acceptance in this
+    function that our title did not constrain."""
+    got = rc.select_option_ids(FLOWER_DETAILS["products"][0], [])
+    assert got.ok and got.option_ids == ["opt_flamingo"]
+    assert got.single_value_axis_accepted_without_title is True
+
+
+def test_a_second_single_value_axis_still_needs_a_title():
+    """Two single-value axes is no longer "one variant, nothing to choose": it is a product whose
+    identity our untitled row does not pin, and the structural argument does not reach it."""
+    product = json.loads(json.dumps(FLOWER_DETAILS["products"][0]))
+    product["options"].append({"name": "Size", "values": [
+        {"optionId": "opt_full", "label": "Full Size", "available": True}]})
+    got = rc.select_option_ids(product, [])
+    assert not got.ok and got.reason == "no_variant_title_supplied"
+
+
+def test_a_multi_value_axis_with_no_title_still_refuses():
+    got = rc.select_option_ids(FENTY_DETAILS["products"][0], [])
+    assert not got.ok and got.reason == "no_variant_title_supplied"
+
+
+def test_the_untitled_single_axis_acceptance_is_visible_on_the_resolution(monkeypatch):
+    """The flag has to survive to `resolve_our_row`'s caller, which is the only thing that can
+    decide whether an unconstrained acceptance is good enough for what it is about to do."""
+    _chain(monkeypatch, search=FLOWER_SEARCH, details=FLOWER_DETAILS, variant=FLOWER_VARIANT)
+    got = _run(rc.resolve_our_row(
+        merchant_domain="flowerbeauty.com", product_name="Petal Pout Lip Color"))
+    assert got.ok and got.single_value_axis_accepted_without_title is True
+
+    titled = _run(rc.resolve_our_row(
+        merchant_domain="flowerbeauty.com", product_name="Petal Pout Lip Color",
+        variant_title="Flamingo Flirt"))
+    assert titled.ok and titled.single_value_axis_accepted_without_title is False
 
 
 def test_a_single_value_axis_still_reports_unavailability():
@@ -973,7 +1101,7 @@ def test_the_flowerbeauty_row_resolves_end_to_end(monkeypatch):
                   variant=FLOWER_VARIANT)
     got = _run(rc.resolve_our_row(
         merchant_domain="flowerbeauty.com", product_name="Petal Pout Lip Color",
-        variant_title="Flamingo Flirt", our_price=8.00,
+        variant_title="Flamingo Flirt", our_price=8.00, currency="USD",
     ))
     assert got.ok and got.variant_id == "var_flamingo"
     assert got.price == (8.0, "USD") and got.price_disagrees is False
@@ -981,9 +1109,16 @@ def test_the_flowerbeauty_row_resolves_end_to_end(monkeypatch):
 
 
 def test_the_substitution_guard_compares_against_reaps_label_not_our_title(monkeypatch):
-    """Because we send Reap's optionId, the response echoes Reap's label. Comparing it against
-    OUR title would refuse every correctly-resolved single-value axis — the guard has to check
-    what we asked for, which is the label, not what our catalog happens to call it."""
+    """Because we send Reap's optionId, the response echoes Reap's label, so the guard compares
+    the response to THAT label rather than to our catalog's title — otherwise every correctly
+    resolved single-value axis would be refused on the finish suffix alone.
+
+    CORRECTED. The old docstring said this made the guard "compare against what we actually asked
+    for", and that was false in the case it was written to justify: when the label had never been
+    checked against our title, `chosen` was Reap's answer and the guard compared Reap to Reap. The
+    guard is only meaningful because `select_option_ids` now establishes, before writing `chosen`,
+    that Reap's label and our title describe the same thing. What this test proves is narrower
+    than the old claim: that a DIFFERENT label coming back is still caught."""
     substituted = json.loads(json.dumps(FLOWER_VARIANT))
     substituted["options"] = [{"name": "Shade", "value": "Petal Pink - Matte"}]
     _chain(monkeypatch, search=FLOWER_SEARCH, details=FLOWER_DETAILS, variant=substituted)
@@ -1146,7 +1281,9 @@ ALL_REASONS = [
     "search:merchant_not_in_results", "search:product_id_not_in_reap_namespace",
     "options:product_has_no_option_axes", "options:no_variant_title_supplied",
     "options:axes_not_determined_by_title", "options:ambiguous_on_axis:Size",
+    "options:duplicate_axis_name:Size",
     "options:value_unavailable_at_reap:Size:Standard",
+    "response_too_large",
     "variant:substituted_on_axis:Size:asked=Standard:got=Mini",
     "variant:response_missing_axis:Size",
     "details:PRODUCT_NOT_FOUND", "single_variant_product_has_no_variant_id",
@@ -1309,3 +1446,565 @@ def test_the_full_ladder_is_sent_when_earlier_rungs_miss(monkeypatch):
     assert got.ok and got.variant_id == "var_flamingo"
     assert seen == ["Flower Beauty Petal Pout Lip Color", "Petal Pout Lip Color",
                     "Flower Beauty lip color"]
+
+
+# ==================================================================================================
+# ADVERSARIAL REVIEW, PR #2140. Each block below reproduces one finding first and then pins the
+# fix. They are grouped by finding id so a reviewer can match them to the report.
+# ==================================================================================================
+
+
+# --- A1: the host allowlist, AT THE TRANSPORT ------------------------------------------------------
+#
+# The allowlist existed and was tested — against `validate_base_url` in isolation. Nothing tested
+# that `_post` calls it, so swapping `validate_base_url()` for `base_url()` on the line above the
+# request left every test in this file green while `Authorization: Bearer <our key>` was sent to
+# whatever host REAP_API_BASE_URL named. A guard nothing exercises at the seam it protects is a
+# guard that can be deleted by accident.
+
+def test_a_host_outside_the_allowlist_is_refused_at_the_transport_with_no_key_sent(wire, monkeypatch):
+    monkeypatch.setenv("REAP_API_BASE_URL", "https://evil.example")
+    with pytest.raises(rc.ReapConfigError):
+        _run(rc.search_products(query="Fenty Eau de Parfum"))
+    # Nothing left the process at all — not a request that was later discarded.
+    assert wire.calls == []
+    # And the key is nowhere in anything the transport saw, by value.
+    assert "sk_test_key" not in json.dumps(wire.calls)
+
+
+def test_a_host_outside_the_allowlist_is_refused_on_a_quote_too(wire, monkeypatch):
+    """The quote path builds a body carrying a buyer email before it reaches `_post`. The refusal
+    still has to land before egress, or that body goes to the unallowed host as well."""
+    monkeypatch.setenv("REAP_API_BASE_URL", "https://reap.global.evil.example")
+    with pytest.raises(rc.ReapConfigError):
+        _run(rc.request_quote(items=[{"variantId": "var_x", "quantity": 1}],
+                              email="buyer@example.com"))
+    assert wire.calls == []
+    assert "buyer@example.com" not in json.dumps(wire.calls)
+
+
+def test_the_key_and_the_version_header_reach_the_transport_on_an_allowed_host(wire):
+    """The positive half. Without it, a mutation that refused EVERYTHING would pass the two
+    negatives above — an absence assertion also passes when the mechanism is absent."""
+    _run(rc.search_products(query="x"))
+    assert wire.calls[0]["headers"]["Authorization"] == "Bearer sk_test_key"
+    assert wire.calls[0]["headers"]["Reap-Version"] == rc.REAP_VERSION
+    assert wire.calls[0]["url"].startswith("https://sandbox.api.reap.global/")
+
+
+def test_the_key_never_appears_in_the_url_or_the_body(wire):
+    """It is a header, and only a header. A credential in a path segment or a query string lands
+    in every access log between here and the partner."""
+    _run(rc.request_quote(items=[{"variantId": "var_x", "quantity": 1}], email="b@example.com"))
+    assert "sk_test_key" not in wire.calls[0]["url"]
+    assert "sk_test_key" not in json.dumps(wire.calls[0]["body"])
+
+
+# --- A2: redirects are not followed ----------------------------------------------------------------
+
+def test_redirects_are_explicitly_not_followed(wire):
+    """Passed explicitly rather than left to httpx's default, and asserted from the CONSTRUCTOR
+    kwargs, which is the only place it can be observed. Following a 3xx re-POSTs the body — which
+    on a quote carries a buyer's shipping address — to whatever `Location` names, and the host
+    allowlist was checked against the URL we chose, never against the one a redirect hands us."""
+    _run(rc.search_products(query="x"))
+    assert wire.calls[0]["follow_redirects"] is False
+
+
+def test_every_path_gets_the_same_redirect_policy(wire):
+    _run(rc.search_products(query="x"))
+    _run(rc.request_quote(items=[{"variantId": "var_x", "quantity": 1}], email="b@example.com"))
+    assert [c["follow_redirects"] for c in wire.calls] == [False, False]
+
+
+# --- A4: userinfo in the base URL ------------------------------------------------------------------
+
+@pytest.mark.parametrize("url", [
+    "https://u:p@sandbox.api.reap.global",
+    "https://u:p@sandbox.api.reap.global/v1",
+    "https://token@prod.api.reap.global",
+    "https://u:p@evil.example",
+])
+def test_userinfo_in_the_base_url_is_refused(url):
+    """`hostname` on all but the last of these IS an allowlisted Reap host, so every other check
+    in `validate_base_url` passed it. httpx then derives `Authorization: Basic <userinfo>` from
+    the URL and REPLACES our Bearer header with it: the Reap call 401s and the userinfo we did not
+    write travels in place of the key we did."""
+    with pytest.raises(rc.ReapConfigError):
+        rc.validate_base_url(url)
+
+
+def test_the_userinfo_refusal_does_not_echo_the_credential():
+    """The userinfo is itself a secret. Naming it in the message puts it in the log that the
+    message exists to produce."""
+    with pytest.raises(rc.ReapConfigError) as exc:
+        rc.validate_base_url("https://admin:hunter2@sandbox.api.reap.global")
+    assert "hunter2" not in str(exc.value)
+
+
+def test_userinfo_is_refused_at_the_transport_before_the_key_is_attached(wire, monkeypatch):
+    monkeypatch.setenv("REAP_API_BASE_URL", "https://u:p@sandbox.api.reap.global")
+    with pytest.raises(rc.ReapConfigError):
+        _run(rc.search_products(query="x"))
+    assert wire.calls == []
+
+
+# --- B3: normalisation must not erase non-ASCII ----------------------------------------------------
+#
+# `_norm` was `[^a-z0-9]+ -> " "` over `.lower()`, which DELETES every non-ASCII character. So any
+# two purely non-Latin labels both normalised to "" and compared EQUAL. `variant_matches_request`
+# — the most important guard in the file — reported a match for 標準 against ミニ, and for Чёрный
+# against Розовый. Silent, and worst exactly where labels are never ASCII.
+
+@pytest.mark.parametrize("asked,got", [
+    ("標準", "ミニ"),          # JP: Standard vs Mini
+    ("チェリー", "ピーチ"),      # JP: Cherry vs Peach
+    ("Чёрный", "Розовый"),   # RU: Black vs Pink
+    ("블랙", "화이트"),          # KR: Black vs White
+])
+def test_two_different_non_ascii_labels_are_not_a_match(asked, got):
+    variant = {"id": "var_x", "options": [{"name": "Size", "value": got}]}
+    assert rc.variant_matches_request(variant, {"Size": asked}) == \
+        f"substituted_on_axis:Size:asked={asked}:got={got}"
+
+
+@pytest.mark.parametrize("label", ["標準", "Чёрный", "블랙", "Crème"])
+def test_a_non_ascii_label_survives_normalisation_as_itself(label):
+    """The other half: they must not merely differ from each other, they must be non-empty. Two
+    labels that both normalise to "" differ from nothing and match everything."""
+    assert rc._norm(label) != ""
+
+
+def test_the_same_non_ascii_label_still_matches_itself():
+    variant = {"id": "var_x", "options": [{"name": "Size", "value": "標準"}]}
+    assert rc.variant_matches_request(variant, {"Size": "標準"}) is None
+
+
+def test_accents_fold_so_a_decomposed_spelling_matches_a_precomposed_one():
+    """"Crème Brûlée" used to normalise to "cr me br l e" and did NOT match "Creme Brulee" — the
+    opposite failure from the same rule, refusing a row that was right."""
+    assert rc._norm("Crème Brûlée") == rc._norm("Creme Brulee") == "creme brulee"
+    variant = {"id": "var_x", "options": [{"name": "Shade", "value": "Crème Brûlée"}]}
+    assert rc.variant_matches_request(variant, {"Shade": "Creme Brulee"}) is None
+
+
+def test_an_empty_normalisation_is_never_a_match_on_either_side():
+    """The guard at the COMPARISON SITE, not in `_norm`. Punctuation-only labels still normalise
+    to "" under the new rule, and `"" == ""` is how the whole non-ASCII class of bug passed."""
+    variant = {"id": "var_x", "options": [{"name": "Size", "value": "---"}]}
+    assert rc.variant_matches_request(variant, {"Size": "***"}) is not None
+    assert rc.variant_matches_request(variant, {"Size": "Standard"}) is not None
+    assert rc.variant_matches_request({"id": "var_x", "options": [{"name": "S", "value": "Mini"}]},
+                                      {"S": "!!!"}) is not None
+
+
+def test_a_non_ascii_option_axis_still_selects_by_label():
+    """End of the same thread at the other end of the join: with `_norm` erasing them, every
+    non-ASCII label matched every non-ASCII title here too."""
+    product = {"id": "prd_jp", "options": [{"name": "サイズ", "values": [
+        {"optionId": "opt_std", "label": "標準", "available": True},
+        {"optionId": "opt_mini", "label": "ミニ", "available": True},
+    ]}]}
+    assert rc.select_option_ids(product, ["標準"]).option_ids == ["opt_std"]
+    assert rc.select_option_ids(product, ["ミニ"]).option_ids == ["opt_mini"]
+    assert not rc.select_option_ids(product, ["トラベル"]).ok
+
+
+def test_ascii_normalisation_is_unchanged():
+    """The fix must not move the cases the module already gets right."""
+    assert rc._norm("Fenty Eau de Parfum") == "fenty eau de parfum"
+    assert rc._norm("Flamingo Flirt - Cream") == "flamingo flirt cream"
+    assert rc._norm("  STANDARD  ") == "standard"
+    assert rc._norm("75ML + Tray") == "75ml tray"
+    assert rc._norm(None) == "" and rc._norm("") == ""
+
+
+# --- B4: a price is an amount AND a currency -------------------------------------------------------
+
+def test_reaps_euro_price_does_not_agree_with_our_dollar_price():
+    """The reproduction. €140.00 vs $140.00 reported agreement — and silence here is the answer
+    that means "our row is confirmed", so the one comparison a human relies on to catch a
+    mispriced row was the one guaranteed to pass."""
+    assert rc._disagrees((140.0, "EUR"), 140.00, "USD") is True
+    assert rc._disagrees((140.0, "USD"), 140.00, "USD") is False
+
+
+@pytest.mark.parametrize("reap_currency,our_currency", [
+    ("", "USD"), ("USD", ""), ("", ""), ("USD", None), (None, "USD"),
+])
+def test_an_unknown_currency_on_either_side_is_a_disagreement_not_an_agreement(
+        reap_currency, our_currency):
+    """Unknown is not agreement. Two bare numbers establish nothing, and reporting nothing is
+    reporting that the row checks out."""
+    assert rc._disagrees((140.0, reap_currency), 140.00, our_currency) is True
+
+
+def test_currency_case_and_padding_do_not_create_a_false_mismatch():
+    assert rc._disagrees((140.0, " usd "), 140.00, "USD") is False
+
+
+def test_no_price_on_either_side_is_still_not_a_disagreement():
+    """A caller that passed no `our_price` asked for no comparison at all, which is different from
+    a comparison it cannot make."""
+    assert rc._disagrees(None, 140.00, "USD") is False
+    assert rc._disagrees((140.0, "USD"), None, "USD") is False
+
+
+def test_a_currency_mismatch_is_reported_separately_from_a_stale_amount():
+    """Different problems, different fixes: no refresh of our amount will make EUR agree with USD,
+    and collapsing them into one flag invites someone to "correct" a row whose number is right."""
+    assert rc._currency_mismatch((140.0, "EUR"), "USD") is True
+    assert rc._currency_mismatch((149.0, "USD"), "USD") is False
+    # Unknown is an unknown, not a mismatch — that is `_disagrees`' job.
+    assert rc._currency_mismatch((140.0, ""), "USD") is False
+    assert rc._currency_mismatch(None, "USD") is False
+
+
+def test_the_currency_mismatch_reaches_the_resolution(monkeypatch):
+    eur = json.loads(json.dumps(STANDARD_VARIANT))
+    eur["price"] = {"amount": 140.0, "currency": "EUR"}
+    _chain(monkeypatch, details=FENTY_DETAILS_STANDARD_AVAILABLE, variant=eur)
+    got = _run(rc.resolve_our_row(
+        merchant_domain="fentybeauty.com", product_name="Fenty Eau de Parfum",
+        variant_title="Standard", our_price=140.00, currency="USD"))
+    assert got.ok
+    assert got.currency_mismatch is True
+    assert got.price_disagrees is True
+
+
+def test_a_row_with_no_currency_is_not_silently_confirmed(monkeypatch):
+    _chain(monkeypatch, details=FENTY_DETAILS_STANDARD_AVAILABLE)
+    got = _run(rc.resolve_our_row(
+        merchant_domain="fentybeauty.com", product_name="Fenty Eau de Parfum",
+        variant_title="Standard", our_price=140.00))
+    assert got.ok and got.price_disagrees is True and got.currency_mismatch is False
+
+
+def test_the_single_variant_path_compares_currency_too(monkeypatch):
+    """The option-less branch has its own `_disagrees` call site. Fixing one and not the other is
+    how a guard ends up half-applied."""
+    details = json.loads(json.dumps(SINGLE_VARIANT_DETAILS))
+    details["products"][0]["defaultVariant"]["price"] = {"amount": 31.80, "currency": "EUR"}
+    _chain(monkeypatch, search=SINGLE_VARIANT_SEARCH, details=details)
+    got = _run(rc.resolve_our_row(merchant_domain="cosrx.com", product_name="Snail Mucin Essence",
+                                  our_price=31.80, currency="USD"))
+    assert got.ok and got.price_disagrees is True and got.currency_mismatch is True
+
+
+# --- B5: two values matching one axis, under the same label ----------------------------------------
+
+def test_two_values_with_the_same_normalised_label_refuse_rather_than_taking_the_last():
+    """"Standard" and "STANDARD!" normalise alike, so the old rule ("refuse only if the labels
+    DIFFER") saw no conflict and silently kept the LAST one — a coin flip between two distinct
+    optionIds, decided by Reap's ordering. They are different variants."""
+    product = {"id": "prd_x", "options": [{"name": "Size", "values": [
+        {"optionId": "opt_a", "label": "Standard", "available": True},
+        {"optionId": "opt_b", "label": "STANDARD!", "available": True},
+    ]}]}
+    got = rc.select_option_ids(product, ["Standard"])
+    assert not got.ok
+    assert got.reason == "ambiguous_on_axis:Size"
+    assert got.option_ids == []
+
+
+def test_two_byte_identical_labels_on_one_axis_also_refuse():
+    product = {"id": "prd_x", "options": [{"name": "Size", "values": [
+        {"optionId": "opt_a", "label": "Standard", "available": True},
+        {"optionId": "opt_b", "label": "Standard", "available": True},
+    ]}]}
+    assert rc.select_option_ids(product, ["Standard"]).reason == "ambiguous_on_axis:Size"
+
+
+def test_two_different_labels_matching_one_title_still_refuse():
+    """The case the old rule did catch. It must keep working."""
+    product = {"id": "prd_x", "options": [{"name": "Size", "values": [
+        {"optionId": "opt_a", "label": "Standard", "available": True},
+        {"optionId": "opt_b", "label": "Rose", "available": True},
+    ]}]}
+    assert rc.select_option_ids(product, ["Standard", "Rose"]).reason == "ambiguous_on_axis:Size"
+
+
+def test_one_matching_value_among_several_is_not_ambiguous():
+    """The control. A rule that refused every axis with more than one value would pass the three
+    tests above and break the module."""
+    got = rc.select_option_ids(FENTY_DETAILS["products"][0], ["Standard"])
+    assert got.ok and got.option_ids == ["opt_standard"]
+
+
+# --- B6: two axes with the same name ---------------------------------------------------------------
+
+def test_two_axes_with_the_same_name_refuse():
+    """`chosen` is a dict keyed on the axis name, and so is the `got` map in
+    `variant_matches_request`. Two axes called "Size" collapse to ONE entry — last write wins —
+    while both optionIds are still sent. The guard then checks one axis and cannot see the other,
+    and the one it checks may not be the one we picked. Reproduced: option_ids had two entries and
+    `chosen` had one, and the substitution guard passed on a response naming a single axis."""
+    product = {"id": "prd_x", "options": [
+        {"name": "Size", "values": [{"optionId": "opt_a", "label": "Standard", "available": True},
+                                    {"optionId": "opt_a2", "label": "Mini", "available": True}]},
+        {"name": "Size", "values": [{"optionId": "opt_b", "label": "Rose", "available": True},
+                                    {"optionId": "opt_b2", "label": "Blue", "available": True}]},
+    ]}
+    got = rc.select_option_ids(product, ["Standard", "Rose"])
+    assert not got.ok
+    assert got.reason.startswith("duplicate_axis_name")
+    assert got.option_ids == []
+
+
+def test_two_unnamed_axes_collide_on_the_same_placeholder_and_refuse():
+    """A missing name becomes "?", so two of them collide exactly as two "Size" axes do. The
+    placeholder must not become a way past the guard."""
+    product = {"id": "prd_x", "options": [
+        {"values": [{"optionId": "opt_a", "label": "Standard", "available": True},
+                    {"optionId": "opt_a2", "label": "Mini", "available": True}]},
+        {"values": [{"optionId": "opt_b", "label": "Rose", "available": True},
+                    {"optionId": "opt_b2", "label": "Blue", "available": True}]},
+    ]}
+    assert rc.select_option_ids(product, ["Standard", "Rose"]).reason.startswith(
+        "duplicate_axis_name")
+
+
+def test_distinct_axis_names_are_not_refused():
+    """The control: the guard must fire on duplicates only."""
+    product = json.loads(json.dumps(FENTY_DETAILS["products"][0]))
+    product["options"].append({"name": "Color", "values": [
+        {"optionId": "opt_rose", "label": "Rose", "available": True},
+        {"optionId": "opt_blue", "label": "Blue", "available": True}]})
+    got = rc.select_option_ids(product, rc.variant_title_tokens("Standard / Rose"))
+    assert got.ok and got.option_ids == ["opt_standard", "opt_rose"]
+
+
+# --- B8: a null label is no label, not the string "None" -------------------------------------------
+
+def test_a_null_label_on_a_single_value_axis_does_not_become_the_word_None():
+    """`str(value.get("label"))` produced the four-character string "None", which went into
+    `chosen`, became what the substitution guard checked the response against, and would have been
+    shown to a human as the option we picked."""
+    product = {"id": "prd_x", "options": [{"name": "Size", "values": [
+        {"optionId": "opt_a", "label": None, "available": True}]}]}
+    got = rc.select_option_ids(product, ["None"])
+    assert not got.ok
+    assert got.reason == "axes_not_determined_by_title"
+    assert "None" not in json.dumps(got.chosen)
+
+
+def test_a_null_label_is_refused_even_with_no_title_to_compare():
+    """The untitled single-axis acceptance is structural, so nothing else would have stopped this
+    one: it would have sent an optionId and recorded "None" as the label we asked for."""
+    product = {"id": "prd_x", "options": [{"name": "Size", "values": [
+        {"optionId": "opt_a", "label": None, "available": True}]}]}
+    got = rc.select_option_ids(product, [])
+    assert not got.ok and got.chosen == {}
+
+
+@pytest.mark.parametrize("label", [None, "", "   "])
+def test_a_blank_label_never_reaches_chosen(label):
+    product = {"id": "prd_x", "options": [{"name": "Size", "values": [
+        {"optionId": "opt_a", "label": label, "available": True},
+        {"optionId": "opt_b", "label": "Mini", "available": True}]}]}
+    got = rc.select_option_ids(product, ["Mini"])
+    assert got.ok and got.chosen == {"Size": "Mini"}
+
+
+# --- C1: untrusted JSON where a dict was assumed ----------------------------------------------------
+
+@pytest.mark.parametrize("merchant", [
+    "fentybeauty.com",                 # a bare string
+    ["fentybeauty.com"],               # a list
+    [{"name": "fentybeauty.com"}],     # a list of the right-shaped thing
+    42,
+    True,
+])
+def test_a_truthy_non_dict_merchant_refuses_instead_of_raising(merchant):
+    """`(p.get("merchant") or {}).get("name")` is only safe for a dict or a falsy value. A truthy
+    non-dict raised AttributeError all the way out of `resolve_our_row` — a crash, in a module
+    where every other malformation is a refusal, triggered by data a partner controls."""
+    payload = {"products": [{"id": "prd_x", "merchant": merchant, "name": "Fenty Eau de Parfum"}]}
+    match = rc.match_product(payload, merchant_domain="fentybeauty.com",
+                             product_name="Fenty Eau de Parfum")
+    assert not match.ok and match.reason == "merchant_not_in_results"
+
+
+def test_one_malformed_row_does_not_hide_a_good_one():
+    """Skip the row, do not abandon the response. The old code took the whole search down with
+    the first bad entry."""
+    payload = {"products": [
+        {"id": "prd_bad", "merchant": "fentybeauty.com", "name": "Fenty Eau de Parfum"},
+        {"id": "prd_good", "merchant": {"name": "fentybeauty.com"},
+         "name": "Fenty Eau de Parfum"},
+    ]}
+    match = rc.match_product(payload, merchant_domain="fentybeauty.com",
+                             product_name="Fenty Eau de Parfum")
+    assert match.ok and match.product_id == "prd_good"
+
+
+def test_a_malformed_merchant_does_not_crash_the_whole_chain(monkeypatch):
+    async def fake(path, body, **kw):
+        return rc.ReapResponse(ok=True, status=200, data={
+            "products": [{"id": "prd_x", "merchant": ["fentybeauty.com"],
+                          "name": "Fenty Eau de Parfum"}], "warnings": []})
+    monkeypatch.setattr(rc, "_post", fake)
+    got = _run(rc.resolve_our_row(merchant_domain="fentybeauty.com",
+                                  product_name="Fenty Eau de Parfum", variant_title="Standard"))
+    assert not got.ok and got.reason == "search:merchant_not_in_results"
+
+
+# --- C2: the response is bounded ---------------------------------------------------------------------
+
+def test_a_declared_content_length_over_the_cap_is_refused_without_parsing(wire):
+    """The cheap check. Nothing upstream limits what a partner returns, and `resp.json()` on a
+    multi-megabyte document allocates the parsed graph on top of the bytes, in a serving path."""
+    wire.next_headers = {"content-length": str(rc.MAX_RESPONSE_BYTES + 1)}
+    got = _run(rc.search_products(query="x"))
+    assert not got.ok and got.error == "response_too_large"
+    assert got.data == {}
+
+
+def test_a_body_over_the_cap_is_refused_even_with_no_content_length(wire):
+    """The check that cannot be lied about. A declared length is a claim; the bytes are the fact,
+    and a chunked response declares nothing at all."""
+    wire.next_content = b"x" * (rc.MAX_RESPONSE_BYTES + 1)
+    got = _run(rc.search_products(query="x"))
+    assert not got.ok and got.error == "response_too_large"
+
+
+def test_a_body_over_the_cap_is_refused_even_when_the_header_understates_it(wire):
+    wire.next_headers = {"content-length": "12"}
+    wire.next_content = b"x" * (rc.MAX_RESPONSE_BYTES + 1)
+    assert _run(rc.search_products(query="x")).error == "response_too_large"
+
+
+def test_a_normal_sized_response_is_not_refused(wire):
+    """The control. A cap of zero would pass all three tests above."""
+    wire.next_payload = {"products": [], "warnings": []}
+    wire.next_headers = {"content-length": "31"}
+    got = _run(rc.search_products(query="x"))
+    assert got.ok and got.error is None
+
+
+def test_a_non_numeric_content_length_does_not_crash_the_parse(wire):
+    """A header is partner input too. `int("banana")` here would be an exception in a serving
+    path, which is a worse outcome than the size it was checking."""
+    wire.next_headers = {"content-length": "banana"}
+    assert _run(rc.search_products(query="x")).ok is True
+
+
+# --- C3: REAP_API_TIMEOUT_SECONDS is a floor, never a ceiling -------------------------------------------
+
+def test_a_low_env_timeout_cannot_shorten_a_quote(wire, monkeypatch):
+    """The reproduction. The env var sat AHEAD of the per-path default, so setting it to 10 — a
+    reasonable-looking number — cut the quote's 35 s budget to 10 s, and quotes take 13-16 s
+    measured. Every quote would have timed out; no test could have seen it, because the value only
+    appears at the transport."""
+    monkeypatch.setenv("REAP_API_TIMEOUT_SECONDS", "10")
+    _run(rc.request_quote(items=[{"variantId": "var_x", "quantity": 1}], email="b@example.com"))
+    assert wire.calls[0]["timeout"] == 35.0
+
+
+def test_the_env_timeout_may_raise_a_bound(wire, monkeypatch):
+    """A floor is still useful: an operator on a slow link can give every path more room."""
+    monkeypatch.setenv("REAP_API_TIMEOUT_SECONDS", "60")
+    _run(rc.search_products(query="x"))
+    _run(rc.request_quote(items=[{"variantId": "var_x", "quantity": 1}], email="b@example.com"))
+    assert wire.calls[0]["timeout"] == 60.0
+    assert wire.calls[1]["timeout"] == 60.0
+
+
+@pytest.mark.parametrize("value", ["30s", "", "   ", "abc", "0", "-5", "nan-ish"])
+def test_an_unusable_env_timeout_is_ignored_rather_than_fatal(wire, monkeypatch, value):
+    """`float("30s")` raised ValueError out of `_post`: a typo in an env var became an exception
+    in a serving path, on every request, until someone noticed. Ignored, and the per-path default
+    stands."""
+    monkeypatch.setenv("REAP_API_TIMEOUT_SECONDS", value)
+    got = _run(rc.search_products(query="x"))
+    assert got.ok
+    assert wire.calls[0]["timeout"] == 12.0
+
+
+def test_an_explicit_timeout_still_beats_the_env_floor(wire, monkeypatch):
+    """The caller's own argument is a decision about one call, and it wins over an ambient one."""
+    monkeypatch.setenv("REAP_API_TIMEOUT_SECONDS", "60")
+    _run(rc.search_products(query="x", timeout_seconds=3.0))
+    assert wire.calls[0]["timeout"] == 3.0
+
+
+# --- C4: `warnings` must be a list of strings ----------------------------------------------------------
+
+def test_a_bare_string_warning_is_wrapped_not_spelled_out_one_letter_at_a_time(wire):
+    """A string is iterable, so `[str(w) for w in data["warnings"]]` turned "MERCHANT_NOT_FOUND"
+    into eighteen single-character warnings. Not merely ugly: MERCHANT_NOT_FOUND is the signal
+    that a search silently ignored its merchant scope, and nothing reading these would have
+    recognised it spelled one letter per entry."""
+    wire.next_payload = {"products": [], "warnings": "MERCHANT_NOT_FOUND"}
+    got = _run(rc.search_products(query="x"))
+    assert got.ok and got.warnings == ["MERCHANT_NOT_FOUND"]
+
+
+@pytest.mark.parametrize("value", [None, 42, {"code": "MERCHANT_NOT_FOUND"}, True])
+def test_a_warnings_field_of_the_wrong_shape_yields_no_warnings(wire, value):
+    """A dict is iterable too, and would have produced its KEYS as warnings."""
+    wire.next_payload = {"products": [], "warnings": value}
+    got = _run(rc.search_products(query="x"))
+    assert got.ok and got.warnings == []
+
+
+def test_a_real_warnings_list_is_unchanged(wire):
+    """The control."""
+    wire.next_payload = {"products": [], "warnings": ["A", "B"]}
+    assert _run(rc.search_products(query="x")).warnings == ["A", "B"]
+
+
+def test_every_warning_is_a_string(wire):
+    wire.next_payload = {"products": [], "warnings": [{"code": "X"}, 7, "Y"]}
+    got = _run(rc.search_products(query="x"))
+    assert all(isinstance(w, str) for w in got.warnings) and len(got.warnings) == 3
+
+
+# --- C6: a quantity is a count -------------------------------------------------------------------------
+
+def test_a_boolean_quantity_is_refused_rather_than_silently_becoming_one():
+    """`int(True)` is 1, so a boolean landed in a purchase quantity as "one item"."""
+    with pytest.raises(rc.ReapRequestError) as exc:
+        rc.build_quote_items([{"variantId": "var_x", "quantity": True}])
+    assert "int" in str(exc.value)
+
+
+@pytest.mark.parametrize("quantity", [2.7, 1.5, 0.9])
+def test_a_fractional_quantity_is_refused_rather_than_truncated(quantity):
+    """`int(2.7)` is 2, so a caller that computed a fractional quantity got a cart line one unit
+    short of what it meant, with no error anywhere. Buyers pay for these."""
+    with pytest.raises(rc.ReapRequestError):
+        rc.build_quote_items([{"variantId": "var_x", "quantity": quantity}])
+
+
+@pytest.mark.parametrize("quantity", ["2", None, [2], {"n": 2}])
+def test_a_non_integer_quantity_is_refused(quantity):
+    with pytest.raises(rc.ReapRequestError):
+        rc.build_quote_items([{"variantId": "var_x", "quantity": quantity}])
+
+
+def test_an_integer_quantity_and_the_default_still_work():
+    """The control — a rule that refused everything would pass all of the above."""
+    assert rc.build_quote_items([{"variantId": "var_x", "quantity": 3}]) == \
+        [{"variantId": "var_x", "quantity": 3}]
+    assert rc.build_quote_items([{"variantId": "var_x"}]) == \
+        [{"variantId": "var_x", "quantity": 1}]
+
+
+def test_the_env_timeout_helper_reports_no_floor_for_a_useless_value(monkeypatch):
+    """Tested against the HELPER, not through the transport, on purpose. At `_post` the `> 0` test
+    is inert -- the floor is applied with `max()` against a positive default, so a zero or negative
+    value could not lower anything and no wire assertion can observe the difference. The contract
+    "a floor, or None" is real at this level, and it is what the next caller of this helper will
+    rely on."""
+    for value in ("0", "0.0", "-5", "-0.1", "abc", "30s", "", "   "):
+        monkeypatch.setenv("REAP_API_TIMEOUT_SECONDS", value)
+        assert rc._env_timeout_floor() is None, value
+
+
+def test_the_env_timeout_helper_reports_a_usable_floor(monkeypatch):
+    """The control."""
+    monkeypatch.setenv("REAP_API_TIMEOUT_SECONDS", "45.5")
+    assert rc._env_timeout_floor() == 45.5
+    monkeypatch.delenv("REAP_API_TIMEOUT_SECONDS", raising=False)
+    assert rc._env_timeout_floor() is None
