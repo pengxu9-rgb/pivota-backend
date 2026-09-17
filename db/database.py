@@ -397,6 +397,89 @@ if IS_POSTGRES:
         raise RuntimeError("db.database: bounded pool checkout failed to install")
 
 
+# ---------------------------------------------------------------------------
+# A cancelled request must still hand its connection back.
+#
+# `databases` 0.7.0 `Connection.__aexit__` decrements the checkout counter and
+# releases the raw connection only INSIDE `async with self._connection_lock`.
+# If a cancellation is delivered while the task waits for that lock, the
+# decrement and the release are both skipped. Nothing owns the checkout any
+# more, so the pool slot is gone for the life of the process.
+#
+# Two things in this app make that reachable:
+#   * Concurrent tasks in one request share ONE `Connection` (0.7.0 keeps it in
+#     a ContextVar that child tasks inherit), so the lock is contended — e.g.
+#     the `asyncio.gather` of three reads in reviews_service.
+#   * Starlette's BaseHTTPMiddleware runs the endpoint in an anyio task group,
+#     and anyio cancellation is level-triggered: it is re-delivered at EVERY
+#     await until the task leaves the scope, including the lock wait inside
+#     `__aexit__`. A single asyncio `task.cancel()` cannot hit it, which is why
+#     a plain-asyncio reproduction stays clean.
+#
+# 2026-09-16: this drained web's 12-slot pools on every instance within hours
+# (api.pivota.cc /health 503, uptime alert flapping). pg_stat_activity showed
+# the fingerprint: connections `idle` in ClientRead for up to 12.7h whose last
+# statement was an app query with no asyncpg release reset after it, CPU 0.1,
+# no locks. Reproduced locally only with anyio cancellation; the leaked
+# holder's history ended in `__aexit__` raising CancelledError from the lock
+# acquire with the counter still at 1.
+#
+# The fix runs the ORIGINAL exit body in its own task and waits for it through
+# `asyncio.shield`, absorbing re-delivered cancellations until it finishes, then
+# re-raises the cancellation. Cancellation is delayed, never dropped: at most by
+# one lock wait plus one release.
+def _install_cancellation_safe_connection_exit() -> bool:
+    """Make `databases.core.Connection.__aexit__` survive cancellation. Returns True if installed."""
+    from databases.core import Connection
+
+    if getattr(Connection.__aexit__, "_pivota_cancel_safe", False):
+        return True
+
+    # Same rule as the checkout patch: refuse to wrap an implementation we have
+    # not read. 0.8+ restructured connection handling; a blind wrap could hide
+    # a different lifecycle.
+    import inspect
+
+    original_source = inspect.getsource(Connection.__aexit__)
+    for expected in (
+        "async with self._connection_lock",
+        "self._connection_counter -= 1",
+        "await self._connection.release()",
+    ):
+        if expected not in original_source:
+            raise RuntimeError(
+                "db.database: refusing to patch connection exit — "
+                f"databases.core.Connection.__aexit__ no longer contains {expected!r}. "
+                "The library changed; re-read it and update this patch."
+            )
+
+    original_exit = Connection.__aexit__
+
+    async def __aexit__(self, exc_type=None, exc_value=None, traceback=None):  # type: ignore[no-untyped-def]
+        # Local strong reference: the loop only holds tasks weakly.
+        exit_task = asyncio.ensure_future(original_exit(self, exc_type, exc_value, traceback))
+        interrupted: Optional[BaseException] = None
+        while not exit_task.done():
+            try:
+                await asyncio.shield(exit_task)
+            except asyncio.CancelledError as exc:
+                interrupted = exc
+        # The exit body's own failure (e.g. a release error) takes precedence.
+        exit_task.result()
+        if interrupted is not None:
+            raise interrupted
+
+    __aexit__._pivota_cancel_safe = True  # type: ignore[attr-defined]
+    Connection.__aexit__ = __aexit__  # type: ignore[assignment]
+    return True
+
+
+# Unconditional, unlike the checkout bound: the defect is in `databases` core,
+# not in the asyncpg backend, so it applies to every engine.
+if not _install_cancellation_safe_connection_exit():
+    raise RuntimeError("db.database: cancellation-safe connection exit failed to install")
+
+
 database = Database(DATABASE_URL, **database_kwargs)
 
 
