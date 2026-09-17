@@ -210,9 +210,16 @@ def test_a_second_axis_that_the_title_does_not_name_refuses():
         {"optionId": "opt_blue", "label": "Blue", "available": True},
     ]})
     got = rc.select_option_ids(product, rc.variant_title_tokens("Standard"))
-    assert not got.ok and got.unmatched_axes == ["Color"]
-    # It reports the axis it DID match, so a human can see how far it got.
-    assert got.chosen == {"Size": "Standard"}
+    assert not got.ok and got.reason == "axes_not_determined_by_title"
+    # It used to report the axis it DID match here. It no longer can: "Standard" is ONE part and
+    # this product has TWO axes, so the title's parts are not candidates at all (see
+    # `test_a_title_with_the_wrong_number_of_parts_matches_nothing_at_all`). The refusal is
+    # unchanged -- a title that names one of two axes never resolved this product.
+    assert got.unmatched_axes == ["Size", "Color"]
+    assert got.chosen == {}
+    # A title that DOES name both axes still resolves, which is the property that matters.
+    both = rc.select_option_ids(product, rc.variant_title_tokens("Standard / Rose"))
+    assert both.ok and both.option_ids == ["opt_standard", "opt_rose"]
 
 
 def test_a_shopify_style_two_axis_title_resolves_both():
@@ -2155,7 +2162,10 @@ def test_a_sole_label_equal_to_our_title_resolves(our_title, reap_label):
     got = rc.select_option_ids(_sole(reap_label), rc.variant_title_tokens(our_title))
     assert got.ok, f"{our_title!r} must resolve {reap_label!r}"
     assert got.option_ids == ["opt_only"]
-    assert got.chosen == {"Size": reap_label}          # REAP's label, as always
+    # REAP's label, as always -- but SANITISED: control characters stripped, whitespace collapsed,
+    # capped. `chosen` is echoed into reason strings and shown to humans, so it is cleaned once on
+    # the way in rather than at each of the places that read it.
+    assert got.chosen == {"Size": reap_label.strip()}
 
 
 def test_a_multi_axis_title_matches_a_single_valued_axis_and_a_multi_valued_one():
@@ -2405,12 +2415,19 @@ def test_the_sole_label_reason_has_its_own_actionable_copy():
 
 # --- P0: fragments that cannot identify a variant --------------------------------------------------
 
-def test_purely_numeric_slash_fragments_are_dropped():
-    """"50/50 Blend" is ONE label — a 50/50 blend — but splitting it offered the bare candidate
-    `50`, which matched a real "50 ml" label. A number alone carries no unit and no meaning."""
-    assert rc.variant_title_tokens("50/50 Blend") == ["50/50 Blend", "50 Blend"]
+def test_a_bare_slash_is_not_a_separator():
+    """CORRECTED. A numeric-fragment FILTER used to paper over this: "50/50 Blend" was split on
+    the bare slash and the fragment `50` was then thrown away for being all digits. The filter was
+    the wrong fix and it cost most of a clothing catalog (see the separator table below). The
+    right fix is that a bare slash was never a separator — Shopify joins options with " / ", and
+    "50/50 Blend", "1/2 oz" and "S/M" are each ONE label."""
+    assert rc.variant_title_tokens("50/50 Blend") == ["50/50 Blend"]
+    assert rc.variant_title_tokens("1/2 oz") == ["1/2 oz"]
+    assert rc.variant_title_tokens("S/M") == ["S/M"]
     assert rc.variant_title_tokens("3.38 fl.oz / 100mL") == \
         ["3.38 fl.oz / 100mL", "3.38 fl.oz", "100mL"]
+    assert rc.variant_title_tokens("Black/White Stripe / L") == \
+        ["Black/White Stripe / L", "Black/White Stripe", "L"]
 
 
 def test_a_purely_numeric_whole_title_is_still_a_candidate():
@@ -3058,24 +3075,605 @@ def test_a_plain_env_timeout_is_still_honoured(monkeypatch):
 # --- the candidate builder, as a unit ---------------------------------------------------------------------
 
 def test_label_candidates_separates_the_title_from_the_aliases():
-    titles, aliases, supplied = rc.label_candidates(["Flamingo Flirt"],
-                                                    ["Flamingo Flirt - Cream", "", "!!!"])
-    assert titles == ["flamingo flirt"]
+    whole, parts, aliases, supplied = rc.label_candidates(
+        ["Flamingo Flirt"], ["Flamingo Flirt - Cream", "", "!!!"])
+    # A title that did not split has no parts at all: the whole title is the only reading of it.
+    assert whole == "flamingo flirt" and parts == []
     assert aliases == ["flamingo flirt cream"]
     assert supplied is True
 
 
+def test_label_candidates_holds_the_whole_title_back_when_the_title_split():
+    """The distinction that keeps parts from wandering: once a title has parts, the whole is a
+    FALLBACK for the last axis rather than a competitor for any axis."""
+    whole, parts, aliases, supplied = rc.label_candidates(
+        rc.variant_title_tokens("Black / M"))
+    assert whole == "black m"
+    assert parts == ["black", "m"]
+    assert aliases == [] and supplied is True
+
+
 def test_label_candidates_reports_the_placeholder_as_no_title():
-    titles, aliases, supplied = rc.label_candidates(["Default Title"])
-    assert titles == [] and aliases == [] and supplied is False
+    whole, parts, aliases, supplied = rc.label_candidates(["Default Title"])
+    assert whole is None and parts == [] and aliases == [] and supplied is False
 
 
 def test_label_candidates_reports_a_broken_title_as_supplied():
-    titles, _, supplied = rc.label_candidates(["!!!"])
-    assert titles == [] and supplied is True
+    whole, parts, _, supplied = rc.label_candidates(["!!!"])
+    assert whole is None and parts == [] and supplied is True
 
 
 def test_label_candidates_deduplicates():
-    titles, aliases, _ = rc.label_candidates(["OS", "os", " o s "], ["OS", "OS"])
-    assert titles == ["os", "o s"]
+    whole, parts, aliases, _ = rc.label_candidates(["OS", "os", " o s "], ["OS", "OS"])
+    assert whole == "os"          # the title split, so the whole is held back
+    assert parts == ["o s"]       # "os" deduplicated against the whole
     assert aliases == ["os"]
+
+
+# ==================================================================================================
+# FOURTH-ROUND REVIEW: the recall regression that exact matching left behind.
+# ==================================================================================================
+#
+# Round 3 replaced fuzzy matching with exact matching and, as part of that, dropped "/"-parts that
+# were shorter than two characters or purely numeric. Those filters were a LEFTOVER of the fuzzy
+# rule -- there a short fragment could match INSIDE a longer label, so dropping it protected
+# something. Under exact matching a part can only match a label it EQUALS, so they protected
+# nothing and cost most of a clothing catalog. Measured on Color=[Black,White] x Size=[S,M,L,XL]:
+#
+#     "Black / M"  -> tokens ['Black / M', 'Black']  -> REFUSED
+#     "White / S"  -> REFUSED          "M / Black" -> REFUSED
+#     "Red / 7"    -> REFUSED          "Black / 32" -> REFUSED
+#     "Black / XL" -> resolved, because XL happens to be two letters
+#
+# The right fix is the separator, not a filter: Shopify joins options with " / " (whitespace both
+# sides) and a BARE slash is part of a label.
+
+def _axes(*specs):
+    """A product from (axis_name, [labels]) pairs."""
+    return {"id": "prd_x", "options": [
+        {"name": name, "values": [
+            {"optionId": f"opt_{name}_{v}".lower().replace(" ", "_"),
+             "label": v, "available": True}
+            for v in labels]}
+        for name, labels in specs]}
+
+
+APPAREL = _axes(("Color", ["Black", "White"]), ("Size", ["S", "M", "L", "XL"]))
+SHOE = _axes(("Color", ["Red", "Blue"]), ("Size", ["6", "7", "8"]))
+TROUSER = _axes(("Color", ["Black", "Navy"]), ("Waist", ["30", "32", "34"]))
+THREE_AXIS = _axes(("Color", ["Black", "White"]), ("Size", ["S", "M"]),
+                   ("Length", ["Regular", "Tall"]))
+SIZE_ONLY = _axes(("Size", ["S", "M", "L"]))
+SHOE_SIZE_ONLY = _axes(("Size", ["6", "7", "8"]))
+
+
+SEPARATOR_TABLE = [
+    # title,                      expected candidates
+    ("Black / M",                 ["Black / M", "Black", "M"]),
+    ("Red / 7",                   ["Red / 7", "Red", "7"]),
+    ("M",                         ["M"]),
+    ("S/M",                       ["S/M"]),
+    ("50/50 Blend",               ["50/50 Blend"]),
+    ("1/2 oz",                    ["1/2 oz"]),
+    ("3.38 fl.oz / 100mL",        ["3.38 fl.oz / 100mL", "3.38 fl.oz", "100mL"]),
+    ("Black/White Stripe / L",    ["Black/White Stripe / L", "Black/White Stripe", "L"]),
+    ("Black / M / Tall",          ["Black / M / Tall", "Black", "M", "Tall"]),
+    ("  Black  /  M  ",           ["Black  /  M", "Black", "M"]),      # padding is tolerated
+    ("Black / M / Black",         ["Black / M / Black", "Black", "M"]),   # de-duplicated
+    ("",                          []),
+    (None,                        []),
+]
+
+
+@pytest.mark.parametrize("title,expected", SEPARATOR_TABLE)
+def test_the_separator_is_a_slash_with_whitespace_on_both_sides(title, expected):
+    """THE TOKEN TABLE. The whole title is always first; each " / "-part follows, trimmed,
+    de-duplicated, order preserved. No length filter and no numeric filter."""
+    assert rc.variant_title_tokens(title) == expected
+
+
+MUST_RESOLVE = [
+    ("Black / M", APPAREL, ["opt_color_black", "opt_size_m"]),
+    ("White / S", APPAREL, ["opt_color_white", "opt_size_s"]),
+    # Order-insensitive: the parts are matched to axes by VALUE, not by position.
+    ("M / Black", APPAREL, ["opt_color_black", "opt_size_m"]),
+    ("Black / XL", APPAREL, ["opt_color_black", "opt_size_xl"]),
+    # A numeric size is a real size.
+    ("Red / 7", SHOE, ["opt_color_red", "opt_size_7"]),
+    ("Black / 32", TROUSER, ["opt_color_black", "opt_waist_32"]),
+    # Three axes.
+    ("Black / M / Tall", THREE_AXIS, ["opt_color_black", "opt_size_m", "opt_length_tall"]),
+    # Single-axis products, including the one-character and numeric cases the filters killed.
+    ("M", SIZE_ONLY, ["opt_size_m"]),
+    ("S", SIZE_ONLY, ["opt_size_s"]),
+    ("7", SHOE_SIZE_ONLY, ["opt_size_7"]),
+]
+
+
+@pytest.mark.parametrize("title,product,expected_ids", MUST_RESOLVE)
+def test_the_common_apparel_title_shapes_resolve(title, product, expected_ids):
+    got = rc.select_option_ids(product, rc.variant_title_tokens(title))
+    assert got.ok, f"{title!r} must resolve: {got.reason}"
+    assert sorted(got.option_ids) == sorted(expected_ids)
+
+
+def test_a_single_axis_label_that_contains_the_separator_resolves_via_the_whole_title():
+    """The reason the whole title is a candidate at all: " / " inside a label is not a separator,
+    and only the whole title can match it."""
+    product = _axes(("Size", ["3.38 fl.oz / 100mL", "1.7 fl.oz / 50mL"]))
+    got = rc.select_option_ids(product, rc.variant_title_tokens("3.38 fl.oz / 100mL"))
+    assert got.ok and got.chosen == {"Size": "3.38 fl.oz / 100mL"}
+
+
+def test_a_single_axis_label_with_a_bare_slash_resolves():
+    """"S/M" is one label. It was never two."""
+    product = _axes(("Size", ["S/M", "L/XL"]))
+    got = rc.select_option_ids(product, rc.variant_title_tokens("S/M"))
+    assert got.ok and got.chosen == {"Size": "S/M"}
+
+
+MUST_STILL_REFUSE = [
+    # The title names one axis of two — no alias fixes that.
+    ("Black", APPAREL, "axes_not_determined_by_title"),
+    # A size this product does not sell.
+    ("Black / XXS", APPAREL, "axes_not_determined_by_title"),
+]
+
+
+@pytest.mark.parametrize("title,product,reason", MUST_STILL_REFUSE)
+def test_an_underdetermined_title_still_refuses(title, product, reason):
+    got = rc.select_option_ids(product, rc.variant_title_tokens(title))
+    assert not got.ok and got.reason == reason
+
+
+def test_a_title_with_the_wrong_number_of_parts_matches_nothing_at_all():
+    """THE COST OF THE ONE-PART-PER-AXIS RULE, stated as a test rather than discovered later. A
+    one-part title against a two-axis product used to report which axis it HAD matched
+    (`chosen == {"Color": "Black"}`); now its parts are not candidates at all, so it reports
+    nothing matched.
+
+    The refusal is the same either way -- "Black" cannot determine Size, and no reading of it
+    ever resolved this product. What is lost is a diagnostic, and what is bought is that a title's
+    halves can never be pooled and drawn from against a product whose axes they do not describe.
+    That pooling is what let "Black/White Stripe / XL" resolve a plain "Black"."""
+    got = rc.select_option_ids(APPAREL, rc.variant_title_tokens("Black"))
+    assert not got.ok
+    assert got.reason == "axes_not_determined_by_title"
+    assert got.unmatched_axes == ["Color", "Size"]
+    assert got.chosen == {}
+
+
+def test_a_two_part_title_is_not_pooled_against_a_three_axis_product():
+    """FEWER parts than axes is just as much a mismatch as more. "Black / M" against
+    Color x Size x Length describes a different product shape from ours, and partially assigning
+    two of its three axes would report a confidence the title does not support. Either way it
+    refuses; the assertion is that NOTHING was matched."""
+    got = rc.select_option_ids(THREE_AXIS, rc.variant_title_tokens("Black / M"))
+    assert not got.ok
+    assert got.chosen == {}
+    assert got.option_ids == []
+    assert got.unmatched_axes == ["Color", "Size", "Length"]
+
+
+def test_a_two_part_title_is_not_pooled_against_a_one_axis_product():
+    """The rule's whole point. "Black / M" offers `Black` and `M`; a one-axis Color product must
+    not be allowed to draw `Black` out of that pair, because our row said Black AND M."""
+    product = _axes(("Color", ["Black", "White"]))
+    got = rc.select_option_ids(product, rc.variant_title_tokens("Black / M"))
+    assert not got.ok
+    assert got.option_ids == []
+
+
+# --- the new ambiguity rules that paying for order-insensitivity requires ---------------------------
+
+def test_one_part_may_not_satisfy_two_axes():
+    """Because every part is now offered to EVERY axis, a title can be readable two ways. "Red / M"
+    against a Color axis that carries a label "M" AND a Size axis that carries "M" has no correct
+    answer, so it refuses and names BOTH axes rather than picking by axis order."""
+    product = _axes(("Color", ["Red", "M"]), ("Size", ["M"]))
+    got = rc.select_option_ids(product, rc.variant_title_tokens("Red / M"))
+    assert not got.ok
+    assert got.reason == "ambiguous_on_axis:Color,Size"
+    assert got.option_ids == []
+
+
+def test_two_parts_may_not_satisfy_one_axis():
+    """The other direction: both parts name the same axis and nothing names the other."""
+    product = _axes(("Color", ["Black", "White"]), ("Size", ["S", "M"]))
+    got = rc.select_option_ids(product, rc.variant_title_tokens("Black / White"))
+    assert not got.ok and got.reason == "ambiguous_on_axis:Color"
+
+
+def test_the_whole_title_may_not_supplement_a_partial_parts_reading():
+    """A product whose Size axis happens to carry a label reading "Black / M". The part `Black`
+    settles Color, and the whole title then equals the Size label — so a rule that only checked
+    "is one axis left?" resolved Color=Black AND Size="Black / M", reading the word Black once as
+    a colour and again as half of a size. The whole title is an ALTERNATIVE reading of the entire
+    title, not a supplement to a partial one."""
+    product = _axes(("Color", ["Black", "White"]), ("Size", ["Black / M", "L"]))
+    got = rc.select_option_ids(product, rc.variant_title_tokens("Black / M"))
+    assert not got.ok
+    assert got.unmatched_axes == ["Size"]
+    assert got.option_ids == []
+
+
+def test_the_whole_title_may_not_settle_one_axis_of_two():
+    """With nothing settled by parts, a two-axis product cannot be resolved from the whole title
+    either: it would pin one axis and leave the other undetermined."""
+    product = _axes(("Color", ["Black / M", "White"]), ("Size", ["S", "L"]))
+    got = rc.select_option_ids(product, rc.variant_title_tokens("Black / M"))
+    assert not got.ok and got.option_ids == []
+
+
+def test_the_whole_title_is_used_when_it_is_the_last_axis_left():
+    """The legitimate case: parts settle every other axis, and the remaining one carries a label
+    that contains the separator."""
+    product = _axes(("Color", ["Black", "White"]),
+                    ("Size", ["3.38 fl.oz / 100mL", "1.7 fl.oz / 50mL"]))
+    # Only the Color part matches; the Size label can only be matched by the whole title, and it
+    # is not equal to it — so this refuses rather than guessing.
+    got = rc.select_option_ids(product, rc.variant_title_tokens("Black / 3.38 fl.oz / 100mL"))
+    assert not got.ok
+
+    single = _axes(("Size", ["3.38 fl.oz / 100mL", "Other"]))
+    assert rc.select_option_ids(single,
+                                rc.variant_title_tokens("3.38 fl.oz / 100mL")).ok
+
+
+def test_an_alias_obeys_the_same_one_axis_rule():
+    """Aliases behave like parts: exact, on any ONE axis, and ambiguous if they claim two."""
+    product = _axes(("Color", ["Special Edition"]), ("Size", ["Special Edition"]))
+    got = rc.select_option_ids(product, rc.variant_title_tokens("Black / M"),
+                               accept_variant_labels=["Special Edition"])
+    assert not got.ok and got.reason == "ambiguous_on_axis:Color,Size"
+
+
+def test_an_alias_settles_one_axis_while_the_title_settles_the_other():
+    """The everyday case the alias hook exists for, now on a two-axis product."""
+    product = _axes(("Shade", ["Flamingo Flirt - Cream"]), ("Size", ["Full Size", "Mini"]))
+    got = rc.select_option_ids(product, rc.variant_title_tokens("Flamingo Flirt / Full Size"),
+                               accept_variant_labels=["Flamingo Flirt - Cream"])
+    assert got.ok
+    assert got.chosen == {"Shade": "Flamingo Flirt - Cream", "Size": "Full Size"}
+
+
+# --- the round-3 refusals, re-asserted against the new separator ------------------------------------
+
+@pytest.mark.parametrize("title,label", [
+    ("50/50 Blend", "50"),      # the bare-slash fragment `50` no longer exists
+    ("1/2 oz", "oz"),
+    ("1/2 oz", "2 oz"),
+])
+def test_a_bare_slash_fragment_cannot_match_a_label(title, label):
+    """These are the cases the numeric/length filters were covering for. The separator fix removes
+    the fragments entirely, so the filters are not needed to stop them."""
+    got = rc.select_option_ids(
+        {"id": "prd_x", "options": [{"name": "Size", "values": [
+            {"optionId": "opt_only", "label": label, "available": True}]}]},
+        rc.variant_title_tokens(title))
+    assert not got.ok and got.reason == "sole_label_differs:Size"
+
+
+# --- F1: a bare-slash fragment that EXACTLY equals a partner label ---------------------------------
+#
+# The worst of the round-4 findings, because exact matching was supposed to have ended this class.
+# Splitting on a bare slash manufactured a candidate that was a real, different product:
+#
+#     our "1/2 oz"  -> fragment "2 oz"  -> Reap's "2 oz"   $22 row, $88 variant, guard GREEN
+#     our "1/4 ct"  -> fragment "4 ct"  -> Reap's "4 ct"
+#     our "A/B Duo" -> fragment "B Duo" -> Reap's "B Duo"
+#
+# The fragment equalled the label, so nothing downstream could object. The separator fix removes
+# the fragment; there is no rule that has to catch it afterwards.
+
+F1_PAIRS = [
+    ("1/2 oz", "2 oz"), ("1/2 oz", "oz"),
+    ("1/4 ct", "4 ct"),
+    ("A/B Duo", "B Duo"),
+    ("1/2 oz", "1 oz"),
+]
+
+
+@pytest.mark.parametrize("our_title,reap_label", F1_PAIRS)
+def test_a_bare_slash_never_manufactures_a_candidate(our_title, reap_label):
+    got = rc.select_option_ids(_sole(reap_label), rc.variant_title_tokens(our_title))
+    assert not got.ok, f"{our_title!r} must not resolve {reap_label!r}"
+    assert got.reason == "sole_label_differs:Size"
+    assert got.option_ids == []
+
+
+def test_the_half_ounce_row_does_not_buy_the_two_ounce_bottle(monkeypatch):
+    """F1 end to end. $22 half-ounce row, $88 two-ounce variant, and every guard green because
+    the candidate our own tokeniser invented was exactly the label Reap returned."""
+    fake = _one_axis_chain(monkeypatch, label="2 oz", price=88.0)
+    got = _run(rc.resolve_our_row(
+        merchant_domain="example.com", product_name="Rose Serum",
+        variant_title="1/2 oz", our_price=22.00, currency="USD"))
+    assert not got.ok
+    assert got.reason == "options:sole_label_differs:Size"
+    assert fake.variant_body is None
+
+
+# --- F2: a label that contains a bare slash must stay one label -------------------------------------
+
+def test_a_label_containing_a_bare_slash_is_matched_whole():
+    """F2. "Black/White Stripe / XL" split on every slash gave ['Black','White Stripe'] — so the
+    REAL label "Black/White Stripe" was never a candidate, while plain "Black" was, and a product
+    carrying both resolved the wrong colour."""
+    product = _axes(("Color", ["Black", "Black/White Stripe"]), ("Size", ["M", "XL"]))
+    got = rc.select_option_ids(product, rc.variant_title_tokens("Black/White Stripe / XL"))
+    assert got.ok
+    assert got.chosen == {"Color": "Black/White Stripe", "Size": "XL"}
+    assert "opt_color_black" not in got.option_ids
+
+
+def test_an_ombre_label_is_not_read_as_its_first_colour():
+    product = _axes(("Color", ["Red", "Red/Blue Ombre"]), ("Size", ["S", "M"]))
+    got = rc.select_option_ids(product, rc.variant_title_tokens("Red/Blue Ombre / M"))
+    assert got.ok
+    assert got.chosen == {"Color": "Red/Blue Ombre", "Size": "M"}
+
+
+def test_the_striped_row_resolves_end_to_end_and_not_as_plain_black(monkeypatch):
+    search = {"products": [{"id": "prd_s", "merchant": {"name": "example.com"},
+                            "name": "Rugby Shirt"}], "warnings": []}
+    product = _axes(("Color", ["Black", "Black/White Stripe"]), ("Size", ["M", "XL"]))
+    product["id"] = "prd_s"
+    product["merchant"] = {"name": "example.com"}
+    product["name"] = "Rugby Shirt"
+    details = {"products": [product], "errors": []}
+    variant = {"id": "var_s", "options": [{"name": "Color", "value": "Black/White Stripe"},
+                                          {"name": "Size", "value": "XL"}],
+               "price": {"amount": 60.0, "currency": "USD"}, "available": True}
+    _chain(monkeypatch, search=search, details=details, variant=variant)
+    got = _run(rc.resolve_our_row(
+        merchant_domain="example.com", product_name="Rugby Shirt",
+        variant_title="Black/White Stripe / XL", our_price=60.00, currency="USD"))
+    assert got.ok and got.variant_id == "var_s"
+    assert got.matched_options == {"Color": "Black/White Stripe", "Size": "XL"}
+
+
+# --- F3: `accept_variant_labels` is a Sequence[str], and a str IS one ------------------------------
+
+def test_a_bare_string_alias_is_wrapped_not_iterated():
+    """F3, and the annotation permits it: `Sequence[str]` is satisfied by a `str`, so
+    `accept_variant_labels="OS"` iterated the STRING into the aliases 'o' and 's'. Under the new
+    separator rule a one-character label is legitimate — S, M, L are sizes — so 's' is a real
+    alias for a real Small, and a One-Size row would have resolved a Small."""
+    product = _axes(("Size", ["S", "M", "OS"]))
+    got = rc.select_option_ids(product, rc.variant_title_tokens("One Size"),
+                               accept_variant_labels="OS")
+    assert got.ok
+    assert got.chosen == {"Size": "OS"}          # not "S"
+
+
+def test_a_bare_string_alias_cannot_reach_a_single_character_label():
+    """The same bug from the other side: the characters of the string must not become keys."""
+    product = _axes(("Size", ["S", "M", "L"]))
+    got = rc.select_option_ids(product, rc.variant_title_tokens("One Size"),
+                               accept_variant_labels="OS")
+    assert not got.ok
+    assert got.option_ids == []
+
+
+@pytest.mark.parametrize("alias", [41669483823149, {"label": "OS"}, ["OS"], None, object()])
+def test_a_non_string_alias_is_dropped_not_stringified(alias):
+    """`str(...)` of an int or a dict produces a key nobody asserted. An alias is a human saying
+    "this exact string names our object"; anything else is not that."""
+    product = _axes(("Size", ["S", "OS"]))
+    got = rc.select_option_ids(product, rc.variant_title_tokens("One Size"),
+                               accept_variant_labels=[alias])
+    assert not got.ok
+
+
+def test_a_one_character_alias_is_kept():
+    """Explicitly NOT filtered: under the current separator rule "M" is a real label, and a
+    previous round's short-string filter is exactly what cost a clothing catalog."""
+    product = _axes(("Size", ["S", "M", "L"]))
+    got = rc.select_option_ids(product, rc.variant_title_tokens("Medium"),
+                               accept_variant_labels=["M"])
+    assert got.ok and got.chosen == {"Size": "M"}
+
+
+def test_too_many_aliases_is_refused_rather_than_truncated():
+    """Silently using the first 32 of 500 is a worse answer than refusing: the caller would not
+    know which of its assertions were in force."""
+    with pytest.raises(rc.ReapRequestError) as exc:
+        rc.select_option_ids(_sole("OS"), rc.variant_title_tokens("One Size"),
+                             accept_variant_labels=[f"L{i}" for i in range(33)])
+    assert "32" in str(exc.value)
+
+
+def test_the_alias_cap_admits_exactly_thirty_two():
+    """The boundary, so the cap is a cap and not an off-by-one."""
+    aliases = [f"L{i}" for i in range(31)] + ["OS"]
+    assert len(aliases) == 32
+    got = rc.select_option_ids(_sole("OS"), rc.variant_title_tokens("One Size"),
+                               accept_variant_labels=aliases)
+    assert got.ok
+
+
+def test_an_over_long_alias_is_dropped():
+    """Dropped rather than truncated: a truncated alias is a key the caller never supplied, and it
+    could match something."""
+    long_alias = "X" * 129
+    product = _axes(("Size", [long_alias]))
+    assert not rc.select_option_ids(product, rc.variant_title_tokens("One Size"),
+                                    accept_variant_labels=[long_alias]).ok
+    ok_alias = "X" * 128
+    product_ok = _axes(("Size", [ok_alias]))
+    assert rc.select_option_ids(product_ok, rc.variant_title_tokens("One Size"),
+                                accept_variant_labels=[ok_alias]).ok
+
+
+# --- F5: partner text is sanitised before it is echoed ---------------------------------------------
+
+def test_a_newline_in_an_axis_name_cannot_forge_a_log_line():
+    """F5. The axis name and the label are partner-controlled and this module echoes both into
+    `reason`, which is logged. A newline turns one reason into two lines."""
+    product = {"id": "prd_x", "options": [{"name": "Size\nInjected: all clear",
+                                           "values": [{"optionId": "o1", "label": "OS",
+                                                       "available": True}]}]}
+    got = rc.select_option_ids(product, rc.variant_title_tokens("Medium"))
+    assert "\n" not in (got.reason or "")
+    assert "\n" not in json.dumps(got.candidates)
+
+
+def test_control_characters_are_stripped_from_labels_and_axis_names():
+    product = {"id": "prd_x", "options": [{"name": "Si\x00ze",
+                                           "values": [{"optionId": "o1",
+                                                       "label": "O\x07S\x1b[31m",
+                                                       "available": True}]}]}
+    got = rc.select_option_ids(product, rc.variant_title_tokens("Medium"))
+    flat = (got.reason or "") + json.dumps(got.candidates)
+    for bad in ("\x00", "\x07", "\x1b"):
+        assert bad not in flat
+
+
+def test_an_enormous_axis_name_is_capped():
+    product = {"id": "prd_x", "options": [{"name": "S" * 10_000,
+                                           "values": [{"optionId": "o1", "label": "OS",
+                                                       "available": True}]}]}
+    got = rc.select_option_ids(product, rc.variant_title_tokens("Medium"))
+    assert len(got.candidates[0]["axis"]) <= 64
+    assert len(got.reason) < 200
+
+
+def test_an_enormous_label_is_capped():
+    got = rc.select_option_ids(_sole("L" * 10_000), rc.variant_title_tokens("Medium"))
+    assert len(got.candidates[0]["label"]) <= 128
+
+
+def test_the_candidate_list_is_bounded():
+    """A product with a hundred single-value axes must not turn one refusal into a hundred-entry
+    payload."""
+    product = _axes(*[(f"Axis{i}", [f"Label{i}"]) for i in range(40)])
+    got = rc.select_option_ids(product, ["Nothing At All"])
+    assert not got.ok
+    assert len(got.candidates) <= 10
+
+
+def test_a_newline_in_a_returned_variant_value_cannot_forge_a_log_line():
+    """The same sanitiser on the other side of the wire: `got[axis]` is interpolated into the
+    substitution refusal."""
+    variant = {"id": "var_x", "options": [{"name": "Size", "value": "Mini\nInjected: all clear"}]}
+    reason = rc.variant_matches_request(variant, {"Size": "Standard"})
+    assert reason is not None and "\n" not in reason
+
+
+def test_a_sanitised_axis_name_still_matches_between_the_two_sides():
+    """The caps and the cleaning have to be the SAME on both sides, or `chosen` and `got` would
+    stop agreeing on the key and every comparison would report a missing axis."""
+    product = {"id": "prd_x", "options": [{"name": " Size ", "values": [
+        {"optionId": "o1", "label": "OS", "available": True}]}]}
+    got = rc.select_option_ids(product, rc.variant_title_tokens("OS"))
+    assert got.ok and got.chosen == {"Size": "OS"}
+    variant = {"id": "var_x", "options": [{"name": "Size\t", "value": " OS "}]}
+    assert rc.variant_matches_request(variant, got.chosen) is None
+
+
+def test_a_partner_error_code_is_sanitised_before_it_becomes_a_reason():
+    payload = {"products": [], "errors": [
+        {"productId": "prd_x", "code": "GONE\nInjected: all clear"}]}
+    _product, err = rc.details_for(payload, "prd_x")
+    assert err is not None and "\n" not in err
+
+
+# --- M10: "Default Title" is matched EXACTLY, not by prefix -------------------------------------------
+
+def test_a_real_title_beginning_with_default_is_not_the_placeholder():
+    """M10. Loosening the placeholder test to `startswith("default")` would make "Default Rose" —
+    a real shade — take the no-title structural path, resolving whatever the product's sole value
+    happens to be."""
+    got = rc.select_option_ids(_sole("Flamingo Flirt - Cream"),
+                               rc.variant_title_tokens("Default Rose"))
+    assert not got.ok
+    assert got.reason == "sole_label_differs:Size"
+    assert got.single_value_axis_accepted_without_title is False
+
+
+def test_a_real_title_beginning_with_default_still_matches_its_own_label():
+    product = _axes(("Shade", ["Default Rose", "Default Blue"]))
+    got = rc.select_option_ids(product, rc.variant_title_tokens("Default Rose"))
+    assert got.ok and got.chosen == {"Shade": "Default Rose"}
+
+
+def test_an_alias_beginning_with_default_is_kept():
+    """M10's twin in the alias filter."""
+    got = rc.select_option_ids(_sole("Default Rose"), rc.variant_title_tokens("Flamingo"),
+                               accept_variant_labels=["Default Rose"])
+    assert got.ok and got.chosen == {"Size": "Default Rose"}
+
+
+# --- M23: availability is reported for an alias match on a MULTI-value axis ----------------------------
+
+def test_an_alias_match_on_a_multi_value_axis_still_reports_unavailability():
+    """M23. The availability guard was only tested through the single-value branch. An alias can
+    equally select an unavailable value on an axis with siblings — which is exactly where Reap
+    substitutes — so the flag has to survive that path too."""
+    product = {"id": "prd_x", "options": [{"name": "Shade", "values": [
+        {"optionId": "opt_a", "label": "Flamingo Flirt - Cream", "available": False},
+        {"optionId": "opt_b", "label": "Petal Pink - Matte", "available": True}]}]}
+    got = rc.select_option_ids(product, rc.variant_title_tokens("Flamingo Flirt"),
+                               accept_variant_labels=["Flamingo Flirt - Cream"])
+    assert got.ok and got.option_ids == ["opt_a"]
+    assert got.unavailable_axes == ["Shade"]
+    assert got.chosen_available == {"Shade": False}
+
+
+def test_an_alias_selected_unavailable_value_stops_the_chain_before_variant(monkeypatch):
+    """And it reaches the refusal that matters: `/variant` is not called for a value Reap would
+    substitute, however the value was selected."""
+    details = json.loads(json.dumps(FLOWER_DETAILS))
+    details["products"][0]["options"][0]["values"][0]["available"] = False
+    fake = _chain(monkeypatch, search=FLOWER_SEARCH, details=details, variant=FLOWER_VARIANT)
+    got = _run(rc.resolve_our_row(
+        merchant_domain="flowerbeauty.com", product_name="Petal Pout Lip Color",
+        variant_title="Flamingo Flirt",
+        accept_variant_labels=["Flamingo Flirt - Cream"]))
+    assert not got.ok
+    assert got.reason.startswith("options:value_unavailable_at_reap:Shade")
+    assert fake.variant_body is None
+
+
+# --- an alias can also make a resolvable axis ambiguous, which fails closed ---------------------------
+
+def test_a_value_with_no_option_id_is_refused_rather_than_sent_as_blank():
+    """There is nothing to send for such a value: an empty `optionId` in the request body is a
+    422 at best and, at worst, a request that means something we did not intend. It was the one
+    guard in this function with no test, found by a mutation sweep."""
+    product = {"id": "prd_x", "options": [{"name": "Size", "values": [
+        {"optionId": "", "label": "OS", "available": True}]}]}
+    got = rc.select_option_ids(product, rc.variant_title_tokens("OS"))
+    assert not got.ok and got.reason == "value_has_no_option_id:Size"
+    assert got.option_ids == []
+
+    multi = {"id": "prd_x", "options": [{"name": "Size", "values": [
+        {"optionId": "   ", "label": "OS", "available": True},
+        {"optionId": "opt_m", "label": "M", "available": True}]}]}
+    assert rc.select_option_ids(multi, rc.variant_title_tokens("OS")).reason == \
+        "value_has_no_option_id:Size"
+
+
+def test_the_partner_text_sanitiser_maps_absent_to_empty():
+    """Where the B8 "a null label is not the string None" property actually lives now. The
+    conditional in `_label_of` that used to carry it was inert once this function existed, so it
+    was removed and the property is pinned here."""
+    assert rc._safe_partner_text(None, 128) == ""
+    assert rc._label_of({"label": None}) == ""
+    assert rc._label_of({}) == ""
+    assert rc._label_of(None) == ""
+    assert "None" not in rc._label_of({"label": None})
+
+
+def test_an_alias_can_turn_a_resolvable_axis_into_an_ambiguous_one():
+    """Worth stating because it is the one way an alias makes things WORSE, and it is the safe
+    direction: adding an alias that happens to equal a sibling label means two candidates name one
+    axis, and the refusal is `ambiguous_on_axis` rather than a guess."""
+    product = _axes(("Shade", ["Flamingo Flirt", "Petal Pink"]))
+    without = rc.select_option_ids(product, rc.variant_title_tokens("Flamingo Flirt"))
+    assert without.ok
+
+    with_alias = rc.select_option_ids(product, rc.variant_title_tokens("Flamingo Flirt"),
+                                      accept_variant_labels=["Petal Pink"])
+    assert not with_alias.ok and with_alias.reason == "ambiguous_on_axis:Shade"
