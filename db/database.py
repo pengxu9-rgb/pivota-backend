@@ -750,13 +750,18 @@ if not _install_failed_begin_cleanup():
 #
 # `Transaction.commit` / `rollback` above run uncancellably, holding the
 # connection's `_transaction_lock` and its pool slot until the statement
-# answers. Nothing else bounds that wait: DB_STATEMENT_TIMEOUT_SECONDS is
-# enforced by the server, prod leaves DB_COMMAND_TIMEOUT_SECONDS unset, and
-# asyncpg waits for a pending cancel to be acknowledged before any
-# command_timeout applies. On a socket that has gone silent (failover, dropped
-# NAT entry) the end never returns: reproduced 2026-09-17 through a TCP proxy
-# that drops traffic — still running after 15s, pool free slots 0, and every
-# sibling on the shared Connection blocked on the lock.
+# answers. DB_STATEMENT_TIMEOUT_SECONDS does not bound that wait (the server
+# enforces it), and DB_COMMAND_TIMEOUT_SECONDS defaults to OFF — only where it
+# is set (web: 600, docs/runbooks/db_command_timeout.md) does it end the wait,
+# and then as a bare TimeoutError that says nothing about whether COMMIT ran.
+# On a socket that has gone silent (failover, dropped NAT entry) with no
+# command timeout the end never returns: reproduced 2026-09-17 through a TCP
+# proxy that drops traffic — still running after 15s, pool free slots 0, and
+# every sibling on the shared Connection blocked on the lock.
+#
+# Where the command timeout is SHORTER than this deadline (some one-off jobs
+# set 60), it fires first and the bare TimeoutError is what surfaces — not
+# CommitOutcomeUnknown.
 #
 # The fix, in the Postgres backend where the asyncpg connection is: the same
 # deadline and terminate as `_abandon_failed_begin` (and as asyncpg's own

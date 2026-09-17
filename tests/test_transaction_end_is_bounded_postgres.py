@@ -180,6 +180,31 @@ async def test_a_hung_commit_does_not_block_siblings_on_the_shared_connection(db
     assert await _rows(db) == [3]
 
 
+@pytest.mark.asyncio
+async def test_a_commit_the_server_rejects_still_raises_through_the_deadline(db) -> None:
+    """The deadline wrapper must pass a real COMMIT failure through, not swallow it.
+
+    A DEFERRED constraint is checked at COMMIT, so COMMIT itself answers with an error.
+    """
+    import asyncpg
+
+    await db.execute(
+        f"ALTER TABLE {TABLE} ADD CONSTRAINT {TABLE}_v_unique UNIQUE (v) DEFERRABLE INITIALLY DEFERRED"
+    )
+
+    async def write() -> None:
+        async with db.transaction():
+            await db.execute(f"INSERT INTO {TABLE} VALUES (1)")
+            await db.execute(f"INSERT INTO {TABLE} VALUES (1)")
+
+    with pytest.raises(asyncpg.UniqueViolationError):
+        await _within_deadline(db, write())
+
+    assert _in_use(db) == 0
+    assert db.terminated == [], "an answered COMMIT is not a silent socket"
+    assert await _rows(db) == []
+
+
 # --- ROLLBACK and savepoints: nothing committed, but still an error --------------------------
 
 
