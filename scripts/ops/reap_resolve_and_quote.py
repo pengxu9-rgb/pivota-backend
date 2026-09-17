@@ -104,13 +104,36 @@ def main() -> int:
         return 2
 
     if args.alias:
+        # CHECKED BEFORE ANY EGRESS, not after. The module caps aliases and raises
+        # ReapRequestError -- but it does so inside `select_option_ids`, which runs AFTER the
+        # search and details legs, so an operator who passed 33 of them would wait through ~10 s
+        # of network calls to be told something that was knowable before the first one. The
+        # try/except below is still there as the backstop for the per-entry rules; this is the
+        # part that makes the common mistake fast and legible.
+        if len(args.alias) > rc.MAX_ACCEPT_VARIANT_LABELS:
+            print(f"\nTOO MANY ALIASES: {len(args.alias)} given, at most "
+                  f"{rc.MAX_ACCEPT_VARIANT_LABELS} allowed. Nothing was sent.")
+            print("An alias is a label a human has ASSERTED means the same physical thing as our\n"
+                  "row. Needing more than a handful means the row, not the alias list, is wrong.")
+            return 2
+        overlong = [a for a in args.alias if len(a) > rc.MAX_ALIAS_LENGTH]
+        if overlong:
+            print(f"\nALIAS TOO LONG (over {rc.MAX_ALIAS_LENGTH} chars): {overlong[0][:60]!r}...")
+            print("It would be dropped silently by the client. Nothing was sent.")
+            return 2
         print(f"aliases      : {args.alias}   (accepted as our variant title)")
-    resolved = asyncio.run(rc.resolve_our_row(
-        merchant_domain=MERCHANT_DOMAIN, product_name=PRODUCT_NAME, brand=BRAND,
-        category=CATEGORY,
-        variant_title=VARIANT_TITLE, our_price=OUR_PRICE, country="US", currency="USD",
-        accept_variant_labels=tuple(args.alias),
-    ))
+    try:
+        resolved = asyncio.run(rc.resolve_our_row(
+            merchant_domain=MERCHANT_DOMAIN, product_name=PRODUCT_NAME, brand=BRAND,
+            category=CATEGORY,
+            variant_title=VARIANT_TITLE, our_price=OUR_PRICE, country="US", currency="USD",
+            accept_variant_labels=tuple(args.alias),
+        ))
+    except rc.ReapRequestError as exc:
+        # The backstop. A build-time refusal is an operator error with a message written for an
+        # operator; a traceback is neither, and it buries that message in a stack.
+        print(f"\nREFUSED BEFORE EGRESS: {exc}")
+        return 2
 
     print("\n--- RESOLUTION " + "-" * 56)
     print(f"ok              : {resolved.ok}")

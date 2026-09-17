@@ -6201,3 +6201,96 @@ def test_the_purchase_steps_script_has_no_alias_option_because_it_resolves_nothi
     source = inspect.getsource(_purchase_steps())
     assert "resolve_our_row" not in source
     assert "accept_variant_labels" not in source
+
+
+# --- the alias caps, from the operator's side ------------------------------------------------------
+#
+# The module caps aliases at 32 entries and 128 characters and raises ReapRequestError above that
+# -- but it does so inside `select_option_ids`, which runs AFTER the search and details legs. An
+# operator who passed 33 would have waited through ~10 s of network calls to be told something
+# knowable before the first one, and would have got a traceback rather than a message.
+
+def test_too_many_aliases_refuses_before_egress_with_a_readable_message(monkeypatch, capsys):
+    called = []
+
+    async def fake_resolve(**kwargs):
+        called.append(kwargs)
+        return rc.VariantResolution(ok=False, reason="search:merchant_not_in_results")
+
+    module = _resolve_script()
+    monkeypatch.setenv("REAP_API_BASE_URL", "https://sandbox.api.reap.global")
+    monkeypatch.setenv("REAP_API_KEY", "sk_test_key")
+    monkeypatch.setattr(rc, "resolve_our_row", fake_resolve)
+    monkeypatch.setattr(_sys, "argv",
+                        ["prog"] + sum((["--alias", f"L{i}"]
+                                        for i in range(rc.MAX_ACCEPT_VARIANT_LABELS + 1)), []))
+    assert module.main() == 2
+    out = capsys.readouterr().out
+    assert "TOO MANY ALIASES" in out and "Nothing was sent" in out
+    assert called == [], "it reached the network before checking"
+
+
+def test_exactly_the_cap_is_still_accepted(monkeypatch):
+    """THE CONTROL: an off-by-one here would refuse a legitimate list."""
+    called = []
+
+    async def fake_resolve(**kwargs):
+        called.append(kwargs)
+        return rc.VariantResolution(ok=False, reason="search:merchant_not_in_results")
+
+    module = _resolve_script()
+    monkeypatch.setenv("REAP_API_BASE_URL", "https://sandbox.api.reap.global")
+    monkeypatch.setenv("REAP_API_KEY", "sk_test_key")
+    monkeypatch.setattr(rc, "resolve_our_row", fake_resolve)
+    monkeypatch.setattr(_sys, "argv",
+                        ["prog"] + sum((["--alias", f"L{i}"]
+                                        for i in range(rc.MAX_ACCEPT_VARIANT_LABELS)), []))
+    module.main()
+    assert len(called) == 1
+    assert len(called[0]["accept_variant_labels"]) == rc.MAX_ACCEPT_VARIANT_LABELS
+
+
+def test_an_overlong_alias_is_reported_rather_than_silently_dropped(monkeypatch, capsys):
+    """The module DROPS an alias over 128 characters -- quietly, which is right for a library and
+    wrong for a probe: the operator would see the same `sole_label_differs` refusal they were
+    trying to fix, with no hint that their alias never counted."""
+    module = _resolve_script()
+    monkeypatch.setenv("REAP_API_BASE_URL", "https://sandbox.api.reap.global")
+    monkeypatch.setenv("REAP_API_KEY", "sk_test_key")
+    monkeypatch.setattr(_sys, "argv", ["prog", "--alias", "x" * (rc.MAX_ALIAS_LENGTH + 1)])
+    assert module.main() == 2
+    assert "ALIAS TOO LONG" in capsys.readouterr().out
+
+
+def test_a_build_time_refusal_from_the_client_is_not_a_traceback(monkeypatch, capsys):
+    """The backstop, for the rules the early check cannot cover. A build-time refusal carries a
+    message written for an operator; a traceback buries it in a stack."""
+    async def angry_resolve(**kwargs):
+        raise rc.ReapRequestError("accept_variant_labels may name at most 32 labels, got 99")
+
+    module = _resolve_script()
+    monkeypatch.setenv("REAP_API_BASE_URL", "https://sandbox.api.reap.global")
+    monkeypatch.setenv("REAP_API_KEY", "sk_test_key")
+    monkeypatch.setattr(rc, "resolve_our_row", angry_resolve)
+    monkeypatch.setattr(_sys, "argv", ["prog"])
+    assert module.main() == 2
+    assert "REFUSED BEFORE EGRESS" in capsys.readouterr().out
+
+
+def test_a_single_alias_still_reaches_the_client_as_a_tuple_not_a_string(monkeypatch):
+    """`accept_variant_labels="OS"` would iterate the STRING into 'O' and 'S'. The module now
+    wraps a bare str defensively, but the script must not rely on that -- argparse's `append`
+    gives a list, and the script passes a tuple of it."""
+    seen = {}
+
+    async def fake_resolve(**kwargs):
+        seen.update(kwargs)
+        return rc.VariantResolution(ok=False, reason="search:merchant_not_in_results")
+
+    module = _resolve_script()
+    monkeypatch.setenv("REAP_API_BASE_URL", "https://sandbox.api.reap.global")
+    monkeypatch.setenv("REAP_API_KEY", "sk_test_key")
+    monkeypatch.setattr(rc, "resolve_our_row", fake_resolve)
+    monkeypatch.setattr(_sys, "argv", ["prog", "--alias", "OS"])
+    module.main()
+    assert seen["accept_variant_labels"] == ("OS",)
