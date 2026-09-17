@@ -688,7 +688,7 @@ def test_the_substitution_check_names_what_was_asked_and_what_came_back():
 
 def test_a_response_missing_the_axis_entirely_is_also_refused():
     assert rc.variant_matches_request({"id": "var_x", "options": []}, {"Size": "Standard"}) \
-        == "response_missing_axis:Size"
+        == "response_axes_differ"
 
 
 def test_a_variant_that_does_match_passes_the_check():
@@ -1351,7 +1351,8 @@ ALL_REASONS = [
     "options:value_unavailable_at_reap:Size:Standard",
     "response_too_large",
     "variant:substituted_on_axis:Size:asked=Standard:got=Mini",
-    "variant:response_missing_axis:Size",
+    "variant:response_axes_differ", "variant:response_duplicate_axis_name:Size",
+    "variant:label_too_long_to_compare:Size", "options:label_too_long_to_compare:Size",
     "details:PRODUCT_NOT_FOUND", "single_variant_product_has_no_variant_id",
     "resolved_id_not_in_reap_namespace", "reap_status_503",
     "transport_error:ReadTimeout", "reap_client_not_configured",
@@ -2488,7 +2489,7 @@ def test_a_non_list_options_field_in_a_variant_does_not_raise(options):
     """In the substitution guard, which is the one place in this module a crash is least
     affordable: an exception here is a refusal that never happens."""
     assert rc.variant_matches_request({"id": "var_x", "options": options},
-                                      {"Size": "Standard"}) == "response_missing_axis:Size"
+                                      {"Size": "Standard"}) == "response_axes_differ"
 
 
 def test_a_malformed_details_payload_does_not_crash_the_chain(monkeypatch):
@@ -2507,7 +2508,7 @@ def test_a_malformed_variant_payload_does_not_crash_the_chain(monkeypatch):
            variant={"id": "var_x", "options": 3})
     got = _run(rc.resolve_our_row(merchant_domain="fentybeauty.com",
                                   product_name="Fenty Eau de Parfum", variant_title="Standard"))
-    assert not got.ok and got.reason == "variant:response_missing_axis:Size"
+    assert not got.ok and got.reason == "variant:response_axes_differ"
 
 
 # --- P2: kana voicing marks are not diacritics -------------------------------------------------------
@@ -3530,18 +3531,32 @@ def test_control_characters_are_stripped_from_labels_and_axis_names():
         assert bad not in flat
 
 
-def test_an_enormous_axis_name_is_capped():
+def test_an_enormous_axis_name_is_refused_and_its_reason_is_capped():
+    """Past the COMPARISON bound it refuses outright — capping a string we then compare is what
+    made two different names collide (F2). The reason line is still display-capped."""
     product = {"id": "prd_x", "options": [{"name": "S" * 10_000,
                                            "values": [{"optionId": "o1", "label": "OS",
                                                        "available": True}]}]}
     got = rc.select_option_ids(product, rc.variant_title_tokens("Medium"))
-    assert len(got.candidates[0]["axis"]) <= 64
+    assert not got.ok and got.reason.startswith("label_too_long_to_compare:")
     assert len(got.reason) < 200
 
 
-def test_an_enormous_label_is_capped():
+def test_an_enormous_label_is_refused_rather_than_truncated():
     got = rc.select_option_ids(_sole("L" * 10_000), rc.variant_title_tokens("Medium"))
-    assert len(got.candidates[0]["label"]) <= 128
+    assert not got.ok and got.reason.startswith("label_too_long_to_compare:")
+
+
+def test_a_merely_long_axis_name_is_capped_only_for_display():
+    """Under the comparison bound it still resolves, and only the REPORTED copy is capped."""
+    name = "S" * 200
+    product = {"id": "prd_x", "options": [{"name": name, "values": [
+        {"optionId": "o1", "label": "OS", "available": True},
+        {"optionId": "o2", "label": "M", "available": True}]}]}
+    got = rc.select_option_ids(product, rc.variant_title_tokens("Medium"))
+    assert not got.ok and got.reason == "axes_not_determined_by_title"
+    assert got.unmatched_axes == [name[:64]]
+    assert len(got.unmatched_axes[0]) == 64
 
 
 def test_the_candidate_list_is_bounded():
@@ -3677,3 +3692,360 @@ def test_an_alias_can_turn_a_resolvable_axis_into_an_ambiguous_one():
     with_alias = rc.select_option_ids(product, rc.variant_title_tokens("Flamingo Flirt"),
                                       accept_variant_labels=["Petal Pink"])
     assert not with_alias.ok and with_alias.reason == "ambiguous_on_axis:Shade"
+
+
+# ==================================================================================================
+# FIFTH-ROUND REVIEW. The matcher's wrong-object class is closed; these are the three blockers
+# BEHIND it -- in the guard that checks the echo, and in the alias seam.
+# ==================================================================================================
+
+
+# --- F1: the echo must describe the selection, axis for axis ---------------------------------------
+#
+# `got` was a dict comprehension, so a response carrying the SAME axis twice collapsed and the LAST
+# entry won. Measured: product Size=[M,L], we send M's optionId, partner answers 200 with
+# [{"Size","L"},{"Size","M"}] -> the guard saw M and PASSED. Reversing the two entries made it
+# fire, so whether we accepted a wrong variant depended on the partner's list order.
+
+@pytest.mark.parametrize("order", [["L", "M"], ["M", "L"]])
+def test_a_duplicated_axis_in_the_response_is_refused_in_either_order(order):
+    """Both orders, because order-dependence WAS the bug: one of these two passed and the other
+    refused, for the same response content."""
+    variant = {"id": "var_x", "options": [{"name": "Size", "value": order[0]},
+                                          {"name": "Size", "value": order[1]}]}
+    assert rc.variant_matches_request(variant, {"Size": "M"}) == \
+        "response_duplicate_axis_name:Size"
+
+
+def test_an_axis_duplicated_only_by_whitespace_is_still_a_duplicate():
+    """"Size" beside "Size " collapsed the same way, because both clean to the same key."""
+    variant = {"id": "var_x", "options": [{"name": "Size", "value": "L"},
+                                          {"name": "Size ", "value": "M"}]}
+    assert rc.variant_matches_request(variant, {"Size": "M"}) == \
+        "response_duplicate_axis_name:Size"
+
+
+def test_an_extra_axis_in_the_response_is_refused():
+    """An axis we never selected means the echo is not a description of our selection."""
+    variant = {"id": "var_x", "options": [{"name": "Size", "value": "M"},
+                                          {"name": "Color", "value": "Red"}]}
+    assert rc.variant_matches_request(variant, {"Size": "M"}) == "response_axes_differ"
+
+
+def test_a_missing_axis_in_the_response_is_refused():
+    variant = {"id": "var_x", "options": [{"name": "Size", "value": "M"}]}
+    assert rc.variant_matches_request(variant, {"Size": "M", "Color": "Red"}) == \
+        "response_axes_differ"
+
+
+def test_an_exactly_matching_axis_set_still_passes():
+    """The control: a rule that refused every echo would pass all four negatives above."""
+    variant = {"id": "var_x", "options": [{"name": "Color", "value": "Red"},
+                                          {"name": "Size", "value": "M"}]}
+    assert rc.variant_matches_request(variant, {"Size": "M", "Color": "Red"}) is None
+
+
+def test_the_duplicated_axis_reaches_the_chain_as_a_refusal(monkeypatch):
+    """End to end: we send M's optionId and the partner echoes both L and M."""
+    product = {"id": "prd_d", "merchant": {"name": "example.com"}, "name": "Tee",
+               "options": [{"name": "Size", "values": [
+                   {"optionId": "opt_m", "label": "M", "available": True},
+                   {"optionId": "opt_l", "label": "L", "available": True}]}]}
+    search = {"products": [{"id": "prd_d", "merchant": {"name": "example.com"},
+                            "name": "Tee"}], "warnings": []}
+    variant = {"id": "var_d", "options": [{"name": "Size", "value": "L"},
+                                          {"name": "Size", "value": "M"}],
+               "price": {"amount": 20.0, "currency": "USD"}, "available": True}
+    _chain(monkeypatch, search=search, details={"products": [product], "errors": []},
+           variant=variant)
+    got = _run(rc.resolve_our_row(merchant_domain="example.com", product_name="Tee",
+                                  variant_title="M", our_price=20.00, currency="USD"))
+    assert not got.ok
+    assert got.reason == "variant:response_duplicate_axis_name:Size"
+    assert got.variant_id is None
+
+
+# --- F2: matching uses FULL strings; only display is capped -----------------------------------------
+#
+# `chosen` held the display-capped label and the guard compared capped-to-capped, so two labels
+# sharing a 128-character prefix truncated EQUAL and a substitution passed. The caps agreeing on
+# both sides is what created the collision.
+
+#: Two limited-edition names that are identical for the first 128 characters — the display cap —
+#: and differ only after it. Under the old rule both truncated to the same string.
+LONG_ONE = "L" * 128 + "ONE"
+LONG_TWO = "L" * 128 + "TWO"
+
+
+def test_two_long_labels_sharing_a_prefix_do_not_compare_equal():
+    assert len(LONG_ONE) == 131
+    assert LONG_ONE[:128] == LONG_TWO[:128]      # the collision the caps used to create
+    assert LONG_ONE != LONG_TWO
+    got = rc.select_option_ids(_sole(LONG_ONE), [LONG_ONE])
+    assert got.ok
+    # `chosen` carries the FULL label -- capping it here is the bug.
+    assert got.chosen["Size"] == LONG_ONE and len(got.chosen["Size"]) == 131
+    substituted = {"id": "var_x", "options": [{"name": "Size", "value": LONG_TWO}]}
+    reason = rc.variant_matches_request(substituted, got.chosen)
+    assert reason is not None and reason.startswith("substituted_on_axis:Size")
+
+
+def test_two_long_axis_names_sharing_a_prefix_are_not_one_axis():
+    """The same collision on the key rather than the value: two axis names sharing a 64-character
+    prefix capped to the same string, so the response looked like it answered our axis."""
+    name_one = "A" * 64 + "ONE"
+    name_two = "A" * 64 + "TWO"
+    assert name_one[:64] == name_two[:64]
+    product = {"id": "prd_x", "options": [{"name": name_one, "values": [
+        {"optionId": "o1", "label": "M", "available": True}]}]}
+    got = rc.select_option_ids(product, ["M"])
+    assert got.ok and got.chosen == {name_one: "M"}
+    echoed_other_axis = {"id": "var_x", "options": [{"name": name_two, "value": "M"}]}
+    assert rc.variant_matches_request(echoed_other_axis, got.chosen) == "response_axes_differ"
+
+
+def test_a_long_label_that_matches_exactly_still_resolves():
+    """The control: length alone must not refuse. 300 characters is fine; it is only past the
+    COMPARISON bound that we stop."""
+    label = "R" * 300
+    got = rc.select_option_ids(_sole(label), [label])
+    assert got.ok and got.chosen == {"Size": label}
+    echoed = {"id": "var_x", "options": [{"name": "Size", "value": label}]}
+    assert rc.variant_matches_request(echoed, got.chosen) is None
+
+
+def test_a_label_past_the_comparison_bound_refuses():
+    got = rc.select_option_ids(_sole("Z" * 1025), ["Z" * 1025])
+    assert not got.ok and got.reason.startswith("label_too_long_to_compare:")
+
+
+def test_a_label_exactly_at_the_comparison_bound_is_allowed():
+    """The boundary, so 1024 is a bound and not an off-by-one."""
+    label = "Z" * 1024
+    got = rc.select_option_ids(_sole(label), [label])
+    assert got.ok
+
+
+def test_the_response_side_has_the_same_comparison_bound():
+    variant = {"id": "var_x", "options": [{"name": "Size", "value": "Z" * 1025}]}
+    assert rc.variant_matches_request(variant, {"Size": "M"}).startswith(
+        "label_too_long_to_compare:")
+
+
+def test_the_display_copy_is_capped_while_the_matching_copy_is_not():
+    """The two forms, side by side. `chosen` is for comparing; `chosen_display` is for printing."""
+    got = rc.select_option_ids(_sole(LONG_ONE), [LONG_ONE])
+    assert got.chosen["Size"] == LONG_ONE
+    assert got.chosen_display["Size"] == LONG_ONE[:128]
+    assert len(got.chosen_display["Size"]) == 128
+
+
+def test_the_resolution_reports_the_display_copy(monkeypatch):
+    """`matched_options` is a REPORTING field — the probe script prints it — so it carries the
+    capped copy, while the guard upstream compared the full one."""
+    product = {"id": "prd_l", "merchant": {"name": "example.com"}, "name": "Tee",
+               "options": [{"name": "Size", "values": [
+                   {"optionId": "opt_one", "label": LONG_ONE, "available": True}]}]}
+    search = {"products": [{"id": "prd_l", "merchant": {"name": "example.com"},
+                            "name": "Tee"}], "warnings": []}
+    variant = {"id": "var_l", "options": [{"name": "Size", "value": LONG_ONE}],
+               "price": {"amount": 20.0, "currency": "USD"}, "available": True}
+    _chain(monkeypatch, search=search, details={"products": [product], "errors": []},
+           variant=variant)
+    got = _run(rc.resolve_our_row(merchant_domain="example.com", product_name="Tee",
+                                  variant_title=LONG_ONE, our_price=20.00, currency="USD"))
+    assert got.ok
+    assert got.matched_options == {"Size": LONG_ONE[:128]}
+
+
+# --- F3: a discarded part is still evidence ----------------------------------------------------------
+#
+# When the parts-count rule discards the title's parts they stop SELECTING — which is right — but
+# they also stopped being looked at, so an alias could settle an axis to a value our own row names
+# AGAINST. The identical contradiction was already refused when the parts were usable.
+
+def test_an_alias_may_not_contradict_a_discarded_part():
+    """One axis Size=[M,L]; our title says L; the alias says M. Before: ok=True, Size=M."""
+    got = rc.select_option_ids(_axes(("Size", ["M", "L"])),
+                               rc.variant_title_tokens("Black / L"),
+                               accept_variant_labels=["M"])
+    assert not got.ok and got.reason == "ambiguous_on_axis:Size"
+    assert got.option_ids == []
+
+
+def test_the_realistic_volume_contradiction_is_refused():
+    """Size=["50ml","150ml"], title "Red / 50ml", alias "150ml" resolved the 150ml — three times
+    the product, chosen against what our own row said."""
+    got = rc.select_option_ids(_axes(("Size", ["50ml", "150ml"])),
+                               rc.variant_title_tokens("Red / 50ml"),
+                               accept_variant_labels=["150ml"])
+    assert not got.ok and got.reason == "ambiguous_on_axis:Size"
+
+
+def test_an_alias_that_agrees_with_the_discarded_part_still_resolves():
+    """The contradiction check must fire on DISAGREEMENT only. Here the alias names the same value
+    the title does, so there is nothing to disagree about."""
+    got = rc.select_option_ids(_axes(("Size", ["M", "L"])),
+                               rc.variant_title_tokens("Black / L"),
+                               accept_variant_labels=["L"])
+    assert got.ok and got.chosen == {"Size": "L"}
+
+
+def test_a_discarded_part_still_never_selects_anything():
+    """The other half: evidence, not selection. Without an alias the same title resolves nothing,
+    because a two-part title against a one-axis product has its parts discarded."""
+    got = rc.select_option_ids(_axes(("Size", ["M", "L"])),
+                               rc.variant_title_tokens("Black / L"))
+    assert not got.ok and got.reason == "axes_not_determined_by_title"
+    assert got.option_ids == []
+
+
+def test_a_contradiction_on_a_second_axis_is_caught_too():
+    """Three parts against two axes: the parts are discarded, two aliases settle both axes, and
+    the discarded `L` contradicts the alias `M` on Size."""
+    product = _axes(("Color", ["Black", "White"]), ("Size", ["M", "L"]))
+    got = rc.select_option_ids(product, rc.variant_title_tokens("Black / L / Tall"),
+                               accept_variant_labels=["Black", "M"])
+    assert not got.ok and got.reason == "ambiguous_on_axis:Size"
+
+
+def test_the_whole_title_reading_is_also_subject_to_contradiction():
+    """The whole-title path settles an axis too, so it gets the same check."""
+    product = _axes(("Size", ["Black / L", "M"]))
+    got = rc.select_option_ids(product, rc.variant_title_tokens("Black / L"),
+                               accept_variant_labels=["M"])
+    assert not got.ok and got.reason == "ambiguous_on_axis:Size"
+
+
+# --- F4: both reported lists are bounded and sanitised -------------------------------------------------
+
+def test_both_reported_lists_are_capped():
+    """The comment claimed the payload was bounded while `unmatched_axes` was not."""
+    product = _axes(*[(f"Axis{i}", [f"Lab{i}"]) for i in range(40)])
+    got = rc.select_option_ids(product, ["nothing at all"])
+    assert not got.ok
+    assert len(got.candidates) == 10
+    assert len(got.unmatched_axes) == 10
+
+
+def test_an_axis_name_is_cleaned_on_BOTH_sides_so_the_two_still_agree():
+    """`chosen`'s key and the response's key have to be produced by the SAME cleaning, or a
+    perfectly good match reads as `response_axes_differ`. This is the reason the request side
+    cleans the axis name rather than merely stripping it: an interior newline or zero-width space
+    survives `.strip()`, and then only one of the two sides has it."""
+    product = {"id": "prd_x", "options": [{"name": "Si\nze", "values": [
+        {"optionId": "o1", "label": "M", "available": True},
+        {"optionId": "o2", "label": "L", "available": True}]}]}
+    got = rc.select_option_ids(product, rc.variant_title_tokens("M"))
+    assert got.ok and got.chosen == {"Si ze": "M"}
+    echoed = {"id": "var_x", "options": [{"name": "Si\nze", "value": "M"}]}
+    assert rc.variant_matches_request(echoed, got.chosen) is None
+
+
+def test_two_axis_names_differing_only_by_an_invisible_are_one_axis():
+    """And the fail-closed half: cleaning makes them collide, and a collision is a refusal. Left
+    uncleaned they would look like two distinct axes and both would be sent."""
+    product = {"id": "prd_x", "options": [
+        {"name": "Size", "values": [{"optionId": "o1", "label": "M", "available": True}]},
+        {"name": "Size​", "values": [{"optionId": "o2", "label": "L", "available": True}]}]}
+    got = rc.select_option_ids(product, rc.variant_title_tokens("M"))
+    assert not got.ok and got.reason == "duplicate_axis_name:Size"
+
+
+def test_unmatched_axis_entries_are_sanitised():
+    product = {"id": "prd_x", "options": [
+        {"name": "Si\nze", "values": [{"optionId": "o1", "label": "A", "available": True},
+                                      {"optionId": "o2", "label": "B", "available": True}]}]}
+    got = rc.select_option_ids(product, ["nothing"])
+    assert got.unmatched_axes == ["Si ze"]
+    assert "\n" not in json.dumps(got.unmatched_axes)
+
+
+# --- F5: "Default Title" is the placeholder, not a prefix ------------------------------------------------
+
+def test_a_title_that_merely_starts_with_default_title_is_a_real_title():
+    """F5. The exact-equality test on the TITLE side had no killing test — `startswith` survived.
+    "Default Title Deluxe" is a real variant name and must not take the no-title path."""
+    got = rc.select_option_ids(_sole("Mini"), rc.variant_title_tokens("Default Title Deluxe"))
+    assert not got.ok
+    assert got.reason == "sole_label_differs:Size"
+    assert got.single_value_axis_accepted_without_title is False
+
+
+def test_default_title_deluxe_still_matches_its_own_label():
+    got = rc.select_option_ids(_sole("Default Title Deluxe"),
+                               rc.variant_title_tokens("Default Title Deluxe"))
+    assert got.ok and got.chosen == {"Size": "Default Title Deluxe"}
+
+
+# --- F6: invisible format characters ----------------------------------------------------------------------
+
+@pytest.mark.parametrize("ch,name", [
+    ("‮", "RIGHT-TO-LEFT OVERRIDE"),
+    ("​", "ZERO WIDTH SPACE"),
+    ("﻿", "BYTE ORDER MARK"),
+    ("⁦", "LEFT-TO-RIGHT ISOLATE"),
+    ("⁩", "POP DIRECTIONAL ISOLATE"),
+    ("‏", "RIGHT-TO-LEFT MARK"),
+])
+def test_invisible_format_characters_never_reach_a_reason_or_a_candidate(ch, name):
+    """C0/C1 stripping missed these entirely. U+202E reverses the rendering of everything after it
+    in whatever reads our log; the rest are invisible splitters."""
+    product = {"id": "prd_x", "options": [{"name": f"Si{ch}ze", "values": [
+        {"optionId": "o1", "label": f"O{ch}S", "available": True}]}]}
+    got = rc.select_option_ids(product, rc.variant_title_tokens("Medium"))
+    flat = (got.reason or "") + json.dumps(got.candidates) + json.dumps(got.unmatched_axes)
+    assert ch not in flat, name
+
+
+def test_an_invisible_split_does_not_stop_a_label_matching():
+    """Decided deliberately and done ONCE, in `_norm`: a zero-width space is not part of what a
+    merchant is selling, so "O<ZWSP>S" and "OS" are the same label. Before, `\\w` turned it into a
+    SPACE and the label normalised to "o s", which refused an identical-looking row."""
+    assert rc._norm("O​S") == rc._norm("OS") == "os"
+    got = rc.select_option_ids(_sole("O​S"), rc.variant_title_tokens("OS"))
+    assert got.ok
+
+
+def test_stripping_invisibles_cannot_merge_two_visibly_different_labels():
+    """The control that matters: removing something invisible must not make two visible strings
+    equal. A real space still separates tokens."""
+    assert rc._norm("OS") != rc._norm("O S")
+    assert rc._norm("AB") != rc._norm("A B")
+    product = _axes(("Size", ["OS", "O S"]))
+    # Two genuinely different labels stay different, so a title naming one does not claim both.
+    assert rc.select_option_ids(product, rc.variant_title_tokens("OS")).ok
+
+
+# --- F7: a non-string label is no label ---------------------------------------------------------------------
+
+@pytest.mark.parametrize("label", [0, 7, 3.5, True, False, {"text": "M"}, ["M"]])
+def test_a_non_string_label_is_treated_as_absent(label):
+    """`_label_of({"label": 0})` gave "0" while `_norm(0)` gives "" — the same value was a label to
+    one half of the module and nothing to the other."""
+    assert rc._label_of({"label": label}) == ""
+
+
+def test_a_sole_value_with_a_numeric_label_is_not_auto_filled():
+    """The consequence of that split: the untitled structural path read `_label_of` and accepted a
+    value the matcher considered unlabelled, recording "0" in `chosen` as the thing we asked for."""
+    product = {"id": "prd_x", "options": [{"name": "Size", "values": [
+        {"optionId": "o1", "label": 0, "available": True}]}]}
+    got = rc.select_option_ids(product, [])
+    assert not got.ok
+    assert got.chosen == {}
+    assert got.candidates == []          # not reported either
+
+
+def test_a_numeric_label_is_unmatchable_from_a_title():
+    product = {"id": "prd_x", "options": [{"name": "Size", "values": [
+        {"optionId": "o1", "label": 7, "available": True},
+        {"optionId": "o2", "label": "M", "available": True}]}]}
+    assert not rc.select_option_ids(product, rc.variant_title_tokens("7")).ok
+    assert rc.select_option_ids(product, rc.variant_title_tokens("M")).ok
+
+
+def test_a_string_label_that_looks_numeric_still_works():
+    """The control — a shoe size "7" as a STRING is a real label and must keep resolving."""
+    got = rc.select_option_ids(_axes(("Size", ["6", "7", "8"])), rc.variant_title_tokens("7"))
+    assert got.ok and got.chosen == {"Size": "7"}

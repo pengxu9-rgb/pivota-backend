@@ -382,6 +382,12 @@ def _norm(text: Any) -> str:
     """
     folded = unicodedata.normalize("NFKD", str(text or ""))
     folded = "".join(ch for ch in folded if not _is_stripped_diacritic(ch))
+    # F6. Invisible FORMAT characters (category Cf) are dropped for matching too, and here rather
+    # than at each comparison site so there is one rule. `\\w` does not match them, so without this
+    # a zero-width space inside "O<ZWSP>S" became a SPACE and the label normalised to "o s" --
+    # which is not "os", so an identical-looking label refused. Dropping them cannot merge two
+    # labels that differ in anything a buyer can see, because nothing here is visible.
+    folded = _strip_format_chars(folded)
     folded = unicodedata.normalize("NFC", folded)
     return _SEPARATOR_RE.sub(" ", folded.casefold()).strip()
 
@@ -464,9 +470,14 @@ def label_candidates(
     WHAT AN ALIAS CAN STILL DO, since "it only ever helps" would be false: an alias that happens
     to equal ANOTHER value's label on an axis our title already settled makes that axis ambiguous,
     and the row stops resolving. That is the safe direction -- two candidates naming one axis is
-    a refusal, not a guess -- but it is a real way to make a working row stop working, so aliases
-    are not free. They are also NOT AXIS-SCOPED: an alias is offered to every axis, which is why
-    one that collides across axes refuses with both axes named.
+    a refusal here -- but it is a real way to make a working row stop working, so aliases are not
+    free. They are also NOT AXIS-SCOPED: an alias is offered to every axis, which is why one that
+    collides across axes refuses with both axes named.
+
+    "A refusal, not a guess" describes THIS function's handling of two candidates naming one axis.
+    It is not a claim about the module as a whole: an alias that contradicts a part of our own
+    title was, until the fifth review, a silent wrong selection rather than a refusal -- see the
+    contradiction pass in `select_option_ids`, which is what makes the sentence true now.
     """
     # `variant_title_tokens` puts the whole title first and the separator-parts after it, and that
     # is the shape assumed here. A caller passing its own list gets the same reading: the first
@@ -561,18 +572,57 @@ def _dedupe(values: Sequence[str]) -> List[str]:
 MAX_AXIS_NAME_LENGTH = 64
 MAX_LABEL_LENGTH = 128
 MAX_REPORTED_CANDIDATES = 10
+#: The hard bound on text this module will COMPARE. Display caps must never be used for matching
+#: (see `_clean_partner_text`), so "uncapped" needs its own limit or a partner could hand us a
+#: megabyte to normalise. Anything longer refuses rather than being silently shortened.
+MAX_COMPARABLE_TEXT = 1024
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 
-def _safe_partner_text(text: Any, cap: int) -> str:
-    """Strip control characters, collapse whitespace, and cap. For DISPLAY and reasons only.
+def _strip_format_chars(text: str) -> str:
+    """Drop Unicode category Cf -- the INVISIBLE formatting characters.
 
-    Not `_norm`: this keeps case and punctuation, because the point is to show a human the label
-    Reap actually sent. Matching still goes through `_norm`.
+    C0/C1 control stripping misses these entirely, and they are the ones that matter for a string
+    we echo into a log: U+202E RIGHT-TO-LEFT OVERRIDE reverses everything after it, U+2066-U+2069
+    are the isolates, and U+200B ZWSP / U+FEFF are invisible splitters that make two identical
+    labels compare unequal. None of them is visible, so none of them can be part of what a
+    merchant is selling.
+    """
+    return "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
+
+
+def _clean_partner_text(text: Any) -> str:
+    """Partner text made safe to hold and COMPARE: controls and format characters out, whitespace
+    collapsed, NOT capped.
+
+    F2. `chosen` used to hold the display-capped label and the substitution guard compared
+    capped-to-capped, so two labels sharing a 128-character prefix -- a limited-edition name
+    ending "...ONE" against one ending "...TWO" -- truncated EQUAL and a substitution passed.
+    The caps agreeing on both sides is exactly what created the collision. Matching therefore uses
+    this function and display uses `_safe_partner_text`; the two are never interchanged.
     """
     cleaned = _CONTROL_CHARS_RE.sub(" ", str(text if text is not None else ""))
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    return cleaned[:cap]
+    cleaned = _strip_format_chars(cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _safe_partner_text(text: Any, cap: int) -> str:
+    """The same cleaning, then CAPPED. For display, reasons and log lines -- never for matching.
+
+    Not `_norm`: this keeps case and punctuation, because the point is to show a human the label
+    Reap actually sent.
+    """
+    return _clean_partner_text(text)[:cap]
+
+
+def _display_axis(axis_name: Any) -> str:
+    """An axis name capped for DISPLAY. Never fed back into a comparison."""
+    return _safe_partner_text(axis_name, MAX_AXIS_NAME_LENGTH)
+
+
+def _display_label(label: Any) -> str:
+    """A label capped for DISPLAY. Never fed back into a comparison."""
+    return _safe_partner_text(label, MAX_LABEL_LENGTH)
 
 
 def _label_of(value: Any) -> str:
@@ -583,12 +633,18 @@ def _label_of(value: Any) -> str:
     against, and would be shown to a human as the option we picked. An empty string here is
     refused by every caller; `"None"` would have been compared, and could even have matched a
     Reap label that genuinely reads "None".
+
+    F7. Only a `str` is a label. `_label_of({"label": 0})` used to give "0" while `_norm(0)` gives
+    "" -- the same value was a label to one half of this module and nothing to the other, and the
+    untitled structural path took the first reading: a sole value labelled `0` was accepted and
+    recorded in `chosen` as "0", a string the matcher would never have matched. Numbers, bools and
+    dicts are now consistently NO label: unmatchable, not auto-fillable, not reported.
+
+    UNCAPPED, because this is the matching form (see `_clean_partner_text`). Display capping
+    happens where text is rendered.
     """
-    # There was an explicit `"" if label is None else ...` here. `_safe_partner_text` already maps
-    # None to "" -- that is where the B8 property now lives -- so the conditional was inert and a
-    # mutation sweep could not kill it. One place, not two.
-    return _safe_partner_text(
-        value.get("label") if isinstance(value, dict) else None, MAX_LABEL_LENGTH)
+    label = value.get("label") if isinstance(value, dict) else None
+    return _clean_partner_text(label) if isinstance(label, str) else ""
 
 
 def normalise_domain(value: Any) -> str:
@@ -705,8 +761,14 @@ def match_product(
 class OptionMatch:
     ok: bool
     option_ids: List[str] = field(default_factory=list)
-    #: Axis name -> the label we chose, so a caller can show a human what was matched.
+    #: Axis name -> the label we chose, FULL and uncapped. This is the MATCHING form: it is what
+    #: `variant_matches_request` compares Reap's response against, and it must never be a capped
+    #: string -- two labels sharing a 128-character prefix truncated equal and a substitution
+    #: passed. Print `chosen_display` instead.
     chosen: Dict[str, str] = field(default_factory=dict)
+    #: The same mapping with the display caps applied (axis 64, label 128). Safe to render into a
+    #: report or a log line; NOT safe to compare.
+    chosen_display: Dict[str, str] = field(default_factory=dict)
     reason: Optional[str] = None
     unmatched_axes: List[str] = field(default_factory=list)
     #: On `sole_label_differs`, `[{"axis": ..., "label": ...}]` -- Reap's ONE label for each
@@ -752,7 +814,7 @@ def select_option_ids(
 
     `accept_variant_labels` is that alias list: caller-supplied strings compared exactly, like any
     other candidate, against the label on ANY axis -- they are NOT axis-scoped. It widens WHICH
-    label we will accept; it does not weaken anything downstream, because availability and the
+    label we will accept; it does not weaken the guards downstream, because availability and the
     substitution guard both run on the label that was chosen. It is not purely additive either:
     an alias that equals a sibling's label on an already-settled axis makes that axis AMBIGUOUS
     and the row refuses. That fails closed, but it means adding an alias can stop a working row
@@ -820,29 +882,44 @@ def select_option_ids(
     if not all_keys and not single_axis_product:
         return OptionMatch(ok=False, reason="no_variant_title_supplied")
 
+    # PARTS WE DISCARDED are still evidence. They may never SELECT anything -- that is the whole
+    # point of the count rule -- but if our title named a value on an axis and something else
+    # settled that axis to a DIFFERENT value, our row is being contradicted and we must not guess
+    # which reading wins. See pass 6.
+    discarded_parts = [] if usable_parts else list(parts)
+
     # --- pass 1: read each axis, and record which candidates its values equal -------------------
-    #: (axis_name, {candidate_key: value}, the sole value dict or None)
-    axes_read: List[Tuple[str, Dict[str, Dict[str, Any]], Optional[Dict[str, Any]]]] = []
+    #: (axis_name, {candidate_key: value}, the sole value dict or None, {label: value} for ALL)
+    axes_read: List[Tuple[str, Dict[str, Dict[str, Any]], Optional[Dict[str, Any]],
+                          Dict[str, Dict[str, Any]]]] = []
     seen_axis_names: List[str] = []
     for axis in options:
         axis = axis if isinstance(axis, dict) else {}
-        # F5. Sanitised HERE, once, because this string becomes a `chosen` key, a `candidates`
-        # entry and a substring of several reason strings. Two axis names that differ only in
-        # control characters or in text past the cap collapse to one and are then caught by the
-        # duplicate check below, which is the fail-closed outcome.
-        axis_name = _safe_partner_text(axis.get("name"), MAX_AXIS_NAME_LENGTH) or "?"
+        # CLEANED but NOT capped: this string is a `chosen` key, and `chosen` is what the
+        # substitution guard looks the response up by. Capping it here is what let two axis names
+        # sharing a 64-character prefix collide (F2). Display capping happens at the point of
+        # rendering, via `_display_axis` below.
+        axis_name = _clean_partner_text(axis.get("name")) or "?"
+        if len(axis_name) > MAX_COMPARABLE_TEXT:
+            return OptionMatch(
+                ok=False,
+                reason=f"label_too_long_to_compare:{_display_axis(axis_name)}")
         if axis_name in seen_axis_names:
             # B6. `chosen` is a dict keyed on the axis name, and so is the `got` map in
             # `variant_matches_request`. Two axes called "Size" therefore collapse to one entry --
             # last write wins -- while BOTH optionIds are still sent. The guard then checks one
             # axis, cannot see the other, and the axis it does check may be the one we did not
-            # pick. Nothing downstream can recover the lost selection, so refuse here.
+            # pick. The response side now refuses a duplicated axis too
+            # (`response_duplicate_axis_name`), so this is no longer the only thing standing
+            # between a collapsed selection and a wrong variant -- but it is the EARLIER one,
+            # and refusing before we send beats refusing after the partner has answered.
             return OptionMatch(ok=False, reason=f"duplicate_axis_name:{axis_name}")
         seen_axis_names.append(axis_name)
         values = axis.get("values") if isinstance(axis.get("values"), list) else []
         sole = values[0] if len(values) == 1 and isinstance(values[0], dict) else None
 
         hits: Dict[str, Dict[str, Any]] = {}
+        value_labels: Dict[str, Dict[str, Any]] = {}
         for value in values:
             value = value if isinstance(value, dict) else {}
             # B8. A null or blank label is NO label, not the string "None". It cannot be compared
@@ -851,7 +928,24 @@ def select_option_ids(
             # holding only non-empty strings, so a blank label simply is not in it -- there was an
             # explicit `not label or` here and a mutation sweep proved it inert. Removed rather
             # than kept as reassurance; the property is pinned on `label_candidates` instead.
-            label = _norm(value.get("label"))
+            #
+            # F7. Read through `_label_of`, so "is this a label?" has ONE answer. Reading
+            # `value.get("label")` directly made `0` normalise to "" here while `_label_of` said
+            # "0", and the untitled path then accepted a value this loop considered unlabelled.
+            label_text = _label_of(value)
+            if len(label_text) > MAX_COMPARABLE_TEXT:
+                # F2's other half: "uncapped for matching" needs its own bound, or a partner can
+                # hand us a megabyte to normalise. Refused rather than truncated -- truncating is
+                # what made two different labels compare equal in the first place.
+                return OptionMatch(
+                    ok=False,
+                    reason=f"label_too_long_to_compare:{_display_axis(axis_name)}")
+            label = _norm(label_text)
+            #: Every value on this axis by normalised label, whether or not it is a candidate.
+            #: Used by the contradiction check in pass 6 -- a part we discarded still counts as
+            #: EVIDENCE about what our row meant, even though it may not select anything.
+            if label:
+                value_labels[label] = value
             if label not in all_keys:
                 continue
             if label in hits:
@@ -859,14 +953,14 @@ def select_option_ids(
                 # "STANDARD!"). Taking the last is a coin flip between two distinct optionIds.
                 return OptionMatch(ok=False, reason=f"ambiguous_on_axis:{axis_name}")
             hits[label] = value
-        axes_read.append((axis_name, hits, sole))
+        axes_read.append((axis_name, hits, sole, value_labels))
 
     # --- pass 2: one part may satisfy at most ONE axis -------------------------------------------
     # Now that every part is offered to every axis, a title like "Red / M" against a product whose
     # Color axis carries a label "M" AND whose Size axis carries "M" has two readings and no way
     # to choose between them. Both axes are named, because the refusal is about the pair.
     key_axes: Dict[str, List[str]] = {}
-    for axis_name, hits, _ in axes_read:
+    for axis_name, hits, _, _ in axes_read:
         for key in hits:
             if key in part_keys:
                 key_axes.setdefault(key, []).append(axis_name)
@@ -878,13 +972,13 @@ def select_option_ids(
     # Two different candidates equalling labels on the SAME axis ("Black / White" against a Color
     # axis carrying both) is a title that does not determine that axis. Checked after pass 2 so
     # that the cross-axis case, which can name both axes, gets the more informative refusal.
-    for axis_name, hits, _ in axes_read:
+    for axis_name, hits, _, _ in axes_read:
         if len(hits) > 1:
             return OptionMatch(ok=False, reason=f"ambiguous_on_axis:{axis_name}")
 
     # --- pass 4: assign parts and aliases ----------------------------------------------------------
     assigned: Dict[str, Dict[str, Any]] = {}
-    for axis_name, hits, _ in axes_read:
+    for axis_name, hits, _, _ in axes_read:
         for key, value in hits.items():
             if key in part_keys:
                 assigned[axis_name] = value
@@ -903,15 +997,34 @@ def select_option_ids(
     #                           one-axis product, which is the only place this reading can be
     #                           complete. On a two-axis product it would settle one axis from the
     #                           whole title and leave the other undetermined anyway.
-    outstanding = [name for name, _, _ in axes_read if name not in assigned]
+    outstanding = [name for name, _, _, _ in axes_read if name not in assigned]
     if whole and not assigned and len(outstanding) == 1:
         axis_name = outstanding[0]
-        hits = next(h for name, h, _ in axes_read if name == axis_name)
+        hits = next(h for name, h, _, _ in axes_read if name == axis_name)
         if whole in hits:
             assigned[axis_name] = hits[whole]
 
+    # --- pass 5b: a DISCARDED part must still be able to contradict --------------------------------
+    # F3. When the parts-count rule discards the title's parts they stop selecting, and they also
+    # stopped being looked at -- so an alias could settle an axis to a value our own row names
+    # AGAINST. Measured: one axis Size=[M,L], title "Black / L", alias ["M"] resolved M, although
+    # the title says L; realistically Size=["50ml","150ml"] with title "Red / 50ml" and alias
+    # "150ml" resolved the 150ml. The same contradiction was already refused when the parts WERE
+    # usable (title "L" + alias "M" -> ambiguous_on_axis), so this closes a hole rather than
+    # adding a rule. Discarded parts still never SELECT anything.
+    for axis_name, _hits, _sole, value_labels in axes_read:
+        value = assigned.get(axis_name)
+        if value is None:
+            continue
+        settled_label = _norm(_label_of(value))
+        for part in discarded_parts:
+            if part in value_labels and part != settled_label:
+                return OptionMatch(ok=False, reason=f"ambiguous_on_axis:{axis_name}")
+
     # --- pass 6: build the result, in axis order --------------------------------------------------
     chosen: Dict[str, str] = {}
+    #: The same mapping, capped for printing. NOTHING may compare these.
+    chosen_display: Dict[str, str] = {}
     chosen_available: Dict[str, Optional[bool]] = {}
     option_ids: List[str] = []
     unmatched: List[str] = []
@@ -920,7 +1033,7 @@ def select_option_ids(
     #: (axis, Reap's label) for every SINGLE-VALUE axis whose one label did not match. These are
     #: the ones an alias can fix, and the label is catalog data -- a shade or size name -- not PII.
     sole_mismatches: List[Tuple[str, str]] = []
-    for axis_name, _hits, sole in axes_read:
+    for axis_name, _hits, sole, _labels in axes_read:
         value = assigned.get(axis_name)
         if value is None and sole is not None and not all_keys:
             # No title and no alias, on the one shape where that is allowed: `single_axis_product`
@@ -945,7 +1058,12 @@ def select_option_ids(
         # is what the response will echo. Sound because the label either EQUALS one of our
         # candidates or was named verbatim as an alias -- in both cases a human or our own row
         # asserted this exact string, and nothing was inferred from it.
+        #
+        # FULL, never capped: this is the string the substitution guard compares against, and a
+        # capped one made two 130-character labels sharing a prefix compare equal. `chosen_display`
+        # is the capped twin, and it is the one that may be printed.
         chosen[axis_name] = _label_of(value)
+        chosen_display[_display_axis(axis_name)] = _display_label(_label_of(value))
         availability = value.get("available")
         chosen_available[axis_name] = availability if isinstance(availability, bool) else None
         if availability is False:
@@ -961,16 +1079,20 @@ def select_option_ids(
         # genuinely does not pin the axis, and no alias fixes that.
         reason = "axes_not_determined_by_title"
         if sole_mismatches and len(sole_mismatches) == len(unmatched):
-            reason = f"sole_label_differs:{sole_mismatches[0][0]}"
+            reason = f"sole_label_differs:{_display_axis(sole_mismatches[0][0])}"
         return OptionMatch(
             ok=False, reason=reason,
-            # Capped: both fields are already sanitised per-entry, and the LIST is bounded so a
-            # product with a thousand axes cannot turn one refusal into a thousand-entry payload.
-            candidates=[{"axis": axis, "label": label}
+            # DISPLAY fields: every entry capped, and both LISTS bounded. F4 -- `unmatched_axes`
+            # was unbounded next to a comment claiming the payload was bounded, so a product with
+            # a thousand axes turned one refusal into a thousand uncapped strings.
+            candidates=[{"axis": _display_axis(axis), "label": _display_label(label)}
                         for axis, label in sole_mismatches[:MAX_REPORTED_CANDIDATES]],
-            unmatched_axes=unmatched, chosen=chosen, chosen_available=chosen_available,
+            unmatched_axes=[_display_axis(a) for a in unmatched[:MAX_REPORTED_CANDIDATES]],
+            chosen=chosen, chosen_display=chosen_display,
+            chosen_available=chosen_available,
         )
     return OptionMatch(ok=True, option_ids=option_ids, chosen=chosen,
+                       chosen_display=chosen_display,
                        chosen_available=chosen_available, unavailable_axes=unavailable,
                        single_value_axis_accepted_without_title=accepted_without_title)
 
@@ -990,23 +1112,41 @@ def variant_matches_request(variant: Any, chosen: Dict[str, str]) -> Optional[st
     It is the same family as `previewVariant` being availability-ordered, and it is why nothing
     here may treat "Reap returned 200" as "Reap did what we asked". The response is checked
     against the request, every time.
+
+    THE ECHO MUST DESCRIBE THE SELECTION, AXIS FOR AXIS. This used to be a dict comprehension, so
+    a response carrying the SAME axis twice silently collapsed and the LAST entry won. Measured:
+    product Size=[M,L], we send M's optionId, partner answers 200 with
+    `[{"Size","L"},{"Size","M"}]` -> the guard saw M and passed, accepting the wrong variant --
+    and REVERSING the two entries made it fire, so the outcome depended on the partner's list
+    order. `"Size"` beside `"Size "` collapsed the same way. So: duplicate axis names refuse, and
+    so does an echo whose axis SET is not the set we selected -- an extra axis or a missing one
+    both mean the response is not describing what we asked for. This is the same policy
+    `select_option_ids` already applies to the request side.
     """
     data = variant if isinstance(variant, dict) else {}
     # C1 (second pass). `data.get("options") or []` is falsy-safe but not TYPE-safe: `{"options": 3}`
     # made this raise TypeError out of `resolve_our_row` -- a crash from partner JSON in the one
     # guard the module cannot afford to lose. An unknown shape carries no options, so it refuses.
     raw_options = data.get("options")
-    # F5. Sanitised on the way in, with the SAME caps `select_option_ids` applied to `chosen` --
-    # they have to agree, because the axis name is the key both sides look each other up by, and
-    # `got[axis]` is interpolated into the refusal string below.
-    got = {
-        _safe_partner_text(o.get("name"), MAX_AXIS_NAME_LENGTH):
-            _safe_partner_text(o.get("value"), MAX_LABEL_LENGTH)
+    # F2. CLEANED, NOT CAPPED -- the same form `chosen` holds. The two sides must agree, and the
+    # earlier version agreed on a CAPPED form, which is what let two axis names sharing a
+    # 64-character prefix look like one axis.
+    pairs = [
+        (_clean_partner_text(o.get("name")), _clean_partner_text(o.get("value")))
         for o in (raw_options if isinstance(raw_options, list) else []) if isinstance(o, dict)
-    }
+    ]
+    got: Dict[str, str] = {}
+    for name, value in pairs:
+        if len(name) > MAX_COMPARABLE_TEXT or len(value) > MAX_COMPARABLE_TEXT:
+            return f"label_too_long_to_compare:{_display_axis(name)}"
+        if name in got:
+            return f"response_duplicate_axis_name:{_display_axis(name)}"
+        got[name] = value
+    if set(got) != set(chosen):
+        # An axis we never selected, or one we did and the echo omits: either way the response
+        # does not describe our selection and there is nothing to compare it against.
+        return "response_axes_differ"
     for axis, label in chosen.items():
-        if axis not in got:
-            return f"response_missing_axis:{axis}"
         got_norm = _norm(got[axis])
         want_norm = _norm(label)
         # B3. An EMPTY normalised string is not a value and must never count as a match. Under the
@@ -1017,7 +1157,9 @@ def variant_matches_request(variant: Any, chosen: Dict[str, str]) -> Optional[st
         # passed review. Fail closed on either side being empty, at the site that compares.
         if not got_norm or not want_norm or got_norm != want_norm:
             # Named in full because this is the case a human has to be able to see at a glance.
-            return f"substituted_on_axis:{axis}:asked={label}:got={got[axis]}"
+            # DISPLAY forms here -- the comparison above used the full strings; this line is text.
+            return (f"substituted_on_axis:{_display_axis(axis)}"
+                    f":asked={_display_label(label)}:got={_display_label(got[axis])}")
     return None
 
 
@@ -1734,7 +1876,8 @@ async def resolve_our_row(
             # On `sole_label_differs` these are Reap's labels for the axes we could not match --
             # the strings a human would put in `accept_variant_labels` if they name our object.
             candidates=options.candidates,
-            matched_options=options.chosen, warnings=found.warnings, queries_tried=tried,
+            matched_options=options.chosen_display, warnings=found.warnings,
+            queries_tried=tried,
         )
 
     if options.unavailable_axes:
@@ -1748,8 +1891,10 @@ async def resolve_our_row(
         axis = options.unavailable_axes[0]
         return VariantResolution(
             ok=False,
-            reason=f"options:value_unavailable_at_reap:{axis}:{options.chosen.get(axis)}",
-            matched_options=options.chosen, chosen_available=options.chosen_available,
+            reason=(f"options:value_unavailable_at_reap:{_display_axis(axis)}"
+                    f":{_display_label(options.chosen.get(axis))}"),
+            matched_options=options.chosen_display,
+            chosen_available=options.chosen_available,
             available=False, warnings=found.warnings, queries_tried=tried,
         )
 
@@ -1774,7 +1919,7 @@ async def resolve_our_row(
     mismatch = variant_matches_request(variant, options.chosen)
     if mismatch:
         return VariantResolution(ok=False, reason=f"variant:{mismatch}",
-                                 matched_options=options.chosen,
+                                 matched_options=options.chosen_display,
                                  chosen_available=options.chosen_available,
                                  warnings=found.warnings, queries_tried=tried)
 
@@ -1785,7 +1930,8 @@ async def resolve_our_row(
         price_disagrees=_disagrees(price, our_price, currency),
         currency_mismatch=_currency_mismatch(price, currency),
         resolved_at=time.time(),
-        matched_options=options.chosen, chosen_available=options.chosen_available,
+        matched_options=options.chosen_display,
+        chosen_available=options.chosen_available,
         single_value_axis_accepted_without_title=options.single_value_axis_accepted_without_title,
         warnings=found.warnings, queries_tried=tried,
     )
@@ -1924,7 +2070,8 @@ REFUSAL_EXPLANATIONS: List[Tuple[str, str]] = [
      "The product reports two option axes with the SAME name. Our selection is keyed on the axis\n"
      "name -- and so is the check that compares Reap's response to what we asked for -- so one of\n"
      "the two selections would be lost while both optionIds were still sent, leaving the\n"
-     "substitution guard checking an axis it cannot identify. Nothing downstream can recover it."),
+     "substitution guard checking an axis it cannot identify. The response side refuses a\n"
+     "duplicated axis as well, so this is the earlier of two refusals rather than the only one."),
     ("response_too_large",
      "Reap's response exceeded the size this module will parse. Not a matching problem: either\n"
      "the endpoint returned something far larger than anything measured, or the response is not\n"
@@ -1956,9 +2103,24 @@ REFUSAL_EXPLANATIONS: List[Tuple[str, str]] = [
      "Reap returned 200 for a DIFFERENT variant than the one we asked for. This is the silent\n"
      "substitution; the reason line names what we asked for and what came back. Refusing is\n"
      "correct -- quoting it would price the wrong physical object."),
-    ("variant:response_missing_axis",
-     "Reap's variant response did not carry an axis we asked about, so we cannot confirm it is\n"
-     "the variant we wanted."),
+    ("variant:response_axes_differ",
+     "Reap's variant response describes a different SET of axes from the one we selected -- it\n"
+     "carries an axis we never asked about, or omits one we did. Either way the echo is not a\n"
+     "description of our selection, so there is nothing to check it against. Refusing beats\n"
+     "comparing the axes that happen to line up."),
+    ("variant:response_duplicate_axis_name",
+     "Reap's variant response carried the SAME axis twice. The two entries collapse into one\n"
+     "reading and the LAST one used to win, so whether the substitution guard fired depended on\n"
+     "the order the partner listed them in -- measured, reversing two entries flipped a wrong\n"
+     "variant from accepted to refused. The response cannot be interpreted; do not retry it."),
+    ("variant:label_too_long_to_compare",
+     "A label or axis name in Reap's response is longer than this module will compare (1024\n"
+     "characters). Comparison uses the FULL string -- capping it is what once made two different\n"
+     "labels look equal -- so an absurd length is refused rather than truncated."),
+    ("options:label_too_long_to_compare",
+     "A label or axis name in Reap's product details is longer than this module will compare\n"
+     "(1024 characters). Same rule as the response side: full strings are compared, so an absurd\n"
+     "length refuses instead of being silently shortened into a possible collision."),
     ("details:", "The product id resolved but details refused it. The code shown is Reap's."),
     ("single_variant_product_has_no_variant_id",
      "An option-less product whose `defaultVariant.id` is not a Reap `var_...`. Do not send it."),
