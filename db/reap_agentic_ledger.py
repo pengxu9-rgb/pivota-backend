@@ -40,6 +40,19 @@ need are the ones this file exports: `transition` for the service, `claim_due_pu
    tests/test_repo_sql_prepare_postgres.py resolves a `database.*` first argument only when it
    is a literal or a MODULE-level name. SQL assembled at call time is invisible to it, and
    statements on a live path that nothing ever PREPAREs are how #1588 reached production.
+   The state vocabularies inside those statements are therefore literal too, and the Python
+   tuples are parsed back OUT of the SQL — see `_states_in` for why that direction.
+
+6. THIS MODULE OPENS NO TRANSACTIONS, AND THE CUTOFFS DEPEND ON THAT. On Postgres
+   `CURRENT_TIMESTAMP` is TRANSACTION-start time, not wall-clock time: inside a long
+   caller-supplied transaction it FREEZES, so a poll loop that ran inside one would compare
+   every row against the clock as it was when the transaction began and either sweep nothing or
+   sweep everything. Every function here runs in autocommit — `mark_enrollment_active` held the
+   last `database.transaction()` and no longer does, for reasons of its own — so the two are
+   equivalent today. The cutoffs still use `clock_timestamp()` on Postgres rather than rely on
+   that: it reads the wall clock at STATEMENT time, so a future caller that wraps one of these
+   in a transaction cannot silently freeze it. SQLite has no equivalent and keeps
+   CURRENT_TIMESTAMP, which is statement-time there anyway.
 
 ── WHY `transition` IS ONE STATEMENT ────────────────────────────────────────────────────────
 
@@ -57,6 +70,7 @@ assignment list built from whichever keyword arguments were not None. Same contr
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -64,20 +78,10 @@ from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Sequence
 
 from db.database import IS_POSTGRES, database
 
-# The minor-unit converter. REUSED, not reimplemented: services/reap_webhooks.major_to_minor is
-# already the one place this repo turns a decimal major-unit amount into an integer minor-unit
-# one, it already refuses (rather than rounds) NaN/inf/non-positive/over-precise values and
-# already knows the zero-decimal currencies. A second implementation would be a second rounding
-# policy, and the rounding policy is the whole point of the function.
-#
-# It returns Optional[int] — None IS the refusal — where this package's brief asked for `-> int`.
-# The repo's contract wins: None is what every existing caller checks for, and raising here would
-# make this module the odd one out on the same rail. Callers must handle None.
-#
-# services/reap_webhooks imports nothing from db/, so this module-level import is not a cycle
-# (unlike db/agent_card_auth_decisions.py's lazy import of services.reap_external_auth, which
-# is).
-from services.reap_webhooks import major_to_minor  # noqa: F401  (re-exported on purpose)
+# The shared minor-unit converter. The rationale lives on `amount_minor_or_none` below, which is
+# the only thing that calls it; services/reap_webhooks imports nothing from db/, so this is not
+# a cycle (unlike db/agent_card_auth_decisions.py's lazy import of services.reap_external_auth).
+from services.reap_webhooks import major_to_minor
 
 # `get_purchase_internal` is deliberately ABSENT: it is the unscoped, unredacted read, and
 # leaving it out of the public surface is half of what stops a route reaching for it. The other
@@ -88,10 +92,12 @@ __all__ = [
     "TERMINAL_STATES",
     "amount_minor_or_none",
     "public_purchase_view",
+    "PUBLIC_PURCHASE_COLUMNS",
     "create_purchase",
     "get_purchase_for_owner",
     "list_purchases_for_owner",
     "transition",
+    "transition_as_holder",
     "claim_due_purchases",
     "release_claim",
     "requeue_stale_claims",
@@ -107,18 +113,23 @@ __all__ = [
 def amount_minor_or_none(value: Any, currency: str) -> Optional[int]:
     """Convert a MAJOR-unit amount to the integer MINOR units this ledger's columns hold.
 
-    A thin, named wrapper over `services.reap_webhooks.major_to_minor` — which is the one
-    converter in this repo and REFUSES rather than rounds (NaN, inf, a binary float, a negative,
-    an amount with more decimals than the currency has, or one over the ceiling all come back
-    None). It is not re-implemented here, because a second implementation would be a second
-    rounding policy and the rounding policy is the entire point of the function.
+    REUSED, NOT REIMPLEMENTED. `services.reap_webhooks.major_to_minor` is already the one place
+    this repo turns a decimal major-unit amount into integer minor units; it already REFUSES
+    rather than rounds (NaN, inf, a binary float, a negative, zero, an amount with more decimals
+    than the currency has, or one over the ceiling all come back None) and it already knows the
+    zero-decimal currencies. A second implementation would be a second rounding policy, and the
+    rounding policy is the entire point of the function.
 
-    WHY A WRAPPER AT ALL, rather than a bare re-export. The re-export in the first cut of this
-    module was imported, named in `__all__`, used by nothing and tested by nothing — decoration
-    that reads as an endorsed entry point. This has the caller this module actually needs
-    (`our_price_minor`, `quoted_total_minor`, `final_total_minor` are all BIGINT minor units and
-    every one of them arrives from an upstream decimal) and it has tests. The name says what the
-    None means, which the upstream name does not.
+    IT RETURNS Optional[int] — None IS THE REFUSAL — where this package's brief asked for
+    `-> int`. The repo's contract wins: None is what every existing caller on this rail checks
+    for, and raising here would make this module the odd one out. Callers must handle None.
+
+    WHY A NAMED WRAPPER rather than a bare re-export. The first cut of this module re-exported
+    `major_to_minor`, listed it in `__all__`, and called it from nowhere — decoration that reads
+    as an endorsed entry point. This has the caller the ledger actually needs (`our_price_minor`,
+    `quoted_total_minor`, `final_total_minor` and `shipping_minor`/`tax_minor` are all BIGINT
+    minor units, and every one of them arrives from an upstream decimal), and it has tests. The
+    name also says what the None means, which the upstream name does not.
     """
     return major_to_minor(value, currency)
 
@@ -148,10 +159,27 @@ ALLOWED_TRANSITIONS: Dict[str, FrozenSet[str]] = {
 
 PURCHASE_STATES: FrozenSet[str] = frozenset(ALLOWED_TRANSITIONS)
 
-# States the poller may hold a lease on. Deliberately NOT "everything non-terminal minus
-# nothing": it is spelled out so that adding a state to the machine forces a decision about
-# whether the poller owns it.
-_POLLABLE_STATES = ("resolving", "needs_enrollment", "quoting", "awaiting_approval", "processing")
+def _states_in(sql: str, anchor: str = "state IN (") -> tuple:
+    """Parse the literal state list out of a SQL statement, after `anchor`.
+
+    THE DIRECTION OF THIS DERIVATION IS DELIBERATE, AND IT IS THE OPPOSITE OF THE OBVIOUS ONE.
+    The obvious design builds each statement's `IN` list by interpolating a Python tuple; that
+    makes the tuple the single source of truth, and it makes every statement an f-string. An
+    f-string is INVISIBLE to tests/test_repo_sql_prepare_postgres.py, which resolves a
+    `database.*` first argument only when it is a literal or a module-level name bound to one —
+    so the whole poller path would ship unplanned, which is the #1588 shape this repo already
+    paid for once.
+
+    So the SQL keeps its literal list and the Python constants are parsed OUT of it. There is
+    still exactly one source of truth, it is just the statement rather than the tuple, and the
+    statements stay PREPARE-visible. This matters: while the constants were written out
+    separately, `test_the_bulk_sweeps_only_use_legal_edges` was watching a tuple the SQL never
+    read, and adding 'processing' to the expire sweep's IN list — expiring a purchase the buyer
+    had ALREADY APPROVED — survived both dialects.
+    """
+    start = sql.index(anchor) + len(anchor)
+    end = sql.index(")", start)
+    return tuple(re.findall(r"'([a-z_]+)'", sql[start:end]))
 
 # The `state IN (...)` list in _TRANSITION_SQL is FIXED WIDTH — nine binds, one per state in the
 # machine, so the statement can be a module-level constant (property 5) while `from_states`
@@ -338,41 +366,65 @@ def _is_unique_violation(exc: BaseException) -> bool:
     return False
 
 
-# Columns `public_purchase_view` strips. Two different kinds of thing, both of which an agent's
-# response has no use for:
+# EXACTLY what an owner-facing read may contain. AN ALLOWLIST, and the first cut of this was a
+# denylist — which failed for the reason denylists fail: deleting "shipping_address" or
+# "agent_user_ref_hash" from it left both suites entirely green, because the only content test
+# intersected the view with the very set under test. A test that asks "is the view free of the
+# things I currently call private?" cannot notice the definition of private shrinking.
 #
-#   PII and buyer identity — shipping_address, buyer_email, buyer_ref, agent_user_ref_hash.
-#       The first two are the columns this rail NULLs on terminal; returning them from a read
-#       before then would put them in whatever the caller logs, which is the leak the nulling
-#       exists to prevent, arriving by a different door.
-#   internals — claimed_by, claimed_at (poller bookkeeping), reap_product_id, reap_variant_id
-#       (EVIDENCE, and a substituted variant id would read as identity to anyone downstream),
-#       queries_tried (our resolver's search terms).
-_PRIVATE_PURCHASE_COLUMNS = frozenset({
-    "shipping_address",
-    "buyer_email",
-    "buyer_ref",
-    "agent_user_ref_hash",
-    "claimed_by",
-    "claimed_at",
-    "reap_product_id",
-    "reap_variant_id",
-    "queries_tried",
-})
+# An allowlist inverts the default. A column added to the table later does NOT appear until
+# somebody adds it here, and the test asserts the view's key set EQUALS a list written out
+# independently in the test file — so the two have to be changed together, deliberately, by
+# someone who looked at the new column.
+#
+# NOT HERE, AND WHY, since the absences are the point:
+#   buyer_ref, agent_id, agent_user_ref_hash — identity we minted; the caller already knows who
+#       it is, and buyer_ref is what we send Reap as owner.id.
+#   buyer_email, shipping_address — PII. These are the columns the rail NULLs on terminal;
+#       handing them back on every read before then is that same leak through another door.
+#   enrollment_id, click_id, return_url — our plumbing.
+#   reap_product_id, reap_variant_id, reap_quote_id, reap_checkout_id — EVIDENCE, never identity.
+#       A substituted variant id handed out here would read as identity to everyone downstream.
+#   queries_tried — our resolver's search terms.
+#   attempts, next_poll_at, claimed_by, claimed_at — poller bookkeeping.
+PUBLIC_PURCHASE_COLUMNS = (
+    "id",
+    "state",
+    "merchant_domain",
+    "product_key",
+    "variant_key",
+    "product_name",
+    "variant_title",
+    "brand",
+    "category",
+    "quantity",
+    "currency",
+    "our_price_minor",
+    "quoted_total_minor",
+    "final_total_minor",
+    "shipping_minor",
+    "tax_minor",
+    "hosted_url",
+    "hosted_url_expires_at",
+    "reap_quote_expires_at",
+    "reap_order_id",
+    "refusal_reason",
+    "last_error_code",
+    "created_at",
+    "updated_at",
+    "terminal_at",
+)
 
 
 def public_purchase_view(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Project a purchase row down to what an agent-facing caller may see.
+    """Project a purchase row down to exactly `PUBLIC_PURCHASE_COLUMNS`.
 
-    An ALLOW-by-removal rather than an allowlist of kept keys, deliberately: a column added to
-    the table later shows up in this view, which is visible and reviewable, instead of silently
-    vanishing from every response. A column that must NOT show up goes in the frozenset above,
-    and tests/test_reap_agentic_ledger.py asserts the set is actually absent from the default
-    owner reads.
+    Keys absent from the row are absent from the view (a partial row projects to a partial view
+    rather than to one padded with None), so this is safe to hand a row from any SELECT.
     """
     if row is None:
         return None
-    return {key: value for key, value in row.items() if key not in _PRIVATE_PURCHASE_COLUMNS}
+    return {key: row[key] for key in PUBLIC_PURCHASE_COLUMNS if key in row}
 
 
 def _purchase(row: Any) -> Optional[Dict[str, Any]]:
@@ -698,6 +750,7 @@ _TRANSITION_SQL = """
            updated_at = CURRENT_TIMESTAMP
      WHERE id = :id
        AND state IN (:from_0, :from_1, :from_2, :from_3, :from_4, :from_5, :from_6, :from_7, :from_8)
+       AND (:holder_unfenced = 1 OR claimed_by = :holder)
     RETURNING *
 """
 
@@ -746,6 +799,7 @@ _TRANSITION_SQL_SQLITE = """
            updated_at = CURRENT_TIMESTAMP
      WHERE id = :id
        AND state IN (:from_0, :from_1, :from_2, :from_3, :from_4, :from_5, :from_6, :from_7, :from_8)
+       AND (:holder_unfenced = 1 OR claimed_by = :holder)
     RETURNING *
 """
 
@@ -755,6 +809,7 @@ async def transition(
     *,
     from_states: Iterable[str],
     to_state: str,
+    holder: Optional[str] = None,
     **fields: Any,
 ) -> Optional[Dict[str, Any]]:
     """Advance a purchase, atomically.
@@ -767,6 +822,34 @@ async def transition(
     distinction matters: an illegal pair is a bug in the caller and must be loud, while a lost
     race is ordinary and must be quiet, and if both produced None the first would be retried
     forever instead of being fixed.
+
+    ── `holder`: THE CLAIM FENCE ────────────────────────────────────────────────────────────
+
+    With `holder` set, the statement also carries `AND claimed_by = :holder`, so a worker can
+    only advance a purchase it still holds the lease on. Any poller caller wants
+    `transition_as_holder`, which is that call with the fence made non-optional.
+
+    THE INTERLEAVING THIS EXISTS FOR, reproduced on both dialects before it was closed: worker A
+    claims a 'quoting' row and stalls. Its lease ages out and `requeue_stale_claims` frees it.
+    Worker B claims the row, quotes it, and advances it to 'awaiting_approval'. A then wakes up
+    holding nothing, calls `transition(from_states=['awaiting_approval'], to_state='processing',
+    reap_checkout_id=…)` — and SUCCEEDS. The row lands in 'processing' carrying a checkout id
+    minted by a worker that does not own it, which is a buyer being charged for the wrong
+    checkout. Nothing in `from_states` can catch this: A's view of the STATE is correct, it is
+    A's view of OWNERSHIP that is stale.
+
+    `claimed_by` is deliberately NOT in `_TRANSITION_FIELDS`, so the poller cannot build this
+    fence itself out of a field write — it has to come from here.
+
+    A fenced call whose claim has moved on returns None, exactly like any other lost race, and
+    the caller re-reads. `holder=None` leaves the statement unfenced, which is what the route
+    that first creates a purchase needs — nothing holds a lease at that point.
+
+    TWO BINDS, `:holder_unfenced` AND `:holder`, for one concept. A single nullable bind used as
+    `(:holder IS NULL OR claimed_by = :holder)` is the same parameter deduced two ways, which is
+    the AmbiguousParameter shape this file avoids everywhere else. `:holder_unfenced` is only
+    ever compared against the integer literal 1 and `:holder` only ever against `claimed_by`, so
+    each has exactly one deducible type.
     """
     if to_state not in PURCHASE_STATES:
         raise ValueError(f"unknown target state {to_state!r}")
@@ -788,10 +871,15 @@ async def transition(
     if unknown:
         raise TypeError(f"transition() got unexpected field(s): {', '.join(sorted(unknown))}")
 
+    if holder is not None and not holder.strip():
+        raise ValueError("holder must be a non-empty worker id, or None for an unfenced call")
+
     values: Dict[str, Any] = {
         "id": purchase_id,
         "to_state": to_state,
         "to_state_probe": to_state,
+        "holder": holder,
+        "holder_unfenced": 1 if holder is None else 0,
     }
     # Pad the fixed-width IN list by repeating the first source. A repeat cannot widen the match,
     # and it keeps the statement a module-level constant — see _FROM_SLOTS.
@@ -810,6 +898,36 @@ async def transition(
     return _purchase(await database.fetch_one(_TRANSITION_SQL_SQLITE, values))
 
 
+async def transition_as_holder(
+    purchase_id: str,
+    worker_id: str,
+    *,
+    from_states: Iterable[str],
+    to_state: str,
+    **fields: Any,
+) -> Optional[Dict[str, Any]]:
+    """THE FORM THE POLLER USES. `transition` with the claim fence made non-optional.
+
+    Every advance a worker makes while holding a lease goes through here. `transition(holder=…)`
+    is the same call; this exists so that the poller package never has to remember the keyword,
+    and so that a code review can see an unfenced worker advance by its NAME rather than by a
+    missing argument.
+
+    Returns None when the lease has moved on — the worker stalled, its claim was requeued, and
+    somebody else owns the row now. That is a lost race like any other: re-read and reconsider,
+    do not retry blindly.
+    """
+    if not (worker_id or "").strip():
+        raise ValueError("worker_id is required — that is the whole point of this function")
+    return await transition(
+        purchase_id,
+        from_states=from_states,
+        to_state=to_state,
+        holder=worker_id,
+        **fields,
+    )
+
+
 # ── purchases: the poller's claim pair ───────────────────────────────────────────────────────
 
 # THE CLAIM PAIR, house style (db/product_quality_backfill_jobs.py): a plain SELECT picks the
@@ -825,7 +943,25 @@ async def transition(
 # It is also unrecoverable, because a dead pod's claim on a terminal row was invisible to the
 # requeue's old state filter — measured, a 99999-second-old claim freed 0 rows. Both halves are
 # fixed: the state conjunct below, and a requeue that no longer filters on state at all.
+#
+# THE SELECT STILL FILTERS `claimed_by IS NULL` EVEN THOUGH THE UPDATE RE-CHECKS IT. Dropping it
+# leaves the claim correct and the poller wasteful: N workers would each fill their whole `limit`
+# with candidates somebody else already holds, and take none of them.
+#
+# `clock_timestamp()` RATHER THAN `CURRENT_TIMESTAMP` ON POSTGRES — see property 6 in the module
+# header. Every cutoff in this file reads the wall clock at the moment the statement runs, not
+# the moment its transaction began.
 _SELECT_DUE_PURCHASES_SQL = """
+    SELECT id FROM reap_agentic_purchases
+     WHERE state IN ('resolving', 'needs_enrollment', 'quoting', 'awaiting_approval', 'processing')
+       AND claimed_by IS NULL
+       AND next_poll_at IS NOT NULL
+       AND next_poll_at <= clock_timestamp()
+     ORDER BY next_poll_at ASC, id ASC
+     LIMIT :limit
+"""
+
+_SELECT_DUE_PURCHASES_SQL_SQLITE = """
     SELECT id FROM reap_agentic_purchases
      WHERE state IN ('resolving', 'needs_enrollment', 'quoting', 'awaiting_approval', 'processing')
        AND claimed_by IS NULL
@@ -835,11 +971,41 @@ _SELECT_DUE_PURCHASES_SQL = """
      LIMIT :limit
 """
 
+# `attempts` COUNTS CLAIMS, AND ONLY WHERE A CLAIM MEANS WORK WAS TRIED.
+#
+# A purchase sitting in 'awaiting_approval' is waiting on a HUMAN — the buyer has the hosted page
+# open, or has not opened it yet. Polled every 30 seconds for the hour a buyer might reasonably
+# take, that is ~120 claims on a purchase where nothing has gone wrong at all, and
+# `fail_exhausted_purchases` would kill it for being patient. Same for 'needs_enrollment', which
+# waits on the buyer enrolling a card.
+#
+# So the counter is incremented only in the states where a claim means WE tried something:
+# resolving, quoting, processing. The two waiting states are excluded here rather than left to
+# the poller to compensate for by choosing `max_attempts` against its own poll cadence — that is
+# a coupling between two packages that nothing would check. `expire_overdue_purchases` is what
+# bounds the waiting states, on a clock rather than a counter, which is the right instrument for
+# waiting on a person.
 _CLAIM_PURCHASE_SQL = """
     UPDATE reap_agentic_purchases
        SET claimed_by = :worker_id,
+           claimed_at = clock_timestamp(),
+           attempts = CASE WHEN state IN ('awaiting_approval', 'needs_enrollment')
+                THEN attempts ELSE attempts + 1 END,
+           updated_at = clock_timestamp()
+     WHERE id = :id
+       AND claimed_by IS NULL
+       AND state IN (
+           'resolving', 'needs_enrollment', 'quoting', 'awaiting_approval', 'processing'
+       )
+    RETURNING *
+"""
+
+_CLAIM_PURCHASE_SQL_SQLITE = """
+    UPDATE reap_agentic_purchases
+       SET claimed_by = :worker_id,
            claimed_at = CURRENT_TIMESTAMP,
-           attempts = attempts + 1,
+           attempts = CASE WHEN state IN ('awaiting_approval', 'needs_enrollment')
+                THEN attempts ELSE attempts + 1 END,
            updated_at = CURRENT_TIMESTAMP
      WHERE id = :id
        AND claimed_by IS NULL
@@ -851,6 +1017,8 @@ _CLAIM_PURCHASE_SQL = """
 
 # Releasing is conjunct on the WORKER, not just the id: a worker whose lease was already requeued
 # and handed to somebody else must not be able to clear the new holder's claim on its way out.
+# This is the SAME fence `transition`'s `holder=` applies — `claimed_by = :worker_id` in both,
+# both answering None when the claim has moved on.
 _RELEASE_CLAIM_SQL = """
     UPDATE reap_agentic_purchases
        SET claimed_by = NULL,
@@ -862,7 +1030,7 @@ _RELEASE_CLAIM_SQL = """
     RETURNING *
 """
 
-# THE CUTOFF IS COMPUTED BY THE SERVER. `CURRENT_TIMESTAMP - interval` binds no datetime at all,
+# THE CUTOFF IS COMPUTED BY THE SERVER. `clock_timestamp() - interval` binds no datetime at all,
 # so it is correct whatever the client process's timezone is and whatever the column's
 # declaration turned out to be — see property 4. A Python-bound cutoff was measured seven hours
 # wrong on this driver.
@@ -880,12 +1048,12 @@ _REQUEUE_STALE_CLAIMS_SQL = """
     UPDATE reap_agentic_purchases
        SET claimed_by = NULL,
            claimed_at = NULL,
-           updated_at = CURRENT_TIMESTAMP
+           updated_at = clock_timestamp()
      WHERE id IN (
         SELECT id FROM reap_agentic_purchases
          WHERE claimed_by IS NOT NULL
            AND claimed_at IS NOT NULL
-           AND claimed_at < CURRENT_TIMESTAMP - (:lease_seconds * INTERVAL '1 second')
+           AND claimed_at < clock_timestamp() - (:lease_seconds * INTERVAL '1 second')
          ORDER BY claimed_at ASC
          LIMIT :limit
      )
@@ -908,6 +1076,18 @@ _REQUEUE_STALE_CLAIMS_SQL_SQLITE = """
     RETURNING id
 """
 
+# States the poller may hold a lease on, PARSED OUT OF the statements that actually enforce them
+# — see `_states_in`. `_POLLABLE_STATES` is the claim's WHERE-clause list; the select-due
+# statement must agree with it, and a test asserts that rather than assuming it.
+#
+# The anchors are specific because `_CLAIM_PURCHASE_SQL` contains TWO `state IN (…)` lists that
+# mean different things — the WHERE clause's pollable states and the attempts CASE's exempt
+# states — and a bare "state IN (" anchor silently returns the first one. It did, on the first
+# cut of this: `_POLLABLE_STATES` came back as the two WAITING states.
+_POLLABLE_STATES = _states_in(_CLAIM_PURCHASE_SQL, "AND state IN (")
+_SELECT_DUE_STATES = _states_in(_SELECT_DUE_PURCHASES_SQL, "WHERE state IN (")
+_CLAIM_ATTEMPT_EXEMPT_STATES = _states_in(_CLAIM_PURCHASE_SQL, "attempts = CASE WHEN state IN (")
+
 
 async def claim_due_purchases(worker_id: str, *, limit: int = 10) -> List[Dict[str, Any]]:
     """Take a lease on up to `limit` purchases whose next_poll_at has come.
@@ -918,22 +1098,32 @@ async def claim_due_purchases(worker_id: str, *, limit: int = 10) -> List[Dict[s
     default 300 there would have had a 300-second lease and no way to tell. A parameter that
     reads as configuration and configures nothing is worse than no parameter.
 
-    A claim is released either by `release_claim` (the worker finished), by a transition into a
-    terminal state (which clears it in the same UPDATE), or by `requeue_stale_claims` (the worker
-    died).
+    FOUR THINGS RELEASE A CLAIM, and a caller reasoning about leases needs all four:
+      * `release_claim(id, worker_id)` — the worker finished a poll and is scheduling the next;
+      * a transition into a TERMINAL state — cleared in the same UPDATE that writes the state;
+      * `expire_overdue_purchases()` / `fail_exhausted_purchases()` — the sweeps write terminal
+        states in bulk and clear the claim with them;
+      * `requeue_stale_claims()` — the worker died and its lease aged out.
+
+    `attempts` is incremented only outside 'awaiting_approval' and 'needs_enrollment'; see the
+    note on `_CLAIM_PURCHASE_SQL` for why waiting on a human is not a failed attempt.
     """
     if not (worker_id or "").strip():
         raise ValueError("worker_id is required — an anonymous claim cannot be requeued")
-    candidates = await database.fetch_all(
-        _SELECT_DUE_PURCHASES_SQL, {"limit": max(1, min(500, int(limit)))}
-    )
+    capped = max(1, min(500, int(limit)))
+    if IS_POSTGRES:
+        candidates = await database.fetch_all(_SELECT_DUE_PURCHASES_SQL, {"limit": capped})
+    else:
+        candidates = await database.fetch_all(_SELECT_DUE_PURCHASES_SQL_SQLITE, {"limit": capped})
     claimed: List[Dict[str, Any]] = []
     for candidate in candidates:
-        row = await database.fetch_one(
-            _CLAIM_PURCHASE_SQL, {"id": candidate["id"], "worker_id": worker_id}
-        )
-        # None means another worker claimed it between the SELECT and here. Expected, not an
-        # error: skip it.
+        params = {"id": candidate["id"], "worker_id": worker_id}
+        if IS_POSTGRES:
+            row = await database.fetch_one(_CLAIM_PURCHASE_SQL, params)
+        else:
+            row = await database.fetch_one(_CLAIM_PURCHASE_SQL_SQLITE, params)
+        # None means another worker claimed it, or it went terminal, between the SELECT and here.
+        # Expected, not an error: skip it.
         claimed_row = _purchase(row)
         if claimed_row is not None:
             claimed.append(claimed_row)
@@ -947,7 +1137,9 @@ async def release_claim(
     next_poll_at: Optional[datetime] = None,
 ) -> Optional[Dict[str, Any]]:
     """Give the lease back, optionally scheduling the next poll. None when this worker no longer
-    holds the claim."""
+    holds the claim — the same fence, and the same answer, as a fenced `transition`."""
+    if not (worker_id or "").strip():
+        raise ValueError("worker_id is required — an unfenced release would clear anyone's claim")
     return _purchase(
         await database.fetch_one(
             _RELEASE_CLAIM_SQL,
@@ -991,26 +1183,72 @@ async def requeue_stale_claims(*, lease_seconds: int = 300, limit: int = 50) -> 
 
 # ── the two sweeps the poller package needs and cannot build safely itself ───────────────────
 #
-# Both are ONE conditional UPDATE over a set of rows, and both write a terminal state — which
-# means both must do everything a terminal transition does: NULL the PII, stamp terminal_at, and
-# clear the claim. Written out here rather than left to the poller to assemble from `transition`
-# in a loop, because a loop is N round trips with N chances to be interrupted halfway, and the
-# half that gets skipped is the PII.
+# Both are ONE conditional UPDATE over a BOUNDED set of rows, and both write a terminal state —
+# which means both must do everything a terminal transition does: NULL the PII, stamp
+# terminal_at, and clear the claim. Written out here rather than left to the poller to assemble
+# from `transition` in a loop, because a loop is N round trips with N chances to be interrupted
+# halfway, and the half that gets skipped is the PII.
 #
-# THE SOURCE STATES ARE CONSTANTS SO A TEST CAN CHECK THEM AGAINST ALLOWED_TRANSITIONS. These
-# statements bypass `transition`, so nothing at runtime enforces the map on them; the edges are
-# asserted by tests/test_reap_agentic_ledger.py::test_the_bulk_sweeps_only_use_legal_edges on
-# both dialects. Both lists are legal today: needs_enrollment -> expired and
-# awaiting_approval -> expired exist, and every pollable state permits -> failed.
-_EXPIRE_SOURCE_STATES = ("needs_enrollment", "awaiting_approval")
-_FAIL_EXHAUSTED_SOURCE_STATES = (
-    "resolving", "needs_enrollment", "quoting", "awaiting_approval", "processing",
-)
+# THEY ARE BOUNDED, AND THE BOUND IS NOT COSMETIC. Prod and staging share one Postgres. An
+# unbounded UPDATE on first arming — when the whole backlog qualifies at once — is a lock window
+# over every matching row at the same time. `WHERE id IN (SELECT ... ORDER BY ... LIMIT :limit)`
+# is the shape the requeue already uses; both return the ids they moved, so the caller loops
+# until fewer than `limit` come back.
+#
+# THE STATE PREDICATE IS REPEATED IN THE OUTER `WHERE`, AND THAT REPETITION IS THE RACE GUARD.
+# Found by this package's own two-connection test, not reasoned about in advance: with the
+# predicate ONLY inside the LIMIT subquery, two concurrent sweeps BOTH moved the same row and
+# both reported it (measured, `assert (1 + 1) == 1`). Under READ COMMITTED the second UPDATE
+# blocks on the row lock and then re-checks its qual — but the subplan it re-checks has already
+# been materialised, so `id IN (…)` is still true and the row is written a second time, its
+# terminal_at overwritten and its id counted twice. Re-stating `state IN (…)` at the top level
+# gives the re-check something that is actually false by then. The inner copy stays, because it
+# is what makes the LIMIT select the right candidates in the first place; a test asserts the two
+# lists are identical.
+#
+# THE SOURCE STATES ARE PARSED OUT OF THESE STATEMENTS (see `_states_in`), so
+# tests/test_reap_agentic_ledger.py::test_the_bulk_sweeps_only_use_legal_edges checks the edges
+# the SQL will really take against ALLOWED_TRANSITIONS. While the two were written out
+# separately, that test watched a tuple the SQL never read, and adding 'processing' to the expire
+# sweep's list — expiring a purchase the buyer had ALREADY APPROVED — survived both dialects.
 
-# Portable as written: CURRENT_TIMESTAMP and a literal IN list mean no dialect split is needed,
-# which is the better answer than two constants whenever it is available (see
-# services/pdp_governance_service.py for the same call).
+# The expire sweep takes a row on EITHER of two clocks, and the second one is the reason the
+# first is not enough:
+#
+#   hosted_url_expires_at — Reap told us when the approval page dies. Precise, and absent
+#                           whenever we never got a hosted URL, or got one without an expiry.
+#   updated_at + max_age  — the ABSOLUTE fallback. Without it a row in 'needs_enrollment' or
+#                           'awaiting_approval' with a NULL hosted_url_expires_at is never
+#                           expired by anything, and keeps the buyer's address and email
+#                           indefinitely. The docstring used to claim this sweep was a PII
+#                           deadline; with only the first clock that was false for exactly the
+#                           rows most likely to be abandoned.
 _EXPIRE_OVERDUE_SQL = """
+    UPDATE reap_agentic_purchases
+       SET state = 'expired',
+           shipping_address = NULL,
+           buyer_email = NULL,
+           claimed_by = NULL,
+           claimed_at = NULL,
+           last_error_code = COALESCE(last_error_code, 'hosted_url_expired'),
+           terminal_at = clock_timestamp(),
+           updated_at = clock_timestamp()
+     WHERE state IN ('needs_enrollment', 'awaiting_approval')
+       AND id IN (
+        SELECT id FROM reap_agentic_purchases
+         WHERE state IN ('needs_enrollment', 'awaiting_approval')
+           AND (
+                (hosted_url_expires_at IS NOT NULL
+                 AND hosted_url_expires_at < clock_timestamp())
+                OR updated_at < clock_timestamp() - (:max_age_seconds * INTERVAL '1 second')
+           )
+         ORDER BY updated_at ASC, id ASC
+         LIMIT :limit
+     )
+    RETURNING id
+"""
+
+_EXPIRE_OVERDUE_SQL_SQLITE = """
     UPDATE reap_agentic_purchases
        SET state = 'expired',
            shipping_address = NULL,
@@ -1021,12 +1259,47 @@ _EXPIRE_OVERDUE_SQL = """
            terminal_at = CURRENT_TIMESTAMP,
            updated_at = CURRENT_TIMESTAMP
      WHERE state IN ('needs_enrollment', 'awaiting_approval')
-       AND hosted_url_expires_at IS NOT NULL
-       AND hosted_url_expires_at < CURRENT_TIMESTAMP
+       AND id IN (
+        SELECT id FROM reap_agentic_purchases
+         WHERE state IN ('needs_enrollment', 'awaiting_approval')
+           AND (
+                (hosted_url_expires_at IS NOT NULL
+                 AND hosted_url_expires_at < CURRENT_TIMESTAMP)
+                OR updated_at < datetime('now', :max_age_window)
+           )
+         ORDER BY updated_at ASC, id ASC
+         LIMIT :limit
+     )
     RETURNING id
 """
 
 _FAIL_EXHAUSTED_SQL = """
+    UPDATE reap_agentic_purchases
+       SET state = 'failed',
+           last_error_code = 'attempts_exhausted',
+           shipping_address = NULL,
+           buyer_email = NULL,
+           claimed_by = NULL,
+           claimed_at = NULL,
+           terminal_at = clock_timestamp(),
+           updated_at = clock_timestamp()
+     WHERE state IN (
+           'resolving', 'needs_enrollment', 'quoting', 'awaiting_approval', 'processing'
+       )
+       AND attempts >= :max_attempts
+       AND id IN (
+        SELECT id FROM reap_agentic_purchases
+         WHERE state IN (
+               'resolving', 'needs_enrollment', 'quoting', 'awaiting_approval', 'processing'
+           )
+           AND attempts >= :max_attempts
+         ORDER BY attempts DESC, id ASC
+         LIMIT :limit
+     )
+    RETURNING id
+"""
+
+_FAIL_EXHAUSTED_SQL_SQLITE = """
     UPDATE reap_agentic_purchases
        SET state = 'failed',
            last_error_code = 'attempts_exhausted',
@@ -1040,33 +1313,85 @@ _FAIL_EXHAUSTED_SQL = """
            'resolving', 'needs_enrollment', 'quoting', 'awaiting_approval', 'processing'
        )
        AND attempts >= :max_attempts
+       AND id IN (
+        SELECT id FROM reap_agentic_purchases
+         WHERE state IN (
+               'resolving', 'needs_enrollment', 'quoting', 'awaiting_approval', 'processing'
+           )
+           AND attempts >= :max_attempts
+         ORDER BY attempts DESC, id ASC
+         LIMIT :limit
+     )
     RETURNING id
 """
 
+# Parsed out of the statements above, not written alongside them. See `_states_in`.
+_EXPIRE_SOURCE_STATES = _states_in(_EXPIRE_OVERDUE_SQL, "WHERE state IN (")
+_FAIL_EXHAUSTED_SOURCE_STATES = _states_in(_FAIL_EXHAUSTED_SQL, "WHERE state IN (")
 
-async def expire_overdue_purchases() -> List[str]:
-    """Expire purchases whose hosted approval page has run out; return the ids that moved.
 
-    The clock is the SERVER's, never the caller's — same rule and same reason as the requeue's
-    cutoff. A buyer who never finished on Reap's page leaves a row that would otherwise sit in
-    'awaiting_approval' holding their address and email indefinitely, so this is a PII deadline
-    as much as a state one.
+def _sweep_limit(limit: int) -> int:
+    value = int(limit)
+    if not (1 <= value <= 500):
+        raise ValueError(f"limit must be between 1 and 500 (got {limit})")
+    return value
+
+
+async def expire_overdue_purchases(
+    *, max_age_seconds: int = 3600, limit: int = 200
+) -> List[str]:
+    """Expire purchases waiting on a buyer who never came back; return the ids that moved.
+
+    Two clocks, both the SERVER's: Reap's `hosted_url_expires_at` when we have one, and an
+    absolute `updated_at + max_age_seconds` fallback for the rows where we do not. The fallback
+    is what makes this a PII deadline rather than a best-effort one — a row in 'awaiting_approval'
+    with no hosted-page expiry was previously expired by nothing at all and kept the buyer's
+    address and email indefinitely.
+
+    BOUNDED. At most `limit` rows per call; loop until fewer than `limit` come back. An unbounded
+    UPDATE on first arming locks every qualifying row at once, on a Postgres that prod and
+    staging share.
     """
-    rows = await database.fetch_all(_EXPIRE_OVERDUE_SQL)
+    if int(max_age_seconds) < 60:
+        raise ValueError(
+            f"max_age_seconds must be at least 60 (got {max_age_seconds}); a shorter deadline "
+            "expires purchases a buyer is still looking at"
+        )
+    capped = _sweep_limit(limit)
+    seconds = int(max_age_seconds)
+    if IS_POSTGRES:
+        rows = await database.fetch_all(
+            _EXPIRE_OVERDUE_SQL, {"max_age_seconds": seconds, "limit": capped}
+        )
+    else:
+        rows = await database.fetch_all(
+            _EXPIRE_OVERDUE_SQL_SQLITE,
+            {"max_age_window": f"-{seconds} seconds", "limit": capped},
+        )
     return [str(r["id"]) for r in rows]
 
 
-async def fail_exhausted_purchases(max_attempts: int) -> List[str]:
-    """Fail non-terminal purchases that have been claimed `max_attempts` times; return the ids.
+async def fail_exhausted_purchases(max_attempts: int, *, limit: int = 200) -> List[str]:
+    """Fail non-terminal purchases claimed `max_attempts` times or more; return the ids.
 
-    `attempts` counts CLAIMS, so this is "the poller has picked this up N times and it is still
-    not finished" — the backstop that stops a permanently-stuck row being leased forever.
+    `attempts` COUNTS CLAIMS, NOT RETRIES, and only in the states where a claim means work was
+    tried — 'awaiting_approval' and 'needs_enrollment' are exempt, because a buyer taking an hour
+    on the partner's page is not a failure and polling them every 30 seconds would otherwise
+    reach ~120 attempts on a perfectly healthy purchase. Those two states are bounded by
+    `expire_overdue_purchases` instead, on a clock, which is the right instrument for waiting on
+    a person. Choose `max_attempts` against how many times you expect to RETRY, not against poll
+    cadence.
+
+    BOUNDED, for the same reason as the expire sweep.
     """
     if int(max_attempts) < 1:
         raise ValueError(f"max_attempts must be at least 1 (got {max_attempts})")
-    rows = await database.fetch_all(
-        _FAIL_EXHAUSTED_SQL, {"max_attempts": int(max_attempts)}
-    )
+    capped = _sweep_limit(limit)
+    params = {"max_attempts": int(max_attempts), "limit": capped}
+    if IS_POSTGRES:
+        rows = await database.fetch_all(_FAIL_EXHAUSTED_SQL, params)
+    else:
+        rows = await database.fetch_all(_FAIL_EXHAUSTED_SQL_SQLITE, params)
     return [str(r["id"]) for r in rows]
 
 
@@ -1134,6 +1459,16 @@ _DEMOTE_OTHER_ACTIVE_SQL = """
     RETURNING id
 """
 
+# STATEMENT (b). `status IN ('pending', 'active')` is a real guard, not a formality: without it,
+# `mark_enrollment_active(<id of a DEAD row>)` RESURRECTS A REVOKED CARD. That is the whole
+# reason `mark_enrollment_dead` exists, undone by a retry of an activation that should have
+# stopped. 'active' is in the list so a redelivered webhook re-activating the row that is
+# already active is idempotent rather than punished.
+#
+# tests/test_reap_agentic_ledger.py::test_activating_a_dead_row_with_no_competitor_stays_dead is
+# what kills its removal. The older test could not: it had a competing active row, so deleting
+# this conjunct still produced None — via the unique index, through the except, for entirely the
+# wrong reason. A guard whose test passes for the wrong reason is not a tested guard.
 _ACTIVATE_ENROLLMENT_SQL = """
     UPDATE reap_agentic_enrollments
        SET status = 'active',
@@ -1231,41 +1566,70 @@ async def mark_enrollment_active(
 ) -> Optional[Dict[str, Any]]:
     """Promote an enrollment to 'active', demoting any other active row for the same buyer.
 
-    Returns None when the target is not activatable (it is 'dead', or it does not exist) and when
-    another activation for the same buyer won a concurrent race. In BOTH cases nothing changed —
-    in particular the buyer's existing active enrollment is left alone, which is the property the
-    ungated version of this function did not have.
+    Returns None when the target is not activatable — it is 'dead', or it does not exist, or
+    another activation for the same buyer won a concurrent race. In every one of those cases the
+    buyer's existing active enrollment is left alone.
 
-    Both statements run in ONE transaction: a demotion that commits without the promotion leaves
-    the buyer with no active card, and a promotion that commits without the demotion leaves two —
-    which the partial unique index would reject anyway, but only on a database where that index
-    exists.
+    ── NO TRANSACTION. TWO AUTOCOMMIT STATEMENTS. ───────────────────────────────────────────
 
-    THE UNIQUE VIOLATION IS CAUGHT OUTSIDE THE `async with`, NOT INSIDE IT. Catching inside would
-    let the transaction COMMIT the demotion it had already done, which is the exact "buyer left
-    with no active card" outcome this function exists to avoid; letting the exception leave the
-    block rolls the demotion back first. Every other lost race in this module answers None, and
-    so does this one — a caller that got a raw driver exception could not tell "you lost" from
-    "the database is broken".
+    This used to hold the module's only `database.transaction()`, and an earlier version of this
+    docstring argued that it had to. That argument was WRONG, and it was wrong in the specific
+    way this repo has been bitten before: databases==0.7.0 scopes its connection by ContextVar,
+    so tasks launched with `asyncio.gather` on the app's SHARED `database` object end up inside
+    each other's transaction. Measured on real Postgres, deterministically, 5 runs out of 5:
+
+        two DIFFERENT buyers — one task raises TransactionEndedOutOfOrder and ITS WRITE IS
+            ROLLED BACK; the other raises NoActiveSQLTransactionError for a write that DID
+            commit. Two unrelated buyers, and one of them loses an enrollment they completed.
+        the SAME buyer, two pending rows — one raises, the other returns None, and NEITHER is
+            activated. A buyer who enrolled ends up with no active card and no error anyone
+            could act on.
+
+    A transaction that behaves like that is not protection, so it is gone. What replaces it is
+    two statements each of which is safe to interleave and idempotent to retry:
+
+        (a) demote the buyer's OTHER active rows, gated on the target being activatable;
+        (b) activate the target, `WHERE id = :id AND status IN ('pending', 'active')`.
+
+    THE TRANSIENT WINDOW IS REAL AND IS STATED RATHER THAN HIDDEN. Between (a) and (b) — and
+    after (a) if the process dies — the buyer has NO active enrollment. A caller that reads
+    `get_active_enrollment` in that window sees None and does what it does for any un-enrolled
+    buyer: re-reads, or starts enrollment. It never sees TWO, which is the state that has no
+    recovery, because the partial unique index makes two impossible. And the window CLOSES on
+    retry: calling this again with the same target completes the activation, because (a) is a
+    no-op once the others are dead and (b) accepts 'pending'. Calling it again on an
+    already-active target returns that row unchanged.
+
+    That is the trade, plainly: a recoverable, self-healing window in exchange for never
+    corrupting a second buyer's write and never raising a driver exception at a caller who
+    simply lost a race.
+
+    THE UNIQUE-VIOLATION CATCH WRAPS EXACTLY STATEMENT (b) — it is the only statement that can
+    raise one, and with no transaction in play there is nothing else in scope to roll back or
+    accidentally commit. Every other lost race in this module answers None, and so does this one:
+    a caller handed a raw driver exception cannot tell "you lost" from "the database is broken".
 
     card_last4 is the ONLY digits of the card that may be stored, and card_network the only other
     card attribute. Nothing else from Reap's payload belongs in this table.
     """
     if card_last4 is not None and (len(card_last4) != 4 or not card_last4.isdigit()):
         raise ValueError("card_last4 must be exactly four digits, or None")
+
+    # (a) — gated on the target being activatable, so a dead or missing target demotes nothing.
+    await database.fetch_all(_DEMOTE_OTHER_ACTIVE_SQL, {"id": enrollment_id})
+
+    # (b) — the only statement here that can hit the partial unique index.
     try:
-        async with database.transaction():
-            await database.fetch_all(_DEMOTE_OTHER_ACTIVE_SQL, {"id": enrollment_id})
-            row = await database.fetch_one(
-                _ACTIVATE_ENROLLMENT_SQL,
-                {
-                    "id": enrollment_id,
-                    "reap_enrollment_id": reap_enrollment_id,
-                    "reap_status": reap_status,
-                    "card_network": card_network,
-                    "card_last4": card_last4,
-                },
-            )
+        row = await database.fetch_one(
+            _ACTIVATE_ENROLLMENT_SQL,
+            {
+                "id": enrollment_id,
+                "reap_enrollment_id": reap_enrollment_id,
+                "reap_status": reap_status,
+                "card_network": card_network,
+                "card_last4": card_last4,
+            },
+        )
     except Exception as exc:  # noqa: BLE001 — narrowed immediately below
         if _is_unique_violation(exc):
             return None

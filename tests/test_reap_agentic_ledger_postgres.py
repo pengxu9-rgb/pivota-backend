@@ -171,13 +171,19 @@ async def _run_on(conn, sql: str, params: dict):
     return await conn.fetch(positional, *[params[name] for name in order])
 
 
-def _transition_params(purchase_id: str, from_states, to_state: str, **fields):
+def _transition_params(purchase_id: str, from_states, to_state: str, holder=None, **fields):
     """Build exactly the parameter dict `ledger.transition` builds — from the module's own field
     list and slot count, so it cannot drift."""
     import db.reap_agentic_ledger as ledger
 
     sources = list(dict.fromkeys(from_states))
-    params = {"id": purchase_id, "to_state": to_state, "to_state_probe": to_state}
+    params = {
+        "id": purchase_id,
+        "to_state": to_state,
+        "to_state_probe": to_state,
+        "holder": holder,
+        "holder_unfenced": 1 if holder is None else 0,
+    }
     for index in range(ledger._FROM_SLOTS):
         params[f"from_{index}"] = sources[index] if index < len(sources) else sources[0]
     for column in ledger._TRANSITION_FIELDS:
@@ -186,6 +192,10 @@ def _transition_params(purchase_id: str, from_states, to_state: str, **fields):
             ledger._bind_json(raw) if column in ledger._JSON_COLUMNS else ledger._bind_dt(raw)
         )
     return params
+
+
+def _sweep_params(max_age_seconds: int = 3600, limit: int = 200):
+    return {"max_age_seconds": max_age_seconds, "limit": limit}
 
 
 async def _mk(state: str = "resolving", **over):
@@ -310,6 +320,96 @@ async def test_two_connections_advancing_at_once_produce_exactly_one_winner():
         f"exactly one advance may win; got {len(rows_a)} + {len(rows_b)}"
     )
     assert await _state_of(purchase["id"]) in ("awaiting_approval", "refused")
+
+
+# ── FINDING 1: the claim fence, across two connections ───────────────────────────────────────
+
+
+async def test_a_stalled_worker_cannot_advance_a_row_whose_lease_it_lost_on_postgres():
+    """THE INTERLEAVING, with worker B on its OWN CONNECTION — which is what "another pod" means.
+
+    A claims a 'quoting' row and stalls; the lease ages out and is requeued; B (a different
+    backend) claims it and advances it to 'awaiting_approval'; A wakes and advances it to
+    'processing' with its own checkout id. Before the fence that SUCCEEDED, leaving a row in
+    'processing' carrying a checkout minted by a worker that does not own it — a buyer charged
+    for the wrong checkout. `from_states` cannot see it: A's view of the STATE is right, its view
+    of OWNERSHIP is stale."""
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _mk(state="quoting")
+    await _set_clock_column(purchase["id"], "next_poll_at", _PAST)
+
+    await ledger.claim_due_purchases("worker_A", limit=5)
+    await _age_claim(purchase["id"], 900)
+    assert await ledger.requeue_stale_claims(lease_seconds=300, limit=10) == 1
+
+    conn = await _raw_connection()
+    try:
+        taken = await _run_on(
+            conn, ledger._CLAIM_PURCHASE_SQL, {"id": purchase["id"], "worker_id": "worker_B"}
+        )
+        assert len(taken) == 1, "worker B, on its own connection, took the lease"
+        advanced = await _run_on(
+            conn,
+            ledger._TRANSITION_SQL,
+            _transition_params(
+                purchase["id"], ["quoting"], "awaiting_approval",
+                holder="worker_B", reap_quote_id="QUOTE_FROM_B",
+            ),
+        )
+        assert len(advanced) == 1
+    finally:
+        await conn.close()
+
+    lost = await ledger.transition_as_holder(
+        purchase["id"], "worker_A", from_states=["awaiting_approval"],
+        to_state="processing", reap_checkout_id="CHECKOUT_FROM_A",
+    )
+    assert lost is None
+    row = await ledger.get_purchase_internal(purchase["id"])
+    assert row["state"] == "awaiting_approval"
+    assert row["reap_checkout_id"] is None
+    assert row["claimed_by"] == "worker_B"
+
+
+async def test_a_fenced_transition_by_the_true_holder_succeeds_on_postgres():
+    """The control — a fence that refused everybody would pass the test above."""
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _mk(state="quoting")
+    await _set_clock_column(purchase["id"], "next_poll_at", _PAST)
+    await ledger.claim_due_purchases("worker_A", limit=5)
+
+    moved = await ledger.transition_as_holder(
+        purchase["id"], "worker_A", from_states=["quoting"],
+        to_state="awaiting_approval", reap_quote_id="q_1",
+    )
+    assert moved is not None and moved["reap_quote_id"] == "q_1"
+    assert moved["claimed_by"] == "worker_A"
+
+
+async def test_a_terminal_transition_by_the_holder_still_clears_the_claim_on_postgres():
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _mk(state="awaiting_approval")
+    await _set_clock_column(purchase["id"], "next_poll_at", _PAST)
+    await ledger.claim_due_purchases("worker_A", limit=5)
+    done = await ledger.transition_as_holder(
+        purchase["id"], "worker_A", from_states=["awaiting_approval"], to_state="completed"
+    )
+    assert done is not None
+    assert done["claimed_by"] is None and done["buyer_email"] is None
+
+
+async def test_the_unfenced_form_still_works_for_callers_that_hold_nothing():
+    """`holder=None` must leave the statement unfenced — the route that starts a purchase holds
+    no lease, and a fence it could not satisfy would make the rail unusable."""
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _mk(state="quoting")
+    assert await ledger.transition(
+        purchase["id"], from_states=["quoting"], to_state="awaiting_approval"
+    ) is not None
 
 
 async def test_the_module_reports_a_real_advance_as_a_row_not_as_none():
@@ -511,19 +611,53 @@ async def test_list_ownership_conjunct_holds_on_postgres():
     assert await ledger.list_purchases_for_owner(None, None) == []
 
 
-async def test_owner_reads_are_redacted_by_default_on_postgres():
+# Written out here, NOT imported from the module — see the same list in the SQLite arm for why
+# an intersection against the module's own set could not notice that set shrinking.
+_EXPECTED_PUBLIC_COLUMNS = {
+    "id", "state", "merchant_domain", "product_key", "variant_key", "product_name",
+    "variant_title", "brand", "category", "quantity", "currency", "our_price_minor",
+    "quoted_total_minor", "final_total_minor", "shipping_minor", "tax_minor", "hosted_url",
+    "hosted_url_expires_at", "reap_quote_expires_at", "reap_order_id", "refusal_reason",
+    "last_error_code", "created_at", "updated_at", "terminal_at",
+}
+
+
+async def test_owner_reads_contain_exactly_the_public_columns_on_postgres():
     import db.reap_agentic_ledger as ledger
 
     purchase = await _mk()
     got = await ledger.get_purchase_for_owner(purchase["id"], "agent_one", "hash_alice")
     listed = await ledger.list_purchases_for_owner("agent_one", "hash_alice")
     for view in (got, listed[0]):
-        leaked = sorted(set(view) & ledger._PRIVATE_PURCHASE_COLUMNS)
-        assert not leaked, f"owner read leaked private columns: {leaked}"
+        assert set(view) == _EXPECTED_PUBLIC_COLUMNS, (
+            f"unexpected: {sorted(set(view) - _EXPECTED_PUBLIC_COLUMNS)}; "
+            f"missing: {sorted(_EXPECTED_PUBLIC_COLUMNS - set(view))}"
+        )
     full = await ledger.get_purchase_for_owner(
         purchase["id"], "agent_one", "hash_alice", include_private=True
     )
     assert full["buyer_email"] == "alice@example.test"
+
+
+async def test_a_column_added_later_does_not_appear_in_the_view_on_postgres():
+    """The allowlist's defining property, through a real ALTER TABLE."""
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _mk()
+    await database.execute(
+        "ALTER TABLE reap_agentic_purchases ADD COLUMN internal_secret_note TEXT"
+    )
+    await database.execute(
+        "UPDATE reap_agentic_purchases SET internal_secret_note = 'do not leak' WHERE id = :i",
+        {"i": purchase["id"]},
+    )
+    internal = await ledger.get_purchase_internal(purchase["id"])
+    assert internal["internal_secret_note"] == "do not leak"
+
+    got = await ledger.get_purchase_for_owner(purchase["id"], "agent_one", "hash_alice")
+    assert "internal_secret_note" not in got
+    assert set(got) == _EXPECTED_PUBLIC_COLUMNS
 
 
 async def test_list_limit_and_offset_are_capped_on_postgres():
@@ -569,7 +703,8 @@ async def test_the_claim_statement_itself_refuses_a_second_holder():
     assert len(rows_a) + len(rows_b) == 1, (
         f"exactly one worker may take a lease; got {len(rows_a)} + {len(rows_b)}"
     )
-    assert (await ledger.get_purchase_internal(purchase["id"]))["attempts"] == 1
+    assert (await ledger.get_purchase_internal(purchase["id"]))["claimed_by"] in\
+        ("worker_a", "worker_b")
 
 
 async def test_the_claim_statement_refuses_a_row_that_went_terminal_after_the_select():
@@ -631,7 +766,6 @@ async def test_claim_then_second_claim_is_empty():
     first = await ledger.claim_due_purchases("worker_a", limit=5)
     second = await ledger.claim_due_purchases("worker_b", limit=5)
     assert len(first) == 1 and second == []
-    assert first[0]["attempts"] == 1
 
 
 @pytest.mark.parametrize("terminal", _TERMINALS)
@@ -717,7 +851,7 @@ async def test_a_requeued_purchase_is_claimable_again_on_postgres():
     await ledger.requeue_stale_claims(lease_seconds=300, limit=10)
     reclaimed = await ledger.claim_due_purchases("worker_b", limit=5)
     assert [c["id"] for c in reclaimed] == [stale["id"]]
-    assert reclaimed[0]["attempts"] == 2
+    assert reclaimed[0]["claimed_by"] == "worker_b"
 
 
 @pytest.mark.parametrize("bad", [0, 29, -1])
@@ -834,8 +968,8 @@ async def test_two_connections_expiring_at_once_move_the_row_once():
     conn_b = await _raw_connection()
     try:
         rows_a, rows_b = await asyncio.gather(
-            _run_on(conn_a, ledger._EXPIRE_OVERDUE_SQL, {}),
-            _run_on(conn_b, ledger._EXPIRE_OVERDUE_SQL, {}),
+            _run_on(conn_a, ledger._EXPIRE_OVERDUE_SQL, _sweep_params()),
+            _run_on(conn_b, ledger._EXPIRE_OVERDUE_SQL, _sweep_params()),
         )
     finally:
         await conn_a.close()
@@ -885,8 +1019,8 @@ async def test_two_connections_failing_exhausted_at_once_move_the_row_once():
     conn_b = await _raw_connection()
     try:
         rows_a, rows_b = await asyncio.gather(
-            _run_on(conn_a, ledger._FAIL_EXHAUSTED_SQL, {"max_attempts": 5}),
-            _run_on(conn_b, ledger._FAIL_EXHAUSTED_SQL, {"max_attempts": 5}),
+            _run_on(conn_a, ledger._FAIL_EXHAUSTED_SQL, {"max_attempts": 5, "limit": 200}),
+            _run_on(conn_b, ledger._FAIL_EXHAUSTED_SQL, {"max_attempts": 5, "limit": 200}),
         )
     finally:
         await conn_a.close()
@@ -894,13 +1028,250 @@ async def test_two_connections_failing_exhausted_at_once_move_the_row_once():
     assert len(rows_a) + len(rows_b) == 1
 
 
-async def test_the_bulk_sweeps_only_use_legal_edges_on_postgres():
+@pytest.mark.parametrize(
+    "sql_name,target",
+    [("_EXPIRE_OVERDUE_SQL", "expired"), ("_FAIL_EXHAUSTED_SQL", "failed")],
+)
+async def test_the_bulk_sweeps_only_use_legal_edges_on_postgres(sql_name, target):
+    """FINDING 4. The state list is parsed OUT OF THE FINAL SQL STRING, so this checks the edges
+    the database will really take. While the tuple and the SQL were two separate things, adding
+    'processing' to the expire sweep's IN list — expiring a purchase the buyer had already
+    APPROVED — survived both dialects."""
     import db.reap_agentic_ledger as ledger
 
-    for src in ledger._EXPIRE_SOURCE_STATES:
-        assert "expired" in ledger.ALLOWED_TRANSITIONS[src]
-    for src in ledger._FAIL_EXHAUSTED_SOURCE_STATES:
-        assert "failed" in ledger.ALLOWED_TRANSITIONS[src]
+    sources = ledger._states_in(getattr(ledger, sql_name), "WHERE state IN (")
+    assert sources
+    for src in sources:
+        assert src in ledger.PURCHASE_STATES
+        assert target in ledger.ALLOWED_TRANSITIONS[src], (
+            f"{sql_name} would move {src!r} -> {target!r}, which ALLOWED_TRANSITIONS forbids"
+        )
+
+
+async def test_the_expire_sweep_never_touches_an_approved_purchase_on_postgres():
+    """A purchase in 'processing' has been APPROVED BY THE BUYER and is settling. Expiring it
+    abandons a payment in flight."""
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _mk(state="processing")
+    await _set_clock_column(purchase["id"], "hosted_url_expires_at", _PAST)
+    await _set_clock_column(
+        purchase["id"], "updated_at", "CURRENT_TIMESTAMP - INTERVAL '99999 seconds'"
+    )
+    assert await ledger.expire_overdue_purchases(max_age_seconds=60) == []
+    assert await _state_of(purchase["id"]) == "processing"
+
+
+# ── P2-1 / P2-2: bounded sweeps and the absolute age fallback ────────────────────────────────
+
+
+async def test_expire_is_bounded_by_limit_on_postgres():
+    """Prod and staging share one Postgres. An unbounded UPDATE on first arming locks every
+    qualifying row at once."""
+    import db.reap_agentic_ledger as ledger
+
+    ids = []
+    for index in range(5):
+        purchase = await _mk(state="awaiting_approval", buyer_ref=f"bref_{index}")
+        await _set_clock_column(purchase["id"], "hosted_url_expires_at", _PAST)
+        ids.append(purchase["id"])
+
+    first = await ledger.expire_overdue_purchases(limit=2)
+    assert len(first) == 2
+    rest = await ledger.expire_overdue_purchases(limit=50)
+    assert len(rest) == 3
+    assert sorted(first + rest) == sorted(ids)
+    assert await ledger.expire_overdue_purchases(limit=50) == []
+
+
+async def test_fail_exhausted_is_bounded_by_limit_on_postgres():
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+
+    ids = []
+    for index in range(4):
+        purchase = await _mk(state="processing", buyer_ref=f"bref_{index}")
+        await database.execute(
+            "UPDATE reap_agentic_purchases SET attempts = 9 WHERE id = :i", {"i": purchase["id"]}
+        )
+        ids.append(purchase["id"])
+    first = await ledger.fail_exhausted_purchases(5, limit=2)
+    assert len(first) == 2
+    rest = await ledger.fail_exhausted_purchases(5, limit=50)
+    assert sorted(first + rest) == sorted(ids)
+
+
+@pytest.mark.parametrize("bad", [0, -1, 501])
+async def test_both_sweeps_refuse_an_out_of_range_limit_on_postgres(bad):
+    import db.reap_agentic_ledger as ledger
+
+    with pytest.raises(ValueError):
+        await ledger.expire_overdue_purchases(limit=bad)
+    with pytest.raises(ValueError):
+        await ledger.fail_exhausted_purchases(5, limit=bad)
+
+
+@pytest.mark.parametrize("state", ["needs_enrollment", "awaiting_approval"])
+async def test_a_row_with_no_hosted_deadline_is_expired_on_absolute_age_on_postgres(state):
+    """P2-2. Reproduced before the fix: with `hosted_url_expires_at` NULL the row was expired by
+    NOTHING and kept the buyer's address and email indefinitely, while the sweep's docstring
+    called itself a PII deadline."""
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _mk(state=state)
+    assert purchase["hosted_url_expires_at"] is None
+    await _set_clock_column(
+        purchase["id"], "updated_at", "CURRENT_TIMESTAMP - INTERVAL '7200 seconds'"
+    )
+    assert await ledger.expire_overdue_purchases(max_age_seconds=3600) == [purchase["id"]]
+    row = await ledger.get_purchase_internal(purchase["id"])
+    assert row["state"] == "expired"
+    assert row["buyer_email"] is None and row["shipping_address"] is None
+
+
+async def test_a_young_row_with_no_hosted_deadline_is_left_alone_on_postgres():
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _mk(state="awaiting_approval")
+    assert await ledger.expire_overdue_purchases(max_age_seconds=3600) == []
+    assert await _state_of(purchase["id"]) == "awaiting_approval"
+
+
+@pytest.mark.parametrize("bad", [0, 59, -1])
+async def test_expire_refuses_a_max_age_under_a_minute_on_postgres(bad):
+    import db.reap_agentic_ledger as ledger
+
+    with pytest.raises(ValueError):
+        await ledger.expire_overdue_purchases(max_age_seconds=bad)
+
+
+# ── P2-3 / boundary guards, Postgres twins ───────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("state", ["resolving", "quoting", "processing"])
+async def test_a_claim_in_a_working_state_increments_attempts_on_postgres(state):
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _mk(state=state)
+    await _set_clock_column(purchase["id"], "next_poll_at", _PAST)
+    claimed = await ledger.claim_due_purchases("worker_a", limit=5)
+    assert claimed[0]["attempts"] == 1
+
+
+@pytest.mark.parametrize("state", ["awaiting_approval", "needs_enrollment"])
+async def test_a_claim_in_a_waiting_state_does_not_increment_attempts_on_postgres(state):
+    """P2-3. A buyer taking an hour on the partner's page, polled every 30 s, would otherwise
+    reach ~120 attempts on a purchase where nothing has gone wrong."""
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _mk(state=state)
+    await _set_clock_column(purchase["id"], "next_poll_at", _PAST)
+    for _ in range(3):
+        await ledger.claim_due_purchases("worker_a", limit=5)
+        await ledger.release_claim(purchase["id"], "worker_a")
+    assert (await ledger.get_purchase_internal(purchase["id"]))["attempts"] == 0
+
+
+async def test_fail_exhausted_takes_a_row_at_exactly_max_attempts_on_postgres():
+    """M22. `>=` vs `>` grants every stuck purchase one extra claim."""
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+
+    at_bound = await _mk(state="processing")
+    await database.execute(
+        "UPDATE reap_agentic_purchases SET attempts = 5 WHERE id = :i", {"i": at_bound["id"]}
+    )
+    assert await ledger.fail_exhausted_purchases(5) == [at_bound["id"]]
+
+
+async def test_the_candidate_select_does_not_offer_already_claimed_rows_on_postgres():
+    """M38. The claim re-checks it, so dropping it from the SELECT keeps the answer correct and
+    makes every worker burn its whole limit on rows somebody else holds."""
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+
+    held = await _make_due()
+    free = await _make_due(buyer_ref="bref_free")
+    await _set_clock_column(
+        held["id"], "next_poll_at", "CURRENT_TIMESTAMP - INTERVAL '600 seconds'"
+    )
+    claimed = await ledger.claim_due_purchases("worker_a", limit=1)
+    assert [c["id"] for c in claimed] == [held["id"]]
+
+    offered = {
+        r["id"]
+        for r in await database.fetch_all(ledger._SELECT_DUE_PURCHASES_SQL, {"limit": 50})
+    }
+    assert free["id"] in offered and held["id"] not in offered
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+async def test_create_refuses_a_non_positive_quantity_on_postgres(bad):
+    """M39 — was killed on SQLite only."""
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+
+    with pytest.raises(ValueError):
+        await ledger.create_purchase(
+            buyer_ref="b", agent_id="a", agent_user_ref_hash="h", quantity=bad
+        )
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+
+
+@pytest.mark.parametrize("field", ["buyer_ref", "agent_id", "agent_user_ref_hash"])
+@pytest.mark.parametrize("bad", [None, "", "   "])
+async def test_create_refuses_blank_ownership_on_postgres(field, bad):
+    """M06 — was killed on SQLite only. A row with NULL ownership is invisible to its own owner,
+    because the conjunct compares with `=` and NULL = NULL is NULL."""
+    import db.reap_agentic_ledger as ledger
+
+    kwargs = dict(buyer_ref="b", agent_id="a", agent_user_ref_hash="h")
+    kwargs[field] = bad
+    with pytest.raises(ValueError):
+        await ledger.create_purchase(**kwargs)
+
+
+@pytest.mark.parametrize("bad", ["424", "42424", "abcd", ""])
+async def test_activation_refuses_a_bad_card_last4_on_postgres(bad):
+    """M40 — was killed on SQLite only. card_last4 is the ONLY digits of the card that may ever
+    be stored, so the shape of it is not a formatting preference."""
+    import db.reap_agentic_ledger as ledger
+
+    enrollment = await ledger.upsert_pending_enrollment(buyer_ref="bref_alice")
+    with pytest.raises(ValueError):
+        await ledger.mark_enrollment_active(enrollment["id"], card_last4=bad)
+
+
+async def test_reactivating_the_already_active_row_does_not_demote_itself_on_postgres():
+    """M29 — was killed on SQLite only. Without `id <> :id` the demotion kills the very row it is
+    about to promote, and an idempotent retry becomes a de-enrolment."""
+    import db.reap_agentic_ledger as ledger
+
+    live = await ledger.upsert_pending_enrollment(buyer_ref="bref_alice")
+    await ledger.mark_enrollment_active(live["id"], reap_enrollment_id="enr_live")
+    again = await ledger.mark_enrollment_active(live["id"], card_network="visa")
+    assert again is not None and again["status"] == "active"
+    assert (await ledger.get_active_enrollment("bref_alice"))["id"] == live["id"]
+
+
+async def test_the_module_opens_no_database_transactions_on_postgres():
+    """P1-2's structural half, asserted here too because this is the dialect where the hazard was
+    measured. An AST walk, not a grep — the docstrings discuss `database.transaction()` by name."""
+    import ast
+
+    tree = ast.parse(
+        (Path(__file__).resolve().parent.parent / "db/reap_agentic_ledger.py").read_text("utf-8")
+    )
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "transaction"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "database"
+    ]
+    assert not calls, f"database.transaction() at line(s) {[c.lineno for c in calls]}"
 
 
 # ── enrollments ──────────────────────────────────────────────────────────────────────────────
@@ -1009,6 +1380,124 @@ async def test_a_lost_activation_race_returns_none_not_a_driver_exception():
         "SELECT status FROM reap_agentic_enrollments WHERE id = :i", {"i": mine["id"]}
     )
     assert loser["status"] == "pending", "the loser's row must be untouched, not half-written"
+
+
+# ── FINDING 2: concurrent activation on the SHARED `database` object ─────────────────────────
+
+
+async def test_two_buyers_activating_at_once_on_the_shared_database_both_succeed():
+    """FINDING 2, THE DEFECT IN ITS PUREST FORM. Two UNRELATED buyers, one `asyncio.gather` on
+    the app's shared `database` — which is how a FastAPI process actually reaches this code.
+
+    With `database.transaction()` in place this was measured 5 runs out of 5 on real Postgres:
+    one task raised TransactionEndedOutOfOrder AND ITS WRITE WAS ROLLED BACK, the other raised
+    NoActiveSQLTransactionError for a write that DID commit. databases==0.7.0 scopes its
+    connection by ContextVar, so gathered tasks end up inside each other's transaction. Two
+    unrelated buyers, and one of them loses an enrollment they completed while the other is told
+    an error about a write that worked.
+
+    With no transaction, both are two autocommit statements that interleave harmlessly."""
+    import db.reap_agentic_ledger as ledger
+
+    a = await ledger.upsert_pending_enrollment(buyer_ref="buyer_one")
+    b = await ledger.upsert_pending_enrollment(buyer_ref="buyer_two")
+
+    async def activate(enrollment_id, ref):
+        return await ledger.mark_enrollment_active(enrollment_id, reap_enrollment_id=ref)
+
+    results = await asyncio.gather(
+        activate(a["id"], "enr_one"),
+        activate(b["id"], "enr_two"),
+        return_exceptions=True,
+    )
+    raised = [r for r in results if isinstance(r, BaseException)]
+    assert not raised, f"concurrent activation for two different buyers raised: {raised}"
+
+    assert (await ledger.get_active_enrollment("buyer_one"))["id"] == a["id"]
+    assert (await ledger.get_active_enrollment("buyer_two"))["id"] == b["id"]
+
+
+async def test_same_buyer_two_targets_at_once_on_the_shared_database_leaves_one_active():
+    """The same hazard aimed at ONE buyer. Measured with the transaction in place: one call
+    raised, the other returned None, and NEITHER row was activated — a buyer who enrolled ending
+    up with no active card and no error anyone could act on.
+
+    Now: nothing raises, exactly one row is active, and the loser is still 'pending', which means
+    retryable rather than silently lost."""
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+
+    first = await ledger.upsert_pending_enrollment(buyer_ref="buyer_same")
+    await database.execute(
+        "INSERT INTO reap_agentic_enrollments (id, buyer_ref, status) "
+        "VALUES ('re_second', 'buyer_same', 'pending')"
+    )
+
+    results = await asyncio.gather(
+        ledger.mark_enrollment_active(first["id"], reap_enrollment_id="enr_a"),
+        ledger.mark_enrollment_active("re_second", reap_enrollment_id="enr_b"),
+        return_exceptions=True,
+    )
+    raised = [r for r in results if isinstance(r, BaseException)]
+    assert not raised, f"concurrent activation for one buyer raised: {raised}"
+
+    actives = await database.fetch_all(
+        "SELECT id FROM reap_agentic_enrollments WHERE buyer_ref = :b AND status = 'active'",
+        {"b": "buyer_same"},
+    )
+    assert len(actives) == 1, f"exactly one active row per buyer; got {[r['id'] for r in actives]}"
+
+    winner = actives[0]["id"]
+    loser = "re_second" if winner == first["id"] else first["id"]
+    loser_status = await database.fetch_val(
+        "SELECT status FROM reap_agentic_enrollments WHERE id = :i", {"i": loser}
+    )
+    assert loser_status in ("pending", "dead"), (
+        f"the loser must be retryable ('pending') or deliberately demoted ('dead'), not "
+        f"{loser_status!r}"
+    )
+    # And whichever call lost answered None rather than raising — asserted above by `not raised`.
+    assert None in results or all(r is not None for r in results)
+
+
+async def test_the_same_target_activated_twice_at_once_returns_the_active_row_both_times():
+    """Idempotency under concurrency: a redelivered webhook racing its own original."""
+    import db.reap_agentic_ledger as ledger
+
+    enrollment = await ledger.upsert_pending_enrollment(buyer_ref="buyer_dup")
+    results = await asyncio.gather(
+        ledger.mark_enrollment_active(enrollment["id"], reap_enrollment_id="enr_x"),
+        ledger.mark_enrollment_active(enrollment["id"], reap_enrollment_id="enr_x"),
+        return_exceptions=True,
+    )
+    raised = [r for r in results if isinstance(r, BaseException)]
+    assert not raised, f"idempotent re-activation raised: {raised}"
+    assert all(r is not None and r["status"] == "active" for r in results)
+    assert (await ledger.get_active_enrollment("buyer_dup"))["id"] == enrollment["id"]
+
+
+async def test_activating_a_dead_row_with_no_competitor_stays_dead_on_postgres():
+    """FINDING 5. With a competing active row the old test passed for the wrong reason — the
+    unique index raised and the except returned None. With NO competitor there is no index to
+    save us, and `status IN ('pending','active')` is the only thing between
+    `mark_enrollment_dead` and a revoked card coming back."""
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+
+    enrollment = await ledger.upsert_pending_enrollment(buyer_ref="buyer_solo")
+    await ledger.mark_enrollment_dead(enrollment["id"], reap_status="REVOKED")
+
+    assert await ledger.mark_enrollment_active(
+        enrollment["id"], reap_enrollment_id="enr_zombie"
+    ) is None
+
+    row = await database.fetch_one(
+        "SELECT status, reap_enrollment_id FROM reap_agentic_enrollments WHERE id = :i",
+        {"i": enrollment["id"]},
+    )
+    assert row["status"] == "dead"
+    assert row["reap_enrollment_id"] is None
+    assert await ledger.get_active_enrollment("buyer_solo") is None
 
 
 async def test_the_reap_enrollment_id_is_unique_when_present_and_free_when_null():

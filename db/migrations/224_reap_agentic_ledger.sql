@@ -37,7 +37,13 @@
 -- under a substitution (a checkout can come back 200 with a different variant than we quoted).
 --
 -- Production deploys skip db/migrations/, so both CREATE TABLEs are ALSO in
--- db/schema_guard.ensure_required_schema_light, byte-identical. If you change one, change both.
+-- db/schema_guard.ensure_required_schema_light. The two must build the SAME SCHEMA — not the
+-- same bytes: the self-heal's SQLite twin legitimately differs on `now()` vs CURRENT_TIMESTAMP
+-- and on JSONB vs TEXT, and formatting differs everywhere. What is actually enforced, by
+-- tests/test_reap_agentic_ledger_postgres.py::test_the_self_heal_builds_the_same_schema_as_the_
+-- migration, is that a database built from this file and one built by the self-heal agree on
+-- every column, every index's pg_indexes.indexdef (so UNIQUE cannot quietly become non-unique)
+-- and every CHECK constraint's pg_get_constraintdef. If you change one, change both.
 
 CREATE TABLE IF NOT EXISTS reap_agentic_enrollments (
     -- Ours, minted by us. Reap's id lands in reap_enrollment_id and is not the key, because the
