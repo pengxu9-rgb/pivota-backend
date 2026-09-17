@@ -5775,9 +5775,29 @@ async def _handle_offers_resolve(
                       FROM catalog_products p
                       JOIN catalog_offers o ON o.product_key = p.product_key
                       LEFT JOIN catalog_merchants m ON m.merchant_id = o.merchant_id
-                     WHERE (p.pivota_signature_id = ANY(:aliases)
-                            OR p.content_key = ANY(:aliases)
-                            OR p.product_key = ANY(:aliases))
+                     WHERE p.product_key IN (
+                           SELECT d.product_key FROM catalog_products d
+                            WHERE d.pivota_signature_id = ANY(:aliases)
+                               OR d.content_key = ANY(:aliases)
+                               OR d.product_key = ANY(:aliases)
+                           -- SIBLING LISTINGS. A listing id (its product_key or signature)
+                           -- widens to every listing sharing its content_key, so asking by
+                           -- ANY seller's listing returns every seller of the product — the
+                           -- same set a `ck_` id already returns. Without this the second
+                           -- retailer is reachable only by a content_key that search, the PDP
+                           -- and this door never hand out: measured 2026-09-17 on the Pyunkang
+                           -- Yul canary, get_offers(listing) = 1 seller, get_offers(ck_) = 2.
+                           -- The anchor must itself be live: a withdrawn listing id answers
+                           -- nothing, exactly as it did before this widening.
+                           UNION
+                           SELECT s.product_key
+                             FROM catalog_products a
+                             JOIN catalog_products s ON s.content_key = a.content_key
+                            WHERE (a.pivota_signature_id = ANY(:aliases)
+                                   OR a.product_key = ANY(:aliases))
+                              AND a.content_key IS NOT NULL
+                              AND a.suppressed_at IS NULL
+                              AND a.suppression_reason IS NULL)
                        -- The PRODUCT's own suppression, not just the offer's. Every serving
                        -- read in services/pivot_query_service.py applies this pair, and
                        -- scripts/withdraw_catalog_rows.py takes a product down by setting
