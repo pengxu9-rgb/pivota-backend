@@ -393,9 +393,22 @@ async def ensure_required_schema_light() -> None:
             # names. tests/test_reap_agentic_ledger.py::test_self_heal_* is the
             # thing that actually checks it, on both dialects.
             #
-            # Keep this DDL byte-identical to db/migrations/224_reap_agentic_ledger.sql.
-            # A self-heal that disagrees with the migration makes prod behave
-            # unlike every environment where the migration ran.
+            # THIS DDL MUST BUILD THE SAME SCHEMA AS
+            # db/migrations/224_reap_agentic_ledger.sql. Not "byte-identical" —
+            # that was the earlier wording here and it was a claim no test made,
+            # which is worse than a weaker claim that one does. What is actually
+            # enforced, by
+            # tests/test_reap_agentic_ledger_postgres.py::
+            # test_the_self_heal_builds_the_same_schema_as_the_migration, is that
+            # a database built by this block and one built by the migration agree
+            # on: every column (name, type, nullability, default, length), every
+            # index's `pg_indexes.indexdef` — so UNIQUE cannot quietly become
+            # non-unique — and every CHECK constraint's `pg_get_constraintdef`.
+            # Formatting and comments may differ; nothing the database acts on may.
+            #
+            # That test exists because the reviewer's mutant proved the old prose
+            # was load-bearing and unchecked: changing CREATE UNIQUE INDEX to
+            # CREATE INDEX in both branches here left the entire suite green.
             try:
                 await database.execute(
                     text(

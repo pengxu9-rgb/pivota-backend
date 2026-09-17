@@ -57,6 +57,7 @@ assignment list built from whichever keyword arguments were not None. Same contr
 from __future__ import annotations
 
 import json
+import sqlite3
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Sequence
@@ -78,24 +79,48 @@ from db.database import IS_POSTGRES, database
 # is).
 from services.reap_webhooks import major_to_minor  # noqa: F401  (re-exported on purpose)
 
+# `get_purchase_internal` is deliberately ABSENT: it is the unscoped, unredacted read, and
+# leaving it out of the public surface is half of what stops a route reaching for it. The other
+# half is its name.
 __all__ = [
     "ALLOWED_TRANSITIONS",
     "PURCHASE_STATES",
     "TERMINAL_STATES",
-    "major_to_minor",
+    "amount_minor_or_none",
+    "public_purchase_view",
     "create_purchase",
-    "get_purchase",
     "get_purchase_for_owner",
     "list_purchases_for_owner",
     "transition",
     "claim_due_purchases",
     "release_claim",
     "requeue_stale_claims",
+    "expire_overdue_purchases",
+    "fail_exhausted_purchases",
     "upsert_pending_enrollment",
     "mark_enrollment_active",
     "mark_enrollment_dead",
     "get_active_enrollment",
 ]
+
+
+def amount_minor_or_none(value: Any, currency: str) -> Optional[int]:
+    """Convert a MAJOR-unit amount to the integer MINOR units this ledger's columns hold.
+
+    A thin, named wrapper over `services.reap_webhooks.major_to_minor` — which is the one
+    converter in this repo and REFUSES rather than rounds (NaN, inf, a binary float, a negative,
+    an amount with more decimals than the currency has, or one over the ceiling all come back
+    None). It is not re-implemented here, because a second implementation would be a second
+    rounding policy and the rounding policy is the entire point of the function.
+
+    WHY A WRAPPER AT ALL, rather than a bare re-export. The re-export in the first cut of this
+    module was imported, named in `__all__`, used by nothing and tested by nothing — decoration
+    that reads as an endorsed entry point. This has the caller this module actually needs
+    (`our_price_minor`, `quoted_total_minor`, `final_total_minor` are all BIGINT minor units and
+    every one of them arrives from an upstream decimal) and it has tests. The name says what the
+    None means, which the upstream name does not.
+    """
+    return major_to_minor(value, currency)
 
 
 # ── the state machine ────────────────────────────────────────────────────────────────────────
@@ -200,9 +225,18 @@ _SQLITE_TS_FORMAT = "%Y-%m-%d %H:%M:%S"
 def _bind_dt(value: Any) -> Any:
     """Make a datetime safe to bind on either engine.
 
-    Naive in means UTC assumed — never the client process's timezone, which is what asyncpg
-    would otherwise apply (property 4). On SQLite it becomes the server's own text format so
-    comparisons against CURRENT_TIMESTAMP are exact rather than lexicographic luck.
+    NAIVE IN MEANS UTC ASSUMED, and the `.replace(tzinfo=utc)` below is the whole of that rule.
+    Without it the `.astimezone(utc)` on the next line reads a naive datetime as LOCAL time, so
+    the same value written from a Pacific box and a UTC box lands eight hours apart — on
+    next_poll_at that is a poll that fires eight hours early or late, and on
+    reap_quote_expires_at it is a quote we believe is valid after Reap has expired it. asyncpg
+    applies the same local-time reading to a naive bind for a timestamptz parameter, so the
+    defect exists on both engines by two different routes and this one line closes both.
+    tests/test_reap_agentic_ledger.py::test_a_naive_datetime_is_read_as_utc_not_as_local_time
+    runs under a shifted process timezone and kills the removal of it.
+
+    On SQLite the result becomes the server's own text format so comparisons against
+    CURRENT_TIMESTAMP are exact rather than lexicographic luck.
     """
     if value is None or not isinstance(value, datetime):
         return value
@@ -273,6 +307,74 @@ def _normalize_row(row: Any, ts_columns: Sequence[str]) -> Optional[Dict[str, An
     return out
 
 
+def _is_unique_violation(exc: BaseException) -> bool:
+    """Is this exception a UNIQUE-constraint violation, on either driver?
+
+    NEITHER DRIVER IS WRAPPED BY `databases` 0.7.0, so there is no one exception type to catch:
+    asyncpg raises `asyncpg.exceptions.UniqueViolationError` and aiosqlite raises
+    `sqlite3.IntegrityError`. Matched by SQLSTATE and by type rather than by importing asyncpg at
+    module scope, which would make this module unimportable on a SQLite-only install.
+
+    SQLAlchemy's `IntegrityError` is unwrapped too, for the paths where something does wrap.
+    """
+    seen = set()
+    candidates = [exc]
+    while candidates:
+        current = candidates.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        # asyncpg: 23505 is unique_violation. Checked before the type name so a subclass or a
+        # re-export cannot slip past.
+        if getattr(current, "sqlstate", None) == "23505":
+            return True
+        if type(current).__name__ == "UniqueViolationError":
+            return True
+        if isinstance(current, sqlite3.IntegrityError) and "unique" in str(current).lower():
+            return True
+        for nested in (current.__cause__, current.__context__, getattr(current, "orig", None)):
+            if isinstance(nested, BaseException):
+                candidates.append(nested)
+    return False
+
+
+# Columns `public_purchase_view` strips. Two different kinds of thing, both of which an agent's
+# response has no use for:
+#
+#   PII and buyer identity — shipping_address, buyer_email, buyer_ref, agent_user_ref_hash.
+#       The first two are the columns this rail NULLs on terminal; returning them from a read
+#       before then would put them in whatever the caller logs, which is the leak the nulling
+#       exists to prevent, arriving by a different door.
+#   internals — claimed_by, claimed_at (poller bookkeeping), reap_product_id, reap_variant_id
+#       (EVIDENCE, and a substituted variant id would read as identity to anyone downstream),
+#       queries_tried (our resolver's search terms).
+_PRIVATE_PURCHASE_COLUMNS = frozenset({
+    "shipping_address",
+    "buyer_email",
+    "buyer_ref",
+    "agent_user_ref_hash",
+    "claimed_by",
+    "claimed_at",
+    "reap_product_id",
+    "reap_variant_id",
+    "queries_tried",
+})
+
+
+def public_purchase_view(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Project a purchase row down to what an agent-facing caller may see.
+
+    An ALLOW-by-removal rather than an allowlist of kept keys, deliberately: a column added to
+    the table later shows up in this view, which is visible and reviewable, instead of silently
+    vanishing from every response. A column that must NOT show up goes in the frozenset above,
+    and tests/test_reap_agentic_ledger.py asserts the set is actually absent from the default
+    owner reads.
+    """
+    if row is None:
+        return None
+    return {key: value for key, value in row.items() if key not in _PRIVATE_PURCHASE_COLUMNS}
+
+
 def _purchase(row: Any) -> Optional[Dict[str, Any]]:
     return _normalize_row(row, _PURCHASE_TS_COLUMNS)
 
@@ -301,7 +403,8 @@ _INSERT_PURCHASE_SQL = """
         :id, :buyer_ref, :agent_id, :agent_user_ref_hash, :enrollment_id, :state,
         :merchant_domain, :product_key, :variant_key, :product_name, :variant_title,
         :brand, :category, :quantity, :currency, :our_price_minor, :click_id, :return_url,
-        CAST(:queries_tried AS JSONB), :next_poll_at, CAST(:shipping_address AS JSONB),
+        CAST(:queries_tried AS JSONB), COALESCE(:next_poll_at, CURRENT_TIMESTAMP),
+        CAST(:shipping_address AS JSONB),
         :buyer_email
     )
     RETURNING *
@@ -317,7 +420,8 @@ _INSERT_PURCHASE_SQL_SQLITE = """
         :id, :buyer_ref, :agent_id, :agent_user_ref_hash, :enrollment_id, :state,
         :merchant_domain, :product_key, :variant_key, :product_name, :variant_title,
         :brand, :category, :quantity, :currency, :our_price_minor, :click_id, :return_url,
-        :queries_tried, :next_poll_at, :shipping_address, :buyer_email
+        :queries_tried, COALESCE(:next_poll_at, CURRENT_TIMESTAMP), :shipping_address,
+        :buyer_email
     )
     RETURNING *
 """
@@ -349,8 +453,8 @@ _LIST_PURCHASES_FOR_OWNER_SQL = """
 async def create_purchase(
     *,
     buyer_ref: str,
-    agent_id: Optional[str] = None,
-    agent_user_ref_hash: Optional[str] = None,
+    agent_id: str,
+    agent_user_ref_hash: str,
     enrollment_id: Optional[str] = None,
     state: str = "resolving",
     purchase_id: Optional[str] = None,
@@ -371,12 +475,42 @@ async def create_purchase(
     shipping_address: Any = None,
     buyer_email: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Open a purchase. `buyer_ref` is the OPAQUE reference we send Reap as owner.id — never the
-    global buyer id, which must not leave this system."""
-    if not (buyer_ref or "").strip():
-        raise ValueError("buyer_ref is required — it is what identifies the owner to Reap")
-    if state not in PURCHASE_STATES:
-        raise ValueError(f"unknown purchase state {state!r}")
+    """Open a purchase, always in 'resolving'. `buyer_ref` is the OPAQUE reference we send Reap
+    as owner.id — never the global buyer id, which must not leave this system.
+
+    A PURCHASE CANNOT BE CREATED IN ANY OTHER STATE, AND THAT IS THE FIX FOR A REAL DEFECT. This
+    used to accept any state in the vocabulary, including the four terminal ones — and creating
+    directly in a terminal state produced a row that KEPT shipping_address and buyer_email and
+    never stamped terminal_at, because the PII rule lives in the transition statement and a
+    create is not a transition. "The resolve failed instantly, record it and stop" is exactly the
+    shape the next package will want, and it would have written the buyer's address into a
+    permanently-terminal row.
+
+    The replacement is not a reminder, it is an impossibility: an instant refusal is
+    `create_purchase(...)` followed by `transition(..., to_state='refused')`, which nulls the PII
+    because every terminal write goes through the one statement that does. The `state` parameter
+    is kept rather than deleted so the refusal names what happened.
+
+    EMPTY OWNERSHIP IS ALSO REFUSED. A row whose agent_id or agent_user_ref_hash is None or blank
+    is invisible to `get_purchase_for_owner` (NULL = NULL is NULL) — its owner could never read
+    it back — and "" is a bucket that two unrelated callers would silently share.
+    """
+    if state != "resolving":
+        raise ValueError(
+            f"a purchase may only be created in 'resolving' (got {state!r}). To record an "
+            "instant refusal, create it and then transition it — the terminal write is what "
+            "nulls shipping_address and buyer_email, and a create does not."
+        )
+    for name, value in (
+        ("buyer_ref", buyer_ref),
+        ("agent_id", agent_id),
+        ("agent_user_ref_hash", agent_user_ref_hash),
+    ):
+        if not (value or "").strip():
+            raise ValueError(
+                f"{name} is required and must not be blank — a purchase without it cannot be "
+                "read back by its owner"
+            )
     if int(quantity) <= 0:
         raise ValueError("quantity must be a positive integer")
 
@@ -419,19 +553,35 @@ async def create_purchase(
     return created
 
 
-async def get_purchase(purchase_id: str) -> Optional[Dict[str, Any]]:
-    """The UNSCOPED read. For internal callers (the poller, the webhook receiver) that already
-    hold the id from our own storage. Anything reachable by an agent must use the owner-scoped
-    pair below."""
+async def get_purchase_internal(purchase_id: str) -> Optional[Dict[str, Any]]:
+    """The UNSCOPED, UNREDACTED read. For internal callers — the poller, the webhook receiver —
+    that already hold the id from our own storage and need the private columns to do their job.
+
+    NAMED `_internal` AND ABSENT FROM `__all__` ON PURPOSE. It was `get_purchase`, which is the
+    obvious name and therefore the one a route author reaches for; the difference between it and
+    `get_purchase_for_owner` is the entire access-control story on this rail, and a name that
+    does not say so is a trap. The suffix is the only thing that makes the wrong call look wrong
+    at the call site.
+    """
     return _purchase(await database.fetch_one(_SELECT_PURCHASE_SQL, {"id": purchase_id}))
 
 
 async def get_purchase_for_owner(
-    purchase_id: str, agent_id: str, agent_user_ref_hash: str
+    purchase_id: str,
+    agent_id: str,
+    agent_user_ref_hash: str,
+    *,
+    include_private: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """The read every agent-facing route makes. None when the purchase is someone else's — the
-    SAME answer as when it does not exist, so the endpoint cannot be used to probe for ids."""
-    return _purchase(
+    SAME answer as when it does not exist, so the endpoint cannot be used to probe for ids.
+
+    REDACTED BY DEFAULT. `include_private=False` runs the row through `public_purchase_view`,
+    which strips the PII and the internals. The default is the safe one because the caller who
+    forgets to think about it is a route, and the failure of forgetting is a leak; an internal
+    caller that genuinely needs the private columns has to say so, and that word is greppable.
+    """
+    row = _purchase(
         await database.fetch_one(
             _SELECT_PURCHASE_FOR_OWNER_SQL,
             {
@@ -441,6 +591,7 @@ async def get_purchase_for_owner(
             },
         )
     )
+    return row if include_private else public_purchase_view(row)
 
 
 async def list_purchases_for_owner(
@@ -449,9 +600,11 @@ async def list_purchases_for_owner(
     *,
     limit: int = 50,
     offset: int = 0,
+    include_private: bool = False,
 ) -> List[Dict[str, Any]]:
     """Owner-scoped history, newest first. The conjunct is the same one `get_purchase_for_owner`
-    uses and for the same reason — a list endpoint that leaks is a worse leak than a get."""
+    uses and for the same reason — a list endpoint that leaks is a worse leak than a get, and so
+    is the redaction default."""
     rows = await database.fetch_all(
         _LIST_PURCHASES_FOR_OWNER_SQL,
         {
@@ -461,7 +614,10 @@ async def list_purchases_for_owner(
             "offset": max(0, int(offset)),
         },
     )
-    return [r for r in (_purchase(row) for row in rows) if r is not None]
+    out = [r for r in (_purchase(row) for row in rows) if r is not None]
+    if include_private:
+        return out
+    return [view for view in (public_purchase_view(r) for r in out) if view is not None]
 
 
 # ── purchases: the conditional advance ───────────────────────────────────────────────────────
@@ -533,6 +689,10 @@ _TRANSITION_SQL = """
                 THEN NULL ELSE COALESCE(CAST(:shipping_address AS JSONB), CAST(shipping_address AS JSONB)) END,
            buyer_email = CASE WHEN :to_state_probe IN ('completed', 'failed', 'refused', 'expired')
                 THEN NULL ELSE COALESCE(:buyer_email, buyer_email) END,
+           claimed_by = CASE WHEN :to_state_probe IN ('completed', 'failed', 'refused', 'expired')
+                THEN NULL ELSE claimed_by END,
+           claimed_at = CASE WHEN :to_state_probe IN ('completed', 'failed', 'refused', 'expired')
+                THEN NULL ELSE claimed_at END,
            terminal_at = CASE WHEN :to_state_probe IN ('completed', 'failed', 'refused', 'expired')
                 THEN CURRENT_TIMESTAMP ELSE terminal_at END,
            updated_at = CURRENT_TIMESTAMP
@@ -577,6 +737,10 @@ _TRANSITION_SQL_SQLITE = """
                 THEN NULL ELSE COALESCE(:shipping_address, shipping_address) END,
            buyer_email = CASE WHEN :to_state_probe IN ('completed', 'failed', 'refused', 'expired')
                 THEN NULL ELSE COALESCE(:buyer_email, buyer_email) END,
+           claimed_by = CASE WHEN :to_state_probe IN ('completed', 'failed', 'refused', 'expired')
+                THEN NULL ELSE claimed_by END,
+           claimed_at = CASE WHEN :to_state_probe IN ('completed', 'failed', 'refused', 'expired')
+                THEN NULL ELSE claimed_at END,
            terminal_at = CASE WHEN :to_state_probe IN ('completed', 'failed', 'refused', 'expired')
                 THEN CURRENT_TIMESTAMP ELSE terminal_at END,
            updated_at = CURRENT_TIMESTAMP
@@ -650,9 +814,17 @@ async def transition(
 
 # THE CLAIM PAIR, house style (db/product_quality_backfill_jobs.py): a plain SELECT picks the
 # next candidates, then ONE conditional UPDATE per candidate decides who actually got it. The
-# SELECT is advisory — it can be stale by the time the UPDATE runs, and that is fine, because
-# `AND claimed_by IS NULL` in the UPDATE is what makes the claim exclusive. A second worker that
-# read the same candidate gets no row back and moves on.
+# SELECT is advisory — it can be stale by the time the UPDATE runs, and that is fine, because the
+# conjuncts in the UPDATE are what make the claim exclusive. A second worker that read the same
+# candidate gets no row back and moves on.
+#
+# THE UPDATE RE-CHECKS THE STATE, AND NOT ONLY THE LEASE. The SELECT and the UPDATE are two
+# statements with a gap between them, and the row can go TERMINAL inside that gap: worker A's
+# SELECT offers a due 'processing' row, worker B completes it, worker A's claim then lands. With
+# only `claimed_by IS NULL` that claim SUCCEEDS and hands the poller a finished purchase to poll.
+# It is also unrecoverable, because a dead pod's claim on a terminal row was invisible to the
+# requeue's old state filter — measured, a 99999-second-old claim freed 0 rows. Both halves are
+# fixed: the state conjunct below, and a requeue that no longer filters on state at all.
 _SELECT_DUE_PURCHASES_SQL = """
     SELECT id FROM reap_agentic_purchases
      WHERE state IN ('resolving', 'needs_enrollment', 'quoting', 'awaiting_approval', 'processing')
@@ -671,6 +843,9 @@ _CLAIM_PURCHASE_SQL = """
            updated_at = CURRENT_TIMESTAMP
      WHERE id = :id
        AND claimed_by IS NULL
+       AND state IN (
+           'resolving', 'needs_enrollment', 'quoting', 'awaiting_approval', 'processing'
+       )
     RETURNING *
 """
 
@@ -695,6 +870,12 @@ _RELEASE_CLAIM_SQL = """
 # `RETURNING id` is what makes the count true on BOTH engines: without it, asyncpg answers None
 # however many rows moved, and the caller's "requeued N stale leases" log line disappears while
 # the requeue itself silently works.
+#
+# IT FREES A STALE CLAIM WHATEVER STATE THE ROW IS IN. This used to filter on the pollable
+# states, which sounds right and is not: a claim on a TERMINAL row is garbage to clear, not work
+# to requeue, and filtering it out made it unclearable forever (measured: a 99999-second-old
+# claim on a completed purchase freed 0 rows). Clearing it cannot resurrect the row, because
+# `_CLAIM_PURCHASE_SQL` carries its own state conjunct — the two changes are one fix.
 _REQUEUE_STALE_CLAIMS_SQL = """
     UPDATE reap_agentic_purchases
        SET claimed_by = NULL,
@@ -705,9 +886,6 @@ _REQUEUE_STALE_CLAIMS_SQL = """
          WHERE claimed_by IS NOT NULL
            AND claimed_at IS NOT NULL
            AND claimed_at < CURRENT_TIMESTAMP - (:lease_seconds * INTERVAL '1 second')
-           AND state IN (
-               'resolving', 'needs_enrollment', 'quoting', 'awaiting_approval', 'processing'
-           )
          ORDER BY claimed_at ASC
          LIMIT :limit
      )
@@ -724,9 +902,6 @@ _REQUEUE_STALE_CLAIMS_SQL_SQLITE = """
          WHERE claimed_by IS NOT NULL
            AND claimed_at IS NOT NULL
            AND claimed_at < datetime('now', :lease_window)
-           AND state IN (
-               'resolving', 'needs_enrollment', 'quoting', 'awaiting_approval', 'processing'
-           )
          ORDER BY claimed_at ASC
          LIMIT :limit
      )
@@ -734,17 +909,18 @@ _REQUEUE_STALE_CLAIMS_SQL_SQLITE = """
 """
 
 
-async def claim_due_purchases(
-    worker_id: str,
-    *,
-    limit: int = 10,
-    lease_seconds: int = 300,
-) -> List[Dict[str, Any]]:
+async def claim_due_purchases(worker_id: str, *, limit: int = 10) -> List[Dict[str, Any]]:
     """Take a lease on up to `limit` purchases whose next_poll_at has come.
 
-    `lease_seconds` is not enforced here — it is what `requeue_stale_claims` measures against,
-    and it is accepted here so the caller states its lease once. A claim is released either by
-    `release_claim` (the worker finished) or by the requeue (the worker died).
+    THERE IS NO `lease_seconds` PARAMETER, and there used to be. It was accepted here, documented
+    as "what requeue_stale_claims measures against", and connected to nothing: the lease length
+    lives entirely in `requeue_stale_claims`, and a caller that passed 60 here and took the
+    default 300 there would have had a 300-second lease and no way to tell. A parameter that
+    reads as configuration and configures nothing is worse than no parameter.
+
+    A claim is released either by `release_claim` (the worker finished), by a transition into a
+    terminal state (which clears it in the same UPDATE), or by `requeue_stale_claims` (the worker
+    died).
     """
     if not (worker_id or "").strip():
         raise ValueError("worker_id is required — an anonymous claim cannot be requeued")
@@ -787,10 +963,19 @@ async def release_claim(
 async def requeue_stale_claims(*, lease_seconds: int = 300, limit: int = 50) -> int:
     """Free leases held past `lease_seconds`; return how many moved.
 
-    This is the only thing that recovers a purchase whose worker died mid-poll. The cutoff is
-    server-side — see the constant above.
+    This is the only thing that recovers a purchase whose worker died mid-poll, and it is the ONE
+    place the lease length is stated. The cutoff is server-side — see the constant above.
+
+    A lease shorter than 30 seconds is a ValueError, not a silently-raised floor. This used to be
+    `max(30, lease_seconds)`: a caller asking for a 5-second lease got 30 and no indication, which
+    is the shape where an operator tunes a number and watches nothing change.
     """
-    seconds = max(30, int(lease_seconds))
+    if int(lease_seconds) < 30:
+        raise ValueError(
+            f"lease_seconds must be at least 30 (got {lease_seconds}); a shorter lease requeues "
+            "work a live worker is still doing"
+        )
+    seconds = int(lease_seconds)
     capped = max(1, min(500, int(limit)))
     if IS_POSTGRES:
         rows = await database.fetch_all(
@@ -802,6 +987,87 @@ async def requeue_stale_claims(*, lease_seconds: int = 300, limit: int = 50) -> 
             {"lease_window": f"-{seconds} seconds", "limit": capped},
         )
     return len(rows)
+
+
+# ── the two sweeps the poller package needs and cannot build safely itself ───────────────────
+#
+# Both are ONE conditional UPDATE over a set of rows, and both write a terminal state — which
+# means both must do everything a terminal transition does: NULL the PII, stamp terminal_at, and
+# clear the claim. Written out here rather than left to the poller to assemble from `transition`
+# in a loop, because a loop is N round trips with N chances to be interrupted halfway, and the
+# half that gets skipped is the PII.
+#
+# THE SOURCE STATES ARE CONSTANTS SO A TEST CAN CHECK THEM AGAINST ALLOWED_TRANSITIONS. These
+# statements bypass `transition`, so nothing at runtime enforces the map on them; the edges are
+# asserted by tests/test_reap_agentic_ledger.py::test_the_bulk_sweeps_only_use_legal_edges on
+# both dialects. Both lists are legal today: needs_enrollment -> expired and
+# awaiting_approval -> expired exist, and every pollable state permits -> failed.
+_EXPIRE_SOURCE_STATES = ("needs_enrollment", "awaiting_approval")
+_FAIL_EXHAUSTED_SOURCE_STATES = (
+    "resolving", "needs_enrollment", "quoting", "awaiting_approval", "processing",
+)
+
+# Portable as written: CURRENT_TIMESTAMP and a literal IN list mean no dialect split is needed,
+# which is the better answer than two constants whenever it is available (see
+# services/pdp_governance_service.py for the same call).
+_EXPIRE_OVERDUE_SQL = """
+    UPDATE reap_agentic_purchases
+       SET state = 'expired',
+           shipping_address = NULL,
+           buyer_email = NULL,
+           claimed_by = NULL,
+           claimed_at = NULL,
+           last_error_code = COALESCE(last_error_code, 'hosted_url_expired'),
+           terminal_at = CURRENT_TIMESTAMP,
+           updated_at = CURRENT_TIMESTAMP
+     WHERE state IN ('needs_enrollment', 'awaiting_approval')
+       AND hosted_url_expires_at IS NOT NULL
+       AND hosted_url_expires_at < CURRENT_TIMESTAMP
+    RETURNING id
+"""
+
+_FAIL_EXHAUSTED_SQL = """
+    UPDATE reap_agentic_purchases
+       SET state = 'failed',
+           last_error_code = 'attempts_exhausted',
+           shipping_address = NULL,
+           buyer_email = NULL,
+           claimed_by = NULL,
+           claimed_at = NULL,
+           terminal_at = CURRENT_TIMESTAMP,
+           updated_at = CURRENT_TIMESTAMP
+     WHERE state IN (
+           'resolving', 'needs_enrollment', 'quoting', 'awaiting_approval', 'processing'
+       )
+       AND attempts >= :max_attempts
+    RETURNING id
+"""
+
+
+async def expire_overdue_purchases() -> List[str]:
+    """Expire purchases whose hosted approval page has run out; return the ids that moved.
+
+    The clock is the SERVER's, never the caller's — same rule and same reason as the requeue's
+    cutoff. A buyer who never finished on Reap's page leaves a row that would otherwise sit in
+    'awaiting_approval' holding their address and email indefinitely, so this is a PII deadline
+    as much as a state one.
+    """
+    rows = await database.fetch_all(_EXPIRE_OVERDUE_SQL)
+    return [str(r["id"]) for r in rows]
+
+
+async def fail_exhausted_purchases(max_attempts: int) -> List[str]:
+    """Fail non-terminal purchases that have been claimed `max_attempts` times; return the ids.
+
+    `attempts` counts CLAIMS, so this is "the poller has picked this up N times and it is still
+    not finished" — the backstop that stops a permanently-stuck row being leased forever.
+    """
+    if int(max_attempts) < 1:
+        raise ValueError(f"max_attempts must be at least 1 (got {max_attempts})")
+    rows = await database.fetch_all(
+        _FAIL_EXHAUSTED_SQL, {"max_attempts": int(max_attempts)}
+    )
+    return [str(r["id"]) for r in rows]
 
 
 # ── enrollments ──────────────────────────────────────────────────────────────────────────────
@@ -843,13 +1109,28 @@ _INSERT_PENDING_ENROLLMENT_SQL = """
 # partial unique index uq_reap_agentic_enrollments_one_active is the belt to this brace; on an
 # engine or a database where that index is absent, this statement is the only thing holding the
 # invariant.
+#
+# THE SUBSELECT IS GATED ON THE TARGET BEING ACTIVATABLE, and that gate is the fix for a real
+# defect: `mark_enrollment_active(<id of a dead row>)` used to demote the buyer's live
+# enrollment and THEN fail to promote the dead one, leaving the buyer with no active card at all
+# — a worse state than the one they started in, reached by a call that answered None as though
+# nothing had happened. With `AND status IN ('pending', 'active')` inside the subselect, a
+# non-activatable target yields NULL, `buyer_ref = NULL` matches nothing, and the demotion is a
+# no-op. The promotion below then also matches nothing, so the whole call is inert.
+#
+# 'active' is in that list as well as 'pending' so that re-activating the row that is ALREADY
+# active stays idempotent (a redelivered webhook must not be punished); `id <> :id` keeps such a
+# call from demoting its own target.
 _DEMOTE_OTHER_ACTIVE_SQL = """
     UPDATE reap_agentic_enrollments
        SET status = 'dead',
            updated_at = CURRENT_TIMESTAMP
      WHERE status = 'active'
        AND id <> :id
-       AND buyer_ref = (SELECT buyer_ref FROM reap_agentic_enrollments WHERE id = :id)
+       AND buyer_ref = (
+           SELECT buyer_ref FROM reap_agentic_enrollments
+            WHERE id = :id AND status IN ('pending', 'active')
+       )
     RETURNING id
 """
 
@@ -950,28 +1231,45 @@ async def mark_enrollment_active(
 ) -> Optional[Dict[str, Any]]:
     """Promote an enrollment to 'active', demoting any other active row for the same buyer.
 
+    Returns None when the target is not activatable (it is 'dead', or it does not exist) and when
+    another activation for the same buyer won a concurrent race. In BOTH cases nothing changed —
+    in particular the buyer's existing active enrollment is left alone, which is the property the
+    ungated version of this function did not have.
+
     Both statements run in ONE transaction: a demotion that commits without the promotion leaves
     the buyer with no active card, and a promotion that commits without the demotion leaves two —
     which the partial unique index would reject anyway, but only on a database where that index
     exists.
+
+    THE UNIQUE VIOLATION IS CAUGHT OUTSIDE THE `async with`, NOT INSIDE IT. Catching inside would
+    let the transaction COMMIT the demotion it had already done, which is the exact "buyer left
+    with no active card" outcome this function exists to avoid; letting the exception leave the
+    block rolls the demotion back first. Every other lost race in this module answers None, and
+    so does this one — a caller that got a raw driver exception could not tell "you lost" from
+    "the database is broken".
 
     card_last4 is the ONLY digits of the card that may be stored, and card_network the only other
     card attribute. Nothing else from Reap's payload belongs in this table.
     """
     if card_last4 is not None and (len(card_last4) != 4 or not card_last4.isdigit()):
         raise ValueError("card_last4 must be exactly four digits, or None")
-    async with database.transaction():
-        await database.fetch_all(_DEMOTE_OTHER_ACTIVE_SQL, {"id": enrollment_id})
-        row = await database.fetch_one(
-            _ACTIVATE_ENROLLMENT_SQL,
-            {
-                "id": enrollment_id,
-                "reap_enrollment_id": reap_enrollment_id,
-                "reap_status": reap_status,
-                "card_network": card_network,
-                "card_last4": card_last4,
-            },
-        )
+    try:
+        async with database.transaction():
+            await database.fetch_all(_DEMOTE_OTHER_ACTIVE_SQL, {"id": enrollment_id})
+            row = await database.fetch_one(
+                _ACTIVATE_ENROLLMENT_SQL,
+                {
+                    "id": enrollment_id,
+                    "reap_enrollment_id": reap_enrollment_id,
+                    "reap_status": reap_status,
+                    "card_network": card_network,
+                    "card_last4": card_last4,
+                },
+            )
+    except Exception as exc:  # noqa: BLE001 — narrowed immediately below
+        if _is_unique_violation(exc):
+            return None
+        raise
     return _enrollment(row)
 
 
