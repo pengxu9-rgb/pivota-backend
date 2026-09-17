@@ -549,7 +549,7 @@ _EXPECTED_NEVER_PUBLIC = {
     "buyer_ref", "agent_id", "agent_user_ref_hash", "buyer_email", "shipping_address",
     "enrollment_id", "click_id", "return_url", "reap_product_id", "reap_variant_id",
     "reap_quote_id", "reap_checkout_id", "queries_tried", "attempts", "next_poll_at",
-    "claimed_by", "claimed_at",
+    "claimed_by", "claimed_at", "state_entered_at",
 }
 
 
@@ -1029,24 +1029,26 @@ async def test_the_postgres_cutoffs_use_clock_timestamp_not_current_timestamp():
     transactions today (see the next test), so the two are equivalent right now — but a future
     caller that wraps a poll loop in one would FREEZE every cutoff at the moment the transaction
     began, and the sweep would then take everything or nothing. `clock_timestamp()` reads the
-    wall clock at STATEMENT time and cannot be frozen that way."""
-    for name in (
-        "_SELECT_DUE_PURCHASES_SQL",
-        "_REQUEUE_STALE_CLAIMS_SQL",
-        "_EXPIRE_OVERDUE_SQL",
-    ):
-        sql = getattr(ledger, name)
-        assert "clock_timestamp()" in sql, f"{name} must read the statement-time clock"
+    wall clock at STATEMENT time and cannot be frozen that way.
+
+    EVERY Postgres statement is checked, not a hand-picked three — the cutoffs AND the
+    `terminal_at`/`updated_at`/`state_entered_at` stamps, so a freezable clock cannot creep back
+    in anywhere."""
+    checked = 0
+    for name, sql in vars(ledger).items():
+        if not (name.endswith("_SQL") and isinstance(sql, str)):
+            continue
         assert "CURRENT_TIMESTAMP" not in sql, (
-            f"{name} still uses CURRENT_TIMESTAMP, which freezes inside a transaction"
+            f"{name} uses CURRENT_TIMESTAMP, which is TRANSACTION-start time on Postgres and "
+            "freezes inside a caller-supplied transaction"
         )
+        checked += 1
+    assert checked >= 12, f"only inspected {checked} Postgres statements — did the suffix change?"
+
     # SQLite has no clock_timestamp(); CURRENT_TIMESTAMP is statement-time there anyway.
-    for name in (
-        "_SELECT_DUE_PURCHASES_SQL_SQLITE",
-        "_REQUEUE_STALE_CLAIMS_SQL_SQLITE",
-        "_EXPIRE_OVERDUE_SQL_SQLITE",
-    ):
-        assert "clock_timestamp()" not in getattr(ledger, name)
+    for name, sql in vars(ledger).items():
+        if name.endswith("_SQLITE") and isinstance(sql, str):
+            assert "clock_timestamp()" not in sql, f"{name} cannot use clock_timestamp()"
 
 
 async def test_the_module_opens_no_database_transactions():
@@ -1156,7 +1158,9 @@ async def test_the_expire_sweep_never_touches_an_approved_purchase():
     would abandon a payment in flight."""
     purchase = await _mk(state="processing")
     await _set_clock_column(purchase["id"], "hosted_url_expires_at", _PAST)
-    await _set_clock_column(purchase["id"], "updated_at", "datetime('now', '-99999 seconds')")
+    await _set_clock_column(
+        purchase["id"], "state_entered_at", "datetime('now', '-99999 seconds')"
+    )
 
     assert await ledger.expire_overdue_purchases(max_age_seconds=60) == []
     assert await _state_of(purchase["id"]) == "processing"
@@ -1227,7 +1231,7 @@ async def test_fail_exhausted_moves_a_stuck_row_and_scrubs_it():
         "claimed_at = CURRENT_TIMESTAMP WHERE id = :i",
         {"i": purchase["id"]},
     )
-    assert await ledger.fail_exhausted_purchases(5) == [purchase["id"]]
+    assert await ledger.fail_exhausted_purchases(5, include_processing=True) == [purchase["id"]]
 
     row = await ledger.get_purchase_internal(purchase["id"])
     assert row["state"] == "failed"
@@ -1247,7 +1251,7 @@ async def test_fail_exhausted_leaves_rows_under_the_bound_and_terminal_rows_alon
         "UPDATE reap_agentic_purchases SET attempts = 99 WHERE id = :i", {"i": already["id"]}
     )
 
-    assert await ledger.fail_exhausted_purchases(5) == []
+    assert await ledger.fail_exhausted_purchases(5, include_processing=True) == []
     assert (await ledger.get_purchase_internal(already["id"]))["state"] == "completed"
 
 
@@ -1257,7 +1261,8 @@ async def test_fail_exhausted_races_cleanly():
         "UPDATE reap_agentic_purchases SET attempts = 9 WHERE id = :i", {"i": purchase["id"]}
     )
     first, second = await asyncio.gather(
-        ledger.fail_exhausted_purchases(5), ledger.fail_exhausted_purchases(5)
+        ledger.fail_exhausted_purchases(5, include_processing=True),
+        ledger.fail_exhausted_purchases(5, include_processing=True),
     )
     assert len(first) + len(second) == 1
 
@@ -1280,7 +1285,7 @@ async def test_fail_exhausted_takes_a_row_at_EXACTLY_max_attempts():
     await database.execute(
         "UPDATE reap_agentic_purchases SET attempts = 4 WHERE id = :i", {"i": below["id"]}
     )
-    assert await ledger.fail_exhausted_purchases(5) == [at_bound["id"]]
+    assert await ledger.fail_exhausted_purchases(5, include_processing=True) == [at_bound["id"]]
 
 
 # ── P2-1: the sweeps are bounded ─────────────────────────────────────────────────────────────
@@ -1314,9 +1319,9 @@ async def test_fail_exhausted_is_bounded_by_limit():
         )
         ids.append(purchase["id"])
 
-    first = await ledger.fail_exhausted_purchases(5, limit=2)
+    first = await ledger.fail_exhausted_purchases(5, limit=2, include_processing=True)
     assert len(first) == 2
-    rest = await ledger.fail_exhausted_purchases(5, limit=10)
+    rest = await ledger.fail_exhausted_purchases(5, limit=10, include_processing=True)
     assert len(rest) == 3
     assert sorted(first + rest) == sorted(ids)
 
@@ -1342,13 +1347,245 @@ async def test_a_row_with_no_hosted_deadline_is_expired_on_absolute_age(state):
     NULL case is the ordinary one for an abandoned purchase rather than an edge."""
     purchase = await _mk(state=state)
     assert purchase["hosted_url_expires_at"] is None
-    await _set_clock_column(purchase["id"], "updated_at", "datetime('now', '-7200 seconds')")
+    await _set_clock_column(
+        purchase["id"], "state_entered_at", "datetime('now', '-7200 seconds')"
+    )
 
     assert await ledger.expire_overdue_purchases(max_age_seconds=3600) == [purchase["id"]]
     row = await ledger.get_purchase_internal(purchase["id"])
     assert row["state"] == "expired"
     assert row["buyer_email"] is None and row["shipping_address"] is None
     assert row["terminal_at"] is not None
+
+
+# ── ROUND 3 (P1): the expiry clock the poll loop cannot reset ────────────────────────────────
+
+
+@pytest.mark.parametrize("state", ["needs_enrollment", "awaiting_approval"])
+async def test_a_poll_loop_cannot_postpone_the_absolute_expiry(state):
+    """THE P1. The fallback used to measure `updated_at` — which `_CLAIM_PURCHASE_SQL`,
+    `_RELEASE_CLAIM_SQL` and `_REQUEUE_STALE_CLAIMS_SQL` all write. So the poll loop reset the
+    deadline every cycle and at the documented 30-second cadence it NEVER FIRED.
+
+    Reproduced on both dialects: a row aged 99999 s, then ONE claim+release, was not expired and
+    kept the buyer's address and email. These are exactly the rows with no other bound —
+    `attempts` is exempt in both waiting states and 'needs_enrollment' has no hosted URL at all.
+
+    This drives the REAL path: a genuine transition into the state, then real claim / release /
+    requeue calls, then the sweep."""
+    purchase = await _mk()
+    moved = await ledger.transition(
+        purchase["id"],
+        from_states=["resolving"],
+        to_state=("needs_enrollment" if state == "needs_enrollment" else "quoting"),
+    )
+    if state == "awaiting_approval":
+        moved = await ledger.transition(
+            purchase["id"], from_states=["quoting"], to_state="awaiting_approval"
+        )
+    assert moved["state"] == state
+    assert moved["hosted_url_expires_at"] is None
+
+    # The row has now been sitting in this state for a long time.
+    await _set_clock_column(
+        purchase["id"], "state_entered_at", "datetime('now', '-99999 seconds')"
+    )
+    await _set_clock_column(purchase["id"], "next_poll_at", _PAST)
+
+    # Several ordinary poll cycles, plus a dead worker's requeue. Every one of these writes
+    # updated_at; none of them may touch state_entered_at.
+    for _ in range(3):
+        await ledger.claim_due_purchases("worker_a", limit=5)
+        await ledger.release_claim(purchase["id"], "worker_a")
+    await ledger.claim_due_purchases("worker_a", limit=5)
+    await _age_claim(purchase["id"], 99999)
+    await ledger.requeue_stale_claims(lease_seconds=300, limit=10)
+
+    assert await ledger.expire_overdue_purchases(max_age_seconds=60) == [purchase["id"]], (
+        "the absolute deadline must survive a poll loop — it measures state_entered_at, which "
+        "only a state change moves"
+    )
+    row = await ledger.get_purchase_internal(purchase["id"])
+    assert row["state"] == "expired"
+    assert row["buyer_email"] is None and row["shipping_address"] is None
+    assert row["terminal_at"] is not None
+    assert row["claimed_by"] is None and row["claimed_at"] is None
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        "claim",
+        "release",
+        "requeue",
+    ],
+)
+async def test_the_poll_loop_does_not_touch_state_entered_at(call):
+    """The guard stated directly: claim, release and requeue move `updated_at` and must leave
+    `state_entered_at` alone. A mutant that makes any of them stamp it dies here."""
+    purchase = await _mk(state="awaiting_approval")
+    await _set_clock_column(purchase["id"], "next_poll_at", _PAST)
+    before = (await ledger.get_purchase_internal(purchase["id"]))["state_entered_at"]
+
+    if call == "claim":
+        await ledger.claim_due_purchases("worker_a", limit=5)
+    elif call == "release":
+        await ledger.claim_due_purchases("worker_a", limit=5)
+        await ledger.release_claim(purchase["id"], "worker_a")
+    else:
+        await ledger.claim_due_purchases("worker_a", limit=5)
+        await _age_claim(purchase["id"], 99999)
+        await ledger.requeue_stale_claims(lease_seconds=300, limit=10)
+
+    after = await ledger.get_purchase_internal(purchase["id"])
+    assert after["state_entered_at"] == before, f"{call} moved state_entered_at"
+    assert after["updated_at"] >= before, f"{call} should still move updated_at"
+
+
+async def test_a_transition_into_a_new_state_resets_state_entered_at():
+    """The other half: the clock is per-STATE, not per-row. A purchase that legitimately spent an
+    hour resolving and re-quoting must get a fresh deadline the moment it reaches
+    'awaiting_approval' — that is the moment the buyer starts looking at the page.
+
+    This is why the column is not `created_at`."""
+    purchase = await _mk()
+    await _set_clock_column(
+        purchase["id"], "state_entered_at", "datetime('now', '-99999 seconds')"
+    )
+    old = (await ledger.get_purchase_internal(purchase["id"]))["state_entered_at"]
+
+    moved = await ledger.transition(
+        purchase["id"], from_states=["resolving"], to_state="quoting"
+    )
+    assert moved["state_entered_at"] > old, "entering a state must restart its clock"
+
+    # And an old creation date alone does not expire a freshly-arrived row.
+    await ledger.transition(
+        purchase["id"], from_states=["quoting"], to_state="awaiting_approval"
+    )
+    await _set_clock_column(purchase["id"], "created_at", "datetime('now', '-99999 seconds')")
+    assert await ledger.expire_overdue_purchases(max_age_seconds=60) == []
+    assert await _state_of(purchase["id"]) == "awaiting_approval"
+
+
+async def test_the_expire_fallback_reads_state_entered_at_not_updated_at():
+    """A shape assertion naming the specific defect, so an edit that switches the column back is
+    refused here rather than in production three weeks later."""
+    for name in ("_EXPIRE_OVERDUE_SQL", "_EXPIRE_OVERDUE_SQL_SQLITE"):
+        sql = getattr(ledger, name)
+        assert "OR state_entered_at <" in sql, f"{name}: the fallback must read state_entered_at"
+        assert "OR updated_at <" not in sql, (
+            f"{name}: measuring updated_at makes the deadline resettable by the poll loop"
+        )
+
+
+async def test_only_state_changing_statements_stamp_state_entered_at():
+    """`state_entered_at` may be written by exactly three kinds of statement — the transition and
+    the two sweeps — and by no other."""
+    stamps = {
+        name: value.count("state_entered_at =")
+        for name, value in vars(ledger).items()
+        if name.endswith(("_SQL", "_SQLITE")) and isinstance(value, str)
+    }
+    writers = {name for name, count in stamps.items() if count}
+    assert writers == {
+        "_TRANSITION_SQL", "_TRANSITION_SQL_SQLITE",
+        "_EXPIRE_OVERDUE_SQL", "_EXPIRE_OVERDUE_SQL_SQLITE",
+        "_FAIL_EXHAUSTED_SQL", "_FAIL_EXHAUSTED_SQL_SQLITE",
+    }, f"unexpected writers of state_entered_at: {sorted(writers)}"
+
+
+async def test_state_entered_at_is_never_public():
+    purchase = await _mk()
+    view = await ledger.get_purchase_for_owner(purchase["id"], "agent_one", "hash_alice")
+    assert "state_entered_at" not in view
+    assert "state_entered_at" not in ledger.PUBLIC_PURCHASE_COLUMNS
+
+
+# ── ROUND 3: 'processing' is not auto-failable ───────────────────────────────────────────────
+
+
+async def test_fail_exhausted_skips_processing_unless_asked():
+    """A purchase in 'processing' has been APPROVED BY THE BUYER and its payment is in flight.
+    Auto-failing it on an attempt counter writes a terminal state over a charge whose outcome we
+    do not know — our ledger saying 'failed' while the buyer's card says otherwise."""
+    processing = await _mk(state="processing")
+    quoting = await _mk(state="quoting", buyer_ref="bref_q")
+    for row_id in (processing["id"], quoting["id"]):
+        await database.execute(
+            "UPDATE reap_agentic_purchases SET attempts = 9 WHERE id = :i", {"i": row_id}
+        )
+
+    assert await ledger.fail_exhausted_purchases(5) == [quoting["id"]]
+    assert await _state_of(processing["id"]) == "processing"
+
+    assert await ledger.fail_exhausted_purchases(5, include_processing=True) == [
+        processing["id"]
+    ]
+    assert await _state_of(processing["id"]) == "failed"
+
+
+# ── ROUND 3 (P3): bounds are bounds, not things to coerce ────────────────────────────────────
+
+
+@pytest.mark.parametrize("bad", [True, False, 2.9, "5", None, b"5"])
+async def test_sweep_bounds_refuse_non_integers(bad):
+    """`int()` reads True as 1, 2.9 as 2 and "5" as 5. Each of these parameters is a bound an
+    operator chose, and silently reinterpreting one turns a typo into a setting nobody can see.
+    Measured before this: `expire_overdue_purchases(limit=True)` ran."""
+    with pytest.raises(ValueError):
+        await ledger.expire_overdue_purchases(limit=bad)
+    with pytest.raises(ValueError):
+        await ledger.expire_overdue_purchases(max_age_seconds=bad)
+    with pytest.raises(ValueError):
+        await ledger.fail_exhausted_purchases(bad)
+    with pytest.raises(ValueError):
+        await ledger.fail_exhausted_purchases(5, limit=bad)
+    with pytest.raises(ValueError):
+        await ledger.requeue_stale_claims(lease_seconds=bad)
+    with pytest.raises(ValueError):
+        await ledger.requeue_stale_claims(limit=bad)
+
+
+@pytest.mark.parametrize("bad", [b"worker", 7, "", "   ", object()])
+async def test_worker_ids_and_holders_must_be_non_empty_strings(bad):
+    """`b"w"` sailed through `(value or "").strip()` and was STORED as the claim holder on
+    SQLite, while asyncpg raised a DataError naming a parameter index. Two wrong answers for one
+    typo, neither of them saying "worker id".
+
+    `None` is deliberately absent: it is the LEGAL unfenced value for `holder`, and its own test
+    is below."""
+    purchase = await _mk()
+    with pytest.raises(ValueError):
+        await ledger.transition(
+            purchase["id"], from_states=["resolving"], to_state="quoting", holder=bad
+        )
+    with pytest.raises(ValueError):
+        await ledger.transition_as_holder(
+            purchase["id"], bad, from_states=["resolving"], to_state="quoting"
+        )
+    with pytest.raises(ValueError):
+        await ledger.claim_due_purchases(bad, limit=5)
+    with pytest.raises(ValueError):
+        await ledger.release_claim(purchase["id"], bad)
+
+
+async def test_none_is_a_worker_id_nowhere_but_a_valid_unfenced_holder():
+    """The control for the strictness above — `holder=None` must stay the unfenced path, and a
+    worker id of None must still be refused."""
+    purchase = await _mk()
+    assert await ledger.transition(
+        purchase["id"], from_states=["resolving"], to_state="quoting", holder=None
+    ) is not None
+    for call in (
+        lambda: ledger.transition_as_holder(
+            purchase["id"], None, from_states=["quoting"], to_state="awaiting_approval"
+        ),
+        lambda: ledger.claim_due_purchases(None, limit=5),
+        lambda: ledger.release_claim(purchase["id"], None),
+    ):
+        with pytest.raises(ValueError):
+            await call()
 
 
 async def test_a_young_row_with_no_hosted_deadline_is_left_alone():
@@ -1511,10 +1748,14 @@ async def test_a_real_unique_violation_through_mark_enrollment_active_returns_no
     """P2-5. The catch used to be asserted in PROSE only, and the unit-level check fed
     `_is_unique_violation` a synthetic exception — which proves the predicate, not the path.
 
-    This drives a REAL sqlite3.IntegrityError out of statement (b). To get there the demotion has
-    to be prevented from clearing the way, so statement (a) is neutered for the duration: that is
-    precisely the seam under test — "(b) hit the index, what does the caller see?" — and with (a)
-    doing its job the situation is unreachable by construction, which is the point of (a)."""
+    This drives a REAL sqlite3.IntegrityError out of statement (b), twice.
+
+    With (b) now running FIRST, the violation happens on its own — the buyer already has a live
+    active row. The module then demotes and retries, and the retry SUCCEEDS, which is the ordinary
+    re-enrolment path. To hold the failure open long enough to observe the caller's answer, the
+    demotion is neutered for the duration, so the retry hits the index too. That is exactly the
+    seam under test: "(b) raised, and raised again — what does the caller see?" The answer must be
+    None, never a driver exception."""
     live = await ledger.upsert_pending_enrollment(buyer_ref="bref_clash")
     await ledger.mark_enrollment_active(live["id"], reap_enrollment_id="enr_live")
     await database.execute(
@@ -1522,15 +1763,17 @@ async def test_a_real_unique_violation_through_mark_enrollment_active_returns_no
         "VALUES ('re_clash', 'bref_clash', 'pending')"
     )
 
-    original = ledger._DEMOTE_OTHER_ACTIVE_SQL
-    ledger._DEMOTE_OTHER_ACTIVE_SQL = (
+    inert = (
         "UPDATE reap_agentic_enrollments SET status = status "
         "WHERE id = :id AND 1 = 0 RETURNING id"
     )
+    original = (ledger._DEMOTE_OTHER_ACTIVE_SQL, ledger._DEMOTE_OTHER_ACTIVE_SQL_SQLITE)
+    ledger._DEMOTE_OTHER_ACTIVE_SQL = inert
+    ledger._DEMOTE_OTHER_ACTIVE_SQL_SQLITE = inert
     try:
         result = await ledger.mark_enrollment_active("re_clash", reap_enrollment_id="enr_clash")
     finally:
-        ledger._DEMOTE_OTHER_ACTIVE_SQL = original
+        ledger._DEMOTE_OTHER_ACTIVE_SQL, ledger._DEMOTE_OTHER_ACTIVE_SQL_SQLITE = original
 
     assert result is None, (
         "a unique violation out of statement (b) must surface as None, like every other lost "
@@ -1541,6 +1784,126 @@ async def test_a_real_unique_violation_through_mark_enrollment_active_returns_no
         "SELECT status FROM reap_agentic_enrollments WHERE id = 're_clash'"
     )
     assert still["status"] == "pending", "the loser stays retryable, never half-written"
+
+
+class _KillTargetAfterFirstStatement:
+    """A `database` stand-in that marks `target` dead immediately after the FIRST statement
+    `mark_enrollment_active` issues, whichever statement that is, then delegates everything else.
+
+    This is the only way to drive the reviewer's interleaving deterministically: the two
+    statements are issued back-to-back inside the function, so the concurrent
+    `mark_enrollment_dead(target)` has to be injected between them rather than raced.
+    """
+
+    def __init__(self, real, target):
+        self._real = real
+        self._target = target
+        self._fired = False
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    async def _kill_once(self):
+        if self._fired:
+            return
+        self._fired = True
+        await self._real.execute(
+            "UPDATE reap_agentic_enrollments SET status = 'dead' WHERE id = :i",
+            {"i": self._target},
+        )
+
+    async def fetch_one(self, sql, values=None):
+        try:
+            return await self._real.fetch_one(sql, values)
+        finally:
+            await self._kill_once()
+
+    async def fetch_all(self, sql, values=None):
+        try:
+            return await self._real.fetch_all(sql, values)
+        finally:
+            await self._kill_once()
+
+
+async def test_a_concurrent_dead_between_the_two_statements_cannot_strand_the_buyer():
+    """ROUND 3, P2 — THE ORDERING, PROVEN BY INTERLEAVING.
+
+    With (a) DEMOTE first: the demotion sees a still-pending target, passes its gate and kills
+    the buyer's live enrollment; the concurrent `mark_enrollment_dead(target)` then lands; (b)
+    finds nothing to activate. The buyer ends with ZERO active enrollments and no retry can heal
+    it, because the target is now permanently unactivatable. Reviewer-verified, and reproduced
+    here before the reorder.
+
+    With (b) ACTIVATE first: (b) raises the unique violation (the live row holds the index), the
+    kill lands, and the demotion's gate now sees a DEAD target and demotes nothing. The retry of
+    (b) returns None, and the live enrollment is untouched.
+
+    Both orders pass every single-call test, because the demotion's gate already covers a target
+    that was dead BEFORE the call. Only this interleaving separates them — which is exactly why
+    the pure-reorder mutant survived the suite until this test existed.
+    """
+    live = await ledger.upsert_pending_enrollment(buyer_ref="bref_interleave")
+    await ledger.mark_enrollment_active(live["id"], reap_enrollment_id="enr_live")
+    await database.execute(
+        "INSERT INTO reap_agentic_enrollments (id, buyer_ref, status) "
+        "VALUES ('re_target', 'bref_interleave', 'pending')"
+    )
+
+    original = ledger.database
+    ledger.database = _KillTargetAfterFirstStatement(original, "re_target")
+    try:
+        result = await ledger.mark_enrollment_active(
+            "re_target", reap_enrollment_id="enr_target"
+        )
+    finally:
+        ledger.database = original
+
+    assert result is None, "the target died mid-flight, so nothing could be activated"
+
+    still = await ledger.get_active_enrollment("bref_interleave")
+    assert still is not None and still["id"] == live["id"], (
+        "the buyer's live enrollment must survive: the demotion may not run on behalf of a "
+        "promotion that cannot happen. Demoting FIRST is what strands the buyer here."
+    )
+    statuses = {
+        r["id"]: r["status"]
+        for r in await database.fetch_all(
+            "SELECT id, status FROM reap_agentic_enrollments WHERE buyer_ref = :b",
+            {"b": "bref_interleave"},
+        )
+    }
+    assert statuses == {live["id"]: "active", "re_target": "dead"}, statuses
+
+
+async def test_the_demotion_statement_never_demotes_its_own_target():
+    """`AND id <> :id` in statement (a), exercised DIRECTLY.
+
+    Since the reorder it is no longer reachable through `mark_enrollment_active`: (a) runs only
+    after (b) raised a unique violation, which can only happen when the target is 'pending' and
+    some OTHER row holds the active slot — so the target is never a demotion candidate anyway.
+    That made the conjunct un-killable through the public function, which is precisely the state
+    the repo calls out: an unreachable guard reads as protection that does not exist.
+
+    It is kept rather than deleted because it is the only thing that would stop a future
+    reordering from having the demotion eat the row it is about to promote, and it is tested at
+    the statement level so that "kept" means "checked". Without it this demotes the target and
+    the buyer ends up with nothing."""
+    live = await ledger.upsert_pending_enrollment(buyer_ref="bref_self")
+    await ledger.mark_enrollment_active(live["id"], reap_enrollment_id="enr_live")
+
+    sql = (
+        ledger._DEMOTE_OTHER_ACTIVE_SQL
+        if IS_POSTGRES
+        else ledger._DEMOTE_OTHER_ACTIVE_SQL_SQLITE
+    )
+    demoted = await database.fetch_all(sql, {"id": live["id"]})
+
+    assert demoted == [], (
+        "the demotion must never name its own target: with `id <> :id` gone it demotes the row "
+        "it was asked to promote"
+    )
+    still = await ledger.get_active_enrollment("bref_self")
+    assert still is not None and still["id"] == live["id"]
 
 
 async def test_activation_is_idempotent_across_a_retry_of_the_same_target():

@@ -230,6 +230,7 @@ _TRANSITION_FIELDS: Sequence[str] = (
 _JSON_COLUMNS = ("queries_tried", "shipping_address")
 
 _PURCHASE_TS_COLUMNS = (
+    "state_entered_at",
     "reap_quote_expires_at",
     "hosted_url_expires_at",
     "claimed_at",
@@ -455,7 +456,7 @@ _INSERT_PURCHASE_SQL = """
         :id, :buyer_ref, :agent_id, :agent_user_ref_hash, :enrollment_id, :state,
         :merchant_domain, :product_key, :variant_key, :product_name, :variant_title,
         :brand, :category, :quantity, :currency, :our_price_minor, :click_id, :return_url,
-        CAST(:queries_tried AS JSONB), COALESCE(:next_poll_at, CURRENT_TIMESTAMP),
+        CAST(:queries_tried AS JSONB), COALESCE(:next_poll_at, clock_timestamp()),
         CAST(:shipping_address AS JSONB),
         :buyer_email
     )
@@ -746,8 +747,9 @@ _TRANSITION_SQL = """
            claimed_at = CASE WHEN :to_state_probe IN ('completed', 'failed', 'refused', 'expired')
                 THEN NULL ELSE claimed_at END,
            terminal_at = CASE WHEN :to_state_probe IN ('completed', 'failed', 'refused', 'expired')
-                THEN CURRENT_TIMESTAMP ELSE terminal_at END,
-           updated_at = CURRENT_TIMESTAMP
+                THEN clock_timestamp() ELSE terminal_at END,
+           state_entered_at = clock_timestamp(),
+           updated_at = clock_timestamp()
      WHERE id = :id
        AND state IN (:from_0, :from_1, :from_2, :from_3, :from_4, :from_5, :from_6, :from_7, :from_8)
        AND (:holder_unfenced = 1 OR claimed_by = :holder)
@@ -796,6 +798,7 @@ _TRANSITION_SQL_SQLITE = """
                 THEN NULL ELSE claimed_at END,
            terminal_at = CASE WHEN :to_state_probe IN ('completed', 'failed', 'refused', 'expired')
                 THEN CURRENT_TIMESTAMP ELSE terminal_at END,
+           state_entered_at = CURRENT_TIMESTAMP,
            updated_at = CURRENT_TIMESTAMP
      WHERE id = :id
        AND state IN (:from_0, :from_1, :from_2, :from_3, :from_4, :from_5, :from_6, :from_7, :from_8)
@@ -871,8 +874,8 @@ async def transition(
     if unknown:
         raise TypeError(f"transition() got unexpected field(s): {', '.join(sorted(unknown))}")
 
-    if holder is not None and not holder.strip():
-        raise ValueError("holder must be a non-empty worker id, or None for an unfenced call")
+    if holder is not None:
+        _require_worker_id(holder, "holder")
 
     values: Dict[str, Any] = {
         "id": purchase_id,
@@ -916,9 +919,14 @@ async def transition_as_holder(
     Returns None when the lease has moved on — the worker stalled, its claim was requeued, and
     somebody else owns the row now. That is a lost race like any other: re-read and reconsider,
     do not retry blindly.
+
+    NONE ALSO MEANS "A SWEEP GOT THERE FIRST". `expire_overdue_purchases` and
+    `fail_exhausted_purchases` are UNFENCED bulk terminal writes: they take no holder, they can
+    terminate a purchase this worker currently holds, and they clear the claim when they do. The
+    worker finds out here, by getting None. So None is never a reason to retry the same write —
+    it is always a reason to re-read the row and decide again.
     """
-    if not (worker_id or "").strip():
-        raise ValueError("worker_id is required — that is the whole point of this function")
+    _require_worker_id(worker_id, "worker_id")
     return await transition(
         purchase_id,
         from_states=from_states,
@@ -1024,12 +1032,33 @@ _RELEASE_CLAIM_SQL = """
        SET claimed_by = NULL,
            claimed_at = NULL,
            next_poll_at = COALESCE(:next_poll_at, next_poll_at),
+           updated_at = clock_timestamp()
+     WHERE id = :id
+       AND claimed_by = :worker_id
+    RETURNING *
+"""
+
+_RELEASE_CLAIM_SQL_SQLITE = """
+    UPDATE reap_agentic_purchases
+       SET claimed_by = NULL,
+           claimed_at = NULL,
+           next_poll_at = COALESCE(:next_poll_at, next_poll_at),
            updated_at = CURRENT_TIMESTAMP
      WHERE id = :id
        AND claimed_by = :worker_id
     RETURNING *
 """
 
+# `claimed_at < cutoff` RATHER THAN `<=`, AND THAT CHOICE IS NOT TESTED. A mutation to `<=` frees
+# a lease at most one tick early on a lease of at least thirty seconds, and the only way to
+# observe the difference is to land exactly on the boundary — which needs control of the server
+# clock finer than either engine offers here (on SQLite the column is second-resolution text, so
+# ties are possible but arrive only when the wall clock happens to cross a second mid-run). It is
+# left untested deliberately: a test that could see it would be a test that fails on timing, and
+# the properties that matter — a fresh lease survives, a long-expired one does not — are covered.
+# Stated here rather than called "equivalent", which it is not: it is a difference too small to
+# be worth a flaky test.
+#
 # THE CUTOFF IS COMPUTED BY THE SERVER. `clock_timestamp() - interval` binds no datetime at all,
 # so it is correct whatever the client process's timezone is and whatever the column's
 # declaration turned out to be — see property 4. A Python-bound cutoff was measured seven hours
@@ -1108,9 +1137,8 @@ async def claim_due_purchases(worker_id: str, *, limit: int = 10) -> List[Dict[s
     `attempts` is incremented only outside 'awaiting_approval' and 'needs_enrollment'; see the
     note on `_CLAIM_PURCHASE_SQL` for why waiting on a human is not a failed attempt.
     """
-    if not (worker_id or "").strip():
-        raise ValueError("worker_id is required — an anonymous claim cannot be requeued")
-    capped = max(1, min(500, int(limit)))
+    _require_worker_id(worker_id, "worker_id")
+    capped = _sweep_limit(limit)
     if IS_POSTGRES:
         candidates = await database.fetch_all(_SELECT_DUE_PURCHASES_SQL, {"limit": capped})
     else:
@@ -1138,18 +1166,15 @@ async def release_claim(
 ) -> Optional[Dict[str, Any]]:
     """Give the lease back, optionally scheduling the next poll. None when this worker no longer
     holds the claim — the same fence, and the same answer, as a fenced `transition`."""
-    if not (worker_id or "").strip():
-        raise ValueError("worker_id is required — an unfenced release would clear anyone's claim")
-    return _purchase(
-        await database.fetch_one(
-            _RELEASE_CLAIM_SQL,
-            {
-                "id": purchase_id,
-                "worker_id": worker_id,
-                "next_poll_at": _bind_dt(next_poll_at),
-            },
-        )
-    )
+    _require_worker_id(worker_id, "worker_id")
+    values = {
+        "id": purchase_id,
+        "worker_id": worker_id,
+        "next_poll_at": _bind_dt(next_poll_at),
+    }
+    if IS_POSTGRES:
+        return _purchase(await database.fetch_one(_RELEASE_CLAIM_SQL, values))
+    return _purchase(await database.fetch_one(_RELEASE_CLAIM_SQL_SQLITE, values))
 
 
 async def requeue_stale_claims(*, lease_seconds: int = 300, limit: int = 50) -> int:
@@ -1162,13 +1187,8 @@ async def requeue_stale_claims(*, lease_seconds: int = 300, limit: int = 50) -> 
     `max(30, lease_seconds)`: a caller asking for a 5-second lease got 30 and no indication, which
     is the shape where an operator tunes a number and watches nothing change.
     """
-    if int(lease_seconds) < 30:
-        raise ValueError(
-            f"lease_seconds must be at least 30 (got {lease_seconds}); a shorter lease requeues "
-            "work a live worker is still doing"
-        )
-    seconds = int(lease_seconds)
-    capped = max(1, min(500, int(limit)))
+    seconds = _require_int(lease_seconds, "lease_seconds", minimum=30)
+    capped = _sweep_limit(limit)
     if IS_POSTGRES:
         rows = await database.fetch_all(
             _REQUEUE_STALE_CLAIMS_SQL, {"lease_seconds": seconds, "limit": capped}
@@ -1232,6 +1252,7 @@ _EXPIRE_OVERDUE_SQL = """
            claimed_at = NULL,
            last_error_code = COALESCE(last_error_code, 'hosted_url_expired'),
            terminal_at = clock_timestamp(),
+           state_entered_at = clock_timestamp(),
            updated_at = clock_timestamp()
      WHERE state IN ('needs_enrollment', 'awaiting_approval')
        AND id IN (
@@ -1240,9 +1261,9 @@ _EXPIRE_OVERDUE_SQL = """
            AND (
                 (hosted_url_expires_at IS NOT NULL
                  AND hosted_url_expires_at < clock_timestamp())
-                OR updated_at < clock_timestamp() - (:max_age_seconds * INTERVAL '1 second')
+                OR state_entered_at < clock_timestamp() - (:max_age_seconds * INTERVAL '1 second')
            )
-         ORDER BY updated_at ASC, id ASC
+         ORDER BY state_entered_at ASC, id ASC
          LIMIT :limit
      )
     RETURNING id
@@ -1257,6 +1278,7 @@ _EXPIRE_OVERDUE_SQL_SQLITE = """
            claimed_at = NULL,
            last_error_code = COALESCE(last_error_code, 'hosted_url_expired'),
            terminal_at = CURRENT_TIMESTAMP,
+           state_entered_at = CURRENT_TIMESTAMP,
            updated_at = CURRENT_TIMESTAMP
      WHERE state IN ('needs_enrollment', 'awaiting_approval')
        AND id IN (
@@ -1265,9 +1287,9 @@ _EXPIRE_OVERDUE_SQL_SQLITE = """
            AND (
                 (hosted_url_expires_at IS NOT NULL
                  AND hosted_url_expires_at < CURRENT_TIMESTAMP)
-                OR updated_at < datetime('now', :max_age_window)
+                OR state_entered_at < datetime('now', :max_age_window)
            )
-         ORDER BY updated_at ASC, id ASC
+         ORDER BY state_entered_at ASC, id ASC
          LIMIT :limit
      )
     RETURNING id
@@ -1282,16 +1304,19 @@ _FAIL_EXHAUSTED_SQL = """
            claimed_by = NULL,
            claimed_at = NULL,
            terminal_at = clock_timestamp(),
+           state_entered_at = clock_timestamp(),
            updated_at = clock_timestamp()
      WHERE state IN (
            'resolving', 'needs_enrollment', 'quoting', 'awaiting_approval', 'processing'
        )
+       AND (:include_processing = 1 OR state <> 'processing')
        AND attempts >= :max_attempts
        AND id IN (
         SELECT id FROM reap_agentic_purchases
          WHERE state IN (
                'resolving', 'needs_enrollment', 'quoting', 'awaiting_approval', 'processing'
            )
+           AND (:include_processing = 1 OR state <> 'processing')
            AND attempts >= :max_attempts
          ORDER BY attempts DESC, id ASC
          LIMIT :limit
@@ -1308,16 +1333,19 @@ _FAIL_EXHAUSTED_SQL_SQLITE = """
            claimed_by = NULL,
            claimed_at = NULL,
            terminal_at = CURRENT_TIMESTAMP,
+           state_entered_at = CURRENT_TIMESTAMP,
            updated_at = CURRENT_TIMESTAMP
      WHERE state IN (
            'resolving', 'needs_enrollment', 'quoting', 'awaiting_approval', 'processing'
        )
+       AND (:include_processing = 1 OR state <> 'processing')
        AND attempts >= :max_attempts
        AND id IN (
         SELECT id FROM reap_agentic_purchases
          WHERE state IN (
                'resolving', 'needs_enrollment', 'quoting', 'awaiting_approval', 'processing'
            )
+           AND (:include_processing = 1 OR state <> 'processing')
            AND attempts >= :max_attempts
          ORDER BY attempts DESC, id ASC
          LIMIT :limit
@@ -1330,11 +1358,44 @@ _EXPIRE_SOURCE_STATES = _states_in(_EXPIRE_OVERDUE_SQL, "WHERE state IN (")
 _FAIL_EXHAUSTED_SOURCE_STATES = _states_in(_FAIL_EXHAUSTED_SQL, "WHERE state IN (")
 
 
-def _sweep_limit(limit: int) -> int:
-    value = int(limit)
-    if not (1 <= value <= 500):
-        raise ValueError(f"limit must be between 1 and 500 (got {limit})")
+def _require_int(value: Any, name: str, *, minimum: int, maximum: Optional[int] = None) -> int:
+    """A STRICT integer bound. No `int()` coercion, and `bool` is not an integer here.
+
+    `int()` is quietly generous in ways that matter for these particular parameters: `int(True)`
+    is 1, `int(2.9)` is 2, `int("5")` is 5. Every one of these parameters expresses a bound an
+    operator chose — a lease length, an age deadline, an attempt ceiling, a batch size — and
+    silently reading `limit=2.9` as 2 or `limit=True` as 1 turns a typo into a production setting
+    nobody can see. Measured before this: `expire_overdue_purchases(limit=True)` ran happily, and
+    so did `limit=2.9` and `fail_exhausted_purchases("5")`.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(
+            f"{name} must be an int (got {type(value).__name__} {value!r}); this is a bound, "
+            "not something to coerce"
+        )
+    if value < minimum or (maximum is not None and value > maximum):
+        upper = f" and at most {maximum}" if maximum is not None else ""
+        raise ValueError(f"{name} must be at least {minimum}{upper} (got {value})")
     return value
+
+
+def _require_worker_id(value: Any, name: str) -> str:
+    """A worker id must be a non-empty STRING.
+
+    `bytes` is refused here rather than at the driver: on SQLite `b"w"` sailed straight through
+    `(value or "").strip()` and was STORED as the claim holder, while asyncpg raised a DataError
+    naming a parameter index. Two different wrong answers for one typo, neither of them saying
+    "worker id".
+    """
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a str (got {type(value).__name__} {value!r})")
+    if not value.strip():
+        raise ValueError(f"{name} must not be blank")
+    return value
+
+
+def _sweep_limit(limit: Any) -> int:
+    return _require_int(limit, "limit", minimum=1, maximum=500)
 
 
 async def expire_overdue_purchases(
@@ -1343,22 +1404,31 @@ async def expire_overdue_purchases(
     """Expire purchases waiting on a buyer who never came back; return the ids that moved.
 
     Two clocks, both the SERVER's: Reap's `hosted_url_expires_at` when we have one, and an
-    absolute `updated_at + max_age_seconds` fallback for the rows where we do not. The fallback
-    is what makes this a PII deadline rather than a best-effort one — a row in 'awaiting_approval'
-    with no hosted-page expiry was previously expired by nothing at all and kept the buyer's
-    address and email indefinitely.
+    absolute `state_entered_at + max_age_seconds` fallback for the rows where we do not. The
+    fallback is what makes this a PII deadline rather than a best-effort one — a row in
+    'awaiting_approval' with no hosted-page expiry was previously expired by nothing at all and
+    kept the buyer's address and email indefinitely.
+
+    THE FALLBACK MEASURES `state_entered_at`, NOT `updated_at`, AND THAT DISTINCTION IS THE WHOLE
+    GUARD. `updated_at` is written by every claim, every release and every requeue, so a deadline
+    measured from it is reset by the poll loop itself and NEVER FIRES at any realistic cadence.
+    Measured: a row aged 99999 seconds, then ONE ordinary claim+release, was not expired and kept
+    the buyer's address and email. These are precisely the rows with no other bound — `attempts`
+    is exempt in both waiting states, and 'needs_enrollment' has no hosted URL of its own at all.
+    `state_entered_at` moves only when the STATE moves, which is a clock the poller cannot reset.
 
     BOUNDED. At most `limit` rows per call; loop until fewer than `limit` come back. An unbounded
     UPDATE on first arming locks every qualifying row at once, on a Postgres that prod and
     staging share.
+
+    UNFENCED, AND THE POLLER MUST KNOW IT. This is a bulk terminal write that takes no `holder`,
+    so it can terminate a purchase a live worker currently holds the lease on. That is deliberate
+    — a worker holding a lease on an abandoned purchase must not be able to keep it alive — and
+    it is safe because the worker's next write goes through the fence and gets None back. The
+    poller must treat None from `transition_as_holder` as "re-read", never as "retry harder".
     """
-    if int(max_age_seconds) < 60:
-        raise ValueError(
-            f"max_age_seconds must be at least 60 (got {max_age_seconds}); a shorter deadline "
-            "expires purchases a buyer is still looking at"
-        )
+    seconds = _require_int(max_age_seconds, "max_age_seconds", minimum=60)
     capped = _sweep_limit(limit)
-    seconds = int(max_age_seconds)
     if IS_POSTGRES:
         rows = await database.fetch_all(
             _EXPIRE_OVERDUE_SQL, {"max_age_seconds": seconds, "limit": capped}
@@ -1371,7 +1441,9 @@ async def expire_overdue_purchases(
     return [str(r["id"]) for r in rows]
 
 
-async def fail_exhausted_purchases(max_attempts: int, *, limit: int = 200) -> List[str]:
+async def fail_exhausted_purchases(
+    max_attempts: int, *, limit: int = 200, include_processing: bool = False
+) -> List[str]:
     """Fail non-terminal purchases claimed `max_attempts` times or more; return the ids.
 
     `attempts` COUNTS CLAIMS, NOT RETRIES, and only in the states where a claim means work was
@@ -1382,12 +1454,26 @@ async def fail_exhausted_purchases(max_attempts: int, *, limit: int = 200) -> Li
     a person. Choose `max_attempts` against how many times you expect to RETRY, not against poll
     cadence.
 
+    'processing' IS SKIPPED UNLESS YOU ASK FOR IT. A purchase in 'processing' has been APPROVED
+    BY THE BUYER and its payment is in flight with Reap. Auto-failing that on an attempt counter
+    would write a terminal state over a charge we do not know the outcome of — our ledger saying
+    'failed' while the buyer's card says otherwise. `include_processing=True` exists because the
+    poller package will eventually need a deliberate answer for a payment stuck in flight; that
+    answer belongs to whoever can also reconcile it with Reap, not to a counter in a sweep.
+
     BOUNDED, for the same reason as the expire sweep.
+
+    UNFENCED, like the expire sweep: it takes no `holder` and can terminate a purchase a live
+    worker holds. The worker's next write then returns None through the fence, which the poller
+    must read as "re-read", never as "retry harder".
     """
-    if int(max_attempts) < 1:
-        raise ValueError(f"max_attempts must be at least 1 (got {max_attempts})")
+    attempts_bound = _require_int(max_attempts, "max_attempts", minimum=1)
     capped = _sweep_limit(limit)
-    params = {"max_attempts": int(max_attempts), "limit": capped}
+    params = {
+        "max_attempts": attempts_bound,
+        "limit": capped,
+        "include_processing": 1 if include_processing else 0,
+    }
     if IS_POSTGRES:
         rows = await database.fetch_all(_FAIL_EXHAUSTED_SQL, params)
     else:
@@ -1411,6 +1497,19 @@ _UPDATE_PENDING_ENROLLMENT_SQL = """
            reap_status = COALESCE(:reap_status, reap_status),
            hosted_url = COALESCE(:hosted_url, hosted_url),
            hosted_url_expires_at = COALESCE(:hosted_url_expires_at, hosted_url_expires_at),
+           updated_at = clock_timestamp()
+     WHERE id = :id
+       AND status = 'pending'
+    RETURNING *
+"""
+
+_UPDATE_PENDING_ENROLLMENT_SQL_SQLITE = """
+    UPDATE reap_agentic_enrollments
+       SET agent_id = COALESCE(:agent_id, agent_id),
+           reap_enrollment_id = COALESCE(:reap_enrollment_id, reap_enrollment_id),
+           reap_status = COALESCE(:reap_status, reap_status),
+           hosted_url = COALESCE(:hosted_url, hosted_url),
+           hosted_url_expires_at = COALESCE(:hosted_url_expires_at, hosted_url_expires_at),
            updated_at = CURRENT_TIMESTAMP
      WHERE id = :id
        AND status = 'pending'
@@ -1428,8 +1527,10 @@ _INSERT_PENDING_ENROLLMENT_SQL = """
     RETURNING *
 """
 
-# THE DEMOTION. Every OTHER active row for this buyer goes 'dead' in the same transaction that
-# promotes this one. Without it a buyer who re-enrols has two active cards and "which card did
+# THE DEMOTION — statement (a). Every OTHER active row for this buyer goes 'dead'. NOT in a
+# transaction (see `mark_enrollment_active` for why this module cannot hold one on this driver),
+# and NOT before the promotion: it runs only once the unique index has proved the target is
+# activatable. Without it a buyer who re-enrols has two active cards and "which card did
 # this buyer authorize?" has no answer — the purchase path would pick one arbitrarily. The
 # partial unique index uq_reap_agentic_enrollments_one_active is the belt to this brace; on an
 # engine or a database where that index is absent, this statement is the only thing holding the
@@ -1447,6 +1548,19 @@ _INSERT_PENDING_ENROLLMENT_SQL = """
 # active stays idempotent (a redelivered webhook must not be punished); `id <> :id` keeps such a
 # call from demoting its own target.
 _DEMOTE_OTHER_ACTIVE_SQL = """
+    UPDATE reap_agentic_enrollments
+       SET status = 'dead',
+           updated_at = clock_timestamp()
+     WHERE status = 'active'
+       AND id <> :id
+       AND buyer_ref = (
+           SELECT buyer_ref FROM reap_agentic_enrollments
+            WHERE id = :id AND status IN ('pending', 'active')
+       )
+    RETURNING id
+"""
+
+_DEMOTE_OTHER_ACTIVE_SQL_SQLITE = """
     UPDATE reap_agentic_enrollments
        SET status = 'dead',
            updated_at = CURRENT_TIMESTAMP
@@ -1478,6 +1592,21 @@ _ACTIVATE_ENROLLMENT_SQL = """
            card_last4 = COALESCE(:card_last4, card_last4),
            hosted_url = NULL,
            hosted_url_expires_at = NULL,
+           updated_at = clock_timestamp()
+     WHERE id = :id
+       AND status IN ('pending', 'active')
+    RETURNING *
+"""
+
+_ACTIVATE_ENROLLMENT_SQL_SQLITE = """
+    UPDATE reap_agentic_enrollments
+       SET status = 'active',
+           reap_enrollment_id = COALESCE(:reap_enrollment_id, reap_enrollment_id),
+           reap_status = COALESCE(:reap_status, reap_status),
+           card_network = COALESCE(:card_network, card_network),
+           card_last4 = COALESCE(:card_last4, card_last4),
+           hosted_url = NULL,
+           hosted_url_expires_at = NULL,
            updated_at = CURRENT_TIMESTAMP
      WHERE id = :id
        AND status IN ('pending', 'active')
@@ -1485,6 +1614,18 @@ _ACTIVATE_ENROLLMENT_SQL = """
 """
 
 _MARK_ENROLLMENT_DEAD_SQL = """
+    UPDATE reap_agentic_enrollments
+       SET status = 'dead',
+           reap_status = COALESCE(:reap_status, reap_status),
+           hosted_url = NULL,
+           hosted_url_expires_at = NULL,
+           updated_at = clock_timestamp()
+     WHERE id = :id
+       AND status <> 'dead'
+    RETURNING *
+"""
+
+_MARK_ENROLLMENT_DEAD_SQL_SQLITE = """
     UPDATE reap_agentic_enrollments
        SET status = 'dead',
            reap_status = COALESCE(:reap_status, reap_status),
@@ -1536,9 +1677,14 @@ async def upsert_pending_enrollment(
         )
         enrollment_id = str(existing["id"]) if existing is not None else None
     if enrollment_id is not None:
-        updated = await database.fetch_one(
-            _UPDATE_PENDING_ENROLLMENT_SQL, {**updates, "id": enrollment_id}
-        )
+        if IS_POSTGRES:
+            updated = await database.fetch_one(
+                _UPDATE_PENDING_ENROLLMENT_SQL, {**updates, "id": enrollment_id}
+            )
+        else:
+            updated = await database.fetch_one(
+                _UPDATE_PENDING_ENROLLMENT_SQL_SQLITE, {**updates, "id": enrollment_id}
+            )
         # None means the row stopped being pending between the read and the write (the buyer
         # finished enrolling). Fall through and mint a fresh pending row rather than resurrect
         # an active one.
@@ -1567,8 +1713,9 @@ async def mark_enrollment_active(
     """Promote an enrollment to 'active', demoting any other active row for the same buyer.
 
     Returns None when the target is not activatable — it is 'dead', or it does not exist, or
-    another activation for the same buyer won a concurrent race. In every one of those cases the
-    buyer's existing active enrollment is left alone.
+    another activation for the same buyer won a concurrent race. When the target was never
+    activatable the buyer's existing active enrollment is left alone; see the window note below
+    for the one case where it is not, which is narrow and no longer unrecoverable.
 
     ── NO TRANSACTION. TWO AUTOCOMMIT STATEMENTS. ───────────────────────────────────────────
 
@@ -1586,28 +1733,48 @@ async def mark_enrollment_active(
             could act on.
 
     A transaction that behaves like that is not protection, so it is gone. What replaces it is
-    two statements each of which is safe to interleave and idempotent to retry:
+    two statements, each safe to interleave and idempotent to retry:
 
         (a) demote the buyer's OTHER active rows, gated on the target being activatable;
         (b) activate the target, `WHERE id = :id AND status IN ('pending', 'active')`.
 
-    THE TRANSIENT WINDOW IS REAL AND IS STATED RATHER THAN HIDDEN. Between (a) and (b) — and
-    after (a) if the process dies — the buyer has NO active enrollment. A caller that reads
-    `get_active_enrollment` in that window sees None and does what it does for any un-enrolled
-    buyer: re-reads, or starts enrollment. It never sees TWO, which is the state that has no
-    recovery, because the partial unique index makes two impossible. And the window CLOSES on
-    retry: calling this again with the same target completes the activation, because (a) is a
-    no-op once the others are dead and (b) accepts 'pending'. Calling it again on an
-    already-active target returns that row unchanged.
+    ── (b) RUNS FIRST, AND THAT ORDER IS THE FIX FOR A REAL DEFECT ──────────────────────────
 
-    That is the trade, plainly: a recoverable, self-healing window in exchange for never
-    corrupting a second buyer's write and never raising a driver exception at a caller who
-    simply lost a race.
+    Running (a) first meant demoting the buyer's live enrollment before knowing whether the
+    promotion could succeed. A concurrent `mark_enrollment_dead(target)` landing in between left
+    BOTH rows dead — the buyer with ZERO active enrollments — and no retry heals it, because the
+    target is now permanently unactivatable. Verified by the reviewer, and reproduced here on
+    both dialects before this reordering.
 
-    THE UNIQUE-VIOLATION CATCH WRAPS EXACTLY STATEMENT (b) — it is the only statement that can
-    raise one, and with no transaction in play there is nothing else in scope to roll back or
-    accidentally commit. Every other lost race in this module answers None, and so does this one:
-    a caller handed a raw driver exception cannot tell "you lost" from "the database is broken".
+    So: try (b) first. Three outcomes, and none of them can strand the buyer.
+
+        (b) returns a row   — done. Nothing was demoted because nothing needed to be.
+        (b) returns None    — the target was not activatable ('dead', or gone). NOTHING IS
+                              DEMOTED. The live enrollment is untouched, which is the property
+                              the old order could not offer.
+        (b) raises UNIQUE   — the index refused because another row for this buyer is active,
+                              which ALSO proves the target itself is activatable. Demoting is
+                              now known to be safe: run (a), then (b) once more.
+
+    The demotion therefore never happens unless the promotion is about to succeed.
+
+    ── THE REMAINING WINDOW, STATED HONESTLY ────────────────────────────────────────────────
+
+    It is not zero. Between the demotion and the retry of (b) the buyer momentarily has no
+    active enrollment, and if the process dies there, a retry of the SAME activation completes
+    it ((a) is then a no-op and (b) accepts 'pending'). What no longer happens is the
+    unrecoverable case: the live row is not demoted on behalf of a target that turns out to be
+    dead. The buyer never sees TWO active rows in any ordering, because the partial unique index
+    makes two impossible.
+
+    A caller that reads `get_active_enrollment` inside the window sees None and does what it does
+    for any un-enrolled buyer — re-read, or start enrollment.
+
+    THE UNIQUE-VIOLATION CATCH WRAPS EXACTLY THE (b) CALLS — they are the only statements here
+    that can raise one, and with no transaction in play there is nothing else in scope to roll
+    back or accidentally commit. Every other lost race in this module answers None, and so does
+    this one: a caller handed a raw driver exception cannot tell "you lost" from "the database is
+    broken".
 
     card_last4 is the ONLY digits of the card that may be stored, and card_network the only other
     card attribute. Nothing else from Reap's payload belongs in this table.
@@ -1615,25 +1782,46 @@ async def mark_enrollment_active(
     if card_last4 is not None and (len(card_last4) != 4 or not card_last4.isdigit()):
         raise ValueError("card_last4 must be exactly four digits, or None")
 
-    # (a) — gated on the target being activatable, so a dead or missing target demotes nothing.
-    await database.fetch_all(_DEMOTE_OTHER_ACTIVE_SQL, {"id": enrollment_id})
+    values = {
+        "id": enrollment_id,
+        "reap_enrollment_id": reap_enrollment_id,
+        "reap_status": reap_status,
+        "card_network": card_network,
+        "card_last4": card_last4,
+    }
 
-    # (b) — the only statement here that can hit the partial unique index.
+    async def _activate():
+        """Statement (b). The ONLY statement here that can hit the partial unique index."""
+        if IS_POSTGRES:
+            return await database.fetch_one(_ACTIVATE_ENROLLMENT_SQL, values)
+        return await database.fetch_one(_ACTIVATE_ENROLLMENT_SQL_SQLITE, values)
+
+    async def _demote():
+        """Statement (a). Gated on the target being activatable, so a dead or missing target
+        demotes nothing even if it somehow reaches here."""
+        if IS_POSTGRES:
+            await database.fetch_all(_DEMOTE_OTHER_ACTIVE_SQL, {"id": enrollment_id})
+        else:
+            await database.fetch_all(_DEMOTE_OTHER_ACTIVE_SQL_SQLITE, {"id": enrollment_id})
+
+    # (b) FIRST. See the docstring: demoting before knowing whether the promotion can succeed is
+    # what left a buyer with zero active enrollments when the target died in between.
     try:
-        row = await database.fetch_one(
-            _ACTIVATE_ENROLLMENT_SQL,
-            {
-                "id": enrollment_id,
-                "reap_enrollment_id": reap_enrollment_id,
-                "reap_status": reap_status,
-                "card_network": card_network,
-                "card_last4": card_last4,
-            },
-        )
-    except Exception as exc:  # noqa: BLE001 — narrowed immediately below
-        if _is_unique_violation(exc):
-            return None
-        raise
+        row = await _activate()
+    except Exception as exc:  # noqa: BLE001 — narrowed immediately
+        if not _is_unique_violation(exc):
+            raise
+        # The index refused because ANOTHER row for this buyer is active — which also means the
+        # target IS activatable, so demoting is now known to be safe. Demote, then try once more.
+        await _demote()
+        try:
+            row = await _activate()
+        except Exception as retry_exc:  # noqa: BLE001
+            if _is_unique_violation(retry_exc):
+                # A third party activated something else in the gap. Lost race: None, like every
+                # other lost race here.
+                return None
+            raise
     return _enrollment(row)
 
 
@@ -1641,11 +1829,10 @@ async def mark_enrollment_dead(
     enrollment_id: str, *, reap_status: Optional[str] = None
 ) -> Optional[Dict[str, Any]]:
     """Retire an enrollment. None when it was already dead — idempotent, not an error."""
-    return _enrollment(
-        await database.fetch_one(
-            _MARK_ENROLLMENT_DEAD_SQL, {"id": enrollment_id, "reap_status": reap_status}
-        )
-    )
+    values = {"id": enrollment_id, "reap_status": reap_status}
+    if IS_POSTGRES:
+        return _enrollment(await database.fetch_one(_MARK_ENROLLMENT_DEAD_SQL, values))
+    return _enrollment(await database.fetch_one(_MARK_ENROLLMENT_DEAD_SQL_SQLITE, values))
 
 
 async def get_active_enrollment(buyer_ref: str) -> Optional[Dict[str, Any]]:

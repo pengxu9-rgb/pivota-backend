@@ -94,7 +94,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_reap_agentic_enrollments_reap_id
 -- AT MOST ONE ACTIVE ENROLLMENT PER BUYER. This is the invariant the whole rail rests on: with
 -- two active rows, "which card did this buyer authorize?" has no answer, and the purchase path
 -- would pick one arbitrarily. db/reap_agentic_ledger.mark_enrollment_active demotes any other
--- active row in the same transaction; this index is what makes the demotion non-optional.
+-- active row — NOT in a transaction (see that function for why it cannot hold one on this
+-- driver), and only once the target is about to become active. THIS INDEX is what makes
+-- the demotion non-optional: it is the only thing that can refuse a second active row.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_reap_agentic_enrollments_one_active
     ON reap_agentic_enrollments (buyer_ref)
     WHERE status = 'active';
@@ -124,6 +126,24 @@ CREATE TABLE IF NOT EXISTS reap_agentic_purchases (
         'resolving', 'needs_enrollment', 'quoting', 'awaiting_approval',
         'processing', 'completed', 'failed', 'refused', 'expired'
     )),
+
+    -- THE CLOCK THE POLL LOOP CANNOT RESET. `updated_at` moves every time anything touches the
+    -- row — a claim, a release and a requeue all write it — so an absolute "this purchase has
+    -- been waiting too long" deadline measured from it NEVER FIRES under a 30-second poll
+    -- cadence. Measured: a row aged 99999s, then ONE ordinary claim+release, was not expired and
+    -- kept the buyer's address and email. These are exactly the rows with no other bound —
+    -- `attempts` is exempt in both waiting states, and 'needs_enrollment' has no hosted URL of
+    -- its own at all.
+    --
+    -- So the deadline gets its own clock: stamped at creation and ONLY by a statement that
+    -- CHANGES `state` (the transition UPDATE and the two sweeps — never claim, release or
+    -- requeue). "This row has sat in needs_enrollment for more than an hour" is then exactly
+    -- what the column says.
+    --
+    -- NOT `created_at`: a purchase that legitimately spent fifty minutes resolving and
+    -- re-quoting would expire seconds after finally reaching awaiting_approval — the moment the
+    -- buyer is actually looking at the page.
+    state_entered_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 
     merchant_domain VARCHAR(255),
 

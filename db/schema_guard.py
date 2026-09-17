@@ -472,6 +472,11 @@ async def ensure_required_schema_light() -> None:
                             'resolving', 'needs_enrollment', 'quoting', 'awaiting_approval',
                             'processing', 'completed', 'failed', 'refused', 'expired'
                         )),
+                        -- The clock the poll loop cannot reset: stamped at create and
+                        -- only by a statement that CHANGES state. `updated_at` is
+                        -- written by every claim/release/requeue, so an absolute
+                        -- waiting deadline measured from it never fires.
+                        state_entered_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                         merchant_domain VARCHAR(255),
                         product_key TEXT,
                         variant_key TEXT,
@@ -2557,6 +2562,11 @@ async def ensure_required_schema_light() -> None:
                             'resolving', 'needs_enrollment', 'quoting', 'awaiting_approval',
                             'processing', 'completed', 'failed', 'refused', 'expired'
                         )),
+                        -- The clock the poll loop cannot reset: stamped at create and
+                        -- only by a statement that CHANGES state. `updated_at` is
+                        -- written by every claim/release/requeue, so an absolute
+                        -- waiting deadline measured from it never fires.
+                        state_entered_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                         merchant_domain VARCHAR(255),
                         product_key TEXT,
                         variant_key TEXT,
