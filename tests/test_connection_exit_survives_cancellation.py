@@ -301,6 +301,94 @@ async def test_a_committed_transaction_still_works() -> None:
     _assert_returned(conn, raw)
 
 
+# --- out-of-order ends (sibling tasks sharing one Connection) ------------------
+#
+# 0.7.0 asserted `stack[-1] is self` before exiting the connection, so a
+# transaction ended while a sibling's was still open above it raised and kept
+# its checkout forever. Not a cancellation bug: it leaks with or without one.
+
+
+@pytest.mark.asyncio
+async def test_an_out_of_order_commit_rolls_back_releases_and_raises() -> None:
+    from db.database import TransactionEndedOutOfOrder
+
+    conn, raw = _connection()
+    outer = await _transaction(conn).start()  # sibling task A
+    inner = await _transaction(conn).start()  # sibling task B, on the same Connection
+    assert conn._connection_counter == 2
+
+    with pytest.raises(TransactionEndedOutOfOrder, match="1 transaction"):
+        await outer.commit()  # A finishes first
+    assert raw.entered.get("commit") is None, "COMMIT sent for a transaction with open levels above it"
+    assert raw.entered.get("rollback") is not None, "the out-of-order transaction was not rolled back"
+    assert conn._transaction_stack == [inner], "the ended transaction is still on the stack"
+    assert conn._connection_counter == 1, "the out-of-order end kept its checkout"
+
+    await inner.commit()  # B ends normally; the stack is consistent again
+    _assert_returned(conn, raw)
+
+
+@pytest.mark.asyncio
+async def test_an_out_of_order_end_whose_rollback_fails_still_releases() -> None:
+    from db.database import TransactionEndedOutOfOrder
+
+    conn, raw = _connection()
+    outer = await _transaction(conn).start()
+    inner = await _transaction(conn).start()
+    raw.fail["rollback"] = RuntimeError("connection lost during rollback")
+
+    with pytest.raises(TransactionEndedOutOfOrder) as excinfo:
+        await outer.rollback()
+    assert isinstance(excinfo.value.__cause__, RuntimeError)
+    assert conn._connection_counter == 1
+
+    del raw.fail["rollback"]
+    await inner.rollback()
+    _assert_returned(conn, raw)
+
+
+@pytest.mark.asyncio
+async def test_sibling_tasks_ending_out_of_order_do_not_leak_the_connection() -> None:
+    """The gather shape from prod: two tasks, one inherited Connection."""
+    from db.database import TransactionEndedOutOfOrder
+
+    conn, raw = _connection()
+    a_open, b_open = asyncio.Event(), asyncio.Event()
+
+    async def task_a() -> None:
+        async with _transaction(conn):
+            a_open.set()
+            await b_open.wait()  # A's work outlives B's BEGIN, but finishes first
+
+    async def task_b() -> None:
+        await a_open.wait()
+        async with _transaction(conn):
+            b_open.set()
+            await _spin()
+
+    results = await asyncio.wait_for(
+        asyncio.gather(task_a(), task_b(), return_exceptions=True), timeout=5
+    )
+    assert isinstance(results[0], TransactionEndedOutOfOrder), results
+    _assert_returned(conn, raw)
+    assert conn._transaction_stack == []
+
+
+@pytest.mark.asyncio
+async def test_ending_a_transaction_twice_raises_without_releasing_twice() -> None:
+    """Off the stack means no checkout held: the exit must NOT become unconditional there."""
+    from db.database import TransactionEndedOutOfOrder
+
+    conn, raw = _connection()
+    async with conn:  # something else holds the connection meanwhile
+        txn = await _transaction(conn).start()
+        await txn.commit()
+        with pytest.raises(TransactionEndedOutOfOrder, match="not open"):
+            await txn.commit()
+        assert conn._connection_counter == 1, "a second end exited a checkout it did not hold"
+    _assert_returned(conn, raw)
+
+
 # --- anyio -------------------------------------------------------------------
 
 
@@ -357,7 +445,9 @@ def test_the_process_actually_installs_the_patch_on_import() -> None:
         "from databases.core import Connection as C, Transaction as T;"
         "import sys;"
         "ok = getattr(C.__aexit__, '_pivota_cancel_safe', False)"
-        " and all(getattr(T, m).__module__ == 'db.database' for m in ('start','commit','rollback'));"
+        " and all(getattr(T, m).__module__ == 'db.database' for m in ('start','commit','rollback'))"
+        " and getattr(__import__('databases.backends.postgres', fromlist=['x']).PostgresTransaction.start,"
+        " '_pivota_failed_begin_cleanup', False);"
         "sys.exit(0 if ok else 3)"
     )
     proc = subprocess.run(

@@ -483,6 +483,14 @@ def _require_source(obj, name: str, expected: tuple) -> None:  # type: ignore[no
             )
 
 
+class TransactionEndedOutOfOrder(RuntimeError):
+    """A `databases` transaction ended while it was not the innermost one open.
+
+    Replaces 0.7.0's bare `assert` (stripped under `python -O`, and raised
+    before the connection checkout was returned).
+    """
+
+
 def _install_cancellation_safe_connection_exit() -> bool:
     """Make `databases` return connections despite cancellation. Returns True if installed."""
     from databases.core import Connection, Transaction
@@ -528,7 +536,10 @@ def _install_cancellation_safe_connection_exit() -> bool:
 
     async def start(self):  # type: ignore[no-untyped-def]
         # 0.7.0 body, plus: a failed or cancelled BEGIN checks the connection
-        # back in. The release's asyncpg reset rolls back anything BEGIN left.
+        # back in. Checking in is NOT a rollback: while a sibling still holds
+        # the shared Connection the counter stays above zero, nothing is
+        # released, and no asyncpg reset runs. Undoing what BEGIN left on the
+        # server is the backend's job — see `_install_failed_begin_cleanup`.
         self._connection = self._connection_callable()
         self._transaction = self._connection._connection.transaction()
 
@@ -546,14 +557,60 @@ def _install_cancellation_safe_connection_exit() -> bool:
         return self
 
     async def _end(self, action: str) -> None:  # type: ignore[no-untyped-def]
-        # 0.7.0 body, plus: the connection exits even if COMMIT/ROLLBACK raises.
+        # 0.7.0 body, plus: once this transaction is known to hold a checkout
+        # (it is on the stack), the connection exits whatever happens — even if
+        # COMMIT/ROLLBACK raises, and even if it is not the innermost one.
+        #
+        # 0.7.0 asserted `stack[-1] is self` BEFORE anything that exits the
+        # connection. Sibling tasks sharing one Connection can end their
+        # transactions out of order, and that assertion then leaked a pool
+        # slot for good. An out-of-order end is still an error, raised after
+        # the release, and it ROLLS BACK rather than doing what was asked:
+        #   * COMMIT of a lower level commits (root) or folds in (savepoint)
+        #     the still-open levels above it. An error must mean "not
+        #     committed", or a caller that retries writes twice.
+        #   * Doing nothing leaves the BEGIN/SAVEPOINT open under the siblings.
+        #     Theirs then "commit" into it and vanish at the release reset —
+        #     silently, which is the worst outcome.
+        #   * ROLLBACK discards the levels above too, so each sibling's own end
+        #     then fails loudly on the server (no such transaction/savepoint).
+        #     Not correct either: a sibling's statements between this ROLLBACK
+        #     and its own end run with no enclosing transaction (autocommit
+        #     after a root rollback). Concurrent transactions on one shared
+        #     Connection cannot be made correct here — only loud and leak-free.
+        # A transaction that is not on the stack at all holds no checkout
+        # (already ended, or its BEGIN failed): raise, and exit nothing.
         async with self._connection._transaction_lock:
-            assert self._connection._transaction_stack[-1] is self
-            self._connection._transaction_stack.pop()
+            stack = self._connection._transaction_stack
+            depth = next((i for i, t in enumerate(stack) if t is self), None)
+            if depth is None:
+                raise TransactionEndedOutOfOrder(
+                    f"cannot {action}: this transaction is not open on its connection "
+                    "(already committed/rolled back, or never started)"
+                )
+            above = len(stack) - 1 - depth
+            del stack[depth]
+            if not above:
+                try:
+                    await getattr(self._transaction, action)()
+                finally:
+                    await self._connection.__aexit__()
+                return
+            message = (
+                f"cannot {action}: {above} transaction(s) started after this one on "
+                "the same connection are still open — concurrent tasks are sharing "
+                "one databases Connection. Rolled this transaction back instead "
+                "(which also discards the open ones above it) and released its "
+                "connection checkout."
+            )
             try:
-                await getattr(self._transaction, action)()
-            finally:
-                await self._connection.__aexit__()
+                try:
+                    await self._transaction.rollback()
+                finally:
+                    await self._connection.__aexit__()
+            except Exception as exc:
+                raise TransactionEndedOutOfOrder(message) from exc
+            raise TransactionEndedOutOfOrder(message)
 
     async def commit(self) -> None:  # type: ignore[no-untyped-def]
         await _run_to_completion(lambda: _end(self, "commit"))
@@ -573,6 +630,97 @@ def _install_cancellation_safe_connection_exit() -> bool:
 # not in the asyncpg backend, so it applies to every engine.
 if not _install_cancellation_safe_connection_exit():
     raise RuntimeError("db.database: cancellation-safe connection exit failed to install")
+
+
+# ---------------------------------------------------------------------------
+# A failed root BEGIN must not leave a transaction nobody owns.
+#
+# asyncpg's `Transaction.start` records itself as the connection's `_top_xact`
+# BEFORE it sends BEGIN, and nothing clears that if BEGIN raises or is
+# cancelled. Cancelled after the server ran BEGIN, the session is left inside a
+# server-side transaction that no code will ever commit.
+#
+# When the connection is released right away, asyncpg's reset rolls that back
+# and nothing is lost. But sibling tasks in one request share one `Connection`,
+# and while one of them still holds it, nothing is released. The request's
+# next `transaction()` then sees `_top_xact` set, becomes a SAVEPOINT inside
+# the orphan, and reports a successful commit. The release reset rolls all of
+# it back later, so the rows never persist and no error is ever raised.
+# Reproduced on Postgres 15 with 0.7.0 + asyncpg 0.31 and the cancellation-safe
+# exit above installed: 0 rows, no error. Without that exit the same run also
+# leaks the slot.
+#
+# The fix, in the backend where asyncpg's state lives: when a ROOT BEGIN
+# fails, clear `_top_xact` and send ROLLBACK, run to completion despite
+# cancellation. ROLLBACK outside a transaction is only a server WARNING, so it
+# is safe whether or not BEGIN reached the server. `_top_xact` is checked
+# first, so a transaction someone started by hand (asyncpg raises before
+# claiming `_top_xact`) is never rolled back. A failed SAVEPOINT is left
+# alone: an empty savepoint changes nothing, and the enclosing transaction
+# still has an owner who ends it.
+async def _abandon_failed_begin(xact) -> None:  # type: ignore[no-untyped-def]
+    con = xact._connection
+    if xact._nested or con._top_xact is not xact:
+        return
+    con._top_xact = None
+    try:
+        await con.execute("ROLLBACK;")
+    except Exception:
+        # Still safe: with `_top_xact` cleared, a server left in the orphan
+        # makes asyncpg REFUSE the next `transaction()` ("manually started
+        # transaction"), so the next write fails loudly instead of vanishing.
+        logger.warning("could not roll back after a failed BEGIN", exc_info=True)
+
+
+def _install_failed_begin_cleanup() -> bool:
+    """Make a failed root BEGIN undo itself on the connection. Returns True if installed."""
+    import asyncpg.transaction
+    from databases.backends.postgres import PostgresTransaction
+
+    if getattr(PostgresTransaction.start, "_pivota_failed_begin_cleanup", False):
+        return True
+
+    _require_source(
+        PostgresTransaction.start,
+        "databases.backends.postgres.PostgresTransaction.start",
+        (
+            "self._connection._connection.transaction(**extra_options)",
+            "await self._transaction.start()",
+        ),
+    )
+    _require_source(
+        asyncpg.transaction.Transaction.start,
+        "asyncpg.transaction.Transaction.start",
+        (
+            "con._top_xact = self",
+            "self._nested = True",
+            "self._state = TransactionState.FAILED",
+        ),
+    )
+
+    async def start(self, is_root, extra_options):  # type: ignore[no-untyped-def]
+        # 0.7.0 body, plus the failed-BEGIN cleanup. An explicit raise, not
+        # an assert, for the same `python -O` reason as the checkout patch.
+        if self._connection._connection is None:
+            raise AssertionError("Connection is not acquired")
+        self._transaction = self._connection._connection.transaction(**extra_options)
+        try:
+            await self._transaction.start()
+        except BaseException:
+            xact = self._transaction
+            await _run_to_completion(lambda: _abandon_failed_begin(xact))
+            raise
+
+    start._pivota_failed_begin_cleanup = True  # type: ignore[attr-defined]
+    PostgresTransaction.start = start  # type: ignore[assignment]
+    return True
+
+
+# Unconditional, like the exit above: it changes nothing until a Postgres BEGIN
+# fails, and `Database` objects are not tied to the module's DATABASE_URL.
+# asyncpg is a hard requirement (requirements.txt).
+if not _install_failed_begin_cleanup():
+    raise RuntimeError("db.database: failed-BEGIN cleanup failed to install")
 
 
 database = Database(DATABASE_URL, **database_kwargs)
