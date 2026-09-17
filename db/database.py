@@ -400,75 +400,170 @@ if IS_POSTGRES:
 # ---------------------------------------------------------------------------
 # A cancelled request must still hand its connection back.
 #
-# `databases` 0.7.0 `Connection.__aexit__` decrements the checkout counter and
-# releases the raw connection only INSIDE `async with self._connection_lock`.
-# If a cancellation is delivered while the task waits for that lock, the
-# decrement and the release are both skipped. Nothing owns the checkout any
-# more, so the pool slot is gone for the life of the process.
+# `databases` 0.7.0 gives a pool connection back only at the END of a sequence
+# of awaits, with no try/finally around them:
+#   * `Connection.__aexit__` decrements the checkout counter and releases the
+#     raw connection only INSIDE `async with self._connection_lock`.
+#   * `Transaction.start` checks the connection out, then sends BEGIN; if BEGIN
+#     raises, nothing checks it back in.
+#   * `Transaction.commit` / `rollback` wait for `_transaction_lock`, send
+#     COMMIT/ROLLBACK, and only then exit the connection.
+# A cancellation (or error) delivered at any of those awaits skips the release.
+# Nothing owns the checkout any more, so the pool slot is gone for the life of
+# the process.
 #
-# Two things in this app make that reachable:
+# One asyncio `task.cancel()` landing while `__aexit__` waits for a contended
+# lock is enough. Two things in this app make it common:
 #   * Concurrent tasks in one request share ONE `Connection` (0.7.0 keeps it in
-#     a ContextVar that child tasks inherit), so the lock is contended — e.g.
+#     a ContextVar that child tasks inherit), so the locks are contended — e.g.
 #     the `asyncio.gather` of three reads in reviews_service.
 #   * Starlette's BaseHTTPMiddleware runs the endpoint in an anyio task group,
 #     and anyio cancellation is level-triggered: it is re-delivered at EVERY
-#     await until the task leaves the scope, including the lock wait inside
-#     `__aexit__`. A single asyncio `task.cancel()` cannot hit it, which is why
-#     a plain-asyncio reproduction stays clean.
+#     await until the task leaves the scope, so it reaches the cleanup awaits
+#     too, not just the query that was running.
 #
 # 2026-09-16: this drained web's 12-slot pools on every instance within hours
 # (api.pivota.cc /health 503, uptime alert flapping). pg_stat_activity showed
 # the fingerprint: connections `idle` in ClientRead for up to 12.7h whose last
 # statement was an app query with no asyncpg release reset after it, CPU 0.1,
-# no locks. Reproduced locally only with anyio cancellation; the leaked
-# holder's history ended in `__aexit__` raising CancelledError from the lock
-# acquire with the counter still at 1.
+# no locks. The leaked holder's history ended in `__aexit__` raising
+# CancelledError from the lock acquire with the counter still at 1. Review of
+# the first fix found the Transaction path leaking the same way (12 slots in 17
+# anyio-cancelled transactions), as `idle in transaction (aborted)`.
 #
-# The fix runs the ORIGINAL exit body in its own task and waits for it through
-# `asyncio.shield`, absorbing re-delivered cancellations until it finishes, then
-# re-raises the cancellation. Cancellation is delayed, never dropped: at most by
-# one lock wait plus one release.
-def _install_cancellation_safe_connection_exit() -> bool:
-    """Make `databases.core.Connection.__aexit__` survive cancellation. Returns True if installed."""
-    from databases.core import Connection
+# The fix runs each cleanup step to completion in its own task
+# (`_run_to_completion`) and re-raises the cancellation afterwards. Cancellation
+# is delayed, never dropped. The delay is bounded by the cleanup itself: lock
+# waits behind siblings, one COMMIT/ROLLBACK, and one release — asyncpg bounds a
+# release by the checkout timeout, statements by DB_STATEMENT_TIMEOUT_SECONDS.
+async def _run_to_completion(make_coro):  # type: ignore[no-untyped-def]
+    """Await `make_coro()` to completion even if this task is cancelled meanwhile.
 
-    if getattr(Connection.__aexit__, "_pivota_cancel_safe", False):
-        return True
+    If a cancellation arrived, it is re-raised afterwards — chained to the
+    cleanup's own error when there was one, so neither is lost. Without one,
+    the cleanup's result or exception is returned/raised as usual.
+    """
+    import anyio
 
+    # Local strong reference: the loop only holds tasks weakly.
+    task = asyncio.ensure_future(make_coro())
+    interrupted: Optional[BaseException] = None
+    # The anyio shield stops anyio re-delivering its cancellation on every loop
+    # pass (a busy spin under BaseHTTPMiddleware); anyio re-applies it at the
+    # caller's next await. Plain asyncio cancellation is not intercepted by the
+    # anyio scope, so it is caught here. `asyncio.wait`, not `asyncio.shield`:
+    # wait neither cancels the task when the waiter is cancelled nor raises the
+    # task's exception, so a cleanup that fails AFTER a cancellation arrived
+    # cannot escape the loop ahead of that cancellation.
+    with anyio.CancelScope(shield=True):
+        while not task.done():
+            try:
+                await asyncio.wait((task,))
+            except asyncio.CancelledError as exc:
+                interrupted = exc
+    if interrupted is not None:
+        if not task.cancelled() and task.exception() is not None:
+            raise interrupted from task.exception()
+        raise interrupted
+    return task.result()
+
+
+def _require_source(obj, name: str, expected: tuple) -> None:  # type: ignore[no-untyped-def]
     # Same rule as the checkout patch: refuse to wrap an implementation we have
     # not read. 0.8+ restructured connection handling; a blind wrap could hide
     # a different lifecycle.
     import inspect
 
-    original_source = inspect.getsource(Connection.__aexit__)
-    for expected in (
-        "async with self._connection_lock",
-        "self._connection_counter -= 1",
-        "await self._connection.release()",
-    ):
-        if expected not in original_source:
+    source = inspect.getsource(obj)
+    for fragment in expected:
+        if fragment not in source:
             raise RuntimeError(
-                "db.database: refusing to patch connection exit — "
-                f"databases.core.Connection.__aexit__ no longer contains {expected!r}. "
-                "The library changed; re-read it and update this patch."
+                f"db.database: refusing to patch {name} — it no longer contains "
+                f"{fragment!r}. The library changed; re-read it and update this patch."
             )
+
+
+def _install_cancellation_safe_connection_exit() -> bool:
+    """Make `databases` return connections despite cancellation. Returns True if installed."""
+    from databases.core import Connection, Transaction
+
+    if getattr(Connection.__aexit__, "_pivota_cancel_safe", False):
+        return True
+
+    _require_source(
+        Connection.__aexit__,
+        "databases.core.Connection.__aexit__",
+        (
+            "async with self._connection_lock",
+            "self._connection_counter -= 1",
+            "await self._connection.release()",
+        ),
+    )
+    _require_source(
+        Transaction.start,
+        "databases.core.Transaction.start",
+        (
+            "async with self._connection._transaction_lock",
+            "await self._connection.__aenter__()",
+            "await self._transaction.start(",
+            "self._connection._transaction_stack.append(self)",
+        ),
+    )
+    for method in (Transaction.commit, Transaction.rollback):
+        _require_source(
+            method,
+            f"databases.core.Transaction.{method.__name__}",
+            (
+                "async with self._connection._transaction_lock",
+                "self._connection._transaction_stack.pop()",
+                f"await self._transaction.{method.__name__}()",
+                "await self._connection.__aexit__()",
+            ),
+        )
 
     original_exit = Connection.__aexit__
 
     async def __aexit__(self, exc_type=None, exc_value=None, traceback=None):  # type: ignore[no-untyped-def]
-        # Local strong reference: the loop only holds tasks weakly.
-        exit_task = asyncio.ensure_future(original_exit(self, exc_type, exc_value, traceback))
-        interrupted: Optional[BaseException] = None
-        while not exit_task.done():
-            try:
-                await asyncio.shield(exit_task)
-            except asyncio.CancelledError as exc:
-                interrupted = exc
-        # The exit body's own failure (e.g. a release error) takes precedence.
-        exit_task.result()
-        if interrupted is not None:
-            raise interrupted
+        await _run_to_completion(lambda: original_exit(self, exc_type, exc_value, traceback))
 
+    async def start(self):  # type: ignore[no-untyped-def]
+        # 0.7.0 body, plus: a failed or cancelled BEGIN checks the connection
+        # back in. The release's asyncpg reset rolls back anything BEGIN left.
+        self._connection = self._connection_callable()
+        self._transaction = self._connection._connection.transaction()
+
+        async with self._connection._transaction_lock:
+            is_root = not self._connection._transaction_stack
+            await self._connection.__aenter__()
+            try:
+                await self._transaction.start(
+                    is_root=is_root, extra_options=self._extra_options
+                )
+            except BaseException:
+                await self._connection.__aexit__()
+                raise
+            self._connection._transaction_stack.append(self)
+        return self
+
+    async def _end(self, action: str) -> None:  # type: ignore[no-untyped-def]
+        # 0.7.0 body, plus: the connection exits even if COMMIT/ROLLBACK raises.
+        async with self._connection._transaction_lock:
+            assert self._connection._transaction_stack[-1] is self
+            self._connection._transaction_stack.pop()
+            try:
+                await getattr(self._transaction, action)()
+            finally:
+                await self._connection.__aexit__()
+
+    async def commit(self) -> None:  # type: ignore[no-untyped-def]
+        await _run_to_completion(lambda: _end(self, "commit"))
+
+    async def rollback(self) -> None:  # type: ignore[no-untyped-def]
+        await _run_to_completion(lambda: _end(self, "rollback"))
+
+    Transaction.start = start  # type: ignore[assignment]
+    Transaction.commit = commit  # type: ignore[assignment]
+    Transaction.rollback = rollback  # type: ignore[assignment]
     __aexit__._pivota_cancel_safe = True  # type: ignore[attr-defined]
     Connection.__aexit__ = __aexit__  # type: ignore[assignment]
     return True
