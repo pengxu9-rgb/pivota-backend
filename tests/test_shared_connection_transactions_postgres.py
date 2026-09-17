@@ -62,7 +62,9 @@ async def _rows(database) -> list:
     return sorted(r[0] for r in await database.fetch_all(f"SELECT v FROM {TABLE}"))
 
 
-def _cancel_after_server_runs(monkeypatch, statement: str, fail_rollback: bool = False):
+def _cancel_after_server_runs(
+    monkeypatch, statement: str, fail_rollback: bool = False, hang_rollback: bool = False
+):
     """Make `statement` succeed on the server, then park so the caller can cancel it.
 
     That is the losing interleaving: the server is inside the transaction, the client
@@ -77,6 +79,10 @@ def _cancel_after_server_runs(monkeypatch, statement: str, fail_rollback: bool =
     async def execute(self, query, *args, **kwargs):  # type: ignore[no-untyped-def]
         if fail_rollback and query.strip().upper().startswith("ROLLBACK"):
             raise ConnectionError("simulated: ROLLBACK could not be sent")
+        if hang_rollback and query.strip().upper().startswith("ROLLBACK"):
+            # A socket gone silent: asyncpg parks here on the cancel acknowledgement
+            # before any command_timeout applies. Cancellable, like that wait.
+            await asyncio.Event().wait()
         result = await real(self, query, *args, **kwargs)
         if query.strip().upper().startswith(statement):
             parked.set()
@@ -87,8 +93,10 @@ def _cancel_after_server_runs(monkeypatch, statement: str, fail_rollback: bool =
     return parked, lambda: monkeypatch.setattr(asyncpg.connection.Connection, "execute", real)
 
 
-async def _cancel_a_root_begin(database, monkeypatch, *, fail_rollback: bool = False) -> None:
-    parked, restore = _cancel_after_server_runs(monkeypatch, "BEGIN", fail_rollback)
+async def _cancel_a_root_begin(
+    database, monkeypatch, *, fail_rollback: bool = False, hang_rollback: bool = False
+) -> None:
+    parked, restore = _cancel_after_server_runs(monkeypatch, "BEGIN", fail_rollback, hang_rollback)
     begin = asyncio.ensure_future(database.connection().transaction().start())
     await asyncio.wait_for(parked.wait(), timeout=5)
     begin.cancel()
@@ -133,6 +141,39 @@ async def test_if_the_cleanup_rollback_fails_the_next_transaction_fails_loudly(d
 
     assert _in_use(db) == 0
     assert await _rows(db) == []
+
+
+@pytest.mark.asyncio
+async def test_a_cleanup_rollback_that_never_answers_terminates_and_returns_the_slot(
+    db, monkeypatch
+) -> None:
+    """The cleanup runs uncancellably, so it must carry its own deadline.
+
+    Without one, a silent socket kept the cancelled BEGIN's task alive forever with the
+    slot checked out — where a plain release would have given up after the checkout
+    timeout and terminated the connection.
+    """
+    import asyncpg.connection
+
+    import db.database as dbmod
+
+    monkeypatch.setattr(dbmod, "DB_POOL_CHECKOUT_TIMEOUT_SECONDS", 0.5)
+    terminated = []
+    real_terminate = asyncpg.connection.Connection.terminate
+
+    def terminate(self):  # type: ignore[no-untyped-def]
+        terminated.append(self)
+        real_terminate(self)
+
+    monkeypatch.setattr(asyncpg.connection.Connection, "terminate", terminate)
+    await asyncio.wait_for(_cancel_a_root_begin(db, monkeypatch, hang_rollback=True), timeout=10)
+
+    assert _in_use(db) == 0, "the slot is still held by a cleanup that never finished"
+    # A connection that did not answer is not handed to the next caller.
+    assert len(terminated) == 1 and terminated[0].is_closed()
+    async with db.transaction():  # the pool replaced the terminated connection
+        await db.execute(f"INSERT INTO {TABLE} VALUES (1)")
+    assert await _rows(db) == [1]
 
 
 # --- 2. transactions ended out of order ------------------------------------------------------

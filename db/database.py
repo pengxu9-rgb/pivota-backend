@@ -433,9 +433,12 @@ if IS_POSTGRES:
 #
 # The fix runs each cleanup step to completion in its own task
 # (`_run_to_completion`) and re-raises the cancellation afterwards. Cancellation
-# is delayed, never dropped. The delay is bounded by the cleanup itself: lock
-# waits behind siblings, one COMMIT/ROLLBACK, and one release — asyncpg bounds a
-# release by the checkout timeout, statements by DB_STATEMENT_TIMEOUT_SECONDS.
+# is delayed, never dropped. The delay is the cleanup itself: lock waits behind
+# siblings, one COMMIT/ROLLBACK, and one release. asyncpg bounds a release by
+# the checkout timeout (and terminates on expiry). DB_STATEMENT_TIMEOUT_SECONDS
+# is enforced by the SERVER, so it does NOT bound a COMMIT/ROLLBACK waiting on a
+# socket that has gone silent — only a client-side DB_COMMAND_TIMEOUT_SECONDS
+# would, and even that not while asyncpg waits for a cancel to be acknowledged.
 async def _run_to_completion(make_coro):  # type: ignore[no-untyped-def]
     """Await `make_coro()` to completion even if this task is cancelled meanwhile.
 
@@ -658,13 +661,30 @@ if not _install_cancellation_safe_connection_exit():
 # claiming `_top_xact`) is never rolled back. A failed SAVEPOINT is left
 # alone: an empty savepoint changes nothing, and the enclosing transaction
 # still has an owner who ends it.
+#
+# The ROLLBACK has a DEADLINE, and the connection is terminated when it runs
+# out. It runs uncancellably (`_run_to_completion`), and asyncpg sends nothing
+# until the server acknowledges the cancel of the BEGIN — a wait no
+# command_timeout covers. On a socket that has gone silent (failover, dropped
+# NAT entry) an unbounded ROLLBACK therefore never returns and holds the slot
+# forever, where the plain release it runs before would have given up and
+# terminated. The deadline is the one that release uses: asyncpg bounds a
+# release by the acquire timeout, which is DB_POOL_CHECKOUT_TIMEOUT_SECONDS.
 async def _abandon_failed_begin(xact) -> None:  # type: ignore[no-untyped-def]
     con = xact._connection
     if xact._nested or con._top_xact is not xact:
         return
     con._top_xact = None
+    if con.is_closed():
+        return  # nothing to roll back; the pool replaces a closed connection
     try:
-        await con.execute("ROLLBACK;")
+        await asyncio.wait_for(con.execute("ROLLBACK;"), DB_POOL_CHECKOUT_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "no answer to ROLLBACK after a failed BEGIN within %.1fs — terminating the connection",
+            DB_POOL_CHECKOUT_TIMEOUT_SECONDS,
+        )
+        con.terminate()
     except Exception:
         # Still safe: with `_top_xact` cleared, a server left in the orphan
         # makes asyncpg REFUSE the next `transaction()` ("manually started
