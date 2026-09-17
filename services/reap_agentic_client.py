@@ -119,12 +119,34 @@ logger = logging.getLogger("reap_agentic_client")
 #: with a Reap document that names it.
 ALLOWED_HOST_SUFFIXES = ("reap.global",)
 
+#: Hosts a URL REAP HANDS US may name, as an exact-or-dot-suffix match, same rule as the base
+#: URL above. This is the other direction of the same boundary and it is the more dangerous one:
+#: `nextAction.url` is a hosted page WE GIVE TO A BUYER, who then types their own card into it.
+#: If Reap's response -- or anything that can influence it -- ever carries a URL on another host,
+#: passing it through makes us the thing that sent a buyer to a card-entry page on an attacker's
+#: domain. So the URL is validated on the way IN and a response that fails is refused whole,
+#: never handed on with a warning.
+#:
+#: `prava.space` is Reap's hosted-checkout domain and `reap.global` their API domain. Both are
+#: here because the sandbox has been observed to serve the hosted page from either. Add a suffix
+#: only with a Reap document that names it -- this list exists to narrow, and every extra entry
+#: widens exactly what it narrows.
+ALLOWED_HOSTED_URL_SUFFIXES = ("prava.space", "reap.global")
+
+#: Hosts our OWN `returnUrl` may name. Read from the environment because the agent front end
+#: moves between environments faster than this file does, and a wrong value here is not a
+#: security hole so much as a buyer who lands nowhere after paying. Default is the one host that
+#: exists today. See `return_url_hosts`.
+DEFAULT_RETURN_URL_HOSTS = ("agent.pivota.cc",)
+
 #: Required header on EVERY agentic endpoint, and enum-constrained to this single value in the
 #: spec. Its absence is a 4xx, not a default -- omitting it was one of #2136's four defects.
 REAP_VERSION = "2025-02-14"
 
-#: Required by the spec on quote and checkout creation (not on the read-only product endpoints).
-_IDEMPOTENT_PATHS = ("/agentic/quotes", "/agentic/checkouts")
+#: Required by the spec on quote, checkout AND enrollment creation (not on the read-only product
+#: endpoints, and not on any GET). Checked against the 17 Sep spec: `Idempotency-Key` is a
+#: `required: true` header parameter on exactly these three POSTs.
+_IDEMPOTENT_PATHS = ("/agentic/quotes", "/agentic/checkouts", "/agentic/enrollments")
 
 #: Per-path read timeouts. NOT one number: a quote takes 13-16 s measured across nine merchants,
 #: because Reap is talking to the merchant's own commerce layer while we wait. The 12 s default
@@ -314,15 +336,50 @@ def idempotency_key(
     return f"pivota-{scope}-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
 
 
-def _headers(key: str, path: str, body: Dict[str, Any]) -> Dict[str, str]:
+def idempotency_material(path: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    """The part of a request body that DEFINES the thing being created.
+
+    The whole body is the right material for a quote -- every field in it changes what is
+    quoted. It is the WRONG material for a checkout and for an enrollment, because both carry a
+    `presentation.returnUrl` that is ours and may legitimately differ between two attempts at
+    the same thing: the return URL carries a click id, so a retry after an unknown outcome
+    arrives with a different query string, hashes to a different key, and CREATES A SECOND
+    CHECKOUT against the same quote -- which is the one failure an idempotency key exists to
+    prevent, reintroduced by the key itself.
+
+    So a checkout is keyed on (quoteId, enrollmentId) and an enrollment on its owner. Both are
+    opaque ids of ours or of Reap's. Note what is deliberately NOT in either: the buyer's email,
+    which the enrollment body may carry. It is PII, it does not identify the enrollment being
+    created, and a key is a value we put in a header on every retry.
+    """
+    data = body if isinstance(body, dict) else {}
+    if path == "/agentic/checkouts":
+        return {"quoteId": str(data.get("quoteId") or ""),
+                "enrollmentId": str(data.get("enrollmentId") or "")}
+    if path == "/agentic/enrollments":
+        owner = data.get("owner") if isinstance(data.get("owner"), dict) else {}
+        return {"source": str(data.get("source") or ""),
+                "ownerType": str(owner.get("type") or ""),
+                "ownerId": str(owner.get("id") or "")}
+    return data
+
+
+def _headers(key: str, path: str, body: Dict[str, Any], *, method: str = "POST") -> Dict[str, str]:
+    """`method` is not cosmetic. `_IDEMPOTENT_PATHS` is matched by PATH, and `/agentic/enrollments`
+    is both a create and a list -- so keying off the path alone would put an Idempotency-Key on
+    the GET too. A key on a read is at best noise and at worst asks a partner to replay a
+    24-hour-old list for a poll."""
     headers = {
         "Authorization": f"Bearer {key}",
-        "Content-Type": "application/json",
         "Reap-Version": REAP_VERSION,
         "User-Agent": "Pivota/1.0 (+https://pivota.cc)",
     }
-    if path in _IDEMPOTENT_PATHS:
-        headers["Idempotency-Key"] = idempotency_key(path.rsplit("/", 1)[-1], body)
+    if method.upper() == "POST":
+        headers["Content-Type"] = "application/json"
+        if path in _IDEMPOTENT_PATHS:
+            headers["Idempotency-Key"] = idempotency_key(
+                path.rsplit("/", 1)[-1], idempotency_material(path, body)
+            )
     return headers
 
 
@@ -1470,6 +1527,22 @@ class ReapResponse:
     #: every merchantPreference value tried in sandbox, so a caller that reads only the status
     #: would record a clean success for a search that ignored its merchant scope entirely.
     warnings: List[str] = field(default_factory=list)
+    #: `error.code` and `error.detail.code` from a 4xx/5xx, and NOTHING ELSE from that body.
+    #:
+    #: This is a deliberate, narrow hole in the body-blind rule above, and it is worth being
+    #: precise about why. The rule exists because a partner's error payload can echo the request
+    #: and the request can carry a buyer's shipping address. But the enrollment and checkout
+    #: legs are a STATE MACHINE the caller has to drive: `ENROLLMENT_NOT_ACTIVE` on a checkout
+    #: create means "send the buyer back to the hosted card page", `AGENTIC_RESOURCE_NOT_FOUND`
+    #: means "this id is gone, start again", and a bare `reap_status_400` collapses both into
+    #: "something went wrong" and leaves a buyer stuck. So exactly two scalar fields are
+    #: extracted, both are shape-checked against `^[A-Z_]{3,64}$` before being kept, and
+    #: everything else in the body -- including `error.message`, which is free text and can echo
+    #: anything -- is discarded unread.
+    error_code: Optional[str] = None
+    #: `error.detail.code`. Where the specific reason lives: 400 AGENTIC_REQUEST_REJECTED with
+    #: `detail.code = ENROLLMENT_NOT_ACTIVE` is the failure seen live.
+    error_detail_code: Optional[str] = None
 
 
 async def _read_bounded(response: Any, *, max_bytes: int = MAX_RESPONSE_BYTES) -> Optional[bytes]:
@@ -1586,11 +1659,25 @@ async def _post(path: str, body: Dict[str, Any], *, timeout_seconds: Optional[fl
                     # The response BODY is deliberately not logged or returned to a serving
                     # caller: a partner's error payload can echo the request, and the request can
                     # contain a buyer's address. Operators reproducing a failure should use the
-                    # probe script, not prod logs. Nothing reads the body here at all.
-                    logger.warning("reap %s rejected: status=%s", path, resp.status_code)
+                    # probe script, not prod logs.
+                    #
+                    # The two machine-readable CODES are the sole exception, on the two legs that
+                    # need them -- see `_ERROR_CODE_PATH_PREFIXES`. On every other path, including
+                    # the quote, the body is not pulled off the socket at all. Where it IS read it
+                    # goes through `_read_bounded` like everything else, so an error body gets the
+                    # same cap as a success body and there is still exactly ONE bound per
+                    # response; an oversized failure yields None and therefore no codes, which is
+                    # the right way round.
+                    code, detail_code = (
+                        _error_codes(await _read_bounded(resp))
+                        if _reads_error_codes(path) else (None, None)
+                    )
+                    logger.warning("reap %s rejected: status=%s code=%s detail=%s",
+                                   path, resp.status_code, code, detail_code)
                     return ReapResponse(
                         ok=False, status=resp.status_code,
                         error=f"reap_status_{resp.status_code}",
+                        error_code=code, error_detail_code=detail_code,
                         merchant_probably_not_completable=(
                             resp.status_code == 503 and path in _SLOW_PATHS),
                     )
@@ -1628,6 +1715,176 @@ async def _post(path: str, body: Dict[str, Any], *, timeout_seconds: Optional[fl
     if warnings:
         logger.info("reap %s returned warnings: %s", path, ",".join(sorted(set(warnings))[:5]))
     return ReapResponse(ok=True, status=resp_status, data=data, warnings=warnings)
+
+
+#: The ONLY shape an error code may have to be carried out of a failed response. Anything else in
+#: that body -- `error.message`, echoed request fields, a partner's stack trace -- is discarded
+#: unread. Bounded and charset-restricted so that a value from a partner cannot become a long
+#: string of arbitrary content in our logs or in a response of ours.
+_ERROR_CODE_RE = re.compile(r"^[A-Z_]{3,64}$")
+
+#: The ONLY paths whose failure body is read at all. Everywhere else a 4xx body is never pulled
+#: off the socket.
+#:
+#: THIS IS A REAL DISAGREEMENT BETWEEN TWO GOOD RULES, AND THIS IS WHERE IT IS SETTLED. The rule
+#: on the branch below this one is that an error body is never read, so a partner payload echoing
+#: a buyer's address cannot enter the process at all. WP1 needs the opposite on two legs: the
+#: enrollment and checkout legs are a state machine the caller drives, and `ENROLLMENT_NOT_ACTIVE`
+#: versus `AGENTIC_RESOURCE_NOT_FOUND` is the difference between "send the buyer back to the card
+#: page" and "start again". A bare `reap_status_400` leaves a buyer stuck.
+#:
+#: Scoping it by path gets both, and not by luck -- it lands exactly where the risk is. The
+#: request body that can carry a buyer's SHIPPING ADDRESS is the quote; enrollment and checkout
+#: bodies carry opaque ids, a returnUrl of ours, and at most an email we already chose to send.
+#: So the endpoint whose echo would be worst is precisely the one we still never read, and the
+#: two we do read are the two with a state machine and nothing much to leak.
+#:
+#: Prefix-matched so the reads (`/agentic/enrollments/{id}`) are covered with the creates.
+_ERROR_CODE_PATH_PREFIXES = ("/agentic/enrollments", "/agentic/checkouts")
+
+
+def _reads_error_codes(path: str) -> bool:
+    return str(path or "").startswith(_ERROR_CODE_PATH_PREFIXES)
+
+
+def _error_codes(raw: Optional[bytes]) -> Tuple[Optional[str], Optional[str]]:
+    """`(error.code, error.detail.code)` from an already-bounded body, or `(None, None)`.
+
+    TAKES BYTES, NOT A RESPONSE, and that is the point of the signature. The size bound lives in
+    `_read_bounded` and nowhere else: this function is handed what that helper returned, so
+    there is exactly ONE bound per response and no way for a second reader to open an unbounded
+    one. `None` in means the body was over the cap, which means no codes -- we would rather lose
+    a machine-readable code than read an unbounded body to find it.
+
+    Everything else in the body is discarded unread. The two values that survive are matched
+    against `_ERROR_CODE_RE` first, so a body that puts an address (or anything else) where a
+    code belongs yields None rather than a leak. `error.message` is free text and is never read.
+    """
+    if not raw:
+        return None, None
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return None, None
+    if not isinstance(payload, dict):
+        return None, None
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return None, None
+
+    def _code(value: Any) -> Optional[str]:
+        return value if isinstance(value, str) and _ERROR_CODE_RE.fullmatch(value) else None
+
+    detail = error.get("detail")
+    return _code(error.get("code")), _code(detail.get("code") if isinstance(detail, dict) else None)
+
+
+async def _get(
+    path: str,
+    *,
+    params: Optional[Dict[str, Any]] = None,
+    timeout_seconds: Optional[float] = None,
+) -> ReapResponse:
+    """One GET. Same host validation, same headers, same body-blind failure handling as `_post`.
+
+    DELIBERATELY A SIBLING OF `_post` RATHER THAN A REFACTOR OF IT. The duplication is real and
+    it is the cheaper of the two costs: `_post` is the module's only egress path and is under
+    concurrent review, and folding both verbs through one helper would make every later fix to
+    one of them a fix to the other by accident.
+
+    The client shipped with `_post` alone, which is why every read in this module used to be a
+    POST or did not exist. Two things differ here and both matter: a GET carries no
+    Idempotency-Key and no Content-Type (see `_headers`), and its query parameters are handed to
+    httpx to encode rather than pasted into the URL by us.
+
+    NOTHING IS STRING-FORMATTED INTO A PATH HERE THAT HAS NOT BEEN THROUGH `_path_id`. That is
+    the guard that stops a caller-supplied id from adding a segment or a query of its own.
+    """
+    if not is_configured():
+        return ReapResponse(ok=False, error="reap_client_not_configured")
+    url = validate_base_url()
+    key = _api_key() or ""
+    if timeout_seconds:
+        timeout = float(timeout_seconds)
+    else:
+        # The same floor semantics as `_post`, through the SAME helper. Reimplementing the rule
+        # here would have given the two verbs two copies to drift apart -- and this one had
+        # exactly that bug before the rebase: it parsed the env var itself and treated a
+        # non-numeric value as "ignore", which is right, while silently disagreeing with
+        # `_env_timeout_floor` about a zero or negative one.
+        timeout = default_timeout_for(path)
+        floor = _env_timeout_floor()
+        if floor is not None:
+            timeout = max(timeout, floor)
+
+    import httpx
+
+    try:
+        # Explicit `follow_redirects=False` -- see the note in `_post`. A GET carries the key in
+        # an `Authorization` header exactly as a POST does, so a followed 30x would hand it to
+        # whatever host the `Location` named.
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+            # STREAMED, through the SAME `_read_bounded` the POST path uses. A non-streaming
+            # `client.get` returns only once the whole body is already in memory, so a size check
+            # after it refuses to PARSE a body it has already fully allocated -- a cosmetic
+            # bound. The read has to stop AT the cap to be one, and doing that here with a second
+            # copy of the logic would give the two verbs two bounds to drift apart.
+            async with client.stream(
+                "GET", f"{url}{path}",
+                params=params or None,
+                headers=_headers(key, path, {}, method="GET"),
+            ) as resp:
+                status = resp.status_code
+                if status >= 400 and not _reads_error_codes(path):
+                    # Not read at all, byte for byte the same rule as `_post`: on a path with no
+                    # state machine to drive there is nothing in a failure body we want, so it
+                    # never comes off the socket.
+                    logger.warning("reap GET %s rejected: status=%s", path, status)
+                    return ReapResponse(ok=False, status=status,
+                                        error=f"reap_status_{status}")
+                # ONE bounded read for everything that IS read -- success bodies, and failure
+                # bodies on the two legs that carry machine-readable codes. Reading it here
+                # rather than once per branch is what keeps it to a single bound per response.
+                raw = await _read_bounded(resp)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("reap GET %s failed: %s", path, type(exc).__name__)
+        return ReapResponse(ok=False, error=f"transport_error:{type(exc).__name__}")
+
+    if raw is None:
+        logger.warning("reap GET %s response exceeded %s bytes; refusing", path,
+                       MAX_RESPONSE_BYTES)
+        return ReapResponse(ok=False, status=status, error="response_too_large")
+
+    if status >= 400:
+        # Body-blind apart from the two codes, exactly as `_post` is. An oversized failure took
+        # the `raw is None` branch above and never reaches here, so it yields no codes either.
+        code, detail_code = _error_codes(raw)
+        logger.warning("reap GET %s rejected: status=%s code=%s detail=%s",
+                       path, status, code, detail_code)
+        return ReapResponse(
+            ok=False, status=status, error=f"reap_status_{status}",
+            error_code=code, error_detail_code=detail_code,
+        )
+
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return ReapResponse(ok=False, status=status, error="unparseable_response")
+
+    data = payload if isinstance(payload, dict) else {}
+    # Coerced exactly as `_post` coerces it: a BARE STRING is iterable, so a naive comprehension
+    # turns "MERCHANT_NOT_FOUND" into eighteen single-character warnings, and the first `_get`
+    # dropped it entirely instead. Two verbs disagreeing about the same partner field is how one
+    # of them silently stops reporting a signal the other reports.
+    raw_warnings = data.get("warnings")
+    if isinstance(raw_warnings, str):
+        raw_warnings = [raw_warnings]
+    elif not isinstance(raw_warnings, list):
+        raw_warnings = []
+    warnings = [str(w) for w in raw_warnings if w]
+    if warnings:
+        logger.info("reap GET %s returned warnings: %s", path, ",".join(sorted(set(warnings))[:5]))
+    return ReapResponse(ok=True, status=status, data=data, warnings=warnings)
 
 
 async def search_products(**kwargs: Any) -> ReapResponse:
@@ -2134,7 +2391,59 @@ REFUSAL_EXPLANATIONS: List[Tuple[str, str]] = [
      "A network failure, not a verdict about the merchant or the product. Retry."),
     ("reap_client_not_configured",
      "REAP_API_BASE_URL and REAP_API_KEY are not both set. Nothing was sent."),
+    # --- WP1: the enrollment, checkout and polling legs -------------------------------------
+    # Appended, and the ordering rule above still holds: none of these is a prefix of an entry
+    # ABOVE it, and the two `reap_status_*` entries below are siblings of `reap_status_503`
+    # rather than extensions of it, so nothing here is shadowed and nothing here shadows.
+    ("hosted_url_not_allowed",
+     "Reap returned a hosted URL on a host we do not allow, and the response was refused WHOLE\n"
+     "rather than passed on with a warning. This is the page a buyer TYPES A CARD INTO, so a\n"
+     "URL we cannot vouch for must not reach one -- and a response merely flagged would still\n"
+     "be read for `nextAction.url`, which is the field the call was for. If the host is\n"
+     "genuinely Reap's, add it to ALLOWED_HOSTED_URL_SUFFIXES with a document that names it.\n"
+     "DO NOT disable the check. This is also the FIRST thing to suspect on a first live run:\n"
+     "the two suffixes are taken from a plan, not from a measurement."),
+    ("reap_status_403",
+     "AGENTIC_PAYMENTS_NOT_ENABLED. The agentic module is not enabled on this key. That is an\n"
+     "account-level fact, not a per-request one -- retrying will not change it."),
+    ("reap_status_404",
+     "AGENTIC_RESOURCE_NOT_FOUND. The id is gone, or was never Reap's. Reap's `prd_`/`var_` ids\n"
+     "are minted per search and are session handles rather than identity: resolve fresh. On an\n"
+     "enrollment or checkout id it means the resource expired -- start the flow again."),
+    ("unparseable_response",
+     "A 2xx whose body was not JSON. Unverifiable rather than failed: we do not know what the\n"
+     "other end did. On a create, retry inside the same idempotency window."),
 ]
+
+#: `error.detail.code` -> what to DO about it, for the enrollment and checkout legs.
+#:
+#: A SEPARATE list from `REFUSAL_EXPLANATIONS` because it is keyed differently -- exact match on
+#: a machine-readable code, not a prefix match on our own reason vocabulary -- and because these
+#: codes come from `error.detail`, which the spec types as a free-form object. So this list is
+#: OBSERVED, not schema-derived, and is not exhaustive.
+DETAIL_CODE_EXPLANATIONS: List[Tuple[str, str]] = [
+    ("ENROLLMENT_NOT_ACTIVE",
+     "The enrollment is not ACTIVE, so there is no card to charge. The buyer has not finished\n"
+     "the hosted card page, or it expired. Poll the enrollment; if it is `pending`, send them\n"
+     "back to its `nextAction.url`. Creating the checkout again will not help."),
+]
+
+
+def explain_detail_code(code: Optional[str]) -> Optional[str]:
+    """What to do about a `ReapResponse.error_detail_code`, or None.
+
+    Deliberately NOT folded into `explain_refusal`. That function answers "what does this reason
+    string mean" and has one signature, one return type and four tests pinning both; this answers
+    a different question from a different source, and returns None rather than a fallback
+    sentence because an unrecognised partner code has no honest explanation to give.
+    """
+    wanted = str(code or "")
+    if not wanted:
+        return None
+    for known, explanation in DETAIL_CODE_EXPLANATIONS:
+        if wanted == known:
+            return explanation
+    return None
 
 
 def explain_refusal(reason: Optional[str]) -> str:
@@ -2149,3 +2458,460 @@ def explain_refusal(reason: Optional[str]) -> str:
         if text.startswith(prefix):
             return explanation
     return "Unrecognised refusal. Read the reason string above and the module that emits it."
+# ============================================================================================
+# ENROLLMENTS, CHECKOUTS AND THE POLLING READS  (WP1)
+# ============================================================================================
+#
+# What the module above stops at is a quote. This section is the rest of the buyer-funded rail,
+# and it still moves no money on our side: the buyer enters THEIR OWN card on a page Reap hosts,
+# and we read the outcome back by polling. Nothing here authorises, captures or funds anything.
+#
+# THE ONE ENROLLMENT BRANCH WE SUPPORT. `POST /agentic/enrollments` is a `oneOf` over three
+# sources. `REAP_CARD` and `BIN_SPONSOR` both take a `cardId` and both enroll a card that has
+# already been ISSUED -- they are the Program-Funded rail, which is dormant BY DESIGN under the
+# 6 Sep constraint that Pivota never holds or moves money. `EXTERNAL` is the buyer's own card,
+# captured on Reap's hosted page. So the builder below does not merely default to EXTERNAL: it
+# REFUSES the other two, and refuses a `cardId` key however it is spelled. A default can be
+# overridden by a caller who has read half the docs; a refusal cannot.
+#
+# THE SHAPE CHANGED UNDER US. Checkout creation no longer takes an `owner` block -- the owner is
+# now carried by the enrollment, and `enrollmentId` replaced it. `info.version` is still 1.0.0,
+# so the document gives no signal that anything moved. That is the whole reason
+# `tests/fixtures/reap_openapi_agentic_2026_09_17.json` and `scripts/ops/reap_spec_diff.py`
+# exist: the spec is pinned to a file in this repo, and a difference is a failing diff rather
+# than a 400 in production.
+
+
+# --- URLs in both directions -----------------------------------------------------------------
+
+
+def return_url_hosts() -> Tuple[str, ...]:
+    """Hosts our own `returnUrl` may name. `REAP_RETURN_URL_HOSTS`, comma-separated.
+
+    An empty or unset variable means the default rather than "no hosts": an operator who clears
+    a variable should get the shipped behaviour, not a client that refuses every enrollment.
+    """
+    raw = (os.getenv("REAP_RETURN_URL_HOSTS") or "").strip()
+    hosts = tuple(h.strip().lower() for h in raw.split(",") if h.strip())
+    return hosts or DEFAULT_RETURN_URL_HOSTS
+
+
+def validate_return_url(raw: Any) -> str:
+    """Return the URL or raise. https, an allowlisted host, no userinfo. A query string is FINE.
+
+    This URL is ours, and it is the only join we have between a Reap checkout and the session
+    that started it -- there is no attribution field in any request body and agentic resources
+    have no webhooks -- so it has to be allowed to carry a click id. What it may NOT do is name
+    a host that is not ours: Reap sends a buyer's browser here after they have entered a card,
+    and a caller-supplied host would turn our enrollment endpoint into an open redirector with a
+    payment page in front of it.
+
+    `no userinfo` is not decoration. `https://agent.pivota.cc@evil.example/` has a HOSTNAME of
+    `evil.example`; a check written against the string rather than the parse reads it the other
+    way round. `urlparse` gets this right, and rejecting userinfo outright means nothing
+    downstream has to.
+    """
+    url = str(raw or "").strip()
+    if not url:
+        raise ReapRequestError("a hosted flow needs a returnUrl")
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        raise ReapRequestError(f"returnUrl must be https, got {parsed.scheme or 'none'!r}")
+    if parsed.username or parsed.password:
+        raise ReapRequestError("returnUrl must not carry userinfo")
+    host = (parsed.hostname or "").lower()
+    allowed = return_url_hosts()
+    if not host or not any(host == h or host.endswith("." + h) for h in allowed):
+        raise ReapRequestError(
+            f"returnUrl host {host!r} is not in REAP_RETURN_URL_HOSTS {allowed}"
+        )
+    return url
+
+
+def hosted_url_is_allowed(raw: Any) -> bool:
+    """Is a URL REAP GAVE US one we may hand to a buyer? https, no userinfo, allowlisted suffix.
+
+    Exact-or-dot-suffix, the same comparison `validate_base_url` uses, and for the same reason:
+    `evilprava.space` and `prava.space.evil.example` both pass a naive `endswith`, and this is a
+    page where somebody types a card number.
+    """
+    url = str(raw or "").strip()
+    if not url:
+        return False
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.username or parsed.password:
+        return False
+    host = (parsed.hostname or "").lower()
+    return bool(host) and any(
+        host == suffix or host.endswith("." + suffix) for suffix in ALLOWED_HOSTED_URL_SUFFIXES
+    )
+
+
+def hosted_action(payload: Any) -> Optional[Tuple[str, Optional[str]]]:
+    """`(url, expiresAt)` from a `nextAction`, or None.
+
+    None means three different things and deliberately collapses them: there is no next action,
+    the next action has no URL, or the URL is one we refuse to hand a buyer. A caller must treat
+    all three as "there is nowhere to send the buyer" -- the ONE thing it must never do is reach
+    into `nextAction.url` itself, which is why this returns the pair rather than the block.
+
+    `expiresAt` is Optional because the spec marks it so: `nextAction` requires only `type` and
+    `url`. A caller that treats a missing expiry as "expired" would refuse every action Reap
+    sends without one.
+    """
+    data = payload if isinstance(payload, dict) else {}
+    action = data.get("nextAction")
+    if not isinstance(action, dict):
+        return None
+    url = str(action.get("url") or "").strip()
+    if not hosted_url_is_allowed(url):
+        return None
+    expires = action.get("expiresAt")
+    return url, (str(expires) if isinstance(expires, str) and expires else None)
+
+
+def _refuse_unsafe_hosted_url(result: ReapResponse) -> ReapResponse:
+    """A 200 whose `nextAction.url` we cannot vouch for is a REFUSAL, not a warning.
+
+    The response is replaced rather than annotated, and `data` is dropped: a caller handed the
+    payload "with a flag on it" reads `nextAction.url` out of it, because that is the field the
+    whole call was for. The only way to be sure the URL is not used is for it not to be there.
+    """
+    if not result.ok:
+        return result
+    action = result.data.get("nextAction") if isinstance(result.data, dict) else None
+    if isinstance(action, dict) and not hosted_url_is_allowed(action.get("url")):
+        # The URL itself is not logged: it came from a partner and it is the untrusted value.
+        logger.warning("reap returned a hosted url outside %s; refusing the response",
+                       ALLOWED_HOSTED_URL_SUFFIXES)
+        return ReapResponse(ok=False, status=result.status, error="hosted_url_not_allowed")
+    return result
+
+
+# --- path parameters: validated before they are ever placed in a URL --------------------------
+
+
+#: The spec's own uuid pattern, in the form it applies to an ENROLLMENT id.
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+#: Quote ids, checkout ids and shipping-option ids. SPEC-DERIVED, and narrower than the spec:
+#: the spec says `string, minLength 1` for every one of these, and a measured sandbox quote id
+#: (`f1e2d3c4`) is not a uuid, so requiring a uuid here would refuse real ids. What this DOES
+#: guarantee is the thing a path parameter has to guarantee -- no `/`, no `?`, no `#`, no `..`,
+#: nothing percent-encoded -- so a caller-supplied id cannot move the request to another path or
+#: bolt a query parameter onto it.
+_OPAQUE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _path_id(value: Any, *, what: str, uuid: bool = False) -> str:
+    """Validate an id BEFORE it is formatted into a URL, or raise.
+
+    The check has to happen here rather than at the call site, because the call site is where
+    somebody will one day write an f-string. `_get` never formats anything it has not been
+    handed by this function.
+    """
+    text = str(value or "").strip()
+    if not text:
+        raise ReapRequestError(f"a {what} id is required")
+    pattern = _UUID_RE if uuid else _OPAQUE_ID_RE
+    if not pattern.match(text):
+        # The VALUE is echoed, truncated: it is ours or Reap's, never a credential, and an
+        # operator with a malformed id needs to see which one it was.
+        raise ReapRequestError(
+            f"{what} id {text[:64]!r} is not a valid "
+            + ("uuid" if uuid else "opaque id ([A-Za-z0-9_-]{1,64})")
+        )
+    return text
+
+
+# --- request builders: whitelist the fields, drop or refuse everything else --------------------
+
+
+#: The two enrollment sources that take a `cardId`. Both are the card-ISSUANCE rail.
+_CARD_ISSUANCE_SOURCES = ("REAP_CARD", "BIN_SPONSOR")
+
+#: Spellings of `cardId` a caller might reach for. Compared after stripping `_` and case, so
+#: `cardId`, `card_id` and `CardID` are all the same refusal.
+_CARD_ID_KEYS = ("cardid",)
+
+
+def _key_shape(name: Any) -> str:
+    return str(name or "").replace("_", "").lower()
+
+
+def build_enrollment_request(
+    *,
+    owner_id: str,
+    return_url: str,
+    email: Optional[str] = None,
+    source: str = "EXTERNAL",
+    **unsupported: Any,
+) -> Dict[str, Any]:
+    """`POST /agentic/enrollments`, EXTERNAL branch only.
+
+    THE REFUSALS ARE THE POINT. `source` is a parameter rather than a constant so that the
+    refusal is reachable and testable, not so that a caller can change it: anything but EXTERNAL
+    raises, and so does a `cardId` under any spelling. Those two sources enroll an ALREADY-ISSUED
+    card -- the Program-Funded rail, dormant by design under "Pivota never holds or moves money"
+    -- and this module must not be the place someone accidentally reopens it. A default would
+    have been a suggestion; this is a wall.
+
+    `email` is optional and prefills the hosted page. It is real buyer PII crossing to a third
+    party, so it is included only when a caller passes it, and it is deliberately NOT part of
+    the idempotency key.
+    """
+    wanted = str(source or "").strip().upper()
+    if wanted in _CARD_ISSUANCE_SOURCES:
+        raise ReapRequestError(
+            f"enrollment source {wanted} is the card-issuance rail and is not buildable here; "
+            "Pivota never holds or moves money, so the only supported source is EXTERNAL"
+        )
+    if wanted != "EXTERNAL":
+        raise ReapRequestError(f"enrollment source must be EXTERNAL, got {wanted!r}")
+    for key in unsupported:
+        if _key_shape(key) in _CARD_ID_KEYS:
+            raise ReapRequestError(
+                "cardId belongs to the card-issuance rail (REAP_CARD / BIN_SPONSOR) and cannot "
+                "be sent from this module"
+            )
+    if unsupported:
+        # Unknown keys are refused rather than dropped HERE, unlike the address builder: an
+        # address has a fixed set of optional fields and a stray key is a caller mistake, but a
+        # stray key on an enrollment is more likely someone building a branch we do not support.
+        raise ReapRequestError(
+            f"unsupported enrollment fields: {','.join(sorted(str(k) for k in unsupported))}"
+        )
+
+    reference = str(owner_id or "").strip()
+    if not reference:
+        raise ReapRequestError("an enrollment needs an owner id (our client reference)")
+    owner: Dict[str, Any] = {"type": "CLIENT_REFERENCE", "id": reference}
+    address = str(email or "").strip()
+    if address:
+        if "@" not in address:
+            raise ReapRequestError("enrollment owner email is not an email address")
+        owner["email"] = address
+    return {
+        "source": "EXTERNAL",
+        "owner": owner,
+        "presentation": {"type": "REDIRECT", "returnUrl": validate_return_url(return_url)},
+    }
+
+
+def build_checkout_request(
+    *,
+    quote_id: str,
+    enrollment_id: str,
+    return_url: str,
+    **unsupported: Any,
+) -> Dict[str, Any]:
+    """`POST /agentic/checkouts`. Exactly `quoteId`, `enrollmentId`, `presentation`.
+
+    THERE IS NO `owner` FIELD ANY MORE. It was one of three required fields on this body and it
+    is now absent from the schema entirely -- the owner is carried by the enrollment. `info.version`
+    did not move, so nothing in the document says so. Reap accepts unknown keys silently with a
+    200 and drops them, which is the property that makes a stale field invisible rather than
+    loud: a body still sending `owner` would look exactly like a body that worked. So `owner` is
+    refused BY NAME here, with its own message, rather than falling through the generic branch.
+    """
+    for key in unsupported:
+        if _key_shape(key) == "owner":
+            raise ReapRequestError(
+                "checkout creation no longer takes an `owner`; the owner is carried by the "
+                "enrollment and `enrollmentId` replaced it (spec read 17 Sep, info.version "
+                "unchanged at 1.0.0)"
+            )
+    if unsupported:
+        raise ReapRequestError(
+            f"unsupported checkout fields: {','.join(sorted(str(k) for k in unsupported))}"
+        )
+    return {
+        "quoteId": _path_id(quote_id, what="quote"),
+        "enrollmentId": _path_id(enrollment_id, what="enrollment", uuid=True),
+        "presentation": {"type": "REDIRECT", "returnUrl": validate_return_url(return_url)},
+    }
+
+
+def build_shipping_option_request(shipping_option_id: str) -> Dict[str, Any]:
+    """`POST /agentic/quotes/{id}/shipping-option`. One field.
+
+    The id is charset-checked with the same rule as a path parameter. The spec puts it in the
+    BODY, not the path, so this is not an injection guard -- it is the cheap shape check that
+    catches an id from the wrong namespace before a round trip, the same move
+    `build_quote_items` makes for `var_...`.
+    """
+    return {"shippingOptionId": _path_id(shipping_option_id, what="shipping option")}
+
+
+# --- calls ------------------------------------------------------------------------------------
+
+
+async def create_enrollment(
+    *,
+    owner_id: str,
+    return_url: str,
+    email: Optional[str] = None,
+    timeout_seconds: Optional[float] = None,
+) -> ReapResponse:
+    """Start a hosted card-entry flow. Returns an enrollment whose `nextAction.url` a HUMAN opens.
+
+    Fast path: the enrollment create is not talking to a merchant's commerce layer the way a
+    quote is, so it keeps the default timeout rather than the 35 s quote bound.
+    """
+    body = build_enrollment_request(owner_id=owner_id, return_url=return_url, email=email)
+    return _refuse_unsafe_hosted_url(
+        await _post("/agentic/enrollments", body, timeout_seconds=timeout_seconds)
+    )
+
+
+async def get_enrollment(
+    enrollment_id: str, *, timeout_seconds: Optional[float] = None
+) -> ReapResponse:
+    eid = _path_id(enrollment_id, what="enrollment", uuid=True)
+    return _refuse_unsafe_hosted_url(
+        await _get(f"/agentic/enrollments/{eid}", timeout_seconds=timeout_seconds)
+    )
+
+
+async def list_enrollments(
+    *,
+    owner_id: str,
+    limit: Optional[int] = None,
+    cursor: Optional[str] = None,
+    owner_type: str = "CLIENT_REFERENCE",
+    timeout_seconds: Optional[float] = None,
+) -> ReapResponse:
+    """`GET /agentic/enrollments?ownerId=...`. A list is always scoped to exactly ONE owner.
+
+    `ownerId` is required by the spec and its absence is a 422, so it is refused here before
+    egress -- a listing with no owner is not a broader listing, it is an error, and a caller
+    that wrote `owner_id=None` meant something that cannot be served.
+    """
+    owner = str(owner_id or "").strip()
+    if not owner:
+        raise ReapRequestError("listing enrollments requires an ownerId; it is not optional")
+    params: Dict[str, Any] = {"ownerId": owner, "ownerType": str(owner_type or "CLIENT_REFERENCE")}
+    if limit is not None:
+        # Clamped rather than refused: the spec's bounds are 1..100 and a caller asking for 500
+        # wants "as many as possible", which is what it gets.
+        params["limit"] = max(1, min(100, int(limit)))
+    if cursor:
+        params["cursor"] = str(cursor)
+    return await _get("/agentic/enrollments", params=params, timeout_seconds=timeout_seconds)
+
+
+async def create_checkout(
+    *,
+    quote_id: str,
+    enrollment_id: str,
+    return_url: str,
+    timeout_seconds: Optional[float] = None,
+) -> ReapResponse:
+    """`POST /agentic/checkouts`. Already in the slow-path set: it is the leg that talks to the
+    merchant, and it carries the quote's 35 s bound rather than the 12 s default."""
+    body = build_checkout_request(
+        quote_id=quote_id, enrollment_id=enrollment_id, return_url=return_url
+    )
+    return _refuse_unsafe_hosted_url(
+        await _post("/agentic/checkouts", body, timeout_seconds=timeout_seconds)
+    )
+
+
+async def get_checkout(checkout_id: str, *, timeout_seconds: Optional[float] = None) -> ReapResponse:
+    """The poll. Agentic resources have NO WEBHOOKS, so this is the only way an outcome is ever
+    learned -- there is nothing that will tell us."""
+    cid = _path_id(checkout_id, what="checkout")
+    return _refuse_unsafe_hosted_url(
+        await _get(f"/agentic/checkouts/{cid}", timeout_seconds=timeout_seconds)
+    )
+
+
+async def get_quote(quote_id: str, *, timeout_seconds: Optional[float] = None) -> ReapResponse:
+    qid = _path_id(quote_id, what="quote")
+    return await _get(f"/agentic/quotes/{qid}", timeout_seconds=timeout_seconds)
+
+
+async def select_shipping_option(
+    *,
+    quote_id: str,
+    shipping_option_id: str,
+    timeout_seconds: Optional[float] = None,
+) -> ReapResponse:
+    """Choose a shipping option. Returns the UPDATED QUOTE -- the same shape as
+    `GET /agentic/quotes/{id}`, with a new `amountBreakdown`. Read the total from the response,
+    never from the quote you already had: choosing a shipping option is what changes it."""
+    qid = _path_id(quote_id, what="quote")
+    return await _post(
+        f"/agentic/quotes/{qid}/shipping-option",
+        build_shipping_option_request(shipping_option_id),
+        timeout_seconds=timeout_seconds,
+    )
+
+
+# --- pure state readers -------------------------------------------------------------------------
+#
+# Every one of these maps an UNRECOGNISED status to its own value rather than to a failure or a
+# success. That is not defensiveness for its own sake: Reap changed a required field on this
+# module's surface between two reads of a document whose version did not change, and a mapping
+# that folded an unknown string into "dead" would retire a live enrollment, while one that folded
+# it into "active" would send a buyer to a checkout that cannot complete. "unknown" is a state a
+# caller has to handle, which is the honest answer.
+
+
+ENROLLMENT_STATES = {
+    "ACTIVE": "active",
+    "REQUIRES_ACTION": "pending",
+    "FAILED": "dead",
+    "EXPIRED": "dead",
+    "REVOKED": "dead",
+}
+
+CHECKOUT_STATES = {
+    "REQUIRES_ACTION": "awaiting_buyer",
+    "PROCESSING": "processing",
+    "COMPLETED": "completed",
+    "FAILED": "failed",
+    "EXPIRED": "expired",
+}
+
+#: What an unrecognised or missing status maps to, in both machines.
+UNKNOWN_STATE = "unknown"
+
+
+def _status_of(payload: Any) -> str:
+    data = payload if isinstance(payload, dict) else {}
+    return str(data.get("status") or "").strip().upper()
+
+
+def enrollment_state(payload: Any) -> str:
+    """`active` | `pending` | `dead` | `unknown`.
+
+    `pending` (REQUIRES_ACTION) means the buyer has not finished the hosted card page yet, and
+    is the state a freshly created enrollment is in. `dead` is terminal in three different ways
+    -- FAILED, EXPIRED, REVOKED -- which are one state for our purposes because the move is the
+    same: enroll again. A caller that needs the distinction reads `status` itself.
+    """
+    return ENROLLMENT_STATES.get(_status_of(payload), UNKNOWN_STATE)
+
+
+def checkout_state(payload: Any) -> str:
+    """`awaiting_buyer` | `processing` | `completed` | `failed` | `expired` | `unknown`.
+
+    `processing` is NOT completed. The buyer has approved and Reap is placing the order; an
+    `orderId` appears only on COMPLETED, and treating PROCESSING as done reports a purchase that
+    may still fail.
+    """
+    return CHECKOUT_STATES.get(_status_of(payload), UNKNOWN_STATE)
+
+
+def checkout_is_terminal(payload: Any) -> bool:
+    """Should a poller stop? COMPLETED, FAILED and EXPIRED only.
+
+    `unknown` is explicitly NOT terminal: a status we do not recognise is a reason to keep
+    looking and to tell a human, not a reason to stop and declare an outcome we cannot name.
+    """
+    return checkout_state(payload) in ("completed", "failed", "expired")
+
+
