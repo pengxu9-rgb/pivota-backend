@@ -284,6 +284,7 @@ def _install_bounded_pool_checkout() -> bool:
                 timeout=DB_POOL_CHECKOUT_TIMEOUT_SECONDS
             )
         except (asyncio.TimeoutError, TimeoutError) as exc:
+            _log_holders_on_starvation()
             pool = self._database._pool
             # Attribution, which the bare TimeoutError cannot carry: an empty
             # message in a 5xx tells an operator nothing about WHY.
@@ -298,10 +299,93 @@ def _install_bounded_pool_checkout() -> bool:
                 "timed out waiting %.1fs for a database connection"
                 % DB_POOL_CHECKOUT_TIMEOUT_SECONDS
             ) from exc
+        _track_checkout(self)
 
     acquire._pivota_bounded = True  # type: ignore[attr-defined]
     PostgresConnection.acquire = acquire  # type: ignore[assignment]
+    _install_release_tracking(PostgresConnection)
     return True
+
+
+# HOLDER TRACKING — which code took the connections that never came back.
+#
+# 2026-09-16: web's pool emptied again (4 instances x 13 connections, all plain
+# `idle` for up to 12h, Cloud SQL CPU 0.1-0.35), the fourth time this wedge has
+# cost a restart with no cause. /__pool_health's `tasks_by_frame` cannot name a
+# LEAK: a connection whose task already finished has no task to park. Only the
+# acquisition site can still be recovered, and only if it was recorded then.
+# See db/pool_holders.py. On by default because the evidence exists only in the
+# minutes before a restart; `DB_POOL_HOLDER_TRACKING=0` switches it off.
+DB_POOL_HOLDER_TRACKING = (os.getenv("DB_POOL_HOLDER_TRACKING") or "1").strip().lower() not in {
+    "0", "false", "no", "off"
+}
+DB_POOL_HOLDER_WARN_SECONDS = _env_float(
+    # No legitimate request holds a connection for 5 minutes: Cloud Run cuts a
+    # request at 300s and DB_COMMAND_TIMEOUT_SECONDS bounds a statement at 600s
+    # only for batch work, which would log once here and be recognisable by site.
+    "DB_POOL_HOLDER_WARN_SECONDS", 300.0, min_value=5.0, max_value=86400.0
+)
+# The checkout-timeout warning fires once per starved caller — ~800 per 10 min
+# on 2026-09-16 — so the holder dump rides along at most this often.
+_HOLDER_DUMP_INTERVAL_SECONDS = 60.0
+_last_holder_dump = [0.0]
+
+
+def _track_checkout(conn) -> None:  # type: ignore[no-untyped-def]
+    """Record a successful checkout. Never lets instrumentation fail a query."""
+    if not DB_POOL_HOLDER_TRACKING:
+        return
+    try:
+        from db.pool_holders import REGISTRY, acquisition_site
+
+        REGISTRY.record(conn, acquisition_site(start_depth=2))
+        REGISTRY.warn_overdue(DB_POOL_HOLDER_WARN_SECONDS)
+    except Exception:  # noqa: BLE001
+        logger.debug("pool holder tracking failed on checkout", exc_info=True)
+
+
+def _log_holders_on_starvation() -> None:
+    if not DB_POOL_HOLDER_TRACKING:
+        return
+    import time as _time
+
+    now = _time.monotonic()
+    if now - _last_holder_dump[0] < _HOLDER_DUMP_INTERVAL_SECONDS:
+        return
+    _last_holder_dump[0] = now
+    try:
+        from db.pool_holders import REGISTRY
+
+        REGISTRY.warn_overdue(DB_POOL_HOLDER_WARN_SECONDS)
+        logger.warning("database pool starved; live checkouts by acquisition site: %s",
+                       REGISTRY.snapshot())
+    except Exception:  # noqa: BLE001
+        logger.debug("pool holder dump failed", exc_info=True)
+
+
+def _install_release_tracking(PostgresConnection) -> None:  # type: ignore[no-untyped-def]
+    """Forget a checkout when `databases` hands the connection back."""
+    if getattr(PostgresConnection.release, "_pivota_tracked", False):
+        return
+    original_release = PostgresConnection.release
+
+    async def release(self) -> None:  # type: ignore[no-untyped-def]
+        try:
+            await original_release(self)
+        finally:
+            # In `finally`: a release that raised has still left `databases`
+            # believing the connection is gone, and a record that outlived it
+            # would be reported as a leak forever.
+            if DB_POOL_HOLDER_TRACKING:
+                try:
+                    from db.pool_holders import REGISTRY
+
+                    REGISTRY.forget(self)
+                except Exception:  # noqa: BLE001
+                    pass
+
+    release._pivota_tracked = True  # type: ignore[attr-defined]
+    PostgresConnection.release = release  # type: ignore[assignment]
 
 
 if IS_POSTGRES:
