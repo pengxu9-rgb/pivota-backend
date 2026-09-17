@@ -366,11 +366,19 @@ class _FakeResponse:
         #: How many bytes the caller actually pulled. A real bound STOPS READING; this is how a
         #: test tells "refused after reading it all" from "refused partway".
         self.bytes_yielded = 0
+        #: The chunk_size `_read_bounded` asked for, and the largest chunk it was actually handed.
+        #: Recorded because the SIZE OF ONE CHUNK is what the cap is enforced in steps of -- a
+        #: reader that omits chunk_size gets whatever httpx decodes in one go.
+        self.requested_chunk_size = "_MISSING"
+        self.largest_chunk = 0
 
-    async def aiter_bytes(self):
-        for start in range(0, len(self.content), self._chunk_size):
-            chunk = self.content[start:start + self._chunk_size]
+    async def aiter_bytes(self, chunk_size=None):
+        self.requested_chunk_size = chunk_size if chunk_size is not None else "_MISSING"
+        step = max(1, int(chunk_size)) if chunk_size else self._chunk_size
+        for start in range(0, len(self.content), step):
+            chunk = self.content[start:start + step]
             self.bytes_yielded += len(chunk)
+            self.largest_chunk = max(self.largest_chunk, len(chunk))
             yield chunk
 
     def json(self):
@@ -987,19 +995,22 @@ def test_different_carts_never_share_a_key():
     assert rc.idempotency_key("quotes", a, now=1.0) != rc.idempotency_key("quotes", b, now=1.0)
 
 
-# --- a single-value axis is compared, not assumed ------------------------------------------------
+# --- a single-value axis is compared EXACTLY, and bridged by an alias ------------------------------
 #
 # Measured on flowerbeauty.com "Petal Pout Lip Color": Reap indexes the per-shade page as its own
 # product, with ONE `Shade` axis carrying ONE value, `"Flamingo Flirt - Cream"`. Our row's title
-# is "Flamingo Flirt" — no finish suffix — so EXACT label matching refuses a row that has exactly
-# one possible answer, and loosening it to containment is right.
+# is "Flamingo Flirt" — no finish suffix — so exact label matching REFUSES it.
 #
-# CORRECTED. This section used to say a single-value axis is "determined" and that refusing there
-# "protects nothing", and the code accepted such an axis without looking at our title at all.
-# That is false, and B1 is what it cost: one value on an axis means there is nothing to choose
-# BETWEEN, not that Reap's one value is the thing our row describes. The measured counter-example
-# is a `Size` axis carrying only `Mini` ($95) against our $140 Standard row — accepted, resolved,
-# and then invisible to the substitution guard, because `chosen` had recorded Reap's own label.
+# CORRECTED TWICE, and the second correction reverses the first. This section originally said a
+# single-value axis is "determined" and that refusing there "protects nothing", while the code
+# accepted such an axis without looking at our title at all. It then said the right answer was to
+# loosen the comparison to containment. Both were wrong, and the second cost three review rounds:
+# substring containment bought "150ml" for a "50ml" row, and whole-token subset bought a $39
+# travel spray for a $78 duo-set row and a "7 oz" bottle for a "1.7 oz" one.
+#
+# The rule is now EXACT on every axis, and the flowerbeauty row is resolved by an explicit alias
+# (`accept_variant_labels`) — a human asserting that two names are one object, which is the
+# judgement no string rule was able to make. Refusing without one is correct, not a gap.
 
 FLOWER_DETAILS = {
     "products": [{
@@ -1033,16 +1044,21 @@ FLOWER_VARIANT = {
 }
 
 
-def test_an_axis_with_one_value_is_determined_even_when_the_label_differs():
-    """The real case, and the reason the comparison is containment rather than equality: our
-    title is a PREFIX of Reap's label, which carries a finish suffix our catalog does not store."""
+def test_an_axis_with_one_value_whose_label_differs_needs_an_alias():
+    """The real flowerbeauty.com row: our title is a PREFIX of Reap's label, which carries a
+    finish suffix our catalog does not store. Two successive rules tried to bridge that gap by
+    string cleverness and each was measured buying a different physical object, so the gap is now
+    bridged by DATA — and only by data."""
+    without = rc.select_option_ids(FLOWER_DETAILS["products"][0],
+                                   rc.variant_title_tokens("Flamingo Flirt"))
+    assert not without.ok and without.reason == "sole_label_differs:Shade"
+
     got = rc.select_option_ids(FLOWER_DETAILS["products"][0],
-                               rc.variant_title_tokens("Flamingo Flirt"))
+                               rc.variant_title_tokens("Flamingo Flirt"),
+                               accept_variant_labels=["Flamingo Flirt - Cream"])
     assert got.ok and got.option_ids == ["opt_flamingo"]
     # `chosen` records REAP's label, because Reap's optionId is what we send and Reap's label is
-    # what the response echoes. That is sound only because the label was checked against our title
-    # first — before the B1 fix nothing compared them, and `chosen` made the guard downstream
-    # compare Reap to Reap.
+    # what the response echoes. Sound because that exact string was asserted by a human.
     assert got.chosen == {"Shade": "Flamingo Flirt - Cream"}
     assert got.single_value_axis_accepted_without_title is False
 
@@ -1058,7 +1074,7 @@ def test_a_single_value_axis_is_still_compared_to_our_title():
     Reap and could not refuse anything."""
     got = rc.select_option_ids(FLOWER_DETAILS["products"][0], ["anything"])
     assert not got.ok
-    assert got.reason == "axes_not_determined_by_title"
+    assert got.reason == "sole_label_differs:Shade"
     assert got.unmatched_axes == ["Shade"]
 
 
@@ -1075,7 +1091,7 @@ def test_the_single_value_axis_hole_would_have_resolved_the_95_dollar_mini_for_o
         {"label": "Mini", "optionId": "opt_mini", "available": True}]}]}
     got = rc.select_option_ids(mini_only, rc.variant_title_tokens("Standard"))
     assert not got.ok
-    assert got.reason == "axes_not_determined_by_title"
+    assert got.reason == "sole_label_differs:Size"
     assert got.option_ids == []
     assert "Size" not in got.chosen
 
@@ -1084,13 +1100,16 @@ def test_the_single_value_axis_hole_would_have_resolved_the_95_dollar_mini_for_o
     assert rc.variant_matches_request(reap_answered_mini, {"Size": "Mini"}) is None
 
 
-def test_a_single_value_axis_accepts_when_reaps_label_is_inside_our_title():
-    """Containment BOTH ways round. Our catalog sometimes carries the longer string: a row titled
-    "Flamingo Flirt Cream Finish" against Reap's bare "Flamingo Flirt" is the same product."""
+def test_a_title_broader_than_reaps_label_is_refused_too():
+    """INVERTED. This asserted that containment the other way round was fine — our longer title
+    against Reap's shorter label. That is the direction round 3 measured buying a $39 travel spray
+    for a $78 duo-set row, because a superset title "covered" whatever Reap named. Both directions
+    are refusals now, and both are an alias away from resolving."""
     product = json.loads(json.dumps(FLOWER_DETAILS["products"][0]))
     product["options"][0]["values"][0]["label"] = "Flamingo Flirt"
     got = rc.select_option_ids(product, rc.variant_title_tokens("Flamingo Flirt Cream Finish"))
-    assert got.ok and got.option_ids == ["opt_flamingo"]
+    assert not got.ok and got.reason == "sole_label_differs:Shade"
+    assert got.candidates == [{"axis": "Shade", "label": "Flamingo Flirt"}]
 
 
 def test_a_single_value_axis_with_no_title_resolves_only_when_there_is_one_axis():
@@ -1128,47 +1147,42 @@ def test_the_untitled_single_axis_acceptance_is_visible_on_the_resolution(monkey
 
     titled = _run(rc.resolve_our_row(
         merchant_domain="flowerbeauty.com", product_name="Petal Pout Lip Color",
-        variant_title="Flamingo Flirt"))
+        variant_title="Flamingo Flirt",
+        accept_variant_labels=["Flamingo Flirt - Cream"]))
     assert titled.ok and titled.single_value_axis_accepted_without_title is False
 
 
 def test_a_single_value_axis_still_reports_unavailability():
-    """The rule determines WHICH value, not whether Reap will sell it."""
+    """Matching decides WHICH value, never whether Reap will sell it. Reached here through an
+    alias, which is the only way this label resolves now — and an alias must not smuggle a row
+    past the availability flag either."""
     product = json.loads(json.dumps(FLOWER_DETAILS["products"][0]))
     product["options"][0]["values"][0]["available"] = False
-    got = rc.select_option_ids(product, ["Flamingo Flirt"])
+    got = rc.select_option_ids(product, ["Flamingo Flirt"],
+                               accept_variant_labels=["Flamingo Flirt - Cream"])
     assert got.ok and got.unavailable_axes == ["Shade"]
-
-
-def test_the_flowerbeauty_row_resolves_end_to_end(monkeypatch):
-    fake = _chain(monkeypatch, search=FLOWER_SEARCH, details=FLOWER_DETAILS,
-                  variant=FLOWER_VARIANT)
-    got = _run(rc.resolve_our_row(
-        merchant_domain="flowerbeauty.com", product_name="Petal Pout Lip Color",
-        variant_title="Flamingo Flirt", our_price=8.00, currency="USD",
-    ))
-    assert got.ok and got.variant_id == "var_flamingo"
-    assert got.price == (8.0, "USD") and got.price_disagrees is False
-    assert fake.variant_body == {"productId": "prd_petalpout", "optionIds": ["opt_flamingo"]}
 
 
 def test_the_substitution_guard_compares_against_reaps_label_not_our_title(monkeypatch):
     """Because we send Reap's optionId, the response echoes Reap's label, so the guard compares
-    the response to THAT label rather than to our catalog's title — otherwise every correctly
-    resolved single-value axis would be refused on the finish suffix alone.
+    the response to THAT label rather than to our catalog's title.
 
-    CORRECTED. The old docstring said this made the guard "compare against what we actually asked
-    for", and that was false in the case it was written to justify: when the label had never been
-    checked against our title, `chosen` was Reap's answer and the guard compared Reap to Reap. The
-    guard is only meaningful because `select_option_ids` now establishes, before writing `chosen`,
-    that Reap's label and our title describe the same thing. What this test proves is narrower
-    than the old claim: that a DIFFERENT label coming back is still caught."""
+    CORRECTED TWICE. The original docstring said this made the guard "compare against what we
+    actually asked for", which was false while the label had never been checked against our title
+    — `chosen` was Reap's own answer and the guard compared Reap to Reap. The second version said
+    the check "establishes that Reap's label and our title describe the same thing", which was
+    true only as far as a fuzzy rule can establish anything, and that rule was measured buying
+    three different wrong objects. What makes `chosen` trustworthy NOW is that the label either
+    equals our title exactly or was named verbatim in `accept_variant_labels` by a human. What
+    this test proves is the narrow thing it always proved: a DIFFERENT label coming back is
+    caught."""
     substituted = json.loads(json.dumps(FLOWER_VARIANT))
     substituted["options"] = [{"name": "Shade", "value": "Petal Pink - Matte"}]
     _chain(monkeypatch, search=FLOWER_SEARCH, details=FLOWER_DETAILS, variant=substituted)
     got = _run(rc.resolve_our_row(
         merchant_domain="flowerbeauty.com", product_name="Petal Pout Lip Color",
         variant_title="Flamingo Flirt",
+        accept_variant_labels=["Flamingo Flirt - Cream"],
     ))
     assert not got.ok
     assert got.reason.startswith("variant:substituted_on_axis:Shade:asked=Flamingo Flirt - Cream")
@@ -1227,6 +1241,7 @@ def test_a_first_query_that_misses_the_merchant_is_retried_with_another(monkeypa
     got = _run(rc.resolve_our_row(
         merchant_domain="flowerbeauty.com", product_name="Petal Pout Lip Color",
         brand="Flower Beauty", variant_title="Flamingo Flirt", our_price=8.00,
+        accept_variant_labels=["Flamingo Flirt - Cream"],
     ))
     assert got.ok and got.variant_id == "var_flamingo"
     assert seen[0] == "Flower Beauty Petal Pout Lip Color"
@@ -1452,7 +1467,8 @@ def test_the_degraded_flag_is_not_set_on_a_success(monkeypatch):
     _chain(monkeypatch, search=FLOWER_SEARCH, details=FLOWER_DETAILS, variant=FLOWER_VARIANT)
     got = _run(rc.resolve_our_row(
         merchant_domain="flowerbeauty.com", product_name="Petal Pout Lip Color",
-        brand="Flower Beauty", category="lip color", variant_title="Flamingo Flirt"))
+        brand="Flower Beauty", category="lip color", variant_title="Flamingo Flirt",
+        accept_variant_labels=["Flamingo Flirt - Cream"]))
     assert got.ok and got.recall_degraded is False
 
 
@@ -1485,7 +1501,7 @@ def test_the_full_ladder_is_sent_when_earlier_rungs_miss(monkeypatch):
     got = _run(rc.resolve_our_row(
         merchant_domain="flowerbeauty.com", product_name="Petal Pout Lip Color",
         brand="Flower Beauty", category="lip color", variant_title="Flamingo Flirt",
-        our_price=8.00,
+        our_price=8.00, accept_variant_labels=["Flamingo Flirt - Cream"],
     ))
     assert got.ok and got.variant_id == "var_flamingo"
     assert seen == ["Flower Beauty Petal Pout Lip Color", "Petal Pout Lip Color",
@@ -1896,8 +1912,9 @@ def test_a_malformed_merchant_does_not_crash_the_whole_chain(monkeypatch):
 # --- C2: the response is bounded ---------------------------------------------------------------------
 
 def test_a_declared_content_length_over_the_cap_is_refused_without_parsing(wire):
-    """The cheap check. Nothing upstream limits what a partner returns, and `resp.json()` on a
-    multi-megabyte document allocates the parsed graph on top of the bytes, in a serving path."""
+    """The cheap check: a declared length can refuse before any body is read at all. Nothing
+    upstream limits what a partner returns, and parsing a multi-megabyte document allocates the
+    object graph on top of the bytes, in a serving path."""
     wire.next_headers = {"content-length": str(rc.MAX_RESPONSE_BYTES + 1)}
     got = _run(rc.search_products(query="x"))
     assert not got.ok and got.error == "response_too_large"
@@ -2059,112 +2076,349 @@ def test_the_env_timeout_helper_reports_a_usable_floor(monkeypatch):
 # ==================================================================================================
 
 
-# --- P0: whole-token matching on a single-value axis ------------------------------------------------
+# --- P0: EXACT label matching, and the alias that replaces fuzziness --------------------------------
 #
-# The first fix compared our title to Reap's sole label with RAW SUBSTRING containment, which
-# ignores token boundaries completely. Every pair below resolved ok=True with a PASSING
-# substitution guard, because `chosen` recorded Reap's label and Reap then echoed it back.
+# Three review rounds each found this one comparison buying a different physical object. The rule
+# was the defect, not any particular version of it:
+#
+#   round 1  the label was not compared to our title at all
+#   round 2  raw SUBSTRING containment   our "50ml"                 -> Reap "150ml"
+#   round 3  whole-token subset + half   our "Travel Spray Duo Set" -> Reap "Travel"   ($78 -> $39)
+#                                        our "1.7 oz"               -> Reap "7 oz"
+#                                        our "Set"                  -> Reap "Gift Set"
+#                                        our "Red / 50ml"           -> Reap "50ml Travel Red Edition"
+#
+# So matching is now EXACT on every axis, and a legitimate mismatch is handled by DATA --
+# `accept_variant_labels` -- which is a human asserting that two names are one object.
 
-def _sole(label, option_id="opt_only", available=True):
-    return {"id": "prd_x", "options": [{"name": "Size", "values": [
+def _sole(label, option_id="opt_only", available=True, axis="Size"):
+    return {"id": "prd_x", "options": [{"name": axis, "values": [
         {"optionId": option_id, "label": label, "available": available}]}]}
 
 
-@pytest.mark.parametrize("our_title,reap_label", [
-    ("50ml", "150ml"),            # a 3x quantity, and the prices can plausibly agree
-    ("Red", "Fired Brick"),
-    ("Mini", "Minimalist Set"),
-    ("M", "Jumbo"),               # one letter, inside a word
-    ("S", "Standard"),
-    ("Tan", "Titanium"),
-    ("S/M", "Mini"),              # via the 1-char `/` fragments this used to produce
-])
-def test_a_substring_of_reaps_label_is_not_a_match(our_title, reap_label):
+MUST_REFUSE = [
+    # round 2's substring failures
+    ("50ml", "150ml"), ("Red", "Fired Brick"), ("Mini", "Minimalist Set"),
+    ("M", "Jumbo"), ("S", "Standard"),
+    # a generic minority token, and our title as a strict prefix
+    ("Cream", "Flamingo Flirt - Cream"), ("Flamingo", "Flamingo Flirt - Cream"),
+    # the measured row the first relaxation was written for. It refuses now, ON PURPOSE, and the
+    # alias test below is where it resolves.
+    ("Flamingo Flirt", "Flamingo Flirt - Cream"),
+    # round 3: the REVERSE direction, which had no coverage condition at all
+    ("Travel Spray Duo Set", "Travel"), ("Mini Duo Set", "Mini"), ("50ml Refill Pack", "50ml"),
+    # round 3: exactly-half let one generic token carry a two-token label
+    ("Set", "Gift Set"), ("Mini", "Mini Set"), ("100ml", "100ml Refill"),
+    # round 3: a decimal point split into two tokens, so the quantity was shared
+    ("1.7 oz", "7 oz"), ("0.5 oz", "5 oz"),
+    # round 3: a multi-axis title's tokens merged into one bag
+    ("Red / 50ml", "50ml Travel Red Edition"),
+    ("50/50 Blend", "50 ml"), ("3.38 fl.oz / 100mL", "100ml Refill"),
+    # plain near-misses, including the one-letter case
+    ("Large", "OS"), ("O", "OS"),
+    # and the non-Latin pairs, which must stay refused now that _norm keeps them distinct
+    ("標準", "ミニ"), ("ゴールド", "コールド"),
+]
+
+
+@pytest.mark.parametrize("our_title,reap_label", MUST_REFUSE)
+def test_a_sole_label_that_is_not_our_title_is_refused(our_title, reap_label):
+    """THE TABLE. Every row is a measured or constructed wrong purchase from one of the three
+    fuzzy rules. None of them may resolve without an explicit alias."""
     got = rc.select_option_ids(_sole(reap_label), rc.variant_title_tokens(our_title))
     assert not got.ok, f"{our_title!r} must not resolve {reap_label!r}"
-    assert got.reason == "axes_not_determined_by_title"
     assert got.option_ids == []
     assert got.chosen == {}
 
 
-def test_the_150ml_row_buys_the_right_bottle_end_to_end(monkeypatch):
-    """THE P0 REPRODUCTION. Our row is "Rose Serum / 50ml / $30 USD". Reap's only value is
-    `150ml`, also $30 — three times the product at the same price, which is exactly the shape a
-    price check cannot catch. Before the fix: ok=True, var_150, price_disagrees=False."""
-    search = {"products": [{"id": "prd_rose", "merchant": {"name": "example.com"},
+@pytest.mark.parametrize("our_title,reap_label", MUST_REFUSE)
+def test_every_refusal_in_the_table_is_actionable(our_title, reap_label):
+    """A single-value mismatch refuses as `sole_label_differs` and carries Reap's label, so an
+    operator can decide whether to store it as an alias without going back to the sandbox."""
+    got = rc.select_option_ids(_sole(reap_label), rc.variant_title_tokens(our_title))
+    assert got.reason == "sole_label_differs:Size"
+    assert got.candidates == [{"axis": "Size", "label": reap_label}]
+
+
+MUST_ACCEPT = [
+    ("OS", "OS"),
+    ("os ", " OS"),                                   # case and surrounding whitespace
+    ("Crème", "Creme"),                               # Latin accents still fold
+    ("3.38 fl.oz / 100mL", "3.38 fl.oz / 100mL"),     # the whole title, decimals intact
+]
+
+
+@pytest.mark.parametrize("our_title,reap_label", MUST_ACCEPT)
+def test_a_sole_label_equal_to_our_title_resolves(our_title, reap_label):
+    """The other half of the table. Exact does not mean byte-identical: `_norm` still folds case,
+    whitespace, punctuation and Latin accents."""
+    got = rc.select_option_ids(_sole(reap_label), rc.variant_title_tokens(our_title))
+    assert got.ok, f"{our_title!r} must resolve {reap_label!r}"
+    assert got.option_ids == ["opt_only"]
+    assert got.chosen == {"Size": reap_label}          # REAP's label, as always
+
+
+def test_a_multi_axis_title_matches_a_single_valued_axis_and_a_multi_valued_one():
+    """One rule for both branches, exercised on one product: `Color` carries a single value and
+    `Size` carries several, and the same title resolves both by equality."""
+    product = {"id": "prd_x", "options": [
+        {"name": "Color", "values": [
+            {"optionId": "opt_black", "label": "Black Wash", "available": True}]},
+        {"name": "Size", "values": [
+            {"optionId": "opt_l", "label": "Large", "available": True},
+            {"optionId": "opt_xxl", "label": "XXLarge", "available": True}]},
+    ]}
+    got = rc.select_option_ids(product, rc.variant_title_tokens("Black Wash / XXLarge"))
+    assert got.ok
+    assert got.option_ids == ["opt_black", "opt_xxl"]
+    assert got.chosen == {"Color": "Black Wash", "Size": "XXLarge"}
+
+
+# --- the alias hook: a human asserting two names are one object ---------------------------------
+
+def test_an_alias_resolves_the_row_that_exact_matching_refuses():
+    """THE DOCUMENTED EXAMPLE. Our title "Flamingo Flirt"; Reap's sole label
+    "Flamingo Flirt - Cream", which carries a finish suffix our catalog does not store. Without
+    the alias it refuses (it is in MUST_REFUSE above); with it, it resolves."""
+    got = rc.select_option_ids(
+        _sole("Flamingo Flirt - Cream", option_id="opt_flamingo"),
+        rc.variant_title_tokens("Flamingo Flirt"),
+        accept_variant_labels=["Flamingo Flirt - Cream"])
+    assert got.ok and got.option_ids == ["opt_flamingo"]
+    assert got.chosen == {"Size": "Flamingo Flirt - Cream"}
+
+
+def test_an_alias_joins_the_title_rather_than_replacing_it():
+    """A row can carry an alias for one axis and still match another axis by its own title. If
+    aliases REPLACED the title's candidates, supplying one would break every axis it does not
+    name — a silent regression on rows that were resolving fine."""
+    got = rc.select_option_ids(_sole("OS"), rc.variant_title_tokens("OS"),
+                               accept_variant_labels=["Some Other Shade"])
+    assert got.ok and got.chosen == {"Size": "OS"}
+
+    product = {"id": "prd_x", "options": [
+        {"name": "Shade", "values": [
+            {"optionId": "opt_s", "label": "Flamingo Flirt - Cream", "available": True}]},
+        {"name": "Size", "values": [
+            {"optionId": "opt_a", "label": "Full Size", "available": True},
+            {"optionId": "opt_b", "label": "Mini", "available": True}]},
+    ]}
+    both = rc.select_option_ids(product, rc.variant_title_tokens("Flamingo Flirt / Full Size"),
+                                accept_variant_labels=["Flamingo Flirt - Cream"])
+    assert both.ok
+    assert both.option_ids == ["opt_s", "opt_a"]   # one by alias, one by our own title
+
+
+def test_an_alias_does_not_rescue_a_broken_title():
+    """A title of "!!!" is a caller bug whether or not an alias is also supplied: the caller
+    believes it constrained the resolution and it did not. Refusing on the title is not something
+    an alias may switch off."""
+    got = rc.select_option_ids(_sole("Flamingo Flirt - Cream"),
+                               rc.variant_title_tokens("!!!"),
+                               accept_variant_labels=["Flamingo Flirt - Cream"])
+    assert not got.ok and got.reason == "variant_title_unusable"
+
+
+def test_an_alias_is_compared_exactly_like_any_other_candidate():
+    """An alias widens WHICH label we accept by exactly one string. It is not a pattern, and it
+    does not make neighbouring labels acceptable."""
+    alias = ["Flamingo Flirt - Cream"]
+    assert rc.select_option_ids(_sole("Flamingo Flirt - Matte"),
+                                rc.variant_title_tokens("Flamingo Flirt"),
+                                accept_variant_labels=alias).ok is False
+    assert rc.select_option_ids(_sole("Flamingo Flirt - Cream Deluxe"),
+                                rc.variant_title_tokens("Flamingo Flirt"),
+                                accept_variant_labels=alias).ok is False
+
+
+def test_an_alias_works_on_a_multi_value_axis_too():
+    """"on any axis", as specified — the alias joins the candidate set, and the candidate set is
+    what both branches test against."""
+    product = {"id": "prd_x", "options": [{"name": "Shade", "values": [
+        {"optionId": "opt_a", "label": "Flamingo Flirt - Cream", "available": True},
+        {"optionId": "opt_b", "label": "Petal Pink - Matte", "available": True}]}]}
+    got = rc.select_option_ids(product, rc.variant_title_tokens("Flamingo Flirt"),
+                               accept_variant_labels=["Flamingo Flirt - Cream"])
+    assert got.ok and got.option_ids == ["opt_a"]
+
+
+@pytest.mark.parametrize("alias", ["", "   ", "!!!", " - ", None, "Default Title"])
+def test_an_unusable_alias_is_ignored_not_treated_as_a_wildcard(alias):
+    """An alias that normalises to nothing must not become a blank key that matches a blank label,
+    and Shopify's placeholder is not an assertion about anything."""
+    got = rc.select_option_ids(_sole("Flamingo Flirt - Cream"),
+                               rc.variant_title_tokens("Flamingo Flirt"),
+                               accept_variant_labels=[alias])
+    assert not got.ok and got.reason == "sole_label_differs:Size"
+
+
+def test_an_alias_does_not_bypass_the_availability_refusal():
+    """An alias says "this label names our object". It says nothing about whether Reap will sell
+    it, and it must not be a way around the guard that stops us calling /variant for a value Reap
+    would substitute."""
+    got = rc.select_option_ids(
+        _sole("Flamingo Flirt - Cream", available=False),
+        rc.variant_title_tokens("Flamingo Flirt"),
+        accept_variant_labels=["Flamingo Flirt - Cream"])
+    assert got.ok                               # it MATCHED
+    assert got.unavailable_axes == ["Size"]     # and is still flagged unavailable
+    assert got.chosen_available == {"Size": False}
+
+
+def test_an_alias_does_not_bypass_the_substitution_guard():
+    """`chosen` still records Reap's label, so the response is still checked against it. An alias
+    changes which label we ask for, never whether we verify what came back."""
+    got = rc.select_option_ids(_sole("Flamingo Flirt - Cream"),
+                               rc.variant_title_tokens("Flamingo Flirt"),
+                               accept_variant_labels=["Flamingo Flirt - Cream"])
+    assert got.chosen == {"Size": "Flamingo Flirt - Cream"}
+    substituted = {"id": "var_x", "options": [{"name": "Size", "value": "Petal Pink - Matte"}]}
+    assert rc.variant_matches_request(substituted, got.chosen) == \
+        "substituted_on_axis:Size:asked=Flamingo Flirt - Cream:got=Petal Pink - Matte"
+
+
+# --- end to end, because a matcher test is not a purchase --------------------------------------
+
+def _one_axis_chain(monkeypatch, *, label, price, variant_label=None):
+    search = {"products": [{"id": "prd_e", "merchant": {"name": "example.com"},
                             "name": "Rose Serum"}], "warnings": []}
-    details = {"products": [{"id": "prd_rose", "merchant": {"name": "example.com"},
+    details = {"products": [{"id": "prd_e", "merchant": {"name": "example.com"},
                              "name": "Rose Serum",
                              "options": [{"name": "Size", "values": [
-                                 {"optionId": "opt_150", "label": "150ml",
+                                 {"optionId": "opt_e", "label": label,
                                   "available": True}]}]}], "errors": []}
-    variant = {"id": "var_150", "options": [{"name": "Size", "value": "150ml"}],
-               "price": {"amount": 30.0, "currency": "USD"}, "available": True}
-    fake = _chain(monkeypatch, search=search, details=details, variant=variant)
+    variant = {"id": "var_e",
+               "options": [{"name": "Size", "value": variant_label or label}],
+               "price": {"amount": price, "currency": "USD"}, "available": True}
+    return _chain(monkeypatch, search=search, details=details, variant=variant)
+
+
+def test_the_duo_set_row_does_not_buy_the_single_travel_spray(monkeypatch):
+    """ROUND 3's headline reproduction. Our row is a $78 "Travel Spray Duo Set"; Reap's only value
+    is "Travel" at $39. The token rule accepted it because our tokens were a superset of Reap's,
+    and the only signal was `price_disagrees` — which callers are explicitly told is as likely to
+    be our staleness as theirs."""
+    fake = _one_axis_chain(monkeypatch, label="Travel", price=39.0)
+    got = _run(rc.resolve_our_row(
+        merchant_domain="example.com", product_name="Rose Serum",
+        variant_title="Travel Spray Duo Set", our_price=78.00, currency="USD"))
+    assert not got.ok
+    assert got.reason == "options:sole_label_differs:Size"
+    assert got.variant_id is None
+    assert fake.variant_body is None
+    assert got.candidates == [{"axis": "Size", "label": "Travel"}]
+
+
+def test_the_1_7_oz_row_does_not_buy_the_7_oz_bottle(monkeypatch):
+    """The decimal-point split, end to end: "1.7 oz" became {1, 7, oz} and shared the token `7`
+    with "7 oz" — a 4x quantity, accepted in both directions."""
+    fake = _one_axis_chain(monkeypatch, label="7 oz", price=60.0)
+    got = _run(rc.resolve_our_row(
+        merchant_domain="example.com", product_name="Rose Serum",
+        variant_title="1.7 oz", our_price=30.00, currency="USD"))
+    assert not got.ok and got.reason == "options:sole_label_differs:Size"
+    assert fake.variant_body is None
+
+
+def test_the_150ml_row_still_does_not_buy_the_50ml_bottle(monkeypatch):
+    """Round 2's reproduction, kept: three times the product at the same price is the shape a
+    price check cannot catch."""
+    fake = _one_axis_chain(monkeypatch, label="150ml", price=30.0)
     got = _run(rc.resolve_our_row(
         merchant_domain="example.com", product_name="Rose Serum",
         variant_title="50ml", our_price=30.00, currency="USD"))
-    assert not got.ok
-    assert got.reason == "options:axes_not_determined_by_title"
-    assert got.variant_id is None
-    assert fake.variant_body is None          # it never even asked
+    assert not got.ok and got.reason == "options:sole_label_differs:Size"
+    assert fake.variant_body is None
 
 
-# The three reference examples that define the rule. Named as such so the rule is testable in one
-# place rather than inferred from the call site.
-
-def test_the_rule_accepts_our_title_as_a_majority_of_reaps_tokens():
-    """REFERENCE 1. {flamingo, flirt} of {flamingo, flirt, cream}: 2 of 3."""
-    assert rc.title_matches_sole_label("Flamingo Flirt", "Flamingo Flirt - Cream") is True
-
-
-def test_the_rule_accepts_an_exact_match():
-    """REFERENCE 2. Equal sets — the degenerate case, which must not fall through the subset
-    arithmetic."""
-    assert rc.title_matches_sole_label("OS", "OS") is True
-
-
-def test_the_rule_refuses_a_generic_minority_token():
-    """REFERENCE 3, and the one that whole-token SUBSET alone would still have let through:
-    {cream} IS a subset of {flamingo, flirt, cream}. 1 of 3 is not half, so it refuses. "Cream" is
-    a finish, not a shade, and it identifies nothing."""
-    assert rc.title_matches_sole_label("Cream", "Flamingo Flirt - Cream") is False
-
-
-def test_the_rule_accepts_a_title_more_specific_than_reaps_label():
-    """Containment the other way round: our catalog sometimes carries the longer string, and a
-    title that COVERS the whole label is not a weaker claim than one that equals it."""
-    assert rc.title_matches_sole_label("Flamingo Flirt Cream Finish", "Flamingo Flirt") is True
-
-
-def test_the_rule_refuses_an_empty_side():
-    assert rc.title_matches_sole_label("", "Flamingo Flirt") is False
-    assert rc.title_matches_sole_label("Flamingo Flirt", "") is False
-    assert rc.title_matches_sole_label("!!!", "Flamingo Flirt") is False
-
-
-@pytest.mark.parametrize("our_title,reap_label", [
-    ("50", "150ml"),      # a bare number inside an alphanumeric token
-    ("50", "50ml"),       # the same number, still not the same token
-    ("150", "1500ml"),
-])
-def test_a_numeric_fragment_never_matches_inside_a_longer_token(our_title, reap_label):
-    """True by construction under whole-token comparison rather than as a separate rule: `{"50"}`
-    is simply not a subset of `{"150ml"}`. Tested anyway, because it is the property that stops a
-    quantity being silently multiplied."""
-    assert rc.title_matches_sole_label(our_title, reap_label) is False
-
-
-def test_the_real_flowerbeauty_row_still_resolves(monkeypatch):
-    """The regression the whole rule has to keep: tightening this must not refuse the measured
-    row it was relaxed for in the first place."""
+def test_an_alias_resolves_the_row_end_to_end(monkeypatch):
+    """The remedy, all the way through: refused without the alias, resolved with it."""
     fake = _chain(monkeypatch, search=FLOWER_SEARCH, details=FLOWER_DETAILS,
                   variant=FLOWER_VARIANT)
     got = _run(rc.resolve_our_row(
         merchant_domain="flowerbeauty.com", product_name="Petal Pout Lip Color",
-        variant_title="Flamingo Flirt", our_price=8.00, currency="USD"))
+        variant_title="Flamingo Flirt", our_price=8.00, currency="USD",
+        accept_variant_labels=["Flamingo Flirt - Cream"]))
     assert got.ok and got.variant_id == "var_flamingo"
+    assert got.price == (8.0, "USD") and got.price_disagrees is False
     assert fake.variant_body == {"productId": "prd_petalpout", "optionIds": ["opt_flamingo"]}
+
+
+def test_without_the_alias_the_same_row_refuses_and_says_what_to_store(monkeypatch):
+    _chain(monkeypatch, search=FLOWER_SEARCH, details=FLOWER_DETAILS, variant=FLOWER_VARIANT)
+    got = _run(rc.resolve_our_row(
+        merchant_domain="flowerbeauty.com", product_name="Petal Pout Lip Color",
+        variant_title="Flamingo Flirt", our_price=8.00, currency="USD"))
+    assert not got.ok and got.reason == "options:sole_label_differs:Shade"
+    assert got.candidates == [{"axis": "Shade", "label": "Flamingo Flirt - Cream"}]
+
+
+def test_the_substitution_guard_still_fires_on_an_aliased_row(monkeypatch):
+    """An alias must not become a way to accept whatever comes back. Reap answers with a DIFFERENT
+    shade; the guard compares against the label we asked for and refuses."""
+    substituted = json.loads(json.dumps(FLOWER_VARIANT))
+    substituted["options"] = [{"name": "Shade", "value": "Petal Pink - Matte"}]
+    _chain(monkeypatch, search=FLOWER_SEARCH, details=FLOWER_DETAILS, variant=substituted)
+    got = _run(rc.resolve_our_row(
+        merchant_domain="flowerbeauty.com", product_name="Petal Pout Lip Color",
+        variant_title="Flamingo Flirt",
+        accept_variant_labels=["Flamingo Flirt - Cream"]))
+    assert not got.ok
+    assert got.reason.startswith("variant:substituted_on_axis:Shade:asked=Flamingo Flirt - Cream")
+
+
+def test_the_sole_label_refusal_is_distinct_from_an_undetermined_axis():
+    """Two different problems needing two different actions: one is an alias away from resolving,
+    the other means our title does not pin the axis at all and no alias fixes it."""
+    product = {"id": "prd_x", "options": [{"name": "Size", "values": [
+        {"optionId": "opt_a", "label": "Small", "available": True},
+        {"optionId": "opt_b", "label": "Large", "available": True}]}]}
+    undetermined = rc.select_option_ids(product, rc.variant_title_tokens("Medium"))
+    assert undetermined.reason == "axes_not_determined_by_title"
+    assert undetermined.candidates == []
+
+    sole = rc.select_option_ids(_sole("Small"), rc.variant_title_tokens("Medium"))
+    assert sole.reason == "sole_label_differs:Size"
+
+
+def test_a_mixed_refusal_is_reported_as_undetermined_not_as_a_sole_label():
+    """When only SOME unmatched axes are single-valued, an alias would not be enough, so the
+    reason must not suggest one. The labels are still carried, because they are still useful."""
+    product = {"id": "prd_x", "options": [
+        {"name": "Shade", "values": [{"optionId": "o1", "label": "Cream", "available": True}]},
+        {"name": "Size", "values": [
+            {"optionId": "o2", "label": "Small", "available": True},
+            {"optionId": "o3", "label": "Large", "available": True}]},
+    ]}
+    got = rc.select_option_ids(product, rc.variant_title_tokens("Medium"))
+    assert got.reason == "axes_not_determined_by_title"
+    assert got.unmatched_axes == ["Shade", "Size"]
+    assert got.candidates == [{"axis": "Shade", "label": "Cream"}]
+
+
+def test_the_sole_label_reason_has_its_own_actionable_copy():
+    text = rc.explain_refusal("options:sole_label_differs:Shade")
+    assert "Unrecognised refusal" not in text
+    assert "alias" in text.lower()
+    assert text != rc.explain_refusal("options:axes_not_determined_by_title")
+
+
+# --- P0: fragments that cannot identify a variant --------------------------------------------------
+
+def test_purely_numeric_slash_fragments_are_dropped():
+    """"50/50 Blend" is ONE label — a 50/50 blend — but splitting it offered the bare candidate
+    `50`, which matched a real "50 ml" label. A number alone carries no unit and no meaning."""
+    assert rc.variant_title_tokens("50/50 Blend") == ["50/50 Blend", "50 Blend"]
+    assert rc.variant_title_tokens("3.38 fl.oz / 100mL") == \
+        ["3.38 fl.oz / 100mL", "3.38 fl.oz", "100mL"]
+
+
+def test_a_purely_numeric_whole_title_is_still_a_candidate():
+    """The drop applies to FRAGMENTS only. A row whose entire title is "50" is a real value, and
+    dropping it would leave nothing to match on."""
+    assert rc.variant_title_tokens("50") == ["50"]
+    got = rc.select_option_ids(_sole("50"), rc.variant_title_tokens("50"))
+    assert got.ok
 
 
 # --- P0: one-character `/` fragments ----------------------------------------------------------------
@@ -2188,31 +2442,6 @@ def test_the_whole_title_is_always_the_first_candidate():
     ]}]}
     got = rc.select_option_ids(product, rc.variant_title_tokens("Standard / Rose"))
     assert got.ok and got.option_ids == ["opt_both"]
-
-
-# --- P0 related: the multi-value branch stays EXACT ---------------------------------------------------
-
-def test_a_multi_value_axis_does_not_accept_a_partial_token_match():
-    """The asymmetry is deliberate. With siblings present, the near-miss strings a relaxed rule
-    would confuse are exactly the ones on the axis: `50ml` beside `150ml`."""
-    product = {"id": "prd_x", "options": [{"name": "Size", "values": [
-        {"optionId": "opt_50", "label": "50ml", "available": True},
-        {"optionId": "opt_150", "label": "150ml", "available": True},
-    ]}]}
-    assert rc.select_option_ids(product, ["50ml"]).option_ids == ["opt_50"]
-    assert rc.select_option_ids(product, ["150ml"]).option_ids == ["opt_150"]
-    # A title that is merely a subset of a sibling's tokens matches NEITHER.
-    assert not rc.select_option_ids(product, ["ml"]).ok
-
-
-def test_a_multi_value_axis_refuses_a_suffixed_label():
-    """What exact matching costs, stated as a test so nobody "fixes" it: with siblings present we
-    refuse rather than guess which one our shorter title meant."""
-    product = {"id": "prd_x", "options": [{"name": "Shade", "values": [
-        {"optionId": "opt_a", "label": "Flamingo Flirt - Cream", "available": True},
-        {"optionId": "opt_b", "label": "Petal Pink - Matte", "available": True},
-    ]}]}
-    assert not rc.select_option_ids(product, ["Flamingo Flirt"]).ok
 
 
 # --- P1: the C1 sweep missed three iterations over partner JSON -----------------------------------
@@ -2299,8 +2528,8 @@ def test_the_normalised_form_carries_no_loose_combining_marks():
     tests above pass WITHOUT recomposition, by accident. NFKD leaves the dakuten as a separate
     U+3099, `\\w` does not match it, and it therefore becomes a SPACE -- so ゴールド normalised to
     `'コ ールト'`. That still differs from コールド, so the substitution guard looked fine, while
-    the label had silently become three tokens instead of one. Whole-token matching runs on these
-    strings, so a spurious space is a wrong answer waiting to happen.
+    the label had silently become three tokens instead of one. Exact matching runs on these
+    strings, so a spurious space is a label that can never match anything.
 
     Pinned as an exact string: four characters, voicing intact, no spaces."""
     assert rc._norm("ゴールド") == "ゴールド"
@@ -2575,3 +2804,278 @@ def test_the_inert_guards_are_gone_and_the_behaviour_is_not():
     assert rc._disagrees((140.0, ""), 140.00, "USD") is True
     assert rc._disagrees((140.0, ""), 140.00, "") is True
     assert rc._disagrees((140.0, "USD"), 140.00, "USD") is False
+
+
+# ==================================================================================================
+# THIRD-ROUND ADVERSARIAL REVIEW, PR #2140.
+# ==================================================================================================
+
+
+# --- P2-5: the cap is enforced in bounded STEPS, not on a number computed too late -----------------
+#
+# `aiter_bytes()` with no chunk_size lets httpx decode as much as each network read yields. Measured
+# by the reviewer: a 16 KiB compressed read decoded to a SINGLE 16.8 MiB chunk -- eight times the
+# cap -- and the whole allocation had already happened by the time `len(chunk)` could look at it.
+# The bound was on a number, not on memory. These tests drive a REAL httpx client through
+# MockTransport, so they exercise httpx's own decoding rather than the fake's slicing.
+
+def _gzip_body(raw: bytes) -> bytes:
+    import gzip
+    return gzip.compress(raw)
+
+
+@pytest.fixture
+def mock_httpx(monkeypatch):
+    """A real `httpx.AsyncClient` over `MockTransport`. No network, no sockets — but httpx's own
+    response decoding, which is the thing under test here."""
+    import httpx
+
+    state = {"body": b"", "headers": {}, "status": 200}
+    real_client = httpx.AsyncClient
+
+    def handler(request):
+        return httpx.Response(state["status"], headers=state["headers"], content=state["body"])
+
+    class _Client(real_client):
+        def __init__(self, *a, **kw):
+            kw["transport"] = httpx.MockTransport(handler)
+            super().__init__(*a, **kw)
+
+    monkeypatch.setenv("REAP_API_BASE_URL", "https://sandbox.api.reap.global")
+    monkeypatch.setenv("REAP_API_KEY", "sk_test_key")
+    monkeypatch.delenv("REAP_API_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    return state
+
+
+def test_a_compressible_body_is_read_in_bounded_steps(mock_httpx):
+    """THE P2-5 REPRODUCTION. 16 MiB of zeros compresses to a few KiB, so without an explicit
+    chunk_size httpx hands the whole decoded 16 MiB over in one piece — eight times the cap,
+    already allocated. With chunk_size=65536 the worst case is the cap plus one chunk."""
+    raw = b"\0" * (16 * 1024 * 1024)
+    mock_httpx["body"] = _gzip_body(raw)
+    mock_httpx["headers"] = {"content-encoding": "gzip"}
+
+    seen = []
+    original = rc._read_bounded
+
+    async def watching(response, *, max_bytes=rc.MAX_RESPONSE_BYTES):
+        real_iter = response.aiter_bytes
+
+        def spy(*a, **kw):
+            inner = real_iter(*a, **kw)
+
+            async def gen():
+                async for chunk in inner:
+                    seen.append(len(chunk))
+                    yield chunk
+            return gen()
+        response.aiter_bytes = spy
+        return await original(response, max_bytes=max_bytes)
+
+    import services.reap_agentic_client as module
+    module._read_bounded = watching
+    try:
+        got = _run(rc.search_products(query="x"))
+    finally:
+        module._read_bounded = original
+
+    assert not got.ok and got.error == "response_too_large"
+    assert seen, "the body was never iterated"
+    assert max(seen) <= 65536, f"largest decoded chunk was {max(seen)}"
+    # And it aborted: it did not decode all 16 MiB before objecting.
+    assert sum(seen) <= rc.MAX_RESPONSE_BYTES + 65536
+
+
+def test_a_normal_body_still_round_trips_through_a_real_client(mock_httpx):
+    """The control on the same transport: chunking must not break an ordinary response."""
+    mock_httpx["body"] = json.dumps({"products": [], "warnings": ["OK"]}).encode()
+    mock_httpx["headers"] = {}
+    got = _run(rc.search_products(query="x"))
+    assert got.ok and got.warnings == ["OK"]
+
+
+def test_the_bounded_reader_asks_for_a_fixed_chunk_size(wire):
+    """Asserted at the call, because the argument is the whole mechanism and it is invisible in
+    the result: a reader that omits it looks identical until a compressible body arrives."""
+    _run(rc.search_products(query="x"))
+    assert wire.last_response.requested_chunk_size == 65536
+    assert wire.last_response.largest_chunk <= 65536
+
+
+# --- P2-6: Hebrew and Arabic points -----------------------------------------------------------------
+
+@pytest.mark.parametrize("pointed,plain", [
+    ("שָׁלוֹם", "שלום"),   # HE shalom
+    ("בְּרֵאשִׁית", "בראשית"),
+    ("كِتَاب", "كتاب"),         # AR kitab
+    ("ٰاللّه", "الله"),
+])
+def test_a_pointed_spelling_equals_its_unpointed_one(pointed, plain):
+    """These marks are neither stripped nor matched by `\\w`, so a pointed label did not merely
+    fail to equal its unpointed spelling — it SHATTERED into one token per letter (שָׁלוֹם became
+    `ש לו ם`). Under exact matching that can only cause a refusal, never a wrong accept, but it is
+    a refusal nobody could diagnose from the reason string."""
+    assert rc._norm(pointed) == rc._norm(plain) != ""
+    assert " " not in rc._norm(pointed)
+
+
+def test_pointed_labels_still_differ_when_the_letters_differ():
+    """The control: folding the points must not fold the words together."""
+    assert rc._norm("שלום") != rc._norm("שלוש")
+
+
+@pytest.mark.parametrize("pointed,plain", [
+    # U+0670 ARABIC LETTER SUPERSCRIPT ALEF, INTERIOR. A leading or trailing one is absorbed by
+    # `.strip()` whether or not it is folded, so only an interior mark discriminates — the same
+    # trap that hid the Cyrillic range in the previous round.
+    ("رٰحمن", "رحمن"),
+    ("الٰله", "الله"),
+    # And an interior harakat, for the same reason.
+    ("كتَاب", "كتاب"),
+    # An interior Hebrew point.
+    ("שלֹום", "שלום"),
+])
+def test_an_interior_point_is_folded_not_turned_into_a_space(pointed, plain):
+    """An unfolded mark is not a word character, so it becomes a SPACE and splits one label into
+    two tokens. Under exact matching that is a refusal rather than a wrong accept — but it is a
+    refusal with no diagnosable cause."""
+    assert rc._norm(pointed) == rc._norm(plain)
+    assert " " not in rc._norm(pointed)
+
+
+# --- P0-2: a decimal point is part of its number ------------------------------------------------------
+
+@pytest.mark.parametrize("text,expected", [
+    ("1.7 oz", "1.7 oz"),
+    ("0.5 oz", "0.5 oz"),
+    ("3.38 fl.oz", "3.38 fl oz"),     # the dot after a LETTER still splits
+    ("1,5 ml", "1,5 ml"),             # a comma decimal, as Europe writes it
+    ("Serum 1.5", "serum 1.5"),
+    (".5 oz", "5 oz"),                # a leading dot has no digit before it
+    ("5. oz", "5 oz"),                # a trailing dot has no digit after it
+])
+def test_a_decimal_between_digits_survives_normalisation(text, expected):
+    assert rc._norm(text) == expected
+
+
+def test_a_decimal_quantity_is_not_confused_with_its_fraction():
+    """The reproduction: `[^\\w]+ -> " "` made "1.7 oz" into {1, 7, oz}, which shared the token 7
+    with "7 oz" — a 4x quantity that the token rule read as overlap, in BOTH directions."""
+    assert rc._norm("1.7 oz") != rc._norm("7 oz")
+    assert rc._norm("0.5 oz") != rc._norm("5 oz")
+
+
+def test_product_name_matching_is_protected_by_the_same_rule():
+    """Product names were already matched exactly, so this was a latent equality bug there too:
+    "Serum 1.5" and "Serum 15" both normalised to token sets that a careless comparison would
+    conflate, and the exact comparison would have equated nothing while looking right."""
+    payload = {"products": [{"id": "prd_a", "merchant": {"name": "x.com"}, "name": "Serum 1.5"}]}
+    assert not rc.match_product(payload, merchant_domain="x.com", product_name="Serum 15").ok
+    assert rc.match_product(payload, merchant_domain="x.com", product_name="Serum 1.5").ok
+
+
+# --- "Default Title": Shopify's placeholder is not a title ---------------------------------------------
+
+@pytest.mark.parametrize("title", ["Default Title", "default title", "DEFAULT TITLE",
+                                   "  Default Title  "])
+def test_shopifys_default_title_placeholder_counts_as_no_title(title):
+    """It is the string Shopify writes when a product has NO variants. Treating it as a real
+    variant title refused every such row against Reap's real sole label."""
+    got = rc.select_option_ids(_sole("Flamingo Flirt - Cream"), rc.variant_title_tokens(title))
+    assert got.ok
+    assert got.single_value_axis_accepted_without_title is True
+
+
+def test_default_title_on_a_multi_value_product_still_refuses():
+    """It is "no title", so it gets no-title treatment — including the refusal when there is
+    actually something to choose between."""
+    product = {"id": "prd_x", "options": [{"name": "Size", "values": [
+        {"optionId": "o1", "label": "Small", "available": True},
+        {"optionId": "o2", "label": "Large", "available": True}]}]}
+    got = rc.select_option_ids(product, rc.variant_title_tokens("Default Title"))
+    assert not got.ok and got.reason == "no_variant_title_supplied"
+
+
+def test_default_title_does_not_match_a_label_that_says_default_title():
+    """It is dropped as a candidate, not kept as one: a Reap label literally reading "Default
+    Title" is matched structurally (one axis, one value) rather than by string equality, and on a
+    multi-value axis it matches nothing."""
+    product = {"id": "prd_x", "options": [{"name": "Size", "values": [
+        {"optionId": "o1", "label": "Default Title", "available": True},
+        {"optionId": "o2", "label": "Large", "available": True}]}]}
+    assert not rc.select_option_ids(product, rc.variant_title_tokens("Default Title")).ok
+
+
+@pytest.mark.parametrize("title", [None, "", "   ", "\t\n"])
+def test_whitespace_only_titles_are_no_title(title):
+    """Documented as consistent with None rather than left to be inferred: they take the
+    structural untitled path, they do NOT refuse as `variant_title_unusable`."""
+    got = rc.select_option_ids(_sole("Flamingo Flirt - Cream"), rc.variant_title_tokens(title))
+    assert got.ok and got.single_value_axis_accepted_without_title is True
+
+
+@pytest.mark.parametrize("title", ["!!!", "/", " - ", "---"])
+def test_punctuation_only_titles_are_still_unusable_not_absent(title):
+    """The distinction that must survive the Default Title change: the caller believes it
+    constrained the resolution, so silently resolving anyway is worse than refusing."""
+    got = rc.select_option_ids(_sole("Flamingo Flirt - Cream"), rc.variant_title_tokens(title))
+    assert not got.ok and got.reason == "variant_title_unusable"
+
+
+# --- timeouts: bool and underscores ---------------------------------------------------------------------
+
+def test_a_boolean_timeout_is_refused(wire):
+    """`isinstance(True, int)` is True, so a bool reached `float()` and became a ONE SECOND
+    timeout — from a caller that meant "yes, use a timeout". Same family as the quantity bug."""
+    for value in (True, False):
+        with pytest.raises(rc.ReapRequestError):
+            _run(rc.search_products(query="x", timeout_seconds=value))
+    assert wire.calls == []
+
+
+@pytest.mark.parametrize("value", ["hello", [30], {"seconds": 30}])
+def test_a_non_numeric_timeout_argument_is_refused(wire, value):
+    with pytest.raises(rc.ReapRequestError):
+        _run(rc.search_products(query="x", timeout_seconds=value))
+    assert wire.calls == []
+
+
+@pytest.mark.parametrize("value", ["1_0", "1_000", "3_0.5"])
+def test_an_env_timeout_with_underscores_is_ignored(value, monkeypatch):
+    """`float("1_0")` is 10.0. Python's numeric-literal underscores are not a format anyone writes
+    in an env var on purpose, so "1_0" quietly meaning ten is a misreading of a typo."""
+    monkeypatch.setenv("REAP_API_TIMEOUT_SECONDS", value)
+    assert rc._env_timeout_floor() is None
+
+
+def test_a_plain_env_timeout_is_still_honoured(monkeypatch):
+    """The control."""
+    monkeypatch.setenv("REAP_API_TIMEOUT_SECONDS", "30.5")
+    assert rc._env_timeout_floor() == 30.5
+
+
+# --- the candidate builder, as a unit ---------------------------------------------------------------------
+
+def test_label_candidates_separates_the_title_from_the_aliases():
+    titles, aliases, supplied = rc.label_candidates(["Flamingo Flirt"],
+                                                    ["Flamingo Flirt - Cream", "", "!!!"])
+    assert titles == ["flamingo flirt"]
+    assert aliases == ["flamingo flirt cream"]
+    assert supplied is True
+
+
+def test_label_candidates_reports_the_placeholder_as_no_title():
+    titles, aliases, supplied = rc.label_candidates(["Default Title"])
+    assert titles == [] and aliases == [] and supplied is False
+
+
+def test_label_candidates_reports_a_broken_title_as_supplied():
+    titles, _, supplied = rc.label_candidates(["!!!"])
+    assert titles == [] and supplied is True
+
+
+def test_label_candidates_deduplicates():
+    titles, aliases, _ = rc.label_candidates(["OS", "os", " o s "], ["OS", "OS"])
+    assert titles == ["os", "o s"]
+    assert aliases == ["os"]

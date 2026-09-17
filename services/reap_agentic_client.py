@@ -45,13 +45,19 @@ different size at a 32% lower price while looking entirely successful, and readi
 staleness would have "corrected" a row that was right. `select_option_ids` therefore fails
 closed on every axis it cannot match, and no code path here falls back to a default variant.
 
-    ONE EXCEPTION, STATED HERE BECAUSE IT IS NOT AN EXCEPTION TO THE RULE ABOVE: an axis with
-    exactly ONE value is matched against our title by whole tokens rather than by exact equality
-    (`title_matches_sole_label`), and a product with exactly one such axis resolves with NO title
-    at all -- flagged, never silently. Both are still comparisons or still structural; neither is
-    a default. An earlier draft of this paragraph said the module fails closed on every axis "it
-    cannot match" full stop, and that sentence was true of the code only until the single-value
-    rule landed underneath it.
+    MATCHING IS EXACT, AND IT TOOK THREE REVIEWS TO GET THERE. Reap's label must EQUAL one of
+    our candidates after normalisation -- on an axis with one value exactly as on an axis with
+    twenty. Two successive attempts to be cleverer than that (substring containment, then
+    whole-token subset with a coverage rule) were each measured buying a different physical
+    object: "50ml" resolving "150ml", "Travel Spray Duo Set" resolving "Travel", "1.7 oz"
+    resolving "7 oz". A rule that accepts a label it was not given is guessing, and the thing it
+    guesses about is what the buyer receives. Where a legitimate row is refused, the answer is an
+    explicit alias in `accept_variant_labels` -- data a human asserted -- and never a looser rule.
+
+    The ONE structural acceptance that remains: a product with exactly one axis carrying exactly
+    one value, and a row that declares no variant title, resolves with the flag
+    `single_value_axis_accepted_without_title` set. Nothing is compared there because nothing
+    needs to be; it is not a default, and it is never silent.
 
 A 200 IS NOT EVIDENCE REAP DID WHAT WE ASKED. Resolving an option value whose `available` flag
 is false SILENTLY SUBSTITUTES a different variant: asking for `Size=Standard` ($140, unavailable)
@@ -180,6 +186,12 @@ def _env_timeout_floor() -> Optional[float]:
     raw = (os.getenv("REAP_API_TIMEOUT_SECONDS") or "").strip()
     if not raw:
         return None
+    if "_" in raw:
+        # `float("1_0")` is 10.0. Python's numeric-literal underscores are not part of any format
+        # an operator writing an env var expects, so "1_0" meaning ten is a silent misreading of
+        # something that was probably a typo. Rejected by spelling, before it is parsed.
+        logger.warning("REAP_API_TIMEOUT_SECONDS contains an underscore; ignoring it")
+        return None
     try:
         value = float(raw)
     except (TypeError, ValueError):
@@ -207,6 +219,12 @@ PRODUCT_ID_PREFIX = "prd_"
 #: kilobytes; a details response for ten products is under 200 KB. 2 MiB is therefore well clear
 #: of anything legitimate and still small enough that parsing one cannot hurt a serving path.
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+
+#: Decoded bytes per step while reading a response. This is what makes MAX_RESPONSE_BYTES a real
+#: bound rather than a number checked after the fact: httpx decompresses as much as each network
+#: read yields unless told otherwise, and a compressed 16 KiB was measured decoding to one 16.8 MiB
+#: chunk -- already eight times the cap by the time its length could be measured.
+_READ_CHUNK_BYTES = 64 * 1024
 
 
 class ReapConfigError(RuntimeError):
@@ -332,13 +350,32 @@ def _norm(text: Any) -> str:
     gold-versus-cold swap. Same class of bug as the one before it, one script further along: a
     normalisation that erases a distinction the merchant is selling on.
 
-    So only marks in the Latin/Greek/Cyrillic diacritic blocks are dropped (U+0300-U+036F
-    COMBINING DIACRITICAL MARKS, U+0483-U+0489 the Cyrillic set), and the rest is RECOMPOSED with
-    NFC so a decomposed dakuten goes back onto its kana instead of being left loose. `\\w` under
-    re.UNICODE then keeps CJK, kana and Cyrillic as themselves.
+    WHAT IS FOLDED, AND WHAT IS LEFT ALONE. Folded away, because in these scripts the mark is an
+    accent on a letter and both spellings mean the same word: Latin/Greek (U+0300-U+036F),
+    Cyrillic (U+0483-U+0489), Hebrew points and cantillation (U+0591-U+05C7), Arabic harakat
+    (U+064B-U+065F and U+0670). Left exactly as they are, because there the mark is part of the
+    character's identity: kana dakuten and handakuten (U+3099/U+309A), and every CJK, Hangul,
+    Thai or Devanagari codepoint, which `\\w` under re.UNICODE keeps as itself.
 
-    NFKD before that still does the compatibility folding we want -- full-width `１５０ＭＬ`
+    The Hebrew and Arabic ranges are here for a different reason from the Latin one. Those marks
+    are not matched by `\\w` either, so an unfolded pointed label did not merely fail to equal its
+    unpointed spelling -- it SHATTERED into one token per letter (שָׁלוֹם -> `ש לו ם`). Under exact
+    matching that can only cause a refusal, never a wrong accept, but it is a refusal nobody could
+    diagnose from the reason string.
+
+    NFC AFTER the strip, so a decomposed dakuten goes back onto its kana instead of being left
+    loose -- a loose mark is not a word character and would become a SPACE, splitting one label
+    into several tokens.
+
+    NFKD before all of it still does the compatibility folding we want -- full-width `１５０ＭＬ`
     folds to `150ml`, so a merchant's full-width spelling matches our ASCII one.
+
+    A DECIMAL POINT IS PART OF ITS NUMBER. `[^\\w]+ -> " "` split "1.7 oz" into `{1, 7, oz}`, so
+    it shared the token `7` with "7 oz" -- a 4x quantity difference that the token matcher then
+    read as overlap. A "." or "," BETWEEN TWO DIGITS is therefore kept, and everything else about
+    the rule is unchanged: "fl.oz" still splits (the dot follows a letter), " - " still collapses.
+    This protects product-NAME matching too, which was already exact and could have equated
+    "Serum 1.5" with "Serum 15".
 
     An empty result is NOT a value. Every site that compares two of these must refuse when either
     side is empty -- `_norm` cannot enforce that for its callers, so the callers do it.
@@ -346,7 +383,7 @@ def _norm(text: Any) -> str:
     folded = unicodedata.normalize("NFKD", str(text or ""))
     folded = "".join(ch for ch in folded if not _is_stripped_diacritic(ch))
     folded = unicodedata.normalize("NFC", folded)
-    return re.sub(r"[^\w]+", " ", folded.casefold(), flags=re.UNICODE).strip()
+    return _SEPARATOR_RE.sub(" ", folded.casefold()).strip()
 
 
 #: Combining ranges that are ACCENTS ON A LETTER, and so are folded away for matching. Everything
@@ -356,7 +393,16 @@ def _norm(text: Any) -> str:
 _STRIPPED_COMBINING_RANGES = (
     (0x0300, 0x036F),   # COMBINING DIACRITICAL MARKS (Latin/Greek)
     (0x0483, 0x0489),   # COMBINING CYRILLIC
+    (0x0591, 0x05C7),   # HEBREW points, accents and cantillation
+    (0x064B, 0x065F),   # ARABIC harakat
+    (0x0670, 0x0670),   # ARABIC LETTER SUPERSCRIPT ALEF
 )
+
+#: What counts as a separator between tokens: any run of non-word characters, EXCEPT a "." or ","
+#: that sits between two digits. The three alternatives are, in order: a dot/comma with no digit
+#: before it, a dot/comma with no digit after it, and any other non-word character. A dot with a
+#: digit on both sides matches none of them and survives, which is what keeps "1.7" one token.
+_SEPARATOR_RE = re.compile(r"(?:(?<!\d)[.,]|[.,](?!\d)|[^\w.,])+", flags=re.UNICODE)
 
 
 def _is_stripped_diacritic(ch: str) -> bool:
@@ -364,58 +410,78 @@ def _is_stripped_diacritic(ch: str) -> bool:
     return any(low <= code <= high for low, high in _STRIPPED_COMBINING_RANGES)
 
 
-def title_matches_sole_label(our_title: Any, reap_label: Any) -> bool:
-    """Does our variant title describe Reap's ONE value on a single-value axis? WHOLE TOKENS ONLY.
+#: Shopify's literal placeholder on a product that has no real variants. It is not a variant
+#: title -- it is the string Shopify puts there when there is nothing to put -- and treating it as
+#: one made every such row refuse against Reap's real sole label. Normalised, so the comparison
+#: catches "Default Title", "default title" and the full-width spelling alike.
+_DEFAULT_TITLE_NORM = "default title"
 
-    THE RULE, and the three examples that fix it:
 
-        "Flamingo Flirt"  vs "Flamingo Flirt - Cream"   ACCEPT
-        "OS"              vs "OS"                       ACCEPT
-        "Cream"           vs "Flamingo Flirt - Cream"   REFUSE
+def label_candidates(
+    wanted_labels: Sequence[str], accept_variant_labels: Sequence[str] = ()
+) -> Tuple[List[str], List[str], bool]:
+    """Normalise our row's title candidates and the caller's aliases into EXACT match keys.
 
-    Normalise both sides, split on whitespace into SETS of whole tokens, and refuse unless one
-    non-empty set is a subset of the other. When OUR set is the smaller one it must additionally
-    cover at least HALF of Reap's tokens -- which is what separates the first example (2 of 3)
-    from the third (1 of 3). When Reap's set is the smaller one, our title is merely more specific
-    than their label and that is accepted outright.
+    Returns `(title_keys, alias_keys, a_title_was_supplied)`. Both key lists are normalised,
+    non-empty and de-duplicated; matching anywhere in this module is `label in set(keys)` and
+    nothing fuzzier.
 
-    A half-coverage test alone decides all three examples, so that is the whole rule; a
-    leading-tokens-in-order clause was considered and left out because it only ever ACCEPTS more,
-    and there is no measured row that needs it. Consequence, stated so nobody rediscovers it as a
-    bug: a row titled just "Flamingo" against "Flamingo Flirt - Cream" refuses. That is the
-    file's standing answer -- the fix for a legitimate refusal is a stored alias, never a looser
-    comparison, exactly as in `merchant_domain_matches`.
+    WHY EXACT, AFTER THREE ROUNDS OF THE ALTERNATIVE. A single-value axis used to be matched by
+    substring containment, then by whole-token subset with a half-coverage rule. Each version was
+    reviewed, each looked defensible, and each was measured buying a different physical object:
 
-    WHY NOT SUBSTRING, which is what this function replaces. The previous rule asked whether
-    either normalised string CONTAINED the other, and containment on a raw string ignores token
-    boundaries entirely. Measured against it, every one of these resolved ok=True with a passing
-    substitution guard:
+        substring     our "50ml"                 -> Reap "150ml"           (3x the quantity)
+        token subset  our "Travel Spray Duo Set" -> Reap "Travel"          ($78 row, $39 item)
+        token subset  our "1.7 oz"               -> Reap "7 oz"            (4x the quantity)
+        token subset  our "Set"                  -> Reap "Gift Set"
+        token subset  our "Red / 50ml"           -> Reap "50ml Travel Red Edition"
 
-        our "50ml" -> Reap "150ml"            (a 3x quantity, at a plausible price)
-        our "Red"  -> Reap "Fired Brick"
-        our "Mini" -> Reap "Minimalist Set"
-        our "Tan"  -> Reap "Titanium"
-        our "S"    -> Reap "Standard"
-        our "M"    -> Reap "Jumbo"
+    The pattern is not that each rule had a bug. It is that ANY rule which accepts a label it was
+    not given is guessing, and the thing it guesses about is what the buyer receives. So the
+    fuzziness is gone: Reap's label must EQUAL one of our candidates after normalisation, on a
+    single-value axis exactly as on a multi-value one.
 
-    End to end: a "Rose Serum / 50ml / $30 USD" row against a product whose only value was
-    `150ml`, also $30, resolved ok=True at var_150 with `price_disagrees=False` -- three times the
-    product, the same price, and nothing anywhere reporting a problem. Whole-token comparison also
-    makes "a purely numeric fragment must not match inside a longer alphanumeric token" true by
-    construction rather than as a separate rule: `{"50"}` is simply not a subset of `{"150ml"}`.
+    THE COST, AND WHERE IT IS PAID. Exact matching refuses the real flowerbeauty.com row that the
+    first relaxation was written for -- our title "Flamingo Flirt" against Reap's sole label
+    "Flamingo Flirt - Cream", which carries a finish suffix our catalog does not store. That
+    refusal is now CORRECT and the remedy is data, not a looser comparison:
+
+        resolve_our_row(..., variant_title="Flamingo Flirt",
+                        accept_variant_labels=["Flamingo Flirt - Cream"])
+
+    resolves it; without the alias it refuses with `sole_label_differs`, and the refusal carries
+    Reap's label so an operator can see what to store. An alias is an assertion by a human that
+    two names are the same object -- which is exactly the judgement no string rule was able to
+    make. It is compared exactly like any other candidate, so it can neither widen a match beyond
+    the label it names nor bypass the availability refusal or the substitution guard.
     """
-    ours = set(_norm(our_title).split())
-    theirs = set(_norm(reap_label).split())
-    if not ours or not theirs:
-        # An empty side is not a value and never matches. Same rule as every other comparison
-        # site in this module.
-        return False
-    if ours <= theirs:
-        # Equality lands here too (2n >= n), which is the "OS" vs "OS" case.
-        return 2 * len(ours) >= len(theirs)
-    if theirs < ours:
-        return True
-    return False
+    normalised = [_norm(w) for w in (wanted_labels or [])]
+    mentions_default_title = any(n == _DEFAULT_TITLE_NORM for n in normalised)
+    title_keys = _dedupe([n for n in normalised if n and n != _DEFAULT_TITLE_NORM])
+
+    # "Was a title supplied?" is about the CALLER's intent, so it reads the raw strings: None,
+    # "" and whitespace-only are all "no title" and take the structural untitled path. Shopify's
+    # "Default Title" placeholder is also no title -- it is what Shopify writes when a product has
+    # no variants at all -- so a row carrying only that is untitled too, not unusable.
+    supplied = any(str(w or "").strip() for w in (wanted_labels or []))
+    if supplied and not title_keys and mentions_default_title:
+        supplied = False
+
+    # An alias that normalises to nothing, or to the placeholder, says nothing and is dropped
+    # rather than being allowed to match a blank label.
+    alias_keys = _dedupe([
+        n for n in (_norm(a) for a in (accept_variant_labels or []))
+        if n and n != _DEFAULT_TITLE_NORM
+    ])
+    return title_keys, alias_keys, supplied
+
+
+def _dedupe(values: Sequence[str]) -> List[str]:
+    out: List[str] = []
+    for value in values:
+        if value not in out:
+            out.append(value)
+    return out
 
 
 def _label_of(value: Any) -> str:
@@ -549,6 +615,11 @@ class OptionMatch:
     chosen: Dict[str, str] = field(default_factory=dict)
     reason: Optional[str] = None
     unmatched_axes: List[str] = field(default_factory=list)
+    #: On `sole_label_differs`, `[{"axis": ..., "label": ...}]` -- Reap's ONE label for each
+    #: single-value axis we could not match. Carried so the refusal is actionable: an operator can
+    #: see the string to put in `accept_variant_labels` without going back to the sandbox. Labels
+    #: are catalog data (a shade, a size), never buyer data.
+    candidates: List[Dict[str, Any]] = field(default_factory=list)
     #: Axis name -> `available` on the value we chose, read from `options[].values[]`.
     #: Carried because the previous version's docstring CLAIMED availability was "reported, not
     #: enforced" while nothing anywhere reported it -- the flag was read and dropped. A docstring
@@ -566,31 +637,46 @@ class OptionMatch:
     single_value_axis_accepted_without_title: bool = False
 
 
-def select_option_ids(detail_product: Any, wanted_labels: Sequence[str]) -> OptionMatch:
-    """Turn our variant title into one `optionId` per axis, or refuse.
+def select_option_ids(
+    detail_product: Any,
+    wanted_labels: Sequence[str],
+    *,
+    accept_variant_labels: Sequence[str] = (),
+) -> OptionMatch:
+    """Turn our variant title into one `optionId` per axis, or refuse. EXACT matching only.
 
     EVERY axis must be matched. A product with Size and Color axes cannot be resolved from a
     title that only names a colour: the missing axis would have to be defaulted, and defaulting
     is precisely the mistake that made Reap's $95 Mini look like our $140 Standard. So an
     unmatched axis is a refusal, and the axis is named in the result.
 
-    AVAILABILITY IS NOW ACTUALLY REPORTED. The previous version of this docstring said it was
-    "reported, not enforced" -- and nothing reported it: `values[].available` was read past and
-    dropped, so a caller had no way to know the value it asked for was unbuyable. Worse, the
-    `available` a caller then saw came from the SUBSTITUTED variant, so an unavailable Standard
-    surfaced as an available Mini. Both the flag and the list of unavailable axes are carried out
-    of here now.
+    ONE MATCHING RULE FOR BOTH BRANCHES. Reap's label must EQUAL one of our candidates after
+    `_norm` -- on an axis with one value exactly as on an axis with twenty. There is no longer a
+    single-value special case, and with it goes the asymmetry an earlier review flagged. See
+    `label_candidates` for the three measured wrong purchases that fuzzy matching produced and why
+    the answer is an alias list rather than a fourth attempt at a rule.
+
+    `accept_variant_labels` is that alias list: caller-supplied strings compared exactly, like any
+    other candidate, against the label on ANY axis. It widens WHICH label we will accept; it does
+    not weaken anything downstream, because availability and the substitution guard both run on
+    the label that was chosen.
+
+    AVAILABILITY IS ACTUALLY REPORTED. An earlier version of this docstring said it was "reported,
+    not enforced" -- and nothing reported it: `values[].available` was read past and dropped, so a
+    caller had no way to know the value it asked for was unbuyable. Worse, the `available` a
+    caller then saw came from the SUBSTITUTED variant, so an unavailable Standard surfaced as an
+    available Mini. Both the flag and the list of unavailable axes are carried out of here now.
 
     An unavailable axis is fatal to the `/variant` call, not merely informational: measured, Reap
     answers 200 with an available sibling rather than the id we asked for, so the id we want does
     not exist to be fetched. `resolve_our_row` refuses before making that call.
 
-    A SINGLE-VALUE AXIS IS STILL COMPARED TO OUR TITLE, BY WHOLE TOKENS. The first version
-    accepted such an axis without looking at our title at all; the second compared them with raw
-    SUBSTRING containment, which ignores token boundaries and accepted "50ml" for "150ml" and
-    "Red" for "Fired Brick". The comparison now lives in `title_matches_sole_label`, which states
-    the rule and the three examples that pin it. Multi-value axes keep EXACT label matching -- see
-    the comment at that branch.
+    TITLES THAT ARE NOT TITLES. None, "" and whitespace-only are all NO title and take the
+    structural untitled path (one axis, one value, or no axes). So is Shopify's literal
+    "Default Title" placeholder, which is what Shopify writes when a product has no variants --
+    treating it as a real title refused every such row. A title made only of punctuation ("!!!",
+    "/", " - ") is different: the caller believes it constrained the resolution, so it refuses as
+    `variant_title_unusable` rather than quietly becoming untitled.
     """
     product = detail_product if isinstance(detail_product, dict) else {}
     options = product.get("options")
@@ -600,16 +686,16 @@ def select_option_ids(detail_product: Any, wanted_labels: Sequence[str]) -> Opti
         # products/variant with an empty option list.
         return OptionMatch(ok=False, reason="product_has_no_option_axes")
 
-    # NOTE the `if _norm(w)` filter, which is load-bearing rather than tidy: a title of "--"
-    # produces one candidate that normalises to "", and an empty token was accepted by every
-    # comparison that used `in`, so it matched ANY single-value label.
-    wanted = [_norm(w) for w in wanted_labels if _norm(w)]
+    wanted, aliases, supplied_a_title = label_candidates(wanted_labels, accept_variant_labels)
     # A title that was SUPPLIED but normalises to nothing ("!!!", "/", " - ") is not the same
     # thing as no title. Falling through to the untitled path would silently resolve a product
     # the caller believes it constrained, so it is its own refusal.
-    supplied_a_title = any(str(w or "").strip() for w in wanted_labels or [])
     if supplied_a_title and not wanted:
         return OptionMatch(ok=False, reason="variant_title_unusable")
+    # The set every axis is matched against. Aliases are additional ACCEPTED LABELS, so they join
+    # the title's candidates rather than replacing them -- and they do not make an untitled row
+    # titled, which is why `supplied_a_title` above reads the title alone.
+    match_keys = set(wanted) | set(aliases)
 
     # The ONE shape where a missing title is not a refusal: one axis, one value. There is then
     # exactly one variant of this product and no choice to get wrong -- structurally the same
@@ -631,6 +717,9 @@ def select_option_ids(detail_product: Any, wanted_labels: Sequence[str]) -> Opti
     unavailable: List[str] = []
     seen_axis_names: List[str] = []
     accepted_without_title = False
+    #: (axis, Reap's label) for every SINGLE-VALUE axis whose one label did not match. These are
+    #: the ones an alias can fix, and the label is catalog data -- a shade or size name -- not PII.
+    sole_mismatches: List[Tuple[str, str]] = []
     for axis in options:
         axis = axis if isinstance(axis, dict) else {}
         axis_name = str(axis.get("name") or "").strip() or "?"
@@ -644,17 +733,11 @@ def select_option_ids(detail_product: Any, wanted_labels: Sequence[str]) -> Opti
         seen_axis_names.append(axis_name)
         values = axis.get("values") if isinstance(axis.get("values"), list) else []
         if len(values) == 1 and isinstance(values[0], dict):
-            # ONE VALUE ON THIS AXIS. Reap indexes some per-shade pages as their own product with
-            # a single-value axis whose label carries a suffix our catalog does not store --
-            # measured on flowerbeauty.com's "Petal Pout Lip Color", one `Shade` axis, one value
-            # `"Flamingo Flirt - Cream"`, against our title "Flamingo Flirt". Exact label matching
-            # refuses that row for no benefit, so this branch -- and ONLY this branch -- relaxes
-            # equality, to the whole-token rule in `title_matches_sole_label`.
-            #
-            # But it is still a comparison. Accepting the label unseen means our title never
-            # constrains the result, and the only thing that would have caught a wrong product is
-            # (merchant, exact product name) -- which does not distinguish a $140 Standard from a
-            # $95 Mini indexed as the sole value of its axis.
+            # ONE VALUE ON THIS AXIS -- matched by the SAME exact rule as any other axis. The one
+            # thing that is special here is the REFUSAL: with a single value there is exactly one
+            # label an operator would have to look at, so a mismatch is reported as
+            # `sole_label_differs` with that label attached, which is an alias away from being
+            # fixed. A mismatch on a multi-value axis is a different problem.
             single = values[0]
             label_text = _label_of(single)
             label_norm = _norm(label_text)
@@ -664,14 +747,15 @@ def select_option_ids(detail_product: Any, wanted_labels: Sequence[str]) -> Opti
                 # become what the substitution guard checks the response against.
                 unmatched.append(axis_name)
                 continue
-            if wanted:
-                if not any(title_matches_sole_label(token, label_norm) for token in wanted):
+            if match_keys:
+                if label_norm not in match_keys:
                     unmatched.append(axis_name)
+                    sole_mismatches.append((axis_name, label_text))
                     continue
             else:
-                # No title. The only way to be here is `single_axis_product` -- every other
-                # titleless product already returned `no_variant_title_supplied` above -- so this
-                # is the structural acceptance, and it is FLAGGED rather than silent. There is
+                # No title and no alias. The only way to be here is `single_axis_product` -- every
+                # other titleless product already returned `no_variant_title_supplied` above -- so
+                # this is the structural acceptance, and it is FLAGGED rather than silent. There is
                 # deliberately no second `single_axis_product` test here: a guard that cannot be
                 # reached reads as protection that does not exist, and the one above is the real
                 # one. (A mutation sweep found the duplicate and could not kill it.)
@@ -681,11 +765,9 @@ def select_option_ids(detail_product: Any, wanted_labels: Sequence[str]) -> Opti
                 return OptionMatch(ok=False, reason=f"value_has_no_option_id:{axis_name}")
             option_ids.append(option_id)
             # `chosen` records REAP's label, because Reap's optionId is what we send and Reap's
-            # label is what the response will echo. That is only sound now that the label has
-            # passed `title_matches_sole_label` against our title above -- i.e. that one of the
-            # two whole-token sets is a subset of the other, with our side covering at least half
-            # of Reap's when ours is the smaller. Not "contains", which is what it used to mean
-            # and which accepted "50ml" for "150ml".
+            # label is what the response will echo. Sound because the label either EQUALS one of
+            # our candidates or was named verbatim as an alias -- in both cases a human or our own
+            # row asserted this exact string, and nothing was inferred from it.
             chosen[axis_name] = label_text
             availability = single.get("available")
             chosen_available[axis_name] = availability if isinstance(availability, bool) else None
@@ -694,25 +776,14 @@ def select_option_ids(detail_product: Any, wanted_labels: Sequence[str]) -> Opti
             continue
 
         hit = None
-        # MULTI-VALUE AXES KEEP EXACT MATCHING, deliberately, and the asymmetry with the branch
-        # above is the point. There, one value means there is no sibling to be confused with and
-        # the only risk is refusing a row whose label carries a suffix we do not store. Here there
-        # ARE siblings, and they are precisely the near-miss strings a relaxed rule would confuse:
-        # `Standard` / `Mini` / `Travel` on one axis, or `150ml` beside `50ml`. Whole-token subset
-        # matching would make `{"50ml"}` and `{"150ml"}` no better separated than a human eye, and
-        # `title_matches_sole_label`'s half-coverage allowance would let a two-token title claim a
-        # three-token sibling. Loosening this branch is how the $95 Mini gets bought for the $140
-        # Standard, so it stays exact. Do not "unify" the two.
-        #
-        # There was a `label and` here. It was INERT -- `wanted` holds only non-empty strings, so
-        # `"" in wanted` is already False -- and a mutation sweep could not kill it. Deleted
-        # rather than annotated: a guard that cannot change an outcome reads as protection this
-        # comparison does not have. The blank label it appeared to defend against is refused by
-        # the membership test itself.
+        # A MULTI-VALUE AXIS, matched by exactly the same rule. There was a `label and` here. It
+        # was INERT -- `match_keys` holds only non-empty strings, so `"" in match_keys` is already
+        # False -- and a mutation sweep could not kill it. Deleted rather than annotated: a guard
+        # that cannot change an outcome reads as protection this comparison does not have.
         for value in values:
             value = value if isinstance(value, dict) else {}
             label = _norm(value.get("label"))
-            if label in wanted:
+            if label in match_keys:
                 if hit is not None:
                     # B5. Two VALUES on one axis matched our title. The previous rule only
                     # refused when their normalised labels DIFFERED, so two values carrying the
@@ -736,8 +807,19 @@ def select_option_ids(detail_product: Any, wanted_labels: Sequence[str]) -> Opti
             unavailable.append(axis_name)
 
     if unmatched:
+        # TWO DIFFERENT REFUSALS, because they need two different things done about them. When
+        # EVERY unmatched axis carried exactly one value, there is a specific, finite thing an
+        # operator can look at -- Reap's one label per axis -- and a specific remedy: if it names
+        # the same object our row does, store it in `accept_variant_labels`. That is
+        # `sole_label_differs`, and the labels ride along in `candidates` so nobody has to go back
+        # to the sandbox to see them. Anything else is `axes_not_determined_by_title`: our title
+        # genuinely does not pin the axis, and no alias fixes that.
+        reason = "axes_not_determined_by_title"
+        if sole_mismatches and len(sole_mismatches) == len(unmatched):
+            reason = f"sole_label_differs:{sole_mismatches[0][0]}"
         return OptionMatch(
-            ok=False, reason="axes_not_determined_by_title",
+            ok=False, reason=reason,
+            candidates=[{"axis": axis, "label": label} for axis, label in sole_mismatches],
             unmatched_axes=unmatched, chosen=chosen, chosen_available=chosen_available,
         )
     return OptionMatch(ok=True, option_ids=option_ids, chosen=chosen,
@@ -794,13 +876,21 @@ def variant_title_tokens(title: Any) -> List[str]:
     label itself. THE WHOLE TITLE IS ALWAYS THE FIRST CANDIDATE, because a single-axis label can
     legitimately contain a slash -- "Standard / Rose" may be one label, not two.
 
-    ONE-CHARACTER FRAGMENTS ARE DROPPED. Splitting "S/M" produced the fragments `S` and `M`, and
-    a single letter is not a label: against the substring rule this function fed, `M` matched any
-    label containing the letter m ("Jumbo", "Mini", "Medium"). The whole-token rule in
-    `title_matches_sole_label` would already refuse those, but a one-character fragment cannot
-    identify a variant under ANY rule, so it is not offered as a candidate at all. The whole title
-    is exempt: a row whose entire title is "S" is a real single-axis size, and dropping it would
-    leave nothing to match on.
+    TWO KINDS OF FRAGMENT ARE DROPPED, and only fragments -- the whole title is always kept.
+
+    One character. "S/M" produced `S` and `M`, and a single letter cannot identify a variant under
+    any rule.
+
+    Purely numeric. "50/50 Blend" is ONE label -- a 50/50 blend -- but splitting it offered the
+    bare candidate `50`, which under exact matching equals a real "50" label on some other axis
+    and under the old fuzzy rule matched "50 ml". A number on its own carries no unit and no
+    meaning; the whole title still covers the legitimate case.
+
+    The whole title is exempt from both rules: a row whose entire title is "S", or "50", is a real
+    single-axis value, and dropping it would leave nothing to match on.
+
+    Since matching is now EXACT, a surviving fragment can only ever match a label it equals --
+    which is what makes these two drops sufficient rather than a first line of defence.
     """
     raw = str(title or "").strip()
     if not raw:
@@ -808,7 +898,9 @@ def variant_title_tokens(title: Any) -> List[str]:
     out = [raw]
     for part in raw.split("/"):
         part = part.strip()
-        if len(part) >= 2 and part not in out:
+        if len(part) < 2 or part.isdigit():
+            continue
+        if part not in out:
             out.append(part)
     return out
 
@@ -1088,18 +1180,26 @@ async def _read_bounded(response: Any, *, max_bytes: int = MAX_RESPONSE_BYTES) -
     it is worth having, because it can refuse before a single byte of body is read. It is also a
     CLAIM, made by the host we are defending against: it can be absent (chunked responses declare
     nothing), or simply wrong. So the cumulative count while reading is what actually enforces the
-    cap, and the read stops the moment it is exceeded rather than finishing and then objecting.
+    cap.
 
-    The previous version had both checks but ran them AFTER `client.post`, which does not return
+    WHAT IS BOUNDED, PRECISELY: DECODED bytes, counted in steps of at most `_READ_CHUNK_BYTES`
+    (64 KiB). Not compressed bytes, and not "the read stops at the cap" in any finer sense than
+    one chunk. `chunk_size` is passed explicitly for that reason: without it httpx decodes as much
+    as each network read yields, and a highly compressible body makes that enormous -- measured, a
+    16 KiB compressed read decoded to a SINGLE 16.8 MiB chunk, eight times this cap, and that
+    whole allocation happened before `len(chunk)` could be looked at. The bound was on a number
+    computed after the damage. With a fixed chunk size the worst case is the cap plus one chunk.
+
+    An earlier version had both checks but ran them AFTER `client.post`, which does not return
     until the whole body is in memory -- so it declined to parse a body it had already fully
-    allocated. That is a cosmetic bound, and it is the one this replaces.
+    allocated. That was a cosmetic bound, and it is the one this replaces.
     """
     declared = str((response.headers or {}).get("content-length") or "").strip()
     if declared.isdigit() and int(declared) > max_bytes:
         return None
     chunks: List[bytes] = []
     total = 0
-    iterator = response.aiter_bytes()
+    iterator = response.aiter_bytes(chunk_size=_READ_CHUNK_BYTES)
     try:
         async for chunk in iterator:
             total += len(chunk)
@@ -1139,6 +1239,14 @@ async def _post(path: str, body: Dict[str, Any], *, timeout_seconds: Optional[fl
     # 25 s. `is not None` distinguishes them, and a non-positive explicit value is a caller bug
     # rather than a request we should reshape.
     if timeout_seconds is not None:
+        # `isinstance(True, int)` is True, so a bool reaches `float()` and becomes 1.0 -- a
+        # one-second timeout on every call, from a caller that meant "yes, use a timeout". Same
+        # family as the quantity bug: Python's bool/int identity turns a type error into a
+        # plausible number. Refused by type before it is converted.
+        if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)):
+            raise ReapRequestError(
+                f"timeout_seconds must be a number, got {type(timeout_seconds).__name__} "
+                f"{timeout_seconds!r}")
         timeout = float(timeout_seconds)
         if not math.isfinite(timeout) or timeout <= 0:
             raise ReapRequestError(
@@ -1164,7 +1272,8 @@ async def _post(path: str, body: Dict[str, Any], *, timeout_seconds: Optional[fl
             # is already in memory -- so the size checks that used to sit below it were measuring
             # an allocation that had already happened. They refused to PARSE an oversized body
             # while having read all of it, which is the part that costs. `stream` plus
-            # `_read_bounded` makes the bound real: the read stops at the cap.
+            # `_read_bounded` makes the bound real: DECODED bytes are counted as they arrive, in
+            # steps of at most 64 KiB, and the read is abandoned once the cap is passed.
             async with client.stream(
                 "POST", f"{url}{path}", json=body, headers=_headers(key, path, body)
             ) as resp:
@@ -1313,9 +1422,10 @@ class VariantResolution:
     #: title asserts "this row has no variants"; nothing here can verify that, and if the
     #: assertion is wrong we have resolved a product whose variant our row never named. A caller
     #: that cannot make that assertion about its own data must treat `True` here as a REFUSAL.
-    #: Every other acceptance was compared to our title (`title_matches_sole_label`), and a title
-    #: that was supplied but normalises to nothing refuses as `variant_title_unusable` rather
-    #: than arriving here.
+    #: Every other acceptance matched our title (or an explicit alias) EXACTLY, and a title that
+    #: was supplied but normalises to nothing refuses as `variant_title_unusable` rather than
+    #: arriving here. Shopify's "Default Title" placeholder counts as no title, so a row carrying
+    #: only that reaches this flag rather than being refused.
     single_value_axis_accepted_without_title: bool = False
     #: Set when the quote leg reported 503. See `ReapResponse.merchant_probably_not_completable`.
     merchant_probably_not_completable: bool = False
@@ -1344,6 +1454,10 @@ async def resolve_our_row(
     currency: Optional[str] = None,
     country: Optional[str] = None,
     also_accept_domains: Sequence[str] = (),
+    # Labels a human has asserted name the same object as this row. Compared EXACTLY, like the
+    # title's own candidates. This is the seam that replaced fuzzy matching -- see
+    # `label_candidates` for the three wrong purchases that produced it.
+    accept_variant_labels: Sequence[str] = (),
     max_search_attempts: int = MAX_SEARCH_ATTEMPTS,
     timeout_seconds: Optional[float] = None,
 ) -> VariantResolution:
@@ -1358,6 +1472,17 @@ async def resolve_our_row(
     $140.00 Fenty gift-tray bundle over the $140.00 Standard perfume, which is the exact trap this
     design avoids. `currency` is OUR row's currency: passing `our_price` without it is a
     comparison this module will not make, and it reports a disagreement rather than agreement.
+
+    RECALL WILL DROP, AND THAT IS THE POINT. Option labels are matched EXACTLY, so a row whose
+    label carries a suffix Reap adds and we do not store now REFUSES -- including the measured
+    flowerbeauty.com row ("Flamingo Flirt" against Reap's "Flamingo Flirt - Cream") that an
+    earlier relaxation was written for. Three review rounds each found that relaxation buying a
+    different physical object, so the trade is deliberate: fewer resolutions, none of them wrong.
+
+    The remedy is `accept_variant_labels`, and the refusal is built to hand you its contents --
+    `options:sole_label_differs:<axis>` comes back with Reap's label in `candidates`. Store it
+    against the row once a human has confirmed the two names mean the same thing, and the row
+    resolves. Do not answer a wave of these by loosening the comparison.
     """
     # Several phrasings, because Reap's search is query-sensitive and a bare product name is the
     # phrasing measured to MISS. `merchant_not_in_results` on one query is not evidence the
@@ -1428,13 +1553,17 @@ async def resolve_our_row(
             warnings=found.warnings,
         )
 
-    options = select_option_ids(product, variant_title_tokens(variant_title))
+    options = select_option_ids(product, variant_title_tokens(variant_title),
+                                accept_variant_labels=accept_variant_labels)
     if not options.ok:
         # NOTE the thing NOT done here: there is no fallback to `defaultVariant`. It is
         # availability-ordered, so on the measured Fenty row it would have silently substituted
         # the $95 Mini for the $140 Standard and returned ok=True.
         return VariantResolution(
             ok=False, reason=f"options:{options.reason}",
+            # On `sole_label_differs` these are Reap's labels for the axes we could not match --
+            # the strings a human would put in `accept_variant_labels` if they name our object.
+            candidates=options.candidates,
             matched_options=options.chosen, warnings=found.warnings, queries_tried=tried,
         )
 
@@ -1608,6 +1737,14 @@ REFUSAL_EXPLANATIONS: List[Tuple[str, str]] = [
     ("options:product_has_no_option_axes",
      "Unexpected: a product with no axes should have been handled by the single-variant path.\n"
      "If you see this, the details response changed shape."),
+    ("options:sole_label_differs",
+     "The axis has exactly ONE value and our title is not it. Reap's label is in `candidates`\n"
+     "above. Our title and Reap's only label differ; if they are the same object, store Reap's\n"
+     "label as an accepted alias for this row (`accept_variant_labels`) -- DO NOT loosen the\n"
+     "match. Three review rounds found a fuzzy version of this comparison buying a different\n"
+     "physical object: \"50ml\" resolved \"150ml\", \"Travel Spray Duo Set\" resolved \"Travel\",\n"
+     "\"1.7 oz\" resolved \"7 oz\". An alias is a human asserting that two names mean one thing,\n"
+     "which is the judgement no string rule was able to make."),
     ("options:ambiguous_on_axis",
      "Two VALUES on one axis both matched our title -- whether under different labels or under\n"
      "labels that normalise alike. Either way the title does not determine that axis, and the\n"
