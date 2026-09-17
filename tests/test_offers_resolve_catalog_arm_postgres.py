@@ -242,3 +242,91 @@ def test_two_offers_to_the_same_destination_are_offered_once(pg_engine):
         str(s.get("source")) == "catalog_offers" and s.get("deduped") == 1
         for s in ((res.get("metadata") or {}).get("sources") or [])
     )
+
+
+_SIB_PK = "ext:retailer:sibling-listing"
+_SIB_SIG = "sig_catalog_arm_sibling"
+_OTHER_PK = "ext:retailer:other-product"
+
+
+def _seed_listing(engine, pk, sig, content_key, merchant, offer_id, price, dest, suppressed=False):
+    """A second retailer LISTING: its own product row, SKU and offer, like the curated retailer
+    lane writes one per seller host."""
+    from sqlalchemy import text
+
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO catalog_merchants (merchant_id, merchant_name, primary_platform, status)"
+            " VALUES (:m, :m, 'external_seed', 'active') ON CONFLICT DO NOTHING"
+        ), {"m": merchant})
+        conn.execute(text(
+            "INSERT INTO catalog_products (product_key, merchant_id, platform, source_product_id,"
+            " title, brand, content_key, pivota_signature_id, catalog_track, truth_tier,"
+            " readiness_tier, pdp_scope, pdp_lifecycle_stage, source_system, updated_at,"
+            " suppressed_at, suppression_reason)"
+            " VALUES (:pk,:m,'external_seed',:pk,'Snail Essence','COSRX',:ck,:sig,"
+            "         'citation','primary','referral_only','multi_merchant_canonical',"
+            "         'published','test',NOW(), :sup, :why)"
+        ), {"pk": pk, "m": merchant, "ck": content_key, "sig": sig,
+            "sup": "2026-01-01T00:00:00" if suppressed else None,
+            "why": "test_takedown" if suppressed else None})
+        sku_key = f"{pk}::canonical"
+        conn.execute(text(
+            "INSERT INTO catalog_skus (sku_key, product_key, merchant_id, platform,"
+            " source_product_id, source_variant_id, title, currency, updated_at)"
+            " VALUES (:sk,:pk,:m,'external_seed',:pk,'v1','Snail Essence','USD',NOW())"
+        ), {"sk": sku_key, "pk": pk, "m": merchant})
+        conn.execute(text(
+            "INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id,"
+            " catalog_track, truth_tier, readiness_tier, offer_mode, channel, availability,"
+            " currency, list_price, merchant_effective_price, offer_type, is_first_party,"
+            " source_ref, offer_payload, updated_at)"
+            " VALUES (:oid,:sk,:pk,:m,'external_referral','observed','referral_only','redirect',"
+            "         'external_referral','in_stock','USD',:p,:p,'retailer',false,:dest,"
+            "         cast(:payload AS jsonb), NOW())"
+        ), {"oid": offer_id, "sk": sku_key, "pk": pk, "m": merchant, "p": price, "dest": dest,
+            "payload": '{"destination_url": "%s"}' % dest})
+
+
+def _sourced(res):
+    return {str(o.get("offer_id") or "").rsplit(":", 1)[-1] for o in (res.get("offers") or [])}
+
+
+def test_a_listing_id_returns_every_seller_that_shares_its_content_key(pg_engine):
+    """The door fix. Two retailers' listings of one product converge on a content_key, and a
+    buyer's agent holds a LISTING id (search and the PDP hand out product_key / signature, never
+    the content_key). Asking by EITHER listing must return BOTH sellers — and each offer keeps its
+    own listing product_key, so the seller tuple is not rewritten. An unrelated product's offer
+    must not ride along."""
+    _seed(pg_engine)
+    _seed_listing(pg_engine, _SIB_PK, _SIB_SIG, "ck_arm", "agent_seed::retailer::ohlolly.com",
+                  "of_sibling", 19.99, "https://ohlolly.com/products/snail")
+    _seed_listing(pg_engine, _OTHER_PK, "sig_other_product", "ck_other",
+                  "agent_seed::retailer::eyurs.com", "of_other", 5.00,
+                  "https://eyurs.com/products/other")
+
+    want = {"of_retailer_cheap", "of_retailer_dear", "of_sibling"}
+    for ident in (_SIG, _PK, _SIB_SIG, _SIB_PK, "ck_arm"):
+        res = _resolve(ident)
+        assert _sourced(res) == want, (ident, _sourced(res))
+        by_offer = {o["source"]["offer_id"]: o for o in res["offers"]}
+        assert by_offer["of_sibling"]["source"]["product_key"] == _SIB_PK
+        assert by_offer["of_retailer_cheap"]["source"]["product_key"] == _PK
+        assert by_offer["of_sibling"]["merchant_id"] == "agent_seed::retailer::ohlolly.com"
+
+
+def test_a_withdrawn_sibling_is_not_offered_through_a_live_listing(pg_engine):
+    _seed(pg_engine)
+    _seed_listing(pg_engine, _SIB_PK, _SIB_SIG, "ck_arm", "agent_seed::retailer::ohlolly.com",
+                  "of_sibling", 19.99, "https://ohlolly.com/products/snail", suppressed=True)
+    assert _sourced(_resolve(_SIG)) == {"of_retailer_cheap", "of_retailer_dear"}
+
+
+def test_a_withdrawn_listing_id_does_not_widen_to_its_live_siblings(pg_engine):
+    """The takedown contract for a listing id is unchanged: a withdrawn listing answered nothing
+    before the widening, and it must not start answering with its siblings' offers."""
+    _seed(pg_engine)
+    _seed_listing(pg_engine, _SIB_PK, _SIB_SIG, "ck_arm", "agent_seed::retailer::ohlolly.com",
+                  "of_sibling", 19.99, "https://ohlolly.com/products/snail", suppressed=True)
+    assert _sourced(_resolve(_SIB_SIG)) == set()
+    assert _sourced(_resolve(_SIB_PK)) == set()
