@@ -62,6 +62,7 @@ async def db(monkeypatch):
         database.unhang.set()
         try:
             await database.execute(f"DROP TABLE IF EXISTS {TABLE}")
+            await database.execute(f"DROP FUNCTION IF EXISTS {TABLE}_slow()")
         finally:
             await asyncio.wait_for(database.disconnect(), timeout=10)
 
@@ -258,3 +259,375 @@ async def test_a_savepoint_release_that_never_answers_loses_the_enclosing_transa
     _assert_terminated_and_released(db)
     await _pool_still_works(db, monkeypatch, 3)
     assert await _rows(db) == [3]
+
+
+# --- the reply lost BEFORE the deadline: command timeout, dropped connection -----------------
+
+
+def _fail_on(monkeypatch, statement: str, exc: BaseException, *, after_server_runs: bool) -> None:
+    """Make `statement` fail without the server's answer — as a command timeout or a lost socket."""
+    import asyncpg.connection
+
+    real = asyncpg.connection.Connection.execute
+
+    async def execute(self, query, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if not query.strip().upper().startswith(statement):
+            return await real(self, query, *args, **kwargs)
+        if after_server_runs:
+            await real(self, query, *args, **kwargs)
+        raise exc
+
+    monkeypatch.setattr(asyncpg.connection.Connection, "execute", execute)
+
+
+def _lost_reply_errors():
+    import asyncpg
+
+    return [
+        pytest.param(asyncio.TimeoutError(), id="command-timeout"),
+        pytest.param(asyncpg.ConnectionDoesNotExistError("connection was closed"), id="socket-lost"),
+        pytest.param(ConnectionResetError("reset by peer"), id="socket-reset"),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("server_committed", [True, False], ids=["committed", "not-sent"])
+@pytest.mark.parametrize("exc", _lost_reply_errors())
+async def test_a_commit_whose_reply_is_lost_early_is_outcome_unknown_too(
+    db, monkeypatch, exc, server_committed
+) -> None:
+    """DB_COMMAND_TIMEOUT_SECONDS shorter than the deadline used to surface as a bare TimeoutError."""
+    from db.database import CommitOutcomeUnknown
+
+    _fail_on(monkeypatch, "COMMIT", exc, after_server_runs=server_committed)
+
+    async def write() -> None:
+        async with db.transaction():
+            await db.execute(f"INSERT INTO {TABLE} VALUES (1)")
+
+    with pytest.raises(CommitOutcomeUnknown, match="MAY OR MAY NOT have committed") as excinfo:
+        await _within_deadline(db, write())
+    assert excinfo.value.__cause__ is exc
+
+    _assert_terminated_and_released(db)
+    await _pool_still_works(db, monkeypatch, 2)
+    assert await _rows(db) == ([1, 2] if server_committed else [2])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exc", _lost_reply_errors())
+async def test_a_savepoint_whose_reply_is_lost_early_is_not_called_a_commit(db, monkeypatch, exc) -> None:
+    """Only a ROOT COMMIT has an unknown outcome; a savepoint's enclosing transaction is still open."""
+    from db.database import CommitOutcomeUnknown
+
+    _fail_on(monkeypatch, "RELEASE SAVEPOINT", exc, after_server_runs=False)
+
+    async def nested_write() -> None:
+        async with db.transaction():
+            async with db.transaction():
+                await db.execute(f"INSERT INTO {TABLE} VALUES (1)")
+
+    with pytest.raises(BaseException) as excinfo:
+        await _within_deadline(db, nested_write())
+    assert not isinstance(excinfo.value, CommitOutcomeUnknown), excinfo.value
+    assert excinfo.value is exc, "a savepoint's own failure must reach the caller unchanged"
+
+
+# --- a release that fails must not strand the databases Connection ---------------------------
+
+
+def _fail_release_reset(monkeypatch) -> list:
+    """asyncpg's release resets the connection; make that fail. asyncpg then terminates and re-raises."""
+    import asyncpg.connection
+
+    calls: list = []
+
+    async def reset(self, *, timeout=None):  # type: ignore[no-untyped-def]
+        calls.append(self)
+        raise ConnectionError("simulated: the socket went silent after COMMIT answered")
+
+    monkeypatch.setattr(asyncpg.connection.Connection, "reset", reset)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_a_committed_write_whose_release_fails_reports_success_and_the_connection_stays_usable(
+    db, monkeypatch, caplog
+) -> None:
+    """The COMMIT answered, so it HAS committed: a failure to release must not report otherwise.
+
+    Before: the release error replaced the successful commit (a retry would write twice), and every
+    later query on that databases Connection failed with "Connection is already acquired".
+    """
+    resets = _fail_release_reset(monkeypatch)
+
+    async def task_body() -> list:
+        async with db.transaction():
+            await db.execute(f"INSERT INTO {TABLE} VALUES (1)")
+        monkeypatch.undo()
+        # Same task, same context: the same databases Connection is checked out again.
+        return [await db.fetch_val("SELECT 42")]
+
+    with caplog.at_level("WARNING", logger="db.database"):
+        assert await _within_deadline(db, task_body()) == [42]
+
+    assert len(resets) == 1, "the release reset was never reached — the test proves nothing"
+    assert db.terminated and db.terminated[0].is_closed()
+    assert _in_use(db) == 0
+    assert await _rows(db) == [1]
+    assert any("releasing a database connection failed" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_release_that_did_not_give_the_slot_back_still_raises(db, monkeypatch) -> None:
+    """Control: forgetting a checkout the pool still holds would leak its slot silently."""
+    import asyncpg.pool
+
+    real_release = asyncpg.pool.Pool.release
+
+    async def release(self, connection, *, timeout=None):  # type: ignore[no-untyped-def]
+        raise ConnectionError("simulated: release failed before touching the connection")
+
+    monkeypatch.setattr(asyncpg.pool.Pool, "release", release)
+    conn = db.connection()
+    with pytest.raises(ConnectionError, match="before touching"):
+        async with conn:
+            await conn.fetch_val("SELECT 1")
+    monkeypatch.setattr(asyncpg.pool.Pool, "release", real_release)
+    # The checkout was not forgotten: releasing it for real now returns the slot.
+    assert conn._connection._connection is not None
+    await conn._connection.release()
+    assert _in_use(db) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exc", _lost_reply_errors())
+async def test_a_root_rollback_whose_reply_is_lost_early_is_not_called_a_commit(db, monkeypatch, exc) -> None:
+    from db.database import CommitOutcomeUnknown
+
+    _fail_on(monkeypatch, "ROLLBACK", exc, after_server_runs=False)
+
+    async def failing_write() -> None:
+        async with db.transaction():
+            await db.execute(f"INSERT INTO {TABLE} VALUES (1)")
+            raise ValueError("the caller's own error")
+
+    with pytest.raises(BaseException) as excinfo:
+        await _within_deadline(db, failing_write())
+    assert not isinstance(excinfo.value, CommitOutcomeUnknown), excinfo.value
+    assert excinfo.value is exc
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_release_after_the_proxy_was_detached_still_clears_and_still_cancels(
+    db, monkeypatch
+) -> None:
+    """Cancellation is never swallowed — and the Connection is not stranded by it either."""
+    import asyncpg.pool
+
+    async def release(self, connection, *, timeout=None):  # type: ignore[no-untyped-def]
+        connection._con.terminate()  # asyncpg detaches the proxy and returns the slot
+        raise asyncio.CancelledError()
+
+    from databases.core import Connection
+
+    # A standalone Connection, not `db.connection()`: that one is shared through the context with
+    # the fixture's teardown, which would inherit the half-exited state this test leaves.
+    conn = Connection(db._backend)
+    await conn.__aenter__()
+    backend_conn = conn._connection
+    monkeypatch.setattr(asyncpg.pool.Pool, "release", release)
+    with pytest.raises(asyncio.CancelledError):
+        await backend_conn.release()
+    assert backend_conn._connection is None, "a cancelled release stranded the databases Connection"
+    monkeypatch.undo()
+    assert _in_use(db) == 0
+
+
+# --- a COMMIT given up on must not keep running on the server --------------------------------
+#
+# Review of the first version: terminating right away also dropped the cancel asyncpg had
+# queued, and a server busy inside COMMIT does not notice a closed socket. The COMMIT then
+# landed AFTER CommitOutcomeUnknown told the caller to check the data (0 rows at the error, 1 row
+# later): a caller that checks and retries writes twice. A deferred constraint trigger that sleeps
+# makes COMMIT itself slow, on a real statement.
+
+
+SLEEP = 2.0
+
+
+async def _make_commit_slow(database) -> None:
+    await database.execute(
+        f"""CREATE OR REPLACE FUNCTION {TABLE}_slow() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+            PERFORM pg_sleep({SLEEP});
+            RETURN NULL;
+        END $$"""
+    )
+    await database.execute(
+        f"CREATE CONSTRAINT TRIGGER {TABLE}_slow AFTER INSERT ON {TABLE} "
+        f"DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION {TABLE}_slow()"
+    )
+
+
+async def _rows_once_the_commit_would_have_landed(database) -> list:
+    await asyncio.sleep(SLEEP + 1.0)
+    return await _rows(database)
+
+
+@pytest.mark.asyncio
+async def test_a_commit_past_the_deadline_is_cancelled_on_the_server_not_just_abandoned(db) -> None:
+    from db.database import CommitOutcomeUnknown
+
+    await _make_commit_slow(db)
+
+    async def write() -> None:
+        async with db.transaction():
+            await db.execute(f"INSERT INTO {TABLE} VALUES (1)")
+
+    with pytest.raises(CommitOutcomeUnknown, match="finished with it") as excinfo:
+        await _within_deadline(db, write())
+    assert excinfo.value.settled is True
+    _assert_terminated_and_released(db)
+    assert await _rows_once_the_commit_would_have_landed(db) == [], (
+        "the COMMIT landed after the caller was told to check the data"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_commit_past_the_command_timeout_is_cancelled_on_the_server_not_just_abandoned(
+    db, monkeypatch
+) -> None:
+    from databases import Database
+
+    import db.database as dbmod
+    from db.database import CommitOutcomeUnknown
+
+    await _make_commit_slow(db)
+    monkeypatch.setattr(dbmod, "DB_POOL_CHECKOUT_TIMEOUT_SECONDS", 5.0)  # the command timeout fires first
+    timed = Database(DATABASE_URL, min_size=1, max_size=1, command_timeout=0.3)
+    await timed.connect()
+    try:
+
+        async def write() -> None:
+            async with timed.transaction():
+                await timed.execute(f"INSERT INTO {TABLE} VALUES (1)")
+
+        with pytest.raises(CommitOutcomeUnknown, match="finished with it") as excinfo:
+            await _within_deadline(db, write())
+        assert excinfo.value.settled is True
+        assert isinstance(excinfo.value.__cause__, asyncio.TimeoutError)
+        assert _in_use(timed) == 0
+    finally:
+        await asyncio.wait_for(timed.disconnect(), timeout=10)
+    assert await _rows_once_the_commit_would_have_landed(db) == [], (
+        "the COMMIT landed after the caller was told to check the data"
+    )
+
+
+@pytest.mark.asyncio
+async def test_when_the_cancel_cannot_land_the_error_says_the_commit_may_still_land(
+    db, monkeypatch
+) -> None:
+    """And it is not a hypothetical: the server finishes that COMMIT after the error."""
+    import asyncpg.connection
+
+    from db.database import CommitOutcomeUnknown
+
+    await _make_commit_slow(db)
+
+    async def unreachable_cancel(self, waiter):  # type: ignore[no-untyped-def]
+        await db.unhang.wait()  # the cancel connection never gets through; terminate() cancels this
+
+    monkeypatch.setattr(asyncpg.connection.Connection, "_cancel", unreachable_cancel)
+
+    async def write() -> None:
+        async with db.transaction():
+            await db.execute(f"INSERT INTO {TABLE} VALUES (1)")
+
+    with pytest.raises(CommitOutcomeUnknown, match="MAY STILL BE RUNNING") as excinfo:
+        await _within_deadline(db, write())
+    assert excinfo.value.settled is False
+    _assert_terminated_and_released(db)
+    assert await _rows_once_the_commit_would_have_landed(db) == [1], (
+        "the server did not finish the COMMIT — then this test no longer shows why the message warns"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["deadline", "command-timeout"])
+async def test_a_cancel_request_that_fails_fast_is_not_reported_as_settled(db, monkeypatch, path) -> None:
+    """A refused cancel connection (or a TLS error) fails at once instead of hanging.
+
+    Reporting that as settled would say "the data is final" while the COMMIT still lands after —
+    the double write this code exists to prevent. The row appearing later is the proof.
+    """
+    import asyncpg.connect_utils
+    from databases import Database
+
+    import db.database as dbmod
+    from db.database import CommitOutcomeUnknown
+
+    await _make_commit_slow(db)
+
+    async def refused(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise ConnectionRefusedError("simulated: the cancel connection was refused")
+
+    monkeypatch.setattr(asyncpg.connect_utils, "_cancel", refused)
+    target = db
+    if path == "command-timeout":
+        monkeypatch.setattr(dbmod, "DB_POOL_CHECKOUT_TIMEOUT_SECONDS", 5.0)
+        target = Database(DATABASE_URL, min_size=1, max_size=1, command_timeout=0.3)
+        await target.connect()
+    try:
+
+        async def write() -> None:
+            async with target.transaction():
+                await target.execute(f"INSERT INTO {TABLE} VALUES (1)")
+
+        with pytest.raises(CommitOutcomeUnknown, match="MAY STILL BE RUNNING") as excinfo:
+            await _within_deadline(db, write())
+        assert excinfo.value.settled is False
+    finally:
+        if target is not db:
+            await asyncio.wait_for(target.disconnect(), timeout=10)
+    assert await _rows_once_the_commit_would_have_landed(db) == [1], (
+        "the server did not finish the COMMIT — then this test no longer shows why settled must be False"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_rollback_past_the_deadline_does_not_wait_for_a_cancel(db, monkeypatch) -> None:
+    """Terminating already fixes a ROLLBACK's outcome; waiting for its cancel only holds the slot."""
+    import asyncpg.connection
+
+    from db.database import TransactionEndTimedOut
+
+    cancels: list = []
+
+    async def slow_cancel(self, waiter):  # type: ignore[no-untyped-def]
+        cancels.append(self)
+        await db.unhang.wait()
+
+    monkeypatch.setattr(asyncpg.connection.Connection, "_cancel", slow_cancel)
+    real = asyncpg.connection.Connection.execute
+
+    async def execute(self, query, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if query.strip().upper().startswith("ROLLBACK"):
+            return await real(self, "SELECT pg_sleep(5)")  # a real statement, so a real cancel
+        return await real(self, query, *args, **kwargs)
+
+    monkeypatch.setattr(asyncpg.connection.Connection, "execute", execute)
+
+    async def failing_write() -> None:
+        async with db.transaction():
+            raise ValueError("the caller's own error")
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    with pytest.raises(TransactionEndTimedOut):
+        await _within_deadline(db, failing_write())
+    elapsed = loop.time() - started
+    assert cancels, "asyncpg never tried to cancel — the test proves nothing"
+    assert elapsed < DEADLINE * 1.5, f"a ROLLBACK waited {elapsed:.2f}s for a cancel it does not need"
+    _assert_terminated_and_released(db)

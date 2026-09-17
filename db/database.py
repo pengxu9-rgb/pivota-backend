@@ -760,20 +760,34 @@ if not _install_failed_begin_cleanup():
 # every sibling on the shared Connection blocked on the lock.
 #
 # Where the command timeout is SHORTER than this deadline (some one-off jobs
-# set 60), it fires first and the bare TimeoutError is what surfaces — not
-# CommitOutcomeUnknown.
+# set 60), it fires first; a root COMMIT that fails that way, or loses its
+# connection mid-statement, is reported as CommitOutcomeUnknown too
+# (`_reply_was_lost`).
 #
 # The fix, in the Postgres backend where the asyncpg connection is: the same
-# deadline and terminate as `_abandon_failed_begin` (and as asyncpg's own
-# release). The connection is terminated FIRST, then the statement's task
-# cancelled — terminating fails asyncpg's pending waiter, so nothing below
-# depends on a cancel the silent server would have to acknowledge. The pool
-# replaces a terminated connection.
+# deadline as `_abandon_failed_begin` (and as asyncpg's own release). When a
+# statement is given up on — the deadline runs out, or DB_COMMAND_TIMEOUT_SECONDS
+# or a dead socket gets there first — the statement is CANCELLED ON THE SERVER
+# first, and the connection terminated after. Order matters:
+#   * Terminating alone does not stop the server. Postgres does not notice a
+#     closed socket while a COMMIT is busy (deferred triggers, constraint
+#     checks), so the COMMIT can still land AFTER the caller was told the
+#     outcome is unknown. A caller that then checks the data, finds nothing,
+#     and retries writes twice. `terminate()` also cancels the cancel request
+#     asyncpg had already queued. Found in review of the first version of this
+#     code: 0 rows at the error, 1 row five seconds later.
+#   * The cancel is bounded by the same deadline. On a silent socket the cancel
+#     request (a new connection) may never be answered; the connection is then
+#     terminated anyway and the error says the server may still be running it.
+# asyncpg resolves its cancel waiter only when the server sends the cancelled
+# statement's result, so a cancel that lands means the server has FINISHED the
+# statement: what the data shows afterwards is final. The pool replaces a
+# terminated connection.
 #
 # What a timeout means for the caller's data:
 #   * root COMMIT: UNKNOWN. The server may have committed before the answer was
-#     lost. `CommitOutcomeUnknown` says so; success is never reported, and the
-#     caller must check before retrying a non-idempotent write.
+#     lost. `CommitOutcomeUnknown` says so, and `.settled` says whether the
+#     server is known to be done with it; success is never reported.
 #   * RELEASE SAVEPOINT / ROLLBACK TO / root ROLLBACK: nothing is committed.
 #     Terminating ends the session and the server rolls back the whole open
 #     transaction, including levels enclosing a savepoint — so this still
@@ -783,7 +797,68 @@ class TransactionEndTimedOut(RuntimeError):
 
 
 class CommitOutcomeUnknown(TransactionEndTimedOut):
-    """A root COMMIT got no answer in time. It may or may not have committed."""
+    """A root COMMIT got no answer. It may or may not have committed.
+
+    `settled` is True when the server acknowledged the cancel, i.e. it has finished the
+    COMMIT and the data can be checked. False: it could not be reached, and the COMMIT
+    may still land after this error.
+    """
+
+    def __init__(self, message: str, *, settled: bool) -> None:
+        super().__init__(message)
+        self.settled = settled
+
+
+def _reply_was_lost(exc: Optional[BaseException]) -> bool:
+    """True if a statement failed WITHOUT the server answering it.
+
+    A client-side timeout (DB_COMMAND_TIMEOUT_SECONDS; TimeoutError is an
+    OSError) or a connection lost mid-statement (ConnectionDoesNotExistError is
+    a PostgresConnectionError). Any other PostgresError is the server's own
+    answer; an InterfaceError is raised before anything is sent.
+    """
+    import asyncpg
+
+    return isinstance(exc, (OSError, asyncpg.PostgresConnectionError))
+
+
+async def _cancel_lands(con, budget: float) -> bool:  # type: ignore[no-untyped-def]
+    """Wait, at most `budget`, for asyncpg's pending cancel to be answered by the server.
+
+    True only when the server has sent the cancelled statement's result — it is done with
+    it. `_wait_for_cancellation` (what asyncpg's own pool release awaits) returns exactly
+    then: the cancel was sent, and the result arrived. Anything else — no cancel pending,
+    the cancel request failing, the budget running out — is False: not known to be done.
+    The protocol is Cython, so its waiter futures are not reachable from here.
+    """
+    protocol = con._protocol
+    if con.is_closed() or protocol is None or not protocol._is_cancelling():
+        return False
+    waiting = asyncio.ensure_future(protocol._wait_for_cancellation())
+    done, _ = await asyncio.wait((waiting,), timeout=budget)
+    if not done:
+        waiting.cancel()  # the connection is terminated next; its futures go with it
+        return False
+    return not waiting.cancelled() and waiting.exception() is None
+
+
+def _commit_outcome_unknown(why: str, settled: bool) -> CommitOutcomeUnknown:
+    if settled:
+        tail = (
+            "It was cancelled on the server, which has finished with it: the data as it is now "
+            "is final. The transaction MAY OR MAY NOT have committed — check before retrying a "
+            "non-idempotent write."
+        )
+    else:
+        tail = (
+            "The transaction MAY OR MAY NOT have committed, and the server could not be reached "
+            "to cancel it, so the COMMIT MAY STILL BE RUNNING and may commit after this error: a "
+            "check of the data now can be contradicted later. Do not retry a non-idempotent "
+            "write on the strength of such a check."
+        )
+    return CommitOutcomeUnknown(
+        f"{why}, and the connection was terminated. {tail}", settled=settled
+    )
 
 
 async def _end_within_deadline(xact, action: str) -> None:  # type: ignore[no-untyped-def]
@@ -793,10 +868,34 @@ async def _end_within_deadline(xact, action: str) -> None:  # type: ignore[no-un
     task = asyncio.ensure_future(getattr(xact, action)())
     done, _ = await asyncio.wait((task,), timeout=deadline)
     if done:
+        exc = None if task.cancelled() else task.exception()
+        if action == "commit" and not nested and _reply_was_lost(exc):
+            # The same unknown outcome as the deadline below, reached first by
+            # DB_COMMAND_TIMEOUT_SECONDS (asyncpg has already queued a cancel)
+            # or by the socket dying mid-COMMIT (nothing left to cancel on).
+            # Terminated for the same reason: nothing about this session can
+            # be trusted, and asyncpg would otherwise make the release wait for
+            # a cancel acknowledgement the dead socket never sends.
+            settled = await _cancel_lands(con, deadline)
+            con.terminate()
+            raise _commit_outcome_unknown(
+                f"COMMIT failed without an answer from the server ({type(exc).__name__})", settled
+            ) from exc
         return task.result()
-    con.terminate()
+    # Cancelling the task makes asyncpg queue a cancel for the running
+    # statement (its waiter callback runs before the task resumes). One shared
+    # budget for the task to unwind and the cancel to land: never trade one
+    # hang for another. Only a root COMMIT waits for the cancel — for the other
+    # ends, terminating already fixes the outcome (nothing committed), so the
+    # wait would only hold the slot and the lock longer.
+    loop = asyncio.get_running_loop()
+    until = loop.time() + deadline
     task.cancel()
-    await asyncio.wait((task,), timeout=deadline)  # bounded: never trade one hang for another
+    await asyncio.wait((task,), timeout=deadline)
+    settled = False
+    if action == "commit" and not nested and task.done():
+        settled = await _cancel_lands(con, max(0.0, until - loop.time()))
+    con.terminate()
     if task.done() and not task.cancelled():
         task.exception()  # consumed: the timeout below is the error that matters
     statement = {
@@ -806,14 +905,14 @@ async def _end_within_deadline(xact, action: str) -> None:  # type: ignore[no-un
         ("rollback", True): "ROLLBACK TO SAVEPOINT",
     }[(action, nested)]
     logger.warning(
-        "no answer to %s within %.1fs — terminated the connection", statement, deadline
+        "no answer to %s within %.1fs — terminated the connection%s",
+        statement,
+        deadline,
+        ("" if action != "commit" or nested
+         else " (cancel acknowledged)" if settled else " (cancel NOT acknowledged)"),
     )
     if action == "commit" and not nested:
-        raise CommitOutcomeUnknown(
-            f"COMMIT got no answer within {deadline:.1f}s and the connection was terminated. "
-            "The transaction MAY OR MAY NOT have committed — the server can commit and the "
-            "answer still be lost. Check the data before retrying a non-idempotent write."
-        )
+        raise _commit_outcome_unknown(f"COMMIT got no answer within {deadline:.1f}s", settled)
     raise TransactionEndTimedOut(
         f"{statement} got no answer within {deadline:.1f}s and the connection was terminated. "
         "Nothing was committed: the server rolls back the whole open transaction "
@@ -856,6 +955,85 @@ def _install_bounded_transaction_end() -> bool:
 # COMMIT/ROLLBACK outlives the deadline.
 if not _install_bounded_transaction_end():
     raise RuntimeError("db.database: bounded transaction end failed to install")
+
+
+# ---------------------------------------------------------------------------
+# A release that fails must not strand the `databases` Connection.
+#
+# asyncpg's pool release resets the connection first (and, after a client-side
+# timeout, waits for the server to acknowledge the cancel). If that fails it
+# TERMINATES the connection and re-raises: the slot is back in the pool, and the
+# pool proxy is detached. `databases` 0.7.0's `PostgresConnection.release` sets
+# `self._connection = None` only after the release RETURNS, so it never does.
+# Every later checkout on that `databases` Connection (the one a task's context
+# keeps for the life of the context) then fails with "Connection is already
+# acquired", for good. Reproduced 2026-09-17 with DB_COMMAND_TIMEOUT_SECONDS
+# shorter than the transaction-end deadline and the socket silent during
+# COMMIT: slot returned, next query AssertionError.
+#
+# The fix: when the release failed and the checkout is provably gone (the proxy
+# was detached, which only happens once asyncpg has released or terminated it),
+# forget it — and do NOT raise. A release runs after the caller's own statement
+# has already answered: a COMMIT that succeeded HAS committed, and raising here
+# (from the `finally` that releases after COMMIT) would report it as failed and
+# invite a retry that writes twice. When the caller's statement failed, that
+# error now reaches the caller instead of being replaced by the release's.
+# Cancellation still propagates. A failed release whose checkout is NOT provably
+# gone raises exactly as before.
+def _install_stranded_release_cleanup() -> bool:
+    """Forget a checkout asyncpg terminated during a failed release. Returns True if installed."""
+    import inspect
+
+    import databases.backends.postgres as pg_backend
+
+    PostgresConnection = pg_backend.PostgresConnection
+    if getattr(PostgresConnection.release, "_pivota_stranded_release", False):
+        return True
+
+    # Read off the module, not the method: holder tracking may already wrap it.
+    source = inspect.getsource(pg_backend)
+    for fragment in (
+        "self._connection = await self._database._pool.release(self._connection)\n"
+        "        self._connection = None",
+    ):
+        if fragment not in source:
+            raise RuntimeError(
+                "db.database: refusing to patch databases.backends.postgres.PostgresConnection"
+                f".release — the module no longer contains {fragment!r}. The library changed; "
+                "re-read it and update this patch."
+            )
+
+    inner_release = PostgresConnection.release
+
+    async def release(self) -> None:  # type: ignore[no-untyped-def]
+        proxy = self._connection
+        try:
+            await inner_release(self)
+        except BaseException as exc:
+            if proxy is None or getattr(proxy, "_con", None) is not None:
+                raise  # not provably gone: the old behaviour
+            self._connection = None
+            if not isinstance(exc, Exception):
+                raise
+            logger.warning(
+                "releasing a database connection failed after asyncpg had already released or "
+                "terminated it — "
+                "its pool slot is back; not raised, because the caller's statement had "
+                "already answered",
+                exc_info=True,
+            )
+
+    # Keep the markers of what this wraps (holder tracking's `_pivota_tracked`):
+    # it still runs, and its own install guard reads the marker to stay single.
+    release.__dict__.update(getattr(inner_release, "__dict__", {}))
+    release._pivota_stranded_release = True  # type: ignore[attr-defined]
+    PostgresConnection.release = release  # type: ignore[assignment]
+    return True
+
+
+# Unconditional, like the patches above: inert until a release fails.
+if not _install_stranded_release_cleanup():
+    raise RuntimeError("db.database: stranded-release cleanup failed to install")
 
 
 database = Database(DATABASE_URL, **database_kwargs)
