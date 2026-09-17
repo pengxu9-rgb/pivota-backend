@@ -496,6 +496,93 @@ class TransactionEndedOutOfOrder(RuntimeError):
     """
 
 
+class TransactionStartTimedOut(RuntimeError):
+    """BEGIN could not get its turn on the shared Connection in time. Nothing was sent."""
+
+
+# BEGIN/COMMIT/ROLLBACK wait for `Connection._query_lock` (see the patched
+# `Transaction.start`) — behind a sibling's statement, which may never finish:
+# a silent socket (failover, dropped NAT entry) where no command timeout is set
+# (DB_COMMAND_TIMEOUT_SECONDS defaults to off; statement_timeout is enforced by
+# the server, so it cannot end a wait on a dead socket), held by a sibling
+# nobody cancels. Unbounded, that wait would hold `_transaction_lock` and —
+# for an end, which runs uncancellably — swallow the caller's cancellation too.
+# 0.7.0 never waited: it sent the statement and asyncpg refused it at once.
+# So the wait has the same deadline as the statement itself, and asyncpg's
+# release (DB_POOL_CHECKOUT_TIMEOUT_SECONDS).
+async def _acquire_query_lock(connection) -> bool:  # type: ignore[no-untyped-def]
+    """Take `connection._query_lock` within the deadline. False if it ran out (lock not held)."""
+    try:
+        await asyncio.wait_for(connection._query_lock.acquire(), DB_POOL_CHECKOUT_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        return False
+    return True
+
+
+@asynccontextmanager
+async def _query_lock_for_begin(connection):  # type: ignore[no-untyped-def]
+    # Nothing is sent yet, so giving up is clean: raise, and terminate nothing.
+    # A sibling's statement that is merely slow is left alone.
+    if not await _acquire_query_lock(connection):
+        raise TransactionStartTimedOut(
+            f"BEGIN waited {DB_POOL_CHECKOUT_TIMEOUT_SECONDS:.1f}s for a statement already running "
+            "on the same databases Connection (a sibling task) and gave up. Nothing was sent."
+        )
+    try:
+        yield
+    finally:
+        connection._query_lock.release()
+
+
+@asynccontextmanager
+async def _query_lock_for_end(connection, action: str, is_root: bool):  # type: ignore[no-untyped-def]
+    # The transaction is open and must not be left open, so giving up means
+    # terminating the session: the server rolls the whole transaction back, and
+    # the sibling's hung statement fails, which returns the lock. The outcome
+    # is KNOWN — the COMMIT was never sent — hence TransactionEndTimedOut, not
+    # CommitOutcomeUnknown. A sibling statement that is merely slow (longer
+    # than the deadline) is killed with it; the alternative is an unbounded,
+    # uncancellable wait.
+    #
+    # The sibling's statement is CANCELLED on the server first (bounded by the
+    # same deadline), then the connection terminated. Terminating alone does not
+    # stop a busy server statement, and until it ends the session keeps the
+    # transaction open and its locks held: reproduced with pg_sleep(30), where a
+    # DROP TABLE on the written table then waited the full 30s.
+    if not await _acquire_query_lock(connection):
+        statement = {
+            ("commit", True): "COMMIT",
+            ("commit", False): "RELEASE SAVEPOINT",
+            ("rollback", True): "ROLLBACK",
+            ("rollback", False): "ROLLBACK TO SAVEPOINT",
+        }[(action, is_root)]
+        con = connection.raw_connection
+        if not con.is_closed():
+            sent = asyncio.get_running_loop().create_future()
+            try:
+                await asyncio.wait_for(con._cancel(sent), DB_POOL_CHECKOUT_TIMEOUT_SECONDS)
+            except Exception:  # noqa: BLE001 — best effort; terminating below is what bounds it
+                pass
+            if sent.done() and not sent.cancelled():
+                sent.exception()  # retrieved: a cancel that could not be sent changes nothing here
+        con.terminate()
+        logger.warning(
+            "%s waited %.1fs for a sibling statement on the shared Connection — terminated the connection",
+            statement,
+            DB_POOL_CHECKOUT_TIMEOUT_SECONDS,
+        )
+        raise TransactionEndTimedOut(
+            f"{statement} waited {DB_POOL_CHECKOUT_TIMEOUT_SECONDS:.1f}s for a statement already "
+            "running on the same databases Connection (a sibling task) and was never sent; the "
+            "connection was terminated. Nothing was committed: the server rolls back the whole "
+            "open transaction when the session ends."
+        )
+    try:
+        yield
+    finally:
+        connection._query_lock.release()
+
+
 def _install_cancellation_safe_connection_exit() -> bool:
     """Make `databases` return connections despite cancellation. Returns True if installed."""
     from databases.core import Connection, Transaction
@@ -522,6 +609,21 @@ def _install_cancellation_safe_connection_exit() -> bool:
             "self._connection._transaction_stack.append(self)",
         ),
     )
+    # The transaction statements below take `_query_lock`; that serializes
+    # them with siblings' statements only while every query takes it too.
+    for method in (
+        Connection.fetch_all,
+        Connection.fetch_one,
+        Connection.fetch_val,
+        Connection.execute,
+        Connection.execute_many,
+        Connection.iterate,
+    ):
+        _require_source(
+            method,
+            f"databases.core.Connection.{method.__name__}",
+            ("async with self._query_lock",),
+        )
     for method in (Transaction.commit, Transaction.rollback):
         _require_source(
             method,
@@ -545,6 +647,22 @@ def _install_cancellation_safe_connection_exit() -> bool:
         # the shared Connection the counter stays above zero, nothing is
         # released, and no asyncpg reset runs. Undoing what BEGIN left on the
         # server is the backend's job — see `_install_failed_begin_cleanup`.
+        #
+        # And: BEGIN (with that cleanup) holds `_query_lock`, like every
+        # fetch/execute does. 0.7.0 sends transaction statements to the raw
+        # connection without it, so a sibling's statement in flight made
+        # asyncpg REFUSE the BEGIN or the cleanup ROLLBACK ("another operation
+        # is in progress"). A refused cleanup left a cancelled BEGIN's orphan
+        # open, and the sibling's next plain write ran inside it and vanished
+        # at the release reset, reported as a success. Prod 2026-09-17: 7x
+        # "could not roll back after a failed BEGIN" with that error, 4 of them
+        # followed within ~5s by asyncpg's "Resetting connection with an active
+        # transaction" on the same revision.
+        # Lock order is always _transaction_lock -> _query_lock (iterate() takes
+        # the query lock only inside its transaction). The wait is bounded (see
+        # `_acquire_query_lock`): a transaction started or ended while an
+        # `iterate()` generator is suspended holding the lock gives up after the
+        # deadline rather than deadlocking.
         self._connection = self._connection_callable()
         self._transaction = self._connection._connection.transaction()
 
@@ -552,9 +670,10 @@ def _install_cancellation_safe_connection_exit() -> bool:
             is_root = not self._connection._transaction_stack
             await self._connection.__aenter__()
             try:
-                await self._transaction.start(
-                    is_root=is_root, extra_options=self._extra_options
-                )
+                async with _query_lock_for_begin(self._connection):
+                    await self._transaction.start(
+                        is_root=is_root, extra_options=self._extra_options
+                    )
             except BaseException:
                 await self._connection.__aexit__()
                 raise
@@ -585,6 +704,12 @@ def _install_cancellation_safe_connection_exit() -> bool:
         #     Connection cannot be made correct here — only loud and leak-free.
         # A transaction that is not on the stack at all holds no checkout
         # (already ended, or its BEGIN failed): raise, and exit nothing.
+        # The statement holds `_query_lock`, as BEGIN does (see `start`): a
+        # COMMIT refused because a sibling's statement was in flight left the
+        # server inside the transaction with asyncpg's `_top_xact` already
+        # cleared, and the sibling's next plain write was silently lost with it.
+        # That wait runs uncancellably, like the lock above, so it has its own
+        # deadline, and giving up terminates the connection (`_query_lock_for_end`).
         async with self._connection._transaction_lock:
             stack = self._connection._transaction_stack
             depth = next((i for i, t in enumerate(stack) if t is self), None)
@@ -597,7 +722,8 @@ def _install_cancellation_safe_connection_exit() -> bool:
             del stack[depth]
             if not above:
                 try:
-                    await getattr(self._transaction, action)()
+                    async with _query_lock_for_end(self._connection, action, depth == 0):
+                        await getattr(self._transaction, action)()
                 finally:
                     await self._connection.__aexit__()
                 return
@@ -610,7 +736,8 @@ def _install_cancellation_safe_connection_exit() -> bool:
             )
             try:
                 try:
-                    await self._transaction.rollback()
+                    async with _query_lock_for_end(self._connection, "rollback", depth == 0):
+                        await self._transaction.rollback()
                 finally:
                     await self._connection.__aexit__()
             except Exception as exc:
@@ -688,9 +815,14 @@ async def _abandon_failed_begin(xact) -> None:  # type: ignore[no-untyped-def]
         )
         con.terminate()
     except Exception:
-        # Still safe: with `_top_xact` cleared, a server left in the orphan
-        # makes asyncpg REFUSE the next `transaction()` ("manually started
-        # transaction"), so the next write fails loudly instead of vanishing.
+        # NOT safe. With `_top_xact` cleared, a server left in the orphan makes
+        # asyncpg refuse the next `transaction()` ("manually started
+        # transaction") — but a sibling's plain execute() runs inside the
+        # orphan and is rolled back at release, reported as a success
+        # (reproduced). The caller holds `_query_lock` (see the patched
+        # `Transaction.start`), so no sibling statement sent through `databases`
+        # can be in flight (raw_connection users bypass it); what
+        # remains is a ROLLBACK that could not be sent at all.
         logger.warning("could not roll back after a failed BEGIN", exc_info=True)
 
 

@@ -631,3 +631,82 @@ async def test_a_rollback_past_the_deadline_does_not_wait_for_a_cancel(db, monke
     assert cancels, "asyncpg never tried to cancel — the test proves nothing"
     assert elapsed < DEADLINE * 1.5, f"a ROLLBACK waited {elapsed:.2f}s for a cancel it does not need"
     _assert_terminated_and_released(db)
+
+
+# --- waiting for a sibling's statement on the shared Connection -------------------------------
+#
+# Transaction statements take `Connection._query_lock` (so a sibling's in-flight statement can no
+# longer get them refused and lose writes). That wait must be bounded too: a sibling nobody
+# cancels, whose statement never finishes, would otherwise hold an uncancellable end forever. The
+# sibling here is a real `pg_sleep(30)` — the lock is held exactly as a dead socket would hold it.
+
+
+async def _sibling_statement_running(db) -> asyncio.Task:
+    sibling = asyncio.ensure_future(db.fetch_all("SELECT pg_sleep(30)"))  # never cancelled below
+    await asyncio.sleep(0.1)  # on the wire, holding the query lock
+    assert not sibling.done(), sibling
+    return sibling
+
+
+@pytest.mark.asyncio
+async def test_a_commit_waiting_on_a_sibling_statement_that_never_finishes_terminates_and_raises(
+    db, monkeypatch
+) -> None:
+    import asyncpg
+
+    from db.database import CommitOutcomeUnknown, TransactionEndTimedOut
+
+    async with db.connection():  # the writer and the sibling share it
+        siblings: list = []
+
+        async def write() -> None:
+            async with db.transaction():
+                await db.execute(f"INSERT INTO {TABLE} VALUES (1)")
+                siblings.append(await _sibling_statement_running(db))
+
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        with pytest.raises(TransactionEndTimedOut) as raised:
+            await _within_deadline(db, write())
+        elapsed = loop.time() - started
+        # COMMIT was never sent, so the outcome is known: not "unknown".
+        assert not isinstance(raised.value, CommitOutcomeUnknown), raised.value
+        assert "never sent" in str(raised.value)
+        # Its statement was cancelled on the server, then its session ended under it.
+        with pytest.raises((asyncpg.QueryCanceledError, asyncpg.PostgresConnectionError)):
+            await asyncio.wait_for(siblings[0], timeout=5)
+
+    assert elapsed < 5, f"waited {elapsed:.2f}s for a sibling with a {DEADLINE}s deadline"
+    _assert_terminated_and_released(db)
+    # Terminating alone leaves the server running pg_sleep(30) inside the open transaction,
+    # holding its locks: the session must actually be gone, not merely disconnected.
+    loop_deadline = loop.time() + 3
+    while await db.fetch_val(
+        "SELECT count(*) FROM pg_stat_activity WHERE query = 'SELECT pg_sleep(30)' "
+        "AND pid <> pg_backend_pid()"
+    ):
+        assert loop.time() < loop_deadline, "the server is still running the sibling's statement"
+        await asyncio.sleep(0.05)
+    await _pool_still_works(db, monkeypatch, 2)
+    assert await _rows(db) == [2], "the terminated transaction's INSERT persisted"
+
+
+@pytest.mark.asyncio
+async def test_a_begin_waiting_on_a_sibling_statement_gives_up_without_terminating(db) -> None:
+    from db.database import TransactionStartTimedOut
+
+    async with db.connection():
+        sibling = await _sibling_statement_running(db)
+        with pytest.raises(TransactionStartTimedOut):
+            await _within_deadline(db, db.transaction().start())
+        # Nothing was sent, so the sibling's (merely slow) statement is left alone.
+        assert db.terminated == [] and not sibling.done()
+        sibling.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(sibling, timeout=5)
+        assert not db.connection().raw_connection._con._top_xact  # the failed start left nothing
+
+    assert _in_use(db) == 0
+    async with db.transaction():
+        await db.execute(f"INSERT INTO {TABLE} VALUES (1)")
+    assert await _rows(db) == [1]
