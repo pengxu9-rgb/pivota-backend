@@ -434,22 +434,27 @@ def test_a_fabricated_currency_mismatch_moves_no_variant_either() -> None:
     assert [v["price_amount"] for v in out["variants"]] == [28.2, 28.2]
 
 
-# --- Shopify Dawn-theme pages: Product.offers[], one Offer per variant --------
+# --- Pages this merge deliberately does NOT heal ------------------------------
 #
-# Re-review of #2193: the ProductGroup shape above was verified, but the more common
-# Dawn shape was inert. The extractor puts each Offer's `sku` INTO `variant_id`, and a
-# blank sku falls through to a positional `offer_N`. Both shapes run through the REAL
-# extractor here.
+# Two attempts to reach Shopify Dawn-theme pages (`Product.offers[]`, sku in
+# `variant_id`) were withdrawn after review: a sku alias and the Offer url's
+# `?variant=` each let a PRODUCT-level Offer price the one shade it named, and the
+# extractor dedupe that came with them collapsed genuinely distinct sizes on
+# non-Shopify stores. These tests pin that those shapes move NOTHING, through the
+# real extractor, so a future attempt has to prove itself against them.
 
 DAWN_URL = "https://shop.example.com/products/lip-gloss"
 
 
-def _dawn_crawl(offers) -> dict:
+def _page(*json_ld_blocks) -> str:
+    scripts = "".join(f'<script type="application/ld+json">{json.dumps(b)}</script>' for b in json_ld_blocks)
+    return f"<html><head>{scripts}</head></html>"
+
+
+def _extract(*blocks) -> dict:
     from services.external_offers_service import _extract_from_html
 
-    ld = {"@context": "http://schema.org/", "@type": "Product", "name": "Lip Gloss", "offers": offers}
-    html = f'<html><head><script type="application/ld+json">{json.dumps(ld)}</script></head></html>'
-    return _extract_from_html(DAWN_URL, html)
+    return _extract_from_html(DAWN_URL, _page(*blocks))
 
 
 def _dawn_offer(sku, vid, price) -> dict:
@@ -459,64 +464,50 @@ def _dawn_offer(sku, vid, price) -> dict:
     return offer
 
 
-def test_dawn_per_variant_sku_matches_the_stored_sku() -> None:
-    crawl = _dawn_crawl([_dawn_offer("JSM-LP-01", "111", "30.00"), _dawn_offer("JSM-LP-02", "222", "31.00")])
-    assert crawl["variants"][0]["variant_id"] == "JSM-LP-01", "premise: the sku lands in variant_id"
-    merged = _merge(
-        [_stored(28.0, vid="internal-a", sku="JSM-LP-01"), _stored(28.0, vid="internal-b", sku="JSM-LP-02")],
-        crawl["variants"],
-    )
-    assert merged is not None
-    assert [v["price_amount"] for v in merged] == [30.0, 31.0]
-
-
-def test_dawn_blank_sku_matches_by_the_offer_url_variant_id() -> None:
-    crawl = _dawn_crawl([_dawn_offer("", "111", "30.00"), _dawn_offer(None, "222", "31.00")])
-    assert crawl["variants"][0]["variant_id"] == "offer_1", "premise: positional without the url"
-    merged = _merge([_stored(28.0, vid="222", sku="S-2"), _stored(28.0, vid="111", sku="S-1")], crawl["variants"])
-    assert merged is not None
-    assert [v["price_amount"] for v in merged] == [31.0, 30.0], "matched by id, not by page order"
-
-
-def test_a_product_level_sku_on_every_shade_moves_nothing() -> None:
-    """Every Offer carries the PRODUCT sku. The extractor collapses them to one crawled
-    variant, which at the merge is indistinguishable from a page printing one product
-    price -- so nothing moves. Neither a fan-out onto every shade nor a guess at one."""
-    crawl = _dawn_crawl([_dawn_offer("32168999", "111", "30.00"), _dawn_offer("32168999", "222", "31.00")])
-    assert len(crawl["variants"]) == 1, "premise: the extractor collapses them"
-    assert _merge([_stored(28.0, vid="111"), _stored(29.0, vid="222")], crawl["variants"]) is None
-
-
-def test_one_product_level_offer_never_prices_the_shade_its_url_names() -> None:
-    """Re-review of #2193 v4: a single Offer with the PRODUCT price and a url carrying
-    `?variant=222` (a theme pairing product.price with a variant canonical url) wrote
-    20.00 onto shade 222, stored at 35.00."""
-    crawl = _dawn_crawl([_dawn_offer("SEL-SKU", "222", "20.00")])
+def test_a_product_level_offer_beside_a_review_widget_moves_no_shade() -> None:
+    """Re-review of v5: a theme's single product-level Offer (price 20.00, url naming
+    shade 222) plus a review app's AggregateOffer block wrote 20.00 onto shade 222,
+    stored at 35.00, end to end."""
+    theme = {"@context": "http://schema.org/", "@type": "Product", "name": "Lip Gloss",
+             "offers": _dawn_offer("SEL-SKU", "222", "20.00")}
+    reviews = {"@context": "http://schema.org/", "@type": "Product", "name": "Lip Gloss",
+               "offers": {"@type": "AggregateOffer", "lowPrice": "20.00", "priceCurrency": "SGD"}}
+    crawl = _extract(theme, reviews)
     stored = [_stored(20.0, vid="111", sku="S-1"), _stored(35.0, vid="222", sku="S-2")]
     assert _merge(stored, crawl["variants"]) is None
-    # The same page shape reaching a stored shade through its sku.
     stored_by_sku = [_stored(20.0, vid="111", sku="SEL-SKU"), _stored(35.0, vid="222", sku="S-2")]
     assert _merge(stored_by_sku, crawl["variants"]) is None
 
 
-def test_one_crawled_variant_with_a_shopify_id_still_moves() -> None:
-    """CONTROL for the guard above: a single crawled variant whose OWN id is a Shopify
-    variant id names its shade unambiguously."""
+def test_dawn_per_variant_offers_move_nothing() -> None:
+    crawl = _extract({"@context": "http://schema.org/", "@type": "Product", "name": "Lip Gloss",
+                      "offers": [_dawn_offer("JSM-LP-01", "111", "30.00"), _dawn_offer("", "222", "31.00")]})
+    stored = [_stored(28.0, vid="111", sku="JSM-LP-01"), _stored(28.0, vid="222", sku="JSM-LP-02")]
+    assert _merge(stored, crawl["variants"]) is None
+
+
+def test_the_extractor_keeps_two_same_priced_sizes_on_a_non_shopify_page() -> None:
+    """The withdrawn dedupe collapsed these to one: a WooCommerce/Magento permalink
+    carries no `?variant=`, so two blank-sku sizes at one price shared a url and price."""
+    url = "https://woo.example.com/product/lip-balm/"
+    crawl = _extract({"@context": "http://schema.org/", "@type": "Product", "name": "Lip Balm", "offers": [
+        {"@type": "Offer", "name": "Small", "price": "12.00", "priceCurrency": "SGD", "url": url},
+        {"@type": "Offer", "name": "Large", "price": "12.00", "priceCurrency": "SGD", "url": url},
+    ]})
+    titles = {v.get("title") for v in crawl["variants"]}
+    assert {"Small", "Large"} <= titles, crawl["variants"]
+
+
+def test_one_crawled_shopify_variant_id_moves_only_its_own_shade() -> None:
+    """The decision the v3 docstring states: a crawled id that IS a Shopify variant id is
+    that variant's identity, so a single such Offer may move its shade and no other.
+    The GID form too."""
     crawl = _real_crawl([(CORE_DROP, "Core Drop", "28.80")])
     merged = _merge([_stored(28.2, CORE_DROP), _stored(28.2, CHAI_TEA, shade="Chai Tea")], crawl["variants"])
-    assert merged is not None
-    assert [v["price_amount"] for v in merged] == [28.8, 28.2]
-
-
-def test_a_dawn_page_mixing_blank_and_filled_skus_heals_the_blank_shade() -> None:
-    """The node walk visits each Offer twice; a blank-sku Offer came back as `offer_2`
-    AND `offer_1` with one url, which made its shade ambiguous and inert."""
-    crawl = _dawn_crawl([_dawn_offer("A", "111", "30.00"), _dawn_offer("", "222", "31.00")])
-    assert [v["variant_id"] for v in crawl["variants"]].count("offer_1") + \
-        [v["variant_id"] for v in crawl["variants"]].count("offer_2") == 1, crawl["variants"]
-    merged = _merge([_stored(28.0, vid="111", sku="A"), _stored(28.0, vid="222", sku="B")], crawl["variants"])
-    assert merged is not None
-    assert [v["price_amount"] for v in merged] == [30.0, 31.0]
+    assert merged is not None and [v["price_amount"] for v in merged] == [28.8, 28.2]
+    gid = [{"variant_id": f"gid://shopify/ProductVariant/{CHAI_TEA}", "price_amount": 30.0, "price_currency": "SGD"}]
+    merged = _merge([_stored(28.2, CORE_DROP), _stored(28.2, CHAI_TEA, shade="Chai Tea")], gid)
+    assert merged is not None and [v["price_amount"] for v in merged] == [28.2, 30.0]
 
 
 def test_every_price_key_the_variant_carries_moves_together_and_none_is_added() -> None:
@@ -541,14 +532,16 @@ def test_a_structurally_better_crawl_replaces_the_variants_end_to_end() -> None:
 
 
 def test_a_key_two_stored_variants_hold_is_refused() -> None:
-    """TWO crawled variants, so the single-crawled-variant guard cannot be what refuses
-    this: only the stored-side ambiguity guard stops SHARED fanning out onto both."""
-    merged = _merge(
-        [_stored(28.2, vid="x1", sku="SHARED"), _stored(30.0, vid="x2", sku="SHARED")],
-        [{"variant_id": "SHARED", "price_amount": 28.8, "price_currency": "SGD"},
-         {"variant_id": "OTHER", "price_amount": 99.0, "price_currency": "SGD"}],
-    )
-    assert merged is None
+    """A product-level sku stored on every shade must not let one crawled price land on
+    all of them."""
+    crawl = [{"variant_id": "c1", "sku": "SHARED", "price_amount": 28.8, "price_currency": "SGD"},
+             {"variant_id": "c2", "sku": "OTHER", "price_amount": 99.0, "price_currency": "SGD"}]
+    assert _merge(
+        [_stored(28.2, vid="x1", sku="SHARED"), _stored(30.0, vid="x2", sku="SHARED")], crawl,
+    ) is None
+    # CONTROL: unshared, the same skus move each shade to its own crawled price.
+    merged = _merge([_stored(28.2, vid="x1", sku="SHARED"), _stored(30.0, vid="x2", sku="OTHER")], crawl)
+    assert merged is not None and [v["price_amount"] for v in merged] == [28.8, 99.0]
 
 
 def test_the_first_matching_key_wins() -> None:

@@ -853,16 +853,20 @@ def _variant_match_keys(variant: Dict[str, Any]) -> List[str]:
     `ProductGroup` whose per-variant `Offer` carries no `sku`, falls through to the
     offer's `@id` and emits `/products/<handle>?variant=50856826536257#offer`. Measured
     against the live jsmbeauty.sg page: 12 crawled variants, 0 raw-id matches, 0 prices
-    moved. So the numeric Shopify id is extracted from the query-string and GID forms,
-    and from the crawled Offer's `offer_url`.
+    moved. So the numeric Shopify id is extracted from the query-string and GID forms.
+    A `sku` field is a key too, but in practice only the STORED side carries one: the
+    extractor puts an Offer's sku into `variant_id`.
 
-    THE CRAWL HAS NO `sku` FIELD. The extractor puts an Offer's sku INTO `variant_id`
-    (Shopify's Dawn theme: per-variant `Product.offers[]`, each with its own `sku`), so
-    an id that is not Shopify-id-shaped is also offered as `sku:<text>` -- on both
-    sides, which is what lets a crawled `JSM-LP-01` meet a stored `sku: JSM-LP-01`.
-    That makes a PRODUCT-level sku, repeated on every stored shade, a key too; the
-    merge refuses any key more than one stored variant holds, so it never fans one
-    price out across shades.
+    DELIBERATELY NOT MATCHED: Shopify Dawn-theme pages (`Product.offers[]`, sku in
+    `variant_id`, blank skus falling to `offer_N`). Two attempts to reach them -- a sku
+    alias for non-Shopify-shaped ids, the Offer url's `?variant=` -- each let a
+    PRODUCT-level Offer (often next to a review app's AggregateOffer) price the one
+    shade its sku or url named. Those stores stay un-healed until the extractor can
+    tell a per-variant Offer from a product-level one structurally.
+
+    A crawled id that IS a Shopify variant id (`?variant=` / ProductVariant gid) is
+    trusted as that variant's identity: Shopify's Liquid emits that variant's own price
+    with it.
 
     Positional `offer_N` ids are NEVER a key: they encode the order offers appeared on
     the page, so a reordered page would write one shade's price onto another.
@@ -876,14 +880,9 @@ def _variant_match_keys(variant: Dict[str, Any]) -> List[str]:
         if not text or _POSITIONAL_OFFER_ID.match(text):
             continue
         match = _SHOPIFY_VARIANT_QUERY_ID.search(text) or _SHOPIFY_VARIANT_GID.search(text)
-        for key in (("id:" + match.group(1),) if match else ("id:" + text, "sku:" + text)):
-            if key not in keys:
-                keys.append(key)
-    raw_url = variant.get("offer_url")
-    if isinstance(raw_url, str):
-        match = _SHOPIFY_VARIANT_QUERY_ID.search(raw_url)
-        if match and ("id:" + match.group(1)) not in keys:
-            keys.append("id:" + match.group(1))
+        key = "id:" + (match.group(1) if match else text)
+        if key not in keys:
+            keys.append(key)
     for field in ("sku", "sku_id"):
         raw = variant.get(field)
         if raw is None or isinstance(raw, (dict, list, bool)):
@@ -924,7 +923,7 @@ def _merge_refreshed_variant_prices(
 
     A key that maps to more than one crawled variant, OR is held by more than one stored
     variant, is ambiguous and ignored on both sides: otherwise a product-level sku shared
-    by every shade would write one crawled price onto all of them.
+    by every stored shade would let one crawled price land on all of them.
     Variants the crawl does not mention are left exactly as they are.
     """
     if not existing or not incoming or not accepted_currency:
@@ -959,18 +958,6 @@ def _merge_refreshed_variant_prices(
             if text:
                 return text
         return None
-
-    # ONE crawled variant against SEVERAL stored shades is the shape a page emits when it
-    # prints a PRODUCT-level price once. Its sku or its url's `?variant=` may still name
-    # one shade (a theme pairing product.price with a variant canonical url), and nothing
-    # here can tell that from a genuine single-variant offer -- so it would write the
-    # product price onto that shade. Only a Shopify-shaped variant id in `variant_id`
-    # itself is trusted in that shape.
-    fresh_dicts = [fresh for fresh in incoming if isinstance(fresh, dict)]
-    if len(fresh_dicts) == 1 and sum(1 for v in existing if isinstance(v, dict)) > 1:
-        only_id = str(fresh_dicts[0].get("variant_id") or "").strip()
-        if not (_SHOPIFY_VARIANT_QUERY_ID.search(only_id) or _SHOPIFY_VARIANT_GID.search(only_id)):
-            return None
 
     by_key: Dict[str, Dict[str, Any]] = {}
     ambiguous: set = set()
