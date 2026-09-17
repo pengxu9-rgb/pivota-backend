@@ -44,6 +44,7 @@ import httpx
 
 from db.database import database
 from services import crawl_politeness
+from services.catalog_offer_suppression import cascade_offer_suppression
 from services.external_offer_dual_write import MIRROR_SOURCE_SYSTEM
 from services.outbound_warm_handoff import extract_product_handle
 
@@ -503,7 +504,12 @@ async def retire_seed_for_dead_destination(
         """,
         {"id": seed_id, "note": note},
     )
-    await database.execute(
+    # RETURNING product_key, not execute(): `databases` + asyncpg gives no
+    # rowcount, and the keys are needed anyway to cascade the suppression to the
+    # product's offers below. Reading them from a separate SELECT would race the
+    # UPDATE's own WHERE (`suppressed_at IS NULL`) and cascade offers belonging to
+    # a product this call did not actually gate.
+    suppressed = await database.fetch_all(
         """
         UPDATE catalog_products
         SET suppressed_at = :stamp,
@@ -512,6 +518,7 @@ async def retire_seed_for_dead_destination(
         WHERE source_ref = :id
           AND source_system = :source_system
           AND suppressed_at IS NULL
+        RETURNING product_key
         """,
         {
             "id": seed_id,
@@ -527,11 +534,30 @@ async def retire_seed_for_dead_destination(
             # incremental work off catalog_products.updated_at must be able to see a withdrawal.
         },
     )
+    # CASCADE TO THE OFFERS. `catalog_products.suppressed_at` gates the PRODUCT;
+    # every offer-grain read lane (priced_offer_sql, fetch_offers_for_keys, the
+    # recall candidate CTE) filters on `catalog_offers.suppressed_at` instead. So
+    # retiring a product whose destination is DEAD while leaving its offers live
+    # keeps quoting a price for a URL this very function just proved is gone.
+    # This lane is nightly and unattended, which is why it is a large share of
+    # the 2,171 suppressed-product-with-live-offer rows measured on prod
+    # 2026-09-08.
+    # `db=database` explicitly: the cascade must run through the SAME handle
+    # this function is already writing on, not through its own module-level
+    # import. In production they are one object; in a test they are not, and a
+    # helper that reached past the caller's handle would write to a different
+    # database than the statement above.
+    cascaded = await cascade_offer_suppression(
+        [str(row["product_key"]) for row in (suppressed or [])], db=database
+    )
     logger.info(
         "external seed retired for dead destination",
-        extra={"seed_id": seed_id, "verdict": observation.verdict},
+        extra={"seed_id": seed_id, "verdict": observation.verdict,
+               "products_suppressed": len(suppressed or []),
+               "offers_cascaded": len(cascaded)},
     )
-    return {"seed_id": seed_id, "retired": True, "verdict": observation.verdict}
+    return {"seed_id": seed_id, "retired": True, "verdict": observation.verdict,
+            "offers_suppressed": len(cascaded)}
 
 
 async def get_sweep_candidates(limit: int) -> List[Dict[str, Any]]:

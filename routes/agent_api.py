@@ -10338,6 +10338,10 @@ async def agent_cancel_order(
             raise HTTPException(status_code=500, detail="Failed to cancel order")
 
         try:
+            # Never imported: `log_order_event` lives in db/products.py:489. The enclosing
+            # try/except swallowed the NameError, so no order_cancelled event was ever logged.
+            from db.products import log_order_event
+
             await log_order_event(
                 event_type="order_cancelled",
                 order_id=order_id,

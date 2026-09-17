@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 # surfaces. Cached `report_projections` rows built at 1.0.0 still hold the
 # NO_FINDINGS all-clear and the bare headline_score, so they must be
 # re-rendered rather than served — the version is what lets a reader tell.
-_BUILDER_VERSION = "1.2.0"
+_BUILDER_VERSION = "1.4.0"
 
 
 # Audience constants (mirror db.audit_evidence values; kept as
@@ -614,7 +614,7 @@ def build_revenue_recovery_projection(
     with the reason, because a false all-clear is worse than an honest gap.
     """
     row = audit_run_row or {}
-    from services.selection_measurement import selection_measurement
+    from services.selection_measurement import selection_measurement, upgrade_retained_measurement
     measurement = {}
     for finding in findings:
         if finding.get("finding_type") == "recovery_measurement":
@@ -701,7 +701,7 @@ def build_revenue_recovery_projection(
         # done asks this surface for a split "with `n` beside it", so a
         # distribution carrying its own counts is what belongs here.
         "headline": headline,
-        "selection": measurement.get("selection") or selection_measurement([]),
+        "selection": upgrade_retained_measurement(measurement.get("selection")),
         "selection_gap": measurement.get("selection_gap"),
         "catalog_available": measurement.get("catalog_available"),
         "stages": [stages[name] for name in _STAGES],

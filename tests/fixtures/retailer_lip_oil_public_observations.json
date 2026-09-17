@@ -1,0 +1,41 @@
+{
+  "provenance": "Read-only public Shopify product JSON canary, 2026-09-11 America/Los_Angeles",
+  "shared_gtin": "8809530070499",
+  "observations": [
+    {
+      "url": "https://asianbeautyessentials.com/products/honey-milk-lip-oil-5g-apieu.js",
+      "status": 200,
+      "title": "Moisturizing Honey & Milk Lip Oil for Soft, Luscious Lips",
+      "product_type": "Lip Care",
+      "vendor": "A'PIEU",
+      "variants": [
+        {
+          "id": 43603819692287,
+          "barcode": "8809530070499",
+          "sku": "APECM09-LipO",
+          "title": "Default Title",
+          "raw_minor_price": 1000
+        }
+      ],
+      "currency": "USD"
+    },
+    {
+      "url": "https://eyurs.com/products/apieu-honey-milk-lip-oil.js",
+      "status": 200,
+      "title": "A'PIEU Honey & Milk Lip Oil (5g)",
+      "product_type": "Lip Treatments",
+      "vendor": "A'PIEU",
+      "variants": [
+        {
+          "id": 41807436316855,
+          "barcode": "8809530070499",
+          "sku": "APU-HON-OIL",
+          "title": "Default Title",
+          "raw_minor_price": 500
+        }
+      ],
+      "currency": "USD"
+    }
+  ],
+  "price_provenance": "Follow-up read-only same-PDP .js observations: minor USD units; USD proved by same-storefront locale canary. These are captured observations, not current stock claims."
+}

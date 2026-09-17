@@ -54,8 +54,8 @@ class InsufficientCreditsError(Exception):
         self.merchant_id = merchant_id
         self.kind = category
         self.category = category
-        self.required = int(required)
-        self.available = int(available)
+        self.required = _decimal(required)
+        self.available = _decimal(available)
         super().__init__(
             f"insufficient credits for merchant {merchant_id}: "
             f"category={category} required={required} available={available}"
@@ -154,7 +154,7 @@ def _balance_from_row(row: Any) -> Dict[str, Any]:
         "overage_charged_credits",
         "version",
     ):
-        out[key] = int(data.get(key) or 0)
+        out[key] = int(data.get(key) or 0) if key == "version" else _decimal(data.get(key))
     out["overage_blocked_until_payment"] = bool(
         data.get("overage_blocked_until_payment") or False
     )
@@ -232,8 +232,8 @@ def _overage_increment_id(
 def _validate_category_amount(category: str, amount: int) -> CreditCategory:
     if category not in _VALID_CATEGORIES:
         raise ValueError(f"unsupported credit category: {category}")
-    if int(amount) < 0:
-        raise ValueError("credit amount must be >= 0")
+    if not _decimal(amount).is_finite() or _decimal(amount) < 0 or _decimal(amount).as_tuple().exponent < -8:
+        raise ValueError("credit amount must be finite, >= 0, and have at most 8 decimal places")
     return category  # type: ignore[return-value]
 
 
@@ -241,10 +241,10 @@ def _normalize_purchased_credit_amount(
     amount: int,
     purchased_credits: Optional[int],
 ) -> int:
-    purchased = int(amount) if purchased_credits is None else int(purchased_credits)
-    if purchased < 0:
+    purchased = _decimal(amount) if purchased_credits is None else _decimal(purchased_credits)
+    if not purchased.is_finite() or purchased < 0 or purchased.as_tuple().exponent < -8:
         raise ValueError("purchased_credits must be >= 0")
-    if purchased > int(amount):
+    if purchased > _decimal(amount):
         raise ValueError("purchased_credits cannot exceed credited amount")
     return purchased
 
@@ -326,6 +326,8 @@ async def _active_subscription_allowance(
          WHERE us.merchant_id = :merchant_id
            AND us.status IN ('active', 'trialing')
            AND sp.status = 'active'
+           AND (us.current_period_start IS NULL OR us.current_period_start <= NOW())
+           AND (us.current_period_end IS NULL OR us.current_period_end > NOW())
          -- A merchant can hold more than one active subscription row (e.g. an
          -- upgrade where the prior plan was never cancelled, or a coupon'd
          -- secondary plan). Prefer the richest plan so a leftover lower tier
@@ -369,6 +371,51 @@ async def apply_subscription_allowance(
     async with _transaction(conn) as tx:
         subscription = await _active_subscription_allowance(merchant_id, tx)
         if not subscription:
+            # A missed lifecycle webhook must not keep renewing an expired
+            # allowance. Only retire a wallet backed by an explicitly ended
+            # period; manual wallets without subscription history are retained.
+            await tx.execute(
+                """
+                -- merchant_credit_balance/expire_stale_subscription_allowance
+                WITH expired AS (
+                    SELECT b.* FROM merchant_credit_balance b
+                 WHERE b.merchant_id = :merchant_id
+                   AND (b.allowance_credits > 0 OR b.plan_tier <> 'free')
+                   AND EXISTS (
+                       SELECT 1 FROM user_subscriptions old
+                        WHERE old.merchant_id = b.merchant_id
+                          AND old.current_period_end <= NOW()
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM user_subscriptions live
+                       JOIN subscription_plans plan ON plan.id = live.plan_id
+                        WHERE live.merchant_id = b.merchant_id
+                          AND live.status IN ('active', 'trialing')
+                          AND plan.status = 'active'
+                          AND (live.current_period_start IS NULL OR live.current_period_start <= NOW())
+                          AND (live.current_period_end IS NULL OR live.current_period_end > NOW())
+                   )
+                    FOR UPDATE OF b
+                ), changed AS (
+                    UPDATE merchant_credit_balance b
+                       SET credits = b.purchased_credits, allowance_credits = 0,
+                           allowance_period_start = NULL, plan_tier = 'free',
+                           updated_at = NOW(), version = b.version + 1
+                      FROM expired e WHERE b.merchant_id = e.merchant_id
+                    RETURNING b.merchant_id, e.version AS previous_version,
+                              e.credits AS credits_before, b.credits AS credits_after,
+                              e.plan_tier AS previous_plan_tier,
+                              e.allowance_period_start AS previous_allowance_period
+                )
+                INSERT INTO merchant_credit_adjustments
+                    (merchant_id, previous_version, reason, credits_before,
+                     credits_after, previous_plan_tier, previous_allowance_period)
+                SELECT merchant_id, previous_version, 'subscription_period_expired',
+                       credits_before, credits_after, previous_plan_tier,
+                       previous_allowance_period FROM changed
+                """,
+                {"merchant_id": merchant_id},
+            )
             return await _get_balance_with_conn(merchant_id, tx)
 
         allowance = int(subscription.get("monthly_credit_allowance") or 0)
@@ -569,8 +616,8 @@ async def _claim_operation(
     payload = {
         "operation": operation,
         "category": category,
-        "amount_credits": int(amount),
-        "purchased_credits": int(purchased_credits),
+        "amount_credits": _decimal(amount),
+        "purchased_credits": _decimal(purchased_credits),
         "usd_cogs_internal": str(usd_cogs),
         "source_idempotency_key": source_key,
         "claimed_at": datetime.now(timezone.utc).isoformat(),
@@ -603,7 +650,7 @@ async def _claim_operation(
             "provider": "pivota",
             "billing_mode": operation,
             "billing_status": "applied",
-            "quantity": int(amount),
+            "quantity": _decimal(amount),
             "payload": _json_payload(payload),
         },
     )
@@ -775,11 +822,11 @@ async def _apply_delta(
     conn: Any = None,
 ) -> Dict[str, Any]:
     category = _validate_category_amount(category, amount)
-    if usd_cogs < 0:
+    if not usd_cogs.is_finite() or usd_cogs < 0:
         raise ValueError("usd_cogs must be >= 0")
     purchased_credit_amount = (
         0 if operation == "debit"
-        else _normalize_purchased_credit_amount(int(amount), purchased_credits)
+        else _normalize_purchased_credit_amount(_decimal(amount), purchased_credits)
     )
     async with _transaction(conn) as tx:
         replay = await _fetch_replay(conn=tx, operation_key=operation_key)
@@ -810,26 +857,26 @@ async def _apply_delta(
 
         for _attempt in range(_MAX_OPTIMISTIC_RETRIES):
             balance = await _get_balance_with_conn(merchant_id, tx)
-            available = int(balance["credits"])
+            available = _decimal(balance["credits"])
             paid_tier = _is_paid_tier(balance.get("plan_tier"))
             if operation == "debit":
                 if balance.get("overage_blocked_until_payment"):
                     raise OveragePaymentBlockedError(merchant_id)
-                if available < int(amount) and not paid_tier:
+                if available < _decimal(amount) and not paid_tier:
                     raise InsufficientCreditsError(
-                        merchant_id, category, int(amount), available,
+                        merchant_id, category, _decimal(amount), available,
                     )
-            purchased_available = int(balance.get("purchased_credits") or 0)
+            purchased_available = _decimal(balance.get("purchased_credits"))
             allowance_available = max(0, available - purchased_available)
             purchased_debit = min(
                 purchased_available,
-                max(0, int(amount) - allowance_available),
+                max(0, _decimal(amount) - allowance_available),
             )
 
             if operation == "debit":
-                balance_debit = min(available, int(amount))
-                overage_shortfall = max(0, int(amount) - available)
-                pending_before = int(balance.get("overage_pending_credits") or 0)
+                balance_debit = min(available, _decimal(amount))
+                overage_shortfall = max(0, _decimal(amount) - available)
+                pending_before = _decimal(balance.get("overage_pending_credits"))
                 pending_after = pending_before + overage_shortfall
                 overage_charge_credits = (
                     (pending_after // DEFAULT_OVERAGE_CHARGE_CREDITS)
@@ -946,7 +993,7 @@ async def _apply_delta(
                     }
                 )
             else:
-                params["amount"] = int(amount)
+                params["amount"] = _decimal(amount)
             row = await tx.fetch_one(
                 sql,
                 params,
@@ -976,7 +1023,7 @@ async def _apply_delta(
         latest = await _get_balance_with_conn(merchant_id, tx)
         if operation == "debit":
             raise InsufficientCreditsError(
-                merchant_id, category, int(amount), int(latest["credits"]),
+                merchant_id, category, _decimal(amount), _decimal(latest["credits"]),
             )
         raise RuntimeError("credit balance optimistic update did not converge")
 
@@ -1001,7 +1048,7 @@ async def debit(
         return await _apply_delta(
             merchant_id=merchant_id,
             category=category,
-            amount=int(amount_credits),
+            amount=_decimal(amount_credits),
             usd_cogs=_decimal(usd_cogs),
             operation_key=operation_key,
             operation="debit",
@@ -1043,7 +1090,7 @@ async def credit(
     return await _apply_delta(
         merchant_id=merchant_id,
         category=category,
-        amount=int(amount_credits),
+        amount=_decimal(amount_credits),
         usd_cogs=_decimal(usd_cogs),
         operation_key=operation_key,
         operation="credit",

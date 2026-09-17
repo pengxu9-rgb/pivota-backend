@@ -90,7 +90,8 @@ def wired(monkeypatch):
         return {"plan_tier": state["tier"]}
 
     async def fake_projection(*, audit_run_id, audience):
-        return {"payload_jsonb": state["projection"], "builder_version": "1.2.0"} if state["projection"] else None
+        from services.audit_projection_builder import _BUILDER_VERSION
+        return {"payload_jsonb": state["projection"], "builder_version": state.get("projection_version", _BUILDER_VERSION)} if state["projection"] else None
 
     # Patched at the SOURCE modules: audit_runs_routes imports both names
     # locally inside the handler, so they are not attributes of `arr` and a
@@ -285,3 +286,13 @@ def test_a_completed_run_still_serves_its_projection(wired):
     res = _client().get("/api/audits/r-1?audience=revenue_recovery")
     assert res.status_code == 200
     assert "FREE-FINDING" in _body(res)
+
+
+def test_stale_recovery_without_report_does_not_serve_old_measurements(wired):
+    wired["tier"] = "pro"
+    wired["row"]["report_jsonb"] = None
+    wired["projection"] = _recovery_projection()
+    wired["projection_version"] = "1.2.0"
+    response = _client().get("/api/audits/r-1?audience=revenue_recovery")
+    assert response.status_code == 409
+    assert "FREE-FINDING" not in _body(response)

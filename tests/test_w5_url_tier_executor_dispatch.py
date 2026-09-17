@@ -47,8 +47,8 @@ async def test_dispatch_only_skips_task_materialization_and_forwards_allowlist(m
         dispatch_only=True,
     )
 
-    # dispatch_only: NO task-queue materialization, NO outreach reverify
-    assert tasks_called == []
+    # URL audits skip new store tasks but still recheck existing outreach.
+    assert tasks_called == ["reverified"]
     assert summary["tasks_materialized"] == 0
     # executors DID dispatch, restricted to the URL-tier allowlist (the fake
     # dispatch returns a fixed count; the point here is the allowlist forwarding)

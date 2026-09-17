@@ -17,6 +17,22 @@ from typing import Any, Dict, List
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _this_file_is_about_the_crawl_itself(monkeypatch):
+    """Open the request-path egress fence for this whole file.
+
+    `verify_offers` is fenced CLOSED by default, because its only request-path caller runs in
+    `web`, which egresses by 8.231.167.230 — the address payment partners allowlist. Almost every
+    test here exists to exercise what happens when we DO fetch: pacing, robots, redirects,
+    timeouts, currency. Fencing them would not make them safer, it would make them vacuous.
+
+    So the fence is opened here explicitly, and `test_the_request_path_is_fenced_by_default` below
+    is the one test that asserts the default with the fixture undone.
+    """
+    monkeypatch.setenv("LIVE_OFFER_VERIFICATION_ALLOW_REQUEST_PATH_EGRESS", "true")
+
+
 from services import crawl_politeness as _cp_module
 from services import live_offer_verification as lov
 
@@ -1233,3 +1249,125 @@ def test_a_variant_with_no_price_is_never_price_verified(monkeypatch: pytest.Mon
     assert out[0].status == lov.VERIFIED, "stock is still established"
     assert out[0].live_price is None
     assert out[0].price_verified is False, "a missing amount cannot be a verified price"
+
+
+@pytest.mark.asyncio
+async def test_the_request_path_is_fenced_by_default(monkeypatch):
+    """MUTANT: default `verify_offers` to egress-allowed.
+
+    The search lane's only request-path caller is `_handle_offers_resolve`, inside `web`, on the
+    `default` subnet whose NAT is the payment address. `_host_diverse_head` guarantees the offers
+    sit on DISTINCT hosts and each costs a robots.txt plus a /meta.json, so arming the lane alone
+    put the exact traffic shape that trips a 15-minute cross-domain block onto the payment IP.
+
+    Two flags now, deliberately: one turns the lane on, one lets it leave the process.
+    """
+    import httpx
+
+    monkeypatch.delenv("LIVE_OFFER_VERIFICATION_ALLOW_REQUEST_PATH_EGRESS", raising=False)
+    lov.reset_for_tests()
+    assert lov.request_path_egress_allowed() is False
+
+    def explode(*a, **k):
+        raise AssertionError("the search lane opened an HTTP client from the money path")
+
+    monkeypatch.setattr(httpx, "AsyncClient", explode)
+
+    async def explode_async(*a, **k):
+        raise AssertionError("the search lane contacted a merchant host")
+
+    monkeypatch.setattr(lov.crawl_politeness, "before_request", explode_async)
+
+    verdicts = await lov.verify_offers([{
+        "offer_id": "o1",
+        "execution_spec": {"pdp_url": "https://brand.example/products/thing",
+                           "variant_id": "41234567890123"},
+    }])
+    assert verdicts, "the lane must still answer, not vanish"
+    assert all(v.reason == lov.NO_CACHED_EVIDENCE for v in verdicts.values())
+
+
+@pytest.mark.asyncio
+async def test_a_lane_that_may_crawl_still_crawls(monkeypatch):
+    """The fence must not make the search lane unusable from a process that SHOULD egress."""
+    monkeypatch.setenv("LIVE_OFFER_VERIFICATION_ALLOW_REQUEST_PATH_EGRESS", "true")
+    lov.reset_for_tests()
+    assert lov.request_path_egress_allowed() is True
+
+    reached = []
+
+    async def record(url, **k):
+        reached.append(url)
+        raise lov.crawl_politeness.CrawlPaced("stop here; contact is what we are asserting")
+
+    monkeypatch.setattr(lov.crawl_politeness, "before_request", record)
+    await lov.verify_offers([{
+        "offer_id": "o1",
+        "execution_spec": {"pdp_url": "https://brand.example/products/thing",
+                           "variant_id": "41234567890123"},
+    }])
+    assert reached, "an opted-in lane must be allowed to ask"
+
+
+@pytest.mark.parametrize("raw,allowed", [
+    ("true", True), ("1", True), ("yes", True), ("on", True), ("TRUE", True),
+    ("false", False), ("0", False), ("", False), ("maybe", False), ("  ", False),
+])
+def test_the_request_path_fence_opens_only_on_an_affirmative_value(monkeypatch, raw, allowed):
+    """MUTANT: `bool(os.getenv(...))`, which opens the fence on the string "false".
+
+    The preflight's twin of this predicate is pinned; this one was not, so a typo could have put
+    the search lane back on the payment address silently.
+    """
+    monkeypatch.setenv("LIVE_OFFER_VERIFICATION_ALLOW_REQUEST_PATH_EGRESS", raw)
+    assert lov.request_path_egress_allowed() is allowed
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_cache_only_beats_the_flag_in_both_directions(monkeypatch):
+    """MUTANT: collapse the three-state `Optional[bool]` either way.
+
+    `None` means "ask the flag"; an explicit value means the caller knows better — which is how a
+    batch lane on `pivota-crawl` crawls while the request-path default stays closed, and how a
+    request-path caller can fence itself even where the flag is open.
+    """
+    seen = []
+
+    async def spy(offer, **kw):
+        seen.append(kw.get("cache_only"))
+        return lov.Verdict(lov.UNVERIFIED, lov.NO_CACHED_EVIDENCE)
+
+    monkeypatch.setattr(lov, "_check_one", spy)
+    offers = [{"offer_id": "o", "execution_spec": {
+        "pdp_url": "https://brand.example/products/thing", "variant_id": "41234567890123"}}]
+
+    monkeypatch.setenv("LIVE_OFFER_VERIFICATION_ALLOW_REQUEST_PATH_EGRESS", "true")
+    await lov.verify_offers(offers)
+    await lov.verify_offers(offers, cache_only=True)
+    monkeypatch.delenv("LIVE_OFFER_VERIFICATION_ALLOW_REQUEST_PATH_EGRESS", raising=False)
+    await lov.verify_offers(offers)
+    await lov.verify_offers(offers, cache_only=False)
+    assert seen == [False, True, True, False], (
+        "None follows the flag; an explicit value overrides it, both ways")
+
+
+def test_an_unasked_offer_is_not_stamped_as_unverified(monkeypatch):
+    """MUTANT: let `no_cached_evidence` take the `unverified` path in `apply_verdicts`.
+
+    That path stamps `stock_verified: false`, `verification_confidence: "unverified"` and
+    `rank_one_unverified: true`, and nulls `expected_item_total` — an agent-visible downgrade of
+    every offer, caused by OUR cold cache, on a flag whose name says "enabled". "Nobody asked" is
+    not "we asked and got nothing"; an unasked offer must look exactly like one outside top-K.
+    """
+    offers = [{"offer_id": "o0"}, {"offer_id": "o1"}]
+    cold = lov.apply_verdicts(
+        offers, {0: lov.Verdict(lov.UNVERIFIED, lov.NO_CACHED_EVIDENCE)})
+    assert len(cold) == 2
+    by_id = {o["offer_id"]: o for o in cold}
+    assert "verification" not in by_id["o0"], "an unasked offer carries no verification claim"
+    assert by_id["o0"].get("rank_one_unverified") is not True
+    assert by_id["o0"].get("stock_verified") is not False
+
+    # ...while a real unverified answer IS still stamped, or the demotion would be lost.
+    asked = lov.apply_verdicts(offers, {0: lov.Verdict(lov.UNVERIFIED, "http_503")})
+    assert asked[0].get("rank_one_unverified") is True or "verification" in asked[0]

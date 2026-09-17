@@ -89,6 +89,98 @@ CREATE TABLE merchant_audit_runs (
 """
 
 
+# ---------------------------------------------------------------------------
+# Row-scoped teardown (#2142's contract: delete what this module writes).
+#
+# Every test here resets its tables at SETUP — `_db` recreates
+# merchant_audit_runs, `_reset_routes` recreates the three audit-evidence
+# tables — so this module never saw its own leftovers. Its NEIGHBOURS did: the
+# last intake test leaves the `ucp_probe` verification_runs row the handler
+# enqueued, status 'pending', merchant_id NULL. The gate files share one
+# database, and tests/test_bind_parameter_types_postgres.py's default claim is
+# "the OLDEST pending row in the table" — so a SECOND `pytest tests/test_*_postgres.py`
+# against the same database locked THIS module's stale row instead of the one
+# that test had just inserted. CI never sees that (a fresh database per job);
+# it bit only local runs.
+#
+# Never DROP at teardown, and never the whole table: the next module in the
+# same run expects these tables to exist, and rows in them that are not ours
+# are not ours to delete. Each DELETE is keyed by the value this module bound
+# into the write it undoes.
+# ---------------------------------------------------------------------------
+
+# The intake tests all default to this domain; the handler keys its enqueue
+# `public_intake:<domain>:<date>` and its route by the domain.
+_INTAKE_DOMAIN = "coldbrand.com"
+_INTAKE_IDEMPOTENCY_KEYS = f"public_intake:{_INTAKE_DOMAIN}:%"
+# The two tests that seed a merchant-owned run write these merchant ids.
+_MERCHANTS_WRITTEN = ("merch-real", "m-1")
+
+# (table, predicate) — the predicate names only columns present in EVERY shape
+# this module gives the table, including the slim merchant_audit_runs that
+# test_classify_survives_a_table_missing_a_modeled_column creates.
+_WRITES = (
+    ("verification_runs", f"idempotency_key LIKE '{_INTAKE_IDEMPOTENCY_KEYS}'"),
+    ("execution_routes", f"normalized_domain = '{_INTAKE_DOMAIN}'"),
+    (
+        "merchant_audit_runs",
+        "subject_type = 'public_funnel' OR merchant_id IN ("
+        + ", ".join(f"'{m}'" for m in _MERCHANTS_WRITTEN) + ")",
+    ),
+)
+
+
+async def _delete_what_this_module_wrote():
+    from db.database import database
+
+    for table, predicate in _WRITES:
+        # The producer tests run before anything creates the audit-evidence
+        # tables, and a fresh database has none of them yet.
+        exists = await database.fetch_val(
+            "SELECT to_regclass(:t) IS NOT NULL", {"t": table}
+        )
+        if exists:
+            await database.execute(f"DELETE FROM {table} WHERE {predicate}")
+
+
+# Tables this module DROPPED and recreated during this run. Once dropped, every
+# row in the table is this module's own, so the module-end check below can
+# count the WHOLE table — which is what catches a write that `_WRITES` does
+# not key, where a check phrased in `_WRITES`' own terms could not.
+_DROPPED: set[str] = set()
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _nothing_outlives_this_module():
+    """Nothing this module wrote may outlive it — see the row-scoped teardown.
+
+    Runs after the last test's `_db` teardown. Any row still in a table this
+    module recreated was written here and missed by `_WRITES`; it turns THIS
+    module red instead of poisoning a neighbour on the next gate run. Removing
+    the verification_runs entry from `_WRITES` produces exactly that error.
+    """
+    yield
+    if not _IS_PG or not _DROPPED:
+        return
+    from sqlalchemy import create_engine, text
+
+    engine = create_engine(DATABASE_URL)
+    try:
+        with engine.begin() as conn:
+            residue = {
+                t: conn.execute(text(f"SELECT count(*) FROM {t}")).scalar()
+                for t in sorted(_DROPPED)
+                if conn.execute(
+                    text("SELECT to_regclass(:t) IS NOT NULL"), {"t": t}
+                ).scalar()
+            }
+    finally:
+        engine.dispose()
+    assert not any(residue.values()), (
+        f"this module left rows behind for the next gate run: {residue}"
+    )
+
+
 @pytest.fixture(autouse=True)
 async def _db():
     from db.database import database
@@ -99,15 +191,21 @@ async def _db():
     if not was_connected:
         await database.connect()
     await database.execute("DROP TABLE IF EXISTS merchant_audit_runs")
+    _DROPPED.add("merchant_audit_runs")
     await database.execute(_PROD_SHAPE)
     for statement in split_statements(_MIGRATION.read_text()):
         await database.execute(statement)
     import db.merchant_audit_runs as mar
     mar._DDL_READY = True
-    yield
-    mar._DDL_READY = False
-    if not was_connected and database.is_connected:
-        await database.disconnect()
+    try:
+        yield
+    finally:
+        mar._DDL_READY = False
+        try:
+            await _delete_what_this_module_wrote()
+        finally:
+            if not was_connected and database.is_connected:
+                await database.disconnect()
 
 
 def _now():
@@ -203,9 +301,9 @@ async def _reset_routes():
     from db.audit_evidence import ensure_audit_evidence_tables
     import db.audit_evidence as ae
     ae._DDL_READY = False
-    await database.execute("DROP TABLE IF EXISTS verification_runs")
-    await database.execute("DROP TABLE IF EXISTS evidence_items")
-    await database.execute("DROP TABLE IF EXISTS execution_routes")
+    for table in ("verification_runs", "evidence_items", "execution_routes"):
+        await database.execute(f"DROP TABLE IF EXISTS {table}")
+        _DROPPED.add(table)
     await ensure_audit_evidence_tables()
 
 

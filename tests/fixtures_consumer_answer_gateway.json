@@ -1,0 +1,31 @@
+{
+  "query": "best serum",
+  "raw": "Consider Anua. <script>not executable</script>",
+  "parsed": null,
+  "evidence_kind": "consumer_answer",
+  "prompt_contract": "consumer_query_v1",
+  "answer": {
+    "text": "Consider Anua. <script>not executable</script>",
+    "sha256": "5e68cb10a707e313b8fe6ef48a541188d547be195ba16f4a9a2da7dccc3d4116",
+    "complete": true,
+    "finish_reason": "completed",
+    "status": "complete",
+    "provider": "chatgpt",
+    "model": "fixture-model",
+    "captured_at": "2026-09-09T02:31:04.432Z",
+    "prompt_sha256": "1c3e03f90e15fdde87df8a74bdbd4798028b00e0f6a3e5969d94c8ecba659545"
+  },
+  "grounding_chunks": [
+    "https://anua.com"
+  ],
+  "grounding_sources": [
+    {
+      "uri": "https://anua.com",
+      "title": "Anua"
+    }
+  ],
+  "retrieved_sources": [],
+  "axis_metadata": {
+    "axis": "category"
+  }
+}

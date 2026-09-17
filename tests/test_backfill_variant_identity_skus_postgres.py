@@ -33,6 +33,24 @@ PK = "ext:pgtest-lipstick::deadbeef"
 SPID = "pgtest-lipstick"
 DEST = "https://brand.example/products/pgtest-lipstick"
 VID = "43062643884185"
+#: The widest key `ingestion.derive_product_key` can mint (214 chars). At this width
+#: `derive_variant_sku_key` falls back to a sha1 of the variant id, which is where a key
+#: derived from the FULL id and one derived from the STORED id stop agreeing.
+LONG_PK = "ext:" + ("pgtest-long-" + "z" * 200)[:200] + "::deadbeef"
+#: Two merchant ids that differ only past the 128th character: numeric (so
+#: MERCHANT_ISSUED), and one `catalog_skus` identity between them.
+VID_LONG_A = "8" * 128 + "1"
+VID_LONG_B = "8" * 128 + "2"
+#: writer_audit_log is shared by every module in the gate run, and rows under OTHER writer
+#: names can be present when this module runs (measured: two `reconcile_catalog_offers` rows,
+#: stamped by the reconciler while test_catalog_offer_writer_sku_precondition_postgres.py drove
+#: it — that module's residue, not the reconcile module's) — so every read is scoped to this writer.
+#: A literal rather than an import of `scripts.backfill_variant_identity_skus.WRITER_NAME`:
+#: that module mutates sys.path and imports db/ and services/ at load, and every other
+#: reference to it in this file is deferred into a function so the skipif above can keep it
+#: out of a non-Postgres run. `_run()` asserts this literal still equals the script's constant,
+#: so a rename there fails loudly instead of scoping every read to a name nobody writes.
+WRITER_NAME = "backfill_variant_identity_skus"
 #: asyncpg binds timestamptz from a datetime, never a string.
 _SUPPRESSED = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
 
@@ -98,31 +116,45 @@ async def _ddl(database):
 
 async def _clear(database):
     """Remove this fixture's ROWS. Never its tables — see _ddl."""
-    await database.execute(
-        "DELETE FROM catalog_offers WHERE product_key = :pk OR source_system = :ss",
-        {"pk": PK, "ss": "variant_identity_backfill_v1"},
-    )
-    await database.execute("DELETE FROM catalog_skus WHERE product_key = :pk", {"pk": PK})
-    await database.execute("DELETE FROM catalog_products WHERE product_key = :pk", {"pk": PK})
+    for pk in (PK, LONG_PK):
+        await database.execute(
+            "DELETE FROM catalog_offers WHERE product_key = :pk OR source_system = :ss",
+            {"pk": pk, "ss": "variant_identity_backfill_v1"},
+        )
+        await database.execute("DELETE FROM catalog_skus WHERE product_key = :pk", {"pk": pk})
+        await database.execute(
+            "DELETE FROM catalog_products WHERE product_key = :pk", {"pk": pk})
     await database.execute(
         "DELETE FROM external_product_seeds WHERE external_product_id = :e", {"e": SPID}
     )
     await database.execute("DELETE FROM writer_audit_log WHERE writer_name = :w",
-                           {"w": "backfill_variant_identity_skus"})
+                           {"w": WRITER_NAME})
 
 
-async def _seed(database, *, variants, offers, suppressed=None):
+async def _audit_row(database):
+    """This module's latest writer_audit_log row (never another module's leftover)."""
+    row = await database.fetch_one(
+        "SELECT * FROM writer_audit_log WHERE writer_name = :w ORDER BY id DESC LIMIT 1",
+        {"w": WRITER_NAME},
+    )
+    # Without this, a WRITER_NAME that matches nothing surfaces as `TypeError: 'NoneType'
+    # object is not iterable` from dict() — which names neither the table nor the writer.
+    assert row is not None, f"no writer_audit_log row for {WRITER_NAME}"
+    return dict(row)
+
+
+async def _seed(database, *, variants, offers, suppressed=None, pk=PK):
     await database.execute(
         """INSERT INTO catalog_products (product_key, merchant_id, platform,
              source_product_id, source_domain, title, suppressed_at)
            VALUES (:pk,:m,:p,:spid,'brand.example','PGTest Lipstick',:sup)""",
-        {"pk": PK, "m": MERCHANT, "p": PLATFORM, "spid": SPID, "sup": suppressed},
+        {"pk": pk, "m": MERCHANT, "p": PLATFORM, "spid": SPID, "sup": suppressed},
     )
     await database.execute(
         """INSERT INTO external_product_seeds
              (external_product_id, attached_product_key, status, seed_data)
            VALUES (:spid,:pk,'active',CAST(:sd AS jsonb))""",
-        {"spid": SPID, "pk": PK, "sd": json.dumps({"snapshot": {"variants": variants}})},
+        {"spid": SPID, "pk": pk, "sd": json.dumps({"snapshot": {"variants": variants}})},
     )
     for i, o in enumerate(offers):
         await database.execute(
@@ -135,7 +167,7 @@ async def _seed(database, *, variants, offers, suppressed=None):
                  'external_referral','default','in_stock',:cur,10.0,'seed',:mkt,
                  :ot,:ifp,:wbd,
                  CAST(:pl AS jsonb),:sup,NOW(),NOW())""",
-            {"oid": f"offer:pg:{i}", "sk": PK + "::canonical", "pk": PK,
+            {"oid": f"offer:pg:{i}", "sk": pk + "::canonical", "pk": pk,
              "m": o.get("merchant_id", "m_seller"), "cur": o.get("currency", "USD"),
              "mkt": o.get("market", "US"), "ot": o.get("offer_type"),
              "ifp": o.get("is_first_party", False), "wbd": o.get("why_buy_direct"),
@@ -178,6 +210,9 @@ async def test_the_identity_index_the_conflict_target_needs_actually_exists(db):
 
 async def _run(**kw):
     import scripts.backfill_variant_identity_skus as backfill
+    # Pins the module constant above to the name the script actually writes: a rename there
+    # would otherwise scope every read here to a writer nobody records.
+    assert backfill.WRITER_NAME == WRITER_NAME
     return await backfill.run(**{"apply": True, "limit": 0, "after": "", "page": 100,
                                  "adopt_existing_offers": False, **kw})
 
@@ -199,6 +234,54 @@ async def test_it_writes_the_pair_and_the_offer_carries_the_variants_own_price(d
     assert float(offer["list_price"]) == 24.0          # the VARIANT's price, not the product's 10.0
     assert offer["availability"] == "in_stock"
     assert json.loads(offer["offer_payload"])["destination_url"] == DEST   # M4
+
+
+async def test_two_variant_ids_that_bind_to_one_identity_are_one_pair_and_counted_once(db):
+    """EXECUTED. The seed offers two shades whose merchant ids differ only past the 128th
+    character. `catalog_skus.source_variant_id` is varchar(128), so they are ONE row
+    whatever this script does — the identity index says so. Before the fix the writer
+    bound `vid[:128]` while deriving `sku_key` from the FULL id (at this product_key width
+    that is the sha1 fallback, so the two keys differed); the second INSERT resolved through
+    `ON CONFLICT (merchant_id, platform, product_key, source_variant_id)` as a DO UPDATE of
+    the first, `RETURNING` the first's key, and the offer derived from that key was then
+    DO UPDATEd with the SECOND shade's price. `skus: 2, offers: 2` for one row carrying
+    the wrong price."""
+    from services.catalog_enrichment_agent.ingestion import derive_variant_sku_key
+
+    await _seed(
+        db, pk=LONG_PK,
+        variants=[
+            _variant(variant_id=VID_LONG_A, title="Ruby", price_amount="24.00"),
+            _variant(variant_id=VID_LONG_B, title="Coral", price_amount="31.00"),
+        ],
+        offers=[{}],
+    )
+    report = await _run()
+
+    assert report["skus_deduped_same_identity"] == 1
+    assert report["skus"] == 1, "a collapsed identity was counted twice"
+    assert report["offers"] == 1
+    assert report["skipped_unique_violation"] == 0
+
+    rows = await db.fetch_all(
+        "SELECT * FROM catalog_skus WHERE product_key = :pk", {"pk": LONG_PK})
+    assert len(rows) == 1
+    sku = dict(rows[0])
+    assert sku["title"] == "Ruby", "the survivor is the first shade"
+    assert sku["source_variant_id"] == VID_LONG_A[:128]
+    # the key names the id the row STORES — re-deriving it from the row finds the row
+    assert sku["sku_key"] == derive_variant_sku_key(LONG_PK, sku["source_variant_id"])
+    # ... and the merchant's full id is still on the row for anyone who needs it
+    payload = sku["sku_payload"]
+    payload = json.loads(payload) if isinstance(payload, str) else payload
+    assert payload["variant_id"] == VID_LONG_A
+
+    offers = [dict(o) for o in await db.fetch_all(
+        "SELECT * FROM catalog_offers WHERE product_key = :pk AND source_system = :s",
+        {"pk": LONG_PK, "s": "variant_identity_backfill_v1"})]
+    assert len(offers) == 1
+    assert offers[0]["sku_key"] == sku["sku_key"]
+    assert float(offers[0]["list_price"]) == 24.0, "the second shade's price overwrote the first's offer"
 
 
 async def test_it_adopts_the_promoter_row_instead_of_colliding_with_it(db):
@@ -326,10 +409,15 @@ async def test_a_priceless_variant_gets_no_row_at_all(db):
 async def test_the_run_is_recorded_in_writer_audit_log(db):
     await _seed(db, variants=[_variant()], offers=[{}])
     report = await _run()
-    row = dict(await db.fetch_one("SELECT * FROM writer_audit_log"))
-    assert row["writer_name"] == "backfill_variant_identity_skus"
+    row = await _audit_row(db)
+    assert row["writer_name"] == WRITER_NAME
     assert row["batch_id"] == report["batch_id"]
     assert row["applied_rows"] == 2
+    # `_audit_row` takes the LATEST row, so it cannot see a duplicated ledger write. One run
+    # is one row.
+    n = await db.fetch_val(
+        "SELECT count(*) FROM writer_audit_log WHERE writer_name = :w", {"w": WRITER_NAME})
+    assert n == 1
 
 
 # ---------------------------------------------------------------------------
@@ -417,7 +505,7 @@ async def test_a_run_whose_every_pair_is_refused_does_not_read_as_success(db):
     assert report["skus"] == 0, "a rolled-back pair must not be counted as written"
     assert report["rolled_back_offer_refused_by_guard"] == 1
     assert await db.fetch_val("SELECT count(*) FROM catalog_skus") == 0
-    assert dict(await db.fetch_one("SELECT * FROM writer_audit_log"))["applied_rows"] == 0
+    assert (await _audit_row(db))["applied_rows"] == 0
 
 
 async def test_an_offer_is_never_attached_to_a_suppressed_sku(db):
@@ -455,8 +543,8 @@ async def test_the_audit_row_and_cursor_survive_an_error_mid_run(db):
     finally:
         backfill.guard_catalog_offer_rows = real
     assert calls["n"] == 1
-    row = dict(await db.fetch_one("SELECT * FROM writer_audit_log"))
-    assert row["writer_name"] == "backfill_variant_identity_skus"
+    row = await _audit_row(db)
+    assert row["writer_name"] == WRITER_NAME
 
 
 async def test_a_missing_arbiter_index_is_not_swallowed_as_a_collision(db):

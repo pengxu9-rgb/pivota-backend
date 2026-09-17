@@ -118,6 +118,11 @@ on:
       - "core/**"
       - "db/migrations/**"
       - "tests/test_*_postgres.py"
+      # The subprocess entrypoint one stamping-backfill gate test runs `main()` through. It
+      # carries no `test_` prefix (pytest must not collect it), so the glob above misses it,
+      # and a PR touching only this file would not run the one test that executes it. The
+      # narrow-filter warning above, once more.
+      - "tests/backfill_variant_id_provenance_stamps_fault_driver.py"
       - "tests/integration/test_recovery_postgres.py"
       # The two files that can neuter this ENTIRE job, neither matched above.
       # tests/conftest.py pins DATABASE_URL — today conditionally, but making

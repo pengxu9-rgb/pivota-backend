@@ -66,6 +66,7 @@ Full pattern and its footguns: docs/runbooks/operating_on_gcp_production.md.
 """
 from __future__ import annotations
 
+from typing import Dict
 import argparse
 import asyncio
 import json

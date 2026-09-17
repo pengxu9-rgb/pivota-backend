@@ -80,6 +80,7 @@ if str(ROOT) not in sys.path:
 from db.database import database
 from scripts.mirror_external_seeds_to_catalog_products import _apply as mirror_apply
 from services.brand_claim_service import normalize_host
+from services.catalog_offer_suppression import cascade_offer_suppression
 from services.catalog_sync_service import make_catalog_product_key
 from services.crawled_inci_ingest import ingest_crawled_inci_items
 from services.external_seed_servability import (
@@ -108,6 +109,35 @@ from services.shopify_publication_signal import (
 )
 
 TOOL = "external_brand_crawl"
+# ⚠️ TOOL IS PROVENANCE, NOT RECALL SCOPE, AND IT WAS BEING USED AS BOTH.
+#
+# `external_product_seeds.tool` is the column the agent door filters recall on. The gateway
+# accepts exactly `shopping_agents`, `creator_agents` and `*`
+# (PIVOTA-Agent src/server.js:16851-16857; the legacy `''` scope is behind
+# PIVOT_BEAUTY_LEGACY_TOOL_SCOPE_RECALL_ENABLED, default false). Writing the provenance string
+# "external_brand_crawl" into that column put every row this script has ever onboarded OUTSIDE
+# the door's IN-list, so the whole external-seed recall arm skipped them. They could still be
+# found through the canonical arm, so this was a halving of recall rather than a blackout —
+# which is exactly why nobody noticed.
+#
+# The column's own default is `'*'` (db/migrations/044_external_product_seeds.sql:12), which is
+# in the accept-list. This lane overrode a correct default with a provenance value.
+#
+# ONE NEW FAILURE MODE COMES WITH THAT, and it did not exist before. `external_brand_crawl` was
+# this lane's private namespace, so the partial unique index could never bite it. `'*'` is the
+# DEFAULT, so it is shared: an INSERT here now collides with any active seed another lane wrote
+# for the same (market, external_product_id) without setting `tool`. The arbiter is
+# ON CONFLICT (id), NOT that index, so such a collision raises 23505 and aborts the run rather
+# than updating. Neither in-repo writer is a realistic source today —
+# catalog_enrichment_agent/apply.py binds its own `:tool` under a different id namespace, and
+# seed_data_writer.py omits the NOT NULL `market`/`destination_url` so it is update-only — but
+# the shape is the catalog_skus two-index hazard, and a loud abort is the good version of it.
+#
+# TOOL still names the PROVENANCE, and must: `_seed_id()` builds the seed's primary key as
+# f"{TOOL}::{epid}", and `source_system` / `reason` record who wrote the row. Changing TOOL
+# itself would re-key every seed this lane has ever written and duplicate the lot. The two
+# meanings are separated here rather than merged.
+SEED_TOOL_SCOPE = "*"
 # catalog_products.platform channel for external-seed supply (matches the mirror).
 PLATFORM = "external_seed"
 
@@ -428,8 +458,18 @@ async def _upsert_seed(
           -- while stored-only enrichment keys the cohort never writes survive.
           seed_data=COALESCE(external_product_seeds.seed_data, '{}'::jsonb) || EXCLUDED.seed_data,
           status='active', updated_at=NOW()
+          -- ⚠️ `tool` IS DELIBERATELY NOT IN THIS SET LIST, so re-crawling an already-onboarded
+          -- brand does NOT heal a row still holding the old provenance value. The fix above
+          -- reaches new epids only; existing rows need the deferred backfill. Adding
+          -- tool=EXCLUDED.tool here is NOT the cheap remedy: the arbiter is ON CONFLICT (id),
+          -- so the UPDATE would move `tool` into the partial unique index
+          -- (market, tool, external_product_id) WHERE status='active' and raise 23505 wherever
+          -- a '*' row already exists for that (market, epid). Measure the collision set first.
         """,
-        {"id": _seed_id(p["external_product_id"]), "epid": p["external_product_id"], "tool": TOOL,
+        {"id": _seed_id(p["external_product_id"]), "epid": p["external_product_id"],
+         # SEED_TOOL_SCOPE, not TOOL — see the constant. TOOL stays in `_seed_id` above, which
+         # is identity: the two must not be the same value by accident again.
+         "tool": SEED_TOOL_SCOPE,
          "domain": _seed_domain(p) or None,
          "url": p.get("destination_url"), "title": p["title"], "img": p.get("image_url"),
          "price": p.get("price_amount"), "data": json.dumps(seed_data, ensure_ascii=False),
@@ -569,12 +609,23 @@ async def _suppress_dropped_listings(
             "WHERE id=:id AND status='active'",
             {"id": sid},
         )
-        await database.execute(
+        # RETURNING product_key (no rowcount from `databases`+asyncpg), so the
+        # offer cascade below acts on exactly the rows this statement gated.
+        gated = await database.fetch_all(
             "UPDATE catalog_products SET suppression_reason=:reason, "
             "suppressed_at=COALESCE(suppressed_at, NOW()), updated_at=NOW() "
-            "WHERE source_ref=:id AND suppression_reason IS NULL",
+            "WHERE source_ref=:id AND suppression_reason IS NULL "
+            "RETURNING product_key",
             {"id": sid, "reason": reason},
         )
+        # Suppressing the product does NOT gate its offers: catalog_offers has
+        # its own suppressed_at and that is what every offer-grain read lane
+        # filters on. Without this, a duplicate listing or an ad landing page is
+        # withdrawn as a product while its offer keeps pricing the page — 2,171
+        # such rows measured on prod 2026-09-08. The mirror runs right after this
+        # for ACTIVE seeds only, so a cascaded offer is not re-minted.
+        await cascade_offer_suppression(
+            [str(r["product_key"]) for r in (gated or [])], db=database)
         suppressed += 1
     return suppressed
 

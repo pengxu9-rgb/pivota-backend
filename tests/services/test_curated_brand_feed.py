@@ -26,7 +26,7 @@ def test_maps_shopify_product_to_validated_record():
     pdp, offers = rec["pdp"], rec["offers"]
     assert pdp["brand"] == "COSRX"
     assert pdp["product_name"] == "Snail Mucin Gel Cleanser"
-    assert pdp["category_path"] == "beauty/skincare/cleanser"
+    assert pdp["category_path"] == "beauty/skincare/cleanse/cleanser"
     assert pdp["barcode"] == "8809416470016"  # GTIN carried (strongest deposit basis)
     assert pdp["source_domain"] == "cosrx.com"
     assert pdp["tags"] == ["k-beauty", "cleanser"]
@@ -351,7 +351,7 @@ def test_price_floor_skips_to_the_first_real_variant():
         category_path="x",
     )
     assert rec["offers"][0]["price"] == 15.0
-    assert rec["pdp"]["barcode"] == "8809416470016"
+    assert rec["pdp"]["barcode"] is None  # Price selection cannot establish PDP identity.
 
 
 def test_picks_first_positive_priced_variant():
@@ -363,7 +363,7 @@ def test_picks_first_positive_priced_variant():
     )
     assert rec is not None
     assert rec["offers"][0]["price"] == 24.0
-    assert rec["pdp"]["barcode"] == "8809416470016"  # GTIN from the priced variant
+    assert rec["pdp"]["barcode"] is None  # Multi-variant PDP cannot take one item's identity.
 
 
 # --- inci_from_pdp_html: the metafield / accordion INCI source (pure; no network)
@@ -785,7 +785,7 @@ def _no_live_meta_json(monkeypatch, request):
         return
 
     async def _offline(domain, **kw):
-        return {"currency": None}
+        return {"currency": "USD"}  # Explicit observed-currency fixture; no network.
 
     monkeypatch.setattr(cbf, "fetch_shopify_shop_locale", _offline)
 
@@ -866,6 +866,7 @@ async def test_meta_json_is_validated_before_it_is_believed(monkeypatch, body, e
     import httpx
 
     class _Resp:
+        url = httpx.URL("https://jsmbeauty.sg/meta.json")
         status_code = 200
         headers = {"content-type": "application/json"}
 
@@ -1046,6 +1047,7 @@ async def test_the_meta_json_fetch_goes_through_the_politeness_gate(monkeypatch)
     )
 
     class _Resp:
+        url = httpx.URL("https://jsmbeauty.sg/meta.json")
         status_code = 200
         headers = {"content-type": "application/json"}
         text = '{"currency": "SGD", "country": "SG"}'
@@ -1097,6 +1099,7 @@ async def test_a_failed_meta_json_is_not_cached_against_the_next_brand(monkeypat
     calls = {"n": 0}
 
     class _Resp:
+        url = httpx.URL("https://jsmbeauty.sg/meta.json")
         def __init__(self, ok):
             self.status_code = 200 if ok else 503
             self.headers = {"content-type": "application/json"}
@@ -1154,7 +1157,7 @@ async def test_no_test_in_this_file_reaches_the_live_network_by_default(monkeypa
     recs = await cbf.records_for_brand(domain="maccosmetics.com", category_path="beauty/makeup")
 
     assert recs, "the stub returned a product, so a record must come back"
-    assert recs[0]["pdp"]["currency"] is None, "offline: no currency learned, ingest defaults USD"
+    assert recs[0]["pdp"]["currency"] == "USD", "offline: no currency learned, ingest defaults USD"
 
 def _folded(base_options, own_variants, shade_titles):
     """Drive the REAL fold. A hand-marked `_multi(FOLDED_INTO_KEY=2)` product is
@@ -1729,7 +1732,7 @@ async def test_the_currency_gate_refuses_before_any_record_is_built(monkeypatch)
 
 @pytest.mark.asyncio
 @pytest.mark.live_locale
-async def test_omitting_the_currency_gate_leaves_the_old_behaviour_exactly(monkeypatch):
+async def test_unproven_currency_is_refused_without_an_expected_currency(monkeypatch):
     """Opt-in. Every brand already onboarded ran without it and must keep running: an
     unreadable /meta.json still yields records, still currency-less, still USD downstream."""
     async def _products(domain, **kw):
@@ -1741,10 +1744,8 @@ async def test_omitting_the_currency_gate_leaves_the_old_behaviour_exactly(monke
     monkeypatch.setattr(cbf, "fetch_shopify_products", _products)
     monkeypatch.setattr(cbf, "fetch_shopify_shop_locale", _locale)
 
-    recs = await cbf.records_for_brand(domain="flowerbeauty.com", category_path="beauty/makeup")
-
-    assert len(recs) == 1
-    assert recs[0]["pdp"]["currency"] is None
+    with pytest.raises(cbf.CurrencyNotProven, match="currency is unproven"):
+        await cbf.records_for_brand(domain="jsmbeauty.sg", category_path="beauty/makeup")
 
 
 @pytest.mark.asyncio
@@ -1966,3 +1967,195 @@ async def test_a_politeness_gate_that_REFUSES_yields_no_blurb(monkeypatch):
 
     assert await cbf.fetch_shop_description_from_meta("jsmbeauty.sg") is None
     assert fetched == [], "the gate refused, so no request may reach the merchant host"
+
+
+# --- brand attribution on a BRAND-FAMILY storefront -------------------------------
+# Measured live 2026-09-11: misshaus.com publishes 125 products under six vendor
+# values — MISSHA 89, APIEU 16, MISSHA US 8, CHOGONGJIN 7, Time Revolution 2,
+# Apieu 1 — and was onboarded with brand="Missha". The 17 A'pieu products landed in
+# the index branded `Missha`, which also made them invisible to brand-strict recall
+# (a live search for `A'PIEU` returned all 15 of the rows we hold while reporting
+# `external_seed_brand_strict_rows: 0`).
+
+def _misshaus(vendor, title, handle):
+    return _product(vendor=vendor, title=title, handle=handle,
+                    variants=[{"price": "12.00", "available": True}])
+
+
+def test_a_sibling_brand_keeps_its_own_vendor_not_the_override():
+    """The exact row that shipped wrong: A'pieu's lip oil on Missha's storefront."""
+    rec = shopify_product_to_record(
+        _misshaus("APIEU", "A'pieu Honey & Milk Lip Oil", "honey-milk-lip-oil-1"),
+        domain="misshaus.com", category_path="beauty/skincare", brand_override="Missha",
+    )
+    assert rec["pdp"]["brand"] == "APIEU"
+    assert rec["pdp"]["brand"] != "Missha"
+    # The merchant is still the storefront — the brand moved, the seller did not.
+    assert rec["offers"][0]["merchant_inferred"] == "Missha"
+
+
+def test_the_override_still_normalises_the_same_brands_spelling():
+    """The override's legitimate job. `MISSHA US` and `Missha` are one brand."""
+    for vendor in ("MISSHA", "MISSHA US", "Missha"):
+        rec = shopify_product_to_record(
+            _misshaus(vendor, "Time Revolution Essence", "tr-essence"),
+            domain="misshaus.com", category_path="beauty/skincare", brand_override="Missha",
+        )
+        assert rec["pdp"]["brand"] == "Missha", vendor
+
+
+def test_punctuation_only_differences_are_the_same_brand():
+    rec = shopify_product_to_record(
+        _misshaus("Apieu", "A pieu Juicy Pang", "juicy-pang"),
+        domain="apieu.com", category_path="beauty/makeup", brand_override="A'PIEU",
+    )
+    assert rec["pdp"]["brand"] == "A'PIEU"
+
+
+def test_the_override_wins_when_the_vendor_names_the_store():
+    """metro.com.sg publishes `vendor: "Metro Singapore Departmental Store -
+    Celebrating 69 Years in SG"` — the shop, not a brand, and (unlike
+    thefaceshopny.com, whose store name happens to CONTAIN its brand and is therefore
+    settled one rule earlier) it shares nothing with the brand but the host label."""
+    rec = shopify_product_to_record(
+        _misshaus(
+            "Metro Singapore Departmental Store - Celebrating 69 Years in SG",
+            "Etude House Drawing Eye Brow", "drawing-eye-brow",
+        ),
+        domain="metro.com.sg", category_path="beauty/makeup",
+        brand_override="ETUDE HOUSE",
+    )
+    assert rec["pdp"]["brand"] == "ETUDE HOUSE"
+    assert cbf.resolve_record_brand(
+        "Metro Singapore Departmental Store - Celebrating 69 Years in SG",
+        "ETUDE HOUSE", "metro.com.sg",
+    )[1] == "override_vendor_is_store"
+
+
+def test_a_supplier_code_is_never_adopted_as_a_brand():
+    """sukoshi.com publishes `vendor: "VC-B004"` on 11 measured rows whose brand is in
+    the title only. A code in the brand column is worse than the override it replaced."""
+    rec = shopify_product_to_record(
+        _misshaus("VC-B004", "A'pieu Honey & Milk Lip Scrub", "lip-scrub"),
+        domain="sukoshi.com", category_path="beauty/skincare", brand_override="A'PIEU",
+    )
+    assert rec["pdp"]["brand"] == "A'PIEU"
+    assert cbf.resolve_record_brand("VC-B004", "A'PIEU", "sukoshi.com") == (
+        "A'PIEU", "override_vendor_is_not_a_name",
+    )
+
+
+def test_the_store_name_guard_is_not_shadowed_by_containment():
+    """thefaceshopny IS settled by containment — pinned so a future reader does not
+    mistake it for evidence that the store-name guard works."""
+    assert cbf.resolve_record_brand(
+        "thefaceshopny", "THE FACE SHOP", "thefaceshopny.com"
+    ) == ("THE FACE SHOP", "override_same_brand")
+
+
+def test_an_absent_vendor_still_takes_the_override():
+    rec = shopify_product_to_record(
+        _misshaus("", "Some Product", "some-product"),
+        domain="misshaus.com", category_path="beauty/skincare", brand_override="Missha",
+    )
+    assert rec["pdp"]["brand"] == "Missha"
+
+
+def test_no_override_is_unchanged_vendor_only():
+    rec = shopify_product_to_record(
+        _misshaus("COSRX", "Snail Gel", "snail-gel"),
+        domain="cosrx.com", category_path="beauty/skincare",
+    )
+    assert rec["pdp"]["brand"] == "COSRX"
+
+
+def test_resolve_record_brand_reasons_are_exhaustive_over_the_measured_feed():
+    """Every vendor misshaus.com actually publishes, and what each resolves to."""
+    seen = {
+        v: cbf.resolve_record_brand(v, "Missha", "misshaus.com")
+        for v in ("MISSHA", "APIEU", "MISSHA US", "CHOGONGJIN", "Time Revolution", "Apieu", "")
+    }
+    assert seen["MISSHA"] == ("Missha", "override_same_brand")
+    assert seen["MISSHA US"] == ("Missha", "override_same_brand")
+    assert seen["APIEU"] == ("APIEU", "vendor_disagrees")
+    assert seen["Apieu"] == ("Apieu", "vendor_disagrees")
+    assert seen["CHOGONGJIN"] == ("CHOGONGJIN", "vendor_disagrees")
+    assert seen["Time Revolution"] == ("Time Revolution", "vendor_disagrees")
+    assert seen[""] == ("Missha", "override_no_vendor")
+
+
+def test_a_short_actual_brand_is_not_relabelled_by_the_override():
+    # 3M is a maker, just as Meitu's 3CE is: short does not mean supplier code.
+    assert cbf.resolve_record_brand("3M", "M3 Cosmetics", "shop.com") == (
+        "3M", "vendor_disagrees",
+    )
+
+
+@pytest.mark.asyncio
+async def test_records_for_brand_reports_every_vendor_it_refused_to_rename(monkeypatch):
+    """The census must be driven by the real call, not recomputed in the test."""
+    feed = [
+        _misshaus("MISSHA", "Time Revolution Essence", "tr-essence"),
+        _misshaus("MISSHA", "Artemisia Ampoule", "artemisia"),
+        _misshaus("APIEU", "A'pieu Honey & Milk Lip Oil", "honey-milk-lip-oil-1"),
+        _misshaus("CHOGONGJIN", "Chogongjin Cream", "chogongjin-cream"),
+    ]
+
+    async def fake_fetch(domain, *, max_products=500, timeout_s=15.0):
+        return feed
+
+    monkeypatch.setattr(cbf, "fetch_shopify_products", fake_fetch)
+    recs = await cbf.records_for_brand(
+        domain="misshaus.com", category_path="beauty/skincare", brand="Missha"
+    )
+    assert [r["pdp"]["brand"] for r in recs] == ["Missha", "Missha", "APIEU", "CHOGONGJIN"]
+
+    census = cbf.records_for_brand.last_brand_census
+    assert census["brand_override"] == "Missha"
+    assert census["kept_vendor_count"] == 2
+    assert census["vendors"]["APIEU"] == {
+        "count": 1, "resolved_brand": "APIEU", "reason": "vendor_disagrees",
+    }
+    assert census["vendors"]["MISSHA"]["reason"] == "override_same_brand"
+
+
+@pytest.mark.asyncio
+async def test_one_brand_never_lands_under_two_spellings(monkeypatch):
+    """misshaus.com publishes `APIEU` on 16 products and `Apieu` on 1. Kept verbatim
+    they are two brands to any consumer that groups by the brand string."""
+    feed = [
+        _misshaus("MISSHA", "Time Revolution Essence", "tr-essence"),
+        _misshaus("APIEU", "A'pieu Honey & Milk Lip Oil", "lip-oil"),
+        _misshaus("APIEU", "A'pieu Hair Vinegar", "hair-vinegar"),
+        _misshaus("Apieu", "A pieu Juicy Pang", "juicy-pang"),
+    ]
+
+    async def fake_fetch(domain, *, max_products=500, timeout_s=15.0):
+        return feed
+
+    monkeypatch.setattr(cbf, "fetch_shopify_products", fake_fetch)
+    recs = await cbf.records_for_brand(
+        domain="misshaus.com", category_path="beauty/skincare", brand="Missha"
+    )
+    brands = [r["pdp"]["brand"] for r in recs]
+    assert brands == ["Missha", "APIEU", "APIEU", "APIEU"]  # modal spelling wins
+    assert "Apieu" not in brands
+    assert cbf.records_for_brand.last_brand_spelling_folds == {"apieu": "APIEU"}
+
+
+@pytest.mark.asyncio
+async def test_the_fold_does_not_touch_a_feed_with_one_spelling_each(monkeypatch):
+    feed = [
+        _misshaus("MISSHA", "Essence", "essence"),
+        _misshaus("CHOGONGJIN", "Cream", "cream"),
+    ]
+
+    async def fake_fetch(domain, *, max_products=500, timeout_s=15.0):
+        return feed
+
+    monkeypatch.setattr(cbf, "fetch_shopify_products", fake_fetch)
+    recs = await cbf.records_for_brand(
+        domain="misshaus.com", category_path="beauty/skincare", brand="Missha"
+    )
+    assert [r["pdp"]["brand"] for r in recs] == ["Missha", "CHOGONGJIN"]
+    assert cbf.records_for_brand.last_brand_spelling_folds == {}

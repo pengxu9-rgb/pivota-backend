@@ -254,8 +254,18 @@ async def test_suppress_dropped_listings_stamps_the_reason_it_is_given():
     executed = []
 
     class _FakeDB:
+        """Records every accessor. `execute` alone went blind the day the mirror
+        suppression became `RETURNING product_key` — and it would have gone on
+        reporting a green assertion about a statement it no longer saw."""
+
         async def execute(self, query, values=None):
             executed.append((query, values))
+
+        async def fetch_all(self, query, values=None):
+            executed.append((query, values))
+            if "RETURNING" in str(query).upper():
+                return [{"product_key": "prod::dropped", "offer_id": "offer::dropped"}]
+            return []
 
     original = onboard.database
     onboard.database = _FakeDB()
@@ -267,8 +277,17 @@ async def test_suppress_dropped_listings_stamps_the_reason_it_is_given():
         onboard.database = original
 
     assert n == 1
-    reasons = [v.get("reason") for _q, v in executed if v and "reason" in v]
+    # Scoped to the PRODUCT statement. The offer cascade that now follows it
+    # carries a `reason` bind too — its own `product_suppressed` label — and an
+    # unscoped scan would read that as this caller's reason being wrong.
+    reasons = [v.get("reason") for q, v in executed
+               if v and "reason" in v and "catalog_products" in str(q)]
     assert reasons == ["external_brand_crawl_unpublished"]
+    # The cascade keeps its OWN label: the offer was not independently judged,
+    # it was gated because its product was, and the revert path keys on that.
+    offer_reasons = [v.get("reason") for q, v in executed
+                     if v and "reason" in v and "catalog_offers" in str(q)]
+    assert offer_reasons == ["product_suppressed"]
 
 
 # --------------------------------------------------------------------------

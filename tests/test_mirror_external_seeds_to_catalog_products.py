@@ -336,18 +336,39 @@ async def test_upsert_canonical_sku_writes_path_C_compatible_shape(monkeypatch) 
     sql = executed[0]["sql"]
     params = executed[0]["params"]
     assert "INSERT INTO catalog_skus" in sql
+    # The PK, deliberately, and NOT `idx_catalog_skus_source_identity_v2`.
+    # catalog_skus carries both, Postgres infers one and never falls through,
+    # and PR #2135 moves the two sibling upserts to the identity index. This
+    # one does not: the PK is the only identity this lane's three callers agree
+    # on, because `merchant_id` is a caller-supplied argument they do not pass
+    # alike (see the rationale block above the statement), and repointing it
+    # without an adoption helper would silently orphan the offer written right
+    # after it.
+    # tests/test_mirror_canonical_sku_upsert_postgres.py executes both claims.
     assert "ON CONFLICT (sku_key) DO UPDATE" in sql
+    # Never a rename: the DO UPDATE must not touch an identity column, or it
+    # would drag catalog_offers rows off the key they were written against.
+    for identity_column in ("sku_key =", "product_key =", "merchant_id =",
+                            "platform =", "source_variant_id ="):
+        assert identity_column not in sql.split("DO UPDATE", 1)[1]
+    # MERGE, not replace. A bare `sku_payload = EXCLUDED.sku_payload` erased
+    # every key another writer had stamped on the row.
+    assert "sku_payload = EXCLUDED.sku_payload" not in sql
+    assert "|| EXCLUDED.sku_payload" in sql
     assert params["sku_key"] == f"{pk}::canonical"
     assert params["product_key"] == pk
     assert params["merchant_id"] == MERCHANT_ID
     assert params["platform"] == PLATFORM
     assert params["source_product_id"] == "ext_abc"
-    # Phase 7d fix: source_variant_id = product_key (NOT literal
-    # 'canonical'). The unique index `idx_catalog_skus_source_identity`
-    # is on (merchant_id, platform, source_variant_id) only 3 columns —
-    # so a literal would collide on every row past the first. Pin the
-    # product_key convention (matches Path C agent) so a future refactor
-    # can't accidentally re-introduce the collision.
+    # source_variant_id = product_key, NOT a literal 'canonical'. The reason is
+    # no longer uniqueness: `idx_catalog_skus_source_identity_v2` is
+    # (merchant_id, platform, product_key, source_variant_id) since migration
+    # 123, so product_key already separates these rows and a literal would not
+    # collide. The convention is pinned because three other things read it —
+    # Path C's canonical row spells it identically,
+    # `services/variant_identity.variant_id_provenance` classifies a restatement
+    # of the product key as PRODUCT_DERIVED, and the gateway's
+    # `isRestatedProductId` guard refuses to spend money against that shape.
     assert params["source_variant_id"] == pk
     assert params["title"] == "Test Product"
     assert params["currency"] == "USD"

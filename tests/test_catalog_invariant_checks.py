@@ -330,3 +330,292 @@ async def test_a_failing_sample_fetch_does_not_erase_the_verdict_from_the_tally(
     # Both verdicts are in the total; the entries and the tally agree.
     assert report["violated_count"] == 2
     assert report["violated_count"] == sum(1 for c in report["checks"] if c.get("violated"))
+
+
+# --- green-over-broken detectors ---------------------------------------------------------------
+
+def _check(name):
+    from services.catalog_invariant_checks import _CHECKS
+    matches = [c for c in _CHECKS if c["name"] == name]
+    assert len(matches) == 1, "expected exactly one %r check, got %d" % (name, len(matches))
+    return matches[0]
+
+
+ANCESTOR_ONLY = "serving_eligible_ancestor_only_taxonomy_node"
+OFF_TAXONOMY = "serving_eligible_off_taxonomy_path"
+NO_PATH = "serving_eligible_with_no_category_path"
+
+
+def test_all_three_taxonomy_checks_are_ratchets_not_reports():
+    """warn_only at threshold 0 would print the real number every run and alarm on nothing — a
+    metric wearing a detector's name, which is the category error this module exists to catch.
+
+    A SHARE, not a row count. The first version enforced at the measured 4,588 rows; review pointed
+    out that is a hair trigger on 43.7% of the served catalogue, since nightly_index_health
+    recomputes serving_eligible every 7,200s and one promotion moves 4,588 to 4,589. A number that
+    must be edited most days gets raised instead of respected."""
+    for name, baseline, threshold in (
+        (ANCESTOR_ONLY, 381, 400),
+        (OFF_TAXONOMY, 68, 75),
+        (NO_PATH, 56, 62),
+    ):
+        check = _check(name)
+        assert not check.get("warn_only"), "%s: a ratchet that never fails is a metric" % name
+        assert check["default_threshold"] == threshold, name
+        # Headroom, but not so much that the alarm is decorative.
+        assert baseline < threshold <= baseline * 1.15, (
+            "%s: threshold %d is not a ratchet over a baseline of %d"
+            % (name, threshold, baseline)
+        )
+        assert check["count_sql"] is None and check["sample_sql"] is None, (
+            "%s computes a share in Python; restating it in SQL is how the two drift" % name
+        )
+        assert callable(check.get("runner")), name
+
+
+def test_the_predicates_ask_EXACTLY_WHAT_RECALL_ASKS():
+    """THE ROUND-2 FINDING, and the reason this file was reworked.
+
+    The first version wrote `lower(btrim(category_path, '/'))`. Recall does neither: its prefix test
+    is `p.category_path LIKE :category_path_prefix` and #2122's is
+    `SUBSTR(:prefix, 1, LENGTH(p.category_path)+1) = p.category_path || '/'` — both case-sensitive,
+    neither trimming. So `Beauty/Makeup` has NO door at all, and a normalising check filed it as
+    "degraded but rescuable" while a mixed-case LEAF fell into no cohort and was reported healthy.
+
+    A detector that normalises what the system under test does not is measuring a different system.
+    """
+    from services.catalog_invariant_checks import (
+        _ANCESTOR_ONLY_SQL,
+        _NO_PATH_SQL,
+        _OFF_TAXONOMY_SQL,
+        _PREFIX_REACHABLE_SQL,
+    )
+
+    for name, sql in (
+        ("prefix_reachable", _PREFIX_REACHABLE_SQL),
+        ("ancestor_only", _ANCESTOR_ONLY_SQL),
+        ("off_taxonomy", _OFF_TAXONOMY_SQL),
+    ):
+        assert "lower(" not in sql, "%s normalises case; recall does not" % name
+        assert "btrim(cp.category_path, '/')" not in sql, (
+            "%s trims slashes; recall does not" % name
+        )
+    # the blank test is the ONE place trimming is right: '   ' is "no path", not a path
+    assert "btrim(cp.category_path)" in _NO_PATH_SQL
+
+
+def test_reachability_is_tested_by_PREFIX_not_by_DEPTH():
+    """The other half of the same finding. The first version exempted a path from the handicapped
+    cohort when it was depth-3 with a trailing slash. But recall's prefix is the LEAF'S PARENT plus
+    a slash, and 12 of the 23 leaf-parents are depth 1 or 2 — `fashion/`, `beauty/fragrance/`. A
+    depth test therefore got those wrong in both directions. Membership is now derived."""
+    from services.catalog_invariant_checks import (
+        _LEAF_PARENTS,
+        _PREFIX_REACHABLE_SQL,
+        _TAXONOMY_PATHS,
+    )
+
+    assert _LEAF_PARENTS, "empty parent set: nothing would be reachable and the check would scream"
+    # every leaf's parent, and nothing that is itself a leaf-with-children
+    assert "beauty/makeup/lip" in _LEAF_PARENTS
+    assert "fashion" in _LEAF_PARENTS, "depth-1 parents exist; a depth test cannot see them"
+    assert "beauty/makeup" not in _LEAF_PARENTS, "no leaf hangs directly off beauty/makeup"
+    assert all(
+        p.rsplit("/", 1)[0] in _LEAF_PARENTS for p in _TAXONOMY_PATHS if "/" in p
+    ), "a leaf whose parent is not a prefix would be permanently uncounted"
+    # and the set reaches the SQL as prefixes, not as equality
+    assert "LIKE 'beauty/makeup/lip/%'" in _PREFIX_REACHABLE_SQL
+    assert "LIKE 'fashion/%'" in _PREFIX_REACHABLE_SQL
+
+
+def test_the_four_cohorts_are_disjoint_and_exhaustive_by_construction():
+    """Interior, off-taxonomy and no-path must not double-count a row, or the three shares describe
+    an overlapping population and none means what it says. They are built by mutual exclusion; the
+    runner re-checks the arithmetic against the live denominator every run
+    (`partition_is_exhaustive`), which is what catches a predicate drifting later."""
+    from services.catalog_invariant_checks import (
+        _ANCESTOR_ONLY_SQL,
+        _NO_PATH_SQL,
+        _OFF_TAXONOMY_SQL,
+        _PREFIX_REACHABLE_SQL,
+    )
+
+    from services.catalog_invariant_checks import _ANCESTOR_SQL, _UNREACHED_SQL
+
+    # each non-blank cohort excludes the blank one and the reachable one
+    for sql in (_ANCESTOR_ONLY_SQL, _OFF_TAXONOMY_SQL):
+        assert sql.startswith(_UNREACHED_SQL), "cohort does not exclude blank + reachable"
+        assert "NOT (" + _NO_PATH_SQL + ")" in sql
+        assert "NOT " + _PREFIX_REACHABLE_SQL in sql
+    # ...and they differ ONLY in the sign of the ancestor test, so no non-blank unreached path can
+    # satisfy both and every one of them satisfies exactly one.
+    assert _ANCESTOR_ONLY_SQL == _UNREACHED_SQL + " AND " + _ANCESTOR_SQL
+    assert _OFF_TAXONOMY_SQL == _UNREACHED_SQL + " AND NOT " + _ANCESTOR_SQL
+
+
+def test_the_LIKE_patterns_are_not_double_escaped():
+    """Review found the first version reaching asyncpg as `LIKE '%%/'` — two wildcards where one was
+    written, because the pattern was built with %-formatting and then %-formatted again. Postgres
+    happens to treat `%%` as `%`, so it worked; the next such slip need not. These are built by
+    concatenation, so the pattern in the source is the pattern that runs."""
+    from services.catalog_invariant_checks import _PREFIX_REACHABLE_SQL
+
+    assert "%%" not in _PREFIX_REACHABLE_SQL, "double-escaped wildcard"
+    assert "LIKE 'beauty/makeup/lip/%'" in _PREFIX_REACHABLE_SQL
+
+
+def test_no_description_claims_the_rows_are_unreachable():
+    """An earlier version was named `..._but_unroutable` and said the rows "can never match". They
+    can: #2122 admits an ancestor row whose own text carries the category word, and prod returns
+    MAC's depth-2 lipsticks on page 2 of a lipstick query. The claim came from reading page 1 and
+    treating absence there as absence, which is the exact reasoning this module exists to catch.
+
+    off_taxonomy is the ONE cohort with no category door, and even it reaches the trigram text scan,
+    so it says "category recall never returns them", not "unreachable"."""
+    for name in (ANCESTOR_ONLY, OFF_TAXONOMY, NO_PATH):
+        check = _check(name)
+        blob = (check["name"] + " " + check["description"]).lower()
+        for banned in ("unroutable", "unreachable", "never reach", "can never"):
+            assert banned not in blob, "%s overclaims reachability: %r" % (name, banned)
+    # each must name the door it is about, or the reader cannot tell the three apart
+    assert "ancestor" in _check(ANCESTOR_ONLY)["description"].lower()
+    assert "missing_taxonomy" in _check(NO_PATH)["description"].lower()
+
+
+def test_the_interior_node_list_is_derived_and_excludes_leaves():
+    """THE MECHANISM. If this list were empty the check would match nothing and look green
+    forever. And if it wrongly contained LEAVES, the check would flag rows that match the
+    query prefix directly and have no handicap at all.
+
+    Routability is not a depth: `fashion/shoes` and `electronics/ereader` are 2-segment leaves.
+    """
+    from services.catalog_invariant_checks import _INTERIOR_NODES, _TAXONOMY_PATHS
+
+    assert _INTERIOR_NODES, "empty interior set: the check would silently match nothing"
+    # interior nodes something extends
+    assert "beauty/makeup" in _INTERIOR_NODES
+    assert "beauty/makeup/lip" in _INTERIOR_NODES
+    assert "beauty" in _INTERIOR_NODES
+    # 2-segment LEAVES must be absent, or the check would flag routable rows
+    assert "fashion/shoes" in _TAXONOMY_PATHS
+    assert "fashion/shoes" not in _INTERIOR_NODES
+    assert "electronics/ereader" not in _INTERIOR_NODES
+    # no full leaf is ever an interior node
+    assert not (_TAXONOMY_PATHS & _INTERIOR_NODES)
+
+
+def test_the_ancestor_list_reaches_the_predicate():
+    """Deriving the set is useless if the query does not use it.
+
+    (String assertions on purpose — they pin only that the derivation is WIRED IN. Whether the
+    predicates COUNT correctly is proved by executing them, in
+    tests/test_green_over_broken_detectors_postgres.py, because a string test cannot tell `IN` from
+    `NOT IN`. That was the round-1 finding that produced the Postgres gate.)"""
+    from services.catalog_invariant_checks import _ANCESTOR_ONLY_SQL, _OFF_TAXONOMY_SQL
+
+    assert "'beauty/makeup'" in _ANCESTOR_ONLY_SQL
+    assert "'beauty/makeup/lip/lipstick'" not in _ANCESTOR_ONLY_SQL, "a LEAF is not an ancestor"
+    assert "'beauty/makeup'" in _OFF_TAXONOMY_SQL
+
+
+def test_every_check_has_a_description_and_a_threshold_env():
+    """Cheap structural guard: a check added without these is invisible in the sweep output."""
+    from services.catalog_invariant_checks import _CHECKS
+    for check in _CHECKS:
+        assert check.get("description"), check["name"]
+        assert check.get("env"), check["name"]
+        assert "default_threshold" in check, check["name"]
+
+
+# --- an unrunnable check is not a passing check ------------------------------------------------
+
+
+class _RaisingDb:
+    """A database that fails the way a real one does when a check's SQL is wrong: it raises."""
+
+    def __init__(self, fail_names):
+        self._fail = set(fail_names)
+
+    def _name_for(self, sql):
+        for check in _CHECKS:
+            if check.get("count_sql") == sql or check.get("sample_sql") == sql:
+                return check["name"]
+        return None
+
+    async def fetch_one(self, sql, values=None):
+        if self._name_for(sql) in self._fail:
+            raise RuntimeError("relation does not exist")
+        return {"c": 0}
+
+    async def fetch_all(self, sql, values=None):
+        if self._name_for(sql) in self._fail:
+            raise RuntimeError("relation does not exist")
+        return []
+
+    async def fetch_val(self, sql, values=None):
+        return 0
+
+
+async def test_a_check_that_RAISES_is_counted_and_named():
+    """Until 2026-09-10 a raising check produced `error` and no `count`/`violated` key, so the
+    summary said "27 checks, 0 violated" and looked exactly like a healthy sweep. Three share
+    checks had been in that state since the day they merged.
+
+    An unrunnable check is not a passing check — it is a green light over a broken thing, which is
+    what this whole module is about."""
+    from services.catalog_invariant_checks import run_catalog_invariant_checks
+
+    target = next(c["name"] for c in _CHECKS if c.get("count_sql"))
+    report = await run_catalog_invariant_checks(_RaisingDb([target]))
+
+    assert report["errored_count"] == 1, report.get("errored")
+    assert report["errored"] == [target]
+    # An error is not a violation: the errored check must appear in NEITHER tally. (Other checks
+    # may legitimately violate against this fake — `taxonomy_code_vs_table_drift` reports an
+    # unreadable shared vocabulary, which is exactly what an empty fake presents — so assert about
+    # the target rather than about a global zero.)
+    entry = next(c for c in report["checks"] if c["name"] == target)
+    assert "violated" not in entry and "count" not in entry
+    assert target not in [c["name"] for c in report["checks"] if c.get("violated")]
+
+
+async def test_a_clean_sweep_reports_ZERO_errored():
+    """The control. A report that always claimed errors would pass the test above."""
+    from services.catalog_invariant_checks import run_catalog_invariant_checks
+
+    report = await run_catalog_invariant_checks(_RaisingDb([]))
+    assert report["errored_count"] == 0
+    assert report["errored"] == []
+
+
+class _SampleRaisesDb:
+    """Counts fine, then raises while fetching example rows — the 2026-09-02 incident's shape."""
+
+    async def fetch_one(self, sql, values=None):
+        return {"c": 10**9}
+
+    async def fetch_all(self, sql, values=None):
+        raise RuntimeError("sample fetch exploded")
+
+    async def fetch_val(self, sql, values=None):
+        return 0
+
+
+async def test_a_check_that_raises_while_SAMPLING_stays_violated_and_is_also_errored():
+    """`errored` OVERLAPS `violated`, on purpose, and the overlap needs pinning because the
+    obvious reading of the summary line is a four-way partition.
+
+    The tally runs before sampling deliberately: the COUNT is the verdict, so a sample fetch that
+    raises must not erase a real violation from the totals — that regression is what the
+    2026-09-02 note in the runner describes. So a check over threshold whose sample fetch dies is
+    BOTH violated and errored, and a reader adding the three numbers will over-count."""
+    from services.catalog_invariant_checks import run_catalog_invariant_checks
+
+    report = await run_catalog_invariant_checks(_SampleRaisesDb())
+    both = [
+        c["name"] for c in report["checks"]
+        if c.get("violated") and c.get("error")
+    ]
+    assert both, "a sample-raise should leave the violation standing AND record the error"
+    assert report["violated_count"] >= len(both)
+    assert set(both).issubset(set(report["errored"]))

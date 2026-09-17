@@ -381,16 +381,27 @@ async def _merchants_for_interactions(interaction_ids: Sequence[str]) -> Dict[st
     }
 
 
-async def report_ledger_retention(*, horizon_days: int) -> Dict[str, Any]:
+async def report_ledger_retention(
+    *, horizon_days: int, now: Optional[datetime] = None
+) -> Dict[str, Any]:
     """How much REAL commerce history sits behind a horizon. Reads only.
 
     PR-0.9 deliberately deletes no real row. This exists so the retention
     policy for real history can be decided against measured volume instead of
     a guess: per merchant, the events and interactions older than the horizon
     and the oldest `occurred_at` still on file.
+
+    `now` INJECTS THE CLOCK, as `sweep_synthetic_events` already allows. Without it this
+    function's answer depends on wall time, so a test with fixed fixture dates asserts a
+    number that is only true for a while. tests/test_commerce_ledger_retention_postgres.py
+    pinned NOW = 2026-09-04T12:00Z and seeded an event one day before it, then called this
+    with no clock — so that event sat outside a 7-day horizon until real time reached
+    2026-09-10T12:00Z, and from that minute on the suite failed with `assert 6 == 5`. It was
+    green at 06:52Z and red at 16:43Z on the same day, on a branch that had not touched the
+    ledger. A test that passes because of the date is not passing.
     """
     horizon_days = max(0, int(horizon_days))
-    cutoff = _utc_now() - timedelta(days=horizon_days)
+    cutoff = (now or _utc_now()) - timedelta(days=horizon_days)
 
     event_rows = await database.fetch_all(
         select(

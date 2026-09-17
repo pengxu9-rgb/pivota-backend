@@ -641,8 +641,9 @@ def _findings_from_brand_rollup(
                 f"and serving this store's offers. This measures our own "
                 f"readiness, not the brand's AI visibility."
                 if str(key) in _PIVOTA_INTERNAL_DIMENSIONS
-                else f"{label}: {band_text}"
-                + (f" — {meaning}" if meaning else "")
+                else f"{label}: diagnostic score {dim.get('median') if dim.get('median') is not None else 'not retained'}/100. "
+                "This score does not establish verified AI identification, mention, or recommendation. "
+                "Review the underlying evidence before changing the product page."
             ),
         })
     return out

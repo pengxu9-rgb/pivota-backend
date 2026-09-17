@@ -123,7 +123,23 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         r"\b(cleanser|cleansing|face wash|facial wash|"
         r"cleansing milk|cleansing foam|cleansing gel|face wipes?|cleansing wipes?|wipes?|wash)\b",
         re.IGNORECASE)),
-    ("Toner", "beauty/skincare/treat/toner", re.compile(
+    # TONER GETS ITS OWN BUCKET, not a slot inside `treat/`. Two reasons, and they agree:
+    #
+    # 1. INDUSTRY STANDARD. Google Product Taxonomy 5976 and Shopify's standard taxonomy
+    #    hb-3-2-9-17 both put `Toners & Astringents` as a DIRECT CHILD of Skin Care — a sibling of
+    #    Facial Cleansers, Lotion & Moisturizer, Sunscreen, Skin Care Masks & Peels and Acne
+    #    Treatments & Kits. Neither nests it under a treatments node; in both, "treatments",
+    #    "masks" and "toners" are three peers.
+    # 2. RECALL. PIVOTA-Agent measured it (src/services/beautyTaxonomy.js): folding toner into
+    #    `treat/` puts it in one bucket with serum(520) + mask(421) + exfoliant(123), which is the
+    #    broad-bucket shape behind the 2026-07-31 junk recall.
+    #
+    # ⚠️ THIS MATCHES THE GATEWAY ON PURPOSE. PIVOTA-Agent has declared `tone/toner` canonical
+    # since 2026-08-04 and its browse leg queries `category_path LIKE 'beauty/skincare/tone/%'`,
+    # while this file named `treat/toner` and nothing here could reach the 315 prod rows sitting on
+    # the gateway's path. Two taxonomies over one column, each calling the other's rows corrupt.
+    # Do not retarget this leaf without changing beautyTaxonomy.js in the same breath.
+    ("Toner", "beauty/skincare/tone/toner", re.compile(
         r"\b(toner|tonic|mist|pad|skin booster)\b", re.IGNORECASE)),
     # Mask is SPLIT in two. Everything here names an unambiguous mask FORM, so
     # it wins over "essence" below: "Real Rice Essence Sheet Mask" is a mask.
@@ -338,6 +354,33 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         r"essentials set|essentials|care set|duo|kit|collection|set)\b",
         re.IGNORECASE)),
 ]
+
+
+# THE ONE DEFINITION OF "THIS ROW HAS BEEN CATEGORISED".
+#
+# A path names a category only once it says something past the top-level domain. `beauty` is a
+# NAMESPACE, not an answer to "what is this" -- and treating it as an answer is what stranded an
+# entire cohort. Measured on the live index: of 50 rows returned for "eau de parfum", 16 sit on bare
+# `beauty`, including the whole Ariana Grande fragrance line, Cosmic Kylie Jenner and every
+# PixiPerfume. Serving drops them as `category_mismatch`, and the backfill below never revisits them
+# because `category_path IS NULL` reads them as already done. A useless answer counted as an answer
+# in both directions at once.
+#
+# It also explains why the cohort survived a taxonomy standardisation pass: `beauty` IS on the
+# taxonomy, so an off-taxonomy health check counts it healthy. Nothing was watching non-leaf paths.
+#
+# Exported so the backfill, the serving gate and any future writer share one rule rather than each
+# re-deciding what "categorised" means. PIVOTA-Agent's serving-side twin is
+# `categoryPathIsCategorised` in src/server.js; the drift test below pins them to the same rule.
+MIN_CATEGORISED_PATH_SEGMENTS = 2
+
+
+def is_categorised_path(category_path: Optional[str]) -> bool:
+    """True when the path names a category, not merely a top-level domain."""
+    if not category_path:
+        return False
+    segments = [seg for seg in str(category_path).strip().strip("/").split("/") if seg]
+    return len(segments) >= MIN_CATEGORISED_PATH_SEGMENTS
 
 
 def classify(text: Optional[str]) -> Optional[Tuple[str, str]]:

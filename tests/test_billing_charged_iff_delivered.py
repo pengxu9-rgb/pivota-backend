@@ -8,13 +8,14 @@ Enforced three ways:
      silently skip the refund).
   2. The refund is idempotent PER RUN + CREDIT KIND (reason excluded from the
      ledger key), so two failure paths reaching the same run can't double-pay.
-  3. /actions/start charges BEFORE drafting and refunds a failed draft (the
-     old order handed out free drafts when the charge failed after the fact).
+  3. /actions/start persists a measured draft, debit and task atomically.
+     Failed generation is never charged; task failure rolls back the transaction.
 
 The free-allowance counter (count_runs_for_merchant_by_subject) excludes
 failed runs for the same reason — a failed audit must not burn a free credit.
 """
 from __future__ import annotations
+from contextlib import asynccontextmanager
 
 import json
 import os
@@ -318,7 +319,7 @@ def actions_env(monkeypatch):
     monkeypatch.setattr(mar_routes, "fetch_audit_run_by_id", fake_fetch)
     monkeypatch.setattr(mar_routes, "consume_credits", fake_consume)
     monkeypatch.setattr(mar_routes, "refund_credits", fake_refund)
-    monkeypatch.setattr(mar_routes, "answer_grounded_question", fake_answer)
+    monkeypatch.setattr(mar_routes, "generate_measured_text", fake_answer)
     monkeypatch.setattr(
         mar_routes, "_build_ask_context", lambda report, pk: {"ctx": 1},
     )
@@ -332,19 +333,33 @@ def actions_env(monkeypatch):
         tasks_db, "find_pending_supersede_candidates", fake_candidates,
     )
     monkeypatch.setattr(tasks_db, "record_task_created", fake_record_task)
+    @asynccontextmanager
+    async def transaction():
+        yield
+    async def execute(*a, **kw):
+        return None
+    monkeypatch.setattr(mar_routes, "database", SimpleNamespace(transaction=transaction, execute=execute))
+    async def measured(**kw):
+        if env.consume_raises:
+            raise env.consume_raises
+        answer = await kw["generate"]()
+        if not answer:
+            raise ValueError("No draft")
+        log.append("consume")
+        return {"answer": answer, "credits_charged": 0.0672}
+    monkeypatch.setattr(mar_routes, "run_measured_generation", measured)
     env.routes = mar_routes
     return env
 
 
 @pytest.mark.asyncio
-async def test_action_draft_charges_before_generating(actions_env):
+async def test_action_draft_charges_measured_usage_after_generating(actions_env):
     out = await actions_env.routes.start_merchant_audit_action(
         _action_body(actions_env.routes), merchant_id="m1",
     )
-    # Order is the invariant: the charge lands before the LLM call, so a
-    # failed/raced charge can never produce a free deliverable.
-    assert actions_env.log.index("consume") < actions_env.log.index("draft")
-    assert out["credits_charged"] == 5
+    # Actual usage is available only after generation; transaction tests cover rollback.
+    assert actions_env.log.index("draft") < actions_env.log.index("consume")
+    assert out["credits_charged"] == 0.0672
     assert out["draft"] == "the draft"
 
 
@@ -355,7 +370,8 @@ async def test_action_draft_refunds_when_generation_fails(actions_env):
         _action_body(actions_env.routes), merchant_id="m1",
     )
     refunds = [e for e in actions_env.log if e.startswith("refund:5:refund:action_draft:")]
-    assert refunds, f"no refund recorded; log={actions_env.log}"
+    assert not refunds
+    assert "consume" not in actions_env.log
     assert out["credits_charged"] == 0
     assert out["draft"] is None
     assert out["task_id"] == "task-1"  # the tracked task is still created
@@ -490,10 +506,15 @@ def ask_env(monkeypatch):
         return True
 
     monkeypatch.setattr(mar_routes, "fetch_audit_run_by_id", fake_fetch)
-    monkeypatch.setattr(mar_routes, "answer_grounded_question", fake_answer)
+    monkeypatch.setattr(mar_routes, "generate_measured_text", fake_answer)
     monkeypatch.setattr(mar_routes, "consume_credits", fake_consume)
     monkeypatch.setattr(mar_routes, "merchant_is_paid_tier", fake_paid)
     monkeypatch.setattr(mar_routes, "estimate_probe_credits", lambda spec: (1, 0))
+    async def measured(**kw):
+        answer = await kw["generate"]()
+        log.append("consume")
+        return {"answer": answer, "credits_charged": 0.0672}
+    monkeypatch.setattr(mar_routes, "run_measured_generation", measured)
     return env
 
 
@@ -557,7 +578,7 @@ async def test_ask_charges_when_it_answers(ask_env):
         _ask_body(ask_env.routes), merchant_id="m1",
     )
     assert ask_env.log == ["answer", "consume"]
-    assert out["credits_charged"] == 1
+    assert out["credits_charged"] == 0.0672
 
 
 def test_the_rebuilt_recovery_projection_carries_actions_for_the_paywall():

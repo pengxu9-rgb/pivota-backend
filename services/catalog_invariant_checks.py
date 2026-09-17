@@ -1,7 +1,10 @@
 """ADR-012 Phase 0b — internal-consistency invariants for the serving surface.
 
-Each invariant is a Postgres count of rows where the SERVED state contradicts
-upstream truth. These are direct correctness checks, deliberately independent
+Most invariants are a Postgres count of rows where the SERVED state contradicts
+upstream truth. A few report a SHARE instead — `count` is then tenths of a
+percent, with the numerator and denominator in `detail`; those declare a
+`runner` and set `count_sql`/`sample_sql` to None, so a share is never restated
+in SQL where it could drift from the Python that computes it. These are direct correctness checks, deliberately independent
 of the completeness-style quality score (which has never caught this class:
 stale-served quarantined stores, shell PDPs, public rows with no offer).
 
@@ -13,12 +16,14 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Any, Dict, List
 
 from sqlalchemy import Boolean, String, and_, column, func, not_, select, table
 
 from db.catalog import catalog_products
 from services.index_pipeline_state_service import QUALITY_SCORE_THRESHOLD
+from services.pdp_category_classifier import CATEGORY_PATTERNS
 from services.offer_currency_policy import is_quarantined_row
 from services.pdp_renderability import compile_pg, pdp_renderable_expression
 from services.identity_join_sql import identity_listing_lateral_sql
@@ -35,6 +40,90 @@ from services.source_quarantine import (
 logger = logging.getLogger(__name__)
 
 _SAMPLE_LIMIT = 5
+
+# --- interior taxonomy nodes, derived from the classifier's own taxonomy ------
+#
+# Recall binds a HARD PREFIX: a "matte lipstick" query resolves `beauty/makeup/lip/`, so a row
+# filed at `beauty/makeup` is an ANCESTOR of that prefix and cannot satisfy it DIRECTLY. It is
+# still reachable — #2122 admits an ancestor row whose own text names the query's category — but
+# only on that weaker path, and without the depth score, so it sorts behind every depth-matched
+# competitor. Measured 2026-09-09: 4,588 serving-eligible rows are in that state.
+#
+# ⚠️ An earlier version of this banner said such a row "can never match" and was "unreachable".
+# That was WRONG: it came from reading page 1 of a 33-result query and treating absence there as
+# absence. Page 2 returns MAC's depth-2 lipsticks. Do not restate the stronger claim.
+#
+# Routability is NOT a depth. `fashion/shoes` and `electronics/ereader` are 2-segment LEAVES that
+# route perfectly well, so the test is whether some canonical path strictly EXTENDS this one.
+# Derived from CATEGORY_PATTERNS rather than restated here, per the banner above _CHECKS: the
+# taxonomy lives in the classifier and a second copy would drift.
+_TAXONOMY_PATHS = frozenset(path for _label, path, _pattern in CATEGORY_PATTERNS)
+_INTERIOR_NODES = frozenset(
+    "/".join(path.split("/")[:i])
+    for path in _TAXONOMY_PATHS
+    for i in range(1, len(path.split("/")))
+)
+# Inlined as a literal list because these are compile-time constants from our own source, not
+# input: every value matches ^[a-z0-9/_-]+$, asserted below so a future taxonomy entry containing
+# a quote cannot turn this into injection.
+assert all(
+    re.fullmatch(r"[a-z0-9/_-]+", node) for node in _INTERIOR_NODES
+), "taxonomy node outside the safe alphabet; do not inline it into SQL"
+_INTERIOR_NODES_SQL = ", ".join("'%s'" % node for node in sorted(_INTERIOR_NODES))
+assert all(
+    re.fullmatch(r"[a-z0-9/_-]+", path) for path in _TAXONOMY_PATHS
+), "taxonomy leaf outside the safe alphabet; do not inline it into SQL"
+
+# The prefixes RECALL ACTUALLY ASKS FOR. `category_path_prefix_for_query` returns the LEAF'S PARENT
+# plus a slash — 'beauty/makeup/lip/' for a lipstick query — and pivot_query_service.py:1144 tests
+# `p.category_path LIKE :category_path_prefix`. 23 of them.
+_LEAF_PARENTS = frozenset(
+    path.rsplit("/", 1)[0] if "/" in path else path for path in _TAXONOMY_PATHS
+)
+
+# ⚠️ NO lower(), NO btrim(). THIS IS THE POINT, and round 2 of review is what taught it.
+#
+# The first version normalised the stored path before testing it. Recall does not: both doors are
+# case-sensitive and neither trims (`LIKE :prefix` at pivot_query_service.py:1144, and #2122's
+# `SUBSTR(:prefix, 1, LENGTH(path)+1) = path || '/'` at :1205-1208). So `Beauty/Makeup` has NO door
+# at all — not even #2122 — and a normalising check filed it under "degraded but rescuable", while a
+# mixed-case LEAF fell into no cohort whatsoever and was reported healthy. A detector that
+# normalises what the system under test does not is measuring a different system.
+#
+# Measured on prod 2026-09-09: ZERO rows are mixed-case, leading-slash or trailing-slash, so this
+# corrects no current number. It corrects the QUESTION, and the first writer to store 'Beauty/...'
+# now lands in the cohort that describes what actually happens to it.
+
+# 1. REACHABLE. The row satisfies some query's hard prefix directly and earns the +90 depth score.
+#    Tested exactly as recall tests it. Note this also admits a row DEEPER than a leaf
+#    ('beauty/makeup/lip/lip_oil'): it matches 'beauty/makeup/lip/%' and is reached. The first
+#    version called 98 such rows unreachable.
+# Built by CONCATENATION, never %-formatting. A LIKE pattern is the one place where writing the
+# SQL through `%` means writing `'%%%%'` to get one wildcard, and every later `%` on the composite
+# halves it again. Review found the first version reaching asyncpg as `LIKE '%%/'` — harmless, since
+# Postgres treats two wildcards as one, but it is a coin-flip away from matching nothing. No format
+# strings here, so the pattern in the source is the pattern that runs.
+_PREFIX_REACHABLE_SQL = "(" + " OR ".join(
+    "cp.category_path LIKE '" + parent + "/%'" for parent in sorted(_LEAF_PARENTS)
+) + ")"
+
+# 2. ANCESTOR-ONLY. Not reachable by prefix, but an exact strict ancestor of one, so #2122 can admit
+#    it IF the row's own text names the category — below every depth-matched competitor, because it
+#    never earns the +90. `_INTERIOR_NODES` is precisely that ancestor set.
+_ANCESTOR_SQL = "cp.category_path IN (" + _INTERIOR_NODES_SQL + ")"
+
+# 3. NO PATH. A DIFFERENT DOOR, which the first version wrongly folded in with the ancestors: a row
+#    with no path is not admitted by #2122 at all (that rule requires
+#    `NULLIF(TRIM(path),'') IS NOT NULL`). It reaches a query only through the brand-gated
+#    `missing_taxonomy` escape at pivot_query_service.py:1353. Different door, different fix,
+#    counted separately.
+_NO_PATH_SQL = "coalesce(btrim(cp.category_path), '') = ''"
+
+# 4. OFF-TAXONOMY. Neither reachable nor an ancestor: NO door at all.
+_UNREACHED_SQL = "NOT (" + _NO_PATH_SQL + ") AND NOT " + _PREFIX_REACHABLE_SQL
+_ANCESTOR_ONLY_SQL = _UNREACHED_SQL + " AND " + _ANCESTOR_SQL
+_OFF_TAXONOMY_SQL = _UNREACHED_SQL + " AND NOT " + _ANCESTOR_SQL
+
 
 # The canonical row->listing join, from services/identity_join_sql. Bound here
 # because Python 3.11 f-string replacement fields cannot span lines, and both
@@ -581,7 +670,398 @@ _DEAD_COMPONENT_SAMPLE_SQL = _DEAD_COMPONENT_CTE + """
     LIMIT 5
 """
 
+# ── offer-grain structural invariants (2026-09-08 inventory) ─────────────────
+#
+# Three states `catalog_offers` must never be in, each measured on prod
+# 2026-09-08 and each with a writer-side fix landing in the same change:
+#
+#   offers_without_sku                         647 live  (writers now mint/refuse)
+#   duplicate_offers_per_sku_channel_market  1,636 rows  (reconciler; no index — see below)
+#   suppressed_product_with_live_offer       2,171 rows  (cascade at the writers)
+#
+# ALL THREE ARE SCOPED TO LIVE OFFERS, and that is a decision rather than an
+# oversight. `scripts/reconcile_catalog_offers.py` remediates by SUPPRESSING,
+# never deleting — an orphan offer is the only surviving record of the writer
+# defect that produced it — so the suppressed rows stay in the table forever. A
+# check counting them too would ship permanently red at the pre-remediation
+# number and could never reach its threshold, which is the "deaf alarm" this
+# module's threshold convention warns about. The question each check asks is
+# "does the SERVED surface contradict itself", and a suppressed row is not on the
+# served surface.
+_OFFERS_WITHOUT_SKU_WHERE = """
+    FROM catalog_offers co
+    WHERE co.suppressed_at IS NULL
+      AND NOT EXISTS (
+            SELECT 1 FROM catalog_skus s WHERE s.sku_key = co.sku_key
+          )
+"""
+
+_OFFERS_WITHOUT_SKU_COUNT_SQL = "SELECT count(*) AS c " + _OFFERS_WITHOUT_SKU_WHERE
+
+_OFFERS_WITHOUT_SKU_SAMPLE_SQL = (
+    "SELECT co.offer_id AS subject_key " + _OFFERS_WITHOUT_SKU_WHERE + " LIMIT 5"
+)
+
+# EXCESS ROWS, not groups. A group of three live offers on one shelf is one
+# index violation and TWO rows that must move, and the remediation is row-grain,
+# so the alarm counts what has to be fixed. The sample projects the sku_key (the
+# shelf), because an offer_id alone would not tell an operator which group it is
+# in. The tuple is (sku_key, channel, market): channel and market are what make
+# two offers different SHELVES rather than duplicates of one.
+_DUPLICATE_OFFERS_CTE = """
+    WITH live_groups AS (
+        SELECT co.sku_key, co.channel, co.market, count(*) AS n
+        FROM catalog_offers co
+        WHERE co.suppressed_at IS NULL
+        GROUP BY co.sku_key, co.channel, co.market
+        HAVING count(*) > 1
+    )
+"""
+
+_DUPLICATE_OFFERS_COUNT_SQL = _DUPLICATE_OFFERS_CTE + """
+    SELECT coalesce(sum(n - 1), 0) AS c FROM live_groups
+"""
+
+_DUPLICATE_OFFERS_SAMPLE_SQL = _DUPLICATE_OFFERS_CTE + """
+    SELECT sku_key AS subject_key
+    FROM live_groups
+    ORDER BY n DESC, sku_key
+    LIMIT 5
+"""
+
+# The cascade check. Anchored on the PRODUCT's gate column and the OFFER's,
+# because they are different columns and nothing propagates between them — there
+# is no trigger, which is the entire reason `services/catalog_offer_suppression`
+# exists.
+_SUPPRESSED_PRODUCT_LIVE_OFFER_WHERE = """
+    FROM catalog_offers co
+    JOIN catalog_products cp ON cp.product_key = co.product_key
+    WHERE co.suppressed_at IS NULL
+      AND cp.suppressed_at IS NOT NULL
+"""
+
+_SUPPRESSED_PRODUCT_LIVE_OFFER_COUNT_SQL = (
+    "SELECT count(*) AS c " + _SUPPRESSED_PRODUCT_LIVE_OFFER_WHERE
+)
+
+_SUPPRESSED_PRODUCT_LIVE_OFFER_SAMPLE_SQL = (
+    "SELECT co.offer_id AS subject_key "
+    + _SUPPRESSED_PRODUCT_LIVE_OFFER_WHERE
+    + " LIMIT 5"
+)
+
+# ── variant identity provenance, per lane ────────────────────────────────────
+# `sku_payload->>'variant_id_provenance'` is the marker
+# `services/variant_identity` defines: merchant_issued (an id we can positively
+# place as the merchant's own), product_derived (one we minted from the product
+# key — never buyable), unverifiable, absent. Live SKUs only, for the same
+# served-surface reason as the three checks above.
+_SKU_PROVENANCE_BY_LANE_SQL = """
+    SELECT s.platform AS lane,
+           count(*) AS skus,
+           count(*) FILTER (
+               WHERE s.sku_payload->>'variant_id_provenance' = 'merchant_issued'
+           ) AS merchant_issued,
+           count(*) FILTER (
+               WHERE s.sku_payload IS NULL
+                  OR s.sku_payload->>'variant_id_provenance' IS NULL
+           ) AS unstamped
+    FROM catalog_skus s
+    WHERE s.suppressed_at IS NULL
+      AND s.suppression_reason IS NULL
+    GROUP BY s.platform
+    ORDER BY count(*) DESC, s.platform
+"""
+
+
+def summarize_identity_provenance(rows: Any) -> Dict[str, Any]:
+    """Per-lane merchant-issued share, WITH the unstamped count beside it.
+
+    THE SHARE ON ITS OWN IS A LIE WHILE THE BACKFILL IS OUTSTANDING, and this is
+    the whole reason the function exists rather than a bare ratio in SQL. Most
+    rows carry no `variant_id_provenance` key at all today — the marker is
+    written by `scripts/backfill_variant_identity_skus.py` and by the writers
+    updated since, so an unstamped row is one nobody has classified, NOT one
+    known to be product-derived. Two shares are therefore reported per lane and
+    neither is allowed to stand alone:
+
+        share_of_all      merchant_issued / skus        — the pessimistic read
+        share_of_stamped  merchant_issued / stamped     — flatters, and is the
+                                                          number a reader will
+                                                          quote unless the
+                                                          denominator is next
+                                                          to it
+
+    `unstamped` is reported per lane so the gap between the two is legible. A
+    lane that is 100% `share_of_stamped` on 12 stamped rows out of 9,000 has told
+    you nothing, and that must be visible in the output rather than inferred.
+
+    `count` — the number the threshold reads — is the LIVE SKUs not positively
+    placed as merchant-issued, which is the honest headline: an id we cannot
+    place is treated exactly as a missing id by everything that spends money.
+    """
+    lanes: List[Dict[str, Any]] = []
+    total = 0
+    total_merchant_issued = 0
+    total_unstamped = 0
+    for row in rows or []:
+        data = dict(row)
+        skus = int(data.get("skus") or 0)
+        merchant_issued = int(data.get("merchant_issued") or 0)
+        unstamped = int(data.get("unstamped") or 0)
+        stamped = skus - unstamped
+        total += skus
+        total_merchant_issued += merchant_issued
+        total_unstamped += unstamped
+        lanes.append({
+            "lane": str(data.get("lane") or "(null)"),
+            "skus": skus,
+            "merchant_issued": merchant_issued,
+            "unstamped": unstamped,
+            "stamped": stamped,
+            "share_of_all": round(merchant_issued / skus, 4) if skus else None,
+            # None, never 0.0, when nothing in the lane is stamped: a lane with
+            # no evidence has no share, and printing 0.0 would read as "measured
+            # and bad" rather than "not measured".
+            "share_of_stamped": (
+                round(merchant_issued / stamped, 4) if stamped else None
+            ),
+        })
+    return {
+        "count": total - total_merchant_issued,
+        "detail": {
+            "lanes": lanes,
+            "skus_live": total,
+            "merchant_issued": total_merchant_issued,
+            "unstamped": total_unstamped,
+            "stamped": total - total_unstamped,
+            "share_of_all": (
+                round(total_merchant_issued / total, 4) if total else None
+            ),
+        },
+    }
+
+
+async def _run_identity_provenance_share(db: Any) -> Dict[str, Any]:
+    rows = await db.fetch_all(_SKU_PROVENANCE_BY_LANE_SQL)
+    outcome = summarize_identity_provenance(rows)
+    lanes = outcome["detail"]["lanes"]
+    # Sample keys are the WORST lanes by share_of_all, so the entry names which
+    # lane to look at rather than five arbitrary sku_keys. A lane with no
+    # share (nothing stamped) sorts worst, which is correct: it is the least
+    # known, not the best.
+    ranked = sorted(
+        lanes,
+        key=lambda lane: (
+            lane["share_of_all"] if lane["share_of_all"] is not None else -1.0,
+            -lane["skus"],
+        ),
+    )
+    return {
+        "count": outcome["count"],
+        "sample_keys": [lane["lane"] for lane in ranked[:_SAMPLE_LIMIT]],
+        "detail": outcome["detail"],
+    }
+
+
+_SERVING_ELIGIBLE_DENOMINATOR_SQL = """
+    SELECT count(*) AS c
+    FROM catalog_products cp
+    JOIN index_pipeline_state ips ON ips.content_key = cp.content_key
+    WHERE ips.serving_eligible
+"""
+
+
+async def _run_taxonomy_share(db: Any, predicate: str, label: str) -> Dict[str, Any]:
+    """A SHARE, in TENTHS OF A PERCENT, not a row count.
+
+    WHY NOT A COUNT. The first version of the interior-node check enforced at the measured 4,588
+    rows. Review pointed out that is a hair trigger on a cohort that is 43.7% of the served
+    catalogue: `nightly_index_health` recomputes serving_eligible for every row every 7,200s from
+    ~13 inputs, so one row promoted onto an interior node moves 4,588 to 4,589 and trips it, and any
+    suppression moves it down and (by this module's own convention) mandates lowering it. A number
+    that must be edited most days is not a ratchet, it is a chore, and a chore gets raised.
+
+    A share is stable under catalogue growth — which is the thing we WANT to happen — and still
+    moves several points when a curated ingest files a whole storefront on one node, which is the
+    thing we want to catch. Tenths of a percent, so ±1 row is rounding noise rather than a trip.
+
+    The raw count and the denominator ride along in `detail` so the number is auditable and nobody
+    has to re-derive it from a percentage.
+    """
+    total = await db.fetch_val(_SERVING_ELIGIBLE_DENOMINATOR_SQL)
+    total = int(total or 0)
+    matched = await db.fetch_val(
+        """
+        SELECT count(*) AS c
+        FROM catalog_products cp
+        JOIN index_pipeline_state ips ON ips.content_key = cp.content_key
+        WHERE ips.serving_eligible AND (%s)
+        """
+        % predicate
+    )
+    matched = int(matched or 0)
+    # An EMPTY serving set is not 0% healthy — there is nothing being served. Report it as such
+    # rather than letting 0/0 read as a clean bill of health.
+    share_tenths = 0 if total == 0 else int(round(1000.0 * matched / total))
+    rows = await db.fetch_all(
+        """
+        SELECT cp.product_key AS subject_key
+        FROM catalog_products cp
+        JOIN index_pipeline_state ips ON ips.content_key = cp.content_key
+        WHERE ips.serving_eligible AND (%s)
+        LIMIT %d
+        """
+        % (predicate, _SAMPLE_LIMIT)
+    )
+    # THE WHOLE PARTITION, every run. A share is only interpretable next to the other buckets, and
+    # the sweep's `violated` log line carries `count` and the description but not much else — so a
+    # reader who sees 402 needs the numerator, the denominator, and what the other 60% are doing.
+    # It also makes the partition self-checking: these four are exhaustive and disjoint by
+    # construction, and `partition_total` says so out loud rather than leaving it to a test.
+    buckets = {}
+    for name, predicate in (
+        ("prefix_reachable", _PREFIX_REACHABLE_SQL + " AND NOT (" + _NO_PATH_SQL + ")"),
+        ("ancestor_only", _ANCESTOR_ONLY_SQL),
+        ("off_taxonomy", _OFF_TAXONOMY_SQL),
+        ("no_path", _NO_PATH_SQL),
+    ):
+        buckets[name] = int(
+            await db.fetch_val(
+                "SELECT count(*) AS c FROM catalog_products cp"
+                " JOIN index_pipeline_state ips ON ips.content_key = cp.content_key"
+                " WHERE ips.serving_eligible AND (%s)" % predicate
+            )
+            or 0
+        )
+    return {
+        "count": share_tenths,
+        "sample_keys": [r["subject_key"] for r in rows],
+        "detail": {
+            "unit": "tenths_of_a_percent_of_serving_eligible",
+            "label": label,
+            "matched_rows": matched,
+            "serving_eligible_rows": total,
+            "share_pct": None if total == 0 else round(100.0 * matched / total, 2),
+            "serving_set_empty": total == 0,
+            "buckets": buckets,
+            "partition_total": sum(buckets.values()),
+            # If these disagree, the four predicates have stopped partitioning the serving set and
+            # every share on this page is describing an overlapping or incomplete population.
+            "partition_is_exhaustive": sum(buckets.values()) == total,
+        },
+    }
+
+
+async def _run_ancestor_only_share(db: Any) -> Dict[str, Any]:
+    return await _run_taxonomy_share(db, _ANCESTOR_ONLY_SQL, "ancestor_only")
+
+
+async def _run_off_taxonomy_share(db: Any) -> Dict[str, Any]:
+    return await _run_taxonomy_share(db, _OFF_TAXONOMY_SQL, "off_taxonomy")
+
+
+async def _run_no_path_share(db: Any) -> Dict[str, Any]:
+    return await _run_taxonomy_share(db, _NO_PATH_SQL, "no_path")
+
+
+async def _run_taxonomy_code_vs_table_drift(db: Any) -> Dict[str, Any]:
+    """Does this repo's in-code vocabulary still match the shared `category_taxonomy` table?
+
+    THE TABLE EXISTS BECAUSE TWO REPOS KEPT TWO VOCABULARIES over one column and each read the
+    other's rows as corruption. Moving the vocabulary into data does not by itself stop that: both
+    services deploy independently of a row change, so code and table WILL drift. The difference is
+    that drift is now observable, and this is what observes it.
+
+    Counts paths in exactly one of the two, in either direction:
+      * in code, absent from the table  — this service will classify rows onto a path the other
+        service does not recognise. Exactly how the 315 toners happened.
+      * in the table, absent from code  — most likely the OTHER service added a category and this
+        one cannot classify into it, so the rows arrive and are never matched here.
+
+    Threshold 0: there is no acceptable number. If the table is unreachable the check reports the
+    error rather than 0 — an unreadable shared vocabulary is not agreement.
+    """
+    from services.category_path_aliases import (
+        ALIASES,
+        ANCESTOR_NODES,
+        TAXONOMY_GAPS,
+        TAXONOMY_LEAVES,
+    )
+    from services.category_taxonomy_store import TaxonomyUnavailable, load
+
+    try:
+        table = await load(db, refresh=True)
+    except TaxonomyUnavailable as exc:
+        return {
+            "count": 1,
+            "sample_keys": [],
+            "detail": {"error": str(exc), "table_readable": False},
+        }
+    code_canonical = set(TAXONOMY_LEAVES) | set(ANCESTOR_NODES)
+    table_canonical = set(table["leaves"]) | set(table["interior"])
+    only_code = sorted(code_canonical - table_canonical)
+    only_table = sorted(table_canonical - code_canonical)
+    # An alias disagreement is as bad as a missing path: the same spelling resolving two ways is
+    # how one service repairs what the other just wrote.
+    alias_conflicts = sorted(
+        "%s: code=%s table=%s" % (src, tgt, table["aliases"].get(src))
+        for src, tgt in ALIASES.items()
+        if table["aliases"].get(src) not in (None, tgt)
+    )
+    # AND aliases the TABLE has that the code does not — the direction the first version of this
+    # check could not see, because it only iterated the code's own map.
+    #
+    # ⚠️ BE PRECISE ABOUT THE RISK. `category_taxonomy` has NO runtime reader on either side today:
+    # this repo's only caller of `category_taxonomy_store.load` is this check, and PIVOTA-Agent has
+    # no SQL against the table at all. The seven paths were collapsed through this repo's in-code
+    # ALIASES via the backfill, NOT through a table row. So a stale alias here is a loaded gun with
+    # nobody yet holding it: harmless until the first reader exists, and the reason to clear it
+    # BEFORE building one, not evidence that something is acting on it now.
+    stale_aliases = sorted(
+        "%s -> %s (table only%s)" % (src, tgt, "; now a declared GAP here" if src in TAXONOMY_GAPS else "")
+        for src, tgt in table["aliases"].items()
+        if src not in ALIASES
+    )
+    violations = only_code + only_table + alias_conflicts + stale_aliases
+    return {
+        "count": len(violations),
+        "sample_keys": violations[:_SAMPLE_LIMIT],
+        "detail": {
+            "in_code_not_in_table": only_code[:20],
+            "in_table_not_in_code": only_table[:20],
+            "alias_conflicts": alias_conflicts[:20],
+            "stale_table_aliases": stale_aliases[:20],
+            "code_paths": len(code_canonical),
+            "table_paths": len(table_canonical),
+            "table_readable": True,
+        },
+    }
+
+
 _CHECKS: List[Dict[str, Any]] = [
+    {
+        # THE DETECTOR THAT MAKES THE SHARED TABLE SAFE. Moving the vocabulary into
+        # `category_taxonomy` gives both services one place to read; it does not stop them
+        # deploying independently of a row change. Code and table will drift. The 2026-09-10
+        # incident was drift that nobody could see — this repo classifying onto `treat/toner`
+        # while the gateway wrote `tone/toner`, each reading the other's rows as corruption.
+        #
+        # Threshold 0, in both directions. A path this repo knows and the table does not means we
+        # are about to write something the other service cannot read; a path the table knows and
+        # this repo does not means the other service already is.
+        "name": "taxonomy_code_vs_table_drift",
+        "description": (
+            "paths present in this repo's CATEGORY_PATTERNS/alias map but not in the shared "
+            "category_taxonomy table, or the reverse, or an alias resolving two different ways — "
+            "two vocabularies over one column is how a deliberate write becomes 'corruption'"
+        ),
+        "env": "CATALOG_INVARIANT_TAXONOMY_DRIFT_THRESHOLD",
+        "default_threshold": 0,
+        "count_sql": None,
+        "sample_sql": None,
+        "runner": _run_taxonomy_code_vs_table_drift,
+    },
     {
         # P1a (#1648). `suppressed_at` is THE gate column — every SQL lane, IPS
         # (`index_pipeline_state_service`: `row_suppressed = suppressed_at is
@@ -1404,6 +1884,230 @@ _CHECKS: List[Dict[str, Any]] = [
             LIMIT 5
         """,
     },
+    {
+        # 2,139 offers (6.5% of the table), 647 of them LIVE, named a sku_key
+        # with no catalog_skus row on prod 2026-09-08 — all external-referral,
+        # all `<product_key>::canonical`, all from two writers
+        # (`us_market_capture` 529 live, `retailer_offer_attach_v1` 118 live)
+        # that build and execute their own INSERT and so never reached
+        # `services/catalog_offer_writer_guard.guard_catalog_offer_rows`, which
+        # has known how to say ORPHAN_NO_SKU the whole time.
+        #
+        # WHY IT MATTERS RATHER THAN BEING UNTIDY: `pivot_query_service` INNER
+        # JOINs catalog_skus, so an orphan offer is invisible to the read lanes —
+        # while remaining fully visible to everything that reads catalog_offers
+        # alone (the price gate, the PDP assembler's offer fetch). It is supply
+        # that both exists and does not, depending on which door asks.
+        #
+        # Threshold 0: both writers now either mint the canonical SKU (capture)
+        # or refuse the offer (attach), so there is no acceptable number here.
+        # LIVE offers only — see the note above the SQL for why counting
+        # suppressed ones would ship a permanently red check.
+        "name": "offers_without_sku",
+        "description": (
+            "a LIVE catalog_offers row names a sku_key with no catalog_skus row "
+            "— invisible to every sku-joined read lane, still counted as supply "
+            "by every offer-only one"
+        ),
+        "env": "CATALOG_INVARIANT_ORPHAN_OFFER_THRESHOLD",
+        "default_threshold": 0,
+        "count_sql": _OFFERS_WITHOUT_SKU_COUNT_SQL,
+        "sample_sql": _OFFERS_WITHOUT_SKU_SAMPLE_SQL,
+    },
+    {
+        # 1,636 duplicate offers across 462 (sku_key, channel, market) groups on
+        # prod 2026-09-08. There is no unique index on that tuple, so two
+        # writers — or one writer under two offer_id namespaces — can both claim
+        # one shelf, and whichever surface reads "the offer" picks by sort order.
+        # That is a silently wrong PRICE, not a duplicate row: the two rows do
+        # not have to agree, and nothing makes them.
+        #
+        # A UNIQUE INDEX ON THE TUPLE IS UNBUILDABLE TODAY, and this check is the
+        # standing alarm precisely because of that. Every INSERT INTO
+        # catalog_offers in the repo arbitrates on `(offer_id)` alone, and the
+        # mirror, the US-market capture and the retailer attach write THE SAME
+        # SHELF under three different offer_id namespaces — which is what the 462
+        # groups are. With a unique index in place the second lane's ON CONFLICT
+        # (offer_id) would not fire and its INSERT would raise 23505 mid-batch
+        # (reproduced on real Postgres), so the index cannot land until those
+        # lanes converge on one offer_id namespace per shelf. That convergence is
+        # a change to the WRITERS, not something a reconciler can reach by
+        # draining rows. Threshold 0 here gives the same signal the index would
+        # — red the moment two lanes claim one shelf — without the failure mode.
+        # scripts/reconcile_catalog_offers.py drains the standing stock.
+        "name": "duplicate_offers_per_sku_channel_market",
+        "description": (
+            "more than one LIVE offer on the same (sku_key, channel, market) — "
+            "counted as EXCESS ROWS, the number that must move, not as groups"
+        ),
+        "env": "CATALOG_INVARIANT_DUPLICATE_OFFER_THRESHOLD",
+        "default_threshold": 0,
+        "count_sql": _DUPLICATE_OFFERS_COUNT_SQL,
+        "sample_sql": _DUPLICATE_OFFERS_SAMPLE_SQL,
+    },
+    {
+        # 2,171 suppressed products carried unsuppressed offers on prod
+        # 2026-09-08. `catalog_products.suppressed_at` gates the PRODUCT;
+        # `catalog_offers.suppressed_at` is a DIFFERENT column and is the one
+        # every offer-grain read lane filters on (priced_offer_sql,
+        # fetch_offers_for_keys, the recall candidate CTE). Nothing propagates
+        # between them — there is no trigger — so a writer that tombstones a
+        # product and stops leaves live, priced supply behind for a row nothing
+        # else will serve.
+        #
+        # `services/catalog_offer_suppression` now cascades at five writers, so
+        # this counts REGROWTH: a sixth writer, or a new one, that suppresses a
+        # product without going through it.
+        "name": "suppressed_product_with_live_offer",
+        "description": (
+            "the product is suppressed and one of its offers is not — the "
+            "product's gate column and the offer's are different columns and "
+            "nothing propagates between them"
+        ),
+        "env": "CATALOG_INVARIANT_SUPPRESSION_CASCADE_THRESHOLD",
+        "default_threshold": 0,
+        "count_sql": _SUPPRESSED_PRODUCT_LIVE_OFFER_COUNT_SQL,
+        "sample_sql": _SUPPRESSED_PRODUCT_LIVE_OFFER_SAMPLE_SQL,
+    },
+    {
+        # WARN-ONLY, AND THAT IS NOT THE SAME AS OFF. Threshold 0 with
+        # `warn_only` is this module's honest pair when the true count is far
+        # from zero for a REASON THAT IS ALREADY BEING WORKED: the variant
+        # identity provenance backfill (#2113: 11,811 SKUs restate the product
+        # id, 1,473 are `<epid>-default`, 2,546 recoverable / 6,148 need a
+        # crawl). Enforcing at 0 today ships permanently red; raising the
+        # threshold to the current count blesses exactly the rows the arc exists
+        # to fix and buys that many rows of head-room for the next writer that
+        # fabricates identity. So it reports its count, its per-lane detail and
+        # its samples exactly as an enforcing check does, and produces no
+        # verdict. PROMOTION IS ONE DELETED KEY — remove `warn_only` when the
+        # backfill lands.
+        #
+        # THE SHARE IS PER LANE and the UNSTAMPED COUNT IS REPORTED BESIDE IT.
+        # A corpus-wide share hides the lane structure (the same mistake
+        # `dead_quality_component` had to be re-cut for on 2026-09-02, when one
+        # Wix store's 1,960 snapshots were read as the corpus), and a share
+        # computed over stamped rows alone climbs toward 100% simply because
+        # most rows are unclassified. `summarize_identity_provenance` reports
+        # share_of_all, share_of_stamped and unstamped together for exactly that
+        # reason; read them together.
+        "name": "skus_without_merchant_issued_identity_share",
+        "description": (
+            "live SKUs whose sku_payload->>'variant_id_provenance' is not "
+            "'merchant_issued', per lane, with the UNSTAMPED count beside the "
+            "share so it cannot be read as a measured 100%"
+        ),
+        "env": "CATALOG_INVARIANT_IDENTITY_PROVENANCE_THRESHOLD",
+        "default_threshold": 0,
+        "warn_only": True,
+        # No count_sql/sample_sql: the two shares and their denominators are
+        # Python and must not be restated in SQL. Same shape as
+        # market_currency_disagreement — see the banner above _CHECKS.
+        "count_sql": None,
+        "sample_sql": None,
+        "runner": _run_identity_provenance_share,
+    },
+    {
+        # RECALL HAS FOUR DOORS AND THESE CHECKS COUNT WHO IS BEHIND WHICH ONE. Serving-eligible
+        # rows partition exhaustively into:
+        #
+        #   prefix_reachable  5,211  49.6%  matches a query prefix directly, earns the +90
+        #   ancestor_only     4,004  38.1%  #2122 only: needs the category word in its own text,
+        #                                   never earns the depth score, sorts behind every
+        #                                   depth-matched competitor
+        #   off_taxonomy        710   6.8%  NO door
+        #   no_path             584   5.6%  brand-gated `missing_taxonomy` escape only
+        #                    ------  -----
+        #                    10,509   100%   (measured on prod 2026-09-09; the runner re-checks
+        #                                     that the four still sum to the denominator)
+        #
+        # ⚠️ THIS DOES NOT CLAIM ANY ROW IS UNREACHABLE. An earlier version did, and it was wrong in
+        # the way this module exists to prevent: the claim came from reading page 1 of a 33-result
+        # query. Page 2 had the rows. Every cohort above except off_taxonomy has a door; what they
+        # lack is the depth score.
+        "name": "serving_eligible_ancestor_only_taxonomy_node",
+        "description": (
+            "SHARE (tenths of a percent) of serving-eligible rows whose category_path is a strict "
+            "ANCESTOR of a query prefix but does not match one — admitted only by #2122, which "
+            "needs the category word in the row's own text and never earns the depth score"
+        ),
+        "env": "CATALOG_INVARIANT_ANCESTOR_ONLY_SHARE_TENTHS",
+        # Measured 2026-09-09: 4,004 of 10,509 = 38.10% = 381 tenths. Enforcing at 400 (40.0%).
+        #
+        # WHAT 400 ACTUALLY CATCHES, stated because the previous version promised something its
+        # number could not deliver. At today's denominator it trips when roughly 330 more rows land
+        # on an ancestor node. Concretely, against the curated ingests this lane has run:
+        #   Flower Beauty  49 rows -> 384   no trip
+        #   Stila         124 rows -> 388   no trip
+        #   Tarte         231 rows -> 394   no trip
+        #   315 rows (the toner cohort's size) -> 399   no trip, barely
+        # So it does NOT catch one small storefront, and claiming otherwise would be the third
+        # overclaim in this file's history. It catches a multi-hundred-row regression, or two
+        # storefronts back to back. A tighter number is not available: promoting ~100 ancestor rows
+        # is ordinary churn and moves this 7 tenths, so anything under ~390 would flap and get
+        # raised, which is how a ratchet dies. Lower it as #2158/#2159 converge the taxonomy.
+        "default_threshold": 400,
+        # No count_sql/sample_sql: the share and its denominator are computed in Python and must not
+        # be restated in SQL. Same shape as skus_without_merchant_issued_identity_share.
+        "count_sql": None,
+        "sample_sql": None,
+        "runner": _run_ancestor_only_share,
+    },
+    {
+        # THE ONLY COHORT WITH NO DOOR, and the one the first version of this work could not see.
+        # Review asked what happens to a path that is neither a leaf nor an ancestor of one.
+        #
+        #   beauty/skincare/tone/toner       315 rows   real: beauty/skincare/treat/toner
+        #   beauty/skincare/sets              49 rows
+        #   beauty/makeup/nails/nail-polish   37 rows
+        #   beauty/skincare/eye-care          31 rows
+        #   beauty/makeup/lips/lip-balm       12 rows   real: beauty/makeup/lip/balm
+        #   beauty/makeup/lips/lip-gloss       9 rows   real: beauty/makeup/lip/gloss
+        #
+        # One wrong segment. It cannot match the hard prefix, and #2122 cannot rescue it either —
+        # that rule needs the stored path to be a strict ANCESTOR of the prefix, and a sibling typo
+        # is not an ancestor. Category recall never returns it; it surfaces only if the trigram text
+        # scan happens to pick it up.
+        #
+        # `onboard_curated_brands --category` validates nothing against CATEGORY_PATTERNS, which is
+        # how one typo got written 315 times. Validating at the writer is the actual fix and belongs
+        # with #2158/#2159; this counts the cohort meanwhile so it cannot grow silently again.
+        "name": "serving_eligible_off_taxonomy_path",
+        "description": (
+            "SHARE (tenths of a percent) of serving-eligible rows on a category_path that is "
+            "NEITHER matched by a query prefix NOR a strict ancestor of one — no depth match and "
+            "no #2122 admission, so category recall never returns them"
+        ),
+        "env": "CATALOG_INVARIANT_OFF_TAXONOMY_SHARE_TENTHS",
+        # Measured 2026-09-09: 710 of 10,509 = 6.76% = 68 tenths. Enforcing at 75 (7.5%), which
+        # trips on roughly 80 more rows — smaller than any of the typo cohorts above, so a newly
+        # mis-filed storefront does trip this one.
+        "default_threshold": 75,
+        "count_sql": None,
+        "sample_sql": None,
+        "runner": _run_off_taxonomy_share,
+    },
+    {
+        # A DIFFERENT DOOR, which is why it is not folded in with the ancestors: #2122 explicitly
+        # requires `NULLIF(TRIM(p.category_path, '')) IS NOT NULL`, so a row with no path is not
+        # admitted by it at all. It reaches a query only through the brand-gated `missing_taxonomy`
+        # escape (pivot_query_service.py:1353) — i.e. only when the query names the brand.
+        #
+        # The first version counted these 584 rows inside the interior cohort and described the
+        # whole 4,588 as "reachable via #2122 ancestor admission". That was false for 584 of them.
+        "name": "serving_eligible_with_no_category_path",
+        "description": (
+            "SHARE (tenths of a percent) of serving-eligible rows with a NULL or blank "
+            "category_path — no prefix match and no #2122 admission (that rule requires a "
+            "non-empty path); reachable only through the brand-gated missing_taxonomy escape"
+        ),
+        "env": "CATALOG_INVARIANT_NO_CATEGORY_PATH_SHARE_TENTHS",
+        # Measured 2026-09-09: 584 of 10,509 = 5.56% = 56 tenths. Enforcing at 62 (6.2%).
+        "default_threshold": 62,
+        "count_sql": None,
+        "sample_sql": None,
+        "runner": _run_no_path_share,
+    },
 ]
 
 
@@ -1483,6 +2187,7 @@ async def run_catalog_invariant_checks(db: Any) -> Dict[str, Any]:
     results: List[Dict[str, Any]] = []
     violated = 0
     warned = 0
+    errored = 0
     for check in _CHECKS:
         entry: Dict[str, Any] = {
             "name": check["name"],
@@ -1525,5 +2230,30 @@ async def run_catalog_invariant_checks(db: Any) -> Dict[str, Any]:
         except Exception as exc:  # noqa: BLE001 — one bad check must not sink the sweep
             logger.exception("catalog_invariants: check %s failed", check["name"])
             entry["error"] = str(exc)
+            errored += 1
         results.append(entry)
-    return {"violated_count": violated, "warned_count": warned, "checks": results}
+    # ERRORED IS ITS OWN COUNTER, and until 2026-09-10 it was no counter at all.
+    #
+    # ⚠️ IT IS NOT A FOURTH EXCLUSIVE STATE, and an earlier version of this comment implied it was.
+    # The tally above runs BEFORE sampling, deliberately (see the 2026-09-02 note): the COUNT is
+    # the verdict, so a sample fetch that raises must not erase a real violation from the totals.
+    # The consequence is that a check which raises while SAMPLING is counted in both `violated` and
+    # `errored` — 21 of 27 in a probe where every `fetch_all` raised. That is intended: the finding
+    # is real and the error is only in fetching examples of it. What is NOT intended is reading the
+    # summary as 27 checks partitioned four ways; `errored` overlaps the other two by design.
+    #
+    # A check that raises gets `error` and NO `count`, `threshold` or `violated` key. The summary
+    # counted violations and warnings only, so a broken check read exactly like a passing one:
+    # "27 checks, 0 violated". Measured on 2026-09-10, three share-based checks had been raising
+    # AttributeError in a unit fake since the day they merged and the file was green throughout;
+    # a fourth followed. Nothing anywhere — no alert policy, no log metric — mentioned the state.
+    #
+    # An unrunnable check is not a passing check. It is the same defect as a green light over a
+    # broken thing, which is the entire subject of this module.
+    return {
+        "violated_count": violated,
+        "warned_count": warned,
+        "errored_count": errored,
+        "errored": sorted(c["name"] for c in results if c.get("error")),
+        "checks": results,
+    }

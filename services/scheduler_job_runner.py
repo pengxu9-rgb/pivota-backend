@@ -17,10 +17,11 @@ scheduler jobs (and the startup-spawned retry workers) share ONE
 
 Two consequences follow, both reproduced on real Postgres:
 
-* a job's `database.transaction()` issues BEGIN outside `_query_lock`, so it
-  collides with another job's in-flight query (`another operation is in
-  progress`); asyncpg had already set `_top_xact`, so every later transaction
-  on that connection issues SAVEPOINT on an idle session — the exact
+* a job's `database.transaction()` issued BEGIN outside `_query_lock` (0.7.0;
+  `db.database` now takes that lock), so it collided with another job's
+  in-flight query (`another operation is in progress`); asyncpg had already set
+  `_top_xact`, so every later transaction on that connection issued SAVEPOINT
+  on an idle session — the exact
   `SAVEPOINT can only be used in transaction blocks` burst in the Postgres log
   — and `databases` leaks the connection counter, so the raw connection is
   never returned to the pool;

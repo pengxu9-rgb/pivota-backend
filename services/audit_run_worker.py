@@ -31,6 +31,8 @@ Resume semantics:
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 import logging
 import asyncio
 import os
@@ -621,6 +623,31 @@ async def _process_one_audit_run_inner(
                         audit_run_id=run_id,
                         prior_runs=prior_runs,
                     )
+                consumer_plan = launch_options.get("consumer_capture_plan")
+                if consumer_plan:
+                    from services.consumer_capture_worker import (
+                        capture_for_leased_run, observations_for_capture, CaptureCheckpointRejected,
+                    )
+                    latest = await mar.fetch_audit_run_by_id(run_id=run_id)
+                    partial = (latest or {}).get("partial_result_jsonb") or {}
+                    try:
+                        captured = await capture_for_leased_run(
+                            run_id=run_id, merchant_id=merchant_id, worker_id=WORKER_ID,
+                            plan=consumer_plan, retained=partial.get("consumer_capture"),
+                        )
+                    except CaptureCheckpointRejected:
+                        # Another owner/cancellation must not trigger our refund
+                        # path or let this stale worker advance the report.
+                        logger.warning("consumer capture checkpoint rejected run_id=%s", run_id)
+                        return True
+                    brand_report["consumer_selection_observations"] = observations_for_capture(
+                        consumer_plan, captured, merchant_brand=str(merchant_name), merchant_host=merchant_domain,
+                    )
+                    brand_report["consumer_capture_summary"] = {
+                        "plan_sha256": consumer_plan["sha256"],
+                        "attempted": len(consumer_plan["jobs"]),
+                        "uncertain": sum(v.get("status") == "started" for v in captured["jobs"].values()),
+                    }
             finally:
                 heartbeat_task.cancel()
                 # Don't await — fire-and-forget cancellation.
@@ -854,13 +881,20 @@ async def _process_one_audit_run_inner(
                         ),
                     }},
                 )
-                ok = await mar.transition_stage(
-                    run_id=run_id,
-                    from_stage=mar.STAGE_VERIFYING,
-                    to_stage=mar.STAGE_COMPLETED,
-                    worker_id=WORKER_ID,
-                    cost_summary_jsonb=cost_summary,
-                )
+                if launch_options.get("consumer_capture_plan"):
+                    from services.consumer_capture_settlement import complete_with_refund
+                    ok = await complete_with_refund(
+                        run_id=run_id, merchant_id=merchant_id, worker_id=WORKER_ID,
+                        launch=launch_options, report=brand_report, cost_summary=cost_summary,
+                    )
+                else:
+                    ok = await mar.transition_stage(
+                        run_id=run_id,
+                        from_stage=mar.STAGE_VERIFYING,
+                        to_stage=mar.STAGE_COMPLETED,
+                        worker_id=WORKER_ID,
+                        cost_summary_jsonb=cost_summary,
+                    )
                 if ok:
                     from services.agent_center_bd_report_service import (
                         clear_synthetic_sku_contexts,
@@ -1063,13 +1097,20 @@ async def _process_one_audit_run_inner(
             # line, projections are warm + verifications are
             # enqueued. The transition is the atomic "this audit
             # is done" commit point.
-            ok = await mar.transition_stage(
-                run_id=run_id,
-                from_stage=mar.STAGE_VERIFYING,
-                to_stage=mar.STAGE_COMPLETED,
-                worker_id=WORKER_ID,
-                cost_summary_jsonb=cost_summary,
-            )
+            if launch_options.get("consumer_capture_plan"):
+                from services.consumer_capture_settlement import complete_with_refund
+                ok = await complete_with_refund(
+                    run_id=run_id, merchant_id=merchant_id, worker_id=WORKER_ID,
+                    launch=launch_options, report=brand_report, cost_summary=cost_summary,
+                )
+            else:
+                ok = await mar.transition_stage(
+                    run_id=run_id,
+                    from_stage=mar.STAGE_VERIFYING,
+                    to_stage=mar.STAGE_COMPLETED,
+                    worker_id=WORKER_ID,
+                    cost_summary_jsonb=cost_summary,
+                )
             if not ok:
                 return True
             current_stage = mar.STAGE_COMPLETED
@@ -1281,7 +1322,7 @@ async def _refund_launch_debits(
         if not kind or amount <= 0:
             continue
         try:
-            purchased_credits = int(item.get("purchased_credits") or 0)
+            purchased_credits = Decimal(str(item.get("purchased_credits") or 0))
         except (TypeError, ValueError):
             purchased_credits = 0
         try:
@@ -1763,15 +1804,12 @@ async def _materialize_tasks_and_executors(
     summary: Dict[str, Any] = {
         "tasks_materialized": 0, "executors_dispatched": 0,
     }
-    # W5: dispatch_only (URL-audit) skips task-queue materialization + outreach
-    # reverification — the url-audit's advisory plan already lives in each
-    # per_sku report's next_best_action, and those paths are connected-store
-    # oriented. Only the report-only executor dispatch below runs.
+    # URL audits retain their advisory plan without materializing store tasks.
+    # Existing merchant outreach is rechecked for both URL and catalog audits.
     if not dispatch_only:
         try:
             from services.task_queue_service import (
                 materialize_tasks_from_audit,
-                reverify_outreach_records,
             )
             tasks_summary = await materialize_tasks_from_audit(
                 merchant_id=merchant_id,
@@ -1785,18 +1823,21 @@ async def _materialize_tasks_and_executors(
                     or tasks_summary.get("count")
                     or 0
                 )
-            # Outreach Step 2 — close the loop: flip any pitched host that now
-            # cites us to 'cited' (the proof). Best-effort; never sinks the audit.
-            outreach_summary = await reverify_outreach_records(
-                merchant_id=merchant_id, run_id=run_id, audit_report=brand_report,
-            )
-            if isinstance(outreach_summary, dict) and outreach_summary.get("flipped"):
-                summary["outreach_cited"] = outreach_summary["flipped"]
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "audit_run_worker: task materialization failed "
                 "for run_id=%s: %s", run_id, exc,
             )
+
+    try:
+        from services.task_queue_service import reverify_outreach_records
+        outreach_summary = await reverify_outreach_records(
+            merchant_id=merchant_id, run_id=run_id, audit_report=brand_report,
+        )
+        if isinstance(outreach_summary, dict) and outreach_summary.get("flipped"):
+            summary["outreach_cited"] = outreach_summary["flipped"]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("audit_run_worker: outreach reverify failed run=%s: %s", run_id, exc)
 
     try:
         from services.executor_agents.base import ExecutorContext

@@ -12,12 +12,14 @@ import hashlib
 import json
 import os
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import stripe
 from databases import Database
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
+from fastapi.encoders import jsonable_encoder
 from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
@@ -216,7 +218,8 @@ async def get_my_current_billing_period(
     merchant_id = _as_text(merchant.get("merchant_id"))
     if not merchant_id:
         raise HTTPException(status_code=400, detail="Authenticated merchant is missing merchant_id")
-    return await monthly_brand_statements_service.current_period_usage_snapshot(merchant_id)
+    snapshot = await monthly_brand_statements_service.current_period_usage_snapshot(merchant_id)
+    return jsonable_encoder(snapshot, custom_encoder={Decimal: float})
 
 
 @router.get("/api/billing/me/statements")
@@ -234,7 +237,7 @@ async def list_my_billing_statements(
         merchant_id=merchant_id,
         limit=capped_limit,
     )
-    return {"statements": statements}
+    return jsonable_encoder({"statements": statements}, custom_encoder={Decimal: float})
 
 
 @router.get("/api/billing/plans")

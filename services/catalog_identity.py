@@ -33,7 +33,7 @@ import os
 import re
 import unicodedata
 from dataclasses import dataclass
-from typing import Mapping, Optional
+from typing import Any, Mapping, Optional
 
 
 _KEY_PREFIX = "ck_"
@@ -300,3 +300,22 @@ def resolve_deposit_content_key_for_row(
         review_state=_get("review_state", "identity_review_state"),
         min_confidence=min_confidence,
     )
+
+
+def validated_source_gtin(value: Any) -> Optional[str]:
+    """Only GS1-shaped, check-digit-valid observations earn a recovered match key.
+
+    normalize_gtin owns normalization; its legacy padding alone also accepts a
+    one-digit supplier code, so this new observation boundary validates first.
+    Existing feed barcodes are not rewritten or reinterpreted here.
+    """
+    if not isinstance(value, str):
+        return None
+    digits = re.sub(r"[\s-]+", "", value)
+    if (not re.fullmatch(r"[0-9]+", digits) or len(digits) not in {8, 12, 13, 14}
+            or not any(d != "0" for d in digits)):
+        return None
+    weighted = sum(int(d) * (3 if i % 2 == 0 else 1) for i, d in enumerate(reversed(digits[:-1])))
+    if (10 - weighted % 10) % 10 != int(digits[-1]):
+        return None
+    return normalize_gtin(digits) or None

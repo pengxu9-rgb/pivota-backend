@@ -4,14 +4,17 @@ from sqlalchemy import (
     REAL,
     BigInteger,
     Boolean,
+    CheckConstraint,
     Column,
     DateTime,
+    ForeignKey,
     Index,
     Integer,
     Numeric,
     String,
     Table,
     Text,
+    text,
 )
 from sqlalchemy.sql import expression, func
 
@@ -200,6 +203,15 @@ catalog_products = Table(
     Column("content_changed_at", DateTime, server_default=func.now(), nullable=False),
     Column("created_at", DateTime, server_default=func.now(), nullable=False),
     Column("updated_at", DateTime, server_default=func.now(), nullable=False),
+    # mig 223. Mirror provenance lookup: the reconciler and sync_offer_for_seed
+    # both locate a seed's mirror row by (source_ref, source_system). See the
+    # catalog_offers twin below.
+    Index(
+        "idx_catalog_products_source_ref_system",
+        "source_ref",
+        "source_system",
+        postgresql_where=Column("source_ref").isnot(None),
+    ),
     Index(
         "idx_catalog_products_source_identity",
         "merchant_id",
@@ -314,6 +326,17 @@ catalog_offers = Table(
     Column("created_at", DateTime, server_default=func.now(), nullable=False),
     Column("updated_at", DateTime, server_default=func.now(), nullable=False),
     Index("idx_catalog_offers_merchant_track", "merchant_id", "catalog_track"),
+    # mig 223. The external-seed mirror reconciler joins
+    # (source_ref, source_system) to find drifted / missing mirror offers.
+    # Without this the reconciler's first query was a seq scan and it timed out
+    # on prod, so the repair path had never run once. Partial because source_ref
+    # is null on every non-mirror row.
+    Index(
+        "idx_catalog_offers_source_ref_system",
+        "source_ref",
+        "source_system",
+        postgresql_where=Column("source_ref").isnot(None),
+    ),
 )
 
 
@@ -533,6 +556,17 @@ checkout_preflight_observations = Table(
     # running the dialect gate in order, where another file's create_all builds this table
     # first and a tz-aware bind then fails with "can't subtract offset-naive and offset-aware".
     Column("created_at", DateTime(timezone=True), server_default=func.now(), nullable=False),
+    # WHERE the row came from, and WHICH run wrote it. Both live in the MODEL and not only in
+    # db/migrations/220, because `web` deploys with SKIP_HEAVY_STARTUP_INIT and never runs the
+    # migration directory at all — `metadata.create_all` above is what actually builds this table
+    # on production, exactly as the `created_at` note explains. A column added to the migration
+    # alone would not exist in prod, and `record()` swallows its own failures, so shadow mode
+    # would stop recording with nothing but a dropped log line to show for it.
+    Column("source", String(32), nullable=False, server_default="live"),
+    # Nullable and untagged for live traffic; a sweep stamps every row of one pass with the same
+    # value so a run that aborted part-way can be excluded from the window instead of poisoning
+    # it. Without it a partial sweep is indistinguishable from a good one.
+    Column("run_id", String(64), nullable=True, index=True),
     Column("mode", String(16), nullable=False),
     Column("outcome", String(16), nullable=False),
     # The decision the ENFORCING gate WOULD have made, recorded while it is not enforcing.
@@ -752,4 +786,53 @@ agent_pdp_view = Table(
         "brand",
         postgresql_where=Column("brand").isnot(None),
     ),
+)
+
+# --- category_taxonomy: ONE vocabulary, read by BOTH services ----------------------------------
+#
+# WHY A TABLE AND NOT A CONSTANT. `category_path` is written and read by two repositories over one
+# database — pivota-backend's CATEGORY_PATTERNS and PIVOTA-Agent's src/services/beautyTaxonomy.js.
+# Each held its own vocabulary, neither imported the other, and on 2026-09-10 they disagreed about
+# where a toner lives: the gateway wrote 315 rows to `beauty/skincare/tone/toner` on purpose while
+# this repo's taxonomy named `beauty/skincare/treat/toner` and could not reach any of them. This
+# repo's own invariant then counted those rows as corruption. Two vocabularies over one column
+# means every disagreement presents as data corruption to whichever side is reading.
+#
+# The rows are the shared place. Both services load and cache this table; nobody has to vendor a
+# copy of the other's file, and `serving_eligible_off_taxonomy_path` can join against it directly
+# instead of against one repo's opinion.
+#
+# SHAPE. Three kinds of row, distinguished without a type column:
+#   canonical leaf   alias_of IS NULL, is_leaf = true    a path recall builds a prefix for
+#   interior node    alias_of IS NULL, is_leaf = false    an ancestor; reachable only via #2122
+#   alias            alias_of IS NOT NULL                 a spelling that means another path
+#
+# The self-FK is what stops an alias pointing at nothing, which is exactly how the 117 orphan paths
+# came to exist. `alias_of` on a row whose target is itself an alias is refused by the CHECK below:
+# one hop only, so resolution cannot loop or need a recursive query on a hot path.
+#
+# ⚠️ IN THE MODEL, not only in db/migrations/221 — `web` deploys with SKIP_HEAVY_STARTUP_INIT and
+# never runs the migration directory, so `metadata.create_all` is what actually builds this on
+# production. See the note on checkout_preflight_observations.created_at above.
+category_taxonomy = Table(
+    "category_taxonomy",
+    metadata,
+    Column("path", String(255), primary_key=True),
+    Column("label", String(128), nullable=False),
+    Column("is_leaf", Boolean, nullable=False, server_default=text("false")),
+    # Self-referential: the canonical path this spelling resolves to. NULL means "this IS canonical".
+    Column("alias_of", String(255), ForeignKey("category_taxonomy.path"), nullable=True),
+    # Free text, because the reason a path was chosen is the part that gets lost. The toner row
+    # carries the Google/Shopify citation; without it the next person re-litigates it.
+    Column("note", Text, nullable=True),
+    Column("updated_at", DateTime(timezone=True), server_default=func.now(), nullable=False),
+    CheckConstraint(
+        "alias_of IS NULL OR is_leaf = false",
+        name="ck_category_taxonomy_alias_is_not_a_leaf",
+    ),
+    CheckConstraint(
+        "alias_of IS NULL OR alias_of <> path",
+        name="ck_category_taxonomy_alias_not_self",
+    ),
+    extend_existing=True,
 )

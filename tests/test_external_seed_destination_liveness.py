@@ -252,6 +252,16 @@ class _FakeDb:
     async def execute(self, query, params=None):
         self.executed.append((query, params))
 
+    async def fetch_all(self, query, params=None):
+        """Recorded too. The mirror suppression now uses `RETURNING product_key`
+        (no rowcount from `databases`+asyncpg, and the keys feed the offer
+        cascade), so a fake that watched only `execute` would have stopped
+        seeing the statement these tests are about the day it changed."""
+        self.executed.append((query, params))
+        if "RETURNING" in str(query).upper():
+            return [{"product_key": "prod::pg1", "offer_id": "offer::pg1"}]
+        return []
+
 
 def _observe(monkeypatch, row, observation, now=None):
     db = _FakeDb(row)
@@ -736,3 +746,38 @@ def test_retirement_scopes_the_mirror_by_source_system_and_stamps_updated_at(mon
     assert mirror_params["source_system"] == liveness.MIRROR_SOURCE_SYSTEM
     assert "updated_at = NOW()" in mirror_sql
     assert mirror_params["reason"] == liveness.SUPPRESSION_REASON
+
+
+def test_retirement_cascades_to_the_products_offers(monkeypatch):
+    """Suppressing the mirror product does NOT gate its offers: catalog_offers
+    carries its OWN suppressed_at and that is what priced_offer_sql,
+    fetch_offers_for_keys and the recall candidate CTE filter on. Without the
+    cascade this nightly, unattended lane keeps a price live on a URL it has just
+    proved is dead — a large share of the 2,171 suppressed-product-with-live-offer
+    rows measured on prod 2026-09-08.
+
+    Both columns are asserted, and the product statement is asserted to project
+    the keys the cascade consumes: reading them from a separate SELECT would race
+    its own `suppressed_at IS NULL` filter and gate offers of a product this call
+    did not suppress.
+    """
+    db = _FakeDb({"status": "active"})
+    monkeypatch.setattr(liveness, "database", db)
+    obs = liveness.DestinationObservation(liveness.VERDICT_DEAD_404, 404, None, corroborated=True)
+    result = _run(liveness.retire_seed_for_dead_destination("eps_1", obs, now=NOW))
+
+    mirror_sql = next(sql for sql, _ in db.executed if "catalog_products" in sql)
+    assert "RETURNING product_key" in mirror_sql
+
+    offer_sql, offer_params = next(
+        (sql, params) for sql, params in db.executed if "catalog_offers" in sql
+    )
+    assert "suppressed_at = NOW()" in offer_sql
+    assert "suppression_reason" in offer_sql
+    assert "suppressed_at IS NULL" in offer_sql, (
+        "the cascade must be idempotent — re-stamping a row another lane "
+        "tombstoned rewrites somebody else's decision"
+    )
+    assert offer_params["reason"] == "product_suppressed"
+    assert offer_params["product_keys"] == ["prod::pg1"]
+    assert result["offers_suppressed"] == 1

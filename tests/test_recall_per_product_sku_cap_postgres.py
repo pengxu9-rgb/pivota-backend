@@ -43,19 +43,55 @@ pytestmark = pytest.mark.skipif(
 _FAT = "pk_fat_lipstick"
 _FAT_SKUS = 60
 _OTHERS = 45
+_MERCHANT = "m_cap"   # every row this module writes carries it — it is the teardown key
+_TABLES = ("catalog_offers", "catalog_skus", "catalog_products", "catalog_merchants")
 
 
 @pytest.fixture(scope="module")
 def pg_engine():
     import db.catalog  # noqa: F401
-    from sqlalchemy import create_engine
+    from sqlalchemy import create_engine, text
 
     from db.database import metadata
 
     engine = create_engine(DATABASE_URL)
     metadata.create_all(engine, checkfirst=True)
     yield engine
+    # Nothing this module wrote may outlive it — see the row-scoped teardown.
+    # `_seed` emptied these tables when each test began, so anything still in
+    # them now was written here under some key other than `_MERCHANT`.
+    with engine.begin() as conn:
+        residue = {t: conn.execute(text(f"SELECT count(*) FROM {t}")).scalar()
+                   for t in _TABLES}
     engine.dispose()
+    assert not any(residue.values()), (
+        f"this module left rows behind for the next gate run: {residue}")
+
+
+# ---------------------------------------------------------------------------
+# Row-scoped teardown
+# ---------------------------------------------------------------------------
+# `_seed` empties these tables at the START of every test, so this module never
+# saw its own leftovers. Its NEIGHBOURS did: the gate files share one database,
+# and this module used to leave its 45 `pk_other_*` SKU and offer rows behind.
+# tests/test_backfill_variant_identity_skus_postgres.py asserts
+# `SELECT count(*) FROM catalog_skus` == 0 in four tests, so a SECOND
+# `pytest tests/test_*_postgres.py` against the same database failed all four
+# with `45 == 0`. CI never sees that — it provisions a fresh database per job —
+# so it bit only local runs. (The products themselves were gone, wiped by a
+# later module's own reset, which is why only orphaned SKUs and offers remained.)
+#
+# Delete BY KEY — the merchant id this module minted, which every row it writes
+# carries — never `DROP`, never the whole table: the contract that file's
+# `_clear` sets.
+@pytest.fixture(autouse=True)
+def _delete_what_this_test_seeded(pg_engine):
+    from sqlalchemy import text
+
+    yield
+    with pg_engine.begin() as conn:
+        for t in _TABLES:
+            conn.execute(text(f"DELETE FROM {t} WHERE merchant_id = :m"), {"m": _MERCHANT})
 
 
 def _seed(engine):
@@ -64,35 +100,36 @@ def _seed(engine):
     from sqlalchemy import text
 
     with engine.begin() as conn:
-        for t in ("catalog_offers", "catalog_skus", "catalog_products", "catalog_merchants"):
+        for t in _TABLES:
             conn.execute(text(f"DELETE FROM {t}"))
         conn.execute(text(
             "INSERT INTO catalog_merchants (merchant_id, merchant_name, primary_platform, status) "
-            "VALUES ('m_cap', 'Cap Merchant', 'external_seed', 'active')"
-        ))
+            "VALUES (:m, 'Cap Merchant', 'external_seed', 'active')"
+        ), {"m": _MERCHANT})
 
         def product(pk, title, n_skus):
             conn.execute(text(
                 "INSERT INTO catalog_products (product_key, merchant_id, platform, source_product_id,"
                 " title, brand, catalog_track, truth_tier, readiness_tier, pdp_scope,"
                 " pdp_lifecycle_stage, source_system, updated_at)"
-                " VALUES (:pk,'m_cap','external_seed',:pk,:t,'ACME','citation','primary',"
+                " VALUES (:pk,:m,'external_seed',:pk,:t,'ACME','citation','primary',"
                 "         'referral_only','multi_merchant_canonical','published','test',NOW())"
-            ), {"pk": pk, "t": title})
+            ), {"pk": pk, "t": title, "m": _MERCHANT})
             for i in range(n_skus):
                 sk = f"{pk}::v{i}"
                 conn.execute(text(
                     "INSERT INTO catalog_skus (sku_key, product_key, merchant_id, platform,"
                     " source_product_id, source_variant_id, title, currency, updated_at)"
-                    " VALUES (:sk,:pk,'m_cap','external_seed',:pk,:vid,:t,'USD',NOW())"
-                ), {"sk": sk, "pk": pk, "vid": f"vid{i}", "t": f"{title} shade {i}"})
+                    " VALUES (:sk,:pk,:m,'external_seed',:pk,:vid,:t,'USD',NOW())"
+                ), {"sk": sk, "pk": pk, "vid": f"vid{i}", "t": f"{title} shade {i}",
+                    "m": _MERCHANT})
                 conn.execute(text(
                     "INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id,"
                     " catalog_track, truth_tier, readiness_tier, offer_mode, channel, availability,"
                     " currency, list_price, merchant_effective_price, updated_at)"
-                    " VALUES (:oid,:sk,:pk,'m_cap','citation','primary','referral_only','redirect',"
+                    " VALUES (:oid,:sk,:pk,:m,'citation','primary','referral_only','redirect',"
                     "         'default','in_stock','USD',24,24,NOW())"
-                ), {"oid": f"of:{sk}", "sk": sk, "pk": pk})
+                ), {"oid": f"of:{sk}", "sk": sk, "pk": pk, "m": _MERCHANT})
 
         for n in range(_OTHERS):
             product(f"pk_other_{n}", f"Other Lipstick {n}", 1)

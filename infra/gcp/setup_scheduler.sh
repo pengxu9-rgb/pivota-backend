@@ -297,10 +297,106 @@ mkbrowserauditjob(){ # Browser is intentionally isolated to the crawl subnet.
     --labels "env=$ENV,managed-by=infra-gcp,lane=store-audit-crawl" --quiet "$@"
 }
 echo "== job: relgraph-sync (Railway cron 37 10 * * *)"
+# --task-timeout OVERRIDES mkjob's 3600s: "$@" lands after the defaults on mkjob's gcloud line and
+# gcloud takes the last occurrence. Thirteen other callers in this file already rely on that, so it
+# is this file's established shape rather than a new assumption — though nothing here TESTS it, and
+# no test asserts it, so treat it as convention-backed, not proven.
+#
+# 3600s is NOT this job's binding constraint today: the cron entry point caps itself well before the
+# clock at 200 anchors over 250 selected rows in a 24h window, which finishes in ~4 minutes
+# (measured 2026-09-09 10:37Z). It becomes the wall the moment anyone raises those caps to rebuild
+# the graph for real: measured the same day, a --limit 1000 build over a 5,000-row selection was
+# TERMINATED at exactly 3600s mid-build, producing no audit and no edges. With --max-retries 1 above
+# that costs two attempts, so 3600s really means two wasted hours; 14400s likewise means eight.
+#
+# ⚠️ THE CAPS ARE NOT SET HERE AND CANNOT BE SET LIVE. They are RELGRAPH_SYNC_LIMIT (default 200,
+# max 2000) and RELGRAPH_SYNC_SELECT_LIMIT (default 250, max 5000), read inside the GATEWAY image by
+# PIVOTA-Agent's scripts/run-relationship-graph-sync-routine-cron.js — grepping THIS repo for them
+# finds nothing. Raising them means adding them to the --set-env-vars line below, because that flag
+# REPLACES the whole env set: an operator who adds them with `gcloud run jobs update` has them wiped
+# by the next reconcile of this script. That is the same drift this timeout override exists to
+# prevent, and it applies to the caps too.
+#
+# So this raise removes ONE of three walls. It changes nothing about the daily run, which exits in
+# minutes either way.
+#
+# COST: infra/gcp/setup_monitoring.sh alerts on relgraph-sync via completed_task_attempt_count
+# {result=failed} — it fires only AFTER a task dies, and there is no duration-based alert. A wedged
+# job is therefore silent for 4h instead of 1h (8h instead of 2h across the retry). Accepted here
+# because the daily run exits in minutes, so a run that is still alive at 1h is already anomalous —
+# but if these caps are ever raised, add a duration alert rather than relying on the failure signal.
+#
+# Precedent for raising, not just lowering: the twelve other mkjob callers all LOWER 3600s, but
+# external-seed-destination-sweep raises mkcrawljob's 300s to 3600s. This is the first override to
+# exceed 3600s.
 mkjob relgraph-sync "$GATEWAY_IMAGE" "$SA" \
   --set-secrets "DATABASE_URL=DATABASE_URL_NOVERIFY:latest,PCI_KB_DATABASE_URL=PCI_KB_DATABASE_URL_NOVERIFY:latest" \
   --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=relgraph-sync,PIVOTA_COMMIT_SHA=$GATEWAY_TAG,DB_POOL_MAX=3,PCI_KB_DB_POOL_MAX=1,INGREDIENT_REFERENCE_DB_POOL_MAX=1,INGREDIENT_SIGNAL_DB_POOL_MAX=1" \
+  --task-timeout 14400s \
   --command npm --args "run,relgraph:sync-routine:cron"
+
+echo "== job: relgraph-health (was GH Actions cron 0 10 * * *)"
+# THE SECOND HALF OF THE 2026-08-25 MIGRATION, finished 2026-09-09.
+#
+# external-seed-sentinel-nongrowth below was moved off its GitHub workflow the day the Railway
+# DATABASE_URL was decommissioned. `Relationship Graph Serving Guard Audit` was missed. It broke the
+# next morning, stayed broken for two weeks, then stopped firing altogether.
+#
+# ⚠️ NOT "no signal at all" — an earlier version of this comment said that and it was false, in the
+# overclaiming way this whole change is meant to stop. `relgraph-sync` runs `serving_guard_audit`
+# itself, at 1% / 25 rows with critical-reason gating on by default
+# — the defaults live in run-relationship-graph-SYNC-routine.js:23-36, which forwards them;
+# run-relationship-graph-routine-job.js itself defaults them to null and gates only when
+# passed, so do not read that file alone and conclude the opposite. That is real coverage. What this job adds is a TIGHTER
+# gate (0 rows / 0%), the expiry alarm, and the no-op detector — the last being the one that would
+# have noticed relgraph-sync passing every day over a graph that gained nothing.
+#
+# It could not be repaired in GitHub. prod Postgres is private-only: `pivota-pg` has
+# `ipv4Enabled: false`, one RFC1918 address (10.25.0.2) and no authorized networks, so a
+# GitHub-hosted runner has no route to it and the `read ECONNRESET` in those runs is GitHub's
+# network resetting traffic to a non-routable address. Repairing it there would have meant putting a
+# public IP back on the production database.
+#
+# Three checks in one execution (PIVOTA-Agent scripts/run-relgraph-health-job.js): the serving
+# guard, whose thresholds used to live as an inline `node -e` in the workflow YAML and are now code
+# with tests; the expiry alarm, which was a SECOND step in the retired workflow; and the no-op-run
+# detector, which catches the ledger passing while nothing is applied. Thresholds come through ENV
+# because gcloud splits --args on commas.
+#
+# THE THRESHOLDS THE RETIRED WORKFLOW SET. Review found the first version of this block set neither
+# the critical reasons nor the expiry thresholds, so those checks would have run green having
+# evaluated nothing — a job whose purpose is to report exactly that, committing it.
+#
+# The two numeric ones are passed. THE CRITICAL-REASON LIST DELIBERATELY IS NOT, and passing it
+# would be strictly LESS safe. `--set-env-vars` is comma-separated, so a three-item list has to
+# travel joined by something else (`;`, or gcloud's `^DELIM^` form). PIVOTA-Agent's parser falls
+# back to its built-in three ONLY when the parsed list comes out EMPTY. A future image that split on
+# `,` alone would parse `a;b;c` as ONE bogus reason — length 1, so the fallback is bypassed, and the
+# check matches nothing and passes every run. Silently. Not passing it means the only path is the
+# script's own default, which cannot be mis-parsed. The list is written here so a reader of this
+# file still knows what is enforced:
+#
+#     ai_approved_dupe_quarantined
+#     candidate_ref_unresolvable_nested_product_prefix
+#     anchor_ref_unresolvable_nested_product_prefix
+#
+# To override, set RELGRAPH_CRITICAL_REASONS on the job by hand; the parser accepts `,` or `;`.
+#
+# RELGRAPH_FAIL_ON_NOOP is deliberately NOT set, so the no-op detector REPORTS in the execution log
+# and does not page. The serving-guard thresholds were already enforcing before the move and stay
+# enforcing; flipping a second severity in the same migration would make a migration bug and a real
+# finding indistinguishable. Turn it on once the graph has demonstrably been applying for a week.
+#
+# Exit 1 = a threshold was breached, and that fails the execution and pages via the "prod: Cloud Run
+# job failing" alert policy, the same replacement for the GH failure email the sentinel uses. Exit 2
+# = the job itself failed. GATEWAY_TAG must be at or after PIVOTA-Agent #2171, which adds the script;
+# an older image fails with npm's `Missing script: "relgraph:health-job"` (not "Cannot find module" —
+# the entrypoint is `npm run`), twice, given --max-retries 1.
+mkjob relgraph-health "$GATEWAY_IMAGE" "$SA" \
+  --set-secrets "DATABASE_URL=DATABASE_URL_NOVERIFY:latest" \
+  --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=relgraph-health,PIVOTA_COMMIT_SHA=$GATEWAY_TAG,DB_POOL_MAX=3,RELGRAPH_MARKET=US,RELGRAPH_MAX_SUPPRESSED_ROWS=0,RELGRAPH_MAX_SUPPRESSED_PCT=0,RELGRAPH_MAX_EXPIRING_14D_PCT=30,RELGRAPH_MIN_TOTAL_ROWS=500" \
+  --task-timeout 1800s \
+  --command npm --args "run,relgraph:health-job"
 
 echo "== job: external-seed-sentinel-nongrowth (GH Actions cron 23 10 * * *)"
 # ADR-009 data-side ratchet, migrated from PIVOTA-Agent's scheduled GitHub workflow
@@ -715,6 +811,13 @@ fi
 
 echo "== scheduler triggers"
 sched relgraph-sync-cron "37 10 * * *" relgraph-sync
+# 10:00 UTC, the slot the retired GitHub workflow held. Nothing else uses it.
+#
+# An earlier version of this comment justified the slot as "37 minutes BEFORE relgraph-sync so the
+# verdict describes yesterday's state". That reasoning is empty and was removed: the serving-guard
+# predicate already filters `expires_at > now()`, and the no-op detector reads 48h/14d windows, so
+# neither check can tell 10:00 from 10:37. It is simply the old slot.
+sched relgraph-health-cron "0 10 * * *" relgraph-health
 sched external-seed-sentinel-nongrowth-cron "23 10 * * *" external-seed-sentinel-nongrowth
 sched pdp-identity-graph-backfill-cron "40 3 * * 1" pdp-identity-graph-backfill
 if [ "$EXTERNAL_SEED_DESTINATION_SWEEP" = true ]; then

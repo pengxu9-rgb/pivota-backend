@@ -37,6 +37,7 @@ shape:
 """
 from __future__ import annotations
 
+from typing import Tuple
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 

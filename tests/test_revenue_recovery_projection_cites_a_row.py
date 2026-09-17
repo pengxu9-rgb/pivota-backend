@@ -668,3 +668,17 @@ def test_the_stage_lists_survive_the_row_shape_too(real_report):
     assert all(
         "pivota_serving_not_ready" not in types for types in by_stage.values()
     )
+
+
+def test_score_findings_do_not_claim_observed_recommendations(real_report):
+    from services.audit_evidence_builder import extract_findings
+    findings = extract_findings(real_report)
+    scores = [f for f in findings if f.get("payload", {}).get("dimension") in
+              {"identity", "citation", "content_richness"}]
+    assert scores
+    for finding in scores:
+        summary = finding["short_summary"]
+        assert "diagnostic score" in summary
+        assert "does not establish verified" in summary
+        assert "doesn't recommend" not in summary
+        assert "can't reliably tell" not in summary
