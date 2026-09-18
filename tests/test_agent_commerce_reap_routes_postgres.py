@@ -31,6 +31,11 @@ thing twice instead of two things once. What is here is what the ENGINE decides:
      conjuncts, the dial, the allowlist, the buyer link, the hosted-URL vetting, the price and
      the return URL are all exercised against real Postgres. Nothing else is duplicated.
 
+THIS FILE DOES NOT IMPORT `main`. It assembles a minimal app from the router plus
+`ErrorHandlerMiddleware`; see the long comment above the assert below for what importing main did
+to two unrelated files in this gate. "The router is registered in main.py" is proved in the SQLite
+arm, which never shares a process with the gate.
+
     DATABASE_URL=postgresql://postgres:postgres@localhost:5432/pivota_reap_wp4_test \\
         .venv/bin/python -m pytest tests/test_agent_commerce_reap_routes_postgres.py
 """
@@ -120,9 +125,48 @@ import services.reap_agentic_purchase as svc  # noqa: E402
 from routes.agent_auth import get_agent_context  # noqa: E402
 from routes.agent_user_auth import AgentUserContext, get_agent_user_context  # noqa: E402
 
-#: Module level, before `_no_network` exists: `main` builds a Stripe client at import time and
-#: that constructs an `httpx.AsyncClient`.
-from main import app  # noqa: E402
+# ── THIS MODULE MUST NEVER IMPORT `main`, AND THE ASSERT BELOW IS LOAD-BEARING ───────────────
+#
+# The Postgres dialect gate runs EVERY `tests/test_*_postgres.py` in ONE pytest process against
+# ONE database, and pytest imports every module at COLLECTION — before any test runs. So an
+# import in this file is an import for the whole gate.
+#
+# `from main import app` took the shared `db.database.metadata` from 1 table to 135 (measured),
+# because importing main imports every route and db module and each one registers its SQLAlchemy
+# `Table` on that shared metadata. One of them is `db/audit_evidence.verification_runs`, whose
+# MODEL declares `created_at` NOT NULL with **no server default** while its DDL owner,
+# `ensure_audit_evidence_tables()`, creates the same table WITH the default.
+#
+# `tests/test_a9_4_barekey_guard_postgres.py` then calls `metadata.create_all(engine,
+# checkfirst=True)` — every registered table — so `verification_runs` got built from the MODEL
+# first, the DDL owner's `IF NOT EXISTS` became a no-op, and three inserts in
+# `tests/test_bind_parameter_types_postgres.py` that legitimately omit `created_at` failed with
+# `NotNullViolationError`. This file was the only gate module importing main, and it broke two
+# other files that have nothing to do with it. Locally it is invisible: the two files pass in
+# isolation and in pairs, and only fail with a9_4 collected in between.
+#
+# So: a MINIMAL app, assembled from the router under test plus the one middleware whose output
+# this file asserts on. The cost is that "the router is registered in main.py" is not provable
+# here — that test lives in the SQLite arm
+# (`test_the_router_is_mounted_on_the_real_app`), which never shares a process with this gate.
+from fastapi import FastAPI  # noqa: E402
+from middleware.error_handler import ErrorHandlerMiddleware  # noqa: E402
+import routes.agent_commerce_reap as routes_reap  # noqa: E402
+
+assert "main" not in sys.modules, (
+    "tests/test_agent_commerce_reap_routes_postgres.py imported `main`, directly or through one "
+    "of its imports. The Postgres gate shares one process and one database, so main's model "
+    "registrations poison `metadata.create_all` for every gate file collected after this one — "
+    "see the comment above. Keep this module's import graph to the router and its dependencies."
+)
+
+#: THE MIDDLEWARE IS NOT DECORATION. Every refusal this file asserts on is read through
+#: `_error()`, which reads `detail.error` — and `detail` is where `ErrorHandlerMiddleware` puts
+#: the route's own body when it re-wraps a 4xx. Without it, this gate would be asserting against a
+#: response shape production never returns.
+app = FastAPI()
+app.add_middleware(ErrorHandlerMiddleware)
+app.include_router(routes_reap.router)
 
 _REAL_ASYNC_CLIENT = httpx.AsyncClient
 
@@ -765,13 +809,6 @@ async def test_the_jsonb_aliases_round_trip_through_the_eligibility_table(client
     assert ledger._decode_json(row["accept_variant_labels"]) == ["Standard 50ml"]
 
 
-async def test_the_router_is_mounted_on_the_real_app():
-    """Proved on this dialect too: the mounting is a line in main.py and this gate runs in CI
-    against a Postgres the SQLite arm never sees."""
-    paths = {getattr(route, "path", None) for route in app.routes}
-    assert f"{BASE}/purchases" in paths
-    assert f"{BASE}/purchases/{{purchase_id}}" in paths
-
 
 # ── 5. the refusals that must die on BOTH dialects ───────────────────────────────────────────
 
@@ -954,8 +991,6 @@ async def test_a_market_the_currency_map_does_not_know_fails_closed(client):
     check — the same direction every other decision on this rail takes. The `market_country`
     column's own CHECK accepts any two uppercase letters, so an operator really can create this
     row; only the map stops the purchase."""
-    import routes.agent_commerce_reap as routes_reap
-
     assert "ZZ" not in routes_reap._MARKET_CURRENCY, "precondition: ZZ is not a known market"
     await _seed_catalog(currency="USD")
     await _seed_eligibility(market="ZZ")
