@@ -12,8 +12,12 @@
 --   reap_agentic_eligibility     is operator configuration. Recoverable only by retyping it.
 --                                Dropping it fails the rail CLOSED (every purchase refuses
 --                                `merchant_not_eligible`), which is the safe direction.
---   reap_agentic_purchase_keys   is 24-hour replay state. Dropping it costs a duplicate purchase
---                                only for a caller that retries inside that window.
+--   reap_agentic_purchase_keys   is 24-hour replay state, plus the hash of the request each key
+--                                was used for. Dropping it costs a duplicate purchase for a
+--                                caller that retries inside that window -- and, until the window
+--                                would have expired anyway, it stops `idempotency_conflict`
+--                                being detectable at all, so a key reused on a different body
+--                                silently opens a second purchase instead of being refused.
 --
 -- Dropped in the reverse of the order they were created, which costs nothing here (there are no
 -- FKs between them, deliberately — see the up migration) but keeps the two files readable as

@@ -25,10 +25,13 @@ dependency, and that costs one ordering property: an unauthenticated caller gets
   * the gate is not duplicated. There is exactly one check per route — no router-level copy —
     because a second, unreachable copy reads as protection that does not exist.
 
-Body validation runs INSIDE the handler (`payload: Dict[str, Any] = Body(...)` then
-`model_validate`) rather than in the signature, for the same reason: a pydantic model in the
-signature is validated by FastAPI BEFORE the handler body, so a malformed body on a dark rail
-would answer 422 and tell the caller the route is there.
+Both handlers take a raw `Request` and do ALL of their parsing inside the body, after the dial,
+for the same reason. Anything in the signature — a `Body(...)` model, a `Query(le=...)` bound — is
+validated by FastAPI BEFORE the handler runs, and its refusal is a 400 naming the field. That made
+the dark rail probeable: a body of `[1, 2]`, the wrong content-type, or `?limit=500` each answered
+400 while every well-formed request answered 404, and no test that sends only valid requests would
+ever have noticed. `/openapi.json` still lists the paths — the routes are mounted at import — and
+that residue is documented rather than papered over.
 
 ── WHAT THIS ROUTE REFUSES TO TRUST ─────────────────────────────────────────────────────────
 
@@ -72,14 +75,16 @@ and no values — and it is mapped to a bare reason code below rather than forwa
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import re
+import unicodedata
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
-from fastapi import APIRouter, Body, Depends, Query
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 
@@ -138,6 +143,8 @@ _REFUSAL_STATUS: Dict[str, int] = {
     "row_not_found": 409,
     "row_unpriced": 409,
     "row_not_shopify": 409,
+    "row_currency_mismatch": 409,
+    "idempotency_conflict": 409,
 }
 
 _DEFAULT_REFUSAL_STATUS = 409
@@ -169,6 +176,53 @@ def _rail_is_live() -> bool:
 def _require_rail() -> None:
     if not _rail_is_live():
         raise svc.PurchaseRefused("not_available_on_this_rail")
+
+
+#: Characters that must never reach a bind on this path. `Cc`/`Cf`/`Cs`/`Co`/`Cn` is the same
+#: Unicode-category set `services.reap_agentic_purchase._clean_buyer_text` uses, and it is used
+#: here for the opposite outcome — see `_identifier` below.
+_UNPRINTABLE = frozenset({"Cc", "Cf", "Cs", "Co", "Cn"})
+
+
+def _identifier(value: Any, name: str, *, max_chars: int) -> str:
+    """One route-owned identifier, or `invalid_request`.
+
+    ── WHY THIS REFUSES WHERE THE BUYER'S ADDRESS IS CLEANED ────────────────────────────────
+
+    `_clean_buyer_text` STRIPS format characters out of the buyer's name and address and then
+    refuses what is left, because a zero-width joiner pasted out of a web form is not an attack
+    and refusing a whole purchase for it helps nobody. These four values are not prose. They are
+    `merchant_domain`, `product_key`, `variant_key` and `idempotency_key`, and every one of them
+    is matched EXACTLY against something in storage. Silently removing a character from an
+    identifier does not sanitise it — it turns it into a different identifier, which then either
+    matches nothing or, worse, matches something else. So these refuse.
+
+    ── WHAT IT ACTUALLY STOPS, AND WHY ONLY THE POSTGRES ARM COULD SEE IT ───────────────────
+
+    A single NUL byte in any of the four reached an asyncpg bind — in `_eligibility` and in
+    `_replayed_purchase_id` — and asyncpg raises `CharacterNotInRepertoireError`, which is not a
+    `PurchaseRefused`, so it escaped the handler's one `except` and the error middleware turned
+    it into a **500**. SQLite stores NULs happily and answered a clean 409, so the SQLite arm
+    could not see this at all: it is a defect that existed only on the dialect production runs.
+    A 500 on a dark rail is also the one answer that tells a prober the route is really there.
+
+    The length cap is here for the same reason the cleanliness check is: `merchant_domain` is
+    `VARCHAR(255)` and `idempotency_key` is `VARCHAR(128)` in migration 226, and a value past
+    those is a driver error rather than a refusal.
+    """
+    text = str(value or "").strip()
+    if not text:
+        raise svc.PurchaseRefused("invalid_request", f"{name} is required")
+    if len(text) > max_chars:
+        raise svc.PurchaseRefused("invalid_request", f"{name} is longer than {max_chars}")
+    if any(unicodedata.category(ch) in _UNPRINTABLE for ch in text):
+        # The VALUE is not named in the message or the log. It is caller-controlled, it is about
+        # to be refused precisely because it contains something that does not render as itself,
+        # and a log line is exactly where that matters.
+        raise svc.PurchaseRefused(
+            "invalid_request", f"{name} contains characters that are not printable"
+        )
+    return text
 
 
 def _require_agent_user(agent_user: Optional[AgentUserContext]) -> str:
@@ -275,6 +329,35 @@ _COUNTRY_RE = re.compile(r"^[A-Z]{2}$")
 #: header of db/migrations/226_reap_agentic_routes.sql for why a NULL here behaves differently on
 #: the two dialects and a value does not.
 _MERCHANT_ROW = ""
+
+#: THE CURRENCY A MARKET IMPLIES. A MAP AND NOT A COLUMN, deliberately.
+#:
+#: The currency of a market is a fact about the world, not a per-merchant setting: two operators
+#: filling in a `market_currency` column for the same country could disagree, and one of them
+#: would be wrong in a way only a charge would reveal. A column also has to be RIGHT on every row
+#: an operator writes by hand, and the SQL snippet in the runbook is the interface most of them
+#: will use.
+#:
+#: IT FAILS CLOSED. A market that is not in this map refuses `row_currency_mismatch` rather than
+#: skipping the check, which is the same direction every other decision on this rail takes —
+#: adding a market is a one-line change here and the runbook says so. That is the right trade for
+#: a list this short: the rail is domestic-only, and the set of markets Reap's agentic rail is
+#: transactable in is smaller still.
+#:
+#: NOTE FOR WHOEVER ENABLES SG. The curated lane writes USD rows, so an SG merchant whose offers
+#: are denominated in USD will refuse here. That refusal is CORRECT — an SGD storefront quoted in
+#: USD is exactly the divergence this check exists for — but it will look like a bug, so the
+#: runbook names it under "Before arming".
+_MARKET_CURRENCY: Dict[str, str] = {
+    "US": "USD",
+    "CA": "CAD",
+    "GB": "GBP",
+    "AU": "AUD",
+    "SG": "SGD",
+    "HK": "HKD",
+    "JP": "JPY",
+    "NZ": "NZD",
+}
 
 _ELIGIBILITY_SQL = """
     SELECT merchant_domain, product_key, variant_key, market_country, enabled,
@@ -478,14 +561,37 @@ async def _reap_buyer_ref(buyer_id: str) -> str:
 #: `o.market` IS NOT A CONJUNCT. The offer table has a market column and filtering on it looks
 #: obviously right; the SG census (market:SG -> 0 rows) is the record of what it actually does
 #: to a lane that names a market. Domesticity is enforced where it is decidable — the
-#: eligibility row's `market_country` against the buyer's shipping country — and not by a column
-#: whose population nobody has measured on this cohort.
+#: eligibility row's `market_country` against the buyer's shipping country, and the CURRENCY
+#: check below — and not by a column whose population nobody has measured on this cohort.
+#:
+#: `o.merchant_id` IS A CONJUNCT, AND IT IS THE ONE THIS QUERY WAS MISSING.
+#: `catalog_offers.merchant_id` is the OFFER SELLER, and it is NOT the same column as
+#: `catalog_products.merchant_id`, which is whose catalogue the product row belongs to. The repo
+#: says so structurally: `services/pivot_query_service._fetch_canonical_rows_for_sku` LEFT JOINs
+#: `catalog_merchants` TWICE — once on `p.merchant_id` and once on `o.merchant_id` — precisely
+#: because one sku can carry offers from several sellers.
+#:
+#: Without the conjunct this query was `ORDER BY price ASC LIMIT 1` across EVERY seller's offer
+#: on the sku, so the cheapest one won. Two ways that goes wrong, and neither is hypothetical:
+#:
+#:   * a competing seller's offer at 1.00 on the same sku becomes `our_price_minor = 100`. The
+#:     buyer is then sent through card enrolment, the quote comes back at the eligible merchant's
+#:     real price, and `verify_quote` refuses `price_changed` — for a price change that never
+#:     happened. The buyer has entered a card and bought nothing.
+#:   * the same product mirrored into the crawl lane (`external_seed`) and synced by the merchant
+#:     (`internal_merchant`) carries TWO offer rows with two prices, and the cheaper copy is
+#:     often the stale one.
+#:
+#: The conjunct is `o.merchant_id = p.merchant_id`: the offer belonging to the merchant whose
+#: catalogue this product is in, which is the merchant the eligibility allowlist was read under
+#: (the domain is a conjunct on the product read). An eligible merchant with no offer of its OWN
+#: on this sku is `row_unpriced` — not "somebody else will sell it to you".
 #:
 #: SUPPRESSION IS A CONJUNCT ON ALL THREE TABLES, both columns each. A suppressed row is one
 #: somebody took out of circulation; selling it is the one thing that must not still work.
 _PRODUCT_SQL = """
-    SELECT p.product_key, p.title AS product_title, p.brand, p.category, p.product_type,
-           p.platform, p.source_domain
+    SELECT p.product_key, p.merchant_id, p.title AS product_title, p.brand, p.category,
+           p.product_type, p.platform, p.source_domain
       FROM catalog_products p
      WHERE p.product_key = :product_key
        AND lower(p.source_domain) = :merchant_domain
@@ -529,6 +635,7 @@ _OFFER_SQL = """
       FROM catalog_offers o
      WHERE o.sku_key = :sku_key
        AND o.product_key = :product_key
+       AND o.merchant_id = :merchant_id
        AND o.suppression_reason IS NULL
        AND o.suppressed_at IS NULL
        AND coalesce(o.merchant_effective_price, o.estimated_best_price, o.list_price) IS NOT NULL
@@ -600,15 +707,38 @@ async def _load_catalog_row(
         sku = candidates[0]
 
     offer = await database.fetch_one(
-        _OFFER_SQL, {"sku_key": sku["sku_key"], "product_key": product_key}
+        _OFFER_SQL,
+        {
+            "sku_key": sku["sku_key"],
+            "product_key": product_key,
+            # THE SELLER. `p.merchant_id`, not a caller value and not the cheapest seller on the
+            # sku — see the note above `_PRODUCT_SQL`.
+            "merchant_id": str(product.get("merchant_id") or ""),
+        },
     )
     if not offer:
-        raise svc.PurchaseRefused("row_unpriced", "no usable offer for this sku")
+        raise svc.PurchaseRefused(
+            "row_unpriced", "the eligible merchant has no usable offer of its own on this sku"
+        )
     offer = dict(offer)
 
     currency = str(offer.get("currency") or sku.get("sku_currency") or "").strip().upper()
     if not currency:
         raise svc.PurchaseRefused("row_unpriced", "the offer names no currency")
+
+    # THE MARKET'S CURRENCY, AND IT IS THE LAST THING BETWEEN A DOMESTIC-ONLY RAIL AND A
+    # CROSS-CURRENCY CHARGE. Everything upstream has established that the buyer ships to a market
+    # this merchant is enabled for; nothing yet has established that the PRICE we are about to
+    # commit to is denominated in that market's money. A US-priced offer quoted for an SG buyer
+    # on an SGD storefront clears every other check here and then diverges at the quote, where
+    # the only vocabulary for it is `price_changed` — a refusal that names the wrong cause and
+    # arrives after the buyer has entered a card.
+    expected = _MARKET_CURRENCY.get(market_country)
+    if expected is None or currency != expected:
+        raise svc.PurchaseRefused(
+            "row_currency_mismatch",
+            f"the offer is priced in {currency} and {market_country} is not",
+        )
 
     # THE RAIL'S OWN CONVERTER, which refuses rather than rounds. A price we cannot state exactly
     # in minor units is one we do not buy against: `verify_quote` compares
@@ -672,12 +802,68 @@ def _default_return_url() -> str:
 _IDEMPOTENCY_WINDOW_SECONDS = 24 * 60 * 60
 
 
+def _request_hash(
+    *,
+    merchant_domain: str,
+    product_key: str,
+    variant_key: Optional[str],
+    quantity: int,
+    email: str,
+    shipping_address: Mapping[str, Any],
+    return_url: str,
+) -> str:
+    """A stable fingerprint of the fields that DECIDE this purchase.
+
+    WHAT IS IN IT is everything a buyer would notice being different: the merchant, the product,
+    the variant, how many, who it goes to and where, and where they come back to afterwards.
+    Change any of those and it is a different purchase, whatever key the caller reused.
+
+    WHAT IS NOT IN IT: `click_context` (accepted and forwarded nowhere) and the idempotency key
+    itself (it is the lookup, not part of what is being compared). Also nothing the ROUTE derives
+    rather than the caller supplying — the price, the buyer ref, the click id — because those are
+    ours and a client retrying an identical request must hash identically even though the click
+    id will differ.
+
+    BUILT FROM THE NORMALISED VALUES, not the raw body. The domain is already lowercased, the
+    keys stripped, the address already through `_buyer_address_for_client` with its fallbacks
+    applied. A retry that differs only in the casing of a domain or a missing-then-supplied
+    `buyer.name` that resolves to the same recipient is the SAME request and must replay; a
+    retry that differs in the address is not, and must not.
+
+    `sort_keys=True` and a fixed separator so two dicts with the same content hash the same
+    whatever order they were built in — the whole value of the column depends on that.
+    """
+    canonical = json.dumps(
+        {
+            "merchant_domain": merchant_domain,
+            "product_key": product_key,
+            "variant_key": variant_key or "",
+            "quantity": int(quantity),
+            "email": email,
+            "shipping_address": {str(k): str(v) for k, v in dict(shipping_address).items()},
+            "return_url": return_url,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 async def _replayed_purchase_id(
-    *, agent_id: str, agent_user_ref_hash: str, idempotency_key: str
+    *, agent_id: str, agent_user_ref_hash: str, idempotency_key: str, request_hash: str
 ) -> Optional[str]:
+    """The purchase this key already opened, or None — and `idempotency_conflict` when the key
+    was used for a DIFFERENT request.
+
+    The conflict is raised rather than ignored because the alternative is the failure mode the
+    column exists to stop: answering 202 with a purchase of something the caller did not just ask
+    for. A client that derives keys from a session or a cart id WILL reuse one across two
+    different bodies, and it will read the 202 as "done".
+    """
     row = await database.fetch_one(
         """
-        SELECT purchase_id, created_at
+        SELECT purchase_id, request_hash, created_at
           FROM reap_agentic_purchase_keys
          WHERE agent_id = :agent_id
            AND agent_user_ref_hash = :agent_user_ref_hash
@@ -696,12 +882,25 @@ async def _replayed_purchase_id(
     if created is not None:
         age = (_now() - created).total_seconds()
         if age > _IDEMPOTENCY_WINDOW_SECONDS:
+            # OUTSIDE THE WINDOW THE KEY IS FORGOTTEN, and that includes the conflict check: the
+            # row is about to be replaced, and refusing a caller for disagreeing with a
+            # fingerprint we are no longer honouring would be the worst of both rules.
             return None
+    stored_hash = str(record.get("request_hash") or "")
+    if stored_hash and stored_hash != request_hash:
+        raise svc.PurchaseRefused(
+            "idempotency_conflict", "this key was used for a different request"
+        )
     return str(record.get("purchase_id") or "").strip() or None
 
 
 async def _claim_idempotency_key(
-    *, agent_id: str, agent_user_ref_hash: str, idempotency_key: str, purchase_id: str
+    *,
+    agent_id: str,
+    agent_user_ref_hash: str,
+    idempotency_key: str,
+    purchase_id: str,
+    request_hash: str,
 ) -> str:
     """Record the key, and return the purchase id that WON.
 
@@ -716,9 +915,9 @@ async def _claim_idempotency_key(
         await database.execute(
             """
             INSERT INTO reap_agentic_purchase_keys (
-                agent_id, agent_user_ref_hash, idempotency_key, purchase_id
+                agent_id, agent_user_ref_hash, idempotency_key, purchase_id, request_hash
             ) VALUES (
-                :agent_id, :agent_user_ref_hash, :idempotency_key, :purchase_id
+                :agent_id, :agent_user_ref_hash, :idempotency_key, :purchase_id, :request_hash
             )
             """,
             {
@@ -726,16 +925,23 @@ async def _claim_idempotency_key(
                 "agent_user_ref_hash": agent_user_ref_hash,
                 "idempotency_key": idempotency_key,
                 "purchase_id": purchase_id,
+                "request_hash": request_hash,
             },
         )
         return purchase_id
     except Exception:  # noqa: BLE001
         pass
 
+    # THE LOSER RE-READS, AND THE RE-READ CAN REFUSE. Two concurrent requests with one key and
+    # two different bodies race here: the winner's hash lands, and this call raises
+    # `idempotency_conflict` for the loser rather than handing it the winner's purchase. That is
+    # the same answer the sequential case gives, which is the point — a race must not be a way to
+    # get an answer the ordinary path refuses.
     winner = await _replayed_purchase_id(
         agent_id=agent_id,
         agent_user_ref_hash=agent_user_ref_hash,
         idempotency_key=idempotency_key,
+        request_hash=request_hash,
     )
     return winner or purchase_id
 
@@ -869,9 +1075,27 @@ def _not_found() -> JSONResponse:
 # ── routes ───────────────────────────────────────────────────────────────────────────────────
 
 
+#: WHY THESE TWO HANDLERS TAKE A RAW `Request`.
+#:
+#: A parameter in the signature — `payload: Dict[str, Any] = Body(...)`, `limit: int = Query(le=100)`
+#: — is validated by FastAPI BEFORE the handler body runs, and its refusal is a 400 naming the
+#: field. So while the rail was dark, `POST` with a body of `[1, 2]`, or with the wrong
+#: content-type, or `GET ?limit=500`, all answered 400 with a field message while every valid
+#: request answered 404. That is a working probe for a feature that is supposed to be absent, and
+#: it survives every test that only ever sends well-formed requests.
+#:
+#: Taking the raw request moves ALL parsing inside the handler, after the dial. Every shape of
+#: input now gets the same 404 from a dark rail, byte for byte.
+#:
+#: WHAT IS STILL VISIBLE, and cannot be fixed here: `/openapi.json` lists these paths whatever the
+#: dial says, because the routes are mounted at import and the schema is built from the router.
+#: That is a deliberate trade — see the note on the mount in `main.py` — and it is documented on
+#: the contract page rather than papered over.
+
+
 @router.post("/purchases")
 async def start_reap_purchase(
-    payload: Dict[str, Any] = Body(...),
+    request: Request,
     context: AgentContext = Depends(get_agent_context),
     agent_user: Optional[AgentUserContext] = Depends(get_agent_user_context),
 ):
@@ -881,13 +1105,33 @@ async def start_reap_purchase(
         agent_user_ref = _require_agent_user(agent_user)
 
         try:
+            payload = await request.json()
+        except Exception:  # noqa: BLE001
+            # A body that is not JSON at all, or an empty one. The parser's message can quote the
+            # body, so it is not carried.
+            raise svc.PurchaseRefused("invalid_request", "the request body is not JSON")
+        if not isinstance(payload, dict):
+            raise svc.PurchaseRefused("invalid_request", "the request body must be an object")
+
+        try:
             req = StartPurchaseRequest.model_validate(payload)
         except ValidationError:
             # The pydantic error names fields AND the values that failed, and one of those fields
             # is the buyer's address. Never forwarded, never logged.
             raise svc.PurchaseRefused("invalid_request", "the request body did not validate")
 
-        merchant_domain = req.merchant_domain.strip().lower()
+        # EVERY ROUTE-OWNED IDENTIFIER THROUGH ONE CHECKPOINT, before any of them can reach a
+        # bind. `.lower()` after the check rather than before: the check is about what the string
+        # CONTAINS, and lowercasing cannot add or remove an unprintable character.
+        merchant_domain = _identifier(
+            req.merchant_domain, "merchant_domain", max_chars=255
+        ).lower()
+        product_key = _identifier(req.product_key, "product_key", max_chars=1024)
+        variant_key = (
+            _identifier(req.variant_key, "variant_key", max_chars=1024)
+            if str(req.variant_key or "").strip()
+            else None
+        )
         market_country = str(req.buyer.shipping_address.country or "").strip().upper()
         if not _COUNTRY_RE.match(market_country):
             raise svc.PurchaseRefused("invalid_address", "country must be two letters")
@@ -897,12 +1141,35 @@ async def start_reap_purchase(
         if not agent_user_ref_hash:
             raise svc.PurchaseRefused("agent_user_required")
 
-        idempotency_key = str(req.idempotency_key or "").strip() or None
+        idempotency_key = (
+            _identifier(req.idempotency_key, "idempotency_key", max_chars=128)
+            if str(req.idempotency_key or "").strip()
+            else None
+        )
+        # THE RETURN URL AND THE ADDRESS ARE RESOLVED HERE, BEFORE THE REPLAY LOOKUP, because both
+        # are part of what the idempotency key is a key FOR. `start_purchase` validates the URL;
+        # this line only decides which one it validates.
+        shipping_address = _buyer_address_for_client(req.buyer)
+        buyer_email = str(req.buyer.email or "").strip()
+        return_url = str(req.return_url or "").strip() or _default_return_url()
+
+        request_hash = _request_hash(
+            merchant_domain=merchant_domain,
+            product_key=product_key,
+            variant_key=variant_key,
+            quantity=int(req.quantity),
+            email=buyer_email,
+            shipping_address=shipping_address,
+            return_url=return_url,
+        )
+
         if idempotency_key:
+            # Raises `idempotency_conflict` when this key was used for a different request.
             replayed = await _replayed_purchase_id(
                 agent_id=agent_id,
                 agent_user_ref_hash=agent_user_ref_hash,
                 idempotency_key=idempotency_key,
+                request_hash=request_hash,
             )
             if replayed:
                 # THE SAME ID, AND THE PURCHASE'S REAL STATE. Not a hardcoded "resolving": by the
@@ -929,14 +1196,14 @@ async def start_reap_purchase(
         eligible = await _eligibility(
             merchant_domain=merchant_domain,
             market_country=market_country,
-            product_key=req.product_key.strip(),
-            variant_key=str(req.variant_key or "").strip() or None,
+            product_key=product_key,
+            variant_key=variant_key,
         )
 
         row = await _load_catalog_row(
             merchant_domain=merchant_domain,
-            product_key=req.product_key.strip(),
-            variant_key=str(req.variant_key or "").strip() or None,
+            product_key=product_key,
+            variant_key=variant_key,
             market_country=eligible.market_country,
             accept_variant_labels=eligible.accept_variant_labels,
             also_accept_domains=eligible.also_accept_domains,
@@ -947,31 +1214,20 @@ async def start_reap_purchase(
         )
         buyer_ref = await _reap_buyer_ref(buyer_id)
 
-        # THE CALLER'S URL, OR OURS — AND IT IS NOT VALIDATED HERE.
-        #
-        # `start_purchase` runs `rc.validate_return_url` on whatever it is handed, builds both
-        # stage variants from it, and raises `PurchaseRefused("invalid_return_url")` — the same
-        # reason code this route would have used. A copy of that check here would be a guard that
-        # can never be the one that fires: it would refuse exactly the inputs the next line
-        # refuses, and a mutation that deleted it would kill no test. An unreachable guard reads
-        # as protection that does not exist, so there is one validator and it is the one that
-        # owns the URL.
-        #
-        # What this line DOES decide is which URL gets validated. A caller that names none gets
-        # ours, and ours goes through the same validator — so an operator who points
-        # `REAP_AGENTIC_RETURN_URL` at a host that is not ours gets a refusal rather than an open
-        # redirector with a payment page in front of it.
-        return_url = str(req.return_url or "").strip() or _default_return_url()
-
         purchase_id = await svc.start_purchase(
             agent_id=agent_id,
             agent_user_ref_hash=agent_user_ref_hash,
             buyer_ref=buyer_ref,
             row=row,
-            buyer=svc.BuyerContact(
-                email=str(req.buyer.email or "").strip(),
-                shipping_address=_buyer_address_for_client(req.buyer),
-            ),
+            # THE RETURN URL IS NOT VALIDATED BY THIS ROUTE. `start_purchase` runs
+            # `rc.validate_return_url` on whatever it is handed, builds both stage variants from
+            # it, and raises `PurchaseRefused("invalid_return_url")` — the same reason code this
+            # route would have used. A copy of that check here would be a guard that can never be
+            # the one that fires, and an unreachable guard reads as protection that does not
+            # exist. One validator, and it is the one that owns the URL — including for the
+            # default, so an operator who points `REAP_AGENTIC_RETURN_URL` at a host that is not
+            # ours gets a refusal rather than an open redirector with a payment page in front.
+            buyer=svc.BuyerContact(email=buyer_email, shipping_address=shipping_address),
             quantity=int(req.quantity),
             # MINTED HERE, NEVER TAKEN FROM THE REQUEST. This is the only join between a Reap
             # checkout and the session that started it, and a caller-supplied one could collide
@@ -986,6 +1242,7 @@ async def start_reap_purchase(
                 agent_user_ref_hash=agent_user_ref_hash,
                 idempotency_key=idempotency_key,
                 purchase_id=purchase_id,
+                request_hash=request_hash,
             )
             if winner != purchase_id:
                 await _abandon_duplicate(purchase_id)
@@ -1038,15 +1295,34 @@ async def get_reap_purchase(
     return view
 
 
-#: The list is capped whatever the caller asks for. `le=` on the query parameter answers 422 for
-#: an over-large value, and the ledger clamps again at 500 — this is the tighter of the two,
-#: because a history page is a page.
+#: The list is capped whatever the caller asks for. The ledger clamps again at 500; this is the
+#: tighter of the two, because a history page is a page.
 _LIST_MAX = 100
+
+
+def _limit_from(request: Request) -> int:
+    """`?limit=` as an int in 1..`_LIST_MAX`, or `invalid_request`.
+
+    Hand-parsed because the dial has to be checked first — see the note above the handlers. An
+    absent parameter is the default; a present one that is not a number, or is out of range, is a
+    refusal rather than a silent clamp, because a caller that asked for 500 and got 20 has been
+    given a page it does not know is partial.
+    """
+    raw = request.query_params.get("limit")
+    if raw is None or str(raw).strip() == "":
+        return 20
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        raise svc.PurchaseRefused("invalid_request", "limit must be an integer")
+    if not (1 <= value <= _LIST_MAX):
+        raise svc.PurchaseRefused("invalid_request", f"limit must be 1..{_LIST_MAX}")
+    return value
 
 
 @router.get("/purchases")
 async def list_reap_purchases(
-    limit: int = Query(default=20, ge=1, le=_LIST_MAX),
+    request: Request,
     context: AgentContext = Depends(get_agent_context),
     agent_user: Optional[AgentUserContext] = Depends(get_agent_user_context),
 ):
@@ -1056,6 +1332,9 @@ async def list_reap_purchases(
         agent_user_ref_hash = hash_agent_user_ref(agent_user_ref)
         if not agent_user_ref_hash:
             raise svc.PurchaseRefused("agent_user_required")
+        # Parsed HERE, not in the signature: a `Query(le=...)` refusal is a 400 that fires before
+        # the handler and told a prober the route exists while the rail was dark.
+        limit = _limit_from(request)
     except svc.PurchaseRefused as exc:
         return _refused(exc)
 

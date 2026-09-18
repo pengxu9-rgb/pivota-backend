@@ -661,6 +661,20 @@ async def ensure_required_schema_light() -> None:
             # The coverage gate cannot see any of this: tests/test_schema_guard_
             # migration_coverage.py inspects one kind of statement only, and
             # every statement here creates a relation rather than a column.
+            # ONE try PER STATEMENT, NOT ONE PER BLOCK. The first cut of this
+            # block shared a single try across all four statements, and its own
+            # comment named `CREATE UNIQUE INDEX uq_reap_agentic_buyer_refs_ref`
+            # as the realistic failure — on a database that already holds two
+            # buyers with one ref — while `CREATE TABLE
+            # reap_agentic_purchase_keys` sat AFTER it in the same try. That is
+            # exactly the mig-224/225 defect this file already carries a long
+            # comment about: the raise abandons every statement after it, so the
+            # keys table would never land, on precisely the databases that were
+            # already unwell, and production has no other route to it.
+            #
+            # Per statement, every arrival converges: each one is independently
+            # a no-op when its object exists, and a failure of any one cannot
+            # starve the others or the self-heals below.
             try:
                 await database.execute(
                     text(
@@ -680,6 +694,9 @@ async def ensure_required_schema_light() -> None:
                         """
                     )
                 )
+            except Exception:  # noqa: BLE001
+                pass
+            try:
                 await database.execute(
                     text(
                         """
@@ -691,6 +708,12 @@ async def ensure_required_schema_light() -> None:
                         """
                     )
                 )
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                # THE STATEMENT THAT ACTUALLY FAILS IN THE FIELD. It cannot be
+                # created on a database that already holds two buyers sharing
+                # one ref, and that is the whole reason it has its own try.
                 await database.execute(
                     text(
                         "CREATE UNIQUE INDEX IF NOT EXISTS "
@@ -698,6 +721,9 @@ async def ensure_required_schema_light() -> None:
                         "ON reap_agentic_buyer_refs (reap_buyer_ref);"
                     )
                 )
+            except Exception:  # noqa: BLE001
+                pass
+            try:
                 await database.execute(
                     text(
                         """
@@ -706,6 +732,7 @@ async def ensure_required_schema_light() -> None:
                         agent_user_ref_hash VARCHAR(64) NOT NULL,
                         idempotency_key VARCHAR(128) NOT NULL,
                         purchase_id VARCHAR(64) NOT NULL,
+                        request_hash VARCHAR(64) NOT NULL,
                         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                         PRIMARY KEY (agent_id, agent_user_ref_hash, idempotency_key)
                     );
@@ -713,11 +740,6 @@ async def ensure_required_schema_light() -> None:
                     )
                 )
             except Exception:  # noqa: BLE001
-                # Best-effort like every sibling, and it must not starve what
-                # follows. A silent failure here is visible from the first
-                # request on the rail: the route refuses `merchant_not_eligible`
-                # (the eligibility read fails closed) rather than answering
-                # wrongly.
                 pass
             # mig 212: the recovery key — the join the Prove stage rests on.
             # Early and wrapped for the same reason as mig 210 below: this
@@ -2890,6 +2912,20 @@ async def ensure_required_schema_light() -> None:
             # Its own try/except, same contract as its Postgres sibling and as
             # the mig-224 twin above: a failure here must not starve the ADD
             # COLUMN heals below.
+            # ONE try PER STATEMENT, NOT ONE PER BLOCK. The first cut of this
+            # block shared a single try across all four statements, and its own
+            # comment named `CREATE UNIQUE INDEX uq_reap_agentic_buyer_refs_ref`
+            # as the realistic failure — on a database that already holds two
+            # buyers with one ref — while `CREATE TABLE
+            # reap_agentic_purchase_keys` sat AFTER it in the same try. That is
+            # exactly the mig-224/225 defect this file already carries a long
+            # comment about: the raise abandons every statement after it, so the
+            # keys table would never land, on precisely the databases that were
+            # already unwell, and production has no other route to it.
+            #
+            # Per statement, every arrival converges: each one is independently
+            # a no-op when its object exists, and a failure of any one cannot
+            # starve the others or the self-heals below.
             try:
                 await database.execute(
                     text(
@@ -2910,6 +2946,9 @@ async def ensure_required_schema_light() -> None:
                         """
                     )
                 )
+            except Exception:  # noqa: BLE001
+                pass
+            try:
                 await database.execute(
                     text(
                         """
@@ -2921,6 +2960,12 @@ async def ensure_required_schema_light() -> None:
                         """
                     )
                 )
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                # THE STATEMENT THAT ACTUALLY FAILS IN THE FIELD. It cannot be
+                # created on a database that already holds two buyers sharing
+                # one ref, and that is the whole reason it has its own try.
                 await database.execute(
                     text(
                         "CREATE UNIQUE INDEX IF NOT EXISTS "
@@ -2928,6 +2973,9 @@ async def ensure_required_schema_light() -> None:
                         "ON reap_agentic_buyer_refs (reap_buyer_ref);"
                     )
                 )
+            except Exception:  # noqa: BLE001
+                pass
+            try:
                 await database.execute(
                     text(
                         """
@@ -2936,6 +2984,7 @@ async def ensure_required_schema_light() -> None:
                         agent_user_ref_hash VARCHAR(64) NOT NULL,
                         idempotency_key VARCHAR(128) NOT NULL,
                         purchase_id VARCHAR(64) NOT NULL,
+                        request_hash VARCHAR(64) NOT NULL,
                         created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                         PRIMARY KEY (agent_id, agent_user_ref_hash, idempotency_key)
                     );

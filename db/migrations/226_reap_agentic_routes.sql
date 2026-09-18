@@ -69,7 +69,9 @@
 -- RETRY of a request whose response it never saw into a hard failure, which is precisely the
 -- case idempotency exists for. The key lives beside the ledger, points at a purchase id, and the
 -- route honours it for 24 hours (the window is enforced in the route, not here, because it is a
--- policy and this is storage).
+-- policy and this is storage). The key row also carries a hash of the request it was used for,
+-- so that reusing a key on a DIFFERENT body is a refusal rather than a 202 about somebody else's
+-- purchase -- see the column.
 
 CREATE TABLE IF NOT EXISTS reap_agentic_eligibility (
     merchant_domain VARCHAR(255) NOT NULL,
@@ -131,6 +133,25 @@ CREATE TABLE IF NOT EXISTS reap_agentic_purchase_keys (
     -- FK BY VALUE, like enrollment_id on the purchase row: a real REFERENCES would make deleting
     -- purchase history fail on a key nobody is going to replay anyway.
     purchase_id VARCHAR(64) NOT NULL,
+
+    -- WHAT THE KEY WAS USED FOR. sha256 over the canonical form of the fields that DECIDE the
+    -- purchase: merchant, product, variant, quantity, buyer email, shipping address, return url.
+    --
+    -- WITHOUT THIS COLUMN AN IDEMPOTENCY KEY IS A LIE THE SERVER TELLS. A key alone answers "have
+    -- I seen this key?", and every caller reads the 202 as "your request was carried out". Reuse
+    -- a key on a different body — a different size, a different address, a different product,
+    -- which is exactly what a client that derives keys from a session id or a cart id will do —
+    -- and the answer is a 202 naming a purchase of something else. The buyer then approves a
+    -- hosted page for a thing they did not ask for, and nothing anywhere records that two
+    -- different requests were made.
+    --
+    -- So the key is the question and this is the request it was asked about: same key + same
+    -- hash replays, same key + DIFFERENT hash is `idempotency_conflict` (409). That is the
+    -- behaviour every payment API worth copying has, and the column is what makes it expressible.
+    --
+    -- NOT NULL WITH NO DEFAULT: there is no such thing as a key row whose request is unknown, and
+    -- a nullable column would let one be written by a path that forgot.
+    request_hash VARCHAR(64) NOT NULL,
 
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 

@@ -587,8 +587,13 @@ async def test_a_buyer_in_another_market_is_refused(client):
 
 
 async def test_the_market_comes_from_the_shipping_country_not_from_the_caller(client):
-    """Two eligibility rows, two markets. The one that applies is the one the parcel goes to."""
-    await _seed_catalog()
+    """Two eligibility rows, two markets. The one that applies is the one the parcel goes to.
+
+    The catalogue is seeded in CAD because the parcel goes to Canada: the market a purchase binds
+    and the currency its price is in are the same decision, and a CAD buyer against a USD offer is
+    `row_currency_mismatch` by design.
+    """
+    await _seed_catalog(currency="CAD")
     await _seed_link()
     await _seed_eligibility(market="US")
     await _seed_eligibility(market="CA")
@@ -1289,3 +1294,309 @@ def test_every_refusal_reason_the_module_raises_has_a_status():
     assert raised <= set(routes_reap._REFUSAL_STATUS), (
         f"no status decided for: {sorted(raised - set(routes_reap._REFUSAL_STATUS))}"
     )
+
+
+# ── the offer seller ─────────────────────────────────────────────────────────────────────────
+
+
+async def _seed_competitor_offer(*, price: str = "1.00", merchant_id: str = "m_competitor"):
+    """A SECOND SELLER's offer on the SAME sku, cheaper. `catalog_offers.merchant_id` is the offer
+    seller and is a different column from `catalog_products.merchant_id`."""
+    await database.execute(
+        """
+        INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id,
+                                    currency, merchant_effective_price)
+        VALUES (:oid, :sk, :pk, :mid, 'USD', :price)
+        """,
+        {
+            "oid": f"off_{merchant_id}",
+            "sk": SKU_KEY,
+            "pk": PRODUCT_KEY,
+            "mid": merchant_id,
+            "price": price,
+        },
+    )
+
+
+async def test_a_competing_sellers_cheaper_offer_is_not_our_price(client):
+    """THE P0. Without `o.merchant_id = p.merchant_id` this query was `ORDER BY price ASC LIMIT 1`
+    across every seller on the sku, so a competitor's 1.00 became `our_price_minor`. The buyer
+    would then be sent through card enrolment and refused `price_changed` at the quote — for a
+    price change that never happened."""
+    await _seed_all()
+    await _seed_competitor_offer(price="1.00")
+
+    resp = await client.post(f"{BASE}/purchases", json=_body())
+    assert resp.status_code == 202
+    row = await _purchase_row(resp.json()["purchase_id"])
+    assert row["our_price_minor"] == 4250, (
+        "the price came from a seller who is not the merchant this purchase is with"
+    )
+
+
+async def test_a_stale_mirror_copy_of_the_same_sku_is_not_our_price(client):
+    """The other shape of the same defect: one sku carrying two offer rows because the product was
+    both mirrored into the crawl lane and synced by the merchant. The cheaper copy is often the
+    stale one, and `ORDER BY price ASC` picks it every time."""
+    await _seed_all()
+    await _seed_competitor_offer(price="28.20", merchant_id="m_brand_external_seed")
+
+    resp = await client.post(f"{BASE}/purchases", json=_body())
+    assert resp.status_code == 202
+    row = await _purchase_row(resp.json()["purchase_id"])
+    assert row["our_price_minor"] == 4250
+
+
+async def test_a_merchant_with_no_offer_of_its_own_is_unpriced(client):
+    """Not "somebody else will sell it to you". The eligible merchant has no offer on this sku, so
+    there is no price we are entitled to commit to."""
+    await _seed_catalog(priced=False)
+    await _seed_eligibility()
+    await _seed_link()
+    await _seed_competitor_offer(price="9.99")
+
+    resp = await client.post(f"{BASE}/purchases", json=_body())
+    assert resp.status_code == 409
+    assert _error(resp) == "row_unpriced"
+
+
+# ── the market's currency ────────────────────────────────────────────────────────────────────
+
+
+async def test_an_offer_priced_in_another_currency_is_refused(client):
+    """A US buyer against a EUR-priced offer. Every other check here passes; the divergence would
+    surface at the quote as `price_changed`, which names the wrong cause and arrives after the
+    buyer has entered a card."""
+    await _seed_catalog(currency="EUR")
+    await _seed_eligibility(market="US")
+    await _seed_link()
+    resp = await client.post(f"{BASE}/purchases", json=_body())
+    assert resp.status_code == 409
+    assert _error(resp) == "row_currency_mismatch"
+
+
+async def test_a_market_the_currency_map_does_not_know_fails_closed(client):
+    """Adding a market is a one-line change in `_MARKET_CURRENCY`. Until somebody makes it, the
+    rail refuses rather than skipping the check — the same direction every other decision here
+    takes."""
+    assert "ZZ" not in routes_reap._MARKET_CURRENCY, "precondition: ZZ is not a known market"
+    await _seed_catalog(currency="USD")
+    await _seed_eligibility(market="ZZ")
+    await _seed_link()
+    address = dict(ADDRESS, country="ZZ")
+    resp = await client.post(
+        f"{BASE}/purchases", json=_body(buyer={"email": EMAIL, "shipping_address": address})
+    )
+    assert resp.status_code == 409
+    assert _error(resp) == "row_currency_mismatch"
+
+
+async def test_a_matching_market_currency_is_accepted(client):
+    """The control: an absence assertion passes when the mechanism is absent too."""
+    await _seed_catalog(currency="USD")
+    await _seed_eligibility(market="US")
+    await _seed_link()
+    resp = await client.post(f"{BASE}/purchases", json=_body())
+    assert resp.status_code == 202
+
+
+# ── unprintable characters in the route-owned identifiers ────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("merchant_domain", "brand.example\x00"),
+        ("product_key", PRODUCT_KEY + "\x00"),
+        ("variant_key", SKU_KEY + "\x00"),
+        ("idempotency_key", "k-1\x00"),
+    ],
+)
+async def test_a_nul_byte_in_an_identifier_is_refused(client, field, value):
+    """REFUSED, not stripped. These four are matched EXACTLY against storage, so removing a
+    character would not sanitise the value — it would turn it into a different identifier. On
+    Postgres an unstripped NUL reached an asyncpg bind and raised
+    `CharacterNotInRepertoireError`, which is not a `PurchaseRefused` and became a 500; see the
+    Postgres arm, which is the only one that can observe that."""
+    await _seed_all()
+    resp = await client.post(f"{BASE}/purchases", json=_body(**{field: value}))
+    assert resp.status_code == 400
+    assert _error(resp) == "invalid_request"
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+
+
+async def test_an_overlong_identifier_is_refused_rather_than_truncated(client):
+    await _seed_all()
+    resp = await client.post(f"{BASE}/purchases", json=_body(merchant_domain="a" * 300))
+    assert resp.status_code == 400
+    assert _error(resp) == "invalid_request"
+
+
+# ── idempotency is a key PLUS the request it was used for ────────────────────────────────────
+
+
+async def test_the_same_key_on_a_different_body_is_a_conflict(client):
+    """A key alone answers "have I seen this key?", and every caller reads the 202 as "your
+    request was carried out". A client that derives keys from a session or a cart id WILL reuse
+    one across two bodies, and the old code answered 202 naming a purchase of something else."""
+    await _seed_catalog(second_variant=True)
+    await _seed_eligibility()
+    await _seed_link()
+
+    first = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="k-1"))
+    assert first.status_code == 202
+
+    second = await client.post(
+        f"{BASE}/purchases", json=_body(idempotency_key="k-1", quantity=3)
+    )
+    assert second.status_code == 409
+    assert _error(second) == "idempotency_conflict"
+
+    third = await client.post(
+        f"{BASE}/purchases", json=_body(idempotency_key="k-1", variant_key=SECOND_SKU_KEY)
+    )
+    assert _error(third) == "idempotency_conflict"
+
+    address = dict(ADDRESS, addressLine1="1 Other St")
+    fourth = await client.post(
+        f"{BASE}/purchases",
+        json=_body(idempotency_key="k-1", buyer={"email": EMAIL, "shipping_address": address}),
+    )
+    assert _error(fourth) == "idempotency_conflict"
+
+    # ...and none of them opened anything.
+    assert await database.fetch_val(
+        "SELECT COUNT(*) FROM reap_agentic_purchases WHERE state = 'resolving'"
+    ) == 1
+
+
+async def test_a_cosmetically_different_but_identical_request_still_replays(client):
+    """The hash is built from the NORMALISED values, so a retry that differs only in the casing of
+    a domain — or supplies the recipient through `buyer.name` instead of the address, resolving to
+    the same recipient — is the same request and must replay rather than conflict."""
+    await _seed_all()
+    first = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="k-1"))
+
+    address = {
+        key: value for key, value in ADDRESS.items() if key not in ("firstName", "lastName")
+    }
+    second = await client.post(
+        f"{BASE}/purchases",
+        json=_body(
+            idempotency_key="k-1",
+            merchant_domain=DOMAIN.upper(),
+            buyer={"email": EMAIL, "name": "Ada Lovelace", "shipping_address": address},
+        ),
+    )
+    assert second.status_code == 202
+    assert second.json()["purchase_id"] == first.json()["purchase_id"]
+
+
+async def test_the_recorded_hash_is_what_the_conflict_compares(client):
+    await _seed_all()
+    await client.post(f"{BASE}/purchases", json=_body(idempotency_key="k-1"))
+    stored = await database.fetch_val(
+        "SELECT request_hash FROM reap_agentic_purchase_keys WHERE idempotency_key = 'k-1'"
+    )
+    assert isinstance(stored, str) and len(stored) == 64
+
+
+# ── the dark rail is not probeable through a validator ───────────────────────────────────────
+
+
+async def test_a_dark_rail_answers_404_for_every_shape_of_bad_input(client, monkeypatch):
+    """THE PROBE. A parameter in the handler signature is validated by FastAPI BEFORE the handler
+    runs, so a malformed body used to answer 400 with a field message while every valid request
+    answered 404 — a working existence oracle for a feature that is supposed to be absent. Every
+    answer below must be byte-for-byte the one a well-formed request gets."""
+    await _seed_all()
+    monkeypatch.delenv("REAP_AGENTIC_ENABLED", raising=False)
+
+    baseline = await client.post(f"{BASE}/purchases", json=_body())
+    assert baseline.status_code == 404
+    expected = _error(baseline)
+
+    probes = [
+        await client.post(f"{BASE}/purchases", json=[1, 2]),
+        await client.post(f"{BASE}/purchases", json={"nonsense": True}),
+        await client.post(f"{BASE}/purchases", content=b"not json at all"),
+        await client.post(
+            f"{BASE}/purchases",
+            content=b"merchant_domain=brand.example",
+            headers={"content-type": "application/x-www-form-urlencoded"},
+        ),
+        await client.get(f"{BASE}/purchases?limit=500"),
+        await client.get(f"{BASE}/purchases?limit=not-a-number"),
+    ]
+    for probe in probes:
+        assert probe.status_code == 404, probe.text
+        assert _error(probe) == expected == "not_available_on_this_rail"
+
+
+async def test_an_over_large_limit_is_refused_when_the_rail_is_live(client):
+    """The control for the probe test: with the dial ON, the bound is still enforced — and as a
+    refusal rather than a silent clamp, because a caller that asked for 500 and got 20 has been
+    handed a page it does not know is partial."""
+    await _seed_all()
+    for resp in (
+        await client.get(f"{BASE}/purchases?limit=500"),
+        await client.get(f"{BASE}/purchases?limit=0"),
+        await client.get(f"{BASE}/purchases?limit=not-a-number"),
+    ):
+        assert resp.status_code == 400
+        assert _error(resp) == "invalid_request"
+
+
+async def test_a_malformed_body_is_refused_when_the_rail_is_live(client):
+    await _seed_all()
+    for resp in (
+        await client.post(f"{BASE}/purchases", json=[1, 2]),
+        await client.post(f"{BASE}/purchases", content=b"not json at all"),
+    ):
+        assert resp.status_code == 400
+        assert _error(resp) == "invalid_request"
+
+
+# ── the self-heal survives its own worst statement ───────────────────────────────────────────
+
+
+async def test_a_failing_unique_index_does_not_starve_the_keys_table():
+    """ONE try PER STATEMENT. The block's own comment names `uq_reap_agentic_buyer_refs_ref` as
+    the statement that fails in the field — on a database already holding two buyers with one ref
+    — and `reap_agentic_purchase_keys` used to sit after it in the SAME try. Production has no
+    other route to that table, so the raise would have starved it forever on exactly the databases
+    that were already unwell."""
+    for table in RAIL_TABLES:
+        await database.execute(f"DROP TABLE IF EXISTS {table}")
+    # A buyer-refs table WITHOUT its unique index, holding the rows that make the index
+    # impossible. This is the shape the self-heal has to survive.
+    await database.execute(
+        """
+        CREATE TABLE reap_agentic_buyer_refs (
+            buyer_id VARCHAR(50) PRIMARY KEY,
+            reap_buyer_ref VARCHAR(128) NOT NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    for buyer in ("b1", "b2"):
+        await database.execute(
+            "INSERT INTO reap_agentic_buyer_refs (buyer_id, reap_buyer_ref) "
+            "VALUES (:b, 'collides')",
+            {"b": buyer},
+        )
+
+    await ensure_required_schema_light()
+
+    # The index could not be created — that is the precondition, not the failure.
+    assert await database.fetch_val(
+        "SELECT COUNT(*) FROM sqlite_master "
+        "WHERE type = 'index' AND name = 'uq_reap_agentic_buyer_refs_ref'"
+    ) == 0, "precondition: the unique index really is impossible on this data"
+
+    # ...and every other statement in the block still landed.
+    for table in ("reap_agentic_eligibility", "reap_agentic_purchase_keys"):
+        assert await database.fetch_val(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = :t",
+            {"t": table},
+        ) == 1, f"{table} was starved by the failing index"
