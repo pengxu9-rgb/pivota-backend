@@ -125,6 +125,46 @@ def _in_stock(availability: Any) -> bool:
     return str(availability or "").strip().lower() in IN_STOCK_AVAILABILITY
 
 
+# "THIS SELLER CANNOT SELL IT", spelled once. The ORDER vocabulary, and the other half of the one
+# above: IN_STOCK_AVAILABILITY is an explicit "yes", this is an explicit "no", and a value in
+# neither (`unknown`, NULL, empty) is no statement at all. Two orderings bind it:
+#   - offers.resolve's catalog arm (routes/agent_shop_gateway): its SQL ORDER BY, the `in_stock`
+#     flag it emits, and `_rank_offers_merit_first`, which reads that flag (and never demotes an
+#     internal offer on it — that lane's own rule, resting on its variant eligibility gate).
+#   - agent_pdp_view.offers (services/agent_pdp_view_assembler.aggregate_offers), before the
+#     top-N cut, through `availability_is_known_unavailable` below.
+# It lived in the gateway until the second caller needed it; a service importing a router to
+# read one frozenset would be the wrong way round.
+#
+# UNKNOWN IS NOT OUT OF STOCK. `unknown` (the column's server default), NULL, empty or any value
+# not in this set ranks WITH the in-stock offers, by price, and never behind them. Two reasons, both measured rather than preferred:
+#   1. Every lane already reports it that way: the seed lane maps `availability: "unknown"` to
+#      `in_stock: True`, and the catalog arm maps NULL to `in_stock: True`. A three-way rank (in
+#      stock > unknown > out of stock) could only be applied where the raw column survives, i.e.
+#      to that arm alone, and would then order offers by a distinction the flag on them does not
+#      show — and that the gateway's `best_offer`, which reads the flag, could not reproduce.
+#   2. Absence of a stock statement is not evidence against a seller. Demoting it is the same
+#      error the gateway's verification tier refuses to make for an unchecked offer.
+# In prod on 2026-09-18 every live retailer offer said `in_stock` (1,178) or `out_of_stock` (86),
+# so the choice changes no row served today; it decides what the next feed with gaps gets.
+# (All unsuppressed catalog_offers the same day: in_stock 19,480, out_of_stock 1,197, unknown 682
+# — no other spelling.)
+#
+# NOT the buy pick's rule. `annotate_offer_buyability` above asks the positive question (is it
+# explicitly in stock?), so there an `unknown` offer loses to an in-stock one. That picks ONE offer
+# to present as the buy; this orders the list. They agree on every explicit value.
+OFFER_UNAVAILABLE_AVAILABILITIES: frozenset[str] = frozenset(
+    {"out_of_stock", "outofstock", "sold_out", "soldout", "unavailable"}
+)
+
+
+def availability_is_known_unavailable(availability: Any) -> bool:
+    """True only on an explicit statement that this seller cannot sell it now: an
+    ``availability`` in OFFER_UNAVAILABLE_AVAILABILITIES, trimmed and case-insensitive.
+    None, empty, ``unknown`` and any other value are False."""
+    return str(availability or "").strip().lower() in OFFER_UNAVAILABLE_AVAILABILITIES
+
+
 def annotate_offer_buyability(
     offers: List[Dict[str, Any]],
     serving_market: str = DEFAULT_SERVING_MARKET,
