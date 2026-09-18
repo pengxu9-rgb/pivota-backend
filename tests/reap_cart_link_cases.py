@@ -100,28 +100,42 @@ ENROLLMENT_ACTIVE = {
 
 
 def cart_quote(**over):
-    """A cart-link quote at the row's price: 28.20 + 5.00 shipping + 0.00 tax = 33.20 USD."""
+    """A cart-link quote at the row's price, IN THE LIVE SHAPE: 28.20 + 5.00 + 0 = 33.20 USD.
+
+    Key names and value types are exactly what a live sandbox `POST /agentic/quotes` returned on
+    2026-09-18: NO `items` (Reap does not echo line items — an earlier version of this fixture
+    invented one), `tax` nested one level deeper with an INT amount, empty `discounts` /
+    `additionalCharges`, FLOAT amounts, and four shipping options each
+    `{id, name, selected, price}`. Tests that exercise a PRESENT `items` pass one explicitly.
+    """
     body = {
         "id": "q_cart_1",
-        # OPAQUE, like every Reap variant id — it cannot be compared with the URL's variant,
-        # which is the gap `verify_cart_link_quote` states.
-        "items": [{"variantId": "var_opaque_1", "quantity": 1}],
-        # The SPEC's option shape (tests/fixtures/reap_openapi_agentic_2026_09_17.json):
-        # {id, name, selected, price: {amount, currency}}.
-        "shippingOptions": [
-            {"id": "ship_std", "name": "Standard", "selected": True,
-             "price": {"amount": 5.00, "currency": "USD"}}
-        ],
         "expiresAt": "2099-01-01T00:00:00Z",
         "amountBreakdown": {
-            "itemsSubtotal": {"amount": 28.20, "currency": "USD"},
-            "shipping": {"amount": 5.00, "currency": "USD"},
-            "tax": {"amount": {"amount": 0.00, "currency": "USD"}, "includedInPrices": False},
-            "finalAmount": {"amount": 33.20, "currency": "USD"},
+            "itemsSubtotal": {"amount": 28.2, "currency": "USD"},
+            "shipping": {"amount": 5.0, "currency": "USD"},
+            "tax": {"amount": {"amount": 0, "currency": "USD"}},
+            "discounts": [],
+            "additionalCharges": [],
+            "finalAmount": {"amount": 33.2, "currency": "USD"},
         },
+        "shippingOptions": [
+            {"id": "ship_std", "name": "Standard", "selected": True,
+             "price": {"amount": 5.0, "currency": "USD"}},
+            {"id": "ship_exp", "name": "Express", "selected": False,
+             "price": {"amount": 12.99, "currency": "USD"}},
+            {"id": "ship_ovn", "name": "Overnight", "selected": False,
+             "price": {"amount": 29.5, "currency": "USD"}},
+            {"id": "ship_free", "name": "Free over 50", "selected": False,
+             "price": {"amount": 0.0, "currency": "USD"}},
+        ],
     }
     body.update(over)
     return body
+
+
+#: A PRESENT, correct echo — the shape the lane accepts IF Reap ever sends one.
+ONE_LINE = [{"variantId": "var_opaque_1", "quantity": 1}]
 
 
 CHECKOUT_CREATED = {
@@ -1115,21 +1129,44 @@ async def test_a_quote_in_another_currency_refuses(reap, attribution):
         [],
         None,
         ["var_a"],
+        "var_a",
+        {"variantId": "var_a", "quantity": 1},
     ],
-    ids=["two-lines", "wrong-qty", "bool-qty", "no-qty", "empty", "absent", "not-an-object"],
+    ids=["two-lines", "wrong-qty", "bool-qty", "no-qty", "empty", "null", "not-an-object",
+         "string", "dict"],
 )
-async def test_anything_but_one_line_at_our_quantity_refuses(reap, attribution, items):
+async def test_a_present_items_that_is_not_one_line_at_our_quantity_refuses(
+    reap, attribution, items
+):
+    """OPTIONAL-BUT-STRICT. A PRESENT `items` — including `null` and `[]` — must be exactly one
+    line at our quantity. Only a MISSING key skips the echo (what Reap actually sends)."""
     purchase_id = await to_quoting(reap)
     quote = cart_quote()
-    if items is None:
-        del quote["items"]
-    else:
-        quote["items"] = items
+    quote["items"] = items
     reap.request_cart_link_quote = ok(quote)
     moved = await step(purchase_id)
     assert moved.state == "refused" and moved.refusal_reason == "price_unverifiable"
     assert (await get(purchase_id))["last_error_code"] == "quote_items_mismatch"
     assert "create_checkout" not in reap.sequence()
+
+
+async def test_an_absent_items_key_skips_only_the_echo(reap, attribution):
+    """What Reap sends. The echo is skipped; the subtotal, currency and shipping rules are not."""
+    purchase_id = await to_quoting(reap)
+    quote = cart_quote()
+    assert "items" not in quote
+    quote["amountBreakdown"]["itemsSubtotal"] = {"amount": 28.19, "currency": "USD"}
+    quote["amountBreakdown"]["finalAmount"] = {"amount": 33.19, "currency": "USD"}
+    reap.request_cart_link_quote = ok(quote)
+    moved = await step(purchase_id)
+    assert moved.state == "refused" and moved.refusal_reason == "price_changed"
+    assert (await get(purchase_id))["last_error_code"] == "quote_items_subtotal_mismatch"
+
+
+async def test_a_present_correct_echo_is_still_accepted(reap, attribution):
+    purchase_id = await to_quoting(reap)
+    reap.request_cart_link_quote = ok(cart_quote(items=ONE_LINE))
+    assert (await step(purchase_id)).state == "awaiting_approval"
 
 
 async def test_quantity_two_is_priced_as_two(reap, attribution):
@@ -1300,7 +1337,7 @@ _ROW = {"currency": "USD", "our_price_minor": 2820, "quantity": 1}
     "mutate,expected",
     [
         (lambda q: q, (True, None, None)),
-        (lambda q: q.update(items=[q["items"][0], q["items"][0]]),
+        (lambda q: q.update(items=ONE_LINE + ONE_LINE),
          (False, "price_unverifiable", "quote_items_mismatch")),
         (lambda q: q.update(items=[{"quantity": 3}]),
          (False, "price_unverifiable", "quote_items_mismatch")),
@@ -1313,7 +1350,7 @@ _ROW = {"currency": "USD", "our_price_minor": 2820, "quantity": 1}
         (lambda q: q["amountBreakdown"]["finalAmount"].update(amount=40.00),
          (False, "price_changed", "quote_total_not_reconciled")),
     ],
-    ids=["ok", "two-lines", "qty", "no-shipping", "subtotal", "currency", "reconcile"],
+    ids=["ok-no-items", "two-lines", "qty", "no-shipping", "subtotal", "currency", "reconcile"],
 )
 def test_verify_cart_link_quote_names_which_rule_refused(mutate, expected):
     quote = cart_quote()
@@ -1329,9 +1366,14 @@ def test_the_items_rule_runs_before_the_shipping_rule():
     assert svc.verify_cart_link_quote(quote, _ROW).last_error_code == "quote_items_mismatch"
 
 
+@pytest.mark.parametrize("with_echo", [False, True], ids=["no-items", "items-present"])
 @pytest.mark.parametrize("quantity", [0, 11, None, True, "1"])
-def test_an_uncheckable_row_quantity_is_unverifiable(quantity):
-    check = svc.verify_cart_link_quote(cart_quote(), {**_ROW, "quantity": quantity})
+def test_an_uncheckable_row_quantity_is_unverifiable(quantity, with_echo):
+    """The ROW is checked before anything in the quote is compared to it. Without an echo that is
+    also true of `verify_quote`'s own row check; WITH a present echo it is this function's own
+    ceiling that decides, because the echo compares against the row's quantity."""
+    quote = cart_quote(items=ONE_LINE) if with_echo else cart_quote()
+    check = svc.verify_cart_link_quote(quote, {**_ROW, "quantity": quantity})
     assert (check.ok, check.last_error_code) == (False, "quote_row_unverifiable")
 
 

@@ -870,18 +870,32 @@ def verify_quote(
         its own breakdown — a discount line we did not read, a fee under a name we do not know.
         → `price_changed` / `quote_total_not_reconciled`.
 
-    (e) THE ITEMS ECHO BACK WHAT WE ASKED FOR. Exactly one line, the `variantId` we sent, the
-        quantity we sent. `price_unverifiable` / `quote_items_mismatch` otherwise, INCLUDING when
-        `items` is absent or is not a list — a quote that does not say what it priced is not a
-        quote we can check.
+    (e) THE ITEMS ECHO — OPTIONAL-BUT-STRICT. Reap's quote response DOES NOT CARRY `items`:
+        not in the published schema (POST /agentic/quotes 200 is `id, shippingOptions,
+        amountBreakdown, expiresAt`) and not in a live sandbox quote (2026-09-18). This check
+        used to REQUIRE the echo, which meant every real quote refused as
+        `quote_items_mismatch` and the lane could never complete a purchase once armed.
 
-        THIS IS NOT BELT AND BRACES. Reap returns 200 FOR A SUBSTITUTED VARIANT (see
-        `reference_reap_returns_200_for_a_substituted_variant`), and every other check here
-        passes happily on a substitution whose price happens to match: (b) compares OUR unit
-        price against a subtotal, and if they agree, the fact that the object being priced is a
-        different one is invisible. This is the only check that looks at WHAT is being bought
-        rather than at what it costs. Skipped when the caller passes no `variant_id`, which the
-        direct unit tests do — an end-to-end caller always has one.
+        So: when the `items` KEY IS ABSENT the echo is skipped and every other rule here still
+        applies — above all (b), the exact subtotal, which is then the check that stands
+        between a substituted variant and the charge. When `items` IS PRESENT it must be
+        exactly the line we sent — one line, our `variantId`, our quantity — and anything else,
+        INCLUDING `items: null` and `items: []`, is `price_unverifiable` /
+        `quote_items_mismatch`. Only a missing key skips; a present value that does not say
+        what was priced is still not a quote we can check. Skipped entirely when the caller
+        passes no `variant_id` (the direct unit tests; the cart-link lane, which has its own).
+
+        WHAT THIS COSTS, STATED: Reap returns 200 FOR A SUBSTITUTED VARIANT, and without an echo
+        nothing in the quote proves it priced OUR variant. The guards left are that the request
+        names exactly one resolved `variantId`, that the subtotal must match to the minor unit,
+        and that the quote id we check out is the one issued for our request. A substitution AT
+        THE SAME PRICE is not caught.
+
+    (f) SHIPPING OPTIONS, WHEN PRESENT, ARE PRICED. Every entry of a present `shippingOptions`
+        must carry a non-empty `id` and a `price` that is a non-negative exact amount in the
+        row's currency (`_is_priced_shipping_option`). `price_unverifiable` /
+        `quote_shipping_options_malformed` otherwise. The cart-link lane additionally requires
+        the list to be NON-EMPTY (its shipping proof); here an absent or empty list is allowed.
 
     `quantity` is re-checked against `MAX_QUANTITY` here as well as in `start_purchase`. Not
     decoration: this is the last arithmetic before a card is charged, the multiplication in (b)
@@ -910,7 +924,9 @@ def verify_quote(
 
     data = payload if isinstance(payload, dict) else {}
 
-    if variant_id is not None:
+    # PRESENCE OF THE KEY, not truthiness: `items: null` and `items: []` are present and
+    # malformed, and refuse. Only a response that does not carry the key skips the echo.
+    if variant_id is not None and "items" in data:
         items = data.get("items")
         if not isinstance(items, list) or len(items) != 1:
             return QuoteCheck(False, "price_unverifiable", "quote_items_mismatch")
@@ -923,6 +939,13 @@ def verify_quote(
             or echoed_quantity != quantity
         ):
             return QuoteCheck(False, "price_unverifiable", "quote_items_mismatch")
+
+    if "shippingOptions" in data:
+        options = data.get("shippingOptions")
+        if not isinstance(options, list) or not all(
+            _is_priced_shipping_option(option, row) for option in options
+        ):
+            return QuoteCheck(False, "price_unverifiable", "quote_shipping_options_malformed")
 
     breakdown = data.get("amountBreakdown")
     breakdown = breakdown if isinstance(breakdown, dict) else {}
@@ -999,11 +1022,11 @@ def verify_cart_link_quote(payload: Any, row: Mapping[str, Any]) -> QuoteCheck:
 
       (1) THE ROW IS CHECKABLE — a quantity in 1..MAX_QUANTITY. `price_unverifiable` /
           `quote_row_unverifiable` otherwise, as in `verify_quote`.
-      (2) EXACTLY ONE LINE, AT OUR QUANTITY. `items` must be a list of one object whose
-          `quantity` is our integer quantity. `price_unverifiable` / `quote_items_mismatch`
-          otherwise — including when `items` is absent, because a quote that does not say what
-          it priced cannot be checked. Our URL names ONE line, so two lines mean Reap priced
-          something we did not send.
+      (2) IF `items` IS PRESENT: exactly one object whose `quantity` is our integer quantity,
+          else `price_unverifiable` / `quote_items_mismatch`, and a present `null` or `[]`
+          refuses too. Reap's quote response does NOT carry `items` (published schema, and a
+          live sandbox quote on 2026-09-18), so an ABSENT key skips this check. The URL names
+          one line, so a present echo of two lines means Reap priced something we did not send.
       (3) A SHIPPING OPTION EXISTS. `shippingOptions` must be a non-empty list, and EVERY
           entry an object with a non-empty `id` and a `price` that is a non-negative amount in
           the row's currency (`_is_priced_shipping_option`).
@@ -1019,9 +1042,10 @@ def verify_cart_link_quote(payload: Any, row: Mapping[str, Any]) -> QuoteCheck:
 
     ── THE KNOWN GAP, STATED WHERE IT LIVES ─────────────────────────────────────────────────
 
-    `variant_id=None` is deliberate: Reap returns OPAQUE variant ids, so nothing in this quote
-    can prove it priced OUR Shopify variant. The mitigations are that the URL names exactly one
-    variant (the validator allows one line and nothing else), and that the subtotal must equal
+    `variant_id=None` is deliberate: Reap returns OPAQUE variant ids and, in practice, NO items
+    echo at all, so nothing in this quote can prove it priced OUR Shopify variant. The
+    mitigations are that the URL names exactly one variant (the validator allows one line and
+    nothing else), that Reap's quote id is bound to our request, and that the subtotal must equal
     our expected unit price times our quantity to the minor unit — a substituted variant at a
     different price refuses. A substitution at the IDENTICAL price is not caught here. If Reap's
     response ever exposes a merchant variant identifier, comparing it to the URL's is the
@@ -1035,12 +1059,16 @@ def verify_cart_link_quote(payload: Any, row: Mapping[str, Any]) -> QuoteCheck:
 
     data = payload if isinstance(payload, dict) else {}
 
-    items = data.get("items")
-    if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict):
-        return QuoteCheck(False, "price_unverifiable", "quote_items_mismatch")
-    echoed = items[0].get("quantity")
-    if isinstance(echoed, bool) or not isinstance(echoed, int) or echoed != quantity:
-        return QuoteCheck(False, "price_unverifiable", "quote_items_mismatch")
+    # OPTIONAL-BUT-STRICT, as in `verify_quote` (e): Reap's quote response carries no `items`
+    # (schema and live sandbox, 2026-09-18). ABSENT key → skip the echo; PRESENT — including
+    # `null` and `[]` — must be exactly one line at our quantity.
+    if "items" in data:
+        items = data.get("items")
+        if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict):
+            return QuoteCheck(False, "price_unverifiable", "quote_items_mismatch")
+        echoed = items[0].get("quantity")
+        if isinstance(echoed, bool) or not isinstance(echoed, int) or echoed != quantity:
+            return QuoteCheck(False, "price_unverifiable", "quote_items_mismatch")
 
     options = data.get("shippingOptions")
     if (

@@ -95,9 +95,10 @@ ENROLLMENT_ACTIVE = {
 
 QUOTE_200 = {
     "id": "f1e2d3c4",
-    # THE ECHO. Reap returns 200 for a SUBSTITUTED variant, so the quote has to say what it
-    # priced and `verify_quote` has to compare it — every other check looks at what it COSTS.
-    "items": [{"variantId": "var_abc123", "quantity": 1}],
+    # NO `items` ECHO. This fixture used to carry one, and it was invented: Reap's quote
+    # response has no `items` field, neither in the published schema nor in a live sandbox
+    # quote (2026-09-18). `verify_quote` now treats `items` as OPTIONAL-BUT-STRICT, and the
+    # tests that exercise a PRESENT echo add one explicitly (see `_quote`).
     # FAR future on purpose: the quoting step now REFUSES to create a checkout from a quote it
     # can already see is dead (P2-9), so a fixture with a past expiry would refuse every happy
     # path. The expired case has its own test.
@@ -108,6 +109,35 @@ QUOTE_200 = {
         "tax": {"amount": {"amount": 1.50, "currency": "USD"}, "includedInPrices": False},
         "finalAmount": {"amount": 45.00, "currency": "USD"},
     },
+}
+
+
+#: A quote in EXACTLY the shape a live sandbox `POST /agentic/quotes` returned on 2026-09-18
+#: (key names and value types; the amounts are ours): no `items`; `tax` nested one level deeper
+#: with an INT amount; empty `discounts` / `additionalCharges`; FLOAT amounts everywhere else;
+#: four shipping options, each `{id, name, selected, price}`. 42.50 + 2.50 + 0 = 45.00, so it
+#: agrees with CHECKOUT_COMPLETED's `finalAmount`.
+LIVE_QUOTE = {
+    "id": "f1e2d3c4",
+    "expiresAt": "2099-01-01T00:00:00Z",
+    "amountBreakdown": {
+        "itemsSubtotal": {"amount": 42.5, "currency": "USD"},
+        "shipping": {"amount": 2.5, "currency": "USD"},
+        "tax": {"amount": {"amount": 0, "currency": "USD"}},
+        "discounts": [],
+        "additionalCharges": [],
+        "finalAmount": {"amount": 45.0, "currency": "USD"},
+    },
+    "shippingOptions": [
+        {"id": "ship_std", "name": "Standard", "selected": True,
+         "price": {"amount": 2.5, "currency": "USD"}},
+        {"id": "ship_exp", "name": "Express", "selected": False,
+         "price": {"amount": 9.99, "currency": "USD"}},
+        {"id": "ship_ovn", "name": "Overnight", "selected": False,
+         "price": {"amount": 24.0, "currency": "USD"}},
+        {"id": "ship_free", "name": "Free over 50", "selected": False,
+         "price": {"amount": 0.0, "currency": "USD"}},
+    ],
 }
 
 CHECKOUT_CREATED = {
@@ -1308,7 +1338,7 @@ async def test_a_completed_row_is_never_claimed_again(reap, attribution):
 # priced as one unit.
 
 
-def _quote(_quantity=1, _variant="var_abc123", **breakdown_over):
+def _quote(_quantity=None, _variant=None, **breakdown_over):
     """QUOTE_200 with its breakdown overridden, and its ITEMS echo kept in step.
 
     `_quantity` / `_variant` exist because the echo check compares them: a test that raised the
@@ -1318,7 +1348,11 @@ def _quote(_quantity=1, _variant="var_abc123", **breakdown_over):
     "missing component" cases are built — an absent block and a zero block are different claims
     and only one of them is a number."""
     payload = json.loads(json.dumps(QUOTE_200))
-    payload["items"] = [{"variantId": _variant, "quantity": _quantity}]
+    # A PRESENT echo only when a test asks for one: Reap sends none (live sandbox, 2026-09-18).
+    if _quantity is not None or _variant is not None:
+        payload["items"] = [
+            {"variantId": _variant or "var_abc123", "quantity": 1 if _quantity is None else _quantity}
+        ]
     for key, value in breakdown_over.items():
         if value is None:
             payload["amountBreakdown"].pop(key, None)
@@ -2263,10 +2297,13 @@ async def test_a_quote_for_a_different_quantity_is_refused(reap, attribution):
     assert row["last_error_code"] == "quote_items_mismatch"
 
 
+_ABSENT = object()
+
+
 @pytest.mark.parametrize(
     "items",
     [
-        None,
+        None,  # PRESENT and null — only a MISSING key skips the echo
         [],
         "var_abc123",
         {"variantId": "var_abc123", "quantity": 1},
@@ -2280,15 +2317,12 @@ async def test_a_quote_for_a_different_quantity_is_refused(reap, attribution):
 async def test_a_quote_that_does_not_say_what_it_priced_is_unverifiable(
     items, reap, attribution
 ):
-    """ANYTHING WE CANNOT READ AS "exactly the line we sent" IS A REFUSAL, including an absent
-    `items`, a non-list, a dict-shaped one, two lines, and a quantity that is a bool or a string.
-    A quote that does not say what it priced is not a quote we can check — the same rule the
-    client applies to a `nextAction` it cannot vet."""
+    """A PRESENT `items` that we cannot read as "exactly the line we sent" IS A REFUSAL: `null`,
+    `[]`, a non-list, a dict-shaped one, two lines, a quantity that is a bool or a string. Only
+    an ABSENT key skips the echo (Reap sends none) — see
+    `test_the_happy_path_completes_on_the_live_quote_shape`."""
     payload = _quote()
-    if items is None:
-        payload.pop("items")
-    else:
-        payload["items"] = items
+    payload["items"] = items
     result, row = await _quote_outcome(reap, payload)
     assert row["refusal_reason"] == "price_unverifiable"
     assert row["last_error_code"] == "quote_items_mismatch"
@@ -2298,11 +2332,16 @@ def test_the_echo_check_is_skipped_when_no_variant_is_supplied():
     """CONTROL for the parameter's default. The direct unit tests call `verify_quote` without a
     variant id; an end-to-end caller always has one, and `_step_quoting` passes it."""
     row = {"currency": "USD", "our_price_minor": 4250, "quantity": 1}
-    assert svc.verify_quote(QUOTE_200, row).ok is True
-    assert svc.verify_quote(QUOTE_200, row, variant_id="var_abc123").ok is True
-    assert svc.verify_quote(QUOTE_200, row, variant_id="var_other").last_error_code == (
+    echoed = _quote(_variant="var_abc123")
+    assert svc.verify_quote(echoed, row).ok is True
+    assert svc.verify_quote(echoed, row, variant_id="var_abc123").ok is True
+    assert svc.verify_quote(echoed, row, variant_id="var_other").last_error_code == (
         "quote_items_mismatch"
     )
+    # And with NO echo — what Reap actually sends — any variant id passes the echo step; the
+    # amount rules are what is left.
+    assert "items" not in QUOTE_200
+    assert svc.verify_quote(QUOTE_200, row, variant_id="var_other").ok is True
 
 
 def test_verify_quote_re_applies_the_quantity_ceiling():
@@ -2772,3 +2811,51 @@ async def test_the_unexported_reader_is_not_the_one_we_use(reap):
     assert "get_enrollment_internal" in source
     assert "get_enrollment_by_reap_id" not in source
     assert "get_enrollment_by_reap_id" not in ledger.__all__
+
+
+# ── the LIVE quote shape (2026-09-18): no `items`, nested int tax, four priced options ────────
+
+
+async def test_the_happy_path_completes_on_the_live_quote_shape(reap, attribution):
+    """Before the fix, EVERY real quote refused as `quote_items_mismatch`: the lane could never
+    complete a purchase once armed. On the shape Reap actually sends, it completes."""
+    reap.request_quote = _ok(LIVE_QUOTE)
+    purchase_id = await _drive_to_completed(reap, attribution)
+    row = await _get(purchase_id)
+    assert row["state"] == "completed" and row["last_error_code"] is None
+    assert (row["quoted_total_minor"], row["shipping_minor"], row["tax_minor"]) == (4500, 250, 0)
+    assert len(attribution.calls) == 1
+
+
+async def test_an_absent_items_key_skips_only_the_echo(reap, attribution):
+    """Every other rule still runs without an echo — the subtotal above all."""
+    payload = json.loads(json.dumps(LIVE_QUOTE))
+    payload["amountBreakdown"]["itemsSubtotal"] = _usd(42.49)
+    payload["amountBreakdown"]["finalAmount"] = _usd(44.99)
+    result, row = await _quote_outcome(reap, payload)
+    assert row["state"] == "refused"
+    assert row["last_error_code"] == "quote_items_subtotal_mismatch"
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        None, "ship_std", [{}], [{"id": "x"}],
+        [{"id": "x", "price": {"amount": 1.0, "currency": "EUR"}}],
+        [{"id": "x", "price": {"amount": -1.0, "currency": "USD"}}],
+    ],
+    ids=["null", "string", "empty-object", "id-only", "wrong-currency", "negative"],
+)
+def test_present_shipping_options_must_each_be_priced_in_the_row_currency(options):
+    row = {"currency": "USD", "our_price_minor": 4250, "quantity": 1}
+    payload = dict(LIVE_QUOTE, shippingOptions=options)
+    check = svc.verify_quote(payload, row, variant_id="var_abc123")
+    assert (check.ok, check.last_error_code) == (False, "quote_shipping_options_malformed")
+
+
+def test_absent_or_empty_shipping_options_are_allowed_on_the_variant_lane():
+    row = {"currency": "USD", "our_price_minor": 4250, "quantity": 1}
+    assert svc.verify_quote({k: v for k, v in LIVE_QUOTE.items() if k != "shippingOptions"},
+                            row, variant_id="var_abc123").ok
+    assert svc.verify_quote(dict(LIVE_QUOTE, shippingOptions=[]), row,
+                            variant_id="var_abc123").ok
