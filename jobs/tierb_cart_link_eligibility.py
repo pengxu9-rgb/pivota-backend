@@ -48,8 +48,9 @@ paid and no payment step is reached.
 ── LOGGING ─────────────────────────────────────────────────────────────────────────────────
 
 No full cart URL is ever logged or printed: the preflight redacts its own, the HTTP client's
-loggers are held at WARNING while this runs, and the one URL this module prints (the landing,
-in the per-merchant line) goes through `redact_cart_permalink` first.
+loggers are held at WARNING while `main()` runs (and restored when it returns, since logger
+levels are process-wide), and the one URL this module prints (the landing, in the per-merchant
+line) goes through `redact_cart_permalink` first.
 
 ── EXIT CODE (highest applicable wins) ─────────────────────────────────────────────────────
 
@@ -456,11 +457,43 @@ def _emit_line(line: str) -> None:
     print(line, flush=True)
 
 
-def _quiet_http_client_logs() -> None:
+def _quiet_http_client_logs() -> Callable[[], None]:
     """httpx logs every request URL at INFO. The preflight redacts those while it runs, but this
-    job has no reason to emit them at all."""
-    for name in _HTTP_CLIENT_LOGGERS:
-        logging.getLogger(name).setLevel(logging.WARNING)
+    job has no reason to emit them at all.
+
+    SCOPED, and the returned callable undoes it. Logger levels are PROCESS-WIDE state: left
+    raised, they silence every later caller's httpx/httpcore records — measured, running the job
+    suite before #2209's preflight suite made its five "no PII in the logs" tests see ZERO log
+    lines, which is exactly the state in which an absence assertion passes vacuously."""
+    loggers = [logging.getLogger(name) for name in _HTTP_CLIENT_LOGGERS]
+    saved = [(lg, lg.level) for lg in loggers]
+    for lg in loggers:
+        lg.setLevel(logging.WARNING)
+
+    def restore() -> None:
+        for lg, level in saved:
+            lg.setLevel(level)
+
+    return restore
+
+
+def _cli_logging() -> Callable[[], None]:
+    """The CLI's logging setup (INFO on the root, the HTTP clients held at WARNING), returning a
+    callable that puts every touched setting back: the root's level and handlers too, since
+    `basicConfig` adds a handler to a root that has none."""
+    root = logging.getLogger()
+    root_level, root_handlers = root.level, list(root.handlers)
+    logging.basicConfig(level=logging.INFO)
+    restore_http = _quiet_http_client_logs()
+
+    def restore() -> None:
+        restore_http()
+        for handler in list(root.handlers):
+            if handler not in root_handlers:
+                root.removeHandler(handler)
+        root.setLevel(root_level)
+
+    return restore
 
 
 async def _main_async(args: argparse.Namespace) -> RunSummary:
@@ -491,10 +524,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not args.budget_seconds > 0:
         parser.error("--budget-seconds must be positive")
 
-    logging.basicConfig(level=logging.INFO)
-    _quiet_http_client_logs()
-    summary = asyncio.run(_main_async(args))
-    print("summary", json.dumps(summary.to_dict(), sort_keys=True), flush=True)
+    restore_logging = _cli_logging()
+    try:
+        summary = asyncio.run(_main_async(args))
+        print("summary", json.dumps(summary.to_dict(), sort_keys=True), flush=True)
+    finally:
+        restore_logging()
     return summary.exit_code
 
 

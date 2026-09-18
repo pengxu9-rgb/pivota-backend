@@ -73,6 +73,33 @@ async def db():
         await database.disconnect()
 
 
+def _touched_loggers() -> List[logging.Logger]:
+    names = {"httpx", "httpcore", job.__name__, "__main__"}
+    names |= {n for n in logging.root.manager.loggerDict if n.startswith("httpcore.")}
+    return [logging.getLogger(n) for n in sorted(names)]
+
+
+@pytest.fixture(autouse=True)
+def _restore_logging_state():
+    """Logger state is PROCESS-WIDE. A test here that leaks a raised httpx/httpcore level makes
+    every later suite that asserts on those records — #2209's "no PII in the logs" tests among
+    them — see nothing at all, and an absence assertion then passes vacuously. Snapshot and
+    restore level, propagate and disabled for every logger this job touches, and the root's
+    level and handlers (the CLI calls `basicConfig`)."""
+    saved = [(lg, lg.level, lg.propagate, lg.disabled) for lg in _touched_loggers()]
+    root = logging.getLogger()
+    root_level, root_handlers = root.level, list(root.handlers)
+    yield
+    for lg, level, propagate, disabled in saved:
+        lg.setLevel(level)
+        lg.propagate = propagate
+        lg.disabled = disabled
+    for handler in list(root.handlers):
+        if handler not in root_handlers:
+            root.removeHandler(handler)
+    root.setLevel(root_level)
+
+
 class FakeClock:
     def __init__(self, start: float = 1000.0) -> None:
         self.now = start
@@ -272,6 +299,66 @@ def test_main_with_the_gate_off_exits_zero_without_touching_the_database(monkeyp
     monkeypatch.setattr(database, "connect", boom)
     assert job.main([]) == 0
     assert '"gate_enabled": false' in capsys.readouterr().out
+
+
+def _http_levels() -> Dict[str, int]:
+    return {n: logging.getLogger(n).level for n in ("httpx", "httpcore")}
+
+
+@pytest.mark.parametrize("before", [logging.NOTSET, logging.DEBUG])
+def test_main_restores_the_http_client_log_levels_it_raised(monkeypatch, before):
+    """The regression for the leak: asserted INSIDE the test, before the autouse fixture's
+    teardown could hide it. The CLI still runs with httpx/httpcore at WARNING."""
+    monkeypatch.delenv(job.GATE_ENV, raising=False)
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(before)
+    root = logging.getLogger()
+    root_level, root_handlers = root.level, list(root.handlers)
+    during = {}
+    real = job._main_async
+
+    async def spy(args):
+        during.update(_http_levels())
+        return await real(args)
+
+    monkeypatch.setattr(job, "_main_async", spy)
+    assert job.main([]) == 0
+    assert during == {"httpx": logging.WARNING, "httpcore": logging.WARNING}  # CLI behaviour kept
+    assert _http_levels() == {"httpx": before, "httpcore": before}  # and undone
+    assert root.level == root_level and list(root.handlers) == root_handlers
+
+
+def test_main_leaves_no_root_handler_or_level_behind(monkeypatch):
+    """Under pytest the root already has capture handlers, so `basicConfig` is a no-op and the
+    root half of the restore is invisible. Give the root no handlers — the state a plain process
+    starts in, where `basicConfig` DOES add one and set INFO — and check both come back."""
+    monkeypatch.delenv(job.GATE_ENV, raising=False)
+    root = logging.getLogger()
+    monkeypatch.setattr(root, "handlers", [])
+    root.setLevel(logging.ERROR)
+    during = {}
+    real = job._main_async
+
+    async def spy(args):
+        during.update(level=root.level, handlers=len(root.handlers))
+        return await real(args)
+
+    monkeypatch.setattr(job, "_main_async", spy)
+    assert job.main([]) == 0
+    assert during == {"level": logging.INFO, "handlers": 1}  # the CLI's own setup ran
+    assert root.handlers == [] and root.level == logging.ERROR
+
+
+def test_main_restores_the_log_levels_even_when_the_run_raises(monkeypatch):
+    logging.getLogger("httpx").setLevel(logging.INFO)
+
+    async def crash(args):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(job, "_main_async", crash)
+    with pytest.raises(RuntimeError):
+        job.main(["--dry-run"])
+    assert logging.getLogger("httpx").level == logging.INFO
 
 
 def test_main_refuses_a_non_positive_budget():
