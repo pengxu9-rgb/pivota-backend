@@ -343,6 +343,14 @@ jobs:
         run: |
           python - <<'PY'
           import os, sys, math, collections, xml.etree.ElementTree as ET
+          # 2026-09-18: 18,905 executed on main at f30956c01 (Reap WP1 at 7b274ed55
+          # had already crossed the cap at 18,869; #2205 added 36). The 16,950 floor
+          # had grown 1,955 of slack (cap 18,645), the cap tripped on both push runs,
+          # and the deploy gate refused both -- prod stayed on 6c5b695ce from 00:42Z.
+          # Every test PASSED; the failure was only this assert. Re-floated into the
+          # printed window (17,187..18,905) at the same ~97%-of-measured: ~565 tests
+          # of deletion headroom, cap 20,174.
+          #
           # 2026-09-14: 17,479 executed on main at e793a2c15 (#2180, which added
           # ~200 tests); the 15,700 floor had grown 1,779 of slack (cap 17,270)
           # and the cap tripped on the push run, so the deploy gate refused and
@@ -368,7 +376,7 @@ jobs:
           # 2026-09-03: 14,027 executed on main; the 12,000 floor had grown 2,027
           # of slack (cap 13,200) and the cap tripped, as designed. Re-floated
           # into the window the assert printed (12,752..14,027).
-          FLOOR = 16950
+          FLOOR = 18340
           # Slack allowance, global and per-subtree: 10% of the floor, but never
           # fewer than ABS_SLACK tests. The absolute term is not decoration — a
           # pure percentage is unusable on a small tree. readiness.tests
