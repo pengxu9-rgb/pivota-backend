@@ -96,6 +96,7 @@ poller drives the state machine afterwards, on another process, over the next mi
     "email": "ada@example.test",
     "name": "Ada Lovelace",
     "phone": "+15550100",
+    "consent_version": "reap-agentic-v1",
     "shipping_address": {
       "firstName": "Ada",
       "lastName": "Lovelace",
@@ -120,7 +121,8 @@ poller drives the state machine afterwards, on another process, over the next mi
 | `product_key` | yes | our catalog key (`catalog_products.product_key`). |
 | `variant_key` | no | our sku key (`catalog_skus.sku_key`), matched **exactly**. Omit only when the product has exactly one variant; a multi-variant product with no `variant_key` is `row_not_found`. |
 | `quantity` | no (default 1) | 1..10 (`MAX_QUANTITY`). |
-| `buyer.email` | yes | |
+| `buyer.email` | yes | the contact for **this purchase**. It is **not** an identity: nothing about the buyer we resolve or create is derived from it. See "The buyer identity" below. |
+| `buyer.consent_version` | **yes** | the version tag of the terms your user accepted, ≤ 32 printable characters. Missing, blank, over-long or unprintable ⇒ `400 consent_required`. Stored against the buyer and **overwritten on every purchase**, so it is always the latest version they accepted. Not an enum — we record the tag, we do not adjudicate it — and not part of the idempotency hash, so re-consenting mid-retry still replays. |
 | `buyer.shipping_address` | yes | **the Reap client's field names**, not the snake_case shape `/agent/v2/commerce/checkouts` uses. Required: `firstName`, `lastName`, `phone`, `addressLine1`, `city`, `country`. Optional: `addressLine2`, `region`, `postalCode`. Unknown keys are dropped. |
 | `buyer.name`, `buyer.phone` | no | **fallbacks only.** Used when the address omits the field; never override it. `name` splits on the last space. |
 | `return_url` | no | defaults to `REAP_AGENTIC_RETURN_URL`, else `https://agent.pivota.cc/reap/return`. Must be https, no userinfo, on a host in `REAP_RETURN_URL_HOSTS`. |
@@ -158,12 +160,14 @@ or that supplies the recipient through `buyer.name` rather than in the address, 
 | 404 | `not_available_on_this_rail` | the dial is off, or the Reap client is unconfigured | fall back |
 | 401 | `agent_user_required` | no `X-Agent-User-JWT` | get a user token, or fall back |
 | 409 | `merchant_not_eligible` | no enabled eligibility row for this domain **in the buyer's market** | fall back |
-| 409 | `buyer_unlinked` | no `buyer_identity_links` row for this agent user — **today this is every agent-only buyer**, see below | fall back |
+| 409 | `buyer_unlinked` | **you should never see this.** Since WP4b the buyer identity is created on the first purchase, so this no longer means "no link" — it is the fail-closed answer when the identity or the opaque ref could not be *stored* (a storage fault, not a request fault). Retrying is reasonable; editing the body will not help. | retry once, then fall back |
 | 409 | `row_not_found` | no such product under this domain, or the variant is not this product's, or no variant named and the product has more than one | fall back |
 | 409 | `row_not_shopify` | the catalog row's intake lane is not `shopify` | fall back |
 | 409 | `row_unpriced` | **this merchant** has no usable offer of its own on the sku, or the price is not exactly representable in minor units | fall back |
 | 409 | `row_currency_mismatch` | the offer is priced in a currency the buyer's market does not use | fall back |
 | 409 | `idempotency_conflict` | this key was already used for a **different** request | use a new key, or re-send the original request |
+| 400 | `consent_required` | `buyer.consent_version` is **absent, blank, longer than 32 characters, or carries an unprintable character** — i.e. a string-shaped value that is not usable | show your user the terms, then resend with the tag |
+| 400 | `invalid_request` | `buyer.consent_version` is **present but not a string** (`123`, `true`, `{}`, `[]`, `1.5`) — a type error is a malformed body, not a missing act by a human, and the two codes tell you to do different things | fix the request |
 | 400 | `invalid_request` | the body is not a JSON object, did not validate, `quantity` out of range, `limit` out of range, or an identifier carries an unprintable character | fix the request |
 | 400 | `invalid_address` | the shipping address is incomplete or unprintable | fix the request |
 | 400 | `invalid_return_url` | not https, carries userinfo, or an unallowed host | fix the request |
@@ -421,25 +425,102 @@ Each element has exactly the same shape as the single read.
 
 ---
 
-## `buyer_unlinked` — read this before planning the integration
+## The buyer identity — read this before planning the integration
 
-**Today, `buyer_unlinked` is the answer for every buyer the agent knows only through an agent user
-token.** That is not an edge case; it is the current state of the system.
+**Linking is automatic on the first purchase.** An agent-only buyer — one we know only through an
+agent user token — gets a buyer identity created for them by their first `POST /purchases`, and
+every purchase after that resolves to the same one. There is nothing to call first and no
+enrollment step to build.
 
-`buyer_identity_links` has exactly one writer: `routes/buyer_api._upsert_buyer_identity_link`,
-reached from `POST /buyer/save_from_checkout` under **buyer authentication**. The link is created
-when a human signs in and consents — nothing an agent presents can create one.
+This reverses what this page said through WP4, when `buyer_unlinked` was the answer for every
+agent-only buyer. Owner decision, 2026-09-18.
 
-The refusal is deliberate and is **not** going to be relaxed by widening this route. A Reap
-enrollment is a **stored card**. Minting a link from an agent's bare assertion would hang that card
-off a buyer account nothing else in the system knows about, and the same human signing in tomorrow
-would get a second account and be asked for their card again.
+### What gets created, and what does not
 
-**Consequence for WP5: this rail cannot be armed for Minds buyers until there is a
-buyer-authenticated enrollment step** — a point in the flow where the buyer themselves establishes
-the link, after which the agent's user token resolves to a real buyer. Until that exists, every
-`POST /purchases` from an agent-only session answers `409 buyer_unlinked` and the door falls back,
-which is the correct behaviour and not a bug to route around.
+On the first purchase, when `(agent_id, hash(agent_user_ref))` has no row:
+
+| created | not created |
+|---|---|
+| a `buyer_identity_links` row binding that pair to a new buyer id | a `shop_users` account |
+| an opaque `reap_agentic_buyer_refs` row — the `owner.id` Reap enrols the card against | anything derived from `buyer.email` |
+
+The buyer id is **random**. It is not derived from the email, the user ref, or anything else in
+the request, and no account row is created for it. That is a security property, not an
+implementation detail: the repo's account writer is *create-or-get* — handed an email that already
+has an account it returns **that account**. Minting through it would let an agent that asserted a
+stranger's email be handed the stranger's real buyer id, and with it their saved email and default
+shipping address on the next checkout intent. The identity an agent asserts is unverified, so it
+lives in its own space and can never collide with a verified one.
+
+The cost of having no account row is a checkout-intent **prefill**, which returns nothing for
+these buyers — exactly what it returned for them before, when there was no link at all. Nothing
+regresses.
+
+### An existing link always wins
+
+If the buyer signed in through the hosted checkout, that link already exists and this route uses
+it unchanged — it never repoints a link a human's sign-in established. Two concurrent first
+purchases produce **one** buyer, **one** link and **one** ref: the insert cannot overwrite, and
+the route re-reads rather than trusting what it minted.
+
+### The one thing WP5 must plan for — the repoint residue
+
+If the same human **later** signs in through the hosted checkout, `POST /buyer/save_from_checkout`
+repoints the link to their real account — correctly, a verified account supersedes a placeholder.
+Because `reap_agentic_buyer_refs` is keyed on the buyer id, their next purchase mints a fresh ref
+and **Reap asks for the card once more**.
+
+**It is not only one extra card entry.** The repoint does not clean up behind itself, and nothing
+else does either:
+
+| what is left behind | state it is left in |
+|---|---|
+| the old `reap_agentic_buyer_refs` row | still there, still holding its `consent_version` / `consented_at`, now pointing at a buyer id no `buyer_identity_links` row mentions — **unreachable** |
+| the old `reap_agentic_enrollments` row | still `status = 'active'`, still holding `card_network`, `card_last4`, `hosted_url` — keyed on the **old** `buyer_ref`, so no future purchase will ever find it |
+| the enrollment **at Reap** | **never revoked.** We stop using it; we do not tell Reap to stop honouring it |
+
+So the buyer's consent record for the account they now use is the *new* row, and the old one is an
+orphan that no query in this rail will ever return. The operator SQL to find and retire these is in
+the runbook under "Before arming". The proper fix — **revoking the enrollment at the moment of the
+repoint** — belongs in `routes/buyer_api`, not on this route, and is a follow-up rather than
+something this PR silently half-does.
+
+That is the trade the owner took. WP4 avoided it by refusing every agent-only buyer forever, which
+made the rail unusable for the door it exists for.
+
+---
+
+## `consent_required` — the gate in front of all of this
+
+`buyer.consent_version` is **required** on every `POST /purchases`. Omit it and the answer is
+`400 consent_required`, decided before eligibility, before the catalog is read, and before
+anything is written — a buyer who has not consented gets no identity, no purchase, and no
+information about which merchants we have enabled.
+
+It exists because WP4b took a human out of the loop. Before it, the buyer arrived already linked
+by a surface where they had signed in, and **that sign-in was the consent**. Creating the identity
+from an agent's assertion removes that step, so the door has to carry the act forward on the
+request that uses it.
+
+* **It is a version tag, not prose.** The wording is Pivota's and is rendered by the door; what
+  the backend records is *which* wording was shown. ≤ 32 printable characters.
+* **We do not adjudicate it.** There is no allowlist of known versions — a backend that refused
+  an unrecognised tag would reject the newest consent the moment the door shipped it.
+* **Latest wins.** It is rewritten on **every** `POST` that succeeds, alongside a `consented_at`
+  timestamp — **including an idempotent replay**. Send a newer tag with a retried
+  `idempotency_key` and the stored tag moves, even though the response is the original purchase.
+* **It is deliberately NOT part of the idempotency request hash.** That hash covers what *decides
+  the purchase* — merchant, product, variant, quantity, buyer email, shipping address, return
+  url. Consent is not one of those: folding it in would turn a door that upgraded its consent
+  version mid-retry into `409 idempotency_conflict`, which is the opposite of what you want from
+  a client that just collected a *stronger* consent. So a retry carrying a new tag replays to the
+  same purchase **and** records the new tag.
+* **A non-string is `invalid_request`, not `consent_required`.** `123`, `true`, `{}` and `[]` are
+  refused as a malformed body; they never reach the consent check. `consent_required` means "go
+  and ask your user", `invalid_request` means "fix your JSON".
+
+The dial is still checked **first**: a dark rail answers `404` to a request with no consent, the
+same as to every other request, so this field cannot be used to probe whether the rail is armed.
 
 ---
 

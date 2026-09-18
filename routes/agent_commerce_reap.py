@@ -48,11 +48,33 @@ domain with no enabled row for the buyer's market refuses `merchant_not_eligible
 
 **The buyer is never the caller's.** The purchase is opened for the buyer that
 `buyer_identity_links` maps `(agent_id, hash(agent_user_ref))` to, and for nobody else. An agent
-cannot name a buyer in the body; there is no field for it.
+cannot name a buyer in the body; there is no field for it. Since WP4b that mapping is CREATED on
+the first purchase when it is absent (see `_buyer_id_for`), and the important half of "never the
+caller's" survives that intact: the identity is minted from randomness, never from the email or
+anything else in the body, and the existing row always wins. An agent can cause a buyer to exist;
+it still cannot choose WHICH buyer.
+
+── CONSENT ──────────────────────────────────────────────────────────────────────────────────
+
+`buyer.consent_version` is REQUIRED on the POST and its absence is `consent_required` (400),
+checked after the dial and before eligibility, the catalog read, and every write. It is the
+version tag of the terms the buyer accepted, stored on `reap_agentic_buyer_refs` — the row the
+card enrollment hangs off — and rewritten on every purchase, so the pair
+`(consent_version, consented_at)` is always the LATEST consent rather than the first.
+
+The field exists because WP4b took a human out of the loop. Before it, a buyer arrived already
+linked by a surface where they had signed in, and that sign-in WAS the consent; minting the
+identity from an agent's assertion removes that step, so the door must carry the act forward.
+The wording is the owner's and lives at the door. This route records which wording, and
+deliberately does not adjudicate it — see `_consent_version`.
 
 ── THE THREE IDENTIFIERS, AND WHY REAP GETS THE THIRD ───────────────────────────────────────
 
     buyer_id                the global buyer. Joins to orders, addresses, users. NEVER leaves.
+                            Minted here on an agent-only buyer's first purchase; it is then an
+                            id in `shop_users`' format with NO `shop_users` row behind it, and
+                            `_buyer_id_for` explains at length why creating that row from the
+                            request's email would be an account-takeover primitive.
     agent_user_ref_hash     the ownership conjunct on the purchase row. NEVER leaves.
     reap_buyer_ref          opaque, per-buyer, minted here. This is `owner.id` at Reap.
 
@@ -80,6 +102,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import unicodedata
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional, Tuple
@@ -137,6 +160,13 @@ _REFUSAL_STATUS: Dict[str, int] = {
     "invalid_address": 400,
     "invalid_return_url": 400,
     "currency_unsupported": 400,
+    # The buyer did not agree to anything. 400 AND NOT 401/403: the caller CAN fix this by
+    # editing the request — it is a missing field, not a missing credential — and a 401 would
+    # send a door that already holds a valid user token off to re-authenticate, which would
+    # change nothing. It is listed apart from `invalid_request` because the door has to be able
+    # to tell "your body is malformed" from "go and ask your user", which are different
+    # instructions to different parts of a client.
+    "consent_required": 400,
     # The request is well-formed; the world does not permit it. Editing the body will not help.
     "merchant_not_eligible": 409,
     "buyer_unlinked": 409,
@@ -225,6 +255,54 @@ def _identifier(value: Any, name: str, *, max_chars: int) -> str:
     return text
 
 
+#: `reap_agentic_buyer_refs.consent_version` is `VARCHAR(32)` in migration 227. The cap is
+#: enforced HERE, before the bind, for the reason `_identifier` gives: a value past the column's
+#: width is a driver error on one dialect and a silent truncation on the other, and a TRUNCATED
+#: VERSION TAG NAMES A DIFFERENT VERSION — which is the one thing this field exists to get right.
+_CONSENT_VERSION_MAX_CHARS = 32
+
+
+def _consent_version(value: Any) -> str:
+    """The version of the terms this buyer accepted, or `consent_required`.
+
+    ── WHY A PURCHASE IS WHERE THIS IS ASKED FOR ────────────────────────────────────────────
+
+    Because this is the request that creates a DURABLE buyer identity and, behind it, a stored
+    card at Reap. Before WP4b there was nowhere to put it: the buyer arrived already linked by a
+    surface where a human had signed in, and that sign-in was the consent. Minting the identity
+    from an agent's assertion removes the human from that step, so the door has to carry the act
+    forward explicitly — and it has to carry it on the request that USES it, not on some earlier
+    call whose result nothing here can see.
+
+    ── WHAT IS CHECKED, AND WHAT DELIBERATELY IS NOT ────────────────────────────────────────
+
+    Non-empty, within the column's width, and printable — the same three properties
+    `_identifier` demands, for the same three reasons, including that a NUL byte reaching an
+    asyncpg bind is a 500 rather than a refusal.
+
+    THE VALUE IS NOT MATCHED AGAINST A LIST. There is no allowlist of known versions and there
+    must not be one here: the wording is the owner's, it changes without a deploy, and a backend
+    that refused an unrecognised tag would reject the newest consent — the strongest one — the
+    moment the door shipped it and before we had. We record what was accepted; we do not
+    adjudicate it. What the record is FOR is answering "which wording was this buyer shown", and
+    for that, storing an unfamiliar tag beats refusing it.
+    """
+    text = str(value or "").strip()
+    if not text:
+        raise svc.PurchaseRefused("consent_required", "buyer.consent_version is required")
+    if len(text) > _CONSENT_VERSION_MAX_CHARS:
+        raise svc.PurchaseRefused(
+            "consent_required",
+            f"buyer.consent_version is longer than {_CONSENT_VERSION_MAX_CHARS}",
+        )
+    if any(unicodedata.category(ch) in _UNPRINTABLE for ch in text):
+        # The VALUE is not named, for the same reason `_identifier` does not name one.
+        raise svc.PurchaseRefused(
+            "consent_required", "buyer.consent_version contains characters that are not printable"
+        )
+    return text
+
+
 def _require_agent_user(agent_user: Optional[AgentUserContext]) -> str:
     """The end-user ref, or a refusal. A purchase needs a BUYER — there is nobody to enroll a
     card for, nobody to own the row, and nobody to scope a later read to."""
@@ -281,6 +359,13 @@ class ReapBuyer(BaseModel):
     name: Optional[str] = None
     phone: Optional[str] = None
     shipping_address: ReapShippingAddress
+    #: REQUIRED BY THE ROUTE, OPTIONAL IN THIS MODEL, AND THAT IS THE POINT. A pydantic
+    #: `Field(...)` here would be validated before the handler's own checks and would arrive as
+    #: `invalid_request` — the one code that tells a door to go and fix its JSON. A missing
+    #: consent is not a malformed body; it is a missing act by a human, and it has its own code.
+    #: `_consent_version` below is the real requirement, and it is a statement the mutant table
+    #: can delete on its own.
+    consent_version: Optional[str] = None
 
 
 class StartPurchaseRequest(BaseModel):
@@ -462,47 +547,216 @@ async def _eligibility(
 # ── the buyer ────────────────────────────────────────────────────────────────────────────────
 
 
-async def _buyer_id_for(*, agent_id: str, agent_user_ref_hash: str) -> str:
-    """`(agent_id, hash(agent_user_ref))` -> `buyer_id`, or `buyer_unlinked`.
+_BUYER_LINK_SQL = """
+    SELECT buyer_id
+      FROM buyer_identity_links
+     WHERE agent_id = :agent_id
+       AND agent_user_ref_hash = :agent_user_ref_hash
+     LIMIT 1
+"""
 
-    ── WHY THIS REFUSES INSTEAD OF CREATING A LINK ──────────────────────────────────────────
 
-    The brief left the choice open. The code decides it: the ONLY writer of
-    `buyer_identity_links` is `routes/buyer_api._upsert_buyer_identity_link`, and it is reached
-    from a BUYER-AUTHENTICATED surface — the buyer signs in, and that is what binds the agent's
-    opaque user ref to a real buyer account. `routes/agent_checkout_intents` only READS the link,
-    and proceeds happily without one, because there a missing link costs a form PREFILL.
+async def _linked_buyer_id(*, agent_id: str, agent_user_ref_hash: str) -> str:
+    """The buyer this pair is already linked to, or `""`. A PURE READ — it mints nothing.
 
-    Here it costs the buyer's identity. The link is what a long-lived card enrollment hangs off:
-    minting one from an agent's assertion alone would attach a stored card to a buyer account
-    nothing else in the system knows about, and the same human signing in tomorrow would get a
-    second account and be asked for their card again. Refusing sends the door to a rail that does
-    not need a durable buyer, which is the correct fallback and is what `not eligible` already
-    means everywhere else on this path.
+    Split out of `_buyer_id_for` so the replay path can record a consent against an existing
+    buyer without acquiring the power to create one. See the call site: a replay must be able to
+    update the consent tag, and must NOT be able to mint an identity before eligibility has been
+    checked.
     """
     row = await database.fetch_one(
-        """
-        SELECT buyer_id
-          FROM buyer_identity_links
-         WHERE agent_id = :agent_id
-           AND agent_user_ref_hash = :agent_user_ref_hash
-         LIMIT 1
-        """,
+        _BUYER_LINK_SQL,
+        {"agent_id": agent_id, "agent_user_ref_hash": agent_user_ref_hash},
+    )
+    return str(dict(row).get("buyer_id") or "").strip() if row else ""
+
+
+async def _touch_link(*, agent_id: str, agent_user_ref_hash: str) -> None:
+    """`last_seen_at` on a link we just used, the same as the prefill reader does.
+
+    `routes/agent_checkout_intents._buyer_prefill_from_identity_link` stamps this on every read,
+    and this route was the one surface that used a link without saying so — which made
+    `last_seen_at` mean "last seen by the checkout-intent path" rather than "last seen", and would
+    have made any dormancy sweep built on it retire buyers who purchase on this rail every day.
+
+    BEST-EFFORT, like its twin. A bookkeeping column must not be able to refuse a purchase.
+    """
+    try:
+        await database.execute(
+            """
+            UPDATE buyer_identity_links
+               SET last_seen_at = CURRENT_TIMESTAMP,
+                   updated_at = CURRENT_TIMESTAMP
+             WHERE agent_id = :agent_id
+               AND agent_user_ref_hash = :agent_user_ref_hash
+            """,
+            {"agent_id": agent_id, "agent_user_ref_hash": agent_user_ref_hash},
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _mint_buyer_id() -> str:
+    """A new buyer id, in the id space `db/accounts.create_or_get_shop_user` mints into.
+
+    `u_` + 16 hex characters: 18 characters into a `VARCHAR(50)` column, 64 bits of randomness,
+    and indistinguishable at every reader from an id that came from a sign-up. The FORMAT is
+    copied deliberately — a second spelling of "a buyer id" would be the kind of thing a later
+    `startswith` somewhere reads as a type tag — but nothing else about that function is.
+    """
+    return f"u_{secrets.token_hex(8)}"
+
+
+async def _buyer_id_for(*, agent_id: str, agent_user_ref_hash: str) -> str:
+    """`(agent_id, hash(agent_user_ref))` -> `buyer_id`, minting one on the first purchase.
+
+    ── WHAT CHANGED, AND WHOSE DECISION IT WAS ──────────────────────────────────────────────
+
+    WP4 refused `buyer_unlinked` here, on the argument that the only writer of
+    `buyer_identity_links` was `routes/buyer_api._upsert_buyer_identity_link` — a
+    BUYER-AUTHENTICATED surface — so a link was something a human's sign-in created and nothing
+    an agent asserted could. The consequence was that EVERY agent-only buyer was refused, which
+    made the rail unarmable for the Minds door it was built for. The owner chose Option A on
+    2026-09-18: mint the buyer identity here, on the first purchase, from the agent JWT's user
+    reference. This function is that decision.
+
+    ── WHAT IS MINTED, AND WHAT IS EMPHATICALLY NOT ─────────────────────────────────────────
+
+    An OPAQUE buyer id, and NO `shop_users` row. Not "not yet" — never, on this path.
+
+    The obvious reading of "create the buyer the base writer would" is to call
+    `db.accounts.create_or_get_shop_user(buyer.email)`, and it is a HOLE. That function is
+    `create_or_GET`: it looks the email up by `email_normalized` first and RETURNS THE EXISTING
+    ACCOUNT when one matches. The email on this request is a string an agent put in a body. So an
+    agent that asserts a stranger's address would be handed that stranger's real `buyer_id`, and
+    the link written below would bind the agent's own user ref to a real human's account — after
+    which `routes/agent_checkout_intents._buyer_prefill_from_identity_link` hands that agent the
+    account's email and default shipping address on the next checkout intent. An account
+    takeover, reachable from an agent token, with the victim's address as the prize.
+
+    The identity minted here is AGENT-ASSERTED, not verified: the agent says "this is end user
+    X", and nothing has checked that. Such an identity must not be able to collide with a
+    verified one, so it is minted from randomness and never from anything the caller sent. The
+    email in the body goes where it always went — to `start_purchase`, as the contact for THIS
+    purchase — and is not an identity here.
+
+    ── WHAT A ROW-LESS BUYER ID COSTS, MEASURED RATHER THAN ASSUMED ─────────────────────────
+
+    `buyer_identity_links.buyer_id` is `VARCHAR(50)` with NO foreign key; there is no
+    `REFERENCES shop_users` anywhere in the repo. The table has exactly two readers besides this
+    module, and both tolerate a buyer id with no account behind it:
+
+      * `routes/agent_checkout_intents._buyer_prefill_from_identity_link` runs
+        `SELECT email FROM shop_users WHERE id = :id` inside a `try` and then reads
+        `buyer_addresses` for a default, also inside one. With neither it returns `None` — which
+        is precisely what it returned for this buyer YESTERDAY, when there was no link at all.
+        The prefill does not regress; it stays absent.
+      * `routes/buyer_api` writes the link, and writes it for a buyer that signed in.
+
+    So the cost is a prefill nobody had. What is bought is a durable identity for the enrollment
+    to hang off, which is the whole of WP4b.
+
+    ── AND WHEN THE SAME HUMAN LATER SIGNS IN ───────────────────────────────────────────────
+
+    `_upsert_buyer_identity_link` is a real upsert and REPOINTS the link to the signed-in
+    account. That is correct and is left alone: a verified account supersedes a placeholder.
+    What it costs is one re-enrollment — `reap_agentic_buyer_refs` is keyed on `buyer_id`, so
+    the next purchase mints a fresh ref for the real account and Reap asks for the card once
+    more. WP4 refused every such buyer forever to avoid exactly that; one re-enrollment after a
+    sign-in is the cheaper half of the trade, and docs/reap_agentic_routes.md says so out loud
+    so the door is not surprised by it.
+
+    ── WHY THE INSERT CANNOT OVERWRITE ──────────────────────────────────────────────────────
+
+    `ON CONFLICT DO NOTHING`, and then the answer is RE-READ rather than assumed. The row that
+    exists wins, whoever wrote it: a concurrent first purchase, or a buyer-authenticated link
+    written between our SELECT and our INSERT. `DO UPDATE` here would let this route — the one
+    with the WEAKEST evidence of who the buyer is — overwrite a link a human's sign-in
+    established. Returning `minted` without the re-read would be the same defect wearing a
+    different hat: two concurrent first purchases would then proceed under two different buyer
+    ids, one of which is in no table, and mint two enrollments for one card.
+    """
+    buyer_id = await _linked_buyer_id(
+        agent_id=agent_id, agent_user_ref_hash=agent_user_ref_hash
+    )
+    if buyer_id:
+        await _touch_link(agent_id=agent_id, agent_user_ref_hash=agent_user_ref_hash)
+        return buyer_id
+
+    minted = _mint_buyer_id()
+    try:
+        await database.execute(
+            """
+            INSERT INTO buyer_identity_links (
+                agent_id, agent_user_ref_hash, buyer_id, created_at, updated_at, last_seen_at
+            )
+            VALUES (
+                :agent_id, :agent_user_ref_hash, :buyer_id,
+                CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+            )
+            ON CONFLICT (agent_id, agent_user_ref_hash) DO NOTHING
+            """,
+            {
+                "agent_id": agent_id,
+                "agent_user_ref_hash": agent_user_ref_hash,
+                "buyer_id": minted,
+            },
+        )
+    except Exception:  # noqa: BLE001
+        # A dialect without `ON CONFLICT` raises the unique violation instead of absorbing it,
+        # and the answer to both is the same one: read what is there now.
+        pass
+
+    # THE RE-READ IS NOT A VERIFICATION STEP, IT IS THE ANSWER. `minted` is never returned.
+    row = await database.fetch_one(
+        _BUYER_LINK_SQL,
         {"agent_id": agent_id, "agent_user_ref_hash": agent_user_ref_hash},
     )
     buyer_id = str(dict(row).get("buyer_id") or "").strip() if row else ""
     if not buyer_id:
-        raise svc.PurchaseRefused("buyer_unlinked", "no buyer is linked to this agent user")
+        # The INSERT failed for a reason that was not a lost race. Fail CLOSED: continuing would
+        # open a purchase — and an enrollment — for a buyer no table has heard of.
+        raise svc.PurchaseRefused("buyer_unlinked", "could not establish a buyer identity")
     return buyer_id
 
 
-async def _reap_buyer_ref(buyer_id: str) -> str:
+async def _record_consent(buyer_id: str, consent_version: str) -> None:
+    """The LATEST consent this buyer gave, on the row the enrollment hangs off.
+
+    NOT WRAPPED IN A `try`, unlike almost everything else that touches this table. The writes
+    around it are wrapped because their failure mode is a lost RACE, which has a correct
+    recovery. This one's failure mode is a schema that is missing migration 227's columns, which
+    has no recovery and must not be absorbed into a purchase that then proceeds as though the
+    consent had been recorded. It surfaces as a 500 on a rail that is already live, which is what
+    every other genuine driver failure on this path does.
+    """
+    await database.execute(
+        """
+        UPDATE reap_agentic_buyer_refs
+           SET consent_version = :consent_version,
+               consented_at = :consented_at
+         WHERE buyer_id = :buyer_id
+        """,
+        {
+            "consent_version": consent_version,
+            "consented_at": _now(),
+            "buyer_id": buyer_id,
+        },
+    )
+
+
+async def _reap_buyer_ref(buyer_id: str, *, consent_version: str) -> str:
     """The opaque `owner.id` for this buyer. Insert-or-read, and race-safe by re-reading.
 
     Read first, because that is what almost every call does. On a miss, mint and insert; a
     concurrent caller that got there first raises a unique violation on either the primary key or
     `uq_reap_agentic_buyer_refs_ref`, and the answer to that is to READ WHAT THEY WROTE, never to
     retry the mint. Two refs for one buyer would be two enrollments for one card.
+
+    THE CONSENT IS WRITTEN ON EVERY PATH THROUGH HERE. On the mint it rides in the same INSERT,
+    so a row cannot exist without one. On every reuse it is rewritten, because the tag is the
+    LATEST version this buyer accepted and a buyer who accepts v2 has not un-accepted it by
+    having a row that says v1.
     """
     existing = await database.fetch_one(
         "SELECT reap_buyer_ref FROM reap_agentic_buyer_refs WHERE buyer_id = :buyer_id",
@@ -511,16 +765,24 @@ async def _reap_buyer_ref(buyer_id: str) -> str:
     if existing:
         ref = str(dict(existing).get("reap_buyer_ref") or "").strip()
         if ref:
+            await _record_consent(buyer_id, consent_version)
             return ref
 
     minted = mint_pairwise_buyer_ref()
     try:
         await database.execute(
             """
-            INSERT INTO reap_agentic_buyer_refs (buyer_id, reap_buyer_ref)
-            VALUES (:buyer_id, :reap_buyer_ref)
+            INSERT INTO reap_agentic_buyer_refs (
+                buyer_id, reap_buyer_ref, consent_version, consented_at
+            )
+            VALUES (:buyer_id, :reap_buyer_ref, :consent_version, :consented_at)
             """,
-            {"buyer_id": buyer_id, "reap_buyer_ref": minted},
+            {
+                "buyer_id": buyer_id,
+                "reap_buyer_ref": minted,
+                "consent_version": consent_version,
+                "consented_at": _now(),
+            },
         )
         return minted
     except Exception:  # noqa: BLE001
@@ -536,6 +798,7 @@ async def _reap_buyer_ref(buyer_id: str) -> str:
         # answer: continuing would mean opening a purchase under a ref nothing has stored, and
         # the enrollment it creates would be unreachable from the next purchase.
         raise svc.PurchaseRefused("buyer_unlinked", "could not establish a buyer reference")
+    await _record_consent(buyer_id, consent_version)
     return ref
 
 
@@ -1120,6 +1383,22 @@ async def start_reap_purchase(
             # is the buyer's address. Never forwarded, never logged.
             raise svc.PurchaseRefused("invalid_request", "the request body did not validate")
 
+        # ── CONSENT, AND WHERE IT SITS IN THE ORDER ──────────────────────────────────────────
+        #
+        # AFTER THE DIAL, WHICH IS NOT A STYLE CHOICE. `_require_rail()` is the first statement
+        # of this handler and everything about a dark rail depends on it staying first: a
+        # `consent_required` answered before the dial is a 400 where every well-formed request
+        # gets a 404, which is a working probe for a feature that is supposed to be absent. That
+        # is the exact defect the note above these handlers records about `Body(...)` and
+        # `Query(...)`, and moving this check one line up would reintroduce it. The mutant table
+        # for this PR kills it in that direction specifically.
+        #
+        # BEFORE ELIGIBILITY, THE CATALOG READ AND EVERY WRITE, which is the other half. A buyer
+        # who has not consented must not have an identity minted for them, must not have a
+        # purchase opened, and must not be able to learn — by the shape of the refusal — which
+        # merchants we have enabled or what is in our catalogue.
+        consent_version = _consent_version(req.buyer.consent_version)
+
         # EVERY ROUTE-OWNED IDENTIFIER THROUGH ONE CHECKPOINT, before any of them can reach a
         # bind. `.lower()` after the check rather than before: the check is about what the string
         # CONTAINS, and lowercasing cannot add or remove an unprintable character.
@@ -1181,6 +1460,27 @@ async def start_reap_purchase(
                     agent_user_ref_hash=agent_user_ref_hash,
                 )
                 if view:
+                    # THE CONSENT IS RECORDED ON A REPLAY TOO, and this is the whole reason
+                    # `_linked_buyer_id` exists as a separate read.
+                    #
+                    # The contract page, the runbook and migration 227's header all say the tag
+                    # is rewritten on EVERY purchase and is always the latest version the buyer
+                    # accepted. Returning here without writing it made that false for exactly the
+                    # requests a door retries — which is where a consent version most plausibly
+                    # changes mid-flight. The prose was right and the code was wrong; this is the
+                    # code catching up.
+                    #
+                    # A READ, NOT `_buyer_id_for`. A replay implies the buyer already exists, so
+                    # the lookup finds them; using the minting version here would hand the replay
+                    # path the power to CREATE an identity before eligibility has been checked,
+                    # and a caller could then mint buyer rows by probing merchants we never
+                    # enabled. Nothing is written when there is no link — there is nothing to
+                    # record a consent against.
+                    replay_buyer_id = await _linked_buyer_id(
+                        agent_id=agent_id, agent_user_ref_hash=agent_user_ref_hash
+                    )
+                    if replay_buyer_id:
+                        await _record_consent(replay_buyer_id, consent_version)
                     return JSONResponse(
                         status_code=202,
                         content={
@@ -1212,7 +1512,7 @@ async def start_reap_purchase(
         buyer_id = await _buyer_id_for(
             agent_id=agent_id, agent_user_ref_hash=agent_user_ref_hash
         )
-        buyer_ref = await _reap_buyer_ref(buyer_id)
+        buyer_ref = await _reap_buyer_ref(buyer_id, consent_version=consent_version)
 
         purchase_id = await svc.start_purchase(
             agent_id=agent_id,

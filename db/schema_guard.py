@@ -710,6 +710,37 @@ async def ensure_required_schema_light() -> None:
                 )
             except Exception:  # noqa: BLE001
                 pass
+            # mig 227: the consent tag the buyer's enrollment hangs off.
+            #
+            # NOT FOLDED INTO THE CREATE ABOVE, DELIBERATELY. Folding it in
+            # would make this statement dead on a fresh database — the only
+            # kind CI builds — so deleting it would still pass every test while
+            # leaving the columns missing on exactly the databases that already
+            # hold a buyer_refs table, which is production. Kept separate, this
+            # statement is the whole of the heal on EVERY arrival: the CREATE
+            # builds the 226 shape and this brings it to 227, whether the table
+            # was born a second ago or a month ago.
+            #
+            # ITS OWN try, per the rule this block already follows. The columns
+            # are nullable with no default, so this cannot fail on data — but a
+            # raise here must not be able to starve the keys table below, which
+            # is the exact defect the comment above records.
+            #
+            # DO NOT WRITE THE TWO WORDS "A-L-T-E-R T-A-B-L-E" IN PROSE
+            # ANYWHERE IN THIS FILE — see the mig-225 comment above for the
+            # gate this breaks and how it broke it.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS reap_agentic_buyer_refs
+                            ADD COLUMN IF NOT EXISTS consent_version VARCHAR(32),
+                            ADD COLUMN IF NOT EXISTS consented_at TIMESTAMPTZ;
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
             try:
                 # THE STATEMENT THAT ACTUALLY FAILS IN THE FIELD. It cannot be
                 # created on a database that already holds two buyers sharing
@@ -2960,6 +2991,38 @@ async def ensure_required_schema_light() -> None:
                         """
                     )
                 )
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 227, SQLite twin: the consent tag, one statement per column.
+            #
+            # PER COLUMN, for the reason the mig-225 twin above spells out:
+            # SQLite's ADD COLUMN has no `IF NOT EXISTS` and no multi-clause
+            # form, so a duplicate column raises and a SHARED try would let the
+            # first already-present column abandon the second. Per column,
+            # every run converges on the same table.
+            #
+            # TIMESTAMP, NOT TIMESTAMPTZ: SQLite has no such type name, and the
+            # column is written with a bound aware datetime either way.
+            #
+            # NOT FOLDED INTO THE CREATE ABOVE — same argument as the Postgres
+            # twin: folded in, it would be dead code on the only databases CI
+            # builds, and its deletion would pass every test.
+            try:
+                for _consent_column, _consent_type in (
+                    ("consent_version", "VARCHAR(32)"),
+                    ("consented_at", "TIMESTAMP"),
+                ):
+                    try:
+                        await database.execute(
+                            text(
+                                f"ALTER TABLE reap_agentic_buyer_refs "
+                                f"ADD COLUMN {_consent_column} {_consent_type};"
+                            )
+                        )
+                    except Exception:  # noqa: BLE001
+                        # Almost always "duplicate column name" — the column is
+                        # already there and this run had nothing to do.
+                        continue
             except Exception:  # noqa: BLE001
                 pass
             try:

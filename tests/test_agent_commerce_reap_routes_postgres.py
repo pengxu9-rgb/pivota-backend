@@ -7,9 +7,11 @@ NOT A COPY OF THE SQLITE ARM, and it does not import it — the house rule is th
 `*_postgres.py` file stands alone, because a shared helper module means the two gates test one
 thing twice instead of two things once. What is here is what the ENGINE decides:
 
-  1. MIGRATION 226 AND THE SELF-HEAL BUILD THE SAME SCHEMA. Production skips db/migrations, so
-     `db/schema_guard.ensure_required_schema_light` IS the production schema for these three
-     tables. The comparison is through the CATALOG — `information_schema.columns`,
+  1. MIGRATIONS 226 + 227 AND THE SELF-HEAL BUILD THE SAME SCHEMA. Production skips
+     db/migrations, so `db/schema_guard.ensure_required_schema_light` IS the production schema
+     for these three tables — including 227's two consent columns, which the self-heal reaches
+     by its own statement rather than by being folded into the CREATE (folded in, it would be
+     dead on a fresh database and its deletion would pass every test). The comparison is through the CATALOG — `information_schema.columns`,
      `pg_indexes.indexdef`, `pg_get_constraintdef` — not through the source text, because a
      `CREATE UNIQUE INDEX` quietly downgraded to `CREATE INDEX` is invisible to a token check and
      a reviewer's mutant proved exactly that on the mig-224 pair.
@@ -31,12 +33,17 @@ thing twice instead of two things once. What is here is what the ENGINE decides:
      conjuncts, the dial, the allowlist, the buyer link, the hosted-URL vetting, the price and
      the return URL are all exercised against real Postgres. Nothing else is duplicated.
 
+  6. WP4b'S MINT AGAINST THE REAL CONSTRAINT. `ON CONFLICT (agent_id, agent_user_ref_hash) DO
+     NOTHING` is Postgres' implementation over a real unique index here, not SQLite's; the
+     consent column is a real `VARCHAR(32)` that raises on an over-long value rather than
+     truncating; and `consented_at` is a real `timestamptz`.
+
 THIS FILE DOES NOT IMPORT `main`. It assembles a minimal app from the router plus
 `ErrorHandlerMiddleware`; see the long comment above the assert below for what importing main did
 to two unrelated files in this gate. "The router is registered in main.py" is proved in the SQLite
 arm, which never shares a process with the gate.
 
-    DATABASE_URL=postgresql://postgres:postgres@localhost:5432/pivota_reap_wp4_test \\
+    DATABASE_URL=postgresql://postgres:postgres@localhost:5432/pivota_reap_wp4b_test \\
         .venv/bin/python -m pytest tests/test_agent_commerce_reap_routes_postgres.py
 """
 
@@ -78,6 +85,10 @@ _MIGRATIONS = (
     _MIGRATIONS_DIR / "224_reap_agentic_ledger.sql",
     _MIGRATIONS_DIR / "225_reap_agentic_purchase_hints.sql",
     _MIGRATIONS_DIR / "226_reap_agentic_routes.sql",
+    # 227 adds the two consent columns to 226's buyer_refs table. In the list because the parity
+    # test below compares what the MIGRATIONS built against what the SELF-HEAL built, and the
+    # self-heal carries 227 — without it here, parity would fail for a change that is correct.
+    _MIGRATIONS_DIR / "227_reap_agentic_buyer_consent.sql",
 )
 
 #: Same convention as the ledger's gate: this file DROPS its tables, so it must be INCAPABLE of
@@ -176,7 +187,7 @@ def _assert_throwaway_database() -> None:
     if not any(m in dbname or m in DATABASE_URL for m in _SAFE_DB_MARKERS):
         pytest.skip(
             f"refusing to drop the agentic route tables in database {dbname!r} — "
-            f"throwaway only (e.g. pivota_reap_wp4_test)"
+            f"throwaway only (e.g. pivota_reap_wp4b_test)"
         )
 
 
@@ -322,13 +333,27 @@ def _error(resp) -> Optional[str]:
     return None
 
 
+#: The consent tag every well-formed POST carries since WP4b.
+CONSENT = "reap-agentic-v1"
+
+
+def _buyer(**over) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "email": EMAIL,
+        "shipping_address": dict(ADDRESS),
+        "consent_version": CONSENT,
+    }
+    payload.update(over)
+    return payload
+
+
 def _body(**over) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "merchant_domain": DOMAIN,
         "product_key": PRODUCT_KEY,
         "variant_key": SKU_KEY,
         "quantity": 1,
-        "buyer": {"email": EMAIL, "shipping_address": dict(ADDRESS)},
+        "buyer": _buyer(),
     }
     payload.update(over)
     return payload
@@ -825,13 +850,344 @@ async def test_every_route_refuses_401_without_an_agent_user(client):
         assert _error(resp) == "agent_user_required"
 
 
-async def test_a_missing_buyer_link_refuses_rather_than_minting_a_buyer(client):
+# ── WP4b on real Postgres: the mint, the race, and the consent column ────────────────────────
+#
+# Replaces `test_a_missing_buyer_link_refuses_rather_than_minting_a_buyer`, which pinned the WP4
+# behaviour the owner reversed on 2026-09-18. What is re-run here rather than left to the SQLite
+# arm is what the ENGINE decides: a REAL unique constraint (so `ON CONFLICT DO NOTHING` is
+# exercised against the implementation production runs, not SQLite's), a real `VARCHAR(32)` (so a
+# value past the cap is a driver error rather than a silent truncation), and a real
+# `timestamptz`.
+
+
+async def _links() -> list:
+    rows = await database.fetch_all(
+        "SELECT agent_id, agent_user_ref_hash, buyer_id FROM buyer_identity_links"
+    )
+    return [dict(r) for r in rows]
+
+
+async def test_the_first_purchase_mints_one_buyer_one_link_and_one_ref(client):
     await _seed_catalog()
     await _seed_eligibility()
+
     resp = await client.post(f"{BASE}/purchases", json=_body())
-    assert resp.status_code == 409
-    assert _error(resp) == "buyer_unlinked"
+
+    assert resp.status_code == 202
+    links = await _links()
+    assert len(links) == 1
+    assert links[0]["agent_id"] == AGENT
+    assert links[0]["agent_user_ref_hash"] == hash_agent_user_ref(USER_REF)
+    assert str(links[0]["buyer_id"]).startswith("u_")
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_buyer_refs") == 1
+
+
+async def test_the_minted_buyer_id_carries_nothing_from_the_request(client):
+    """`db.accounts.create_or_get_shop_user` is create-or-GET: minting through it would hand an
+    agent that asserted a stranger's email that stranger's real buyer_id, and with it their
+    prefill. The id must contain nothing the caller sent."""
+    await _seed_catalog()
+    await _seed_eligibility()
+    await client.post(f"{BASE}/purchases", json=_body())
+
+    buyer_id = (await _links())[0]["buyer_id"]
+    for sent in (EMAIL, EMAIL.split("@")[0], USER_REF, hash_agent_user_ref(USER_REF)):
+        assert sent not in buyer_id
+    assert len(buyer_id) == 18
+
+
+async def test_two_user_refs_at_one_agent_get_two_buyers(client):
+    """THE OTHER DIRECTION from the test above, and the one that was undefended.
+
+    Two END USERS OF ONE AGENT sending the SAME body — same `buyer.email` — must not collapse onto
+    one buyer, because one buyer is one `reap_buyer_ref` is ONE STORED CARD. A mutant minting
+    `"u_" + sha256(agent_id + "|" + email)[:16]` passes every other test in this file (no literal
+    substring of the email survives a hash, and `agent_id` is in it so the cross-agent test is
+    happy). Only this one kills it.
+    """
+    await _seed_catalog()
+    await _seed_eligibility()
+
+    CALLER.agent_user_ref = USER_REF
+    first = await client.post(f"{BASE}/purchases", json=_body())
+    CALLER.agent_user_ref = OTHER_USER_REF
+    second = await client.post(f"{BASE}/purchases", json=_body())
+
+    assert first.status_code == 202
+    assert second.status_code == 202
+    links = await _links()
+    assert len(links) == 2
+    assert {l["agent_id"] for l in links} == {AGENT}, "precondition: one agent, two end users"
+    assert len({l["buyer_id"] for l in links}) == 2, (
+        "two end users of one agent share a buyer id — and therefore one stored card"
+    )
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_buyer_refs") == 2
+    a = (await ledger.get_purchase_internal(first.json()["purchase_id"]))["buyer_ref"]
+    b = (await ledger.get_purchase_internal(second.json()["purchase_id"]))["buyer_ref"]
+    assert a != b, "two end users of one agent were enrolled against one card"
+
+
+WINNER_BUYER_ID = "u_pgwinner000000"
+
+
+def _race_a_link_in(monkeypatch, buyer_id: str = WINNER_BUYER_ID):
+    """Make a competing link appear BETWEEN the route's SELECT and its INSERT.
+
+    A PRE-INSERTED ROW DOES NOT TEST THIS. The route's opening SELECT finds a pre-seeded link
+    and returns before the INSERT, so the statement whose `ON CONFLICT` behaviour is the point is
+    never reached — the `DO NOTHING` -> `DO UPDATE` mutant survived that version of this test on
+    both dialects. The race is a write that lands after our read missed, so the competing row is
+    inserted from inside `database.execute`, on the way into the route's own link INSERT.
+    """
+    real_execute = database.execute
+    state = {"raced": False}
+
+    async def _racing_execute(query, values=None, *args, **kwargs):
+        if not state["raced"] and "INSERT INTO buyer_identity_links" in str(query):
+            state["raced"] = True
+            await _seed_link(buyer_id=buyer_id)
+        return await real_execute(query, values, *args, **kwargs)
+
+    monkeypatch.setattr(database, "execute", _racing_execute)
+    return state
+
+
+async def test_the_real_unique_constraint_makes_the_loser_yield(client, monkeypatch):
+    """THE RACE, against the constraint production has.
+
+    `uq_buyer_identity_links_agent_ref_hash` is a real unique index here, so `ON CONFLICT
+    (agent_id, agent_user_ref_hash) DO NOTHING` is the Postgres implementation being exercised —
+    not SQLite's. The winner's buyer_id must be what the purchase is opened under.
+    """
+    await _seed_catalog()
+    await _seed_eligibility()
+    state = _race_a_link_in(monkeypatch)
+
+    resp = await client.post(f"{BASE}/purchases", json=_body())
+
+    assert state["raced"], "precondition: the route never reached its link INSERT"
+    assert resp.status_code == 202
+    links = await _links()
+    assert len(links) == 1, "the loser inserted a second link instead of yielding"
+    assert links[0]["buyer_id"] == WINNER_BUYER_ID, (
+        "the route overwrote a link that was written first — `DO NOTHING` became `DO UPDATE`"
+    )
+    ref = await database.fetch_val(
+        "SELECT reap_buyer_ref FROM reap_agentic_buyer_refs WHERE buyer_id = :b",
+        {"b": WINNER_BUYER_ID},
+    )
+    row = await ledger.get_purchase_internal(resp.json()["purchase_id"])
+    assert row["buyer_ref"] == ref
+
+
+async def test_the_insert_does_not_overwrite_an_existing_link(client):
+    """The already-linked path: the opening SELECT finds the human's link and the route returns
+    on it. This is the common case, NOT the `ON CONFLICT` case — the test above is that one."""
+    await _seed_all()
+    await client.post(f"{BASE}/purchases", json=_body())
+    assert [l["buyer_id"] for l in await _links()] == [BUYER_ID]
+
+
+async def test_two_agents_with_the_same_user_ref_get_two_buyers(client):
+    await _seed_catalog()
+    await _seed_eligibility()
+
+    await client.post(f"{BASE}/purchases", json=_body())
+    CALLER.agent_id = OTHER_AGENT
+    await client.post(f"{BASE}/purchases", json=_body())
+
+    links = await _links()
+    assert len(links) == 2
+    assert len({l["buyer_id"] for l in links}) == 2
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_buyer_refs") == 2
+
+
+async def test_consent_is_required_and_refused_before_any_row_is_written(client):
+    await _seed_catalog()
+    await _seed_eligibility()
+
+    resp = await client.post(
+        f"{BASE}/purchases", json=_body(buyer={"email": EMAIL, "shipping_address": dict(ADDRESS)})
+    )
+
+    assert resp.status_code == 400
+    assert _error(resp) == "consent_required"
+    assert await _links() == []
     assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_buyer_refs") == 0
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+
+
+async def test_the_dial_is_checked_before_consent(client, monkeypatch):
+    """A consent check ahead of the dial answers 400 where every well-formed request answers
+    404 — a working probe for a rail that is meant to be absent."""
+    monkeypatch.delenv("REAP_AGENTIC_ENABLED", raising=False)
+    resp = await client.post(
+        f"{BASE}/purchases", json=_body(buyer={"email": EMAIL, "shipping_address": dict(ADDRESS)})
+    )
+    assert resp.status_code == 404
+    assert _error(resp) == "not_available_on_this_rail"
+
+
+async def test_the_consent_columns_are_written_and_are_the_declared_types(client):
+    """`consented_at` must be a real `timestamptz` carrying an aware value — a naive one here
+    would be read back as UTC on one engine and as local time on another."""
+    await _seed_catalog()
+    await _seed_eligibility()
+
+    await client.post(f"{BASE}/purchases", json=_body())
+
+    row = dict(
+        await database.fetch_one(
+            "SELECT consent_version, consented_at FROM reap_agentic_buyer_refs"
+        )
+    )
+    assert row["consent_version"] == CONSENT
+    assert isinstance(row["consented_at"], datetime)
+    assert row["consented_at"].tzinfo is not None
+
+    types = {
+        r["column_name"]: (r["data_type"], r["character_maximum_length"])
+        for r in await database.fetch_all(
+            """
+            SELECT column_name, data_type, character_maximum_length
+              FROM information_schema.columns
+             WHERE table_schema = 'public' AND table_name = 'reap_agentic_buyer_refs'
+            """
+        )
+    }
+    assert types["consent_version"] == ("character varying", 32)
+    assert types["consented_at"][0] == "timestamp with time zone"
+
+
+async def test_a_consent_version_past_the_column_width_is_refused_not_truncated(client):
+    """THE REASON THE CAP IS IN THE ROUTE. `VARCHAR(32)` on this engine raises
+    `StringDataRightTruncation` on a longer value — a 500, not a refusal — and a truncated version
+    tag names a DIFFERENT version. The route caps it before the bind."""
+    await _seed_all()
+    resp = await client.post(
+        f"{BASE}/purchases", json=_body(buyer=_buyer(consent_version="v" * 33))
+    )
+    assert resp.status_code == 400
+    assert _error(resp) == "consent_required"
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+
+
+async def test_a_nul_byte_in_the_consent_version_is_a_refusal_and_not_a_500(client):
+    """asyncpg raises `CharacterNotInRepertoireError` on a NUL, which is not a `PurchaseRefused`
+    and arrives as a 500. Only this dialect can see it — SQLite stores NULs happily."""
+    await _seed_all()
+    resp = await client.post(
+        f"{BASE}/purchases", json=_body(buyer=_buyer(consent_version="v1\x00"))
+    )
+    assert resp.status_code == 400
+    assert _error(resp) == "consent_required"
+
+
+async def test_the_latest_consent_version_replaces_the_stored_one(client):
+    await _seed_catalog()
+    await _seed_eligibility()
+
+    await client.post(f"{BASE}/purchases", json=_body())
+    first_at = await database.fetch_val("SELECT consented_at FROM reap_agentic_buyer_refs")
+    await client.post(f"{BASE}/purchases", json=_body(buyer=_buyer(consent_version="v2")))
+
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_buyer_refs") == 1
+    assert await database.fetch_val("SELECT consent_version FROM reap_agentic_buyer_refs") == "v2"
+    assert await database.fetch_val("SELECT consented_at FROM reap_agentic_buyer_refs") >= first_at
+
+
+async def test_consent_is_recorded_for_a_buyer_the_hosted_checkout_linked(client):
+    """The already-linked path mints nothing, and is the one a consent write could be dropped
+    from without any mint test noticing."""
+    await _seed_all()
+    await client.post(f"{BASE}/purchases", json=_body())
+    assert await database.fetch_val(
+        "SELECT consent_version FROM reap_agentic_buyer_refs WHERE buyer_id = :b",
+        {"b": BUYER_ID},
+    ) == CONSENT
+
+
+async def test_a_replay_still_records_the_latest_consent(client):
+    """A replay returns 202 before the buyer-ref code runs, and was the one successful POST that
+    left the stored tag stale — while the contract page, the runbook and migration 227's header
+    all promise it is rewritten on every purchase. Checked here as well as on SQLite because
+    `consented_at` is a real `timestamptz` and the comparison is a real server-side one."""
+    await _seed_all()
+    first = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="pg-replay"))
+    assert first.status_code == 202
+    before = await database.fetch_val("SELECT consented_at FROM reap_agentic_buyer_refs")
+
+    second = await client.post(
+        f"{BASE}/purchases",
+        json=_body(idempotency_key="pg-replay", buyer=_buyer(consent_version="v9")),
+    )
+
+    assert second.status_code == 202
+    assert second.json()["purchase_id"] == first.json()["purchase_id"], (
+        "precondition: this was a replay, not a new purchase"
+    )
+    assert await database.fetch_val("SELECT consent_version FROM reap_agentic_buyer_refs") == "v9"
+    assert await database.fetch_val("SELECT consented_at FROM reap_agentic_buyer_refs") >= before
+
+
+async def test_a_replay_whose_link_was_deleted_does_not_re_mint_one(client):
+    """An idempotency key outlives its link if the link is deleted inside the 24-hour window — an
+    erasure request, or an operator cleaning up. The key knows nothing about the link, so the
+    replay still resolves; resolving the buyer with the MINTING lookup would silently recreate an
+    identity that was deliberately deleted, on a path that has not checked eligibility."""
+    await _seed_catalog()
+    await _seed_eligibility()
+    first = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="pg-k-x"))
+    assert first.status_code == 202
+    assert len(await _links()) == 1
+
+    await database.execute("DELETE FROM buyer_identity_links")
+    assert await _links() == []
+
+    second = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="pg-k-x"))
+
+    assert second.status_code == 202
+    assert second.json()["purchase_id"] == first.json()["purchase_id"], (
+        "precondition: this was a replay — otherwise the mint below is not the thing under test"
+    )
+    assert await _links() == [], (
+        "a replay re-created a buyer identity that had been deleted, on a path that has not "
+        "checked eligibility"
+    )
+
+
+async def test_the_link_is_touched_when_it_is_reused(client):
+    """`last_seen_at` on the reuse path, checked HERE because this dialect has the clock
+    resolution to show the bump: `CURRENT_TIMESTAMP` is a real server-side `timestamptz` and the
+    comparison is against a value Postgres itself wrote."""
+    await _seed_all()
+    await database.execute(
+        "UPDATE buyer_identity_links SET last_seen_at = NULL WHERE agent_id = :a", {"a": AGENT}
+    )
+    assert await database.fetch_val("SELECT last_seen_at FROM buyer_identity_links") is None
+
+    await client.post(f"{BASE}/purchases", json=_body())
+
+    seen = await database.fetch_val("SELECT last_seen_at FROM buyer_identity_links")
+    assert seen is not None, "the rail used a link without stamping that it had seen it"
+    assert seen.tzinfo is not None
+    created = await database.fetch_val("SELECT created_at FROM buyer_identity_links")
+    assert seen >= created
+
+
+async def test_the_minted_identity_is_never_in_a_response(client):
+    await _seed_catalog()
+    await _seed_eligibility()
+
+    resp = await client.post(f"{BASE}/purchases", json=_body())
+    buyer_id = (await _links())[0]["buyer_id"]
+    ref = await database.fetch_val("SELECT reap_buyer_ref FROM reap_agentic_buyer_refs")
+
+    read = await client.get(f"{BASE}/purchases/{resp.json()['purchase_id']}")
+    listed = await client.get(f"{BASE}/purchases")
+    for body in (resp.text, read.text, listed.text):
+        for secret in (buyer_id, ref, hash_agent_user_ref(USER_REF), CONSENT):
+            assert secret not in body
 
 
 async def test_a_non_shopify_row_is_refused(client):
@@ -997,7 +1353,7 @@ async def test_a_market_the_currency_map_does_not_know_fails_closed(client):
     await _seed_link()
     address = dict(ADDRESS, country="ZZ")
     resp = await client.post(
-        f"{BASE}/purchases", json=_body(buyer={"email": EMAIL, "shipping_address": address})
+        f"{BASE}/purchases", json=_body(buyer=_buyer(shipping_address=address))
     )
     assert resp.status_code == 409
     assert _error(resp) == "row_currency_mismatch"
@@ -1051,7 +1407,7 @@ async def test_the_same_key_on_a_different_body_is_a_conflict(client):
     address = dict(ADDRESS, addressLine1="1 Other St", city="Oakland")
     third = await client.post(
         f"{BASE}/purchases",
-        json=_body(idempotency_key="pg-c-1", buyer={"email": EMAIL, "shipping_address": address}),
+        json=_body(idempotency_key="pg-c-1", buyer=_buyer(shipping_address=address)),
     )
     assert third.status_code == 409
     assert _error(third) == "idempotency_conflict"
@@ -1061,7 +1417,7 @@ async def test_the_same_key_on_a_different_body_is_a_conflict(client):
         f"{BASE}/purchases",
         json=_body(
             idempotency_key="pg-c-1",
-            buyer={"email": "someone-else@example.test", "shipping_address": dict(ADDRESS)},
+            buyer=_buyer(email="someone-else@example.test"),
         ),
     )
     assert _error(fourth) == "idempotency_conflict"
