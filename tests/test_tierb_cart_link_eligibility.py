@@ -39,7 +39,7 @@ TABLE = "tierb_cart_link_eligibility"
 
 _BRIEF_DEFINITE = {
     "ELIGIBLE", "LOGIN_REQUIRED", "NOT_ACCEPTING_ORDERS", "VARIANT_GONE", "VARIANT_UNAVAILABLE",
-    "PASSWORD_PAGE", "BLOCKED_UNKNOWN", "CHECKOUT_PREFILL_MISSING",
+    "PASSWORD_PAGE", "BLOCKED_UNKNOWN", "CHECKOUT_PREFILL_MISSING", "CHECKOUT_MARKET_MISMATCH",
 }
 _BRIEF_INDEFINITE = {"TRANSPORT_ERROR", "VARIANT_UNVERIFIED", "UNCLASSIFIED", "INVALID_INPUT"}
 
@@ -241,7 +241,31 @@ def test_normalize_domain_refuses(raw):
 # ── the verdict partition ───────────────────────────────────────────────────────────────────
 
 
-def test_the_definite_and_indefinite_sets_are_the_briefs_and_partition_the_enum():
+def test_every_preflight_verdict_is_classified_definite_or_indefinite():
+    """FAILS THE MOMENT #2209's Verdict enum gains a member this module has not classified, and
+    names it. Classifying one is a decision (does it overwrite a verdict? is it eligible?) and
+    touches three places: the set in db/tierb_cart_link_eligibility.py and, for a definite one,
+    the verdict CHECK lists in migration 227 and in the self-heal."""
+    missing = elig.unclassified_verdicts()
+    assert not missing, (
+        f"Verdict member(s) {missing} are classified NEITHER definite NOR indefinite in "
+        "db/tierb_cart_link_eligibility.py; record_result refuses them and the job exits 4. "
+        "Decide, add them to DEFINITE_VERDICTS or INDEFINITE_VERDICTS, and (if definite) to the "
+        "verdict/previous_verdict CHECK lists in db/migrations/227_* and the self-heal."
+    )
+
+
+def test_the_unclassified_check_names_a_new_member():
+    """The check above is only as good as its detector: a synthetic enum with one extra member
+    must come back named, and only that member."""
+    import enum
+
+    Grown = enum.Enum("Grown", {v.name: v.value for v in Verdict} | {"SHOP_ON_FIRE": "SHOP_ON_FIRE"})
+    assert elig.unclassified_verdicts(Grown) == ["SHOP_ON_FIRE"]
+    assert elig.unclassified_verdicts(Verdict) == []
+
+
+def test_the_definite_and_indefinite_sets_are_the_decided_ones_and_disjoint():
     definite = {v.value for v in elig.DEFINITE_VERDICTS}
     indefinite = {v.value for v in elig.INDEFINITE_VERDICTS}
     assert definite == _BRIEF_DEFINITE
@@ -545,4 +569,59 @@ async def test_a_malformed_key_is_refused_on_write_and_on_read(domain, market):
         await elig.get_eligibility(domain, market)
     with pytest.raises(ValueError):
         await elig.is_cart_link_eligible(domain, market)
+    assert await _count() == 0
+
+
+# ── CHECKOUT_MARKET_MISMATCH and checkout_country (#2209 @ 4e12d5a2) ────────────────────────
+
+
+async def test_a_market_mismatch_is_definite_overwrites_eligible_and_is_not_eligible():
+    await elig.record_result("judydoll.com", "US", res("ELIGIBLE", checkout_country="US"))
+    assert await elig.is_cart_link_eligible("judydoll.com", "US") is True
+    row = await elig.record_result(
+        "judydoll.com", "US", res("CHECKOUT_MARKET_MISMATCH", checkout_country="JP", detail="checkout_country_JP")
+    )
+    assert row["verdict"] == "CHECKOUT_MARKET_MISMATCH"  # ACCEPT: recorded as a verdict
+    assert row["previous_verdict"] == "ELIGIBLE"
+    assert row["consecutive_same"] == 1
+    assert row["checkout_country"] == "JP"
+    assert _close(row["checked_at"], _now())
+    assert await elig.is_cart_link_eligible("judydoll.com", "US") is False  # REFUSE: not eligible
+
+
+async def test_a_market_mismatch_is_accepted_as_a_previous_verdict_too():
+    await elig.record_result("judydoll.com", "US", res("CHECKOUT_MARKET_MISMATCH", checkout_country=None))
+    row = await elig.record_result("judydoll.com", "US", res("ELIGIBLE", checkout_country="US"))
+    assert row["previous_verdict"] == "CHECKOUT_MARKET_MISMATCH"
+    assert await elig.is_cart_link_eligible("judydoll.com", "US") is True
+
+
+async def test_checkout_country_is_evidence_of_the_definite_verdict_only():
+    row = await elig.record_result("judydoll.com", "US", res("ELIGIBLE", checkout_country="US"))
+    assert row["checkout_country"] == "US"
+    # an indefinite result never touches it
+    row = await elig.record_result("judydoll.com", "US", res("UNCLASSIFIED", checkout_country="JP"))
+    assert row["checkout_country"] == "US"
+    # a definite one replaces it, with NULL when the page stated none
+    row = await elig.record_result("judydoll.com", "US", res("LOGIN_REQUIRED", checkout_country=None))
+    assert row["checkout_country"] is None
+
+
+async def test_an_indefinite_first_row_has_no_checkout_country():
+    row = await elig.record_result("judydoll.com", "US", res("TRANSPORT_ERROR", checkout_country="US"))
+    assert row["checkout_country"] is None
+
+
+@pytest.mark.parametrize("bad", ["us", "USA", "U", "", "1A", 42])
+async def test_a_malformed_checkout_country_is_stored_as_null_not_truncated(bad):
+    row = await elig.record_result("judydoll.com", "US", res("CHECKOUT_MARKET_MISMATCH", checkout_country=bad))
+    assert row["verdict"] == "CHECKOUT_MARKET_MISMATCH"
+    assert row["checkout_country"] is None
+
+
+async def test_the_database_refuses_a_malformed_checkout_country():
+    with pytest.raises(Exception):
+        await database.execute(
+            f"INSERT INTO {TABLE} (shop_domain, market, checkout_country) VALUES ('judydoll.com', 'US', 'us')"
+        )
     assert await _count() == 0

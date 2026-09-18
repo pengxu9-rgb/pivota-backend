@@ -113,9 +113,11 @@ async def test_the_self_heal_builds_the_same_schema_as_migration_227():
     await _apply(_MIGRATION)
     from_migration = await _schema_fingerprint()
     columns, indexes, constraints, names = from_migration
-    assert len(columns) == 17, columns
+    assert len(columns) == 18, columns
     assert any("UNIQUE" in d.upper() and "(shop_domain, market)" in d for d in indexes.values()), indexes
-    assert sum(1 for kind, _ in constraints if kind == "c") == 5, constraints
+    assert sum(1 for kind, _ in constraints if kind == "c") == 6, constraints
+    assert "checkout_country" in {c[0] for c in columns}
+    assert all("CHECKOUT_MARKET_MISMATCH" in d for k, d in constraints if k == "c" and "ELIGIBLE" in d)
     assert names == ["ck_tierb_cart_link_eligibility_verdict_has_clock",
                      "uq_tierb_cart_link_eligibility_shop_market"]
 

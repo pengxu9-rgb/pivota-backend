@@ -16,6 +16,8 @@ are measured exactly, and the suite does not take 1.5 s per request.
 from __future__ import annotations
 
 import asyncio
+import html
+import json
 import logging
 import os
 import sys
@@ -101,7 +103,7 @@ TOKEN = "hWNGxZONBs9DRwvyX0myoSvM"
 
 
 class Storefronts:
-    """kind per host: eligible | login | not_accepting | transport. Every request is recorded
+    """kind per host: eligible | login | not_accepting | mismatch | transport. Every request is recorded
     with the fake clock's time, so pacing is measured on what actually reached the network."""
 
     def __init__(self, clock: FakeClock, kinds: Dict[str, str]) -> None:
@@ -109,6 +111,7 @@ class Storefronts:
         self.kinds = kinds
         self.requests: List[Tuple[float, httpx.Request]] = []
         self.click_ids: Dict[str, str] = {}
+        self.countries: Dict[str, str] = {}
 
     def transport(self) -> httpx.MockTransport:
         return httpx.MockTransport(self.handle)
@@ -131,19 +134,35 @@ class Storefronts:
         if path.startswith("/cart/"):
             query = dict(parse_qsl(urlparse(str(request.url)).query))
             self.click_ids[host] = query.get("attributes[pivota_click_id]", "")
+            # The permalink pins the checkout market (`country=`); Shopify honours it, except
+            # on the "mismatch" store, which lands the buyer in JP whatever was asked.
+            self.countries[host] = "JP" if kind == "mismatch" else query.get("country", "")
             if kind == "login":
                 return httpx.Response(302, headers={"location": "https://shopify.com/authentication/1/login"})
             return httpx.Response(302, headers={"location": f"https://{host}/checkouts/cn/{TOKEN}/information"})
         if path.startswith("/checkouts/cn/"):
             if kind == "not_accepting":
                 return httpx.Response(403, text="<h1>This store isn&rsquo;t set up to receive orders yet</h1>")
-            body = (
-                '<script id="checkout-state">{&quot;merchandise&quot;:{&quot;id&quot;:'
-                f'&quot;gid://shopify/ProductVariant/{vid}&quot;}},&quot;attributes&quot;:[{{&quot;key&quot;:'
-                f'&quot;pivota_click_id&quot;,&quot;value&quot;:&quot;{self.click_ids.get(host, "")}&quot;}}]}}</script>'
-            )
-            return httpx.Response(200, text=body, headers={"content-type": "text/html; charset=utf-8"})
+            return httpx.Response(200, text=self.checkout_page(host, vid),
+                                  headers={"content-type": "text/html; charset=utf-8"})
         raise AssertionError(f"unrouted {host}{path}")
+
+    def checkout_page(self, host: str, vid: str) -> str:
+        """The checkout's serialized state, keyed the way the live page keys it (the shape
+        #2209's structural readers parse): a MerchandiseLine for the variant, the click id as a
+        cart attribute, and the buyer's country."""
+        state = {
+            "merchandise": {"merchandiseLines": [{
+                "__typename": "MerchandiseLine",
+                "merchandise": {"__typename": "ProductVariantMerchandise",
+                                "id": f"gid://shopify/ProductVariantMerchandise/{vid}",
+                                "variantId": f"gid://shopify/ProductVariant/{vid}"},
+            }]},
+            "note": {"customAttributes": [{"key": "pivota_click_id", "value": self.click_ids.get(host, "")}]},
+            "buyerIdentity": {"customer": {"countryCode": self.countries.get(host, "")}},
+        }
+        serialized = html.escape(json.dumps(state, separators=(",", ":")), quote=True)
+        return f'<html><head><meta name="serialized-session" content="{serialized}"></head><body></body></html>'
 
     def times(self) -> List[float]:
         return [t for t, _ in self.requests]
@@ -441,16 +460,25 @@ async def test_a_dry_run_writes_nothing(db):
 async def test_end_to_end_records_definite_verdicts_and_keeps_a_prior_one_on_a_transport_error(db):
     await elig.record_result("flaky.us", "US", result("ELIGIBLE", host="flaky.us"))
     clock = FakeClock()
-    kinds = {"judydoll.com": "eligible", "podl.us": "login", "luafee.jp": "not_accepting", "flaky.us": "transport"}
+    await elig.record_result("extra1.us", "US", result("ELIGIBLE", host="extra1.us"))
+    kinds = {"judydoll.com": "eligible", "podl.us": "login", "luafee.jp": "not_accepting", "flaky.us": "transport",
+             "extra1.us": "mismatch"}
     store = Storefronts(clock, kinds)
-    rows = merchants("judydoll.com", "podl.us", "flaky.us") + [Merchant("luafee.jp", "JP", VIDS["luafee.jp"])]
+    rows = merchants("judydoll.com", "podl.us", "flaky.us", "extra1.us") + [Merchant("luafee.jp", "JP", VIDS["luafee.jp"])]
     summary = await run(clock=clock, dry_run=False, merchants=rows, transport=store.transport())
 
-    assert summary.counts == {"ELIGIBLE": 1, "LOGIN_REQUIRED": 1, "NOT_ACCEPTING_ORDERS": 1, "TRANSPORT_ERROR": 1}
-    assert summary.definite == 3 and summary.indefinite == 1 and summary.record_failures == 0
-    assert summary.exit_code == job.EXIT_OK  # 1 of 4 indefinite: a flaky store, not an alarm
-    assert (await elig.get_eligibility("judydoll.com", "US"))["verdict"] == "ELIGIBLE"
+    assert summary.counts == {"ELIGIBLE": 1, "LOGIN_REQUIRED": 1, "NOT_ACCEPTING_ORDERS": 1, "TRANSPORT_ERROR": 1,
+                              "CHECKOUT_MARKET_MISMATCH": 1}
+    assert summary.definite == 4 and summary.indefinite == 1 and summary.record_failures == 0
+    assert summary.exit_code == job.EXIT_OK  # 1 of 5 indefinite: a flaky store, not an alarm
+    judy = await elig.get_eligibility("judydoll.com", "US")
+    assert judy["verdict"] == "ELIGIBLE" and judy["checkout_country"] == "US"
     assert await elig.is_cart_link_eligible("judydoll.com", "US") is True
+    # A checkout that landed in JP for a US buyer is a definite NO, and it replaces ELIGIBLE.
+    moved = await elig.get_eligibility("extra1.us", "US")
+    assert moved["verdict"] == "CHECKOUT_MARKET_MISMATCH" and moved["previous_verdict"] == "ELIGIBLE"
+    assert moved["checkout_country"] == "JP"
+    assert await elig.is_cart_link_eligible("extra1.us", "US") is False
     assert (await elig.get_eligibility("podl.us", "US"))["verdict"] == "LOGIN_REQUIRED"
     assert (await elig.get_eligibility("luafee.jp", "JP"))["verdict"] == "NOT_ACCEPTING_ORDERS"
     flaky = await elig.get_eligibility("flaky.us", "US")

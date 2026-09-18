@@ -57,6 +57,7 @@ __all__ = [
     "DEFINITE_VERDICTS",
     "INDEFINITE_VERDICTS",
     "DEFAULT_MAX_AGE_HOURS",
+    "unclassified_verdicts",
     "ensure_schema",
     "normalize_domain",
     "record_result",
@@ -76,6 +77,9 @@ DEFINITE_VERDICTS: FrozenSet[Verdict] = frozenset({
     Verdict.PASSWORD_PAGE,
     Verdict.BLOCKED_UNKNOWN,
     Verdict.CHECKOUT_PREFILL_MISSING,
+    # A checkout that landed in another market than the buyer's, or whose market the page did
+    # not state: the store answered, and the answer is "not for this market". Fail-closed.
+    Verdict.CHECKOUT_MARKET_MISMATCH,
 })
 INDEFINITE_VERDICTS: FrozenSet[Verdict] = frozenset({
     Verdict.TRANSPORT_ERROR,
@@ -83,6 +87,14 @@ INDEFINITE_VERDICTS: FrozenSet[Verdict] = frozenset({
     Verdict.UNCLASSIFIED,
     Verdict.INVALID_INPUT,
 })
+
+def unclassified_verdicts(verdicts: Any = Verdict) -> list:
+    """Members of the preflight's verdict enum that neither set classifies, by value. Empty today.
+    A new member upstream makes `record_result` refuse it (ValueError) — this is the check that
+    names it, so the failure is a decision to make rather than a mystery."""
+    known = {v.value for v in DEFINITE_VERDICTS | INDEFINITE_VERDICTS}
+    return sorted(v.value for v in verdicts if v.value not in known)
+
 
 _TS_COLUMNS = ("checked_at", "last_attempt_at", "verdict_changed_at", "created_at")
 
@@ -110,11 +122,11 @@ _WIDTHS = {
 _UPSERT_DEFINITE_SQL = """
 INSERT INTO tierb_cart_link_eligibility (
     shop_domain, market, verdict, retryable, variant_id, variant_source, product_title,
-    price_text, detail, checked_at, last_attempt_at, last_error_code,
+    price_text, detail, checkout_country, checked_at, last_attempt_at, last_error_code,
     verdict_changed_at, previous_verdict, consecutive_same
 ) VALUES (
     :shop_domain, :market, :verdict, :retryable, :variant_id, :variant_source, :product_title,
-    :price_text, :detail, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, NULL,
+    :price_text, :detail, :checkout_country, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, NULL,
     CURRENT_TIMESTAMP, NULL, 1
 )
 ON CONFLICT (shop_domain, market) DO UPDATE SET
@@ -137,6 +149,7 @@ ON CONFLICT (shop_domain, market) DO UPDATE SET
     product_title = EXCLUDED.product_title,
     price_text = EXCLUDED.price_text,
     detail = EXCLUDED.detail,
+    checkout_country = EXCLUDED.checkout_country,
     checked_at = EXCLUDED.checked_at,
     last_attempt_at = EXCLUDED.last_attempt_at,
     last_error_code = NULL
@@ -146,11 +159,11 @@ RETURNING *
 _UPSERT_DEFINITE_SQL_SQLITE = """
 INSERT INTO tierb_cart_link_eligibility (
     shop_domain, market, verdict, retryable, variant_id, variant_source, product_title,
-    price_text, detail, checked_at, last_attempt_at, last_error_code,
+    price_text, detail, checkout_country, checked_at, last_attempt_at, last_error_code,
     verdict_changed_at, previous_verdict, consecutive_same
 ) VALUES (
     :shop_domain, :market, :verdict, :retryable, :variant_id, :variant_source, :product_title,
-    :price_text, :detail, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, NULL,
+    :price_text, :detail, :checkout_country, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, NULL,
     CURRENT_TIMESTAMP, NULL, 1
 )
 ON CONFLICT (shop_domain, market) DO UPDATE SET
@@ -173,6 +186,7 @@ ON CONFLICT (shop_domain, market) DO UPDATE SET
     product_title = EXCLUDED.product_title,
     price_text = EXCLUDED.price_text,
     detail = EXCLUDED.detail,
+    checkout_country = EXCLUDED.checkout_country,
     checked_at = EXCLUDED.checked_at,
     last_attempt_at = EXCLUDED.last_attempt_at,
     last_error_code = NULL
@@ -233,6 +247,14 @@ def _fit(column: str, value: Any) -> Optional[str]:
     text = str(value)
     width = _WIDTHS.get(column)
     return text[:width] if width else text
+
+
+def _country_or_none(value: Any) -> Optional[str]:
+    """The checkout's buyer country, kept only in its ISO-2 shape. Anything else is dropped to
+    NULL rather than truncated into a different country."""
+    if isinstance(value, str) and len(value) == 2 and value.isascii() and value.isalpha() and value.isupper():
+        return value
+    return None
 
 
 def _decode_dt(value: Any) -> Any:
@@ -309,6 +331,7 @@ async def record_result(domain: str, market: str, result: PreflightResult) -> Di
             "product_title": _fit("product_title", result.product_title),
             "price_text": _fit("price_text", result.price),
             "detail": _fit("detail", result.detail),
+            "checkout_country": _country_or_none(result.checkout_country),
         }
         if IS_POSTGRES:
             row = await database.fetch_one(_UPSERT_DEFINITE_SQL, params)

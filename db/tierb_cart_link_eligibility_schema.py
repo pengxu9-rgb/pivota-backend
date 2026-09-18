@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS tierb_cart_link_eligibility (
     market VARCHAR(2) NOT NULL CHECK (length(market) = 2 AND market = upper(market)),
     verdict VARCHAR(32) CHECK (verdict IS NULL OR verdict IN (
         'ELIGIBLE', 'LOGIN_REQUIRED', 'NOT_ACCEPTING_ORDERS', 'VARIANT_GONE',
-        'VARIANT_UNAVAILABLE', 'PASSWORD_PAGE', 'BLOCKED_UNKNOWN', 'CHECKOUT_PREFILL_MISSING'
+        'VARIANT_UNAVAILABLE', 'PASSWORD_PAGE', 'BLOCKED_UNKNOWN', 'CHECKOUT_PREFILL_MISSING',
+        'CHECKOUT_MARKET_MISMATCH'
     )),
     retryable BOOLEAN,
     variant_id VARCHAR(32),
@@ -34,13 +35,15 @@ CREATE TABLE IF NOT EXISTS tierb_cart_link_eligibility (
     product_title TEXT,
     price_text VARCHAR(32),
     detail VARCHAR(255),
+    checkout_country VARCHAR(2) CHECK (checkout_country IS NULL OR (length(checkout_country) = 2 AND checkout_country = upper(checkout_country))),
     checked_at TIMESTAMPTZ,
     last_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_error_code VARCHAR(128),
     verdict_changed_at TIMESTAMPTZ,
     previous_verdict VARCHAR(32) CHECK (previous_verdict IS NULL OR previous_verdict IN (
         'ELIGIBLE', 'LOGIN_REQUIRED', 'NOT_ACCEPTING_ORDERS', 'VARIANT_GONE',
-        'VARIANT_UNAVAILABLE', 'PASSWORD_PAGE', 'BLOCKED_UNKNOWN', 'CHECKOUT_PREFILL_MISSING'
+        'VARIANT_UNAVAILABLE', 'PASSWORD_PAGE', 'BLOCKED_UNKNOWN', 'CHECKOUT_PREFILL_MISSING',
+        'CHECKOUT_MARKET_MISMATCH'
     )),
     consecutive_same INTEGER NOT NULL DEFAULT 0 CHECK (consecutive_same >= 0),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -57,7 +60,8 @@ CREATE TABLE IF NOT EXISTS tierb_cart_link_eligibility (
     market VARCHAR(2) NOT NULL CHECK (length(market) = 2 AND market = upper(market)),
     verdict VARCHAR(32) CHECK (verdict IS NULL OR verdict IN (
         'ELIGIBLE', 'LOGIN_REQUIRED', 'NOT_ACCEPTING_ORDERS', 'VARIANT_GONE',
-        'VARIANT_UNAVAILABLE', 'PASSWORD_PAGE', 'BLOCKED_UNKNOWN', 'CHECKOUT_PREFILL_MISSING'
+        'VARIANT_UNAVAILABLE', 'PASSWORD_PAGE', 'BLOCKED_UNKNOWN', 'CHECKOUT_PREFILL_MISSING',
+        'CHECKOUT_MARKET_MISMATCH'
     )),
     retryable BOOLEAN,
     variant_id VARCHAR(32),
@@ -65,13 +69,15 @@ CREATE TABLE IF NOT EXISTS tierb_cart_link_eligibility (
     product_title TEXT,
     price_text VARCHAR(32),
     detail VARCHAR(255),
+    checkout_country VARCHAR(2) CHECK (checkout_country IS NULL OR (length(checkout_country) = 2 AND checkout_country = upper(checkout_country))),
     checked_at TIMESTAMP,
     last_attempt_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     last_error_code VARCHAR(128),
     verdict_changed_at TIMESTAMP,
     previous_verdict VARCHAR(32) CHECK (previous_verdict IS NULL OR previous_verdict IN (
         'ELIGIBLE', 'LOGIN_REQUIRED', 'NOT_ACCEPTING_ORDERS', 'VARIANT_GONE',
-        'VARIANT_UNAVAILABLE', 'PASSWORD_PAGE', 'BLOCKED_UNKNOWN', 'CHECKOUT_PREFILL_MISSING'
+        'VARIANT_UNAVAILABLE', 'PASSWORD_PAGE', 'BLOCKED_UNKNOWN', 'CHECKOUT_PREFILL_MISSING',
+        'CHECKOUT_MARKET_MISMATCH'
     )),
     consecutive_same INTEGER NOT NULL DEFAULT 0 CHECK (consecutive_same >= 0),
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,

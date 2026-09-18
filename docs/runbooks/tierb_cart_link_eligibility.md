@@ -108,7 +108,8 @@ SELECT shop_domain, market, verdict, checked_at, consecutive_same, previous_verd
 ```
 
 - `verdict` is the last **definite** verdict (ELIGIBLE, LOGIN_REQUIRED, NOT_ACCEPTING_ORDERS,
-  VARIANT_GONE, VARIANT_UNAVAILABLE, PASSWORD_PAGE, BLOCKED_UNKNOWN, CHECKOUT_PREFILL_MISSING)
+  VARIANT_GONE, VARIANT_UNAVAILABLE, PASSWORD_PAGE, BLOCKED_UNKNOWN, CHECKOUT_PREFILL_MISSING,
+  CHECKOUT_MARKET_MISMATCH)
   and `checked_at` is when it was observed.
 - An **indefinite** result (TRANSPORT_ERROR, VARIANT_UNVERIFIED, UNCLASSIFIED, INVALID_INPUT)
   never overwrites a verdict: it moves only `last_attempt_at` and `last_error_code`. So
