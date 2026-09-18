@@ -1255,17 +1255,70 @@ def test_rank_offers_merit_first_does_not_demote_unknown_availability() -> None:
     assert [o["offer_id"] for o in ranked] == ["of:unknown", "of:silent", "of:in_stock"]
 
 
-def test_rank_offers_merit_first_never_demotes_an_internal_offer_on_its_summary_flag() -> None:
-    """Review of #2218: an internal offer exists only because the eligibility gate found its
-    variant sellable (reading `available` first); its summary `in_stock` reads inventory_quantity
-    alone, so an untracked-inventory variant says False. Demoting on that cut a buyable exact
-    match at limit=1 and flipped resolution_mode to external_only."""
+def test_rank_offers_merit_first_puts_a_sold_out_buy_here_offer_behind_an_equal_fit_referral() -> None:
+    """The internal exemption is gone: a buy-here offer whose flag says sold out no longer wins
+    an equal-fit tie on transactability. Its flag is the eligibility gate's own stock verdict
+    now, so False means the gate would refuse the variant (see `_build_internal_offer_summary`).
+    """
     import routes.agent_shop_gateway as gateway
 
-    internal_qty_zero = {**_internal_offer("of:internal", 0.95), "in_stock": False}
+    internal_sold_out = {**_internal_offer("of:internal", 0.95), "in_stock": False}
     external_in_stock = {**_external_offer("of:external", 1.0), "in_stock": True}
-    ranked = gateway._rank_offers_merit_first([external_in_stock, internal_qty_zero])
+    ranked = gateway._rank_offers_merit_first([internal_sold_out, external_in_stock])
+    assert [o["offer_id"] for o in ranked] == ["of:external", "of:internal"]
+
+
+def test_rank_offers_merit_first_a_sellable_buy_here_offer_still_wins_the_tie() -> None:
+    """Control for the test above: stock is what moved the internal offer, not its route."""
+    import routes.agent_shop_gateway as gateway
+
+    internal_in_stock = {**_internal_offer("of:internal", 0.95), "in_stock": True}
+    external_in_stock = {**_external_offer("of:external", 1.0), "in_stock": True}
+    ranked = gateway._rank_offers_merit_first([external_in_stock, internal_in_stock])
     assert [o["offer_id"] for o in ranked] == ["of:internal", "of:external"]
+
+
+# The internal offer's `in_stock` IS the gate's stock verdict. Each row: the variant the offer
+# ships (None = no variant; the product is read the way the gate reads a product with none), the
+# product around it, and the flag an agent must see. Expected values are spelled out rather than
+# only compared to the gate, so a change that broke both the same way would still fail here.
+_INTERNAL_STOCK_CASES = [
+    # untracked / keep-selling: the platform says buyable at quantity 0
+    pytest.param({"available": True, "inventory_quantity": 0}, {}, True, id="untracked_available_qty0"),
+    pytest.param({"available": False, "inventory_quantity": 5}, {}, False, id="available_false_beats_qty"),
+    pytest.param({"inventory_quantity": 0}, {}, False, id="qty0"),
+    pytest.param({"inventory_quantity": 3}, {}, True, id="qty3"),
+    pytest.param({"availability": "out_of_stock"}, {}, False, id="availability_oos"),
+    pytest.param({"availability": "in_stock"}, {}, True, id="availability_in_stock"),
+    pytest.param({}, {"inventory_quantity": 0, "in_stock": False}, True,
+                 id="variant_states_nothing_is_not_oos_whatever_the_product_says"),
+    pytest.param(None, {"in_stock": False, "inventory_quantity": 5}, False,
+                 id="no_variant_product_in_stock_false_beats_qty"),
+    pytest.param(None, {"inventory_quantity": 0}, False, id="no_variant_product_qty0"),
+    pytest.param(None, {"inventory_quantity": 4}, True, id="no_variant_product_qty4"),
+]
+
+
+@pytest.mark.parametrize("variant, product_extra, expected", _INTERNAL_STOCK_CASES)
+def test_internal_offer_in_stock_is_the_eligibility_gates_verdict(variant, product_extra, expected) -> None:
+    import routes.agent_shop_gateway as gateway
+    from services.product_exposure_service import (
+        _standard_variant_reason_codes,
+        product_as_standard_variant,
+    )
+
+    product = {"id": "p1", "title": "P", "price": 10.0, "currency": "USD", **product_extra}
+    variant_payload = {"id": "v1", "price": 10.0, **variant} if variant is not None else {}
+    summary = gateway._build_internal_offer_summary(
+        merchant_id="m1", platform="shopify", product_payload=product,
+        variant_payload=variant_payload, confidence=0.95,
+        canonical_ref=None, canonical_group_id=None,
+    )
+    gate_view = variant_payload or product_as_standard_variant(product)
+    gate_says_in_stock = "out_of_stock" not in _standard_variant_reason_codes(
+        gate_view, product_currency="USD")
+    assert summary["in_stock"] is expected
+    assert summary["in_stock"] is gate_says_in_stock
 
 
 def test_rank_offers_merit_first_stock_does_not_jump_a_fit_tier() -> None:
@@ -1473,6 +1526,141 @@ def test_offers_resolve_exact_internal_beats_exact_external_end_to_end(
     assert isinstance(offers[0]["internal_checkout_items"], list)
     assert external["affiliate_url"].startswith("https://example.com/r?token=")
     assert external["internal_checkout_items"] is None
+
+
+def _stock_tie_fetch_all(internal_variant: dict):
+    """One exact internal row (the queried sku, confidence 0.95) and one exact, in-stock
+    referral seed for the same sku (1.0) -- the same fit tier, so stock and then
+    transactability decide the order. The product_data carries no platform/merchant_id, so it
+    fails StandardProduct validation and the gate reads the variant raw, `available` first."""
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM external_product_seeds" in q:
+            return [
+                {
+                    "id": "eps_stock_1",
+                    "external_product_id": "ext_stock_1",
+                    "market": "US",
+                    "tool": "*",
+                    "destination_url": "https://brand.example/products/serum",
+                    "canonical_url": "https://brand.example/products/serum",
+                    "domain": "brand.example",
+                    "title": "Brand Serum (referral)",
+                    "price_amount": 25.0,
+                    "price_currency": "USD",
+                    "availability": "in_stock",
+                    "utm_template": None,
+                    "seed_data": {
+                        "snapshot": dict(_VERIFIED_CONTENT),
+                        "brand": "Brand Example",
+                        "variants": [
+                            {
+                                "variant_id": "SKU_STOCK_EXACT",
+                                "title": "Brand Serum 30ml",
+                                "price_amount": 25.0,
+                                "price_currency": "USD",
+                                "availability": "in_stock",
+                            }
+                        ],
+                    },
+                    "status": "active",
+                    **_VERIFIED_DESTINATION,
+                }
+            ]
+        if "FROM products_cache" in q:
+            return [
+                {
+                    "merchant_id": "merch_stock",
+                    "product_data": {
+                        "id": "prod_stock_1",
+                        "title": "Internal Serum (buy-here)",
+                        "currency": "USD",
+                        "price": 24.0,
+                        "merchant_name": "Buy-Here Store",
+                        "variants": [{"id": "SKU_STOCK_EXACT", "price": 24.0, **internal_variant}],
+                    },
+                }
+            ]
+        return []
+
+    return fake_fetch_all
+
+
+def _post_stock_tie(monkeypatch, client, internal_variant: dict, *, limit: int,
+                    commerce_surface=None) -> dict:
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
+
+    monkeypatch.setattr(gateway.database, "fetch_all", _stock_tie_fetch_all(internal_variant))
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(
+        gateway, "_make_external_redirect_url", AsyncMock(return_value="https://example.com/r?token=stock")
+    )
+    payload = {"product": {"sku_id": "SKU_STOCK_EXACT"}, "limit": limit, "market": "US", "tool": "*"}
+    if commerce_surface:
+        payload["commerce_surface"] = commerce_surface
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={"operation": "offers.resolve", "payload": payload,
+              "metadata": {"source": "creator-agent-ui"}},
+    )
+    assert res.status_code == 200
+    return res.json()
+
+
+def test_relaxed_fallback_sold_out_buy_here_offer_ranks_behind_an_in_stock_referral(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """RELAXED mode (no commerce_surface): no variant passes the gate, so the handler falls back
+    to variants[0] and ships a buy-here offer that cannot be bought. While internal offers were
+    exempt from the stock rank, it won the equal-fit tie over the in-stock referral on
+    transactability. It now prints the gate's verdict (False) and ranks behind it."""
+    body = _post_stock_tie(monkeypatch, client, {"inventory_quantity": 0}, limit=10)
+    offers = body.get("offers") or []
+    assert [o["purchase_route"] for o in offers] == ["affiliate_outbound", "internal_checkout"]
+    assert [o["in_stock"] for o in offers] == [True, False]
+    # Both still ship, so the internal row is still the resolution; the order is what changed.
+    assert body["resolution_mode"] == "exact_match"
+
+
+def test_relaxed_fallback_sold_out_buy_here_offer_at_limit_1_reports_external_only(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """limit=1 cuts the sold-out buy-here offer, and resolution_mode is reconciled against what
+    SHIPS: a response holding one referral says external_only, names no resolved_target, and
+    does not claim an internal offer."""
+    body = _post_stock_tie(monkeypatch, client, {"inventory_quantity": 0}, limit=1)
+    offers = body.get("offers") or []
+    assert [o["purchase_route"] for o in offers] == ["affiliate_outbound"]
+    assert offers[0]["in_stock"] is True
+    assert body["resolution_mode"] == "external_only"
+    assert body.get("resolved_target") is None
+    assert body["substitution_reason_codes"] == []
+    assert body["metadata"]["has_internal"] is False
+    assert body["metadata"]["has_external"] is True
+
+
+@pytest.mark.parametrize("commerce_surface", [None, "agent_api"], ids=["relaxed", "strict"])
+def test_untracked_inventory_buy_here_variant_stays_first_at_limit_1(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, commerce_surface
+) -> None:
+    """The case the exemption existed for. An untracked / keep-selling variant says
+    `available: true` at quantity 0; the gate ships it, and the flag -- now the gate's verdict --
+    says in stock. So with the exemption gone it still wins the equal-fit tie, survives the
+    limit=1 cut, and the response stays an exact match."""
+    body = _post_stock_tie(
+        monkeypatch, client, {"inventory_quantity": 0, "available": True},
+        limit=1, commerce_surface=commerce_surface,
+    )
+    offers = body.get("offers") or []
+    assert [o["purchase_route"] for o in offers] == ["internal_checkout"]
+    assert offers[0]["in_stock"] is True
+    assert body["resolution_mode"] == "exact_match"
+    assert body["resolved_target"]["variant_id"] == "SKU_STOCK_EXACT"
+    assert body["metadata"]["has_internal"] is True
 
 
 def test_offers_resolve_pure_internal_order_unchanged_end_to_end(
