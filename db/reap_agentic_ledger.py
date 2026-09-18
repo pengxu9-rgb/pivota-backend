@@ -1,4 +1,4 @@
-"""Persistence for the Reap AGENTIC rail (migration 224): purchases + enrollments.
+"""Persistence for the Reap AGENTIC rail (migrations 224 + 225): purchases + enrollments.
 
 Two tables, one job each:
 
@@ -11,6 +11,22 @@ scheduler job and no state-machine service — those are later work packages, an
 need are the ones this file exports: `transition` for the service, `claim_due_purchases` /
 `release_claim` / `requeue_stale_claims` for the poller, `get_purchase_for_owner` /
 `list_purchases_for_owner` for the routes.
+
+── WHAT MIGRATION 225 ADDED, AND WHY IT IS A COLUMN AND NOT AN ARGUMENT ─────────────────────
+
+`start_purchase` and `advance` run in DIFFERENT PROCESSES, minutes apart, and `advance` may run
+many times. Anything the RESOLVER needs that is not in a column is gone by the time the resolve
+happens — so the three resolution hints (`accept_variant_labels`, `also_accept_domains`,
+`market_country`) are stored on the purchase row by `create_purchase` and read back by
+`get_purchase_internal` on every re-resolve. Before they existed,
+services/reap_agentic_purchase.py refused any purchase carrying them, with
+`resolution_hints_not_persistable`; the Flower Beauty Tier-A row is the case that cannot resolve
+at all without an accepted alias.
+
+Two smaller gaps closed with them, both named by that same caller: `release_claim` can now record
+`last_error_code`, so a step that made no progress says WHY in the row rather than only in a log
+line; and `get_enrollment_internal` / `get_enrollment_by_reap_id` are plain enrollment READS,
+retiring the workaround of calling `upsert_pending_enrollment` — a write — to get a row back.
 
 ── FIVE PROPERTIES OF THIS DRIVER THAT SHAPED EVERY STATEMENT BELOW ─────────────────────────
 
@@ -83,9 +99,22 @@ from db.database import IS_POSTGRES, database
 # a cycle (unlike db/agent_card_auth_decisions.py's lazy import of services.reap_external_auth).
 from services.reap_webhooks import major_to_minor
 
-# `get_purchase_internal` is deliberately ABSENT: it is the unscoped, unredacted read, and
-# leaving it out of the public surface is half of what stops a route reaching for it. The other
-# half is its name.
+# `get_purchase_internal`, `get_enrollment_internal` AND `get_enrollment_by_reap_id` are
+# deliberately ABSENT. The first two are the unscoped, unredacted reads and their names say so.
+#
+# The third is here on the same list rather than exported, and that is a decision worth stating
+# because the obvious argument goes the other way: `get_enrollment_by_reap_id` is a
+# self-describing name nobody reaches for by mistake, and `get_active_enrollment` is exported
+# although it is unscoped too. What settles it is WHAT THE ROW CARRIES. Both new reads hand back
+# `hosted_url` — a live page on which a card can be enrolled — keyed on an identifier that comes
+# from OUTSIDE this system. `get_active_enrollment` is keyed on `buyer_ref`, which we minted, and
+# by the time a caller holds one it has already proved whose it is. A partner's enrollment id has
+# proved nothing on its own.
+#
+# THE PRECONDITION, THEREFORE: a caller must have AUTHENTICATED the reap enrollment id before
+# using it here — a verified webhook signature, or an id read out of a row we already own. It is
+# not a value to accept from a request. Keeping it off `__all__` does not enforce that (nothing
+# in Python would), but it makes the import the deliberate act the precondition needs.
 __all__ = [
     "ALLOWED_TRANSITIONS",
     "PURCHASE_STATES",
@@ -227,7 +256,21 @@ _TRANSITION_FIELDS: Sequence[str] = (
 
 # Columns stored as jsonb on Postgres / TEXT-holding-JSON on SQLite. Encoded on the way in,
 # decoded on the way out — see properties 2 and 3.
-_JSON_COLUMNS = ("queries_tried", "shipping_address")
+#
+# THE TWO HINT COLUMNS (mig 225) ARE HERE FOR THE READ SIDE, NOT THE WRITE SIDE. They are written
+# only by `create_purchase`, which binds them through `_bind_json` explicitly; they are
+# deliberately NOT in `_TRANSITION_FIELDS`, because a hint is an assertion the CALLER made when
+# the purchase was opened and a poller step has no standing to revise it. What this tuple buys
+# them is `_normalize_row`: without it, `get_purchase_internal` hands the resolver the raw jsonb
+# TEXT asyncpg returns (property 2) and `for label in row["accept_variant_labels"]` iterates the
+# CHARACTERS of a JSON string — a resolve that silently accepts nothing, on the one path that
+# exists to make a resolve succeed.
+_JSON_COLUMNS = (
+    "queries_tried",
+    "shipping_address",
+    "accept_variant_labels",
+    "also_accept_domains",
+)
 
 _PURCHASE_TS_COLUMNS = (
     "state_entered_at",
@@ -295,6 +338,162 @@ def _decode_json(value: Any) -> Any:
         # A column that is not valid JSON is evidence of a bad write, not a reason to raise on
         # a read path. Hand back what is there.
         return value
+
+
+# ── mig-225 hint validation ──────────────────────────────────────────────────────────────────
+#
+# THESE VALIDATE AT THE LEDGER, NOT ONLY AT THE SERVICE, and the duplication is on purpose. These
+# three values are CALLER ASSERTIONS that change what a resolver will ACCEPT — "this other label
+# names my product", "this other domain is also this merchant". They are the one class of input
+# on this rail whose whole job is to widen a match, so a malformed one does not fail loudly, it
+# quietly widens the match by more than the caller meant. `services/reap_agentic_purchase.py`
+# checks its own inputs at its own boundary; this checks what actually reaches the column, which
+# is the last place anything can.
+#
+# THE BOUNDS ARE THERE TO KEEP THE ROW A ROW. `queries_tried` is diagnostic and unbounded because
+# WE write it; these arrive from a caller and land in a column every resolve reads, so 32 entries
+# of 128 characters is stated rather than left to whatever the caller happened to send. The
+# 128-character bound applies to BOTH lists: on labels it is the only length rule there is, and
+# on domains it sits inside the stricter hostname shape below (which already caps the whole name
+# at 253 and each label at 63), where it is belt to that brace rather than the operative rule.
+
+_HINT_MAX_ENTRIES = 32
+_HINT_LABEL_MAX_CHARS = 128
+
+# CONTROL CHARACTERS ARE REFUSED IN EVERY HINT ENTRY, and this is not tidiness. A label is free
+# text — it is the one field here with no shape rule beyond a length — so before this it could
+# carry anything a caller put in it:
+#
+#   * a NUL byte was STORED on SQLite and reached Postgres as a raw asyncpg
+#     UntranslatableCharacterError, unwrapped, naming a parameter index rather than the field —
+#     two different wrong answers for one bad input, and neither says "accept_variant_labels";
+#   * a newline makes a one-line log entry into two, so a label can forge a log line;
+#   * an ESC introduces an ANSI escape sequence, and these values are printed to operator
+#     terminals by every diagnostic that shows why a resolve refused.
+#
+# The domains path never needed this (the hostname shape admits no control character), but the
+# check runs for both so that "what may be in a hint entry" has one answer.
+_HINT_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+# A DELIBERATELY PLAIN HOSTNAME SHAPE, not a URL parser and not a public-suffix check. Labels of
+# letters/digits/hyphen, not starting or ending with a hyphen, at least two of them, a TLD that is
+# alphabetic. It refuses a scheme, a path, a port, a space, an empty label and a bare hostname
+# with no dot — which is the whole set of things a caller sends when it meant to send a URL. What
+# it does NOT do is decide whether the domain exists; that is the resolver's business and cannot
+# be answered here.
+#
+# `\Z` AND NOT `$`, IN ALL THREE PATTERNS BELOW. In Python `$` also matches immediately before a
+# trailing newline, so `re.match(r"^[a-z_]+$", "brand.example\n")` SUCCEEDS — a trailing newline
+# would sail through every one of these validators and into the column, where it is invisible in
+# every log line and in every diff that prints the value. `\Z` is the true end of the string.
+# Caught by tests/test_reap_agentic_ledger.py::test_release_refuses_a_malformed_error_code, whose
+# trailing-newline case was written as an ordinary "a code is not a sentence" case and found this.
+_HINT_DOMAIN_RE = re.compile(
+    r"^(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}\Z"
+)
+
+# ISO-3166-1 alpha-2, UPPERCASE. Not case-folded: the column feeds a market lookup, 'us' and 'US'
+# must not become two markets, and picking a canonical spelling is cheaper than normalising at
+# every read. A caller with a lowercase code gets a ValueError naming the rule rather than a row
+# that is subtly the wrong market.
+_HINT_COUNTRY_RE = re.compile(r"^[A-Z]{2}\Z")
+
+# The shape of a `last_error_code`. Lowercase word characters plus the three separators the
+# rail's own vocabulary already uses — ':' for the transport codes' `family:detail`, '.' and '-'
+# for partner codes echoed back. 64 characters because that is what the column is.
+_ERROR_CODE_RE = re.compile(r"^[a-z0-9_:.-]{1,64}\Z")
+
+
+def _require_hint_list(value: Any, name: str, *, max_chars: int, domains: bool) -> Optional[list]:
+    """Validate one hint list; return the (normalised) list, or None for "no hints".
+
+    NONE AND `[]` COLLAPSE TO NONE, and that is the module's answer to "what does an empty list
+    mean?". They are the same assertion — the caller offered no aliases — and storing two
+    spellings of it would make every reader carry a `or []`. NULL is the one spelling.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+        raise ValueError(
+            f"{name} must be a list of strings or None (got {type(value).__name__} {value!r}); "
+            "a bare string is refused because it would be stored as a list of its characters"
+        )
+    items = list(value)
+    if not items:
+        return None
+    if len(items) > _HINT_MAX_ENTRIES:
+        raise ValueError(
+            f"{name} may name at most {_HINT_MAX_ENTRIES} entries (got {len(items)})"
+        )
+    out: List[str] = []
+    for entry in items:
+        if not isinstance(entry, str):
+            raise ValueError(
+                f"{name} entries must be strings (got {type(entry).__name__} {entry!r})"
+            )
+        text = entry.strip()
+        if not text:
+            raise ValueError(f"{name} entries must not be blank")
+        # BEFORE the length bound and before the hostname shape, so the message names the real
+        # problem. `.strip()` above has already removed leading/trailing whitespace including a
+        # trailing newline, so what reaches here is a control character INSIDE the value — which
+        # is never a typo worth repairing.
+        if _HINT_CONTROL_CHARS_RE.search(text):
+            raise ValueError(
+                f"{name} entries must not contain control characters (got {entry!r}); a NUL is "
+                "unstorable on Postgres, and a newline or an ESC forges a log line"
+            )
+        if len(text) > max_chars:
+            raise ValueError(
+                f"{name} entries must be at most {max_chars} characters (got {len(text)})"
+            )
+        if domains:
+            # Hostnames are case-insensitive, so lowercasing is a normalisation and not a
+            # judgement — and it is what makes the stored value comparable to a domain the
+            # resolver read off a URL without either side remembering to fold.
+            text = text.lower()
+            if not _HINT_DOMAIN_RE.match(text):
+                raise ValueError(
+                    f"{name} entries must be plain hostnames (got {entry!r}); no scheme, no "
+                    "path, no port"
+                )
+        out.append(text)
+    return out
+
+
+def _require_country(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not _HINT_COUNTRY_RE.match(value):
+        raise ValueError(
+            f"market_country must be two UPPERCASE letters (ISO-3166-1 alpha-2) or None, got "
+            f"{value!r}"
+        )
+    return value
+
+
+def _require_error_code(value: Any) -> Optional[str]:
+    """Validate a `last_error_code` on its way into the column, or None for "do not write one".
+
+    REFUSES RATHER THAN TRUNCATES OR FOLDS. This value is written by a poller and read by a human
+    deciding why a purchase stalled, so the two failure modes to avoid are a code that is silently
+    a different code (case-folded, truncated at 64) and a code that is a sentence. A ValueError
+    names the offending value at the call site that produced it, which is the only place the real
+    vocabulary can be fixed.
+
+    THE CALLER'S OBLIGATION, STATED HERE BECAUSE IT IS NOT OBVIOUS: the pattern is LOWERCASE.
+    services/reap_agentic_purchase.py builds codes like `transport_error:ReadTimeout` by
+    appending an httpx exception TYPE name, and passes partner codes through unfolded — both are
+    refused here. That caller must lower-case what it hands to `release_claim`.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str) or not _ERROR_CODE_RE.match(value):
+        raise ValueError(
+            f"last_error_code must match {_ERROR_CODE_RE.pattern} (lowercase, at most 64 "
+            f"characters), got {value!r}"
+        )
+    return value
 
 
 def _decode_dt(value: Any) -> Any:
@@ -388,6 +587,12 @@ def _is_unique_violation(exc: BaseException) -> bool:
 #       A substituted variant id handed out here would read as identity to everyone downstream.
 #   queries_tried — our resolver's search terms.
 #   attempts, next_poll_at, claimed_by, claimed_at — poller bookkeeping.
+#   accept_variant_labels, also_accept_domains, market_country — CATALOG assertions the caller
+#       made. Not PII and not identity, so their absence here is the "keep the allowlist minimal"
+#       argument rather than a confidentiality one: no owner-facing read has a use for its own
+#       echoed input. They ARE returned by `get_purchase_for_owner(include_private=True)` and by
+#       `get_purchase_internal`, which is the point of the column — this list governs the
+#       REDACTED view, not what the row holds.
 PUBLIC_PURCHASE_COLUMNS = (
     "id",
     "state",
@@ -451,14 +656,17 @@ _INSERT_PURCHASE_SQL = """
         id, buyer_ref, agent_id, agent_user_ref_hash, enrollment_id, state,
         merchant_domain, product_key, variant_key, product_name, variant_title,
         brand, category, quantity, currency, our_price_minor, click_id, return_url,
-        queries_tried, next_poll_at, shipping_address, buyer_email
+        queries_tried, next_poll_at, shipping_address, buyer_email,
+        accept_variant_labels, also_accept_domains, market_country
     ) VALUES (
         :id, :buyer_ref, :agent_id, :agent_user_ref_hash, :enrollment_id, :state,
         :merchant_domain, :product_key, :variant_key, :product_name, :variant_title,
         :brand, :category, :quantity, :currency, :our_price_minor, :click_id, :return_url,
         CAST(:queries_tried AS JSONB), COALESCE(:next_poll_at, clock_timestamp()),
         CAST(:shipping_address AS JSONB),
-        :buyer_email
+        :buyer_email,
+        CAST(:accept_variant_labels AS JSONB), CAST(:also_accept_domains AS JSONB),
+        :market_country
     )
     RETURNING *
 """
@@ -468,13 +676,15 @@ _INSERT_PURCHASE_SQL_SQLITE = """
         id, buyer_ref, agent_id, agent_user_ref_hash, enrollment_id, state,
         merchant_domain, product_key, variant_key, product_name, variant_title,
         brand, category, quantity, currency, our_price_minor, click_id, return_url,
-        queries_tried, next_poll_at, shipping_address, buyer_email
+        queries_tried, next_poll_at, shipping_address, buyer_email,
+        accept_variant_labels, also_accept_domains, market_country
     ) VALUES (
         :id, :buyer_ref, :agent_id, :agent_user_ref_hash, :enrollment_id, :state,
         :merchant_domain, :product_key, :variant_key, :product_name, :variant_title,
         :brand, :category, :quantity, :currency, :our_price_minor, :click_id, :return_url,
         :queries_tried, COALESCE(:next_poll_at, CURRENT_TIMESTAMP), :shipping_address,
-        :buyer_email
+        :buyer_email,
+        :accept_variant_labels, :also_accept_domains, :market_country
     )
     RETURNING *
 """
@@ -527,9 +737,31 @@ async def create_purchase(
     next_poll_at: Optional[datetime] = None,
     shipping_address: Any = None,
     buyer_email: Optional[str] = None,
+    accept_variant_labels: Any = None,
+    also_accept_domains: Any = None,
+    market_country: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Open a purchase, always in 'resolving'. `buyer_ref` is the OPAQUE reference we send Reap
     as owner.id — never the global buyer id, which must not leave this system.
+
+    ── THE THREE RESOLUTION HINTS (mig 225) ─────────────────────────────────────────────────
+
+    `accept_variant_labels`, `also_accept_domains` and `market_country` are stated ONCE, here,
+    and the resolver re-reads them on EVERY re-resolve. They are accepted at CREATE and nowhere
+    else — they are not in `_TRANSITION_FIELDS`, so no poller step can revise them. That is the
+    point: a hint is an assertion the CALLER made about what it is willing to buy, and a worker
+    that could widen it mid-flight could widen it past what the buyer approved.
+
+    They exist because `advance` runs in a DIFFERENT PROCESS from the call that opens the
+    purchase, minutes later and possibly repeatedly: anything not in a column is gone by the time
+    the resolve happens. services/reap_agentic_purchase.py (PR #2204) refuses a purchase carrying
+    the two lists today, with `resolution_hints_not_persistable`, precisely because migration 224
+    had nowhere to keep them.
+
+    VALIDATED HERE AS WELL AS AT THE SERVICE. These are the one class of input on this rail whose
+    job is to WIDEN what a resolver accepts, so a malformed one does not fail loudly — it widens
+    the match by more than the caller meant. See `_require_hint_list`. `None` and `[]` both store
+    NULL: "no hints" has one spelling in the column.
 
     A PURCHASE CANNOT BE CREATED IN ANY OTHER STATE, AND THAT IS THE FIX FOR A REAL DEFECT. This
     used to accept any state in the vocabulary, including the four terminal ones — and creating
@@ -567,6 +799,23 @@ async def create_purchase(
     if int(quantity) <= 0:
         raise ValueError("quantity must be a positive integer")
 
+    # BEFORE THE INSERT, so a refused hint leaves NO ROW AT ALL. A purchase created and then
+    # rejected would be a 'resolving' row holding the buyer's address and email with nothing
+    # scheduled to terminate it — the PII deadline only starts once the row exists.
+    labels = _require_hint_list(
+        accept_variant_labels,
+        "accept_variant_labels",
+        max_chars=_HINT_LABEL_MAX_CHARS,
+        domains=False,
+    )
+    domains = _require_hint_list(
+        also_accept_domains,
+        "also_accept_domains",
+        max_chars=_HINT_LABEL_MAX_CHARS,
+        domains=True,
+    )
+    country = _require_country(market_country)
+
     values: Dict[str, Any] = {
         "id": purchase_id or new_purchase_id(),
         "buyer_ref": buyer_ref,
@@ -590,6 +839,9 @@ async def create_purchase(
         "next_poll_at": _bind_dt(next_poll_at),
         "shipping_address": _bind_json(shipping_address),
         "buyer_email": buyer_email,
+        "accept_variant_labels": _bind_json(labels),
+        "also_accept_domains": _bind_json(domains),
+        "market_country": country,
     }
     # THE BRANCH IS AT THE CALL SITE, not `sql = A if IS_POSTGRES else B` one line up. Both
     # forms read the same; only this one is visible to tests/test_repo_sql_prepare_postgres.py,
@@ -706,6 +958,27 @@ async def list_purchases_for_owner(
 # terminal state must not still carry the buyer's address and email. The only version of that
 # rule which cannot be skipped by a crash, a retry, or a caller who forgot is the one that is
 # part of the same write that makes the state terminal.
+#
+# WHY `last_error_code` IS THE ONE COLUMN WHOSE COALESCE IS CONDITIONAL. Everywhere else in this
+# statement, None means "leave this column alone", and that is right for a column that accumulates
+# what we know. It is WRONG on the last error once the purchase is FINISHED, because the column
+# then stops meaning "the most recent thing that went wrong" and starts meaning "why this purchase
+# ended" — and a retry that eventually SUCCEEDS would carry the failed attempt's code into a
+# 'completed' row. Measured on the caller: a purchase that failed one `processing` poll with
+# `completed_without_order_id` (or any transport code), then completed cleanly on the next, landed
+# in 'completed' still carrying the stale code, and every reader of that row would have said the
+# order had a problem it did not have.
+#
+# So the rule is: TERMINAL TARGET -> the bind is written straight through, so None CLEARS and an
+# explicit code STAYS (which is how 'failed' and 'refused' say why). NON-TERMINAL target -> the
+# ordinary COALESCE, because a step in flight that reports nothing must not erase the last thing
+# that did go wrong. `release_claim` keeps its unconditional COALESCE for that same reason: a
+# release is never terminal.
+#
+# `:last_error_code` APPEARS TWICE HERE AND THAT IS SAFE, unlike `:to_state`/`:to_state_probe`.
+# Both occurrences are VALUE positions of the same column type, so Postgres deduces one type for
+# them; the split that statement needs is between a value being assigned and a value being
+# compared, which is not what this is. The PREPARE gate is what actually confirms it.
 _TRANSITION_SQL = """
     UPDATE reap_agentic_purchases
        SET state = :to_state,
@@ -736,7 +1009,8 @@ _TRANSITION_SQL = """
            hosted_url_expires_at = COALESCE(:hosted_url_expires_at, hosted_url_expires_at),
            refusal_reason = COALESCE(:refusal_reason, refusal_reason),
            queries_tried = COALESCE(CAST(:queries_tried AS JSONB), CAST(queries_tried AS JSONB)),
-           last_error_code = COALESCE(:last_error_code, last_error_code),
+           last_error_code = CASE WHEN :to_state_probe IN ('completed', 'failed', 'refused', 'expired')
+                THEN :last_error_code ELSE COALESCE(:last_error_code, last_error_code) END,
            next_poll_at = COALESCE(:next_poll_at, next_poll_at),
            shipping_address = CASE WHEN :to_state_probe IN ('completed', 'failed', 'refused', 'expired')
                 THEN NULL ELSE COALESCE(CAST(:shipping_address AS JSONB), CAST(shipping_address AS JSONB)) END,
@@ -786,7 +1060,8 @@ _TRANSITION_SQL_SQLITE = """
            hosted_url_expires_at = COALESCE(:hosted_url_expires_at, hosted_url_expires_at),
            refusal_reason = COALESCE(:refusal_reason, refusal_reason),
            queries_tried = COALESCE(:queries_tried, queries_tried),
-           last_error_code = COALESCE(:last_error_code, last_error_code),
+           last_error_code = CASE WHEN :to_state_probe IN ('completed', 'failed', 'refused', 'expired')
+                THEN :last_error_code ELSE COALESCE(:last_error_code, last_error_code) END,
            next_poll_at = COALESCE(:next_poll_at, next_poll_at),
            shipping_address = CASE WHEN :to_state_probe IN ('completed', 'failed', 'refused', 'expired')
                 THEN NULL ELSE COALESCE(:shipping_address, shipping_address) END,
@@ -820,6 +1095,27 @@ async def transition(
     Returns the NEW row, or None when the row was not in one of `from_states` — which is the
     concurrency guard, not an error. Two workers advancing the same purchase from the same state
     both issue this statement; exactly one gets a row back.
+
+    ── `last_error_code` DOES NOT BEHAVE LIKE THE OTHER OPTIONAL FIELDS ─────────────────────
+
+    For every other column here, passing None means "leave this alone". For `last_error_code`
+    that holds only while the target state is NON-TERMINAL. On a TERMINAL target the value is
+    written straight through:
+
+        to_state terminal, last_error_code=None   -> the column is CLEARED
+        to_state terminal, last_error_code='x'    -> 'x' is stored (how 'failed'/'refused' speak)
+        to_state non-terminal, last_error_code=None -> the previous code is KEPT
+
+    Because once a purchase is finished the column stops meaning "the last thing that went wrong"
+    and starts meaning "why this purchase ended". Without the distinction a retry that eventually
+    SUCCEEDS carries the failed attempt's code into a 'completed' row — measured on the caller: a
+    `processing` poll that failed with `completed_without_order_id` and then completed cleanly
+    landed in 'completed' still carrying that code, and every reader of the row would have
+    believed the order had a problem it did not have.
+
+    A caller that wants a terminal row to KEEP the code it already had must pass it explicitly.
+    `release_claim` is unaffected and keeps its unconditional COALESCE — a release is never
+    terminal.
 
     Raises ValueError for a pair ALLOWED_TRANSITIONS does not permit, before any SQL runs. The
     distinction matters: an illegal pair is a bug in the caller and must be loud, while a lost
@@ -1027,11 +1323,38 @@ _CLAIM_PURCHASE_SQL_SQLITE = """
 # and handed to somebody else must not be able to clear the new holder's claim on its way out.
 # This is the SAME fence `transition`'s `holder=` applies — `claimed_by = :worker_id` in both,
 # both answering None when the claim has moved on.
+#
+# ── `last_error_code` IS WRITTEN HERE, IN THE SAME CONDITIONAL UPDATE ────────────────────────
+#
+# A release is the ONLY way a step that made no progress ends, and until now it could not say
+# WHY. The poller's alternative was a `transition` — but a held step has not changed state, so
+# there is no legal edge to take, and inventing a self-edge to carry an error string would put a
+# diagnostic in the statement that also stamps `state_entered_at` and nulls PII. So the code
+# rides on the release.
+#
+# `COALESCE(:last_error_code, last_error_code)` and not a bare assignment: a release that passes
+# nothing must LEAVE THE PREVIOUS CODE ALONE. The poller releases on every ordinary poll of a
+# healthy row, and a bare assignment would erase the reason the row stalled on the very next
+# uneventful tick — the value would only ever survive for one poll interval, which is the same as
+# not storing it.
+#
+# ── `state_entered_at` IS NOT TOUCHED, AND THAT IS LOAD-BEARING ──────────────────────────────
+#
+# It is the PII deadline's clock (see `expire_overdue_purchases`), and it is deliberately a clock
+# the poll loop CANNOT RESET: `updated_at` already moves on every claim, release and requeue, so a
+# deadline measured from it never fires under a 30-second cadence. Measured, before that was
+# fixed: a row aged 99999 seconds, then ONE ordinary claim+release, was not expired and kept the
+# buyer's address and email. Adding `state_entered_at = clock_timestamp()` to these two statements
+# would re-open exactly that hole from the other end, and it would look like a harmless
+# consistency tidy-up. tests/test_reap_agentic_ledger.py::
+# test_release_with_an_error_code_does_not_touch_state_entered_at is the mutant that kills it, on
+# both dialects.
 _RELEASE_CLAIM_SQL = """
     UPDATE reap_agentic_purchases
        SET claimed_by = NULL,
            claimed_at = NULL,
            next_poll_at = COALESCE(:next_poll_at, next_poll_at),
+           last_error_code = COALESCE(:last_error_code, last_error_code),
            updated_at = clock_timestamp()
      WHERE id = :id
        AND claimed_by = :worker_id
@@ -1043,6 +1366,7 @@ _RELEASE_CLAIM_SQL_SQLITE = """
        SET claimed_by = NULL,
            claimed_at = NULL,
            next_poll_at = COALESCE(:next_poll_at, next_poll_at),
+           last_error_code = COALESCE(:last_error_code, last_error_code),
            updated_at = CURRENT_TIMESTAMP
      WHERE id = :id
        AND claimed_by = :worker_id
@@ -1163,14 +1487,41 @@ async def release_claim(
     worker_id: str,
     *,
     next_poll_at: Optional[datetime] = None,
+    last_error_code: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Give the lease back, optionally scheduling the next poll. None when this worker no longer
-    holds the claim — the same fence, and the same answer, as a fenced `transition`."""
+    """Give the lease back, optionally scheduling the next poll and recording WHY. None when this
+    worker no longer holds the claim — the same fence, and the same answer, as a fenced
+    `transition`.
+
+    ── `last_error_code`: WHY THE STEP WAS RELEASED ─────────────────────────────────────────
+
+    A step that made no progress ends here, and before this it ended SILENTLY: the code lived in
+    a log line and in the poller's return value, so "why has this purchase been stuck in
+    'quoting' for an hour?" had no answer in the row. It is written in the SAME conditional UPDATE
+    as the release — not a second statement — so a worker cannot release the lease and then fail
+    to record the reason, and so the write inherits the `claimed_by = :worker_id` fence: a worker
+    that has already lost the lease cannot stamp an error code onto somebody else's step.
+
+    Passing None LEAVES ANY PREVIOUS CODE IN PLACE (`COALESCE`), because the poller releases on
+    every ordinary poll of a healthy row and a bare assignment would erase the reason on the next
+    uneventful tick.
+
+    NO `attempts_delta`. `attempts` is counted at CLAIM, in `_CLAIM_PURCHASE_SQL`, and only in the
+    states where a claim means work was tried. A second place that could move it would make the
+    counter mean two things at once, and `fail_exhausted_purchases` reads it as one.
+
+    REFUSED, NOT TRUNCATED OR FOLDED, when the code does not match `^[a-z0-9_:.-]{1,64}\Z` — see
+    `_require_error_code`, which also states what that means for the caller in PR #2204.
+
+    `state_entered_at` IS NOT TOUCHED. It is the PII deadline's clock, and the poll loop must not
+    be able to reset it; see the note on `_RELEASE_CLAIM_SQL`.
+    """
     _require_worker_id(worker_id, "worker_id")
     values = {
         "id": purchase_id,
         "worker_id": worker_id,
         "next_poll_at": _bind_dt(next_poll_at),
+        "last_error_code": _require_error_code(last_error_code),
     }
     if IS_POSTGRES:
         return _purchase(await database.fetch_one(_RELEASE_CLAIM_SQL, values))
@@ -1386,6 +1737,32 @@ def _require_worker_id(value: Any, name: str) -> str:
     `(value or "").strip()` and was STORED as the claim holder, while asyncpg raised a DataError
     naming a parameter index. Two different wrong answers for one typo, neither of them saying
     "worker id".
+    """
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a str (got {type(value).__name__} {value!r})")
+    if not value.strip():
+        raise ValueError(f"{name} must not be blank")
+    return value
+
+
+def _require_lookup_id(value: Any, name: str) -> str:
+    """An id a read is keyed on must be a non-empty STRING.
+
+    THE SAME RULE AS `_require_worker_id`, AND FOR THE SAME MEASURED REASON: a non-string id
+    produces a DIFFERENT wrong answer on each engine, and neither of them names the argument.
+    `get_enrollment_internal(123)` matched nothing on SQLite — a quiet None, which a caller reads
+    as "no such enrollment" and acts on by failing the purchase for the wrong reason — and raised
+    a raw asyncpg DataError naming a parameter index on Postgres.
+
+    BLANK IS REFUSED TOO, and that is the half worth stating. `""` is not a lookup, it is a
+    caller that lost its id somewhere upstream; answering None lets it keep going and report the
+    enrollment as missing. The empty string also happens to match nothing in both engines today,
+    which is exactly what makes the bug survivable and therefore worth refusing out loud.
+
+    NOTE WHAT THIS IS NOT. It is not the guard that stops `get_enrollment_by_reap_id` wildcarding
+    on a NULL bind — that lives in the SQL, which compares rather than testing for NULL, and
+    tests exercise the statement directly with a None parameter precisely because this function
+    would otherwise hide it.
     """
     if not isinstance(value, str):
         raise ValueError(f"{name} must be a str (got {type(value).__name__} {value!r})")
@@ -1644,6 +2021,54 @@ _SELECT_ACTIVE_ENROLLMENT_SQL = """
      LIMIT 1
 """
 
+# ── the two plain enrollment reads ───────────────────────────────────────────────────────────
+#
+# WHY THEY EXIST. Until now the ONLY enrollment read on this module was
+# `get_active_enrollment(buyer_ref)`, and a purchase sitting in 'needs_enrollment' has by
+# definition no ACTIVE enrollment — so the poller could not recover the partner's enrollment id
+# for the row it was polling. services/reap_agentic_purchase.py (PR #2204) works around that
+# today by calling `upsert_pending_enrollment(enrollment_id=…)` purely to get the row back, and
+# says so in its own docstring: a WRITE used as a read. It bumps `updated_at`, and if the row
+# stopped being pending in between it MINTS A FRESH PENDING ROW rather than returning the one
+# asked for. These two reads retire that.
+#
+# AN EXPLICIT COLUMN LIST, NOT `SELECT *`, AND THAT IS THE POINT OF THE `_internal` PAIR. The
+# enrollment table is small and none of it is card data beyond the network name and last four
+# digits — but `agent_id` and `reap_status` are ours and upstream's respectively, and neither
+# has a caller. A projection that names what it hands out is a projection whose growth is a
+# deliberate edit, which is the same argument PUBLIC_PURCHASE_COLUMNS makes for purchases. `id`
+# IS included although the by-id caller already holds it: it is the handle
+# `get_enrollment_by_reap_id`'s caller needs to reach `mark_enrollment_active` /
+# `mark_enrollment_dead`, and a read that cannot be acted on is not worth having.
+#
+# card_last4 IS IN THE PROJECTION and that is not a leak: four digits and a network name are
+# exactly what migration 224 permits this table to hold, and they exist to be displayed. Nothing
+# else from the partner's payload is here to hand out.
+# The column list is written out in BOTH statements rather than built from one shared constant:
+# an f-string or a `.format()` here would make these two statements invisible to
+# tests/test_repo_sql_prepare_postgres.py, which is property 5 in the module header and the
+# #1588 shape this file avoids everywhere else. A test asserts the two projections are identical.
+_SELECT_ENROLLMENT_BY_ID_SQL = """
+    SELECT id, buyer_ref, reap_enrollment_id, status, hosted_url, hosted_url_expires_at,
+           card_network, card_last4
+      FROM reap_agentic_enrollments
+     WHERE id = :id
+"""
+
+# Reap's id is UNIQUE WHEN PRESENT (uq_reap_agentic_enrollments_reap_id), so this matches at most
+# one row — no ORDER BY and no LIMIT, because there is nothing to choose between and a LIMIT here
+# would quietly paper over a missing index on a database that lost it.
+#
+# A NULL argument matches NOTHING, by the same `NULL = NULL is NULL` property the ownership
+# conjuncts rely on: every PENDING row has a NULL `reap_enrollment_id`, and a lookup that
+# wildcarded on None would hand back an arbitrary one of them.
+_SELECT_ENROLLMENT_BY_REAP_ID_SQL = """
+    SELECT id, buyer_ref, reap_enrollment_id, status, hosted_url, hosted_url_expires_at,
+           card_network, card_last4
+      FROM reap_agentic_enrollments
+     WHERE reap_enrollment_id = :reap_enrollment_id
+"""
+
 
 async def upsert_pending_enrollment(
     *,
@@ -1840,4 +2265,74 @@ async def get_active_enrollment(buyer_ref: str) -> Optional[Dict[str, Any]]:
     uq_reap_agentic_enrollments_one_active and `mark_enrollment_active`."""
     return _enrollment(
         await database.fetch_one(_SELECT_ACTIVE_ENROLLMENT_SQL, {"buyer_ref": buyer_ref})
+    )
+
+
+async def get_enrollment_internal(enrollment_id: str) -> Optional[Dict[str, Any]]:
+    """Read ONE enrollment by OUR id, whatever its status. None when there is no such row.
+
+    THE READ THE POLLER NEEDED AND DID NOT HAVE. A purchase in 'needs_enrollment' points at a
+    PENDING enrollment, which `get_active_enrollment` cannot see by definition, so recovering the
+    partner's id for that row meant calling `upsert_pending_enrollment` — a write — and wearing
+    its side effects (a bumped `updated_at`, and a freshly minted stray pending row whenever the
+    target had stopped being pending). This is that read, and it writes nothing.
+
+    NAMED `_internal` AND ABSENT FROM `__all__`, for the SAME reason as `get_purchase_internal`:
+    it is UNSCOPED. There is no ownership conjunct here — the enrollment table has none to apply,
+    it is keyed on `buyer_ref` — so anything agent-facing must scope the read itself, from the
+    purchase row it already proved the caller owns. The suffix is what makes the wrong call look
+    wrong at the call site.
+
+    Returns the projection named in `_SELECT_ENROLLMENT_BY_ID_SQL`, not the whole row.
+
+    THE ID MUST BE A NON-EMPTY STRING, refused here rather than at the driver — the same rule
+    `_require_worker_id` states and for the same measured reason: a non-string id produces a
+    DIFFERENT wrong answer per engine. `123` matched nothing on SQLite (a quiet None, read as
+    "no such enrollment" by a caller who then fails the purchase for the wrong reason) and raised
+    a raw asyncpg DataError naming a parameter index on Postgres. One ValueError naming the
+    argument beats both.
+    """
+    return _enrollment(
+        await database.fetch_one(
+            _SELECT_ENROLLMENT_BY_ID_SQL,
+            {"id": _require_lookup_id(enrollment_id, "enrollment_id")},
+        )
+    )
+
+
+async def get_enrollment_by_reap_id(reap_enrollment_id: str) -> Optional[Dict[str, Any]]:
+    """Read ONE enrollment by REAP's id. None when nothing matches.
+
+    THE WEBHOOK'S READ. A partner callback names the enrollment by THEIR id and nothing else, so
+    without this the receiver has no way to find our row and act on it — and the natural
+    workaround, scanning for it, is a table scan on the one lookup that happens per callback.
+
+    At most one row can match: `uq_reap_agentic_enrollments_reap_id` is unique where the id is
+    present, which is also the index this read uses. A None argument matches NOTHING rather than
+    every pending row — see the note on the statement.
+
+    ── THE CALLER MUST HAVE AUTHENTICATED THIS ID ─────────────────────────────────────────
+
+    UNSCOPED, like `get_enrollment_internal`, and ABSENT FROM `__all__` for a reason that is
+    about the ROW rather than the name: what comes back carries `hosted_url`, a live page on
+    which a card can be enrolled, and the key it is looked up by comes from OUTSIDE this system.
+    `get_active_enrollment` is exported although it is unscoped too, because it is keyed on
+    `buyer_ref` — a value we minted, which a caller has already proved is theirs. A partner's
+    enrollment id has proved nothing on its own.
+
+    So: use this with an id from a VERIFIED webhook (signature checked) or from a row we already
+    own. Never with one taken from a request. Nothing here can enforce that — the precondition is
+    the caller's, and this paragraph is where it is written down.
+
+    Same projection as `get_enrollment_internal`.
+    """
+    return _enrollment(
+        await database.fetch_one(
+            _SELECT_ENROLLMENT_BY_REAP_ID_SQL,
+            {
+                "reap_enrollment_id": _require_lookup_id(
+                    reap_enrollment_id, "reap_enrollment_id"
+                )
+            },
+        )
     )
