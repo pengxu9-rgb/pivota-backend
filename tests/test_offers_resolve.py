@@ -1219,6 +1219,63 @@ def test_rank_offers_merit_first_pure_internal_order_unchanged() -> None:
     assert [o["offer_id"] for o in ranked] == [o["offer_id"] for o in internal_offers]
 
 
+def test_rank_offers_merit_first_puts_a_sold_out_offer_behind_a_sellable_one_of_equal_fit() -> None:
+    """The Purito case at the ranker: equal fit, the cheaper-but-sold-out seller must not lead.
+    Every lane spells "cannot sell" through `in_stock`; the catalog arm also ships `availability`."""
+    import routes.agent_shop_gateway as gateway
+
+    sold_out = {**_external_offer("of:eyurs", 0.8), "availability": "out_of_stock",
+                "in_stock": False}
+    in_stock = {**_external_offer("of:sokoglam", 0.8), "availability": "in_stock",
+                "in_stock": True}
+    ranked = gateway._rank_offers_merit_first([sold_out, in_stock])
+    assert [o["offer_id"] for o in ranked] == ["of:sokoglam", "of:eyurs"]
+
+
+def test_rank_offers_merit_first_reads_the_flag_alone_when_a_lane_ships_no_availability() -> None:
+    """The seed and internal lanes emit `in_stock` and no `availability` key at all."""
+    import routes.agent_shop_gateway as gateway
+
+    sold_out = {**_external_offer("of:seed_sold_out", 0.8), "in_stock": False}
+    sellable = {**_external_offer("of:seed_sellable", 0.8), "in_stock": True}
+    ranked = gateway._rank_offers_merit_first([sold_out, sellable])
+    assert [o["offer_id"] for o in ranked] == ["of:seed_sellable", "of:seed_sold_out"]
+
+
+def test_rank_offers_merit_first_does_not_demote_unknown_availability() -> None:
+    """Unknown is not out of stock: an offer that states nothing keeps its place (stable sort)
+    ahead of a later in-stock one — only an explicit "cannot sell" moves an offer down."""
+    import routes.agent_shop_gateway as gateway
+
+    unknown = {**_external_offer("of:unknown", 0.8), "availability": "unknown", "in_stock": True}
+    silent = _external_offer("of:silent", 0.8)  # no stock statement of any kind
+    in_stock = {**_external_offer("of:in_stock", 0.8), "availability": "in_stock",
+                "in_stock": True}
+    ranked = gateway._rank_offers_merit_first([unknown, silent, in_stock])
+    assert [o["offer_id"] for o in ranked] == ["of:unknown", "of:silent", "of:in_stock"]
+
+
+def test_rank_offers_merit_first_stock_outranks_the_transactability_tiebreak() -> None:
+    """A buy-here offer that cannot be bought is not a tie worth winning."""
+    import routes.agent_shop_gateway as gateway
+
+    internal_sold_out = {**_internal_offer("of:internal", 0.9), "in_stock": False}
+    external_in_stock = {**_external_offer("of:external", 0.9), "in_stock": True}
+    ranked = gateway._rank_offers_merit_first([internal_sold_out, external_in_stock])
+    assert [o["offer_id"] for o in ranked] == ["of:external", "of:internal"]
+
+
+def test_rank_offers_merit_first_stock_does_not_jump_a_fit_tier() -> None:
+    """A product-grain "in stock" says SOME variant is on the shelf, not the one that matched
+    exactly, so it stays behind an exact match even when that match is sold out."""
+    import routes.agent_shop_gateway as gateway
+
+    exact_sold_out = {**_external_offer("of:exact", 1.0), "in_stock": False}
+    product_in_stock = {**_external_offer("of:product", 0.8), "in_stock": True}
+    ranked = gateway._rank_offers_merit_first([product_in_stock, exact_sold_out])
+    assert [o["offer_id"] for o in ranked] == ["of:exact", "of:product"]
+
+
 def test_offers_resolve_ranks_higher_merit_external_above_lower_merit_internal(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:
@@ -3750,6 +3807,56 @@ def test_catalog_offers_arm_surfaces_a_retailer_by_signature(
     )
     # No new resolution_mode literal: an external-only answer keeps the existing vocabulary.
     assert body.get("resolution_mode") == "external_only"
+
+
+def test_catalog_offers_arm_ships_an_in_stock_seller_ahead_of_a_cheaper_sold_out_one(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """Measured 2026-09-18 on the Purito Oat-in Calming Gel Cream: best offer eyurs.com $13
+    out_of_stock over sokoglam.com $19.50 in_stock. The fake returns the rows in the old
+    price-only order, so this proves the ranker downstream of the SQL holds the line too (the
+    SQL half, ORDER BY before LIMIT, can only be proved on Postgres — see
+    tests/test_offers_resolve_catalog_arm_postgres.py). It also pins that the SQL is handed the
+    SAME vocabulary the `in_stock` flag is computed from."""
+    import routes.agent_shop_gateway as gateway
+
+    rows = [
+        {**_CATALOG_OFFER_ROW, "offer_id": "of_eyurs", "merchant_id": "eyurs",
+         "merchant_name": "eyurs", "availability": "out_of_stock", "price_amount": 13.00,
+         "destination_url": "https://eyurs.com/products/purito-oat"},
+        {**_CATALOG_OFFER_ROW, "offer_id": "of_sokoglam", "merchant_id": "sokoglam",
+         "merchant_name": "Soko Glam", "availability": "in_stock", "price_amount": 19.50,
+         "destination_url": "https://sokoglam.com/products/purito-oat"},
+        {**_CATALOG_OFFER_ROW, "offer_id": "of_ohlolly", "merchant_id": "ohlolly",
+         "merchant_name": "Oh Lolly", "availability": "OUT_OF_STOCK ", "price_amount": 21.00,
+         "destination_url": "https://ohlolly.com/products/purito-oat"},
+    ]
+    bound = {}
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM catalog_products" in q and "JOIN catalog_offers" in q:
+            bound.update(values or {})
+        return _catalog_arm_fetch_all(query, values, offer_rows=rows)
+
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(
+        gateway, "_make_external_redirect_url",
+        AsyncMock(return_value="https://example.com/r?token=catalog"))
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={"operation": "offers.resolve",
+              "payload": {"product": {"product_id": "ext:retailer:purito"}, "limit": 10,
+                          "market": "US", "tool": "*", "commerce_surface": "agent_api"},
+              "metadata": {"source": "creator-agent-ui"}},
+    )
+    assert res.status_code == 200
+    offers = res.json().get("offers") or []
+    assert [o["source"]["offer_id"] for o in offers] == ["of_sokoglam", "of_eyurs", "of_ohlolly"]
+    assert [o["in_stock"] for o in offers] == [True, False, False]
+    assert bound.get("unavailable") == sorted(gateway.OFFER_UNAVAILABLE_AVAILABILITIES)
 
 
 def test_catalog_offers_arm_now_RUNS_beside_the_seed_lane(
