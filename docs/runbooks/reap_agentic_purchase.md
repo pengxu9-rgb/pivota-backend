@@ -1,4 +1,4 @@
-# Reap agentic purchase — the state machine (WP2b) + the poller (WP3)
+# Reap agentic purchase — the state machine (WP2b), the poller (WP3) + the routes (WP4)
 
 `services/reap_agentic_purchase.py` (the state machine) and
 `jobs/reap_agentic_purchase_poll.py` (the poller that drives it). Buyer-funded purchases over
@@ -6,8 +6,8 @@ Reap's agentic rail: the buyer enrols **their own card** once on Reap's hosted p
 each purchase on another hosted page. **Pivota never holds or moves money and never sees card
 data.**
 
-This rail is **dark**. It has no routes, the dial is off, and the scheduler job is registered but
-inert — and the worker service that would run it **is deployed separately from the normal
+This rail is **dark**. Its routes exist but answer 404, the dial is off, and the scheduler job is
+registered but inert — and the worker service that would run it **is deployed separately from the normal
 backend deploy**. Nothing here has ever talked to a `reap.global` or `prava.space` host.
 
 ---
@@ -493,6 +493,128 @@ terminal write still wins.
   the id cannot be persisted before the transition; it is written to the log at INFO
   (`checkout created purchase=… checkout=… quote=…`) so the orphan is at least findable.
 
+
+---
+
+## The routes — `routes/agent_commerce_reap.py` (WP4)
+
+Three, under `/agent/v2/commerce/reap`, registered in `main.py` next to `agent_commerce_router`.
+**The wire contract — every field, every refusal code, worked JSON — is
+`docs/reap_agentic_routes.md`.** This section is the operational half: what an operator turns on,
+and what the routes decide.
+
+| route | what it does |
+|---|---|
+| `POST /purchases` | opens a purchase and returns `202` at once. **Makes no partner call.** |
+| `GET /purchases/{id}` | the owner's read: state, totals, the current hosted URL, the order reference |
+| `GET /purchases?limit=` | the same, for this buyer's recent purchases |
+
+### The dial makes them 404, not 503
+
+While `is_enabled()` is false **or** `rc.is_configured()` is false, all three answer
+**404 `not_available_on_this_rail`**. That is not a bug report, it is the design: the agent door's
+job on a 404 is to fall back to another rail, and a 503 would read as "this rail is the answer,
+retry shortly" and stall a buyer behind a feature nobody has armed. The check is the first
+statement of each handler — one per route, not a router-level dependency, so a mutation that
+deletes one is killed by its own test rather than by all three at once.
+
+The gate is read **per request**, so arming the rail is an env change and not a redeploy.
+
+### What the routes decide, and what they refuse to trust
+
+| the route will not trust | what it does instead |
+|---|---|
+| **the price** | reads `catalog_products` → `catalog_skus` → `catalog_offers` for `(merchant_domain, product_key, variant_key)`, with `coalesce(merchant_effective_price, estimated_best_price, list_price)` — the same precedence every other surface in the repo uses. A price in the request body is ignored. |
+| **the merchant** | `reap_agentic_eligibility` is an allowlist. No enabled row for this domain **in the buyer's market** ⇒ `merchant_not_eligible`. |
+| **the buyer** | resolved from `buyer_identity_links` on `(agent_id, hash(agent_user_ref))`. No link ⇒ `buyer_unlinked` — the routes never create one (see below). |
+| **the variant key** | matched exactly against `catalog_skus.sku_key`, never re-derived: this repo has three live spellings of a variant sku key and they collide. |
+| **the storefront** | `catalog_products.platform` must be `shopify`. `external_seed` rows are refused `row_not_shopify` even though most of that cohort really is Shopify — that normalisation needs seed-snapshot evidence the catalog tables do not carry, and this is a charge, not a display. |
+
+**Why a missing buyer link is a refusal and not a sign-up.** The only writer of
+`buyer_identity_links` is `routes/buyer_api._upsert_buyer_identity_link`, reached from a
+buyer-authenticated surface — the buyer signs in, and that is what binds the agent's opaque user
+ref to a real account. Minting a link from an agent's assertion alone would hang a stored card off
+a buyer account nothing else knows about, and the same human signing in tomorrow would get a
+second account and be asked for their card again.
+
+### Storage the routes own — migration 226
+
+Three tables, none of them touched by the state machine or the poller. Also in
+`db/schema_guard.ensure_required_schema_light` in **both** dialect branches, in their own
+try/except, because production deploys skip `db/migrations/`.
+
+| table | what it is |
+|---|---|
+| `reap_agentic_eligibility` | the allowlist. `(merchant_domain, market_country, product_key, variant_key)` |
+| `reap_agentic_buyer_refs` | `buyer_id` → the opaque `owner.id` we send Reap. Minted once, never exposed. |
+| `reap_agentic_purchase_keys` | idempotency, 24 h, scoped to `(agent_id, agent_user_ref_hash, idempotency_key)` |
+
+`reap_buyer_ref` is a **third** identifier, not the global buyer id and not
+`buyer_agent_links.agent_scoped_buyer_ref`. An enrollment is a CARD: an agent-scoped ref would
+give one human two refs, two enrollments and two cards, and migration 224's "at most one active
+enrollment per buyer_ref" would then hold twice, per agent, which is not the invariant anybody
+wanted.
+
+---
+
+## Enabling a merchant
+
+There is **no admin route** for this in WP4 — deliberately. Arming a domain is the step that lets
+a buyer's own card be spent at that merchant, and it should leave a row somebody wrote on purpose.
+
+```sql
+-- 1. THE MERCHANT ROW. This is the row eligibility is decided against. product_key and
+--    variant_key are '' (the sentinel for "the whole merchant" — NOT NULL, which does not behave
+--    the same on both dialects inside a primary key).
+INSERT INTO reap_agentic_eligibility (merchant_domain, product_key, variant_key,
+                                      market_country, enabled)
+VALUES ('brand.example', '', '', 'US', TRUE)
+ON CONFLICT (merchant_domain, market_country, product_key, variant_key)
+DO UPDATE SET enabled = EXCLUDED.enabled, updated_at = now();
+```
+
+* `merchant_domain` must match `catalog_products.source_domain`, **lowercased**. Check it first:
+  `SELECT DISTINCT source_domain, platform FROM catalog_products WHERE merchant_id = '<id>';`
+  A domain that does not match answers `row_not_found` for every product on it.
+* `market_country` is ISO-3166-1 alpha-2, **uppercase**, and the match is EQUALITY against the
+  buyer's `shipping_address.country`. **Domestic only.** A merchant that sells into two markets
+  gets two rows.
+* `enabled` defaults to `FALSE`. A row somebody created and did not finish thinking about is not
+  an authorization to spend.
+
+```sql
+-- 2. OPTIONAL: per-product resolution aliases. These do NOT grant eligibility — `enabled` is
+--    read from the merchant row only — they only widen what the resolver will accept as naming
+--    the same object. Leave variant_key '' to apply to every variant of the product.
+INSERT INTO reap_agentic_eligibility (merchant_domain, product_key, variant_key,
+                                      market_country, enabled,
+                                      accept_variant_labels, also_accept_domains)
+VALUES ('brand.example', 'prod::m_brand::shopify::1001', '', 'US', FALSE,
+        '["Standard 50ml"]'::jsonb, '["shop.brand.example"]'::jsonb);
+```
+
+The ledger bounds these: at most 32 entries of 128 characters, no control characters, domains
+lowercased and hostname-shaped (no scheme, path or port). It **raises rather than truncating**, and
+the route maps that to `invalid_request` — so a malformed operator row refuses the purchase rather
+than quietly resolving without the alias it was created to supply.
+
+```sql
+-- 3. TURNING A MERCHANT OFF. Purchases already in flight are NOT affected: eligibility is read
+--    once, at POST. They continue, and the poller finishes them.
+UPDATE reap_agentic_eligibility
+   SET enabled = FALSE, updated_at = now()
+ WHERE merchant_domain = 'brand.example';
+
+-- 4. WHAT IS ARMED RIGHT NOW.
+SELECT merchant_domain, market_country, enabled, updated_at
+  FROM reap_agentic_eligibility
+ WHERE product_key = '' ORDER BY merchant_domain;
+```
+
+> **Never `DELETE FROM reap_agentic_buyer_refs`.** It is the only record of which opaque owner id
+> Reap knows a buyer by. Dropping a row strands that buyer's enrollment at Reap and asks somebody
+> who has already given us a card to enter it again.
+
 ---
 
 ## Tests
@@ -503,6 +625,8 @@ terminal write still wins.
 | `tests/test_reap_agentic_purchase_postgres.py` | Postgres (dialect gate) | the fence across **two backend connections**, jsonb-as-text, the server-side clock, the partial unique index, PREPARE |
 | `tests/test_reap_agentic_purchase_poll.py` | SQLite | the poller: the gate (step 4 only), the run order, the counts, the dials and their bounds, the budget, the leftover-claims invariant, cancellation, registration |
 | `tests/test_reap_agentic_purchase_poll_postgres.py` | Postgres (dialect gate) | the poller across **two real backend connections**, its SQL constants under PREPARE, the error backoff against the server clock, `include_processing=False` on the real statement, the PII deadline with the rail off, claim release on cancellation |
+| `tests/test_agent_commerce_reap_routes.py` | SQLite | the three routes over the real app: the router is MOUNTED, the 404 on all three while dark, the ownership conjuncts, eligibility and the market, the price coming from our catalog, the buyer ref, idempotency, the hosted-URL vetting, and that no response or log line carries the buyer |
+| `tests/test_agent_commerce_reap_routes_postgres.py` | Postgres (dialect gate) | migration 226 vs the self-heal through the **catalog** (columns, `indexdef`, `pg_get_constraintdef`), the `numeric`→`Decimal` price path the `CAST` exists for, the `market_country` regex CHECK, and every security-relevant refusal re-run on the production dialect |
 
 All four drive the **real** ledger and the client's **real** pure helpers; only the client's six
 transport functions are faked, and an autouse fixture makes an unpatched `httpx.AsyncClient`
@@ -515,4 +639,8 @@ DATABASE_URL=postgresql://postgres:postgres@localhost:5432/pivota_reap_wp2b_test
     .venv/bin/python -m pytest tests/test_reap_agentic_purchase_postgres.py
 DATABASE_URL=postgresql://postgres:postgres@localhost:5432/pivota_reap_wp3_test \
     .venv/bin/python -m pytest tests/test_reap_agentic_purchase_poll_postgres.py
+
+.venv/bin/python -m pytest tests/test_agent_commerce_reap_routes.py
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/pivota_reap_wp4_test \
+    .venv/bin/python -m pytest tests/test_agent_commerce_reap_routes_postgres.py
 ```

@@ -626,6 +626,99 @@ async def ensure_required_schema_light() -> None:
                 )
             except Exception:  # noqa: BLE001
                 pass
+            # mig 226: the three tables the agentic purchase ROUTES read —
+            # eligibility, the per-buyer opaque ref, and the idempotency keys.
+            # db/migrations/226_reap_agentic_routes.sql is the same schema; that
+            # file's header says what each one is for and why none of them could
+            # be a column on the purchase row.
+            #
+            # ITS OWN try/except, NOT folded into either block above. The mig-225
+            # comment records what folding cost last time: one statement in a
+            # shared try raised on databases that exist, and everything after it
+            # never landed. The failure modes here are not hypothetical either —
+            # `CREATE UNIQUE INDEX uq_reap_agentic_buyer_refs_ref` fails on a
+            # database that somehow holds two buyers with one ref, and if that
+            # raise could reach the mig-224 block it would take the whole rail's
+            # storage with it.
+            #
+            # AFTER the two blocks above rather than before them, which is the
+            # opposite of the mig-207 argument and deliberate: these three tables
+            # are read by a ROUTE that 404s while the dial is off, so a missing
+            # relation here is a refused purchase on a dark rail, not a declined
+            # card at a live checkout. The tables that ARE on the live path go
+            # first; this one takes its turn.
+            #
+            # THIS DDL MUST BUILD THE SAME SCHEMA AS THE MIGRATION — not the same
+            # bytes. What is enforced, by tests/test_agent_commerce_reap_routes_
+            # postgres.py::test_the_self_heal_builds_the_same_schema_as_migration
+            # _226, is that a database built from that file and one built by this
+            # block agree on every column, every index's `pg_indexes.indexdef`
+            # (so UNIQUE cannot quietly become non-unique), and every CHECK
+            # constraint's `pg_get_constraintdef`. Prose is not a test; that one
+            # is, and it was written because the reviewer's mutant on the mig-224
+            # pair proved the earlier wording was load-bearing and unchecked.
+            #
+            # The coverage gate cannot see any of this: tests/test_schema_guard_
+            # migration_coverage.py inspects one kind of statement only, and
+            # every statement here creates a relation rather than a column.
+            try:
+                await database.execute(
+                    text(
+                        """
+                    CREATE TABLE IF NOT EXISTS reap_agentic_eligibility (
+                        merchant_domain VARCHAR(255) NOT NULL,
+                        product_key TEXT NOT NULL DEFAULT '',
+                        variant_key TEXT NOT NULL DEFAULT '',
+                        market_country VARCHAR(2) NOT NULL
+                            CHECK (market_country ~ '^[A-Z]{2}$'),
+                        enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                        accept_variant_labels JSONB,
+                        also_accept_domains JSONB,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        PRIMARY KEY (merchant_domain, market_country, product_key, variant_key)
+                    );
+                        """
+                    )
+                )
+                await database.execute(
+                    text(
+                        """
+                    CREATE TABLE IF NOT EXISTS reap_agentic_buyer_refs (
+                        buyer_id VARCHAR(50) PRIMARY KEY,
+                        reap_buyer_ref VARCHAR(128) NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                    );
+                        """
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS "
+                        "uq_reap_agentic_buyer_refs_ref "
+                        "ON reap_agentic_buyer_refs (reap_buyer_ref);"
+                    )
+                )
+                await database.execute(
+                    text(
+                        """
+                    CREATE TABLE IF NOT EXISTS reap_agentic_purchase_keys (
+                        agent_id VARCHAR(128) NOT NULL,
+                        agent_user_ref_hash VARCHAR(64) NOT NULL,
+                        idempotency_key VARCHAR(128) NOT NULL,
+                        purchase_id VARCHAR(64) NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        PRIMARY KEY (agent_id, agent_user_ref_hash, idempotency_key)
+                    );
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                # Best-effort like every sibling, and it must not starve what
+                # follows. A silent failure here is visible from the first
+                # request on the rail: the route refuses `merchant_not_eligible`
+                # (the eligibility read fails closed) rather than answering
+                # wrongly.
+                pass
             # mig 212: the recovery key — the join the Prove stage rests on.
             # Early and wrapped for the same reason as mig 210 below: this
             # branch is ONE try, and an unguarded CREATE INDEX further down
@@ -2759,6 +2852,96 @@ async def ensure_required_schema_light() -> None:
                         # already there and this run had nothing to do. Continue
                         # so the remaining columns still get their chance.
                         continue
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 226, SQLite twin: eligibility, the per-buyer opaque ref, and
+            # the idempotency keys. Same argument as the mig-224 twin above for
+            # why these are here at all — they are SQL-only tables, absent from
+            # `metadata`, so without this block a dev or test SQLite database
+            # never gets them and the SQLite arm of the route tests would be
+            # testing a schema that exists nowhere.
+            #
+            # THREE DELIBERATE DIFFERENCES FROM THE POSTGRES DDL, and no others:
+            #   now()        -> CURRENT_TIMESTAMP   (not a SQLite function)
+            #   TIMESTAMPTZ  -> TIMESTAMP           (the convention the
+            #                                        `sqlite_type` map below
+            #                                        already states)
+            #   JSONB        -> TEXT                (JSONB is not a SQLite type
+            #                                        name; declaring it gives the
+            #                                        column NUMERIC affinity and
+            #                                        silently stores 0 for a JSON
+            #                                        payload — the same trap as
+            #                                        `CAST(:x AS JSONB)`)
+            #
+            # The `market_country` CHECK is the fourth difference and the only
+            # one that is not a type name. Postgres spells it with the regex
+            # operator, which SQLite does not have; the twin spells the same rule
+            # as a length-and-case test. Neither is the authority — the route
+            # uppercases and regex-checks the value before it is ever bound, and
+            # db/reap_agentic_ledger._require_country checks it again on the way
+            # into the purchase row. These CHECKs are the third line, kept
+            # because a table that can hold `usa` is a table somebody will
+            # eventually put `usa` in by hand.
+            #
+            # Everything that carries MEANING is identical: the PRIMARY KEYs, the
+            # NOT NULLs, the `enabled` default of FALSE (a half-configured row is
+            # not an authorization to spend), and the UNIQUE on reap_buyer_ref.
+            #
+            # Its own try/except, same contract as its Postgres sibling and as
+            # the mig-224 twin above: a failure here must not starve the ADD
+            # COLUMN heals below.
+            try:
+                await database.execute(
+                    text(
+                        """
+                    CREATE TABLE IF NOT EXISTS reap_agentic_eligibility (
+                        merchant_domain VARCHAR(255) NOT NULL,
+                        product_key TEXT NOT NULL DEFAULT '',
+                        variant_key TEXT NOT NULL DEFAULT '',
+                        market_country VARCHAR(2) NOT NULL
+                            CHECK (length(market_country) = 2
+                                   AND market_country = upper(market_country)),
+                        enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                        accept_variant_labels TEXT,
+                        also_accept_domains TEXT,
+                        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (merchant_domain, market_country, product_key, variant_key)
+                    );
+                        """
+                    )
+                )
+                await database.execute(
+                    text(
+                        """
+                    CREATE TABLE IF NOT EXISTS reap_agentic_buyer_refs (
+                        buyer_id VARCHAR(50) PRIMARY KEY,
+                        reap_buyer_ref VARCHAR(128) NOT NULL,
+                        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                        """
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS "
+                        "uq_reap_agentic_buyer_refs_ref "
+                        "ON reap_agentic_buyer_refs (reap_buyer_ref);"
+                    )
+                )
+                await database.execute(
+                    text(
+                        """
+                    CREATE TABLE IF NOT EXISTS reap_agentic_purchase_keys (
+                        agent_id VARCHAR(128) NOT NULL,
+                        agent_user_ref_hash VARCHAR(64) NOT NULL,
+                        idempotency_key VARCHAR(128) NOT NULL,
+                        purchase_id VARCHAR(64) NOT NULL,
+                        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (agent_id, agent_user_ref_hash, idempotency_key)
+                    );
+                        """
+                    )
+                )
             except Exception:  # noqa: BLE001
                 pass
             # Self-heal EVERY table in REQUIRED_SCHEMA, not a hardcoded subset:
