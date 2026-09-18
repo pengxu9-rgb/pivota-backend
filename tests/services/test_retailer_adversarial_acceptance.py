@@ -1,4 +1,5 @@
 """Concrete adversarial failures from the pre-rollout review; no network or DB."""
+import asyncio
 import copy
 import json
 from unittest.mock import AsyncMock, MagicMock
@@ -251,3 +252,243 @@ def test_primary_apply_group_failure_is_incomplete_even_with_all_row_counts():
     counts = {"pdps": 1, "skus": 2, "offers": 2}
     with pytest.raises(PrimaryIngestionIncomplete):
         require_primary_apply({"planned": counts}, {**counts, "product_groups_failed": 1})
+
+
+# --- Dry-run legacy listing preflight (--check-legacy-listings) --------------------------------
+# Wave 1 (2026-09-18): every dry run said `ready_to_apply`, then the apply refused haruharu wonder
+# at ohlolly.com on a legacy `prod::external_seed::...` row that owned the same listing URL.
+# These pin that the dry run now reports what the apply refuses on, from the same finder, while
+# writing nothing and leaving the apply guard's decision (suppressed rows still block) unchanged.
+
+_SUPPRESSED_AT = "2026-09-01T00:00:00+00:00"
+_RETAILER_ARGS = ["--domain", "first.example", "--category", "beauty", "--source-role", "retailer",
+                  "--only-vendor", "A'PIEU", "--emit-real-variants"]
+
+
+def second_product():
+    raw = product()
+    raw.update(id=9000002, handle="honey-milk-lip-balm", title="Honey Milk Lip Balm")
+    raw["variants"] = [dict(raw["variants"][0], id=45000000000009, barcode="4006381333931")]
+    return raw
+
+
+def legacy_owner(pdp, key, *, suppressed=None, reason=None, url=None):
+    return {"product_key": key, "source_domain": pdp["source_domain"],
+            "canonical_url": url or pdp["canonical_url"],
+            "suppressed_at": suppressed, "suppression_reason": reason}
+
+
+class ReadOnlyCatalog:
+    """Records every call; any write-shaped call fails the test at the call site."""
+
+    def __init__(self, rows, *, connected=True, error=None):
+        self.rows, self.is_connected, self.error = rows, connected, error
+        self.queries, self.connects, self.disconnects = [], 0, 0
+
+    async def fetch_all(self, query, values=None):
+        self.queries.append((query, values))
+        if self.error:
+            raise self.error
+        return self.rows
+
+    async def connect(self):
+        self.connects += 1
+        self.is_connected = True
+
+    async def disconnect(self):
+        self.disconnects += 1
+        self.is_connected = False
+
+    def __getattr__(self, name):  # execute / execute_many / transaction / fetch_one ...
+        raise AssertionError(f"legacy preflight touched database.{name}")
+
+
+def run_dry(monkeypatch, capsys, database, raws=None, extra=()):
+    raws = raws or [product()]
+    async def fetch(**kwargs):
+        return batch([record(raw=raw) for raw in raws])
+    monkeypatch.setattr(cli, "records_for_brand", fetch)
+    apply = AsyncMock()
+    monkeypatch.setattr(cli, "apply_ingest_plan", apply)
+    if database is not None:
+        monkeypatch.setattr(cli, "_preflight_database", lambda: (database, None))
+    rc = cli.main(_RETAILER_ARGS + list(extra))
+    out, err = capsys.readouterr()
+    lines = [line for line in out.splitlines() if line.startswith(cli.LEGACY_LISTINGS_MARKER)]
+    assert len(lines) == 1, out
+    apply.assert_not_awaited()
+    return rc, json.loads(lines[0][len(cli.LEGACY_LISTINGS_MARKER):]), out, err
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("batch_mode", [False, True])
+@pytest.mark.parametrize("suppressed", [None, _SUPPRESSED_AT])
+async def test_suppressed_legacy_owner_still_blocks_apply_before_any_write(batch_mode, suppressed):
+    """Decision pinned, not changed: a suppressed legacy owner refuses exactly like a live one."""
+    plan = ing.ingest_validated_jsonl([record()])
+    database = AsyncMock()
+    database.is_connected = True
+    database.fetch_all.return_value = [legacy_owner(plan["pdps"][0], "ext:legacy-title::12345678",
+                                                    suppressed=suppressed, reason="withdrawn")]
+    with pytest.raises(ValueError, match="retailer_listing_migration_required"):
+        await writer.apply_ingest_plan(plan, batch_label="review", db=database, batch=batch_mode)
+    database.execute.assert_not_awaited()
+
+
+@pytest.mark.parametrize("suppressed", [None, _SUPPRESSED_AT])
+def test_dry_run_reports_the_legacy_owner_apply_refuses_and_writes_nothing(monkeypatch, capsys, suppressed):
+    pdp = ing.ingest_validated_jsonl([record()])["pdps"][0]
+    legacy_key = "prod::external_seed::external_seed::ext_bf55156550aa86a7eb921ff2"
+    database = ReadOnlyCatalog([legacy_owner(pdp, legacy_key, suppressed=suppressed, reason="stale")])
+    rc, report, out, err = run_dry(monkeypatch, capsys, database, extra=["--check-legacy-listings"])
+
+    assert rc == 2
+    assert "legacy_listing_preflight_conflicts" in err
+    assert "DRY-RUN" not in out
+    assert report["status"] == "conflicts" and report["apply_would_refuse"] is True
+    assert report["planned_listings"] == 1
+    assert report["conflict_count"] == 1 and report["listings_with_conflicts"] == 1
+    assert report["suppressed_conflict_count"] == (1 if suppressed else 0)
+    assert report["conflicts"] == [{
+        "listing": "first.example/products/honey-milk-lip-oil",
+        "planned_product_key": pdp["product_key"],
+        "legacy_owners": [{"product_key": legacy_key, "suppressed": bool(suppressed),
+                           "suppression_reason": "stale"}],
+    }]
+    # The plan verdict line is untouched: curated_apply_gate parses it, the worker computes it too.
+    assert 'primary ingestion: {' in out and '"status": "ready_to_apply"' in out
+    # Strictly SELECT-only: one fetch_all (any other attribute access raises in ReadOnlyCatalog).
+    assert len(database.queries) == 1
+    assert database.queries[0][0].lstrip().upper().startswith("SELECT")
+    assert database.queries[0][1] == {"hosts": ["first.example"]}
+
+
+@pytest.mark.parametrize("suppressed", [None, _SUPPRESSED_AT])
+def test_dry_run_refusal_is_the_exact_message_the_apply_raises(monkeypatch, capsys, suppressed):
+    plan = ing.ingest_validated_jsonl([record()])
+    rows = [legacy_owner(plan["pdps"][0], "ext:legacy-title::12345678", suppressed=suppressed)]
+    _, report, _, _ = run_dry(monkeypatch, capsys, ReadOnlyCatalog(rows), extra=["--check-legacy-listings"])
+    database = AsyncMock()
+    database.is_connected = True
+    database.fetch_all.return_value = rows
+    with pytest.raises(ValueError) as refused:
+        asyncio.run(writer.apply_ingest_plan(plan, batch_label="review", db=database))
+    assert str(refused.value) == report["apply_refusal"]
+
+
+def test_dry_run_counts_every_owner_per_listing_suppressed_or_not(monkeypatch, capsys):
+    """ohlolly.com shape: one listing held by many legacy rows, most suppressed, plus a second listing."""
+    pdps = ing.ingest_validated_jsonl([record(raw=product()), record(raw=second_product())])["pdps"]
+    oil, balm = sorted(pdps, key=lambda p: p["canonical_url"], reverse=True)
+    assert oil["canonical_url"].endswith("/honey-milk-lip-oil")
+    rows = [legacy_owner(oil, f"legacy::oil::{i}", suppressed=_SUPPRESSED_AT if i else None) for i in range(3)]
+    rows += [legacy_owner(balm, "legacy::balm", suppressed=_SUPPRESSED_AT),
+             legacy_owner(oil, oil["product_key"]),  # the planned key itself is not a conflict
+             legacy_owner(oil, "legacy::other", url="https://first.example/products/unrelated")]
+    rc, report, _, _ = run_dry(monkeypatch, capsys, ReadOnlyCatalog(rows),
+                               raws=[product(), second_product()], extra=["--check-legacy-listings"])
+    assert rc == 2
+    assert report["planned_listings"] == 2
+    assert report["conflict_count"] == 4
+    assert report["suppressed_conflict_count"] == 3
+    assert report["listings_with_conflicts"] == 2
+    owners = {c["listing"]: [o["product_key"] for o in c["legacy_owners"]] for c in report["conflicts"]}
+    assert owners == {"first.example/products/honey-milk-lip-oil": ["legacy::oil::0", "legacy::oil::1", "legacy::oil::2"],
+                      "first.example/products/honey-milk-lip-balm": ["legacy::balm"]}
+
+
+def test_dry_run_is_clear_when_only_the_planned_key_and_unrelated_rows_exist(monkeypatch, capsys):
+    pdp = ing.ingest_validated_jsonl([record()])["pdps"][0]
+    rows = [legacy_owner(pdp, pdp["product_key"]),
+            legacy_owner(pdp, "legacy::other", url="https://first.example/products/unrelated", suppressed=_SUPPRESSED_AT)]
+    rc, report, out, _ = run_dry(monkeypatch, capsys, ReadOnlyCatalog(rows), extra=["--check-legacy-listings"])
+    assert rc == 0 and "DRY-RUN" in out
+    assert report["status"] == "clear" and report["apply_would_refuse"] is False
+    assert report["conflict_count"] == 0 and report["conflicts"] == [] and report["apply_refusal"] is None
+
+
+def test_dry_run_reports_an_unproven_legacy_row_in_the_order_apply_meets_it(monkeypatch, capsys):
+    """A same-host row with no listing path makes the apply raise identity_unproven; say so."""
+    plan = ing.ingest_validated_jsonl([record()])
+    pdp = plan["pdps"][0]
+    rows = [legacy_owner(pdp, "legacy::home", url="https://first.example/"),
+            legacy_owner(pdp, "legacy::oil")]
+    rc, report, _, _ = run_dry(monkeypatch, capsys, ReadOnlyCatalog(rows), extra=["--check-legacy-listings"])
+    assert rc == 2 and report["status"] == "conflicts"
+    assert report["unproven_legacy_rows"] == [{"product_key": "legacy::home", "canonical_url": "https://first.example/"}]
+    assert report["conflict_count"] == 1
+    assert report["apply_refusal"].startswith("retailer_listing_identity_unproven")
+    database = AsyncMock()
+    database.is_connected = True
+    database.fetch_all.return_value = rows
+    with pytest.raises(ValueError, match="retailer_listing_identity_unproven"):
+        asyncio.run(writer.apply_ingest_plan(plan, batch_label="review", db=database))
+    database.fetch_all.return_value = list(reversed(rows))
+    with pytest.raises(ValueError, match="retailer_listing_migration_required"):
+        asyncio.run(writer.apply_ingest_plan(plan, batch_label="review", db=database))
+
+
+def test_dry_run_without_the_flag_says_unchecked_and_never_opens_the_db(monkeypatch, capsys):
+    def no_db():
+        raise AssertionError("dry run opened the DB without --check-legacy-listings")
+    monkeypatch.setattr(cli, "_preflight_database", no_db)
+    rc, report, out, _ = run_dry(monkeypatch, capsys, None)
+    assert rc == 0 and "DRY-RUN" in out
+    assert report["status"] == "unchecked" and report["planned_listings"] == 1
+    assert "conflict_count" not in report  # an unchecked run never claims zero conflicts
+
+
+def test_preflight_connects_and_disconnects_a_db_it_opened(monkeypatch, capsys):
+    database = ReadOnlyCatalog([], connected=False)
+    rc, report, _, _ = run_dry(monkeypatch, capsys, database, extra=["--check-legacy-listings"])
+    assert rc == 0 and report["status"] == "clear"
+    assert (database.connects, database.disconnects, database.is_connected) == (1, 1, False)
+
+
+def test_preflight_error_exits_2_and_never_prints_the_driver_message(monkeypatch, capsys):
+    database = ReadOnlyCatalog([], error=RuntimeError("connect failed postgresql://u:hunter2@10.0.0.1/db"))
+    rc, report, out, err = run_dry(monkeypatch, capsys, database, extra=["--check-legacy-listings"])
+    assert rc == 2
+    assert report["status"] == "error" and report["error"] == "RuntimeError"
+    assert "hunter2" not in out + err and "conflict_count" not in report
+
+
+def test_preflight_refuses_the_sqlite_fallback_instead_of_reporting_clear(monkeypatch, capsys):
+    import db.database as db_module
+    monkeypatch.setattr(db_module, "DATABASE_URL", "sqlite+aiosqlite:///./pivota.db")
+    database, reason = cli._preflight_database()
+    assert database is None and reason == "no_postgres_database_url"
+    async def fetch(**kwargs):
+        return batch([record()])
+    monkeypatch.setattr(cli, "records_for_brand", fetch)
+    assert cli.main(_RETAILER_ARGS + ["--check-legacy-listings"]) == 2
+    out = capsys.readouterr().out
+    assert '"error": "no_postgres_database_url"' in out and '"status": "error"' in out
+
+
+@pytest.mark.asyncio
+async def test_select_only_handle_cannot_write():
+    inner = AsyncMock()
+    handle = cli._SelectOnlyDatabase(inner)
+    for sql in ("UPDATE catalog_products SET suppressed_at = NULL", "  delete from catalog_products",
+                "WITH x AS (DELETE FROM catalog_products RETURNING 1) SELECT * FROM x"):
+        with pytest.raises(PermissionError):
+            await handle.fetch_all(sql, {})
+    assert not hasattr(handle, "execute") and not hasattr(handle, "transaction")
+    inner.fetch_all.assert_not_awaited()
+    await handle.fetch_all("  select 1", {})
+    inner.fetch_all.assert_awaited_once()
+
+
+def test_brand_official_plan_has_no_retailer_listings_to_check(monkeypatch, capsys):
+    raw = product()
+    async def fetch(**kwargs):
+        return batch([feed.shopify_product_to_record(raw, domain="first.example", category_path="beauty",
+                                                     currency="USD", source_role="brand_official")])
+    monkeypatch.setattr(cli, "records_for_brand", fetch)
+    def no_db():
+        raise AssertionError("no retailer listing planned; nothing to read")
+    monkeypatch.setattr(cli, "_preflight_database", no_db)
+    assert cli.main(["--domain", "first.example", "--category", "beauty", "--check-legacy-listings"]) == 0
+    out = capsys.readouterr().out
+    assert 'legacy listings: {"planned_listings": 0, "status": "not_applicable"}' in out
