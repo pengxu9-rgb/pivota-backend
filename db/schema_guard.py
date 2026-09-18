@@ -810,6 +810,49 @@ async def ensure_required_schema_light() -> None:
                 )
             except Exception:  # noqa: BLE001
                 pass
+            # mig 228: the per-click attribution CLAIM for cart-link Reap purchases,
+            # and the index the merchant side needs to ask "is this click one of
+            # those?". THIS DDL MUST BUILD THE SAME SCHEMA AS
+            # db/migrations/228_conversion_click_claims.sql; compared through the
+            # catalog by tests/test_conversion_click_claims_postgres.py.
+            #
+            # A CREATE TABLE, so the coverage gate (ADD COLUMN only) cannot see a
+            # missing heal here, the same hole the mig-224 block names. The parity
+            # test is what catches it.
+            #
+            # TWO tries, not one: the index is on ANOTHER table, and a failure to
+            # build it must not cost the claims table. Both are best-effort like
+            # every sibling, and both fail SAFE: without the table the merchant side
+            # fails open (closes as before 228) and the Reap side fails closed
+            # (skips its edge), so a missing heal can never double an edge.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        CREATE TABLE IF NOT EXISTS conversion_click_claims (
+                            click_id TEXT PRIMARY KEY,
+                            claimed_by TEXT NOT NULL
+                                CONSTRAINT ck_conversion_click_claims_claimed_by
+                                CHECK (claimed_by IN ('reap_agentic', 'merchant_order')),
+                            external_order_id TEXT,
+                            claimed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                        );
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                await database.execute(
+                    text(
+                        """
+                        CREATE INDEX IF NOT EXISTS idx_reap_agentic_purchases_click_id
+                            ON reap_agentic_purchases (click_id);
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
             # mig 212: the recovery key — the join the Prove stage rests on.
             # Early and wrapped for the same reason as mig 210 below: this
             # branch is ONE try, and an unguarded CREATE INDEX further down
@@ -3134,6 +3177,36 @@ async def ensure_required_schema_light() -> None:
                         )
                     except Exception:  # noqa: BLE001
                         continue
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 228: the per-click attribution claim, SQLite twin. Same CHECK and
+            # key as the Postgres statement; TIMESTAMPTZ -> TIMESTAMP and now() ->
+            # CURRENT_TIMESTAMP per this branch's convention. Two tries for the
+            # reason the Postgres sibling gives.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        CREATE TABLE IF NOT EXISTS conversion_click_claims (
+                            click_id TEXT PRIMARY KEY,
+                            claimed_by TEXT NOT NULL
+                                CONSTRAINT ck_conversion_click_claims_claimed_by
+                                CHECK (claimed_by IN ('reap_agentic', 'merchant_order')),
+                            external_order_id TEXT,
+                            claimed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                        );
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                await database.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS idx_reap_agentic_purchases_click_id "
+                        "ON reap_agentic_purchases (click_id);"
+                    )
+                )
             except Exception:  # noqa: BLE001
                 pass
             # Self-heal EVERY table in REQUIRED_SCHEMA, not a hardcoded subset:

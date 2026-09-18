@@ -4,10 +4,12 @@
 --                  `var_` id before every quote. Every row before this migration is one of
 --                  these, and the DEFAULT makes that true of every row it touches.
 --   cart_link    — the row carries a Shopify CART PERMALINK
---                  (`https://<shop>/cart/<variant>:<qty>?attributes[pivota_click_id]=<clk>`)
---                  which Reap quotes and checks out AS RECEIVED. This is the Tier B lane: the
---                  merchant's own agent checkout refuses us, and the cart attribute is what
---                  carries our click id onto the merchant's order.
+--                  (`https://<shop>/cart/<variant>:<qty>?attributes[pivota_click_id]=<clk>
+--                  &country=<MARKET>`) which Reap quotes and checks out AS RECEIVED. This is
+--                  the Tier B lane: the merchant's own agent checkout refuses us, the cart
+--                  attribute is what carries our click id onto the merchant's order, and
+--                  `country=` pins the checkout's market to the buyer's (without it the market
+--                  is whatever Reap's egress IP resolves to).
 --
 -- THE PAIRING IS A DATABASE FACT, NOT ONLY A PYTHON ONE. A cart_link row without a URL has
 -- nothing to quote, and a reap_variant row WITH one is a row two code paths would each read
@@ -15,8 +17,9 @@
 -- below is what refuses them for any other writer.
 --
 -- cart_url IS NOT PII AND IS NOT NULLED ON TERMINAL. services/reap_cart_link.validate_cart_link
--- admits exactly one query key (our click attribute) and a path of digits, so a `checkout[...]`
--- key carrying the buyer's email or address can never be stored here. It stays on a terminal
+-- admits exactly two query keys, our click attribute and `country` (each exactly once), and a
+-- path of digits, so a `checkout[...]` key carrying the buyer's email or address can never be
+-- stored here. It stays on a terminal
 -- row for the same reason the resolution hints do: it is the record of what was bought.
 -- It is NOT in db/reap_agentic_ledger.PUBLIC_PURCHASE_COLUMNS, and neither is item_source.
 --

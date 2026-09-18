@@ -7,7 +7,7 @@ TWO HALVES:
   1. EVERY case in tests/reap_cart_link_cases.py, collected again here, so the ledger pairing,
      the validator's whole table through `create_purchase`, the raw-writer CHECKs, the dials and
      the state machine end to end all run on the production engine. On this engine the fixture
-     builds the schema from the MIGRATIONS (224 → 225 → 226).
+     builds the schema from the MIGRATIONS (224 → 225 → 226 → 228).
 
   2. What only Postgres can show, below: the mig-226 self-heal builds the SAME CATALOG as the
      migration (columns, and every CHECK's `pg_get_constraintdef` BY NAME); healing a 225-shaped
@@ -49,6 +49,10 @@ pytestmark = pytest.mark.skipif(
     not _IS_PG,
     reason="needs a Postgres DATABASE_URL — this is the production-dialect gate",
 )
+
+_MIG_226 = MIGRATIONS_DIR / "226_reap_agentic_purchase_item_source.sql"
+_MIG_228 = MIGRATIONS_DIR / "228_conversion_click_claims.sql"
+assert MIGRATIONS[-2:] == (_MIG_226, _MIG_228)
 
 _NEW_CONSTRAINTS = (
     "ck_reap_agentic_purchases_item_source",
@@ -132,7 +136,7 @@ async def test_a_second_heal_changes_nothing_and_duplicates_no_constraint():
 
 async def test_the_migration_is_idempotent_on_its_own():
     before = await _catalog()
-    await apply_migrations((MIGRATIONS[-1],))
+    await apply_migrations((_MIG_226,))
     assert await _catalog() == before
 
 
@@ -177,7 +181,7 @@ async def test_the_down_migration_reverses_cleanly_once_drained_and_226_reapplie
     columns = {c[0] for c in (await _catalog())[0]}
     assert not ({"item_source", "cart_url"} & columns)
     # And forward again: the up migration is what an operator re-runs after a rollback.
-    await apply_migrations((MIGRATIONS[-1],))
+    await apply_migrations((_MIG_226,))
     reread = await ledger.get_purchase_internal(row["id"])
     # The drained row comes back as the column DEFAULT says — its URL is gone with the column.
     assert reread["item_source"] == "reap_variant" and reread["cart_url"] is None
@@ -218,3 +222,133 @@ async def test_the_stored_url_is_text_and_round_trips_verbatim():
         {"i": row["id"]},
     )
     assert raw["t"] == "text" and raw["cart_url"] == CART_URL
+
+
+# ── migration 228: the per-click claim, on the production engine ─────────────────────────────
+
+
+async def _claims_catalog():
+    """The claims table's columns, CHECKs, primary key and indexes, plus the purchases click_id
+    index, as the DATABASE built them."""
+    from db.database import database
+
+    columns = await database.fetch_all(
+        """
+        SELECT column_name, data_type, is_nullable, column_default
+          FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'conversion_click_claims'
+         ORDER BY column_name
+        """
+    )
+    constraints = await database.fetch_all(
+        """
+        SELECT c.conname, c.contype, pg_get_constraintdef(c.oid) AS def
+          FROM pg_constraint c
+          JOIN pg_class t ON t.oid = c.conrelid
+         WHERE t.relname = 'conversion_click_claims'
+         ORDER BY c.conname
+        """
+    )
+    indexes = await database.fetch_all(
+        """
+        SELECT indexname, indexdef FROM pg_indexes
+         WHERE schemaname = 'public'
+           AND (tablename = 'conversion_click_claims'
+                OR indexname = 'idx_reap_agentic_purchases_click_id')
+         ORDER BY indexname
+        """
+    )
+    return (
+        [tuple(dict(r).values()) for r in columns],
+        [(r["conname"], r["contype"], " ".join(r["def"].split())) for r in constraints],
+        [(r["indexname"], " ".join(r["indexdef"].split())) for r in indexes],
+    )
+
+
+async def test_the_self_heal_builds_the_228_catalog_the_migration_builds():
+    from db.schema_guard import ensure_required_schema_light
+
+    from_migration = await _claims_catalog()
+    columns, constraints, indexes = from_migration
+    assert [c[0] for c in columns] == ["claimed_at", "claimed_by", "click_id", "external_order_id"]
+    assert {c[0] for c in constraints} == {
+        "conversion_click_claims_pkey", "ck_conversion_click_claims_claimed_by"
+    }
+    assert "idx_reap_agentic_purchases_click_id" in {i[0] for i in indexes}
+
+    await drop_tables()
+    await ensure_required_schema_light()
+    assert await _claims_catalog() == from_migration
+
+
+async def test_the_228_heal_is_idempotent_and_the_migration_reapplies():
+    from db.schema_guard import ensure_required_schema_light
+
+    before = await _claims_catalog()
+    await ensure_required_schema_light()
+    await apply_migrations((_MIG_228,))
+    assert await _claims_catalog() == before
+
+
+async def test_the_scope_lookup_uses_the_click_id_index():
+    from db.database import database
+
+    await database.execute("SET enable_seqscan = off")
+    try:
+        rows = await database.fetch_all(
+            "EXPLAIN SELECT 1 FROM reap_agentic_purchases "
+            "WHERE click_id = 'clk_x' AND item_source = 'cart_link' LIMIT 1"
+        )
+    finally:
+        await database.execute("SET enable_seqscan = on")
+    plan = " ".join(str(dict(r).get("QUERY PLAN", "")) for r in rows)
+    assert "idx_reap_agentic_purchases_click_id" in plan, plan
+
+
+async def test_two_connections_claiming_at_once_produce_exactly_one_winner():
+    """THE GUARD, ACROSS BACKENDS. Two pods — a webhook worker and a Reap poller — claim the same
+    click on their own asyncpg connections at the same moment. The PRIMARY KEY lets exactly one
+    INSERT return a row. Repeated, with the claimants swapped, so neither side wins by order."""
+    import asyncio
+
+    import asyncpg
+
+    import services.conversion_click_claims as ccc
+
+    url = DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
+    sql = re.sub(r":(click_id|claimed_by|external_order_id)", lambda m: {
+        "click_id": "$1", "claimed_by": "$2", "external_order_id": "$3"}[m.group(1)],
+        ccc._CLAIM_CLICK_SQL)
+    for round_no in range(10):
+        conns = [await asyncpg.connect(url) for _ in range(4)]
+        try:
+            claimants = ["reap_agentic", "merchant_order"] * 2
+            if round_no % 2:
+                claimants.reverse()
+            click = f"clk_race_{round_no}"
+            results = await asyncio.gather(*[
+                conn.fetch(sql, click, who, f"ord_{i}")
+                for i, (conn, who) in enumerate(zip(conns, claimants))
+            ])
+        finally:
+            for conn in conns:
+                await conn.close()
+        assert sum(len(r) for r in results) == 1, (round_no, results)
+
+
+async def _run_down_228():
+    from db.database import database
+    from db.sql_migrations import split_statements
+
+    down = MIGRATIONS_DIR / "down/228_conversion_click_claims_down.sql"
+    for statement in split_statements(down.read_text(encoding="utf-8")):
+        await database.execute(statement)
+
+
+async def test_the_228_down_migration_reverses_cleanly_and_228_reapplies():
+    before = await _claims_catalog()
+    await _run_down_228()
+    columns, constraints, indexes = await _claims_catalog()
+    assert columns == [] and constraints == [] and indexes == []
+    await apply_migrations((_MIG_228,))
+    assert await _claims_catalog() == before

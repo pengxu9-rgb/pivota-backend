@@ -123,6 +123,13 @@ on:
       # and a PR touching only this file would not run the one test that executes it. The
       # narrow-filter warning above, once more.
       - "tests/backfill_variant_id_provenance_stamps_fault_driver.py"
+      # Same reason, for the Reap cart-link lane. Every case its Postgres gate runs lives in a
+      # shared, non-`test_` module that tests/test_reap_agentic_cart_link_postgres.py collects
+      # by `import *`, and that module imports the validator's accept/refuse table from
+      # tests/test_reap_cart_link.py, which the `_postgres` glob does not match either. A PR
+      # touching only one of these would otherwise skip the gate that runs them on Postgres.
+      - "tests/reap_cart_link_cases.py"
+      - "tests/test_reap_cart_link.py"
       - "tests/integration/test_recovery_postgres.py"
       # The two files that can neuter this ENTIRE job, neither matched above.
       # tests/conftest.py pins DATABASE_URL — today conditionally, but making

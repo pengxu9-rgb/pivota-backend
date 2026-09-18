@@ -54,6 +54,8 @@ MIGRATIONS = (
     MIGRATIONS_DIR / "224_reap_agentic_ledger.sql",
     MIGRATIONS_DIR / "225_reap_agentic_purchase_hints.sql",
     MIGRATIONS_DIR / "226_reap_agentic_purchase_item_source.sql",
+    # 228: the per-click attribution claim + the purchases click_id index.
+    MIGRATIONS_DIR / "228_conversion_click_claims.sql",
 )
 SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")
 
@@ -104,8 +106,11 @@ def cart_quote(**over):
         # OPAQUE, like every Reap variant id — it cannot be compared with the URL's variant,
         # which is the gap `verify_cart_link_quote` states.
         "items": [{"variantId": "var_opaque_1", "quantity": 1}],
+        # The SPEC's option shape (tests/fixtures/reap_openapi_agentic_2026_09_17.json):
+        # {id, name, selected, price: {amount, currency}}.
         "shippingOptions": [
-            {"id": "ship_std", "name": "Standard", "amount": {"amount": 5.00, "currency": "USD"}}
+            {"id": "ship_std", "name": "Standard", "selected": True,
+             "price": {"amount": 5.00, "currency": "USD"}}
         ],
         "expiresAt": "2099-01-01T00:00:00Z",
         "amountBreakdown": {
@@ -161,6 +166,7 @@ async def apply_migrations(paths=MIGRATIONS):
 
 
 async def drop_tables():
+    await database.execute("DROP TABLE IF EXISTS conversion_click_claims")
     await database.execute("DROP TABLE IF EXISTS reap_agentic_purchases")
     await database.execute("DROP TABLE IF EXISTS reap_agentic_enrollments")
 
@@ -272,12 +278,25 @@ def reap(monkeypatch):
 
 
 class Attribution:
+    """Stands in for `close_external_order_conversion` on EVERY channel (Reap, webhook, poller),
+    and keeps its one real dedupe: an edge per (merchant_id, external_order_id), ON CONFLICT DO
+    NOTHING. That is exactly the guard that CANNOT see a Reap close and a merchant close of one
+    sale as the same thing, which is what the mig-228 claim is for."""
+
     def __init__(self):
         self.calls = []
+        self.edges = {}
+        self.raises = None
 
     async def __call__(self, **kwargs):
         self.calls.append(kwargs)
-        return {"id": "edge_1"}
+        if self.raises is not None:
+            raise self.raises
+        key = (kwargs["merchant_id"], kwargs["external_order_id"])
+        if key in self.edges:
+            return {"replayed": True}
+        self.edges[key] = kwargs
+        return {"edge_id": f"edge_{len(self.edges)}", "replayed": False}
 
 
 @pytest.fixture(autouse=True)
@@ -1368,3 +1387,562 @@ async def test_no_log_record_result_or_exception_carries_the_buyers_details(
     # CONTROL: the haystack is not empty — the lane did log, and the refusals were captured.
     assert any("item_source=cart_link" in r.getMessage() for r in ours)
     assert "checkout_prefill" in haystack and "quantity_mismatch" in haystack
+
+
+# ══ 6. ONE EDGE PER CART-LINK SALE: the mig-228 click claim ═════════════════════════════════
+#
+# The P1 from the #2214 review. One cart-link sale can be closed by Reap under
+# (merchant_domain, Reap orderId) AND by the merchant's own Shopify order (which carries our click
+# id) under (tenant merchant, Shopify order id). `Attribution.edges` keeps the real edge table's
+# only dedupe, so without the claim every ordering below produces TWO edges.
+
+import services.commerce_attribution_service as _cas  # noqa: E402
+import services.conversion_click_claims as ccc  # noqa: E402
+
+#: Captured at import, BEFORE the autouse `attribution` fixture replaces it on the module, so the
+#: real-close cases can put the genuine primitive back.
+REAL_CLOSE = _cas.close_external_order_conversion
+
+MERCHANT_TENANT = "merch_judydoll"
+SHOPIFY_ORDER_ID = "5550001"
+REAP_ORDER_ID = "ord_cart_1"
+
+
+async def claims_count() -> int:
+    row = await database.fetch_one("SELECT COUNT(*) AS n FROM conversion_click_claims")
+    return int(row["n"])
+
+
+async def completed_via_reap(reap) -> str:
+    purchase_id = await to_quoting(reap)
+    assert (await step(purchase_id)).state == "awaiting_approval"
+    assert (await step(purchase_id)).state == "completed"
+    return purchase_id
+
+
+async def purchase_id_for(click_id=CLICK) -> str:
+    row = await database.fetch_one(
+        "SELECT id FROM reap_agentic_purchases WHERE click_id = :c", {"c": click_id}
+    )
+    return row["id"]
+
+
+class _FakeWebhookRequest:
+    def __init__(self, body: bytes):
+        self._body = body
+
+        class _H:
+            def get(self, key, default=None):
+                return default
+
+        self.headers = _H()
+
+    async def body(self):
+        return self._body
+
+
+class _FakeOrdersDB:
+    async def fetch_one(self, query, values=None):
+        return None
+
+    async def execute(self, query, values=None):
+        return 0
+
+
+@pytest.fixture
+def merchant_paths(monkeypatch, attribution):
+    """The REAL `orders/paid` webhook handler and the REAL poller `_process_order`, each with its
+    own module-level `close_external_order_conversion` pointed at the shared edge recorder. Only
+    their non-attribution collaborators are stubbed, as in
+    tests/test_t2_2_webhook_orders_paid_closure.py."""
+    import db.database as db_database
+    import routes.webhook_routes as wr
+    import services.external_conversion_poller as poller
+
+    async def _onboarding(merchant_id):
+        return {"merchant_id": merchant_id, "mcp_shop_domain": "judydoll.myshopify.com"}
+
+    async def _stores(merchant_id):
+        return []
+
+    async def _ingest(**kwargs):
+        return (False, None)
+
+    async def _log(**kwargs):
+        return None
+
+    monkeypatch.setattr(wr, "get_merchant_onboarding", _onboarding)
+    monkeypatch.setattr(wr, "get_merchant_active_stores", _stores)
+    monkeypatch.setattr(wr, "ingest_shopify_webhook", _ingest)
+    monkeypatch.setattr(wr, "record_shopify_webhook", lambda *a, **k: None)
+    monkeypatch.setattr(wr, "log_order_event", _log)
+    monkeypatch.setattr(wr, "close_external_order_conversion", attribution)
+    monkeypatch.setattr(poller, "close_external_order_conversion", attribution)
+    # The webhook reads `db.database.database` at CALL time for its Pivota-orders lookup; the
+    # claim module and the ledger hold the real one, which is the point.
+    monkeypatch.setattr(db_database, "database", _FakeOrdersDB())
+
+    class _Paths:
+        async def webhook(self, click_id=CLICK, order_id=SHOPIFY_ORDER_ID):
+            from fastapi import BackgroundTasks
+
+            payload = json.dumps({
+                "id": int(order_id), "name": "#1042", "financial_status": "paid",
+                "total_price": "33.20", "currency": "USD",
+                "note_attributes": [{"name": "pivota_click_id", "value": click_id}],
+            }).encode()
+            resp = await wr.handle_shopify_webhook(
+                merchant_id=MERCHANT_TENANT,
+                request=_FakeWebhookRequest(payload),
+                background_tasks=BackgroundTasks(),
+                x_shopify_hmac_sha256="whatever",
+                x_shopify_topic="orders/paid",
+                x_shopify_shop_domain="judydoll.myshopify.com",
+            )
+            assert resp["status"] == "success"
+
+        async def poller(self, click_id=CLICK, order_id=SHOPIFY_ORDER_ID):
+            from datetime import datetime, timezone
+
+            return await poller._process_order(
+                merchant_id=MERCHANT_TENANT,
+                order={
+                    "id": int(order_id), "financial_status": "paid",
+                    "total_price": "33.20", "currency": "USD",
+                    "note_attributes": [{"name": "pivota_click_id", "value": click_id}],
+                },
+                converted_at_default=datetime.now(timezone.utc),
+                shop_domain="judydoll.myshopify.com",
+            )
+
+    return _Paths()
+
+
+async def _finish_reap(purchase_id):
+    await active_enrollment()
+    assert (await step(purchase_id)).state == "quoting"
+    assert (await step(purchase_id)).state == "awaiting_approval"
+    assert (await step(purchase_id)).state == "completed"
+
+
+@pytest.mark.parametrize("channel", ["webhook", "poller"])
+async def test_merchant_first_then_reap_leaves_one_edge_the_merchants(
+    reap, attribution, merchant_paths, channel
+):
+    purchase_id = await start()  # the cart-link purchase exists, so its click is claim-scoped
+    await getattr(merchant_paths, channel)()
+    assert list(attribution.edges) == [(MERCHANT_TENANT, SHOPIFY_ORDER_ID)]
+
+    await _finish_reap(purchase_id)  # Reap completes the SAME sale afterwards
+
+    assert list(attribution.edges) == [(MERCHANT_TENANT, SHOPIFY_ORDER_ID)]
+    row = await get(purchase_id)
+    assert row["last_error_code"] == "attribution_closed_by_other_channel"
+    assert row["state"] == "completed" and row["reap_order_id"] == REAP_ORDER_ID
+
+
+@pytest.mark.parametrize("channel", ["webhook", "poller"])
+async def test_reap_first_then_merchant_leaves_one_edge_reaps(
+    reap, attribution, merchant_paths, channel
+):
+    purchase_id = await completed_via_reap(reap)
+    assert list(attribution.edges) == [(SHOP, REAP_ORDER_ID)]
+    assert (await get(purchase_id))["last_error_code"] is None
+
+    await getattr(merchant_paths, channel)()
+    assert list(attribution.edges) == [(SHOP, REAP_ORDER_ID)]
+    # The merchant close was not even attempted — not attempted-and-deduped.
+    assert [c["external_order_id"] for c in attribution.calls] == [REAP_ORDER_ID]
+
+
+async def test_the_webhook_and_the_poller_are_one_claimant(reap, attribution, merchant_paths):
+    """Both merchant paths close the SAME Shopify order under the SAME key. The poller, seeing an
+    order the webhook already closed, is the owner retrying — it proceeds, and the edge table's
+    own (merchant, order) dedupe makes it a replay."""
+    await start()
+    await merchant_paths.webhook()
+    assert await merchant_paths.poller() == "closed"
+    assert list(attribution.edges) == [(MERCHANT_TENANT, SHOPIFY_ORDER_ID)]
+    assert len(attribution.calls) == 2
+
+
+async def test_a_second_shopify_order_on_the_same_claimed_click_is_skipped(
+    reap, attribution, merchant_paths
+):
+    """One click, one edge: the claim is per click. Stated as a test so the choice is visible."""
+    await start()
+    await merchant_paths.webhook(order_id="5550001")
+    await merchant_paths.webhook(order_id="5550002")
+    assert list(attribution.edges) == [(MERCHANT_TENANT, "5550001")]
+
+
+@pytest.mark.parametrize("channel", ["webhook", "poller"])
+async def test_a_non_reap_click_closes_exactly_as_before_and_never_touches_the_claims(
+    reap, attribution, merchant_paths, channel, monkeypatch
+):
+    """Byte-for-byte: the close receives the same keyword arguments the pre-228 call site sent,
+    and no claim statement runs."""
+    await start()  # a cart-link purchase exists — for ANOTHER click
+    touched = []
+    real_claim = ccc.claim_click
+
+    async def _spy(*a, **k):
+        touched.append(a)
+        return await real_claim(*a, **k)
+
+    monkeypatch.setattr(ccc, "claim_click", _spy)
+    await getattr(merchant_paths, channel)(click_id="clk_organic_1")
+    assert touched == [] and await claims_count() == 0
+    (call,) = attribution.calls
+    expected = {
+        "merchant_id": MERCHANT_TENANT, "click_id": "clk_organic_1",
+        "external_order_id": SHOPIFY_ORDER_ID, "gross_amount_cents": 3320, "currency": "USD",
+        "converting_shop_domain": "judydoll.myshopify.com",
+    }
+    assert {k: call[k] for k in expected} == expected
+    assert set(call) == {
+        "merchant_id", "click_id", "external_order_id", "gross_amount_cents", "currency",
+        "converted_at", "note_attrs_or_payload", "converting_shop_domain",
+    }
+
+
+async def test_a_reap_variant_purchases_click_is_not_claim_scoped(
+    reap, attribution, merchant_paths
+):
+    """Only CART-LINK purchases put the click on the merchant order. A variant-lane row with the
+    same click id is not in scope."""
+    await ledger.create_purchase(
+        buyer_ref="bref_v", agent_id="agent_one", agent_user_ref_hash="hash_v",
+        merchant_domain="brand.example", currency="USD", our_price_minor=4250,
+        click_id="clk_variant_1",
+    )
+    await merchant_paths.webhook(click_id="clk_variant_1")
+    assert await claims_count() == 0
+    assert list(attribution.edges) == [(MERCHANT_TENANT, SHOPIFY_ORDER_ID)]
+
+
+# ── the error paths: merchant side fails OPEN, Reap side fails CLOSED ────────────────────────
+
+
+@pytest.mark.parametrize("channel", ["webhook", "poller"])
+async def test_a_missing_claims_table_fails_open_on_the_merchant_side(
+    reap, attribution, merchant_paths, caplog, channel
+):
+    await start()
+    await database.execute("DROP TABLE conversion_click_claims")
+    caplog.set_level(logging.WARNING, logger="services.conversion_click_claims")
+    await getattr(merchant_paths, channel)()
+    assert list(attribution.edges) == [(MERCHANT_TENANT, SHOPIFY_ORDER_ID)]
+    assert any("closing as before" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_failing_scope_lookup_fails_open_on_the_merchant_side(
+    reap, attribution, merchant_paths
+):
+    """The lookup itself can fail too (here: a pre-226 table with no item_source)."""
+    await to_pre_226_shape()
+    await merchant_paths.poller()
+    assert list(attribution.edges) == [(MERCHANT_TENANT, SHOPIFY_ORDER_ID)]
+
+
+async def test_a_missing_claims_table_fails_closed_on_the_reap_side(reap, attribution):
+    purchase_id = await to_quoting(reap)
+    assert (await step(purchase_id)).state == "awaiting_approval"
+    await database.execute("DROP TABLE conversion_click_claims")
+    assert (await step(purchase_id)).state == "completed"
+    assert (await get(purchase_id))["last_error_code"] == "attribution_claim_unavailable"
+    assert attribution.edges == {} and attribution.calls == []
+
+
+async def test_a_reap_close_that_raises_gives_the_claim_back(reap, attribution, merchant_paths):
+    """We own the click but wrote no edge: the merchant side must still be able to close it."""
+    attribution.raises = RuntimeError("edge table unavailable")
+    await completed_via_reap(reap)
+    assert attribution.edges == {} and await claims_count() == 0
+    attribution.raises = None
+    await merchant_paths.webhook()
+    assert list(attribution.edges) == [(MERCHANT_TENANT, SHOPIFY_ORDER_ID)]
+
+
+async def test_a_merchant_close_that_raises_gives_the_claim_back(
+    reap, attribution, merchant_paths
+):
+    purchase_id = await start()
+    attribution.raises = RuntimeError("edge table unavailable")
+    await merchant_paths.webhook()  # the webhook swallows it, as before
+    assert attribution.edges == {} and await claims_count() == 0
+    attribution.raises = None
+    await _finish_reap(purchase_id)
+    assert list(attribution.edges) == [(SHOP, REAP_ORDER_ID)]
+
+
+async def test_a_reap_completion_that_loses_its_fence_gives_the_claim_back(
+    reap, attribution, monkeypatch
+):
+    purchase_id = await to_quoting(reap)
+    assert (await step(purchase_id)).state == "awaiting_approval"
+
+    async def _lost(*a, **k):
+        return None
+
+    monkeypatch.setattr(ledger, "transition_as_holder", _lost)
+    assert (await step(purchase_id)).outcome == "lost_claim"
+    assert await claims_count() == 0 and attribution.calls == []
+
+
+# ── the primitive ────────────────────────────────────────────────────────────────────────────
+
+
+async def test_the_claim_is_first_writer_wins_with_an_owner_retry():
+    assert await ccc.claim_click("clk_p", claimed_by="reap_agentic", external_order_id="o1")
+    assert await ccc.claim_click("clk_p", claimed_by="reap_agentic", external_order_id="o1")
+    assert not await ccc.claim_click("clk_p", claimed_by="reap_agentic", external_order_id="o2")
+    assert not await ccc.claim_click("clk_p", claimed_by="merchant_order", external_order_id="o1")
+    row = await database.fetch_one(
+        "SELECT claimed_by, external_order_id FROM conversion_click_claims "
+        "WHERE click_id = 'clk_p'"
+    )
+    assert (row["claimed_by"], row["external_order_id"]) == ("reap_agentic", "o1")
+
+
+async def test_a_claim_is_released_only_by_its_owner_for_its_order():
+    await ccc.claim_click("clk_r", claimed_by="merchant_order", external_order_id="o1")
+    await ccc.release_click_claim("clk_r", claimed_by="reap_agentic", external_order_id="o1")
+    await ccc.release_click_claim("clk_r", claimed_by="merchant_order", external_order_id="o2")
+    assert await claims_count() == 1
+    await ccc.release_click_claim("clk_r", claimed_by="merchant_order", external_order_id="o1")
+    assert await claims_count() == 0
+
+
+@pytest.mark.parametrize(
+    "click_id,claimed_by,order",
+    [("", "reap_agentic", "o"), ("c", "reap_agentic", ""), ("c", "someone_else", "o")],
+)
+async def test_a_claim_refuses_blank_ids_and_unknown_claimants(click_id, claimed_by, order):
+    with pytest.raises(ValueError):
+        await ccc.claim_click(click_id, claimed_by=claimed_by, external_order_id=order)
+    assert await claims_count() == 0
+
+
+async def test_the_database_refuses_an_unknown_claimant_from_any_writer():
+    with pytest.raises(Exception) as caught:
+        await database.execute(
+            "INSERT INTO conversion_click_claims (click_id, claimed_by) VALUES ('c', 'nobody')"
+        )
+    assert "ck_conversion_click_claims_claimed_by" in str(caught.value)
+
+
+def test_the_228_self_heal_twins_declare_the_migrations_table():
+    migration = (MIGRATIONS_DIR / "228_conversion_click_claims.sql").read_text()
+    guard = (ROOT / "db/schema_guard.py").read_text()
+
+    def _create(text: str, start_at: int = 0) -> str:
+        start = text.index("CREATE TABLE IF NOT EXISTS conversion_click_claims", start_at)
+        return _norm(text[start: text.index(";", start) + 1])
+
+    from_migration = _create(migration)
+    assert _create(guard) == from_migration
+    assert _create(guard, guard.rindex("if IS_SQLITE:")) == from_migration.replace(
+        "TIMESTAMPTZ NOT NULL DEFAULT now()", "TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP"
+    )
+    index = "CREATE INDEX IF NOT EXISTS idx_reap_agentic_purchases_click_id"
+    assert index in migration
+    assert _norm(guard).count(_norm(index + " ON reap_agentic_purchases (click_id);")) == 1
+    assert (index + " \"\n                        \"ON reap_agentic_purchases (click_id);") in guard
+
+
+def test_the_228_down_migration_drops_both():
+    down = (MIGRATIONS_DIR / "down/228_conversion_click_claims_down.sql").read_text()
+    assert "DROP TABLE IF EXISTS conversion_click_claims" in down
+    assert "DROP INDEX IF EXISTS idx_reap_agentic_purchases_click_id" in down
+
+
+async def test_the_228_heal_lands_after_a_failing_sibling():
+    """Its own try: the claims table must exist even when an earlier self-heal statement raised
+    (two active enrollments for one buyer make the mig-224 unique index fail)."""
+    await database.execute("DROP TABLE conversion_click_claims")
+    await database.execute("DROP INDEX IF EXISTS uq_reap_agentic_enrollments_one_active")
+    for row_id in ("re_d1", "re_d2"):
+        await database.execute(
+            "INSERT INTO reap_agentic_enrollments (id, buyer_ref, status) "
+            "VALUES (:i, 'b', 'active')",
+            {"i": row_id},
+        )
+    await ensure_required_schema_light()
+    assert await claims_count() == 0  # the table exists
+
+
+# ── the reviewer's repro, through the REAL close primitive ──────────────────────────────────
+
+
+class _EdgeDB:
+    """Just enough database for the real `close_external_order_conversion` (as in
+    tests/test_t2_2_external_conversion_closure.FakeDB): the click lookup, and the edge INSERT
+    with its ON CONFLICT (merchant_id, external_order_id) DO NOTHING."""
+
+    def __init__(self, click_row=None):
+        self.click_row = click_row
+        self.edges = {}
+
+    async def fetch_one(self, query, values=None):
+        if isinstance(query, str) and "INSERT INTO commerce_attribution_edges" in query:
+            params = dict(values or {})
+            key = (params["merchant_id"], params["external_order_id"])
+            if key in self.edges:
+                return None
+            self.edges[key] = params
+            return {"edge_id": params["edge_id"]}
+        return self.click_row
+
+    async def fetch_all(self, query, values=None):
+        return []
+
+    async def execute(self, query, values=None):
+        return 0
+
+
+@pytest.fixture
+def real_close(monkeypatch):
+    edge_db = _EdgeDB()
+
+    async def _noop(*a, **k):
+        return {"interaction_id": "int_stub"}
+
+    monkeypatch.setattr(_cas, "close_external_order_conversion", REAL_CLOSE)
+    monkeypatch.setattr(_cas, "database", edge_db)
+    monkeypatch.setattr(_cas, "record_commerce_event_best_effort", _noop)
+    return edge_db
+
+
+@pytest.mark.parametrize("merchant_first", [True, False], ids=["merchant-first", "reap-first"])
+async def test_one_sale_is_one_edge_through_the_real_close(reap, real_close, merchant_first):
+    """agent_review2214/test_double_edge_repro.py, FIXED: the same two closes of the same sale
+    through the real primitive, each reached through its real call site (the merchant helper,
+    the Reap completion). Before mig 228 this was two edges."""
+
+    async def _merchant():
+        await ccc.close_merchant_conversion_with_claim(
+            REAL_CLOSE, merchant_id=MERCHANT_TENANT, click_id=CLICK,
+            external_order_id=SHOPIFY_ORDER_ID, gross_amount_cents=3320, currency="USD",
+            converting_shop_domain=SHOP,
+        )
+
+    purchase_id = await to_quoting(reap)
+    assert (await step(purchase_id)).state == "awaiting_approval"
+    if merchant_first:
+        await _merchant()
+    assert (await step(purchase_id)).state == "completed"
+    if not merchant_first:
+        await _merchant()
+    expected = (MERCHANT_TENANT, SHOPIFY_ORDER_ID) if merchant_first else (SHOP, REAP_ORDER_ID)
+    assert list(real_close.edges) == [expected]
+
+
+# ══ 7. REVIEW P2s ═══════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        [{}],
+        [{"id": "x"}],
+        [{"id": "x", "price": {"amount": 5.00, "currency": "EUR"}}],
+        [{"id": "x", "price": {"amount": -1.00, "currency": "USD"}}],
+        [{"id": "x", "price": {"amount": 5.001, "currency": "USD"}}],
+        [{"id": "", "price": {"amount": 5.00, "currency": "USD"}}],
+        [{"id": 7, "price": {"amount": 5.00, "currency": "USD"}}],
+        [{"id": "x", "price": {"currency": "USD"}}],
+        [{"id": "x", "price": {"amount": 5.00, "currency": "USD"}}, {}],
+    ],
+    ids=["empty-object", "id-only", "wrong-currency", "negative", "sub-cent", "blank-id",
+         "int-id", "no-amount", "one-good-one-empty"],
+)
+def test_a_shipping_option_must_carry_an_id_and_a_price_in_the_row_currency(options):
+    check = svc.verify_cart_link_quote(cart_quote(shippingOptions=options), _ROW)
+    assert (check.ok, check.refusal_reason) == (False, "no_shipping_option")
+
+
+def test_free_shipping_is_a_priced_option():
+    options = [{"id": "free", "name": "Free", "selected": True,
+                "price": {"amount": 0.0, "currency": "USD"}}]
+    quote = cart_quote(shippingOptions=options)
+    quote["amountBreakdown"]["shipping"] = {"amount": 0.0, "currency": "USD"}
+    quote["amountBreakdown"]["finalAmount"] = {"amount": 28.20, "currency": "USD"}
+    assert svc.verify_cart_link_quote(quote, _ROW).ok
+
+
+async def test_a_claim_lost_before_the_cart_quote_makes_no_quote(reap, attribution, monkeypatch):
+    """R1. The re-read immediately before `request_cart_link_quote` — the call with a side effect
+    at the partner. The lease moves AFTER the step's first guard and BEFORE the quote."""
+    purchase_id = await to_quoting(reap)
+    real = ledger.get_active_enrollment
+
+    async def _steal_then_read(buyer_ref):
+        await database.execute(
+            "UPDATE reap_agentic_purchases SET claimed_by = 'w_other' WHERE id = :i",
+            {"i": purchase_id},
+        )
+        return await real(buyer_ref)
+
+    monkeypatch.setattr(ledger, "get_active_enrollment", _steal_then_read)
+    moved = await step(purchase_id)
+    assert moved.outcome == "lost_claim"
+    assert reap.named("request_cart_link_quote") == []
+
+
+@pytest.mark.parametrize(
+    "column,value",
+    [("merchant_domain", "other.example"), ("market_country", "SG"), ("quantity", 2)],
+    ids=["shop", "market", "quantity"],
+)
+async def test_the_completion_recheck_is_the_full_validator(reap, attribution, column, value):
+    """R4. Not the click id alone: another shop, another market or another quantity at the sink
+    completes the purchase and writes NO edge."""
+    purchase_id = await to_quoting(reap)
+    assert (await step(purchase_id)).state == "awaiting_approval"
+    await database.execute(
+        f"UPDATE reap_agentic_purchases SET {column} = :v WHERE id = :i",
+        {"v": value, "i": purchase_id},
+    )
+    assert (await step(purchase_id)).state == "completed"
+    assert (await get(purchase_id))["last_error_code"] == "cart_link_attribution_unverified"
+    assert attribution.calls == [] and await claims_count() == 0
+
+
+def test_neither_dataclass_prints_the_url_or_the_buyer():
+    text = repr(item()) + repr(svc.BuyerContact(email=EMAIL, shipping_address=dict(ADDRESS)))
+    assert CLICK not in text and "cart/" not in text
+    for pii in PII_STRINGS:
+        assert pii.lower() not in text.lower()
+    assert "judydoll.com" in text and "BuyerContact" in text  # control: the repr still exists
+
+
+def _cart_url_on(host: str) -> str:
+    return CART_URL.replace(f"//{SHOP}/", f"//{host}/")
+
+
+@pytest.mark.parametrize("host", [SHOP, f"www.{SHOP}"], ids=["apex", "www"])
+async def test_the_converting_shop_is_the_urls_own_host(reap, attribution, host):
+    await active_enrollment()
+    purchase_id = await start(cart_link=item(cart_url=_cart_url_on(host)))
+    for _ in range(3):
+        await step(purchase_id)
+    (call,) = attribution.calls
+    assert call["converting_shop_domain"] == host
+    assert call["merchant_id"] == SHOP  # the subject is unchanged
+
+
+@pytest.mark.parametrize("host", [SHOP, f"www.{SHOP}"], ids=["apex", "www"])
+async def test_a_www_link_is_not_stamped_seller_mismatch_by_the_real_close(reap, real_close, host):
+    """The click was minted for the URL's host (`dest_domain`). The real guard compares it with
+    `converting_shop_domain` without folding `www.`, so the bare shop used to exclude the edge."""
+    real_close.click_row = {"click_id": CLICK, "merchant_id": None, "dest_domain": host}
+    await active_enrollment()
+    purchase_id = await start(cart_link=item(cart_url=_cart_url_on(host)))
+    for _ in range(3):
+        await step(purchase_id)
+    (edge,) = real_close.edges.values()
+    metadata = json.loads(edge["metadata"])
+    assert metadata["click_matched"] is True
+    assert metadata.get("seller_mismatch") is not True
+    assert metadata["converting_shop_domain"] == host
