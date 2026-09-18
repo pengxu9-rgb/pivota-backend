@@ -10143,7 +10143,14 @@ async def _handle_find_products_multi(
     an intermediate, not what gets served. Those callers pass False so the
     decision-layer ledger records exactly one event per SERVED slate, not the
     intermediate queries (which would pollute the behavioral baseline)."""
-    result = await _handle_find_products_multi_inner(payload, request_metadata, background_tasks)
+    # Every seed bind this request makes, in any lane, is recorded by fetch_external_seed_rows into
+    # this request's observation -- opened here, INSIDE the request's own task, so it never crosses
+    # the task queue (services/market_telemetry.py explains why that distinction matters).
+    seed_bind_sink = market_telemetry.open_seed_bind_sink(request_metadata)
+    try:
+        result = await _handle_find_products_multi_inner(payload, request_metadata, background_tasks)
+    finally:
+        market_telemetry.close_seed_bind_sink(seed_bind_sink)
     # Exclude test/demo rigs BEFORE redirect stamping + decision recording, so a
     # rig is neither /r-attributed nor deposited in the behavioral ledger. This
     # is the wrapper over EVERY inner return branch (cached, pivot, fallback,
@@ -11767,7 +11774,6 @@ async def _handle_find_products_multi_inner(
                 ),
             )
             _seed_fast_multiterm = _seed_query_fast_multiterm_enabled()
-            market_telemetry.observe_bound(request_metadata, None)
             stage_a_result = await fetch_external_seed_rows(
                 database=database,
                 market=None,
@@ -11803,7 +11809,6 @@ async def _handle_find_products_multi_inner(
                 and bool(MULTI_SEARCH_SHOPPING_ENABLE_SEED_TEXT_SCAN)
             ):
                 external_seed_broad_fallback_used = True
-                market_telemetry.observe_bound(request_metadata, None)
                 stage_b_result = await fetch_external_seed_rows(
                     database=database,
                     market=None,
@@ -15884,31 +15889,25 @@ async def invoke_shop_operation(
             # One market record per find_products_multi request, on every outcome -- success,
             # HTTPException, disconnect. It cannot fail the request: any error is recorded as
             # such instead of the fields.
+            # Through market_telemetry.emit, NOT logger.info(..., extra=...): on this module's logger
+            # INFO is never emitted in prod and `extra` is never rendered (review of this PR,
+            # confirmed on prod logs). emit writes one JSON line Cloud Run stores as jsonPayload.
             try:
-                logger.info(
-                    "multi.invoke.market",
-                    extra={
-                        "status_code": status_code,
-                        "source": source_normalized,
-                        "duration_ms": round(duration_seconds * 1000.0, 1),
-                        **market_telemetry.build_record(
-                            raw_payload=request.payload,
-                            envelope_metadata=request.metadata,
-                            observation=market_observation,
-                            result=locals().get("result"),
-                            dedup_cache_hit=dedup_cache_hit,
-                            dedup_inflight_joined=dedup_inflight_joined,
-                        ),
-                    },
-                )
+                market_telemetry.emit({
+                    "status_code": status_code,
+                    "source": source_normalized,
+                    "duration_ms": round(duration_seconds * 1000.0, 1),
+                    **market_telemetry.build_record(
+                        raw_payload=request.payload,
+                        envelope_metadata=request.metadata,
+                        observation=market_observation,
+                        result=locals().get("result"),
+                        dedup_cache_hit=dedup_cache_hit,
+                        dedup_inflight_joined=dedup_inflight_joined,
+                    ),
+                })
             except Exception as telemetry_error:  # pragma: no cover - defensive
-                try:
-                    logger.info(
-                        "multi.invoke.market",
-                        extra={"market_telemetry_error": str(telemetry_error)[:120]},
-                    )
-                except Exception:
-                    pass
+                market_telemetry.emit({"market_telemetry_error": str(telemetry_error)[:120]})
             if duration_seconds >= 2.0:
                 logger.info(
                     "multi.invoke.slow",
