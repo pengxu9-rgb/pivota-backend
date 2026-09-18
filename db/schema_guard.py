@@ -796,14 +796,14 @@ async def ensure_required_schema_light() -> None:
             except Exception:  # noqa: BLE001
                 # Best-effort like every sibling; must not starve what follows.
                 pass
-            # mig 227: Tier B cart-link eligibility. Early and in its own
+            # mig 228: Tier B cart-link eligibility. Early and in its own
             # try, for the reasons the mig-207 block gives: this branch is ONE
             # try, so being early means nothing upstream can starve it and
             # being wrapped means a failure here cannot starve what follows.
             # The DDL lives in db/tierb_cart_link_eligibility_schema (one
             # definition, shared with the SQLite branch below); tests/
             # test_tierb_cart_link_eligibility_postgres.py compares the schema
-            # it builds with db/migrations/227_* through the catalog.
+            # it builds with db/migrations/228_* through the catalog.
             try:
                 from db.tierb_cart_link_eligibility_schema import (
                     ensure_schema as _ensure_tierb_cart_link_eligibility,
@@ -2715,7 +2715,7 @@ async def ensure_required_schema_light() -> None:
             return
 
         if IS_SQLITE:
-            # mig 227: Tier B cart-link eligibility, SQLite twin — the same
+            # mig 228: Tier B cart-link eligibility, SQLite twin — the same
             # function as the Postgres branch; it picks the dialect's DDL.
             # SQL-only (no SQLAlchemy Table) for the reason the mig-224 block
             # below gives. Its own try, so it cannot starve what follows.

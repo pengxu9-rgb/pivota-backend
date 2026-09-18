@@ -1,4 +1,4 @@
--- Reverse of 227_tierb_cart_link_eligibility.sql.
+-- Reverse of 228_tierb_cart_link_eligibility.sql.
 --
 -- The UNIQUE (shop_domain, market) constraint and its index go with the table. This drops the
 -- recorded eligibility verdicts, which is safe on a dark lane: nothing reads them yet, and the

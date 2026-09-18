@@ -1,4 +1,4 @@
-"""The DDL for migration 227's table, as the schema-guard self-heal runs it.
+"""The DDL for migration 228's table, as the schema-guard self-heal runs it.
 
 A module of its own, importing nothing but db.database, because db/schema_guard imports it at
 startup inside a try that swallows every exception: an import chain that failed there (the
@@ -14,7 +14,7 @@ from db.database import IS_POSTGRES, database
 #
 # Production never runs db/migrations, so this IS the production schema: db/schema_guard.
 # ensure_required_schema_light calls `ensure_schema` early, in its own try. The Postgres DDL
-# must build the same schema as db/migrations/227_tierb_cart_link_eligibility.sql —
+# must build the same schema as db/migrations/228_tierb_cart_link_eligibility.sql —
 # tests/test_tierb_cart_link_eligibility_postgres.py compares the two through the catalog.
 # The SQLite twin differs only where SQLite must (no now(), no BIGSERIAL, no TIMESTAMPTZ);
 # every CHECK, NOT NULL and the UNIQUE key are the same.

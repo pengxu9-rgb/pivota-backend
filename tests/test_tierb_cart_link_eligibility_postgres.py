@@ -3,7 +3,7 @@
 Picked up by .github/workflows/postgres-dialect-gate.yml via the `tests/test_*_postgres.py`
 glob. Three things here, the first two of which SQLite cannot show:
 
-  1. THE SELF-HEAL BUILDS THE SAME SCHEMA AS MIGRATION 227, compared through the CATALOG
+  1. THE SELF-HEAL BUILDS THE SAME SCHEMA AS MIGRATION 228, compared through the CATALOG
      (columns, `pg_indexes.indexdef`, `pg_get_constraintdef`) rather than the source text:
      production never runs db/migrations, so the self-heal IS the production schema.
   2. PREPARE: every Postgres SQL constant in db/tierb_cart_link_eligibility.py is planned.
@@ -52,8 +52,8 @@ from tests.test_tierb_cart_link_eligibility_job import (  # noqa: E402,F401
     test_end_to_end_records_definite_verdicts_and_keeps_a_prior_one_on_a_transport_error,
 )
 
-_MIGRATION = Path(__file__).resolve().parent.parent / "db/migrations/227_tierb_cart_link_eligibility.sql"
-_DOWN = Path(__file__).resolve().parent.parent / "db/migrations/down/227_tierb_cart_link_eligibility_down.sql"
+_MIGRATION = Path(__file__).resolve().parent.parent / "db/migrations/228_tierb_cart_link_eligibility.sql"
+_DOWN = Path(__file__).resolve().parent.parent / "db/migrations/down/228_tierb_cart_link_eligibility_down.sql"
 _TABLE = "tierb_cart_link_eligibility"
 
 
@@ -105,7 +105,7 @@ async def _schema_fingerprint():
     )
 
 
-async def test_the_self_heal_builds_the_same_schema_as_migration_227():
+async def test_the_self_heal_builds_the_same_schema_as_migration_228():
     from db.database import database
     from db.tierb_cart_link_eligibility_schema import ensure_schema
 

@@ -1,4 +1,4 @@
-"""Persistence for Tier B cart-link eligibility (migration 227): one row per (shop, market).
+"""Persistence for Tier B cart-link eligibility (migration 228): one row per (shop, market).
 
 Written once a day by jobs/tierb_cart_link_eligibility.py; read by whoever decides whether a
 buyer may be sent down the cart-permalink path (`is_cart_link_eligible`). This module is the

@@ -2,7 +2,7 @@
 
 Records which Shopify merchants on our Tier B list currently accept the cart-permalink checkout
 (`https://{shop}/cart/{variant}:1?attributes[pivota_click_id]=...`). One row per
-`(shop_domain, market)` in `tierb_cart_link_eligibility` (migration 227). **Dark**: nothing reads
+`(shop_domain, market)` in `tierb_cart_link_eligibility` (migration 228). **Dark**: nothing reads
 the table yet.
 
 | Piece | Where |
@@ -10,7 +10,7 @@ the table yet.
 | Merchant list (40 rows) | `config/tierb_cart_link_merchants.json`, validated by `services/tierb_cart_link_merchants.py` |
 | Job | `python -m jobs.tierb_cart_link_eligibility` |
 | Storage + read API | `db/tierb_cart_link_eligibility.py` (`record_result`, `get_eligibility`, `is_cart_link_eligible`) |
-| Schema | `db/migrations/227_*` and the self-heal `db/tierb_cart_link_eligibility_schema.py` |
+| Schema | `db/migrations/228_*` and the self-heal `db/tierb_cart_link_eligibility_schema.py` |
 | Provisioning | `infra/gcp/setup_tierb_cart_link_eligibility_job.sh` |
 | The check itself | `services/shopify_cart_link_preflight.py` (PR #2209) |
 

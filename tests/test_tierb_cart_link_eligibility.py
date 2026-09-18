@@ -294,13 +294,13 @@ def test_every_preflight_verdict_is_classified_definite_or_indefinite():
     """FAILS THE MOMENT #2209's Verdict enum gains a member this module has not classified, and
     names it. Classifying one is a decision (does it overwrite a verdict? is it eligible?) and
     touches three places: the set in db/tierb_cart_link_eligibility.py and, for a definite one,
-    the verdict CHECK lists in migration 227 and in the self-heal."""
+    the verdict CHECK lists in migration 228 and in the self-heal."""
     missing = elig.unclassified_verdicts()
     assert not missing, (
         f"Verdict member(s) {missing} are classified NEITHER definite NOR indefinite in "
         "db/tierb_cart_link_eligibility.py; record_result refuses them and the job exits 4. "
         "Decide, add them to DEFINITE_VERDICTS or INDEFINITE_VERDICTS, and (if definite) to the "
-        "verdict/previous_verdict CHECK lists in db/migrations/227_* and the self-heal."
+        "verdict/previous_verdict CHECK lists in db/migrations/228_* and the self-heal."
     )
 
 
