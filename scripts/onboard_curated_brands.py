@@ -204,7 +204,7 @@ def _select_by_gtin(records: List[Dict[str, Any]], canonical: set, *, domain: st
 LEGACY_LISTINGS_MARKER = "legacy listings: "
 
 
-class _SelectOnlyDatabase:
+class _SelectOnlyHandle:
     """The preflight's only handle on the catalog DB: one method, and it refuses non-SELECT text.
 
     `find_legacy_retailer_listing_owners` needs nothing else, so anything that tries to write
@@ -258,7 +258,7 @@ async def _legacy_listing_report(plan: Dict[str, Any], *, check: bool) -> Dict[s
         if not getattr(database, "is_connected", False):
             await database.connect()
             connected_here = True
-        findings = await find_legacy_retailer_listing_owners(plan, _SelectOnlyDatabase(database))
+        findings = await find_legacy_retailer_listing_owners(plan, _SelectOnlyHandle(database))
     except Exception as exc:  # noqa: BLE001 — reported, never swallowed into "clear"
         # The class only: a driver error can quote its connection string.
         return {**report, "status": "error", "error": type(exc).__name__}

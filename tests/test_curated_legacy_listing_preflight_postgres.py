@@ -90,7 +90,7 @@ async def test_real_sql_finds_live_and_suppressed_owners_and_writes_nothing(cata
     await _insert(admin, "legacy::other-host", "https://other.example/products/haruharu-wonder-serum-mist")
     before = await _snapshot(admin)
 
-    findings = await writer.find_legacy_retailer_listing_owners(plan, cli._SelectOnlyDatabase(database))
+    findings = await writer.find_legacy_retailer_listing_owners(plan, cli._SelectOnlyHandle(database))
     by_key = {f["legacy_product_key"]: f for f in findings}
     assert set(by_key) == {LEGACY_LIVE, LEGACY_SUPPRESSED}
     assert {f["kind"] for f in findings} == {"conflict"}

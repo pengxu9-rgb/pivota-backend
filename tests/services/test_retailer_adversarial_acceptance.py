@@ -469,7 +469,7 @@ def test_preflight_refuses_the_sqlite_fallback_instead_of_reporting_clear(monkey
 @pytest.mark.asyncio
 async def test_select_only_handle_cannot_write():
     inner = AsyncMock()
-    handle = cli._SelectOnlyDatabase(inner)
+    handle = cli._SelectOnlyHandle(inner)
     for sql in ("UPDATE catalog_products SET suppressed_at = NULL", "  delete from catalog_products",
                 "WITH x AS (DELETE FROM catalog_products RETURNING 1) SELECT * FROM x"):
         with pytest.raises(PermissionError):
