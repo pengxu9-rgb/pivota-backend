@@ -258,3 +258,116 @@ def test_redaction_of_non_urls():
     assert redact_cart_permalink("") == ""
     assert redact_cart_permalink(None) == ""
     assert redact_cart_permalink("ucp-probe@pivota.cc") == REDACTED
+
+
+
+# =============================================================================================
+# Review of #2209 @71675390
+# =============================================================================================
+
+from services.outbound_links_service import redact_query_string  # noqa: E402
+
+
+# --- P2: `country=` pins the checkout market -----------------------------------------------------
+
+
+@pytest.mark.parametrize("kwargs,expected", PINNED_WITHOUT_BUYER)
+def test_country_none_is_byte_identical_too(kwargs, expected):
+    assert build_shopify_cart_permalink(**kwargs, country=None) == expected
+    assert build_shopify_cart_permalink(**kwargs, buyer=None, country=None) == expected
+
+
+def test_country_is_appended_after_the_click_attribute_upper_cased():
+    assert build_shopify_cart_permalink(
+        shop_domain="judydoll.com", variant_id="50041364447509", click_id="clk_j", country="us"
+    ) == "https://judydoll.com/cart/50041364447509:1?attributes[pivota_click_id]=clk_j&country=US"
+    assert build_shopify_cart_permalink(
+        shop_domain="s.com", variant_id="1", click_id="", country="SG") == "https://s.com/cart/1:1?country=SG"
+
+
+def test_country_and_buyer_together_keep_click_then_country_then_prefill():
+    url = build_shopify_cart_permalink(
+        shop_domain="judydoll.com", variant_id="50041364447509", click_id="clk_j", buyer=JUDYDOLL, country="US")
+    assert url == JUDYDOLL_LINK.replace("clk_j&", "clk_j&country=US&", 1)
+
+
+@pytest.mark.parametrize("country", ["USA", "U1", "", " US", "U", 1, "Üs"])
+def test_a_malformed_country_produces_no_link(country):
+    assert build_shopify_cart_permalink(shop_domain="s.com", variant_id="1", click_id="c", country=country) is None
+
+
+def test_country_is_kept_visible_by_redaction_and_only_when_it_is_a_country():
+    assert redact_cart_permalink("https://s.com/cart/1:1?attributes[pivota_click_id]=clk&country=US") == (
+        "https://s.com/cart/1:1?attributes[pivota_click_id]=clk&country=US")
+    assert redact_cart_permalink("https://s.com/cart/1:1?country=a%40b.com") == "https://s.com/cart/1:1?country=REDACTED"
+
+
+# --- P8: `;` separators, path params, and kept keys with unexpected values ------------------------
+
+
+def test_a_semicolon_separated_query_after_the_click_id_is_redacted():
+    red = redact_cart_permalink("https://s.com/cart/1:1?attributes[pivota_click_id]=clk;checkout[email]=a@b.com")
+    assert "a@b.com" not in red and "a%40b.com" not in red
+    assert red == "https://s.com/cart/1:1?attributes[pivota_click_id]=clk&checkout[email]=REDACTED"
+
+
+def test_path_params_are_dropped():
+    red = redact_cart_permalink("https://s.com/cart/1:1;checkout[email]=a@b.com?x=1")
+    assert "a@b.com" not in red
+    assert red == "https://s.com/cart/1:1?x=REDACTED"
+
+
+def test_a_kept_key_with_a_value_that_is_not_a_click_id_is_redacted():
+    red = redact_cart_permalink(
+        "https://s.com/cart/1:1?attributes[pivota_click_id]=a@b.com&attributes[pivota_click_id]=clk_ok")
+    assert "a@b.com" not in red
+    assert red.endswith("attributes[pivota_click_id]=REDACTED&attributes[pivota_click_id]=clk_ok")
+
+
+def test_a_key_that_is_not_a_parameter_name_is_redacted_whole():
+    assert redact_query_string("a%40b.com x=1&ok=2") == "REDACTED&ok=REDACTED"
+    assert redact_query_string("someone@example.com=1") == "REDACTED"
+
+
+def test_redact_query_string_directly():
+    assert redact_query_string("") == ""
+    assert redact_query_string(None) == ""
+    q = "attributes%5Bpivota_click_id%5D=clk_1&checkout%5Bemail%5D=a%40b.com&country=JP;page=2"
+    assert redact_query_string(q) == (
+        "attributes%5Bpivota_click_id%5D=clk_1&checkout%5Bemail%5D=REDACTED&country=JP&page=REDACTED")
+
+
+# --- P9: repr() carries no PII ---------------------------------------------------------------------
+
+
+def test_cart_prefill_repr_carries_no_pii():
+    buyer = _buyer(address2="Suite 5")
+    text = repr(buyer) + str(buyer)
+    for value in ("ucp-probe@pivota.cc", "Pivota", "Probe", "1209 Orange Street", "Suite 5", "Wilmington",
+                  "19801", "+12025550142", "DE"):
+        assert value not in text, value
+    assert "country='US'" in text
+    assert buyer.email == "ucp-probe@pivota.cc", "the value is still there, just not printed"
+
+
+def test_cart_prefill_positional_order_is_unchanged():
+    b = CartPrefill("a@b.co", "A", "B", "1 Main", "City", "US", "Apt 1", "CA", "90001", "+12025550142")
+    assert (b.email, b.address1, b.country, b.address2, b.province, b.zip, b.phone) == (
+        "a@b.co", "1 Main", "US", "Apt 1", "CA", "90001", "+12025550142")
+
+
+# --- P10: C1 controls and bidi overrides are refused; ordinary non-ASCII is not ----------------------
+
+
+@pytest.mark.parametrize("char", ["\x80", "\x85", "\x9f", "‎", "‏", "‪", "‫", "‬",
+                                  "‭", "‮", "⁦", "⁧", "⁨", "⁩"])
+def test_c1_controls_and_bidi_marks_are_refused(char):
+    buyer = _buyer(last_name=f"B{char}")
+    assert cart_prefill_refusal(buyer) == "last_name_control_character"
+    assert build_shopify_cart_permalink(shop_domain="s.com", variant_id="1", click_id="c", buyer=buyer) is None
+
+
+@pytest.mark.parametrize("value", ["Zoë", "O'Neil", "千代田区", "Müller-Lüdenscheidt",
+                                   " Main", "‍"])
+def test_ordinary_non_ascii_is_accepted(value):
+    assert cart_prefill_refusal(_buyer(last_name=value)) is None

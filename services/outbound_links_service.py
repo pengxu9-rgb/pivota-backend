@@ -7,7 +7,7 @@ import os
 import re
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, unquote_plus, urlencode, urlparse, urlunparse, parse_qsl
@@ -282,19 +282,20 @@ class CartPrefill:
     the URL entirely. See `cart_prefill_refusal` for what is refused and why.
 
     THE URL THIS PRODUCES CARRIES BUYER PII. Never log it raw; use
-    `redact_cart_permalink`.
+    `redact_cart_permalink`. The PII fields are also kept out of ``repr()`` (only `country`
+    shows), so an exception message or a debug print of the object cannot leak them.
     """
 
-    email: str
-    first_name: str
-    last_name: str
-    address1: str
-    city: str
+    email: str = field(repr=False)
+    first_name: str = field(repr=False)
+    last_name: str = field(repr=False)
+    address1: str = field(repr=False)
+    city: str = field(repr=False)
     country: str  # ISO 3166-1 alpha-2
-    address2: Optional[str] = None
-    province: Optional[str] = None
-    zip: Optional[str] = None
-    phone: Optional[str] = None  # E.164, e.g. +12025550142
+    address2: Optional[str] = field(default=None, repr=False)
+    province: Optional[str] = field(default=None, repr=False)
+    zip: Optional[str] = field(default=None, repr=False)
+    phone: Optional[str] = field(default=None, repr=False)  # E.164, e.g. +12025550142
 
 
 # Emission order follows the link Reap was sent (judydoll), with address2 after address1.
@@ -307,17 +308,20 @@ CART_PREFILL_MAX_VALUE_LEN = 256
 # address properly on its own page; this only refuses values that are obviously not one.
 _PLAUSIBLE_EMAIL = re.compile(r"^[^@\s]+@[^@\s.]+(?:\.[^@\s.]+)+$")
 _E164_PHONE = re.compile(r"^\+[1-9][0-9]{6,14}$")
-# Every C0 control and DEL, not only CR/LF/NUL: a value is a form field, and no form field
-# a buyer can type contains a control character. CR/LF are the header-injection shape.
-_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+# Every C0 control, DEL and every C1 control, not only CR/LF/NUL: a value is a form field, and
+# no form field a buyer can type contains a control character. CR/LF are the header-injection
+# shape. Bidi overrides/isolates and LRM/RLM are refused too: they make a rendered name or
+# address read differently from its bytes (the "Trojan Source" class).
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f\u200e\u200f\u202a-\u202e\u2066-\u2069]")
 
 
 def cart_prefill_refusal(buyer: Any) -> Optional[str]:
     """Why `buyer` cannot be put on a cart permalink, or None when it can.
 
     Refused: a missing required field, an implausible email (``a@b``), a country that is not
-    exactly two ASCII letters (``USA``), a phone that is not E.164, any control character
-    (``"1 Main\\r\\nX-Evil: 1"``), and any value over 256 characters. Non-ASCII text is
+    exactly two ASCII letters (``USA``), a phone that is not E.164, any C0/C1 control character
+    (``"1 Main\\r\\nX-Evil: 1"``) or bidi override/isolate/mark, and any value over 256
+    characters. Non-ASCII text is
     accepted (``"Chiyoda-ku 千代田区"``) — it is percent-encoded as UTF-8, not refused.
     """
     if not isinstance(buyer, CartPrefill):
@@ -366,22 +370,34 @@ def build_shopify_cart_permalink(
     click_id: str,
     quantity: int = 1,
     buyer: Optional[CartPrefill] = None,
+    country: Optional[str] = None,
 ) -> Optional[str]:
     """Full Shopify cart permalink carrying the pivota click id as an order-surviving
     attribute, or None when a cart permalink cannot be built (missing host /
     non-numeric variant id).
 
-    With `buyer`, the link also prefills the checkout's email and shipping address. A buyer
-    that `cart_prefill_refusal` refuses makes the whole call return None — never a link
-    without the prefill the caller asked for. Without `buyer` the output is byte-identical
-    to what it was before `buyer` existed (pinned by tests).
+    With `country` (ISO-2), the link carries ``country=<CC>``, which PINS the checkout's market:
+    verified live 2026-09-18 from a JP egress, judydoll's link landed on an ``en-jp`` checkout
+    with buyer countryCode JP, and the same link plus ``&country=US`` on ``en-us`` / US. A
+    country that is not two ASCII letters makes the call return None.
+
+    With `buyer`, the link also prefills the checkout's email and shipping address (human
+    handoff only; the Reap path passes none). A buyer that `cart_prefill_refusal` refuses makes
+    the whole call return None — never a link without the prefill the caller asked for.
+
+    Without `buyer` and `country` the output is byte-identical to what it was before either
+    existed (pinned by tests).
     """
     base = shopify_cart_base_url(shop_domain=shop_domain, variant_id=variant_id, quantity=quantity)
     if not base:
         return None
     if buyer is not None and cart_prefill_refusal(buyer) is not None:
         return None
+    if country is not None and not (isinstance(country, str) and re.fullmatch(r"[A-Za-z]{2}", country)):
+        return None
     url = append_shopify_cart_click_attribute(base, click_id)
+    if country is not None:
+        url = _append_query_fragment(url, f"{SHOPIFY_CART_COUNTRY_PARAM}={country.upper()}")
     if buyer is not None:
         url = _append_query_fragment(url, _cart_prefill_query(buyer))
     return url
@@ -391,18 +407,55 @@ def build_shopify_cart_permalink(
 # Shopify's redirect chain carries more than `checkout[...]` — the shop.app hop's
 # `shop_pay_token` is a JWT whose payload embeds the whole landing URL, email and address
 # included (seen live 2026-09-18 on pourri.com), and `return_to` names the checkout token.
-_REDACTION_KEEP_KEYS = frozenset({SHOPIFY_CART_CLICK_ATTRIBUTE, SHOPIFY_CART_RECOVERY_ATTRIBUTE})
+# The market pin on a cart permalink. Not PII (a country code), and the one thing an operator
+# needs to see to debug a checkout that landed in the wrong market — so it stays visible.
+SHOPIFY_CART_COUNTRY_PARAM = "country"
+# Each kept key also has a shape its VALUE must have, or the value is redacted anyway: a
+# second `attributes[pivota_click_id]=a@b.com` must not ride through on the key's name.
+_REDACTION_KEEP_VALUES = {
+    SHOPIFY_CART_CLICK_ATTRIBUTE: re.compile(r"[A-Za-z0-9_.\-]{1,128}"),
+    SHOPIFY_CART_RECOVERY_ATTRIBUTE: re.compile(r"[A-Za-z0-9_.\-]{1,128}"),
+    SHOPIFY_CART_COUNTRY_PARAM: re.compile(r"[A-Za-z]{2}"),
+}
+_REDACTION_KEEP_KEYS = frozenset(_REDACTION_KEEP_VALUES)
+_REDACTION_SAFE_KEY = re.compile(r"[A-Za-z0-9_.\-\[\]%]{1,128}")
 REDACTED = "REDACTED"
+
+
+def redact_query_string(query: Any) -> str:
+    """A query string safe to log: the click id, recovery key and `country` survive (when
+    their values have the expected shape); every other value becomes ``REDACTED``.
+
+    Splits on ``;`` as well as ``&`` — a server that treats ``;`` as a separator would read
+    ``clk;checkout[email]=a@b.com`` as two parameters, so the redactor must too. A key that
+    does not look like a parameter name is itself redacted (keys can carry data).
+    """
+    parts = []
+    for piece in re.split(r"[&;]", str(query or "")):
+        if not piece:
+            continue
+        raw_key, sep, raw_value = piece.partition("=")
+        if not _REDACTION_SAFE_KEY.fullmatch(raw_key):
+            parts.append(REDACTED)
+            continue
+        key = unquote_plus(raw_key)
+        shape = _REDACTION_KEEP_VALUES.get(key)
+        if shape is not None and sep and shape.fullmatch(raw_value):
+            parts.append(piece)
+        else:
+            parts.append(f"{raw_key}={REDACTED}" if sep else REDACTED)
+    return "&".join(parts)
 
 
 def redact_cart_permalink(url: Any) -> str:
     """A cart permalink (or any hop of its redirect chain) safe to log.
 
-    Keeps scheme, host, path and the click-id / recovery-key attributes. Every other query
-    value — every ``checkout[...]`` value first among them, whether its brackets are literal
-    or percent-encoded (``checkout%5Bemail%5D``, as Shopify re-emits them on the next hop) —
-    becomes ``REDACTED``. Keys are kept so the shape stays readable. Userinfo and fragment
-    are dropped. Something that does not parse as a URL is redacted whole.
+    Keeps scheme, host, path and the click-id / recovery-key / `country` parameters. Every
+    other query value — every ``checkout[...]`` value first among them, whether its brackets
+    are literal or percent-encoded (``checkout%5Bemail%5D``, as Shopify re-emits them on the
+    next hop) — becomes ``REDACTED`` (see `redact_query_string`). Keys are kept so the shape
+    stays readable. Userinfo, path ``;params`` and the fragment are dropped. Something that does
+    not parse as a URL is redacted whole.
     """
     raw = str(url or "")
     try:
@@ -414,17 +467,7 @@ def redact_cart_permalink(url: Any) -> str:
     if not parsed.scheme or not host:
         return REDACTED if raw else ""
     netloc = f"{host}:{port}" if port else host
-    parts = []
-    for piece in parsed.query.split("&") if parsed.query else []:
-        if not piece:
-            continue
-        raw_key, sep, raw_value = piece.partition("=")
-        key = unquote_plus(raw_key)
-        if key in _REDACTION_KEEP_KEYS:
-            parts.append(piece)
-        else:
-            parts.append(f"{raw_key}={REDACTED}" if sep else REDACTED)
-    return urlunparse((parsed.scheme, netloc, parsed.path, parsed.params, "&".join(parts), ""))
+    return urlunparse((parsed.scheme, netloc, parsed.path, "", redact_query_string(parsed.query), ""))
 
 
 def url_domain(url: str) -> str:

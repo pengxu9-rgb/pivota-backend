@@ -27,6 +27,20 @@ buyer's market it would report the SERVER's market instead (prod egress is US, a
 JP) — which is why `market` is a required argument and must equal the buyer's country when a
 buyer is given.
 
+THE CHECKOUT'S MARKET IS PINNED TOO. Without it Shopify picks the checkout market from the
+requester: from a JP egress judydoll's permalink landed on an `en-jp` checkout with buyer
+countryCode JP; the same link plus `&country=US` landed on `en-us` / US (verified live
+2026-09-18). The permalink is therefore always built with `country=<market>`, the landed
+checkout's buyer country is read back (`buyerIdentity.customer.countryCode`), and a checkout in
+any other market — or one whose market cannot be read — is CHECKOUT_MARKET_MISMATCH.
+
+WHAT COUNTS AS EVIDENCE ON THE PAGE. Not substrings. The variant must be a MERCHANDISE LINE
+(`merchandiseLines[].merchandise.id == gid://shopify/ProductVariantMerchandise/<id>`, a
+`MerchandiseLine`), not a mention in a removed line, a recommendation or an echoed URL; the click
+id must be the cart attribute pair (`customAttributes[] {key: pivota_click_id, value: <exact>}`),
+not the `queryString` / `return_to` echo the page also carries. Both are parsed as JSON out of
+the HTML-unescaped page.
+
 THE ONE SIDE EFFECT. Following the permalink CREATES AN ABANDONED SHOPIFY CHECKOUT on the
 merchant's store — the same side effect as every UCP probe before it. Nothing else is written,
 nothing is paid, no payment step is touched. Resolving the variant reads only the public
@@ -37,7 +51,10 @@ merchant list (today: `scripts/ops/tierb_cart_link_preflight.py`, an operator to
 that let a caller name the host would let an anonymous party make us create checkouts, under
 our IP and our click ids, on any store they like — and would turn this into a fetcher of
 arbitrary URLs besides. Redirect hops are held to https on a DNS name (no IP literals, no
-localhost), but that is a floor, not a licence to widen the input.
+numeric/hex hosts such as `127.1` or `0x7f.1`, no `localhost`/`*.localhost`/`.local`/
+`.internal`), but that is a floor, not a licence to widen the input. KNOWN LIMITATION: a DNS
+name that RESOLVES to a private address is not refused (no resolution is done here); that is
+acceptable only because no web caller can reach this and hosts come from our own list.
 
 WHAT IT CANNOT SEE: SHIPPING. Shopify's checkout page ships `deliveryLines: []` in its server
 HTML and loads rates with JavaScript, so no HTTP-only check can prove a rate exists. Measured on
@@ -73,13 +90,14 @@ import httpx
 
 from services.outbound_links_service import (
     CartPrefill,
+    redact_query_string,
     build_shopify_cart_permalink,
     cart_prefill_refusal,
     extract_shopify_numeric_variant_id,
     normalize_shop_host,
     redact_cart_permalink,
 )
-from services.shopify_variant_identity import parse_product_js
+from services.shopify_variant_identity import MAX_VARIANTS, parse_product_js
 
 logger = logging.getLogger(__name__)
 
@@ -95,9 +113,10 @@ USER_AGENT = (
 )
 _HEADERS = {"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"}
 
-_CHECKOUT_PATH = re.compile(r"/checkouts/(?:cn|c|co)/")
+_CHECKOUT_PATH = re.compile(r"^/checkouts/(?:cn|c|co)/")
 _NOT_ACCEPTING_TEXT = "set up to receive orders"
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+_INVALID_LOCATION_PREFIX = "Invalid URL in location header"  # httpx 0.27 _redirect_url
 _CHECKOUT_TOTAL = re.compile(
     r'totalAmount":\{"value":\{"amount":"([0-9.]+)","currencyCode":"([A-Z]{3})"'
 )
@@ -123,6 +142,9 @@ class Verdict(str, enum.Enum):
     # The storefront would not let us confirm the variant (non-200 / non-JSON / scan cap).
     VARIANT_UNVERIFIED = "VARIANT_UNVERIFIED"
     PASSWORD_PAGE = "PASSWORD_PAGE"
+    # A checkout with our line and click id, but in another market than the buyer's (or one
+    # whose market cannot be read off the page). Definite: not eligible.
+    CHECKOUT_MARKET_MISMATCH = "CHECKOUT_MARKET_MISMATCH"
     # Connect error, timeout, proxy flake. RETRYABLE, and never proof of ineligibility.
     TRANSPORT_ERROR = "TRANSPORT_ERROR"
     # The caller's arguments were refused before any request was made.
@@ -167,6 +189,7 @@ class PreflightResult:
     final_url: Optional[str] = None  # redacted
     missing: Tuple[str, ...] = ()
     detail: Optional[str] = None
+    checkout_country: Optional[str] = None  # buyerIdentity countryCode read off the checkout
     shipping_verified: bool = field(default=False, init=False)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -184,10 +207,15 @@ _PREFLIGHT_ACTIVE: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "shopify_cart_link_preflight_active", default=False
 )
 _URL_IN_TEXT = re.compile(r"https?://[^\s\"'<>]+")
+# Any `?query` span, whatever precedes it: httpcore logs a RELATIVE `Location`
+# (`/checkouts/cn/T?checkout%5Bemail%5D=...`) or a scheme-relative one (`//s.com/...?...`)
+# exactly as the server sent it, and neither matches an `https?://` pattern.
+_QUERY_IN_TEXT = re.compile(r"\?([^\s\"'<>#]*)")
 
 
 def _redact_text(text: str) -> str:
-    return _URL_IN_TEXT.sub(lambda m: redact_cart_permalink(m.group(0)), text)
+    text = _URL_IN_TEXT.sub(lambda m: redact_cart_permalink(m.group(0)), text)
+    return _QUERY_IN_TEXT.sub(lambda m: "?" + redact_query_string(m.group(1)), text)
 
 
 def _redact_log_arg(arg: Any) -> Any:
@@ -268,16 +296,25 @@ class _Landing:
     too_many_redirects: bool = False
 
 
+# A last label that is all digits or `0x`-hex is not a DNS name: `127.1`, `0x7f.1`, `10.1` and
+# `0177.0.0.1` are all addresses to the resolver (inet_aton shorthand), none of them a domain.
+_NUMERIC_LABEL = re.compile(r"(?:0x[0-9a-f]*|[0-9]+)")
+
+
 def _host_refusal(host: str) -> Optional[str]:
-    if not host or "." not in host:
-        return "host_not_a_domain"
-    if host == "localhost" or host.endswith((".localhost", ".local", ".internal")):
+    h = str(host or "").strip().lower().rstrip(".")  # `localhost.` is `localhost`
+    if h == "localhost" or h.endswith((".localhost", ".local", ".internal")):
         return "host_local"
+    if not h or "." not in h:
+        return "host_not_a_domain"
     try:
-        ipaddress.ip_address(host.strip("[]"))
+        ipaddress.ip_address(h.strip("[]"))
         return "host_is_ip_literal"
     except ValueError:
-        return None
+        pass
+    if _NUMERIC_LABEL.fullmatch(h.split(".")[-1]):
+        return "host_is_numeric"
+    return None
 
 
 def _hop_refusal(url: str) -> Optional[str]:
@@ -324,15 +361,29 @@ async def _fetch_following(
     chain: List[Hop] = []
     current = url
     for _ in range(MAX_REDIRECT_HOPS):
-        for key, value in (pin_params or {}).items():
-            current = _with_query_param(current, key, value)
-        refusal = _hop_refusal(current)
-        if refusal:
-            raise _HopRefused(refusal, chain)
-        request = client.build_request("GET", current, headers=_HEADERS, timeout=REQUEST_TIMEOUT_S)
+        try:
+            for key, value in (pin_params or {}).items():
+                current = _with_query_param(current, key, value)
+            refusal = _hop_refusal(current)
+            if refusal:
+                raise _HopRefused(refusal, chain)
+            request = client.build_request("GET", current, headers=_HEADERS, timeout=REQUEST_TIMEOUT_S)
+        except (httpx.InvalidURL, UnicodeError, ValueError):
+            # A `Location` httpx cannot parse (`:abc` port, `https://xn--/` IDNA): not a network
+            # failure and not retryable, but never an exception that sinks the caller's batch.
+            raise _HopRefused("hop_invalid_url", chain) from None
         try:
             response = await client.send(request, stream=True, follow_redirects=False)
-        except httpx.TransportError as exc:
+        except (httpx.InvalidURL, UnicodeError):
+            raise _HopRefused("hop_invalid_url", chain) from None
+        except httpx.RemoteProtocolError as exc:
+            # httpx parses a redirect's Location even with follow_redirects=False (to fill
+            # `next_request`), and reports an unparseable one (`:abc` port) as this transport
+            # error. That is the server's malformed header, not a flaky network: not retryable.
+            if str(exc).startswith(_INVALID_LOCATION_PREFIX):
+                raise _HopRefused("hop_invalid_url", chain) from None
+            raise _TransportFailure(exc, chain) from None
+        except httpx.HTTPError as exc:
             raise _TransportFailure(exc, chain) from None
         try:
             chain.append((response.status_code, redact_cart_permalink(str(response.url))))
@@ -342,7 +393,8 @@ async def _fetch_following(
                 current = urljoin(str(response.url), location)
                 continue
             body = await _read_bounded(response)
-        except httpx.TransportError as exc:
+        except httpx.HTTPError as exc:
+            # TransportError, and DecodingError (a gzip body that is not gzip): both retryable.
             raise _TransportFailure(exc, chain) from None
         finally:
             await response.aclose()
@@ -357,8 +409,8 @@ def _is_login_hop(redacted_url: str) -> bool:
     parsed = urlparse(redacted_url)
     host = (parsed.hostname or "").lower()
     path = parsed.path or ""
-    if "/customer_authentication/" in path:
-        return True
+    if "/customer_authentication/" in path or path.startswith("/account/login"):
+        return True  # new customer accounts, and classic `/account/login`
     return (host == "shopify.com" or host.endswith(".shopify.com")) and path.startswith("/authentication/")
 
 
@@ -366,6 +418,78 @@ def _page_contains(text: str, value: str) -> bool:
     """Exact presence in the HTML-unescaped page. No other decoding is attempted: a value the
     page only carries in some other encoding reads as missing, which errs toward not ELIGIBLE."""
     return bool(value) and value in text
+
+
+_JSON = json.JSONDecoder()
+_MAX_KEY_HITS = 64
+_CLICK_ATTRIBUTE_KEY = "pivota_click_id"
+
+
+def _json_values_after(page: str, key: str) -> List[Any]:
+    """Every JSON value that follows `"<key>":` in the page, parsed (bounded). An occurrence
+    whose value does not parse is skipped, never guessed at. The leading quote in the needle
+    means `"removedMerchandiseLines"` is NOT a `"merchandiseLines"`."""
+    needle = re.compile(r'"' + re.escape(key) + r'"\s*:\s*')
+    out: List[Any] = []
+    for hit in needle.finditer(page):
+        if len(out) >= _MAX_KEY_HITS:
+            break
+        try:
+            value, _ = _JSON.raw_decode(page, hit.end())
+        except ValueError:
+            continue
+        out.append(value)
+    return out
+
+
+def _has_variant_line(page: str, variant_id: str) -> bool:
+    """Is `variant_id` a merchandise LINE of this checkout? Exact gid equality (so `5004` is
+    not `50041`), inside a `MerchandiseLine` of a `merchandiseLines` array, on a
+    `*ProductVariantMerchandise`; a `variantId`, when present, must agree."""
+    want_id = f"gid://shopify/ProductVariantMerchandise/{variant_id}"
+    want_variant = f"gid://shopify/ProductVariant/{variant_id}"
+    for lines in _json_values_after(page, "merchandiseLines"):
+        for line in lines if isinstance(lines, list) else []:
+            if not isinstance(line, dict) or line.get("__typename") != "MerchandiseLine":
+                continue
+            merch = line.get("merchandise")
+            if not isinstance(merch, dict):
+                continue
+            if not str(merch.get("__typename") or "").endswith("ProductVariantMerchandise"):
+                continue
+            if merch.get("id") != want_id:
+                continue
+            if "variantId" in merch and merch.get("variantId") != want_variant:
+                continue
+            return True
+    return False
+
+
+def _has_click_attribute(page: str, click_id: str) -> bool:
+    """Is the click id the checkout's cart attribute — `{key: pivota_click_id, value: <exact>}`
+    in a `customAttributes` array? A URL or queryString echo of it does not count."""
+    for attrs in _json_values_after(page, "customAttributes"):
+        for attr in attrs if isinstance(attrs, list) else []:
+            if isinstance(attr, dict) and attr.get("key") == _CLICK_ATTRIBUTE_KEY and attr.get("value") == click_id:
+                return True
+    return False
+
+
+def checkout_buyer_country(body: str) -> Optional[str]:
+    """The checkout's buyer country (`buyerIdentity.countryCode`, or `.customer.countryCode` as
+    Shopify nests it today), read off the HTML-unescaped page. The empty `"buyerIdentity":[]` of a
+    PolicyFactSet is not an object and never matches. None when absent OR ambiguous (two
+    different codes): an unreadable market is not a matching one."""
+    page = html.unescape(body or "")
+    found = set()
+    for ident in _json_values_after(page, "buyerIdentity"):
+        if not isinstance(ident, dict):
+            continue
+        for holder in (ident, ident.get("customer")):
+            code = holder.get("countryCode") if isinstance(holder, dict) else None
+            if isinstance(code, str) and re.fullmatch(r"[A-Z]{2}", code):
+                found.add(code)
+    return next(iter(found)) if len(found) == 1 else None
 
 
 def classify_landing(
@@ -376,6 +500,7 @@ def classify_landing(
     variant_id: str,
     click_id: str,
     buyer: Optional[CartPrefill],
+    market: Optional[str] = None,
 ) -> Tuple[Verdict, Tuple[str, ...]]:
     """Pure: the verdict for a finished redirect chain, plus what an almost-checkout lacked.
 
@@ -383,7 +508,12 @@ def classify_landing(
     Order matters: a login hop wins whatever the final status is (the 406 at
     shopify.com/authentication is incidental), and ELIGIBLE is reached only by a 200 on a
     /checkouts/(cn|c|co)/ path carrying the exact variant gid and the click id — plus, when a
-    buyer was given, the email and address1.
+    buyer was given, the email and address1. With `market` (the preflight always passes it) the
+    checkout's buyer country must equal it, else CHECKOUT_MARKET_MISMATCH.
+
+    The variant and click id are read STRUCTURALLY (see `_has_variant_line`,
+    `_has_click_attribute`). The email / address1 prefill check stays a presence check on the
+    unescaped page; it only runs on the human-handoff path.
     """
     final_path = urlparse(chain[-1][1]).path if chain else ""
     if any(_is_login_hop(url) for _, url in chain):
@@ -392,27 +522,29 @@ def classify_landing(
         return Verdict.VARIANT_GONE, ()
     page = html.unescape(body or "")
     if final_status == 403:
-        if "/checkouts/" in final_path and _NOT_ACCEPTING_TEXT in page.lower():
+        if final_path.startswith("/checkouts/") and _NOT_ACCEPTING_TEXT in page.lower():
             return Verdict.NOT_ACCEPTING_ORDERS, ()
         return Verdict.BLOCKED_UNKNOWN, ()
     if final_path.startswith("/password"):
         return Verdict.PASSWORD_PAGE, ()
     if final_status == 200 and _CHECKOUT_PATH.search(final_path):
         missing: List[str] = []
-        if not re.search(rf"ProductVariant/{re.escape(variant_id)}(?!\d)", page):
+        if not _has_variant_line(page, variant_id):
             missing.append("variant")
-        if not _page_contains(page, click_id):
+        if not _has_click_attribute(page, click_id):
             missing.append("click_id")
         if buyer is not None:
             if not _page_contains(page, buyer.email.strip()):
                 missing.append("email")
             if not _page_contains(page, buyer.address1.strip()):
                 missing.append("address1")
-        if not missing:
-            return Verdict.ELIGIBLE, ()
         if "variant" in missing or "click_id" in missing:
             return Verdict.UNCLASSIFIED, tuple(missing)
-        return Verdict.CHECKOUT_PREFILL_MISSING, tuple(missing)
+        if market is not None and checkout_buyer_country(page) != market.upper():
+            return Verdict.CHECKOUT_MARKET_MISMATCH, tuple(missing)
+        if missing:
+            return Verdict.CHECKOUT_PREFILL_MISSING, tuple(missing)
+        return Verdict.ELIGIBLE, ()
     return Verdict.UNCLASSIFIED, ()
 
 
@@ -503,7 +635,12 @@ async def _resolve_from_handle(
     if variant_id:
         match = [v for v in variants if v["shopify_variant_id"] == variant_id]
         if not match:
-            res.verdict, res.detail = Verdict.VARIANT_GONE, "variant_not_on_product"
+            raw = payload.get("variants")
+            if isinstance(raw, list) and len(raw) >= MAX_VARIANTS:
+                # parse_product_js keeps the first MAX_VARIANTS: absence past that is unproven.
+                res.verdict, res.detail = Verdict.VARIANT_UNVERIFIED, "product_js_variants_truncated"
+            else:
+                res.verdict, res.detail = Verdict.VARIANT_GONE, "variant_not_on_product"
             return True
         pick, source = match[0], "caller"
         if not pick["available"]:
@@ -532,11 +669,14 @@ async def _resolve_from_catalog(
     """Scan `/products.json` page by page, EVERY page read for `market` (`country=` pinned on
     every hop). Following redirects matters: robinsons.com.sg 301s this path to another host,
     and the first probe mistook that for no catalog."""
+    many_variants = False
     for page in range(1, MAX_CATALOG_PAGES + 1):
         landing = await _fetch_following(
             client,
             f"https://{host}/products.json?limit={CATALOG_PAGE_SIZE}&page={page}",
-            pin_params={"country": market},
+            # limit/page pinned like country: a redirect that drops the query would otherwise
+            # serve page 1 at the default size forever and "prove" a variant absent.
+            pin_params={"limit": str(CATALOG_PAGE_SIZE), "page": str(page), "country": market},
         )
         res.chain.extend(landing.chain)
         wall = _landing_wall(landing)
@@ -554,6 +694,8 @@ async def _resolve_from_catalog(
         for product in products:
             if not isinstance(product, dict):
                 continue
+            if len(product.get("variants") or []) >= MAX_VARIANTS:
+                many_variants = True
             for variant in product.get("variants") or []:
                 if not isinstance(variant, dict):
                     continue
@@ -585,7 +727,10 @@ async def _resolve_from_catalog(
         # Cap reached with pages still full: absence is not proven.
         res.verdict, res.detail = Verdict.VARIANT_UNVERIFIED, "catalog_scan_cap"
         return
-    if variant_id:
+    if variant_id and many_variants:
+        # A product listed with MAX_VARIANTS or more may be truncated by the storefront itself.
+        res.verdict, res.detail = Verdict.VARIANT_UNVERIFIED, "catalog_variants_possibly_truncated"
+    elif variant_id:
         res.verdict, res.detail = Verdict.VARIANT_GONE, "variant_not_in_catalog"
     else:
         res.verdict, res.detail = Verdict.VARIANT_UNAVAILABLE, "no_representative_variant"
@@ -724,7 +869,8 @@ async def _preflight(
         resolve_chain=resolve_chain,
     )
     url = build_shopify_cart_permalink(
-        shop_domain=host, variant_id=chosen.variant_id, click_id=click_id, quantity=quantity, buyer=buyer
+        shop_domain=host, variant_id=chosen.variant_id, click_id=click_id, quantity=quantity, buyer=buyer,
+        country=market,
     )
     if not url:
         return _done(PreflightResult(verdict=Verdict.INVALID_INPUT, detail="permalink_refused", **known))
@@ -751,8 +897,9 @@ async def _preflight(
         ))
     verdict, missing = classify_landing(
         chain=landing.chain, final_status=landing.status, body=landing.body,
-        variant_id=chosen.variant_id, click_id=click_id, buyer=buyer,
+        variant_id=chosen.variant_id, click_id=click_id, buyer=buyer, market=market,
     )
+    checkout_country = checkout_buyer_country(landing.body) if landing.status == 200 else None
     total = _CHECKOUT_TOTAL.search(html.unescape(landing.body)) if landing.status == 200 else None
     return _done(PreflightResult(
         verdict=verdict,
@@ -763,7 +910,12 @@ async def _preflight(
         missing=missing,
         checkout_total=(total.group(1) if total else None),
         checkout_currency=(total.group(2) if total else None),
-        detail=(None if verdict is not Verdict.UNCLASSIFIED else f"status_{landing.status}"),
+        detail=(
+            f"status_{landing.status}" if verdict is Verdict.UNCLASSIFIED
+            else f"checkout_country_{checkout_country or 'unreadable'}" if verdict is Verdict.CHECKOUT_MARKET_MISMATCH
+            else None
+        ),
+        checkout_country=checkout_country,
         **known,
     ))
 

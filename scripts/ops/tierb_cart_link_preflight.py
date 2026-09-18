@@ -107,6 +107,15 @@ async def run_rows(
     gate = asyncio.Semaphore(max(1, min(int(concurrency), MAX_CONCURRENCY)))
 
     async def one(row: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            return await attempt(row)
+        except Exception as exc:  # noqa: BLE001 — one merchant must never sink the whole report
+            # Type name only: an exception message can carry a URL, and a URL can carry PII.
+            return {**row, "buyer": None, "attempts": None, "result": {
+                "host": row["domain"], "verdict": Verdict.UNCLASSIFIED.value, "retryable": False,
+                "detail": f"script_exception:{type(exc).__name__}", "shipping_verified": False}}
+
+    async def attempt(row: Dict[str, Any]) -> Dict[str, Any]:
         buyer = PROBE_BUYERS.get(row["market"]) if use_buyer else None
         out: Dict[str, Any] = {**row, "buyer": ("probe_" + row["market"]) if buyer else None}
         if use_buyer and buyer is None:
@@ -142,6 +151,7 @@ def summary_line(entry: Dict[str, Any]) -> str:
         f"{entry['domain']:22} {entry['market'] or '-':3} {r['verdict']:26} "
         f"retry={'Y' if r.get('retryable') else 'n'} att={entry['attempts']} "
         f"variant={r.get('variant_id') or '-'}({r.get('variant_source') or '-'}) "
+        f"checkout_country={r.get('checkout_country') or '-'} "
         f"final={r.get('final_status') or '-'}@{r.get('final_host') or '-'} "
         f"missing={missing} ship_verified={str(r.get('shipping_verified', False)).lower()} "
         f"detail={r.get('detail') or '-'}"

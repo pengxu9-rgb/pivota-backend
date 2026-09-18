@@ -51,29 +51,66 @@ TOKEN = "hWNGxZONBs9DRwvyX0myoSvM"
 # --- fixtures modelled on the live bodies ----------------------------------------------------
 
 
-def checkout_body(*, variant=VID, click=CLICK, email=EMAIL, address1=ADDR1, total=("9.99", "USD")):
-    """A /checkouts/cn/ page: state JSON HTML-escaped inside a script tag, plus rendered inputs.
-    `deliveryLines: []` because shipping rates load later via JS (the reason shipping is
-    unverifiable here)."""
-    state = ['{&quot;deliveryLines&quot;:[]']
-    if variant:
-        state.append(f',&quot;merchandise&quot;:{{&quot;id&quot;:&quot;gid://shopify/ProductVariant/{variant}&quot;}}')
-    if click:
-        state.append(f',&quot;attributes&quot;:[{{&quot;key&quot;:&quot;pivota_click_id&quot;,&quot;value&quot;:&quot;{click}&quot;}}]')
+def merchandise_line(variant, *, typename="ProductVariantMerchandise", variant_id=None):
+    """One `MerchandiseLine`, shaped like judydoll's live checkout (2026-09-18)."""
+    return {
+        "stableId": "dd930d1d-6cc3-45cd-a188-11258a924e5e",
+        "merchandise": {
+            "__typename": typename,
+            "id": f"gid://shopify/ProductVariantMerchandise/{variant}",
+            "digest": "43f27e47c6ed0a6b3e8ead7c4ae62038",
+            "variantId": f"gid://shopify/ProductVariant/{variant_id or variant}",
+            "title": "Single Eyeshadow",
+        },
+        "lineComponents": [],
+        "legacyFee": False,
+        "__typename": "MerchandiseLine",
+    }
+
+
+def checkout_state(*, variant=VID, click=CLICK, total=("9.99", "USD"), country="US", extra=None,
+                   lines=None, attributes=None):
+    """The checkout's serialized state, keyed the way the live page keys it: the policy set's
+    EMPTY `buyerIdentity: []`, a `queryString` that ECHOES the click id (it must never count),
+    `merchandiseLines`, `note.customAttributes`, `buyerIdentity.customer.countryCode`."""
+    state = {
+        "session": {"policies": {"payment": [], "buyerIdentity": [], "merchandise": [],
+                                 "__typename": "PolicyFactSet"}},
+        "shopConfig": {"queryString": f"_r=AQAB&attributes%5Bpivota_click_id%5D={CLICK}&cart_link_id=NM6Naf3v"},
+        "delivery": {"deliveryLines": []},
+        "merchandise": {"taxesIncluded": False, "merchandiseLines": (
+            lines if lines is not None else ([merchandise_line(variant)] if variant else []))},
+        "note": {"customAttributes": (
+            attributes if attributes is not None
+            else ([{"key": "pivota_click_id", "value": click, "__typename": "NoteAttribute"}] if click else [])),
+            "message": "", "__typename": "Note"},
+    }
+    if country is not None:
+        state["buyerIdentity"] = {"shopUser": None, "customer": {
+            "presentmentCurrency": (total or ("", "USD"))[1], "countryCode": country,
+            "market": {"handle": country.lower(), "__typename": "Market"}, "__typename": "GuestProfile"}}
     if total:
-        state.append(
-            f',&quot;totalAmount&quot;:{{&quot;value&quot;:{{&quot;amount&quot;:&quot;{total[0]}&quot;,'
-            f'&quot;currencyCode&quot;:&quot;{total[1]}&quot;}}}}'
-        )
-    state.append("}")
+        state["totalAmount"] = {"value": {"amount": total[0], "currencyCode": total[1]}}
+    state.update(extra or {})
+    return state
+
+
+def checkout_body(*, variant=VID, click=CLICK, email=EMAIL, address1=ADDR1, total=("9.99", "USD"),
+                  country="US", state=None):
+    """A /checkouts/cn/ page: the state JSON HTML-escaped (`&quot;`) inside an attribute, as the
+    live page serializes it, plus rendered inputs. `deliveryLines: []` because shipping rates load
+    later via JS (the reason shipping is unverifiable here)."""
+    if state is None:
+        state = checkout_state(variant=variant, click=click, total=total, country=country)
+    serialized = html.escape(json.dumps(state, separators=(",", ":")), quote=True)
     inputs = ""
     if email:
         inputs += f'<input name="email" value="{html.escape(email)}">'
     if address1:
         inputs += f'<input name="address1" value="{html.escape(address1)}">'
     return (
-        "<!DOCTYPE html><html><head><title>Checkout - Judydoll</title></head><body>"
-        f'<script type="application/json" id="checkout-state">{"".join(state)}</script>'
+        "<!DOCTYPE html><html><head><title>Checkout - Judydoll</title>"
+        f'<meta name="serialized-session" content="{serialized}"></head><body>'
         f"{inputs}</body></html>"
     )
 
@@ -656,7 +693,7 @@ async def test_accept_language_no_longer_decides_availability(monkeypatch, accep
 async def test_country_is_sent_on_every_catalog_page():
     full_page = {"products": [{"title": f"P{i}", "variants": [cvar(str(10_000 + i))]} for i in range(250)]}
     store = Store({("s.com", "/products.json"): products_json(full_page, full_page, catalog(cvar())),
-                   **cart_to_checkout(host="s.com")})
+                   **cart_to_checkout(host="s.com", body=checkout_body(country="SG", total=("40.0", "SGD")))})
     result = await run(store, host="s.com", market="SG", variant_id=VID)
     assert result.verdict is Verdict.ELIGIBLE
     pages = store.hit("/products.json")
@@ -793,7 +830,7 @@ async def test_a_relative_location_is_resolved_against_the_current_hop():
 
 @pytest.mark.parametrize("kwargs,detail", [
     (dict(host="10.0.0.1"), "host_is_ip_literal"),
-    (dict(host="localhost"), "host_not_a_domain"),
+    (dict(host="localhost"), "host_local"),
     (dict(host="shop.internal"), "host_local"),
     (dict(variant_id="SKU-1"), "variant_id_not_numeric"),
     (dict(product_handle="a/b"), "product_handle_malformed"),
@@ -1040,3 +1077,388 @@ async def test_script_concurrency_never_exceeds_six():
     await script.run_rows(rows, concurrency=50, preflight_fn=_fake([], calls, inflight), retry_delay_s=0)
     assert len(calls) == 20
     assert inflight["max"] == 6
+
+
+
+# =============================================================================================
+# Review of #2209 @71675390 — every finding has an accepting and a refusing test below.
+# =============================================================================================
+
+CHECKOUT_URL = f"https://s.com/checkouts/cn/{TOKEN}/en-us"
+
+
+def _classify_state(state, *, market=None, buyer=None, click=CLICK, variant=VID):
+    body = checkout_body(state=state, email=None, address1=None)
+    return classify_landing(chain=[(200, CHECKOUT_URL)], final_status=200, body=body,
+                            variant_id=variant, click_id=click, buyer=buyer, market=market)
+
+
+# --- P1: the variant must be a merchandise LINE, the click id the cart ATTRIBUTE --------------
+
+
+def test_review_repro_wrong_line_removed_line_and_prefix_click_is_not_eligible():
+    """r1.py verbatim: line 9999, removedLines 5004, attribute clk_12; want 5004 / clk_1."""
+    chain = [(302, "https://s.com/cart/5004:1?attributes[pivota_click_id]=REDACTED"),
+             (200, "https://s.com/checkouts/cn/TOK/en-us")]
+    body = ('{"lines":[{"merchandise":{"id":"gid://shopify/ProductVariant/9999"}}],'
+            '"removedLines":[{"id":"gid://shopify/ProductVariant/5004"}],'
+            '"attributes":[{"key":"pivota_click_id","value":"clk_12"}]}')
+    verdict, missing = classify_landing(chain=chain, final_status=200, body=body, variant_id="5004",
+                                        click_id="clk_1", buyer=None)
+    assert verdict is Verdict.UNCLASSIFIED and missing == ("variant", "click_id")
+
+
+def test_review_repro_click_only_in_an_echoed_url_is_not_eligible():
+    body = ('<link rel="canonical" href="https://s.com/cart/5004:1?attributes[pivota_click_id]=clk_1">'
+            ' ProductVariant/5004')
+    verdict, missing = classify_landing(chain=[(200, "https://s.com/checkouts/cn/TOK/en-us")], final_status=200,
+                                        body=body, variant_id="5004", click_id="clk_1", buyer=None)
+    assert verdict is Verdict.UNCLASSIFIED and "click_id" in missing
+
+
+def test_the_live_shaped_checkout_is_eligible():
+    assert _classify_state(checkout_state()) == (Verdict.ELIGIBLE, ())
+
+
+def test_key_order_and_whitespace_inside_the_line_do_not_matter():
+    line = merchandise_line(VID)
+    shuffled = {k: line[k] for k in reversed(list(line))}
+    shuffled["merchandise"] = {k: line["merchandise"][k] for k in reversed(list(line["merchandise"]))}
+    state = checkout_state(lines=[shuffled])
+    body = checkout_body(state=state, email=None, address1=None).replace("&quot;:", "&quot; :  ")
+    verdict, _ = classify_landing(chain=[(200, CHECKOUT_URL)], final_status=200, body=body,
+                                  variant_id=VID, click_id=CLICK, buyer=None)
+    assert verdict is Verdict.ELIGIBLE
+
+
+def test_the_contextualized_merchandise_typename_is_accepted_and_other_lines_may_coexist():
+    lines = [merchandise_line("11111111111111"),
+             merchandise_line(VID, typename="ContextualizedProductVariantMerchandise")]
+    assert _classify_state(checkout_state(lines=lines))[0] is Verdict.ELIGIBLE
+
+
+def test_the_click_id_is_compared_exactly():
+    assert _classify_state(checkout_state(click="clk_12"), click="clk_1")[1] == ("click_id",)
+    assert _classify_state(checkout_state(click="clk_1"), click="clk_12")[1] == ("click_id",)
+    assert _classify_state(checkout_state(click="xclk_1"), click="clk_1")[1] == ("click_id",)
+    assert _classify_state(checkout_state(click="clk_1"), click="clk_1")[0] is Verdict.ELIGIBLE
+
+
+def test_a_click_id_present_only_in_the_query_string_echo_does_not_count():
+    state = checkout_state(attributes=[])
+    body = checkout_body(state=state, email=None, address1=None)
+    assert CLICK in html.unescape(body), "control: the echo really carries the click id"
+    assert _classify_state(state)[1] == ("click_id",)
+
+
+def test_a_click_attribute_under_another_key_does_not_count():
+    state = checkout_state(attributes=[{"key": "utm_content", "value": CLICK}])
+    assert _classify_state(state)[1] == ("click_id",)
+
+
+def test_the_variant_only_in_removed_lines_does_not_count():
+    state = checkout_state(lines=[], extra={"removedMerchandiseLines": [merchandise_line(VID)],
+                                            "removedLines": [merchandise_line(VID)]})
+    assert _classify_state(state)[1] == ("variant",)
+
+
+def test_the_variant_only_in_a_recommendation_block_does_not_count():
+    rec = {"productRecommendations": [{"merchandise": merchandise_line(VID)["merchandise"],
+                                       "__typename": "ProductRecommendation"}]}
+    state = checkout_state(lines=[merchandise_line("11111111111111")], extra=rec)
+    assert _classify_state(state)[1] == ("variant",)
+
+
+def test_a_line_that_is_not_a_merchandise_line_or_not_a_variant_does_not_count():
+    not_a_line = dict(merchandise_line(VID), __typename="RecommendedLine")
+    assert _classify_state(checkout_state(lines=[not_a_line]))[1] == ("variant",)
+    gift = merchandise_line(VID, typename="GiftCardMerchandise")
+    assert _classify_state(checkout_state(lines=[gift]))[1] == ("variant",)
+
+
+def test_a_line_whose_variant_id_disagrees_does_not_count():
+    assert _classify_state(checkout_state(lines=[merchandise_line(VID, variant_id="999")]))[1] == ("variant",)
+
+
+def test_a_longer_variant_gid_starting_with_ours_does_not_count():
+    assert _classify_state(checkout_state(lines=[merchandise_line(VID + "1")]))[1] == ("variant",)
+    # the same with no `variantId` to fall back on: the `id` comparison alone must refuse it
+    bare = merchandise_line(VID + "1")
+    del bare["merchandise"]["variantId"]
+    assert _classify_state(checkout_state(lines=[bare]))[1] == ("variant",)
+
+
+def test_variant_id_is_optional_when_the_merchandise_id_matches():
+    bare = merchandise_line(VID)
+    del bare["merchandise"]["variantId"]
+    assert _classify_state(checkout_state(lines=[bare]))[0] is Verdict.ELIGIBLE
+
+
+def test_a_key_that_merely_ends_in_merchandise_lines_is_not_the_line_list():
+    state = checkout_state(lines=[], extra={"deletedmerchandiseLines": [merchandise_line(VID)]})
+    assert _classify_state(state)[1] == ("variant",)
+
+
+async def test_an_input_host_that_is_not_valid_idna_is_unclassified_not_an_exception():
+    result = await run(Store({}), host="xn--zz.com", variant_id=VID)
+    assert result.verdict is Verdict.UNCLASSIFIED and result.detail == "resolve:hop_invalid_url"
+
+
+# --- P2: the checkout market is pinned and read back ------------------------------------------
+
+
+async def test_the_permalink_carries_country_equal_to_the_market():
+    for market, country in (("US", "US"), ("SG", "SG")):
+        store = Store({("s.com", "/products.json"): products_json(catalog(cvar())),
+                       **cart_to_checkout(host="s.com", body=checkout_body(country=country))})
+        result = await run(store, host="s.com", market=market, variant_id=VID)
+        assert result.verdict is Verdict.ELIGIBLE and result.checkout_country == country
+        (cart,) = store.hit("/cart/")
+        assert cart.url.params.get_list("country") == [market]
+        assert f"country={market}" in result.chain[0][1], "country stays visible in the redacted chain"
+
+
+async def test_a_checkout_in_another_market_is_a_market_mismatch():
+    store = Store({("s.com", "/products.json"): products_json(catalog(cvar())),
+                   **cart_to_checkout(host="s.com", body=checkout_body(country="JP", total=("1545", "JPY")))})
+    result = await run(store, host="s.com", market="US", variant_id=VID)
+    assert result.verdict is Verdict.CHECKOUT_MARKET_MISMATCH
+    assert result.checkout_country == "JP" and result.detail == "checkout_country_JP"
+    assert result.retryable is False
+
+
+async def test_a_checkout_whose_market_cannot_be_read_is_a_market_mismatch():
+    """country=None leaves only the policy set's EMPTY `buyerIdentity: []`, which must not match."""
+    body = checkout_body(country=None)
+    assert "buyerIdentity&quot;:[]" in body
+    store = Store({("s.com", "/products.json"): products_json(catalog(cvar())),
+                   **cart_to_checkout(host="s.com", body=body)})
+    result = await run(store, host="s.com", market="US", variant_id=VID)
+    assert result.verdict is Verdict.CHECKOUT_MARKET_MISMATCH
+    assert result.checkout_country is None and result.detail == "checkout_country_unreadable"
+
+
+def test_checkout_buyer_country_reads_nested_top_level_and_refuses_ambiguity():
+    assert pf.checkout_buyer_country(checkout_body(country="SG")) == "SG"
+    top = checkout_state(country=None, extra={"buyerIdentity": {"countryCode": "GB", "email": None}})
+    assert pf.checkout_buyer_country(checkout_body(state=top)) == "GB"
+    two = checkout_state(country="US", extra={"buyerProposal": {"buyerIdentity": {"countryCode": "JP"}}})
+    assert pf.checkout_buyer_country(checkout_body(state=two)) is None
+    same = checkout_state(country="US", extra={"buyerProposal": {"buyerIdentity": {"countryCode": "US"}}})
+    assert pf.checkout_buyer_country(checkout_body(state=same)) == "US"
+    assert pf.checkout_buyer_country(checkout_body(country=None)) is None
+    assert pf.checkout_buyer_country('"buyerIdentity":{"countryCode":"usa"}') is None
+
+
+def test_market_mismatch_outranks_a_missing_prefill():
+    state = checkout_state(country="JP")
+    body = checkout_body(state=state, email=None)
+    verdict, _ = classify_landing(chain=[(200, CHECKOUT_URL)], final_status=200, body=body, variant_id=VID,
+                                  click_id=CLICK, buyer=BUYER, market="US")
+    assert verdict is Verdict.CHECKOUT_MARKET_MISMATCH
+
+
+# --- P3: no network-type failure escapes; one merchant never sinks the report -----------------
+
+
+class _StreamedBody(httpx.AsyncByteStream):
+    """A body httpx only decodes when it is READ (as on the real network). `content=` bytes are
+    decoded eagerly inside the mock, which would exercise a different except clause."""
+
+    async def __aiter__(self):
+        yield b"not gzip at all"
+
+
+@pytest.mark.parametrize("eager", [True, False], ids=["decoded-at-send", "decoded-at-read"])
+async def test_a_body_that_fails_to_decode_is_a_retryable_transport_error(eager):
+    def bad_gzip(request):
+        if eager:
+            return httpx.Response(200, headers={"content-encoding": "gzip"}, content=b"not gzip at all")
+        return httpx.Response(200, headers={"content-encoding": "gzip"}, stream=_StreamedBody())
+
+    store = Store({("s.com", "/products.json"): products_json(catalog(cvar())),
+                   ("s.com", f"/cart/{VID}:1"): redirect(302, f"https://s.com/checkouts/cn/{TOKEN}/en-us"),
+                   ("s.com", f"/checkouts/cn/{TOKEN}/en-us"): bad_gzip})
+    result = await run(store, host="s.com", variant_id=VID)
+    assert result.verdict is Verdict.TRANSPORT_ERROR and result.retryable is True
+    assert result.detail == "permalink:DecodingError"
+
+
+@pytest.mark.parametrize("location", [
+    "https://s.com:abc/checkouts/cn/T?checkout%5Bemail%5D=alice%40example.com",
+    "https://xn--zz.com/checkouts/cn/T",
+    "https://xn--a.com/x",
+])
+async def test_an_unparseable_location_is_unclassified_not_an_exception(location):
+    store = Store({("s.com", "/products.json"): products_json(catalog(cvar())),
+                   ("s.com", f"/cart/{VID}:1"): redirect(302, location)})
+    result = await run(store, host="s.com", variant_id=VID, buyer=BUYER)
+    assert result.verdict is Verdict.UNCLASSIFIED and result.detail == "permalink:hop_invalid_url"
+    assert "alice" not in json.dumps(result.to_dict())
+
+
+async def test_any_other_protocol_error_stays_a_retryable_transport_error():
+    store = Store({("s.com", "/products.json"): products_json(catalog(cvar())),
+                   ("s.com", f"/cart/{VID}:1"): _raise(httpx.RemoteProtocolError)})
+    result = await run(store, host="s.com", variant_id=VID)
+    assert result.verdict is Verdict.TRANSPORT_ERROR and result.retryable is True
+    assert result.detail == "permalink:RemoteProtocolError"
+
+
+async def test_an_unparseable_location_while_resolving_is_unclassified():
+    store = Store({("s.com", "/products.json"): redirect(301, "https://xn--zz.com/products.json")})
+    result = await run(store, host="s.com", variant_id=VID)
+    assert result.verdict is Verdict.UNCLASSIFIED and result.detail == "resolve:hop_invalid_url"
+
+
+async def test_script_one_raising_merchant_does_not_sink_the_report():
+    script = _load_script()
+
+    async def flaky(host, **kwargs):
+        if host == "bad.com":
+            raise RuntimeError("https://bad.com/cart/1:1?checkout[email]=alice@example.com")
+        return PreflightResult(host=host, verdict=Verdict.ELIGIBLE)
+
+    rows = [script.normalize_row({"domain": d, "market": "US"}) for d in ("a.com", "bad.com", "c.com")]
+    out = await script.run_rows(rows, preflight_fn=flaky, retry_delay_s=0)
+    assert [e["result"]["verdict"] for e in out] == ["ELIGIBLE", "UNCLASSIFIED", "ELIGIBLE"]
+    assert out[1]["result"]["detail"] == "script_exception:RuntimeError"
+    assert "alice" not in json.dumps(out)
+
+
+# --- P4: relative and scheme-relative Locations in httpcore's trace are redacted --------------
+
+
+@pytest.mark.parametrize("location", [
+    "/checkouts/cn/T?checkout%5Bemail%5D=alice%40example.com&attributes%5Bpivota_click_id%5D=clk_keep&country=US",
+    "//s.com/checkouts/cn/T?checkout%5Bemail%5D=alice%40example.com&attributes%5Bpivota_click_id%5D=clk_keep&country=US",
+    "https://s.com/checkouts/cn/T?checkout%5Bemail%5D=alice%40example.com&attributes%5Bpivota_click_id%5D=clk_keep&country=US",
+])
+def test_httpcore_location_lines_are_redacted_in_every_url_form(caplog, location):
+    caplog.set_level(logging.DEBUG)
+    line = ("receive_response_headers.complete return_value=(b'HTTP/1.1', 302, b'Found', "
+            f"[(b'Location', b'{location}')])")
+    token = pf._PREFLIGHT_ACTIVE.set(True)
+    try:
+        logging.getLogger("httpcore.http11").debug(line)
+    finally:
+        pf._PREFLIGHT_ACTIVE.reset(token)
+    (message,) = [r.getMessage() for r in caplog.records if r.name == "httpcore.http11"]
+    assert "alice" not in message
+    assert "checkout%5Bemail%5D=REDACTED" in message
+    assert "attributes%5Bpivota_click_id%5D=clk_keep" in message and "country=US" in message
+
+
+def test_text_without_a_query_is_left_alone():
+    assert pf._redact_text("why? because") == "why? because"
+    assert pf._redact_text("GET /cart/1:1 200") == "GET /cart/1:1 200"
+
+
+# --- P5: the host guard ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("host,reason", [
+    ("127.1", "host_is_numeric"), ("0x7f.1", "host_is_numeric"), ("10.1", "host_is_numeric"),
+    ("0177.0.0.1", "host_is_numeric"), ("127.0.0.1.", "host_is_ip_literal"),
+    ("localhost.", "host_local"), ("LOCALHOST", "host_local"), ("foo.localhost.", "host_local"),
+    ("foo.localhost", "host_local"), ("[::ffff:127.0.0.1]", "host_is_ip_literal"),
+])
+def test_numeric_hex_and_localhost_hosts_are_refused(host, reason):
+    assert pf._hop_refusal(f"https://{host}/x") == reason
+
+
+@pytest.mark.parametrize("host", ["judydoll.com", "www.robinsons.com.sg", "face.cafe", "1password.com", "123.example.org"])
+def test_real_dns_names_pass_the_host_guard(host):
+    assert pf._hop_refusal(f"https://{host}/x") is None
+
+
+async def test_a_redirect_to_a_numeric_host_is_never_fetched():
+    store = Store({("s.com", "/products.json"): products_json(catalog(cvar())),
+                   ("s.com", f"/cart/{VID}:1"): redirect(302, "https://127.1/latest/meta-data")})
+    result = await run(store, host="s.com", variant_id=VID)
+    assert result.verdict is Verdict.UNCLASSIFIED and result.detail == "permalink:host_is_numeric"
+    assert len(store.requests) == 2
+
+
+# --- P6: more than 100 variants ----------------------------------------------------------------
+
+
+def _big_product(n, available=True):
+    return {"title": "Big", "variants": [{"id": 1000 + i, "title": str(i), "available": available, "price": 1000}
+                                         for i in range(n)]}
+
+
+async def test_a_named_variant_past_the_parse_cap_is_unverified_not_gone():
+    store = Store({("s.com", "/products/big.js"): lambda r: httpx.Response(200, json=_big_product(150))})
+    result = await run(store, host="s.com", variant_id="1120", product_handle="big")
+    assert result.verdict is Verdict.VARIANT_UNVERIFIED and result.detail == "product_js_variants_truncated"
+    assert store.hit("/cart/") == []
+
+
+async def test_a_named_variant_within_a_big_product_is_still_found():
+    store = Store({("s.com", "/products/big.js"): lambda r: httpx.Response(200, json=_big_product(150)),
+                   **cart_to_checkout(host="s.com", vid="1050", body=checkout_body(variant="1050"))})
+    result = await run(store, host="s.com", variant_id="1050", product_handle="big")
+    assert result.verdict is Verdict.ELIGIBLE
+
+
+async def test_a_small_product_without_the_named_variant_is_still_gone():
+    store = Store({("s.com", "/products/big.js"): lambda r: httpx.Response(200, json=_big_product(99))})
+    result = await run(store, host="s.com", variant_id="5555", product_handle="big")
+    assert result.verdict is Verdict.VARIANT_GONE and result.detail == "variant_not_on_product"
+
+
+async def test_a_catalog_product_at_the_variant_cap_makes_absence_unverified():
+    many = {"title": "Many", "variants": [cvar(str(2000 + i)) for i in range(100)]}
+    store = Store({("s.com", "/products.json"): products_json({"products": [many]})})
+    result = await run(store, host="s.com", variant_id=VID)
+    assert result.verdict is Verdict.VARIANT_UNVERIFIED and result.detail == "catalog_variants_possibly_truncated"
+    few = {"title": "Few", "variants": [cvar(str(2000 + i)) for i in range(99)]}
+    store = Store({("s.com", "/products.json"): products_json({"products": [few]})})
+    assert (await run(store, host="s.com", variant_id=VID)).verdict is Verdict.VARIANT_GONE
+
+
+# --- P7: limit/page survive a redirect that drops the query -----------------------------------
+
+
+async def test_limit_and_page_are_re_pinned_after_a_query_dropping_redirect():
+    """r2.py (d): the www host serves 30 per page when `limit` is missing, so a lost query reads
+    page 1 of 30 and "proves" product #50 absent."""
+    products = [{"title": f"P{i}", "variants": [cvar(str(7000 + i))]} for i in range(100)]
+
+    def www(request):
+        n = int(request.url.params.get("page", "1"))
+        size = int(request.url.params.get("limit", "30"))
+        return httpx.Response(200, json={"products": products[(n - 1) * size: n * size]})
+
+    store = Store({("s.com", "/products.json"): redirect(301, "https://www.s.com/products.json"),
+                   ("www.s.com", "/products.json"): www,
+                   **cart_to_checkout(host="s.com", vid="7050", body=checkout_body(variant="7050"))})
+    result = await run(store, host="s.com", variant_id="7050")
+    assert result.verdict is Verdict.ELIGIBLE
+    (www_read,) = [r for r in store.requests if r.url.host == "www.s.com"]
+    assert (www_read.url.params.get("limit"), www_read.url.params.get("page"),
+            www_read.url.params.get("country")) == ("250", "1", "US")
+
+
+# --- P10: smaller gaps ---------------------------------------------------------------------------
+
+
+def test_the_checkout_path_is_anchored():
+    body = checkout_body()
+    assert _classify("https://s.com/pages/checkouts/c/x", body=body)[0] is Verdict.UNCLASSIFIED
+    assert _classify("https://s.com/en/checkouts/cn/x", body=body)[0] is Verdict.UNCLASSIFIED
+    assert _classify("https://s.com/checkouts/c/x", body=body)[0] is Verdict.ELIGIBLE
+    assert _classify("https://s.com/pages/checkouts/x", status=403, body=NOT_ACCEPTING_BODY)[0] \
+        is Verdict.BLOCKED_UNKNOWN
+    assert _classify("https://s.com/checkouts/cn/x", status=403, body=NOT_ACCEPTING_BODY)[0] \
+        is Verdict.NOT_ACCEPTING_ORDERS
+
+
+def test_classic_account_login_is_login_required():
+    good = f"https://s.com/checkouts/cn/{TOKEN}"
+    assert _classify(good, chain=[(302, "https://s.com/cart/1:1"), (200, "https://s.com/account/login")],
+                     body="<form>")[0] is Verdict.LOGIN_REQUIRED
+    assert _classify(good, chain=[(302, "https://s.com/account/login?return_url=x"), (200, good)])[0] \
+        is Verdict.LOGIN_REQUIRED
+    assert _classify(good, chain=[(302, "https://s.com/account"), (200, good)])[0] is Verdict.ELIGIBLE
