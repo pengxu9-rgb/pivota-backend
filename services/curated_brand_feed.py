@@ -1274,6 +1274,32 @@ def _brand_key(value: Optional[str]) -> str:
     return "".join(c for c in str(value or "").casefold() if c.isalnum())
 
 
+# MEASURED RENAMES that retailers still sell under the old and new names. In retailer mode a
+# vendor is written under the operator's --brand only when the two are the SAME brand; exact
+# alphanumeric equality decides that everywhere except here. Containment cannot: it would merge
+# "Purito" with "Purito Seoul" (a rename -- correct) and equally "A'PIEU" with "A'PIEU Plus"
+# (a distinct vendor -- tests/services/test_retailer_adversarial_acceptance.py pins that it is
+# NOT overridden). So each family is listed, with the evidence that it is one brand.
+#
+# Measured 2026-09-18 over every vendor at eyurs.com, ohlolly.com and sokoglam.com: these are
+# the ONLY cross-host spellings that exact equality leaves split. Without an entry, one product
+# sold by two of these retailers gets two brand identities (content_key is built from the
+# brand) and can never converge.
+RETAILER_BRAND_SPELLINGS = {
+    # Manyo Factory renamed to ma:nyo: sokoglam "MANYO FACTORY", ohlolly "ma:nyo", eyurs "manyo".
+    "manyofactory": "manyo",
+    "manyo": "manyo",
+    # Purito renamed to Purito Seoul: eyurs "Purito SEOUL", sokoglam "Purito Seoul", ohlolly "Purito".
+    "puritoseoul": "purito",
+    "purito": "purito",
+}
+
+
+def _retailer_brand_family(key: str) -> Optional[str]:
+    """The listed brand family for an alphanumeric brand key, or None when it is not listed."""
+    return RETAILER_BRAND_SPELLINGS.get(key)
+
+
 def _looks_like_a_brand_name(value: Optional[str]) -> bool:
     """Only explicit supplier-code shapes are codes; short/Unicode names are brands.
 
@@ -1503,10 +1529,14 @@ def shopify_product_to_record(
         if (not _looks_like_a_brand_name(vendor) or not vendor_key
                 or (len(host_label) >= 3 and host_label in vendor_key)):
             raise ValueError(f"{host}: retailer_maker_unproven: vendor {vendor!r} is not maker evidence")
-        # Only exact normalized maker equivalence permits a spelling override.
-        # Brand-direct store/supplier-code heuristics cannot label retailer stock.
+        # Only exact normalized maker equivalence permits a spelling override --
+        # or a MEASURED rename in RETAILER_BRAND_SPELLINGS. Brand-direct store/supplier-code
+        # heuristics cannot label retailer stock.
         override_key = "".join(c for c in str(brand_override or "").casefold() if c.isalnum())
-        brand = brand_override if override_key == vendor_key else vendor
+        same_brand = override_key == vendor_key or (
+            bool(override_key) and _retailer_brand_family(override_key) is not None
+            and _retailer_brand_family(override_key) == _retailer_brand_family(vendor_key))
+        brand = brand_override if same_brand else vendor
     else:
         brand, _brand_reason = resolve_record_brand(product.get("vendor"), brand_override, host)
     brand = str(brand or "").strip()
