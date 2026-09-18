@@ -146,3 +146,48 @@ def test_the_repair_planner_agrees_with_a_fresh_ingest_when_it_knows_the_host():
     # Without the host it stays conservative: no measured shelf applies.
     unknown = plan_category_repair([{**row, "source_domain": None}])
     assert unknown["proposed_changes"] == 0
+
+
+def test_a_title_that_names_no_leaf_still_takes_the_measured_shelf():
+    """The rows the table exists for. Every positive fixture above names its own leaf, so without
+    this case a stricter "the title must name the leaf" rule would pass every test."""
+    assert feed._title_paths("Pyunkang Yul 100") == set()
+    assert resolve("Serums", "Pyunkang Yul 100", "eyurs.com") == ("beauty/skincare/treat/serum", MEASURED)
+
+
+@pytest.mark.parametrize("ptype,title", [
+    ("Moisturizers", "Haruharu WONDER Black Bamboo Nourishing Calming Hand & Nail Cream (50ml)"),
+    ("Moisturizers", "Derma:B Daily Moisture Body Lotion - Hydrating Care for Dry Skin (400ml)"),
+    ("Masks", "Argan Oil Hair Mask"),
+    ("Serums", "Scalp Revitalizing Serum"),
+    ("Serums", "Lash Growth Serum"),
+])
+def test_a_face_care_shelf_does_not_take_a_product_for_another_body_area(ptype, title):
+    """The first two are REAL eyurs products on its "Moisturizers" shelf -- a hand cream and a body
+    lotion that the table would have filed as facial creams."""
+    assert resolve(ptype, title, "eyurs.com") == evidence_only(ptype, title)
+
+
+def test_the_body_area_rule_covers_the_lip_shelf_too():
+    assert resolve("Lip Balms", "Nourishing Lip Balm for Dry Lips", "sokoglam.com")[0] == "beauty/makeup/lip/balm"
+    assert resolve("Lip Balms", "Lip & Body Balm", "sokoglam.com") == evidence_only("Lip Balms", "Lip & Body Balm")
+
+
+def test_the_measured_confidence_is_no_other_writers_value():
+    from scripts.backfill_pdp_category_path import CONFIDENCE_REGEX_BACKFILL
+    from services.pdp_category_classifier import CATEGORY_CONFIDENCE_VARIANT
+    assert MEASURED not in {CONFIDENCE_REGEX_BACKFILL, CATEGORY_CONFIDENCE_VARIANT,
+                            feed.CATEGORY_CONFIDENCE_MERCHANT_TYPE, feed.CATEGORY_CONFIDENCE_EXPLICIT_TITLE,
+                            feed.CATEGORY_CONFIDENCE_FEED_DEFAULT}
+
+
+def test_the_planner_never_lets_a_shelf_challenge_a_stored_leaf():
+    """Review finding: --review-existing-leaves sets the fallback to "beauty", so a shelf could have
+    proposed replacing a stored toner with a cleanser. A shelf fills gaps; it never overrules a leaf."""
+    from scripts.plan_curated_category_repair import plan_category_repair
+    row = {"product_key": "k1", "category_path": "beauty/skincare/tone/toner", "source_domain": "eyurs.com",
+           "title": "Pyunkang Yul Calming Deep Moisture (200ml)", "product_type": "Toner",
+           "category_evidence": {"title": "Pyunkang Yul Calming Deep Moisture (200ml)", "product_type": "Cleansers",
+                                 "source_url": "https://eyurs.com/products/x", "observed_at": "2026-09-18T00:00:00Z"}}
+    plan = plan_category_repair([row], review_existing_leaves=True)
+    assert plan["proposed_changes"] == 0

@@ -1350,8 +1350,9 @@ CATEGORY_CONFIDENCE_EXPLICIT_TITLE = 0.8
 CATEGORY_CONFIDENCE_FEED_DEFAULT = 0.3
 # A leaf taken from a MEASURED (host, merchant product_type) pair. Below a merchant type
 # that names its class directly (0.9): the merchant declared a shelf, the leaf was inferred
-# from reading every product on it. Distinct so a reader can tell the two apart.
-CATEGORY_CONFIDENCE_MEASURED_HOST_TYPE = 0.85
+# from reading every product on it. Distinct from every other writer's value so a stored
+# (label, confidence) pair can be traced to this table.
+CATEGORY_CONFIDENCE_MEASURED_HOST_TYPE = 0.82  # not 0.85: the regex backfill and variant fold write 0.85
 
 # Generic shelves are not assertions of a purchasable product class. In particular,
 # the shared legacy regex maps Lip Care to balm, contradicting the measured lip oil.
@@ -1444,6 +1445,9 @@ _MEASURED_HOST_PRODUCT_TYPES = {
 }
 
 
+_NON_FACE_TITLE = re.compile(r"\b(?:hair|scalp|body|foot|feet|hands?|nails?|lash(?:es)?|brows?|beard)\b", re.I)
+
+
 def _title_paths(title: Optional[str]) -> set:
     from services.pdp_category_classifier import CATEGORY_PATTERNS
     return {path for _label, path, pattern in CATEGORY_PATTERNS if pattern.search(str(title or ""))}
@@ -1462,6 +1466,12 @@ def _measured_host_type_leaf(*, domain: Optional[str], product_type: Optional[st
     # shelf, and the product's own title outranks it. A title naming no leaf does not.
     if named and leaf not in named:
         return None
+    # Every measured shelf is FACE (or lip) care. A title naming another body area is a different
+    # product the patterns cannot see: measured on eyurs' own "Moisturizers" shelf, a "Hand & Nail
+    # Cream" and a "Body Lotion"; a future "Argan Oil Hair Mask" on "Masks" would otherwise become a
+    # facial mask, and a "Lip & Body Balm" is not only a lip balm.
+    if _NON_FACE_TITLE.search(str(title or "")):
+        return None
     return leaf
 
 
@@ -1471,7 +1481,9 @@ def _resolve_category(*, product_type: Optional[str], title: Optional[str], flag
 
     Structural no-regression: anything the evidence policy resolves to a leaf, and every
     deliberate refusal (""), is returned untouched. The measured shelf fills only a coarse
-    FALLBACK, i.e. "no evidence", never "conflicting evidence" and never a caller's leaf.
+    FALLBACK -- which includes the evidence policy's multi-pattern AMBIGUITY return: ohlolly's
+    "Wash Off Mask" matches both the cleanser ("wash") and mask patterns, and the table names
+    it because every product on that shelf was read. It never fills a refusal or a caller's leaf.
     """
     path, confidence = _resolve_category_by_evidence(product_type=product_type, title=title, flag_path=flag_path)
     from services.category_path_aliases import resolve
