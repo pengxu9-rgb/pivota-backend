@@ -547,6 +547,38 @@ async def ensure_required_schema_light() -> None:
                         "WHERE reap_checkout_id IS NOT NULL;"
                     )
                 )
+                # mig 225: the resolver's three hint columns, BYTE-IDENTICAL to
+                # db/migrations/225_reap_agentic_purchase_hints.sql.
+                #
+                # THIS IS THE SHAPE THE COVERAGE GATE ACTUALLY CHECKS. The
+                # CREATE TABLEs above are invisible to
+                # tests/test_schema_guard_migration_coverage.py (it parses
+                # ADD COLUMN only) — an ALTER is not, so this one is gated at PR
+                # time as well as by the rail's own parity test.
+                #
+                # THE CREATE TABLE ABOVE DELIBERATELY DOES NOT CARRY THESE THREE,
+                # and this ALTER is what lands them on EVERY path. That is what
+                # keeps the two builds identical down to ordinal position: the
+                # migration route is `224 CREATE` then `225 ALTER`, and folding
+                # the columns into the CREATE here would make the self-heal's
+                # route `CREATE-with-them` — same column set, different order,
+                # and a needless second place to keep in step. On an empty
+                # database the CREATE runs and this ALTER adds three columns; on
+                # a database already carrying the 224 shape the CREATE is the
+                # no-op and this ALTER is the whole of the heal; on a database
+                # already carrying the 225 shape both are no-ops. All three
+                # arrivals end at one schema, which is what idempotent means
+                # here.
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS reap_agentic_purchases
+                            ADD COLUMN IF NOT EXISTS accept_variant_labels JSONB,
+                            ADD COLUMN IF NOT EXISTS also_accept_domains JSONB,
+                            ADD COLUMN IF NOT EXISTS market_country TEXT;
+                        """
+                    )
+                )
             except Exception:  # noqa: BLE001
                 # Best-effort like every sibling, and it must not starve what
                 # follows. The rail itself is loud if this silently fails: every
@@ -2637,6 +2669,46 @@ async def ensure_required_schema_light() -> None:
                         "WHERE reap_checkout_id IS NOT NULL;"
                     )
                 )
+                # mig 225: the resolver's three hint columns, SQLite twin.
+                #
+                # ONE ALTER PER COLUMN, EACH IN ITS OWN try — and neither of
+                # those is house style copied for its own sake, they are what
+                # SQLite forces:
+                #
+                #   * SQLite's ALTER TABLE has NO `IF NOT EXISTS` for ADD COLUMN
+                #     and NO multi-clause ADD, so the Postgres statement cannot
+                #     be reused verbatim. A duplicate column raises
+                #     OperationalError("duplicate column name: …"), which is the
+                #     no-op this branch has to spell with an except.
+                #   * A shared try would make the FIRST already-present column
+                #     abandon the two after it. On the second run of the
+                #     self-heal — or on a dev database built before this
+                #     migration where one column somehow landed and the others
+                #     did not — that leaves the table permanently short. Per
+                #     column, every run converges.
+                #
+                # JSONB IS NOT A SQLITE TYPE NAME: declaring it would give the
+                # column NUMERIC affinity and silently store 0 for a JSON
+                # payload, which is the same trap as `CAST(:x AS JSONB)` — see
+                # property 3 in db/reap_agentic_ledger.py's header. TEXT, like
+                # the queries_tried / shipping_address twins above.
+                for _hint_column, _hint_type in (
+                    ("accept_variant_labels", "TEXT"),
+                    ("also_accept_domains", "TEXT"),
+                    ("market_country", "TEXT"),
+                ):
+                    try:
+                        await database.execute(
+                            text(
+                                f"ALTER TABLE reap_agentic_purchases "
+                                f"ADD COLUMN {_hint_column} {_hint_type};"
+                            )
+                        )
+                    except Exception:  # noqa: BLE001
+                        # Almost always "duplicate column name" — the column is
+                        # already there and this run had nothing to do. Continue
+                        # so the remaining columns still get their chance.
+                        continue
             except Exception:  # noqa: BLE001
                 pass
             # Self-heal EVERY table in REQUIRED_SCHEMA, not a hardcoded subset:

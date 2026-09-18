@@ -57,7 +57,19 @@ pytestmark = pytest.mark.skipif(
     ),
 )
 
-_MIGRATION = Path(__file__).resolve().parent.parent / "db/migrations/224_reap_agentic_ledger.sql"
+_MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "db/migrations"
+
+# EVERY migration this rail owns, IN ORDER — not just the one that created the tables. 225 is an
+# ALTER, so a fixture that applied only 224 would build the pre-225 schema and then compare it
+# against a self-heal that does carry the hint columns: the catalog-parity test would fail for
+# the wrong reason, and every hint round-trip below would fail on an UndefinedColumn. The list is
+# explicit rather than a glob so that the next migration on some OTHER table cannot silently
+# join this gate's fixture.
+_MIGRATIONS = (
+    _MIGRATIONS_DIR / "224_reap_agentic_ledger.sql",
+    _MIGRATIONS_DIR / "225_reap_agentic_purchase_hints.sql",
+)
+_MIGRATION = _MIGRATIONS[0]
 
 # Same convention as tests/test_agent_issued_cards_postgres.py: this gate DROPS its tables, so it
 # must be INCAPABLE of running anywhere but a throwaway — made true, not merely stated.
@@ -104,8 +116,9 @@ async def _apply_migration():
     from db.database import database
     from db.sql_migrations import split_statements
 
-    for statement in split_statements(_MIGRATION.read_text(encoding="utf-8")):
-        await database.execute(statement)
+    for path in _MIGRATIONS:
+        for statement in split_statements(path.read_text(encoding="utf-8")):
+            await database.execute(statement)
 
 
 async def _drop_tables():
@@ -2098,3 +2111,735 @@ async def test_the_repo_prepare_sweep_can_see_this_module():
         "these database.* call sites hand SQL the repo's PREPARE sweep cannot follow, so the "
         "statements would ship unplanned:\n  " + "\n  ".join(unresolvable)
     )
+
+
+# ═════════════════════════════════════════════════════════════════════════════════════════════
+# WP2c — migration 225, on REAL Postgres
+# ═════════════════════════════════════════════════════════════════════════════════════════════
+#
+# WHAT ONLY THIS ARM CAN PROVE, on top of the row-level semantics the SQLite file covers:
+#
+#   * the hint columns really are `jsonb` in the shipped schema, and the driver hands their
+#     contents back as TEXT (property 2) — so the module's decode is doing real work here and
+#     deleting it produces a resolver iterating the characters of a JSON string;
+#   * the SELF-HEAL builds the same schema as the migration THROUGH THE CATALOG, now including
+#     the three mig-225 columns, on a database built the way production builds it;
+#   * the self-heal's ALTER lands on a database that already carries the 224 shape — the state
+#     every environment that deployed 224 is actually in, and the one an empty-database test
+#     cannot distinguish from the ALTER being deleted;
+#   * every new SQL constant PREPAREs. `_SELECT_ENROLLMENT_BY_REAP_ID_SQL` in particular binds a
+#     parameter used only in one comparison, which is exactly the shape that has produced
+#     AmbiguousParameter on this rail before.
+
+
+_HINT_COLUMNS = ("accept_variant_labels", "also_accept_domains", "market_country")
+
+
+async def _purchase_columns() -> set:
+    from db.database import database
+
+    rows = await database.fetch_all(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_schema = 'public' AND table_name = 'reap_agentic_purchases'"
+    )
+    return {r["column_name"] for r in rows}
+
+
+async def _apply_224_only():
+    """Build the table EXACTLY as migration 224 left it — the shape every environment that
+    deployed 224 is running — by applying that one file and nothing after it."""
+    from db.database import database
+    from db.sql_migrations import split_statements
+
+    await _drop_tables()
+    for statement in split_statements(
+        (_MIGRATIONS_DIR / "224_reap_agentic_ledger.sql").read_text(encoding="utf-8")
+    ):
+        await database.execute(statement)
+    assert database  # the fixture's connection is what ran those
+
+
+# ── 225.1 the hint columns, through the driver ───────────────────────────────────────────────
+
+
+async def test_the_hint_columns_really_are_jsonb_and_text_in_the_shipped_schema():
+    from db.database import database
+
+    rows = await database.fetch_all(
+        """
+        SELECT column_name, data_type FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'reap_agentic_purchases'
+           AND column_name IN ('accept_variant_labels', 'also_accept_domains', 'market_country')
+        """
+    )
+    types = {r["column_name"]: r["data_type"] for r in rows}
+    assert types == {
+        "accept_variant_labels": "jsonb",
+        "also_accept_domains": "jsonb",
+        "market_country": "text",
+    }, types
+
+
+async def test_the_hints_come_back_as_text_from_the_driver_and_as_lists_from_the_module():
+    """THE DECODE, WITH A CONTROL, on the engine that actually has the problem. Asserting only
+    that the read is a list would pass on a driver that never had it; asserting only that the raw
+    value is a str would pass with the decode deleted. Both halves, so dropping these columns from
+    `_JSON_COLUMNS` dies here."""
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _mk(
+        accept_variant_labels=["Nude Glow", "nude-glow"],
+        also_accept_domains=["shop.brand.example"],
+        market_country="US",
+    )
+    raw = await database.fetch_val(
+        "SELECT accept_variant_labels FROM reap_agentic_purchases WHERE id = :i",
+        {"i": purchase["id"]},
+    )
+    assert isinstance(raw, str), (
+        "a raw-SQL jsonb column is expected to arrive as text on asyncpg — if that stops being "
+        "true the module's decode needs re-checking, not deleting"
+    )
+
+    for row in (purchase, await ledger.get_purchase_internal(purchase["id"])):
+        assert isinstance(row["accept_variant_labels"], list), (
+            "the raw JSON string reached the caller; a resolver iterating it would iterate its "
+            "CHARACTERS and accept nothing"
+        )
+        assert row["accept_variant_labels"] == ["Nude Glow", "nude-glow"]
+        assert row["also_accept_domains"] == ["shop.brand.example"]
+        assert row["market_country"] == "US"
+
+
+async def test_hints_default_to_null_on_postgres():
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _mk()
+    read = await ledger.get_purchase_internal(purchase["id"])
+    for name in _HINT_COLUMNS:
+        assert read[name] is None
+        assert await database.fetch_val(
+            f"SELECT {name} FROM reap_agentic_purchases WHERE id = :i", {"i": purchase["id"]}
+        ) is None
+
+
+@pytest.mark.parametrize("empty", [[], ()])
+async def test_an_empty_hint_list_is_null_on_postgres(empty):
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _mk(accept_variant_labels=empty, also_accept_domains=empty)
+    read = await ledger.get_purchase_internal(purchase["id"])
+    assert read["accept_variant_labels"] is None
+    assert read["also_accept_domains"] is None
+
+
+async def test_the_stored_hints_are_queryable_as_jsonb_not_as_a_string():
+    """A jsonb column that had silently become text would still round-trip through the module's
+    own encode/decode. This asks the DATABASE to read the value as JSON, which text cannot do."""
+    from db.database import database
+
+    purchase = await _mk(accept_variant_labels=["Nude Glow", "nude-glow"])
+    count = await database.fetch_val(
+        "SELECT jsonb_array_length(accept_variant_labels) FROM reap_agentic_purchases "
+        "WHERE id = :i",
+        {"i": purchase["id"]},
+    )
+    assert count == 2
+
+
+async def test_domains_are_lowercased_on_postgres():
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _mk(
+        accept_variant_labels=["Nude Glow"], also_accept_domains=["Shop.BRAND.example"]
+    )
+    read = await ledger.get_purchase_internal(purchase["id"])
+    assert read["also_accept_domains"] == ["shop.brand.example"]
+    assert read["accept_variant_labels"] == ["Nude Glow"], "labels keep their case"
+
+
+async def test_the_hints_survive_a_terminal_transition_on_postgres():
+    """NOT PII: these name products and hostnames, not the buyer, so the terminal statement leaves
+    them alone while it nulls shipping_address and buyer_email."""
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _mk(
+        accept_variant_labels=["Nude Glow"],
+        also_accept_domains=["brand.example"],
+        market_country="US",
+    )
+    await ledger.transition(purchase["id"], from_states=["resolving"], to_state="refused")
+    done = await ledger.get_purchase_internal(purchase["id"])
+    assert done["buyer_email"] is None and done["shipping_address"] is None
+    assert done["accept_variant_labels"] == ["Nude Glow"]
+    assert done["also_accept_domains"] == ["brand.example"]
+    assert done["market_country"] == "US"
+
+
+async def test_hints_cannot_be_revised_by_a_transition_on_postgres():
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _mk(accept_variant_labels=["Nude Glow"])
+    for field in _HINT_COLUMNS:
+        assert field not in ledger._TRANSITION_FIELDS
+        with pytest.raises(TypeError):
+            await ledger.transition(
+                purchase["id"], from_states=["resolving"], to_state="quoting", **{field: ["x"]}
+            )
+
+
+# ── 225.2 validation, Postgres twins ─────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["not-a-list", b"bytes", 123, {"a": 1}, [""], ["   "], [None], [123], ["x"] * 33,
+     ["x" * 129]],
+)
+async def test_create_refuses_a_bad_accept_variant_labels_on_postgres(bad):
+    with pytest.raises(ValueError):
+        await _mk(accept_variant_labels=bad)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["brand.example", ["https://brand.example"], ["brand.example/path"], ["brand.example:443"],
+     ["localhost"], ["brand..example"], ["-brand.example"], ["bra nd.example"], ["brand.123"],
+     [""], ["x" * 250 + ".example"], ["a.example"] * 33],
+)
+async def test_create_refuses_a_bad_also_accept_domains_on_postgres(bad):
+    with pytest.raises(ValueError):
+        await _mk(also_accept_domains=bad)
+
+
+@pytest.mark.parametrize("bad", ["us", "USA", "U", "", "  ", "U5", 12, b"US", "Us", "US\n"])
+async def test_create_refuses_a_bad_market_country_on_postgres(bad):
+    with pytest.raises(ValueError):
+        await _mk(market_country=bad)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"accept_variant_labels": ["", "ok"]},
+        {"also_accept_domains": ["https://brand.example"]},
+        {"market_country": "us"},
+    ],
+)
+async def test_a_refused_hint_leaves_no_row_behind_on_postgres(kwargs):
+    """REFUSED BEFORE THE INSERT. A row created and then rejected would hold the buyer's address
+    and email in 'resolving' with nothing scheduled to terminate it — the PII deadline only
+    starts once the row exists."""
+    from db.database import database
+
+    before = await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases")
+    with pytest.raises(ValueError):
+        await _mk(**kwargs)
+    after = await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases")
+    assert after == before, "a refused hint still wrote a purchase row"
+
+
+@pytest.mark.parametrize(
+    "good", ["brand.example", "shop.brand.example", "a-b.co.uk", "xn--80ak6aa92e.com"]
+)
+async def test_the_domain_shape_accepts_real_hostnames_on_postgres(good):
+    """CONTROL: a validator that refused everything would pass every refusal test above."""
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _mk(also_accept_domains=[good])
+    read = await ledger.get_purchase_internal(purchase["id"])
+    assert read["also_accept_domains"] == [good]
+
+
+# ── 225.3 release_claim records WHY, on Postgres ─────────────────────────────────────────────
+
+
+async def _claimed(**over):
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _mk(**over)
+    claimed = await ledger.claim_due_purchases("worker_a", limit=5)
+    assert [r["id"] for r in claimed] == [purchase["id"]], "precondition: the row was claimable"
+    return purchase
+
+
+async def test_release_records_the_error_code_on_postgres():
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _claimed()
+    released = await ledger.release_claim(
+        purchase["id"], "worker_a", last_error_code="transport_error:readtimeout"
+    )
+    assert released is not None
+    assert released["last_error_code"] == "transport_error:readtimeout"
+    read = await ledger.get_purchase_internal(purchase["id"])
+    assert read["last_error_code"] == "transport_error:readtimeout"
+    assert read["claimed_by"] is None
+
+
+async def test_the_release_error_code_projects_through_the_allowlist_only_on_postgres():
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _claimed()
+    await ledger.release_claim(purchase["id"], "worker_a", last_error_code="quote_expired")
+    row = await ledger.get_purchase_internal(purchase["id"])
+    view = ledger.public_purchase_view(row)
+    assert set(view) == _EXPECTED_PUBLIC_COLUMNS
+    for name in _HINT_COLUMNS:
+        assert name not in view
+
+
+async def test_release_without_a_code_keeps_the_previous_one_on_postgres():
+    """COALESCE, not a bare assignment — the poller releases on every ordinary poll, so a bare
+    assignment would erase the reason on the next uneventful tick."""
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _claimed()
+    await ledger.release_claim(purchase["id"], "worker_a", last_error_code="quote_expired")
+    await ledger.claim_due_purchases("worker_a", limit=5)
+    await ledger.release_claim(purchase["id"], "worker_a")
+    read = await ledger.get_purchase_internal(purchase["id"])
+    assert read["last_error_code"] == "quote_expired"
+
+
+async def test_release_with_an_error_code_does_not_touch_state_entered_at_on_postgres():
+    """THE MUTANT: adding `state_entered_at = clock_timestamp()` to the release statements, which
+    looks like a consistency tidy-up and makes the PII deadline resettable by the poll loop."""
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _claimed(state="resolving")
+    await _set_clock_column(
+        purchase["id"], "state_entered_at", "CURRENT_TIMESTAMP - INTERVAL '99999 seconds'"
+    )
+    before = (await ledger.get_purchase_internal(purchase["id"]))["state_entered_at"]
+
+    await ledger.release_claim(
+        purchase["id"], "worker_a", last_error_code="transport_error:readtimeout"
+    )
+
+    after = await ledger.get_purchase_internal(purchase["id"])
+    assert after["state_entered_at"] == before, (
+        "release moved state_entered_at — the PII deadline is now resettable by the poll loop"
+    )
+    assert after["updated_at"] >= before, "release must still bump updated_at"
+
+
+async def test_a_release_that_records_a_code_still_lets_the_absolute_expiry_fire_on_postgres():
+    """The behavioural half, through the sweep that matters. If the release stamped
+    `state_entered_at`, this row would be young again and survive with its PII."""
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _claimed(state="needs_enrollment")
+    await _set_clock_column(
+        purchase["id"], "state_entered_at", "CURRENT_TIMESTAMP - INTERVAL '99999 seconds'"
+    )
+    await ledger.release_claim(purchase["id"], "worker_a", last_error_code="enrollment_pending")
+
+    moved = await ledger.expire_overdue_purchases(max_age_seconds=60)
+    assert purchase["id"] in moved, (
+        "the abandoned row survived its absolute deadline — release reset the clock"
+    )
+    expired = await ledger.get_purchase_internal(purchase["id"])
+    assert expired["buyer_email"] is None and expired["shipping_address"] is None
+
+
+async def test_the_release_statements_do_not_write_state_entered_at():
+    """The shape assertion behind the two tests above, on both dialect twins, so the mutant is
+    refused by a test that NAMES it."""
+    import db.reap_agentic_ledger as ledger
+
+    for name in ("_RELEASE_CLAIM_SQL", "_RELEASE_CLAIM_SQL_SQLITE"):
+        sql = getattr(ledger, name)
+        assert "state_entered_at" not in sql, f"{name} writes state_entered_at"
+        assert "last_error_code = COALESCE(:last_error_code, last_error_code)" in sql
+        assert "updated_at =" in sql
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["TRANSPORT_ERROR", "transport error", "transport/error", "x" * 65, "", "   ",
+     b"transport_error", 123, ["transport_error"], "transport_error\n"],
+)
+async def test_release_refuses_a_malformed_error_code_on_postgres(bad):
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _claimed()
+    with pytest.raises(ValueError):
+        await ledger.release_claim(purchase["id"], "worker_a", last_error_code=bad)
+
+
+async def test_a_refused_error_code_releases_nothing_on_postgres():
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _claimed()
+    with pytest.raises(ValueError):
+        await ledger.release_claim(purchase["id"], "worker_a", last_error_code="NOT VALID")
+    still = await ledger.get_purchase_internal(purchase["id"])
+    assert still["claimed_by"] == "worker_a"
+    assert still["last_error_code"] is None
+
+
+@pytest.mark.parametrize(
+    "good", ["transport_error:readtimeout", "quote_expired", "a", "x" * 64, "err.4xx"]
+)
+async def test_the_error_code_shape_accepts_the_rails_vocabulary_on_postgres(good):
+    """CONTROL for the refusals above."""
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _claimed()
+    released = await ledger.release_claim(purchase["id"], "worker_a", last_error_code=good)
+    assert released["last_error_code"] == good
+
+
+async def test_release_by_the_wrong_worker_records_nothing_on_postgres():
+    """The error-code write inherits the release's fence, across the SAME statement — a worker
+    that has already lost the lease cannot stamp a reason onto somebody else's step."""
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _claimed()
+    assert await ledger.release_claim(
+        purchase["id"], "worker_b", last_error_code="not_my_step"
+    ) is None
+    read = await ledger.get_purchase_internal(purchase["id"])
+    assert read["last_error_code"] is None
+    assert read["claimed_by"] == "worker_a"
+
+
+async def test_a_second_connection_that_stole_the_lease_beats_our_release_on_postgres():
+    """The fence across TWO BACKEND CONNECTIONS, which is the only place it really means
+    anything: the SQLite arm serialises everything onto one connection. Worker A's lease ages
+    out and is requeued, worker B claims the row — A's release, error code and all, must write
+    NOTHING."""
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _claimed()
+    await _age_claim(purchase["id"], 99999)
+    assert await ledger.requeue_stale_claims(lease_seconds=300, limit=10) == 1
+
+    conn = await _raw_connection()
+    try:
+        row = await _run_on(
+            conn,
+            ledger._CLAIM_PURCHASE_SQL,
+            {"id": purchase["id"], "worker_id": "worker_b"},
+        )
+        assert row is not None, "precondition: the other connection took the lease"
+    finally:
+        await conn.close()
+
+    assert await ledger.release_claim(
+        purchase["id"], "worker_a", last_error_code="stale_worker"
+    ) is None
+    read = await ledger.get_purchase_internal(purchase["id"])
+    assert read["claimed_by"] == "worker_b"
+    assert read["last_error_code"] is None
+
+
+async def test_release_claim_has_no_attempts_delta_on_postgres():
+    import inspect
+
+    import db.reap_agentic_ledger as ledger
+
+    params = inspect.signature(ledger.release_claim).parameters
+    assert "attempts_delta" not in params
+    assert set(params) == {"purchase_id", "worker_id", "next_poll_at", "last_error_code"}
+
+    purchase = await _claimed()
+    before = (await ledger.get_purchase_internal(purchase["id"]))["attempts"]
+    await ledger.release_claim(purchase["id"], "worker_a", last_error_code="quote_expired")
+    assert (await ledger.get_purchase_internal(purchase["id"]))["attempts"] == before
+
+
+# ── 225.4 the two enrollment reads, on Postgres ──────────────────────────────────────────────
+
+
+_ENROLLMENT_PROJECTION = {
+    "id", "buyer_ref", "reap_enrollment_id", "status", "hosted_url", "hosted_url_expires_at",
+    "card_network", "card_last4",
+}
+_ENROLLMENT_NEVER_PROJECTED = {"agent_id", "reap_status", "created_at", "updated_at"}
+
+
+async def test_get_enrollment_internal_reads_a_pending_row_on_postgres():
+    import db.reap_agentic_ledger as ledger
+
+    created = await ledger.upsert_pending_enrollment(
+        buyer_ref="bref_alice", reap_enrollment_id="enr_1", hosted_url="https://hosted.example/a"
+    )
+    read = await ledger.get_enrollment_internal(created["id"])
+    assert read is not None
+    assert read["id"] == created["id"]
+    assert read["status"] == "pending"
+    assert read["reap_enrollment_id"] == "enr_1"
+
+
+async def test_get_enrollment_internal_writes_nothing_on_postgres():
+    """The whole reason it exists: the workaround it replaces is `upsert_pending_enrollment`, a
+    WRITE, which bumps `updated_at` and can mint a stray pending row."""
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+
+    created = await ledger.upsert_pending_enrollment(buyer_ref="bref_alice")
+    before = await database.fetch_all(
+        "SELECT id, updated_at FROM reap_agentic_enrollments ORDER BY id"
+    )
+    await ledger.get_enrollment_internal(created["id"])
+    await ledger.get_enrollment_internal("re_missing")
+    after = await database.fetch_all(
+        "SELECT id, updated_at FROM reap_agentic_enrollments ORDER BY id"
+    )
+    assert [dict(r) for r in after] == [dict(r) for r in before]
+
+
+@pytest.mark.parametrize("status", ["pending", "active", "dead"])
+async def test_get_enrollment_internal_reads_every_status_on_postgres(status):
+    import db.reap_agentic_ledger as ledger
+
+    created = await ledger.upsert_pending_enrollment(buyer_ref=f"bref_{status}")
+    if status == "active":
+        await ledger.mark_enrollment_active(created["id"], card_network="visa", card_last4="4242")
+    elif status == "dead":
+        await ledger.mark_enrollment_dead(created["id"])
+    read = await ledger.get_enrollment_internal(created["id"])
+    assert read["status"] == status
+
+
+async def test_the_enrollment_reads_carry_exactly_the_projection_on_postgres():
+    """An EQUALITY against a literal written in this file — `>=` would pass a projection that
+    quietly grew `agent_id` or the partner's raw `reap_status`."""
+    import db.reap_agentic_ledger as ledger
+
+    created = await ledger.upsert_pending_enrollment(
+        buyer_ref="bref_alice",
+        agent_id="agent_one",
+        reap_enrollment_id="enr_p",
+        reap_status="upstream_words",
+    )
+    for row in (
+        await ledger.get_enrollment_internal(created["id"]),
+        await ledger.get_enrollment_by_reap_id("enr_p"),
+    ):
+        assert set(row) == _ENROLLMENT_PROJECTION, (
+            f"unexpected: {sorted(set(row) - _ENROLLMENT_PROJECTION)}; "
+            f"missing: {sorted(_ENROLLMENT_PROJECTION - set(row))}"
+        )
+        assert not (set(row) & _ENROLLMENT_NEVER_PROJECTED)
+
+
+async def test_get_enrollment_by_reap_id_finds_the_row_on_postgres():
+    import db.reap_agentic_ledger as ledger
+
+    created = await ledger.upsert_pending_enrollment(
+        buyer_ref="bref_alice", reap_enrollment_id="enr_webhook"
+    )
+    read = await ledger.get_enrollment_by_reap_id("enr_webhook")
+    assert read is not None and read["id"] == created["id"]
+
+
+async def test_get_enrollment_by_reap_id_does_not_wildcard_on_none_on_postgres():
+    """EVERY pending row has a NULL `reap_enrollment_id`, and on Postgres `NULL = NULL` is NULL
+    rather than false — which is what makes this a no-match instead of an arbitrary buyer's
+    enrollment handed to a webhook receiver."""
+    import db.reap_agentic_ledger as ledger
+
+    await ledger.upsert_pending_enrollment(buyer_ref="bref_one")
+    await ledger.upsert_pending_enrollment(buyer_ref="bref_two")
+    assert await ledger.get_enrollment_by_reap_id(None) is None
+    assert await ledger.get_enrollment_by_reap_id("") is None
+    assert await ledger.get_enrollment_by_reap_id("enr_unknown") is None
+
+
+async def test_get_enrollment_by_reap_id_uses_the_unique_index_on_postgres():
+    """At most one row can match, and the reason is an INDEX rather than a LIMIT: the statement
+    has neither an ORDER BY nor a LIMIT, so a database that lost
+    uq_reap_agentic_enrollments_reap_id would be visible rather than papered over."""
+    import asyncpg
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+
+    await ledger.upsert_pending_enrollment(buyer_ref="bref_a", reap_enrollment_id="enr_u")
+    with pytest.raises(asyncpg.exceptions.UniqueViolationError):
+        await database.execute(
+            "INSERT INTO reap_agentic_enrollments (id, buyer_ref, status, reap_enrollment_id) "
+            "VALUES ('re_dup', 'bref_b', 'pending', 'enr_u')"
+        )
+    sql = ledger._SELECT_ENROLLMENT_BY_REAP_ID_SQL
+    assert "LIMIT" not in sql.upper() and "ORDER BY" not in sql.upper()
+
+
+async def test_get_enrollment_by_reap_id_survives_the_row_going_dead_on_postgres():
+    import db.reap_agentic_ledger as ledger
+
+    created = await ledger.upsert_pending_enrollment(
+        buyer_ref="bref_alice", reap_enrollment_id="enr_dead"
+    )
+    await ledger.mark_enrollment_dead(created["id"])
+    read = await ledger.get_enrollment_by_reap_id("enr_dead")
+    assert read is not None and read["status"] == "dead"
+
+
+# ── 225.5 the self-heal, through the catalog ─────────────────────────────────────────────────
+
+
+async def test_the_parity_fingerprint_actually_covers_the_new_columns():
+    """GUARD THE GUARD. `test_the_self_heal_builds_the_same_schema_as_the_migration` compares two
+    fingerprints — and it would compare two fingerprints that BOTH omitted these columns just as
+    happily. This asserts the columns are IN the thing being compared, so the parity test's pass
+    is evidence about them rather than about their absence."""
+    columns, _indexes, _checks = await _schema_fingerprint()
+    named = {row[1] for row in columns if row[0] == "reap_agentic_purchases"}
+    assert set(_HINT_COLUMNS) <= named, (
+        f"the fingerprint does not mention {sorted(set(_HINT_COLUMNS) - named)} — the parity "
+        "test cannot be proving anything about them"
+    )
+
+
+async def test_the_self_heal_builds_the_hint_columns_identically_to_the_migration():
+    """The mig-225 slice of the catalog parity test, stated so a failure NAMES these columns
+    rather than arriving as one line in a whole-table diff. THE MUTANT THIS KILLS: deleting the
+    mig-225 ALTER from ONE schema_guard branch. On this dialect that is the Postgres branch, and
+    the columns then exist in the migration build and not in the self-heal build."""
+    from db.schema_guard import ensure_required_schema_light
+
+    columns_m, _i, _c = await _schema_fingerprint()
+    from_migration = {r[1]: r for r in columns_m if r[0] == "reap_agentic_purchases"}
+    assert set(_HINT_COLUMNS) <= set(from_migration), "precondition: 225 is in the fixture"
+
+    await _drop_tables()
+    await ensure_required_schema_light()
+    columns_s, _i, _c = await _schema_fingerprint()
+    from_self_heal = {r[1]: r for r in columns_s if r[0] == "reap_agentic_purchases"}
+
+    missing = set(_HINT_COLUMNS) - set(from_self_heal)
+    assert not missing, (
+        f"the self-heal did not build {sorted(missing)} — production, which never runs "
+        "db/migrations, would not have them at all"
+    )
+    for name in _HINT_COLUMNS:
+        assert from_self_heal[name] == from_migration[name], (
+            f"{name} is built differently by the self-heal:\n"
+            f"  migration: {from_migration[name]}\n  self-heal: {from_self_heal[name]}"
+        )
+
+
+async def test_the_self_heal_adds_the_hint_columns_to_a_224_shaped_database():
+    """PATH TWO, AND THE ONE THAT MATTERS IN PRODUCTION. Every environment that deployed
+    migration 224 already HAS this table, so `CREATE TABLE IF NOT EXISTS` is a no-op there and
+    the ALTER is the whole of the heal. A test that only covered an empty database would pass
+    with the ALTER deleted entirely."""
+    from db.schema_guard import ensure_required_schema_light
+    import db.reap_agentic_ledger as ledger
+
+    await _apply_224_only()
+    before = await _purchase_columns()
+    assert not (set(_HINT_COLUMNS) & before), "precondition: this is the 224 shape"
+
+    await ensure_required_schema_light()
+
+    after = await _purchase_columns()
+    assert after - before == set(_HINT_COLUMNS), (
+        f"the heal on a 224-shaped database added {sorted(after - before)}"
+    )
+    purchase = await _mk(accept_variant_labels=["Nude Glow"], market_country="US")
+    read = await ledger.get_purchase_internal(purchase["id"])
+    assert read["accept_variant_labels"] == ["Nude Glow"] and read["market_country"] == "US"
+
+
+async def test_healing_a_224_shaped_database_reaches_the_migrations_own_column_types():
+    """Not just "the columns exist" — the same TYPES. A heal that landed `accept_variant_labels`
+    as text would round-trip through the module's own encode/decode and be invisible until
+    somebody wrote a jsonb query against it."""
+    from db.schema_guard import ensure_required_schema_light
+
+    from_migration = {
+        r[1]: r for r in (await _schema_fingerprint())[0] if r[0] == "reap_agentic_purchases"
+    }
+    await _apply_224_only()
+    await ensure_required_schema_light()
+    healed = {
+        r[1]: r for r in (await _schema_fingerprint())[0] if r[0] == "reap_agentic_purchases"
+    }
+    for name in _HINT_COLUMNS:
+        assert healed[name] == from_migration[name], (
+            f"{name} healed onto a 224-shaped database differently from the migration:\n"
+            f"  migration: {from_migration[name]}\n  healed:    {healed[name]}"
+        )
+
+
+async def test_the_hint_self_heal_is_idempotent_on_a_224_shaped_database():
+    """It runs on EVERY startup. A second run must add nothing and must not raise — a raise here
+    takes the whole best-effort block with it, including the self-heals that follow."""
+    from db.database import database
+    from db.schema_guard import ensure_required_schema_light
+
+    await _apply_224_only()
+    await ensure_required_schema_light()
+    once = await _schema_fingerprint()
+
+    await ensure_required_schema_light()
+    await ensure_required_schema_light()
+
+    assert await _schema_fingerprint() == once, "a later run changed the schema"
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+
+
+async def test_the_migration_and_the_postgres_self_heal_are_byte_identical_on_the_alter():
+    """The migration's ALTER and the Postgres branch's ALTER must be the SAME STATEMENT, because
+    the two build the same production schema by two routes and only one of them ever runs in
+    prod. Compared on normalised whitespace: formatting differs, nothing the database acts on
+    may."""
+    root = Path(__file__).resolve().parent.parent
+    migration = (
+        root / "db/migrations/225_reap_agentic_purchase_hints.sql"
+    ).read_text(encoding="utf-8")
+    guard = (root / "db/schema_guard.py").read_text(encoding="utf-8")
+
+    def _alter(text: str) -> str:
+        start = text.index("ALTER TABLE IF EXISTS reap_agentic_purchases")
+        return " ".join(text[start: text.index(";", start) + 1].split())
+
+    assert _alter(migration) == _alter(guard), (
+        "the mig-225 ALTER in db/schema_guard.py is not the one in the migration:\n"
+        f"  migration:   {_alter(migration)}\n  schema_guard: {_alter(guard)}"
+    )
+
+
+async def test_the_new_columns_are_partitioned_between_public_and_never_public():
+    """GUARD THE GUARD, the Postgres twin of the SQLite partition test: a column that is in
+    neither list is a decision nobody made. The never-public set is written out here rather than
+    imported, so a shrinking definition of private cannot satisfy it."""
+    never_public = {
+        "buyer_ref", "agent_id", "agent_user_ref_hash", "buyer_email", "shipping_address",
+        "enrollment_id", "click_id", "return_url", "reap_product_id", "reap_variant_id",
+        "reap_quote_id", "reap_checkout_id", "queries_tried", "attempts", "next_poll_at",
+        "claimed_by", "claimed_at", "state_entered_at",
+        "accept_variant_labels", "also_accept_domains", "market_country",
+    }
+    columns = await _purchase_columns()
+    unclassified = columns - _EXPECTED_PUBLIC_COLUMNS - never_public
+    assert not unclassified, (
+        f"these columns are in neither list: {sorted(unclassified)} — decide which, here AND in "
+        "db/reap_agentic_ledger.PUBLIC_PURCHASE_COLUMNS"
+    )
+    assert not (_EXPECTED_PUBLIC_COLUMNS & never_public), "the two lists overlap"
+
+
+async def test_the_new_sql_constants_are_module_level_and_prepare():
+    """`test_every_postgres_sql_constant_in_the_module_prepares` sweeps whatever it FINDS, so it
+    would stay green if these statements had been built at call time and were therefore invisible
+    to it — the #1588 blind spot. This names them."""
+    constants = _module_sql_constants()
+    for name in ("_SELECT_ENROLLMENT_BY_ID_SQL", "_SELECT_ENROLLMENT_BY_REAP_ID_SQL"):
+        assert name in constants, f"{name} is not a module-level SQL constant"
+
+    conn = await _raw_connection()
+    try:
+        for name in sorted(constants):
+            if name.endswith("_SQLITE"):
+                continue
+            positional, _order = _to_positional(constants[name])
+            await conn.prepare(positional)
+    finally:
+        await conn.close()
