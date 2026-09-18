@@ -772,6 +772,44 @@ async def ensure_required_schema_light() -> None:
                 )
             except Exception:  # noqa: BLE001
                 pass
+            # mig 226: the purchase's ITEM SOURCE — 'reap_variant' (every row
+            # before this) or 'cart_link' (a Shopify cart permalink Reap quotes
+            # as received), plus the URL a cart_link row carries.
+            #
+            # THIS DDL MUST BUILD THE SAME SCHEMA AS
+            # db/migrations/226_reap_agentic_purchase_item_source.sql, CHECKs
+            # included — they carry the pairing rule (a cart_link row has a URL,
+            # a reap_variant row has none). Enforced through the catalog by
+            # tests/test_reap_agentic_cart_link_postgres.py and by the whole-
+            # table parity test in tests/test_reap_agentic_ledger_postgres.py.
+            #
+            # ITS OWN try/except, for the reason the mig-225 block above gives
+            # at length: a raise in a sibling must not starve these columns, and
+            # a raise here must not starve the heals that follow. The column
+            # constraints ride on `ADD COLUMN IF NOT EXISTS`, so a second run
+            # skips them with their columns rather than adding a duplicate.
+            #
+            # NOT folded into the CREATE TABLE above, same as mig 225: this is
+            # what lands the columns on EVERY path, in migration order.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS reap_agentic_purchases
+                            ADD COLUMN IF NOT EXISTS item_source TEXT NOT NULL DEFAULT 'reap_variant'
+                                CONSTRAINT ck_reap_agentic_purchases_item_source
+                                CHECK (item_source IN ('reap_variant', 'cart_link')),
+                            ADD COLUMN IF NOT EXISTS cart_url TEXT
+                                CONSTRAINT ck_reap_agentic_purchases_cart_url_pairing
+                                CHECK (
+                                    (item_source = 'reap_variant' AND cart_url IS NULL)
+                                    OR (item_source = 'cart_link' AND cart_url IS NOT NULL)
+                                );
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
             # mig 212: the recovery key — the join the Prove stage rests on.
             # Early and wrapped for the same reason as mig 210 below: this
             # branch is ONE try, and an unguarded CREATE INDEX further down
@@ -3054,6 +3092,48 @@ async def ensure_required_schema_light() -> None:
                         """
                     )
                 )
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 226: item_source + cart_url, SQLite twin.
+            #
+            # Same two layers of try as the mig-225 twin above, for the same
+            # reasons: SQLite has no `IF NOT EXISTS` on ADD COLUMN and no
+            # multi-clause ADD, so each column is its own statement and a
+            # "duplicate column name" on one must not abandon the other.
+            #
+            # THE CHECKS ARE COLUMN CONSTRAINTS HERE TOO, byte-for-byte the
+            # Postgres ones, and SQLite enforces a column CHECK that names
+            # another column exactly as a table CHECK. ORDER MATTERS: item_source
+            # first, because cart_url's pairing CHECK names it. Since SQLite
+            # 3.37 an ADD COLUMN's CHECK is tested against the existing rows;
+            # every existing row takes the DEFAULT 'reap_variant' and a NULL
+            # URL, which the pairing admits.
+            try:
+                for _source_column, _source_decl in (
+                    (
+                        "item_source",
+                        "TEXT NOT NULL DEFAULT 'reap_variant' "
+                        "CONSTRAINT ck_reap_agentic_purchases_item_source "
+                        "CHECK (item_source IN ('reap_variant', 'cart_link'))",
+                    ),
+                    (
+                        "cart_url",
+                        "TEXT "
+                        "CONSTRAINT ck_reap_agentic_purchases_cart_url_pairing "
+                        "CHECK ("
+                        "(item_source = 'reap_variant' AND cart_url IS NULL) "
+                        "OR (item_source = 'cart_link' AND cart_url IS NOT NULL))",
+                    ),
+                ):
+                    try:
+                        await database.execute(
+                            text(
+                                f"ALTER TABLE reap_agentic_purchases "
+                                f"ADD COLUMN {_source_column} {_source_decl};"
+                            )
+                        )
+                    except Exception:  # noqa: BLE001
+                        continue
             except Exception:  # noqa: BLE001
                 pass
             # Self-heal EVERY table in REQUIRED_SCHEMA, not a hardcoded subset:
