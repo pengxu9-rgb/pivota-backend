@@ -119,6 +119,8 @@ from services.commerce_surface_service import (
 from services.product_exposure_service import (
     build_agent_push_projection_from_standard_variant,
     pick_first_eligible_variant_from_standard_product,
+    product_as_standard_variant,
+    standard_variant_in_stock,
 )
 from observability.reliability_metrics import (
     record_catalog_pivot_shadow_compare,
@@ -3689,16 +3691,22 @@ def _build_internal_offer_summary(
         variant_payload.get("compare_at_price")
         or product_payload.get("compare_at_price")
     )
-    inventory_quantity = _coerce_int(
-        variant_payload.get("inventory_quantity")
-        if variant_payload.get("inventory_quantity") is not None
-        else product_payload.get("inventory_quantity")
+    # THE GATE'S VERDICT, not a second opinion. This flag used to read `inventory_quantity`
+    # alone, while the eligibility gate that picks the variant reads `available` first — so an
+    # untracked / keep-selling variant (`available: true`, quantity 0) shipped as a buy-here
+    # offer printed `in_stock: false`, and ranking had to exempt every internal offer to avoid
+    # demoting it. Reading the gate's own function makes the two agree by construction; with no
+    # variant to ship, it reads the product the way the gate does for a product with none.
+    #
+    # One input gap remains and it is the gate's, not this flag's: the gate reads the product
+    # after a StandardProduct round-trip, and StandardProductVariant has no `available` field,
+    # so for a well-formed product the gate never sees `available` (it reads quantity). A
+    # gate-picked variant is that normalized dict, so the two read the same bytes; only the
+    # relaxed `variants[0]` fallback reaches here raw. Measured 2026-09-18: 0 of 82
+    # products_cache rows carry `available` on a variant, and 0 flip this flag.
+    in_stock = standard_variant_in_stock(
+        variant_payload if variant_payload else product_as_standard_variant(product_payload)
     )
-    in_stock = True
-    if inventory_quantity is not None:
-        in_stock = inventory_quantity > 0
-    elif isinstance(product_payload.get("in_stock"), bool):
-        in_stock = bool(product_payload.get("in_stock"))
 
     seller = (
         str(
@@ -3866,28 +3874,25 @@ OFFER_UNAVAILABLE_AVAILABILITIES: frozenset[str] = frozenset(
 def _offer_is_known_unavailable(offer: Dict[str, Any]) -> bool:
     """True only on an explicit statement that this seller cannot sell it now.
 
-    Reads the `in_stock` flag, which every external lane emits (the catalog arm derives it from
+    Reads the `in_stock` flag, which every lane emits (the catalog arm derives it from
     OFFER_UNAVAILABLE_AVAILABILITIES). There is no separate `availability` check here on purpose:
     no lane ships an unavailable `availability` beside a True flag, so one would be dead code.
 
-    INTERNAL (buy-here) OFFERS ARE NEVER DEMOTED ON THIS FLAG, because the flag is wrong in the
-    direction that matters. The summary's `in_stock` reads `inventory_quantity` alone, so an
-    untracked / keep-selling Shopify variant (`available: true`, quantity 0) shows False; demoting
-    on it cut a buyable exact match at limit=1 and flipped `resolution_mode` from exact_match to
-    external_only.
+    INTERNAL (buy-here) OFFERS ARE READ THE SAME WAY. They used to be exempt because their flag
+    read `inventory_quantity` alone and so called an untracked / keep-selling variant
+    (`available: true`, quantity 0) sold out; demoting on that cut a buyable exact match at
+    limit=1. The flag now IS the eligibility gate's stock verdict
+    (`standard_variant_in_stock`, see `_build_internal_offer_summary`), so False means what it
+    says. What the exemption cost, and why it had to go: in RELAXED mode (no commerce_surface)
+    the handler falls back to `variants[0]` when no variant passes the gate, so a genuinely sold
+    out buy-here offer shipped and, exempt, won an equal-fit tie over an in-stock referral.
 
-    HONEST LIMIT. In STRICT mode (the caller names a commerce_surface) an internal offer only
-    exists for a variant `pick_first_eligible_variant_from_standard_product` passed, and that gate
-    refuses out-of-stock variants, so the exemption costs nothing. In RELAXED mode the handler
-    falls back to `variants[0]` when no variant passes, so a genuinely unsellable buy-here offer
-    can ship and, being exempt, still wins an equal-fit tie over an in-stock referral — exactly as
-    it did before this ranking existed (transactability already won that tie). Closing that means
-    making the summary's flag read the way the gate does (`available`, then quantity, then
-    `availability`) and then dropping this exemption; that changes an agent-visible flag and is
-    its own change.
+    Not covered, because the flag cannot know: a Shopify product the adapter synced stores no
+    `available` per variant, so an untracked / keep-selling variant arrives at quantity 0 and
+    the gate itself calls it sold out. Here it ranks behind an equal-fit sellable offer (in
+    STRICT mode the gate never ships it at all). Measured 2026-09-18: 3 of 82 products_cache
+    rows had that shape, all expired; 0 of the 24 live rows.
     """
-    if str(offer.get("purchase_route") or "") == "internal_checkout":
-        return False
     return offer.get("in_stock") is False
 
 
@@ -3914,8 +3919,9 @@ def _rank_offers_merit_first(offers: List[Dict[str, Any]]) -> List[Dict[str, Any
     2026-09-18, ``get_offers`` on the Purito Oat-in Calming Gel Cream led with eyurs.com at $13,
     out of stock, over sokoglam.com at $19.50, in stock. It is INSIDE the fit tier, not above it,
     on purpose: a product-grain "in stock" says some variant is on the shelf, not the one that
-    matched exactly, so it must not jump an exact match. It applies to referred offers only —
-    an internal offer already passed a stock gate (see ``_offer_is_known_unavailable``).
+    matched exactly, so it must not jump an exact match. It applies to buy-here offers too:
+    their flag is the eligibility gate's own verdict (see ``_offer_is_known_unavailable``), so
+    a sold-out buy-here offer no longer wins a tie on transactability alone.
 
     Sort key (all ascending): (fit_tier_rank, unavailable, transactability_rank, -confidence).
     The sort is stable, so equal-key offers keep prior order — a pure-internal set (same-product
