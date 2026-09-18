@@ -1274,6 +1274,41 @@ def _brand_key(value: Optional[str]) -> str:
     return "".join(c for c in str(value or "").casefold() if c.isalnum())
 
 
+# MEASURED RENAMES that retailers still sell under the old and new names. In retailer mode a
+# vendor is written under the operator's --brand only when the two are the SAME brand; exact
+# alphanumeric equality decides that everywhere except here. Containment cannot: it would merge
+# "Purito" with "Purito Seoul" (a rename -- correct) and equally "A'PIEU" with "A'PIEU Plus"
+# (a distinct vendor -- tests/services/test_retailer_adversarial_acceptance.py pins that it is
+# NOT overridden). So each family is listed, with the evidence that it is one brand.
+#
+# Measured 2026-09-18 over every vendor at eyurs.com, ohlolly.com and sokoglam.com: these are
+# the ONLY cross-host spellings that exact equality leaves split.
+RETAILER_BRAND_SPELLINGS = {
+    # Manyo Factory renamed to ma:nyo: sokoglam "MANYO FACTORY", ohlolly "ma:nyo", eyurs "manyo".
+    "manyofactory": "manyo",
+    "manyo": "manyo",
+    # Purito renamed to Purito Seoul: eyurs "Purito SEOUL", sokoglam "Purito Seoul", ohlolly "Purito".
+    "puritoseoul": "purito",
+    "purito": "purito",
+}
+# The spelling each family is WRITTEN as -- in retailer AND brand-official mode, with or without
+# --brand. content_key is
+# built from normalize_brand(brand), which keeps punctuation ("ma:nyo" != "manyo"), so writing
+# the operator's string would still split a family whenever two runs spelled --brand
+# differently. The canonical spelling is the one the catalog ALREADY carries, measured in prod
+# 2026-09-18: 78 brand-official rows as "Ma:nyo" (manyo.us), and "Purito SEOUL"
+# (purito-seoul.com). Any other spelling would split retailer rows from those.
+RETAILER_BRAND_CANONICAL = {
+    "manyo": "Ma:nyo",
+    "purito": "Purito SEOUL",
+}
+
+
+def _retailer_brand_family(key: str) -> Optional[str]:
+    """The listed brand family for an alphanumeric brand key, or None when it is not listed."""
+    return RETAILER_BRAND_SPELLINGS.get(key)
+
+
 def _looks_like_a_brand_name(value: Optional[str]) -> bool:
     """Only explicit supplier-code shapes are codes; short/Unicode names are brands.
 
@@ -1609,12 +1644,25 @@ def shopify_product_to_record(
         if (not _looks_like_a_brand_name(vendor) or not vendor_key
                 or (len(host_label) >= 3 and host_label in vendor_key)):
             raise ValueError(f"{host}: retailer_maker_unproven: vendor {vendor!r} is not maker evidence")
-        # Only exact normalized maker equivalence permits a spelling override.
-        # Brand-direct store/supplier-code heuristics cannot label retailer stock.
+        # Only exact normalized maker equivalence permits a spelling override --
+        # or a MEASURED rename in RETAILER_BRAND_SPELLINGS. Brand-direct store/supplier-code
+        # heuristics cannot label retailer stock.
         override_key = "".join(c for c in str(brand_override or "").casefold() if c.isalnum())
-        brand = brand_override if override_key == vendor_key else vendor
+        # The VENDOR's own listed family decides its spelling -- a normalisation of the maker the
+        # retailer named, never a relabel into whatever family --brand belongs to. It does not
+        # depend on --brand at all, so a run without one converges too.
+        vendor_family = _retailer_brand_family(vendor_key)
+        if vendor_family is not None:
+            brand = RETAILER_BRAND_CANONICAL[vendor_family]
+        else:
+            brand = brand_override if override_key == vendor_key else vendor
     else:
         brand, _brand_reason = resolve_record_brand(product.get("vendor"), brand_override, host)
+        # The same one-spelling-per-family rule for brand-official stores: a manyo.us re-run with
+        # --brand "Manyo" would otherwise write "Manyo" and split from its own 78 "Ma:nyo" rows.
+        official_family = _retailer_brand_family("".join(c for c in str(brand or "").casefold() if c.isalnum()))
+        if official_family is not None:
+            brand = RETAILER_BRAND_CANONICAL[official_family]
     brand = str(brand or "").strip()
     if not brand:
         return None
