@@ -140,6 +140,18 @@ async def test_without_a_mac_lipstick_a_lip_product_beats_anything_else():
     assert (pick["variant_id"], pick["rank"]) == ("52", 1)
 
 
+@pytest.mark.parametrize("prod, rank", [
+    (product(1, "Advanced Liposomal NMN", "liposomal-nmn", vendor="Haroutine", variants=[]), 2),  # not a lip product
+    (product(2, "PDRN Lip Sleeping Mask", "pdrn-lip-sleeping-mask", variants=[]), 1),
+    (product(3, "Kids' Moisture Lip Balm, 0.1oz.", "kids-moisture-lip-balm", variants=[]), 1),
+    (product(4, "Velvet Lipstick", "velvet-lipstick", vendor="M·A·C", variants=[]), 0),
+    (product(5, "Eclipse Palette", "eclipse-palette", vendor="MAC", variants=[]), 2),  # "eclipse" is not "lip"
+])
+def test_the_preference_reads_whole_words(prod, rank):
+    prod["variants"] = [var(1)]
+    assert hints._preference(prod) == rank
+
+
 async def test_nothing_qualifying_is_no_replacement():
     catalog = [[product(1, "Sample", "s", variants=[var(1)]), product(2, "Cream", "c", variants=[var(2, available=False)])]]
     shop = Shop(catalog=catalog)
@@ -209,6 +221,59 @@ async def test_a_handle_that_does_not_list_the_variant_is_not_written(monkeypatc
     assert "product_handle" not in rows[0]
 
 
+@pytest.mark.parametrize("title, handle, unfit", [
+    ("Pro Filt'r Fluid Flex Foundation Shade Sample", "pro-filtr-fluid-flex-foundation-shade-sample", True),
+    ("Glow Starter Sample", "glow-starter-sample-pack", True),
+    ("[GIFT] Collagen Glow Sunscreen 10ml", "collagen-glow-sunscreen-10ml", True),
+    ("Kids Trial Travel Kit", "kids-trial-travel-kit-shampoo-body-wash", True),
+    ("Gloss Bomb Universal Lip Luminizer", "gloss-bomb-universal-lip-luminizer", False),
+    ("Single Eyeshadow", "single-eyeshadow", False),
+    ("The Latest Glow Serum", "latest-glow-serum", False),   # whole words: "latest" is not "test"
+    ("Serum", "serum-testers", True),
+])
+def test_unfit_seeds_are_recognised_by_title_or_handle(title, handle, unfit):
+    assert hints.is_unfit(title, handle) is unfit
+
+
+def _unfit_shop():
+    catalog = [[
+        product(1, "Shade Sample", "shade-sample", variants=[var(11)]),
+        product(2, "Lip Mini", "lip-mini", variants=[var(21)]),
+        product(3, "Travel Size Lip Oil", "lip-oil-travel", variants=[var(31)]),
+        product(4, "Lip Care Kit", "lip-care-kit", variants=[var(41)]),
+        product(5, "Gloss Bomb Lip Luminizer", "gloss-bomb", variants=[var(51)]),
+        product(6, "Body Cream", "body-cream", variants=[var(61)]),
+    ]]
+    return Shop(
+        variants={"11": "/products/shade-sample?variant=11"},
+        catalog=catalog,
+        product_js={"shade-sample": {"title": "Shade Sample", "variants": [{"id": 11, "available": True}]},
+                    "gloss-bomb": {"title": "Gloss Bomb Lip Luminizer", "variants": [{"id": 51, "available": True}]}},
+    )
+
+
+@pytest.mark.parametrize("replace_unfit", [False, True])
+async def test_an_unfit_seed_is_swapped_for_a_full_size_product_only_when_asked(monkeypatch, replace_unfit):
+    shop = _unfit_shop()
+    monkeypatch.setattr(hints, "_default_inner_transport", lambda: httpx.MockTransport(shop.handle))
+
+    async def no_wait(self):
+        return None
+
+    monkeypatch.setattr(hints.RequestPacer, "acquire", no_wait)
+    rows = [{"domain": "fentybeauty.com", "market": "US", "variant_id": "11"}]
+    report = await hints.refresh(rows, only=None, replace_gone=False, max_pages=1, replace_unfit=replace_unfit)
+    if not replace_unfit:
+        assert report[0]["lookup"] == "found"
+        assert rows[0] == {"domain": "fentybeauty.com", "market": "US", "variant_id": "11",
+                           "product_handle": "shade-sample"}
+        return
+    # a lip product that is not a mini, a travel size or a kit; confirmed on /products/<h>.js
+    assert report[0]["lookup"] == "replaced" and report[0]["replaced_because"] == "unfit"
+    assert report[0]["replaced_variant_id"] == "11" and report[0]["listed"] is True
+    assert rows[0] == {"domain": "fentybeauty.com", "market": "US", "variant_id": "51", "product_handle": "gloss-bomb"}
+
+
 async def test_refresh_goes_through_the_global_pacer(monkeypatch):
     shop = Shop(variants={"1": "/products/h?variant=1"}, product_js={"h": {"title": "H", "variants": [{"id": 1, "available": True}]}})
     monkeypatch.setattr(hints, "_default_inner_transport", lambda: httpx.MockTransport(shop.handle))
@@ -220,3 +285,12 @@ async def test_refresh_goes_through_the_global_pacer(monkeypatch):
     monkeypatch.setattr(hints.RequestPacer, "acquire", counting)
     await hints.refresh([{"domain": "a.com", "market": "US", "variant_id": "1"}], only=None, replace_gone=False, max_pages=1)
     assert len(calls) == len(shop.requests) == 2
+
+
+def test_no_seed_in_the_repo_list_is_a_sample_gift_or_trial_by_its_handle():
+    """The eligibility probe should exercise a product a buyer would actually purchase. Titles
+    are not in the file, but the handle usually carries the tell (…-sample-pack, kids-trial-…)."""
+    from services.tierb_cart_link_merchants import load_merchants
+
+    unfit = [(m.domain, m.product_handle) for m in load_merchants() if hints.is_unfit(None, m.product_handle)]
+    assert unfit == []

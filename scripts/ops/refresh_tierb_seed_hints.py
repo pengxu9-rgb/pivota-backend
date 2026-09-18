@@ -3,6 +3,7 @@
     python scripts/ops/refresh_tierb_seed_hints.py                      # print the plan
     python scripts/ops/refresh_tierb_seed_hints.py --write              # also rewrite the file
     python scripts/ops/refresh_tierb_seed_hints.py --write --replace-gone --only robinsons.com.sg
+    python scripts/ops/refresh_tierb_seed_hints.py --write --replace-unfit
 
 WHAT IT DOES. For every row that names a `variant_id`:
 
@@ -18,7 +19,11 @@ WHAT IT DOES. For every row that names a `variant_id`:
      /products.json?country=<market> (at most `--max-pages` pages): an available, shipped, priced
      (>= 5) variant of a product whose title contains none of "test" / "sample" / "gift",
      preferring, in order, a MAC lipstick, then any lip product (the Meitu try-on line is lips),
-     then anything else that qualifies.
+     then anything else that qualifies. A replacement must also look full-size: none of
+     "mini" / "travel" / "sachet" / "kit" in its title or handle either.
+  4. With `--replace-unfit`, a seed that resolves fine but whose title or handle says it is a
+     test / sample / gift / trial product is swapped the same way: the eligibility probe should
+     exercise a product a buyer would actually purchase.
 
 WHAT IT NEVER DOES. It never follows a cart permalink and never touches /cart or /checkouts, so
 it creates NO checkouts. Every request is a read-only GET of a public storefront JSON or redirect,
@@ -58,7 +63,25 @@ USER_AGENT = (
 HEADERS = {"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"}
 MAX_HOPS = 5
 _PRODUCT_PATH = re.compile(r"/products/([^/?#]+)")
-_EXCLUDED_WORDS = ("test", "sample", "gift")
+# A seed whose product title or handle carries one of these is not something a buyer would
+# actually purchase (a tester, a sample, a gift-with-purchase, a trial kit): `--replace-unfit`
+# swaps it. A REPLACEMENT must additionally look full-size.
+_UNFIT_WORDS = ("test", "tester", "sample", "gift", "trial")
+_EXCLUDED_WORDS = _UNFIT_WORDS + ("mini", "travel", "sachet", "kit")
+# WHOLE WORDS (an optional plural s), never substrings: "luminizer" is not "mini", "latest" is
+# not "test". Matched against the title and the handle, split on anything non-alphanumeric.
+_UNFIT_RE = re.compile(r"\b(?:" + "|".join(_UNFIT_WORDS) + r")s?\b")
+_EXCLUDED_RE = re.compile(r"\b(?:" + "|".join(_EXCLUDED_WORDS) + r")s?\b")
+
+
+# A LIP product by whole word, not by substring: "Advanced Liposomal NMN" (haroutine, live
+# 2026-09-18) is a supplement, and a substring match ranked it as a lip product.
+_LIP_RE = re.compile(r"\blip(?:s|stick|sticks|gloss|balm|tint|liner)?\b")
+_LIPSTICK_RE = re.compile(r"\blipsticks?\b")
+
+
+def _words(*parts: Any) -> str:
+    return " ".join(re.split(r"[^a-z0-9]+", " ".join(str(p or "") for p in parts).lower()))
 _FORBIDDEN_PATHS = ("/cart", "/checkouts", "/checkout")
 
 
@@ -121,8 +144,11 @@ async def confirm_handle(
     return False, None, payload.get("title")
 
 
+def is_unfit(title: Optional[str], handle: Optional[str]) -> bool:
+    return bool(_UNFIT_RE.search(_words(title, handle)))
+
+
 def _qualifies(product: Dict[str, Any], variant: Dict[str, Any]) -> bool:
-    title = str(product.get("title") or "").lower()
     try:
         price = float(variant.get("price") or 0)
     except (TypeError, ValueError):
@@ -131,17 +157,17 @@ def _qualifies(product: Dict[str, Any], variant: Dict[str, Any]) -> bool:
         variant.get("available") is True
         and variant.get("requires_shipping", True) is not False
         and price >= 5
-        and not any(word in title for word in _EXCLUDED_WORDS)
+        and not _EXCLUDED_RE.search(_words(product.get("title"), product.get("handle")))
     )
 
 
 def _preference(product: Dict[str, Any]) -> int:
     """0 = a MAC lipstick, 1 = any lip product, 2 = anything else that qualifies."""
     vendor = str(product.get("vendor") or "").lower().replace("·", "").replace(".", "").replace(" ", "")
-    text = " ".join(str(product.get(k) or "") for k in ("title", "product_type")).lower()
-    if vendor.startswith("mac") and "lipstick" in text:
+    text = _words(product.get("title"), product.get("product_type"))
+    if vendor.startswith("mac") and _LIPSTICK_RE.search(text):
         return 0
-    if "lip" in text:
+    if _LIP_RE.search(text):
         return 1
     return 2
 
@@ -186,8 +212,21 @@ def dump_rows(rows: List[Dict[str, Any]]) -> str:
     return "[\n" + ",\n".join("  " + json.dumps(r, ensure_ascii=False) for r in ordered) + "\n]\n"
 
 
+async def _replace(client: httpx.AsyncClient, row: Dict[str, Any], entry: Dict[str, Any],
+                   reason: str, max_pages: int) -> Optional[str]:
+    """Swap the row's variant for a picked replacement; the new handle, or None if none fits."""
+    pick = await pick_replacement(client, row["domain"], row["market"], max_pages)
+    entry["replacement"] = pick
+    if not (pick and pick.get("product_handle")):
+        return None
+    entry["replaced_variant_id"], entry["replaced_because"] = row["variant_id"], reason
+    row["variant_id"] = entry["variant_id"] = pick["variant_id"]
+    entry["lookup"] = "replaced"
+    return pick["product_handle"]
+
+
 async def refresh(rows: List[Dict[str, Any]], *, only: Optional[List[str]], replace_gone: bool,
-                  max_pages: int) -> List[Dict[str, Any]]:
+                  max_pages: int, replace_unfit: bool = False) -> List[Dict[str, Any]]:
     report: List[Dict[str, Any]] = []
     pacer = RequestPacer()
     transport = ReadOnlyTransport(PacedTransport(_default_inner_transport(), pacer))
@@ -203,20 +242,22 @@ async def refresh(rows: List[Dict[str, Any]], *, only: Optional[List[str]], repl
                 if status == "gone":
                     entry["gone_variant_id"] = row["variant_id"]
                 if status == "gone" and replace_gone:
-                    pick = await pick_replacement(client, row["domain"], row["market"], max_pages)
-                    entry["replacement"] = pick
-                    if pick and pick.get("product_handle"):
-                        row["variant_id"], handle = pick["variant_id"], pick["product_handle"]
-                        entry["variant_id"] = row["variant_id"]
-                        status = entry["lookup"] = "replaced"
+                    handle = await _replace(client, row, entry, "gone", max_pages) or handle
                 if handle:
                     listed, available, title = await confirm_handle(
                         client, row["domain"], handle, row["variant_id"], row["market"])
+                    if listed and replace_unfit and is_unfit(title, handle):
+                        entry.update(unfit_title=title, unfit_handle=handle)
+                        new_handle = await _replace(client, row, entry, "unfit", max_pages)
+                        if new_handle:
+                            handle = new_handle
+                            listed, available, title = await confirm_handle(
+                                client, row["domain"], handle, row["variant_id"], row["market"])
                     entry.update(handle=handle, listed=listed, available=available, title=title)
                     if listed:
                         row["product_handle"] = handle
                     else:
-                        entry["lookup"] = f"{status}:handle_does_not_list_variant"
+                        entry["lookup"] = f"{entry['lookup']}:handle_does_not_list_variant"
             except httpx.HTTPError as exc:
                 entry["lookup"] = f"unknown:{type(exc).__name__}"
             report.append(entry)
@@ -229,6 +270,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--file", default=str(DEFAULT_MERCHANTS_PATH))
     ap.add_argument("--write", action="store_true", help="rewrite the file with the resolved hints")
     ap.add_argument("--replace-gone", action="store_true", help="pick a replacement for a variant that 404s")
+    ap.add_argument("--replace-unfit", action="store_true",
+                    help="swap a seed whose product is a test/sample/gift/trial for a full-size one")
     ap.add_argument("--max-pages", type=int, default=40, help="catalog pages to scan for a replacement")
     ap.add_argument("--only", action="append", default=None, metavar="DOMAIN")
     args = ap.parse_args(argv)
@@ -236,7 +279,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     path = Path(args.file)
     rows = json.loads(path.read_text(encoding="utf-8"))
     parse_merchants(rows)  # refuse to start on a malformed list
-    report = asyncio.run(refresh(rows, only=args.only, replace_gone=args.replace_gone, max_pages=args.max_pages))
+    report = asyncio.run(refresh(rows, only=args.only, replace_gone=args.replace_gone, max_pages=args.max_pages,
+                                 replace_unfit=args.replace_unfit))
     parse_merchants(rows)  # and refuse to write one
     unresolved = [e for e in report if e["lookup"] not in ("found", "replaced") or not e.get("listed")]
     print(f"resolved {len(report) - len(unresolved)}/{len(report)}; unresolved: "

@@ -124,7 +124,7 @@ def test_the_repo_merchant_list_loads_and_matches_the_measured_population():
     assert by_domain["robinsons.com.sg"].market == "SG"
 
 
-# The two seed variants replaced after the 2026-09-18 probe, and why. Every other row keeps the
+# The seed variants replaced after the 2026-09-18 probe, and why. Every other row keeps the
 # measured population's variant.
 _REPLACED = {
     # the seed (Collagen Bubble Serum 1-Pack) is unavailable with country=US
@@ -132,6 +132,11 @@ _REPLACED = {
     # the seed 404s at /variants/<id>; a MAC lipstick live in SG replaces it
     "robinsons.com.sg": ("40975353675861", "42438682574933",
                          "powder-kiss-velvet-blur-slim-lipstick-898-sheer-outrage-2g-0-07oz-1"),
+    # `--replace-unfit`: the seed was a sample / gift / trial kit, not something a buyer purchases
+    "fentybeauty.com": ("67362637381677", "44306794217517", "gloss-bomb-universal-lip-luminizer-cherry-amor"),
+    "haroutine.com": ("50679311892726", "51667887161590", "rest-restore-magnesium"),
+    "medicube.us": ("43402263756848", "41946336886832", "pdrn-lip-sleeping-mask"),
+    "goongbe.us": ("41008543563834", "40854246064186", "kids-moisture-lip-balm-0-1oz"),
 }
 
 
@@ -147,7 +152,7 @@ def test_the_repo_merchant_list_carries_a_handle_for_every_seeded_variant():
 
 def test_the_repo_merchant_list_is_the_2026_09_18_population_row_for_row():
     """The list is the measured population with `variant` renamed and a handle added: no row
-    dropped or moved to another market, and no variant changed except the two in _REPLACED."""
+    dropped or moved to another market, and no variant changed except those in _REPLACED."""
     population = os.environ.get("TIERB_POPULATION_JSON") or os.path.join(
         os.path.dirname(__file__), "..", "reports", "tierb_cart_permalink_2026_09_18", "population.json"
     )
