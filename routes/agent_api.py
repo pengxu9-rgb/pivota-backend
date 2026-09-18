@@ -7101,6 +7101,123 @@ async def agent_resolve_products(
             query="products_cache_by_alias",
         )
 
+    # Source 1c: the CATALOG lanes.
+    #
+    # products_cache above is a merchant-sync cache. The external_referral cohort
+    # is never written to it -- measured 2026-09-16: ZERO products_cache rows for
+    # merch_obs_88382424262f3e0f, whose catalog_skus rows carry the real Shopify
+    # variant ids. So resolve answered NO_CANDIDATES for every referral row, for
+    # every caller, by construction: the identity exists, in a table this endpoint
+    # never read. A partner hit it resolving a variant id they had just resolved
+    # successfully against the merchant's own storefront.
+    #
+    # Coverage this reaches (prod, serving-eligible): 17,447 catalog_skus rows with
+    # a non-empty source_variant_id across 9,108 distinct products.
+    #
+    # BOTH axes are restored, because a caller blocked on product_id is as stuck as
+    # one blocked on sku_id, and they are one defect: resolve read only the cache.
+    #
+    # The emitted platform_product_id is `source_product_id` and that is load-bearing,
+    # not a guess: the canonical-mapping lookup below joins
+    # product_group_members.platform_product_id, and every one of the 15,588 rows in
+    # that table stores source_product_id (zero carry a sig_/ext:/ck_ shape). Emitting
+    # the signature or the product_key here would resolve the candidate and then
+    # silently lose canonical_ref.
+    # Gated on `not candidates_by_key`, matching the alias lane and the search
+    # fallback below. Gating on `exact_cache_rows` alone ran this lane even when the
+    # ALIAS lane had already resolved, and its score 1.0 then overwrote that
+    # candidate's source -- two extra round-trips on a request that was already done.
+    if not candidates_by_key and (sku_aliases or product_aliases):
+        catalog_started = time.perf_counter()
+        catalog_rows: List[Dict[str, Any]] = []
+        try:
+            if sku_aliases:
+                rows = await asyncio.wait_for(
+                    database.fetch_all(
+                        """
+                        SELECT cp.source_product_id AS platform_product_id,
+                               cs.merchant_id,
+                               cs.platform,
+                               cp.title
+                        FROM catalog_skus cs
+                        JOIN catalog_products cp ON cp.product_key = cs.product_key
+                        WHERE (CAST(:merchant_id AS TEXT) IS NULL OR cs.merchant_id = CAST(:merchant_id AS TEXT))
+                          AND (cs.source_variant_id = ANY(:sku_aliases) OR cs.sku = ANY(:sku_aliases))
+                          AND COALESCE(cp.source_product_id, '') <> ''
+                          -- Suppressed/tombstoned rows are refused by every serving
+                          -- path, so resolving one hands the caller an id that
+                          -- get_product and get_offers will both decline.
+                          AND cs.suppressed_at IS NULL
+                          AND cp.suppressed_at IS NULL
+                        ORDER BY cp.product_key
+                        LIMIT 80
+                        """,
+                        {"merchant_id": merchant_id, "sku_aliases": sku_aliases},
+                    ),
+                    timeout=resolve_exact_sku_timeout_s,
+                )
+                catalog_rows.extend([dict(r) for r in (rows or [])])
+
+            if product_aliases and not catalog_rows:
+                rows = await asyncio.wait_for(
+                    database.fetch_all(
+                        """
+                        SELECT cp.source_product_id AS platform_product_id,
+                               cp.merchant_id,
+                               cp.platform,
+                               cp.title
+                        FROM catalog_products cp
+                        WHERE (CAST(:merchant_id AS TEXT) IS NULL OR cp.merchant_id = CAST(:merchant_id AS TEXT))
+                          AND (cp.pivota_signature_id = ANY(:pid_aliases)
+                               OR cp.source_product_id = ANY(:pid_aliases)
+                               OR cp.content_key = ANY(:pid_aliases)
+                               OR cp.product_key = ANY(:pid_aliases))
+                          AND COALESCE(cp.source_product_id, '') <> ''
+                          AND cp.suppressed_at IS NULL
+                        ORDER BY cp.product_key
+                        LIMIT 80
+                        """,
+                        {"merchant_id": merchant_id, "pid_aliases": product_aliases},
+                    ),
+                    timeout=resolve_exact_pid_timeout_s,
+                )
+                catalog_rows.extend([dict(r) for r in (rows or [])])
+
+            for row_data in catalog_rows:
+                _add_candidate(
+                    merchant=row_data.get("merchant_id"),
+                    platform=row_data.get("platform"),
+                    platform_product_id=row_data.get("platform_product_id"),
+                    title=row_data.get("title"),
+                    source="catalog_identity_exact",
+                    score=1.0,
+                )
+            _record_source(
+                source="catalog_identity_exact",
+                status="ok" if catalog_rows else "empty",
+                reason_code="ok" if catalog_rows else "no_candidates",
+                source_started=catalog_started,
+                row_count=len(catalog_rows),
+                query="catalog_skus_and_products_by_identity",
+            )
+        # NO asyncio.TimeoutError branch. The cache lanes route that same exception
+        # through `_classify_db_reason_code`, which calls it what it is -- a database
+        # query timeout. Reporting `upstream_timeout` here made the response's
+        # top-level reason `UPSTREAM_TIMEOUT` / `search_timeout`, because the
+        # `search_timed_out` check below matches on exactly that string. A caller
+        # would have been told the SEARCH timed out when search never ran.
+        except Exception as e:  # noqa: BLE001
+            # Never costs the turn: the search fallback below still runs, exactly as
+            # it does when the cache lanes fail.
+            _record_source(
+                source="catalog_identity_exact",
+                status="error",
+                reason_code=_classify_db_reason_code(e),
+                source_started=catalog_started,
+                error=type(e).__name__,
+                query="catalog_skus_and_products_by_identity",
+            )
+
     # Source 2/3: scoped/global search fallback.
     search_query = query_text or (product_aliases[0] if product_aliases else sku_aliases[0] if sku_aliases else "")
     search_timeout_s = 4.0
