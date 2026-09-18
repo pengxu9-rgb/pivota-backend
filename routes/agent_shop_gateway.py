@@ -3870,12 +3870,21 @@ def _offer_is_known_unavailable(offer: Dict[str, Any]) -> bool:
     OFFER_UNAVAILABLE_AVAILABILITIES). There is no separate `availability` check here on purpose:
     no lane ships an unavailable `availability` beside a True flag, so one would be dead code.
 
-    INTERNAL (buy-here) OFFERS ARE NEVER DEMOTED ON THIS FLAG. They are built only from a variant
-    that `pick_first_eligible_variant_from_standard_product` already passed, and that gate refuses
-    out-of-stock variants reading the variant's `available` first. The summary's `in_stock` reads
-    `inventory_quantity` alone, so an untracked / keep-selling Shopify variant (available, quantity
-    0) shows False. Demoting on it would second-guess the gate with the weaker signal: at limit=1
-    it cut a buyable exact match and flipped `resolution_mode` from exact_match to external_only.
+    INTERNAL (buy-here) OFFERS ARE NEVER DEMOTED ON THIS FLAG, because the flag is wrong in the
+    direction that matters. The summary's `in_stock` reads `inventory_quantity` alone, so an
+    untracked / keep-selling Shopify variant (`available: true`, quantity 0) shows False; demoting
+    on it cut a buyable exact match at limit=1 and flipped `resolution_mode` from exact_match to
+    external_only.
+
+    HONEST LIMIT. In STRICT mode (the caller names a commerce_surface) an internal offer only
+    exists for a variant `pick_first_eligible_variant_from_standard_product` passed, and that gate
+    refuses out-of-stock variants, so the exemption costs nothing. In RELAXED mode the handler
+    falls back to `variants[0]` when no variant passes, so a genuinely unsellable buy-here offer
+    can ship and, being exempt, still wins an equal-fit tie over an in-stock referral — exactly as
+    it did before this ranking existed (transactability already won that tie). Closing that means
+    making the summary's flag read the way the gate does (`available`, then quantity, then
+    `availability`) and then dropping this exemption; that changes an agent-visible flag and is
+    its own change.
     """
     if str(offer.get("purchase_route") or "") == "internal_checkout":
         return False
@@ -5878,8 +5887,11 @@ async def _handle_offers_resolve(
                      -- stock: see OFFER_UNAVAILABLE_AVAILABILITIES, which this binds, so the
                      -- order matches the `in_stock` flag computed below. `offer_id` makes a
                      -- price tie cut the same way every time.
-                     -- The btrim set is the ASCII whitespace Python's .strip() removes, so
-                     -- a tab- or newline-padded value sorts the way its flag reads.
+                     -- The btrim set is the common ASCII whitespace (space, tab, newline,
+                     -- CR, FF, VT), so a tab- or newline-padded value sorts the way its flag
+                     -- reads. Python's .strip() also removes 0x1C-0x1F and Unicode spaces
+                     -- (NBSP); a value padded with those would still sort as sellable while
+                     -- flagged not — no live row is (only in_stock/out_of_stock, 2026-09-18).
                      ORDER BY (lower(btrim(coalesce(o.availability, ''),
                                            E' \t\n\r\f\v'))
                                = ANY(:unavailable)) ASC,
