@@ -139,6 +139,7 @@ class Storefronts:
         self.requests: List[Tuple[float, httpx.Request]] = []
         self.click_ids: Dict[str, str] = {}
         self.countries: Dict[str, str] = {}
+        self.flaked: set = set()
 
     def transport(self) -> httpx.MockTransport:
         return httpx.MockTransport(self.handle)
@@ -150,6 +151,9 @@ class Storefronts:
             return httpx.Response(406, text="<html>Sign in</html>")
         kind = self.kinds[host]
         if kind == "transport":
+            raise httpx.ConnectError("proxy flake", request=request)
+        if kind == "flaky_once" and host not in self.flaked:
+            self.flaked.add(host)
             raise httpx.ConnectError("proxy flake", request=request)
         vid = VIDS[host]
         if path == "/products.json":
@@ -207,6 +211,32 @@ def result(verdict: str, host: str = "judydoll.com", **over) -> PreflightResult:
     return PreflightResult(host=host, verdict=v, retryable=v is Verdict.TRANSPORT_ERROR, market="US", **over)
 
 
+# EVERY stand-in preflight call in this file is written here (host, attempt-order kwargs), and an
+# autouse fixture fails any test in which one carried a buyer. It cannot live INSIDE the stand-in:
+# the job survives an exception from a preflight (counted as a crash), so an assertion raised
+# there would be swallowed. Reviewer's mutant X3 — no buyer on attempt 1, a CartPrefill on the
+# RETRY — survived while only first calls were checked.
+_PREFLIGHT_CALLS: List[Tuple[str, dict]] = []
+
+
+def _seen(host: str, kwargs: dict) -> None:
+    _PREFLIGHT_CALLS.append((host, dict(kwargs)))
+
+
+def assert_no_buyer_in(calls) -> None:
+    for host, kwargs in calls:
+        assert "buyer" in kwargs, f"{host}: the job stopped passing buyer= explicitly"
+        assert kwargs["buyer"] is None, f"{host}: a buyer reached the preflight: {kwargs['buyer']!r}"
+
+
+@pytest.fixture(autouse=True)
+def _no_buyer_on_any_attempt():
+    _PREFLIGHT_CALLS.clear()
+    yield
+    assert_no_buyer_in(_PREFLIGHT_CALLS)
+    _PREFLIGHT_CALLS.clear()
+
+
 class SpyPreflight:
     """A stand-in preflight: returns scripted results per host, records every call's kwargs."""
 
@@ -219,6 +249,7 @@ class SpyPreflight:
 
     async def __call__(self, host, **kwargs):
         self.calls.append((host, kwargs))
+        _seen(host, kwargs)
         self.in_flight += 1
         self.max_in_flight = max(self.max_in_flight, self.in_flight)
         try:
@@ -388,6 +419,18 @@ async def test_every_preflight_call_carries_no_buyer_and_the_rows_market_variant
                     "luafee.jp": ("JP", "47000000000002", None)}
 
 
+async def test_the_retry_through_the_real_preflight_sends_no_prefill_either():
+    """X3's shape end to end: attempt 1 dies on a transport error before any cart; the RETRY is
+    the attempt that follows the permalink, and it must carry no `checkout[...]`."""
+    clock = FakeClock()
+    store = Storefronts(clock, {"judydoll.com": "flaky_once"})
+    summary = await run(clock=clock, dry_run=True, merchants=merchants("judydoll.com"), transport=store.transport())
+    assert summary.counts == {"ELIGIBLE": 1} and summary.outcomes[0].attempts == 2
+    cart = [u for u in store.urls() if "/cart/" in u]
+    assert len(cart) == 1
+    assert "checkout%5B" not in cart[0] and "checkout[" not in cart[0]
+
+
 async def test_the_real_preflight_sends_no_prefill_parameters():
     clock = FakeClock()
     store = Storefronts(clock, {"judydoll.com": "eligible"})
@@ -415,12 +458,16 @@ async def test_a_retryable_result_is_retried_exactly_once():
     assert [h for h, _ in spy.calls].count("podl.us") == 2
     assert 2.0 in clock.sleeps
     assert summary.exit_code == job.EXIT_INDEFINITE
+    # The RETRY carries no buyer either — every call, not only the first.
+    assert len(spy.calls) == 4
+    assert all(kwargs.get("buyer", "MISSING") is None for _, kwargs in spy.calls), spy.calls
 
 
 @pytest.mark.parametrize("verdict", ["UNCLASSIFIED", "VARIANT_UNVERIFIED", "INVALID_INPUT", "ELIGIBLE", "LOGIN_REQUIRED"])
 async def test_a_non_retryable_result_is_not_retried(verdict):
     spy = SpyPreflight({"judydoll.com": [verdict, "ELIGIBLE"]})
     summary = await run(dry_run=True, merchants=merchants("judydoll.com"), preflight_fn=spy)
+    assert all(kwargs.get("buyer", "MISSING") is None for _, kwargs in spy.calls)
     assert len(spy.calls) == 1
     assert summary.outcomes[0].attempts == 1
     assert summary.outcomes[0].result.verdict.value == verdict
@@ -517,6 +564,7 @@ async def test_a_budget_hit_during_the_retry_keeps_the_first_result():
     clock = FakeClock()
 
     async def slow_flake(host, **kwargs):
+        _seen(host, kwargs)
         clock.now += 30
         return result("TRANSPORT_ERROR", host=host)
 
@@ -588,6 +636,7 @@ async def test_a_record_failure_exits_non_zero_and_does_not_stop_the_run():
 
 async def test_a_crashing_preflight_is_counted_and_the_rest_still_run():
     async def crashy(host, **kwargs):
+        _seen(host, kwargs)
         if host == "podl.us":
             raise RuntimeError("bug")
         return result("ELIGIBLE", host=host)

@@ -26,7 +26,9 @@ WHAT IT DOES. For every row that names a `variant_id`:
      exercise a product a buyer would actually purchase.
 
 WHAT IT NEVER DOES. It never follows a cart permalink and never touches /cart or /checkouts, so
-it creates NO checkouts. Every request is a read-only GET of a public storefront JSON or redirect,
+it creates NO checkouts. It may request ONLY /variants/<id>, /products/<handle>[.js] and
+/products.json, optionally under one locale segment; anything else, a redirect target included,
+is refused before it is sent. Every request is a read-only GET of a public storefront JSON or redirect,
 paced through the same global limiter as the eligibility job (>= 1.5 s between request starts).
 Run it from a laptop or the crawl subnet — never from the worker (the payment-allowlisted NAT).
 
@@ -82,19 +84,33 @@ _LIPSTICK_RE = re.compile(r"\blipsticks?\b")
 
 def _words(*parts: Any) -> str:
     return " ".join(re.split(r"[^a-z0-9]+", " ".join(str(p or "") for p in parts).lower()))
-_FORBIDDEN_PATHS = ("/cart", "/checkouts", "/checkout")
+
+
+# THE ONLY PATHS THIS SCRIPT MAY REQUEST, with at most one leading locale segment (`/en-us`,
+# `/ja`, `/en-sg`). An ALLOWLIST, not a denylist: the earlier guard refused paths STARTING with
+# /cart or /checkouts, so a redirect to `/en-us/cart/123:1` or `/<shop_id>/checkouts/...` passed
+# (review of #2213). Anything not listed here is refused, and the check runs on every request the
+# client sends, so it holds after redirects too.
+_ALLOWED_PATH = re.compile(
+    r"^(?:/[a-z]{2}(?:-[a-z0-9]{2,4})?)?"
+    r"/(?:variants/[0-9]+|products\.json|products/[^/]+)$"
+)
+
+
+def path_allowed(path: str) -> bool:
+    return bool(_ALLOWED_PATH.fullmatch(path or ""))
 
 
 class ReadOnlyTransport(httpx.AsyncBaseTransport):
-    """Refuses anything but a GET, and any path that could create a cart or a checkout. The
-    script's own code never builds one; this makes a redirect that tries it fail loudly too."""
+    """Refuses anything but a GET of an allowlisted storefront read (`_ALLOWED_PATH`). The
+    script's own code never builds anything else; this makes a redirect that tries it fail
+    loudly too."""
 
     def __init__(self, inner: httpx.AsyncBaseTransport) -> None:
         self._inner = inner
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        path = request.url.path.lower()
-        if request.method != "GET" or any(path == p or path.startswith(p + "/") for p in _FORBIDDEN_PATHS):
+        if request.method != "GET" or not path_allowed(request.url.path):
             raise RuntimeError(f"refused non-read-only request: {request.method} {request.url.host}{request.url.path}")
         return await self._inner.handle_async_request(request)
 

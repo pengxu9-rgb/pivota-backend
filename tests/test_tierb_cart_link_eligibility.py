@@ -574,11 +574,22 @@ async def test_eligibility_is_per_market():
     assert await elig.is_cart_link_eligible("judydoll.com", "SG") is False
 
 
-@pytest.mark.parametrize("bad", [0, -1, float("nan"), float("inf"), True, "48", None])
-async def test_a_nonsense_max_age_is_refused(bad):
+@pytest.mark.parametrize("bad", [0, -1, 8761, 10**9, 1.5, 48.0, float("nan"), float("inf"), True, "48", None])
+async def test_a_nonsense_max_age_is_refused_before_any_sql(bad, monkeypatch):
     await elig.record_result("judydoll.com", "US", res("ELIGIBLE"))
+
+    async def no_sql(*a, **k):  # pragma: no cover - reached only by a regression
+        raise AssertionError("SQL ran before max_age_hours was validated")
+
+    monkeypatch.setattr(elig.database, "fetch_one", no_sql)
     with pytest.raises(ValueError):
         await elig.is_cart_link_eligible("judydoll.com", "US", max_age_hours=bad)
+
+
+@pytest.mark.parametrize("edge", [1, 8760])
+async def test_the_max_age_bounds_are_inclusive(edge):
+    await elig.record_result("judydoll.com", "US", res("ELIGIBLE"))
+    assert await elig.is_cart_link_eligible("judydoll.com", "US", max_age_hours=edge) is True
 
 
 # ── the key ─────────────────────────────────────────────────────────────────────────────────
@@ -616,9 +627,36 @@ async def test_a_malformed_key_is_refused_on_write_and_on_read(domain, market):
         await elig.record_result(domain, market, res("ELIGIBLE", host="judydoll.com"))
     with pytest.raises(ValueError):
         await elig.get_eligibility(domain, market)
-    with pytest.raises(ValueError):
-        await elig.is_cart_link_eligible(domain, market)
     assert await _count() == 0
+
+
+@pytest.mark.parametrize("domain, market", [
+    ("https://judydoll.com/", "US"), ("https://judydoll.com/cart/1:1?checkout[email]=a@b.test", "US"),
+    ("", "US"), ("judydoll", "US"), (None, "US"), ("judydoll.com", "USA"), ("judydoll.com", None),
+])
+async def test_the_gate_answers_false_never_raises_for_a_key_it_cannot_normalise(domain, market, caplog):
+    # A real ELIGIBLE row exists for the normalisable twin, so False is the refusal, not a miss.
+    await elig.record_result("judydoll.com", "US", res("ELIGIBLE"))
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger=elig.__name__):
+        assert await elig.is_cart_link_eligible(domain, market) is False
+    lines = [r.getMessage() for r in caplog.records if r.name == elig.__name__ and r.levelno == logging.WARNING]
+    assert len(lines) == 1, lines
+    # the host at most: never a scheme, a path, a query or the buyer's email
+    for leak in ("https://", "/cart", "checkout", "a@b.test", "?"):
+        assert leak not in lines[0], lines[0]
+    if isinstance(domain, str) and "judydoll.com" in domain and market == "US":
+        assert "host=judydoll.com" in lines[0]
+
+
+async def test_a_normalisable_key_logs_nothing_and_answers_from_the_row(caplog):
+    await elig.record_result("judydoll.com", "US", res("ELIGIBLE"))
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger=elig.__name__):
+        assert await elig.is_cart_link_eligible("WWW.judydoll.com", "us") is True
+    assert not [r for r in caplog.records if r.name == elig.__name__]
 
 
 # ── CHECKOUT_MARKET_MISMATCH and checkout_country (#2209 @ 4e12d5a2) ────────────────────────
@@ -674,3 +712,17 @@ async def test_the_database_refuses_a_malformed_checkout_country():
             f"INSERT INTO {TABLE} (shop_domain, market, checkout_country) VALUES ('judydoll.com', 'US', 'us')"
         )
     assert await _count() == 0
+
+
+def test_the_postgres_gate_runs_when_the_suites_it_imports_change():
+    """tests/test_tierb_cart_link_eligibility_postgres.py imports its database cases from this file
+    and the job suite; neither matches the gate's `tests/test_*_postgres.py` glob. A PR touching
+    only them must still trigger the gate that runs them on Postgres."""
+    import yaml
+
+    workflow = os.path.join(os.path.dirname(__file__), "..", ".github", "workflows", "postgres-dialect-gate.yml")
+    with open(workflow, encoding="utf-8") as fh:
+        doc = yaml.safe_load(fh)
+    paths = (doc.get("on") or doc.get(True))["pull_request"]["paths"]
+    for suite in ("tests/test_tierb_cart_link_eligibility.py", "tests/test_tierb_cart_link_eligibility_job.py"):
+        assert suite in paths, suite

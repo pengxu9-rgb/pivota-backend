@@ -159,23 +159,56 @@ async def test_nothing_qualifying_is_no_replacement():
         assert await hints.pick_replacement(client, "x.com", "US", max_pages=3) is None
 
 
-@pytest.mark.parametrize("method, path", [("GET", "/cart/1:1"), ("GET", "/checkouts/cn/T"), ("GET", "/cart"),
-                                          ("POST", "/products.json"), ("GET", "/checkout")])
-async def test_the_transport_refuses_anything_that_could_create_a_cart_or_checkout(method, path):
+REFUSED_PATHS = [
+    "/cart/1:1", "/cart", "/checkouts/cn/T", "/checkout",
+    # the two bypasses the denylist let through (review of #2213)
+    "/en-us/cart/123:1", "/12345678/checkouts/cn/T/information",
+    # anything else that is not one of the four reads
+    "/", "/account/login", "/products/a/b", "/variants/abc", "/collections/all/products.json",
+    "/en-us/fr/products.json", "/cart/add.js", "/products", "/variants/1/extra",
+]
+ALLOWED_PATHS = [
+    "/variants/40975353675861", "/products/mac-lipstick", "/products/mac-lipstick.js", "/products.json",
+    "/en-us/products.json", "/ja/products/%EB%B0%A4.js", "/en-sg/variants/1", "/products/acv-shampoo-530ml-사본",
+]
+
+
+@pytest.mark.parametrize("path", REFUSED_PATHS)
+async def test_the_transport_refuses_every_path_off_the_allowlist(path):
     shop = Shop()
     async with shop.client() as client:
         with pytest.raises(RuntimeError, match="refused"):
-            await client.request(method, f"https://x.com{path}")
+            await client.get(f"https://x.com{path}")
+    assert shop.requests == []
+    assert hints.path_allowed(path) is False
+
+
+@pytest.mark.parametrize("path", ALLOWED_PATHS)
+def test_the_allowlist_admits_the_four_reads_with_an_optional_locale(path):
+    assert hints.path_allowed(httpx.URL(f"https://x.com{path}").path) is True
+
+
+async def test_a_post_to_an_allowed_path_is_refused():
+    shop = Shop()
+    async with shop.client() as client:
+        with pytest.raises(RuntimeError, match="refused"):
+            await client.post("https://x.com/products.json")
     assert shop.requests == []
 
 
-async def test_a_redirect_into_the_cart_is_refused_too():
+@pytest.mark.parametrize("location", ["/cart/1:1", "/en-us/cart/123:1", "/12345678/checkouts/cn/T",
+                                      "https://shop.app/checkouts/x"])
+async def test_a_redirect_off_the_allowlist_is_refused_too(location):
+    sent = []
+
     async def routed(request):
-        return httpx.Response(302, headers={"location": "/cart/1:1"})
+        sent.append(request.url.path)
+        return httpx.Response(302, headers={"location": location})
 
     async with httpx.AsyncClient(transport=hints.ReadOnlyTransport(httpx.MockTransport(routed))) as client:
         with pytest.raises(RuntimeError, match="refused"):
             await hints.variant_redirect(client, "x.com", "1")
+    assert sent == ["/variants/1"]  # the redirect target never reached the network
 
 
 def test_the_file_is_written_one_row_per_line_in_key_order():

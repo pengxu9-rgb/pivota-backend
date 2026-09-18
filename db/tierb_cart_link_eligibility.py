@@ -44,9 +44,10 @@ under, is refused: that is a caller mixing up two merchants, and the row would b
 
 from __future__ import annotations
 
-import math
+import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, FrozenSet, Optional
+from urllib.parse import urlsplit
 
 from db.database import IS_POSTGRES, database
 from db.tierb_cart_link_eligibility_schema import ensure_schema
@@ -67,6 +68,10 @@ __all__ = [
 
 TABLE = "tierb_cart_link_eligibility"
 DEFAULT_MAX_AGE_HOURS = 48
+MIN_MAX_AGE_HOURS = 1
+MAX_MAX_AGE_HOURS = 8760  # a year: beyond that "fresh" means nothing
+
+logger = logging.getLogger(__name__)
 
 DEFINITE_VERDICTS: FrozenSet[Verdict] = frozenset({
     Verdict.ELIGIBLE,
@@ -356,21 +361,46 @@ async def get_eligibility(domain: str, market: str) -> Optional[Dict[str, Any]]:
     return _normalize_row(row)
 
 
+def _host_for_log(value: Any) -> str:
+    """The HOST of whatever a caller passed, and nothing more: a caller that hands this gate a
+    full URL must not get its path or query into our logs."""
+    if not isinstance(value, str):
+        return f"<{type(value).__name__}>"
+    text = value.strip()
+    try:
+        host = urlsplit(text if "//" in text else f"//{text}").hostname
+    except ValueError:
+        host = None
+    return (host or "<unparseable>")[:253]
+
+
 async def is_cart_link_eligible(
-    domain: str, market: str, *, max_age_hours: float = DEFAULT_MAX_AGE_HOURS
+    domain: str, market: str, *, max_age_hours: int = DEFAULT_MAX_AGE_HOURS
 ) -> bool:
     """True ONLY when the last definite verdict is ELIGIBLE and it was observed within
     `max_age_hours` (measured on `checked_at`, by the database clock). No row, a NULL verdict,
     any other verdict, or a stale ELIGIBLE -> False.
 
+    A domain or market it cannot normalise (e.g. `https://judydoll.com/`) is NOT an error for a
+    gate: it returns False, and logs at WARNING naming only the host. `max_age_hours` outside
+    1..8760 (an int) IS a programming error and raises ValueError, before any SQL.
+
     Database errors propagate: whether an outage should close Tier B or fail the request is the
     caller's decision, and a swallowed error here would be indistinguishable from "no".
     """
-    if isinstance(max_age_hours, bool) or not isinstance(max_age_hours, (int, float)):
-        raise ValueError("max_age_hours must be a number")
-    if not math.isfinite(max_age_hours) or not max_age_hours > 0:
-        raise ValueError("max_age_hours must be a positive finite number")
-    params = {**_key(domain, market), "max_age_seconds": int(max_age_hours * 3600)}
+    if isinstance(max_age_hours, bool) or not isinstance(max_age_hours, int):
+        raise ValueError("max_age_hours must be an int")
+    if not MIN_MAX_AGE_HOURS <= max_age_hours <= MAX_MAX_AGE_HOURS:
+        raise ValueError(f"max_age_hours must be in {MIN_MAX_AGE_HOURS}..{MAX_MAX_AGE_HOURS}")
+    try:
+        key = _key(domain, market)
+    except ValueError:
+        logger.warning(
+            "tierb eligibility: refused an un-normalisable key (host=%s market=%.8r); not eligible",
+            _host_for_log(domain), market,
+        )
+        return False
+    params = {**key, "max_age_seconds": max_age_hours * 3600}
     if IS_POSTGRES:
         row = await database.fetch_one(_SELECT_ELIGIBLE_SQL, params)
     else:

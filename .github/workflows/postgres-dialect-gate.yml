@@ -141,6 +141,11 @@ on:
       # Postgres arm is the half that tests the statements which actually ship.
       - "tests/test_quality_backfill_partial_update.py"
       - "tests/test_quality_backfill_enqueue_dedupe.py"
+      # tests/test_tierb_cart_link_eligibility_postgres.py IMPORTS its database cases from these
+      # two (so the storage rules and the mocked end-to-end job run on Postgres). Neither matches
+      # the `_postgres` glob, so a PR touching only them would not run the gate that runs them.
+      - "tests/test_tierb_cart_link_eligibility.py"
+      - "tests/test_tierb_cart_link_eligibility_job.py"
       - "requirements.txt"
       - "requirements-dev.txt"
       - ".github/workflows/postgres-dialect-gate.yml"
