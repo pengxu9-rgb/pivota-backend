@@ -183,6 +183,7 @@ async def _db():
     await ensure_required_schema_light()
 
     import sqlalchemy
+    from db.accounts import shop_users
     from db.buyer_vault import buyer_identity_links
     from db.catalog import catalog_merchants, catalog_offers, catalog_products, catalog_skus
 
@@ -196,12 +197,16 @@ async def _db():
             catalog_offers,
             catalog_merchants,
             buyer_identity_links,
+            # Built so the mint test can PROVE no account row is created for a minted buyer.
+            # Without the table that assertion raises "no such table", which is not the same
+            # statement and would go on "passing" as an error if it were ever swallowed.
+            shop_users,
         ],
         checkfirst=True,
     )
     engine.dispose()
 
-    for table in CATALOG_TABLES + ("buyer_identity_links",):
+    for table in CATALOG_TABLES + ("buyer_identity_links", "shop_users"):
         await database.execute(f"DELETE FROM {table}")
     yield
 
@@ -494,14 +499,294 @@ async def test_every_route_refuses_401_without_an_agent_user(client):
         assert _error(resp) == "agent_user_required"
 
 
-async def test_a_missing_buyer_link_refuses_rather_than_minting_a_buyer(client):
+# ── WP4b: the buyer identity is minted on the first purchase ─────────────────────────────────
+#
+# This block replaces `test_a_missing_buyer_link_refuses_rather_than_minting_a_buyer`, which
+# asserted the WP4 behaviour the owner reversed on 2026-09-18. The refusal it pinned —
+# `buyer_unlinked` on an agent-only buyer — no longer exists on this route.
+
+
+async def _links() -> list:
+    rows = await database.fetch_all(
+        "SELECT agent_id, agent_user_ref_hash, buyer_id FROM buyer_identity_links"
+    )
+    return [dict(r) for r in rows]
+
+
+async def test_the_first_purchase_mints_exactly_one_buyer_one_link_and_one_ref(client):
+    """The whole of WP4b in one assertion set: an agent-only buyer, never seen before, gets a
+    purchase — and gets exactly one of each thing behind it."""
     await _seed_catalog()
     await _seed_eligibility()
+
     resp = await client.post(f"{BASE}/purchases", json=_body())
-    assert resp.status_code == 409
-    assert _error(resp) == "buyer_unlinked"
-    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+
+    assert resp.status_code == 202
+    links = await _links()
+    assert len(links) == 1
+    assert links[0]["agent_id"] == AGENT
+    assert links[0]["agent_user_ref_hash"] == hash_agent_user_ref(USER_REF)
+    assert str(links[0]["buyer_id"]).strip()
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_buyer_refs") == 1
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 1
+
+
+async def test_the_minted_buyer_id_is_not_derived_from_the_email(client):
+    """THE SECURITY PROPERTY, not a formatting preference.
+
+    `db.accounts.create_or_get_shop_user` is create-or-GET: handed an email that already has an
+    account it returns THAT account's id. If this route minted through it, an agent asserting a
+    stranger's address would be handed the stranger's real buyer_id — and
+    `_buyer_prefill_from_identity_link` would then hand that agent the account's email and
+    default shipping address. So the minted id must contain nothing from the request, and no
+    `shop_users` row may be created for it.
+    """
+    await _seed_catalog()
+    await _seed_eligibility()
+    await client.post(f"{BASE}/purchases", json=_body())
+
+    buyer_id = (await _links())[0]["buyer_id"]
+    assert EMAIL not in buyer_id
+    assert EMAIL.split("@")[0] not in buyer_id
+    assert USER_REF not in buyer_id
+    assert hash_agent_user_ref(USER_REF) not in buyer_id
+    # The id space, so no reader can tell a minted buyer from a signed-up one by its shape.
+    assert buyer_id.startswith("u_")
+    assert len(buyer_id) == 18
+
+    #: No account row is created, and the prefill reader tolerates that — it returned None for
+    #: this buyer yesterday, when there was no link at all, and it returns None now.
+    assert await database.fetch_val(
+        "SELECT COUNT(*) FROM shop_users WHERE id = :id", {"id": buyer_id}
+    ) == 0
+
+
+async def test_a_second_purchase_reuses_the_buyer_the_link_and_the_enrollment(client):
+    """Idempotent. A second ref would be a second enrollment, which is a second card."""
+    await _seed_catalog()
+    await _seed_eligibility()
+
+    first = await client.post(f"{BASE}/purchases", json=_body())
+    buyer_id = (await _links())[0]["buyer_id"]
+    second = await client.post(f"{BASE}/purchases", json=_body())
+
+    assert second.status_code == 202
+    assert len(await _links()) == 1
+    assert (await _links())[0]["buyer_id"] == buyer_id
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_buyer_refs") == 1
+    a = (await _purchase_row(first.json()["purchase_id"]))["buyer_ref"]
+    b = (await _purchase_row(second.json()["purchase_id"]))["buyer_ref"]
+    assert a == b
+
+
+async def test_a_buyer_already_linked_by_the_hosted_checkout_is_not_re_minted(client):
+    """The link a HUMAN's sign-in wrote is the one that stands. A route that overwrote it would
+    detach a real account from the agent session that belongs to it."""
+    await _seed_all()
+
+    resp = await client.post(f"{BASE}/purchases", json=_body())
+
+    assert resp.status_code == 202
+    links = await _links()
+    assert len(links) == 1
+    assert links[0]["buyer_id"] == BUYER_ID
+
+
+async def test_two_agents_with_the_same_user_ref_get_two_buyers(client):
+    """`agent_user_ref` is opaque and agent-scoped: "user-ada" at two agents is two people, and
+    the link's key is the PAIR. One buyer for both would merge two strangers' cards."""
+    await _seed_catalog()
+    await _seed_eligibility()
+
+    await client.post(f"{BASE}/purchases", json=_body())
+    CALLER.agent_id = OTHER_AGENT
+    await client.post(f"{BASE}/purchases", json=_body())
+
+    links = await _links()
+    assert len(links) == 2
+    assert {l["agent_id"] for l in links} == {AGENT, OTHER_AGENT}
+    assert len({l["buyer_id"] for l in links}) == 2
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_buyer_refs") == 2
+
+
+async def test_a_link_written_between_the_read_and_the_insert_wins(client):
+    """THE RACE, simulated where it actually bites.
+
+    Two concurrent first POSTs both SELECT nothing and both INSERT. The unique constraint on
+    `(agent_id, agent_user_ref_hash)` lets exactly one land; `ON CONFLICT DO NOTHING` absorbs the
+    other, and the route then RE-READS rather than returning what it minted. Pre-inserting the
+    row is the same situation from the loser's point of view, and it is the one that can be
+    written deterministically: the winner's buyer_id must come back, not ours.
+    """
+    await _seed_catalog()
+    await _seed_eligibility()
+    await _seed_link(buyer_id="u_thewinner00000")
+
+    resp = await client.post(f"{BASE}/purchases", json=_body())
+
+    assert resp.status_code == 202
+    links = await _links()
+    assert len(links) == 1, "the loser inserted a second link instead of yielding"
+    assert links[0]["buyer_id"] == "u_thewinner00000"
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_buyer_refs") == 1
+    row = await _purchase_row(resp.json()["purchase_id"])
+    ref = await database.fetch_val(
+        "SELECT reap_buyer_ref FROM reap_agentic_buyer_refs WHERE buyer_id = :b",
+        {"b": "u_thewinner00000"},
+    )
+    assert row["buyer_ref"] == ref, "the purchase was opened under a ref that is not the winner's"
+
+
+async def test_two_first_purchases_in_flight_leave_one_buyer_one_link_and_one_ref(client):
+    """Both callers run the whole handler; only one row of each may exist afterwards."""
+    import asyncio
+
+    await _seed_catalog()
+    await _seed_eligibility()
+
+    first, second = await asyncio.gather(
+        client.post(f"{BASE}/purchases", json=_body()),
+        client.post(f"{BASE}/purchases", json=_body()),
+    )
+
+    assert first.status_code == 202
+    assert second.status_code == 202
+    assert len(await _links()) == 1
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_buyer_refs") == 1
+    a = (await _purchase_row(first.json()["purchase_id"]))["buyer_ref"]
+    b = (await _purchase_row(second.json()["purchase_id"]))["buyer_ref"]
+    assert a == b
+
+
+async def test_the_minted_buyer_id_is_never_in_the_response(client):
+    await _seed_catalog()
+    await _seed_eligibility()
+
+    resp = await client.post(f"{BASE}/purchases", json=_body())
+    buyer_id = (await _links())[0]["buyer_id"]
+
+    assert buyer_id not in resp.text
+    read = await client.get(f"{BASE}/purchases/{resp.json()['purchase_id']}")
+    assert buyer_id not in read.text
+    listed = await client.get(f"{BASE}/purchases")
+    assert buyer_id not in listed.text
+
+
+async def test_nothing_on_the_mint_path_logs_the_identity(client, caplog):
+    """The same detector as `test_nothing_on_this_path_logs_the_buyer`, aimed at what WP4b added:
+    the minted buyer id, the opaque ref, the ref hash and the consent tag. `_ours` excludes the
+    DRIVER loggers, which echo every bind parameter at DEBUG — that is the claim being made here,
+    "our code does not log the identity", not "no library ever sees it"."""
+    await _seed_catalog()
+    await _seed_eligibility()
+    with caplog.at_level(logging.DEBUG):
+        await client.post(f"{BASE}/purchases", json=_body())
+
+    buyer_id = (await _links())[0]["buyer_id"]
+    ref = await database.fetch_val("SELECT reap_buyer_ref FROM reap_agentic_buyer_refs")
+    ours = [record for record in caplog.records if _ours(record)]
+    # THE CONTROL, for the reason the twin above gives: an absence assertion passes when the
+    # mechanism is absent too.
+    assert ours, "precondition: this path logged something of ours to look at"
+    assert any("reap_agentic" in record.getMessage() for record in ours)
+
+    logged = "\n".join(record.getMessage() for record in ours)
+    for secret in (buyer_id, ref, hash_agent_user_ref(USER_REF), USER_REF, CONSENT):
+        assert secret not in logged
+
+
+# ── WP4b: consent ────────────────────────────────────────────────────────────────────────────
+
+
+async def test_a_purchase_without_consent_is_refused_before_anything_is_written(client):
+    await _seed_catalog()
+    await _seed_eligibility()
+
+    resp = await client.post(
+        f"{BASE}/purchases", json=_body(buyer={"email": EMAIL, "shipping_address": dict(ADDRESS)})
+    )
+
+    assert resp.status_code == 400
+    assert _error(resp) == "consent_required"
+    assert await _links() == []
     assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_buyer_refs") == 0
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+
+
+@pytest.mark.parametrize("value", ["", "   ", None, "v" * 33, "v1\x00"])
+async def test_a_blank_overlong_or_unprintable_consent_is_refused(client, value):
+    await _seed_all()
+    resp = await client.post(
+        f"{BASE}/purchases", json=_body(buyer=_buyer(consent_version=value))
+    )
+    assert resp.status_code == 400
+    assert _error(resp) == "consent_required"
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+
+
+async def test_the_dial_is_checked_before_consent_so_a_dark_rail_stays_dark(client, monkeypatch):
+    """THE ORDERING MUTANT'S TARGET. A consent check ahead of the dial answers 400 where every
+    well-formed request answers 404 — a working probe for a rail that is meant to be absent."""
+    monkeypatch.delenv("REAP_AGENTIC_ENABLED", raising=False)
+    resp = await client.post(
+        f"{BASE}/purchases", json=_body(buyer={"email": EMAIL, "shipping_address": dict(ADDRESS)})
+    )
+    assert resp.status_code == 404
+    assert _error(resp) == "not_available_on_this_rail"
+
+
+async def test_consent_is_stored_on_the_row_the_enrollment_hangs_off(client):
+    await _seed_catalog()
+    await _seed_eligibility()
+
+    await client.post(f"{BASE}/purchases", json=_body())
+
+    row = await database.fetch_one(
+        "SELECT consent_version, consented_at FROM reap_agentic_buyer_refs"
+    )
+    assert dict(row)["consent_version"] == CONSENT
+    assert dict(row)["consented_at"] is not None
+
+
+async def test_a_later_consent_version_replaces_the_stored_one(client):
+    """LATEST WINS. A buyer who accepted v2 has not un-accepted it by having a row saying v1."""
+    await _seed_catalog()
+    await _seed_eligibility()
+
+    await client.post(f"{BASE}/purchases", json=_body())
+    await client.post(
+        f"{BASE}/purchases", json=_body(buyer=_buyer(consent_version="reap-agentic-v2"))
+    )
+
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_buyer_refs") == 1
+    assert await database.fetch_val(
+        "SELECT consent_version FROM reap_agentic_buyer_refs"
+    ) == "reap-agentic-v2"
+
+
+async def test_consent_is_recorded_for_a_buyer_the_hosted_checkout_linked(client):
+    """The already-linked path writes the consent too — it is the path that mints no buyer, and
+    the one a `_record_consent` call could most easily be dropped from."""
+    await _seed_all()
+    await client.post(f"{BASE}/purchases", json=_body())
+    assert await database.fetch_val(
+        "SELECT consent_version FROM reap_agentic_buyer_refs WHERE buyer_id = :b",
+        {"b": BUYER_ID},
+    ) == CONSENT
+
+
+async def test_consent_is_not_part_of_the_idempotency_hash(client):
+    """A re-consent is not a different purchase. Folding the tag into the request hash would turn
+    a door that upgraded its consent version mid-retry into an `idempotency_conflict`."""
+    await _seed_all()
+    first = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="k-consent"))
+    second = await client.post(
+        f"{BASE}/purchases",
+        json=_body(idempotency_key="k-consent", buyer=_buyer(consent_version="v2")),
+    )
+    assert first.status_code == 202
+    assert second.status_code == 202
+    assert second.json()["purchase_id"] == first.json()["purchase_id"]
 
 
 # ── the happy path, and where the price comes from ───────────────────────────────────────────
