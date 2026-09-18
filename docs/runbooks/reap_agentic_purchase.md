@@ -21,7 +21,7 @@ transition.
 | state | what it means | this package's step calls | → |
 |---|---|---|---|
 | `resolving` | we have our catalog row, not Reap's variant | `resolve_our_row`; then either `get_active_enrollment` or `upsert_pending_enrollment` + `create_enrollment` | `needs_enrollment`, `quoting`, `refused`, `failed` |
-| `needs_enrollment` | buyer has a hosted card page open | `get_active_enrollment`; `upsert_pending_enrollment` (re-read); `get_enrollment`; `mark_enrollment_active` / `mark_enrollment_dead` | `quoting`, `expired` (sweep only), `failed` |
+| `needs_enrollment` | buyer has a hosted card page open | `get_active_enrollment`; `get_enrollment_internal` (re-read — a READ, not the old upsert-as-read); `get_enrollment`; `mark_enrollment_active` / `mark_enrollment_dead` | `quoting`, `expired` (sweep only), `failed` |
 | `quoting` | ready to price and hand the buyer a link | `get_active_enrollment`; `resolve_our_row` **again**; `request_quote`; **`verify_quote`**; `create_checkout` — **all in one step** | `awaiting_approval`, `refused`, `failed` |
 | `awaiting_approval` | buyer has the approval page | `get_checkout` | `processing`, `completed`, `failed`, `expired` |
 | `processing` | buyer approved; Reap is placing the order | `get_checkout` | `completed`, `failed` |
