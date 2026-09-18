@@ -1255,14 +1255,17 @@ def test_rank_offers_merit_first_does_not_demote_unknown_availability() -> None:
     assert [o["offer_id"] for o in ranked] == ["of:unknown", "of:silent", "of:in_stock"]
 
 
-def test_rank_offers_merit_first_stock_outranks_the_transactability_tiebreak() -> None:
-    """A buy-here offer that cannot be bought is not a tie worth winning."""
+def test_rank_offers_merit_first_never_demotes_an_internal_offer_on_its_summary_flag() -> None:
+    """Review of #2218: an internal offer exists only because the eligibility gate found its
+    variant sellable (reading `available` first); its summary `in_stock` reads inventory_quantity
+    alone, so an untracked-inventory variant says False. Demoting on that cut a buyable exact
+    match at limit=1 and flipped resolution_mode to external_only."""
     import routes.agent_shop_gateway as gateway
 
-    internal_sold_out = {**_internal_offer("of:internal", 0.9), "in_stock": False}
-    external_in_stock = {**_external_offer("of:external", 0.9), "in_stock": True}
-    ranked = gateway._rank_offers_merit_first([internal_sold_out, external_in_stock])
-    assert [o["offer_id"] for o in ranked] == ["of:external", "of:internal"]
+    internal_qty_zero = {**_internal_offer("of:internal", 0.95), "in_stock": False}
+    external_in_stock = {**_external_offer("of:external", 1.0), "in_stock": True}
+    ranked = gateway._rank_offers_merit_first([external_in_stock, internal_qty_zero])
+    assert [o["offer_id"] for o in ranked] == ["of:internal", "of:external"]
 
 
 def test_rank_offers_merit_first_stock_does_not_jump_a_fit_tier() -> None:

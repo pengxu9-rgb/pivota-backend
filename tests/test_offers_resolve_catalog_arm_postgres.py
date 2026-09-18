@@ -396,6 +396,10 @@ def test_the_sql_normalises_availability_exactly_as_the_stock_flag_does(pg_engin
     _seed_purito(pg_engine, eyurs=" SOLD_OUT ", sokoglam="in_stock", ohlolly="Unavailable")
     res = _resolve(_PURITO_CK, limit=1)
     assert _order(res) == ["of_sokoglam"]
+    # Tab and newline too: `btrim` alone strips only spaces, `.strip()` strips all of these.
+    _seed_purito(pg_engine, eyurs="\tout_of_stock\n", sokoglam="in_stock", ohlolly="sold_out\r")
+    res = _resolve(_PURITO_CK, limit=1)
+    assert _order(res) == ["of_sokoglam"]
 
 
 def test_the_host_dedupe_keeps_the_in_stock_listing_of_a_host(pg_engine):
@@ -415,3 +419,16 @@ def test_the_host_dedupe_keeps_the_in_stock_listing_of_a_host(pg_engine):
         str(s.get("source")) == "catalog_offers" and s.get("deduped") == 1
         for s in ((res.get("metadata") or {}).get("sources") or [])
     )
+
+
+def test_a_price_tie_is_cut_by_offer_id_the_same_way_every_time(pg_engine):
+    """Two in-stock sellers at one price: without a final key the LIMIT picks whichever row the
+    plan yields first. Seeded in REVERSE id order so insertion order cannot pass this."""
+    _seed(pg_engine)
+    _seed_listing(pg_engine, "ext:retailer:tie-b", "sig_tie_b", "ck_tie",
+                  "agent_seed::retailer::sokoglam.com", "of_tie_b", 15.00,
+                  "https://sokoglam.com/products/tie")
+    _seed_listing(pg_engine, "ext:retailer:tie-a", "sig_tie_a", "ck_tie",
+                  "agent_seed::retailer::ohlolly.com", "of_tie_a", 15.00,
+                  "https://ohlolly.com/products/tie")
+    assert _order(_resolve("ck_tie", limit=1)) == ["of_tie_a"]

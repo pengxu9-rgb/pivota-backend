@@ -3864,11 +3864,22 @@ OFFER_UNAVAILABLE_AVAILABILITIES: frozenset[str] = frozenset(
 
 
 def _offer_is_known_unavailable(offer: Dict[str, Any]) -> bool:
-    """True only on an explicit statement that this seller cannot sell it now."""
-    if offer.get("in_stock") is False:
-        return True
-    availability = str(offer.get("availability") or "").strip().lower()
-    return availability in OFFER_UNAVAILABLE_AVAILABILITIES
+    """True only on an explicit statement that this seller cannot sell it now.
+
+    Reads the `in_stock` flag, which every external lane emits (the catalog arm derives it from
+    OFFER_UNAVAILABLE_AVAILABILITIES). There is no separate `availability` check here on purpose:
+    no lane ships an unavailable `availability` beside a True flag, so one would be dead code.
+
+    INTERNAL (buy-here) OFFERS ARE NEVER DEMOTED ON THIS FLAG. They are built only from a variant
+    that `pick_first_eligible_variant_from_standard_product` already passed, and that gate refuses
+    out-of-stock variants reading the variant's `available` first. The summary's `in_stock` reads
+    `inventory_quantity` alone, so an untracked / keep-selling Shopify variant (available, quantity
+    0) shows False. Demoting on it would second-guess the gate with the weaker signal: at limit=1
+    it cut a buyable exact match and flipped `resolution_mode` from exact_match to external_only.
+    """
+    if str(offer.get("purchase_route") or "") == "internal_checkout":
+        return False
+    return offer.get("in_stock") is False
 
 
 def _rank_offers_merit_first(offers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -3894,8 +3905,8 @@ def _rank_offers_merit_first(offers: List[Dict[str, Any]]) -> List[Dict[str, Any
     2026-09-18, ``get_offers`` on the Purito Oat-in Calming Gel Cream led with eyurs.com at $13,
     out of stock, over sokoglam.com at $19.50, in stock. It is INSIDE the fit tier, not above it,
     on purpose: a product-grain "in stock" says some variant is on the shelf, not the one that
-    matched exactly, so it must not jump an exact match. It sits ABOVE transactability because a
-    buy-here offer that cannot be bought is not a tiebreak worth winning.
+    matched exactly, so it must not jump an exact match. It applies to referred offers only —
+    an internal offer already passed a stock gate (see ``_offer_is_known_unavailable``).
 
     Sort key (all ascending): (fit_tier_rank, unavailable, transactability_rank, -confidence).
     The sort is stable, so equal-key offers keep prior order — a pure-internal set (same-product
@@ -5867,7 +5878,10 @@ async def _handle_offers_resolve(
                      -- stock: see OFFER_UNAVAILABLE_AVAILABILITIES, which this binds, so the
                      -- order matches the `in_stock` flag computed below. `offer_id` makes a
                      -- price tie cut the same way every time.
-                     ORDER BY (lower(btrim(coalesce(o.availability, '')))
+                     -- The btrim set is the ASCII whitespace Python's .strip() removes, so
+                     -- a tab- or newline-padded value sorts the way its flag reads.
+                     ORDER BY (lower(btrim(coalesce(o.availability, ''),
+                                           E' \t\n\r\f\v'))
                                = ANY(:unavailable)) ASC,
                               price_amount ASC,
                               o.offer_id ASC
