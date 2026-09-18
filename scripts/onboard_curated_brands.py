@@ -28,7 +28,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from services.catalog_identity import validated_source_gtin  # noqa: E402
-from services.catalog_enrichment_agent.apply import apply_ingest_plan  # noqa: E402
+from services.catalog_enrichment_agent.apply import (  # noqa: E402
+    apply_ingest_plan, find_legacy_retailer_listing_owners, legacy_listing_refusal, planned_retailer_listings,
+)
 from services.catalog_enrichment_agent.ingestion import ingest_validated_jsonl  # noqa: E402
 from services.catalog_enrichment_agent.primary_ingestion import (  # noqa: E402
     inspect_primary_plan, require_primary_plan, require_primary_apply,
@@ -197,6 +199,102 @@ def _select_by_gtin(records: List[Dict[str, Any]], canonical: set, *, domain: st
     return kept, matched
 
 
+#: Its own line, never merged into `primary ingestion:` — scripts/curated_apply_gate.py parses that
+#: marker, and the plan inspection it prints must stay the pure-plan verdict the worker also computes.
+LEGACY_LISTINGS_MARKER = "legacy listings: "
+
+
+class _SelectOnlyHandle:
+    """The preflight's only handle on the catalog DB: one method, and it refuses non-SELECT text.
+
+    `find_legacy_retailer_listing_owners` needs nothing else, so anything that tries to write
+    through this handle fails with AttributeError (no execute/transaction) or PermissionError.
+    """
+
+    def __init__(self, database: Any) -> None:
+        self._database = database
+
+    async def fetch_all(self, query: str, values: Optional[Dict[str, Any]] = None) -> Any:
+        if not str(query).lstrip().upper().startswith("SELECT"):
+            raise PermissionError("legacy listing preflight is SELECT-only")
+        return await self._database.fetch_all(query, values)
+
+
+def _preflight_database() -> tuple:
+    """(database, None) for the configured Postgres catalog, or (None, reason). Never prints the URL.
+
+    db.database falls back to a local sqlite file when DATABASE_URL is unset; a preflight run against
+    that would report "clear" about a catalog it never read, so anything but Postgres is refused.
+    """
+    import db.database as db_module
+
+    if not str(getattr(db_module, "DATABASE_URL", "") or "").lower().startswith("postgres"):
+        return None, "no_postgres_database_url"
+    return db_module.database, None
+
+
+async def _legacy_listing_report(plan: Dict[str, Any], *, check: bool) -> Dict[str, Any]:
+    """Which planned listings an older, non-`ext:retailer:` catalog row already owns.
+
+    This is the apply guard (apply._refuse_parallel_retailer_listings) run ahead of time over the
+    SAME finder and SQL, so a dry run can say what the apply will refuse. It is read-only and opt-in
+    (--check-legacy-listings): when not requested, the report says `unchecked` rather than going
+    silent, because a silent dry run is how Wave 1 read `ready_to_apply` for a cohort (haruharu
+    wonder at ohlolly.com) that the apply then refused. Suppressed owners are listed and COUNTED as
+    conflicts, because the apply refuses on them too.
+    """
+    listings = planned_retailer_listings(plan)
+    report: Dict[str, Any] = {"planned_listings": len(listings)}
+    if not listings:
+        return {**report, "status": "not_applicable"}
+    if not check:
+        return {**report, "status": "unchecked",
+                "hint": "pass --check-legacy-listings (a SELECT on catalog_products) to see what apply will refuse"}
+    database, reason = _preflight_database()
+    if database is None:
+        return {**report, "status": "error", "error": reason}
+    connected_here = False
+    try:
+        if not getattr(database, "is_connected", False):
+            await database.connect()
+            connected_here = True
+        findings = await find_legacy_retailer_listing_owners(plan, _SelectOnlyHandle(database))
+    except Exception as exc:  # noqa: BLE001 — reported, never swallowed into "clear"
+        # The class only: a driver error can quote its connection string.
+        return {**report, "status": "error", "error": type(exc).__name__}
+    finally:
+        if connected_here and getattr(database, "is_connected", False):
+            await database.disconnect()
+
+    by_listing: Dict[str, Dict[str, Any]] = {}
+    for finding in findings:
+        if finding["kind"] != "conflict":
+            continue
+        entry = by_listing.setdefault(finding["listing"], {
+            "listing": finding["listing"], "planned_product_key": finding["planned_product_key"], "legacy_owners": [],
+        })
+        entry["legacy_owners"].append({
+            "product_key": finding["legacy_product_key"],
+            "suppressed": finding["suppressed"],
+            "suppression_reason": finding["suppression_reason"],
+        })
+    owners = [o for entry in by_listing.values() for o in entry["legacy_owners"]]
+    return {
+        **report,
+        "status": "conflicts" if findings else "clear",
+        "apply_would_refuse": bool(findings),
+        "apply_refusal": legacy_listing_refusal(findings[0]) if findings else None,
+        "conflict_count": len(owners),
+        "suppressed_conflict_count": sum(1 for o in owners if o["suppressed"]),
+        "listings_with_conflicts": len(by_listing),
+        "conflicts": list(by_listing.values()),
+        "unproven_legacy_rows": [
+            {"product_key": f["legacy_product_key"], "canonical_url": f["canonical_url"]}
+            for f in findings if f["kind"] == "identity_unproven"
+        ],
+    }
+
+
 async def _run(args: argparse.Namespace) -> int:
     brands = _read_brand_list(args)
     # Validated BEFORE the first fetch: a typo'd GTIN should cost nothing and stop everything.
@@ -285,8 +383,18 @@ async def _run(args: argparse.Namespace) -> int:
         f"skipped={plan.get('skipped')}"
     )
     print("primary ingestion: " + json.dumps(inspect_primary_plan(plan), sort_keys=True))
+    legacy = None
+    if not args.apply:
+        # Apply runs the real guard itself, before any write; this is the dry run's view of it.
+        legacy = await _legacy_listing_report(plan, check=args.check_legacy_listings)
+        print(LEGACY_LISTINGS_MARKER + json.dumps(legacy, sort_keys=True, ensure_ascii=False))
     _print_plan_identity(plan, limit=_effective_print_limit(args))
     if not args.apply:
+        if legacy["status"] in ("conflicts", "error"):
+            # Only reachable with --check-legacy-listings: the operator asked, so a cohort the apply
+            # will refuse (or a check that could not run) must not exit like a clean plan.
+            print(json.dumps({"error": f"legacy_listing_preflight_{legacy['status']}"}), file=sys.stderr)
+            return 2
         print("  DRY-RUN — re-run with --apply to ingest as depositable anchors.")
         return 0
 
@@ -384,6 +492,17 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="print identity (product_key/gtin/category_path/variant ids/...) for at "
                         "most N planned PDPs; 0 prints every row. Printed for dry-run AND --apply. "
                         f"Default: {_PLAN_PRINT_DEFAULT} on a dry run, ALL rows with --apply")
+    p.add_argument(
+        "--check-legacy-listings",
+        action="store_true",
+        help=(
+            "dry run only: SELECT catalog_products on each planned retailer host and report every "
+            "older row (suppressed or not) owning a planned listing URL — the rows --apply refuses "
+            "on with retailer_listing_migration_required. Needs a Postgres DATABASE_URL; exits 2 on "
+            "a conflict or when the check cannot run. Never writes. Ignored with --apply, which "
+            "always enforces the same check before its first write"
+        ),
+    )
     p.add_argument("--apply", action="store_true", help="ingest (else dry-run plan)")
     args = p.parse_args(argv)
     try:
