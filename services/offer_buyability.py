@@ -142,7 +142,9 @@ def _in_stock(availability: Any) -> bool:
 #      `in_stock: True`, and the catalog arm maps NULL to `in_stock: True`. A three-way rank (in
 #      stock > unknown > out of stock) could only be applied where the raw column survives, i.e.
 #      to that arm alone, and would then order offers by a distinction the flag on them does not
-#      show — and that the gateway's `best_offer`, which reads the flag, could not reproduce.
+#      show — and that the gateway's `best_offer` could not reproduce once it reads the flag
+#      (PIVOTA-Agent offersToSignals; on its main as of 2026-09-18 it does not read in_stock at
+#      all — pengxu9-rgb/PIVOTA-Agent#2240 makes it).
 #   2. Absence of a stock statement is not evidence against a seller. Demoting it is the same
 #      error the gateway's verification tier refuses to make for an unchecked offer.
 # In prod on 2026-09-18 every live retailer offer said `in_stock` (1,178) or `out_of_stock` (86),

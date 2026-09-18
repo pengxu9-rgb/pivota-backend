@@ -458,7 +458,7 @@ def aggregate_offers(
     # can sell it now; the brand's own sold-out listing ahead of an in-stock retailer is the
     # defect, not a preference (The Ordinary out of stock over ulta.com in stock at the same
     # $19; COSRX out of stock at $15 over stylekorean in stock at $6.30). The best_offer
-    # companion to #2218 (PIVOTA-Agent offersToSignals) makes the same call. The primary still leads WITHIN its
+    # companion to #2218 (PIVOTA-Agent#2240, offersToSignals; open) makes the same call. The primary still leads WITHIN its
     # stock group, and can only leave the stored set when it is unavailable and at least N
     # sellable offers exist — 0 rows in prod that day. No reader of these offers (backend,
     # PIVOTA-Agent, pivota-agent-ui) keys on is_primary or offers[0]; offer_count, price_min
