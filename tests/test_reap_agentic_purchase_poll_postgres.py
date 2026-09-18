@@ -61,7 +61,14 @@ pytestmark = pytest.mark.skipif(
     ),
 )
 
-_MIGRATION = Path(__file__).resolve().parent.parent / "db/migrations/224_reap_agentic_ledger.sql"
+#: BOTH migrations, in order. 225 adds the resolution-hint columns #2204 now persists, and
+#: applying only 224 would build a schema the repo no longer declares — a dialect gate testing a
+#: table that does not exist anywhere else is worse than no gate.
+_MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "db/migrations"
+_MIGRATIONS = (
+    _MIGRATIONS_DIR / "224_reap_agentic_ledger.sql",
+    _MIGRATIONS_DIR / "225_reap_agentic_purchase_hints.sql",
+)
 
 # Same convention as the other gates on this rail: this file DROPS its tables, so it must be
 # INCAPABLE of running anywhere but a throwaway — made true, not merely stated.
@@ -125,6 +132,18 @@ def _enrollment_active(partner_id: str) -> dict:
 
 QUOTE_200 = {
     "id": "f1e2d3c4",
+    # THE ECHO, and it is not optional any more. #2204's adoption round made `verify_quote`
+    # compare what the quote says it PRICED against the variant we asked for -- Reap returns 200
+    # for a SUBSTITUTED variant, so every other check looks at what it costs and none of them
+    # would notice. A quote with no `items` is refused, which is correct and which is exactly
+    # what a stale copy of this fixture produced here: `price_changed` on every happy path.
+    #
+    # This is the running cost of the duplicate-the-fixtures convention on this rail (see the
+    # module docstring). It is paid deliberately: importing the SQLite arm would make the dialect
+    # gate's collection depend on a file it is not collecting.
+    "items": [{"variantId": "var_abc123", "quantity": 1}],
+    # FAR future on purpose: the quoting step now refuses to create a checkout from a quote it
+    # can already see is dead, so a fixture with a past expiry refuses every happy path.
     "expiresAt": "2099-01-01T00:00:00Z",
     "amountBreakdown": {
         "itemsSubtotal": {"amount": 42.50, "currency": "USD"},
@@ -170,8 +189,9 @@ async def _apply_migration():
     from db.database import database
     from db.sql_migrations import split_statements
 
-    for statement in split_statements(_MIGRATION.read_text(encoding="utf-8")):
-        await database.execute(statement)
+    for path in _MIGRATIONS:
+        for statement in split_statements(path.read_text(encoding="utf-8")):
+            await database.execute(statement)
 
 
 @pytest.fixture(autouse=True)

@@ -1151,6 +1151,127 @@ async def test_an_outcome_invented_after_this_job_was_written_is_also_counted(mo
     assert await _all_claims() == {}
 
 
+# ══ 7c. what #2204's adoption round changed under us ══════════════════════════════
+
+
+async def test_a_raising_step_now_records_why_on_the_row(monkeypatch, reap):
+    """`release_claim` gained `last_error_code` in #2204's adoption round, and THIS is the path
+    that needed it. Before, a step that RAISED wrote nothing at all: the exception type lived in
+    one log line, so "why has this purchase been stuck in 'resolving' for an hour?" had no answer
+    in the row a human would actually look at."""
+    purchase_id = await _start()
+
+    class _UniqueViolationError(RuntimeError):
+        pass
+
+    async def _raises(pid, worker):
+        raise _UniqueViolationError("uq_reap_agentic_purchases_checkout")
+
+    monkeypatch.setattr(job.purchase_svc, "advance", _raises)
+
+    report = await _run(worker_id="w1")
+
+    assert report.errors == 1
+    row = await _get(purchase_id)
+    assert row["claimed_by"] is None
+    # LOWERCASED, because `release_claim` REFUSES a code outside `^[a-z0-9_:.-]{1,64}` rather than
+    # folding it — a raise here would turn one bad row into a failed release.
+    assert row["last_error_code"] == "poller_advance_raised:_uniqueviolationerror"
+
+
+def test_the_error_code_this_job_writes_is_one_the_ledger_will_accept(monkeypatch):
+    """The obligation `_require_error_code`'s docstring states explicitly: the pattern is
+    LOWERCASE and the caller must fold. Asserted against the LEDGER'S OWN regex for a spread of
+    exception type names, including ones with digits and underscores, so a future exception class
+    cannot make a scheduled job raise inside its own error handler."""
+    for type_name in (
+        "UniqueViolationError", "ReadTimeout", "OSError", "_Boom", "Error2", "A" * 200,
+    ):
+        code = job.purchase_svc._error_code(f"poller_advance_raised:{type_name}")
+        assert ledger._ERROR_CODE_RE.match(code), (type_name, code)
+        # And it really is acceptable to the validator, not merely regex-shaped.
+        assert ledger._require_error_code(code) == code
+
+
+async def test_the_post_step_release_does_not_erase_the_services_own_reason(monkeypatch, reap):
+    """THE REGRESSION THIS JOB IS ONE LINE AWAY FROM. #2204 now records a reason on its OWN
+    no-progress releases (`_release(..., error_code=…)`). This job then issues an unconditional
+    `release_claim` after every step — and passing a code there, or a bare assignment in the
+    ledger, would overwrite the service's more specific reason on every ordinary tick.
+
+    Driven through a REAL released step: an enrollment the partner still calls pending.
+    """
+    purchase_id = await _start()
+    await _run(worker_id="w1")  # -> needs_enrollment
+    await _raw(
+        "UPDATE reap_agentic_purchases SET next_poll_at = '2020-01-01 00:00:00' WHERE id = :i",
+        {"i": purchase_id},
+    )
+    reap.get_enrollment = lambda **kw: _ok(
+        dict(ENROLLMENT_ACTIVE, id=str(kw.get("id")), status="REQUIRES_ACTION", paymentMethod=None)
+    )
+
+    report = await _run(worker_id="w2")
+
+    assert report.released == 1, report
+    row = await _get(purchase_id)
+    assert row["state"] == "needs_enrollment"
+    assert row["claimed_by"] is None
+    assert row["last_error_code"] == "enrollment_pending", (
+        "the poller's own release overwrote the reason the state machine recorded"
+    )
+
+
+def test_processing_is_the_only_state_with_no_bound():
+    """WHY `processing_over_attempts` EXISTS, derived from the ledger's SQL rather than asserted.
+
+    Each pollable state is bounded by a clock, by a counter, or by nothing:
+
+      * `_EXPIRE_SOURCE_STATES` — bounded by `expire_overdue_purchases`, i.e. a CLOCK. This is
+        also the PII deadline: a state outside this list never has `buyer_email` or
+        `shipping_address` nulled by the passage of time.
+      * `_FAIL_EXHAUSTED_SOURCE_STATES` minus `_CLAIM_ATTEMPT_EXEMPT_STATES` minus 'processing'
+        (which the poller always skips) — bounded by a COUNTER.
+
+    The remainder is 'processing', and #2204's round-2 review measured what that costs: a row
+    parked there and aged to 2020 still held the buyer's address and email. If a future change
+    ever bounds it, this test fails and whoever made the change gets to decide what
+    `processing_over_attempts` is still for.
+    """
+    bounded_by_clock = set(ledger._EXPIRE_SOURCE_STATES)
+    bounded_by_counter = (
+        set(ledger._FAIL_EXHAUSTED_SOURCE_STATES)
+        - set(ledger._CLAIM_ATTEMPT_EXEMPT_STATES)
+        - {"processing"}
+    )
+    unbounded = set(ledger._POLLABLE_STATES) - bounded_by_clock - bounded_by_counter
+
+    assert unbounded == {"processing"}, unbounded
+    # And the PII half of the claim, stated separately because it is the half that matters.
+    assert "processing" not in ledger._EXPIRE_SOURCE_STATES
+
+
+async def test_every_outcome_the_service_can_return_is_one_this_job_handles():
+    """MERGED IS NOT RUNNING, applied to a vocabulary. The job counts four outcomes by name and
+    routes everything else to `errors`. That is safe, but it is only INFORMATIVE while the two
+    lists agree — so the service's own documented set is parsed out of `AdvanceResult`'s
+    docstring and compared, and a new outcome added upstream lands here as a failing assertion
+    rather than as a silent bump in `errors` months later.
+    """
+    import inspect
+    import re as _re
+
+    doc = inspect.getdoc(svc.AdvanceResult) or ""
+    body = doc.split("`outcome` is one of:", 1)[-1]
+    documented = set(_re.findall(r"^\s{4,}([a-z_]+)\s{2,}\S", body, _re.M))
+
+    assert documented == {"advanced", "released", "lost_claim", "terminal", "missing"}, documented
+    counted = {"advanced", "released", "lost_claim", "terminal"}
+    assert counted < documented
+    # 'missing' is the one the service can return that this job deliberately routes to `errors`.
+    assert documented - counted == {"missing"}
+
+
 # ══ 8. concurrency ════════════════════════════════════════════════════════════════════════════
 
 

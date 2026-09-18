@@ -331,10 +331,22 @@ class PollReport:
     something and seeing nothing happen.
 
     `errors` is the only count that should ever page anyone. `processing_over_attempts` is the
-    one that should ever WAKE anyone: it is read-only, it names rows the fail sweep deliberately
-    refuses to touch, and a number that does not fall is a buyer's payment stuck in flight with
-    nobody looking. The first cut reported nothing at all for those rows — measured at
-    attempts=100,005 on a row no count mentioned.
+    one that should ever WAKE anyone.
+
+    'processing' IS THE ONLY POLLABLE STATE WITH NO BOUND AT ALL, and that is derived from the
+    ledger's own SQL rather than asserted here — see
+    `test_processing_is_the_only_state_with_no_bound`, which parses
+    `_EXPIRE_SOURCE_STATES` / `_FAIL_EXHAUSTED_SOURCE_STATES` / `_CLAIM_ATTEMPT_EXEMPT_STATES`
+    out of the statements that enforce them. `expire_overdue_purchases` does not name it, so it
+    has NO PII DEADLINE; `fail_exhausted_purchases` skips it, so the counter never terminates it.
+    #2204's round-2 review measured exactly what that costs: a row parked in 'processing' and
+    aged to 2020 still held `buyer_email` and `shipping_address`. That fix removed the one path
+    which parked rows there deliberately; it did not, and could not, bound the state.
+
+    So this count is not a nicety. It is the ONLY signal that a buyer's payment is stuck in
+    flight — and, with it, their address and email. A number that does not fall needs a person.
+    The first cut reported nothing at all for those rows: measured at attempts=100,005 on a row
+    no count mentioned.
     """
 
     requeued: int = 0
@@ -389,6 +401,9 @@ _LEFTOVER_CLAIMS_SQL = """
 #: `fail_exhausted_purchases(include_processing=False)` refuses to terminate, on purpose. READ
 #: ONLY. Reported so that the refusal is visible rather than silent: the alternative to a count
 #: is an operator discovering a stuck charge when the buyer complains.
+#:
+#: 'processing' also has NO PII DEADLINE — `expire_overdue_purchases` does not name it — so these
+#: rows hold `buyer_email` and `shipping_address` for as long as they sit there. See `PollReport`.
 _PROCESSING_OVER_ATTEMPTS_SQL = """
     SELECT COUNT(*) AS stuck FROM reap_agentic_purchases
      WHERE state = 'processing'
@@ -712,6 +727,11 @@ async def run_reap_agentic_purchase_poll(
                 # Counted as `abandoned_budget`, NOT as `released` (fix F8): "the partner was not
                 # ready" and "we ran out of time" are different facts and an operator tuning the
                 # budget needs to tell them apart.
+                # NO `last_error_code` HERE. Nothing went wrong: the row is healthy and simply
+                # due again. `last_error_code` is what a human reads to find out why a purchase
+                # stalled, and putting an error-shaped value on a row that was merely deferred is
+                # how that column stops meaning anything. Passing None COALESCEs, so whatever
+                # real reason is already on the row survives.
                 if await _release_guarded(purchase_id, worker, counts):
                     counts["abandoned_budget"] += 1
                 continue
@@ -737,6 +757,21 @@ async def run_reap_agentic_purchase_poll(
                         purchase_id,
                         worker,
                         next_poll_at=clock() + timedelta(seconds=error_backoff),
+                        # AND RECORD WHY, which is new with #2204's adoption round. Before it,
+                        # `release_claim` took a schedule and nothing else, so the reason a
+                        # purchase stalled lived only in a log line: "why has this been stuck in
+                        # 'quoting' for an hour?" had no answer in the row. THIS is the path that
+                        # needed it most — a step that RAISED wrote nothing at all.
+                        #
+                        # Through the SERVICE'S fold, not a local copy. `release_claim` REFUSES a
+                        # code outside `^[a-z0-9_:.-]{1,64}` rather than truncating or folding it,
+                        # and `_error_code` is the one place this rail lowercases, trims to the
+                        # column width and substitutes `error_code_unrepresentable` instead of
+                        # losing the fact that something went wrong. A second implementation here
+                        # would be a second vocabulary in one column.
+                        last_error_code=purchase_svc._error_code(
+                            f"poller_advance_raised:{type(exc).__name__}"
+                        ),
                     )
                 except Exception as release_exc:  # noqa: BLE001
                     # The `finally` below is the backstop for this row; say so rather than
@@ -779,8 +814,10 @@ async def run_reap_agentic_purchase_poll(
 
             # UNCONDITIONAL, and a fenced no-op wherever the claim is already gone. See the
             # module header for which outcomes leave the lease held (every non-terminal
-            # `advanced` does). No `next_poll_at`: `release_claim` COALESCEs, so the schedule the
-            # state machine chose survives this call untouched.
+            # `advanced` does). No `next_poll_at` AND NO `last_error_code`: `release_claim`
+            # COALESCEs both, so the schedule the state machine chose AND the reason it recorded
+            # on an `outcome="released"` step both survive this call untouched. Passing a code
+            # here would overwrite the service's own, more specific one on every ordinary tick.
             #
             # GUARDED, and INSIDE the per-row loop body (fix F1): in the first cut this call sat
             # bare, so a pool blip on row 2 of 10 propagated out of the whole function and
