@@ -27,7 +27,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from services.catalog_enrichment_agent.apply import apply_ingest_plan  # noqa: E402
+from services.catalog_identity import validated_source_gtin  # noqa: E402
+from services.catalog_enrichment_agent.apply import (  # noqa: E402
+    apply_ingest_plan, find_legacy_retailer_listing_owners, legacy_listing_refusal, planned_retailer_listings,
+)
 from services.catalog_enrichment_agent.ingestion import ingest_validated_jsonl  # noqa: E402
 from services.catalog_enrichment_agent.primary_ingestion import (  # noqa: E402
     inspect_primary_plan, require_primary_plan, require_primary_apply,
@@ -138,8 +141,165 @@ def _effective_print_limit(args: argparse.Namespace) -> int:
     return 0 if args.apply else _PLAN_PRINT_DEFAULT
 
 
+def _canonical_gtins(wanted: List[str]) -> set:
+    """Every requested GTIN, or refuse. A single unusable value is a typo in a command line that
+    decides what gets written to production: ignoring it because a SIBLING matched is how a run
+    certifies a cohort nobody asked for."""
+    canonical = set()
+    for value in wanted:
+        gtin = validated_source_gtin(value)
+        if not gtin:
+            raise ValueError(f"--only-gtin {value!r} is not a valid GS1 GTIN")
+        canonical.add(gtin)
+    if not canonical:
+        # Unreachable from _run (guarded by `if args.only_gtin`, and every element either raises
+        # or is added), but this is a module-level helper: a future caller passing [] should be
+        # told, not handed an empty set that quietly matches nothing downstream.
+        raise ValueError("--only-gtin needs at least one valid GS1 GTIN")
+    return canonical
+
+
+def _record_gtins(record: Dict[str, Any]) -> set:
+    """Every GTIN this record can be identified by: the PDP's own, and its variants'.
+
+    `pdp.barcode` is set only for a single-variant, unfolded product (curated_brand_feed), so a
+    multi-variant listing — exactly what --emit-real-variants produces — carries its barcodes on
+    the VARIANTS. Matching the PDP level alone refused those products with "matched none" while the help
+    text promised to keep "products carrying this GTIN".
+    """
+    pdp = record.get("pdp") or {}
+    found = {validated_source_gtin(pdp.get("gtin") or pdp.get("barcode"))}
+    for variant in (pdp.get("variants") or []):
+        if isinstance(variant, dict):
+            found.add(validated_source_gtin(variant.get("barcode") or variant.get("gtin")))
+    return {g for g in found if g}
+
+
+def _select_by_gtin(records: List[Dict[str, Any]], canonical: set, *, domain: str) -> tuple:
+    """Keep only the records carrying one of `canonical`; return (kept, gtins that matched).
+
+    An acceptance case is about specific products, but the vendor filter is the narrowest tool the
+    lane had: a Pyunkang Yul run at eyurs.com selects 10 products, 7 of which carry a merchant
+    product_type this taxonomy does not map, so the whole cohort lands `category_unresolved` and
+    apply refuses it — over products the case never wanted.
+
+    A filter that matches NOTHING raises, mirroring --only-vendor: an empty run that looks like a
+    clean one is how a canary certifies a cohort it never actually selected. Which of several
+    requested GTINs went unmatched is decided by the CALLER, across every domain in the run — one
+    roster row may legitimately carry only some of them.
+    """
+    kept, matched = [], set()
+    for record in records:
+        found = _record_gtins(record) & canonical
+        if found:
+            kept.append(record)
+            matched |= found
+    if not kept:
+        raise ValueError(f"{domain}: --only-gtin matched none of the selected products")
+    return kept, matched
+
+
+#: Its own line, never merged into `primary ingestion:` — scripts/curated_apply_gate.py parses that
+#: marker, and the plan inspection it prints must stay the pure-plan verdict the worker also computes.
+LEGACY_LISTINGS_MARKER = "legacy listings: "
+
+
+class _SelectOnlyHandle:
+    """The preflight's only handle on the catalog DB: one method, and it refuses non-SELECT text.
+
+    `find_legacy_retailer_listing_owners` needs nothing else, so anything that tries to write
+    through this handle fails with AttributeError (no execute/transaction) or PermissionError.
+    """
+
+    def __init__(self, database: Any) -> None:
+        self._database = database
+
+    async def fetch_all(self, query: str, values: Optional[Dict[str, Any]] = None) -> Any:
+        if not str(query).lstrip().upper().startswith("SELECT"):
+            raise PermissionError("legacy listing preflight is SELECT-only")
+        return await self._database.fetch_all(query, values)
+
+
+def _preflight_database() -> tuple:
+    """(database, None) for the configured Postgres catalog, or (None, reason). Never prints the URL.
+
+    db.database falls back to a local sqlite file when DATABASE_URL is unset; a preflight run against
+    that would report "clear" about a catalog it never read, so anything but Postgres is refused.
+    """
+    import db.database as db_module
+
+    if not str(getattr(db_module, "DATABASE_URL", "") or "").lower().startswith("postgres"):
+        return None, "no_postgres_database_url"
+    return db_module.database, None
+
+
+async def _legacy_listing_report(plan: Dict[str, Any], *, check: bool) -> Dict[str, Any]:
+    """Which planned listings an older, non-`ext:retailer:` catalog row already owns.
+
+    This is the apply guard (apply._refuse_parallel_retailer_listings) run ahead of time over the
+    SAME finder and SQL, so a dry run can say what the apply will refuse. It is read-only and opt-in
+    (--check-legacy-listings): when not requested, the report says `unchecked` rather than going
+    silent, because a silent dry run is how Wave 1 read `ready_to_apply` for a cohort (haruharu
+    wonder at ohlolly.com) that the apply then refused. Suppressed owners are listed and COUNTED as
+    conflicts, because the apply refuses on them too.
+    """
+    listings = planned_retailer_listings(plan)
+    report: Dict[str, Any] = {"planned_listings": len(listings)}
+    if not listings:
+        return {**report, "status": "not_applicable"}
+    if not check:
+        return {**report, "status": "unchecked",
+                "hint": "pass --check-legacy-listings (a SELECT on catalog_products) to see what apply will refuse"}
+    database, reason = _preflight_database()
+    if database is None:
+        return {**report, "status": "error", "error": reason}
+    connected_here = False
+    try:
+        if not getattr(database, "is_connected", False):
+            await database.connect()
+            connected_here = True
+        findings = await find_legacy_retailer_listing_owners(plan, _SelectOnlyHandle(database))
+    except Exception as exc:  # noqa: BLE001 — reported, never swallowed into "clear"
+        # The class only: a driver error can quote its connection string.
+        return {**report, "status": "error", "error": type(exc).__name__}
+    finally:
+        if connected_here and getattr(database, "is_connected", False):
+            await database.disconnect()
+
+    by_listing: Dict[str, Dict[str, Any]] = {}
+    for finding in findings:
+        if finding["kind"] != "conflict":
+            continue
+        entry = by_listing.setdefault(finding["listing"], {
+            "listing": finding["listing"], "planned_product_key": finding["planned_product_key"], "legacy_owners": [],
+        })
+        entry["legacy_owners"].append({
+            "product_key": finding["legacy_product_key"],
+            "suppressed": finding["suppressed"],
+            "suppression_reason": finding["suppression_reason"],
+        })
+    owners = [o for entry in by_listing.values() for o in entry["legacy_owners"]]
+    return {
+        **report,
+        "status": "conflicts" if findings else "clear",
+        "apply_would_refuse": bool(findings),
+        "apply_refusal": legacy_listing_refusal(findings[0]) if findings else None,
+        "conflict_count": len(owners),
+        "suppressed_conflict_count": sum(1 for o in owners if o["suppressed"]),
+        "listings_with_conflicts": len(by_listing),
+        "conflicts": list(by_listing.values()),
+        "unproven_legacy_rows": [
+            {"product_key": f["legacy_product_key"], "canonical_url": f["canonical_url"]}
+            for f in findings if f["kind"] == "identity_unproven"
+        ],
+    }
+
+
 async def _run(args: argparse.Namespace) -> int:
     brands = _read_brand_list(args)
+    # Validated BEFORE the first fetch: a typo'd GTIN should cost nothing and stop everything.
+    wanted_gtins = _canonical_gtins(args.only_gtin) if args.only_gtin else set()
+    matched_gtins: set = set()
     if not brands:
         print("no brands to onboard (need --domain or --file rows with domain+category)", file=sys.stderr)
         return 2
@@ -177,6 +337,12 @@ async def _run(args: argparse.Namespace) -> int:
                 f"{vendor_report['before']} -> {vendor_report['after']} products"
             )
             records_for_brand.last_vendor_filter_report = None  # type: ignore[attr-defined]
+        if wanted_gtins:
+            before = len(recs)
+            recs, matched = _select_by_gtin(recs, wanted_gtins, domain=b["domain"])
+            matched_gtins |= matched
+            print(f"    gtin filter {sorted(wanted_gtins)}: {before} -> {len(recs)} products "
+                  f"(matched {sorted(matched)})")
         print(f"  {b['domain']}: {len(recs)} products")
         # A brand-family storefront must not ingest silently. misshaus.com shipped 17
         # A'pieu products into the index branded "Missha" because nothing printed the
@@ -205,6 +371,11 @@ async def _run(args: argparse.Namespace) -> int:
             )
         all_records.extend(recs)
 
+    # A requested GTIN that matched nothing ANYWHERE is a request that was silently dropped. Across
+    # the whole run, not per row: a roster row may legitimately carry only some of them.
+    if wanted_gtins - matched_gtins:
+        raise ValueError(f"--only-gtin values matched no product in this run: "
+                         f"{sorted(wanted_gtins - matched_gtins)}")
     plan = ingest_validated_jsonl(all_records)
     print(
         f"plan: pdps={len(plan.get('pdps') or [])} skus={len(plan.get('skus') or [])} "
@@ -212,8 +383,18 @@ async def _run(args: argparse.Namespace) -> int:
         f"skipped={plan.get('skipped')}"
     )
     print("primary ingestion: " + json.dumps(inspect_primary_plan(plan), sort_keys=True))
+    legacy = None
+    if not args.apply:
+        # Apply runs the real guard itself, before any write; this is the dry run's view of it.
+        legacy = await _legacy_listing_report(plan, check=args.check_legacy_listings)
+        print(LEGACY_LISTINGS_MARKER + json.dumps(legacy, sort_keys=True, ensure_ascii=False))
     _print_plan_identity(plan, limit=_effective_print_limit(args))
     if not args.apply:
+        if legacy["status"] in ("conflicts", "error"):
+            # Only reachable with --check-legacy-listings: the operator asked, so a cohort the apply
+            # will refuse (or a check that could not run) must not exit like a clean plan.
+            print(json.dumps({"error": f"legacy_listing_preflight_{legacy['status']}"}), file=sys.stderr)
+            return 2
         print("  DRY-RUN — re-run with --apply to ingest as depositable anchors.")
         return 0
 
@@ -292,10 +473,36 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="Recover missing barcodes from identity-matched product .js; opt-in, no price changes")
     p.add_argument("--max-pdp-identity-fetches", type=int, default=100,
                    help="Selected-product recovery attempt budget (0 disables requests; up to two redirects each)")
+    p.add_argument(
+        "--only-gtin",
+        action="append",
+        default=[],
+        metavar="GTIN",
+        help=(
+            "keep only products carrying this GTIN (repeatable). Narrows a cohort to the exact "
+            "products a case is about, so unrelated products whose merchant product_type this "
+            "taxonomy cannot map do not block the apply. Matches the PDP's own barcode OR any of "
+            "its merchant variants', with GS1 normalisation, so 13- and 14-digit spellings agree. "
+            "Every requested GTIN must be valid and must match somewhere in the run, and a host "
+            "matching none of them is an error, not an empty run. It narrows the PLAN only: the "
+            "crawl still reads the whole feed and GTIN recovery still spends its budget first."
+        ),
+    )
     p.add_argument("--plan-print-limit", type=int, default=None, metavar="N",
                    help="print identity (product_key/gtin/category_path/variant ids/...) for at "
                         "most N planned PDPs; 0 prints every row. Printed for dry-run AND --apply. "
                         f"Default: {_PLAN_PRINT_DEFAULT} on a dry run, ALL rows with --apply")
+    p.add_argument(
+        "--check-legacy-listings",
+        action="store_true",
+        help=(
+            "dry run only: SELECT catalog_products on each planned retailer host and report every "
+            "older row (suppressed or not) owning a planned listing URL — the rows --apply refuses "
+            "on with retailer_listing_migration_required. Needs a Postgres DATABASE_URL; exits 2 on "
+            "a conflict or when the check cannot run. Never writes. Ignored with --apply, which "
+            "always enforces the same check before its first write"
+        ),
+    )
     p.add_argument("--apply", action="store_true", help="ingest (else dry-run plan)")
     args = p.parse_args(argv)
     try:

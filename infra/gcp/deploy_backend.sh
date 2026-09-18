@@ -149,6 +149,17 @@ fi
 # below exists to catch. The intent stays in the file; overriding it stays explicit.
 : "${CPU_LIMIT:=}"
 : "${MEMORY_LIMIT:=}"
+# ONE NAME, OPPOSITE MEANINGS, ONE FILE APART. In THIS script `CONCURRENCY_LIMIT` is the override
+# and the bare `CONCURRENCY` is the internal per-env CONSTANT set in the case block above. In
+# deploy_gateway.sh it is the other way round: there `CONCURRENCY` is an accepted ALIAS for the
+# override, because that is the spelling the 2026-09-15 incident runbook used.
+#
+# Nothing leaks between them: the case block assigns CONCURRENCY unconditionally, so an operator
+# who exported `CONCURRENCY=20` for a gateway deploy and then ran this script has it overwritten
+# with the per-env value rather than honoured. That is the SAFE direction - but it is silent, and
+# it is the reverse of what the same export just did one file over. Do not "fix" this by making
+# CONCURRENCY an alias here as well: that would let a stale export from a gateway deploy re-shape
+# the backend, which is the failure the unconditional assignment currently prevents.
 : "${CONCURRENCY_LIMIT:=}"
 # `0` is the trap here and is why this is not a plain digit check: Cloud Run reads
 # `--concurrency 0` as UNLIMITED, so the one value that looks like the tightest possible budget

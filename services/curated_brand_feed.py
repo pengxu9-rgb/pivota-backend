@@ -1274,6 +1274,41 @@ def _brand_key(value: Optional[str]) -> str:
     return "".join(c for c in str(value or "").casefold() if c.isalnum())
 
 
+# MEASURED RENAMES that retailers still sell under the old and new names. In retailer mode a
+# vendor is written under the operator's --brand only when the two are the SAME brand; exact
+# alphanumeric equality decides that everywhere except here. Containment cannot: it would merge
+# "Purito" with "Purito Seoul" (a rename -- correct) and equally "A'PIEU" with "A'PIEU Plus"
+# (a distinct vendor -- tests/services/test_retailer_adversarial_acceptance.py pins that it is
+# NOT overridden). So each family is listed, with the evidence that it is one brand.
+#
+# Measured 2026-09-18 over every vendor at eyurs.com, ohlolly.com and sokoglam.com: these are
+# the ONLY cross-host spellings that exact equality leaves split.
+RETAILER_BRAND_SPELLINGS = {
+    # Manyo Factory renamed to ma:nyo: sokoglam "MANYO FACTORY", ohlolly "ma:nyo", eyurs "manyo".
+    "manyofactory": "manyo",
+    "manyo": "manyo",
+    # Purito renamed to Purito Seoul: eyurs "Purito SEOUL", sokoglam "Purito Seoul", ohlolly "Purito".
+    "puritoseoul": "purito",
+    "purito": "purito",
+}
+# The spelling each family is WRITTEN as -- in retailer AND brand-official mode, with or without
+# --brand. content_key is
+# built from normalize_brand(brand), which keeps punctuation ("ma:nyo" != "manyo"), so writing
+# the operator's string would still split a family whenever two runs spelled --brand
+# differently. The canonical spelling is the one the catalog ALREADY carries, measured in prod
+# 2026-09-18: 78 brand-official rows as "Ma:nyo" (manyo.us), and "Purito SEOUL"
+# (purito-seoul.com). Any other spelling would split retailer rows from those.
+RETAILER_BRAND_CANONICAL = {
+    "manyo": "Ma:nyo",
+    "purito": "Purito SEOUL",
+}
+
+
+def _retailer_brand_family(key: str) -> Optional[str]:
+    """The listed brand family for an alphanumeric brand key, or None when it is not listed."""
+    return RETAILER_BRAND_SPELLINGS.get(key)
+
+
 def _looks_like_a_brand_name(value: Optional[str]) -> bool:
     """Only explicit supplier-code shapes are codes; short/Unicode names are brands.
 
@@ -1348,6 +1383,11 @@ def resolve_record_brand(
 CATEGORY_CONFIDENCE_MERCHANT_TYPE = 0.9
 CATEGORY_CONFIDENCE_EXPLICIT_TITLE = 0.8
 CATEGORY_CONFIDENCE_FEED_DEFAULT = 0.3
+# A leaf taken from a MEASURED (host, merchant product_type) pair. Below a merchant type
+# that names its class directly (0.9): the merchant declared a shelf, the leaf was inferred
+# from reading every product on it. Distinct from every other writer's value so a stored
+# (label, confidence) pair can be traced to this table.
+CATEGORY_CONFIDENCE_MEASURED_HOST_TYPE = 0.82  # not 0.85: the regex backfill and variant fold write 0.85
 
 # Generic shelves are not assertions of a purchasable product class. In particular,
 # the shared legacy regex maps Lip Care to balm, contradicting the measured lip oil.
@@ -1393,7 +1433,107 @@ def _pattern_matches(text: Optional[str]) -> int:
     return len({path for _label, path, pattern in CATEGORY_PATTERNS if pattern.search(str(text or ""))})
 
 
-def _resolve_category(*, product_type: Optional[str], title: Optional[str], flag_path: str) -> Tuple[str, float]:
+# MEASURED (host, merchant product_type) -> leaf. Every CATEGORY_PATTERNS entry matches the
+# SINGULAR noun, so a merchant filing products under "Cleansers" / "Sheet Masks" / "Serums"
+# resolves to nothing -- and one unresolved row blocks its whole curated cohort. This is NOT a
+# plural rule: a general singularising door was drafted and reviewed, and it gave confident
+# wrong leaves on hosts nobody had read ("Pads" -> toner, "Lash Serums" -> skincare serum,
+# "Pet Shampoos" -> shampoo, "Masks & Peels" -> exfoliant). A merchant's shelf name means what
+# THAT merchant files under it; it is evidence only where somebody read the shelf.
+#
+# Each entry below was read product by product on 2026-09-18 over every product on that host
+# (eyurs.com 434, ohlolly.com 510, sokoglam.com 567), and every product on the shelf belonged
+# to the leaf -- or named a different leaf in its title, which `_resolve_category` checks per
+# product before using the entry. Shelves that were NOT one class are deliberately absent:
+# eyurs "Cotton Pads" (an accessory the toner pattern catches through "pad"), "Foot Masks"
+# (body care), ohlolly "Exfoliator" (body scrubs + facial peel pads), sokoglam "physical" /
+# "chemical" (exfoliant pads despite the names).
+_MEASURED_HOST_PRODUCT_TYPES = {
+    "eyurs.com": {
+        "sheet masks": "beauty/skincare/treat/mask",
+        "masks": "beauty/skincare/treat/mask",
+        "eye masks": "beauty/skincare/treat/mask",
+        "wash off mask": "beauty/skincare/treat/mask",
+        "moisturizers": "beauty/skincare/moisturize/cream",
+        "face moisturizers": "beauty/skincare/moisturize/cream",
+        "serums": "beauty/skincare/treat/serum",
+        "face serums": "beauty/skincare/treat/serum",
+        "ampoules": "beauty/skincare/treat/serum",
+        "essences": "beauty/skincare/treat/serum",
+        "cleansers": "beauty/skincare/cleanse/cleanser",
+        "oil cleansers": "beauty/skincare/cleanse/cleanser",
+        "gel cleansers": "beauty/skincare/cleanse/cleanser",
+        "toners": "beauty/skincare/tone/toner",
+        "suncream": "beauty/skincare/sun/sunscreen",
+    },
+    "ohlolly.com": {
+        # "Wash off mask" is AMBIGUOUS to the regexes (cleanser "wash" + mask); every product
+        # on the shelf was a rinse-off mask.
+        "wash off mask": "beauty/skincare/treat/mask",
+        # Overnight "sleeping packs" are leave-on masks.
+        "sleeping pack": "beauty/skincare/treat/mask",
+        "sun care": "beauty/skincare/sun/sunscreen",
+    },
+    "sokoglam.com": {
+        "lip balms": "beauty/makeup/lip/balm",
+    },
+}
+
+
+_NON_FACE_TITLE = re.compile(r"\b(?:hair|scalp|body|foot|feet|hands?|nails?|lash(?:es)?|brows?|beard)\b", re.I)
+
+
+def _title_paths(title: Optional[str]) -> set:
+    from services.pdp_category_classifier import CATEGORY_PATTERNS
+    return {path for _label, path, pattern in CATEGORY_PATTERNS if pattern.search(str(title or ""))}
+
+
+def _measured_host_type_leaf(*, domain: Optional[str], product_type: Optional[str], title: Optional[str]) -> Optional[str]:
+    """The measured leaf for this host's shelf, unless THIS product's title names another leaf."""
+    host = _clean_domain(domain or "").lower()
+    host = host[4:] if host.startswith("www.") else host
+    ptype = " ".join(str(product_type or "").casefold().split())
+    leaf = _MEASURED_HOST_PRODUCT_TYPES.get(host, {}).get(ptype)
+    if not leaf:
+        return None
+    named = _title_paths(title)
+    # eyurs files "Pyunkang Yul Essence Toner" under "Cleansers": a shelf is evidence about the
+    # shelf, and the product's own title outranks it. A title naming no leaf does not.
+    if named and leaf not in named:
+        return None
+    # Every measured shelf is FACE (or lip) care. A title naming another body area is a different
+    # product the patterns cannot see: measured on eyurs' own "Moisturizers" shelf, a "Hand & Nail
+    # Cream" and a "Body Lotion"; a future "Argan Oil Hair Mask" on "Masks" would otherwise become a
+    # facial mask, and a "Lip & Body Balm" is not only a lip balm.
+    if _NON_FACE_TITLE.search(str(title or "")):
+        return None
+    return leaf
+
+
+def _resolve_category(*, product_type: Optional[str], title: Optional[str], flag_path: str,
+                      domain: Optional[str] = None) -> Tuple[str, float]:
+    """Evidence policy, then -- ONLY where it left the product unresolved -- a measured host shelf.
+
+    Structural no-regression: anything the evidence policy resolves to a leaf, and every
+    deliberate refusal (""), is returned untouched. The measured shelf fills only a coarse
+    FALLBACK -- which includes the evidence policy's multi-pattern AMBIGUITY return: ohlolly's
+    "Wash Off Mask" matches both the cleanser ("wash") and mask patterns, and the table names
+    it because every product on that shelf was read. It never fills a refusal or a caller's leaf.
+    """
+    path, confidence = _resolve_category_by_evidence(product_type=product_type, title=title, flag_path=flag_path)
+    from services.category_path_aliases import resolve
+    if path == "" or resolve(path):
+        return path, confidence
+    fallback = str(flag_path or "").strip().strip("/").lower()
+    if fallback and fallback.split("/", 1)[0] != "beauty":
+        return path, confidence
+    leaf = _measured_host_type_leaf(domain=domain, product_type=product_type, title=title)
+    if leaf:
+        return leaf, CATEGORY_CONFIDENCE_MEASURED_HOST_TYPE
+    return path, confidence
+
+
+def _resolve_category_by_evidence(*, product_type: Optional[str], title: Optional[str], flag_path: str) -> Tuple[str, float]:
     """One category evidence policy shared by feed mapping and repair planning.
 
     Retain #2158's ambiguity guard, conservative marketing-title behavior and
@@ -1457,9 +1597,10 @@ def _resolve_category(*, product_type: Optional[str], title: Optional[str], flag
     return fallback, CATEGORY_CONFIDENCE_FEED_DEFAULT
 
 
-def product_category_path(*, title: Optional[str], product_type: Optional[str], fallback: str) -> str:
+def product_category_path(*, title: Optional[str], product_type: Optional[str], fallback: str,
+                          domain: Optional[str] = None) -> str:
     """Path-only wrapper for the review-only repair planner; no second classifier."""
-    path = _resolve_category(product_type=product_type, title=title, flag_path=fallback)[0]
+    path = _resolve_category(product_type=product_type, title=title, flag_path=fallback, domain=domain)[0]
     # The repair planner expresses abstention as no change, never a blank-path
     # update. Fresh mapping consumes the unresolved result directly above.
     return path or fallback
@@ -1503,12 +1644,25 @@ def shopify_product_to_record(
         if (not _looks_like_a_brand_name(vendor) or not vendor_key
                 or (len(host_label) >= 3 and host_label in vendor_key)):
             raise ValueError(f"{host}: retailer_maker_unproven: vendor {vendor!r} is not maker evidence")
-        # Only exact normalized maker equivalence permits a spelling override.
-        # Brand-direct store/supplier-code heuristics cannot label retailer stock.
+        # Only exact normalized maker equivalence permits a spelling override --
+        # or a MEASURED rename in RETAILER_BRAND_SPELLINGS. Brand-direct store/supplier-code
+        # heuristics cannot label retailer stock.
         override_key = "".join(c for c in str(brand_override or "").casefold() if c.isalnum())
-        brand = brand_override if override_key == vendor_key else vendor
+        # The VENDOR's own listed family decides its spelling -- a normalisation of the maker the
+        # retailer named, never a relabel into whatever family --brand belongs to. It does not
+        # depend on --brand at all, so a run without one converges too.
+        vendor_family = _retailer_brand_family(vendor_key)
+        if vendor_family is not None:
+            brand = RETAILER_BRAND_CANONICAL[vendor_family]
+        else:
+            brand = brand_override if override_key == vendor_key else vendor
     else:
         brand, _brand_reason = resolve_record_brand(product.get("vendor"), brand_override, host)
+        # The same one-spelling-per-family rule for brand-official stores: a manyo.us re-run with
+        # --brand "Manyo" would otherwise write "Manyo" and split from its own 78 "Ma:nyo" rows.
+        official_family = _retailer_brand_family("".join(c for c in str(brand or "").casefold() if c.isalnum()))
+        if official_family is not None:
+            brand = RETAILER_BRAND_CANONICAL[official_family]
     brand = str(brand or "").strip()
     if not brand:
         return None
@@ -1636,7 +1790,7 @@ def shopify_product_to_record(
     canonical_url = f"https://{host}/products/{handle}"
     category_input_path = category_path
     category_path, category_confidence = _resolve_category(
-        title=title, product_type=product.get("product_type"), flag_path=category_path,
+        title=title, product_type=product.get("product_type"), flag_path=category_path, domain=domain,
     )
     from services.category_path_aliases import resolve
     category_path = resolve(category_path)

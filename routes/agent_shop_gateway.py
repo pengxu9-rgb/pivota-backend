@@ -37,6 +37,7 @@ from pydantic import BaseModel, Field, ConfigDict
 from config.settings import resolve_public_api_base_url, settings
 from services.seed_variant_options import seed_variant_options_as_mapping
 from services.outbound_warm_handoff import could_upgrade_at_click_time
+from services import market_telemetry
 from db.database import database
 from models.catalog import PivotPaymentContext, PivotQueryRequest, PivotResultItem
 from models.reviews_refs import SkuRef as ReviewsSkuRef
@@ -5775,9 +5776,29 @@ async def _handle_offers_resolve(
                       FROM catalog_products p
                       JOIN catalog_offers o ON o.product_key = p.product_key
                       LEFT JOIN catalog_merchants m ON m.merchant_id = o.merchant_id
-                     WHERE (p.pivota_signature_id = ANY(:aliases)
-                            OR p.content_key = ANY(:aliases)
-                            OR p.product_key = ANY(:aliases))
+                     WHERE p.product_key IN (
+                           SELECT d.product_key FROM catalog_products d
+                            WHERE d.pivota_signature_id = ANY(:aliases)
+                               OR d.content_key = ANY(:aliases)
+                               OR d.product_key = ANY(:aliases)
+                           -- SIBLING LISTINGS. A listing id (its product_key or signature)
+                           -- widens to every listing sharing its content_key, so asking by
+                           -- ANY seller's listing returns every seller of the product — the
+                           -- same set a `ck_` id already returns. Without this the second
+                           -- retailer is reachable only by a content_key that search, the PDP
+                           -- and this door never hand out: measured 2026-09-17 on the Pyunkang
+                           -- Yul canary, get_offers(listing) = 1 seller, get_offers(ck_) = 2.
+                           -- The anchor must itself be live: a withdrawn listing id answers
+                           -- nothing, exactly as it did before this widening.
+                           UNION
+                           SELECT s.product_key
+                             FROM catalog_products a
+                             JOIN catalog_products s ON s.content_key = a.content_key
+                            WHERE (a.pivota_signature_id = ANY(:aliases)
+                                   OR a.product_key = ANY(:aliases))
+                              AND a.content_key IS NOT NULL
+                              AND a.suppressed_at IS NULL
+                              AND a.suppression_reason IS NULL)
                        -- The PRODUCT's own suppression, not just the offer's. Every serving
                        -- read in services/pivot_query_service.py applies this pair, and
                        -- scripts/withdraw_catalog_rows.py takes a product down by setting
@@ -7734,6 +7755,11 @@ async def _handle_find_products_multi_via_pivot(
     # candidate set that never contained a single row of that brand.
     brand_anchor_terms, brand_anchor_source = await _resolve_brand_anchor_terms(query)
 
+    # Resolved once, and the SAME value is both recorded and handed to recall, so the record is
+    # what recall received rather than a second derivation of it (services/market_telemetry.py).
+    pivot_market = _pivot_market_from_payload(payload, request_metadata)
+    market_telemetry.observe_resolved(request_metadata, pivot_market)
+
     pivot_result = await search_pivot_catalog(
         PivotQueryRequest(
             query=query,
@@ -7742,7 +7768,7 @@ async def _handle_find_products_multi_via_pivot(
             # the exact opposite, and contradict the contract the field documents.
             brand_anchor_terms=brand_anchor_terms,
             merchant_id=None,
-            market=_pivot_market_from_payload(payload, request_metadata),
+            market=pivot_market,
             limit=raw_limit,
             include_external=(
                 False if canonical_sig_mode else PIVOT_MULTI_SERVE_INCLUDE_EXTERNAL
@@ -10002,7 +10028,7 @@ async def _invoke_multi_upstream_fallback(
     if not MULTI_SEARCH_UPSTREAM_FALLBACK_BASE_URL:
         return None
 
-    metadata_payload: Dict[str, Any] = dict(request_metadata or {})
+    metadata_payload: Dict[str, Any] = market_telemetry.strip_for_forwarding(dict(request_metadata or {}))
     metadata_payload["upstream_fallback_hop"] = hop + 1
     body: Dict[str, Any] = {
         "operation": "find_products_multi",
@@ -10117,7 +10143,14 @@ async def _handle_find_products_multi(
     an intermediate, not what gets served. Those callers pass False so the
     decision-layer ledger records exactly one event per SERVED slate, not the
     intermediate queries (which would pollute the behavioral baseline)."""
-    result = await _handle_find_products_multi_inner(payload, request_metadata, background_tasks)
+    # Every seed bind this request makes, in any lane, is recorded by fetch_external_seed_rows into
+    # this request's observation -- opened here, INSIDE the request's own task, so it never crosses
+    # the task queue (services/market_telemetry.py explains why that distinction matters).
+    seed_bind_sink = market_telemetry.open_seed_bind_sink(request_metadata)
+    try:
+        result = await _handle_find_products_multi_inner(payload, request_metadata, background_tasks)
+    finally:
+        market_telemetry.close_seed_bind_sink(seed_bind_sink)
     # Exclude test/demo rigs BEFORE redirect stamping + decision recording, so a
     # rig is neither /r-attributed nor deposited in the behavioral ledger. This
     # is the wrapper over EVERY inner return branch (cached, pivot, fallback,
@@ -15690,9 +15723,15 @@ async def invoke_shop_operation(
         dedup_cache_hit = False
         dedup_inflight_joined = False
         dedup_key: Optional[str] = None
+        # This request's own observation of which market it resolved and bound. It rides in the
+        # request's metadata dict -- captured by the queued closure below -- rather than a
+        # ContextVar: the task queue starts waiting tasks from inside whichever request just
+        # finished, so an ambient context would hand the observation to the wrong request.
+        market_observation: Dict[str, Any] = {}
         try:
             multi_request_metadata = dict(normalized_metadata)
             multi_request_metadata["_pivot_shadow_schedule_suppressed"] = True
+            multi_request_metadata[market_telemetry.OBSERVATION_KEY] = market_observation
             if INVOKE_MULTI_BYPASS_QUEUE_SHOPPING and is_shopping_surface:
                 if MULTI_SEARCH_PAGE_REQUEST_DEDUP_ENABLED:
                     dedup_key = _build_multi_page_request_dedup_key(
@@ -15847,6 +15886,28 @@ async def invoke_shop_operation(
             raise
         finally:
             duration_seconds = max(0.0, time.time() - started)
+            # One market record per find_products_multi request, on every outcome -- success,
+            # HTTPException, disconnect. It cannot fail the request: any error is recorded as
+            # such instead of the fields.
+            # Through market_telemetry.emit, NOT logger.info(..., extra=...): on this module's logger
+            # INFO is never emitted in prod and `extra` is never rendered (review of this PR,
+            # confirmed on prod logs). emit writes one JSON line Cloud Run stores as jsonPayload.
+            try:
+                market_telemetry.emit({
+                    "status_code": status_code,
+                    "source": source_normalized,
+                    "duration_ms": round(duration_seconds * 1000.0, 1),
+                    **market_telemetry.build_record(
+                        raw_payload=request.payload,
+                        envelope_metadata=request.metadata,
+                        observation=market_observation,
+                        result=locals().get("result"),
+                        dedup_cache_hit=dedup_cache_hit,
+                        dedup_inflight_joined=dedup_inflight_joined,
+                    ),
+                })
+            except Exception as telemetry_error:  # pragma: no cover - defensive
+                market_telemetry.emit({"market_telemetry_error": str(telemetry_error)[:120]})
             if duration_seconds >= 2.0:
                 logger.info(
                     "multi.invoke.slow",

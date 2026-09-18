@@ -14,19 +14,24 @@ def evidence():
         "gateway_revision": "def", "source_artifacts": ["saved-live-responses.json"],
         "crawl": {"status": "complete", "selected_products": 2},
         "products": [{"product_key": f"pk_{host}", "content_key": "ck", "product_group_id": "pg", "brand": "3CE", "seller_host": host,
-            "merchant_id": f"merchant_{host}", "currency": "USD", "market": "US", "variant_id": "123456",
+            # Lane-shaped ids: the product carries the observed seller-of-record, the offer the
+            # lane's own agent_seed namespace. Inventing ids here is what hid earlier defects.
+            "merchant_id": f"merch_obs_{host}", "currency": "USD", "market": "US", "variant_id": "123456",
             "variant_id_provenance": "merchant_issued", "gtin": "8809530070499",
-            "category_path": "beauty/makeup/lip/lipstick", "inci_source": "reseller_listing"}
+            "category_path": "beauty/makeup/lip/lipstick", "inci_source": "reseller_listing",
+            "inci_row": {"present": True, "source_system": "reseller_listing", "raw_inci_chars": 412}}
             for host in ["one.example", "two.example"]],
         "search_product_keys": ["pk_one.example", "pk_two.example"],
         "pdp_product_keys": ["pk_one.example", "pk_two.example"],
         "offer_product_keys": ["pk_one.example", "pk_two.example"],
-        "offers": [{"product_key": f"pk_{host}", "merchant_id": f"merchant_{host}", "seller_host": host,
+        "offers": [{"product_key": f"pk_{host}", "merchant_id": f"agent_seed::{host}", "seller_host": host,
                     "variant_id": "123456", "currency": "USD", "market": "US",
                     "destination_url": f"https://{host}/products/lipstick"}
                    for host in ["one.example", "two.example"]],
         "second_ingest_added_product_keys": [], "second_ingest_added_sku_keys": [],
-        "second_ingest_added_offer_keys": [], "identity_failures": []}}
+        "second_ingest_added_offer_keys": [], "identity_failures": [],
+        "evidence_provenance": {"collector": "collect_curated_canary_evidence/v1",
+                                "collected_at": NOW.isoformat(), "backend_revision": "abc"}}}
 
 
 def test_missing_observations_are_pending_never_success():
@@ -196,6 +201,10 @@ def test_the_shipped_manifest_is_evaluable_and_each_case_keeps_its_own_shelf():
     for case in manifest["cases"]:
         for field in ("accepted_brands", "seller_hosts", "market", "currency", "inci_source"):
             assert case.get(field), f"{case['case_id']} is missing {field}"
+        # An undeclared (or typo'd) source_role falls to the WEAKER offer-identity rule, so the
+        # shipped manifest may not rely on the default.
+        assert case.get("source_role") in {"retailer", "brand_official"}, (
+            f"{case['case_id']} must declare source_role; an undeclared role is checked loosely")
         if case.get("target_gtin"):
             assert canonical_gtin(case["target_gtin"]), f"{case['case_id']} target_gtin fails GS1"
         declared = case.get("required_category_prefix")
@@ -224,3 +233,270 @@ def test_the_shipped_lip_case_rejects_a_skincare_product():
     result = evaluate({"cases": [lip_case]}, data, now=NOW)
     assert result["failed"] == 1
     assert any("beauty/makeup/lip/" in r for r in result["cases"][0]["reasons"])
+
+
+def test_evidence_without_collector_provenance_cannot_pass():
+    """Every field here is otherwise typeable by hand; provenance names who produced it."""
+    data = evidence()
+    del data["same_brand"]["evidence_provenance"]
+    result = evaluate(MANIFEST, data, now=NOW)
+    assert result["failed"] == 1
+    assert any("provenance" in reason for reason in result["cases"][0]["reasons"])
+
+    for blanked in ("collector", "collected_at", "backend_revision"):
+        data = evidence()
+        data["same_brand"]["evidence_provenance"][blanked] = "  "
+        assert evaluate(MANIFEST, data, now=NOW)["failed"] == 1, blanked
+
+
+def test_a_declared_ingredient_authority_needs_a_stored_row_behind_it():
+    """The curated mapper stamps inci_source on EVERY retailer record, while the row is written
+    only when the seller published ingredients. Without this, a product whose PDP carries no INCI
+    passes — measured 2026-09-16, the A'PIEU lip oil at eyurs.com is exactly that product."""
+    data = evidence()
+    del data["same_brand"]["products"][0]["inci_row"]
+    assert evaluate(MANIFEST, data, now=NOW)["failed"] == 1
+
+    data = evidence()
+    data["same_brand"]["products"][0]["inci_row"] = {
+        "present": False, "source_system": None, "raw_inci_chars": 0}
+    result = evaluate(MANIFEST, data, now=NOW)
+    assert result["failed"] == 1
+    assert any("no stored ingredient row" in r for r in result["cases"][0]["reasons"])
+
+
+def test_a_stored_row_that_disagrees_with_the_case_cannot_pass():
+    """Compared against the CASE, not a sibling field: the collector writes both the row and any
+    declared source, so comparing those two to each other proves only self-consistency."""
+    data = evidence()
+    data["same_brand"]["products"][0]["inci_row"]["source_system"] = "brand_official"
+    result = evaluate(MANIFEST, data, now=NOW)
+    assert result["failed"] == 1
+    assert any("not the case's authority" in r for r in result["cases"][0]["reasons"])
+
+    # A file that agrees with ITSELF while disagreeing with the case is still refused.
+    data = evidence()
+    data["same_brand"]["products"][0]["inci_source"] = "brand_official"
+    data["same_brand"]["products"][0]["inci_row"]["source_system"] = "brand_official"
+    assert evaluate(MANIFEST, data, now=NOW)["failed"] == 1
+
+    # A row that exists but holds no text is not authority either.
+    data = evidence()
+    data["same_brand"]["products"][0]["inci_row"]["raw_inci_chars"] = 0
+    assert evaluate(MANIFEST, data, now=NOW)["failed"] == 1
+
+
+def test_an_uncollected_surface_is_not_a_measured_absence():
+    """null means the door was never asked; [] means it was asked and returned nothing. Collapsing
+    them lets a never-measured surface read as a measured result."""
+    data = evidence()
+    data["same_brand"]["search_product_keys"] = None
+    result = evaluate(MANIFEST, data, now=NOW)
+    assert result["failed"] == 1
+    reasons = result["cases"][0]["reasons"]
+    assert any("was not collected" in r for r in reasons), reasons
+    assert not any("product missing from search_product_keys" in r for r in reasons), \
+        "an uncollected surface must not be reported as a measured absence"
+
+
+def test_uncollected_idempotence_and_identity_failures_cannot_pass():
+    """`null` here means the second ingest was never run / failures never measured. An empty list
+    is the claim 'measured, and there were none'."""
+    for field in ("second_ingest_added_product_keys", "identity_failures"):
+        data = evidence()
+        data["same_brand"][field] = None
+        assert evaluate(MANIFEST, data, now=NOW)["failed"] == 1, field
+
+
+def test_an_offer_keeps_its_own_merchant_namespace():
+    """The curated lane writes the product under the observed seller-of-record (merch_obs_<hash>)
+    and its offers under agent_seed::retailer::<host> — apply.py does not re-point offers, and
+    test_curated_retailer_contract pins that shape. Demanding the two be equal made every curated
+    retailer case unpassable, so the tuple matches on seller_host/variant/currency/market."""
+    data = evidence()
+    for product, offer in zip(data["same_brand"]["products"], data["same_brand"]["offers"]):
+        product["merchant_id"] = f"merch_obs_{product['seller_host']}"
+        offer["merchant_id"] = f"agent_seed::retailer::{offer['seller_host']}"
+    assert evaluate(MANIFEST, data, now=NOW)["passed"] == 1
+
+
+def test_offers_collapsing_onto_one_merchant_identity_still_fail():
+    """That is the property the old product-to-offer equality was really protecting; dropping it
+    from the tuple must not drop it from the contract."""
+    data = evidence()
+    for product, offer in zip(data["same_brand"]["products"], data["same_brand"]["offers"]):
+        product["merchant_id"] = f"merch_obs_{product['seller_host']}"
+        offer["merchant_id"] = "agent_seed::retailer::one.example"
+    result = evaluate(MANIFEST, data, now=NOW)
+    assert result["failed"] == 1
+    assert any("offers collapsed" in r for r in result["cases"][0]["reasons"])
+
+
+def test_an_offer_without_any_merchant_identity_cannot_resolve():
+    data = evidence()
+    for offer in data["same_brand"]["offers"]:
+        offer["merchant_id"] = ""
+    assert evaluate(MANIFEST, data, now=NOW)["failed"] == 1
+
+
+def test_an_offer_in_another_market_or_currency_does_not_resolve_this_product():
+    """market is a hard serving partition: an offer stamped KR does not make a US product
+    resolvable, and a price in another currency is not this product's price."""
+    for field, other in (("market", "KR"), ("currency", "KRW")):
+        data = evidence()
+        data["same_brand"]["offers"][0][field] = other
+        result = evaluate(MANIFEST, data, now=NOW)
+        assert result["failed"] == 1, field
+        assert any("missing seller-specific resolvable offer" in r
+                   for r in result["cases"][0]["reasons"]), field
+
+
+RETAILER_CASE = dict(MANIFEST["cases"][0], source_role="retailer")
+
+
+def _retailer_evidence():
+    """Evidence in the shape the lane actually writes: product under the observed
+    seller-of-record, offer under the host-derived retailer id."""
+    data = evidence()
+    for product, offer in zip(data["same_brand"]["products"], data["same_brand"]["offers"]):
+        product["merchant_id"] = f"merch_obs_{product['seller_host']}"
+        offer["merchant_id"] = f"agent_seed::retailer::{offer['seller_host']}"
+    return data
+
+
+def test_the_expected_offer_identity_matches_what_the_writer_derives():
+    """The validator duplicates the id shape rather than importing the ingest chain; if the real
+    deriver ever changes, this fails instead of the duplication drifting silently."""
+    from services.catalog_enrichment_agent.ingestion import derive_merchant_id
+    from scripts.validate_meitu_canary_evidence import retailer_merchant_id
+
+    for host in ("one.example", "eyurs.com", "ohlolly.com"):
+        assert retailer_merchant_id(host) == derive_merchant_id(None, host, seller_domain=host)
+
+
+def test_a_retailer_offer_must_carry_its_own_hosts_identity():
+    """Each of these passed when any non-empty merchant id was accepted."""
+    manifest = {"cases": [RETAILER_CASE]}
+    assert evaluate(manifest, _retailer_evidence(), now=NOW)["passed"] == 1
+
+    # Cross-wired: host A's offer carries host B's identity.
+    data = _retailer_evidence()
+    data["same_brand"]["offers"][0]["merchant_id"] = "agent_seed::retailer::two.example"
+    data["same_brand"]["offers"][1]["merchant_id"] = "agent_seed::retailer::one.example"
+    assert evaluate(manifest, data, now=NOW)["failed"] == 1, "cross-wired seller identities"
+
+    # The ADR-009-banned shared bucket, which apply.py documents as mintable.
+    data = _retailer_evidence()
+    data["same_brand"]["offers"][0]["merchant_id"] = "external_seed"
+    assert evaluate(manifest, data, now=NOW)["failed"] == 1, "legacy external_seed bucket"
+
+    # An unrelated namespace entirely.
+    data = _retailer_evidence()
+    data["same_brand"]["offers"][0]["merchant_id"] = "merch_totally_unrelated"
+    assert evaluate(manifest, data, now=NOW)["failed"] == 1, "unrelated merchant namespace"
+
+
+def test_a_single_seller_retailer_case_still_checks_the_offer_identity():
+    """The collapse check only runs for multi-seller cases, so without the host-derived check a
+    single-seller case had NO constraint tying an offer to its seller at all."""
+    case = dict(RETAILER_CASE, seller_hosts=["one.example"])
+    data = _retailer_evidence()
+    for field in ("products", "offers"):
+        data["same_brand"][field] = [row for row in data["same_brand"][field]
+                                     if row["seller_host"] == "one.example"]
+    for surface in ("search_product_keys", "pdp_product_keys", "offer_product_keys"):
+        data["same_brand"][surface] = ["pk_one.example"]
+    data["same_brand"]["crawl"]["selected_products"] = 1
+    assert evaluate({"cases": [case]}, data, now=NOW)["passed"] == 1
+
+    data["same_brand"]["offers"][0]["merchant_id"] = "external_seed"
+    assert evaluate({"cases": [case]}, data, now=NOW)["failed"] == 1
+
+
+def test_the_offer_must_belong_to_this_product_and_this_variant():
+    """seller_host and variant_id were both deletable from the tuple without a test failing."""
+    manifest = {"cases": [RETAILER_CASE]}
+
+    # An offer whose seller_host names the other retailer.
+    data = _retailer_evidence()
+    data["same_brand"]["offers"][0]["seller_host"] = "two.example"
+    assert evaluate(manifest, data, now=NOW)["failed"] == 1, "offer filed under the wrong host"
+
+    # An offer hanging off the canonical stub instead of the merchant variant: the
+    # "looks purchasable, isn't" shape this canary exists to catch.
+    data = _retailer_evidence()
+    data["same_brand"]["offers"][0]["variant_id"] = data["same_brand"]["products"][0]["product_key"]
+    assert evaluate(manifest, data, now=NOW)["failed"] == 1, "offer on the canonical stub"
+
+
+def test_an_unrelated_hosts_offer_does_not_trip_the_collapse_check():
+    """The collapse check asks whether THIS case's sellers share an identity. An offer from a
+    host outside the case reusing one of those ids is not this case's collapse, and counting it
+    fails a case whose own sellers are perfectly distinct."""
+    manifest = {"cases": [RETAILER_CASE]}
+    data = _retailer_evidence()
+    stray = dict(data["same_brand"]["offers"][0])
+    stray["seller_host"] = "unrelated.example"
+    data["same_brand"]["offers"].append(stray)
+    result = evaluate(manifest, data, now=NOW)
+    assert result["passed"] == 1, result["cases"][0]["reasons"]
+
+
+def test_a_brand_offer_must_still_be_this_lanes_identity():
+    """A brand offer's id is slug-derived and cannot be matched exactly, but it may not be
+    arbitrary: accepting any non-empty id left brand cases with the hole just closed for
+    retailer ones. Two of the six shipped cases are brand_official."""
+    case = dict(MANIFEST["cases"][0], source_role="brand_official")
+    manifest = {"cases": [case]}
+    assert evaluate(manifest, evidence(), now=NOW)["passed"] == 1
+
+    for bad in ("external_seed", "merch_unrelated", "agent_seed::retailer::two.example",
+                "agent_x", "agent_seedX::flower"):
+        data = evidence()
+        data["same_brand"]["offers"][0]["merchant_id"] = bad
+        result = evaluate(manifest, data, now=NOW)
+        assert result["failed"] == 1, f"brand case accepted offer merchant {bad!r}"
+
+
+def test_the_banned_shared_bucket_is_refused_for_every_case_shape():
+    """ADR-009 D2 bans the shared external_seed bucket, and apply.py documents rows being minted
+    into it; an offer there is not a seller-specific offer whatever the case's role."""
+    for role in ("retailer", "brand_official", None):
+        case = dict(MANIFEST["cases"][0])
+        if role:
+            case["source_role"] = role
+        data = _retailer_evidence() if role == "retailer" else evidence()
+        data["same_brand"]["offers"][0]["merchant_id"] = "external_seed"
+        assert evaluate({"cases": [case]}, data, now=NOW)["failed"] == 1, role
+
+
+def test_the_mirrored_constants_match_their_real_definitions():
+    """Both strings are copied rather than imported (this screen is standalone); the copies are
+    pinned here so they cannot drift from the writer."""
+    from services.catalog_enrichment_agent.ingestion import MERCHANT_ID_PREFIX, derive_merchant_id
+    from services.seller_identity import BANNED_BUCKET_MERCHANT_ID as REAL_BANNED
+    from scripts.validate_meitu_canary_evidence import (
+        AGENT_SEED_PREFIX, BANNED_BUCKET_MERCHANT_ID, retailer_merchant_id,
+    )
+
+    assert AGENT_SEED_PREFIX == MERCHANT_ID_PREFIX
+    assert BANNED_BUCKET_MERCHANT_ID == REAL_BANNED
+    # Host shapes the writer normalises before building the id.
+    for host in ("eyurs.com", "EYURS.COM", "www.eyurs.com", "ohlolly.com"):
+        assert retailer_merchant_id(host) == derive_merchant_id(
+            None, host.lower().removeprefix("www."), seller_domain=host.lower().removeprefix("www."))
+
+
+def test_a_retailer_offer_is_held_to_the_exact_id_not_merely_the_namespace():
+    """The brand rule (namespace + not-another-host) catches every earlier retailer case, so
+    disabling the exact-match rule entirely left no failing test. These two shapes are refused
+    ONLY by exact matching: a brand-lane slug, and a retailer id for a host outside the case."""
+    manifest = {"cases": [RETAILER_CASE]}
+    for wrong in ("agent_seed::3ce", "agent_seed::retailer::somewhere-else.example"):
+        data = _retailer_evidence()
+        data["same_brand"]["offers"][0]["merchant_id"] = wrong
+        result = evaluate(manifest, data, now=NOW)
+        assert result["failed"] == 1, f"retailer case accepted {wrong!r}"
+
+    # And the correct one still passes, so this is not merely a stricter refusal.
+    assert evaluate(manifest, _retailer_evidence(), now=NOW)["passed"] == 1

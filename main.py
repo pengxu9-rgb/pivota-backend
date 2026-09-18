@@ -137,6 +137,7 @@ from routes.auth import router as auth_api_router  # API auth endpoints
 from routes.mcp_oauth_as import router as mcp_oauth_as_router  # MCP OAuth Authorization Server (flag-gated)
 from routes.agent_account import router as agent_account_router  # Agent account management
 from routes.agent_commerce import router as agent_commerce_router
+from routes.agent_commerce_reap import router as agent_commerce_reap_router
 from routes.admin_api import router as admin_api_router
 from routes.admin_partner_cohort import router as admin_partner_cohort_router
 from routes.admin_partner_comms import router as admin_partner_comms_router
@@ -1152,6 +1153,12 @@ app.include_router(agent_pdp_v1_router)  # Agent PDP v1 denormalized read path (
 app.include_router(agent_citation_v1_router)  # External citation read API (/agent/v1/citation/*) — ADR-007 P0
 app.include_router(agent_account_router)  # Agent account management (/agent/account/*)
 app.include_router(agent_commerce_router)  # Agent v2 commerce execute contract
+# Agent v2 Reap agentic purchase rail (/agent/v2/commerce/reap/*). DARK: every route on it
+# answers 404 while REAP_AGENTIC_ENABLED is off or the Reap client is unconfigured, which is
+# the state of production. Mounted anyway, and deliberately: a router that is only mounted
+# when a dial is on is a router whose mounting is itself untested, and the dial is read per
+# request so flipping it must not need a redeploy.
+app.include_router(agent_commerce_reap_router)
 app.include_router(admin_api_router)  # Admin API endpoints
 app.include_router(admin_partner_cohort_router)  # Admin channel-partner cohort progress/evaluation
 app.include_router(admin_partner_comms_router)  # Admin channel-partner contact, send log, send settlement email

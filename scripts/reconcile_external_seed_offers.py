@@ -59,6 +59,25 @@ MISSING_SQL = """
     WHERE eps.status = 'active'
       AND co.offer_id IS NULL
     ORDER BY eps.updated_at DESC
+    LIMIT :row_limit
+"""
+
+# The COUNTS are the whole point of the dry-run report, so they are measured
+# separately and WITHOUT the limit. Bounding the row fetch while letting the
+# count run free is the only way the report can stay honest about how much drift
+# exists while the repair set stays bounded -- a single limited query would have
+# silently reported "1000 drifted" forever.
+MISSING_COUNT_SQL = """
+    SELECT COUNT(*) AS n
+    FROM external_product_seeds eps
+    JOIN catalog_products cp
+      ON cp.source_ref = eps.id
+     AND cp.source_system = :mirror_source
+    LEFT JOIN catalog_offers co
+      ON co.source_ref = eps.id
+     AND co.source_system = :mirror_source
+    WHERE eps.status = 'active'
+      AND co.offer_id IS NULL
 """
 
 # Offers whose price / availability / currency drifted from the live seed.
@@ -78,6 +97,21 @@ DRIFT_SQL = """
          OR co.currency IS DISTINCT FROM coalesce(eps.price_currency, 'USD')
       )
     ORDER BY eps.updated_at DESC
+    LIMIT :row_limit
+"""
+
+DRIFT_COUNT_SQL = """
+    SELECT COUNT(*) AS n
+    FROM external_product_seeds eps
+    JOIN catalog_offers co
+      ON co.source_ref = eps.id
+     AND co.source_system = :mirror_source
+    WHERE eps.status = 'active'
+      AND (
+            co.list_price IS DISTINCT FROM eps.price_amount::numeric(12,2)
+         OR co.availability IS DISTINCT FROM eps.availability
+         OR co.currency IS DISTINCT FROM coalesce(eps.price_currency, 'USD')
+      )
 """
 
 # Mirror offers whose seed vanished or is no longer active (report only).
@@ -88,20 +122,54 @@ ORPHAN_SQL = """
     WHERE co.source_system = :mirror_source
       AND (eps.id IS NULL OR eps.status <> 'active')
     ORDER BY co.updated_at DESC
+    LIMIT :row_limit
+"""
+
+ORPHAN_COUNT_SQL = """
+    SELECT COUNT(*) AS n
+    FROM catalog_offers co
+    LEFT JOIN external_product_seeds eps ON eps.id = co.source_ref
+    WHERE co.source_system = :mirror_source
+      AND (eps.id IS NULL OR eps.status <> 'active')
 """
 
 
+async def _count(sql: str, params: Dict[str, Any]) -> int:
+    row = await database.fetch_one(sql, params)
+    if row is None:
+        return 0
+    return int(dict(row).get("n") or 0)
+
+
 async def run_reconcile(*, apply: bool, limit: int, sample_limit: int) -> Dict[str, Any]:
-    params = {"mirror_source": _MIRROR_SOURCE}
+    count_params = {"mirror_source": _MIRROR_SOURCE}
+    # Fetch enough rows to cover both the sample and the repair set, and no more.
+    # Unbounded, these three queries sorted every matching row on prod and the
+    # first one exceeded the statement timeout -- the reason this script had
+    # never completed a single run.
+    row_limit = max(int(limit or 0), int(sample_limit or 0), 1)
+    params = {**count_params, "row_limit": row_limit}
+
     missing = [dict(r) for r in await database.fetch_all(MISSING_SQL, params)]
     drift = [dict(r) for r in await database.fetch_all(DRIFT_SQL, params)]
     orphan = [dict(r) for r in await database.fetch_all(ORPHAN_SQL, params)]
 
+    missing_total = await _count(MISSING_COUNT_SQL, count_params)
+    drift_total = await _count(DRIFT_COUNT_SQL, count_params)
+    orphan_total = await _count(ORPHAN_COUNT_SQL, count_params)
+
     report: Dict[str, Any] = {
         "apply": apply,
-        "missing_offers": len(missing),
-        "drifted_offers": len(drift),
-        "orphan_offers": len(orphan),
+        # Totals, NOT len(rows): the rows are capped by row_limit.
+        "missing_offers": missing_total,
+        "drifted_offers": drift_total,
+        "orphan_offers": orphan_total,
+        "row_limit": row_limit,
+        "rows_examined": {
+            "missing": len(missing),
+            "drift": len(drift),
+            "orphan": len(orphan),
+        },
         "missing_sample": missing[:sample_limit],
         "drift_sample": drift[:sample_limit],
         "orphan_sample": orphan[:sample_limit],
@@ -124,12 +192,8 @@ async def run_reconcile(*, apply: bool, limit: int, sample_limit: int) -> Dict[s
         if result.get("status") == "synced":
             repaired += 1
     report["repaired"] = repaired
-    report["remaining_missing"] = len(
-        [dict(r) for r in await database.fetch_all(MISSING_SQL, params)]
-    )
-    report["remaining_drift"] = len(
-        [dict(r) for r in await database.fetch_all(DRIFT_SQL, params)]
-    )
+    report["remaining_missing"] = await _count(MISSING_COUNT_SQL, count_params)
+    report["remaining_drift"] = await _count(DRIFT_COUNT_SQL, count_params)
     return report
 
 

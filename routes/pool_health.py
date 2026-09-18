@@ -287,6 +287,25 @@ def _tasks_by_frame() -> Dict[str, int]:
     return dict(counts.most_common(_MAX_FRAME_GROUPS))
 
 
+def _holders() -> Dict[str, Any]:
+    """Live checkouts grouped by where they were ACQUIRED (db/pool_holders.py).
+
+    The complement of `tasks_by_frame`: that names tasks parked while holding a slot, this names
+    the code that took a slot even when no task holds it any more — the leak case, which the
+    2026-09-16 wedge was (13 idle connections per instance, nothing parked on them). Like the
+    rest of this endpoint: FILE:LINE only.
+    """
+    try:
+        from db.database import DB_POOL_HOLDER_TRACKING
+        from db.pool_holders import REGISTRY
+
+        if not DB_POOL_HOLDER_TRACKING:
+            return {"tracking": False}
+        return {"tracking": True, **REGISTRY.snapshot()}
+    except Exception as exc:  # noqa: BLE001
+        return {"tracking": None, "error": type(exc).__name__}
+
+
 def _verdict(pool_ok: Optional[bool], direct_ok: Optional[bool]) -> str:
     if pool_ok:
         return "healthy" if direct_ok is not False else "direct_probe_blocked"
@@ -328,5 +347,6 @@ async def pool_health() -> Dict[str, Any]:
         "pool_probe": pool_probe,
         "direct_probe": direct_probe,
         "tasks_by_frame": _tasks_by_frame(),
+        "holders": _holders(),
         "timestamp": time.time(),
     }

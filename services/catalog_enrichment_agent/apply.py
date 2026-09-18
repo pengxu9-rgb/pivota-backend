@@ -18,7 +18,7 @@ Two executors share one set of SQL constants:
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from services.catalog_enrichment_agent.bulk_writer import bulk_upsert
 from services.catalog_enrichment_agent.ingestion import AGENT_VERSION, derive_offer_id
@@ -1486,12 +1486,21 @@ async def _prepare_seller_of_record(plan: Dict[str, Any], database: Any) -> Dict
     return plan
 
 
-async def _refuse_parallel_retailer_listings(plan: Dict[str, Any], database: Any) -> None:
-    """A new listing key must not silently leave an older same-URL row eligible.
+#: Every row on a planned listing's host. Shared by the apply guard and the dry-run
+#: preflight (`find_legacy_retailer_listing_owners`) so that the preflight reports
+#: exactly the rows the apply will refuse on. The suppression columns are read only
+#: for disclosure: the WHERE clause deliberately does NOT exclude suppressed rows
+#: (see `_refuse_parallel_retailer_listings` for why a suppressed owner still blocks).
+_LEGACY_LISTING_OWNERS_SQL = """
+        SELECT product_key, source_domain, canonical_url, suppressed_at, suppression_reason
+        FROM catalog_products
+        WHERE lower(split_part(regexp_replace(canonical_url,
+                             '^https?://(www[.])?', '', 'i'), '/', 1)) = ANY(:hosts)
+        """
 
-    The reviewed cohort migration owns retiring old children and seed rows. Both
-    executors refuse before any merchant or catalog write when that work remains.
-    """
+
+def planned_retailer_listings(plan: Dict[str, Any]) -> Dict[str, str]:
+    """Listing identity -> planned `ext:retailer:` product_key. Pure; no DB."""
     from services.catalog_enrichment_agent.ingestion import retailer_listing_identity
 
     listings = {}
@@ -1499,28 +1508,79 @@ async def _refuse_parallel_retailer_listings(plan: Dict[str, Any], database: Any
         if str(pdp.get("product_key") or "").startswith("ext:retailer:"):
             identity = retailer_listing_identity(pdp.get("source_domain"), pdp.get("canonical_url"))
             listings[identity] = pdp["product_key"]
-    if not listings:
-        return
-    rows = await database.fetch_all(
-        """
-        SELECT product_key, source_domain, canonical_url FROM catalog_products
-        WHERE lower(split_part(regexp_replace(canonical_url,
-                             '^https?://(www[.])?', '', 'i'), '/', 1)) = ANY(:hosts)
-        """, {"hosts": sorted({listing.split("/", 1)[0] for listing in listings})},
-    )
+    return listings
+
+
+async def find_legacy_retailer_listing_owners(plan: Dict[str, Any], database: Any) -> List[Dict[str, Any]]:
+    """Every existing row the apply guard would refuse on, in the order it would meet them.
+
+    SELECT-only: the only call made on `database` is one `fetch_all`. Each finding is
+    either `kind="conflict"` (another product_key owns a planned listing URL) or
+    `kind="identity_unproven"` (an existing row on the host whose URL cannot be turned
+    into a listing identity; the guard raises that ValueError as-is). The apply raises
+    on the FIRST finding, so order is preserved rather than grouped.
+    """
     from urllib.parse import urlsplit
 
+    from services.catalog_enrichment_agent.ingestion import retailer_listing_identity
+
+    listings = planned_retailer_listings(plan)
+    if not listings:
+        return []
+    rows = await database.fetch_all(
+        _LEGACY_LISTING_OWNERS_SQL,
+        {"hosts": sorted({listing.split("/", 1)[0] for listing in listings})},
+    )
+    findings: List[Dict[str, Any]] = []
     for row in rows or []:
         row = dict(row)
         # The candidate's URL owns this comparison. Missing source metadata on
         # an unrelated old listing must not block every product on its host.
         url = row.get("canonical_url") or ""
-        identity = retailer_listing_identity(urlsplit(url).hostname, url)
+        try:
+            identity = retailer_listing_identity(urlsplit(url).hostname, url)
+        except ValueError as exc:
+            findings.append({"kind": "identity_unproven", "legacy_product_key": row.get("product_key"),
+                             "canonical_url": url, "error": str(exc)})
+            continue
         if identity in listings and row.get("product_key") != listings[identity]:
-            raise ValueError(
-                "retailer_listing_migration_required: existing product "
-                f"{row.get('product_key')} owns {identity}; migrate/rekey or remove its full legacy chain before onboarding"
-            )
+            findings.append({
+                "kind": "conflict",
+                "listing": identity,
+                "planned_product_key": listings[identity],
+                "legacy_product_key": row.get("product_key"),
+                "suppressed": row.get("suppressed_at") is not None,
+                "suppression_reason": row.get("suppression_reason"),
+            })
+    return findings
+
+
+def legacy_listing_refusal(finding: Dict[str, Any]) -> str:
+    """The message the apply guard raises for this finding (the dry run quotes it)."""
+    if finding["kind"] == "identity_unproven":
+        return str(finding["error"])
+    return (
+        "retailer_listing_migration_required: existing product "
+        f"{finding['legacy_product_key']} owns {finding['listing']}; migrate/rekey or remove its full legacy chain before onboarding"
+    )
+
+
+async def _refuse_parallel_retailer_listings(plan: Dict[str, Any], database: Any) -> None:
+    """A new listing key must not silently leave an older same-URL row eligible.
+
+    The reviewed cohort migration owns retiring old children and seed rows. Both
+    executors refuse before any merchant or catalog write when that work remains.
+
+    A SUPPRESSED legacy owner still refuses (unchanged since the guard landed).
+    `catalog_products.suppressed_at` is reversible -- scripts/withdraw_catalog_rows.py
+    --revert and services/identity_resolution.py REVERT_ROWS_SQL both clear it -- and it
+    says nothing about the row's seed/sku/offer chain (external_product_seeds carries
+    its own `status`), so a suppressed product row is not proof its legacy chain is
+    retired. Admitting it would let a revert put two live listings on one URL.
+    """
+    findings = await find_legacy_retailer_listing_owners(plan, database)
+    if findings:
+        raise ValueError(legacy_listing_refusal(findings[0]))
 
 
 async def apply_ingest_plan(
