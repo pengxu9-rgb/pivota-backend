@@ -609,30 +609,64 @@ async def test_two_agents_with_the_same_user_ref_get_two_buyers(client):
     assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_buyer_refs") == 2
 
 
-async def test_a_link_written_between_the_read_and_the_insert_wins(client):
-    """THE RACE, simulated where it actually bites.
+WINNER_BUYER_ID = "u_thewinner00000"
+
+
+def _race_a_link_in(monkeypatch, buyer_id: str = WINNER_BUYER_ID):
+    """Make a competing link appear BETWEEN the route's SELECT and its INSERT.
+
+    ── WHY THIS SEAM AND NOT A PRE-INSERTED ROW ─────────────────────────────────────────────
+
+    The first cut of this test seeded the link before the request. It asserted the right thing
+    and proved nothing: the route's opening SELECT finds a pre-seeded row and returns on the
+    spot, so the INSERT — the statement whose `ON CONFLICT` behaviour is the entire point — was
+    never reached. The mutant that turns `DO NOTHING` into `DO UPDATE SET buyer_id = EXCLUDED
+    .buyer_id` SURVIVED that test on both dialects, which is how the gap was found.
+
+    The race is a write that lands after our read missed. So the competing row is inserted from
+    inside `database.execute`, on the way into the route's own link INSERT — which is exactly
+    that window, deterministically, on either engine.
+    """
+    real_execute = database.execute
+    state = {"raced": False}
+
+    async def _racing_execute(query, values=None, *args, **kwargs):
+        if not state["raced"] and "INSERT INTO buyer_identity_links" in str(query):
+            # Set FIRST: the seed below goes through this same patched callable.
+            state["raced"] = True
+            await _seed_link(buyer_id=buyer_id)
+        return await real_execute(query, values, *args, **kwargs)
+
+    monkeypatch.setattr(database, "execute", _racing_execute)
+    return state
+
+
+async def test_a_link_written_between_the_read_and_the_insert_wins(client, monkeypatch):
+    """THE RACE, at the statement where it bites.
 
     Two concurrent first POSTs both SELECT nothing and both INSERT. The unique constraint on
     `(agent_id, agent_user_ref_hash)` lets exactly one land; `ON CONFLICT DO NOTHING` absorbs the
-    other, and the route then RE-READS rather than returning what it minted. Pre-inserting the
-    row is the same situation from the loser's point of view, and it is the one that can be
-    written deterministically: the winner's buyer_id must come back, not ours.
+    other, and the route then RE-READS rather than returning what it minted. The winner's
+    buyer_id must be what the purchase is opened under — never ours.
     """
     await _seed_catalog()
     await _seed_eligibility()
-    await _seed_link(buyer_id="u_thewinner00000")
+    state = _race_a_link_in(monkeypatch)
 
     resp = await client.post(f"{BASE}/purchases", json=_body())
 
+    assert state["raced"], "precondition: the route never reached its link INSERT"
     assert resp.status_code == 202
     links = await _links()
     assert len(links) == 1, "the loser inserted a second link instead of yielding"
-    assert links[0]["buyer_id"] == "u_thewinner00000"
+    assert links[0]["buyer_id"] == WINNER_BUYER_ID, (
+        "the route overwrote a link that was written first — `DO NOTHING` became `DO UPDATE`"
+    )
     assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_buyer_refs") == 1
     row = await _purchase_row(resp.json()["purchase_id"])
     ref = await database.fetch_val(
         "SELECT reap_buyer_ref FROM reap_agentic_buyer_refs WHERE buyer_id = :b",
-        {"b": "u_thewinner00000"},
+        {"b": WINNER_BUYER_ID},
     )
     assert row["buyer_ref"] == ref, "the purchase was opened under a ref that is not the winner's"
 

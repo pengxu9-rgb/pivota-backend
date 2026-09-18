@@ -889,35 +889,62 @@ async def test_the_minted_buyer_id_carries_nothing_from_the_request(client):
     assert len(buyer_id) == 18
 
 
-async def test_the_real_unique_constraint_makes_the_loser_yield(client):
+WINNER_BUYER_ID = "u_pgwinner000000"
+
+
+def _race_a_link_in(monkeypatch, buyer_id: str = WINNER_BUYER_ID):
+    """Make a competing link appear BETWEEN the route's SELECT and its INSERT.
+
+    A PRE-INSERTED ROW DOES NOT TEST THIS. The route's opening SELECT finds a pre-seeded link
+    and returns before the INSERT, so the statement whose `ON CONFLICT` behaviour is the point is
+    never reached — the `DO NOTHING` -> `DO UPDATE` mutant survived that version of this test on
+    both dialects. The race is a write that lands after our read missed, so the competing row is
+    inserted from inside `database.execute`, on the way into the route's own link INSERT.
+    """
+    real_execute = database.execute
+    state = {"raced": False}
+
+    async def _racing_execute(query, values=None, *args, **kwargs):
+        if not state["raced"] and "INSERT INTO buyer_identity_links" in str(query):
+            state["raced"] = True
+            await _seed_link(buyer_id=buyer_id)
+        return await real_execute(query, values, *args, **kwargs)
+
+    monkeypatch.setattr(database, "execute", _racing_execute)
+    return state
+
+
+async def test_the_real_unique_constraint_makes_the_loser_yield(client, monkeypatch):
     """THE RACE, against the constraint production has.
 
     `uq_buyer_identity_links_agent_ref_hash` is a real unique index here, so `ON CONFLICT
     (agent_id, agent_user_ref_hash) DO NOTHING` is the Postgres implementation being exercised —
-    not SQLite's. A pre-inserted row is the loser's view of two concurrent first purchases, and
-    the winner's buyer_id must be what comes back.
+    not SQLite's. The winner's buyer_id must be what the purchase is opened under.
     """
     await _seed_catalog()
     await _seed_eligibility()
-    await _seed_link(buyer_id="u_pgwinner000000")
+    state = _race_a_link_in(monkeypatch)
 
     resp = await client.post(f"{BASE}/purchases", json=_body())
 
+    assert state["raced"], "precondition: the route never reached its link INSERT"
     assert resp.status_code == 202
     links = await _links()
     assert len(links) == 1, "the loser inserted a second link instead of yielding"
-    assert links[0]["buyer_id"] == "u_pgwinner000000"
+    assert links[0]["buyer_id"] == WINNER_BUYER_ID, (
+        "the route overwrote a link that was written first — `DO NOTHING` became `DO UPDATE`"
+    )
     ref = await database.fetch_val(
         "SELECT reap_buyer_ref FROM reap_agentic_buyer_refs WHERE buyer_id = :b",
-        {"b": "u_pgwinner000000"},
+        {"b": WINNER_BUYER_ID},
     )
     row = await ledger.get_purchase_internal(resp.json()["purchase_id"])
     assert row["buyer_ref"] == ref
 
 
 async def test_the_insert_does_not_overwrite_an_existing_link(client):
-    """`DO NOTHING`, not `DO UPDATE`. The route with the weakest evidence of who the buyer is
-    must never repoint a link a human's sign-in wrote."""
+    """The already-linked path: the opening SELECT finds the human's link and the route returns
+    on it. This is the common case, NOT the `ON CONFLICT` case — the test above is that one."""
     await _seed_all()
     await client.post(f"{BASE}/purchases", json=_body())
     assert [l["buyer_id"] for l in await _links()] == [BUYER_ID]
