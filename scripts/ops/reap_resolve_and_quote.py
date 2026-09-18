@@ -74,7 +74,18 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--quote", action="store_true",
                     help="after resolving, also call POST /agentic/quotes")
+    ap.add_argument("--alias", action="append", default=None, metavar="LABEL",
+                    help="a Reap variant label to accept for our title, e.g. "
+                         "--alias 'Flamingo Flirt - Cream'. Repeatable. Needed when Reap's sole "
+                         "label carries a merchant suffix our row does not store: the match is "
+                         "EXACT, so such a row now refuses with `options:sole_label_differs` "
+                         "rather than being guessed at. The refusal prints Reap's label, so the "
+                         "loop is: run once, read the label, re-run with it as --alias.")
     args = ap.parse_args()
+    # `default=None` plus this, not `default=[]`: argparse appends to the default OBJECT, so a
+    # mutable default is shared across every call in one interpreter -- which is exactly how the
+    # tests drive `main()`, and would have leaked one test's aliases into the next.
+    args.alias = list(args.alias or [])
 
     from services import reap_agentic_client as rc
 
@@ -96,11 +107,37 @@ def main() -> int:
               "DO NOT disable the check: a mistyped base URL delivers the API key to the typo.")
         return 2
 
-    resolved = asyncio.run(rc.resolve_our_row(
-        merchant_domain=MERCHANT_DOMAIN, product_name=PRODUCT_NAME, brand=BRAND,
-        category=CATEGORY,
-        variant_title=VARIANT_TITLE, our_price=OUR_PRICE, country="US", currency="USD",
-    ))
+    if args.alias:
+        # CHECKED BEFORE ANY EGRESS, not after. The module caps aliases and raises
+        # ReapRequestError -- but it does so inside `select_option_ids`, which runs AFTER the
+        # search and details legs, so an operator who passed 33 of them would wait through ~10 s
+        # of network calls to be told something that was knowable before the first one. The
+        # try/except below is still there as the backstop for the per-entry rules; this is the
+        # part that makes the common mistake fast and legible.
+        if len(args.alias) > rc.MAX_ACCEPT_VARIANT_LABELS:
+            print(f"\nTOO MANY ALIASES: {len(args.alias)} given, at most "
+                  f"{rc.MAX_ACCEPT_VARIANT_LABELS} allowed. Nothing was sent.")
+            print("An alias is a label a human has ASSERTED means the same physical thing as our\n"
+                  "row. Needing more than a handful means the row, not the alias list, is wrong.")
+            return 2
+        overlong = [a for a in args.alias if len(a) > rc.MAX_ALIAS_LENGTH]
+        if overlong:
+            print(f"\nALIAS TOO LONG (over {rc.MAX_ALIAS_LENGTH} chars): {overlong[0][:60]!r}...")
+            print("It would be dropped silently by the client. Nothing was sent.")
+            return 2
+        print(f"aliases      : {args.alias}   (accepted as our variant title)")
+    try:
+        resolved = asyncio.run(rc.resolve_our_row(
+            merchant_domain=MERCHANT_DOMAIN, product_name=PRODUCT_NAME, brand=BRAND,
+            category=CATEGORY,
+            variant_title=VARIANT_TITLE, our_price=OUR_PRICE, country="US", currency="USD",
+            accept_variant_labels=tuple(args.alias),
+        ))
+    except rc.ReapRequestError as exc:
+        # The backstop. A build-time refusal is an operator error with a message written for an
+        # operator; a traceback is neither, and it buries that message in a stack.
+        print(f"\nREFUSED BEFORE EGRESS: {exc}")
+        return 2
 
     print("\n--- RESOLUTION " + "-" * 56)
     print(f"ok              : {resolved.ok}")
@@ -127,6 +164,12 @@ def main() -> int:
         print(f"warnings        : {resolved.warnings}")
     if resolved.candidates:
         print(f"candidates      : {json.dumps(resolved.candidates, indent=2)[:1200]}")
+    if (resolved.reason or "").startswith("options:sole_label_differs"):
+        labels = [c.get("label") for c in resolved.candidates if isinstance(c, dict)
+                  and c.get("label")]
+        if labels:
+            print("\nRE-RUN WITH, once you have checked these are the same physical thing:")
+            print("  " + " ".join(f"--alias {label!r}" for label in labels))
 
     if not resolved.ok:
         print("\n--- WHAT THIS TELLS US " + "-" * 48)
