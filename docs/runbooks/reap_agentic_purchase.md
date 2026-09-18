@@ -609,10 +609,49 @@ SELECT COUNT(*) FROM buyer_identity_links WHERE agent_id = '<agent_id>';
 Zero no longer means "arming will change nothing" — it means no purchase has been made yet. The
 count should climb by one per new end user.
 
-**One thing to expect in support.** A buyer whose identity this rail created, who *later* signs in
-through the hosted checkout, gets their link repointed to their real account — and because
-`reap_agentic_buyer_refs` is keyed on `buyer_id`, their next purchase asks them to enter the card
-once more. That is correct and happens at most once per buyer. It is not a bug report.
+**One thing to expect in support, and it leaves orphans.** A buyer whose identity this rail
+created, who *later* signs in through the hosted checkout, gets their link repointed to their real
+account by `POST /buyer/save_from_checkout`. Because `reap_agentic_buyer_refs` is keyed on
+`buyer_id`, their next purchase mints a fresh ref and asks them to enter the card once more. That
+is correct and happens at most once per buyer — **it is not a bug report.**
+
+The repoint does not clean up behind itself, and **this is a known residue, not a solved problem**:
+
+* the old `reap_agentic_buyer_refs` row survives, still carrying its `consent_version` /
+  `consented_at`, now pointing at a `buyer_id` no link mentions — unreachable by any query here;
+* the old `reap_agentic_enrollments` row survives **`status = 'active'`**, holding `card_network`,
+  `card_last4` and `hosted_url`, keyed on the old `buyer_ref` so nothing will ever read it again;
+* **the enrollment at Reap is never revoked.** We stop using it; we never tell Reap to stop
+  honouring it.
+
+Find the orphans — refs whose buyer is no longer linked, and the enrollments hanging off them:
+
+```sql
+SELECT r.buyer_id, r.reap_buyer_ref, r.consent_version, r.created_at,
+       e.id AS enrollment_id, e.status, e.card_network, e.card_last4
+  FROM reap_agentic_buyer_refs r
+  LEFT JOIN reap_agentic_enrollments e ON e.buyer_ref = r.reap_buyer_ref
+ WHERE NOT EXISTS (
+         SELECT 1 FROM buyer_identity_links l WHERE l.buyer_id = r.buyer_id
+       )
+ ORDER BY r.created_at;
+```
+
+Retire the enrollments that turns up through the ledger, **not** with a hand-written UPDATE —
+`db.reap_agentic_ledger.mark_enrollment_dead(enrollment_id)` is idempotent, keeps the status
+vocabulary's `CHECK` honest and returns `None` when the row was already dead:
+
+```python
+from db.reap_agentic_ledger import mark_enrollment_dead
+await mark_enrollment_dead("<enrollment_id>", reap_status="orphaned_by_buyer_repoint")
+```
+
+Leave the `reap_agentic_buyer_refs` row alone — it is the consent record for a purchase that
+really happened, and deleting it destroys the only evidence of which terms that buyer was shown.
+
+**The proper fix is to revoke the enrollment at the moment of the repoint**, which belongs in
+`routes/buyer_api` (the surface that does the repointing) and is a **follow-up**. Until it lands,
+this sweep is the containment.
 
 ### 2. The merchant must have an offer of its own, in the market's currency
 

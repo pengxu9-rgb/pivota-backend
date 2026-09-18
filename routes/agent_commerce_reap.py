@@ -556,6 +556,46 @@ _BUYER_LINK_SQL = """
 """
 
 
+async def _linked_buyer_id(*, agent_id: str, agent_user_ref_hash: str) -> str:
+    """The buyer this pair is already linked to, or `""`. A PURE READ — it mints nothing.
+
+    Split out of `_buyer_id_for` so the replay path can record a consent against an existing
+    buyer without acquiring the power to create one. See the call site: a replay must be able to
+    update the consent tag, and must NOT be able to mint an identity before eligibility has been
+    checked.
+    """
+    row = await database.fetch_one(
+        _BUYER_LINK_SQL,
+        {"agent_id": agent_id, "agent_user_ref_hash": agent_user_ref_hash},
+    )
+    return str(dict(row).get("buyer_id") or "").strip() if row else ""
+
+
+async def _touch_link(*, agent_id: str, agent_user_ref_hash: str) -> None:
+    """`last_seen_at` on a link we just used, the same as the prefill reader does.
+
+    `routes/agent_checkout_intents._buyer_prefill_from_identity_link` stamps this on every read,
+    and this route was the one surface that used a link without saying so — which made
+    `last_seen_at` mean "last seen by the checkout-intent path" rather than "last seen", and would
+    have made any dormancy sweep built on it retire buyers who purchase on this rail every day.
+
+    BEST-EFFORT, like its twin. A bookkeeping column must not be able to refuse a purchase.
+    """
+    try:
+        await database.execute(
+            """
+            UPDATE buyer_identity_links
+               SET last_seen_at = CURRENT_TIMESTAMP,
+                   updated_at = CURRENT_TIMESTAMP
+             WHERE agent_id = :agent_id
+               AND agent_user_ref_hash = :agent_user_ref_hash
+            """,
+            {"agent_id": agent_id, "agent_user_ref_hash": agent_user_ref_hash},
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _mint_buyer_id() -> str:
     """A new buyer id, in the id space `db/accounts.create_or_get_shop_user` mints into.
 
@@ -636,12 +676,11 @@ async def _buyer_id_for(*, agent_id: str, agent_user_ref_hash: str) -> str:
     different hat: two concurrent first purchases would then proceed under two different buyer
     ids, one of which is in no table, and mint two enrollments for one card.
     """
-    row = await database.fetch_one(
-        _BUYER_LINK_SQL,
-        {"agent_id": agent_id, "agent_user_ref_hash": agent_user_ref_hash},
+    buyer_id = await _linked_buyer_id(
+        agent_id=agent_id, agent_user_ref_hash=agent_user_ref_hash
     )
-    buyer_id = str(dict(row).get("buyer_id") or "").strip() if row else ""
     if buyer_id:
+        await _touch_link(agent_id=agent_id, agent_user_ref_hash=agent_user_ref_hash)
         return buyer_id
 
     minted = _mint_buyer_id()
@@ -1421,6 +1460,27 @@ async def start_reap_purchase(
                     agent_user_ref_hash=agent_user_ref_hash,
                 )
                 if view:
+                    # THE CONSENT IS RECORDED ON A REPLAY TOO, and this is the whole reason
+                    # `_linked_buyer_id` exists as a separate read.
+                    #
+                    # The contract page, the runbook and migration 227's header all say the tag
+                    # is rewritten on EVERY purchase and is always the latest version the buyer
+                    # accepted. Returning here without writing it made that false for exactly the
+                    # requests a door retries — which is where a consent version most plausibly
+                    # changes mid-flight. The prose was right and the code was wrong; this is the
+                    # code catching up.
+                    #
+                    # A READ, NOT `_buyer_id_for`. A replay implies the buyer already exists, so
+                    # the lookup finds them; using the minting version here would hand the replay
+                    # path the power to CREATE an identity before eligibility has been checked,
+                    # and a caller could then mint buyer rows by probing merchants we never
+                    # enabled. Nothing is written when there is no link — there is nothing to
+                    # record a consent against.
+                    replay_buyer_id = await _linked_buyer_id(
+                        agent_id=agent_id, agent_user_ref_hash=agent_user_ref_hash
+                    )
+                    if replay_buyer_id:
+                        await _record_consent(replay_buyer_id, consent_version)
                     return JSONResponse(
                         status_code=202,
                         content={

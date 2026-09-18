@@ -896,6 +896,37 @@ async def test_the_minted_buyer_id_carries_nothing_from_the_request(client):
     assert len(buyer_id) == 18
 
 
+async def test_two_user_refs_at_one_agent_get_two_buyers(client):
+    """THE OTHER DIRECTION from the test above, and the one that was undefended.
+
+    Two END USERS OF ONE AGENT sending the SAME body — same `buyer.email` — must not collapse onto
+    one buyer, because one buyer is one `reap_buyer_ref` is ONE STORED CARD. A mutant minting
+    `"u_" + sha256(agent_id + "|" + email)[:16]` passes every other test in this file (no literal
+    substring of the email survives a hash, and `agent_id` is in it so the cross-agent test is
+    happy). Only this one kills it.
+    """
+    await _seed_catalog()
+    await _seed_eligibility()
+
+    CALLER.agent_user_ref = USER_REF
+    first = await client.post(f"{BASE}/purchases", json=_body())
+    CALLER.agent_user_ref = OTHER_USER_REF
+    second = await client.post(f"{BASE}/purchases", json=_body())
+
+    assert first.status_code == 202
+    assert second.status_code == 202
+    links = await _links()
+    assert len(links) == 2
+    assert {l["agent_id"] for l in links} == {AGENT}, "precondition: one agent, two end users"
+    assert len({l["buyer_id"] for l in links}) == 2, (
+        "two end users of one agent share a buyer id — and therefore one stored card"
+    )
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_buyer_refs") == 2
+    a = (await ledger.get_purchase_internal(first.json()["purchase_id"]))["buyer_ref"]
+    b = (await ledger.get_purchase_internal(second.json()["purchase_id"]))["buyer_ref"]
+    assert a != b, "two end users of one agent were enrolled against one card"
+
+
 WINNER_BUYER_ID = "u_pgwinner000000"
 
 
@@ -1074,6 +1105,74 @@ async def test_consent_is_recorded_for_a_buyer_the_hosted_checkout_linked(client
         "SELECT consent_version FROM reap_agentic_buyer_refs WHERE buyer_id = :b",
         {"b": BUYER_ID},
     ) == CONSENT
+
+
+async def test_a_replay_still_records_the_latest_consent(client):
+    """A replay returns 202 before the buyer-ref code runs, and was the one successful POST that
+    left the stored tag stale — while the contract page, the runbook and migration 227's header
+    all promise it is rewritten on every purchase. Checked here as well as on SQLite because
+    `consented_at` is a real `timestamptz` and the comparison is a real server-side one."""
+    await _seed_all()
+    first = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="pg-replay"))
+    assert first.status_code == 202
+    before = await database.fetch_val("SELECT consented_at FROM reap_agentic_buyer_refs")
+
+    second = await client.post(
+        f"{BASE}/purchases",
+        json=_body(idempotency_key="pg-replay", buyer=_buyer(consent_version="v9")),
+    )
+
+    assert second.status_code == 202
+    assert second.json()["purchase_id"] == first.json()["purchase_id"], (
+        "precondition: this was a replay, not a new purchase"
+    )
+    assert await database.fetch_val("SELECT consent_version FROM reap_agentic_buyer_refs") == "v9"
+    assert await database.fetch_val("SELECT consented_at FROM reap_agentic_buyer_refs") >= before
+
+
+async def test_a_replay_whose_link_was_deleted_does_not_re_mint_one(client):
+    """An idempotency key outlives its link if the link is deleted inside the 24-hour window — an
+    erasure request, or an operator cleaning up. The key knows nothing about the link, so the
+    replay still resolves; resolving the buyer with the MINTING lookup would silently recreate an
+    identity that was deliberately deleted, on a path that has not checked eligibility."""
+    await _seed_catalog()
+    await _seed_eligibility()
+    first = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="pg-k-x"))
+    assert first.status_code == 202
+    assert len(await _links()) == 1
+
+    await database.execute("DELETE FROM buyer_identity_links")
+    assert await _links() == []
+
+    second = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="pg-k-x"))
+
+    assert second.status_code == 202
+    assert second.json()["purchase_id"] == first.json()["purchase_id"], (
+        "precondition: this was a replay — otherwise the mint below is not the thing under test"
+    )
+    assert await _links() == [], (
+        "a replay re-created a buyer identity that had been deleted, on a path that has not "
+        "checked eligibility"
+    )
+
+
+async def test_the_link_is_touched_when_it_is_reused(client):
+    """`last_seen_at` on the reuse path, checked HERE because this dialect has the clock
+    resolution to show the bump: `CURRENT_TIMESTAMP` is a real server-side `timestamptz` and the
+    comparison is against a value Postgres itself wrote."""
+    await _seed_all()
+    await database.execute(
+        "UPDATE buyer_identity_links SET last_seen_at = NULL WHERE agent_id = :a", {"a": AGENT}
+    )
+    assert await database.fetch_val("SELECT last_seen_at FROM buyer_identity_links") is None
+
+    await client.post(f"{BASE}/purchases", json=_body())
+
+    seen = await database.fetch_val("SELECT last_seen_at FROM buyer_identity_links")
+    assert seen is not None, "the rail used a link without stamping that it had seen it"
+    assert seen.tzinfo is not None
+    created = await database.fetch_val("SELECT created_at FROM buyer_identity_links")
+    assert seen >= created
 
 
 async def test_the_minted_identity_is_never_in_a_response(client):

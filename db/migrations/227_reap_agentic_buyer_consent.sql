@@ -37,6 +37,15 @@
 -- tests/test_agent_commerce_reap_routes_postgres.py::
 -- test_the_self_heal_builds_the_same_schema_as_migration_226 reads what the DATABASE built from
 -- each, so a divergence here is a failure there rather than a surprise in production.
+--
+-- WHAT THE COVERAGE GATE ACTUALLY COVERS HERE — less than it looks.
+-- tests/test_schema_guard_migration_coverage.py matches this file's two ADD COLUMNs against the
+-- POSTGRES branch's statement only. The SQLite twin builds its DDL with an f-string
+-- (`ADD COLUMN {_consent_column} …`), and the gate's regex reads source text, so the column name
+-- is a placeholder it cannot see. Deleting the SQLite heal would therefore NOT turn that gate
+-- red. What defends it is the runtime suite — tests/test_agent_commerce_reap_routes.py builds
+-- its schema through the self-heal and every consent assertion in it fails without these
+-- columns — and that is the check to keep working, not the coverage gate.
 
 ALTER TABLE IF EXISTS reap_agentic_buyer_refs
     ADD COLUMN IF NOT EXISTS consent_version VARCHAR(32),

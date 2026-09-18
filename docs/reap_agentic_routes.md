@@ -166,7 +166,8 @@ or that supplies the recipient through `buyer.name` rather than in the address, 
 | 409 | `row_unpriced` | **this merchant** has no usable offer of its own on the sku, or the price is not exactly representable in minor units | fall back |
 | 409 | `row_currency_mismatch` | the offer is priced in a currency the buyer's market does not use | fall back |
 | 409 | `idempotency_conflict` | this key was already used for a **different** request | use a new key, or re-send the original request |
-| 400 | `consent_required` | `buyer.consent_version` is missing, blank, longer than 32 characters, or carries an unprintable character | show your user the terms, then resend with the tag |
+| 400 | `consent_required` | `buyer.consent_version` is **absent, blank, longer than 32 characters, or carries an unprintable character** — i.e. a string-shaped value that is not usable | show your user the terms, then resend with the tag |
+| 400 | `invalid_request` | `buyer.consent_version` is **present but not a string** (`123`, `true`, `{}`, `[]`, `1.5`) — a type error is a malformed body, not a missing act by a human, and the two codes tell you to do different things | fix the request |
 | 400 | `invalid_request` | the body is not a JSON object, did not validate, `quantity` out of range, `limit` out of range, or an identifier carries an unprintable character | fix the request |
 | 400 | `invalid_address` | the shipping address is incomplete or unprintable | fix the request |
 | 400 | `invalid_return_url` | not https, carries userinfo, or an unallowed host | fix the request |
@@ -462,12 +463,27 @@ it unchanged — it never repoints a link a human's sign-in established. Two con
 purchases produce **one** buyer, **one** link and **one** ref: the insert cannot overwrite, and
 the route re-reads rather than trusting what it minted.
 
-### The one thing WP5 must plan for
+### The one thing WP5 must plan for — the repoint residue
 
 If the same human **later** signs in through the hosted checkout, `POST /buyer/save_from_checkout`
 repoints the link to their real account — correctly, a verified account supersedes a placeholder.
 Because `reap_agentic_buyer_refs` is keyed on the buyer id, their next purchase mints a fresh ref
-and **Reap asks for the card once more**. One re-enrollment after a sign-in, once.
+and **Reap asks for the card once more**.
+
+**It is not only one extra card entry.** The repoint does not clean up behind itself, and nothing
+else does either:
+
+| what is left behind | state it is left in |
+|---|---|
+| the old `reap_agentic_buyer_refs` row | still there, still holding its `consent_version` / `consented_at`, now pointing at a buyer id no `buyer_identity_links` row mentions — **unreachable** |
+| the old `reap_agentic_enrollments` row | still `status = 'active'`, still holding `card_network`, `card_last4`, `hosted_url` — keyed on the **old** `buyer_ref`, so no future purchase will ever find it |
+| the enrollment **at Reap** | **never revoked.** We stop using it; we do not tell Reap to stop honouring it |
+
+So the buyer's consent record for the account they now use is the *new* row, and the old one is an
+orphan that no query in this rail will ever return. The operator SQL to find and retire these is in
+the runbook under "Before arming". The proper fix — **revoking the enrollment at the moment of the
+repoint** — belongs in `routes/buyer_api`, not on this route, and is a follow-up rather than
+something this PR silently half-does.
 
 That is the trade the owner took. WP4 avoided it by refusing every agent-only buyer forever, which
 made the rail unusable for the door it exists for.
@@ -490,9 +506,18 @@ request that uses it.
   the backend records is *which* wording was shown. ≤ 32 printable characters.
 * **We do not adjudicate it.** There is no allowlist of known versions — a backend that refused
   an unrecognised tag would reject the newest consent the moment the door shipped it.
-* **Latest wins.** It is rewritten on every purchase, alongside a `consented_at` timestamp.
-* **It is not in the idempotency hash.** A retry that carries a newer tag still replays to the
-  same purchase rather than answering `idempotency_conflict`.
+* **Latest wins.** It is rewritten on **every** `POST` that succeeds, alongside a `consented_at`
+  timestamp — **including an idempotent replay**. Send a newer tag with a retried
+  `idempotency_key` and the stored tag moves, even though the response is the original purchase.
+* **It is deliberately NOT part of the idempotency request hash.** That hash covers what *decides
+  the purchase* — merchant, product, variant, quantity, buyer email, shipping address, return
+  url. Consent is not one of those: folding it in would turn a door that upgraded its consent
+  version mid-retry into `409 idempotency_conflict`, which is the opposite of what you want from
+  a client that just collected a *stronger* consent. So a retry carrying a new tag replays to the
+  same purchase **and** records the new tag.
+* **A non-string is `invalid_request`, not `consent_required`.** `123`, `true`, `{}` and `[]` are
+  refused as a malformed body; they never reach the consent check. `consent_required` means "go
+  and ask your user", `invalid_request` means "fix your JSON".
 
 The dial is still checked **first**: a dark rail answers `404` to a request with no consent, the
 same as to every other request, so this field cannot be used to probe whether the rail is armed.

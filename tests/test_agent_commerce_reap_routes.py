@@ -641,6 +641,47 @@ def _race_a_link_in(monkeypatch, buyer_id: str = WINNER_BUYER_ID):
     return state
 
 
+async def test_two_user_refs_at_one_agent_get_two_buyers(client):
+    """THE OTHER DIRECTION, and the one that was undefended.
+
+    `test_two_agents_with_the_same_user_ref_get_two_buyers` covers two AGENTS. This covers two END
+    USERS OF ONE AGENT sending the SAME body — same `buyer.email`, same everything — and it is the
+    direction where a "make the mint deterministic" refactor does real harm: a buyer id derived
+    from `(agent_id, email)` collapses them onto ONE buyer, ONE `reap_buyer_ref`, and therefore
+    ONE STORED CARD shared between two strangers who merely typed the same address.
+
+    A mutant minting `"u_" + sha256(agent_id + "|" + email)[:16]` survives every other test in
+    this file: the id contains no literal substring of the email, so the non-containment
+    assertions above pass, and the cross-agent test passes because `agent_id` is in the hash. Only
+    this test kills it.
+    """
+    await _seed_catalog()
+    await _seed_eligibility()
+
+    # Same agent, same body, two different end users.
+    CALLER.agent_user_ref = USER_REF
+    first = await client.post(f"{BASE}/purchases", json=_body())
+    CALLER.agent_user_ref = OTHER_USER_REF
+    second = await client.post(f"{BASE}/purchases", json=_body())
+
+    assert first.status_code == 202
+    assert second.status_code == 202
+    links = await _links()
+    assert len(links) == 2
+    assert {l["agent_id"] for l in links} == {AGENT}, "precondition: one agent, two end users"
+    assert {l["agent_user_ref_hash"] for l in links} == {
+        hash_agent_user_ref(USER_REF),
+        hash_agent_user_ref(OTHER_USER_REF),
+    }
+    assert len({l["buyer_id"] for l in links}) == 2, (
+        "two end users of one agent share a buyer id — and therefore one stored card"
+    )
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_buyer_refs") == 2
+    a = (await _purchase_row(first.json()["purchase_id"]))["buyer_ref"]
+    b = (await _purchase_row(second.json()["purchase_id"]))["buyer_ref"]
+    assert a != b, "two end users of one agent were enrolled against one card"
+
+
 async def test_a_link_written_between_the_read_and_the_insert_wins(client, monkeypatch):
     """THE RACE, at the statement where it bites.
 
@@ -807,6 +848,107 @@ async def test_consent_is_recorded_for_a_buyer_the_hosted_checkout_linked(client
         "SELECT consent_version FROM reap_agentic_buyer_refs WHERE buyer_id = :b",
         {"b": BUYER_ID},
     ) == CONSENT
+
+
+async def test_a_replay_still_records_the_latest_consent(client):
+    """THE CONTRACT SAYS "REWRITTEN ON EVERY PURCHASE", SO A REPLAY MUST REWRITE IT.
+
+    A replay returns 202 before the buyer-ref code runs, so it was the one POST that answered
+    successfully and left the stored tag stale — while the contract page, the runbook and
+    migration 227's header all promised the opposite. A retry is exactly where a door's consent
+    version plausibly changes mid-flight.
+    """
+    await _seed_all()
+    first = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="k-replay"))
+    assert first.status_code == 202
+    before = await database.fetch_val("SELECT consented_at FROM reap_agentic_buyer_refs")
+
+    second = await client.post(
+        f"{BASE}/purchases",
+        json=_body(idempotency_key="k-replay", buyer=_buyer(consent_version="v9")),
+    )
+
+    assert second.status_code == 202
+    assert second.json()["purchase_id"] == first.json()["purchase_id"], (
+        "precondition: this was a replay, not a new purchase"
+    )
+    assert await database.fetch_val("SELECT consent_version FROM reap_agentic_buyer_refs") == "v9"
+    assert await database.fetch_val("SELECT consented_at FROM reap_agentic_buyer_refs") >= before
+
+
+async def test_a_replay_whose_link_was_deleted_does_not_re_mint_one(client):
+    """The replay path records consent through a READ, never through the minting lookup.
+
+    ── THE STATE THIS BUILDS, AND WHY IT IS REACHABLE ───────────────────────────────────────
+
+    An idempotency key outlives its purchase's link if the link is deleted inside the 24-hour
+    window — an erasure request, or an operator cleaning up. The key row is keyed on
+    `(agent_id, agent_user_ref_hash, idempotency_key)` and knows nothing about the link, so the
+    replay still resolves.
+
+    If the replay path resolved the buyer with `_buyer_id_for`, that retry would silently MINT a
+    fresh identity for a buyer whose link was deliberately removed — recreating erased data, and
+    doing it on a path that has not checked eligibility. `_linked_buyer_id` is a pure read, so
+    there is simply nothing to record the consent against and nothing is written.
+
+    The first cut of this test switched end users instead of deleting the link, which meant no
+    replay resolved at all and the mutant it was aimed at survived it.
+    """
+    await _seed_catalog()
+    await _seed_eligibility()
+    first = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="k-x"))
+    assert first.status_code == 202
+    assert len(await _links()) == 1
+
+    await database.execute("DELETE FROM buyer_identity_links")
+    assert await _links() == []
+
+    second = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="k-x"))
+
+    assert second.status_code == 202
+    assert second.json()["purchase_id"] == first.json()["purchase_id"], (
+        "precondition: this was a replay — otherwise the mint below is not the thing under test"
+    )
+    assert await _links() == [], (
+        "a replay re-created a buyer identity that had been deleted, on a path that has not "
+        "checked eligibility"
+    )
+
+
+async def test_the_link_is_touched_when_it_is_reused(client):
+    """`last_seen_at` means "last seen", not "last seen by the checkout-intent path".
+
+    `_buyer_prefill_from_identity_link` stamps it on every read. This route used a link without
+    saying so, which would make any dormancy sweep built on the column retire buyers who purchase
+    on this rail daily."""
+    await _seed_all()
+    await database.execute(
+        "UPDATE buyer_identity_links SET last_seen_at = NULL WHERE agent_id = :a", {"a": AGENT}
+    )
+    assert await database.fetch_val("SELECT last_seen_at FROM buyer_identity_links") is None
+
+    await client.post(f"{BASE}/purchases", json=_body())
+
+    assert await database.fetch_val("SELECT last_seen_at FROM buyer_identity_links") is not None
+
+
+@pytest.mark.parametrize("value", [123, True, {}, [], 1.5])
+async def test_a_non_string_consent_version_is_invalid_request_not_consent_required(
+    client, value
+):
+    """A TYPE ERROR IS A MALFORMED BODY, AND THE CODES MEAN DIFFERENT THINGS.
+
+    `consent_required` tells a door to go and ask its user; `invalid_request` tells it to fix its
+    JSON. A non-string never reaches `_consent_version` — pydantic refuses it first, and in v2
+    that includes `123` and `true`, which are NOT coerced to strings. Pinned because the contract
+    page now documents this split and a reader would otherwise have to guess."""
+    await _seed_all()
+    resp = await client.post(
+        f"{BASE}/purchases", json=_body(buyer=_buyer(consent_version=value))
+    )
+    assert resp.status_code == 400
+    assert _error(resp) == "invalid_request"
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
 
 
 async def test_consent_is_not_part_of_the_idempotency_hash(client):
