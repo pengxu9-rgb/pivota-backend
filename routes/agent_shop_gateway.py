@@ -37,6 +37,7 @@ from pydantic import BaseModel, Field, ConfigDict
 from config.settings import resolve_public_api_base_url, settings
 from services.seed_variant_options import seed_variant_options_as_mapping
 from services.outbound_warm_handoff import could_upgrade_at_click_time
+from services import market_telemetry
 from db.database import database
 from models.catalog import PivotPaymentContext, PivotQueryRequest, PivotResultItem
 from models.reviews_refs import SkuRef as ReviewsSkuRef
@@ -7754,6 +7755,11 @@ async def _handle_find_products_multi_via_pivot(
     # candidate set that never contained a single row of that brand.
     brand_anchor_terms, brand_anchor_source = await _resolve_brand_anchor_terms(query)
 
+    # Resolved once, and the SAME value is both recorded and handed to recall, so the record is
+    # what recall received rather than a second derivation of it (services/market_telemetry.py).
+    pivot_market = _pivot_market_from_payload(payload, request_metadata)
+    market_telemetry.observe_resolved(request_metadata, pivot_market)
+
     pivot_result = await search_pivot_catalog(
         PivotQueryRequest(
             query=query,
@@ -7762,7 +7768,7 @@ async def _handle_find_products_multi_via_pivot(
             # the exact opposite, and contradict the contract the field documents.
             brand_anchor_terms=brand_anchor_terms,
             merchant_id=None,
-            market=_pivot_market_from_payload(payload, request_metadata),
+            market=pivot_market,
             limit=raw_limit,
             include_external=(
                 False if canonical_sig_mode else PIVOT_MULTI_SERVE_INCLUDE_EXTERNAL
@@ -10022,7 +10028,7 @@ async def _invoke_multi_upstream_fallback(
     if not MULTI_SEARCH_UPSTREAM_FALLBACK_BASE_URL:
         return None
 
-    metadata_payload: Dict[str, Any] = dict(request_metadata or {})
+    metadata_payload: Dict[str, Any] = market_telemetry.strip_for_forwarding(dict(request_metadata or {}))
     metadata_payload["upstream_fallback_hop"] = hop + 1
     body: Dict[str, Any] = {
         "operation": "find_products_multi",
@@ -11761,6 +11767,7 @@ async def _handle_find_products_multi_inner(
                 ),
             )
             _seed_fast_multiterm = _seed_query_fast_multiterm_enabled()
+            market_telemetry.observe_bound(request_metadata, None)
             stage_a_result = await fetch_external_seed_rows(
                 database=database,
                 market=None,
@@ -11796,6 +11803,7 @@ async def _handle_find_products_multi_inner(
                 and bool(MULTI_SEARCH_SHOPPING_ENABLE_SEED_TEXT_SCAN)
             ):
                 external_seed_broad_fallback_used = True
+                market_telemetry.observe_bound(request_metadata, None)
                 stage_b_result = await fetch_external_seed_rows(
                     database=database,
                     market=None,
@@ -15710,9 +15718,15 @@ async def invoke_shop_operation(
         dedup_cache_hit = False
         dedup_inflight_joined = False
         dedup_key: Optional[str] = None
+        # This request's own observation of which market it resolved and bound. It rides in the
+        # request's metadata dict -- captured by the queued closure below -- rather than a
+        # ContextVar: the task queue starts waiting tasks from inside whichever request just
+        # finished, so an ambient context would hand the observation to the wrong request.
+        market_observation: Dict[str, Any] = {}
         try:
             multi_request_metadata = dict(normalized_metadata)
             multi_request_metadata["_pivot_shadow_schedule_suppressed"] = True
+            multi_request_metadata[market_telemetry.OBSERVATION_KEY] = market_observation
             if INVOKE_MULTI_BYPASS_QUEUE_SHOPPING and is_shopping_surface:
                 if MULTI_SEARCH_PAGE_REQUEST_DEDUP_ENABLED:
                     dedup_key = _build_multi_page_request_dedup_key(
@@ -15867,6 +15881,34 @@ async def invoke_shop_operation(
             raise
         finally:
             duration_seconds = max(0.0, time.time() - started)
+            # One market record per find_products_multi request, on every outcome -- success,
+            # HTTPException, disconnect. It cannot fail the request: any error is recorded as
+            # such instead of the fields.
+            try:
+                logger.info(
+                    "multi.invoke.market",
+                    extra={
+                        "status_code": status_code,
+                        "source": source_normalized,
+                        "duration_ms": round(duration_seconds * 1000.0, 1),
+                        **market_telemetry.build_record(
+                            raw_payload=request.payload,
+                            envelope_metadata=request.metadata,
+                            observation=market_observation,
+                            result=locals().get("result"),
+                            dedup_cache_hit=dedup_cache_hit,
+                            dedup_inflight_joined=dedup_inflight_joined,
+                        ),
+                    },
+                )
+            except Exception as telemetry_error:  # pragma: no cover - defensive
+                try:
+                    logger.info(
+                        "multi.invoke.market",
+                        extra={"market_telemetry_error": str(telemetry_error)[:120]},
+                    )
+                except Exception:
+                    pass
             if duration_seconds >= 2.0:
                 logger.info(
                     "multi.invoke.slow",
