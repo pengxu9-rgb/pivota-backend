@@ -364,14 +364,42 @@ def _now() -> datetime:
 
 
 def _cap(value: Any) -> Optional[str]:
-    """Trim an OUR-VOCABULARY code to the column width. NOT for a partner id — see `_partner_id`.
+    """Trim a value VERBATIM to the column width. Or None.
 
-    This used to be applied to partner ids too, which is how `"chk/../../admin"` reached
-    `reap_checkout_id`: the row entered 'awaiting_approval' and every later poll then raised
-    `ReapRequestError` out of `advance` when the client validated the id on its way into a URL
-    path — unbounded, because 'awaiting_approval' is exempt from the attempts counter.
+    For the columns whose content is somebody else's vocabulary and must survive unchanged:
+    `refusal_reason` (the client's own reasons, `options:sole_label_differs:<axis>`),
+    `reap_status` (the partner's raw status, which the ledger records and never matches on),
+    `card_network` (`VISA`, shown to a buyer), and the `prd_`/`var_` evidence handles.
+
+    NOT for `last_error_code` — that is `_error_code`, which folds case — and not for a partner
+    id that will be put in a URL, which is `_partner_id`. Applying this to ids is how
+    `"chk/../../admin"` reached `reap_checkout_id`: the row entered 'awaiting_approval' and every
+    later poll raised `ReapRequestError` out of `advance`, unbounded, because that state is
+    exempt from the attempts counter.
+
+    ONE HELPER FOR ALL SIX KINDS WAS A MISTAKE AND IT WAS CAUGHT BY A TEST. Folding case in here
+    turned `card_network` into `"visa"` on its way to a column whose only job is to be displayed.
     """
     text = str(value or "").strip()
+    return text[:_CODE_MAX] or None
+
+
+def _error_code(value: Any) -> Optional[str]:
+    """An error code for `last_error_code`: lowercased, trimmed to the column width, or None.
+
+    THE COLUMN MIXES THREE VOCABULARIES AND THEY DISAGREE ON CASE. Ours is snake_case
+    (`quote_expired`, `partner_id_malformed`); the client's transport codes are
+    `transport_error:ReadTimeout`; and every partner code the client keeps is pinned UPPERCASE by
+    its own `^[A-Z_]{3,64}$` shape check (`ENROLLMENT_NOT_ACTIVE`, `AGENTIC_RESOURCE_NOT_FOUND`).
+    A column holding both `quote_expired` and `ENROLLMENT_NOT_ACTIVE` cannot be grouped, filtered
+    or alerted on without every consumer carrying its own fold — and the consumer that forgets
+    reads one real error rate as two smaller ones.
+
+    One fold, at the only place that writes the column. `refusal_reason` is deliberately NOT
+    folded: it is a different column with a different vocabulary, and a reader matching on the
+    client's reason strings would break.
+    """
+    text = str(value or "").strip().lower()
     return text[:_CODE_MAX] or None
 
 
@@ -399,7 +427,22 @@ _ORDER_ID_RE = re.compile(r"^[A-Za-z0-9_:.-]{1,128}$")
 
 
 def _order_id(value: Any) -> Optional[str]:
-    text = str(value or "").strip()
+    """The partner's order id, or None. A STRING, or it is not an order id.
+
+    THE TYPE CHECK IS THE WHOLE POINT AND IT WAS MISSING. `str(value).strip()` is generous in
+    exactly the way that matters here: `orderId: true` became `"True"` and `orderId: 12345`
+    became `"12345"`, both of which sail through the charset rule below. This value is half of
+    an idempotency key on `(merchant_id, external_order_id)` with `ON CONFLICT DO NOTHING`, so
+    a partner that ever sent a boolean would have EVERY order at that merchant collide on
+    `(merchant, "True")` — one edge written, all the rest silently dropped, that merchant's GMV
+    reading as one sale for ever and no error anywhere.
+
+    Refused rather than coerced: a non-string `orderId` is a partner contract change, and the
+    right response is `completed_without_order_id` and a human, not a cast.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
     return text if _ORDER_ID_RE.match(text) else None
 
 
@@ -438,6 +481,18 @@ def _parse_ts(value: Any) -> Optional[datetime]:
     except ValueError:
         return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+#: Currencies with THREE decimal places. `_exponent` answers 2 for anything that is not on the
+#: repo's zero-decimal list, so every one of these would be scaled by 100 instead of 1000 —
+#: 1.234 KWD read as 123 fils rather than 1234, a tenfold error in the partner's favour, with no
+#: symptom at all because the arithmetic stays self-consistent all the way to the charge.
+#:
+#: REFUSED AT `start_purchase` RATHER THAN HANDLED. Handling them means a third exponent through
+#: `major_to_minor`, which is the repo's one rounding policy and is not this package's to widen —
+#: see the note on `amount_minor_or_none`. Reap's own coverage is USD/SGD-shaped today, so this
+#: refuses a market we do not serve rather than a purchase somebody was going to make.
+THREE_DECIMAL_CURRENCIES = frozenset({"KWD", "BHD", "JOD", "OMR", "TND", "LYD", "IQD"})
 
 
 def _exponent(currency: Any) -> int:
@@ -680,7 +735,9 @@ class QuoteCheck:
     tax_minor: Optional[int] = None
 
 
-def verify_quote(payload: Any, row: Mapping[str, Any]) -> QuoteCheck:
+def verify_quote(
+    payload: Any, row: Mapping[str, Any], *, variant_id: Optional[str] = None
+) -> QuoteCheck:
     """Does this quote describe the purchase we opened, at the price we opened it at?
 
     ── WHY THIS EXISTS, WHICH IS A DEFECT THIS PACKAGE SHIPPED ─────────────────────────────
@@ -707,8 +764,8 @@ def verify_quote(payload: Any, row: Mapping[str, Any]) -> QuoteCheck:
         `price_unverifiable` / `quote_amounts_unreadable`. An absent tax block and a zero tax
         block are different claims and only the second one is a number.
 
-    (a) CURRENCY. Every one of those four, AND `rc.quote_total` where it can read the field, must
-        name the ROW's currency. → `price_changed` / `quote_currency_mismatch`.
+    (a) CURRENCY. Every one of those four must name the ROW's currency. → `price_changed` /
+        `quote_currency_mismatch`.
 
     (b) SUBTOTAL, EXACTLY. `itemsSubtotal == quantity × our_price_minor`, with NO tolerance. Both
         numbers describe the same merchant's line item; a cent of drift is a different price, not
@@ -718,6 +775,24 @@ def verify_quote(payload: Any, row: Mapping[str, Any]) -> QuoteCheck:
         `QUOTE_RECONCILE_TOLERANCE_MINOR`. This is what catches a total that does not follow from
         its own breakdown — a discount line we did not read, a fee under a name we do not know.
         → `price_changed` / `quote_total_not_reconciled`.
+
+    (e) THE ITEMS ECHO BACK WHAT WE ASKED FOR. Exactly one line, the `variantId` we sent, the
+        quantity we sent. `price_unverifiable` / `quote_items_mismatch` otherwise, INCLUDING when
+        `items` is absent or is not a list — a quote that does not say what it priced is not a
+        quote we can check.
+
+        THIS IS NOT BELT AND BRACES. Reap returns 200 FOR A SUBSTITUTED VARIANT (see
+        `reference_reap_returns_200_for_a_substituted_variant`), and every other check here
+        passes happily on a substitution whose price happens to match: (b) compares OUR unit
+        price against a subtotal, and if they agree, the fact that the object being priced is a
+        different one is invisible. This is the only check that looks at WHAT is being bought
+        rather than at what it costs. Skipped when the caller passes no `variant_id`, which the
+        direct unit tests do — an end-to-end caller always has one.
+
+    `quantity` is re-checked against `MAX_QUANTITY` here as well as in `start_purchase`. Not
+    decoration: this is the last arithmetic before a card is charged, the multiplication in (b)
+    is the thing that would scale, and the row could have been written by something that is not
+    `start_purchase`.
 
     The arithmetic is entirely in INTEGER MINOR UNITS. Nothing that decides whether a card is
     charged does binary floating point.
@@ -732,7 +807,7 @@ def verify_quote(payload: Any, row: Mapping[str, Any]) -> QuoteCheck:
         or unit <= 0
         or isinstance(quantity, bool)
         or not isinstance(quantity, int)
-        or quantity < 1
+        or not (1 <= quantity <= MAX_QUANTITY)
     ):
         # Defensive: `_price_verdict` already refuses a row with no stored unit price before a
         # quote is ever requested, and `start_purchase` writes both columns. Reached only by a
@@ -740,6 +815,21 @@ def verify_quote(payload: Any, row: Mapping[str, Any]) -> QuoteCheck:
         return QuoteCheck(False, "price_unverifiable", "quote_row_unverifiable")
 
     data = payload if isinstance(payload, dict) else {}
+
+    if variant_id is not None:
+        items = data.get("items")
+        if not isinstance(items, list) or len(items) != 1:
+            return QuoteCheck(False, "price_unverifiable", "quote_items_mismatch")
+        line = items[0] if isinstance(items[0], dict) else {}
+        echoed_quantity = line.get("quantity")
+        if (
+            str(line.get("variantId") or "") != str(variant_id)
+            or isinstance(echoed_quantity, bool)
+            or not isinstance(echoed_quantity, int)
+            or echoed_quantity != quantity
+        ):
+            return QuoteCheck(False, "price_unverifiable", "quote_items_mismatch")
+
     breakdown = data.get("amountBreakdown")
     breakdown = breakdown if isinstance(breakdown, dict) else {}
     tax_block = breakdown.get("tax")
@@ -754,11 +844,14 @@ def verify_quote(payload: Any, row: Mapping[str, Any]) -> QuoteCheck:
     if any(part is None for part in parts.values()):
         return QuoteCheck(False, "price_unverifiable", "quote_amounts_unreadable")
 
-    # (a) — every currency in the breakdown, plus the client's own read of `finalAmount`.
+    # (a) — every currency in the breakdown.
+    #
+    # THERE USED TO BE A `rc.quote_total` CROSS-CHECK HERE AND IT WAS INERT. It reads
+    # `amountBreakdown.finalAmount` out of the SAME dict `_money` has already read, so the only
+    # way it could contribute a different currency is if the two disagreed about one dict — which
+    # they cannot. It read as a second opinion and was arithmetic that could not fail; a mutation
+    # deleting it could not be killed by any test. Removed rather than left as reassurance.
     named = {part[1] for part in parts.values()}
-    client_total = rc.quote_total(data)
-    if client_total is not None:
-        named.add(str(client_total[1] or "").strip().upper())
     if named != {currency}:
         return QuoteCheck(False, "price_changed", "quote_currency_mismatch")
 
@@ -896,6 +989,14 @@ async def start_purchase(
     currency = _require_text(row.currency, "row.currency").upper()
     if not _CURRENCY_RE.match(currency):
         raise PurchaseRefused("invalid_request", "row.currency must be a 3-letter ISO code")
+    if currency in THREE_DECIMAL_CURRENCIES:
+        # `_exponent` assumes two decimal places for everything outside the repo's zero-decimal
+        # list, so a three-decimal currency would be scaled by 100 instead of 1000 — silently,
+        # consistently, all the way to the charge. Refused at the door.
+        raise PurchaseRefused(
+            "currency_unsupported",
+            f"{currency} has three minor-unit decimals and this rail's converter assumes two",
+        )
     if (
         isinstance(row.our_price_minor, bool)
         or not isinstance(row.our_price_minor, int)
@@ -1109,6 +1210,7 @@ async def _release(
     )
     if released is None:
         return _lost(row)
+    error_code = _error_code(error_code)
     if error_code:
         # The CODE, never a body, a URL or an address. Every value that reaches this line is
         # either our own vocabulary or `ReapResponse.error`/`error_code`, both of which the
@@ -1124,7 +1226,7 @@ async def _release(
         str(row["id"]),
         outcome="released",
         state=state,
-        last_error_code=_cap(error_code),
+        last_error_code=error_code,
         next_poll_in_seconds=int(seconds),
     )
 
@@ -1229,7 +1331,7 @@ async def _step_resolving(row: Mapping[str, Any], worker_id: str) -> AdvanceResu
             return await _release(row, worker_id, error_code=code, transport=True)
         return await _move(
             row, worker_id, ["resolving"], "failed",
-            last_error_code=_cap(created.error_detail_code or created.error_code or code),
+            last_error_code=_error_code(created.error_detail_code or created.error_code or code),
             **evidence,
         )
 
@@ -1347,7 +1449,7 @@ async def _step_needs_enrollment(row: Mapping[str, Any], worker_id: str) -> Adva
             return await _release(row, worker_id, error_code=code, transport=True)
         return await _move(
             row, worker_id, ["needs_enrollment"], "failed",
-            last_error_code=_cap(read.error_detail_code or read.error_code or code),
+            last_error_code=_error_code(read.error_detail_code or read.error_code or code),
         )
 
     state = rc.enrollment_state(read.data)
@@ -1454,9 +1556,11 @@ async def _step_quoting(row: Mapping[str, Any], worker_id: str) -> AdvanceResult
             # used to suppress the merchant.
             return await _move(
                 row, worker_id, ["quoting"], "refused",
-                refusal_reason="merchant_not_completable", last_error_code=_cap(code),
+                refusal_reason="merchant_not_completable", last_error_code=_error_code(code),
             )
-        return await _move(row, worker_id, ["quoting"], "failed", last_error_code=_cap(code))
+        return await _move(
+            row, worker_id, ["quoting"], "failed", last_error_code=_error_code(code)
+        )
 
     raw_quote_id = str(quote.data.get("id") or "").strip()
     if not raw_quote_id:
@@ -1486,7 +1590,7 @@ async def _step_quoting(row: Mapping[str, Any], worker_id: str) -> AdvanceResult
     # THE QUOTE IS THE NUMBER THAT DECIDES THE CHARGE, so it is checked before anything is
     # created. See `verify_quote` for the three measured ways the previous code reached a live
     # hosted checkout without ever comparing it to the purchase we opened.
-    check = verify_quote(quote.data, row)
+    check = verify_quote(quote.data, row, variant_id=resolution.variant_id)
     if not check.ok:
         return await _move(
             row, worker_id, ["quoting"], "refused",
@@ -1522,7 +1626,10 @@ async def _step_quoting(row: Mapping[str, Any], worker_id: str) -> AdvanceResult
             # owner starts a new purchase and enrolls again.
             return await _move(
                 row, worker_id, ["quoting"], "failed",
-                last_error_code="ENROLLMENT_NOT_ACTIVE", **evidence,
+                # Lowercased like every other code in this column — see `_error_code`. The
+                # partner spells it upper-case; the column does not care which of its three
+                # source vocabularies a value came from.
+                last_error_code=_error_code("ENROLLMENT_NOT_ACTIVE"), **evidence,
             )
         code = str(checkout.error or "checkout_create_failed")
         if _is_transport(code):
@@ -1537,7 +1644,7 @@ async def _step_quoting(row: Mapping[str, Any], worker_id: str) -> AdvanceResult
             return await _release(row, worker_id, error_code=code, transport=True)
         return await _move(
             row, worker_id, ["quoting"], "failed",
-            last_error_code=_cap(detail or checkout.error_code or code), **evidence,
+            last_error_code=_error_code(detail or checkout.error_code or code), **evidence,
         )
 
     # A LIVE CHECKOUT EXISTS AT THE PARTNER FROM THIS LINE ON, and it is recorded on every exit
@@ -1669,69 +1776,83 @@ async def _step_processing(row: Mapping[str, Any], worker_id: str) -> AdvanceRes
     return await _step_checkout_poll(row, worker_id, "processing")
 
 
-#: How long to wait before re-reading a checkout the partner called COMPLETED without giving us
-#: an order id. The human-wait cadence rather than 'processing's 15 s: this is not a payment in
-#: flight any more, it is a payload that needs a person, and 'processing' is the one state
-#: `fail_exhausted_purchases` skips by default — so it sits there, visible, instead of being
-#: auto-failed over a charge that succeeded.
-ORDER_ID_MISSING_BACKOFF_SECONDS = POLL_INTERVALS["awaiting_approval"]
-
-
 async def _complete(
     row: Mapping[str, Any], worker_id: str, from_state: str, payload: Mapping[str, Any]
 ) -> AdvanceResult:
-    """Write 'completed' — but only with an order id — then close the attribution edge.
+    """Write 'completed', then close the attribution edge — but ONLY when we can key and price it.
 
-    ── 'completed' REQUIRES AN ORDER ID (P1-3) ─────────────────────────────────────────────
+    THE ROW COMPLETES WHENEVER THE PARTNER SAYS COMPLETED. The edge is a separate decision, and
+    the two used to be conflated in both directions. The three things that can be missing —
+    the order id, the amount, or agreement between the amount charged and the amount quoted —
+    each suppress the EDGE and name themselves in `last_error_code`; none of them suppresses the
+    completion.
 
-    `orderId` appears only on COMPLETED, and the row's whole value after the fact is that it
-    names the order. A COMPLETED payload without one used to land as 'completed' with
-    `reap_order_id = NULL`, and the attribution hook was then called with
-    `external_order_id = ""` — which `close_external_order_conversion` DROPS with a warning. The
-    money was real, the row said so, and the GMV existed nowhere: not on the row, not in the
-    attribution ledger, not in any log a person reads.
+    ── WHY A MISSING ORDER ID NO LONGER PARKS THE ROW IN 'processing' (review round 2, P0) ──
 
-    So a COMPLETED we cannot key goes to (or stays in) 'processing' with
-    `last_error_code=completed_without_order_id` and a slow poll. 'processing' is deliberate: it
-    is the one non-terminal state the exhaustion sweep skips, so the row waits for a human
-    instead of being auto-failed over a charge that succeeded. If the partner fills the field in
-    on a later read, the next poll completes it normally.
+    The previous fix sent a COMPLETED-without-an-orderId to 'processing' so a human would see it.
+    That was wrong for a reason the reviewer measured rather than argued: 'processing' HAS NO PII
+    DEADLINE. `expire_overdue_purchases` sweeps 'needs_enrollment' and 'awaiting_approval' only
+    (its source states are parsed out of its own SQL), and `fail_exhausted_purchases` skips
+    'processing' unless asked. A row aged to 2020 kept `buyer_email` and `shipping_address`
+    against every default sweep — indefinitely, for a purchase that had already SUCCEEDED.
 
-    ── THE EDGE REQUIRES A REAL AMOUNT (P1-4) ──────────────────────────────────────────────
+    And it was the wrong shape anyway: the charge went through, so nothing is in flight. There is
+    no further state for this purchase to reach, and the one statement that nulls the PII is the
+    terminal write. So it completes, `external_order_id` stays NULL, no edge is written, and
+    `reap_checkout_id` — which is stored — is what a reconciliation re-reads to recover the order
+    id later.
+
+    A genuinely PENDING or PROCESSING partner status is a different thing entirely and still
+    belongs in 'processing'; that path is `_step_checkout_poll`'s, not this function's.
+
+    ── THE EDGE IS SUPPRESSED, NEVER WRITTEN WRONG ─────────────────────────────────────────
 
     `close_external_order_conversion` is idempotent on `(merchant_id, external_order_id)` via
-    `ON CONFLICT DO NOTHING`. So an edge written with `gross_amount_cents = None` is PERMANENT:
-    the slot is taken, a later correct close is silently dropped, and that order's GMV reads as
-    zero for ever. A missing, string-shaped or wrong-currency `finalAmount` therefore completes
-    the ROW — the order exists, and refusing to record that would be a worse lie — with
-    `last_error_code=final_amount_missing` and NO EDGE AT ALL, leaving the slot free for a
-    reconciliation job that can re-read the checkout.
+    `ON CONFLICT DO NOTHING`, so ANY edge written here is PERMANENT — a later, correct close is
+    silently dropped. That makes "write something approximate now" strictly worse than "write
+    nothing and leave the slot free", which is what each of these does:
+
+      completed_without_order_id — no key, so no edge could be correct.
+      final_amount_missing       — absent, unparsable, or in another currency.
+      charged_total_differs      — the amount CHARGED is not the amount we QUOTED and showed the
+                                   buyer. `quoted_total_minor` was written by the quoting step
+                                   and, until this round, never read by anything. Reporting a
+                                   charge that differs from the approved quote as ordinary GMV
+                                   would launder a partner-side re-price into our numbers; an
+                                   operator reconciles it against the stored quote instead.
+                                   Tolerance is the same one minor unit `verify_quote` allows,
+                                   for the same rounding reason.
     """
     currency = row.get("currency")
     order_id = _order_id(payload.get("orderId"))
-    if order_id is None:
-        if from_state == "processing":
-            return await _release(
-                row, worker_id,
-                error_code="completed_without_order_id",
-                seconds=ORDER_ID_MISSING_BACKOFF_SECONDS,
-            )
-        return await _move(
-            row, worker_id, [from_state], "processing",
-            last_error_code="completed_without_order_id",
-            next_poll_at=_now() + timedelta(seconds=ORDER_ID_MISSING_BACKOFF_SECONDS),
-        )
 
     final = _money(payload.get("finalAmount")) or _money(payload.get("amount"))
     final_minor = None
     if final is not None and final[1] == str(currency or "").strip().upper():
         final_minor = _positive_minor(final[0], currency)
 
+    quoted_minor = row.get("quoted_total_minor")
+    charged_agrees = (
+        final_minor is not None
+        and isinstance(quoted_minor, int)
+        and not isinstance(quoted_minor, bool)
+        and abs(final_minor - quoted_minor) <= QUOTE_RECONCILE_TOLERANCE_MINOR
+    )
+
+    if order_id is None:
+        reason = "completed_without_order_id"
+    elif final_minor is None:
+        reason = "final_amount_missing"
+    elif not charged_agrees:
+        reason = "charged_total_differs"
+    else:
+        reason = None
+
     moved = await _move(
         row, worker_id, [from_state], "completed",
         reap_order_id=order_id,
         final_total_minor=final_minor,
-        last_error_code=None if final_minor is not None else "final_amount_missing",
+        last_error_code=reason,
     )
     if moved.outcome != "advanced":
         # THE HOOK IS AFTER THE FENCE, NOT BEFORE IT. A lost claim means somebody else moved this
@@ -1739,11 +1860,11 @@ async def _complete(
         # not complete puts GMV in the attribution ledger that no order backs.
         return moved
 
-    if final_minor is None:
+    if reason is not None:
         logger.warning(
-            "reap_agentic: purchase=%s completed with order=%s but no usable final amount; "
-            "no attribution edge written so a reconciliation can still close it",
-            row["id"], order_id,
+            "reap_agentic: purchase=%s completed but no attribution edge written (%s); "
+            "reap_checkout_id is stored so a reconciliation can still close it",
+            row["id"], reason,
         )
         return moved
 

@@ -95,6 +95,9 @@ ENROLLMENT_ACTIVE = {
 
 QUOTE_200 = {
     "id": "f1e2d3c4",
+    # THE ECHO. Reap returns 200 for a SUBSTITUTED variant, so the quote has to say what it
+    # priced and `verify_quote` has to compare it — every other check looks at what it COSTS.
+    "items": [{"variantId": "var_abc123", "quantity": 1}],
     # FAR future on purpose: the quoting step now REFUSES to create a checkout from a quote it
     # can already see is dead (P2-9), so a fixture with a past expiry would refuse every happy
     # path. The expired case has its own test.
@@ -829,7 +832,11 @@ async def test_enrollment_not_active_on_the_checkout_fails_with_the_partners_own
     result = await _step(purchase_id)
     assert result.state == "failed"
     row = await _get(purchase_id)
-    assert row["last_error_code"] == "ENROLLMENT_NOT_ACTIVE"
+    assert row["last_error_code"] == "enrollment_not_active", (
+        "`last_error_code` is one column fed by three vocabularies — ours, the client's "
+        "transport codes and the partner's UPPERCASE ones — and it is folded to lower case at "
+        "the single place that writes it so it can be grouped on"
+    )
     assert row["state"] == "failed"
     assert row["buyer_email"] is None
     assert row["reap_quote_id"] == "f1e2d3c4", "the quote we did take is still evidence"
@@ -990,7 +997,7 @@ async def test_a_transport_failure_releases_with_the_states_doubled_backoff(
     assert result.outcome == "released"
     assert result.state == state
     assert result.next_poll_in_seconds == expected_backoff
-    assert result.last_error_code == "transport_error:ReadTimeout"
+    assert result.last_error_code == "transport_error:readtimeout"
     after = await _get(purchase_id)
     assert after["state"] == state, "a transport failure must not move the row"
     assert after["claimed_by"] is None, "the lease is given back"
@@ -1308,11 +1315,17 @@ async def test_a_completed_row_is_never_claimed_again(reap, attribution):
 # priced as one unit.
 
 
-def _quote(**breakdown_over):
+def _quote(_quantity=1, _variant="var_abc123", **breakdown_over):
+    """QUOTE_200 with its breakdown overridden, and its ITEMS echo kept in step.
+
+    `_quantity` / `_variant` exist because the echo check compares them: a test that raised the
+    quantity without moving the echo would be testing `quote_items_mismatch` while believing it
+    was testing the subtotal arithmetic."""
     """QUOTE_200 with its breakdown overridden. `None` DELETES a key, which is how the
     "missing component" cases are built — an absent block and a zero block are different claims
     and only one of them is a number."""
     payload = json.loads(json.dumps(QUOTE_200))
+    payload["items"] = [{"variantId": _variant, "quantity": _quantity}]
     for key, value in breakdown_over.items():
         if value is None:
             payload["amountBreakdown"].pop(key, None)
@@ -1353,7 +1366,7 @@ async def test_a_quote_must_price_the_whole_quantity(reap, attribution):
     """QUANTITY > 1, WHICH IS THE CASE THE REVIEWER'S MUTANT SURVIVED. A check written as
     `subtotal == our_price_minor` passes every quantity-1 test in this file and buys three
     bottles for the price of one."""
-    payload = _quote(itemsSubtotal=_usd(42.50), finalAmount=_usd(45.00))
+    payload = _quote(_quantity=3, itemsSubtotal=_usd(42.50), finalAmount=_usd(45.00))
     result, row = await _quote_outcome(reap, payload, quantity=3)
     assert row["state"] == "refused"
     assert row["last_error_code"] == "quote_items_subtotal_mismatch"
@@ -1363,7 +1376,7 @@ async def test_a_quote_must_price_the_whole_quantity(reap, attribution):
 async def test_a_quote_that_prices_the_whole_quantity_is_accepted(reap, attribution):
     """CONTROL for the test above — the multiplication has to accept the right number too, or
     the refusal above would be proving nothing but that quantity 3 always refuses."""
-    payload = _quote(itemsSubtotal=_usd(127.50), finalAmount=_usd(130.00))
+    payload = _quote(_quantity=3, itemsSubtotal=_usd(127.50), finalAmount=_usd(130.00))
     result, row = await _quote_outcome(reap, payload, quantity=3)
     assert row["state"] == "awaiting_approval"
     assert row["quoted_total_minor"] == 13000
@@ -1650,79 +1663,87 @@ async def _to_awaiting(reap):
     return purchase_id
 
 
-async def test_a_completed_checkout_with_no_order_id_does_not_complete(reap, attribution):
-    """The money was real, the row said 'completed', and the GMV existed NOWHERE: not on the row
-    (`reap_order_id` NULL), not in the attribution ledger (the closer drops an empty
-    `external_order_id` with a warning), not in any log a person reads."""
+async def test_a_completed_checkout_with_no_order_id_still_completes_and_sheds_its_pii(
+    reap, attribution
+):
+    """REVIEW ROUND 2, P0 — AND THIS TEST USED TO ASSERT THE OPPOSITE.
+
+    The previous fix parked a COMPLETED-without-an-orderId in 'processing' so a human would see
+    it. 'processing' HAS NO PII DEADLINE: `expire_overdue_purchases` sweeps only
+    'needs_enrollment' and 'awaiting_approval' (its source states are parsed out of its own SQL,
+    asserted below), and `fail_exhausted_purchases` skips 'processing' unless asked. So the row
+    kept `buyer_email` and `shipping_address` against every default sweep, indefinitely, for a
+    purchase whose charge had already SUCCEEDED.
+
+    Nothing is in flight once the partner says COMPLETED, so the row is terminal: the one
+    statement that nulls the PII is the terminal write. The order id is simply absent, no edge is
+    written, and `reap_checkout_id` is what a reconciliation re-reads to recover it."""
     reap.get_checkout = _ok({k: v for k, v in CHECKOUT_COMPLETED.items() if k != "orderId"})
     purchase_id = await _to_awaiting(reap)
     result = await _step(purchase_id)
 
-    assert result.state == "processing"
+    assert result.state == "completed"
     row = await _get(purchase_id)
-    assert row["state"] == "processing"
-    assert row["state"] != "completed"
+    assert row["state"] == "completed"
+    assert row["terminal_at"] is not None
+    assert row["buyer_email"] is None, "the terminal write is what sheds the PII"
+    assert row["shipping_address"] is None
+    assert row["reap_order_id"] is None
     assert row["last_error_code"] == "completed_without_order_id"
-    assert row["terminal_at"] is None
+    assert row["reap_checkout_id"] == "chk_7f3a", "the handle a reconciliation needs"
     assert attribution.calls == []
-    # 'processing' is the one non-terminal state `fail_exhausted_purchases` skips by default, so
-    # the row waits for a person rather than being auto-failed over a charge that succeeded.
-    assert "processing" not in await _exhaustible_states()
-    assert row["next_poll_at"] > datetime.now(timezone.utc) + timedelta(seconds=20)
 
 
-async def _exhaustible_states():
-    """What `fail_exhausted_purchases` will terminate with its default arguments — read from the
-    ledger by RUNNING it, not by reading its source."""
-    out = []
-    for state in ("resolving", "needs_enrollment", "quoting", "awaiting_approval", "processing"):
-        probe = await _start()
-        await _raw_state(probe, state)
-        await database.execute(
-            "UPDATE reap_agentic_purchases SET attempts = 99 WHERE id = :i", {"i": probe}
-        )
-        if probe in await ledger.fail_exhausted_purchases(5, limit=50):
-            out.append(state)
-        await database.execute("DELETE FROM reap_agentic_purchases WHERE id = :i", {"i": probe})
-    return out
-
-
-async def test_it_completes_normally_once_the_order_id_appears(reap, attribution):
-    """CONTROL, and the recovery path: a partner that fills the field in on a later read gets a
-    normal completion on the next poll. Nothing is stuck."""
-    reap.get_checkout = [
-        _ok({k: v for k, v in CHECKOUT_COMPLETED.items() if k != "orderId"}),
-        _ok(CHECKOUT_COMPLETED),
-    ]
-    purchase_id = await _to_awaiting(reap)
-    assert (await _step(purchase_id)).state == "processing"
-    assert (await _step(purchase_id)).state == "completed"
-    row = await _get(purchase_id)
-    assert row["reap_order_id"] == "ord_991"
-    assert len(attribution.calls) == 1
-
-
-async def test_a_processing_row_with_no_order_id_stays_processing(reap, attribution):
-    """'processing' → 'processing' is not an edge, so this arm releases instead of advancing."""
-    reap.get_checkout = _ok({k: v for k, v in CHECKOUT_COMPLETED.items() if k != "orderId"})
-    purchase_id = await _to_awaiting(reap)
-    await _step(purchase_id)
-    result = await _step(purchase_id)
-    assert result.outcome == "released"
-    assert result.state == "processing"
-    assert result.next_poll_in_seconds == svc.ORDER_ID_MISSING_BACKOFF_SECONDS
-    assert (await _get(purchase_id))["state"] == "processing"
+def test_the_states_with_no_pii_deadline_are_the_ones_this_module_never_parks_a_row_in():
+    """THE CONTROL FOR THE TEST ABOVE, read out of the LEDGER'S OWN SQL rather than asserted from
+    memory. Only these two states are swept on a clock; a terminal-by-success purchase left
+    anywhere else keeps the buyer's address until somebody notices."""
+    assert set(ledger._EXPIRE_SOURCE_STATES) == {"needs_enrollment", "awaiting_approval"}
+    assert "processing" not in ledger._EXPIRE_SOURCE_STATES
 
 
 @pytest.mark.parametrize("bad", ["", "   ", "ord 991", "ord/991", "o" * 129, "ord?991"])
 async def test_an_order_id_we_could_not_use_as_a_key_counts_as_missing(bad, reap, attribution):
     """The order id becomes half of an idempotency key on `(merchant, external_order_id)`. A
-    value that is not a usable key is not an order id."""
+    value that is not a usable key is not an order id — and the row still completes."""
     reap.get_checkout = _ok(dict(CHECKOUT_COMPLETED, orderId=bad))
     purchase_id = await _to_awaiting(reap)
     result = await _step(purchase_id)
-    assert result.state == "processing"
+    assert result.state == "completed"
+    row = await _get(purchase_id)
+    assert row["reap_order_id"] is None
+    assert row["last_error_code"] == "completed_without_order_id"
+    assert row["buyer_email"] is None
     assert attribution.calls == []
+
+
+@pytest.mark.parametrize("bad", [True, False, 12345, 12.5, ["ord_1"], {"id": "ord_1"}, None])
+async def test_an_order_id_that_is_not_a_string_is_not_an_order_id(bad, reap, attribution):
+    """THE TYPE GUARD, AND IT IS THE ONE THAT COSTS MOST TO GET WRONG. `str(value).strip()` is
+    generous in exactly the wrong way here: `orderId: true` became `"True"` and `orderId: 12345`
+    became `"12345"`, and both pass the charset rule.
+
+    That value is half of an idempotency key with `ON CONFLICT DO NOTHING`, so a partner sending
+    a boolean would make EVERY order at that merchant collide on `(merchant, "True")`: one edge
+    written, every later one silently dropped, that merchant's GMV reading as a single sale for
+    ever, and no error anywhere to notice it by."""
+    assert svc._order_id(bad) is None
+    reap.get_checkout = _ok(dict(CHECKOUT_COMPLETED, orderId=bad))
+    purchase_id = await _to_awaiting(reap)
+    assert (await _step(purchase_id)).state == "completed"
+    row = await _get(purchase_id)
+    assert row["reap_order_id"] is None
+    assert row["last_error_code"] == "completed_without_order_id"
+    assert attribution.calls == []
+
+
+async def test_a_string_order_id_is_still_accepted(reap, attribution):
+    """CONTROL: the type guard must not refuse the ordinary case."""
+    assert svc._order_id("ord_991") == "ord_991"
+    purchase_id = await _to_awaiting(reap)
+    assert (await _step(purchase_id)).state == "completed"
+    assert (await _get(purchase_id))["reap_order_id"] == "ord_991"
+    assert len(attribution.calls) == 1
 
 
 async def test_a_completed_order_with_no_usable_amount_writes_no_edge(reap, attribution):
@@ -1754,6 +1775,52 @@ async def test_a_final_amount_in_another_currency_writes_no_edge(reap, attributi
     row = await _get(purchase_id)
     assert row["final_total_minor"] is None
     assert row["last_error_code"] == "final_amount_missing"
+    assert attribution.calls == []
+
+
+@pytest.mark.parametrize(
+    "charged,edge",
+    [(45.00, True), (45.01, True), (44.99, True), (45.02, False), (52.00, False), (1.00, False)],
+)
+async def test_the_edge_is_only_written_when_the_charge_matches_the_quote(
+    charged, edge, reap, attribution
+):
+    """`quoted_total_minor` was written by the quoting step and, until this round, READ BY
+    NOTHING. The buyer approved a hosted page showing the quote; a charge that differs from it is
+    a partner-side re-price, and reporting it as ordinary GMV would launder that into our numbers
+    where nobody would ever look at it again — the edge is idempotent, so the first value is the
+    only value.
+
+    Same one-minor-unit tolerance as `verify_quote`, for the same rounding reason."""
+    reap.get_checkout = _ok(
+        dict(CHECKOUT_COMPLETED, finalAmount={"amount": charged, "currency": "USD"})
+    )
+    purchase_id = await _to_awaiting(reap)
+    assert (await _step(purchase_id)).state == "completed"
+
+    row = await _get(purchase_id)
+    assert row["quoted_total_minor"] == 4500, "control: the quote was recorded"
+    assert row["final_total_minor"] == int(round(charged * 100))
+    if edge:
+        assert len(attribution.calls) == 1
+        assert attribution.calls[0]["gross_amount_cents"] == int(round(charged * 100))
+        assert row["last_error_code"] is None
+    else:
+        assert attribution.calls == []
+        assert row["last_error_code"] == "charged_total_differs"
+
+
+async def test_a_charge_that_cannot_be_compared_writes_no_edge(reap, attribution):
+    """A row with no stored quote cannot be checked, and the absence of the check is not a pass.
+    Reached only by a row some other writer made — `quoting` always records the total."""
+    reap.get_checkout = _ok(CHECKOUT_COMPLETED)
+    purchase_id = await _to_awaiting(reap)
+    await database.execute(
+        "UPDATE reap_agentic_purchases SET quoted_total_minor = NULL WHERE id = :i",
+        {"i": purchase_id},
+    )
+    assert (await _step(purchase_id)).state == "completed"
+    assert (await _get(purchase_id))["last_error_code"] == "charged_total_differs"
     assert attribution.calls == []
 
 
@@ -2169,3 +2236,148 @@ async def test_the_edge_is_withheld_by_complete_itself_not_only_by_the_closer(
     )
     assert attribution.calls == []
     assert (await _get(purchase_id))["last_error_code"] == "final_amount_missing"
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# 19. WHAT WAS PRICED, NOT ONLY WHAT IT COST  (review round 2)
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+
+
+async def test_a_quote_for_a_different_variant_is_refused_even_at_the_right_price(
+    reap, attribution
+):
+    """REAP RETURNS 200 FOR A SUBSTITUTED VARIANT. Every other check in `verify_quote` looks at
+    what the quote COSTS, and a substitution whose price happens to match sails through all of
+    them: (b) compares OUR unit price against a subtotal, and if those agree, the fact that a
+    different physical object is being priced is invisible.
+
+    This is the only check that looks at WHAT is being bought."""
+    payload = _quote(_variant="var_SOMETHING_ELSE")
+    result, row = await _quote_outcome(reap, payload)
+    assert row["state"] == "refused"
+    assert row["refusal_reason"] == "price_unverifiable"
+    assert row["last_error_code"] == "quote_items_mismatch"
+    assert reap.named("create_checkout") == []
+    assert row["buyer_email"] is None
+
+
+async def test_a_quote_for_a_different_quantity_is_refused(reap, attribution):
+    """The echo carries the quantity too, and the subtotal check cannot see a quantity change
+    that the partner also repriced consistently."""
+    payload = _quote(_quantity=2, itemsSubtotal=_usd(85.00), finalAmount=_usd(87.50))
+    result, row = await _quote_outcome(reap, payload)   # the row asked for 1
+    assert row["state"] == "refused"
+    assert row["last_error_code"] == "quote_items_mismatch"
+
+
+@pytest.mark.parametrize(
+    "items",
+    [
+        None,
+        [],
+        "var_abc123",
+        {"variantId": "var_abc123", "quantity": 1},
+        [{"variantId": "var_abc123", "quantity": 1}, {"variantId": "var_x", "quantity": 1}],
+        [{"variantId": "var_abc123"}],
+        [{"variantId": "var_abc123", "quantity": True}],
+        [{"variantId": "var_abc123", "quantity": "1"}],
+        [{}],
+    ],
+)
+async def test_a_quote_that_does_not_say_what_it_priced_is_unverifiable(
+    items, reap, attribution
+):
+    """ANYTHING WE CANNOT READ AS "exactly the line we sent" IS A REFUSAL, including an absent
+    `items`, a non-list, a dict-shaped one, two lines, and a quantity that is a bool or a string.
+    A quote that does not say what it priced is not a quote we can check — the same rule the
+    client applies to a `nextAction` it cannot vet."""
+    payload = _quote()
+    if items is None:
+        payload.pop("items")
+    else:
+        payload["items"] = items
+    result, row = await _quote_outcome(reap, payload)
+    assert row["refusal_reason"] == "price_unverifiable"
+    assert row["last_error_code"] == "quote_items_mismatch"
+
+
+def test_the_echo_check_is_skipped_when_no_variant_is_supplied():
+    """CONTROL for the parameter's default. The direct unit tests call `verify_quote` without a
+    variant id; an end-to-end caller always has one, and `_step_quoting` passes it."""
+    row = {"currency": "USD", "our_price_minor": 4250, "quantity": 1}
+    assert svc.verify_quote(QUOTE_200, row).ok is True
+    assert svc.verify_quote(QUOTE_200, row, variant_id="var_abc123").ok is True
+    assert svc.verify_quote(QUOTE_200, row, variant_id="var_other").last_error_code == (
+        "quote_items_mismatch"
+    )
+
+
+def test_verify_quote_re_applies_the_quantity_ceiling():
+    """`MAX_QUANTITY` is enforced at `start_purchase`, and again here. Not decoration: this is
+    the last arithmetic before a card is charged, the subtotal check MULTIPLIES by this number,
+    and the row could have been written by something that is not `start_purchase`."""
+    ok_row = {"currency": "USD", "our_price_minor": 4250, "quantity": svc.MAX_QUANTITY}
+    over = dict(ok_row, quantity=svc.MAX_QUANTITY + 1)
+    assert svc.verify_quote(QUOTE_200, over).last_error_code == "quote_row_unverifiable"
+    assert svc.verify_quote(QUOTE_200, dict(ok_row, quantity=0)).last_error_code == (
+        "quote_row_unverifiable"
+    )
+    # CONTROL: the ceiling itself is allowed, so the refusal above is about the bound and not
+    # about every quantity above one.
+    payload = _quote(_quantity=svc.MAX_QUANTITY,
+                     itemsSubtotal=_usd(425.00), finalAmount=_usd(427.50))
+    assert svc.verify_quote(payload, ok_row, variant_id="var_abc123").ok is True
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# 20. THE CODE COLUMN, AND A CURRENCY THE CONVERTER CANNOT STATE  (review round 2)
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.parametrize("currency", sorted(svc.THREE_DECIMAL_CURRENCIES))
+async def test_a_three_decimal_currency_is_refused_at_the_door(currency, reap):
+    """`_exponent` answers 2 for everything outside the repo's zero-decimal list, so 1.234 KWD
+    would be read as 123 fils rather than 1234 — a tenfold error in the partner's favour, with no
+    symptom at all, because the arithmetic stays self-consistent all the way to the charge.
+
+    Refused rather than handled: handling it means a third exponent through `major_to_minor`,
+    which is the repo's ONE rounding policy and not this package's to widen."""
+    with pytest.raises(svc.PurchaseRefused) as exc:
+        await _start(row=_row(currency=currency))
+    assert exc.value.reason == "currency_unsupported"
+    assert await _count() == 0
+
+
+@pytest.mark.parametrize("currency", ["USD", "SGD", "EUR", "JPY"])
+async def test_the_currencies_this_rail_can_state_are_accepted(currency, reap):
+    """CONTROL, and JPY is the interesting one: zero decimals, which the repo's converter already
+    knows about, so it must NOT be swept up by the three-decimal refusal."""
+    assert await _start(row=_row(currency=currency))
+
+
+def test_the_error_code_column_is_folded_and_the_other_columns_are_not():
+    """ONE HELPER FOR SIX KINDS OF VALUE WAS A MISTAKE, and this test is what caught it: folding
+    case inside the shared `_cap` turned `card_network` into `"visa"` on its way to a column
+    whose only job is to be shown to a buyer.
+
+    `last_error_code` is folded because it is ONE column fed by three vocabularies that disagree
+    on case. `refusal_reason` is not, because a reader matches on the client's own reason
+    strings."""
+    assert svc._error_code("ENROLLMENT_NOT_ACTIVE") == "enrollment_not_active"
+    assert svc._error_code("transport_error:ReadTimeout") == "transport_error:readtimeout"
+    assert svc._error_code("quote_expired") == "quote_expired"
+    assert svc._error_code("") is None and svc._error_code(None) is None
+    assert svc._cap("VISA") == "VISA"
+    assert svc._cap("options:sole_label_differs:shade") == "options:sole_label_differs:shade"
+    assert len(svc._error_code("z" * 200)) == svc._CODE_MAX
+
+
+async def test_a_partner_status_is_recorded_verbatim_not_folded(reap, attribution):
+    """`reap_status` is the partner's raw value, which the ledger records and never matches on —
+    folding it would corrupt the record rather than tidy it."""
+    purchase_id = await _start()
+    await _step(purchase_id)
+    await _step(purchase_id)
+    enrollment = await ledger.get_active_enrollment("bref_alice")
+    assert enrollment["reap_status"] == "ACTIVE"
+    assert enrollment["card_network"] == "VISA"

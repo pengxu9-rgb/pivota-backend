@@ -38,12 +38,21 @@ anything is created. All four checks must pass:
 
 | check | rule | on failure |
 |---|---|---|
+| **items echo** | `items` is exactly one line, carrying the `variantId` we sent and the quantity we sent | `price_unverifiable` / `quote_items_mismatch` |
 | readable | `finalAmount`, `itemsSubtotal`, `shipping` and `tax.amount` all present and parsable as exact decimals (a JSON number **or** a decimal string) | `price_unverifiable` / `quote_amounts_unreadable` |
-| currency | every one of those four — and `rc.quote_total` where it can read the field — names the **row's** currency | `price_changed` / `quote_currency_mismatch` |
+| currency | every one of those four names the **row's** currency | `price_changed` / `quote_currency_mismatch` |
 | subtotal | `itemsSubtotal == quantity × our_price_minor`, **exactly**, no tolerance | `price_changed` / `quote_items_subtotal_mismatch` |
 | reconciles | `finalAmount == itemsSubtotal + shipping + tax`, within **±1 minor unit** | `price_changed` / `quote_total_not_reconciled` |
 
-A `None` is **never** COALESCEd into "fine": an amount we cannot state exactly is one we do not
+**The items echo is the only check that looks at *what* is being bought.** Reap returns 200 for a
+**substituted variant**, and every other check here looks at what the quote *costs* — a
+substitution whose price happens to match sails through all of them. `MAX_QUANTITY` is re-applied
+inside `verify_quote` as well as at `start_purchase`, because the subtotal check multiplies by
+that number and it is the last arithmetic before a card is charged.
+
+A quote that does not say what it priced — `items` absent, not a list, two lines, a bool or
+string quantity — is `quote_items_mismatch`, same as a mismatch. A `None` is **never** COALESCEd
+into "fine": an amount we cannot state exactly is one we do not
 buy against. `shipping` and `tax` may be exactly `0.00` (free shipping is the commonest quote
 there is) and are read through a sibling converter for that reason; a **negative** component is
 still refused. A quote whose `expiresAt` has already passed is not turned into a checkout —
@@ -165,16 +174,38 @@ above, plus `ENROLLMENT_NOT_ACTIVE`, `enrollment_dead`, `enrollment_no_hosted_ac
 `no_active_enrollment`, `completed_without_order_id`, `final_amount_missing`, and
 `reap_status_<n>` / `AGENTIC_*` codes passed through from the partner.
 
-`completed_without_order_id` — the partner said COMPLETED and gave no usable `orderId`. The row
-goes to (or stays in) **`processing`**, never `completed`: `orderId` is the only thing that makes
-the order findable, and `close_external_order_conversion` drops an empty one. `processing` is the
-state `fail_exhausted_purchases` skips by default, so the row waits for a person rather than
-being auto-failed over a charge that succeeded. A later poll that carries the id completes it.
+### The three codes that suppress the attribution edge
 
-`final_amount_missing` — the order exists and the row **is** completed, but no attribution edge
-was written. That edge is idempotent on `(merchant_id, external_order_id)` via
-`ON CONFLICT DO NOTHING`, so writing one with a null amount would permanently occupy the slot and
-that order would read as zero GMV for ever. Leaving it empty lets a reconciliation close it.
+A COMPLETED checkout **always completes the row**. The edge is a separate decision, and three
+things suppress it. The edge is idempotent on `(merchant_id, external_order_id)` via
+`ON CONFLICT DO NOTHING`, so **any** edge written here is permanent and a later correct close is
+silently dropped — which makes "write something approximate now" strictly worse than "write
+nothing and leave the slot free". In all three cases `reap_checkout_id` is stored, and that is
+what a reconciliation re-reads.
+
+| code | meaning |
+|---|---|
+| `completed_without_order_id` | no usable `orderId` (absent, blank, wrong charset, **or not a string** — `orderId: true` used to become `"True"` and collide every order at that merchant onto one key) |
+| `final_amount_missing` | `finalAmount` absent, unparsable, or in another currency |
+| `charged_total_differs` | the amount **charged** is not the amount **quoted** (the buyer approved a page showing the quote), outside ±1 minor unit — or there is no stored quote to compare against |
+
+`completed_without_order_id` **completes the row; it does not park it.** An earlier version sent
+it to `processing` so a human would see it, which was wrong for a measured reason: **`processing`
+has no PII deadline.** `expire_overdue_purchases` sweeps only `needs_enrollment` and
+`awaiting_approval`, and `fail_exhausted_purchases` skips `processing` by default, so the row kept
+`buyer_email` and `shipping_address` against every default sweep, indefinitely — for a purchase
+whose charge had already succeeded. The terminal write is the one statement that nulls the PII,
+and nothing is in flight once the partner says COMPLETED.
+
+A genuinely **PENDING/PROCESSING** partner status is a different thing and still belongs in
+`processing`; bounding that is the poller's attempts counter, not this module's job.
+
+`last_error_code` is **lower-cased** at the single place that writes it. The column is fed by
+three vocabularies that disagree on case — ours (`quote_expired`), the client's transport codes
+(`transport_error:ReadTimeout`) and the partner's, which its own `^[A-Z_]{3,64}$` check pins
+UPPERCASE (`ENROLLMENT_NOT_ACTIVE`) — and a column holding both cannot be grouped or alerted on
+without every consumer carrying its own fold. `refusal_reason`, `reap_status` and `card_network`
+are **not** folded: those carry somebody else's vocabulary verbatim.
 
 `partner_id_malformed` — a partner id we will not store, because it cannot survive the client's
 own path-parameter rule. Storing one put the row in `awaiting_approval` and made every later poll
@@ -210,6 +241,12 @@ the returned `AdvanceResult` and in one log line. Closing that gap needs a ledge
 * **`market_country`.** Accepted, validated, and **not persisted** — same reason. Dropping it
   degrades recall only; an out-of-market variant comes back in another currency or at another
   price and is refused as `price_changed`.
+* **Three-decimal currencies** (KWD, BHD, JOD, OMR, TND, LYD, IQD). `start_purchase` refuses them
+  with `currency_unsupported`. `_exponent` assumes two decimal places for anything outside the
+  repo's zero-decimal list, so 1.234 KWD would be stored as 123 fils rather than 1234 — a tenfold
+  error in the partner's favour that stays self-consistent all the way to the charge. Handling
+  them means a third exponent through `major_to_minor`, which is the repo's one rounding policy
+  and not this package's to widen.
 * **Re-quoting after a shipping-option change.** `select_shipping_option` exists on the client and
   is not used here; the quote's default option is taken.
 * **Orphaned checkouts.** A crash between `create_checkout` returning 200 and the transition that

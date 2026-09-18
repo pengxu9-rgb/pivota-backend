@@ -104,6 +104,9 @@ ENROLLMENT_ACTIVE = {
 }
 QUOTE_200 = {
     "id": "f1e2d3c4",
+    # THE ECHO. Reap returns 200 for a SUBSTITUTED variant, so the quote has to say what it
+    # priced and `verify_quote` has to compare it — every other check looks at what it COSTS.
+    "items": [{"variantId": "var_abc123", "quantity": 1}],
     # FAR future on purpose: the quoting step now REFUSES to create a checkout from a quote it
     # can already see is dead (P2-9), so a fixture with a past expiry would refuse every happy
     # path. The expired case has its own test.
@@ -749,7 +752,7 @@ async def test_enrollment_not_active_fails_with_the_partners_own_detail_code(rea
         await _step(purchase_id)
     row = await _get(purchase_id)
     assert row["state"] == "failed"
-    assert row["last_error_code"] == "ENROLLMENT_NOT_ACTIVE"
+    assert row["last_error_code"] == "enrollment_not_active"
 
 
 async def test_a_503_on_the_quote_refuses_as_not_completable(reap):
@@ -821,8 +824,14 @@ async def test_no_rail_log_record_carries_the_buyers_details(reap, attribution, 
 # survived BOTH arms, and because the money checks have to hold where the money is.
 
 
-def _quote(**breakdown_over):
+def _quote(_quantity=1, _variant="var_abc123", **breakdown_over):
+    """QUOTE_200 with its breakdown overridden, and its ITEMS echo kept in step.
+
+    `_quantity` / `_variant` exist because the echo check compares them: a test that raised the
+    quantity without moving the echo would be testing `quote_items_mismatch` while believing it
+    was testing the subtotal arithmetic."""
     payload = json.loads(json.dumps(QUOTE_200))
+    payload["items"] = [{"variantId": _variant, "quantity": _quantity}]
     for key, value in breakdown_over.items():
         if value is None:
             payload["amountBreakdown"].pop(key, None)
@@ -838,7 +847,8 @@ def _usd(amount):
 async def test_a_quote_must_price_the_whole_quantity(reap):
     """QUANTITY > 1 — the case a check written as `subtotal == our_price_minor` passes on every
     quantity-1 test in either suite, while buying three bottles for the price of one."""
-    reap.request_quote = _ok(_quote(itemsSubtotal=_usd(42.50), finalAmount=_usd(45.00)))
+    reap.request_quote = _ok(_quote(_quantity=3, itemsSubtotal=_usd(42.50),
+                                    finalAmount=_usd(45.00)))
     await _active_enrollment()
     purchase_id = await _start(quantity=3)
     for _ in range(3):
@@ -853,7 +863,8 @@ async def test_a_quote_must_price_the_whole_quantity(reap):
 
 async def test_the_right_quantity_at_the_right_price_is_accepted(reap):
     """CONTROL: the multiplication must accept the correct number too."""
-    reap.request_quote = _ok(_quote(itemsSubtotal=_usd(127.50), finalAmount=_usd(130.00)))
+    reap.request_quote = _ok(_quote(_quantity=3, itemsSubtotal=_usd(127.50),
+                                    finalAmount=_usd(130.00)))
     await _active_enrollment()
     purchase_id = await _start(quantity=3)
     # two steps: the buyer is already enrolled, so resolving -> quoting -> awaiting_approval.
@@ -995,19 +1006,46 @@ async def test_a_claim_lost_mid_step_is_still_caught_by_the_fence(reap):
     assert row["claimed_by"] == "worker-b"
 
 
-async def test_a_completed_checkout_with_no_order_id_does_not_complete(reap, attribution):
-    """P1-3. The money is real; a row that says 'completed' while naming no order puts the GMV
-    nowhere at all — the closer drops an empty `external_order_id` with a warning."""
+async def test_a_completed_checkout_with_no_order_id_completes_and_sheds_its_pii(
+    reap, attribution
+):
+    """REVIEW ROUND 2, P0, ON THE DIALECT WHERE THE SWEEPS RUN.
+
+    The previous fix parked this in 'processing' so a human would see it — and 'processing' has
+    NO PII deadline: `expire_overdue_purchases` sweeps only 'needs_enrollment' and
+    'awaiting_approval', and `fail_exhausted_purchases` skips 'processing' by default. Asserted
+    here by RUNNING both sweeps against a row aged past every threshold, rather than by reading
+    their source: the row must already be terminal and already stripped."""
+    import db.reap_agentic_ledger as ledger
+
     reap.get_checkout = _ok({k: v for k, v in CHECKOUT_COMPLETED.items() if k != "orderId"})
     purchase_id = await _start()
     for _ in range(4):
         result = await _step(purchase_id)
     row = await _get(purchase_id)
-    assert result.state == "processing"
-    assert row["state"] == "processing" and row["state"] != "completed"
+
+    assert result.state == "completed"
+    assert row["state"] == "completed"
+    assert row["terminal_at"] is not None
+    assert row["buyer_email"] is None, "the terminal write is what sheds the PII"
+    assert row["shipping_address"] is None
+    assert row["reap_order_id"] is None
     assert row["last_error_code"] == "completed_without_order_id"
-    assert row["terminal_at"] is None
+    assert row["reap_checkout_id"] == "chk_7f3a", "the handle a reconciliation needs"
     assert attribution.calls == []
+
+    # THE CONTROL, and the measurement the reviewer made: age the row past every deadline and run
+    # both default sweeps. Neither can reach 'processing', so had the row parked there it would
+    # still be holding the buyer's address at this point.
+    await _raw(
+        "UPDATE reap_agentic_purchases SET state_entered_at = TIMESTAMPTZ '2020-01-01', "
+        "updated_at = TIMESTAMPTZ '2020-01-01', attempts = 999 WHERE id = :i",
+        {"i": purchase_id},
+    )
+    assert await ledger.expire_overdue_purchases(max_age_seconds=60, limit=50) == []
+    assert await ledger.fail_exhausted_purchases(5, limit=50) == []
+    still = await _get(purchase_id)
+    assert still["buyer_email"] is None and still["shipping_address"] is None
 
 
 async def test_a_completed_order_with_no_usable_amount_writes_no_edge(reap, attribution):
@@ -1098,3 +1136,96 @@ async def test_a_bidi_override_never_reaches_the_jsonb_column(reap):
     assert "\u202e" not in raw["shipping_address"]
     assert "202e" not in raw["shipping_address"].lower()
     assert json.loads(raw["shipping_address"])["firstName"] == "Adaelbaroved"
+
+
+async def test_a_substituted_variant_is_refused_even_at_the_right_price(reap):
+    """Reap returns 200 for a SUBSTITUTED variant. Every other check in `verify_quote` looks at
+    what the quote COSTS; only the items echo looks at what is being bought."""
+    reap.request_quote = _ok(_quote(_variant="var_SOMETHING_ELSE"))
+    await _active_enrollment()
+    purchase_id = await _start()
+    # two steps: the buyer is already enrolled, so resolving -> quoting -> the quote check.
+    for _ in range(2):
+        await _step(purchase_id)
+    row = await _get(purchase_id)
+    assert row["state"] == "refused"
+    assert row["refusal_reason"] == "price_unverifiable"
+    assert row["last_error_code"] == "quote_items_mismatch"
+    assert reap.named("create_checkout") == []
+    assert row["buyer_email"] is None
+
+
+@pytest.mark.parametrize("bad", [True, 12345, None, ["ord_1"]])
+async def test_an_order_id_that_is_not_a_string_completes_without_an_edge(bad, reap, attribution):
+    """`str(value).strip()` turned `orderId: true` into `"True"`. That value is half of an
+    idempotency key with ON CONFLICT DO NOTHING, so every order at the merchant would collide on
+    `(merchant, "True")`: one edge written, the rest dropped, the GMV reading as one sale for
+    ever."""
+    reap.get_checkout = _ok(dict(CHECKOUT_COMPLETED, orderId=bad))
+    purchase_id = await _start()
+    for _ in range(4):
+        await _step(purchase_id)
+    row = await _get(purchase_id)
+    assert row["state"] == "completed"
+    assert row["reap_order_id"] is None
+    assert row["last_error_code"] == "completed_without_order_id"
+    assert row["buyer_email"] is None
+    assert attribution.calls == []
+
+
+@pytest.mark.parametrize("charged,edge", [(45.00, True), (45.01, True), (52.00, False)])
+async def test_the_edge_is_only_written_when_the_charge_matches_the_quote(
+    charged, edge, reap, attribution
+):
+    """`quoted_total_minor` was written by the quoting step and, until this round, read by
+    NOTHING. The buyer approved a hosted page showing the quote; a charge that differs is a
+    partner-side re-price, and the edge is idempotent — the first value written is the only value
+    there will ever be."""
+    reap.get_checkout = _ok(
+        dict(CHECKOUT_COMPLETED, finalAmount={"amount": charged, "currency": "USD"})
+    )
+    purchase_id = await _start()
+    for _ in range(4):
+        await _step(purchase_id)
+    row = await _get(purchase_id)
+    assert row["state"] == "completed"
+    assert row["quoted_total_minor"] == 4500, "control: the quote was recorded"
+    if edge:
+        assert len(attribution.calls) == 1
+        assert attribution.calls[0]["gross_amount_cents"] == int(round(charged * 100))
+        assert row["last_error_code"] is None
+    else:
+        assert attribution.calls == []
+        assert row["last_error_code"] == "charged_total_differs"
+
+
+async def test_a_three_decimal_currency_is_refused_before_any_row_is_written(reap):
+    """`_exponent` assumes two decimals for everything outside the repo's zero-decimal list, so
+    1.234 KWD would be stored as 123 fils rather than 1234 — a tenfold error that stays
+    self-consistent all the way to the charge, with no symptom at all."""
+    import services.reap_agentic_purchase as svc
+    from db.database import database
+
+    with pytest.raises(svc.PurchaseRefused) as exc:
+        await _start(row=_row(currency="KWD"))
+    assert exc.value.reason == "currency_unsupported"
+    count = await database.fetch_one("SELECT COUNT(*) AS n FROM reap_agentic_purchases")
+    assert int(count["n"]) == 0
+
+
+async def test_the_error_code_column_is_lower_case_and_the_others_are_verbatim(reap):
+    """`last_error_code` is one VARCHAR(64) fed by three vocabularies that disagree on case, so
+    it is folded at the single place that writes it. `reap_status` and `card_network` are NOT:
+    those columns record what the partner said and what a buyer is shown."""
+    import db.reap_agentic_ledger as ledger
+
+    purchase_id = await _start()
+    await _step(purchase_id)
+    await _step(purchase_id)
+    enrollment = await ledger.get_active_enrollment("bref_alice")
+    assert enrollment["reap_status"] == "ACTIVE"
+    assert enrollment["card_network"] == "VISA"
+
+    reap.request_quote = _ok(dict(QUOTE_200, expiresAt="2020-01-01T00:00:00Z"))
+    result = await _step(purchase_id)
+    assert result.last_error_code == "quote_expired"
