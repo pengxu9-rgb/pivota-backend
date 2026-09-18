@@ -95,7 +95,10 @@ ENROLLMENT_ACTIVE = {
 
 QUOTE_200 = {
     "id": "f1e2d3c4",
-    "expiresAt": "2026-09-17T20:35:00Z",
+    # FAR future on purpose: the quoting step now REFUSES to create a checkout from a quote it
+    # can already see is dead (P2-9), so a fixture with a past expiry would refuse every happy
+    # path. The expired case has its own test.
+    "expiresAt": "2099-01-01T00:00:00Z",
     "amountBreakdown": {
         "itemsSubtotal": {"amount": 42.50, "currency": "USD"},
         "shipping": {"amount": 1.00, "currency": "USD"},
@@ -994,14 +997,6 @@ async def test_a_transport_failure_releases_with_the_states_doubled_backoff(
     assert after["next_poll_at"] > before["next_poll_at"]
 
 
-def test_the_backoff_is_capped(monkeypatch):
-    """Uncapped, a long interval plus repeated failures walks off into hours — and
-    `expire_overdue_purchases` would terminate the purchase before the next poll ever ran."""
-    assert svc.MAX_BACKOFF_SECONDS == 600
-    for interval in svc.POLL_INTERVALS.values():
-        assert min(interval * svc.TRANSPORT_BACKOFF_MULTIPLIER, svc.MAX_BACKOFF_SECONDS) <= 600
-
-
 async def test_a_pending_enrollment_waits_the_plain_interval_not_the_doubled_one(
     reap, attribution
 ):
@@ -1073,12 +1068,14 @@ async def test_an_unrecognised_checkout_status_never_advances(reap, attribution)
 
 
 async def test_the_worker_that_does_not_hold_the_claim_writes_nothing(reap, attribution):
-    """TWO WORKERS, ONE ROW. `worker-a` holds the lease; `worker-b` runs a full step against the
-    same purchase and every write it makes carries `AND claimed_by = 'worker-b'`, which matches
-    nothing. It gets `lost_claim` and the row is untouched.
+    """TWO WORKERS, ONE ROW. `worker-a` holds the lease; `worker-b` runs a step against the same
+    purchase, is stopped by the ownership re-read before it reaches the partner, and would be
+    stopped by the fence even if it were not. It gets `lost_claim` and the row is untouched.
 
-    This is the interleaving the fence exists for: A's view of the STATE is correct, and it is
-    A's view of OWNERSHIP that is stale. Nothing in `from_states` can catch it."""
+    THIS TEST NO LONGER PROVES THE FENCE ON ITS OWN, and that matters for reading the mutant
+    table: with the re-read in front, the step ends before any write is attempted. The fence
+    itself is proven by `test_a_claim_lost_mid_step_still_writes_nothing`, where the claim moves
+    INSIDE the partner call and only the conjunct in the UPDATE can catch it."""
     purchase_id = await _start()
     await _claim(purchase_id, "worker-a")
     before = await _get(purchase_id)
@@ -1298,3 +1295,877 @@ async def test_a_completed_row_is_never_claimed_again(reap, attribution):
         {"i": purchase_id},
     )
     assert await ledger.claim_due_purchases("w2", limit=10) == []
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# 12. THE QUOTE IS THE NUMBER THAT DECIDES THE CHARGE  (review P0-1)
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+#
+# The unit price is not the charge. Everything in this block exists because the first cut of this
+# module verified the RESOLVED UNIT PRICE and then stored the quote's totals without comparing
+# them to anything — and reached 'awaiting_approval', with a live hosted link in front of a
+# buyer, on a 999.00 quote, on a wholly-EUR quote against a USD row, and on a quantity-3 purchase
+# priced as one unit.
+
+
+def _quote(**breakdown_over):
+    """QUOTE_200 with its breakdown overridden. `None` DELETES a key, which is how the
+    "missing component" cases are built — an absent block and a zero block are different claims
+    and only one of them is a number."""
+    payload = json.loads(json.dumps(QUOTE_200))
+    for key, value in breakdown_over.items():
+        if value is None:
+            payload["amountBreakdown"].pop(key, None)
+        else:
+            payload["amountBreakdown"][key] = value
+    return payload
+
+
+def _usd(amount):
+    return {"amount": amount, "currency": "USD"}
+
+
+async def _quote_outcome(reap, quote_payload, **start_over):
+    """Drive a pre-enrolled buyer to the quoting step with `quote_payload` and return the row."""
+    reap.request_quote = _ok(quote_payload)
+    await _active_enrollment()
+    purchase_id = await _start(**start_over)
+    await _step(purchase_id)
+    result = await _step(purchase_id)
+    return result, await _get(purchase_id)
+
+
+async def test_a_quote_total_that_is_not_our_purchase_refuses(reap, attribution):
+    """THE P0. Unit price 42.50 verified at resolve, quote 999.00 — and the old code proceeded,
+    because nothing ever compared the quote to the purchase."""
+    payload = _quote(itemsSubtotal=_usd(999.00), finalAmount=_usd(1001.50))
+    result, row = await _quote_outcome(reap, payload)
+    assert result.state == "refused"
+    assert row["state"] == "refused" and row["state"] != "awaiting_approval"
+    assert row["refusal_reason"] == "price_changed"
+    assert row["last_error_code"] == "quote_items_subtotal_mismatch"
+    assert row["hosted_url"] is None
+    assert reap.named("create_checkout") == [], "nothing is created against a price we refuse"
+    assert row["buyer_email"] is None
+
+
+async def test_a_quote_must_price_the_whole_quantity(reap, attribution):
+    """QUANTITY > 1, WHICH IS THE CASE THE REVIEWER'S MUTANT SURVIVED. A check written as
+    `subtotal == our_price_minor` passes every quantity-1 test in this file and buys three
+    bottles for the price of one."""
+    payload = _quote(itemsSubtotal=_usd(42.50), finalAmount=_usd(45.00))
+    result, row = await _quote_outcome(reap, payload, quantity=3)
+    assert row["state"] == "refused"
+    assert row["last_error_code"] == "quote_items_subtotal_mismatch"
+    assert reap.named("create_checkout") == []
+
+
+async def test_a_quote_that_prices_the_whole_quantity_is_accepted(reap, attribution):
+    """CONTROL for the test above — the multiplication has to accept the right number too, or
+    the refusal above would be proving nothing but that quantity 3 always refuses."""
+    payload = _quote(itemsSubtotal=_usd(127.50), finalAmount=_usd(130.00))
+    result, row = await _quote_outcome(reap, payload, quantity=3)
+    assert row["state"] == "awaiting_approval"
+    assert row["quoted_total_minor"] == 13000
+    assert row["quantity"] == 3
+
+
+async def test_a_quote_in_another_currency_refuses_and_stores_no_totals(reap, attribution):
+    """A WHOLLY-EUR QUOTE AGAINST A USD ROW. Every amount failed the old currency conjunct, every
+    one came back None, and `COALESCE(:col, col)` in the transition swallowed all of them — so
+    the row went to a live EUR checkout carrying NULL totals, with nothing to look at."""
+    payload = _quote(
+        itemsSubtotal={"amount": 42.50, "currency": "EUR"},
+        shipping={"amount": 1.00, "currency": "EUR"},
+        tax={"amount": {"amount": 1.50, "currency": "EUR"}, "includedInPrices": False},
+        finalAmount={"amount": 45.00, "currency": "EUR"},
+    )
+    result, row = await _quote_outcome(reap, payload)
+    assert row["state"] == "refused"
+    assert row["refusal_reason"] == "price_changed"
+    assert row["last_error_code"] == "quote_currency_mismatch"
+    assert row["quoted_total_minor"] is None
+    assert reap.named("create_checkout") == []
+
+
+async def test_one_component_in_another_currency_is_enough_to_refuse(reap, attribution):
+    """The conjunct is over EVERY amount in the breakdown, not just the total. A shipping line
+    quoted in another currency is a total that cannot be the sum of its parts."""
+    payload = _quote(shipping={"amount": 1.00, "currency": "GBP"})
+    result, row = await _quote_outcome(reap, payload)
+    assert row["last_error_code"] == "quote_currency_mismatch"
+
+
+async def test_a_total_that_does_not_follow_from_its_breakdown_refuses(reap, attribution):
+    """42.50 + 1.00 + 1.50 is 45.00, not 52.00. A total that does not reconcile is a line we did
+    not read — a fee, a discount reversed — and this is the last place anything looks."""
+    payload = _quote(finalAmount=_usd(52.00))
+    result, row = await _quote_outcome(reap, payload)
+    assert row["state"] == "refused"
+    assert row["last_error_code"] == "quote_total_not_reconciled"
+
+
+@pytest.mark.parametrize("delta,expected", [(0.01, "awaiting_approval"), (0.02, "refused")])
+async def test_the_reconciliation_tolerance_is_exactly_one_minor_unit(
+    delta, expected, reap, attribution
+):
+    """ONE unit is a rounding artifact — the partner rounds a percentage tax once and we round
+    our reconstruction independently. TWO is a breakdown that does not describe the charge."""
+    payload = _quote(finalAmount=_usd(round(45.00 + delta, 2)))
+    result, row = await _quote_outcome(reap, payload)
+    assert row["state"] == expected
+
+
+MISSING_COMPONENTS = ["finalAmount", "itemsSubtotal", "shipping", "tax"]
+
+
+@pytest.mark.parametrize("missing", MISSING_COMPONENTS)
+async def test_any_missing_breakdown_component_is_unverifiable(missing, reap, attribution):
+    """NEVER COALESCE A None INTO "FINE". An absent tax block and a zero tax block are different
+    claims; only the second one is a number, and only a number can be checked."""
+    result, row = await _quote_outcome(reap, _quote(**{missing: None}))
+    assert row["state"] == "refused"
+    assert row["refusal_reason"] == "price_unverifiable"
+    assert row["last_error_code"] == "quote_amounts_unreadable"
+    assert reap.named("create_checkout") == []
+
+
+async def test_zero_shipping_and_zero_tax_are_amounts_not_absences(reap, attribution):
+    """FREE SHIPPING IS THE COMMONEST QUOTE THERE IS. The repo's one converter refuses zero
+    (`0 < scaled`), which is right for a spend and wrong for a breakdown component — using it for
+    shipping would make every zero-shipping purchase `price_unverifiable`."""
+    payload = _quote(
+        shipping=_usd(0.00),
+        tax={"amount": _usd(0.00), "includedInPrices": True},
+        finalAmount=_usd(42.50),
+    )
+    result, row = await _quote_outcome(reap, payload)
+    assert row["state"] == "awaiting_approval"
+    assert row["shipping_minor"] == 0
+    assert row["tax_minor"] == 0
+    assert row["quoted_total_minor"] == 4250
+
+
+async def test_a_negative_component_is_refused_rather_than_subtracted(reap, attribution):
+    """A negative shipping line is a discount wearing the wrong field name. Accepting it would
+    let the reconciliation pass on a total that is lower than the goods."""
+    payload = _quote(shipping=_usd(-1.00), finalAmount=_usd(43.00))
+    result, row = await _quote_outcome(reap, payload)
+    assert row["refusal_reason"] == "price_unverifiable"
+    assert row["last_error_code"] == "quote_amounts_unreadable"
+
+
+async def test_decimal_strings_are_read_as_amounts(reap, attribution):
+    """This partner has sent decimal STRINGS in other fields of the same API, and
+    `rc.quote_total` refuses anything that is not a JSON number. A reader that answered None for
+    `"45.00"` would turn a perfectly good quote into `price_unverifiable`."""
+    payload = _quote(
+        itemsSubtotal={"amount": "42.50", "currency": "USD"},
+        shipping={"amount": "1.00", "currency": "USD"},
+        tax={"amount": {"amount": "1.50", "currency": "USD"}},
+        finalAmount={"amount": "45.00", "currency": "USD"},
+    )
+    result, row = await _quote_outcome(reap, payload)
+    assert row["state"] == "awaiting_approval"
+    assert row["quoted_total_minor"] == 4500
+    assert row["shipping_minor"] == 100
+    assert row["tax_minor"] == 150
+
+
+@pytest.mark.parametrize("bad", ["not a number", True, None, float("inf"), "1e400"])
+async def test_an_amount_that_is_not_an_amount_is_unverifiable(bad, reap, attribution):
+    result, row = await _quote_outcome(reap, _quote(finalAmount={"amount": bad,
+                                                                 "currency": "USD"}))
+    assert row["refusal_reason"] == "price_unverifiable"
+
+
+def test_verify_quote_names_which_check_refused():
+    """The four codes, asserted against the function directly so the vocabulary is pinned in one
+    place rather than inferred from five end-to-end tests."""
+    row = {"currency": "USD", "our_price_minor": 4250, "quantity": 1}
+    assert svc.verify_quote(QUOTE_200, row).ok is True
+    assert svc.verify_quote(_quote(tax=None), row).last_error_code == "quote_amounts_unreadable"
+    assert svc.verify_quote(
+        _quote(finalAmount={"amount": 45.00, "currency": "EUR"}), row
+    ).last_error_code == "quote_currency_mismatch"
+    assert svc.verify_quote(
+        _quote(itemsSubtotal=_usd(50.00), finalAmount=_usd(52.50)), row
+    ).last_error_code == "quote_items_subtotal_mismatch"
+    assert svc.verify_quote(_quote(finalAmount=_usd(90.00)), row).last_error_code == (
+        "quote_total_not_reconciled"
+    )
+    # A row that cannot state its own price is the fifth, defensive, branch.
+    assert svc.verify_quote(QUOTE_200, {"currency": "USD", "our_price_minor": None,
+                                        "quantity": 1}).last_error_code == (
+        "quote_row_unverifiable"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# 13. NO PARTNER SIDE EFFECTS AFTER A LOST CLAIM  (review P1-2)
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+
+
+LOSER_STATES = ["resolving", "needs_enrollment", "quoting", "awaiting_approval", "processing"]
+
+
+@pytest.mark.parametrize("state", LOSER_STATES)
+async def test_a_worker_that_does_not_hold_the_claim_calls_the_partner_not_at_all(
+    state, reap, attribution
+):
+    """MEASURED BEFORE THIS GUARD EXISTED: a worker that had lost the lease in 'quoting' still ran
+    resolve → request_quote → create_checkout, leaving a LIVE CHECKOUT at Reap bound to the
+    buyer's enrollment and referenced by no row of ours; one that had lost it in 'resolving' still
+    created a hosted enrollment page.
+
+    The fence protects our database and cannot protect the partner — it is a conjunct in an
+    UPDATE, and by the time it answers, the checkout exists. `_still_ours` is the addition."""
+    await _active_enrollment()
+    purchase_id = await _start()
+    await _raw_state(purchase_id, state)
+    await database.execute(
+        "UPDATE reap_agentic_purchases SET reap_checkout_id = 'chk_7f3a' WHERE id = :i",
+        {"i": purchase_id},
+    )
+    await _claim(purchase_id, "worker-a")
+    before = await _get(purchase_id)
+    reap.calls.clear()
+
+    result = await svc.advance(purchase_id, "worker-b")
+
+    assert result.outcome == "lost_claim"
+    assert reap.calls == [], f"the loser in {state!r} called the partner"
+    after = await _get(purchase_id)
+    assert after["state"] == state
+    assert after["claimed_by"] == "worker-a"
+    assert after["updated_at"] == before["updated_at"]
+
+
+async def test_the_loser_in_resolving_mints_no_enrollment_row(reap, attribution):
+    """`upsert_pending_enrollment` takes NO holder, so it is an UNFENCED write and the re-read is
+    the only thing in front of it. Without it the loser minted an enrollment row for the buyer."""
+    purchase_id = await _start()
+    await _claim(purchase_id, "worker-a")
+    result = await svc.advance(purchase_id, "worker-b")
+    assert result.outcome == "lost_claim"
+    rows = await database.fetch_all("SELECT * FROM reap_agentic_enrollments")
+    assert rows == [] or len(rows) == 0
+
+
+async def test_the_loser_does_not_overwrite_the_holders_hosted_link(reap, attribution):
+    """The second unfenced enrollment write. The holder's live 15-minute link was replaced by one
+    the loser minted, so the buyer's page stopped matching the enrollment we were polling."""
+    purchase_id = await _start()
+    await _step(purchase_id, "worker-a")           # holder reaches needs_enrollment
+    enrollment_before = await database.fetch_one(
+        "SELECT * FROM reap_agentic_enrollments WHERE buyer_ref = 'bref_alice'"
+    )
+    await _raw_state(purchase_id, "resolving")
+    await _claim(purchase_id, "worker-a")
+    reap.create_enrollment = _ok(
+        dict(ENROLLMENT_CREATED, nextAction=dict(ENROLLMENT_CREATED["nextAction"],
+                                                 url="https://pay.prava.space/enroll/OTHER"))
+    )
+    reap.calls.clear()
+
+    assert (await svc.advance(purchase_id, "worker-b")).outcome == "lost_claim"
+
+    after = await database.fetch_one(
+        "SELECT * FROM reap_agentic_enrollments WHERE buyer_ref = 'bref_alice'"
+    )
+    assert after["hosted_url"] == enrollment_before["hosted_url"]
+    assert "OTHER" not in str(after["hosted_url"])
+    assert reap.calls == []
+
+
+async def test_a_claim_lost_mid_step_still_writes_nothing(reap, attribution):
+    """THE FENCE ITSELF, past the re-read. The claim moves INSIDE the partner call, so
+    `_still_ours` has already passed and only the `AND claimed_by = :worker_id` conjunct in the
+    UPDATE can catch it. This is the test that dies when the fence's None is ignored — the
+    re-read cannot stand in for it."""
+    purchase_id = await _start()
+    await _claim(purchase_id, "w1")
+
+    async def _steal(**kwargs):
+        await database.execute(
+            "UPDATE reap_agentic_purchases SET claimed_by = 'worker-b' WHERE id = :i",
+            {"i": purchase_id},
+        )
+        return _resolved()
+
+    reap.resolve_our_row = _steal
+    result = await svc.advance(purchase_id, "w1")
+    assert result.outcome == "lost_claim"
+    row = await _get(purchase_id)
+    assert row["state"] == "resolving"
+    assert row["reap_variant_id"] is None
+    assert row["claimed_by"] == "worker-b"
+
+
+async def test_a_claim_lost_mid_step_before_a_release_writes_nothing(reap, attribution):
+    """The same, on the no-progress path: `release_claim` is fenced on the same conjunct, so a
+    worker whose lease moved cannot reschedule — or clear — the new holder's row."""
+    purchase_id = await _start()
+    await _claim(purchase_id, "w1")
+    before = await _get(purchase_id)
+
+    async def _steal_then_fail(**kwargs):
+        await database.execute(
+            "UPDATE reap_agentic_purchases SET claimed_by = 'worker-b' WHERE id = :i",
+            {"i": purchase_id},
+        )
+        return _transport_resolution()
+
+    reap.resolve_our_row = _steal_then_fail
+    result = await svc.advance(purchase_id, "w1")
+    assert result.outcome == "lost_claim"
+    row = await _get(purchase_id)
+    assert row["claimed_by"] == "worker-b"
+    assert row["next_poll_at"] == before["next_poll_at"], "the loser rescheduled nothing"
+
+
+async def test_a_state_that_moved_under_us_stops_the_step_before_the_partner(reap, attribution):
+    """The re-read checks the STATE as well as the claim. A sweep can terminate a row we still
+    hold — both bulk sweeps take no holder — and `claimed_by` alone would let this worker quote a
+    purchase that is already 'expired'."""
+    purchase_id = await _start()
+    await _claim(purchase_id, "w1")
+    await _raw_state(purchase_id, "quoting")   # somebody else advanced it; our `row` says
+    row = dict(await _get(purchase_id), state="resolving")  # ...what we read at step start
+    result = await svc._step_resolving(row, "w1")
+    assert result.outcome == "lost_claim"
+    assert reap.calls == []
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# 14. 'completed' IS A CLAIM ABOUT AN ORDER  (review P1-3 and P1-4)
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+
+
+async def _to_awaiting(reap):
+    await _active_enrollment()
+    purchase_id = await _start()
+    await _step(purchase_id)
+    await _step(purchase_id)
+    return purchase_id
+
+
+async def test_a_completed_checkout_with_no_order_id_does_not_complete(reap, attribution):
+    """The money was real, the row said 'completed', and the GMV existed NOWHERE: not on the row
+    (`reap_order_id` NULL), not in the attribution ledger (the closer drops an empty
+    `external_order_id` with a warning), not in any log a person reads."""
+    reap.get_checkout = _ok({k: v for k, v in CHECKOUT_COMPLETED.items() if k != "orderId"})
+    purchase_id = await _to_awaiting(reap)
+    result = await _step(purchase_id)
+
+    assert result.state == "processing"
+    row = await _get(purchase_id)
+    assert row["state"] == "processing"
+    assert row["state"] != "completed"
+    assert row["last_error_code"] == "completed_without_order_id"
+    assert row["terminal_at"] is None
+    assert attribution.calls == []
+    # 'processing' is the one non-terminal state `fail_exhausted_purchases` skips by default, so
+    # the row waits for a person rather than being auto-failed over a charge that succeeded.
+    assert "processing" not in await _exhaustible_states()
+    assert row["next_poll_at"] > datetime.now(timezone.utc) + timedelta(seconds=20)
+
+
+async def _exhaustible_states():
+    """What `fail_exhausted_purchases` will terminate with its default arguments — read from the
+    ledger by RUNNING it, not by reading its source."""
+    out = []
+    for state in ("resolving", "needs_enrollment", "quoting", "awaiting_approval", "processing"):
+        probe = await _start()
+        await _raw_state(probe, state)
+        await database.execute(
+            "UPDATE reap_agentic_purchases SET attempts = 99 WHERE id = :i", {"i": probe}
+        )
+        if probe in await ledger.fail_exhausted_purchases(5, limit=50):
+            out.append(state)
+        await database.execute("DELETE FROM reap_agentic_purchases WHERE id = :i", {"i": probe})
+    return out
+
+
+async def test_it_completes_normally_once_the_order_id_appears(reap, attribution):
+    """CONTROL, and the recovery path: a partner that fills the field in on a later read gets a
+    normal completion on the next poll. Nothing is stuck."""
+    reap.get_checkout = [
+        _ok({k: v for k, v in CHECKOUT_COMPLETED.items() if k != "orderId"}),
+        _ok(CHECKOUT_COMPLETED),
+    ]
+    purchase_id = await _to_awaiting(reap)
+    assert (await _step(purchase_id)).state == "processing"
+    assert (await _step(purchase_id)).state == "completed"
+    row = await _get(purchase_id)
+    assert row["reap_order_id"] == "ord_991"
+    assert len(attribution.calls) == 1
+
+
+async def test_a_processing_row_with_no_order_id_stays_processing(reap, attribution):
+    """'processing' → 'processing' is not an edge, so this arm releases instead of advancing."""
+    reap.get_checkout = _ok({k: v for k, v in CHECKOUT_COMPLETED.items() if k != "orderId"})
+    purchase_id = await _to_awaiting(reap)
+    await _step(purchase_id)
+    result = await _step(purchase_id)
+    assert result.outcome == "released"
+    assert result.state == "processing"
+    assert result.next_poll_in_seconds == svc.ORDER_ID_MISSING_BACKOFF_SECONDS
+    assert (await _get(purchase_id))["state"] == "processing"
+
+
+@pytest.mark.parametrize("bad", ["", "   ", "ord 991", "ord/991", "o" * 129, "ord?991"])
+async def test_an_order_id_we_could_not_use_as_a_key_counts_as_missing(bad, reap, attribution):
+    """The order id becomes half of an idempotency key on `(merchant, external_order_id)`. A
+    value that is not a usable key is not an order id."""
+    reap.get_checkout = _ok(dict(CHECKOUT_COMPLETED, orderId=bad))
+    purchase_id = await _to_awaiting(reap)
+    result = await _step(purchase_id)
+    assert result.state == "processing"
+    assert attribution.calls == []
+
+
+async def test_a_completed_order_with_no_usable_amount_writes_no_edge(reap, attribution):
+    """`close_external_order_conversion` is idempotent on `(merchant, external_order_id)` via
+    ON CONFLICT DO NOTHING, so an edge written with `gross_amount_cents = None` is PERMANENT: the
+    slot is taken, a later correct close is dropped, and that order reads as zero GMV for ever.
+
+    The ROW still completes — the order exists and refusing to record that would be a worse lie —
+    and it says why, so a reconciliation can close it from a re-read."""
+    reap.get_checkout = _ok({k: v for k, v in CHECKOUT_COMPLETED.items() if k != "finalAmount"})
+    purchase_id = await _to_awaiting(reap)
+    result = await _step(purchase_id)
+
+    assert result.state == "completed"
+    row = await _get(purchase_id)
+    assert row["state"] == "completed"
+    assert row["reap_order_id"] == "ord_991"
+    assert row["final_total_minor"] is None
+    assert row["last_error_code"] == "final_amount_missing"
+    assert attribution.calls == [], "no edge, so the idempotency slot stays free"
+
+
+async def test_a_final_amount_in_another_currency_writes_no_edge(reap, attribution):
+    reap.get_checkout = _ok(
+        dict(CHECKOUT_COMPLETED, finalAmount={"amount": 45.00, "currency": "EUR"})
+    )
+    purchase_id = await _to_awaiting(reap)
+    assert (await _step(purchase_id)).state == "completed"
+    row = await _get(purchase_id)
+    assert row["final_total_minor"] is None
+    assert row["last_error_code"] == "final_amount_missing"
+    assert attribution.calls == []
+
+
+async def test_the_closer_refuses_a_keyless_or_amountless_edge_on_its_own(reap, attribution,
+                                                                          caplog):
+    """THE SECOND LAYER, called directly. `_complete` already decides this and is tested above;
+    this exists because the cost of being wrong is permanent and a future caller of
+    `_close_attribution` will not have read `_complete`."""
+    caplog.set_level(logging.DEBUG)
+    await svc._close_attribution(
+        {"id": "rp_x", "merchant_domain": "brand.example", "reap_order_id": "",
+         "final_total_minor": 4500, "currency": "USD"}
+    )
+    await svc._close_attribution(
+        {"id": "rp_y", "merchant_domain": "brand.example", "reap_order_id": "ord_1",
+         "final_total_minor": 0, "currency": "USD"}
+    )
+    assert attribution.calls == []
+    assert sum("refusing to close a conversion" in r.getMessage() for r in caplog.records) == 2
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# 15. PARTNER IDS ARE VALIDATED WHERE THEY ARE STORED  (review P2-5, P2-6, P2-7, P2-9)
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.parametrize(
+    "field,bad",
+    [
+        ("create_checkout", "chk/../../admin"),
+        ("create_checkout", "chk?ownerId=someone-else"),
+        ("request_quote", "f1/../x"),
+    ],
+)
+async def test_a_partner_id_that_could_move_a_request_never_reaches_the_row(
+    field, bad, reap, attribution
+):
+    """STORED, THE ROW ENTERED 'awaiting_approval', AND THEN EVERY LATER POLL RAISED. `_path_id`
+    inside the client refuses such an id on its way into a URL path — by raising, out of
+    `advance`, for ever, because 'awaiting_approval' is exempt from the attempts counter. Caught
+    at WRITE time instead: one named failure, and the value is never stored."""
+    payload = _ok(dict(CHECKOUT_CREATED, id=bad)) if field == "create_checkout" \
+        else _ok(dict(QUOTE_200, id=bad))
+    setattr(reap, field, payload)
+    await _active_enrollment()
+    purchase_id = await _start()
+    await _step(purchase_id)
+    result = await _step(purchase_id)
+
+    assert result.state == "failed"
+    row = await _get(purchase_id)
+    assert row["last_error_code"] == "partner_id_malformed"
+    assert bad not in json.dumps(row, default=str)
+
+
+def test_a_partner_id_the_client_would_refuse_is_refused_here():
+    """PINNED TO THE CLIENT'S OWN RULE, not to a copy of it. If `rc._path_id` tightens, this
+    tightens with it; a second regex here would be a second rule, and the one that decides which
+    ids can be fetched is the client's."""
+    for bad in ["../../admin", "abc/def", "abc?x=1", "abc#frag", "a b", "a" * 65, ""]:
+        with pytest.raises(rc.ReapRequestError):
+            rc._path_id(bad, what="checkout")
+        assert svc._partner_id(bad, what="checkout") is None
+    assert svc._partner_id("chk_7f3a", what="checkout") == "chk_7f3a"
+
+
+async def test_a_malformed_id_already_on_the_row_fails_it_instead_of_raising(reap, attribution):
+    """Written before the write-time check existed, or by another writer. Without the read-side
+    check `rc.get_checkout` raises out of `advance` on every poll."""
+    purchase_id = await _start()
+    await _raw_state(purchase_id, "awaiting_approval")
+    await database.execute(
+        "UPDATE reap_agentic_purchases SET reap_checkout_id = 'chk/../../admin' WHERE id = :i",
+        {"i": purchase_id},
+    )
+    result = await _step(purchase_id)
+    assert result.state == "failed"
+    assert (await _get(purchase_id))["last_error_code"] == "partner_id_malformed"
+    assert reap.named("get_checkout") == []
+
+
+async def test_the_checkout_id_survives_a_no_hosted_action_failure(reap, attribution):
+    """P2-5. The checkout is REAL from the moment `create_checkout` returns 200. Dropping its id
+    on the way out left a live checkout at the partner with nothing in our storage pointing at
+    it — unfindable rather than merely unused."""
+    reap.create_checkout = _ok({k: v for k, v in CHECKOUT_CREATED.items() if k != "nextAction"})
+    await _active_enrollment()
+    purchase_id = await _start()
+    await _step(purchase_id)
+    result = await _step(purchase_id)
+
+    assert result.state == "failed"
+    row = await _get(purchase_id)
+    assert row["last_error_code"] == "checkout_no_hosted_action"
+    assert row["reap_checkout_id"] == "chk_7f3a"
+    assert row["reap_quote_id"] == "f1e2d3c4"
+    assert row["hosted_url"] is None
+
+
+async def test_a_hostile_url_arrives_as_a_client_refusal_not_as_a_missing_action(reap,
+                                                                                 attribution):
+    """THE TWO PATHS ARE DIFFERENT AND THE COMMENT USED TO CONFLATE THEM. A hostile
+    `nextAction.url` is refused INSIDE the client, which replaces the response with
+    `ok=False, error="hosted_url_not_allowed"` and DROPS `.data` — so it lands in the `not ok`
+    branch and the URL never reaches this module. `checkout_no_hosted_action` is the other thing:
+    a well-formed 200 with no action at all."""
+    reap.create_checkout = rc.ReapResponse(
+        ok=False, status=200, error="hosted_url_not_allowed"
+    )
+    await _active_enrollment()
+    purchase_id = await _start()
+    await _step(purchase_id)
+    result = await _step(purchase_id)
+    row = await _get(purchase_id)
+    assert result.state == "failed"
+    assert row["last_error_code"] == "hosted_url_not_allowed"
+    assert row["last_error_code"] != "checkout_no_hosted_action"
+    assert row["hosted_url"] is None
+
+
+async def test_the_enrollment_the_checkout_is_bound_to_is_written_on_the_row(reap, attribution):
+    """P2-7. The resolving step recorded whatever was active THEN. A buyer who re-enrolled since
+    has a different active row, and a purchase pointing at the old one names a card that did not
+    pay for it — while `create_checkout` was correctly sent the new one."""
+    first = await _active_enrollment(reap_id="11111111-1111-1111-1111-111111111111")
+    purchase_id = await _start()
+    await _step(purchase_id)
+    assert (await _get(purchase_id))["enrollment_id"] == first["id"]
+
+    second = await _active_enrollment(reap_id="22222222-2222-2222-2222-222222222222")
+    assert second["id"] != first["id"]
+    await _step(purchase_id)
+
+    row = await _get(purchase_id)
+    assert row["state"] == "awaiting_approval"
+    assert reap.named("create_checkout")[0]["enrollment_id"] == (
+        "22222222-2222-2222-2222-222222222222"
+    )
+    assert row["enrollment_id"] == second["id"], "the row must name the card that will pay"
+
+
+async def test_an_expired_quote_is_never_turned_into_a_checkout(reap, attribution):
+    """P2-9. `reap_quote_expires_at` was written and never read. A quote lives about five
+    minutes; one we can already see is dead is a round trip we know will fail."""
+    reap.request_quote = _ok(dict(QUOTE_200, expiresAt="2020-01-01T00:00:00Z"))
+    await _active_enrollment()
+    purchase_id = await _start()
+    await _step(purchase_id)
+    result = await _step(purchase_id)
+
+    assert result.outcome == "released"
+    assert result.state == "quoting"
+    assert result.last_error_code == "quote_expired"
+    assert result.next_poll_in_seconds == svc.POLL_INTERVALS["quoting"]
+    assert reap.named("create_checkout") == []
+    assert (await _get(purchase_id))["state"] == "quoting"
+
+
+async def test_a_quote_with_no_expiry_is_not_treated_as_expired(reap, attribution):
+    """CONTROL. The spec does not require `expiresAt`, and a caller that read a missing expiry as
+    "expired" would refuse every quote the partner sends without one."""
+    reap.request_quote = _ok({k: v for k, v in QUOTE_200.items() if k != "expiresAt"})
+    await _active_enrollment()
+    purchase_id = await _start()
+    await _step(purchase_id)
+    assert (await _step(purchase_id)).state == "awaiting_approval"
+
+
+async def test_a_quoting_row_with_no_active_enrollment_fails_without_calling_the_partner(
+    reap, attribution
+):
+    """A REAL GUARD, not a formality: without it the partner enrollment id is "" and the checkout
+    is either refused by the client's builder or — on any laxer builder — created bound to no
+    card at all. 'quoting' cannot legally go back to 'needs_enrollment', so this fails."""
+    purchase_id = await _start()
+    await _raw_state(purchase_id, "quoting")
+    result = await _step(purchase_id)
+    assert result.state == "failed"
+    assert (await _get(purchase_id))["last_error_code"] == "no_active_enrollment"
+    assert reap.calls == []
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# 16. THE BACKOFF ACTUALLY REACHES ITS CAP  (review P3-10)
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+
+
+def test_the_transport_backoff_accumulates_until_it_hits_the_cap():
+    """THE CAP USED TO BE DEAD CODE. A flat "interval × 2" tops out at 120 against a cap of 600,
+    so `min(120, 600)` was a comparison that could never bind — and the only test available
+    asserted `min(x, 600) <= 600`, which is true of every x. Asserted here as the real function's
+    OUTPUT SEQUENCE."""
+    seq = [svc.transport_backoff_seconds("resolving", n) for n in range(1, 8)]
+    assert seq == [120, 240, 480, 600, 600, 600, 600]
+    assert svc.MAX_BACKOFF_SECONDS in seq, "the cap is reachable"
+    assert [svc.transport_backoff_seconds("processing", n) for n in range(1, 6)] == [
+        30, 60, 120, 240, 480
+    ]
+
+
+def test_the_backoff_is_defined_for_a_missing_or_absurd_attempt_count():
+    """`attempts` is 0 on a row nothing has claimed yet, and the poller's own claim is what moves
+    it. A None, a string or a huge value must all produce a number, not an exception and not a
+    thousand-digit integer."""
+    for value in (None, 0, "", "nonsense", -5, 10 ** 6, True):
+        seconds = svc.transport_backoff_seconds("quoting", value)
+        assert isinstance(seconds, int)
+        assert svc.POLL_INTERVALS["quoting"] <= seconds <= svc.MAX_BACKOFF_SECONDS
+
+
+async def test_a_repeatedly_failing_row_backs_further_off_each_time(reap, attribution):
+    """End to end, through the ledger's own `attempts` counter — which is incremented by the
+    CLAIM, so this drives claims rather than setting the column."""
+    reap.resolve_our_row = _transport_resolution()
+    purchase_id = await _start()
+    seen = []
+    for _ in range(4):
+        claimed = await ledger.claim_due_purchases("w1", limit=5)
+        assert [c["id"] for c in claimed] == [purchase_id]
+        result = await svc.advance(purchase_id, "w1")
+        seen.append(result.next_poll_in_seconds)
+        await database.execute(
+            "UPDATE reap_agentic_purchases SET next_poll_at = datetime('now', '-5 seconds') "
+            "WHERE id = :i",
+            {"i": purchase_id},
+        )
+    assert seen == [120, 240, 480, 600]
+    assert (await _get(purchase_id))["state"] == "resolving"
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# 17. BUYER TEXT IS CLEANED BEFORE IT IS STORED OR SENT  (review P3-11)
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+
+
+async def test_a_bidi_override_is_stripped_from_a_name_before_anything_sees_it(reap,
+                                                                               attribution):
+    """U+202E RIGHT-TO-LEFT OVERRIDE inside `firstName` was stored verbatim and forwarded to the
+    partner, where it reverses the rendering of everything after it — on a shipping label, in a
+    confirmation email, and in our own owner view."""
+    await _active_enrollment()
+    purchase_id = await _start(
+        buyer=svc.BuyerContact(EMAIL, dict(ADDRESS, firstName="Ada\u202eelbaroved"))
+    )
+    stored = (await _get(purchase_id))["shipping_address"]
+    assert stored["firstName"] == "Adaelbaroved"
+    assert "\u202e" not in json.dumps(stored)
+
+    await _step(purchase_id)
+    sent = json.dumps(reap.named("request_quote") or [{}], default=str)
+    assert "\u202e" not in sent
+
+
+@pytest.mark.parametrize("field", ["firstName", "lastName", "addressLine1", "city"])
+async def test_control_characters_are_stripped_from_every_address_field(field, reap):
+    purchase_id = await _start(
+        buyer=svc.BuyerContact(EMAIL, dict(ADDRESS, **{field: "A\u200bB\u0007C"}))
+    )
+    assert (await _get(purchase_id))["shipping_address"][field] == "ABC"
+
+
+async def test_an_address_that_is_only_format_characters_is_refused(reap):
+    """Stripping can empty a field, and an empty required field is the client's own refusal."""
+    with pytest.raises(svc.PurchaseRefused) as exc:
+        await _start(buyer=svc.BuyerContact(EMAIL, dict(ADDRESS, city="\u200b\u202e")))
+    assert exc.value.reason == "invalid_address"
+    assert await _count() == 0
+
+
+async def test_an_email_carrying_a_format_character_is_cleaned_not_stored_as_sent(reap):
+    """STRIP AND THEN REFUSE THE REMAINDER, here as everywhere else. `ada<RLO>@example.test`
+    cleans to a perfectly ordinary address, and refusing the purchase over an invisible character
+    somebody's web form inserted helps nobody. What must not happen is the override reaching
+    storage or the partner."""
+    purchase_id = await _start(
+        buyer=svc.BuyerContact("ada\u202e@example.test", dict(ADDRESS))
+    )
+    assert (await _get(purchase_id))["buyer_email"] == EMAIL
+
+
+async def test_an_email_that_is_not_an_address_once_cleaned_is_refused(reap):
+    with pytest.raises(svc.PurchaseRefused) as exc:
+        await _start(buyer=svc.BuyerContact("\u202e\u200b", dict(ADDRESS)))
+    assert exc.value.reason == "invalid_request"
+    assert await _count() == 0
+
+
+async def test_the_cleaned_value_is_the_one_that_is_validated_and_sent(reap, attribution):
+    """CONTROL for the ordering. Cleaning AFTER validation would mean we validated one string and
+    sent another; cleaning before means the stored value, the validated value and the value on
+    the wire are the same string."""
+    await _active_enrollment()
+    purchase_id = await _start(
+        buyer=svc.BuyerContact(EMAIL, dict(ADDRESS, addressLine1="900\u200b Brannan St"))
+    )
+    stored = (await _get(purchase_id))["shipping_address"]["addressLine1"]
+    await _step(purchase_id)   # resolving -> quoting (the buyer is already enrolled)
+    await _step(purchase_id)   # quoting: this is the step that quotes
+    assert stored == "900 Brannan St"
+    assert reap.named("request_quote")[0]["shipping_address"]["addressLine1"] == stored
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# 18. THE GUARDS THAT ONLY MATTER MID-STEP
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+#
+# Three mutants survived the first sweep of this fix, and all three for the same reason: a
+# NEIGHBOURING guard was catching the case the test exercised, so removing the guard under test
+# changed nothing observable. Each test below removes that cover.
+#
+# This is the shape the repo has been bitten by before — a guard whose test passes for the wrong
+# reason is not a tested guard. The cover here is legitimate defence in depth, which is exactly
+# why it has to be stepped around rather than deleted.
+
+
+async def test_the_claim_is_re_checked_between_the_quote_and_the_checkout(reap, attribution):
+    """M25. The re-read at the TOP of the quoting step catches the ordinary loser, so a test that
+    starts with the lease already gone cannot see this one. A quote takes 13–19 SECONDS — the
+    longest window in the whole machine, and comfortably long enough for a lease to age out and
+    be requeued — so the claim moves INSIDE `request_quote` here.
+
+    What it costs to get wrong: a live checkout at Reap, bound to the buyer's enrolled card, that
+    no row of ours references and that the fence will then refuse to record."""
+    await _active_enrollment()
+    purchase_id = await _start()
+    await _step(purchase_id)                      # -> quoting
+    await _claim(purchase_id, "w1")
+
+    async def _steal_then_quote(**kwargs):
+        await database.execute(
+            "UPDATE reap_agentic_purchases SET claimed_by = 'worker-b' WHERE id = :i",
+            {"i": purchase_id},
+        )
+        return _ok(QUOTE_200)
+
+    reap.request_quote = _steal_then_quote
+    reap.calls.clear()
+
+    result = await svc.advance(purchase_id, "w1")
+
+    assert result.outcome == "lost_claim"
+    assert reap.named("create_checkout") == [], (
+        "the lease moved during the quote; no checkout may be created against it"
+    )
+    row = await _get(purchase_id)
+    assert row["state"] == "quoting"
+    assert row["reap_checkout_id"] is None
+    assert row["reap_quote_id"] is None
+
+
+async def test_the_claim_is_re_checked_before_the_enrollment_is_minted(reap, attribution):
+    """M27. `upsert_pending_enrollment` and `create_enrollment` sit AFTER the resolve, and the
+    resolve is three partner round trips (search → details → variant). The top-of-step re-read
+    cannot speak for what is true that much later, so the claim moves inside the resolve here.
+
+    Both writes are UNFENCED — the ledger's enrollment functions take no holder — so this re-read
+    is the only thing standing in front of them. Getting it wrong minted an enrollment row for
+    the buyer and replaced the real holder's live hosted link with one nobody will be sent to."""
+    purchase_id = await _start()
+    await _step(purchase_id, "worker-a")          # the holder reaches needs_enrollment
+    held = await database.fetch_one(
+        "SELECT * FROM reap_agentic_enrollments WHERE buyer_ref = 'bref_alice'"
+    )
+    await _raw_state(purchase_id, "resolving")
+    await _claim(purchase_id, "w1")
+
+    async def _steal_then_resolve(**kwargs):
+        await database.execute(
+            "UPDATE reap_agentic_purchases SET claimed_by = 'worker-b' WHERE id = :i",
+            {"i": purchase_id},
+        )
+        return _resolved()
+
+    reap.resolve_our_row = _steal_then_resolve
+    reap.create_enrollment = _ok(
+        dict(ENROLLMENT_CREATED, nextAction=dict(ENROLLMENT_CREATED["nextAction"],
+                                                 url="https://pay.prava.space/enroll/STOLEN"))
+    )
+    reap.calls.clear()
+
+    result = await svc.advance(purchase_id, "w1")
+
+    assert result.outcome == "lost_claim"
+    assert reap.named("create_enrollment") == []
+    rows = await database.fetch_all("SELECT * FROM reap_agentic_enrollments")
+    assert len(rows) == 1, "no second enrollment row may be minted by a worker that lost"
+    assert rows[0]["hosted_url"] == held["hosted_url"]
+    assert "STOLEN" not in str(rows[0]["hosted_url"])
+
+
+async def test_the_edge_is_withheld_by_complete_itself_not_only_by_the_closer(
+    reap, attribution, caplog
+):
+    """M29. `_close_attribution` carries its own refusal for a keyless or amountless edge, and
+    that second layer was silently doing all the work: deleting the decision in `_complete` left
+    `attribution.calls == []` true anyway.
+
+    The two layers log DIFFERENT lines, so the test asserts which one fired. The first layer is
+    the one that matters operationally — it is what names `final_amount_missing` on the row — and
+    the second exists only because the cost of being wrong is a permanent zero-GMV edge that no
+    later close can replace."""
+    caplog.set_level(logging.DEBUG)
+    reap.get_checkout = _ok({k: v for k, v in CHECKOUT_COMPLETED.items() if k != "finalAmount"})
+    purchase_id = await _to_awaiting(reap)
+    await _step(purchase_id)
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("no attribution edge written" in m for m in messages), (
+        "`_complete` must be the thing that declines to open an edge it cannot key"
+    )
+    assert not any("refusing to close a conversion" in m for m in messages), (
+        "the closer's own guard must not be what caught this — it is the backstop"
+    )
+    assert attribution.calls == []
+    assert (await _get(purchase_id))["last_error_code"] == "final_amount_missing"

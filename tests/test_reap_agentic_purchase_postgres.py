@@ -104,7 +104,10 @@ ENROLLMENT_ACTIVE = {
 }
 QUOTE_200 = {
     "id": "f1e2d3c4",
-    "expiresAt": "2026-09-17T20:35:00Z",
+    # FAR future on purpose: the quoting step now REFUSES to create a checkout from a quote it
+    # can already see is dead (P2-9), so a fixture with a past expiry would refuse every happy
+    # path. The expired case has its own test.
+    "expiresAt": "2099-01-01T00:00:00Z",
     "amountBreakdown": {
         "itemsSubtotal": {"amount": 42.50, "currency": "USD"},
         "shipping": {"amount": 1.00, "currency": "USD"},
@@ -810,3 +813,288 @@ async def test_no_rail_log_record_carries_the_buyers_details(reap, attribution, 
     for secret in PII_STRINGS:
         assert secret not in haystack
     assert "reap_agentic" in haystack
+
+
+# ── 5. the review's four blocking findings, on the production dialect ────────────────────────
+#
+# Each of these is here rather than only on SQLite because the reviewer's mutants for them
+# survived BOTH arms, and because the money checks have to hold where the money is.
+
+
+def _quote(**breakdown_over):
+    payload = json.loads(json.dumps(QUOTE_200))
+    for key, value in breakdown_over.items():
+        if value is None:
+            payload["amountBreakdown"].pop(key, None)
+        else:
+            payload["amountBreakdown"][key] = value
+    return payload
+
+
+def _usd(amount):
+    return {"amount": amount, "currency": "USD"}
+
+
+async def test_a_quote_must_price_the_whole_quantity(reap):
+    """QUANTITY > 1 — the case a check written as `subtotal == our_price_minor` passes on every
+    quantity-1 test in either suite, while buying three bottles for the price of one."""
+    reap.request_quote = _ok(_quote(itemsSubtotal=_usd(42.50), finalAmount=_usd(45.00)))
+    await _active_enrollment()
+    purchase_id = await _start(quantity=3)
+    for _ in range(3):
+        await _step(purchase_id)
+    row = await _get(purchase_id)
+    assert row["state"] == "refused"
+    assert row["refusal_reason"] == "price_changed"
+    assert row["last_error_code"] == "quote_items_subtotal_mismatch"
+    assert reap.named("create_checkout") == []
+    assert row["buyer_email"] is None and row["shipping_address"] is None
+
+
+async def test_the_right_quantity_at_the_right_price_is_accepted(reap):
+    """CONTROL: the multiplication must accept the correct number too."""
+    reap.request_quote = _ok(_quote(itemsSubtotal=_usd(127.50), finalAmount=_usd(130.00)))
+    await _active_enrollment()
+    purchase_id = await _start(quantity=3)
+    # two steps: the buyer is already enrolled, so resolving -> quoting -> awaiting_approval.
+    for _ in range(2):
+        await _step(purchase_id)
+    row = await _get(purchase_id)
+    assert row["state"] == "awaiting_approval"
+    assert row["quoted_total_minor"] == 13000
+
+
+async def test_a_second_currency_quote_refuses_and_stores_no_totals(reap):
+    """A WHOLLY-EUR QUOTE AGAINST A USD ROW. On the old code every amount came back None and the
+    transition's `COALESCE(:col, col)` swallowed all four — a live EUR checkout with NULL totals.
+    Asserted on Postgres because the COALESCE that did the swallowing is the Postgres statement,
+    jsonb casts and all."""
+    reap.request_quote = _ok(_quote(
+        itemsSubtotal={"amount": 42.50, "currency": "EUR"},
+        shipping={"amount": 1.00, "currency": "EUR"},
+        tax={"amount": {"amount": 1.50, "currency": "EUR"}, "includedInPrices": False},
+        finalAmount={"amount": 45.00, "currency": "EUR"},
+    ))
+    await _active_enrollment()
+    purchase_id = await _start()
+    for _ in range(3):
+        await _step(purchase_id)
+    row = await _get(purchase_id)
+    assert row["state"] == "refused"
+    assert row["last_error_code"] == "quote_currency_mismatch"
+    assert row["quoted_total_minor"] is None
+    assert row["shipping_minor"] is None
+    assert row["tax_minor"] is None
+    assert reap.named("create_checkout") == []
+
+
+async def test_zero_shipping_is_an_amount_on_this_dialect_too(reap):
+    """The repo's one converter refuses zero, so shipping and tax go through a sibling that does
+    not. Free shipping is the commonest quote there is; if this refused, almost everything
+    would."""
+    reap.request_quote = _ok(_quote(
+        shipping=_usd(0.00),
+        tax={"amount": _usd(0.00), "includedInPrices": True},
+        finalAmount=_usd(42.50),
+    ))
+    await _active_enrollment()
+    purchase_id = await _start()
+    # two steps: the buyer is already enrolled, so resolving -> quoting -> awaiting_approval.
+    for _ in range(2):
+        await _step(purchase_id)
+    row = await _get(purchase_id)
+    assert row["state"] == "awaiting_approval"
+    assert row["shipping_minor"] == 0 and row["tax_minor"] == 0
+
+
+async def test_the_loser_calls_the_partner_not_at_all_from_a_second_connection(reap):
+    """P1-2 ACROSS TWO REAL BACKEND CONNECTIONS. The other pod takes the claim on its own asyncpg
+    connection and commits; our worker then runs a full step in 'quoting' and must make NO
+    partner call — the old code ran resolve → request_quote → create_checkout and left a live
+    checkout at Reap, bound to the buyer's enrollment, that no row references."""
+    import services.reap_agentic_purchase as svc
+
+    await _active_enrollment()
+    purchase_id = await _start()
+    await _step(purchase_id)                       # -> quoting
+    await _claim(purchase_id, "worker-a")
+    before = await _get(purchase_id)
+
+    conn = await _raw_connection()
+    try:
+        rows = await conn.fetch(
+            "UPDATE reap_agentic_purchases SET claimed_by = $1 WHERE id = $2 AND claimed_by = $3 "
+            "RETURNING id",
+            "worker-b", purchase_id, "worker-a",
+        )
+        assert len(rows) == 1
+    finally:
+        await conn.close()
+
+    reap.calls.clear()
+    result = await svc.advance(purchase_id, "worker-a")
+
+    assert result.outcome == "lost_claim"
+    assert reap.calls == []
+    after = await _get(purchase_id)
+    assert after["state"] == "quoting"
+    assert after["reap_quote_id"] is None
+    assert after["reap_checkout_id"] is None
+    assert after["updated_at"] == before["updated_at"]
+
+
+async def test_the_loser_in_resolving_writes_nothing_to_the_enrollments_table(reap):
+    """`upsert_pending_enrollment` takes no holder, so these are UNFENCED writes and the re-read
+    is all there is. Two real connections."""
+    import services.reap_agentic_purchase as svc
+    from db.database import database
+
+    purchase_id = await _start()
+    await _claim(purchase_id, "worker-a")
+    conn = await _raw_connection()
+    try:
+        await conn.execute(
+            "UPDATE reap_agentic_purchases SET claimed_by = 'worker-b' WHERE id = $1", purchase_id
+        )
+    finally:
+        await conn.close()
+
+    reap.calls.clear()
+    assert (await svc.advance(purchase_id, "worker-a")).outcome == "lost_claim"
+    assert reap.calls == []
+    count = await database.fetch_one("SELECT COUNT(*) AS n FROM reap_agentic_enrollments")
+    assert int(count["n"]) == 0
+
+
+async def test_a_claim_lost_mid_step_is_still_caught_by_the_fence(reap):
+    """PAST the re-read: the claim moves on another connection INSIDE the partner call, so only
+    the `AND claimed_by = :worker_id` conjunct in the UPDATE can catch it. This is the test that
+    dies when the fence's None is ignored."""
+    import services.reap_agentic_purchase as svc
+
+    purchase_id = await _start()
+    await _claim(purchase_id, "w1")
+
+    async def _steal(**kwargs):
+        conn = await _raw_connection()
+        try:
+            await conn.execute(
+                "UPDATE reap_agentic_purchases SET claimed_by = 'worker-b' WHERE id = $1",
+                purchase_id,
+            )
+        finally:
+            await conn.close()
+        return _resolved()
+
+    reap.resolve_our_row = _steal
+    result = await svc.advance(purchase_id, "w1")
+    assert result.outcome == "lost_claim"
+    row = await _get(purchase_id)
+    assert row["state"] == "resolving"
+    assert row["reap_variant_id"] is None
+    assert row["claimed_by"] == "worker-b"
+
+
+async def test_a_completed_checkout_with_no_order_id_does_not_complete(reap, attribution):
+    """P1-3. The money is real; a row that says 'completed' while naming no order puts the GMV
+    nowhere at all — the closer drops an empty `external_order_id` with a warning."""
+    reap.get_checkout = _ok({k: v for k, v in CHECKOUT_COMPLETED.items() if k != "orderId"})
+    purchase_id = await _start()
+    for _ in range(4):
+        result = await _step(purchase_id)
+    row = await _get(purchase_id)
+    assert result.state == "processing"
+    assert row["state"] == "processing" and row["state"] != "completed"
+    assert row["last_error_code"] == "completed_without_order_id"
+    assert row["terminal_at"] is None
+    assert attribution.calls == []
+
+
+async def test_a_completed_order_with_no_usable_amount_writes_no_edge(reap, attribution):
+    """P1-4. `close_external_order_conversion` is idempotent on `(merchant, external_order_id)`
+    via ON CONFLICT DO NOTHING, so a None-gross edge is PERMANENT and no later close can replace
+    it. The row completes — the order exists — and says why, leaving the slot free."""
+    reap.get_checkout = _ok({k: v for k, v in CHECKOUT_COMPLETED.items() if k != "finalAmount"})
+    purchase_id = await _start()
+    for _ in range(4):
+        await _step(purchase_id)
+    row = await _get(purchase_id)
+    assert row["state"] == "completed"
+    assert row["reap_order_id"] == "ord_991"
+    assert row["final_total_minor"] is None
+    assert row["last_error_code"] == "final_amount_missing"
+    assert attribution.calls == []
+
+
+async def test_a_malformed_partner_id_never_reaches_a_varchar_column(reap):
+    """P2-6, on the dialect where the column is a real VARCHAR(128): `chk/../../admin` used to be
+    stored, the row entered 'awaiting_approval', and every later poll raised out of `advance`
+    when the client validated the id into a URL path — unbounded, because that state is exempt
+    from the attempts counter."""
+    reap.create_checkout = _ok(dict(CHECKOUT_CREATED, id="chk/../../admin"))
+    await _active_enrollment()
+    purchase_id = await _start()
+    for _ in range(3):
+        await _step(purchase_id)
+    row = await _get(purchase_id)
+    assert row["state"] == "failed"
+    assert row["last_error_code"] == "partner_id_malformed"
+    assert row["reap_checkout_id"] is None
+
+
+async def test_an_expired_quote_is_never_turned_into_a_checkout(reap):
+    """P2-9."""
+    reap.request_quote = _ok(dict(QUOTE_200, expiresAt="2020-01-01T00:00:00Z"))
+    await _active_enrollment()
+    purchase_id = await _start()
+    await _step(purchase_id)
+    result = await _step(purchase_id)
+    assert result.outcome == "released"
+    assert result.last_error_code == "quote_expired"
+    assert reap.named("create_checkout") == []
+    assert (await _get(purchase_id))["state"] == "quoting"
+
+
+async def test_the_backoff_accumulates_against_the_ledgers_own_attempts_counter(reap):
+    """P3-10 end to end. `attempts` is incremented by the CLAIM statement, so this drives real
+    claims on real Postgres rather than setting the column, and reads the sequence back out of
+    the scheduled `next_poll_at`."""
+    import services.reap_agentic_purchase as svc
+
+    reap.resolve_our_row = _transport_resolution()
+    purchase_id = await _start()
+    seen = []
+    for _ in range(4):
+        claimed = await ledger_module().claim_due_purchases("w1", limit=5)
+        assert [c["id"] for c in claimed] == [purchase_id]
+        seen.append((await svc.advance(purchase_id, "w1")).next_poll_in_seconds)
+        await _raw(
+            "UPDATE reap_agentic_purchases SET next_poll_at = clock_timestamp() - "
+            "INTERVAL '5 seconds' WHERE id = :i",
+            {"i": purchase_id},
+        )
+    assert seen == [120, 240, 480, 600]
+    assert svc.MAX_BACKOFF_SECONDS in seen, "the cap is reachable"
+
+
+def ledger_module():
+    import db.reap_agentic_ledger as ledger
+
+    return ledger
+
+
+async def test_a_bidi_override_never_reaches_the_jsonb_column(reap):
+    """P3-11 on the dialect that actually stores jsonb. U+202E inside `firstName` reverses the
+    rendering of everything after it — on a shipping label and in our own owner view."""
+    import services.reap_agentic_purchase as svc
+    from db.database import database
+
+    purchase_id = await _start(
+        buyer=svc.BuyerContact(EMAIL, dict(ADDRESS, firstName="Ada\u202eelbaroved"))
+    )
+    raw = await database.fetch_one(
+        "SELECT shipping_address FROM reap_agentic_purchases WHERE id = :i", {"i": purchase_id}
+    )
+    assert "\u202e" not in raw["shipping_address"]
+    assert "202e" not in raw["shipping_address"].lower()
+    assert json.loads(raw["shipping_address"])["firstName"] == "Adaelbaroved"

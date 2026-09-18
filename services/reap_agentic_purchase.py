@@ -23,21 +23,38 @@ poller (a later package) does:
 A step never loops and never sleeps. It makes at most the calls one state needs, writes at most
 one transition, and returns.
 
-── THE FENCE, AND WHY THERE IS NO PRE-CHECK ────────────────────────────────────────────────
+── TWO DIFFERENT GUARDS, AND THEY PROTECT DIFFERENT THINGS ─────────────────────────────────
 
-EVERY write here goes through `ledger.transition_as_holder(..., worker_id)` or
-`ledger.release_claim(id, worker_id)`, both of which carry `AND claimed_by = :worker_id`. When
-either answers None the step ends as `AdvanceResult(outcome="lost_claim")` and NOTHING else
-happens. `ledger.transition` — the unfenced form — is never called from this module, and a
-reviewer can check that with one grep.
+1. THE FENCE, over our DATABASE. Every write to the purchases table goes through
+   `ledger.transition_as_holder(..., worker_id)`; every release goes through
+   `ledger.release_claim(id, worker_id)`. Both carry `AND claimed_by = :worker_id`, so when
+   either answers None the step ends as `AdvanceResult(outcome="lost_claim")` and NO FURTHER
+   WRITE HAPPENS. `ledger.transition` — the unfenced form — is never called from this module,
+   and a reviewer can check that with one grep. This guard is AUTHORITATIVE: it is a conjunct
+   inside the UPDATE, so nothing can land between the check and the write.
 
-There is deliberately NO `if row["claimed_by"] != worker_id: return lost_claim` at the top, even
-though it would save a partner round trip in the lost case. A pre-check reads as the fence and
-is not one: it is a read-then-write across a gap, so it can pass and the write can still land
-after the lease moved. Worse, having one would make the REAL fence untestable — a test that
-proves "the loser writes nothing" would be proving the pre-check, and deleting `worker_id` from
-the transition call would survive it. The fence is the conjunct in the UPDATE, so the fence is
-what the tests exercise.
+2. THE OWNERSHIP RE-READ, over the PARTNER. `_still_ours` re-reads the row and requires that we
+   still hold the claim AND that the state has not moved, immediately before the first partner
+   call of a step and again immediately before every call or enrollment-table write that has a
+   SIDE EFFECT (`create_enrollment`, `request_quote`, `create_checkout`,
+   `upsert_pending_enrollment`, `mark_enrollment_active`, `mark_enrollment_dead`).
+
+   THIS SECOND GUARD IS NOT A FENCE AND MUST NOT BE READ AS ONE. It is read-then-act across a
+   gap: a claim that moves inside that gap is not caught, and the partner call still happens.
+   What it buys is that the ORDINARY lost race — the lease was already gone when the step began
+   — costs nothing at the partner. An earlier revision of this docstring claimed the fence alone
+   meant "NOTHING else happens" after a lost claim. That was FALSE and it was measured: a worker
+   that had lost the lease in 'quoting' still ran resolve → quote → create_checkout, leaving a
+   live checkout at Reap bound to the buyer's enrollment and referenced by no row of ours, and a
+   worker that had lost it in 'resolving' still minted an enrollment row and overwrote the real
+   holder's hosted link — both of those are UNFENCED enrollment-table writes, because the ledger
+   offers no holder parameter on `upsert_pending_enrollment`.
+
+   THE RESIDUAL WINDOW IS REAL AND IT IS NOT CLOSED HERE. Closing it needs either a holder
+   conjunct on the enrollment writes or an outbox, both of which are ledger changes. What is
+   true today: the ordinary case makes no partner call, and a checkout created inside the window
+   is never handed to a buyer, because the URL only reaches them through a row that the fence
+   refused to write.
 
 A lost claim is never an error and never a reason to retry the same write. See
 `transition_as_holder`'s docstring: the unfenced bulk sweeps (`expire_overdue_purchases`,
@@ -67,8 +84,10 @@ has already emptied of both.
 ── FAIL CLOSED ─────────────────────────────────────────────────────────────────────────────
 
   * The dial `REAP_AGENTIC_ENABLED` defaults OFF and an unconfigured client refuses.
-  * A price that does not agree, in amount AND currency, REFUSES. A price we cannot verify at
-    all refuses too — "no stored price to compare against" is not agreement.
+  * A price that does not agree, in amount AND currency, REFUSES — and the QUOTE is checked as
+    well as the unit price, because the quote is the number that decides the charge. See
+    `verify_quote`. A price we cannot verify at all refuses too: "no number to compare against"
+    is not agreement, and a `None` is never COALESCEd into "fine".
   * A hosted URL that `rc.hosted_action` will not vouch for means there is nowhere to send the
     buyer, so the purchase fails rather than entering a state whose whole content is a link.
   * An unrecognised partner status NEVER advances. It releases and says so.
@@ -85,9 +104,10 @@ from __future__ import annotations
 import logging
 import os
 import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -105,9 +125,12 @@ __all__ = [
     "POLL_INTERVALS",
     "PurchaseRefused",
     "PurchaseRow",
+    "QuoteCheck",
     "advance",
     "is_enabled",
     "start_purchase",
+    "transport_backoff_seconds",
+    "verify_quote",
 ]
 
 
@@ -151,12 +174,43 @@ POLL_INTERVALS: Dict[str, int] = {
     "processing": 15,
 }
 
-#: A transport failure is not a schedule: it is an unknown. The state's own interval, DOUBLED,
-#: capped here. The cap matters more than the doubling — without it a state with a long interval
-#: plus repeated failures walks off into hours, and `expire_overdue_purchases` would terminate
-#: the purchase before the next poll ever ran.
+#: A transport failure is not a schedule: it is an unknown. The state's own interval, DOUBLED on
+#: the first failure and doubled AGAIN for each consecutive one, capped at `MAX_BACKOFF_SECONDS`.
+#:
+#: THE ACCUMULATION IS THE POINT AND IT USED TO BE MISSING. A flat "interval × 2" made the cap
+#: DEAD CODE: the largest interval is 60, so the worst backoff this module could ever produce was
+#: 120 against a cap of 600, and `min(120, 600)` is a comparison that can never bind. A partner
+#: outage then meant every worker returning at the ordinary doubled cadence forever. With the
+#: accumulation, `resolving` walks 120 → 240 → 480 → 600 → 600 and the cap is what stops it.
+#:
+#: THE COUNTER IS THE LEDGER'S `attempts`, which counts CLAIMS in 'resolving', 'quoting' and
+#: 'processing' and is deliberately EXEMPT in the two human-wait states. So the accumulation
+#: works in exactly the three states where a claim means we tried something, and the two waiting
+#: states stay at interval × 2 — they are bounded by `expire_overdue_purchases` on a clock
+#: instead, which is the right instrument for waiting on a person. Stated rather than hidden:
+#: `transport_backoff_seconds('awaiting_approval', n)` is 60 for every n.
 TRANSPORT_BACKOFF_MULTIPLIER = 2
 MAX_BACKOFF_SECONDS = 600
+
+#: Exponent ceiling before the multiplication, so a pathological `attempts` cannot build a
+#: thousand-digit integer on the way to being capped at 600.
+_MAX_BACKOFF_DOUBLINGS = 16
+
+
+def transport_backoff_seconds(state: str, attempts: Any = None) -> int:
+    """Seconds to wait after a transport failure in `state`, given the row's `attempts`.
+
+    A module function rather than an expression inlined in `_release` so the SEQUENCE it produces
+    can be tested directly — the old cap was untestable because the only test available asserted
+    `min(x, 600) <= 600`, which is true of every x.
+    """
+    base = POLL_INTERVALS[state]
+    try:
+        tried = int(attempts)
+    except (TypeError, ValueError):
+        tried = 1
+    doublings = min(max(tried, 1), _MAX_BACKOFF_DOUBLINGS)
+    return int(min(base * (TRANSPORT_BACKOFF_MULTIPLIER ** doublings), MAX_BACKOFF_SECONDS))
 
 #: The two states that wait on a PERSON, where "immediately due" is meaningless. On entering one
 #: of these the next poll is scheduled a full interval out; on entering any other state it is due
@@ -296,12 +350,57 @@ class AdvanceResult:
 
 
 def _now() -> datetime:
+    """AWARE UTC.
+
+    A MUTATION THAT DROPS THE tzinfo IS INERT HERE, AND THAT IS WORTH SAYING RATHER THAN TESTING.
+    Every datetime this module produces reaches the database through `ledger._bind_dt`, which
+    reads a NAIVE datetime as UTC by rule — so `datetime.now()` and `datetime.now(timezone.utc)`
+    store the same instant, and no test in this package can tell them apart. The guard that makes
+    that true is the ledger's, and `test_a_naive_datetime_is_read_as_utc_not_as_local_time` (in
+    the ledger's own suite, under a shifted process timezone) is what kills its removal. Writing
+    a test here would be a test of the ledger wearing this module's name.
+    """
     return datetime.now(timezone.utc)
 
 
 def _cap(value: Any) -> Optional[str]:
+    """Trim an OUR-VOCABULARY code to the column width. NOT for a partner id — see `_partner_id`.
+
+    This used to be applied to partner ids too, which is how `"chk/../../admin"` reached
+    `reap_checkout_id`: the row entered 'awaiting_approval' and every later poll then raised
+    `ReapRequestError` out of `advance` when the client validated the id on its way into a URL
+    path — unbounded, because 'awaiting_approval' is exempt from the attempts counter.
+    """
     text = str(value or "").strip()
     return text[:_CODE_MAX] or None
+
+
+def _partner_id(value: Any, *, what: str, uuid: bool = False) -> Optional[str]:
+    """A partner id we are about to STORE, validated by THE CLIENT'S OWN RULE, or None.
+
+    `rc._path_id` is the function that will later validate this same value on its way into a URL
+    path, so it is the rule that matters; a second copy here would be a second rule, and the one
+    that decides is the client's. Calling it at WRITE time is what turns "every later poll
+    raises" into "this purchase fails once, with a name".
+
+    Private, and used deliberately: if the client tightens its id rule, this tightens with it.
+    `test_a_partner_id_the_client_would_refuse_is_refused_here` pins the two together.
+    """
+    try:
+        return rc._path_id(value, what=what, uuid=uuid)
+    except rc.ReapRequestError:
+        return None
+
+
+#: An order id is the ONE partner id this module never puts in a URL — it goes to the attribution
+#: ledger as an opaque key — so it gets its own, wider rule rather than the path-parameter one.
+#: Still an allowlist: it becomes part of an idempotency key on `(merchant, external_order_id)`.
+_ORDER_ID_RE = re.compile(r"^[A-Za-z0-9_:.-]{1,128}$")
+
+
+def _order_id(value: Any) -> Optional[str]:
+    text = str(value or "").strip()
+    return text if _ORDER_ID_RE.match(text) else None
 
 
 def _is_transport(code: Any) -> bool:
@@ -406,6 +505,67 @@ def _amount_minor(pair: Optional[Tuple[float, str]], currency: Any) -> Optional[
     return ledger.amount_minor_or_none(_major_text(amount), ours)
 
 
+def _money(node: Any) -> Optional[Tuple[Decimal, str]]:
+    """`{"amount": 45.00 | "45.00", "currency": "USD"}` → `(Decimal("45.00"), "USD")`, or None.
+
+    WHY NOT `rc.quote_total` / `rc._price_of` FOR EVERY FIELD. Those refuse anything that is not
+    a JSON number, and this partner has been observed sending decimal STRINGS in other fields of
+    the same API. A reader that answers None for `"45.00"` turns a perfectly good quote into
+    `price_unverifiable`, which is safe but useless. `rc.quote_total` is still consulted in
+    `verify_quote` as a cross-check on the one field it does read.
+
+    DECIMAL, NEVER FLOAT, and the conversion goes through `_major_text` so a float is read via
+    its shortest round-tripping repr. `bool` is refused explicitly because `isinstance(True, int)`
+    is True in Python and a boolean would otherwise become `Decimal(1)`.
+    """
+    block = node if isinstance(node, dict) else {}
+    text = _major_text(block.get("amount"))
+    if text is None:
+        return None
+    try:
+        amount = Decimal(text)
+    except (InvalidOperation, ValueError):
+        return None
+    if not amount.is_finite():
+        return None
+    return amount, str(block.get("currency") or "").strip().upper()
+
+
+def _positive_minor(amount: Decimal, currency: Any) -> Optional[int]:
+    """A POSITIVE major-unit Decimal → integer minor units, through the repo's ONE converter."""
+    return ledger.amount_minor_or_none(amount, str(currency or "").strip().upper())
+
+
+def _component_minor(amount: Decimal, currency: Any) -> Optional[int]:
+    """A NON-NEGATIVE breakdown component (shipping, tax) → integer minor units, or None.
+
+    A SECOND CONVERTER, AND THE REASON IS ONE CHARACTER WIDE. `major_to_minor` — the repo's one
+    converter, which this module uses everywhere else through `_positive_minor` — refuses zero:
+    `if not (0 < scaled <= MAX_AMOUNT_MINOR)`. That is right for a spend and wrong for a
+    breakdown component, because FREE SHIPPING IS `0.00` and so is tax in most of the US. Using
+    it for shipping would answer None for the commonest quote there is, and None means
+    `price_unverifiable`, so every zero-shipping purchase would refuse.
+
+    Everything else about the policy is identical and deliberately copied rather than relaxed:
+    exact decimals only (an amount with more places than the currency has is REFUSED, not
+    rounded), the same ceiling, and a NEGATIVE component is still refused — a negative shipping
+    line is a discount wearing the wrong field name, and it must not quietly reduce the total we
+    reconcile against.
+    """
+    exponent = _exponent(currency)
+    try:
+        scaled = amount * (Decimal(10) ** exponent)
+    except (InvalidOperation, ValueError):
+        return None
+    from services.reap_webhooks import MAX_AMOUNT_MINOR
+
+    if not (0 <= scaled <= MAX_AMOUNT_MINOR):
+        return None
+    if scaled != scaled.to_integral_value():
+        return None
+    return int(scaled)
+
+
 def _flat_amount(node: Any) -> Optional[Tuple[float, str]]:
     """`{"amount": 152.60, "currency": "USD"}` → `(152.6, "USD")`.
 
@@ -500,6 +660,134 @@ def _price_verdict(resolution: Any, row: Mapping[str, Any]) -> Optional[str]:
     return None
 
 
+#: `finalAmount` may legitimately differ from `subtotal + shipping + tax` by one minor unit:
+#: the partner rounds a percentage tax once, at the end, and our reconstruction rounds the same
+#: number independently. ONE unit, not "about right" — a discrepancy of two is a breakdown that
+#: does not describe the number being charged, and this is the last place anything looks.
+QUOTE_RECONCILE_TOLERANCE_MINOR = 1
+
+
+@dataclass(frozen=True)
+class QuoteCheck:
+    """The verdict on one quote, plus the amounts it proved. Never carries partner text."""
+
+    ok: bool
+    refusal_reason: Optional[str] = None
+    last_error_code: Optional[str] = None
+    total_minor: Optional[int] = None
+    subtotal_minor: Optional[int] = None
+    shipping_minor: Optional[int] = None
+    tax_minor: Optional[int] = None
+
+
+def verify_quote(payload: Any, row: Mapping[str, Any]) -> QuoteCheck:
+    """Does this quote describe the purchase we opened, at the price we opened it at?
+
+    ── WHY THIS EXISTS, WHICH IS A DEFECT THIS PACKAGE SHIPPED ─────────────────────────────
+
+    The first cut checked the RESOLVED UNIT PRICE against `our_price_minor` and then stored the
+    quote's totals without comparing them to anything. The unit price is not the charge. Three
+    measured consequences, all of which ended in 'awaiting_approval' with a LIVE hosted link in
+    front of a buyer:
+
+      * unit 42.50 verified, quote `finalAmount` 999.00 — proceeded;
+      * a quote wholly in EUR against a USD row — every amount failed the currency conjunct
+        inside the old `_amount_minor`, every one came back None, and the Nones were COALESCEd
+        away by the transition's `COALESCE(:col, col)`, so the row went to a live EUR checkout
+        with NULL totals and nothing to notice;
+      * quantity 3 at 42.50 with a one-unit 45.00 total — proceeded.
+
+    The third is why (b) below multiplies. The second is why NOTHING here is allowed to answer
+    None and be treated as fine.
+
+    ── THE FOUR CHECKS ─────────────────────────────────────────────────────────────────────
+
+    (d) READABLE FIRST. `finalAmount`, `itemsSubtotal`, `shipping` and `tax.amount` must ALL be
+        present and parsable as exact decimals. Any one missing or unreadable →
+        `price_unverifiable` / `quote_amounts_unreadable`. An absent tax block and a zero tax
+        block are different claims and only the second one is a number.
+
+    (a) CURRENCY. Every one of those four, AND `rc.quote_total` where it can read the field, must
+        name the ROW's currency. → `price_changed` / `quote_currency_mismatch`.
+
+    (b) SUBTOTAL, EXACTLY. `itemsSubtotal == quantity × our_price_minor`, with NO tolerance. Both
+        numbers describe the same merchant's line item; a cent of drift is a different price, not
+        a rounding artifact. → `price_changed` / `quote_items_subtotal_mismatch`.
+
+    (c) THE TOTAL RECONCILES. `finalAmount == itemsSubtotal + shipping + tax`, within
+        `QUOTE_RECONCILE_TOLERANCE_MINOR`. This is what catches a total that does not follow from
+        its own breakdown — a discount line we did not read, a fee under a name we do not know.
+        → `price_changed` / `quote_total_not_reconciled`.
+
+    The arithmetic is entirely in INTEGER MINOR UNITS. Nothing that decides whether a card is
+    charged does binary floating point.
+    """
+    currency = str(row.get("currency") or "").strip().upper()
+    unit = row.get("our_price_minor")
+    quantity = row.get("quantity")
+    if (
+        not currency
+        or isinstance(unit, bool)
+        or not isinstance(unit, int)
+        or unit <= 0
+        or isinstance(quantity, bool)
+        or not isinstance(quantity, int)
+        or quantity < 1
+    ):
+        # Defensive: `_price_verdict` already refuses a row with no stored unit price before a
+        # quote is ever requested, and `start_purchase` writes both columns. Reached only by a
+        # row some other writer made.
+        return QuoteCheck(False, "price_unverifiable", "quote_row_unverifiable")
+
+    data = payload if isinstance(payload, dict) else {}
+    breakdown = data.get("amountBreakdown")
+    breakdown = breakdown if isinstance(breakdown, dict) else {}
+    tax_block = breakdown.get("tax")
+    tax_block = tax_block if isinstance(tax_block, dict) else {}
+
+    parts = {
+        "finalAmount": _money(breakdown.get("finalAmount")),
+        "itemsSubtotal": _money(breakdown.get("itemsSubtotal")),
+        "shipping": _money(breakdown.get("shipping")),
+        "tax": _money(tax_block.get("amount")),
+    }
+    if any(part is None for part in parts.values()):
+        return QuoteCheck(False, "price_unverifiable", "quote_amounts_unreadable")
+
+    # (a) — every currency in the breakdown, plus the client's own read of `finalAmount`.
+    named = {part[1] for part in parts.values()}
+    client_total = rc.quote_total(data)
+    if client_total is not None:
+        named.add(str(client_total[1] or "").strip().upper())
+    if named != {currency}:
+        return QuoteCheck(False, "price_changed", "quote_currency_mismatch")
+
+    total_minor = _positive_minor(parts["finalAmount"][0], currency)
+    subtotal_minor = _positive_minor(parts["itemsSubtotal"][0], currency)
+    shipping_minor = _component_minor(parts["shipping"][0], currency)
+    tax_minor = _component_minor(parts["tax"][0], currency)
+    if None in (total_minor, subtotal_minor, shipping_minor, tax_minor):
+        # An amount that is negative, zero where it must be positive, over the ceiling, or
+        # carrying more decimal places than the currency has. Unstateable exactly = not bought
+        # against, and NEVER passed on as None.
+        return QuoteCheck(False, "price_unverifiable", "quote_amounts_unreadable")
+
+    if subtotal_minor != unit * quantity:
+        return QuoteCheck(False, "price_changed", "quote_items_subtotal_mismatch")
+
+    reconstructed = subtotal_minor + shipping_minor + tax_minor
+    if abs(total_minor - reconstructed) > QUOTE_RECONCILE_TOLERANCE_MINOR:
+        return QuoteCheck(False, "price_changed", "quote_total_not_reconciled")
+
+    return QuoteCheck(
+        True,
+        total_minor=total_minor,
+        subtotal_minor=subtotal_minor,
+        shipping_minor=shipping_minor,
+        tax_minor=tax_minor,
+    )
+
+
 def _single_variant_verdict(resolution: Any, row: Mapping[str, Any]) -> Optional[str]:
     """Refuse a structural option match on a row that DID name a variant.
 
@@ -518,6 +806,35 @@ def _single_variant_verdict(resolution: Any, row: Mapping[str, Any]) -> Optional
 
 
 # ── start_purchase ───────────────────────────────────────────────────────────────────────────
+
+
+#: Unicode general categories removed from every buyer-supplied text field before it is stored
+#: or sent to a partner. Cf is the one that matters: U+202E RIGHT-TO-LEFT OVERRIDE inside a
+#: `firstName` was stored verbatim and forwarded to Reap, where it reverses the rendering of
+#: everything after it on a shipping label, in a confirmation email and in our own owner view.
+#: Cc (control) and the surrogate/private-use categories are stripped with it because none of
+#: them is a character anybody typed into a name or a street.
+_STRIPPED_CATEGORIES = frozenset({"Cf", "Cc", "Cs", "Co", "Cn"})
+
+
+def _clean_buyer_text(value: Any) -> str:
+    """Remove format/control characters from one buyer-supplied field, then trim.
+
+    STRIP AND THEN REFUSE WHAT REMAINS, rather than refusing anything containing one: a stray
+    zero-width joiner pasted out of a web form is not an attack, and refusing the whole purchase
+    for it helps nobody. What must not survive is a character that can make the STORED value
+    render as something other than itself. `start_purchase` refuses if anything non-printable is
+    still there afterwards.
+    """
+    text = "".join(
+        ch for ch in str(value or "") if unicodedata.category(ch) not in _STRIPPED_CATEGORIES
+    )
+    return text.strip()
+
+
+def _is_clean(text: str) -> bool:
+    """Every remaining character prints as itself (an ordinary space excepted)."""
+    return all(ch == " " or ch.isprintable() for ch in text)
 
 
 def _require_text(value: Any, name: str) -> str:
@@ -624,11 +941,23 @@ async def start_purchase(
     #    are required, and a second opinion here would be a second contract to keep in step.
     if not isinstance(buyer, BuyerContact):
         raise PurchaseRefused("invalid_request", "buyer must be a BuyerContact")
-    email = str(buyer.email or "").strip()
-    if not _EMAIL_RE.match(email):
+    email = _clean_buyer_text(buyer.email)
+    if not _EMAIL_RE.match(email) or not _is_clean(email):
         raise PurchaseRefused("invalid_request", "buyer.email is not an email address")
+
+    # Cleaned BEFORE the client's builder sees it, so the value that is validated, the value that
+    # is stored and the value that reaches Reap are the same string. Cleaning after validation
+    # would mean we validated one string and sent another.
+    raw_address = buyer.shipping_address or {}
+    if not isinstance(raw_address, Mapping):
+        raise PurchaseRefused("invalid_address", "buyer.shipping_address must be a mapping")
+    cleaned_address = {key: _clean_buyer_text(value) for key, value in raw_address.items()}
+    if not all(_is_clean(value) for value in cleaned_address.values()):
+        raise PurchaseRefused(
+            "invalid_address", "shipping address contains characters that are not printable"
+        )
     try:
-        shipping = rc.build_shipping_address(dict(buyer.shipping_address or {}))
+        shipping = rc.build_shipping_address(cleaned_address)
     except rc.ReapRequestError as exc:
         # The client's message names the MISSING KEYS and nothing else — no values — so it is
         # safe to carry. `str(exc)` on this path has been checked for that.
@@ -690,6 +1019,38 @@ def _next_poll_for(to_state: str) -> datetime:
     return _now()
 
 
+def _lost(row: Mapping[str, Any]) -> AdvanceResult:
+    return AdvanceResult(str(row["id"]), outcome="lost_claim", state=str(row.get("state") or ""))
+
+
+async def _still_ours(row: Mapping[str, Any], worker_id: str) -> Optional[Dict[str, Any]]:
+    """Re-read the row; return it only if we STILL hold the claim and the state has not moved.
+
+    THE SECOND GUARD, over the PARTNER rather than over our database — see the module header for
+    why there are two and why this one is not a fence. It is called immediately before the first
+    partner call of a step and again immediately before every call or enrollment-table write with
+    a side effect, so the ordinary lost race (the lease was already gone when the step began)
+    costs nothing at Reap: no checkout created for a row we cannot write, no enrollment minted
+    over the real holder's.
+
+    IT CANNOT CLOSE THE WINDOW, only narrow it. A claim that moves between this read and the call
+    two lines later is not caught. Saying that here rather than only in the header, because this
+    is the function a reviewer will be standing in when they ask.
+
+    THE STATE CONJUNCT MATTERS AS MUCH AS THE CLAIM ONE. A sweep can terminate a row we still
+    hold — `expire_overdue_purchases` and `fail_exhausted_purchases` take no holder — so
+    `claimed_by` alone would still let a worker quote a purchase that is already 'expired'.
+    """
+    fresh = await ledger.get_purchase_internal(str(row["id"]))
+    if fresh is None:
+        return None
+    if str(fresh.get("claimed_by") or "") != worker_id:
+        return None
+    if str(fresh.get("state") or "") != str(row.get("state") or ""):
+        return None
+    return fresh
+
+
 async def _move(
     row: Mapping[str, Any],
     worker_id: str,
@@ -710,7 +1071,7 @@ async def _move(
         str(row["id"]), worker_id, from_states=list(from_states), to_state=to_state, **fields
     )
     if moved is None:
-        return AdvanceResult(str(row["id"]), outcome="lost_claim", state=str(row["state"]))
+        return _lost(row)
     return AdvanceResult(
         str(row["id"]),
         outcome="advanced",
@@ -738,15 +1099,16 @@ async def _release(
     """
     state = str(row["state"])
     if seconds is None:
-        base = POLL_INTERVALS[state]
         seconds = (
-            min(base * TRANSPORT_BACKOFF_MULTIPLIER, MAX_BACKOFF_SECONDS) if transport else base
+            transport_backoff_seconds(state, row.get("attempts"))
+            if transport
+            else POLL_INTERVALS[state]
         )
     released = await ledger.release_claim(
         str(row["id"]), worker_id, next_poll_at=_now() + timedelta(seconds=seconds)
     )
     if released is None:
-        return AdvanceResult(str(row["id"]), outcome="lost_claim", state=state)
+        return _lost(row)
     if error_code:
         # The CODE, never a body, a URL or an address. Every value that reaches this line is
         # either our own vocabulary or `ReapResponse.error`/`error_code`, both of which the
@@ -805,6 +1167,11 @@ async def _step_resolving(row: Mapping[str, Any], worker_id: str) -> AdvanceResu
     handles (five searches for the same product on one day returned five different `prd_` ids),
     so the quote step re-resolves rather than trusting them.
     """
+    guarded = await _still_ours(row, worker_id)
+    if guarded is None:
+        return _lost(row)
+    row = guarded
+
     resolution = await rc.resolve_our_row(**_resolution_inputs(row))
     queries = list(getattr(resolution, "queries_tried", None) or [])
 
@@ -837,9 +1204,16 @@ async def _step_resolving(row: Mapping[str, Any], worker_id: str) -> AdvanceResu
             enrollment_id=str(active["id"]), **evidence,
         )
 
-    # No active card. Mint OUR enrollment row FIRST: its id is the `attempt_id` the partner's
-    # idempotency key is derived from, and without it a second attempt by the same buyer replays
-    # the first enrollment — with its dead 15-minute link — for the rest of the day.
+    # No active card. Two SIDE-EFFECTING writes follow — an enrollment row of ours and a hosted
+    # page at the partner — and `upsert_pending_enrollment` takes NO holder, so nothing but this
+    # re-read stands between a worker that lost its lease and an enrollment row minted over the
+    # real holder's. Measured before it was added.
+    if await _still_ours(row, worker_id) is None:
+        return _lost(row)
+
+    # Mint OUR enrollment row FIRST: its id is the `attempt_id` the partner's idempotency key is
+    # derived from, and without it a second attempt by the same buyer replays the first
+    # enrollment — with its dead 15-minute link — for the rest of the day.
     ours = await ledger.upsert_pending_enrollment(
         buyer_ref=str(row["buyer_ref"]), agent_id=row.get("agent_id")
     )
@@ -870,12 +1244,22 @@ async def _step_resolving(row: Mapping[str, Any], worker_id: str) -> AdvanceResu
         )
     hosted_url, expires_at = action
     expires = _parse_ts(expires_at)
+    partner_enrollment_id = _partner_id(created.data.get("id"), what="enrollment", uuid=True)
+    if partner_enrollment_id is None:
+        # An enrollment id we cannot put in a URL is an enrollment we can never poll. Failing now
+        # is one named failure; storing it is a `ReapRequestError` out of every later step.
+        return await _move(
+            row, worker_id, ["resolving"], "failed",
+            last_error_code="partner_id_malformed", **evidence,
+        )
 
+    if await _still_ours(row, worker_id) is None:
+        return _lost(row)
     await ledger.upsert_pending_enrollment(
         buyer_ref=str(row["buyer_ref"]),
         agent_id=row.get("agent_id"),
         enrollment_id=str(ours["id"]),
-        reap_enrollment_id=_cap(created.data.get("id")),
+        reap_enrollment_id=partner_enrollment_id,
         reap_status=_cap(created.data.get("status")),
         hosted_url=hosted_url,
         hosted_url_expires_at=expires,
@@ -889,7 +1273,9 @@ async def _step_resolving(row: Mapping[str, Any], worker_id: str) -> AdvanceResu
     )
 
 
-async def _pending_enrollment_row(row: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+async def _pending_enrollment_row(
+    row: Mapping[str, Any], worker_id: str
+) -> Optional[Dict[str, Any]]:
     """Re-read the buyer's PENDING enrollment row.
 
     THIS IS A WORKAROUND AND IT SHOULD NOT SURVIVE THE NEXT PACKAGE. The ledger exports
@@ -909,6 +1295,9 @@ async def _pending_enrollment_row(row: Mapping[str, Any]) -> Optional[Dict[str, 
     enrollment_id = str(row.get("enrollment_id") or "").strip()
     if not enrollment_id:
         return None
+    # An UPSERT is a WRITE, and it takes no holder. Guarded like every other side effect.
+    if await _still_ours(row, worker_id) is None:
+        return None
     return await ledger.upsert_pending_enrollment(
         buyer_ref=str(row["buyer_ref"]), enrollment_id=enrollment_id
     )
@@ -922,18 +1311,33 @@ async def _step_needs_enrollment(row: Mapping[str, Any], worker_id: str) -> Adva
     # The buyer may have enrolled via ANOTHER purchase of theirs, in which case the card is
     # already active and there is nothing to poll. Checked first, and it is also what keeps the
     # re-read below from minting a stray pending row in the common case.
+    guarded = await _still_ours(row, worker_id)
+    if guarded is None:
+        return _lost(row)
+    row = guarded
+
     active = await ledger.get_active_enrollment(str(row["buyer_ref"]))
     if active is not None:
         return await _move(
             row, worker_id, ["needs_enrollment"], "quoting", enrollment_id=str(active["id"])
         )
 
-    ours = await _pending_enrollment_row(row)
+    ours = await _pending_enrollment_row(row, worker_id)
+    if ours is None and str(row.get("enrollment_id") or "").strip():
+        # The re-read declined because the lease moved, not because the row is unreadable.
+        return _lost(row)
     partner_id = str((ours or {}).get("reap_enrollment_id") or "").strip()
     if not partner_id:
         return await _move(
             row, worker_id, ["needs_enrollment"], "failed",
             last_error_code="enrollment_row_unreadable",
+        )
+    if _partner_id(partner_id, what="enrollment", uuid=True) is None:
+        # Stored before the write-time check existed, or by another writer. `rc.get_enrollment`
+        # would raise out of `advance` on every poll, and this state is attempts-exempt.
+        return await _move(
+            row, worker_id, ["needs_enrollment"], "failed",
+            last_error_code="partner_id_malformed",
         )
 
     read = await rc.get_enrollment(partner_id)
@@ -951,6 +1355,8 @@ async def _step_needs_enrollment(row: Mapping[str, Any], worker_id: str) -> Adva
         method = read.data.get("paymentMethod")
         method = method if isinstance(method, dict) else {}
         last4 = str(method.get("last4") or "").strip()
+        if await _still_ours(row, worker_id) is None:
+            return _lost(row)
         await ledger.mark_enrollment_active(
             str(ours["id"]),
             reap_enrollment_id=partner_id,
@@ -965,6 +1371,8 @@ async def _step_needs_enrollment(row: Mapping[str, Any], worker_id: str) -> Adva
             row, worker_id, ["needs_enrollment"], "quoting", enrollment_id=str(ours["id"])
         )
     if state == "dead":
+        if await _still_ours(row, worker_id) is None:
+            return _lost(row)
         await ledger.mark_enrollment_dead(
             str(ours["id"]), reap_status=_cap(read.data.get("status"))
         )
@@ -992,13 +1400,24 @@ async def _step_quoting(row: Mapping[str, Any], worker_id: str) -> AdvanceResult
     against a handle nobody has checked since, which is how a buyer is charged for a variant that
     is no longer the one we priced.
     """
+    guarded = await _still_ours(row, worker_id)
+    if guarded is None:
+        return _lost(row)
+    row = guarded
+
     active = await ledger.get_active_enrollment(str(row["buyer_ref"]))
     partner_enrollment = str((active or {}).get("reap_enrollment_id") or "").strip()
     if not partner_enrollment:
         # 'quoting' cannot legally go back to 'needs_enrollment', so there is nowhere to send
-        # this. The owner starts a new purchase, which enrolls again.
+        # this. The owner starts a new purchase, which enrolls again. A REAL GUARD, not a
+        # formality: without it `partner_enrollment` is "" and the checkout create is either
+        # refused by the client's builder or — on any laxer builder — bound to no card at all.
         return await _move(
             row, worker_id, ["quoting"], "failed", last_error_code="no_active_enrollment"
+        )
+    if _partner_id(partner_enrollment, what="enrollment", uuid=True) is None:
+        return await _move(
+            row, worker_id, ["quoting"], "failed", last_error_code="partner_id_malformed"
         )
 
     resolution = await rc.resolve_our_row(**_resolution_inputs(row))
@@ -1018,6 +1437,8 @@ async def _step_quoting(row: Mapping[str, Any], worker_id: str) -> AdvanceResult
                 refusal_reason=verdict, queries_tried=queries,
             )
 
+    if await _still_ours(row, worker_id) is None:
+        return _lost(row)
     quote = await rc.request_quote(
         items=[{"variantId": resolution.variant_id, "quantity": int(row.get("quantity") or 1)}],
         email=row.get("buyer_email"),
@@ -1037,26 +1458,57 @@ async def _step_quoting(row: Mapping[str, Any], worker_id: str) -> AdvanceResult
             )
         return await _move(row, worker_id, ["quoting"], "failed", last_error_code=_cap(code))
 
-    quote_id = str(quote.data.get("id") or "").strip()
-    if not quote_id:
+    raw_quote_id = str(quote.data.get("id") or "").strip()
+    if not raw_quote_id:
         return await _move(
             row, worker_id, ["quoting"], "failed", last_error_code="quote_id_missing"
         )
+    quote_id = _partner_id(raw_quote_id, what="quote")
+    if quote_id is None:
+        return await _move(
+            row, worker_id, ["quoting"], "failed", last_error_code="partner_id_malformed"
+        )
 
-    currency = row.get("currency")
-    evidence = {
+    quote_expires = _parse_ts(quote.data.get("expiresAt"))
+    evidence: Dict[str, Any] = {
         "reap_product_id": _cap(resolution.product_id),
         "reap_variant_id": _cap(resolution.variant_id),
-        "reap_quote_id": _cap(quote_id),
-        "reap_quote_expires_at": _parse_ts(quote.data.get("expiresAt")),
-        "quoted_total_minor": _amount_minor(rc.quote_total(quote.data), currency),
-        "tax_minor": _amount_minor(rc.quote_tax(quote.data), currency),
-        "shipping_minor": _amount_minor(
-            _flat_amount((quote.data.get("amountBreakdown") or {}).get("shipping")), currency
-        ),
+        "reap_quote_id": quote_id,
+        "reap_quote_expires_at": quote_expires,
         "queries_tried": queries,
+        # P2-7: the enrollment this checkout is about to be BOUND TO, written onto the row in the
+        # same transition. The resolving step wrote whatever was active then; a buyer who
+        # re-enrolled since has a different active row, and a purchase pointing at the old one
+        # names a card that did not pay for it.
+        "enrollment_id": str(active["id"]),
     }
 
+    # THE QUOTE IS THE NUMBER THAT DECIDES THE CHARGE, so it is checked before anything is
+    # created. See `verify_quote` for the three measured ways the previous code reached a live
+    # hosted checkout without ever comparing it to the purchase we opened.
+    check = verify_quote(quote.data, row)
+    if not check.ok:
+        return await _move(
+            row, worker_id, ["quoting"], "refused",
+            refusal_reason=check.refusal_reason,
+            last_error_code=check.last_error_code,
+            **evidence,
+        )
+    evidence.update(
+        quoted_total_minor=check.total_minor,
+        shipping_minor=check.shipping_minor,
+        tax_minor=check.tax_minor,
+    )
+
+    # P2-9: a quote we already know is dead must not become a checkout. `reap_quote_expires_at`
+    # was previously written and never read. Compared against this process's clock, which is the
+    # clock available at this point; both sides are UTC, and the check is advisory — the partner
+    # would refuse the create anyway. What it buys is a named reason and one fewer round trip.
+    if quote_expires is not None and quote_expires <= _now():
+        return await _release(row, worker_id, error_code="quote_expired")
+
+    if await _still_ours(row, worker_id) is None:
+        return _lost(row)
     checkout = await rc.create_checkout(
         quote_id=quote_id,
         enrollment_id=partner_enrollment,
@@ -1077,18 +1529,55 @@ async def _step_quoting(row: Mapping[str, Any], worker_id: str) -> AdvanceResult
             # The quote is lost with the step. That is correct rather than merely tolerable: a
             # quote we could not turn into a checkout expires in five minutes, and the next step
             # re-resolves and re-quotes from scratch anyway.
+            #
+            # A HOSTILE HOSTED URL ALSO LANDS HERE, not below: `_refuse_unsafe_hosted_url` inside
+            # the client turns a 200 carrying a `nextAction.url` it will not vouch for into
+            # `ok=False, error="hosted_url_not_allowed"` AND DROPS `.data`, so the URL never
+            # reaches this module at all.
             return await _release(row, worker_id, error_code=code, transport=True)
         return await _move(
             row, worker_id, ["quoting"], "failed",
             last_error_code=_cap(detail or checkout.error_code or code), **evidence,
         )
 
+    # A LIVE CHECKOUT EXISTS AT THE PARTNER FROM THIS LINE ON, and it is recorded on every exit
+    # below — including the failures. P2-5: dropping it on the way out left a real checkout with
+    # nothing in our storage pointing at it.
+    checkout_id = _partner_id(checkout.data.get("id"), what="checkout")
+    if checkout_id is None:
+        # P2-6. A checkout id that cannot go in a URL path is one `rc.get_checkout` will refuse,
+        # and it would refuse it by RAISING out of `advance` on every subsequent poll —
+        # unbounded, because 'awaiting_approval' is exempt from the attempts counter. Caught at
+        # WRITE time instead: one named failure, and the malformed value is never stored.
+        return await _move(
+            row, worker_id, ["quoting"], "failed",
+            last_error_code="partner_id_malformed", **evidence,
+        )
+    evidence["reap_checkout_id"] = checkout_id
+
+    # P2-8, THE ORPHAN WINDOW, STATED RATHER THAN IMPLIED. A crash between the create above and
+    # the transition below leaves a checkout at Reap that no row of ours references. It cannot be
+    # recovered by replaying the create: the client's idempotency key for `/agentic/checkouts` is
+    # derived from `(quoteId, enrollmentId)`, and the next step re-resolves and re-quotes, so it
+    # arrives with a NEW quote id and a different key. There is no double-charge risk — the
+    # buyer only ever receives the hosted URL through a row the fence agreed to write, and an
+    # unapproved checkout expires — but the checkout is real and somebody may have to find it.
+    #
+    # THE LEDGER OFFERS NO FENCED FIELD-ONLY WRITE (`transition_as_holder` needs a state change
+    # and `release_claim` takes only `next_poll_at`), so it cannot be recorded BEFORE the
+    # transition. It is logged instead: an id, not a URL and not PII.
+    logger.info(
+        "reap_agentic: checkout created purchase=%s checkout=%s quote=%s",
+        row["id"], checkout_id, quote_id,
+    )
+
     action = rc.hosted_action(checkout.data)
     if action is None:
-        # THE HOSTILE-URL PATH. `hosted_action` has already applied the host allowlist, the
-        # https rule, the no-userinfo rule and the port pin; None means there is nowhere to send
-        # the buyer. 'awaiting_approval' exists to hold a link, so it is not entered without one
-        # — and the partner's URL is not written anywhere on the row.
+        # NOT the hostile-URL path — that one never gets here (see the note above the `not ok`
+        # branch). This is a WELL-FORMED 200 with no next action at all, or one that is not a
+        # REDIRECT: a checkout with nowhere to send the buyer. 'awaiting_approval' exists to hold
+        # a link, so it is not entered without one, and the checkout id is kept because the
+        # checkout is real.
         return await _move(
             row, worker_id, ["quoting"], "failed",
             last_error_code="checkout_no_hosted_action", **evidence,
@@ -1096,7 +1585,6 @@ async def _step_quoting(row: Mapping[str, Any], worker_id: str) -> AdvanceResult
     hosted_url, expires_at = action
     return await _move(
         row, worker_id, ["quoting"], "awaiting_approval",
-        reap_checkout_id=_cap(checkout.data.get("id")),
         hosted_url=hosted_url,
         hosted_url_expires_at=_parse_ts(expires_at),
         **evidence,
@@ -1113,10 +1601,25 @@ async def _step_checkout_poll(
     is `ALLOWED_TRANSITIONS`' job — 'processing' → 'processing' is not an edge, so the processing
     arm releases where the approval arm advances.
     """
+    guarded = await _still_ours(row, worker_id)
+    if guarded is None:
+        # `get_checkout` has no side effect at the partner, so this is not about protecting Reap
+        # — it is about not spending a request, and a rate-limit budget, on a row we cannot
+        # write. The same guard everywhere keeps "a loser calls nothing" a rule rather than a
+        # list of exceptions a reader has to hold in their head.
+        return _lost(row)
+    row = guarded
+
     checkout_id = str(row.get("reap_checkout_id") or "").strip()
     if not checkout_id:
         return await _move(
             row, worker_id, [from_state], "failed", last_error_code="checkout_id_missing"
+        )
+    if _partner_id(checkout_id, what="checkout") is None:
+        # Written before the write-time check existed, or by another writer. Without this,
+        # `rc.get_checkout` raises out of `advance` on every poll for ever.
+        return await _move(
+            row, worker_id, [from_state], "failed", last_error_code="partner_id_malformed"
         )
 
     read = await rc.get_checkout(checkout_id)
@@ -1166,24 +1669,82 @@ async def _step_processing(row: Mapping[str, Any], worker_id: str) -> AdvanceRes
     return await _step_checkout_poll(row, worker_id, "processing")
 
 
+#: How long to wait before re-reading a checkout the partner called COMPLETED without giving us
+#: an order id. The human-wait cadence rather than 'processing's 15 s: this is not a payment in
+#: flight any more, it is a payload that needs a person, and 'processing' is the one state
+#: `fail_exhausted_purchases` skips by default — so it sits there, visible, instead of being
+#: auto-failed over a charge that succeeded.
+ORDER_ID_MISSING_BACKOFF_SECONDS = POLL_INTERVALS["awaiting_approval"]
+
+
 async def _complete(
     row: Mapping[str, Any], worker_id: str, from_state: str, payload: Mapping[str, Any]
 ) -> AdvanceResult:
-    """Write 'completed', then — and only then — close the attribution edge."""
+    """Write 'completed' — but only with an order id — then close the attribution edge.
+
+    ── 'completed' REQUIRES AN ORDER ID (P1-3) ─────────────────────────────────────────────
+
+    `orderId` appears only on COMPLETED, and the row's whole value after the fact is that it
+    names the order. A COMPLETED payload without one used to land as 'completed' with
+    `reap_order_id = NULL`, and the attribution hook was then called with
+    `external_order_id = ""` — which `close_external_order_conversion` DROPS with a warning. The
+    money was real, the row said so, and the GMV existed nowhere: not on the row, not in the
+    attribution ledger, not in any log a person reads.
+
+    So a COMPLETED we cannot key goes to (or stays in) 'processing' with
+    `last_error_code=completed_without_order_id` and a slow poll. 'processing' is deliberate: it
+    is the one non-terminal state the exhaustion sweep skips, so the row waits for a human
+    instead of being auto-failed over a charge that succeeded. If the partner fills the field in
+    on a later read, the next poll completes it normally.
+
+    ── THE EDGE REQUIRES A REAL AMOUNT (P1-4) ──────────────────────────────────────────────
+
+    `close_external_order_conversion` is idempotent on `(merchant_id, external_order_id)` via
+    `ON CONFLICT DO NOTHING`. So an edge written with `gross_amount_cents = None` is PERMANENT:
+    the slot is taken, a later correct close is silently dropped, and that order's GMV reads as
+    zero for ever. A missing, string-shaped or wrong-currency `finalAmount` therefore completes
+    the ROW — the order exists, and refusing to record that would be a worse lie — with
+    `last_error_code=final_amount_missing` and NO EDGE AT ALL, leaving the slot free for a
+    reconciliation job that can re-read the checkout.
+    """
     currency = row.get("currency")
-    final_minor = _amount_minor(_flat_amount(payload.get("finalAmount")), currency)
-    if final_minor is None:
-        final_minor = _amount_minor(_flat_amount(payload.get("amount")), currency)
+    order_id = _order_id(payload.get("orderId"))
+    if order_id is None:
+        if from_state == "processing":
+            return await _release(
+                row, worker_id,
+                error_code="completed_without_order_id",
+                seconds=ORDER_ID_MISSING_BACKOFF_SECONDS,
+            )
+        return await _move(
+            row, worker_id, [from_state], "processing",
+            last_error_code="completed_without_order_id",
+            next_poll_at=_now() + timedelta(seconds=ORDER_ID_MISSING_BACKOFF_SECONDS),
+        )
+
+    final = _money(payload.get("finalAmount")) or _money(payload.get("amount"))
+    final_minor = None
+    if final is not None and final[1] == str(currency or "").strip().upper():
+        final_minor = _positive_minor(final[0], currency)
 
     moved = await _move(
         row, worker_id, [from_state], "completed",
-        reap_order_id=_cap(payload.get("orderId")),
+        reap_order_id=order_id,
         final_total_minor=final_minor,
+        last_error_code=None if final_minor is not None else "final_amount_missing",
     )
     if moved.outcome != "advanced":
         # THE HOOK IS AFTER THE FENCE, NOT BEFORE IT. A lost claim means somebody else moved this
         # row — possibly a sweep that failed it — and closing a conversion for a purchase we did
         # not complete puts GMV in the attribution ledger that no order backs.
+        return moved
+
+    if final_minor is None:
+        logger.warning(
+            "reap_agentic: purchase=%s completed with order=%s but no usable final amount; "
+            "no attribution edge written so a reconciliation can still close it",
+            row["id"], order_id,
+        )
         return moved
 
     # `_move` returned the row the ledger's UPDATE gave back, but not its contents; re-read the
@@ -1208,6 +1769,20 @@ async def _close_attribution(purchase: Mapping[str, Any]) -> None:
     reconciliation job is the answer to a systematically failing hook, not a louder failure here.
     """
     from services.commerce_attribution_service import close_external_order_conversion
+
+    order_id = str(purchase.get("reap_order_id") or "").strip()
+    gross = purchase.get("final_total_minor")
+    if not order_id or isinstance(gross, bool) or not isinstance(gross, int) or gross <= 0:
+        # THE SECOND LAYER. `_complete` already decides this, and the decision is tested there;
+        # this exists because the cost of being wrong is a PERMANENT zero-GMV row that no later
+        # close can replace (`ON CONFLICT DO NOTHING` on `(merchant, external_order_id)`), and a
+        # future caller of this function will not have read `_complete`.
+        logger.warning(
+            "reap_agentic: refusing to close a conversion for purchase=%s without an order id "
+            "and a positive amount",
+            purchase.get("id"),
+        )
+        return
 
     try:
         await close_external_order_conversion(
