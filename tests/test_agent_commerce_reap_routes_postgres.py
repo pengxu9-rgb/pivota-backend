@@ -7,9 +7,11 @@ NOT A COPY OF THE SQLITE ARM, and it does not import it — the house rule is th
 `*_postgres.py` file stands alone, because a shared helper module means the two gates test one
 thing twice instead of two things once. What is here is what the ENGINE decides:
 
-  1. MIGRATION 226 AND THE SELF-HEAL BUILD THE SAME SCHEMA. Production skips db/migrations, so
-     `db/schema_guard.ensure_required_schema_light` IS the production schema for these three
-     tables. The comparison is through the CATALOG — `information_schema.columns`,
+  1. MIGRATIONS 226 + 227 AND THE SELF-HEAL BUILD THE SAME SCHEMA. Production skips
+     db/migrations, so `db/schema_guard.ensure_required_schema_light` IS the production schema
+     for these three tables — including 227's two consent columns, which the self-heal reaches
+     by its own statement rather than by being folded into the CREATE (folded in, it would be
+     dead on a fresh database and its deletion would pass every test). The comparison is through the CATALOG — `information_schema.columns`,
      `pg_indexes.indexdef`, `pg_get_constraintdef` — not through the source text, because a
      `CREATE UNIQUE INDEX` quietly downgraded to `CREATE INDEX` is invisible to a token check and
      a reviewer's mutant proved exactly that on the mig-224 pair.
@@ -31,12 +33,17 @@ thing twice instead of two things once. What is here is what the ENGINE decides:
      conjuncts, the dial, the allowlist, the buyer link, the hosted-URL vetting, the price and
      the return URL are all exercised against real Postgres. Nothing else is duplicated.
 
+  6. WP4b'S MINT AGAINST THE REAL CONSTRAINT. `ON CONFLICT (agent_id, agent_user_ref_hash) DO
+     NOTHING` is Postgres' implementation over a real unique index here, not SQLite's; the
+     consent column is a real `VARCHAR(32)` that raises on an over-long value rather than
+     truncating; and `consented_at` is a real `timestamptz`.
+
 THIS FILE DOES NOT IMPORT `main`. It assembles a minimal app from the router plus
 `ErrorHandlerMiddleware`; see the long comment above the assert below for what importing main did
 to two unrelated files in this gate. "The router is registered in main.py" is proved in the SQLite
 arm, which never shares a process with the gate.
 
-    DATABASE_URL=postgresql://postgres:postgres@localhost:5432/pivota_reap_wp4_test \\
+    DATABASE_URL=postgresql://postgres:postgres@localhost:5432/pivota_reap_wp4b_test \\
         .venv/bin/python -m pytest tests/test_agent_commerce_reap_routes_postgres.py
 """
 
@@ -180,7 +187,7 @@ def _assert_throwaway_database() -> None:
     if not any(m in dbname or m in DATABASE_URL for m in _SAFE_DB_MARKERS):
         pytest.skip(
             f"refusing to drop the agentic route tables in database {dbname!r} — "
-            f"throwaway only (e.g. pivota_reap_wp4_test)"
+            f"throwaway only (e.g. pivota_reap_wp4b_test)"
         )
 
 

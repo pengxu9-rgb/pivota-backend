@@ -528,18 +528,32 @@ The gate is read **per request**, so arming the rail is an env change and not a 
 | **another seller's price** | `catalog_offers.merchant_id` is the offer SELLER and is not `catalog_products.merchant_id`. One sku carries offers from several sellers, and the crawl-mirror and merchant-sync lanes can both hold a copy. Only this merchant's own offer is read; no offer of its own ⇒ `row_unpriced`. |
 | **the currency** | the offer must be priced in the currency the buyer's market uses (`US` → `USD`). Otherwise `row_currency_mismatch` — the divergence would otherwise surface at the quote as `price_changed`, naming the wrong cause, after the buyer has entered a card. |
 | **the merchant** | `reap_agentic_eligibility` is an allowlist. No enabled row for this domain **in the buyer's market** ⇒ `merchant_not_eligible`. |
-| **the buyer** | resolved from `buyer_identity_links` on `(agent_id, hash(agent_user_ref))`. No link ⇒ `buyer_unlinked` — the routes never create one (see below). |
+| **the buyer** | resolved from `buyer_identity_links` on `(agent_id, hash(agent_user_ref))`. No link ⇒ one is **created** (see below). The agent cannot name a buyer: there is no field for it, and the id minted is random, never derived from `buyer.email`. |
+| **the consent** | `buyer.consent_version` is required; missing or malformed ⇒ `consent_required`, decided after the dial and before eligibility, the catalog read and every write. Recorded against the buyer, latest wins. |
 | **the variant key** | matched exactly against `catalog_skus.sku_key`, never re-derived: this repo has three live spellings of a variant sku key and they collide. |
 | **the storefront** | `catalog_products.platform` must be `shopify`. `external_seed` rows are refused `row_not_shopify` even though most of that cohort really is Shopify — that normalisation needs seed-snapshot evidence the catalog tables do not carry, and this is a charge, not a display. |
 
-**Why a missing buyer link is a refusal and not a sign-up.** The only writer of
-`buyer_identity_links` is `routes/buyer_api._upsert_buyer_identity_link`, reached from a
-buyer-authenticated surface — the buyer signs in, and that is what binds the agent's opaque user
-ref to a real account. Minting a link from an agent's assertion alone would hang a stored card off
-a buyer account nothing else knows about, and the same human signing in tomorrow would get a
-second account and be asked for their card again.
+**Why a missing buyer link is now a sign-up and not a refusal.** Owner decision, 2026-09-18. Until
+WP4b the routes refused `buyer_unlinked`, on the argument that only a buyer-authenticated sign-in
+should bind an agent's opaque user ref to an account. The consequence was that **every** agent-only
+buyer was refused, which made the rail unarmable for the door it was built for.
 
-### Storage the routes own — migration 226
+The first purchase now creates the link, and with it a **random** buyer id — not an account row,
+and nothing derived from `buyer.email`. That last part is load-bearing:
+`db/accounts.create_or_get_shop_user` is *create-or-get*, so minting through it would hand an
+agent that asserted a stranger's email that stranger's real buyer id, and with it their saved
+email and default shipping address through the checkout-intent prefill. An agent-asserted identity
+is unverified and gets its own id space.
+
+An existing link always wins — the insert cannot overwrite one, and the route re-reads rather than
+trusting what it minted, so two concurrent first purchases yield one buyer, one link, one ref.
+
+**The one residue.** If the same human later signs in through the hosted checkout, that surface
+repoints the link to their real account, and because `reap_agentic_buyer_refs` is keyed on
+`buyer_id` their next purchase mints a fresh ref — so **Reap asks for the card once more**. One
+re-enrollment after a sign-in. That is the trade; WP4 avoided it by refusing those buyers forever.
+
+### Storage the routes own — migrations 226 and 227
 
 Three tables, none of them touched by the state machine or the poller. Also in
 `db/schema_guard.ensure_required_schema_light` in **both** dialect branches, in their own
@@ -548,7 +562,7 @@ try/except, because production deploys skip `db/migrations/`.
 | table | what it is |
 |---|---|
 | `reap_agentic_eligibility` | the allowlist. `(merchant_domain, market_country, product_key, variant_key)` |
-| `reap_agentic_buyer_refs` | `buyer_id` → the opaque `owner.id` we send Reap. Minted once, never exposed. |
+| `reap_agentic_buyer_refs` | `buyer_id` → the opaque `owner.id` we send Reap. Minted once, never exposed. Migration **227** adds `consent_version VARCHAR(32)` and `consented_at TIMESTAMPTZ` — the terms the buyer's enrollment was established under, rewritten on every purchase so the pair is always the latest. Nullable only because rows minted before 227 exist; nothing written from now on can be NULL, because the route refuses `consent_required` before it writes. |
 | `reap_agentic_purchase_keys` | idempotency, 24 h, scoped to `(agent_id, agent_user_ref_hash, idempotency_key)`, carrying a hash of the request the key was used for — the same key on a different body is `idempotency_conflict`, not a 202 about somebody else's purchase |
 
 `reap_buyer_ref` is a **third** identifier, not the global buyer id and not
@@ -563,27 +577,42 @@ wanted.
 
 Three things are true today, and each one will otherwise be discovered as a mystery refusal.
 
-### 1. Every agent-only buyer answers `buyer_unlinked`
+### 1. The door must send `buyer.consent_version`, or every purchase is refused
 
-`buyer_identity_links` has exactly one writer: `routes/buyer_api._upsert_buyer_identity_link`,
-reached from `POST /buyer/save_from_checkout` under **buyer authentication**. The link is created
-when a human signs in and consents; nothing an agent presents can create one.
+This replaces the old item 1, "every agent-only buyer answers `buyer_unlinked`". That is no longer
+true: since WP4b the first purchase creates the buyer identity, so an agent with **zero** rows in
+`buyer_identity_links` is now perfectly armable. The blocker moved.
 
-**The refusal stays.** A Reap enrollment is a STORED CARD. Minting a link from an agent's bare
-assertion would hang that card off a buyer account nothing else in the system knows about, and the
-same human signing in tomorrow would get a second account and be asked for their card again.
+**The new blocker is the door.** `buyer.consent_version` is required on every `POST /purchases`,
+and a door that does not send it gets `400 consent_required` on every single request — which looks
+exactly like a broken rail. Confirm the door sends it **before** you arm anything.
 
-So: **this rail cannot be armed for Minds buyers until there is a buyer-authenticated enrollment
-step** — a point in the flow where the buyer themselves establishes the link, after which the
-agent's user token resolves to a real buyer. Until then every `POST /purchases` from an agent-only
-session answers `409 buyer_unlinked`, the door falls back, and that is correct behaviour rather
-than something to route around. Check before you arm anything:
+After arming, this is the query that tells you whether consent is actually arriving:
+
+```sql
+SELECT consent_version, COUNT(*), MAX(consented_at)
+  FROM reap_agentic_buyer_refs
+ GROUP BY consent_version
+ ORDER BY 2 DESC;
+```
+
+A `NULL` group is rows minted before migration 227 — expected, and only for buyers linked by the
+hosted checkout before this shipped. A *growing* NULL group is impossible unless the consent write
+has been broken; investigate rather than waiting.
+
+To see the identities the rail is creating for an agent:
 
 ```sql
 SELECT COUNT(*) FROM buyer_identity_links WHERE agent_id = '<agent_id>';
 ```
 
-Zero means arming the rail for that agent will change nothing at all.
+Zero no longer means "arming will change nothing" — it means no purchase has been made yet. The
+count should climb by one per new end user.
+
+**One thing to expect in support.** A buyer whose identity this rail created, who *later* signs in
+through the hosted checkout, gets their link repointed to their real account — and because
+`reap_agentic_buyer_refs` is keyed on `buyer_id`, their next purchase asks them to enter the card
+once more. That is correct and happens at most once per buyer. It is not a bug report.
 
 ### 2. The merchant must have an offer of its own, in the market's currency
 
@@ -690,8 +719,8 @@ SELECT merchant_domain, market_country, enabled, updated_at
 | `tests/test_reap_agentic_purchase_postgres.py` | Postgres (dialect gate) | the fence across **two backend connections**, jsonb-as-text, the server-side clock, the partial unique index, PREPARE |
 | `tests/test_reap_agentic_purchase_poll.py` | SQLite | the poller: the gate (step 4 only), the run order, the counts, the dials and their bounds, the budget, the leftover-claims invariant, cancellation, registration |
 | `tests/test_reap_agentic_purchase_poll_postgres.py` | Postgres (dialect gate) | the poller across **two real backend connections**, its SQL constants under PREPARE, the error backoff against the server clock, `include_processing=False` on the real statement, the PII deadline with the rail off, claim release on cancellation |
-| `tests/test_agent_commerce_reap_routes.py` | SQLite | the three routes over the real app: the router is MOUNTED, the 404 on all three while dark **and for every shape of malformed input**, the ownership conjuncts, eligibility and the market, the price coming from our catalog and from THIS merchant's own offer, the market-currency rule, the buyer ref, idempotency including the request-hash conflict, unprintable identifiers, the hosted-URL vetting, the per-statement self-heal, and that no response or log line carries the buyer |
-| `tests/test_agent_commerce_reap_routes_postgres.py` | Postgres (dialect gate) | migration 226 vs the self-heal through the **catalog** (columns, `indexdef`, `pg_get_constraintdef`), the `numeric`→`Decimal` price path the `CAST` exists for, the `market_country` regex CHECK, **a NUL byte in an identifier being a refusal and not a 500** (asyncpg raises where SQLite stores it happily, so only this arm can see it), and every security-relevant refusal re-run on the production dialect |
+| `tests/test_agent_commerce_reap_routes.py` | SQLite | the three routes over the real app: the router is MOUNTED, the 404 on all three while dark **and for every shape of malformed input**, the ownership conjuncts, eligibility and the market, the price coming from our catalog and from THIS merchant's own offer, the market-currency rule, the buyer ref, idempotency including the request-hash conflict, unprintable identifiers, the hosted-URL vetting, the per-statement self-heal, and that no response or log line carries the buyer; **WP4b**: the first purchase minting exactly one buyer/link/ref, the second reusing them, a hosted-checkout link never being re-minted, two agents sharing a user ref getting two buyers, a link racing in at the write seam winning, and consent being required, ordered after the dial, and stored |
+| `tests/test_agent_commerce_reap_routes_postgres.py` | Postgres (dialect gate) | migrations 226+227 vs the self-heal through the **catalog** (columns, `indexdef`, `pg_get_constraintdef`), the `numeric`→`Decimal` price path the `CAST` exists for, the `market_country` regex CHECK, **a NUL byte in an identifier being a refusal and not a 500** (asyncpg raises where SQLite stores it happily, so only this arm can see it), and every security-relevant refusal re-run on the production dialect; **WP4b**: the mint against the REAL unique constraint (`ON CONFLICT DO NOTHING` as Postgres implements it), the `VARCHAR(32)` consent cap refusing rather than truncating, and `consented_at` being a real aware `timestamptz` |
 
 All four drive the **real** ledger and the client's **real** pure helpers; only the client's six
 transport functions are faked, and an autouse fixture makes an unpatched `httpx.AsyncClient`
@@ -706,6 +735,6 @@ DATABASE_URL=postgresql://postgres:postgres@localhost:5432/pivota_reap_wp3_test 
     .venv/bin/python -m pytest tests/test_reap_agentic_purchase_poll_postgres.py
 
 .venv/bin/python -m pytest tests/test_agent_commerce_reap_routes.py
-DATABASE_URL=postgresql://postgres:postgres@localhost:5432/pivota_reap_wp4_test \
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/pivota_reap_wp4b_test \
     .venv/bin/python -m pytest tests/test_agent_commerce_reap_routes_postgres.py
 ```
