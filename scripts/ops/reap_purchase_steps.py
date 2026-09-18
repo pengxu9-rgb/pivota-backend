@@ -27,7 +27,12 @@ WHAT THIS SCRIPT WILL NOT DO, AND WHY THAT IS THE DESIGN.
   `enroll` and `checkout` are DRY BY DEFAULT and need `--apply`. Both CREATE something at a
   partner: an enrollment is cheap, but a checkout against a live quote is the step where a real
   buyer's card gets charged, and a dry run that prints the exact body is worth more than an
-  undo that does not exist. `poll` is read-only and needs no flag.
+  undo that does not exist.
+
+  `poll` needs no flag because it creates NOTHING AT THE PARTNER -- it is two GETs. It is not
+  "read-only" without qualification, and the docstring used to say so: it rewrites the state
+  file with the statuses it saw. Nothing there is destructive, but an operator who read
+  "read-only" and pointed two polls at one state file would have been told something untrue.
 
   It is not run by CI and it is not imported by anything. Live verification is a human sitting
   with the sandbox key, reading what came back.
@@ -96,6 +101,26 @@ def _save(path: str, state: Dict[str, Any]) -> None:
 
 
 # --- shared preamble ------------------------------------------------------------------------
+
+
+def _checked_id(rc, value, *, what, uuid=False):
+    """Validate an id the way the client will, but HERE, where the failure is a message.
+
+    The client validates ids and raises ReapRequestError; this script called those functions
+    without catching it, so `--attempt-id 'a/b'`, a 65-character attempt id, a malformed
+    `--enrollment-id`, and a malformed id read out of the STATE FILE each ended in a traceback.
+    A traceback is the wrong output for an operator error: the exception already carries a
+    sentence written for a human, and a stack buries it.
+
+    Returns the id, or exits 2 with that sentence. The try/except around each call stays as the
+    backstop -- this is the one that fires first and says which flag was wrong.
+    """
+    try:
+        return rc._path_id(value, what=what, uuid=uuid)
+    except rc.ReapRequestError as exc:
+        print(f"\nBAD {what.upper()} ID: {exc}")
+        print("Nothing was sent.")
+        raise SystemExit(2)
 
 
 def _client():
@@ -167,6 +192,11 @@ def _show_hosted(rc, payload: Dict[str, Any]) -> Optional[str]:
 
 def cmd_enroll(args) -> int:
     rc = _client()
+    # VALIDATED BEFORE THE DRY RUN, not inside the --apply branch where it used to live. A dry
+    # run exists to tell an operator their request is wrong before they send one; one that
+    # prints a confident body and defers the id check to `--apply` tells them the opposite.
+    attempt_id = args.attempt_id or f"ops-{int(time.time())}"
+    attempt_id = _checked_id(rc, attempt_id, what="enrollment attempt")
     try:
         body = rc.build_enrollment_request(
             owner_id=args.owner_id, return_url=args.return_url, email=args.email
@@ -183,10 +213,10 @@ def cmd_enroll(args) -> int:
           "either of them, or any `cardId`, at all.")
 
     if not args.apply:
+        print(f"\nattempt id : {attempt_id}   (idempotency material; NOT sent in the body)")
         print("\nDRY RUN. Nothing was sent. Re-run with --apply to create this enrollment.")
         return 0
 
-    attempt_id = args.attempt_id or f"ops-{int(time.time())}"
     print(f"\nattempt id : {attempt_id}   (idempotency material; NOT sent in the body)")
     print("A NEW attempt id means a NEW enrollment. Reuse one only to retry an attempt whose\n"
           "outcome you never saw -- the key is not time-bucketed, so reusing it tomorrow would\n"
@@ -223,6 +253,8 @@ def cmd_checkout(args) -> int:
     if not enrollment_id:
         print("\nNo enrollment id — run `enroll` first, or pass --enrollment-id.")
         return 3
+    enrollment_id = _checked_id(rc, enrollment_id, what="enrollment", uuid=True)
+    quote_id = _checked_id(rc, args.quote_id, what="quote")
 
     if not args.skip_enrollment_check:
         current = asyncio.run(rc.get_enrollment(enrollment_id))
@@ -248,7 +280,7 @@ def cmd_checkout(args) -> int:
 
     try:
         body = rc.build_checkout_request(
-            quote_id=args.quote_id, enrollment_id=enrollment_id, return_url=args.return_url
+            quote_id=quote_id, enrollment_id=enrollment_id, return_url=args.return_url
         )
     except rc.ReapRequestError as exc:
         print(f"\nREFUSED BEFORE EGRESS: {exc}")
@@ -269,7 +301,7 @@ def cmd_checkout(args) -> int:
         return 0
 
     result = asyncio.run(rc.create_checkout(
-        quote_id=args.quote_id, enrollment_id=enrollment_id, return_url=args.return_url
+        quote_id=quote_id, enrollment_id=enrollment_id, return_url=args.return_url
     ))
     if not result.ok:
         _report_failure(rc, result)
@@ -283,7 +315,7 @@ def cmd_checkout(args) -> int:
     _show_hosted(rc, payload)
 
     state["checkout_id"] = payload.get("id")
-    state["quote_id"] = args.quote_id
+    state["quote_id"] = quote_id
     state["checkout_status"] = payload.get("status")
     state["checkout_created_at"] = time.time()
     _save(args.state, state)
@@ -300,13 +332,21 @@ def cmd_poll(args) -> int:
     if not enrollment_id and not checkout_id:
         print("\nNothing to poll — no ids in the state file and none passed.")
         return 3
+    # Checked even when they came from the STATE FILE: that file is edited by hand between runs,
+    # and "it was in the json" is not provenance.
+    if enrollment_id:
+        enrollment_id = _checked_id(rc, enrollment_id, what="enrollment", uuid=True)
+    if checkout_id:
+        checkout_id = _checked_id(rc, checkout_id, what="checkout")
 
     changed = False
+    failed = False
     if enrollment_id:
         result = asyncio.run(rc.get_enrollment(enrollment_id))
         print("\n--- ENROLLMENT " + "-" * 56)
         if not result.ok:
             _report_failure(rc, result)
+            failed = True
         else:
             payload = result.data
             print(f"id     : {payload.get('id')}")
@@ -326,6 +366,7 @@ def cmd_poll(args) -> int:
         print("\n--- CHECKOUT " + "-" * 58)
         if not result.ok:
             _report_failure(rc, result)
+            failed = True
         else:
             payload = result.data
             where = rc.checkout_state(payload)
@@ -348,7 +389,12 @@ def cmd_poll(args) -> int:
     if changed:
         state["polled_at"] = time.time()
         _save(args.state, state)
-    return 0
+    # N4. `poll` used to exit 0 on EVERY failure -- a 400 ENROLLMENT_NOT_ACTIVE and a 500 both
+    # printed their explanation and then reported success. That is the shape that makes a poll
+    # loop in a shell script spin forever on a dead enrollment, and it disagreed with `enroll`
+    # and `checkout`, which both return 4. The explanation is still printed; the exit code now
+    # matches it.
+    return 4 if failed else 0
 
 
 def main() -> int:
@@ -383,7 +429,8 @@ def main() -> int:
     checkout.add_argument("--apply", action="store_true", help="actually create it")
     checkout.set_defaults(func=cmd_checkout)
 
-    poll = sub.add_parser("poll", help="read the enrollment and/or checkout. Read-only.")
+    poll = sub.add_parser("poll", help="read the enrollment and/or checkout; creates nothing at "
+                                       "the partner, but does update the state file")
     poll.add_argument("--enrollment-id")
     poll.add_argument("--checkout-id")
     poll.set_defaults(func=cmd_poll)

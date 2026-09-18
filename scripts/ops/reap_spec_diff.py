@@ -236,10 +236,23 @@ def _required_delta(old: Any, new: Any) -> List[str]:
     return lines
 
 
+#: The published spec is ~1.7 MB. 8 MiB is far clear of that and still bounded: `response.read()`
+#: with no argument reads whatever the host sends, and this script is pointed at a URL an operator
+#: can override.
+MAX_SPEC_BYTES = 8 * 1024 * 1024
+
+
 def fetch(url: str = SPEC_URL, *, timeout: float = 60.0) -> Dict[str, Any]:
+    if not str(url).startswith("https://"):
+        # An http:// spec is a document an intermediary can rewrite, and what we do with it is
+        # decide whether our request bodies are still correct.
+        raise ValueError(f"spec URL must be https, got {url!r}")
     request = urllib.request.Request(url, headers={"User-Agent": "Pivota/1.0 (+https://pivota.cc)"})
     with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
-        return json.loads(response.read().decode("utf-8"))
+        raw = response.read(MAX_SPEC_BYTES + 1)
+    if len(raw) > MAX_SPEC_BYTES:
+        raise ValueError(f"spec at {url} exceeded {MAX_SPEC_BYTES} bytes; refusing to parse it")
+    return json.loads(raw.decode("utf-8"))
 
 
 def main() -> int:

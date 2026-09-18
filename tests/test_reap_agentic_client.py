@@ -4558,10 +4558,14 @@ def test_the_owner_id_goes_in_params_not_pasted_into_the_url(wire, clean_env):
     """Handed to httpx to encode. An id string-formatted into the URL by us is the other half of
     the path-injection surface `_path_id` covers."""
     wire.next_payload = {"items": [], "nextCursor": None}
-    _run(rc.list_enrollments(owner_id="cust 42/&x=1", limit=5))
+    # URL-STRUCTURAL characters, not whitespace. The point here is that `/`, `&` and `=` reach
+    # httpx to encode rather than being pasted into the path -- whitespace is now refused
+    # outright by `list_enrollments`, which is a different guard with its own test, and using a
+    # space here would have made this test about that instead.
+    _run(rc.list_enrollments(owner_id="cust42/&x=1", limit=5))
     call = wire.calls[0]
     assert call["url"] == "https://sandbox.api.reap.global/agentic/enrollments"
-    assert call["params"]["ownerId"] == "cust 42/&x=1"
+    assert call["params"]["ownerId"] == "cust42/&x=1"
     assert "?" not in call["url"]
 
 
@@ -5198,6 +5202,12 @@ URL_PATHS_AND_GUARDS = {
     "POST /agentic/mandates/{id}/cancel RESPONSE nextAction.url": "NOT CALLED",
     "POST /agentic/mandates/{id}/cancel RESPONSE merchant.url": "NOT CALLED",
     "POST /agentic/enrollments/{id}/revoke RESPONSE nextAction.url": "NOT CALLED",
+    # The two QUOTE reads. They carry no `nextAction` and no URL in today's schema -- which is
+    # why they are commented rather than keyed: the ratchet compares against what the fixture
+    # actually declares, and a row for a field that does not exist would now fail as stale. They
+    # are wrapped in `_refuse_unsafe_hosted_url` anyway; see `get_quote` for why, and
+    # `test_the_quote_reads_are_wrapped_even_though_todays_schema_has_no_url` for the pin.
+    #
     # Inbound MEDIA urls, and these are UNGUARDED today. They are not card-entry pages, so the
     # hosted-URL rule does not apply to them -- but they are partner-controlled strings that a
     # UI would put in an `img src`, and nothing in this module vets them. Out of scope for WP1
@@ -5211,24 +5221,63 @@ URL_PATHS_AND_GUARDS = {
 }
 
 
-def _url_bearing_paths(spec):
-    """Re-derive the url-bearing fields from the fixture, as field names rather than positions."""
-    found = set()
+def field_of_entry(entry):
+    """`"POST /x RESPONSE nextAction.url"` and `"POST /x RESPONSE.nextAction.url"` -> the same
+    key. The table is written for a human; the walker emits dotted paths."""
+    for marker in (" RESPONSE", " REQUEST"):
+        if marker in entry:
+            head, _, tail = entry.partition(marker)
+            return f"{head}{marker} {tail.lstrip(' .').replace('items[].', '')}"
+    return entry
 
-    def walk(node, path):
+
+def _ratchet_mismatch(derived, declared):
+    """`(unclassified, stale)` -- the two directions the ratchet must report.
+
+    Factored out of the assertion because an inline `derived == declared` is not reachable from
+    a test: only the derivation could be driven, so the STALE direction was asserted nowhere and
+    a one-sided mutant survived the whole suite. A comparison worth making both ways is worth
+    being able to test both ways.
+    """
+    return sorted(derived - declared), sorted(declared - derived)
+
+
+def _url_bearing_paths(spec):
+    """Re-derive the url-bearing fields from the fixture, as field names rather than positions.
+
+    IT FOLLOWS `$ref`. It did not, and the two-way ratchet is what found that: the enrollment
+    create's 200 is a `oneOf` of refs into `components`, so its `nextAction.url` -- the first
+    hosted URL in the whole flow, the one a buyer types a card into -- was invisible to the
+    derivation. The table declared it and the one-sided check never compared in that direction,
+    so the gap read as coverage. A ratchet that cannot see the component schemas is a ratchet
+    over the shallow half of the document.
+
+    `seen` guards against a self-referential schema; the spec has none today, and a test that
+    hangs on a re-pin is not a test anybody keeps.
+    """
+    found = set()
+    schemas = (spec.get("components") or {}).get("schemas") or {}
+
+    def walk(node, path, seen=()):
         if isinstance(node, dict):
+            ref = node.get("$ref")
+            if isinstance(ref, str) and ref.startswith("#/components/schemas/"):
+                name = ref.rsplit("/", 1)[-1]
+                if name in schemas and name not in seen:
+                    walk(schemas[name], path, seen + (name,))
+                return
             if node.get("format") == "uri" or (
                     node.get("type") == "string"
                     and path.rsplit(".", 1)[-1].lower().endswith("url")):
                 found.add(path)
             for key, value in node.items():
                 if key in ("properties", "items", "oneOf", "anyOf", "allOf"):
-                    walk(value, path)
+                    walk(value, path, seen)
                 elif key not in ("description", "example", "title", "format", "pattern"):
-                    walk(value, f"{path}.{key}" if path else key)
+                    walk(value, f"{path}.{key}" if path else key, seen)
         elif isinstance(node, list):
             for value in node:
-                walk(value, path)
+                walk(value, path, seen)
 
     for path, item in spec["paths"].items():
         for method, op in item.items():
@@ -5245,23 +5294,36 @@ def _url_bearing_paths(spec):
 
 def test_every_url_bearing_field_in_the_pinned_spec_has_been_classified():
     """THE RATCHET. Reap moved a required field once without saying so; the next thing they move
-    could be a new URL we hand a buyer. Counting them is not enough — this compares the SET, so
-    a re-pin that adds one fails here and somebody has to decide what guards it."""
-    def field_of(entry):
-        """`"POST /x RESPONSE nextAction.url"` and `"POST /x RESPONSE.nextAction.url"` -> the
-        same key. The table is written for a human; the walker emits dotted paths."""
-        for marker in (" RESPONSE", " REQUEST"):
-            if marker in entry:
-                head, _, tail = entry.partition(marker)
-                return f"{head}{marker} {tail.lstrip(' .').replace('items[].', '')}"
-        return entry
-
-    derived = {field_of(d) for d in _url_bearing_paths(_spec())}
-    declared = {field_of(k) for k in URL_PATHS_AND_GUARDS}
-    unclassified = derived - declared
-    assert not unclassified, (
-        f"url-bearing schema fields with no entry in URL_PATHS_AND_GUARDS: {sorted(unclassified)}"
+    could be a new URL we hand a buyer. Counting them is not enough, and neither is checking one
+    direction — this compares the SET BOTH WAYS, so a re-pin that adds a url-bearing field fails
+    until somebody decides what guards it, and one that removes a field fails until the row
+    claiming to guard it is deleted."""
+    derived = {field_of_entry(d) for d in _url_bearing_paths(_spec())}
+    declared = {field_of_entry(k) for k in URL_PATHS_AND_GUARDS}
+    # SET EQUALITY, both directions. `derived - declared` alone catches a field the partner ADDS
+    # and says nothing about one they REMOVE -- which leaves a stale row claiming a guard on a
+    # field that no longer exists, and a table that describes a schema we are not talking to is
+    # worse than no table, because it reads as assurance.
+    unclassified, stale = _ratchet_mismatch(derived, declared)
+    assert not unclassified and not stale, (
+        f"unclassified (in the spec, no guard named): {unclassified}\n"
+        f"stale (guard named, not in the spec): {stale}"
     )
+
+
+def test_the_ratchet_reports_a_STALE_row_as_well_as_an_unclassified_field():
+    """The direction a one-sided check cannot see. A row naming a guard for a field the partner
+    has REMOVED is a table describing a schema we are not talking to -- worse than no table,
+    because it reads as assurance. Both directions, and a control showing the real sets agree."""
+    real = {field_of_entry(d) for d in _url_bearing_paths(_spec())}
+    declared = {field_of_entry(k) for k in URL_PATHS_AND_GUARDS}
+    assert _ratchet_mismatch(real, declared) == ([], [])
+
+    unclassified, stale = _ratchet_mismatch(real | {"POST /x RESPONSE newThing.url"}, declared)
+    assert unclassified == ["POST /x RESPONSE newThing.url"] and stale == []
+
+    unclassified, stale = _ratchet_mismatch(real, declared | {"POST /x RESPONSE goneThing.url"})
+    assert stale == ["POST /x RESPONSE goneThing.url"] and unclassified == []
 
 
 def test_the_url_ratchet_actually_bites():
@@ -6294,3 +6356,504 @@ def test_a_single_alias_still_reaches_the_client_as_a_tuple_not_a_string(monkeyp
     monkeypatch.setattr(_sys, "argv", ["prog", "--alias", "OS"])
     module.main()
     assert seen["accept_variant_labels"] == ("OS",)
+
+
+# ==================================================================================================
+# MERGE-READINESS REVIEW. N1 is the blocking one: the return-url guard EXISTED and nothing pinned
+# that the builders call it.
+# ==================================================================================================
+
+#: Hostile `returnUrl` values, each for a different reason.
+HOSTILE_RETURN_URLS = [
+    "https://evil.example/steal?next=1",      # an open redirector with a card page in front
+    "https://agent.pivota.cc/r\r\nX: y",      # header injection through a sanitised parse
+    "http://agent.pivota.cc/r",               # downgraded
+    "https://evil.example@agent.pivota.cc/r",  # host is ours, the prefix is not
+    "https://agent.pivota.cc.evil.example/r",  # suffix confusion
+    "",
+]
+
+
+@pytest.mark.parametrize("bad", HOSTILE_RETURN_URLS)
+def test_the_enrollment_BUILDER_refuses_a_hostile_return_url(bad, clean_env):
+    """N1. `validate_return_url` was correct and well tested on its own — and NOTHING pinned that
+    either builder actually called it. Replacing the call with the raw `return_url` left all 815
+    tests green while `presentation.returnUrl` became whatever the caller passed. A guard that
+    nothing proves is reached is a guard that can be deleted by accident."""
+    with pytest.raises(rc.ReapRequestError):
+        rc.build_enrollment_request(owner_id="cust_42", return_url=bad)
+
+
+@pytest.mark.parametrize("bad", HOSTILE_RETURN_URLS)
+def test_the_checkout_BUILDER_refuses_a_hostile_return_url(bad, clean_env):
+    with pytest.raises(rc.ReapRequestError):
+        rc.build_checkout_request(quote_id="f1e2d3c4", enrollment_id=ENROLLMENT_UUID,
+                                  return_url=bad)
+
+
+@pytest.mark.parametrize("bad", HOSTILE_RETURN_URLS)
+def test_create_enrollment_refuses_a_hostile_return_url_before_egress(bad, wire, clean_env):
+    """At the CALL SITE, with zero transport calls. The builder refusing is necessary; what
+    matters operationally is that nothing reaches Reap."""
+    with pytest.raises(rc.ReapRequestError):
+        _run(rc.create_enrollment(owner_id="cust_42", return_url=bad, attempt_id=ATTEMPT_ID))
+    assert wire.calls == []
+
+
+@pytest.mark.parametrize("bad", HOSTILE_RETURN_URLS)
+def test_create_checkout_refuses_a_hostile_return_url_before_egress(bad, wire, clean_env):
+    with pytest.raises(rc.ReapRequestError):
+        _run(rc.create_checkout(quote_id="f1e2d3c4", enrollment_id=ENROLLMENT_UUID,
+                                return_url=bad))
+    assert wire.calls == []
+
+
+def test_the_return_url_that_reaches_the_wire_is_the_validated_one(wire, clean_env):
+    """THE CONTROL for all four above, and the positive half of the same claim: a good URL does
+    arrive, unchanged, in `presentation.returnUrl`."""
+    wire.next_payload = ENROLLMENT_CREATED
+    _run(rc.create_enrollment(owner_id="cust_42", return_url=RETURN_URL, attempt_id=ATTEMPT_ID))
+    assert wire.calls[0]["body"]["presentation"]["returnUrl"] == RETURN_URL
+    wire.next_payload = CHECKOUT_CREATED
+    _run(rc.create_checkout(quote_id="f1e2d3c4", enrollment_id=ENROLLMENT_UUID,
+                            return_url=RETURN_URL))
+    assert wire.calls[1]["body"]["presentation"]["returnUrl"] == RETURN_URL
+
+
+# --- N2: one timeout rule, both verbs ---------------------------------------------------------------
+
+@pytest.mark.parametrize("bad", [True, False, -1, 0, float("nan"), float("inf"), "5", "abc", []])
+@pytest.mark.parametrize("verb", ["get", "post"])
+def test_both_verbs_refuse_the_same_bad_timeouts(bad, verb, wire, clean_env):
+    """`_get` kept `if timeout_seconds:` after `_post` grew validation, so the two disagreed in
+    five ways AT ONCE on the verb that does the polling: True became a 1.0 s timeout, -1 went to
+    httpx as -1.0, nan passed through, 0 and False silently fell back to the default a caller was
+    overriding, and "5" worked by accident. Parametrised over both verbs because the bug was the
+    two of them having separate copies of one rule."""
+    call = (rc.get_checkout("chk_7f3a", timeout_seconds=bad) if verb == "get"
+            else rc.request_quote(items=[{"variantId": "var_x", "quantity": 1}],
+                                  email="b@example.com", timeout_seconds=bad))
+    with pytest.raises(rc.ReapRequestError):
+        _run(call)
+    assert wire.calls == []
+
+
+@pytest.mark.parametrize("verb", ["get", "post"])
+def test_both_verbs_accept_a_real_explicit_timeout(verb, wire, clean_env):
+    """THE CONTROL: a resolver that refused everything would pass the test above."""
+    wire.next_payload = CHECKOUT_COMPLETED if verb == "get" else QUOTE_200
+    call = (rc.get_checkout("chk_7f3a", timeout_seconds=2.5) if verb == "get"
+            else rc.request_quote(items=[{"variantId": "var_x", "quantity": 1}],
+                                  email="b@example.com", timeout_seconds=2.5))
+    _run(call)
+    assert wire.calls[0]["timeout"] == 2.5
+
+
+def test_there_is_exactly_one_timeout_resolver():
+    """The structural half. Two copies of this rule is what produced N2, so the fix is not
+    'fixed the copy' but 'there is one'."""
+    import inspect
+    for fn in (rc._get, rc._post):
+        source = inspect.getsource(fn)
+        assert "resolve_timeout(" in source
+        assert "_env_timeout_floor()" not in source, "the floor rule was re-inlined"
+
+
+# --- N3: one response, one classification, whichever verb asked --------------------------------------
+
+@pytest.mark.parametrize("verb", ["get", "post"])
+def test_an_oversized_4xx_is_a_status_failure_on_both_verbs(verb, wire, clean_env):
+    """`_get` classified by SIZE first, so one oversized 400 was `response_too_large` here and
+    `reap_status_400` there — the same response, two answers, on the pair of verbs a caller uses
+    interchangeably to drive one state machine. A failure is a failure whatever its length."""
+    wire.next_status = 400
+    wire.next_content = b"{" + b"z" * (rc.MAX_RESPONSE_BYTES + 512 * 1024)
+    call = (rc.get_checkout("chk_7f3a") if verb == "get"
+            else rc.create_checkout(quote_id="f1e2d3c4", enrollment_id=ENROLLMENT_UUID,
+                                    return_url=RETURN_URL))
+    got = _run(call)
+    assert got.error == "reap_status_400", got.error
+    assert got.data == {}
+
+
+@pytest.mark.parametrize("verb", ["get", "post"])
+def test_an_oversized_2xx_is_still_too_large_on_both_verbs(verb, wire, clean_env):
+    """THE CONTROL: size classification did not go away, it moved to where it belongs."""
+    wire.next_status = 200
+    wire.next_content = b"{" + b"z" * (rc.MAX_RESPONSE_BYTES + 512 * 1024)
+    call = (rc.get_checkout("chk_7f3a") if verb == "get"
+            else rc.request_quote(items=[{"variantId": "var_x", "quantity": 1}],
+                                  email="b@example.com"))
+    assert _run(call).error == "response_too_large"
+
+
+# --- N6: the two quote reads are wrapped -------------------------------------------------------------
+
+def test_the_quote_reads_are_wrapped_even_though_todays_schema_has_no_url(wire, clean_env):
+    """No `nextAction` exists in the quote schema today, so the guard is a no-op — which is the
+    point: it costs nothing, and this partner has already moved a required field without touching
+    `info.version`. A step-up action on a RE-PRICE is exactly the shape that would appear here
+    first, and an unwrapped read is a hole that opens the day the schema moves."""
+    poisoned = json.loads(json.dumps(QUOTE_200))
+    poisoned["nextAction"] = {"type": "REDIRECT", "url": "https://evil.example/collect-card"}
+    for call in (lambda: rc.get_quote("f1e2d3c4"),
+                 lambda: rc.select_shipping_option(quote_id="f1e2d3c4",
+                                                   shipping_option_id="ship_std")):
+        wire.next_payload = poisoned
+        got = _run(call())
+        assert not got.ok and got.error == "hosted_url_not_allowed"
+        assert got.data == {}
+
+
+def test_a_normal_quote_still_comes_back(wire, clean_env):
+    """THE CONTROL: the guard is a no-op on a payload with no nextAction, which is every quote
+    the schema describes today."""
+    wire.next_payload = QUOTE_200
+    assert _run(rc.get_quote("f1e2d3c4")).ok
+    assert _run(rc.select_shipping_option(quote_id="f1e2d3c4",
+                                          shipping_option_id="ship_std")).ok
+
+
+# --- N7: a shape we cannot walk is refused, not waved through -----------------------------------------
+
+@pytest.mark.parametrize("items", [
+    {"0": {"nextAction": {"type": "REDIRECT", "url": "https://evil.example/x"}}},
+    "not a list",
+    7,
+])
+def test_a_non_list_items_is_refused(items, wire, clean_env):
+    """`if isinstance(items, list)` read as "walk it when it is a list" and therefore as "ignore
+    it when it is not" — the same inversion that let a non-dict `nextAction` through. A
+    dict-shaped `items` carried a hostile action out with ok=True."""
+    wire.next_payload = {"items": items, "nextCursor": None}
+    got = _run(rc.list_enrollments(owner_id="cust_42"))
+    assert not got.ok and got.error == "hosted_url_not_allowed"
+    assert got.data == {}
+
+
+def test_a_list_or_absent_items_is_fine(wire, clean_env):
+    """THE CONTROL, both shapes: a real list, and no `items` key at all (every non-list response)."""
+    wire.next_payload = {"items": [], "nextCursor": None}
+    assert _run(rc.list_enrollments(owner_id="cust_42")).ok
+    wire.next_payload = ENROLLMENT_ACTIVE
+    assert _run(rc.get_enrollment(ENROLLMENT_UUID)).ok
+
+
+# --- N8: ids are strings ------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("value", [7, True, 1.5, ["a"], {"a": 1}])
+def test_a_non_string_id_is_refused_not_coerced(value, wire, clean_env):
+    """`str(7)` is "7" and `str(True)` is "True", both of which pass the charset rule and reach a
+    partner as an id. `attempt_id=True` became the literal attempt "True", shared by every caller
+    who made the same mistake — so two different buyers' enrollments would replay each other."""
+    with pytest.raises(rc.ReapRequestError) as exc:
+        rc._path_id(value, what="checkout")
+    assert "must be a string" in str(exc.value)
+    assert wire.calls == []
+
+
+def test_a_non_string_attempt_id_is_refused_at_the_call_site(wire, clean_env):
+    with pytest.raises(rc.ReapRequestError):
+        _run(rc.create_enrollment(owner_id="c", return_url=RETURN_URL, attempt_id=True))
+    assert wire.calls == []
+
+
+# --- N9: the list endpoint's other caller-supplied strings ---------------------------------------------
+
+@pytest.mark.parametrize("bad", ["cust 42", "cust\r\n42", "cust\x0042", "cust​42"])
+def test_a_hostile_owner_id_is_refused_on_the_LIST_endpoint_too(bad, wire, clean_env):
+    """The builder checked `owner.id` and the list endpoint did not — one of two call sites for
+    the same value, and the unchecked one is the one that puts it in a QUERY STRING."""
+    with pytest.raises(rc.ReapRequestError):
+        _run(rc.list_enrollments(owner_id=bad))
+    assert wire.calls == []
+
+
+@pytest.mark.parametrize("bad", ["cur sor", "cur\r\nsor", 7])
+def test_a_hostile_cursor_is_refused(bad, wire, clean_env):
+    with pytest.raises(rc.ReapRequestError):
+        _run(rc.list_enrollments(owner_id="cust_42", cursor=bad))
+    assert wire.calls == []
+
+
+@pytest.mark.parametrize("bad", ["ADMIN", "client_reference", "", "REAP_USER_EVIL"])
+def test_an_owner_type_outside_the_spec_enum_is_refused(bad, wire, clean_env):
+    """This parameter decides WHOSE enrollments come back."""
+    with pytest.raises(rc.ReapRequestError):
+        _run(rc.list_enrollments(owner_id="cust_42", owner_type=bad))
+    assert wire.calls == []
+
+
+@pytest.mark.parametrize("good", ["CLIENT_REFERENCE", "REAP_USER"])
+def test_both_spec_owner_types_are_accepted(good, wire, clean_env):
+    """THE CONTROL."""
+    wire.next_payload = {"items": [], "nextCursor": None}
+    _run(rc.list_enrollments(owner_id="cust_42", owner_type=good))
+    assert wire.calls[0]["params"]["ownerType"] == good
+
+
+# --- N10: invisible characters are characters ------------------------------------------------------------
+
+@pytest.mark.parametrize("bad", [
+    "https://pay.prava.space/x​y",     # ZWSP
+    "https://pay.prava.space/x﻿y",     # BOM
+    "https://pay.prava.space/‮x",      # RIGHT-TO-LEFT OVERRIDE
+    "https://pay.prava.space/x y",     # LINE SEPARATOR
+    "https://pay.prava.space/x y",     # NO-BREAK SPACE
+])
+def test_an_invisible_character_in_a_hosted_url_is_rejected(bad):
+    """The ASCII-only check missed the half that matters most for a string we hand a buyer as a
+    link: U+202E reverses everything after it in anything that renders it, U+200B and U+FEFF are
+    invisible splitters, U+2028 is a newline to a non-ASCII-aware consumer. None is visible, so
+    none can be part of a legitimate URL."""
+    assert rc.hosted_url_is_allowed(bad) is False
+
+
+@pytest.mark.parametrize("bad", [
+    "https://agent.pivota.cc/r​y",
+    "https://agent.pivota.cc/r y",
+    "https://agent.pivota.cc/r‮y",
+])
+def test_an_invisible_character_in_a_return_url_is_refused(bad, clean_env):
+    with pytest.raises(rc.ReapRequestError):
+        rc.validate_return_url(bad)
+
+
+def test_a_normal_url_with_punctuation_still_passes(clean_env):
+    """THE CONTROL: the check must not start refusing legitimate URLs."""
+    assert rc.hosted_url_is_allowed("https://pay.prava.space/checkout/abc-123_x?session=A.B~C")
+    assert rc.validate_return_url("https://agent.pivota.cc/r?click=a-b_c.d~e&x=1%20y")
+
+
+# --- N12: path SEGMENTS, not string prefixes ---------------------------------------------------------------
+
+@pytest.mark.parametrize("path,expected", [
+    ("/agentic/enrollments", True),
+    ("/agentic/enrollments/abc", True),
+    ("/agentic/checkouts", True),
+    ("/agentic/checkouts/abc", True),
+    ("/agentic/enrollmentsEVIL", False),
+    ("/agentic/checkoutsEVIL/x", False),
+    ("/agentic/quotes", False),
+    ("/agentic/quotes/abc/shipping-option", False),
+])
+def test_the_error_code_paths_are_matched_by_segment(path, expected):
+    """`"/agentic/enrollmentsEVIL".startswith("/agentic/enrollments")` is True, so a prefix test
+    quietly extended "we read this failure body" to any path beginning with one of these."""
+    assert rc._reads_error_codes(path) is expected
+
+
+# --- N14: the shipping-option re-prices, so it gets the slow bound --------------------------------------------
+
+def test_the_shipping_option_call_gets_the_slow_path_timeout(wire, clean_env):
+    """It goes back to the merchant's commerce layer for shipping and tax — the same work a quote
+    does, and measured at the same 13-16 s. On the 25 s default it would have timed out."""
+    wire.next_payload = QUOTE_200
+    _run(rc.select_shipping_option(quote_id="f1e2d3c4", shipping_option_id="ship_std"))
+    assert wire.calls[0]["timeout"] == rc._QUOTE_TIMEOUT_S
+
+
+def test_a_path_that_merely_contains_shipping_option_is_not_slow():
+    """THE CONTROL for a suffix rule: it matches the END of the path, not anywhere in it."""
+    assert rc.default_timeout_for("/agentic/quotes/q/shipping-option") == rc._QUOTE_TIMEOUT_S
+    assert rc.default_timeout_for("/agentic/shipping-option/evil") == rc._DEFAULT_TIMEOUT_S
+
+
+# --- N11: the ratchet compares the SET, both ways -------------------------------------------------------------
+
+def test_the_ratchet_notices_a_REMOVED_url_field_too():
+    """One-sided, it caught a field the partner ADDS and said nothing about one they REMOVE —
+    leaving a row claiming a guard on a field that no longer exists. A table that describes a
+    schema we are not talking to is worse than no table: it reads as assurance."""
+    spec = json.loads(json.dumps(_spec()))
+    # All THREE enrollment-create branches, because the 200 is a `oneOf` over them and removing
+    # the field from one leaves the others declaring it — which is itself worth knowing: the
+    # derivation is a union over the branches, so a url only disappears when every branch drops
+    # it. Getting this wrong in the test is how I learned it.
+    for name in ("ExternalEnrollmentCreateResponse", "ReapCardEnrollmentCreateResponse",
+                 "BinSponsorEnrollmentCreateResponse"):
+        spec["components"]["schemas"][name]["properties"].pop("nextAction", None)
+    derived = _url_bearing_paths(spec)
+    # The POST create SPECIFICALLY. `GET /agentic/enrollments` (the list) declares its own
+    # inline `nextAction` and is untouched by this edit — a substring match on
+    # "/agentic/enrollments RESPONSE" hits both, which is how this assertion was wrong first.
+    gone = "POST /agentic/enrollments RESPONSE.nextAction.url"
+    assert gone not in derived, sorted(d for d in derived if "enrollments" in d)
+    # And the pinned spec DOES have it, so the equality assertion is meaningful.
+    assert gone in _url_bearing_paths(_spec())
+
+
+def test_the_ratchet_sees_through_a_ref_into_components():
+    """The blind spot the two-way check found: the enrollment create's 200 is a `oneOf` of refs,
+    so the FIRST hosted URL in the whole flow was invisible to the derivation while the table
+    declared it — and the one-sided check never compared in that direction."""
+    derived = _url_bearing_paths(_spec())
+    assert any(d.startswith("POST /agentic/enrollments RESPONSE") and d.endswith("nextAction.url")
+               for d in derived), sorted(derived)
+
+
+# --- the operator script's exit codes and residual tracebacks ------------------------------------------
+#
+# Driven as a SUBPROCESS, because the thing under test is the exit code and whether a traceback
+# reaches stderr -- neither of which is observable from an in-process call to `main()`.
+
+_STEPS_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "scripts", "ops", "reap_purchase_steps.py")
+
+
+def _run_steps(tmp_path, *args, state=None):
+    import subprocess
+    env = {"PATH": "/usr/bin:/bin",
+           "REAP_API_BASE_URL": "https://sandbox.api.reap.global",
+           "REAP_API_KEY": "not-a-real-key"}
+    state_path = str(state or (tmp_path / "state.json"))
+    return subprocess.run([_sys.executable, _STEPS_PATH, "--state", state_path, *args],
+                          capture_output=True, text=True,
+                          cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                          env=env)
+
+
+@pytest.mark.parametrize("bad", ["a/b", "x" * 65, "has space", "a?b=1"])
+def test_a_malformed_attempt_id_is_a_message_not_a_traceback(tmp_path, bad):
+    """N5. The CLIENT validates ids and raises; the script called it unwrapped, so every one of
+    these ended in a stack trace. The exception already carries a sentence written for an
+    operator — a traceback buries it."""
+    out = _run_steps(tmp_path, "enroll", "--owner-id", "ops-1", "--attempt-id", bad)
+    assert out.returncode == 2, out.stdout + out.stderr
+    assert "Traceback" not in out.stderr
+    assert "BAD ENROLLMENT ATTEMPT ID" in out.stdout
+
+
+def test_a_malformed_enrollment_id_on_checkout_is_a_message(tmp_path):
+    out = _run_steps(tmp_path, "checkout", "--quote-id", "f1e2d3c4",
+                     "--enrollment-id", "a/b", "--skip-enrollment-check")
+    assert out.returncode == 2, out.stdout + out.stderr
+    assert "Traceback" not in out.stderr
+    assert "BAD ENROLLMENT ID" in out.stdout
+
+
+def test_a_malformed_quote_id_on_checkout_is_a_message(tmp_path):
+    out = _run_steps(tmp_path, "checkout", "--quote-id", "f1/../x",
+                     "--enrollment-id", ENROLLMENT_UUID, "--skip-enrollment-check")
+    assert out.returncode == 2, out.stdout + out.stderr
+    assert "Traceback" not in out.stderr
+    assert "BAD QUOTE ID" in out.stdout
+
+
+@pytest.mark.parametrize("flag,value", [
+    ("--enrollment-id", "a/b"),
+    ("--checkout-id", "chk 7f3a"),
+])
+def test_a_malformed_id_on_poll_is_a_message(tmp_path, flag, value):
+    out = _run_steps(tmp_path, "poll", flag, value)
+    assert out.returncode == 2, out.stdout + out.stderr
+    assert "Traceback" not in out.stderr
+
+
+def test_a_malformed_id_in_the_STATE_FILE_is_a_message(tmp_path):
+    """The state file is edited by hand between runs, so "it was in the json" is not provenance."""
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"enrollment_id": "a/b", "checkout_id": "chk_ok"}))
+    out = _run_steps(tmp_path, "poll", state=state)
+    assert out.returncode == 2, out.stdout + out.stderr
+    assert "Traceback" not in out.stderr
+
+
+def test_the_script_still_runs_with_well_formed_ids(tmp_path):
+    """THE CONTROL: validation that refused everything would pass every test above and make the
+    script useless. A dry-run enroll with a good attempt id must still reach its dry-run exit."""
+    out = _run_steps(tmp_path, "enroll", "--owner-id", "ops-1", "--attempt-id", "enr-row-1")
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert "DRY RUN" in out.stdout
+
+
+# --- N4: `poll` exited 0 on every failure ------------------------------------------------------------------
+
+def test_poll_exits_non_zero_when_a_read_fails(tmp_path, monkeypatch):
+    """N4. A 400 ENROLLMENT_NOT_ACTIVE and a 500 both printed their explanation and then reported
+    SUCCESS — which is what makes a poll loop in a shell script spin forever on a dead
+    enrollment, and it disagreed with `enroll` and `checkout`, which both return 4."""
+    module = _purchase_steps()
+
+    async def failing_get(_id, **kw):
+        return rc.ReapResponse(ok=False, status=400, error="reap_status_400",
+                               error_code="AGENTIC_REQUEST_REJECTED",
+                               error_detail_code="ENROLLMENT_NOT_ACTIVE")
+
+    monkeypatch.setenv("REAP_API_BASE_URL", "https://sandbox.api.reap.global")
+    monkeypatch.setenv("REAP_API_KEY", "sk_test_key")
+    monkeypatch.setattr(rc, "get_enrollment", failing_get)
+    monkeypatch.setattr(rc, "get_checkout", failing_get)
+
+    args = _sys.modules["argparse"].Namespace(
+        state=str(tmp_path / "s.json"), enrollment_id=ENROLLMENT_UUID, checkout_id="chk_7f3a")
+    assert module.cmd_poll(args) == 4
+
+
+def test_poll_exits_zero_when_both_reads_succeed(tmp_path, monkeypatch):
+    """THE CONTROL: a poll that always failed would satisfy the test above and break the loop it
+    exists to drive."""
+    module = _purchase_steps()
+
+    async def ok_enrollment(_id, **kw):
+        return rc.ReapResponse(ok=True, status=200, data=ENROLLMENT_ACTIVE)
+
+    async def ok_checkout(_id, **kw):
+        return rc.ReapResponse(ok=True, status=200, data=CHECKOUT_COMPLETED)
+
+    monkeypatch.setenv("REAP_API_BASE_URL", "https://sandbox.api.reap.global")
+    monkeypatch.setenv("REAP_API_KEY", "sk_test_key")
+    monkeypatch.setattr(rc, "get_enrollment", ok_enrollment)
+    monkeypatch.setattr(rc, "get_checkout", ok_checkout)
+
+    args = _sys.modules["argparse"].Namespace(
+        state=str(tmp_path / "s.json"), enrollment_id=ENROLLMENT_UUID, checkout_id="chk_7f3a")
+    assert module.cmd_poll(args) == 0
+
+
+def test_poll_does_not_claim_to_be_read_only():
+    """It writes the state file. Nothing there is destructive, but an operator who read
+    "read-only" and pointed two polls at one state file was told something untrue."""
+    import inspect
+    source = inspect.getsource(_purchase_steps())
+    assert "`poll` is read-only" not in source
+    assert "creates NOTHING AT THE PARTNER" in source
+
+
+# --- N13 / N15 --------------------------------------------------------------------------------------------
+
+def test_the_spec_diff_refuses_a_plaintext_spec_url():
+    """What we do with that document is decide whether our request bodies are still correct."""
+    module = _spec_diff()
+    with pytest.raises(ValueError) as exc:
+        module.fetch("http://docs.reap.global/api-reference/openapi.json")
+    assert "https" in str(exc.value)
+
+
+def test_the_spec_diff_bounds_what_it_will_parse():
+    """`response.read()` with no argument reads whatever the host sends, and `--url` is operator
+    supplied."""
+    module = _spec_diff()
+    assert module.MAX_SPEC_BYTES <= 16 * 1024 * 1024
+    import inspect
+    assert "read(MAX_SPEC_BYTES + 1)" in inspect.getsource(module.fetch)
+
+
+def test_the_alias_flag_has_no_shared_mutable_default(monkeypatch):
+    """`action="append", default=[]` appends to the default OBJECT, so one process's aliases leak
+    into the next call — which is exactly how the tests drive `main()`."""
+    seen = []
+
+    async def fake_resolve(**kwargs):
+        seen.append(kwargs["accept_variant_labels"])
+        return rc.VariantResolution(ok=False, reason="search:merchant_not_in_results")
+
+    module = _resolve_script()
+    monkeypatch.setenv("REAP_API_BASE_URL", "https://sandbox.api.reap.global")
+    monkeypatch.setenv("REAP_API_KEY", "sk_test_key")
+    monkeypatch.setattr(rc, "resolve_our_row", fake_resolve)
+    monkeypatch.setattr(_sys, "argv", ["prog", "--alias", "First"])
+    module.main()
+    monkeypatch.setattr(_sys, "argv", ["prog"])
+    module.main()
+    assert seen == [("First",), ()], seen

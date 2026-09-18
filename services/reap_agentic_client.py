@@ -162,7 +162,11 @@ _IDEMPOTENT_PATHS = ("/agentic/quotes", "/agentic/checkouts", "/agentic/enrollme
 #: revisit. Quotes and checkouts stay at 35 s: nothing in today's run moved them.
 _DEFAULT_TIMEOUT_S = 25.0
 _QUOTE_TIMEOUT_S = 35.0
+#: `shipping-option` is here because it RE-PRICES: Reap goes back to the merchant's commerce
+#: layer for shipping and tax, which is the same work a quote does and takes the same 13-16 s.
+#: It is matched by suffix rather than by equality because its path carries a quote id.
 _SLOW_PATHS = ("/agentic/quotes", "/agentic/checkouts")
+_SLOW_PATH_SUFFIXES = ("/shipping-option",)
 
 #: Ceiling on `REAP_API_TIMEOUT_SECONDS`. The env var raises a floor across ALL paths and one
 #: resolution makes several calls, so an unbounded value is a multiplied one: `=600` would let a
@@ -172,7 +176,9 @@ _MAX_ENV_TIMEOUT_S = 120.0
 
 
 def default_timeout_for(path: str) -> float:
-    return _QUOTE_TIMEOUT_S if path in _SLOW_PATHS else _DEFAULT_TIMEOUT_S
+    if path in _SLOW_PATHS or path.endswith(_SLOW_PATH_SUFFIXES):
+        return _QUOTE_TIMEOUT_S
+    return _DEFAULT_TIMEOUT_S
 
 
 def _env_timeout_floor() -> Optional[float]:
@@ -229,6 +235,42 @@ def _env_timeout_floor() -> Optional[float]:
                        _MAX_ENV_TIMEOUT_S)
         return _MAX_ENV_TIMEOUT_S
     return value
+
+def resolve_timeout(path: str, timeout_seconds: Any) -> float:
+    """The timeout for one call: an explicit argument, validated, else the per-path default
+    raised (never lowered) by the env floor.
+
+    ONE FUNCTION, CALLED BY BOTH VERBS, and that is the finding it exists to close rather than a
+    tidiness preference. `_post` grew this validation and `_get` kept `if timeout_seconds:`, so
+    the two disagreed in five ways at once on the verb that does the POLLING: `True` became a
+    1.0 s timeout, `-1` was handed to httpx as -1.0, `nan` went through untouched, `0` and
+    `False` silently fell back to the default a caller was explicitly overriding, and `"5"`
+    worked by accident. A copied rule is a rule that drifts; the only way the docstring on `_get`
+    can honestly say "the same as `_post`" is for there to be one of these.
+
+    `is not None`, not truthiness: 0 is a caller asking for no timeout, which is a bug worth
+    naming, not an absence worth defaulting.
+    """
+    if timeout_seconds is not None:
+        # `isinstance(True, int)` is True, so a bool reaches `float()` and becomes 1.0 -- a
+        # one-second timeout on every call, from a caller that meant "yes, use a timeout". Same
+        # family as the quantity bug: Python's bool/int identity turns a type error into a
+        # plausible number. Refused by type before it is converted.
+        if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)):
+            raise ReapRequestError(
+                f"timeout_seconds must be a number, got {type(timeout_seconds).__name__} "
+                f"{timeout_seconds!r}")
+        timeout = float(timeout_seconds)
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ReapRequestError(
+                f"timeout_seconds must be a positive finite number, got {timeout_seconds!r}")
+        return timeout
+    # The per-path default is the BASE and the env var may only raise it. See
+    # `_env_timeout_floor` for why it used to be able to lower it, and why that was invisible.
+    timeout = default_timeout_for(path)
+    floor = _env_timeout_floor()
+    return max(timeout, floor) if floor is not None else timeout
+
 
 #: Reap's own id prefixes, used to reject a value from the wrong namespace before it is sent.
 #: This is the guard that would have caught #2136's central error: our storefront variant id
@@ -350,6 +392,10 @@ def idempotency_key(
         material = f"{canonical}|{bucket}"
     return f"pivota-{scope}-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
 
+
+#: The `ownerType` values the spec's enum admits. `CLIENT_REFERENCE` is ours -- our own customer
+#: id; `REAP_USER` is Reap's own account namespace and nothing in this module mints one.
+OWNER_TYPES = ("CLIENT_REFERENCE", "REAP_USER")
 
 #: Paths whose idempotency key carries NO time component. See `idempotency_key`: the bucket is a
 #: quote-shaped answer, and on a create that can charge a card it is a double-charge edge.
@@ -1661,26 +1707,7 @@ async def _post(
     # supplied" and silently fell through to the default, so a caller asking for no timeout got
     # 25 s. `is not None` distinguishes them, and a non-positive explicit value is a caller bug
     # rather than a request we should reshape.
-    if timeout_seconds is not None:
-        # `isinstance(True, int)` is True, so a bool reaches `float()` and becomes 1.0 -- a
-        # one-second timeout on every call, from a caller that meant "yes, use a timeout". Same
-        # family as the quantity bug: Python's bool/int identity turns a type error into a
-        # plausible number. Refused by type before it is converted.
-        if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)):
-            raise ReapRequestError(
-                f"timeout_seconds must be a number, got {type(timeout_seconds).__name__} "
-                f"{timeout_seconds!r}")
-        timeout = float(timeout_seconds)
-        if not math.isfinite(timeout) or timeout <= 0:
-            raise ReapRequestError(
-                f"timeout_seconds must be a positive finite number, got {timeout_seconds!r}")
-    else:
-        # The per-path default is the BASE and the env var may only raise it. See
-        # `_env_timeout_floor` for why it used to be able to lower it, and why that was invisible.
-        timeout = default_timeout_for(path)
-        floor = _env_timeout_floor()
-        if floor is not None:
-            timeout = max(timeout, floor)
+    timeout = resolve_timeout(path, timeout_seconds)
 
     import httpx
 
@@ -1790,7 +1817,16 @@ _ERROR_CODE_PATH_PREFIXES = ("/agentic/enrollments", "/agentic/checkouts")
 
 
 def _reads_error_codes(path: str) -> bool:
-    return str(path or "").startswith(_ERROR_CODE_PATH_PREFIXES)
+    """Match whole PATH SEGMENTS, not a string prefix.
+
+    `"/agentic/enrollmentsEVIL".startswith("/agentic/enrollments")` is True, so a prefix test
+    quietly extended the "we read this failure body" set to any path that happens to begin with
+    one of these. Nothing constructs such a path today -- every caller here builds from a literal
+    -- but this predicate decides whether a partner's error body is read at all, and "no caller
+    does that yet" is the argument that was wrong about `items`.
+    """
+    text = str(path or "")
+    return any(text == p or text.startswith(p + "/") for p in _ERROR_CODE_PATH_PREFIXES)
 
 
 def _error_codes(raw: Optional[bytes]) -> Tuple[Optional[str], Optional[str]]:
@@ -1838,6 +1874,13 @@ async def _get(
 ) -> ReapResponse:
     """One GET. Same host validation, same headers, same body-blind failure handling as `_post`.
 
+    "SAME AS `_post`" IS A CLAIM THIS FUNCTION HAS TWICE FAILED TO MEET, so it is worth saying
+    what it now means and how it is held. The timeout comes from the shared `resolve_timeout`,
+    not a second copy that drifted in five ways. A failure is classified by STATUS FIRST, so an
+    oversized 400 is `reap_status_400` on both verbs rather than `response_too_large` on this one.
+    The body is read through the shared `_read_bounded`, once, and only for the two codes on the
+    two scoped paths. Each of those three is pinned by a test that drives BOTH verbs.
+
     DELIBERATELY A SIBLING OF `_post` RATHER THAN A REFACTOR OF IT. The duplication is real and
     it is the cheaper of the two costs: `_post` is the module's only egress path and is under
     concurrent review, and folding both verbs through one helper would make every later fix to
@@ -1855,18 +1898,9 @@ async def _get(
         return ReapResponse(ok=False, error="reap_client_not_configured")
     url = validate_base_url()
     key = _api_key() or ""
-    if timeout_seconds:
-        timeout = float(timeout_seconds)
-    else:
-        # The same floor semantics as `_post`, through the SAME helper. Reimplementing the rule
-        # here would have given the two verbs two copies to drift apart -- and this one had
-        # exactly that bug before the rebase: it parsed the env var itself and treated a
-        # non-numeric value as "ignore", which is right, while silently disagreeing with
-        # `_env_timeout_floor` about a zero or negative one.
-        timeout = default_timeout_for(path)
-        floor = _env_timeout_floor()
-        if floor is not None:
-            timeout = max(timeout, floor)
+    # The SAME resolver `_post` uses, not a second copy of the rule -- see `resolve_timeout`
+    # for the five ways the copy that used to live here had already drifted.
+    timeout = resolve_timeout(path, timeout_seconds)
 
     import httpx
 
@@ -1886,36 +1920,37 @@ async def _get(
                 headers=_headers(key, path, {}, method="GET"),
             ) as resp:
                 status = resp.status_code
-                if status >= 400 and not _reads_error_codes(path):
-                    # Not read at all, byte for byte the same rule as `_post`: on a path with no
-                    # state machine to drive there is nothing in a failure body we want, so it
-                    # never comes off the socket.
-                    logger.warning("reap GET %s rejected: status=%s", path, status)
-                    return ReapResponse(ok=False, status=status,
-                                        error=f"reap_status_{status}")
-                # ONE bounded read for everything that IS read -- success bodies, and failure
-                # bodies on the two legs that carry machine-readable codes. Reading it here
-                # rather than once per branch is what keeps it to a single bound per response.
+                if status >= 400:
+                    # STATUS DECIDES FIRST, and this ordering is the finding. `_get` used to
+                    # classify by SIZE first, so one oversized 400 came back `response_too_large`
+                    # on this verb and `reap_status_400` on the other -- the same response, two
+                    # different answers, on the pair of verbs a caller uses interchangeably to
+                    # drive one state machine. A failure is a failure whatever its length.
+                    #
+                    # The body is read only on the two scoped paths, only for the two codes, and
+                    # only through `_read_bounded`; an oversized error body simply yields no
+                    # codes, which is the right trade and not a different outcome.
+                    code, detail_code = (
+                        _error_codes(await _read_bounded(resp))
+                        if _reads_error_codes(path) else (None, None)
+                    )
+                    logger.warning("reap GET %s rejected: status=%s code=%s detail=%s",
+                                   path, status, code, detail_code)
+                    return ReapResponse(
+                        ok=False, status=status, error=f"reap_status_{status}",
+                        error_code=code, error_detail_code=detail_code,
+                    )
                 raw = await _read_bounded(resp)
     except Exception as exc:  # noqa: BLE001
         logger.warning("reap GET %s failed: %s", path, type(exc).__name__)
         return ReapResponse(ok=False, error=f"transport_error:{type(exc).__name__}")
 
+    # Size classification applies to a SUCCESS body only: past here the status is 2xx, so
+    # "too large to parse" is the whole of what went wrong.
     if raw is None:
         logger.warning("reap GET %s response exceeded %s bytes; refusing", path,
                        MAX_RESPONSE_BYTES)
         return ReapResponse(ok=False, status=status, error="response_too_large")
-
-    if status >= 400:
-        # Body-blind apart from the two codes, exactly as `_post` is. An oversized failure took
-        # the `raw is None` branch above and never reaches here, so it yields no codes either.
-        code, detail_code = _error_codes(raw)
-        logger.warning("reap GET %s rejected: status=%s code=%s detail=%s",
-                       path, status, code, detail_code)
-        return ReapResponse(
-            ok=False, status=status, error=f"reap_status_{status}",
-            error_code=code, error_detail_code=detail_code,
-        )
 
     try:
         payload = json.loads(raw.decode("utf-8"))
@@ -2558,6 +2593,27 @@ def explain_refusal(reason: Optional[str]) -> str:
 _URL_FORBIDDEN_CHARS = re.compile(r"[\x00-\x20\x7f]")
 
 
+def _url_has_forbidden_chars(url: str) -> bool:
+    """C0/space/DEL, AND Unicode format and separator characters.
+
+    The regex alone is ASCII-only, which left the more interesting half open: U+200B ZWSP and
+    U+FEFF are invisible splitters, U+202E RIGHT-TO-LEFT OVERRIDE reverses everything after it in
+    anything that renders the URL, and U+2028/U+2029 are line separators that a non-ASCII-aware
+    log or template can treat as newlines. All of them are invisible or worse in a string we hand
+    a buyer as a link, and none can be part of a legitimate URL of Reap's or ours -- a URL that
+    needs one percent-encodes it.
+
+    `_strip_format_chars` is the module's existing Cf rule, reused rather than re-derived: the
+    matcher already decided these characters have no place in partner text, and a URL is partner
+    text we additionally click on.
+    """
+    if _URL_FORBIDDEN_CHARS.search(url):
+        return True
+    if _strip_format_chars(url) != url:          # any Cf: ZWSP, FEFF, RLO, the isolates
+        return True
+    return any(unicodedata.category(ch) in ("Zl", "Zp", "Zs") for ch in url)
+
+
 def return_url_hosts() -> Tuple[str, ...]:
     """Hosts our own `returnUrl` may name. `REAP_RETURN_URL_HOSTS`, comma-separated.
 
@@ -2587,7 +2643,7 @@ def validate_return_url(raw: Any) -> str:
     url = str(raw or "").strip()
     if not url:
         raise ReapRequestError("a hosted flow needs a returnUrl")
-    if _URL_FORBIDDEN_CHARS.search(url):
+    if _url_has_forbidden_chars(url):
         # BEFORE parsing, and this ordering is the whole point -- see `_URL_FORBIDDEN_CHARS`.
         raise ReapRequestError("returnUrl must not contain control characters or whitespace")
     parsed = urlparse(url)
@@ -2617,7 +2673,7 @@ def hosted_url_is_allowed(raw: Any) -> bool:
     url = str(raw or "").strip()
     if not url:
         return False
-    if _URL_FORBIDDEN_CHARS.search(url):
+    if _url_has_forbidden_chars(url):
         return False
     parsed = urlparse(url)
     if parsed.scheme != "https" or parsed.username or parsed.password:
@@ -2712,6 +2768,14 @@ def _refuse_unsafe_hosted_url(result: ReapResponse) -> ReapResponse:
         return result
     data = result.data if isinstance(result.data, dict) else {}
     items = data.get("items")
+    if items is not None and not isinstance(items, list):
+        # Same rule as a non-dict `nextAction`, and missed for the same reason: the old
+        # `if isinstance(items, list)` read as "walk it when it is a list" and therefore as
+        # "ignore it when it is not". A dict-shaped `items` -- `{"0": {"nextAction": ...}}` --
+        # carried a hostile action straight through with ok=True. Anything we cannot walk, we
+        # refuse; we do not get to decide a shape we do not recognise is harmless.
+        logger.warning("reap returned a non-list `items`; refusing the response")
+        return ReapResponse(ok=False, status=result.status, error="hosted_url_not_allowed")
     candidates = [data] + (list(items) if isinstance(items, list) else [])
     if any(_next_action_is_unsafe(node) for node in candidates):
         # The URL itself is not logged: it came from a partner and it is the untrusted value.
@@ -2745,7 +2809,14 @@ def _path_id(value: Any, *, what: str, uuid: bool = False) -> str:
     somebody will one day write an f-string. `_get` never formats anything it has not been
     handed by this function.
     """
-    text = str(value or "").strip()
+    if value is not None and not isinstance(value, str):
+        # `str(7)` is "7" and `str(True)` is "True", both of which sail through the charset rule
+        # and reach a partner as an id. A caller passing a non-string has made a mistake about
+        # what this parameter is; coercing it turns that mistake into a plausible-looking id.
+        # Same rule as `build_enrollment_request` applies to `owner_id`.
+        raise ReapRequestError(
+            f"{what} id must be a string, got {type(value).__name__} {value!r}")
+    text = (value or "").strip()
     if not text:
         raise ReapRequestError(f"a {what} id is required")
     pattern = _UUID_RE if uuid else _OPAQUE_ID_RE
@@ -2958,10 +3029,28 @@ async def list_enrollments(
     egress -- a listing with no owner is not a broader listing, it is an error, and a caller
     that wrote `owner_id=None` meant something that cannot be served.
     """
-    owner = str(owner_id or "").strip()
+    if owner_id is not None and not isinstance(owner_id, str):
+        raise ReapRequestError(
+            f"ownerId must be a string, got {type(owner_id).__name__} {owner_id!r}")
+    owner = (owner_id or "").strip()
     if not owner:
         raise ReapRequestError("listing enrollments requires an ownerId; it is not optional")
-    params: Dict[str, Any] = {"ownerId": owner, "ownerType": str(owner_type or "CLIENT_REFERENCE")}
+    if _url_has_forbidden_chars(owner):
+        # The SAME check the builder applies to `owner.id`, applied to the same value on the
+        # other endpoint that carries it. It was on one of the two, which is the shape of a
+        # guard that does not exist: this one puts the value in a QUERY STRING.
+        raise ReapRequestError("ownerId must not contain whitespace or control characters")
+    # `None` means "not supplied" and takes the default. Anything ELSE a caller passed, they
+    # meant -- including `""`, which under `or "CLIENT_REFERENCE"` silently became the default
+    # and so read as a scope the caller never asked for. Same rule as `timeout_seconds=0`.
+    wanted_type = "CLIENT_REFERENCE" if owner_type is None else str(owner_type)
+    if wanted_type not in OWNER_TYPES:
+        # The spec constrains this to an enum. An unrecognised value is a 400 from Reap at best
+        # and a silently different scope at worst -- and this parameter decides WHOSE
+        # enrollments come back.
+        raise ReapRequestError(
+            f"ownerType must be one of {OWNER_TYPES}, got {wanted_type!r}")
+    params: Dict[str, Any] = {"ownerId": owner, "ownerType": wanted_type}
     if limit is not None:
         # Clamped rather than refused: the spec's bounds are 1..100 and a caller asking for 500
         # wants "as many as possible", which is what it gets. A non-numeric limit is a DIFFERENT
@@ -2972,7 +3061,12 @@ async def list_enrollments(
         except (TypeError, ValueError):
             raise ReapRequestError(f"enrollment list limit must be an integer, got {limit!r}")
     if cursor:
-        params["cursor"] = str(cursor)
+        if not isinstance(cursor, str):
+            raise ReapRequestError(
+                f"cursor must be a string, got {type(cursor).__name__} {cursor!r}")
+        if _url_has_forbidden_chars(cursor):
+            raise ReapRequestError("cursor must not contain whitespace or control characters")
+        params["cursor"] = cursor
     # THE FIFTH `nextAction` SITE. Every element of `items[]` carries its own, per the pinned
     # spec, and this call was the one that did not go through the guard.
     return _refuse_unsafe_hosted_url(
@@ -3007,8 +3101,18 @@ async def get_checkout(checkout_id: str, *, timeout_seconds: Optional[float] = N
 
 
 async def get_quote(quote_id: str, *, timeout_seconds: Optional[float] = None) -> ReapResponse:
+    """WRAPPED, even though today's quote schema has no `nextAction` and no URL at all.
+
+    The guard is a no-op on a payload without one, so the cost is nothing; the reason to pay it
+    is that this partner has ALREADY moved a required field without touching `info.version`, and
+    a step-up action on a re-price -- 3DS on a quote that changed price, say -- is exactly the
+    shape that would appear here first. An unwrapped read is a hole that opens the day the schema
+    moves, and the schema moving without telling us is the one thing we have measured twice.
+    """
     qid = _path_id(quote_id, what="quote")
-    return await _get(f"/agentic/quotes/{qid}", timeout_seconds=timeout_seconds)
+    return _refuse_unsafe_hosted_url(
+        await _get(f"/agentic/quotes/{qid}", timeout_seconds=timeout_seconds)
+    )
 
 
 async def select_shipping_option(
@@ -3021,10 +3125,14 @@ async def select_shipping_option(
     `GET /agentic/quotes/{id}`, with a new `amountBreakdown`. Read the total from the response,
     never from the quote you already had: choosing a shipping option is what changes it."""
     qid = _path_id(quote_id, what="quote")
-    return await _post(
-        f"/agentic/quotes/{qid}/shipping-option",
-        build_shipping_option_request(shipping_option_id),
-        timeout_seconds=timeout_seconds,
+    # Wrapped for the same reason as `get_quote`, and with more cause: this call RE-PRICES, so
+    # it is the one a step-up action would most plausibly be attached to.
+    return _refuse_unsafe_hosted_url(
+        await _post(
+            f"/agentic/quotes/{qid}/shipping-option",
+            build_shipping_option_request(shipping_option_id),
+            timeout_seconds=timeout_seconds,
+        )
     )
 
 

@@ -74,7 +74,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--quote", action="store_true",
                     help="after resolving, also call POST /agentic/quotes")
-    ap.add_argument("--alias", action="append", default=[], metavar="LABEL",
+    ap.add_argument("--alias", action="append", default=None, metavar="LABEL",
                     help="a Reap variant label to accept for our title, e.g. "
                          "--alias 'Flamingo Flirt - Cream'. Repeatable. Needed when Reap's sole "
                          "label carries a merchant suffix our row does not store: the match is "
@@ -82,6 +82,10 @@ def main() -> int:
                          "rather than being guessed at. The refusal prints Reap's label, so the "
                          "loop is: run once, read the label, re-run with it as --alias.")
     args = ap.parse_args()
+    # `default=None` plus this, not `default=[]`: argparse appends to the default OBJECT, so a
+    # mutable default is shared across every call in one interpreter -- which is exactly how the
+    # tests drive `main()`, and would have leaked one test's aliases into the next.
+    args.alias = list(args.alias or [])
 
     from services import reap_agentic_client as rc
 
