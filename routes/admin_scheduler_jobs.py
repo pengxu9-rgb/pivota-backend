@@ -39,6 +39,15 @@ _MANAGEABLE_JOB_IDS = frozenset(
         # import is in flight. Pausing must not require one.
         "catalog_import_drain_tick",
         "catalog_import_stale_reaper",
+        # The Reap agentic purchase poller calls a payment partner on a rail that
+        # spends a BUYER'S OWN card. Same argument as the catalog-import drain
+        # directly above: its only other stop lever is REAP_AGENTIC_ENABLED, i.e.
+        # a deploy — and turning that dial off does not merely stop new work, it
+        # stops the sweeps too, so purchases already in flight stall and keep the
+        # buyer's address and email until it is turned back on (see
+        # docs/runbooks/reap_agentic_purchase.md). Pausing the job instead leaves
+        # the dial armed, which is the lever an operator actually wants at 3am.
+        "reap_agentic_purchase_poll",
     }
 )
 
@@ -62,6 +71,13 @@ _RUNNABLE_JOB_IDS = frozenset(
         # reapers above. Force-runnable so an operator can recover rows stranded
         # in `running` without waiting out the 300s tick.
         "catalog_import_stale_reaper",
+        # Bounded (claim batch + a wall-clock budget), idempotent tick-by-tick,
+        # and it takes its own lease per run — so an out-of-band run alongside a
+        # scheduled one claims disjoint rows rather than racing. This is the "run
+        # it once by hand" step in the arming procedure in
+        # docs/runbooks/reap_agentic_purchase.md; without it, the first evidence
+        # that arming worked would be a log line up to 30s later.
+        "reap_agentic_purchase_poll",
     }
 )
 
