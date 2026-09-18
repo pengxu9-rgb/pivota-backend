@@ -148,6 +148,25 @@ def test_a_seed_bind_is_recorded_only_inside_an_open_sink() -> None:
     assert store == {"market_bound": ["SG", "*"]}
 
 
+def test_a_nested_sink_restores_the_outer_one_when_it_closes() -> None:
+    # The fragrance semantic retry re-enters _handle_find_products_multi, opening a nested sink.
+    # Closing it must RESTORE the outer sink, not clear it -- or any bind the outer request makes
+    # after the retry returns is silently lost. (Review of this PR: equivalent today only because
+    # the retry happens to be the last bind-capable step.)
+    outer: Dict[str, Any] = {}
+    inner: Dict[str, Any] = {}
+    outer_token = mt.open_seed_bind_sink({mt.OBSERVATION_KEY: outer})
+    try:
+        inner_token = mt.open_seed_bind_sink({mt.OBSERVATION_KEY: inner})
+        mt.record_seed_bind("JP")
+        mt.close_seed_bind_sink(inner_token)
+        mt.record_seed_bind("SG")  # after the nested call returned: belongs to the OUTER request
+    finally:
+        mt.close_seed_bind_sink(outer_token)
+    assert inner == {"market_bound": ["JP"]}
+    assert outer == {"market_bound": ["SG"]}
+
+
 def test_served_currency_mismatch_means_more_than_one_KNOWN_currency() -> None:
     s = mt.summarise_served_products
     assert s([{"currency": "SGD"}, {"currency": "USD"}])["served_currency_mismatch"] is True
@@ -219,6 +238,27 @@ def test_the_event_is_written_as_one_json_line_even_when_the_root_logger_is_at_W
     events = _emitted(capsys)
     assert events == [{"event": "multi.invoke.market", "market_requested": "SG",
                        "market_source": "explicit_search", "market_bound": ["*"]}]
+
+
+def test_the_event_does_not_depend_on_a_parent_logger_s_level(capsys: pytest.CaptureFixture) -> None:
+    # The emitter must set INFO on ITSELF. Review of this PR: removing that survived every test,
+    # because its parent `pivota` logger happens to be set to INFO elsewhere at import. If that ever
+    # changes -- or a process emits before that import -- the record would silently drop again,
+    # which is the exact failure this emitter exists to prevent. So: silence every ancestor.
+    ancestors = [logging.getLogger("pivota"), logging.getLogger()]
+    saved = [(lg, lg.level) for lg in ancestors]
+    for lg in ancestors:
+        lg.setLevel(logging.CRITICAL)
+    emitter = logging.getLogger("pivota.market_telemetry")
+    saved_own = emitter.level
+    emitter.setLevel(logging.NOTSET)  # as if nothing had configured it yet
+    try:
+        mt.emit({"market_requested": "SG"})
+    finally:
+        emitter.setLevel(saved_own)
+        for lg, level in saved:
+            lg.setLevel(level)
+    assert [e["market_requested"] for e in _emitted(capsys)] == ["SG"]
 
 
 def test_emit_never_raises_on_unserialisable_values(capsys: pytest.CaptureFixture) -> None:
