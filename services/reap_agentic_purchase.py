@@ -105,13 +105,14 @@ import logging
 import os
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import db.reap_agentic_ledger as ledger
+import services.conversion_click_claims as ccc
 import services.reap_agentic_client as rc
 from services.reap_cart_link import cart_link_line, cart_link_refusal
 
@@ -346,7 +347,10 @@ class CartLinkItem:
     this lane reads them to decide what is bought.
     """
 
-    cart_url: str
+    # repr=False: the URL carries our click id and the merchant's variant, and a dataclass repr
+    # is what ends up in a traceback or a debug log line. Not PII (the validator guarantees
+    # that), but nothing a log reader needs.
+    cart_url: str = field(repr=False)
     shop_domain: str
     our_price_minor: int
     currency: str
@@ -365,8 +369,10 @@ class BuyerContact:
     it was given: a caller cannot widen what reaches a third party by adding keys.
     """
 
-    email: str
-    shipping_address: Mapping[str, Any]
+    # repr=False on BOTH: this dataclass is the buyer's PII, and its default repr would print it
+    # into any traceback, assertion message or `%r` log line that ever touches one.
+    email: str = field(repr=False)
+    shipping_address: Mapping[str, Any] = field(repr=False)
 
 
 @dataclass(frozen=True)
@@ -998,7 +1004,9 @@ def verify_cart_link_quote(payload: Any, row: Mapping[str, Any]) -> QuoteCheck:
           otherwise — including when `items` is absent, because a quote that does not say what
           it priced cannot be checked. Our URL names ONE line, so two lines mean Reap priced
           something we did not send.
-      (3) A SHIPPING OPTION EXISTS. `shippingOptions` must be a non-empty list of objects.
+      (3) A SHIPPING OPTION EXISTS. `shippingOptions` must be a non-empty list, and EVERY
+          entry an object with a non-empty `id` and a `price` that is a non-negative amount in
+          the row's currency (`_is_priced_shipping_option`).
           Otherwise the purchase is REFUSED, terminally, as `no_shipping_option`. THIS IS THE
           LANE'S SHIPPING PROOF: a merchant that cannot ship to the buyer's address, or that
           holds the cart below a basket minimum, answers with no option, and that is the one
@@ -1038,11 +1046,33 @@ def verify_cart_link_quote(payload: Any, row: Mapping[str, Any]) -> QuoteCheck:
     if (
         not isinstance(options, list)
         or not options
-        or not all(isinstance(option, dict) for option in options)
+        or not all(_is_priced_shipping_option(option, row) for option in options)
     ):
         return QuoteCheck(False, "no_shipping_option", "quote_no_shipping_option")
 
     return verify_quote(data, row, variant_id=None)
+
+
+def _is_priced_shipping_option(option: Any, row: Mapping[str, Any]) -> bool:
+    """One shipping option that PROVES something: an object with a non-empty string `id` and a
+    `price` that is a non-negative, exactly-representable amount in the ROW's currency.
+
+    The spec's option is `{id, name, selected, price: {amount, currency}}`. `[{}]` used to pass
+    the "non-empty list of objects" rule, which made an empty object shipping proof. An option we
+    could not select (no id) or whose cost we cannot state in the buyer's currency is not
+    evidence that the merchant ships to this buyer at a price we can check. Free shipping is
+    `0.00` and passes (`_component_minor` accepts zero); a negative price is refused.
+    """
+    if not isinstance(option, dict):
+        return False
+    option_id = option.get("id")
+    if not isinstance(option_id, str) or not option_id.strip():
+        return False
+    price = _money(option.get("price"))
+    currency = str(row.get("currency") or "").strip().upper()
+    if price is None or not currency or price[1] != currency:
+        return False
+    return _component_minor(price[0], currency) is not None
 
 
 # ── start_purchase ───────────────────────────────────────────────────────────────────────────
@@ -1472,20 +1502,32 @@ def _cart_link_verdict(row: Mapping[str, Any]) -> Optional[Tuple[str, str]]:
     return None
 
 
-def _cart_link_attribution_mismatch(row: Mapping[str, Any]) -> bool:
-    """True when a cart-link row's stored URL does not carry the row's own click id on the row's
-    own merchant host — i.e. when an attribution edge keyed on the row would credit a click, or a
-    shop, that the checked-out cart did not carry. The full validator against the STORED values
-    (so a market that no longer matches suppresses the edge too — a row that disagrees with its
-    own URL is not one to credit). The DIALS are not consulted: the charge has already happened,
-    and whether to record it is not a question a kill switch answers."""
+def _cart_link_attribution_mismatch(row: Mapping[str, Any]) -> Optional[str]:
+    """None when a cart-link row agrees with its own stored URL; else the `last_error_code` that
+    suppresses its attribution edge.
+
+    THE FULL VALIDATOR AND THE QUANTITY, not the click id alone. It is the same check every
+    pre-checkout step makes, against the STORED click id, shop, market and quantity, run again
+    at the sink, where being wrong writes a PERMANENT edge. A click that differs is named
+    `cart_link_click_id_mismatch`. Anything else (another shop, another market, another
+    quantity, a URL that no longer validates) is `cart_link_attribution_unverified`. The DIALS
+    are not consulted: the charge has already happened, and whether to record it is not a
+    question a kill switch answers.
+    """
     reason = cart_link_refusal(
         row.get("cart_url"),
         click_id=row.get("click_id"),
         shop_domain=row.get("merchant_domain"),
         market=row.get("market_country"),
     )
-    return reason is not None
+    if reason == "click_id_mismatch":
+        return "cart_link_click_id_mismatch"
+    if reason is not None:
+        return "cart_link_attribution_unverified"
+    line = cart_link_line(row.get("cart_url"))
+    if line is None or line[1] != row.get("quantity"):
+        return "cart_link_attribution_unverified"
+    return None
 
 
 def _lost(row: Mapping[str, Any]) -> AdvanceResult:
@@ -2325,14 +2367,41 @@ async def _complete(
     elif not charged_agrees:
         reason = "charged_total_differs"
     elif _is_cart_link(row) and _cart_link_attribution_mismatch(row):
-        # THE CLICK ID AT THE SINK. On this lane the merchant's order carries whatever click id
-        # was IN THE URL Reap checked out, and the edge is keyed on the row's `click_id`. The two
+        # THE URL AT THE SINK. On this lane the merchant's order carries whatever click id was IN
+        # THE URL Reap checked out, and the edge is keyed on the row's `click_id` and shop. They
         # were checked equal at create and before every quote; they are checked again here,
-        # where being wrong writes a PERMANENT edge (`ON CONFLICT DO NOTHING`) crediting a click
-        # the order does not carry.
-        reason = "cart_link_click_id_mismatch"
+        # where being wrong writes a PERMANENT edge (`ON CONFLICT DO NOTHING`).
+        reason = _cart_link_attribution_mismatch(row)
     else:
         reason = None
+
+    # ── THE CLICK CLAIM (mig 228), cart-link rows only ──────────────────────────────────────
+    #
+    # The merchant's own Shopify order carries this same click id, so the `orders/paid` webhook
+    # and the read_orders poller can close this SAME sale under (tenant merchant, Shopify order
+    # id), a key that never collides with ours. First writer wins, one INSERT, no transaction
+    # (see services/conversion_click_claims). Taken BEFORE the completing write so that the
+    # outcome lands in `last_error_code` in the SAME write: a completed row cannot be written
+    # again.
+    #
+    # FAILS CLOSED: an error taking the claim skips our edge and says so. The merchant side,
+    # which fails open, can still close the sale, so the error costs at most our edge and can
+    # never double it.
+    claimed = False
+    if reason is None and _is_cart_link(row):
+        try:
+            claimed = await ccc.claim_click(
+                row.get("click_id"), claimed_by=ccc.REAP_CLAIMANT, external_order_id=order_id
+            )
+        except Exception as exc:  # noqa: BLE001 — fail closed, by design
+            logger.warning(
+                "reap_agentic: purchase=%s attribution claim failed error_type=%s",
+                row["id"], type(exc).__name__,
+            )
+            reason = ccc.ATTRIBUTION_CLAIM_UNAVAILABLE
+        else:
+            if not claimed:
+                reason = ccc.CLOSED_BY_OTHER_CHANNEL
 
     moved = await _move(
         row, worker_id, [from_state], "completed",
@@ -2343,7 +2412,12 @@ async def _complete(
     if moved.outcome != "advanced":
         # THE HOOK IS AFTER THE FENCE, NOT BEFORE IT. A lost claim means somebody else moved this
         # row — possibly a sweep that failed it — and closing a conversion for a purchase we did
-        # not complete puts GMV in the attribution ledger that no order backs.
+        # not complete puts GMV in the attribution ledger that no order backs. A click claim we
+        # took for it is given back, so the merchant side can still close the sale.
+        if claimed:
+            await ccc.release_click_claim(
+                row.get("click_id"), claimed_by=ccc.REAP_CLAIMANT, external_order_id=order_id
+            )
         return moved
 
     if reason is not None:
@@ -2359,11 +2433,32 @@ async def _complete(
     # `buyer_email` and `shipping_address`, so what comes back has no PII in it at all — which is
     # exactly the row the hook should see.
     completed = await ledger.get_purchase_internal(str(row["id"])) or {}
-    await _close_attribution(completed)
+    closed = await _close_attribution(completed)
+    if claimed and not closed:
+        # We own the click but wrote no edge. Give the claim back so the merchant side can.
+        await ccc.release_click_claim(
+            row.get("click_id"), claimed_by=ccc.REAP_CLAIMANT, external_order_id=order_id
+        )
     return moved
 
 
-async def _close_attribution(purchase: Mapping[str, Any]) -> None:
+def _converting_shop_domain(purchase: Mapping[str, Any]) -> str:
+    """The shop the sale happened on, in the form the seller-mismatch guard compares.
+
+    For a cart-link row it is the HOST OF THE STORED URL, exactly as validated: apex or `www.`.
+    That is the host the click was minted for (the click's `dest_domain`), and the attribution
+    guard compares the two without folding `www.` (normalize_shop_host does not strip it). So
+    passing the bare `merchant_domain` for a `www.` link stamps `seller_mismatch` and EXCLUDES a
+    legitimate edge. Only this lane's argument changes; the shared normalisation does not.
+    """
+    if _is_cart_link(purchase):
+        host = urlsplit(str(purchase.get("cart_url") or "")).hostname
+        if host:
+            return host
+    return str(purchase.get("merchant_domain") or "")
+
+
+async def _close_attribution(purchase: Mapping[str, Any]) -> bool:
     """Tell the attribution ledger a Pivota-referred order closed. NEVER FAILS THE PURCHASE.
 
     The purchase row is ALREADY 'completed' and terminal when this runs, so there is nothing to
@@ -2374,6 +2469,9 @@ async def _close_attribution(purchase: Mapping[str, Any]) -> None:
     So the exception TYPE is logged and nothing else. Not the message: this call touches
     `surface_click_events` and an integrity error's message can carry row content. A follow-up
     reconciliation job is the answer to a systematically failing hook, not a louder failure here.
+
+    Returns True when the close ran without raising, so `_complete` can give back a click claim
+    (mig 228) whose edge was never written.
     """
     from services.commerce_attribution_service import close_external_order_conversion
 
@@ -2389,7 +2487,7 @@ async def _close_attribution(purchase: Mapping[str, Any]) -> None:
             "and a positive amount",
             purchase.get("id"),
         )
-        return
+        return False
 
     try:
         await close_external_order_conversion(
@@ -2408,7 +2506,7 @@ async def _close_attribution(purchase: Mapping[str, Any]) -> None:
                 "purchase_id": purchase.get("id"),
                 "reap_checkout_id": purchase.get("reap_checkout_id"),
             },
-            converting_shop_domain=str(purchase.get("merchant_domain") or ""),
+            converting_shop_domain=_converting_shop_domain(purchase),
             is_self_report=False,
         )
     except Exception as exc:  # noqa: BLE001 — deliberately broad; see the docstring
@@ -2417,6 +2515,8 @@ async def _close_attribution(purchase: Mapping[str, Any]) -> None:
             purchase.get("id"),
             type(exc).__name__,
         )
+        return False
+    return True
 
 
 #: state -> the coroutine that advances it. A dict rather than an if-chain so that
