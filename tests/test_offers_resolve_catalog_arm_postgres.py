@@ -13,7 +13,7 @@ The statement uses four things that differ between the two engines:
     silently accepts it here would fail in prod,
   * `offer_payload->>'destination_url'` — jsonb text extraction,
   * `coalesce(...) > 0` over three NUMERIC columns,
-  * `ORDER BY price_amount ASC` on a COMPUTED alias.
+  * `ORDER BY` a boolean over `= ANY(:unavailable)`, then the COMPUTED `price_amount` alias.
 
 The test drives the REAL handler rather than a copy of the SQL: a copied
 statement cannot catch a change to the one the route actually sends.
@@ -115,7 +115,7 @@ def _seed(engine):
         ), {"sk": sku_key, "pk": _PK, "p": 12.00})
 
 
-def _resolve(product_id):
+def _resolve(product_id, limit=10):
     """Drive the REAL handler, so the SQL under test is the one the route sends."""
     from routes.agent_shop_gateway import OffersResolvePayload, _handle_offers_resolve
 
@@ -128,7 +128,7 @@ def _resolve(product_id):
         await database.connect()
         try:
             return await _handle_offers_resolve(
-                OffersResolvePayload(product={"product_id": product_id}, limit=10,
+                OffersResolvePayload(product={"product_id": product_id}, limit=limit,
                                      market="US", tool="*", commerce_surface="agent_api"),
                 None, _BT(),
             )
@@ -249,7 +249,8 @@ _SIB_SIG = "sig_catalog_arm_sibling"
 _OTHER_PK = "ext:retailer:other-product"
 
 
-def _seed_listing(engine, pk, sig, content_key, merchant, offer_id, price, dest, suppressed=False):
+def _seed_listing(engine, pk, sig, content_key, merchant, offer_id, price, dest, suppressed=False,
+                  availability="in_stock"):
     """A second retailer LISTING: its own product row, SKU and offer, like the curated retailer
     lane writes one per seller host."""
     from sqlalchemy import text
@@ -282,10 +283,10 @@ def _seed_listing(engine, pk, sig, content_key, merchant, offer_id, price, dest,
             " currency, list_price, merchant_effective_price, offer_type, is_first_party,"
             " source_ref, offer_payload, updated_at)"
             " VALUES (:oid,:sk,:pk,:m,'external_referral','observed','referral_only','redirect',"
-            "         'external_referral','in_stock','USD',:p,:p,'retailer',false,:dest,"
+            "         'external_referral',:avail,'USD',:p,:p,'retailer',false,:dest,"
             "         cast(:payload AS jsonb), NOW())"
         ), {"oid": offer_id, "sk": sku_key, "pk": pk, "m": merchant, "p": price, "dest": dest,
-            "payload": '{"destination_url": "%s"}' % dest})
+            "avail": availability, "payload": '{"destination_url": "%s"}' % dest})
 
 
 def _sourced(res):
@@ -330,3 +331,104 @@ def test_a_withdrawn_listing_id_does_not_widen_to_its_live_siblings(pg_engine):
                   "of_sibling", 19.99, "https://ohlolly.com/products/snail", suppressed=True)
     assert _sourced(_resolve(_SIB_SIG)) == set()
     assert _sourced(_resolve(_SIB_PK)) == set()
+
+
+# --- stock before price ---------------------------------------------------------------------
+#
+# Measured in prod 2026-09-18, right after the Wave 1 retailer ingest: get_offers on the Purito
+# Oat-in Calming Gel Cream (ext:retailer:0465db3774ad9906d3d91664fcd3ab1a, three retailers)
+# returned eyurs.com $13 out_of_stock, then sokoglam.com $19.50 in_stock, then ohlolly.com $21
+# out_of_stock. The same census found 7 content_keys with a cheaper out-of-stock offer ranked
+# above an in-stock one, 5 of them at rank 1, and 6 where limit 1 or 2 cut every in-stock seller.
+
+_PURITO_CK = "ck_purito_oat"
+
+
+def _seed_purito(engine, eyurs="out_of_stock", sokoglam="in_stock", ohlolly="out_of_stock"):
+    _seed(engine)
+    for n, (merchant, oid, price, dest, avail) in enumerate((
+        ("agent_seed::retailer::eyurs.com", "of_eyurs", 13.00,
+         "https://eyurs.com/products/purito-oat", eyurs),
+        ("agent_seed::retailer::sokoglam.com", "of_sokoglam", 19.50,
+         "https://sokoglam.com/products/purito-oat", sokoglam),
+        ("agent_seed::retailer::ohlolly.com", "of_ohlolly", 21.00,
+         "https://ohlolly.com/products/purito-oat", ohlolly),
+    )):
+        _seed_listing(engine, f"ext:retailer:purito-{n}", f"sig_purito_{n}", _PURITO_CK,
+                      merchant, oid, price, dest, availability=avail)
+
+
+def _order(res):
+    return [o["source"]["offer_id"] for o in (res.get("offers") or [])]
+
+
+def test_an_in_stock_seller_outranks_a_cheaper_out_of_stock_one(pg_engine):
+    """The measured case. In stock first; price ascending WITHIN each group, so the two sellers
+    that cannot sell keep their cheapest-first order behind the one that can."""
+    _seed_purito(pg_engine)
+    res = _resolve(_PURITO_CK)
+    assert _order(res) == ["of_sokoglam", "of_eyurs", "of_ohlolly"]
+    # The order must agree with the stock flag printed on each offer, never contradict it.
+    assert [o["in_stock"] for o in res["offers"]] == [True, False, False]
+
+
+def test_the_limit_never_cuts_an_in_stock_seller_for_cheaper_out_of_stock_ones(pg_engine):
+    """ORDER BY must apply before LIMIT. At limit 1 the price-only order kept eyurs (cannot sell)
+    and dropped sokoglam (can) — the buyer's agent got one offer and it was a dead end."""
+    _seed_purito(pg_engine)
+    assert _order(_resolve(_PURITO_CK, limit=1)) == ["of_sokoglam"]
+    assert _order(_resolve(_PURITO_CK, limit=2)) == ["of_sokoglam", "of_eyurs"]
+
+
+def test_unknown_availability_ranks_with_in_stock_by_price_not_behind_it(pg_engine):
+    """`unknown` is the column's default and says nothing against the seller, so it competes on
+    price with in-stock offers and stays ahead of out-of-stock ones. The shipped `in_stock` flag
+    reads True for it, which is exactly why the order must not treat it as worse."""
+    _seed_purito(pg_engine, eyurs="unknown", sokoglam="in_stock", ohlolly="out_of_stock")
+    res = _resolve(_PURITO_CK)
+    assert _order(res) == ["of_eyurs", "of_sokoglam", "of_ohlolly"]
+    assert [o["in_stock"] for o in res["offers"]] == [True, True, False]
+
+
+def test_the_sql_normalises_availability_exactly_as_the_stock_flag_does(pg_engine):
+    """Case and padding: ` SOLD_OUT ` is unavailable to the Python flag, so it must be to the
+    ORDER BY too, or a sloppy feed value would rank an unsellable offer first while labelled so."""
+    _seed_purito(pg_engine, eyurs=" SOLD_OUT ", sokoglam="in_stock", ohlolly="Unavailable")
+    res = _resolve(_PURITO_CK, limit=1)
+    assert _order(res) == ["of_sokoglam"]
+    # Tab and newline too: `btrim` alone strips only spaces, `.strip()` strips all of these.
+    _seed_purito(pg_engine, eyurs="\tout_of_stock\n", sokoglam="in_stock", ohlolly="sold_out\r")
+    res = _resolve(_PURITO_CK, limit=1)
+    assert _order(res) == ["of_sokoglam"]
+
+
+def test_the_host_dedupe_keeps_the_in_stock_listing_of_a_host(pg_engine):
+    """The dedupe itself is unchanged — first offer per destination host wins — but it reads the
+    rows in the new order, so a host's in-stock listing now survives over its cheaper sold-out
+    one instead of being deduped away behind it."""
+    _seed(pg_engine)
+    _seed_listing(pg_engine, "ext:retailer:dup-a", "sig_dup_a", "ck_dup",
+                  "agent_seed::retailer::eyurs.com", "of_dup_sold_out", 9.00,
+                  "https://eyurs.com/products/a", availability="out_of_stock")
+    _seed_listing(pg_engine, "ext:retailer:dup-b", "sig_dup_b", "ck_dup",
+                  "agent_seed::retailer::eyurs.com", "of_dup_in_stock", 11.00,
+                  "https://www.eyurs.com/products/b")
+    res = _resolve("ck_dup")
+    assert _order(res) == ["of_dup_in_stock"]
+    assert any(
+        str(s.get("source")) == "catalog_offers" and s.get("deduped") == 1
+        for s in ((res.get("metadata") or {}).get("sources") or [])
+    )
+
+
+def test_a_price_tie_is_cut_by_offer_id_the_same_way_every_time(pg_engine):
+    """Two in-stock sellers at one price: without a final key the LIMIT picks whichever row the
+    plan yields first. Seeded in REVERSE id order so insertion order cannot pass this."""
+    _seed(pg_engine)
+    _seed_listing(pg_engine, "ext:retailer:tie-b", "sig_tie_b", "ck_tie",
+                  "agent_seed::retailer::sokoglam.com", "of_tie_b", 15.00,
+                  "https://sokoglam.com/products/tie")
+    _seed_listing(pg_engine, "ext:retailer:tie-a", "sig_tie_a", "ck_tie",
+                  "agent_seed::retailer::ohlolly.com", "of_tie_a", 15.00,
+                  "https://ohlolly.com/products/tie")
+    assert _order(_resolve("ck_tie", limit=1)) == ["of_tie_a"]

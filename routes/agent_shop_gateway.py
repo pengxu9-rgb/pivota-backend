@@ -3843,6 +3843,54 @@ def _attach_eligible_serving_fields_to_items(
     return attached_items
 
 
+# "THIS SELLER CANNOT SELL IT", spelled once. The catalog arm's SQL ORDER BY binds this set, the
+# `in_stock` flag that arm emits is derived from it, and `_rank_offers_merit_first` reads that flag —
+# so the order an offer ships in can never contradict the stock claim printed on it.
+#
+# UNKNOWN IS NOT OUT OF STOCK. `unknown` (the column's server default), NULL, empty or any value
+# not in this set ranks WITH the in-stock offers, by price, and never behind them. Two reasons, both measured rather than preferred:
+#   1. Every lane already reports it that way: the seed lane maps `availability: "unknown"` to
+#      `in_stock: True`, and this arm maps NULL to `in_stock: True`. A three-way rank (in stock >
+#      unknown > out of stock) could only be applied where the raw column survives, i.e. to this
+#      arm alone, and would then order offers by a distinction the flag on them does not show —
+#      and that the gateway's `best_offer`, which reads the flag, could not reproduce.
+#   2. Absence of a stock statement is not evidence against a seller. Demoting it is the same
+#      error the gateway's verification tier refuses to make for an unchecked offer.
+# In prod on 2026-09-18 every live retailer offer said `in_stock` (1,178) or `out_of_stock` (86),
+# so the choice changes no row served today; it decides what the next feed with gaps gets.
+OFFER_UNAVAILABLE_AVAILABILITIES: frozenset[str] = frozenset(
+    {"out_of_stock", "outofstock", "sold_out", "soldout", "unavailable"}
+)
+
+
+def _offer_is_known_unavailable(offer: Dict[str, Any]) -> bool:
+    """True only on an explicit statement that this seller cannot sell it now.
+
+    Reads the `in_stock` flag, which every external lane emits (the catalog arm derives it from
+    OFFER_UNAVAILABLE_AVAILABILITIES). There is no separate `availability` check here on purpose:
+    no lane ships an unavailable `availability` beside a True flag, so one would be dead code.
+
+    INTERNAL (buy-here) OFFERS ARE NEVER DEMOTED ON THIS FLAG, because the flag is wrong in the
+    direction that matters. The summary's `in_stock` reads `inventory_quantity` alone, so an
+    untracked / keep-selling Shopify variant (`available: true`, quantity 0) shows False; demoting
+    on it cut a buyable exact match at limit=1 and flipped `resolution_mode` from exact_match to
+    external_only.
+
+    HONEST LIMIT. In STRICT mode (the caller names a commerce_surface) an internal offer only
+    exists for a variant `pick_first_eligible_variant_from_standard_product` passed, and that gate
+    refuses out-of-stock variants, so the exemption costs nothing. In RELAXED mode the handler
+    falls back to `variants[0]` when no variant passes, so a genuinely unsellable buy-here offer
+    can ship and, being exempt, still wins an equal-fit tie over an in-stock referral — exactly as
+    it did before this ranking existed (transactability already won that tie). Closing that means
+    making the summary's flag read the way the gate does (`available`, then quantity, then
+    `availability`) and then dropping this exemption; that changes an agent-visible flag and is
+    its own change.
+    """
+    if str(offer.get("purchase_route") or "") == "internal_checkout":
+        return False
+    return offer.get("in_stock") is False
+
+
 def _rank_offers_merit_first(offers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Rank offers MERIT-FIRST, never by in-agent integration status (T2-4, decision #3).
 
@@ -3861,9 +3909,18 @@ def _rank_offers_merit_first(offers: List[Dict[str, Any]]) -> List[Dict[str, Any
     Raw confidence is a final deterministic tiebreak within a tier. We do NOT mutate the source
     confidence values (other code reads them) — the bucketing is local to the sort key.
 
-    Sort key (all ascending): (fit_tier_rank, transactability_rank, -confidence). The sort is
-    stable, so equal-key offers keep prior order — a pure-internal set (same-product offers
-    share a confidence) is ordered byte-identically to the old ``internal + external`` list.
+    STOCK, inside the fit tier. An offer that says it cannot be sold (see
+    ``_offer_is_known_unavailable``) ranks after every offer of the same fit that can — measured
+    2026-09-18, ``get_offers`` on the Purito Oat-in Calming Gel Cream led with eyurs.com at $13,
+    out of stock, over sokoglam.com at $19.50, in stock. It is INSIDE the fit tier, not above it,
+    on purpose: a product-grain "in stock" says some variant is on the shelf, not the one that
+    matched exactly, so it must not jump an exact match. It applies to referred offers only —
+    an internal offer already passed a stock gate (see ``_offer_is_known_unavailable``).
+
+    Sort key (all ascending): (fit_tier_rank, unavailable, transactability_rank, -confidence).
+    The sort is stable, so equal-key offers keep prior order — a pure-internal set (same-product
+    offers share a confidence) is ordered byte-identically to the old ``internal + external``
+    list, and the catalog arm's in-stock-then-price SQL order survives into the response.
     """
 
     def _merit(offer: Dict[str, Any]) -> float:
@@ -3885,9 +3942,14 @@ def _rank_offers_merit_first(offers: List[Dict[str, Any]]) -> List[Dict[str, Any
         # Tiebreaker only: 0 = transactable in-agent (buy-here) wins ties, 1 = referral.
         return 0 if str(offer.get("purchase_route") or "") == "internal_checkout" else 1
 
-    def _key(offer: Dict[str, Any]) -> Tuple[int, int, float]:
+    def _key(offer: Dict[str, Any]) -> Tuple[int, int, int, float]:
         confidence = _merit(offer)
-        return (_fit_tier_rank(confidence), _transactability_rank(offer), -confidence)
+        return (
+            _fit_tier_rank(confidence),
+            1 if _offer_is_known_unavailable(offer) else 0,
+            _transactability_rank(offer),
+            -confidence,
+        )
 
     return sorted(offers, key=_key)
 
@@ -5817,11 +5879,29 @@ async def _handle_offers_resolve(
                                     o.list_price) > 0
                        AND coalesce(o.offer_payload->>'destination_url', o.source_ref)
                            IS NOT NULL
-                     ORDER BY price_amount ASC
+                     -- IN STOCK FIRST, then price, and BEFORE the LIMIT. Price alone put
+                     -- eyurs.com $13 out_of_stock ahead of sokoglam.com $19.50 in_stock (prod,
+                     -- 2026-09-18), and because the LIMIT cuts this list it could also drop
+                     -- the only in-stock seller for cheaper ones that cannot sell — measured
+                     -- the same day on 6 content_keys at limit 1 or 2. Unknown ranks with in
+                     -- stock: see OFFER_UNAVAILABLE_AVAILABILITIES, which this binds, so the
+                     -- order matches the `in_stock` flag computed below. `offer_id` makes a
+                     -- price tie cut the same way every time.
+                     -- The btrim set is the common ASCII whitespace (space, tab, newline,
+                     -- CR, FF, VT), so a tab- or newline-padded value sorts the way its flag
+                     -- reads. Python's .strip() also removes 0x1C-0x1F and Unicode spaces
+                     -- (NBSP); a value padded with those would still sort as sellable while
+                     -- flagged not — no live row is (only in_stock/out_of_stock, 2026-09-18).
+                     ORDER BY (lower(btrim(coalesce(o.availability, ''),
+                                           E' \t\n\r\f\v'))
+                               = ANY(:unavailable)) ASC,
+                              price_amount ASC,
+                              o.offer_id ASC
                      LIMIT :limit
                     """,
                     {"aliases": ident_aliases, "limit": max(limit, 1),
-                     "market": market_hint},
+                     "market": market_hint,
+                     "unavailable": sorted(OFFER_UNAVAILABLE_AVAILABILITIES)},
                 ),
                 timeout=min(OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS, 1.0),
             )
@@ -5904,8 +5984,7 @@ async def _handle_offers_resolve(
                     "currency": str(r.get("currency") or "USD").strip() or "USD",
                     "availability": availability,
                     "in_stock": (availability or "").strip().lower()
-                    not in {"out_of_stock", "outofstock", "sold_out",
-                            "soldout", "unavailable"},
+                    not in OFFER_UNAVAILABLE_AVAILABILITIES,
                     "url": destination,
                     "purchase_route": "affiliate_outbound",
                     # NEVER the raw destination under this key. `affiliate_url` MEANS an
