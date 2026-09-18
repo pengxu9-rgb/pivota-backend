@@ -129,13 +129,39 @@ def _error(resp) -> Optional[str]:
     return None
 
 
+#: The consent tag every well-formed POST carries since WP4b. A version string, not prose — the
+#: wording lives at the door.
+CONSENT = "reap-agentic-v1"
+
+
+def _buyer(**over) -> Dict[str, Any]:
+    """The buyer block, with the consent tag already on it.
+
+    A helper and not a literal at each call site because `consent_version` is REQUIRED: a test
+    that overrides the buyer to say something about the ADDRESS should not accidentally also be
+    asserting what happens without consent. The tests that are about consent build it explicitly
+    and never come through here.
+    """
+    payload: Dict[str, Any] = {
+        "email": EMAIL,
+        "shipping_address": dict(ADDRESS),
+        "consent_version": CONSENT,
+    }
+    payload.update(over)
+    return payload
+
+
 def _body(**over) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "merchant_domain": DOMAIN,
         "product_key": PRODUCT_KEY,
         "variant_key": SKU_KEY,
         "quantity": 1,
-        "buyer": {"email": EMAIL, "shipping_address": dict(ADDRESS)},
+        "buyer": {
+            "email": EMAIL,
+            "shipping_address": dict(ADDRESS),
+            "consent_version": CONSENT,
+        },
     }
     payload.update(over)
     return payload
@@ -600,7 +626,7 @@ async def test_the_market_comes_from_the_shipping_country_not_from_the_caller(cl
     address = dict(ADDRESS, country="CA")
     resp = await client.post(
         f"{BASE}/purchases",
-        json=_body(buyer={"email": EMAIL, "shipping_address": address}, market_country="US"),
+        json=_body(buyer=_buyer(shipping_address=address), market_country="US"),
     )
     assert resp.status_code == 202
     row = await _purchase_row(resp.json()["purchase_id"])
@@ -1168,7 +1194,7 @@ async def test_an_incomplete_address_is_refused_without_naming_a_value(client):
     await _seed_all()
     address = {key: value for key, value in ADDRESS.items() if key != "phone"}
     resp = await client.post(
-        f"{BASE}/purchases", json=_body(buyer={"email": EMAIL, "shipping_address": address})
+        f"{BASE}/purchases", json=_body(buyer=_buyer(shipping_address=address))
     )
     assert resp.status_code == 400
     assert _error(resp) == "invalid_address"
@@ -1184,12 +1210,7 @@ async def test_the_buyer_name_and_phone_are_fallbacks_not_overrides(client):
     resp = await client.post(
         f"{BASE}/purchases",
         json=_body(
-            buyer={
-                "email": EMAIL,
-                "name": "Ada Lovelace",
-                "phone": "+15550100",
-                "shipping_address": address,
-            }
+            buyer=_buyer(name="Ada Lovelace", phone="+15550100", shipping_address=address)
         ),
     )
     assert resp.status_code == 202
@@ -1204,7 +1225,7 @@ async def test_an_address_that_names_a_recipient_wins_over_the_buyer_name(client
     await _seed_all()
     resp = await client.post(
         f"{BASE}/purchases",
-        json=_body(buyer={"email": EMAIL, "name": "Somebody Else", "shipping_address": dict(ADDRESS)}),
+        json=_body(buyer=_buyer(name="Somebody Else")),
     )
     assert resp.status_code == 202
     stored = ledger._decode_json((await _purchase_row(resp.json()["purchase_id"]))["shipping_address"])
@@ -1216,7 +1237,7 @@ async def test_a_bad_email_is_refused(client):
     await _seed_all()
     resp = await client.post(
         f"{BASE}/purchases",
-        json=_body(buyer={"email": "not-an-email", "shipping_address": dict(ADDRESS)}),
+        json=_body(buyer=_buyer(email="not-an-email")),
     )
     assert resp.status_code == 400
     assert _error(resp) == "invalid_request"
@@ -1263,7 +1284,7 @@ async def test_an_extra_address_key_cannot_widen_what_is_stored(client):
     await _seed_all()
     address = dict(ADDRESS, ssn="000-00-0000", note="deliver to the neighbour")
     resp = await client.post(
-        f"{BASE}/purchases", json=_body(buyer={"email": EMAIL, "shipping_address": address})
+        f"{BASE}/purchases", json=_body(buyer=_buyer(shipping_address=address))
     )
     assert resp.status_code == 202
     stored = ledger._decode_json((await _purchase_row(resp.json()["purchase_id"]))["shipping_address"])
@@ -1385,7 +1406,7 @@ async def test_a_market_the_currency_map_does_not_know_fails_closed(client):
     await _seed_link()
     address = dict(ADDRESS, country="ZZ")
     resp = await client.post(
-        f"{BASE}/purchases", json=_body(buyer={"email": EMAIL, "shipping_address": address})
+        f"{BASE}/purchases", json=_body(buyer=_buyer(shipping_address=address))
     )
     assert resp.status_code == 409
     assert _error(resp) == "row_currency_mismatch"
@@ -1460,7 +1481,7 @@ async def test_the_same_key_on_a_different_body_is_a_conflict(client):
     address = dict(ADDRESS, addressLine1="1 Other St")
     fourth = await client.post(
         f"{BASE}/purchases",
-        json=_body(idempotency_key="k-1", buyer={"email": EMAIL, "shipping_address": address}),
+        json=_body(idempotency_key="k-1", buyer=_buyer(shipping_address=address)),
     )
     assert _error(fourth) == "idempotency_conflict"
 
@@ -1485,7 +1506,7 @@ async def test_a_cosmetically_different_but_identical_request_still_replays(clie
         json=_body(
             idempotency_key="k-1",
             merchant_domain=DOMAIN.upper(),
-            buyer={"email": EMAIL, "name": "Ada Lovelace", "shipping_address": address},
+            buyer=_buyer(name="Ada Lovelace", shipping_address=address),
         ),
     )
     assert second.status_code == 202
