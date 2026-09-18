@@ -1377,6 +1377,51 @@ _TYPE_FAMILIES = {
 }
 _AMBIGUOUS_PRODUCT_TYPE_KEYS = frozenset({"lipglossoil", "lipglossliptint"})
 
+# PLURAL PRODUCT TYPES. Every CATEGORY_PATTERNS entry matches the SINGULAR noun, so a
+# merchant filing products under "Cleansers" / "Sheet Masks" / "Serums" resolves to
+# nothing, and one unresolved row blocks its whole curated cohort. Measured 2026-09-18
+# over every product of eyurs.com (434), ohlolly.com (510) and sokoglam.com (567):
+# eyurs resolved 204 of 434 before this door and 387 after; no product that resolved
+# before changed. It is a DOOR, not an alias table: it only runs when the merchant's
+# own type matched no pattern at all, and it refuses whenever the title names a
+# different leaf -- eyurs files "Pyunkang Yul Essence Toner" under "Cleansers", and a
+# plural alias would have turned that honest null into a confident cleanser.
+_PLURAL_DOOR_REFUSED_MODIFIERS = frozenset({
+    # The door rescues FACE-care nouns. A body area or an accessory material names a
+    # different shelf that the face patterns cannot see: measured, "Cotton Pads"
+    # matched toner through its "pad" and "Foot Masks" matched the facial mask.
+    "cotton", "foot", "feet", "hand", "hands", "body", "hair", "nail", "nails",
+})
+# A modifier that NAMES a shelf must agree with the leaf the head noun found. The face
+# patterns key on the head noun, so "Lip Masks" would otherwise become a facial sheet
+# mask; "Lip Balms" (the one measured lip plural, sokoglam.com) already lands on the lip
+# shelf and passes.
+_PLURAL_DOOR_SHELF_MODIFIERS = {"lip": "beauty/makeup/lip/"}
+
+
+def _singular_product_type(ptype: str) -> str:
+    """The merchant type with its HEAD noun made singular, or "" when it is not a plural."""
+    words = ptype.split()
+    if not words:
+        return ""
+    head = words[-1]
+    if len(head) <= 3 or head.endswith(("ss", "us", "is")):
+        return ""
+    if head.endswith("ies"):
+        head = head[:-3] + "y"
+    elif re.search(r"(?:sh|ch|x)es$", head):
+        head = head[:-2]
+    elif head.endswith("s"):
+        head = head[:-1]
+    else:
+        return ""
+    return " ".join(words[:-1] + [head])
+
+
+def _title_paths(title: Optional[str]) -> set:
+    from services.pdp_category_classifier import CATEGORY_PATTERNS
+    return {path for _label, path, pattern in CATEGORY_PATTERNS if pattern.search(str(title or ""))}
+
 
 def _title_contradicts_product_type(title: Optional[str], path: str) -> bool:
     claimed = _TYPE_FAMILIES.get(path)
@@ -1432,6 +1477,15 @@ def _resolve_category(*, product_type: Optional[str], title: Optional[str], flag
         "sun protection": "beauty/skincare/sun/sunscreen",
         # Foot Care is a body-care treatment, not footwear or a facial peel.
         "foot care": "beauty/body/care",
+        # Measured 2026-09-18 over every product carrying these exact types at
+        # eyurs.com, ohlolly.com and sokoglam.com; each list was all one class.
+        # "Wash off mask" matches both the cleanser ("wash") and mask patterns, so
+        # the regex count calls it ambiguous; every title was a rinse-off mask.
+        "wash off mask": "beauty/skincare/treat/mask",
+        # Overnight "sleeping packs" are leave-on masks, not a pack of anything.
+        "sleeping pack": "beauty/skincare/treat/mask",
+        "sun care": "beauty/skincare/sun/sunscreen",
+        "suncream": "beauty/skincare/sun/sunscreen",
     }
     if ptype in explicit_types:
         return accept(explicit_types[ptype], CATEGORY_CONFIDENCE_MERCHANT_TYPE)
@@ -1446,6 +1500,20 @@ def _resolve_category(*, product_type: Optional[str], title: Optional[str], flag
         hit = classify(product_type)
         if hit:
             return accept(hit[1], CATEGORY_CONFIDENCE_MERCHANT_TYPE)
+    if matches == 0 and ptype not in _GENERIC_PRODUCT_TYPES:
+        singular = _singular_product_type(ptype)
+        if (singular and singular not in _GENERIC_PRODUCT_TYPES
+                and not (set(singular.split()) & _PLURAL_DOOR_REFUSED_MODIFIERS)
+                and _pattern_matches(singular) == 1):
+            hit = classify(singular)
+            shelves = {shelf for word, shelf in _PLURAL_DOOR_SHELF_MODIFIERS.items() if word in singular.split()}
+            if hit and all(hit[1].startswith(shelf) for shelf in shelves):
+                named = _title_paths(title)
+                if named and hit[1] not in named:
+                    # The title names a different leaf: the merchant's shelf is not
+                    # evidence enough to overrule it, and neither is the title alone.
+                    return "", CATEGORY_CONFIDENCE_FEED_DEFAULT
+                return accept(hit[1], CATEGORY_CONFIDENCE_MERCHANT_TYPE)
     # An unclassifiable multi-use label (e.g. Lip & Cheek) is not permission to
     # choose a competing category from its title.
     if matches == 0 and re.search(r"[&/]|\band\b", ptype):
