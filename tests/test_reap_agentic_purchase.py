@@ -470,16 +470,9 @@ BAD_STARTS = [
         dict(row=_row(variant_title=None)),
         "invalid_request",
     ),
-    (
-        "an alias the ledger cannot carry",
-        dict(row=_row(accept_variant_labels=("Flamingo Flirt - Cream",))),
-        "resolution_hints_not_persistable",
-    ),
-    (
-        "an extra domain the ledger cannot carry",
-        dict(row=_row(also_accept_domains=("shop.brand.example",))),
-        "resolution_hints_not_persistable",
-    ),
+    # The two hint lists used to be refused here as `resolution_hints_not_persistable`.
+    # Migration 225 gave them columns; section 22 covers them now, including the bad-shape cases
+    # the LEDGER refuses, which still leave no row behind.
     ("an email with no @", dict(buyer=svc.BuyerContact("ada", dict(ADDRESS))), "invalid_request"),
     (
         "an email with whitespace",
@@ -2487,3 +2480,295 @@ async def test_a_partner_code_reaches_the_column_already_folded(reap, attributio
     stored = (await _get(purchase_id))["last_error_code"]
     assert stored == "enrollment_not_active"
     assert svc.ERROR_CODE_RE.match(stored)
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# 22. THE RESOLUTION HINTS SURVIVE start_purchase NOW  (#2206 adoption)
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+#
+# Until migration 225 these were REFUSED — `resolution_hints_not_persistable` — because the
+# ledger had no columns for them and `advance` runs in another process, so accepting a purchase
+# would have meant accepting an instruction we were going to drop. The columns exist; the refusal
+# is gone; these tests are what stop it becoming a silent drop instead.
+
+
+async def test_the_hints_a_human_confirmed_reach_the_resolver_that_needs_them(reap, attribution):
+    """THE WHOLE POINT OF THE COLUMNS. `accept_variant_labels` is the client's documented remedy
+    for a merchant whose label spells the shade differently — without it that row refuses as
+    `options:sole_label_differs` for ever, blaming the label for what is really our storage.
+
+    Asserted at the RESOLVER's own call, not just on the row: a value that is persisted and then
+    not passed on is the same outcome as one that was never persisted."""
+    purchase_id = await _start(
+        row=_row(
+            accept_variant_labels=("Flamingo Flirt - Cream", "Flamingo Flirt Cream"),
+            also_accept_domains=("shop.brand.example", "Brand.Example"),
+            market_country="us",
+        )
+    )
+    stored = await _get(purchase_id)
+    assert stored["accept_variant_labels"] == [
+        "Flamingo Flirt - Cream", "Flamingo Flirt Cream"
+    ]
+    assert stored["also_accept_domains"] == ["shop.brand.example", "brand.example"]
+    assert stored["market_country"] == "US"
+
+    await _step(purchase_id)
+    sent = reap.named("resolve_our_row")[0]
+    assert sent["accept_variant_labels"] == (
+        "Flamingo Flirt - Cream", "Flamingo Flirt Cream"
+    )
+    assert sent["also_accept_domains"] == ("shop.brand.example", "brand.example")
+    assert sent["country"] == "US"
+
+
+async def test_a_row_with_no_hints_passes_none_of_them(reap, attribution):
+    """CONTROL. The absence has to stay an absence — `None`, not `[]` — because that is the one
+    spelling the ledger stores, and the resolver reads an empty sequence as "no aliases"."""
+    # The shared `_row()` fixture carries market_country="US", so it is cleared explicitly here
+    # rather than by omission — a test of absence must not depend on a default.
+    purchase_id = await _start(row=_row(market_country=None))
+    stored = await _get(purchase_id)
+    assert stored["accept_variant_labels"] is None
+    assert stored["also_accept_domains"] is None
+    assert stored["market_country"] is None
+
+    await _step(purchase_id)
+    sent = reap.named("resolve_our_row")[0]
+    assert sent["accept_variant_labels"] == ()
+    assert sent["also_accept_domains"] == ()
+    assert sent["country"] is None
+
+
+@pytest.mark.parametrize("given,expected", [("us", "US"), ("Us", "US"), (" gb ", "GB")])
+async def test_the_market_country_is_uppercased_on_our_side(given, expected, reap):
+    """THE LEDGER REFUSES RATHER THAN NORMALISING — its guard is `^[A-Z]{2}` — so an ordinary
+    lowercase `"us"` from a caller would come back as a ValueError about a value the caller would
+    reasonably think was fine. Case is not a decision anybody is making here, so it is normalised
+    on this side, where a caller's mistake is still a caller's mistake."""
+    purchase_id = await _start(row=_row(market_country=given))
+    assert (await _get(purchase_id))["market_country"] == expected
+
+
+@pytest.mark.parametrize("bad", ["USA", "u", "1s", "", "  "])
+async def test_a_country_that_is_not_two_letters_is_still_refused(bad, reap):
+    with pytest.raises(svc.PurchaseRefused) as exc:
+        await _start(row=_row(market_country=bad))
+    assert exc.value.reason == "invalid_request"
+    assert await _count() == 0
+
+
+HOSTILE_HINTS = [
+    ("thirty-three labels", dict(accept_variant_labels=tuple(f"l{i}" for i in range(33)))),
+    ("a label of 129 characters", dict(accept_variant_labels=("x" * 129,))),
+    ("a label carrying a newline", dict(accept_variant_labels=("Flamingo\nFlirt",))),
+    ("a label carrying a NUL", dict(accept_variant_labels=("Flamingo\x00Flirt",))),
+    ("a blank label", dict(accept_variant_labels=("   ",))),
+    ("a label that is not a string", dict(accept_variant_labels=(123,))),
+    ("a domain with a scheme", dict(also_accept_domains=("https://shop.brand.example",))),
+    ("a domain with a path", dict(also_accept_domains=("brand.example/shop",))),
+    ("a domain with a port", dict(also_accept_domains=("brand.example:8443",))),
+]
+
+
+@pytest.mark.parametrize(
+    "label,over", HOSTILE_HINTS, ids=[case[0] for case in HOSTILE_HINTS]
+)
+async def test_a_hint_the_ledger_refuses_is_a_purchase_refusal_not_a_valueerror(
+    label, over, reap
+):
+    """THE LEDGER OWNS THE BOUNDS AND IT RAISES RATHER THAN TRUNCATING — deliberately, because a
+    silently shortened alias is an alias that names a DIFFERENT object, and the whole purpose of
+    the column is to say two names mean the same thing.
+
+    What this module owns is the exception TYPE. A bare `ValueError` escaping `start_purchase`
+    would be the one caller error on this surface that a route could not map, so it is turned
+    into the same `PurchaseRefused` as every other bad input — and, like every other refusal
+    here, it leaves no row behind."""
+    with pytest.raises(svc.PurchaseRefused) as exc:
+        await _start(row=_row(**over))
+    assert exc.value.reason == "invalid_request"
+    assert await _count() == 0
+    assert reap.calls == []
+
+
+async def test_the_hints_survive_a_terminal_transition(reap, attribution):
+    """NOT PII, SO NOT NULLED. `shipping_address` and `buyer_email` go on a terminal write; these
+    are catalog assertions about products and hostnames and name nobody, and a completed purchase
+    that KEPT the alias it resolved through is exactly the record you want when that alias is
+    questioned later."""
+    reap.resolve_our_row = rc.VariantResolution(ok=False, reason="search:merchant_not_in_results")
+    purchase_id = await _start(
+        row=_row(accept_variant_labels=("Flamingo Flirt - Cream",), market_country="US")
+    )
+    await _step(purchase_id)
+    row = await _get(purchase_id)
+    assert row["state"] == "refused"
+    assert row["buyer_email"] is None, "control: the PII did go"
+    assert row["accept_variant_labels"] == ["Flamingo Flirt - Cream"]
+    assert row["market_country"] == "US"
+
+
+async def test_the_hints_are_not_in_the_owner_facing_view(reap):
+    """Harmless to show, but the allowlist is kept minimal on principle and an owner-facing read
+    has no use for our resolver's search configuration."""
+    purchase_id = await _start(row=_row(accept_variant_labels=("Flamingo Flirt - Cream",)))
+    view = await ledger.get_purchase_for_owner(purchase_id, "agent_one", "hash_alice")
+    assert "accept_variant_labels" not in view
+    assert "also_accept_domains" not in view
+    assert "market_country" not in view
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# 23. A RELEASE NOW RECORDS WHY  (#2206 adoption)
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+
+
+async def test_a_transport_failure_records_its_reason_on_the_row(reap, attribution):
+    """IT USED TO RECORD ONLY A SCHEDULE. `release_claim` took `next_poll_at` and nothing else,
+    and there are no self-edges, so the code existed on the returned `AdvanceResult` and in one
+    log line and nowhere a human would look. A stalled row showed a future poll time and no
+    cause."""
+    reap.resolve_our_row = _transport_resolution()
+    purchase_id = await _start()
+    result = await _step(purchase_id)
+
+    assert result.outcome == "released"
+    row = await _get(purchase_id)
+    assert row["state"] == "resolving", "still not a transition"
+    assert row["last_error_code"] == "transport_error:readtimeout"
+    assert result.last_error_code == row["last_error_code"]
+
+
+async def test_the_code_a_release_writes_is_folded_or_the_ledger_refuses_it(reap, attribution):
+    """THE FOLD IS NOT COSMETIC HERE ANY MORE. `release_claim` validates against
+    `^[a-z0-9_:.-]{1,64}` and REFUSES rather than folding — and this module builds
+    `transport_error:ReadTimeout` out of an httpx exception TYPE name, which is mixed case by
+    construction. Unfolded, every transport release on this rail would raise a ValueError out of
+    `advance`.
+
+    Asserted against the ledger's own pattern, so the two cannot drift."""
+    reap.get_enrollment = _ok(dict(ENROLLMENT_ACTIVE, status="SOMETHING_NEW"))
+    purchase_id = await _start()
+    await _step(purchase_id)
+    result = await _step(purchase_id)
+
+    assert result.last_error_code == "unknown_enrollment_status"
+    stored = (await _get(purchase_id))["last_error_code"]
+    assert ledger._ERROR_CODE_RE.match(stored)
+    assert ledger._require_error_code(stored) == stored, "the ledger would accept this again"
+
+
+async def test_a_release_with_no_code_keeps_the_one_already_there(reap, attribution):
+    """`None` means "do not write one", not "clear it" — the release statement COALESCEs. A buyer
+    still looking at the hosted page must not erase the transport failure that preceded them."""
+    reap.get_checkout = _ok(CHECKOUT_CREATED)  # REQUIRES_ACTION -> awaiting_buyer, no code
+    purchase_id = await _start()
+    await _step(purchase_id)
+    await _step(purchase_id)
+    await _step(purchase_id)
+    await database.execute(
+        "UPDATE reap_agentic_purchases SET last_error_code = 'earlier_trouble' WHERE id = :i",
+        {"i": purchase_id},
+    )
+    result = await _step(purchase_id)
+    assert result.outcome == "released"
+    assert result.last_error_code is None
+    assert (await _get(purchase_id))["last_error_code"] == "earlier_trouble"
+
+
+async def test_a_clean_completion_clears_a_stale_code(reap, attribution):
+    """THE TERMINAL WRITE NO LONGER COALESCES, and this is the behaviour that depends on it. A
+    purchase that hit a transport failure, retried and then completed cleanly must not carry
+    `transport_error:readtimeout` for ever — a terminal row's `last_error_code` is read as "why
+    this ended", and a stale one says the purchase failed when it did not.
+
+    Driven through the real sequence rather than by setting the column, so it is the module's own
+    `last_error_code=None` on the completing transition that does the clearing."""
+    reap.resolve_our_row = [_transport_resolution(), _resolved()]
+    await _active_enrollment()
+    purchase_id = await _start()
+
+    assert (await _step(purchase_id)).outcome == "released"
+    assert (await _get(purchase_id))["last_error_code"] == "transport_error:readtimeout"
+
+    assert (await _step(purchase_id)).state == "quoting"
+    assert (await _step(purchase_id)).state == "awaiting_approval"
+    assert (await _step(purchase_id)).state == "completed"
+
+    row = await _get(purchase_id)
+    assert row["state"] == "completed"
+    assert row["last_error_code"] is None, (
+        "a clean completion must clear the stale code, not inherit it"
+    )
+    assert len(attribution.calls) == 1
+
+
+async def test_a_terminal_failure_still_records_its_own_code_over_a_stale_one(reap, attribution):
+    """CONTROL for the test above: "no COALESCE on terminal" must not mean "terminal always
+    clears". An explicit code on the terminal write wins."""
+    reap.resolve_our_row = [_transport_resolution(), _resolved(price=(99.99, "USD"))]
+    purchase_id = await _start()
+    await _step(purchase_id)
+    assert (await _get(purchase_id))["last_error_code"] == "transport_error:readtimeout"
+
+    reap.create_enrollment = rc.ReapResponse(
+        ok=False, status=400, error="reap_status_400", error_code="AGENTIC_REQUEST_REJECTED"
+    )
+    await _step(purchase_id)
+    row = await _get(purchase_id)
+    assert row["state"] == "refused"
+    assert row["refusal_reason"] == "price_changed"
+    assert row["last_error_code"] is None, (
+        "this refusal names itself in refusal_reason and carries no code of its own"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# 24. THE ENROLLMENT READ IS A READ  (#2206 adoption)
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+
+
+async def test_polling_an_enrollment_writes_nothing_to_the_enrollments_table(reap, attribution):
+    """IT USED TO BE AN UPSERT. `get_active_enrollment` cannot see a PENDING row by definition, so
+    recovering the partner's id meant calling `upsert_pending_enrollment` — a WRITE, unfenced,
+    which bumped `updated_at` on every single poll and could mint a stray pending row."""
+    reap.get_enrollment = _ok(ENROLLMENT_CREATED)  # still pending; the step will keep polling
+    purchase_id = await _start()
+    await _step(purchase_id)
+    before = await database.fetch_all("SELECT * FROM reap_agentic_enrollments")
+    assert len(before) == 1
+
+    for _ in range(3):
+        assert (await _step(purchase_id)).outcome == "released"
+
+    after = await database.fetch_all("SELECT * FROM reap_agentic_enrollments")
+    assert len(after) == 1, "polling must not mint enrollment rows"
+    assert after[0]["updated_at"] == before[0]["updated_at"], (
+        "a read must not touch updated_at — the old upsert did, on every poll"
+    )
+
+
+async def test_a_purchase_pointing_at_a_missing_enrollment_fails_by_name(reap, attribution):
+    """None from the reader now means ONE thing — there is no such row — so this code is a true
+    statement. Under the upsert it was a bucket that also caught a lost claim and a row that had
+    stopped being pending mid-poll."""
+    purchase_id = await _start()
+    await _step(purchase_id)
+    await database.execute("DELETE FROM reap_agentic_enrollments")
+    result = await _step(purchase_id)
+    assert result.state == "failed"
+    assert (await _get(purchase_id))["last_error_code"] == "enrollment_row_unreadable"
+    assert reap.named("get_enrollment") == []
+
+
+async def test_the_unexported_reader_is_not_the_one_we_use(reap):
+    """`get_enrollment_by_reap_id` exists on the ledger and is deliberately NOT exported. This
+    module addresses its own row by OUR id, which is the id the purchase row carries and the one
+    whose ownership the caller has already established."""
+    import pathlib
+
+    source = pathlib.Path(svc.__file__).read_text(encoding="utf-8")
+    assert "get_enrollment_internal" in source
+    assert "get_enrollment_by_reap_id" not in source
+    assert "get_enrollment_by_reap_id" not in ledger.__all__

@@ -57,7 +57,15 @@ pytestmark = pytest.mark.skipif(
     ),
 )
 
-_MIGRATION = Path(__file__).resolve().parent.parent / "db/migrations/224_reap_agentic_ledger.sql"
+#: BOTH migrations, in order. 225 adds the three resolution-hint columns this package now
+#: persists, and applying only 224 would build a schema the repo no longer declares — the failure
+#: is an UndefinedColumnError on every test, which is loud, but the gate exists to catch the
+#: quiet version of that.
+_MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "db/migrations"
+_MIGRATIONS = (
+    _MIGRATIONS_DIR / "224_reap_agentic_ledger.sql",
+    _MIGRATIONS_DIR / "225_reap_agentic_purchase_hints.sql",
+)
 
 # Same convention as tests/test_reap_agentic_ledger_postgres.py: this gate DROPS its tables, so
 # it must be INCAPABLE of running anywhere but a throwaway — made true, not merely stated.
@@ -155,8 +163,9 @@ async def _apply_migration():
     from db.database import database
     from db.sql_migrations import split_statements
 
-    for statement in split_statements(_MIGRATION.read_text(encoding="utf-8")):
-        await database.execute(statement)
+    for path in _MIGRATIONS:
+        for statement in split_statements(path.read_text(encoding="utf-8")):
+            await database.execute(statement)
 
 
 @pytest.fixture(autouse=True)
@@ -791,7 +800,9 @@ async def test_every_start_refusal_leaves_the_table_empty(reap):
     bad = [
         dict(quantity=0),
         dict(row=_row(currency="USDD")),
-        dict(row=_row(accept_variant_labels=("x",))),
+        # A hint the LEDGER refuses (a label carrying a control character). The list itself is
+        # persisted now; what still refuses is a bad shape, and it must still leave no row.
+        dict(row=_row(accept_variant_labels=("Flamingo\nFlirt",))),
         dict(return_url="https://evil.example/x"),
         dict(buyer=svc.BuyerContact(EMAIL, {})),
     ]
@@ -1229,3 +1240,126 @@ async def test_the_error_code_column_is_lower_case_and_the_others_are_verbatim(r
     reap.request_quote = _ok(dict(QUOTE_200, expiresAt="2020-01-01T00:00:00Z"))
     result = await _step(purchase_id)
     assert result.last_error_code == "quote_expired"
+
+
+# ── 6. the #2206 adoption, on the dialect that decides it ────────────────────────────────────
+
+
+async def test_the_hint_columns_are_jsonb_and_come_back_as_text_until_the_ledger_decodes(reap):
+    """TWO ASSERTIONS, AND THE FIRST IS THE POINT. asyncpg hands back jsonb VERBATIM as a `str`
+    for a raw statement — no SQLAlchemy result processor runs — so the decoded assertion alone
+    would pass on a driver that never had the problem. These are columns THIS package writes at
+    create and reads at advance, across two processes, so the round trip is the whole feature."""
+    from db.database import database
+
+    purchase_id = await _start(
+        row=_row(
+            accept_variant_labels=("Flamingo Flirt - Cream",),
+            also_accept_domains=("Shop.Brand.Example",),
+            market_country="us",
+        )
+    )
+    raw = await database.fetch_one(
+        "SELECT accept_variant_labels, also_accept_domains, market_country "
+        "FROM reap_agentic_purchases WHERE id = :i",
+        {"i": purchase_id},
+    )
+    assert isinstance(raw["accept_variant_labels"], str), "jsonb arrives as text on this driver"
+    assert json.loads(raw["accept_variant_labels"]) == ["Flamingo Flirt - Cream"]
+    assert json.loads(raw["also_accept_domains"]) == ["shop.brand.example"]
+    assert raw["market_country"] == "US"
+
+    row = await _get(purchase_id)
+    assert row["accept_variant_labels"] == ["Flamingo Flirt - Cream"]
+    assert row["also_accept_domains"] == ["shop.brand.example"]
+
+
+async def test_the_hints_reach_the_resolver_across_the_process_boundary(reap):
+    """The point of the columns: `advance` runs in a DIFFERENT PROCESS from `start_purchase`, so
+    anything not in a column is gone by the time the resolve happens. Asserted at the resolver's
+    own call, because a value persisted and then not passed on is the same outcome as one never
+    persisted."""
+    purchase_id = await _start(
+        row=_row(accept_variant_labels=("Flamingo Flirt - Cream",),
+                 also_accept_domains=("shop.brand.example",), market_country="gb")
+    )
+    await _step(purchase_id)
+    sent = reap.named("resolve_our_row")[0]
+    assert sent["accept_variant_labels"] == ("Flamingo Flirt - Cream",)
+    assert sent["also_accept_domains"] == ("shop.brand.example",)
+    assert sent["country"] == "GB"
+
+
+async def test_the_hints_survive_a_terminal_transition_but_the_pii_does_not(reap):
+    """NOT PII, SO NOT NULLED — catalog assertions about products and hostnames that name nobody.
+    The control is in the same test: `buyer_email` and `shipping_address` DID go, so this is
+    about which columns the terminal write clears rather than about it not running."""
+    import services.reap_agentic_client as rc
+
+    reap.resolve_our_row = rc.VariantResolution(ok=False, reason="search:merchant_not_in_results")
+    purchase_id = await _start(
+        row=_row(accept_variant_labels=("Flamingo Flirt - Cream",), market_country="US")
+    )
+    await _step(purchase_id)
+    row = await _get(purchase_id)
+    assert row["state"] == "refused"
+    assert row["buyer_email"] is None and row["shipping_address"] is None
+    assert row["accept_variant_labels"] == ["Flamingo Flirt - Cream"]
+    assert row["market_country"] == "US"
+
+
+async def test_a_transport_failure_records_its_reason_on_the_row(reap):
+    """`release_claim` used to take `next_poll_at` and nothing else, and there are no self-edges,
+    so a stalled row showed a future poll time and NO CAUSE. The ledger validates the code and
+    REFUSES rather than folding, so an unfolded `transport_error:ReadTimeout` would raise a
+    ValueError out of `advance` on every transport release."""
+    import db.reap_agentic_ledger as ledger
+
+    reap.resolve_our_row = _transport_resolution()
+    purchase_id = await _start()
+    result = await _step(purchase_id)
+
+    assert result.outcome == "released"
+    row = await _get(purchase_id)
+    assert row["state"] == "resolving", "still not a transition"
+    assert row["last_error_code"] == "transport_error:readtimeout"
+    assert ledger._ERROR_CODE_RE.match(row["last_error_code"])
+
+
+async def test_a_clean_completion_clears_a_stale_code(reap, attribution):
+    """THE TERMINAL WRITE NO LONGER COALESCES `last_error_code`, and this is the behaviour that
+    rests on it: a purchase that hit a transport failure, retried and completed cleanly must not
+    carry `transport_error:readtimeout` for ever. A terminal row's code is read as "why this
+    ended"."""
+    reap.resolve_our_row = [_transport_resolution(), _resolved()]
+    await _active_enrollment()
+    purchase_id = await _start()
+
+    assert (await _step(purchase_id)).outcome == "released"
+    assert (await _get(purchase_id))["last_error_code"] == "transport_error:readtimeout"
+    for _ in range(3):
+        await _step(purchase_id)
+
+    row = await _get(purchase_id)
+    assert row["state"] == "completed"
+    assert row["last_error_code"] is None
+    assert len(attribution.calls) == 1
+
+
+async def test_polling_an_enrollment_writes_nothing(reap):
+    """It used to be an UPSERT — unfenced, bumping `updated_at` on every poll, and capable of
+    minting a stray pending row. `get_enrollment_internal` is a read."""
+    from db.database import database
+
+    reap.get_enrollment = _ok(ENROLLMENT_CREATED)  # stays pending
+    purchase_id = await _start()
+    await _step(purchase_id)
+    before = await database.fetch_all("SELECT * FROM reap_agentic_enrollments")
+    assert len(before) == 1
+
+    for _ in range(3):
+        assert (await _step(purchase_id)).outcome == "released"
+
+    after = await database.fetch_all("SELECT * FROM reap_agentic_enrollments")
+    assert len(after) == 1
+    assert after[0]["updated_at"] == before[0]["updated_at"]

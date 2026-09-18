@@ -266,34 +266,26 @@ class PurchaseRow:
     pieces of it to a partner, and a caller that could mutate it after validation would be
     handing the partner something nobody checked.
 
-    ── FOUR FIELDS THE LEDGER CANNOT STORE, AND WHAT THIS MODULE DOES ABOUT IT ──────────────
+    ── ALL FOUR SURVIVE `start_purchase` NOW. THREE OF THEM DID NOT. ───────────────────────
 
-    Migration 224 has columns for merchant_domain, product_key, variant_key, product_name,
-    variant_title, brand, category, currency and our_price_minor. It has NONE for
-    `market_country`, `also_accept_domains`, `accept_variant_labels` or `declared_single_variant`
-    — and `advance` runs in a DIFFERENT PROCESS from `start_purchase`, so anything not in a
-    column is gone by the time the resolve happens.
+    Migration 224 had no columns for `market_country`, `also_accept_domains` or
+    `accept_variant_labels`, and `advance` runs in a DIFFERENT PROCESS from `start_purchase`, so
+    a hint that was not in a column was gone by the time the resolve happened. This module
+    REFUSED a row carrying either alias list — `resolution_hints_not_persistable` — rather than
+    accept a purchase whose stated remedy it would then not apply. Migration 225 adds the three
+    columns; the refusal is gone, `start_purchase` persists them and `_resolution_inputs` reads
+    them back, so a human-confirmed alias now reaches the resolver that needs it.
 
-    They are handled one at a time rather than dropped as a group, because they fail differently:
+    `declared_single_variant` still needs no column of its own: it is carried as the ABSENCE of
+    `variant_title`, which is exactly how the client reads it (see
+    `single_value_axis_accepted_without_title`). `start_purchase` refuses the inconsistent
+    combination and `_single_variant_verdict` re-checks it at the other end.
 
-      declared_single_variant — CARRIED FAITHFULLY, as the absence of `variant_title`. The client
-          reads "no variant title" as exactly this assertion (see
-          `single_value_axis_accepted_without_title`), so the column already holds it. Validated
-          for consistency at `start_purchase`, and re-checked at resolve.
-
-      also_accept_domains / accept_variant_labels — REFUSED at `start_purchase`. These are
-          per-row assertions a HUMAN made ("this label names the same object", "this domain is
-          also this merchant"), and their only purpose is to change what the resolver accepts.
-          Taking a purchase whose stated remedy we will not apply means the resolve refuses later
-          with `options:sole_label_differs` — a reason that blames the label when the real cause
-          is our storage, after a partner round trip. Refusing up front says the true thing. The
-          refusal lifts the day a migration adds the columns; nothing else has to change.
-
-      market_country — ACCEPTED AND NOT PERSISTED, alone among the four, because dropping it
-          degrades RECALL and cannot buy the wrong object: an out-of-market variant comes back in
-          another currency (refused as `price_changed` via `currency_mismatch`) or at another
-          price (refused as `price_changed`). Validated here so the day the column exists the
-          value is already the right shape.
+    THE LEDGER OWNS THE HINTS' SHAPE, NOT THIS MODULE: at most 32 labels of 128 characters with
+    no control characters, hostnames lowercased and shape-checked, `market_country` two UPPERCASE
+    letters. It RAISES rather than truncating, and `start_purchase` maps that to
+    `PurchaseRefused` so a route sees one exception type. The one thing this module does to the
+    values is UPPERCASE the country before the ledger sees it — see `start_purchase`.
     """
 
     merchant_domain: str
@@ -704,11 +696,13 @@ def _stage_url(return_url: Any, stage: str) -> str:
 def _resolution_inputs(row: Mapping[str, Any]) -> Dict[str, Any]:
     """The kwargs `rc.resolve_our_row` gets, built from the DURABLE row and nothing else.
 
-    `country`, `also_accept_domains` and `accept_variant_labels` are fixed at their empty values
-    here and that is not an oversight — see `PurchaseRow` for which of them are refused at
-    `start_purchase` (both alias lists) and which is accepted and lost (country). This function
-    is the one place the loss is visible, so it is the one place to change when migration 225
-    adds the columns.
+    ALL OF IT COMES OFF THE ROW. `country`, `also_accept_domains` and `accept_variant_labels`
+    were fixed at their empty values here until migration 225 gave them columns; this was the one
+    place that loss was visible and it is the one place that changed.
+
+    The hint columns are decoded by the ledger (they are in its `_JSON_COLUMNS`), so what arrives
+    is a list on both dialects. Tupled here because `resolve_our_row` takes a `Sequence` it must
+    not be able to mutate.
     """
     return {
         "merchant_domain": str(row.get("merchant_domain") or ""),
@@ -718,9 +712,9 @@ def _resolution_inputs(row: Mapping[str, Any]) -> Dict[str, Any]:
         "category": row.get("category") or None,
         "our_price": _minor_to_major(row.get("our_price_minor"), row.get("currency")),
         "currency": row.get("currency") or None,
-        "country": None,
-        "also_accept_domains": (),
-        "accept_variant_labels": (),
+        "country": row.get("market_country") or None,
+        "also_accept_domains": tuple(row.get("also_accept_domains") or ()),
+        "accept_variant_labels": tuple(row.get("accept_variant_labels") or ()),
     }
 
 
@@ -1045,8 +1039,18 @@ async def start_purchase(
         or row.our_price_minor <= 0
     ):
         raise PurchaseRefused("invalid_request", "row.our_price_minor must be a positive int")
-    if row.market_country is not None and not re.match(r"^[A-Za-z]{2}$", str(row.market_country)):
-        raise PurchaseRefused("invalid_request", "row.market_country must be 2 letters or None")
+    market_country = None
+    if row.market_country is not None:
+        # UPPERCASED HERE, BEFORE THE LEDGER SEES IT, and that is not tidying. The column's guard
+        # is `^[A-Z]{2}\\Z` and the ledger REFUSES rather than normalising — so an ordinary
+        # lowercase "us" from a caller would come back as a ValueError about a value the caller
+        # would reasonably think was fine. Case is not a decision anybody is making here, so it
+        # is normalised on this side, where a caller's mistake is still a caller's mistake.
+        market_country = str(row.market_country).strip().upper()
+        if not re.match(r"^[A-Z]{2}$", market_country):
+            raise PurchaseRefused(
+                "invalid_request", "row.market_country must be two letters, or None"
+            )
 
     variant_title = str(row.variant_title or "").strip() or None
     # The assertion and the column have to agree, because the column is the only carrier — see
@@ -1064,13 +1068,12 @@ async def start_purchase(
             "a row with no variant_title must set declared_single_variant",
         )
 
-    # The two hint lists the ledger cannot carry to the resolver. Refused rather than dropped —
-    # see PurchaseRow for the whole argument.
-    if tuple(row.accept_variant_labels or ()) or tuple(row.also_accept_domains or ()):
-        raise PurchaseRefused(
-            "resolution_hints_not_persistable",
-            "accept_variant_labels / also_accept_domains have no column on migration 224",
-        )
+    # PERSISTED, NOT REFUSED. Passed through as-is: every bound on these — 32 entries, 128
+    # characters, no control characters, hostname shape, lowercasing — belongs to the ledger, and
+    # a second opinion here would be a second contract to keep in step. It raises; the create
+    # below turns that into a `PurchaseRefused`.
+    accept_variant_labels = list(row.accept_variant_labels or ()) or None
+    also_accept_domains = list(row.also_accept_domains or ()) or None
 
     # 4. QUANTITY. A strict int: `int(2.9)` is 2 and `int(True)` is 1, and this is a count of
     #    physical objects somebody is charged for.
@@ -1118,26 +1121,37 @@ async def start_purchase(
     except rc.ReapRequestError as exc:
         raise PurchaseRefused("invalid_return_url", str(exc)) from None
 
-    created = await ledger.create_purchase(
-        buyer_ref=buyer_ref,
-        agent_id=agent_id,
-        agent_user_ref_hash=agent_user_ref_hash,
-        merchant_domain=merchant_domain,
-        product_key=product_key,
-        variant_key=str(row.variant_key or "").strip() or None,
-        product_name=product_name,
-        variant_title=variant_title,
-        brand=str(row.brand or "").strip() or None,
-        category=str(row.category or "").strip() or None,
-        quantity=quantity,
-        currency=currency,
-        our_price_minor=row.our_price_minor,
-        click_id=str(click_id or "").strip() or None,
-        return_url=rc.validate_return_url(return_url),
-        # The whitelisted output, not the caller's dict.
-        shipping_address=dict(shipping),
-        buyer_email=email,
-    )
+    try:
+        created = await ledger.create_purchase(
+            buyer_ref=buyer_ref,
+            agent_id=agent_id,
+            agent_user_ref_hash=agent_user_ref_hash,
+            merchant_domain=merchant_domain,
+            product_key=product_key,
+            variant_key=str(row.variant_key or "").strip() or None,
+            product_name=product_name,
+            variant_title=variant_title,
+            brand=str(row.brand or "").strip() or None,
+            category=str(row.category or "").strip() or None,
+            quantity=quantity,
+            currency=currency,
+            our_price_minor=row.our_price_minor,
+            click_id=str(click_id or "").strip() or None,
+            return_url=rc.validate_return_url(return_url),
+            market_country=market_country,
+            accept_variant_labels=accept_variant_labels,
+            also_accept_domains=also_accept_domains,
+            # The whitelisted output, not the caller's dict.
+            shipping_address=dict(shipping),
+            buyer_email=email,
+        )
+    except ValueError as exc:
+        # THE HINT COLUMNS ARE THE ONLY THING HERE THAT CAN RAISE, and the ledger raises rather
+        # than truncating them — deliberately, because a silently shortened alias is an alias
+        # that names a different object. Mapped to this module's one exception type so a route
+        # has one thing to catch; the ledger's message names the field and the bound and never a
+        # buyer value, which is why it is safe to carry.
+        raise PurchaseRefused("invalid_request", str(exc)) from None
     logger.info(
         "reap_agentic: purchase opened id=%s merchant=%s state=%s",
         created["id"],
@@ -1247,12 +1261,21 @@ async def _release(
             if transport
             else POLL_INTERVALS[state]
         )
+    error_code = _error_code(error_code)
     released = await ledger.release_claim(
-        str(row["id"]), worker_id, next_poll_at=_now() + timedelta(seconds=seconds)
+        str(row["id"]),
+        worker_id,
+        next_poll_at=_now() + timedelta(seconds=seconds),
+        # PERSISTED NOW. `release_claim` used to take `next_poll_at` and nothing else, so a
+        # transport failure recorded its schedule and NOT its reason: the code lived only on the
+        # returned `AdvanceResult` and in one log line, and a human looking at a stalled row saw
+        # a future poll time and no cause. The fold above is not optional — the ledger REFUSES a
+        # code outside `^[a-z0-9_:.-]{1,64}` rather than folding it, and this module builds
+        # `transport_error:ReadTimeout` out of an httpx type name.
+        last_error_code=error_code,
     )
     if released is None:
         return _lost(row)
-    error_code = _error_code(error_code)
     if error_code:
         # The CODE, never a body, a URL or an address. Every value that reaches this line is
         # either our own vocabulary or `ReapResponse.error`/`error_code`, both of which the
@@ -1417,34 +1440,32 @@ async def _step_resolving(row: Mapping[str, Any], worker_id: str) -> AdvanceResu
     )
 
 
-async def _pending_enrollment_row(
-    row: Mapping[str, Any], worker_id: str
-) -> Optional[Dict[str, Any]]:
-    """Re-read the buyer's PENDING enrollment row.
+async def _enrollment_row(row: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """The purchase's own enrollment row, by OUR id. A READ, and it writes nothing.
 
-    THIS IS A WORKAROUND AND IT SHOULD NOT SURVIVE THE NEXT PACKAGE. The ledger exports
-    `get_active_enrollment(buyer_ref)` and nothing that reads an enrollment BY ID, so the only
-    way to recover the partner's enrollment id from a purchase sitting in 'needs_enrollment' —
-    where the row is pending by definition, so `get_active_enrollment` answers None — is
-    `upsert_pending_enrollment`, which is an upsert that RETURNS the row it touched. Pinning
-    `enrollment_id` makes it address our own row rather than "the newest pending row for this
-    buyer".
+    IT USED TO BE A WRITE, AND THAT IS THE WHOLE POINT OF THIS FUNCTION'S HISTORY. The ledger
+    exported `get_active_enrollment(buyer_ref)` and nothing that read an enrollment by id — and a
+    purchase in 'needs_enrollment' points at a PENDING row, which that reader cannot see by
+    definition. The only way to recover the partner's id was `upsert_pending_enrollment`, an
+    UPSERT that happens to return the row it touched. It bumped `updated_at` on every poll, it
+    took no holder so it was unfenced, and whenever the target had stopped being pending it
+    MINTED A STRAY PENDING ROW instead of returning ours.
 
-    The cost is honest: it bumps `updated_at`, and if our row stopped being pending between the
-    `get_active_enrollment` above and this call, the upsert MINTS A FRESH PENDING ROW rather than
-    returning ours. That row has no `reap_enrollment_id`, the caller sees that and fails the
-    purchase with a named code — a bounded, visible outcome rather than a silent wrong one. The
-    fix is a `get_enrollment_by_id` on the ledger, which is a ledger change.
+    `get_enrollment_internal` is that read. None now means one thing — there is no such row — so
+    the caller's `enrollment_row_unreadable` is a true statement rather than a bucket that also
+    caught a lost claim and a mid-poll status change.
+
+    NO OWNERSHIP RE-READ IN FRONT OF IT ANY MORE, and that is a deletion rather than an omission:
+    `_still_ours` guards SIDE EFFECTS, and this one has none. The step's own guard, two lines
+    above the call, is what stops a worker that lost its lease getting this far.
+
+    `_internal` IS UNSCOPED, so the scoping is ours: the id comes off a purchase row whose
+    ownership the caller has already established, never from a request.
     """
     enrollment_id = str(row.get("enrollment_id") or "").strip()
     if not enrollment_id:
         return None
-    # An UPSERT is a WRITE, and it takes no holder. Guarded like every other side effect.
-    if await _still_ours(row, worker_id) is None:
-        return None
-    return await ledger.upsert_pending_enrollment(
-        buyer_ref=str(row["buyer_ref"]), enrollment_id=enrollment_id
-    )
+    return await ledger.get_enrollment_internal(enrollment_id)
 
 
 async def _step_needs_enrollment(row: Mapping[str, Any], worker_id: str) -> AdvanceResult:
@@ -1466,10 +1487,7 @@ async def _step_needs_enrollment(row: Mapping[str, Any], worker_id: str) -> Adva
             row, worker_id, ["needs_enrollment"], "quoting", enrollment_id=str(active["id"])
         )
 
-    ours = await _pending_enrollment_row(row, worker_id)
-    if ours is None and str(row.get("enrollment_id") or "").strip():
-        # The re-read declined because the lease moved, not because the row is unreadable.
-        return _lost(row)
+    ours = await _enrollment_row(row)
     partner_id = str((ours or {}).get("reap_enrollment_id") or "").strip()
     if not partner_id:
         return await _move(

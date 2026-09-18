@@ -58,6 +58,25 @@ there is) and are read through a sibling converter for that reason; a **negative
 still refused. A quote whose `expiresAt` has already passed is not turned into a checkout —
 release with `quote_expired` and re-quote next step.
 
+### Resolution hints
+
+`accept_variant_labels`, `also_accept_domains` and `market_country` are **persisted** (migration
+225) and read back by `_resolution_inputs`, so a hint survives the process boundary between
+`start_purchase` and `advance`. They used to be refused (`resolution_hints_not_persistable`) or
+silently dropped, because there were no columns for them.
+
+* The **ledger** owns their shape: at most 32 labels of 128 characters, no control characters;
+  domains lowercased and hostname-shaped (no scheme, path or port); `market_country` two
+  UPPERCASE letters. It **raises rather than truncating** — a silently shortened alias names a
+  different object — and `start_purchase` maps that to `PurchaseRefused("invalid_request")`, so a
+  route has one exception type to catch and no row is left behind.
+* **This module uppercases `market_country`** before the ledger sees it. The column's guard is
+  `^[A-Z]{2}`, so an ordinary lowercase `us` would otherwise come back as a refusal of a value
+  the caller would reasonably think was fine.
+* They are **not PII** and are **not** nulled on a terminal transition: a completed purchase that
+  kept the alias it resolved through is the record you want when that alias is questioned later.
+  They are also not in the owner-facing view.
+
 ### Why the quote step re-resolves
 `reap_variant_id` / `reap_product_id` on the row are **evidence, never identity**: five searches
 for the same product on one day returned five different `prd_` ids. Quoting against a stored
@@ -109,8 +128,10 @@ Obligations, in order of how expensive they are to get wrong:
      makes **no partner call at all** and returns `outcome="lost_claim"`.
 
    Residual, and not closed here: a claim that moves between the re-read and the call two lines
-   later is not caught, and `upsert_pending_enrollment` takes no holder. Closing it needs a
-   holder conjunct on the enrollment writes or an outbox — both ledger changes.
+   later is not caught, and the enrollment-table writes take no holder. Closing it needs a holder
+   conjunct on those writes or an outbox — both ledger changes. (The enrollment *read* is no
+   longer a write: `get_enrollment_internal` replaced the upsert-as-read, so polling a pending
+   enrollment no longer touches `updated_at` or risks minting a stray row.)
 2. **`lost_claim` means re-read, never retry.** Somebody else owns the row, *or* an unfenced bulk
    sweep terminated it. Retrying the same write cannot succeed.
 3. **Wrap each row's step in its own `try`.** `advance` does **not** catch driver exceptions. The
@@ -215,9 +236,20 @@ raise out of `advance`, unbounded, since that state is exempt from the attempts 
 starts a new purchase. Same for `ENROLLMENT_NOT_ACTIVE` — `quoting` → `needs_enrollment` is not a
 legal edge, so there is no way back to the card page on that purchase.
 
-**A transport failure records no code in the database.** `release_claim` accepts `next_poll_at`
-and nothing else, and there are no self-edges, so on a transport error the code exists only on
-the returned `AdvanceResult` and in one log line. Closing that gap needs a ledger change.
+**A transport failure now records its reason.** `release_claim` takes `last_error_code`
+(migration 225's sibling change), so a stalled row says *why* rather than only *when to look
+again*. The ledger **validates** the code against `^[a-z0-9_:.-]{1,64}` and refuses rather than
+folding, which is why `_error_code` folds at the single place that writes the column — this
+module builds `transport_error:ReadTimeout` out of an httpx exception type name, and unfolded
+that would raise out of every transport release.
+
+`None` on a release means *do not write one*: the release statement COALESCEs, so a buyer still
+looking at the hosted page does not erase the transport failure that preceded them.
+
+**A terminal transition writes `last_error_code` without COALESCE.** So a clean completion after
+an earlier transport failure **clears** the stale code — a terminal row's code is read as "why
+this ended", and a stale one says the purchase failed when it did not. An explicit code on a
+terminal write still wins.
 
 ---
 
@@ -233,14 +265,6 @@ the returned `AdvanceResult` and in one log line. Closing that gap needs a ledge
 * **Reap's same-name-per-colour products.** Reap lists some merchants' products once per colour
   under the same name. `match_product` requires an exact name match and refuses an ambiguous set;
   the remedy is `accept_variant_labels`, **which this package refuses** (see below).
-* **`accept_variant_labels` / `also_accept_domains`.** Migration 224 has no columns for them and
-  `advance` runs in another process, so they cannot reach the resolver. `start_purchase` refuses
-  a row carrying either (`resolution_hints_not_persistable`) rather than accepting a purchase
-  whose stated remedy we will not apply. Lifting this is one migration plus three lines in
-  `_resolution_inputs`.
-* **`market_country`.** Accepted, validated, and **not persisted** — same reason. Dropping it
-  degrades recall only; an out-of-market variant comes back in another currency or at another
-  price and is refused as `price_changed`.
 * **Three-decimal currencies** (KWD, BHD, JOD, OMR, TND, LYD, IQD). `start_purchase` refuses them
   with `currency_unsupported`. `_exponent` assumes two decimal places for anything outside the
   repo's zero-decimal list, so 1.234 KWD would be stored as 123 fils rather than 1234 — a tenfold
@@ -257,12 +281,6 @@ the returned `AdvanceResult` and in one log line. Closing that gap needs a ledge
   to write, and an unapproved checkout expires. The ledger offers no fenced field-only write, so
   the id cannot be persisted before the transition; it is written to the log at INFO
   (`checkout created purchase=… checkout=… quote=…`) so the orphan is at least findable.
-* **Reading an enrollment row by id.** The ledger exports `get_active_enrollment(buyer_ref)` and
-  nothing else, so `needs_enrollment` re-reads its own pending row through
-  `upsert_pending_enrollment(enrollment_id=…)`. That bumps `updated_at`, and in a narrow race can
-  mint one stray pending row — which the next step turns into a named failure
-  (`enrollment_row_unreadable`), not a silent wrong answer. A `get_enrollment_by_id` on the ledger
-  retires the workaround.
 
 ---
 
