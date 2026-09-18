@@ -124,21 +124,47 @@ def test_the_repo_merchant_list_loads_and_matches_the_measured_population():
     assert by_domain["robinsons.com.sg"].market == "SG"
 
 
+# The two seed variants replaced after the 2026-09-18 probe, and why. Every other row keeps the
+# measured population's variant.
+_REPLACED = {
+    # the seed (Collagen Bubble Serum 1-Pack) is unavailable with country=US
+    "podl.us": ("43311538634826", "43311735799882", "chestnut-balm-to-foam-cleanser"),
+    # the seed 404s at /variants/<id>; a MAC lipstick live in SG replaces it
+    "robinsons.com.sg": ("40975353675861", "42438682574933",
+                         "powder-kiss-velvet-blur-slim-lipstick-898-sheer-outrage-2g-0-07oz-1"),
+}
+
+
+def test_the_repo_merchant_list_carries_a_handle_for_every_seeded_variant():
+    merchants = {m.domain: m for m in load_merchants()}
+    seeded = [m for m in merchants.values() if m.variant_id]
+    assert len(seeded) == 36 and all(m.product_handle for m in seeded)
+    assert all(m.product_handle is None for m in merchants.values() if not m.variant_id)
+    for domain, (_old, new, handle) in _REPLACED.items():
+        assert (merchants[domain].variant_id, merchants[domain].product_handle) == (new, handle)
+    assert merchants["metro.com.sg"].product_handle == "mac-m-a-cximal-matte-silky-lipstick"
+
+
 def test_the_repo_merchant_list_is_the_2026_09_18_population_row_for_row():
-    """The list is the measured population with `variant` renamed — no row dropped, reordered
-    into a different market, or given a different variant."""
-    population = os.path.join(
+    """The list is the measured population with `variant` renamed and a handle added: no row
+    dropped or moved to another market, and no variant changed except the two in _REPLACED."""
+    population = os.environ.get("TIERB_POPULATION_JSON") or os.path.join(
         os.path.dirname(__file__), "..", "reports", "tierb_cart_permalink_2026_09_18", "population.json"
     )
     with open(DEFAULT_MERCHANTS_PATH, encoding="utf-8") as fh:
         ours = json.load(fh)
-    assert all(set(r) <= {"domain", "market", "variant_id"} for r in ours)
+    assert all(set(r) <= {"domain", "market", "variant_id", "product_handle"} for r in ours)
     if os.path.exists(population):  # untracked report; present on the operator's checkout only
         with open(population, encoding="utf-8") as fh:
             theirs = json.load(fh)
-        assert [(r["domain"], r["market"], r.get("variant")) for r in theirs] == [
-            (r["domain"], r["market"], r.get("variant_id")) for r in ours
+        expected = [
+            (r["domain"], r["market"],
+             _REPLACED[r["domain"]][1] if r["domain"] in _REPLACED else r.get("variant"))
+            for r in theirs
         ]
+        assert expected == [(r["domain"], r["market"], r.get("variant_id")) for r in ours]
+        for domain, (old, _new, _handle) in _REPLACED.items():
+            assert any(r["domain"] == domain and r.get("variant") == old for r in theirs)
 
 
 def _row(**over):
@@ -153,6 +179,24 @@ def test_parse_accepts_a_canonical_row_and_one_without_a_variant():
         Merchant("judydoll.com", "US", "50041364447509"),
         Merchant("podl.us", "US", None),
     ]
+
+
+def test_parse_accepts_a_product_handle_hint_and_keeps_it_decoded():
+    out = parse_merchants([_row(product_handle="mac-m-a-cximal-matte-silky-lipstick"),
+                           {"domain": "podl.us", "market": "US", "variant_id": "1", "product_handle": "밤-클렌저"}])
+    assert out[0].product_handle == "mac-m-a-cximal-matte-silky-lipstick"
+    assert out[1].product_handle == "밤-클렌저"
+
+
+@pytest.mark.parametrize("bad", ["", "a/b", "a?b", "a b", "a%20b", "x" * 256, 7, "a\nb"])
+def test_parse_refuses_a_malformed_product_handle(bad):
+    with pytest.raises(MerchantListError, match="product_handle"):
+        parse_merchants([_row(product_handle=bad)])
+
+
+def test_parse_refuses_a_handle_without_a_variant():
+    with pytest.raises(MerchantListError, match="without variant_id"):
+        parse_merchants([{"domain": "podl.us", "market": "US", "product_handle": "chestnut-balm-to-foam-cleanser"}])
 
 
 def test_parse_accepts_the_same_domain_in_two_markets():

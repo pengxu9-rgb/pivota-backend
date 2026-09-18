@@ -283,9 +283,9 @@ def test_main_refuses_a_non_positive_budget():
 # ── what each preflight is asked ────────────────────────────────────────────────────────────
 
 
-async def test_every_preflight_call_carries_no_buyer_and_the_rows_market_and_variant():
+async def test_every_preflight_call_carries_no_buyer_and_the_rows_market_variant_and_handle():
     spy = SpyPreflight({})
-    rows = [Merchant("judydoll.com", "US", "50041364447509"), Merchant("robinsons.com.sg", "SG", None),
+    rows = [Merchant("judydoll.com", "US", "50041364447509", "single-eyeshadow"), Merchant("robinsons.com.sg", "SG", None),
             Merchant("luafee.jp", "JP", "47000000000002")]
     await run(dry_run=True, merchants=rows, preflight_fn=spy)
     assert len(spy.calls) == 3
@@ -294,10 +294,11 @@ async def test_every_preflight_call_carries_no_buyer_and_the_rows_market_and_var
         assert "buyer" in kwargs and kwargs["buyer"] is None, "a buyer reached the preflight"
         assert kwargs["client"] is not None
         assert kwargs["click_id"].startswith("clk_tierbelig_T_")
-        assert kwargs["product_handle"] is None and kwargs["quantity"] == 1
-        seen[host] = (kwargs["market"], kwargs["variant_id"])
-    assert seen == {"judydoll.com": ("US", "50041364447509"), "robinsons.com.sg": ("SG", None),
-                    "luafee.jp": ("JP", "47000000000002")}
+        assert kwargs["quantity"] == 1
+        seen[host] = (kwargs["market"], kwargs["variant_id"], kwargs["product_handle"])
+    assert seen == {"judydoll.com": ("US", "50041364447509", "single-eyeshadow"),
+                    "robinsons.com.sg": ("SG", None, None),
+                    "luafee.jp": ("JP", "47000000000002", None)}
 
 
 async def test_the_real_preflight_sends_no_prefill_parameters():

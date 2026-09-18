@@ -250,7 +250,7 @@ async def _check_merchant(
                 merchant.domain,
                 market=merchant.market,
                 variant_id=merchant.variant_id,
-                product_handle=None,
+                product_handle=merchant.product_handle,
                 quantity=1,
                 buyer=None,  # NEVER a buyer: the Reap path carries no PII in the link
                 click_id=click_id_for(merchant.domain, stamp),

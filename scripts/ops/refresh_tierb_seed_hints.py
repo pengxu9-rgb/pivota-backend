@@ -1,0 +1,251 @@
+"""Operator tool: refresh the `product_handle` hints in config/tierb_cart_link_merchants.json.
+
+    python scripts/ops/refresh_tierb_seed_hints.py                      # print the plan
+    python scripts/ops/refresh_tierb_seed_hints.py --write              # also rewrite the file
+    python scripts/ops/refresh_tierb_seed_hints.py --write --replace-gone --only robinsons.com.sg
+
+WHAT IT DOES. For every row that names a `variant_id`:
+
+  1. GET https://<domain>/variants/<id>, following redirects BY HAND. Shopify answers an existing
+     variant with a redirect to `/products/<handle>?variant=<id>`, and a variant that no longer
+     exists with 404. (metro.com.sg/variants/50755485991233 -> 302 to
+     /products/mac-m-a-cximal-matte-silky-lipstick?variant=50755485991233; robinsons'
+     40975353675861 -> 404, verified 2026-09-18.)
+  2. Confirm the handle: GET /products/<handle>.js?country=<market> must list the variant, and
+     its `available` flag for that market is reported (never acted on — an unavailable variant
+     is a finding for a human, as podl's was).
+  3. A variant that is GONE is reported. With `--replace-gone` a replacement is picked from
+     /products.json?country=<market> (at most `--max-pages` pages): an available, shipped, priced
+     (>= 5) variant of a product whose title contains none of "test" / "sample" / "gift",
+     preferring, in order, a MAC lipstick, then any lip product (the Meitu try-on line is lips),
+     then anything else that qualifies.
+
+WHAT IT NEVER DOES. It never follows a cart permalink and never touches /cart or /checkouts, so
+it creates NO checkouts. Every request is a read-only GET of a public storefront JSON or redirect,
+paced through the same global limiter as the eligibility job (>= 1.5 s between request starts).
+Run it from a laptop or the crawl subnet — never from the worker (the payment-allowlisted NAT).
+
+Rows without a `variant_id` are merchant-level probes and are left alone.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import re
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import unquote, urljoin, urlparse
+
+import httpx
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+from jobs.tierb_cart_link_eligibility import (  # noqa: E402
+    PacedTransport,
+    RequestPacer,
+    _default_inner_transport,
+)
+from services.tierb_cart_link_merchants import DEFAULT_MERCHANTS_PATH, parse_merchants  # noqa: E402
+
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/128.0 Safari/537.36"
+)
+HEADERS = {"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"}
+MAX_HOPS = 5
+_PRODUCT_PATH = re.compile(r"/products/([^/?#]+)")
+_EXCLUDED_WORDS = ("test", "sample", "gift")
+_FORBIDDEN_PATHS = ("/cart", "/checkouts", "/checkout")
+
+
+class ReadOnlyTransport(httpx.AsyncBaseTransport):
+    """Refuses anything but a GET, and any path that could create a cart or a checkout. The
+    script's own code never builds one; this makes a redirect that tries it fail loudly too."""
+
+    def __init__(self, inner: httpx.AsyncBaseTransport) -> None:
+        self._inner = inner
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path.lower()
+        if request.method != "GET" or any(path == p or path.startswith(p + "/") for p in _FORBIDDEN_PATHS):
+            raise RuntimeError(f"refused non-read-only request: {request.method} {request.url.host}{request.url.path}")
+        return await self._inner.handle_async_request(request)
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
+
+def handle_from_url(url: str) -> Optional[str]:
+    match = _PRODUCT_PATH.search(urlparse(url).path)
+    return unquote(match.group(1)) if match else None
+
+
+async def variant_redirect(client: httpx.AsyncClient, domain: str, variant_id: str) -> Tuple[str, Optional[str]]:
+    """('found', handle) | ('gone', None) | ('unknown:<why>', None), from /variants/<id>."""
+    url = f"https://{domain}/variants/{variant_id}"
+    for _ in range(MAX_HOPS):
+        response = await client.get(url, headers=HEADERS)
+        if response.status_code == 404:
+            return "gone", None
+        if response.status_code in (301, 302, 303, 307, 308) and response.headers.get("location"):
+            url = urljoin(str(response.url), response.headers["location"])
+            handle = handle_from_url(url)
+            if handle:
+                return "found", handle
+            continue
+        return f"unknown:status_{response.status_code}", None
+    return "unknown:too_many_redirects", None
+
+
+async def confirm_handle(
+    client: httpx.AsyncClient, domain: str, handle: str, variant_id: str, market: str
+) -> Tuple[bool, Optional[bool], Optional[str]]:
+    """(variant listed on the product, available in `market`, product title)."""
+    response = await client.get(
+        f"https://{domain}/products/{handle}.js", params={"country": market}, headers=HEADERS,
+        follow_redirects=True,
+    )
+    if response.status_code != 200:
+        return False, None, None
+    try:
+        payload = response.json()
+    except ValueError:
+        return False, None, None
+    for variant in payload.get("variants") or []:
+        if str(variant.get("id")) == str(variant_id):
+            return True, bool(variant.get("available")), payload.get("title")
+    return False, None, payload.get("title")
+
+
+def _qualifies(product: Dict[str, Any], variant: Dict[str, Any]) -> bool:
+    title = str(product.get("title") or "").lower()
+    try:
+        price = float(variant.get("price") or 0)
+    except (TypeError, ValueError):
+        price = 0.0
+    return (
+        variant.get("available") is True
+        and variant.get("requires_shipping", True) is not False
+        and price >= 5
+        and not any(word in title for word in _EXCLUDED_WORDS)
+    )
+
+
+def _preference(product: Dict[str, Any]) -> int:
+    """0 = a MAC lipstick, 1 = any lip product, 2 = anything else that qualifies."""
+    vendor = str(product.get("vendor") or "").lower().replace("·", "").replace(".", "").replace(" ", "")
+    text = " ".join(str(product.get(k) or "") for k in ("title", "product_type")).lower()
+    if vendor.startswith("mac") and "lipstick" in text:
+        return 0
+    if "lip" in text:
+        return 1
+    return 2
+
+
+async def pick_replacement(
+    client: httpx.AsyncClient, domain: str, market: str, max_pages: int
+) -> Optional[Dict[str, Any]]:
+    best: Optional[Tuple[int, Dict[str, Any]]] = None
+    for page in range(1, max_pages + 1):
+        response = await client.get(
+            f"https://{domain}/products.json", params={"limit": 250, "page": page, "country": market},
+            headers=HEADERS, follow_redirects=True,
+        )
+        if response.status_code != 200:
+            break
+        try:
+            products = response.json().get("products") or []
+        except ValueError:
+            break
+        if not products:
+            break
+        for product in products:
+            for variant in product.get("variants") or []:
+                if not _qualifies(product, variant):
+                    continue
+                rank = _preference(product)
+                if best is None or rank < best[0]:
+                    best = (rank, {"variant_id": str(variant["id"]), "product_handle": product.get("handle"),
+                                   "title": product.get("title"), "vendor": product.get("vendor"), "rank": rank})
+                break  # one variant per product is enough to rank it
+            if best is not None and best[0] == 0:
+                return best[1]
+        if len(products) < 250:
+            break
+    return best[1] if best else None
+
+
+def dump_rows(rows: List[Dict[str, Any]]) -> str:
+    ordered = []
+    for row in rows:
+        ordered.append({k: row[k] for k in ("domain", "market", "variant_id", "product_handle") if row.get(k)})
+    return "[\n" + ",\n".join("  " + json.dumps(r, ensure_ascii=False) for r in ordered) + "\n]\n"
+
+
+async def refresh(rows: List[Dict[str, Any]], *, only: Optional[List[str]], replace_gone: bool,
+                  max_pages: int) -> List[Dict[str, Any]]:
+    report: List[Dict[str, Any]] = []
+    pacer = RequestPacer()
+    transport = ReadOnlyTransport(PacedTransport(_default_inner_transport(), pacer))
+    async with httpx.AsyncClient(transport=transport, timeout=30.0, follow_redirects=False) as client:
+        for row in rows:
+            if not row.get("variant_id") or (only and row["domain"] not in only):
+                continue
+            entry: Dict[str, Any] = {"domain": row["domain"], "market": row["market"], "variant_id": row["variant_id"],
+                                     "gone_variant_id": None}
+            try:
+                status, handle = await variant_redirect(client, row["domain"], row["variant_id"])
+                entry["lookup"] = status
+                if status == "gone":
+                    entry["gone_variant_id"] = row["variant_id"]
+                if status == "gone" and replace_gone:
+                    pick = await pick_replacement(client, row["domain"], row["market"], max_pages)
+                    entry["replacement"] = pick
+                    if pick and pick.get("product_handle"):
+                        row["variant_id"], handle = pick["variant_id"], pick["product_handle"]
+                        entry["variant_id"] = row["variant_id"]
+                        status = entry["lookup"] = "replaced"
+                if handle:
+                    listed, available, title = await confirm_handle(
+                        client, row["domain"], handle, row["variant_id"], row["market"])
+                    entry.update(handle=handle, listed=listed, available=available, title=title)
+                    if listed:
+                        row["product_handle"] = handle
+                    else:
+                        entry["lookup"] = f"{status}:handle_does_not_list_variant"
+            except httpx.HTTPError as exc:
+                entry["lookup"] = f"unknown:{type(exc).__name__}"
+            report.append(entry)
+            print(json.dumps(entry, ensure_ascii=False), flush=True)
+    return report
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--file", default=str(DEFAULT_MERCHANTS_PATH))
+    ap.add_argument("--write", action="store_true", help="rewrite the file with the resolved hints")
+    ap.add_argument("--replace-gone", action="store_true", help="pick a replacement for a variant that 404s")
+    ap.add_argument("--max-pages", type=int, default=40, help="catalog pages to scan for a replacement")
+    ap.add_argument("--only", action="append", default=None, metavar="DOMAIN")
+    args = ap.parse_args(argv)
+
+    path = Path(args.file)
+    rows = json.loads(path.read_text(encoding="utf-8"))
+    parse_merchants(rows)  # refuse to start on a malformed list
+    report = asyncio.run(refresh(rows, only=args.only, replace_gone=args.replace_gone, max_pages=args.max_pages))
+    parse_merchants(rows)  # and refuse to write one
+    unresolved = [e for e in report if e["lookup"] not in ("found", "replaced") or not e.get("listed")]
+    print(f"resolved {len(report) - len(unresolved)}/{len(report)}; unresolved: "
+          f"{[(e['domain'], e['lookup']) for e in unresolved]}", flush=True)
+    if args.write:
+        path.write_text(dump_rows(rows), encoding="utf-8")
+        print(f"wrote {path}", flush=True)
+    return 1 if unresolved else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

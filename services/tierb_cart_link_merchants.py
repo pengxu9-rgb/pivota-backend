@@ -4,11 +4,16 @@ The list lives in `config/tierb_cart_link_merchants.json`: the 40 Shopify mercha
 2026-09-18 (reports/tierb_cart_permalink_2026_09_18/population.json, with `variant` renamed to
 `variant_id`). It is a JSON list of
 
-    {"domain": "judydoll.com", "market": "US", "variant_id": "50041364447509"}
+    {"domain": "judydoll.com", "market": "US", "variant_id": "50041364447509",
+     "product_handle": "single-eyeshadow"}
 
-`variant_id` is optional. It is a HINT: the preflight confirms it against the live storefront
-and reports VARIANT_GONE / VARIANT_UNAVAILABLE rather than substituting another variant. A row
-without one is a merchant-level probe (the preflight picks a representative variant).
+`variant_id` and `product_handle` are optional HINTS. The preflight confirms the variant against
+the live storefront and reports VARIANT_GONE / VARIANT_UNAVAILABLE rather than substituting
+another. The handle lets it read ONE `/products/<handle>.js` instead of scanning the whole
+catalog, which a store with more than 5,000 products never finishes (`catalog_scan_cap`); a
+handle that 404s falls back to the scan. A row with neither is a merchant-level probe (the
+preflight picks a representative variant). `scripts/ops/refresh_tierb_seed_hints.py` refreshes
+the handles (read-only).
 
 THE FILE IS HELD TO ITS CANONICAL FORM, NOT NORMALISED INTO IT. A row whose domain is not
 already `normalize_domain(domain)` (`www.`, upper case, a scheme, a path, a port) is refused
@@ -32,11 +37,14 @@ from typing import Any, List, Optional, Sequence, Tuple, Union
 
 DEFAULT_MERCHANTS_PATH = Path(__file__).resolve().parents[1] / "config" / "tierb_cart_link_merchants.json"
 
-_ALLOWED_KEYS = frozenset({"domain", "market", "variant_id"})
+_ALLOWED_KEYS = frozenset({"domain", "market", "variant_id", "product_handle"})
 _LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 _TLD = re.compile(r"[a-z]{2,63}")
 _MARKET = re.compile(r"[A-Z]{2}")
 _VARIANT_ID = re.compile(r"[0-9]{1,20}")
+# The preflight's own shape for a handle, minus control characters and `%`: a handle is stored
+# DECODED, because the preflight percent-encodes it and an encoded one would be encoded twice.
+_HANDLE = re.compile(r"[^/?#%\s\x00-\x1f\x7f]{1,255}")
 
 
 class MerchantListError(ValueError):
@@ -48,6 +56,7 @@ class Merchant:
     domain: str
     market: str
     variant_id: Optional[str] = None
+    product_handle: Optional[str] = None
 
 
 def normalize_domain(value: Any) -> str:
@@ -104,11 +113,16 @@ def parse_merchants(raw: Any) -> List[Merchant]:
         variant = row.get("variant_id")
         if variant is not None and (not isinstance(variant, str) or not _VARIANT_ID.fullmatch(variant)):
             raise MerchantListError(f"{where}: variant_id {variant!r} is not a numeric string")
+        handle = row.get("product_handle")
+        if handle is not None and (not isinstance(handle, str) or not _HANDLE.fullmatch(handle)):
+            raise MerchantListError(f"{where}: product_handle {handle!r} is not a bare, decoded handle")
+        if handle is not None and variant is None:
+            raise MerchantListError(f"{where}: product_handle without variant_id (a handle hints a variant)")
         key = (canonical, market)
         if key in seen:
             raise MerchantListError(f"{where}: duplicate merchant {canonical} {market}")
         seen.add(key)
-        out.append(Merchant(domain=canonical, market=market, variant_id=variant))
+        out.append(Merchant(domain=canonical, market=market, variant_id=variant, product_handle=handle))
     return out
 
 
