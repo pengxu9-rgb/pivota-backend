@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from db.database import database
 from services.catalog_identity import normalize_gtin
 from services.claim_safety import ensure_category_disclaimers
+from services.offer_buyability import availability_is_known_unavailable
 from services.source_quarantine import (
     CATALOG_PRODUCT_DOMAIN_SQL,
     build_quarantine_anti_join_sql,
@@ -402,7 +403,8 @@ def aggregate_offers(
     List[Dict[str, Any]],
 ]:
     """Compute price aggregates + top-N offers. Stable ordering:
-    primary merchant first, then price ASC, then merchant_id ASC.
+    sellable before known-unavailable, then primary merchant first, then
+    price ASC, then merchant_id ASC — all applied BEFORE the top-N cut.
 
     `seller_trust_by_id` (W8): the outcome-derived per-merchant trust envelope,
     injected onto each offer like `url` is. Absent/None → offers carry no trust
@@ -445,8 +447,39 @@ def aggregate_offers(
     price_min = min(prices_in_currency) if prices_in_currency else None
     price_max = max(prices_in_currency) if prices_in_currency else None
 
-    def sort_key(o: Dict[str, Any]) -> Tuple[int, float, str]:
+    # SELLABLE FIRST, and before the cut. (primary, price) alone let a cheaper or primary
+    # out-of-stock offer lead the list and let the top-N cut drop the sellable ones. Rebuilt
+    # read-only from prod on 2026-09-18: 39 of 12,643 rows reorder, 26 of them led with an
+    # out-of-stock offer while a sellable one sat behind it, 13 change which offers survive the
+    # cut, and on 1 (a 39-shade lipstick whose five cheapest-then-first shades were all sold
+    # out) the cut had left no in-stock offer, so the served buy pick was a sold-out shade.
+    #
+    # ABOVE is_primary, deliberately. is_primary says whose listing supplies the page, not who
+    # can sell it now; the brand's own sold-out listing ahead of an in-stock retailer is the
+    # defect, not a preference (The Ordinary out of stock over ulta.com in stock at the same
+    # $19; COSRX out of stock at $15 over stylekorean in stock at $6.30). The best_offer
+    # companion to #2218 (PIVOTA-Agent#2240, offersToSignals; open) makes the same call. The primary still leads WITHIN its
+    # stock group, and can only leave the stored set when it is unavailable and at least N
+    # sellable offers exist — 0 rows in prod that day. No reader of these offers (backend,
+    # PIVOTA-Agent, pivota-agent-ui) keys on is_primary or offers[0]; offer_count, price_min
+    # and price_max still cover every offer, unavailable ones included.
+    #
+    # Unknown availability is sellable here: one vocabulary, OFFER_UNAVAILABLE_AVAILABILITIES,
+    # shared with offers.resolve; the reasons are at the constant in services/offer_buyability.py.
+    #
+    # NO internal-offer exemption, unlike offers.resolve. There an internal offer exists only
+    # after a variant eligibility gate that reads `available`, so its quantity-only flag is the
+    # weaker signal. Here nothing stronger exists: an internal offer's `availability` IS the
+    # quantity-only string catalog_sync wrote (in_stock iff inventory_quantity > 0), and the buy
+    # pick already acts on it. Prod 2026-09-18: 10 unsuppressed internal offers, all in_stock.
+    # THE COST, stated: that string is wrong for an untracked / keep-selling Shopify variant
+    # (sellable, quantity 0), and this key now lets it decide more than the buy pick did — such
+    # an internal primary drops behind every sellable retailer and, with N of them, out of the
+    # stored set, where before is_primary always kept it. The fix belongs at the writer
+    # (services/catalog_sync_service.py, read the variant's `available` first), not here.
+    def sort_key(o: Dict[str, Any]) -> Tuple[int, int, float, str]:
         return (
+            1 if availability_is_known_unavailable(o.get("availability")) else 0,
             0 if o.get("is_primary") else 1,
             float(o.get("price") or 0.0),
             o.get("merchant_id") or "",
