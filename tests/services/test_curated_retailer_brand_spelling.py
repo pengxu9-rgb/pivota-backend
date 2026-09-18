@@ -57,29 +57,25 @@ def test_the_family_spelling_joins_the_existing_official_rows_identity():
 
 
 def test_one_family_never_relabels_another():
-    """Review finding: no test crossed two listed families, so a mutant writing ANY listed family
-    whenever the vendor was listed survived. A Purito product with --brand Manyo keeps its vendor."""
-    assert brand_on("ohlolly.com", "Purito", "Manyo") == "Purito"
-    assert brand_on("sokoglam.com", "MANYO FACTORY", "Purito Seoul") == "MANYO FACTORY"
+    """Review finding: no test crossed two listed families. A product keeps its OWN family's spelling
+    whatever family --brand names -- never the other family's."""
+    assert brand_on("ohlolly.com", "Purito", "Manyo") == "Purito SEOUL"
+    assert brand_on("sokoglam.com", "MANYO FACTORY", "Purito Seoul") == "Ma:nyo"
 
 
-def test_every_host_of_a_renamed_brand_now_shares_one_content_key():
-    """The point of the change, stated on the identity key itself: three retailers' spellings of
-    one product, each run with a DIFFERENT --brand spelling, produce ONE content_key."""
-    keys = {
-        make_content_key(brand_on(host, vendor, override), "Pure Fit Cica Cleansing Foam", None)
-        for host, vendor, override in (("sokoglam.com", "Purito Seoul", "Purito Seoul"),
-                                       ("eyurs.com", "Purito SEOUL", "PURITO"),
-                                       ("ohlolly.com", "Purito", "purito seoul"))
-    }
-    assert len(keys) == 1
+@pytest.mark.parametrize("vendor,want", [("Purito", "Purito SEOUL"), ("MANYO FACTORY", "Ma:nyo")])
+def test_a_listed_vendor_converges_even_without_brand(vendor, want):
+    """Review finding: with no --brand the raw vendor was written, so a whole-feed run never joined
+    the family. The vendor's own family decides its spelling."""
+    assert brand_on("retailer.com", vendor, None) == want
 
 
-def test_before_this_change_the_renamed_brand_split_identity():
-    """The control: the raw vendors themselves DO produce different content keys, so the test above
-    is not passing because content_key ignores the brand."""
-    raw = {make_content_key(v, "Pure Fit Cica Cleansing Foam", None) for v in ("Purito Seoul", "Purito")}
-    assert len(raw) == 2
+def test_a_brand_official_store_writes_its_familys_spelling_too():
+    """Review finding: brand-official mode never consulted the families, so a manyo.us re-run with
+    --brand "Manyo" would write "Manyo" and split from the 78 "Ma:nyo" rows it already has."""
+    rec = feed.shopify_product_to_record(product("manyo"), domain="manyo.us", category_path="beauty/skincare",
+                                         brand_override="Manyo", currency="USD", source_role="brand_official")
+    assert rec["pdp"]["brand"] == "Ma:nyo"
 
 
 @pytest.mark.parametrize("vendor,override", [("Innisfree", "Laneige"), ("COSRX", "Cosmetics")])
@@ -112,8 +108,8 @@ def test_case_and_punctuation_variants_still_collapse_as_before():
     assert brand_on("retailer.com", "TONY MOLY", "TONYMOLY") == "TONYMOLY"
 
 
-def test_no_override_writes_the_vendor():
-    assert brand_on("retailer.com", "MANYO FACTORY", None) == "MANYO FACTORY"
+def test_no_override_writes_an_unlisted_vendor_as_is():
+    assert brand_on("retailer.com", "Some Indie Brand", None) == "Some Indie Brand"
 
 
 def test_a_vendor_naming_the_store_is_still_refused_in_retailer_mode():

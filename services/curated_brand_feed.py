@@ -1291,7 +1291,8 @@ RETAILER_BRAND_SPELLINGS = {
     "puritoseoul": "purito",
     "purito": "purito",
 }
-# The spelling each family is WRITTEN as, whatever --brand the operator typed. content_key is
+# The spelling each family is WRITTEN as -- in retailer AND brand-official mode, with or without
+# --brand. content_key is
 # built from normalize_brand(brand), which keeps punctuation ("ma:nyo" != "manyo"), so writing
 # the operator's string would still split a family whenever two runs spelled --brand
 # differently. The canonical spelling is the one the catalog ALREADY carries, measured in prod
@@ -1541,13 +1542,21 @@ def shopify_product_to_record(
         # or a MEASURED rename in RETAILER_BRAND_SPELLINGS. Brand-direct store/supplier-code
         # heuristics cannot label retailer stock.
         override_key = "".join(c for c in str(brand_override or "").casefold() if c.isalnum())
-        family = _retailer_brand_family(override_key)
-        if family is not None and family == _retailer_brand_family(vendor_key):
-            brand = RETAILER_BRAND_CANONICAL[family]
+        # The VENDOR's own listed family decides its spelling -- a normalisation of the maker the
+        # retailer named, never a relabel into whatever family --brand belongs to. It does not
+        # depend on --brand at all, so a run without one converges too.
+        vendor_family = _retailer_brand_family(vendor_key)
+        if vendor_family is not None:
+            brand = RETAILER_BRAND_CANONICAL[vendor_family]
         else:
             brand = brand_override if override_key == vendor_key else vendor
     else:
         brand, _brand_reason = resolve_record_brand(product.get("vendor"), brand_override, host)
+        # The same one-spelling-per-family rule for brand-official stores: a manyo.us re-run with
+        # --brand "Manyo" would otherwise write "Manyo" and split from its own 78 "Ma:nyo" rows.
+        official_family = _retailer_brand_family("".join(c for c in str(brand or "").casefold() if c.isalnum()))
+        if official_family is not None:
+            brand = RETAILER_BRAND_CANONICAL[official_family]
     brand = str(brand or "").strip()
     if not brand:
         return None
