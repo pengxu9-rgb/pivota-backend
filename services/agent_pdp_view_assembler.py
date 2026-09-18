@@ -472,6 +472,11 @@ def aggregate_offers(
     # weaker signal. Here nothing stronger exists: an internal offer's `availability` IS the
     # quantity-only string catalog_sync wrote (in_stock iff inventory_quantity > 0), and the buy
     # pick already acts on it. Prod 2026-09-18: 10 unsuppressed internal offers, all in_stock.
+    # THE COST, stated: that string is wrong for an untracked / keep-selling Shopify variant
+    # (sellable, quantity 0), and this key now lets it decide more than the buy pick did — such
+    # an internal primary drops behind every sellable retailer and, with N of them, out of the
+    # stored set, where before is_primary always kept it. The fix belongs at the writer
+    # (services/catalog_sync_service.py, read the variant's `available` first), not here.
     def sort_key(o: Dict[str, Any]) -> Tuple[int, int, float, str]:
         return (
             1 if availability_is_known_unavailable(o.get("availability")) else 0,

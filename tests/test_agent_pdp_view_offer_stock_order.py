@@ -199,6 +199,11 @@ def test_an_internal_offer_is_not_exempt_here() -> None:
     offers passed a variant eligibility gate first. This view has no such gate: an internal
     offer's `availability` is the quantity-only string catalog_sync wrote, and it is the only
     stock statement here, so it ranks like any other."""
-    internal = {**_offer("internal_store", "5.00", "out_of_stock"), "is_first_party": True}
+    internal = {
+        **_offer("internal_store", "5.00", "out_of_stock"),
+        "is_first_party": True,
+        "offer_type": "brand_direct",
+        "catalog_track": "internal_merchant",
+    }
     top = _top([internal, _offer("retailer", "9.00", "in_stock")], primary="internal_store")
     assert _ids(top) == ["retailer", "internal_store"]

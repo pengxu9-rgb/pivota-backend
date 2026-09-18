@@ -37,7 +37,10 @@ from pydantic import BaseModel, Field, ConfigDict
 from config.settings import resolve_public_api_base_url, settings
 from services.seed_variant_options import seed_variant_options_as_mapping
 from services.outbound_warm_handoff import could_upgrade_at_click_time
-from services.offer_buyability import OFFER_UNAVAILABLE_AVAILABILITIES
+from services.offer_buyability import (
+    OFFER_UNAVAILABLE_AVAILABILITIES,
+    availability_is_known_unavailable,
+)
 from services import market_telemetry
 from db.database import database
 from models.catalog import PivotPaymentContext, PivotQueryRequest, PivotResultItem
@@ -5972,8 +5975,7 @@ async def _handle_offers_resolve(
                     "price": float(price_amount) if price_amount is not None else None,
                     "currency": str(r.get("currency") or "USD").strip() or "USD",
                     "availability": availability,
-                    "in_stock": (availability or "").strip().lower()
-                    not in OFFER_UNAVAILABLE_AVAILABILITIES,
+                    "in_stock": not availability_is_known_unavailable(availability),
                     "url": destination,
                     "purchase_route": "affiliate_outbound",
                     # NEVER the raw destination under this key. `affiliate_url` MEANS an
