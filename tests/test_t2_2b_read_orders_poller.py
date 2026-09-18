@@ -387,3 +387,41 @@ async def test_batch_never_raises_on_candidate_query_failure(monkeypatch):
     result = await poller.poll_external_conversions_batch()
     assert result["ok"] is False
     assert result["reason"] == "candidate_query_failed"
+
+
+# --- (mig 228) a close skipped because Reap owns the click is NOT counted as closed ----------
+
+
+@pytest.mark.asyncio
+async def test_a_close_skipped_for_a_reap_owned_click_counts_as_skipped_claimed(monkeypatch):
+    """DELIBERATE SUMMARY CHANGE (#2214 review P2-5). A cart-link Reap purchase's click can be
+    closed by Reap first; the merchant-side helper then skips. Before this, the poller still
+    reported that order as "closed". It now has its own outcome and its own counter."""
+    fake = FakeDB(click_row=_click_row())
+    monkeypatch.setattr(poller, "database", fake)
+    monkeypatch.setattr(svc, "database", fake)
+    _install_fetch(monkeypatch, [[_order(id=7010)]])
+
+    async def _reap_owns_it(close, **kwargs):
+        return {"skipped_claimed": True, "reason": "attribution_closed_by_other_channel"}
+
+    monkeypatch.setattr(poller, "close_merchant_conversion_with_claim", _reap_owns_it)
+    summary = await poller.poll_external_conversions_for_merchant(
+        merchant_id="merch_test", credentials=CREDS
+    )
+
+    assert summary["closed"] == 0
+    assert summary["skipped_claimed"] == 1
+    assert fake.insert_attempts == 0
+
+
+@pytest.mark.asyncio
+async def test_the_summary_carries_the_skipped_claimed_counter_from_the_start(monkeypatch):
+    fake = FakeDB(click_row=_click_row())
+    monkeypatch.setattr(poller, "database", fake)
+    monkeypatch.setattr(svc, "database", fake)
+    _install_fetch(monkeypatch, [[]])
+    summary = await poller.poll_external_conversions_for_merchant(
+        merchant_id="merch_test", credentials=CREDS
+    )
+    assert summary["skipped_claimed"] == 0

@@ -45,7 +45,10 @@ from services.commerce_attribution_service import (
     extract_click_id_from_note_attributes,
     shopify_order_total_to_cents,
 )
-from services.conversion_click_claims import close_merchant_conversion_with_claim
+from services.conversion_click_claims import (
+    close_merchant_conversion_with_claim,
+    is_skipped_claimed,
+)
 from services.shopify_transactions_service import DEFAULT_API_VERSION
 
 logger = logging.getLogger("external_conversion_poller")
@@ -407,7 +410,8 @@ async def _process_order(
     shop_domain: Optional[str] = None,
 ) -> str:
     """Close one order if it carries our click id AND is paid. Returns an outcome
-    tag: 'closed' | 'no_click' | 'unpaid' | 'no_order_id' | 'invalid'.
+    tag: 'closed' | 'no_click' | 'unpaid' | 'no_order_id' | 'invalid' | 'skipped_claimed'
+    (a cart-link Reap purchase's click whose edge Reap already wrote, mig 228).
 
     ``shop_domain`` is the polled store's Shopify domain (the store the sale
     happened on); it is forwarded as ``converting_shop_domain`` for the ADR-009
@@ -429,7 +433,7 @@ async def _process_order(
     # cart-link Reap purchase's click is also closed by Reap under another key, so it goes
     # through the first-writer-wins claim; every other click reaches the same close with the
     # same arguments. Fails open. See services/conversion_click_claims.
-    await close_merchant_conversion_with_claim(
+    result = await close_merchant_conversion_with_claim(
         close_external_order_conversion,
         merchant_id=merchant_id,
         click_id=click_id,
@@ -441,6 +445,9 @@ async def _process_order(
         # ADR-009 §D3: the store we polled IS the converting store-of-record.
         converting_shop_domain=shop_domain,
     )
+    if is_skipped_claimed(result):
+        # Reap already closed this cart-link sale's click (mig 228). NOT "closed": nothing was.
+        return "skipped_claimed"
     return "closed"
 
 
@@ -466,6 +473,7 @@ async def poll_external_conversions_for_merchant(
         "scanned": 0,
         "skipped_no_click": 0,
         "skipped_unpaid": 0,
+        "skipped_claimed": 0,
         "pages": 0,
         "errors": 0,
     }
@@ -544,6 +552,8 @@ async def poll_external_conversions_for_merchant(
                 summary["skipped_no_click"] += 1
             elif outcome == "unpaid":
                 summary["skipped_unpaid"] += 1
+            elif outcome == "skipped_claimed":
+                summary["skipped_claimed"] += 1
 
         if not next_cursor:
             scan_complete = True  # genuinely no more pages — the window is fully scanned

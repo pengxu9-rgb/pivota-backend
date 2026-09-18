@@ -20,6 +20,27 @@ insert owns the edge. A later insert gets no row back, and the claimant then ski
 existing claim is ITS OWN for the SAME order, in which case it proceeds. That second case is a
 retry, and the edge close is itself idempotent on (merchant_id, external_order_id).
 
+A CLAIM IS NEVER RELEASED. A MISSED EDGE BEATS A DOUBLE EDGE. An earlier revision gave a claim
+back whenever its edge was not written (a lost fence, or a close that raised). The #2214 review
+showed every such release can re-open the double edge. The owner retry means two workers of ONE
+claimant (two Reap pods on one row, or the webhook and the poller on one order) both hold "the"
+claim. If one of them writes the edge and the other then releases, the DELETE removes the claim
+the writer is standing on, and the other channel wins a fresh one: two edges. A per-attempt token
+does not help, because the releaser was the INSERT winner. So the release path is gone.
+
+WHAT THAT COSTS, EXACTLY: a claim can be held with NO edge.
+  * Merchant side: a close that raised after its claim leaves the claim held. The NEXT merchant
+    close of that order (a webhook redelivery, or the read_orders poller's next pass, which
+    re-reads paid orders by watermark) is a same-claimant, same-order retry. It proceeds, and
+    fills the edge. So a merchant-side miss heals on the poller's own cadence.
+  * Reap side: a Reap completion that claimed and then did not write its edge (the close raised,
+    the process died between the completing write and the close, or its fence was lost) does
+    NOT heal. A 'completed' purchase row is never advanced again, so nothing retries it. That
+    sale then has NO edge, and the merchant side skips it because Reap holds the claim.
+  Both are made VISIBLE rather than silent. A WARNING (click id and claimant, ids only) is logged
+  whenever a claim is won and its close then fails, and `list_claims_without_edge` is the
+  read-only SELECT an operator reconciles from.
+
 FIRST WRITER WINS, AND THAT IS ACCEPTED. A Reap edge can pre-empt a seller-verified merchant
 edge for the same sale, and the merchant edge is the better-evidenced one: the store reported it
 directly. One edge with the weaker provenance is still correct GMV. Two edges are not.
@@ -40,7 +61,7 @@ exception TYPES only.
 from __future__ import annotations
 
 import logging
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from db.database import database
 
@@ -54,7 +75,9 @@ __all__ = [
     "claim_click",
     "close_merchant_conversion_with_claim",
     "is_reap_cart_link_click",
-    "release_click_claim",
+    "is_skipped_claimed",
+    "list_claims_without_edge",
+    "warn_claim_without_edge",
 ]
 
 #: The two claimants. The CHECK on `conversion_click_claims.claimed_by` holds the same pair.
@@ -67,6 +90,8 @@ MERCHANT_CLAIMANT = "merchant_order"
 CLOSED_BY_OTHER_CHANNEL = "attribution_closed_by_other_channel"
 #: `last_error_code` when the claim itself could not be taken (Reap side fails closed).
 ATTRIBUTION_CLAIM_UNAVAILABLE = "attribution_claim_unavailable"
+
+_SKIPPED_KEY = "skipped_claimed"
 
 # Module-level constants, one statement each, identical on both engines (SQLite 3.35+ has
 # ON CONFLICT … DO NOTHING RETURNING), so tests/test_repo_sql_prepare_postgres.py can see and
@@ -92,12 +117,20 @@ _SELECT_CLAIM_SQL = """
      WHERE click_id = :click_id
 """
 
-# Only the claimant that holds it, for the order it holds it for, can release it.
-_RELEASE_CLAIM_SQL = """
-    DELETE FROM conversion_click_claims
-     WHERE click_id = :click_id
-       AND claimed_by = :claimed_by
-       AND external_order_id = :external_order_id
+# RECONCILIATION, READ-ONLY. A claim whose owner never wrote its edge: no edge carries the
+# claim's click id AND the claim's order id. Keyed on (click_id, external_order_id), not on
+# merchant_id, because the two claimants write their edges under different merchant ids.
+_CLAIMS_WITHOUT_EDGE_SQL = """
+    SELECT c.click_id, c.claimed_by, c.external_order_id, c.claimed_at
+      FROM conversion_click_claims c
+     WHERE NOT EXISTS (
+            SELECT 1
+              FROM commerce_attribution_edges e
+             WHERE e.click_id = c.click_id
+               AND e.external_order_id = c.external_order_id
+           )
+     ORDER BY c.claimed_at, c.click_id
+     LIMIT :limit
 """
 
 
@@ -110,7 +143,8 @@ def _require(value: Any, name: str) -> str:
 
 async def is_reap_cart_link_click(click_id: Any) -> bool:
     """Does this click belong to a cart-link Reap purchase? Uses
-    `idx_reap_agentic_purchases_click_id` (mig 228). Raises on a database error, and the caller
+    the partial unique index `uq_reap_agentic_purchases_cart_link_click`, whose predicate is this
+    query's. Raises on a database error, and the caller
     decides which way to fail."""
     text = str(click_id or "").strip()
     if not text:
@@ -124,7 +158,8 @@ async def claim_click(click_id: Any, *, claimed_by: str, external_order_id: Any)
 
     The INSERT is the decision. The SELECT after a conflict does not decide anything; it only
     tells a retry by the owner that it IS the owner, so a close that failed after its claim can
-    be re-run by the same channel. Anyone else gets False.
+    be re-run by the same claimant for the same order (on the merchant side, the poller's next
+    pass). Anyone else gets False. Nothing ever deletes a claim; see the module docstring.
     """
     if claimed_by not in (REAP_CLAIMANT, MERCHANT_CLAIMANT):
         raise ValueError(f"unknown claimant {claimed_by!r}")
@@ -146,24 +181,28 @@ async def claim_click(click_id: Any, *, claimed_by: str, external_order_id: Any)
     )
 
 
-async def release_click_claim(click_id: Any, *, claimed_by: str, external_order_id: Any) -> None:
-    """Give back a claim whose edge was NOT written, so the other channel can still close the sale.
-    Best-effort: a failure is logged (type only) and swallowed. The worst case is a held claim
-    with no edge, and a same-claimant retry can still fill it."""
-    try:
-        await database.execute(
-            _RELEASE_CLAIM_SQL,
-            {
-                "click_id": _require(click_id, "click_id"),
-                "claimed_by": claimed_by,
-                "external_order_id": _require(external_order_id, "external_order_id"),
-            },
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "conversion_click_claims: release failed click=%s claimant=%s error_type=%s",
-            click_id, claimed_by, type(exc).__name__,
-        )
+def warn_claim_without_edge(click_id: Any, *, claimed_by: str, external_order_id: Any) -> None:
+    """The one log line for "we own this click and wrote no edge". Ids only, no bodies."""
+    logger.warning(
+        "conversion_click_claims: claim held WITHOUT an edge click=%s claimant=%s order=%s; "
+        "see list_claims_without_edge",
+        click_id, claimed_by, external_order_id,
+    )
+
+
+async def list_claims_without_edge(limit: int = 100) -> List[Dict[str, Any]]:
+    """Claims whose owner has no edge for (click_id, order), oldest first. READ-ONLY, for ops
+    reconciliation. A merchant-side row here usually heals on the poller's next pass; a
+    `reap_agentic` row never heals on its own (a completed purchase is not revisited), and its
+    `reap_checkout_id` on the purchase row is what a human re-closes it from."""
+    bounded = max(1, min(1000, int(limit)))
+    rows = await database.fetch_all(_CLAIMS_WITHOUT_EDGE_SQL, {"limit": bounded})
+    return [dict(row) for row in rows]
+
+
+def is_skipped_claimed(result: Any) -> bool:
+    """Did `close_merchant_conversion_with_claim` skip because another channel owns the click?"""
+    return isinstance(result, dict) and result.get(_SKIPPED_KEY) is True
 
 
 async def close_merchant_conversion_with_claim(
@@ -183,11 +222,13 @@ async def close_merchant_conversion_with_claim(
       * not a cart-link Reap click (the common case)  → `close(...)` exactly as before; the
         claims table is never read or written;
       * a cart-link Reap click, claim won (or already ours for this order) → `close(...)`;
-      * a cart-link Reap click, claimed by Reap       → NO close; returns None and logs INFO;
+      * a cart-link Reap click, claimed by Reap       → NO close; returns
+        `{"skipped_claimed": True, ...}` (see `is_skipped_claimed`) and logs INFO;
       * ANY error while deciding                      → FAIL OPEN: WARNING, then `close(...)`.
 
-    If `close` raises after a claim was won, the claim is released before re-raising, so Reap is
-    not locked out of a sale that has no edge.
+    If `close` raises after a claim was won, the claim is KEPT (see the module docstring for why
+    a release re-opens the double edge), a WARNING names it, and the exception propagates as
+    before. The next close of the same order by this claimant fills it.
     """
     claimed = False
     try:
@@ -200,7 +241,7 @@ async def close_merchant_conversion_with_claim(
                     "conversion_click_claims: merchant close skipped click=%s order=%s (%s)",
                     click_id, external_order_id, CLOSED_BY_OTHER_CHANNEL,
                 )
-                return None
+                return {_SKIPPED_KEY: True, "reason": CLOSED_BY_OTHER_CHANNEL}
     except Exception as exc:  # noqa: BLE001 — fail OPEN on the merchant side, by design
         claimed = False
         logger.warning(
@@ -212,7 +253,7 @@ async def close_merchant_conversion_with_claim(
         return await close(click_id=click_id, external_order_id=external_order_id, **close_kwargs)
     except Exception:
         if claimed:
-            await release_click_claim(
+            warn_claim_without_edge(
                 click_id, claimed_by=MERCHANT_CLAIMANT, external_order_id=external_order_id
             )
         raise

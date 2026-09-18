@@ -20,16 +20,19 @@
 --
 -- SCOPE. Only clicks that belong to a cart_link Reap purchase are ever claimed. The merchant side
 -- looks that up by click id first, and every other click never touches this table. That lookup
--- is on reap_agentic_purchases.click_id, which had no index, hence the second statement.
+-- (`click_id = ? AND item_source = 'cart_link'`) is served by the partial unique index
+-- uq_reap_agentic_purchases_cart_link_click from the item_source migration, whose predicate is
+-- exactly the lookup's; a plain click_id index here was measured to be unused, and was removed.
 --
 --   claimed_by        — 'reap_agentic' or 'merchant_order' (the webhook and the poller close
 --                       the same Shopify order under the same key, so they are ONE claimant)
 --   external_order_id — the order id the claimant closes under. A same-claimant retry for the
 --                       same order proceeds (the edge close is idempotent); anything else skips.
 --
--- Production deploys skip db/migrations/, so both statements are ALSO in
--- db/schema_guard.ensure_required_schema_light, each in its own try. The two builds are compared
--- through the catalog by tests/test_conversion_click_claims_postgres.py.
+-- Production deploys skip db/migrations/, so this statement is ALSO in
+-- db/schema_guard.ensure_required_schema_light, in its own try. The two builds are compared
+-- through the catalog by tests/test_reap_agentic_cart_link_postgres.py
+-- (test_the_self_heal_builds_the_228_catalog_the_migration_builds).
 
 CREATE TABLE IF NOT EXISTS conversion_click_claims (
     click_id TEXT PRIMARY KEY,
@@ -39,6 +42,3 @@ CREATE TABLE IF NOT EXISTS conversion_click_claims (
     external_order_id TEXT,
     claimed_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-
-CREATE INDEX IF NOT EXISTS idx_reap_agentic_purchases_click_id
-    ON reap_agentic_purchases (click_id);

@@ -228,8 +228,7 @@ async def test_the_stored_url_is_text_and_round_trips_verbatim():
 
 
 async def _claims_catalog():
-    """The claims table's columns, CHECKs, primary key and indexes, plus the purchases click_id
-    index, as the DATABASE built them."""
+    """The claims table's columns, CHECKs, primary key and indexes, as the DATABASE built them."""
     from db.database import database
 
     columns = await database.fetch_all(
@@ -252,9 +251,7 @@ async def _claims_catalog():
     indexes = await database.fetch_all(
         """
         SELECT indexname, indexdef FROM pg_indexes
-         WHERE schemaname = 'public'
-           AND (tablename = 'conversion_click_claims'
-                OR indexname = 'idx_reap_agentic_purchases_click_id')
+         WHERE schemaname = 'public' AND tablename = 'conversion_click_claims'
          ORDER BY indexname
         """
     )
@@ -274,7 +271,7 @@ async def test_the_self_heal_builds_the_228_catalog_the_migration_builds():
     assert {c[0] for c in constraints} == {
         "conversion_click_claims_pkey", "ck_conversion_click_claims_claimed_by"
     }
-    assert "idx_reap_agentic_purchases_click_id" in {i[0] for i in indexes}
+    assert {i[0] for i in indexes} == {"conversion_click_claims_pkey"}
 
     await drop_tables()
     await ensure_required_schema_light()
@@ -302,7 +299,7 @@ async def test_the_scope_lookup_uses_the_click_id_index():
     finally:
         await database.execute("SET enable_seqscan = on")
     plan = " ".join(str(dict(r).get("QUERY PLAN", "")) for r in rows)
-    assert "idx_reap_agentic_purchases_click_id" in plan, plan
+    assert "uq_reap_agentic_purchases_cart_link_click" in plan, plan
 
 
 async def test_two_connections_claiming_at_once_produce_exactly_one_winner():
@@ -352,3 +349,137 @@ async def test_the_228_down_migration_reverses_cleanly_and_228_reapplies():
     assert columns == [] and constraints == [] and indexes == []
     await apply_migrations((_MIG_228,))
     assert await _claims_catalog() == before
+
+
+# ── #2214b: one click, one cart-link purchase, and at most ONE edge, across connections ───────
+
+
+def _positional(sql: str):
+    order = []
+
+    def _bind(match):
+        name = match.group(1)
+        if name not in order:
+            order.append(name)
+        return f"${order.index(name) + 1}"
+
+    return re.sub(r":([a-zA-Z_][a-zA-Z0-9_]*)", _bind, sql), order
+
+
+async def test_two_connections_creating_cart_link_purchases_on_one_click_leave_one_row():
+    """THE CREATE RACE. Two pods run the ledger's own cart-link INSERT for the same click on
+    their own connections at once. `uq_reap_agentic_purchases_cart_link_click` lets exactly one
+    commit; the other gets a UniqueViolation, which `start_purchase` maps to
+    `cart_link_click_in_use`."""
+    import asyncio
+
+    import asyncpg
+
+    import db.reap_agentic_ledger as ledger
+    from db.database import database
+
+    sql, order = _positional(ledger._INSERT_CART_LINK_PURCHASE_SQL)
+    url = DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
+
+    def _params(purchase_id):
+        values = {
+            "id": purchase_id, "buyer_ref": f"b_{purchase_id}", "agent_id": "a",
+            "agent_user_ref_hash": "h", "enrollment_id": None, "state": "resolving",
+            "merchant_domain": "judydoll.com", "product_key": None, "variant_key": None,
+            "product_name": None, "variant_title": None, "brand": None, "category": None,
+            "quantity": 1, "currency": "USD", "our_price_minor": 2820,
+            "click_id": "clk_race_create", "return_url": None, "queries_tried": None,
+            "next_poll_at": None, "shipping_address": None, "buyer_email": None,
+            "accept_variant_labels": None, "also_accept_domains": None, "market_country": "US",
+            "item_source": "cart_link", "cart_url": CART_URL,
+        }
+        return [values[name] for name in order]
+
+    conns = [await asyncpg.connect(url) for _ in range(2)]
+    try:
+        results = await asyncio.gather(
+            *[conn.fetch(sql, *_params(f"rp_race_{i}")) for i, conn in enumerate(conns)],
+            return_exceptions=True,
+        )
+    finally:
+        for conn in conns:
+            await conn.close()
+    errors = [r for r in results if isinstance(r, BaseException)]
+    assert len(errors) == 1 and isinstance(errors[0], asyncpg.exceptions.UniqueViolationError)
+    assert ledger._is_unique_violation(errors[0])
+    row = await database.fetch_one(
+        "SELECT COUNT(*) AS n FROM reap_agentic_purchases WHERE click_id = 'clk_race_create'"
+    )
+    assert row["n"] == 1
+
+
+async def test_the_cart_link_click_index_is_unique_and_partial_in_both_builds():
+    from db.database import database
+    from db.schema_guard import ensure_required_schema_light
+
+    async def _indexdef():
+        row = await database.fetch_one(
+            "SELECT indexdef FROM pg_indexes WHERE indexname = "
+            "'uq_reap_agentic_purchases_cart_link_click'"
+        )
+        return " ".join(row["indexdef"].split()) if row else None
+
+    from_migration = await _indexdef()
+    assert from_migration and "CREATE UNIQUE INDEX" in from_migration
+    assert "WHERE (item_source = 'cart_link'::text)" in from_migration
+    await drop_tables()
+    await ensure_required_schema_light()
+    assert await _indexdef() == from_migration
+
+
+async def _claim_on_its_own_connection(click_id, claimed_by, order_id):
+    """A claim taken by ANOTHER POD: the module's own statement, on its own asyncpg connection,
+    committed before the service under test runs."""
+    import asyncpg
+
+    import services.conversion_click_claims as ccc
+
+    sql, order = _positional(ccc._CLAIM_CLICK_SQL)
+    values = {"click_id": click_id, "claimed_by": claimed_by, "external_order_id": order_id}
+    conn = await asyncpg.connect(DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://"))
+    try:
+        return await conn.fetch(sql, *[values[name] for name in order])
+    finally:
+        await conn.close()
+
+
+async def test_a_webhook_pod_claims_first_then_reap_completes_one_edge_on_two_connections(
+    reap, attribution
+):
+    """Webhook first, on ANOTHER connection: Reap's completion is skipped and says so."""
+    from reap_cart_link_cases import CLICK, completed_via_reap, get
+
+    rows = await _claim_on_its_own_connection(CLICK, "merchant_order", "5550001")
+    assert len(rows) == 1
+    purchase_id = await completed_via_reap(reap)
+    assert (await get(purchase_id))["last_error_code"] == "attribution_closed_by_other_channel"
+    assert attribution.edges == {}  # the webhook pod wrote its edge elsewhere; Reap wrote none
+
+
+async def test_reap_claims_first_then_a_webhook_pod_cannot_claim_on_its_own_connection(
+    reap, attribution
+):
+    """Reap first: a merchant claim from another connection gets no row back."""
+    from reap_cart_link_cases import CLICK, REAP_ORDER_ID, SHOP, completed_via_reap
+
+    await completed_via_reap(reap)
+    assert list(attribution.edges) == [(SHOP, REAP_ORDER_ID)]
+    assert await _claim_on_its_own_connection(CLICK, "merchant_order", "5550001") == []
+
+
+async def test_a_reap_claim_that_crashed_blocks_another_pods_merchant_claim(reap, attribution):
+    """The crash-after-claim case across connections: the Reap claim persists (committed; no
+    transaction to roll back), so another pod's merchant claim is refused. At most one edge —
+    here, zero, which list_claims_without_edge reports."""
+    import services.conversion_click_claims as ccc
+    from reap_cart_link_cases import CLICK, REAP_ORDER_ID
+
+    assert await ccc.claim_click(CLICK, claimed_by="reap_agentic", external_order_id=REAP_ORDER_ID)
+    # ... and the Reap process dies here, before any edge.
+    assert await _claim_on_its_own_connection(CLICK, "merchant_order", "5550001") == []
+    assert attribution.edges == {}

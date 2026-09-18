@@ -30,5 +30,6 @@ BEGIN
     END IF;
 END
 $$;
+DROP INDEX IF EXISTS uq_reap_agentic_purchases_cart_link_click;
 ALTER TABLE IF EXISTS reap_agentic_purchases DROP COLUMN IF EXISTS cart_url;
 ALTER TABLE IF EXISTS reap_agentic_purchases DROP COLUMN IF EXISTS item_source;

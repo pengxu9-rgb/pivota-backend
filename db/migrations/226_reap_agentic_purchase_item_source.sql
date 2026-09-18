@@ -48,3 +48,13 @@ ALTER TABLE IF EXISTS reap_agentic_purchases
             (item_source = 'reap_variant' AND cart_url IS NULL)
             OR (item_source = 'cart_link' AND cart_url IS NOT NULL)
         );
+
+-- ONE CLICK, ONE CART-LINK PURCHASE. The merchant's order carries the click id from the URL,
+-- and the attribution claim (conversion_click_claims) is per click, so two cart-link purchases
+-- sharing a click would be two sales competing for one claim. PARTIAL, so reap_variant rows
+-- (whose click ids are ordinary referral clicks) are untouched. A second cart-link purchase on
+-- the same click is refused by services/reap_agentic_purchase.start_purchase with
+-- `cart_link_click_in_use`; this index is what makes that true under a race.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_reap_agentic_purchases_cart_link_click
+    ON reap_agentic_purchases (click_id)
+    WHERE item_source = 'cart_link';

@@ -419,8 +419,10 @@ async def purchase_columns() -> set:
 
 
 async def to_pre_226_shape():
-    """The table exactly as every environment that deployed 225 has it: drop the two mig-226
-    columns (cart_url first — its CHECK names item_source). Both engines accept this form."""
+    """The table exactly as every environment that deployed 225 has it: drop the mig-226 unique
+    index (SQLite refuses to drop an indexed column) and the two mig-226 columns (cart_url first —
+    its CHECK names item_source). Both engines accept this form."""
+    await database.execute("DROP INDEX IF EXISTS uq_reap_agentic_purchases_cart_link_click")
     await database.execute("ALTER TABLE reap_agentic_purchases DROP COLUMN cart_url")
     await database.execute("ALTER TABLE reap_agentic_purchases DROP COLUMN item_source")
 
@@ -1397,7 +1399,11 @@ async def test_no_log_record_result_or_exception_carries_the_buyers_details(
     seen.append(await step(purchase_id))
     seen.append(await step(purchase_id))
 
-    refused_id = await start(buyer_ref="bref_bob")
+    # Its OWN click: one click, one cart-link purchase (uq_reap_agentic_purchases_cart_link_click).
+    refused_id = await start(
+        buyer_ref="bref_bob", click_id="clk_bob_1",
+        cart_link=item(cart_url=CART_URL.replace(CLICK, "clk_bob_1")),
+    )
     reap.request_cart_link_quote = ok(cart_quote(shippingOptions=[]))
     await active_enrollment(
         buyer_ref="bref_bob", reap_id="4fa85f64-5717-4562-b3fc-2c963f66afa7"
@@ -1591,7 +1597,9 @@ async def test_reap_first_then_merchant_leaves_one_edge_reaps(
     assert list(attribution.edges) == [(SHOP, REAP_ORDER_ID)]
     assert (await get(purchase_id))["last_error_code"] is None
 
-    await getattr(merchant_paths, channel)()
+    outcome = await getattr(merchant_paths, channel)()
+    if channel == "poller":
+        assert outcome == "skipped_claimed"  # NOT "closed": nothing was
     assert list(attribution.edges) == [(SHOP, REAP_ORDER_ID)]
     # The merchant close was not even attempted — not attempted-and-deduped.
     assert [c["external_order_id"] for c in attribution.calls] == [REAP_ORDER_ID]
@@ -1696,40 +1704,197 @@ async def test_a_missing_claims_table_fails_closed_on_the_reap_side(reap, attrib
     assert attribution.edges == {} and attribution.calls == []
 
 
-async def test_a_reap_close_that_raises_gives_the_claim_back(reap, attribution, merchant_paths):
-    """We own the click but wrote no edge: the merchant side must still be able to close it."""
+async def _ensure_edges_table():
+    created = False
+    try:
+        await database.fetch_one("SELECT click_id, external_order_id FROM commerce_attribution_edges LIMIT 1")
+    except Exception:  # noqa: BLE001
+        await database.execute(
+            "CREATE TABLE commerce_attribution_edges ("
+            "edge_id TEXT PRIMARY KEY, merchant_id TEXT, click_id TEXT, external_order_id TEXT)"
+        )
+        created = True
+    return created
+
+
+async def _drop_edges_table_if(created):
+    if created:
+        await database.execute("DROP TABLE IF EXISTS commerce_attribution_edges")
+
+
+async def test_a_reap_close_that_raises_keeps_the_claim_and_says_so(
+    reap, attribution, merchant_paths, caplog
+):
+    """NO RELEASE (#2214 review, P1). We own the click and wrote no edge: the claim is KEPT, a
+    WARNING names it, and the merchant side is skipped — a MISSED edge, never a double one."""
+    caplog.set_level(logging.WARNING)
     attribution.raises = RuntimeError("edge table unavailable")
     await completed_via_reap(reap)
-    assert attribution.edges == {} and await claims_count() == 0
+    assert attribution.edges == {} and await claims_count() == 1
+    assert any(
+        "claim held WITHOUT an edge" in r.getMessage() and CLICK in r.getMessage()
+        and "reap_agentic" in r.getMessage()
+        for r in caplog.records
+    )
     attribution.raises = None
     await merchant_paths.webhook()
-    assert list(attribution.edges) == [(MERCHANT_TENANT, SHOPIFY_ORDER_ID)]
+    assert attribution.edges == {}  # missed, visibly — not doubled
 
 
-async def test_a_merchant_close_that_raises_gives_the_claim_back(
-    reap, attribution, merchant_paths
+async def test_a_merchant_close_that_raises_keeps_the_claim_and_the_poller_fills_it(
+    reap, attribution, merchant_paths, caplog
 ):
+    """NO RELEASE (P1-2). The webhook's close raises after its claim: the claim is kept and
+    named. Reap then completes and is skipped. The poller's next pass is the SAME claimant for
+    the SAME order, so it fills the held claim — one edge, the merchant's."""
+    caplog.set_level(logging.WARNING)
     purchase_id = await start()
     attribution.raises = RuntimeError("edge table unavailable")
     await merchant_paths.webhook()  # the webhook swallows it, as before
-    assert attribution.edges == {} and await claims_count() == 0
+    assert attribution.edges == {} and await claims_count() == 1
+    assert any("claim held WITHOUT an edge" in r.getMessage() for r in caplog.records)
     attribution.raises = None
     await _finish_reap(purchase_id)
-    assert list(attribution.edges) == [(SHOP, REAP_ORDER_ID)]
+    assert (await get(purchase_id))["last_error_code"] == "attribution_closed_by_other_channel"
+    assert await merchant_paths.poller() == "closed"
+    assert list(attribution.edges) == [(MERCHANT_TENANT, SHOPIFY_ORDER_ID)]
 
 
-async def test_a_reap_completion_that_loses_its_fence_gives_the_claim_back(
-    reap, attribution, monkeypatch
+async def test_a_reap_completion_that_loses_its_fence_keeps_the_claim(
+    reap, attribution, merchant_paths, monkeypatch
 ):
+    """P1-1, inverted from the round-2 test that pinned the bug. After a lost fence the claim is
+    STILL HELD, and a later webhook close of the same sale is skipped."""
     purchase_id = await to_quoting(reap)
     assert (await step(purchase_id)).state == "awaiting_approval"
+    real = ledger.transition_as_holder
 
     async def _lost(*a, **k):
         return None
 
     monkeypatch.setattr(ledger, "transition_as_holder", _lost)
     assert (await step(purchase_id)).outcome == "lost_claim"
-    assert await claims_count() == 0 and attribution.calls == []
+    monkeypatch.setattr(ledger, "transition_as_holder", real)
+    assert await claims_count() == 1 and attribution.calls == []
+    await merchant_paths.webhook()
+    assert attribution.edges == {}
+
+
+async def test_review_R1_a_fence_loser_cannot_open_a_second_edge(
+    reap, attribution, merchant_paths, monkeypatch
+):
+    """agent_review2214b R1, ported. Worker A (stale lease) and worker B both reach `_complete`
+    for the same Reap order. A claims; B re-claims as the owner, moves the row and writes the
+    edge; A's fence loses. It used to RELEASE — deleting B's claim — and the webhook then won a
+    fresh one: two edges. Now: ONE."""
+    purchase_id = await to_quoting(reap)
+    assert (await step(purchase_id)).state == "awaiting_approval"
+    real = ledger.transition_as_holder
+
+    async def _b_wins_then_a_loses(pid, worker, **kw):
+        assert await ccc.claim_click(CLICK, claimed_by="reap_agentic", external_order_id=REAP_ORDER_ID)
+        await real(pid, worker, **kw)
+        completed = await ledger.get_purchase_internal(pid)
+        assert await svc._close_attribution(completed)
+        return None  # A: fence lost
+
+    monkeypatch.setattr(ledger, "transition_as_holder", _b_wins_then_a_loses)
+    assert (await step(purchase_id)).outcome == "lost_claim"
+    monkeypatch.setattr(ledger, "transition_as_holder", real)
+    assert list(attribution.edges) == [(SHOP, REAP_ORDER_ID)]
+    assert await claims_count() == 1
+    await merchant_paths.webhook()
+    assert list(attribution.edges) == [(SHOP, REAP_ORDER_ID)]
+
+
+async def test_review_R2_a_failed_webhook_close_cannot_open_a_second_edge(
+    reap, attribution, merchant_paths, monkeypatch
+):
+    """agent_review2214b R2, ported. The webhook claims; the poller (same claimant, same order)
+    runs to completion inside the webhook's close and writes the edge; then the webhook's close
+    raises. It used to RELEASE — deleting the claim the poller's edge stands on — and Reap then
+    won: two edges. Now: ONE."""
+    import routes.webhook_routes as wr
+    import services.external_conversion_poller as poller
+
+    purchase_id = await start()
+    state = {"n": 0}
+
+    async def close(**kwargs):
+        state["n"] += 1
+        if state["n"] == 1:
+            await merchant_paths.poller()
+            raise RuntimeError("transient")
+        return await attribution(**kwargs)
+
+    monkeypatch.setattr(wr, "close_external_order_conversion", close)
+    monkeypatch.setattr(poller, "close_external_order_conversion", close)
+    await merchant_paths.webhook()
+    assert list(attribution.edges) == [(MERCHANT_TENANT, SHOPIFY_ORDER_ID)]
+    await _finish_reap(purchase_id)
+    assert list(attribution.edges) == [(MERCHANT_TENANT, SHOPIFY_ORDER_ID)]
+
+
+async def test_a_crash_after_the_claim_misses_the_edge_and_is_listed(
+    reap, attribution, merchant_paths, monkeypatch
+):
+    """The process dies between the completing write and the close. The row is 'completed', the
+    claim is held, no edge exists, and nothing retries a completed row. The merchant side is
+    skipped (a missed edge, never a double). `list_claims_without_edge` reports it."""
+    purchase_id = await to_quoting(reap)
+    assert (await step(purchase_id)).state == "awaiting_approval"
+
+    async def _die(purchase):
+        raise KeyboardInterrupt("process killed")  # not an Exception: nothing catches it
+
+    monkeypatch.setattr(svc, "_close_attribution", _die)
+    with pytest.raises(KeyboardInterrupt):
+        await step(purchase_id)
+    assert (await get(purchase_id))["state"] == "completed"
+    await merchant_paths.webhook()
+    assert attribution.edges == {} and await claims_count() == 1
+
+    created = await _ensure_edges_table()
+    try:
+        listed = await ccc.list_claims_without_edge(limit=10)
+    finally:
+        await _drop_edges_table_if(created)
+    assert [(r["click_id"], r["claimed_by"], r["external_order_id"]) for r in listed] == [
+        (CLICK, "reap_agentic", REAP_ORDER_ID)
+    ]
+
+
+async def test_list_claims_without_edge_skips_claims_that_have_their_edge():
+    await ccc.claim_click("clk_has", claimed_by="merchant_order", external_order_id="o1")
+    await ccc.claim_click("clk_none", claimed_by="reap_agentic", external_order_id="o2")
+    created = await _ensure_edges_table()
+    try:
+        await database.execute(
+            "INSERT INTO commerce_attribution_edges (edge_id, merchant_id, click_id, "
+            "external_order_id) VALUES ('e1', 'm', 'clk_has', 'o1')"
+        )
+        # Same click, OTHER order: not this claim's edge.
+        await database.execute(
+            "INSERT INTO commerce_attribution_edges (edge_id, merchant_id, click_id, "
+            "external_order_id) VALUES ('e2', 'm', 'clk_none', 'o_other')"
+        )
+        listed = await ccc.list_claims_without_edge(limit=10)
+        assert [r["click_id"] for r in listed] == ["clk_none"]
+        assert await ccc.list_claims_without_edge(limit=0) == listed[:1]
+    finally:
+        await database.execute("DELETE FROM commerce_attribution_edges WHERE edge_id IN ('e1', 'e2')")
+        await _drop_edges_table_if(created)
+
+
+def test_the_claim_module_has_no_release_path():
+    """A release re-opens the double edge (P1). Not a guard left unreachable: gone."""
+    import inspect as _inspect
+
+    source = _inspect.getsource(ccc)
+    assert "release_click_claim" not in source
+    assert "DELETE FROM conversion_click_claims" not in source
+    svc_source = Path(svc.__file__).read_text()
+    assert "release_click_claim" not in svc_source
 
 
 # ── the primitive ────────────────────────────────────────────────────────────────────────────
@@ -1745,15 +1910,6 @@ async def test_the_claim_is_first_writer_wins_with_an_owner_retry():
         "WHERE click_id = 'clk_p'"
     )
     assert (row["claimed_by"], row["external_order_id"]) == ("reap_agentic", "o1")
-
-
-async def test_a_claim_is_released_only_by_its_owner_for_its_order():
-    await ccc.claim_click("clk_r", claimed_by="merchant_order", external_order_id="o1")
-    await ccc.release_click_claim("clk_r", claimed_by="reap_agentic", external_order_id="o1")
-    await ccc.release_click_claim("clk_r", claimed_by="merchant_order", external_order_id="o2")
-    assert await claims_count() == 1
-    await ccc.release_click_claim("clk_r", claimed_by="merchant_order", external_order_id="o1")
-    assert await claims_count() == 0
 
 
 @pytest.mark.parametrize(
@@ -1787,16 +1943,14 @@ def test_the_228_self_heal_twins_declare_the_migrations_table():
     assert _create(guard, guard.rindex("if IS_SQLITE:")) == from_migration.replace(
         "TIMESTAMPTZ NOT NULL DEFAULT now()", "TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP"
     )
-    index = "CREATE INDEX IF NOT EXISTS idx_reap_agentic_purchases_click_id"
-    assert index in migration
-    assert _norm(guard).count(_norm(index + " ON reap_agentic_purchases (click_id);")) == 1
-    assert (index + " \"\n                        \"ON reap_agentic_purchases (click_id);") in guard
+    # The plain click_id index is GONE (unused: the partial unique index serves the lookup).
+    for text in (migration, guard):
+        assert "idx_reap_agentic_purchases_click_id" not in text
 
 
 def test_the_228_down_migration_drops_both():
     down = (MIGRATIONS_DIR / "down/228_conversion_click_claims_down.sql").read_text()
     assert "DROP TABLE IF EXISTS conversion_click_claims" in down
-    assert "DROP INDEX IF EXISTS idx_reap_agentic_purchases_click_id" in down
 
 
 async def test_the_228_heal_lands_after_a_failing_sibling():
@@ -1988,3 +2142,150 @@ async def test_a_www_link_is_not_stamped_seller_mismatch_by_the_real_close(reap,
     assert metadata["click_matched"] is True
     assert metadata.get("seller_mismatch") is not True
     assert metadata["converting_shop_domain"] == host
+
+
+# ══ 8. REVIEW #2214b: P2s ═══════════════════════════════════════════════════════════════════
+
+
+# ── P2-1 one click, one cart-link purchase ──────────────────────────────────────────────────
+
+
+async def test_a_second_cart_link_purchase_on_the_same_click_is_refused():
+    await start()
+    with pytest.raises(svc.PurchaseRefused) as caught:
+        await start(buyer_ref="bref_bob")
+    assert caught.value.reason == "cart_link_click_in_use"
+    assert await count() == 1
+
+
+async def test_the_unique_index_holds_when_the_early_read_misses_the_race(monkeypatch):
+    """The early read is a courtesy; the INDEX is the guard. With the read blind (as it is when
+    two starts race), the second INSERT violates `uq_reap_agentic_purchases_cart_link_click` and
+    maps to the same refusal, leaving one row."""
+    await start()
+
+    async def _blind(click_id):
+        return False
+
+    monkeypatch.setattr(ccc, "is_reap_cart_link_click", _blind)
+    with pytest.raises(svc.PurchaseRefused) as caught:
+        await start(buyer_ref="bref_bob")
+    assert caught.value.reason == "cart_link_click_in_use"
+    assert await count() == 1
+
+
+async def test_a_read_error_in_the_early_check_is_not_a_refusal(monkeypatch):
+    async def _broken(click_id):
+        raise RuntimeError("read failed")
+
+    monkeypatch.setattr(ccc, "is_reap_cart_link_click", _broken)
+    assert await start()
+
+
+async def test_the_index_is_partial_to_cart_link_rows():
+    """A variant-lane row and a cart-link row may share a click; two variant rows may too."""
+    for ref in ("bref_v1", "bref_v2"):
+        await ledger.create_purchase(
+            buyer_ref=ref, agent_id="agent_one", agent_user_ref_hash="h",
+            merchant_domain="brand.example", currency="USD", our_price_minor=4250,
+            click_id=CLICK,
+        )
+    assert await start()
+    with pytest.raises(Exception) as caught:
+        await mk_cart_row(buyer_ref="bref_raw")
+    assert "unique" in str(caught.value).lower()
+
+
+def test_the_cart_link_click_index_is_in_the_migration_and_both_twins():
+    migration = (MIGRATIONS_DIR / "226_reap_agentic_purchase_item_source.sql").read_text()
+    guard = (ROOT / "db/schema_guard.py").read_text()
+    expected = _norm(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_reap_agentic_purchases_cart_link_click "
+        "ON reap_agentic_purchases (click_id) WHERE item_source = 'cart_link';"
+    )
+    assert expected in _norm(migration)
+    pg_branch, sqlite_branch = guard.rsplit("if IS_SQLITE:", 1)
+    assert expected in _norm(pg_branch)
+    joined = _norm("".join(re.findall(r'"([^"]*)"', sqlite_branch)))
+    assert expected in joined
+    down = (MIGRATIONS_DIR / "down/226_reap_agentic_purchase_item_source_down.sql").read_text()
+    assert "DROP INDEX IF EXISTS uq_reap_agentic_purchases_cart_link_click" in down
+
+
+# ── P2-2 the shipping options agree with the breakdown ─────────────────────────────────────
+
+
+def _opt(oid, amount, selected=None):
+    option = {"id": oid, "name": oid, "price": {"amount": amount, "currency": "USD"}}
+    if selected is not None:
+        option["selected"] = selected
+    return option
+
+
+@pytest.mark.parametrize(
+    "options,ok",
+    [
+        ([_opt("a", 5.0, True), _opt("b", 9.0, False)], True),
+        ([_opt("a", 9.0, True), _opt("b", 5.0, False)], False),   # selected is not the breakdown
+        ([_opt("a", 5.0, True), _opt("b", 5.0, True)], False),    # two selected
+        ([_opt("a", 5.0), _opt("b", 9.0)], True),                 # none selected, one matches
+        ([_opt("a", 7.0), _opt("b", 9.0)], False),                # none selected, none matches
+        ([_opt("a", 5.0, "true"), _opt("b", 9.0)], True),         # only `is True` is "selected"
+        ([_opt("a", 9.0, "true"), _opt("b", 7.0)], False),
+    ],
+    ids=["selected-matches", "selected-differs", "two-selected", "none-selected-one-matches",
+         "none-selected-none-matches", "string-true-is-not-selected", "string-true-none-matches"],
+)
+def test_the_shipping_options_must_agree_with_the_breakdown_on_the_cart_lane(options, ok):
+    check = svc.verify_cart_link_quote(cart_quote(shippingOptions=options), _ROW)
+    if ok:
+        assert check.ok, check
+    else:
+        assert (check.ok, check.refusal_reason, check.last_error_code) == (
+            False, "price_changed", "quote_shipping_not_reconciled"
+        )
+
+
+def test_the_shipping_options_must_agree_with_the_breakdown_on_the_variant_lane():
+    row = {"currency": "USD", "our_price_minor": 2820, "quantity": 1}
+    agreeing = cart_quote()
+    assert svc.verify_quote(agreeing, row, variant_id="var_opaque_1").ok
+    disagreeing = cart_quote(shippingOptions=[_opt("a", 9.0, True)])
+    check = svc.verify_quote(disagreeing, row, variant_id="var_opaque_1")
+    assert check.last_error_code == "quote_shipping_not_reconciled"
+    # Absent or empty options are still allowed on the variant lane.
+    assert svc.verify_quote(cart_quote(shippingOptions=[]), row, variant_id="var_opaque_1").ok
+
+
+# ── P2-3 adjustments we cannot read ──────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("field", ["discounts", "additionalCharges"])
+@pytest.mark.parametrize(
+    "value,ok",
+    [
+        ([], True),
+        (None, True),
+        ([{"amount": {"amount": 1.0, "currency": "USD"}}], False),
+        ({"amount": 1.0}, False),
+        ("none", False),
+    ],
+    ids=["empty", "null", "non-empty", "object", "string"],
+)
+def test_adjustments_must_be_absent_or_empty_on_both_lanes(field, value, ok):
+    quote = cart_quote()
+    quote["amountBreakdown"][field] = value
+    row = {"currency": "USD", "our_price_minor": 2820, "quantity": 1}
+    for check in (svc.verify_cart_link_quote(quote, _ROW),
+                  svc.verify_quote(quote, row, variant_id="var_opaque_1")):
+        if ok:
+            assert check.ok, check
+        else:
+            assert (check.ok, check.last_error_code) == (False, "quote_adjustments_unsupported")
+
+
+def test_absent_adjustment_keys_are_allowed():
+    quote = cart_quote()
+    del quote["amountBreakdown"]["discounts"]
+    del quote["amountBreakdown"]["additionalCharges"]
+    assert svc.verify_cart_link_quote(quote, _ROW).ok

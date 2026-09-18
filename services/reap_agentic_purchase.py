@@ -867,8 +867,24 @@ def verify_quote(
 
     (c) THE TOTAL RECONCILES. `finalAmount == itemsSubtotal + shipping + tax`, within
         `QUOTE_RECONCILE_TOLERANCE_MINOR`. This is what catches a total that does not follow from
-        its own breakdown — a discount line we did not read, a fee under a name we do not know.
-        → `price_changed` / `quote_total_not_reconciled`.
+        the four components it names. → `price_changed` / `quote_total_not_reconciled`.
+
+        IT DOES NOT, ON ITS OWN, CATCH A DISCOUNT OR A CHARGE. The breakdown also carries
+        `discounts` and `additionalCharges`, whose shapes we have not seen populated. A
+        discount can move `finalAmount` AND a component together, or a charge can come with a
+        total that still reconciles, and either passes (c). So (g) refuses them outright.
+
+    (g) NO ADJUSTMENTS WE CANNOT READ. `amountBreakdown.discounts` / `additionalCharges` must be
+        absent, null or `[]` (live quotes, 2026-09-18, carried `[]`). A non-empty list, or any
+        other value, is `price_unverifiable` / `quote_adjustments_unsupported`. This fails closed
+        until their shape is known.
+
+    (h) THE SHIPPING OPTIONS AGREE WITH THE BREAKDOWN, when a non-empty list is present. If any
+        option is `selected: true`, EXACTLY ONE may be, and its price must equal
+        `amountBreakdown.shipping`. If none is selected, `amountBreakdown.shipping` must equal
+        the price of at least one option. Otherwise `price_changed` /
+        `quote_shipping_not_reconciled`. A selected option is NOT required: nothing has shown
+        that live quotes mark one, and requiring it could refuse every real quote.
 
     (e) THE ITEMS ECHO — OPTIONAL-BUT-STRICT. Reap's quote response DOES NOT CARRY `items`:
         not in the published schema (POST /agentic/quotes 200 is `id, shippingOptions,
@@ -982,12 +998,25 @@ def verify_quote(
         # against, and NEVER passed on as None.
         return QuoteCheck(False, "price_unverifiable", "quote_amounts_unreadable")
 
+    # (g) — adjustments we cannot read. Fail closed until their shape is known.
+    for adjustment in ("discounts", "additionalCharges"):
+        value = breakdown.get(adjustment)
+        if value is not None and value != []:
+            return QuoteCheck(False, "price_unverifiable", "quote_adjustments_unsupported")
+
     if subtotal_minor != unit * quantity:
         return QuoteCheck(False, "price_changed", "quote_items_subtotal_mismatch")
 
     reconstructed = subtotal_minor + shipping_minor + tax_minor
     if abs(total_minor - reconstructed) > QUOTE_RECONCILE_TOLERANCE_MINOR:
         return QuoteCheck(False, "price_changed", "quote_total_not_reconciled")
+
+    # (h) — the options agree with the breakdown's shipping line. Every option was already
+    # proved priced in the row currency (f), so each converts.
+    options = data.get("shippingOptions")
+    if isinstance(options, list) and options:
+        if not _shipping_reconciles(options, shipping_minor, currency):
+            return QuoteCheck(False, "price_changed", "quote_shipping_not_reconciled")
 
     return QuoteCheck(
         True,
@@ -1079,6 +1108,23 @@ def verify_cart_link_quote(payload: Any, row: Mapping[str, Any]) -> QuoteCheck:
         return QuoteCheck(False, "no_shipping_option", "quote_no_shipping_option")
 
     return verify_quote(data, row, variant_id=None)
+
+
+def _shipping_reconciles(options: Sequence[Any], shipping_minor: int, currency: str) -> bool:
+    """Does `amountBreakdown.shipping` describe one of these (already priced) options?
+
+    A selected option, if any is marked, is THE option: exactly one may be, and it must be the
+    breakdown's shipping. With none marked, the breakdown's shipping must be the price of at
+    least one option. Only `selected is True` counts as marked, not a truthy string.
+    """
+    def _minor(option: Any) -> Optional[int]:
+        price = _money(option.get("price")) if isinstance(option, dict) else None
+        return _component_minor(price[0], currency) if price else None
+
+    selected = [o for o in options if isinstance(o, dict) and o.get("selected") is True]
+    if selected:
+        return len(selected) == 1 and _minor(selected[0]) == shipping_minor
+    return any(_minor(o) == shipping_minor for o in options)
 
 
 def _is_priced_shipping_option(option: Any, row: Mapping[str, Any]) -> bool:
@@ -1448,6 +1494,20 @@ async def _start_cart_link_purchase(
     email, shipping = _validated_buyer(buyer)
     validated_return_url = _validated_return_url(return_url)
 
+    # ONE CLICK, ONE CART-LINK PURCHASE. The merchant's order will carry this click id, and the
+    # attribution claim is per click. This read is the courteous early answer; the partial unique
+    # index `uq_reap_agentic_purchases_cart_link_click` is what holds under a race, and its
+    # violation below maps to the same code. A read error here is not a refusal: the index is the
+    # guard.
+    try:
+        in_use = await ccc.is_reap_cart_link_click(click)
+    except Exception:  # noqa: BLE001
+        in_use = False
+    if in_use:
+        raise PurchaseRefused(
+            "cart_link_click_in_use", "a cart-link purchase already exists for this click"
+        )
+
     try:
         created = await ledger.create_purchase(
             buyer_ref=buyer_ref,
@@ -1471,6 +1531,13 @@ async def _start_cart_link_purchase(
         # The ledger's messages name a field and a rule, never a value, and its cart_url refusal
         # carries only the validator's reason code.
         raise PurchaseRefused("invalid_request", str(exc)) from None
+    except Exception as exc:  # noqa: BLE001 — only the one we can name is mapped
+        if ledger._is_unique_violation(exc):
+            # Lost the race to another cart-link purchase on the same click.
+            raise PurchaseRefused(
+                "cart_link_click_in_use", "a cart-link purchase already exists for this click"
+            ) from None
+        raise
     logger.info(
         "reap_agentic: purchase opened id=%s merchant=%s state=%s item_source=cart_link",
         created["id"],
@@ -2415,6 +2482,14 @@ async def _complete(
     # FAILS CLOSED: an error taking the claim skips our edge and says so. The merchant side,
     # which fails open, can still close the sale, so the error costs at most our edge and can
     # never double it.
+    #
+    # A CLAIM TAKEN HERE IS NEVER GIVEN BACK, whatever happens next. Two workers on this row are
+    # the SAME claimant for the SAME order, so both get True. If one of them writes the edge and
+    # the other then released, it would delete the claim the writer stands on, and the merchant
+    # side would win a fresh one: two edges (#2214 review, P1-1). A missed edge beats a double
+    # edge. The cost is that a Reap claim with no edge does not heal on its own (a completed row
+    # is never advanced again), so it is logged and listed by
+    # `conversion_click_claims.list_claims_without_edge`.
     claimed = False
     if reason is None and _is_cart_link(row):
         try:
@@ -2441,10 +2516,12 @@ async def _complete(
         # THE HOOK IS AFTER THE FENCE, NOT BEFORE IT. A lost claim means somebody else moved this
         # row — possibly a sweep that failed it — and closing a conversion for a purchase we did
         # not complete puts GMV in the attribution ledger that no order backs. A click claim we
-        # took for it is given back, so the merchant side can still close the sale.
+        # took is KEPT: the worker that did win the fence may be writing the edge under it right
+        # now. If nobody completes this purchase, the claim shows in list_claims_without_edge.
         if claimed:
-            await ccc.release_click_claim(
-                row.get("click_id"), claimed_by=ccc.REAP_CLAIMANT, external_order_id=order_id
+            logger.info(
+                "reap_agentic: purchase=%s lost its fence after claiming click=%s; claim kept",
+                row["id"], row.get("click_id"),
             )
         return moved
 
@@ -2463,8 +2540,9 @@ async def _complete(
     completed = await ledger.get_purchase_internal(str(row["id"])) or {}
     closed = await _close_attribution(completed)
     if claimed and not closed:
-        # We own the click but wrote no edge. Give the claim back so the merchant side can.
-        await ccc.release_click_claim(
+        # We own the click and wrote no edge. NOT released (see the claim block above): this is
+        # the missed edge the design accepts, made visible instead of silent.
+        ccc.warn_claim_without_edge(
             row.get("click_id"), claimed_by=ccc.REAP_CLAIMANT, external_order_id=order_id
         )
     return moved

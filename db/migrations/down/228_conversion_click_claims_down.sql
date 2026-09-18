@@ -7,5 +7,4 @@
 -- whose Reap edge is already written from ALSO getting a merchant edge. Drain the cart-link lane
 -- (REAP_AGENTIC_CART_LINK_ENABLED off, all cart_link rows terminal, merchant closes caught up)
 -- before running this.
-DROP INDEX IF EXISTS idx_reap_agentic_purchases_click_id;
 DROP TABLE IF EXISTS conversion_click_claims;
