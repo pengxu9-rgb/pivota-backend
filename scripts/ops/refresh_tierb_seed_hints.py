@@ -22,8 +22,9 @@ WHAT IT DOES. For every row that names a `variant_id`:
      then anything else that qualifies. A replacement must also look full-size: none of
      "mini" / "travel" / "sachet" / "kit" in its title or handle either.
   4. With `--replace-unfit`, a seed that resolves fine but whose title or handle says it is a
-     test / sample / gift / trial product is swapped the same way: the eligibility probe should
-     exercise a product a buyer would actually purchase.
+     test / sample / gift / trial, a sachet / travel size / mini, a duplicated `copy` / `사본`
+     listing, or short-dated (`Exp 01/28`) is swapped the same way: the eligibility probe should
+     exercise the full-size product a buyer would actually purchase.
 
 WHAT IT NEVER DOES. It never follows a cart permalink and never touches /cart or /checkouts, so
 it creates NO checkouts. It may request ONLY /variants/<id>, /products/<handle>[.js] and
@@ -68,12 +69,21 @@ _PRODUCT_PATH = re.compile(r"/products/([^/?#]+)")
 # A seed whose product title or handle carries one of these is not something a buyer would
 # actually purchase (a tester, a sample, a gift-with-purchase, a trial kit): `--replace-unfit`
 # swaps it. A REPLACEMENT must additionally look full-size.
-_UNFIT_WORDS = ("test", "tester", "sample", "gift", "trial")
-_EXCLUDED_WORDS = _UNFIT_WORDS + ("mini", "travel", "sachet", "kit")
+#   * a tester / sample / gift / trial: not sold as the product;
+#   * a sachet, a travel size, a mini: sold, but not the full-size product a buyer asks for
+#     (mixsoon's 1.5 ml sachet, murad's travel size — review of #2213);
+#   * `copy` / `사본` ("copy" in Korean): a duplicated listing (`...-copy`, `...-사본` on skin1004,
+#     lador, mealit), which a merchant can delete or leave stale at any time.
+_UNFIT_WORDS = ("test", "tester", "sample", "gift", "trial", "sachet", "travel", "mini", "copy", "사본")
+_EXCLUDED_WORDS = _UNFIT_WORDS + ("kit",)
 # WHOLE WORDS (an optional plural s), never substrings: "luminizer" is not "mini", "latest" is
-# not "test". Matched against the title and the handle, split on anything non-alphanumeric.
+# not "test", "copycat" is not "copy". Matched against the title and the handle, split on
+# anything that is not a letter or digit in ANY script (so `사본` survives the split).
 _UNFIT_RE = re.compile(r"\b(?:" + "|".join(_UNFIT_WORDS) + r")s?\b")
 _EXCLUDED_RE = re.compile(r"\b(?:" + "|".join(_EXCLUDED_WORDS) + r")s?\b")
+# A SHORT-DATED listing: "(Exp 01/28)", "EXP: 2026-03", "Expiry 03.2027" (pupsik.sg). Read on the
+# raw title, because the date's punctuation is the signal.
+_EXPIRY_RE = re.compile(r"\bexp(?:iry|ires|iration)?\b\.?\s*[:\-]?\s*\d{1,4}\s*[/.\-]\s*\d{1,4}", re.IGNORECASE)
 
 
 # A LIP product by whole word, not by substring: "Advanced Liposomal NMN" (haroutine, live
@@ -83,7 +93,7 @@ _LIPSTICK_RE = re.compile(r"\blipsticks?\b")
 
 
 def _words(*parts: Any) -> str:
-    return " ".join(re.split(r"[^a-z0-9]+", " ".join(str(p or "") for p in parts).lower()))
+    return " ".join(re.split(r"[\W_]+", " ".join(str(p or "") for p in parts).lower()))
 
 
 # THE ONLY PATHS THIS SCRIPT MAY REQUEST, with at most one leading locale segment (`/en-us`,
@@ -161,7 +171,7 @@ async def confirm_handle(
 
 
 def is_unfit(title: Optional[str], handle: Optional[str]) -> bool:
-    return bool(_UNFIT_RE.search(_words(title, handle)))
+    return bool(_UNFIT_RE.search(_words(title, handle)) or _EXPIRY_RE.search(str(title or "")))
 
 
 def _qualifies(product: Dict[str, Any], variant: Dict[str, Any]) -> bool:
@@ -174,6 +184,7 @@ def _qualifies(product: Dict[str, Any], variant: Dict[str, Any]) -> bool:
         and variant.get("requires_shipping", True) is not False
         and price >= 5
         and not _EXCLUDED_RE.search(_words(product.get("title"), product.get("handle")))
+        and not _EXPIRY_RE.search(str(product.get("title") or ""))
     )
 
 
@@ -188,10 +199,19 @@ def _preference(product: Dict[str, Any]) -> int:
     return 2
 
 
-async def pick_replacement(
+# How many ranked candidates a swap may try to CONFIRM before giving up. A storefront can list a
+# product in /products.json whose /products/<handle>.js 404s (skin1004's vitamin-c-96-powder,
+# 2026-09-19), so the best-ranked candidate is not always usable.
+MAX_CANDIDATES = 5
+
+
+async def rank_replacements(
     client: httpx.AsyncClient, domain: str, market: str, max_pages: int
-) -> Optional[Dict[str, Any]]:
-    best: Optional[Tuple[int, Dict[str, Any]]] = None
+) -> List[Dict[str, Any]]:
+    """Every qualifying product (its first qualifying variant), best first: rank (MAC lipstick,
+    lip, any), then catalog order. Stops early once MAX_CANDIDATES rank-0 candidates are in hand."""
+    found: List[Tuple[int, int, Dict[str, Any]]] = []
+    order = 0
     for page in range(1, max_pages + 1):
         response = await client.get(
             f"https://{domain}/products.json", params={"limit": 250, "page": page, "country": market},
@@ -210,15 +230,23 @@ async def pick_replacement(
                 if not _qualifies(product, variant):
                     continue
                 rank = _preference(product)
-                if best is None or rank < best[0]:
-                    best = (rank, {"variant_id": str(variant["id"]), "product_handle": product.get("handle"),
-                                   "title": product.get("title"), "vendor": product.get("vendor"), "rank": rank})
+                found.append((rank, order, {"variant_id": str(variant["id"]), "product_handle": product.get("handle"),
+                                            "title": product.get("title"), "vendor": product.get("vendor"),
+                                            "rank": rank}))
+                order += 1
                 break  # one variant per product is enough to rank it
-            if best is not None and best[0] == 0:
-                return best[1]
+        if sum(1 for r, _, _ in found if r == 0) >= MAX_CANDIDATES:
+            break
         if len(products) < 250:
             break
-    return best[1] if best else None
+    return [c for _, _, c in sorted(found, key=lambda t: (t[0], t[1])) if c.get("product_handle")]
+
+
+async def pick_replacement(
+    client: httpx.AsyncClient, domain: str, market: str, max_pages: int
+) -> Optional[Dict[str, Any]]:
+    ranked = await rank_replacements(client, domain, market, max_pages)
+    return ranked[0] if ranked else None
 
 
 def dump_rows(rows: List[Dict[str, Any]]) -> str:
@@ -230,15 +258,23 @@ def dump_rows(rows: List[Dict[str, Any]]) -> str:
 
 async def _replace(client: httpx.AsyncClient, row: Dict[str, Any], entry: Dict[str, Any],
                    reason: str, max_pages: int) -> Optional[str]:
-    """Swap the row's variant for a picked replacement; the new handle, or None if none fits."""
-    pick = await pick_replacement(client, row["domain"], row["market"], max_pages)
-    entry["replacement"] = pick
-    if not (pick and pick.get("product_handle")):
-        return None
-    entry["replaced_variant_id"], entry["replaced_because"] = row["variant_id"], reason
-    row["variant_id"] = entry["variant_id"] = pick["variant_id"]
-    entry["lookup"] = "replaced"
-    return pick["product_handle"]
+    """Swap the row's variant for the best candidate that CONFIRMS (listed on its own
+    /products/<handle>.js and available in the row's market), trying at most MAX_CANDIDATES in
+    rank order; the new handle, or None if none does."""
+    candidates = await rank_replacements(client, row["domain"], row["market"], max_pages)
+    entry["candidates_tried"] = []
+    for candidate in candidates[:MAX_CANDIDATES]:
+        listed, available, _title = await confirm_handle(
+            client, row["domain"], candidate["product_handle"], candidate["variant_id"], row["market"])
+        entry["candidates_tried"].append(candidate["product_handle"])
+        if listed and available:
+            entry["replacement"] = candidate
+            entry["replaced_variant_id"], entry["replaced_because"] = row["variant_id"], reason
+            row["variant_id"] = entry["variant_id"] = candidate["variant_id"]
+            entry["lookup"] = "replaced"
+            return candidate["product_handle"]
+    entry["replacement"] = None
+    return None
 
 
 async def refresh(rows: List[Dict[str, Any]], *, only: Optional[List[str]], replace_gone: bool,
@@ -252,6 +288,12 @@ async def refresh(rows: List[Dict[str, Any]], *, only: Optional[List[str]], repl
                 continue
             entry: Dict[str, Any] = {"domain": row["domain"], "market": row["market"], "variant_id": row["variant_id"],
                                      "gone_variant_id": None}
+            # A SWAP IS ALL OR NOTHING. `_replace` moves the row to the new variant before its
+            # handle is confirmed; if the confirmation fails (a 404, a proxy flake mid-read), the
+            # row must go back to what it was — measured live 2026-09-19: skin1004's swap lost its
+            # confirm to a ConnectError and the row was written with the NEW variant and the OLD
+            # handle, a pair that exists nowhere.
+            original = dict(row)
             try:
                 status, handle = await variant_redirect(client, row["domain"], row["variant_id"])
                 entry["lookup"] = status
@@ -276,6 +318,13 @@ async def refresh(rows: List[Dict[str, Any]], *, only: Optional[List[str]], repl
                         entry["lookup"] = f"{entry['lookup']}:handle_does_not_list_variant"
             except httpx.HTTPError as exc:
                 entry["lookup"] = f"unknown:{type(exc).__name__}"
+            if row.get("variant_id") != original.get("variant_id") and not (
+                entry.get("lookup") == "replaced" and entry.get("listed")
+            ):
+                row.clear()
+                row.update(original)
+                entry["variant_id"] = row["variant_id"]
+                entry["rolled_back"] = True
             report.append(entry)
             print(json.dumps(entry, ensure_ascii=False), flush=True)
     return report

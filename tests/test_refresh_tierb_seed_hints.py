@@ -263,6 +263,18 @@ async def test_a_handle_that_does_not_list_the_variant_is_not_written(monkeypatc
     ("Single Eyeshadow", "single-eyeshadow", False),
     ("The Latest Glow Serum", "latest-glow-serum", False),   # whole words: "latest" is not "test"
     ("Serum", "serum-testers", True),
+    # review of #2213: sachets, travel sizes, minis, duplicated listings, short-dated stock
+    ("mixsoon Bean Essence 1.5ml + Bean Cream 1ml Sachet 7+8", "mixsoon-bean-essence-1-5ml-bean-cream-1ml-sachet-7-8", True),
+    ("Superactive Moisturizer SPF 50 Brightening - Travel Size", "superactive-moisturizer-spf-50-brightening-travel-size", True),
+    ("Lip Oil Mini", "lip-oil-mini", True),
+    ("[30% Off] Centella Soothing Cream 30ml", "centella-soothing-cream-copy", True),
+    ("ACV Shampoo 150ml", "acv-shampoo-530ml-사본", True),
+    ("ダイエットプロテイン", "ダイエットプロテイン-7個入-사본", True),
+    ("Pony Effect Coverstay Bake & Fix Powder, 6.5g (Exp 01/28)", "pony-effect-coverstay-bake-fix-powder", True),
+    ("Cream (EXP: 2026-03)", "cream", True),
+    ("Expert Repair Cream", "expert-repair-cream", False),     # "expert" is not an expiry
+    ("Copycat Balm", "copycat-balm", False),                   # whole words: "copycat" is not "copy"
+    ("Exfoliating Pads 70 pcs", "exp-pads", False),            # "exp" with no date is not an expiry
 ])
 def test_unfit_seeds_are_recognised_by_title_or_handle(title, handle, unfit):
     assert hints.is_unfit(title, handle) is unfit
@@ -305,6 +317,78 @@ async def test_an_unfit_seed_is_swapped_for_a_full_size_product_only_when_asked(
     assert report[0]["lookup"] == "replaced" and report[0]["replaced_because"] == "unfit"
     assert report[0]["replaced_variant_id"] == "11" and report[0]["listed"] is True
     assert rows[0] == {"domain": "fentybeauty.com", "market": "US", "variant_id": "51", "product_handle": "gloss-bomb"}
+
+
+def _no_pacing(monkeypatch, handler):
+    monkeypatch.setattr(hints, "_default_inner_transport", lambda: httpx.MockTransport(handler))
+
+    async def no_wait(self):
+        return None
+
+    monkeypatch.setattr(hints.RequestPacer, "acquire", no_wait)
+
+
+def _fenty_row():
+    return [{"domain": "fentybeauty.com", "market": "US", "variant_id": "11", "product_handle": "shade-sample"}]
+
+
+async def test_an_unconfirmable_candidate_is_skipped_for_the_next_one(monkeypatch):
+    """Live 2026-09-19: skin1004 lists vitamin-c-96-powder in /products.json while its
+    /products/<handle>.js 404s. The best-ranked candidate is not always usable; try the next."""
+    shop = _unfit_shop()
+    shop.product_js.pop("gloss-bomb")  # the lip candidate 404s on its own .js
+    shop.product_js["body-cream"] = {"title": "Body Cream", "variants": [{"id": 61, "available": True}]}
+    _no_pacing(monkeypatch, shop.handle)
+    rows = _fenty_row()
+    report = await hints.refresh(rows, only=None, replace_gone=False, max_pages=1, replace_unfit=True)
+    assert report[0]["lookup"] == "replaced" and report[0]["candidates_tried"] == ["gloss-bomb", "body-cream"]
+    assert rows[0] == {"domain": "fentybeauty.com", "market": "US", "variant_id": "61", "product_handle": "body-cream"}
+
+
+async def test_an_unavailable_candidate_is_skipped_too(monkeypatch):
+    shop = _unfit_shop()
+    shop.product_js["gloss-bomb"] = {"title": "Gloss Bomb", "variants": [{"id": 51, "available": False}]}
+    shop.product_js["body-cream"] = {"title": "Body Cream", "variants": [{"id": 61, "available": True}]}
+    _no_pacing(monkeypatch, shop.handle)
+    rows = _fenty_row()
+    await hints.refresh(rows, only=None, replace_gone=False, max_pages=1, replace_unfit=True)
+    assert rows[0]["variant_id"] == "61"
+
+
+async def test_with_no_confirmable_candidate_the_row_is_left_alone(monkeypatch):
+    shop = _unfit_shop()
+    shop.product_js.pop("gloss-bomb")
+    _no_pacing(monkeypatch, shop.handle)
+    rows = _fenty_row()
+    report = await hints.refresh(rows, only=None, replace_gone=False, max_pages=1, replace_unfit=True)
+    assert rows == _fenty_row()
+    assert report[0]["lookup"] == "found" and report[0]["replacement"] is None
+
+
+@pytest.mark.parametrize("failure", ["404", "connect_error"])
+async def test_a_swap_that_fails_its_final_confirmation_is_rolled_back(monkeypatch, failure):
+    """The live bug, 2026-09-19: skin1004's swap lost its confirmation to a proxy ConnectError and
+    the row was written with the NEW variant and the OLD handle. The candidate confirms once
+    (inside the swap), then the final read fails: the row must be exactly what it was."""
+    shop = _unfit_shop()
+    real = shop.handle
+    seen = {"n": 0}
+
+    def handle(request):
+        if request.url.path == "/products/gloss-bomb.js":
+            seen["n"] += 1
+            if seen["n"] > 1:
+                if failure == "404":
+                    return httpx.Response(404)
+                raise httpx.ConnectError("proxy flake", request=request)
+        return real(request)
+
+    _no_pacing(monkeypatch, handle)
+    rows = _fenty_row()
+    report = await hints.refresh(rows, only=None, replace_gone=False, max_pages=1, replace_unfit=True)
+    assert rows == _fenty_row()
+    assert report[0]["rolled_back"] is True and report[0]["variant_id"] == "11"
+    assert report[0]["lookup"] != "replaced"
 
 
 async def test_refresh_goes_through_the_global_pacer(monkeypatch):

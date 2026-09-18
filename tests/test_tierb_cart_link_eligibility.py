@@ -137,6 +137,14 @@ _REPLACED = {
     "haroutine.com": ("50679311892726", "51667887161590", "rest-restore-magnesium"),
     "medicube.us": ("43402263756848", "41946336886832", "pdrn-lip-sleeping-mask"),
     "goongbe.us": ("41008543563834", "40854246064186", "kids-moisture-lip-balm-0-1oz"),
+    # review of #2213: a sachet, a travel size, a mini, short-dated stock, duplicated listings
+    "mixsoon.us": ("52294932594989", "45975663214893", "mixsoon-vegan-melting-lip-balm-dry-rose"),
+    "murad.com": ("51585917452591", "58472651948335", "collagen-resculpt-skin-support"),
+    "heartpercent.us": ("53109000536373", "53257609511221", "heart-percent-dote-on-mood-all-day-lip-shaper-3g"),
+    "pupsik.sg": ("46865686692094", "47782853607678", "bzu-bzu-little-lady-kids-lip-tint-2-shades"),
+    "skin1004.com": ("51442476548342", "49135893741814", "hydration-set"),
+    "lador.us": ("46604307431526", "46624892354662", "wonder-hair-oil-100ml"),
+    "mealit.jp": ("47744246776029", "46694104072413", "ミルイットウェルネスアサビジェリーカット8000-15p"),
 }
 
 
