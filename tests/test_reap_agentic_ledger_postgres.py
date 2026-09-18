@@ -2296,7 +2296,11 @@ async def test_hints_cannot_be_revised_by_a_transition_on_postgres():
 @pytest.mark.parametrize(
     "bad",
     ["not-a-list", b"bytes", 123, {"a": 1}, [""], ["   "], [None], [123], ["x"] * 33,
-     ["x" * 129]],
+     ["x" * 129],
+     # Control characters. The NUL case is the one that MATTERS on this dialect: before the
+     # check it reached asyncpg as a raw UntranslatableCharacterError naming a parameter index,
+     # which is a 500 rather than a refusal and never says "accept_variant_labels".
+     ["a\x00b"], ["a\nb"], ["a\rb"], ["a\tb"], ["\x1b[0m"], ["a\x7fb"]],
 )
 async def test_create_refuses_a_bad_accept_variant_labels_on_postgres(bad):
     with pytest.raises(ValueError):
@@ -2307,7 +2311,8 @@ async def test_create_refuses_a_bad_accept_variant_labels_on_postgres(bad):
     "bad",
     ["brand.example", ["https://brand.example"], ["brand.example/path"], ["brand.example:443"],
      ["localhost"], ["brand..example"], ["-brand.example"], ["bra nd.example"], ["brand.123"],
-     [""], ["x" * 250 + ".example"], ["a.example"] * 33],
+     [""], ["x" * 250 + ".example"], ["a.example"] * 33,
+     ["a\x00b.example"], ["a\nb.example"], ["\x1b[0m.example"]],
 )
 async def test_create_refuses_a_bad_also_accept_domains_on_postgres(bad):
     with pytest.raises(ValueError):
@@ -2638,17 +2643,55 @@ async def test_get_enrollment_by_reap_id_finds_the_row_on_postgres():
     assert read is not None and read["id"] == created["id"]
 
 
-async def test_get_enrollment_by_reap_id_does_not_wildcard_on_none_on_postgres():
+async def test_the_by_reap_id_STATEMENT_does_not_wildcard_on_a_null_bind_on_postgres():
     """EVERY pending row has a NULL `reap_enrollment_id`, and on Postgres `NULL = NULL` is NULL
     rather than false — which is what makes this a no-match instead of an arbitrary buyer's
-    enrollment handed to a webhook receiver."""
+    enrollment handed to a webhook receiver.
+
+    RUN AGAINST THE STATEMENT, not through the function: `_require_lookup_id` now refuses None
+    before the query, so a test that called the function would pass with the SQL rewritten to
+    `(:reap_enrollment_id IS NULL OR …)` — the Python guard would hide the SQL one."""
+    from db.database import database
     import db.reap_agentic_ledger as ledger
 
     await ledger.upsert_pending_enrollment(buyer_ref="bref_one")
     await ledger.upsert_pending_enrollment(buyer_ref="bref_two")
-    assert await ledger.get_enrollment_by_reap_id(None) is None
-    assert await ledger.get_enrollment_by_reap_id("") is None
+    rows = await database.fetch_all(
+        ledger._SELECT_ENROLLMENT_BY_REAP_ID_SQL, {"reap_enrollment_id": None}
+    )
+    assert rows == [], (
+        "the by-reap-id statement matched rows on a NULL bind — every pending enrollment in the "
+        "table is reachable by anyone who can reach this read"
+    )
+
+
+async def test_get_enrollment_by_reap_id_is_none_for_an_unknown_id_on_postgres():
+    import db.reap_agentic_ledger as ledger
+
+    await ledger.upsert_pending_enrollment(buyer_ref="bref_one")
     assert await ledger.get_enrollment_by_reap_id("enr_unknown") is None
+
+
+@pytest.mark.parametrize("bad", [None, "", "   ", 123, b"re_1", 1.5, ["re_1"]])
+@pytest.mark.parametrize("reader", ["get_enrollment_internal", "get_enrollment_by_reap_id"])
+async def test_the_enrollment_reads_refuse_a_non_string_or_blank_id_on_postgres(reader, bad):
+    """On THIS dialect the unguarded versions raised a raw asyncpg DataError naming a parameter
+    index — a 500 that never says which argument was wrong. One ValueError beats it."""
+    import db.reap_agentic_ledger as ledger
+
+    with pytest.raises(ValueError):
+        await getattr(ledger, reader)(bad)
+
+
+async def test_the_enrollment_reads_are_both_off_the_advertised_surface_on_postgres():
+    """Both new reads are UNSCOPED and both hand back `hosted_url` — a live page on which a card
+    can be enrolled. `get_enrollment_by_reap_id` is keyed on an identifier from OUTSIDE this
+    system, so its caller must have authenticated that id first."""
+    import db.reap_agentic_ledger as ledger
+
+    assert "get_enrollment_internal" not in ledger.__all__
+    assert "get_enrollment_by_reap_id" not in ledger.__all__
+    assert "get_active_enrollment" in ledger.__all__
 
 
 async def test_get_enrollment_by_reap_id_uses_the_unique_index_on_postgres():
@@ -2785,11 +2828,15 @@ async def test_the_hint_self_heal_is_idempotent_on_a_224_shaped_database():
     assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
 
 
-async def test_the_migration_and_the_postgres_self_heal_are_byte_identical_on_the_alter():
+async def test_the_migration_and_the_postgres_self_heal_run_the_same_alter():
     """The migration's ALTER and the Postgres branch's ALTER must be the SAME STATEMENT, because
     the two build the same production schema by two routes and only one of them ever runs in
-    prod. Compared on normalised whitespace: formatting differs, nothing the database acts on
-    may."""
+    prod.
+
+    COMPARED ON NORMALISED WHITESPACE, and the name of this test says so rather than saying
+    "byte-identical" — the two differ in leading indentation and nothing asserts otherwise, so
+    claiming bytes would be claiming more than is checked. What is checked is every token the
+    database acts on."""
     root = Path(__file__).resolve().parent.parent
     migration = (
         root / "db/migrations/225_reap_agentic_purchase_hints.sql"
@@ -2840,6 +2887,267 @@ async def test_the_new_sql_constants_are_module_level_and_prepare():
             if name.endswith("_SQLITE"):
                 continue
             positional, _order = _to_positional(constants[name])
+            await conn.prepare(positional)
+    finally:
+        await conn.close()
+
+
+# ── 225.6 a failing sibling statement must not starve the hint columns ───────────────────────
+#
+# THE REVIEWER'S P1, REPRODUCED. The mig-225 ALTER used to be the LAST statement inside the
+# mig-224 try, and `CREATE UNIQUE INDEX uq_reap_agentic_enrollments_one_active` FAILS on a
+# 224-shaped database that already holds two 'active' enrollments for one buyer_ref. That raise
+# abandoned every statement after it, so the three hint columns never landed — and because
+# production never runs db/migrations there was no other route: `create_purchase` then raised
+# UndefinedColumnError on every call, forever, on exactly the databases that were already unwell.
+#
+# This is the dialect the defect was found on, and the one where it matters: on Postgres the
+# duplicate rows make a REAL index build fail.
+
+
+async def _seed_two_active_enrollments_for_one_buyer():
+    """Put the database in the state that makes the unique-index creation fail.
+
+    Raw INSERTs against a table built WITHOUT the index, because that is the only way this state
+    is reachable — `mark_enrollment_active` cannot produce it, which is the whole point of the
+    index. It is reachable in production the way any pre-index duplicate is: rows written before
+    the index existed, or an index dropped by hand during an incident.
+    """
+    from db.database import database
+
+    await database.execute("DROP TABLE IF EXISTS reap_agentic_enrollments")
+    await database.execute(
+        """
+        CREATE TABLE reap_agentic_enrollments (
+            id VARCHAR(64) PRIMARY KEY,
+            buyer_ref VARCHAR(128) NOT NULL,
+            agent_id VARCHAR(128),
+            reap_enrollment_id VARCHAR(128),
+            status VARCHAR(16) NOT NULL
+                CHECK (status IN ('pending', 'active', 'dead')),
+            reap_status VARCHAR(64),
+            card_network VARCHAR(32),
+            card_last4 VARCHAR(4)
+                CHECK (card_last4 IS NULL OR length(card_last4) = 4),
+            hosted_url TEXT,
+            hosted_url_expires_at TIMESTAMPTZ,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """
+    )
+    for row_id in ("re_dup_a", "re_dup_b"):
+        await database.execute(
+            "INSERT INTO reap_agentic_enrollments (id, buyer_ref, status) "
+            "VALUES (:i, 'bref_dup', 'active')",
+            {"i": row_id},
+        )
+
+
+async def test_the_repro_really_does_break_the_unique_index_on_postgres():
+    """CONTROL, AND IT IS NOT OPTIONAL. The tests below assert that something SURVIVES a failure
+    — and an assertion that a mechanism survives a failure passes just as happily when THERE WAS
+    NO FAILURE. If these duplicate rows stopped making the index build fail, the starvation tests
+    would stay green while testing nothing at all.
+
+    So: prove the failure is real, by attempting the statement the self-heal attempts."""
+    import asyncpg
+    from db.database import database
+
+    await _seed_two_active_enrollments_for_one_buyer()
+    with pytest.raises(asyncpg.exceptions.UniqueViolationError):
+        await database.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_reap_agentic_enrollments_one_active "
+            "ON reap_agentic_enrollments (buyer_ref) WHERE status = 'active';"
+        )
+
+
+async def test_a_failing_sibling_statement_does_not_starve_the_hint_columns_on_postgres():
+    """THE P1 REGRESSION GUARD, on the dialect it was found on."""
+    from db.schema_guard import ensure_required_schema_light
+
+    await _apply_224_only()
+    await _seed_two_active_enrollments_for_one_buyer()
+    before = await _purchase_columns()
+    assert not (set(_HINT_COLUMNS) & before), "precondition: the 224 shape, no hint columns"
+
+    await ensure_required_schema_light()
+
+    after = await _purchase_columns()
+    assert set(_HINT_COLUMNS) <= after, (
+        f"a failing sibling statement starved the mig-225 columns: missing "
+        f"{sorted(set(_HINT_COLUMNS) - after)}. Production never runs db/migrations, so these "
+        "columns would not exist there at all and create_purchase would raise on every call."
+    )
+
+
+async def test_the_rail_still_opens_a_purchase_after_a_failing_sibling_on_postgres():
+    """The behavioural half. `create_purchase` is the call that raised UndefinedColumnError in
+    the reviewer's repro — not a schema query, the actual thing a request does."""
+    from db.schema_guard import ensure_required_schema_light
+    import db.reap_agentic_ledger as ledger
+
+    await _apply_224_only()
+    await _seed_two_active_enrollments_for_one_buyer()
+    await ensure_required_schema_light()
+
+    purchase = await _mk(
+        accept_variant_labels=["Nude Glow"],
+        also_accept_domains=["brand.example"],
+        market_country="US",
+    )
+    read = await ledger.get_purchase_internal(purchase["id"])
+    assert read["accept_variant_labels"] == ["Nude Glow"]
+    assert read["also_accept_domains"] == ["brand.example"]
+    assert read["market_country"] == "US"
+
+
+async def test_the_healed_hint_columns_have_the_right_types_after_a_failing_sibling():
+    """Not just "they exist" — the same catalog shape the migration builds. A heal that limped
+    to the finish with `text` columns would round-trip through the module's own encode/decode
+    and stay invisible."""
+    from db.schema_guard import ensure_required_schema_light
+
+    from_migration = {
+        r[1]: r for r in (await _schema_fingerprint())[0] if r[0] == "reap_agentic_purchases"
+    }
+    await _apply_224_only()
+    await _seed_two_active_enrollments_for_one_buyer()
+    await ensure_required_schema_light()
+    healed = {
+        r[1]: r for r in (await _schema_fingerprint())[0] if r[0] == "reap_agentic_purchases"
+    }
+    for name in _HINT_COLUMNS:
+        assert healed[name] == from_migration[name], (
+            f"{name} healed differently after a failing sibling:\n"
+            f"  migration: {from_migration[name]}\n  healed:    {healed[name]}"
+        )
+
+
+# ── 225.7 a terminal transition CLEARS a stale last_error_code ───────────────────────────────
+#
+# FROM THE #2204 RE-REVIEW. With an unconditional COALESCE, a retry that eventually SUCCEEDS
+# carried the failed attempt's code into a 'completed' row. On THIS dialect the change also has
+# to survive planning: `:last_error_code` now appears twice in one statement, which is the shape
+# that produced AmbiguousParameter on this rail before — `test_every_postgres_sql_constant_in_
+# the_module_prepares` is what confirms it does not here.
+
+
+async def _with_stored_error_code(state: str, code: str = "completed_without_order_id", **over):
+    """A purchase sitting in `state` with `code` already on the row, put there by a RAW UPDATE —
+    a claim/release cycle would also move claimed_by, attempts and next_poll_at, any of which
+    could mask or explain a result here."""
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _mk(state=state, **over)
+    await database.execute(
+        "UPDATE reap_agentic_purchases SET last_error_code = :c WHERE id = :i",
+        {"c": code, "i": purchase["id"]},
+    )
+    assert (await ledger.get_purchase_internal(purchase["id"]))["last_error_code"] == code
+    return purchase
+
+
+async def test_a_clean_completion_clears_a_stale_error_code_on_postgres():
+    """THE CASE THE RE-REVIEW FOUND."""
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _with_stored_error_code("processing")
+    moved = await ledger.transition(
+        purchase["id"], from_states=["processing"], to_state="completed"
+    )
+    assert moved is not None and moved["state"] == "completed"
+    assert moved["last_error_code"] is None, (
+        "a clean completion kept the failed attempt's code; every reader of this row would "
+        "believe the order had a problem it did not have"
+    )
+    assert (await ledger.get_purchase_internal(purchase["id"]))["last_error_code"] is None
+
+
+@pytest.mark.parametrize("terminal", _TERMINALS)
+async def test_every_terminal_target_clears_a_stale_code_on_postgres(terminal):
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _with_stored_error_code(
+        _REACHES_TERMINAL[terminal], buyer_ref=f"bref_{terminal}"
+    )
+    moved = await ledger.transition(
+        purchase["id"], from_states=[_REACHES_TERMINAL[terminal]], to_state=terminal
+    )
+    assert moved["state"] == terminal
+    assert moved["last_error_code"] is None
+
+
+async def test_a_terminal_transition_stores_an_explicit_code_on_postgres():
+    """The half that lets 'failed' and 'refused' speak at all."""
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _with_stored_error_code("processing")
+    moved = await ledger.transition(
+        purchase["id"],
+        from_states=["processing"],
+        to_state="failed",
+        last_error_code="checkout_declined",
+    )
+    assert moved["last_error_code"] == "checkout_declined"
+    read = await ledger.get_purchase_internal(purchase["id"])
+    assert read["last_error_code"] == "checkout_declined"
+
+
+async def test_a_non_terminal_transition_still_keeps_the_previous_code_on_postgres():
+    """THE COALESCE HALF, AND THE CONTROL FOR THE WHOLE RULE. Without it, replacing the CASE with
+    a bare assignment on BOTH arms would pass every test above."""
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _with_stored_error_code("quoting", code="quote_expired")
+    moved = await ledger.transition(
+        purchase["id"], from_states=["quoting"], to_state="awaiting_approval"
+    )
+    assert moved["state"] == "awaiting_approval"
+    assert moved["last_error_code"] == "quote_expired", (
+        "a non-terminal advance erased the previous error code — a row in flight would forget "
+        "why it last stalled on every uneventful step"
+    )
+
+
+async def test_a_terminal_transition_clears_the_code_and_the_pii_together_on_postgres():
+    """The terminal write is ONE statement, so the code clearing and the PII nulling cannot come
+    apart — a crash between them is not a state this rail can reach."""
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _with_stored_error_code("processing")
+    moved = await ledger.transition(
+        purchase["id"], from_states=["processing"], to_state="completed"
+    )
+    assert moved["last_error_code"] is None
+    assert moved["buyer_email"] is None and moved["shipping_address"] is None
+    assert moved["terminal_at"] is not None
+    assert moved["claimed_by"] is None
+
+
+async def test_release_claim_still_coalesces_on_postgres():
+    """The rule is about TERMINAL writes; a release is never terminal. Pinned so that "make them
+    consistent" is a change somebody has to argue for."""
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _with_stored_error_code("quoting", code="quote_expired")
+    await ledger.claim_due_purchases("worker_a", limit=5)
+    await ledger.release_claim(purchase["id"], "worker_a")
+    read = await ledger.get_purchase_internal(purchase["id"])
+    assert read["last_error_code"] == "quote_expired"
+
+
+async def test_the_terminal_clear_survives_planning_on_postgres():
+    """`:last_error_code` now appears TWICE in one statement. Both occurrences are value
+    positions of the same column type, so Postgres deduces one type — but that is an argument,
+    and this is the check. A statement it cannot plan is the #1588 class."""
+    import db.reap_agentic_ledger as ledger
+
+    conn = await _raw_connection()
+    try:
+        for name in ("_TRANSITION_SQL",):
+            positional, _order = _to_positional(getattr(ledger, name))
             await conn.prepare(positional)
     finally:
         await conn.close()

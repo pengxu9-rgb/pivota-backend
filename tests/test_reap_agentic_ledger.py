@@ -2357,6 +2357,12 @@ _BAD_LABEL_LISTS = [
     [123],
     ["x"] * 33,                           # over the entry cap
     ["x" * 129],                          # over the char cap
+    ["a\x00b"],                           # NUL: unstorable on Postgres, stored on SQLite
+    ["a\nb"],                             # a newline forges a second log line
+    ["a\rb"],
+    ["a\tb"],
+    ["\x1b[0m"],                          # an ANSI escape, and these are printed to terminals
+    ["a\x7fb"],                           # DEL
 ]
 
 _BAD_DOMAIN_LISTS = [
@@ -2373,6 +2379,9 @@ _BAD_DOMAIN_LISTS = [
     [""],
     ["x" * 250 + ".example"],             # over 253 characters
     ["a.example"] * 33,                   # over the entry cap
+    ["a\x00b.example"],                   # control characters, same rule as labels
+    ["a\nb.example"],
+    ["\x1b[0m.example"],
 ]
 
 _BAD_COUNTRIES = ["us", "USA", "U", "", "  ", "U5", 12, b"US", "us ", "Us", "U S"]
@@ -2436,7 +2445,8 @@ async def test_the_hint_bounds_accept_their_own_limit():
     off-by-one free to move."""
     labels = [f"label-{i}" for i in range(32)]
     # 63 is the longest a single DNS label may be, so this is the domain validator's own limit
-    # rather than an arbitrary long string.
+    # rather than an arbitrary long string. It is also inside the shared 128-character bound,
+    # which applies to both lists and on the domains path is belt to the hostname shape's brace.
     purchase = await _mk(
         accept_variant_labels=labels, also_accept_domains=["x" * 63 + ".example"]
     )
@@ -2761,7 +2771,20 @@ async def test_get_enrollment_internal_reads_every_status(status):
 
 async def test_get_enrollment_internal_is_none_for_an_unknown_id():
     assert await ledger.get_enrollment_internal("re_nope") is None
-    assert await ledger.get_enrollment_internal("") is None
+
+
+@pytest.mark.parametrize("bad", [None, "", "   ", 123, b"re_1", 1.5, ["re_1"]])
+@pytest.mark.parametrize(
+    "reader", ["get_enrollment_internal", "get_enrollment_by_reap_id"]
+)
+async def test_the_enrollment_reads_refuse_a_non_string_or_blank_id(reader, bad):
+    """A non-string id produced a DIFFERENT wrong answer per engine: a quiet None on SQLite —
+    which a caller reads as "no such enrollment" and acts on by failing the purchase for the
+    wrong reason — and a raw asyncpg DataError naming a parameter index on Postgres. Blank is
+    refused for the same reason: `""` is a caller that lost its id upstream, and it matches
+    nothing in both engines, which is exactly what makes the bug survivable."""
+    with pytest.raises(ValueError):
+        await getattr(ledger, reader)(bad)
 
 
 async def test_the_enrollment_reads_carry_exactly_the_projection():
@@ -2814,14 +2837,30 @@ async def test_get_enrollment_by_reap_id_finds_the_row():
     assert read is not None and read["id"] == created["id"]
 
 
-async def test_get_enrollment_by_reap_id_refuses_to_wildcard_on_none():
-    """EVERY pending row has a NULL `reap_enrollment_id`. A lookup that wildcarded on None would
-    hand the webhook receiver an arbitrary unrelated buyer's enrollment — `NULL = NULL is NULL`
-    is what stops it, the same property the ownership conjuncts rest on."""
+async def test_the_by_reap_id_STATEMENT_does_not_wildcard_on_a_null_bind():
+    """EVERY pending row has a NULL `reap_enrollment_id`. A statement that wildcarded on NULL
+    would hand a webhook receiver an arbitrary unrelated buyer's enrollment — `NULL = NULL is
+    NULL` is what stops it, the same property the ownership conjuncts rest on.
+
+    RUN AGAINST THE STATEMENT, NOT THROUGH THE FUNCTION, and deliberately so. `_require_lookup_id`
+    now refuses None before the query, which means a test that called the function would pass
+    with the SQL rewritten to `(:reap_enrollment_id IS NULL OR …)` — the Python guard would hide
+    the SQL one. Binding NULL straight into the statement is the only way to see it, and it keeps
+    the wildcard mutant dead on this dialect (on Postgres the PREPARE sweep kills it too, as
+    AmbiguousParameter)."""
     await ledger.upsert_pending_enrollment(buyer_ref="bref_one")
     await ledger.upsert_pending_enrollment(buyer_ref="bref_two")
-    assert await ledger.get_enrollment_by_reap_id(None) is None
-    assert await ledger.get_enrollment_by_reap_id("") is None
+    rows = await database.fetch_all(
+        ledger._SELECT_ENROLLMENT_BY_REAP_ID_SQL, {"reap_enrollment_id": None}
+    )
+    assert rows == [], (
+        "the by-reap-id statement matched rows on a NULL bind — every pending enrollment in the "
+        "table is reachable by anyone who can reach this read"
+    )
+
+
+async def test_get_enrollment_by_reap_id_is_none_for_an_unknown_id():
+    await ledger.upsert_pending_enrollment(buyer_ref="bref_one")
     assert await ledger.get_enrollment_by_reap_id("enr_unknown") is None
 
 
@@ -2843,7 +2882,16 @@ async def test_the_enrollment_reads_are_named_and_exported_deliberately():
     because the trap the suffix guards against is a NAME a route author reaches for by mistake,
     and nobody reaches for "by reap id" when they meant "the buyer's enrollment"."""
     assert "get_enrollment_internal" not in ledger.__all__
-    assert "get_enrollment_by_reap_id" in ledger.__all__
+    assert "get_enrollment_by_reap_id" not in ledger.__all__, (
+        "both new enrollment reads are UNSCOPED and both hand back `hosted_url` — a live page on "
+        "which a card can be enrolled. get_enrollment_by_reap_id is keyed on an identifier that "
+        "comes from OUTSIDE this system, so its caller must have authenticated that id first; "
+        "keeping it off the advertised surface is what makes importing it a deliberate act"
+    )
+    assert "get_active_enrollment" in ledger.__all__, (
+        "the scoped-by-construction read stays exported: it is keyed on buyer_ref, which we "
+        "minted and the caller has already proved is theirs"
+    )
     assert not hasattr(ledger, "get_enrollment"), (
         "the un-suffixed name is the trap; it must not appear"
     )
@@ -3034,3 +3082,386 @@ async def test_the_down_migration_exists_and_drops_all_three():
     ).read_text(encoding="utf-8")
     for column in _HINT_COLUMNS:
         assert f"DROP COLUMN IF EXISTS {column}" in down
+
+
+# ── 225.6 a failing sibling statement must not starve the hint columns ───────────────────────
+#
+# THE REVIEWER'S P1, AS A TEST. The mig-225 ALTERs used to be the LAST statements inside the
+# mig-224 try, and every statement in that try can raise — one of them raises on databases that
+# exist. `CREATE UNIQUE INDEX uq_reap_agentic_enrollments_one_active` FAILS on a table that
+# already holds two 'active' enrollments for one buyer_ref, and that raise abandoned everything
+# after it. Production never runs db/migrations, so there was no other route: the three hint
+# columns never landed and `create_purchase` raised on every call, forever, on exactly the
+# databases that were already unwell.
+#
+# The fix is position PLUS its own try — the mig-207 / mig-212 shape. These tests are what keeps
+# it, and the mutant that folds the ALTERs back into the mig-224 try must fail them.
+
+
+async def _seed_two_active_enrollments_for_one_buyer():
+    """Put the database in the state that makes the unique-index creation fail.
+
+    Built with RAW INSERTs against a table created WITHOUT the index, because that is the only
+    way this state is reachable — `mark_enrollment_active` cannot produce it, which is the whole
+    point of the index. It is reachable in production the way any pre-index duplicate is: rows
+    written before the index existed, or an index dropped by hand during an incident.
+    """
+    await database.execute("DROP TABLE IF EXISTS reap_agentic_enrollments")
+    await database.execute(
+        """
+        CREATE TABLE reap_agentic_enrollments (
+            id VARCHAR(64) PRIMARY KEY,
+            buyer_ref VARCHAR(128) NOT NULL,
+            agent_id VARCHAR(128),
+            reap_enrollment_id VARCHAR(128),
+            status VARCHAR(16) NOT NULL
+                CHECK (status IN ('pending', 'active', 'dead')),
+            reap_status VARCHAR(64),
+            card_network VARCHAR(32),
+            card_last4 VARCHAR(4)
+                CHECK (card_last4 IS NULL OR length(card_last4) = 4),
+            hosted_url TEXT,
+            hosted_url_expires_at TIMESTAMP,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    for row_id in ("re_dup_a", "re_dup_b"):
+        await database.execute(
+            "INSERT INTO reap_agentic_enrollments (id, buyer_ref, status) "
+            "VALUES (:i, 'bref_dup', 'active')",
+            {"i": row_id},
+        )
+
+
+async def test_a_failing_sibling_statement_does_not_starve_the_hint_columns():
+    """THE P1 REGRESSION GUARD. Two active enrollments for one buyer_ref make
+    `CREATE UNIQUE INDEX uq_reap_agentic_enrollments_one_active` raise. The hint columns must
+    land anyway — they are in their own try, after the mig-224 one, so a failure there cannot
+    reach them."""
+    await database.execute("DROP TABLE IF EXISTS reap_agentic_purchases")
+    await database.execute(_MIG_224_PURCHASES_DDL)
+    await _seed_two_active_enrollments_for_one_buyer()
+
+    await ensure_required_schema_light()
+
+    columns = await _purchase_columns()
+    assert set(_HINT_COLUMNS) <= columns, (
+        f"a failing sibling statement starved the mig-225 columns: missing "
+        f"{sorted(set(_HINT_COLUMNS) - columns)}. Production never runs db/migrations, so these "
+        "columns would not exist there at all and create_purchase would raise on every call."
+    )
+
+
+async def test_the_rail_still_works_after_a_failing_sibling_statement():
+    """The behavioural half: not just "the columns exist" but "a purchase can be opened". This is
+    the call that raised in the reviewer's repro."""
+    await database.execute("DROP TABLE IF EXISTS reap_agentic_purchases")
+    await database.execute(_MIG_224_PURCHASES_DDL)
+    await _seed_two_active_enrollments_for_one_buyer()
+
+    await ensure_required_schema_light()
+
+    purchase = await _mk(
+        accept_variant_labels=["Nude Glow"],
+        also_accept_domains=["brand.example"],
+        market_country="US",
+    )
+    read = await ledger.get_purchase_internal(purchase["id"])
+    assert read["accept_variant_labels"] == ["Nude Glow"]
+    assert read["also_accept_domains"] == ["brand.example"]
+    assert read["market_country"] == "US"
+
+
+async def test_the_precondition_really_does_break_the_unique_index():
+    """CONTROL, and it is not optional. The two tests above assert that something SURVIVES a
+    failure — and an assertion that a mechanism survives a failure passes just as happily when
+    THERE WAS NO FAILURE. If the duplicate rows stopped making the index creation fail, those
+    tests would keep passing while testing nothing at all.
+
+    So: prove the failure is real, by attempting the same statement the self-heal attempts and
+    requiring it to raise."""
+    await _seed_two_active_enrollments_for_one_buyer()
+    with pytest.raises(Exception) as caught:
+        await database.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_reap_agentic_enrollments_one_active "
+            "ON reap_agentic_enrollments (buyer_ref) WHERE status = 'active';"
+        )
+    assert "unique" in str(caught.value).lower(), (
+        f"the repro no longer breaks the index, so the starvation tests prove nothing: "
+        f"{caught.value!r}"
+    )
+
+
+def _innermost_try_containing(source: str, marker: str):
+    """The innermost `try:` block whose body contains `marker`, as (lineno, col_offset).
+
+    Structural, via the AST, because the thing under test is NESTING and the only honest way to
+    read nesting out of this file is to parse it. An indentation heuristic cannot: the SQL lives
+    in triple-quoted strings whose own indentation has nothing to do with the Python block
+    structure, and the first cut of this test compared exactly those and failed for that reason.
+    """
+    import ast
+
+    tree = ast.parse(source)
+    found = []
+
+    def walk(node, try_stack):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if marker in node.value:
+                found.append(try_stack[-1] if try_stack else None)
+        for child in ast.iter_child_nodes(node):
+            if isinstance(node, ast.Try) and child in node.body:
+                walk(child, try_stack + [(node.lineno, node.col_offset)])
+            else:
+                walk(child, try_stack)
+
+    walk(tree, [])
+    assert found, f"marker not found in the source: {marker!r}"
+    return found
+
+
+async def test_the_hint_alters_are_not_inside_the_mig_224_try():
+    """THE SHAPE ASSERTION BEHIND THE STARVATION TESTS, so the mutant that folds the mig-225
+    ALTERs back into the mig-224 try is refused by a test that NAMES it rather than by a schema
+    diff a reader has to decode.
+
+    Read STRUCTURALLY out of the AST: the innermost `try:` enclosing the mig-225 ALTER must not
+    be the innermost `try:` enclosing the mig-224 `CREATE TABLE`. That is exactly what "its own
+    try/except" means, and it is what stops a failing CREATE INDEX reaching these columns.
+    """
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[1] / "db/schema_guard.py").read_text(
+        encoding="utf-8"
+    )
+
+    create_tries = set(
+        _innermost_try_containing(source, "CREATE TABLE IF NOT EXISTS reap_agentic_purchases")
+    )
+    pg_alter_tries = set(
+        _innermost_try_containing(source, "ADD COLUMN IF NOT EXISTS accept_variant_labels")
+    )
+    assert create_tries and pg_alter_tries, "precondition: both statements were located"
+    assert not (create_tries & pg_alter_tries), (
+        "the Postgres mig-225 ALTER shares its try with the mig-224 CREATE TABLE — a failing "
+        "CREATE INDEX in that block would starve the hint columns, and production never runs "
+        "db/migrations so there is no other route"
+    )
+
+    # The SQLite twin: its per-column ALTER is an f-string, so the marker is the literal fragment
+    # that survives into the AST as a constant.
+    sqlite_alter_tries = set(
+        _innermost_try_containing(source, "ALTER TABLE reap_agentic_purchases ")
+    )
+    assert sqlite_alter_tries, "precondition: the SQLite mig-225 ALTER was located"
+    assert not (sqlite_alter_tries & create_tries), (
+        "the SQLite mig-225 ALTER loop shares its try with the mig-224 CREATE TABLE"
+    )
+
+
+async def test_the_coverage_gate_sees_the_mig_225_columns():
+    """The repo-wide gate (tests/test_schema_guard_migration_coverage.py) already checks this —
+    but when it fails it says "migration 225 is uncovered", which sends the reader looking for a
+    missing self-heal that is in fact right there. This says the other thing.
+
+    THE FAILURE MODE IS PROSE. That gate scans db/schema_guard.py with a regex matching the words
+    ALTER + TABLE followed by a name, then captures everything up to the next `;`. A MENTION OF
+    THOSE WORDS IN A COMMENT matches first, swallows the real statement below it into its body,
+    and files these three columns under a table named "if" — after which the gate reports the
+    migration as uncovered and `re.finditer` never looks at the real statement at all. That
+    happened while this PR was being written, to a comment explaining the statement.
+    """
+    import importlib.util
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "_coverage_gate", root / "tests/test_schema_guard_migration_coverage.py"
+    )
+    gate = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gate)
+
+    covered = gate._schema_guard_covered()
+    for column in _HINT_COLUMNS:
+        assert ("reap_agentic_purchases", column) in covered, (
+            f"the coverage gate cannot see the self-heal for {column}. The ALTER is in "
+            "db/schema_guard.py — check whether a COMMENT in that file mentions the words ALTER "
+            "and TABLE together, which makes the gate's regex swallow the real statement."
+        )
+
+
+# ── 225.7 a terminal transition CLEARS a stale last_error_code ───────────────────────────────
+#
+# FROM THE #2204 RE-REVIEW. `last_error_code` is the one optional field in `transition` whose
+# "None means leave it alone" is wrong once the purchase is FINISHED: the column then stops
+# meaning "the last thing that went wrong" and starts meaning "why this purchase ended". With an
+# unconditional COALESCE, a retry that eventually SUCCEEDS carried the failed attempt's code into
+# a 'completed' row, and every reader of that row would have believed the order had a problem it
+# did not have.
+
+
+async def _with_stored_error_code(state: str, code: str = "completed_without_order_id", **over):
+    """A purchase sitting in `state` with `code` already on the row.
+
+    The code is put there with a RAW UPDATE rather than through `release_claim`, because
+    `release_claim` is not what these tests are about and a claim/release cycle would also move
+    `claimed_by`, `attempts` and `next_poll_at` — three things that could mask or explain a
+    result here.
+    """
+    purchase = await _mk(state=state, **over)
+    await database.execute(
+        "UPDATE reap_agentic_purchases SET last_error_code = :c WHERE id = :i",
+        {"c": code, "i": purchase["id"]},
+    )
+    assert (await ledger.get_purchase_internal(purchase["id"]))["last_error_code"] == code
+    return purchase
+
+
+async def test_a_clean_completion_clears_a_stale_error_code():
+    """THE CASE THE RE-REVIEW FOUND. One `processing` poll failed and recorded why; the next one
+    completed the order. The finished row must not still say the first poll's reason."""
+    purchase = await _with_stored_error_code("processing")
+
+    moved = await ledger.transition(
+        purchase["id"], from_states=["processing"], to_state="completed"
+    )
+
+    assert moved is not None and moved["state"] == "completed"
+    assert moved["last_error_code"] is None, (
+        "a clean completion kept the failed attempt's code; every reader of this row would "
+        "believe the order had a problem it did not have"
+    )
+    assert (await ledger.get_purchase_internal(purchase["id"]))["last_error_code"] is None
+
+
+@pytest.mark.parametrize("terminal", _TERMINALS)
+async def test_every_terminal_target_clears_a_stale_code_when_none_is_passed(terminal):
+    """All four terminals, not just 'completed' — the rule is about the column's MEANING once the
+    row is finished, which does not depend on which terminal it reached."""
+    purchase = await _with_stored_error_code(
+        _REACHES_TERMINAL[terminal], buyer_ref=f"bref_{terminal}"
+    )
+    moved = await ledger.transition(
+        purchase["id"], from_states=[_REACHES_TERMINAL[terminal]], to_state=terminal
+    )
+    assert moved["state"] == terminal
+    assert moved["last_error_code"] is None
+
+
+async def test_a_terminal_transition_stores_an_explicit_code():
+    """The other half, and the one that makes 'failed' and 'refused' able to speak at all. The
+    rule clears on None; it does not stop a caller SAYING why."""
+    purchase = await _with_stored_error_code("processing")
+
+    moved = await ledger.transition(
+        purchase["id"],
+        from_states=["processing"],
+        to_state="failed",
+        last_error_code="checkout_declined",
+    )
+    assert moved["last_error_code"] == "checkout_declined"
+    read = await ledger.get_purchase_internal(purchase["id"])
+    assert read["last_error_code"] == "checkout_declined"
+
+
+async def test_a_terminal_transition_can_keep_the_old_code_by_restating_it():
+    """A caller that WANTS the finished row to carry the code it already had passes it. Stated
+    because "None clears" would otherwise read as "the ledger throws the reason away"."""
+    purchase = await _with_stored_error_code("processing", code="transport_error:readtimeout")
+    moved = await ledger.transition(
+        purchase["id"],
+        from_states=["processing"],
+        to_state="failed",
+        last_error_code="transport_error:readtimeout",
+    )
+    assert moved["last_error_code"] == "transport_error:readtimeout"
+
+
+async def test_a_non_terminal_transition_still_keeps_the_previous_code():
+    """THE COALESCE HALF, AND THE CONTROL FOR THE WHOLE RULE. A step in flight that reports
+    nothing must not erase the last thing that did go wrong — otherwise the fix for the stale
+    code would just be "never store one". Without this test, replacing the CASE with a bare
+    assignment on BOTH arms would pass every test above."""
+    purchase = await _with_stored_error_code("quoting", code="quote_expired")
+
+    moved = await ledger.transition(
+        purchase["id"], from_states=["quoting"], to_state="awaiting_approval"
+    )
+
+    assert moved["state"] == "awaiting_approval"
+    assert moved["last_error_code"] == "quote_expired", (
+        "a non-terminal advance erased the previous error code — a row in flight would forget "
+        "why it last stalled on every uneventful step"
+    )
+
+
+async def test_a_non_terminal_transition_still_overwrites_with_a_new_code():
+    purchase = await _with_stored_error_code("resolving", code="quote_expired")
+    moved = await ledger.transition(
+        purchase["id"],
+        from_states=["resolving"],
+        to_state="quoting",
+        last_error_code="resolve_retry",
+    )
+    assert moved["last_error_code"] == "resolve_retry"
+
+
+async def test_release_claim_still_coalesces_even_though_transition_does_not_always():
+    """The rule is about TERMINAL writes, and a release is never terminal. Pinned here so that
+    "make them consistent" is a change somebody has to argue for rather than tidy into."""
+    purchase = await _with_stored_error_code("quoting", code="quote_expired")
+    await ledger.claim_due_purchases("worker_a", limit=5)
+    await ledger.release_claim(purchase["id"], "worker_a")
+    read = await ledger.get_purchase_internal(purchase["id"])
+    assert read["last_error_code"] == "quote_expired"
+
+
+async def test_the_terminal_clear_is_conditional_in_both_transition_statements():
+    """The shape assertion, on both dialect twins. The mutant this refuses is the obvious tidy-up
+    — putting `last_error_code` back on the unconditional COALESCE line with its neighbours."""
+    for name in ("_TRANSITION_SQL", "_TRANSITION_SQL_SQLITE"):
+        sql = getattr(ledger, name)
+        assert "last_error_code = COALESCE(:last_error_code, last_error_code),\n" not in sql, (
+            f"{name} writes last_error_code through an unconditional COALESCE; a clean "
+            "completion after a failed retry would keep the stale code"
+        )
+        assert (
+            "last_error_code = CASE WHEN :to_state_probe IN "
+            "('completed', 'failed', 'refused', 'expired')" in sql
+        ), f"{name} lost the terminal-clears-the-code rule"
+        # And the NON-terminal arm must still be a COALESCE, or a step in flight erases it.
+        assert "ELSE COALESCE(:last_error_code, last_error_code) END" in sql, (
+            f"{name} lost the COALESCE on the non-terminal arm"
+        )
+
+    # The release statements keep the unconditional form — a release is never terminal.
+    for name in ("_RELEASE_CLAIM_SQL", "_RELEASE_CLAIM_SQL_SQLITE"):
+        assert (
+            "last_error_code = COALESCE(:last_error_code, last_error_code)"
+            in getattr(ledger, name)
+        )
+
+
+async def test_the_bulk_sweeps_still_write_their_own_terminal_codes():
+    """The two sweeps write terminal states WITHOUT going through `transition`, so the rule above
+    does not reach them — and they must keep saying why, since a sweep is the one terminal write
+    no caller is watching."""
+    expired = await _mk(state="needs_enrollment")
+    await _set_clock_column(
+        expired["id"], "state_entered_at", "datetime('now', '-99999 seconds')"
+    )
+    assert expired["id"] in await ledger.expire_overdue_purchases(max_age_seconds=60)
+    assert (await ledger.get_purchase_internal(expired["id"]))["last_error_code"] == (
+        "hosted_url_expired"
+    )
+
+    stuck = await _mk(state="quoting", buyer_ref="bref_stuck")
+    await database.execute(
+        "UPDATE reap_agentic_purchases SET attempts = 99 WHERE id = :i", {"i": stuck["id"]}
+    )
+    assert stuck["id"] in await ledger.fail_exhausted_purchases(5)
+    assert (await ledger.get_purchase_internal(stuck["id"]))["last_error_code"] == (
+        "attempts_exhausted"
+    )

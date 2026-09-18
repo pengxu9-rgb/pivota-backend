@@ -547,28 +547,73 @@ async def ensure_required_schema_light() -> None:
                         "WHERE reap_checkout_id IS NOT NULL;"
                     )
                 )
-                # mig 225: the resolver's three hint columns, BYTE-IDENTICAL to
-                # db/migrations/225_reap_agentic_purchase_hints.sql.
-                #
-                # THIS IS THE SHAPE THE COVERAGE GATE ACTUALLY CHECKS. The
-                # CREATE TABLEs above are invisible to
-                # tests/test_schema_guard_migration_coverage.py (it parses
-                # ADD COLUMN only) — an ALTER is not, so this one is gated at PR
-                # time as well as by the rail's own parity test.
-                #
-                # THE CREATE TABLE ABOVE DELIBERATELY DOES NOT CARRY THESE THREE,
-                # and this ALTER is what lands them on EVERY path. That is what
-                # keeps the two builds identical down to ordinal position: the
-                # migration route is `224 CREATE` then `225 ALTER`, and folding
-                # the columns into the CREATE here would make the self-heal's
-                # route `CREATE-with-them` — same column set, different order,
-                # and a needless second place to keep in step. On an empty
-                # database the CREATE runs and this ALTER adds three columns; on
-                # a database already carrying the 224 shape the CREATE is the
-                # no-op and this ALTER is the whole of the heal; on a database
-                # already carrying the 225 shape both are no-ops. All three
-                # arrivals end at one schema, which is what idempotent means
-                # here.
+            except Exception:  # noqa: BLE001
+                # Best-effort like every sibling, and it must not starve what
+                # follows. The rail itself is loud if this silently fails: every
+                # call against it is an UndefinedTable 500 rather than a wrong
+                # answer, so the failure is visible from the first request.
+                pass
+            # mig 225: the resolver's three hint columns.
+            #
+            # THIS DDL MUST BUILD THE SAME SCHEMA AS
+            # db/migrations/225_reap_agentic_purchase_hints.sql — not the same
+            # bytes. Leading whitespace differs and no test asserts otherwise;
+            # the same wording as the mig-224 block above, and for the same
+            # reason. What IS enforced, by
+            # tests/test_reap_agentic_ledger_postgres.py::
+            # test_the_self_heal_builds_the_hint_columns_identically_to_the_
+            # migration, is that the two builds agree on every column the
+            # catalog reports — name, type, nullability, default, length.
+            #
+            # ── ITS OWN try/except, AND THAT IS THE WHOLE POINT OF THIS BLOCK ──
+            #
+            # It used to be the LAST statement inside the mig-224 try above, and
+            # that was a real defect rather than a style question: every
+            # statement in that try can raise, and one of them raises on
+            # databases that exist. `CREATE UNIQUE INDEX
+            # uq_reap_agentic_enrollments_one_active` FAILS on a 224-shaped
+            # database that already holds two 'active' enrollments for one
+            # buyer_ref — reproduced by the reviewer. The raise abandoned every
+            # statement after it, so the three hint columns NEVER LANDED, and
+            # because production never runs db/migrations there was no other
+            # route: `create_purchase` then raised UndefinedColumnError on every
+            # call, forever, on exactly the databases that were already unwell.
+            #
+            # A failure of the CREATE TABLEs cannot starve this, and a failure
+            # HERE cannot starve the self-heals below. Both directions, which is
+            # what the mig-207 and mig-212 blocks buy the same way and for the
+            # same reason. Position alone buys neither.
+            #
+            # THIS IS ALSO THE SHAPE THE COVERAGE GATE CHECKS. The CREATE TABLEs
+            # above are invisible to tests/test_schema_guard_migration_coverage.py
+            # (it parses ADD COLUMN only) — an ALTER is not, so this one is gated
+            # at PR time as well as by the rail's own parity test.
+            #
+            # THE CREATE TABLE ABOVE DELIBERATELY DOES NOT CARRY THESE THREE, and
+            # this ALTER is what lands them on EVERY path. That keeps the two
+            # builds identical down to ordinal position: the migration route is
+            # `224 CREATE` then `225 ALTER`, and folding the columns into the
+            # CREATE here would make the self-heal's route `CREATE-with-them` —
+            # same column set, different order, and a needless second place to
+            # keep in step. On an empty database the CREATE runs and this ALTER
+            # adds three columns; on a 224-shaped database the CREATE is the
+            # no-op and this ALTER is the whole of the heal; on a 225-shaped one
+            # both are no-ops. All three arrivals end at one schema, which is
+            # what idempotent means here.
+            #
+            # The statement carries `IF EXISTS` on the table name, so on a
+            # database where the CREATE above genuinely failed this is a no-op
+            # rather than a second error.
+            #
+            # DO NOT WRITE THE TWO WORDS "A-L-T-E-R T-A-B-L-E" IN PROSE ANYWHERE
+            # IN THIS FILE. tests/test_schema_guard_migration_coverage.py scans
+            # this source with a regex that matches those words followed by a
+            # name and then captures everything up to the next `;` — a mention
+            # in a comment matches first, swallows the real statement below it
+            # into its body, and files these columns under a table called "if".
+            # The gate then reports migration 225 as uncovered. That happened,
+            # on this very comment.
+            try:
                 await database.execute(
                     text(
                         """
@@ -580,10 +625,6 @@ async def ensure_required_schema_light() -> None:
                     )
                 )
             except Exception:  # noqa: BLE001
-                # Best-effort like every sibling, and it must not starve what
-                # follows. The rail itself is loud if this silently fails: every
-                # call against it is an UndefinedTable 500 rather than a wrong
-                # answer, so the failure is visible from the first request.
                 pass
             # mig 212: the recovery key — the join the Prove stage rests on.
             # Early and wrapped for the same reason as mig 210 below: this
@@ -2669,29 +2710,38 @@ async def ensure_required_schema_light() -> None:
                         "WHERE reap_checkout_id IS NOT NULL;"
                     )
                 )
-                # mig 225: the resolver's three hint columns, SQLite twin.
-                #
-                # ONE ALTER PER COLUMN, EACH IN ITS OWN try — and neither of
-                # those is house style copied for its own sake, they are what
-                # SQLite forces:
-                #
-                #   * SQLite's ALTER TABLE has NO `IF NOT EXISTS` for ADD COLUMN
-                #     and NO multi-clause ADD, so the Postgres statement cannot
-                #     be reused verbatim. A duplicate column raises
-                #     OperationalError("duplicate column name: …"), which is the
-                #     no-op this branch has to spell with an except.
-                #   * A shared try would make the FIRST already-present column
-                #     abandon the two after it. On the second run of the
-                #     self-heal — or on a dev database built before this
-                #     migration where one column somehow landed and the others
-                #     did not — that leaves the table permanently short. Per
-                #     column, every run converges.
-                #
-                # JSONB IS NOT A SQLITE TYPE NAME: declaring it would give the
-                # column NUMERIC affinity and silently store 0 for a JSON
-                # payload, which is the same trap as `CAST(:x AS JSONB)` — see
-                # property 3 in db/reap_agentic_ledger.py's header. TEXT, like
-                # the queries_tried / shipping_address twins above.
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 225: the resolver's three hint columns, SQLite twin.
+            #
+            # ── TWO LAYERS OF try, AND EACH ONE ANSWERS A DIFFERENT FAILURE ──
+            #
+            # OUTER (here): this loop is OUTSIDE the mig-224 try above, for the
+            # reason the Postgres sibling spells out at length — every statement
+            # in that try can raise, one of them raises on databases that exist,
+            # and a raise there used to abandon these three columns forever on
+            # exactly the databases that were already unwell.
+            #
+            # INNER (per column): SQLite's ALTER TABLE has NO `IF NOT EXISTS`
+            # for ADD COLUMN and NO multi-clause ADD, so the Postgres statement
+            # cannot be reused verbatim. A duplicate column raises
+            # OperationalError("duplicate column name: …"), which is the no-op
+            # this branch has to spell with an except — and a SHARED try would
+            # make the FIRST already-present column abandon the two after it,
+            # leaving a partially-healed table permanently short. Per column,
+            # every run converges.
+            #
+            # The statement here cannot carry `IF EXISTS` on the table name
+            # (SQLite has no such form), so on a database where the CREATE above
+            # genuinely failed each one raises "no such table" and the inner
+            # except absorbs it — the same no-op, reached by a different error.
+            #
+            # JSONB IS NOT A SQLITE TYPE NAME: declaring it would give the column
+            # NUMERIC affinity and silently store 0 for a JSON payload, which is
+            # the same trap as `CAST(:x AS JSONB)` — see property 3 in
+            # db/reap_agentic_ledger.py's header. TEXT, like the queries_tried /
+            # shipping_address twins above.
+            try:
                 for _hint_column, _hint_type in (
                     ("accept_variant_labels", "TEXT"),
                     ("also_accept_domains", "TEXT"),

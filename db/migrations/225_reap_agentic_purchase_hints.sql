@@ -38,8 +38,8 @@
 -- absent list are the same assertion here, and one spelling of it is enough.
 --
 -- Production deploys skip db/migrations/, so these three ADD COLUMNs are ALSO in
--- db/schema_guard.ensure_required_schema_light — BYTE-IDENTICAL on the Postgres branch, and with
--- the SQLite twin's usual TEXT/TIMESTAMP substitutions on the other. The catalog-parity test
+-- db/schema_guard.ensure_required_schema_light. The two must build the SAME SCHEMA, not the same
+-- bytes (formatting differs; the SQLite twin also substitutes TEXT for JSONB, which it must). The catalog-parity test
 -- tests/test_reap_agentic_ledger_postgres.py::test_the_self_heal_builds_the_same_schema_as_the_
 -- migration compares what the DATABASE built from each, so a divergence here is a failure there
 -- rather than a surprise in production.
