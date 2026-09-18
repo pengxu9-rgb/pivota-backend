@@ -3228,7 +3228,7 @@ async def _process_shopify_webhook_event(
                     )
                     if click_id:
                         amount_cents, order_currency = shopify_order_total_to_cents(data)
-                        # mig 228: a cart-link Reap purchase's click is ALSO closed by
+                        # mig 230: a cart-link Reap purchase's click is ALSO closed by
                         # Reap, under a different key. The helper claims the click
                         # first-writer-wins for THOSE clicks only, and calls the same
                         # close with the same arguments for every other click. It

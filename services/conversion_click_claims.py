@@ -1,4 +1,4 @@
-"""One attribution edge per cart-link click: a first-writer-wins claim (migration 228).
+"""One attribution edge per cart-link click: a first-writer-wins claim (migration 230).
 
 THE PROBLEM. A Reap cart-link purchase is ONE sale that TWO channels can close:
 
@@ -52,7 +52,7 @@ SCOPE, ON BOTH SIDES, AND ONLY THERE:
     `reap_agentic_purchases` row with that click id and `item_source = 'cart_link'` exists.
     Every other click is passed straight to the close exactly as before and never touches the
     claims table. It FAILS OPEN: any error on the claim path logs a WARNING and closes as before
-    228, so a new table can never block merchant-webhook attribution.
+    230, so a new table can never block merchant-webhook attribution.
 
 Nothing here logs a click id's buyer, an order body or an address. The log lines carry ids and
 exception TYPES only.
@@ -217,7 +217,7 @@ async def close_merchant_conversion_with_claim(
 
     `close` is passed IN, not imported, so each caller keeps calling its OWN module-level
     `close_external_order_conversion`: the same object, with the same keyword arguments, as
-    before 228.
+    before 230.
 
       * not a cart-link Reap click (the common case)  → `close(...)` exactly as before; the
         claims table is never read or written;

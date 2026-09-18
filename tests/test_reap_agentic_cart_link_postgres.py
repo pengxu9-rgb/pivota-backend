@@ -1,4 +1,4 @@
-"""The Reap agentic CART-LINK lane (mig 226) against REAL Postgres.
+"""The Reap agentic CART-LINK lane (mig 229) against REAL Postgres.
 
 Picked up by .github/workflows/postgres-dialect-gate.yml via the `tests/test_*_postgres.py` glob.
 
@@ -7,9 +7,9 @@ TWO HALVES:
   1. EVERY case in tests/reap_cart_link_cases.py, collected again here, so the ledger pairing,
      the validator's whole table through `create_purchase`, the raw-writer CHECKs, the dials and
      the state machine end to end all run on the production engine. On this engine the fixture
-     builds the schema from the MIGRATIONS (224 → 225 → 226 → 228).
+     builds the schema from the MIGRATIONS (224 → 225 → 229 → 230).
 
-  2. What only Postgres can show, below: the mig-226 self-heal builds the SAME CATALOG as the
+  2. What only Postgres can show, below: the mig-229 self-heal builds the SAME CATALOG as the
      migration (columns, and every CHECK's `pg_get_constraintdef` BY NAME); healing a 225-shaped
      database reaches that catalog; a second heal adds nothing and duplicates no constraint; the
      down migration refuses while a cart_link row is in flight and reverses cleanly once drained;
@@ -37,7 +37,7 @@ from reap_cart_link_cases import (  # noqa: E402
     apply_migrations,
     drop_tables,
     mk_cart_row,
-    to_pre_226_shape,
+    to_pre_229_shape,
 )
 
 DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
@@ -50,9 +50,9 @@ pytestmark = pytest.mark.skipif(
     reason="needs a Postgres DATABASE_URL — this is the production-dialect gate",
 )
 
-_MIG_226 = MIGRATIONS_DIR / "226_reap_agentic_purchase_item_source.sql"
-_MIG_228 = MIGRATIONS_DIR / "228_conversion_click_claims.sql"
-assert MIGRATIONS[-2:] == (_MIG_226, _MIG_228)
+_MIG_229 = MIGRATIONS_DIR / "229_reap_agentic_purchase_item_source.sql"
+_MIG_230 = MIGRATIONS_DIR / "230_conversion_click_claims.sql"
+assert MIGRATIONS[-2:] == (_MIG_229, _MIG_230)
 
 _NEW_CONSTRAINTS = (
     "ck_reap_agentic_purchases_item_source",
@@ -88,7 +88,7 @@ async def _catalog():
     )
 
 
-async def test_the_self_heal_builds_the_226_catalog_the_migration_builds():
+async def test_the_self_heal_builds_the_229_catalog_the_migration_builds():
     from db.schema_guard import ensure_required_schema_light
 
     columns_m, checks_m = await _catalog()
@@ -110,7 +110,7 @@ async def test_healing_a_225_shaped_database_reaches_the_migrations_catalog():
     from db.schema_guard import ensure_required_schema_light
 
     from_migration = await _catalog()
-    await to_pre_226_shape()
+    await to_pre_229_shape()
     names = {n for n, _ in (await _catalog())[1]}
     assert not (set(_NEW_CONSTRAINTS) & names), "precondition: the 225 shape"
 
@@ -136,7 +136,7 @@ async def test_a_second_heal_changes_nothing_and_duplicates_no_constraint():
 
 async def test_the_migration_is_idempotent_on_its_own():
     before = await _catalog()
-    await apply_migrations((_MIG_226,))
+    await apply_migrations((_MIG_229,))
     assert await _catalog() == before
 
 
@@ -156,7 +156,7 @@ async def _run_down():
     from db.sql_migrations import split_statements
     from db.database import database
 
-    down = MIGRATIONS_DIR / "down/226_reap_agentic_purchase_item_source_down.sql"
+    down = MIGRATIONS_DIR / "down/229_reap_agentic_purchase_item_source_down.sql"
     for statement in split_statements(down.read_text(encoding="utf-8")):
         await database.execute(statement)
 
@@ -172,7 +172,7 @@ async def test_the_down_migration_refuses_while_a_cart_link_row_is_in_flight():
     assert set(_NEW_CONSTRAINTS) <= names, "a refused down must leave the columns in place"
 
 
-async def test_the_down_migration_reverses_cleanly_once_drained_and_226_reapplies():
+async def test_the_down_migration_reverses_cleanly_once_drained_and_229_reapplies():
     import db.reap_agentic_ledger as ledger
 
     row = await mk_cart_row()
@@ -181,14 +181,14 @@ async def test_the_down_migration_reverses_cleanly_once_drained_and_226_reapplie
     columns = {c[0] for c in (await _catalog())[0]}
     assert not ({"item_source", "cart_url"} & columns)
     # And forward again: the up migration is what an operator re-runs after a rollback.
-    await apply_migrations((_MIG_226,))
+    await apply_migrations((_MIG_229,))
     reread = await ledger.get_purchase_internal(row["id"])
     # The drained row comes back as the column DEFAULT says — its URL is gone with the column.
     assert reread["item_source"] == "reap_variant" and reread["cart_url"] is None
 
 
-async def test_the_down_migration_is_a_no_op_on_a_pre_226_database():
-    await to_pre_226_shape()
+async def test_the_down_migration_is_a_no_op_on_a_pre_229_database():
+    await to_pre_229_shape()
     await _run_down()
 
 
@@ -224,7 +224,7 @@ async def test_the_stored_url_is_text_and_round_trips_verbatim():
     assert raw["t"] == "text" and raw["cart_url"] == CART_URL
 
 
-# ── migration 228: the per-click claim, on the production engine ─────────────────────────────
+# ── migration 230: the per-click claim, on the production engine ─────────────────────────────
 
 
 async def _claims_catalog():
@@ -262,7 +262,7 @@ async def _claims_catalog():
     )
 
 
-async def test_the_self_heal_builds_the_228_catalog_the_migration_builds():
+async def test_the_self_heal_builds_the_230_catalog_the_migration_builds():
     from db.schema_guard import ensure_required_schema_light
 
     from_migration = await _claims_catalog()
@@ -278,12 +278,12 @@ async def test_the_self_heal_builds_the_228_catalog_the_migration_builds():
     assert await _claims_catalog() == from_migration
 
 
-async def test_the_228_heal_is_idempotent_and_the_migration_reapplies():
+async def test_the_230_heal_is_idempotent_and_the_migration_reapplies():
     from db.schema_guard import ensure_required_schema_light
 
     before = await _claims_catalog()
     await ensure_required_schema_light()
-    await apply_migrations((_MIG_228,))
+    await apply_migrations((_MIG_230,))
     assert await _claims_catalog() == before
 
 
@@ -333,21 +333,21 @@ async def test_two_connections_claiming_at_once_produce_exactly_one_winner():
         assert sum(len(r) for r in results) == 1, (round_no, results)
 
 
-async def _run_down_228():
+async def _run_down_230():
     from db.database import database
     from db.sql_migrations import split_statements
 
-    down = MIGRATIONS_DIR / "down/228_conversion_click_claims_down.sql"
+    down = MIGRATIONS_DIR / "down/230_conversion_click_claims_down.sql"
     for statement in split_statements(down.read_text(encoding="utf-8")):
         await database.execute(statement)
 
 
-async def test_the_228_down_migration_reverses_cleanly_and_228_reapplies():
+async def test_the_230_down_migration_reverses_cleanly_and_230_reapplies():
     before = await _claims_catalog()
-    await _run_down_228()
+    await _run_down_230()
     columns, constraints, indexes = await _claims_catalog()
     assert columns == [] and constraints == [] and indexes == []
-    await apply_migrations((_MIG_228,))
+    await apply_migrations((_MIG_230,))
     assert await _claims_catalog() == before
 
 

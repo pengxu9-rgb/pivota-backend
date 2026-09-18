@@ -389,7 +389,7 @@ async def test_batch_never_raises_on_candidate_query_failure(monkeypatch):
     assert result["reason"] == "candidate_query_failed"
 
 
-# --- (mig 228) a close skipped because Reap owns the click is NOT counted as closed ----------
+# --- (mig 230) a close skipped because Reap owns the click is NOT counted as closed ----------
 
 
 @pytest.mark.asyncio

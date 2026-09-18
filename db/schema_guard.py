@@ -772,12 +772,12 @@ async def ensure_required_schema_light() -> None:
                 )
             except Exception:  # noqa: BLE001
                 pass
-            # mig 226: the purchase's ITEM SOURCE — 'reap_variant' (every row
+            # mig 229: the purchase's ITEM SOURCE — 'reap_variant' (every row
             # before this) or 'cart_link' (a Shopify cart permalink Reap quotes
             # as received), plus the URL a cart_link row carries.
             #
             # THIS DDL MUST BUILD THE SAME SCHEMA AS
-            # db/migrations/226_reap_agentic_purchase_item_source.sql, CHECKs
+            # db/migrations/229_reap_agentic_purchase_item_source.sql, CHECKs
             # included — they carry the pairing rule (a cart_link row has a URL,
             # a reap_variant row has none). Enforced through the catalog by
             # tests/test_reap_agentic_cart_link_postgres.py and by the whole-
@@ -810,7 +810,7 @@ async def ensure_required_schema_light() -> None:
                 )
             except Exception:  # noqa: BLE001
                 pass
-            # mig 226, second statement: one cart-link purchase per click. Its OWN try:
+            # mig 229, second statement: one cart-link purchase per click. Its OWN try:
             # on a database that already holds two cart-link rows for one click the
             # build RAISES, and that must not cost the columns above or the heals below.
             try:
@@ -825,19 +825,19 @@ async def ensure_required_schema_light() -> None:
                 )
             except Exception:  # noqa: BLE001
                 pass
-            # mig 228: the per-click attribution CLAIM for cart-link Reap purchases,
+            # mig 230: the per-click attribution CLAIM for cart-link Reap purchases,
             # and the index the merchant side needs to ask "is this click one of
             # those?". THIS DDL MUST BUILD THE SAME SCHEMA AS
-            # db/migrations/228_conversion_click_claims.sql; compared through the
+            # db/migrations/230_conversion_click_claims.sql; compared through the
             # catalog by tests/test_reap_agentic_cart_link_postgres.py
-            # (test_the_self_heal_builds_the_228_catalog_the_migration_builds).
+            # (test_the_self_heal_builds_the_230_catalog_the_migration_builds).
             #
             # A CREATE TABLE, so the coverage gate (ADD COLUMN only) cannot see a
             # missing heal here, the same hole the mig-224 block names. The parity
             # test is what catches it.
             #
             # Best-effort like every sibling, and it fails SAFE: without the table
-            # the merchant side fails open (closes as before 228) and the Reap side
+            # the merchant side fails open (closes as before 230) and the Reap side
             # fails closed (skips its edge), so a missing heal can never double an
             # edge. The scope lookup's index is the item_source migration's partial
             # unique index, healed with that migration.
@@ -3142,7 +3142,7 @@ async def ensure_required_schema_light() -> None:
                 )
             except Exception:  # noqa: BLE001
                 pass
-            # mig 226: item_source + cart_url, SQLite twin.
+            # mig 229: item_source + cart_url, SQLite twin.
             #
             # Same two layers of try as the mig-225 twin above, for the same
             # reasons: SQLite has no `IF NOT EXISTS` on ADD COLUMN and no
@@ -3184,7 +3184,7 @@ async def ensure_required_schema_light() -> None:
                         continue
             except Exception:  # noqa: BLE001
                 pass
-            # mig 226, second statement, SQLite twin: one cart-link purchase per click.
+            # mig 229, second statement, SQLite twin: one cart-link purchase per click.
             # SQLite supports the same partial unique index verbatim. Own try, same reason.
             try:
                 await database.execute(
@@ -3197,7 +3197,7 @@ async def ensure_required_schema_light() -> None:
                 )
             except Exception:  # noqa: BLE001
                 pass
-            # mig 228: the per-click attribution claim, SQLite twin. Same CHECK and
+            # mig 230: the per-click attribution claim, SQLite twin. Same CHECK and
             # key as the Postgres statement; TIMESTAMPTZ -> TIMESTAMP and now() ->
             # CURRENT_TIMESTAMP per this branch's convention.
             try:

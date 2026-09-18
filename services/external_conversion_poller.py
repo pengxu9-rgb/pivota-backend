@@ -411,7 +411,7 @@ async def _process_order(
 ) -> str:
     """Close one order if it carries our click id AND is paid. Returns an outcome
     tag: 'closed' | 'no_click' | 'unpaid' | 'no_order_id' | 'invalid' | 'skipped_claimed'
-    (a cart-link Reap purchase's click whose edge Reap already wrote, mig 228).
+    (a cart-link Reap purchase's click whose edge Reap already wrote, mig 230).
 
     ``shop_domain`` is the polled store's Shopify domain (the store the sale
     happened on); it is forwarded as ``converting_shop_domain`` for the ADR-009
@@ -429,7 +429,7 @@ async def _process_order(
         return "no_order_id"
     cents, currency = shopify_order_total_to_cents(order)
     converted_at = _parse_dt(order.get("processed_at")) or _parse_dt(order.get("created_at")) or converted_at_default
-    # Idempotency + click gate + edge upsert all live inside this call (T2-2). mig 228: a
+    # Idempotency + click gate + edge upsert all live inside this call (T2-2). mig 230: a
     # cart-link Reap purchase's click is also closed by Reap under another key, so it goes
     # through the first-writer-wins claim; every other click reaches the same close with the
     # same arguments. Fails open. See services/conversion_click_claims.
@@ -446,7 +446,7 @@ async def _process_order(
         converting_shop_domain=shop_domain,
     )
     if is_skipped_claimed(result):
-        # Reap already closed this cart-link sale's click (mig 228). NOT "closed": nothing was.
+        # Reap already closed this cart-link sale's click (mig 230). NOT "closed": nothing was.
         return "skipped_claimed"
     return "closed"
 

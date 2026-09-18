@@ -53,9 +53,13 @@ MIGRATIONS_DIR = ROOT / "db/migrations"
 MIGRATIONS = (
     MIGRATIONS_DIR / "224_reap_agentic_ledger.sql",
     MIGRATIONS_DIR / "225_reap_agentic_purchase_hints.sql",
-    MIGRATIONS_DIR / "226_reap_agentic_purchase_item_source.sql",
-    # 228: the per-click attribution claim + the purchases click_id index.
-    MIGRATIONS_DIR / "228_conversion_click_claims.sql",
+    # main's 226 (routes: buyer refs, eligibility, keys) and 227 (consent on the buyer ref): a
+    # cart-link start requires a MINTED buyer identity carrying the consent (#2219).
+    MIGRATIONS_DIR / "226_reap_agentic_routes.sql",
+    MIGRATIONS_DIR / "227_reap_agentic_buyer_consent.sql",
+    MIGRATIONS_DIR / "229_reap_agentic_purchase_item_source.sql",
+    # 230: the per-click attribution claim.
+    MIGRATIONS_DIR / "230_conversion_click_claims.sql",
 )
 SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")
 
@@ -181,6 +185,7 @@ async def apply_migrations(paths=MIGRATIONS):
 
 async def drop_tables():
     await database.execute("DROP TABLE IF EXISTS conversion_click_claims")
+    await database.execute("DROP TABLE IF EXISTS reap_agentic_buyer_refs")
     await database.execute("DROP TABLE IF EXISTS reap_agentic_purchases")
     await database.execute("DROP TABLE IF EXISTS reap_agentic_enrollments")
 
@@ -188,7 +193,7 @@ async def drop_tables():
 @pytest.fixture(autouse=True)
 async def cartlink_db():
     """SQLite: the self-heal, which is the schema production gets. Postgres: the migrations,
-    224 → 225 → 226 — the Postgres collector then proves the self-heal builds the same catalog."""
+    224 → 225 → 229 — the Postgres collector then proves the self-heal builds the same catalog."""
     if IS_POSTGRES:
         _assert_throwaway_database()
     was_connected = database.is_connected
@@ -295,7 +300,7 @@ class Attribution:
     """Stands in for `close_external_order_conversion` on EVERY channel (Reap, webhook, poller),
     and keeps its one real dedupe: an edge per (merchant_id, external_order_id), ON CONFLICT DO
     NOTHING. That is exactly the guard that CANNOT see a Reap close and a merchant close of one
-    sale as the same thing, which is what the mig-228 claim is for."""
+    sale as the same thing, which is what the mig-230 claim is for."""
 
     def __init__(self):
         self.calls = []
@@ -338,7 +343,23 @@ def item(**over) -> svc.CartLinkItem:
     return svc.CartLinkItem(**kwargs)
 
 
-async def start(**over) -> str:
+#: The consent tag every cart-link start carries in these cases (#2219). Not an allowlisted
+#: value — the rail records whatever the door sends — just a stable one.
+CONSENT = "terms-2026-09"
+
+
+async def mint_buyer(buyer_ref: str, consent_version: str = CONSENT) -> None:
+    """What routes/agent_commerce_reap `_buyer_id_for` + `_reap_buyer_ref` leave behind: a buyer
+    identity row whose opaque ref is `buyer_ref`, carrying the consent. Written directly because
+    those helpers are the ROUTE's and these cases drive the service."""
+    await database.execute(
+        "INSERT INTO reap_agentic_buyer_refs (buyer_id, reap_buyer_ref, consent_version, "
+        "consented_at) VALUES (:b, :r, :c, CURRENT_TIMESTAMP) ON CONFLICT (buyer_id) DO NOTHING",
+        {"b": f"buyer_{buyer_ref}", "r": buyer_ref, "c": consent_version},
+    )
+
+
+async def start(_mint: bool = True, **over) -> str:
     kwargs = dict(
         agent_id="agent_one",
         agent_user_ref_hash="hash_alice",
@@ -348,8 +369,11 @@ async def start(**over) -> str:
         quantity=1,
         click_id=CLICK,
         return_url=RETURN_URL,
+        consent_version=CONSENT,
     )
     kwargs.update(over)
+    if _mint and isinstance(kwargs.get("buyer_ref"), str) and kwargs["buyer_ref"].strip():
+        await mint_buyer(kwargs["buyer_ref"])
     return await svc.start_purchase(**kwargs)
 
 
@@ -418,9 +442,9 @@ async def purchase_columns() -> set:
     return {r["name"] for r in rows}
 
 
-async def to_pre_226_shape():
-    """The table exactly as every environment that deployed 225 has it: drop the mig-226 unique
-    index (SQLite refuses to drop an indexed column) and the two mig-226 columns (cart_url first —
+async def to_pre_229_shape():
+    """The table exactly as every environment that deployed 225 has it: drop the mig-229 unique
+    index (SQLite refuses to drop an indexed column) and the two mig-229 columns (cart_url first —
     its CHECK names item_source). Both engines accept this form."""
     await database.execute("DROP INDEX IF EXISTS uq_reap_agentic_purchases_cart_link_click")
     await database.execute("ALTER TABLE reap_agentic_purchases DROP COLUMN cart_url")
@@ -431,16 +455,16 @@ def _norm(text: str) -> str:
     return " ".join(text.split())
 
 
-# ══ 1. SCHEMA: migration 226 and its self-heal ═══════════════════════════════════════════════
+# ══ 1. SCHEMA: migration 229 and its self-heal ═══════════════════════════════════════════════
 
 
-async def test_the_226_columns_exist_with_their_default():
+async def test_the_229_columns_exist_with_their_default():
     columns = await purchase_columns()
     assert {"item_source", "cart_url"} <= columns
 
 
 async def test_a_default_create_is_a_reap_variant_row_with_no_url():
-    """Every caller before mig 226: the row it gets is a reap_variant row, no URL."""
+    """Every caller before mig 229: the row it gets is a reap_variant row, no URL."""
     row = await ledger.create_purchase(
         buyer_ref="bref_alice", agent_id="agent_one", agent_user_ref_hash="hash_alice",
         merchant_domain="brand.example", currency="USD", our_price_minor=4250,
@@ -451,7 +475,7 @@ async def test_a_default_create_is_a_reap_variant_row_with_no_url():
 
 async def test_the_self_heal_adds_both_columns_to_a_225_shaped_table():
     """PATH TWO — the one production takes: the table exists, only the ALTER can heal it."""
-    await to_pre_226_shape()
+    await to_pre_229_shape()
     assert not ({"item_source", "cart_url"} & await purchase_columns()), "precondition"
     await ensure_required_schema_light()
     assert {"item_source", "cart_url"} <= await purchase_columns()
@@ -460,13 +484,13 @@ async def test_the_self_heal_adds_both_columns_to_a_225_shaped_table():
 
 
 async def test_existing_rows_take_the_default_when_the_column_is_healed_on():
-    await to_pre_226_shape()
+    await to_pre_229_shape()
     await database.execute(
         "INSERT INTO reap_agentic_purchases (id, buyer_ref, state) "
-        "VALUES ('rp_before226', 'bref_x', 'resolving')"
+        "VALUES ('rp_before229', 'bref_x', 'resolving')"
     )
     await ensure_required_schema_light()
-    row = await get("rp_before226")
+    row = await get("rp_before229")
     assert row["item_source"] == "reap_variant" and row["cart_url"] is None
 
 
@@ -482,11 +506,11 @@ async def test_the_self_heal_is_idempotent_and_the_checks_still_hold():
     assert "ck_reap_agentic_purchases_cart_url_pairing" in str(caught.value)
 
 
-async def test_a_failing_sibling_statement_does_not_starve_the_226_columns():
+async def test_a_failing_sibling_statement_does_not_starve_the_229_columns():
     """THE OWN-try MUTANT. Two active enrollments for one buyer make the mig-224 block's unique
-    index RAISE; the mig-226 columns must land anyway. Folding the 226 ALTER into that try is
+    index RAISE; the mig-229 columns must land anyway. Folding the 229 ALTER into that try is
     the defect this kills."""
-    await to_pre_226_shape()
+    await to_pre_229_shape()
     await database.execute("DROP TABLE IF EXISTS reap_agentic_enrollments")
     await database.execute(
         """
@@ -562,7 +586,7 @@ def test_the_migration_and_both_self_heal_twins_declare_the_same_columns():
     Postgres twin: the whole ALTER, whitespace-normalised, must EQUAL the migration's.
     SQLite twin: each column declaration must equal the migration's clause for that column —
     SQLite cannot run the multi-clause statement, but it must declare the same CHECKs."""
-    migration = (MIGRATIONS_DIR / "226_reap_agentic_purchase_item_source.sql").read_text()
+    migration = (MIGRATIONS_DIR / "229_reap_agentic_purchase_item_source.sql").read_text()
     guard = (ROOT / "db/schema_guard.py").read_text()
 
     def _alter(text: str) -> str:
@@ -572,12 +596,12 @@ def test_the_migration_and_both_self_heal_twins_declare_the_same_columns():
             stmt = text[start: text.index(";", start) + 1]
             if "item_source" in stmt:
                 return _norm(stmt)
-        raise AssertionError("no mig-226 ALTER found")
+        raise AssertionError("no mig-229 ALTER found")
 
     assert _alter(migration) == _alter(guard)
 
     sqlite_branch = guard.rsplit("if IS_SQLITE:", 1)[1]
-    block = sqlite_branch[sqlite_branch.index("mig 226"):]
+    block = sqlite_branch[sqlite_branch.index("mig 229"):]
     block = block[: block.index("except Exception:  # noqa: BLE001\n                pass")]
     decls = re.findall(r'\(\s*"(item_source|cart_url)",\s*((?:"[^"]*"\s*)+),?\s*\)', block)
     assert [d[0] for d in decls] == ["item_source", "cart_url"], "order matters: pairing names item_source"
@@ -593,13 +617,13 @@ def test_the_migration_and_both_self_heal_twins_declare_the_same_columns():
 
 
 def test_the_item_source_vocabulary_is_the_checks_own():
-    migration = (MIGRATIONS_DIR / "226_reap_agentic_purchase_item_source.sql").read_text()
+    migration = (MIGRATIONS_DIR / "229_reap_agentic_purchase_item_source.sql").read_text()
     check = re.search(r"CHECK \(item_source IN \(([^)]*)\)\)", migration).group(1)
     assert set(re.findall(r"'([a-z_]+)'", check)) == set(ledger.ITEM_SOURCES)
 
 
 def test_the_down_migration_drops_both_and_refuses_while_cart_rows_are_in_flight():
-    down = (MIGRATIONS_DIR / "down/226_reap_agentic_purchase_item_source_down.sql").read_text()
+    down = (MIGRATIONS_DIR / "down/229_reap_agentic_purchase_item_source_down.sql").read_text()
     assert "DROP COLUMN IF EXISTS cart_url" in down
     assert "DROP COLUMN IF EXISTS item_source" in down
     assert down.index("DROP COLUMN IF EXISTS cart_url") < down.index(
@@ -611,7 +635,7 @@ def test_the_down_migration_drops_both_and_refuses_while_cart_rows_are_in_flight
 def test_the_coverage_gate_sees_both_new_columns():
     import test_schema_guard_migration_coverage as gate
 
-    migration = (MIGRATIONS_DIR / "226_reap_agentic_purchase_item_source.sql").read_text()
+    migration = (MIGRATIONS_DIR / "229_reap_agentic_purchase_item_source.sql").read_text()
     assert gate._extract_added_columns(migration) == {
         ("reap_agentic_purchases", "item_source"),
         ("reap_agentic_purchases", "cart_url"),
@@ -723,7 +747,7 @@ async def test_a_terminal_row_keeps_its_url_and_sheds_its_pii():
 
 def test_the_reap_variant_insert_statement_is_untouched():
     """Byte-identical behaviour for existing callers, at its strongest: their statement does not
-    name either new column, so it cannot fail on a database where the mig-226 heal did not land."""
+    name either new column, so it cannot fail on a database where the mig-229 heal did not land."""
     for sql in (ledger._INSERT_PURCHASE_SQL, ledger._INSERT_PURCHASE_SQL_SQLITE):
         assert "item_source" not in sql and "cart_url" not in sql
     for sql in (ledger._INSERT_CART_LINK_PURCHASE_SQL, ledger._INSERT_CART_LINK_PURCHASE_SQL_SQLITE):
@@ -731,8 +755,8 @@ def test_the_reap_variant_insert_statement_is_untouched():
     assert "JSONB" not in ledger._INSERT_CART_LINK_PURCHASE_SQL_SQLITE
 
 
-async def test_a_reap_variant_create_still_works_on_a_database_without_the_226_columns():
-    await to_pre_226_shape()
+async def test_a_reap_variant_create_still_works_on_a_database_without_the_229_columns():
+    await to_pre_229_shape()
     row = await ledger.create_purchase(
         buyer_ref="bref_alice", agent_id="agent_one", agent_user_ref_hash="hash_alice",
         merchant_domain="brand.example", currency="USD", our_price_minor=4250,
@@ -1437,7 +1461,7 @@ async def test_no_log_record_result_or_exception_carries_the_buyers_details(
     assert "checkout_prefill" in haystack and "quantity_mismatch" in haystack
 
 
-# ══ 6. ONE EDGE PER CART-LINK SALE: the mig-228 click claim ═════════════════════════════════
+# ══ 6. ONE EDGE PER CART-LINK SALE: the mig-230 click claim ═════════════════════════════════
 #
 # The P1 from the #2214 review. One cart-link sale can be closed by Reap under
 # (merchant_domain, Reap orderId) AND by the merchant's own Shopify order (which carries our click
@@ -1630,7 +1654,7 @@ async def test_a_second_shopify_order_on_the_same_claimed_click_is_skipped(
 async def test_a_non_reap_click_closes_exactly_as_before_and_never_touches_the_claims(
     reap, attribution, merchant_paths, channel, monkeypatch
 ):
-    """Byte-for-byte: the close receives the same keyword arguments the pre-228 call site sent,
+    """Byte-for-byte: the close receives the same keyword arguments the pre-230 call site sent,
     and no claim statement runs."""
     await start()  # a cart-link purchase exists — for ANOTHER click
     touched = []
@@ -1689,8 +1713,8 @@ async def test_a_missing_claims_table_fails_open_on_the_merchant_side(
 async def test_a_failing_scope_lookup_fails_open_on_the_merchant_side(
     reap, attribution, merchant_paths
 ):
-    """The lookup itself can fail too (here: a pre-226 table with no item_source)."""
-    await to_pre_226_shape()
+    """The lookup itself can fail too (here: a pre-229 table with no item_source)."""
+    await to_pre_229_shape()
     await merchant_paths.poller()
     assert list(attribution.edges) == [(MERCHANT_TENANT, SHOPIFY_ORDER_ID)]
 
@@ -1711,7 +1735,8 @@ async def _ensure_edges_table():
     except Exception:  # noqa: BLE001
         await database.execute(
             "CREATE TABLE commerce_attribution_edges ("
-            "edge_id TEXT PRIMARY KEY, merchant_id TEXT, click_id TEXT, external_order_id TEXT)"
+            "edge_id TEXT PRIMARY KEY, merchant_id TEXT, order_id TEXT, click_id TEXT, "
+            "external_order_id TEXT, refund_count INTEGER, refunded_amount NUMERIC)"
         )
         created = True
     return created
@@ -1870,13 +1895,15 @@ async def test_list_claims_without_edge_skips_claims_that_have_their_edge():
     created = await _ensure_edges_table()
     try:
         await database.execute(
-            "INSERT INTO commerce_attribution_edges (edge_id, merchant_id, click_id, "
-            "external_order_id) VALUES ('e1', 'm', 'clk_has', 'o1')"
+            "INSERT INTO commerce_attribution_edges (edge_id, merchant_id, order_id, click_id, "
+            "external_order_id, refund_count, refunded_amount) "
+            "VALUES ('e1', 'm', 'test_order_1', 'clk_has', 'o1', 0, 0)"
         )
         # Same click, OTHER order: not this claim's edge.
         await database.execute(
-            "INSERT INTO commerce_attribution_edges (edge_id, merchant_id, click_id, "
-            "external_order_id) VALUES ('e2', 'm', 'clk_none', 'o_other')"
+            "INSERT INTO commerce_attribution_edges (edge_id, merchant_id, order_id, click_id, "
+            "external_order_id, refund_count, refunded_amount) "
+            "VALUES ('e2', 'm', 'test_order_2', 'clk_none', 'o_other', 0, 0)"
         )
         listed = await ccc.list_claims_without_edge(limit=10)
         assert [r["click_id"] for r in listed] == ["clk_none"]
@@ -1930,8 +1957,8 @@ async def test_the_database_refuses_an_unknown_claimant_from_any_writer():
     assert "ck_conversion_click_claims_claimed_by" in str(caught.value)
 
 
-def test_the_228_self_heal_twins_declare_the_migrations_table():
-    migration = (MIGRATIONS_DIR / "228_conversion_click_claims.sql").read_text()
+def test_the_230_self_heal_twins_declare_the_migrations_table():
+    migration = (MIGRATIONS_DIR / "230_conversion_click_claims.sql").read_text()
     guard = (ROOT / "db/schema_guard.py").read_text()
 
     def _create(text: str, start_at: int = 0) -> str:
@@ -1948,12 +1975,12 @@ def test_the_228_self_heal_twins_declare_the_migrations_table():
         assert "idx_reap_agentic_purchases_click_id" not in text
 
 
-def test_the_228_down_migration_drops_both():
-    down = (MIGRATIONS_DIR / "down/228_conversion_click_claims_down.sql").read_text()
+def test_the_230_down_migration_drops_both():
+    down = (MIGRATIONS_DIR / "down/230_conversion_click_claims_down.sql").read_text()
     assert "DROP TABLE IF EXISTS conversion_click_claims" in down
 
 
-async def test_the_228_heal_lands_after_a_failing_sibling():
+async def test_the_230_heal_lands_after_a_failing_sibling():
     """Its own try: the claims table must exist even when an earlier self-heal statement raised
     (two active enrollments for one buyer make the mig-224 unique index fail)."""
     await database.execute("DROP TABLE conversion_click_claims")
@@ -2014,7 +2041,7 @@ def real_close(monkeypatch):
 async def test_one_sale_is_one_edge_through_the_real_close(reap, real_close, merchant_first):
     """agent_review2214/test_double_edge_repro.py, FIXED: the same two closes of the same sale
     through the real primitive, each reached through its real call site (the merchant helper,
-    the Reap completion). Before mig 228 this was two edges."""
+    the Reap completion). Before mig 230 this was two edges."""
 
     async def _merchant():
         await ccc.close_merchant_conversion_with_claim(
@@ -2197,7 +2224,7 @@ async def test_the_index_is_partial_to_cart_link_rows():
 
 
 def test_the_cart_link_click_index_is_in_the_migration_and_both_twins():
-    migration = (MIGRATIONS_DIR / "226_reap_agentic_purchase_item_source.sql").read_text()
+    migration = (MIGRATIONS_DIR / "229_reap_agentic_purchase_item_source.sql").read_text()
     guard = (ROOT / "db/schema_guard.py").read_text()
     expected = _norm(
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_reap_agentic_purchases_cart_link_click "
@@ -2208,7 +2235,7 @@ def test_the_cart_link_click_index_is_in_the_migration_and_both_twins():
     assert expected in _norm(pg_branch)
     joined = _norm("".join(re.findall(r'"([^"]*)"', sqlite_branch)))
     assert expected in joined
-    down = (MIGRATIONS_DIR / "down/226_reap_agentic_purchase_item_source_down.sql").read_text()
+    down = (MIGRATIONS_DIR / "down/229_reap_agentic_purchase_item_source_down.sql").read_text()
     assert "DROP INDEX IF EXISTS uq_reap_agentic_purchases_cart_link_click" in down
 
 
@@ -2289,3 +2316,68 @@ def test_absent_adjustment_keys_are_allowed():
     del quote["amountBreakdown"]["discounts"]
     del quote["amountBreakdown"]["additionalCharges"]
     assert svc.verify_cart_link_quote(quote, _ROW).ok
+
+
+# ══ 9. #2219 ON THE CART-LINK LANE: consent + a minted buyer identity ════════════════════════
+
+
+@pytest.mark.parametrize(
+    "consent,why",
+    [(None, "missing"), ("", "blank"), ("   ", "whitespace"), ("v" * 33, "too-long"),
+     ("terms\u202e2026", "unprintable")],
+    ids=["missing", "blank", "whitespace", "too-long", "unprintable"],
+)
+async def test_a_cart_link_start_without_consent_is_refused_before_any_write(consent, why):
+    with pytest.raises(svc.PurchaseRefused) as caught:
+        await start(consent_version=consent)
+    assert caught.value.reason == "consent_required", why
+    assert await count() == 0
+
+
+async def test_consent_is_checked_before_the_item_is_looked_at():
+    """Same order as the route: a buyer who has not consented learns nothing about the item."""
+    with pytest.raises(svc.PurchaseRefused) as caught:
+        await start(consent_version=None, cart_link=item(cart_url=PREFILL_LINK))
+    assert caught.value.reason == "consent_required"
+
+
+async def test_a_cart_link_start_for_an_identity_never_minted_is_refused():
+    with pytest.raises(svc.PurchaseRefused) as caught:
+        await start(_mint=False)
+    assert caught.value.reason == "buyer_unlinked"
+    assert await count() == 0
+
+
+async def test_a_cart_link_start_whose_identity_carries_another_consent_is_refused():
+    await mint_buyer("bref_alice", consent_version="terms-2025-01")
+    with pytest.raises(svc.PurchaseRefused) as caught:
+        await start(_mint=False)
+    assert caught.value.reason == "consent_required"
+    assert await count() == 0
+
+
+async def test_an_unreadable_identity_table_fails_closed():
+    await database.execute("DROP TABLE reap_agentic_buyer_refs")
+    with pytest.raises(svc.PurchaseRefused) as caught:
+        await start(_mint=False)
+    assert caught.value.reason == "buyer_unlinked"
+    assert await count() == 0
+
+
+async def test_a_minted_consented_identity_opens_the_purchase():
+    purchase_id = await start()
+    assert (await get(purchase_id))["buyer_ref"] == "bref_alice"
+
+
+async def test_the_variant_lane_is_unchanged_at_the_service():
+    """CONTROL. On the variant lane #2219's requirements are the ROUTE's and stay there; the
+    service opens a row purchase with no consent argument exactly as before."""
+    purchase_id = await start(
+        _mint=False, cart_link=None, consent_version=None, click_id="click_abc",
+        row=svc.PurchaseRow(
+            merchant_domain="brand.example", product_key="pk_1", variant_key="vk_1",
+            product_name="Standard Eau de Parfum", variant_title="Standard", brand="Brand",
+            category="fragrance", our_price_minor=4250, currency="USD", market_country="US",
+        ),
+    )
+    assert (await get(purchase_id))["item_source"] == "reap_variant"

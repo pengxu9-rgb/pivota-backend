@@ -1,4 +1,4 @@
--- Reverse of 226_reap_agentic_purchase_item_source.sql.
+-- Reverse of 229_reap_agentic_purchase_item_source.sql.
 --
 -- REFUSES WHILE A cart_link PURCHASE IS IN FLIGHT. Dropping the two columns does not delete a
 -- cart_link row; it turns it into what every row without an item_source is, a reap_variant

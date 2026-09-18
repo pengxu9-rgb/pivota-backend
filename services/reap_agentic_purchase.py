@@ -1199,6 +1199,7 @@ async def start_purchase(
     click_id: Optional[str],
     return_url: str,
     cart_link: Optional[CartLinkItem] = None,
+    consent_version: Optional[str] = None,
 ) -> str:
     """Open a purchase in 'resolving' and return its id. MAKES NO PARTNER CALL.
 
@@ -1208,6 +1209,14 @@ async def start_purchase(
     additionally needs `REAP_AGENTIC_CART_LINK_ENABLED` and `rc.supports_cart_link_quote()`, and
     refuses with its own codes (`cart_link_disabled`, `cart_link_quote_unsupported`,
     `cart_link_refused`) before anything else about it is looked at.
+
+    A `cart_link` call ALSO requires `consent_version`, and `buyer_ref` must be a buyer identity
+    #2219's route helpers already MINTED, with that same consent recorded on it
+    (`consent_required` / `buyer_unlinked` otherwise). On the variant lane those two are enforced
+    by routes/agent_commerce_reap before this function is called; the cart-link lane has no
+    route yet, so this function enforces them itself rather than leave a door that opens a
+    purchase for a buyer who never consented. It does not mint: minting has one owner, the
+    route's `_buyer_id_for` / `_reap_buyer_ref`, and a future cart-link route calls those.
 
     EVERY REFUSAL HAPPENS BEFORE THE INSERT, and that ordering is the contract this function is
     tested on (`test_every_refusal_leaves_the_table_empty` counts rows). A row written and then
@@ -1257,6 +1266,7 @@ async def start_purchase(
             agent_id=agent_id,
             agent_user_ref_hash=agent_user_ref_hash,
             buyer_ref=buyer_ref,
+            consent_version=consent_version,
             item=cart_link,
             buyer=buyer,
             quantity=quantity,
@@ -1376,6 +1386,49 @@ async def start_purchase(
     return str(created["id"])
 
 
+#: `reap_agentic_buyer_refs.consent_version` is VARCHAR(32) (migration 227), and the route caps
+#: it at the same width for the same reason: a truncated version tag names a different version.
+_CONSENT_VERSION_MAX_CHARS = 32
+
+
+async def _require_cart_link_consent(buyer_ref: str, consent_version: Any) -> None:
+    """#2219's two requirements, on the cart-link lane: a consent version, and a buyer identity
+    that was MINTED with that consent recorded on it.
+
+    The version gets the route's three checks (`routes.agent_commerce_reap._consent_version`):
+    non-empty, within the column's width, printable — and, like the route, it is NOT matched
+    against an allowlist. Then the identity: `buyer_ref` must be a row the route's
+    `_reap_buyer_ref` wrote, and its recorded consent must be THIS version (the route writes the
+    latest version on every purchase, so a mismatch means this call is not the one that
+    recorded it). A read error fails CLOSED: no purchase for an identity we cannot see.
+    """
+    text = str(consent_version or "").strip()
+    if not text:
+        raise PurchaseRefused("consent_required", "consent_version is required")
+    if len(text) > _CONSENT_VERSION_MAX_CHARS:
+        raise PurchaseRefused(
+            "consent_required", f"consent_version is longer than {_CONSENT_VERSION_MAX_CHARS}"
+        )
+    if not _is_clean(text) or text != _clean_buyer_text(text):
+        raise PurchaseRefused(
+            "consent_required", "consent_version contains characters that are not printable"
+        )
+    try:
+        linked = await ledger.get_buyer_ref_consent(buyer_ref)
+    except Exception as exc:  # noqa: BLE001 — fail closed
+        logger.warning(
+            "reap_agentic: buyer identity unreadable for a cart-link start error_type=%s",
+            type(exc).__name__,
+        )
+        raise PurchaseRefused("buyer_unlinked", "the buyer identity could not be read") from None
+    if linked is None:
+        raise PurchaseRefused("buyer_unlinked", "buyer_ref is not a minted buyer identity")
+    if str(linked.get("consent_version") or "") != text:
+        raise PurchaseRefused(
+            "consent_required", "the buyer identity does not carry this consent_version"
+        )
+
+
 def _validated_buyer(buyer: Any) -> Tuple[str, Dict[str, str]]:
     """The buyer's email and WHITELISTED shipping address, or `PurchaseRefused`.
 
@@ -1432,6 +1485,7 @@ async def _start_cart_link_purchase(
     agent_id: str,
     agent_user_ref_hash: str,
     buyer_ref: str,
+    consent_version: Optional[str],
     item: Any,
     buyer: Any,
     quantity: Any,
@@ -1447,6 +1501,12 @@ async def _start_cart_link_purchase(
     `checkout[...]` PII it was refused for; `cart_link_refused` carries the validator's reason
     CODE, which is a fixed vocabulary word.
     """
+    # CONSENT AND A MINTED IDENTITY FIRST, before anything about the item is looked at — the
+    # same position the route gives them on the variant lane (after the dials, before
+    # eligibility, the catalog read and every write), for the same reason: a buyer who has not
+    # consented must not be able to learn anything from the shape of the refusal.
+    await _require_cart_link_consent(buyer_ref, consent_version)
+
     if not isinstance(item, CartLinkItem):
         raise PurchaseRefused("invalid_request", "cart_link must be a CartLinkItem")
     shop_domain = _require_text(item.shop_domain, "cart_link.shop_domain").lower()
@@ -1563,7 +1623,7 @@ def _next_poll_for(to_state: str) -> datetime:
 
 
 def _is_cart_link(row: Mapping[str, Any]) -> bool:
-    """A cart-link row? Anything else — including a row read before mig 226 existed, where the
+    """A cart-link row? Anything else — including a row read before mig 229 existed, where the
     column is absent — is the variant lane, which is what the column's DEFAULT says too."""
     return str(row.get("item_source") or "reap_variant") == "cart_link"
 
@@ -2470,7 +2530,7 @@ async def _complete(
     else:
         reason = None
 
-    # ── THE CLICK CLAIM (mig 228), cart-link rows only ──────────────────────────────────────
+    # ── THE CLICK CLAIM (mig 230), cart-link rows only ──────────────────────────────────────
     #
     # The merchant's own Shopify order carries this same click id, so the `orders/paid` webhook
     # and the read_orders poller can close this SAME sale under (tenant merchant, Shopify order
@@ -2577,7 +2637,7 @@ async def _close_attribution(purchase: Mapping[str, Any]) -> bool:
     reconciliation job is the answer to a systematically failing hook, not a louder failure here.
 
     Returns True when the close ran without raising, so `_complete` can give back a click claim
-    (mig 228) whose edge was never written.
+    (mig 230) whose edge was never written.
     """
     from services.commerce_attribution_service import close_external_order_conversion
 

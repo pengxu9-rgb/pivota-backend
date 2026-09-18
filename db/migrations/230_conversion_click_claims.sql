@@ -1,6 +1,6 @@
 -- ONE EDGE PER CART-LINK CLICK: a first-writer-wins claim, taken WITHOUT a transaction.
 --
--- THE DEFECT THIS CLOSES. A Reap cart-link purchase (mig 226) is ONE sale that TWO channels can
+-- THE DEFECT THIS CLOSES. A Reap cart-link purchase (mig 229) is ONE sale that TWO channels can
 -- close. Reap reports it (services/reap_agentic_purchase._close_attribution closes under
 -- (merchant_domain, Reap orderId)). The merchant's own Shopify order ALSO carries our
 -- `pivota_click_id` cart attribute, because the permalink put it there, so the `orders/paid`
@@ -32,7 +32,7 @@
 -- Production deploys skip db/migrations/, so this statement is ALSO in
 -- db/schema_guard.ensure_required_schema_light, in its own try. The two builds are compared
 -- through the catalog by tests/test_reap_agentic_cart_link_postgres.py
--- (test_the_self_heal_builds_the_228_catalog_the_migration_builds).
+-- (test_the_self_heal_builds_the_230_catalog_the_migration_builds).
 
 CREATE TABLE IF NOT EXISTS conversion_click_claims (
     click_id TEXT PRIMARY KEY,

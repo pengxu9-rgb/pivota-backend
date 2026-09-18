@@ -65,12 +65,12 @@ _MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "db/migrations"
 _MIGRATIONS = (
     _MIGRATIONS_DIR / "224_reap_agentic_ledger.sql",
     _MIGRATIONS_DIR / "225_reap_agentic_purchase_hints.sql",
-    # 226 adds item_source + cart_url (the cart-link lane). Without it the whole-table parity
+    # 229 adds item_source + cart_url (the cart-link lane). Without it the whole-table parity
     # test compares a self-heal that HAS them against a migration build that does not.
-    _MIGRATIONS_DIR / "226_reap_agentic_purchase_item_source.sql",
-    # 228 builds the click-claims table. The self-heal builds it too, so the migration list
+    _MIGRATIONS_DIR / "229_reap_agentic_purchase_item_source.sql",
+    # 230 builds the click-claims table. The self-heal builds it too, so the migration list
     # applies it for parity with what the self-heal leaves behind.
-    _MIGRATIONS_DIR / "228_conversion_click_claims.sql",
+    _MIGRATIONS_DIR / "230_conversion_click_claims.sql",
 )
 
 # Same convention as tests/test_reap_agentic_ledger_postgres.py: this gate DROPS its tables, so

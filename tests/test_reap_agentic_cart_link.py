@@ -1,4 +1,4 @@
-"""The Reap agentic CART-LINK lane (mig 226), on SQLite.
+"""The Reap agentic CART-LINK lane (mig 229), on SQLite.
 
 Every case lives in tests/reap_cart_link_cases.py and is collected here AND in
 tests/test_reap_agentic_cart_link_postgres.py — the same functions under both engines, so the two
