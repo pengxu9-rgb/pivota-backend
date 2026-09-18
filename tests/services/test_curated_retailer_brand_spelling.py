@@ -40,16 +40,37 @@ def brand_on(host, vendor, override):
 @pytest.mark.parametrize("host,vendor", [
     ("sokoglam.com", "MANYO FACTORY"), ("ohlolly.com", "ma:nyo"), ("eyurs.com", "manyo"),
 ])
-def test_a_renamed_brand_is_written_under_the_operators_one_spelling(host, vendor):
-    assert brand_on(host, vendor, "Manyo") == "Manyo"
+@pytest.mark.parametrize("override", ["Manyo", "ma:nyo", "Manyo Factory", "MANYO"])
+def test_a_renamed_brand_is_written_under_the_catalogs_one_spelling(host, vendor, override):
+    """Whatever the operator typed for --brand, the family writes the spelling the catalog already
+    carries -- 78 brand-official rows as "Ma:nyo" (manyo.us). normalize_brand keeps punctuation, so
+    writing "Manyo" would split every retailer row from those official rows."""
+    assert brand_on(host, vendor, override) == "Ma:nyo"
+
+
+def test_the_family_spelling_joins_the_existing_official_rows_identity():
+    official = make_content_key("Ma:nyo", "Pure Cleansing Oil", None)          # the stored official rows
+    retail = make_content_key(brand_on("sokoglam.com", "MANYO FACTORY", "Manyo"), "Pure Cleansing Oil", None)
+    assert retail == official
+    # The control: the operator's plain spelling would NOT have joined them.
+    assert make_content_key("Manyo", "Pure Cleansing Oil", None) != official
+
+
+def test_one_family_never_relabels_another():
+    """Review finding: no test crossed two listed families, so a mutant writing ANY listed family
+    whenever the vendor was listed survived. A Purito product with --brand Manyo keeps its vendor."""
+    assert brand_on("ohlolly.com", "Purito", "Manyo") == "Purito"
+    assert brand_on("sokoglam.com", "MANYO FACTORY", "Purito Seoul") == "MANYO FACTORY"
 
 
 def test_every_host_of_a_renamed_brand_now_shares_one_content_key():
     """The point of the change, stated on the identity key itself: three retailers' spellings of
-    one product produce ONE content_key once each writes the operator's brand."""
+    one product, each run with a DIFFERENT --brand spelling, produce ONE content_key."""
     keys = {
-        make_content_key(brand_on(host, vendor, "Purito Seoul"), "Pure Fit Cica Cleansing Foam", None)
-        for host, vendor in (("sokoglam.com", "Purito Seoul"), ("eyurs.com", "Purito SEOUL"), ("ohlolly.com", "Purito"))
+        make_content_key(brand_on(host, vendor, override), "Pure Fit Cica Cleansing Foam", None)
+        for host, vendor, override in (("sokoglam.com", "Purito Seoul", "Purito Seoul"),
+                                       ("eyurs.com", "Purito SEOUL", "PURITO"),
+                                       ("ohlolly.com", "Purito", "purito seoul"))
     }
     assert len(keys) == 1
 
@@ -79,6 +100,10 @@ def test_an_unlisted_containing_spelling_keeps_the_vendor(vendor, override):
 def test_a_listed_family_does_not_absorb_an_unlisted_neighbour():
     # "Purito Plus" contains "purito" but is not a listed spelling of the family.
     assert brand_on("retailer.com", "Purito Plus", "Purito Seoul") == "Purito Plus"
+
+
+def test_every_family_has_exactly_one_canonical_spelling():
+    assert set(feed.RETAILER_BRAND_CANONICAL) == set(feed.RETAILER_BRAND_SPELLINGS.values())
 
 
 def test_case_and_punctuation_variants_still_collapse_as_before():
