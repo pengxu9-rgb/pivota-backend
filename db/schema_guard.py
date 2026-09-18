@@ -796,6 +796,24 @@ async def ensure_required_schema_light() -> None:
             except Exception:  # noqa: BLE001
                 # Best-effort like every sibling; must not starve what follows.
                 pass
+            # mig 227: Tier B cart-link eligibility. Early and in its own
+            # try, for the reasons the mig-207 block gives: this branch is ONE
+            # try, so being early means nothing upstream can starve it and
+            # being wrapped means a failure here cannot starve what follows.
+            # The DDL lives in db/tierb_cart_link_eligibility_schema (one
+            # definition, shared with the SQLite branch below); tests/
+            # test_tierb_cart_link_eligibility_postgres.py compares the schema
+            # it builds with db/migrations/227_* through the catalog.
+            try:
+                from db.tierb_cart_link_eligibility_schema import (
+                    ensure_schema as _ensure_tierb_cart_link_eligibility,
+                )
+
+                await _ensure_tierb_cart_link_eligibility()
+            except Exception:  # noqa: BLE001
+                # Loud elsewhere if it fails: the job's first write is an
+                # UndefinedTable error, and it exits non-zero.
+                pass
             # mig 215: collector token registry. Early and wrapped like its
             # siblings: the issue routes INSERT into these tables, so a deploy
             # that skips db/migrations/ would fail every token provisioning
@@ -2697,6 +2715,18 @@ async def ensure_required_schema_light() -> None:
             return
 
         if IS_SQLITE:
+            # mig 227: Tier B cart-link eligibility, SQLite twin — the same
+            # function as the Postgres branch; it picks the dialect's DDL.
+            # SQL-only (no SQLAlchemy Table) for the reason the mig-224 block
+            # below gives. Its own try, so it cannot starve what follows.
+            try:
+                from db.tierb_cart_link_eligibility_schema import (
+                    ensure_schema as _ensure_tierb_cart_link_eligibility,
+                )
+
+                await _ensure_tierb_cart_link_eligibility()
+            except Exception:  # noqa: BLE001
+                pass
             # mig 224: the Reap AGENTIC rail's two tables, SQLite twin.
             #
             # THE SQLITE BRANCH HAS ONLY EVER DONE `ADD COLUMN` UNTIL NOW, and
