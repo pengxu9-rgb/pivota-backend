@@ -384,6 +384,23 @@ def _cap(value: Any) -> Optional[str]:
     return text[:_CODE_MAX] or None
 
 
+#: THE LEDGER'S OWN SHAPE FOR `last_error_code`, written out here because only ONE of the two
+#: ledger functions that write the column enforces it: `release_claim` validates, and
+#: `transition` does not. So a code that fails this reaches the column silently through a
+#: transition and is then REJECTED the next time a release carries the same value — the column
+#: would hold a value its own writer refuses to write, which is the kind of asymmetry that only
+#: shows up under load.
+#:
+#: `_error_code` therefore enforces it on the way out, and
+#: `test_no_error_code_this_module_can_emit_fails_the_ledgers_shape` walks every literal in the
+#: module so the two cannot drift.
+ERROR_CODE_RE = re.compile(r"^[a-z0-9_:.-]{1,64}\Z")
+
+#: What an unrepresentable code becomes. NOT None: "there was an error we could not name" and
+#: "there was no error" are different facts, and the second one is what None already means.
+UNREPRESENTABLE_ERROR_CODE = "error_code_unrepresentable"
+
+
 def _error_code(value: Any) -> Optional[str]:
     """An error code for `last_error_code`: lowercased, trimmed to the column width, or None.
 
@@ -398,9 +415,34 @@ def _error_code(value: Any) -> Optional[str]:
     One fold, at the only place that writes the column. `refusal_reason` is deliberately NOT
     folded: it is a different column with a different vocabulary, and a reader matching on the
     client's reason strings would break.
+
+    ── AND IT ENFORCES THE LEDGER'S SHAPE, BECAUSE ONLY HALF THE LEDGER DOES ────────────────
+
+    `release_claim` validates `last_error_code` against `ERROR_CODE_RE`; `transition` does not.
+    A code that fails the pattern would therefore land in the column through a transition and be
+    REFUSED the next time a release carried the same value — a column holding a value its own
+    writer will not write.
+
+    Every source feeding this today is already inside the class (ours is snake_case, the partner
+    codes the client keeps are shape-checked `^[A-Z_]{3,64}$` before it keeps them, and its
+    transport codes are `transport_error:<PythonTypeName>`), so this is a guard against the
+    partner or the client changing, not against anything measured. An unrepresentable code
+    becomes `UNREPRESENTABLE_ERROR_CODE` rather than None: losing the fact that something went
+    wrong is worse than losing its name.
     """
-    text = str(value or "").strip().lower()
-    return text[:_CODE_MAX] or None
+    text = str(value or "").strip().lower()[:_CODE_MAX]
+    if not text:
+        return None
+    if not ERROR_CODE_RE.match(text):
+        # The code itself, capped hard. It is a scalar the client shape-checks, not a body — but
+        # by definition we are here because it was not the shape we expected, so it is truncated
+        # rather than trusted, and nothing else from the response goes anywhere near this line.
+        logger.warning(
+            "reap_agentic: refusing to store an error code outside the ledger's shape (%r)",
+            text[:32],
+        )
+        return UNREPRESENTABLE_ERROR_CODE
+    return text
 
 
 def _partner_id(value: Any, *, what: str, uuid: bool = False) -> Optional[str]:

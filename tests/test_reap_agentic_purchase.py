@@ -2381,3 +2381,109 @@ async def test_a_partner_status_is_recorded_verbatim_not_folded(reap, attributio
     enrollment = await ledger.get_active_enrollment("bref_alice")
     assert enrollment["reap_status"] == "ACTIVE"
     assert enrollment["card_network"] == "VISA"
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# 21. EVERY CODE THIS MODULE CAN EMIT FITS THE COLUMN'S SHAPE
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+#
+# The ledger validates `last_error_code` in `release_claim` and NOT in `transition`. So a code
+# outside the shape lands in the column through a transition, silently, and is then REFUSED the
+# next time a release carries the same value — the column would hold a value its own writer will
+# not write. These two tests are what keep the module's vocabulary and the ledger's pattern from
+# drifting apart, from both ends: the literals, and the fold.
+
+
+def _error_code_literals():
+    """Every string literal this module passes as `last_error_code=` or `error_code=`, read out
+    of the SOURCE by walking its AST.
+
+    WHY THE AST AND NOT A LIST WRITTEN OUT HERE. A list in the test is a list somebody has to
+    remember to extend, and the failure of forgetting is invisible — a new code with a capital
+    letter or a space in it would be stored by a transition and then rejected by the next
+    release, with nothing failing in between. Walking the source means adding a code to the
+    module IS adding it to this test."""
+    import ast
+    import pathlib
+
+    tree = ast.parse(pathlib.Path(svc.__file__).read_text(encoding="utf-8"))
+    out = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.keyword) and node.arg in ("last_error_code", "error_code"):
+            value = node.value
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                out.append((node.lineno, value.value))
+        # `QuoteCheck(False, "price_unverifiable", "quote_amounts_unreadable")` passes its code
+        # POSITIONALLY, so the keyword walk above cannot see it — and those are the four newest
+        # codes in the module.
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "QuoteCheck":
+            for index, arg in enumerate(node.args):
+                if index == 2 and isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                    out.append((node.lineno, arg.value))
+    return out
+
+
+def test_no_error_code_this_module_can_emit_fails_the_ledgers_shape():
+    literals = _error_code_literals()
+    # CONTROL: the walk found something. An empty list would make every assertion below vacuous,
+    # which is exactly how an AST-walking test rots when the code it reads is refactored.
+    assert len(literals) >= 20, f"the AST walk found only {len(literals)} codes; it is broken"
+    assert {"partner_id_malformed", "quote_expired", "quote_items_mismatch"} <= {
+        code for _, code in literals
+    }
+    bad = [(line, code) for line, code in literals if not svc.ERROR_CODE_RE.match(code)]
+    assert bad == [], f"codes the ledger's release_claim would refuse: {bad}"
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("ENROLLMENT_NOT_ACTIVE", "enrollment_not_active"),
+        ("AGENTIC_RESOURCE_NOT_FOUND", "agentic_resource_not_found"),
+        ("transport_error:ReadTimeout", "transport_error:readtimeout"),
+        ("reap_status_503", "reap_status_503"),
+        ("hosted_url_not_allowed", "hosted_url_not_allowed"),
+        ("  Quote_Expired  ", "quote_expired"),
+    ],
+)
+def test_every_shape_the_client_can_hand_us_folds_into_the_column(raw, expected):
+    """The three vocabularies that feed this column, each through `_error_code`. The partner's
+    codes are pinned UPPERCASE by the client's own `^[A-Z_]{3,64}$` check before it keeps them,
+    so the fold is the only thing making them groupable alongside ours."""
+    assert svc._error_code(raw) == expected
+    assert svc.ERROR_CODE_RE.match(expected)
+
+
+@pytest.mark.parametrize("raw", ["bad code!", "héllo", "a/b", "A B", "code\\n", "x" * 200])
+def test_a_code_outside_the_shape_becomes_a_named_placeholder_not_a_bad_write(raw, caplog):
+    """NOT None, and not the raw value. `transition` does not validate, so the raw value would be
+    written and then refused by the next `release_claim` carrying it. And None already means
+    "there was no error", which is a different fact from "there was an error we cannot name".
+
+    Nothing here is measured — every source feeding the column today is already inside the class.
+    This is the guard for the partner or the client changing, which on this rail has happened
+    twice without the version moving."""
+    caplog.set_level(logging.DEBUG)
+    folded = svc._error_code(raw)
+    assert folded is not None
+    assert svc.ERROR_CODE_RE.match(folded), f"{folded!r} would be refused by release_claim"
+    if len(raw) <= svc._CODE_MAX and raw.strip():
+        assert folded == svc.UNREPRESENTABLE_ERROR_CODE
+        assert any("outside the ledger's shape" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_partner_code_reaches_the_column_already_folded(reap, attribution):
+    """End to end, not just through the helper: the partner's `ENROLLMENT_NOT_ACTIVE` is written
+    by a TRANSITION, which does not validate — so if the fold were not applied at the call site
+    the column would carry a value `release_claim` refuses."""
+    reap.create_checkout = rc.ReapResponse(
+        ok=False, status=400, error="reap_status_400",
+        error_code="AGENTIC_REQUEST_REJECTED", error_detail_code="ENROLLMENT_NOT_ACTIVE",
+    )
+    await _active_enrollment()
+    purchase_id = await _start()
+    await _step(purchase_id)
+    await _step(purchase_id)
+    stored = (await _get(purchase_id))["last_error_code"]
+    assert stored == "enrollment_not_active"
+    assert svc.ERROR_CODE_RE.match(stored)
