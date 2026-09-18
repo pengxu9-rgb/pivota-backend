@@ -155,17 +155,94 @@ def test_unresolved_or_explained_leftovers_stop_the_run(key, value):
 
 
 @pytest.mark.parametrize(
-    "extra,reason",
+    "extra",
     [
-        ('{"error": "--only-gtin values matched no product in this run"}', "apply_error"),
-        ('{"crawl": {"status": "incomplete"}}', "crawl_incomplete"),
-        ("Traceback (most recent call last):", "traceback"),
+        "Traceback (most recent call last):",
+        "2026-09-18T02:59:12Z\tTraceback (most recent call last):",
+        "  + Exception Group Traceback (most recent call last):",
     ],
 )
-def test_a_failure_printed_anywhere_stops_even_a_clean_looking_report(extra, reason):
+def test_a_traceback_anywhere_stops_even_a_clean_looking_report(extra):
+    """Anywhere on the line: a fetch format with a timestamp prefix must not hide one."""
     verdict = evaluate_apply_log(_clean_text() + "\n" + extra + "\n")
     assert verdict["ok"] is False
-    assert reason in verdict["reasons"]
+    assert "traceback" in verdict["reasons"]
+
+
+def test_a_failed_job_stops_the_run_whatever_the_log_says():
+    """The runner appends `JOB=<id> RC=<n>`. A partial apply raises and exits 2, and its stderr
+    `{"error": ...}` line never reaches a fetched log (Cloud Run parses bare JSON into jsonPayload,
+    which the fetch prints blank) -- so the exit code is the only witness of the failure."""
+    verdict = evaluate_apply_log(_clean_text() + "\nJOB=oneoff-1-2 RC=2\n")
+    assert verdict["ok"] is False
+    assert "runner_failed" in verdict["reasons"]
+    assert verdict["runner_rc"] == 2
+
+
+def test_a_succeeded_job_with_a_clean_report_passes_and_records_the_rc():
+    verdict = evaluate_apply_log(_clean_text() + "\nJOB=oneoff-61425-664 RC=0\n")
+    assert verdict["ok"] is True, verdict["reasons"]
+    assert verdict["runner_rc"] == 0
+
+
+def test_a_lost_report_line_is_told_apart_from_a_failed_apply():
+    """Cloud Logging drops lines, and the report is the LAST line printed. With RC=0 the write
+    succeeded and the log is incomplete -- fetch it again; with RC!=0 the apply failed."""
+    plan_only = "\n".join(
+        line for line in _clean_text().splitlines()
+        if not (MARKER in line and '"applied"' in line)
+    )
+    lost = evaluate_apply_log(plan_only + "\nJOB=oneoff-1-2 RC=0\n")
+    assert lost["ok"] is False
+    assert lost["reasons"] == ["report_line_missing_from_logs"]
+
+    failed = evaluate_apply_log(plan_only + "\nJOB=oneoff-1-2 RC=2\n")
+    assert failed["ok"] is False
+    assert set(failed["reasons"]) == {"runner_failed", "no_post_apply_report"}
+
+
+def test_two_apply_reports_in_one_log_stop_the_run():
+    """Two hosts, or a failed attempt with a clean retry appended: judging only the last report
+    would pass a log whose earlier apply failed."""
+    post = [line for line in _clean_text().splitlines() if MARKER in line and '"applied"' in line]
+    verdict = evaluate_apply_log(_clean_text() + "\n" + post[0] + "\n")
+    assert verdict["ok"] is False
+    assert "multiple_apply_reports" in verdict["reasons"]
+
+
+def test_the_report_must_be_for_the_host_this_runner_applied():
+    assert evaluate_apply_log(_clean_text(), domain="eyurs.com")["ok"] is True
+    assert evaluate_apply_log(_clean_text(), domain="www.eyurs.com")["ok"] is True
+
+    wrong = evaluate_apply_log(_clean_text(), domain="ohlolly.com")
+    assert wrong["ok"] is False
+    assert "report_for_another_host" in wrong["reasons"]
+
+    def no_products(report):
+        report["applied"]["primary_readiness"]["products"] = []
+
+    empty = evaluate_apply_log(_with_post_apply(no_products), domain="eyurs.com")
+    assert empty["ok"] is False
+    assert "report_for_another_host" in empty["reasons"]
+
+
+def test_skus_explained_by_natural_key_dedupe_are_not_missing():
+    """Mirrors `require_primary_apply`: fewer SKUs than planned is acceptable ONLY up to the number
+    explicitly deduplicated on the natural key. The producer returns `applied` for this run; a gate
+    that stopped it would stop a clean multi-variant host."""
+    def deduped(report):
+        report["missing"]["skus"] = 1
+        report["applied"]["skus_deduped_same_identity"] = 1
+
+    assert evaluate_apply_log(_with_post_apply(deduped))["ok"] is True
+
+    def over(report):
+        report["missing"]["skus"] = 2
+        report["applied"]["skus_deduped_same_identity"] = 1
+
+    verdict = evaluate_apply_log(_with_post_apply(over))
+    assert verdict["ok"] is False
+    assert "missing_skus" in verdict["reasons"]
 
 
 def test_an_unparsable_report_line_is_a_reason_not_a_skip():
