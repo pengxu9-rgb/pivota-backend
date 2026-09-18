@@ -106,6 +106,9 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
+# Stdlib-only, like this module; the structural check `build_cart_link_quote_request` applies.
+from services.reap_cart_link import cart_link_line
+
 logger = logging.getLogger("reap_agentic_client")
 
 #: Hosts a base URL may name, as a suffix match. From the OpenAPI `servers` block:
@@ -1993,6 +1996,108 @@ async def resolve_variant(*, product_id: str, option_ids: Sequence[str], timeout
 async def request_quote(**kwargs: Any) -> ReapResponse:
     timeout = kwargs.pop("timeout_seconds", None)
     return await _post("/agentic/quotes", build_quote_request(**kwargs), timeout_seconds=timeout)
+
+
+# --- the cart-link quote (Tier B), WIRE NAME NOT YET PUBLISHED ------------------------------
+#
+# Reap confirmed on 2026-09-18 that `POST /agentic/quotes` will accept a Shopify cart permalink
+# "as received", in place of `items`. The feature ships the following week and THE BODY FIELD
+# THAT CARRIES THE URL HAS NOT BEEN PUBLISHED. This module has guessed a field name before --
+# PR #2136 sent `ucpItemId` where the spec said `variantId`, and Reap accepts unknown keys
+# silently with a 200 and drops them -- so a guessed name here would produce a quote request
+# that LOOKS like it carries the cart, a 200, and a quote for nothing.
+#
+# So the name is a constant that is None until the spec names it, and every entry point below
+# refuses while it is None. Setting it is a one-line change that must come with a spec diff
+# (scripts/ops/reap_spec_diff.py) showing the field; nothing reads it from the environment,
+# because an operator must not be able to guess it either.
+
+#: The `POST /agentic/quotes` body field for the cart permalink. None = not published yet.
+CART_LINK_QUOTE_FIELD: Optional[str] = None
+
+# A plain JSON identifier, and never one of the fields the quote body already carries: a value
+# of "email" would silently put the URL where the buyer's address goes.
+_CART_LINK_FIELD_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}\Z")
+_QUOTE_BODY_FIELDS = frozenset({"items", "email", "shippingAddress"})
+
+
+class CartLinkQuoteUnsupported(ReapRequestError):
+    """The cart-link quote cannot be built because Reap has not published its field name.
+
+    A `ReapRequestError` so every existing `except rc.ReapRequestError` still catches it; its own
+    type (and `code`) so a caller can tell "not yet possible" from "this request was malformed".
+    """
+
+    code = "cart_link_quote_unsupported"
+
+
+def _cart_link_field() -> Optional[str]:
+    """The configured field name if it is usable, else None. Read at CALL time, so a test (or the
+    one-line change that sets it) takes effect without a re-import."""
+    name = CART_LINK_QUOTE_FIELD
+    if not isinstance(name, str) or not _CART_LINK_FIELD_RE.match(name):
+        return None
+    if name in _QUOTE_BODY_FIELDS:
+        return None
+    return name
+
+
+def supports_cart_link_quote() -> bool:
+    """Can a cart-link quote be requested at all? False while `CART_LINK_QUOTE_FIELD` is None
+    (or is not a usable field name)."""
+    return _cart_link_field() is not None
+
+
+def build_cart_link_quote_request(
+    *,
+    cart_url: str,
+    email: str,
+    shipping_address: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """`POST /agentic/quotes` with a cart permalink instead of `items`.
+
+    `{<CART_LINK_QUOTE_FIELD>: cart_url, email, shippingAddress}` -- the email and address in
+    EXACTLY the shape `build_quote_request` sends (same email rule, same field-by-field address
+    whitelist via `build_shipping_address`), because that half of the schema is published.
+
+    THREE DIFFERENCES FROM THE `items` QUOTE, each on purpose:
+      * raises `CartLinkQuoteUnsupported` while the field name is unpublished -- see above;
+      * the shipping address is REQUIRED, not optional: on this lane the quote is our only proof
+        the merchant ships to the buyer at all, and a quote without an address proves nothing;
+      * the URL is re-checked STRUCTURALLY (`services.reap_cart_link.cart_link_line`): one line,
+        our click attribute, a `country=` pin, no `checkout[...]` key, no other key. The client
+        cannot know the row's click id or shop, so this is not the full validation -- the ledger
+        ran that before the row existed -- but it means the builder cannot be handed a URL
+        carrying PII even by a caller that skipped the ledger. The URL is NEVER named in a
+        message: a refused one may be carrying exactly that PII.
+    """
+    field_name = _cart_link_field()
+    if field_name is None:
+        raise CartLinkQuoteUnsupported(
+            "cart_link_quote_unsupported: Reap has not published the quote field for a cart "
+            "permalink; CART_LINK_QUOTE_FIELD is unset"
+        )
+    if cart_link_line(cart_url) is None:
+        raise ReapRequestError("cart_url is not a structurally valid cart link")
+    address = str(email or "").strip()
+    if not address or "@" not in address:
+        raise ReapRequestError("a quote needs a buyer email")
+    shipping = build_shipping_address(shipping_address)
+    if not shipping:
+        raise ReapRequestError("a cart-link quote needs a shipping address")
+    return {field_name: cart_url, "email": address, "shippingAddress": shipping}
+
+
+async def request_cart_link_quote(**kwargs: Any) -> ReapResponse:
+    """`request_quote`'s twin for a cart permalink. SAME TRANSPORT, not a copy of it: the same
+    `_post` to the same `/agentic/quotes` path, so the timeout (`_QUOTE_TIMEOUT_S`, via the path),
+    the time-bucketed Idempotency-Key over the whole body, the body-blind error handling, the
+    503 `merchant_probably_not_completable` inference, the streaming size cap and the
+    no-redirects rule are all the ones `request_quote` gets. Only the body builder differs."""
+    timeout = kwargs.pop("timeout_seconds", None)
+    return await _post(
+        "/agentic/quotes", build_cart_link_quote_request(**kwargs), timeout_seconds=timeout
+    )
 
 
 def details_for(details_payload: Any, product_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
