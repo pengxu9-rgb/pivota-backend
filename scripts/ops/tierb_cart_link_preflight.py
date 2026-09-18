@@ -1,7 +1,7 @@
 """Operator tool: run the Tier B cart-permalink preflight over a list of OUR merchants.
 
     python scripts/ops/tierb_cart_link_preflight.py merchants.json --out report.json
-    python scripts/ops/tierb_cart_link_preflight.py merchants.json --out report.json --no-buyer
+    python scripts/ops/tierb_cart_link_preflight.py merchants.json --out report.json --with-probe-buyer
     python scripts/ops/tierb_cart_link_preflight.py merchants.json --out report.json --only judydoll.com
 
 INPUT is a JSON list of `{domain, market, variant_id?, product_handle?}`. The key `variant` is
@@ -9,18 +9,27 @@ read as `variant_id`, so reports/tierb_cart_permalink_2026_09_18/population.json
 A row with neither a variant nor a handle is a merchant-level probe: the preflight picks the
 first representative variant in the store's catalog.
 
+MARKET IS REQUIRED PER ROW. Shopify's `available` is scoped to the market it resolves for the
+request, so each row's `market` is passed through and every catalog read pins `country=<market>`.
+Without it, availability would be read for THIS machine's market (podl.us read as sold out from
+a JP IP while it sells to the US). A row with a missing or malformed market comes back
+INVALID_INPUT.
+
 WHAT IT DOES TO EACH STORE. It reads the public product JSON and follows one cart permalink,
 which CREATES ONE ABANDONED CHECKOUT per merchant (per retry). Nothing is paid; no payment step
 is reached. Run it only over Pivota's own merchant list — never over a domain someone handed
 you (see services/shopify_cart_link_preflight.py).
 
-THE BUYER is synthetic, per market (the values the 2026-09-18 probe used: a registered-agent
-address in Wilmington DE, 1 Raffles Place, 1-1 Marunouchi, 10 Downing Street) with the
-placeholder mailbox ucp-probe@pivota.cc. `--no-buyer` skips the prefill entirely. A market with
-no probe buyer is refused, not given a foreign address.
+NO BUYER BY DEFAULT — that is the Reap path: the link carries only variant, qty and the click
+id, and the buyer's email and address travel in Reap's quote body. `--with-probe-buyer` opts in
+to the human-handoff prefill with a synthetic buyer per market (the values the 2026-09-18 probe
+used: a registered-agent address in Wilmington DE, 1 Raffles Place, 1-1 Marunouchi, 10 Downing
+Street) and the placeholder mailbox ucp-probe@pivota.cc. With it, a market with no probe buyer
+is refused, not given a foreign address.
 
-WHAT IT CANNOT TELL YOU: whether the store ships the item. ELIGIBLE means "lands on a prefilled
-checkout", and heartpercent.us (no US delivery) passes it. `shipping_verified` is always false.
+WHAT IT CANNOT TELL YOU: whether the store ships the item. ELIGIBLE means "lands on a checkout
+carrying our variant and click id", and heartpercent.us (no US delivery) passes it.
+`shipping_verified` is always false; on the Reap path the shipping proof is Reap's quote.
 
 There is no DB write. Concurrency is capped at 6. A TRANSPORT_ERROR is retried once — this
 machine's local proxy flakes, and a transport failure is never proof a store is ineligible.
@@ -88,7 +97,7 @@ def click_id_for(domain: str, stamp: str) -> str:
 async def run_rows(
     rows: List[Dict[str, Any]],
     *,
-    use_buyer: bool = True,
+    use_buyer: bool = False,
     concurrency: int = MAX_CONCURRENCY,
     preflight_fn: PreflightFn = preflight,
     retry_delay_s: float = RETRY_DELAY_S,
@@ -111,8 +120,9 @@ async def run_rows(
             while attempts < 2:
                 attempts += 1
                 result = await preflight_fn(
-                    row["domain"], variant_id=row["variant_id"], product_handle=row["product_handle"],
-                    quantity=1, buyer=buyer, click_id=click_id_for(row["domain"], stamp),
+                    row["domain"], market=row["market"], variant_id=row["variant_id"],
+                    product_handle=row["product_handle"], quantity=1, buyer=buyer,
+                    click_id=click_id_for(row["domain"], stamp),
                 )
                 if result.verdict is not Verdict.TRANSPORT_ERROR:
                     break
@@ -142,7 +152,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("input", help="JSON list of {domain, market, variant_id?, product_handle?}")
     ap.add_argument("--out", required=True, help="where to write the JSON report")
-    ap.add_argument("--no-buyer", action="store_true", help="do not prefill email/address")
+    ap.add_argument("--with-probe-buyer", action="store_true",
+                    help="prefill a synthetic buyer per market (human-handoff shape); default: no buyer")
     ap.add_argument("--concurrency", type=int, default=MAX_CONCURRENCY, help="capped at 6")
     ap.add_argument("--only", action="append", default=None, metavar="DOMAIN",
                     help="restrict to these domains (repeatable)")
@@ -158,10 +169,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         rows = [r for r in rows if r["domain"].lower() in wanted]
 
     started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    entries = asyncio.run(run_rows(rows, use_buyer=not args.no_buyer, concurrency=args.concurrency))
+    entries = asyncio.run(run_rows(rows, use_buyer=args.with_probe_buyer, concurrency=args.concurrency))
     report = {
         "generated_at": started,
-        "buyer": "none" if args.no_buyer else "synthetic_probe_per_market",
+        "buyer": "synthetic_probe_per_market" if args.with_probe_buyer else "none",
+        "market_scoped_availability": True,
         "shipping_verified": False,
         "note": "HTTP-only preflight: shipping rates load via JS and are NOT checked.",
         "counts": dict(Counter(e["result"]["verdict"] for e in entries)),

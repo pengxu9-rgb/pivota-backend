@@ -152,6 +152,7 @@ def cart_to_checkout(host="judydoll.com", vid=VID, body=None, status=200):
 
 async def run(store, host="judydoll.com", **kwargs):
     kwargs.setdefault("click_id", CLICK)
+    kwargs.setdefault("market", kwargs["buyer"].country if kwargs.get("buyer") else "US")
     async with store.client() as client:
         return await preflight(host, client=client, **kwargs)
 
@@ -175,6 +176,14 @@ async def test_judydoll_shape_is_eligible_with_buyer():
     # the permalink that went out really carried the prefill
     sent = str(store.hit("/cart/")[0].url)
     assert "checkout[email]=ucp-probe%40pivota.cc" in sent or "checkout%5Bemail%5D=ucp-probe%40pivota.cc" in sent
+
+
+def test_without_a_buyer_eligible_never_asks_for_email_or_address():
+    """The Reap path: no buyer in the link, so none can be expected on the page."""
+    body = checkout_body(email=None, address1=None)
+    assert EMAIL not in body and ADDR1 not in body
+    verdict, missing = _classify(f"https://s.com/checkouts/cn/{TOKEN}", body=body, buyer=None)
+    assert verdict is Verdict.ELIGIBLE and missing == ()
 
 
 async def test_eligible_without_a_buyer_needs_no_email_on_the_page():
@@ -550,6 +559,138 @@ async def test_with_nothing_named_and_nothing_representative_it_is_unavailable()
     assert store.hit("/cart/") == []
 
 
+# --- availability is read in the BUYER's market ------------------------------------------------
+#
+# Shopify scopes `available` to the market it resolves for the REQUEST. Measured on podl.us from a
+# JP IP (2026-09-18): any Accept-Language -> 0 available; no language header, or `&country=US`,
+# -> 2; `&country=JP` -> 0. These mocks reproduce that: `country=` decides when present, and only
+# without it does the request's own language header decide.
+
+PODL_VID = "43311735799882"
+
+
+def _market_available(request):
+    country = request.url.params.get("country")
+    if country is not None:
+        return country == "US"
+    return "accept-language" not in request.headers
+
+
+def podl_catalog(request):
+    available = _market_available(request)
+    return httpx.Response(200, json={"products": [{
+        "title": "Chestnut Balm-to-Foam Cleanser", "handle": "chestnut-balm-to-foam-cleanser",
+        "variants": [cvar(PODL_VID, available=available, price="20.00", title="1-Pack")],
+    }]} if request.url.params.get("page", "1") == "1" else {"products": []})
+
+
+def podl_product_js(request):
+    return httpx.Response(200, json={"title": "Chestnut Balm-to-Foam Cleanser", "variants": [
+        {"id": int(PODL_VID), "title": "1-Pack", "available": _market_available(request), "price": 2000},
+    ]})
+
+
+def _podl_store(**extra):
+    return Store({
+        ("podl.us", "/products.json"): podl_catalog,
+        ("podl.us", "/products/chestnut-balm-to-foam-cleanser.js"): podl_product_js,
+        **_login_routes("podl.us", PODL_VID, via_host="www.podl.global"),
+        **extra,
+    })
+
+
+@pytest.mark.parametrize("variant_id", [PODL_VID, None])
+async def test_catalog_availability_is_read_for_the_us_market(variant_id):
+    store = _podl_store()
+    result = await run(store, host="podl.us", market="US", variant_id=variant_id)
+    assert result.verdict is Verdict.LOGIN_REQUIRED, "available in US -> the permalink is followed"
+    assert result.variant_id == PODL_VID and result.market == "US"
+    assert [r.url.params.get("country") for r in store.hit("/products.json")] == ["US"]
+
+
+@pytest.mark.parametrize("variant_id", [PODL_VID, None])
+async def test_the_same_catalog_read_for_jp_is_unavailable(variant_id):
+    store = _podl_store()
+    result = await run(store, host="podl.us", market="JP", variant_id=variant_id)
+    assert result.verdict is Verdict.VARIANT_UNAVAILABLE
+    assert result.market == "JP"
+    assert store.hit("/cart/") == [], "no checkout for a variant the buyer's market cannot buy"
+    assert [r.url.params.get("country") for r in store.hit("/products.json")] == ["JP"]
+
+
+@pytest.mark.parametrize("variant_id", [PODL_VID, None])
+async def test_handle_availability_is_read_for_the_us_market(variant_id):
+    store = _podl_store()
+    result = await run(store, host="podl.us", market="US", variant_id=variant_id,
+                       product_handle="chestnut-balm-to-foam-cleanser")
+    assert result.verdict is Verdict.LOGIN_REQUIRED
+    assert [r.url.params.get("country") for r in store.hit("/products/")] == ["US"]
+    assert store.hit("/products.json") == []
+
+
+@pytest.mark.parametrize("variant_id", [PODL_VID, None])
+async def test_the_same_handle_read_for_jp_is_unavailable(variant_id):
+    store = _podl_store()
+    result = await run(store, host="podl.us", market="JP", variant_id=variant_id,
+                       product_handle="chestnut-balm-to-foam-cleanser")
+    assert result.verdict is Verdict.VARIANT_UNAVAILABLE
+    assert store.hit("/cart/") == []
+
+
+@pytest.mark.parametrize("accept_language", ["en-US,en;q=0.9", "ja-JP", "ko-KR", None])
+@pytest.mark.parametrize("path", ["catalog", "handle"])
+async def test_accept_language_no_longer_decides_availability(monkeypatch, accept_language, path):
+    headers = {"User-Agent": pf.USER_AGENT}
+    if accept_language is not None:
+        headers["Accept-Language"] = accept_language
+    monkeypatch.setattr(pf, "_HEADERS", headers)
+    store = _podl_store()
+    kwargs = dict(product_handle="chestnut-balm-to-foam-cleanser") if path == "handle" else {}
+    result = await run(store, host="podl.us", market="US", variant_id=PODL_VID, **kwargs)
+    assert result.verdict is Verdict.LOGIN_REQUIRED
+    # control: the header really varied on the wire
+    seen = {r.headers.get("accept-language") for r in store.requests}
+    assert seen == {accept_language}
+
+
+async def test_country_is_sent_on_every_catalog_page():
+    full_page = {"products": [{"title": f"P{i}", "variants": [cvar(str(10_000 + i))]} for i in range(250)]}
+    store = Store({("s.com", "/products.json"): products_json(full_page, full_page, catalog(cvar())),
+                   **cart_to_checkout(host="s.com")})
+    result = await run(store, host="s.com", market="SG", variant_id=VID)
+    assert result.verdict is Verdict.ELIGIBLE
+    pages = store.hit("/products.json")
+    assert [r.url.params.get("page") for r in pages] == ["1", "2", "3"]
+    assert [r.url.params.get("country") for r in pages] == ["SG", "SG", "SG"]
+
+
+async def test_country_survives_a_redirect_that_drops_or_rewrites_the_query():
+    """robinsons 301s products.json to www; a redirect may lose the query or carry another
+    market. Every hop is re-pinned to the buyer's market, exactly once."""
+    store = Store({
+        ("s.com", "/products.json"): redirect(301, "https://www.s.com/products.json?country=JP&limit=250&page=1"),
+        ("www.s.com", "/products.json"): products_json(catalog(cvar())),
+        ("s.com", "/products/x.js"): redirect(301, "https://www.s.com/products/x.js"),
+        ("www.s.com", "/products/x.js"): lambda r: httpx.Response(200, json={
+            "title": "X", "variants": [{"id": int(VID), "title": "A", "available": True, "price": 999}]}),
+        **cart_to_checkout(host="s.com"),
+    })
+    await run(store, host="s.com", market="US", variant_id=VID)
+    await run(store, host="s.com", market="US", variant_id=VID, product_handle="x")
+    reads = store.hit("/products")
+    assert len(reads) == 4
+    for request in reads:
+        assert request.url.params.get_list("country") == ["US"], str(request.url)
+
+
+def test_with_query_param_merges_and_replaces():
+    assert pf._with_query_param("https://s.com/p.json", "country", "US") == "https://s.com/p.json?country=US"
+    assert pf._with_query_param("https://s.com/p.json?limit=250&page=2", "country", "US") == (
+        "https://s.com/p.json?limit=250&page=2&country=US")
+    assert pf._with_query_param("https://s.com/p.json?country=JP&page=2", "country", "US") == (
+        "https://s.com/p.json?page=2&country=US")
+
+
 # --- PASSWORD_PAGE -------------------------------------------------------------------------
 
 
@@ -662,21 +803,45 @@ async def test_a_relative_location_is_resolved_against_the_current_hop():
     (dict(click_id="clk\r\nx"), "click_id_invalid"),
     (dict(buyer=CartPrefill(email="a@b", first_name="P", last_name="Q", address1="1", city="c", country="US")),
      "email_implausible"),
-    (dict(buyer=CartPrefill(email=EMAIL, first_name="P", last_name="Q", address1="1", city="c", country="USA")),
+    (dict(market="US", buyer=CartPrefill(email=EMAIL, first_name="P", last_name="Q", address1="1", city="c",
+                                         country="USA")),
      "country_not_iso2"),
+    (dict(market="USA"), "market_not_iso2"),
+    (dict(market="U1"), "market_not_iso2"),
+    (dict(market=""), "market_not_iso2"),
+    (dict(market=None), "market_not_iso2"),
+    (dict(market="US", buyer=CartPrefill(email=EMAIL, first_name="P", last_name="Q", address1="1", city="c",
+                                         country="JP")),
+     "buyer_country_not_market"),
+    (dict(market="jp", buyer=CartPrefill(email=EMAIL, first_name="P", last_name="Q", address1="1", city="c",
+                                         country="US")),
+     "buyer_country_not_market"),
 ])
 async def test_bad_input_is_refused_before_any_request(kwargs, detail):
     store = Store({})
     host = kwargs.pop("host", "s.com")
     result = await run(store, host=host, **kwargs)
     assert result.verdict is Verdict.INVALID_INPUT and result.detail == detail
+    assert result.market is None
     assert store.requests == []
+
+
+def test_market_is_a_required_keyword():
+    with pytest.raises(TypeError):
+        asyncio.run(preflight("s.com", click_id=CLICK))  # type: ignore[call-arg]
+
+
+async def test_a_lowercase_market_matching_the_buyer_is_accepted():
+    store = Store({("judydoll.com", "/products.json"): products_json(catalog(cvar())), **cart_to_checkout()})
+    result = await run(store, variant_id=VID, buyer=BUYER, market="us")
+    assert result.verdict is Verdict.ELIGIBLE and result.market == "US"
+    assert all(r.url.params.get("country") == "US" for r in store.hit("/products.json"))
 
 
 async def test_without_an_injected_client_the_suite_guard_blocks_the_real_network():
     """Control for the autouse guard: a preflight that builds its own client must be stopped."""
     with pytest.raises(AssertionError, match="un-mocked network request"):
-        await preflight("judydoll.com", variant_id=VID, click_id=CLICK)
+        await preflight("judydoll.com", market="US", variant_id=VID, click_id=CLICK)
 
 
 # --- PII: nothing emitted during a run carries the buyer's email or address ------------------
@@ -812,18 +977,60 @@ async def test_script_retries_a_transport_error_exactly_once(sequence, attempts,
     assert out[0]["result"]["verdict"] == final
 
 
-async def test_script_buyer_modes():
+async def test_script_defaults_to_no_buyer_the_reap_path():
     script = _load_script()
     calls = []
     rows = [script.normalize_row({"domain": "a.com", "market": "US"}),
             script.normalize_row({"domain": "b.com", "market": "FR"})]
-    out = await script.run_rows(rows, preflight_fn=_fake([], calls), retry_delay_s=0)
+    await script.run_rows(rows, preflight_fn=_fake([], calls), retry_delay_s=0)
+    assert [c[1]["buyer"] for c in calls] == [None, None]
+
+
+async def test_script_probe_buyer_is_opt_in_and_never_foreign():
+    script = _load_script()
+    calls = []
+    rows = [script.normalize_row({"domain": "a.com", "market": "US"}),
+            script.normalize_row({"domain": "b.com", "market": "FR"})]
+    out = await script.run_rows(rows, use_buyer=True, preflight_fn=_fake([], calls), retry_delay_s=0)
     assert calls[0][1]["buyer"] is script.PROBE_BUYERS["US"]
     assert len(calls) == 1, "a market with no probe buyer is refused, not sent a foreign address"
     assert out[1]["result"]["verdict"] == "INVALID_INPUT"
-    calls.clear()
-    await script.run_rows(rows, use_buyer=False, preflight_fn=_fake([], calls), retry_delay_s=0)
-    assert [c[1]["buyer"] for c in calls] == [None, None]
+
+
+@pytest.mark.parametrize("argv_extra,use_buyer", [([], False), (["--with-probe-buyer"], True)])
+def test_script_cli_buyer_is_opt_in(tmp_path, monkeypatch, argv_extra, use_buyer):
+    script = _load_script()
+    seen = {}
+
+    async def fake_run_rows(rows, **kwargs):
+        seen.update(kwargs, rows=rows)
+        return []
+
+    monkeypatch.setattr(script, "run_rows", fake_run_rows)
+    src = tmp_path / "in.json"
+    src.write_text(json.dumps([{"domain": "podl.us", "market": "US"}]))
+    out = tmp_path / "out.json"
+    assert script.main([str(src), "--out", str(out), *argv_extra]) == 0
+    assert seen["use_buyer"] is use_buyer
+    report = json.loads(out.read_text())
+    assert report["buyer"] == ("synthetic_probe_per_market" if use_buyer else "none")
+    assert report["shipping_verified"] is False
+
+
+def test_script_cli_no_longer_accepts_no_buyer(tmp_path):
+    script = _load_script()
+    with pytest.raises(SystemExit):
+        script.main([str(tmp_path / "in.json"), "--out", str(tmp_path / "o.json"), "--no-buyer"])
+
+
+async def test_script_passes_each_rows_market():
+    script = _load_script()
+    calls = []
+    rows = [script.normalize_row({"domain": "a.com", "market": "us"}),
+            script.normalize_row({"domain": "b.jp", "market": "JP"}),
+            script.normalize_row({"domain": "c.sg", "market": "SG"})]
+    await script.run_rows(rows, preflight_fn=_fake([], calls), retry_delay_s=0)
+    assert sorted((host, kw["market"]) for host, kw in calls) == [("a.com", "US"), ("b.jp", "JP"), ("c.sg", "SG")]
 
 
 async def test_script_concurrency_never_exceeds_six():

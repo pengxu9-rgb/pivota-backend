@@ -3,14 +3,29 @@
 WHY THIS EXISTS. "Tier B" Shopify merchants price a cart through their UCP (agent checkout)
 door but refuse agent completion (`requires_escalation`: `extension_interaction_required`,
 `redirect_to_checkout_required`, `customer_account_required`). What Reap CAN complete for them
-is the storefront's own checkout, reached through a cart permalink that prefills the buyer:
+is the storefront's own checkout, reached through a cart permalink:
 
     https://{host}/cart/{variant}:{qty}?attributes[pivota_click_id]=clk_...
-        &checkout[email]=...&checkout[shipping_address][first_name]=...
 
 Measured 2026-09-18 over 40 Tier B merchants: 36 landed on `/checkouts/cn/<token>/...` with the
-email, address, click id and variant all on the page. The rest failed in four distinct ways, and
-this module names each one instead of reporting a bare "no" (see `Verdict`).
+click id and variant on the page (and, when prefilled, the email and address too). The rest
+failed in four distinct ways, and this module names each one instead of reporting a bare "no"
+(see `Verdict`).
+
+THE REAP PATH CARRIES NO BUYER PII IN THE LINK: call this with `buyer=None`. Reap's quote
+endpoint (`POST /agentic/quotes`) takes the cart URL as received, and the buyer's email and
+shipping address travel in the quote BODY. The `buyer=` prefill (`checkout[email]`,
+`checkout[shipping_address][...]`) exists for a HUMAN handoff only. Without a buyer, ELIGIBLE
+never requires an email or address on the page.
+
+AVAILABILITY IS MARKET-SCOPED. Shopify's storefront `available` flag is computed for the market
+Shopify resolves for the REQUEST (egress IP + Accept-Language), not for the buyer. Measured on
+podl.us from a JP-geolocated machine: `products.json` with any Accept-Language showed 0 available
+variants; with `&country=US`, 2. Every catalog and handle read here therefore pins
+`country=<market>`, so this preflight answers "available in THIS market". Read without the
+buyer's market it would report the SERVER's market instead (prod egress is US, a laptop may be
+JP) — which is why `market` is a required argument and must equal the buyer's country when a
+buyer is given.
 
 THE ONE SIDE EFFECT. Following the permalink CREATES AN ABANDONED SHOPIFY CHECKOUT on the
 merchant's store — the same side effect as every UCP probe before it. Nothing else is written,
@@ -29,10 +44,11 @@ HTML and loads rates with JavaScript, so no HTTP-only check can prove a rate exi
 the same day: heartpercent.us (no delivery to the US for the item) and anua.us / skin1004.com
 (qty 1 below a basket minimum, "Shipping not available") all land prefilled and therefore pass
 this preflight as ELIGIBLE. `PreflightResult.shipping_verified` is always False for that reason;
-shipping must be proven downstream (the UCP priced step or a real browser) before a buyer is
-sent to pay.
+shipping must be proven downstream before a buyer is sent to pay — on the Reap path that proof
+is Reap's quote (`shippingOptions` + `amountBreakdown`); a quote with no shipping option is not
+eligible.
 
-PII. The permalink carries the buyer's email and address. Every URL this module records or logs
+PII. A prefilled permalink carries the buyer's email and address. Every URL this module records or logs
 goes through `redact_cart_permalink` first, and while a preflight runs, the HTTP client's own
 logging (httpx prints the full URL at INFO; httpcore prints response headers, `Location`
 included, at DEBUG) is redacted by a filter scoped to the preflight's context — see
@@ -49,9 +65,9 @@ import ipaddress
 import json
 import logging
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote, urljoin, urlparse
+from urllib.parse import quote, unquote_plus, urljoin, urlparse, urlunparse
 
 import httpx
 
@@ -135,6 +151,7 @@ class PreflightResult:
     host: str
     verdict: Verdict
     retryable: bool = False
+    market: Optional[str] = None  # the market `available` was read for (None if refused)
     variant_id: Optional[str] = None
     variant_source: Optional[str] = None  # "caller" | "product" | "catalog"
     variant_title: Optional[str] = None
@@ -285,13 +302,30 @@ async def _read_bounded(response: httpx.Response) -> str:
     return b"".join(chunks).decode(response.encoding or "utf-8", errors="replace")
 
 
-async def _fetch_following(client: httpx.AsyncClient, url: str) -> _Landing:
+def _with_query_param(url: str, key: str, value: str) -> str:
+    """`url` with exactly one `key=value`, merged into whatever query it already has (an
+    existing `key` is replaced, never duplicated)."""
+    parsed = urlparse(url)
+    kept = [p for p in parsed.query.split("&") if p and unquote_plus(p.partition("=")[0]) != key]
+    kept.append(f"{key}={quote(value, safe='')}")
+    return urlunparse(parsed._replace(query="&".join(kept)))
+
+
+async def _fetch_following(
+    client: httpx.AsyncClient, url: str, *, pin_params: Optional[Dict[str, str]] = None
+) -> _Landing:
     """GET `url`, following redirects BY HAND (at most MAX_REDIRECT_HOPS requests), recording
     every hop REDACTED. Cross-host redirects are followed — poopourri.com lands on pourri.com
-    via shop.app — but only to https on a DNS name."""
+    via shop.app — but only to https on a DNS name.
+
+    `pin_params` are merged into EVERY hop's query, not just the first: a storefront that 301s
+    `products.json` to another host (robinsons -> www) may drop the query on the way, and a
+    catalog read that loses `country=` silently answers for the server's market instead."""
     chain: List[Hop] = []
     current = url
     for _ in range(MAX_REDIRECT_HOPS):
+        for key, value in (pin_params or {}).items():
+            current = _with_query_param(current, key, value)
         refusal = _hop_refusal(current)
         if refusal:
             raise _HopRefused(refusal, chain)
@@ -437,11 +471,19 @@ def _representative(product: Dict[str, Any], variant: Dict[str, Any]) -> bool:
 
 
 async def _resolve_from_handle(
-    client: httpx.AsyncClient, host: str, handle: str, variant_id: Optional[str], res: _Resolution
+    client: httpx.AsyncClient,
+    host: str,
+    handle: str,
+    variant_id: Optional[str],
+    market: str,
+    res: _Resolution,
 ) -> bool:
     """True when the handle settled the question (chosen or terminal verdict); False to fall
-    back to the catalog scan (only when the handle 404s and the caller named a variant)."""
-    landing = await _fetch_following(client, f"https://{host}/products/{quote(handle, safe='')}.js")
+    back to the catalog scan (only when the handle 404s and the caller named a variant).
+    `available` is read for `market` (`country=` pinned on every hop)."""
+    landing = await _fetch_following(
+        client, f"https://{host}/products/{quote(handle, safe='')}.js", pin_params={"country": market}
+    )
     res.chain.extend(landing.chain)
     wall = _landing_wall(landing)
     if wall:
@@ -485,13 +527,16 @@ async def _resolve_from_handle(
 
 
 async def _resolve_from_catalog(
-    client: httpx.AsyncClient, host: str, variant_id: Optional[str], res: _Resolution
+    client: httpx.AsyncClient, host: str, variant_id: Optional[str], market: str, res: _Resolution
 ) -> None:
-    """Scan `/products.json` page by page. Following redirects matters: robinsons.com.sg and
-    podl.us 301 this path to another host, and the first probe mistook that for no catalog."""
+    """Scan `/products.json` page by page, EVERY page read for `market` (`country=` pinned on
+    every hop). Following redirects matters: robinsons.com.sg 301s this path to another host,
+    and the first probe mistook that for no catalog."""
     for page in range(1, MAX_CATALOG_PAGES + 1):
         landing = await _fetch_following(
-            client, f"https://{host}/products.json?limit={CATALOG_PAGE_SIZE}&page={page}"
+            client,
+            f"https://{host}/products.json?limit={CATALOG_PAGE_SIZE}&page={page}",
+            pin_params={"country": market},
         )
         res.chain.extend(landing.chain)
         wall = _landing_wall(landing)
@@ -547,16 +592,20 @@ async def _resolve_from_catalog(
 
 
 async def _resolve_variant(
-    client: httpx.AsyncClient, host: str, variant_id: Optional[str], product_handle: Optional[str]
+    client: httpx.AsyncClient,
+    host: str,
+    variant_id: Optional[str],
+    product_handle: Optional[str],
+    market: str,
 ) -> _Resolution:
     """Confirm the caller's variant, or pick one. NEVER substitutes a variant the caller did not
     name: a named variant that is gone or unavailable is reported as such. Without a named
     variant, a handle confines the pick to that product; with neither, the pick is the first
     representative variant in the catalog (a merchant-level probe)."""
     res = _Resolution()
-    if product_handle and await _resolve_from_handle(client, host, product_handle, variant_id, res):
+    if product_handle and await _resolve_from_handle(client, host, product_handle, variant_id, market, res):
         return res
-    await _resolve_from_catalog(client, host, variant_id, res)
+    await _resolve_from_catalog(client, host, variant_id, market, res)
     return res
 
 
@@ -564,11 +613,13 @@ async def _resolve_variant(
 
 
 def _input_refusal(
-    host: str, variant_id: Any, product_handle: Any, quantity: Any, buyer: Any, click_id: Any
+    host: str, market: Any, variant_id: Any, product_handle: Any, quantity: Any, buyer: Any, click_id: Any
 ) -> Optional[str]:
     refusal = _host_refusal(host)
     if refusal:
         return refusal
+    if not isinstance(market, str) or not re.fullmatch(r"[A-Za-z]{2}", market):
+        return "market_not_iso2"
     if variant_id is not None and not extract_shopify_numeric_variant_id(str(variant_id)):
         return "variant_id_not_numeric"
     if product_handle is not None and not re.fullmatch(r"[^/?#\s]{1,255}", str(product_handle)):
@@ -579,13 +630,20 @@ def _input_refusal(
     if not cid.strip() or len(cid) > 256 or re.search(r"[\x00-\x1f\x7f]", cid):
         return "click_id_invalid"
     if buyer is not None:
-        return cart_prefill_refusal(buyer)
+        refusal = cart_prefill_refusal(buyer)
+        if refusal:
+            return refusal
+        # Refused, not reconciled: availability is read for `market`, the checkout ships to the
+        # buyer's country, and a mismatch would answer a question nobody asked.
+        if buyer.country.strip().upper() != market.upper():
+            return "buyer_country_not_market"
     return None
 
 
 async def preflight(
     host: str,
     *,
+    market: str,
     variant_id: Optional[str] = None,
     product_handle: Optional[str] = None,
     quantity: int = 1,
@@ -595,6 +653,11 @@ async def preflight(
 ) -> PreflightResult:
     """Resolve a live variant, follow its (optionally prefilled) cart permalink, classify.
 
+    `market` (ISO-2, required) is the BUYER's market: `available` is read for it, because
+    Shopify scopes availability to the market it resolves for the request. With a buyer,
+    `buyer.country` must equal `market`. The Reap path passes `buyer=None` (the buyer travels
+    in Reap's quote body, not in the link).
+
     Only for hosts on Pivota's internal merchant list — see the module docstring. Creates one
     abandoned checkout per call that reaches the permalink step. Never raises for a network
     outcome: transport failures come back as TRANSPORT_ERROR with retryable=True.
@@ -603,15 +666,20 @@ async def preflight(
     token = _PREFLIGHT_ACTIVE.set(True)
     try:
         if client is not None:
-            return await _preflight(host, variant_id, product_handle, quantity, buyer, click_id, client)
-        async with httpx.AsyncClient(headers=_HEADERS, timeout=REQUEST_TIMEOUT_S) as own:
-            return await _preflight(host, variant_id, product_handle, quantity, buyer, click_id, own)
+            result = await _preflight(host, market, variant_id, product_handle, quantity, buyer, click_id, client)
+        else:
+            async with httpx.AsyncClient(headers=_HEADERS, timeout=REQUEST_TIMEOUT_S) as own:
+                result = await _preflight(host, market, variant_id, product_handle, quantity, buyer, click_id, own)
     finally:
         _PREFLIGHT_ACTIVE.reset(token)
+    if result.verdict is Verdict.INVALID_INPUT:
+        return result
+    return replace(result, market=market.upper())
 
 
 async def _preflight(
     raw_host: str,
+    raw_market: Any,
     variant_id: Optional[str],
     product_handle: Optional[str],
     quantity: int,
@@ -620,13 +688,14 @@ async def _preflight(
     client: httpx.AsyncClient,
 ) -> PreflightResult:
     host = normalize_shop_host(raw_host)
-    refusal = _input_refusal(host, variant_id, product_handle, quantity, buyer, click_id)
+    refusal = _input_refusal(host, raw_market, variant_id, product_handle, quantity, buyer, click_id)
     if refusal:
         return _done(PreflightResult(host=host, verdict=Verdict.INVALID_INPUT, detail=refusal))
+    market = raw_market.upper()
     named = extract_shopify_numeric_variant_id(str(variant_id)) if variant_id is not None else None
 
     try:
-        resolution = await _resolve_variant(client, host, named, product_handle)
+        resolution = await _resolve_variant(client, host, named, product_handle, market)
     except _TransportFailure as exc:
         return _done(PreflightResult(
             host=host, verdict=Verdict.TRANSPORT_ERROR, retryable=True,
