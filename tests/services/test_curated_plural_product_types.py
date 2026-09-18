@@ -1,142 +1,148 @@
-"""Plural merchant product types must resolve -- and must not invent a category on the way.
+"""Measured (host, merchant product_type) shelves resolve -- and only where somebody read them.
 
 Every CATEGORY_PATTERNS entry matches the SINGULAR noun, so a merchant filing products under
 "Cleansers" / "Sheet Masks" / "Serums" resolved to nothing, and one unresolved row blocks its whole
-curated cohort. Measured 2026-09-18 over every product of three US K-beauty Shopify hosts
-(eyurs.com 434, ohlolly.com 510, sokoglam.com 567): eyurs resolved 204 before and 387 after;
-ohlolly 456 -> 479; sokoglam 477 -> 478; and NO product that resolved before changed.
+curated cohort. Measured 2026-09-18 over every product on eyurs.com (434), ohlolly.com (510) and
+sokoglam.com (567): resolved 204 -> 387, 456 -> 479, 477 -> 478; and -- checked under two flags --
+nothing that resolved before changed and no deliberate refusal was overridden.
 
-The titles below are the real ones from that crawl. Each negative case is a way the first draft
-of this door would have lied: eyurs files "Pyunkang Yul Essence Toner" under "Cleansers"; the
-toner pattern's "pad" turned "Cotton Pads" into a toner; the facial mask pattern turned a foot
-peel into a facial mask.
+A first draft used a general plural-singularising DOOR. Review showed it gave confident wrong
+leaves on hosts nobody had read and changed rows the evidence policy already resolved; the
+adversarial inputs below are that review's, and each must now resolve EXACTLY as the evidence
+policy alone does. Titles are the real ones from the crawl unless marked.
 """
 import pytest
 
 from services import curated_brand_feed as feed
 
-LEAF = feed.CATEGORY_CONFIDENCE_MERCHANT_TYPE
+MEASURED = feed.CATEGORY_CONFIDENCE_MEASURED_HOST_TYPE
 FEED_DEFAULT = feed.CATEGORY_CONFIDENCE_FEED_DEFAULT
 
 
-def resolve(product_type, title, flag_path="beauty"):
-    return feed._resolve_category(product_type=product_type, title=title, flag_path=flag_path)
+def resolve(product_type, title, domain, flag_path="beauty"):
+    return feed._resolve_category(product_type=product_type, title=title, flag_path=flag_path, domain=domain)
 
 
-@pytest.mark.parametrize("ptype,title,want", [
-    ("Sheet Masks", "Beauty of Joseon Centella Asiatica Calming Sheet Mask", "beauty/skincare/treat/mask"),
-    ("Moisturizers", "Pyunkang Yul Nutrition Cream (100ml)", "beauty/skincare/moisturize/cream"),
-    ("Serums", "Beauty of Joseon Glow Serum: Propolis + Niacinamide (30ml)", "beauty/skincare/treat/serum"),
-    ("Cleansers", "Pyunkang Yul Deep Clear Cleansing Balm", "beauty/skincare/cleanse/cleanser"),
-    ("Toners", "SOME BY MI AHA-BHA-PHA 30 Days Miracle Toner (150ml)", "beauty/skincare/tone/toner"),
-    ("Oil Cleansers", "Beauty of Joseon Ginseng Cleansing Oil (210ml)", "beauty/skincare/cleanse/cleanser"),
-    ("Lip Balms", "Phyto-Glow Lip Balm SPF 45", "beauty/makeup/lip/balm"),
+def evidence_only(product_type, title, flag_path="beauty"):
+    return feed._resolve_category_by_evidence(product_type=product_type, title=title, flag_path=flag_path)
+
+
+@pytest.mark.parametrize("domain,ptype,title,want", [
+    ("eyurs.com", "Sheet Masks", "Beauty of Joseon Centella Asiatica Calming Sheet Mask", "beauty/skincare/treat/mask"),
+    ("eyurs.com", "Moisturizers", "Pyunkang Yul Nutrition Cream (100ml)", "beauty/skincare/moisturize/cream"),
+    ("eyurs.com", "Serums", "Beauty of Joseon Glow Serum: Propolis + Niacinamide (30ml)", "beauty/skincare/treat/serum"),
+    ("eyurs.com", "Cleansers", "Pyunkang Yul Deep Clear Cleansing Balm", "beauty/skincare/cleanse/cleanser"),
+    ("eyurs.com", "Ampoules", "SKIN1004 Madagascar Centella Asiatica 100 Ampoule", "beauty/skincare/treat/serum"),
+    ("ohlolly.com", "Wash Off Mask", "Beauty of Joseon Red Bean Refreshing Pore Mask", "beauty/skincare/treat/mask"),
+    ("ohlolly.com", "Sleeping Pack", "Cosrx Ultimate Nourishing Rice Overnight Spa Mask", "beauty/skincare/treat/mask"),
+    ("ohlolly.com", "Sun Care", "Isntree Hyaluronic Acid Daily Sun Gel", "beauty/skincare/sun/sunscreen"),
+    ("sokoglam.com", "Lip Balms", "Phyto-Glow Lip Balm SPF 45", "beauty/makeup/lip/balm"),
 ])
-def test_a_plural_merchant_type_resolves_to_its_singular_leaf(ptype, title, want):
-    assert resolve(ptype, title) == (want, LEAF)
+def test_a_measured_shelf_resolves_its_products(domain, ptype, title, want):
+    assert resolve(ptype, title, domain) == (want, MEASURED)
 
 
-def test_a_title_that_says_nothing_does_not_stop_the_merchant_type():
-    # The title names no leaf at all: the merchant's shelf is the only evidence, and it is enough.
-    assert resolve("Serums", "Pyunkang Yul 100")[0] == "beauty/skincare/treat/serum"
+def test_the_measured_leaf_carries_its_own_confidence():
+    # Below a merchant type that names its class directly: a reader must tell the two apart.
+    assert feed.CATEGORY_CONFIDENCE_FEED_DEFAULT < MEASURED < feed.CATEGORY_CONFIDENCE_MERCHANT_TYPE
 
 
-def test_the_title_naming_a_different_leaf_refuses_rather_than_guessing():
-    """eyurs.com files its Essence Toner under "Cleansers". A plural alias would have filed a
-    toner as a cleanser with confidence; the door returns the honest unresolved answer instead,
-    and it does NOT fall back to the title's own guess either."""
-    assert resolve("Cleansers", "Pyunkang Yul Essence Toner (100ml)") == ("", FEED_DEFAULT)
-    assert resolve("Masks", "NEOGEN Dermalogy Real Bakuchiol Firming Serum (30ml)") == ("", FEED_DEFAULT)
+@pytest.mark.parametrize("domain", [None, "", "unknown-retailer.com", "sokoglam.com"])
+def test_a_shelf_name_means_nothing_on_a_host_nobody_read(domain):
+    # sokoglam never measured "Serums"; an unknown host never measured anything.
+    assert resolve("Serums", "Glow Serum", domain) == evidence_only("Serums", "Glow Serum")
 
 
-@pytest.mark.parametrize("ptype,title", [
+@pytest.mark.parametrize("domain", ["https://www.eyurs.com/", "EYURS.COM", "www.eyurs.com"])
+def test_the_host_is_matched_however_it_is_spelled(domain):
+    assert resolve("Serums", "Glow Serum", domain)[0] == "beauty/skincare/treat/serum"
+
+
+def test_a_title_naming_another_leaf_steps_the_shelf_aside():
+    """eyurs files its Essence Toner under "Cleansers". The shelf is evidence about the shelf; the
+    product's own title outranks it -- and the shelf then contributes NOTHING, rather than forcing
+    an unresolved "" onto a row the evidence policy would have answered."""
+    assert resolve("Cleansers", "Pyunkang Yul Essence Toner (100ml)", "eyurs.com") == evidence_only(
+        "Cleansers", "Pyunkang Yul Essence Toner (100ml)")
+
+
+def test_a_title_naming_another_leaf_on_a_broad_shelf_is_not_forced_in():
+    # Review case: "Sun Care" is a broad retail shelf. A tanning mousse on it is not a sunscreen.
+    assert resolve("Sun Care", "Self Tanning Mousse", "ohlolly.com")[0] != "beauty/skincare/sun/sunscreen"
+
+
+def test_a_callers_explicit_leaf_still_wins_where_the_title_disagrees():
+    """Review finding: the draft door returned "" here and dropped the caller's leaf, which would
+    block the whole cohort. A leaf flag the evidence policy honours is returned untouched."""
+    flag = "beauty/skincare/tone/toner"
+    assert resolve("Cleansers", "Pyunkang Yul Essence Toner", "eyurs.com", flag) == evidence_only(
+        "Cleansers", "Pyunkang Yul Essence Toner", flag)
+    assert resolve("Cleansers", "Pyunkang Yul Essence Toner", "eyurs.com", flag)[0] == flag
+
+
+# The review's adversarial inputs. On ANY host -- including the measured ones, whose tables do not
+# list these shelves -- each must resolve exactly as the evidence policy alone does.
+ADVERSARIAL = [
+    ("Masks", "Silicone Mask Brush"),               # the tool title resolves before any shelf
+    ("Cleansers", "Konjac Cleansing Brush"),
+    ("Masks & Peels", "Honey Overnight Pack"),       # the multi-use guard
+    ("Cleansers & Toners", "Plain Title"),
+    ("Pads", "Makeup Remover Rounds"),
+    ("Lash Serums", "Lash Growth Serum"),
+    ("Pet Shampoos", "Dog Shampoo"),
+    ("Kits", "Brow Kit"),
+    ("Polishes", "Nail Polish"),
+    ("Scrubs", "Coconut Body Scrub"),
     ("Cotton Pads", "Pyunkang Yul 1/3 Cotton Pads (160pcs)"),
     ("Foot Masks", "PUREDERM Shiny & Soft Foot Peeling Mask (1 Pair)"),
-    ("Hand Masks", "Moisturizing Hand Mask"),
-    ("Body Serums", "Glow Body Serum"),
-])
-def test_a_body_area_or_accessory_material_is_not_rescued_as_face_care(ptype, title):
-    """Measured: "Cotton Pads" matched the toner pattern through "pad" and "Foot Masks" matched the
-    facial mask. The door rescues face-care nouns; these name another shelf and stay unresolved."""
-    path, confidence = resolve(ptype, title)
-    assert path == "beauty"
-    assert confidence == FEED_DEFAULT
+]
 
 
-def test_a_plural_the_patterns_still_cannot_classify_stays_unresolved():
-    assert resolve("Accessories", "Makeup Pouch") == ("beauty", FEED_DEFAULT)
+@pytest.mark.parametrize("domain", ["eyurs.com", "ohlolly.com", "sokoglam.com", "unknown.com"])
+@pytest.mark.parametrize("ptype,title", ADVERSARIAL)
+def test_unmeasured_shelves_resolve_exactly_as_the_evidence_policy_does(domain, ptype, title):
+    assert resolve(ptype, title, domain) == evidence_only(ptype, title)
 
 
-def test_a_generic_plural_shelf_is_not_a_product_class():
-    # "lip treatments" is deliberately generic: only an explicit lip-oil title refines it.
-    assert resolve("Lip Treatments", "Dr. Ceuracle Vegan Kombucha Tea Lip Balm") == ("beauty", FEED_DEFAULT)
+def test_a_deliberate_refusal_is_never_filled_by_a_shelf(monkeypatch):
+    """The evidence policy returns "" for conflicting evidence (e.g. an ambiguous lip type). That is
+    a refusal, not a gap: even a measured shelf listing that exact type may not fill it."""
+    ptype = "Lip Gloss/Oil"
+    assert evidence_only(ptype, "Juicy Gloss")[0] == ""
+    monkeypatch.setitem(feed._MEASURED_HOST_PRODUCT_TYPES, "eyurs.com",
+                        {**feed._MEASURED_HOST_PRODUCT_TYPES["eyurs.com"], "lip gloss/oil": "beauty/makeup/lip/oil"})
+    assert resolve(ptype, "Juicy Gloss", "eyurs.com")[0] == ""
 
 
-def test_a_type_the_patterns_already_matched_keeps_its_existing_answer():
-    """The door only runs for a type that matched NOTHING. "Hair Conditioners" already matches one
-    pattern ("hair") through the pre-existing mapping, and singularising it would match two -- so
-    it is neither rescued nor re-decided: it keeps exactly the answer it had before the door."""
-    assert resolve("Hair Conditioners", "Repair Conditioner") == ("beauty/haircare/general", LEAF)
+def test_a_resolved_leaf_is_never_replaced_by_a_shelf(monkeypatch):
+    """Structural no-regression: plant a WRONG shelf entry for a type the evidence policy already
+    resolves, and the evidence answer must still win."""
+    monkeypatch.setitem(feed._MEASURED_HOST_PRODUCT_TYPES, "eyurs.com",
+                        {**feed._MEASURED_HOST_PRODUCT_TYPES["eyurs.com"], "cleanser": "beauty/skincare/treat/mask"})
+    assert resolve("Cleanser", "Gentle Cleanser", "eyurs.com")[0] == "beauty/skincare/cleanse/cleanser"
 
 
-def test_a_singular_that_matches_several_leaves_is_not_rescued():
-    # "Lips" -> "lip" names several lip leaves at once: one regex hit is required.
-    assert resolve("Lips", "Dewy Gloss") == ("beauty", FEED_DEFAULT)
+@pytest.mark.parametrize("flag", ["fashion", "electronics", "fashion/shoes"])
+def test_a_non_beauty_flag_is_left_alone(flag):
+    # "fashion" is a non-leaf root: without the guard, a beauty shelf would fill a fashion row.
+    assert resolve("Serums", "Glow Serum", "eyurs.com", flag_path=flag) == evidence_only(
+        "Serums", "Glow Serum", flag_path=flag)
 
 
-def test_singular_types_are_untouched_by_the_door():
-    assert resolve("Cleanser", "Pyunkang Yul Essence Toner (100ml)")[0] == "beauty/skincare/cleanse/cleanser"
+def test_the_feed_mapper_passes_the_host():
+    rec = feed.shopify_product_to_record({
+        "title": "Beauty of Joseon Glow Serum", "product_type": "Serums", "handle": "glow", "vendor": "Beauty of Joseon",
+        "variants": [{"price": "18", "available": True}], "images": [{"src": "https://x.com/i.jpg"}],
+    }, domain="eyurs.com", category_path="beauty")
+    assert rec["pdp"]["category_path"] == "beauty/skincare/treat/serum"
 
 
-def test_an_explicit_leaf_flag_still_wins_over_a_rescued_plural():
-    # The existing precedence: a caller who names a LEAF keeps it. The door must not bypass accept().
-    assert resolve("Serums", "Glow Serum", flag_path="beauty/skincare/treat/mask") == (
-        "beauty/skincare/treat/mask", FEED_DEFAULT)
-
-
-@pytest.mark.parametrize("word,want", [
-    ("masks", "mask"), ("sheet masks", "sheet mask"), ("accessories", "accessory"),
-    ("brushes", "brush"), ("gloss", ""), ("serum", ""), ("gels", "gel"), ("lips", "lip"), ("", ""),
-])
-def test_singularising_touches_only_a_plural_head_noun(word, want):
-    assert feed._singular_product_type(word) == want
-
-
-@pytest.mark.parametrize("ptype,title,want", [
-    ("Wash Off Mask", "Beauty of Joseon Red Bean Refreshing Pore Mask", "beauty/skincare/treat/mask"),
-    ("Sleeping Pack", "Cosrx Ultimate Nourishing Rice Overnight Spa Mask", "beauty/skincare/treat/mask"),
-    ("Sun Care", "Isntree Hyaluronic Acid Daily Sun Gel", "beauty/skincare/sun/sunscreen"),
-    ("Suncream", "SOME BY MI Truecica Mineral Calming Tone-Up Suncream SPF50+", "beauty/skincare/sun/sunscreen"),
-])
-def test_the_four_measured_exact_types_map_to_their_one_class(ptype, title, want):
-    """Each of these was all one class across every product carrying it at the three hosts.
-    "Wash off mask" is otherwise AMBIGUOUS (cleanser "wash" + mask), which is why it needs naming."""
-    assert resolve(ptype, title) == (want, LEAF)
-
-
-def test_a_shelf_named_by_the_type_must_agree_with_the_leaf():
-    """The face patterns key on the head noun, so "Lip Masks" found the facial sheet mask. A type
-    that says "lip" is on the lip shelf; the leaf must be too. "Lip Balms" -- the one lip plural
-    measured, at sokoglam.com -- already is, and keeps resolving."""
-    assert resolve("Lip Masks", "Overnight Lip Mask") == ("beauty", FEED_DEFAULT)
-    assert resolve("Lip Balms", "Phyto-Glow Lip Balm SPF 45")[0] == "beauty/makeup/lip/balm"
-    assert resolve("Lip Oils", "Juicy Lip Oil")[0] == "beauty/makeup/lip/oil"
-
-
-def test_a_singular_that_is_itself_a_generic_shelf_is_not_rescued():
-    """"Lip Colors" is not on the generic list, but its singular "lip color" is: a generic shelf
-    does not become a product class by losing an s."""
-    assert resolve("Lip Colors", "Velvet Lip Color") == ("beauty", FEED_DEFAULT)
-
-
-def test_a_singular_hitting_two_leaves_is_ambiguous_not_a_first_match(monkeypatch):
-    """No head noun in today's patterns reaches this (measured over 25 common plural heads), but
-    first-match-wins is not evidence -- the same PR #2158 rule the main mapping enforces. Pinned with
-    an injected overlapping pattern so the guard is a tested rule rather than dead code."""
-    import re
-    from services import pdp_category_classifier as clf
-
-    overlap = ("Overlap", "beauty/skincare/treat/serum", re.compile(r"\bgizmo\b", re.I))
-    first = ("Gizmo", "beauty/skincare/treat/mask", re.compile(r"\bgizmo\b", re.I))
-    monkeypatch.setattr(clf, "CATEGORY_PATTERNS", [first, overlap, *clf.CATEGORY_PATTERNS])
-    assert resolve("Gizmos", "Plain Title") == ("beauty", FEED_DEFAULT)
+def test_the_repair_planner_agrees_with_a_fresh_ingest_when_it_knows_the_host():
+    from scripts.plan_curated_category_repair import plan_category_repair
+    row = {"product_key": "k1", "category_path": "beauty", "title": "Beauty of Joseon Glow Serum",
+           "product_type": "Serums", "source_domain": "eyurs.com"}
+    plan = plan_category_repair([row])
+    assert plan["changes"][0]["proposed_category_path"] == "beauty/skincare/treat/serum"
+    # Without the host it stays conservative: no measured shelf applies.
+    unknown = plan_category_repair([{**row, "source_domain": None}])
+    assert unknown["proposed_changes"] == 0

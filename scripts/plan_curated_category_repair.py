@@ -40,7 +40,10 @@ def plan_category_repair(rows: list[dict[str, Any]], *, review_existing_leaves: 
                 raise ValueError(f"reviewing existing leaf needs merchant category_evidence: {key}")
             title, product_type = evidence["title"], evidence["product_type"]
             fallback = "beauty" if before.startswith("beauty/") else before
-        after = product_category_path(title=title, product_type=product_type, fallback=fallback)
+        # The host's MEASURED shelves apply only when the snapshot says which host the row came
+        # from, so a plan matches what a fresh ingest of that host would write.
+        after = product_category_path(title=title, product_type=product_type, fallback=fallback,
+                                      domain=row.get("source_domain"))
         if after == fallback and fallback != before:
             continue  # no positive evidence; do not propose a coarse downgrade
         if after != before:
