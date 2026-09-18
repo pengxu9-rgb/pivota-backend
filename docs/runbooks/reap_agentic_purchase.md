@@ -1,11 +1,14 @@
-# Reap agentic purchase — the state machine (WP2b)
+# Reap agentic purchase — the state machine (WP2b) + the poller (WP3)
 
-`services/reap_agentic_purchase.py`. Buyer-funded purchases over Reap's agentic rail: the buyer
-enrols **their own card** once on Reap's hosted page, and approves each purchase on another
-hosted page. **Pivota never holds or moves money and never sees card data.**
+`services/reap_agentic_purchase.py` (the state machine) and
+`jobs/reap_agentic_purchase_poll.py` (the poller that drives it). Buyer-funded purchases over
+Reap's agentic rail: the buyer enrols **their own card** once on Reap's hosted page, and approves
+each purchase on another hosted page. **Pivota never holds or moves money and never sees card
+data.**
 
-This package is **dark**. It has no routes and no scheduler, nothing calls it in production, and
-the dial is off. Nothing here has ever talked to a `reap.global` or `prava.space` host.
+This rail is **dark**. It has no routes, the dial is off, and the scheduler job is registered but
+inert — and the worker service that would run it **is deployed separately from the normal
+backend deploy**. Nothing here has ever talked to a `reap.global` or `prava.space` host.
 
 ---
 
@@ -18,7 +21,7 @@ transition.
 | state | what it means | this package's step calls | → |
 |---|---|---|---|
 | `resolving` | we have our catalog row, not Reap's variant | `resolve_our_row`; then either `get_active_enrollment` or `upsert_pending_enrollment` + `create_enrollment` | `needs_enrollment`, `quoting`, `refused`, `failed` |
-| `needs_enrollment` | buyer has a hosted card page open | `get_active_enrollment`; `upsert_pending_enrollment` (re-read); `get_enrollment`; `mark_enrollment_active` / `mark_enrollment_dead` | `quoting`, `expired` (sweep only), `failed` |
+| `needs_enrollment` | buyer has a hosted card page open | `get_active_enrollment`; `get_enrollment_internal` (re-read — a READ, not the old upsert-as-read); `get_enrollment`; `mark_enrollment_active` / `mark_enrollment_dead` | `quoting`, `expired` (sweep only), `failed` |
 | `quoting` | ready to price and hand the buyer a link | `get_active_enrollment`; `resolve_our_row` **again**; `request_quote`; **`verify_quote`**; `create_checkout` — **all in one step** | `awaiting_approval`, `refused`, `failed` |
 | `awaiting_approval` | buyer has the approval page | `get_checkout` | `processing`, `completed`, `failed`, `expired` |
 | `processing` | buyer approved; Reap is placing the order | `get_checkout` | `completed`, `failed` |
@@ -95,15 +98,222 @@ handle is quoting against something nobody has checked since.
 `REAP_AGENTIC_ENABLED` gates `start_purchase` only. `advance` does **not** re-check it: a
 purchase already in flight must be allowed to finish (or fail cleanly) after the dial is turned
 off — stranding a row in `awaiting_approval` after the buyer has paid is worse than finishing it.
-**To stop the rail: turn the dial off (no new purchases) and let the backlog drain.**
 
-Backoff (`POLL_INTERVALS`, seconds, no progress made): `resolving` 60, `needs_enrollment` 30,
-`quoting` 60, `awaiting_approval` 30, `processing` 15. A **transport** failure uses the state's
-interval doubled, capped at `MAX_BACKOFF_SECONDS` = 600.
+> **The poller re-checks it, but ONLY for the partner-facing half.**
+> `run_reap_agentic_purchase_poll` gates **step 4 only** (claim + `advance`). With the rail off
+> it returns `skipped_disabled=1`, takes no claim and makes no partner call — and **the three
+> sweeps above it run anyway**, including the PII deadline.
+>
+> The first cut gated the whole run, and that was a measured retention bug: with the rail off, an
+> `awaiting_approval` row 99,999 s old kept `buyer_email` and `shipping_address` across three
+> consecutive ticks. Because the gate is `is_enabled() **and** `is_configured()`, one unset
+> credential had the same effect as an operator switching the feature off.
+>
+> The rule is: **the dial stops us talking to a partner. It is not permission to stop forgetting
+> people.** That is safe because none of steps 1–3 calls a partner (they are three UPDATEs in
+> `db/reap_agentic_ledger.py`) and none can touch a row whose payment is in flight —
+> `expire_overdue_purchases` names only the two waiting states and `fail_exhausted_purchases`
+> runs `include_processing=False`, both parsed out of the SQL that enforces them.
+
+### The poller's dials
+
+All integers, all with code defaults, **all read per run** (except the interval, which an
+APScheduler trigger fixes at registration). An invalid or out-of-range value falls back to the
+default **with a warning naming the variable** — never a crash, never a silent zero. The minimums
+sit at or above the ledger's own floors on purpose: `lease_seconds < 30` and
+`max_age_seconds < 60` are `ValueError`s out of the ledger, so an unvalidated dial would not be a
+bad setting, it would be an exception out of a scheduled job on every tick.
+
+| variable | default | bounds | effect |
+|---|---|---|---|
+| `REAP_AGENTIC_ENABLED` | **unset = off** | truthy allowlist | the gate, inside the job, over **step 4 only**. Off ⇒ `skipped_disabled=1`, no claim, no partner call — the sweeps still run |
+| `REAP_AGENTIC_POLL_INTERVAL_SECONDS` | 30 | 5–3600 | the `interval` trigger **and** `misfire_grace_time`. Registration-time only — changing it needs a restart |
+| `REAP_AGENTIC_CLAIM_BATCH` | 10 | 1–100 | rows claimed per run. Capped at 100 because each row is a serial partner chain |
+| `REAP_AGENTIC_LEASE_SECONDS` | 300 | **180**–3600 | what `requeue_stale_claims` measures against. The floor is 180, not the ledger's 30: a lease shorter than one step gets a LIVE worker's row requeued underneath it, and both workers then call the partner |
+| `REAP_AGENTIC_HOSTED_MAX_AGE_SECONDS` | 3600 | 60–2592000 | the absolute PII deadline in `expire_overdue_purchases`, measured from `state_entered_at` |
+| `REAP_AGENTIC_MAX_ATTEMPTS` | 50 | 1–10000 | attempts ceiling. `attempts` counts **claims**, and only in `resolving`/`quoting`/`processing` |
+| `REAP_AGENTIC_ERROR_BACKOFF_SECONDS` | 120 | 1–3600 | how long a row waits after `advance` **raised**. Not the state machine's table — this is the path where it did not get to choose |
+| `REAP_AGENTIC_POLL_BUDGET_SECONDS` | 240 | 10–3600 | wall-clock budget. It stops the job **starting** work — a row already in flight finishes — so the run deadline is sized as budget + one whole step |
+
+### How slow one step really is
+
+The `~40 s for quoting` figure that used to live here was inherited and is **wrong** for
+`_step_quoting` as it now stands. Re-derived from `services/reap_agentic_client`'s per-path read
+timeouts:
+
+| call | bound | note |
+|---|---|---|
+| `resolve_our_row` | up to 4 × 25 s = **100 s** | `MAX_SEARCH_ATTEMPTS` (3) `products/search` plus one `products/variant` |
+| `request_quote` | **35 s** | 13–16 s measured across nine merchants |
+| `create_checkout` | **35 s** | |
+| | **170 s worst realistic** | |
+
+Everything else is sized from that one number: the lease floor (180), the run deadline
+(600 = 240 budget + 170 step + margin for the sweeps), and the standing caveat below.
+
+> **Even 600 s is not a guarantee.** The client hands httpx a *bare float* timeout, and httpx
+> spreads a bare float across connect, read, write **and** pool as that value **each** — so the
+> strict bound on one `quoting` step is roughly 4 × 170 s. The run deadline is a backstop against
+> a **wedge**, not a promise that a batch completes. That is safe because the job wraps its row
+> loop in a `try/finally` that releases every claim on `CancelledError`, so a cut run strands no
+> leases and the next tick simply re-claims what it did not reach.
+
+Two constants are deliberately **not** dials: `SWEEP_BATCH` (200 rows per sweep statement — a
+lock-window property of a Postgres prod and staging share, not an operator setting) and
+`MAX_SWEEP_ITERATIONS` (20 — the cap that stops a sweep whose predicate a future migration makes
+permanently true becoming an infinite loop inside a scheduled job).
 
 ---
 
-## What a poller must do
+## The poller — `jobs/reap_agentic_purchase_poll.py` (WP3)
+
+`async def run_reap_agentic_purchase_poll(*, worker_id=None, now=None) -> PollReport`
+
+Registered in `services/audit_scheduler.py` as **`reap_agentic_purchase_poll`**, an `interval`
+job every `REAP_AGENTIC_POLL_INTERVAL_SECONDS` (default 30), `max_instances=1`, `coalesce=True`,
+run deadline **600 s** in `_JOB_RUN_DEADLINES` (see the derivation above).
+
+### Run order (each step bounded)
+
+| # | step | bound |
+|---|---|---|
+| 1 | `requeue_stale_claims(lease_seconds=REAP_AGENTIC_LEASE_SECONDS)` | one batch of 200 per run |
+| 2 | `expire_overdue_purchases(max_age_seconds=REAP_AGENTIC_HOSTED_MAX_AGE_SECONDS)` | 200 per statement, looped until a partial batch, hard cap 20 iterations |
+| 3 | `fail_exhausted_purchases(REAP_AGENTIC_MAX_ATTEMPTS, include_processing=False)` | same |
+| 4 | `claim_due_purchases(worker, limit=REAP_AGENTIC_CLAIM_BATCH)` → per row `advance` → `release_claim` | **sequential**, one partner chain at a time, stopped by `REAP_AGENTIC_POLL_BUDGET_SECONDS` |
+
+**The sweeps run before the claim** because a row held by a dead pod is not claimable until the
+requeue frees it — a claim-first run would skip exactly the rows that most need attention, every
+tick, forever, on a pod that keeps dying.
+
+**Step 3 never touches `processing`.** A purchase in `processing` has been approved by the buyer
+and its payment is in flight with Reap; auto-failing it on a counter writes `failed` over a
+charge whose outcome we do not know. **A payment stuck in `processing` is a human decision** —
+reconcile the checkout with Reap by hand, then either transition the row or call
+`fail_exhausted_purchases(..., include_processing=True)` yourself. There is deliberately no env
+var for it: a dial would let somebody arm it once and forget.
+
+**After the loop this worker holds no claims**, and that is *checked with a query*, not asserted.
+Anything left over is released and counted under `errors`.
+
+### The counts on `PollReport`
+
+Counts and a duration only — **no ids, no PII**. Purchase ids appear in DEBUG logs and in the two
+ERROR lines an operator must act on.
+
+| count | meaning | action if it is high |
+|---|---|---|
+| `skipped_disabled` | 1 = **step 4** was skipped (dial off, or client unconfigured). NOT "the run did nothing" — the sweeps above it ran and their counts are real | expected while dark |
+| `requeued` | stale leases freed | steadily > 0 means workers are dying mid-step, or `REAP_AGENTIC_LEASE_SECONDS` is below the slowest step |
+| `expired` | purchases the buyer abandoned; PII NULLed | normal; a spike means hosted pages are expiring before buyers use them |
+| `failed_exhausted` | rows that hit the attempt ceiling | look at `last_error_code` on those rows — the rail is failing the same way repeatedly |
+| `processing_over_attempts` | **read-only.** Purchases in `processing` at or past `max_attempts` — the exact set the fail sweep refuses to terminate because a payment is in flight | **any non-zero value that does not fall needs a human.** Reconcile the checkout with Reap; the counter will never resolve these. See below |
+| `claimed` | leases taken this run | `== REAP_AGENTIC_CLAIM_BATCH` every tick means the backlog is growing; raise the batch or the interval |
+| `advanced` | rows that changed state | — |
+| `released` | rows that made no progress because **the partner was not ready** | — |
+| `abandoned_budget` | rows claimed and handed straight back because **the run ran out of time**. Kept separate from `released` on purpose: they are different facts and only one of them means "raise the budget" | persistently > 0 ⇒ lower `REAP_AGENTIC_CLAIM_BATCH` or raise `REAP_AGENTIC_POLL_BUDGET_SECONDS` |
+| `lost_claim` | a fenced write answered None — a sweep or another worker got there first | **never an error**; steadily high means two workers are fighting, i.e. more than one worker service is armed |
+| `terminal` | the row was already terminal when the step read it | a few are normal (a sweep landed between claim and step) |
+| `errors` | **the only count that should page anyone** | see below |
+| `duration_ms` | wall clock | approaching `REAP_AGENTIC_POLL_BUDGET_SECONDS` every tick means the batch cannot be serviced at this cadence |
+
+### When `errors` > 0
+
+`errors` means one of three things, all of them bugs, none of them backpressure:
+
+1. **`advance` raised.** The log line is
+   `advance RAISED for purchase=<id> error_type=<Type>; releasing with a <N>s backoff` — the
+   exception TYPE and the purchase id, never the message (a driver error's message carries row
+   content, and on this table that content is the buyer's email and address). The known case is
+   `UniqueViolationError` on `uq_reap_agentic_purchases_checkout`: the partner handed back a
+   `checkout.id` we already stored, which means two of our rows believe they own one charge.
+   **Do not retry it.** Find both rows (`SELECT id, state FROM reap_agentic_purchases WHERE
+   reap_checkout_id = '<id>'`), reconcile the checkout with Reap, and resolve by hand. The row
+   itself is safe meanwhile: it was released with `REAP_AGENTIC_ERROR_BACKOFF_SECONDS`.
+2. **A claim survived the loop.** The log line says so and names the purchase id. It has already
+   been released. This is a bug in the poller — open an issue with the surrounding run's report.
+3. **`advance` returned an outcome the poller does not know** (`returned an unhandled outcome
+   '<x>'`). Today that is only `missing` — a row claimed a moment ago and unreadable now, which
+   should be impossible — or a new outcome added to `services/reap_agentic_purchase.py` without
+   updating the poller's list. Counting it rather than dropping it is what keeps a whole new
+   outcome class from being invisible in the one report an operator reads.
+
+Everything else is a count, not an error. In particular `lost_claim` is the designed answer to
+the unfenced bulk sweeps and must never be alerted on.
+
+---
+
+## Arming it
+
+The poller runs **only on the worker service**. `_add_job` registers nothing unless
+`services.audit_scheduler._queue_worker_enabled()` is true, because prod and staging share one
+Postgres and the claim has no environment filter — a staging service would poach production
+purchases and spend a buyer's card with staging code.
+
+> **THE WORKER SERVICE IS DEPLOYED SEPARATELY. The normal backend deploy does NOT ship it.**
+> Merging this and deploying the backend changes nothing: the job only exists in a process where
+> `_queue_worker_enabled()` is true, and that process has to be deployed on its own. See
+> `docs/` on the scheduler lane; this is the same gap that left `catalog_import_drain_tick`
+> registered on an undeployed worker.
+
+1. Deploy the worker service.
+2. `AUDIT_WORKER_ENABLED=true` on it (or let the service-name detection decide; the gate is
+   fail-safe toward ENABLED, so an unknown platform stays on).
+3. `REAP_API_BASE_URL` + `REAP_API_KEY` — both, or `is_configured()` is false and every run
+   returns `skipped_disabled=1`.
+4. `REAP_AGENTIC_ENABLED=1`. **This is the arming step.** No redeploy and no scheduler restart:
+   the gate lives inside the job, so the next tick picks it up.
+5. Run it once by hand and read the report:
+   `POST /admin/scheduler/jobs/reap_agentic_purchase_poll/run-now` (admin auth). The response is
+   the runner outcome; the counts are in the job's own log line and on
+   `GET /admin/scheduler/runs`.
+6. Watch `errors` and `lost_claim` for a few ticks.
+
+### Stopping it
+
+**Pause and dial-off are not interchangeable, and the difference is the PII deadline.** A paused
+job never fires, so pausing stops *everything* — including the sweep that forgets abandoned
+buyers. Turning the dial off stops only the partner-facing half.
+
+| lever | stops partner calls | sweeps keep running | use when |
+|---|---|---|---|
+| `REAP_AGENTIC_ENABLED` off | **yes** | **yes** — requeue, expire (the PII deadline) and fail all still run | **the normal stop.** Reach for this first. |
+| `POST .../reap_agentic_purchase_poll/pause` | yes | **NO — nothing runs at all** | only briefly: the database is in trouble, or the job itself is misbehaving. **Resume it, or the PII deadline stays off.** |
+| `POST .../cancel-running` | frees a wedged in-flight run only | yes | a run has wedged; it never starts work |
+| redeploy the worker without the env var | yes | yes | equivalent to the dial, plus it abandons the in-flight run |
+
+With the dial off, purchases already in flight **stall** — nothing advances them — but they are
+still expired on the clock and still have their PII nulled, and their claims are still recovered.
+That is the intended resting state for a disarmed rail.
+
+**If you must pause:** set a reminder to resume. A paused poller is a rail that has stopped
+forgetting people, and nothing else in the system will do it for you.
+
+### When `processing_over_attempts` will not go down
+
+These rows are the deliberate blind spot. The buyer approved, Reap took the payment, and our poll
+has asked about it `max_attempts` times without getting a terminal answer. The counter will
+**never** fail them — `fail_exhausted_purchases` runs `include_processing=False` so our ledger
+cannot say `failed` over a charge whose outcome we do not know.
+
+To resolve one:
+
+1. `SELECT id, reap_checkout_id, attempts, state_entered_at FROM reap_agentic_purchases
+   WHERE state = 'processing' AND attempts >= <max_attempts>;`
+2. Ask Reap what that checkout did. This rail has **no webhooks**, so this is a manual lookup.
+3. Then, and only then, transition the row by hand — or, if you have confirmed the charge did not
+   happen, call `fail_exhausted_purchases(..., include_processing=True)` yourself. There is no
+   env var for that flag on purpose: a dial would let somebody arm it once and forget, which is
+   the same as not having decided.
+
+Both `run-now` and `pause`/`resume` are **allowlists** in `routes/admin_scheduler_jobs.py`
+(`_RUNNABLE_JOB_IDS`, `_MANAGEABLE_JOB_IDS`); `reap_agentic_purchase_poll` was added to both, and
+`tests/test_reap_agentic_purchase_poll.py` pins that so a rename cannot silently take the levers
+away.
+
+---
+
+## What a poller must do (the obligations WP3 implements)
 
 ```python
 for row in await ledger.claim_due_purchases(worker_id, limit=N):
@@ -152,9 +362,10 @@ Obligations, in order of how expensive they are to get wrong:
      approved and its payment is in flight, and auto-failing it writes a terminal state over a
      charge whose outcome we do not know.
    * `requeue_stale_claims(lease_seconds=…)` — recovers a row whose worker died mid-step.
-6. **`lease_seconds` must exceed the longest step.** A quote takes 13–19 s and the quote step
-   also creates a checkout, so `quoting` can take ~40 s. The ledger's floor is 30 s; 300 s (its
-   default) is sane.
+6. **`lease_seconds` must exceed the longest step.** The `~40 s` this used to say was written
+   before the quote-verification round and is wrong — see **How slow one step really is** above:
+   the worst realistic `quoting` step is **170 s**. The ledger's floor is 30 s, WP3's own floor is
+   **180 s**, and 300 s (the default) is sane.
 7. **Never call the unfenced `ledger.transition` from a worker.** Use `transition_as_holder`.
 
 ---
@@ -290,13 +501,18 @@ terminal write still wins.
 |---|---|---|
 | `tests/test_reap_agentic_purchase.py` | SQLite | every state, every refusal, the fence under interleaving, PII, the backoff table |
 | `tests/test_reap_agentic_purchase_postgres.py` | Postgres (dialect gate) | the fence across **two backend connections**, jsonb-as-text, the server-side clock, the partial unique index, PREPARE |
+| `tests/test_reap_agentic_purchase_poll.py` | SQLite | the poller: the gate (step 4 only), the run order, the counts, the dials and their bounds, the budget, the leftover-claims invariant, cancellation, registration |
+| `tests/test_reap_agentic_purchase_poll_postgres.py` | Postgres (dialect gate) | the poller across **two real backend connections**, its SQL constants under PREPARE, the error backoff against the server clock, `include_processing=False` on the real statement, the PII deadline with the rail off, claim release on cancellation |
 
-Both drive the **real** ledger and the client's **real** pure helpers; only the client's six
+All four drive the **real** ledger and the client's **real** pure helpers; only the client's six
 transport functions are faked, and an autouse fixture makes an unpatched `httpx.AsyncClient`
 raise so a step that reached the network fails rather than hangs.
 
 ```
-.venv/bin/python -m pytest tests/test_reap_agentic_purchase.py
+.venv/bin/python -m pytest tests/test_reap_agentic_purchase.py \
+                          tests/test_reap_agentic_purchase_poll.py
 DATABASE_URL=postgresql://postgres:postgres@localhost:5432/pivota_reap_wp2b_test \
     .venv/bin/python -m pytest tests/test_reap_agentic_purchase_postgres.py
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/pivota_reap_wp3_test \
+    .venv/bin/python -m pytest tests/test_reap_agentic_purchase_poll_postgres.py
 ```

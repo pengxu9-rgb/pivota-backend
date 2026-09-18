@@ -49,6 +49,12 @@ Job registration happens at start-up time. Currently registers:
 - `cafe24_reconciliation` — every 15 minutes, replays Cafe24 webhook and
   Data Bridge logs for a bounded least-recently-run store batch. It is dormant
   unless CAFE24_RECONCILIATION_ENABLED is explicitly enabled.
+- `reap_agentic_purchase_poll` — every REAP_AGENTIC_POLL_INTERVAL_SECONDS
+  (default 30), drives jobs/reap_agentic_purchase_poll: requeue stale claims,
+  expire overdue purchases (the PII deadline), fail attempt-exhausted ones, then
+  claim due rows and take ONE state-machine step on each. Dormant unless
+  REAP_AGENTIC_ENABLED is set AND the Reap client is configured — the gate is
+  inside the job, so registering it here is inert.
 
 Best-effort: scheduler init failure logs a warning but does not crash
 the API. The audit endpoints still work; only the cron is degraded.
@@ -189,6 +195,32 @@ _JOB_RUN_DEADLINES = {
     "merchant_order_gap_alert": 300,
     # A bounded SELECT plus one INSERT per lost enqueue; no platform calls.
     "merchant_order_create_reconcile": 300,
+    # Reap agentic purchase poller. The job carries its OWN wall-clock budget
+    # (REAP_AGENTIC_POLL_BUDGET_SECONDS, default 240) which stops it STARTING new
+    # work; a row already in flight runs to completion, so a run can legitimately
+    # exceed the budget by one whole step. This deadline must therefore sit above
+    # budget + the slowest SINGLE step.
+    #
+    # THE SLOWEST STEP IS NOT ~40s. That figure was inherited from WP2b's runbook
+    # and is wrong for `_step_quoting` as it now stands. Re-derived from
+    # services/reap_agentic_client's per-path read timeouts:
+    #   resolve_our_row   up to MAX_SEARCH_ATTEMPTS (3) products/search at 25s,
+    #                     plus one products/variant at 25s          -> 100s
+    #   request_quote     35s   (13-16s measured across nine merchants)
+    #   create_checkout   35s
+    #                                                    worst realistic  170s
+    # 240 + 170 = 410; 600 leaves headroom for the three bulk sweeps that run
+    # before any claiming. Raise the budget and this must move with it.
+    #
+    # AND EVEN 600 IS NOT A GUARANTEE, deliberately. The client hands httpx a
+    # BARE FLOAT timeout, which httpx spreads across connect, read, write AND
+    # pool as that value EACH -- the same trap the agent_card_revocation_sweep
+    # note above describes -- so the strict bound on one `quoting` step is ~4x
+    # 170s. This deadline is a backstop against a WEDGE, not a promise that a
+    # batch completes. That is safe here because the job wraps its row loop in a
+    # try/finally that releases every claim on CancelledError, so a cut run
+    # strands no leases and the next tick simply re-claims what it did not reach.
+    "reap_agentic_purchase_poll": 600,
 }
 
 
@@ -418,6 +450,43 @@ async def start_scheduler() -> None:
             id="external_conversion_poll",
             replace_existing=True,
             misfire_grace_time=600,
+            coalesce=True,
+        )
+
+        # Reap agentic purchase poller (WP3): the only thing that moves a
+        # buyer-funded Reap purchase through its state machine. There are NO
+        # WEBHOOKS on that rail, so this poll is the sole way a checkout outcome
+        # is ever learned, and it is also what runs the two bulk sweeps — the PII
+        # deadline for purchases waiting on a buyer, and the attempt ceiling.
+        #
+        # OFF BY DEFAULT and the gate is INSIDE the job (REAP_AGENTIC_ENABLED plus
+        # a configured Reap client), exactly like external_conversion_poll above:
+        # registering it here is inert, so deploying this never starts autonomous
+        # partner polling, and arming the rail needs an env var rather than a
+        # scheduler restart. A SECOND gate here would be a second thing to keep
+        # in step with the first.
+        #
+        # `max_instances=1` is explicit rather than inherited from APScheduler's
+        # default: two overlapping runs would each mint their own worker id and
+        # claim disjoint rows, so it is not a correctness fence — it is what stops
+        # a slow tick stacking partner call chains on a partner that rate-limits.
+        # `misfire_grace_time` is deliberately SHORT (one interval): a poll tick
+        # that missed its slot has nothing to catch up on, because the next tick
+        # selects on `next_poll_at <= now` and therefore sees everything the
+        # skipped one would have.
+        from jobs.reap_agentic_purchase_poll import (
+            job_interval_seconds,
+            run_reap_agentic_purchase_poll,
+        )
+        _reap_agentic_interval = job_interval_seconds()
+        _add_job(
+            run_reap_agentic_purchase_poll,
+            "interval",
+            seconds=_reap_agentic_interval,
+            id="reap_agentic_purchase_poll",
+            replace_existing=True,
+            max_instances=1,
+            misfire_grace_time=_reap_agentic_interval,
             coalesce=True,
         )
 
