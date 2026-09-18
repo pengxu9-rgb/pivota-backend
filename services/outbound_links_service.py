@@ -10,7 +10,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote, urlencode, urlparse, urlunparse, parse_qsl
+from urllib.parse import quote, unquote_plus, urlencode, urlparse, urlunparse, parse_qsl
 
 from sqlalchemy import and_, desc, func, or_, select
 
@@ -272,16 +272,159 @@ def shopify_cart_base_url(
     return f"https://{host}/cart/{numeric_variant}:{qty}"
 
 
+@dataclass(frozen=True)
+class CartPrefill:
+    """Buyer details Shopify's cart permalink can carry into checkout.
+
+    Emitted as ``checkout[email]`` and ``checkout[shipping_address][<field>]`` — Shopify's
+    own key names, verified live 2026-09-18 on 36/40 Tier B merchants (the page rendered
+    the email, address and zip in its inputs). Optional fields left empty are omitted from
+    the URL entirely. See `cart_prefill_refusal` for what is refused and why.
+
+    THE URL THIS PRODUCES CARRIES BUYER PII. Never log it raw; use
+    `redact_cart_permalink`.
+    """
+
+    email: str
+    first_name: str
+    last_name: str
+    address1: str
+    city: str
+    country: str  # ISO 3166-1 alpha-2
+    address2: Optional[str] = None
+    province: Optional[str] = None
+    zip: Optional[str] = None
+    phone: Optional[str] = None  # E.164, e.g. +12025550142
+
+
+# Emission order follows the link Reap was sent (judydoll), with address2 after address1.
+_CART_PREFILL_ADDRESS_FIELDS: Tuple[str, ...] = (
+    "first_name", "last_name", "address1", "address2", "city", "province", "zip", "country", "phone",
+)
+_CART_PREFILL_REQUIRED: Tuple[str, ...] = ("email", "first_name", "last_name", "address1", "city", "country")
+CART_PREFILL_MAX_VALUE_LEN = 256
+# Deliberately loose: one @, a dot in the domain, no whitespace. Shopify validates the
+# address properly on its own page; this only refuses values that are obviously not one.
+_PLAUSIBLE_EMAIL = re.compile(r"^[^@\s]+@[^@\s.]+(?:\.[^@\s.]+)+$")
+_E164_PHONE = re.compile(r"^\+[1-9][0-9]{6,14}$")
+# Every C0 control and DEL, not only CR/LF/NUL: a value is a form field, and no form field
+# a buyer can type contains a control character. CR/LF are the header-injection shape.
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def cart_prefill_refusal(buyer: Any) -> Optional[str]:
+    """Why `buyer` cannot be put on a cart permalink, or None when it can.
+
+    Refused: a missing required field, an implausible email (``a@b``), a country that is not
+    exactly two ASCII letters (``USA``), a phone that is not E.164, any control character
+    (``"1 Main\\r\\nX-Evil: 1"``), and any value over 256 characters. Non-ASCII text is
+    accepted (``"Chiyoda-ku 千代田区"``) — it is percent-encoded as UTF-8, not refused.
+    """
+    if not isinstance(buyer, CartPrefill):
+        return "not_a_cart_prefill"
+    for name in ("email",) + _CART_PREFILL_ADDRESS_FIELDS:
+        value = getattr(buyer, name)
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            return f"{name}_not_a_string"
+        if _CONTROL_CHARS.search(value):
+            return f"{name}_control_character"
+        if len(value) > CART_PREFILL_MAX_VALUE_LEN:
+            return f"{name}_too_long"
+    for name in _CART_PREFILL_REQUIRED:
+        if not str(getattr(buyer, name) or "").strip():
+            return f"{name}_missing"
+    if not _PLAUSIBLE_EMAIL.match(buyer.email.strip()):
+        return "email_implausible"
+    if not re.fullmatch(r"[A-Za-z]{2}", buyer.country.strip()):
+        return "country_not_iso2"
+    phone = str(buyer.phone or "").strip()
+    if phone and not _E164_PHONE.match(phone):
+        return "phone_not_e164"
+    return None
+
+
+def _cart_prefill_query(buyer: CartPrefill) -> str:
+    """The ``checkout[...]`` query fragment. Keys keep literal brackets (the documented
+    permalink form, as `append_shopify_cart_click_attribute` does); values are percent-encoded
+    UTF-8 with nothing left safe, so no value can introduce ``&``, ``=`` or ``#``."""
+    pairs = [("checkout[email]", buyer.email.strip())]
+    for name in _CART_PREFILL_ADDRESS_FIELDS:
+        value = str(getattr(buyer, name) or "").strip()
+        if name == "country":
+            value = value.upper()
+        if value:
+            pairs.append((f"checkout[shipping_address][{name}]", value))
+    return "&".join(f"{key}={quote(value, safe='')}" for key, value in pairs)
+
+
 def build_shopify_cart_permalink(
-    *, shop_domain: Optional[str], variant_id: Optional[str], click_id: str, quantity: int = 1
+    *,
+    shop_domain: Optional[str],
+    variant_id: Optional[str],
+    click_id: str,
+    quantity: int = 1,
+    buyer: Optional[CartPrefill] = None,
 ) -> Optional[str]:
     """Full Shopify cart permalink carrying the pivota click id as an order-surviving
     attribute, or None when a cart permalink cannot be built (missing host /
-    non-numeric variant id)."""
+    non-numeric variant id).
+
+    With `buyer`, the link also prefills the checkout's email and shipping address. A buyer
+    that `cart_prefill_refusal` refuses makes the whole call return None — never a link
+    without the prefill the caller asked for. Without `buyer` the output is byte-identical
+    to what it was before `buyer` existed (pinned by tests).
+    """
     base = shopify_cart_base_url(shop_domain=shop_domain, variant_id=variant_id, quantity=quantity)
     if not base:
         return None
-    return append_shopify_cart_click_attribute(base, click_id)
+    if buyer is not None and cart_prefill_refusal(buyer) is not None:
+        return None
+    url = append_shopify_cart_click_attribute(base, click_id)
+    if buyer is not None:
+        url = _append_query_fragment(url, _cart_prefill_query(buyer))
+    return url
+
+
+# Query values a redacted cart/checkout URL may keep. Everything else is replaced: a hop in
+# Shopify's redirect chain carries more than `checkout[...]` — the shop.app hop's
+# `shop_pay_token` is a JWT whose payload embeds the whole landing URL, email and address
+# included (seen live 2026-09-18 on pourri.com), and `return_to` names the checkout token.
+_REDACTION_KEEP_KEYS = frozenset({SHOPIFY_CART_CLICK_ATTRIBUTE, SHOPIFY_CART_RECOVERY_ATTRIBUTE})
+REDACTED = "REDACTED"
+
+
+def redact_cart_permalink(url: Any) -> str:
+    """A cart permalink (or any hop of its redirect chain) safe to log.
+
+    Keeps scheme, host, path and the click-id / recovery-key attributes. Every other query
+    value — every ``checkout[...]`` value first among them, whether its brackets are literal
+    or percent-encoded (``checkout%5Bemail%5D``, as Shopify re-emits them on the next hop) —
+    becomes ``REDACTED``. Keys are kept so the shape stays readable. Userinfo and fragment
+    are dropped. Something that does not parse as a URL is redacted whole.
+    """
+    raw = str(url or "")
+    try:
+        parsed = urlparse(raw)
+        host = parsed.hostname or ""
+        port = parsed.port
+    except ValueError:
+        return REDACTED
+    if not parsed.scheme or not host:
+        return REDACTED if raw else ""
+    netloc = f"{host}:{port}" if port else host
+    parts = []
+    for piece in parsed.query.split("&") if parsed.query else []:
+        if not piece:
+            continue
+        raw_key, sep, raw_value = piece.partition("=")
+        key = unquote_plus(raw_key)
+        if key in _REDACTION_KEEP_KEYS:
+            parts.append(piece)
+        else:
+            parts.append(f"{raw_key}={REDACTED}" if sep else REDACTED)
+    return urlunparse((parsed.scheme, netloc, parsed.path, parsed.params, "&".join(parts), ""))
 
 
 def url_domain(url: str) -> str:
