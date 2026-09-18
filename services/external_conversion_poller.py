@@ -45,6 +45,7 @@ from services.commerce_attribution_service import (
     extract_click_id_from_note_attributes,
     shopify_order_total_to_cents,
 )
+from services.conversion_click_claims import close_merchant_conversion_with_claim
 from services.shopify_transactions_service import DEFAULT_API_VERSION
 
 logger = logging.getLogger("external_conversion_poller")
@@ -424,8 +425,12 @@ async def _process_order(
         return "no_order_id"
     cents, currency = shopify_order_total_to_cents(order)
     converted_at = _parse_dt(order.get("processed_at")) or _parse_dt(order.get("created_at")) or converted_at_default
-    # Idempotency + click gate + edge upsert all live inside this call (T2-2).
-    await close_external_order_conversion(
+    # Idempotency + click gate + edge upsert all live inside this call (T2-2). mig 228: a
+    # cart-link Reap purchase's click is also closed by Reap under another key, so it goes
+    # through the first-writer-wins claim; every other click reaches the same close with the
+    # same arguments. Fails open. See services/conversion_click_claims.
+    await close_merchant_conversion_with_claim(
+        close_external_order_conversion,
         merchant_id=merchant_id,
         click_id=click_id,
         external_order_id=external_order_id,

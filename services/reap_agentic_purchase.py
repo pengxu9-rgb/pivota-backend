@@ -105,20 +105,23 @@ import logging
 import os
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import db.reap_agentic_ledger as ledger
+import services.conversion_click_claims as ccc
 import services.reap_agentic_client as rc
+from services.reap_cart_link import cart_link_line, cart_link_refusal
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "AdvanceResult",
     "BuyerContact",
+    "CartLinkItem",
     "HUMAN_WAIT_STATES",
     "MAX_BACKOFF_SECONDS",
     "MAX_QUANTITY",
@@ -127,9 +130,11 @@ __all__ = [
     "PurchaseRow",
     "QuoteCheck",
     "advance",
+    "is_cart_link_enabled",
     "is_enabled",
     "start_purchase",
     "transport_backoff_seconds",
+    "verify_cart_link_quote",
     "verify_quote",
 ]
 
@@ -153,6 +158,25 @@ def is_enabled() -> bool:
     a buyer's own card at a third party.
     """
     return (os.getenv(REAP_AGENTIC_ENABLED_ENV) or "").strip().lower() in _TRUTHY
+
+
+#: The CART-LINK lane's own dial (Tier B: a Shopify cart permalink Reap quotes as received).
+#: Default OFF, the same strict allowlist parse, read at call time. It is IN ADDITION to
+#: `REAP_AGENTIC_ENABLED`, never instead of it: a cart-link purchase needs both, plus a client
+#: that knows Reap's field name (`rc.supports_cart_link_quote()`).
+#:
+#: IT IS ALSO A KILL SWITCH FOR ROWS IN FLIGHT, and that is a decision rather than a side
+#: effect. `advance` re-reads it on every cart-link step BEFORE a quote exists ('resolving',
+#: 'quoting') and REFUSES the purchase when it is off — terminal, so the buyer's address and
+#: email are nulled by the same write. It is NOT consulted once a checkout exists
+#: ('awaiting_approval', 'processing'): the buyer may already have approved a payment, and
+#: turning a dial must never abandon one in flight.
+REAP_AGENTIC_CART_LINK_ENABLED_ENV = "REAP_AGENTIC_CART_LINK_ENABLED"
+
+
+def is_cart_link_enabled() -> bool:
+    """Is the cart-link lane armed? Default OFF; `ture` is off, exactly as for the rail's dial."""
+    return (os.getenv(REAP_AGENTIC_CART_LINK_ENABLED_ENV) or "").strip().lower() in _TRUTHY
 
 
 # ── the backoff table ────────────────────────────────────────────────────────────────────────
@@ -304,6 +328,38 @@ class PurchaseRow:
 
 
 @dataclass(frozen=True)
+class CartLinkItem:
+    """What a CART-LINK purchase buys: a Shopify cart permalink, quoted by Reap as received.
+
+    THE URL IS THE IDENTITY. There is no resolver on this lane: Reap's ids are opaque, and the
+    merchant's own agent checkout — the reason this lane exists — refuses us. So the permalink
+    names the one line (merchant variant id + quantity), carries our click id as a cart
+    attribute that survives onto the merchant's order, and pins the checkout's market with
+    `country=`. `services.reap_cart_link.validate_cart_link` is the gate, run here and again in
+    the ledger against the values that are stored.
+
+    The rest of the purchase comes from `start_purchase`'s own arguments, so there is ONE source
+    for each fact: `quantity` (must equal the URL's), `click_id` (must equal the URL's) and the
+    buyer. `our_price_minor` is the EXPECTED UNIT price; the quote's items subtotal must be
+    exactly `our_price_minor × quantity` in minor units, which is the lane's price check.
+
+    `product_name` / `product_key` are optional and for display and joins only — nothing on
+    this lane reads them to decide what is bought.
+    """
+
+    # repr=False: the URL carries our click id and the merchant's variant, and a dataclass repr
+    # is what ends up in a traceback or a debug log line. Not PII (the validator guarantees
+    # that), but nothing a log reader needs.
+    cart_url: str = field(repr=False)
+    shop_domain: str
+    our_price_minor: int
+    currency: str
+    market_country: str
+    product_name: Optional[str] = None
+    product_key: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class BuyerContact:
     """The PII, for the length of one `start_purchase` call.
 
@@ -313,8 +369,10 @@ class BuyerContact:
     it was given: a caller cannot widen what reaches a third party by adding keys.
     """
 
-    email: str
-    shipping_address: Mapping[str, Any]
+    # repr=False on BOTH: this dataclass is the buyer's PII, and its default repr would print it
+    # into any traceback, assertion message or `%r` log line that ever touches one.
+    email: str = field(repr=False)
+    shipping_address: Mapping[str, Any] = field(repr=False)
 
 
 @dataclass(frozen=True)
@@ -934,6 +992,89 @@ def _single_variant_verdict(resolution: Any, row: Mapping[str, Any]) -> Optional
     return None
 
 
+def verify_cart_link_quote(payload: Any, row: Mapping[str, Any]) -> QuoteCheck:
+    """Does this CART-LINK quote describe the purchase we opened, at our price, with shipping?
+
+    Four checks, in this order, and then every amount check `verify_quote` makes:
+
+      (1) THE ROW IS CHECKABLE — a quantity in 1..MAX_QUANTITY. `price_unverifiable` /
+          `quote_row_unverifiable` otherwise, as in `verify_quote`.
+      (2) EXACTLY ONE LINE, AT OUR QUANTITY. `items` must be a list of one object whose
+          `quantity` is our integer quantity. `price_unverifiable` / `quote_items_mismatch`
+          otherwise — including when `items` is absent, because a quote that does not say what
+          it priced cannot be checked. Our URL names ONE line, so two lines mean Reap priced
+          something we did not send.
+      (3) A SHIPPING OPTION EXISTS. `shippingOptions` must be a non-empty list, and EVERY
+          entry an object with a non-empty `id` and a `price` that is a non-negative amount in
+          the row's currency (`_is_priced_shipping_option`).
+          Otherwise the purchase is REFUSED, terminally, as `no_shipping_option`. THIS IS THE
+          LANE'S SHIPPING PROOF: a merchant that cannot ship to the buyer's address, or that
+          holds the cart below a basket minimum, answers with no option, and that is the one
+          place we find out before a buyer is sent to approve a payment.
+      (4) THE AMOUNTS — `verify_quote(payload, row, variant_id=None)`, unchanged: every
+          breakdown amount readable, every currency the row's (`quote_currency_mismatch`), the
+          items subtotal EXACTLY `our_price_minor × quantity` in integer minor units
+          (`price_changed` / `quote_items_subtotal_mismatch`), and the total reconciling with
+          its breakdown. The same rule and the same codes as the variant lane; not a copy.
+
+    ── THE KNOWN GAP, STATED WHERE IT LIVES ─────────────────────────────────────────────────
+
+    `variant_id=None` is deliberate: Reap returns OPAQUE variant ids, so nothing in this quote
+    can prove it priced OUR Shopify variant. The mitigations are that the URL names exactly one
+    variant (the validator allows one line and nothing else), and that the subtotal must equal
+    our expected unit price times our quantity to the minor unit — a substituted variant at a
+    different price refuses. A substitution at the IDENTICAL price is not caught here. If Reap's
+    response ever exposes a merchant variant identifier, comparing it to the URL's is the
+    follow-up.
+    """
+    quantity = row.get("quantity")
+    if isinstance(quantity, bool) or not isinstance(quantity, int) or not (
+        1 <= quantity <= MAX_QUANTITY
+    ):
+        return QuoteCheck(False, "price_unverifiable", "quote_row_unverifiable")
+
+    data = payload if isinstance(payload, dict) else {}
+
+    items = data.get("items")
+    if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict):
+        return QuoteCheck(False, "price_unverifiable", "quote_items_mismatch")
+    echoed = items[0].get("quantity")
+    if isinstance(echoed, bool) or not isinstance(echoed, int) or echoed != quantity:
+        return QuoteCheck(False, "price_unverifiable", "quote_items_mismatch")
+
+    options = data.get("shippingOptions")
+    if (
+        not isinstance(options, list)
+        or not options
+        or not all(_is_priced_shipping_option(option, row) for option in options)
+    ):
+        return QuoteCheck(False, "no_shipping_option", "quote_no_shipping_option")
+
+    return verify_quote(data, row, variant_id=None)
+
+
+def _is_priced_shipping_option(option: Any, row: Mapping[str, Any]) -> bool:
+    """One shipping option that PROVES something: an object with a non-empty string `id` and a
+    `price` that is a non-negative, exactly-representable amount in the ROW's currency.
+
+    The spec's option is `{id, name, selected, price: {amount, currency}}`. `[{}]` used to pass
+    the "non-empty list of objects" rule, which made an empty object shipping proof. An option we
+    could not select (no id) or whose cost we cannot state in the buyer's currency is not
+    evidence that the merchant ships to this buyer at a price we can check. Free shipping is
+    `0.00` and passes (`_component_minor` accepts zero); a negative price is refused.
+    """
+    if not isinstance(option, dict):
+        return False
+    option_id = option.get("id")
+    if not isinstance(option_id, str) or not option_id.strip():
+        return False
+    price = _money(option.get("price"))
+    currency = str(row.get("currency") or "").strip().upper()
+    if price is None or not currency or price[1] != currency:
+        return False
+    return _component_minor(price[0], currency) is not None
+
+
 # ── start_purchase ───────────────────────────────────────────────────────────────────────────
 
 
@@ -978,13 +1119,21 @@ async def start_purchase(
     agent_id: str,
     agent_user_ref_hash: str,
     buyer_ref: str,
-    row: PurchaseRow,
+    row: Optional[PurchaseRow] = None,
     buyer: BuyerContact,
     quantity: int,
     click_id: Optional[str],
     return_url: str,
+    cart_link: Optional[CartLinkItem] = None,
 ) -> str:
     """Open a purchase in 'resolving' and return its id. MAKES NO PARTNER CALL.
+
+    EXACTLY ONE OF `row` (a catalog row the resolver turns into a Reap variant) and `cart_link`
+    (a Shopify cart permalink Reap quotes as received — see `CartLinkItem`). A `row` call is the
+    path every caller before the cart-link lane takes, and it is unchanged. A `cart_link` call
+    additionally needs `REAP_AGENTIC_CART_LINK_ENABLED` and `rc.supports_cart_link_quote()`, and
+    refuses with its own codes (`cart_link_disabled`, `cart_link_quote_unsupported`,
+    `cart_link_refused`) before anything else about it is looked at.
 
     EVERY REFUSAL HAPPENS BEFORE THE INSERT, and that ordering is the contract this function is
     tested on (`test_every_refusal_leaves_the_table_empty` counts rows). A row written and then
@@ -1006,8 +1155,19 @@ async def start_purchase(
     #    that could tell a caller something about our configuration.
     if not is_enabled():
         raise PurchaseRefused("rail_disabled", f"{REAP_AGENTIC_ENABLED_ENV} is not set")
+    if cart_link is not None and not is_cart_link_enabled():
+        raise PurchaseRefused(
+            "cart_link_disabled", f"{REAP_AGENTIC_CART_LINK_ENABLED_ENV} is not set"
+        )
     if not rc.is_configured():
         raise PurchaseRefused("rail_unconfigured", "the Reap client has no base URL or key")
+    if cart_link is not None and not rc.supports_cart_link_quote():
+        # Reap has not published the quote field for a cart permalink. Refused here rather than
+        # at the first quote so no row — and no copy of the buyer's address — exists for a
+        # purchase that cannot be quoted.
+        raise PurchaseRefused(
+            "cart_link_quote_unsupported", "the Reap client has no cart-link quote field yet"
+        )
 
     # 2. OWNERSHIP. The ledger refuses a blank agent_id / agent_user_ref_hash too; this is the
     #    earlier, better-worded copy, and `buyer_ref` is checked here because the ledger's own
@@ -1015,6 +1175,20 @@ async def start_purchase(
     agent_id = _require_text(agent_id, "agent_id")
     agent_user_ref_hash = _require_text(agent_user_ref_hash, "agent_user_ref_hash")
     buyer_ref = _require_text(buyer_ref, "buyer_ref")
+
+    if cart_link is not None:
+        if row is not None:
+            raise PurchaseRefused("invalid_request", "pass a row or a cart_link, not both")
+        return await _start_cart_link_purchase(
+            agent_id=agent_id,
+            agent_user_ref_hash=agent_user_ref_hash,
+            buyer_ref=buyer_ref,
+            item=cart_link,
+            buyer=buyer,
+            quantity=quantity,
+            click_id=click_id,
+            return_url=return_url,
+        )
 
     # 3. THE ROW.
     if not isinstance(row, PurchaseRow):
@@ -1082,44 +1256,11 @@ async def start_purchase(
     if not (1 <= quantity <= MAX_QUANTITY):
         raise PurchaseRefused("invalid_request", f"quantity must be 1..{MAX_QUANTITY}")
 
-    # 5. THE BUYER. Both values go to a third party, so both are checked by the CLIENT'S OWN
-    #    rules — `build_shipping_address` is what decides which address fields exist and which
-    #    are required, and a second opinion here would be a second contract to keep in step.
-    if not isinstance(buyer, BuyerContact):
-        raise PurchaseRefused("invalid_request", "buyer must be a BuyerContact")
-    email = _clean_buyer_text(buyer.email)
-    if not _EMAIL_RE.match(email) or not _is_clean(email):
-        raise PurchaseRefused("invalid_request", "buyer.email is not an email address")
+    # 5. THE BUYER.
+    email, shipping = _validated_buyer(buyer)
 
-    # Cleaned BEFORE the client's builder sees it, so the value that is validated, the value that
-    # is stored and the value that reaches Reap are the same string. Cleaning after validation
-    # would mean we validated one string and sent another.
-    raw_address = buyer.shipping_address or {}
-    if not isinstance(raw_address, Mapping):
-        raise PurchaseRefused("invalid_address", "buyer.shipping_address must be a mapping")
-    cleaned_address = {key: _clean_buyer_text(value) for key, value in raw_address.items()}
-    if not all(_is_clean(value) for value in cleaned_address.values()):
-        raise PurchaseRefused(
-            "invalid_address", "shipping address contains characters that are not printable"
-        )
-    try:
-        shipping = rc.build_shipping_address(cleaned_address)
-    except rc.ReapRequestError as exc:
-        # The client's message names the MISSING KEYS and nothing else — no values — so it is
-        # safe to carry. `str(exc)` on this path has been checked for that.
-        raise PurchaseRefused("invalid_address", str(exc)) from None
-    if not shipping:
-        raise PurchaseRefused("invalid_address", "a shipping address is required")
-
-    # 6. THE RETURN URL, through the client's validator: https, no userinfo, an allowlisted host.
-    #    Both stage variants are built now, so a URL that cannot carry our query string is a
-    #    refusal here rather than a failure three states later.
-    try:
-        rc.validate_return_url(return_url)
-        _stage_url(return_url, "enroll")
-        _stage_url(return_url, "checkout")
-    except rc.ReapRequestError as exc:
-        raise PurchaseRefused("invalid_return_url", str(exc)) from None
+    # 6. THE RETURN URL.
+    _validated_return_url(return_url)
 
     try:
         created = await ledger.create_purchase(
@@ -1161,6 +1302,156 @@ async def start_purchase(
     return str(created["id"])
 
 
+def _validated_buyer(buyer: Any) -> Tuple[str, Dict[str, str]]:
+    """The buyer's email and WHITELISTED shipping address, or `PurchaseRefused`.
+
+    Both values go to a third party, so both are checked by the CLIENT'S OWN rules —
+    `build_shipping_address` is what decides which address fields exist and which are required,
+    and a second opinion here would be a second contract to keep in step. Shared by both item
+    sources, so the two lanes cannot come to disagree about what a buyer is.
+    """
+    if not isinstance(buyer, BuyerContact):
+        raise PurchaseRefused("invalid_request", "buyer must be a BuyerContact")
+    email = _clean_buyer_text(buyer.email)
+    if not _EMAIL_RE.match(email) or not _is_clean(email):
+        raise PurchaseRefused("invalid_request", "buyer.email is not an email address")
+
+    # Cleaned BEFORE the client's builder sees it, so the value that is validated, the value that
+    # is stored and the value that reaches Reap are the same string. Cleaning after validation
+    # would mean we validated one string and sent another.
+    raw_address = buyer.shipping_address or {}
+    if not isinstance(raw_address, Mapping):
+        raise PurchaseRefused("invalid_address", "buyer.shipping_address must be a mapping")
+    cleaned_address = {key: _clean_buyer_text(value) for key, value in raw_address.items()}
+    if not all(_is_clean(value) for value in cleaned_address.values()):
+        raise PurchaseRefused(
+            "invalid_address", "shipping address contains characters that are not printable"
+        )
+    try:
+        shipping = rc.build_shipping_address(cleaned_address)
+    except rc.ReapRequestError as exc:
+        # The client's message names the MISSING KEYS and nothing else — no values — so it is
+        # safe to carry. `str(exc)` on this path has been checked for that.
+        raise PurchaseRefused("invalid_address", str(exc)) from None
+    if not shipping:
+        raise PurchaseRefused("invalid_address", "a shipping address is required")
+    return email, dict(shipping)
+
+
+def _validated_return_url(return_url: Any) -> str:
+    """The return URL through the client's validator: https, no userinfo, an allowlisted host.
+
+    Both stage variants are built now, so a URL that cannot carry our query string is a refusal
+    here rather than a failure three states later.
+    """
+    try:
+        rc.validate_return_url(return_url)
+        _stage_url(return_url, "enroll")
+        _stage_url(return_url, "checkout")
+    except rc.ReapRequestError as exc:
+        raise PurchaseRefused("invalid_return_url", str(exc)) from None
+    return rc.validate_return_url(return_url)
+
+
+async def _start_cart_link_purchase(
+    *,
+    agent_id: str,
+    agent_user_ref_hash: str,
+    buyer_ref: str,
+    item: Any,
+    buyer: Any,
+    quantity: Any,
+    click_id: Optional[str],
+    return_url: Any,
+) -> str:
+    """The cart-link half of `start_purchase`. The dials and ownership are already checked.
+
+    SAME CONTRACT AS THE ROW HALF: every refusal is a `PurchaseRefused` raised BEFORE the
+    INSERT, so a refused purchase leaves no row and no copy of the buyer's address.
+
+    THE URL IS NEVER IN A MESSAGE. A refused cart link may be carrying exactly the
+    `checkout[...]` PII it was refused for; `cart_link_refused` carries the validator's reason
+    CODE, which is a fixed vocabulary word.
+    """
+    if not isinstance(item, CartLinkItem):
+        raise PurchaseRefused("invalid_request", "cart_link must be a CartLinkItem")
+    shop_domain = _require_text(item.shop_domain, "cart_link.shop_domain").lower()
+    currency = _require_text(item.currency, "cart_link.currency").upper()
+    if not _CURRENCY_RE.match(currency):
+        raise PurchaseRefused("invalid_request", "cart_link.currency must be a 3-letter ISO code")
+    if currency in THREE_DECIMAL_CURRENCIES:
+        raise PurchaseRefused(
+            "currency_unsupported",
+            f"{currency} has three minor-unit decimals and this rail's converter assumes two",
+        )
+    if (
+        isinstance(item.our_price_minor, bool)
+        or not isinstance(item.our_price_minor, int)
+        or item.our_price_minor <= 0
+    ):
+        raise PurchaseRefused(
+            "invalid_request", "cart_link.our_price_minor must be a positive int"
+        )
+    market_country = str(item.market_country or "").strip().upper()
+    if not re.match(r"^[A-Z]{2}\Z", market_country):
+        # REQUIRED on this lane, unlike a row's: the URL's `country=` pin is compared against it,
+        # and without a pin the checkout's market is whatever Reap's egress IP resolves to.
+        raise PurchaseRefused("invalid_request", "cart_link.market_country must be two letters")
+
+    if isinstance(quantity, bool) or not isinstance(quantity, int):
+        raise PurchaseRefused("invalid_request", "quantity must be an int")
+    if not (1 <= quantity <= MAX_QUANTITY):
+        raise PurchaseRefused("invalid_request", f"quantity must be 1..{MAX_QUANTITY}")
+    click = _require_text(click_id, "click_id")
+
+    # THE GATE. Against the values that will be stored, so the check here and the ledger's own
+    # re-check see the same inputs.
+    reason = cart_link_refusal(
+        item.cart_url, click_id=click, shop_domain=shop_domain, market=market_country
+    )
+    if reason is not None:
+        raise PurchaseRefused("cart_link_refused", reason)
+    line = cart_link_line(item.cart_url)
+    if line is None or line[1] != quantity:
+        # The URL names its own quantity and Reap checks the URL out as received, so a second
+        # number that disagrees with it is a number nothing would honour.
+        raise PurchaseRefused("cart_link_refused", "quantity_mismatch")
+
+    email, shipping = _validated_buyer(buyer)
+    validated_return_url = _validated_return_url(return_url)
+
+    try:
+        created = await ledger.create_purchase(
+            buyer_ref=buyer_ref,
+            agent_id=agent_id,
+            agent_user_ref_hash=agent_user_ref_hash,
+            merchant_domain=shop_domain,
+            product_key=str(item.product_key or "").strip() or None,
+            product_name=str(item.product_name or "").strip() or None,
+            quantity=quantity,
+            currency=currency,
+            our_price_minor=item.our_price_minor,
+            click_id=click,
+            return_url=validated_return_url,
+            market_country=market_country,
+            shipping_address=shipping,
+            buyer_email=email,
+            item_source="cart_link",
+            cart_url=item.cart_url,
+        )
+    except ValueError as exc:
+        # The ledger's messages name a field and a rule, never a value, and its cart_url refusal
+        # carries only the validator's reason code.
+        raise PurchaseRefused("invalid_request", str(exc)) from None
+    logger.info(
+        "reap_agentic: purchase opened id=%s merchant=%s state=%s item_source=cart_link",
+        created["id"],
+        shop_domain,
+        created["state"],
+    )
+    return str(created["id"])
+
+
 # ── advance ──────────────────────────────────────────────────────────────────────────────────
 
 
@@ -1174,6 +1465,69 @@ def _next_poll_for(to_state: str) -> datetime:
     if to_state in HUMAN_WAIT_STATES:
         return _now() + timedelta(seconds=POLL_INTERVALS[to_state])
     return _now()
+
+
+def _is_cart_link(row: Mapping[str, Any]) -> bool:
+    """A cart-link row? Anything else — including a row read before mig 226 existed, where the
+    column is absent — is the variant lane, which is what the column's DEFAULT says too."""
+    return str(row.get("item_source") or "reap_variant") == "cart_link"
+
+
+def _cart_link_verdict(row: Mapping[str, Any]) -> Optional[Tuple[str, str]]:
+    """None when a cart-link row may take its next PRE-CHECKOUT step; else
+    `(refusal_reason, last_error_code)`.
+
+    RE-CHECKED ON EVERY STEP, NOT TRUSTED FROM THE CREATE. The dials can be turned off, the
+    client can lose its field name in a rollback, and a row can be written by something that is
+    not `start_purchase`. So before each quote-side step: both dials, the client's support, and
+    the stored URL through the same validator against the STORED click id, merchant and market —
+    which is what makes "the row's click id is the one in the URL" true at the moment the URL is
+    about to leave for Reap, not only at the moment it was written.
+    """
+    if not (is_enabled() and is_cart_link_enabled()):
+        return "cart_link_disabled", "cart_link_disabled"
+    if not rc.supports_cart_link_quote():
+        return "cart_link_quote_unsupported", "cart_link_quote_unsupported"
+    reason = cart_link_refusal(
+        row.get("cart_url"),
+        click_id=row.get("click_id"),
+        shop_domain=row.get("merchant_domain"),
+        market=row.get("market_country"),
+    )
+    if reason is not None:
+        return "cart_link_invalid", _error_code(f"cart_link_{reason}") or "cart_link_invalid"
+    line = cart_link_line(row.get("cart_url"))
+    if line is None or line[1] != row.get("quantity"):
+        return "cart_link_invalid", "cart_link_quantity_mismatch"
+    return None
+
+
+def _cart_link_attribution_mismatch(row: Mapping[str, Any]) -> Optional[str]:
+    """None when a cart-link row agrees with its own stored URL; else the `last_error_code` that
+    suppresses its attribution edge.
+
+    THE FULL VALIDATOR AND THE QUANTITY, not the click id alone. It is the same check every
+    pre-checkout step makes, against the STORED click id, shop, market and quantity, run again
+    at the sink, where being wrong writes a PERMANENT edge. A click that differs is named
+    `cart_link_click_id_mismatch`. Anything else (another shop, another market, another
+    quantity, a URL that no longer validates) is `cart_link_attribution_unverified`. The DIALS
+    are not consulted: the charge has already happened, and whether to record it is not a
+    question a kill switch answers.
+    """
+    reason = cart_link_refusal(
+        row.get("cart_url"),
+        click_id=row.get("click_id"),
+        shop_domain=row.get("merchant_domain"),
+        market=row.get("market_country"),
+    )
+    if reason == "click_id_mismatch":
+        return "cart_link_click_id_mismatch"
+    if reason is not None:
+        return "cart_link_attribution_unverified"
+    line = cart_link_line(row.get("cart_url"))
+    if line is None or line[1] != row.get("quantity"):
+        return "cart_link_attribution_unverified"
+    return None
 
 
 def _lost(row: Mapping[str, Any]) -> AdvanceResult:
@@ -1339,6 +1693,19 @@ async def _step_resolving(row: Mapping[str, Any], worker_id: str) -> AdvanceResu
         return _lost(row)
     row = guarded
 
+    if _is_cart_link(row):
+        # NO RESOLVE. The cart link IS the item; there is no Reap variant to find and no catalog
+        # price to compare one against — the quote step's subtotal check is this lane's price
+        # check. What this step still does is the part that is not about the item: the buyer's
+        # card.
+        verdict = _cart_link_verdict(row)
+        if verdict is not None:
+            return await _move(
+                row, worker_id, ["resolving"], "refused",
+                refusal_reason=verdict[0], last_error_code=verdict[1],
+            )
+        return await _resolving_to_enrollment(row, worker_id, {})
+
     resolution = await rc.resolve_our_row(**_resolution_inputs(row))
     queries = list(getattr(resolution, "queries_tried", None) or [])
 
@@ -1363,7 +1730,19 @@ async def _step_resolving(row: Mapping[str, Any], worker_id: str) -> AdvanceResu
         "reap_variant_id": _cap(resolution.variant_id),
         "queries_tried": queries,
     }
+    return await _resolving_to_enrollment(row, worker_id, evidence)
 
+
+async def _resolving_to_enrollment(
+    row: Mapping[str, Any], worker_id: str, evidence: Mapping[str, Any]
+) -> AdvanceResult:
+    """The second half of 'resolving', shared by both item sources: does the buyer have a card?
+
+    `evidence` is written on every transition out of here — the resolver's handles on the
+    variant lane, nothing on the cart-link lane (it has no resolver). Split out of
+    `_step_resolving` unchanged so the two lanes cannot come to disagree about enrollment.
+    """
+    evidence = dict(evidence)
     active = await ledger.get_active_enrollment(str(row["buyer_ref"]))
     if active is not None:
         return await _move(
@@ -1582,6 +1961,9 @@ async def _step_quoting(row: Mapping[str, Any], worker_id: str) -> AdvanceResult
             row, worker_id, ["quoting"], "failed", last_error_code="partner_id_malformed"
         )
 
+    if _is_cart_link(row):
+        return await _quote_cart_link(row, worker_id, active, partner_enrollment)
+
     resolution = await rc.resolve_our_row(**_resolution_inputs(row))
     queries = list(getattr(resolution, "queries_tried", None) or [])
     if not resolution.ok:
@@ -1606,6 +1988,87 @@ async def _step_quoting(row: Mapping[str, Any], worker_id: str) -> AdvanceResult
         email=row.get("buyer_email"),
         shipping_address=row.get("shipping_address"),
     )
+    return await _checkout_from_quote(
+        row,
+        worker_id,
+        active,
+        partner_enrollment,
+        quote,
+        item_evidence={
+            "reap_product_id": _cap(resolution.product_id),
+            "reap_variant_id": _cap(resolution.variant_id),
+            "queries_tried": queries,
+        },
+        check=lambda data: verify_quote(data, row, variant_id=resolution.variant_id),
+    )
+
+
+async def _quote_cart_link(
+    row: Mapping[str, Any],
+    worker_id: str,
+    active: Mapping[str, Any],
+    partner_enrollment: str,
+) -> AdvanceResult:
+    """'quoting' for a CART-LINK row: re-check the row, quote the URL, then the shared tail.
+
+    `rc.resolve_our_row` is NOT called — there is nothing to resolve; the URL names the line.
+    The quote is `rc.request_cart_link_quote`, which is `request_quote`'s transport with a
+    different body, and the verdict is `verify_cart_link_quote`. Everything from the quote id
+    onward — the checkout, the hosted page, the evidence written on every exit — is the same
+    code the variant lane runs.
+    """
+    verdict = _cart_link_verdict(row)
+    if verdict is not None:
+        return await _move(
+            row, worker_id, ["quoting"], "refused",
+            refusal_reason=verdict[0], last_error_code=verdict[1],
+        )
+
+    if await _still_ours(row, worker_id) is None:
+        return _lost(row)
+    try:
+        quote = await rc.request_cart_link_quote(
+            cart_url=row.get("cart_url"),
+            email=row.get("buyer_email"),
+            shipping_address=row.get("shipping_address"),
+        )
+    except rc.ReapRequestError as exc:
+        # Raised BEFORE egress by the body builder. Its own code when it has one (the field name
+        # went away between the verdict above and here); a generic one otherwise. `str(exc)` is
+        # not used: the builder's messages carry no values, but nothing on this path needs one.
+        code = str(getattr(exc, "code", "") or "cart_link_quote_unbuildable")
+        return await _move(
+            row, worker_id, ["quoting"], "refused",
+            refusal_reason=_cap(code), last_error_code=_error_code(code),
+        )
+    return await _checkout_from_quote(
+        row,
+        worker_id,
+        active,
+        partner_enrollment,
+        quote,
+        item_evidence={},
+        check=lambda data: verify_cart_link_quote(data, row),
+    )
+
+
+async def _checkout_from_quote(
+    row: Mapping[str, Any],
+    worker_id: str,
+    active: Mapping[str, Any],
+    partner_enrollment: str,
+    quote: Any,
+    *,
+    item_evidence: Mapping[str, Any],
+    check: Any,
+) -> AdvanceResult:
+    """The tail of 'quoting', shared by both item sources: from a quote response to a checkout.
+
+    `item_evidence` is what the item lane knows about the object (the resolver's handles, or
+    nothing); `check` is that lane's verdict on the quote payload. Everything else — the failure
+    mapping, the quote id rules, the expiry check, the checkout create and every evidence write
+    on the way out — is ONE body, moved here unchanged from `_step_quoting`.
+    """
     if not quote.ok:
         code = str(quote.error or "quote_failed")
         if _is_transport(code):
@@ -1635,11 +2098,9 @@ async def _step_quoting(row: Mapping[str, Any], worker_id: str) -> AdvanceResult
 
     quote_expires = _parse_ts(quote.data.get("expiresAt"))
     evidence: Dict[str, Any] = {
-        "reap_product_id": _cap(resolution.product_id),
-        "reap_variant_id": _cap(resolution.variant_id),
+        **item_evidence,
         "reap_quote_id": quote_id,
         "reap_quote_expires_at": quote_expires,
-        "queries_tried": queries,
         # P2-7: the enrollment this checkout is about to be BOUND TO, written onto the row in the
         # same transition. The resolving step wrote whatever was active then; a buyer who
         # re-enrolled since has a different active row, and a purchase pointing at the old one
@@ -1650,18 +2111,18 @@ async def _step_quoting(row: Mapping[str, Any], worker_id: str) -> AdvanceResult
     # THE QUOTE IS THE NUMBER THAT DECIDES THE CHARGE, so it is checked before anything is
     # created. See `verify_quote` for the three measured ways the previous code reached a live
     # hosted checkout without ever comparing it to the purchase we opened.
-    check = verify_quote(quote.data, row, variant_id=resolution.variant_id)
-    if not check.ok:
+    verdict = check(quote.data)
+    if not verdict.ok:
         return await _move(
             row, worker_id, ["quoting"], "refused",
-            refusal_reason=check.refusal_reason,
-            last_error_code=check.last_error_code,
+            refusal_reason=verdict.refusal_reason,
+            last_error_code=verdict.last_error_code,
             **evidence,
         )
     evidence.update(
-        quoted_total_minor=check.total_minor,
-        shipping_minor=check.shipping_minor,
-        tax_minor=check.tax_minor,
+        quoted_total_minor=verdict.total_minor,
+        shipping_minor=verdict.shipping_minor,
+        tax_minor=verdict.tax_minor,
     )
 
     # P2-9: a quote we already know is dead must not become a checkout. `reap_quote_expires_at`
@@ -1905,8 +2366,42 @@ async def _complete(
         reason = "final_amount_missing"
     elif not charged_agrees:
         reason = "charged_total_differs"
+    elif _is_cart_link(row) and _cart_link_attribution_mismatch(row):
+        # THE URL AT THE SINK. On this lane the merchant's order carries whatever click id was IN
+        # THE URL Reap checked out, and the edge is keyed on the row's `click_id` and shop. They
+        # were checked equal at create and before every quote; they are checked again here,
+        # where being wrong writes a PERMANENT edge (`ON CONFLICT DO NOTHING`).
+        reason = _cart_link_attribution_mismatch(row)
     else:
         reason = None
+
+    # ── THE CLICK CLAIM (mig 228), cart-link rows only ──────────────────────────────────────
+    #
+    # The merchant's own Shopify order carries this same click id, so the `orders/paid` webhook
+    # and the read_orders poller can close this SAME sale under (tenant merchant, Shopify order
+    # id), a key that never collides with ours. First writer wins, one INSERT, no transaction
+    # (see services/conversion_click_claims). Taken BEFORE the completing write so that the
+    # outcome lands in `last_error_code` in the SAME write: a completed row cannot be written
+    # again.
+    #
+    # FAILS CLOSED: an error taking the claim skips our edge and says so. The merchant side,
+    # which fails open, can still close the sale, so the error costs at most our edge and can
+    # never double it.
+    claimed = False
+    if reason is None and _is_cart_link(row):
+        try:
+            claimed = await ccc.claim_click(
+                row.get("click_id"), claimed_by=ccc.REAP_CLAIMANT, external_order_id=order_id
+            )
+        except Exception as exc:  # noqa: BLE001 — fail closed, by design
+            logger.warning(
+                "reap_agentic: purchase=%s attribution claim failed error_type=%s",
+                row["id"], type(exc).__name__,
+            )
+            reason = ccc.ATTRIBUTION_CLAIM_UNAVAILABLE
+        else:
+            if not claimed:
+                reason = ccc.CLOSED_BY_OTHER_CHANNEL
 
     moved = await _move(
         row, worker_id, [from_state], "completed",
@@ -1917,7 +2412,12 @@ async def _complete(
     if moved.outcome != "advanced":
         # THE HOOK IS AFTER THE FENCE, NOT BEFORE IT. A lost claim means somebody else moved this
         # row — possibly a sweep that failed it — and closing a conversion for a purchase we did
-        # not complete puts GMV in the attribution ledger that no order backs.
+        # not complete puts GMV in the attribution ledger that no order backs. A click claim we
+        # took for it is given back, so the merchant side can still close the sale.
+        if claimed:
+            await ccc.release_click_claim(
+                row.get("click_id"), claimed_by=ccc.REAP_CLAIMANT, external_order_id=order_id
+            )
         return moved
 
     if reason is not None:
@@ -1933,11 +2433,32 @@ async def _complete(
     # `buyer_email` and `shipping_address`, so what comes back has no PII in it at all — which is
     # exactly the row the hook should see.
     completed = await ledger.get_purchase_internal(str(row["id"])) or {}
-    await _close_attribution(completed)
+    closed = await _close_attribution(completed)
+    if claimed and not closed:
+        # We own the click but wrote no edge. Give the claim back so the merchant side can.
+        await ccc.release_click_claim(
+            row.get("click_id"), claimed_by=ccc.REAP_CLAIMANT, external_order_id=order_id
+        )
     return moved
 
 
-async def _close_attribution(purchase: Mapping[str, Any]) -> None:
+def _converting_shop_domain(purchase: Mapping[str, Any]) -> str:
+    """The shop the sale happened on, in the form the seller-mismatch guard compares.
+
+    For a cart-link row it is the HOST OF THE STORED URL, exactly as validated: apex or `www.`.
+    That is the host the click was minted for (the click's `dest_domain`), and the attribution
+    guard compares the two without folding `www.` (normalize_shop_host does not strip it). So
+    passing the bare `merchant_domain` for a `www.` link stamps `seller_mismatch` and EXCLUDES a
+    legitimate edge. Only this lane's argument changes; the shared normalisation does not.
+    """
+    if _is_cart_link(purchase):
+        host = urlsplit(str(purchase.get("cart_url") or "")).hostname
+        if host:
+            return host
+    return str(purchase.get("merchant_domain") or "")
+
+
+async def _close_attribution(purchase: Mapping[str, Any]) -> bool:
     """Tell the attribution ledger a Pivota-referred order closed. NEVER FAILS THE PURCHASE.
 
     The purchase row is ALREADY 'completed' and terminal when this runs, so there is nothing to
@@ -1948,6 +2469,9 @@ async def _close_attribution(purchase: Mapping[str, Any]) -> None:
     So the exception TYPE is logged and nothing else. Not the message: this call touches
     `surface_click_events` and an integrity error's message can carry row content. A follow-up
     reconciliation job is the answer to a systematically failing hook, not a louder failure here.
+
+    Returns True when the close ran without raising, so `_complete` can give back a click claim
+    (mig 228) whose edge was never written.
     """
     from services.commerce_attribution_service import close_external_order_conversion
 
@@ -1963,7 +2487,7 @@ async def _close_attribution(purchase: Mapping[str, Any]) -> None:
             "and a positive amount",
             purchase.get("id"),
         )
-        return
+        return False
 
     try:
         await close_external_order_conversion(
@@ -1982,7 +2506,7 @@ async def _close_attribution(purchase: Mapping[str, Any]) -> None:
                 "purchase_id": purchase.get("id"),
                 "reap_checkout_id": purchase.get("reap_checkout_id"),
             },
-            converting_shop_domain=str(purchase.get("merchant_domain") or ""),
+            converting_shop_domain=_converting_shop_domain(purchase),
             is_self_report=False,
         )
     except Exception as exc:  # noqa: BLE001 — deliberately broad; see the docstring
@@ -1991,6 +2515,8 @@ async def _close_attribution(purchase: Mapping[str, Any]) -> None:
             purchase.get("id"),
             type(exc).__name__,
         )
+        return False
+    return True
 
 
 #: state -> the coroutine that advances it. A dict rather than an if-chain so that

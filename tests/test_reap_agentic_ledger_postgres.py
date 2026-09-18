@@ -68,6 +68,12 @@ _MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "db/migrations"
 _MIGRATIONS = (
     _MIGRATIONS_DIR / "224_reap_agentic_ledger.sql",
     _MIGRATIONS_DIR / "225_reap_agentic_purchase_hints.sql",
+    # 226 adds item_source + cart_url (the cart-link lane). Without it the whole-table parity
+    # test compares a self-heal that HAS them against a migration build that does not.
+    _MIGRATIONS_DIR / "226_reap_agentic_purchase_item_source.sql",
+    # 228 adds idx_reap_agentic_purchases_click_id to this table (and the click-claims table).
+    # The self-heal builds that index, so the whole-table parity test needs the migration too.
+    _MIGRATIONS_DIR / "228_conversion_click_claims.sql",
 )
 _MIGRATION = _MIGRATIONS[0]
 
@@ -2782,7 +2788,8 @@ async def test_the_self_heal_adds_the_hint_columns_to_a_224_shaped_database():
     await ensure_required_schema_light()
 
     after = await _purchase_columns()
-    assert after - before == set(_HINT_COLUMNS), (
+    # A 224-shaped database is also pre-226, so the same heal lands mig 226's two columns.
+    assert after - before == set(_HINT_COLUMNS) | {"item_source", "cart_url"}, (
         f"the heal on a 224-shaped database added {sorted(after - before)}"
     )
     purchase = await _mk(accept_variant_labels=["Nude Glow"], market_country="US")
@@ -2863,6 +2870,8 @@ async def test_the_new_columns_are_partitioned_between_public_and_never_public()
         "reap_quote_id", "reap_checkout_id", "queries_tried", "attempts", "next_poll_at",
         "claimed_by", "claimed_at", "state_entered_at",
         "accept_variant_labels", "also_accept_domains", "market_country",
+        # mig 226 — see the SQLite twin of this list for why neither is public.
+        "item_source", "cart_url",
     }
     columns = await _purchase_columns()
     unclassified = columns - _EXPECTED_PUBLIC_COLUMNS - never_public
