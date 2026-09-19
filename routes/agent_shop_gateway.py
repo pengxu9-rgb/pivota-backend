@@ -37,6 +37,10 @@ from pydantic import BaseModel, Field, ConfigDict
 from config.settings import resolve_public_api_base_url, settings
 from services.seed_variant_options import seed_variant_options_as_mapping
 from services.outbound_warm_handoff import could_upgrade_at_click_time
+from services.offer_buyability import (
+    OFFER_UNAVAILABLE_AVAILABILITIES,
+    availability_is_known_unavailable,
+)
 from services import market_telemetry
 from db.database import database
 from models.catalog import PivotPaymentContext, PivotQueryRequest, PivotResultItem
@@ -3698,12 +3702,9 @@ def _build_internal_offer_summary(
     # demoting it. Reading the gate's own function makes the two agree by construction; with no
     # variant to ship, it reads the product the way the gate does for a product with none.
     #
-    # One input gap remains and it is the gate's, not this flag's: the gate reads the product
-    # after a StandardProduct round-trip, and StandardProductVariant has no `available` field,
-    # so for a well-formed product the gate never sees `available` (it reads quantity). A
-    # gate-picked variant is that normalized dict, so the two read the same bytes; only the
-    # relaxed `variants[0]` fallback reaches here raw. Measured 2026-09-18: 0 of 82
-    # products_cache rows carry `available` on a variant, and 0 flip this flag.
+    # StandardProductVariant retains `available`, including the sellability that the Shopify
+    # adapter derives from inventory tracking and continue-selling policy. Legacy cache rows
+    # lacking that field still fall back to quantity until refreshed.
     in_stock = standard_variant_in_stock(
         variant_payload if variant_payload else product_as_standard_variant(product_payload)
     )
@@ -3851,24 +3852,12 @@ def _attach_eligible_serving_fields_to_items(
     return attached_items
 
 
-# "THIS SELLER CANNOT SELL IT", spelled once. The catalog arm's SQL ORDER BY binds this set, the
-# `in_stock` flag that arm emits is derived from it, and `_rank_offers_merit_first` reads that flag —
-# so the order an offer ships in can never contradict the stock claim printed on it.
-#
-# UNKNOWN IS NOT OUT OF STOCK. `unknown` (the column's server default), NULL, empty or any value
-# not in this set ranks WITH the in-stock offers, by price, and never behind them. Two reasons, both measured rather than preferred:
-#   1. Every lane already reports it that way: the seed lane maps `availability: "unknown"` to
-#      `in_stock: True`, and this arm maps NULL to `in_stock: True`. A three-way rank (in stock >
-#      unknown > out of stock) could only be applied where the raw column survives, i.e. to this
-#      arm alone, and would then order offers by a distinction the flag on them does not show —
-#      and that the gateway's `best_offer`, which reads the flag, could not reproduce.
-#   2. Absence of a stock statement is not evidence against a seller. Demoting it is the same
-#      error the gateway's verification tier refuses to make for an unchecked offer.
-# In prod on 2026-09-18 every live retailer offer said `in_stock` (1,178) or `out_of_stock` (86),
-# so the choice changes no row served today; it decides what the next feed with gaps gets.
-OFFER_UNAVAILABLE_AVAILABILITIES: frozenset[str] = frozenset(
-    {"out_of_stock", "outofstock", "sold_out", "soldout", "unavailable"}
-)
+# "THIS SELLER CANNOT SELL IT" is spelled once: OFFER_UNAVAILABLE_AVAILABILITIES, in
+# services/offer_buyability.py (moved from here so agent_pdp_view's offer order binds the same set
+# without a service importing a router; why unknown ranks WITH in stock is documented there). The
+# catalog arm's SQL ORDER BY binds it, the `in_stock` flag that arm emits is derived from it, and
+# `_rank_offers_merit_first` reads that flag — so the order an offer ships in can never contradict
+# the stock claim printed on it.
 
 
 def _offer_is_known_unavailable(offer: Dict[str, Any]) -> bool:
@@ -3887,11 +3876,9 @@ def _offer_is_known_unavailable(offer: Dict[str, Any]) -> bool:
     the handler falls back to `variants[0]` when no variant passes the gate, so a genuinely sold
     out buy-here offer shipped and, exempt, won an equal-fit tie over an in-stock referral.
 
-    Not covered, because the flag cannot know: a Shopify product the adapter synced stores no
-    `available` per variant, so an untracked / keep-selling variant arrives at quantity 0 and
-    the gate itself calls it sold out. Here it ranks behind an equal-fit sellable offer (in
-    STRICT mode the gate never ships it at all). Measured 2026-09-18: 3 of 82 products_cache
-    rows had that shape, all expired; 0 of the 24 live rows.
+    Legacy Shopify cache rows without per-variant `available` still use quantity until refreshed.
+    The 2026-09-18 census found three possible keep-selling rows, all expired; none of the 24
+    live rows had that shape.
     """
     return offer.get("in_stock") is False
 
@@ -5989,8 +5976,7 @@ async def _handle_offers_resolve(
                     "price": float(price_amount) if price_amount is not None else None,
                     "currency": str(r.get("currency") or "USD").strip() or "USD",
                     "availability": availability,
-                    "in_stock": (availability or "").strip().lower()
-                    not in OFFER_UNAVAILABLE_AVAILABILITIES,
+                    "in_stock": not availability_is_known_unavailable(availability),
                     "url": destination,
                     "purchase_route": "affiliate_outbound",
                     # NEVER the raw destination under this key. `affiliate_url` MEANS an

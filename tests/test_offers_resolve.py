@@ -1531,8 +1531,8 @@ def test_offers_resolve_exact_internal_beats_exact_external_end_to_end(
 def _stock_tie_fetch_all(internal_variant: dict):
     """One exact internal row (the queried sku, confidence 0.95) and one exact, in-stock
     referral seed for the same sku (1.0) -- the same fit tier, so stock and then
-    transactability decide the order. The product_data carries no platform/merchant_id, so it
-    fails StandardProduct validation and the gate reads the variant raw, `available` first."""
+    transactability decide the order. The cache product is a valid StandardProduct so the
+    gate exercises the same normalization path as real synced products."""
 
     async def fake_fetch_all(query: str, values=None):
         q = str(query)
@@ -1574,11 +1574,14 @@ def _stock_tie_fetch_all(internal_variant: dict):
                     "merchant_id": "merch_stock",
                     "product_data": {
                         "id": "prod_stock_1",
+                        "platform": "shopify",
+                        "merchant_id": "merch_stock",
                         "title": "Internal Serum (buy-here)",
                         "currency": "USD",
                         "price": 24.0,
                         "merchant_name": "Buy-Here Store",
-                        "variants": [{"id": "SKU_STOCK_EXACT", "price": 24.0, **internal_variant}],
+                        "variants": [{"id": "SKU_STOCK_EXACT", "title": "30ml", "price": 24.0,
+                                      **internal_variant}],
                     },
                 }
             ]
@@ -1661,6 +1664,45 @@ def test_untracked_inventory_buy_here_variant_stays_first_at_limit_1(
     assert body["resolution_mode"] == "exact_match"
     assert body["resolved_target"]["variant_id"] == "SKU_STOCK_EXACT"
     assert body["metadata"]["has_internal"] is True
+
+
+@pytest.mark.parametrize(
+    "inventory_management, inventory_policy, expected",
+    [
+        pytest.param(None, "deny", True, id="untracked"),
+        pytest.param("shopify", "continue", True, id="keep_selling"),
+        pytest.param("shopify", "deny", False, id="tracked_sold_out"),
+    ],
+)
+def test_shopify_variant_sellability_survives_cache_roundtrip(
+    inventory_management, inventory_policy, expected
+) -> None:
+    import json
+
+    from adapters.product_adapters import ShopifyProductAdapter
+    from models.standard_product import StandardProduct
+    from services.product_exposure_service import pick_first_eligible_variant_from_standard_product
+
+    raw = {
+        "id": 100,
+        "title": "Shopify serum",
+        "status": "active",
+        "variants": [{
+            "id": 200,
+            "title": "30ml",
+            "price": "24.00",
+            "inventory_quantity": 0,
+            "inventory_management": inventory_management,
+            "inventory_policy": inventory_policy,
+        }],
+    }
+    product = ShopifyProductAdapter.convert_to_standard(raw, merchant_id="merch_stock")
+    # The sync caches product.json(); the gate then validates that JSON as StandardProduct.
+    cached = json.loads(product.model_dump_json())
+    revived = StandardProduct.model_validate(cached)
+    assert revived.variants[0].available is expected
+    assert bool(pick_first_eligible_variant_from_standard_product(cached)) is expected
+    assert product.in_stock is expected
 
 
 def test_offers_resolve_pure_internal_order_unchanged_end_to_end(

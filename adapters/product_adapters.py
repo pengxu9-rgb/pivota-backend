@@ -657,10 +657,14 @@ class ShopifyProductAdapter:
         sellable_variant_count = 0
         min_sellable_price: Optional[float] = None
         if isinstance(raw_variants, list):
-            for v in raw_variants:
+            for variant, v in zip(variants, raw_variants):
                 if not isinstance(v, dict):
                     continue
-                if not _is_variant_sellable(v):
+                # Keep the variant verdict alongside its quantity in products_cache. The
+                # exposure gate reads `available` before quantity, so untracked inventory
+                # and Shopify's continue-selling policy must survive normalization.
+                variant.available = _is_variant_sellable(v)
+                if not variant.available:
                     continue
                 sellable_variant_count += 1
                 try:
