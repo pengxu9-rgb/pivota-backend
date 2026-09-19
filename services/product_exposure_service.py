@@ -111,23 +111,30 @@ def _build_standard_variant_fallback(product: Dict[str, Any]) -> list[Dict[str, 
         if result:
             return result
 
-    return [
-        {
-            "id": product.get("product_id") or product.get("id"),
-            "price": product.get("price"),
-            "currency": product.get("currency"),
-            "inventory_quantity": product.get("inventory_quantity"),
-            "available": product.get("in_stock"),
-            "availability": product.get("availability"),
-        }
-    ]
+    return [product_as_standard_variant(product)]
 
 
-def _standard_variant_reason_codes(variant: Dict[str, Any], *, product_currency: Any) -> list[str]:
-    reasons: list[str] = []
-    price_amount = _coerce_price_amount(variant.get("price"))
-    currency = _coerce_currency(variant.get("currency") or product_currency)
+def product_as_standard_variant(product: Dict[str, Any]) -> Dict[str, Any]:
+    """The single variant the gate reads for a product that lists none."""
+    return {
+        "id": product.get("product_id") or product.get("id"),
+        "price": product.get("price"),
+        "currency": product.get("currency"),
+        "inventory_quantity": product.get("inventory_quantity"),
+        "available": product.get("in_stock"),
+        "availability": product.get("availability"),
+    }
 
+
+def standard_variant_in_stock(variant: Dict[str, Any]) -> bool:
+    """The gate's stock verdict for one variant — the ONE place it is spelled.
+
+    Precedence: `available` (the platform's own "can be bought", which stays True for an
+    untracked or keep-selling variant at quantity 0), then `inventory_quantity > 0`, then the
+    `availability` string. The agent-push gate refuses a variant on `out_of_stock` exactly when
+    this is False, and offers.resolve prints it as an internal offer's `in_stock`, so the flag an
+    agent reads cannot disagree with the gate that decided whether to ship the variant.
+    """
     available = variant.get("available")
     if available is None:
         inventory_quantity = variant.get("inventory_quantity")
@@ -138,8 +145,15 @@ def _standard_variant_reason_codes(variant: Dict[str, Any], *, product_currency:
                 available = None
     if available is None:
         available = _availability_to_in_stock(variant.get("availability"))
+    return bool(available)
 
-    if not bool(available):
+
+def _standard_variant_reason_codes(variant: Dict[str, Any], *, product_currency: Any) -> list[str]:
+    reasons: list[str] = []
+    price_amount = _coerce_price_amount(variant.get("price"))
+    currency = _coerce_currency(variant.get("currency") or product_currency)
+
+    if not standard_variant_in_stock(variant):
         reasons.append("out_of_stock")
     if price_amount is None:
         reasons.append("missing_price")
