@@ -276,7 +276,8 @@ def test_sku_opportunity_scores_bb_lab_prompt_cases():
         "prompt": "bb lab collagen alternatives",
         "substituted_by": "Vital Proteins",
         "engines": ["deepseek", "gemini"],
-        "kind": "branded",
+            "kind": "branded",
+            "evidence_kind": "diagnostic_probe",
         # A branded/specific prompt, not a broad head term — the comparison
         # play stays the prescribed move.
         "broad_head_prompt": False,

@@ -746,11 +746,11 @@ def _sku_prescription_for_gap(
             return _base_payload(
                 primary_gap=primary_gap,
                 headline=(
-                    f"{substitute} owns the broad {prompt} question — "
+                    f"A diagnostic test of the broad {prompt} question named {substitute} — "
                     "win your specific lane first."
                 ),
                 why_this_first=(
-                    f"On {prompt}, AI answers with {substitute}. That's a "
+                    f"In the audit probe for {prompt}, an answer named {substitute} without clearly verifying this SKU. That's a "
                     "big-budget head term — outranking them there is the "
                     "most expensive first fight you can pick. The faster win "
                     "is the specific ask you're already a match for; head "
@@ -784,11 +784,11 @@ def _sku_prescription_for_gap(
         )
         return _base_payload(
             primary_gap=primary_gap,
-            headline=f"When buyers ask for alternatives, AI names {substitute}, not {sku_title}.",
+            headline=f"An audit probe named {substitute} without clearly verifying {sku_title}.",
             why_this_first=(
-                f"On {prompt}, AI answers with {substitute} instead of {sku_title}. "
-                "Those buyers are already shopping your category, they just don't "
-                "have a reason to pick you yet."
+                f"On the diagnostic question {prompt}, an AI answer named {substitute} "
+                f"without clearly verifying {sku_title}. This is a gap in that "
+                "tested answer, not a claim about every shopper question."
             ),
             first_move=f"Publish a comparison — {sku_title} vs {substitute} — showing when you win.",
             self_serve_actions=[
@@ -2909,7 +2909,7 @@ def _evidence_read_for_gap(
         substitute = str(substitution.get("substituted_by") or "a substitute").strip()
         prompt = _sku_query_phrase(substitution.get("prompt") or "")
         return {
-            "summary": f"On {prompt}, AI substitutes {substitute} for this SKU.",
+            "summary": f"In the diagnostic probe for {prompt}, AI named {substitute} without clearly verifying this SKU.",
             "chips": sku_score_chips,
         }
 
@@ -3044,7 +3044,7 @@ def _tracking_metrics_for_gap(
                 f"Answers citing your page for that lane instead of defaulting to {substitute}.",
             ]
         return [
-            f"Alternative prompts that name this SKU instead of {substitute}.",
+            f"Repeat the diagnostic prompt and check whether it clearly identifies this SKU alongside {substitute}.",
             "Answers citing the official comparison page or product proof.",
         ]
     if primary_gap == PRIMARY_SKU_CONTENT_REVISION_GAP:

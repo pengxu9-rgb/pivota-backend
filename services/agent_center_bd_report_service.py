@@ -6359,6 +6359,7 @@ def _grounding_evidence(probe_runs: Any, cap: int = 12) -> List[Dict[str, Any]]:
             "axis_metadata": run.get("axis_metadata"),
             "grounding_sources": sources,
             "evidence_excerpt": excerpt or None,
+            "identity_mismatch": run.get("identity_mismatch"),
             # Whether the SKU was actually found in this answer — lets the
             # narrative use an excerpt as "what's working" proof only when it is
             # a positive result, never a "couldn't find it" line (Fix 3).
@@ -6925,6 +6926,8 @@ def sanitize_report_for_merchant(report: Any) -> Any:
     if not isinstance(report, (dict, list)):
         return report
     clone = copy.deepcopy(report)
+    from services.audit_content_repair import repair_report_content
+    clone = repair_report_content(clone)
     _strip_score_breakdowns(clone)
     _strip_internal_deep_tier(clone)
     return clone
@@ -7350,6 +7353,9 @@ async def build_per_sku_report(
     )
     probe_runs = _merchant_visible_probe_payloads(raw_probe_runs)
     product = _get_product(sku_ctx)
+    from services.probe_identity_guard import guard_probe_identity
+
+    probe_runs = guard_probe_identity(probe_runs, product, sku_ctx)
     deep_landscape_internal = None
     try:
         from services.deep_tier_prompts import build_deep_landscape_rollup
@@ -7508,19 +7514,26 @@ async def build_per_sku_report(
     # "unassessed-competitor-attribute" and even the deterministic fallback was
     # rejected (brief_status=unavailable, run b29d6a0f). The depth is also
     # surfaced on competitor_intel for the UI.
-    next_best_action = await attach_sku_strategic_brief(
-        next_best_action,
-        opportunity=opportunity,
-        attribute_graph=attribute_graph,
-        primary_gaps=primary_gaps,
-        scores=scores,
-        identity=identity,
-        sku_title=(_get_sku(sku_ctx).get("title") or product.get("title")),
-        merchant_host=normalize_host(product.get("canonical_url") or product.get("pdp_url")),
-        competitor_attributes=(
-            competitor_attributes if competitor_attributes != "not_assessed" else None
-        ),
-    )
+    if any(run.get("identity_mismatch") for run in _flatten_probe_runs(probe_runs)):
+        # The free-form brief could turn a wrong-brand retailer source into a
+        # merchant listing/review claim. Keep the deterministic action until
+        # the conflicting source has been re-audited.
+        next_best_action["brief_status"] = "unavailable"
+        next_best_action["brief_debug"] = {"outcome": "identity_conflict"}
+    else:
+        next_best_action = await attach_sku_strategic_brief(
+            next_best_action,
+            opportunity=opportunity,
+            attribute_graph=attribute_graph,
+            primary_gaps=primary_gaps,
+            scores=scores,
+            identity=identity,
+            sku_title=(_get_sku(sku_ctx).get("title") or product.get("title")),
+            merchant_host=normalize_host(product.get("canonical_url") or product.get("pdp_url")),
+            competitor_attributes=(
+                competitor_attributes if competitor_attributes != "not_assessed" else None
+            ),
+        )
     # Surface the competitor intelligence on the report so the merchant/UI can
     # see "what AI says <winner> is known for" directly.
     if isinstance(competitor_attributes, Mapping) and competitor_attributes.get("status") == "assessed":
@@ -13520,6 +13533,10 @@ async def run_brand_report(
                 sku_key, str(merchant_id), audit_run_id,
             )
             sku_ctx = await load_sku_context(sku_key, str(merchant_id))
+            from services.probe_identity_guard import guard_probe_identity
+            probe_runs_by_sku[sku_key] = guard_probe_identity(
+                probe_runs_by_sku[sku_key], _get_product(sku_ctx), sku_ctx,
+            )
             verify_summary, verify_outputs = await _run_deepseek_verify_pass(
                 sku_ctx=sku_ctx,
                 probe_runs=probe_runs_by_sku[sku_key],

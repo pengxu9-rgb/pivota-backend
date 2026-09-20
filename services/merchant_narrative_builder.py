@@ -299,8 +299,8 @@ def _headline_story(
         )
     return (
         f"Shoppers who already know {name} can find you — your listings are "
-        "indexed — but AI does not yet recommend you to new shoppers asking the "
-        "category question."
+        "indexed. In this audit's grounded category probes, an independent "
+        "recommendation was not verified."
     )
 
 
@@ -916,9 +916,9 @@ def _where_youre_losing(
             )
     elif findable:
         text = (
-            "When shoppers ask the category question, no independent source "
-            f"recommends {merchant_name or 'the brand'} — only your own/retail "
-            "listings appear, which is distribution, not endorsement."
+            "In this audit's grounded category probes, no independent source "
+            f"verified a recommendation of {merchant_name or 'the brand'}; "
+            "only your own/retail listings were observed, which establishes distribution only."
         )
     elif summary.get("cited_via_hosts"):
         # Cited via retailers/marketplaces (no recognized own-site, no category

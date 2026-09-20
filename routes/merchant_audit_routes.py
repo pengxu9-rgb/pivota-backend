@@ -1858,6 +1858,10 @@ def _shape_url_audit_response(row: Dict[str, Any]) -> Dict[str, Any]:
     report = repair_stored_narrative(
         report, fallback_name=(base.get("merchant_name") if isinstance(base, dict) else None)
     )
+    from services.audit_content_repair import repair_report_content
+    report = repair_report_content(
+        report, merchant_name=base.get("merchant_name") if isinstance(base, dict) else None,
+    )
     brand_rollup = report.get("brand_rollup") or {}
     out: Dict[str, Any] = {
         "status": "succeeded",
