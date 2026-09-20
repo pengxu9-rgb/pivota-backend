@@ -4,8 +4,11 @@ Agent 专用 API 路由
 """
 
 from services.seed_variant_options import normalize_seed_variant_options
+from services import agent_search_gateway_proxy
+from config.settings import settings as _app_settings
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, Header, Response, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any, Awaitable, Callable
 from decimal import Decimal
@@ -6747,7 +6750,94 @@ async def agent_search_products_beauty(
     """
     Beauty-only alias for agent product search.
     Forces catalog_surface=beauty while preserving existing search behavior.
+
+    Behind AGENT_BEAUTY_SEARCH_VIA_GATEWAY this is served by the gateway's implementation of the
+    same search (ADR-021: one external door) -- see services/agent_search_gateway_proxy.py.
+    Off (the default), nothing below the local call changes.
     """
+    proxy_on, _proxy_reason = agent_search_gateway_proxy.enabled_for(
+        getattr(context, "agent_id", None), req.headers,
+    )
+    if _proxy_reason == "already_proxied":
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error": {"code": "gateway_search_proxy_loop", "reason": "untrusted_proxy_hop"}},
+        )
+    if proxy_on:
+        if limit > 100 or offset % limit != 0:
+            return JSONResponse(
+                status_code=422,
+                content={"status": "error", "error": {"code": "gateway_pagination_unsupported"}},
+            )
+        # The public gateway search door does not enforce this backend's per-agent merchant ACL.
+        # Until it can carry a trusted scope, fail closed for restricted agents.
+        requested_merchants = ([merchant_id] if merchant_id else list(merchant_ids or []))
+        if any(not context.can_access_merchant(mid) for mid in requested_merchants):
+            return JSONResponse(
+                status_code=403,
+                content={"status": "error", "error": {"code": "merchant_forbidden"}},
+            )
+        if getattr(context, "allowed_merchants", None) is not None:
+            return JSONResponse(
+                status_code=403,
+                content={"status": "error", "error": {"code": "gateway_merchant_scope_unavailable"}},
+            )
+        proxy_started = time.perf_counter()
+        gateway_body, why, gateway_status = await agent_search_gateway_proxy.search(
+            base_url=_app_settings.pivota_agent_internal_url,
+            query_items=list(req.query_params.multi_items()),
+            headers=req.headers,
+        )
+        if gateway_body is not None:
+            envelope = agent_search_gateway_proxy.to_backend_envelope(
+                gateway_body,
+                limit=limit,
+                offset=offset,
+                query=query,
+                category=category,
+                min_price=min_price,
+                max_price=max_price,
+                in_stock_only=in_stock_only,
+                merchant_id=merchant_id,
+                merchant_ids=merchant_ids,
+            )
+            # The same per-caller request log and search metric the local path records, so usage
+            # accounting is unchanged -- under its own metric path, so proxied traffic is countable.
+            background_tasks.add_task(
+                log_agent_request,
+                context=context,
+                status_code=200,
+                merchant_id=merchant_id or "cross_merchant_search",
+            )
+            try:
+                record_catalog_search(
+                    mode="search_standard",
+                    path="gateway_proxy",
+                    result="ok" if envelope["products"] else "no_candidates",
+                    duration_seconds=max(0.0, time.perf_counter() - proxy_started),
+                )
+            except Exception:
+                pass
+            return envelope
+        background_tasks.add_task(
+            log_agent_request,
+            context=context,
+            status_code=gateway_status,
+            merchant_id=merchant_id or "cross_merchant_search",
+        )
+        try:
+            record_catalog_search(
+                mode="search_standard",
+                path="gateway_proxy",
+                result="error",
+                duration_seconds=max(0.0, time.perf_counter() - proxy_started),
+            )
+        except Exception:
+            pass
+        return JSONResponse(
+            status_code=gateway_status,
+            content={"status": "error", "error": {"code": "gateway_search_failed", "reason": why}},
+        )
     return await agent_search_products(
         req=req,
         background_tasks=background_tasks,
