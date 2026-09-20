@@ -324,6 +324,7 @@ def test_post_enqueues_and_returns_202(client, stub):
     # Default profile is now pilot_gemini (free-tier = Gemini only); ChatGPT is
     # premium/opt-in, so the default run is Gemini-only and ~half the cost.
     assert launch["coverage_profile"] == "pilot_gemini"
+    assert launch["paid_actions_unlocked_at_launch"] is True
     assert launch["providers"] == ["gemini"]
     assert launch["provider_models"]["gemini"]["model"] == "gemini-2.5-flash"
     assert launch["provider_models"]["gemini"]["model_is_override"] is False
@@ -537,6 +538,7 @@ def test_post_free_tier_applies_rate_limit_and_credits(client, stub):
     )
     assert res.status_code == 202
     assert stub.rate_limit_checks == ["merch-A"]
+    assert stub.enqueued[0]["request_options_jsonb"]["launch"]["paid_actions_unlocked_at_launch"] is False
     assert stub.balance["credits"] == 9824
 
 

@@ -1204,6 +1204,7 @@ async def create_audit_run(
             requested_by_user_id=auth_merchant_id,
             request_options_jsonb={
                 "launch": {
+                    "paid_actions_unlocked_at_launch": paid_tier,
                     **({"consumer_capture_plan": consumer_plan, "consumer_capture_quote": consumer_quote} if consumer_plan else {}),
                     "audit_mode": "per_sku",
                     "coverage_profile": coverage.get("profile"),

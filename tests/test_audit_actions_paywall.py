@@ -366,6 +366,21 @@ async def test_expired_owner_retains_paid_actions_from_launch_snapshot(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_synced_audit_uses_explicit_launch_entitlement_only(monkeypatch):
+    monkeypatch.setattr(mar, "_ACTIONS_PAYWALL_ENABLED", True)
+
+    async def balance(_merchant_id):
+        return {"plan_tier": "free"}
+
+    monkeypatch.setattr(mar, "get_balance", balance)
+    run = _historical_url_run()
+    run["subject_type"] = "merchant"
+    assert (await mar._apply_actions_paywall(_shaped_fixture(), "m1", run))["actions_locked"] is True
+    run["partial_result_jsonb"]["launch"]["paid_actions_unlocked_at_launch"] = True
+    assert (await mar._apply_actions_paywall(_shaped_fixture(), "m1", run)).get("actions_locked") is not True
+
+
+@pytest.mark.asyncio
 async def test_old_paid_dual_provider_run_retains_actions_even_if_balance_fails(monkeypatch):
     monkeypatch.setattr(mar, "_ACTIONS_PAYWALL_ENABLED", True)
 

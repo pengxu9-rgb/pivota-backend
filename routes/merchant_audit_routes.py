@@ -1775,7 +1775,9 @@ def _run_earned_paid_actions(run: Optional[Dict[str, Any]]) -> bool:
     June 24, 2026 onward is accepted as a historical marker. A free audit
     allowance / zero credit debit says nothing about plan entitlement.
     """
-    if not isinstance(run, dict) or run.get("subject_type") != "merchant_url":
+    if not isinstance(run, dict) or run.get("subject_type") not in {
+        "merchant", "merchant_url"
+    }:
         return False
     partial = run.get("partial_result_jsonb")
     launch = partial.get("launch") if isinstance(partial, dict) else None
@@ -1783,6 +1785,8 @@ def _run_earned_paid_actions(run: Optional[Dict[str, Any]]) -> bool:
         return False
     if "paid_actions_unlocked_at_launch" in launch:
         return launch["paid_actions_unlocked_at_launch"] is True
+    if run.get("subject_type") != "merchant_url":
+        return False
     if launch.get("audit_mode") != "per_sku":
         return False
     requested_at = str(run.get("requested_at") or "")
