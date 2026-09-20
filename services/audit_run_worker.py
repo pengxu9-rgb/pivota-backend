@@ -648,6 +648,8 @@ async def _process_one_audit_run_inner(
                         "attempted": len(consumer_plan["jobs"]),
                         "uncertain": sum(v.get("status") == "started" for v in captured["jobs"].values()),
                     }
+                    from services.audit_content_repair import repair_report_content
+                    brand_report = repair_report_content(brand_report, merchant_name=str(merchant_name))
             finally:
                 heartbeat_task.cancel()
                 # Don't await — fire-and-forget cancellation.

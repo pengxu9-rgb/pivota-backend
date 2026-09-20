@@ -1858,6 +1858,10 @@ def _shape_url_audit_response(row: Dict[str, Any]) -> Dict[str, Any]:
     report = repair_stored_narrative(
         report, fallback_name=(base.get("merchant_name") if isinstance(base, dict) else None)
     )
+    from services.audit_content_repair import repair_report_content
+    report = repair_report_content(
+        report, merchant_name=base.get("merchant_name") if isinstance(base, dict) else None,
+    )
     brand_rollup = report.get("brand_rollup") or {}
     out: Dict[str, Any] = {
         "status": "succeeded",
@@ -4296,6 +4300,8 @@ async def answer_merchant_audit_question(
             status_code=409,
             detail="This audit doesn't have a report to answer from yet.",
         )
+    from services.audit_content_repair import repair_report_content
+    report = repair_report_content(report)
 
     # The recovery projection is EXTRA grounding, not a replacement. It carries
     # no narrative overview, no whats_working / where_youre_losing, no honest
@@ -4485,6 +4491,8 @@ async def start_merchant_audit_action(
         raise HTTPException(
             status_code=409, detail="This audit doesn't have a report to act on yet.",
         )
+    from services.audit_content_repair import repair_report_content
+    report = repair_report_content(report)
 
     from db.merchant_tasks import (
         find_pending_supersede_candidates,
