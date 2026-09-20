@@ -51,8 +51,9 @@ SCOPE, ON BOTH SIDES, AND ONLY THERE:
   * Merchant side: `close_merchant_conversion_with_claim` claims ONLY when a
     `reap_agentic_purchases` row with that click id and `item_source = 'cart_link'` exists.
     Every other click is passed straight to the close exactly as before and never touches the
-    claims table. It FAILS OPEN: any error on the claim path logs a WARNING and closes as before
-    230, so a new table can never block merchant-webhook attribution.
+    claims table. A claim-path error DEFERS closure: we cannot prove that this click is outside
+    the cart-link scope, and closing without a claim can double-count the Reap sale. The Shopify
+    order itself is unaffected; the read_orders poller holds its watermark and retries closure.
 
 Nothing here logs a click id's buyer, an order body or an address. The log lines carry ids and
 exception TYPES only.
@@ -70,6 +71,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "ATTRIBUTION_CLAIM_UNAVAILABLE",
     "CLOSED_BY_OTHER_CHANNEL",
+    "ClickClaimUnavailable",
     "MERCHANT_CLAIMANT",
     "REAP_CLAIMANT",
     "claim_click",
@@ -92,6 +94,11 @@ CLOSED_BY_OTHER_CHANNEL = "attribution_closed_by_other_channel"
 ATTRIBUTION_CLAIM_UNAVAILABLE = "attribution_claim_unavailable"
 
 _SKIPPED_KEY = "skipped_claimed"
+
+
+class ClickClaimUnavailable(RuntimeError):
+    """Attribution closure must retry when the cart-link claim cannot be checked."""
+
 
 # Module-level constants, one statement each, identical on both engines (SQLite 3.35+ has
 # ON CONFLICT … DO NOTHING RETURNING), so tests/test_repo_sql_prepare_postgres.py can see and
@@ -224,7 +231,7 @@ async def close_merchant_conversion_with_claim(
       * a cart-link Reap click, claim won (or already ours for this order) → `close(...)`;
       * a cart-link Reap click, claimed by Reap       → NO close; returns
         `{"skipped_claimed": True, ...}` (see `is_skipped_claimed`) and logs INFO;
-      * ANY error while deciding                      → FAIL OPEN: WARNING, then `close(...)`.
+      * ANY error while deciding                      → raise ClickClaimUnavailable; do not close.
 
     If `close` raises after a claim was won, the claim is KEPT (see the module docstring for why
     a release re-opens the double edge), a WARNING names it, and the exception propagates as
@@ -242,13 +249,13 @@ async def close_merchant_conversion_with_claim(
                     click_id, external_order_id, CLOSED_BY_OTHER_CHANNEL,
                 )
                 return {_SKIPPED_KEY: True, "reason": CLOSED_BY_OTHER_CHANNEL}
-    except Exception as exc:  # noqa: BLE001 — fail OPEN on the merchant side, by design
-        claimed = False
+    except Exception as exc:  # noqa: BLE001 — an uncertain claim must never double-count
         logger.warning(
-            "conversion_click_claims: claim path failed, closing as before click=%s order=%s "
+            "conversion_click_claims: claim path failed, deferring close click=%s order=%s "
             "error_type=%s",
             click_id, external_order_id, type(exc).__name__,
         )
+        raise ClickClaimUnavailable("click claim unavailable; retry attribution close") from None
     try:
         return await close(click_id=click_id, external_order_id=external_order_id, **close_kwargs)
     except Exception:

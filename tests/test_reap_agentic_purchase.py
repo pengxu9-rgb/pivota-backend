@@ -622,8 +622,7 @@ async def test_the_attribution_hook_is_called_once_with_the_orders_own_numbers(
     assert call["gross_amount_cents"] == 4500
     assert call["currency"] == "USD"
     assert call["is_self_report"] is False
-    assert call["note_attrs_or_payload"] == {
-        "source": "reap_agentic",
+    assert call["trusted_partner_provenance"] == {
         "partner_reported": True,
         "purchase_id": purchase_id,
         "reap_checkout_id": "chk_7f3a",

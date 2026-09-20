@@ -750,6 +750,30 @@ SELECT merchant_domain, market_country, enabled, updated_at
 
 ---
 
+## Cart-link attribution safety (migration 230)
+
+One cart-link sale can be reported under a Reap order ID and a Shopify order ID. A permanent
+`conversion_click_claims` row gives the click to the first closer; **never delete or release a
+claim to retry**. Releasing one can let the other channel write a second edge. The Reap close
+uses the click's recorded `seller_ref` as its merchant identity when present, after checking that
+the recorded click destination is the stored cart URL's shop. Legacy clicks retain their prior
+domain-based close. Reap provenance is stored under `metadata.partner_provenance`, not accepted
+from Shopify order data.
+
+If the merchant webhook cannot read the cart-link scope or take the claim, it still acknowledges
+the paid order, but **defers attribution**. The read_orders poller holds its watermark when it
+sees that claim failure, and retries the window on its next run. This protects against two GMV
+edges during a transient claim-table failure. Monitor the poller's `claim_unavailable` and
+`watermark_held` signals; if the poller is not running, arrange an operator replay of the paid
+order after the claim store recovers.
+
+A Reap purchase can complete but fail to write its attribution edge (for example, if the process
+dies after the terminal write). The claim remains held, so the merchant channel cannot repair it.
+Find those rows with `services.conversion_click_claims.list_claims_without_edge`; reconcile the
+Reap order and the recorded click before writing a missing edge. Do not infer an order from an
+empty claim and do not remove the claim as a shortcut. This remains an explicit launch gate until
+an operator-owned reconciliation procedure is tested.
+
 ## Tests
 
 | file | dialect | what it is for |

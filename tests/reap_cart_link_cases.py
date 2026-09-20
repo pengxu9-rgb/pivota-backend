@@ -324,6 +324,12 @@ def attribution(monkeypatch):
 
     recorder = Attribution()
     monkeypatch.setattr(cas, "close_external_order_conversion", recorder)
+    # Most lane tests create no surface_click_events table; they fake the attribution close.
+    # The real-close fixture below restores the real identity resolver against its edge DB.
+    async def _legacy_identity(_click_id, converting_shop_domain):
+        return None
+
+    monkeypatch.setattr(cas, "reap_cart_link_seller_ref", _legacy_identity)
     return recorder
 
 
@@ -1068,7 +1074,7 @@ async def test_the_happy_path_reaches_completed_and_closes_attribution_once(reap
     assert call["merchant_id"] == SHOP and call["converting_shop_domain"] == SHOP
     assert call["external_order_id"] == "ord_cart_1"
     assert call["gross_amount_cents"] == 3320 and call["currency"] == "USD"
-    assert call["note_attrs_or_payload"]["partner_reported"] is True
+    assert call["trusted_partner_provenance"]["partner_reported"] is True
     assert call["is_self_report"] is False
 
     # No resolver, no items quote: exactly one cart-link quote, carrying the stored URL and the
@@ -1474,6 +1480,7 @@ import services.conversion_click_claims as ccc  # noqa: E402
 #: Captured at import, BEFORE the autouse `attribution` fixture replaces it on the module, so the
 #: real-close cases can put the genuine primitive back.
 REAL_CLOSE = _cas.close_external_order_conversion
+REAL_IDENTITY_RESOLVER = _cas.reap_cart_link_seller_ref
 
 MERCHANT_TENANT = "merch_judydoll"
 SHOPIFY_ORDER_ID = "5550001"
@@ -1695,28 +1702,53 @@ async def test_a_reap_variant_purchases_click_is_not_claim_scoped(
     assert list(attribution.edges) == [(MERCHANT_TENANT, SHOPIFY_ORDER_ID)]
 
 
-# ── the error paths: merchant side fails OPEN, Reap side fails CLOSED ────────────────────────
+# ── the error paths: both sides defer attribution on an uncertain claim ─────────────────────
 
 
 @pytest.mark.parametrize("channel", ["webhook", "poller"])
-async def test_a_missing_claims_table_fails_open_on_the_merchant_side(
+async def test_a_missing_claims_table_defers_the_merchant_close(
     reap, attribution, merchant_paths, caplog, channel
 ):
     await start()
     await database.execute("DROP TABLE conversion_click_claims")
     caplog.set_level(logging.WARNING, logger="services.conversion_click_claims")
-    await getattr(merchant_paths, channel)()
-    assert list(attribution.edges) == [(MERCHANT_TENANT, SHOPIFY_ORDER_ID)]
-    assert any("closing as before" in r.getMessage() for r in caplog.records)
+    if channel == "poller":
+        with pytest.raises(ccc.ClickClaimUnavailable):
+            await merchant_paths.poller()
+    else:
+        await merchant_paths.webhook()  # Shopify order handling still succeeds
+    assert attribution.edges == {}
+    assert any("deferring close" in r.getMessage() for r in caplog.records)
 
 
-async def test_a_failing_scope_lookup_fails_open_on_the_merchant_side(
+async def test_a_failing_scope_lookup_defers_the_merchant_close(
     reap, attribution, merchant_paths
 ):
     """The lookup itself can fail too (here: a pre-229 table with no item_source)."""
     await to_pre_229_shape()
-    await merchant_paths.poller()
-    assert list(attribution.edges) == [(MERCHANT_TENANT, SHOPIFY_ORDER_ID)]
+    with pytest.raises(ccc.ClickClaimUnavailable):
+        await merchant_paths.poller()
+    assert attribution.edges == {}
+
+
+async def test_a_claim_error_after_a_reap_edge_cannot_double_the_sale(
+    reap, real_close, monkeypatch
+):
+    real_close.click_row = {"click_id": CLICK, "merchant_id": None, "dest_domain": SHOP}
+    await completed_via_reap(reap)
+    assert len(real_close.edges) == 1
+
+    async def _claim_unavailable(*args, **kwargs):
+        raise RuntimeError("claim store unavailable")
+
+    monkeypatch.setattr(ccc, "claim_click", _claim_unavailable)
+    with pytest.raises(ccc.ClickClaimUnavailable):
+        await ccc.close_merchant_conversion_with_claim(
+            REAL_CLOSE, merchant_id=MERCHANT_TENANT, click_id=CLICK,
+            external_order_id=SHOPIFY_ORDER_ID, gross_amount_cents=3320,
+            currency="USD", converting_shop_domain=SHOP,
+        )
+    assert len(real_close.edges) == 1
 
 
 async def test_a_missing_claims_table_fails_closed_on_the_reap_side(reap, attribution):
@@ -2032,6 +2064,7 @@ def real_close(monkeypatch):
         return {"interaction_id": "int_stub"}
 
     monkeypatch.setattr(_cas, "close_external_order_conversion", REAL_CLOSE)
+    monkeypatch.setattr(_cas, "reap_cart_link_seller_ref", REAL_IDENTITY_RESOLVER)
     monkeypatch.setattr(_cas, "database", edge_db)
     monkeypatch.setattr(_cas, "record_commerce_event_best_effort", _noop)
     return edge_db
@@ -2169,6 +2202,43 @@ async def test_a_www_link_is_not_stamped_seller_mismatch_by_the_real_close(reap,
     assert metadata["click_matched"] is True
     assert metadata.get("seller_mismatch") is not True
     assert metadata["converting_shop_domain"] == host
+
+
+@pytest.mark.parametrize("host", [SHOP, f"www.{SHOP}"], ids=["apex", "www"])
+async def test_a_seller_keyed_cart_sale_uses_the_recorded_seller_identity(
+    reap, real_close, host
+):
+    """A shop domain is not the tenant seller_ref; passing it excludes real Tier B GMV."""
+    real_close.click_row = {
+        "click_id": CLICK, "merchant_id": None, "dest_domain": host,
+        "context": {"seller_ref": MERCHANT_TENANT, "seed_kind": "external"},
+    }
+    await active_enrollment()
+    purchase_id = await start(cart_link=item(cart_url=_cart_url_on(host)))
+    for _ in range(3):
+        await step(purchase_id)
+    assert list(real_close.edges) == [(MERCHANT_TENANT, REAP_ORDER_ID)]
+    (edge,) = real_close.edges.values()
+    metadata = json.loads(edge["metadata"])
+    assert metadata["click_matched"] is True
+    assert metadata.get("seller_mismatch") is not True
+    assert metadata["seller_ref"] == MERCHANT_TENANT
+    assert metadata["partner_provenance"]["partner_reported"] is True
+    assert metadata["partner_provenance"]["purchase_id"] == purchase_id
+
+
+async def test_a_seller_keyed_click_for_another_shop_writes_no_reap_edge(reap, real_close):
+    real_close.click_row = {
+        "click_id": CLICK, "merchant_id": None, "dest_domain": "another.example",
+        "context": {"seller_ref": MERCHANT_TENANT},
+    }
+    await active_enrollment()
+    purchase_id = await start()
+    for _ in range(3):
+        await step(purchase_id)
+    assert (await get(purchase_id))["state"] == "completed"
+    assert real_close.edges == {}
+    assert await claims_count() == 1  # held for reconciliation, never given away
 
 
 # ══ 8. REVIEW #2214b: P2s ═══════════════════════════════════════════════════════════════════

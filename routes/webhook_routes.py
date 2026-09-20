@@ -3232,7 +3232,8 @@ async def _process_shopify_webhook_event(
                         # Reap, under a different key. The helper claims the click
                         # first-writer-wins for THOSE clicks only, and calls the same
                         # close with the same arguments for every other click. It
-                        # fails open. See services/conversion_click_claims.
+                        # defers attribution on claim failure (the order webhook itself still
+                        # succeeds); the read_orders poller holds its watermark and retries.
                         await close_merchant_conversion_with_claim(
                             close_external_order_conversion,
                             merchant_id=merchant_id,

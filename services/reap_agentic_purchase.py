@@ -2539,9 +2539,9 @@ async def _complete(
     # outcome lands in `last_error_code` in the SAME write: a completed row cannot be written
     # again.
     #
-    # FAILS CLOSED: an error taking the claim skips our edge and says so. The merchant side,
-    # which fails open, can still close the sale, so the error costs at most our edge and can
-    # never double it.
+    # FAILS CLOSED: an error taking the claim skips our edge and says so. The merchant side
+    # also defers attribution on an uncertain claim, then re-polls its order window. Neither
+    # channel may create an unclaimed second edge while the claim store is unavailable.
     #
     # A CLAIM TAKEN HERE IS NEVER GIVEN BACK, whatever happens next. Two workers on this row are
     # the SAME claimant for the SAME order, so both get True. If one of them writes the edge and
@@ -2636,10 +2636,13 @@ async def _close_attribution(purchase: Mapping[str, Any]) -> bool:
     `surface_click_events` and an integrity error's message can carry row content. A follow-up
     reconciliation job is the answer to a systematically failing hook, not a louder failure here.
 
-    Returns True when the close ran without raising, so `_complete` can give back a click claim
-    (mig 230) whose edge was never written.
+    Returns True when the close ran without raising. A cart-link click claim is never released;
+    a failed close is visible through `list_claims_without_edge` for reconciliation.
     """
-    from services.commerce_attribution_service import close_external_order_conversion
+    from services.commerce_attribution_service import (
+        close_external_order_conversion,
+        reap_cart_link_seller_ref,
+    )
 
     order_id = str(purchase.get("reap_order_id") or "").strip()
     gross = purchase.get("final_total_minor")
@@ -2656,23 +2659,28 @@ async def _close_attribution(purchase: Mapping[str, Any]) -> bool:
         return False
 
     try:
+        converting_shop = _converting_shop_domain(purchase)
+        merchant_id = str(purchase.get("merchant_domain") or "")
+        if _is_cart_link(purchase):
+            seller_ref = await reap_cart_link_seller_ref(
+                str(purchase.get("click_id") or ""), converting_shop
+            )
+            if seller_ref:
+                merchant_id = seller_ref
         await close_external_order_conversion(
-            merchant_id=str(purchase.get("merchant_domain") or ""),
+            merchant_id=merchant_id,
             click_id=purchase.get("click_id"),
             external_order_id=str(purchase.get("reap_order_id") or ""),
             gross_amount_cents=purchase.get("final_total_minor"),
             currency=purchase.get("currency"),
             converted_at=_now(),
-            note_attrs_or_payload={
-                "source": "reap_agentic",
-                # The partner told us this order exists; we did not observe it on the merchant's
-                # own store. `is_self_report` is a DIFFERENT axis (a merchant reporting its own
-                # sale over the signed API) and stays False — see that function's docstring.
+            trusted_partner_provenance={
+                # Reap told us the order exists; it is not a merchant self-report.
                 "partner_reported": True,
                 "purchase_id": purchase.get("id"),
                 "reap_checkout_id": purchase.get("reap_checkout_id"),
             },
-            converting_shop_domain=_converting_shop_domain(purchase),
+            converting_shop_domain=converting_shop,
             is_self_report=False,
         )
     except Exception as exc:  # noqa: BLE001 — deliberately broad; see the docstring

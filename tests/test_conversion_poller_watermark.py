@@ -87,6 +87,31 @@ async def test_shopify_advances_watermark_on_per_order_failure(monkeypatch):
     assert len(writes) == 1, "a per-ORDER failure must NOT hold the watermark (window was scanned)"
 
 
+@pytest.mark.asyncio
+async def test_shopify_holds_watermark_when_click_claim_is_unavailable(monkeypatch):
+    from services import external_conversion_poller as ecp
+    from services.conversion_click_claims import ClickClaimUnavailable
+
+    writes = _patch_watermark(monkeypatch, ecp)
+
+    async def one_order_fetch(**_kw):
+        return ([{"id": 1}], None)
+
+    async def uncertain_claim(**_kw):
+        raise ClickClaimUnavailable("retry attribution close")
+
+    monkeypatch.setattr(ecp, "_fetch_orders_page", one_order_fetch)
+    monkeypatch.setattr(ecp, "_process_order", uncertain_claim)
+
+    summary = await ecp.poll_external_conversions_for_merchant(
+        merchant_id="m1", credentials=_SHOPIFY_CREDS, now=_NOW,
+    )
+    assert summary["errors"] == 1
+    assert summary["claim_unavailable"] is True
+    assert summary["watermark_held"] is True
+    assert writes == []
+
+
 # --- WooCommerce lane ---------------------------------------------------------
 
 @pytest.mark.asyncio
