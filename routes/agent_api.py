@@ -6758,7 +6758,30 @@ async def agent_search_products_beauty(
     proxy_on, _proxy_reason = agent_search_gateway_proxy.enabled_for(
         getattr(context, "agent_id", None), req.headers,
     )
+    if _proxy_reason == "already_proxied":
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error": {"code": "gateway_search_proxy_loop", "reason": "untrusted_proxy_hop"}},
+        )
     if proxy_on:
+        if limit > 100 or offset % limit != 0:
+            return JSONResponse(
+                status_code=422,
+                content={"status": "error", "error": {"code": "gateway_pagination_unsupported"}},
+            )
+        # The public gateway search door does not enforce this backend's per-agent merchant ACL.
+        # Until it can carry a trusted scope, fail closed for restricted agents.
+        requested_merchants = ([merchant_id] if merchant_id else list(merchant_ids or []))
+        if any(not context.can_access_merchant(mid) for mid in requested_merchants):
+            return JSONResponse(
+                status_code=403,
+                content={"status": "error", "error": {"code": "merchant_forbidden"}},
+            )
+        if getattr(context, "allowed_merchants", None) is not None:
+            return JSONResponse(
+                status_code=403,
+                content={"status": "error", "error": {"code": "gateway_merchant_scope_unavailable"}},
+            )
         proxy_started = time.perf_counter()
         gateway_body, why, gateway_status = await agent_search_gateway_proxy.search(
             base_url=_app_settings.pivota_agent_internal_url,

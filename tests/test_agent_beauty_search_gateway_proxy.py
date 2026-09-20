@@ -160,9 +160,10 @@ class _Ctx:
         self.agent_id = agent_id
         self.agent_name = "test"
         self.request = None
+        self.allowed_merchants = None
 
     def can_access_merchant(self, merchant_id: str) -> bool:
-        return True
+        return self.allowed_merchants is None or merchant_id in self.allowed_merchants
 
 
 @pytest.fixture
@@ -180,8 +181,12 @@ def endpoint(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(agent_api, "agent_search_products", local_search)
     monkeypatch.setattr(agent_api, "log_agent_request", no_log)
     monkeypatch.setattr(agent_api._app_settings, "pivota_agent_internal_url", "http://gw.test")
-    state = {"agent_id": "agent_meitu"}
-    app.dependency_overrides[get_agent_context] = lambda: _Ctx(state["agent_id"])
+    state = {"agent_id": "agent_meitu", "allowed_merchants": None}
+    def context_for_test():
+        ctx = _Ctx(state["agent_id"])
+        ctx.allowed_merchants = state["allowed_merchants"]
+        return ctx
+    app.dependency_overrides[get_agent_context] = context_for_test
     yield local_calls, state
     app.dependency_overrides.pop(get_agent_context, None)
 
@@ -266,9 +271,38 @@ async def test_a_valid_empty_gateway_answer_stays_empty_and_does_not_fall_throug
 
 
 @pytest.mark.asyncio
-async def test_a_request_that_came_through_the_proxy_is_not_forwarded_again(monkeypatch: pytest.MonkeyPatch, endpoint) -> None:
+async def test_untrusted_hop_header_cannot_restore_local_recall(monkeypatch: pytest.MonkeyPatch, endpoint) -> None:
     local_calls, _ = endpoint
     monkeypatch.setenv(proxy.FLAG, "on")
     seen = _mock_client(monkeypatch, lambda r: httpx.Response(200, json=GATEWAY_BODY))
-    await _get(MEITU_QUERY, headers={proxy.HOP_HEADER: "1"})
-    assert seen == [] and len(local_calls) == 1
+    resp = await _get(MEITU_QUERY, headers={proxy.HOP_HEADER: "1"})
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "gateway_search_proxy_loop"
+    assert seen == [] and local_calls == []
+
+
+@pytest.mark.asyncio
+async def test_restricted_agent_cannot_bypass_merchant_acl(monkeypatch: pytest.MonkeyPatch, endpoint) -> None:
+    local_calls, state = endpoint
+    monkeypatch.setenv(proxy.FLAG, "on")
+    state["allowed_merchants"] = ["merchant_a"]
+    seen = _mock_client(monkeypatch, lambda r: httpx.Response(200, json=GATEWAY_BODY))
+    denied = await _get({**MEITU_QUERY, "merchant_id": "merchant_b"})
+    assert denied.status_code == 403
+    assert denied.json()["error"]["code"] == "merchant_forbidden"
+    unscoped = await _get(MEITU_QUERY)
+    assert unscoped.status_code == 403
+    assert unscoped.json()["error"]["code"] == "gateway_merchant_scope_unavailable"
+    assert seen == [] and local_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("offset,limit", [(15, 20), (0, 101)])
+async def test_proxy_rejects_pagination_the_gateway_cannot_represent(monkeypatch: pytest.MonkeyPatch, endpoint, offset: int, limit: int) -> None:
+    local_calls, _ = endpoint
+    monkeypatch.setenv(proxy.FLAG, "on")
+    seen = _mock_client(monkeypatch, lambda r: httpx.Response(200, json=GATEWAY_BODY))
+    resp = await _get({**MEITU_QUERY, "offset": str(offset), "limit": str(limit)})
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "gateway_pagination_unsupported"
+    assert seen == [] and local_calls == []

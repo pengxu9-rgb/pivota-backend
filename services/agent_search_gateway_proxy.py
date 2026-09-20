@@ -64,11 +64,11 @@ def enabled_for(agent_id: Optional[str], headers: Mapping[str, str], env: Mappin
     """Whether THIS request is forwarded, and why not when it is not."""
     if str(env.get(FLAG, "")).strip().lower() not in {"1", "true", "on", "yes"}:
         return False, "flag_off"
-    if any(key.lower() == HOP_HEADER.lower() for key in headers.keys()):
-        return False, "already_proxied"
     allowed = {item.strip() for item in str(env.get(AGENT_IDS_FLAG, "")).split(",") if item.strip()}
     if allowed and str(agent_id or "") not in allowed:
         return False, "caller_not_enabled"
+    if any(key.lower() == HOP_HEADER.lower() for key in headers.keys()):
+        return False, "already_proxied"
     return True, "enabled"
 
 
