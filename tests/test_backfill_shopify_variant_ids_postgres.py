@@ -44,15 +44,15 @@ pytestmark = pytest.mark.skipif(
 
 DDL = """
 CREATE TABLE IF NOT EXISTS external_product_seeds (
-  id TEXT PRIMARY KEY,
-  market TEXT NOT NULL DEFAULT 'US',
-  tool TEXT NOT NULL DEFAULT '*',
-  destination_url TEXT NOT NULL,
+  id TEXT,
+  market TEXT DEFAULT 'US',
+  tool TEXT DEFAULT '*',
+  destination_url TEXT,
   canonical_url TEXT NULL,
   domain TEXT NULL,
-  seed_data JSONB NOT NULL DEFAULT '{}'::jsonb,
-  status TEXT NOT NULL DEFAULT 'active',
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  seed_data JSONB DEFAULT '{}'::jsonb,
+  status TEXT DEFAULT 'active',
+  updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 """
 
@@ -69,10 +69,23 @@ async def _db():
     if not was_connected:
         await database.connect()
     # The full Postgres gate shares one throwaway database across modules. Earlier tests
-    # leave minimal same-named seed tables (sometimes just `id`); IF NOT EXISTS alone then
-    # silently keeps that incompatible shape and every real JSONB query fails in CI.
-    await database.execute("DROP TABLE IF EXISTS external_product_seeds")
+    # leave minimal same-named seed tables; IF NOT EXISTS alone keeps that incompatible
+    # shape. Extend only the columns this fixture needs. Dropping/recreating the table
+    # instead poisons later modules whose lightweight seed INSERTs omit `id`.
     await database.execute(DDL)
+    for name, column_type in (
+        ("market", "TEXT DEFAULT 'US'"),
+        ("tool", "TEXT DEFAULT '*'"),
+        ("destination_url", "TEXT"),
+        ("canonical_url", "TEXT"),
+        ("domain", "TEXT"),
+        ("seed_data", "JSONB DEFAULT '{}'::jsonb"),
+        ("status", "TEXT DEFAULT 'active'"),
+        ("updated_at", "TIMESTAMPTZ DEFAULT NOW()"),
+    ):
+        await database.execute(
+            f"ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS {name} {column_type}"
+        )
     await database.execute("TRUNCATE external_product_seeds")
     yield database
     if not was_connected and database.is_connected:
