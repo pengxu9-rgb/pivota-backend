@@ -143,6 +143,7 @@ async def fetch_skus_for_keys(product_keys: List[str], *, db: Any = None) -> Lis
           visible_option_labels
         FROM catalog_skus
         WHERE product_key = ANY(:keys)
+          AND suppressed_at IS NULL
         """,
         {"keys": product_keys},
     )
