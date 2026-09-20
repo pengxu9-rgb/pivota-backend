@@ -419,10 +419,13 @@ def sole_verified_cart_variant_id(
     }:
         return None
     try:
-        proof_host = urlparse(proof_url).hostname
+        proof_origin = urlparse(proof_url)
+        proof_host = proof_origin.hostname
+        proof_port = proof_origin.port
     except ValueError:
         return None
-    if proof_host != str(shop_domain or "").strip().lower():
+    if (proof_origin.scheme != "https" or proof_port not in (None, 443)
+            or proof_host != str(shop_domain or "").strip().lower()):
         return None
     try:
         checked_at = datetime.fromisoformat(str(proof.get("checked_at") or ""))

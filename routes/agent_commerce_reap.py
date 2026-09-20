@@ -1160,7 +1160,7 @@ async def _load_cart_link_item(
                 seed_data = None
         variant_id = sole_verified_cart_variant_id(
             seed_data,
-            product_urls=[seed.get("canonical_url"), seed.get("destination_url")],
+            product_urls=[seed.get("canonical_url") or seed.get("destination_url")],
             shop_domain=merchant_domain,
         )
         # An attachment naming another id is a contradiction, even if its string is all digits.

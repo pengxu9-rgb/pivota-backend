@@ -606,17 +606,20 @@ async def test_cart_link_refuses_a_non_numeric_catalog_variant(client, monkeypat
     assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
 
 
-@pytest.mark.parametrize("stamped_variants,attached_variant,attached_product,expected", [
-    (("50041364447509",), "50041364447509", PRODUCT_KEY, 202),
-    (("50041364447509",), None, PRODUCT_KEY, 202),
-    ((), "50041364447509", PRODUCT_KEY, 409),
-    (("50041364447509",), "99999999999999", PRODUCT_KEY, 409),
-    (("50041364447509",), "50041364447509", "prod::other", 409),
-    (("50041364447509", "50041364447510"), "50041364447509", PRODUCT_KEY, 409),
-    (("50041364447509", "MALFORMED"), "50041364447509", PRODUCT_KEY, 409),
+@pytest.mark.parametrize("stamped_variants,attached_variant,attached_product,expected,canonical_url", [
+    (("50041364447509",), "50041364447509", PRODUCT_KEY, 202, None),
+    (("50041364447509",), None, PRODUCT_KEY, 202, None),
+    ((), "50041364447509", PRODUCT_KEY, 409, None),
+    (("50041364447509",), "99999999999999", PRODUCT_KEY, 409, None),
+    (("50041364447509",), "50041364447509", "prod::other", 409, None),
+    (("50041364447509", "50041364447510"), "50041364447509", PRODUCT_KEY, 409, None),
+    (("50041364447509", "MALFORMED"), "50041364447509", PRODUCT_KEY, 409, None),
+    (("50041364447509",), "50041364447509", PRODUCT_KEY, 409,
+     f"https://{DOMAIN}/products/new"),
 ])
 async def test_cart_link_mirrored_seed_requires_product_bound_storefront_variant(
-    client, monkeypatch, stamped_variants, attached_variant, attached_product, expected
+    client, monkeypatch, stamped_variants, attached_variant, attached_product, expected,
+    canonical_url,
 ):
     await _seed_catalog(platform="external_seed")
     await database.execute(
@@ -642,12 +645,13 @@ async def test_cart_link_mirrored_seed_requires_product_bound_storefront_variant
     )
     await database.execute(
         "INSERT INTO external_product_seeds "
-        "(id, status, domain, market, destination_url, attached_product_key, "
+        "(id, status, domain, market, destination_url, canonical_url, attached_product_key, "
         "attached_variant_id, seed_data) "
-        "VALUES (:seed_id, 'active', :domain, 'US', :destination, :product_key, :variant, "
+        "VALUES (:seed_id, 'active', :domain, 'US', :destination, :canonical, :product_key, :variant, "
         ":seed_data)",
         {"seed_id": MIRROR_SEED_ID, "domain": DOMAIN,
-         "destination": f"https://{DOMAIN}/products/test", "product_key": attached_product,
+         "destination": f"https://{DOMAIN}/products/test", "canonical": canonical_url,
+         "product_key": attached_product,
          "variant": attached_variant, "seed_data": json.dumps(seed_data)},
     )
     await _seed_tierb_verdict()

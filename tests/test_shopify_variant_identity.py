@@ -60,7 +60,18 @@ def test_cart_proof_requires_fresh_same_url_sole_live_variant() -> None:
     assert sole_verified_cart_variant_id(seed, product_urls=url, shop_domain="brand.com", now=now) is None
     seed["snapshot"]["shopify_cart_proof"]["live_variant_count"] = 1
     assert sole_verified_cart_variant_id(seed, product_urls=["https://brand.com/products/other"], shop_domain="brand.com", now=now) is None
+    assert sole_verified_cart_variant_id(
+        seed, product_urls=["https://brand.com/products/new"],
+        shop_domain="brand.com", now=now,
+    ) is None
     assert sole_verified_cart_variant_id(seed, product_urls=url, shop_domain="other.com", now=now) is None
+    for unsafe_url in ("http://brand.com/products/serum.js",
+                       "https://brand.com:8080/products/serum.js"):
+        seed["snapshot"]["shopify_cart_proof"]["product_js_url"] = unsafe_url
+        assert sole_verified_cart_variant_id(
+            seed, product_urls=[unsafe_url], shop_domain="brand.com", now=now,
+        ) is None
+    seed["snapshot"]["shopify_cart_proof"]["product_js_url"] = "https://brand.com/products/serum.js"
     assert sole_verified_cart_variant_id(seed, product_urls=url, shop_domain="brand.com", now=now + timedelta(days=8)) is None
     seed["snapshot"]["variants"].append("unknown second variant")
     assert sole_verified_cart_variant_id(seed, product_urls=url, shop_domain="brand.com", now=now) is None
