@@ -4300,6 +4300,8 @@ async def answer_merchant_audit_question(
             status_code=409,
             detail="This audit doesn't have a report to answer from yet.",
         )
+    from services.audit_content_repair import repair_report_content
+    report = repair_report_content(report)
 
     # The recovery projection is EXTRA grounding, not a replacement. It carries
     # no narrative overview, no whats_working / where_youre_losing, no honest
@@ -4489,6 +4491,8 @@ async def start_merchant_audit_action(
         raise HTTPException(
             status_code=409, detail="This audit doesn't have a report to act on yet.",
         )
+    from services.audit_content_repair import repair_report_content
+    report = repair_report_content(report)
 
     from db.merchant_tasks import (
         find_pending_supersede_candidates,
