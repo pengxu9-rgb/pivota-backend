@@ -174,28 +174,27 @@ async def run(apply: bool) -> None:
                               AND e.price_currency = 'SGD' AND e.price_amount = :new_price)
                 RETURNING product_key
             """, {"key": PRODUCT_KEY, "ck": product["content_key"], "merchant": MERCHANT_ID,
-                    "url": URL, "seed_id": seed["id"], "new_price": NEW_PRICE,
+                    "url": URL, "seed_id": seed["id"], "new_price": float(NEW_PRICE),
                     "category_source": CATEGORY_SOURCE})
             require(len(updated) == 1, "product_cas_failed")
 
             for row in live:
                 changed = await database.fetch_all("""
-                    UPDATE catalog_offers SET list_price = :new_price,
-                        merchant_effective_price = :new_price,
-                        estimated_best_price = :new_price,
+                    UPDATE catalog_offers SET list_price = 30.00,
+                        merchant_effective_price = 30.00,
+                        estimated_best_price = 30.00,
                         offer_payload = COALESCE(offer_payload, CAST('{}' AS jsonb))
                             || jsonb_build_object('meitu_sg_price_reviewed_0920', 'SGD30'),
                         updated_at = NOW()
                     WHERE offer_id = :offer_id AND sku_key = :sku_key AND product_key = :key
                       AND merchant_id = :merchant AND source_system = 'catalog_enrichment_agent_v1'
-                      AND currency = 'SGD' AND list_price = :old_price
-                      AND merchant_effective_price = :old_price
-                      AND estimated_best_price = :old_price
+                      AND currency = 'SGD' AND list_price = 28.20
+                      AND merchant_effective_price = 28.20
+                      AND estimated_best_price = 28.20
                       AND suppressed_at IS NULL
                     RETURNING offer_id
                 """, {"offer_id": row["offer_id"], "sku_key": row["sku_key"],
-                        "key": PRODUCT_KEY, "merchant": OFFER_MERCHANT_ID,
-                        "old_price": OLD_PRICE, "new_price": NEW_PRICE})
+                        "key": PRODUCT_KEY, "merchant": OFFER_MERCHANT_ID})
                 require(len(changed) == 1, "variant_offer_cas_failed:" + str(row["source_variant_id"]))
 
             old = placeholder[0]
@@ -204,13 +203,13 @@ async def run(apply: bool) -> None:
                     suppressed_at = NOW(), updated_at = NOW()
                 WHERE offer_id = :offer_id AND sku_key = :sku_key AND product_key = :key
                   AND merchant_id = :merchant AND source_system = 'catalog_enrichment_agent_v1'
-                  AND currency = 'SGD' AND list_price = :old_price
-                  AND merchant_effective_price = :old_price
-                  AND estimated_best_price = :old_price AND suppressed_at IS NULL
+                  AND currency = 'SGD' AND list_price = 28.20
+                  AND merchant_effective_price = 28.20
+                  AND estimated_best_price = 28.20 AND suppressed_at IS NULL
                 RETURNING offer_id
             """, {"reason": REASON, "offer_id": old["offer_id"],
                     "sku_key": old["sku_key"], "key": PRODUCT_KEY,
-                    "merchant": OFFER_MERCHANT_ID, "old_price": OLD_PRICE})
+                    "merchant": OFFER_MERCHANT_ID})
             require(len(retired_offer) == 1, "canonical_offer_cas_failed")
             retired_sku = await database.fetch_all("""
                 UPDATE catalog_skus SET suppression_reason = :reason,
