@@ -105,20 +105,26 @@ import re
 import secrets
 import unicodedata
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Literal, Mapping, Optional, Tuple
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 
 import db.reap_agentic_ledger as ledger
+import db.tierb_cart_link_eligibility as tierb_eligibility
 import services.reap_agentic_client as rc
 import services.reap_agentic_purchase as svc
 from db.buyer_vault import hash_agent_user_ref, mint_pairwise_buyer_ref
+from db.commerce_attribution import surface_click_events
 from db.database import database
 from routes.agent_auth import AgentContext, get_agent_context
 from routes.agent_user_auth import AgentUserContext, get_agent_user_context
 from services.commerce_attribution_service import new_click_id
+from services.outbound_links_service import (
+    build_shopify_cart_permalink,
+    extract_shopify_numeric_variant_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -173,6 +179,8 @@ _REFUSAL_STATUS: Dict[str, int] = {
     "row_not_found": 409,
     "row_unpriced": 409,
     "row_not_shopify": 409,
+    "row_variant_unverified": 409,
+    "seller_identity_unverified": 409,
     "row_currency_mismatch": 409,
     "idempotency_conflict": 409,
 }
@@ -369,6 +377,7 @@ class ReapBuyer(BaseModel):
 
 
 class StartPurchaseRequest(BaseModel):
+    item_source: Literal["reap_variant", "cart_link"] = "reap_variant"
     merchant_domain: str = Field(..., min_length=1, max_length=255)
     product_key: str = Field(..., min_length=1)
     variant_key: Optional[str] = None
@@ -1037,6 +1046,154 @@ async def _load_catalog_row(
     )
 
 
+# Tier B uses the same catalog price discipline as the variant lane, but its item identity is a
+# merchant-issued Shopify numeric variant id, not Reap's opaque variant. A mirrored external-seed
+# SKU is synthetic (`source_variant_id == product_key`), so it MUST get its real variant from the
+# active, market-matched seed; a number guessed from its SKU key would buy the wrong item.
+_CART_PRODUCT_SQL = """
+    SELECT p.product_key, p.merchant_id, p.seller_ref, p.seed_kind, p.platform,
+           p.source_ref, p.source_system, p.title AS product_title
+      FROM catalog_products p
+     WHERE p.product_key = :product_key
+       AND lower(p.source_domain) = :merchant_domain
+       AND p.suppression_reason IS NULL
+       AND p.suppressed_at IS NULL
+"""
+_CART_SKU_BY_KEY_SQL = """
+    SELECT s.sku_key, s.source_variant_id, s.title AS variant_title, s.currency
+      FROM catalog_skus s
+     WHERE s.product_key = :product_key AND s.sku_key = :variant_key
+       AND s.suppression_reason IS NULL AND s.suppressed_at IS NULL
+"""
+_CART_SINGLE_SKU_SQL = """
+    SELECT s.sku_key, s.source_variant_id, s.title AS variant_title, s.currency
+      FROM catalog_skus s
+     WHERE s.product_key = :product_key
+       AND s.suppression_reason IS NULL AND s.suppressed_at IS NULL
+     ORDER BY s.sku_key LIMIT 2
+"""
+_CART_SEED_VARIANT_SQL = """
+    SELECT e.attached_variant_id
+      FROM external_product_seeds e
+     WHERE e.id = :seed_id AND e.status = 'active'
+       AND lower(e.domain) = :merchant_domain AND upper(e.market) = :market_country
+"""
+_CART_OFFER_SQL = """
+    SELECT o.currency,
+           CAST(coalesce(o.merchant_effective_price, o.estimated_best_price, o.list_price)
+                AS TEXT) AS price
+      FROM catalog_offers o
+     WHERE o.product_key = :product_key AND o.sku_key = :sku_key
+       AND o.merchant_id = :merchant_id
+       AND o.suppression_reason IS NULL AND o.suppressed_at IS NULL
+       AND coalesce(o.merchant_effective_price, o.estimated_best_price, o.list_price) IS NOT NULL
+       AND lower(coalesce(o.availability, 'unknown')) NOT IN
+           ('out_of_stock', 'sold_out', 'unavailable')
+     ORDER BY coalesce(o.merchant_effective_price, o.estimated_best_price, o.list_price) ASC
+     LIMIT 1
+"""
+
+
+async def _load_cart_link_item(
+    *, merchant_domain: str, product_key: str, variant_key: Optional[str],
+    market_country: str,
+) -> Tuple[Dict[str, Any], str, str, Optional[str]]:
+    """Return server-priced cart item, seller identity, and Shopify variant, or refuse.
+
+    The buyer/agent supplies only catalog keys. No caller URL, price, Shopify variant, or seller
+    identity is accepted. Mirrored seeds without a verified attached variant are not buyable on
+    this rail, even if their synthetic SKU looks like a variant.
+    """
+    raw = await database.fetch_one(
+        _CART_PRODUCT_SQL, {"product_key": product_key, "merchant_domain": merchant_domain}
+    )
+    if raw is None:
+        raise svc.PurchaseRefused("row_not_found", "no catalog product for this domain and key")
+    product = dict(raw)
+    platform = str(product.get("platform") or "").strip().lower()
+    if platform not in ("shopify", "external_seed"):
+        raise svc.PurchaseRefused("row_not_shopify", "cart-link product has no Shopify source")
+
+    if variant_key:
+        raw_sku = await database.fetch_one(
+            _CART_SKU_BY_KEY_SQL, {"product_key": product_key, "variant_key": variant_key}
+        )
+        if raw_sku is None:
+            raise svc.PurchaseRefused("row_not_found", "no sku for this product and key")
+        sku = dict(raw_sku)
+    else:
+        skus = [dict(row) for row in await database.fetch_all(
+            _CART_SINGLE_SKU_SQL, {"product_key": product_key}
+        )]
+        if len(skus) != 1:
+            raise svc.PurchaseRefused("row_not_found", "variant is ambiguous")
+        sku = skus[0]
+
+    if platform == "shopify":
+        variant_id = extract_shopify_numeric_variant_id(sku.get("source_variant_id"))
+        seller_ref = str(product.get("seller_ref") or product.get("merchant_id") or "").strip()
+    else:
+        if str(product.get("source_system") or "") != "external_product_seeds_mirror_v1":
+            raise svc.PurchaseRefused("row_variant_unverified", "external seed source is unknown")
+        seed = await database.fetch_one(
+            _CART_SEED_VARIANT_SQL,
+            {"seed_id": product.get("source_ref"), "merchant_domain": merchant_domain,
+             "market_country": market_country},
+        )
+        variant_id = extract_shopify_numeric_variant_id(
+            dict(seed).get("attached_variant_id") if seed else None
+        )
+        seller_ref = str(product.get("seller_ref") or "").strip()
+    if not variant_id:
+        raise svc.PurchaseRefused("row_variant_unverified", "no verified Shopify numeric variant")
+    if not seller_ref or seller_ref != str(product.get("merchant_id") or "").strip():
+        raise svc.PurchaseRefused("seller_identity_unverified", "catalog seller identity is ambiguous")
+
+    offer = await database.fetch_one(
+        _CART_OFFER_SQL,
+        {"product_key": product_key, "sku_key": sku["sku_key"],
+         "merchant_id": seller_ref},
+    )
+    if offer is None:
+        raise svc.PurchaseRefused("row_unpriced", "seller has no usable offer on this sku")
+    offer = dict(offer)
+    currency = str(offer.get("currency") or sku.get("currency") or "").strip().upper()
+    if currency != _MARKET_CURRENCY.get(market_country):
+        raise svc.PurchaseRefused("row_currency_mismatch", "offer currency differs from market")
+    price_minor = ledger.amount_minor_or_none(offer.get("price"), currency)
+    if not price_minor or price_minor <= 0:
+        raise svc.PurchaseRefused("row_unpriced", "offer price is not an exact minor amount")
+
+    # URL and click id are filled by the route after it mints a new click. These are facts only;
+    # there is no URL-shaped caller input anywhere in this path.
+    return (
+        {"shop_domain": merchant_domain, "our_price_minor": int(price_minor),
+         "currency": currency, "market_country": market_country,
+         "product_name": str(product.get("product_title") or "").strip() or None,
+         "product_key": product_key},
+        seller_ref,
+        variant_id,
+        str(product.get("seed_kind") or "").strip() or None,
+    )
+
+
+async def _record_cart_link_click(
+    *, click_id: str, cart_url: str, shop_domain: str, seller_ref: str,
+    product_key: str, variant_key: Optional[str], agent_id: str,
+    seed_kind: Optional[str],
+) -> None:
+    """Persist the click identity before a purchase can be opened; failure closes the door."""
+    await database.execute(surface_click_events.insert().values(
+        click_id=click_id, merchant_id=seller_ref if len(seller_ref) <= 50 else None,
+        surface="reap_cart_link", commerce_surface="reap_cart_link",
+        source_channel="agent", agent_id=agent_id if len(agent_id) <= 64 else None,
+        destination_url=cart_url, dest_domain=shop_domain,
+        context={"seller_ref": seller_ref, "seed_kind": seed_kind, "item_source": "cart_link",
+                 "product_key": product_key, "variant_key": variant_key},
+        impression_count=0, click_count=1, first_click_at=_now(), last_click_at=_now(),
+    ))
+
+
 # ── idempotency ──────────────────────────────────────────────────────────────────────────────
 
 #: Where Reap sends the buyer's browser after a hosted page. There is no such constant in the
@@ -1074,6 +1231,7 @@ def _request_hash(
     email: str,
     shipping_address: Mapping[str, Any],
     return_url: str,
+    item_source: str = "reap_variant",
 ) -> str:
     """A stable fingerprint of the fields that DECIDE this purchase.
 
@@ -1095,17 +1253,22 @@ def _request_hash(
 
     `sort_keys=True` and a fixed separator so two dicts with the same content hash the same
     whatever order they were built in — the whole value of the column depends on that.
+    The cart-link lane also includes `item_source`; the legacy variant lane keeps its original
+    hash shape so existing idempotency keys retain their meaning across this rollout.
     """
+    facts = {
+        "merchant_domain": merchant_domain,
+        "product_key": product_key,
+        "variant_key": variant_key or "",
+        "quantity": int(quantity),
+        "email": email,
+        "shipping_address": {str(k): str(v) for k, v in dict(shipping_address).items()},
+        "return_url": return_url,
+    }
+    if item_source != "reap_variant":
+        facts["item_source"] = item_source
     canonical = json.dumps(
-        {
-            "merchant_domain": merchant_domain,
-            "product_key": product_key,
-            "variant_key": variant_key or "",
-            "quantity": int(quantity),
-            "email": email,
-            "shipping_address": {str(k): str(v) for k, v in dict(shipping_address).items()},
-            "return_url": return_url,
-        },
+        facts,
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=True,
@@ -1383,6 +1546,13 @@ async def start_reap_purchase(
             # is the buyer's address. Never forwarded, never logged.
             raise svc.PurchaseRefused("invalid_request", "the request body did not validate")
 
+        # The cart-link lane has two further dark gates. Decide them before consent or any
+        # merchant/catalog read so a disabled lane is the same 404 fallback as the base rail.
+        if req.item_source == "cart_link" and (
+            not svc.is_cart_link_enabled() or not rc.supports_cart_link_quote()
+        ):
+            raise svc.PurchaseRefused("not_available_on_this_rail")
+
         # ── CONSENT, AND WHERE IT SITS IN THE ORDER ──────────────────────────────────────────
         #
         # AFTER THE DIAL, WHICH IS NOT A STYLE CHOICE. `_require_rail()` is the first statement
@@ -1440,6 +1610,7 @@ async def start_reap_purchase(
             email=buyer_email,
             shipping_address=shipping_address,
             return_url=return_url,
+            item_source=req.item_source,
         )
 
         if idempotency_key:
@@ -1490,35 +1661,68 @@ async def start_reap_purchase(
                         },
                     )
 
-        # ELIGIBILITY BEFORE THE CATALOG READ. A domain nobody enabled gets the same answer
-        # whether or not we hold its products, so an ineligible merchant cannot be probed for
-        # what is in our catalogue.
-        eligible = await _eligibility(
-            merchant_domain=merchant_domain,
-            market_country=market_country,
-            product_key=product_key,
-            variant_key=variant_key,
-        )
-
-        row = await _load_catalog_row(
-            merchant_domain=merchant_domain,
-            product_key=product_key,
-            variant_key=variant_key,
-            market_country=eligible.market_country,
-            accept_variant_labels=eligible.accept_variant_labels,
-            also_accept_domains=eligible.also_accept_domains,
-        )
+        # ELIGIBILITY BEFORE THE CATALOG READ on either lane. The daily Tier B verdict is
+        # distinct from the variant rail's operator allowlist; it expires after 48 hours.
+        row = None
+        cart_facts = None
+        cart_variant = None
+        cart_seller = None
+        cart_seed_kind = None
+        if req.item_source == "cart_link":
+            if not await tierb_eligibility.is_cart_link_eligible(
+                merchant_domain, market_country
+            ):
+                raise svc.PurchaseRefused("merchant_not_eligible")
+            cart_facts, cart_seller, cart_variant, cart_seed_kind = await _load_cart_link_item(
+                merchant_domain=merchant_domain,
+                product_key=product_key,
+                variant_key=variant_key,
+                market_country=market_country,
+            )
+        else:
+            eligible = await _eligibility(
+                merchant_domain=merchant_domain,
+                market_country=market_country,
+                product_key=product_key,
+                variant_key=variant_key,
+            )
+            row = await _load_catalog_row(
+                merchant_domain=merchant_domain,
+                product_key=product_key,
+                variant_key=variant_key,
+                market_country=eligible.market_country,
+                accept_variant_labels=eligible.accept_variant_labels,
+                also_accept_domains=eligible.also_accept_domains,
+            )
 
         buyer_id = await _buyer_id_for(
             agent_id=agent_id, agent_user_ref_hash=agent_user_ref_hash
         )
         buyer_ref = await _reap_buyer_ref(buyer_id, consent_version=consent_version)
 
+        click_id = new_click_id()
+        cart_link_item = None
+        if cart_facts is not None:
+            cart_url = build_shopify_cart_permalink(
+                shop_domain=merchant_domain, variant_id=cart_variant, click_id=click_id,
+                quantity=int(req.quantity), country=market_country,
+            )
+            if cart_url is None:
+                raise svc.PurchaseRefused("row_variant_unverified")
+            await _record_cart_link_click(
+                click_id=click_id, cart_url=cart_url, shop_domain=merchant_domain,
+                seller_ref=cart_seller, product_key=product_key, variant_key=variant_key,
+                agent_id=agent_id, seed_kind=cart_seed_kind,
+            )
+            cart_link_item = svc.CartLinkItem(cart_url=cart_url, **cart_facts)
+
         purchase_id = await svc.start_purchase(
             agent_id=agent_id,
             agent_user_ref_hash=agent_user_ref_hash,
             buyer_ref=buyer_ref,
             row=row,
+            cart_link=cart_link_item,
+            consent_version=consent_version,
             # THE RETURN URL IS NOT VALIDATED BY THIS ROUTE. `start_purchase` runs
             # `rc.validate_return_url` on whatever it is handed, builds both stage variants from
             # it, and raises `PurchaseRefused("invalid_return_url")` — the same reason code this
@@ -1532,7 +1736,7 @@ async def start_reap_purchase(
             # MINTED HERE, NEVER TAKEN FROM THE REQUEST. This is the only join between a Reap
             # checkout and the session that started it, and a caller-supplied one could collide
             # with another caller's.
-            click_id=new_click_id(),
+            click_id=click_id,
             return_url=return_url,
         )
 

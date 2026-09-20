@@ -769,10 +769,17 @@ order after the claim store recovers.
 
 A Reap purchase can complete but fail to write its attribution edge (for example, if the process
 dies after the terminal write). The claim remains held, so the merchant channel cannot repair it.
-Find those rows with `services.conversion_click_claims.list_claims_without_edge`; reconcile the
-Reap order and the recorded click before writing a missing edge. Do not infer an order from an
-empty claim and do not remove the claim as a shortcut. This remains an explicit launch gate until
-an operator-owned reconciliation procedure is tested.
+Set `DATABASE_URL` explicitly to the intended database, then run
+`python -m scripts.reconcile_reap_cart_link_claims --limit 100`. This is read-only and returns a
+`ready` row only for a unique completed cart-link purchase with the same claimed click/order,
+an intact URL/shop/quantity, a seller-keyed click on that shop, a charged amount within one minor
+unit of the quote, and no OTHER
+edge on that click. Investigate every `skipped` row; never delete or reassign a claim. After
+confirming the partner order independently, run the same command with `--apply`. It rechecks the
+claim and existing edges before the idempotent close and reports `repaired` only when the edge
+can be read back. This procedure does not call Reap or change a charge. The merchant-owned claim
+path remains with webhook/poller replay, not this repair command. Do not treat this repair as
+proof of the Reap cart-link quote contract or as authorization for a paid canary.
 
 ## Tests
 

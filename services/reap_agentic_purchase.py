@@ -112,8 +112,10 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import db.reap_agentic_ledger as ledger
+import db.tierb_cart_link_eligibility as tierb_eligibility
 import services.conversion_click_claims as ccc
 import services.reap_agentic_client as rc
+from db.database import database
 from services.reap_cart_link import cart_link_line, cart_link_refusal
 
 logger = logging.getLogger(__name__)
@@ -130,6 +132,7 @@ __all__ = [
     "PurchaseRow",
     "QuoteCheck",
     "advance",
+    "reconcile_completed_cart_link_claims",
     "is_cart_link_enabled",
     "is_enabled",
     "start_purchase",
@@ -1213,10 +1216,10 @@ async def start_purchase(
     A `cart_link` call ALSO requires `consent_version`, and `buyer_ref` must be a buyer identity
     #2219's route helpers already MINTED, with that same consent recorded on it
     (`consent_required` / `buyer_unlinked` otherwise). On the variant lane those two are enforced
-    by routes/agent_commerce_reap before this function is called; the cart-link lane has no
-    route yet, so this function enforces them itself rather than leave a door that opens a
-    purchase for a buyer who never consented. It does not mint: minting has one owner, the
-    route's `_buyer_id_for` / `_reap_buyer_ref`, and a future cart-link route calls those.
+    by routes/agent_commerce_reap before this function is called. The cart-link route does the
+    same, and this function enforces them again for direct callers rather than leave a door that
+    opens a purchase for a buyer who never consented. It does not mint: minting has one owner,
+    the route's `_buyer_id_for` / `_reap_buyer_ref`.
 
     EVERY REFUSAL HAPPENS BEFORE THE INSERT, and that ordering is the contract this function is
     tested on (`test_every_refusal_leaves_the_table_empty` counts rows). A row written and then
@@ -1531,6 +1534,13 @@ async def _start_cart_link_purchase(
         # REQUIRED on this lane, unlike a row's: the URL's `country=` pin is compared against it,
         # and without a pin the checkout's market is whatever Reap's egress IP resolves to.
         raise PurchaseRefused("invalid_request", "cart_link.market_country must be two letters")
+
+    # The daily merchant verdict is the first reader of migration 228. It is deliberately a
+    # START gate only: an already-approved purchase must not be abandoned when the 48-hour verdict
+    # expires or a later probe changes it. A missing/stale/non-ELIGIBLE row refuses before any
+    # purchase or buyer PII is written. Database errors propagate; an outage must not arm Tier B.
+    if not await tierb_eligibility.is_cart_link_eligible(shop_domain, market_country):
+        raise PurchaseRefused("merchant_not_eligible", "no fresh Tier B cart-link verdict")
 
     if isinstance(quantity, bool) or not isinstance(quantity, int):
         raise PurchaseRefused("invalid_request", "quantity must be an int")
@@ -2691,6 +2701,112 @@ async def _close_attribution(purchase: Mapping[str, Any]) -> bool:
         )
         return False
     return True
+
+
+_RECONCILE_CART_PURCHASE_SQL = """
+    SELECT id FROM reap_agentic_purchases
+     WHERE item_source = 'cart_link' AND state = 'completed'
+       AND click_id = :click_id AND reap_order_id = :order_id
+     LIMIT 2
+"""
+_RECONCILE_EDGE_SQL = """
+    SELECT 1 AS hit FROM commerce_attribution_edges
+     WHERE click_id = :click_id AND external_order_id = :order_id
+     LIMIT 1
+"""
+_RECONCILE_ANY_EDGE_SQL = """
+    SELECT 1 AS hit FROM commerce_attribution_edges
+     WHERE click_id = :click_id
+     LIMIT 1
+"""
+
+
+async def reconcile_completed_cart_link_claims(
+    *, limit: int = 100, apply: bool = False
+) -> Dict[str, Any]:
+    """Inspect permanently held Reap claims without an edge; optionally re-close verified rows.
+
+    This never calls Reap or alters a purchase, claim, or payment. A default read-only run names
+    candidates for operator review. `apply=True` reuses the same idempotent attribution close
+    after checking the completed purchase, click/shop/quantity, and charged-vs-quoted amount.
+    Claims are NEVER released. Merchant claims are left to webhook/poller retry.
+    """
+    claims = await ccc.list_claims_without_edge(limit)
+    results = []
+    from services.commerce_attribution_service import reap_cart_link_seller_ref
+
+    for claim in claims:
+        click = str(claim.get("click_id") or "")
+        order = str(claim.get("external_order_id") or "")
+        entry = {"click_id": click, "order_id": order, "status": "skipped"}
+        if claim.get("claimed_by") != ccc.REAP_CLAIMANT or not click or not order:
+            entry["reason"] = "not_reap_claim"
+            results.append(entry)
+            continue
+        matches = await database.fetch_all(
+            _RECONCILE_CART_PURCHASE_SQL, {"click_id": click, "order_id": order}
+        )
+        if len(matches) != 1:
+            entry["reason"] = "purchase_not_unique_and_completed"
+            results.append(entry)
+            continue
+        purchase_id = str(dict(matches[0]).get("id") or "")
+        purchase = await ledger.get_purchase_internal(purchase_id) or {}
+        quoted = purchase.get("quoted_total_minor")
+        charged = purchase.get("final_total_minor")
+        if (
+            _cart_link_attribution_mismatch(purchase)
+            or isinstance(quoted, bool) or not isinstance(quoted, int)
+            or isinstance(charged, bool) or not isinstance(charged, int)
+            or charged <= 0
+            or abs(charged - quoted) > QUOTE_RECONCILE_TOLERANCE_MINOR
+        ):
+            entry["reason"] = "purchase_evidence_unverified"
+            results.append(entry)
+            continue
+        try:
+            seller_ref = await reap_cart_link_seller_ref(
+                click, _converting_shop_domain(purchase)
+            )
+        except Exception:  # noqa: BLE001 — a broken click identity must not be repaired
+            seller_ref = None
+        if not seller_ref:
+            entry["reason"] = "click_identity_unverified"
+            results.append(entry)
+            continue
+        # A different order id on this click is not an invitation to write another GMV edge.
+        # The claim monitor keys by (click, owner order), but this repair is stricter.
+        if await database.fetch_one(_RECONCILE_ANY_EDGE_SQL, {"click_id": click}):
+            entry["reason"] = "another_edge_for_click"
+            results.append(entry)
+            continue
+        entry["purchase_id"] = purchase_id
+        if not apply:
+            entry["status"] = "ready"
+        else:
+            # Claims are permanent in code, but check again immediately before the write so an
+            # operator's manual DB edit cannot turn this run into an unclaimed second edge.
+            owner = await database.fetch_one(
+                "SELECT claimed_by, external_order_id FROM conversion_click_claims "
+                "WHERE click_id = :click_id", {"click_id": click},
+            )
+            owner = dict(owner) if owner else {}
+            if owner.get("claimed_by") != ccc.REAP_CLAIMANT or owner.get("external_order_id") != order:
+                entry["reason"] = "claim_changed"
+            elif await database.fetch_one(_RECONCILE_ANY_EDGE_SQL, {"click_id": click}):
+                entry["reason"] = "another_edge_for_click"
+            elif await _close_attribution(purchase):
+                edge = await database.fetch_one(
+                    _RECONCILE_EDGE_SQL, {"click_id": click, "order_id": order}
+                )
+                entry["status"] = "repaired" if edge else "failed"
+                if edge is None:
+                    entry["reason"] = "edge_still_absent"
+            else:
+                entry["status"] = "failed"
+                entry["reason"] = "close_failed"
+        results.append(entry)
+    return {"apply": apply, "inspected": len(claims), "results": results}
 
 
 #: state -> the coroutine that advances it. A dict rather than an if-chain so that

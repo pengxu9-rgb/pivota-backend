@@ -117,7 +117,8 @@ poller drives the state machine afterwards, on another process, over the next mi
 
 | field | required | notes |
 |---|---|---|
-| `merchant_domain` | yes | lowercased. Must be **enabled** in `reap_agentic_eligibility` for the buyer's market. |
+| `item_source` | no (default `reap_variant`) | Set to `cart_link` for Tier B. The entire cart-link lane remains a 404 fallback until `REAP_AGENTIC_CART_LINK_ENABLED` is on **and** Reap publishes the quote body field (`CART_LINK_QUOTE_FIELD`, currently unset). |
+| `merchant_domain` | yes | lowercased. Variant lane: must be enabled in `reap_agentic_eligibility`. Cart-link lane: must have a fresh `tierb_cart_link_eligibility` verdict. Both are checked in the buyer's market. |
 | `product_key` | yes | our catalog key (`catalog_products.product_key`). |
 | `variant_key` | no | our sku key (`catalog_skus.sku_key`), matched **exactly**. Omit only when the product has exactly one variant; a multi-variant product with no `variant_key` is `row_not_found`. |
 | `quantity` | no (default 1) | 1..10 (`MAX_QUANTITY`). |
@@ -133,6 +134,17 @@ poller drives the state machine afterwards, on another process, over the next mi
 catalog and is the number `verify_quote` later compares against Reap's subtotal, exactly, with no
 tolerance.
 
+For `item_source: "cart_link"`, the same authenticated endpoint requires a **fresh ELIGIBLE Tier B
+verdict** for `(merchant_domain, buyer.shipping_address.country)` before reading the catalog or
+minting a buyer. It constructs the single-line Shopify permalink itself, including `country=` and
+an owned `pivota_click_id`; the caller cannot provide a URL, variant ID, seller identity or price.
+The catalog SKU must identify a numeric Shopify variant, or an active same-market external seed
+must have a numeric `attached_variant_id`; a synthetic canonical SKU is never treated as a
+merchant variant. The seller's own offer supplies the exact price and currency. A click row is
+recorded before the purchase opens so the later conversion has verified seller identity. The
+cart-link quote checks shipping options and totals, but an ELIGIBLE merchant verdict alone does
+not prove shipping for this buyer or every SKU.
+
 ### Response — `202 Accepted`
 
 ```json
@@ -147,7 +159,7 @@ A **replay** (same `idempotency_key`, same agent, same buyer, inside 24 h, **and
 request**) returns the same `purchase_id` and the purchase's **current** state, which may not be
 `resolving`.
 
-The key is compared together with a hash of the request it was used for: merchant, product,
+The key is compared together with a hash of the request it was used for: item source, merchant, product,
 variant, quantity, buyer email, shipping address and return url. Reuse a key on a **different**
 body and the answer is `409 idempotency_conflict`, not a 202 naming a purchase of something else.
 Values are compared after normalisation, so a retry that differs only in the casing of a domain,
@@ -159,10 +171,12 @@ or that supplies the recipient through `buyer.name` rather than in the address, 
 |---|---|---|---|
 | 404 | `not_available_on_this_rail` | the dial is off, or the Reap client is unconfigured | fall back |
 | 401 | `agent_user_required` | no `X-Agent-User-JWT` | get a user token, or fall back |
-| 409 | `merchant_not_eligible` | no enabled eligibility row for this domain **in the buyer's market** | fall back |
+| 409 | `merchant_not_eligible` | no enabled variant-lane row, or no fresh ELIGIBLE cart-link verdict, for this domain **in the buyer's market** | fall back |
 | 409 | `buyer_unlinked` | **you should never see this.** Since WP4b the buyer identity is created on the first purchase, so this no longer means "no link" — it is the fail-closed answer when the identity or the opaque ref could not be *stored* (a storage fault, not a request fault). Retrying is reasonable; editing the body will not help. | retry once, then fall back |
 | 409 | `row_not_found` | no such product under this domain, or the variant is not this product's, or no variant named and the product has more than one | fall back |
 | 409 | `row_not_shopify` | the catalog row's intake lane is not `shopify` | fall back |
+| 409 | `row_variant_unverified` | Tier B has no numeric Shopify variant verified from our catalog or active same-market seed | fall back |
+| 409 | `seller_identity_unverified` | the catalog seller identity does not agree with the offer owner | fall back |
 | 409 | `row_unpriced` | **this merchant** has no usable offer of its own on the sku, or the price is not exactly representable in minor units | fall back |
 | 409 | `row_currency_mismatch` | the offer is priced in a currency the buyer's market does not use | fall back |
 | 409 | `idempotency_conflict` | this key was already used for a **different** request | use a new key, or re-send the original request |

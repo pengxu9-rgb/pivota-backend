@@ -330,6 +330,12 @@ def attribution(monkeypatch):
         return None
 
     monkeypatch.setattr(cas, "reap_cart_link_seller_ref", _legacy_identity)
+    import db.tierb_cart_link_eligibility as tierb_eligibility
+
+    async def _eligible(_domain, _market):
+        return True
+
+    monkeypatch.setattr(tierb_eligibility, "is_cart_link_eligible", _eligible)
     return recorder
 
 
@@ -1000,6 +1006,23 @@ async def test_an_unconfigured_client_still_refuses_first_as_unconfigured(monkey
     with pytest.raises(svc.PurchaseRefused) as caught:
         await start()
     assert caught.value.reason == "rail_unconfigured"
+
+
+async def test_no_fresh_tierb_verdict_refuses_before_a_purchase_write(monkeypatch):
+    import db.tierb_cart_link_eligibility as tierb_eligibility
+
+    calls = []
+
+    async def _ineligible(domain, market):
+        calls.append((domain, market))
+        return False
+
+    monkeypatch.setattr(tierb_eligibility, "is_cart_link_eligible", _ineligible)
+    with pytest.raises(svc.PurchaseRefused) as caught:
+        await start()
+    assert caught.value.reason == "merchant_not_eligible"
+    assert calls == [(SHOP, "US")]
+    assert await count() == 0
 
 
 @pytest.mark.parametrize(
@@ -1919,6 +1942,96 @@ async def test_a_crash_after_the_claim_misses_the_edge_and_is_listed(
     assert [(r["click_id"], r["claimed_by"], r["external_order_id"]) for r in listed] == [
         (CLICK, "reap_agentic", REAP_ORDER_ID)
     ]
+
+
+async def test_completed_reap_claim_reconciliation_is_dry_by_default_and_repairs_once(
+    reap, attribution, monkeypatch
+):
+    purchase_id = await to_quoting(reap)
+    assert (await step(purchase_id)).state == "awaiting_approval"
+
+    async def _crash(_purchase):
+        raise KeyboardInterrupt("after terminal write")
+
+    monkeypatch.setattr(svc, "_close_attribution", _crash)
+    with pytest.raises(KeyboardInterrupt):
+        await step(purchase_id)
+    assert (await get(purchase_id))["state"] == "completed"
+
+    created = await _ensure_edges_table()
+    try:
+        missing_identity = await svc.reconcile_completed_cart_link_claims()
+        assert missing_identity["results"][0]["reason"] == "click_identity_unverified"
+
+        async def _owned_click(_click, _domain):
+            return "seller"
+
+        monkeypatch.setattr(_cas, "reap_cart_link_seller_ref", _owned_click)
+        dry = await svc.reconcile_completed_cart_link_claims()
+        assert dry["apply"] is False
+        assert dry["results"] == [{
+            "click_id": CLICK, "order_id": REAP_ORDER_ID,
+            "status": "ready", "purchase_id": purchase_id,
+        }]
+        assert await database.fetch_one(
+            "SELECT 1 FROM commerce_attribution_edges WHERE click_id = :c", {"c": CLICK}
+        ) is None
+
+        await database.execute(
+            "INSERT INTO commerce_attribution_edges (edge_id, merchant_id, order_id, "
+            "click_id, external_order_id, refund_count, refunded_amount) "
+            "VALUES ('other', 'seller', 'other_order', :click_id, 'other_reap_order', 0, 0)",
+            {"click_id": CLICK},
+        )
+        refused = await svc.reconcile_completed_cart_link_claims(apply=True)
+        assert refused["results"][0]["reason"] == "another_edge_for_click"
+        await database.execute("DELETE FROM commerce_attribution_edges WHERE edge_id = 'other'")
+
+        async def _write_edge(purchase):
+            assert purchase["id"] == purchase_id
+            await database.execute(
+                "INSERT INTO commerce_attribution_edges (edge_id, merchant_id, order_id, "
+                "click_id, external_order_id, refund_count, refunded_amount) "
+                "VALUES ('repaired', 'seller', 'repaired_order', :click_id, :order_id, 0, 0)",
+                {"click_id": CLICK, "order_id": REAP_ORDER_ID},
+            )
+            return True
+
+        monkeypatch.setattr(svc, "_close_attribution", _write_edge)
+        applied = await svc.reconcile_completed_cart_link_claims(apply=True)
+        assert applied["results"][0]["status"] == "repaired"
+        assert (await svc.reconcile_completed_cart_link_claims(apply=True))["inspected"] == 0
+        assert attribution.edges == {}
+    finally:
+        await database.execute(
+            "DELETE FROM commerce_attribution_edges WHERE edge_id IN ('repaired', 'other')"
+        )
+        await _drop_edges_table_if(created)
+
+
+async def test_reconciliation_refuses_an_unverified_completed_purchase(reap, monkeypatch):
+    purchase_id = await to_quoting(reap)
+    assert (await step(purchase_id)).state == "awaiting_approval"
+
+    async def _crash(_purchase):
+        raise KeyboardInterrupt("after terminal write")
+
+    monkeypatch.setattr(svc, "_close_attribution", _crash)
+    with pytest.raises(KeyboardInterrupt):
+        await step(purchase_id)
+    await database.execute(
+        "UPDATE reap_agentic_purchases SET final_total_minor = final_total_minor + 100 "
+        "WHERE id = :id", {"id": purchase_id},
+    )
+    created = await _ensure_edges_table()
+    try:
+        result = await svc.reconcile_completed_cart_link_claims(apply=True)
+        assert result["results"][0]["reason"] == "purchase_evidence_unverified"
+        assert await database.fetch_one(
+            "SELECT 1 FROM commerce_attribution_edges WHERE click_id = :c", {"c": CLICK}
+        ) is None
+    finally:
+        await _drop_edges_table_if(created)
 
 
 async def test_list_claims_without_edge_skips_claims_that_have_their_edge():
