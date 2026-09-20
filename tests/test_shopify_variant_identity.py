@@ -16,6 +16,7 @@ against a real Postgres, by tests/test_backfill_shopify_variant_ids_postgres.py.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
 import pytest
@@ -25,6 +26,7 @@ from services.shopify_variant_identity import (
     parse_product_js,
     product_js_url,
     sole_stamped_variant_id,
+    sole_verified_cart_variant_id,
     stamp_variant_ids,
     storefront_is_shopify,
 )
@@ -40,6 +42,31 @@ def _live(vid: str, title: str, *, options: List[str] | None = None, price: int 
         "available": available,
         "sku": sku,
     }
+
+
+def test_cart_proof_requires_fresh_same_url_sole_live_variant() -> None:
+    now = datetime.now(timezone.utc)
+    seed = {"snapshot": {"variants": [{"shopify_variant_id": "11"}],
+                         "shopify_cart_proof": {
+                             "source": "products_js_v1",
+                             "product_js_url": "https://brand.com/products/serum.js",
+                             "live_variant_count": 1,
+                             "variant_id": "11",
+                             "checked_at": now.isoformat(),
+                         }}}
+    url = ["https://brand.com/products/serum"]
+    assert sole_verified_cart_variant_id(seed, product_urls=url, shop_domain="brand.com", now=now) == "11"
+    seed["snapshot"]["shopify_cart_proof"]["live_variant_count"] = 2
+    assert sole_verified_cart_variant_id(seed, product_urls=url, shop_domain="brand.com", now=now) is None
+    seed["snapshot"]["shopify_cart_proof"]["live_variant_count"] = 1
+    assert sole_verified_cart_variant_id(seed, product_urls=["https://brand.com/products/other"], shop_domain="brand.com", now=now) is None
+    assert sole_verified_cart_variant_id(seed, product_urls=url, shop_domain="other.com", now=now) is None
+    assert sole_verified_cart_variant_id(seed, product_urls=url, shop_domain="brand.com", now=now + timedelta(days=8)) is None
+    seed["snapshot"]["variants"].append("unknown second variant")
+    assert sole_verified_cart_variant_id(seed, product_urls=url, shop_domain="brand.com", now=now) is None
+    seed["snapshot"]["variants"].pop()
+    seed["snapshot"].pop("shopify_cart_proof")
+    assert sole_verified_cart_variant_id(seed, product_urls=url, shop_domain="brand.com", now=now) is None
 
 
 # ---------------------------------------------------------------- URL derivation

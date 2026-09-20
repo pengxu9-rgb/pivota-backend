@@ -140,8 +140,10 @@ minting a buyer. It constructs the single-line Shopify permalink itself, includi
 an owned `pivota_click_id`; the caller cannot provide a URL, variant ID, seller identity or price.
 The catalog SKU must identify a numeric Shopify variant. For a mirrored external seed, a numeric
 operator-entered `attached_variant_id` is **not** enough: the active same-market seed must be
-attached to this catalog product and carry storefront-stamped evidence for exactly one Shopify
-variant. A contradictory attached id, a multi-variant snapshot, or a synthetic canonical SKU
+attached to this catalog product and carry a dedicated, at-most-seven-day-old proof from the
+same Shopify `.js` fetch that the live storefront had exactly one variant. The proof's product
+URL and numeric id must agree with the seed snapshot. A contradictory attached id, a
+multi-variant snapshot, or a synthetic canonical SKU
 without that evidence is refused. The seller's own offer supplies the exact price and currency.
 A click row is recorded before the purchase opens so the later conversion has verified seller identity. The
 cart-link quote checks shipping options and totals, but an ELIGIBLE merchant verdict alone does

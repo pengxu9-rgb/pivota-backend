@@ -1440,7 +1440,13 @@ async def test_tierb_mirrored_seed_requires_storefront_evidence_on_postgres(clie
         )
         stamped = json.dumps({"snapshot": {"storefront_platform": "shopify", "variants": [
             {"shopify_variant_id": "50041364447509"}
-        ]}})
+        ], "shopify_cart_proof": {
+            "source": "products_js_v1",
+            "product_js_url": f"https://{DOMAIN}/products/test.js",
+            "live_variant_count": 1,
+            "variant_id": "50041364447509",
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }}})
         await database.execute(
             "INSERT INTO external_product_seeds "
             "(id, market, destination_url, domain, attached_product_key, "

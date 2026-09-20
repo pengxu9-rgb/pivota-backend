@@ -125,7 +125,7 @@ from services.outbound_links_service import (
     build_shopify_cart_permalink,
     extract_shopify_numeric_variant_id,
 )
-from services.shopify_variant_identity import sole_stamped_variant_id, storefront_is_shopify
+from services.shopify_variant_identity import sole_verified_cart_variant_id
 
 logger = logging.getLogger(__name__)
 
@@ -1075,7 +1075,7 @@ _CART_SINGLE_SKU_SQL = """
      ORDER BY s.sku_key LIMIT 2
 """
 _CART_SEED_VARIANT_SQL = """
-    SELECT e.attached_variant_id, e.seed_data
+    SELECT e.attached_variant_id, e.seed_data, e.destination_url, e.canonical_url
       FROM external_product_seeds e
      WHERE e.id = :seed_id AND e.status = 'active'
        AND e.attached_product_key = :product_key
@@ -1158,9 +1158,10 @@ async def _load_cart_link_item(
                 seed_data = json.loads(seed_data)
             except (TypeError, ValueError):
                 seed_data = None
-        variant_id = (
-            sole_stamped_variant_id(seed_data)
-            if storefront_is_shopify(seed_data) else None
+        variant_id = sole_verified_cart_variant_id(
+            seed_data,
+            product_urls=[seed.get("canonical_url"), seed.get("destination_url")],
+            shop_domain=merchant_domain,
         )
         # An attachment naming another id is a contradiction, even if its string is all digits.
         # Never use it as a fallback: that is the numeric-SKU wrong-cart bug in the gateway.

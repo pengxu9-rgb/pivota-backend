@@ -535,7 +535,9 @@ The gate is read **per request**, so arming the rail is an env change and not a 
 
 The Tier B **cart-link** lane is narrower in a different way: a mirrored `external_seed` is
 buyable only when its active market-matched seed is attached to that exact catalog product and
-its storefront snapshot stamps exactly one Shopify variant. An operator-entered numeric
+its storefront snapshot has exactly one stamped variant and a fresh, URL-bound `.js` proof
+that the live Shopify product itself had exactly one variant. Older stamps without that proof
+fail closed until a backfill refresh. An operator-entered numeric
 `attached_variant_id` is not proof; if it conflicts with the stamp, the route refuses. The
 variant lane described in the table above still refuses external seeds entirely.
 

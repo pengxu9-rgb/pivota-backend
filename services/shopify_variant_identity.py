@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, urlunparse
 
@@ -383,8 +384,53 @@ def sole_stamped_variant_id(seed_data: Any) -> Optional[str]:
     variants = snapshot.get("variants")
     if not isinstance(variants, list):
         return None
-    entries = [v for v in variants if isinstance(v, dict)]
-    if len(entries) != 1:
+    if len(variants) != 1 or not isinstance(variants[0], dict):
         return None
-    sole = str(entries[0].get("shopify_variant_id") or "").strip()
+    sole = str(variants[0].get("shopify_variant_id") or "").strip()
     return sole if _numeric_id(sole) else None
+
+
+def sole_verified_cart_variant_id(
+    seed_data: Any, *, product_urls: List[str], shop_domain: str,
+    now: Optional[datetime] = None,
+) -> Optional[str]:
+    """Accept a mirrored cart id only with a fresh, same-fetch sole-storefront proof.
+
+    A snapshot with one stamped entry is insufficient: a label match can stamp that entry
+    while Shopify's live product has several variants. The dedicated proof is written only
+    from a successful products.js response by the backfill, never inferred from seed labels.
+    """
+    if not isinstance(seed_data, dict):
+        return None
+    snapshot = seed_data.get("snapshot")
+    if not isinstance(snapshot, dict):
+        return None
+    proof = snapshot.get("shopify_cart_proof")
+    if not isinstance(proof, dict) or proof.get("source") != "products_js_v1":
+        return None
+    if type(proof.get("live_variant_count")) is not int or proof["live_variant_count"] != 1:
+        return None
+    variant_id = sole_stamped_variant_id(seed_data)
+    if not variant_id or _numeric_id(proof.get("variant_id")) != variant_id:
+        return None
+    proof_url = proof.get("product_js_url")
+    if not isinstance(proof_url, str) or proof_url not in {
+        product_js_url(url) for url in product_urls if url
+    }:
+        return None
+    try:
+        proof_host = urlparse(proof_url).hostname
+    except ValueError:
+        return None
+    if proof_host != str(shop_domain or "").strip().lower():
+        return None
+    try:
+        checked_at = datetime.fromisoformat(str(proof.get("checked_at") or ""))
+    except ValueError:
+        return None
+    if checked_at.tzinfo is None:
+        return None
+    current = now or datetime.now(timezone.utc)
+    if checked_at > current or current - checked_at > timedelta(days=7):
+        return None
+    return variant_id

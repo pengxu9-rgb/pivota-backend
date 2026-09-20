@@ -223,7 +223,7 @@ async def _db():
         await database.execute(
             "CREATE TABLE external_product_seeds ("
             "id TEXT PRIMARY KEY, status TEXT, domain TEXT, market TEXT, "
-            "destination_url TEXT, attached_product_key TEXT, attached_variant_id TEXT, "
+            "destination_url TEXT, canonical_url TEXT, attached_product_key TEXT, attached_variant_id TEXT, "
             "seed_data TEXT)"
         )
 
@@ -613,6 +613,7 @@ async def test_cart_link_refuses_a_non_numeric_catalog_variant(client, monkeypat
     (("50041364447509",), "99999999999999", PRODUCT_KEY, 409),
     (("50041364447509",), "50041364447509", "prod::other", 409),
     (("50041364447509", "50041364447510"), "50041364447509", PRODUCT_KEY, 409),
+    (("50041364447509", "MALFORMED"), "50041364447509", PRODUCT_KEY, 409),
 ])
 async def test_cart_link_mirrored_seed_requires_product_bound_storefront_variant(
     client, monkeypatch, stamped_variants, attached_variant, attached_product, expected
@@ -629,8 +630,15 @@ async def test_cart_link_mirrored_seed_requires_product_bound_storefront_variant
     )
     seed_data = (
         {"snapshot": {"storefront_platform": "shopify", "variants": [
-            {"shopify_variant_id": variant} for variant in stamped_variants
-        ]}} if stamped_variants else {}
+            variant if variant == "MALFORMED" else {"shopify_variant_id": variant}
+            for variant in stamped_variants
+        ], "shopify_cart_proof": {
+            "source": "products_js_v1",
+            "product_js_url": f"https://{DOMAIN}/products/test.js",
+            "live_variant_count": 1,
+            "variant_id": stamped_variants[0],
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }}} if stamped_variants else {}
     )
     await database.execute(
         "INSERT INTO external_product_seeds "
