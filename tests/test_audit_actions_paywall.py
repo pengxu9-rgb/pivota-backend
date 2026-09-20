@@ -341,6 +341,62 @@ async def test_tier_lookup_failure_fails_closed(monkeypatch):
     assert out["actions_locked"] is True
 
 
+def _historical_url_run(*, providers=None, explicit=None, requested_at="2026-09-05T00:00:00Z"):
+    launch = {"audit_mode": "per_sku", "providers": providers or ["gemini", "chatgpt"]}
+    if explicit is not None:
+        launch["paid_actions_unlocked_at_launch"] = explicit
+    return {
+        "subject_type": "merchant_url", "requested_at": requested_at,
+        "partial_result_jsonb": {"launch": launch},
+    }
+
+
+@pytest.mark.asyncio
+async def test_expired_owner_retains_paid_actions_from_launch_snapshot(monkeypatch):
+    monkeypatch.setattr(mar, "_ACTIONS_PAYWALL_ENABLED", True)
+
+    async def balance(_merchant_id):
+        return {"plan_tier": "free"}
+
+    monkeypatch.setattr(mar, "get_balance", balance)
+    run = _historical_url_run(providers=["gemini"], explicit=True)
+    out = await mar._apply_actions_paywall(_shaped_fixture(), "m1", run)
+    assert out["merchant_narrative"]["prioritized_actions"]
+    assert out.get("actions_locked") is not True
+
+
+@pytest.mark.asyncio
+async def test_old_paid_dual_provider_run_retains_actions_even_if_balance_fails(monkeypatch):
+    monkeypatch.setattr(mar, "_ACTIONS_PAYWALL_ENABLED", True)
+
+    async def broken_balance(_merchant_id):
+        raise RuntimeError("billing unavailable")
+
+    monkeypatch.setattr(mar, "get_balance", broken_balance)
+    out = await mar._apply_actions_paywall(
+        _shaped_fixture(), "m1", _historical_url_run()
+    )
+    assert out["merchant_narrative"]["prioritized_actions"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("run", [
+    _historical_url_run(providers=["gemini"], explicit=False),
+    _historical_url_run(providers=["gemini"]),
+    _historical_url_run(explicit=False),
+    _historical_url_run(requested_at="2026-06-23T23:59:59Z"),
+])
+async def test_free_or_unproven_run_stays_locked(monkeypatch, run):
+    monkeypatch.setattr(mar, "_ACTIONS_PAYWALL_ENABLED", True)
+
+    async def balance(_merchant_id):
+        return {"plan_tier": "free"}
+
+    monkeypatch.setattr(mar, "get_balance", balance)
+    out = await mar._apply_actions_paywall(_shaped_fixture(), "m1", run)
+    assert out["actions_locked"] is True
+
+
 # ---- share-view interaction -------------------------------------------------
 
 def test_share_redaction_carries_lock_markers():

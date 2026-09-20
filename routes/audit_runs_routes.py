@@ -1557,6 +1557,7 @@ async def get_audit_run(
                 _strip_brand_facing_internal_money(proj.get("payload_jsonb"))
             ),
             str(row.get("merchant_id") or ""),
+            row,
         )
 
     from routes.merchant_audit_routes import _apply_actions_paywall
@@ -1567,6 +1568,7 @@ async def get_audit_run(
                 _strip_brand_facing_internal_money(dict(row))
             ),
             str(row.get("merchant_id") or ""),
+            row,
         )
     )
 

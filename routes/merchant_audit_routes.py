@@ -1767,14 +1767,41 @@ def _strip_actions_for_free_tier(shaped: Dict[str, Any]) -> Dict[str, Any]:
     return shaped
 
 
+def _run_earned_paid_actions(run: Optional[Dict[str, Any]]) -> bool:
+    """Preserve access to actions earned when an audit was launched.
+
+    New URL audits persist an explicit entitlement. Older URL audits lack
+    that field, so only the paid-only dual-provider launch configuration from
+    June 24, 2026 onward is accepted as a historical marker. A free audit
+    allowance / zero credit debit says nothing about plan entitlement.
+    """
+    if not isinstance(run, dict) or run.get("subject_type") != "merchant_url":
+        return False
+    partial = run.get("partial_result_jsonb")
+    launch = partial.get("launch") if isinstance(partial, dict) else None
+    if not isinstance(launch, dict):
+        return False
+    if "paid_actions_unlocked_at_launch" in launch:
+        return launch["paid_actions_unlocked_at_launch"] is True
+    if launch.get("audit_mode") != "per_sku":
+        return False
+    requested_at = str(run.get("requested_at") or "")
+    if requested_at[:10] < "2026-06-24":
+        return False
+    providers = launch.get("providers")
+    return isinstance(providers, list) and {
+        "gemini", "chatgpt"
+    }.issubset({str(p).strip().lower() for p in providers})
+
+
 async def _apply_actions_paywall(
-    shaped: Dict[str, Any], owner_merchant_id: str
+    shaped: Dict[str, Any], owner_merchant_id: str,
+    run: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Strip the paid action layer when the OWNING merchant is free-tier and
-    the paywall flag is on. Tier-lookup failures fail CLOSED (treated as
-    free): a paying merchant briefly seeing a lock beats an unauthenticated
-    surface leaking the paid layer on a billing-service hiccup."""
+    """Gate new paid actions by current tier, but retain earned report access."""
     if not _ACTIONS_PAYWALL_ENABLED:
+        return shaped
+    if _run_earned_paid_actions(run):
         return shaped
     try:
         balance = await get_balance(owner_merchant_id)
@@ -2605,6 +2632,7 @@ async def run_merchant_url_audit(
                 "audit_mode": "per_sku",
                 "coverage_profile": _WEDGE_COVERAGE_PROFILE,
                 "providers": providers_for_launch,
+                "paid_actions_unlocked_at_launch": paid_tier,
                 "verify_providers": list(_WEDGE_VERIFY_PROVIDERS),
                 # Depth tier: on deep the explicit count is OMITTED so the
                 # worker resolves the tier budget (a persisted default would
@@ -2748,7 +2776,7 @@ async def get_merchant_url_audit(
         # + authority_map). Reshape it into the URL-audit envelope the client
         # expects (status/run_id/per_sku_reports/methodology/…).
         shaped = _shape_url_audit_response(row)
-        shaped = await _apply_actions_paywall(shaped, merchant_id)
+        shaped = await _apply_actions_paywall(shaped, merchant_id, row)
         if summary_only:
             return {
                 "status": "succeeded",
@@ -3069,7 +3097,7 @@ async def read_shared_audit(token: str) -> Response:
     # must not hand out the paid action layer the merchant themselves can't
     # see. (Paid owners' shares keep the full report — e.g. the marketing
     # sample report from a paid demo account.)
-    shaped = await _apply_actions_paywall(shaped, run.get("merchant_id") or "")
+    shaped = await _apply_actions_paywall(shaped, run.get("merchant_id") or "", run)
     shaped.update(await _shared_momentum_payload(run))
     shaped = _redact_shared_report(shaped)
     import json as _json
@@ -4289,7 +4317,7 @@ async def answer_merchant_audit_question(
     # handed, so nesting the projection would hide the paid layer from the
     # paywall it was just wired through.
     context.update(recovery)
-    context = await _apply_actions_paywall(context, merchant_id)
+    context = await _apply_actions_paywall(context, merchant_id, run)
 
     context_json = json.dumps(context, default=str)[:_ASK_CONTEXT_MAX_CHARS]
     user_message = (

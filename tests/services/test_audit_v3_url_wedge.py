@@ -234,6 +234,7 @@ def test_post_returns_running_with_run_id(client):
     assert launch["audit_mode"] == "per_sku"
     # Stub merchant is growth (paid) -> gets the paid provider set (gemini + chatgpt).
     assert launch["providers"] == mar._WEDGE_PROVIDERS + mar._WEDGE_PAID_PROVIDERS
+    assert launch["paid_actions_unlocked_at_launch"] is True
     assert [s["pdp_url"] for s in launch["synthetic_products"]] == _BODY["product_urls"]
     # No custom prompts by default.
     assert launch["custom_prompts"] == []
@@ -1048,6 +1049,7 @@ def test_free_tier_stays_gemini_only(client):
     launch = client.enqueued[-1]["request_options_jsonb"]["launch"]
     assert launch["providers"] == mar._WEDGE_PROVIDERS
     assert "chatgpt" not in launch["providers"]
+    assert launch["paid_actions_unlocked_at_launch"] is False
 
 
 def test_retail_channel_url_uses_brand_site_as_first_party(client):
