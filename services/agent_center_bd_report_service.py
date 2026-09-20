@@ -6344,6 +6344,10 @@ async def _selection_gap_section(
 def _grounding_evidence(probe_runs: Any, cap: int = 12) -> List[Dict[str, Any]]:
     evidence: List[Dict[str, Any]] = []
     for run in _flatten_probe_runs(probe_runs):
+        if run.get("identity_mismatch"):
+            # This is still retained in the raw checkpoint/failing prompts,
+            # but the merchant UI treats every row here as positive SKU proof.
+            continue
         sources = run.get("grounding_sources") or []
         parsed = run.get("parsed") if isinstance(run.get("parsed"), dict) else {}
         excerpt = (
@@ -7660,6 +7664,9 @@ async def build_per_sku_report(
             )
         ),
         "verbatim_grounding_evidence": _grounding_evidence(probe_runs),
+        "identity_rejected_evidence_count": sum(
+            bool(run.get("identity_mismatch")) for run in _flatten_probe_runs(probe_runs)
+        ),
         "axis_coverage": _axis_coverage(probe_runs),
         "query_class_coverage": _query_class_coverage(probe_runs),
         # INTERNAL-FIRST (founder 2026-07-21): substitution-rate + contest map

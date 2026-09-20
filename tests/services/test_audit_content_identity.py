@@ -30,8 +30,8 @@ def test_target_anko_cannot_count_as_anuko_sku_but_genuine_and_mixed_answers_rem
     assert verdict["sku_identified"] is False
     assert verdict["grounded_positive"] is False
     evidence = _grounding_evidence(guard_probe_identity(original, ANUKO, {"product": ANUKO}))
-    assert evidence[0]["product_visible"] is False
-    assert evidence[0]["identity_mismatch"]
+    assert len(evidence) == 2
+    assert all("Target Australia" not in (item.get("evidence_excerpt") or "") for item in evidence)
     assert runs[1]["parsed"]["product_visible"] is True
     assert runs[2]["parsed"]["product_visible"] is True
     assert original[0]["raw_runs"][0]["parsed"]["product_visible"] is True
@@ -63,7 +63,8 @@ def test_legacy_report_repairs_false_evidence_and_diagnostic_action_without_muta
     }
     fixed = repair_report_content(report)
     sku = fixed["per_sku_reports"][0]
-    assert sku["verbatim_grounding_evidence"][0]["product_visible"] is False
+    assert sku["verbatim_grounding_evidence"] == []
+    assert sku["identity_rejected_evidence_count"] == 1
     assert sku["historical_identity_review_required"] is True
     assert "strategic_brief" not in sku["next_best_action"]
     assert "diagnostic question" in sku["next_best_action"]["why_this_first"]

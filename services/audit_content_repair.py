@@ -22,21 +22,28 @@ def repair_report_content(report: dict[str, Any], *, merchant_name: str | None =
         if not isinstance(sku, dict):
             continue
         title = str(sku.get("sku_title") or "this product")
+        kept_evidence = []
+        rejected = 0
         for evidence in sku.get("verbatim_grounding_evidence") or []:
             if not isinstance(evidence, dict) or evidence.get("product_visible") is not True:
+                kept_evidence.append(evidence)
                 continue
             sources = [s for s in evidence.get("grounding_sources") or [] if isinstance(s, dict)]
             excerpt = str(evidence.get("evidence_excerpt") or "")
             source_text = " ".join(str(s.get(k) or "") for s in sources for k in ("title", "uri", "url"))
             if not brand or not sources or _mentions_brand(excerpt + " " + source_text, brand):
+                kept_evidence.append(evidence)
                 continue
             own_host = _host(out.get("merchant_domain"))
             if own_host and any(_host(s.get("uri") or s.get("url")) == own_host for s in sources):
+                kept_evidence.append(evidence)
                 continue
-            evidence["product_visible"] = False
-            evidence["identity_mismatch"] = "positive_model_verdict_without_merchant_identity"
             sku["historical_identity_review_required"] = True
             invalid_excerpts.append(excerpt)
+            rejected += 1
+        if rejected:
+            sku["verbatim_grounding_evidence"] = kept_evidence
+            sku["identity_rejected_evidence_count"] = rejected
         nba = sku.get("next_best_action")
         if isinstance(nba, dict):
             if sku.get("historical_identity_review_required"):
