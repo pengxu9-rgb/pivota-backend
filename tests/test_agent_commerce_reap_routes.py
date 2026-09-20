@@ -83,6 +83,7 @@ DOMAIN = "brand.example"
 PRODUCT_KEY = "prod::m_brand::shopify::1001"
 SKU_KEY = "sku::prod::m_brand::shopify::1001::v1"
 SECOND_SKU_KEY = "sku::prod::m_brand::shopify::1001::v2"
+MIRROR_SEED_ID = "seed_reap_cart_route_fixture"
 
 EMAIL = "ada@example.test"
 ADDRESS = {
@@ -212,17 +213,33 @@ async def _db():
     )
     engine.dispose()
 
-    # The route only reads these five seed columns; production uses migration 044's fuller
-    # table. Keep a minimal read fixture here rather than importing an unrelated employee API.
-    await database.execute(
-        "CREATE TABLE IF NOT EXISTS external_product_seeds ("
-        "id TEXT PRIMARY KEY, status TEXT, domain TEXT, market TEXT, attached_variant_id TEXT)"
-    )
+    # Other suites use the same file-backed SQLite database and require migration 044's wider
+    # seed table. Only create this route's small fixture if absent, and DROP it after the test;
+    # IF NOT EXISTS without teardown poisoned those suites with a permanently narrow schema.
+    had_seed_table = await database.fetch_one(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'external_product_seeds'"
+    ) is not None
+    if not had_seed_table:
+        await database.execute(
+            "CREATE TABLE external_product_seeds ("
+            "id TEXT PRIMARY KEY, status TEXT, domain TEXT, market TEXT, "
+            "destination_url TEXT, attached_product_key TEXT, attached_variant_id TEXT, "
+            "seed_data TEXT)"
+        )
 
     for table in CATALOG_TABLES + ("buyer_identity_links", "shop_users"):
         await database.execute(f"DELETE FROM {table}")
-    await database.execute("DELETE FROM external_product_seeds")
-    yield
+    await database.execute(
+        "DELETE FROM external_product_seeds WHERE id = :id", {"id": MIRROR_SEED_ID}
+    )
+    try:
+        yield
+    finally:
+        await database.execute(
+            "DELETE FROM external_product_seeds WHERE id = :id", {"id": MIRROR_SEED_ID}
+        )
+        if not had_seed_table:
+            await database.execute("DROP TABLE external_product_seeds")
 
 
 @pytest.fixture(autouse=True)
@@ -589,27 +606,41 @@ async def test_cart_link_refuses_a_non_numeric_catalog_variant(client, monkeypat
     assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
 
 
-@pytest.mark.parametrize("attached_variant,expected", [
-    ("50041364447509", 202), (None, 409),
+@pytest.mark.parametrize("stamped_variants,attached_variant,attached_product,expected", [
+    (("50041364447509",), "50041364447509", PRODUCT_KEY, 202),
+    (("50041364447509",), None, PRODUCT_KEY, 202),
+    ((), "50041364447509", PRODUCT_KEY, 409),
+    (("50041364447509",), "99999999999999", PRODUCT_KEY, 409),
+    (("50041364447509",), "50041364447509", "prod::other", 409),
+    (("50041364447509", "50041364447510"), "50041364447509", PRODUCT_KEY, 409),
 ])
-async def test_cart_link_mirrored_seed_uses_only_its_market_verified_variant(
-    client, monkeypatch, attached_variant, expected
+async def test_cart_link_mirrored_seed_requires_product_bound_storefront_variant(
+    client, monkeypatch, stamped_variants, attached_variant, attached_product, expected
 ):
     await _seed_catalog(platform="external_seed")
     await database.execute(
         "UPDATE catalog_products SET seller_ref = 'm_brand', seed_kind = 'self', "
-        "source_system = 'external_product_seeds_mirror_v1', source_ref = 'seed_1' "
-        "WHERE product_key = :pk", {"pk": PRODUCT_KEY},
+        "source_system = 'external_product_seeds_mirror_v1', source_ref = :seed_id "
+        "WHERE product_key = :pk", {"pk": PRODUCT_KEY, "seed_id": MIRROR_SEED_ID},
     )
     await database.execute(
         "UPDATE catalog_skus SET source_variant_id = :pk WHERE sku_key = :sk",
         {"pk": PRODUCT_KEY, "sk": SKU_KEY},
     )
+    seed_data = (
+        {"snapshot": {"storefront_platform": "shopify", "variants": [
+            {"shopify_variant_id": variant} for variant in stamped_variants
+        ]}} if stamped_variants else {}
+    )
     await database.execute(
         "INSERT INTO external_product_seeds "
-        "(id, status, domain, market, attached_variant_id) "
-        "VALUES ('seed_1', 'active', :domain, 'US', :variant)",
-        {"domain": DOMAIN, "variant": attached_variant},
+        "(id, status, domain, market, destination_url, attached_product_key, "
+        "attached_variant_id, seed_data) "
+        "VALUES (:seed_id, 'active', :domain, 'US', :destination, :product_key, :variant, "
+        ":seed_data)",
+        {"seed_id": MIRROR_SEED_ID, "domain": DOMAIN,
+         "destination": f"https://{DOMAIN}/products/test", "product_key": attached_product,
+         "variant": attached_variant, "seed_data": json.dumps(seed_data)},
     )
     await _seed_tierb_verdict()
     monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")

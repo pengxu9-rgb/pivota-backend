@@ -125,6 +125,7 @@ from services.outbound_links_service import (
     build_shopify_cart_permalink,
     extract_shopify_numeric_variant_id,
 )
+from services.shopify_variant_identity import sole_stamped_variant_id, storefront_is_shopify
 
 logger = logging.getLogger(__name__)
 
@@ -1048,8 +1049,9 @@ async def _load_catalog_row(
 
 # Tier B uses the same catalog price discipline as the variant lane, but its item identity is a
 # merchant-issued Shopify numeric variant id, not Reap's opaque variant. A mirrored external-seed
-# SKU is synthetic (`source_variant_id == product_key`), so it MUST get its real variant from the
-# active, market-matched seed; a number guessed from its SKU key would buy the wrong item.
+# SKU is synthetic (`source_variant_id == product_key`). Its operator-entered
+# `attached_variant_id` is NOT proof of Shopify identity: it can be a numeric SKU. The mirror
+# therefore needs a product-bound seed with a sole variant stamped from storefront `.js` evidence.
 _CART_PRODUCT_SQL = """
     SELECT p.product_key, p.merchant_id, p.seller_ref, p.seed_kind, p.platform,
            p.source_ref, p.source_system, p.title AS product_title
@@ -1073,9 +1075,10 @@ _CART_SINGLE_SKU_SQL = """
      ORDER BY s.sku_key LIMIT 2
 """
 _CART_SEED_VARIANT_SQL = """
-    SELECT e.attached_variant_id
+    SELECT e.attached_variant_id, e.seed_data
       FROM external_product_seeds e
      WHERE e.id = :seed_id AND e.status = 'active'
+       AND e.attached_product_key = :product_key
        AND lower(e.domain) = :merchant_domain AND upper(e.market) = :market_country
 """
 _CART_OFFER_SQL = """
@@ -1101,8 +1104,8 @@ async def _load_cart_link_item(
     """Return server-priced cart item, seller identity, and Shopify variant, or refuse.
 
     The buyer/agent supplies only catalog keys. No caller URL, price, Shopify variant, or seller
-    identity is accepted. Mirrored seeds without a verified attached variant are not buyable on
-    this rail, even if their synthetic SKU looks like a variant.
+    identity is accepted. Mirrored seeds need an attached product and a sole variant proven by
+    storefront evidence. Numeric operator input alone cannot authorize a purchase.
     """
     raw = await database.fetch_one(
         _CART_PRODUCT_SQL, {"product_key": product_key, "merchant_domain": merchant_domain}
@@ -1135,14 +1138,35 @@ async def _load_cart_link_item(
     else:
         if str(product.get("source_system") or "") != "external_product_seeds_mirror_v1":
             raise svc.PurchaseRefused("row_variant_unverified", "external seed source is unknown")
+        # A mirror is a product-grain row. Even a caller-named SKU cannot make an arbitrary
+        # choice among multiple offers agree with a sole storefront variant.
+        mirror_skus = [dict(row) for row in await database.fetch_all(
+            _CART_SINGLE_SKU_SQL, {"product_key": product_key}
+        )]
+        if len(mirror_skus) != 1 or mirror_skus[0]["sku_key"] != sku["sku_key"]:
+            raise svc.PurchaseRefused("row_variant_unverified", "mirror variant is ambiguous")
         seed = await database.fetch_one(
             _CART_SEED_VARIANT_SQL,
-            {"seed_id": product.get("source_ref"), "merchant_domain": merchant_domain,
+            {"seed_id": product.get("source_ref"), "product_key": product_key,
+             "merchant_domain": merchant_domain,
              "market_country": market_country},
         )
-        variant_id = extract_shopify_numeric_variant_id(
-            dict(seed).get("attached_variant_id") if seed else None
+        seed = dict(seed) if seed else {}
+        seed_data = seed.get("seed_data")
+        if isinstance(seed_data, str):
+            try:
+                seed_data = json.loads(seed_data)
+            except (TypeError, ValueError):
+                seed_data = None
+        variant_id = (
+            sole_stamped_variant_id(seed_data)
+            if storefront_is_shopify(seed_data) else None
         )
+        # An attachment naming another id is a contradiction, even if its string is all digits.
+        # Never use it as a fallback: that is the numeric-SKU wrong-cart bug in the gateway.
+        attached_id = str(seed.get("attached_variant_id") or "").strip()
+        if attached_id and extract_shopify_numeric_variant_id(attached_id) != variant_id:
+            raise svc.PurchaseRefused("row_variant_unverified", "seed identity contradicts storefront")
         seller_ref = str(product.get("seller_ref") or "").strip()
     if not variant_id:
         raise svc.PurchaseRefused("row_variant_unverified", "no verified Shopify numeric variant")

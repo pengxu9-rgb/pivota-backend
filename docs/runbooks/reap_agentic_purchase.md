@@ -533,6 +533,12 @@ The gate is read **per request**, so arming the rail is an env change and not a 
 | **the variant key** | matched exactly against `catalog_skus.sku_key`, never re-derived: this repo has three live spellings of a variant sku key and they collide. |
 | **the storefront** | `catalog_products.platform` must be `shopify`. `external_seed` rows are refused `row_not_shopify` even though most of that cohort really is Shopify — that normalisation needs seed-snapshot evidence the catalog tables do not carry, and this is a charge, not a display. |
 
+The Tier B **cart-link** lane is narrower in a different way: a mirrored `external_seed` is
+buyable only when its active market-matched seed is attached to that exact catalog product and
+its storefront snapshot stamps exactly one Shopify variant. An operator-entered numeric
+`attached_variant_id` is not proof; if it conflicts with the stamp, the route refuses. The
+variant lane described in the table above still refuses external seeds entirely.
+
 **Why a missing buyer link is now a sign-up and not a refusal.** Owner decision, 2026-09-18. Until
 WP4b the routes refused `buyer_unlinked`, on the argument that only a buyer-authenticated sign-in
 should bind an agent's opaque user ref to an account. The consequence was that **every** agent-only

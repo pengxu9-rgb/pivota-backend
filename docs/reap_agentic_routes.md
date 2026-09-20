@@ -138,10 +138,12 @@ For `item_source: "cart_link"`, the same authenticated endpoint requires a **fre
 verdict** for `(merchant_domain, buyer.shipping_address.country)` before reading the catalog or
 minting a buyer. It constructs the single-line Shopify permalink itself, including `country=` and
 an owned `pivota_click_id`; the caller cannot provide a URL, variant ID, seller identity or price.
-The catalog SKU must identify a numeric Shopify variant, or an active same-market external seed
-must have a numeric `attached_variant_id`; a synthetic canonical SKU is never treated as a
-merchant variant. The seller's own offer supplies the exact price and currency. A click row is
-recorded before the purchase opens so the later conversion has verified seller identity. The
+The catalog SKU must identify a numeric Shopify variant. For a mirrored external seed, a numeric
+operator-entered `attached_variant_id` is **not** enough: the active same-market seed must be
+attached to this catalog product and carry storefront-stamped evidence for exactly one Shopify
+variant. A contradictory attached id, a multi-variant snapshot, or a synthetic canonical SKU
+without that evidence is refused. The seller's own offer supplies the exact price and currency.
+A click row is recorded before the purchase opens so the later conversion has verified seller identity. The
 cart-link quote checks shipping options and totals, but an ELIGIBLE merchant verdict alone does
 not prove shipping for this buyer or every SKU.
 
