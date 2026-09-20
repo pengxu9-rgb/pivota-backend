@@ -179,4 +179,6 @@ async def search(
         return None, "gateway_invalid_json", 502
     if not isinstance(body, dict) or not isinstance(body.get("products"), list):
         return None, "gateway_unexpected_shape", 502
+    if str(body.get("status", "success")).lower() in {"error", "failed"}:
+        return None, "gateway_failed_response", 502
     return body, "ok", 200

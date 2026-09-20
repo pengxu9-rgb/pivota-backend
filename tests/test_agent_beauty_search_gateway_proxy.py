@@ -143,6 +143,7 @@ def _mock_client(monkeypatch: pytest.MonkeyPatch, handler) -> List[httpx.Request
     (lambda r: httpx.Response(401, json={}), "gateway_http_401", 401),
     (lambda r: httpx.Response(200, text="not json"), "gateway_invalid_json", 502),
     (lambda r: httpx.Response(200, json={"no": "products"}), "gateway_unexpected_shape", 502),
+    (lambda r: httpx.Response(200, json={"status": "failed", "products": []}), "gateway_failed_response", 502),
     (lambda r: (_ for _ in ()).throw(httpx.ReadTimeout("slow")), "gateway_timeout", 504),
     (lambda r: (_ for _ in ()).throw(httpx.ConnectError("down")), "gateway_unavailable", 503),
 ])
