@@ -84,11 +84,26 @@ _PDP_UPSERT_SQL = """
                   pivota_signature_id = COALESCE(catalog_products.pivota_signature_id, EXCLUDED.pivota_signature_id),
                   pivota_canonical_url = COALESCE(catalog_products.pivota_canonical_url, EXCLUDED.pivota_canonical_url),
                   pivota_signature_minted_at = COALESCE(catalog_products.pivota_signature_minted_at, EXCLUDED.pivota_signature_minted_at),
-                  category_path = EXCLUDED.category_path,
+                  -- Preserve the reviewed SG gloss classification if a replay
+                  -- carries the old depth-two crawl label. A newly corrected
+                  -- source path can still replace it.
+                  category_path = CASE
+                    WHEN catalog_products.product_key = 'ext:jungsaemmool-lip-pression-metal-serum-gloss::66a3c8a4'
+                     AND catalog_products.category_label_source = 'meitu_sg_gloss_reviewed_0920'
+                     AND EXCLUDED.category_path = 'beauty/makeup'
+                    THEN catalog_products.category_path ELSE EXCLUDED.category_path END,
                   category_kind = COALESCE(EXCLUDED.category_kind, catalog_products.category_kind),
                   source_domain = EXCLUDED.source_domain,
-                  category_confidence = EXCLUDED.category_confidence,
-                  category_label_source = EXCLUDED.category_label_source,
+                  category_confidence = CASE
+                    WHEN catalog_products.product_key = 'ext:jungsaemmool-lip-pression-metal-serum-gloss::66a3c8a4'
+                     AND catalog_products.category_label_source = 'meitu_sg_gloss_reviewed_0920'
+                     AND EXCLUDED.category_path = 'beauty/makeup'
+                    THEN catalog_products.category_confidence ELSE EXCLUDED.category_confidence END,
+                  category_label_source = CASE
+                    WHEN catalog_products.product_key = 'ext:jungsaemmool-lip-pression-metal-serum-gloss::66a3c8a4'
+                     AND catalog_products.category_label_source = 'meitu_sg_gloss_reviewed_0920'
+                     AND EXCLUDED.category_path = 'beauty/makeup'
+                    THEN catalog_products.category_label_source ELSE EXCLUDED.category_label_source END,
                   canonical_url = EXCLUDED.canonical_url,
                   image_url = EXCLUDED.image_url,
                   product_payload = EXCLUDED.product_payload,
@@ -300,12 +315,31 @@ _OFFER_UPSERT_SQL = """
                       END,
                       availability = EXCLUDED.availability,
                       inventory_quantity = EXCLUDED.inventory_quantity,
-                      list_price = EXCLUDED.list_price,
-                      merchant_effective_price = EXCLUDED.merchant_effective_price,
-                      estimated_best_price = EXCLUDED.estimated_best_price,
+                      -- The attached seed and merchant variants were reviewed
+                      -- at SGD 30. A stale replay of the old SGD 28.20 capture
+                      -- must not undo that repair. A new price can still win.
+                      list_price = CASE
+                        WHEN catalog_offers.product_key = 'ext:jungsaemmool-lip-pression-metal-serum-gloss::66a3c8a4'
+                         AND catalog_offers.offer_payload->>'meitu_sg_price_reviewed_0920' = 'SGD30'
+                         AND catalog_offers.list_price = 30 AND EXCLUDED.list_price = 28.20
+                        THEN catalog_offers.list_price ELSE EXCLUDED.list_price END,
+                      merchant_effective_price = CASE
+                        WHEN catalog_offers.product_key = 'ext:jungsaemmool-lip-pression-metal-serum-gloss::66a3c8a4'
+                         AND catalog_offers.offer_payload->>'meitu_sg_price_reviewed_0920' = 'SGD30'
+                         AND catalog_offers.merchant_effective_price = 30 AND EXCLUDED.merchant_effective_price = 28.20
+                        THEN catalog_offers.merchant_effective_price ELSE EXCLUDED.merchant_effective_price END,
+                      estimated_best_price = CASE
+                        WHEN catalog_offers.product_key = 'ext:jungsaemmool-lip-pression-metal-serum-gloss::66a3c8a4'
+                         AND catalog_offers.offer_payload->>'meitu_sg_price_reviewed_0920' = 'SGD30'
+                         AND catalog_offers.estimated_best_price = 30 AND EXCLUDED.estimated_best_price = 28.20
+                        THEN catalog_offers.estimated_best_price ELSE EXCLUDED.estimated_best_price END,
                       price_confidence = EXCLUDED.price_confidence,
                       source_domain = EXCLUDED.source_domain,
-                      offer_payload = EXCLUDED.offer_payload,
+                      offer_payload = CASE
+                        WHEN catalog_offers.product_key = 'ext:jungsaemmool-lip-pression-metal-serum-gloss::66a3c8a4'
+                         AND catalog_offers.offer_payload->>'meitu_sg_price_reviewed_0920' = 'SGD30'
+                         AND catalog_offers.list_price = 30 AND EXCLUDED.list_price = 28.20
+                        THEN catalog_offers.offer_payload ELSE EXCLUDED.offer_payload END,
                       updated_at = NOW()
                     """
 
