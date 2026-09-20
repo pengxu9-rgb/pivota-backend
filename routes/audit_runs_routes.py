@@ -1204,6 +1204,7 @@ async def create_audit_run(
             requested_by_user_id=auth_merchant_id,
             request_options_jsonb={
                 "launch": {
+                    "paid_actions_unlocked_at_launch": paid_tier,
                     **({"consumer_capture_plan": consumer_plan, "consumer_capture_quote": consumer_quote} if consumer_plan else {}),
                     "audit_mode": "per_sku",
                     "coverage_profile": coverage.get("profile"),
@@ -1557,6 +1558,7 @@ async def get_audit_run(
                 _strip_brand_facing_internal_money(proj.get("payload_jsonb"))
             ),
             str(row.get("merchant_id") or ""),
+            row,
         )
 
     from routes.merchant_audit_routes import _apply_actions_paywall
@@ -1567,6 +1569,7 @@ async def get_audit_run(
                 _strip_brand_facing_internal_money(dict(row))
             ),
             str(row.get("merchant_id") or ""),
+            row,
         )
     )
 

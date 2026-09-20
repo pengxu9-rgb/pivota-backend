@@ -125,7 +125,19 @@ def test_the_authed_poll_serves_the_gap_to_a_paid_owner(wired):
     )
 
 
-def test_the_public_share_read_locks_the_gap_for_a_free_owner(wired, monkeypatch):
+def test_the_authed_poll_keeps_earned_actions_after_expiry(wired):
+    wired["row"]["requested_at"] = "2026-09-05T00:00:00Z"
+    wired["row"]["partial_result_jsonb"] = {"launch": {
+        "audit_mode": "per_sku", "providers": ["gemini", "chatgpt"],
+        "billing_mode": "free", "estimated_audit_credits": 0,
+    }}
+    body = _client().get("/api/merchant-center/audit/url-readiness/r-1").json()
+    assert body.get("actions_locked") is not True
+    assert body["selection_gap"]["gaps"][0]["query"] == "best beginner drone under 300"
+
+
+@pytest.mark.parametrize("historical_paid", [False, True])
+def test_the_public_share_read_locks_the_gap_for_a_free_owner(wired, monkeypatch, historical_paid):
     """The share view is keyed to the OWNER's tier — a free owner's link must
     not hand the paid layer to anyone holding the URL."""
     class _FakeShareDB:
@@ -151,6 +163,11 @@ def test_the_public_share_read_locks_the_gap_for_a_free_owner(wired, monkeypatch
 
     import db.database as dbmod
     monkeypatch.setattr(dbmod, "database", _FakeShareDB())
+    if historical_paid:
+        wired["row"]["requested_at"] = "2026-09-05T00:00:00Z"
+        wired["row"]["partial_result_jsonb"] = {"launch": {
+            "audit_mode": "per_sku", "providers": ["gemini", "chatgpt"],
+        }}
 
     client = _client()
     token = client.post(
@@ -159,6 +176,10 @@ def test_the_public_share_read_locks_the_gap_for_a_free_owner(wired, monkeypatch
     body = client.get(f"/api/public/audit-share/{token}").json()
 
     assert body["shared_view"] is True
+    if historical_paid:
+        assert body.get("actions_locked") is not True
+        assert body["selection_gap"]["gaps"][0]["query"] == "best beginner drone under 300"
+        return
     assert body.get("selection_gap") is None
     assert (body.get("brand_rollup") or {}).get("selection_gap") is None
     assert "best beginner drone under 300" not in _gap_text(body)

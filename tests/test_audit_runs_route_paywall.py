@@ -140,6 +140,15 @@ def test_the_canonical_shape_is_intact_for_a_paid_owner(wired):
     assert "PAID-QUERY" in blob and "PAID-ACTION" in blob
 
 
+def test_the_canonical_shape_keeps_earned_actions_after_expiry(wired):
+    wired["row"]["requested_at"] = "2026-09-05T00:00:00Z"
+    wired["row"]["partial_result_jsonb"] = {"launch": {
+        "audit_mode": "per_sku", "providers": ["gemini", "chatgpt"],
+    }}
+    blob = _body(_client().get("/api/audits/r-1"))
+    assert "PAID-QUERY" in blob and "PAID-ACTION" in blob
+
+
 def test_the_revenue_recovery_audience_is_paywalled(wired):
     """C2 added this audience to MERCHANT_ALLOWED_AUDIENCES, and its
     stages[].actions carry full action content through the same return."""
@@ -164,6 +173,20 @@ def test_the_revenue_recovery_audience_is_intact_for_a_paid_owner(wired):
         "stages": [{"stage": "get_selected", "status": "MEASURED",
                     "findings": [],
                     "actions": [{"title": "PAID-ACTION rewrite the PDP"}]}],
+    }
+    blob = _body(_client().get("/api/audits/r-1?audience=revenue_recovery"))
+    assert "PAID-ACTION" in blob
+
+
+def test_the_revenue_recovery_audience_keeps_earned_actions_after_expiry(wired):
+    wired["row"]["requested_at"] = "2026-09-05T00:00:00Z"
+    wired["row"]["partial_result_jsonb"] = {"launch": {
+        "audit_mode": "per_sku", "providers": ["gemini", "chatgpt"],
+    }}
+    wired["projection"] = {
+        "audience": "revenue_recovery",
+        "stages": [{"stage": "get_selected", "status": "MEASURED",
+                    "findings": [], "actions": [{"title": "PAID-ACTION rewrite the PDP"}]}],
     }
     blob = _body(_client().get("/api/audits/r-1?audience=revenue_recovery"))
     assert "PAID-ACTION" in blob
