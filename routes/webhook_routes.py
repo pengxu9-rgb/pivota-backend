@@ -35,6 +35,7 @@ from services.commerce_attribution_service import (
     extract_click_id_from_note_attributes,
     shopify_order_total_to_cents,
 )
+from services.conversion_click_claims import close_merchant_conversion_with_claim
 from services.catalog_sync_service import (
     create_catalog_sync_job,
     mark_catalog_sync_event_processed,
@@ -3227,7 +3228,14 @@ async def _process_shopify_webhook_event(
                     )
                     if click_id:
                         amount_cents, order_currency = shopify_order_total_to_cents(data)
-                        await close_external_order_conversion(
+                        # mig 230: a cart-link Reap purchase's click is ALSO closed by
+                        # Reap, under a different key. The helper claims the click
+                        # first-writer-wins for THOSE clicks only, and calls the same
+                        # close with the same arguments for every other click. It
+                        # defers attribution on claim failure (the order webhook itself still
+                        # succeeds); the read_orders poller holds its watermark and retries.
+                        await close_merchant_conversion_with_claim(
+                            close_external_order_conversion,
                             merchant_id=merchant_id,
                             click_id=click_id,
                             external_order_id=shopify_order_id,

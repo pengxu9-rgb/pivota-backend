@@ -65,6 +65,12 @@ _MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "db/migrations"
 _MIGRATIONS = (
     _MIGRATIONS_DIR / "224_reap_agentic_ledger.sql",
     _MIGRATIONS_DIR / "225_reap_agentic_purchase_hints.sql",
+    # 229 adds item_source + cart_url (the cart-link lane). Without it the whole-table parity
+    # test compares a self-heal that HAS them against a migration build that does not.
+    _MIGRATIONS_DIR / "229_reap_agentic_purchase_item_source.sql",
+    # 230 builds the click-claims table. The self-heal builds it too, so the migration list
+    # applies it for parity with what the self-heal leaves behind.
+    _MIGRATIONS_DIR / "230_conversion_click_claims.sql",
 )
 
 # Same convention as tests/test_reap_agentic_ledger_postgres.py: this gate DROPS its tables, so
@@ -112,9 +118,10 @@ ENROLLMENT_ACTIVE = {
 }
 QUOTE_200 = {
     "id": "f1e2d3c4",
-    # THE ECHO. Reap returns 200 for a SUBSTITUTED variant, so the quote has to say what it
-    # priced and `verify_quote` has to compare it — every other check looks at what it COSTS.
-    "items": [{"variantId": "var_abc123", "quantity": 1}],
+    # NO `items` ECHO. This fixture used to carry one, and it was invented: Reap's quote
+    # response has no `items` field, neither in the published schema nor in a live sandbox
+    # quote (2026-09-18). `verify_quote` now treats `items` as OPTIONAL-BUT-STRICT, and the
+    # tests that exercise a PRESENT echo add one explicitly (see `_quote`).
     # FAR future on purpose: the quoting step now REFUSES to create a checkout from a quote it
     # can already see is dead (P2-9), so a fixture with a past expiry would refuse every happy
     # path. The expired case has its own test.
@@ -126,6 +133,36 @@ QUOTE_200 = {
         "finalAmount": {"amount": 45.00, "currency": "USD"},
     },
 }
+
+
+#: A quote in EXACTLY the shape a live sandbox `POST /agentic/quotes` returned on 2026-09-18
+#: (key names and value types; the amounts are ours): no `items`; `tax` nested one level deeper
+#: with an INT amount; empty `discounts` / `additionalCharges`; FLOAT amounts everywhere else;
+#: four shipping options, each `{id, name, selected, price}`. 42.50 + 2.50 + 0 = 45.00, so it
+#: agrees with CHECKOUT_COMPLETED's `finalAmount`.
+LIVE_QUOTE = {
+    "id": "f1e2d3c4",
+    "expiresAt": "2099-01-01T00:00:00Z",
+    "amountBreakdown": {
+        "itemsSubtotal": {"amount": 42.5, "currency": "USD"},
+        "shipping": {"amount": 2.5, "currency": "USD"},
+        "tax": {"amount": {"amount": 0, "currency": "USD"}},
+        "discounts": [],
+        "additionalCharges": [],
+        "finalAmount": {"amount": 45.0, "currency": "USD"},
+    },
+    "shippingOptions": [
+        {"id": "ship_std", "name": "Standard", "selected": True,
+         "price": {"amount": 2.5, "currency": "USD"}},
+        {"id": "ship_exp", "name": "Express", "selected": False,
+         "price": {"amount": 9.99, "currency": "USD"}},
+        {"id": "ship_ovn", "name": "Overnight", "selected": False,
+         "price": {"amount": 24.0, "currency": "USD"}},
+        {"id": "ship_free", "name": "Free over 50", "selected": False,
+         "price": {"amount": 0.0, "currency": "USD"}},
+    ],
+}
+
 CHECKOUT_CREATED = {
     "id": "chk_7f3a",
     "status": "REQUIRES_ACTION",
@@ -835,14 +872,18 @@ async def test_no_rail_log_record_carries_the_buyers_details(reap, attribution, 
 # survived BOTH arms, and because the money checks have to hold where the money is.
 
 
-def _quote(_quantity=1, _variant="var_abc123", **breakdown_over):
+def _quote(_quantity=None, _variant=None, **breakdown_over):
     """QUOTE_200 with its breakdown overridden, and its ITEMS echo kept in step.
 
     `_quantity` / `_variant` exist because the echo check compares them: a test that raised the
     quantity without moving the echo would be testing `quote_items_mismatch` while believing it
     was testing the subtotal arithmetic."""
     payload = json.loads(json.dumps(QUOTE_200))
-    payload["items"] = [{"variantId": _variant, "quantity": _quantity}]
+    # A PRESENT echo only when a test asks for one: Reap sends none (live sandbox, 2026-09-18).
+    if _quantity is not None or _variant is not None:
+        payload["items"] = [
+            {"variantId": _variant or "var_abc123", "quantity": 1 if _quantity is None else _quantity}
+        ]
     for key, value in breakdown_over.items():
         if value is None:
             payload["amountBreakdown"].pop(key, None)
@@ -1363,3 +1404,25 @@ async def test_polling_an_enrollment_writes_nothing(reap):
     after = await database.fetch_all("SELECT * FROM reap_agentic_enrollments")
     assert len(after) == 1
     assert after[0]["updated_at"] == before[0]["updated_at"]
+
+
+# ── the LIVE quote shape (2026-09-18), on the production engine ──────────────────────────────
+
+
+async def test_the_happy_path_completes_on_the_live_quote_shape_on_postgres(reap, attribution):
+    """No `items`, nested int tax, four priced shipping options, floats — what Reap sends. Before
+    the optional-but-strict fix this refused as `quote_items_mismatch`, every time."""
+    reap.request_quote = _ok(LIVE_QUOTE)
+    purchase_id = await _drive_to_completed()
+    row = await _get(purchase_id)
+    assert row["state"] == "completed" and row["last_error_code"] is None
+    assert (row["quoted_total_minor"], row["shipping_minor"], row["tax_minor"]) == (4500, 250, 0)
+    assert len(attribution.calls) == 1
+
+
+@pytest.mark.parametrize("items", [None, []], ids=["null", "empty"])
+async def test_a_present_but_empty_items_still_refuses_on_postgres(reap, attribution, items):
+    reap.request_quote = _ok(dict(LIVE_QUOTE, items=items))
+    purchase_id = await _drive_to_completed()
+    row = await _get(purchase_id)
+    assert row["state"] == "refused" and row["last_error_code"] == "quote_items_mismatch"

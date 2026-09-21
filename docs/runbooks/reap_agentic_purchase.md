@@ -533,6 +533,14 @@ The gate is read **per request**, so arming the rail is an env change and not a 
 | **the variant key** | matched exactly against `catalog_skus.sku_key`, never re-derived: this repo has three live spellings of a variant sku key and they collide. |
 | **the storefront** | `catalog_products.platform` must be `shopify`. `external_seed` rows are refused `row_not_shopify` even though most of that cohort really is Shopify — that normalisation needs seed-snapshot evidence the catalog tables do not carry, and this is a charge, not a display. |
 
+The Tier B **cart-link** lane is narrower in a different way: a mirrored `external_seed` is
+buyable only when its active market-matched seed is attached to that exact catalog product and
+its storefront snapshot has exactly one stamped variant and a fresh, URL-bound `.js` proof
+that the live Shopify product itself had exactly one variant. Older stamps without that proof
+fail closed until a backfill refresh. An operator-entered numeric
+`attached_variant_id` is not proof; if it conflicts with the stamp, the route refuses. The
+variant lane described in the table above still refuses external seeds entirely.
+
 **Why a missing buyer link is now a sign-up and not a refusal.** Owner decision, 2026-09-18. Until
 WP4b the routes refused `buyer_unlinked`, on the argument that only a buyer-authenticated sign-in
 should bind an agent's opaque user ref to an account. The consequence was that **every** agent-only
@@ -749,6 +757,37 @@ SELECT merchant_domain, market_country, enabled, updated_at
 > who has already given us a card to enter it again.
 
 ---
+
+## Cart-link attribution safety (migration 230)
+
+One cart-link sale can be reported under a Reap order ID and a Shopify order ID. A permanent
+`conversion_click_claims` row gives the click to the first closer; **never delete or release a
+claim to retry**. Releasing one can let the other channel write a second edge. The Reap close
+uses the click's recorded `seller_ref` as its merchant identity when present, after checking that
+the recorded click destination is the stored cart URL's shop. Legacy clicks retain their prior
+domain-based close. Reap provenance is stored under `metadata.partner_provenance`, not accepted
+from Shopify order data.
+
+If the merchant webhook cannot read the cart-link scope or take the claim, it still acknowledges
+the paid order, but **defers attribution**. The read_orders poller holds its watermark when it
+sees that claim failure, and retries the window on its next run. This protects against two GMV
+edges during a transient claim-table failure. Monitor the poller's `claim_unavailable` and
+`watermark_held` signals; if the poller is not running, arrange an operator replay of the paid
+order after the claim store recovers.
+
+A Reap purchase can complete but fail to write its attribution edge (for example, if the process
+dies after the terminal write). The claim remains held, so the merchant channel cannot repair it.
+Set `DATABASE_URL` explicitly to the intended database, then run
+`python -m scripts.reconcile_reap_cart_link_claims --limit 100`. This is read-only and returns a
+`ready` row only for a unique completed cart-link purchase with the same claimed click/order,
+an intact URL/shop/quantity, a seller-keyed click on that shop, a charged amount within one minor
+unit of the quote, and no OTHER
+edge on that click. Investigate every `skipped` row; never delete or reassign a claim. After
+confirming the partner order independently, run the same command with `--apply`. It rechecks the
+claim and existing edges before the idempotent close and reports `repaired` only when the edge
+can be read back. This procedure does not call Reap or change a charge. The merchant-owned claim
+path remains with webhook/poller replay, not this repair command. Do not treat this repair as
+proof of the Reap cart-link quote contract or as authorization for a paid canary.
 
 ## Tests
 

@@ -5,7 +5,7 @@ import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from sqlalchemy import select
@@ -773,6 +773,37 @@ def _seed_seller_from_click(row: Optional[Dict[str, Any]]) -> tuple[Optional[str
     return seller_ref, seed_kind
 
 
+async def reap_cart_link_seller_ref(click_id: str, converting_shop_domain: str) -> Optional[str]:
+    """Resolve a Reap cart sale's seller identity from its recorded click, if present.
+
+    The purchase ledger stores a Shopify *domain*, but seller-keyed attribution expects the
+    seller's tenant identity. Never take that identity from the purchase request. A seller-keyed
+    click is usable only when its recorded redirect destination is the cart URL's store; a
+    mismatched or missing destination cannot authorize a conversion for that seller.
+    Return None for a legacy click so its caller keeps the purchase's original merchant domain.
+    """
+    from services.outbound_links_service import normalize_shop_host  # local: import cycle
+
+    host = normalize_shop_host(converting_shop_domain)
+    if not host:
+        raise ValueError("cart-link converting shop is missing")
+    click = str(click_id or "").strip()
+    if not click:
+        raise ValueError("cart-link click is missing")
+    raw = await database.fetch_one(
+        select(surface_click_events).where(surface_click_events.c.click_id == click)
+    )
+    if raw is None:
+        return None
+    row = dict(raw)
+    seller_ref, _ = _seed_seller_from_click(row)
+    if not seller_ref:
+        return None
+    if normalize_shop_host(row.get("dest_domain")) != host:
+        raise ValueError("seller-keyed click destination does not match cart shop")
+    return seller_ref
+
+
 def _ext_edge_keys(merchant_id: str, external_order_id: str) -> tuple[str, str]:
     """Deterministic (edge_id, synthetic order_id) for an external conversion.
 
@@ -826,6 +857,7 @@ async def close_external_order_conversion(
     note_attrs_or_payload: Optional[Dict[str, Any]] = None,
     converting_shop_domain: Optional[str] = None,
     is_self_report: bool = False,
+    trusted_partner_provenance: Optional[Mapping[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Materialize a `converted` external attribution edge from an orders/paid webhook.
 
@@ -977,6 +1009,19 @@ async def close_external_order_conversion(
             for k in ("id", "name", "order_number", "financial_status")
             if note_attrs_or_payload.get(k) is not None
         }
+    # This is a separate INTERNAL argument: Shopify note attributes are merchant/buyer supplied
+    # and must never be able to assert partner provenance by choosing JSON keys.
+    if trusted_partner_provenance:
+        provenance = {
+            key: str(trusted_partner_provenance[key]).strip()
+            for key in ("purchase_id", "reap_checkout_id")
+            if trusted_partner_provenance.get(key) is not None
+            and str(trusted_partner_provenance[key]).strip()
+        }
+        if trusted_partner_provenance.get("partner_reported") is True:
+            provenance["partner_reported"] = True
+        if provenance:
+            metadata["partner_provenance"] = provenance
     # ADR-009 D3: record the seller subject (or the honest legacy gap).
     if click_seller_ref:
         metadata["seller_ref"] = click_seller_ref

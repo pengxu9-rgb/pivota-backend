@@ -1,4 +1,4 @@
-"""Persistence for the Reap AGENTIC rail (migrations 224 + 225): purchases + enrollments.
+"""Persistence for the Reap AGENTIC rail (migrations 224 + 225 + 229): purchases + enrollments.
 
 Two tables, one job each:
 
@@ -27,6 +27,13 @@ Two smaller gaps closed with them, both named by that same caller: `release_clai
 `last_error_code`, so a step that made no progress says WHY in the row rather than only in a log
 line; and `get_enrollment_internal` / `get_enrollment_by_reap_id` are plain enrollment READS,
 retiring the workaround of calling `upsert_pending_enrollment` — a write — to get a row back.
+
+── WHAT MIGRATION 229 ADDED ─────────────────────────────────────────────────────────────────
+
+`item_source` ('reap_variant' | 'cart_link') and `cart_url`. A cart_link row carries a Shopify
+cart permalink that Reap quotes and checks out as received (the Tier B lane); `create_purchase`
+enforces the pairing and runs `services.reap_cart_link` on the URL before the INSERT, and the
+column CHECKs enforce the pairing for any other writer. Both are create-only.
 
 ── FIVE PROPERTIES OF THIS DRIVER THAT SHAPED EVERY STATEMENT BELOW ─────────────────────────
 
@@ -98,6 +105,12 @@ from db.database import IS_POSTGRES, database
 # the only thing that calls it; services/reap_webhooks imports nothing from db/, so this is not
 # a cycle (unlike db/agent_card_auth_decisions.py's lazy import of services.reap_external_auth).
 from services.reap_webhooks import major_to_minor
+
+# The cart-link validator (mig 229). Pure — stdlib only — so importing it from the data layer
+# costs nothing and cannot cycle. The ledger runs it itself rather than trusting the caller to
+# have run it, because the URL is stored and later sent to a partner that checks it out AS
+# RECEIVED; see `create_purchase`.
+from services.reap_cart_link import cart_link_refusal, validate_cart_link
 
 # `get_purchase_internal`, `get_enrollment_internal` AND `get_enrollment_by_reap_id` are
 # deliberately ABSENT. The first two are the unscoped, unredacted reads and their names say so.
@@ -403,6 +416,10 @@ _HINT_COUNTRY_RE = re.compile(r"^[A-Z]{2}\Z")
 # for partner codes echoed back. 64 characters because that is what the column is.
 _ERROR_CODE_RE = re.compile(r"^[a-z0-9_:.-]{1,64}\Z")
 
+# mig 229: what a purchase row asks the quote to price. The SAME vocabulary as the column's
+# CHECK; tests/test_reap_agentic_cart_link.py parses the migration to hold the two together.
+ITEM_SOURCES: FrozenSet[str] = frozenset({"reap_variant", "cart_link"})
+
 
 def _require_hint_list(value: Any, name: str, *, max_chars: int, domains: bool) -> Optional[list]:
     """Validate one hint list; return the (normalised) list, or None for "no hints".
@@ -496,6 +513,48 @@ def _require_error_code(value: Any) -> Optional[str]:
     return value
 
 
+def _require_item_source(
+    item_source: Any,
+    cart_url: Any,
+    *,
+    click_id: Optional[str],
+    merchant_domain: Optional[str],
+    market_country: Optional[str],
+) -> Optional[str]:
+    """Enforce the item-source PAIRING and return the URL to store (canonical), or None.
+
+    reap_variant — MUST NOT carry a URL. Every caller before mig 229 lands here with the
+                   defaults and gets None back, which is what makes those callers unchanged.
+    cart_link    — MUST carry a URL, and the URL must pass `services.reap_cart_link` against
+                   THIS ROW's click id, merchant domain and market: the one cart line, our click
+                   attribute carrying `click_id`, the market pinned by `country=market_country`,
+                   on the shop's own host. What is stored is the validator's CANONICAL form.
+
+    THE MESSAGE NEVER CONTAINS THE URL. A refused URL may carry the very `checkout[...]` PII it
+    was refused for, and a ValueError message is a thing that gets logged and re-raised; the
+    validator's reason code is a fixed vocabulary word and says enough.
+    """
+    if not isinstance(item_source, str) or item_source not in ITEM_SOURCES:
+        raise ValueError(f"item_source must be one of {sorted(ITEM_SOURCES)}")
+    if item_source == "reap_variant":
+        if cart_url is not None:
+            raise ValueError("a reap_variant purchase must not carry a cart_url")
+        return None
+    if cart_url is None:
+        raise ValueError("a cart_link purchase requires a cart_url")
+    reason = cart_link_refusal(
+        cart_url, click_id=click_id, shop_domain=merchant_domain, market=market_country
+    )
+    if reason is not None:
+        raise ValueError(f"cart_url refused: {reason}")
+    canonical = validate_cart_link(
+        cart_url, click_id=click_id, shop_domain=merchant_domain, market=market_country
+    )
+    if canonical is None:  # pragma: no cover — the refusal above is the same predicate
+        raise ValueError("cart_url refused")
+    return canonical
+
+
 def _decode_dt(value: Any) -> Any:
     """Postgres hands back a datetime; SQLite hands back the text it stored. Out of here it is a
     timezone-AWARE UTC datetime on both, so no caller and no test has to know which engine it is
@@ -587,6 +646,9 @@ def _is_unique_violation(exc: BaseException) -> bool:
 #       A substituted variant id handed out here would read as identity to everyone downstream.
 #   queries_tried — our resolver's search terms.
 #   attempts, next_poll_at, claimed_by, claimed_at — poller bookkeeping.
+#   item_source, cart_url (mig 229) — how the quote is asked for, and the cart permalink itself.
+#       cart_url carries our click id and the merchant's variant id; neither is the owner's
+#       business, and "keep the allowlist minimal" decides item_source the same way.
 #   accept_variant_labels, also_accept_domains, market_country — CATALOG assertions the caller
 #       made. Not PII and not identity, so their absence here is the "keep the allowlist minimal"
 #       argument rather than a confidentiality one: no owner-facing read has a use for its own
@@ -689,6 +751,57 @@ _INSERT_PURCHASE_SQL_SQLITE = """
     RETURNING *
 """
 
+# THE cart_link INSERT IS A SEPARATE STATEMENT, and the reap_variant one above is NOT EDITED.
+# Two reasons. (1) Every caller before mig 229 must behave byte-identically, and the strongest
+# form of that is that its statement is the same text. (2) A database where the mig-229 heal
+# did not land (its try swallowed a failure) still opens reap_variant purchases: only a
+# statement that NAMES the two new columns can fail on their absence, and only the cart_link
+# lane — dark behind its own dial — issues one.
+#
+# `item_source` is BOUND rather than written as the literal 'cart_link' so the PREPARE sweep
+# plans it the way every other column is planned; the ledger has already refused any other value.
+_INSERT_CART_LINK_PURCHASE_SQL = """
+    INSERT INTO reap_agentic_purchases (
+        id, buyer_ref, agent_id, agent_user_ref_hash, enrollment_id, state,
+        merchant_domain, product_key, variant_key, product_name, variant_title,
+        brand, category, quantity, currency, our_price_minor, click_id, return_url,
+        queries_tried, next_poll_at, shipping_address, buyer_email,
+        accept_variant_labels, also_accept_domains, market_country,
+        item_source, cart_url
+    ) VALUES (
+        :id, :buyer_ref, :agent_id, :agent_user_ref_hash, :enrollment_id, :state,
+        :merchant_domain, :product_key, :variant_key, :product_name, :variant_title,
+        :brand, :category, :quantity, :currency, :our_price_minor, :click_id, :return_url,
+        CAST(:queries_tried AS JSONB), COALESCE(:next_poll_at, clock_timestamp()),
+        CAST(:shipping_address AS JSONB),
+        :buyer_email,
+        CAST(:accept_variant_labels AS JSONB), CAST(:also_accept_domains AS JSONB),
+        :market_country,
+        :item_source, :cart_url
+    )
+    RETURNING *
+"""
+
+_INSERT_CART_LINK_PURCHASE_SQL_SQLITE = """
+    INSERT INTO reap_agentic_purchases (
+        id, buyer_ref, agent_id, agent_user_ref_hash, enrollment_id, state,
+        merchant_domain, product_key, variant_key, product_name, variant_title,
+        brand, category, quantity, currency, our_price_minor, click_id, return_url,
+        queries_tried, next_poll_at, shipping_address, buyer_email,
+        accept_variant_labels, also_accept_domains, market_country,
+        item_source, cart_url
+    ) VALUES (
+        :id, :buyer_ref, :agent_id, :agent_user_ref_hash, :enrollment_id, :state,
+        :merchant_domain, :product_key, :variant_key, :product_name, :variant_title,
+        :brand, :category, :quantity, :currency, :our_price_minor, :click_id, :return_url,
+        :queries_tried, COALESCE(:next_poll_at, CURRENT_TIMESTAMP), :shipping_address,
+        :buyer_email,
+        :accept_variant_labels, :also_accept_domains, :market_country,
+        :item_source, :cart_url
+    )
+    RETURNING *
+"""
+
 _SELECT_PURCHASE_SQL = """
     SELECT * FROM reap_agentic_purchases WHERE id = :id
 """
@@ -740,6 +853,8 @@ async def create_purchase(
     accept_variant_labels: Any = None,
     also_accept_domains: Any = None,
     market_country: Optional[str] = None,
+    item_source: str = "reap_variant",
+    cart_url: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Open a purchase, always in 'resolving'. `buyer_ref` is the OPAQUE reference we send Reap
     as owner.id — never the global buyer id, which must not leave this system.
@@ -779,6 +894,15 @@ async def create_purchase(
     EMPTY OWNERSHIP IS ALSO REFUSED. A row whose agent_id or agent_user_ref_hash is None or blank
     is invisible to `get_purchase_for_owner` (NULL = NULL is NULL) — its owner could never read
     it back — and "" is a bucket that two unrelated callers would silently share.
+
+    ── THE ITEM SOURCE (mig 229) ────────────────────────────────────────────────────────────
+
+    `item_source='reap_variant'` with `cart_url=None` is the default and is every caller before
+    mig 229: same checks, same statement, same row. `item_source='cart_link'` REQUIRES a
+    `cart_url`, and the URL is validated HERE against this row's `click_id`, `merchant_domain`
+    and `market_country` (see `_require_item_source`) — before the INSERT, so a refused URL
+    leaves no row, and a `checkout[...]` URL carrying buyer PII can never be stored. Both
+    columns are create-only: neither is in `_TRANSITION_FIELDS`.
     """
     if state != "resolving":
         raise ValueError(
@@ -815,6 +939,13 @@ async def create_purchase(
         domains=True,
     )
     country = _require_country(market_country)
+    stored_cart_url = _require_item_source(
+        item_source,
+        cart_url,
+        click_id=click_id,
+        merchant_domain=merchant_domain,
+        market_country=country,
+    )
 
     values: Dict[str, Any] = {
         "id": purchase_id or new_purchase_id(),
@@ -848,7 +979,14 @@ async def create_purchase(
     # which resolves a `database.*` first argument when it is a module-level name but declines a
     # local bound to a conditional expression. Same shape as
     # db/product_quality_backfill_jobs.requeue_stale_quality_backfill_jobs.
-    if IS_POSTGRES:
+    if item_source == "cart_link":
+        values["item_source"] = item_source
+        values["cart_url"] = stored_cart_url
+        if IS_POSTGRES:
+            row = await database.fetch_one(_INSERT_CART_LINK_PURCHASE_SQL, values)
+        else:
+            row = await database.fetch_one(_INSERT_CART_LINK_PURCHASE_SQL_SQLITE, values)
+    elif IS_POSTGRES:
         row = await database.fetch_one(_INSERT_PURCHASE_SQL, values)
     else:
         row = await database.fetch_one(_INSERT_PURCHASE_SQL_SQLITE, values)
@@ -2298,6 +2436,27 @@ async def get_enrollment_internal(enrollment_id: str) -> Optional[Dict[str, Any]
             {"id": _require_lookup_id(enrollment_id, "enrollment_id")},
         )
     )
+
+
+# THE BUYER IDENTITY A CART-LINK PURCHASE MUST ALREADY HAVE (#2219's table, migrations 226/227).
+# Read by the opaque ref the purchase row carries, through `uq_reap_agentic_buyer_refs_ref`.
+_SELECT_BUYER_REF_CONSENT_SQL = """
+    SELECT reap_buyer_ref, consent_version
+      FROM reap_agentic_buyer_refs
+     WHERE reap_buyer_ref = :reap_buyer_ref
+"""
+
+
+async def get_buyer_ref_consent(reap_buyer_ref: str) -> Optional[Dict[str, Any]]:
+    """`{reap_buyer_ref, consent_version}` for a MINTED buyer identity, or None when this ref was
+    never minted. A READ; the minting and the consent write belong to routes/agent_commerce_reap
+    (`_buyer_id_for`, `_reap_buyer_ref`, `_record_consent`) and nowhere else.
+
+    Raises on a database error (a schema missing migrations 226/227): the caller fails closed.
+    """
+    ref = _require_lookup_id(reap_buyer_ref, "reap_buyer_ref")
+    row = await database.fetch_one(_SELECT_BUYER_REF_CONSENT_SQL, {"reap_buyer_ref": ref})
+    return dict(row) if row is not None else None
 
 
 async def get_enrollment_by_reap_id(reap_enrollment_id: str) -> Optional[Dict[str, Any]]:

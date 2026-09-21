@@ -555,6 +555,10 @@ _EXPECTED_NEVER_PUBLIC = {
     # confidentiality one. Written here deliberately, because
     # test_the_two_expected_column_sets_partition_the_table forces the choice to be made.
     "accept_variant_labels", "also_accept_domains", "market_country",
+    # mig 229. cart_url carries our click id and the merchant's variant id; item_source is how
+    # the quote is asked for. Neither is the owner's business — the brief says so for cart_url,
+    # and the minimal-allowlist rule decides item_source.
+    "item_source", "cart_url",
 }
 
 
@@ -2992,8 +2996,10 @@ async def test_the_self_heal_adds_the_hint_columns_to_a_224_shaped_database():
 
     after = await _purchase_columns()
     assert set(_HINT_COLUMNS) <= after
-    assert after - before == set(_HINT_COLUMNS), (
-        "the heal added something other than the three mig-225 columns"
+    # A 224-shaped database is ALSO pre-229, so the heal lands mig 229's two columns in the same
+    # run. Named explicitly rather than loosened to `<=`: "nothing else" is still the assertion.
+    assert after - before == set(_HINT_COLUMNS) | {"item_source", "cart_url"}, (
+        "the heal added something other than the three mig-225 and two mig-229 columns"
     )
 
     # And the rail works on the healed table.

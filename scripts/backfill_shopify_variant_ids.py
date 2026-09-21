@@ -12,6 +12,7 @@ stamps into `seed_data.snapshot`:
     storefront_platform        = "shopify"          <- proves the is_shopify gate's predicate
     storefront_platform_source = "products_js_v1"   <- provenance, so the claim is auditable
     variants[].shopify_variant_id                   <- the numeric id the permalink needs
+    shopify_cart_proof                               <- same-fetch sole-live-variant attestation
 
 A successful `/products/<handle>.js` parse IS the proof of Shopify-ness: only Shopify serves
 that endpoint in that shape. So the same fetch that recovers variant ids also establishes
@@ -109,6 +110,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+from datetime import datetime, timezone
 import os
 import sys
 import time
@@ -189,9 +191,9 @@ SELECT_CANDIDATES_SQL = f"""
       -- empty string and dropped rows whose destination_url was perfectly good.
       AND COALESCE(NULLIF(canonical_url, ''), destination_url) ~ '/products/'
       AND jsonb_array_length({_SNAPSHOT_VARIANTS_SAFE}) > 0
-      -- Not already covered: at least one variant still lacks a stamped id. Keeps a
-      -- partially-covered row eligible, and retires it once every variant is stamped.
-      AND EXISTS (
+      -- Unstamped variants need recovery; a sole stamped row without cart proof needs
+      -- same-fetch proof; a row with proof is revisited to refresh or revoke it.
+      AND (EXISTS (
             SELECT 1 FROM jsonb_array_elements({_SNAPSHOT_VARIANTS_SAFE}) AS v
             -- NUMERIC, not merely non-empty. A live writer lands unvalidated variant keys
             -- here (recover_seed_data_from_catalog_extract -> seed_data_writer), and junk like
@@ -199,6 +201,9 @@ SELECT_CANDIDATES_SQL = f"""
             -- permanently — unrepairable, and useless to the consumer, which requires numeric.
             WHERE COALESCE(v->>'shopify_variant_id', '') !~ '^[0-9]+$'
           )
+          OR (jsonb_array_length({_SNAPSHOT_VARIANTS_SAFE}) = 1
+              AND NOT (seed_data->'snapshot' ? 'shopify_cart_proof'))
+          OR seed_data->'snapshot' ? 'shopify_cart_proof')
       {{domain_clause}}
       {{cursor_clause}}
     -- ORDER BY id + a CURSOR, because eligibility alone is not progress. A row that can never
@@ -211,7 +216,7 @@ SELECT_CANDIDATES_SQL = f"""
     LIMIT :limit
 """
 
-# jsonb_set on two paths in one statement: the variants array and the platform evidence.
+# jsonb_set on the variant, platform and cart-proof paths in one statement.
 # `updated_at` is deliberately NOT bumped — get_last_extracted_at falls back to it, feeding
 # the 7-day stale_snapshot BLOCKER, and a variants-only .js fetch is not an extraction
 # event. The optimistic guard makes this safe against the refresh job, which rewrites the
@@ -221,10 +226,13 @@ STAMP_UPDATE_SQL = """
     UPDATE external_product_seeds
     SET seed_data = jsonb_set(
             jsonb_set(
-                jsonb_set(seed_data, '{snapshot,variants}', CAST(:variants AS jsonb), true),
-                '{snapshot,storefront_platform}', to_jsonb(CAST(:platform AS text)), true
+                jsonb_set(
+                    jsonb_set(seed_data, '{snapshot,variants}', CAST(:variants AS jsonb), true),
+                    '{snapshot,storefront_platform}', to_jsonb(CAST(:platform AS text)), true
+                ),
+                '{snapshot,storefront_platform_source}', to_jsonb(CAST(:platform_source AS text)), true
             ),
-            '{snapshot,storefront_platform_source}', to_jsonb(CAST(:platform_source AS text)), true
+            '{snapshot,shopify_cart_proof}', CAST(:cart_proof AS jsonb), true
         )
     WHERE id = :id
       -- THE LOAD-BEARING GUARD IS THE SNAPSHOT ONE (mutation-verified: dropping it is the
@@ -416,7 +424,22 @@ async def run(
         live = parse_product_js(payload)
         new_variants, report = stamp_variant_ids(variants, live)
         reasons[report["reason"]] += 1
-        if report["stamped"] <= 0:
+        raw_live = payload.get("variants") if isinstance(payload, dict) else None
+        live_count = len(raw_live) if isinstance(raw_live, list) else 0
+        cart_proof = None
+        if (
+            live_count == 1 and len(live) == 1 and len(new_variants) == 1
+            and new_variants[0].get("shopify_variant_id") == live[0]["shopify_variant_id"]
+        ):
+            cart_proof = {
+                "source": STOREFRONT_PLATFORM_SOURCE,
+                "product_js_url": js_url,
+                "live_variant_count": 1,
+                "variant_id": live[0]["shopify_variant_id"],
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+            }
+        prior_proof = (seed_data.get("snapshot") or {}).get("shopify_cart_proof")
+        if report["stamped"] <= 0 and not cart_proof and not prior_proof:
             continue
 
         stamped_total += report["stamped"]
@@ -429,6 +452,7 @@ async def run(
                     "variants": json.dumps(new_variants, ensure_ascii=False),
                     "platform": STOREFRONT_PLATFORM,
                     "platform_source": STOREFRONT_PLATFORM_SOURCE,
+                    "cart_proof": json.dumps(cart_proof),
                     "updated_at": row.get("updated_at"),
                 },
             )

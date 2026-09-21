@@ -772,6 +772,92 @@ async def ensure_required_schema_light() -> None:
                 )
             except Exception:  # noqa: BLE001
                 pass
+            # mig 229: the purchase's ITEM SOURCE — 'reap_variant' (every row
+            # before this) or 'cart_link' (a Shopify cart permalink Reap quotes
+            # as received), plus the URL a cart_link row carries.
+            #
+            # THIS DDL MUST BUILD THE SAME SCHEMA AS
+            # db/migrations/229_reap_agentic_purchase_item_source.sql, CHECKs
+            # included — they carry the pairing rule (a cart_link row has a URL,
+            # a reap_variant row has none). Enforced through the catalog by
+            # tests/test_reap_agentic_cart_link_postgres.py and by the whole-
+            # table parity test in tests/test_reap_agentic_ledger_postgres.py.
+            #
+            # ITS OWN try/except, for the reason the mig-225 block above gives
+            # at length: a raise in a sibling must not starve these columns, and
+            # a raise here must not starve the heals that follow. The column
+            # constraints ride on `ADD COLUMN IF NOT EXISTS`, so a second run
+            # skips them with their columns rather than adding a duplicate.
+            #
+            # NOT folded into the CREATE TABLE above, same as mig 225: this is
+            # what lands the columns on EVERY path, in migration order.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS reap_agentic_purchases
+                            ADD COLUMN IF NOT EXISTS item_source TEXT NOT NULL DEFAULT 'reap_variant'
+                                CONSTRAINT ck_reap_agentic_purchases_item_source
+                                CHECK (item_source IN ('reap_variant', 'cart_link')),
+                            ADD COLUMN IF NOT EXISTS cart_url TEXT
+                                CONSTRAINT ck_reap_agentic_purchases_cart_url_pairing
+                                CHECK (
+                                    (item_source = 'reap_variant' AND cart_url IS NULL)
+                                    OR (item_source = 'cart_link' AND cart_url IS NOT NULL)
+                                );
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 229, second statement: one cart-link purchase per click. Its OWN try:
+            # on a database that already holds two cart-link rows for one click the
+            # build RAISES, and that must not cost the columns above or the heals below.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        CREATE UNIQUE INDEX IF NOT EXISTS uq_reap_agentic_purchases_cart_link_click
+                            ON reap_agentic_purchases (click_id)
+                            WHERE item_source = 'cart_link';
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 230: the per-click attribution CLAIM for cart-link Reap purchases,
+            # and the index the merchant side needs to ask "is this click one of
+            # those?". THIS DDL MUST BUILD THE SAME SCHEMA AS
+            # db/migrations/230_conversion_click_claims.sql; compared through the
+            # catalog by tests/test_reap_agentic_cart_link_postgres.py
+            # (test_the_self_heal_builds_the_230_catalog_the_migration_builds).
+            #
+            # A CREATE TABLE, so the coverage gate (ADD COLUMN only) cannot see a
+            # missing heal here, the same hole the mig-224 block names. The parity
+            # test is what catches it.
+            #
+            # Best-effort like every sibling, and it fails SAFE: without the table
+            # the merchant side fails open (closes as before 230) and the Reap side
+            # fails closed (skips its edge), so a missing heal can never double an
+            # edge. The scope lookup's index is the item_source migration's partial
+            # unique index, healed with that migration.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        CREATE TABLE IF NOT EXISTS conversion_click_claims (
+                            click_id TEXT PRIMARY KEY,
+                            claimed_by TEXT NOT NULL
+                                CONSTRAINT ck_conversion_click_claims_claimed_by
+                                CHECK (claimed_by IN ('reap_agentic', 'merchant_order')),
+                            external_order_id TEXT,
+                            claimed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                        );
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
             # mig 212: the recovery key — the join the Prove stage rests on.
             # Early and wrapped for the same reason as mig 210 below: this
             # branch is ONE try, and an unguarded CREATE INDEX further down
@@ -3081,6 +3167,81 @@ async def ensure_required_schema_light() -> None:
                         created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                         PRIMARY KEY (agent_id, agent_user_ref_hash, idempotency_key)
                     );
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 229: item_source + cart_url, SQLite twin.
+            #
+            # Same two layers of try as the mig-225 twin above, for the same
+            # reasons: SQLite has no `IF NOT EXISTS` on ADD COLUMN and no
+            # multi-clause ADD, so each column is its own statement and a
+            # "duplicate column name" on one must not abandon the other.
+            #
+            # THE CHECKS ARE COLUMN CONSTRAINTS HERE TOO, byte-for-byte the
+            # Postgres ones, and SQLite enforces a column CHECK that names
+            # another column exactly as a table CHECK. ORDER MATTERS: item_source
+            # first, because cart_url's pairing CHECK names it. Since SQLite
+            # 3.37 an ADD COLUMN's CHECK is tested against the existing rows;
+            # every existing row takes the DEFAULT 'reap_variant' and a NULL
+            # URL, which the pairing admits.
+            try:
+                for _source_column, _source_decl in (
+                    (
+                        "item_source",
+                        "TEXT NOT NULL DEFAULT 'reap_variant' "
+                        "CONSTRAINT ck_reap_agentic_purchases_item_source "
+                        "CHECK (item_source IN ('reap_variant', 'cart_link'))",
+                    ),
+                    (
+                        "cart_url",
+                        "TEXT "
+                        "CONSTRAINT ck_reap_agentic_purchases_cart_url_pairing "
+                        "CHECK ("
+                        "(item_source = 'reap_variant' AND cart_url IS NULL) "
+                        "OR (item_source = 'cart_link' AND cart_url IS NOT NULL))",
+                    ),
+                ):
+                    try:
+                        await database.execute(
+                            text(
+                                f"ALTER TABLE reap_agentic_purchases "
+                                f"ADD COLUMN {_source_column} {_source_decl};"
+                            )
+                        )
+                    except Exception:  # noqa: BLE001
+                        continue
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 229, second statement, SQLite twin: one cart-link purchase per click.
+            # SQLite supports the same partial unique index verbatim. Own try, same reason.
+            try:
+                await database.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS "
+                        "uq_reap_agentic_purchases_cart_link_click "
+                        "ON reap_agentic_purchases (click_id) "
+                        "WHERE item_source = 'cart_link';"
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 230: the per-click attribution claim, SQLite twin. Same CHECK and
+            # key as the Postgres statement; TIMESTAMPTZ -> TIMESTAMP and now() ->
+            # CURRENT_TIMESTAMP per this branch's convention.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        CREATE TABLE IF NOT EXISTS conversion_click_claims (
+                            click_id TEXT PRIMARY KEY,
+                            claimed_by TEXT NOT NULL
+                                CONSTRAINT ck_conversion_click_claims_claimed_by
+                                CHECK (claimed_by IN ('reap_agentic', 'merchant_order')),
+                            external_order_id TEXT,
+                            claimed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                        );
                         """
                     )
                 )

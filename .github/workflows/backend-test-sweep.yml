@@ -151,7 +151,10 @@ concurrency:
 jobs:
   sweep:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # #2213's sweep took 12m30s; #2214's larger suite hit the 15m job timeout
+    # before finishing. Keep the full suite and its floor checks, with room for
+    # the added cart-link cases and runner variance.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

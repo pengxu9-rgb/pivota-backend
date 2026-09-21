@@ -83,6 +83,7 @@ DOMAIN = "brand.example"
 PRODUCT_KEY = "prod::m_brand::shopify::1001"
 SKU_KEY = "sku::prod::m_brand::shopify::1001::v1"
 SECOND_SKU_KEY = "sku::prod::m_brand::shopify::1001::v2"
+MIRROR_SEED_ID = "seed_reap_cart_route_fixture"
 
 EMAIL = "ada@example.test"
 ADDRESS = {
@@ -99,13 +100,17 @@ ADDRESS = {
 #: dict it fed in cannot notice a field being dropped from both.
 PII_STRINGS = ("ada@example.test", "900 Brannan St", "Lovelace", "+15550100")
 
-CATALOG_TABLES = ("catalog_products", "catalog_skus", "catalog_offers", "catalog_merchants")
+CATALOG_TABLES = (
+    "catalog_products", "catalog_skus", "catalog_offers", "catalog_merchants",
+    "surface_click_events",
+)
 RAIL_TABLES = (
     "reap_agentic_purchase_keys",
     "reap_agentic_buyer_refs",
     "reap_agentic_eligibility",
     "reap_agentic_purchases",
     "reap_agentic_enrollments",
+    "tierb_cart_link_eligibility",
 )
 
 
@@ -186,6 +191,7 @@ async def _db():
     from db.accounts import shop_users
     from db.buyer_vault import buyer_identity_links
     from db.catalog import catalog_merchants, catalog_offers, catalog_products, catalog_skus
+    from db.commerce_attribution import surface_click_events
 
     url = (os.getenv("DATABASE_URL") or "").replace("sqlite+aiosqlite://", "sqlite://")
     engine = sqlalchemy.create_engine(url)
@@ -196,6 +202,7 @@ async def _db():
             catalog_skus,
             catalog_offers,
             catalog_merchants,
+            surface_click_events,
             buyer_identity_links,
             # Built so the mint test can PROVE no account row is created for a minted buyer.
             # Without the table that assertion raises "no such table", which is not the same
@@ -206,9 +213,33 @@ async def _db():
     )
     engine.dispose()
 
+    # Other suites use the same file-backed SQLite database and require migration 044's wider
+    # seed table. Only create this route's small fixture if absent, and DROP it after the test;
+    # IF NOT EXISTS without teardown poisoned those suites with a permanently narrow schema.
+    had_seed_table = await database.fetch_one(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'external_product_seeds'"
+    ) is not None
+    if not had_seed_table:
+        await database.execute(
+            "CREATE TABLE external_product_seeds ("
+            "id TEXT PRIMARY KEY, status TEXT, domain TEXT, market TEXT, "
+            "destination_url TEXT, canonical_url TEXT, attached_product_key TEXT, attached_variant_id TEXT, "
+            "seed_data TEXT)"
+        )
+
     for table in CATALOG_TABLES + ("buyer_identity_links", "shop_users"):
         await database.execute(f"DELETE FROM {table}")
-    yield
+    await database.execute(
+        "DELETE FROM external_product_seeds WHERE id = :id", {"id": MIRROR_SEED_ID}
+    )
+    try:
+        yield
+    finally:
+        await database.execute(
+            "DELETE FROM external_product_seeds WHERE id = :id", {"id": MIRROR_SEED_ID}
+        )
+        if not had_seed_table:
+            await database.execute("DROP TABLE external_product_seeds")
 
 
 @pytest.fixture(autouse=True)
@@ -216,6 +247,7 @@ def _env(monkeypatch):
     monkeypatch.setenv("REAP_AGENTIC_ENABLED", "1")
     monkeypatch.setenv("REAP_API_BASE_URL", "https://sandbox.api.reap.global")
     monkeypatch.setenv("REAP_API_KEY", "sk_test_key")
+    monkeypatch.delenv("REAP_AGENTIC_CART_LINK_ENABLED", raising=False)
     monkeypatch.delenv("REAP_RETURN_URL_HOSTS", raising=False)
     monkeypatch.delenv("REAP_AGENTIC_RETURN_URL", raising=False)
     monkeypatch.delenv("BUYER_IDENTITY_LINK_SECRET", raising=False)
@@ -398,6 +430,30 @@ async def _seed_all():
     await _seed_link()
 
 
+async def _seed_tierb_verdict(*, verdict: str = "ELIGIBLE", age_hours: int = 0):
+    await database.execute(
+        """
+        INSERT INTO tierb_cart_link_eligibility
+            (shop_domain, market, verdict, checked_at)
+        VALUES (:domain, 'US', :verdict,
+                datetime(CURRENT_TIMESTAMP, :age))
+        """,
+        {"domain": DOMAIN, "verdict": verdict, "age": f"-{age_hours} hours"},
+    )
+
+
+async def _seed_tierb_shopify_item():
+    await _seed_catalog()
+    await database.execute(
+        "UPDATE catalog_products SET seller_ref = 'm_brand', seed_kind = 'self' "
+        "WHERE product_key = :pk", {"pk": PRODUCT_KEY},
+    )
+    await database.execute(
+        "UPDATE catalog_skus SET source_variant_id = '50041364447509' WHERE sku_key = :sk",
+        {"sk": SKU_KEY},
+    )
+
+
 async def _purchase_row(purchase_id: str) -> Dict[str, Any]:
     row = await ledger.get_purchase_internal(purchase_id)
     assert row is not None
@@ -474,6 +530,141 @@ async def test_an_unconfigured_client_is_as_absent_as_a_dial_that_is_off(client,
         resp = await coro
         assert resp.status_code == 404
         assert _error(resp) == "not_available_on_this_rail"
+
+
+async def test_cart_link_stays_dark_when_its_dial_or_partner_field_is_missing(client, monkeypatch):
+    await _seed_tierb_shopify_item()
+    await _seed_tierb_verdict()
+    body = _body(item_source="cart_link")
+    for dial, field in ((None, "fakeCartUrl"), ("1", None)):
+        if dial is None:
+            monkeypatch.delenv("REAP_AGENTIC_CART_LINK_ENABLED", raising=False)
+        else:
+            monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", dial)
+        monkeypatch.setattr(routes_reap.rc, "CART_LINK_QUOTE_FIELD", field)
+        response = await client.post(f"{BASE}/purchases", json=body)
+        assert response.status_code == 404
+        assert _error(response) == "not_available_on_this_rail"
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+
+
+async def test_cart_link_needs_a_fresh_tierb_verdict_before_minting_a_buyer(client, monkeypatch):
+    await _seed_tierb_shopify_item()
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    monkeypatch.setattr(routes_reap.rc, "CART_LINK_QUOTE_FIELD", "fakeCartUrl")
+    for verdict, age in ((None, 0), ("LOGIN_REQUIRED", 0), ("ELIGIBLE", 49)):
+        if verdict is not None:
+            await database.execute("DELETE FROM tierb_cart_link_eligibility")
+            await _seed_tierb_verdict(verdict=verdict, age_hours=age)
+        response = await client.post(f"{BASE}/purchases", json=_body(item_source="cart_link"))
+        assert response.status_code == 409
+        assert _error(response) == "merchant_not_eligible"
+    assert await database.fetch_val("SELECT COUNT(*) FROM buyer_identity_links") == 0
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+
+
+async def test_cart_link_route_builds_server_priced_item_and_owned_click(client, monkeypatch):
+    await _seed_tierb_shopify_item()
+    await _seed_tierb_verdict()
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    monkeypatch.setattr(routes_reap.rc, "CART_LINK_QUOTE_FIELD", "fakeCartUrl")
+    # These unrecognised client fields are ignored, not used as price, item, or attribution.
+    response = await client.post(f"{BASE}/purchases", json=_body(
+        item_source="cart_link", our_price_minor=1, cart_url="https://evil.example/cart/1:1",
+        seller_ref="attacker",
+    ))
+    assert response.status_code == 202, response.text
+    purchase = await _purchase_row(response.json()["purchase_id"])
+    assert purchase["item_source"] == "cart_link"
+    assert purchase["our_price_minor"] == 4250
+    assert purchase["currency"] == "USD" and purchase["market_country"] == "US"
+    assert purchase["cart_url"] == (
+        "https://brand.example/cart/50041364447509:1?attributes[pivota_click_id]="
+        f"{purchase['click_id']}&country=US"
+    )
+    click = await database.fetch_one(
+        "SELECT merchant_id, dest_domain, context FROM surface_click_events "
+        "WHERE click_id = :click", {"click": purchase["click_id"]},
+    )
+    assert click is not None
+    assert click["merchant_id"] == "m_brand" and click["dest_domain"] == DOMAIN
+    context = click["context"]
+    if isinstance(context, str):
+        context = json.loads(context)
+    assert context["seller_ref"] == "m_brand"
+    assert EMAIL not in json.dumps(context)
+
+
+async def test_cart_link_refuses_a_non_numeric_catalog_variant(client, monkeypatch):
+    await _seed_catalog()  # synthetic source_variant_id='v1' is not a Shopify id
+    await _seed_tierb_verdict()
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    monkeypatch.setattr(routes_reap.rc, "CART_LINK_QUOTE_FIELD", "fakeCartUrl")
+    response = await client.post(f"{BASE}/purchases", json=_body(item_source="cart_link"))
+    assert response.status_code == 409
+    assert _error(response) == "row_variant_unverified"
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+
+
+@pytest.mark.parametrize("stamped_variants,attached_variant,attached_product,expected,canonical_url", [
+    (("50041364447509",), "50041364447509", PRODUCT_KEY, 202, None),
+    (("50041364447509",), None, PRODUCT_KEY, 202, None),
+    ((), "50041364447509", PRODUCT_KEY, 409, None),
+    (("50041364447509",), "99999999999999", PRODUCT_KEY, 409, None),
+    (("50041364447509",), "50041364447509", "prod::other", 409, None),
+    (("50041364447509", "50041364447510"), "50041364447509", PRODUCT_KEY, 409, None),
+    (("50041364447509", "MALFORMED"), "50041364447509", PRODUCT_KEY, 409, None),
+    (("50041364447509",), "50041364447509", PRODUCT_KEY, 409,
+     f"https://{DOMAIN}/products/new"),
+])
+async def test_cart_link_mirrored_seed_requires_product_bound_storefront_variant(
+    client, monkeypatch, stamped_variants, attached_variant, attached_product, expected,
+    canonical_url,
+):
+    await _seed_catalog(platform="external_seed")
+    await database.execute(
+        "UPDATE catalog_products SET seller_ref = 'm_brand', seed_kind = 'self', "
+        "source_system = 'external_product_seeds_mirror_v1', source_ref = :seed_id "
+        "WHERE product_key = :pk", {"pk": PRODUCT_KEY, "seed_id": MIRROR_SEED_ID},
+    )
+    await database.execute(
+        "UPDATE catalog_skus SET source_variant_id = :pk WHERE sku_key = :sk",
+        {"pk": PRODUCT_KEY, "sk": SKU_KEY},
+    )
+    seed_data = (
+        {"snapshot": {"storefront_platform": "shopify", "variants": [
+            variant if variant == "MALFORMED" else {"shopify_variant_id": variant}
+            for variant in stamped_variants
+        ], "shopify_cart_proof": {
+            "source": "products_js_v1",
+            "product_js_url": f"https://{DOMAIN}/products/test.js",
+            "live_variant_count": 1,
+            "variant_id": stamped_variants[0],
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }}} if stamped_variants else {}
+    )
+    await database.execute(
+        "INSERT INTO external_product_seeds "
+        "(id, status, domain, market, destination_url, canonical_url, attached_product_key, "
+        "attached_variant_id, seed_data) "
+        "VALUES (:seed_id, 'active', :domain, 'US', :destination, :canonical, :product_key, :variant, "
+        ":seed_data)",
+        {"seed_id": MIRROR_SEED_ID, "domain": DOMAIN,
+         "destination": f"https://{DOMAIN}/products/test", "canonical": canonical_url,
+         "product_key": attached_product,
+         "variant": attached_variant, "seed_data": json.dumps(seed_data)},
+    )
+    await _seed_tierb_verdict()
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    monkeypatch.setattr(routes_reap.rc, "CART_LINK_QUOTE_FIELD", "fakeCartUrl")
+    response = await client.post(f"{BASE}/purchases", json=_body(item_source="cart_link"))
+    assert response.status_code == expected, response.text
+    if expected == 202:
+        purchase = await _purchase_row(response.json()["purchase_id"])
+        assert "/cart/50041364447509:1?" in purchase["cart_url"]
+    else:
+        assert _error(response) == "row_variant_unverified"
+        assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
 
 
 async def test_a_dark_rail_answers_404_even_for_a_body_that_would_not_validate(client, monkeypatch):

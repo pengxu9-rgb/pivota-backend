@@ -2,8 +2,9 @@
 
 Records which Shopify merchants on our Tier B list currently accept the cart-permalink checkout
 (`https://{shop}/cart/{variant}:1?attributes[pivota_click_id]=...`). One row per
-`(shop_domain, market)` in `tierb_cart_link_eligibility` (migration 228). **Dark**: nothing reads
-the table yet.
+`(shop_domain, market)` in `tierb_cart_link_eligibility` (migration 228). The Reap cart-link
+purchase start reads `is_cart_link_eligible` and refuses missing, non-ELIGIBLE or stale rows.
+The lane remains **dark** while the Reap cart-link dial is off or its quote field is unknown.
 
 | Piece | Where |
 |---|---|

@@ -89,6 +89,9 @@ _MIGRATIONS = (
     # test below compares what the MIGRATIONS built against what the SELF-HEAL built, and the
     # self-heal carries 227 — without it here, parity would fail for a change that is correct.
     _MIGRATIONS_DIR / "227_reap_agentic_buyer_consent.sql",
+    _MIGRATIONS_DIR / "228_tierb_cart_link_eligibility.sql",
+    _MIGRATIONS_DIR / "229_reap_agentic_purchase_item_source.sql",
+    _MIGRATIONS_DIR / "230_conversion_click_claims.sql",
 )
 
 #: Same convention as the ledger's gate: this file DROPS its tables, so it must be INCAPABLE of
@@ -102,7 +105,10 @@ _TABLES = (
     "reap_agentic_buyer_refs",
     "reap_agentic_purchase_keys",
 )
-_RAIL_TABLES = _TABLES + ("reap_agentic_purchases", "reap_agentic_enrollments")
+_RAIL_TABLES = _TABLES + (
+    "reap_agentic_purchases", "reap_agentic_enrollments",
+    "tierb_cart_link_eligibility", "conversion_click_claims",
+)
 
 BASE = "/agent/v2/commerce/reap"
 
@@ -210,6 +216,7 @@ async def _build_catalog_tables():
     import sqlalchemy
     from db.buyer_vault import buyer_identity_links
     from db.catalog import catalog_merchants, catalog_offers, catalog_products, catalog_skus
+    from db.commerce_attribution import surface_click_events
 
     url = DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
     engine = sqlalchemy.create_engine(url)
@@ -221,6 +228,7 @@ async def _build_catalog_tables():
             catalog_offers,
             catalog_merchants,
             buyer_identity_links,
+            surface_click_events,
         ],
         checkfirst=True,
     )
@@ -231,6 +239,7 @@ async def _build_catalog_tables():
         "catalog_products",
         "catalog_merchants",
         "buyer_identity_links",
+        "surface_click_events",
     ):
         await database.execute(f"DELETE FROM {table}")
 
@@ -1364,6 +1373,108 @@ async def test_a_matching_market_currency_is_accepted(client):
     await _seed_all()
     resp = await client.post(f"{BASE}/purchases", json=_body())
     assert resp.status_code == 202
+
+
+async def test_tierb_cart_route_mints_owned_click_and_numeric_variant_on_postgres(
+    client, monkeypatch
+):
+    """Exercise the new route against Postgres JSONB, NUMERIC, and the real 228–230 schema."""
+    await _seed_catalog()
+    await database.execute(
+        "UPDATE catalog_products SET seller_ref = 'm_pg' WHERE product_key = :pk",
+        {"pk": PRODUCT_KEY},
+    )
+    await database.execute(
+        "UPDATE catalog_skus SET source_variant_id = '50041364447509' WHERE sku_key = :sk",
+        {"sk": SKU_KEY},
+    )
+    await database.execute(
+        "INSERT INTO tierb_cart_link_eligibility "
+        "(shop_domain, market, verdict, checked_at, consecutive_same) "
+        "VALUES (:domain, 'US', 'ELIGIBLE', now(), 1)",
+        {"domain": DOMAIN},
+    )
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    monkeypatch.setattr(routes_reap.rc, "CART_LINK_QUOTE_FIELD", "hypotheticalCartUrl")
+    resp = await client.post(f"{BASE}/purchases", json=_body(item_source="cart_link"))
+    assert resp.status_code == 202, resp.text
+    purchase = await database.fetch_one(
+        "SELECT item_source, click_id, cart_url, our_price_minor FROM reap_agentic_purchases "
+        "WHERE id = :id", {"id": resp.json()["purchase_id"]},
+    )
+    assert purchase["item_source"] == "cart_link"
+    assert purchase["our_price_minor"] == 4250
+    assert "/cart/50041364447509:1?" in purchase["cart_url"]
+    click = await database.fetch_one(
+        "SELECT merchant_id, context FROM surface_click_events WHERE click_id = :click_id",
+        {"click_id": purchase["click_id"]},
+    )
+    assert click["merchant_id"] == "m_pg"
+    context = click["context"]
+    if isinstance(context, str):
+        context = json.loads(context)
+    assert context["seller_ref"] == "m_pg"
+
+
+async def test_tierb_mirrored_seed_requires_storefront_evidence_on_postgres(client, monkeypatch):
+    """Raw asyncpg JSONB reads must decode before the sole-stamped-variant decision."""
+    from db.sql_migrations import split_statements
+
+    seed_id = "seed_reap_cart_route_pg"
+    # This file is restricted to a throwaway DB. Build the real 044 schema from scratch, since
+    # another test module may have left a narrow fixture table with the same name.
+    await database.execute("DROP TABLE IF EXISTS external_product_seeds")
+    migration = _MIGRATIONS_DIR / "044_external_product_seeds.sql"
+    for statement in split_statements(migration.read_text(encoding="utf-8")):
+        await database.execute(statement)
+    try:
+        await _seed_catalog(platform="external_seed")
+        await database.execute(
+            "UPDATE catalog_products SET seller_ref = 'm_pg', seed_kind = 'self', "
+            "source_system = 'external_product_seeds_mirror_v1', source_ref = :seed_id "
+            "WHERE product_key = :pk", {"seed_id": seed_id, "pk": PRODUCT_KEY},
+        )
+        await database.execute(
+            "UPDATE catalog_skus SET source_variant_id = :pk WHERE sku_key = :sk",
+            {"pk": PRODUCT_KEY, "sk": SKU_KEY},
+        )
+        stamped = json.dumps({"snapshot": {"storefront_platform": "shopify", "variants": [
+            {"shopify_variant_id": "50041364447509"}
+        ], "shopify_cart_proof": {
+            "source": "products_js_v1",
+            "product_js_url": f"https://{DOMAIN}/products/test.js",
+            "live_variant_count": 1,
+            "variant_id": "50041364447509",
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }}})
+        await database.execute(
+            "INSERT INTO external_product_seeds "
+            "(id, market, destination_url, domain, attached_product_key, "
+            "attached_variant_id, seed_data) "
+            "VALUES (:seed_id, 'US', :url, :domain, :pk, '50041364447509', "
+            "CAST(:seed_data AS JSONB))",
+            {"seed_id": seed_id, "url": f"https://{DOMAIN}/products/test",
+             "domain": DOMAIN, "pk": PRODUCT_KEY, "seed_data": stamped},
+        )
+        await database.execute(
+            "INSERT INTO tierb_cart_link_eligibility "
+            "(shop_domain, market, verdict, checked_at, consecutive_same) "
+            "VALUES (:domain, 'US', 'ELIGIBLE', now(), 1)", {"domain": DOMAIN},
+        )
+        monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+        monkeypatch.setattr(routes_reap.rc, "CART_LINK_QUOTE_FIELD", "hypotheticalCartUrl")
+        response = await client.post(f"{BASE}/purchases", json=_body(item_source="cart_link"))
+        assert response.status_code == 202, response.text
+        purchase = await database.fetch_one(
+            "SELECT cart_url FROM reap_agentic_purchases WHERE id = :id",
+            {"id": response.json()["purchase_id"]},
+        )
+        assert "/cart/50041364447509:1?" in purchase["cart_url"]
+    finally:
+        await database.execute(
+            "DELETE FROM external_product_seeds WHERE id = :seed_id", {"seed_id": seed_id}
+        )
+        await database.execute("DROP TABLE external_product_seeds")
 
 
 @pytest.mark.parametrize(
