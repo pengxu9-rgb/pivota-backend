@@ -283,10 +283,10 @@ PIVOT_MULTI_SERVE_SOURCE_ALLOWLIST = _bootstrap_env_csv_set(
     "AGENT_SHOP_PIVOT_MULTI_SERVE_SOURCE_ALLOWLIST",
     {"shopping_agent"},
 )
-PIVOT_MULTI_SERVE_INCLUDE_EXTERNAL = _bootstrap_env_bool(
-    "AGENT_SHOP_PIVOT_MULTI_SERVE_INCLUDE_EXTERNAL",
-    True,
-)
+# External offers are part of the normal shopping recall universe. Keep the
+# symbol for compatibility with tests and call sites, but retire the env kill
+# switch so a stale deployment setting cannot hide future external merchants.
+PIVOT_MULTI_SERVE_INCLUDE_EXTERNAL = True
 PIVOT_MULTI_SERVE_INCLUDE_INCENTIVES = _bootstrap_env_bool(
     "AGENT_SHOP_PIVOT_MULTI_SERVE_INCLUDE_INCENTIVES",
     True,
