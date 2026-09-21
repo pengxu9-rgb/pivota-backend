@@ -1076,13 +1076,15 @@ async def search_products(
     # Contract: allow callers to request above 200, but clamp internally.
     limit = max(1, min(int(limit or 20), AGENT_SDK_FIXED_SEARCH_LIMIT_MAX))
     offset = max(0, int(offset or 0))
-    effective_in_stock_only = (
+    stock_filter_explicit = in_stock_only is not None or in_stock is not None
+    requested_in_stock_only = (
         in_stock_only
         if in_stock_only is not None
         else in_stock
         if in_stock is not None
-        else True
+        else False
     )
+    effective_in_stock_only = bool(requested_in_stock_only and stock_filter_explicit)
 
     # Partners still using this legacy URL receive the gateway's single recall
     # implementation. The caller's obsolete allow_external_seed=false switch
@@ -1159,6 +1161,7 @@ async def search_products(
                 min_price=min_price,
                 max_price=max_price,
                 in_stock_only=bool(effective_in_stock_only),
+                in_stock_filter_explicit=stock_filter_explicit,
                 limit=limit,
                 offset=offset,
                 allow_external_seed=allow_external_seed,

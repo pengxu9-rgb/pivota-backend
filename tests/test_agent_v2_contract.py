@@ -164,6 +164,8 @@ async def test_agent_v2_products_search_response_shape(
     assert body["status"] == "success"
     assert body["pagination"]["total"] == 1
     assert observed["market"] == "SG"
+    assert observed["in_stock_only"] is False
+    assert observed["in_stock_filter_explicit"] is False
 
     first = body["products"][0]
     assert first["product_id"] == "prod_1"
@@ -176,6 +178,46 @@ async def test_agent_v2_products_search_response_shape(
         "order_create",
     ]
     assert first["provenance"]["merchant_id"] == "m_contract"
+
+
+@pytest.mark.asyncio
+async def test_agent_v2_products_search_preserves_explicit_stock_filter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_v2 as agent_v2
+    from routes.agent_auth import get_agent_context
+
+    observed: Dict[str, Any] = {}
+
+    async def fake_v1_search(**kwargs: Any) -> Dict[str, Any]:
+        observed.update(kwargs)
+        return {
+            "status": "success",
+            "products": [],
+            "pagination": {"total": 0, "limit": 10, "offset": 0, "has_more": False},
+            "metadata": {"reason_code": "no_candidates"},
+        }
+
+    app.dependency_overrides[get_agent_context] = _override_get_agent_context
+    monkeypatch.setattr(agent_v2, "agent_v1_search_products", fake_v1_search)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/agent/v2/products/search",
+                json={
+                    "query": "serum",
+                    "merchant_id": "m_contract",
+                    "limit": 10,
+                    "in_stock_only": True,
+                },
+            )
+    finally:
+        app.dependency_overrides.pop(get_agent_context, None)
+
+    assert resp.status_code == 200
+    assert observed["in_stock_only"] is True
+    assert observed["in_stock_filter_explicit"] is True
 
 
 @pytest.mark.asyncio

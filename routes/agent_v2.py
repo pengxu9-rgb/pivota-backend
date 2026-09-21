@@ -72,7 +72,7 @@ class SearchProductsRequest(BaseModel):
     catalog_surface: Optional[str] = None
     min_price: Optional[float] = None
     max_price: Optional[float] = None
-    in_stock_only: bool = True
+    in_stock_only: bool = False
     limit: int = Field(default=20, ge=1, le=200)
     offset: int = Field(default=0, ge=0)
     allow_external_seed: bool = True
@@ -703,6 +703,7 @@ async def search_products_v2(
         min_price=body.min_price,
         max_price=body.max_price,
         in_stock_only=body.in_stock_only,
+        in_stock_filter_explicit="in_stock_only" in body.model_fields_set,
         limit=body.limit,
         offset=body.offset,
         allow_external_seed=body.allow_external_seed,

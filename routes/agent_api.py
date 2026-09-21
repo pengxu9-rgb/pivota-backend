@@ -70,6 +70,7 @@ from services.external_referral_readiness import (
     external_referral_live_verification_reasons,
     should_block_external_referral_runtime,
 )
+from services.offer_buyability import expected_currency_for_market
 from services.agent_ranking_service import (
     AgentRankingFeatures,
     get_agent_ranking_config,
@@ -3346,6 +3347,7 @@ async def _search_products_fast_mode(
     allow_external_seed: bool,
     allow_stale_cache: bool,
     query_semantic_class: str = "default",
+    expected_currency: Optional[str] = None,
 ) -> Dict[str, Any]:
     normalized_seed_strategy = _normalize_external_seed_strategy(
         normalized_seed_strategy, fallback="legacy"
@@ -3475,13 +3477,13 @@ async def _search_products_fast_mode(
             continue
         seen_keys.add(key)
 
-        if in_stock_only and not _availability_to_in_stock(product.get("in_stock")):
-            continue
-
-        price = _safe_price_number(product.get("price"), 0.0)
-        if min_price is not None and price < float(min_price):
-            continue
-        if max_price is not None and price > float(max_price):
+        if not _passes_explicit_commerce_filters(
+            product,
+            in_stock_only=in_stock_only,
+            min_price=min_price,
+            max_price=max_price,
+            expected_currency=expected_currency,
+        ):
             continue
         if not _passes_category_filter_fast(product, normalized_category):
             continue
@@ -3562,6 +3564,79 @@ def _availability_to_in_stock(availability: Any) -> bool:
     if not raw:
         return True
     return raw not in {"out_of_stock", "outofstock", "sold_out", "soldout", "unavailable"}
+
+
+def _known_product_stock_state(product: Dict[str, Any]) -> Optional[bool]:
+    """Return a stock decision only when the row carries an explicit signal."""
+    verification = product.get("commerce_verification")
+    if isinstance(verification, dict) and verification.get("required") is True:
+        return None
+    # The normalized availability string comes from the live offer chain and
+    # takes precedence over the scrape-time boolean when they disagree.
+    for value in (product.get("availability"), product.get("in_stock")):
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            continue
+        raw = str(value).strip().lower()
+        if raw in {"true", "1", "yes", "in_stock", "in stock", "instock", "available"}:
+            return True
+        if raw in {
+            "false", "0", "no", "out_of_stock", "out of stock", "outofstock",
+            "sold_out", "sold out", "soldout", "unavailable", "discontinued",
+        }:
+            return False
+    return None
+
+
+def _known_product_price(
+    product: Dict[str, Any], *, expected_currency: Optional[str] = None
+) -> Optional[float]:
+    """Return a finite, currency-qualified price or preserve it as unknown."""
+    verification = product.get("commerce_verification")
+    if isinstance(verification, dict) and verification.get("required") is True:
+        return None
+    raw = product.get("price")
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return None
+    sentinel = float("nan")
+    price = _safe_price_number(raw, sentinel)
+    if price != price or price in {float("inf"), float("-inf")}:
+        return None
+    currency = str(
+        product.get("currency")
+        or product.get("currency_code")
+        or product.get("price_currency")
+        or ""
+    ).strip().upper()
+    if not re.fullmatch(r"[A-Z]{3}", currency):
+        return None
+    if expected_currency and currency != str(expected_currency).strip().upper():
+        return None
+    return price
+
+
+def _passes_explicit_commerce_filters(
+    product: Dict[str, Any],
+    *,
+    in_stock_only: bool,
+    min_price: Optional[float],
+    max_price: Optional[float],
+    expected_currency: Optional[str] = None,
+) -> bool:
+    """Keep unknown commerce facts discoverable, but never claim a strict match."""
+    if in_stock_only and _known_product_stock_state(product) is not True:
+        return False
+    if min_price is None and max_price is None:
+        return True
+    price = _known_product_price(product, expected_currency=expected_currency)
+    if price is None:
+        return False
+    if min_price is not None and price < float(min_price):
+        return False
+    if max_price is not None and price > float(max_price):
+        return False
+    return True
 
 
 def _request_base_url(req: Request) -> str:
@@ -4931,6 +5006,7 @@ async def agent_search_products(
     min_price: Optional[float] = None,
     max_price: Optional[float] = None,
     in_stock_only: bool = True,
+    in_stock_filter_explicit: Optional[bool] = None,
     limit: int = Query(default=20, ge=1),
     offset: int = Query(default=0, ge=0),
     allow_external_seed: bool = Query(default=True),
@@ -4958,6 +5034,16 @@ async def agent_search_products(
     - 分页支持
     - 相关度评分
     """
+    # Preserve whether the caller actually requested a hard stock filter.
+    # FastAPI's historical default is True, but omission is discovery intent
+    # and must not erase rows whose inventory still needs a live quote.
+    if in_stock_filter_explicit is None:
+        in_stock_filter_explicit = (
+            "in_stock_only" in req.query_params
+            or "inStockOnly" in req.query_params
+        )
+    in_stock_only = bool(in_stock_only and in_stock_filter_explicit)
+    expected_price_currency = expected_currency_for_market(market)
     started = time.perf_counter()
     auth_lookup_ms = max(0, int(getattr(getattr(req, "state", None), "agent_auth_lookup_ms", 0) or 0))
     auth_total_ms = max(0, int(getattr(getattr(req, "state", None), "agent_auth_total_ms", 0) or 0))
@@ -5437,6 +5523,7 @@ async def agent_search_products(
                 allow_external_seed=allow_external_seed,
                 allow_stale_cache=allow_stale_cache,
                 query_semantic_class=query_semantic_class,
+                expected_currency=expected_price_currency,
             )
             paginated_products = list(fast_result["products"])
             fast_ranked_candidates = list(fast_result.get("ranked_candidates") or [])
@@ -5507,12 +5594,13 @@ async def agent_search_products(
                         key = f"{str(product.get('merchant_id') or '').strip()}::{str(product.get('product_id') or product.get('id') or '').strip()}"
                         if not key or key in seen_keys:
                             continue
-                        if in_stock_only and not _availability_to_in_stock(product.get("in_stock")):
-                            continue
-                        price = _safe_price_number(product.get("price"), 0.0)
-                        if min_price is not None and price < float(min_price):
-                            continue
-                        if max_price is not None and price > float(max_price):
+                        if not _passes_explicit_commerce_filters(
+                            product,
+                            in_stock_only=in_stock_only,
+                            min_price=min_price,
+                            max_price=max_price,
+                            expected_currency=expected_price_currency,
+                        ):
                             continue
                         if not _passes_category_filter_fast(product, normalized_category):
                             continue
@@ -6017,17 +6105,18 @@ async def agent_search_products(
                     )
                     if projection.get("agent_push_status") == AGENT_PUSH_STATUS_EXCLUDED:
                         continue
-                if in_stock_only and not product.get("in_stock", True):
-                    continue
                 if not _matches_catalog_surface(product, normalized_catalog_surface):
                     continue
                 if not _passes_retrieval_profile_filter(product, query_semantic_class):
                     continue
 
-                price = _safe_price_number(product.get("price", 0), 0.0)
-                if min_price and price < min_price:
-                    continue
-                if max_price and price > max_price:
+                if not _passes_explicit_commerce_filters(
+                    product,
+                    in_stock_only=in_stock_only,
+                    min_price=min_price,
+                    max_price=max_price,
+                    expected_currency=expected_price_currency,
+                ):
                     continue
 
                 product.setdefault("relevance_score", 1.0)
@@ -6226,17 +6315,18 @@ async def agent_search_products(
                 )
                 if projection.get("agent_push_status") == AGENT_PUSH_STATUS_EXCLUDED:
                     continue
-            if in_stock_only and not product.get("in_stock", True):
-                continue
             if not _matches_catalog_surface(product, normalized_catalog_surface):
                 continue
             if not _passes_retrieval_profile_filter(product, query_semantic_class):
                 continue
 
-            price = _safe_price_number(product.get("price", 0), 0.0)
-            if min_price and price < min_price:
-                continue
-            if max_price and price > max_price:
+            if not _passes_explicit_commerce_filters(
+                product,
+                in_stock_only=in_stock_only,
+                min_price=min_price,
+                max_price=max_price,
+                expected_currency=expected_price_currency,
+            ):
                 continue
 
             if normalized_category:
@@ -6809,6 +6899,11 @@ async def agent_search_products_beauty(
     same search (ADR-021: one external door) -- see services/agent_search_gateway_proxy.py.
     Off (the default), nothing below the local call changes.
     """
+    in_stock_filter_explicit = (
+        "in_stock_only" in req.query_params
+        or "inStockOnly" in req.query_params
+    )
+    in_stock_only = bool(in_stock_only and in_stock_filter_explicit)
     proxy_on, _proxy_reason = agent_search_gateway_proxy.enabled_for(
         getattr(context, "agent_id", None), req.headers,
     )
@@ -6904,6 +6999,7 @@ async def agent_search_products_beauty(
         min_price=min_price,
         max_price=max_price,
         in_stock_only=in_stock_only,
+        in_stock_filter_explicit=in_stock_filter_explicit,
         limit=limit,
         offset=offset,
         allow_external_seed=allow_external_seed,
@@ -7396,6 +7492,7 @@ async def agent_resolve_products(
                         min_price=None,
                         max_price=None,
                         in_stock_only=True,
+                        in_stock_filter_explicit=True,
                         limit=max(20, min(80, limit * 3)),
                         offset=0,
                         context=context,
