@@ -118,7 +118,10 @@ async def test_agent_v2_products_search_response_shape(
     import routes.agent_v2 as agent_v2
     from routes.agent_auth import get_agent_context
 
+    observed: Dict[str, Any] = {}
+
     async def fake_v1_search(**kwargs: Any) -> Dict[str, Any]:
+        observed.update(kwargs)
         return {
             "status": "success",
             "products": [
@@ -151,7 +154,7 @@ async def test_agent_v2_products_search_response_shape(
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             resp = await client.post(
                 "/agent/v2/products/search",
-                json={"query": "serum", "merchant_id": "m_contract", "limit": 10},
+                json={"query": "serum", "market": "SG", "merchant_id": "m_contract", "limit": 10},
             )
     finally:
         app.dependency_overrides.pop(get_agent_context, None)
@@ -160,6 +163,7 @@ async def test_agent_v2_products_search_response_shape(
     body = resp.json()
     assert body["status"] == "success"
     assert body["pagination"]["total"] == 1
+    assert observed["market"] == "SG"
 
     first = body["products"][0]
     assert first["product_id"] == "prod_1"
