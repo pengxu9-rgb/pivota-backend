@@ -100,7 +100,8 @@ class StoreJourneyStep(BaseModel):
     reason: Optional[Literal[
         "storefront_loaded", "search_result_found", "search_unavailable",
         "search_no_result", "pdp_confirmed", "pdp_unconfirmed",
-        "cart_item_added", "cart_control_unavailable", "required_selection_unresolved",
+        "cart_item_added", "cart_control_unavailable", "cart_item_not_observed",
+        "required_selection_unresolved",
         "checkout_reached",
         "checkout_route_missing", "address_fields_filled",
         "address_form_unavailable", "challenge", "login_required",
