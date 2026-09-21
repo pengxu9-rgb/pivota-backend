@@ -264,6 +264,106 @@ async def test_agent_api_build_external_seed_product_degrades_untrusted_commerce
         assert unsafe_field not in product
 
 
+def test_live_quote_required_product_does_not_satisfy_strict_commerce_filters() -> None:
+    import routes.agent_api as agent_api_module
+
+    discovery_only = {
+        "product_id": "external_unpriced_review",
+        "availability": "unknown",
+        "buyable": False,
+        "checkout_ready": False,
+        "commerce_verification": {
+            "required": True,
+            "status": "live_quote_required",
+        },
+    }
+
+    assert agent_api_module._passes_explicit_commerce_filters(
+        discovery_only,
+        in_stock_only=False,
+        min_price=None,
+        max_price=None,
+    )
+    assert not agent_api_module._passes_explicit_commerce_filters(
+        discovery_only,
+        in_stock_only=True,
+        min_price=None,
+        max_price=None,
+    )
+    assert not agent_api_module._passes_explicit_commerce_filters(
+        discovery_only,
+        in_stock_only=False,
+        min_price=None,
+        max_price=1,
+    )
+    assert not agent_api_module._passes_explicit_commerce_filters(
+        discovery_only,
+        in_stock_only=False,
+        min_price=0,
+        max_price=None,
+    )
+
+    verified = {"price": 30, "currency": "SGD", "in_stock": True}
+    assert agent_api_module._passes_explicit_commerce_filters(
+        verified,
+        in_stock_only=True,
+        min_price=29,
+        max_price=31,
+        expected_currency="SGD",
+    )
+    assert not agent_api_module._passes_explicit_commerce_filters(
+        verified,
+        in_stock_only=False,
+        min_price=None,
+        max_price=29,
+        expected_currency="SGD",
+    )
+
+    assert not agent_api_module._passes_explicit_commerce_filters(
+        {"price": 30, "in_stock": True},
+        in_stock_only=False,
+        min_price=29,
+        max_price=31,
+        expected_currency="SGD",
+    )
+    assert not agent_api_module._passes_explicit_commerce_filters(
+        {"price": 30, "currency": "USD", "in_stock": True},
+        in_stock_only=False,
+        min_price=29,
+        max_price=31,
+        expected_currency="SGD",
+    )
+    assert not agent_api_module._passes_explicit_commerce_filters(
+        {
+            "price": 30,
+            "currency": "SGD",
+            "availability": "in_stock",
+            "commerce_verification": {"required": True},
+        },
+        in_stock_only=False,
+        min_price=29,
+        max_price=31,
+        expected_currency="SGD",
+    )
+
+
+def test_strict_stock_filter_prefers_live_availability_over_stale_boolean() -> None:
+    import routes.agent_api as agent_api_module
+
+    assert not agent_api_module._passes_explicit_commerce_filters(
+        {"availability": "out_of_stock", "in_stock": True},
+        in_stock_only=True,
+        min_price=None,
+        max_price=None,
+    )
+    assert agent_api_module._passes_explicit_commerce_filters(
+        {"availability": "in_stock", "in_stock": False},
+        in_stock_only=True,
+        min_price=None,
+        max_price=None,
+    )
+
+
 @pytest.mark.asyncio
 async def test_agent_api_build_external_seed_product_uses_canonical_url_when_destination_missing(
     monkeypatch: pytest.MonkeyPatch,

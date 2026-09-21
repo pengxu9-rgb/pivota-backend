@@ -273,6 +273,7 @@ async def test_general_queryless_browse_is_served_by_the_gateway(monkeypatch: py
     })
     assert resp.status_code == 200
     assert resp.json()["metadata"]["served_by"] == "gateway"
+    assert resp.json()["filters_applied"]["in_stock_only"] is False
     assert local_calls == []
     assert len(seen) == 1
     sent = dict(seen[0].url.params)
@@ -281,6 +282,23 @@ async def test_general_queryless_browse_is_served_by_the_gateway(monkeypatch: py
     assert sent["allow_external_seed"] == "true"
     assert sent["external_seed_strategy"] == "unified_relevance"
     assert "catalog_surface" not in sent
+
+
+@pytest.mark.asyncio
+async def test_public_query_cannot_override_internal_stock_filter_provenance(
+    monkeypatch: pytest.MonkeyPatch, endpoint
+) -> None:
+    local_calls, _ = endpoint
+    monkeypatch.delenv(proxy.FLAG, raising=False)
+    resp = await _get_general({
+        "query": "lip gloss",
+        "in_stock_only": "true",
+        "in_stock_filter_explicit": "false",
+    })
+    assert resp.status_code == 200
+    assert len(local_calls) == 1
+    assert local_calls[0]["in_stock_only"] is True
+    assert local_calls[0]["in_stock_filter_explicit"] is True
 
 
 @pytest.mark.asyncio
@@ -306,6 +324,18 @@ async def test_flag_off_the_endpoint_is_exactly_what_it_was(monkeypatch: pytest.
     assert seen == [], "the gateway is never called with the flag off"
     assert len(local_calls) == 1
     assert "served_by" not in resp.json()["metadata"], "and the answer carries no proxy marker"
+
+
+@pytest.mark.asyncio
+async def test_omitted_stock_filter_is_discovery_not_a_strict_unknown_stock_gate(
+    monkeypatch: pytest.MonkeyPatch, endpoint
+) -> None:
+    local_calls, _ = endpoint
+    monkeypatch.delenv(proxy.FLAG, raising=False)
+    resp = await _get({"query": "lip gloss", "market": "SG", "limit": "20"})
+    assert resp.status_code == 200
+    assert len(local_calls) == 1
+    assert local_calls[0]["in_stock_only"] is False
 
 
 @pytest.mark.asyncio
