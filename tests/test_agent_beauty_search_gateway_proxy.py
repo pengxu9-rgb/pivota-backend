@@ -239,6 +239,32 @@ async def test_general_search_ignores_legacy_false_source_switch(monkeypatch: py
 
 
 @pytest.mark.asyncio
+async def test_general_queryless_browse_is_served_by_the_gateway(monkeypatch: pytest.MonkeyPatch, endpoint) -> None:
+    import routes.agent_sdk_fixed as sdk
+
+    local_calls, _ = endpoint
+    monkeypatch.setenv(proxy.FLAG, "on")
+    monkeypatch.setenv(proxy.AGENT_IDS_FLAG, "agent_meitu")
+    monkeypatch.setattr(sdk, "log_agent_request", AsyncMock(return_value=None))
+    seen = _mock_client(monkeypatch, lambda r: httpx.Response(200, json=GATEWAY_BODY))
+
+    resp = await _get_general({
+        "market": "SG", "search_all_merchants": "true",
+        "allow_external_seed": "false", "limit": "20",
+    })
+    assert resp.status_code == 200
+    assert resp.json()["metadata"]["served_by"] == "gateway"
+    assert local_calls == []
+    assert len(seen) == 1
+    sent = dict(seen[0].url.params)
+    assert "query" not in sent
+    assert sent["market"] == "SG"
+    assert sent["allow_external_seed"] == "true"
+    assert sent["external_seed_strategy"] == "unified_relevance"
+    assert "catalog_surface" not in sent
+
+
+@pytest.mark.asyncio
 async def test_general_proxy_preserves_merchant_acl(monkeypatch: pytest.MonkeyPatch, endpoint) -> None:
     _, state = endpoint
     monkeypatch.setenv(proxy.FLAG, "on")

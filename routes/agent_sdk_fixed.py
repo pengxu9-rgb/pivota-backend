@@ -1064,7 +1064,7 @@ async def search_products(
             status_code=400,
             content={"status": "error", "error": {"code": "gateway_search_proxy_loop"}},
         )
-    if proxy_on and str(query or "").strip():
+    if proxy_on:
         if limit > 100 or offset % limit != 0:
             return JSONResponse(
                 status_code=422,
