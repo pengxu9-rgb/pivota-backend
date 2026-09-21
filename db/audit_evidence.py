@@ -27,6 +27,7 @@ Phase 4 dual-write strategy:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -1855,6 +1856,48 @@ async def list_evidence_for_run(
         )
         return []
     return [dict(r) for r in (rows or [])]
+
+
+async def fetch_latest_commerce_verification_for_merchant(
+    *, merchant_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Latest storefront browser journey for one merchant.
+
+    The merchant API needs the work-queue row even when a probe produced no
+    positive evidence. Reading only evidence_items would turn blocked, failed,
+    and still-running journeys into the same empty state.
+    """
+    if not merchant_id:
+        return None
+    await ensure_audit_evidence_tables()
+    try:
+        row = await database.fetch_one(
+            verification_runs.select()
+            .where(
+                verification_runs.c.merchant_id == merchant_id,
+                verification_runs.c.verifier_id
+                == VERIFIER_COMMERCE_CHECKOUT_PROBE,
+            )
+            .order_by(verification_runs.c.created_at.desc())
+            .limit(1)
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "fetch_latest_commerce_verification_for_merchant failed merchant=%s: %s",
+            merchant_id, str(exc)[:200],
+        )
+        return None
+    if not row:
+        return None
+    value = dict(row)
+    raw = value.get("evidence_jsonb")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            raw = None
+    value["evidence_jsonb"] = raw if isinstance(raw, dict) else {}
+    return value
 
 
 async def list_findings_for_run(
