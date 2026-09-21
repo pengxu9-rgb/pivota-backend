@@ -166,6 +166,17 @@ EXTERNAL_REFERRAL_BLOCKER_ANOMALIES = {
     # reads a price without proving the URL still resolves. One field cannot answer both.
     "destination_stale",
 }
+# Recall only needs a real product destination that is safe to hand to the
+# merchant checkout.  The broader audit blocker set above still drives refresh
+# work and transaction-readiness reporting, but it must not remove an otherwise
+# usable offer from discovery merely because its cached content is old, its
+# local variant projection is incomplete, or its last liveness check is stale.
+EXTERNAL_REFERRAL_RUNTIME_BLOCKER_ANOMALIES = {
+    "non_product_fallback_page",
+    "redirect_unavailable",
+    "destination_domain_not_allowed",
+    "destination_dead",
+}
 EXTERNAL_REFERRAL_REVIEW_ANOMALIES = {
     "zero_images",
     "generic_template_description",
@@ -1543,12 +1554,21 @@ async def should_block_external_referral_runtime(
     matched_via: str = "runtime",
     allowed_domains: Optional[List[str]] = None,
 ) -> Tuple[bool, ExternalReferralStatus]:
+    """Block recall only when the merchant handoff is unusable or unsafe.
+
+    ``status`` intentionally retains every audit blocker so operators and the
+    transaction path can require refresh or quote validation.  Recall is
+    source-neutral: nonterminal audit findings do not hide external offers.
+    """
     status = await evaluate_external_referral_seed(
         row,
         matched_via=matched_via,
         allowed_domains=allowed_domains,
     )
-    blocked = status.status == "blocked"
+    runtime_blockers = sorted(
+        set(status.blocker_anomaly_types) & EXTERNAL_REFERRAL_RUNTIME_BLOCKER_ANOMALIES
+    )
+    blocked = bool(runtime_blockers)
     if blocked:
         _record_metric("referral_runtime_filtered_total")
         logger.info(
@@ -1556,7 +1576,8 @@ async def should_block_external_referral_runtime(
             extra={
                 "seed_id": status.seed_id,
                 "matched_via": matched_via,
-                "blockers": list(status.blocker_anomaly_types),
+                "blockers": runtime_blockers,
+                "audit_blockers": list(status.blocker_anomaly_types),
             },
         )
     return blocked, status

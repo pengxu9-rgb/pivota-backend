@@ -2526,8 +2526,7 @@ def _build_external_item(row: Dict[str, Any], query: str, *, source_order: int) 
 
 
 def _sort_items(items: List[PivotResultItem]) -> List[PivotResultItem]:
-    def sort_key(item: PivotResultItem) -> tuple[int, int, float, float, int, Decimal]:
-        internal_boost = 1 if item.catalog_track == "internal_merchant" else 0
+    def sort_key(item: PivotResultItem) -> tuple[int, float, float, int, Decimal]:
         exact_boost = 1 if item.match_explanation.get("exact_match") else 0
         relevance_boost = 0.0
         source_boost = 0.0
@@ -2568,7 +2567,6 @@ def _sort_items(items: List[PivotResultItem]) -> List[PivotResultItem]:
                 structure_boost = 0.0
         return (
             -exact_boost,
-            -internal_boost,
             -(relevance_boost + source_boost),
             -structure_boost,
             source_order,

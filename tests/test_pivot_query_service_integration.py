@@ -449,6 +449,62 @@ async def test_sort_items_prefers_external_relevance_before_price() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sort_items_does_not_prefer_internal_source_over_relevance() -> None:
+    def build_item(
+        title: str,
+        *,
+        catalog_track: str,
+        relevance: float,
+    ) -> module.PivotResultItem:
+        return module.PivotResultItem(
+            merchant=module.MerchantNode(merchant_name="Demo"),
+            product=module.ProductNode(title=title),
+            sku=module.SkuNode(),
+            offers=[
+                module.OfferNode(
+                    offer_id=f"offer::{title}",
+                    catalog_track=catalog_track,
+                    truth_tier="fallback",
+                    readiness_tier="commerce_ready",
+                    offer_mode="redirect",
+                    source_system="test",
+                    pricing=module.PivotPricing(
+                        currency="USD",
+                        merchant_effective_price=Decimal("25.00"),
+                        estimated_best_price=Decimal("25.00"),
+                    ),
+                    incentives=[],
+                )
+            ],
+            catalog_track=catalog_track,
+            truth_tier="fallback",
+            readiness_tier="commerce_ready",
+            freshness={},
+            source_system="test",
+            match_explanation={
+                "lane": "test",
+                "relevance_score": relevance,
+                "source_order": 0,
+            },
+        )
+
+    internal = build_item(
+        "Less Relevant Internal",
+        catalog_track="internal_merchant",
+        relevance=0.2,
+    )
+    external = build_item(
+        "More Relevant External",
+        catalog_track="external_referral",
+        relevance=0.9,
+    )
+
+    items = module._sort_items([internal, external])
+
+    assert items[0].product.title == "More Relevant External"
+
+
+@pytest.mark.asyncio
 async def test_sort_items_prefers_external_source_order_before_price_when_relevance_ties() -> None:
     def build_item(title: str, price: str, source_order: int) -> module.PivotResultItem:
         return module.PivotResultItem(

@@ -1581,9 +1581,9 @@ def test_a_seed_row_never_disagrees_with_its_own_seed_data():
     `variants[].currency` -- so the scalar `price_currency` column MUST move with it.
 
     Leaving it behind splits the row against its own JSON, which is exactly what
-    `external_seed_audit.detect_price_currency_mismatch` looks for. That is a BLOCKER anomaly
-    (`EXTERNAL_REFERRAL_BLOCKER_ANOMALIES`), it makes `_build_external_seed_product` return None,
-    and no other lane writes this column -- so the seed leaves the agent surface permanently.
+    `external_seed_audit.detect_price_currency_mismatch` looks for. That remains a BLOCKER
+    audit anomaly (`EXTERNAL_REFERRAL_BLOCKER_ANOMALIES`) and can prevent a trustworthy quote,
+    even though source-neutral recall now keeps the offer discoverable for live validation.
 
     Reachable two ordinary ways: any storefront already indexed as USD, and a first ingest whose
     /meta.json read failed followed by one that succeeded. Asserted in BOTH directions, because
