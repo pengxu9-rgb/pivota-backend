@@ -2913,6 +2913,7 @@ def _schedule_external_seed_cache_refresh(
     cache_key: str,
     req: Request,
     query: Optional[str],
+    market: str,
     query_semantic_class: Optional[str],
     limit: int,
     page_offset: int,
@@ -2936,6 +2937,7 @@ def _schedule_external_seed_cache_refresh(
             refreshed = await _load_external_seed_products_for_search(
                 req=req,
                 query=query,
+                market=market,
                 limit=limit,
                 page_offset=page_offset,
                 build_budget_ms=build_budget_ms,
@@ -2965,6 +2967,7 @@ async def _load_external_seed_products_with_cache(
     *,
     req: Request,
     query: Optional[str],
+    market: Optional[str] = None,
     query_semantic_class: Optional[str],
     limit: int,
     build_budget_ms: Optional[int],
@@ -2981,6 +2984,7 @@ async def _load_external_seed_products_with_cache(
     brand_query_detected: bool = False,
     metrics_out: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
+    normalized_market = str(market or DEFAULT_EXTERNAL_SEED_MARKET).strip().upper() or DEFAULT_EXTERNAL_SEED_MARKET
     metrics = metrics_out if isinstance(metrics_out, dict) else {}
     metrics.setdefault("executed", False)
     metrics.setdefault("skip_reason", "not_attempted")
@@ -3013,6 +3017,7 @@ async def _load_external_seed_products_with_cache(
         return await _load_external_seed_products_for_search(
             req=req,
             query=query,
+            market=normalized_market,
             limit=limit,
             page_offset=page_offset,
             build_budget_ms=build_budget_ms,
@@ -3035,6 +3040,7 @@ async def _load_external_seed_products_with_cache(
         return await _load_external_seed_products_for_search(
             req=req,
             query=query,
+            market=normalized_market,
             limit=limit,
             page_offset=page_offset,
             build_budget_ms=build_budget_ms,
@@ -3057,7 +3063,7 @@ async def _load_external_seed_products_with_cache(
     )
     cache_key = _build_external_seed_cache_key(
         query=query,
-        market=DEFAULT_EXTERNAL_SEED_MARKET,
+        market=normalized_market,
         strategy=normalized_seed_strategy,
         surface=normalized_catalog_surface,
         scope=cache_scope,
@@ -3122,6 +3128,7 @@ async def _load_external_seed_products_with_cache(
                     cache_key=cache_key,
                     req=req,
                     query=query,
+                    market=normalized_market,
                     query_semantic_class=query_semantic_class,
                     limit=limit,
                     page_offset=page_offset,
@@ -3142,6 +3149,7 @@ async def _load_external_seed_products_with_cache(
     sync_rows = await _load_external_seed_products_for_search(
         req=req,
         query=query,
+        market=normalized_market,
         limit=limit,
         page_offset=page_offset,
         build_budget_ms=build_budget_ms,
@@ -3172,6 +3180,7 @@ async def _load_external_seed_products_with_cache(
             cache_key=cache_key,
             req=req,
             query=query,
+            market=normalized_market,
             query_semantic_class=query_semantic_class,
             limit=limit,
             page_offset=page_offset,
@@ -3886,6 +3895,7 @@ async def _load_external_seed_products_for_search(
     *,
     req: Request,
     query: Optional[str],
+    market: Optional[str] = None,
     query_semantic_class: Optional[str] = None,
     limit: int,
     page_offset: int = 0,
@@ -3940,6 +3950,7 @@ async def _load_external_seed_products_for_search(
     normalized_semantic_class = (
         str(query_semantic_class or "default").strip().lower() or "default"
     )
+    normalized_market = str(market or DEFAULT_EXTERNAL_SEED_MARKET).strip().upper() or DEFAULT_EXTERNAL_SEED_MARKET
     normalized_expansion_terms = _normalize_external_seed_terms_for_cache(
         expansion_terms
         if expansion_terms is not None
@@ -3965,7 +3976,7 @@ async def _load_external_seed_products_for_search(
     )
     stage_a_result = await fetch_external_seed_rows(
         database=database,
-        market=DEFAULT_EXTERNAL_SEED_MARKET,
+        market=normalized_market,
         query=query,
         limit=limit,
         offset=max(0, int(page_offset or 0)),
@@ -4003,7 +4014,7 @@ async def _load_external_seed_products_for_search(
         stage_a_lean_rescue_attempted = True
         lean_rescue_result = await fetch_external_seed_rows(
             database=database,
-            market=DEFAULT_EXTERNAL_SEED_MARKET,
+            market=normalized_market,
             query=query,
             limit=limit,
             offset=max(0, int(page_offset or 0)),
@@ -4055,7 +4066,7 @@ async def _load_external_seed_products_for_search(
         )
         stage_b_result = await fetch_external_seed_rows(
             database=database,
-            market=DEFAULT_EXTERNAL_SEED_MARKET,
+            market=normalized_market,
             query=stage_b_query,
             limit=stage_b_limit,
             offset=0,
@@ -4141,7 +4152,7 @@ async def _load_external_seed_products_for_search(
         broad_limit = min(1000, max(int(limit or 20) * 4, 120))
         broad_fetch_result = await fetch_external_seed_rows(
             database=database,
-            market=None,
+            market=normalized_market,
             query=query,
             limit=broad_limit,
             offset=0,
@@ -4977,6 +4988,10 @@ async def agent_search_products(
             external_seed_strategy,
             fallback="legacy",
         )
+        # Public recall is source-neutral. Keep the legacy query fields for
+        # compatibility, but they can no longer exclude external offers.
+        allow_external_seed = True
+        normalized_seed_strategy = "unified_relevance"
         normalized_catalog_surface = _normalize_catalog_surface(catalog_surface)
         retrieval_profile_hint = (
             normalized_catalog_surface if normalized_catalog_surface == CATALOG_SURFACE_BEAUTY else None
@@ -5080,6 +5095,8 @@ async def agent_search_products(
             and min_price is None
             and max_price is None
         )
+        if is_browse_mode and not merchant_id and not merchant_ids and search_all_merchants is True:
+            fast_mode_enabled = True
         requested_search_all_merchants = search_all_merchants is True
         requested_external_seed_only = bool(external_seed_only)
         merchant_scope_override_reason: Optional[str] = None
@@ -5115,6 +5132,7 @@ async def agent_search_products(
             and not merchant_id
             and not merchant_ids
             and (search_all_merchants is True)
+            and not allow_external_seed
         ):
             try:
                 allowed = (
@@ -5425,6 +5443,7 @@ async def agent_search_products(
                     external_seed_products = await _load_external_seed_products_with_cache(
                         req=req,
                         query=query,
+                        market=market,
                         query_semantic_class=query_semantic_class,
                         limit=ext_limit,
                         build_budget_ms=AGENT_EXTERNAL_SEED_FAST_SUPPLEMENT_BUDGET_MS,
@@ -5895,6 +5914,7 @@ async def agent_search_products(
                 external_seed_products = await _load_external_seed_products_with_cache(
                     req=req,
                     query=query,
+                    market=market,
                     query_semantic_class=query_semantic_class,
                     limit=external_seed_limit,
                     build_budget_ms=AGENT_EXTERNAL_SEED_GENERAL_BUDGET_MS,

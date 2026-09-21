@@ -1159,24 +1159,21 @@ def test_rank_offers_merit_first_higher_merit_external_beats_lower_merit_interna
     assert ranked[0]["confidence"] > ranked[1]["confidence"]
 
 
-def test_rank_offers_merit_first_transactability_breaks_ties() -> None:
-    """Tiebreaker ONLY: when fit is equal, the transactable (buy-here) offer wins."""
+def test_rank_offers_merit_first_checkout_transport_does_not_break_ties() -> None:
+    """Equal-fit offers keep stable order regardless of checkout transport."""
     import routes.agent_shop_gateway as gateway
 
     external = _external_offer("of:external", 0.9)
     internal = _internal_offer("of:internal", 0.9)
 
-    # External is listed first in the input; the tiebreaker must still promote internal.
     ranked = gateway._rank_offers_merit_first([external, internal])
 
-    assert [o["offer_id"] for o in ranked] == ["of:internal", "of:external"]
-    assert ranked[0]["purchase_route"] == "internal_checkout"
+    assert [o["offer_id"] for o in ranked] == ["of:external", "of:internal"]
 
 
 def test_rank_offers_merit_first_exact_tiers_collapse_across_scales() -> None:
     """Scale-artifact guard: internal exact (0.95) and external exact (1.0) are the SAME fit
-    tier, so the transactability tiebreaker fires and buy-here (internal) ranks first — the
-    0.05 cross-scale gap must NOT invert the demotion."""
+    tier; the raw fit score is the final deterministic tiebreak."""
     import routes.agent_shop_gateway as gateway
 
     external_exact = _external_offer("of:external_exact", 1.0)
@@ -1184,8 +1181,7 @@ def test_rank_offers_merit_first_exact_tiers_collapse_across_scales() -> None:
 
     ranked = gateway._rank_offers_merit_first([external_exact, internal_exact])
 
-    assert [o["offer_id"] for o in ranked] == ["of:internal_exact", "of:external_exact"]
-    assert ranked[0]["purchase_route"] == "internal_checkout"
+    assert [o["offer_id"] for o in ranked] == ["of:external_exact", "of:internal_exact"]
 
 
 def test_rank_offers_merit_first_exact_external_beats_lower_tier_internal() -> None:
@@ -1268,14 +1264,13 @@ def test_rank_offers_merit_first_puts_a_sold_out_buy_here_offer_behind_an_equal_
     assert [o["offer_id"] for o in ranked] == ["of:external", "of:internal"]
 
 
-def test_rank_offers_merit_first_a_sellable_buy_here_offer_still_wins_the_tie() -> None:
-    """Control for the test above: stock is what moved the internal offer, not its route."""
+def test_rank_offers_merit_first_sellable_checkout_routes_compete_on_merit() -> None:
     import routes.agent_shop_gateway as gateway
 
     internal_in_stock = {**_internal_offer("of:internal", 0.95), "in_stock": True}
     external_in_stock = {**_external_offer("of:external", 1.0), "in_stock": True}
     ranked = gateway._rank_offers_merit_first([external_in_stock, internal_in_stock])
-    assert [o["offer_id"] for o in ranked] == ["of:internal", "of:external"]
+    assert [o["offer_id"] for o in ranked] == ["of:external", "of:internal"]
 
 
 # The internal offer's `in_stock` IS the gate's stock verdict. Each row: the variant the offer
@@ -1430,13 +1425,10 @@ def test_offers_resolve_ranks_higher_merit_external_above_lower_merit_internal(
     assert isinstance(internal["internal_checkout_items"], list)
 
 
-def test_offers_resolve_exact_internal_beats_exact_external_end_to_end(
+def test_offers_resolve_exact_offers_do_not_rank_by_checkout_transport_end_to_end(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:
-    """End-to-end tiebreaker (now REACHABLE): when the SAME sku matches both an internal
-    (buy-here, confidence 0.95) and an external (referral, confidence 1.0) offer, they are the
-    same fit tier -> transactability breaks the tie -> the internal buy-here offer ranks first.
-    The 0.95-vs-1.0 cross-scale gap must not invert the demotion."""
+    """An exact external offer can lead an exact internal offer on merit."""
     import routes.agent_shop_gateway as gateway
 
     async def fake_fetch_all(query: str, values=None):
@@ -1513,25 +1505,23 @@ def test_offers_resolve_exact_internal_beats_exact_external_end_to_end(
     offers = body.get("offers") or []
     assert len(offers) >= 2, "both the exact internal and exact external offer should be present"
 
-    # Same fit tier (exact) -> transactability tiebreaker -> buy-here (internal) first.
-    assert offers[0]["purchase_route"] == "internal_checkout"
-    assert offers[0]["source"]["type"] == "internal_product"
+    assert offers[0]["purchase_route"] == "affiliate_outbound"
     external = next(o for o in offers if o["purchase_route"] == "affiliate_outbound")
-    assert offers.index(offers[0]) < offers.index(external)
-    # Despite the external carrying a numerically higher raw confidence.
-    assert external["confidence"] > offers[0]["confidence"]
+    internal = next(o for o in offers if o["purchase_route"] == "internal_checkout")
+    assert offers.index(external) < offers.index(internal)
+    assert external["confidence"] > internal["confidence"]
 
     # Honest labels remain on both.
-    assert offers[0]["affiliate_url"] is None
-    assert isinstance(offers[0]["internal_checkout_items"], list)
+    assert internal["affiliate_url"] is None
+    assert isinstance(internal["internal_checkout_items"], list)
     assert external["affiliate_url"].startswith("https://example.com/r?token=")
     assert external["internal_checkout_items"] is None
 
 
 def _stock_tie_fetch_all(internal_variant: dict):
     """One exact internal row (the queried sku, confidence 0.95) and one exact, in-stock
-    referral seed for the same sku (1.0) -- the same fit tier, so stock and then
-    transactability decide the order. The cache product is a valid StandardProduct so the
+    referral seed for the same sku (1.0) -- the same fit tier, so stock and then merit
+    decide the order. The cache product is a valid StandardProduct so the
     gate exercises the same normalization path as real synced products."""
 
     async def fake_fetch_all(query: str, values=None):
@@ -1647,23 +1637,20 @@ def test_relaxed_fallback_sold_out_buy_here_offer_at_limit_1_reports_external_on
 
 
 @pytest.mark.parametrize("commerce_surface", [None, "agent_api"], ids=["relaxed", "strict"])
-def test_untracked_inventory_buy_here_variant_stays_first_at_limit_1(
+def test_untracked_inventory_does_not_create_a_checkout_transport_preference_at_limit_1(
     monkeypatch: pytest.MonkeyPatch, client: TestClient, commerce_surface
 ) -> None:
-    """The case the exemption existed for. An untracked / keep-selling variant says
-    `available: true` at quantity 0; the gate ships it, and the flag -- now the gate's verdict --
-    says in stock. So with the exemption gone it still wins the equal-fit tie, survives the
-    limit=1 cut, and the response stays an exact match."""
+    """A sellable internal offer remains eligible but does not outrank by source."""
     body = _post_stock_tie(
         monkeypatch, client, {"inventory_quantity": 0, "available": True},
         limit=1, commerce_surface=commerce_surface,
     )
     offers = body.get("offers") or []
-    assert [o["purchase_route"] for o in offers] == ["internal_checkout"]
+    assert [o["purchase_route"] for o in offers] == ["affiliate_outbound"]
     assert offers[0]["in_stock"] is True
-    assert body["resolution_mode"] == "exact_match"
-    assert body["resolved_target"]["variant_id"] == "SKU_STOCK_EXACT"
-    assert body["metadata"]["has_internal"] is True
+    assert body["resolution_mode"] == "external_only"
+    assert body.get("resolved_target") is None
+    assert body["metadata"]["has_internal"] is False
 
 
 @pytest.mark.parametrize(

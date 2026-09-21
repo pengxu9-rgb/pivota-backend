@@ -47,7 +47,7 @@ GATEWAY_PATH = "/agent/v1/products/search"
 TIMEOUT_SECONDS = 8.0
 
 # Query parameters the gateway must not receive from the caller: they are set here.
-_OWNED_PARAMS = {"catalog_surface", "source"}
+_OWNED_PARAMS = {"catalog_surface", "source", "allow_external_seed", "external_seed_strategy"}
 
 _client: Optional[httpx.AsyncClient] = None
 
@@ -72,10 +72,18 @@ def enabled_for(agent_id: Optional[str], headers: Mapping[str, str], env: Mappin
     return True, "enabled"
 
 
-def gateway_params(query_items: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
-    """The caller's query parameters, verbatim and in order, plus the two this proxy owns."""
+def gateway_params(
+    query_items: List[Tuple[str, str]], *, catalog_surface: Optional[str] = "beauty"
+) -> List[Tuple[str, str]]:
+    """Preserve request filters while enforcing one source-neutral recall contract."""
     kept = [(key, value) for key, value in query_items if key not in _OWNED_PARAMS]
-    return kept + [("catalog_surface", "beauty"), ("source", PROXY_SOURCE)]
+    if catalog_surface:
+        kept.append(("catalog_surface", catalog_surface))
+    return kept + [
+        ("allow_external_seed", "true"),
+        ("external_seed_strategy", "unified_relevance"),
+        ("source", PROXY_SOURCE),
+    ]
 
 
 def gateway_headers(headers: Mapping[str, str]) -> Dict[str, str]:
@@ -105,6 +113,7 @@ def to_backend_envelope(
     in_stock_only: bool,
     merchant_id: Optional[str],
     merchant_ids: Optional[List[str]],
+    catalog_surface: Optional[str] = "beauty",
 ) -> Dict[str, Any]:
     """The gateway's answer in THIS endpoint's contract: the same top-level keys, the same
     pagination fields, the products as the gateway serves them."""
@@ -134,12 +143,12 @@ def to_backend_envelope(
             "merchant_ids": merchant_ids,
             "merchants_searched": None,
             "cross_merchant_search": merchant_id is None and not merchant_ids,
-            "catalog_surface": "beauty",
+            "catalog_surface": catalog_surface,
         },
         "filters_applied": {
             "query": query,
             "category": category,
-            "catalog_surface": "beauty",
+            "catalog_surface": catalog_surface,
             "min_price": min_price,
             "max_price": max_price,
             "in_stock_only": in_stock_only,
@@ -147,7 +156,7 @@ def to_backend_envelope(
         "metadata": {
             **gateway_metadata,
             "source": "agent_search_products",
-            "catalog_surface": "beauty",
+            "catalog_surface": catalog_surface,
             "reason_code": "ok" if products else "no_candidates",
             "served_by": "gateway",
             "gateway_query_source": gateway_metadata.get("query_source"),
@@ -160,11 +169,16 @@ async def search(
     base_url: str,
     query_items: List[Tuple[str, str]],
     headers: Mapping[str, str],
+    catalog_surface: Optional[str] = "beauty",
 ) -> Tuple[Optional[Dict[str, Any]], str, int]:
     """Forward once. Return body, safe reason and caller-facing HTTP status; never raise."""
     url = f"{str(base_url).rstrip('/')}{GATEWAY_PATH}"
     try:
-        response = await _get_client().get(url, params=gateway_params(query_items), headers=gateway_headers(headers))
+        response = await _get_client().get(
+            url,
+            params=gateway_params(query_items, catalog_surface=catalog_surface),
+            headers=gateway_headers(headers),
+        )
     except httpx.TimeoutException:
         return None, "gateway_timeout", 504
     except httpx.RequestError:
