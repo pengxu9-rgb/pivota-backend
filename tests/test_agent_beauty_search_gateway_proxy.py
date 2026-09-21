@@ -153,13 +153,32 @@ def _mock_client(monkeypatch: pytest.MonkeyPatch, handler) -> List[httpx.Request
     (lambda r: httpx.Response(401, json={}), "gateway_http_401", 401),
     (lambda r: httpx.Response(200, text="not json"), "gateway_invalid_json", 502),
     (lambda r: httpx.Response(200, json={"no": "products"}), "gateway_unexpected_shape", 502),
-    (lambda r: httpx.Response(200, json={"status": "failed", "products": []}), "gateway_failed_response", 502),
+    (lambda r: httpx.Response(200, json={"status": "failed", "products": [], "error": {}}), "gateway_failed_response", 502),
     (lambda r: (_ for _ in ()).throw(httpx.ReadTimeout("slow")), "gateway_timeout", 504),
     (lambda r: (_ for _ in ()).throw(httpx.ConnectError("down")), "gateway_unavailable", 503),
 ])
 async def test_every_failure_is_returned_as_a_reason_never_raised(monkeypatch: pytest.MonkeyPatch, handler, reason, status) -> None:
     _mock_client(monkeypatch, handler)
     assert await proxy.search(base_url="http://gw.test", query_items=[("query", "x")], headers={}) == (None, reason, status)
+
+
+@pytest.mark.asyncio
+async def test_gateway_failed_decision_without_error_is_a_valid_empty_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = {
+        "status": "failed",
+        "products": [],
+        "total": 0,
+        "error": None,
+        "metadata": {"failure_class": "beauty_legacy_fallback_blocked"},
+    }
+    _mock_client(monkeypatch, lambda r: httpx.Response(200, json=body))
+    assert await proxy.search(
+        base_url="http://gw.test",
+        query_items=[("query", "JUNG SAEM MOOL")],
+        headers={},
+    ) == (body, "ok", 200)
 
 
 # --- the endpoint, end to end ------------------------------------------------------------

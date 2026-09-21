@@ -193,6 +193,12 @@ async def search(
         return None, "gateway_invalid_json", 502
     if not isinstance(body, dict) or not isinstance(body.get("products"), list):
         return None, "gateway_unexpected_shape", 502
-    if str(body.get("status", "success")).lower() in {"error", "failed"}:
+    gateway_status = str(body.get("status", "success")).lower()
+    # The gateway uses ``status=failed`` with HTTP 200 for a resolved, empty
+    # search decision (for example, no candidates in the selected market). It
+    # is a valid terminal search response when no error payload exists. Keep
+    # explicit application errors visible while preserving empty-result HTTP
+    # semantics for callers of the backend compatibility door.
+    if gateway_status in {"error", "failed"} and body.get("error") is not None:
         return None, "gateway_failed_response", 502
     return body, "ok", 200
