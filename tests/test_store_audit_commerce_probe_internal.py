@@ -45,6 +45,20 @@ def test_receipt_accepts_truthful_required_selection_failure():
     assert receipt.steps[0].reason == "required_selection_unresolved"
 
 
+def test_receipt_accepts_cart_item_not_observed_failure():
+    receipt = _receipt(
+        cart={"status": "unknown"},
+        checkout={"status": "unavailable"},
+        steps=[{
+            "step": "add_to_cart",
+            "status": "failed",
+            "reason": "cart_item_not_observed",
+        }],
+    )
+    assert receipt.cart.status == "unknown"
+    assert receipt.steps[0].reason == "cart_item_not_observed"
+
+
 def test_receipt_rejects_free_form_or_duplicate_journey_steps():
     with pytest.raises(ValidationError):
         _receipt(steps=[{"step": "checkout", "status": "passed", "reason": "https://secret"}])
