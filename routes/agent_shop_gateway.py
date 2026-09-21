@@ -155,7 +155,10 @@ AGENT_API_KEY = os.getenv("SHOP_GATEWAY_AGENT_API_KEY") or os.getenv("PIVOTA_API
 logger = logging.getLogger(__name__)
 
 try:
-    from services.external_referral_readiness import should_block_external_referral_runtime
+    from services.external_referral_readiness import (
+        external_referral_live_verification_reasons,
+        should_block_external_referral_runtime,
+    )
 except ModuleNotFoundError:
     class _FallbackExternalReferralStatus:
         def __init__(self, *, seed_id: Optional[str] = None, matched_via: str = "runtime") -> None:
@@ -176,6 +179,11 @@ except ModuleNotFoundError:
             seed_id=str((row or {}).get("id") or "").strip() or None,
             matched_via=matched_via,
         )
+
+    def external_referral_live_verification_reasons(
+        status: _FallbackExternalReferralStatus,
+    ) -> List[str]:
+        return list(status.blocker_anomaly_types)
 
 
 def _bootstrap_env_int(name: str, default: int, *, min_value: int, max_value: int) -> int:
@@ -4445,6 +4453,22 @@ async def _handle_offers_resolve(
                         {
                             "seed_id": row_dict.get("id"),
                             "blockers": list(gate_status.blocker_anomaly_types),
+                        },
+                    )
+                )
+                continue
+            live_verification_reasons = external_referral_live_verification_reasons(gate_status)
+            if live_verification_reasons:
+                # Recall can return a referral-only card, but offer resolution
+                # cannot synthesize commerce facts before a live merchant check.
+                mapping_candidates.append(
+                    _conf(
+                        "external_seed",
+                        0.0,
+                        "external_seed_requires_live_verification",
+                        {
+                            "seed_id": row_dict.get("id"),
+                            "blockers": live_verification_reasons,
                         },
                     )
                 )

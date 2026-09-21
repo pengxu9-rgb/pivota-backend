@@ -202,6 +202,69 @@ async def test_agent_api_build_external_seed_product_skips_blocked_referral_seed
 
 
 @pytest.mark.asyncio
+async def test_agent_api_build_external_seed_product_degrades_untrusted_commerce_facts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_api as agent_api_module
+
+    gate_status = type(
+        "GateStatus",
+        (),
+        {
+            "status": "blocked",
+            "gating_policy_version": "external_referral_v1",
+            "blocker_anomaly_types": ["price_currency_mismatch", "zero_variants"],
+            "review_anomaly_types": [],
+        },
+    )()
+    monkeypatch.setattr(
+        agent_api_module,
+        "should_block_external_referral_runtime",
+        AsyncMock(return_value=(False, gate_status)),
+    )
+
+    product = await agent_api_module._build_external_seed_product(
+        req=type("Req", (), {"base_url": "https://agent.pivota.cc/"})(),
+        seed_row={
+            "id": "seed_untrusted",
+            "external_product_id": "ext_untrusted",
+            "market": "SG",
+            "tool": "*",
+            "destination_url": "https://example.com/p/untrusted",
+            "canonical_url": "https://example.com/p/untrusted",
+            "price_amount": "30.00",
+            "price_currency": "USD",
+            "seed_data": {
+                "title": "Recallable Product Requiring Live Quote",
+                "variants": [],
+            },
+        },
+        allowed_domains=[],
+        metrics_out={},
+    )
+
+    assert product is not None
+    assert product["title"] == "Recallable Product Requiring Live Quote"
+    assert product["commerce_verification"] == {
+        "required": True,
+        "status": "live_quote_required",
+        "reasons": ["price_currency_mismatch", "zero_variants"],
+        "price_trusted": False,
+        "availability_trusted": False,
+    }
+    assert product["external_referral_status"]["blocker_anomaly_types"] == [
+        "price_currency_mismatch",
+        "zero_variants",
+    ]
+    assert product["buyable"] is False
+    assert product["checkout_ready"] is False
+    assert product["availability"] == "unknown"
+    assert product["variants"] == []
+    for unsafe_field in ("price", "currency", "in_stock", "inventory_quantity", "seed_data"):
+        assert unsafe_field not in product
+
+
+@pytest.mark.asyncio
 async def test_agent_api_build_external_seed_product_uses_canonical_url_when_destination_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

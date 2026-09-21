@@ -784,6 +784,10 @@ async def test_stale_audit_findings_do_not_hide_an_external_offer_from_recall(mo
     assert status.status == "blocked"
     assert {"stale_snapshot", "destination_stale"}.issubset(status.blocker_anomaly_types)
     assert blocked is False
+    assert module.external_referral_live_verification_reasons(status) == [
+        "destination_stale",
+        "stale_snapshot",
+    ]
 
 
 @pytest.mark.asyncio

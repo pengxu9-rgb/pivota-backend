@@ -177,6 +177,16 @@ EXTERNAL_REFERRAL_RUNTIME_BLOCKER_ANOMALIES = {
     "destination_domain_not_allowed",
     "destination_dead",
 }
+
+
+def external_referral_live_verification_reasons(status: ExternalReferralStatus) -> List[str]:
+    """Audit blockers that require live commerce validation but allow recall."""
+    return sorted(
+        set(getattr(status, "blocker_anomaly_types", []) or [])
+        - EXTERNAL_REFERRAL_RUNTIME_BLOCKER_ANOMALIES
+    )
+
+
 EXTERNAL_REFERRAL_REVIEW_ANOMALIES = {
     "zero_images",
     "generic_template_description",
