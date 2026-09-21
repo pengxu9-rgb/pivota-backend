@@ -199,6 +199,6 @@ async def search(
     # is a valid terminal search response when no error payload exists. Keep
     # explicit application errors visible while preserving empty-result HTTP
     # semantics for callers of the backend compatibility door.
-    if gateway_status in {"error", "failed"} and body.get("error"):
+    if gateway_status in {"error", "failed"} and body.get("error") is not None:
         return None, "gateway_failed_response", 502
     return body, "ok", 200
