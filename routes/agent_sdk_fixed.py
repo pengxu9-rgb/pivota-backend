@@ -3,6 +3,7 @@ SDK-Ready Agent API Endpoints - COMPREHENSIVE FIX
 Properly handles all database schema issues and edge cases
 """
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, BackgroundTasks
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 from datetime import datetime
@@ -42,6 +43,9 @@ from services.external_seed_search import (
 from services.external_referral_readiness import should_block_external_referral_runtime
 from db.agent_ranking_log import log_ranking_batch
 from db.agent_product_events import log_product_events
+from routes.agent_auth import log_agent_request
+from services import agent_search_gateway_proxy
+from config.settings import settings as _app_settings
 
 router = APIRouter(prefix="/agent/v1", tags=["agent-sdk"])
 
@@ -800,6 +804,7 @@ async def search_products(
     allow_stale_cache: bool = Query(default=True),
     external_seed_strategy: str = Query(default="legacy"),
     fast_mode: bool = Query(default=False),
+    market: Optional[str] = Query(default=None),
     context: AgentContext = Depends(get_agent_context)
 ):
     """
@@ -1047,6 +1052,66 @@ async def search_products(
         else True
     )
 
+    # Partners still using this legacy URL receive the gateway's single recall
+    # implementation. The caller's obsolete allow_external_seed=false switch
+    # cannot hide eligible offers. Keep scoped callers on the local path until
+    # the gateway can enforce their trusted merchant ACL.
+    proxy_on, proxy_reason = agent_search_gateway_proxy.enabled_for(
+        getattr(context, "agent_id", None), req.headers,
+    )
+    if proxy_reason == "already_proxied":
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error": {"code": "gateway_search_proxy_loop"}},
+        )
+    if proxy_on:
+        if limit > 100 or offset % limit != 0:
+            return JSONResponse(
+                status_code=422,
+                content={"status": "error", "error": {"code": "gateway_pagination_unsupported"}},
+            )
+        requested_merchants = ([merchant_id] if merchant_id else list(merchant_ids or []))
+        if any(not context.can_access_merchant(mid) for mid in requested_merchants):
+            return JSONResponse(
+                status_code=403,
+                content={"status": "error", "error": {"code": "merchant_forbidden"}},
+            )
+        if getattr(context, "allowed_merchants", None) is not None:
+            return JSONResponse(
+                status_code=403,
+                content={"status": "error", "error": {"code": "gateway_merchant_scope_unavailable"}},
+            )
+        gateway_body, why, gateway_status = await agent_search_gateway_proxy.search(
+            base_url=_app_settings.pivota_agent_internal_url,
+            query_items=list(req.query_params.multi_items()),
+            headers=req.headers,
+            catalog_surface=(normalized_catalog_surface if normalized_catalog_surface == "beauty" else None),
+        )
+        background_tasks.add_task(
+            log_agent_request,
+            context=context,
+            status_code=gateway_status,
+            merchant_id=merchant_id or "cross_merchant_search",
+        )
+        if gateway_body is None:
+            return JSONResponse(
+                status_code=gateway_status,
+                content={"status": "error", "error": {"code": "gateway_search_failed", "reason": why}},
+            )
+        return agent_search_gateway_proxy.to_backend_envelope(
+            gateway_body,
+            limit=limit,
+            offset=offset,
+            query=query,
+            category=category,
+            min_price=min_price,
+            max_price=max_price,
+            in_stock_only=bool(effective_in_stock_only),
+            merchant_id=merchant_id,
+            merchant_ids=merchant_ids,
+            catalog_surface=normalized_catalog_surface,
+        )
+
     try:
         delegate_timeout_s = _resolve_delegate_timeout_seconds(merchant_id)
         result = await _await_with_hard_timeout(
@@ -1068,6 +1133,7 @@ async def search_products(
                 allow_stale_cache=allow_stale_cache,
                 external_seed_strategy=external_seed_strategy,
                 fast_mode=fast_mode,
+                market=market,
                 context=context,
             ),
             delegate_timeout_s,

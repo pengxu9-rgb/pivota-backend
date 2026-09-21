@@ -5121,7 +5121,7 @@ async def test_agent_sdk_fixed_delegate_path_does_not_double_inject_external_see
     external_loader.assert_not_awaited()
 
 
-def test_agent_products_search_allow_external_seed_false_disables_external_merge(
+def test_agent_products_search_legacy_false_cannot_disable_external_merge(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:
     import routes.agent_api as agent_api_module
@@ -5176,11 +5176,11 @@ def test_agent_products_search_allow_external_seed_false_disables_external_merge
     payload = res.json()
     products = payload.get("products") or []
     assert products
-    assert all(p.get("merchant_id") != "external_seed" for p in products)
+    assert any(p.get("merchant_id") == "external_seed" for p in products)
     source_breakdown = ((payload.get("metadata") or {}).get("source_breakdown") or {})
-    assert source_breakdown.get("external_seed_count") == 0
-    assert source_breakdown.get("strategy_applied") == "external_seed_disabled"
-    assert external_loader.await_count == 0
+    assert source_breakdown.get("external_seed_count") == 1
+    assert source_breakdown.get("strategy_applied") == "unified_relevance"
+    assert external_loader.await_count == 1
 
 
 def test_agent_products_search_supplement_internal_first_keeps_internal_ahead(
@@ -8080,7 +8080,7 @@ async def test_shop_gateway_find_products_multi_generic_default_ui_keeps_high_co
 
 
 @pytest.mark.asyncio
-async def test_shop_gateway_find_products_multi_generic_default_ui_skips_external_seed_fallback(
+async def test_shop_gateway_find_products_multi_generic_default_ui_includes_external_seed_recall(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import routes.agent_shop_gateway as agent_shop_gateway_module
@@ -8093,22 +8093,25 @@ async def test_shop_gateway_find_products_multi_generic_default_ui_skips_externa
             return []
         return []
 
-    async def fail_fetch_external_seed_rows(**kwargs):
-        raise AssertionError("default generic ui/web queries should not execute external seed search")
+    seed_fetch_calls = {"n": 0}
 
-    async def fail_prefetched_external_seed_wrappers(request_metadata):
-        raise AssertionError("default generic ui/web queries should not load prefetched external seed wrappers")
+    async def recording_fetch_external_seed_rows(**kwargs):
+        seed_fetch_calls["n"] += 1
+        return {"rows": [], "query_timeout": False, "total_count": 0}
+
+    async def empty_prefetched_external_seed_wrappers(request_metadata):
+        return []
 
     monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
     monkeypatch.setattr(
         agent_shop_gateway_module,
         "fetch_external_seed_rows",
-        fail_fetch_external_seed_rows,
+        recording_fetch_external_seed_rows,
     )
     monkeypatch.setattr(
         agent_shop_gateway_module,
         "_build_prefetched_external_seed_wrappers",
-        fail_prefetched_external_seed_wrappers,
+        empty_prefetched_external_seed_wrappers,
     )
     monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", False)
     monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
@@ -8131,8 +8134,8 @@ async def test_shop_gateway_find_products_multi_generic_default_ui_skips_externa
     assert result.get("products") == []
     metadata = result.get("metadata") or {}
     assert metadata.get("query_semantic_class") == "default"
-    assert metadata.get("external_seed_executed") is False
-    assert metadata.get("external_seed_skip_reason") == "semantic_class_blocked"
+    assert seed_fetch_calls["n"] >= 1
+    assert metadata.get("external_seed_skip_reason") != "semantic_class_blocked"
 
 
 @pytest.mark.asyncio
@@ -8215,24 +8218,24 @@ async def test_shop_gateway_find_products_multi_catalog_brand_allows_external_se
 
 
 @pytest.mark.asyncio
-async def test_shop_gateway_find_products_multi_heuristic_brand_does_not_open_external_seed_gate(
+async def test_shop_gateway_find_products_multi_heuristic_brand_still_uses_unified_recall(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Only catalog/static brand detection opens the external-seed gate. The
-    looser suffix-pattern heuristic (mode='heuristic') must NOT — it is not a
-    proof the brand exists in the catalog, so a default-class query that merely
-    looks brand-like stays blocked (no junk widening)."""
+    """Brand confidence affects ranking, not source eligibility."""
     import routes.agent_shop_gateway as agent_shop_gateway_module
     import routes.agent_api as agent_api_module
 
     async def fake_fetch_all(query: str, values=None):
         return []
 
-    async def fail_fetch_external_seed_rows(**kwargs):
-        raise AssertionError("heuristic-only brand detection must not execute external seed search")
+    seed_fetch_calls = {"n": 0}
 
-    async def fail_prefetched_external_seed_wrappers(request_metadata):
-        raise AssertionError("heuristic-only brand detection must not load prefetched external seed wrappers")
+    async def recording_fetch_external_seed_rows(**kwargs):
+        seed_fetch_calls["n"] += 1
+        return {"rows": [], "query_timeout": False, "total_count": 0}
+
+    async def empty_prefetched_external_seed_wrappers(request_metadata):
+        return []
 
     async def fake_ensure_brand_dictionary_loaded():
         return None
@@ -8248,11 +8251,11 @@ async def test_shop_gateway_find_products_multi_heuristic_brand_does_not_open_ex
         }
 
     monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
-    monkeypatch.setattr(agent_shop_gateway_module, "fetch_external_seed_rows", fail_fetch_external_seed_rows)
+    monkeypatch.setattr(agent_shop_gateway_module, "fetch_external_seed_rows", recording_fetch_external_seed_rows)
     monkeypatch.setattr(
         agent_shop_gateway_module,
         "_build_prefetched_external_seed_wrappers",
-        fail_prefetched_external_seed_wrappers,
+        empty_prefetched_external_seed_wrappers,
     )
     monkeypatch.setattr(agent_api_module, "_ensure_brand_dictionary_loaded", fake_ensure_brand_dictionary_loaded)
     monkeypatch.setattr(agent_api_module, "_detect_brand_query", fake_detect_brand_query)
@@ -8276,5 +8279,5 @@ async def test_shop_gateway_find_products_multi_heuristic_brand_does_not_open_ex
 
     metadata = result.get("metadata") or {}
     assert metadata.get("brand_query_detected") is False
-    assert metadata.get("external_seed_executed") is False
-    assert metadata.get("external_seed_skip_reason") == "semantic_class_blocked"
+    assert seed_fetch_calls["n"] >= 1
+    assert metadata.get("external_seed_skip_reason") != "semantic_class_blocked"

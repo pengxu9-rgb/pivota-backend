@@ -283,10 +283,10 @@ PIVOT_MULTI_SERVE_SOURCE_ALLOWLIST = _bootstrap_env_csv_set(
     "AGENT_SHOP_PIVOT_MULTI_SERVE_SOURCE_ALLOWLIST",
     {"shopping_agent"},
 )
-PIVOT_MULTI_SERVE_INCLUDE_EXTERNAL = _bootstrap_env_bool(
-    "AGENT_SHOP_PIVOT_MULTI_SERVE_INCLUDE_EXTERNAL",
-    True,
-)
+# External offers are part of the normal shopping recall universe. Keep the
+# symbol for compatibility with tests and call sites, but retire the env kill
+# switch so a stale deployment setting cannot hide future external merchants.
+PIVOT_MULTI_SERVE_INCLUDE_EXTERNAL = True
 PIVOT_MULTI_SERVE_INCLUDE_INCENTIVES = _bootstrap_env_bool(
     "AGENT_SHOP_PIVOT_MULTI_SERVE_INCLUDE_INCENTIVES",
     True,
@@ -3889,8 +3889,8 @@ def _rank_offers_merit_first(offers: List[Dict[str, Any]]) -> List[Dict[str, Any
     Index neutrality is a core differentiator: an external (referred, ``orderable:false``)
     offer must not be demoted purely for being un-integrated. Internal (buy-here) and
     external (referral) offers compete on the same relevance/quality signal — the per-offer
-    match ``confidence`` — and in-agent transactability is applied ONLY as a tiebreaker
-    between otherwise-equal-FIT offers (an orderable/buy-here offer wins the tie).
+    match ``confidence``. Checkout transport is not a ranking signal: external merchants can
+    complete through their own checkout and the constrained card rail.
 
     The two tiers score match ``confidence`` on non-comparable scales (internal exact = 0.95
     at ``_build_internal_offer_summary``; external exact = 1.0 in ``_append_external_...``), so
@@ -3931,16 +3931,11 @@ def _rank_offers_merit_first(offers: List[Dict[str, Any]]) -> List[Dict[str, Any
             return 1  # product-level match
         return 2  # loose match
 
-    def _transactability_rank(offer: Dict[str, Any]) -> int:
-        # Tiebreaker only: 0 = transactable in-agent (buy-here) wins ties, 1 = referral.
-        return 0 if str(offer.get("purchase_route") or "") == "internal_checkout" else 1
-
-    def _key(offer: Dict[str, Any]) -> Tuple[int, int, int, float]:
+    def _key(offer: Dict[str, Any]) -> Tuple[int, int, float]:
         confidence = _merit(offer)
         return (
             _fit_tier_rank(confidence),
             1 if _offer_is_known_unavailable(offer) else 0,
-            _transactability_rank(offer),
             -confidence,
         )
 
@@ -11463,11 +11458,10 @@ async def _handle_find_products_multi_inner(
         # Never let brand detection break recall — fall back to the prior gate.
         brand_query_detected = False
         brand_query_terms = []
-    semantic_external_seed_fallback_allowed = bool(
-        strict_serving_mode
-        or query_semantic_class in {"beauty", "fragrance"}
-        or brand_query_detected
-    )
+    # External offers are part of the same recall universe. Semantic class and
+    # brand detection still influence ranking and precision checks, but cannot
+    # remove an otherwise eligible catalog source.
+    semantic_external_seed_fallback_allowed = True
 
     # Detect special intents for downstream filtering/UX.
     look_intent = False
