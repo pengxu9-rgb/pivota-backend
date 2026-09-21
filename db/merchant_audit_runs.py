@@ -1053,7 +1053,9 @@ async def recent_runs_for_merchant(
             # history list, the trend inputs and the tasks lookup through this
             # function — naming it explicitly beats every caller remembering.
             query = query.where(
-                merchant_audit_runs.c.subject_type != SUBJECT_TYPE_PUBLIC_FUNNEL
+                merchant_audit_runs.c.subject_type.notin_([
+                    SUBJECT_TYPE_PUBLIC_FUNNEL, "store_readiness",
+                ])
             )
         rows = await database.fetch_all(
             query.order_by(merchant_audit_runs.c.requested_at.desc()).limit(limit)

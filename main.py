@@ -394,6 +394,7 @@ from routes.store_audit_commerce_probe_internal import router as store_audit_com
 from routes.store_audit_ops import router as store_audit_ops_router
 from routes.store_audit_public_intake import router as store_audit_public_intake_router
 from routes.store_audit_public_intake import claim_router as store_audit_claim_router
+from routes.store_readiness import router as store_readiness_router
 from routes.agent_internal_products import router as agent_internal_products_router
 from routes.subject_resolve import router as subject_resolve_router
 from routes.accounts_orders_api import router as accounts_orders_router
@@ -1408,6 +1409,7 @@ app.include_router(store_audit_commerce_probe_internal_router)  # Store Audit co
 app.include_router(store_audit_ops_router)  # Admin-only Store Audit lane diagnostics (no caller SQL; redacted)
 app.include_router(store_audit_public_intake_router)  # Public store-audit intake/teaser for the marketing funnel (flag gated, UCP lane only)
 app.include_router(store_audit_claim_router)  # AUTHENTICATED claim of an anonymous funnel run (same flag; not under /public/*)
+app.include_router(store_readiness_router)  # Merchant-triggered storefront journey: search -> PDP -> cart -> address -> checkout
 app.include_router(agent_internal_products_router)  # Thin internal search primitive (/agent/internal/products/search)
 app.include_router(agent_management_router)  # Agent management
 app.include_router(fulfillment_api_router)  # Fulfillment tracking for agents
