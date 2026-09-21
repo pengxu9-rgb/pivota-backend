@@ -67,6 +67,7 @@ class SearchProductsRequest(BaseModel):
     merchant_ids: Optional[List[str]] = None
     search_all_merchants: bool = False
     query: Optional[str] = None
+    market: Optional[str] = None
     category: Optional[str] = None
     catalog_surface: Optional[str] = None
     min_price: Optional[float] = None
@@ -709,7 +710,11 @@ async def search_products_v2(
         allow_stale_cache=body.allow_stale_cache,
         external_seed_strategy=body.external_seed_strategy,
         fast_mode=body.fast_mode,
-        market=body.request_context.country if body.request_context and body.request_context.country else None,
+        market=body.market or (
+            body.request_context.country
+            if body.request_context and body.request_context.country
+            else None
+        ),
         psp=body.payment_context.psp if body.payment_context else None,
         payment_method_type=body.payment_context.payment_method_type if body.payment_context else None,
         card_network=body.payment_context.card_network if body.payment_context else None,
