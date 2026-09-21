@@ -40,7 +40,10 @@ from services.external_seed_search import (
     dedupe_external_seed_rows,
     fetch_external_seed_rows,
 )
-from services.external_referral_readiness import should_block_external_referral_runtime
+from services.external_referral_readiness import (
+    external_referral_live_verification_reasons,
+    should_block_external_referral_runtime,
+)
 from db.agent_ranking_log import log_ranking_batch
 from db.agent_product_events import log_product_events
 from routes.agent_auth import log_agent_request
@@ -262,13 +265,15 @@ async def _build_external_seed_product(
     if not external_product_id:
         return None
 
-    blocked, _gate_status = await should_block_external_referral_runtime(
+    blocked, gate_status = await should_block_external_referral_runtime(
         seed_row,
         matched_via="agent_sdk_fixed",
         allowed_domains=allowed_domains,
     )
     if blocked:
         return None
+    live_verification_reasons = external_referral_live_verification_reasons(gate_status)
+    requires_live_verification = bool(live_verification_reasons)
 
     disclosure_text = seed_row.get("disclosure_text") or seed_data.get("disclosure_text") or DEFAULT_DISCLOSURE_TEXT
     utm_template = seed_row.get("utm_template") or seed_data.get("utm_template") or DEFAULT_UTM_TEMPLATE
@@ -402,7 +407,9 @@ async def _build_external_seed_product(
         if len(variants) >= 30:
             break
 
-    if not variants:
+    if requires_live_verification:
+        variants = []
+    elif not variants:
         variants = [
             {
                 "id": external_product_id,
@@ -425,12 +432,18 @@ async def _build_external_seed_product(
         "title": title or destination_url,
         "name": title or destination_url,
         "description": str(seed_data.get("description") or "") or "",
-        "price": price,
-        "currency": price_currency,
+        **({"price": price, "currency": price_currency} if not requires_live_verification else {}),
         "image_url": image_url,
         "image_urls": image_urls,
-        "in_stock": True,
-        "inventory_quantity": 999,
+        **(
+            {"in_stock": True, "inventory_quantity": 999}
+            if not requires_live_verification
+            else {
+                "availability": "unknown",
+                "buyable": False,
+                "checkout_ready": False,
+            }
+        ),
         "product_type": "external",
         "source": "external_seed",
         "external_seed_id": seed_id,
@@ -439,6 +452,25 @@ async def _build_external_seed_product(
         "external_url": canonical_url or destination_url,
         "disclosure_text": str(disclosure_text or DEFAULT_DISCLOSURE_TEXT),
         "brand": brand,
+        "external_referral_status": {
+            "status": str(getattr(gate_status, "status", "") or "unknown"),
+            "gating_policy_version": str(
+                getattr(gate_status, "gating_policy_version", "") or "unknown"
+            ),
+            "blocker_anomaly_types": list(
+                getattr(gate_status, "blocker_anomaly_types", []) or []
+            ),
+            "review_anomaly_types": list(
+                getattr(gate_status, "review_anomaly_types", []) or []
+            ),
+        },
+        "commerce_verification": {
+            "required": requires_live_verification,
+            "status": "live_quote_required" if requires_live_verification else "catalog_facts_accepted",
+            "reasons": live_verification_reasons,
+            "price_trusted": not requires_live_verification,
+            "availability_trusted": not requires_live_verification,
+        },
         "variants": variants,
     }
 

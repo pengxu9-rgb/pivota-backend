@@ -763,6 +763,57 @@ async def test_a_verified_link_does_not_buy_freshness_for_a_stale_price(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_stale_audit_findings_do_not_hide_an_external_offer_from_recall(monkeypatch):
+    from services import external_referral_readiness as module
+
+    row = _seed_row(id="eps_stale_but_recallable")
+    row["seed_data"]["snapshot"]["extracted_at"] = _iso_days_ago(400)
+    row["destination_checked_at"] = _iso_days_ago(400)
+    row["destination_verdict"] = "live"
+    row["destination_failure_streak"] = 0
+
+    async def fake_allowed_domains(*, market: str):
+        return ["example.com"]
+
+    monkeypatch.setattr(module, "get_allowed_domains_for_market", fake_allowed_domains)
+    blocked, status = await module.should_block_external_referral_runtime(
+        row,
+        matched_via="test_recall",
+    )
+
+    assert status.status == "blocked"
+    assert {"stale_snapshot", "destination_stale"}.issubset(status.blocker_anomaly_types)
+    assert blocked is False
+    assert module.external_referral_live_verification_reasons(status) == [
+        "destination_stale",
+        "stale_snapshot",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_terminal_destination_failure_still_blocks_external_offer_recall(monkeypatch):
+    from services import external_referral_readiness as module
+
+    row = _seed_row(id="eps_dead_destination")
+    row["seed_data"]["snapshot"]["extracted_at"] = _iso_days_ago(0)
+    row["destination_checked_at"] = _iso_days_ago(0)
+    row["destination_verdict"] = "dead_404"
+    row["destination_failure_streak"] = 2
+
+    async def fake_allowed_domains(*, market: str):
+        return ["example.com"]
+
+    monkeypatch.setattr(module, "get_allowed_domains_for_market", fake_allowed_domains)
+    blocked, status = await module.should_block_external_referral_runtime(
+        row,
+        matched_via="test_recall",
+    )
+
+    assert "destination_dead" in status.blocker_anomaly_types
+    assert blocked is True
+
+
+@pytest.mark.asyncio
 async def test_a_fresh_price_does_not_buy_a_pass_for_an_unverified_link(monkeypatch):
     """And the converse — otherwise the old fail-open comes back through the other door."""
     from services import external_referral_readiness as module

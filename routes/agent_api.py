@@ -66,7 +66,10 @@ from services.external_seed_search import (
     dedupe_external_seed_rows,
     fetch_external_seed_rows,
 )
-from services.external_referral_readiness import should_block_external_referral_runtime
+from services.external_referral_readiness import (
+    external_referral_live_verification_reasons,
+    should_block_external_referral_runtime,
+)
 from services.agent_ranking_service import (
     AgentRankingFeatures,
     get_agent_ranking_config,
@@ -3688,7 +3691,7 @@ async def _build_external_seed_product(
         _increment_external_seed_metric_reason(metrics_out, "missing_external_product_id")
         return None
 
-    blocked, _gate_status = await should_block_external_referral_runtime(
+    blocked, gate_status = await should_block_external_referral_runtime(
         seed_row,
         matched_via="agent_api",
         allowed_domains=allowed_domains,
@@ -3696,6 +3699,8 @@ async def _build_external_seed_product(
     if blocked:
         _increment_external_seed_metric_reason(metrics_out, "blocked_referral_runtime")
         return None
+    live_verification_reasons = external_referral_live_verification_reasons(gate_status)
+    requires_live_verification = bool(live_verification_reasons)
 
     disclosure_text = (
         seed_row.get("disclosure_text")
@@ -3834,7 +3839,11 @@ async def _build_external_seed_product(
         if len(variants) >= 30:
             break
 
-    if not variants:
+    if requires_live_verification:
+        # Preserve recall without promoting stale or contradictory commerce
+        # facts. The merchant checkout/live quote path owns verification.
+        variants = []
+    elif not variants:
         variants = [
             {
                 "id": external_product_id,
@@ -3858,12 +3867,18 @@ async def _build_external_seed_product(
         "description": str(seed_data.get("description") or "") or "",
         **({"brand": brand} if brand else {}),
         **({"vendor": vendor} if vendor else {}),
-        "price": price,
-        "currency": price_currency,
+        **({"price": price, "currency": price_currency} if not requires_live_verification else {}),
         "image_url": image_url,
         "image_urls": image_urls,
-        "in_stock": True,
-        "inventory_quantity": 999,
+        **(
+            {"in_stock": True, "inventory_quantity": 999}
+            if not requires_live_verification
+            else {
+                "availability": "unknown",
+                "buyable": False,
+                "checkout_ready": False,
+            }
+        ),
         "product_type": product_type,
         **({"category": category} if category else {}),
         **({"tags": tags} if tags else {}),
@@ -3886,7 +3901,26 @@ async def _build_external_seed_product(
         "external_seed_id": seed_id,
         "external_redirect_url": external_redirect_url,
         "disclosure_text": str(disclosure_text or DEFAULT_DISCLOSURE_TEXT),
-        "seed_data": seed_data,
+        **({"seed_data": seed_data} if not requires_live_verification else {}),
+        "external_referral_status": {
+            "status": str(getattr(gate_status, "status", "") or "unknown"),
+            "gating_policy_version": str(
+                getattr(gate_status, "gating_policy_version", "") or "unknown"
+            ),
+            "blocker_anomaly_types": list(
+                getattr(gate_status, "blocker_anomaly_types", []) or []
+            ),
+            "review_anomaly_types": list(
+                getattr(gate_status, "review_anomaly_types", []) or []
+            ),
+        },
+        "commerce_verification": {
+            "required": requires_live_verification,
+            "status": "live_quote_required" if requires_live_verification else "catalog_facts_accepted",
+            "reasons": live_verification_reasons,
+            "price_trusted": not requires_live_verification,
+            "availability_trusted": not requires_live_verification,
+        },
         "variants": variants,
     }
 
