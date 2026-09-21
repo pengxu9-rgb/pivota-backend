@@ -31,6 +31,20 @@ def test_receipt_is_structured_and_redacted():
     assert receipt.steps[0].step == "storefront_access"
 
 
+def test_receipt_accepts_truthful_required_selection_failure():
+    receipt = _receipt(
+        cart={"status": "selection_required"},
+        checkout={"status": "unavailable"},
+        steps=[{
+            "step": "add_to_cart",
+            "status": "failed",
+            "reason": "required_selection_unresolved",
+        }],
+    )
+    assert receipt.cart.status == "selection_required"
+    assert receipt.steps[0].reason == "required_selection_unresolved"
+
+
 def test_receipt_rejects_free_form_or_duplicate_journey_steps():
     with pytest.raises(ValidationError):
         _receipt(steps=[{"step": "checkout", "status": "passed", "reason": "https://secret"}])
