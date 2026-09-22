@@ -119,7 +119,12 @@ async def fetch_detail(*, base_url: str, merchant_id: str, signature: str, varia
                        headers: Mapping[str, str]) -> Tuple[Optional[Dict[str, Any]], str, int]:
     """Ask the gateway's PDP lane once. (product in the `{product}` detail shape, reason,
     caller-facing status); never raises. `merchant_id`/`variant_id` are not sent: the lane is keyed
-    by the Pivota id alone, and the merchant was already checked against it in resolve_signature."""
+    by the Pivota id alone, and the merchant was already checked against it in resolve_signature.
+
+    ⚠️ NEVER add `variant_id` + `merchant_id` to this payload. With both, the gateway's get_pdp_v2
+    fetches the variant from THIS backend's `/merchants/{mid}/variant/{vid}` -- the route that calls
+    this function -- with its internal key and no hop header: an unbounded loop. The route tests pin
+    the exact wire body with `==` for that reason."""
     try:
         response = await _get_client().post(
             f"{str(base_url).rstrip('/')}{INVOKE_PATH}",

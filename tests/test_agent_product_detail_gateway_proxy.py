@@ -380,3 +380,5 @@ async def test_the_real_gateway_answer_maps_to_this_contract(monkeypatch: pytest
     assert (core["title"], core["sku"], core["price"], core["currency"], core["available"]) == ("Core Drop", "32168999", 30.0, "SGD", True)
     assert product["options"][0]["name"] == "Color" and len(product["options"][0]["values"]) == 12
     assert product["destination_url"] == "https://jsmbeauty.sg/products/lip-pression-metal-serum-gloss"
+    # The lane's own answer agrees with the merchant the path named (and resolve_signature checked).
+    assert real["modules"][0]["data"]["pdp_payload"]["product"]["merchant_id"] == MID == product["merchant_id"]
