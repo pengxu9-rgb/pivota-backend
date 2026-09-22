@@ -1473,8 +1473,8 @@ _MEASURED_HOST_PRODUCT_TYPES = {
         # check still sets the shelf aside for "Wash Off Pack": "wash" names the cleanser leaf.)
         "masks, exfoliators": "beauty/skincare/treat/mask",
         # treat/treatment, not treat/mask: Google 5976 and Shopify file patches under Acne
-        # Treatments. This DIVERGES from CATEGORY_PATTERNS, which maps "pimple patch"/"spot patch"
-        # to mask -- a patch whose title says so steps this shelf aside and stays unresolved here.
+        # Treatments. CATEGORY_PATTERNS now agrees (#2250), so this type usually resolves on its own
+        # evidence before the shelf is read; the entry stays as the measured record of the shelf.
         "acne pimple patch": "beauty/skincare/treat/treatment",
     },
     "ohlolly.com": {

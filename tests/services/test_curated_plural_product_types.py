@@ -42,8 +42,6 @@ def evidence_only(product_type, title, flag_path="beauty"):
     ("eyurs.com", "Masks, Exfoliators", "Isntree Mugwort Calming Clay Mask", "beauty/skincare/treat/mask"),
     # A title matching two leaves (face powder + mask) that includes the shelf's leaf is accepted.
     ("eyurs.com", "Masks, Exfoliators", "My Scheming Collagen Blackhead Remover Mask Powder", "beauty/skincare/treat/mask"),
-    ("eyurs.com", "Acne Pimple Patch", "Cosrx AC Collection Acne Patch – Heal & Protect Active Breakouts", "beauty/skincare/treat/treatment"),
-    ("eyurs.com", "Acne Pimple Patch", "Cosrx Acne Pimple Master Patch", "beauty/skincare/treat/treatment"),
     ("sokoglam.com", "Spot", "Spot the Difference Blemish Treatment", "beauty/skincare/treat/treatment"),
     ("sokoglam.com", "Spot", "Mighty Patch - The Original", "beauty/skincare/treat/treatment"),
     ("sokoglam.com", "Spot", "Might Patch - Micropoint for Blemishes", "beauty/skincare/treat/treatment"),  # "blemishes" is no pattern
@@ -212,8 +210,6 @@ def test_the_planner_never_lets_a_shelf_challenge_a_stored_leaf():
 
 @pytest.mark.parametrize("domain,ptype,title", [
     # The title names a DIFFERENT leaf than the new shelf: the shelf steps aside.
-    ("eyurs.com", "Acne Pimple Patch", "NEOGEN Dermalogy A-Clear Soothing Clear Spot Patch"),  # "spot patch" -> mask
-    ("sokoglam.com", "Spot", "Soft Shield Pimple Patch"),                                  # "pimple patch" -> mask
     ("sokoglam.com", "Spot", "Mineral Sunscreen SPF 50"),                                   # invented
     ("eyurs.com", "Masks, Exfoliators", "Gentle Peeling Gel"),                              # invented
     # Real: "wash" is the cleanser pattern, so the title names a different leaf and the shelf yields.
@@ -231,3 +227,45 @@ def test_the_new_shelves_step_aside_for_a_title_that_names_another_class(domain,
 @pytest.mark.parametrize("ptype", ["Spot", "Acne Pimple Patch", "Masks, Exfoliators"])
 def test_the_new_shelves_mean_nothing_on_a_host_that_did_not_file_them(domain, ptype):
     assert resolve(ptype, "Cosrx Acne Pimple Master Patch", domain) == evidence_only(ptype, "Cosrx Acne Pimple Master Patch")
+
+
+# #2250: CATEGORY_PATTERNS now files an acne patch under treat/treatment too, so the shelf and the
+# classifier agree. eyurs' "Acne Pimple Patch" type now names ONE leaf (it named mask via "pimple
+# patch" AND treatment via "acne" before), so it resolves on the merchant's own type, ahead of the shelf.
+@pytest.mark.parametrize("title", [
+    "Cosrx AC Collection Acne Patch – Heal & Protect Active Breakouts",
+    "Cosrx Acne Pimple Master Patch",
+    "NEOGEN Dermalogy A-Clear Soothing Clear Spot Patch",
+])
+def test_the_acne_patch_type_resolves_on_its_own_evidence(title):
+    want = ("beauty/skincare/treat/treatment", feed.CATEGORY_CONFIDENCE_MERCHANT_TYPE)
+    assert resolve("Acne Pimple Patch", title, "eyurs.com") == want
+    assert evidence_only("Acne Pimple Patch", title) == want
+
+
+def test_a_pimple_patch_title_no_longer_steps_the_spot_shelf_aside():
+    # Before #2250 "pimple patch" named mask, the shelf yielded and the row stayed unresolved.
+    assert resolve("Spot", "Soft Shield Pimple Patch", "sokoglam.com") == ("beauty/skincare/treat/treatment", MEASURED)
+
+
+# The evidence policy counts EVERY pattern that matches. An acne-qualified plural must name one
+# leaf, not treatment (the acne entry) AND mask (Mask's generic "patches" arm).
+@pytest.mark.parametrize("text,paths", [
+    ("Pimple Patches", 1), ("Spot Patches", 1), ("Spot Cover Patches", 1),
+    ("Acne Patches", 1), ("Blemish Patches", 1), ("Acne Pimple Patch", 1),
+    ("Eye Patches", 1), ("Hydrogel Patches", 1),
+    # The look-behinds are word-anchored and exact: only the acne qualifiers are declined.
+    ("Tattoo Cover Patches", 1), ("Hotspot Patches", 1),
+])
+def test_an_acne_patch_type_names_one_leaf(text, paths):
+    assert feed._pattern_matches(text) == paths
+
+
+@pytest.mark.parametrize("ptype,want", [
+    ("Pimple Patches", "beauty/skincare/treat/treatment"),
+    ("Spot Cover Patches", "beauty/skincare/treat/treatment"),
+    ("Eye Patches", "beauty/skincare/treat/mask"),
+    ("Hydrogel Patches", "beauty/skincare/treat/mask"),
+])
+def test_a_patch_type_resolves_rather_than_reading_as_ambiguous(ptype, want):
+    assert evidence_only(ptype, "Some Product 36ct") == (want, feed.CATEGORY_CONFIDENCE_MERCHANT_TYPE)
