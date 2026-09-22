@@ -33,8 +33,10 @@ from services.catalog_enrichment_agent.apply import (  # noqa: E402
 )
 from services.catalog_enrichment_agent.ingestion import ingest_validated_jsonl  # noqa: E402
 from services.catalog_enrichment_agent.primary_ingestion import (  # noqa: E402
-    inspect_primary_plan, require_primary_plan, require_primary_apply,
+    PrimaryIngestionIncomplete, inspect_primary_plan, require_primary_plan, require_primary_apply,
+    skipped_by_reason,
 )
+from services.catalog_enrichment_agent.primary_readiness import PrimaryReadinessIncomplete  # noqa: E402
 from services.curated_brand_feed import CrawlIncomplete, records_for_brand  # noqa: E402
 from services.catalog_onboard_worker import normalize_curated_brand_payload  # noqa: E402
 
@@ -204,20 +206,37 @@ def _select_by_gtin(records: List[Dict[str, Any]], canonical: set, *, domain: st
 LEGACY_LISTINGS_MARKER = "legacy listings: "
 
 
-class _SelectOnlyHandle:
-    """The preflight's only handle on the catalog DB: one method, and it refuses non-SELECT text.
+#: Its own line, like LEGACY_LISTINGS_MARKER, for the same reason.
+BRAND_HOST_GUARD_MARKER = "brand host guard: "
 
-    `find_legacy_retailer_listing_owners` needs nothing else, so anything that tries to write
-    through this handle fails with AttributeError (no execute/transaction) or PermissionError.
+#: Printed once per planned PDP an apply did not land, beside the partial report. Greppable.
+SKIPPED_PDP_PREFIX = "    skipped pdp "
+
+
+class _SelectOnlyHandle:
+    """The preflight's only handle on the catalog DB: two read methods, both refusing non-SELECT text.
+
+    `find_legacy_retailer_listing_owners` needs fetch_all and the brand-host guard's finder
+    (`audit_index_intake._existing_brand_canonical_conflict`) needs fetch_one; nothing else. Anything
+    that tries to write through this handle fails with AttributeError (no execute/transaction) or
+    PermissionError.
     """
 
     def __init__(self, database: Any) -> None:
         self._database = database
 
-    async def fetch_all(self, query: str, values: Optional[Dict[str, Any]] = None) -> Any:
+    @staticmethod
+    def _require_select(query: str) -> None:
         if not str(query).lstrip().upper().startswith("SELECT"):
-            raise PermissionError("legacy listing preflight is SELECT-only")
+            raise PermissionError("catalog preflight is SELECT-only")
+
+    async def fetch_all(self, query: str, values: Optional[Dict[str, Any]] = None) -> Any:
+        self._require_select(query)
         return await self._database.fetch_all(query, values)
+
+    async def fetch_one(self, query: str, values: Optional[Dict[str, Any]] = None) -> Any:
+        self._require_select(query)
+        return await self._database.fetch_one(query, values)
 
 
 def _preflight_database() -> tuple:
@@ -293,6 +312,114 @@ async def _legacy_listing_report(plan: Dict[str, Any], *, check: bool) -> Dict[s
             for f in findings if f["kind"] == "identity_unproven"
         ],
     }
+
+
+async def _brand_host_guard_report(plan: Dict[str, Any], *, check: bool) -> Dict[str, Any]:
+    """Which planned PDPs the ADR-008 brand-host guard may SKIP at apply, from the guard's own finder.
+
+    Wave 1 (2026-09-18, job oneoff-29431-10355): 5 of 15 Haruharu Wonder PDPs at ohlolly.com were
+    skipped because a legacy `prod::external_seed::...` row of the same brand on the same host sits
+    under another merchant; the dry run said `ready_to_apply` and the apply ended partial. This runs
+    `_existing_brand_canonical_conflict` — the SQL the guard runs, not a copy — once per distinct
+    (planned merchant, brand, host) the guard would bind, through the SELECT-only handle.
+
+    What it cannot say, and so does not claim: the guard runs only for a row that found NO exact
+    Tier-0 identity (GTIN / content_key / canonical_url / source_product_id) first, and apply may remap
+    a pre-existing product_key's merchant before the guard sees it. `rows_at_risk` is therefore an
+    UPPER bound: every planned row in a conflicting group, of which those that attach are not skipped.
+    """
+    from services.audit_index_intake import (
+        _existing_brand_canonical_conflict, audit_brand_fragmentation_guard_enabled, brand_host_guard_key,
+    )
+    from services.intake_identity import (
+        _DOOR_BLOCKS_ON_BRAND_CONFLICT, DOOR_CATALOG_ENRICHMENT, intake_identity_enabled,
+    )
+
+    groups: Dict[tuple, List[str]] = {}
+    for pdp in plan.get("pdps") or []:
+        brand, host = brand_host_guard_key(pdp)
+        merchant_id = str(pdp.get("merchant_id") or "")
+        if merchant_id and brand and host:  # the guard binds nothing without all three
+            groups.setdefault((merchant_id, brand, host), []).append(str(pdp.get("product_key") or ""))
+    report: Dict[str, Any] = {
+        "planned_groups": len(groups),
+        # This process's flags. The apply job's env decides; these say what THIS env would do.
+        "identity_gate_on_here": intake_identity_enabled(DOOR_CATALOG_ENRICHMENT),
+        "guard_enabled_here": audit_brand_fragmentation_guard_enabled(),
+        "on_conflict": "skip" if _DOOR_BLOCKS_ON_BRAND_CONFLICT.get(DOOR_CATALOG_ENRICHMENT, True) else "flag",
+    }
+    if not groups:
+        return {**report, "status": "not_applicable"}
+    if not check:
+        return {**report, "status": "unchecked",
+                "hint": "pass --check-brand-host-guard (a SELECT on catalog_products) to see which rows apply may skip"}
+    database, reason = _preflight_database()
+    if database is None:
+        return {**report, "status": "error", "error": reason}
+    connected_here = False
+    conflicts: List[Dict[str, Any]] = []
+    try:
+        if not getattr(database, "is_connected", False):
+            await database.connect()
+            connected_here = True
+        handle = _SelectOnlyHandle(database)
+        for (merchant_id, brand, host), keys in sorted(groups.items()):
+            found = await _existing_brand_canonical_conflict(
+                merchant_id, {"brand": brand, "source_domain": host}, database=handle,
+            )
+            if found:
+                conflicts.append({
+                    "merchant_id": merchant_id, "brand": brand, "host": host,
+                    "conflict_product_key": found.get("product_key"),
+                    "conflict_merchant_id": found.get("merchant_id"),
+                    "rows_at_risk": len(keys), "product_keys": sorted(keys),
+                })
+    except Exception as exc:  # noqa: BLE001 — reported, never swallowed into "clear"
+        return {**report, "status": "error", "error": type(exc).__name__}
+    finally:
+        if connected_here and getattr(database, "is_connected", False):
+            await database.disconnect()
+    return {
+        **report,
+        "status": "conflicts" if conflicts else "clear",
+        "apply_may_skip": bool(conflicts),
+        "rows_at_risk": sum(c["rows_at_risk"] for c in conflicts),
+        "conflicts": conflicts,
+    }
+
+
+def _failed_apply_report(exc: BaseException) -> Optional[Dict[str, Any]]:
+    """The report a refused apply leaves behind, or None when the failure carries none.
+
+    `apply_ingest_plan(primary_readiness=True)` wraps the persistence verdict — a
+    PrimaryIngestionIncomplete carrying the per-row `skipped_products` — in a
+    PrimaryReadinessIncomplete whose message keeps only 300 characters of it.
+    """
+    cause: Optional[BaseException] = exc
+    while cause is not None:
+        if isinstance(cause, PrimaryIngestionIncomplete):
+            return dict(cause.report)
+        cause = cause.__cause__
+    if isinstance(exc, PrimaryReadinessIncomplete):
+        persisted = dict(exc.persisted_counts or {})
+        skipped = [r for r in (persisted.pop("skipped_products", None) or []) if isinstance(r, dict)]
+        return {
+            "status": "failed",
+            "reasons": [f"primary_readiness_{exc.report.get('failed_stage') or 'failed'}"],
+            "readiness_failure": exc.report,
+            "applied": persisted,
+            "skipped_products": skipped,
+            "skipped_by_reason": skipped_by_reason(skipped),
+        }
+    return None
+
+
+def _print_failed_apply(report: Dict[str, Any]) -> None:
+    """Stdout, not stderr: a job's stderr JSON reaches Cloud Logging as a message-less
+    jsonPayload the runner's log fetch prints blank (see scripts/curated_apply_gate.py)."""
+    print("primary ingestion: " + json.dumps(report, sort_keys=True, ensure_ascii=False, default=str))
+    for row in report.get("skipped_products") or []:
+        print(SKIPPED_PDP_PREFIX + json.dumps(row, sort_keys=True, ensure_ascii=False, default=str))
 
 
 async def _run(args: argparse.Namespace) -> int:
@@ -383,17 +510,24 @@ async def _run(args: argparse.Namespace) -> int:
         f"skipped={plan.get('skipped')}"
     )
     print("primary ingestion: " + json.dumps(inspect_primary_plan(plan), sort_keys=True))
-    legacy = None
+    legacy = brand_guard = None
     if not args.apply:
         # Apply runs the real guard itself, before any write; this is the dry run's view of it.
         legacy = await _legacy_listing_report(plan, check=args.check_legacy_listings)
         print(LEGACY_LISTINGS_MARKER + json.dumps(legacy, sort_keys=True, ensure_ascii=False))
+        brand_guard = await _brand_host_guard_report(plan, check=args.check_brand_host_guard)
+        print(BRAND_HOST_GUARD_MARKER + json.dumps(brand_guard, sort_keys=True, ensure_ascii=False))
     _print_plan_identity(plan, limit=_effective_print_limit(args))
     if not args.apply:
         if legacy["status"] in ("conflicts", "error"):
             # Only reachable with --check-legacy-listings: the operator asked, so a cohort the apply
             # will refuse (or a check that could not run) must not exit like a clean plan.
             print(json.dumps({"error": f"legacy_listing_preflight_{legacy['status']}"}), file=sys.stderr)
+            return 2
+        if brand_guard["status"] in ("conflicts", "error"):
+            # Only reachable with --check-brand-host-guard. A cohort whose apply may end partial is
+            # not a clean plan, even though the skip is the guard working as designed.
+            print(json.dumps({"error": f"brand_host_guard_preflight_{brand_guard['status']}"}), file=sys.stderr)
             return 2
         print("  DRY-RUN — re-run with --apply to ingest as depositable anchors.")
         return 0
@@ -403,8 +537,17 @@ async def _run(args: argparse.Namespace) -> int:
     if not getattr(database, "is_connected", False):
         await database.connect()
     try:
-        counts = await apply_ingest_plan(plan, batch_label=f"curated_brands:{len(brands)}", db=database, primary_readiness=True)
-        result = require_primary_apply(preflight, counts)
+        try:
+            counts = await apply_ingest_plan(plan, batch_label=f"curated_brands:{len(brands)}", db=database,
+                                             primary_readiness=True)
+            result = require_primary_apply(preflight, counts)
+        except ValueError as exc:
+            # The exception message is compact (Queue.error is capped at 500 chars); the rows it
+            # counts, and why each did not land, go to stdout in full before it propagates.
+            report = _failed_apply_report(exc)
+            if report is not None:
+                _print_failed_apply(report)
+            raise
         print("primary ingestion: " + json.dumps(result, sort_keys=True))
     finally:
         if getattr(database, "is_connected", False):
@@ -501,6 +644,17 @@ def main(argv: Optional[List[str]] = None) -> int:
             "on with retailer_listing_migration_required. Needs a Postgres DATABASE_URL; exits 2 on "
             "a conflict or when the check cannot run. Never writes. Ignored with --apply, which "
             "always enforces the same check before its first write"
+        ),
+    )
+    p.add_argument(
+        "--check-brand-host-guard",
+        action="store_true",
+        help=(
+            "dry run only: run the ADR-008 brand-host guard's own finder (a SELECT on catalog_products) "
+            "once per planned (merchant, brand, host) and report which planned PDPs --apply may SKIP "
+            "because the same brand on the same host is already canonical under another merchant. An "
+            "upper bound: a row that attaches to an existing identity first is not skipped. Needs a "
+            "Postgres DATABASE_URL; exits 2 on a conflict or when the check cannot run. Never writes"
         ),
     )
     p.add_argument("--apply", action="store_true", help="ingest (else dry-run plan)")

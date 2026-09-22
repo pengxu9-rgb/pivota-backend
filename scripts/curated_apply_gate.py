@@ -21,13 +21,19 @@ protects nothing.
 WHAT THE LOG CAN AND CANNOT SAY (the runner fetches it with
 `gcloud logging read ... --format='value(textPayload,jsonPayload.message)'`):
   * `onboard_curated_brands.py` prints `primary ingestion: <json>` twice on an apply: the plan
-    inspection (`status: ready_to_apply`, no `applied` key), then — only when
-    `require_primary_apply` accepted the write — the post-apply report (`status: applied`).
-  * A partial apply RAISES (`PrimaryIngestionIncomplete` is a ValueError), prints `{"error": ...}`
-    to stderr and exits 2. That stderr line is bare JSON, which Cloud Run parses into
-    `jsonPayload` with no `message` key, so the fetch prints it as a BLANK row
+    inspection (`status: ready_to_apply`, no `applied` key), then the post-apply report — with
+    `status: applied` when `require_primary_apply` accepted the write, or `status: partial` /
+    `failed` when it refused it. Both post-apply shapes carry `applied`, `skipped_products` (one
+    row per planned PDP that did not land: `reason` = identity_skip / identity_resolution_incomplete
+    / insert_failed / product_group_failed, with the identity matcher and the conflicting row) and
+    `skipped_by_reason`. The verdict repeats those, so a stop names the rows and why.
+  * A refused apply then RAISES (`PrimaryIngestionIncomplete` is a ValueError), prints
+    `{"error": ...}` to stderr and exits 2. That stderr line is bare JSON, which Cloud Run parses
+    into `jsonPayload` with no `message` key, so the fetch prints it as a BLANK row
     (scripts/measure_checkout_preflight.py records the same). It can never be seen here; do not
-    add a check for it — a check that cannot fire reads as protection that does not exist.
+    add a check for it — a check that cannot fire reads as protection that does not exist. That is
+    why the CLI prints the refused report to STDOUT first. Logs from before 2026-09-22 have no
+    refused report at all, and read as `no_post_apply_report` as they always did.
   * What CAN distinguish a failed apply from a lost log line is the job's exit code, which the
     phase runner appends to the log as `JOB=<id> RC=<n>`. A non-zero RC is a failure; RC=0 with
     no report means the report line was lost by the logging sink, not that the write failed.
@@ -56,7 +62,15 @@ _MUST_BE_ZERO = (
     "product_groups_failed",
     "skus_identity_conflict",
     "pdps_skipped_identity",
+    "pdps_skipped_insert",
+    "products_fully_skipped",
     "offers_dropped_for_refused_sku",
+)
+
+# What the verdict repeats per skipped row: enough to act on without opening intake_identity_events.
+_SKIPPED_FIELDS = (
+    "product_key", "reason", "matcher", "detail", "conflict_product_key", "conflict_merchant_id",
+    "action", "error", "sqlstate",
 )
 
 _RUNNER_RC = re.compile(r"^JOB=\S+\s+RC=(\d+)\s*$")
@@ -77,8 +91,23 @@ def _host(url: str) -> str:
     return host[4:] if host.startswith("www.") else host
 
 
+def _skipped_rows(report: dict) -> list[dict]:
+    rows = report.get("skipped_products")
+    if not isinstance(rows, list):
+        return []
+    return [{k: row[k] for k in _SKIPPED_FIELDS if row.get(k) is not None} for row in rows if isinstance(row, dict)]
+
+
+def _skip_key(row: dict) -> str:
+    # Same bucket as primary_ingestion.skipped_reason_key; kept local so this gate stays importable
+    # without the service tree (it runs against a fetched log file, often off the service image).
+    reason = str(row.get("reason") or "unknown")
+    return f"{reason}:{row['matcher']}" if reason == "identity_skip" and row.get("matcher") else reason
+
+
 def evaluate_apply_log(text: str, *, domain: str | None = None) -> dict:
-    """Return `{ok, reasons, apply_status, readiness_status, runner_rc, product_keys, applied}`.
+    """Return `{ok, reasons, apply_status, readiness_status, runner_rc, product_keys, applied,
+    skipped_products, skipped_by_reason}`.
 
     `ok` is True only when the log carries exactly one post-apply report, every check on it passes,
     and the runner — when it said anything — said the job succeeded. Anything the log does not say
@@ -130,6 +159,8 @@ def evaluate_apply_log(text: str, *, domain: str | None = None) -> dict:
             "runner_rc": runner_rc,
             "product_keys": [],
             "applied": None,
+            "skipped_products": [],
+            "skipped_by_reason": {},
         }
 
     applied = report["applied"]
@@ -165,6 +196,13 @@ def evaluate_apply_log(text: str, *, domain: str | None = None) -> dict:
     for key in _MUST_BE_ZERO:
         if applied.get(key):
             reasons.append(key)
+    skipped = _skipped_rows(report)
+    skipped_tally: dict[str, int] = {}
+    for row in skipped:
+        skipped_tally[_skip_key(row)] = skipped_tally.get(_skip_key(row), 0) + 1
+    if skipped:
+        reasons.append("skipped_products")
+        reasons.extend(f"skipped:{key}" for key in skipped_tally)
 
     products = [p for p in (readiness.get("products") or []) if isinstance(p, dict)]
     if domain:
@@ -183,6 +221,8 @@ def evaluate_apply_log(text: str, *, domain: str | None = None) -> dict:
         "runner_rc": runner_rc,
         "product_keys": [p.get("product_key") for p in products],
         "applied": {k: applied.get(k) for k in ("pdps", "skus", "offers", "inci_written", *_MUST_BE_ZERO)},
+        "skipped_products": skipped,
+        "skipped_by_reason": skipped_tally,
     }
 
 

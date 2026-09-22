@@ -434,18 +434,32 @@ def audit_brand_fragmentation_guard_enabled(merchant_id: Optional[str] = None) -
     return True
 
 
+def brand_host_guard_key(fields: Dict[str, Any]) -> tuple:
+    """The (brand, host) the brand-host guard binds for these fields; either may be ''.
+
+    One definition, used by the finder below AND by the curated dry run's
+    prediction (scripts/onboard_curated_brands.py --check-brand-host-guard), so
+    the preview groups rows exactly the way the guard will look them up."""
+    brand = str(fields.get("brand") or "").strip()
+    host = str(fields.get("source_domain") or "").strip() or _host(fields.get("canonical_url"))
+    return brand, host
+
+
 async def _existing_brand_canonical_conflict(
-    merchant_id: str, fields: Dict[str, Any]
+    merchant_id: str, fields: Dict[str, Any], *, database: Any = None,
 ) -> Optional[Dict[str, Any]]:
     """Return an existing PUBLISHED canonical row for the SAME brand + host under a
     DIFFERENT merchant, or None. Conservative (case-insensitive exact brand + host
     match, published-only) to keep false-positives near-zero — a false skip would
-    drop a legitimately new brand's seed."""
-    brand = str(fields.get("brand") or "").strip()
-    host = str(fields.get("source_domain") or "").strip() or _host(fields.get("canonical_url"))
+    drop a legitimately new brand's seed.
+
+    `database` defaults to the process pool; a caller may pass a read-only handle
+    (one `fetch_one`) — the curated dry run does, to predict this guard's skips."""
+    brand, host = brand_host_guard_key(fields)
     if not brand or not host:
         return None
-    from db.database import database
+    if database is None:
+        from db.database import database
 
     row = await database.fetch_one(
         """

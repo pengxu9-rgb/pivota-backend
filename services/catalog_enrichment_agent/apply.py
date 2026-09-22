@@ -450,16 +450,51 @@ async def _derive_seed_seller_for_plan_row(seed: Dict[str, Any]) -> tuple[Option
     )
 
 
+def _note_pdp_refusal(
+    refusals: Optional[Dict[str, Dict[str, Any]]], pdp: Dict[str, Any], reason: str, **detail: Any,
+) -> None:
+    """Record WHY one planned PDP (and so its children) did not land, keyed by product_key.
+
+    The counters (`pdps_skipped_identity`, `pdps_skipped_insert`, `product_groups_failed`)
+    say how many; this says which and why, and it is what a partial apply report prints.
+    Without it the only per-row trace was a logger.info line that never reaches a Cloud
+    Run job's stdout — on 2026-09-18 five Haruharu Wonder rows at ohlolly.com were
+    deliberately skipped by the brand-host guard and read as swallowed DB writes. The
+    first refusal recorded for a product wins: a later stage never sees a refused row.
+    """
+    key = str(pdp.get("product_key") or "")
+    if refusals is None or not key or key in refusals:
+        return
+    refusals[key] = {
+        "product_key": key, "reason": reason,
+        **{k: v for k, v in detail.items() if v is not None},
+    }
+
+
+def _exc_detail(exc: BaseException) -> Dict[str, Any]:
+    """A refused row's error: class, SQLSTATE when the driver has one, bounded message."""
+    return {
+        "error": type(exc).__name__,
+        "sqlstate": getattr(exc, "sqlstate", None) or getattr(exc, "pgcode", None),
+        "message": str(exc)[:160] or None,
+    }
+
+
+def _skipped_products(refusals: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [refusals[k] for k in sorted(refusals)]
+
+
 async def _apply_pdp_identity_gate(
     pdp: Dict[str, Any], *, identity_gate_on: bool,
     group_targets: Optional[Dict[str, str]] = None,
+    refusals: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> bool:
     """Shared pre-insert step for a PDP row (both executors). Mutates `pdp` in
     place: canonicalizes the source barcode into the `gtin` match-attribute column
     (ADR-011 — never folded into content_key) and, when the identity gate is on,
     resolves-or-attaches the content identity. Returns True when the PDP should be
     inserted, False when the identity gate SKIPs it (brand conflict — review
-    enqueued)."""
+    enqueued) or cannot resolve it; `refusals`, when given, records which and why."""
     from services.intake_identity import (
         ACTION_SKIP,
         DOOR_CATALOG_ENRICHMENT,
@@ -497,21 +532,39 @@ async def _apply_pdp_identity_gate(
     failed = isinstance(detail, dict) and detail.get("reason") == "error"
     action = ident.get("action") if isinstance(ident, dict) else None
     content_key = ident.get("content_key") if isinstance(ident, dict) else None
+    matcher = evidence.get("matcher") if isinstance(evidence, dict) else None
     if (failed or action not in {ACTION_SKIP, ACTION_ATTACH, ACTION_FLAG, ACTION_MINT}
             or (action != ACTION_SKIP and (not isinstance(content_key, str) or not content_key.strip()))):
         logger.error("apply_ingest_plan: identity resolution incomplete for product_key=%s; refusing PDP and children",
                      pdp.get("product_key"))
+        _note_pdp_refusal(
+            refusals, pdp, "identity_resolution_incomplete",
+            action=action, matcher=matcher,
+            detail="resolver_error" if failed else ("no_content_key" if action in {
+                ACTION_ATTACH, ACTION_FLAG, ACTION_MINT} else "unknown_action"),
+            message=str(detail.get("error"))[:160] if failed and detail.get("error") else None,
+        )
         return False
     if action == ACTION_SKIP:
+        skip = detail if isinstance(detail, dict) else {}
         logger.info(
-            "apply_ingest_plan: identity gate skipped product_key=%s "
-            "(brand conflict — review enqueued)", pdp.get("product_key"),
+            "apply_ingest_plan: identity gate skipped product_key=%s matcher=%s "
+            "conflict_product_key=%s conflict_merchant_id=%s (review enqueued)",
+            pdp.get("product_key"), matcher,
+            skip.get("conflict_product_key"), skip.get("conflict_merchant_id"),
+        )
+        _note_pdp_refusal(
+            refusals, pdp, "identity_skip", matcher=matcher, detail=skip.get("reason"),
+            conflict_product_key=skip.get("conflict_product_key"),
+            conflict_merchant_id=skip.get("conflict_merchant_id"),
         )
         return False
     if str(pdp.get("product_key") or "").startswith("ext:retailer:") and group_targets is not None:
         target = ident.get("product_group_id")
         if not isinstance(target, str) or not target.strip():
             logger.error("primary retailer identity returned no group for product_key=%s", pdp.get("product_key"))
+            _note_pdp_refusal(refusals, pdp, "identity_resolution_incomplete",
+                              action=action, matcher=matcher, detail="no_product_group")
             return False
         group_targets[pdp["product_key"]] = target
     pdp["content_key"] = content_key
@@ -541,6 +594,7 @@ async def _ensure_singleton_pg(pdp: Dict[str, Any]) -> None:
 
 async def _ensure_primary_retailer_group(
     pdp: Dict[str, Any], *, database: Any, target: Optional[str] = None,
+    refusals: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> bool:
     """Persist primary retailer group evidence on the writer's own DB, or refuse.
 
@@ -573,6 +627,7 @@ async def _ensure_primary_retailer_group(
     except Exception as exc:  # noqa: BLE001 — counted refusal, never a success substitute
         logger.error("primary retailer group persistence failed for product_key=%s: %s",
                      pdp.get("product_key"), str(exc)[:200])
+        _note_pdp_refusal(refusals, pdp, "product_group_failed", **_exc_detail(exc))
         return False
 
 
@@ -1715,10 +1770,12 @@ async def _apply_ingest_plan(
     counts["product_groups_failed"] = 0
     counts["pdps_skipped_identity"] = 0
     skipped_product_keys: set = set()
+    refusals: Dict[str, Dict[str, Any]] = {}
 
     # 2. catalog_products — UPSERT by product_key.
     for pdp in pdps:
-        if not await _apply_pdp_identity_gate(pdp, identity_gate_on=identity_gate_on, group_targets=group_targets):
+        if not await _apply_pdp_identity_gate(pdp, identity_gate_on=identity_gate_on, group_targets=group_targets,
+                                              refusals=refusals):
             counts["pdps_skipped_identity"] += 1
             skipped_product_keys.add(pdp.get("product_key"))
             continue
@@ -1727,10 +1784,11 @@ async def _apply_ingest_plan(
             counts["pdps"] += 1
         except Exception as exc:  # noqa: BLE001
             logger.exception("insert pdp failed for product_key=%s — %s", pdp.get("product_key"), exc)
+            _note_pdp_refusal(refusals, pdp, "insert_failed", **_exc_detail(exc))
 
         if str(pdp.get("product_key") or "").startswith("ext:retailer:"):
             if not await _ensure_primary_retailer_group(
-                pdp, database=database, target=group_targets.get(pdp["product_key"]),
+                pdp, database=database, target=group_targets.get(pdp["product_key"]), refusals=refusals,
             ):
                 counts["product_groups_failed"] += 1
                 skipped_product_keys.add(pdp.get("product_key"))
@@ -1824,6 +1882,7 @@ async def _apply_ingest_plan(
         )
     )
 
+    counts["skipped_products"] = _skipped_products(refusals)
     await write_writer_audit_log(audit)
     logger.info("apply_ingest_plan applied: %s", counts)
     return counts
@@ -1876,20 +1935,30 @@ async def _apply_ingest_plan_batched(
     group_targets: Dict[str, str] = {}
     counts["product_groups_failed"] = 0
     skipped_product_keys: set = set()
+    refusals: Dict[str, Dict[str, Any]] = {}
 
     # 2. catalog_products — run the per-row identity gate first (it may SKIP rows
     #    and may itself round-trip when enabled), then bulk-upsert the survivors.
     insertable_pdps = []
     for pdp in pdps:
-        if not await _apply_pdp_identity_gate(pdp, identity_gate_on=identity_gate_on, group_targets=group_targets):
+        if not await _apply_pdp_identity_gate(pdp, identity_gate_on=identity_gate_on, group_targets=group_targets,
+                                              refusals=refusals):
             counts["pdps_skipped_identity"] += 1
             skipped_product_keys.add(pdp.get("product_key"))
             continue
         insertable_pdps.append(pdp)
 
+    def _note_pdp_insert_failure(row: Dict[str, Any], exc: BaseException) -> None:
+        # Replaces bulk_upsert's generic per-row log line, so it logs as that did.
+        logger.error("bulk_upsert[pdps] row skipped (product_key=%s) — %s", row.get("product_key"), str(exc)[:200])
+        _note_pdp_refusal(refusals, row, "insert_failed", **_exc_detail(exc))
+
     counts["pdps"], counts["pdps_skipped_insert"], pdp_skipped_rows = await bulk_upsert(
-        database, _PDP_UPSERT_SQL, insertable_pdps, label="pdps"
+        database, _PDP_UPSERT_SQL, insertable_pdps, label="pdps", on_row_error=_note_pdp_insert_failure,
     )
+    for row in pdp_skipped_rows:
+        # A row rejected before bind never reaches on_row_error; it was still not written.
+        _note_pdp_refusal(refusals, row, "insert_failed")
     # Orphan prevention: a PDP whose insert failed joins the skip set so its
     # children are excluded from every later stage (no fake offers/skus/seeds).
     failed_pdp_keys = {r.get("product_key") for r in pdp_skipped_rows}
@@ -1906,7 +1975,7 @@ async def _apply_ingest_plan_batched(
     for pdp in inserted_pdps:
         if str(pdp.get("product_key") or "").startswith("ext:retailer:"):
             if not await _ensure_primary_retailer_group(
-                pdp, database=database, target=group_targets.get(pdp["product_key"]),
+                pdp, database=database, target=group_targets.get(pdp["product_key"]), refusals=refusals,
             ):
                 counts["product_groups_failed"] += 1
                 skipped_product_keys.add(pdp.get("product_key"))
@@ -2001,6 +2070,7 @@ async def _apply_ingest_plan_batched(
         )
     )
 
+    counts["skipped_products"] = _skipped_products(refusals)
     await write_writer_audit_log(audit)
     logger.info("apply_ingest_plan(batch) applied: %s", counts)
     return counts
