@@ -8,11 +8,35 @@ from typing import Any, Dict
 from services.category_path_aliases import resolve
 
 
+#: The apply counters that explain a shortfall. Printed with the report, never only logged.
+APPLY_GAP_COUNTERS = (
+    "pdps_skipped_identity", "pdps_skipped_insert", "products_fully_skipped", "product_groups_failed",
+    "skus_identity_conflict", "offers_dropped_for_refused_sku", "offers_skipped", "offers_skipped_insert",
+)
+
+
+def skipped_reason_key(row: Dict[str, Any]) -> str:
+    """`identity_skip:brand_host_fragmentation`, `insert_failed`, ... — one tally bucket per cause."""
+    reason = str(row.get("reason") or "unknown")
+    matcher = row.get("matcher")
+    return f"{reason}:{matcher}" if reason == "identity_skip" and matcher else reason
+
+
+def skipped_by_reason(rows: Any) -> Dict[str, int]:
+    tally: Dict[str, int] = {}
+    for row in rows or []:
+        if isinstance(row, dict):
+            key = skipped_reason_key(row)
+            tally[key] = tally.get(key, 0) + 1
+    return tally
+
+
 class PrimaryIngestionIncomplete(ValueError):
     def __init__(self, report: Dict[str, Any]):
         self.report = report
         # Queue.error is capped at 500 chars. Preserve reasons and core counts;
-        # verbose product keys/adoption counters remain available on report.
+        # verbose product keys/adoption counters and the per-row `skipped_products`
+        # remain available on report (the CLI prints it whole before raising).
         compact = {
             k: report[k]
             for k in ("status", "reasons", "planned", "missing", "unresolved_category_count", "skipped_records")
@@ -20,7 +44,11 @@ class PrimaryIngestionIncomplete(ValueError):
         }
         if "applied" in report:
             compact["applied"] = {k: report["applied"].get(k, 0) for k in ("pdps", "skus", "offers")}
-        super().__init__("primary_ingestion_incomplete: " + json.dumps(compact, sort_keys=True))
+        # The per-row reasons are deliberately NOT in this message: every prod caller reaches it
+        # through PrimaryReadinessIncomplete, which keeps only its first 300 chars, and a tally
+        # there cuts `status` out of Queue.error. The CLI prints the full report to stdout instead.
+        message = "primary_ingestion_incomplete: " + json.dumps(compact, sort_keys=True)
+        super().__init__(message)
 
 
 def inspect_primary_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
@@ -91,11 +119,18 @@ def require_primary_apply(plan_report: Dict[str, Any], applied: Dict[str, Any]) 
     deduped = max(0, int(applied.get("skus_deduped_same_identity") or 0))
     unexplained_skus = max(0, missing["skus"] - deduped)
     incomplete = int(applied.get("product_groups_failed") or 0) or missing["pdps"] or missing["offers"] or unexplained_skus or (expected["skus"] and not counts["skus"])
+    applied_counts = dict(applied)
+    # Which planned products did not land, and why — hoisted out of `applied` so the
+    # report names them beside `missing` instead of burying a list among counters.
+    skipped = [r for r in (applied_counts.pop("skipped_products", None) or []) if isinstance(r, dict)]
     report = {
         **plan_report,
         "status": "partial" if incomplete else "applied",
-        "applied": dict(applied),
+        "applied": applied_counts,
         "missing": missing,
+        "skipped_products": skipped,
+        "skipped_by_reason": skipped_by_reason(skipped),
+        "apply_gap_counters": {k: applied_counts.get(k) for k in APPLY_GAP_COUNTERS if k in applied_counts},
     }
     if incomplete:
         report["reasons"] = ["incomplete_primary_writes"]
