@@ -1447,7 +1447,9 @@ def _pattern_matches(text: Optional[str]) -> int:
 # product before using the entry. Shelves that were NOT one class are deliberately absent:
 # eyurs "Cotton Pads" (an accessory the toner pattern catches through "pad"), "Foot Masks"
 # (body care), ohlolly "Exfoliator" (body scrubs + facial peel pads), sokoglam "physical" /
-# "chemical" (exfoliant pads despite the names).
+# "chemical" (exfoliant pads despite the names). Re-read 2026-09-22 and also left out: eyurs
+# "Exfoliators" (a peel-off mask among the exfoliants) and "Wrinkle Patch" (an acne patch among
+# the wrinkle patches).
 _MEASURED_HOST_PRODUCT_TYPES = {
     "eyurs.com": {
         "sheet masks": "beauty/skincare/treat/mask",
@@ -1465,6 +1467,12 @@ _MEASURED_HOST_PRODUCT_TYPES = {
         "gel cleansers": "beauty/skincare/cleanse/cleanser",
         "toners": "beauty/skincare/tone/toner",
         "suncream": "beauty/skincare/sun/sunscreen",
+        # Added 2026-09-22 from a re-read of every product on eyurs.com (433). Both types name TWO
+        # pattern families, so the evidence policy reads them as ambiguous; every product on each
+        # shelf was one class: four rinse-off / clay masks, and three acne patches. (The per-product title
+        # check still sets the shelf aside for "Wash Off Pack": "wash" names the cleanser leaf.)
+        "masks, exfoliators": "beauty/skincare/treat/mask",
+        "acne pimple patch": "beauty/skincare/treat/treatment",
     },
     "ohlolly.com": {
         # "Wash off mask" is AMBIGUOUS to the regexes (cleanser "wash" + mask); every product
@@ -1476,6 +1484,8 @@ _MEASURED_HOST_PRODUCT_TYPES = {
     },
     "sokoglam.com": {
         "lip balms": "beauty/makeup/lip/balm",
+        # 2026-09-22, every product on sokoglam.com (564): nine blemish patches and spot treatments.
+        "spot": "beauty/skincare/treat/treatment",
     },
 }
 

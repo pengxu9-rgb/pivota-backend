@@ -37,6 +37,14 @@ def evidence_only(product_type, title, flag_path="beauty"):
     ("ohlolly.com", "Sleeping Pack", "Cosrx Ultimate Nourishing Rice Overnight Spa Mask", "beauty/skincare/treat/mask"),
     ("ohlolly.com", "Sun Care", "Isntree Hyaluronic Acid Daily Sun Gel", "beauty/skincare/sun/sunscreen"),
     ("sokoglam.com", "Lip Balms", "Phyto-Glow Lip Balm SPF 45", "beauty/makeup/lip/balm"),
+    # 2026-09-22 re-read.
+    ("eyurs.com", "Masks, Exfoliators", "Round Lab 1025 Dokdo Mud Pack 100ml (Wash Off Mask)", "beauty/skincare/treat/mask"),
+    ("eyurs.com", "Masks, Exfoliators", "Isntree Mugwort Calming Clay Mask", "beauty/skincare/treat/mask"),
+    ("eyurs.com", "Acne Pimple Patch", "Cosrx AC Collection Acne Patch – Heal & Protect Active Breakouts", "beauty/skincare/treat/treatment"),
+    ("eyurs.com", "Acne Pimple Patch", "Cosrx Acne Pimple Master Patch", "beauty/skincare/treat/treatment"),
+    ("sokoglam.com", "Spot", "Spot the Difference Blemish Treatment", "beauty/skincare/treat/treatment"),
+    ("sokoglam.com", "Spot", "Mighty Patch - The Original", "beauty/skincare/treat/treatment"),
+    ("sokoglam.com", "Spot", "A-Clear Soothing Pink Eraser", "beauty/skincare/treat/treatment"),
 ])
 def test_a_measured_shelf_resolves_its_products(domain, ptype, title, want):
     assert resolve(ptype, title, domain) == (want, MEASURED)
@@ -95,6 +103,12 @@ ADVERSARIAL = [
     ("Scrubs", "Coconut Body Scrub"),
     ("Cotton Pads", "Pyunkang Yul 1/3 Cotton Pads (160pcs)"),
     ("Foot Masks", "PUREDERM Shiny & Soft Foot Peeling Mask (1 Pair)"),
+    # Re-read 2026-09-22 and deliberately NOT listed: each shelf held more than one class.
+    ("Exfoliators", "APRILSKIN Real Calendula Peel Off Pack (100g)"),
+    ("Exfoliators", "Cosrx BHA Blackhead Power Liquid (100ml)"),
+    ("Wrinkle Patch", "Anua Triple Acid Spot Care Microdart Patch – Exfoliate & Calm Spots"),
+    ("Physical", "AHA-BHA-PHA 30 Days Miracle Truecica Clear Pad"),
+    ("Exfoliator", "Tiela Perfume Therapy Body Scrub Shine"),
 ]
 
 
@@ -191,3 +205,26 @@ def test_the_planner_never_lets_a_shelf_challenge_a_stored_leaf():
                                  "source_url": "https://eyurs.com/products/x", "observed_at": "2026-09-18T00:00:00Z"}}
     plan = plan_category_repair([row], review_existing_leaves=True)
     assert plan["proposed_changes"] == 0
+
+
+@pytest.mark.parametrize("domain,ptype,title", [
+    # The title names a DIFFERENT leaf than the new shelf: the shelf steps aside.
+    ("eyurs.com", "Acne Pimple Patch", "NEOGEN Dermalogy A-Clear Soothing Clear Spot Patch"),  # "spot patch" -> mask
+    ("sokoglam.com", "Spot", "Soft Shield Pimple Patch"),                                  # "pimple patch" -> mask
+    ("sokoglam.com", "Spot", "Mineral Sunscreen SPF 50"),                                   # invented
+    ("eyurs.com", "Masks, Exfoliators", "Gentle Peeling Gel"),                              # invented
+    # Real: "wash" is the cleanser pattern, so the title names a different leaf and the shelf yields.
+    ("eyurs.com", "Masks, Exfoliators", "AXIS-Y Mugwort Pore Clarifying Wash Off Pack"),
+    # Another body area on a face shelf.
+    ("sokoglam.com", "Spot", "Body Acne Spot Treatment"),                                   # invented
+    ("eyurs.com", "Masks, Exfoliators", "Argan Hair Mask"),                                 # invented
+])
+def test_the_new_shelves_step_aside_for_a_title_that_names_another_class(domain, ptype, title):
+    # The shelf contributes nothing: the answer is exactly the evidence policy's.
+    assert resolve(ptype, title, domain) == evidence_only(ptype, title)
+
+
+@pytest.mark.parametrize("domain", ["ohlolly.com", "unknown.com"])
+@pytest.mark.parametrize("ptype", ["Spot", "Acne Pimple Patch", "Masks, Exfoliators"])
+def test_the_new_shelves_mean_nothing_on_a_host_that_did_not_file_them(domain, ptype):
+    assert resolve(ptype, "Cosrx Acne Pimple Master Patch", domain) == evidence_only(ptype, "Cosrx Acne Pimple Master Patch")
