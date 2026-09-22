@@ -1773,11 +1773,14 @@ async def ingest_standard_products(
                 offer_id = make_catalog_offer_id(sku_key, "default", "internal_merchant")
                 list_price = compare_at if compare_at and variant_price and compare_at > variant_price else variant_price
                 merchant_effective_price = variant_price
-                # The gate's stock verdict, not quantity alone: an untracked or keep-selling Shopify
-                # variant is `available` at quantity 0, and the eligibility gate ships it (see
-                # standard_variant_in_stock). Writing it out_of_stock here made agent_pdp_view rank a
-                # sellable buy-here offer behind every retailer. `available` absent (legacy cache
-                # rows, other platforms) -> quantity, exactly as before.
+                # The gate's stock verdict for a variant, not quantity alone: an untracked or
+                # keep-selling Shopify variant is `available` at quantity 0, and the eligibility gate
+                # ships it (see standard_variant_in_stock). Writing it out_of_stock here made
+                # agent_pdp_view rank a sellable buy-here offer behind every retailer. `available`
+                # absent (legacy cache rows, non-Shopify adapters, the no-variant fallback) ->
+                # quantity, exactly as before. For a product with no variants the gate reads
+                # product.in_stock (quantity AND orderable) instead; that case is unchanged here, and
+                # a non-orderable product is written merchant_view_only below.
                 availability = (
                     "in_stock"
                     if standard_variant_in_stock(

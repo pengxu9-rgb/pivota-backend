@@ -137,12 +137,14 @@ def _in_stock(availability: Any) -> bool:
 # read one frozenset would be the wrong way round.
 #
 # NOT THE REPO'S RAW-STRING VOCABULARY. utils.availability_vocabulary owns "is this out of stock"
-# for raw platform/feed strings (phrases, schema.org IRIs, `discontinued`, `reserved`, ...), and
-# the writers that feed catalog_offers normalize through it, so the column holds only its
-# canonical output: prod 2026-09-22, all 33,344 rows are in_stock / out_of_stock / `unknown`.
-# This set is the literal subset SQL can bind (`= ANY(:unavailable)`) to read those STORED
-# values; a test pins that every token in it is out of stock to the owner. Do not point a reader
-# of raw strings at this set — use the owner.
+# for raw platform/feed strings (phrases, schema.org IRIs, `discontinued`, `reserved`, ...). This
+# set is the literal subset SQL can bind (`= ANY(:unavailable)`) to read STORED catalog_offers
+# values, and it is only complete while those values are canonical. They are TODAY — prod
+# 2026-09-22, all 33,344 rows are in_stock / out_of_stock / `unknown` — but that is a measured
+# fact, not an enforced one: most writers emit those literals, and
+# services/external_offer_dual_write copies a seed's availability string as-is, so a raw
+# "sold out" landing there would rank as sellable. A test pins that every token here is out of
+# stock to the owner. Do not point a reader of raw strings at this set — use the owner.
 #
 # UNKNOWN IS NOT OUT OF STOCK. `unknown` (the column's server default), NULL, empty or any value
 # not in this set ranks WITH the in-stock offers, by price, and never behind them. Two reasons, both measured rather than preferred:

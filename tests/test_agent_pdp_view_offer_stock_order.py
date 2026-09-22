@@ -170,11 +170,12 @@ def test_the_vocabulary_is_exactly_the_one_offers_resolve_ranks_by() -> None:
 
 
 def test_the_offer_set_is_a_subset_of_the_repo_vocabulary_owner() -> None:
-    """utils.availability_vocabulary owns "is this out of stock" for RAW strings, and every writer
-    that feeds catalog_offers normalizes through it — prod 2026-09-22, all 33,344 rows hold only
-    its canonical output (in_stock / out_of_stock) or `unknown` (no verdict). This set is the
-    literal subset SQL can bind to read those stored values. Pin that relationship: every token
-    here is out of stock to the owner, and the owner's canonical out-of-stock value is here."""
+    """utils.availability_vocabulary owns "is this out of stock" for RAW strings. This set is the
+    literal subset SQL can bind to read STORED catalog_offers values, which prod 2026-09-22 holds
+    only as the owner's canonical output (in_stock / out_of_stock) or `unknown` (no verdict) —
+    measured, not enforced (external_offer_dual_write copies a seed's string as-is). Pin the
+    relationship: every token here is out of stock to the owner, and the owner's canonical
+    out-of-stock value is here."""
     from utils.availability_vocabulary import OUT_OF_STOCK, is_out_of_stock, normalize_availability
 
     assert all(is_out_of_stock(token) for token in OFFER_UNAVAILABLE_AVAILABILITIES)
