@@ -529,9 +529,19 @@ fails if a second route picks it up). It:
    published certs (`alg: none` and HS256 are refused by the library's algorithm allow-list);
    `iss ∈ {accounts.google.com, https://accounts.google.com}`; `aud == OPS_GATEWAY_OIDC_AUDIENCE`
    exactly; `email_verified` is boolean **true**; `email ∈ OPS_GATEWAY_SERVICE_ACCOUNTS`
-   (lower-cased compare); `exp`/`iat` inside a **10 s** clock skew. The certs fetch is wrapped so
-   it cannot use the library's 120 s default.
-3. **Fails closed on everything else**, and the refusal is **byte-identical** to what a bad admin
+   (lower-cased compare); `exp`/`iat` inside a **10 s** clock skew.
+3. **Costs an anonymous caller nothing.** google-auth does *not* cache certificates — it GETs
+   `googleapis.com/oauth2/v1/certs` on every verification, *before* it parses the token — so on a
+   public route any stranger could steer our outbound traffic one request at a time. The module
+   therefore parses the JWS header first (size, compact form, `alg: RS256`, a `kid`) and refuses
+   before any fetch; caches the document for `OPS_GATEWAY_OIDC_CERTS_TTL_SECONDS`; allows an
+   unknown-`kid` refresh at most once per 60 s process-wide; caps fetches at 10 per minute
+   process-wide; and hands the library a transport that replays the cached bytes and can reach
+   nothing.
+4. **Never blocks the event loop.** The verification runs in a threadpool under a 2 s
+   `asyncio.wait_for`, because a blocking certs fetch on the loop stalls every other request this
+   worker is serving — on a public route, remotely triggerable.
+5. **Fails closed on everything else**, and the refusal is **byte-identical** to what a bad admin
    JWT gets — same status, same body — so nothing about this path is discoverable from a
    response. The reason is a rate-limited `warning` carrying a short CODE only. The token is
    never logged; the accepted service-account email is logged at **debug** only.
@@ -551,6 +561,52 @@ fails if a second route picks it up). It:
 **Both backend envs, or neither.** Either one alone reads as DISABLED — an audience-less or an
 allow-list-less verification is an open door, so the half-configured state refuses rather than
 admits. With both unset (the shipped default) this route behaves exactly as it did before.
+
+Optional third env: `OPS_GATEWAY_OIDC_CERTS_TTL_SECONDS` (default `3600`, clamped to
+`[60, 86400]`) — how long Google's signing certificates are reused. Leave it alone unless Google
+rotates unusually; `0` is not reachable, because a TTL of 0 restores the unbounded-fetch
+behaviour this route was fixed for.
+
+### The audience is NORMALISED, and both sides normalise it the same way
+
+A first review of this change found the two sides disagreeing. The gateway's `cloudRunAudience()`
+lower-cases the host, drops a default `:443` and folds one trailing slash to the origin; this
+side originally only `.strip()`ed. So an operator who pasted **the same string**
+`https://api.pivota.cc/` into both envs got a 401 on every read — and a 401 fails open on the
+gateway, so the gate disarmed **silently**. Both sides now apply the identical rule.
+
+**The rule: a bare https ORIGIN.** https only; no userinfo; no path beyond `/`; no query; no
+fragment; the host is lower-cased; a default `:443` is dropped; one trailing slash folds away.
+
+| written into BOTH envs | what both sides use | accepted? |
+|---|---|---|
+| `https://api.pivota.cc` | `https://api.pivota.cc` | ✅ |
+| `https://api.pivota.cc/` | `https://api.pivota.cc` | ✅ |
+| `https://API.PIVOTA.CC` | `https://api.pivota.cc` | ✅ |
+| `https://api.pivota.cc:443` | `https://api.pivota.cc` | ✅ |
+| `http://api.pivota.cc` | — | ❌ disabled |
+| `api.pivota.cc` | — | ❌ disabled |
+| `foo` | — | ❌ disabled (the first cut accepted this verbatim) |
+| `https://api.pivota.cc/ops` | — | ❌ disabled |
+| `https://api.pivota.cc:8443` | — | ❌ disabled |
+
+A value that was **set and refused** is DISABLED, not passed through, and it is logged once per
+interval as `audience_env_invalid:<value>` — otherwise a typo in this env is indistinguishable
+from never having set it, and the symptom of both is "the gate quietly does nothing".
+
+### Rolling this back
+
+**Unset both backend envs** (`OPS_GATEWAY_OIDC_AUDIENCE` and `OPS_GATEWAY_SERVICE_ACCOUNTS`).
+The route immediately reverts to plain `require_admin`. The gateway then gets a **401** on every
+read, which — by its own fail-open rule — means it **falls back to `PIVOTA_OPS_ADMIN_TOKEN` if
+that is still set, and otherwise keeps its previous behaviour**. Nothing refuses a purchase
+either way.
+
+> **That is exactly why `PIVOTA_OPS_ADMIN_TOKEN` should stay set on the gateway until the
+> identity rail has been observed working.** Rolling the backend back with the static token
+> already removed leaves the gate reading nothing — inert, not broken, but inert silently. If
+> you want the gateway to stop trying the identity rail too, unset `PIVOTA_OPS_OIDC_AUDIENCE`
+> there; that is a second revision and is not needed for the backend rollback to be safe.
 
 > **⚠️ BACKEND FIRST, THEN THE GATEWAY.** Setting the gateway's audience first means the gateway
 > sends an identity token to a backend that does not yet accept one: every read 401s, and because

@@ -117,26 +117,50 @@ def mint(private_pem):
     return _mint
 
 
-@pytest.fixture(autouse=True)
-def offline_certs(monkeypatch, public_pem):
-    """Google's certs, served from this process. Nothing in this file touches the network."""
-    from google.oauth2 import id_token as google_id_token
+class _CertsServer:
+    """Google's certs document, served from this process — and COUNTED.
 
-    monkeypatch.setattr(
-        google_id_token, "_fetch_certs", lambda request, certs_url: {KEY_ID: public_pem},
-    )
-    # A transport is still resolved by `certs_request()`; pin it to something that raises, so
-    # that if the patch above ever stopped holding this file fails loudly rather than dialling
-    # out to Google from a unit test.
-    monkeypatch.setattr(gw, "_certs_request", _ExplodingRequest(), raising=False)
-    gw._reset_warn_state_for_test()
-    yield
-    gw._reset_warn_state_for_test()
+    Counting matters as much as serving. google-auth does NOT cache, and its fetch happens BEFORE
+    the token is parsed, so on a `--allow-unauthenticated` route the number of outbound requests
+    an ANONYMOUS caller can cause is a security property, not a performance one. Every fetch in
+    this file goes through here, so "N requests made M fetches" is a measurement.
+    """
+
+    def __init__(self, certs):
+        self.certs = dict(certs)
+        self.calls = []
+        self.failure = None
+
+    def __call__(self, url):
+        self.calls.append(url)
+        if self.failure is not None:
+            raise self.failure
+        return dict(self.certs)
+
+    @property
+    def count(self):
+        return len(self.calls)
 
 
 class _ExplodingRequest:
     def __call__(self, *args: Any, **kwargs: Any) -> Any:  # pragma: no cover - must never run
-        raise AssertionError("the certs transport was used — _fetch_certs patch did not hold")
+        raise AssertionError("the OUTBOUND certs transport was used — the seam did not hold")
+
+
+@pytest.fixture(autouse=True)
+def certs(monkeypatch, public_pem):
+    """The module's ONE network seam, replaced. Nothing in this file touches the network."""
+    server = _CertsServer({KEY_ID: public_pem})
+    monkeypatch.setattr(gw, "_http_fetch_certs", server)
+    # The OUTBOUND transport is still resolved by `certs_request()`; pin it to something that
+    # raises, so that if the seam above ever stopped being the only one, this file fails loudly
+    # rather than dialling out to Google from a unit test.
+    monkeypatch.setattr(gw, "_certs_request", _ExplodingRequest(), raising=False)
+    gw._reset_warn_state_for_test()
+    gw._reset_certs_cache_for_test()
+    yield server
+    gw._reset_warn_state_for_test()
+    gw._reset_certs_cache_for_test()
 
 
 @pytest.fixture(autouse=True)
@@ -590,13 +614,8 @@ async def test_an_exception_inside_verification_fails_closed(app, mint, monkeypa
     await _assert_refused_like_a_bad_admin_jwt(app, mint())
 
 
-async def test_a_certs_fetch_failure_fails_closed(app, mint, monkeypatch):
-    from google.oauth2 import id_token as google_id_token
-
-    def _unreachable(request, certs_url):
-        raise OSError("connection refused")
-
-    monkeypatch.setattr(google_id_token, "_fetch_certs", _unreachable)
+async def test_a_certs_fetch_failure_fails_closed(app, mint, certs):
+    certs.failure = OSError("connection refused")
     await _assert_refused_like_a_bad_admin_jwt(app, mint())
 
 
@@ -660,9 +679,11 @@ def _good_claims(**overrides: Any) -> Dict[str, Any]:
     return {k: v for k, v in claims.items() if v is not _OMIT}
 
 
-async def test_conjunct_control_the_stubbed_claims_are_otherwise_accepted(stub_verify):
+async def test_conjunct_control_the_stubbed_claims_are_otherwise_accepted(stub_verify, mint):
+    # A REAL token shape: the header pre-check and the certs lookup are upstream of the library
+    # and must still be satisfied. Only the library's VERDICT is stubbed.
     stub_verify(_good_claims())
-    identity = gw.verify_gateway_identity("anything")
+    identity = gw.verify_gateway_identity(mint())
     assert identity["email"] == GATEWAY_SA
     assert identity["role"] == "gateway_identity"
 
@@ -685,32 +706,322 @@ async def test_conjunct_control_the_stubbed_claims_are_otherwise_accepted(stub_v
         ({"email": 12345}, "no_email"),
     ],
 )
-async def test_each_conjunct_refuses_on_its_own(stub_verify, overrides, expected_code):
+async def test_each_conjunct_refuses_on_its_own(stub_verify, mint, overrides, expected_code):
     stub_verify(_good_claims(**overrides))
     with pytest.raises(gw._Refused) as refusal:
-        gw.verify_gateway_identity("anything")
+        gw.verify_gateway_identity(mint())
     assert refusal.value.code == expected_code
 
 
-async def test_a_non_mapping_from_the_library_is_refused(stub_verify):
+async def test_a_non_mapping_from_the_library_is_refused(stub_verify, mint):
     stub_verify(["not", "a", "mapping"])
     with pytest.raises(gw._Refused) as refusal:
-        gw.verify_gateway_identity("anything")
+        gw.verify_gateway_identity(mint())
     assert refusal.value.code == "claims_not_mapping"
 
 
-async def test_the_library_is_called_with_the_configured_audience_and_the_skew(monkeypatch):
+async def test_the_library_is_called_with_the_configured_audience_and_the_skew(monkeypatch, mint):
     from google.oauth2 import id_token as google_id_token
 
     seen = {}
 
     def _verify(token, request, audience=None, clock_skew_in_seconds=0):
-        seen.update({"audience": audience, "skew": clock_skew_in_seconds, "token": token})
+        seen.update({"audience": audience, "skew": clock_skew_in_seconds,
+                     "token": token, "request": request})
         return _good_claims()
 
     monkeypatch.setattr(google_id_token, "verify_oauth2_token", _verify)
-    gw.verify_gateway_identity("the-token")
+    token = mint()
+    gw.verify_gateway_identity(token)
     # The AUDIENCE goes to the library too, so the library's own compare is armed as well as ours.
     assert seen["audience"] == AUDIENCE
     assert seen["skew"] == gw.CLOCK_SKEW_SECONDS <= 10
-    assert seen["token"] == "the-token"
+    assert seen["token"] == token
+    # And the transport it is handed CANNOT reach the network: it replays the cached document.
+    assert isinstance(seen["request"], gw._ReplayCertsRequest)
+
+
+# ===========================================================================
+# REVIEW FINDING P1-1 — OUTBOUND REQUESTS AN ANONYMOUS CALLER CAN CAUSE
+#
+# google-auth does NOT cache certs. `_fetch_certs` issues an unconditional GET on every
+# `verify_oauth2_token`, and it does so BEFORE `jwt.decode` looks at the token. On a
+# `--allow-unauthenticated` service that composes into: any stranger makes this backend call
+# googleapis, once per request they send, by posting `aaaa.bbbb.cccc`.
+#
+# These cases MEASURE the fetch count. That is the only honest way to state the property — a
+# docstring claiming the library caches is exactly what the first cut had.
+# ===========================================================================
+
+async def test_many_valid_reads_cause_exactly_one_certs_fetch(app, mint, certs):
+    for _ in range(5):
+        assert (await _get(app, "/probe", mint())).status_code == 200
+    assert certs.count == 1, f"5 valid reads made {certs.count} outbound fetches"
+
+
+@pytest.mark.parametrize("junk", [
+    "aaaa.bbbb.cccc",              # the measured attack: three base64-ish segments
+    "not-a-token",
+    "a.b",
+    "a.b.c.d",
+    "...",
+    "x." + "!" * 40 + ".z",        # an undecodable header
+])
+async def test_an_anonymous_junk_token_causes_ZERO_certs_fetches(app, certs, junk):
+    await _assert_refused_like_a_bad_admin_jwt(app, junk)
+    assert certs.count == 0, f"{junk!r} made {certs.count} outbound fetches"
+
+
+async def test_alg_none_and_hs256_cause_zero_certs_fetches(app, public_pem, certs):
+    import hashlib
+    import hmac
+
+    payload = _b64(json.dumps(_claims()).encode())
+    none_header = _b64(json.dumps({"alg": "none", "typ": "JWT", "kid": KEY_ID}).encode())
+    await _assert_refused_like_a_bad_admin_jwt(app, f"{none_header}.{payload}.{_b64(b'')}")
+
+    hs_header = _b64(json.dumps({"alg": "HS256", "typ": "JWT", "kid": KEY_ID}).encode())
+    signature = _b64(hmac.new(public_pem.encode(), f"{hs_header}.{payload}".encode(), hashlib.sha256).digest())
+    await _assert_refused_like_a_bad_admin_jwt(app, f"{hs_header}.{payload}.{signature}")
+
+    # The library WOULD have refused both — after paying for a fetch each. The pre-check is a
+    # cost control, not a second security check, and this is the cost it controls.
+    assert certs.count == 0
+
+
+async def test_a_token_with_no_kid_causes_zero_certs_fetches(app, private_pem, certs):
+    from google.auth import crypt
+    from google.auth import jwt as google_jwt
+
+    # Correctly signed, correct alg — but no `kid`, so no certs entry could ever match it.
+    # The signer carries no key id, which is what keeps `encode` from adding one.
+    signer = crypt.RSASigner.from_string(private_pem, None)
+    token = google_jwt.encode(signer, _claims(), header={"alg": "RS256"}).decode()
+    assert json.loads(base64.urlsafe_b64decode(token.split(".")[0] + "==")).get("kid") is None
+    await _assert_refused_like_a_bad_admin_jwt(app, token)
+    assert certs.count == 0
+
+
+async def test_an_oversized_token_causes_zero_certs_fetches(app, mint, certs):
+    await _assert_refused_like_a_bad_admin_jwt(app, mint() + "A" * (gw.MAX_TOKEN_BYTES + 1))
+    assert certs.count == 0
+
+
+async def test_an_unknown_kid_refreshes_ONCE_and_then_refuses_without_fetching(app, private_pem, certs):
+    from google.auth import crypt
+    from google.auth import jwt as google_jwt
+
+    # Prime the cache with a good read, so the document in hand is FRESH.
+    signer = crypt.RSASigner.from_string(private_pem, KEY_ID)
+    good = google_jwt.encode(signer, _claims()).decode()
+    assert (await _get(app, "/probe", good)).status_code == 200
+    assert certs.count == 1
+
+    # `encode` stamps `kid` from the SIGNER after the caller's header, so the kid has to come
+    # from a signer built with it — passing it in `header` is silently overwritten.
+    stranger_signer = crypt.RSASigner.from_string(private_pem, "rotated-kid")
+    stranger = google_jwt.encode(stranger_signer, _claims()).decode()
+    await _assert_refused_like_a_bad_admin_jwt(app, stranger)
+    assert certs.count == 2, "an unknown kid earns exactly one refresh"
+
+    # And then nothing, however many times it is repeated inside the interval. This is the
+    # attacker's cheapest lever on our egress and it is bounded.
+    for _ in range(8):
+        await _assert_refused_like_a_bad_admin_jwt(app, stranger)
+    assert certs.count == 2, f"a repeated unknown kid made {certs.count} fetches"
+
+
+async def test_a_kid_rotation_after_the_ttl_costs_exactly_two_fetches(app, private_pem, certs, monkeypatch):
+    from google.auth import crypt
+    from google.auth import jwt as google_jwt
+
+    monkeypatch.setenv(gw.CERTS_TTL_SECONDS_ENV, "60")
+    signer = crypt.RSASigner.from_string(private_pem, KEY_ID)
+    assert (await _get(app, "/probe", google_jwt.encode(signer, _claims()).decode())).status_code == 200
+    assert certs.count == 1
+
+    # Time passes past the TTL, and Google has rotated to a new kid.
+    base = time.monotonic()
+    monkeypatch.setattr(gw.time, "monotonic", lambda: base + 61.0)
+    rotated_signer = crypt.RSASigner.from_string(private_pem, "kid-2")
+    certs.certs = {"kid-2": certs.certs[KEY_ID]}
+    rotated = google_jwt.encode(rotated_signer, _claims()).decode()
+
+    assert (await _get(app, "/probe", rotated)).status_code == 200
+    assert certs.count == 2, "an expired document costs one fetch, not more"
+    assert (await _get(app, "/probe", rotated)).status_code == 200
+    assert certs.count == 2, "and the refreshed document is then reused"
+
+
+async def test_the_process_wide_fetch_budget_is_the_last_line(app, private_pem, certs, monkeypatch):
+    from google.auth import crypt
+    from google.auth import jwt as google_jwt
+
+    # Defeat the TTL and the kid-refresh limiter, so the ONLY thing left is the budget.
+    monkeypatch.setattr(gw, "certs_ttl_seconds", lambda: 0.0)
+    monkeypatch.setattr(gw, "CERTS_KID_REFRESH_MIN_INTERVAL_SECONDS", 0.0)
+    signer = crypt.RSASigner.from_string(private_pem, KEY_ID)
+    token = google_jwt.encode(signer, _claims()).decode()
+
+    for _ in range(gw.CERTS_FETCH_MAX_PER_WINDOW + 10):
+        await _get(app, "/probe", token)
+    assert certs.count <= gw.CERTS_FETCH_MAX_PER_WINDOW, (
+        f"{certs.count} fetches exceeded the {gw.CERTS_FETCH_MAX_PER_WINDOW}/window ceiling"
+    )
+
+
+async def test_the_certs_ttl_env_is_clamped_at_both_ends(monkeypatch):
+    monkeypatch.delenv(gw.CERTS_TTL_SECONDS_ENV, raising=False)
+    assert gw.certs_ttl_seconds() == gw.DEFAULT_CERTS_TTL_SECONDS
+    for value, expected in [
+        ("0", gw.MIN_CERTS_TTL_SECONDS),        # 0 would restore the unbounded-fetch defect
+        ("-99999", gw.MIN_CERTS_TTL_SECONDS),
+        ("999999999", gw.MAX_CERTS_TTL_SECONDS),
+        ("not-a-number", gw.DEFAULT_CERTS_TTL_SECONDS),
+        ("120", 120.0),
+    ]:
+        monkeypatch.setenv(gw.CERTS_TTL_SECONDS_ENV, value)
+        assert gw.certs_ttl_seconds() == expected, value
+
+
+async def test_the_verifier_is_handed_a_transport_that_cannot_reach_the_network(app, mint, certs):
+    # `_ReplayCertsRequest` refusing an uncached URL is what makes "0 fetches inside verify" a
+    # structural property rather than a claim about library behaviour we do not control.
+    replay = gw._ReplayCertsRequest(gw.GOOGLE_OAUTH2_CERTS_URL, {"k": "v"})
+    assert replay(gw.GOOGLE_OAUTH2_CERTS_URL).status == 200
+    with pytest.raises(RuntimeError):
+        replay("https://somewhere-else.example/certs")
+
+
+# ===========================================================================
+# REVIEW FINDING P1-2 — THE EVENT LOOP MUST NOT STALL
+#
+# `verify_gateway_identity` is synchronous and does blocking I/O. Called inline from an
+# `async def` dependency it runs ON THE LOOP, and a slow googleapis response stalls every other
+# request this worker is serving — remotely triggerable on a public route.
+# ===========================================================================
+
+async def test_a_slow_certs_fetch_does_not_stall_the_event_loop(app, mint, certs):
+    import asyncio as _asyncio
+
+    def _slow(url):
+        time.sleep(0.6)          # blocking, exactly like a socket read
+        return dict(certs.certs)
+
+    certs.__call__  # noqa: B018 - documents that the seam below replaces this object's behaviour
+    original = gw._http_fetch_certs
+    gw._http_fetch_certs = _slow
+    try:
+        beats = 0
+
+        async def heartbeat():
+            nonlocal beats
+            for _ in range(12):
+                await _asyncio.sleep(0.05)
+                beats += 1
+
+        pulse = _asyncio.ensure_future(heartbeat())
+        response = await _get(app, "/probe", mint())
+        await pulse
+    finally:
+        gw._http_fetch_certs = original
+
+    assert response.status_code == 200
+    # Inline, the first cut let 0 of 12 beats run. Off the loop, essentially all of them do.
+    assert beats >= 8, f"the loop stalled: only {beats} of 12 heartbeats ran"
+
+
+async def test_the_whole_verification_is_bounded_and_a_timeout_refuses(app, mint, monkeypatch):
+    def _forever(token):
+        time.sleep(5.0)
+        raise AssertionError("should have been abandoned")
+
+    monkeypatch.setattr(gw, "verify_gateway_identity", _forever)
+    monkeypatch.setattr(gw, "VERIFY_TIMEOUT_SECONDS", 0.2)
+    started = time.monotonic()
+    await _assert_refused_like_a_bad_admin_jwt(app, mint())
+    assert time.monotonic() - started < 3.0, "the verification was not bounded"
+
+
+async def test_the_timeouts_are_inside_the_gateways_own_call_budget():
+    # The gateway caps this whole read at 2000 ms (MAX_TIMEOUT_MS there). Anything we spend past
+    # that is spent on a client that has already given up and failed open.
+    assert gw.VERIFY_TIMEOUT_SECONDS <= 2.0
+    # `requests` applies its timeout PER SOCKET OPERATION, so this must leave room for more
+    # than one of them inside the ceiling above.
+    assert gw.CERTS_TIMEOUT_SECONDS <= 1.5
+
+
+# ===========================================================================
+# REVIEW FINDING P2-1 — THE TWO SIDES MUST NORMALISE THE AUDIENCE IDENTICALLY
+#
+# The gateway's `cloudRunAudience()` lower-cases the host, drops a default `:443` and folds one
+# trailing slash. This side used to only `.strip()`. The same string pasted into both envs
+# therefore produced a 401 — and a 401 fails OPEN on the gateway, so the gate disarmed silently.
+# ===========================================================================
+
+# (spelling written into BOTH envs, what the gateway puts on the wire / what this side accepts)
+AUDIENCE_PARITY = [
+    ("https://api.pivota.cc", "https://api.pivota.cc"),
+    ("https://api.pivota.cc/", "https://api.pivota.cc"),
+    ("https://API.PIVOTA.CC", "https://api.pivota.cc"),
+    ("https://api.pivota.cc:443", "https://api.pivota.cc"),
+    ("https://api.pivota.cc:443/", "https://api.pivota.cc"),
+    ("  https://api.pivota.cc  ", "https://api.pivota.cc"),
+]
+
+AUDIENCE_REFUSED = [
+    "http://api.pivota.cc",          # not https
+    "api.pivota.cc",                 # not a URL
+    "foo",                           # the value the first cut accepted verbatim
+    "https://api.pivota.cc/ops",     # a path
+    "https://api.pivota.cc:8443",    # a non-default port
+    "https://api.pivota.cc?x=1",
+    "https://api.pivota.cc#f",
+    "https://user:pw@api.pivota.cc",
+    "https://",
+    "https://api.pivota.cc:notaport",
+]
+
+
+@pytest.mark.parametrize("spelling,expected", AUDIENCE_PARITY)
+async def test_the_audience_normalises_the_way_the_gateway_normalises_it(spelling, expected, monkeypatch):
+    assert gw.normalize_audience(spelling) == expected
+    monkeypatch.setenv(gw.AUDIENCE_ENV, spelling)
+    assert gw.configured_audience() == expected
+
+
+@pytest.mark.parametrize("spelling", AUDIENCE_REFUSED)
+async def test_an_audience_that_is_not_a_bare_https_origin_DISABLES_the_path(spelling, monkeypatch):
+    assert gw.normalize_audience(spelling) is None, spelling
+    monkeypatch.setenv(gw.AUDIENCE_ENV, spelling)
+    # Disabled, not "passed through": a value that is not an origin cannot be what the gateway
+    # asked the metadata server for, so accepting it would arm a door that can never open.
+    assert gw.configured_audience() == ""
+    assert gw.gateway_identity_enabled() is False
+
+
+async def test_a_refused_audience_env_is_logged_once_with_its_value(monkeypatch, caplog):
+    caplog.set_level(logging.DEBUG, logger="utils.gateway_oidc_auth")
+    monkeypatch.setenv(gw.AUDIENCE_ENV, "api.pivota.cc")
+    for _ in range(4):
+        gw.configured_audience()
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1, [r.getMessage() for r in warnings]
+    # The VALUE is operator-supplied configuration, not caller input; naming it is what makes the
+    # line actionable, and not naming it is what made this failure mode invisible.
+    assert "api.pivota.cc" in warnings[0].getMessage()
+    assert "audience_env_invalid" in warnings[0].getMessage()
+
+
+async def test_a_token_minted_for_the_unnormalised_spelling_is_still_accepted(app, private_pem, monkeypatch):
+    from google.auth import crypt
+    from google.auth import jwt as google_jwt
+
+    # The operator wrote the trailing-slash spelling on BOTH sides. The gateway normalises it
+    # before asking the metadata server, so the token's `aud` is the origin — and this side must
+    # now agree, which is the entire point of the finding.
+    monkeypatch.setenv(gw.AUDIENCE_ENV, "https://api.pivota.cc/")
+    signer = crypt.RSASigner.from_string(private_pem, KEY_ID)
+    token = google_jwt.encode(signer, _claims(aud="https://api.pivota.cc")).decode()
+    assert (await _get(app, "/probe", token)).status_code == 200
