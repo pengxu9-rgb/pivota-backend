@@ -335,11 +335,16 @@ def _app():
     from fastapi import FastAPI
 
     from routes.merchant_purchasability_ops import router
-    from utils.auth import require_admin
+    from utils.gateway_oidc_auth import require_admin_or_gateway_identity
 
     app = FastAPI()
     app.include_router(router)
-    app.dependency_overrides[require_admin] = lambda: {"role": "admin"}
+    # The route's dependency since the OIDC follow-up. FastAPI keys overrides on the EXACT
+    # callable the route declares, so an override of `require_admin` would silently stop
+    # applying and every case here would 403 on a missing Authorization header — a failure that
+    # reads as a schema problem in this file and is not one. The auth dependency itself has no
+    # database in it and is tested dialect-free in tests/test_ops_gateway_oidc.py.
+    app.dependency_overrides[require_admin_or_gateway_identity] = lambda: {"role": "admin"}
     return app
 
 

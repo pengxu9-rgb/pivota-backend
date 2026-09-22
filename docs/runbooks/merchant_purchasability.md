@@ -227,7 +227,8 @@ rail calls — so it is the answer; the rows are only the evidence.
 The supported read is the **ops route**:
 
 ```
-GET /ops/merchant-purchasability?domain=<domain>&market=<XX>     (admin auth)
+GET /ops/merchant-purchasability?domain=<domain>&market=<XX>     (admin JWT, or the gateway's
+                                                                  Google identity token)
 ```
 
 It normalises `domain` and `market` through the same functions the writer keys on, so an operator
@@ -390,10 +391,17 @@ and it is why their order is not negotiable.**
    this step:** it is the only thing standing between step 6 and a 409 on a live merchant.
 6. **`MERCHANT_PURCHASABILITY_ENFORCE=1`.** Only now does a missing fact refuse a purchase.
 
+7. **AUTH: the two OIDC envs, ON THE BACKEND FIRST** — `OPS_GATEWAY_OIDC_AUDIENCE` and
+   `OPS_GATEWAY_SERVICE_ACCOUNTS`. Both or neither. See §10.
+8. **THEN the gateway's `PIVOTA_OPS_OIDC_AUDIENCE`,** the same string byte for byte. See §10.
+
 > **Arming these in the other order is the outage.** With `ENFORCE` on and no facts gathered,
 > every merchant reads `browse_only` and the Reap rail refuses `merchant_not_purchasable` (409)
 > for all of them. Because the job is worker-only, setting `SWEEP_ENABLED` on the backend does
 > not fix it — the sweep is not running there at all.
+>
+> Steps 7–8 are independent of 1–6 and may be done at any point, but the **order between them**
+> is not optional, and for the same reason in reverse: gateway-first is silent. See §10.
 
 ### Gateway (PIVOTA-Agent) change
 
@@ -402,19 +410,22 @@ can see (`routes/store_audit_ops.py::checkout_tier_coverage`) is counts-only, an
 `ready_for_complete` does not exist in this repo at all. The gateway change is therefore a
 separate PR in **PIVOTA-Agent**, and until it lands the gate protects the Reap rail only.
 
-**File:** `services/ucpStoreAuditProbe.js`.
+**File:** ~~`services/ucpStoreAuditProbe.js`~~ — as merged (PIVOTA-Agent #2259) it is
+`src/services/merchantPurchasabilityClient.js`, a module of its own rather than an edit to the
+probe, so the gate has no dependency on the store-audit lane it sits beside.
 
 **Contract:**
 
 * Call `GET /ops/merchant-purchasability?domain=<domain>&market=<ISO-2>` on the backend.
-* **Auth:** the same ops credential the gateway already uses for its store-audit reads. Surveyed:
-  this route sits behind `Depends(require_admin)` from `utils/auth.py`, byte-for-byte the
-  dependency on `/ops/store-audit/domain-diagnostics` and `/ops/store-audit/checkout-tier-coverage`.
-  Reuse that caller; do not mint a new one.
-  **That means a Bearer JWT whose `role` is `admin` or `super_admin` — NOT an `X-ADMIN-KEY`
-  header.** `utils/auth.py` also exports `require_admin_or_key`, which does accept
-  `ADMIN_API_KEY` / `PROMOTIONS_ADMIN_KEY`; these ops routes deliberately do not use it, so a
-  gateway reaching for the header will get a 401 and it will look like a routing problem.
+* **Auth:** ~~the same ops credential the gateway already uses for its store-audit reads~~.
+  **SURVEYED AND WRONG: there is no such caller.** The gateway calls no backend `/ops/...` route,
+  holds no admin JWT and has no code that mints one. What shipped in PIVOTA-Agent #2259 was a
+  standing admin JWT in `PIVOTA_OPS_ADMIN_TOKEN`, and §10 is the follow-up that replaced it.
+  **Still true and still load-bearing:** this is a Bearer JWT whose `role` is `admin` or
+  `super_admin` — NOT an `X-ADMIN-KEY` header. `utils/auth.py` also exports
+  `require_admin_or_key`, which does accept `ADMIN_API_KEY` / `PROMOTIONS_ADMIN_KEY`; these ops
+  routes deliberately do not use it, so a gateway reaching for the header will get a 401 and it
+  will look like a routing problem.
 * **Act on `tier` ONLY when `enforced` is `true`.** This is the whole reason `enforced` is in the
   response. With enforcement off every merchant reads `browse_only` — because no fact is being
   enforced, not because the merchant is browse-only — so a gateway that consumed `tier` alone
@@ -485,3 +496,134 @@ misordered state again — the facts age out through the TTL and merchants silen
 Nothing needs to be un-migrated and no row needs deleting: stale facts are simply not read. The
 rows stay, and they are still readable through the ops route (which is not gated on the dial), so
 you can keep diagnosing a merchant with the rail disarmed.
+
+---
+
+## 10. The gateway's auth on this route: a Google identity token, not a standing JWT
+
+### Why this route's app-level check is the whole guarantee
+
+**Production `web` is deployed `--allow-unauthenticated`** (`infra/gcp/deploy_backend.sh`,
+`PUBLIC=1`). Cloud Run IAM does **not** stand in front of `GET /ops/merchant-purchasability`:
+anyone on the internet may reach it. The dependency in `utils/gateway_oidc_auth.py` is not
+"defence in depth behind IAM", it **is** the defence, and every branch in it fails closed.
+
+### Why the standing admin JWT had to go
+
+`PIVOTA_OPS_ADMIN_TOKEN` is a long-lived `admin`/`super_admin` JWT pasted into the gateway's
+environment. It is over-scoped (a role, for one read-only route) and — worse — **it expires
+silently**. The gateway fails OPEN on any non-200 by design, so on the day that JWT lapses this
+route answers 401, the gateway logs `merchant_purchasability_read_failed` once per five minutes,
+and **the purchasability gate is disarmed while every dial on both sides still reads "on"**.
+
+### What the route accepts now
+
+`utils/auth.py` is unchanged. A sibling module adds
+`require_admin_or_gateway_identity`, used on **this route and no other** (there is a test that
+fails if a second route picks it up). It:
+
+1. runs `require_admin` first and **unchanged** — same `get_current_user`, same `test-token`
+   bypass, same 503-on-unusable-secret;
+2. otherwise verifies the same `Authorization: Bearer` value as a **Google OIDC ID token**
+   through `google.oauth2.id_token.verify_oauth2_token`, requiring ALL of: RS256 against Google's
+   published certs (`alg: none` and HS256 are refused by the library's algorithm allow-list);
+   `iss ∈ {accounts.google.com, https://accounts.google.com}`; `aud == OPS_GATEWAY_OIDC_AUDIENCE`
+   exactly; `email_verified` is boolean **true**; `email ∈ OPS_GATEWAY_SERVICE_ACCOUNTS`
+   (lower-cased compare); `exp`/`iat` inside a **10 s** clock skew.
+3. **Costs an anonymous caller nothing.** google-auth does *not* cache certificates — it GETs
+   `googleapis.com/oauth2/v1/certs` on every verification, *before* it parses the token — so on a
+   public route any stranger could steer our outbound traffic one request at a time. The module
+   therefore parses the JWS header first (size, compact form, `alg: RS256`, a `kid`) and refuses
+   before any fetch; caches the document for `OPS_GATEWAY_OIDC_CERTS_TTL_SECONDS`; allows an
+   unknown-`kid` refresh at most once per 60 s process-wide; caps fetches at 10 per minute
+   process-wide; and hands the library a transport that replays the cached bytes and can reach
+   nothing.
+4. **Never blocks the event loop.** The verification runs in a threadpool under a 2 s
+   `asyncio.wait_for`, because a blocking certs fetch on the loop stalls every other request this
+   worker is serving — on a public route, remotely triggerable.
+5. **Fails closed on everything else**, and the refusal is **byte-identical** to what a bad admin
+   JWT gets — same status, same body — so nothing about this path is discoverable from a
+   response. The reason is a rate-limited `warning` carrying a short CODE only. The token is
+   never logged; the accepted service-account email is logged at **debug** only.
+
+**`X-ADMIN-KEY` is still refused here**, exactly as before. Nothing widened to
+`require_admin_or_key`.
+
+### The envs, and the arming order
+
+| where | variable | value |
+|---|---|---|
+| backend `web` | `OPS_GATEWAY_OIDC_AUDIENCE` | `https://api.pivota.cc` (this backend's canonical https origin; a bare origin — no path, no port, no trailing slash) |
+| backend `web` | `OPS_GATEWAY_SERVICE_ACCOUNTS` | `sa-gateway@pivota-prod.iam.gserviceaccount.com` — the gateway's runtime SA, from `infra/gcp/deploy_gateway.sh` (`--service-account "sa-gateway@$PROJECT.iam.gserviceaccount.com"` with `PROJECT=pivota-prod`). Confirm against the live revision: `gcloud run services describe gateway --project pivota-prod --region us-west1 --format='value(spec.template.spec.serviceAccountName)'`. Comma-separated if more than one |
+| gateway | `PIVOTA_OPS_OIDC_AUDIENCE` | **the same string**, byte for byte |
+| gateway | `PIVOTA_OPS_ADMIN_TOKEN` | keep as a **dev fallback** only; may be unset in prod once the identity rail is confirmed |
+
+**Both backend envs, or neither.** Either one alone reads as DISABLED — an audience-less or an
+allow-list-less verification is an open door, so the half-configured state refuses rather than
+admits. With both unset (the shipped default) this route behaves exactly as it did before.
+
+Optional third env: `OPS_GATEWAY_OIDC_CERTS_TTL_SECONDS` (default `3600`, clamped to
+`[60, 86400]`) — how long Google's signing certificates are reused. Leave it alone unless Google
+rotates unusually; `0` is not reachable, because a TTL of 0 restores the unbounded-fetch
+behaviour this route was fixed for.
+
+### The audience is NORMALISED, and both sides normalise it the same way
+
+A first review of this change found the two sides disagreeing. The gateway's `cloudRunAudience()`
+lower-cases the host, drops a default `:443` and folds one trailing slash to the origin; this
+side originally only `.strip()`ed. So an operator who pasted **the same string**
+`https://api.pivota.cc/` into both envs got a 401 on every read — and a 401 fails open on the
+gateway, so the gate disarmed **silently**. Both sides now apply the identical rule.
+
+**The rule: a bare https ORIGIN.** https only; no userinfo; no path beyond `/`; no query; no
+fragment; the host is lower-cased; a default `:443` is dropped; one trailing slash folds away.
+
+| written into BOTH envs | what both sides use | accepted? |
+|---|---|---|
+| `https://api.pivota.cc` | `https://api.pivota.cc` | ✅ |
+| `https://api.pivota.cc/` | `https://api.pivota.cc` | ✅ |
+| `https://API.PIVOTA.CC` | `https://api.pivota.cc` | ✅ |
+| `https://api.pivota.cc:443` | `https://api.pivota.cc` | ✅ |
+| `http://api.pivota.cc` | — | ❌ disabled |
+| `api.pivota.cc` | — | ❌ disabled |
+| `foo` | — | ❌ disabled (the first cut accepted this verbatim) |
+| `https://api.pivota.cc/ops` | — | ❌ disabled |
+| `https://api.pivota.cc:8443` | — | ❌ disabled |
+
+A value that was **set and refused** is DISABLED, not passed through, and it is logged once per
+interval as `audience_env_invalid:<value>` — otherwise a typo in this env is indistinguishable
+from never having set it, and the symptom of both is "the gate quietly does nothing".
+
+### Rolling this back
+
+**Unset both backend envs** (`OPS_GATEWAY_OIDC_AUDIENCE` and `OPS_GATEWAY_SERVICE_ACCOUNTS`).
+The route immediately reverts to plain `require_admin`. The gateway then gets a **401** on every
+read, which — by its own fail-open rule — means it **falls back to `PIVOTA_OPS_ADMIN_TOKEN` if
+that is still set, and otherwise keeps its previous behaviour**. Nothing refuses a purchase
+either way.
+
+> **That is exactly why `PIVOTA_OPS_ADMIN_TOKEN` should stay set on the gateway until the
+> identity rail has been observed working.** Rolling the backend back with the static token
+> already removed leaves the gate reading nothing — inert, not broken, but inert silently. If
+> you want the gateway to stop trying the identity rail too, unset `PIVOTA_OPS_OIDC_AUDIENCE`
+> there; that is a second revision and is not needed for the backend rollback to be safe.
+
+> **⚠️ BACKEND FIRST, THEN THE GATEWAY.** Setting the gateway's audience first means the gateway
+> sends an identity token to a backend that does not yet accept one: every read 401s, and because
+> the gateway fails OPEN that is **silent** — the gate disarms and every dial still reads "on".
+> Backend first means the worst case is a backend accepting a token nobody sends yet, which
+> changes nothing.
+>
+> **⚠️ THE TWO AUDIENCE STRINGS MUST MATCH BYTE FOR BYTE.** The check is `claims["aud"] != audience`,
+> a string compare, not a URL compare. `https://api.pivota.cc/` and `http://api.pivota.cc` are
+> different audiences and both 401 — silently, for the reason above. On the gateway side
+> `cloudRunAudience()` refuses anything that is not a bare https origin, which narrows but does
+> not remove this.
+
+### Verifying it took
+
+The backend logs the accepted service account at **debug** (`utils.gateway_oidc_auth`), and logs
+a rate-limited `warning` with a reason code on refusal. On the gateway, a sustained
+`merchant_purchasability_read_failed` with `failure: status_401` after step 8 means the audiences
+do not match or the SA is not in the allow-list — **alert on that line specifically and treat it
+as "the gate is off"**.
