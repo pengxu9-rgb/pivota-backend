@@ -237,20 +237,30 @@ def test_cooldown_env_parsing(monkeypatch):
 
 
 async def test_env_cooldown_is_what_the_helper_uses_when_none_is_passed(monkeypatch):
-    """A 1-second cooldown from the env, then wait it out: the third call must
-    enqueue. Any positive default would fold it, so this distinguishes "reads
-    the env" from "uses some positive number" — the first version set 3600 and
-    could not tell those apart."""
-    import asyncio
+    """The env cooldown, not some positive default, sets the window: a job
+    just inside it folds, the same job just outside it does not. The first
+    version set 3600 and could not tell "reads the env" from "uses some
+    positive number"; the second used a 1-second env cooldown and real sleeps,
+    and flaked on the dialect gate (main 3c2dc41a, run 35694694301) when two
+    back-to-back calls on a slow runner landed more than a second apart.
 
-    monkeypatch.setenv(QUALITY_BACKFILL_ENQUEUE_COOLDOWN_ENV, "1")
-    await _auto(cooldown_seconds=None)
+    Time is controlled by moving the job's stored `requested_at` with
+    `_age()` — patching `_utcnow()` would not do it, because the lookup
+    compares against the SERVER clock. The two probes bracket the env value
+    at ±1 minute, so wall-clock drift between calls only matters past 60s, and
+    only a cooldown in (49min, 51min] passes both — the env value is there,
+    the 6h default is not."""
+    env_minutes = 50
+    assert not (49 * 60 < DEFAULT_QUALITY_BACKFILL_ENQUEUE_COOLDOWN_SECONDS <= 51 * 60)
+
+    monkeypatch.setenv(QUALITY_BACKFILL_ENQUEUE_COOLDOWN_ENV, str(env_minutes * 60))
+    first = await _auto(cooldown_seconds=None)
+    job_id = first["job"]["job_id"]
+    await _age(job_id, minutes=env_minutes - 1)
     folded = await _auto(cooldown_seconds=None)
     assert folded["enqueued"] is False
-    # 2.5s, not 1.2s: `_utcnow()` truncates to whole seconds and SQLite's
-    # string comparison is inclusive at the exact second, so a 1-second window
-    # needs the clock to have moved at least two full seconds past the write.
-    await asyncio.sleep(2.5)
+    assert folded["job"]["job_id"] == job_id
+    await _age(job_id, minutes=2)
     out = await _auto(cooldown_seconds=None)
     assert out["enqueued"] is True
     assert await _count() == 2
