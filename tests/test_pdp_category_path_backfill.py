@@ -158,6 +158,9 @@ TREATMENT_FIXTURES = [
     "Murad Retinol Youth Renewal Night Treatment",
     "Pixi Spot Stickers Trio",
     "Peace Out Acne Stickers",
+    # Acne / blemish patches are Acne Treatments (Google 5976, Shopify), not masks.
+    "Hero Cosmetics Mighty Pimple Patch",
+    "Anua Ultra-Thin Spot Cover Patch",
 ]
 
 FACE_OIL_FIXTURES = [
@@ -184,10 +187,8 @@ MASK_FIXTURES = [
     "Mediheal Tea Tree Essential Sheet Mask",
     "Laneige Water Sleeping Mask",
     "Innisfree Super Volcanic Pore Clay Mask",
-    "Hero Cosmetics Mighty Pimple Patch",
     "Pixi LipPatch",
     "Summer Fridays Jet Lag Mask",
-    "Anua Ultra-Thin Spot Cover Patch",
     "Patyka Patchs Lift Regard 360°",
 ]
 
@@ -290,7 +291,7 @@ PATTERN_ORDER_FIXTURES = [
     ("Real Rice Essence Sheet Mask 10 Pack", "beauty/skincare/treat/mask"),
     ("Mediheal Essence Mask Sheet Tea Tree", "beauty/skincare/treat/mask"),
     ("Snail Essence Sleeping Mask", "beauty/skincare/treat/mask"),
-    ("Acne Care Essence Spot Patch 18ct", "beauty/skincare/treat/mask"),
+    ("Acne Care Essence Spot Patch 18ct", "beauty/skincare/treat/treatment"),
     ("Some By Mi Miracle Essence Peeling Gel", "beauty/skincare/treat/exfoliant"),
     ("Blemish Essence Spot Treatment Gel", "beauty/skincare/treat/treatment"),
     ("Lavender Essence Body Oil", "beauty/skincare/moisturize/oil"),
@@ -421,6 +422,42 @@ def test_tanning_resolves(title: str) -> None:
     assert hit is not None
     assert hit[0] == "Tanning"
     assert hit[1] == "beauty/body/tanning"
+
+
+# An acne patch named by its qualifier is a treatment, including the plural that the Mask
+# pattern's generic "patches" arm would otherwise reach first.
+@pytest.mark.parametrize("title", [
+    "Hero Cosmetics Mighty Pimple Patches 36ct",
+    "COSRX Acne Pimple Master Patch",
+    "Acne Patch Hydrocolloid 24 Patches",
+    "Starface Blemish Patches Hydro-Stars",
+    "NEOGEN Dermalogy A-Clear Soothing Clear Spot Patch",
+    "Soft Shield Pimple Patch",
+    "Spot Cover Patches 60ea",
+])
+def test_an_acne_patch_is_a_treatment_not_a_mask(title: str) -> None:
+    assert classify(title) == ("Treatment", "beauty/skincare/treat/treatment")
+
+
+# ...and only those. Eye patches, lip patches and a bare "patches" keep the mask leaf.
+@pytest.mark.parametrize("title", [
+    "Beauty of Joseon Revive Under Eye Patch",
+    "Hydrogel Eye Patches 60pcs",
+    "Dark Spot Eye Patch",
+    "Pixi LipPatch",
+    "Collagen Lip Patch",
+    "Gold Patches 30 Pairs",
+    "Patyka Patchs Lift Regard 360°",
+])
+def test_a_non_acne_patch_stays_a_mask(title: str) -> None:
+    assert classify(title) == ("Mask", "beauty/skincare/treat/mask")
+
+
+def test_moving_acne_patches_does_not_move_the_recall_prefix() -> None:
+    # Recall binds the PARENT of the leaf; mask and treatment share treat/.
+    from services.pdp_category_classifier import category_path_prefix_for_query
+    for query in ("pimple patch", "spot patch", "acne patch", "eye patch"):
+        assert category_path_prefix_for_query(query) == "beauty/skincare/treat/"
 
 
 @pytest.mark.parametrize("title", MASK_FIXTURES)

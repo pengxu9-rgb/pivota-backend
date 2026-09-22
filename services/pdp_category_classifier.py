@@ -141,12 +141,23 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
     # Do not retarget this leaf without changing beautyTaxonomy.js in the same breath.
     ("Toner", "beauty/skincare/tone/toner", re.compile(
         r"\b(toner|tonic|mist|pad|skin booster)\b", re.IGNORECASE)),
+    # An acne / blemish patch is a TREATMENT, not a mask. Google Product Taxonomy 5976 and Shopify
+    # both file it under Acne Treatments, and the measured curated shelves (eyurs "Acne Pimple
+    # Patch", sokoglam "Spot") map it to treat/treatment -- so while these phrases sat in the Mask
+    # pattern one product class lived on two leaves, and a title saying "pimple patch" on one of
+    # those shelves named a different leaf than its shelf and stayed unresolved.
+    # It sits ABOVE Mask because Mask still claims the generic plural "patches": "Pimple Patches"
+    # must reach this entry first. Only a patch noun NAMED by its acne qualifier moves; eye patches,
+    # lip patches and a bare "patches" stay masks.
+    ("Treatment", "beauty/skincare/treat/treatment", re.compile(
+        r"\b(?:pimple|spot(?:\s+cover)?|acne|blemish)\s+patch(?:es)?\b",
+        re.IGNORECASE)),
     # Mask is SPLIT in two. Everything here names an unambiguous mask FORM, so
     # it wins over "essence" below: "Real Rice Essence Sheet Mask" is a mask.
     ("Mask", "beauty/skincare/treat/mask", re.compile(
         r"\b(face mask|clay mask|charcoal mask|sheet mask|mask sheet|gel mask|"
         r"sleeping mask|sleep mask|wash[-\s]?off mask|under eye patch|eye patch|"
-        r"pimple patch|spot cover patch|spot patch|patchs|patches|lip\s?patch)\b",
+        r"patchs|patches|lip\s?patch)\b",
         re.IGNORECASE)),
     ("Exfoliant", "beauty/skincare/treat/exfoliant", re.compile(
         r"\b(exfoliant|exfoliating|exfoliation|peel|peeling|peeling gel|peel pads?|"
