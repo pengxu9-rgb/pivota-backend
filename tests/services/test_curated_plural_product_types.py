@@ -40,10 +40,13 @@ def evidence_only(product_type, title, flag_path="beauty"):
     # 2026-09-22 re-read.
     ("eyurs.com", "Masks, Exfoliators", "Round Lab 1025 Dokdo Mud Pack 100ml (Wash Off Mask)", "beauty/skincare/treat/mask"),
     ("eyurs.com", "Masks, Exfoliators", "Isntree Mugwort Calming Clay Mask", "beauty/skincare/treat/mask"),
+    # A title matching two leaves (face powder + mask) that includes the shelf's leaf is accepted.
+    ("eyurs.com", "Masks, Exfoliators", "My Scheming Collagen Blackhead Remover Mask Powder", "beauty/skincare/treat/mask"),
     ("eyurs.com", "Acne Pimple Patch", "Cosrx AC Collection Acne Patch – Heal & Protect Active Breakouts", "beauty/skincare/treat/treatment"),
     ("eyurs.com", "Acne Pimple Patch", "Cosrx Acne Pimple Master Patch", "beauty/skincare/treat/treatment"),
     ("sokoglam.com", "Spot", "Spot the Difference Blemish Treatment", "beauty/skincare/treat/treatment"),
     ("sokoglam.com", "Spot", "Mighty Patch - The Original", "beauty/skincare/treat/treatment"),
+    ("sokoglam.com", "Spot", "Might Patch - Micropoint for Blemishes", "beauty/skincare/treat/treatment"),  # "blemishes" is no pattern
     ("sokoglam.com", "Spot", "A-Clear Soothing Pink Eraser", "beauty/skincare/treat/treatment"),
 ])
 def test_a_measured_shelf_resolves_its_products(domain, ptype, title, want):
