@@ -4548,6 +4548,97 @@ def test_the_enrollment_CREATE_on_that_same_path_does_carry_one(wire, clean_env)
     assert wire.calls[0]["method"] == "POST"
 
 
+# --- WP4c: revoking an enrollment ---------------------------------------------------------------
+#
+# `POST /agentic/enrollments/{id}/revoke` IS IN THE PINNED SPEC (`revokeEnrollment_agentic`), so
+# "does Reap offer revocation" is answered yes and these tests hold the answer to the fixture.
+# Nothing on the hosted checkout's save path calls it -- see
+# `routes/buyer_api._retire_reap_state_on_repoint`, which must not make a partner call -- so this
+# leg exists for an operator and for a later job, and the runbook's orphan section names it.
+
+
+def test_the_revoke_path_is_the_one_in_the_pinned_spec():
+    """READ OFF THE FIXTURE, not asserted as a string we believe. `reference: reap changed a
+    required field without moving its version` -- the pinned spec is the only thing in a position
+    to notice when this path stops existing."""
+    spec = _spec()
+    assert "/agentic/enrollments/{id}/revoke" in spec["paths"]
+    operation = spec["paths"]["/agentic/enrollments/{id}/revoke"]
+    assert set(operation) == {"post"}
+    # No request body in the spec, which is why the client sends `{}`.
+    assert "requestBody" not in operation["post"]
+
+
+def test_a_revoke_posts_to_the_sub_resource_with_the_version_header(wire, clean_env):
+    wire.next_payload = ENROLLMENT_ACTIVE
+    got = _run(rc.revoke_enrollment(ENROLLMENT_UUID))
+    assert got.ok
+    call = wire.calls[0]
+    assert call["method"] == "POST"
+    assert call["url"] == (
+        f"https://sandbox.api.reap.global/agentic/enrollments/{ENROLLMENT_UUID}/revoke"
+    )
+    assert call["headers"]["Reap-Version"] == "2025-02-14"
+    assert call["headers"]["Authorization"] == "Bearer sk_test_key"
+
+
+def test_a_revoke_carries_no_idempotency_key(wire, clean_env):
+    """`_IDEMPOTENT_PATHS` is matched by EQUALITY and names the enrollment COLLECTION, not this
+    sub-resource -- so no key is attached, which is correct rather than incidental: revoking
+    twice is the same statement made twice, and a 24-hour replay of a revoke protects nothing.
+
+    Asserted because the opposite would be silent: a key here would ask Reap to replay a
+    day-old revoke response for a revoke of a DIFFERENT enrollment only if the material collided,
+    which is exactly the kind of bug nobody finds by reading."""
+    wire.next_payload = ENROLLMENT_ACTIVE
+    _run(rc.revoke_enrollment(ENROLLMENT_UUID))
+    assert "Idempotency-Key" not in wire.calls[0]["headers"]
+
+
+def test_a_revoke_id_must_be_a_uuid_and_refuses_before_egress(wire, clean_env):
+    """The same `_path_id(uuid=True)` every by-id enrollment leg applies. Our own ledger's
+    enrollment id is a DIFFERENT id space and must not be able to reach a partner path by being
+    pasted into the wrong argument -- and the refusal has to happen before anything goes out,
+    which `wire.calls == []` is what distinguishes."""
+    for bad in ("chk_7f3a", "../../admin", "abc?x=1", ""):
+        with pytest.raises(rc.ReapRequestError):
+            _run(rc.revoke_enrollment(bad))
+    assert wire.calls == []
+
+
+def test_a_revoke_goes_through_the_hosted_url_guard(wire, clean_env):
+    """`feedback: check whether a caller has the same defect`. The spec's 200 for this path
+    carries a `nextAction` of its own, and a hosted URL is a hosted URL whichever verb produced
+    it -- so the guard applies here exactly as it does on the create and the two reads."""
+    payload = json.loads(json.dumps(ENROLLMENT_CREATED))
+    payload["nextAction"]["url"] = "https://evil.example/x"
+    wire.next_payload = payload
+    got = _run(rc.revoke_enrollment(ENROLLMENT_UUID))
+    assert not got.ok and got.error == "hosted_url_not_allowed"
+
+
+def test_a_revoke_reads_the_partners_error_code_and_nothing_else(wire, clean_env):
+    """`_ERROR_CODE_PATH_PREFIXES` is a PREFIX match, so this sub-resource inherits the scoped
+    error read the enrollment collection has. The body itself is never returned: a partner's
+    error payload can echo the request."""
+    wire.next_status = 404
+    wire.next_payload = {
+        "error": {
+            "code": "ENROLLMENT_NOT_FOUND",
+            # Free text, and it echoes the request. Never read, never returned, never logged.
+            "message": "no enrollment for buyer ada@example.test at 900 Brannan St",
+        }
+    }
+    got = _run(rc.revoke_enrollment(ENROLLMENT_UUID))
+    assert not got.ok
+    assert got.status == 404
+    assert got.error == "reap_status_404"
+    assert got.error_code == "ENROLLMENT_NOT_FOUND"
+    assert got.data == {}
+    # THE HALF THAT MATTERS: the code came out, the body did not.
+    assert "Brannan" not in json.dumps(got.__dict__ if hasattr(got, "__dict__") else str(got))
+
+
 def test_a_get_sends_no_content_type(wire, clean_env):
     wire.next_payload = ENROLLMENT_ACTIVE
     _run(rc.get_enrollment(ENROLLMENT_UUID))
@@ -5191,8 +5282,15 @@ URL_PATHS_AND_GUARDS = {
     # Outbound, and OURS: validated before egress.
     "POST /agentic/enrollments REQUEST presentation.returnUrl": "validate_return_url",
     "POST /agentic/checkouts REQUEST presentation.returnUrl": "validate_return_url",
-    # Endpoints this module does not call at all. The mandates rail and enrollment revocation
-    # are the card-ISSUANCE side, dormant by design; no code path here can reach them.
+    # WP4c. Enrollment REVOCATION left the `NOT CALLED` list: `retire_buyer_refs_for_buyer`
+    # retires our side of a stranded enrollment at the moment a buyer link is repointed, and
+    # this is the leg that tells Reap to stop honouring the card. It is NOT on the hosted
+    # checkout's path — see `routes/buyer_api._retire_reap_state_on_repoint` for why an inline
+    # partner call is refused there — so its callers are an operator and a later job. It goes
+    # through `_refuse_unsafe_hosted_url` like every other enrollment leg.
+    "POST /agentic/enrollments/{id}/revoke RESPONSE nextAction.url": "revoke_enrollment",
+    # Endpoints this module does not call at all. The mandates rail is the card-ISSUANCE side,
+    # dormant by design; no code path here can reach it.
     "GET /agentic/mandates/{id} RESPONSE nextAction.url": "NOT CALLED",
     "GET /agentic/mandates/{id} RESPONSE merchant.url": "NOT CALLED",
     "POST /agentic/mandates/{id}/pause RESPONSE nextAction.url": "NOT CALLED",
@@ -5201,7 +5299,6 @@ URL_PATHS_AND_GUARDS = {
     "POST /agentic/mandates/{id}/resume RESPONSE merchant.url": "NOT CALLED",
     "POST /agentic/mandates/{id}/cancel RESPONSE nextAction.url": "NOT CALLED",
     "POST /agentic/mandates/{id}/cancel RESPONSE merchant.url": "NOT CALLED",
-    "POST /agentic/enrollments/{id}/revoke RESPONSE nextAction.url": "NOT CALLED",
     # The two QUOTE reads. They carry no `nextAction` and no URL in today's schema -- which is
     # why they are commented rather than keyed: the ratchet compares against what the fixture
     # actually declares, and a row for a field that does not exist would now fail as stale. They
@@ -5351,11 +5448,37 @@ def test_every_inbound_hosted_url_path_is_guarded_by_a_call_that_exists():
 def test_the_mandates_rail_really_is_uncalled():
     """The `NOT CALLED` rows above, checked rather than asserted. `mandates` is the card-issuance
     side and nothing in this module may reach it — that is the 6 Sep constraint, not a scoping
-    choice, so a new caller should have to delete this test on purpose."""
+    choice, so a new caller should have to delete this test on purpose.
+
+    ── WHAT WP4c CHANGED HERE, AND WHAT IT DID NOT ─────────────────────────────────────────
+
+    This test also asserted `"/revoke" not in source`, and that line was NOT about mandates: the
+    only `/revoke` in the whole pinned spec is `POST /agentic/enrollments/{id}/revoke`. It was a
+    second statement — "this module does not revoke enrollments either" — wearing the mandates
+    test's name, and WP4c reverses that one deliberately, because the repoint sweep's whole
+    subject is a stranded enrollment nobody has told Reap to stop honouring.
+
+    So the assertion is narrowed rather than dropped: the ONLY `/revoke` this module may build
+    is the enrollment one. A `/agentic/mandates/{id}/revoke` appearing tomorrow still fails here,
+    and so does any other revoke path, because both halves are checked — the mandates prefix is
+    banned outright, and every remaining `/revoke` occurrence must be the enrollment sub-resource.
+    """
     import inspect
+    import re
+
     source = inspect.getsource(rc)
     assert "/agentic/mandates" not in source
-    assert "/revoke" not in source
+
+    # Checked on the TEXT BEFORE each occurrence rather than per line, so a `/revoke` in prose
+    # (this module explains itself at length) is held to the same rule as one in an f-string.
+    occurrences = list(re.finditer(r"/revoke", source))
+    assert occurrences, "the enrollment revoke leg disappeared; this test is now vacuous"
+    for match in occurrences:
+        before = source[: match.start()]
+        assert re.search(r"/agentic/enrollments/[^/\s`]+$", before), (
+            "a /revoke path that is not the enrollment sub-resource: "
+            + source[max(0, match.start() - 60) : match.end()]
+        )
 
 
 def test_the_pinned_spec_covers_every_agentic_path_this_module_calls():

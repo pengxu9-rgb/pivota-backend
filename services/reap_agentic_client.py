@@ -3120,6 +3120,47 @@ async def get_enrollment(
     )
 
 
+async def revoke_enrollment(
+    enrollment_id: str, *, timeout_seconds: Optional[float] = None
+) -> ReapResponse:
+    """`POST /agentic/enrollments/{id}/revoke` — tell Reap to stop honouring this card.
+
+    WP4c ADDED THIS BECAUSE THE SPEC HAS IT. `tests/fixtures/reap_openapi_agentic_2026_09_17.json`
+    carries `revokeEnrollment_agentic` on this path, taking the id and the `Reap-Version` header
+    and no body. Before WP4c the runbook's orphan section said flatly that "the enrollment at
+    Reap is never revoked" — we stop using it and never tell Reap to stop honouring it. This is
+    the call that closes that half.
+
+    ── WHO MAY CALL IT, AND WHO DELIBERATELY DOES NOT ──────────────────────────────────────
+
+    NOT `routes/buyer_api._retire_reap_state_on_repoint`, which is where the repoint is detected.
+    That hook runs on the hosted checkout's save path with a human waiting on the response, and
+    a POST here can take up to `_DEFAULT_TIMEOUT_S` — 25 seconds — before it gives up. A hook
+    that promised never to slow the checkout cannot make a partner call. The local retirement
+    (`db.reap_agentic_ledger.retire_buyer_refs_for_buyer`) is the part that must be synchronous,
+    because it is what stops OUR side reaching for a stranded enrollment; this is the part that
+    can happen later, from an operator's shell against the ids the runbook's audit query finds,
+    or from a job.
+
+    NO BODY AND NO IDEMPOTENCY KEY. The spec defines no request body, so `{}` is what goes on
+    the wire; and this exact path is not in `_IDEMPOTENT_PATHS` (that tuple is matched by
+    equality, and it names the enrollment COLLECTION, not this sub-resource). A key would be
+    wrong here anyway: revoking twice is the same statement made twice, which is what idempotent
+    means, and a 24-hour replay of a revoke has nothing to protect.
+
+    `uuid=True`, like every other by-id enrollment call: Reap's enrollment ids are UUIDs in the
+    pinned spec, and our own ledger id — a different id space entirely — must not be able to
+    reach a partner path by being pasted into the wrong argument.
+    """
+    eid = _path_id(enrollment_id, what="enrollment", uuid=True)
+    # THROUGH THE SAME `nextAction` GUARD AS EVERY OTHER ENROLLMENT LEG. The spec's 200 for this
+    # path carries a `nextAction` of its own, and a hosted URL is a hosted URL whichever verb
+    # produced it.
+    return _refuse_unsafe_hosted_url(
+        await _post(f"/agentic/enrollments/{eid}/revoke", {}, timeout_seconds=timeout_seconds)
+    )
+
+
 async def list_enrollments(
     *,
     owner_id: str,
