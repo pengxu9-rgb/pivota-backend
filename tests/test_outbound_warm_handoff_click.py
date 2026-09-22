@@ -783,3 +783,319 @@ def test_route_forwards_ctx_so_join_mode_alone_can_knock_out(monkeypatch) -> Non
     assert res.headers["location"] == exotic_cart
     assert calls == [], "an empty ctx here would have warmed an already-prefilled cart"
     assert logged[0]["token_payload"]["ctx"]["warm_reason"] == "already_cart"
+
+
+# ---------------------------------------------------------------------------------------------
+# The buyer MARKET on the warm-handoff body (PIVOTA-Agent #2259 purchasability gate).
+#
+# The gateway keys the merchant-purchasability fact on (domain, market) and REFUSES to
+# substitute its own deployment market: a body with no usable `market` is
+# `merchant_purchasability_unkeyable` and the gate keeps the previous behaviour — the exact
+# lane flowerbeauty.com travelled. So the market we send must be the one THIS CLICK WAS
+# SERVED FOR (the signed token's own top-level `market`), never a server-side default, and an
+# unusable value must be OMITTED rather than coerced.
+#
+# See docs/runbooks/merchant_purchasability.md, "Gateway (PIVOTA-Agent) change".
+# ---------------------------------------------------------------------------------------------
+
+
+def _mint_token_with_market(market: Any, dest: str = BRAND_DEST) -> str:
+    """A signed `/r` token whose TOP-LEVEL `market` is exactly `market`.
+
+    `market=_ABSENT` mints a token with no `market` key at all — the shape the four real
+    minters produce when nothing named a market.
+    """
+    from services.outbound_links_service import make_redirect_token
+
+    payload: Dict[str, Any] = {"tool": "*", "dest": dest, "ctx": {"pvt_click_id": "clk_test"}}
+    if market is not _ABSENT:
+        payload["market"] = market
+    return make_redirect_token(payload, ttl_seconds=3600)
+
+
+_ABSENT = object()
+
+
+class _BodySpy:
+    """Captures the exact body handed to httpx, and answers a valid warm handoff."""
+
+    def __init__(self) -> None:
+        self.bodies: list = []
+
+    async def post(self, url: str, **kwargs: Any) -> Any:
+        self.bodies.append(kwargs.get("json"))
+
+        class _R:
+            status_code = 200
+
+            @staticmethod
+            def json() -> Dict[str, Any]:
+                return {"continue_url": CONTINUE_URL, "cart_id": "gid://shopify/Cart/abc"}
+
+        return _R()
+
+    @property
+    def body(self) -> Dict[str, Any]:
+        assert len(self.bodies) == 1, f"expected exactly one POST, saw {len(self.bodies)}"
+        return self.bodies[0]
+
+
+async def _body_for_market(market: Any) -> Dict[str, Any]:
+    spy = _BodySpy()
+    out = await warm.resolve_warm_handoff(
+        dest=BRAND_DEST,
+        ctx={"pvt_click_id": "clk_1"},
+        settings=settings,
+        market=market,
+        client=spy,
+    )
+    assert out is not None, "the handoff itself must still resolve"
+    return spy.body
+
+
+# --- the validator, in isolation -------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("US", "US"),
+        ("SG", "SG"),
+        ("jp", "JP"),  # lower case is the SAME market, upper-cased
+        ("Gb", "GB"),
+        ("  sg  ", "SG"),  # surrounding whitespace is not a different market
+        ("USA", None),  # alpha-3 is NOT alpha-2 — omit, never truncate to "US"
+        ("usa", None),
+        ("", None),
+        ("   ", None),
+        ("U", None),
+        ("U1", None),
+        ("1S", None),
+        ("U-S", None),
+        ("us-east-1", None),
+        ("*", None),
+        (None, None),
+        (123, None),
+        (["US"], None),
+        (True, None),
+    ],
+)
+def test_click_market_accepts_only_iso2(raw: Any, expected: Optional[str]) -> None:
+    assert warm.click_market(raw) == expected
+
+
+def test_click_market_never_invents_a_market() -> None:
+    """The refusing half of the rule, stated on its own: nothing unusable becomes a market.
+
+    `"USA"` must NOT become `"US"` by truncation and `None` must NOT become the deployment's
+    market. A coerced value asks the purchasability gate about a vantage the buyer is not in,
+    and a positive fact from another vantage is exactly what made flowerbeauty.com look
+    payable (runbook §2).
+    """
+    assert warm.click_market("USA") is None
+    assert warm.click_market(None) is None
+    assert warm.click_market("") is None
+
+
+# --- the wire body ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_body_carries_the_market_when_the_click_has_one() -> None:
+    assert (await _body_for_market("SG"))["market"] == "SG"
+
+
+@pytest.mark.asyncio
+async def test_body_uppercases_a_lowercase_market() -> None:
+    body = await _body_for_market("sg")
+    assert body["market"] == "SG", "the gateway's contract is ISO-2 UPPERCASE"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", [None, "", "   ", "USA", "usa", "U", "u1", 7, ["SG"]])
+async def test_body_omits_the_key_when_the_market_is_unusable(bad: Any) -> None:
+    """Absent, not empty and not coerced. The gateway reads a missing key as `unkeyable` and
+    keeps its previous behaviour; a `""` or a wrong-vantage code would be a silent answer."""
+    body = await _body_for_market(bad)
+    assert "market" not in body, f"{bad!r} must send NO market key, got {body.get('market')!r}"
+
+
+@pytest.mark.asyncio
+async def test_body_is_byte_identical_to_the_pre_market_snapshot_when_no_market() -> None:
+    """The no-market body is EXACTLY what this lane sent before `market` existed.
+
+    Pinned as bytes, key order included, so an accidental `"market": null`, an empty string,
+    a reordering, or any new field at all fails here rather than in production.
+    """
+    import json
+
+    snapshot = (
+        '{"brand_domain": "cosrx.com", '
+        '"product_url": "https://www.cosrx.com/products/peptide-132-hair-home-care-kit", '
+        '"product_handle": "peptide-132-hair-home-care-kit", '
+        '"attribution": {"pivota_click_id": "clk_1"}}'
+    )
+    assert json.dumps(await _body_for_market(None)) == snapshot
+
+
+@pytest.mark.asyncio
+async def test_market_is_the_only_addition_to_the_body() -> None:
+    """With a market, the body is the snapshot PLUS `market` and nothing else."""
+    without = await _body_for_market(None)
+    with_market = await _body_for_market("SG")
+    assert set(with_market) - set(without) == {"market"}
+    assert {k: v for k, v in with_market.items() if k != "market"} == without
+
+
+@pytest.mark.asyncio
+async def test_body_never_carries_buyer_email_or_address() -> None:
+    """A market is a country code, not a buyer. Nothing identifying may ride along.
+
+    Scans the SERIALIZED body, so a PII value nested under any key is caught, and asserts the
+    key set exactly — which is what stops a future "helpful" buyer field being added.
+    """
+    import json
+
+    ctx_with_pii = {
+        "pvt_click_id": "clk_1",
+        "email": "shopper@example.com",
+        "buyer_email": "shopper@example.com",
+        "address1": "1 Raffles Place",
+        "zip": "048616",
+        "phone": "+65 6123 4567",
+        "first_name": "Ada",
+        "last_name": "Lovelace",
+        "ip": "203.0.113.7",
+    }
+    spy = _BodySpy()
+    await warm.resolve_warm_handoff(
+        dest=BRAND_DEST, ctx=ctx_with_pii, settings=settings, market="SG", client=spy
+    )
+    wire = json.dumps(spy.body).lower()
+    for leaked in (
+        "shopper@example.com",
+        "raffles",
+        "048616",
+        "6123",
+        "ada",
+        "lovelace",
+        "203.0.113.7",
+        "email",
+        "address",
+        "phone",
+        "zip",
+    ):
+        assert leaked not in wire, f"{leaked!r} reached the gateway body"
+    assert set(spy.body) == {"brand_domain", "product_url", "product_handle", "attribution", "market"}
+    assert set(spy.body["attribution"]) == {"pivota_click_id"}
+
+
+@pytest.mark.asyncio
+async def test_default_market_argument_sends_nothing() -> None:
+    """A caller that passes no `market` at all sends no key — the callers converted before the
+    producer, so an un-migrated one degrades to today's behaviour, never to a wrong vantage."""
+    spy = _BodySpy()
+    await warm.resolve_warm_handoff(
+        dest=BRAND_DEST, ctx={"pvt_click_id": "clk_1"}, settings=settings, client=spy
+    )
+    assert "market" not in spy.body
+
+
+# --- the route: the market must be the CLICK's, through the real signed token ----------------
+
+
+def test_route_sends_the_markets_the_token_was_minted_with(monkeypatch) -> None:
+    """A JP token sends JP and an SG token sends SG — through the real mint + real route.
+
+    Two different non-default markets, so a hardcoded `"US"` (or any single constant) fails
+    here. This is the whole point: the gate must be keyed on the buyer's vantage.
+    """
+    for market in ("JP", "SG"):
+        warm.memo_clear()
+        calls = _spy_resolver(monkeypatch, {"continue_url": CONTINUE_URL})
+        _spy_logger(monkeypatch)
+        token = _mint_token_with_market(market)
+
+        client = TestClient(app)
+        res = client.get(f"/r?token={token}", headers={"user-agent": HUMAN_UA}, follow_redirects=False)
+
+        assert res.headers["location"] == CONTINUE_URL
+        assert len(calls) == 1
+        assert calls[0]["market"] == market, (
+            f"the gate must be keyed on the click's own market, not {calls[0]['market']!r}"
+        )
+
+
+def test_route_lowercase_token_market_reaches_the_gateway_uppercased(monkeypatch) -> None:
+    calls = _spy_resolver(monkeypatch, {"continue_url": CONTINUE_URL})
+    _spy_logger(monkeypatch)
+    token = _mint_token_with_market("jp")
+
+    TestClient(app).get(f"/r?token={token}", headers={"user-agent": HUMAN_UA}, follow_redirects=False)
+
+    assert calls[0]["market"] == "JP"
+
+
+@pytest.mark.parametrize("bad", [_ABSENT, "", "USA", None])
+def test_route_sends_no_market_when_the_token_has_none(monkeypatch, bad: Any) -> None:
+    """No market on the token ⇒ no market on the wire ⇒ the gateway keeps previous behaviour.
+
+    A `"US"` here would be the defect: the deployment's market standing in for the buyer's.
+    """
+    calls = _spy_resolver(monkeypatch, {"continue_url": CONTINUE_URL})
+    logged = _spy_logger(monkeypatch)
+    token = _mint_token_with_market(bad)
+
+    TestClient(app).get(f"/r?token={token}", headers={"user-agent": HUMAN_UA}, follow_redirects=False)
+
+    assert calls[0]["market"] is None, f"expected no market, got {calls[0]['market']!r}"
+    assert logged[0]["token_payload"]["ctx"]["warm_market"] == "none", (
+        "an un-keyable click must be COUNTED on the existing instrument, not lost"
+    )
+
+
+def test_route_counts_the_keyed_market_on_the_click_event(monkeypatch) -> None:
+    """The other arm of the counter: a keyed click records the ISO-2 code it was keyed on."""
+    _spy_resolver(monkeypatch, {"continue_url": CONTINUE_URL})
+    logged = _spy_logger(monkeypatch)
+    token = _mint_token_with_market("SG")
+
+    TestClient(app).get(f"/r?token={token}", headers={"user-agent": HUMAN_UA}, follow_redirects=False)
+
+    ctx = logged[0]["token_payload"]["ctx"]
+    assert ctx["warm_market"] == "SG"
+    assert ctx["handoff"] == "warm", "the counter must not disturb the substitution instrument"
+    assert ctx["warm_reason"] == "ok"
+
+
+def test_ineligible_click_gets_no_market_counter(monkeypatch) -> None:
+    """The counter measures the gate-keying population only — clicks that never asked.
+
+    An un-allowlisted brand never reaches the gateway, so counting it as `warm_market=none`
+    would inflate the un-keyable population with clicks that were never candidates.
+    """
+    monkeypatch.setattr(settings, "outbound_warm_handoff_brands_raw", "someone-else.com")
+    calls = _spy_resolver(monkeypatch, {"continue_url": CONTINUE_URL})
+    logged = _spy_logger(monkeypatch)
+    token = _mint_token_with_market("SG")
+
+    TestClient(app).get(f"/r?token={token}", headers={"user-agent": HUMAN_UA}, follow_redirects=False)
+
+    assert calls == []
+    assert "warm_market" not in logged[0]["token_payload"]["ctx"]
+
+
+def test_flag_off_is_still_byte_identical(monkeypatch) -> None:
+    """The market work must not have woken the lane up when the flag is off."""
+    monkeypatch.setattr(settings, "outbound_warm_handoff_enabled", False)
+    calls = _spy_resolver(monkeypatch, {"continue_url": CONTINUE_URL})
+    logged = _spy_logger(monkeypatch)
+    token = _mint_token_with_market("SG")
+
+    res = TestClient(app).get(
+        f"/r?token={token}", headers={"user-agent": HUMAN_UA}, follow_redirects=False
+    )
+
+    assert res.headers["location"] == BRAND_DEST
+    assert calls == []
+    assert "warm_market" not in (logged[0]["token_payload"].get("ctx") or {})

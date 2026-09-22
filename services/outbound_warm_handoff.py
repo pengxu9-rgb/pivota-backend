@@ -84,6 +84,36 @@ BOT_UA_MARKERS: Tuple[str, ...] = (
 
 _HANDLE_RE = re.compile(r"/products/([a-z0-9][a-z0-9\-_.]*)", re.IGNORECASE)
 
+# ISO 3166-1 alpha-2, and NOTHING else. The gateway's merchant-purchasability gate
+# (PIVOTA-Agent #2259, `docs/merchant-purchasability-gate.md`) keys the fact on
+# (domain, market) and refuses to substitute its own deployment market: a body with no
+# usable `market` is `merchant_purchasability_unkeyable` and the gate keeps the PREVIOUS
+# behaviour. So an unusable value must be OMITTED, never coerced — a coerced market asks
+# the gate about a vantage the shopper is not in, and a positive fact from another vantage
+# is exactly the evidence that made flowerbeauty.com look purchasable.
+_MARKET_RE = re.compile(r"^[A-Z]{2}$")
+
+
+def click_market(market: Any) -> Optional[str]:
+    """The ISO-2 market THIS CLICK WAS SERVED FOR, upper-cased, or ``None``.
+
+    The only admissible source is the signed redirect token's own top-level ``market``
+    (``services/outbound_links_service.resolve_outbound_link`` and the three seed-card
+    minters all stamp it there). That is the value the outbound lane already keyed on when
+    it served this click: it selected the `outbound_link_rules` row, it gated the domain
+    allowlist, it is the `{{market}}` in the UTM campaign, and it is the `market` column on
+    the click event. Any OTHER market — this process's egress country, ``SEED_MARKET``, the
+    gateway deployment's `primaryMarket()` — is a different question than the one the buyer
+    asked, so it is never substituted here.
+
+    ``"us"`` -> ``"US"``. ``"USA"``, ``""``, ``None``, ``"U1"``, a non-string -> ``None``.
+    """
+    if not isinstance(market, str):
+        return None
+    candidate = market.strip().upper()
+    return candidate if _MARKET_RE.match(candidate) else None
+
+
 # A warm handoff may only 302 to a CART or CHECKOUT. Measured against the shapes the gateway
 # actually returns (PIVOTA-Agent `extractHandoffUrl` yields the merchant's UCP
 # continue_url | checkout_url | permalink | url), BOTH families are legitimate and live:
@@ -403,6 +433,7 @@ async def resolve_warm_handoff(
     dest: str,
     ctx: Optional[Dict[str, Any]],
     settings: Any,
+    market: Any = None,
     client: Optional[httpx.AsyncClient] = None,
 ) -> Optional[Dict[str, Any]]:
     """Call the gateway's internal resolve endpoint. Returns {continue_url, cart_id} or None.
@@ -438,6 +469,16 @@ async def resolve_warm_handoff(
         # Threaded into the UCP create_cart `attribution` arg — whether Shopify persists it
         # onto the order is the spec's Phase 0 empirical question; passing it costs nothing.
         payload["attribution"] = {"pivota_click_id": click_id}
+
+    # THE BUYER MARKET, for the gateway's merchant-purchasability gate and nothing else.
+    # Validated at the SINK (here), not merely at the caller, so no caller can put a
+    # non-ISO-2 value on the wire. Omitted when unknown: the gateway then logs
+    # `merchant_purchasability_unkeyable` and keeps its previous behaviour, which is a
+    # deliberate no-change, not a silent pass. With `market` absent this payload is
+    # byte-identical to what it was before this key existed.
+    market_code = click_market(market)
+    if market_code:
+        payload["market"] = market_code
 
     # A shopper is waiting on the 302: `total_deadline` is a TRUE wall-clock ceiling via
     # asyncio.wait_for (httpx.Timeout alone is per-phase — connect+read could stack past it).

@@ -430,6 +430,20 @@ separate PR in **PIVOTA-Agent**, and until it lands the gate protects the Reap r
 * `sweep_enabled` is also in the response, for diagnostics: `sweep_enabled: false` with
   `enforced: true` is the misordered state above and is worth logging loudly.
 
+**The click lane sends `market`; a click with no market is not gated.** The warm-handoff body
+this backend POSTs to the gateway's `POST /internal/ucp/warm-handoff/resolve`
+(`services/outbound_warm_handoff.resolve_warm_handoff`) carries an optional `market`: the ISO-2
+market **the click itself was served for**, read from the signed `/r` token's own top-level
+`market` (`services/outbound_warm_handoff.click_market`) — the same value that selected the
+outbound rule and the domain allowlist for that click. It is validated to `^[A-Z]{2}$` after
+upper-casing and **omitted otherwise**; nothing is substituted, not this process's egress
+country and not `SEED_MARKET`, because the fact is keyed on the BUYER's vantage and a positive
+fact from another vantage is the flowerbeauty signal all over again. A click whose token carries
+no usable market therefore sends **no `market` key**, the gateway logs
+`merchant_purchasability_unkeyable`, and that handoff keeps its pre-gate behaviour — an
+un-gated click, by design. Those clicks are counted, not lost: the click event ctx carries
+`warm_market` alongside `handoff` / `warm_reason`, holding the ISO-2 code or the literal `none`.
+
 ### Rolling back
 
 **Unset `MERCHANT_PURCHASABILITY_ENFORCE`.** That alone stops every refusal:

@@ -29,6 +29,7 @@ from services.outbound_links_service import (
 )
 from config.settings import settings
 from services.outbound_warm_handoff import (
+    click_market,
     evaluate_warm_eligibility,
     memo_get,
     memo_set,
@@ -226,14 +227,27 @@ async def redirect_endpoint(req: Request, token: str = Query(..., min_length=10)
                 settings=settings,
             )
             if eligible:
+                # THE CLICK'S OWN MARKET — the signed token's top-level `market`, stamped by
+                # whichever minter served this link. It is the market that selected the
+                # outbound rule and the domain allowlist for THIS click, so it is the market
+                # the gateway's purchasability gate must key on. Never this process's egress
+                # country and never SEED_MARKET: the gate asks "is this merchant payable from
+                # where the buyer is", and answering from another vantage is the flowerbeauty
+                # lane. A token that carries no usable market sends no `market` key at all and
+                # is counted as `warm_market=none` on the click event ctx below — the gateway
+                # keeps its previous behaviour for those.
+                market_code = click_market(payload.get("market"))
                 # Per-token memo: agent-platform prefetch + the real human click build ONE
-                # cart, and the human click 302s instantly off the memo.
+                # cart, and the human click 302s instantly off the memo. The memo is keyed on
+                # the token, and the market travels ON the token, so two markets can never
+                # share one memoed cart.
                 hit, resolved = memo_get(token)
                 if not hit:
                     resolved = await resolve_warm_handoff(
                         dest=dest,
                         ctx=payload.get("ctx") if isinstance(payload.get("ctx"), dict) else {},
                         settings=settings,
+                        market=market_code,
                     )
                     memo_set(token, resolved)
                 if resolved and resolved.get("continue_url"):
@@ -241,6 +255,12 @@ async def redirect_endpoint(req: Request, token: str = Query(..., min_length=10)
                     warm_ctx = {"handoff": "warm", "warm_reason": "ok"}
                 else:
                     warm_ctx = {"handoff": "cold", "warm_reason": "unresolved"}
+                # The gate-keying instrument, on the SAME click-event ctx as handoff /
+                # warm_reason. `none` = this click asked the gateway a question it could not
+                # key, so the purchasability gate kept its previous behaviour. Counting it
+                # here is what stops "no market" from being an invisible population. An ISO-2
+                # code or the literal `none` — never a buyer identifier.
+                warm_ctx["warm_market"] = market_code or "none"
             else:
                 warm_ctx = {"handoff": "cold", "warm_reason": reason}
             ctx_out = dict(payload.get("ctx")) if isinstance(payload.get("ctx"), dict) else {}
