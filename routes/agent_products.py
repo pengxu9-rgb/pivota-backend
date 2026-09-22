@@ -543,7 +543,24 @@ async def get_merchant_products(
         # Verify agent has access to this merchant
         if not context.can_access_merchant(merchant_id):
             raise HTTPException(status_code=403, detail="Not authorized for this merchant")
-        
+
+        # An observed external retailer (merch_obs_*, e.g. jsmbeauty.sg) has no catalog here: no
+        # onboarding, no products cache, no realtime API. The hybrid query below answers 200 with
+        # an EMPTY list for it, which reads as "this store sells nothing" -- measured 2026-09-22 for
+        # the JSM seller whose product search and detail both serve. Refuse explicitly instead, and
+        # say where its products are: search (by brand) finds them, product/variant detail opens them.
+        if str(merchant_id or "").strip().startswith(detail_proxy.OBSERVED_SELLER_PREFIX):
+            background_tasks.add_task(log_agent_request, context=context, status_code=404, merchant_id=merchant_id)
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    "Catalog listing is not available for external retailer sellers. Find their products "
+                    "with GET /agent/v1/products/search (for example by brand), and open one with "
+                    "GET /agent/v1/products/merchants/{merchant_id}/product/{product_id}."
+                ),
+                headers={"X-Error-Code": "MERCHANT_LISTING_UNAVAILABLE"},
+            )
+
         # Use hybrid query service (decides cache vs realtime)
         products, query_source, error = await get_products_hybrid(
             merchant_id=merchant_id,
