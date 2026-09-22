@@ -45,6 +45,16 @@ GATEWAY_PRODUCT = {
          "price": {"current": {"amount": 30, "currency": "SGD"}}, "availability": {"in_stock": False}},
     ],
 }
+# The same product as the gateway's get_pdp_v2 lane returns it: the canonical module's
+# pdp_payload.product, brand as {name}, price as {current:{amount,currency}}.
+PDP_V2_BODY = {"modules": [
+    {"type": "overview", "data": {}},
+    {"type": "canonical", "data": {"pdp_payload": {"product": {
+        **{k: v for k, v in GATEWAY_PRODUCT.items() if k not in {"brand", "currency"}},
+        "brand": {"name": "JUNGSAEMMOOL"},
+        "price": {"current": {"amount": 30, "currency": "SGD"}},
+    }}}},
+]}
 CONTRACT_KEYS = {"id", "merchant_id", "currency", "title", "description", "vendor", "product_type",
                  "variants", "options", "images", "tags"}
 
@@ -116,7 +126,7 @@ async def _get(path: str, headers: Dict[str, str] | None = None) -> httpx.Respon
 
 
 def _ok(_request: httpx.Request) -> httpx.Response:
-    return httpx.Response(200, json={"product": GATEWAY_PRODUCT})
+    return httpx.Response(200, json=PDP_V2_BODY)
 
 
 # --- the switch ---------------------------------------------------------------------------
@@ -157,8 +167,9 @@ async def test_product_detail_is_served_by_the_gateway_in_this_contract(monkeypa
     sent = seen[0]
     assert str(sent.url) == "http://gw.test/agent/shop/v1/invoke"
     import json as _json
-    assert _json.loads(sent.content) == {"operation": "get_product_detail",
-                                         "payload": {"product": {"merchant_id": MID, "product_id": SIG}}}
+    # get_pdp_v2, NOT get_product_detail: over HTTP invoke the latter goes back to this backend.
+    assert _json.loads(sent.content) == {"operation": "get_pdp_v2",
+                                         "payload": {"product_ref": {"product_id": SIG}, "include": ["product_overview"]}}
     assert sent.headers["x-agent-api-key"] == "ak_caller", "the caller's own key, never a service credential"
     assert sent.headers[HOP_HEADER] == "1"
 
@@ -242,7 +253,7 @@ async def test_variant_detail_resolves_the_variant_then_serves_the_product(monke
     assert onboarding_calls == []
     assert db.calls[-1]["variant_id"] == variant
     import json as _json
-    assert _json.loads(seen[0].content)["payload"]["product"] == {"merchant_id": MID, "product_id": SIG, "sku_id": variant}
+    assert _json.loads(seen[0].content)["payload"]["product_ref"] == {"product_id": SIG}
     body = resp.json()
     product = body["product"]
     assert product["id"] == SIG and body["selected_variant_id"] == variant
@@ -264,8 +275,9 @@ async def test_a_handle_is_matched_only_as_the_exact_external_key_shape() -> Non
     db = _FakeDB()
     await detail_proxy.resolve_signature(db, MID, product_ref="lip_gloss%")
     assert db.calls[-1]["ext_ref"] == "ext:lip\\_gloss\\%::%", "LIKE metacharacters in a caller's id are escaped"
+    # A Pivota id is looked up like any other reference -- never trusted as-is.
     sig, why = await detail_proxy.resolve_signature(db, MID, product_ref=SIG)
-    assert (sig, why) == (SIG, "sig")
+    assert (sig, why) == (SIG, "resolved") and db.calls[-1]["ref"] == SIG
 
 
 @pytest.mark.asyncio
@@ -302,3 +314,69 @@ async def test_a_connected_merchants_variant_detail_still_runs_its_own_path(monk
     assert body["product"]["title"] == "Wix Balm" and body["selected_variant_id"] == "v_123"
     assert "served_by" not in body["product"]
     assert seen == [], "a connected merchant is never forwarded"
+
+
+
+@pytest.mark.asyncio
+async def test_another_merchants_pivota_id_is_not_served_under_this_merchant(monkeypatch: pytest.MonkeyPatch, endpoint) -> None:
+    """The gateway lane is merchant-blind, so the lookup is the only thing tying the id to the path's
+    merchant (its SQL scope is pinned on Postgres in test_agent_product_detail_lookup_postgres.py)."""
+    _, db, _ = endpoint
+    monkeypatch.setenv(detail_proxy.FLAG, "on")
+    seen = _mock_gateway(monkeypatch, _ok)
+    resp = await _get(f"/agent/v1/products/merchants/{MID}/product/sig_of_another_merchant")
+    assert resp.status_code == 404 and resp.headers["x-error-code"] == "DETAIL_NOT_FOUND"
+    assert db.calls[-1]["ref"] == "sig_of_another_merchant"
+    assert seen == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("handler,status,code", [
+    (lambda r: (_ for _ in ()).throw(httpx.ReadTimeout("slow", request=r)), 504, "GATEWAY_TIMEOUT"),
+    (lambda r: (_ for _ in ()).throw(httpx.ConnectError("down", request=r)), 503, "GATEWAY_UNAVAILABLE"),
+    (lambda r: httpx.Response(200, content=b"<html>"), 502, "GATEWAY_INVALID_JSON"),
+    (lambda r: httpx.Response(200, json={"modules": [{"type": "overview", "data": {}}]}), 404, "GATEWAY_NO_CANONICAL_PRODUCT"),
+])
+async def test_transport_and_shape_failures_are_visible(monkeypatch: pytest.MonkeyPatch, endpoint, handler, status: int, code: str) -> None:
+    _, _, onboarding_calls = endpoint
+    monkeypatch.setenv(detail_proxy.FLAG, "on")
+    _mock_gateway(monkeypatch, handler)
+    resp = await _get(f"/agent/v1/products/merchants/{MID}/product/{SIG}")
+    assert (resp.status_code, resp.headers["x-error-code"]) == (status, code)
+    assert onboarding_calls == []
+
+
+def test_pdp_v2_normalization_matches_the_gateways_own() -> None:
+    product = detail_proxy.normalize_pdp_v2(PDP_V2_BODY)
+    assert (product["brand"], product["price"], product["currency"]) == ("JUNGSAEMMOOL", 30, "SGD")
+    assert product["variants"] == GATEWAY_PRODUCT["variants"]
+    assert detail_proxy.normalize_pdp_v2({"modules": []}) is None
+    assert detail_proxy.normalize_pdp_v2({}) is None
+
+
+def test_unknown_stock_and_image_fallbacks() -> None:
+    raw = {"product_id": SIG, "image_url": "https://x/one.jpg", "currency": "SGD",
+           "variants": [{"variant_id": "1", "price": {"current": {"amount": 30, "currency": "SGD"}}, "availability": {}}]}
+    product = detail_proxy.to_backend_detail(raw, merchant_id=MID)["product"]
+    assert product["images"] == ["https://x/one.jpg"]
+    assert product["variants"][0]["available"] is None, "no flag from the retailer is unknown, not False"
+
+
+@pytest.mark.asyncio
+async def test_the_real_gateway_answer_maps_to_this_contract(monkeypatch: pytest.MonkeyPatch, endpoint) -> None:
+    """Against the LIVE get_pdp_v2 body (tests/fixtures, captured 2026-09-22), not a shape we wrote."""
+    import json as _json
+    from pathlib import Path
+
+    real = _json.loads((Path(__file__).parent / "fixtures" / "gateway_pdp_v2_jsm_gloss_2026_09_22.json").read_text())
+    monkeypatch.setenv(detail_proxy.FLAG, "on")
+    _mock_gateway(monkeypatch, lambda r: httpx.Response(200, json=real))
+    resp = await _get(f"/agent/v1/products/merchants/{MID}/variant/50856826536257")
+    assert resp.status_code == 200
+    product = resp.json()["product"]
+    assert (product["title"], product["vendor"], product["currency"]) == ("LIP-PRESSION Metal Serum Gloss", "JUNGSAEMMOOL", "SGD")
+    assert len(product["variants"]) == 12 and len(product["images"]) >= 1
+    core = next(v for v in product["variants"] if v["variant_id"] == "50856826536257")
+    assert (core["title"], core["sku"], core["price"], core["currency"], core["available"]) == ("Core Drop", "32168999", 30.0, "SGD", True)
+    assert product["options"][0]["name"] == "Color" and len(product["options"][0]["values"]) == 12
+    assert product["destination_url"] == "https://jsmbeauty.sg/products/lip-pression-metal-serum-gloss"

@@ -1,0 +1,479 @@
+{
+ "modules": [
+  {
+   "type": "canonical",
+   "data": {
+    "pdp_payload": {
+     "product": {
+      "product_id": "sig_b978d922cbcb2f0c04ccf2e1a1e3b558",
+      "merchant_id": "merch_obs_88382424262f3e0f",
+      "title": "LIP-PRESSION Metal Serum Gloss",
+      "pdp_schema_profile": "beauty_formula",
+      "subtitle": "",
+      "brand": {
+       "name": "JUNGSAEMMOOL"
+      },
+      "category_path": [
+       "beauty",
+       "makeup",
+       "lip",
+       "gloss"
+      ],
+      "category_kind": "beauty",
+      "image_url": "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637",
+      "image_urls": [
+       "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637",
+       "https://jsmbeauty.sg/cdn/shop/files/SHOPIFY_1f9060d9-25b7-487c-84da-926c8a6bfe18_840x.jpg?v=1769737637",
+       "https://jsmbeauty.sg/cdn/shop/files/MASTERCLASS_SET_1_0989f782-71e1-4657-ace4-6a26f404e805.jpg?v=1712048070",
+       "https://jsmbeauty.sg/cdn/shop/files/01_IMG_3035.jpg?v=1712048139",
+       "https://jsmbeauty.sg/cdn/shop/files/230915__2.png?v=1712048543",
+       "https://jsmbeauty.sg/cdn/shop/files/WhatsApp_Image_2024-04-02_at_4.50.33_PM.jpg?v=1712047852"
+      ],
+      "images": [
+       "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637",
+       "https://jsmbeauty.sg/cdn/shop/files/SHOPIFY_1f9060d9-25b7-487c-84da-926c8a6bfe18_840x.jpg?v=1769737637",
+       "https://jsmbeauty.sg/cdn/shop/files/MASTERCLASS_SET_1_0989f782-71e1-4657-ace4-6a26f404e805.jpg?v=1712048070",
+       "https://jsmbeauty.sg/cdn/shop/files/01_IMG_3035.jpg?v=1712048139",
+       "https://jsmbeauty.sg/cdn/shop/files/230915__2.png?v=1712048543",
+       "https://jsmbeauty.sg/cdn/shop/files/WhatsApp_Image_2024-04-02_at_4.50.33_PM.jpg?v=1712047852"
+      ],
+      "source": "external_seed",
+      "readiness_tier": null,
+      "serving_eligible": true,
+      "purchase_route": null,
+      "commerce_mode": null,
+      "checkout_handoff": null,
+      "external_redirect_url": "https://jsmbeauty.sg/products/lip-pression-metal-serum-gloss",
+      "url": "https://agent.pivota.cc/products/sig_b978d922cbcb2f0c04ccf2e1a1e3b558",
+      "canonical_url": "https://agent.pivota.cc/products/sig_b978d922cbcb2f0c04ccf2e1a1e3b558",
+      "destination_url": "https://jsmbeauty.sg/products/lip-pression-metal-serum-gloss",
+      "source_url": "https://jsmbeauty.sg/products/lip-pression-metal-serum-gloss",
+      "default_variant_id": "50856826536257",
+      "variants": [
+       {
+        "variant_id": "50856826536257",
+        "sku_id": "32168999",
+        "title": "Core Drop",
+        "options": [
+         {
+          "name": "Color",
+          "value": "Core Drop",
+          "axis_kind": "color"
+         }
+        ],
+        "price": {
+         "current": {
+          "amount": 30,
+          "currency": "SGD"
+         }
+        },
+        "availability": {
+         "in_stock": true
+        },
+        "image_url": "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637",
+        "label_image_url": "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637",
+        "swatch_image_url": "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637",
+        "images": [
+         "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637"
+        ],
+        "image_urls": [
+         "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637"
+        ],
+        "axis_kind": "color",
+        "display_label": "Color: Core Drop",
+        "source_quality_status": "captured"
+       },
+       {
+        "variant_id": "50865870831937",
+        "sku_id": "32128937",
+        "title": "Chai Tea",
+        "options": [
+         {
+          "name": "Color",
+          "value": "Chai Tea",
+          "axis_kind": "color"
+         }
+        ],
+        "price": {
+         "current": {
+          "amount": 30,
+          "currency": "SGD"
+         }
+        },
+        "availability": {
+         "in_stock": true
+        },
+        "image_url": "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637",
+        "label_image_url": "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637",
+        "swatch_image_url": "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637",
+        "images": [
+         "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637"
+        ],
+        "image_urls": [
+         "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637"
+        ],
+        "axis_kind": "color",
+        "display_label": "Color: Chai Tea",
+        "source_quality_status": "captured"
+       },
+       {
+        "variant_id": "50865870864705",
+        "sku_id": "32179002",
+        "title": "Mermaid Dew",
+        "options": [
+         {
+          "name": "Color",
+          "value": "Mermaid Dew",
+          "axis_kind": "color"
+         }
+        ],
+        "price": {
+         "current": {
+          "amount": 30,
+          "currency": "SGD"
+         }
+        },
+        "availability": {
+         "in_stock": true
+        },
+        "image_url": "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637",
+        "label_image_url": "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637",
+        "swatch_image_url": "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637",
+        "images": [
+         "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637"
+        ],
+        "image_urls": [
+         "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637"
+        ],
+        "axis_kind": "color",
+        "display_label": "Color: Mermaid Dew",
+        "source_quality_status": "captured"
+       },
+       {
+        "variant_id": "50865870897473",
+        "sku_id": "32108913",
+        "title": "Barbie Muse",
+        "options": [
+         {
+          "name": "Color",
+          "value": "Barbie Muse",
+          "axis_kind": "color"
+         }
+        ],
+        "price": {
+         "current": {
+          "amount": 30,
+          "currency": "SGD"
+         }
+        },
+        "availability": {
+         "in_stock": true
+        },
+        "image_url": "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637",
+        "label_image_url": "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637",
+        "swatch_image_url": "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637",
+        "images": [
+         "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637"
+        ],
+        "image_urls": [
+         "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637"
+        ],
+        "axis_kind": "color",
+        "display_label": "Color: Barbie Muse",
+        "source_quality_status": "captured"
+       },
+       {
+        "variant_id": "50865870930241",
+        "sku_id": "32199026",
+        "title": "Demi Love",
+        "options": [
+         {
+          "name": "Color",
+          "value": "Demi Love",
+          "axis_kind": "color"
+         }
+        ],
+        "price": {
+         "current": {
+          "amount": 30,
+          "currency": "SGD"
+         }
+        },
+        "availability": {
+         "in_stock": true
+        },
+        "image_url": "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637",
+        "label_image_url": "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637",
+        "swatch_image_url": "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637",
+        "images": [
+         "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637"
+        ],
+        "image_urls": [
+         "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637"
+        ],
+        "axis_kind": "color",
+        "display_label": "Color: Demi Love",
+        "source_quality_status": "captured"
+       },
+       {
+        "variant_id": "50865870963009",
+        "sku_id": "32118920",
+        "title": "Muted Fig",
+        "options": [
+         {
+          "name": "Color",
+          "value": "Muted Fig",
+          "axis_kind": "color"
+         }
+        ],
+        "price": {
+         "current": {
+          "amount": 30,
+          "currency": "SGD"
+         }
+        },
+        "availability": {
+         "in_stock": true
+        },
+        "image_url": "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637",
+        "label_image_url": "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637",
+        "swatch_image_url": "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637",
+        "images": [
+         "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637"
+        ],
+        "image_urls": [
+         "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637"
+        ],
+        "axis_kind": "color",
+        "display_label": "Color: Muted Fig",
+        "source_quality_status": "captured"
+       },
+       {
+        "variant_id": "50865870995777",
+        "sku_id": "32148951",
+        "title": "Rose Dose",
+        "options": [
+         {
+          "name": "Color",
+          "value": "Rose Dose",
+          "axis_kind": "color"
+         }
+        ],
+        "price": {
+         "current": {
+          "amount": 30,
+          "currency": "SGD"
+         }
+        },
+        "availability": {
+         "in_stock": true
+        },
+        "image_url": "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637",
+        "label_image_url": "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637",
+        "swatch_image_url": "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637",
+        "images": [
+         "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637"
+        ],
+        "image_urls": [
+         "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637"
+        ],
+        "axis_kind": "color",
+        "display_label": "Color: Rose Dose",
+        "source_quality_status": "captured"
+       },
+       {
+        "variant_id": "50865871028545",
+        "sku_id": "32189019",
+        "title": "Tawny Peach",
+        "options": [
+         {
+          "name": "Color",
+          "value": "Tawny Peach",
+          "axis_kind": "color"
+         }
+        ],
+        "price": {
+         "current": {
+          "amount": 30,
+          "currency": "SGD"
+         }
+        },
+        "availability": {
+         "in_stock": true
+        },
+        "image_url": "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637",
+        "label_image_url": "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637",
+        "swatch_image_url": "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637",
+        "images": [
+         "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637"
+        ],
+        "image_urls": [
+         "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637"
+        ],
+        "axis_kind": "color",
+        "display_label": "Color: Tawny Peach",
+        "source_quality_status": "captured"
+       },
+       {
+        "variant_id": "50865871061313",
+        "sku_id": "32138944",
+        "title": "Burnt Sienna",
+        "options": [
+         {
+          "name": "Color",
+          "value": "Burnt Sienna",
+          "axis_kind": "color"
+         }
+        ],
+        "price": {
+         "current": {
+          "amount": 30,
+          "currency": "SGD"
+         }
+        },
+        "availability": {
+         "in_stock": true
+        },
+        "image_url": "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637",
+        "label_image_url": "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637",
+        "swatch_image_url": "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637",
+        "images": [
+         "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637"
+        ],
+        "image_urls": [
+         "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637"
+        ],
+        "axis_kind": "color",
+        "display_label": "Color: Burnt Sienna",
+        "source_quality_status": "captured"
+       },
+       {
+        "variant_id": "50865871094081",
+        "sku_id": "32158968",
+        "title": "Coco Mocha",
+        "options": [
+         {
+          "name": "Color",
+          "value": "Coco Mocha",
+          "axis_kind": "color"
+         }
+        ],
+        "price": {
+         "current": {
+          "amount": 30,
+          "currency": "SGD"
+         }
+        },
+        "availability": {
+         "in_stock": true
+        },
+        "image_url": "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637",
+        "label_image_url": "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637",
+        "swatch_image_url": "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637",
+        "images": [
+         "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637"
+        ],
+        "image_urls": [
+         "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637"
+        ],
+        "axis_kind": "color",
+        "display_label": "Color: Coco Mocha",
+        "source_quality_status": "captured"
+       },
+       {
+        "variant_id": "50865871126849",
+        "sku_id": "32209033",
+        "title": "Berry Moon",
+        "options": [
+         {
+          "name": "Color",
+          "value": "Berry Moon",
+          "axis_kind": "color"
+         }
+        ],
+        "price": {
+         "current": {
+          "amount": 30,
+          "currency": "SGD"
+         }
+        },
+        "availability": {
+         "in_stock": true
+        },
+        "image_url": "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637",
+        "label_image_url": "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637",
+        "swatch_image_url": "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637",
+        "images": [
+         "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637"
+        ],
+        "image_urls": [
+         "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637"
+        ],
+        "axis_kind": "color",
+        "display_label": "Color: Berry Moon",
+        "source_quality_status": "captured"
+       },
+       {
+        "variant_id": "50865871159617",
+        "sku_id": "32219040",
+        "title": "Boba Noir",
+        "options": [
+         {
+          "name": "Color",
+          "value": "Boba Noir",
+          "axis_kind": "color"
+         }
+        ],
+        "price": {
+         "current": {
+          "amount": 30,
+          "currency": "SGD"
+         }
+        },
+        "availability": {
+         "in_stock": true
+        },
+        "image_url": "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637",
+        "label_image_url": "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637",
+        "swatch_image_url": "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637",
+        "images": [
+         "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637"
+        ],
+        "image_urls": [
+         "https://jsmbeauty.sg/cdn/shop/files/MetalSerumGloss_02.jpg?v=1769737637"
+        ],
+        "axis_kind": "color",
+        "display_label": "Color: Boba Noir",
+        "source_quality_status": "captured"
+       }
+      ],
+      "purchase_grain": "variant",
+      "price": {
+       "current": {
+        "amount": 30,
+        "currency": "SGD"
+       }
+      },
+      "availability": {
+       "in_stock": true
+      },
+      "description": "A lip gloss with rich colour density and a cooling metal tip, delivering voluminous shine and continuous hydration with its 93% serum-caring formula.",
+      "source_product_id": "jungsaemmool:615e47aee567b863",
+      "product_key": "ext:jungsaemmool-lip-pression-metal-serum-gloss::66a3c8a4",
+      "catalog_category_path": "beauty/makeup/lip/gloss",
+      "category": "Lip Gloss",
+      "product_type": "Lip Gloss",
+      "category_label_source": "meitu_sg_gloss_reviewed_0920",
+      "category_confidence": 0.95,
+      "sellable_item_group_id": "sig_b978d922cbcb2f0c04ccf2e1a1e3b558",
+      "product_group_id": "sig_b978d922cbcb2f0c04ccf2e1a1e3b558",
+      "pivota_signature_id": "sig_b978d922cbcb2f0c04ccf2e1a1e3b558",
+      "signature_id": "sig_b978d922cbcb2f0c04ccf2e1a1e3b558",
+      "pivota_canonical_url": "https://agent.pivota.cc/products/sig_b978d922cbcb2f0c04ccf2e1a1e3b558"
+     }
+    }
+   }
+  }
+ ],
+ "_note": "Live gateway HTTP invoke get_pdp_v2 for sig_b978d922cbcb2f0c04ccf2e1a1e3b558, 2026-09-22, trimmed to the canonical module."
+}

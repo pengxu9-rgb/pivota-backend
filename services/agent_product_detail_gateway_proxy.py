@@ -7,11 +7,17 @@ sellers, `merch_obs_*` -- e.g. jsmbeauty.sg) are in none of them, so a partner t
 product through search and opens it gets a 404. Measured 2026-09-22 for the Meitu JSM gloss:
 search returns it, detail and variant detail both 404.
 
-The gateway already serves that detail: hosted UCP `get_product` reaches it through the gateway's
-`/agent/shop/v1/invoke` `get_product_detail`, which routes observed sellers to its own PDP lane
-(title, brand, images, every shade with its SKU and live price). So this module forwards the SAME
-call, with the caller's OWN credential, and reshapes the answer into this endpoint's contract --
-one detail implementation (ADR-021), not a second copy of it here with a staler price.
+The gateway already serves that detail: its PDP lane, `get_pdp_v2` -- the lane the public product
+page renders from, and the one hosted UCP `get_product` is rerouted to for observed sellers (title,
+brand, images, every shade with its SKU and live price). This module asks that lane, over the
+gateway's HTTP `/agent/shop/v1/invoke`, with the caller's OWN credential, and reshapes the answer
+into this endpoint's contract -- one detail implementation (ADR-021), not a second copy here.
+
+⚠️ NOT `get_product_detail`. Over HTTP invoke, the gateway sends `get_product_detail` straight
+back to THIS backend's Python invoke route, which has no observed-seller rows and 404s. The
+observed-seller reroute to `get_pdp_v2` lives only in the gateway's in-process commerce kernel
+(invokeCommerceKernelRawUpstream), which hosted UCP uses and HTTP invoke does not. Review of #2239
+caught this; the first version's mocked gateway answered any POST, so its tests could not.
 
 Scope: observed sellers only. Onboarded merchants keep their existing path untouched, and the
 gateway's own detail for a non-observed seller would call back into this backend.
@@ -54,12 +60,16 @@ def enabled_for(merchant_id: Optional[str], headers: Mapping[str, str], env: Map
     return True, "enabled"
 
 
-# The one table lookup: the caller's reference (a Pivota id, a handle, a product key, or a variant
-# id) -> the product's Pivota signature, scoped to THIS merchant and to unsuppressed rows (the same
-# refusal every serving path makes). A handle is the middle of the external key
-# `ext:<handle>::<hash>`, so it is matched by that exact shape, never by a free LIKE.
+# The one table lookup: the caller's reference (a Pivota id, a product key, a content key, a
+# source product id, or the name segment of an external key) -> the product's Pivota signature,
+# scoped to THIS merchant and to unsuppressed rows (the same refusal every serving path makes).
+# A Pivota id goes through it too: the gateway lane is merchant-blind, so an unchecked `sig_` would
+# let `/merchants/A/product/<B's sig>` serve B's product labelled A.
+# The external key is `ext:<name>::<hash>` (derive_product_key), so its name segment is matched by
+# that exact shape, never by a free LIKE. For the Meitu gloss the name equals the Shopify handle;
+# that is not guaranteed in general, and a miss is an honest 404.
 _PRODUCT_SQL = """
-SELECT cp.pivota_signature_id
+SELECT DISTINCT cp.pivota_signature_id
 FROM catalog_products cp
 WHERE cp.merchant_id = :merchant_id
   AND cp.suppressed_at IS NULL
@@ -69,12 +79,11 @@ WHERE cp.merchant_id = :merchant_id
        OR cp.product_key = :ref
        OR cp.content_key = :ref
        OR cp.product_key LIKE :ext_ref)
-ORDER BY (cp.pivota_signature_id = :ref) DESC, cp.product_key
 LIMIT 2
 """
 
 _VARIANT_SQL = """
-SELECT cp.pivota_signature_id
+SELECT DISTINCT cp.pivota_signature_id
 FROM catalog_skus cs
 JOIN catalog_products cp ON cp.product_key = cs.product_key
 WHERE cs.merchant_id = :merchant_id
@@ -82,7 +91,6 @@ WHERE cs.merchant_id = :merchant_id
   AND cs.suppressed_at IS NULL
   AND cp.suppressed_at IS NULL
   AND COALESCE(cp.pivota_signature_id, '') <> ''
-ORDER BY cp.product_key
 LIMIT 2
 """
 
@@ -96,8 +104,6 @@ async def resolve_signature(database: Any, merchant_id: str, *, product_ref: Opt
     """(signature, reason). Exactly one product, or refuse -- never a guess between two."""
     if product_ref:
         ref = str(product_ref).strip()
-        if ref.startswith("sig_"):
-            return ref, "sig"
         rows = await database.fetch_all(_PRODUCT_SQL, {
             "merchant_id": merchant_id, "ref": ref, "ext_ref": f"ext:{_like_escape(ref)}::%",
         })
@@ -111,14 +117,16 @@ async def resolve_signature(database: Any, merchant_id: str, *, product_ref: Opt
 
 async def fetch_detail(*, base_url: str, merchant_id: str, signature: str, variant_id: Optional[str],
                        headers: Mapping[str, str]) -> Tuple[Optional[Dict[str, Any]], str, int]:
-    """Forward once. (product, reason, caller-facing status); never raises."""
-    product: Dict[str, Any] = {"merchant_id": merchant_id, "product_id": signature}
-    if variant_id:
-        product["sku_id"] = str(variant_id)
+    """Ask the gateway's PDP lane once. (product in the `{product}` detail shape, reason,
+    caller-facing status); never raises. `merchant_id`/`variant_id` are not sent: the lane is keyed
+    by the Pivota id alone, and the merchant was already checked against it in resolve_signature."""
     try:
         response = await _get_client().post(
             f"{str(base_url).rstrip('/')}{INVOKE_PATH}",
-            json={"operation": "get_product_detail", "payload": {"product": product}},
+            json={
+                "operation": "get_pdp_v2",
+                "payload": {"product_ref": {"product_id": signature}, "include": ["product_overview"]},
+            },
             headers=gateway_headers(headers),
         )
     except httpx.TimeoutException:
@@ -129,15 +137,38 @@ async def fetch_detail(*, base_url: str, merchant_id: str, signature: str, varia
         body = response.json()
     except Exception:
         return None, "gateway_invalid_json", 502
-    if response.status_code == 200 and isinstance(body, dict) and isinstance(body.get("product"), dict):
-        return body["product"], "ok", 200
+    if response.status_code == 200 and isinstance(body, dict):
+        product = normalize_pdp_v2(body)
+        if product is not None:
+            return product, "ok", 200
+        return None, "gateway_no_canonical_product", 404
     error = body.get("error") if isinstance(body, dict) else None
     code = str((error or {}).get("code") or "") if isinstance(error, dict) else ""
-    # The gateway's "this id is real but has nothing to show" answers are a not-found to this caller.
     if code in {"NO_MERCHANT_OFFER", "PRODUCT_NOT_FOUND", "NOT_FOUND"} or response.status_code == 404:
         return None, f"gateway_{code.lower() or 'not_found'}", 404
     status = response.status_code
     return None, f"gateway_http_{status}", status if status in {400, 401, 403, 429, 503, 504} else 502
+
+
+def normalize_pdp_v2(body: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The gateway's own normalizePdpV2ToProductDetail (src/server.js), in Python: the canonical
+    module's `pdp_payload.product`, with brand `{name}` and price `{current:{amount,currency}}`
+    flattened. None when there is no canonical product."""
+    modules = body.get("modules") if isinstance(body.get("modules"), list) else []
+    canonical = next((m for m in modules if isinstance(m, dict) and m.get("type") == "canonical"), None)
+    data = canonical.get("data") if isinstance(canonical, dict) and isinstance(canonical.get("data"), dict) else {}
+    payload = data.get("pdp_payload") if isinstance(data.get("pdp_payload"), dict) else {}
+    product = payload.get("product")
+    if not isinstance(product, dict):
+        return None
+    out = dict(product)
+    brand = product.get("brand")
+    out["brand"] = (brand.get("name") if isinstance(brand, dict) else brand) or None
+    price = product.get("price")
+    current = price.get("current") if isinstance(price, dict) and isinstance(price.get("current"), dict) else None
+    out["price"] = current.get("amount") if current else (price if isinstance(price, (int, float)) else None)
+    out["currency"] = current.get("currency") if current else (product.get("currency") if isinstance(product.get("currency"), str) else None)
+    return out
 
 
 def _money(value: Any) -> Optional[float]:
