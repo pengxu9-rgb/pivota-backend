@@ -382,3 +382,43 @@ async def test_the_real_gateway_answer_maps_to_this_contract(monkeypatch: pytest
     assert product["destination_url"] == "https://jsmbeauty.sg/products/lip-pression-metal-serum-gloss"
     # The lane's own answer agrees with the merchant the path named (and resolve_signature checked).
     assert real["modules"][0]["data"]["pdp_payload"]["product"]["merchant_id"] == MID == product["merchant_id"]
+
+
+# --- merchant listing ------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_listing_an_external_retailer_is_an_explicit_refusal_not_an_empty_catalog(monkeypatch: pytest.MonkeyPatch, endpoint) -> None:
+    hybrid_calls: List[str] = []
+
+    async def hybrid(**kwargs: Any):
+        hybrid_calls.append(kwargs["merchant_id"])
+        return [], "cache", None
+
+    monkeypatch.setattr(agent_products, "get_products_hybrid", hybrid)
+    resp = await _get(f"/agent/v1/products/merchants/{MID}")
+    assert resp.status_code == 404
+    assert resp.headers["x-error-code"] == "MERCHANT_LISTING_UNAVAILABLE"
+    assert "/agent/v1/products/search" in resp.json()["detail"]
+    assert hybrid_calls == [], "the empty lookup is never run for an external retailer"
+
+
+@pytest.mark.asyncio
+async def test_a_connected_merchants_listing_is_unchanged(monkeypatch: pytest.MonkeyPatch, endpoint) -> None:
+    hybrid_calls: List[str] = []
+
+    async def hybrid(**kwargs: Any):
+        hybrid_calls.append(kwargs["merchant_id"])
+        return [], "cache", "no products"
+
+    monkeypatch.setattr(agent_products, "get_products_hybrid", hybrid)
+    resp = await _get("/agent/v1/products/merchants/merch_shopify_00d4a720d67d96c5dcba")
+    assert hybrid_calls == ["merch_shopify_00d4a720d67d96c5dcba"]
+    assert resp.status_code == 502 and "x-error-code" not in resp.headers, "its own path, its own answer"
+
+
+@pytest.mark.asyncio
+async def test_a_restricted_agent_is_refused_before_the_listing_check(monkeypatch: pytest.MonkeyPatch, endpoint) -> None:
+    ctx, _, _ = endpoint
+    ctx.allowed_merchants = ["merch_other"]
+    resp = await _get(f"/agent/v1/products/merchants/{MID}")
+    assert resp.status_code == 403
