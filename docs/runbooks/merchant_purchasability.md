@@ -1,0 +1,393 @@
+# Merchant purchasability — the fact, the sweep, the gate (WP6)
+
+`db/merchant_purchasability.py` (the rule and the only writer), `jobs/merchant_purchasability_sweep.py`
+(the loop and its bounds), `services/shopify_cart_link_preflight.py` (the detector),
+`routes/merchant_purchasability_ops.py` (the operator read), migration
+`db/migrations/231_merchant_purchasability.sql` (the table).
+
+This rail is **dark by default**. `MERCHANT_PURCHASABILITY_ENABLED` is unset, the scheduler job is
+registered but inert, and `routes/agent_commerce_reap.py` does not consult the fact at all.
+
+---
+
+## 1. The rule
+
+**A merchant × market row carries a PURCHASE affordance only while it holds a fresh, POSITIVE
+purchasability fact.**
+
+* POSITIVE means one thing and one thing only: we rendered that merchant's landed checkout, the
+  checkout's **own** accept-list named a **card** gateway, and the line was charged at the price we
+  hold. In code that is `verdict is ELIGIBLE` **and** `card_available is True` — both conjuncts,
+  written out, in `db.merchant_purchasability.is_positive`. ELIGIBLE on its own is not enough:
+  the Tier B lane's ELIGIBLE means "the permalink landed on a checkout with our line on it", which
+  is exactly what flowerbeauty.com satisfied.
+* **"Unverifiable" is NOT positive.** A row nobody can verify keeps browse and referral; it never
+  keeps buy. It is not demoted either — it simply ages out through the TTL. The old liveness
+  sweep's "cannot verify ⇒ freeze, keep every affordance" is the defect this rail exists to close,
+  and the TTL is what stops it recurring.
+* **Card only.** A wallet is not a card. Reap pays headless with a card, so a checkout offering
+  PayPal, Shop Pay, Apple Pay or a gift card and nothing else is a checkout this rail cannot
+  complete, however healthy the store is.
+
+Freshness is a TTL (default 72 h) on `positive_until`, computed and compared **server-side**.
+Two consecutive confirmed negatives clear the window early. One does not — a single PRICE_DRIFT on
+a store mid-sale, or one LOGIN_REQUIRED from a redirect that bounced, is not a pattern.
+
+`is_purchasable` **fails closed** on a database error. That is the opposite of what a liveness
+check should do, deliberately: a liveness sweep that cannot reach a store must not delete it, but a
+purchase gate that cannot prove payment must not permit it.
+
+---
+
+## 2. The incident this closes (2026-09-22)
+
+**flowerbeauty.com was served as purchasable.** Four separate signals said yes and not one of them
+was about paying:
+
+| signal | what it actually said |
+|---|---|
+| the liveness sweep | read `products.json` over HTTP and treated "cannot verify" as a **freeze** that kept every affordance, buy included |
+| the UCP reprobe | recorded `ready_for_complete`, which means the door **PRICED a cart**. It says nothing whatever about payment |
+| `/.well-known/ucp` `payment_handlers` | listed `dev.shopify.card` — a **PLATFORM CONSTANT every Shopify store repeats**, not an accept-list |
+| the cart-link preflight | rendered the landed checkout and read the merchandise line, the click id and the market — and **never looked at the payment methods** |
+
+Rendered in a browser that day, flowerbeauty's one-page checkout offered **PayPal ONLY**, and its
+storefront charged **USD 8.00** against our indexed **USD 14.95**.
+
+So the fact this table holds is narrow and positive: a checkout we rendered, whose own
+`availablePaymentLines` named a card gateway with card brands, at the price we think it is.
+
+---
+
+## 3. How the detector works — the evidence source
+
+The landed checkout page's serialized state carries an **`availablePaymentLines`** array — the
+store's ACTUAL accept-list for this checkout. It is HTML-escaped in the page, so
+`checkout_payment_methods` unescapes first and then parses every JSON value following
+`"availablePaymentLines":`. Each element is:
+
+```json
+{"placements": ["PAYMENT_METHOD"], "paymentMethod": {"__typename": "...", "name": "...", "paymentBrands": ["VISA", "..."]}}
+```
+
+A **CARD** is present only when some line satisfies all three conjuncts:
+
+1. `"PAYMENT_METHOD"` is in `placements` — an `ACCELERATED_CHECKOUT`-only line is a wallet button,
+   not a card form;
+2. `paymentMethod.__typename == "PaymentProvider"` — the only typename that denotes a card gateway;
+3. `paymentMethod.paymentBrands` intersects the card-brand set (`_CARD_BRANDS`: VISA, MASTERCARD,
+   AMEX, DISCOVER, DINERS_CLUB, JCB, UNIONPAY, MAESTRO, ELO, …).
+
+Measured live, 2026-09-22:
+
+| merchant | variant | card line found | other lines | `card_available` |
+|---|---|---|---|---|
+| idewcare.com | 46722440036604 | `PaymentProvider` `shopify_payments`, brands VISA / MASTERCARD / AMEX / DISCOVER / DINERS_CLUB / ELO | GiftCard, ShopPay, ApplePay, GooglePay, Paypal, ShopifyInstallments, AnyStripeSharedToken | **True** |
+| judydoll.com | 49922977038613 | `PaymentProvider` `Airwallex`, brands VISA / MASTERCARD / AMEX / MAESTRO / JCB / UNIONPAY | GiftCard, ApplePay, GooglePay, Paypal, AnyStripeSharedToken | **True** |
+| flowerbeauty.com | 17281773207622 | **NONE** | AnyGiftCardPaymentMethod, PaypalWalletConfig (PAYPAL_EXPRESS), AnyStripeSharedTokenPaymentMethod | **False → NO_CARD_PAYMENT** |
+
+`card_available` is **three-valued**. `True` = a card line was read. `False` = the accept-list was
+read and holds no card line — **positive evidence**. `None` = no accept-list could be read at all,
+or the array named no method, or two copies of the serialized state disagreed. **None is never
+False**: an unreadable page, a bot challenge or a transport failure is unverifiable, and this
+module never turns "cannot tell" into "no card".
+
+### The traps
+
+**Never substring-match for a card.** Every one of these is a measured false positive:
+
+* the substring **`creditCard` appears on ALL THREE pages**, including the PayPal-only one;
+* **`AnyGiftCardPaymentMethod`** and **`AnyStripeSharedTokenPaymentMethod`** are
+  `availablePaymentLines` entries on all three. They are **platform constants, not an accept-list**;
+* `/.well-known/ucp` `payment_handlers` naming `dev.shopify.card` is the same trap one layer up
+  (see the incident above).
+
+Only `PaymentProvider` + `PAYMENT_METHOD` placement + card `paymentBrands` counts. Reading any of
+the above as a card is exactly the false positive this detector exists to stop.
+
+### Price parity
+
+The same merchandise line carries the money. `checkout_line_price` reads
+`merchandiseLines[].totalAmount.value.{amount,currencyCode}` and the line's `.quantity`, and
+returns the **unit** price in exact minor units — only when `total % quantity == 0` and only when
+the copies of the serialized state agree. Live on 2026-09-22 the three landed lines read
+**13.99 / 13.99 / 8.00 USD**; our index held **14.95 USD** for flowerbeauty.
+
+Against a caller-supplied `expected_price_minor` the difference is reported **exactly**, in minor
+units, and **any non-zero difference is PRICE_DRIFT**. There is no tolerance band: a drift is a
+fact about our index being wrong, and widening it would re-hide the case it was written for.
+Cross-currency subtraction is not a drift, it is a category error — `price_drift` returns None.
+
+---
+
+## 4. Verdict table
+
+Every `services.shopify_cart_link_preflight.Verdict` the sweep can record. **Exactly five advance
+`consecutive_failures`** — the ones where the store answered about **itself**
+(`db.merchant_purchasability.NEGATIVE_VERDICTS`). At `DEMOTE_AFTER_FAILURES` (**2**) consecutive
+negatives, `positive_until` is cleared.
+
+| verdict | what it means | advances `consecutive_failures`? |
+|---|---|---|
+| `NO_CARD_PAYMENT` | the checkout's own accept-list was READ and holds no card line (flowerbeauty.com: PayPal only) | **YES — confirmed negative** |
+| `NOT_ACCEPTING_ORDERS` | 403 on `/checkouts/` saying the store "isn't set up to receive orders yet" | **YES — confirmed negative** |
+| `LOGIN_REQUIRED` | a hop went through `/customer_authentication/`, `/account/login` or `shopify.com/authentication/` | **YES — confirmed negative** |
+| `VARIANT_GONE` | 410 on `/cart/...`, or the storefront no longer lists the variant | **YES — confirmed negative** |
+| `PRICE_DRIFT` | the landed line charges a different price than our indexed one — exact, minor units, no tolerance | **YES — confirmed negative** |
+| `ELIGIBLE` | landed on a checkout carrying our merchandise line, our click id and the right market. With `card_available is True` this is the **POSITIVE** fact that arms the window and resets the counter; with `card_available is None` it is unverifiable and changes nothing | no |
+| `BLOCKED_UNKNOWN` | **any other 403.** The preflight's own docstring calls it "not evidence of anything in particular" — a bot challenge as often as anything. **UNVERIFIABLE, never a negative** | no |
+| `TRANSPORT_ERROR` | connect error, timeout, proxy flake. Retryable. **UNVERIFIABLE, never a negative** and never proof of ineligibility | no |
+| `VARIANT_UNAVAILABLE` | the storefront lists the variant (or product) but nothing is available to buy | no |
+| `VARIANT_UNVERIFIED` | the storefront would not let us confirm the variant (non-200, non-JSON, or the scan cap was reached) — absence is not proven | no |
+| `CHECKOUT_MARKET_MISMATCH` | our line and click id landed, but in another market than the buyer's, or the checkout's market could not be read | no |
+| `CHECKOUT_PREFILL_MISSING` | landed with the variant and click id, but a buyer prefill did not stick. The sweep runs `buyer=None`, so it cannot produce this | no |
+| `PASSWORD_PAGE` | the storefront is behind a password wall | no |
+| `INVALID_INPUT` | the caller's arguments were refused before any request was made | no |
+| `UNCLASSIFIED` | anything nobody has named yet, including too-many-redirects and a refused hop | no |
+
+**`BLOCKED_UNKNOWN` and `TRANSPORT_ERROR` are the two to hold on to.** They are the half that is
+easy to get backwards. A bot challenge is not a merchant refusing cards, and judydoll.com **reset
+direct TCP from one of our egresses while answering through another** — treating that as a negative
+would demote a good merchant on a network fact. Equally they must not FREEZE the affordance, which
+was the original defect; the TTL is what stops that, because a row nobody can verify stops being
+fresh.
+
+---
+
+## 5. Dials
+
+All read **per run / per call**, never cached at import, so arming or retuning is an env change and
+not a redeploy. An invalid or out-of-range value falls back to the default **with a warning naming
+the variable** — never a crash, and never a silent zero (a TTL of 0 would expire every fact on
+arrival).
+
+| variable | default | bounds | what it does |
+|---|---|---|---|
+| `MERCHANT_PURCHASABILITY_ENABLED` | **unset = off** | truthy allowlist: `1`, `true`, `on`, `yes` (case/space-insensitive) | **THE DIAL, with one authoritative reader** (`db.merchant_purchasability.is_gate_enabled`). It gates the sweep job **AND** the consumers' filter. One reader rather than one per module, because a consumer reading it differently from the job would enforce a rule against facts nobody was gathering |
+| `MERCHANT_PURCHASABILITY_TTL_HOURS` | `72` | `1`–`720` | how long one positive fact stays positive. 720 h is 30 days; past that "fresh" is not a word that means anything |
+| `MERCHANT_PURCHASABILITY_BUYER_VANTAGE` | `worker` | any string, truncated to 32 chars | the vantage `is_purchasable` demands a positive fact **FROM**. See §6 — this is the dial that decides whose question the gate is answering |
+| `VANTAGE_PROXY_URL` | **unset** | must start `http://` or `https://`, else ignored | when set, every merchant is ALSO checked through that proxy and recorded under vantage `proxy`. Anything else is ignored rather than handed to httpx, which would raise inside the run |
+| `MERCHANT_PURCHASABILITY_INTERVAL_SECONDS` | `3600` | `60`–`86400` | the scheduler `interval` trigger **and** `misfire_grace_time`. **Registration-time only** — a change needs a restart. Hourly against a 72 h TTL is 72 chances to refresh a fact before it expires |
+| `MERCHANT_PURCHASABILITY_BATCH` | `20` | `1`–`200` | merchants per run. Each is a full redirect chain plus up to 20 catalog pages, and each leaves an abandoned checkout behind — this is a politeness bound as much as a time bound |
+| `MERCHANT_PURCHASABILITY_BUDGET_SECONDS` | `600` | `30`–`3600` | wall-clock budget for one run. It stops the job **STARTING** a new merchant; one already in flight runs to completion, so a run can exceed this by one merchant's worth of fetches. The scheduler's run deadline for `merchant_purchasability_sweep` is **900 s** |
+| `MERCHANT_PURCHASABILITY_PAUSE_MS` | `1500` | `0`–`60000` | seconds (in ms) to wait between merchants. One store at a time, unhurried: this rail has no latency requirement and a burst of checkout creations against one platform does not help us |
+
+Two things are deliberately **not** dials: `DEMOTE_AFTER_FAILURES` (2) and the card-brand set.
+
+---
+
+## 6. Vantage — READ THIS BEFORE ARMING
+
+**Reachability is EGRESS-DEPENDENT, and that was measured, not assumed.**
+
+* **judydoll.com RESET direct TCP connections from one of our egresses (3/3) while answering
+  through another (3/3).**
+* **A human could not open flowerbeauty.com from his browser at all, while our machine could.**
+
+A fact gathered from the worker's egress is a fact about **the worker's egress**. That is why
+`vantage` is part of the primary key rather than a label, and why `is_purchasable` requires a
+positive fact **from the vantage named by `MERCHANT_PURCHASABILITY_BUYER_VANTAGE`** (default
+`worker`). A positive fact from any OTHER vantage is evidence for a human, never permission for the
+door.
+
+> **THE BUYER VANTAGE MUST MATCH THE BUYER/PARTNER EGRESS**, or the gate is answering a question
+> nobody asked. The default `worker` is honest — it names where we actually looked — but it is not
+> the buyer's egress unless your buyer pays from the worker's network. Set it, and configure that
+> vantage, before you arm the rail.
+
+Setting `VANTAGE_PROXY_URL` adds a second vantage, `proxy`, recorded under the same
+(domain, market) key. **It costs one more abandoned checkout per merchant per run** — that is the
+whole price, and it is why the proxy vantage is opt-in rather than always on.
+
+`GET /ops/merchant-purchasability` reports `buyer_vantage` next to the rows for exactly this
+reason: a reader who looks only at `card_available` will be misled by a positive fact from the
+wrong vantage. The route's `tier` field is computed through `is_purchasable` — the same function the
+rail calls — so it is the answer; the rows are only the evidence.
+
+---
+
+## 7. Operator SQL
+
+The supported read is the **ops route**:
+
+```
+GET /ops/merchant-purchasability?domain=<domain>&market=<XX>     (admin auth)
+```
+
+It normalises `domain` and `market` through the same functions the writer keys on, so an operator
+cannot be shown a different row than the door reads, and it returns `tier`, `buyer_vantage`,
+`gate_enabled`, `ttl_hours` and every vantage's row. **It is not gated on the dial** — an operator
+arming the rail needs to see the facts first.
+
+The SQL below is for when you are already inside a one-off job (Cloud SQL is private-IP only; see
+`reference_run_a_prod_sql_census_with_a_oneoff_job`). Table `merchant_purchasability`,
+PK `(merchant_domain, market_country, vantage)`.
+
+```sql
+-- THE CENSUS. Every fact we hold, newest first.
+SELECT merchant_domain, market_country, vantage, verdict, card_available,
+       landed_price_minor, landed_currency, expected_price_minor, price_drift_minor,
+       consecutive_failures, checked_at, positive_until,
+       (positive_until IS NOT NULL AND positive_until > now()) AS positive_now
+  FROM merchant_purchasability
+ ORDER BY checked_at DESC NULLS FIRST;
+```
+
+```sql
+-- WHO IS PURCHASABLE RIGHT NOW, PER VANTAGE. Only the row whose vantage equals
+-- MERCHANT_PURCHASABILITY_BUYER_VANTAGE is what the door reads; the others are evidence.
+SELECT vantage, merchant_domain, market_country, verdict, payment_methods,
+       checked_at, positive_until
+  FROM merchant_purchasability
+ WHERE positive_until IS NOT NULL
+   AND positive_until > now()
+ ORDER BY vantage, merchant_domain;
+```
+
+```sql
+-- WHO IS DEMOTED, AND WHY. A cleared window with a live failure counter is a demotion;
+-- a cleared window with counter 0 is a fact that simply aged out.
+SELECT merchant_domain, market_country, vantage, verdict, card_available,
+       consecutive_failures, price_drift_minor, landed_currency, checked_at,
+       evidence ->> 'detail' AS detail
+  FROM merchant_purchasability
+ WHERE positive_until IS NULL
+    OR positive_until <= now()
+ ORDER BY consecutive_failures DESC, checked_at DESC;
+```
+
+```sql
+-- NEVER CHECKED. The population is the UNION of the two Reap allowlists at merchant grain;
+-- a merchant absent from both cannot be bought from, so a fact about it would gate nothing.
+WITH population AS (
+    SELECT lower(merchant_domain) AS domain, upper(market_country) AS market
+      FROM reap_agentic_eligibility
+     WHERE product_key = '' AND variant_key = '' AND enabled = TRUE
+    UNION
+    SELECT lower(shop_domain) AS domain, upper(market) AS market
+      FROM tierb_cart_link_eligibility
+     WHERE verdict = 'ELIGIBLE'
+)
+SELECT p.domain, p.market
+  FROM population p
+  LEFT JOIN merchant_purchasability m
+         ON m.merchant_domain = p.domain
+        AND m.market_country = p.market
+ WHERE m.merchant_domain IS NULL
+ ORDER BY p.domain, p.market;
+```
+
+Note the join keys are the **normalised** ones (`normalize_domain` lowercases and strips one
+leading `www.`; `normalize_market` uppercases to two characters), so a population row spelled
+`www.Judydoll.com` will not join to the fact row `judydoll.com` unless you fold it as above.
+
+### Forcing a re-check
+
+**Two options, and they are not equivalent.**
+
+* **Wait for the sweep.** This is the normal answer. `load_population` orders never-checked rows
+  first and then oldest-checked first, so a stale merchant reaches the front of the queue by
+  itself. At the default interval (1 h) and batch (20) a population of a few dozen merchants is
+  fully re-swept well inside one TTL window. Nothing needs doing.
+* **`DELETE` the row** to jump the queue:
+
+  ```sql
+  DELETE FROM merchant_purchasability
+   WHERE merchant_domain = '<domain>' AND market_country = '<XX>';
+  ```
+
+  This removes the row from `list_due`, so `_staleness` sorts that merchant as never-checked and
+  the next tick picks it first. **It also deletes the positive window immediately**: until that
+  tick completes, `is_purchasable` answers False and — with the dial on — the Reap rail refuses
+  `merchant_not_purchasable` for that merchant. Delete to *unstick* a merchant, never to "refresh"
+  a healthy one.
+
+There is no UPDATE that is a correct re-check. `positive_until` is only ever written by the one
+upsert the sweep issues, from the **server's** clock, off a checkout somebody actually rendered.
+Hand-writing a window is minting a payment fact nobody measured.
+
+---
+
+## 8. How to read the evidence blob
+
+`evidence` is JSONB, bounded at 4000 characters, written by an **allow-list** of keys in
+`db.merchant_purchasability._evidence`. Those keys and nothing else:
+
+| key | what it tells you |
+|---|---|
+| `verdict` | the preflight's verdict, same value as the `verdict` column — kept here so the blob is self-describing when it is copied out of the row |
+| `retryable` | whether the preflight considered the outcome retryable. True only on `TRANSPORT_ERROR` |
+| `detail` | the preflight's own reason string, ≤ 255 chars: `no_card_in_<labels>`, `drift_<n>_<CUR>`, `checkout_country_<XX>`, `variant_not_in_catalog`, `resolve:<ExcType>`, `status_<n>`, … **This is the field to read first** |
+| `final_status` | HTTP status of the landing. 200 with a non-ELIGIBLE verdict means we read a page and did not like it; 403 means we were stopped |
+| `final_host` | where the redirect chain ended. A cross-host landing (shop.app, a `*.myshopify.com`) is normal and worth knowing |
+| `checkout_country` | the checkout's own `buyerIdentity` country code, read off the page. The market conjunct is decided against this |
+| `variant_source` | `caller` (the Tier B confirmed variant), `product` (from a handle) or `catalog` (the sweep's representative pick). A drift on a `catalog` variant is a weaker claim than one on a `caller` variant |
+| `chain` | up to 12 `[status, redacted_url]` hops. Dropped first when the blob exceeds 4000 chars, in which case `detail` reads `evidence_truncated` |
+
+**It holds NO buyer data and NO page HTML.** Three reasons, all of them load-bearing:
+
+1. **There is no buyer to leak.** The sweep calls the preflight with `buyer=None` — the Reap path
+   carries no buyer PII in the cart permalink; the buyer's email and address travel in Reap's quote
+   **body**. `SweepReport` is counts-only for the same reason (no domains, no variant ids, no rows).
+2. **It is an allow-list, not a deny-list.** That is what keeps (1) true when somebody later passes
+   a buyer on this path: a new field cannot land in evidence by default, it has to be added.
+3. **A page body would carry the merchant's own tokens** — and would dwarf every other column,
+   making this table the largest thing in the database for a read nobody does. The payment-method
+   **labels** (`shopify_payments`, `Airwallex`, `PAYPAL_EXPRESS`, `AnyGiftCardPaymentMethod`) are
+   stored instead, in the separate `payment_methods` column, capped at 32 entries of 64 chars, and
+   they are gateway names — never a token, an id or a client secret.
+
+Every URL in the chain has already been through `redact_cart_permalink` inside the preflight, so
+host, path and click id survive and buyer values do not.
+
+---
+
+## 9. Turning it on, and rolling back
+
+The sweep runs **only on the worker service** — `_add_job` registers nothing unless
+`services.audit_scheduler._queue_worker_enabled()` is true, because prod and staging share one
+Postgres. The normal backend deploy does not ship the worker; see
+`project_scheduler_lane_runs_on_undeployed_worker_2026_09_02`.
+
+1. **Deploy dark.** Everything in WP6 is inert with the dial unset: the job touches no merchant
+   (every check creates an abandoned checkout on a live store, so dormant-by-default matters more
+   here than on most jobs), and `routes/agent_commerce_reap.py` does not consult the fact.
+2. **Set `MERCHANT_PURCHASABILITY_BUYER_VANTAGE`** — and, if that is not the worker's own egress,
+   `VANTAGE_PROXY_URL` — **before** the dial. See §6. Arming with the wrong vantage gates on a
+   fact about a network the buyer does not pay from.
+3. **Arm the dial:** `MERCHANT_PURCHASABILITY_ENABLED=1`. No redeploy and no scheduler restart —
+   the gate is read per run and per call.
+
+> **THE JOB AND THE ENFORCEMENT SHARE ONE DIAL, SO ARMING IT ARMS BOTH AT ONCE.** There is no
+> window in which the sweep gathers facts while the rail still serves everyone. `is_gate_enabled`
+> is the single authoritative reader for both halves on purpose — two readers of one dial is two
+> things to get out of step — but the operational consequence is blunt: **at the moment you set the
+> variable, every merchant reads `browse_only`, because no fact has been gathered yet, and the Reap
+> rail refuses `merchant_not_purchasable` (409) for all of them.** That state lasts until the first
+> sweep tick completes for each merchant — at the default interval and batch, up to
+> `ceil(population / 20)` hours.
+>
+> So: **arm it, then immediately watch `GET /ops/merchant-purchasability?domain=…&market=…` for the
+> merchants you care about** and confirm each flips to `tier: "purchase"`. Do not arm it and walk
+> away. If a merchant you expect to be purchasable stays `browse_only`, the route's `note` field
+> names the three candidate reasons (a positive row under a DIFFERENT vantage, an expired window,
+> or two consecutive negatives) and §7's demotion query tells you which.
+
+4. **Watch the sweep's report** for a few ticks. It is counts-only:
+   `population / checked / positive / negative / unverifiable / written / abandoned_budget /
+   errors / skipped_disabled / duration_ms`. `skipped_disabled=1` means the dial is off.
+   **`errors` is the only count that should page anyone** — a check that raised, or a fact that
+   could not be written. A high `unverifiable` is not an error; it is the egress telling you
+   something, and §6 is where to look.
+
+### Rolling back
+
+**Unset `MERCHANT_PURCHASABILITY_ENABLED`.** That is the whole rollback:
+
+* the Reap rail stops consulting the fact and behaves exactly as it did before WP6 — the refusal
+  is behind `if purchasability.is_gate_enabled():` and nothing else changes;
+* the sweep returns `skipped_disabled=1` and contacts no merchant.
+
+Nothing needs to be un-migrated and no row needs deleting: stale facts are simply not read. The
+rows stay, and they are still readable through the ops route (which is not gated on the dial), so
+you can keep diagnosing a merchant with the rail disarmed.

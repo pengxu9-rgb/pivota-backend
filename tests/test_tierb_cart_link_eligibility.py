@@ -40,6 +40,11 @@ TABLE = "tierb_cart_link_eligibility"
 _BRIEF_DEFINITE = {
     "ELIGIBLE", "LOGIN_REQUIRED", "NOT_ACCEPTING_ORDERS", "VARIANT_GONE", "VARIANT_UNAVAILABLE",
     "PASSWORD_PAGE", "BLOCKED_UNKNOWN", "CHECKOUT_PREFILL_MISSING", "CHECKOUT_MARKET_MISMATCH",
+    # Added with the merchant purchasability gate. This lane cannot PRODUCE either one today (it
+    # calls the preflight without `check_card` and without an expected price), but it must
+    # CLASSIFY them, and definite is the fail-closed choice — see migration 232 for why
+    # indefinite would keep a stale ELIGIBLE on a merchant that went PayPal-only.
+    "NO_CARD_PAYMENT", "PRICE_DRIFT",
 }
 _BRIEF_INDEFINITE = {"TRANSPORT_ERROR", "VARIANT_UNVERIFIED", "UNCLASSIFIED", "INVALID_INPUT"}
 

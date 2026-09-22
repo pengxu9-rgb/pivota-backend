@@ -113,6 +113,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 import db.reap_agentic_ledger as ledger
 import db.tierb_cart_link_eligibility as tierb_eligibility
+import db.merchant_purchasability as purchasability
 import services.reap_agentic_client as rc
 import services.reap_agentic_purchase as svc
 from db.buyer_vault import hash_agent_user_ref, mint_pairwise_buyer_ref
@@ -176,6 +177,13 @@ _REFUSAL_STATUS: Dict[str, int] = {
     "consent_required": 400,
     # The request is well-formed; the world does not permit it. Editing the body will not help.
     "merchant_not_eligible": 409,
+    # The merchant is ALLOWLISTED but holds no fresh, positive purchasability fact: nobody has
+    # recently rendered its checkout from the buyer's vantage and seen a card method at our
+    # price. A SEPARATE CODE from `merchant_not_eligible` on purpose — the two say different
+    # things to an operator ("nobody listed this merchant" vs "this merchant is listed and we
+    # cannot prove it can be paid"), and collapsing them would hide exactly the state this gate
+    # exists to make visible. 409 like its neighbours: the body is fine, the world is not.
+    "merchant_not_purchasable": 409,
     "buyer_unlinked": 409,
     "row_not_found": 409,
     "row_unpriced": 409,
@@ -1685,6 +1693,24 @@ async def start_reap_purchase(
                             "poll_after_seconds": view.get("poll_after_seconds"),
                         },
                     )
+
+        # PURCHASABILITY BEFORE EITHER LANE'S ELIGIBILITY, because it is the broader refusal:
+        # both allowlists say a merchant is PERMITTED, and neither says its checkout can be PAID.
+        # flowerbeauty.com was allowlisted, priced a UCP cart, advertised `dev.shopify.card` (a
+        # platform constant every Shopify store repeats) and rendered a checkout whose only
+        # payment method was PayPal, at a price we did not hold.
+        #
+        # DARK BY DEFAULT. With MERCHANT_PURCHASABILITY_ENABLED off this is not consulted at all
+        # and the rail behaves exactly as it did; with it on, a merchant with no fresh positive
+        # fact FROM THE BUYER VANTAGE is refused. `is_purchasable` fails CLOSED on a database
+        # error, which is the right direction for a payment gate even though it is the wrong one
+        # for a liveness check.
+        if purchasability.is_gate_enabled():
+            if not await purchasability.is_purchasable(merchant_domain, market_country):
+                raise svc.PurchaseRefused(
+                    "merchant_not_purchasable",
+                    "no fresh positive purchasability fact for this domain and market",
+                )
 
         # ELIGIBILITY BEFORE THE CATALOG READ on either lane. The daily Tier B verdict is
         # distinct from the variant rail's operator allowlist; it expires after 48 hours.
