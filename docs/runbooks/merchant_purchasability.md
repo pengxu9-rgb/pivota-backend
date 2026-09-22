@@ -430,19 +430,42 @@ separate PR in **PIVOTA-Agent**, and until it lands the gate protects the Reap r
 * `sweep_enabled` is also in the response, for diagnostics: `sweep_enabled: false` with
   `enforced: true` is the misordered state above and is worth logging loudly.
 
-**The click lane sends `market`; a click with no market is not gated.** The warm-handoff body
-this backend POSTs to the gateway's `POST /internal/ucp/warm-handoff/resolve`
-(`services/outbound_warm_handoff.resolve_warm_handoff`) carries an optional `market`: the ISO-2
-market **the click itself was served for**, read from the signed `/r` token's own top-level
-`market` (`services/outbound_warm_handoff.click_market`) — the same value that selected the
-outbound rule and the domain allowlist for that click. It is validated to `^[A-Z]{2}$` after
-upper-casing and **omitted otherwise**; nothing is substituted, not this process's egress
-country and not `SEED_MARKET`, because the fact is keyed on the BUYER's vantage and a positive
-fact from another vantage is the flowerbeauty signal all over again. A click whose token carries
-no usable market therefore sends **no `market` key**, the gateway logs
-`merchant_purchasability_unkeyable`, and that handoff keeps its pre-gate behaviour — an
-un-gated click, by design. Those clicks are counted, not lost: the click event ctx carries
-`warm_market` alongside `handoff` / `warm_reason`, holding the ISO-2 code or the literal `none`.
+**The click lane sends `market` when it was OBSERVED; a click with no observed market is not
+gated.** The warm-handoff body this backend POSTs to the gateway's
+`POST /internal/ucp/warm-handoff/resolve` (`services/outbound_warm_handoff.resolve_warm_handoff`)
+carries an optional `market` — the ISO-2 market the click itself was served for, read from the
+signed `/r` token. Two conditions must both hold, and the decision is made at the sink
+(`warm_market_decision`) so no caller can widen it:
+
+1. **the token says the market was OBSERVED** (`market_observed: true`), and
+2. **it validates as `^[A-Z]{2}$`** after upper-casing (`iso2_market`).
+
+**Why two and not one.** All five `/r` minters default an unknown market to `"US"` —
+`normalize_market`, `market_hint or "US"`, `body.market or "US"`,
+`DEFAULT_EXTERNAL_SEED_MARKET`. That default is load-bearing for *serving* (it picks the
+`outbound_link_rules` row, the domain allowlist, the `{{market}}` in the UTM campaign and the
+`market` column on the click event) and is unchanged. But it is a **placeholder, not a fact about
+the buyer**, and it was inert only while nothing keyed on it. Forwarding it to this gate would
+judge a Japanese buyer against the **US** fact — the flowerbeauty false positive relocated from
+"no market" to "**wrong** market", which is worse, because a wrong answer looks like an answer.
+So each minter stamps `market_observed: true` on the token payload **only** when the market came
+from the caller / request / seed row (`services/outbound_links_service.market_is_observed`), and
+nothing is ever substituted: not this process's egress country, not `SEED_MARKET`, not the
+gateway's `primaryMarket()`.
+
+When the market is not forwarded the body carries **no `market` key**, the gateway logs
+`merchant_purchasability_unkeyable`, and that handoff keeps its pre-gate behaviour — an un-gated
+click, by design. Those clicks are counted, not lost: the click event ctx carries `warm_market`
+alongside `handoff` / `warm_reason`, holding the ISO-2 code, or `none_unobserved` (a defaulted
+market — or a token minted before the flag existed), or `none_invalid` (a market *was* named and
+is not ISO-2). Two reasons, because they need different fixes: `none_unobserved` is a minter that
+never learned the buyer's market, `none_invalid` is a caller sending a bad code.
+
+**Rollout note.** Every `/r` token minted before this change carries no `market_observed`, so it
+reads as unobserved and the gate stays inert for it until it ages out on its own 7-day TTL.
+Expect `warm_market=none_unobserved` to dominate for the first week and then fall as links turn
+over; if it does *not* fall, a minter is not learning the buyer's market and that is the thing to
+fix — never the gate.
 
 ### Rolling back
 

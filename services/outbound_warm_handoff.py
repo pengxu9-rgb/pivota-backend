@@ -84,34 +84,60 @@ BOT_UA_MARKERS: Tuple[str, ...] = (
 
 _HANDLE_RE = re.compile(r"/products/([a-z0-9][a-z0-9\-_.]*)", re.IGNORECASE)
 
-# ISO 3166-1 alpha-2, and NOTHING else. The gateway's merchant-purchasability gate
-# (PIVOTA-Agent #2259, `docs/merchant-purchasability-gate.md`) keys the fact on
-# (domain, market) and refuses to substitute its own deployment market: a body with no
-# usable `market` is `merchant_purchasability_unkeyable` and the gate keeps the PREVIOUS
-# behaviour. So an unusable value must be OMITTED, never coerced — a coerced market asks
-# the gate about a vantage the shopper is not in, and a positive fact from another vantage
-# is exactly the evidence that made flowerbeauty.com look purchasable.
-_MARKET_RE = re.compile(r"^[A-Z]{2}$")
+# THE BUYER MARKET FOR THE PURCHASABILITY GATE.
+#
+# The gateway's merchant-purchasability gate (PIVOTA-Agent #2259,
+# `docs/merchant-purchasability-gate.md`) keys the fact on (domain, market) and refuses to
+# substitute its own deployment market: a body with no usable `market` is
+# `merchant_purchasability_unkeyable` and the gate keeps the PREVIOUS behaviour. So an
+# unusable value must be OMITTED, never coerced — a coerced market asks the gate about a
+# vantage the shopper is not in, and a positive fact from another vantage is exactly the
+# evidence that made flowerbeauty.com look purchasable.
+#
+# TWO conditions, not one. The token's `market` is not automatically a fact about the buyer:
+# every minter DEFAULTS an unknown market to "US" (see the MARKET PROVENANCE note in
+# `services/outbound_links_service`), so a bare `market` can be a placeholder. Forwarding a
+# placeholder would gate a non-US buyer against the US fact — the same false-positive class,
+# moved from "no market" to "WRONG market", which is strictly worse because a wrong answer
+# looks like an answer. So the market is forwarded only when the token says it was OBSERVED
+# **and** it validates as ISO-2.
+_MARKET_UNOBSERVED = "none_unobserved"
+_MARKET_INVALID = "none_invalid"
 
 
 def click_market(market: Any) -> Optional[str]:
-    """The ISO-2 market THIS CLICK WAS SERVED FOR, upper-cased, or ``None``.
+    """The ISO-2 market, upper-cased, or ``None``. Validity only — see `warm_market_decision`
+    for the observed-vs-defaulted question, which this deliberately does not answer.
 
-    The only admissible source is the signed redirect token's own top-level ``market``
-    (``services/outbound_links_service.resolve_outbound_link`` and the three seed-card
-    minters all stamp it there). That is the value the outbound lane already keyed on when
-    it served this click: it selected the `outbound_link_rules` row, it gated the domain
-    allowlist, it is the `{{market}}` in the UTM campaign, and it is the `market` column on
-    the click event. Any OTHER market — this process's egress country, ``SEED_MARKET``, the
-    gateway deployment's `primaryMarket()` — is a different question than the one the buyer
-    asked, so it is never substituted here.
+    Delegates to `services.outbound_links_service.iso2_market` so there is exactly ONE
+    normaliser for this vocabulary and the sink cannot drift from the minters.
 
     ``"us"`` -> ``"US"``. ``"USA"``, ``""``, ``None``, ``"U1"``, a non-string -> ``None``.
     """
-    if not isinstance(market, str):
-        return None
-    candidate = market.strip().upper()
-    return candidate if _MARKET_RE.match(candidate) else None
+    from services.outbound_links_service import iso2_market
+
+    return iso2_market(market)
+
+
+def warm_market_decision(market: Any, market_observed: Any) -> Tuple[Optional[str], str]:
+    """``(market_to_send, reason)`` for the warm-handoff body.
+
+    ``market_to_send`` is non-None ONLY when the token said the market was observed AND it
+    validates as ISO-2; ``reason`` is the ISO-2 code itself, or ``none_unobserved`` (the
+    token carried a defaulted / placeholder market, or is older than the flag) or
+    ``none_invalid`` (a market WAS named, and it is not ISO-2). Both reasons are literals,
+    never a buyer identifier.
+
+    `market_observed is not True` covers the legacy population for free: a token minted
+    before `market_observed` existed has no such key, arrives as ``None``, and reads as
+    unobserved — so the gate stays inert for it until it ages out on its own 7-day TTL.
+    """
+    if market_observed is not True:
+        return None, _MARKET_UNOBSERVED
+    code = click_market(market)
+    if code is None:
+        return None, _MARKET_INVALID
+    return code, code
 
 
 # A warm handoff may only 302 to a CART or CHECKOUT. Measured against the shapes the gateway
@@ -434,6 +460,7 @@ async def resolve_warm_handoff(
     ctx: Optional[Dict[str, Any]],
     settings: Any,
     market: Any = None,
+    market_observed: Any = None,
     client: Optional[httpx.AsyncClient] = None,
 ) -> Optional[Dict[str, Any]]:
     """Call the gateway's internal resolve endpoint. Returns {continue_url, cart_id} or None.
@@ -471,12 +498,12 @@ async def resolve_warm_handoff(
         payload["attribution"] = {"pivota_click_id": click_id}
 
     # THE BUYER MARKET, for the gateway's merchant-purchasability gate and nothing else.
-    # Validated at the SINK (here), not merely at the caller, so no caller can put a
-    # non-ISO-2 value on the wire. Omitted when unknown: the gateway then logs
-    # `merchant_purchasability_unkeyable` and keeps its previous behaviour, which is a
-    # deliberate no-change, not a silent pass. With `market` absent this payload is
+    # BOTH conditions are decided at the SINK (here), not merely at the caller, so no caller
+    # can put a placeholder or a non-ISO-2 value on the wire. Omitted otherwise: the gateway
+    # then logs `merchant_purchasability_unkeyable` and keeps its previous behaviour, which
+    # is a deliberate no-change, not a silent pass. With `market` absent this payload is
     # byte-identical to what it was before this key existed.
-    market_code = click_market(market)
+    market_code, _market_reason = warm_market_decision(market, market_observed)
     if market_code:
         payload["market"] = market_code
 

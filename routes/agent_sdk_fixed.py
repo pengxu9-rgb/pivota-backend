@@ -35,6 +35,8 @@ from services.outbound_links_service import (
     get_allowed_domains_for_market,
     is_destination_domain_allowed,
     make_redirect_token,
+    market_is_observed,
+    TOKEN_MARKET_OBSERVED_KEY,
 )
 from services.external_seed_search import (
     dedupe_external_seed_rows,
@@ -340,6 +342,16 @@ async def _build_external_seed_product(
         {
             "market": market,
             "tool": tool,
+            # The seed row's OWN market, when it has one. A NULL market row serves
+            # DEFAULT_EXTERNAL_SEED_MARKET ("US") — a placeholder, not a fact about the
+            # buyer — so it is left unstamped and the warm-handoff lane leaves the gateway's
+            # purchasability gate un-keyed for it. See the MARKET PROVENANCE note in
+            # `services/outbound_links_service`.
+            **(
+                {TOKEN_MARKET_OBSERVED_KEY: True}
+                if market_is_observed(seed_row.get("market"))
+                else {}
+            ),
             "dest": dest_with_utm,
             "ctx": _redirect_ctx,
         }

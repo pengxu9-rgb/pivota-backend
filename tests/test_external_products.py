@@ -522,6 +522,7 @@ async def test_shop_gateway_make_external_redirect_url_without_allowlist_gate(
 
     redirect = await agent_shop_gateway_module._make_external_redirect_url(
         market="US",
+        market_observed=True,
         tool="*",
         destination_url="https://example.com/p/1",
         utm_template=None,

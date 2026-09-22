@@ -29,11 +29,11 @@ from services.outbound_links_service import (
 )
 from config.settings import settings
 from services.outbound_warm_handoff import (
-    click_market,
     evaluate_warm_eligibility,
     memo_get,
     memo_set,
     resolve_warm_handoff,
+    warm_market_decision,
 )
 
 
@@ -227,16 +227,23 @@ async def redirect_endpoint(req: Request, token: str = Query(..., min_length=10)
                 settings=settings,
             )
             if eligible:
-                # THE CLICK'S OWN MARKET — the signed token's top-level `market`, stamped by
-                # whichever minter served this link. It is the market that selected the
-                # outbound rule and the domain allowlist for THIS click, so it is the market
-                # the gateway's purchasability gate must key on. Never this process's egress
-                # country and never SEED_MARKET: the gate asks "is this merchant payable from
-                # where the buyer is", and answering from another vantage is the flowerbeauty
-                # lane. A token that carries no usable market sends no `market` key at all and
-                # is counted as `warm_market=none` on the click event ctx below — the gateway
-                # keeps its previous behaviour for those.
-                market_code = click_market(payload.get("market"))
+                # THE CLICK'S OWN MARKET, and only when the token says the minter OBSERVED it.
+                # The token's top-level `market` selected the outbound rule and the domain
+                # allowlist for THIS click, so an observed one is exactly the vantage the
+                # gateway's purchasability gate must key on. But every minter defaults an
+                # unknown market to "US", so a bare `market` can be a PLACEHOLDER — and
+                # forwarding a placeholder gates a non-US buyer against the US fact, which is
+                # the flowerbeauty false positive moved from "no market" to "wrong market".
+                # `market_observed` separates the two; the decision itself is made at the sink
+                # (`warm_market_decision`) so a caller cannot widen it. Never this process's
+                # egress country and never SEED_MARKET. An un-forwarded market sends no key at
+                # all and is counted on the click event ctx below, as `none_unobserved` (a
+                # defaulted market, or a token older than the flag) or `none_invalid` (a market
+                # was named and is not ISO-2) — the gateway keeps its previous behaviour for
+                # both.
+                market_code, market_reason = warm_market_decision(
+                    payload.get("market"), payload.get("market_observed")
+                )
                 # Per-token memo: agent-platform prefetch + the real human click build ONE
                 # cart, and the human click 302s instantly off the memo. The memo is keyed on
                 # the token, and the market travels ON the token, so two markets can never
@@ -247,7 +254,8 @@ async def redirect_endpoint(req: Request, token: str = Query(..., min_length=10)
                         dest=dest,
                         ctx=payload.get("ctx") if isinstance(payload.get("ctx"), dict) else {},
                         settings=settings,
-                        market=market_code,
+                        market=payload.get("market"),
+                        market_observed=payload.get("market_observed"),
                     )
                     memo_set(token, resolved)
                 if resolved and resolved.get("continue_url"):
@@ -256,11 +264,14 @@ async def redirect_endpoint(req: Request, token: str = Query(..., min_length=10)
                 else:
                     warm_ctx = {"handoff": "cold", "warm_reason": "unresolved"}
                 # The gate-keying instrument, on the SAME click-event ctx as handoff /
-                # warm_reason. `none` = this click asked the gateway a question it could not
-                # key, so the purchasability gate kept its previous behaviour. Counting it
-                # here is what stops "no market" from being an invisible population. An ISO-2
-                # code or the literal `none` — never a buyer identifier.
-                warm_ctx["warm_market"] = market_code or "none"
+                # warm_reason: the ISO-2 code the gate was keyed on, or WHY it was not keyed
+                # (`none_unobserved` / `none_invalid`). Two reasons, not one, because they
+                # need different fixes — an unobserved market is a MINTER that never learned
+                # the buyer's market, an invalid one is a caller sending a bad code — and one
+                # bucket would hide whichever is smaller. Counting them here is what stops the
+                # un-gated population being invisible. Literals and country codes only, never
+                # a buyer identifier.
+                warm_ctx["warm_market"] = market_reason
             else:
                 warm_ctx = {"handoff": "cold", "warm_reason": reason}
             ctx_out = dict(payload.get("ctx")) if isinstance(payload.get("ctx"), dict) else {}

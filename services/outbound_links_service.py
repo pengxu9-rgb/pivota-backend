@@ -95,6 +95,59 @@ def normalize_market(market: Optional[str]) -> str:
     return m or "US"
 
 
+# ---------------------------------------------------------------------------------------------
+# MARKET PROVENANCE. `normalize_market` above, and the `... or "US"` in every other minter,
+# DEFAULT an unknown market to "US". That default is load-bearing for serving — it picks the
+# `outbound_link_rules` row, the domain allowlist, the `{{market}}` in the UTM campaign and the
+# `market` column on the click event — and NOTHING here changes it.
+#
+# But a defaulted "US" is a PLACEHOLDER, not a fact about the buyer, and the two are
+# indistinguishable once the token is signed. That was inert while nobody keyed anything on it.
+# It stops being inert the moment the warm-handoff lane forwards the token's market to the
+# gateway's merchant-purchasability gate: a non-US buyer whose click was minted without a market
+# would be gated against the US fact, which relocates the flowerbeauty false-positive class from
+# "no market" to "WRONG market" — strictly worse, because a wrong answer looks like an answer.
+#
+# So the minters additionally stamp `market_observed: true` on the token payload when, and only
+# when, the market came from the caller / request / seed row. The warm-handoff sink forwards
+# `market` only for an OBSERVED one. A token minted before this existed carries no flag, reads as
+# unobserved, and leaves the gate inert for its remaining TTL — which is the safe direction.
+# ---------------------------------------------------------------------------------------------
+
+TOKEN_MARKET_OBSERVED_KEY = "market_observed"
+
+_ISO2_MARKET_RE = re.compile(r"^[A-Z]{2}$")
+
+
+def iso2_market(raw: Any) -> Optional[str]:
+    """ISO-3166 alpha-2, upper-cased — or ``None``. The ONE normaliser for this vocabulary.
+
+    ``"us"`` / ``"  sg  "`` -> ``"US"`` / ``"SG"``. ``"USA"``, ``""``, ``"U1"``, a non-string
+    -> ``None``: never truncated, never defaulted. Deliberately NOT `normalize_market`, which
+    serves ``"USA"`` as ``"USA"`` and ``None`` as ``"US"`` — that function answers "what do we
+    serve this click as", this one answers "is this a market code we can key a fact on".
+    """
+    if not isinstance(raw, str):
+        return None
+    candidate = raw.strip().upper()
+    return candidate if _ISO2_MARKET_RE.match(candidate) else None
+
+
+def market_is_observed(*raws: Any) -> bool:
+    """True when at least one of `raws` actually NAMED a market.
+
+    `raws` are the raw sources a mint site falls back through, in order — e.g.
+    ``market_is_observed(candidate.market, body.market)`` for a site whose served value is
+    ``candidate.market or body.market or "US"``. False means every source was empty and the
+    market about to be served is the ``"US"`` DEFAULT.
+
+    This is PROVENANCE, not validity: ``"USA"`` was named by the caller, so it is observed —
+    and is then rejected by `iso2_market` at the sink and counted as `none_invalid`. The two
+    are separate questions and collapsing them would hide one of them.
+    """
+    return any(isinstance(raw, str) and raw.strip() for raw in raws)
+
+
 def normalize_scope(scope: str) -> str:
     s = str(scope or "").strip().lower()
     if s not in {"sku", "brand", "category", "role", "default"}:
@@ -799,6 +852,15 @@ async def resolve_outbound_link(input: Dict[str, Any], request_base_url: str) ->
     token_payload = {
         "market": market,
         "tool": tool,
+        # Stamped ONLY when the CALLER named the market — a `normalize_market` default is a
+        # placeholder and must not be forwarded to the purchasability gate. See the MARKET
+        # PROVENANCE note above `iso2_market`. Absent, never `false`, so the mint is
+        # byte-identical for a defaulted market.
+        **(
+            {TOKEN_MARKET_OBSERVED_KEY: True}
+            if market_is_observed(input.get("market"))
+            else {}
+        ),
         "ruleId": matched.get("id"),
         "dest": dest_with_tracking,
         "ctx": {
