@@ -49,9 +49,14 @@
 -- purchase and this row is never rewritten at all.
 --
 -- Production deploys skip db/migrations/, so both ADD COLUMNs are ALSO in
--- db/schema_guard.ensure_required_schema_light, in BOTH dialect branches, each statement in its
--- own try. The two must build the SAME SCHEMA, not the same bytes (the SQLite twin substitutes
--- TIMESTAMP for TIMESTAMPTZ, which it must). The whole-table parity test
+-- db/schema_guard.ensure_required_schema_light, in BOTH dialect branches, and the heal has its
+-- own try in each — one try around the ONE two-clause statement on the Postgres side (where
+-- `IF NOT EXISTS` makes a single statement idempotent), and one try PER COLUMN on the SQLite
+-- side (where ADD COLUMN has no `IF NOT EXISTS`, raises on a duplicate, and a shared try would
+-- let an already-present consent_version abandon consented_at for ever). Neither may be folded
+-- into a sibling's try: a raise in one heal must not starve another, which is the defect the
+-- mig-225 comment in that file records at length. The two must build the SAME SCHEMA, not the
+-- same bytes (the SQLite twin substitutes TIMESTAMP for TIMESTAMPTZ, which it must). The whole-table parity test
 -- tests/test_reap_agentic_ledger_postgres.py::test_the_self_heal_builds_the_same_schema_as_the_
 -- migration reads what the DATABASE built from each, so a divergence here is a failure there
 -- rather than a surprise in production.

@@ -55,11 +55,20 @@ pytestmark = pytest.mark.skipif(
 _MIG_229 = MIGRATIONS_DIR / "229_reap_agentic_purchase_item_source.sql"
 _MIG_230 = MIGRATIONS_DIR / "230_conversion_click_claims.sql"
 _MIG_233 = MIGRATIONS_DIR / "233_reap_agentic_purchase_consent.sql"
-# THE TAIL, NOT A SLICE OF A FIXED WIDTH. This used to pin `MIGRATIONS[-2:]`, which asserted
-# both that 229 and 230 are present AND that nothing follows them — so migration 233, which
-# legitimately follows, broke an assertion that was never about it. The membership-and-order
-# form says what was actually meant: these three are applied, in this order, last.
-assert MIGRATIONS[-3:] == (_MIG_229, _MIG_230, _MIG_233)
+# BY NAME AND RELATIVE ORDER, NOT BY A SLICE. This pinned `MIGRATIONS[-2:]`, which asserted both
+# "229 and 230 are applied" and "nothing follows them" — and the second half is not something
+# this file has any business asserting: migration 233 legitimately follows, and broke a pin that
+# was never about it. Widening the slice to `[-3:]` would be the same trap one migration later,
+# so the pin says what is actually meant: each of these is in the list, and in this order
+# relative to one another. A migration 234 on some other table joins the list without touching
+# this line; a 233 dropped from the list, or moved before 229, still fails here.
+for _earlier, _later in ((_MIG_229, _MIG_230), (_MIG_230, _MIG_233)):
+    assert _earlier in MIGRATIONS and _later in MIGRATIONS, (
+        f"{_later.name} is missing from the cart-link fixture's migration list"
+    )
+    assert MIGRATIONS.index(_earlier) < MIGRATIONS.index(_later), (
+        f"{_later.name} is applied before {_earlier.name}"
+    )
 
 _NEW_CONSTRAINTS = (
     "ck_reap_agentic_purchases_item_source",

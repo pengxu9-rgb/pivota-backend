@@ -3335,3 +3335,194 @@ async def test_a_migration_list_without_233_fails_the_parity_for_the_named_reaso
     assert not (stale_columns - healed_columns), (
         "the self-heal is missing a column the migrations build"
     )
+
+
+#: The accepted half of the SQLite arm's `_CONSENT_MATRIX`, re-stated here rather than imported:
+#: the two ledger arms duplicate their fixtures by house convention (importing the SQLite module
+#: would execute its body, including a `pytestmark` that SKIPS on Postgres). Escapes, never raw
+#: characters — an NBSP in this file is invisible in a diff, which is the same property that
+#: makes it worth testing.
+_CONSENT_MATRIX_PG = (
+    ("v1", True),
+    ("Terms/v2 (EU)", True),
+    (chr(0x6761) + chr(0x6B3E) + "-v1", True),
+    ("v1 x", True),
+    ("v1" + chr(0x00A0) + "x", True),               # NBSP - the character the copies disagreed on
+    ("v1" + chr(0x3000) + "x", True),               # IDEOGRAPHIC SPACE - 3 bytes in UTF-8
+    ("v1" + chr(0x2028) + "x", True),               # LINE SEPARATOR
+    ("v1" + chr(0x2029) + "x", True),
+    ("v1" + chr(0x1F642), True),                 # 4 bytes in UTF-8
+    # 32 CHARACTERS, 94 bytes. VARCHAR(32) counts CHARACTERS, so this fits; a column that
+    # counted BYTES would refuse it, and the ledger's len(text) cap agrees with the column.
+    # The bracketing "v"s are load-bearing: U+3000 IS whitespace, so a tag made only of them
+    # strips to "" and is refused as blank - correct, and not what is under test here.
+    ("v" + chr(0x3000) * 30 + "v", True),
+    ("x" * 32, True),
+    # THE REFUSED HALF. It is here so the verdict test below is a real partition rather than a
+    # sweep of things that all pass: a mutant that WIDENS one layer is only visible on an input
+    # the others refuse.
+    ("x" * 33, False),
+    ("", False),
+    ("   ", False),
+    ("v1" + chr(0x0000) + "x", False),         # NUL (Cc) - an asyncpg bind error if it got out
+    ("v1" + chr(0x000A) + "v2", False),        # interior newline
+    ("v1" + chr(0x200B) + "x", False),         # ZERO WIDTH SPACE (Cf)
+    ("v1" + chr(0x202E) + "x", False),         # RTL OVERRIDE (Cf)
+    (123, False),
+    (True, False),
+    (None, False),
+)
+
+
+# ── mig 233, the Postgres arms the SQLite suite cannot stand in for ──────────────────────────
+#
+# THE TWO BULK SWEEPS ARE DIALECT-SPLIT STATEMENTS. `_EXPIRE_OVERDUE_SQL` and
+# `_FAIL_EXHAUSTED_SQL` each have a `…_SQLITE` twin, and they write a terminal state WITHOUT
+# going through `transition` — so "the consent survives a terminal write" has to be asserted
+# against BOTH spellings or a PG-only edit to the Postgres statement ships green. The SQLite
+# mutants for these died in the sweep; these are what kill their Postgres siblings.
+
+
+async def test_the_expire_sweep_keeps_the_consent_on_postgres():
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _mk(state="awaiting_approval", consent_version=_CONSENT_TAG)
+    await _set_clock_column(purchase["id"], "hosted_url_expires_at", _PAST)
+    assert await ledger.expire_overdue_purchases() == [purchase["id"]]
+
+    row = await ledger.get_purchase_internal(purchase["id"])
+    # BOTH HALVES. "the consent survives" alone would pass on a sweep that had stopped scrubbing
+    # anything, which is a worse defect than the one under test.
+    assert row["state"] == "expired"
+    assert row["buyer_email"] is None and row["shipping_address"] is None
+    assert row["consent_version"] == _CONSENT_TAG
+    assert row["consented_at"] is not None
+
+
+async def test_the_fail_exhausted_sweep_keeps_the_consent_on_postgres():
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _mk(state="processing", consent_version=_CONSENT_TAG)
+    await database.execute(
+        "UPDATE reap_agentic_purchases SET attempts = 7 WHERE id = :i", {"i": purchase["id"]}
+    )
+    assert await ledger.fail_exhausted_purchases(5, include_processing=True) == [purchase["id"]]
+
+    row = await ledger.get_purchase_internal(purchase["id"])
+    assert row["state"] == "failed"
+    assert row["buyer_email"] is None and row["shipping_address"] is None
+    assert row["consent_version"] == _CONSENT_TAG
+    assert row["consented_at"] is not None
+
+
+async def test_neither_sweep_statement_names_the_consent_columns():
+    """THE SOURCE-LEVEL READING of the two tests above, over all FOUR statements — the two
+    sweeps times the two dialects. The behavioural tests cover a row that reaches each sweep;
+    this covers the statements themselves, including the SQLite twins that this gate does not
+    execute, so one file's edit cannot pass while the other's fails."""
+    import db.reap_agentic_ledger as ledger
+
+    for name in (
+        "_EXPIRE_OVERDUE_SQL",
+        "_EXPIRE_OVERDUE_SQL_SQLITE",
+        "_FAIL_EXHAUSTED_SQL",
+        "_FAIL_EXHAUSTED_SQL_SQLITE",
+        "_TRANSITION_SQL",
+        "_TRANSITION_SQL_SQLITE",
+    ):
+        sql = getattr(ledger, name)
+        assert "consent_version" not in sql, f"{name} writes consent_version"
+        assert "consented_at" not in sql, f"{name} writes consented_at"
+
+
+async def test_a_naive_consented_at_is_refused_on_postgres():
+    """THE DIALECT THIS RULE IS ABOUT. asyncpg encodes a naive datetime for a `timestamptz`
+    parameter as THIS PROCESS's local wall time — measured seven hours off from a Pacific box
+    against a UTC database. `_bind_dt` would silently repair it; for evidence about a human act
+    the caller is told instead, because a timestamp read seven hours off is evidence of the
+    wrong moment."""
+    with pytest.raises(ValueError, match="timezone-aware"):
+        await _mk(consent_version=_CONSENT_TAG, consented_at=datetime(2026, 9, 20, 11, 0, 0))
+
+
+async def test_a_consented_at_without_a_version_is_refused_on_postgres():
+    with pytest.raises(ValueError, match="without a consent_version"):
+        await _mk(consented_at=datetime(2026, 9, 20, tzinfo=timezone.utc))
+
+
+# ── the one validator, through the production dialect ───────────────────────────────────────
+
+
+def test_all_three_layers_call_the_same_consent_validator_object_on_postgres():
+    """THE IDENTITY ASSERTION, RUN IN THE GATE'S PROCESS. The SQLite arm asserts the same thing,
+    and this arm is not redundant: the dialect gate imports these modules in a different order
+    and with `IS_POSTGRES` true, and a lazily-rebound name (a module that re-created its own
+    validator under some import condition) would only show up in one of the two."""
+    import db.reap_agentic_ledger as ledger
+    import routes.agent_commerce_reap as route_mod
+    import services.reap_agentic_purchase as svc_mod
+
+    assert svc_mod.consent_shape is ledger.require_consent_version
+    assert route_mod.consent_shape is ledger.require_consent_version
+    assert "require_consent_version" in ledger.__all__
+
+
+
+
+@pytest.mark.parametrize("value,accepted", _CONSENT_MATRIX_PG)
+def test_the_three_layers_agree_on_every_input_on_postgres(value, accepted):
+    """THE VERDICT MATRIX, RUN IN THE DIALECT GATE'S PROCESS.
+
+    The SQLite arm has the same test, and this is not redundant duplication — it is what stops
+    this gate being blind to a re-implementation. The identity assertion catches a layer that
+    REPLACES its reference to the shared validator; it does not catch one that keeps the
+    reference and puts its own fast path in FRONT of it, which is the shape the original defect
+    actually had (three functions that each called their own rule first). That mutant survives
+    the identity test and dies here, on the inputs the layers would disagree about: NBSP, the
+    ideographic space, U+2028/U+2029.
+
+    Pure Python, so the dialect is not what is under test — the gate's PROCESS is. These modules
+    are imported here in a different order and with `IS_POSTGRES` true.
+    """
+    import db.reap_agentic_ledger as ledger
+    import routes.agent_commerce_reap as route_mod
+    import services.reap_agentic_purchase as svc_mod
+
+    def _verdict(fn, exc):
+        try:
+            return ("accepted", fn(value))
+        except exc:
+            return ("refused", None)
+
+    route = _verdict(route_mod._consent_version, svc_mod.PurchaseRefused)
+    service = _verdict(svc_mod._require_consent_version, svc_mod.PurchaseRefused)
+    store = _verdict(lambda v: ledger.require_consent_version(v, required=True), ValueError)
+
+    assert route == service == store, (
+        f"the layers disagree on {value!r}: route={route} service={service} ledger={store}"
+    )
+    assert route[0] == ("accepted" if accepted else "refused")
+
+
+
+@pytest.mark.parametrize("value,accepted", _CONSENT_MATRIX_PG)
+async def test_an_accepted_tag_round_trips_through_a_real_varchar32(value, accepted):
+    """THE MATRIX AGAINST THE REAL COLUMN. The verdict agreement is a pure-Python property and
+    the SQLite arm owns it; what only this arm can show is that every tag the three layers ADMIT
+    also survives an asyncpg bind into a `VARCHAR(32)` and comes back the same string.
+
+    That is the half the original defect was invisible to: a value the route accepted and wrote
+    to the buyer-ref row was never checked against the purchase column on this engine. NBSP,
+    ideographic space and U+2028 are multi-byte in UTF-8, and `VARCHAR(32)` counts CHARACTERS —
+    a 32-character tag of them is 60+ bytes, and a column that counted bytes would refuse it.
+    """
+    import db.reap_agentic_ledger as ledger
+
+    if not accepted:
+        pytest.skip("the refused inputs are the SQLite arm's verdict matrix")
+    purchase = await _mk(
+        consent_version=value, buyer_ref=f"bref_pg{_CONSENT_MATRIX_PG.index((value, accepted))}"
+    )
+    read = await ledger.get_purchase_internal(purchase["id"])
+    assert read["consent_version"] == value.strip()

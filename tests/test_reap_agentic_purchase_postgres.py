@@ -1473,7 +1473,17 @@ async def test_the_variant_lane_refuses_without_a_consent_on_postgres():
     assert await _purchase_count() == before, "a refused consent left a row behind"
 
 
-@pytest.mark.parametrize("value", ["", "   ", "v" * 33, "v1\x00"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        "", "   ", "v" * 33, "v1" + chr(0x0000),
+        # NOT A STRING. This one is not decoration: the service used to do
+        # `str(consent_version or "")`, so `123` became the consent tag "123" — a consent
+        # nobody gave, stored on a purchase row as evidence. It now goes through the shared
+        # validator, which refuses a non-str outright.
+        123, True, 1.5, {}, [],
+    ],
+)
 async def test_a_malformed_consent_is_refused_at_the_service_on_postgres(value):
     """The NUL case is the one only this dialect can judge: reaching an asyncpg bind it is an
     untranslatable-character error naming a parameter index, i.e. a 500. Refused first, so both

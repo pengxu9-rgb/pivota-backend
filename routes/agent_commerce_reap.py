@@ -112,6 +112,11 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 
 import db.reap_agentic_ledger as ledger
+# THE ONE consent-tag shape rule, imported rather than re-implemented. Bound at module level
+# so tests can assert BY IDENTITY that this module, services/reap_agentic_purchase and the
+# ledger call the same function object — see that function's docstring for the production
+# divergence three copies of the rule produced.
+from db.reap_agentic_ledger import require_consent_version as consent_shape
 import db.tierb_cart_link_eligibility as tierb_eligibility
 import db.merchant_purchasability as purchasability
 import services.reap_agentic_client as rc
@@ -272,13 +277,6 @@ def _identifier(value: Any, name: str, *, max_chars: int) -> str:
     return text
 
 
-#: `reap_agentic_buyer_refs.consent_version` is `VARCHAR(32)` in migration 227. The cap is
-#: enforced HERE, before the bind, for the reason `_identifier` gives: a value past the column's
-#: width is a driver error on one dialect and a silent truncation on the other, and a TRUNCATED
-#: VERSION TAG NAMES A DIFFERENT VERSION — which is the one thing this field exists to get right.
-_CONSENT_VERSION_MAX_CHARS = 32
-
-
 def _consent_version(value: Any) -> str:
     """The version of the terms this buyer accepted, or `consent_required`.
 
@@ -291,33 +289,40 @@ def _consent_version(value: Any) -> str:
     forward explicitly — and it has to carry it on the request that USES it, not on some earlier
     call whose result nothing here can see.
 
-    ── WHAT IS CHECKED, AND WHAT DELIBERATELY IS NOT ────────────────────────────────────────
+    ── THE RULE IS NOT HERE. IT IS `consent_shape`, AND SO IS THE SERVICE'S AND THE LEDGER'S ─
 
-    Non-empty, within the column's width, and printable — the same three properties
-    `_identifier` demands, for the same three reasons, including that a NUL byte reaching an
-    asyncpg bind is a 500 rather than a refusal.
+    `consent_shape` is `db.reap_agentic_ledger.require_consent_version`. This function is the
+    mapping from its `ValueError` to this route's refusal code, and nothing else.
+
+    IT USED TO BE A COPY OF THE RULE, one of three, and the three had drifted: this one and the
+    ledger tested unicode CATEGORY membership while the service tested `str.isprintable()`, which
+    is additionally False for every `Zs` except U+0020 and for U+2028/U+2029. A tag carrying a
+    non-breaking space was therefore accepted HERE, written onto the buyer-ref row by
+    `_record_consent`, and then refused by `start_purchase` with `consent_required` — the consent
+    recorded, the purchase refused for not having one. Measured on Postgres: `buyer_refs = 1`,
+    `purchases = 0`.
+
+    ── WHAT IS DELIBERATELY NOT CHECKED, WHEREVER THE RULE LIVES ────────────────────────────
 
     THE VALUE IS NOT MATCHED AGAINST A LIST. There is no allowlist of known versions and there
-    must not be one here: the wording is the owner's, it changes without a deploy, and a backend
-    that refused an unrecognised tag would reject the newest consent — the strongest one — the
-    moment the door shipped it and before we had. We record what was accepted; we do not
-    adjudicate it. What the record is FOR is answering "which wording was this buyer shown", and
-    for that, storing an unfamiliar tag beats refusing it.
+    must not be one: the wording is the owner's, it changes without a deploy, and a backend that
+    refused an unrecognised tag would reject the newest consent — the strongest one — the moment
+    the door shipped it and before we had. We record what was accepted; we do not adjudicate it.
+    What the record is FOR is answering "which wording was this buyer shown", and for that,
+    storing an unfamiliar tag beats refusing it.
+
+    ── WHAT A NON-STRING DOES ───────────────────────────────────────────────────────────────
+
+    It never reaches here: `StartPurchaseRequest.buyer` types the field, so `123` / `true` / `{}`
+    are `invalid_request` from pydantic before this runs. `consent_shape` refuses one too, which
+    is what protects the direct callers of `start_purchase` that have no pydantic in front.
     """
-    text = str(value or "").strip()
-    if not text:
-        raise svc.PurchaseRefused("consent_required", "buyer.consent_version is required")
-    if len(text) > _CONSENT_VERSION_MAX_CHARS:
-        raise svc.PurchaseRefused(
-            "consent_required",
-            f"buyer.consent_version is longer than {_CONSENT_VERSION_MAX_CHARS}",
-        )
-    if any(unicodedata.category(ch) in _UNPRINTABLE for ch in text):
-        # The VALUE is not named, for the same reason `_identifier` does not name one.
-        raise svc.PurchaseRefused(
-            "consent_required", "buyer.consent_version contains characters that are not printable"
-        )
-    return text
+    try:
+        return str(consent_shape(value, required=True))
+    except ValueError as exc:
+        # The ledger's messages name the FIELD and the RULE and never the value — which is the
+        # same courtesy `_identifier` extends, and the reason it is safe to carry one out here.
+        raise svc.PurchaseRefused("consent_required", str(exc)) from None
 
 
 def _require_agent_user(agent_user: Optional[AgentUserContext]) -> str:

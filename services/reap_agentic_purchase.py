@@ -112,6 +112,11 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import db.reap_agentic_ledger as ledger
+# THE ONE consent-tag shape rule, imported rather than re-implemented. The name is bound at
+# module level so `tests/test_reap_agentic_ledger.py` can assert BY IDENTITY that this module,
+# the route and the ledger call the same function object — see that function's docstring for
+# the production divergence three copies of the rule produced.
+from db.reap_agentic_ledger import require_consent_version as consent_shape
 import db.tierb_cart_link_eligibility as tierb_eligibility
 import services.conversion_click_claims as ccc
 import services.reap_agentic_client as rc
@@ -1411,51 +1416,49 @@ async def start_purchase(
     return str(created["id"])
 
 
-#: `reap_agentic_buyer_refs.consent_version` is VARCHAR(32) (migration 227), and the route caps
-#: it at the same width for the same reason: a truncated version tag names a different version.
-_CONSENT_VERSION_MAX_CHARS = 32
-
-
 def _require_consent_version(consent_version: Any) -> str:
-    """The consent tag, checked for SHAPE, for EVERY lane. Returns the stripped value.
+    """The consent tag, for EVERY lane. Returns the stripped value, or refuses.
 
-    ── WHY THIS IS NO LONGER THE CART-LINK LANE'S PRIVATE RULE ──────────────────────────────
+    ── THE SHAPE CHECK IS NOT HERE. IT IS ONE FUNCTION, AND THIS CALLS IT ───────────────────
 
-    It was, and the reason it was is that #2219 put the requirement on the ROUTE and the
-    cart-link lane wanted a second copy for direct callers. That left the variant lane with a
-    consent rule enforced in exactly one place — `routes.agent_commerce_reap._consent_version` —
-    and nothing at all once you called this module directly. Since migration 233 the purchase ROW
-    carries the consent, so "opened without a consent" is now a row that exists and cannot be
-    explained, on either lane. One check, both lanes, before the INSERT.
+    `consent_shape` is `db.reap_agentic_ledger.require_consent_version`, imported at the top of
+    this module — the SAME FUNCTION OBJECT the route calls. This wrapper exists only to turn its
+    `ValueError` into this module's one exception type, which is what a route wants to catch.
 
-    THE THREE CHECKS ARE THE ROUTE'S, in the route's order: non-empty after strip, within the
-    column's width, printable. Not matched against an allowlist, for the reason
-    `routes.agent_commerce_reap._consent_version` gives at length — the wording is the owner's,
-    it changes without a deploy, and refusing an unrecognised tag would reject the newest consent
-    the moment the door shipped it. `db/reap_agentic_ledger._require_consent_version` is the
-    third copy, on the storage side, and all three accept the same set deliberately: a tag
-    refused by a later copy than the one that already wrote it is two stores disagreeing.
+    THIS USED TO BE A THIRD COPY OF THE RULE, AND THE COPIES HAD DRIFTED. This function tested
+    `str.isprintable()` while the route and the ledger tested unicode CATEGORY membership
+    (`{Cc,Cf,Cs,Co,Cn}`). `isprintable()` is additionally False for every `Zs` except U+0020 and
+    for U+2028/U+2029 — so a tag carrying a non-breaking space or an ideographic space was
+    accepted by the route, WRITTEN onto the buyer-ref row, and then refused here with
+    `consent_required`. Measured on Postgres: `buyer_refs = 1`, `purchases = 0`. The consent was
+    recorded and the purchase was refused for not having one.
+
+    It also coerced with `str(consent_version or "")`, so `123` became the consent `"123"`.
+
+    Both are gone because the rule is gone from this file. The version is still checked HERE as
+    well as at the route because a direct caller of `start_purchase` never passes through a
+    route — but "as well as" now means the same function, not a second opinion.
+
+    ── WHY EVERY LANE, SINCE #2219 ONLY REQUIRED IT ON THE CART-LINK ONE ────────────────────
+
+    Migration 233 put the tag on the purchase ROW, so a purchase opened without one is a row
+    nothing can explain, whichever lane opened it. Before that the variant lane's rule lived in
+    the route alone and a direct call could open a purchase with no consent at all.
     """
-    text = str(consent_version or "").strip()
-    if not text:
-        raise PurchaseRefused("consent_required", "consent_version is required")
-    if len(text) > _CONSENT_VERSION_MAX_CHARS:
-        raise PurchaseRefused(
-            "consent_required", f"consent_version is longer than {_CONSENT_VERSION_MAX_CHARS}"
-        )
-    if not _is_clean(text) or text != _clean_buyer_text(text):
-        raise PurchaseRefused(
-            "consent_required", "consent_version contains characters that are not printable"
-        )
-    return text
+    try:
+        return str(consent_shape(consent_version, required=True))
+    except ValueError as exc:
+        # The ledger's messages name the FIELD and the RULE and never the value, which is what
+        # makes them safe to carry into a refusal a caller sees.
+        raise PurchaseRefused("consent_required", str(exc)) from None
 
 
 async def _require_cart_link_consent(buyer_ref: str, consent_version: Any) -> str:
     """#2219's two requirements, on the cart-link lane: a consent version, and a buyer identity
     that was MINTED with that consent recorded on it. Returns the validated version.
 
-    The version gets `_require_consent_version` — the route's three checks, which every lane now
-    runs. Then the identity, which is this lane's alone: `buyer_ref` must be a row the route's
+    The version goes through `_require_consent_version`, i.e. through `consent_shape`, the one
+    validator every layer calls. Then the identity, which is this lane's alone: `buyer_ref` must be a row the route's
     `_reap_buyer_ref` wrote, and its recorded consent must be THIS version (the route writes the
     latest version on every purchase, so a mismatch means this call is not the one that
     recorded it). A read error fails CLOSED: no purchase for an identity we cannot see.

@@ -149,6 +149,10 @@ __all__ = [
     "PURCHASE_STATES",
     "TERMINAL_STATES",
     "amount_minor_or_none",
+    # THE ONE consent-tag validator. Exported because routes/ and services/ call THIS function
+    # rather than keeping copies of its rule — see its docstring for the production divergence
+    # that three copies produced.
+    "require_consent_version",
     "public_purchase_view",
     "PUBLIC_PURCHASE_COLUMNS",
     "create_purchase",
@@ -522,39 +526,79 @@ def _require_country(value: Any) -> Optional[str]:
 #: is the one thing this column exists to get right.
 _CONSENT_VERSION_MAX_CHARS = 32
 
-#: The unicode categories that are not printable text. VERBATIM the set
-#: `routes.agent_commerce_reap._UNPRINTABLE` uses, and that is the point: this check must accept
-#: EXACTLY what the route accepts. A narrower rule here (say, an identifier-shaped regex) would
-#: refuse a tag the route had already written onto the buyer-ref row in the same request — the
-#: two stores would disagree, and the refusal would arrive AFTER the consent had been recorded.
-#: A wider one would store a tag the route would never have let through. So: the same three
-#: checks, in the same order, spelled the same way — non-empty after strip, within the width,
-#: printable. Deliberately NOT an allowlist of known versions, for the reason `_consent_version`
-#: gives at length: the wording is the owner's and changes without a deploy, so a backend that
-#: refused an unrecognised tag would reject the NEWEST consent the moment the door shipped it.
+#: The unicode categories that are not printable text. The SAME set
+#: `routes.agent_commerce_reap._UNPRINTABLE` names, and it is defined once here because
+#: `require_consent_version` below is the one function all three layers call.
 _CONSENT_UNPRINTABLE = frozenset({"Cc", "Cf", "Cs", "Co", "Cn"})
 
 
-def _require_consent_version(value: Any) -> Optional[str]:
-    """The consent tag this purchase is opened under, stripped — or None for "not recorded".
+def require_consent_version(value: Any, *, required: bool = False) -> Optional[str]:
+    """THE ONE CONSENT-TAG VALIDATOR ON THIS RAIL. Returns the stripped tag, or None.
 
-    None IS ACCEPTED AND MEANS "NO CONSENT ON THIS ROW". The column is nullable because rows
-    opened before migration 233 exist, and this module is not where the requirement lives:
-    `services.reap_agentic_purchase.start_purchase` refuses `consent_required` on BOTH lanes
-    before it ever calls this function, so nothing the rail opens from today on reaches the
-    INSERT without one. Making it mandatory HERE would also break the module's own read/write
-    tests of pre-233 shapes, and would put the rail's policy in its storage layer.
+    ── WHY THIS IS EXPORTED, AND WHY IT LIVES IN THE STORAGE LAYER ──────────────────────────
 
-    A BLANK STRING IS NOT None. `""` and `"   "` are a caller that meant to send a tag and sent
-    nothing; they are refused rather than quietly stored as NULL, because a NULL written by a
-    live rail is indistinguishable from a pre-233 row and that is the one distinction the column
-    is for.
+    `routes.agent_commerce_reap` and `services.reap_agentic_purchase` IMPORT THIS FUNCTION and
+    call it. They do not re-implement it, and they do not each keep "the same three checks
+    spelled the same way" — which is what they used to do, and which was WRONG IN PRODUCTION.
+
+    The three copies had drifted. The route and this module tested unicode CATEGORY membership
+    (`{Cc,Cf,Cs,Co,Cn}`); the service used `str.isprintable()`, which is additionally False for
+    every `Zs` except U+0020 and for U+2028/U+2029. So a tag containing a non-breaking space, an
+    ideographic space or a line separator was ACCEPTED by the route, which WROTE it onto the
+    buyer-ref row, and then REFUSED by the service, which raised `consent_required` after the
+    consent had already been recorded. Measured end to end on Postgres: `buyer_refs = 1`,
+    `purchases = 0`. That is precisely the failure three copies existed to prevent, and prose in
+    three files saying they agreed did not make them agree.
+
+    So the rule is not "keep them in step"; it is that THERE IS ONLY ONE OF THEM. It lives here
+    because this module is the SINK — the value ends in a column of this module's table — and
+    because the ledger imports nothing route-side, so both callers can reach it without a cycle.
+    `tests/test_reap_agentic_ledger.py` asserts BY IDENTITY that the route's and the service's
+    names ARE this function object, which is what makes a re-implementation impossible rather
+    than merely discouraged.
+
+    ── WHAT IS CHECKED ──────────────────────────────────────────────────────────────────────
+
+    A string, non-empty after `.strip()`, at most `_CONSENT_VERSION_MAX_CHARS`, and carrying no
+    character in `_CONSENT_UNPRINTABLE`. In that order, so the message names the real problem.
+
+    NOT MATCHED AGAINST AN ALLOWLIST, and there must never be one: the wording is the owner's, it
+    changes without a deploy, and a backend that refused an unrecognised tag would reject the
+    NEWEST consent — the strongest one — the moment the door shipped it and before we had.
+
+    ── `required` ───────────────────────────────────────────────────────────────────────────
+
+    `required=False` (the default, and what `create_purchase` passes): `None` means "no consent
+    on this row" and comes back as None. The column is nullable because rows opened before
+    migration 233 exist, and a storage layer is the wrong place for the rail's policy.
+
+    `required=True` (what the route and the service pass): `None` is refused like a blank. That
+    is the rail's actual policy — every purchase opened from today on carries a consent — and it
+    belongs at the two doors rather than in the column.
+
+    A BLANK STRING IS NEVER None, under either flag. `""` and `"   "` are a caller that meant to
+    send a tag and sent nothing; storing them as NULL would make them indistinguishable from a
+    pre-233 row, which is the one distinction this column exists for.
+
+    ── WHAT IT RAISES ───────────────────────────────────────────────────────────────────────
+
+    `ValueError`, always, with a message that names the FIELD and the RULE and never the value —
+    an unprintable character in an error message is an unprintable character in a log line. Each
+    caller maps it to its own vocabulary: the route and the service to
+    `PurchaseRefused("consent_required")`, `create_purchase` by letting it out as the ValueError
+    its other validators raise. One rule, three exception vocabularies, no second opinion about
+    what a tag may contain.
     """
     if value is None:
+        if required:
+            raise ValueError("consent_version is required")
         return None
     if not isinstance(value, str):
+        # A non-string never reaches this from the route — pydantic types the field and refuses
+        # one as a malformed body — but it does reach it from a direct call, and `str(123)`
+        # would have stored "123" as a consent somebody gave.
         raise ValueError(
-            f"consent_version must be a string or None (got {type(value).__name__} {value!r})"
+            f"consent_version must be a string or None (got {type(value).__name__})"
         )
     text = value.strip()
     if not text:
@@ -568,13 +612,10 @@ def _require_consent_version(value: Any) -> Optional[str]:
             f"{len(text)}); a truncated version tag names a different version"
         )
     if any(unicodedata.category(ch) in _CONSENT_UNPRINTABLE for ch in text):
-        # THE VALUE IS NOT NAMED, the same courtesy the route extends: an unprintable character
-        # in an error message is an unprintable character in a log line. A NUL here would
-        # otherwise reach an asyncpg bind as an untranslatable-character error naming a parameter
-        # index, and be stored happily by SQLite — two wrong answers for one bad input.
-        raise ValueError(
-            "consent_version contains characters that are not printable"
-        )
+        # THE VALUE IS NOT NAMED. A NUL here would otherwise reach an asyncpg bind as an
+        # untranslatable-character error naming a parameter index, and be stored happily by
+        # SQLite — two wrong answers for one bad input.
+        raise ValueError("consent_version contains characters that are not printable")
     return text
 
 
@@ -1075,9 +1116,10 @@ async def create_purchase(
     the wrong place for the rail's policy. The requirement lives one layer up:
     `services.reap_agentic_purchase.start_purchase` refuses `consent_required` on BOTH lanes,
     before the INSERT, so nothing opened from today on arrives here without one. What IS enforced
-    here is the SHAPE — see `_require_consent_version`, whose three checks are verbatim the
-    route's, so this function cannot refuse a tag the route already wrote onto the buyer-ref row
-    in the same request.
+    here is the SHAPE — through `require_consent_version`, which is THE SAME FUNCTION OBJECT the
+    route and the service call. Not "the same rule spelled the same way": the same function, so
+    this call cannot refuse a tag the route already wrote onto the buyer-ref row in the same
+    request. Its docstring records the production divergence that three copies produced.
 
     `consented_at` DEFAULTS TO `now()` WHEN A VERSION IS GIVEN, and is refused without one. The
     default is what makes the pair agree with the refs row the route writes in the same request,
@@ -1121,7 +1163,7 @@ async def create_purchase(
     # BEFORE THE INSERT, same rule as the hints above: a malformed consent tag must leave NO ROW.
     # A purchase written and then refused for its consent would be a 'resolving' row holding the
     # buyer's address and email with no consent evidence and nothing scheduled to terminate it.
-    consent = _require_consent_version(consent_version)
+    consent = require_consent_version(consent_version)
     consented = _require_consented_at(consented_at, consent_version=consent)
     stored_cart_url = _require_item_source(
         item_source,

@@ -3569,12 +3569,14 @@ async def test_a_naive_consented_at_is_refused_rather_than_assumed_utc():
 
 
 async def test_a_consent_tag_the_route_accepts_is_not_refused_here():
-    """THE TWO VALIDATORS MUST ACCEPT THE SAME SET. The route validates and writes the tag onto
-    the buyer-ref row, then calls this module; a NARROWER rule here would refuse, AFTER the
-    consent had been recorded, a value the route had already accepted — two stores disagreeing,
-    and a refusal that arrives too late to prevent it.
+    """A SMOKE TEST FOR THE ORDINARY TAGS, kept alongside the full matrix below.
 
-    These are all values `routes.agent_commerce_reap._consent_version` returns unchanged.
+    It was written when the three layers each had their own copy of the rule and it was the
+    parity check for them — which is exactly the shape that passed while they diverged on the
+    inputs nobody had written down (NBSP, ideographic space, U+2028). The real guarantee is now
+    `test_all_three_layers_call_the_same_consent_validator_object`: one function, asserted by
+    identity. This stays because a plain "the everyday tags round-trip" case is worth having and
+    fails more legibly than a 23-row matrix when something basic breaks.
     """
     for n, tag in enumerate(("v1", "terms 2026-09", "Terms/v2 (EU)", "条款-v1", "x" * 32)):
         purchase = await _mk(consent_version=tag, buyer_ref=f"bref_tag_{n}")
@@ -3843,3 +3845,151 @@ def test_the_233_down_migration_drops_both_columns_in_the_safe_order():
     assert down.count("ALTER TABLE IF EXISTS reap_agentic_purchases") == 2, (
         "one statement per column, so a partial apply reverses"
     )
+
+
+# ── the consent-tag rule is ONE function, and these tests are what make that true ────────────
+#
+# THE DEFECT THIS REPLACES. There were three copies of "non-empty, within the width, printable",
+# one per layer, and prose in all three saying they agreed. They did not: the route and the
+# ledger tested unicode CATEGORY membership (`{Cc,Cf,Cs,Co,Cn}`) while
+# services.reap_agentic_purchase tested `str.isprintable()`, which is additionally False for
+# every `Zs` except U+0020 and for U+2028/U+2029. A tag carrying a non-breaking space was
+# accepted by the route, WRITTEN onto the buyer-ref row, then refused by the service with
+# `consent_required`: the consent recorded, the purchase refused for not having one. Measured on
+# Postgres: buyer_refs = 1, purchases = 0.
+#
+# THE FIX IS NOT A BETTER PARITY TEST OVER THREE COPIES. It is that there is ONE function and the
+# other two layers hold a REFERENCE to it, which the identity test below asserts with `is` — so a
+# re-implementation cannot pass. The matrix is the behavioural half: it pins the verdicts, and it
+# would catch a divergence even if somebody found a way to reintroduce one.
+#
+# EVERY LITERAL BELOW IS WRITTEN AS AN ESCAPE, deliberately. A raw NBSP or zero-width space in
+# this file is invisible in a diff, a review and a terminal — which is the same property that
+# makes these characters worth testing.
+
+#: Every input whose classification differs between plausible spellings of "printable", plus the
+#: boundaries. Each carries WHY it is here, because a matrix nobody can read is a matrix nobody
+#: will extend.
+_CONSENT_MATRIX = (
+    ("v1", True),                                   # the ordinary case
+    ("terms-2026-09", True),
+    ("Terms/v2 (EU)", True),                        # spaces, slash, parens: the door's wording
+    (chr(0x6761) + chr(0x6B3E) + "-v1", True),                # non-Latin: we record a tag, we do not parse it
+    ("v1 x", True),                                 # U+0020, the one space isprintable() allows
+    ("v1" + chr(0x00A0) + "x", True),               # NBSP (Zs) - isprintable() False, the rule YES
+    ("v1" + chr(0x3000) + "x", True),               # IDEOGRAPHIC SPACE (Zs) - same divergence
+    ("v1" + chr(0x2028) + "x", True),               # LINE SEPARATOR (Zl) - same divergence
+    ("v1" + chr(0x2029) + "x", True),               # PARAGRAPH SEPARATOR (Zp) - same divergence
+    ("v1" + chr(0x1F642), True),                 # emoji (So) - printable by both spellings
+    ("  v1  ", True),                               # stripped, not refused
+    ("v1" + chr(0x000A), True),                     # a TRAILING newline is stripped away
+    ("x" * 32, True),                               # exactly the column's width
+    ("x" * 33, False),                              # one past it - refused, never truncated
+    ("", False),
+    ("   ", False),                                 # blank after strip is a mistake, not "none"
+    ("v1" + chr(0x0000) + "x", False),               # NUL (Cc) - unstorable on Postgres
+    ("v1" + chr(0x000A) + "v2", False),             # an INTERIOR newline forges a log line
+    ("v1" + chr(0x200B) + "x", False),              # ZERO WIDTH SPACE (Cf) - invisible in a diff
+    ("v1" + chr(0x202E) + "x", False),               # RTL OVERRIDE (Cf) - reverses the rendering
+    (123, False),                                   # not a str: str(123) would store "123"
+    (True, False),
+    (None, False),                                  # under required=True, which both doors pass
+)
+
+
+def test_all_three_layers_call_the_same_consent_validator_object():
+    """BY IDENTITY, WHICH IS THE WHOLE FIX. A test that compared BEHAVIOUR across three
+    implementations is exactly what was in place while they diverged in production: it passes for
+    every input somebody thought to write down, and the defect lived in the inputs nobody did.
+
+    `is` cannot be satisfied by a copy. To make this fail you have to reintroduce a second
+    implementation, which is the thing being prevented.
+    """
+    import routes.agent_commerce_reap as route_mod
+    import services.reap_agentic_purchase as svc_mod
+
+    assert svc_mod.consent_shape is ledger.require_consent_version, (
+        "services/reap_agentic_purchase no longer calls the ledger's validator — it has a copy"
+    )
+    assert route_mod.consent_shape is ledger.require_consent_version, (
+        "routes/agent_commerce_reap no longer calls the ledger's validator — it has a copy"
+    )
+    # EXPORTED, so those imports are supported rather than a reach into a private name the next
+    # cleanup deletes.
+    assert "require_consent_version" in ledger.__all__
+
+
+@pytest.mark.parametrize("value,accepted", _CONSENT_MATRIX)
+def test_the_three_layers_agree_on_every_input_in_the_matrix(value, accepted):
+    """ROUTE -> SERVICE -> LEDGER on one input, asserted to give the SAME verdict.
+
+    The three raise different exception TYPES by design — the two doors owe their callers a
+    `PurchaseRefused("consent_required")`, the ledger owes `create_purchase`'s contract a
+    `ValueError` — so what is compared is ACCEPT/REFUSE and, on accept, the normalised value.
+
+    A mutant that narrows or widens ANY ONE of the three dies here on the inputs where the others
+    disagree with it.
+    """
+    import routes.agent_commerce_reap as route_mod
+    import services.reap_agentic_purchase as svc_mod
+
+    def _verdict(fn, exc):
+        try:
+            return ("accepted", fn(value))
+        except exc:
+            return ("refused", None)
+
+    route = _verdict(route_mod._consent_version, svc_mod.PurchaseRefused)
+    service = _verdict(svc_mod._require_consent_version, svc_mod.PurchaseRefused)
+    store = _verdict(lambda v: ledger.require_consent_version(v, required=True), ValueError)
+
+    assert route == service == store, (
+        f"the layers disagree on {value!r}: route={route} service={service} ledger={store}"
+    )
+    assert route[0] == ("accepted" if accepted else "refused"), (
+        f"{value!r} was expected to be {'accepted' if accepted else 'refused'}"
+    )
+    if accepted:
+        assert route[1] == value.strip(), "an accepted value is the stripped input, unchanged"
+
+
+@pytest.mark.parametrize("value,accepted", _CONSENT_MATRIX)
+async def test_every_accepted_tag_in_the_matrix_reaches_the_column(value, accepted):
+    """THE OTHER END OF THE PIPE. Agreeing about a verdict is not the same as the accepted value
+    SURVIVING THE BIND: a tag all three admit must also be storable and come back unchanged.
+
+    This is the defect seen from the other side — the route wrote an NBSP tag onto the buyer-ref
+    row and nothing then checked that the same value could reach the purchase row at all.
+    """
+    if not accepted:
+        pytest.skip("the refused inputs are the verdict matrix's business")
+    purchase = await _mk(
+        consent_version=value, buyer_ref=f"bref_m{_CONSENT_MATRIX.index((value, accepted))}"
+    )
+    read = await ledger.get_purchase_internal(purchase["id"])
+    assert read["consent_version"] == value.strip()
+
+
+async def test_a_tag_the_route_accepts_is_never_refused_further_down():
+    """THE INVARIANT, STATED AS ITSELF rather than as an agreement between three validators.
+
+    The route validates, WRITES the tag onto the buyer-ref row, and only then calls the service,
+    which calls the ledger. So the only ordering that matters is one-directional: nothing
+    downstream may refuse what the route already accepted and recorded. Every value the route
+    admits is fed through both later layers here.
+    """
+    import routes.agent_commerce_reap as route_mod
+    import services.reap_agentic_purchase as svc_mod
+
+    admitted = []
+    for value, _ in _CONSENT_MATRIX:
+        try:
+            admitted.append(route_mod._consent_version(value))
+        except svc_mod.PurchaseRefused:
+            continue
+    assert len(admitted) >= 12, "precondition: the route admits most of the matrix"
+
+    for tag in admitted:
+        # No exception is the assertion.
+        assert svc_mod._require_consent_version(tag) == tag
+        assert ledger.require_consent_version(tag, required=True) == tag
