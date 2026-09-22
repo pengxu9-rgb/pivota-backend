@@ -1496,13 +1496,14 @@ _FACE_SKINCARE_LEAF = re.compile(r"^beauty/skincare/(?:cleanse|tone|treat|moistu
 # moisturize/cream, "Foot Cream" -> moisturize/cream, "Eye Lash Serum" -> treat/serum; and a
 # "Body Wash" / "Hand Wash" filed under the merchant type "Cleanser" -> cleanse/cleanser.
 #
-# Whole words only: "Handmade", "Behind", "Splash", "Brown", "Bodied", "Hairline" are not areas.
-# "The Body Shop" is a brand, not a body product; "crow's feet" is the eye area.
+# Whole words only: "Handmade", "Behind", "Splash", "Brown", "Bodied", "Hairline" are not areas,
+# nor is a hyphenated craft word ("Hand-Picked", "Second-hand"). "The Body Shop" is a brand.
 _NON_FACE_AREAS = (
-    ("hand", re.compile(r"\bhand(?:s|cream|wash)?\b", re.I), "beauty/body/care"),
+    ("hand", re.compile(r"(?<!second-)\bhand(?:s|cream|wash)?\b"
+                        r"(?!-(?:picked|made|crafted|poured|selected|blended|harvested|tied))", re.I),
+     "beauty/body/care"),
     ("body", re.compile(r"\bbody\b(?!\s+shop\b)", re.I), "beauty/body/care"),
-    # "Crow's feet" are eye wrinkles -- measured in prod on an eye serum.
-    ("foot", re.compile(r"(?<!\bcrow's )(?<!\bcrows )(?<!\bcrow )\b(?:foot|feet)\b", re.I), "beauty/body/care"),
+    ("foot", re.compile(r"\b(?:foot|feet)\b", re.I), "beauty/body/care"),
     ("hair", re.compile(r"\b(?:hair|scalp)\b", re.I), "beauty/haircare/general"),
     ("lash", re.compile(r"\b(?:eye\s?)?lash(?:es)?\b", re.I), None),
     ("brow", re.compile(r"\b(?:eye)?brows?\b", re.I), None),
@@ -1511,6 +1512,12 @@ _NON_FACE_AREAS = (
 )
 # A title that ALSO names the face ("Face & Body Lotion") is face care too; the old answer stands.
 _FACE_WORD = re.compile(r"\b(?:face|facial)\b", re.I)
+# Phrases that contain an area word but name no product area: "crow's feet" are eye wrinkles
+# (measured in prod on an eye serum; Shopify titles often use a curly apostrophe), and a cleanser
+# "safe for lash extensions" is a face cleanser.
+_NOT_AN_AREA = re.compile(r"\bcrow[\u2019']?s?[\s-]+feet\b|\b(?:eye\s?)?lash[\s-]+extensions?\b", re.I)
+# Hair REMOVAL is body care, not hair care: "Hair Removal Aftercare Serum", "Ingrown Hair Serum".
+_HAIR_REMOVAL = re.compile(r"\b(?:hair[\s-]+removal|ingrown[\s-]+hairs?)\b", re.I)
 
 
 def _non_face_leaf(path: str, *, title: Optional[str], product_type: Optional[str]) -> Optional[str]:
@@ -1525,6 +1532,7 @@ def _non_face_leaf(path: str, *, title: Optional[str], product_type: Optional[st
     text = " ".join(str(v or "") for v in (title, product_type))
     if _FACE_WORD.search(text):
         return None
+    text = _HAIR_REMOVAL.sub(" body ", _NOT_AN_AREA.sub(" ", text))
     areas = {name: leaf for name, pattern, leaf in _NON_FACE_AREAS if pattern.search(text)}
     if not areas:
         return None
@@ -1571,9 +1579,18 @@ def _resolve_category(*, product_type: Optional[str], title: Optional[str], flag
     The body-area rule changes an answer ONLY where the answer is a face skincare leaf AND the
     title or merchant type names a non-face area (and not the face as well). Every other row --
     every face-titled row -- is returned exactly as before.
+
+    A caller's own taxonomy LEAF is not second-guessed here: the repair planner passes a stored
+    leaf as the flag, and a stored leaf may be challenged only with fresh merchant evidence
+    (--review-existing-leaves, which passes a coarse flag instead). Curated feeds pass a coarse
+    flag ("beauty"), so every face leaf the resolver derives itself is checked.
     """
     path, confidence = _resolve_category_unguarded(
         product_type=product_type, title=title, flag_path=flag_path, domain=domain)
+    from services.pdp_category_classifier import CATEGORY_PATTERNS
+    flag = str(flag_path or "").strip().strip("/").lower()
+    if path == flag and flag in {leaf for _label, leaf, _pattern in CATEGORY_PATTERNS}:
+        return path, confidence
     from services.category_path_aliases import resolve
     leaf = _non_face_leaf(resolve(path) or "", title=title, product_type=product_type)
     if leaf is None:

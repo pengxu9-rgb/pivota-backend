@@ -52,6 +52,18 @@ def test_an_unresolved_row_carries_the_feed_default_confidence():
         "", feed.CATEGORY_CONFIDENCE_FEED_DEFAULT)
 
 
+def test_an_unresolved_answer_is_a_cohort_block_by_design():
+    """"" is `category_unresolved`, which require_primary_plan refuses for the whole brand-host
+    cohort. That is the chosen trade (Peng, 2026-09-22): a refused cohort over a lash serum
+    served as a face serum. Pinned so a change to it is a decision, not an accident."""
+    rec = feed.shopify_product_to_record({
+        "title": "ETUDE My Lash Serum 9g", "product_type": "Eye Lash Serum", "handle": "ls",
+        "vendor": "ETUDE", "variants": [{"price": "9", "available": True}],
+        "images": [{"src": "https://eyurs.com/i.jpg"}],
+    }, domain="eyurs.com", category_path="beauty")
+    assert rec["pdp"]["category_path"] in ("", None)
+
+
 @pytest.mark.parametrize("ptype,title,want", [
     ("Moisturizer", "Bifi Blanche Microbiome Foot Cream", BODY),
     ("Moisturizer", "Silky Feet Cream", BODY),
@@ -67,6 +79,9 @@ def test_an_unresolved_row_carries_the_feed_default_confidence():
     ("Serum", "Nail Strengthening Serum", ""),
     ("Serum", "Cuticle Serum", ""),
     ("Moisturizer", "Beard Cream", ""),
+    ("Serum", "Hair Removal Aftercare Serum", BODY),
+    ("Serum", "Ingrown Hair Serum", BODY),
+    ("Moisturizer", "Hand-Cream Intensive", BODY),
     # A hand-and-nail cream is a hand cream.
     ("Hand Cream", "haruharu wonder Black Bamboo Nourishing Calming Hand & Nail Cream", BODY),
     # Two areas on two different shelves: no single honest leaf.
@@ -98,6 +113,13 @@ def test_every_non_face_area(ptype, title, want):
     ("Moisturizer", "LAGOM Collagen Lifting Neck Cream"),
     ("Serum", "Crows Feet Serum"),
     ("Serum", "Crow Feet Smoothing Serum"),
+    ("Moisturizer", "Eye Cream for Crow\u2019s Feet"),
+    ("Moisturizer", "Crows-Feet Eye Cream"),
+    ("Serum", "Crow's-feet Serum"),
+    ("Cleanser", "Cleansing Balm - Lash Extension Friendly"),
+    ("Cleanser", "Oil Cleanser (safe for eyelash extensions)"),
+    ("Moisturizer", "Hand-Picked Botanicals Night Cream"),
+    ("Moisturizer", "Second-hand Glow Cream"),
 ])
 def test_face_titles_are_untouched(ptype, title):
     assert resolve(ptype, title) == unguarded(ptype, title)
@@ -115,12 +137,28 @@ def test_a_non_face_leaf_or_unresolved_answer_is_never_touched(ptype, title):
     assert resolve(ptype, title) == unguarded(ptype, title)
 
 
-def test_a_callers_face_leaf_is_refused_too():
-    """"Never" includes a caller's flag: the feed default is a guess about the whole cohort."""
+def test_a_callers_own_leaf_is_not_second_guessed():
+    """The repair planner passes a STORED leaf as the flag; it may be challenged only with fresh
+    merchant evidence under --review-existing-leaves (which passes a coarse flag)."""
     flag = "beauty/skincare/moisturize/cream"
-    assert unguarded("", "Silky Body Butter", flag_path=flag)[0] == flag
-    assert resolve("", "Silky Body Butter", flag_path=flag)[0] == BODY
-    assert resolve("", "Barrier Cream", flag_path=flag)[0] == flag
+    assert resolve("Hand Cream", "Pyunkang Yul Hand Cream", flag_path=flag) == unguarded(
+        "Hand Cream", "Pyunkang Yul Hand Cream", flag_path=flag)
+    # ...but a face leaf the resolver derives from the merchant type under that flag is checked.
+    assert resolve("Cleanser", "Body Wash", flag_path="beauty/skincare")[0] == BODY
+
+
+def test_the_repair_planner_does_not_challenge_a_stored_leaf_without_evidence():
+    from scripts.plan_curated_category_repair import plan_category_repair
+    rows = [{"product_key": "k1", "title": "Pyunkang Yul Hand Cream", "product_type": "Hand Cream",
+             "category_path": "beauty/skincare/moisturize/cream"},
+            {"product_key": "k2", "title": "Eye Cream for Crow\u2019s Feet", "product_type": None,
+             "category_path": "beauty/skincare/moisturize/cream"}]
+    assert plan_category_repair(rows)["proposed_changes"] == 0
+    reviewed = [{**rows[0], "category_evidence": {
+        "title": "Pyunkang Yul Hand Cream", "product_type": "Hand Cream",
+        "source_url": "https://ohlolly.com/products/x", "observed_at": "2026-09-22"}}]
+    plan = plan_category_repair(reviewed, review_existing_leaves=True)
+    assert plan["changes"][0]["proposed_category_path"] == BODY
 
 
 def test_an_off_taxonomy_face_spelling_is_caught_through_the_alias():
