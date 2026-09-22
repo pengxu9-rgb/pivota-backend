@@ -337,6 +337,10 @@ async def enqueue_audit_identity_review(
                 module_key="identity",
                 status="needs_review",
                 priority="normal",
+                # Must be explicit: the Table's `default=False` is Python-side, and
+                # `databases` never evaluates it — it binds NULL, which the NOT NULL
+                # column rejects (tests/test_audit_identity_review_enqueue_postgres.py).
+                qa_sample=False,
                 checklist={
                     "source": "audit_intake",
                     "audit_product_key": fields.get("product_key"),
