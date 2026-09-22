@@ -65,6 +65,51 @@ shipping must be proven downstream before a buyer is sent to pay — on the Reap
 is Reap's quote (`shippingOptions` + `amountBreakdown`); a quote with no shipping option is not
 eligible.
 
+WHAT IT CAN NOW SEE: THE PAYMENT METHODS. Measured live 2026-09-22. The checkout page's
+serialized state carries an `availablePaymentLines` array — the store's ACTUAL accept-list for
+this checkout, unlike `/.well-known/ucp` `payment_handlers`, which is a platform constant every
+Shopify store repeats. Each element is
+`{placements: ["PAYMENT_METHOD"|"ACCELERATED_CHECKOUT"], paymentMethod: {__typename, name,
+paymentBrands}}`, and a CARD form is present only when some line is a `PaymentProvider` in the
+`PAYMENT_METHOD` placement whose `paymentBrands` name card brands. Live: idewcare.com =
+`PaymentProvider/shopify_payments` (VISA, MASTERCARD, AMEX, DISCOVER, ...), judydoll.com =
+`PaymentProvider/Airwallex` (VISA, MASTERCARD, AMEX, MAESTRO, JCB, UNIONPAY), flowerbeauty.com =
+NO PaymentProvider at all, only PayPal. That last one is `NO_CARD_PAYMENT`: a card-paying
+headless checkout (Reap) cannot complete it, and it was served as purchasable before this check
+existed.
+
+DO NOT SUBSTRING-MATCH FOR A CARD. `creditCard` appears in the scripts of all three pages
+including the PayPal-only one, and `AnyGiftCardPaymentMethod` / `AnyStripeSharedTokenPaymentMethod`
+appear as `availablePaymentLines` entries on all three — they are platform constants, not an
+accept-list, and reading either as a card is exactly the false positive this module exists to
+stop. Only `PaymentProvider` + card `paymentBrands` counts.
+
+`card_available` is a THREE-valued answer: True (a card line was read), False (the accept-list
+was read and holds no card line — POSITIVE evidence), None (no accept-list could be read at all).
+None is never False: an unreadable page, a bot challenge or a transport failure is unverifiable,
+and this module never turns "cannot tell" into "no card".
+
+AND THE NEGATIVE IS DEFENDED AGAINST VOCABULARY DRIFT, because it is the dangerous answer. This
+reads an UNVERSIONED blob belonging to somebody else, and a drift in it lands on EVERY Shopify
+merchant on the same afternoon. So False requires the array to be present, non-empty, and every
+line to have the measured shape — `placements` a list, `paymentMethod` an object with a string
+`__typename`, `paymentBrands` a list or null. Anything else is `DETECTOR_SHAPE_UNEXPECTED`:
+`card_available=None`, verdict `BLOCKED_UNKNOWN`, `retryable=True`. A parser that shrugged at a
+renamed typename would demote the whole catalogue and call it evidence.
+
+BOTH CONJUNCTS OF THE CARD RULE ARE LOAD-BEARING. On every page measured, non-provider lines
+carry `paymentBrands: null`, so the brand check ALONE appears to decide — and `ApplePayWalletConfig`
+already carries `placements: ["PAYMENT_METHOD"]`. A wallet that also advertised the card brands
+behind it (which is what a wallet is) would then read as a card FORM, and a headless payer cannot
+authenticate to a wallet. `__typename == "PaymentProvider"` is what stops that, on its own.
+
+PRICE PARITY. The merchandise line carries `totalAmount.value.{amount,currencyCode}` and
+`quantity`, so the price the buyer would actually be charged is readable. Live on the same day,
+flowerbeauty.com's line was USD 8.00 while our index held USD 14.95. With a caller-supplied
+`expected_price_minor` the difference is reported EXACTLY, in minor units, and any non-zero
+difference is `PRICE_DRIFT`. There is no tolerance band: a drift is a fact about our index being
+wrong, and widening it would re-hide the case it was written for.
+
 PII. A prefilled permalink carries the buyer's email and address. Every URL this module records or logs
 goes through `redact_cart_permalink` first, and while a preflight runs, the HTTP client's own
 logging (httpx prints the full URL at INFO; httpcore prints response headers, `Location`
@@ -83,10 +128,13 @@ import json
 import logging
 import re
 from dataclasses import asdict, dataclass, field, replace
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, unquote_plus, urljoin, urlparse, urlunparse
 
 import httpx
+
+from utils.money import ZERO_DECIMAL_CURRENCIES
 
 from services.outbound_links_service import (
     CartPrefill,
@@ -142,6 +190,13 @@ class Verdict(str, enum.Enum):
     # The storefront would not let us confirm the variant (non-200 / non-JSON / scan cap).
     VARIANT_UNVERIFIED = "VARIANT_UNVERIFIED"
     PASSWORD_PAGE = "PASSWORD_PAGE"
+    # The checkout's own accept-list was READ and holds no card method (flowerbeauty.com: PayPal
+    # only). POSITIVE evidence of a checkout a card-paying agent cannot complete — never the
+    # verdict for a page we could not read, which stays BLOCKED_UNKNOWN / TRANSPORT_ERROR.
+    NO_CARD_PAYMENT = "NO_CARD_PAYMENT"
+    # The landed checkout charges a different price than the caller's expected one. Exact, in
+    # minor units, no tolerance band.
+    PRICE_DRIFT = "PRICE_DRIFT"
     # A checkout with our line and click id, but in another market than the buyer's (or one
     # whose market cannot be read off the page). Definite: not eligible.
     CHECKOUT_MARKET_MISMATCH = "CHECKOUT_MARKET_MISMATCH"
@@ -190,6 +245,18 @@ class PreflightResult:
     missing: Tuple[str, ...] = ()
     detail: Optional[str] = None
     checkout_country: Optional[str] = None  # buyerIdentity countryCode read off the checkout
+    # The checkout's own accept-list, as labels (gateway `name` when the page gives one, else the
+    # GraphQL `__typename`). Bounded and PII-free: no tokens, no merchant ids, no buyer data.
+    payment_methods: Tuple[str, ...] = ()
+    # THREE-VALUED. None means "could not determine" and is NEVER False: card-by-absence is the
+    # false negative that would let an unreadable page demote a good merchant, just as
+    # card-by-substring is the false positive that let flowerbeauty.com through.
+    card_available: Optional[bool] = None
+    # The landed merchandise line's UNIT price, exact minor units, and its currency.
+    landed_price_minor: Optional[int] = None
+    landed_currency: Optional[str] = None
+    # landed - expected, exact minor units. None when either side is unknown; 0 means parity.
+    price_drift_minor: Optional[int] = None
     shipping_verified: bool = field(default=False, init=False)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -198,6 +265,7 @@ class PreflightResult:
         out["resolve_chain"] = [list(h) for h in self.resolve_chain]
         out["chain"] = [list(h) for h in self.chain]
         out["missing"] = list(self.missing)
+        out["payment_methods"] = list(self.payment_methods)
         return out
 
 
@@ -492,6 +560,250 @@ def checkout_buyer_country(body: str) -> Optional[str]:
     return next(iter(found)) if len(found) == 1 else None
 
 
+# --- payment methods -------------------------------------------------------------------------
+
+# Brands Shopify names on a card gateway's `paymentBrands`. Membership here is what makes a
+# payment line a CARD form; a gateway that names none of them is not evidence of a card.
+_CARD_BRANDS = frozenset({
+    "VISA", "MASTERCARD", "MASTER_CARD", "AMEX", "AMERICAN_EXPRESS", "DISCOVER", "DINERS_CLUB",
+    "DINERS", "JCB", "UNIONPAY", "UNION_PAY", "MAESTRO", "ELO", "HIPERCARD", "CARTES_BANCAIRES",
+    "CARTE_BLEUE", "DANKORT", "MADA", "INTERAC", "BANCONTACT",
+})
+# The ONLY `paymentMethod.__typename` that denotes a card gateway. `AnyGiftCardPaymentMethod` and
+# `AnyStripeSharedTokenPaymentMethod` are on every Shopify checkout measured, flowerbeauty's
+# PayPal-only one included; the `*WalletConfig` types are wallets, which a headless card payer
+# cannot drive either.
+_CARD_METHOD_TYPENAME = "PaymentProvider"
+_PAYMENT_METHOD_PLACEMENT = "PAYMENT_METHOD"
+_MAX_PAYMENT_METHOD_LABELS = 32
+_MAX_PAYMENT_METHOD_LABEL_LEN = 64
+
+
+def _payment_method_label(method: Dict[str, Any]) -> Optional[str]:
+    """A short, PII-free name for one payment line: the gateway `name` when the page gives one
+    (`shopify_payments`, `Airwallex`, `PAYPAL_EXPRESS`), else its `__typename`. Never a token,
+    an id or a client secret — this string is stored as evidence."""
+    for key in ("name", "__typename"):
+        value = method.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:_MAX_PAYMENT_METHOD_LABEL_LEN]
+    return None
+
+
+#: The note recorded when the accept-list is present but does not have the shape this detector
+#: was measured against. It is NOT a negative — see `_read_payment_lines`.
+DETECTOR_SHAPE_UNEXPECTED = "detector_shape_unexpected"
+
+
+class _ShapeSurprise(Exception):
+    """One `availablePaymentLines` element was not the shape measured on 2026-09-22."""
+
+
+def _read_payment_lines(lines: List[Any]) -> Tuple[Tuple[str, ...], bool]:
+    """(labels, card_present) for one `availablePaymentLines` array. Raises `_ShapeSurprise`.
+
+    THE NEGATIVE IS THE DANGEROUS ANSWER, SO IT IS THE ONE THAT IS DEFENDED. `card_available` is
+    False only when EVERY line in the array has the shape below. That is not fussiness: this
+    detector reads an UNVERSIONED serialized blob belonging to somebody else, and every drift in
+    it lands on every Shopify merchant at once. If Shopify drops `placements`, renames
+    `PaymentProvider`, or starts sending `paymentBrands` as a comma-joined string, a lenient
+    parser reads "no card line here" for the entire catalogue on the same afternoon and the rail
+    demotes every merchant it has. A shape surprise must therefore mean "I cannot read this page"
+    (None, retryable), never "this merchant refuses cards".
+
+    THE SHAPE, per line, all required:
+      * the line is an object;
+      * `placements` is a LIST (of strings);
+      * `paymentMethod` is an object whose `__typename` is a string;
+      * `paymentBrands`, when present, is a list or null — never a string or a number.
+
+    BOTH CONJUNCTS OF THE CARD RULE ARE LOAD-BEARING and neither is implied by the other. On
+    every page measured, non-provider lines happen to carry `paymentBrands: null`, so the brand
+    check ALONE appears to decide — which is exactly why deleting the `__typename` conjunct
+    survived the first test suite. It must not: `ApplePayWalletConfig` already carries
+    `placements: ["PAYMENT_METHOD"]`, so a wallet that one day also advertises the card brands it
+    accepts (which is what a wallet IS — a stored card) would be read as a card FORM a headless
+    payer can drive. It is not; the payer cannot authenticate to the wallet. See
+    `tests/test_merchant_purchasability.py::test_a_wallet_line_that_advertises_card_brands_is_not_a_card`.
+    """
+    labels: List[str] = []
+    card = False
+    for line in lines:
+        if not isinstance(line, dict):
+            raise _ShapeSurprise("line is not an object")
+        method = line.get("paymentMethod")
+        if not isinstance(method, dict):
+            raise _ShapeSurprise("paymentMethod is not an object")
+        typename = method.get("__typename")
+        if not isinstance(typename, str) or not typename.strip():
+            raise _ShapeSurprise("paymentMethod.__typename is not a string")
+        raw = line.get("placements")
+        if not isinstance(raw, list):
+            raise _ShapeSurprise("placements is not a list")
+        brands = method.get("paymentBrands")
+        if brands is not None and not isinstance(brands, list):
+            raise _ShapeSurprise("paymentBrands is neither a list nor null")
+
+        label = _payment_method_label(method)
+        if label:
+            labels.append(label)
+        if _PAYMENT_METHOD_PLACEMENT not in {p for p in raw if isinstance(p, str)}:
+            continue  # an ACCELERATED_CHECKOUT-only line is a wallet button, not a card form
+        if typename != _CARD_METHOD_TYPENAME:
+            continue  # LOAD-BEARING on its own; see the docstring
+        named = {b.strip().upper() for b in (brands or []) if isinstance(b, str)}
+        if named & _CARD_BRANDS:
+            card = True
+    return tuple(sorted(set(labels))[:_MAX_PAYMENT_METHOD_LABELS]), card
+
+
+def checkout_payment_methods(body: str) -> Tuple[Tuple[str, ...], Optional[bool], Optional[str]]:
+    """The checkout's accept-list, whether it offers a CARD, and a detector note.
+
+    Returns `(labels, card_available, note)`. `card_available` is None — not False — whenever:
+      * no `availablePaymentLines` array could be read at all;
+      * the array is present but EMPTY, or names no method;
+      * a line does not have the measured shape (`note` is then `DETECTOR_SHAPE_UNEXPECTED`);
+      * two copies of the serialized state disagree.
+
+    Only an array we fully read, every line well-shaped, holding no `PaymentProvider` with card
+    brands, answers False. See the module docstring for why a substring must never be used here.
+    """
+    page = html.unescape(body or "")
+    answers = set()
+    surprised = False
+    for lines in _json_values_after(page, "availablePaymentLines"):
+        if not isinstance(lines, list) or not lines:
+            continue
+        try:
+            labels, card = _read_payment_lines(lines)
+        except _ShapeSurprise as exc:
+            # The type and nothing else: this is somebody else's page and its values are not ours
+            # to log. One line at WARNING because a drift here is a whole-platform event.
+            surprised = True
+            logger.warning(
+                "cart-link preflight: availablePaymentLines did not have the measured shape (%s); "
+                "reporting card_available=None rather than a negative", exc,
+            )
+            continue
+        if not labels:
+            continue  # an accept-list that names nothing determines nothing
+        answers.add((labels, card))
+    if surprised:
+        # A surprise anywhere poisons the read, even if another copy parsed cleanly: the two
+        # copies are the same state, so one of them being unreadable means we do not know which
+        # is current.
+        return (), None, DETECTOR_SHAPE_UNEXPECTED
+    if len(answers) != 1:
+        return (), None, None
+    labels, card = next(iter(answers))
+    return labels, card, None
+
+
+# --- price parity ----------------------------------------------------------------------------
+
+# Bounded on purpose: `Decimal("1e999999999")` is a denial of service, and an amount with more
+# than six decimals is not a price Shopify renders.
+_AMOUNT = re.compile(r"-?\d{1,15}(?:\.\d{1,6})?")
+
+
+def amount_to_minor(amount: Any, currency: Any) -> Optional[int]:
+    """EXACT minor units, or None. Never 0-on-failure: a price we could not read must not become
+    a price of zero, which would mint a drift out of an unreadable page (the `Number(null) is 0`
+    trap). `utils.money.to_minor_units` is deliberately not used here — it answers 0 for junk and
+    rounds HALF_UP, and this comparison must be exact."""
+    if not isinstance(amount, str) or not isinstance(currency, str):
+        return None
+    text = amount.strip()
+    if not _AMOUNT.fullmatch(text):
+        return None
+    try:
+        value = Decimal(text)
+    except InvalidOperation:
+        return None
+    factor = 1 if currency.strip().upper() in ZERO_DECIMAL_CURRENCIES else 100
+    scaled = value * factor
+    if scaled != scaled.to_integral_value():
+        return None  # a sub-minor-unit price is not representable; report nothing, not a rounding
+    return int(scaled)
+
+
+def _line_quantity(line: Dict[str, Any]) -> Optional[int]:
+    """A merchandise line's quantity as an int, or None.
+
+    IT IS NOT A NUMBER ON THE PAGE. Measured live 2026-09-22 on all three survey merchants, a
+    line's `quantity` is a constraint object —
+    `{"__typename":"ProposalMerchandiseQuantityByItem","items":{"__typename":"IntValueConstraint",
+    "value":1}}` — and reading it as an int silently drops EVERY line, which reads as "no price
+    on this checkout" rather than as a parse failure. A bare int is still accepted in case the
+    shape changes back; anything else answers None.
+    """
+    raw = line.get("quantity")
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw if raw >= 1 else None
+    if isinstance(raw, dict):
+        items = raw.get("items")
+        value = items.get("value") if isinstance(items, dict) else None
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        return value if value >= 1 else None
+    return None
+
+
+def checkout_line_price(body: str, variant_id: str) -> Tuple[Optional[int], Optional[str]]:
+    """`(unit_price_minor, currency)` for `variant_id`'s merchandise line on the landed checkout.
+
+    Read from `merchandiseLines[].totalAmount.value` — the LINE total — divided by the line's
+    `quantity`, and only when that division is exact. `(None, None)` when the line is absent,
+    unreadable, or when two copies of the serialized state disagree: an ambiguous price is not a
+    price, and reporting one would invent a drift.
+    """
+    page = html.unescape(body or "")
+    want_id = f"gid://shopify/ProductVariantMerchandise/{variant_id}"
+    found = set()
+    for lines in _json_values_after(page, "merchandiseLines"):
+        for line in lines if isinstance(lines, list) else []:
+            if not isinstance(line, dict) or line.get("__typename") != "MerchandiseLine":
+                continue
+            merch = line.get("merchandise")
+            if not isinstance(merch, dict) or merch.get("id") != want_id:
+                continue
+            total = line.get("totalAmount")
+            money = total.get("value") if isinstance(total, dict) else None
+            if not isinstance(money, dict):
+                continue
+            currency = money.get("currencyCode")
+            minor = amount_to_minor(money.get("amount"), currency)
+            quantity = _line_quantity(line)
+            if minor is None or quantity is None:
+                continue
+            if minor % quantity:
+                continue  # a unit price that is not a whole minor unit: report nothing
+            found.add((minor // quantity, str(currency).strip().upper()))
+    return next(iter(found)) if len(found) == 1 else (None, None)
+
+
+def price_drift(
+    landed_minor: Optional[int],
+    landed_currency: Optional[str],
+    expected_minor: Optional[int],
+    expected_currency: Optional[str],
+) -> Optional[int]:
+    """`landed - expected` in minor units, or None when either side is unknown or the two
+    currencies differ (cross-currency subtraction is not a drift, it is a category error)."""
+    if landed_minor is None or expected_minor is None:
+        return None
+    if isinstance(expected_minor, bool) or not isinstance(expected_minor, int):
+        return None
+    if not landed_currency or not expected_currency:
+        return None
+    if landed_currency.strip().upper() != expected_currency.strip().upper():
+        return None
+    return landed_minor - expected_minor
+
+
 def classify_landing(
     *,
     chain: List[Hop],
@@ -501,6 +813,9 @@ def classify_landing(
     click_id: str,
     buyer: Optional[CartPrefill],
     market: Optional[str] = None,
+    card_available: Optional[bool] = None,
+    price_drift_minor: Optional[int] = None,
+    detector_note: Optional[str] = None,
 ) -> Tuple[Verdict, Tuple[str, ...]]:
     """Pure: the verdict for a finished redirect chain, plus what an almost-checkout lacked.
 
@@ -542,6 +857,18 @@ def classify_landing(
             return Verdict.UNCLASSIFIED, tuple(missing)
         if market is not None and checkout_buyer_country(page) != market.upper():
             return Verdict.CHECKOUT_MARKET_MISMATCH, tuple(missing)
+        # Both of these outrank a prefill miss: they are facts about whether this checkout can be
+        # PAID, and `is False` / `!= 0` are written out so that an undetermined card (None) and a
+        # parity of 0 can never fall through as a negative.
+        if detector_note:
+            # The accept-list was THERE and we could not trust our reading of it. That is a fact
+            # about the DETECTOR, not about the merchant, so it lands where every other
+            # "cannot verify" lands -- unverifiable and retryable -- and never as a negative.
+            return Verdict.BLOCKED_UNKNOWN, tuple(missing)
+        if card_available is False:
+            return Verdict.NO_CARD_PAYMENT, tuple(missing)
+        if price_drift_minor is not None and price_drift_minor != 0:
+            return Verdict.PRICE_DRIFT, tuple(missing)
         if missing:
             return Verdict.CHECKOUT_PREFILL_MISSING, tuple(missing)
         return Verdict.ELIGIBLE, ()
@@ -794,6 +1121,9 @@ async def preflight(
     quantity: int = 1,
     buyer: Optional[CartPrefill] = None,
     click_id: str,
+    check_card: bool = False,
+    expected_price_minor: Optional[int] = None,
+    expected_currency: Optional[str] = None,
     client: Optional[httpx.AsyncClient] = None,
 ) -> PreflightResult:
     """Resolve a live variant, follow its (optionally prefilled) cart permalink, classify.
@@ -803,18 +1133,27 @@ async def preflight(
     `buyer.country` must equal `market`. The Reap path passes `buyer=None` (the buyer travels
     in Reap's quote body, not in the link).
 
+    `expected_price_minor` / `expected_currency` (optional) are OUR indexed unit price for the
+    variant. When both are given and the landed line's price can be read, the exact difference is
+    reported as `price_drift_minor` and any non-zero difference is PRICE_DRIFT.
+
     Only for hosts on Pivota's internal merchant list — see the module docstring. Creates one
     abandoned checkout per call that reaches the permalink step. Never raises for a network
     outcome: transport failures come back as TRANSPORT_ERROR with retryable=True.
     `shipping_verified` is always False.
     """
     token = _PREFLIGHT_ACTIVE.set(True)
+    expected = (expected_price_minor, expected_currency, bool(check_card))
     try:
         if client is not None:
-            result = await _preflight(host, market, variant_id, product_handle, quantity, buyer, click_id, client)
+            result = await _preflight(
+                host, market, variant_id, product_handle, quantity, buyer, click_id, client, expected
+            )
         else:
             async with httpx.AsyncClient(headers=_HEADERS, timeout=REQUEST_TIMEOUT_S) as own:
-                result = await _preflight(host, market, variant_id, product_handle, quantity, buyer, click_id, own)
+                result = await _preflight(
+                    host, market, variant_id, product_handle, quantity, buyer, click_id, own, expected
+                )
     finally:
         _PREFLIGHT_ACTIVE.reset(token)
     if result.verdict is Verdict.INVALID_INPUT:
@@ -831,7 +1170,9 @@ async def _preflight(
     buyer: Optional[CartPrefill],
     click_id: str,
     client: httpx.AsyncClient,
+    expected: Tuple[Optional[int], Optional[str], bool] = (None, None, False),
 ) -> PreflightResult:
+    expected_price_minor, expected_currency, check_card = expected
     host = normalize_shop_host(raw_host)
     refusal = _input_refusal(host, raw_market, variant_id, product_handle, quantity, buyer, click_id)
     if refusal:
@@ -895,14 +1236,41 @@ async def _preflight(
             verdict=Verdict.UNCLASSIFIED, chain=tuple(landing.chain), final_status=landing.status,
             final_host=final_host, final_url=final_url, detail="too_many_redirects", **known,
         ))
+    # Read the payment accept-list and the line price BEFORE classifying, and only off a 200: a
+    # 403 challenge page or a password wall carries neither, and must stay unverifiable.
+    if landing.status == 200:
+        payment_methods, card_available, detector_note = checkout_payment_methods(landing.body)
+        landed_price_minor, landed_currency = checkout_line_price(landing.body, chosen.variant_id)
+    else:
+        payment_methods, card_available, detector_note = (), None, None
+        landed_price_minor, landed_currency = None, None
+    if not check_card:
+        # The note only means anything to a caller that asked for the card verdict; without
+        # `check_card` it must not move the Tier B lane's verdict either.
+        detector_note = None
+    drift = price_drift(landed_price_minor, landed_currency, expected_price_minor, expected_currency)
     verdict, missing = classify_landing(
         chain=landing.chain, final_status=landing.status, body=landing.body,
         variant_id=chosen.variant_id, click_id=click_id, buyer=buyer, market=market,
+        # THE FIELDS ARE ALWAYS FILLED; ONLY THE VERDICT IS OPT-IN. `check_card` exists so that
+        # adding this detector cannot change what the Tier B cart-link lane decides — that lane
+        # calls `preflight` without it and keeps every verdict it had, while its rows still gain
+        # the observability. The purchasability sweep passes check_card=True, behind its own dial.
+        card_available=(card_available if check_card else None), price_drift_minor=drift,
+        detector_note=detector_note,
     )
     checkout_country = checkout_buyer_country(landing.body) if landing.status == 200 else None
     total = _CHECKOUT_TOTAL.search(html.unescape(landing.body)) if landing.status == 200 else None
     return _done(PreflightResult(
         verdict=verdict,
+        # RETRYABLE, like every other unverifiable outcome: the page is there, our reading of it
+        # is not, and the next sweep should try again rather than the row ageing out as a fact.
+        retryable=(verdict is Verdict.BLOCKED_UNKNOWN and bool(detector_note)),
+        payment_methods=payment_methods,
+        card_available=card_available,
+        landed_price_minor=landed_price_minor,
+        landed_currency=landed_currency,
+        price_drift_minor=drift,
         chain=tuple(landing.chain),
         final_status=landing.status,
         final_host=final_host,
@@ -913,6 +1281,9 @@ async def _preflight(
         detail=(
             f"status_{landing.status}" if verdict is Verdict.UNCLASSIFIED
             else f"checkout_country_{checkout_country or 'unreadable'}" if verdict is Verdict.CHECKOUT_MARKET_MISMATCH
+            else detector_note if detector_note and verdict is Verdict.BLOCKED_UNKNOWN
+            else "no_card_in_" + ",".join(payment_methods) if verdict is Verdict.NO_CARD_PAYMENT
+            else f"drift_{drift}_{landed_currency}" if verdict is Verdict.PRICE_DRIFT
             else None
         ),
         checkout_country=checkout_country,

@@ -784,6 +784,25 @@ purchase. Adding one is a one-line change.
 Lowercased, exactly. A domain that does not match answers `row_not_found` for every product on it,
 which reads as "we do not have this merchant" rather than "the eligibility row is wrong".
 
+### Before arming: eligibility rows need a fresh positive purchasability fact
+
+With `MERCHANT_PURCHASABILITY_ENFORCE` on, an enabled `reap_agentic_eligibility` row — or a Tier B
+`ELIGIBLE` verdict — is **necessary but not sufficient**. `POST /agent/v2/commerce/reap/purchases`
+additionally refuses **`merchant_not_purchasable` (409)** unless
+`db.merchant_purchasability.is_purchasable(domain, market)` is true, and that needs a **fresh
+positive fact FROM THE BUYER VANTAGE**: a checkout we actually rendered whose own accept-list named
+a card gateway, at the price we hold, gathered from the egress named by
+`MERCHANT_PURCHASABILITY_BUYER_VANTAGE` and not yet aged out. The check runs **before** either
+lane's eligibility, because it is the broader refusal — both allowlists say a merchant is
+*permitted*, and neither says its checkout can be *paid*; it is a separate refusal code from
+`merchant_not_eligible` so an operator can tell "nobody listed this merchant" from "this merchant
+is listed and we cannot prove it can be paid". Note that arming that dial arms the gathering and
+the enforcement at the same time, so every merchant answers `merchant_not_purchasable` until the
+first sweep tick lands its fact. See **docs/runbooks/merchant_purchasability.md** for the rule, the
+vantage, and the rollback, and read a merchant's current state with
+`GET /ops/merchant-purchasability?domain=&market=` (admin auth) — its `tier` field is computed
+through the same `is_purchasable` this route calls.
+
 ---
 
 ## Enabling a merchant

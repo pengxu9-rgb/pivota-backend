@@ -265,6 +265,134 @@ async def ensure_required_schema_light() -> None:
     await _ensure_database_connected()
     try:
         if IS_POSTGRES:
+            # mig 231: the MERCHANT PURCHASABILITY fact — the only thing that may
+            # let a merchant x market row carry a BUY affordance. See
+            # db/migrations/231_merchant_purchasability.sql for the incident it
+            # closes (flowerbeauty.com served as purchasable with a PayPal-only
+            # checkout at a price we did not hold).
+            #
+            # A CREATE TABLE, so the coverage gate (ADD COLUMN only) cannot see a
+            # missing heal here — the same hole the mig-224 and mig-230 blocks
+            # name. The catalog-parity test in
+            # tests/test_merchant_purchasability_postgres.py is what closes it.
+            #
+            # Its OWN try, and EARLY in the branch, for the reason the mig-207
+            # block below states at length: this whole IS_POSTGRES branch is one
+            # try-block, so a statement that raises abandons every statement after
+            # it. It fails SAFE either way — with the table missing,
+            # `is_purchasable` finds no fact and answers False, which refuses the
+            # purchase rather than opening it.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        CREATE TABLE IF NOT EXISTS merchant_purchasability (
+                            merchant_domain VARCHAR(255) NOT NULL,
+                            market_country VARCHAR(2) NOT NULL
+                                CONSTRAINT ck_merchant_purchasability_market
+                                CHECK (market_country ~ '^[A-Z]{2}$'),
+                            vantage VARCHAR(32) NOT NULL,
+                            checked_at TIMESTAMPTZ,
+                            verdict VARCHAR(32),
+                            card_available BOOLEAN,
+                            payment_methods JSONB,
+                            landed_price_minor BIGINT,
+                            landed_currency VARCHAR(8),
+                            expected_price_minor BIGINT,
+                            price_drift_minor BIGINT,
+                            variant_id VARCHAR(32),
+                            evidence JSONB,
+                            consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                            positive_until TIMESTAMPTZ,
+                            PRIMARY KEY (merchant_domain, market_country, vantage)
+                        );
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 231, second statement: the sweep's due-list index. Its OWN try —
+            # an index build that raises must not cost the table above it or the
+            # heals below.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        CREATE INDEX IF NOT EXISTS idx_merchant_purchasability_due
+                            ON merchant_purchasability (checked_at);
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 232: widen migration 228's verdict vocabulary for NO_CARD_PAYMENT and
+            # PRICE_DRIFT.
+            #
+            # THE CREATE TABLE IN db/tierb_cart_link_eligibility_schema.py ALREADY CARRIES THE
+            # WIDE LIST, and on a FRESH database that is the whole heal. It is NOT enough on a
+            # database that already holds a 228-shaped table: `CREATE TABLE IF NOT EXISTS` does
+            # nothing there, so the narrow CHECK survives and the first NO_CARD_PAYMENT write
+            # raises. Measured on a 228-only database, which is what production is.
+            #
+            # The constraint names are POSTGRES'S OWN (`<table>_<column>_check`): migration 228
+            # declared both CHECKs inline and unnamed. Dropped by that name and re-added under
+            # it, so this and the migration leave byte-identical catalogs — compared by
+            # tests/test_merchant_purchasability_postgres.py.
+            #
+            # IDEMPOTENT: DROP ... IF EXISTS then ADD, so a second arrival re-adds the same
+            # definition rather than duplicating or failing. Each statement pair in its own try,
+            # for the reason the mig-207 block below states: this branch is one try-block.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS tierb_cart_link_eligibility
+                            DROP CONSTRAINT IF EXISTS tierb_cart_link_eligibility_verdict_check;
+                        """
+                    )
+                )
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS tierb_cart_link_eligibility
+                            ADD CONSTRAINT tierb_cart_link_eligibility_verdict_check
+                            CHECK (verdict IS NULL OR verdict IN (
+                                'ELIGIBLE', 'LOGIN_REQUIRED', 'NOT_ACCEPTING_ORDERS',
+                                'VARIANT_GONE', 'VARIANT_UNAVAILABLE', 'PASSWORD_PAGE',
+                                'BLOCKED_UNKNOWN', 'CHECKOUT_PREFILL_MISSING',
+                                'CHECKOUT_MARKET_MISMATCH', 'NO_CARD_PAYMENT', 'PRICE_DRIFT'
+                            ));
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS tierb_cart_link_eligibility
+                            DROP CONSTRAINT IF EXISTS
+                                tierb_cart_link_eligibility_previous_verdict_check;
+                        """
+                    )
+                )
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS tierb_cart_link_eligibility
+                            ADD CONSTRAINT tierb_cart_link_eligibility_previous_verdict_check
+                            CHECK (previous_verdict IS NULL OR previous_verdict IN (
+                                'ELIGIBLE', 'LOGIN_REQUIRED', 'NOT_ACCEPTING_ORDERS',
+                                'VARIANT_GONE', 'VARIANT_UNAVAILABLE', 'PASSWORD_PAGE',
+                                'BLOCKED_UNKNOWN', 'CHECKOUT_PREFILL_MISSING',
+                                'CHECKOUT_MARKET_MISMATCH', 'NO_CARD_PAYMENT', 'PRICE_DRIFT'
+                            ));
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
             # mig 207: the Reap EXTERNAL AUTHORIZATION ledger + merchant descriptor
             # registry. Both tables are read on the FIRST authorization Reap sends,
             # inside a 1.6-second budget, and a missing relation there is not a 500
@@ -2801,6 +2929,79 @@ async def ensure_required_schema_light() -> None:
             return
 
         if IS_SQLITE:
+            # mig 231: the merchant purchasability fact, SQLite twin.
+            #
+            # NOT byte-identical to the Postgres DDL, and the differences are the
+            # ones this branch always makes: TIMESTAMPTZ -> TIMESTAMP, JSONB ->
+            # TEXT (SQLite has no JSON affinity; the module encodes and decodes),
+            # and the regex CHECK -> the length/upper pair SQLite can evaluate,
+            # exactly as the mig-226 eligibility twin below writes it.
+            #
+            # SQL-ONLY, no SQLAlchemy Table, for the reason the mig-224 twin gives:
+            # a `Table` would make the model the source of truth because
+            # `metadata.create_all` runs BEFORE db/migrations in main.py, and then
+            # the SQLite half of this rail's tests would be testing a schema that
+            # exists nowhere. Its own try, so it cannot starve what follows.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        CREATE TABLE IF NOT EXISTS merchant_purchasability (
+                            merchant_domain VARCHAR(255) NOT NULL,
+                            market_country VARCHAR(2) NOT NULL
+                                CONSTRAINT ck_merchant_purchasability_market
+                                CHECK (length(market_country) = 2
+                                       AND market_country = upper(market_country)),
+                            vantage VARCHAR(32) NOT NULL,
+                            checked_at TIMESTAMP,
+                            verdict VARCHAR(32),
+                            card_available BOOLEAN,
+                            payment_methods TEXT,
+                            landed_price_minor BIGINT,
+                            landed_currency VARCHAR(8),
+                            expected_price_minor BIGINT,
+                            price_drift_minor BIGINT,
+                            variant_id VARCHAR(32),
+                            evidence TEXT,
+                            consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                            positive_until TIMESTAMP,
+                            PRIMARY KEY (merchant_domain, market_country, vantage)
+                        );
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 231, second statement: the due-list index, SQLite twin. Its own
+            # try, same reason as the Postgres half.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        CREATE INDEX IF NOT EXISTS idx_merchant_purchasability_due
+                            ON merchant_purchasability (checked_at);
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 232, SQLite twin: THERE IS NO STATEMENT HERE, AND THAT IS THE ANSWER.
+            #
+            # SQLite cannot alter a CHECK in place. There is no DROP CONSTRAINT and no ADD
+            # CONSTRAINT; widening one means rebuilding the table (create-new, copy, drop, rename)
+            # under `PRAGMA legacy_alter_table`, and doing that here — best-effort, inside a try
+            # that swallows everything, against a table another statement in this same branch may
+            # have just created — risks losing the rows on a partial failure. That trade is not
+            # worth taking for this table.
+            #
+            # IT IS SAFE TO OMIT because of where SQLite is used: dev machines and the test suite,
+            # both of which build the schema from scratch. `ensure_schema` below runs the
+            # `CREATE TABLE IF NOT EXISTS` in db/tierb_cart_link_eligibility_schema.py, whose
+            # verdict list ALREADY carries NO_CARD_PAYMENT and PRICE_DRIFT, so every SQLite
+            # database born after this change has the wide vocabulary. Only a SQLite file that
+            # predates it keeps the narrow one, and the fix for that file is to delete it.
+            #
+            # Production is Postgres, and the Postgres branch above does heal it in place.
             # mig 228: Tier B cart-link eligibility, SQLite twin — the same
             # function as the Postgres branch; it picks the dialect's DDL.
             # SQL-only (no SQLAlchemy Table) for the reason the mig-224 block

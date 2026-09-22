@@ -31,6 +31,7 @@ from db.audit_evidence import (
     fetch_verification_history_for_domain,
     summarize_ucp_route_merchant_coverage,
 )
+import db.merchant_purchasability as purchasability
 from routes.store_audit_probe_internal import SENSITIVE_RESULT_KEYS
 from utils.auth import require_admin
 
@@ -126,6 +127,12 @@ class CoverageResponse(BaseModel):
     active_ucp_routes: int
     routes_with_proven_merchant: int
     note: str
+    #: Whether the purchasability gate is armed. When it is, a merchant's checkout tier is NOT
+    #: this lane's business at all: reaching the checkout-tested tier means the door PRICED a
+    #: cart, which says nothing about whether that checkout takes a card. See
+    #: `purchasability_note` and docs/runbooks/merchant_purchasability.md.
+    purchasability_gate_enabled: bool = False
+    purchasability_note: str = ""
 
 
 def _iso(value: Any) -> Optional[str]:
@@ -200,6 +207,14 @@ async def checkout_tier_coverage(
     """
     summary = await summarize_ucp_route_merchant_coverage()
     failed = summary.get("active_ucp_routes", -1) < 0
+    # THE SECOND ANSWER THIS ENDPOINT NOW CARRIES. A route reaching the
+    # checkout-tested tier means the merchant's door PRICED A CART. It does not
+    # mean the merchant's checkout can be PAID, and reading it as if it did is
+    # what put flowerbeauty.com in front of buyers with a PayPal-only checkout.
+    # With the purchasability gate armed, no route's tier authorises a purchase:
+    # only a fresh positive purchasability fact does, and that is per merchant x
+    # market x vantage, which this counts-only summary cannot express.
+    gate_on = purchasability.is_enforcement_enabled()
     return CoverageResponse(
         active_ucp_routes=summary.get("active_ucp_routes", -1),
         routes_with_proven_merchant=summary.get("routes_with_proven_merchant", -1),
@@ -207,5 +222,14 @@ async def checkout_tier_coverage(
             "lookup FAILED — these numbers are not measurements" if failed
             else "flipping the checkout tier changes nothing while "
                  "routes_with_proven_merchant is 0"
+        ),
+        purchasability_gate_enabled=gate_on,
+        purchasability_note=(
+            "MERCHANT_PURCHASABILITY_ENFORCE is ON: a checkout tier does NOT authorise a "
+            "purchase. Every merchant without a fresh positive purchasability fact from the "
+            "buyer vantage is browse_only — query GET /ops/merchant-purchasability per merchant."
+            if gate_on else
+            "MERCHANT_PURCHASABILITY_ENFORCE is off: nothing downgrades a tier, and a "
+            "checkout-tested route still says nothing about whether that checkout takes a card."
         ),
     )

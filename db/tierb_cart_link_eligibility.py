@@ -85,6 +85,13 @@ DEFINITE_VERDICTS: FrozenSet[Verdict] = frozenset({
     # A checkout that landed in another market than the buyer's, or whose market the page did
     # not state: the store answered, and the answer is "not for this market". Fail-closed.
     Verdict.CHECKOUT_MARKET_MISMATCH,
+    # The checkout's own accept-list was READ and holds no card method, and the checkout's line
+    # price differs from ours. Both are the store answering about itself, so both are definite —
+    # and both mean a card-paying agent must not be sent down this path. Added with the
+    # purchasability gate; `unclassified_verdicts()` is the test that forced this decision to be
+    # made here rather than letting the two members be written by default.
+    Verdict.NO_CARD_PAYMENT,
+    Verdict.PRICE_DRIFT,
 })
 INDEFINITE_VERDICTS: FrozenSet[Verdict] = frozenset({
     Verdict.TRANSPORT_ERROR,
