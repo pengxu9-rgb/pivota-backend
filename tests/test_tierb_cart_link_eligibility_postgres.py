@@ -54,7 +54,20 @@ from tests.test_tierb_cart_link_eligibility_job import (  # noqa: E402,F401
 
 _MIGRATION = Path(__file__).resolve().parent.parent / "db/migrations/228_tierb_cart_link_eligibility.sql"
 _DOWN = Path(__file__).resolve().parent.parent / "db/migrations/down/228_tierb_cart_link_eligibility_down.sql"
+#: 232 WIDENS 228's verdict vocabulary (NO_CARD_PAYMENT, PRICE_DRIFT). It belongs in the parity
+#: build for exactly the reason the reap gate's list gives for 227: the parity test compares what
+#: the MIGRATIONS built against what the SELF-HEAL built, and the self-heal carries 232 — both the
+#: widened CREATE TABLE in db/tierb_cart_link_eligibility_schema.py and the in-place widening in
+#: db/schema_guard.py. Without it here, parity fails for a change that is correct.
+#:
+#: THE RULE THIS FILE LEARNED: when a later migration ALTERS an earlier table, the earlier table's
+#: own parity suite is what catches it — not the CI-order subset, which does not run this file.
+_MIGRATION_232 = Path(__file__).resolve().parent.parent / "db/migrations/232_tierb_verdict_vocabulary.sql"
+_MIGRATIONS = (_MIGRATION, _MIGRATION_232)
 _TABLE = "tierb_cart_link_eligibility"
+
+#: The two verdicts 232 adds. Named here so the control below can fail for a REASON.
+_WIDENED_VERDICTS = ("NO_CARD_PAYMENT", "PRICE_DRIFT")
 
 
 async def _apply(path: Path) -> None:
@@ -110,7 +123,8 @@ async def test_the_self_heal_builds_the_same_schema_as_migration_228():
     from db.tierb_cart_link_eligibility_schema import ensure_schema
 
     await database.execute(f"DROP TABLE IF EXISTS {_TABLE}")
-    await _apply(_MIGRATION)
+    for migration in _MIGRATIONS:
+        await _apply(migration)
     from_migration = await _schema_fingerprint()
     columns, indexes, constraints, names = from_migration
     assert len(columns) == 18, columns
@@ -118,6 +132,13 @@ async def test_the_self_heal_builds_the_same_schema_as_migration_228():
     assert sum(1 for kind, _ in constraints if kind == "c") == 6, constraints
     assert "checkout_country" in {c[0] for c in columns}
     assert all("CHECKOUT_MARKET_MISMATCH" in d for k, d in constraints if k == "c" and "ELIGIBLE" in d)
+    # 232's widening, on the MIGRATION side. Both verdict CHECKs must carry both new members:
+    # if this ever fails, the migration list above has drifted from what the self-heal builds.
+    verdict_checks = [d for k, d in constraints if k == "c" and "ELIGIBLE" in d]
+    assert len(verdict_checks) == 2, verdict_checks
+    for definition in verdict_checks:
+        for verdict in _WIDENED_VERDICTS:
+            assert verdict in definition, f"migration 232 did not widen: {definition}"
     assert names == ["ck_tierb_cart_link_eligibility_verdict_has_clock",
                      "uq_tierb_cart_link_eligibility_shop_market"]
 
@@ -129,6 +150,78 @@ async def test_the_self_heal_builds_the_same_schema_as_migration_228():
     assert from_self_heal[1] == from_migration[1], "indexes differ between self-heal and migration"
     assert from_self_heal[2] == from_migration[2], "constraints differ between self-heal and migration"
     assert from_self_heal[3] == from_migration[3], "constraint names differ"
+
+
+async def test_a_228_only_build_FAILS_this_parity_and_names_the_check():
+    """THE CONTROL. Without it the parity test above could pass vacuously — it passed for months
+    while 228 was the only migration, and it went on passing the moment 232 shipped only because
+    the assertion was comparing two builds that happened to agree.
+
+    A migration side built from 228 ALONE must differ from the self-heal, and the difference must
+    be THE VERDICT CHECK, named: the widened members are present on one side and absent on the
+    other. A control that merely asserted "they differ" would also pass if the two builds
+    disagreed about something else entirely.
+    """
+    from db.database import database
+    from db.tierb_cart_link_eligibility_schema import ensure_schema
+
+    await database.execute(f"DROP TABLE IF EXISTS {_TABLE}")
+    await _apply(_MIGRATION)  # 228 ONLY — deliberately not _MIGRATIONS
+    narrow = await _schema_fingerprint()
+
+    await database.execute(f"DROP TABLE IF EXISTS {_TABLE}")
+    await ensure_schema()
+    wide = await _schema_fingerprint()
+
+    assert wide[2] != narrow[2], (
+        "a 228-only migration build is indistinguishable from the self-heal — either 232 stopped "
+        "widening anything, or the fingerprint stopped looking at CHECK constraints, and in "
+        "both cases the parity test above proves nothing"
+    )
+
+    def _verdict_checks(fingerprint):
+        return [d for kind, d in fingerprint[2] if kind == "c" and "ELIGIBLE" in d]
+
+    narrow_checks, wide_checks = _verdict_checks(narrow), _verdict_checks(wide)
+    assert len(narrow_checks) == len(wide_checks) == 2
+    for verdict in _WIDENED_VERDICTS:
+        assert all(verdict not in d for d in narrow_checks), (
+            f"228 alone already admits {verdict} — 232 is not what widened it"
+        )
+        assert all(verdict in d for d in wide_checks), (
+            f"the self-heal does not admit {verdict}"
+        )
+
+    # And everything OTHER than the verdict vocabulary must already agree, so the control is
+    # pointing at the CHECK and not at some unrelated drift.
+    assert wide[0] == narrow[0], "columns should not differ between 228 and the self-heal"
+    assert wide[1] == narrow[1], "indexes should not differ between 228 and the self-heal"
+    assert wide[3] == narrow[3], "constraint names should not differ"
+
+
+async def test_the_schema_guard_heals_a_228_shaped_table_to_the_widened_vocabulary():
+    """The OTHER arrival path, and the one production takes: a table that already exists in
+    228's shape. `CREATE TABLE IF NOT EXISTS` does nothing there, so only the in-place widening
+    in db/schema_guard.py can fix it — measured, because the first cut of 232 had no self-heal
+    and left production refusing every NO_CARD_PAYMENT write."""
+    from db.database import database
+    from db.schema_guard import ensure_required_schema_light
+
+    await database.execute(f"DROP TABLE IF EXISTS {_TABLE}")
+    await _apply(_MIGRATION)  # 228 only: production's shape before this PR
+    before = [d for k, d in (await _schema_fingerprint())[2] if k == "c" and "ELIGIBLE" in d]
+    assert all(v not in d for d in before for v in _WIDENED_VERDICTS), "precondition: narrow"
+
+    await ensure_required_schema_light()
+
+    after = [d for k, d in (await _schema_fingerprint())[2] if k == "c" and "ELIGIBLE" in d]
+    for verdict in _WIDENED_VERDICTS:
+        assert all(verdict in d for d in after), f"the heal did not widen for {verdict}"
+    # Behaviourally, not just in the catalog.
+    await database.execute(
+        f"INSERT INTO {_TABLE} (shop_domain, market, verdict, checked_at) "
+        "VALUES ('judydoll.com', 'US', 'NO_CARD_PAYMENT', now())"
+    )
 
 
 async def test_the_schema_guard_builds_it_too_and_the_unique_key_holds():

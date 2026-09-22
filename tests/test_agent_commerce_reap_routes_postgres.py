@@ -92,6 +92,12 @@ _MIGRATIONS = (
     _MIGRATIONS_DIR / "228_tierb_cart_link_eligibility.sql",
     _MIGRATIONS_DIR / "229_reap_agentic_purchase_item_source.sql",
     _MIGRATIONS_DIR / "230_conversion_click_claims.sql",
+    # 232 widens 228's verdict vocabulary in place. Same reason as 227 above: this file DROPS
+    # tierb_cart_link_eligibility and rebuilds it from this list, and the self-heal carries 232,
+    # so a migration build without it is not the schema production has. 226's parity fingerprint
+    # does not span that table today — but a build that disagrees with the self-heal is a trap
+    # waiting for whoever widens the fingerprint.
+    _MIGRATIONS_DIR / "232_tierb_verdict_vocabulary.sql",
 )
 
 #: Same convention as the ledger's gate: this file DROPS its tables, so it must be INCAPABLE of
