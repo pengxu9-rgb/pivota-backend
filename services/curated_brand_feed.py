@@ -1483,6 +1483,68 @@ _MEASURED_HOST_PRODUCT_TYPES = {
 _NON_FACE_TITLE = re.compile(r"\b(?:hair|scalp|body|foot|feet|hands?|nails?|lash(?:es)?|brows?|beard)\b", re.I)
 
 
+# FACE skincare leaves: the four shelves a face routine is built from. Sunscreen is deliberately
+# absent -- a body sunscreen IS a sunscreen, and sun/sunscreen names no body area.
+_FACE_SKINCARE_LEAF = re.compile(r"^beauty/skincare/(?:cleanse|tone|treat|moisturize)/")
+
+# The body area a product names, and the leaf that area belongs to -- None where the taxonomy has
+# NO honest leaf (no lash/brow-care, nail-care or men's-grooming leaf; see TAXONOMY_GAPS), so the
+# row is left unresolved rather than filed under a face shelf it does not belong to.
+#
+# Why this exists: the merchant product_type door keeps only the noun a pattern recognises and
+# drops its qualifier. Measured on ohlolly.com / eyurs.com 2026-09-22: type "Hand Cream" ->
+# moisturize/cream, "Foot Cream" -> moisturize/cream, "Eye Lash Serum" -> treat/serum; and a
+# "Body Wash" / "Hand Wash" filed under the merchant type "Cleanser" -> cleanse/cleanser.
+#
+# Whole words only: "Handmade", "Behind", "Splash", "Brown", "Bodied", "Hairline" are not areas,
+# nor is a hyphenated craft word ("Hand-Picked", "Second-hand"). "The Body Shop" is a brand.
+_NON_FACE_AREAS = (
+    ("hand", re.compile(r"(?<!second-)\bhand(?:s|cream|wash)?\b"
+                        r"(?!-(?:picked|made|crafted|poured|selected|blended|harvested|tied))", re.I),
+     "beauty/body/care"),
+    ("body", re.compile(r"\bbody\b(?!\s+shop\b)", re.I), "beauty/body/care"),
+    ("foot", re.compile(r"\b(?:foot|feet)\b", re.I), "beauty/body/care"),
+    ("hair", re.compile(r"\b(?:hair|scalp)\b", re.I), "beauty/haircare/general"),
+    ("lash", re.compile(r"\b(?:eye\s?)?lash(?:es)?\b", re.I), None),
+    ("brow", re.compile(r"\b(?:eye)?brows?\b", re.I), None),
+    ("nail", re.compile(r"\b(?:nails?|cuticles?)\b", re.I), None),
+    ("beard", re.compile(r"\bbeards?\b", re.I), None),
+)
+# A title that ALSO names the face ("Face & Body Lotion") is face care too; the old answer stands.
+_FACE_WORD = re.compile(r"\b(?:face|facial)\b", re.I)
+# Phrases that contain an area word but name no product area: "crow's feet" are eye wrinkles
+# (measured in prod on an eye serum; Shopify titles often use a curly apostrophe), and a cleanser
+# "safe for lash extensions" is a face cleanser.
+_NOT_AN_AREA = re.compile(r"\bcrow[\u2019']?s?[\s-]+feet\b|\b(?:eye\s?)?lash[\s-]+extensions?\b", re.I)
+# Hair REMOVAL is body care, not hair care: "Hair Removal Aftercare Serum", "Ingrown Hair Serum".
+_HAIR_REMOVAL = re.compile(r"\b(?:hair[\s-]+removal|ingrown[\s-]+hairs?)\b", re.I)
+
+
+def _non_face_leaf(path: str, *, title: Optional[str], product_type: Optional[str]) -> Optional[str]:
+    """The leaf a FACE-leaf answer must become when the product names another body area.
+
+    Returns None when the rule does not apply -- `path` is not a face skincare leaf, or no non-face
+    area is named, or the face is named too -- so the caller keeps its answer unchanged. Otherwise
+    returns that area's leaf, or "" (unresolved) where the areas disagree or have no leaf.
+    """
+    if not _FACE_SKINCARE_LEAF.match(path or ""):
+        return None
+    text = " ".join(str(v or "") for v in (title, product_type))
+    if _FACE_WORD.search(text):
+        return None
+    text = _HAIR_REMOVAL.sub(" body ", _NOT_AN_AREA.sub(" ", text))
+    areas = {name: leaf for name, pattern, leaf in _NON_FACE_AREAS if pattern.search(text)}
+    if not areas:
+        return None
+    # A "Hand & Nail Cream" is a hand cream: nail care is part of the hand shelf.
+    if "hand" in areas:
+        areas.pop("nail", None)
+    leaves = set(areas.values())
+    if len(leaves) == 1 and None not in leaves:
+        return leaves.pop()
+    return ""
+
+
 def _title_paths(title: Optional[str]) -> set:
     from services.pdp_category_classifier import CATEGORY_PATTERNS
     return {path for _label, path, pattern in CATEGORY_PATTERNS if pattern.search(str(title or ""))}
@@ -1512,6 +1574,35 @@ def _measured_host_type_leaf(*, domain: Optional[str], product_type: Optional[st
 
 def _resolve_category(*, product_type: Optional[str], title: Optional[str], flag_path: str,
                       domain: Optional[str] = None) -> Tuple[str, float]:
+    """Resolve, then refuse a FACE skincare leaf for a product that names another body area.
+
+    The body-area rule changes an answer ONLY where the answer is a face skincare leaf AND the
+    title or merchant type names a non-face area (and not the face as well). Every other row --
+    every face-titled row -- is returned exactly as before.
+
+    A caller's own taxonomy LEAF is not second-guessed here: the repair planner passes a stored
+    leaf as the flag, and a stored leaf may be challenged only with fresh merchant evidence
+    (--review-existing-leaves, which passes a coarse flag instead). Curated feeds pass a coarse
+    flag ("beauty"), so every face leaf the resolver derives itself is checked.
+    """
+    path, confidence = _resolve_category_unguarded(
+        product_type=product_type, title=title, flag_path=flag_path, domain=domain)
+    from services.pdp_category_classifier import CATEGORY_PATTERNS
+    flag = str(flag_path or "").strip().strip("/").lower()
+    if path == flag and flag in {leaf for _label, leaf, _pattern in CATEGORY_PATTERNS}:
+        return path, confidence
+    from services.category_path_aliases import resolve
+    leaf = _non_face_leaf(resolve(path) or "", title=title, product_type=product_type)
+    if leaf is None:
+        return path, confidence
+    if not leaf:
+        return "", CATEGORY_CONFIDENCE_FEED_DEFAULT
+    # The leaf now rests on the product's own area word, not on the merchant's type alone.
+    return leaf, min(confidence, CATEGORY_CONFIDENCE_EXPLICIT_TITLE)
+
+
+def _resolve_category_unguarded(*, product_type: Optional[str], title: Optional[str], flag_path: str,
+                                domain: Optional[str] = None) -> Tuple[str, float]:
     """Evidence policy, then -- ONLY where it left the product unresolved -- a measured host shelf.
 
     Structural no-regression: anything the evidence policy resolves to a leaf, and every
