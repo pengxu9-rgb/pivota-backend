@@ -68,6 +68,7 @@ def test_redirect_identity_legacy_null_seller_is_none_not_self():
 async def test_token_ctx_carries_seller_ref_alongside_anchor():
     redirect_url = await gateway._make_external_redirect_url(
         market="US",
+        market_observed=True,
         tool="offers.resolve",
         destination_url="https://brand.com/products/widget",
         utm_template=None,
@@ -94,6 +95,7 @@ async def test_token_ctx_carries_seller_ref_alongside_anchor():
 async def test_token_ctx_omits_seller_keys_for_legacy_seed():
     redirect_url = await gateway._make_external_redirect_url(
         market="US",
+        market_observed=True,
         tool="offers.resolve",
         destination_url="https://brand.com/products/widget",
         utm_template=None,

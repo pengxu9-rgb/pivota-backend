@@ -2916,6 +2916,7 @@ def test_the_allowlist_still_sees_the_destination_without_the_join_key(
     url = asyncio.run(
         gateway._make_external_redirect_url(
             market="US", tool="*",
+            market_observed=True,
             destination_url="https://brand.com/products/serum",
             utm_template=None, ctx={},
             merchant_id=None, product_id=None, variant_id="SKU-1",

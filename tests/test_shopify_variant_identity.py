@@ -463,6 +463,7 @@ def test_end_to_end_an_evidence_stamped_seed_redirects_into_a_prefilled_cart() -
     redirect_url = asyncio.run(
         _make_external_redirect_url(
             market="US",
+            market_observed=True,
             tool="*",
             destination_url="https://genabelle.com/products/melacare-jelly-touch-dual-pad",
             utm_template=None,
@@ -505,6 +506,7 @@ def test_end_to_end_control_the_same_seed_without_evidence_stays_referral_only()
     redirect_url = asyncio.run(
         _make_external_redirect_url(
             market="US",
+            market_observed=True,
             tool="*",
             destination_url="https://genabelle.com/products/melacare-jelly-touch-dual-pad",
             utm_template=None,
@@ -614,6 +616,7 @@ def test_a_declined_prefill_is_not_rescued_by_a_numeric_sku() -> None:
     redirect_url = asyncio.run(
         _make_external_redirect_url(
             market="US", tool="*",
+            market_observed=True,
             destination_url="https://genabelle.com/products/melacare-jelly-touch-dual-pad",
             utm_template=None, ctx={"seedId": "eps_1"}, allowed_domains=["genabelle.com"],
             merchant_id=identity["merchant_id"], product_id=identity["product_id"],
@@ -640,6 +643,7 @@ def test_a_caller_that_cannot_justify_an_id_gets_no_cart_at_all() -> None:
     without = asyncio.run(
         _make_external_redirect_url(
             market="US", tool="*", destination_url="https://shop.example/products/x",
+            market_observed=True,
             utm_template=None, ctx={"source": "connected_catalog"},
             allowed_domains=["shop.example"], merchant_id="merch_1", product_id="p1",
             variant_id="41234567890123", cart_variant_id=None,
@@ -652,6 +656,7 @@ def test_a_caller_that_cannot_justify_an_id_gets_no_cart_at_all() -> None:
     with_claim = asyncio.run(
         _make_external_redirect_url(
             market="US", tool="*", destination_url="https://shop.example/products/x",
+            market_observed=True,
             utm_template=None, ctx={"source": "connected_catalog"},
             allowed_domains=["shop.example"], merchant_id="merch_1", product_id="p1",
             variant_id="41234567890123", cart_variant_id="41234567890123",

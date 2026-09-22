@@ -40,6 +40,8 @@ from services.outbound_links_service import (
     _is_domain_allowed,
     apply_utm,
     make_redirect_token,
+    market_is_observed,
+    TOKEN_MARKET_OBSERVED_KEY,
 )
 from services.seed_content_audit import audit_seed_data
 from services.external_seed_audit import (
@@ -1473,6 +1475,10 @@ async def _make_redirect_url(
         {
             "market": market,
             "tool": tool,
+            # `market` arrives here RAW (the seed row's / the request's own value), and is
+            # exactly what gets stamped — so its own emptiness is the provenance question.
+            # See the MARKET PROVENANCE note in `services/outbound_links_service`.
+            **({TOKEN_MARKET_OBSERVED_KEY: True} if market_is_observed(market) else {}),
             "dest": dest_with_utm,
             "ctx": ctx,
         }

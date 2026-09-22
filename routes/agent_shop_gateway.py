@@ -87,6 +87,8 @@ from services.outbound_links_service import (
     REFERRAL_CLICK_PARAM,
     SHOPIFY_CART_CLICK_ATTRIBUTE,
     make_redirect_token,
+    market_is_observed,
+    TOKEN_MARKET_OBSERVED_KEY,
     normalize_shop_host,
     parse_redirect_token_verified,
     shopify_cart_base_url,
@@ -4746,6 +4748,7 @@ async def _handle_offers_resolve(
                 stable_click_id = new_click_id()
                 redirect_url = await _make_external_redirect_url(
                     market=used_market,
+                    market_observed=market_is_observed(row_dict.get("market"), market_hint),
                     tool=used_tool,
                     destination_url=str(canonical_url or destination_url),
                     utm_template=row_dict.get("utm_template") or seed_data.get("utm_template"),
@@ -5961,6 +5964,7 @@ async def _handle_offers_resolve(
             # "nothing matched".
             redirect_url = await _make_external_redirect_url(
                 market=market_hint or "US",
+                market_observed=market_is_observed(market_hint),
                 tool=tool_hint or "offers.resolve",
                 destination_url=destination,
                 utm_template=None,
@@ -6852,6 +6856,11 @@ async def _attach_connected_product_redirects(
             else:
                 redirect_url = await _make_external_redirect_url(
                     market=used_market,
+                    # `_attach_connected_product_redirects` is called by every caller today
+                    # WITHOUT a market, so `used_market` is the "US" default. Threaded from
+                    # the parameter anyway, so a caller that starts naming one is observed
+                    # without a second change here.
+                    market_observed=market_is_observed(market),
                     tool=used_tool,
                     destination_url=dest,
                     utm_template=None,
@@ -9105,6 +9114,17 @@ def compose_attributed_destinations(
 async def _make_external_redirect_url(
     *,
     market: str,
+    # DID THE CALLER OBSERVE THIS MARKET, or is `market` the "US" DEFAULT? Every call site
+    # below serves `<something> or "US"`, and once the token's market is forwarded to the
+    # gateway's merchant-purchasability gate the two stop being interchangeable: a defaulted
+    # "US" would gate a non-US buyer against the US fact. See the MARKET PROVENANCE note in
+    # `services/outbound_links_service`.
+    #
+    # NO DEFAULT, deliberately, for the same reason `cart_variant_id` has none: a defaulted
+    # one makes OMISSION silent, so a new call site (or a deleted line) would quietly start
+    # stamping tokens as unobserved — or, worse under the opposite default, as observed —
+    # with nothing failing. Required turns that into a TypeError the suite catches.
+    market_observed: bool,
     tool: str,
     destination_url: str,
     utm_template: Optional[str],
@@ -9208,6 +9228,9 @@ async def _make_external_redirect_url(
         {
             "market": market,
             "tool": tool,
+            # Absent rather than `false` for an unobserved market, so the token is
+            # byte-identical to a pre-provenance mint on that (majority) path.
+            **({TOKEN_MARKET_OBSERVED_KEY: True} if market_observed is True else {}),
             "dest": dest,
             "ctx": enriched_ctx,
         }
@@ -9506,6 +9529,7 @@ async def mint_external_seed_links(body: ExternalSeedLinksRequest) -> Dict[str, 
         )
         redirect_url = await _make_external_redirect_url(
             market=market,
+            market_observed=market_is_observed(candidate.market, body.market),
             tool=tool,
             destination_url=destination_url,
             utm_template=candidate.utm_template,
@@ -9663,6 +9687,7 @@ async def _build_prefetched_external_seed_wrappers(
             else:
                 redirect_url = await _make_external_redirect_url(
                     market=market,
+                    market_observed=market_is_observed(candidate.get("market")),
                     tool=tool,
                     destination_url=destination_url,
                     utm_template=utm_template,
@@ -12029,6 +12054,7 @@ async def _handle_find_products_multi_inner(
             else:
                 redirect_url = await _make_external_redirect_url(
                     market=market,
+                    market_observed=market_is_observed(row_dict.get("market")),
                     tool=tool,
                     destination_url=dest,
                     utm_template=utm_template,
