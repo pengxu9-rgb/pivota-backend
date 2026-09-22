@@ -493,6 +493,115 @@ async def test_a_raising_retire_leaves_the_checkout_unaffected(monkeypatch, capl
 # ::test_the_fallback_arm_is_unreachable_on_postgres pins that so it cannot change silently.
 
 
+async def test_a_raising_pre_upsert_peek_leaves_the_checkout_unaffected(
+    monkeypatch, retire_calls, caplog
+):
+    """THE OTHER HALF OF "NOTHING IN THIS HOOK CAN FAIL THE CHECKOUT", and the one the first
+    draft did not defend.
+
+    `_existing_link_buyer_id` catches around its own `fetch_one` — but the two statements after
+    that `try` are outside it, so "this cannot raise" was a claim about the callee's BODY relied
+    on at a call site in `_upsert_buyer_identity_link`. That call was bare. An exception there
+    escaped a function whose every write arm is individually guarded, out of the hosted
+    checkout's save path, which has no handler of its own at ~:1293.
+
+    So the peek is wrapped at the call site too, and this is the test that says so: with the peek
+    raising outright, the upsert must still happen, its return value must be exactly what it is
+    with no peek at all, no exception may escape, and — because the hook has no old buyer to
+    reason about — NO repoint line may be logged.
+    """
+    await seed_link(agent_id=AGENT, ref_hash=ref_hash(), buyer_id=MINTED_BUYER)
+    await seed_buyer_ref(buyer_id=MINTED_BUYER, reap_buyer_ref=REAP_REF)
+    enrollment_id = await seed_enrollment(reap_buyer_ref=REAP_REF)
+
+    async def boom(**kwargs):
+        raise RuntimeError("the peek exploded")
+
+    monkeypatch.setattr(buyer_api, "_existing_link_buyer_id", boom)
+
+    with caplog.at_level(logging.INFO, logger="routes.buyer_api"):
+        result = await upsert(REAL_BUYER)
+
+    # THE NO-PEEK RESULT, asserted as the same value the function returns on every other
+    # successful path rather than as a literal: the point is that the peek is not part of the
+    # contract, so its failure cannot change the answer.
+    assert result == ref_hash()
+    # And the WRITE really landed — a `None` peek must not have turned into a skipped upsert.
+    assert await link_buyer_id(agent_id=AGENT, ref_hash=ref_hash()) == REAL_BUYER
+
+    assert retire_calls == []
+    row = dict(await enrollment_row(enrollment_id))
+    assert row["status"] == "active"
+    assert await buyer_ref_count(MINTED_BUYER) == 1
+
+    text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "event=reap_buyer_link_peek_failed error=RuntimeError" in text
+    # NO repoint line of EITHER kind: with no old buyer read, no repoint was observed, and a
+    # `_kept` here would claim a decision the code was in no position to make.
+    assert "event=reap_buyer_link_repointed" not in text
+    for secret in secret_strings():
+        assert secret not in text
+
+
+async def test_a_peek_whose_REAL_QUERY_FAILS_leaves_the_checkout_unaffected(
+    monkeypatch, retire_calls, caplog
+):
+    """THE SAME PROPERTY THROUGH THE REAL CODE PATH, and the reason this is a second test rather
+    than a duplicate of the one above.
+
+    That one replaces `_existing_link_buyer_id` wholesale, so it proves the CALL SITE survives a
+    raising callee — and proves nothing about the callee, which is now the function that actually
+    raises (its own `try` was removed as an inert double guard; see its docstring). This one
+    leaves the real function in place and breaks the thing it depends on: `fetch_one` fails for
+    the peek's statement and ONLY for it, so the read genuinely raises, the guard genuinely
+    catches, and the upsert below runs against a healthy database.
+
+    `feedback: mutating the seam is not mutating the code the seam watches` — a suite that only
+    ever monkeypatched the helper would keep passing if the helper stopped being called at all.
+    """
+    await seed_link(agent_id=AGENT, ref_hash=ref_hash(), buyer_id=MINTED_BUYER)
+    await seed_buyer_ref(buyer_id=MINTED_BUYER, reap_buyer_ref=REAP_REF)
+    enrollment_id = await seed_enrollment(reap_buyer_ref=REAP_REF)
+
+    real_fetch_one = database.fetch_one
+    hits = []
+
+    async def fetch_one(query, *args, **kwargs):
+        # SCOPED TO THE PEEK'S OWN STATEMENT. Failing every `fetch_one` would break the fixture's
+        # own reads and the ledger's, and the test would then pass for the wrong reason.
+        if "FROM buyer_identity_links" in str(query):
+            hits.append(1)
+            raise RuntimeError(
+                "connection reset while binding "
+                f"agent_user_ref_hash={ref_hash()}"
+            )
+        return await real_fetch_one(query, *args, **kwargs)
+
+    monkeypatch.setattr(database, "fetch_one", fetch_one)
+    with caplog.at_level(logging.INFO, logger="routes.buyer_api"):
+        result = await upsert(REAL_BUYER)
+    monkeypatch.undo()
+
+    # The read really was attempted, so the guard really was the thing that ran.
+    assert hits, "the peek's statement was never issued; this test proved nothing"
+
+    assert result == ref_hash()
+    assert await link_buyer_id(agent_id=AGENT, ref_hash=ref_hash()) == REAL_BUYER
+
+    assert retire_calls == []
+    assert dict(await enrollment_row(enrollment_id))["status"] == "active"
+    assert await buyer_ref_count(MINTED_BUYER) == 1
+
+    text = "\n".join(record.getMessage() for record in caplog.records)
+    # LOGGED, NOT SILENT. The retirement this suppressed is one of the paths the runbook's audit
+    # query is the only backstop for, and a silent suppression is what makes it unfindable.
+    assert "event=reap_buyer_link_peek_failed error=RuntimeError" in text
+    assert "event=reap_buyer_link_repointed" not in text
+    # The driver's message named the ref hash. The log must not.
+    for secret in secret_strings():
+        assert secret not in text
+
+
 async def test_a_failed_upsert_retires_nothing(monkeypatch, retire_calls):
     """Both write arms fail, so no repoint happened. Retiring the old identity on a write that
     did not land would destroy the card of a buyer whose link still names them."""
@@ -515,6 +624,92 @@ async def test_a_failed_upsert_retires_nothing(monkeypatch, retire_calls):
     assert await link_buyer_id(agent_id=AGENT, ref_hash=ref_hash()) == MINTED_BUYER
     assert dict(await enrollment_row(enrollment_id))["status"] == "active"
     assert await buyer_ref_count(MINTED_BUYER) == 1
+
+
+# ── two repoints off one buyer ───────────────────────────────────────────────────────────────
+
+
+async def test_two_repoints_off_one_buyer_leave_no_orphan(retire_calls):
+    """THE RACE THE WRITE-BEFORE-GUARD ORDERING SETTLES, pinned so it stays settled.
+
+    One buyer linked through TWO agents, both links repointed to their real account at the same
+    time. The remaining-links guard makes each repoint ask "does the old buyer still own a
+    link?", and asked at the wrong moment that question has two wrong answers available: both
+    repoints could see the other's link and both decline (an orphan nobody retires), or both
+    could see none and both sweep (a double retirement).
+
+    NEITHER IS REACHABLE, and the reason is an ORDERING rather than a lock: each repoint WRITES
+    before its own guard READS. So by the time the temporally-last guard runs, both writes are
+    visible to it — the interleaving where guard A has not yet seen write B is exactly the
+    interleaving in which write A has already happened and guard B will see it. At least one
+    guard therefore observes zero remaining links, and the sweep it runs is idempotent, so a
+    second one finds nothing left to do.
+
+    What this test asserts is the INVARIANT and not the schedule: after both repoints, the old
+    buyer's Reap state is gone. Which of the two did the sweeping is a scheduling detail and
+    asserting it would pin the scheduler instead of the property.
+    """
+    import asyncio
+
+    await seed_link(agent_id=AGENT, ref_hash=ref_hash(), buyer_id=MINTED_BUYER)
+    await seed_link(agent_id=OTHER_AGENT, ref_hash=ref_hash(), buyer_id=MINTED_BUYER)
+    await seed_buyer_ref(buyer_id=MINTED_BUYER, reap_buyer_ref=REAP_REF)
+    enrollment_id = await seed_enrollment(reap_buyer_ref=REAP_REF)
+
+    results = await asyncio.gather(
+        upsert(REAL_BUYER, agent_id=AGENT),
+        upsert(REAL_BUYER, agent_id=OTHER_AGENT),
+    )
+
+    assert results == [ref_hash(), ref_hash()]
+    assert await link_buyer_id(agent_id=AGENT, ref_hash=ref_hash()) == REAL_BUYER
+    assert await link_buyer_id(agent_id=OTHER_AGENT, ref_hash=ref_hash()) == REAL_BUYER
+
+    # THE INVARIANT: no orphan survives the race.
+    assert await buyer_ref_count(MINTED_BUYER) == 0
+    row = dict(await enrollment_row(enrollment_id))
+    assert row["status"] == "dead"
+    assert row["reap_status"] == "buyer_link_repointed"
+    assert row["hosted_url"] is None
+
+    # At least one guard swept. Whether the other also called (and got zeros) is scheduling.
+    assert [call for call in retire_calls if call[0] == MINTED_BUYER]
+
+
+async def test_the_sequential_ordering_of_two_repoints_keeps_then_retires(retire_calls, caplog):
+    """The same two repoints, run ONE AFTER THE OTHER, which is the schedule an operator reading
+    the log will actually see and the one the `_kept` line has to make sense in.
+
+    The first repoint finds the second agent's link still on the old buyer and DECLINES — the
+    card is live for that other agent, and killing it is the damage the guard exists to prevent.
+    The second repoint is the one that finds nothing left and sweeps. So `_kept` is not a
+    failure, it is the correct answer at that moment, and the state converges one repoint later.
+
+    Asserted as a SEQUENCE because a suite that only measured the end state would pass with the
+    guard deleted — M6's mutant does exactly that.
+    """
+    await seed_link(agent_id=AGENT, ref_hash=ref_hash(), buyer_id=MINTED_BUYER)
+    await seed_link(agent_id=OTHER_AGENT, ref_hash=ref_hash(), buyer_id=MINTED_BUYER)
+    await seed_buyer_ref(buyer_id=MINTED_BUYER, reap_buyer_ref=REAP_REF)
+    enrollment_id = await seed_enrollment(reap_buyer_ref=REAP_REF)
+
+    with caplog.at_level(logging.INFO, logger="routes.buyer_api"):
+        await upsert(REAL_BUYER, agent_id=AGENT)
+        first = "\n".join(record.getMessage() for record in caplog.records)
+
+        assert "event=reap_buyer_link_repointed_kept" in first
+        assert retire_calls == []
+        assert await buyer_ref_count(MINTED_BUYER) == 1
+        assert dict(await enrollment_row(enrollment_id))["status"] == "active"
+
+        caplog.clear()
+        await upsert(REAL_BUYER, agent_id=OTHER_AGENT)
+        second = "\n".join(record.getMessage() for record in caplog.records)
+
+    assert "event=reap_buyer_link_repointed refs=1 enrollments=1" in second
+    assert retire_calls == [(MINTED_BUYER, "buyer_link_repointed")]
+    assert await buyer_ref_count(MINTED_BUYER) == 0
+    assert dict(await enrollment_row(enrollment_id))["status"] == "dead"
 
 
 # ── the log lines ────────────────────────────────────────────────────────────────────────────
@@ -640,6 +835,22 @@ async def test_retire_touches_nobody_elses_ref():
         None,
         123,
         "buyer_link_repointed\nevent=ok",  # a forged log line
+        # ── THE TWO CASES THAT MAKE `\Z` LOAD-BEARING ───────────────────────────────────
+        #
+        # `$` AND `\Z` ARE NOT THE SAME ANCHOR, and the difference is exactly one trailing
+        # newline: without `re.MULTILINE`, `$` matches at the end of the string OR just before a
+        # newline that ends it. So `^[a-z0-9_:.-]{1,64}$` ACCEPTS "buyer_link_repointed\n" and
+        # `\Z` refuses it.
+        #
+        # A mutant that swapped the anchor survived the whole suite, because every other case
+        # here puts its newline in the MIDDLE ("…\nevent=ok"), which neither anchor accepts.
+        # The gap mattered: a reason with a trailing newline reaches `reap_status` and every log
+        # line and operator report that column feeds, and a value ending in a newline is the
+        # forged-log-line primitive the control-character rules on this rail exist to refuse.
+        "buyer_link_repointed\n",
+        # And a bare newline, which the CHARACTER CLASS refuses on its own — the control for the
+        # case above, so "the anchor is what refused it" is a distinguishable statement.
+        "\n",
     ],
 )
 async def test_retire_refuses_a_reason_outside_the_vocabulary(reason):

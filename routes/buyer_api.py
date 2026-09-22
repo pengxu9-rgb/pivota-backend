@@ -537,17 +537,33 @@ async def _existing_link_buyer_id(*, agent_id: str, agent_user_ref_hash: str) ->
     EXCLUDED.buyer_id` overwrites it in place and no dialect hands back what it replaced in a
     form this code path can use on both engines.
 
-    Best-effort, like everything else this hook does: a failure here returns None, which reads as
-    "no previous buyer", which suppresses the retirement. Suppressing it costs the orphan the
-    runbook already documents; letting the exception out would cost the buyer their checkout.
+    RAISES ON A DATABASE FAILURE, AND DOES NOT CATCH ITS OWN. There is exactly ONE guard for this
+    read and it lives at the call site in `_upsert_buyer_identity_link`, which turns a failure
+    into "no previous buyer" — suppressing the retirement, and costing the orphan the runbook's
+    audit query already looks for.
+
+    THE FIRST VERSION CAUGHT HERE **AND** THERE, and the second guard had to go rather than the
+    first. Two reasons, and the second is the one that decided it:
+
+      * IT WAS INERT. Once the call site was wrapped, nothing could observe this branch: a mutant
+        that turned this `except Exception: return None` into a bare `raise` survived the entire
+        suite under both dialects, because the outer guard absorbed it and produced the same
+        answer. `feedback: an unreachable guard reads as protection that does not exist` — a
+        double guard is not twice the protection, it is one guard plus untested code.
+      * IT WAS SILENT. Catching here returned None with no log line, so a database that had lost
+        `buyer_identity_links` looked exactly like a buyer with no previous link — and the
+        retirement it silently suppressed is one of the paths the runbook's audit query is the
+        only backstop for. Raising lets the call site log `event=reap_buyer_link_peek_failed
+        error=<Type>` once, which is what makes that path findable.
+
+    So: this function is allowed to fail, and the ONE caller is required to survive it. Two tests
+    hold that — one monkeypatches this function to raise outright, one makes the real `fetch_one`
+    fail on this statement — and removing the call-site guard kills them both.
     """
-    try:
-        row = await database.fetch_one(
-            _EXISTING_LINK_BUYER_ID_SQL,
-            {"agent_id": agent_id, "agent_user_ref_hash": agent_user_ref_hash},
-        )
-    except Exception:
-        return None
+    row = await database.fetch_one(
+        _EXISTING_LINK_BUYER_ID_SQL,
+        {"agent_id": agent_id, "agent_user_ref_hash": agent_user_ref_hash},
+    )
     if not row:
         return None
     return str(dict(row).get("buyer_id") or "").strip() or None
@@ -640,11 +656,32 @@ async def _upsert_buyer_identity_link(*, buyer_id: str, agent_id: str, agent_use
 
     # WP4c. WHO THIS LINK NAMED BEFORE, read while it is still readable. Both write paths below
     # overwrite `buyer_id` in place, so this is the only moment the previous value exists. It is
-    # a peek on the same `(agent_id, agent_user_ref_hash)` key the upsert conflicts on, and it
-    # cannot raise — see `_existing_link_buyer_id`.
-    previous_buyer_id = await _existing_link_buyer_id(
-        agent_id=agent_id, agent_user_ref_hash=ref_hash
-    )
+    # a peek on the same `(agent_id, agent_user_ref_hash)` key the upsert conflicts on.
+    #
+    # THIS `try` IS THE ONLY GUARD ON THAT READ, and it is here rather than inside the helper.
+    # The first draft left this line bare and let `_existing_link_buyer_id` catch its own
+    # failure — which was a claim about the CALLEE'S BODY relied on at a call site on a live
+    # buyer surface, and it was untestable besides: with both guards present, a mutant that made
+    # the inner one re-raise survived the whole suite under both dialects, because this one
+    # absorbed it. One guard, at the boundary where the obligation actually lives.
+    #
+    # The obligation is real. An exception escaping this line would leave
+    # `_upsert_buyer_identity_link` — whose own write arms are each individually guarded —
+    # propagating out of the hosted checkout's save path, which has no handler of its own at
+    # the call site (~:1293).
+    #
+    # So the WP4c addition is fail-closed at its own boundary: a peek that fails means "no
+    # previous buyer", which suppresses the retirement and costs the orphan the runbook's audit
+    # query already looks for. The upsert below then runs exactly as it did before WP4c existed.
+    try:
+        previous_buyer_id = await _existing_link_buyer_id(
+            agent_id=agent_id, agent_user_ref_hash=ref_hash
+        )
+    except Exception as exc:  # noqa: BLE001
+        # The TYPE only — a driver error stringifies its bound parameters, and one of them is a
+        # buyer's agent-scoped ref hash.
+        logger.warning("event=reap_buyer_link_peek_failed error=%s", type(exc).__name__)
+        previous_buyer_id = None
 
     # Preferred path: Postgres/modern SQLite upsert.
     try:

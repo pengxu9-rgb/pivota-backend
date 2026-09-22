@@ -86,6 +86,8 @@ from reap_repoint_cases import (  # noqa: E402
     upsert,
 )
 
+import logging  # noqa: E402
+
 import db.reap_agentic_ledger as ledger  # noqa: E402
 import routes.buyer_api as buyer_api  # noqa: E402
 from db.database import database  # noqa: E402
@@ -229,13 +231,34 @@ async def test_the_fallback_arm_is_unreachable_on_postgres(retire_calls):
 
     ── WHY THIS IS A TEST AND NOT A FIX ────────────────────────────────────────────────────
 
-    Production takes the FIRST arm (the test above proves it), so this path is dead code on the
-    engine that matters; changing it means changing a base function's return contract on a live
-    buyer surface, which is not WP4c's scope. What is NOT acceptable is leaving it undescribed:
-    the consequence for this rail is that on the one engine where the fallback could run, a
-    repoint happens and the hook does NOT fire, because the hook is inside the guard that reads
-    False. That is the brief's rule ("never fire when the upsert failed") applied faithfully to a
-    predicate that is lying, and an operator reading the runbook should be able to find out why.
+    Changing it means changing a base function's return contract on a live buyer surface, which
+    is not WP4c's scope. What is NOT acceptable is leaving it undescribed: on this path a repoint
+    happens and the hook does NOT fire, because the hook sits inside a guard that reads False for
+    a write that landed. That is the brief's rule ("never fire when the upsert failed") applied
+    faithfully to a predicate that is lying.
+
+    ── HOW REACHABLE IS IT? LESS THAN THE FIRST DRAFT OF THIS DOCSTRING CLAIMED ────────────
+
+    That draft said the fallback is "dead code on the engine that matters". IT IS NOT, and the
+    overclaim is worth naming because it is the `feedback: scope of evidence must match scope of
+    claim` shape. What is actually proved is narrower:
+
+      PROVED   `test_the_upsert_takes_its_first_arm_here` shows that on a HEALTHY Postgres the
+               `ON CONFLICT` arm runs and the fallback is never reached.
+      NOT      that nothing can reach it. The fallback is reached whenever the primary write
+      PROVED   raises AT ALL — and that includes a TRANSIENT failure (a dropped connection, a
+               statement timeout, a serialization error, a pool exhaustion) on an otherwise fine
+               database. In that case the UPDATE below may well succeed, report None, fall
+               through to the INSERT, violate the unique index, and return None — while having
+               repointed the link, with no retirement.
+
+    So this is not dead code; it is code UNREACHED IN THE OBSERVED FAILURE MODE. A transient
+    primary-write failure can still reach it, and it has no hook. The containment for that path
+    is the runbook's audit query, which is why that query stays and is now labelled the backstop
+    rather than a leftover — along with the other uncovered path, a request CANCELLED between
+    the upsert and the retire (`asyncio.CancelledError` is a `BaseException`, so the hook's
+    `except Exception` does not catch it, deliberately: a cancelled request must not be turned
+    into a completed one).
 
     The assertion is written so that FIXING the base makes this test fail loudly rather than
     silently pass, which is the point of pinning a defect rather than commenting on it.
@@ -272,3 +295,66 @@ async def test_the_fallback_arm_is_unreachable_on_postgres(retire_calls):
     # And therefore the hook did not fire: the repoint is invisible to the guard it sits behind.
     assert retire_calls == []
     assert dict(await enrollment_row(enrollment_id))["status"] == "active"
+
+
+async def test_a_peek_that_fails_the_way_asyncpg_fails_leaves_the_checkout_unaffected(
+    retire_calls, caplog
+):
+    """The shared arm proves this with a `RuntimeError`. THIS ONE USES THE REAL EXCEPTION FAMILY,
+    and that is not decoration — it is the distinction `reference: a transport failure is
+    unverifiable` keeps making, applied to an exception's TYPE.
+
+    Two things differ from a synthetic error and both are the point:
+
+      1. asyncpg's errors are `PostgresError` subclasses, which are `Exception` subclasses — so
+         the call-site guard catches them. A guard written against `RuntimeError` would not have
+         been a guard against the family that actually arrives from this driver.
+      2. THEIR `str()` CARRIES THE STATEMENT AND ITS BOUND PARAMETERS. That is why the handler
+         logs `type(exc).__name__` and never `exc`, and the bound parameter on this statement is
+         an agent-scoped ref hash. The exception below is constructed with a message that
+         contains the hash, so the "no identifiers in the log" assertion is testing a real leak
+         route rather than a hypothetical one.
+
+    A raised UndefinedTableError is also the realistic shape of the one failure this peek has in
+    production: a database that has `buyer_identity_links` missing or renamed.
+    """
+    import asyncpg
+
+    await seed_link(agent_id=AGENT, ref_hash=ref_hash(), buyer_id=MINTED_BUYER)
+    await seed_buyer_ref(buyer_id=MINTED_BUYER, reap_buyer_ref=REAP_REF)
+    enrollment_id = await seed_enrollment(reap_buyer_ref=REAP_REF)
+
+    leaky = (
+        'relation "buyer_identity_links" does not exist; '
+        f"statement bound agent_user_ref_hash={ref_hash()}"
+    )
+
+    async def boom(**kwargs):
+        raise asyncpg.exceptions.UndefinedTableError(leaky)
+
+    real_peek = buyer_api._existing_link_buyer_id
+    buyer_api._existing_link_buyer_id = boom
+    try:
+        with caplog.at_level(logging.INFO, logger="routes.buyer_api"):
+            result = await upsert(REAL_BUYER)
+    finally:
+        buyer_api._existing_link_buyer_id = real_peek
+
+    assert result == ref_hash()
+    assert await database.fetch_val(
+        """
+        SELECT buyer_id FROM buyer_identity_links
+         WHERE agent_id = :a AND agent_user_ref_hash = :h
+        """,
+        {"a": AGENT, "h": ref_hash()},
+    ) == REAL_BUYER
+
+    assert retire_calls == []
+    assert dict(await enrollment_row(enrollment_id))["status"] == "active"
+
+    text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "event=reap_buyer_link_peek_failed error=UndefinedTableError" in text
+    assert "event=reap_buyer_link_repointed" not in text
+    # The driver's message named the ref hash. The log must not.
+    assert ref_hash() not in text
+    assert "buyer_identity_links" not in text

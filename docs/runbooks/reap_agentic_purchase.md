@@ -668,10 +668,34 @@ called from the repoint hook: that hook runs on the hosted checkout's save path 
 waiting, and a partner POST can take up to the client's 25-second timeout. Run it from a shell
 against the ids the audit below turns up.
 
-**The audit query, which is now an audit rather than the containment.** It finds refs whose buyer
-is no longer linked and the enrollments hanging off them. After WP4c a healthy database returns
-**nothing** from it for repoints that fired; what it still finds is the `_kept` cases, rows
-stranded before WP4c shipped, and anything a swallowed failure left behind:
+> **Until `revoke_enrollment` is run, the card is still live at Reap.** Say this plainly to anyone
+> asking whether a repointed buyer's old card is "gone": on our side, yes — the enrollment is
+> `dead`, its hosted page is cleared, and nothing will quote against it again. At Reap, **no**. The
+> partner has not been told to stop honouring it, and nothing in this repo tells them
+> automatically. That step is an operator's, from the ids the audit query below turns up, and it
+> stays outstanding until somebody runs it.
+
+**The audit query — now the BACKSTOP rather than the containment.** It finds refs whose buyer is no
+longer linked and the enrollments hanging off them. After WP4c a healthy database returns
+**nothing** from it for repoints that fired. What it still finds, and what it is now *for*:
+
+* the **`_kept`** cases — the old buyer still has links through other agents, so the hook declined
+  on purpose. If such a buyer later loses those links too, this query is what notices;
+* rows **stranded before WP4c** shipped;
+* a repoint whose hook **failed** — the hook swallows everything (`event=reap_buyer_link_repoint_failed`
+  in the logs), by design, so a failure leaves exactly the orphan this query describes;
+* a repoint through the **fallback write arm**. On Postgres that arm reports no rowcount for an
+  UPDATE that landed, so it can repoint the link and return `None` **without firing the hook**. It
+  is not reached on a healthy database — the `ON CONFLICT` arm is — but a *transient* failure of
+  the primary write (a dropped connection, a statement timeout, a serialization error, pool
+  exhaustion) falls through to it on an otherwise fine database. Pinned by
+  `tests/test_reap_buyer_link_repoint_postgres.py::test_the_fallback_arm_is_unreachable_on_postgres`;
+* a request **cancelled between the upsert and the retire**. `asyncio.CancelledError` is a
+  `BaseException`, so the hook's `except Exception` does not catch it — deliberately: a cancelled
+  request must not be turned into a completed one. The write landed, the sweep did not run.
+
+So: run it periodically, not only when somebody complains. It is cheap and it is the only thing
+watching those last three paths.
 
 ```sql
 SELECT r.buyer_id, r.reap_buyer_ref, r.consent_version, r.created_at,
@@ -695,8 +719,14 @@ print(report.refs_retired, report.enrollments_marked_dead)   # ints only, by des
 ```
 
 `reason` is written into `reap_agentic_enrollments.reap_status` and must match
-`^[a-z0-9_:.-]{1,64}$` — it is refused rather than folded or truncated, because a truncated reason
-names a different reason. Use `orphaned_by_buyer_repoint` for a hand-run sweep so it is
+`^[a-z0-9_:.-]{1,64}\Z` — it is refused rather than folded or truncated, because a truncated reason
+names a different reason.
+
+> **`\Z`, not `$`, and copy it that way.** Without `re.MULTILINE`, Python's `$` also matches just
+> *before* a newline that ends the string, so `…{1,64}$` **accepts** `"buyer_link_repointed\n"`
+> while `\Z` refuses it. A reason ending in a newline reaches `reap_status` and every log line and
+> report that column feeds — it is the forged-log-line primitive. An ad hoc script that re-spelled
+> this check with `$` would be subtly wrong; the ledger uses `\Z` and so does this page. Use `orphaned_by_buyer_repoint` for a hand-run sweep so it is
 distinguishable from the hook's own `buyer_link_repointed`.
 
 For ONE enrollment and nothing else, `mark_enrollment_dead` is still the right call — idempotent,
