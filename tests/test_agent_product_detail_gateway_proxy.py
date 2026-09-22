@@ -398,7 +398,11 @@ async def test_listing_an_external_retailer_is_an_explicit_refusal_not_an_empty_
     resp = await _get(f"/agent/v1/products/merchants/{MID}")
     assert resp.status_code == 404
     assert resp.headers["x-error-code"] == "MERCHANT_LISTING_UNAVAILABLE"
-    assert "/agent/v1/products/search" in resp.json()["detail"]
+    # The unified error body a client switches on says the same thing as the header (review of #2241:
+    # an unregistered code fell back to PRODUCT_NOT_FOUND in the body).
+    body = resp.json()
+    assert body["error"]["code"] == "MERCHANT_LISTING_UNAVAILABLE", body
+    assert "/agent/v1/products/search" in str(body)
     assert hybrid_calls == [], "the empty lookup is never run for an external retailer"
 
 
