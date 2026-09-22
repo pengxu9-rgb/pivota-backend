@@ -10,7 +10,8 @@ THE RULES UNDER TEST, from db/merchant_purchasability.py's docstring:
   * only a CONFIRMED NEGATIVE advances `consecutive_failures`, and BLOCKED_UNKNOWN is not one;
   * TWO consecutive negatives demote; one does not; one positive resets;
   * `is_purchasable` requires a positive fact FROM THE BUYER VANTAGE, within the TTL;
-  * every consumer is dark until MERCHANT_PURCHASABILITY_ENABLED is set.
+  * the sweep is dark until MERCHANT_PURCHASABILITY_SWEEP_ENABLED is set, the consumers until
+    MERCHANT_PURCHASABILITY_ENFORCE is — two dials, because the job runs only on the worker.
 
 Every rule has an ACCEPT and a REFUSE half. The detector tests run against RECORDED FIXTURES of
 three live checkouts — see tests/fixtures/merchant_purchasability/README.md for how they were
@@ -25,15 +26,19 @@ import pathlib
 import sys
 from datetime import datetime, timedelta, timezone
 
+import html
+
 import httpx
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import db.merchant_purchasability as mp  # noqa: E402
+import db.reap_agentic_ledger as ledger  # noqa: E402
 import jobs.merchant_purchasability_sweep as sweep  # noqa: E402
 from db.database import IS_POSTGRES, database  # noqa: E402
 from services.shopify_cart_link_preflight import (  # noqa: E402
+    _json_values_after,
     PreflightResult,
     Verdict,
     amount_to_minor,
@@ -84,7 +89,8 @@ def _dial_off(monkeypatch):
     """Every dial starts UNSET, so a test that needs one sets it explicitly and a test that
     forgets sees the shipped default rather than another test's leftovers."""
     for name in (
-        "MERCHANT_PURCHASABILITY_ENABLED", "MERCHANT_PURCHASABILITY_TTL_HOURS",
+        "MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "MERCHANT_PURCHASABILITY_ENFORCE",
+        "MERCHANT_PURCHASABILITY_TTL_HOURS",
         "MERCHANT_PURCHASABILITY_BUYER_VANTAGE", "VANTAGE_PROXY_URL",
         "MERCHANT_PURCHASABILITY_BATCH", "MERCHANT_PURCHASABILITY_BUDGET_SECONDS",
         "MERCHANT_PURCHASABILITY_PAUSE_MS", "MERCHANT_PURCHASABILITY_INTERVAL_SECONDS",
@@ -185,7 +191,7 @@ def test_the_detector_separates_the_three_live_checkouts(fixture, variant, card,
     """THE CENTRAL CLAIM. Two card merchants and one PayPal-only merchant, recorded live on
     2026-09-22, and the detector must tell them apart from the page alone."""
     body = (FIXTURES / fixture).read_text()
-    methods, available = checkout_payment_methods(body)
+    methods, available, _note = checkout_payment_methods(body)
     assert available is card, f"{fixture}: card_available should be {card}"
     assert methods, "the accept-list must be read, not merely absent"
     assert checkout_line_price(body, variant) == (minor, currency)
@@ -195,9 +201,9 @@ def test_the_card_merchants_carry_a_payment_provider_and_the_paypal_one_does_not
     """Names the MECHANISM, so a failure says which structure moved rather than arriving as a
     bare boolean. The card gateways differ (shopify_payments vs Airwallex) on purpose: the rule
     is the __typename plus the brands, never a known gateway name."""
-    idew, _ = checkout_payment_methods((FIXTURES / "idewcare_card.html").read_text())
-    judy, _ = checkout_payment_methods((FIXTURES / "judydoll_card.html").read_text())
-    flower, _ = checkout_payment_methods((FIXTURES / "flowerbeauty_paypal_only.html").read_text())
+    idew = checkout_payment_methods((FIXTURES / "idewcare_card.html").read_text())[0]
+    judy = checkout_payment_methods((FIXTURES / "judydoll_card.html").read_text())[0]
+    flower = checkout_payment_methods((FIXTURES / "flowerbeauty_paypal_only.html").read_text())[0]
     assert "shopify_payments" in idew and "Airwallex" in judy
     assert "PAYPAL_EXPRESS" in flower
     assert not {"shopify_payments", "Airwallex"} & set(flower)
@@ -210,7 +216,7 @@ def test_the_substring_creditcard_is_on_all_three_pages_and_must_not_be_the_dete
     assert all("creditcard" in b or "credit card" in b.replace("&quot;", "") for b in bodies) or True
     # The real claim: the PayPal-only page answers False even though its accept-list is READ and
     # non-empty. A substring detector would have answered True for it.
-    methods, available = checkout_payment_methods((FIXTURES / "flowerbeauty_paypal_only.html").read_text())
+    methods, available, _note = checkout_payment_methods((FIXTURES / "flowerbeauty_paypal_only.html").read_text())
     assert available is False and len(methods) >= 2
 
 
@@ -220,7 +226,7 @@ def test_the_platform_constants_are_on_all_three_and_never_count_as_a_card():
     exactly like `/.well-known/ucp`'s `dev.shopify.card`, and reading either as a card is the
     false positive this module exists to stop."""
     for fixture, *_ in LIVE_CASES:
-        methods, _ = checkout_payment_methods((FIXTURES / fixture).read_text())
+        methods, _card, _note = checkout_payment_methods((FIXTURES / fixture).read_text())
         assert "AnyGiftCardPaymentMethod" in methods
         assert "AnyStripeSharedTokenPaymentMethod" in methods
 
@@ -228,7 +234,7 @@ def test_the_platform_constants_are_on_all_three_and_never_count_as_a_card():
 def test_card_is_never_true_by_absence_and_never_false_by_absence():
     """Both directions of the three-valued rule, on pages that carry no accept-list at all."""
     for body in ("", "<html></html>", '<script>{"creditCard":true}</script>', "not json at all"):
-        methods, available = checkout_payment_methods(body)
+        methods, available, _note = checkout_payment_methods(body)
         assert available is None, f"an unreadable page must be UNDETERMINED, got {available!r}"
         assert methods == ()
 
@@ -256,11 +262,228 @@ def test_a_payment_provider_naming_no_card_brand_is_not_a_card():
 def test_payment_method_labels_are_bounded_and_carry_no_tokens():
     """These labels are stored as evidence. A client token or a merchant id must never become one."""
     for fixture, *_ in LIVE_CASES:
-        methods, _ = checkout_payment_methods((FIXTURES / fixture).read_text())
+        methods, _card, _note = checkout_payment_methods((FIXTURES / fixture).read_text())
         assert len(methods) <= 32
         for label in methods:
             assert len(label) <= 64
             assert not label.startswith("ey"), "a JWT-shaped label would be a token"
+
+
+# ── F10: BOTH conjuncts of the card rule, each load-bearing on its own ──────────────────────
+#
+# Derived from the live pages: on all three, EVERY non-provider line carries `paymentBrands:
+# null`, so the brand check alone appears to decide and deleting the `__typename` conjunct
+# survives a suite that only uses those pages. It must not survive this one.
+
+
+def _line(typename, *, placements=("PAYMENT_METHOD",), name=None, brands=None):
+    method = {"__typename": typename, "paymentBrands": brands}
+    if name is not None:
+        method["name"] = name
+    return {"placements": list(placements), "paymentMethod": method}
+
+
+def _accept_list(*lines) -> str:
+    return json.dumps({"availablePaymentLines": list(lines)})
+
+
+def test_the_fixtures_really_do_leave_the_typename_conjunct_unexercised():
+    """The PRECONDITION for the test below, asserted rather than asserted-in-prose: if a live
+    page ever grows a non-provider line WITH card brands, this fails and the synthetic case
+    below stops being synthetic."""
+    for fixture, *_ in LIVE_CASES:
+        page_text = html.unescape((FIXTURES / fixture).read_text())
+        for lines in _json_values_after(page_text, "availablePaymentLines"):
+            for line in lines:
+                method = line["paymentMethod"]
+                if method["__typename"] != "PaymentProvider":
+                    assert method.get("paymentBrands") is None, (
+                        f"{fixture}: {method['__typename']} now carries brands — the brand check "
+                        "alone no longer decides, and this suite's reasoning has changed"
+                    )
+
+
+def test_a_wallet_line_that_advertises_card_brands_is_not_a_card():
+    """THE MUTANT THIS KILLS: deleting `__typename != _CARD_METHOD_TYPENAME: continue`.
+
+    `ApplePayWalletConfig` already carries `placements: ["PAYMENT_METHOD"]` on two of the three
+    live pages. A wallet IS a stored card, so a wallet that one day also advertises the brands
+    behind it is entirely plausible — and it is still not a card FORM, because a headless payer
+    cannot authenticate to somebody's Apple Pay. Only `PaymentProvider` is a form we can fill.
+    """
+    body = _accept_list(
+        _line("AnyGiftCardPaymentMethod"),
+        _line("ApplePayWalletConfig", placements=("PAYMENT_METHOD", "ACCELERATED_CHECKOUT"),
+              name="APPLE_PAY", brands=["VISA", "MASTERCARD"]),
+        _line("AnyStripeSharedTokenPaymentMethod"),
+    )
+    methods, card, note = checkout_payment_methods(body)
+    assert note is None, "the shape is fine; only the TYPE disqualifies it"
+    assert card is False, "a wallet with card brands is not a card form"
+    assert "APPLE_PAY" in methods
+
+    verdict, _ = classify_landing(
+        chain=[(200, "https://x.com/checkouts/cn/T")], final_status=200, body=page(),
+        variant_id="1", click_id="c", buyer=None, market="US", card_available=card,
+    )
+    assert verdict is Verdict.NO_CARD_PAYMENT
+
+
+@pytest.mark.parametrize("typename", [
+    "ShopPayWalletConfig", "GooglePayWalletConfig", "PaypalWalletConfig",
+    "ShopifyInstallmentsWalletConfig", "AnyRedeemablePaymentMethod",
+    "AnyStripeSharedTokenPaymentMethod", "AnyGiftCardPaymentMethod",
+])
+def test_no_non_provider_typename_becomes_a_card_even_with_card_brands(typename):
+    """Every `__typename` seen on the three live pages, each given card brands. Not one may
+    read as a card."""
+    body = _accept_list(_line(typename, brands=["VISA", "MASTERCARD", "AMEX"]))
+    assert checkout_payment_methods(body)[1] is False, typename
+
+
+def test_the_provider_conjunct_alone_is_not_enough_either():
+    """The MIRROR: a PaymentProvider naming no card brand is not a card. Both conjuncts, both
+    directions, so neither can be deleted."""
+    assert checkout_payment_methods(_accept_list(_line("PaymentProvider", brands=[])))[1] is False
+    assert checkout_payment_methods(
+        _accept_list(_line("PaymentProvider", brands=["KLARNA_LATER"]))
+    )[1] is False
+    assert checkout_payment_methods(
+        _accept_list(_line("PaymentProvider", brands=["VISA"]))
+    )[1] is True
+
+
+# ── F1: the NEGATIVE is defended against vocabulary drift ───────────────────────────────────
+#
+# This reads an UNVERSIONED blob belonging to somebody else. A drift in it lands on EVERY
+# Shopify merchant on the same afternoon, so a lenient parser would demote the whole catalogue
+# and call it evidence. `False` requires every line to have the measured shape.
+
+SHAPE_DRIFTS = {
+    "placements_absent": {"paymentMethod": {"__typename": "PaypalWalletConfig",
+                                            "paymentBrands": None}},
+    "placements_a_string": {"placements": "PAYMENT_METHOD",
+                            "paymentMethod": {"__typename": "PaypalWalletConfig"}},
+    "paymentMethod_absent": {"placements": ["PAYMENT_METHOD"]},
+    "paymentMethod_a_string": {"placements": ["PAYMENT_METHOD"], "paymentMethod": "paypal"},
+    "typename_absent": {"placements": ["PAYMENT_METHOD"], "paymentMethod": {"name": "PAYPAL"}},
+    "typename_not_a_string": {"placements": ["PAYMENT_METHOD"],
+                              "paymentMethod": {"__typename": 7}},
+    "brands_a_string": {"placements": ["PAYMENT_METHOD"],
+                        "paymentMethod": {"__typename": "PaymentProvider",
+                                          "paymentBrands": "VISA,MASTERCARD"}},
+    "brands_an_object": {"placements": ["PAYMENT_METHOD"],
+                         "paymentMethod": {"__typename": "PaymentProvider",
+                                           "paymentBrands": {"0": "VISA"}}},
+    "line_is_a_string": "paypal",
+    "line_is_null": None,
+}
+
+
+@pytest.mark.parametrize("drift", sorted(SHAPE_DRIFTS))
+def test_a_shape_surprise_is_undetermined_and_never_a_negative(drift):
+    body = _accept_list(_line("AnyGiftCardPaymentMethod"), SHAPE_DRIFTS[drift])
+    methods, card, note = checkout_payment_methods(body)
+    assert card is None, f"{drift} must not answer False for every merchant at once"
+    assert note == "detector_shape_unexpected"
+    assert methods == (), "a read we do not trust reports no accept-list either"
+
+
+@pytest.mark.parametrize("drift", sorted(SHAPE_DRIFTS))
+def test_a_shape_surprise_becomes_blocked_unknown_and_retryable(drift):
+    """It lands where every other "cannot verify" lands, so the row ages out through the TTL
+    instead of being demoted — and the next sweep tries again."""
+    verdict, _ = classify_landing(
+        chain=[(200, "https://x.com/checkouts/cn/T")], final_status=200, body=page(),
+        variant_id="1", click_id="c", buyer=None, market="US",
+        card_available=None, detector_note="detector_shape_unexpected",
+    )
+    assert verdict is Verdict.BLOCKED_UNKNOWN
+
+
+async def test_a_shape_surprise_demotes_nobody_however_often_it_repeats(_db):
+    """The whole point: a platform-wide drift must not walk every merchant to a demotion."""
+    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
+    armed = (await _row())["positive_until"]
+    for _ in range(6):
+        await mp.record_check(
+            "judydoll.com", "US",
+            res("BLOCKED_UNKNOWN", card=None, retryable=True, detail="detector_shape_unexpected"),
+        )
+    row = await _row()
+    assert row["consecutive_failures"] == 0 and row["positive_until"] == armed
+    assert row["evidence"]["detail"] == "detector_shape_unexpected", "and it says WHY in evidence"
+
+
+async def test_a_shape_surprise_comes_back_retryable_from_the_real_preflight(monkeypatch):
+    """End to end through `preflight`, not just `classify_landing`: the result must carry
+    `retryable=True` and say WHY in `detail`, so the sweep records an unverifiable attempt and
+    the next tick tries again instead of the row ageing out as if it were a fact."""
+    import services.shopify_cart_link_preflight as pf
+
+    drifted = json.dumps({"availablePaymentLines": [{
+        "placements": ["PAYMENT_METHOD"],
+        "paymentMethod": {"__typename": "PaymentProvider", "name": "x",
+                          "paymentBrands": "VISA,MASTERCARD"},
+    }]})
+
+    async def _fake_fetch(client, url, *, pin_params=None):
+        if "/products.json" in url or "/products/" in url:
+            return pf._Landing(200, json.dumps({"products": [{
+                "title": "Thing", "variants": [
+                    {"id": 1, "available": True, "price": "13.99", "title": "Default",
+                     "requires_shipping": True}]}]}), [(200, url)])
+        return pf._Landing(200, page() + drifted, [(200, "https://x.com/checkouts/cn/T")])
+
+    monkeypatch.setattr(pf, "_fetch_following", _fake_fetch)
+    result = await pf.preflight(
+        "x.com", market="US", variant_id="1", click_id="c", buyer=None, check_card=True,
+    )
+    assert result.verdict is Verdict.BLOCKED_UNKNOWN
+    assert result.retryable is True, "a drift is unverifiable, and unverifiable is retryable"
+    assert result.detail == "detector_shape_unexpected"
+    assert result.card_available is None
+
+
+async def test_a_shape_surprise_does_not_make_an_ordinary_403_retryable(monkeypatch):
+    """The control: `retryable` must come from the NOTE, not from the verdict. A plain
+    BLOCKED_UNKNOWN (any other 403) keeps its existing non-retryable behaviour."""
+    import services.shopify_cart_link_preflight as pf
+
+    async def _fake_fetch(client, url, *, pin_params=None):
+        if "/products.json" in url or "/products/" in url:
+            return pf._Landing(200, json.dumps({"products": [{
+                "title": "Thing", "variants": [
+                    {"id": 1, "available": True, "price": "13.99", "title": "Default",
+                     "requires_shipping": True}]}]}), [(200, url)])
+        return pf._Landing(403, "go away", [(403, "https://x.com/checkouts/cn/T")])
+
+    monkeypatch.setattr(pf, "_fetch_following", _fake_fetch)
+    result = await pf.preflight(
+        "x.com", market="US", variant_id="1", click_id="c", buyer=None, check_card=True,
+    )
+    assert result.verdict is Verdict.BLOCKED_UNKNOWN
+    assert result.retryable is False
+    assert result.detail != "detector_shape_unexpected"
+
+
+def test_a_card_line_is_still_read_when_every_line_is_well_shaped():
+    """The ACCEPT half: the shape guard must not have made every page undetermined."""
+    body = _accept_list(
+        _line("AnyGiftCardPaymentMethod"),
+        _line("PaymentProvider", name="shopify_payments", brands=["VISA", "MASTERCARD"]),
+        _line("PaypalWalletConfig", placements=("PAYMENT_METHOD", "ACCELERATED_CHECKOUT"),
+              name="PAYPAL_EXPRESS"),
+    )
+    assert checkout_payment_methods(body) == (
+        ("AnyGiftCardPaymentMethod", "PAYPAL_EXPRESS", "shopify_payments"), True, None,
+    )
+
+
+def test_an_empty_accept_list_is_undetermined_not_a_negative():
+    """An array that is present but empty is a rendering artefact, not a store with no payment
+    methods — no checkout has none."""
+    assert checkout_payment_methods('{"availablePaymentLines":[]}')[1] is None
 
 
 # ── price parity ────────────────────────────────────────────────────────────────────────────
@@ -332,7 +555,7 @@ def test_a_line_whose_unit_price_is_not_a_whole_minor_unit_reports_nothing():
 
 
 def test_a_read_accept_list_without_a_card_is_no_card_payment():
-    _, card = checkout_payment_methods((FIXTURES / "flowerbeauty_paypal_only.html").read_text())
+    _, card, _note = checkout_payment_methods((FIXTURES / "flowerbeauty_paypal_only.html").read_text())
     assert card is False, "precondition: the live PayPal-only page reads as no card"
     verdict, _ = classify_landing(
         chain=[(200, "https://flowerbeauty.com/checkouts/cn/T")], final_status=200,
@@ -685,7 +908,7 @@ async def test_the_job_is_dark_by_default_and_contacts_nobody(_db, monkeypatch):
 
 
 async def test_the_job_sweeps_the_population_when_armed(_db, monkeypatch, _population):
-    monkeypatch.setenv("MERCHANT_PURCHASABILITY_ENABLED", "true")
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "true")
     monkeypatch.setenv("MERCHANT_PURCHASABILITY_PAUSE_MS", "0")
     fetcher = _Fetcher({"flowerbeauty.com": res("NO_CARD_PAYMENT", card=False, host="flowerbeauty.com")})
     monkeypatch.setattr(sweep, "_preflight", fetcher)
@@ -701,7 +924,7 @@ async def test_the_job_sweeps_the_population_when_armed(_db, monkeypatch, _popul
 async def test_the_job_passes_check_card_and_never_a_buyer(_db, monkeypatch, _population):
     """`buyer=None` ALWAYS: the Reap path carries no buyer data in the link, and this sweep has
     no buyer to carry. `check_card=True` is what makes the card evidence a verdict."""
-    monkeypatch.setenv("MERCHANT_PURCHASABILITY_ENABLED", "true")
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "true")
     monkeypatch.setenv("MERCHANT_PURCHASABILITY_PAUSE_MS", "0")
     fetcher = _Fetcher({})
     monkeypatch.setattr(sweep, "_preflight", fetcher)
@@ -716,7 +939,7 @@ async def test_the_job_passes_check_card_and_never_a_buyer(_db, monkeypatch, _po
 async def test_the_job_holds_a_wall_clock_budget(_db, monkeypatch, _population):
     """The budget stops it STARTING a merchant. Without one, a slow batch would run past the
     scheduler's run deadline and be cut mid-store, every tick."""
-    monkeypatch.setenv("MERCHANT_PURCHASABILITY_ENABLED", "true")
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "true")
     monkeypatch.setenv("MERCHANT_PURCHASABILITY_PAUSE_MS", "0")
     monkeypatch.setenv("MERCHANT_PURCHASABILITY_BUDGET_SECONDS", "30")
     # A clock that jumps past the budget as soon as the FIRST merchant has been fetched, so the
@@ -738,7 +961,7 @@ async def test_the_job_holds_a_wall_clock_budget(_db, monkeypatch, _population):
 
 
 async def test_the_job_bounds_its_batch(_db, monkeypatch, _population):
-    monkeypatch.setenv("MERCHANT_PURCHASABILITY_ENABLED", "true")
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "true")
     monkeypatch.setenv("MERCHANT_PURCHASABILITY_PAUSE_MS", "0")
     monkeypatch.setenv("MERCHANT_PURCHASABILITY_BATCH", "1")
     fetcher = _Fetcher({})
@@ -748,7 +971,7 @@ async def test_the_job_bounds_its_batch(_db, monkeypatch, _population):
 
 
 async def test_one_merchant_that_raises_does_not_end_the_batch(_db, monkeypatch, _population):
-    monkeypatch.setenv("MERCHANT_PURCHASABILITY_ENABLED", "true")
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "true")
     monkeypatch.setenv("MERCHANT_PURCHASABILITY_PAUSE_MS", "0")
 
     def _boom(host, kwargs):
@@ -764,7 +987,7 @@ async def test_one_merchant_that_raises_does_not_end_the_batch(_db, monkeypatch,
 
 async def test_the_report_carries_counts_only(_db, monkeypatch, _population):
     """No domains, no variant ids, nothing from a row — the same rule PollReport follows."""
-    monkeypatch.setenv("MERCHANT_PURCHASABILITY_ENABLED", "true")
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "true")
     monkeypatch.setenv("MERCHANT_PURCHASABILITY_PAUSE_MS", "0")
     monkeypatch.setattr(sweep, "_preflight", _Fetcher({}))
     report = await sweep.run_merchant_purchasability_sweep()
@@ -777,7 +1000,7 @@ async def test_the_report_carries_counts_only(_db, monkeypatch, _population):
 
 
 async def test_the_second_vantage_is_configured_not_coded(_db, monkeypatch, _population):
-    monkeypatch.setenv("MERCHANT_PURCHASABILITY_ENABLED", "true")
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "true")
     monkeypatch.setenv("MERCHANT_PURCHASABILITY_PAUSE_MS", "0")
     monkeypatch.setenv("VANTAGE_PROXY_URL", "http://127.0.0.1:7897")
     fetcher = _Fetcher({})
@@ -800,31 +1023,317 @@ async def test_the_population_is_the_union_of_the_two_reap_allowlists(_db, _popu
     assert by_domain["judydoll.com"].variant_id == "50041364447509", "the Tier B row's confirmed variant"
 
 
-async def test_the_job_gate_and_the_consumer_gate_are_one_reader():
-    """Two readers of one dial is two things to get out of step."""
-    assert sweep.is_enabled.__doc__ and "is_gate_enabled" in sweep.is_enabled.__doc__
-    assert sweep.is_enabled is not mp.is_gate_enabled
-    assert sweep.is_enabled() is mp.is_gate_enabled()
+# ── the two dials (F5) ──────────────────────────────────────────────────────────────────────
+#
+# IT WAS ONE DIAL, AND ONE WAS A BUG. `_add_job` registers on the production WORKER only, and a
+# normal backend deploy does not ship the worker — so one shared dial armed on the backend turns
+# the refusals on while the sweep that feeds them never runs anywhere, and every merchant in the
+# catalogue answers a permanent 409. Each dial must gate ONLY its own side.
+
+
+async def test_the_sweep_dial_gates_the_job_and_not_the_consumers(_db, monkeypatch, _population):
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "1")
+    monkeypatch.delenv("MERCHANT_PURCHASABILITY_ENFORCE", raising=False)
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_PAUSE_MS", "0")
+    fetcher = _Fetcher({})
+    monkeypatch.setattr(sweep, "_preflight", fetcher)
+
+    report = await sweep.run_merchant_purchasability_sweep()
+    assert report.skipped_disabled == 0 and report.checked > 0, "the sweep runs"
+    assert mp.is_enforcement_enabled() is False, "and enforcement stays off"
+
+
+async def test_the_enforce_dial_gates_the_consumers_and_not_the_job(_db, monkeypatch, _population):
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_ENFORCE", "1")
+    monkeypatch.delenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", raising=False)
+    fetcher = _Fetcher({})
+    monkeypatch.setattr(sweep, "_preflight", fetcher)
+
+    report = await sweep.run_merchant_purchasability_sweep()
+    assert report.skipped_disabled == 1, "the job stays dark"
+    assert fetcher.calls == [], "and contacts nobody"
+    assert mp.is_enforcement_enabled() is True, "while enforcement is armed"
+
+
+async def test_neither_dial_reads_the_other_ones_variable(monkeypatch):
+    """The two must not be wired to one env var under two names. Set each ALONE and the other
+    must stay off — this is what kills a mutant that points one reader at the other's name."""
+    monkeypatch.delenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", raising=False)
+    monkeypatch.delenv("MERCHANT_PURCHASABILITY_ENFORCE", raising=False)
+    assert (mp.is_sweep_enabled(), mp.is_enforcement_enabled()) == (False, False)
+
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "1")
+    assert (mp.is_sweep_enabled(), mp.is_enforcement_enabled()) == (True, False)
+
+    monkeypatch.delenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED")
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_ENFORCE", "1")
+    assert (mp.is_sweep_enabled(), mp.is_enforcement_enabled()) == (False, True)
+
+
+def test_the_job_reads_the_sweep_dial_through_the_one_authoritative_reader():
+    assert sweep.is_enabled is not mp.is_sweep_enabled, "delegates rather than aliases"
+    assert "is_sweep_enabled" in (sweep.is_enabled.__doc__ or "")
+
+
+@pytest.mark.parametrize("dial", ["MERCHANT_PURCHASABILITY_SWEEP_ENABLED",
+                                  "MERCHANT_PURCHASABILITY_ENFORCE"])
+def test_a_dial_is_off_for_anything_that_is_not_an_explicit_yes(monkeypatch, dial):
+    reader = mp.is_sweep_enabled if dial.endswith("SWEEP_ENABLED") else mp.is_enforcement_enabled
+    for off in ("", "0", "false", "off", "no", "maybe", "TRUEISH", " "):
+        monkeypatch.setenv(dial, off)
+        assert reader() is False, off
+    for on in ("1", "true", "TRUE", " on ", "yes"):
+        monkeypatch.setenv(dial, on)
+        assert reader() is True, on
+
+
+# ── the gateway contract, on BOTH dialects ──────────────────────────────────────────────────
+#
+# These live here and not only in the Postgres file because `enforced` is a CONTRACT with another
+# repo, not a storage detail: a mutant that hardcoded it survived when the only coverage was
+# Postgres-side. The route needs an app, so it gets a minimal one — never `main` (gate-wide
+# create_all poisoning) and never TestClient (it hangs against the asyncpg pool).
+
+
+@pytest.fixture
+def ops_app():
+    from fastapi import FastAPI
+
+    from routes.merchant_purchasability_ops import router
+    from utils.auth import require_admin
+
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[require_admin] = lambda: {"role": "admin"}
+    return app
+
+
+async def ops_get(app, url):
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+        return await client.get(url)
+
+
+async def test_the_ops_route_reports_enforced_from_the_enforce_dial(_db, ops_app, monkeypatch):
+    """`enforced` IS the gateway's permission to act on `tier`. Hardcode it and a gateway takes
+    the whole catalogue browse-only on the day the field ships, because with enforcement off
+    every merchant reads browse_only."""
+    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
+
+    monkeypatch.delenv("MERCHANT_PURCHASABILITY_ENFORCE", raising=False)
+    body = (await ops_get(ops_app, "/ops/merchant-purchasability?domain=judydoll.com&market=US")).json()
+    assert body["enforced"] is False, "the dial is off, so the gateway must not act on tier"
+    assert body["tier"] == "purchase", "the FACT is still reported"
+
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_ENFORCE", "1")
+    body = (await ops_get(ops_app, "/ops/merchant-purchasability?domain=judydoll.com&market=US")).json()
+    assert body["enforced"] is True
+
+
+async def test_the_ops_route_reports_sweep_enabled_from_the_sweep_dial(_db, ops_app, monkeypatch):
+    """The misordered state — nothing gathering, everything refusing — must be visible."""
+    monkeypatch.delenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", raising=False)
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_ENFORCE", "1")
+    body = (await ops_get(ops_app, "/ops/merchant-purchasability?domain=never-seen.com&market=US")).json()
+    assert (body["sweep_enabled"], body["enforced"]) == (False, True), (
+        "this pair is the arming mistake the runbook warns about, and it has to be readable"
+    )
+    assert body["tier"] == "browse_only"
+
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "1")
+    body = (await ops_get(ops_app, "/ops/merchant-purchasability?domain=never-seen.com&market=US")).json()
+    assert body["sweep_enabled"] is True
+
+
+async def test_the_two_dials_are_reported_independently(_db, ops_app, monkeypatch):
+    """Four states, four distinct answers — a single shared reader would collapse them to two."""
+    seen = set()
+    for sweep_on in (False, True):
+        for enforce_on in (False, True):
+            for name, on in (("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", sweep_on),
+                             ("MERCHANT_PURCHASABILITY_ENFORCE", enforce_on)):
+                monkeypatch.setenv(name, "1") if on else monkeypatch.delenv(name, raising=False)
+            body = (await ops_get(
+                ops_app, "/ops/merchant-purchasability?domain=x.com&market=US")).json()
+            seen.add((body["sweep_enabled"], body["enforced"]))
+    assert seen == {(False, False), (False, True), (True, False), (True, True)}
 
 
 # ══ 4. REGISTRATION ════════════════════════════════════════════════════════════════════════
 
 
-def test_the_job_is_registered_with_a_run_deadline():
-    """A registered job without an explicit deadline inherits the default and a boot warning;
-    tests/test_scheduler_job_isolation.py fails on it. Pinned here so removing either half of the
-    registration is a failure in this suite too."""
-    import services.audit_scheduler as scheduler
+class _RecordingScheduler:
+    """The same recorder tests/test_scheduler_job_isolation.py uses, so this test sees what
+    `start_scheduler` ACTUALLY registers rather than what the source text says."""
 
-    source = pathlib.Path(scheduler.__file__).read_text()
-    assert 'id="merchant_purchasability_sweep"' in source, "the _add_job registration is gone"
-    assert "run_merchant_purchasability_sweep" in source
-    assert "merchant_purchasability_sweep" in scheduler._JOB_RUN_DEADLINES
-    deadline = scheduler.run_deadline_for("merchant_purchasability_sweep")
+    def __init__(self, *a, **k):
+        self.added = []  # (id, func)
+
+    def add_job(self, func, *a, **k):
+        self.added.append((k.get("id"), func, k))
+
+    def start(self):
+        pass
+
+    def get_jobs(self):
+        return []
+
+
+async def test_the_job_is_actually_registered_and_wrapped_and_bounded(monkeypatch):
+    """FROM THE LIVE REGISTRY, not from a grep of the source.
+
+    A source-text assertion survives an undefined binding: rename
+    `run_merchant_purchasability_sweep` in the job module and the registration raises a
+    NameError at boot while the grep still finds the string and reports green. This calls
+    `start_scheduler` and reads what it handed the scheduler.
+    """
+    import services.audit_scheduler as sched
+
+    for key in ("AUDIT_WORKER_ENABLED", "RAILWAY_SERVICE_NAME", "RAILWAY_ENVIRONMENT"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("RAILWAY_SERVICE_NAME", "web")
+    monkeypatch.setattr(sched, "_SCHEDULER", None)
+    recorder = _RecordingScheduler()
+    monkeypatch.setattr("apscheduler.schedulers.asyncio.AsyncIOScheduler", lambda *a, **k: recorder)
+
+    await sched.start_scheduler()
+    assert sched._BOOT_ERROR is None, sched._BOOT_ERROR
+
+    registered = {jid: (fn, kwargs) for jid, fn, kwargs in recorder.added}
+    assert "merchant_purchasability_sweep" in registered, (
+        "the sweep is not registered — a boot-time NameError or a deleted _add_job call would "
+        "look exactly like this, and a source grep would not"
+    )
+    func, kwargs = registered["merchant_purchasability_sweep"]
+    assert getattr(func, "__wrapped_job_id__", None) == "merchant_purchasability_sweep", (
+        "registered without the isolating wrapper: it would share the startup Connection"
+    )
+    assert kwargs["max_instances"] == 1, "two overlapping runs double the abandoned checkouts"
+    assert kwargs["seconds"] == sweep.job_interval_seconds()
+
+    deadline = sched.run_deadline_for("merchant_purchasability_sweep")
+    assert deadline == sched._JOB_RUN_DEADLINES["merchant_purchasability_sweep"]
     assert deadline > sweep.DIALS["budget_seconds"].default, (
         "the deadline must sit above the job's own budget plus one merchant"
     )
-    assert "merchant_purchasability_sweep" in (scheduler.__doc__ or ""), "the docstring job list"
+    assert "merchant_purchasability_sweep" in (sched.__doc__ or ""), "the docstring job list"
+
+
+def test_the_registration_is_worker_only_and_the_runbook_says_so():
+    """`_add_job` is gated on `_queue_worker_enabled()`, so a normal backend deploy ships the
+    consumers but NOT the fact-gathering. That is the whole reason the dial is split, and an
+    operator has to know it before arming."""
+    import services.audit_scheduler as sched
+
+    source = pathlib.Path(sched.__file__).read_text()
+    assert "if worker_enabled:" in source
+    runbook = (pathlib.Path(__file__).parent.parent / "docs" / "runbooks"
+               / "merchant_purchasability.md").read_text().lower()
+    assert "worker" in runbook and "merchant_purchasability_sweep_enabled" in runbook
+    assert "merchant_purchasability_enforce" in runbook
+
+
+async def test_check_card_defaults_off_behaviourally_not_just_in_the_signature(monkeypatch):
+    """M23. A signature assertion survives a caller that passes `check_card=True` by default
+    somewhere else, and survives the parameter being ignored entirely. This drives the real
+    `preflight` over the PayPal-only fixture through a fake transport and compares VERDICTS.
+    """
+    import services.shopify_cart_link_preflight as pf
+
+    fixture = html.unescape((FIXTURES / "flowerbeauty_paypal_only.html").read_text())
+    # A landing that satisfies every pre-card check, plus the live accept-list.
+    body = page(variant="17281773207622") + fixture
+
+    async def _fake_fetch(client, url, *, pin_params=None):
+        if "/products.json" in url or "/products/" in url:
+            return pf._Landing(200, json.dumps({"products": [{
+                "title": "Thing", "variants": [
+                    {"id": 17281773207622, "available": True, "price": "14.95",
+                     "title": "Default", "requires_shipping": True}]}]}),
+                [(200, url)])
+        return pf._Landing(200, body, [(200, "https://flowerbeauty.com/checkouts/cn/T")])
+
+    monkeypatch.setattr(pf, "_fetch_following", _fake_fetch)
+
+    default = await pf.preflight(
+        "flowerbeauty.com", market="US", variant_id="17281773207622",
+        click_id="c", buyer=None,
+    )
+    asked = await pf.preflight(
+        "flowerbeauty.com", market="US", variant_id="17281773207622",
+        click_id="c", buyer=None, check_card=True,
+    )
+
+    assert default.verdict is not Verdict.NO_CARD_PAYMENT, (
+        "the DEFAULT call must keep the pre-PR verdict — this is what keeps the Tier B lane "
+        "unchanged, and a signature assertion cannot show it"
+    )
+    assert default.verdict is Verdict.ELIGIBLE, "it keeps the verdict it had before this PR"
+    assert asked.verdict is Verdict.NO_CARD_PAYMENT, "asking for the card check changes the verdict"
+    assert asked.card_available is False
+    # THE FIELDS ARE FILLED EITHER WAY; only the VERDICT is opt-in. That is the design: a Tier B
+    # row gains the observability without its decision moving. So the two results must differ in
+    # exactly one place — the verdict — and agree everywhere else the detector touched.
+    assert default.card_available is asked.card_available is False
+    assert default.payment_methods == asked.payment_methods
+    assert "PAYPAL_EXPRESS" in asked.payment_methods
+    assert "shopify_payments" not in asked.payment_methods
+
+
+async def test_the_sweep_population_equals_what_the_reap_route_admits(_db, _population):
+    """F7. A gate whose population is NARROWER than the allowlist it gates is not a gate.
+
+    The reviewer measured a merchant the route accepts that the sweep never visited: the sweep
+    also required `variant_key = ''`, which the route never does. Both now derive from
+    `db.reap_agentic_ledger.list_enabled_merchant_markets`, and this test is the equality.
+    """
+    import routes.agent_commerce_reap as reap
+
+    # A merchant row typed WITH a variant key — legal, operator-typed, and invisible to the old
+    # sweep predicate while perfectly acceptable to the route.
+    await database.execute(
+        "INSERT INTO reap_agentic_eligibility (merchant_domain, product_key, variant_key, "
+        "market_country, enabled) VALUES ('variantkeyed.com', '', 'v123', 'US', TRUE)"
+    )
+
+    admitted = await reap._eligibility(
+        merchant_domain="variantkeyed.com", market_country="US",
+        product_key="anything", variant_key=None,
+    )
+    assert admitted.market_country == "US", "precondition: the ROUTE admits this merchant"
+
+    population = {(t.domain, t.market) for t in await sweep.load_population(50)}
+    assert ("variantkeyed.com", "US") in population, (
+        "the route admits this merchant and the sweep never visits it — it would be purchasable "
+        "with no fact ever gathered"
+    )
+
+    # And the equality in general: every merchant the variant lane admits is in the population.
+    lane = {(mp.normalize_domain(r["merchant_domain"]), mp.normalize_market(r["market_country"]))
+            for r in await ledger.list_enabled_merchant_markets()}
+    assert lane <= population, sorted(lane - population)
+
+
+def test_the_route_and_the_sweep_share_one_merchant_row_sentinel():
+    """Two spellings of "which rows are merchant rows" is how the gap above happened."""
+    import routes.agent_commerce_reap as reap
+
+    # NOT `reap._MERCHANT_ROW is ledger.ELIGIBILITY_MERCHANT_ROW`: both are `""`, which CPython
+    # interns, so identity holds even when the route redeclares its own literal — a mutant that
+    # did exactly that survived this assertion. The binding has to be checked in the SOURCE.
+    assert reap._MERCHANT_ROW == ledger.ELIGIBILITY_MERCHANT_ROW
+    reap_source = pathlib.Path(reap.__file__).read_text()
+    assert "_MERCHANT_ROW = ledger.ELIGIBILITY_MERCHANT_ROW" in reap_source, (
+        "the route must BIND the ledger's sentinel, not redeclare a literal that happens to "
+        "match it today"
+    )
+    assert '_MERCHANT_ROW = ""' not in reap_source
+    sweep_source = pathlib.Path(sweep.__file__).read_text()
+    assert "FROM reap_agentic_eligibility" not in sweep_source, (
+        "the sweep must not spell the variant lane's query itself; it calls the shared helper "
+        "(naming the table in PROSE is fine — this looks for a second copy of the SQL)"
+    )
+    assert "list_enabled_merchant_markets" in sweep_source
 
 
 # ══ 5. THE CONSUMERS, dark behind the dial ═════════════════════════════════════════════════
@@ -832,25 +1341,31 @@ def test_the_job_is_registered_with_a_run_deadline():
 
 async def test_the_reap_rail_ignores_the_fact_while_the_dial_is_off(_db, monkeypatch):
     """DARK BY DEFAULT: with the dial off the rail behaves exactly as it did."""
-    monkeypatch.delenv("MERCHANT_PURCHASABILITY_ENABLED", raising=False)
-    assert mp.is_gate_enabled() is False
+    monkeypatch.delenv("MERCHANT_PURCHASABILITY_ENFORCE", raising=False)
+    assert mp.is_enforcement_enabled() is False
     # No fact exists at all; the gate would refuse if it were consulted.
     assert await mp.is_purchasable("judydoll.com", "US") is False
 
 
-async def test_the_reap_rail_consults_the_fact_when_the_dial_is_on(monkeypatch):
-    """The seam, read off the source so that deleting the call is a failure here."""
+async def test_the_reap_rail_consults_the_fact_only_under_the_enforce_dial(monkeypatch):
+    """The seam. Read off the source because the surrounding handler needs a whole authenticated
+    purchase request to reach; the BEHAVIOUR of the dial itself is covered above."""
     source = (pathlib.Path(__file__).parent.parent / "routes" / "agent_commerce_reap.py").read_text()
-    assert "purchasability.is_gate_enabled()" in source
+    assert "purchasability.is_enforcement_enabled()" in source
     assert "purchasability.is_purchasable(merchant_domain, market_country)" in source
     assert '"merchant_not_purchasable"' in source
     assert '"merchant_not_purchasable": 409' in source
+    assert "purchasability.is_sweep_enabled()" not in source, (
+        "the reap rail must never gate on the SWEEP dial — that is the misordered arming the "
+        "split exists to make impossible"
+    )
 
 
-def test_the_checkout_tier_surface_says_a_tier_does_not_authorise_a_purchase():
+def test_the_checkout_tier_surface_gates_on_enforce_and_not_on_the_sweep_dial():
     source = (pathlib.Path(__file__).parent.parent / "routes" / "store_audit_ops.py").read_text()
     assert "purchasability_gate_enabled" in source
-    assert "purchasability.is_gate_enabled()" in source
+    assert "purchasability.is_enforcement_enabled()" in source
+    assert "purchasability.is_sweep_enabled()" not in source
 
 
 @pytest.fixture

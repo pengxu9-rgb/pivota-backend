@@ -89,6 +89,20 @@ was read and holds no card line — POSITIVE evidence), None (no accept-list cou
 None is never False: an unreadable page, a bot challenge or a transport failure is unverifiable,
 and this module never turns "cannot tell" into "no card".
 
+AND THE NEGATIVE IS DEFENDED AGAINST VOCABULARY DRIFT, because it is the dangerous answer. This
+reads an UNVERSIONED blob belonging to somebody else, and a drift in it lands on EVERY Shopify
+merchant on the same afternoon. So False requires the array to be present, non-empty, and every
+line to have the measured shape — `placements` a list, `paymentMethod` an object with a string
+`__typename`, `paymentBrands` a list or null. Anything else is `DETECTOR_SHAPE_UNEXPECTED`:
+`card_available=None`, verdict `BLOCKED_UNKNOWN`, `retryable=True`. A parser that shrugged at a
+renamed typename would demote the whole catalogue and call it evidence.
+
+BOTH CONJUNCTS OF THE CARD RULE ARE LOAD-BEARING. On every page measured, non-provider lines
+carry `paymentBrands: null`, so the brand check ALONE appears to decide — and `ApplePayWalletConfig`
+already carries `placements: ["PAYMENT_METHOD"]`. A wallet that also advertised the card brands
+behind it (which is what a wallet is) would then read as a card FORM, and a headless payer cannot
+authenticate to a wallet. `__typename == "PaymentProvider"` is what stops that, on its own.
+
 PRICE PARITY. The merchandise line carries `totalAmount.value.{amount,currencyCode}` and
 `quantity`, so the price the buyer would actually be charged is readable. Live on the same day,
 flowerbeauty.com's line was USD 8.00 while our index held USD 14.95. With a caller-supplied
@@ -576,54 +590,114 @@ def _payment_method_label(method: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+#: The note recorded when the accept-list is present but does not have the shape this detector
+#: was measured against. It is NOT a negative — see `_read_payment_lines`.
+DETECTOR_SHAPE_UNEXPECTED = "detector_shape_unexpected"
+
+
+class _ShapeSurprise(Exception):
+    """One `availablePaymentLines` element was not the shape measured on 2026-09-22."""
+
+
 def _read_payment_lines(lines: List[Any]) -> Tuple[Tuple[str, ...], bool]:
-    """(labels, card_present) for one `availablePaymentLines` array."""
+    """(labels, card_present) for one `availablePaymentLines` array. Raises `_ShapeSurprise`.
+
+    THE NEGATIVE IS THE DANGEROUS ANSWER, SO IT IS THE ONE THAT IS DEFENDED. `card_available` is
+    False only when EVERY line in the array has the shape below. That is not fussiness: this
+    detector reads an UNVERSIONED serialized blob belonging to somebody else, and every drift in
+    it lands on every Shopify merchant at once. If Shopify drops `placements`, renames
+    `PaymentProvider`, or starts sending `paymentBrands` as a comma-joined string, a lenient
+    parser reads "no card line here" for the entire catalogue on the same afternoon and the rail
+    demotes every merchant it has. A shape surprise must therefore mean "I cannot read this page"
+    (None, retryable), never "this merchant refuses cards".
+
+    THE SHAPE, per line, all required:
+      * the line is an object;
+      * `placements` is a LIST (of strings);
+      * `paymentMethod` is an object whose `__typename` is a string;
+      * `paymentBrands`, when present, is a list or null — never a string or a number.
+
+    BOTH CONJUNCTS OF THE CARD RULE ARE LOAD-BEARING and neither is implied by the other. On
+    every page measured, non-provider lines happen to carry `paymentBrands: null`, so the brand
+    check ALONE appears to decide — which is exactly why deleting the `__typename` conjunct
+    survived the first test suite. It must not: `ApplePayWalletConfig` already carries
+    `placements: ["PAYMENT_METHOD"]`, so a wallet that one day also advertises the card brands it
+    accepts (which is what a wallet IS — a stored card) would be read as a card FORM a headless
+    payer can drive. It is not; the payer cannot authenticate to the wallet. See
+    `tests/test_merchant_purchasability.py::test_a_wallet_line_that_advertises_card_brands_is_not_a_card`.
+    """
     labels: List[str] = []
     card = False
     for line in lines:
         if not isinstance(line, dict):
-            continue
+            raise _ShapeSurprise("line is not an object")
         method = line.get("paymentMethod")
         if not isinstance(method, dict):
-            continue
+            raise _ShapeSurprise("paymentMethod is not an object")
+        typename = method.get("__typename")
+        if not isinstance(typename, str) or not typename.strip():
+            raise _ShapeSurprise("paymentMethod.__typename is not a string")
+        raw = line.get("placements")
+        if not isinstance(raw, list):
+            raise _ShapeSurprise("placements is not a list")
+        brands = method.get("paymentBrands")
+        if brands is not None and not isinstance(brands, list):
+            raise _ShapeSurprise("paymentBrands is neither a list nor null")
+
         label = _payment_method_label(method)
         if label:
             labels.append(label)
-        raw = line.get("placements")
-        placements = {p for p in raw if isinstance(p, str)} if isinstance(raw, list) else set()
-        if _PAYMENT_METHOD_PLACEMENT not in placements:
+        if _PAYMENT_METHOD_PLACEMENT not in {p for p in raw if isinstance(p, str)}:
             continue  # an ACCELERATED_CHECKOUT-only line is a wallet button, not a card form
-        if method.get("__typename") != _CARD_METHOD_TYPENAME:
-            continue
-        brands = method.get("paymentBrands")
-        named = {str(b).strip().upper() for b in brands if isinstance(b, str)} if isinstance(brands, list) else set()
+        if typename != _CARD_METHOD_TYPENAME:
+            continue  # LOAD-BEARING on its own; see the docstring
+        named = {b.strip().upper() for b in (brands or []) if isinstance(b, str)}
         if named & _CARD_BRANDS:
             card = True
     return tuple(sorted(set(labels))[:_MAX_PAYMENT_METHOD_LABELS]), card
 
 
-def checkout_payment_methods(body: str) -> Tuple[Tuple[str, ...], Optional[bool]]:
-    """The checkout's accept-list and whether it offers a CARD, read off the HTML-unescaped page.
+def checkout_payment_methods(body: str) -> Tuple[Tuple[str, ...], Optional[bool], Optional[str]]:
+    """The checkout's accept-list, whether it offers a CARD, and a detector note.
 
-    Returns `(labels, card_available)`. `card_available` is None — not False — whenever no
-    `availablePaymentLines` array could be read, when the array names no method at all, or when
-    two copies of the serialized state disagree. Only an array we actually read, holding no
-    `PaymentProvider` with card brands, answers False. See the module docstring for why a
-    substring must never be used here.
+    Returns `(labels, card_available, note)`. `card_available` is None — not False — whenever:
+      * no `availablePaymentLines` array could be read at all;
+      * the array is present but EMPTY, or names no method;
+      * a line does not have the measured shape (`note` is then `DETECTOR_SHAPE_UNEXPECTED`);
+      * two copies of the serialized state disagree.
+
+    Only an array we fully read, every line well-shaped, holding no `PaymentProvider` with card
+    brands, answers False. See the module docstring for why a substring must never be used here.
     """
     page = html.unescape(body or "")
     answers = set()
+    surprised = False
     for lines in _json_values_after(page, "availablePaymentLines"):
-        if not isinstance(lines, list):
+        if not isinstance(lines, list) or not lines:
             continue
-        labels, card = _read_payment_lines(lines)
+        try:
+            labels, card = _read_payment_lines(lines)
+        except _ShapeSurprise as exc:
+            # The type and nothing else: this is somebody else's page and its values are not ours
+            # to log. One line at WARNING because a drift here is a whole-platform event.
+            surprised = True
+            logger.warning(
+                "cart-link preflight: availablePaymentLines did not have the measured shape (%s); "
+                "reporting card_available=None rather than a negative", exc,
+            )
+            continue
         if not labels:
-            continue  # an empty or unreadable accept-list determines nothing
+            continue  # an accept-list that names nothing determines nothing
         answers.add((labels, card))
+    if surprised:
+        # A surprise anywhere poisons the read, even if another copy parsed cleanly: the two
+        # copies are the same state, so one of them being unreadable means we do not know which
+        # is current.
+        return (), None, DETECTOR_SHAPE_UNEXPECTED
     if len(answers) != 1:
-        return (), None
+        return (), None, None
     labels, card = next(iter(answers))
-    return labels, card
+    return labels, card, None
 
 
 # --- price parity ----------------------------------------------------------------------------
@@ -741,6 +815,7 @@ def classify_landing(
     market: Optional[str] = None,
     card_available: Optional[bool] = None,
     price_drift_minor: Optional[int] = None,
+    detector_note: Optional[str] = None,
 ) -> Tuple[Verdict, Tuple[str, ...]]:
     """Pure: the verdict for a finished redirect chain, plus what an almost-checkout lacked.
 
@@ -785,6 +860,11 @@ def classify_landing(
         # Both of these outrank a prefill miss: they are facts about whether this checkout can be
         # PAID, and `is False` / `!= 0` are written out so that an undetermined card (None) and a
         # parity of 0 can never fall through as a negative.
+        if detector_note:
+            # The accept-list was THERE and we could not trust our reading of it. That is a fact
+            # about the DETECTOR, not about the merchant, so it lands where every other
+            # "cannot verify" lands -- unverifiable and retryable -- and never as a negative.
+            return Verdict.BLOCKED_UNKNOWN, tuple(missing)
         if card_available is False:
             return Verdict.NO_CARD_PAYMENT, tuple(missing)
         if price_drift_minor is not None and price_drift_minor != 0:
@@ -1159,11 +1239,15 @@ async def _preflight(
     # Read the payment accept-list and the line price BEFORE classifying, and only off a 200: a
     # 403 challenge page or a password wall carries neither, and must stay unverifiable.
     if landing.status == 200:
-        payment_methods, card_available = checkout_payment_methods(landing.body)
+        payment_methods, card_available, detector_note = checkout_payment_methods(landing.body)
         landed_price_minor, landed_currency = checkout_line_price(landing.body, chosen.variant_id)
     else:
-        payment_methods, card_available = (), None
+        payment_methods, card_available, detector_note = (), None, None
         landed_price_minor, landed_currency = None, None
+    if not check_card:
+        # The note only means anything to a caller that asked for the card verdict; without
+        # `check_card` it must not move the Tier B lane's verdict either.
+        detector_note = None
     drift = price_drift(landed_price_minor, landed_currency, expected_price_minor, expected_currency)
     verdict, missing = classify_landing(
         chain=landing.chain, final_status=landing.status, body=landing.body,
@@ -1173,11 +1257,15 @@ async def _preflight(
         # calls `preflight` without it and keeps every verdict it had, while its rows still gain
         # the observability. The purchasability sweep passes check_card=True, behind its own dial.
         card_available=(card_available if check_card else None), price_drift_minor=drift,
+        detector_note=detector_note,
     )
     checkout_country = checkout_buyer_country(landing.body) if landing.status == 200 else None
     total = _CHECKOUT_TOTAL.search(html.unescape(landing.body)) if landing.status == 200 else None
     return _done(PreflightResult(
         verdict=verdict,
+        # RETRYABLE, like every other unverifiable outcome: the page is there, our reading of it
+        # is not, and the next sweep should try again rather than the row ageing out as a fact.
+        retryable=(verdict is Verdict.BLOCKED_UNKNOWN and bool(detector_note)),
         payment_methods=payment_methods,
         card_available=card_available,
         landed_price_minor=landed_price_minor,
@@ -1193,6 +1281,7 @@ async def _preflight(
         detail=(
             f"status_{landing.status}" if verdict is Verdict.UNCLASSIFIED
             else f"checkout_country_{checkout_country or 'unreadable'}" if verdict is Verdict.CHECKOUT_MARKET_MISMATCH
+            else detector_note if detector_note and verdict is Verdict.BLOCKED_UNKNOWN
             else "no_card_in_" + ",".join(payment_methods) if verdict is Verdict.NO_CARD_PAYMENT
             else f"drift_{drift}_{landed_currency}" if verdict is Verdict.PRICE_DRIFT
             else None

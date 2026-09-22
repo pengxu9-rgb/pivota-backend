@@ -155,6 +155,9 @@ __all__ = [
     # hangs off that buyer id. Nothing it returns identifies anybody (see `RetireReport`).
     "RetireReport",
     "retire_buyer_refs_for_buyer",
+    # WP6. The ONE definition of "which merchant x market rows does the variant lane admit?".
+    "ELIGIBILITY_MERCHANT_ROW",
+    "list_enabled_merchant_markets",
 ]
 
 
@@ -2669,3 +2672,44 @@ async def retire_buyer_refs_for_buyer(buyer_id: str, *, reason: str) -> RetireRe
     return RetireReport(
         refs_retired=refs_retired, enrollments_marked_dead=enrollments_marked_dead
     )
+
+
+# ── the variant lane's merchant set (WP6) ───────────────────────────────────────────────────
+
+#: The sentinel that distinguishes the MERCHANT row of `reap_agentic_eligibility` from an
+#: OVERRIDE row. `''`, not NULL: see db/migrations/226_reap_agentic_routes.sql for why a NULL
+#: behaves differently on the two dialects and a value does not.
+#:
+#: ONE DEFINITION, TWO READERS. `routes/agent_commerce_reap._MERCHANT_ROW` is this constant, and
+#: `list_enabled_merchant_markets` below is the SET form of the same predicate. They were two
+#: separate expressions until a reviewer measured a merchant the route ACCEPTS that the
+#: purchasability sweep never VISITED: the sweep also required `variant_key = ''`, which the
+#: route does not, so an eligibility row typed with a variant key was purchasable-by-the-route
+#: and invisible-to-the-sweep. A gate whose population is narrower than the thing it gates is
+#: not a gate. Keep these two in step, or a merchant slips through again.
+ELIGIBILITY_MERCHANT_ROW = ""
+
+#: Every (domain, market) the variant lane admits. The predicate is EXACTLY the route's:
+#: `product_key = ''` marks the merchant row, `enabled` is read from that row, and NOTHING is
+#: said about `variant_key` — an override row's variant key is not part of merchant identity.
+_ENABLED_MERCHANT_MARKETS_SQL = """
+SELECT DISTINCT merchant_domain, market_country
+  FROM reap_agentic_eligibility
+ WHERE product_key = :merchant_row
+   AND enabled = TRUE
+"""
+
+
+async def list_enabled_merchant_markets() -> List[Dict[str, Any]]:
+    """The variant lane's merchant x market set, as `[{"merchant_domain", "market_country"}]`.
+
+    Fails SOFT (empty list) when the table is absent — a SQLite dev database or a partially
+    migrated environment contributes nothing rather than ending a caller's sweep.
+    """
+    try:
+        rows = await database.fetch_all(
+            _ENABLED_MERCHANT_MARKETS_SQL, {"merchant_row": ELIGIBILITY_MERCHANT_ROW}
+        )
+    except Exception:  # noqa: BLE001 - see the docstring
+        return []
+    return [dict(r) for r in rows]

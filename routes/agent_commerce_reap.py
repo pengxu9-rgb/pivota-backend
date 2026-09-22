@@ -431,7 +431,12 @@ _COUNTRY_RE = re.compile(r"^[A-Z]{2}$")
 #: The sentinel that distinguishes the MERCHANT row from an OVERRIDE row. `''`, not NULL: see the
 #: header of db/migrations/226_reap_agentic_routes.sql for why a NULL here behaves differently on
 #: the two dialects and a value does not.
-_MERCHANT_ROW = ""
+#:
+#: IMPORTED, NOT REDECLARED (WP6). `db.reap_agentic_ledger` owns this constant and the SET form
+#: of the same predicate (`list_enabled_merchant_markets`), which the purchasability sweep uses
+#: to build its population. Two spellings of "which rows are merchant rows" is how a merchant
+#: this route accepts came to be one the sweep never visited.
+_MERCHANT_ROW = ledger.ELIGIBILITY_MERCHANT_ROW
 
 #: THE CURRENCY A MARKET IMPLIES. A MAP AND NOT A COLUMN, deliberately.
 #:
@@ -1700,12 +1705,12 @@ async def start_reap_purchase(
         # platform constant every Shopify store repeats) and rendered a checkout whose only
         # payment method was PayPal, at a price we did not hold.
         #
-        # DARK BY DEFAULT. With MERCHANT_PURCHASABILITY_ENABLED off this is not consulted at all
+        # DARK BY DEFAULT. With MERCHANT_PURCHASABILITY_ENFORCE off this is not consulted at all
         # and the rail behaves exactly as it did; with it on, a merchant with no fresh positive
         # fact FROM THE BUYER VANTAGE is refused. `is_purchasable` fails CLOSED on a database
         # error, which is the right direction for a payment gate even though it is the wrong one
         # for a liveness check.
-        if purchasability.is_gate_enabled():
+        if purchasability.is_enforcement_enabled():
             if not await purchasability.is_purchasable(merchant_domain, market_country):
                 raise svc.PurchaseRefused(
                     "merchant_not_purchasable",

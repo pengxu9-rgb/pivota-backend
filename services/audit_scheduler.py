@@ -61,7 +61,7 @@ Job registration happens at start-up time. Currently registers:
   eligibility allowlists and records whether that checkout offers a CARD and at
   what price (jobs/merchant_purchasability_sweep). A merchant carries a purchase
   affordance only while it holds a fresh POSITIVE fact; "unverifiable" is not
-  positive. Dormant unless MERCHANT_PURCHASABILITY_ENABLED is set — the gate is
+  positive. Dormant unless MERCHANT_PURCHASABILITY_SWEEP_ENABLED is set — the gate is
   inside the job, so registering it here is inert. It must stay dormant by
   default because every check creates an abandoned checkout on a live store.
 
@@ -530,7 +530,7 @@ async def start_scheduler() -> None:
         # as purchasable with a PayPal-only checkout.
         #
         # OFF BY DEFAULT and the gate is INSIDE the job
-        # (MERCHANT_PURCHASABILITY_ENABLED), exactly like reap_agentic_purchase_poll
+        # (MERCHANT_PURCHASABILITY_SWEEP_ENABLED), exactly like reap_agentic_purchase_poll
         # above: registering it here is inert, so deploying this contacts no
         # merchant, and arming it needs an env var rather than a scheduler restart.
         # A SECOND gate here would be a second thing to keep in step with the first.

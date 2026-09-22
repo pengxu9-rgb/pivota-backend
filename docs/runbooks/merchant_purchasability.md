@@ -5,8 +5,14 @@
 `routes/merchant_purchasability_ops.py` (the operator read), migration
 `db/migrations/231_merchant_purchasability.sql` (the table).
 
-This rail is **dark by default**. `MERCHANT_PURCHASABILITY_ENABLED` is unset, the scheduler job is
-registered but inert, and `routes/agent_commerce_reap.py` does not consult the fact at all.
+This rail is **dark by default**, behind **two** dials. `MERCHANT_PURCHASABILITY_SWEEP_ENABLED`
+(the job) and `MERCHANT_PURCHASABILITY_ENFORCE` (the consumers) are both unset: the scheduler job
+is registered but inert, and `routes/agent_commerce_reap.py` does not consult the fact at all.
+
+**They are two dials because the sweep runs only on the WORKER and the normal backend deploy does
+not ship the worker.** One shared dial, armed on the backend, would switch the refusals on while
+nothing gathered facts anywhere — a permanent 409 on every merchant in the catalogue. Arm them in
+the order in §9, never together.
 
 ---
 
@@ -163,7 +169,8 @@ arrival).
 
 | variable | default | bounds | what it does |
 |---|---|---|---|
-| `MERCHANT_PURCHASABILITY_ENABLED` | **unset = off** | truthy allowlist: `1`, `true`, `on`, `yes` (case/space-insensitive) | **THE DIAL, with one authoritative reader** (`db.merchant_purchasability.is_gate_enabled`). It gates the sweep job **AND** the consumers' filter. One reader rather than one per module, because a consumer reading it differently from the job would enforce a rule against facts nobody was gathering |
+| `MERCHANT_PURCHASABILITY_SWEEP_ENABLED` | **unset = off** | truthy allowlist: `1`, `true`, `on`, `yes` (case/space-insensitive) | **DIAL 1 of 2** (`db.merchant_purchasability.is_sweep_enabled`). Gates the sweep JOB and nothing else. Off = the job contacts no merchant, which matters because every check creates an abandoned checkout on a live store. **Set this on the WORKER service** |
+| `MERCHANT_PURCHASABILITY_ENFORCE` | **unset = off** | same truthy allowlist | **DIAL 2 of 2** (`db.merchant_purchasability.is_enforcement_enabled`). Gates the CONSUMERS and nothing else: the Reap route's `merchant_not_purchasable` refusal and the checkout tier's downgrade. Off = a missing fact refuses nothing. Also the `enforced` field the gateway reads |
 | `MERCHANT_PURCHASABILITY_TTL_HOURS` | `72` | `1`–`720` | how long one positive fact stays positive. 720 h is 30 days; past that "fresh" is not a word that means anything |
 | `MERCHANT_PURCHASABILITY_BUYER_VANTAGE` | `worker` | any string, truncated to 32 chars | the vantage `is_purchasable` demands a positive fact **FROM**. See §6 — this is the dial that decides whose question the gate is answering |
 | `VANTAGE_PROXY_URL` | **unset** | must start `http://` or `https://`, else ignored | when set, every merchant is ALSO checked through that proxy and recorded under vantage `proxy`. Anything else is ignored rather than handed to httpx, which would raise inside the run |
@@ -173,6 +180,15 @@ arrival).
 | `MERCHANT_PURCHASABILITY_PAUSE_MS` | `1500` | `0`–`60000` | seconds (in ms) to wait between merchants. One store at a time, unhurried: this rail has no latency requirement and a burst of checkout creations against one platform does not help us |
 
 Two things are deliberately **not** dials: `DEMOTE_AFTER_FAILURES` (2) and the card-brand set.
+
+**Why the dial is split.** It was one dial, and one was a bug.
+`services.audit_scheduler._add_job` registers every job only when
+`_queue_worker_enabled()` is true — prod and staging share one Postgres, so only the production
+worker may run singleton crons — and **the normal backend deploy does not ship the worker** (see
+`project_scheduler_lane_runs_on_undeployed_worker_2026_09_02`). A single dial set on the backend
+would therefore arm the refusals while the sweep that feeds them never ran anywhere:
+`is_purchasable` finds no fact for any merchant, and the Reap rail answers a permanent 409
+`merchant_not_purchasable` for the entire catalogue until somebody unsets the variable again.
 
 ---
 
@@ -347,46 +363,87 @@ host, path and click id survive and buyer values do not.
 The sweep runs **only on the worker service** — `_add_job` registers nothing unless
 `services.audit_scheduler._queue_worker_enabled()` is true, because prod and staging share one
 Postgres. The normal backend deploy does not ship the worker; see
-`project_scheduler_lane_runs_on_undeployed_worker_2026_09_02`.
+`project_scheduler_lane_runs_on_undeployed_worker_2026_09_02`. **This is why there are two dials,
+and it is why their order is not negotiable.**
 
-1. **Deploy dark.** Everything in WP6 is inert with the dial unset: the job touches no merchant
-   (every check creates an abandoned checkout on a live store, so dormant-by-default matters more
-   here than on most jobs), and `routes/agent_commerce_reap.py` does not consult the fact.
-2. **Set `MERCHANT_PURCHASABILITY_BUYER_VANTAGE`** — and, if that is not the worker's own egress,
-   `VANTAGE_PROXY_URL` — **before** the dial. See §6. Arming with the wrong vantage gates on a
-   fact about a network the buyer does not pay from.
-3. **Arm the dial:** `MERCHANT_PURCHASABILITY_ENABLED=1`. No redeploy and no scheduler restart —
-   the gate is read per run and per call.
+### The arming order
 
-> **THE JOB AND THE ENFORCEMENT SHARE ONE DIAL, SO ARMING IT ARMS BOTH AT ONCE.** There is no
-> window in which the sweep gathers facts while the rail still serves everyone. `is_gate_enabled`
-> is the single authoritative reader for both halves on purpose — two readers of one dial is two
-> things to get out of step — but the operational consequence is blunt: **at the moment you set the
-> variable, every merchant reads `browse_only`, because no fact has been gathered yet, and the Reap
-> rail refuses `merchant_not_purchasable` (409) for all of them.** That state lasts until the first
-> sweep tick completes for each merchant — at the default interval and batch, up to
-> `ceil(population / 20)` hours.
->
-> So: **arm it, then immediately watch `GET /ops/merchant-purchasability?domain=…&market=…` for the
-> merchants you care about** and confirm each flips to `tier: "purchase"`. Do not arm it and walk
-> away. If a merchant you expect to be purchasable stays `browse_only`, the route's `note` field
-> names the three candidate reasons (a positive row under a DIFFERENT vantage, an expired window,
-> or two consecutive negatives) and §7's demotion query tells you which.
-
-4. **Watch the sweep's report** for a few ticks. It is counts-only:
+1. **Deploy dark.** Both dials unset. The job touches no merchant and
+   `routes/agent_commerce_reap.py` does not consult the fact.
+2. **Set the vantage first.** `MERCHANT_PURCHASABILITY_BUYER_VANTAGE` — and, if that is not the
+   worker's own egress, `VANTAGE_PROXY_URL` — **before** either dial. See §6. Arming with the
+   wrong vantage gates on a fact about a network the buyer does not pay from.
+3. **`MERCHANT_PURCHASABILITY_SWEEP_ENABLED=1`, ON THE WORKER.** Nothing is refused yet. The job
+   begins gathering facts on its next tick; no redeploy and no scheduler restart.
+4. **Wait for one full pass over the population.** At the defaults that is
+   `ceil(population / MERCHANT_PURCHASABILITY_BATCH)` ticks, i.e. `ceil(population / 20)` hours
+   at the hourly interval. Watch the sweep's counts-only report:
    `population / checked / positive / negative / unverifiable / written / abandoned_budget /
-   errors / skipped_disabled / duration_ms`. `skipped_disabled=1` means the dial is off.
-   **`errors` is the only count that should page anyone** — a check that raised, or a fact that
-   could not be written. A high `unverifiable` is not an error; it is the egress telling you
-   something, and §6 is where to look.
+   errors / skipped_disabled / duration_ms`. A pass is complete when `checked` has covered
+   `population` across ticks. **`errors` is the only count that should page anyone**; a high
+   `unverifiable` is not an error, it is the egress telling you something, and §6 is where to look.
+5. **Verify coverage merchant by merchant** through
+   `GET /ops/merchant-purchasability?domain=…&market=…`. Every merchant you expect to be
+   purchasable must read `"tier": "purchase"`. If one stays `browse_only`, the response's `note`
+   names the three candidate reasons — a positive row under a DIFFERENT vantage, an expired
+   window, or two consecutive negatives — and §7's demotion query tells you which. **Do not skip
+   this step:** it is the only thing standing between step 6 and a 409 on a live merchant.
+6. **`MERCHANT_PURCHASABILITY_ENFORCE=1`.** Only now does a missing fact refuse a purchase.
+
+> **Arming these in the other order is the outage.** With `ENFORCE` on and no facts gathered,
+> every merchant reads `browse_only` and the Reap rail refuses `merchant_not_purchasable` (409)
+> for all of them. Because the job is worker-only, setting `SWEEP_ENABLED` on the backend does
+> not fix it — the sweep is not running there at all.
+
+### Gateway (PIVOTA-Agent) change
+
+The per-merchant checkout tier is decided in the gateway repo, **not here**: the tier this backend
+can see (`routes/store_audit_ops.py::checkout_tier_coverage`) is counts-only, and
+`ready_for_complete` does not exist in this repo at all. The gateway change is therefore a
+separate PR in **PIVOTA-Agent**, and until it lands the gate protects the Reap rail only.
+
+**File:** `services/ucpStoreAuditProbe.js`.
+
+**Contract:**
+
+* Call `GET /ops/merchant-purchasability?domain=<domain>&market=<ISO-2>` on the backend.
+* **Auth:** the same ops credential the gateway already uses for its store-audit reads. Surveyed:
+  this route sits behind `Depends(require_admin)` from `utils/auth.py`, byte-for-byte the
+  dependency on `/ops/store-audit/domain-diagnostics` and `/ops/store-audit/checkout-tier-coverage`.
+  Reuse that caller; do not mint a new one.
+  **That means a Bearer JWT whose `role` is `admin` or `super_admin` — NOT an `X-ADMIN-KEY`
+  header.** `utils/auth.py` also exports `require_admin_or_key`, which does accept
+  `ADMIN_API_KEY` / `PROMOTIONS_ADMIN_KEY`; these ops routes deliberately do not use it, so a
+  gateway reaching for the header will get a 401 and it will look like a routing problem.
+* **Act on `tier` ONLY when `enforced` is `true`.** This is the whole reason `enforced` is in the
+  response. With enforcement off every merchant reads `browse_only` — because no fact is being
+  enforced, not because the merchant is browse-only — so a gateway that consumed `tier` alone
+  would take the entire catalogue browse-only on the day the field shipped. When `enforced` is
+  false, log and keep the previous behaviour.
+* **Cache for at most 5 minutes** per `(domain, market)`. The fact changes at sweep cadence
+  (hourly by default), so a short cache costs nothing and a long one delays a demotion.
+* **Fail OPEN to the previous behaviour on transport error, timeout or a non-200.** The backend
+  fails CLOSED — `is_purchasable` returns False when the database will not answer, because a
+  payment gate that cannot prove payment must not permit it — and the gateway must **not**
+  double-fail. Two independent fail-closed layers turn one backend blip into a catalogue-wide
+  outage; one is the guarantee, two is an incident.
+* `sweep_enabled` is also in the response, for diagnostics: `sweep_enabled: false` with
+  `enforced: true` is the misordered state above and is worth logging loudly.
 
 ### Rolling back
 
-**Unset `MERCHANT_PURCHASABILITY_ENABLED`.** That is the whole rollback:
+**Unset `MERCHANT_PURCHASABILITY_ENFORCE`.** That alone stops every refusal:
 
 * the Reap rail stops consulting the fact and behaves exactly as it did before WP6 — the refusal
-  is behind `if purchasability.is_gate_enabled():` and nothing else changes;
-* the sweep returns `skipped_disabled=1` and contacts no merchant.
+  is behind `if purchasability.is_enforcement_enabled():` and nothing else changes;
+* the checkout-tier surface stops reporting a downgrade, and the ops route's `enforced` goes
+  `false`, which tells the gateway to fall back to its previous behaviour;
+* the sweep **keeps running** and keeps the facts fresh, so re-arming later needs no second wait.
+
+Unset `MERCHANT_PURCHASABILITY_SWEEP_ENABLED` as well to stop contacting merchants; the sweep then
+returns `skipped_disabled=1`. Unsetting only the sweep dial while leaving `ENFORCE` on is the
+misordered state again — the facts age out through the TTL and merchants silently become
+`browse_only` one by one.
 
 Nothing needs to be un-migrated and no row needs deleting: stale facts are simply not read. The
 rows stay, and they are still readable through the ops route (which is not gated on the dial), so

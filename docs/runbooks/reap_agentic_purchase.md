@@ -786,7 +786,7 @@ which reads as "we do not have this merchant" rather than "the eligibility row i
 
 ### Before arming: eligibility rows need a fresh positive purchasability fact
 
-With `MERCHANT_PURCHASABILITY_ENABLED` on, an enabled `reap_agentic_eligibility` row — or a Tier B
+With `MERCHANT_PURCHASABILITY_ENFORCE` on, an enabled `reap_agentic_eligibility` row — or a Tier B
 `ELIGIBLE` verdict — is **necessary but not sufficient**. `POST /agent/v2/commerce/reap/purchases`
 additionally refuses **`merchant_not_purchasable` (409)** unless
 `db.merchant_purchasability.is_purchasable(domain, market)` is true, and that needs a **fresh

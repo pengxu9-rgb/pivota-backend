@@ -325,6 +325,74 @@ async def ensure_required_schema_light() -> None:
                 )
             except Exception:  # noqa: BLE001
                 pass
+            # mig 232: widen migration 228's verdict vocabulary for NO_CARD_PAYMENT and
+            # PRICE_DRIFT.
+            #
+            # THE CREATE TABLE IN db/tierb_cart_link_eligibility_schema.py ALREADY CARRIES THE
+            # WIDE LIST, and on a FRESH database that is the whole heal. It is NOT enough on a
+            # database that already holds a 228-shaped table: `CREATE TABLE IF NOT EXISTS` does
+            # nothing there, so the narrow CHECK survives and the first NO_CARD_PAYMENT write
+            # raises. Measured on a 228-only database, which is what production is.
+            #
+            # The constraint names are POSTGRES'S OWN (`<table>_<column>_check`): migration 228
+            # declared both CHECKs inline and unnamed. Dropped by that name and re-added under
+            # it, so this and the migration leave byte-identical catalogs — compared by
+            # tests/test_merchant_purchasability_postgres.py.
+            #
+            # IDEMPOTENT: DROP ... IF EXISTS then ADD, so a second arrival re-adds the same
+            # definition rather than duplicating or failing. Each statement pair in its own try,
+            # for the reason the mig-207 block below states: this branch is one try-block.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS tierb_cart_link_eligibility
+                            DROP CONSTRAINT IF EXISTS tierb_cart_link_eligibility_verdict_check;
+                        """
+                    )
+                )
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS tierb_cart_link_eligibility
+                            ADD CONSTRAINT tierb_cart_link_eligibility_verdict_check
+                            CHECK (verdict IS NULL OR verdict IN (
+                                'ELIGIBLE', 'LOGIN_REQUIRED', 'NOT_ACCEPTING_ORDERS',
+                                'VARIANT_GONE', 'VARIANT_UNAVAILABLE', 'PASSWORD_PAGE',
+                                'BLOCKED_UNKNOWN', 'CHECKOUT_PREFILL_MISSING',
+                                'CHECKOUT_MARKET_MISMATCH', 'NO_CARD_PAYMENT', 'PRICE_DRIFT'
+                            ));
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS tierb_cart_link_eligibility
+                            DROP CONSTRAINT IF EXISTS
+                                tierb_cart_link_eligibility_previous_verdict_check;
+                        """
+                    )
+                )
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS tierb_cart_link_eligibility
+                            ADD CONSTRAINT tierb_cart_link_eligibility_previous_verdict_check
+                            CHECK (previous_verdict IS NULL OR previous_verdict IN (
+                                'ELIGIBLE', 'LOGIN_REQUIRED', 'NOT_ACCEPTING_ORDERS',
+                                'VARIANT_GONE', 'VARIANT_UNAVAILABLE', 'PASSWORD_PAGE',
+                                'BLOCKED_UNKNOWN', 'CHECKOUT_PREFILL_MISSING',
+                                'CHECKOUT_MARKET_MISMATCH', 'NO_CARD_PAYMENT', 'PRICE_DRIFT'
+                            ));
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
             # mig 207: the Reap EXTERNAL AUTHORIZATION ledger + merchant descriptor
             # registry. Both tables are read on the FIRST authorization Reap sends,
             # inside a 1.6-second budget, and a missing relation there is not a 500
@@ -2917,6 +2985,23 @@ async def ensure_required_schema_light() -> None:
                 )
             except Exception:  # noqa: BLE001
                 pass
+            # mig 232, SQLite twin: THERE IS NO STATEMENT HERE, AND THAT IS THE ANSWER.
+            #
+            # SQLite cannot alter a CHECK in place. There is no DROP CONSTRAINT and no ADD
+            # CONSTRAINT; widening one means rebuilding the table (create-new, copy, drop, rename)
+            # under `PRAGMA legacy_alter_table`, and doing that here — best-effort, inside a try
+            # that swallows everything, against a table another statement in this same branch may
+            # have just created — risks losing the rows on a partial failure. That trade is not
+            # worth taking for this table.
+            #
+            # IT IS SAFE TO OMIT because of where SQLite is used: dev machines and the test suite,
+            # both of which build the schema from scratch. `ensure_schema` below runs the
+            # `CREATE TABLE IF NOT EXISTS` in db/tierb_cart_link_eligibility_schema.py, whose
+            # verdict list ALREADY carries NO_CARD_PAYMENT and PRICE_DRIFT, so every SQLite
+            # database born after this change has the wide vocabulary. Only a SQLite file that
+            # predates it keeps the narrow one, and the fix for that file is to delete it.
+            #
+            # Production is Postgres, and the Postgres branch above does heal it in place.
             # mig 228: Tier B cart-link eligibility, SQLite twin — the same
             # function as the Postgres branch; it picks the dialect's DDL.
             # SQL-only (no SQLAlchemy Table) for the reason the mig-224 block

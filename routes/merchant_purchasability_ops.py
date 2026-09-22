@@ -13,11 +13,17 @@ routes/store_audit_ops.py uses. Domain and market are the only free inputs and b
 normalized through the same functions the writer keys on, so an operator cannot be shown a
 different row than the door reads.
 
-IT IS A READ ONLY, AND IT IS NOT GATED ON THE DIAL. With MERCHANT_PURCHASABILITY_ENABLED off the
-sweep gathers nothing and the consumers ignore what is there, but an operator arming the rail
-needs to see the facts FIRST — a route that went dark with the dial would be unreadable at
-exactly the moment it is needed. It reports the gate's state instead, so the numbers are never
-mistaken for enforcement.
+IT IS A READ ONLY, AND IT IS GATED ON NEITHER DIAL. With both dials off the sweep gathers nothing
+and the consumers ignore what is there, but an operator arming the rail needs to see the facts
+FIRST — a route that went dark with a dial would be unreadable at exactly the moment it is
+needed. It reports both dials' state instead, so its numbers are never mistaken for enforcement.
+
+THIS ROUTE IS ALSO THE GATEWAY'S CONTRACT. The per-merchant checkout tier is decided in the
+PIVOTA-Agent gateway (`services/ucpStoreAuditProbe.js`), not here, so the gateway reads `tier`
+from this response — but ONLY when `enforced` is true. That field is not decoration: with
+enforcement off every merchant reads `browse_only`, so a gateway that acted on `tier` alone
+would take the entire catalogue browse-only on the day it shipped. See the "Gateway
+(PIVOTA-Agent) change" section of docs/runbooks/merchant_purchasability.md.
 
 NO BUYER DATA CAN REACH THIS RESPONSE. The evidence blob is written by an allow-list of keys
 (see `db/merchant_purchasability._evidence`) and the sweep runs with `buyer=None`; there is no
@@ -63,8 +69,15 @@ class PurchasabilityResponse(BaseModel):
     #: What the DOOR would answer right now for this merchant x market. `purchase` only when a
     #: fresh positive fact exists FROM THE BUYER VANTAGE; every other state is `browse_only`.
     tier: str
+    #: THE GATEWAY CONTRACT. False means the backend is NOT refusing on this fact yet, so a
+    #: consumer must keep its previous behaviour and treat `tier` as advisory. A gateway that
+    #: acted on `tier` without reading this would turn the whole catalogue browse-only on the
+    #: day the field shipped, because with enforcement off every merchant reads browse_only.
+    enforced: bool
     buyer_vantage: str
-    gate_enabled: bool
+    #: Whether the SWEEP is arming. `sweep_enabled=False` with `enforced=True` is the misordered
+    #: state the runbook warns about: nothing is gathering facts and everything is being refused.
+    sweep_enabled: bool
     ttl_hours: int
     facts: List[PurchasabilityFact]
     note: str
@@ -136,8 +149,9 @@ async def merchant_purchasability(
         domain=normalized,
         market=normalized_market,
         tier=("purchase" if purchasable else "browse_only"),
+        enforced=purchasability.is_enforcement_enabled(),
         buyer_vantage=vantage,
-        gate_enabled=purchasability.is_gate_enabled(),
+        sweep_enabled=purchasability.is_sweep_enabled(),
         ttl_hours=purchasability.ttl_hours(),
         facts=facts,
         note=note,

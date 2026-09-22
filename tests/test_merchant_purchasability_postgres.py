@@ -68,6 +68,15 @@ if _IS_PG:
 _MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "db" / "migrations"
 _MIGRATION = _MIGRATIONS_DIR / "231_merchant_purchasability.sql"
 _DOWN = _MIGRATIONS_DIR / "down" / "231_merchant_purchasability_down.sql"
+_MIG_228 = _MIGRATIONS_DIR / "228_tierb_cart_link_eligibility.sql"
+_MIG_232 = _MIGRATIONS_DIR / "232_tierb_verdict_vocabulary.sql"
+
+#: The two members migration 232 adds to migration 228's verdict vocabulary.
+_WIDENED = ("NO_CARD_PAYMENT", "PRICE_DRIFT")
+_TIERB_CHECKS = (
+    "tierb_cart_link_eligibility_verdict_check",
+    "tierb_cart_link_eligibility_previous_verdict_check",
+)
 
 # Same convention as the sibling gates: this file DROPS its table, so it must be INCAPABLE of
 # running anywhere but a throwaway — made true, not merely stated.
@@ -398,15 +407,185 @@ async def test_the_ops_route_carries_no_buyer_data(_migration_db, _app):
 
 
 async def test_the_ops_route_reports_the_gate_state_but_is_not_gated_by_it(_migration_db, _app, monkeypatch):
-    """A route that went dark with the dial would be unreadable at exactly the moment an operator
-    needs it — before arming."""
+    """A route that went dark with a dial would be unreadable at exactly the moment an operator
+    needs it — before arming. `enforced` is also the gateway's contract: it must be able to tell
+    "this merchant is browse_only" from "the backend is not enforcing yet"."""
     import db.merchant_purchasability as mp
 
     await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
-    monkeypatch.delenv("MERCHANT_PURCHASABILITY_ENABLED", raising=False)
+    monkeypatch.delenv("MERCHANT_PURCHASABILITY_ENFORCE", raising=False)
     body = (await _get(_app, "/ops/merchant-purchasability?domain=judydoll.com&market=US")).json()
-    assert body["gate_enabled"] is False
+    assert body["enforced"] is False
     assert body["facts"], "the facts are still readable with the gate off"
-    monkeypatch.setenv("MERCHANT_PURCHASABILITY_ENABLED", "1")
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_ENFORCE", "1")
     body = (await _get(_app, "/ops/merchant-purchasability?domain=judydoll.com&market=US")).json()
-    assert body["gate_enabled"] is True
+    assert body["enforced"] is True
+
+
+# ══ migration 232: the widened Tier B verdict vocabulary IS self-healed ════════════════════
+#
+# F8. The self-heal's CREATE TABLE already carries the wide list, which is the whole heal on a
+# FRESH database — and NOTHING on a database that already holds a 228-shaped table, because
+# `CREATE TABLE IF NOT EXISTS` does nothing there. Production is exactly that database. Measured:
+# before the fix, healing a 228-only database left the narrow CHECK and the first
+# NO_CARD_PAYMENT write raised.
+
+
+async def _tierb_check_defs():
+    from db.database import database
+
+    rows = await database.fetch_all(
+        """
+        SELECT c.conname, pg_get_constraintdef(c.oid) AS def
+          FROM pg_constraint c
+          JOIN pg_class t ON t.oid = c.conrelid
+         WHERE c.contype = 'c' AND t.relname = 'tierb_cart_link_eligibility'
+         ORDER BY c.conname
+        """
+    )
+    return {r["conname"]: " ".join(r["def"].split()) for r in rows}
+
+
+@pytest.fixture
+async def _tierb_228():
+    """A database holding migration 228's table and NOT 232 — i.e. production's shape."""
+    from db.database import database
+
+    _assert_throwaway_database()
+    was_connected = database.is_connected
+    if not was_connected:
+        await database.connect()
+    await database.execute("DROP TABLE IF EXISTS tierb_cart_link_eligibility")
+    await _apply(_MIG_228)
+    yield
+    await database.execute("DROP TABLE IF EXISTS tierb_cart_link_eligibility")
+    if not was_connected and database.is_connected:
+        await database.disconnect()
+
+
+async def test_a_228_only_database_really_does_refuse_the_new_verdicts(_tierb_228):
+    """THE PRECONDITION, measured rather than asserted in prose. If this ever stops failing, the
+    heal below is testing nothing."""
+    import asyncpg
+    from db.database import database
+
+    defs = await _tierb_check_defs()
+    for name in _TIERB_CHECKS:
+        assert name in defs, f"precondition: 228 built {name}"
+        for verdict in _WIDENED:
+            assert verdict not in defs[name], f"precondition: 228 does not admit {verdict}"
+
+    with pytest.raises(asyncpg.exceptions.CheckViolationError):
+        await database.execute(
+            "INSERT INTO tierb_cart_link_eligibility (shop_domain, market, verdict, checked_at) "
+            "VALUES ('x.com', 'US', 'NO_CARD_PAYMENT', now())"
+        )
+
+
+async def test_the_self_heal_widens_the_verdict_check_on_a_228_shaped_database(_tierb_228):
+    """The heal, on the database production actually has."""
+    from db.database import database
+    from db.schema_guard import ensure_required_schema_light
+
+    await ensure_required_schema_light()
+
+    defs = await _tierb_check_defs()
+    for name in _TIERB_CHECKS:
+        for verdict in _WIDENED:
+            assert verdict in defs[name], f"{name} still refuses {verdict} after the heal"
+
+    # Behaviourally, not just in the catalog.
+    for verdict in _WIDENED:
+        await database.execute(
+            "INSERT INTO tierb_cart_link_eligibility (shop_domain, market, verdict, checked_at) "
+            "VALUES (:d, 'US', :v, now())",
+            {"d": f"{verdict.lower()}.com", "v": verdict},
+        )
+
+
+async def test_the_232_self_heal_builds_the_checks_the_migration_builds(_tierb_228):
+    """Catalog parity for 232, the same comparison the 231 test makes: migration-built vs
+    self-heal-built, from the same starting state."""
+    from db.database import database
+    from db.schema_guard import ensure_required_schema_light
+
+    await _apply(_MIG_232)
+    from_migration = await _tierb_check_defs()
+
+    await database.execute("DROP TABLE IF EXISTS tierb_cart_link_eligibility")
+    await _apply(_MIG_228)
+    await ensure_required_schema_light()
+    from_self_heal = await _tierb_check_defs()
+
+    for name in _TIERB_CHECKS:
+        assert from_self_heal[name] == from_migration[name], (
+            f"{name} differs:\n  migration: {from_migration[name]}\n"
+            f"  self-heal: {from_self_heal[name]}"
+        )
+
+
+async def test_the_232_heal_is_idempotent(_tierb_228):
+    from db.schema_guard import ensure_required_schema_light
+
+    await ensure_required_schema_light()
+    once = await _tierb_check_defs()
+    await ensure_required_schema_light()
+    await ensure_required_schema_light()
+    assert await _tierb_check_defs() == once
+
+
+async def test_the_migration_reapplies_over_a_self_healed_tierb_table(_tierb_228):
+    from db.schema_guard import ensure_required_schema_light
+
+    await ensure_required_schema_light()
+    before = await _tierb_check_defs()
+    await _apply(_MIG_232)
+    assert await _tierb_check_defs() == before
+
+
+async def test_a_fresh_database_gets_the_wide_vocabulary_without_the_migration():
+    """The other arrival path: a database with NO tierb table at all is built by the self-heal's
+    CREATE TABLE, whose list is already wide."""
+    from db.database import database
+    from db.schema_guard import ensure_required_schema_light
+
+    _assert_throwaway_database()
+    was_connected = database.is_connected
+    if not was_connected:
+        await database.connect()
+    try:
+        await database.execute("DROP TABLE IF EXISTS tierb_cart_link_eligibility")
+        await ensure_required_schema_light()
+        defs = await _tierb_check_defs()
+        for name in _TIERB_CHECKS:
+            for verdict in _WIDENED:
+                assert verdict in defs[name]
+    finally:
+        await database.execute("DROP TABLE IF EXISTS tierb_cart_link_eligibility")
+        if not was_connected and database.is_connected:
+            await database.disconnect()
+
+
+async def test_the_ops_route_carries_the_gateway_contract_fields(_migration_db, _app, monkeypatch):
+    """`enforced` is not decoration: with enforcement off EVERY merchant reads browse_only, so a
+    gateway acting on `tier` alone would take the whole catalogue browse-only on day one."""
+    import db.merchant_purchasability as mp
+
+    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
+    monkeypatch.delenv("MERCHANT_PURCHASABILITY_ENFORCE", raising=False)
+    monkeypatch.delenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", raising=False)
+    body = (await _get(_app, "/ops/merchant-purchasability?domain=judydoll.com&market=US")).json()
+    assert body["enforced"] is False and body["sweep_enabled"] is False
+    assert body["tier"] == "purchase", "the FACT is reported regardless of the dials"
+
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_ENFORCE", "1")
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "1")
+    body = (await _get(_app, "/ops/merchant-purchasability?domain=judydoll.com&market=US")).json()
+    assert body["enforced"] is True and body["sweep_enabled"] is True
+
+
+async def test_a_merchant_with_no_fact_is_browse_only_but_not_enforced(_migration_db, _app, monkeypatch):
+    """The exact day-one state the gateway must NOT act on."""
+    monkeypatch.delenv("MERCHANT_PURCHASABILITY_ENFORCE", raising=False)
+    body = (await _get(_app, "/ops/merchant-purchasability?domain=never-seen.com&market=US")).json()
+    assert body["tier"] == "browse_only" and body["enforced"] is False

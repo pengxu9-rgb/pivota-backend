@@ -17,7 +17,10 @@ Surveyed 2026-09-22. There is NO single merchant x market table in this repo. Th
     to report that its merchant coverage is zero.
   * `reap_agentic_eligibility` — the VARIANT lane's allowlist, keyed
     (merchant_domain, market_country, product_key, variant_key). The merchant-grain row is
-    `product_key = ''`.
+    `product_key = ''`, and this job does not spell that predicate itself: it calls
+    `db.reap_agentic_ledger.list_enabled_merchant_markets`, which is the SET form of the exact
+    predicate `routes/agent_commerce_reap` decides eligibility with. A population narrower than
+    the door's allowlist is a merchant the gate never sees.
   * `tierb_cart_link_eligibility` — the CART-LINK lane's allowlist, keyed (shop_domain, market),
     and it already carries a confirmed `variant_id`.
 
@@ -36,12 +39,19 @@ we hold one, so that a drift is a statement about our index and not about an unr
 
 ── THE GATE IS INSIDE THE JOB ───────────────────────────────────────────────────────────────
 
-`MERCHANT_PURCHASABILITY_ENABLED`, read PER RUN, gates the whole run — and unlike the Reap
+`MERCHANT_PURCHASABILITY_SWEEP_ENABLED`, read PER RUN, gates the whole run — and unlike the Reap
 poller, gating the whole run is correct here, because this job has no sweep that must keep
 running while the rail is off. It holds no PII, expires nothing and promises nothing to a buyer;
 with the dial off it should touch no merchant at all, because every fetch it makes CREATES AN
 ABANDONED CHECKOUT on that merchant's store. Registering it in the scheduler is therefore inert,
 exactly like `reap_agentic_purchase_poll`, and arming it needs an env var rather than a redeploy.
+
+IT IS A DIFFERENT DIAL FROM THE CONSUMERS' (`MERCHANT_PURCHASABILITY_ENFORCE`), and that is not
+tidiness. `services.audit_scheduler._add_job` registers jobs ONLY on the production worker, and a
+normal backend deploy does not ship the worker — so one shared dial, armed on the backend, would
+switch the refusals on while this job never ran anywhere, and every merchant in the catalogue
+would answer a permanent 409. Sweep first, verify coverage, enforce second: see
+`db.merchant_purchasability.is_enforcement_enabled` and the runbook.
 
 ── VANTAGE ──────────────────────────────────────────────────────────────────────────────────
 
@@ -78,6 +88,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import httpx
 
 import db.merchant_purchasability as facts
+import db.reap_agentic_ledger as ledger
 from db.database import database
 from services.shopify_cart_link_preflight import (
     REQUEST_TIMEOUT_S,
@@ -162,13 +173,17 @@ def _reset_dial_warnings() -> None:
 
 
 def is_enabled() -> bool:
-    """THE DIAL. DELEGATED to `db.merchant_purchasability.is_gate_enabled`, not re-read here:
-    one dial with two readers is two things to get out of step, and a job that armed on a
-    different rule than its consumers would gather facts nobody enforced (or the reverse).
+    """THE SWEEP DIAL (`MERCHANT_PURCHASABILITY_SWEEP_ENABLED`), and ONLY that one.
+
+    DELEGATED to `db.merchant_purchasability.is_sweep_enabled` rather than re-read here, so the
+    dial has one authoritative reader. It is a DIFFERENT dial from the one the consumers read
+    (`MERCHANT_PURCHASABILITY_ENFORCE`), and that separation is the whole point: this job runs
+    only on the worker, so arming enforcement without first arming and completing a sweep would
+    refuse every merchant in the catalogue. See `is_enforcement_enabled` for the arming order.
 
     Read per run and NOTHING caches or shortcuts around it: with it off this job must touch no
     merchant, because every check it makes creates an abandoned checkout on a live store."""
-    return facts.is_gate_enabled()
+    return facts.is_sweep_enabled()
 
 
 def job_interval_seconds() -> int:
@@ -187,16 +202,6 @@ def proxy_url() -> Optional[str]:
 #
 # Module-level constants, no f-strings: tests/test_repo_sql_prepare_postgres.py resolves a
 # `database.*` first argument only when it is a literal or a module-level name.
-
-#: The VARIANT lane's allowlist, merchant grain. `product_key = ''` IS the merchant row (the
-#: rail's own convention, see db/migrations/226); `enabled` is read from that row only.
-_VARIANT_LANE_SQL = """
-SELECT merchant_domain AS domain, market_country AS market
-  FROM reap_agentic_eligibility
- WHERE product_key = ''
-   AND variant_key = ''
-   AND enabled = TRUE
-"""
 
 #: The CART-LINK lane's allowlist, with the variant it already confirmed on the storefront.
 #: `verdict = 'ELIGIBLE'` matches what `is_cart_link_eligible` requires before the door will use
@@ -271,8 +276,16 @@ async def load_population(limit: int) -> List[Target]:
     by the Tier B job — a stronger fact than anything the catalog holds.
     """
     merged: Dict[Tuple[str, str], Optional[str]] = {}
-    for row in await _rows(_VARIANT_LANE_SQL):
-        key = (facts.normalize_domain(row.get("domain")), facts.normalize_market(row.get("market")))
+    # THE VARIANT LANE'S SET COMES FROM THE LANE ITSELF, not from a second copy of its predicate
+    # written here. `routes/agent_commerce_reap` decides eligibility with the same sentinel this
+    # helper filters on, so the population cannot be narrower than what the door accepts — which
+    # it was, until a reviewer measured a merchant the route admitted and the sweep never visited
+    # (the sweep additionally required `variant_key = ''`; the route never has).
+    for row in await ledger.list_enabled_merchant_markets():
+        key = (
+            facts.normalize_domain(row.get("merchant_domain")),
+            facts.normalize_market(row.get("market_country")),
+        )
         if key[0] and len(key[1]) == 2:
             merged.setdefault(key, None)
     for row in await _rows(_CART_LANE_SQL):

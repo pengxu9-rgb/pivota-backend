@@ -72,7 +72,8 @@ __all__ = [
     "NEGATIVE_VERDICTS",
     "DEMOTE_AFTER_FAILURES",
     "DEFAULT_TTL_HOURS",
-    "is_gate_enabled",
+    "is_sweep_enabled",
+    "is_enforcement_enabled",
     "WORKER_VANTAGE",
     "buyer_vantage",
     "ttl_hours",
@@ -145,19 +146,45 @@ def ttl_hours() -> int:
     return _env_int("MERCHANT_PURCHASABILITY_TTL_HOURS", DEFAULT_TTL_HOURS, MIN_TTL_HOURS, MAX_TTL_HOURS)
 
 
-def is_gate_enabled() -> bool:
-    """THE DIAL, and the ONE authoritative reader of it.
+def _truthy(name: str) -> bool:
+    return str(os.getenv(name) or "").strip().lower() in ("1", "true", "on", "yes")
 
-    It gates the sweep job AND every consumer's filter. One reader rather than one per module,
-    because two readers of one dial is two things to get out of step — and a consumer that read
-    it differently from the job would enforce a rule against facts nobody was gathering.
 
-    Default OFF. Nothing caches this: it is read per call so that an operator can arm or disarm
-    the gate without a redeploy.
+def is_sweep_enabled() -> bool:
+    """Dial 1 of 2: may the sweep JOB contact merchants and gather facts?
+
+    Gates jobs/merchant_purchasability_sweep.py and NOTHING else. Default OFF, because every
+    check it makes creates an abandoned checkout on a live store.
     """
-    return str(os.getenv("MERCHANT_PURCHASABILITY_ENABLED") or "").strip().lower() in (
-        "1", "true", "on", "yes"
-    )
+    return _truthy("MERCHANT_PURCHASABILITY_SWEEP_ENABLED")
+
+
+def is_enforcement_enabled() -> bool:
+    """Dial 2 of 2: may a missing fact REFUSE a purchase?
+
+    Gates the consumers — the Reap route's `merchant_not_purchasable` refusal and the checkout
+    tier's downgrade — and NOTHING else. Default OFF.
+
+    ── WHY THIS IS TWO DIALS AND NOT ONE ──────────────────────────────────────────────────────
+
+    It was one, and one was a bug. `services.audit_scheduler._add_job` registers every job only
+    on the production WORKER (`_queue_worker_enabled()`), and a normal backend deploy does not
+    ship the worker. So a single dial armed on the backend would switch the consumers on while
+    the sweep that feeds them never ran anywhere: `is_purchasable` would find no fact for any
+    merchant and the rail would answer a permanent 409 `merchant_not_purchasable` for the entire
+    catalogue, with no way to fix it short of unsetting the dial again.
+
+    Split, the arming ORDER becomes expressible, and it is the only safe one:
+
+        1. MERCHANT_PURCHASABILITY_SWEEP_ENABLED on, ON THE WORKER.
+        2. Wait for one full pass over the population (batch x interval; see the runbook).
+        3. Verify coverage merchant by merchant through GET /ops/merchant-purchasability.
+        4. MERCHANT_PURCHASABILITY_ENFORCE on.
+
+    Turning these on in the other order is the outage. See
+    docs/runbooks/merchant_purchasability.md.
+    """
+    return _truthy("MERCHANT_PURCHASABILITY_ENFORCE")
 
 
 def buyer_vantage() -> str:

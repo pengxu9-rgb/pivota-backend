@@ -214,7 +214,7 @@ async def checkout_tier_coverage(
     # With the purchasability gate armed, no route's tier authorises a purchase:
     # only a fresh positive purchasability fact does, and that is per merchant x
     # market x vantage, which this counts-only summary cannot express.
-    gate_on = purchasability.is_gate_enabled()
+    gate_on = purchasability.is_enforcement_enabled()
     return CoverageResponse(
         active_ucp_routes=summary.get("active_ucp_routes", -1),
         routes_with_proven_merchant=summary.get("routes_with_proven_merchant", -1),
@@ -225,11 +225,11 @@ async def checkout_tier_coverage(
         ),
         purchasability_gate_enabled=gate_on,
         purchasability_note=(
-            "MERCHANT_PURCHASABILITY_ENABLED is ON: a checkout tier does NOT authorise a "
+            "MERCHANT_PURCHASABILITY_ENFORCE is ON: a checkout tier does NOT authorise a "
             "purchase. Every merchant without a fresh positive purchasability fact from the "
             "buyer vantage is browse_only — query GET /ops/merchant-purchasability per merchant."
             if gate_on else
-            "MERCHANT_PURCHASABILITY_ENABLED is off: nothing downgrades a tier, and a "
+            "MERCHANT_PURCHASABILITY_ENFORCE is off: nothing downgrades a tier, and a "
             "checkout-tested route still says nothing about whether that checkout takes a card."
         ),
     )
