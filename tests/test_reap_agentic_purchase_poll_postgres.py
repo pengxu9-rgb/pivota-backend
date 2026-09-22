@@ -68,6 +68,11 @@ _MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "db/migrations"
 _MIGRATIONS = (
     _MIGRATIONS_DIR / "224_reap_agentic_ledger.sql",
     _MIGRATIONS_DIR / "225_reap_agentic_purchase_hints.sql",
+    # 233 adds consent_version + consented_at to reap_agentic_purchases. The self-heal carries
+    # it, so a migration build without it is not the schema production has — and every purchase this suite opens
+    # would fail on an UndefinedColumn. See
+    # feedback_a_later_migration_that_alters_a_table_breaks_that_tables_own_parity_test.
+    _MIGRATIONS_DIR / "233_reap_agentic_purchase_consent.sql",
 )
 
 # Same convention as the other gates on this rail: this file DROPS its tables, so it must be
@@ -79,6 +84,8 @@ _SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect
 
 RETURN_URL = "https://agent.pivota.cc/reap/return?click=abc123"
 EMAIL = "ada@example.test"
+#: mig 233 — the consent tag every purchase is opened under on this rail.
+CONSENT = "terms-2026-09"
 ADDRESS = {
     "firstName": "Ada",
     "lastName": "Lovelace",
@@ -205,9 +212,31 @@ async def _db():
     await database.execute("DROP TABLE IF EXISTS reap_agentic_purchases")
     await database.execute("DROP TABLE IF EXISTS reap_agentic_enrollments")
     await _apply_migration()
-    yield
-    if not was_connected and database.is_connected:
-        await database.disconnect()
+    try:
+        yield
+    finally:
+        # TEARDOWN, NOT ONLY SETUP. The Postgres gate runs every tests/test_*_postgres.py in ONE
+        # process against ONE database, in alphabetical order, so whatever the LAST test here
+        # leaves behind is what the next FILE starts with. Setup-only cleaning protects this
+        # suite from its predecessor and protects nobody from this suite — which is exactly how
+        # tests/test_agent_commerce_reap_routes_postgres.py broke four tests in
+        # tests/test_backfill_variant_identity_skus_postgres.py on this branch.
+        #
+        # These tables are ones this file DROPS at setup, so the leak it prevents is narrower
+        # than the routes suite's: a later file that READS one without dropping it first. Cheap,
+        # symmetric, and it means "leave it as you found it" is the rule everywhere on this rail
+        # rather than the patch applied to the one file that got caught.
+        #
+        # In a `finally`, so a failing test still cleans up: a failing test is the one most
+        # likely to have left a half-written row, and a cleanup that runs only on success turns
+        # one red test into a cascade in another file.
+        for _table in ('reap_agentic_purchases', 'reap_agentic_enrollments'):
+            try:
+                await database.execute(f"DELETE FROM {_table}")
+            except Exception:  # noqa: BLE001 - a table this run never built is not a leak
+                continue
+        if not was_connected and database.is_connected:
+            await database.disconnect()
 
 
 @pytest.fixture(autouse=True)
@@ -371,6 +400,10 @@ async def _start(**over) -> str:
         quantity=1,
         click_id="click_abc",
         return_url=RETURN_URL,
+        # mig 233: REQUIRED on every lane now, not only cart_link. Passed by the helper so the
+        # suites that are about something else keep testing that something else; the tests that
+        # are about consent override it explicitly.
+        consent_version=CONSENT,
     )
     kwargs.update(over)
     return await svc.start_purchase(**kwargs)

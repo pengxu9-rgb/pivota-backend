@@ -28,6 +28,20 @@ Two smaller gaps closed with them, both named by that same caller: `release_clai
 line; and `get_enrollment_internal` / `get_enrollment_by_reap_id` are plain enrollment READS,
 retiring the workaround of calling `upsert_pending_enrollment` — a write — to get a row back.
 
+── WHAT MIGRATION 233 ADDED ─────────────────────────────────────────────────────────────────
+
+`consent_version` and `consented_at` ON THE PURCHASE ROW: the version of the terms that was in
+force WHEN THIS PURCHASE WAS OPENED. Migration 227 put the same pair on
+`reap_agentic_buyer_refs` and argued a per-purchase copy would be the same string repeated —
+which stopped being the whole story when WP4c taught the hosted-checkout sign-in path to DELETE
+that refs row on a repoint. The refs row now answers "what is this buyer's LATEST consent"; these
+two answer "what was THIS purchase opened under", and nothing deletes them.
+
+Written by `create_purchase` and NEVER AGAIN. They are not in `_TRANSITION_FIELDS`, so no poller
+step can revise them, and the terminal write that NULLs `shipping_address` and `buyer_email`
+leaves them alone: a completed purchase keeps its consent and keeps none of the buyer's PII.
+They ARE in `PUBLIC_PURCHASE_COLUMNS` — see the note on that tuple.
+
 ── WHAT MIGRATION 229 ADDED ─────────────────────────────────────────────────────────────────
 
 `item_source` ('reap_variant' | 'cart_link') and `cart_url`. A cart_link row carries a Shopify
@@ -95,6 +109,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import unicodedata
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -134,6 +149,10 @@ __all__ = [
     "PURCHASE_STATES",
     "TERMINAL_STATES",
     "amount_minor_or_none",
+    # THE ONE consent-tag validator. Exported because routes/ and services/ call THIS function
+    # rather than keeping copies of its rule — see its docstring for the production divergence
+    # that three copies produced.
+    "require_consent_version",
     "public_purchase_view",
     "PUBLIC_PURCHASE_COLUMNS",
     "create_purchase",
@@ -295,6 +314,7 @@ _JSON_COLUMNS = (
 )
 
 _PURCHASE_TS_COLUMNS = (
+    "consented_at",
     "state_entered_at",
     "reap_quote_expires_at",
     "hosted_url_expires_at",
@@ -498,6 +518,146 @@ def _require_country(value: Any) -> Optional[str]:
     return value
 
 
+#: `reap_agentic_purchases.consent_version` is `VARCHAR(32)` (migration 233), the same width as
+#: `reap_agentic_buyer_refs.consent_version` (227) and the same cap
+#: `routes.agent_commerce_reap._CONSENT_VERSION_MAX_CHARS` applies before it binds. Enforced
+#: HERE as well, because a value past the column's width is a driver error on one dialect and a
+#: silent truncation on the other — and A TRUNCATED VERSION TAG NAMES A DIFFERENT VERSION, which
+#: is the one thing this column exists to get right.
+_CONSENT_VERSION_MAX_CHARS = 32
+
+#: The unicode categories that are not printable text. The SAME set
+#: `routes.agent_commerce_reap._UNPRINTABLE` names, and it is defined once here because
+#: `require_consent_version` below is the one function all three layers call.
+_CONSENT_UNPRINTABLE = frozenset({"Cc", "Cf", "Cs", "Co", "Cn"})
+
+
+def require_consent_version(value: Any, *, required: bool = False) -> Optional[str]:
+    """THE ONE CONSENT-TAG VALIDATOR ON THIS RAIL. Returns the stripped tag, or None.
+
+    ── WHY THIS IS EXPORTED, AND WHY IT LIVES IN THE STORAGE LAYER ──────────────────────────
+
+    `routes.agent_commerce_reap` and `services.reap_agentic_purchase` IMPORT THIS FUNCTION and
+    call it. They do not re-implement it, and they do not each keep "the same three checks
+    spelled the same way" — which is what they used to do, and which was WRONG IN PRODUCTION.
+
+    The three copies had drifted. The route and this module tested unicode CATEGORY membership
+    (`{Cc,Cf,Cs,Co,Cn}`); the service used `str.isprintable()`, which is additionally False for
+    every `Zs` except U+0020 and for U+2028/U+2029. So a tag containing a non-breaking space, an
+    ideographic space or a line separator was ACCEPTED by the route, which WROTE it onto the
+    buyer-ref row, and then REFUSED by the service, which raised `consent_required` after the
+    consent had already been recorded. Measured end to end on Postgres: `buyer_refs = 1`,
+    `purchases = 0`. That is precisely the failure three copies existed to prevent, and prose in
+    three files saying they agreed did not make them agree.
+
+    So the rule is not "keep them in step"; it is that THERE IS ONLY ONE OF THEM. It lives here
+    because this module is the SINK — the value ends in a column of this module's table — and
+    because the ledger imports nothing route-side, so both callers can reach it without a cycle.
+    `tests/test_reap_agentic_ledger.py` asserts BY IDENTITY that the route's and the service's
+    names ARE this function object, which is what makes a re-implementation impossible rather
+    than merely discouraged.
+
+    ── WHAT IS CHECKED ──────────────────────────────────────────────────────────────────────
+
+    A string, non-empty after `.strip()`, at most `_CONSENT_VERSION_MAX_CHARS`, and carrying no
+    character in `_CONSENT_UNPRINTABLE`. In that order, so the message names the real problem.
+
+    NOT MATCHED AGAINST AN ALLOWLIST, and there must never be one: the wording is the owner's, it
+    changes without a deploy, and a backend that refused an unrecognised tag would reject the
+    NEWEST consent — the strongest one — the moment the door shipped it and before we had.
+
+    ── `required` ───────────────────────────────────────────────────────────────────────────
+
+    `required=False` (the default, and what `create_purchase` passes): `None` means "no consent
+    on this row" and comes back as None. The column is nullable because rows opened before
+    migration 233 exist, and a storage layer is the wrong place for the rail's policy.
+
+    `required=True` (what the route and the service pass): `None` is refused like a blank. That
+    is the rail's actual policy — every purchase opened from today on carries a consent — and it
+    belongs at the two doors rather than in the column.
+
+    A BLANK STRING IS NEVER None, under either flag. `""` and `"   "` are a caller that meant to
+    send a tag and sent nothing; storing them as NULL would make them indistinguishable from a
+    pre-233 row, which is the one distinction this column exists for.
+
+    ── WHAT IT RAISES ───────────────────────────────────────────────────────────────────────
+
+    `ValueError`, always, with a message that names the FIELD and the RULE and never the value —
+    an unprintable character in an error message is an unprintable character in a log line. Each
+    caller maps it to its own vocabulary: the route and the service to
+    `PurchaseRefused("consent_required")`, `create_purchase` by letting it out as the ValueError
+    its other validators raise. One rule, three exception vocabularies, no second opinion about
+    what a tag may contain.
+    """
+    if value is None:
+        if required:
+            raise ValueError("consent_version is required")
+        return None
+    if not isinstance(value, str):
+        # A non-string never reaches this from the route — pydantic types the field and refuses
+        # one as a malformed body — but it does reach it from a direct call, and `str(123)`
+        # would have stored "123" as a consent somebody gave.
+        raise ValueError(
+            f"consent_version must be a string or None (got {type(value).__name__})"
+        )
+    text = value.strip()
+    if not text:
+        raise ValueError(
+            "consent_version must not be blank — pass None for a row with no recorded consent, "
+            "which is not the same thing"
+        )
+    if len(text) > _CONSENT_VERSION_MAX_CHARS:
+        raise ValueError(
+            f"consent_version must be at most {_CONSENT_VERSION_MAX_CHARS} characters (got "
+            f"{len(text)}); a truncated version tag names a different version"
+        )
+    if any(unicodedata.category(ch) in _CONSENT_UNPRINTABLE for ch in text):
+        # THE VALUE IS NOT NAMED. A NUL here would otherwise reach an asyncpg bind as an
+        # untranslatable-character error naming a parameter index, and be stored happily by
+        # SQLite — two wrong answers for one bad input.
+        raise ValueError("consent_version contains characters that are not printable")
+    return text
+
+
+def _require_consented_at(value: Any, *, consent_version: Optional[str]) -> Optional[datetime]:
+    """When the consent named by `consent_version` was in force for THIS purchase.
+
+    DEFAULTED, NOT REQUIRED. A caller that passes a version and no timestamp gets `now()` — the
+    moment the purchase is opened, which is when the tag was in force by construction. The two
+    always travel together: a timestamp with no version would be a moment attached to nothing,
+    and it is refused.
+
+    CLIENT-SIDE `now()`, WHICH IS A DEPARTURE FROM PROPERTY 4 IN THE HEADER AND IS DELIBERATE.
+    Every CUTOFF in this module is computed server-side because a clock that disagrees with the
+    database turns a comparison into a wrong answer. This value is never compared to a server
+    clock — nothing sweeps on it, nothing polls on it — so what matters instead is that it can be
+    made to match the `consented_at` the route writes on the buyer-ref row in the same request.
+    `_bind_dt` makes it timezone-aware UTC on both engines, so the naive-datetime trap that
+    property 4 is really about cannot be reached from here.
+    """
+    if value is None:
+        return datetime.now(timezone.utc) if consent_version else None
+    if not isinstance(value, datetime):
+        raise ValueError(
+            f"consented_at must be a datetime or None (got {type(value).__name__} {value!r})"
+        )
+    if consent_version is None:
+        raise ValueError(
+            "consented_at was given without a consent_version — a moment attached to no version "
+            "records nothing"
+        )
+    if value.tzinfo is None:
+        # REFUSED, NOT ASSUMED UTC, unlike `_bind_dt`'s rule for the poller's clocks. Those are
+        # internal values this rail computes; this one is EVIDENCE about a human act, and a
+        # timestamp read eight hours off is evidence of the wrong moment. `_bind_dt` would
+        # silently repair it; the caller is told instead.
+        raise ValueError(
+            "consented_at must be timezone-aware — a naive datetime binds with the client "
+            "process timezone and would record the wrong moment"
+        )
+    return value
+
+
 def _require_error_code(value: Any) -> Optional[str]:
     """Validate a `last_error_code` on its way into the column, or None for "do not write one".
 
@@ -664,6 +824,18 @@ def _is_unique_violation(exc: BaseException) -> bool:
 #       echoed input. They ARE returned by `get_purchase_for_owner(include_private=True)` and by
 #       `get_purchase_internal`, which is the point of the column — this list governs the
 #       REDACTED view, not what the row holds.
+#
+# HERE, AND WHY — consent_version, consented_at (mig 233). THE BUYER'S OWN CONSENT TAG IS THEIRS
+# TO READ. Every other judgement on this list is "is this the owner's business?", and for a
+# record of what the owner themselves accepted the answer is yes in a way it is for nothing else
+# on the row: it names no person, it is not PII (which is why the terminal write leaves it while
+# it NULLs the email and the address), it is not partner evidence, and it is not our plumbing —
+# it is a version tag the owner's own door chose and sent us. An owner asking "what did I agree
+# to when I opened this?" is asking about their own act, and a purchase view that could not
+# answer it would be making the record less legible to the only person entitled to it. That is
+# the argument that beats "keep the allowlist minimal" here and does not beat it for
+# `market_country`: an echoed catalog hint tells the owner nothing they did not send; a consent
+# tag tells them which of several versions was in force, which they may well not know.
 PUBLIC_PURCHASE_COLUMNS = (
     "id",
     "state",
@@ -687,6 +859,8 @@ PUBLIC_PURCHASE_COLUMNS = (
     "reap_order_id",
     "refusal_reason",
     "last_error_code",
+    "consent_version",
+    "consented_at",
     "created_at",
     "updated_at",
     "terminal_at",
@@ -728,7 +902,8 @@ _INSERT_PURCHASE_SQL = """
         merchant_domain, product_key, variant_key, product_name, variant_title,
         brand, category, quantity, currency, our_price_minor, click_id, return_url,
         queries_tried, next_poll_at, shipping_address, buyer_email,
-        accept_variant_labels, also_accept_domains, market_country
+        accept_variant_labels, also_accept_domains, market_country,
+        consent_version, consented_at
     ) VALUES (
         :id, :buyer_ref, :agent_id, :agent_user_ref_hash, :enrollment_id, :state,
         :merchant_domain, :product_key, :variant_key, :product_name, :variant_title,
@@ -737,7 +912,8 @@ _INSERT_PURCHASE_SQL = """
         CAST(:shipping_address AS JSONB),
         :buyer_email,
         CAST(:accept_variant_labels AS JSONB), CAST(:also_accept_domains AS JSONB),
-        :market_country
+        :market_country,
+        :consent_version, :consented_at
     )
     RETURNING *
 """
@@ -748,24 +924,32 @@ _INSERT_PURCHASE_SQL_SQLITE = """
         merchant_domain, product_key, variant_key, product_name, variant_title,
         brand, category, quantity, currency, our_price_minor, click_id, return_url,
         queries_tried, next_poll_at, shipping_address, buyer_email,
-        accept_variant_labels, also_accept_domains, market_country
+        accept_variant_labels, also_accept_domains, market_country,
+        consent_version, consented_at
     ) VALUES (
         :id, :buyer_ref, :agent_id, :agent_user_ref_hash, :enrollment_id, :state,
         :merchant_domain, :product_key, :variant_key, :product_name, :variant_title,
         :brand, :category, :quantity, :currency, :our_price_minor, :click_id, :return_url,
         :queries_tried, COALESCE(:next_poll_at, CURRENT_TIMESTAMP), :shipping_address,
         :buyer_email,
-        :accept_variant_labels, :also_accept_domains, :market_country
+        :accept_variant_labels, :also_accept_domains, :market_country,
+        :consent_version, :consented_at
     )
     RETURNING *
 """
 
-# THE cart_link INSERT IS A SEPARATE STATEMENT, and the reap_variant one above is NOT EDITED.
-# Two reasons. (1) Every caller before mig 229 must behave byte-identically, and the strongest
-# form of that is that its statement is the same text. (2) A database where the mig-229 heal
-# did not land (its try swallowed a failure) still opens reap_variant purchases: only a
-# statement that NAMES the two new columns can fail on their absence, and only the cart_link
-# lane — dark behind its own dial — issues one.
+# THE cart_link INSERT IS A SEPARATE STATEMENT because the two lanes write different columns:
+# a reap_variant row must not name `item_source`/`cart_url` at all, so that a database where the
+# mig-229 heal did not land (its try swallowed a failure) still opens reap_variant purchases —
+# only a statement that NAMES those two can fail on their absence, and only the cart_link lane,
+# dark behind its own dial, issues one.
+#
+# MIG 233 IS IN BOTH STATEMENTS AND THAT PROTECTION DOES NOT EXTEND TO IT, deliberately. The
+# consent columns are on the LIVE lane as much as the dark one, and a database missing them must
+# not quietly open purchases with no consent evidence: naming them here makes a missing mig-233
+# heal an UndefinedColumn on the first purchase — loud, immediate, and before any money moves —
+# rather than a silent NULL that reads as "a row from before 233" forever after. The down
+# migration says the same thing from the other side.
 #
 # `item_source` is BOUND rather than written as the literal 'cart_link' so the PREPARE sweep
 # plans it the way every other column is planned; the ledger has already refused any other value.
@@ -776,6 +960,7 @@ _INSERT_CART_LINK_PURCHASE_SQL = """
         brand, category, quantity, currency, our_price_minor, click_id, return_url,
         queries_tried, next_poll_at, shipping_address, buyer_email,
         accept_variant_labels, also_accept_domains, market_country,
+        consent_version, consented_at,
         item_source, cart_url
     ) VALUES (
         :id, :buyer_ref, :agent_id, :agent_user_ref_hash, :enrollment_id, :state,
@@ -786,6 +971,7 @@ _INSERT_CART_LINK_PURCHASE_SQL = """
         :buyer_email,
         CAST(:accept_variant_labels AS JSONB), CAST(:also_accept_domains AS JSONB),
         :market_country,
+        :consent_version, :consented_at,
         :item_source, :cart_url
     )
     RETURNING *
@@ -798,6 +984,7 @@ _INSERT_CART_LINK_PURCHASE_SQL_SQLITE = """
         brand, category, quantity, currency, our_price_minor, click_id, return_url,
         queries_tried, next_poll_at, shipping_address, buyer_email,
         accept_variant_labels, also_accept_domains, market_country,
+        consent_version, consented_at,
         item_source, cart_url
     ) VALUES (
         :id, :buyer_ref, :agent_id, :agent_user_ref_hash, :enrollment_id, :state,
@@ -806,6 +993,7 @@ _INSERT_CART_LINK_PURCHASE_SQL_SQLITE = """
         :queries_tried, COALESCE(:next_poll_at, CURRENT_TIMESTAMP), :shipping_address,
         :buyer_email,
         :accept_variant_labels, :also_accept_domains, :market_country,
+        :consent_version, :consented_at,
         :item_source, :cart_url
     )
     RETURNING *
@@ -862,6 +1050,8 @@ async def create_purchase(
     accept_variant_labels: Any = None,
     also_accept_domains: Any = None,
     market_country: Optional[str] = None,
+    consent_version: Optional[str] = None,
+    consented_at: Optional[datetime] = None,
     item_source: str = "reap_variant",
     cart_url: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -912,6 +1102,28 @@ async def create_purchase(
     and `market_country` (see `_require_item_source`) — before the INSERT, so a refused URL
     leaves no row, and a `checkout[...]` URL carrying buyer PII can never be stored. Both
     columns are create-only: neither is in `_TRANSITION_FIELDS`.
+
+    ── THE CONSENT (mig 233) ────────────────────────────────────────────────────────────────
+
+    `consent_version` is the version tag of the terms that was in force WHEN THIS PURCHASE WAS
+    OPENED, and `consented_at` is when. Both are CREATE-ONLY in the strongest sense available
+    here: they are not in `_TRANSITION_FIELDS`, so no poller step can revise them, and the
+    transition statement that NULLs `shipping_address` and `buyer_email` on a terminal state does
+    not name them, so a completed purchase keeps its consent and keeps none of the PII.
+
+    NOT ENFORCED HERE, AND THAT IS NOT AN OVERSIGHT. `None` is accepted, because the column is
+    nullable for the rows this rail opened before migration 233 and because a storage layer is
+    the wrong place for the rail's policy. The requirement lives one layer up:
+    `services.reap_agentic_purchase.start_purchase` refuses `consent_required` on BOTH lanes,
+    before the INSERT, so nothing opened from today on arrives here without one. What IS enforced
+    here is the SHAPE — through `require_consent_version`, which is THE SAME FUNCTION OBJECT the
+    route and the service call. Not "the same rule spelled the same way": the same function, so
+    this call cannot refuse a tag the route already wrote onto the buyer-ref row in the same
+    request. Its docstring records the production divergence that three copies produced.
+
+    `consented_at` DEFAULTS TO `now()` WHEN A VERSION IS GIVEN, and is refused without one. The
+    default is what makes the pair agree with the refs row the route writes in the same request,
+    to within the milliseconds between the two statements.
     """
     if state != "resolving":
         raise ValueError(
@@ -948,6 +1160,11 @@ async def create_purchase(
         domains=True,
     )
     country = _require_country(market_country)
+    # BEFORE THE INSERT, same rule as the hints above: a malformed consent tag must leave NO ROW.
+    # A purchase written and then refused for its consent would be a 'resolving' row holding the
+    # buyer's address and email with no consent evidence and nothing scheduled to terminate it.
+    consent = require_consent_version(consent_version)
+    consented = _require_consented_at(consented_at, consent_version=consent)
     stored_cart_url = _require_item_source(
         item_source,
         cart_url,
@@ -982,6 +1199,8 @@ async def create_purchase(
         "accept_variant_labels": _bind_json(labels),
         "also_accept_domains": _bind_json(domains),
         "market_country": country,
+        "consent_version": consent,
+        "consented_at": _bind_dt(consented),
     }
     # THE BRANCH IS AT THE CALL SITE, not `sql = A if IS_POSTGRES else B` one line up. Both
     # forms read the same; only this one is visible to tests/test_repo_sql_prepare_postgres.py,
@@ -2609,11 +2828,19 @@ async def retire_buyer_refs_for_buyer(buyer_id: str, *, reason: str) -> RetireRe
     transact again. The real account's next purchase mints a fresh ref and records a fresh
     consent through `_reap_buyer_ref`, so the live buyer is never left without one.
 
-    WHAT THAT COSTS, STATED PLAINLY: `reap_agentic_purchases` has no consent column, so after
-    this runs the `consent_version` the RETIRED identity accepted is not retained anywhere. The
-    purchases themselves survive untouched — they are owned by `(agent_id, agent_user_ref_hash)`
-    on the purchase row, which the repoint does not change, so purchase history stays readable
-    by the agent that made it.
+    WHAT THIS DOES NOT COST, SINCE MIGRATION 233: the consent evidence. Every purchase carries
+    its own `consent_version` / `consented_at` — the tag that was in force when THAT purchase was
+    opened — and this function does not touch `reap_agentic_purchases` at all. The refs row's
+    pair is only the LATEST consent, kept for re-use on the next purchase and for
+    `services.reap_agentic_purchase._require_cart_link_consent` to check a minted identity
+    against; deleting it retires a current-state record, not the evidence.
+
+    (Until 233 it WAS the cost, and this docstring, docs/runbooks/reap_agentic_purchase.md and
+    docs/reap_agentic_routes.md all said so. That is what 233 exists to fix.)
+
+    The purchases themselves survive untouched in every other respect too — they are owned by
+    `(agent_id, agent_user_ref_hash)` on the purchase row, which the repoint does not change, so
+    purchase history stays readable by the agent that made it.
 
     ── ARGUMENTS ───────────────────────────────────────────────────────────────────────────
 

@@ -281,6 +281,8 @@ one that does not exist, so this endpoint cannot be used to probe for ids.
   "reap_quote_expires_at": null,
   "refusal_reason": null,
   "last_error_code": null,
+  "consent_version": "reap-agentic-v1",
+  "consented_at": "2026-09-18T07:15:49.926588+00:00",
   "created_at": "2026-09-18T07:15:49.926588+00:00",
   "updated_at": "2026-09-18T07:15:49.959009+00:00",
   "terminal_at": null,
@@ -315,6 +317,8 @@ one that does not exist, so this endpoint cannot be used to probe for ids.
   "reap_quote_expires_at": "2026-09-18T07:20:49.964987+00:00",
   "refusal_reason": null,
   "last_error_code": null,
+  "consent_version": "reap-agentic-v1",
+  "consented_at": "2026-09-18T07:15:49.926588+00:00",
   "created_at": "2026-09-18T07:15:49.926588+00:00",
   "updated_at": "2026-09-18T07:15:49.965465+00:00",
   "terminal_at": null,
@@ -350,6 +354,8 @@ one that does not exist, so this endpoint cannot be used to probe for ids.
   "reap_quote_expires_at": "2026-09-18T07:20:49.964987+00:00",
   "refusal_reason": null,
   "last_error_code": null,
+  "consent_version": "reap-agentic-v1",
+  "consented_at": "2026-09-18T07:15:49.926588+00:00",
   "created_at": "2026-09-18T07:15:49.926588+00:00",
   "updated_at": "2026-09-18T07:15:49.970321+00:00",
   "terminal_at": "2026-09-18T07:15:49.970321+00:00",
@@ -383,6 +389,10 @@ one that does not exist, so this endpoint cannot be used to probe for ids.
   state (`completed`, `failed`, `refused`, `expired`).
 * **`refusal_reason`** (on `refused`) is our vocabulary, sometimes carrying the resolver's own
   reason verbatim (e.g. `options:sole_label_differs:size`). Diagnostic, not an enum to branch on.
+* **`consent_version` / `consented_at`** (migration **233**) are the tag your door sent as
+  `buyer.consent_version` on the `POST` that opened *this* purchase, and when. Never rewritten —
+  a later purchase under a newer tag does not move them, and a terminal state does not clear
+  them. `null` only on purchases opened before 233.
 * **What is never here:** the buyer's email or address; `buyer_ref`, `agent_id`,
   `agent_user_ref_hash`; `reap_product_id`, `reap_variant_id`, `reap_quote_id`,
   `reap_checkout_id`; `enrollment_id`, `click_id`, `return_url`; any Reap media or image URL.
@@ -420,6 +430,8 @@ not a number — is **400 `invalid_request`**, not a silent clamp, because a cal
       "reap_quote_expires_at": "2026-09-18T07:20:49.964987+00:00",
       "refusal_reason": null,
       "last_error_code": null,
+      "consent_version": "reap-agentic-v1",
+      "consented_at": "2026-09-18T07:15:49.926588+00:00",
       "created_at": "2026-09-18T07:15:49.926588+00:00",
       "updated_at": "2026-09-18T07:15:49.970321+00:00",
       "terminal_at": "2026-09-18T07:15:49.970321+00:00",
@@ -498,13 +510,17 @@ reason="buyer_link_repointed")`:
 |---|---|
 | the old `reap_agentic_enrollments` row(s) | every non-dead one is marked `status = 'dead'` with `reap_status = 'buyer_link_repointed'`, and its `hosted_url` is cleared — so the live card-entry page stops being a live card-entry page |
 | the old `reap_agentic_buyer_refs` row | **deleted.** A consent tag on a buyer id that no link names is a record nobody can find, and leaving it holds a `reap_buyer_ref` under `uq_reap_agentic_buyer_refs_ref` for an identity that will never transact again. The live account records a fresh consent on its own row at its next purchase |
-| the buyer's **purchases** | untouched. A purchase is owned by `(agent_id, agent_user_ref_hash)` on its own row, which the repoint does not change, so history stays readable by the agent that made it |
+| the buyer's **purchases** | untouched, **including their consent evidence.** A purchase is owned by `(agent_id, agent_user_ref_hash)` on its own row, which the repoint does not change, so history stays readable by the agent that made it — and since migration **233** each row carries the `consent_version` / `consented_at` that was in force when *that* purchase was opened |
 | the enrollment **at Reap** | still ours to revoke separately. `services.reap_agentic_client.revoke_enrollment` is the call (`POST /agentic/enrollments/{id}/revoke`, in the pinned spec) and it is **not** made from the checkout path — a partner POST there can take up to 25 s with a human waiting. See the runbook |
 
-**What the delete costs, stated rather than buried:** `reap_agentic_purchases` has no consent
-column, so the `consent_version` the *retired* identity accepted is not retained anywhere after the
-sweep. The identity being retired is one nothing can reach; the account the buyer actually uses
-always has a current consent row.
+**What the delete does not cost, since migration 233:** the consent evidence. It used to — this
+page said so, in these words: "`reap_agentic_purchases` has no consent column, so the
+`consent_version` the *retired* identity accepted is not retained anywhere after the sweep."
+Migration 233 gave the purchase row its own `consent_version` / `consented_at`, immutable after the
+`INSERT`, which the sweep does not touch. **The refs row's tag is only the LATEST consent**, kept
+so the next purchase can re-use it and so the cart-link lane can check a minted identity against
+it; the per-purchase copy is the evidence. The identity being retired is one nothing can reach;
+the account the buyer actually uses always has a current consent row.
 
 **Two cases the hook deliberately does not fire on.** A repoint away from a buyer who **still has
 other links** (a real account linked through several agents, losing one of them) is left alone and
@@ -537,9 +553,20 @@ request that uses it.
   the backend records is *which* wording was shown. ≤ 32 printable characters.
 * **We do not adjudicate it.** There is no allowlist of known versions — a backend that refused
   an unrecognised tag would reject the newest consent the moment the door shipped it.
-* **Latest wins.** It is rewritten on **every** `POST` that succeeds, alongside a `consented_at`
-  timestamp — **including an idempotent replay**. Send a newer tag with a retried
-  `idempotency_key` and the stored tag moves, even though the response is the original purchase.
+* **Latest wins *on the buyer row*.** `reap_agentic_buyer_refs.consent_version` is rewritten on
+  **every** `POST` that succeeds, alongside a `consented_at` timestamp — **including an idempotent
+  replay**. Send a newer tag with a retried `idempotency_key` and the stored tag moves, even
+  though the response is the original purchase.
+* **The purchase row keeps the tag it was opened under, for ever.** Migration **233** stores the
+  same validated string on `reap_agentic_purchases` in the same request, and nothing rewrites it:
+  it is absent from the transition statement, so no poller step can revise it, and the terminal
+  write that `NULL`s the buyer's email and shipping address leaves it alone. A completed purchase
+  keeps its consent and none of the buyer's PII. It comes back on `GET /purchases/{id}` and on the
+  list, as `consent_version` and `consented_at` — a buyer's own consent tag is theirs to read. It
+  is `null` only on rows opened before 233.
+* **So an idempotent replay with a NEW tag leaves the two disagreeing, and that is correct.** The
+  buyer row moves to the new version; the replayed purchase still names the version it was
+  actually opened under, because that is what it is evidence of.
 * **It is deliberately NOT part of the idempotency request hash.** That hash covers what *decides
   the purchase* — merchant, product, variant, quantity, buyer email, shipping address, return
   url. Consent is not one of those: folding it in would turn a door that upgraded its consent

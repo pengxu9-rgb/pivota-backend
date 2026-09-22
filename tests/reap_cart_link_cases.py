@@ -60,6 +60,11 @@ MIGRATIONS = (
     MIGRATIONS_DIR / "229_reap_agentic_purchase_item_source.sql",
     # 230: the per-click attribution claim.
     MIGRATIONS_DIR / "230_conversion_click_claims.sql",
+    # 233 adds consent_version + consented_at to reap_agentic_purchases. The self-heal carries
+    # it, so a migration build without it is not the schema production has — and every cart-link purchase these
+    # cases open would fail on an UndefinedColumn. See
+    # feedback_a_later_migration_that_alters_a_table_breaks_that_tables_own_parity_test.
+    MIGRATIONS_DIR / "233_reap_agentic_purchase_consent.sql",
 )
 SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")
 
@@ -204,9 +209,31 @@ async def cartlink_db():
         await apply_migrations()
     else:
         await ensure_required_schema_light()
-    yield
-    if IS_POSTGRES and not was_connected and database.is_connected:
-        await database.disconnect()
+    try:
+        yield
+    finally:
+        # TEARDOWN, NOT ONLY SETUP. The Postgres gate runs every tests/test_*_postgres.py in ONE
+        # process against ONE database, in alphabetical order, so whatever the LAST test here
+        # leaves behind is what the next FILE starts with. Setup-only cleaning protects this
+        # suite from its predecessor and protects nobody from this suite — which is exactly how
+        # tests/test_agent_commerce_reap_routes_postgres.py broke four tests in
+        # tests/test_backfill_variant_identity_skus_postgres.py on this branch.
+        #
+        # These tables are ones this file DROPS at setup, so the leak it prevents is narrower
+        # than the routes suite's: a later file that READS one without dropping it first. Cheap,
+        # symmetric, and it means "leave it as you found it" is the rule everywhere on this rail
+        # rather than the patch applied to the one file that got caught.
+        #
+        # In a `finally`, so a failing test still cleans up: a failing test is the one most
+        # likely to have left a half-written row, and a cleanup that runs only on success turns
+        # one red test into a cascade in another file.
+        for _table in ('conversion_click_claims', 'reap_agentic_buyer_refs', 'reap_agentic_purchases', 'reap_agentic_enrollments'):
+            try:
+                await database.execute(f"DELETE FROM {_table}")
+            except Exception:  # noqa: BLE001 - a table this run never built is not a leak
+                continue
+        if IS_POSTGRES and not was_connected and database.is_connected:
+            await database.disconnect()
 
 
 @pytest.fixture(autouse=True)
@@ -2553,14 +2580,35 @@ async def test_a_minted_consented_identity_opens_the_purchase():
 
 
 async def test_the_variant_lane_is_unchanged_at_the_service():
-    """CONTROL. On the variant lane #2219's requirements are the ROUTE's and stay there; the
-    service opens a row purchase with no consent argument exactly as before."""
-    purchase_id = await start(
-        _mint=False, cart_link=None, consent_version=None, click_id="click_abc",
-        row=svc.PurchaseRow(
-            merchant_domain="brand.example", product_key="pk_1", variant_key="vk_1",
-            product_name="Standard Eau de Parfum", variant_title="Standard", brand="Brand",
-            category="fragrance", our_price_minor=4250, currency="USD", market_country="US",
-        ),
+    """CONTROL, REWRITTEN BY MIGRATION 233. It used to assert that the variant lane opens a row
+    purchase with `consent_version=None` "exactly as before", because #2219 left the consent
+    requirement on the ROUTE for that lane and only the cart-link lane re-checked it here.
+
+    233 moved the evidence onto the purchase row, so a purchase with no consent is now a row
+    nothing can explain on EITHER lane, and `start_purchase` refuses it on both. What this
+    control still says — and it is the part that was ever about the cart-link lane — is that the
+    variant lane's ITEM SOURCE is untouched: no cart_url, no minted buyer ref required, and
+    `item_source = 'reap_variant'`."""
+    row = svc.PurchaseRow(
+        merchant_domain="brand.example", product_key="pk_1", variant_key="vk_1",
+        product_name="Standard Eau de Parfum", variant_title="Standard", brand="Brand",
+        category="fragrance", our_price_minor=4250, currency="USD", market_country="US",
     )
-    assert (await get(purchase_id))["item_source"] == "reap_variant"
+    purchase_id = await start(
+        _mint=False, cart_link=None, consent_version=CONSENT, click_id="click_abc", row=row,
+    )
+    stored = await get(purchase_id)
+    assert stored["item_source"] == "reap_variant"
+    assert stored["cart_url"] is None
+    # NO MINTED BUYER REF (`_mint=False`): the identity half of the cart-link check is still that
+    # lane's alone, and widening it would have made this call fail for a different reason.
+    assert stored["consent_version"] == CONSENT
+
+    # And the lane now refuses without one, before any row exists.
+    before = await count()
+    with pytest.raises(svc.PurchaseRefused) as excinfo:
+        await start(
+            _mint=False, cart_link=None, consent_version=None, click_id="click_def", row=row,
+        )
+    assert excinfo.value.reason == "consent_required"
+    assert await count() == before

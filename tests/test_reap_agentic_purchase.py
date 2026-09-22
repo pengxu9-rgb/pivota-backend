@@ -59,6 +59,8 @@ pytestmark = pytest.mark.skipif(
 
 RETURN_URL = "https://agent.pivota.cc/reap/return?click=abc123"
 EMAIL = "ada@example.test"
+#: mig 233 — the consent tag every purchase is opened under on this rail.
+CONSENT = "terms-2026-09"
 ADDRESS = {
     "firstName": "Ada",
     "lastName": "Lovelace",
@@ -355,6 +357,10 @@ async def _start(**over) -> str:
         quantity=1,
         click_id="click_abc",
         return_url=RETURN_URL,
+        # mig 233: REQUIRED on every lane now, not only cart_link. Passed by the helper so the
+        # suites that are about something else keep testing that something else; the tests that
+        # are about consent override it explicitly.
+        consent_version=CONSENT,
     )
     kwargs.update(over)
     return await svc.start_purchase(**kwargs)
@@ -2858,3 +2864,77 @@ def test_absent_or_empty_shipping_options_are_allowed_on_the_variant_lane():
                             row, variant_id="var_abc123").ok
     assert svc.verify_quote(dict(LIVE_QUOTE, shippingOptions=[]), row,
                             variant_id="var_abc123").ok
+
+
+# ── mig 233: consent is required on EVERY lane, and lands on the row ─────────────────────────
+#
+# It used to be the cart-link lane's alone (#2219), checked here for direct callers while the
+# variant lane relied on the route having checked it. Migration 233 put the evidence on the
+# purchase row, so a purchase opened with no consent is now a row nothing can explain, whichever
+# lane opened it.
+
+
+async def test_a_purchase_opened_through_this_service_carries_its_consent():
+    purchase_id = await _start()
+    row = await ledger.get_purchase_internal(purchase_id)
+    assert row["consent_version"] == CONSENT
+    assert row["consented_at"] is not None
+
+
+async def test_the_variant_lane_refuses_without_a_consent_and_writes_nothing():
+    """BEFORE THE INSERT — the contract `test_every_refusal_leaves_the_table_empty` states for
+    every other refusal on this path, now including this one. A row written and then refused
+    would carry the buyer's address into a state no transition ever nulls."""
+    before = await _count()
+    with pytest.raises(svc.PurchaseRefused) as caught:
+        await _start(consent_version=None)
+    assert caught.value.reason == "consent_required"
+    assert await _count() == before
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["", "   ", "v" * 33, "v1\x00", "v1\x1b[31m"],
+)
+async def test_a_malformed_consent_is_refused_on_the_variant_lane_too(value):
+    """The SAME three checks the route applies, so a direct caller cannot store a tag the route
+    would have refused. `consent_required`, not `invalid_request`: a string-shaped value that is
+    not usable is a missing act by a human, which is what the route's vocabulary says too."""
+    before = await _count()
+    with pytest.raises(svc.PurchaseRefused) as caught:
+        await _start(consent_version=value)
+    assert caught.value.reason == "consent_required"
+    assert await _count() == before
+
+
+async def test_the_consent_is_refused_before_the_item_is_looked_at():
+    """ORDER. A caller that has not consented must not be able to learn, from the SHAPE of the
+    refusal, whether its row would otherwise have been accepted — so the consent check sits
+    ahead of every check on the row. A row that is ALSO malformed still answers
+    `consent_required`, which is what proves the order rather than asserting it in prose."""
+    with pytest.raises(svc.PurchaseRefused) as caught:
+        await _start(consent_version=None, row=_row(currency="not-a-currency"))
+    assert caught.value.reason == "consent_required"
+
+
+async def test_the_consent_is_refused_after_the_dial_so_a_dark_rail_stays_dark(monkeypatch):
+    """THE OTHER HALF OF THE ORDER, and the one with a security consequence. The dials run first:
+    a `consent_required` from a rail that is switched off would be a working probe for a feature
+    that is supposed to be absent."""
+    monkeypatch.delenv("REAP_AGENTIC_ENABLED", raising=False)
+    with pytest.raises(svc.PurchaseRefused) as caught:
+        await _start(consent_version=None)
+    assert caught.value.reason == "rail_disabled"
+
+
+async def test_the_consent_survives_the_purchase_reaching_a_terminal_state():
+    """END TO END through the service, not only through the ledger's own statement: whatever the
+    poller does to this row, the consent is still on it when the row is terminal and the buyer's
+    email and address are gone."""
+    purchase_id = await _start()
+    await ledger.transition(purchase_id, from_states=["resolving"], to_state="refused")
+
+    row = await ledger.get_purchase_internal(purchase_id)
+    assert row["state"] == "refused"
+    assert row["buyer_email"] is None and row["shipping_address"] is None
+    assert row["consent_version"] == CONSENT

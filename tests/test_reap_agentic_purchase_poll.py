@@ -51,6 +51,7 @@ import jobs.reap_agentic_purchase_poll as job  # noqa: E402
 from test_reap_agentic_purchase import (  # noqa: E402
     ADDRESS,
     CHECKOUT_COMPLETED,
+    CONSENT,
     CHECKOUT_CREATED,
     EMAIL,
     ENROLLMENT_ACTIVE,
@@ -203,6 +204,10 @@ async def _start(**over) -> str:
         quantity=1,
         click_id="click_abc",
         return_url=RETURN_URL,
+        # mig 233: REQUIRED on every lane now, not only cart_link. Passed by the helper so the
+        # suites that are about something else keep testing that something else; the tests that
+        # are about consent override it explicitly.
+        consent_version=CONSENT,
     )
     kwargs.update(over)
     return await svc.start_purchase(**kwargs)

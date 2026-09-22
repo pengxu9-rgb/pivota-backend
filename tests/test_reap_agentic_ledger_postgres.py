@@ -74,6 +74,11 @@ _MIGRATIONS = (
     # 230 builds the click-claims table. The self-heal builds it too, so the migration list
     # applies it for parity with what the self-heal leaves behind.
     _MIGRATIONS_DIR / "230_conversion_click_claims.sql",
+    # 233 adds consent_version + consented_at to reap_agentic_purchases. The self-heal carries
+    # it, so a migration build without it is not the schema production has — and this file's
+    # whole-table parity test would fail for a change that is correct. See
+    # feedback_a_later_migration_that_alters_a_table_breaks_that_tables_own_parity_test.
+    _MIGRATIONS_DIR / "233_reap_agentic_purchase_consent.sql",
 )
 _MIGRATION = _MIGRATIONS[0]
 
@@ -146,9 +151,31 @@ async def _db():
     # and leave this gate testing a schema the repo no longer declares.
     await _drop_tables()
     await _apply_migration()
-    yield
-    if not was_connected and database.is_connected:
-        await database.disconnect()
+    try:
+        yield
+    finally:
+        # TEARDOWN, NOT ONLY SETUP. The Postgres gate runs every tests/test_*_postgres.py in ONE
+        # process against ONE database, in alphabetical order, so whatever the LAST test here
+        # leaves behind is what the next FILE starts with. Setup-only cleaning protects this
+        # suite from its predecessor and protects nobody from this suite — which is exactly how
+        # tests/test_agent_commerce_reap_routes_postgres.py broke four tests in
+        # tests/test_backfill_variant_identity_skus_postgres.py on this branch.
+        #
+        # These tables are ones this file DROPS at setup, so the leak it prevents is narrower
+        # than the routes suite's: a later file that READS one without dropping it first. Cheap,
+        # symmetric, and it means "leave it as you found it" is the rule everywhere on this rail
+        # rather than the patch applied to the one file that got caught.
+        #
+        # In a `finally`, so a failing test still cleans up: a failing test is the one most
+        # likely to have left a half-written row, and a cleanup that runs only on success turns
+        # one red test into a cascade in another file.
+        for _table in ('reap_agentic_purchases', 'reap_agentic_enrollments'):
+            try:
+                await database.execute(f"DELETE FROM {_table}")
+            except Exception:  # noqa: BLE001 - a table this run never built is not a leak
+                continue
+        if not was_connected and database.is_connected:
+            await database.disconnect()
 
 
 # ── plumbing for the second-connection tests ─────────────────────────────────────────────────
@@ -643,6 +670,9 @@ _EXPECTED_PUBLIC_COLUMNS = {
     "quoted_total_minor", "final_total_minor", "shipping_minor", "tax_minor", "hosted_url",
     "hosted_url_expires_at", "reap_quote_expires_at", "reap_order_id", "refusal_reason",
     "last_error_code", "created_at", "updated_at", "terminal_at",
+    # mig 233 — the buyer's own consent tag, public for the reason the SQLite twin of this list
+    # states. Written here too, deliberately: the partition test forces the choice.
+    "consent_version", "consented_at",
 }
 
 
@@ -2788,8 +2818,15 @@ async def test_the_self_heal_adds_the_hint_columns_to_a_224_shaped_database():
     await ensure_required_schema_light()
 
     after = await _purchase_columns()
-    # A 224-shaped database is also pre-229, so the same heal lands mig 229's two columns.
-    assert after - before == set(_HINT_COLUMNS) | {"item_source", "cart_url"}, (
+    # A 224-shaped database is also pre-229 and pre-233, so the same heal lands those
+    # migrations' columns in the same run. Named, not loosened to `<=`: "nothing else" is still
+    # the assertion.
+    assert after - before == set(_HINT_COLUMNS) | {
+        "item_source",
+        "cart_url",
+        "consent_version",
+        "consented_at",
+    }, (
         f"the heal on a 224-shaped database added {sorted(after - before)}"
     )
     purchase = await _mk(accept_variant_labels=["Nude Glow"], market_country="US")
@@ -3160,3 +3197,417 @@ async def test_the_terminal_clear_survives_planning_on_postgres():
             await conn.prepare(positional)
     finally:
         await conn.close()
+
+
+# ── migration 233 on the production dialect ─────────────────────────────────────────────────
+
+_CONSENT_TAG = "terms-2026-09"
+
+
+async def test_the_consent_columns_are_the_shape_the_migration_declares():
+    """`VARCHAR(32)` and `timestamptz`, read out of the CATALOG rather than off the source text.
+
+    The width matters on THIS dialect specifically: a `VARCHAR(32)` refuses an over-long value
+    where SQLite would store it whole, so "the ledger caps it before the bind" and "the column
+    caps it" are two different guarantees and only one of them is visible here.
+    """
+    from db.database import database
+
+    rows = await database.fetch_all(
+        """
+        SELECT column_name, data_type, is_nullable, character_maximum_length
+          FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'reap_agentic_purchases'
+           AND column_name IN ('consent_version', 'consented_at')
+         ORDER BY column_name
+        """
+    )
+    got = {r["column_name"]: dict(r) for r in rows}
+    assert set(got) == {"consent_version", "consented_at"}, (
+        "migration 233 did not build both columns"
+    )
+    assert got["consent_version"]["data_type"] == "character varying"
+    assert got["consent_version"]["character_maximum_length"] == 32
+    assert got["consented_at"]["data_type"] == "timestamp with time zone"
+    # NULLABLE ON PURPOSE: rows opened before 233 exist and a NOT NULL would need a backfilled
+    # value, which would mean inventing a consent nobody gave.
+    assert got["consent_version"]["is_nullable"] == "YES"
+    assert got["consented_at"]["is_nullable"] == "YES"
+
+
+async def test_a_consent_round_trips_as_an_aware_timestamptz():
+    """asyncpg hands a `timestamptz` back as an aware datetime; the SQLite arm gets a string that
+    `_normalize_row` parses. Only this arm can prove the column is genuinely a `timestamptz`
+    rather than a text column that happens to look like one."""
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _mk(consent_version=_CONSENT_TAG)
+    assert purchase["consent_version"] == _CONSENT_TAG
+    assert isinstance(purchase["consented_at"], datetime)
+    assert purchase["consented_at"].tzinfo is not None
+
+    read = await ledger.get_purchase_internal(purchase["id"])
+    assert read["consented_at"] == purchase["consented_at"]
+
+
+async def test_an_over_long_consent_is_refused_before_the_bind_not_truncated():
+    """THE DIALECT'S OWN FAILURE MODE. Past the column's width, Postgres raises a
+    StringDataRightTruncation naming a parameter index — not a field — and SQLite stores the
+    whole thing. The ledger refuses first, so both dialects give the same answer, and the answer
+    names `consent_version`."""
+    from db.database import database
+
+    before = await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases")
+    with pytest.raises(ValueError, match="consent_version"):
+        await _mk(consent_version="v" * 33)
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == before
+
+
+async def test_a_nul_in_a_consent_is_a_valueerror_and_not_an_asyncpg_error():
+    """A NUL byte reaching an asyncpg bind is an untranslatable-character error that names a
+    parameter index and is a 500 for the caller. SQLite stores it happily. Only this arm can see
+    the difference, which is why the check is in the ledger and the test is here."""
+    with pytest.raises(ValueError, match="printable"):
+        await _mk(consent_version="v1\x00")
+
+
+@pytest.mark.parametrize("terminal,from_state", sorted(_REACHES_TERMINAL.items()))
+async def test_the_terminal_write_keeps_the_consent_on_postgres(terminal, from_state):
+    """The rail's central promise, on the dialect that actually runs it: the PII goes, the
+    evidence stays. Both halves, for the reason the SQLite twin gives."""
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _mk(state=from_state, consent_version=_CONSENT_TAG)
+    assert purchase["buyer_email"] and purchase["shipping_address"]
+
+    done = await ledger.transition(purchase["id"], from_states=[from_state], to_state=terminal)
+    assert done["buyer_email"] is None and done["shipping_address"] is None
+    assert done["consent_version"] == _CONSENT_TAG
+    assert done["consented_at"] is not None
+
+
+async def test_the_owner_view_carries_the_consent_on_postgres():
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _mk(consent_version=_CONSENT_TAG)
+    view = await ledger.get_purchase_for_owner(purchase["id"], "agent_one", "hash_alice")
+    assert view["consent_version"] == _CONSENT_TAG
+    assert view["consented_at"] is not None
+
+
+async def test_the_self_heal_lands_the_consent_columns_on_postgres():
+    """The heal's own statement, on a table that already exists — which is every production
+    database. The whole-table parity test covers this too; this one names the columns so a
+    failure says what is missing instead of printing a diff of the catalog."""
+    from db.database import database
+    from db.schema_guard import ensure_required_schema_light
+
+    await _drop_tables()
+    await ensure_required_schema_light()
+
+    columns = await _purchase_columns()
+    assert {"consent_version", "consented_at"} <= columns, (
+        "the mig-233 heal did not land in db/schema_guard.py's Postgres branch"
+    )
+    await database.execute(
+        "INSERT INTO reap_agentic_purchases (id, buyer_ref, state, consent_version, consented_at)"
+        " VALUES ('rp_heal', 'bref_h', 'resolving', 'terms-x', now())"
+    )
+    assert await database.fetch_val(
+        "SELECT consent_version FROM reap_agentic_purchases WHERE id = 'rp_heal'"
+    ) == "terms-x"
+
+
+async def test_a_migration_list_without_233_fails_the_parity_for_the_named_reason():
+    """THE CONTROL FOR THE PARITY FIXTURE, and the lesson it encodes.
+
+    `_MIGRATIONS` pins the list this gate applies, and `test_the_self_heal_builds_the_same_schema
+    _as_the_migration` compares that build against the self-heal's. When a later migration ALTERs
+    this table and is self-healed, a fixture that still lists only the earlier ones builds a
+    schema production does not have — and the parity test then fails for a change that is
+    correct, in a file nobody on the new work is running. That is exactly what happened to
+    migration 228's own gate when 232 widened its CHECK (PR #2240).
+
+    So: prove the omission is DETECTED, and detected for the RIGHT REASON. A 229-only build must
+    differ from the self-heal, and the difference must be precisely the two mig-233 columns —
+    not some other drift that would make this control pass while saying nothing.
+    """
+    from db.database import database
+    from db.sql_migrations import split_statements
+    from db.schema_guard import ensure_required_schema_light
+
+    without_233 = tuple(p for p in _MIGRATIONS if "233_" not in p.name)
+    assert len(without_233) == len(_MIGRATIONS) - 1, "233 is not in the fixture's list"
+
+    await _drop_tables()
+    for path in without_233:
+        for statement in split_statements(path.read_text(encoding="utf-8")):
+            await database.execute(statement)
+    stale_columns = await _purchase_columns()
+
+    await _drop_tables()
+    await ensure_required_schema_light()
+    healed_columns = await _purchase_columns()
+
+    assert healed_columns - stale_columns == {"consent_version", "consented_at"}, (
+        "a 229-only migration build differs from the self-heal by something other than the two "
+        f"mig-233 columns: {sorted(healed_columns - stale_columns)}"
+    )
+    assert not (stale_columns - healed_columns), (
+        "the self-heal is missing a column the migrations build"
+    )
+
+
+#: The accepted half of the SQLite arm's `_CONSENT_MATRIX`, re-stated here rather than imported:
+#: the two ledger arms duplicate their fixtures by house convention (importing the SQLite module
+#: would execute its body, including a `pytestmark` that SKIPS on Postgres). Escapes, never raw
+#: characters — an NBSP in this file is invisible in a diff, which is the same property that
+#: makes it worth testing.
+_CONSENT_MATRIX_PG = (
+    ("v1", True),
+    ("Terms/v2 (EU)", True),
+    (chr(0x6761) + chr(0x6B3E) + "-v1", True),
+    ("v1 x", True),
+    ("v1" + chr(0x00A0) + "x", True),               # NBSP - the character the copies disagreed on
+    ("v1" + chr(0x3000) + "x", True),               # IDEOGRAPHIC SPACE - 3 bytes in UTF-8
+    ("v1" + chr(0x2028) + "x", True),               # LINE SEPARATOR
+    ("v1" + chr(0x2029) + "x", True),
+    ("v1" + chr(0x1F642), True),                 # 4 bytes in UTF-8
+    # 32 CHARACTERS, 94 bytes. VARCHAR(32) counts CHARACTERS, so this fits; a column that
+    # counted BYTES would refuse it, and the ledger's len(text) cap agrees with the column.
+    # The bracketing "v"s are load-bearing: U+3000 IS whitespace, so a tag made only of them
+    # strips to "" and is refused as blank - correct, and not what is under test here.
+    ("v" + chr(0x3000) * 30 + "v", True),
+    ("x" * 32, True),
+    # THE REFUSED HALF. It is here so the verdict test below is a real partition rather than a
+    # sweep of things that all pass: a mutant that WIDENS one layer is only visible on an input
+    # the others refuse.
+    ("x" * 33, False),
+    ("", False),
+    ("   ", False),
+    ("v1" + chr(0x0000) + "x", False),         # NUL (Cc) - an asyncpg bind error if it got out
+    ("v1" + chr(0x000A) + "v2", False),        # interior newline
+    ("v1" + chr(0x200B) + "x", False),         # ZERO WIDTH SPACE (Cf)
+    ("v1" + chr(0x202E) + "x", False),         # RTL OVERRIDE (Cf)
+    (123, False),
+    (True, False),
+    (None, False),
+)
+
+
+# ── mig 233, the Postgres arms the SQLite suite cannot stand in for ──────────────────────────
+#
+# THE TWO BULK SWEEPS ARE DIALECT-SPLIT STATEMENTS. `_EXPIRE_OVERDUE_SQL` and
+# `_FAIL_EXHAUSTED_SQL` each have a `…_SQLITE` twin, and they write a terminal state WITHOUT
+# going through `transition` — so "the consent survives a terminal write" has to be asserted
+# against BOTH spellings or a PG-only edit to the Postgres statement ships green. The SQLite
+# mutants for these died in the sweep; these are what kill their Postgres siblings.
+
+
+async def test_the_expire_sweep_keeps_the_consent_on_postgres():
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _mk(state="awaiting_approval", consent_version=_CONSENT_TAG)
+    await _set_clock_column(purchase["id"], "hosted_url_expires_at", _PAST)
+    assert await ledger.expire_overdue_purchases() == [purchase["id"]]
+
+    row = await ledger.get_purchase_internal(purchase["id"])
+    # BOTH HALVES. "the consent survives" alone would pass on a sweep that had stopped scrubbing
+    # anything, which is a worse defect than the one under test.
+    assert row["state"] == "expired"
+    assert row["buyer_email"] is None and row["shipping_address"] is None
+    assert row["consent_version"] == _CONSENT_TAG
+    assert row["consented_at"] is not None
+
+
+async def test_the_fail_exhausted_sweep_keeps_the_consent_on_postgres():
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _mk(state="processing", consent_version=_CONSENT_TAG)
+    await database.execute(
+        "UPDATE reap_agentic_purchases SET attempts = 7 WHERE id = :i", {"i": purchase["id"]}
+    )
+    assert await ledger.fail_exhausted_purchases(5, include_processing=True) == [purchase["id"]]
+
+    row = await ledger.get_purchase_internal(purchase["id"])
+    assert row["state"] == "failed"
+    assert row["buyer_email"] is None and row["shipping_address"] is None
+    assert row["consent_version"] == _CONSENT_TAG
+    assert row["consented_at"] is not None
+
+
+async def test_neither_sweep_statement_names_the_consent_columns():
+    """THE SOURCE-LEVEL READING of the two tests above, over all FOUR statements — the two
+    sweeps times the two dialects. The behavioural tests cover a row that reaches each sweep;
+    this covers the statements themselves, including the SQLite twins that this gate does not
+    execute, so one file's edit cannot pass while the other's fails."""
+    import db.reap_agentic_ledger as ledger
+
+    for name in (
+        "_EXPIRE_OVERDUE_SQL",
+        "_EXPIRE_OVERDUE_SQL_SQLITE",
+        "_FAIL_EXHAUSTED_SQL",
+        "_FAIL_EXHAUSTED_SQL_SQLITE",
+        "_TRANSITION_SQL",
+        "_TRANSITION_SQL_SQLITE",
+    ):
+        sql = getattr(ledger, name)
+        assert "consent_version" not in sql, f"{name} writes consent_version"
+        assert "consented_at" not in sql, f"{name} writes consented_at"
+
+
+async def test_a_naive_consented_at_is_refused_on_postgres():
+    """THE DIALECT THIS RULE IS ABOUT. asyncpg encodes a naive datetime for a `timestamptz`
+    parameter as THIS PROCESS's local wall time — measured seven hours off from a Pacific box
+    against a UTC database. `_bind_dt` would silently repair it; for evidence about a human act
+    the caller is told instead, because a timestamp read seven hours off is evidence of the
+    wrong moment."""
+    with pytest.raises(ValueError, match="timezone-aware"):
+        await _mk(consent_version=_CONSENT_TAG, consented_at=datetime(2026, 9, 20, 11, 0, 0))
+
+
+async def test_a_consented_at_without_a_version_is_refused_on_postgres():
+    with pytest.raises(ValueError, match="without a consent_version"):
+        await _mk(consented_at=datetime(2026, 9, 20, tzinfo=timezone.utc))
+
+
+# ── the one validator, through the production dialect ───────────────────────────────────────
+
+
+def test_all_three_layers_call_the_same_consent_validator_object_on_postgres():
+    """THE IDENTITY ASSERTION, RUN IN THE GATE'S PROCESS. The SQLite arm asserts the same thing,
+    and this arm is not redundant: the dialect gate imports these modules in a different order
+    and with `IS_POSTGRES` true, and a lazily-rebound name (a module that re-created its own
+    validator under some import condition) would only show up in one of the two."""
+    import db.reap_agentic_ledger as ledger
+    import routes.agent_commerce_reap as route_mod
+    import services.reap_agentic_purchase as svc_mod
+
+    assert svc_mod.consent_shape is ledger.require_consent_version
+    assert route_mod.consent_shape is ledger.require_consent_version
+    assert "require_consent_version" in ledger.__all__
+
+
+
+
+@pytest.mark.parametrize("value,accepted", _CONSENT_MATRIX_PG)
+def test_the_three_layers_agree_on_every_input_on_postgres(value, accepted):
+    """THE VERDICT MATRIX, RUN IN THE DIALECT GATE'S PROCESS.
+
+    The SQLite arm has the same test, and this is not redundant duplication — it is what stops
+    this gate being blind to a re-implementation. The identity assertion catches a layer that
+    REPLACES its reference to the shared validator; it does not catch one that keeps the
+    reference and puts its own fast path in FRONT of it, which is the shape the original defect
+    actually had (three functions that each called their own rule first). That mutant survives
+    the identity test and dies here, on the inputs the layers would disagree about: NBSP, the
+    ideographic space, U+2028/U+2029.
+
+    Pure Python, so the dialect is not what is under test — the gate's PROCESS is. These modules
+    are imported here in a different order and with `IS_POSTGRES` true.
+    """
+    import db.reap_agentic_ledger as ledger
+    import routes.agent_commerce_reap as route_mod
+    import services.reap_agentic_purchase as svc_mod
+
+    def _verdict(fn, exc):
+        try:
+            return ("accepted", fn(value))
+        except exc:
+            return ("refused", None)
+
+    route = _verdict(route_mod._consent_version, svc_mod.PurchaseRefused)
+    service = _verdict(svc_mod._require_consent_version, svc_mod.PurchaseRefused)
+    store = _verdict(lambda v: ledger.require_consent_version(v, required=True), ValueError)
+
+    assert route == service == store, (
+        f"the layers disagree on {value!r}: route={route} service={service} ledger={store}"
+    )
+    assert route[0] == ("accepted" if accepted else "refused")
+
+
+#: THE MATRIX, SPLIT AT COLLECTION TIME INTO THE TWO THINGS IT SAYS.
+#:
+#: WHY NOT ONE PARAMETRISATION WITH A `pytest.skip` FOR THE REFUSED HALF — which is what this
+#: was, and which broke the Postgres dialect gate. That job has a post-step, "Assert the gate
+#: actually gated", which exits 1 on ANY skipped test: the gate files skip themselves when
+#: DATABASE_URL is not a Postgres URL, so a skip in that job cannot be distinguished from the
+#: whole gate having quietly not run. pytest was green (2377 passed) and the JOB was red.
+#:
+#: A skip is the wrong tool here anyway. "This input is refused, so there is nothing to store"
+#: is not an absent test — it is a DIFFERENT assertion, and writing it as a skip threw away the
+#: half of the matrix that carries the security argument. Two lists, two tests, no skips, and
+#: every row of the matrix is asserted in one of them.
+_CONSENT_ACCEPTED_PG = tuple(v for v, ok in _CONSENT_MATRIX_PG if ok)
+_CONSENT_REFUSED_PG = tuple(v for v, ok in _CONSENT_MATRIX_PG if not ok)
+
+#: The refused values MINUS `None`. `None` is refused by the two DOORS (`required=True`) and
+#: accepted by the column, where it means "a row opened before migration 233" — so it belongs in
+#: the refusal test of the validator and not in the one that asserts no row is written.
+_CONSENT_REFUSED_VALUES_PG = tuple(v for v in _CONSENT_REFUSED_PG if v is not None)
+
+assert _CONSENT_ACCEPTED_PG and _CONSENT_REFUSED_VALUES_PG, (
+    "the matrix must keep both halves — a split that emptied one would make its test vacuous"
+)
+
+
+@pytest.mark.parametrize("value", _CONSENT_ACCEPTED_PG)
+async def test_an_accepted_tag_round_trips_through_a_real_varchar32(value):
+    """THE ACCEPTED HALF, AGAINST THE REAL COLUMN. The verdict agreement is a pure-Python
+    property and the SQLite arm owns it; what only this arm can show is that every tag the three
+    layers ADMIT also survives an asyncpg bind into a `VARCHAR(32)` and comes back the same
+    string.
+
+    That is the half the original defect was invisible to: a value the route accepted and wrote
+    to the buyer-ref row was never checked against the purchase column on this engine. NBSP, the
+    ideographic space and U+2028 are multi-byte in UTF-8, and `VARCHAR(32)` counts CHARACTERS —
+    the 32-character tag in the matrix is 94 bytes, and a column that counted bytes would refuse
+    it.
+
+    PARAMETRISED OVER THE ACCEPTED LIST, not over the whole matrix with a skip: see the note on
+    `_CONSENT_ACCEPTED_PG`.
+    """
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _mk(
+        consent_version=value, buyer_ref=f"bref_pg{_CONSENT_ACCEPTED_PG.index(value)}"
+    )
+    read = await ledger.get_purchase_internal(purchase["id"])
+    assert read["consent_version"] == value.strip()
+
+
+@pytest.mark.parametrize("value", _CONSENT_REFUSED_VALUES_PG)
+async def test_a_refused_tag_reaches_no_column_at_all(value):
+    """THE REFUSED HALF, AND IT IS AN ASSERTION RATHER THAN A SKIP.
+
+    This used to be the skipped branch of the test above, which threw away the half of the
+    matrix that carries the security argument: a NUL is unstorable on Postgres and a zero-width
+    space is invisible in every diff, and what has to be true of both is that they never reach
+    the column AND leave no row behind them. `create_purchase` validates before the INSERT, so
+    a refused tag must cost nothing.
+    """
+    from db.database import database
+
+    before = await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases")
+    with pytest.raises(ValueError):
+        await _mk(consent_version=value)
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == before
+
+
+async def test_none_is_refused_by_the_doors_and_accepted_by_the_column():
+    """`None` is the one value the two halves of the matrix disagree about, so it gets its own
+    test rather than a row in either list.
+
+    The DOORS refuse it (`required=True`): every purchase opened from today on carries a consent.
+    The COLUMN accepts it, because rows opened before migration 233 exist and NULL is the truth
+    about them. That difference is the whole reason `require_consent_version` takes a flag.
+    """
+    import db.reap_agentic_ledger as ledger
+
+    with pytest.raises(ValueError, match="required"):
+        ledger.require_consent_version(None, required=True)
+    assert ledger.require_consent_version(None) is None
+
+    purchase = await _mk(consent_version=None)
+    assert purchase["consent_version"] is None and purchase["consented_at"] is None

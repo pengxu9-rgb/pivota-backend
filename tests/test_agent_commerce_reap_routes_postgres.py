@@ -98,6 +98,11 @@ _MIGRATIONS = (
     # does not span that table today — but a build that disagrees with the self-heal is a trap
     # waiting for whoever widens the fingerprint.
     _MIGRATIONS_DIR / "232_tierb_verdict_vocabulary.sql",
+    # 233 adds consent_version + consented_at to reap_agentic_purchases. The self-heal carries
+    # it, so a migration build without it is not the schema production has — and every POST this gate makes
+    # would fail on an UndefinedColumn. See
+    # feedback_a_later_migration_that_alters_a_table_breaks_that_tables_own_parity_test.
+    _MIGRATIONS_DIR / "233_reap_agentic_purchase_consent.sql",
 )
 
 #: Same convention as the ledger's gate: this file DROPS its tables, so it must be INCAPABLE of
@@ -239,15 +244,53 @@ async def _build_catalog_tables():
         checkfirst=True,
     )
     engine.dispose()
-    for table in (
-        "catalog_offers",
-        "catalog_skus",
-        "catalog_products",
-        "catalog_merchants",
-        "buyer_identity_links",
-        "surface_click_events",
-    ):
-        await database.execute(f"DELETE FROM {table}")
+    await _clear_shared_tables()
+
+
+#: EVERY table this gate writes that it does NOT drop, in FK-safe order (offers -> skus ->
+#: products). These are SHARED with suites that neither create nor drop them, which is what makes
+#: leaving a row behind their problem rather than ours.
+#:
+#: WHY THIS IS A NAMED LIST AND NOT AN INLINE LOOP IN THE FIXTURE'S SETUP. It used to be exactly
+#: that, and it ran at SETUP ONLY — so the LAST test in this file left its rows in place for
+#: whatever ran next. The Postgres dialect gate runs the whole `tests/test_*_postgres.py` glob in
+#: ONE process against ONE database, in alphabetical order, and the file after this one is
+#: `tests/test_backfill_variant_identity_skus_postgres.py`, which opens with
+#: `assert count(*) FROM catalog_skus == 0`. It failed four tests. Measured on a fresh database:
+#: this suite alone left 1 row each in catalog_skus, catalog_products, catalog_offers and
+#: buyer_identity_links.
+#:
+#: The rule this encodes: A SUITE THAT WRITES A SHARED TABLE MUST LEAVE IT AS IT FOUND IT,
+#: whichever of its tests ran last. Setup-only cleaning protects THIS file from the previous one
+#: and protects nobody from this one.
+_SHARED_TABLES = (
+    "catalog_offers",
+    "catalog_skus",
+    "catalog_products",
+    "catalog_merchants",
+    "buyer_identity_links",
+    "surface_click_events",
+)
+
+#: The rail's own tables. This gate DROPs and rebuilds them at setup, so cleaning them again at
+#: teardown is not what keeps this file correct — it is what keeps the NEXT file correct if it
+#: reads one without dropping it first, and it costs a DELETE on an empty table.
+_TEARDOWN_TABLES = _SHARED_TABLES + tuple(reversed(_RAIL_TABLES))
+
+
+async def _clear_shared_tables(tables=_SHARED_TABLES) -> None:
+    """DELETE every row this gate could have written, in FK-safe order.
+
+    ONE try PER TABLE. A table that does not exist — because a DROP/rebuild failed, or because
+    the teardown is running after a test that dropped one — must not abandon the DELETEs after
+    it, which is the same argument db/schema_guard.py makes for its per-statement try blocks.
+    Leaving four tables dirty because the first was missing is how a cleanup becomes a no-op.
+    """
+    for table in tables:
+        try:
+            await database.execute(f"DELETE FROM {table}")
+        except Exception:  # noqa: BLE001 — see the docstring
+            continue
 
 
 @pytest.fixture(autouse=True)
@@ -261,9 +304,19 @@ async def _db():
     await _drop_tables()
     await _apply_migrations()
     await _build_catalog_tables()
-    yield
-    if not was_connected and database.is_connected:
-        await database.disconnect()
+    try:
+        yield
+    finally:
+        # TEARDOWN, AND IT IS THE HALF THAT WAS MISSING. Setup-only cleaning leaves the LAST
+        # test's rows for whatever the gate runs next — see `_SHARED_TABLES` for the four tests
+        # it broke in tests/test_backfill_variant_identity_skus_postgres.py.
+        #
+        # In a `finally`, so a test that FAILS or errors still cleans up: a failing test is
+        # exactly the one most likely to have left a half-written row behind, and a cleanup that
+        # only runs on success turns one red test into a cascade in another file.
+        await _clear_shared_tables(_TEARDOWN_TABLES)
+        if not was_connected and database.is_connected:
+            await database.disconnect()
 
 
 @pytest.fixture(autouse=True)
@@ -1200,9 +1253,20 @@ async def test_the_minted_identity_is_never_in_a_response(client):
 
     read = await client.get(f"{BASE}/purchases/{resp.json()['purchase_id']}")
     listed = await client.get(f"{BASE}/purchases")
+    # THE CONSENT TAG CAME OFF THIS LIST AT MIGRATION 233, deliberately and with the owner's
+    # decision behind it. It was here because WP4b had no reason to hand it back and the
+    # allowlist was kept minimal; 233 makes it the one column on the purchase row that records
+    # something the OWNER did, and a buyer's own consent tag is theirs to read. The three
+    # IDENTITY values below are what this test is actually about and they have not moved.
     for body in (resp.text, read.text, listed.text):
-        for secret in (buyer_id, ref, hash_agent_user_ref(USER_REF), CONSENT):
+        for secret in (buyer_id, ref, hash_agent_user_ref(USER_REF)):
             assert secret not in body
+
+    # Stated rather than left as an absence: the tag IS in the owner-facing reads now, so a
+    # future edit that puts it back on the secret list above has to argue with this line.
+    assert CONSENT in read.text and CONSENT in listed.text
+    # And it is still absent from the 202, which carries no purchase fields at all.
+    assert CONSENT not in resp.text
 
 
 async def test_a_non_shopify_row_is_refused(client):
@@ -1625,3 +1689,136 @@ async def test_a_failing_unique_index_does_not_starve_the_keys_table():
             "WHERE table_schema = 'public' AND table_name = :t",
             {"t": table},
         ) == 1, f"{table} was starved by the failing index"
+
+
+# ── mig 233: the two stores agree at open time, on the production dialect ────────────────────
+
+
+async def test_the_route_writes_the_same_consent_to_both_stores_on_postgres(client):
+    """ONE VALIDATED STRING, TWO WRITERS, ONE REQUEST. `_reap_buyer_ref` records the buyer's
+    LATEST consent and `start_purchase` records what THIS purchase was opened under; a mutant
+    that hands one of them a different value leaves two stores disagreeing about a human act,
+    and every test that checks only one of them stays green.
+
+    On this dialect the two columns are a real `VARCHAR(32)` and a real `timestamptz`, so the
+    comparison is one the database performed rather than one Python performed on two strings.
+    """
+    await _seed_catalog()
+    await _seed_eligibility()
+
+    resp = await client.post(f"{BASE}/purchases", json=_body())
+    assert resp.status_code == 202
+    purchase_id = resp.json()["purchase_id"]
+
+    row = await database.fetch_one(
+        """
+        SELECT p.consent_version AS on_purchase,
+               p.consented_at    AS purchase_at,
+               r.consent_version AS on_buyer,
+               r.consented_at    AS buyer_at
+          FROM reap_agentic_purchases p
+         CROSS JOIN reap_agentic_buyer_refs r
+         WHERE p.id = :i
+        """,
+        {"i": purchase_id},
+    )
+    got = dict(row)
+    assert got["on_purchase"] == CONSENT
+    assert got["on_purchase"] == got["on_buyer"], (
+        "the route wrote a different consent tag to the purchase than to the buyer identity"
+    )
+    # Both are aware `timestamptz` values written seconds apart in the same request.
+    assert got["purchase_at"].tzinfo is not None and got["buyer_at"].tzinfo is not None
+    assert abs((got["purchase_at"] - got["buyer_at"]).total_seconds()) < 60
+
+
+async def test_a_refused_consent_writes_to_neither_store_on_postgres(client):
+    """The control: `consent_required` is decided before both writes."""
+    await _seed_catalog()
+    await _seed_eligibility()
+
+    resp = await client.post(
+        f"{BASE}/purchases", json=_body(buyer=_buyer(consent_version="v" * 33))
+    )
+    assert resp.status_code == 400
+    assert _error(resp) == "consent_required"
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_buyer_refs") == 0
+
+
+async def test_a_replay_moves_only_the_buyers_tag_on_postgres(client):
+    """The two stores mean different things, and a replay is where that shows: the buyer's tag
+    is current state and moves; the purchase's is evidence and does not."""
+    await _seed_catalog()
+    await _seed_eligibility()
+
+    first = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="pg-233"))
+    purchase_id = first.json()["purchase_id"]
+
+    again = await client.post(
+        f"{BASE}/purchases",
+        json=_body(idempotency_key="pg-233", buyer=_buyer(consent_version="v-later")),
+    )
+    assert again.json()["purchase_id"] == purchase_id
+
+    assert await database.fetch_val(
+        "SELECT consent_version FROM reap_agentic_buyer_refs"
+    ) == "v-later"
+    assert await database.fetch_val(
+        "SELECT consent_version FROM reap_agentic_purchases WHERE id = :i", {"i": purchase_id}
+    ) == CONSENT
+
+
+# ── the suite must leave the shared tables as it found them ─────────────────────────────────
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _leaves_no_rows_behind():
+    """AFTER EVERY TEST IN THIS FILE, assert the shared tables are empty.
+
+    WHY THIS EXISTS AND WHY IT IS NOT A TEST. A test asserting "the catalog is empty" would run
+    with the per-test fixture's SETUP already done, so it would pass on the exact build that
+    shipped the leak — setup-only cleaning makes every test start clean and says nothing about
+    what it leaves. The property is about TEARDOWN, so the check has to outlive the tests. A
+    module-scoped fixture's finalizer runs after the last function-scoped teardown, which is
+    precisely the moment the next file in the gate's alphabetical order begins.
+
+    SYNCHRONOUS, ON ITS OWN CONNECTION, DELIBERATELY. `asyncio_mode = auto` gives this repo a
+    FUNCTION-scoped event loop; a module-scoped async fixture would need its own loop scope and
+    would be a second way for this check to fail for reasons that are not about the database.
+    `_build_catalog_tables` already opens a sync SQLAlchemy engine in this file, so this is the
+    house pattern, and a connection of its own cannot be disturbed by whatever state the last
+    test left the shared `database` object in.
+
+    IT ASSERTS RATHER THAN CLEANS. Cleaning here would hide the defect from itself: the gate
+    would stay green while the fixture's teardown quietly did nothing. The failure names the
+    table and the count, and it fails THIS file rather than the innocent one that runs next —
+    which is the whole point, because the four tests this leak actually broke were in
+    tests/test_backfill_variant_identity_skus_postgres.py and had nothing to do with Reap.
+    """
+    yield
+    if not _IS_PG:
+        return
+
+    import sqlalchemy
+
+    engine = sqlalchemy.create_engine(DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://"))
+    dirty = {}
+    try:
+        with engine.connect() as conn:
+            for table in _SHARED_TABLES:
+                try:
+                    count = conn.execute(sqlalchemy.text(f"SELECT COUNT(*) FROM {table}")).scalar()
+                except Exception:  # noqa: BLE001 — a table this run never built is not a leak
+                    continue
+                if count:
+                    dirty[table] = count
+    finally:
+        engine.dispose()
+
+    assert not dirty, (
+        f"this suite left rows in shared tables: {dirty}. The Postgres gate runs every "
+        f"tests/test_*_postgres.py in ONE process against ONE database, in alphabetical order, "
+        f"and the next file asserts these are empty. Clean in the _db fixture's teardown, not "
+        f"only in its setup."
+    )

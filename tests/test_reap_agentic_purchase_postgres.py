@@ -71,6 +71,11 @@ _MIGRATIONS = (
     # 230 builds the click-claims table. The self-heal builds it too, so the migration list
     # applies it for parity with what the self-heal leaves behind.
     _MIGRATIONS_DIR / "230_conversion_click_claims.sql",
+    # 233 adds consent_version + consented_at to reap_agentic_purchases. The self-heal carries
+    # it, so a migration build without it is not the schema production has — and every purchase this suite opens
+    # would fail on an UndefinedColumn. See
+    # feedback_a_later_migration_that_alters_a_table_breaks_that_tables_own_parity_test.
+    _MIGRATIONS_DIR / "233_reap_agentic_purchase_consent.sql",
 )
 
 # Same convention as tests/test_reap_agentic_ledger_postgres.py: this gate DROPS its tables, so
@@ -88,6 +93,8 @@ _SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect
 
 RETURN_URL = "https://agent.pivota.cc/reap/return?click=abc123"
 EMAIL = "ada@example.test"
+#: mig 233 — the consent tag every purchase is opened under on this rail.
+CONSENT = "terms-2026-09"
 ADDRESS = {
     "firstName": "Ada",
     "lastName": "Lovelace",
@@ -218,9 +225,31 @@ async def _db():
     await database.execute("DROP TABLE IF EXISTS reap_agentic_purchases")
     await database.execute("DROP TABLE IF EXISTS reap_agentic_enrollments")
     await _apply_migration()
-    yield
-    if not was_connected and database.is_connected:
-        await database.disconnect()
+    try:
+        yield
+    finally:
+        # TEARDOWN, NOT ONLY SETUP. The Postgres gate runs every tests/test_*_postgres.py in ONE
+        # process against ONE database, in alphabetical order, so whatever the LAST test here
+        # leaves behind is what the next FILE starts with. Setup-only cleaning protects this
+        # suite from its predecessor and protects nobody from this suite — which is exactly how
+        # tests/test_agent_commerce_reap_routes_postgres.py broke four tests in
+        # tests/test_backfill_variant_identity_skus_postgres.py on this branch.
+        #
+        # These tables are ones this file DROPS at setup, so the leak it prevents is narrower
+        # than the routes suite's: a later file that READS one without dropping it first. Cheap,
+        # symmetric, and it means "leave it as you found it" is the rule everywhere on this rail
+        # rather than the patch applied to the one file that got caught.
+        #
+        # In a `finally`, so a failing test still cleans up: a failing test is the one most
+        # likely to have left a half-written row, and a cleanup that runs only on success turns
+        # one red test into a cascade in another file.
+        for _table in ('reap_agentic_purchases', 'reap_agentic_enrollments'):
+            try:
+                await database.execute(f"DELETE FROM {_table}")
+            except Exception:  # noqa: BLE001 - a table this run never built is not a leak
+                continue
+        if not was_connected and database.is_connected:
+            await database.disconnect()
 
 
 @pytest.fixture(autouse=True)
@@ -387,6 +416,10 @@ async def _start(**over) -> str:
         quantity=1,
         click_id="click_abc",
         return_url=RETURN_URL,
+        # mig 233: REQUIRED on every lane now, not only cart_link. Passed by the helper so the
+        # suites that are about something else keep testing that something else; the tests that
+        # are about consent override it explicitly.
+        consent_version=CONSENT,
     )
     kwargs.update(over)
     return await svc.start_purchase(**kwargs)
@@ -1426,3 +1459,61 @@ async def test_a_present_but_empty_items_still_refuses_on_postgres(reap, attribu
     purchase_id = await _drive_to_completed()
     row = await _get(purchase_id)
     assert row["state"] == "refused" and row["last_error_code"] == "quote_items_mismatch"
+
+
+# ── mig 233: the service's own consent gate, on the production dialect ───────────────────────
+
+
+async def _purchase_count() -> int:
+    from db.database import database
+
+    return int(await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases"))
+
+
+async def test_a_purchase_opened_through_this_service_carries_its_consent_on_postgres():
+    import db.reap_agentic_ledger as ledger
+
+    purchase_id = await _start()
+    row = await ledger.get_purchase_internal(purchase_id)
+    assert row["consent_version"] == CONSENT
+    # A real `timestamptz`, aware, not a string that looks like one.
+    assert row["consented_at"] is not None and row["consented_at"].tzinfo is not None
+
+
+async def test_the_variant_lane_refuses_without_a_consent_on_postgres():
+    """THE SERVICE'S OWN GATE, not the route's. Both exist, and only a test that calls
+    `start_purchase` DIRECTLY can see this one — the route validates first, so every route-level
+    test stays green with the service's check removed. That is not hypothetical: the mutant that
+    removes it survived this gate until this test existed.
+    """
+    import services.reap_agentic_purchase as svc
+
+    before = await _purchase_count()
+    with pytest.raises(svc.PurchaseRefused) as caught:
+        await _start(consent_version=None)
+    assert caught.value.reason == "consent_required"
+    assert await _purchase_count() == before, "a refused consent left a row behind"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "", "   ", "v" * 33, "v1" + chr(0x0000),
+        # NOT A STRING. This one is not decoration: the service used to do
+        # `str(consent_version or "")`, so `123` became the consent tag "123" — a consent
+        # nobody gave, stored on a purchase row as evidence. It now goes through the shared
+        # validator, which refuses a non-str outright.
+        123, True, 1.5, {}, [],
+    ],
+)
+async def test_a_malformed_consent_is_refused_at_the_service_on_postgres(value):
+    """The NUL case is the one only this dialect can judge: reaching an asyncpg bind it is an
+    untranslatable-character error naming a parameter index, i.e. a 500. Refused first, so both
+    dialects answer `consent_required` and the answer names the field."""
+    import services.reap_agentic_purchase as svc
+
+    before = await _purchase_count()
+    with pytest.raises(svc.PurchaseRefused) as caught:
+        await _start(consent_version=value)
+    assert caught.value.reason == "consent_required"
+    assert await _purchase_count() == before

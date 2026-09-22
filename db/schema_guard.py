@@ -953,6 +953,43 @@ async def ensure_required_schema_light() -> None:
                 )
             except Exception:  # noqa: BLE001
                 pass
+            # mig 233: the consent that was in force when the purchase was OPENED,
+            # on the purchase row itself.
+            #
+            # WHY THE PURCHASE ROW AND NOT ONLY THE BUYER ROW (mig 227). WP4c
+            # deletes the `reap_agentic_buyer_refs` row when a buyer identity is
+            # repointed by a hosted-checkout sign-in, and that row was the sole
+            # carrier of the tag. These two columns are the copy nothing deletes;
+            # the refs row keeps its own pair as the LATEST consent, for re-use.
+            #
+            # ITS OWN try, per this block's rule. The columns are nullable with no
+            # default, so this cannot fail on data — but a raise here must not be
+            # able to starve the mig-230 heal below, which is the exact defect the
+            # mig-225 comment above records at length.
+            #
+            # NOT FOLDED INTO THE mig-224 CREATE TABLE ABOVE, deliberately and for
+            # the reason the mig-227 twin states: folded in, this would be dead on
+            # a fresh database — the only kind CI builds — so deleting it would
+            # pass every test while leaving the columns missing on exactly the
+            # databases that already hold a purchases table, which is production.
+            # Kept separate, this statement is the whole of the heal on EVERY
+            # arrival, and it lands the columns in migration order.
+            #
+            # DO NOT WRITE THE TWO WORDS "A-L-T-E-R T-A-B-L-E" IN PROSE ANYWHERE
+            # IN THIS FILE — see the mig-225 comment above for the gate this
+            # breaks and how it broke it.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS reap_agentic_purchases
+                            ADD COLUMN IF NOT EXISTS consent_version VARCHAR(32),
+                            ADD COLUMN IF NOT EXISTS consented_at TIMESTAMPTZ;
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
             # mig 230: the per-click attribution CLAIM for cart-link Reap purchases,
             # and the index the merchant side needs to ask "is this click one of
             # those?". THIS DDL MUST BUILD THE SAME SCHEMA AS
@@ -3426,6 +3463,48 @@ async def ensure_required_schema_light() -> None:
                         "WHERE item_source = 'cart_link';"
                     )
                 )
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 233, SQLite twin: the consent in force when the purchase was
+            # opened, one statement per column.
+            #
+            # PER COLUMN, for the reason the mig-225 and mig-227 twins above spell
+            # out: SQLite's ADD COLUMN has no `IF NOT EXISTS` and no multi-clause
+            # form, so a duplicate column raises OperationalError and a SHARED try
+            # would let the first already-present column abandon the second —
+            # leaving a table permanently short of `consented_at` on exactly the
+            # databases a previous run half-healed. Per column, every arrival
+            # converges on the same table.
+            #
+            # TIMESTAMP, NOT TIMESTAMPTZ: SQLite has no such type name, and the
+            # column is written through `_bind_dt`, which hands SQLite the
+            # server's own text format either way.
+            #
+            # THE COVERAGE GATE CANNOT SEE THIS ONE. The column name is an
+            # f-string placeholder, and tests/test_schema_guard_migration_
+            # coverage.py reads SOURCE TEXT — so deleting this loop would not turn
+            # that gate red. What defends it is the runtime suite: every consent
+            # assertion in tests/test_reap_agentic_ledger.py builds its schema
+            # through this self-heal and fails without these columns. That is the
+            # check to keep working, exactly as the mig-227 twin says of its own.
+            try:
+                for _purchase_consent_column, _purchase_consent_type in (
+                    ("consent_version", "VARCHAR(32)"),
+                    ("consented_at", "TIMESTAMP"),
+                ):
+                    try:
+                        await database.execute(
+                            text(
+                                f"ALTER TABLE reap_agentic_purchases "
+                                f"ADD COLUMN {_purchase_consent_column} "
+                                f"{_purchase_consent_type};"
+                            )
+                        )
+                    except Exception:  # noqa: BLE001
+                        # Almost always "duplicate column name" — the column is
+                        # already there and this run had nothing to do. Continue
+                        # so the remaining column still gets its chance.
+                        continue
             except Exception:  # noqa: BLE001
                 pass
             # mig 230: the per-click attribution claim, SQLite twin. Same CHECK and

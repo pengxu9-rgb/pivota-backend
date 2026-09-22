@@ -112,6 +112,11 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import db.reap_agentic_ledger as ledger
+# THE ONE consent-tag shape rule, imported rather than re-implemented. The name is bound at
+# module level so `tests/test_reap_agentic_ledger.py` can assert BY IDENTITY that this module,
+# the route and the ledger call the same function object — see that function's docstring for
+# the production divergence three copies of the rule produced.
+from db.reap_agentic_ledger import require_consent_version as consent_shape
 import db.tierb_cart_link_eligibility as tierb_eligibility
 import services.conversion_click_claims as ccc
 import services.reap_agentic_client as rc
@@ -1213,13 +1218,21 @@ async def start_purchase(
     refuses with its own codes (`cart_link_disabled`, `cart_link_quote_unsupported`,
     `cart_link_refused`) before anything else about it is looked at.
 
-    A `cart_link` call ALSO requires `consent_version`, and `buyer_ref` must be a buyer identity
-    #2219's route helpers already MINTED, with that same consent recorded on it
-    (`consent_required` / `buyer_unlinked` otherwise). On the variant lane those two are enforced
-    by routes/agent_commerce_reap before this function is called. The cart-link route does the
-    same, and this function enforces them again for direct callers rather than leave a door that
-    opens a purchase for a buyer who never consented. It does not mint: minting has one owner,
-    the route's `_buyer_id_for` / `_reap_buyer_ref`.
+    `consent_version` IS REQUIRED ON EVERY LANE (`consent_required` otherwise), and it is
+    STORED ON THE PURCHASE ROW. It used to be the cart-link lane's requirement alone, checked
+    here for direct callers while the variant lane relied on routes/agent_commerce_reap having
+    checked it. Migration 233 made that split untenable: the purchase row now carries the tag
+    that was in force when it was opened — evidence that survives the terminal PII write and the
+    WP4c repoint that deletes the buyer's refs row — so a purchase opened with no consent is a
+    row nothing can explain, whichever lane opened it. One check, both lanes, before the INSERT.
+
+    The keyword keeps its `None` default so the failure of not passing it is a `PurchaseRefused`
+    naming the field rather than a `TypeError` naming a signature; it is not optional.
+
+    A `cart_link` call ALSO requires that `buyer_ref` be a buyer identity #2219's route helpers
+    already MINTED, with that same consent recorded on it (`buyer_unlinked` otherwise) — see
+    `_require_cart_link_consent` for why that half is this lane's alone. It does not mint:
+    minting has one owner, the route's `_buyer_id_for` / `_reap_buyer_ref`.
 
     EVERY REFUSAL HAPPENS BEFORE THE INSERT, and that ordering is the contract this function is
     tested on (`test_every_refusal_leaves_the_table_empty` counts rows). A row written and then
@@ -1262,6 +1275,15 @@ async def start_purchase(
     agent_user_ref_hash = _require_text(agent_user_ref_hash, "agent_user_ref_hash")
     buyer_ref = _require_text(buyer_ref, "buyer_ref")
 
+    # 2b. THE CONSENT, ON BOTH LANES. Since migration 233 the purchase ROW carries the tag that
+    #     was in force when it was opened, so a purchase with no consent is a row nothing can
+    #     explain — not only a missing act on the cart-link lane. Checked HERE, after the dials
+    #     and the ownership and before anything about the item is looked at: a caller that has
+    #     not consented must not learn, from the shape of the refusal, whether a merchant is
+    #     eligible or an item is in our catalogue. The cart-link lane re-checks it together with
+    #     the minted identity, which is its own extra requirement.
+    consent = _require_consent_version(consent_version)
+
     if cart_link is not None:
         if row is not None:
             raise PurchaseRefused("invalid_request", "pass a row or a cart_link, not both")
@@ -1269,7 +1291,7 @@ async def start_purchase(
             agent_id=agent_id,
             agent_user_ref_hash=agent_user_ref_hash,
             buyer_ref=buyer_ref,
-            consent_version=consent_version,
+            consent_version=consent,
             item=cart_link,
             buyer=buyer,
             quantity=quantity,
@@ -1369,6 +1391,11 @@ async def start_purchase(
             market_country=market_country,
             accept_variant_labels=accept_variant_labels,
             also_accept_domains=also_accept_domains,
+            # mig 233: the consent in force when this purchase was opened, on the row itself.
+            # The SAME string the route validated and recorded on the buyer-ref row in this same
+            # request, so the two stores agree at open time. `consented_at` is left to the
+            # ledger, which stamps `now()` whenever a version is given.
+            consent_version=consent,
             # The whitelisted output, not the caller's dict.
             shipping_address=dict(shipping),
             buyer_email=email,
@@ -1389,33 +1416,61 @@ async def start_purchase(
     return str(created["id"])
 
 
-#: `reap_agentic_buyer_refs.consent_version` is VARCHAR(32) (migration 227), and the route caps
-#: it at the same width for the same reason: a truncated version tag names a different version.
-_CONSENT_VERSION_MAX_CHARS = 32
+def _require_consent_version(consent_version: Any) -> str:
+    """The consent tag, for EVERY lane. Returns the stripped value, or refuses.
+
+    ── THE SHAPE CHECK IS NOT HERE. IT IS ONE FUNCTION, AND THIS CALLS IT ───────────────────
+
+    `consent_shape` is `db.reap_agentic_ledger.require_consent_version`, imported at the top of
+    this module — the SAME FUNCTION OBJECT the route calls. This wrapper exists only to turn its
+    `ValueError` into this module's one exception type, which is what a route wants to catch.
+
+    THIS USED TO BE A THIRD COPY OF THE RULE, AND THE COPIES HAD DRIFTED. This function tested
+    `str.isprintable()` while the route and the ledger tested unicode CATEGORY membership
+    (`{Cc,Cf,Cs,Co,Cn}`). `isprintable()` is additionally False for every `Zs` except U+0020 and
+    for U+2028/U+2029 — so a tag carrying a non-breaking space or an ideographic space was
+    accepted by the route, WRITTEN onto the buyer-ref row, and then refused here with
+    `consent_required`. Measured on Postgres: `buyer_refs = 1`, `purchases = 0`. The consent was
+    recorded and the purchase was refused for not having one.
+
+    It also coerced with `str(consent_version or "")`, so `123` became the consent `"123"`.
+
+    Both are gone because the rule is gone from this file. The version is still checked HERE as
+    well as at the route because a direct caller of `start_purchase` never passes through a
+    route — but "as well as" now means the same function, not a second opinion.
+
+    ── WHY EVERY LANE, SINCE #2219 ONLY REQUIRED IT ON THE CART-LINK ONE ────────────────────
+
+    Migration 233 put the tag on the purchase ROW, so a purchase opened without one is a row
+    nothing can explain, whichever lane opened it. Before that the variant lane's rule lived in
+    the route alone and a direct call could open a purchase with no consent at all.
+    """
+    try:
+        return str(consent_shape(consent_version, required=True))
+    except ValueError as exc:
+        # The ledger's messages name the FIELD and the RULE and never the value, which is what
+        # makes them safe to carry into a refusal a caller sees.
+        raise PurchaseRefused("consent_required", str(exc)) from None
 
 
-async def _require_cart_link_consent(buyer_ref: str, consent_version: Any) -> None:
+async def _require_cart_link_consent(buyer_ref: str, consent_version: Any) -> str:
     """#2219's two requirements, on the cart-link lane: a consent version, and a buyer identity
-    that was MINTED with that consent recorded on it.
+    that was MINTED with that consent recorded on it. Returns the validated version.
 
-    The version gets the route's three checks (`routes.agent_commerce_reap._consent_version`):
-    non-empty, within the column's width, printable — and, like the route, it is NOT matched
-    against an allowlist. Then the identity: `buyer_ref` must be a row the route's
+    The version goes through `_require_consent_version`, i.e. through `consent_shape`, the one
+    validator every layer calls. Then the identity, which is this lane's alone: `buyer_ref` must be a row the route's
     `_reap_buyer_ref` wrote, and its recorded consent must be THIS version (the route writes the
     latest version on every purchase, so a mismatch means this call is not the one that
     recorded it). A read error fails CLOSED: no purchase for an identity we cannot see.
+
+    THE IDENTITY HALF IS NOT EXTENDED TO THE VARIANT LANE, and that is deliberate rather than an
+    omission. On that lane the route mints the ref and opens the purchase in one request, so the
+    refs row is written microseconds before `start_purchase` is called; a direct caller holding a
+    `buyer_ref` we never minted is refused by the ledger's ownership rules instead. Widening this
+    read to the variant lane would make every existing direct caller of this module depend on a
+    table migration 226 created for the routes.
     """
-    text = str(consent_version or "").strip()
-    if not text:
-        raise PurchaseRefused("consent_required", "consent_version is required")
-    if len(text) > _CONSENT_VERSION_MAX_CHARS:
-        raise PurchaseRefused(
-            "consent_required", f"consent_version is longer than {_CONSENT_VERSION_MAX_CHARS}"
-        )
-    if not _is_clean(text) or text != _clean_buyer_text(text):
-        raise PurchaseRefused(
-            "consent_required", "consent_version contains characters that are not printable"
-        )
+    text = _require_consent_version(consent_version)
     try:
         linked = await ledger.get_buyer_ref_consent(buyer_ref)
     except Exception as exc:  # noqa: BLE001 — fail closed
@@ -1430,6 +1485,7 @@ async def _require_cart_link_consent(buyer_ref: str, consent_version: Any) -> No
         raise PurchaseRefused(
             "consent_required", "the buyer identity does not carry this consent_version"
         )
+    return text
 
 
 def _validated_buyer(buyer: Any) -> Tuple[str, Dict[str, str]]:
@@ -1508,7 +1564,7 @@ async def _start_cart_link_purchase(
     # same position the route gives them on the variant lane (after the dials, before
     # eligibility, the catalog read and every write), for the same reason: a buyer who has not
     # consented must not be able to learn anything from the shape of the refusal.
-    await _require_cart_link_consent(buyer_ref, consent_version)
+    consent = await _require_cart_link_consent(buyer_ref, consent_version)
 
     if not isinstance(item, CartLinkItem):
         raise PurchaseRefused("invalid_request", "cart_link must be a CartLinkItem")
@@ -1592,6 +1648,8 @@ async def _start_cart_link_purchase(
             click_id=click,
             return_url=validated_return_url,
             market_country=market_country,
+            # mig 233, same as the variant lane: the validated tag this call was made under.
+            consent_version=consent,
             shipping_address=shipping,
             buyer_email=email,
             item_source="cart_link",

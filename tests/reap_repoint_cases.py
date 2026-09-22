@@ -373,6 +373,50 @@ async def test_a_minted_to_real_repoint_retires_the_minted_identity(retire_calls
     assert kept is not None and kept["id"] == purchase["id"]
 
 
+async def test_the_repoint_leaves_the_purchases_consent_evidence_intact(retire_calls):
+    """MIGRATION 233, AT THE EXACT EVENT IT EXISTS FOR — and on both dialects, because this
+    module is collected by a SQLite arm and a Postgres arm.
+
+    Before 233 the consent tag lived ONLY on `reap_agentic_buyer_refs`, and this hook deletes
+    that row. So the moment a human signed in through the hosted checkout, the record of which
+    terms every purchase their agent-minted identity had made was opened under disappeared —
+    silently, for the one identity whose purchases are most worth auditing.
+
+    The refs row still goes (that is WP4c's decision and it is unchanged); what must not go with
+    it is the purchase's own copy.
+    """
+    await seed_link(agent_id=AGENT, ref_hash=ref_hash(), buyer_id=MINTED_BUYER)
+    await seed_buyer_ref(buyer_id=MINTED_BUYER, reap_buyer_ref=REAP_REF)
+    purchase = await ledger.create_purchase(
+        buyer_ref=REAP_REF,
+        agent_id=AGENT,
+        agent_user_ref_hash=ref_hash(),
+        merchant_domain="brand.example",
+        consent_version=CONSENT,
+    )
+
+    # PRECONDITION, stated: both stores carry the tag before the repoint. Without it this test
+    # would pass on a build where the purchase never got a consent in the first place.
+    assert (await ledger.get_buyer_ref_consent(REAP_REF))["consent_version"] == CONSENT
+    assert (await ledger.get_purchase_internal(purchase["id"]))["consent_version"] == CONSENT
+
+    assert await upsert(REAL_BUYER) == ref_hash()
+    assert retire_calls == [(MINTED_BUYER, "buyer_link_repointed")]
+
+    # The refs row is gone, exactly as WP4c intends — the evidence it used to be the only
+    # carrier of is not.
+    assert await buyer_ref_count(MINTED_BUYER) == 0
+    assert await ledger.get_buyer_ref_consent(REAP_REF) is None
+
+    after = await ledger.get_purchase_internal(purchase["id"])
+    assert after["consent_version"] == CONSENT
+    assert after["consented_at"] is not None
+
+    # And the owner can still read it, which is the point of it being in the allowlist.
+    view = await ledger.get_purchase_for_owner(purchase["id"], AGENT, ref_hash())
+    assert view["consent_version"] == CONSENT
+
+
 async def test_a_pending_enrollment_is_retired_too(retire_calls):
     """`status <> 'dead'`, not `status = 'active'`. A PENDING enrollment carries a live
     `hosted_url` — a page on which a card can still be entered — so sweeping only the active one

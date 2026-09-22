@@ -2273,3 +2273,103 @@ async def test_a_failing_unique_index_does_not_starve_the_keys_table():
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = :t",
             {"t": table},
         ) == 1, f"{table} was starved by the failing index"
+
+
+# ── mig 233: the same consent on the purchase row, in the same request ───────────────────────
+
+
+async def test_the_route_writes_the_same_consent_to_both_stores_in_one_request(client):
+    """THE PROPERTY MIGRATION 233 IS FOR, at the seam where it can actually go wrong.
+
+    The route validates `buyer.consent_version` ONCE and has to hand the SAME string to two
+    writers: `_reap_buyer_ref`, which records the buyer's LATEST consent, and `start_purchase`,
+    which records the consent THIS purchase was opened under. A mutant that passes a different
+    value to one of them — a re-read of `req.buyer.consent_version`, a literal, a stale local —
+    produces two stores that disagree about an act a human performed, and every existing test
+    still passes because each store is individually populated.
+    """
+    await _seed_catalog()
+    await _seed_eligibility()
+
+    resp = await client.post(f"{BASE}/purchases", json=_body())
+    assert resp.status_code == 202
+    purchase_id = resp.json()["purchase_id"]
+
+    on_the_buyer = await database.fetch_val(
+        "SELECT consent_version FROM reap_agentic_buyer_refs"
+    )
+    row = await database.fetch_one(
+        "SELECT consent_version, consented_at FROM reap_agentic_purchases WHERE id = :i",
+        {"i": purchase_id},
+    )
+    on_the_purchase = dict(row)
+
+    assert on_the_purchase["consent_version"] == CONSENT
+    assert on_the_purchase["consented_at"] is not None
+    assert on_the_purchase["consent_version"] == on_the_buyer, (
+        "the route wrote a different consent tag to the purchase than to the buyer identity"
+    )
+
+
+async def test_a_refused_purchase_writes_no_consent_anywhere(client):
+    """The control: `consent_required` is decided before either write, so neither store gets a
+    row. Without this, the test above would pass on a build that wrote both stores from a
+    request that should have been refused outright."""
+    await _seed_catalog()
+    await _seed_eligibility()
+
+    resp = await client.post(
+        f"{BASE}/purchases", json=_body(buyer=_buyer(consent_version=""))
+    )
+    assert resp.status_code == 400
+    assert _error(resp) == "consent_required"
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_buyer_refs") == 0
+
+
+async def test_the_owner_read_hands_back_the_consent_this_purchase_was_opened_under(client):
+    """IN the public view. `_public_body` is built from `PUBLIC_PURCHASE_COLUMNS` and never reads
+    a column itself, so this is what the allowlist decided — and it is the end-to-end reading of
+    that decision."""
+    await _seed_catalog()
+    await _seed_eligibility()
+
+    purchase_id = (await client.post(f"{BASE}/purchases", json=_body())).json()["purchase_id"]
+
+    body = (await client.get(f"{BASE}/purchases/{purchase_id}")).json()
+    assert body["consent_version"] == CONSENT
+    assert body["consented_at"] is not None
+
+    listed = (await client.get(f"{BASE}/purchases")).json()["purchases"]
+    assert listed[0]["consent_version"] == CONSENT
+
+
+async def test_a_replay_moves_the_buyers_tag_but_not_the_purchases(client):
+    """THE TWO STORES MEAN DIFFERENT THINGS, and this is the request where the difference shows.
+
+    A retry under the same idempotency key with a NEWER tag replays to the original purchase and
+    rewrites the buyer's latest consent — both already tested. What 233 adds is that the PURCHASE
+    keeps the tag it was actually opened under, because it is evidence rather than current state.
+    A mutant that made the purchase's copy follow the buyer's would pass every test that came
+    before this one.
+    """
+    await _seed_catalog()
+    await _seed_eligibility()
+
+    first = await client.post(
+        f"{BASE}/purchases", json=_body(idempotency_key="k-233-replay")
+    )
+    purchase_id = first.json()["purchase_id"]
+
+    again = await client.post(
+        f"{BASE}/purchases",
+        json=_body(idempotency_key="k-233-replay", buyer=_buyer(consent_version="v-later")),
+    )
+    assert again.json()["purchase_id"] == purchase_id
+
+    assert await database.fetch_val(
+        "SELECT consent_version FROM reap_agentic_buyer_refs"
+    ) == "v-later"
+    assert await database.fetch_val(
+        "SELECT consent_version FROM reap_agentic_purchases WHERE id = :i", {"i": purchase_id}
+    ) == CONSENT
