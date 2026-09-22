@@ -556,10 +556,15 @@ is unverified and gets its own id space.
 An existing link always wins — the insert cannot overwrite one, and the route re-reads rather than
 trusting what it minted, so two concurrent first purchases yield one buyer, one link, one ref.
 
-**The one residue.** If the same human later signs in through the hosted checkout, that surface
-repoints the link to their real account, and because `reap_agentic_buyer_refs` is keyed on
-`buyer_id` their next purchase mints a fresh ref — so **Reap asks for the card once more**. One
-re-enrollment after a sign-in. That is the trade; WP4 avoided it by refusing those buyers forever.
+**The one cost, and it is now the only one.** If the same human later signs in through the hosted
+checkout, that surface repoints the link to their real account, and because
+`reap_agentic_buyer_refs` is keyed on `buyer_id` their next purchase mints a fresh ref — so **Reap
+asks for the card once more**. One re-enrollment after a sign-in. That is the trade; WP4 avoided it
+by refusing those buyers forever.
+
+Since **WP4c** the repoint also cleans up after itself: the stranded enrollment is marked dead and
+the stale `reap_agentic_buyer_refs` row is deleted, automatically, at the moment of the repoint.
+See "One thing to expect in support" below.
 
 ### Storage the routes own — migrations 226 and 227
 
@@ -617,22 +622,56 @@ SELECT COUNT(*) FROM buyer_identity_links WHERE agent_id = '<agent_id>';
 Zero no longer means "arming will change nothing" — it means no purchase has been made yet. The
 count should climb by one per new end user.
 
-**One thing to expect in support, and it leaves orphans.** A buyer whose identity this rail
-created, who *later* signs in through the hosted checkout, gets their link repointed to their real
-account by `POST /buyer/save_from_checkout`. Because `reap_agentic_buyer_refs` is keyed on
+**One thing to expect in support. The cleanup is automatic (WP4c).** A buyer whose identity this
+rail created, who *later* signs in through the hosted checkout, gets their link repointed to their
+real account by `POST /buyer/save_from_checkout`. Because `reap_agentic_buyer_refs` is keyed on
 `buyer_id`, their next purchase mints a fresh ref and asks them to enter the card once more. That
 is correct and happens at most once per buyer — **it is not a bug report.**
 
-The repoint does not clean up behind itself, and **this is a known residue, not a solved problem**:
+**Since WP4c the repoint cleans up behind itself.** `routes/buyer_api._upsert_buyer_identity_link`
+— the surface that does the repointing — calls
+`db.reap_agentic_ledger.retire_buyer_refs_for_buyer(old_buyer_id, reason="buyer_link_repointed")`
+inline, and that call:
 
-* the old `reap_agentic_buyer_refs` row survives, still carrying its `consent_version` /
-  `consented_at`, now pointing at a `buyer_id` no link mentions — unreachable by any query here;
-* the old `reap_agentic_enrollments` row survives **`status = 'active'`**, holding `card_network`,
-  `card_last4` and `hosted_url`, keyed on the old `buyer_ref` so nothing will ever read it again;
-* **the enrollment at Reap is never revoked.** We stop using it; we never tell Reap to stop
-  honouring it.
+* marks every **non-dead** enrollment on the old `reap_buyer_ref` `status = 'dead'` with
+  `reap_status = 'buyer_link_repointed'`, clearing `hosted_url` — *pending* rows included, because
+  a pending row's hosted page is a page a card can still be entered on;
+* then **deletes** the old `reap_agentic_buyer_refs` row. A consent tag on a buyer id no link
+  mentions is a record nobody can find; the live account records a fresh consent at its next
+  purchase. What this costs: `reap_agentic_purchases` has no consent column, so the
+  `consent_version` the *retired* identity accepted is not retained after the sweep;
+* leaves **purchases alone** — a purchase is owned by `(agent_id, agent_user_ref_hash)` on its own
+  row, which the repoint does not change.
 
-Find the orphans — refs whose buyer is no longer linked, and the enrollments hanging off them:
+It is idempotent (a second run reports zeros), it is not transactional by design (ordered
+autocommit statements — the `databases` shared-connection rule forbids a transaction here, and the
+order is chosen so a crash between statements leaves a state the next run heals), and it cannot
+fail or slow the checkout: the hook is wrapped, never re-raises, and makes **no partner call**.
+
+Two log lines, carrying counts and no identifiers:
+
+```
+event=reap_buyer_link_repointed refs=1 enrollments=1
+event=reap_buyer_link_repointed_kept
+```
+
+The `_kept` line is the case the hook **declines**: the old buyer still has links through other
+agents, and `reap_agentic_buyer_refs` is keyed on the buyer id rather than on `(agent, ref)`, so
+retiring there would kill a card that buyer is actively using elsewhere. Those are left for the
+audit below.
+
+**The enrollment at Reap is still a separate step.** We stop using it; the partner is not told to
+stop honouring it. Reap *does* offer `POST /agentic/enrollments/{id}/revoke`
+(`revokeEnrollment_agentic`, in `tests/fixtures/reap_openapi_agentic_2026_09_17.json`), wrapped as
+`services.reap_agentic_client.revoke_enrollment(<reap_enrollment_id>)`. It is deliberately **not**
+called from the repoint hook: that hook runs on the hosted checkout's save path with a human
+waiting, and a partner POST can take up to the client's 25-second timeout. Run it from a shell
+against the ids the audit below turns up.
+
+**The audit query, which is now an audit rather than the containment.** It finds refs whose buyer
+is no longer linked and the enrollments hanging off them. After WP4c a healthy database returns
+**nothing** from it for repoints that fired; what it still finds is the `_kept` cases, rows
+stranded before WP4c shipped, and anything a swallowed failure left behind:
 
 ```sql
 SELECT r.buyer_id, r.reap_buyer_ref, r.consent_version, r.created_at,
@@ -645,21 +684,41 @@ SELECT r.buyer_id, r.reap_buyer_ref, r.consent_version, r.created_at,
  ORDER BY r.created_at;
 ```
 
-Retire the enrollments that turns up through the ledger, **not** with a hand-written UPDATE —
-`db.reap_agentic_ledger.mark_enrollment_dead(enrollment_id)` is idempotent, keeps the status
-vocabulary's `CHECK` honest and returns `None` when the row was already dead:
+Retire what that turns up through the ledger, **not** with a hand-written UPDATE. For a whole
+stranded identity, use the WP4c sweep — it is the same code the hook runs, it is idempotent, and it
+handles the enrollments and the refs row in the safe order:
+
+```python
+from db.reap_agentic_ledger import retire_buyer_refs_for_buyer
+report = await retire_buyer_refs_for_buyer("<buyer_id>", reason="orphaned_by_buyer_repoint")
+print(report.refs_retired, report.enrollments_marked_dead)   # ints only, by design
+```
+
+`reason` is written into `reap_agentic_enrollments.reap_status` and must match
+`^[a-z0-9_:.-]{1,64}$` — it is refused rather than folded or truncated, because a truncated reason
+names a different reason. Use `orphaned_by_buyer_repoint` for a hand-run sweep so it is
+distinguishable from the hook's own `buyer_link_repointed`.
+
+For ONE enrollment and nothing else, `mark_enrollment_dead` is still the right call — idempotent,
+keeps the status vocabulary's `CHECK` honest, returns `None` when the row was already dead:
 
 ```python
 from db.reap_agentic_ledger import mark_enrollment_dead
 await mark_enrollment_dead("<enrollment_id>", reap_status="orphaned_by_buyer_repoint")
 ```
 
-Leave the `reap_agentic_buyer_refs` row alone — it is the consent record for a purchase that
-really happened, and deleting it destroys the only evidence of which terms that buyer was shown.
+Then, optionally, tell Reap:
 
-**The proper fix is to revoke the enrollment at the moment of the repoint**, which belongs in
-`routes/buyer_api` (the surface that does the repointing) and is a **follow-up**. Until it lands,
-this sweep is the containment.
+```python
+from services import reap_agentic_client as rc
+result = await rc.revoke_enrollment("<reap_enrollment_id>")   # the PARTNER's id, a uuid
+```
+
+**Note what changed in WP4c and read it before reaching for an older copy of this page.** This
+section used to say "leave the `reap_agentic_buyer_refs` row alone — it is the consent record".
+WP4c reverses that on the owner's decision (2026-09-22): the row is deleted, because a consent tag
+on a buyer id no link mentions is not a record anybody can find, and the account the buyer actually
+uses always carries a current one. The cost is stated above.
 
 ### 2. The merchant must have an offer of its own, in the market's currency
 

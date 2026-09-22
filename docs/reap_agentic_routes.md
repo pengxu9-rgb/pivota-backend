@@ -481,27 +481,40 @@ it unchanged — it never repoints a link a human's sign-in established. Two con
 purchases produce **one** buyer, **one** link and **one** ref: the insert cannot overwrite, and
 the route re-reads rather than trusting what it minted.
 
-### The one thing WP5 must plan for — the repoint residue
+### A repointed buyer re-enrols once — and the old identity is retired for them (WP4c)
 
 If the same human **later** signs in through the hosted checkout, `POST /buyer/save_from_checkout`
 repoints the link to their real account — correctly, a verified account supersedes a placeholder.
 Because `reap_agentic_buyer_refs` is keyed on the buyer id, their next purchase mints a fresh ref
-and **Reap asks for the card once more**.
+and **Reap asks for the card once more**. *That is the whole of what the door should expect:* one
+extra card entry, at most once per buyer. It is not a bug report.
 
-**It is not only one extra card entry.** The repoint does not clean up behind itself, and nothing
-else does either:
+**What used to be left behind is now retired at the moment of the repoint.** WP4c put a hook on
+`routes/buyer_api._upsert_buyer_identity_link` — the surface that does the repointing — which
+calls `db.reap_agentic_ledger.retire_buyer_refs_for_buyer(old_buyer_id,
+reason="buyer_link_repointed")`:
 
-| what is left behind | state it is left in |
+| what the repoint strands | what happens to it now |
 |---|---|
-| the old `reap_agentic_buyer_refs` row | still there, still holding its `consent_version` / `consented_at`, now pointing at a buyer id no `buyer_identity_links` row mentions — **unreachable** |
-| the old `reap_agentic_enrollments` row | still `status = 'active'`, still holding `card_network`, `card_last4`, `hosted_url` — keyed on the **old** `buyer_ref`, so no future purchase will ever find it |
-| the enrollment **at Reap** | **never revoked.** We stop using it; we do not tell Reap to stop honouring it |
+| the old `reap_agentic_enrollments` row(s) | every non-dead one is marked `status = 'dead'` with `reap_status = 'buyer_link_repointed'`, and its `hosted_url` is cleared — so the live card-entry page stops being a live card-entry page |
+| the old `reap_agentic_buyer_refs` row | **deleted.** A consent tag on a buyer id that no link names is a record nobody can find, and leaving it holds a `reap_buyer_ref` under `uq_reap_agentic_buyer_refs_ref` for an identity that will never transact again. The live account records a fresh consent on its own row at its next purchase |
+| the buyer's **purchases** | untouched. A purchase is owned by `(agent_id, agent_user_ref_hash)` on its own row, which the repoint does not change, so history stays readable by the agent that made it |
+| the enrollment **at Reap** | still ours to revoke separately. `services.reap_agentic_client.revoke_enrollment` is the call (`POST /agentic/enrollments/{id}/revoke`, in the pinned spec) and it is **not** made from the checkout path — a partner POST there can take up to 25 s with a human waiting. See the runbook |
 
-So the buyer's consent record for the account they now use is the *new* row, and the old one is an
-orphan that no query in this rail will ever return. The operator SQL to find and retire these is in
-the runbook under "Before arming". The proper fix — **revoking the enrollment at the moment of the
-repoint** — belongs in `routes/buyer_api`, not on this route, and is a follow-up rather than
-something this PR silently half-does.
+**What the delete costs, stated rather than buried:** `reap_agentic_purchases` has no consent
+column, so the `consent_version` the *retired* identity accepted is not retained anywhere after the
+sweep. The identity being retired is one nothing can reach; the account the buyer actually uses
+always has a current consent row.
+
+**Two cases the hook deliberately does not fire on.** A repoint away from a buyer who **still has
+other links** (a real account linked through several agents, losing one of them) is left alone and
+logged `event=reap_buyer_link_repointed_kept` — `reap_agentic_buyer_refs` is keyed on the buyer id,
+not on `(agent, ref)`, so retiring there would kill a card the buyer is actively using through
+another agent. And a first insert, an idempotent re-upsert, or an upsert that failed are not
+repoints at all.
+
+The hook cannot fail or slow the checkout: it is wrapped, it never re-raises, it makes no partner
+call, and it logs two integers and no identifiers.
 
 That is the trade the owner took. WP4 avoided it by refusing every agent-only buyer forever, which
 made the rail unusable for the door it exists for.

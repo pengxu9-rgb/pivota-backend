@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import time
 from datetime import datetime, timedelta, timezone
@@ -31,6 +32,8 @@ from routes.accounts_orders_api import AccountsPrincipal, get_accounts_principal
 
 from sqlalchemy.sql import func
 
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/buyer/v1", tags=["buyer"])
 
@@ -488,6 +491,141 @@ async def _get_or_create_pairwise_buyer_ref(*, buyer_id: str, agent_id: str) -> 
     )
 
 
+# ── WP4c: the Reap rail's state must not be orphaned by a repoint ────────────────────────────
+#
+# `_upsert_buyer_identity_link` below is a REPOINT: `ON CONFLICT … DO UPDATE SET buyer_id =
+# EXCLUDED.buyer_id` moves an `(agent_id, hash(agent_user_ref))` link from whatever buyer id it
+# named to the signed-in one. That is correct — a verified account supersedes a placeholder —
+# and `routes/agent_commerce_reap._buyer_id_for` says so at length.
+#
+# What it left behind is the problem. `routes/agent_commerce_reap` mints a `u_<16hex>` buyer id
+# on an agent's first Reap purchase and hangs a `reap_agentic_buyer_refs` row off it; an
+# enrollment — the buyer's own card, live at Reap, carrying `card_network`, `card_last4` and a
+# `hosted_url` — hangs off that row's `reap_buyer_ref`. Both are keyed on the OLD buyer id, so
+# the moment this surface repoints the link they are unreachable by every query on this rail:
+# still `active` at Reap, tracked by nothing here. docs/runbooks/reap_agentic_purchase.md
+# carried an operator SQL sweep for exactly that residue; this hook is the sweep, run at the
+# moment the residue is created.
+
+#: The `reap_status` written onto every enrollment this hook retires. Lowercase, in the
+#: vocabulary `db.reap_agentic_ledger` validates, and stable — an operator greps for it.
+_REAP_REPOINT_REASON = "buyer_link_repointed"
+
+#: Read by the pre-upsert peek. A literal, not a builder: it is the SAME key the upsert conflicts
+#: on, and the two drifting apart would make the peek answer about a different row.
+_EXISTING_LINK_BUYER_ID_SQL = """
+    SELECT buyer_id
+      FROM buyer_identity_links
+     WHERE agent_id = :agent_id
+       AND agent_user_ref_hash = :agent_user_ref_hash
+     LIMIT 1
+"""
+
+#: "Does this buyer id still own ANY agent link?" — the guard in `_retire_reap_state_on_repoint`.
+_ANY_LINK_FOR_BUYER_SQL = """
+    SELECT 1
+      FROM buyer_identity_links
+     WHERE buyer_id = :buyer_id
+     LIMIT 1
+"""
+
+
+async def _existing_link_buyer_id(*, agent_id: str, agent_user_ref_hash: str) -> Optional[str]:
+    """The buyer id this link names RIGHT NOW, or None when there is no link yet.
+
+    Read BEFORE the upsert, because after it the old value is gone — `DO UPDATE SET buyer_id =
+    EXCLUDED.buyer_id` overwrites it in place and no dialect hands back what it replaced in a
+    form this code path can use on both engines.
+
+    Best-effort, like everything else this hook does: a failure here returns None, which reads as
+    "no previous buyer", which suppresses the retirement. Suppressing it costs the orphan the
+    runbook already documents; letting the exception out would cost the buyer their checkout.
+    """
+    try:
+        row = await database.fetch_one(
+            _EXISTING_LINK_BUYER_ID_SQL,
+            {"agent_id": agent_id, "agent_user_ref_hash": agent_user_ref_hash},
+        )
+    except Exception:
+        return None
+    if not row:
+        return None
+    return str(dict(row).get("buyer_id") or "").strip() or None
+
+
+async def _retire_reap_state_on_repoint(
+    *, old_buyer_id: Optional[str], new_buyer_id: str
+) -> None:
+    """Retire the Reap rail's state hanging off `old_buyer_id`, when the repoint stranded it.
+
+    ── THIS FUNCTION MAY NOT FAIL AND MAY NOT BE SLOW ──────────────────────────────────────
+
+    Its caller is the hosted checkout's save path, which a human is waiting on. So: ONE
+    try/except around the whole body, nothing re-raised, and no partner call — the work is two
+    short indexed reads plus, in the rare repoint case, the ledger's own statements.
+
+    THERE IS DELIBERATELY NO CALL TO REAP HERE, although Reap does offer one
+    (`POST /agentic/enrollments/{id}/revoke`, in the pinned spec fixture). An outbound HTTP
+    request on this path can take up to the client's 25-second timeout, which is the one thing
+    this hook promised not to do, and `db/reap_agentic_ledger` is the rail's data layer with no
+    HTTP client in it by its own stated contract. `services.reap_agentic_client.revoke_enrollment`
+    exists for an operator or a later job to call; what this hook guarantees is that OUR side
+    stops using the enrollment and never mints a purchase against that ref again.
+
+    ── WHEN IT FIRES, AND THE CASE IT DELIBERATELY DECLINES ────────────────────────────────
+
+    Not on a first insert (no old buyer), not on an idempotent re-upsert (same buyer), and not
+    when the upsert itself failed — the caller only reaches here on a write it believes landed.
+
+    AND NOT WHEN THE OLD BUYER STILL HAS LINKS. `reap_agentic_buyer_refs` is keyed on `buyer_id`,
+    NOT on `(agent_id, agent_user_ref_hash)`. So retiring "the old buyer's refs" retires ONE
+    enrollment that serves EVERY agent that buyer transacts through. For a minted, single-link
+    identity that is exactly right: the identity had one link, the link moved, nothing is left.
+    For a real account that is linked to three agents and lost one of them, it would kill a card
+    the buyer is actively using on the other two — a repoint on agent A silently breaking agent
+    B's next purchase.
+
+    The test is therefore "does this buyer id still own any link AFTER the repoint", asked of the
+    table rather than inferred from the shape of the id. Inferring it — `old.startswith("u_")` —
+    would be reading the mint format as a type tag, which `_mint_buyer_id` copied that format
+    specifically so that nobody would do. A buyer with links left is LOGGED AND LEFT; the
+    runbook's audit query still finds it if it ever does become unreachable.
+
+    ── WHAT THE LOG LINE MAY CONTAIN ───────────────────────────────────────────────────────
+
+    Two integers, and nothing else. No buyer id (durable, joins to orders and addresses), no
+    agent id, no ref hash, no `reap_buyer_ref` (an opaque identity a partner also holds). The
+    counts are the whole of what an operator needs to see that the sweep ran.
+    """
+    try:
+        old = str(old_buyer_id or "").strip()
+        if not old or old == str(new_buyer_id or "").strip():
+            return
+        still_linked = await database.fetch_one(_ANY_LINK_FOR_BUYER_SQL, {"buyer_id": old})
+        if still_linked is not None:
+            logger.info("event=reap_buyer_link_repointed_kept")
+            return
+        # IMPORTED LAZILY, AND THAT IS NOT A STYLE CHOICE. `routes/buyer_api` is a live
+        # buyer-facing surface; a module-level import here would pull db/reap_agentic_ledger —
+        # and through it services.reap_webhooks and services.reap_cart_link — into this module's
+        # import graph, so a syntax error or a slow import anywhere on the Reap rail would take
+        # the buyer's checkout down with it. A test asserts this module imports with the ledger
+        # absent from sys.modules.
+        from db.reap_agentic_ledger import retire_buyer_refs_for_buyer
+
+        report = await retire_buyer_refs_for_buyer(old, reason=_REAP_REPOINT_REASON)
+        logger.info(
+            "event=reap_buyer_link_repointed refs=%d enrollments=%d",
+            report.refs_retired,
+            report.enrollments_marked_dead,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # THE EXCEPTION TYPE ONLY, never `exc` itself. A driver error on this path stringifies
+        # the statement AND its bound parameters, and the bound parameters here are buyer ids.
+        # `%s` on the type name cannot carry one.
+        logger.warning("event=reap_buyer_link_repoint_failed error=%s", type(exc).__name__)
+
+
 async def _upsert_buyer_identity_link(*, buyer_id: str, agent_id: str, agent_user_ref: str) -> Optional[str]:
     """
     Persist agent-scoped identity mapping:
@@ -499,6 +637,14 @@ async def _upsert_buyer_identity_link(*, buyer_id: str, agent_id: str, agent_use
     ref_hash = hash_agent_user_ref(ref)
     if not ref_hash:
         return None
+
+    # WP4c. WHO THIS LINK NAMED BEFORE, read while it is still readable. Both write paths below
+    # overwrite `buyer_id` in place, so this is the only moment the previous value exists. It is
+    # a peek on the same `(agent_id, agent_user_ref_hash)` key the upsert conflicts on, and it
+    # cannot raise — see `_existing_link_buyer_id`.
+    previous_buyer_id = await _existing_link_buyer_id(
+        agent_id=agent_id, agent_user_ref_hash=ref_hash
+    )
 
     # Preferred path: Postgres/modern SQLite upsert.
     try:
@@ -522,6 +668,9 @@ async def _upsert_buyer_identity_link(*, buyer_id: str, agent_id: str, agent_use
                 "buyer_id": buyer_id,
             },
         )
+        await _retire_reap_state_on_repoint(
+            old_buyer_id=previous_buyer_id, new_buyer_id=buyer_id
+        )
         return ref_hash
     except Exception:
         pass
@@ -541,6 +690,15 @@ async def _upsert_buyer_identity_link(*, buyer_id: str, agent_id: str, agent_use
             )
         )
         if int(updated or 0) > 0:
+            # THE SECOND WRITE PATH, AND IT REPOINTS TOO. This UPDATE sets `buyer_id` on a row
+            # that already existed, which is the same repoint the ON CONFLICT arm performs; a
+            # hook on only one of them is a hook that does not exist on whichever dialect takes
+            # the other. The third arm below — the INSERT reached only when this UPDATE matched
+            # NOTHING — creates a link rather than moving one, so there is no old buyer to
+            # retire and no call there.
+            await _retire_reap_state_on_repoint(
+                old_buyer_id=previous_buyer_id, new_buyer_id=buyer_id
+            )
             return ref_hash
     except Exception:
         pass

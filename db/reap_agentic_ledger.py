@@ -96,6 +96,7 @@ import json
 import re
 import sqlite3
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Sequence
 
@@ -149,6 +150,11 @@ __all__ = [
     "mark_enrollment_active",
     "mark_enrollment_dead",
     "get_active_enrollment",
+    # WP4c. Exported because its caller is OUTSIDE this rail — routes/buyer_api, the hosted
+    # checkout — and it is scoped by construction: it takes a buyer id and touches only what
+    # hangs off that buyer id. Nothing it returns identifies anybody (see `RetireReport`).
+    "RetireReport",
+    "retire_buyer_refs_for_buyer",
 ]
 
 
@@ -2494,4 +2500,172 @@ async def get_enrollment_by_reap_id(reap_enrollment_id: str) -> Optional[Dict[st
                 )
             },
         )
+    )
+
+
+# ── WP4c: retiring a buyer identity this rail no longer owns ─────────────────────────────────
+#
+# THE SITUATION, in one sentence: `routes/buyer_api._upsert_buyer_identity_link` REPOINTS an
+# `(agent_id, hash(agent_user_ref))` link from one `buyer_id` to another, and everything this
+# rail hangs off the OLD buyer id — its `reap_agentic_buyer_refs` row, and every enrollment on
+# that row's `reap_buyer_ref` — becomes unreachable the instant that happens. `_buyer_id_for`
+# mints a `u_<16hex>` buyer id on an agent's first purchase; the human behind it later signs in
+# through the hosted checkout, and the link now names their real account. Nothing joins the two.
+#
+# WHAT "UNREACHABLE" COSTS, and it is not nothing. The stranded enrollment row keeps
+# `status = 'active'`, holding `card_network`, `card_last4` and a `hosted_url`. It is a live
+# card authorization at Reap that our side has silently stopped tracking. Before this function
+# the runbook's answer was an operator SQL sweep; that sweep is still in
+# docs/runbooks/reap_agentic_purchase.md, now as an AUDIT rather than as the containment.
+
+_RETIRE_REASON_RE = re.compile(r"^[a-z0-9_:.-]{1,64}\Z")
+
+
+@dataclass(frozen=True)
+class RetireReport:
+    """What one retirement did. INTS ONLY, and that is the whole design of this type.
+
+    The caller is `routes/buyer_api`, on the hosted checkout's save path, and the only thing it
+    does with this is write two numbers into a log line. Handing back ids — the buyer id, the
+    refs, the enrollment ids — would put a durable buyer identifier and an opaque partner-facing
+    reference one `logger.info("%s", report)` away from an access log. There is no caller that
+    needs them and no way to leak a count.
+
+    FROZEN because these are a measurement of something that already happened.
+    """
+
+    refs_retired: int
+    enrollments_marked_dead: int
+
+
+# The buyer's refs. `reap_agentic_buyer_refs.buyer_id` is the PRIMARY KEY, so this returns at
+# most one row today — it is written as a set because the DELETE below is keyed on the PAIR, and
+# a read that assumed "exactly one" would have to be rewritten the day that key widens.
+_SELECT_BUYER_REFS_FOR_BUYER_SQL = """
+    SELECT reap_buyer_ref
+      FROM reap_agentic_buyer_refs
+     WHERE buyer_id = :buyer_id
+"""
+
+# Every enrollment on one ref that is not already dead. `status <> 'dead'` rather than
+# `status = 'active'`: a PENDING row carries a live `hosted_url` — a page on which a card can
+# still be enrolled — so retiring only the active one would leave the reachable half behind.
+_SELECT_LIVE_ENROLLMENTS_FOR_REF_SQL = """
+    SELECT id
+      FROM reap_agentic_enrollments
+     WHERE buyer_ref = :buyer_ref
+       AND status <> 'dead'
+"""
+
+# KEYED ON THE PAIR, not on the buyer id alone. Between the SELECT above and this statement the
+# row may have been repointed to a different ref by a concurrent path; deleting by buyer_id
+# would then delete a ref this call never looked at and never retired the enrollments of.
+_DELETE_BUYER_REF_SQL = """
+    DELETE FROM reap_agentic_buyer_refs
+     WHERE buyer_id = :buyer_id
+       AND reap_buyer_ref = :reap_buyer_ref
+"""
+
+
+async def retire_buyer_refs_for_buyer(buyer_id: str, *, reason: str) -> RetireReport:
+    """Retire this rail's state for a buyer id that no longer owns its agent link.
+
+    For every `reap_agentic_buyer_refs` row of `buyer_id`: mark every non-dead enrollment on that
+    row's `reap_buyer_ref` dead with `reap_status = reason`, then DELETE the refs row.
+
+    ── THE ORDER IS THE CRASH RECOVERY, AND IT IS WHY THERE IS NO TRANSACTION ───────────────
+
+    No `database.transaction()`. The `databases` 0.7.0 rule this repo has been bitten by twice
+    (see reference_databases_transaction_statements_bypass_the_query_lock) is that transaction
+    statements share one connection across child tasks and bypass the query lock, so wrapping
+    this would turn a concurrent write elsewhere into a silently lost one. What replaces it is an
+    ORDER in which every prefix of the work is a state the next call heals:
+
+      enrollments dead FIRST — a crash here leaves the refs row present, so the next call finds
+                               it again, marks the remaining ones (the already-dead ones are
+                               no-ops) and finishes the job.
+      refs row deleted LAST  — a crash after it would mean the enrollments were already dead,
+                               because they were dealt with before it.
+
+    The one order that is NOT safe is the reverse: deleting the refs row first loses the only
+    handle on the enrollments, and they stay `active` forever with nothing pointing at them.
+
+    ── IDEMPOTENT, AND THE COUNTS SAY SO ───────────────────────────────────────────────────
+
+    A second call returns `RetireReport(0, 0)`: the refs row is gone, so there is nothing to
+    read and nothing to delete. That is the property the caller relies on, because the caller is
+    a hook on a route that a buyer can hit twice in a second.
+
+    ── WHY THE REFS ROW IS DELETED AND NOT LEFT ────────────────────────────────────────────
+
+    The runbook USED to say "leave the row alone — it is the consent record". That was written
+    when nothing retired it, and it is reversed here on the owner's decision (2026-09-22): a
+    consent tag on a buyer id that no agent link names is not a record anybody can find — the
+    runbook's own audit query defines the orphan as exactly that row — and leaving it keeps a
+    `reap_buyer_ref` alive under `uq_reap_agentic_buyer_refs_ref` for an identity that will never
+    transact again. The real account's next purchase mints a fresh ref and records a fresh
+    consent through `_reap_buyer_ref`, so the live buyer is never left without one.
+
+    WHAT THAT COSTS, STATED PLAINLY: `reap_agentic_purchases` has no consent column, so after
+    this runs the `consent_version` the RETIRED identity accepted is not retained anywhere. The
+    purchases themselves survive untouched — they are owned by `(agent_id, agent_user_ref_hash)`
+    on the purchase row, which the repoint does not change, so purchase history stays readable
+    by the agent that made it.
+
+    ── ARGUMENTS ───────────────────────────────────────────────────────────────────────────
+
+    `reason` is written into `reap_agentic_enrollments.reap_status`, a `VARCHAR(64)`, and is
+    validated against the same lowercase vocabulary `_require_error_code` enforces on
+    `last_error_code`. It is REFUSED rather than folded or truncated for the same reason: a
+    truncated reason names a different reason, and this column is what an operator reads to find
+    out why a card stopped being honoured.
+
+    Raises `ValueError` on a bad `buyer_id` or a bad `reason`. Raises whatever the driver raises
+    on a database error — this function does not decide whether its caller can survive a failure,
+    and the one caller that cannot (the hosted checkout hook) wraps it itself.
+    """
+    wanted = _require_lookup_id(buyer_id, "buyer_id")
+    if not isinstance(reason, str) or not _RETIRE_REASON_RE.match(reason):
+        raise ValueError(
+            f"reason must match {_RETIRE_REASON_RE.pattern} (lowercase, at most 64 characters), "
+            f"got {reason!r}"
+        )
+
+    rows = await database.fetch_all(_SELECT_BUYER_REFS_FOR_BUYER_SQL, {"buyer_id": wanted})
+    refs = [
+        ref
+        for ref in (str(dict(row).get("reap_buyer_ref") or "").strip() for row in rows or [])
+        if ref
+    ]
+
+    refs_retired = 0
+    enrollments_marked_dead = 0
+    for ref in refs:
+        live = await database.fetch_all(
+            _SELECT_LIVE_ENROLLMENTS_FOR_REF_SQL, {"buyer_ref": ref}
+        )
+        for enrollment_row in live or []:
+            enrollment_id = str(dict(enrollment_row).get("id") or "").strip()
+            if not enrollment_id:
+                continue
+            # REUSED, NOT REIMPLEMENTED. `mark_enrollment_dead` is the one writer of
+            # `status = 'dead'`: it clears `hosted_url` in the same statement (the live card page
+            # is the point of the exercise), carries its own `status <> 'dead'` conjunct so a row
+            # somebody else retired in the gap is a None rather than a second write, and is
+            # dialect-split already. A hand-written UPDATE here would be a second spelling of the
+            # rail's retirement semantics.
+            if await mark_enrollment_dead(enrollment_id, reap_status=reason) is not None:
+                enrollments_marked_dead += 1
+        await database.execute(
+            _DELETE_BUYER_REF_SQL, {"buyer_id": wanted, "reap_buyer_ref": ref}
+        )
+        # COUNTED FROM WHAT WAS READ AND THEN DELETED, not from a driver rowcount. `databases`
+        # 0.7.0 does not give a usable rowcount for `execute()` on both dialects (the repo has a
+        # reference note on exactly that), so a count derived from one would be a number that is
+        # right on SQLite and absent on Postgres. This counts the refs this call took
+        # responsibility for, which is what the log line means.
+        refs_retired += 1
+
+    return RetireReport(
+        refs_retired=refs_retired, enrollments_marked_dead=enrollments_marked_dead
     )
