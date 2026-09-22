@@ -1,0 +1,61 @@
+-- 233: THE CONSENT THAT WAS IN FORCE WHEN THIS PURCHASE WAS OPENED, on the purchase row.
+--
+-- WHY THIS EXISTS WHEN MIGRATION 227 ARGUED THE OPPOSITE. 227's header says a copy per purchase
+-- would be "the same string repeated" and that the question an auditor asks is "under which
+-- version is this buyer enrolled". Both halves of that were true when it was written and one of
+-- them stopped being true: WP4c (#2236) taught the hosted-checkout sign-in path to DELETE the
+-- `reap_agentic_buyer_refs` row when a buyer identity is repointed, and that row was the sole
+-- carrier of the tag. So for every purchase an agent-minted identity made, the consent evidence
+-- now disappears the first time the human behind it signs in — the one event that makes the
+-- purchase worth auditing. The repeated string is the point: it is repeated ON A ROW NOTHING
+-- DELETES, next to what was bought, and it answers the OTHER question — "under which version was
+-- THIS purchase opened" — which the refs row could only ever answer for the latest one.
+--
+-- The refs row keeps its own pair and keeps its meaning: LATEST-WINS, for re-use on the next
+-- purchase and for `services/reap_agentic_purchase._require_cart_link_consent` to check a
+-- minted identity against. These two columns are the EVIDENCE; that one is the CURRENT STATE.
+-- Owner decision, 2026-09-22.
+--
+-- IMMUTABLE AFTER THE INSERT, which is the property that makes it evidence rather than a field.
+-- Neither column is in `db/reap_agentic_ledger._TRANSITION_FIELDS`, so no poller step and no
+-- webhook can revise them, and neither is touched by the terminal write — the statement that
+-- NULLs `shipping_address` and `buyer_email` leaves these two alone, on purpose. A completed
+-- purchase therefore keeps the consent and keeps none of the PII, which is exactly the pair an
+-- auditor needs and the regulator's reason for asking.
+--
+-- NOT PII. A version tag names a document the owner published; it names no person. That is why
+-- it survives the terminal write while the address and the email do not, and it is also why
+-- these two ARE in `PUBLIC_PURCHASE_COLUMNS`: the buyer's own consent tag is the buyer's to read
+-- back, unlike the catalog assertions and the partner evidence the allowlist keeps out.
+--
+-- NULLABLE, AND THAT IS NOT A LOOSE END — the same argument 227 makes for the refs row. Rows
+-- opened before this migration exist and a NOT NULL would need a backfill, which would mean
+-- inventing a consent nobody gave. NULL reads as "we do not know", which is the truth about
+-- those rows and is distinguishable from every value. What makes it unreachable for NEW rows is
+-- not the column: `services/reap_agentic_purchase.start_purchase` refuses `consent_required` on
+-- BOTH lanes before the INSERT, so a purchase opened from today on cannot have a NULL here.
+--
+-- VARCHAR(32), matching `reap_agentic_buyer_refs.consent_version` exactly. The route caps the
+-- tag at 32 printable characters before it binds and the ledger caps it again; a value past the
+-- cap is refused rather than truncated at the driver, because A TRUNCATED VERSION TAG NAMES A
+-- DIFFERENT VERSION. Two columns of the same width is what lets the two stores be compared for
+-- equality, which is what `_require_cart_link_consent` does and what the route's own test
+-- asserts for the same request.
+--
+-- consented_at IS THE MOMENT THIS PURCHASE WAS OPENED UNDER THAT TAG, not the moment the buyer
+-- first accepted it. `create_purchase` defaults it to `now()` when a version is given, so it is
+-- within milliseconds of the refs row's `consented_at` for the same request — the two stores
+-- agree at open time, and drift from there because the refs row is rewritten by every later
+-- purchase and this row is never rewritten at all.
+--
+-- Production deploys skip db/migrations/, so both ADD COLUMNs are ALSO in
+-- db/schema_guard.ensure_required_schema_light, in BOTH dialect branches, each statement in its
+-- own try. The two must build the SAME SCHEMA, not the same bytes (the SQLite twin substitutes
+-- TIMESTAMP for TIMESTAMPTZ, which it must). The whole-table parity test
+-- tests/test_reap_agentic_ledger_postgres.py::test_the_self_heal_builds_the_same_schema_as_the_
+-- migration reads what the DATABASE built from each, so a divergence here is a failure there
+-- rather than a surprise in production.
+
+ALTER TABLE IF EXISTS reap_agentic_purchases
+    ADD COLUMN IF NOT EXISTS consent_version VARCHAR(32),
+    ADD COLUMN IF NOT EXISTS consented_at TIMESTAMPTZ;

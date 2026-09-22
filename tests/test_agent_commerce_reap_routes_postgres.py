@@ -98,6 +98,11 @@ _MIGRATIONS = (
     # does not span that table today — but a build that disagrees with the self-heal is a trap
     # waiting for whoever widens the fingerprint.
     _MIGRATIONS_DIR / "232_tierb_verdict_vocabulary.sql",
+    # 233 adds consent_version + consented_at to reap_agentic_purchases. The self-heal carries
+    # it, so a migration build without it is not the schema production has — and every POST this gate makes
+    # would fail on an UndefinedColumn. See
+    # feedback_a_later_migration_that_alters_a_table_breaks_that_tables_own_parity_test.
+    _MIGRATIONS_DIR / "233_reap_agentic_purchase_consent.sql",
 )
 
 #: Same convention as the ledger's gate: this file DROPS its tables, so it must be INCAPABLE of
@@ -1200,9 +1205,20 @@ async def test_the_minted_identity_is_never_in_a_response(client):
 
     read = await client.get(f"{BASE}/purchases/{resp.json()['purchase_id']}")
     listed = await client.get(f"{BASE}/purchases")
+    # THE CONSENT TAG CAME OFF THIS LIST AT MIGRATION 233, deliberately and with the owner's
+    # decision behind it. It was here because WP4b had no reason to hand it back and the
+    # allowlist was kept minimal; 233 makes it the one column on the purchase row that records
+    # something the OWNER did, and a buyer's own consent tag is theirs to read. The three
+    # IDENTITY values below are what this test is actually about and they have not moved.
     for body in (resp.text, read.text, listed.text):
-        for secret in (buyer_id, ref, hash_agent_user_ref(USER_REF), CONSENT):
+        for secret in (buyer_id, ref, hash_agent_user_ref(USER_REF)):
             assert secret not in body
+
+    # Stated rather than left as an absence: the tag IS in the owner-facing reads now, so a
+    # future edit that puts it back on the secret list above has to argue with this line.
+    assert CONSENT in read.text and CONSENT in listed.text
+    # And it is still absent from the 202, which carries no purchase fields at all.
+    assert CONSENT not in resp.text
 
 
 async def test_a_non_shopify_row_is_refused(client):
@@ -1625,3 +1641,81 @@ async def test_a_failing_unique_index_does_not_starve_the_keys_table():
             "WHERE table_schema = 'public' AND table_name = :t",
             {"t": table},
         ) == 1, f"{table} was starved by the failing index"
+
+
+# ── mig 233: the two stores agree at open time, on the production dialect ────────────────────
+
+
+async def test_the_route_writes_the_same_consent_to_both_stores_on_postgres(client):
+    """ONE VALIDATED STRING, TWO WRITERS, ONE REQUEST. `_reap_buyer_ref` records the buyer's
+    LATEST consent and `start_purchase` records what THIS purchase was opened under; a mutant
+    that hands one of them a different value leaves two stores disagreeing about a human act,
+    and every test that checks only one of them stays green.
+
+    On this dialect the two columns are a real `VARCHAR(32)` and a real `timestamptz`, so the
+    comparison is one the database performed rather than one Python performed on two strings.
+    """
+    await _seed_catalog()
+    await _seed_eligibility()
+
+    resp = await client.post(f"{BASE}/purchases", json=_body())
+    assert resp.status_code == 202
+    purchase_id = resp.json()["purchase_id"]
+
+    row = await database.fetch_one(
+        """
+        SELECT p.consent_version AS on_purchase,
+               p.consented_at    AS purchase_at,
+               r.consent_version AS on_buyer,
+               r.consented_at    AS buyer_at
+          FROM reap_agentic_purchases p
+         CROSS JOIN reap_agentic_buyer_refs r
+         WHERE p.id = :i
+        """,
+        {"i": purchase_id},
+    )
+    got = dict(row)
+    assert got["on_purchase"] == CONSENT
+    assert got["on_purchase"] == got["on_buyer"], (
+        "the route wrote a different consent tag to the purchase than to the buyer identity"
+    )
+    # Both are aware `timestamptz` values written seconds apart in the same request.
+    assert got["purchase_at"].tzinfo is not None and got["buyer_at"].tzinfo is not None
+    assert abs((got["purchase_at"] - got["buyer_at"]).total_seconds()) < 60
+
+
+async def test_a_refused_consent_writes_to_neither_store_on_postgres(client):
+    """The control: `consent_required` is decided before both writes."""
+    await _seed_catalog()
+    await _seed_eligibility()
+
+    resp = await client.post(
+        f"{BASE}/purchases", json=_body(buyer=_buyer(consent_version="v" * 33))
+    )
+    assert resp.status_code == 400
+    assert _error(resp) == "consent_required"
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_buyer_refs") == 0
+
+
+async def test_a_replay_moves_only_the_buyers_tag_on_postgres(client):
+    """The two stores mean different things, and a replay is where that shows: the buyer's tag
+    is current state and moves; the purchase's is evidence and does not."""
+    await _seed_catalog()
+    await _seed_eligibility()
+
+    first = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="pg-233"))
+    purchase_id = first.json()["purchase_id"]
+
+    again = await client.post(
+        f"{BASE}/purchases",
+        json=_body(idempotency_key="pg-233", buyer=_buyer(consent_version="v-later")),
+    )
+    assert again.json()["purchase_id"] == purchase_id
+
+    assert await database.fetch_val(
+        "SELECT consent_version FROM reap_agentic_buyer_refs"
+    ) == "v-later"
+    assert await database.fetch_val(
+        "SELECT consent_version FROM reap_agentic_purchases WHERE id = :i", {"i": purchase_id}
+    ) == CONSENT

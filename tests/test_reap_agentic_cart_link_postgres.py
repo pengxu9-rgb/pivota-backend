@@ -25,6 +25,8 @@ import os
 import re
 import sys
 
+from datetime import datetime, timezone
+
 import pytest
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -52,7 +54,12 @@ pytestmark = pytest.mark.skipif(
 
 _MIG_229 = MIGRATIONS_DIR / "229_reap_agentic_purchase_item_source.sql"
 _MIG_230 = MIGRATIONS_DIR / "230_conversion_click_claims.sql"
-assert MIGRATIONS[-2:] == (_MIG_229, _MIG_230)
+_MIG_233 = MIGRATIONS_DIR / "233_reap_agentic_purchase_consent.sql"
+# THE TAIL, NOT A SLICE OF A FIXED WIDTH. This used to pin `MIGRATIONS[-2:]`, which asserted
+# both that 229 and 230 are present AND that nothing follows them — so migration 233, which
+# legitimately follows, broke an assertion that was never about it. The membership-and-order
+# form says what was actually meant: these three are applied, in this order, last.
+assert MIGRATIONS[-3:] == (_MIG_229, _MIG_230, _MIG_233)
 
 _NEW_CONSTRAINTS = (
     "ck_reap_agentic_purchases_item_source",
@@ -391,6 +398,11 @@ async def test_two_connections_creating_cart_link_purchases_on_one_click_leave_o
             "click_id": "clk_race_create", "return_url": None, "queries_tried": None,
             "next_poll_at": None, "shipping_address": None, "buyer_email": None,
             "accept_variant_labels": None, "also_accept_domains": None, "market_country": "US",
+            # mig 233. This dict is keyed off the STATEMENT'S OWN bind order, so a column added
+            # to the INSERT has to be added here too — which is the point of building it this
+            # way: the test executes the module's real SQL, not a paraphrase that could drift.
+            "consent_version": "terms-2026-09",
+            "consented_at": datetime.now(timezone.utc),
             "item_source": "cart_link", "cart_url": CART_URL,
         }
         return [values[name] for name in order]

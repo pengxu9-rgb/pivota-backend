@@ -638,8 +638,11 @@ inline, and that call:
   a pending row's hosted page is a page a card can still be entered on;
 * then **deletes** the old `reap_agentic_buyer_refs` row. A consent tag on a buyer id no link
   mentions is a record nobody can find; the live account records a fresh consent at its next
-  purchase. What this costs: `reap_agentic_purchases` has no consent column, so the
-  `consent_version` the *retired* identity accepted is not retained after the sweep;
+  purchase. **This does not cost the consent evidence** — since migration **233** every
+  `reap_agentic_purchases` row carries its own `consent_version` / `consented_at`, the tag that
+  was in force *when that purchase was opened*, and the sweep does not touch that table. The
+  refs row's pair is only the **latest** consent, kept for re-use on the next purchase and for
+  the cart-link lane's identity check;
 * leaves **purchases alone** — a purchase is owned by `(agent_id, agent_user_ref_hash)` on its own
   row, which the repoint does not change.
 
@@ -748,7 +751,37 @@ result = await rc.revoke_enrollment("<reap_enrollment_id>")   # the PARTNER's id
 section used to say "leave the `reap_agentic_buyer_refs` row alone — it is the consent record".
 WP4c reverses that on the owner's decision (2026-09-22): the row is deleted, because a consent tag
 on a buyer id no link mentions is not a record anybody can find, and the account the buyer actually
-uses always carries a current one. The cost is stated above.
+uses always carries a current one.
+
+**Older copies of this page said the delete costs the consent evidence. Migration 233 removed that
+cost** — the evidence lives on the purchase row now, and the refs row's tag is only the latest,
+for re-use. To read what a given purchase was opened under:
+
+```sql
+SELECT id, state, merchant_domain, product_name,
+       consent_version, consented_at, created_at, terminal_at
+  FROM reap_agentic_purchases
+ WHERE id = '<rp_…>';
+```
+
+`consent_version` is `NULL` **only** on rows opened before 233 — nothing the rail opens now can
+have one, because `services/reap_agentic_purchase.start_purchase` refuses `consent_required` on
+both lanes before the `INSERT`. `consented_at` is aware UTC on both dialects. Neither column is
+ever rewritten: they are absent from the transition statement's field list, so no poller step can
+revise them, and the terminal write that `NULL`s `shipping_address` and `buyer_email` leaves them
+alone. A completed purchase therefore keeps its consent and none of the buyer's PII. To census the
+rail:
+
+```sql
+SELECT consent_version, COUNT(*), MIN(created_at), MAX(created_at)
+  FROM reap_agentic_purchases
+ GROUP BY consent_version
+ ORDER BY 2 DESC;
+```
+
+A **growing** `NULL` group here means the rail is opening purchases with no consent evidence,
+which the service is supposed to make impossible — treat it the way you would treat a growing
+`NULL` group on the buyer-refs census above.
 
 ### 2. The merchant must have an offer of its own, in the market's currency
 

@@ -71,6 +71,11 @@ _MIGRATIONS = (
     # 230 builds the click-claims table. The self-heal builds it too, so the migration list
     # applies it for parity with what the self-heal leaves behind.
     _MIGRATIONS_DIR / "230_conversion_click_claims.sql",
+    # 233 adds consent_version + consented_at to reap_agentic_purchases. The self-heal carries
+    # it, so a migration build without it is not the schema production has — and every purchase this suite opens
+    # would fail on an UndefinedColumn. See
+    # feedback_a_later_migration_that_alters_a_table_breaks_that_tables_own_parity_test.
+    _MIGRATIONS_DIR / "233_reap_agentic_purchase_consent.sql",
 )
 
 # Same convention as tests/test_reap_agentic_ledger_postgres.py: this gate DROPS its tables, so
@@ -88,6 +93,8 @@ _SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect
 
 RETURN_URL = "https://agent.pivota.cc/reap/return?click=abc123"
 EMAIL = "ada@example.test"
+#: mig 233 — the consent tag every purchase is opened under on this rail.
+CONSENT = "terms-2026-09"
 ADDRESS = {
     "firstName": "Ada",
     "lastName": "Lovelace",
@@ -387,6 +394,10 @@ async def _start(**over) -> str:
         quantity=1,
         click_id="click_abc",
         return_url=RETURN_URL,
+        # mig 233: REQUIRED on every lane now, not only cart_link. Passed by the helper so the
+        # suites that are about something else keep testing that something else; the tests that
+        # are about consent override it explicitly.
+        consent_version=CONSENT,
     )
     kwargs.update(over)
     return await svc.start_purchase(**kwargs)
@@ -1426,3 +1437,51 @@ async def test_a_present_but_empty_items_still_refuses_on_postgres(reap, attribu
     purchase_id = await _drive_to_completed()
     row = await _get(purchase_id)
     assert row["state"] == "refused" and row["last_error_code"] == "quote_items_mismatch"
+
+
+# ── mig 233: the service's own consent gate, on the production dialect ───────────────────────
+
+
+async def _purchase_count() -> int:
+    from db.database import database
+
+    return int(await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases"))
+
+
+async def test_a_purchase_opened_through_this_service_carries_its_consent_on_postgres():
+    import db.reap_agentic_ledger as ledger
+
+    purchase_id = await _start()
+    row = await ledger.get_purchase_internal(purchase_id)
+    assert row["consent_version"] == CONSENT
+    # A real `timestamptz`, aware, not a string that looks like one.
+    assert row["consented_at"] is not None and row["consented_at"].tzinfo is not None
+
+
+async def test_the_variant_lane_refuses_without_a_consent_on_postgres():
+    """THE SERVICE'S OWN GATE, not the route's. Both exist, and only a test that calls
+    `start_purchase` DIRECTLY can see this one — the route validates first, so every route-level
+    test stays green with the service's check removed. That is not hypothetical: the mutant that
+    removes it survived this gate until this test existed.
+    """
+    import services.reap_agentic_purchase as svc
+
+    before = await _purchase_count()
+    with pytest.raises(svc.PurchaseRefused) as caught:
+        await _start(consent_version=None)
+    assert caught.value.reason == "consent_required"
+    assert await _purchase_count() == before, "a refused consent left a row behind"
+
+
+@pytest.mark.parametrize("value", ["", "   ", "v" * 33, "v1\x00"])
+async def test_a_malformed_consent_is_refused_at_the_service_on_postgres(value):
+    """The NUL case is the one only this dialect can judge: reaching an asyncpg bind it is an
+    untranslatable-character error naming a parameter index, i.e. a 500. Refused first, so both
+    dialects answer `consent_required` and the answer names the field."""
+    import services.reap_agentic_purchase as svc
+
+    before = await _purchase_count()
+    with pytest.raises(svc.PurchaseRefused) as caught:
+        await _start(consent_version=value)
+    assert caught.value.reason == "consent_required"
+    assert await _purchase_count() == before

@@ -68,6 +68,11 @@ _MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "db/migrations"
 _MIGRATIONS = (
     _MIGRATIONS_DIR / "224_reap_agentic_ledger.sql",
     _MIGRATIONS_DIR / "225_reap_agentic_purchase_hints.sql",
+    # 233 adds consent_version + consented_at to reap_agentic_purchases. The self-heal carries
+    # it, so a migration build without it is not the schema production has — and every purchase this suite opens
+    # would fail on an UndefinedColumn. See
+    # feedback_a_later_migration_that_alters_a_table_breaks_that_tables_own_parity_test.
+    _MIGRATIONS_DIR / "233_reap_agentic_purchase_consent.sql",
 )
 
 # Same convention as the other gates on this rail: this file DROPS its tables, so it must be
@@ -79,6 +84,8 @@ _SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect
 
 RETURN_URL = "https://agent.pivota.cc/reap/return?click=abc123"
 EMAIL = "ada@example.test"
+#: mig 233 — the consent tag every purchase is opened under on this rail.
+CONSENT = "terms-2026-09"
 ADDRESS = {
     "firstName": "Ada",
     "lastName": "Lovelace",
@@ -371,6 +378,10 @@ async def _start(**over) -> str:
         quantity=1,
         click_id="click_abc",
         return_url=RETURN_URL,
+        # mig 233: REQUIRED on every lane now, not only cart_link. Passed by the helper so the
+        # suites that are about something else keep testing that something else; the tests that
+        # are about consent override it explicitly.
+        consent_version=CONSENT,
     )
     kwargs.update(over)
     return await svc.start_purchase(**kwargs)

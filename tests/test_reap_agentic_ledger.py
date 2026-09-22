@@ -544,6 +544,13 @@ _EXPECTED_PUBLIC_COLUMNS = {
     "quoted_total_minor", "final_total_minor", "shipping_minor", "tax_minor", "hosted_url",
     "hosted_url_expires_at", "reap_quote_expires_at", "reap_order_id", "refusal_reason",
     "last_error_code", "created_at", "updated_at", "terminal_at",
+    # mig 233. THE BUYER'S OWN CONSENT TAG IS THEIRS TO READ — the one column on this row that
+    # records something the OWNER did, rather than something we or a partner did. Not PII (it
+    # names a document, not a person), which is also why the terminal write leaves it while it
+    # NULLs the email and the address. Added here DELIBERATELY, as an edit to this literal: the
+    # partition test below forces the choice, and the allowlist's whole design is that a new
+    # column is invisible until somebody writes it into both lists.
+    "consent_version", "consented_at",
 }
 _EXPECTED_NEVER_PUBLIC = {
     "buyer_ref", "agent_id", "agent_user_ref_hash", "buyer_email", "shipping_address",
@@ -2996,10 +3003,17 @@ async def test_the_self_heal_adds_the_hint_columns_to_a_224_shaped_database():
 
     after = await _purchase_columns()
     assert set(_HINT_COLUMNS) <= after
-    # A 224-shaped database is ALSO pre-229, so the heal lands mig 229's two columns in the same
-    # run. Named explicitly rather than loosened to `<=`: "nothing else" is still the assertion.
-    assert after - before == set(_HINT_COLUMNS) | {"item_source", "cart_url"}, (
-        "the heal added something other than the three mig-225 and two mig-229 columns"
+    # A 224-shaped database is ALSO pre-229 and pre-233, so the heal lands those migrations'
+    # columns in the same run. Named explicitly rather than loosened to `<=`: "nothing else" is
+    # still the assertion.
+    assert after - before == set(_HINT_COLUMNS) | {
+        "item_source",
+        "cart_url",
+        "consent_version",
+        "consented_at",
+    }, (
+        "the heal added something other than the three mig-225, two mig-229 and two mig-233 "
+        "columns"
     )
 
     # And the rail works on the healed table.
@@ -3470,4 +3484,362 @@ async def test_the_bulk_sweeps_still_write_their_own_terminal_codes():
     assert stuck["id"] in await ledger.fail_exhausted_purchases(5)
     assert (await ledger.get_purchase_internal(stuck["id"]))["last_error_code"] == (
         "attempts_exhausted"
+    )
+
+
+# ── migration 233: the consent that was in force when the purchase was opened ────────────────
+#
+# WHAT THESE TESTS ARE FOR, in one sentence: the tag has to be UNREVISABLE and UNDELETABLE, and
+# "unrevisable" has three separate mechanisms behind it (absent from `_TRANSITION_FIELDS`,
+# absent from the transition statement, absent from every sweep), each of which a mutant can
+# break on its own.
+
+CONSENT_TAG = "terms-2026-09"
+
+
+async def test_a_purchase_opened_with_a_consent_carries_both_columns():
+    purchase = await _mk(consent_version=CONSENT_TAG)
+    assert purchase["consent_version"] == CONSENT_TAG
+    assert isinstance(purchase["consented_at"], datetime)
+    assert purchase["consented_at"].tzinfo is not None, (
+        "consented_at must come back aware — a naive one read as local time is the wrong moment"
+    )
+
+    read = await ledger.get_purchase_internal(purchase["id"])
+    assert read["consent_version"] == CONSENT_TAG
+    assert read["consented_at"] == purchase["consented_at"]
+
+
+async def test_a_purchase_opened_without_one_reads_as_none():
+    """THE PRE-233 SHAPE. The column is nullable for rows this rail opened before the migration,
+    and None must be distinguishable from every value rather than defaulted into one."""
+    purchase = await _mk()
+    assert purchase["consent_version"] is None
+    assert purchase["consented_at"] is None
+
+
+async def test_a_caller_supplied_consented_at_is_stored_as_given():
+    """The route and the ledger write the pair in the same request; a caller that wants them to
+    be the SAME instant rather than milliseconds apart can say so."""
+    moment = datetime(2026, 9, 20, 11, 22, 33, tzinfo=timezone.utc)
+    purchase = await _mk(consent_version=CONSENT_TAG, consented_at=moment)
+    assert purchase["consented_at"] == moment
+
+
+@pytest.mark.parametrize(
+    "bad,why",
+    [
+        ("", "blank"),
+        ("   ", "whitespace only"),
+        ("v" * 33, "past the column's width"),
+        ("v1\x00", "a NUL"),
+        ("v1\nv2", "an interior newline"),
+        ("v1\x1b[31m", "an ANSI escape"),
+        (123, "not a string"),
+        (True, "not a string"),
+    ],
+)
+async def test_a_malformed_consent_is_refused_and_leaves_no_row(bad, why):
+    """REFUSED BEFORE THE INSERT, like the hints: a row written and then rejected would be a
+    'resolving' row holding the buyer's address with no consent and nothing to terminate it.
+
+    A BLANK IS NOT None. `""` is a caller that meant to send a tag; storing it as NULL would make
+    it indistinguishable from a pre-233 row, which is the one distinction the column exists for.
+    """
+    before = await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases")
+    with pytest.raises(ValueError):
+        await _mk(consent_version=bad)
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == before, (
+        f"a consent that is {why} left a row behind"
+    )
+
+
+async def test_a_consented_at_without_a_version_is_refused():
+    """A moment attached to no version records nothing."""
+    with pytest.raises(ValueError, match="without a consent_version"):
+        await _mk(consented_at=datetime(2026, 9, 20, tzinfo=timezone.utc))
+
+
+async def test_a_naive_consented_at_is_refused_rather_than_assumed_utc():
+    """`_bind_dt` ASSUMES UTC for the rail's own clocks, and that is right for them. This value
+    is evidence about a human act: a timestamp read eight hours off is evidence of the wrong
+    moment, so the caller is told rather than silently repaired."""
+    with pytest.raises(ValueError, match="timezone-aware"):
+        await _mk(consent_version=CONSENT_TAG, consented_at=datetime(2026, 9, 20, 11, 0, 0))
+
+
+async def test_a_consent_tag_the_route_accepts_is_not_refused_here():
+    """THE TWO VALIDATORS MUST ACCEPT THE SAME SET. The route validates and writes the tag onto
+    the buyer-ref row, then calls this module; a NARROWER rule here would refuse, AFTER the
+    consent had been recorded, a value the route had already accepted — two stores disagreeing,
+    and a refusal that arrives too late to prevent it.
+
+    These are all values `routes.agent_commerce_reap._consent_version` returns unchanged.
+    """
+    for n, tag in enumerate(("v1", "terms 2026-09", "Terms/v2 (EU)", "条款-v1", "x" * 32)):
+        purchase = await _mk(consent_version=tag, buyer_ref=f"bref_tag_{n}")
+        assert purchase["consent_version"] == tag
+
+
+async def test_the_consent_columns_are_not_transition_fields():
+    """THE MUTANT THIS KILLS: adding them to `_TRANSITION_FIELDS`. A poller step that could
+    rewrite the tag could rewrite what the buyer is recorded as having agreed to."""
+    assert "consent_version" not in ledger._TRANSITION_FIELDS
+    assert "consented_at" not in ledger._TRANSITION_FIELDS
+
+    # And the STATEMENT does not name them either — the tuple and the SQL are two places a
+    # mutant can reach, and only one of them is what the database acts on.
+    for name in ("_TRANSITION_SQL", "_TRANSITION_SQL_SQLITE"):
+        sql = getattr(ledger, name)
+        assert "consent_version" not in sql, f"{name} writes consent_version"
+        assert "consented_at" not in sql, f"{name} writes consented_at"
+
+
+async def test_a_transition_cannot_change_the_consent():
+    """The behavioural reading of the above: passing the field is a TypeError at the call site,
+    not a silently dropped write."""
+    purchase = await _mk(consent_version=CONSENT_TAG)
+    with pytest.raises(TypeError):
+        await ledger.transition(
+            purchase["id"],
+            from_states=["resolving"],
+            to_state="quoting",
+            consent_version="terms-forged",
+        )
+    moved = await ledger.transition(
+        purchase["id"], from_states=["resolving"], to_state="quoting"
+    )
+    assert moved["consent_version"] == CONSENT_TAG
+
+
+@pytest.mark.parametrize("terminal,from_state", sorted(_REACHES_TERMINAL.items()))
+async def test_the_terminal_write_keeps_the_consent_and_nulls_the_pii(terminal, from_state):
+    """THE WHOLE POINT OF MIGRATION 233, as a property of the one statement that writes a
+    terminal state: the buyer's email and address go, the consent stays.
+
+    BOTH HALVES IN ONE TEST, deliberately. "The consent survives" on its own would pass on a
+    build where the terminal write had stopped nulling ANYTHING, which is a far worse defect.
+    """
+    purchase = await _mk(state=from_state, consent_version=CONSENT_TAG)
+    assert purchase["buyer_email"] and purchase["shipping_address"]
+
+    done = await ledger.transition(purchase["id"], from_states=[from_state], to_state=terminal)
+    assert done["state"] == terminal
+    assert done["buyer_email"] is None, "the terminal write stopped nulling the email"
+    assert done["shipping_address"] is None, "the terminal write stopped nulling the address"
+    assert done["consent_version"] == CONSENT_TAG, (
+        "the terminal write took the consent evidence with the PII"
+    )
+    assert done["consented_at"] is not None
+
+
+async def test_the_bulk_sweeps_keep_the_consent_too():
+    """The two sweeps write a terminal state WITHOUT going through `transition`, so the rule
+    above does not reach them — they are their own statements and their own mutants."""
+    expired = await _mk(state="needs_enrollment", consent_version=CONSENT_TAG)
+    await _set_clock_column(
+        expired["id"], "state_entered_at", "datetime('now', '-99999 seconds')"
+    )
+    assert expired["id"] in await ledger.expire_overdue_purchases(max_age_seconds=60)
+    swept = await ledger.get_purchase_internal(expired["id"])
+    assert swept["buyer_email"] is None and swept["consent_version"] == CONSENT_TAG
+
+    stuck = await _mk(state="quoting", buyer_ref="bref_stuck2", consent_version=CONSENT_TAG)
+    await database.execute(
+        "UPDATE reap_agentic_purchases SET attempts = 99 WHERE id = :i", {"i": stuck["id"]}
+    )
+    assert stuck["id"] in await ledger.fail_exhausted_purchases(5)
+    failed = await ledger.get_purchase_internal(stuck["id"])
+    assert failed["buyer_email"] is None and failed["consent_version"] == CONSENT_TAG
+
+
+async def test_the_owner_can_read_their_own_consent_tag():
+    """IN the allowlist, unlike every other column added to this table since 224. A buyer's own
+    consent tag is theirs to read — see the note on PUBLIC_PURCHASE_COLUMNS."""
+    purchase = await _mk(consent_version=CONSENT_TAG)
+    view = await ledger.get_purchase_for_owner(purchase["id"], "agent_one", "hash_alice")
+    assert view["consent_version"] == CONSENT_TAG
+    assert view["consented_at"] is not None
+
+    assert "consent_version" in ledger.PUBLIC_PURCHASE_COLUMNS
+    assert "consented_at" in ledger.PUBLIC_PURCHASE_COLUMNS
+
+    listed = await ledger.list_purchases_for_owner("agent_one", "hash_alice")
+    assert listed[0]["consent_version"] == CONSENT_TAG
+
+
+async def test_retiring_the_buyer_refs_row_leaves_the_purchase_consent_intact():
+    """WP4c's repoint DELETES the refs row — which was the only carrier of the tag before 233.
+    This is the defect migration 233 exists to close, tested through the real sweep."""
+    await database.execute(
+        "INSERT INTO reap_agentic_buyer_refs "
+        "(buyer_id, reap_buyer_ref, consent_version, consented_at) "
+        "VALUES ('u_abc', 'bref_alice', :c, CURRENT_TIMESTAMP)",
+        {"c": CONSENT_TAG},
+    )
+    purchase = await _mk(consent_version=CONSENT_TAG)
+    assert (await ledger.get_buyer_ref_consent("bref_alice"))["consent_version"] == CONSENT_TAG
+
+    report = await ledger.retire_buyer_refs_for_buyer("u_abc", reason="buyer_link_repointed")
+    assert report.refs_retired == 1
+
+    # The refs row is gone — the evidence it used to carry went with it.
+    assert await ledger.get_buyer_ref_consent("bref_alice") is None
+    # The purchase still says what it was opened under.
+    read = await ledger.get_purchase_internal(purchase["id"])
+    assert read["consent_version"] == CONSENT_TAG
+    assert read["consented_at"] is not None
+
+
+async def test_the_self_heal_lands_the_consent_columns_on_a_224_shaped_database():
+    """PATH TWO for migration 233, the one production takes: a database that already has the
+    table gets the columns from the self-heal's own statement, not from the CREATE TABLE.
+
+    A test that only covered the empty database would pass with this heal deleted.
+    """
+    await database.execute("DROP TABLE IF EXISTS reap_agentic_purchases")
+    await database.execute(_MIG_224_PURCHASES_DDL)
+    before = await _purchase_columns()
+    assert "consent_version" not in before, "precondition: this is a pre-233 shape"
+
+    await ensure_required_schema_light()
+
+    after = await _purchase_columns()
+    assert {"consent_version", "consented_at"} <= after
+
+    # And the rail works on the healed table.
+    purchase = await _mk(consent_version=CONSENT_TAG)
+    read = await ledger.get_purchase_internal(purchase["id"])
+    assert read["consent_version"] == CONSENT_TAG
+
+
+async def test_the_consent_self_heal_is_idempotent_on_a_second_run():
+    """SQLite's ADD COLUMN has no IF NOT EXISTS and RAISES on a duplicate, so "no-op" here means
+    "the except swallowed it AND the column after it still ran" — which is why that branch is one
+    try PER COLUMN. A shared try would leave `consented_at` permanently missing."""
+    await database.execute("DROP TABLE IF EXISTS reap_agentic_purchases")
+    await database.execute(_MIG_224_PURCHASES_DDL)
+    await ensure_required_schema_light()
+    once = await _purchase_columns()
+
+    await ensure_required_schema_light()
+    await ensure_required_schema_light()
+
+    assert await _purchase_columns() == once
+    assert {"consent_version", "consented_at"} <= once
+
+
+async def test_the_consent_heal_finishes_a_PARTIALLY_healed_table():
+    """THE STATE THE PER-COLUMN try ACTUALLY EXISTS FOR, and the one an idempotence test cannot
+    reach.
+
+    A previous run that added `consent_version` and then died — a crash, a killed pod, an
+    operator who ran half the ALTER by hand — leaves a table with one of the two columns. On the
+    next startup SQLite raises "duplicate column name" on the FIRST statement, and a branch that
+    shared one try (or broke out of the loop) would treat that as "nothing to do here" and never
+    reach `consented_at`. The table would then be permanently short of it, on exactly the
+    databases that were already unwell, and production has no other route to that column.
+
+    A sweep mutant that turns the per-column `continue` into a `break` survives the idempotence
+    test above — both columns are absent on its first run, so nothing raises — and is killed
+    here. That is the whole reason this test is separate.
+    """
+    await database.execute("DROP TABLE IF EXISTS reap_agentic_purchases")
+    await database.execute(_MIG_224_PURCHASES_DDL)
+    await database.execute(
+        "ALTER TABLE reap_agentic_purchases ADD COLUMN consent_version VARCHAR(32)"
+    )
+    partial = await _purchase_columns()
+    assert "consent_version" in partial and "consented_at" not in partial, (
+        "precondition: exactly one of the two columns is present"
+    )
+
+    await ensure_required_schema_light()
+
+    healed = await _purchase_columns()
+    assert "consented_at" in healed, (
+        "the heal stopped at the already-present column and never reached consented_at"
+    )
+    # And the rail works on the finished table.
+    purchase = await _mk(consent_version=CONSENT_TAG)
+    assert (await ledger.get_purchase_internal(purchase["id"]))["consented_at"] is not None
+
+
+async def test_the_hint_heal_also_finishes_a_partially_healed_table():
+    """THE CONTROL, and a check on the claim the mig-225 twin's comment already makes. The same
+    `break`-instead-of-`continue` defect is available in every per-column loop in that branch;
+    this one proves the property is not special to the mig-233 loop."""
+    await database.execute("DROP TABLE IF EXISTS reap_agentic_purchases")
+    await database.execute(_MIG_224_PURCHASES_DDL)
+    await database.execute(
+        "ALTER TABLE reap_agentic_purchases ADD COLUMN accept_variant_labels TEXT"
+    )
+    await ensure_required_schema_light()
+
+    healed = await _purchase_columns()
+    assert {"also_accept_domains", "market_country"} <= healed, (
+        "the mig-225 heal stopped at the already-present column"
+    )
+
+
+def test_the_233_self_heal_twins_declare_the_migrations_columns():
+    """SOURCE-LEVEL, and it is the only thing that can see the SQLite twin at all: the coverage
+    gate reads `ADD COLUMN <name>` out of the POSTGRES branch, and the SQLite twin builds its
+    DDL with an f-string whose column name is a placeholder. So this test names both.
+
+    The Postgres side is compared token-for-token against the migration; the SQLite side is
+    checked for the two column names and their types, which is what the placeholder hides.
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    migration = (
+        root / "db/migrations/233_reap_agentic_purchase_consent.sql"
+    ).read_text(encoding="utf-8")
+    guard = (root / "db/schema_guard.py").read_text(encoding="utf-8")
+
+    def _statement(text: str, start: int) -> str:
+        return " ".join(text[start: text.index(";", start) + 1].split())
+
+    # BY MEMBERSHIP, NOT BY POSITION. The guard's Postgres branch holds SEVERAL statements that
+    # open this table (225, 229, 233) and the buyer-refs one (227) names the SAME TWO COLUMNS on
+    # a different table — so "the first ALTER before the first mention of consent_version" reads
+    # the wrong statement, which is how the first cut of this test failed. Collect every one of
+    # them and require the migration's, verbatim, to be present.
+    opener = "ALTER TABLE IF EXISTS reap_agentic_purchases"
+    found, at = [], guard.find(opener)
+    while at != -1:
+        found.append(_statement(guard, at))
+        at = guard.find(opener, at + 1)
+
+    wanted = _statement(migration, migration.index(opener))
+    assert wanted in found, (
+        "the mig-233 statement in the migration is not one of db/schema_guard.py's:\n"
+        f"  migration:    {wanted}\n"
+        + "".join(f"  schema_guard: {f}\n" for f in found)
+    )
+    assert found.count(wanted) == 1, "the mig-233 heal is duplicated in db/schema_guard.py"
+
+    assert '("consent_version", "VARCHAR(32)")' in guard, (
+        "the SQLite twin of the mig-233 heal does not add consent_version"
+    )
+    assert '("consented_at", "TIMESTAMP")' in guard, (
+        "the SQLite twin of the mig-233 heal does not add consented_at"
+    )
+
+
+def test_the_233_down_migration_drops_both_columns_in_the_safe_order():
+    """cart_url/item_source taught this file that a down file's ORDER is load-bearing. These two
+    have no dependency on each other, so what is asserted is only that both are dropped and both
+    carry `IF EXISTS` — a partial apply must reverse cleanly."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    down = (
+        root / "db/migrations/down/233_reap_agentic_purchase_consent_down.sql"
+    ).read_text(encoding="utf-8")
+    assert "DROP COLUMN IF EXISTS consented_at" in down
+    assert "DROP COLUMN IF EXISTS consent_version" in down
+    assert down.count("ALTER TABLE IF EXISTS reap_agentic_purchases") == 2, (
+        "one statement per column, so a partial apply reverses"
     )
