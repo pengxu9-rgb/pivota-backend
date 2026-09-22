@@ -245,11 +245,17 @@ async def test_env_cooldown_is_what_the_helper_uses_when_none_is_passed(monkeypa
     back-to-back calls on a slow runner landed more than a second apart.
 
     Time is controlled by moving the job's stored `requested_at` with
-    `_age()` — patching `_utcnow()` would not do it, because the lookup
-    compares against the SERVER clock. The two probes bracket the env value
-    at ±1 minute, so wall-clock drift between calls only matters past 60s, and
-    only a cooldown in (49min, 51min] passes both — the env value is there,
-    the 6h default is not."""
+    `_age()`. Patching `_utcnow()` cannot advance "now": it only stamps the
+    write, and the lookup reads the SERVER clock (CURRENT_TIMESTAMP /
+    datetime('now')). The two probes bracket the env value at ±1 minute.
+
+    Wall-clock drift can only break the FOLD probe (49 min old, must fold),
+    and only once the write-to-lookup gap passes ~59s — 60s less up to 1s of
+    `_utcnow()` truncation. The enqueue probe only gets safer as time passes.
+
+    The cooldowns that pass both probes are (49min + e, 51min + e], where e
+    is the few seconds elapsed since the write — effectively (49min, 51min].
+    The env value is inside that window; the 6h default and 0 are not."""
     env_minutes = 50
     assert not (49 * 60 < DEFAULT_QUALITY_BACKFILL_ENQUEUE_COOLDOWN_SECONDS <= 51 * 60)
 
