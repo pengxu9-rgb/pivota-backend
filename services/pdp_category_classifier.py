@@ -154,10 +154,13 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         re.IGNORECASE)),
     # Mask is SPLIT in two. Everything here names an unambiguous mask FORM, so
     # it wins over "essence" below: "Real Rice Essence Sheet Mask" is a mask.
+    # The bare "patches" arm declines the acne-qualified plural the entry above owns. First-match
+    # order alone is not enough: services/curated_brand_feed.py counts EVERY pattern that matches,
+    # and a merchant product_type "Pimple Patches" hitting both would read as ambiguous there.
     ("Mask", "beauty/skincare/treat/mask", re.compile(
         r"\b(face mask|clay mask|charcoal mask|sheet mask|mask sheet|gel mask|"
         r"sleeping mask|sleep mask|wash[-\s]?off mask|under eye patch|eye patch|"
-        r"patchs|patches|lip\s?patch)\b",
+        r"patchs|(?<!pimple\s)(?<!spot\s)(?<!cover\s)(?<!acne\s)(?<!blemish\s)patches|lip\s?patch)\b",
         re.IGNORECASE)),
     ("Exfoliant", "beauty/skincare/treat/exfoliant", re.compile(
         r"\b(exfoliant|exfoliating|exfoliation|peel|peeling|peeling gel|peel pads?|"
