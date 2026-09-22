@@ -160,7 +160,7 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
     ("Mask", "beauty/skincare/treat/mask", re.compile(
         r"\b(face mask|clay mask|charcoal mask|sheet mask|mask sheet|gel mask|"
         r"sleeping mask|sleep mask|wash[-\s]?off mask|under eye patch|eye patch|"
-        r"patchs|(?<!pimple\s)(?<!spot\s)(?<!cover\s)(?<!acne\s)(?<!blemish\s)patches|lip\s?patch)\b",
+        r"patchs|(?<!\bpimple\s)(?<!\bspot\s)(?<!\bspot\scover\s)(?<!\bacne\s)(?<!\bblemish\s)patches|lip\s?patch)\b",
         re.IGNORECASE)),
     ("Exfoliant", "beauty/skincare/treat/exfoliant", re.compile(
         r"\b(exfoliant|exfoliating|exfoliation|peel|peeling|peeling gel|peel pads?|"

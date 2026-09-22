@@ -254,6 +254,8 @@ def test_a_pimple_patch_title_no_longer_steps_the_spot_shelf_aside():
     ("Pimple Patches", 1), ("Spot Patches", 1), ("Spot Cover Patches", 1),
     ("Acne Patches", 1), ("Blemish Patches", 1), ("Acne Pimple Patch", 1),
     ("Eye Patches", 1), ("Hydrogel Patches", 1),
+    # The look-behinds are word-anchored and exact: only the acne qualifiers are declined.
+    ("Tattoo Cover Patches", 1), ("Hotspot Patches", 1),
 ])
 def test_an_acne_patch_type_names_one_leaf(text, paths):
     assert feed._pattern_matches(text) == paths
