@@ -130,7 +130,6 @@ _alias(
     "beauty/skincare/moisturizer/night_cream",
     "beauty/skincare/moisturizer/tinted",
     "beauty/skincare/face/lotion",
-    "beauty/skincare/hand/nail",
 )
 
 _alias(
@@ -189,6 +188,10 @@ _alias(
     "beauty/bath/shower_gel",
     "beauty/bath/soap",
     "beauty/bath/shower/oil",
+    # A hand-and-nail product is hand care, which the taxonomy files as body care -- it was folded
+    # into the FACE cream leaf until 2026-09-22. (`hand/cream` stays a gap: the gateway keeps it
+    # INTENTIONALLY_DISTINCT.)
+    "beauty/skincare/hand/nail",
     "beauty/personal_care/deodorant",
     "beauty/skincare/body/body-oil",
     "beauty/skincare/body/butter",
