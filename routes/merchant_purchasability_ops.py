@@ -8,10 +8,16 @@ the VPC can read it. Without this route the only answer to "why did that merchan
 purchasable" is a one-off SQL job.
 
 WHAT IT IS NOT. Not a query endpoint. One fixed question, no caller-supplied SQL, no table names
-on the wire, admin-gated with the same `Depends(require_admin)` every handler in
-routes/store_audit_ops.py uses. Domain and market are the only free inputs and both are
-normalized through the same functions the writer keys on, so an operator cannot be shown a
-different row than the door reads.
+on the wire, admin-gated. Domain and market are the only free inputs and both are normalized
+through the same functions the writer keys on, so an operator cannot be shown a different row
+than the door reads.
+
+THE ONE WAY THIS ROUTE DIFFERS FROM ITS SIBLINGS. Since the OIDC follow-up it depends on
+`require_admin_or_gateway_identity` rather than the bare `Depends(require_admin)` every handler
+in routes/store_audit_ops.py uses. That dependency runs `require_admin` first and unchanged, and
+additionally accepts the PIVOTA-Agent gateway's Google-signed Cloud Run identity token — but
+only once an operator sets BOTH `OPS_GATEWAY_OIDC_AUDIENCE` and `OPS_GATEWAY_SERVICE_ACCOUNTS`.
+With the shipped defaults this route's behaviour, including every refusal body, is unchanged.
 
 IT IS A READ ONLY, AND IT IS GATED ON NEITHER DIAL. With both dials off the sweep gathers nothing
 and the consumers ignore what is there, but an operator arming the rail needs to see the facts
@@ -39,7 +45,7 @@ from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
 
 import db.merchant_purchasability as purchasability
-from utils.auth import require_admin
+from utils.gateway_oidc_auth import require_admin_or_gateway_identity
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +97,17 @@ def _iso(value: Any) -> Optional[str]:
 async def merchant_purchasability(
     domain: str = Query(..., min_length=3, max_length=253),
     market: str = Query(..., min_length=2, max_length=2),
-    _admin: Dict[str, Any] = Depends(require_admin),
+    # ADMIN JWT **OR** THE GATEWAY'S GOOGLE IDENTITY TOKEN. This is the only route in the
+    # repo that accepts the second, and it is read-only. See utils/gateway_oidc_auth.py: the
+    # OIDC path is DISABLED until both `OPS_GATEWAY_OIDC_AUDIENCE` and
+    # `OPS_GATEWAY_SERVICE_ACCOUNTS` are set, so with the shipped defaults this is exactly
+    # `require_admin` and every refusal is byte-identical to today's.
+    #
+    # It is NOT `require_admin_or_key`: `X-ADMIN-KEY` is still refused here, as on every
+    # other ops route. The reason the gateway needed this at all is that its credential was a
+    # standing admin JWT in an env var, and the gateway fails OPEN on a non-200 — so the day
+    # that JWT expired the gate would have disarmed itself silently.
+    _principal: Dict[str, Any] = Depends(require_admin_or_gateway_identity),
 ) -> PurchasabilityResponse:
     """Every purchasability row for one merchant x market, one per vantage, plus the tier the
     agent door would serve.
