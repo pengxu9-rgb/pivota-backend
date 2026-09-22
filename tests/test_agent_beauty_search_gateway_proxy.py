@@ -435,3 +435,129 @@ async def test_proxy_rejects_pagination_the_gateway_cannot_represent(monkeypatch
     assert resp.status_code == 422
     assert resp.json()["error"]["code"] == "gateway_pagination_unsupported"
     assert seen == [] and local_calls == []
+
+
+# --- POST /agent/v2/products/search: the same forwarding, from a JSON body --------------------
+#
+# The third search door. It called the local implementation directly, so with the proxy on for
+# both v1 GET doors it was the one path left on the dark local lane (171 calls in 14 days).
+
+
+@pytest.fixture
+def v2_endpoint(monkeypatch: pytest.MonkeyPatch, endpoint):
+    import routes.agent_v2 as agent_v2
+
+    local_calls, state = endpoint
+    v2_local: List[Dict[str, Any]] = []
+
+    async def local_search(**kwargs: Any) -> Dict[str, Any]:
+        v2_local.append(kwargs)
+        return {"status": "success", "products": [], "pagination": {},
+                "metadata": {"source": "agent_search_products", "reason_code": "no_candidates"}}
+
+    monkeypatch.setattr(agent_v2, "agent_v1_search_products", local_search)
+    monkeypatch.setattr(agent_v2, "log_agent_request", AsyncMock(return_value=None))
+    monkeypatch.setattr(agent_v2._app_settings, "pivota_agent_internal_url", "http://gw.test")
+    yield v2_local, state
+
+
+async def _post_v2(body: Dict[str, Any], headers: Dict[str, str] | None = None) -> httpx.Response:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://api.test") as client:
+        return await client.post("/agent/v2/products/search", json=body,
+                                 headers={"X-API-Key": "ak_caller", **(headers or {})})
+
+
+V2_MEITU_BODY = {"query": "LIP-PRESSION Metal Serum Gloss", "market": "SG", "limit": 20}
+
+
+@pytest.mark.asyncio
+async def test_v2_flag_on_is_served_by_the_gateway_with_v1s_query_string(monkeypatch: pytest.MonkeyPatch, v2_endpoint) -> None:
+    v2_local, _ = v2_endpoint
+    monkeypatch.setenv(proxy.FLAG, "on")
+    seen = _mock_client(monkeypatch, lambda r: httpx.Response(200, json=GATEWAY_BODY))
+    resp = await _post_v2(V2_MEITU_BODY)
+
+    assert resp.status_code == 200
+    assert v2_local == [], "the local implementation does not run"
+    assert len(seen) == 1
+    sent = seen[0]
+    assert str(sent.url).startswith("http://gw.test/agent/v1/products/search?")
+    params = dict(sent.url.params)
+    assert params["query"] == "LIP-PRESSION Metal Serum Gloss"
+    assert params["market"] == "SG"
+    assert (params["limit"], params["offset"]) == ("20", "0")
+    assert params["search_all_merchants"] == "true", "v2's own default: no merchant named = all merchants"
+    assert params["allow_external_seed"] == "true" and params["source"] == proxy.PROXY_SOURCE
+    assert "in_stock_only" not in params, "an unset stock filter is not a filter"
+    assert "catalog_surface" not in params
+    assert sent.headers["x-agent-api-key"] == "ak_caller"
+    assert sent.headers[proxy.HOP_HEADER] == "1"
+
+    body = resp.json()
+    # v2's own contract survives: its keys, its canonical cards, its decision id.
+    assert set(body) == {"status", "products", "pagination", "metadata", "request_context"}
+    assert [p["canonical_title"] for p in body["products"]] == [p["title"] for p in GATEWAY_BODY["products"]]
+    # The gateway's price and currency reach v2's offers unchanged (no USD default applied).
+    assert [(o["price"], o["currency"]) for p in body["products"] for o in p["offers"]] == [("30", "SGD"), ("28.2", "SGD")]
+    assert body["metadata"]["served_by"] == "gateway"
+    assert body["metadata"]["decision_id"]
+
+
+@pytest.mark.asyncio
+async def test_v2_market_falls_back_to_the_request_context_country(monkeypatch: pytest.MonkeyPatch, v2_endpoint) -> None:
+    monkeypatch.setenv(proxy.FLAG, "on")
+    seen = _mock_client(monkeypatch, lambda r: httpx.Response(200, json=GATEWAY_BODY))
+    resp = await _post_v2({"query": "lip gloss", "request_context": {"country": "SG"},
+                           "in_stock_only": True, "catalog_surface": "beauty", "merchant_ids": ["m1", "m2"]})
+    assert resp.status_code == 200
+    params = seen[0].url.params
+    assert params["market"] == "SG"
+    assert params["in_stock_only"] == "true", "an explicitly set stock filter is forwarded"
+    assert params["catalog_surface"] == "beauty"
+    assert params.get_list("merchant_ids") == ["m1", "m2"]
+    assert "search_all_merchants" not in params
+
+
+@pytest.mark.asyncio
+async def test_v2_flag_off_is_exactly_what_it_was(monkeypatch: pytest.MonkeyPatch, v2_endpoint) -> None:
+    v2_local, _ = v2_endpoint
+    monkeypatch.delenv(proxy.FLAG, raising=False)
+    seen = _mock_client(monkeypatch, lambda r: httpx.Response(200, json=GATEWAY_BODY))
+    resp = await _post_v2(V2_MEITU_BODY)
+    assert resp.status_code == 200
+    assert seen == [] and len(v2_local) == 1
+    assert v2_local[0]["market"] == "SG" and v2_local[0]["query"] == V2_MEITU_BODY["query"]
+    assert "served_by" not in resp.json()["metadata"]
+
+
+@pytest.mark.asyncio
+async def test_v2_a_failed_forward_is_a_visible_error_never_a_local_fallback(monkeypatch: pytest.MonkeyPatch, v2_endpoint) -> None:
+    v2_local, _ = v2_endpoint
+    monkeypatch.setenv(proxy.FLAG, "on")
+    _mock_client(monkeypatch, lambda r: httpx.Response(503, json={}))
+    resp = await _post_v2(V2_MEITU_BODY)
+    assert resp.status_code == 503
+    assert resp.json()["error"] == {"code": "gateway_search_failed", "reason": "gateway_http_503"}
+    assert v2_local == []
+
+
+@pytest.mark.asyncio
+async def test_v2_guards_match_the_v1_doors(monkeypatch: pytest.MonkeyPatch, v2_endpoint) -> None:
+    v2_local, state = v2_endpoint
+    monkeypatch.setenv(proxy.FLAG, "on")
+    seen = _mock_client(monkeypatch, lambda r: httpx.Response(200, json=GATEWAY_BODY))
+
+    loop = await _post_v2(V2_MEITU_BODY, headers={proxy.HOP_HEADER: "1"})
+    assert (loop.status_code, loop.json()["error"]["code"]) == (400, "gateway_search_proxy_loop")
+
+    for bad in ({"offset": 15, "limit": 20}, {"offset": 0, "limit": 101}):
+        page = await _post_v2({**V2_MEITU_BODY, **bad})
+        assert (page.status_code, page.json()["error"]["code"]) == (422, "gateway_pagination_unsupported"), bad
+
+    state["allowed_merchants"] = ["merchant_a"]
+    denied = await _post_v2({**V2_MEITU_BODY, "merchant_id": "merchant_b"})
+    assert (denied.status_code, denied.json()["error"]["code"]) == (403, "merchant_forbidden")
+    unscoped = await _post_v2(V2_MEITU_BODY)
+    assert (unscoped.status_code, unscoped.json()["error"]["code"]) == (403, "gateway_merchant_scope_unavailable")
+
+    assert seen == [] and v2_local == []

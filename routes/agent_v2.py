@@ -9,6 +9,7 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from db.database import database
@@ -20,7 +21,7 @@ from models.quote import QuotePreviewRequest
 from routes.agent_api import agent_create_order as agent_v1_create_order
 from routes.agent_api import agent_search_products as agent_v1_search_products
 from routes.agent_api import agent_track_order as agent_v1_track_order
-from routes.agent_auth import AgentContext, get_agent_context
+from routes.agent_auth import AgentContext, get_agent_context, log_agent_request
 from routes.agent_checkout_intents import (
     CheckoutIntentItem,
     CreateCheckoutIntentRequest,
@@ -29,6 +30,8 @@ from routes.agent_checkout_intents import (
 from routes.agent_user_auth import AgentUserContext, get_agent_user_context
 from routes.quote_routes import preview_quote as agent_v1_preview_quote
 from routes.refund_api import RefundRequest, process_refund as process_refund_route
+from config.settings import settings as _app_settings
+from services import agent_search_gateway_proxy
 from services.pcs_tier_service import get_merchant_pcs_tier
 from services.agent_governance import validate_request_compat
 from services.platform_capabilities import get_store_platform_capabilities
@@ -681,6 +684,112 @@ def _health_score(row: Dict[str, Any], scopes_json: Dict[str, Any]) -> int:
     return max(0, min(100, score))
 
 
+def _v2_search_query_items(body: SearchProductsRequest, search_all_merchants: bool) -> List[tuple]:
+    """The v2 POST body as the query string the v1 GET door forwards: same names, same values.
+
+    Only fields the caller could have sent to v1 are carried. `in_stock_only` travels only when the
+    caller set it, as on v1 (an unset stock filter is not a filter). Recall-source switches
+    (allow_external_seed, external_seed_strategy, ...) are owned by the proxy and dropped there.
+    """
+    items: List[tuple] = []
+    if body.query is not None:
+        items.append(("query", body.query))
+    if body.merchant_id:
+        items.append(("merchant_id", body.merchant_id))
+    for merchant in body.merchant_ids or []:
+        items.append(("merchant_ids", merchant))
+    if search_all_merchants:
+        items.append(("search_all_merchants", "true"))
+    if body.category:
+        items.append(("category", body.category))
+    if body.min_price is not None:
+        items.append(("min_price", str(body.min_price)))
+    if body.max_price is not None:
+        items.append(("max_price", str(body.max_price)))
+    if "in_stock_only" in body.model_fields_set:
+        items.append(("in_stock_only", "true" if body.in_stock_only else "false"))
+    items.append(("limit", str(body.limit)))
+    items.append(("offset", str(body.offset)))
+    market = body.market or (
+        body.request_context.country if body.request_context and body.request_context.country else None
+    )
+    if market:
+        items.append(("market", market))
+    return items
+
+
+async def _v2_search_via_gateway(
+    req: Request,
+    body: SearchProductsRequest,
+    background_tasks: BackgroundTasks,
+    context: AgentContext,
+    search_all_merchants: bool,
+) -> Optional[Any]:
+    """The same forwarding the v1 GET doors do (routes/agent_sdk_fixed.py search_products and
+    routes/agent_api.py agent_search_products_beauty), under the same flag and with the same
+    guards. None: not forwarded, serve locally. A dict: the gateway's answer in the v1 envelope,
+    for v2's own post-processing. A JSONResponse: an error to return as-is -- a failed gateway call
+    is reported, never silently replaced by the local lane, which serves no external offers.
+    """
+    proxy_on, proxy_reason = agent_search_gateway_proxy.enabled_for(
+        getattr(context, "agent_id", None), req.headers,
+    )
+    if proxy_reason == "already_proxied":
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error": {"code": "gateway_search_proxy_loop"}},
+        )
+    if not proxy_on:
+        return None
+    if body.limit > 100 or body.offset % body.limit != 0:
+        return JSONResponse(
+            status_code=422,
+            content={"status": "error", "error": {"code": "gateway_pagination_unsupported"}},
+        )
+    requested_merchants = [body.merchant_id] if body.merchant_id else list(body.merchant_ids or [])
+    if any(not context.can_access_merchant(mid) for mid in requested_merchants):
+        return JSONResponse(
+            status_code=403,
+            content={"status": "error", "error": {"code": "merchant_forbidden"}},
+        )
+    if getattr(context, "allowed_merchants", None) is not None:
+        return JSONResponse(
+            status_code=403,
+            content={"status": "error", "error": {"code": "gateway_merchant_scope_unavailable"}},
+        )
+    catalog_surface = str(body.catalog_surface or "").strip().lower() or None
+    gateway_body, why, gateway_status = await agent_search_gateway_proxy.search(
+        base_url=_app_settings.pivota_agent_internal_url,
+        query_items=_v2_search_query_items(body, search_all_merchants),
+        headers=req.headers,
+        catalog_surface=("beauty" if catalog_surface == "beauty" else None),
+    )
+    background_tasks.add_task(
+        log_agent_request,
+        context=context,
+        status_code=gateway_status,
+        merchant_id=body.merchant_id or "cross_merchant_search",
+    )
+    if gateway_body is None:
+        return JSONResponse(
+            status_code=gateway_status,
+            content={"status": "error", "error": {"code": "gateway_search_failed", "reason": why}},
+        )
+    return agent_search_gateway_proxy.to_backend_envelope(
+        gateway_body,
+        limit=body.limit,
+        offset=body.offset,
+        query=body.query,
+        category=body.category,
+        min_price=body.min_price,
+        max_price=body.max_price,
+        in_stock_only=bool(body.in_stock_only and "in_stock_only" in body.model_fields_set),
+        merchant_id=body.merchant_id,
+        merchant_ids=body.merchant_ids,
+        catalog_surface=catalog_surface,
+    )
+
+
 @router.post("/products/search")
 async def search_products_v2(
     req: Request,
@@ -691,7 +800,12 @@ async def search_products_v2(
     search_all_merchants = body.search_all_merchants or (
         not body.merchant_id and not body.merchant_ids
     )
-    result = await agent_v1_search_products(
+    # Behind AGENT_BEAUTY_SEARCH_VIA_GATEWAY this door is served by the gateway, like both v1 GET
+    # search doors; its post-processing below (canonical cards, decision layer) is unchanged.
+    proxied = await _v2_search_via_gateway(req, body, background_tasks, context, search_all_merchants)
+    if isinstance(proxied, JSONResponse):
+        return proxied
+    result = proxied if proxied is not None else await agent_v1_search_products(
         req=req,
         background_tasks=background_tasks,
         merchant_id=body.merchant_id,
