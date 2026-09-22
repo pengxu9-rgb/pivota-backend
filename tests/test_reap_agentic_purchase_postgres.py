@@ -225,9 +225,31 @@ async def _db():
     await database.execute("DROP TABLE IF EXISTS reap_agentic_purchases")
     await database.execute("DROP TABLE IF EXISTS reap_agentic_enrollments")
     await _apply_migration()
-    yield
-    if not was_connected and database.is_connected:
-        await database.disconnect()
+    try:
+        yield
+    finally:
+        # TEARDOWN, NOT ONLY SETUP. The Postgres gate runs every tests/test_*_postgres.py in ONE
+        # process against ONE database, in alphabetical order, so whatever the LAST test here
+        # leaves behind is what the next FILE starts with. Setup-only cleaning protects this
+        # suite from its predecessor and protects nobody from this suite — which is exactly how
+        # tests/test_agent_commerce_reap_routes_postgres.py broke four tests in
+        # tests/test_backfill_variant_identity_skus_postgres.py on this branch.
+        #
+        # These tables are ones this file DROPS at setup, so the leak it prevents is narrower
+        # than the routes suite's: a later file that READS one without dropping it first. Cheap,
+        # symmetric, and it means "leave it as you found it" is the rule everywhere on this rail
+        # rather than the patch applied to the one file that got caught.
+        #
+        # In a `finally`, so a failing test still cleans up: a failing test is the one most
+        # likely to have left a half-written row, and a cleanup that runs only on success turns
+        # one red test into a cascade in another file.
+        for _table in ('reap_agentic_purchases', 'reap_agentic_enrollments'):
+            try:
+                await database.execute(f"DELETE FROM {_table}")
+            except Exception:  # noqa: BLE001 - a table this run never built is not a leak
+                continue
+        if not was_connected and database.is_connected:
+            await database.disconnect()
 
 
 @pytest.fixture(autouse=True)
