@@ -8,9 +8,6 @@ from typing import Any, Dict
 from services.category_path_aliases import resolve
 
 
-#: Queue.error is capped at 500 chars (catalog_onboard_queue); the message must fit it.
-QUEUE_ERROR_CAP = 500
-
 #: The apply counters that explain a shortfall. Printed with the report, never only logged.
 APPLY_GAP_COUNTERS = (
     "pdps_skipped_identity", "pdps_skipped_insert", "products_fully_skipped", "product_groups_failed",
@@ -47,14 +44,10 @@ class PrimaryIngestionIncomplete(ValueError):
         }
         if "applied" in report:
             compact["applied"] = {k: report["applied"].get(k, 0) for k in ("pdps", "skus", "offers")}
-        tally = skipped_by_reason(report.get("skipped_products"))
-        if tally:
-            compact["skipped_by_reason"] = tally
+        # The per-row reasons are deliberately NOT in this message: every prod caller reaches it
+        # through PrimaryReadinessIncomplete, which keeps only its first 300 chars, and a tally
+        # there cuts `status` out of Queue.error. The CLI prints the full report to stdout instead.
         message = "primary_ingestion_incomplete: " + json.dumps(compact, sort_keys=True)
-        if len(message) > QUEUE_ERROR_CAP and "skipped_by_reason" in compact:
-            # Never trade a core count for the tally: fall back to its total.
-            compact["skipped_by_reason"] = {"total": sum(tally.values())}
-            message = "primary_ingestion_incomplete: " + json.dumps(compact, sort_keys=True)
         super().__init__(message)
 
 

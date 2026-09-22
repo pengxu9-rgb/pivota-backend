@@ -1884,7 +1884,8 @@ async def _apply_ingest_plan(
 
     counts["skipped_products"] = _skipped_products(refusals)
     await write_writer_audit_log(audit)
-    logger.info("apply_ingest_plan applied: %s", counts)
+    # The list can be thousands of rows; one log entry past 256 KiB is dropped by Cloud Logging.
+    logger.info("apply_ingest_plan applied: %s", {**counts, "skipped_products": len(counts["skipped_products"])})
     return counts
 
 
@@ -2072,5 +2073,6 @@ async def _apply_ingest_plan_batched(
 
     counts["skipped_products"] = _skipped_products(refusals)
     await write_writer_audit_log(audit)
-    logger.info("apply_ingest_plan(batch) applied: %s", counts)
+    # The list can be thousands of rows; one log entry past 256 KiB is dropped by Cloud Logging.
+    logger.info("apply_ingest_plan(batch) applied: %s", {**counts, "skipped_products": len(counts["skipped_products"])})
     return counts

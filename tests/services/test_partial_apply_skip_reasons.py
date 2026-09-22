@@ -23,7 +23,7 @@ from scripts import onboard_curated_brands as cli
 from services import audit_index_intake as aii, intake_identity as identity
 from services.catalog_enrichment_agent import apply as writer, ingestion as ing
 from services.catalog_enrichment_agent.primary_ingestion import (
-    QUEUE_ERROR_CAP, PrimaryIngestionIncomplete, inspect_primary_plan, require_primary_apply,
+    PrimaryIngestionIncomplete, inspect_primary_plan, require_primary_apply,
 )
 from services.catalog_enrichment_agent.primary_readiness import PrimaryReadinessIncomplete
 from tests.services.test_retailer_adversarial_acceptance import (
@@ -239,20 +239,20 @@ def test_partial_report_hoists_rows_out_of_applied_and_tallies_them():
     assert "skipped_products" not in report["applied"]
     assert applied["skipped_products"], "the caller's counts are not mutated"
     message = str(refused.value)
-    assert len(message) <= QUEUE_ERROR_CAP
-    assert '"identity_skip:brand_host_fragmentation": 5' in message
-    assert LEGACY_KEY not in message  # per-row detail lives on the report, not the capped message
+    assert "skipped_by_reason" not in message and LEGACY_KEY not in message
 
 
-def test_message_falls_back_to_a_total_before_it_would_breach_the_cap():
-    rows = [dict(r, reason=f"insert_failed_variant_{i:03d}_" + "x" * 20) for i, r in enumerate(haruharu_rows(12))]
+def test_the_message_prod_actually_stores_still_keeps_status():
+    """Every prod caller wraps this error in PrimaryReadinessIncomplete, which keeps 300 chars of it
+    (apply.apply_ingest_plan). The per-row detail must not push `status` out of that window."""
+    planned = {"pdps": 15, "skus": 30, "offers": 30}
     with pytest.raises(PrimaryIngestionIncomplete) as refused:
-        require_primary_apply({"planned": {"pdps": 12, "skus": 1, "offers": 1}},
-                              {"pdps": 0, "skus": 1, "offers": 1, "skipped_products": rows})
-    message = str(refused.value)
-    assert len(message) <= QUEUE_ERROR_CAP
-    assert '"skipped_by_reason": {"total": 12}' in message
-    assert '"missing"' in message and '"planned"' in message  # core counts never traded away
+        require_primary_apply({"planned": planned, "reasons": [], "unresolved_category_count": 0,
+                               "skipped_records": 0},
+                              {"pdps": 10, "skus": 20, "offers": 20, "skipped_products": haruharu_rows()})
+    stored = str(PrimaryReadinessIncomplete({"failed_stage": "persistence", "error": str(refused.value)[:300]}))
+    assert len(stored) <= 500
+    assert '\\"status\\": \\"partial\\"' in stored
 
 
 def test_a_clean_apply_report_names_no_row():
