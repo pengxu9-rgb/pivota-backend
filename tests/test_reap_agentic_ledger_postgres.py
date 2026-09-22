@@ -3527,24 +3527,87 @@ def test_the_three_layers_agree_on_every_input_on_postgres(value, accepted):
     assert route[0] == ("accepted" if accepted else "refused")
 
 
+#: THE MATRIX, SPLIT AT COLLECTION TIME INTO THE TWO THINGS IT SAYS.
+#:
+#: WHY NOT ONE PARAMETRISATION WITH A `pytest.skip` FOR THE REFUSED HALF — which is what this
+#: was, and which broke the Postgres dialect gate. That job has a post-step, "Assert the gate
+#: actually gated", which exits 1 on ANY skipped test: the gate files skip themselves when
+#: DATABASE_URL is not a Postgres URL, so a skip in that job cannot be distinguished from the
+#: whole gate having quietly not run. pytest was green (2377 passed) and the JOB was red.
+#:
+#: A skip is the wrong tool here anyway. "This input is refused, so there is nothing to store"
+#: is not an absent test — it is a DIFFERENT assertion, and writing it as a skip threw away the
+#: half of the matrix that carries the security argument. Two lists, two tests, no skips, and
+#: every row of the matrix is asserted in one of them.
+_CONSENT_ACCEPTED_PG = tuple(v for v, ok in _CONSENT_MATRIX_PG if ok)
+_CONSENT_REFUSED_PG = tuple(v for v, ok in _CONSENT_MATRIX_PG if not ok)
 
-@pytest.mark.parametrize("value,accepted", _CONSENT_MATRIX_PG)
-async def test_an_accepted_tag_round_trips_through_a_real_varchar32(value, accepted):
-    """THE MATRIX AGAINST THE REAL COLUMN. The verdict agreement is a pure-Python property and
-    the SQLite arm owns it; what only this arm can show is that every tag the three layers ADMIT
-    also survives an asyncpg bind into a `VARCHAR(32)` and comes back the same string.
+#: The refused values MINUS `None`. `None` is refused by the two DOORS (`required=True`) and
+#: accepted by the column, where it means "a row opened before migration 233" — so it belongs in
+#: the refusal test of the validator and not in the one that asserts no row is written.
+_CONSENT_REFUSED_VALUES_PG = tuple(v for v in _CONSENT_REFUSED_PG if v is not None)
+
+assert _CONSENT_ACCEPTED_PG and _CONSENT_REFUSED_VALUES_PG, (
+    "the matrix must keep both halves — a split that emptied one would make its test vacuous"
+)
+
+
+@pytest.mark.parametrize("value", _CONSENT_ACCEPTED_PG)
+async def test_an_accepted_tag_round_trips_through_a_real_varchar32(value):
+    """THE ACCEPTED HALF, AGAINST THE REAL COLUMN. The verdict agreement is a pure-Python
+    property and the SQLite arm owns it; what only this arm can show is that every tag the three
+    layers ADMIT also survives an asyncpg bind into a `VARCHAR(32)` and comes back the same
+    string.
 
     That is the half the original defect was invisible to: a value the route accepted and wrote
-    to the buyer-ref row was never checked against the purchase column on this engine. NBSP,
+    to the buyer-ref row was never checked against the purchase column on this engine. NBSP, the
     ideographic space and U+2028 are multi-byte in UTF-8, and `VARCHAR(32)` counts CHARACTERS —
-    a 32-character tag of them is 60+ bytes, and a column that counted bytes would refuse it.
+    the 32-character tag in the matrix is 94 bytes, and a column that counted bytes would refuse
+    it.
+
+    PARAMETRISED OVER THE ACCEPTED LIST, not over the whole matrix with a skip: see the note on
+    `_CONSENT_ACCEPTED_PG`.
     """
     import db.reap_agentic_ledger as ledger
 
-    if not accepted:
-        pytest.skip("the refused inputs are the SQLite arm's verdict matrix")
     purchase = await _mk(
-        consent_version=value, buyer_ref=f"bref_pg{_CONSENT_MATRIX_PG.index((value, accepted))}"
+        consent_version=value, buyer_ref=f"bref_pg{_CONSENT_ACCEPTED_PG.index(value)}"
     )
     read = await ledger.get_purchase_internal(purchase["id"])
     assert read["consent_version"] == value.strip()
+
+
+@pytest.mark.parametrize("value", _CONSENT_REFUSED_VALUES_PG)
+async def test_a_refused_tag_reaches_no_column_at_all(value):
+    """THE REFUSED HALF, AND IT IS AN ASSERTION RATHER THAN A SKIP.
+
+    This used to be the skipped branch of the test above, which threw away the half of the
+    matrix that carries the security argument: a NUL is unstorable on Postgres and a zero-width
+    space is invisible in every diff, and what has to be true of both is that they never reach
+    the column AND leave no row behind them. `create_purchase` validates before the INSERT, so
+    a refused tag must cost nothing.
+    """
+    from db.database import database
+
+    before = await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases")
+    with pytest.raises(ValueError):
+        await _mk(consent_version=value)
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == before
+
+
+async def test_none_is_refused_by_the_doors_and_accepted_by_the_column():
+    """`None` is the one value the two halves of the matrix disagree about, so it gets its own
+    test rather than a row in either list.
+
+    The DOORS refuse it (`required=True`): every purchase opened from today on carries a consent.
+    The COLUMN accepts it, because rows opened before migration 233 exist and NULL is the truth
+    about them. That difference is the whole reason `require_consent_version` takes a flag.
+    """
+    import db.reap_agentic_ledger as ledger
+
+    with pytest.raises(ValueError, match="required"):
+        ledger.require_consent_version(None, required=True)
+    assert ledger.require_consent_version(None) is None
+
+    purchase = await _mk(consent_version=None)
+    assert purchase["consent_version"] is None and purchase["consented_at"] is None

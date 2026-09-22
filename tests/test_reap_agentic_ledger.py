@@ -3952,22 +3952,55 @@ def test_the_three_layers_agree_on_every_input_in_the_matrix(value, accepted):
     if accepted:
         assert route[1] == value.strip(), "an accepted value is the stripped input, unchanged"
 
+#: THE MATRIX, SPLIT AT COLLECTION TIME INTO THE TWO THINGS IT SAYS.
+#:
+#: WHY NOT ONE PARAMETRISATION WITH A `pytest.skip` FOR THE REFUSED HALF — which is what this
+#: was, and which broke the Postgres dialect gate. That job has a post-step, "Assert the gate
+#: actually gated", which exits 1 on ANY skipped test: the gate files skip themselves when
+#: DATABASE_URL is not a Postgres URL, so a skip in that job cannot be distinguished from the
+#: whole gate having quietly not run. pytest was green (2377 passed) and the JOB was red.
+#:
+#: A skip is the wrong tool here anyway. "This input is refused, so there is nothing to store"
+#: is not an absent test — it is a DIFFERENT assertion, and writing it as a skip threw away the
+#: half of the matrix that carries the security argument. Two lists, two tests, no skips, and
+#: every row of the matrix is asserted in one of them.
+_CONSENT_ACCEPTED = tuple(v for v, ok in _CONSENT_MATRIX if ok)
+_CONSENT_REFUSED = tuple(v for v, ok in _CONSENT_MATRIX if not ok)
 
-@pytest.mark.parametrize("value,accepted", _CONSENT_MATRIX)
-async def test_every_accepted_tag_in_the_matrix_reaches_the_column(value, accepted):
+#: The refused values MINUS `None`. `None` is refused by the two DOORS (`required=True`) and
+#: accepted by the column, where it means "a row opened before migration 233" — so it belongs in
+#: the refusal test of the validator and not in the one that asserts no row is written.
+_CONSENT_REFUSED_VALUES = tuple(v for v in _CONSENT_REFUSED if v is not None)
+
+assert _CONSENT_ACCEPTED and _CONSENT_REFUSED_VALUES, (
+    "the matrix must keep both halves — a split that emptied one would make its test vacuous"
+)
+
+
+@pytest.mark.parametrize("value", _CONSENT_ACCEPTED)
+async def test_every_accepted_tag_in_the_matrix_reaches_the_column(value):
     """THE OTHER END OF THE PIPE. Agreeing about a verdict is not the same as the accepted value
     SURVIVING THE BIND: a tag all three admit must also be storable and come back unchanged.
 
     This is the defect seen from the other side — the route wrote an NBSP tag onto the buyer-ref
     row and nothing then checked that the same value could reach the purchase row at all.
     """
-    if not accepted:
-        pytest.skip("the refused inputs are the verdict matrix's business")
     purchase = await _mk(
-        consent_version=value, buyer_ref=f"bref_m{_CONSENT_MATRIX.index((value, accepted))}"
+        consent_version=value, buyer_ref=f"bref_m{_CONSENT_ACCEPTED.index(value)}"
     )
     read = await ledger.get_purchase_internal(purchase["id"])
     assert read["consent_version"] == value.strip()
+
+
+@pytest.mark.parametrize("value", _CONSENT_REFUSED_VALUES)
+async def test_a_refused_tag_in_the_matrix_reaches_no_column_at_all(value):
+    """The refused half, as an ASSERTION. It was the skipped branch of the test above — see the
+    note on `_CONSENT_ACCEPTED` for why a skip was the wrong tool even before the dialect gate
+    started failing on skips."""
+    before = await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases")
+    with pytest.raises(ValueError):
+        await _mk(consent_version=value)
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == before
 
 
 async def test_a_tag_the_route_accepts_is_never_refused_further_down():
