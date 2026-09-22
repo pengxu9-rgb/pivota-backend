@@ -169,6 +169,22 @@ def test_the_vocabulary_is_exactly_the_one_offers_resolve_ranks_by() -> None:
     )
 
 
+def test_the_offer_set_is_a_subset_of_the_repo_vocabulary_owner() -> None:
+    """utils.availability_vocabulary owns "is this out of stock" for RAW strings. This set is the
+    literal subset SQL can bind to read STORED catalog_offers values, which prod 2026-09-22 holds
+    only as the owner's canonical output (in_stock / out_of_stock) or `unknown` (no verdict) —
+    measured, not enforced (external_offer_dual_write copies a seed's string as-is). Pin the
+    relationship: every token here is out of stock to the owner, and the owner's canonical
+    out-of-stock value is here."""
+    from utils.availability_vocabulary import OUT_OF_STOCK, is_out_of_stock, normalize_availability
+
+    assert all(is_out_of_stock(token) for token in OFFER_UNAVAILABLE_AVAILABILITIES)
+    assert OUT_OF_STOCK in OFFER_UNAVAILABLE_AVAILABILITIES
+    # The owner's "no verdict" is never unavailable here.
+    assert normalize_availability("unknown") is None
+    assert not availability_is_known_unavailable("unknown")
+
+
 def test_offers_resolve_binds_the_same_set() -> None:
     import routes.agent_shop_gateway as gateway
 

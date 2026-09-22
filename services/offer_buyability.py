@@ -129,12 +129,22 @@ def _in_stock(availability: Any) -> bool:
 # above: IN_STOCK_AVAILABILITY is an explicit "yes", this is an explicit "no", and a value in
 # neither (`unknown`, NULL, empty) is no statement at all. Two orderings bind it:
 #   - offers.resolve's catalog arm (routes/agent_shop_gateway): its SQL ORDER BY, the `in_stock`
-#     flag it emits, and `_rank_offers_merit_first`, which reads that flag (and never demotes an
-#     internal offer on it — that lane's own rule, resting on its variant eligibility gate).
+#     flag it emits, and `_rank_offers_merit_first`, which reads that flag. (Internal offers are
+#     read the same way since #2221: their flag is the eligibility gate's verdict.)
 #   - agent_pdp_view.offers (services/agent_pdp_view_assembler.aggregate_offers), before the
 #     top-N cut, through `availability_is_known_unavailable` below.
 # It lived in the gateway until the second caller needed it; a service importing a router to
 # read one frozenset would be the wrong way round.
+#
+# NOT THE REPO'S RAW-STRING VOCABULARY. utils.availability_vocabulary owns "is this out of stock"
+# for raw platform/feed strings (phrases, schema.org IRIs, `discontinued`, `reserved`, ...). This
+# set is the literal subset SQL can bind (`= ANY(:unavailable)`) to read STORED catalog_offers
+# values, and it is only complete while those values are canonical. They are TODAY — prod
+# 2026-09-22, all 33,344 rows are in_stock / out_of_stock / `unknown` — but that is a measured
+# fact, not an enforced one: most writers emit those literals, and
+# services/external_offer_dual_write copies a seed's availability string as-is, so a raw
+# "sold out" landing there would rank as sellable. A test pins that every token here is out of
+# stock to the owner. Do not point a reader of raw strings at this set — use the owner.
 #
 # UNKNOWN IS NOT OUT OF STOCK. `unknown` (the column's server default), NULL, empty or any value
 # not in this set ranks WITH the in-stock offers, by price, and never behind them. Two reasons, both measured rather than preferred:
@@ -142,9 +152,8 @@ def _in_stock(availability: Any) -> bool:
 #      `in_stock: True`, and the catalog arm maps NULL to `in_stock: True`. A three-way rank (in
 #      stock > unknown > out of stock) could only be applied where the raw column survives, i.e.
 #      to that arm alone, and would then order offers by a distinction the flag on them does not
-#      show — and that the gateway's `best_offer` could not reproduce once it reads the flag
-#      (PIVOTA-Agent offersToSignals; on its main as of 2026-09-18 it does not read in_stock at
-#      all — pengxu9-rgb/PIVOTA-Agent#2240 makes it).
+#      show — and that the gateway's `best_offer` (PIVOTA-Agent offersToSignals, which reads the
+#      flag since PIVOTA-Agent#2240) could not reproduce.
 #   2. Absence of a stock statement is not evidence against a seller. Demoting it is the same
 #      error the gateway's verification tier refuses to make for an unchecked offer.
 # In prod on 2026-09-18 every live retailer offer said `in_stock` (1,178) or `out_of_stock` (86),
