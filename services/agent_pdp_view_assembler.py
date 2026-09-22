@@ -459,7 +459,7 @@ def aggregate_offers(
     # can sell it now; the brand's own sold-out listing ahead of an in-stock retailer is the
     # defect, not a preference (The Ordinary out of stock over ulta.com in stock at the same
     # $19; COSRX out of stock at $15 over stylekorean in stock at $6.30). The best_offer
-    # companion to #2218 (PIVOTA-Agent#2240, offersToSignals; open) makes the same call. The primary still leads WITHIN its
+    # companion to #2218 (PIVOTA-Agent#2240, offersToSignals) makes the same call. The primary still leads WITHIN its
     # stock group, and can only leave the stored set when it is unavailable and at least N
     # sellable offers exist — 0 rows in prod that day. No reader of these offers (backend,
     # PIVOTA-Agent, pivota-agent-ui) keys on is_primary or offers[0]; offer_count, price_min
@@ -468,16 +468,10 @@ def aggregate_offers(
     # Unknown availability is sellable here: one vocabulary, OFFER_UNAVAILABLE_AVAILABILITIES,
     # shared with offers.resolve; the reasons are at the constant in services/offer_buyability.py.
     #
-    # NO internal-offer exemption, unlike offers.resolve. There an internal offer exists only
-    # after a variant eligibility gate that reads `available`, so its quantity-only flag is the
-    # weaker signal. Here nothing stronger exists: an internal offer's `availability` IS the
-    # quantity-only string catalog_sync wrote (in_stock iff inventory_quantity > 0), and the buy
-    # pick already acts on it. Prod 2026-09-18: 10 unsuppressed internal offers, all in_stock.
-    # THE COST, stated: that string is wrong for an untracked / keep-selling Shopify variant
-    # (sellable, quantity 0), and this key now lets it decide more than the buy pick did — such
-    # an internal primary drops behind every sellable retailer and, with N of them, out of the
-    # stored set, where before is_primary always kept it. The fix belongs at the writer
-    # (services/catalog_sync_service.py, read the variant's `available` first), not here.
+    # NO internal-offer exemption — offers.resolve has none either since #2221. An internal
+    # offer's `availability` is what catalog_sync wrote from the gate's own stock verdict
+    # (standard_variant_in_stock: `available` first, then quantity), so an untracked or
+    # keep-selling variant is in_stock here and a sold-out one is not.
     def sort_key(o: Dict[str, Any]) -> Tuple[int, int, float, str]:
         return (
             1 if availability_is_known_unavailable(o.get("availability")) else 0,
