@@ -74,7 +74,7 @@ async def db():
             await database.disconnect()
 
 
-async def _billed_line(db, *, agent="agent_minds", amount=450, invoice_status="finalized", day=DAY,
+async def _billed_line(db, *, agent="agent_minds", amount=450, invoice_status="paid", day=DAY,
                        channel_partner=None, merchant="brand.example", tag="1"):
     """One rollup row billed on one invoice line, as generate_merchant_invoice writes them."""
     rollup_id = await db.fetch_val(
@@ -88,9 +88,10 @@ async def _billed_line(db, *, agent="agent_minds", amount=450, invoice_status="f
         {"s": date(2026, 9, 1), "e": date(2026, 9, 30), "k": "run-" + tag})
     await db.execute(
         "INSERT INTO invoices (merchant_id, billing_period_start, billing_period_end, stripe_invoice_id, "
-        "total_cents, status, billing_run_id) VALUES (:m, :s, :e, :inv, :amt, :st, :r)",
+        "total_cents, status, billing_run_id, paid_at) VALUES (:m, :s, :e, :inv, :amt, :st, :r, :paid)",
         {"m": merchant, "s": date(2026, 9, 1), "e": date(2026, 9, 30), "inv": "in_" + tag, "amt": amount,
-         "st": invoice_status, "r": run_id})
+         "st": invoice_status, "r": run_id,
+         "paid": datetime.now(timezone.utc) if invoice_status == "paid" else None})
     return await db.fetch_val(
         "INSERT INTO billing_run_items (billing_run_id, merchant_id, source_type, source_id, "
         "stripe_invoice_item_id, stripe_invoice_id, amount_cents) "
@@ -147,8 +148,8 @@ async def test_a_disputed_line_is_voided_and_the_share_reverses(db):
     assert await _total(db, line) == 0
 
 
-@pytest.mark.parametrize("status", ["void", "uncollectible"])
-async def test_a_dead_invoice_reverses_the_share(db, status):
+@pytest.mark.parametrize("status", ["void", "uncollectible", "payment_failed", "draft"])
+async def test_an_invoice_that_stops_being_paid_reverses_the_share(db, status):
     from services.agent_share_accrual import accrue_for_line
 
     line = await _billed_line(db); await _rate()
@@ -158,12 +159,32 @@ async def test_a_dead_invoice_reverses_the_share(db, status):
     assert await _total(db, line) == 0
 
 
-@pytest.mark.parametrize("status", ["draft", "finalized", "paid", "payment_failed"])
-async def test_a_standing_invoice_carries_the_share(db, status):
+@pytest.mark.parametrize("status", ["draft", "finalizing", "finalized", "payment_failed", "failed"])
+async def test_only_a_paid_invoice_carries_a_share(db, status):
+    """Re-review of #2273 (P1): nothing locally marks an invoice void or uncollectible, so an unpaid
+    invoice must never carry a share; it may never be collected."""
     from services.agent_share_accrual import accrue_for_line
 
     line = await _billed_line(db, invoice_status=status); await _rate()
-    assert (await accrue_for_line(line)).target_minor == 112
+    r = await accrue_for_line(line)
+    assert (r.basis, r.target_minor, r.status) == (f"invoice_{status}", 0, "unchanged")
+
+
+async def test_an_invoice_paid_long_after_it_was_billed_is_still_picked_up(db):
+    """The sweep keys on paid_at, not only on the line's creation or invoices.updated_at (whose
+    trigger prod may lack): a line billed 200 days ago and paid today must accrue."""
+    from services import agent_share_accrual as svc
+
+    line = await _billed_line(db, invoice_status="payment_failed"); await _rate()
+    long_ago = datetime.now(timezone.utc) - timedelta(days=200)
+    await db.execute("UPDATE billing_run_items SET created_at = :t", {"t": long_ago})
+    await db.execute("ALTER TABLE invoices DISABLE TRIGGER USER")
+    await db.execute("UPDATE invoices SET updated_at = :t", {"t": long_ago})
+    assert (await svc.accrue_recent(120))["lines"] == 0
+    await db.execute("UPDATE invoices SET status = 'paid', paid_at = NOW()")
+    summary = await svc.accrue_recent(120)
+    assert summary["lines"] == 1 and summary.get("written") == 1
+    assert await _total(db, line) == 112
 
 
 async def test_no_agent_or_the_unknown_sentinel_accrues_nothing(db):
@@ -299,8 +320,8 @@ async def test_two_accruals_of_one_line_cannot_both_write(db):
 
 
 async def test_a_line_without_its_invoice_row_accrues_nothing(db):
-    """A line exists before its invoice row commits, and a failed run rolls the invoice back while
-    Stripe items remain. Neither is billed, so neither is shared."""
+    """Items and their invoice row are written in one transaction, so this is a manual delete or a
+    broken join. Unbilled either way, so not shared."""
     from services.agent_share_accrual import accrue_for_line
 
     line = await _billed_line(db); await _rate()

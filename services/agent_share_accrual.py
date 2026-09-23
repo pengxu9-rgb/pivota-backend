@@ -12,8 +12,12 @@ from billing, never re-derived from rates (review of #2273):
   what the merchant was billed, and every order the rollup bills (Pivota-checkout edges as well
   as referral ones) is covered.
 - The line is credited to the rollup row's agent, if it is a real one (not the 'unknown' sentinel).
-- The line accrues only while it stands. A dispute voids it (`voided_at`), a void or uncollectible
-  invoice cancels it, and in both cases the share reverses to 0. A dispute's replacement line
+- The line accrues only once Pivota has been PAID for it: its invoice's status is `paid`, and the
+  line is not voided. Nothing locally ever marks an invoice void or uncollectible (the Stripe
+  webhooks mirror only invoice.paid and invoice.payment_failed), so crediting anything short of
+  `paid` could leave an agent a share of money never collected (re-review of #2273). A dispute
+  voids the line (`voided_at`) and the share reverses to 0. Refunds after payment (credit notes)
+  are not mirrored locally yet; that is a follow-up. A dispute's replacement line
   (`dispute_adj`) carries no rollup link, so it is not credited to an agent. That errs in Pivota's
   favour and needs a follow-up.
 - A line whose rollup row also names a CHANNEL PARTNER accrues 0 with basis
@@ -49,8 +53,8 @@ DEFAULT_LOOKBACK_DAYS = 120
 UNKNOWN_AGENT = "unknown"
 #: Invoice items are created in USD (invoice_generation_service hardcodes "currency": "usd").
 INVOICE_CURRENCY = "USD"
-#: An invoice in these states bills nothing.
-_DEAD_INVOICE_STATES = ("void", "uncollectible")
+#: The only invoice status that means Pivota was paid. Everything else carries no share.
+_PAID_INVOICE_STATUS = "paid"
 #: A rate may start at most this far in the past (clock skew between operator and database).
 RATE_START_SKEW = timedelta(minutes=5)
 
@@ -58,7 +62,7 @@ _LINE_FOR_UPDATE_SQL = """
 SELECT bri.id AS line_id, bri.merchant_id, bri.source_type, bri.source_id AS rollup_id,
        bri.amount_cents, bri.voided_at, bri.stripe_invoice_id,
        g.date AS billed_day, g.agent_id, g.channel_partner_id,
-       inv.status AS invoice_status
+       inv.status AS invoice_status, inv.paid_at
 FROM billing_run_items bri
 LEFT JOIN gmv_attribution_daily g ON g.id = bri.source_id AND bri.source_type = 'gmv_rollup'
 LEFT JOIN invoices inv ON inv.stripe_invoice_id = bri.stripe_invoice_id
@@ -93,15 +97,17 @@ INSERT INTO agent_share_ledger (
 )
 """
 
-# Lines whose state may have moved in the window: newly billed, voided, or on an invoice that
-# changed. Filtered to lines a real agent is on, or that the ledger already credited (to reverse).
+# Lines whose state may have moved in the window: newly billed, voided, or on an invoice that was
+# paid or changed. paid_at is keyed explicitly: the webhook writes it, while invoices.updated_at
+# depends on a trigger prod may not carry (numbered migrations are not applied there). Filtered to lines a real agent is on, or that the ledger already credited (to reverse).
 _RECENT_LINES_SQL = """
 SELECT bri.id AS line_id
 FROM billing_run_items bri
 JOIN gmv_attribution_daily g ON g.id = bri.source_id
 LEFT JOIN invoices inv ON inv.stripe_invoice_id = bri.stripe_invoice_id
 WHERE bri.source_type = 'gmv_rollup'
-  AND (bri.created_at >= :since OR bri.voided_at >= :since OR inv.updated_at >= :since)
+  AND (bri.created_at >= :since OR bri.voided_at >= :since OR inv.updated_at >= :since
+       OR inv.paid_at >= :since)
   AND ((g.agent_id IS NOT NULL AND g.agent_id <> '' AND g.agent_id <> :unknown)
        OR bri.id IN (SELECT DISTINCT billing_run_item_id FROM agent_share_ledger))
 ORDER BY bri.id
@@ -161,7 +167,7 @@ async def accrue_for_line(line_id: int, *, apply: bool = True) -> LineAccrual:
             basis = "line_voided"
         elif line["invoice_status"] is None:
             basis = "no_invoice"
-        elif str(line["invoice_status"]) in _DEAD_INVOICE_STATES:
+        elif str(line["invoice_status"]) != _PAID_INVOICE_STATUS:
             basis = f"invoice_{line['invoice_status']}"
         elif line["channel_partner_id"] is not None:
             basis = "channel_partner_row"
