@@ -20,7 +20,14 @@ import socket
 from datetime import datetime
 from decimal import Decimal
 
-from db.orders import get_order, update_order, update_order_status, mark_order_paid, mark_order_shipped
+from db.orders import (
+    _coerce_metadata_obj,
+    get_order,
+    mark_order_paid,
+    mark_order_shipped,
+    update_order,
+    update_order_status,
+)
 from db.merchant_onboarding import get_merchant_onboarding
 from utils.auth import get_current_employee
 from db.products import log_order_event
@@ -326,7 +333,7 @@ async def _resolve_stripe_order_for_refund(
 
     def _scoped(order: Optional[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
         return _scope_stripe_order_to_psp_owner(
-            order,
+            _with_decoded_metadata(order),
             psp_owner_merchant_id=psp_owner,
             psp_id=psp_id,
             payment_intent_id=payment_intent_id,
@@ -345,6 +352,23 @@ async def _resolve_stripe_order_for_refund(
         if order_hint:
             return _scoped(_db_row_to_dict(await get_order(order_hint)))
     return None, None
+
+
+def _with_decoded_metadata(order: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The order with `metadata` as a dict, decoded ONCE for every refund consumer (and for
+    `_resolve_stripe_order_for_payment_event`'s PaymentIntent lookup, which has the same raw query).
+
+    On Postgres `orders.metadata` (a json column) reaches this resolver as its JSON TEXT from
+    the raw `SELECT *`, which has no type to decode it. (`get_order` already hands back a
+    decoded dict; decoding here too keeps the two lookups from diverging.) Every consumer
+    downstream (`finalize_refund_success`, `_stripe_refund_level_cumulative`,
+    `merge_refund_metadata`, the failure rollback) treats a non-dict as `{}`, so each refund
+    event rebuilt `psp_refund_refs` / `psp_refund_records` from nothing and the `update_order`
+    full-replace paths wrote that back over every other key.
+    """
+    if not isinstance(order, dict) or "metadata" not in order:
+        return order
+    return {**order, "metadata": _coerce_metadata_obj(order.get("metadata"))}
 
 
 async def _persist_stripe_refund_observability(
@@ -534,20 +558,16 @@ async def _resolve_stripe_order_for_payment_event(
 
     query = "SELECT * FROM orders WHERE payment_intent_id = :payment_intent_id"
     from db.database import database
-    from db.orders import _coerce_metadata_obj
 
     if payment_intent_id:
         result = await database.fetch_one(query, {"payment_intent_id": payment_intent_id})
         if result:
-            order = _db_row_to_dict(result)
             # The raw `SELECT *` hands `orders.metadata` (a json column) back as its JSON TEXT;
             # the metadata.order_id path below goes through `get_order`, which decodes it.
             # Decode here so both lookups give callers the same shape: the success path reads
             # skip_platform_order_creation / ops_canary off it, and the finalizers treat a
             # non-dict as {}.
-            if isinstance(order, dict) and "metadata" in order:
-                order = {**order, "metadata": _coerce_metadata_obj(order.get("metadata"))}
-            return _scoped(order)
+            return _scoped(_with_decoded_metadata(_db_row_to_dict(result)))
 
     order_hint = ""
     if isinstance(payment_meta, dict):
