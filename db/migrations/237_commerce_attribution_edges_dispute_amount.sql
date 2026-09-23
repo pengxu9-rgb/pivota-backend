@@ -1,4 +1,4 @@
--- 236_commerce_attribution_edges_dispute_amount.sql
+-- 237_commerce_attribution_edges_dispute_amount.sql
 -- Keep chargebacks as their own total on the attribution edge.
 --
 -- refund_amount_cents is now two things added together:

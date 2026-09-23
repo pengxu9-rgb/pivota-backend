@@ -1009,7 +1009,7 @@ async def ensure_required_schema_light() -> None:
                 )
             except Exception:  # noqa: BLE001
                 pass
-            # mig 236: the chargeback part of commerce_attribution_edges.refund_amount_cents.
+            # mig 237: the chargeback part of commerce_attribution_edges.refund_amount_cents.
             # Every refund and dispute write to the edge names this column
             # (services/commerce_attribution_service.py _APPLY_REFUND_TOTAL_QUERY,
             # _ATTRIBUTE_DISPUTE_QUERY), so without it those writes fail, and

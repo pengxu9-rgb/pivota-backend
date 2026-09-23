@@ -22,7 +22,7 @@ charge.refunded arrived), and a merchant $300 refund at 900. The order's
 so the edge now takes that total as a CEILING
 (`apply_refund_total_to_attribution_edge`). Chargebacks are not in
 `total_refunded`, so they stay additive and are kept apart in
-`dispute_amount_cents` (migration 236).
+`dispute_amount_cents` (migration 237).
 
 HOW IT IS DRIVEN. The real `/webhooks/stripe` route over `httpx.ASGITransport`
 (TestClient hangs against the asyncpg pool), a real `orders` row, a real edge
@@ -34,7 +34,7 @@ TABLE HYGIENE. `orders` and `commerce_attribution_edges` are shared with other
 gate modules, so they are created `checkfirst` and never dropped; this module
 deletes only its own rows. The migration-109 refund columns the model does not
 declare are added with `ADD COLUMN IF NOT EXISTS` exactly as the migration does,
-and migration 236 is applied from its own file.
+and migration 237 is applied from its own file.
 """
 
 from __future__ import annotations
@@ -95,9 +95,9 @@ ALTER TABLE commerce_attribution_edges
   ) STORED
 """
 
-_MIGRATION_236 = (
+_MIGRATION_237 = (
     Path(__file__).resolve().parents[1]
-    / "db/migrations/236_commerce_attribution_edges_dispute_amount.sql"
+    / "db/migrations/237_commerce_attribution_edges_dispute_amount.sql"
 )
 
 # db/migrations/001_add_refund_tables.sql, the only DDL owner RefundService has.
@@ -157,7 +157,7 @@ async def _db():
         # whole body on a raw cursor, in one transaction.
         raw = engine.raw_connection()
         try:
-            raw.cursor().execute(_MIGRATION_236.read_text())
+            raw.cursor().execute(_MIGRATION_237.read_text())
             raw.commit()
         finally:
             raw.close()

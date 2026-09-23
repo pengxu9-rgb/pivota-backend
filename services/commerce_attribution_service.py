@@ -618,7 +618,7 @@ RETURNING edge_id, merchant_id, click_id, canonical_product_id,
 #
 # Chargebacks are NOT in orders.total_refunded. They stay additive per dispute id
 # (_ATTRIBUTE_DISPUTE_QUERY) and are also counted in dispute_amount_cents
-# (migration 236), so the ceiling applies to refund_amount_cents minus that part.
+# (migration 237), so the ceiling applies to refund_amount_cents minus that part.
 #
 # `prior` locks every edge of the order and reads its value BEFORE the update, so
 # the caller can emit the ledger event for the money this call actually added.

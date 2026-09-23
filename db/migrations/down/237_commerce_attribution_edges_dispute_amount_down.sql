@@ -1,4 +1,4 @@
--- Reverse of 236_commerce_attribution_edges_dispute_amount.sql.
+-- Reverse of 237_commerce_attribution_edges_dispute_amount.sql.
 --
 -- refund_amount_cents keeps the chargeback money it already holds. Only the split
 -- is lost. Deploy code that still reads dispute_amount_cents after this and every
