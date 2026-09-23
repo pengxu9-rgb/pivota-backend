@@ -151,7 +151,8 @@ async def transition(job_id: str, *, status: str, reason: Optional[str], run_id:
     )
     if not row and expected_status:
         # Superseded: the stage's verdict is dropped, but its lease must not block the lane.
-        await write_db.execute("UPDATE retailer_ingest_jobs SET lease_until = NULL WHERE id = :id", {"id": job_id})
+        await write_db.execute("UPDATE retailer_ingest_jobs SET lease_until = NULL WHERE id = :id "
+                               "AND status NOT IN ('queued', 'apply_due')", {"id": job_id})
     return bool(row)
 
 

@@ -39,8 +39,9 @@ _LIP_COLOUR_LEAVES = frozenset({"beauty/makeup/lip/lipstick", "beauty/makeup/lip
 # Area leaves the non-face rule (#2248) files a product under on purpose; its title names the face
 # leaf it was moved AWAY from ("Hand Cream" -> body/care), which is not a contradiction.
 _AREA_LEAF = re.compile(r"^beauty/(?:body|haircare)/")
-# A set/kit/multi-pack filed as ONE product: its own shelf is beauty/sets.
-_SET_TITLE = re.compile(r"\b(?:sets?|kits?|bundles?|trio|\d+\s*-?\s*(?:pcs|pieces?|ea)|special\s+edition|"
+# A set/kit/multi-pack filed as ONE product: its own shelf is beauty/sets. A count of 1 ("1pc",
+# "1ea" -- how Korean retailers label single items) is a single product.
+_SET_TITLE = re.compile(r"\b(?:sets?|kits?|bundles?|trio|(?:[2-9]|\d{2,})\s*-?\s*(?:pcs?|pieces?|ea)|special\s+edition|"
                         r"duo\s+edition|double\s+edition|\d+\s*x\s*\d+\s*(?:ml|g))\b", re.I)
 
 # A lip product ships in a few ml/g (balm tins reach ~15-18 g); 20+ is a face or body format.

@@ -138,3 +138,11 @@ def test_an_area_leaf_is_exempt_only_when_its_own_title_names_the_area(title, pt
     rec = record(title, ptype, title.lower().replace(" ", "-"), body="<p>A serum.</p>")
     assert rec is not None and rec["pdp"]["category_path"]
     assert "title_contradicts_category" in rules(detectors.detect([rec]), detectors.BLOCK)
+
+
+
+def test_a_single_unit_count_is_not_a_set():
+    rec = record("3CE Velvet Lip Tint (1pc)", "LIP TINT", "one-pc", body="<p>Velvet colour for lips.</p>")
+    assert "set_filed_as_single_product" not in rules(detectors.detect([rec]))
+    two = record("3CE Velvet Lip Tint 2pcs", "LIP TINT", "two-pcs", body="<p>Velvet colour for lips.</p>")
+    assert "set_filed_as_single_product" in rules(detectors.detect([two]))

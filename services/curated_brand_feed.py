@@ -1614,7 +1614,7 @@ _LIP_OTHER_AREA = re.compile(r"\b(?:cheeks?|eyes?|eyelids?|face|facial|brows?|cu
                              r"hair|feet|foot)\b", re.I)
 # a set, kit or bundle: its own shelf (beauty/sets), whatever lip product is inside it
 _LIP_SET = re.compile(r"\b(?:sets?|kits?|bundles?|packs?|combos?|duos?|trios?|quads?|twins?|palettes?|wardrobes?|"
-                      r"collections?|gift|sampler|discovery|advent|vault|\d+\s*-?\s*(?:pcs?|pieces?|ea)|"
+                      r"collections?|gift|sampler|discovery|advent|vault|(?:[2-9]|\d{2,})\s*-?\s*(?:pcs?|pieces?|ea)|"
                       r"\d+\s*x|x\s*\d+)\b", re.I)
 # a tool or accessory FOR a lip product, not a lip product
 _LIP_ACCESSORY = re.compile(r"\b(?:brush(?:es)?|sharpeners?|applicators?|cases?|holders?|pouch(?:es)?|"

@@ -42,6 +42,9 @@ def evidence():
     ("Velvet Lipstick", "Lips", "beauty/makeup/lip/lipstick"),
     # thisisbeauty.us types every product "Misc"
     ("ILLAMASQUA Lipstick HOWL 0.14oz - Imperfect Box", "Misc", "beauty/makeup/lip/lipstick"),
+    # a count of one is a single product, not a set
+    ("3CE Velvet Lip Tint (1pc)", "Misc", "beauty/makeup/lip/tint"),
+    ("Soft Matte Lipstick 1 EA", "", "beauty/makeup/lip/lipstick"),
     ("ILLAMASQUA Loaded Lip Polish FIZZ 0.05oz - New", "Other", None),
     # sizes and SPF are not joiners
     ("3CE - Soft Matte Lipstick 3.5g/0.12oz", None, "beauty/makeup/lip/lipstick"),
