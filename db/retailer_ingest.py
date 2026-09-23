@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional
 
 from db.database import database
 
+STATUSES = ("queued", "apply_due", "held", "done", "nothing", "failed", "cancelled")  # migration 234 CHECK
 OPEN_STATUSES = ("queued", "apply_due", "held")
 DUE_STATUSES = ("queued", "apply_due")
 
@@ -230,6 +231,28 @@ async def status_counts(*, db: Any = None) -> Dict[str, int]:
     read_db = db or database
     rows = await read_db.fetch_all("SELECT status, count(*) AS n FROM retailer_ingest_jobs GROUP BY status")
     return {r["status"]: int(r["n"]) for r in rows}
+
+
+async def get_job(job_id: str, *, db: Any = None) -> Optional[Dict[str, Any]]:
+    read_db = db or database
+    row = await read_db.fetch_one("SELECT * FROM retailer_ingest_jobs WHERE id = :id", {"id": job_id})
+    return dict(row) if row else None
+
+
+async def recent_runs(*, limit: int = 20, db: Any = None) -> List[Dict[str, Any]]:
+    """The most recent runs across every job, with the job's domain/brand and the run's outcome."""
+    read_db = db or database
+    rows = await read_db.fetch_all(
+        """
+        SELECT r.id, r.job_id, j.domain, j.brand, r.stage, r.outcome, r.error, r.image_sha,
+               r.started_at, r.finished_at
+        FROM retailer_ingest_runs r JOIN retailer_ingest_jobs j ON j.id = r.job_id
+        ORDER BY r.started_at DESC, r.id DESC
+        LIMIT :limit
+        """,
+        {"limit": int(limit)},
+    )
+    return [dict(r) for r in rows]
 
 
 def backoff_until(attempts: int, *, now: Optional[datetime] = None, base_minutes: int = 30,
