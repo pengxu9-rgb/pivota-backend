@@ -53,8 +53,15 @@ SCRIPT = REPO / "infra" / "gcp" / "setup_scheduler.sh"
 # `ARM=relgraph-health-cron`, and only after a gateway image carrying PIVOTA-Agent #2171's script is
 # rolled onto the job — an older image fails with npm's `Missing script`.)
 # REMOVE THIS NOTE once it is live.
+#
+# `retailer-ingest-drain-cron` is AHEAD OF PROD on the same terms: it ships with the retailer
+# ingest pipeline's infra and does not exist until someone runs this script. Without it every run
+# here also creates-and-pauses it, which the ARM/DISARM surgery tests would read as a foreign
+# trigger. The drain tests at the bottom that need the CREATE path pass their own empty
+# EXISTING_TRIGGERS_FILE. REMOVE THIS NOTE once it is live.
 EXISTING_TRIGGERS = {
     "relgraph-health-cron",
+    "retailer-ingest-drain-cron",
     "relgraph-sync-cron", "reviews-invitation-send-cron",
     "commerce-index-relgraph-cron", "commerce-index-search-index-cron",
     "commerce-index-checkout-validation-cron", "commerce-index-insight-refresh-cron",
@@ -107,7 +114,13 @@ FAKE_GCLOUD = textwrap.dedent(
 )
 
 def _run(tmp_path: Path, env_overrides: dict[str, str | None]) -> list[str]:
-    """Run the real script against a fake gcloud; return the recorded invocations.
+    """Run the real script against a fake gcloud; return the recorded invocations."""
+    return _run_full(tmp_path, env_overrides)[0]
+
+
+def _run_full(tmp_path: Path, env_overrides: dict[str, str | None],
+              *, expect_rc: int = 0) -> tuple[list[str], subprocess.CompletedProcess]:
+    """Run the real script against a fake gcloud; return (recorded invocations, process).
 
     A value of None DELETES the key from the child environment. That distinction is
     load-bearing: the script separates "operator said false" from "operator said nothing"
@@ -146,11 +159,11 @@ def _run(tmp_path: Path, env_overrides: dict[str, str | None]) -> list[str]:
         ["bash", str(SCRIPT), "prod", "a" * 40, "b" * 40],
         capture_output=True, text=True, env=env, cwd=str(REPO),
     )
-    assert proc.returncode == 0, (
+    assert proc.returncode == expect_rc, (
         f"the script must run to completion against live-prod-shaped state.\n"
         f"rc={proc.returncode}\nstderr:\n{proc.stderr[-3000:]}"
     )
-    return log.read_text().splitlines()
+    return log.read_text().splitlines(), proc
 
 
 def _state_changes(calls: list[str]) -> set[tuple[str, str]]:
@@ -466,3 +479,169 @@ def test_no_args_value_beginning_with_a_dash_uses_the_space_form():
         "(or a variable that may): gcloud will reject them. Use --args=<value>.\n  "
         + "\n  ".join(offenders)
     )
+
+
+# ---- retailer-ingest-drain: the unattended retailer ingest Job ----------------------------
+#
+# Asserted on the gcloud line the script WOULD issue, not on its source: the overrides ride
+# mkcrawljob's "$@" and only mean anything if they land AFTER its defaults, where gcloud takes the
+# last occurrence. A source grep would pass with the override placed anywhere.
+DRAIN = "retailer-ingest-drain"
+DRAIN_TRIGGER = "retailer-ingest-drain-cron"
+# The env the 2026-09-23 curated-ingest one-offs ran with. PIVOTA_SERVING_PRICING_REGIONS is US
+# alone: the pipeline requires USD and the multi-region value carries a comma.
+PROVEN_INGEST_ENV = {
+    "ENABLE_INTAKE_IDENTITY_ENRICHMENT": "1",
+    "ENABLE_INTAKE_IDENTITY_AUDIT": "1",
+    "ENABLE_INTAKE_IDENTITY_BRAND_AUTHORED": "1",
+    "ENABLE_INTAKE_IDENTITY_MIRROR": "1",
+    "ENABLE_INTAKE_IDENTITY_SYNC": "1",
+    "ENABLE_KBEAUTY_AGENT_DECISION_GATES": "true",
+    "ENABLE_STORELESS_BRAND_CATALOG": "1",
+    "INDEX_ELIGIBLE_READ": "1",
+    "INDEX_ELIGIBLE_RECALL": "1",
+    "INDEX_ELIGIBLE_SITEMAP": "1",
+    "INDEXNOW_ENABLED": "true",
+    "PDP_QUALITY_SCORE_SOURCE_BACKED_OPTIONAL_COMPONENTS": "1",
+    "STRICT_BEAUTY_CATEGORY_TEXT_RECALL": "true",
+    "PIVOTA_SERVING_PRICING_REGIONS": "US",
+    "DB_STATEMENT_TIMEOUT_SECONDS": "30",
+    "DB_COMMAND_TIMEOUT_SECONDS": "600",
+    "CURATED_CRAWL_PAGE_ATTEMPTS": "5",
+    "CRAWL_MIN_INTERVAL_SECONDS": "4",
+    "CRAWL_BACKOFF_BASE_SECONDS": "15",
+    "RETAILER_INGEST_LEASE_SECONDS": "4200",
+    "PIVOTA_ENV": "production",
+}
+
+
+def _drain_call(calls: list[str]) -> list[str]:
+    hits = [c for c in calls if c.startswith(f"run jobs create {DRAIN} ")
+            or c.startswith(f"run jobs update {DRAIN} ")]
+    assert len(hits) == 1, f"expected exactly one create/update of {DRAIN}, got {len(hits)}"
+    return hits[0].split()
+
+
+def _values(tokens: list[str], flag: str) -> list[str]:
+    """Every value given for `flag`, in order, whether as `--flag v` or `--flag=v`."""
+    out = []
+    for i, t in enumerate(tokens):
+        if t == flag and i + 1 < len(tokens):
+            out.append(tokens[i + 1])
+        elif t.startswith(flag + "="):
+            out.append(t[len(flag) + 1:])
+    return out
+
+
+def _env(tokens: list[str]) -> dict[str, str]:
+    (raw,) = _values(tokens, "--set-env-vars")  # ONE line: the reconcile replaces the whole set
+    items = raw.split(",")
+    env = {}
+    for item in items:
+        # gcloud splits on EVERY comma, so a comma inside a value leaves a fragment with no
+        # `KEY=` of its own. That fragment is what this catches.
+        assert re.fullmatch(r"[A-Z][A-Z0-9_]*=[^,]*", item), f"not a KEY=VALUE item: {item!r}"
+        key, value = item.split("=", 1)
+        assert key not in env, f"{key} set twice on one --set-env-vars line"
+        env[key] = value
+    return env
+
+
+def _seconds(value: str) -> int:
+    m = re.fullmatch(r"(\d+)s", value)
+    assert m, f"unexpected duration {value!r}"
+    return int(m.group(1))
+
+
+def _gib(value: str) -> float:
+    m = re.fullmatch(r"(\d+)(Gi|Mi)", value)
+    assert m, f"unexpected memory {value!r}"
+    return int(m.group(1)) / (1 if m.group(2) == "Gi" else 1024)
+
+
+def test_the_drain_crawls_only_from_the_crawl_subnet(tmp_path):
+    """The default subnet's NAT address is the payment IP; a retailer crawl must never use it."""
+    tokens = _drain_call(_run(tmp_path, {}))
+    assert _values(tokens, "--subnet") == ["pivota-crawl"], _values(tokens, "--subnet")
+    assert _values(tokens, "--vpc-egress")[-1] == "all-traffic"
+
+
+def test_the_drain_overrides_land_last(tmp_path):
+    """gcloud takes the last occurrence, so the LAST value is the one the job gets."""
+    tokens = _drain_call(_run(tmp_path, {}))
+    assert _seconds(_values(tokens, "--task-timeout")[-1]) >= 3600, (
+        "mkcrawljob's 300s default would kill a 20k-product crawl mid-stage"
+    )
+    assert _values(tokens, "--max-retries")[-1] == "0", (
+        "the pipeline retries through its ledger; a Cloud Run retry re-crawls the store uncounted"
+    )
+    assert _gib(_values(tokens, "--memory")[-1]) >= 1
+    assert _values(tokens, "--tasks")[-1] == "1"
+    assert _values(tokens, "--parallelism")[-1] == "1"
+    assert _values(tokens, "--command") == ["python"]
+    assert _values(tokens, "--args") == ["-m,jobs.retailer_ingest_drain"]
+    assert (REPO / "jobs" / "retailer_ingest_drain.py").is_file()
+
+
+def test_the_drain_env_is_always_enabled_with_the_proven_env(tmp_path):
+    """The TRIGGER is the arm/disarm switch; the env must not be one.
+
+    It used to be a script input defaulting to 0, and because --set-env-vars replaces the whole env
+    set, any run of this script for an unrelated job silently disarmed the drain. A leftover
+    RETAILER_INGEST_DRAIN_ENABLED=0 in the operator's shell must not reach the job either."""
+    for leftover in (None, "0"):
+        run_dir = tmp_path / str(leftover)    # one call log per run
+        run_dir.mkdir()
+        calls = _run(run_dir, {"RETAILER_INGEST_DRAIN_ENABLED": leftover})
+        tokens = _drain_call(calls)
+        env = _env(tokens)
+        assert env["RETAILER_INGEST_DRAIN_ENABLED"] == "1", leftover
+        missing = {k: v for k, v in PROVEN_INGEST_ENV.items() if env.get(k) != v}
+        assert not missing, f"env differs from the proven ingest env: {missing}"
+        # The pipeline records the image it ran on (PIVOTA_COMMIT_SHA or IMAGE_SHA).
+        assert env["PIVOTA_COMMIT_SHA"] == "a" * 40
+        assert "--update-env-vars" not in tokens
+        assert _values(tokens, "--set-secrets") == ["DATABASE_URL=DATABASE_URL:latest"]
+
+
+def _drain_state_changes(calls: list[str]) -> set[tuple[str, str]]:
+    return {c for c in _state_changes(calls) if c[1] == DRAIN_TRIGGER}
+
+
+@pytest.mark.parametrize("paused_env", [None, "1", "0"])
+def test_the_drain_trigger_is_every_30_minutes_utc_and_created_paused(tmp_path, paused_env):
+    """Created paused even under PAUSED=0, which arms every OTHER trigger a run creates."""
+    empty = tmp_path / "none.txt"
+    empty.write_text("")
+    calls = _run(tmp_path, {"EXISTING_TRIGGERS_FILE": str(empty), "PAUSED": paused_env,
+                            # PAUSED=0 resumes the Store Audit lanes' creates too; irrelevant here.
+                            "STORE_AUDIT_UCP_REPROBE_ARMED": "false",
+                            "STORE_AUDIT_COMMERCE_REPROBE_ARMED": "false"})
+    creates = [c for c in calls if c.startswith(f"scheduler jobs create http {DRAIN_TRIGGER} ")]
+    assert len(creates) == 1, creates
+    assert "--schedule=*/30 * * * * --time-zone=Etc/UTC" in creates[0]
+    assert f"/jobs/{DRAIN}:run" in creates[0]
+    assert _drain_state_changes(calls) == {("pause", DRAIN_TRIGGER)}
+
+
+@pytest.mark.parametrize("overrides", [
+    {},                                                    # a plain reconcile for another job
+    {"PAUSED": "0"},                                       # arms NEW triggers only
+    {"RETAILER_INGEST_DRAIN_ENABLED": "0"},                 # the retired input, left in a shell
+    {"DISARM": "reviews-invitation-send-cron"},            # surgery on a different trigger
+    {"ARM": "content-canonical-election-cron"},
+], ids=["plain", "paused0", "legacy-flag", "disarm-other", "arm-other"])
+def test_a_rerun_leaves_an_existing_drain_trigger_alone(tmp_path, overrides):
+    """Whatever state the live trigger is in - paused or resumed by `gcloud scheduler jobs
+    pause|resume` - a re-run issues neither pause nor resume for it, so that state stands. The
+    `update` must still happen (the definition is reconciled), just never the state."""
+    calls = _run(tmp_path, overrides)
+    assert [c for c in calls if c.startswith(f"scheduler jobs update http {DRAIN_TRIGGER} ")]
+    assert _drain_state_changes(calls) == set(), _drain_state_changes(calls)
+
+
+@pytest.mark.parametrize("script", ["setup_scheduler.sh", "setup_monitoring.sh"])
+def test_the_edited_scripts_parse(script):
+    proc = subprocess.run(["bash", "-n", str(REPO / "infra" / "gcp" / script)],
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
