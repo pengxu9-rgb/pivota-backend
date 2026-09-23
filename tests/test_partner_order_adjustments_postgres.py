@@ -358,9 +358,9 @@ async def test_a_reroll_waits_for_another_reroll_of_the_same_day(db):
 
 
 
-async def test_a_day_a_billing_run_covers_is_left_alone_before_its_invoice_exists(db):
-    """Re-review of #2271: the run is inserted before it reads the rollup; its invoice commits only
-    after the Stripe calls. The guard must see the run, not wait for the invoice."""
+async def test_a_billing_run_without_this_merchant_s_invoice_leaves_the_day_to_be_rerolled(db):
+    """The invoice run reads under the day lock, so a merchant it has not invoiced yet reads the
+    re-rolled day fresh; only a committed invoice freezes a merchant's day."""
     from services.partner_order_adjustments import record_partner_order_adjustment
 
     await _close_partner_edge(db)
@@ -368,8 +368,8 @@ async def test_a_day_a_billing_run_covers_is_left_alone_before_its_invoice_exist
                      {"s": YESTERDAY - timedelta(days=5), "e": YESTERDAY + timedelta(days=5)})
     r = await record_partner_order_adjustment(partner="reap", purchase_id="rp_abc", event_id="evt_1",
                                               kind="refund", currency="USD", amount_minor=1500)
-    assert r.rollup == "invoiced_period_manual_credit"
-    assert (await _rollup(db))["r"] == 0
+    assert r.rollup == "recomputed"
+    assert (await _rollup(db))["r"] == 1500
 
 
 async def test_a_cancelled_billing_run_does_not_block(db):

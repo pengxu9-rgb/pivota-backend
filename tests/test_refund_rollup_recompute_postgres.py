@@ -355,9 +355,12 @@ async def test_a_voided_invoice_does_not_freeze_the_day(db):
 
 
 @pytest.mark.parametrize("status", ["running", "failed", "partial_failed", "completed"])
-async def test_a_billing_run_that_has_read_the_day_freezes_it_before_its_invoice_exists(db, status):
-    """generate_merchant_invoice reads the rollup, calls Stripe, and only then writes invoices.
-    The run's row exists from the start, for every merchant of its period."""
+async def test_a_billing_run_without_this_merchant_s_invoice_does_not_freeze_the_day(db, status):
+    """The invoice run reads its rows under the day lock (lock_billing_days), so a merchant it has
+    not invoiced yet reads the day fresh when it is: freezing it would bill a stale take. A
+    partial_failed resume of a merchant whose day was re-rolled meanwhile re-reads the new take;
+    Stripe then refuses the reused invoice_item idempotency key for the changed amount, so that
+    resume fails loudly instead of over-billing (#2274 review, carried here)."""
     from services.commerce_attribution_service import attach_refund_to_attribution_edge
 
     await _billed_edge(db)
@@ -365,8 +368,86 @@ async def test_a_billing_run_that_has_read_the_day_freezes_it_before_its_invoice
 
     await attach_refund_to_attribution_edge(order_id="ord_late", refund_id="re_1", amount=Decimal("25.00"))
 
-    assert await _edge_refund_cents(db) == 2_500
+    assert await _rollup(db) == {"g": 10_000, "r": 2_500, "n": 7_500, "t": 750}
+
+
+async def test_an_invoice_being_written_blocks_the_reroll_until_it_commits_then_freezes_the_day(db):
+    """The race this closes: the invoice run holds the day lock SHARED while it reads and bills;
+    the re-roll takes it exclusively, waits for the invoice to commit, then finds it and leaves
+    the day as billed. Before this, the re-roll could rewrite the day between the invoice run's
+    read and its invoices row."""
+    import asyncpg
+
+    from services.gmv_aggregation_service import INVOICED_PERIOD_MANUAL_CREDIT, recompute_for_date
+
+    await _billed_edge(db)
+    await db.execute("UPDATE commerce_attribution_edges SET refund_amount_cents = 2500")
+    other = await asyncpg.connect(DATABASE_URL)
+    try:
+        tx = other.transaction()
+        await tx.start()
+        await other.execute(
+            "SELECT pg_advisory_xact_lock_shared(CAST(hashtext(CAST($1 AS text)) AS bigint))",
+            f"gmv_attribution_daily:{BILLED_DAY.isoformat()}",
+        )
+        task = asyncio.ensure_future(recompute_for_date(BILLED_DAY, MERCHANT))
+        await asyncio.sleep(0.5)
+        assert not task.done(), "the re-roll did not wait for the invoice run's shared day lock"
+        await other.execute(
+            "INSERT INTO invoices (merchant_id, billing_period_start, billing_period_end, status) "
+            "VALUES ($1, $2, $3, 'draft')",
+            MERCHANT, BILLED_DAY - timedelta(days=1), BILLED_DAY + timedelta(days=1),
+        )
+        await tx.commit()
+        outcome = await asyncio.wait_for(task, timeout=10)
+    finally:
+        await other.close()
+    assert outcome == INVOICED_PERIOD_MANUAL_CREDIT
     assert await _rollup(db) == {"g": 10_000, "r": 0, "n": 10_000, "t": 1_000}
+
+
+async def test_a_reroll_behind_a_long_invoice_run_gives_up_instead_of_stalling(db, monkeypatch):
+    """A refund webhook must not hang behind an invoice run holding the day across its Stripe
+    calls: the re-roll's wait is bounded, reported as recompute_failed, and a redelivery retries."""
+    import asyncpg
+
+    from services import gmv_aggregation_service as gmv
+
+    monkeypatch.setattr(gmv, "_RECOMPUTE_LOCK_TIMEOUT_QUERY", "SET LOCAL lock_timeout = '300ms'")
+    await _billed_edge(db)
+    other = await asyncpg.connect(DATABASE_URL)
+    try:
+        tx = other.transaction()
+        await tx.start()
+        await other.execute(
+            "SELECT pg_advisory_xact_lock_shared(CAST(hashtext(CAST($1 AS text)) AS bigint))",
+            f"gmv_attribution_daily:{BILLED_DAY.isoformat()}",
+        )
+        outcome = await asyncio.wait_for(
+            gmv.recompute_days_for_edges([{"edge_id": "cae_1", "merchant_id": MERCHANT, "created_at": BILLED_AT}]),
+            timeout=10,
+        )
+        await tx.rollback()
+    finally:
+        await other.close()
+    assert outcome == {(MERCHANT, BILLED_DAY): gmv.RECOMPUTE_FAILED}
+
+
+async def test_the_nightly_rollup_is_not_bounded_by_the_refund_timeout(db, monkeypatch):
+    from services import gmv_aggregation_service as gmv
+
+    monkeypatch.setattr(gmv, "_RECOMPUTE_LOCK_TIMEOUT_QUERY", "SELECT 'must not run'")
+    seen = []
+    real_execute = db.execute
+
+    async def spy(query, values=None):
+        seen.append(str(query))
+        return await real_execute(query, values)
+
+    monkeypatch.setattr(gmv.database, "execute", spy)
+    await _billed_edge(db)
+    await gmv.aggregate_daily(BILLED_DAY)
+    assert not any("must not run" in q for q in seen)
 
 
 async def test_a_cancelled_or_other_period_billing_run_does_not_freeze_the_day(db):
@@ -396,7 +477,7 @@ async def test_the_outcome_names_each_day_and_why(db, monkeypatch):
     }
 
 
-@pytest.mark.parametrize("table", ["invoices", "billing_runs"])
+@pytest.mark.parametrize("table", ["invoices"])
 async def test_an_invoice_check_that_fails_leaves_the_day_alone(db, table):
     """Fail closed: a day we could not check is a day we must not rewrite."""
     from services.commerce_attribution_service import attach_refund_to_attribution_edge
