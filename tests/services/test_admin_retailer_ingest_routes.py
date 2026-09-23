@@ -189,13 +189,9 @@ def test_every_route_carries_require_admin_in_its_own_dependencies():
             f"{route.path} has no require_admin")
 
 
-def test_main_mounts_the_router_behind_the_guard():
-    import main
-
-    mounted = {r.path: r for r in main.app.routes if getattr(r, "path", "").startswith("/admin/retailer-ingest")}
-    assert set(mounted) == {r.path for r in module.router.routes}
-    for path, route in mounted.items():
-        assert any(d.call is require_admin for d in route.dependant.dependencies), path
+# The live-app mount check lives in tests/test_admin_retailer_ingest_mounted.py: importing `main` from
+# tests/services runs it early in the sweep's single pytest process, and a background thread main
+# starts outlived an early test's event loop -- the sweep printed its summary and never exited.
 
 
 # ---------------------------------------------------------------------------
