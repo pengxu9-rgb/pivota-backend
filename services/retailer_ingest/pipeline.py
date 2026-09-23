@@ -30,10 +30,11 @@ class _Stop(Exception):
     """End this stage early with a job transition and a recorded outcome."""
 
     def __init__(self, outcome: str, status: str, reason: str, *, next_run_at: Optional[datetime] = None,
-                 count_attempt: bool = False):
+                 count_attempt: bool = False, checks: Optional[Dict[str, Any]] = None):
         super().__init__(reason)
         self.outcome, self.status, self.reason = outcome, status, reason
         self.next_run_at, self.count_attempt = next_run_at, count_attempt
+        self.checks = checks  # what the stage had measured when it stopped, so the run records it
 
 
 _OPTION_TYPES = {
@@ -186,6 +187,26 @@ async def _crawl(job: Dict[str, Any], stage: str) -> List[Dict[str, Any]]:
     return records
 
 
+#: Rows the category filter left out, recorded per run. Capped so one huge store cannot bloat a run
+#: row; the counts are always complete, and `rows_truncated` says when the list is not.
+LEFT_OUT_ROWS_CAP = 300
+
+
+def _left_out_summary(left_out: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Which rows a category filter left out and why: counts by reason and by the merchant's own
+    product type (the usual culprit), plus the rows themselves up to LEFT_OUT_ROWS_CAP."""
+    from collections import Counter
+    return {
+        "count": len(left_out),
+        "by_reason": dict(Counter(e["reason"] for e in left_out)),
+        "by_merchant_type": dict(Counter(str(e.get("merchant_product_type") or "(none)") for e in left_out)
+                                 .most_common(25)),
+        "rows": [{k: e.get(k) for k in ("reason", "product_name", "category_path", "merchant_product_type", "handle")}
+                 for e in left_out[:LEFT_OUT_ROWS_CAP]],
+        "rows_truncated": len(left_out) > LEFT_OUT_ROWS_CAP,
+    }
+
+
 async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Narrow, plan and run every check. Returns the plan plus a verdict; never writes."""
     import scripts.onboard_curated_brands as cli
@@ -205,11 +226,13 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
                           "severity": detectors.BLOCK, "handle": handle,
                           "detail": "an approved exclusion no longer matches any product"})
     if o.get("only_category") or o.get("only_resolved_category"):
-        try:
-            records = cli._select_by_category(records, prefix=o.get("only_category"), domain=job["domain"])
-        except ValueError:
+        records, left_out = cli._partition_by_category(records, prefix=o.get("only_category"))
+        checks["left_out"] = _left_out_summary(left_out)
+        if not records:
+            checks["kept"] = 0
             raise _Stop("nothing_to_ingest", "nothing",
-                        f"no product resolves under {o.get('only_category') or 'a resolved category'}")
+                        f"no product resolves under {o.get('only_category') or 'a resolved category'}",
+                        checks=checks)
     checks["kept"] = len(records)
 
     plan = ingest_validated_jsonl(records)
@@ -334,7 +357,7 @@ async def _run_stage(job: Dict[str, Any], *, db: Any) -> Dict[str, Any]:
             return {"job_id": job["id"], "stage": stage, "outcome": "clean", "status": "apply_due"}
         return await _apply(job, run_id, result, summary, db=db)
     except _Stop as stop:
-        await ledger.finish_run(run_id, outcome=stop.outcome, checks=result.get("checks"),
+        await ledger.finish_run(run_id, outcome=stop.outcome, checks=stop.checks or result.get("checks"),
                                 flags=result.get("flags"), error=stop.reason, db=db)
         await _move(job, status=stop.status, run_id=run_id, reason=stop.reason,
                                 next_run_at=stop.next_run_at, count_attempt=stop.count_attempt, db=db)

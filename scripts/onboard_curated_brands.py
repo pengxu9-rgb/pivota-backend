@@ -274,6 +274,33 @@ def _print_lip_title_rows(records: List[Dict[str, Any]]) -> int:
 CATEGORY_FILTER_MARKER = "category filter report: "
 
 
+def _partition_by_category(records: List[Dict[str, Any]], *, prefix: Optional[str]) -> tuple:
+    """(kept, left_out) for the category filter below. Pure: no printing, no raising. Each left-out
+    entry names the row and WHY -- `category_unresolved` (the taxonomy cannot place it) or
+    `outside_category_filter` (it resolves, but not under `prefix`)."""
+    from services.category_path_aliases import resolve
+    want = (prefix or "").strip().strip("/").lower()
+    kept, left_out = [], []
+    for record in records:
+        pdp = record.get("pdp")
+        if not isinstance(pdp, dict):
+            kept.append(record)
+            continue
+        leaf = resolve(pdp.get("category_path")) or ""
+        if leaf and (not want or leaf == want or leaf.startswith(want + "/")):
+            kept.append(record)
+            continue
+        left_out.append({
+            "reason": "category_unresolved" if not leaf else "outside_category_filter",
+            "product_name": pdp.get("product_name") or pdp.get("title"),
+            "category_path": pdp.get("category_path"),
+            "merchant_product_type": pdp.get("category_source_product_type"),
+            "canonical_url": _record_url(record),
+            "handle": _record_handle(record),
+        })
+    return kept, left_out
+
+
 def _select_by_category(records: List[Dict[str, Any]], *, prefix: Optional[str],
                         domain: Optional[str] = None) -> List[Dict[str, Any]]:
     """Keep the records whose category RESOLVES (and, with `prefix`, sits under it).
@@ -290,28 +317,12 @@ def _select_by_category(records: List[Dict[str, Any]], *, prefix: Optional[str],
     and --only-vendor. A record with no `pdp` is not a category question: it is kept, and the plan
     refuses it exactly as it would without this filter.
     """
-    from services.category_path_aliases import resolve
     want = (prefix or "").strip().strip("/").lower()
-    kept, left_out = [], []
-    for record in records:
-        pdp = record.get("pdp")
-        if not isinstance(pdp, dict):
-            kept.append(record)
-            continue
-        leaf = resolve(pdp.get("category_path")) or ""
-        if leaf and (not want or leaf == want or leaf.startswith(want + "/")):
-            kept.append(record)
-        else:
-            left_out.append((record, "category_unresolved" if not leaf else "outside_category_filter"))
-    for record, reason in left_out:
-        pdp = record.get("pdp") or {}
-        print(LEFT_OUT_PDP_PREFIX + json.dumps({
-            "reason": reason,
-            "product_name": pdp.get("product_name") or pdp.get("title"),
-            "category_path": pdp.get("category_path"),
-            "merchant_product_type": pdp.get("category_source_product_type"),
-            "canonical_url": _record_url(record),
-        }, sort_keys=True, ensure_ascii=False))
+    kept, left_out = _partition_by_category(records, prefix=prefix)
+    for entry in left_out:
+        print(LEFT_OUT_PDP_PREFIX + json.dumps({k: entry[k] for k in (
+            "reason", "product_name", "category_path", "merchant_product_type", "canonical_url")},
+            sort_keys=True, ensure_ascii=False))
     print(f"    category filter {want or '(resolved)'}: {len(records)} -> {len(kept)} products "
           f"({len(left_out)} left out)")
     print(CATEGORY_FILTER_MARKER + json.dumps({

@@ -423,3 +423,34 @@ async def test_an_olive_young_product_can_be_excluded_by_its_product_id(oy):
     j["options"]["exclude_handles"] = ["GA2"]
     out = await pipeline.run_stage(j, db=oy.db)
     assert out["status"] == "done" and len(oy.applied[-1]["pdps"]) == 1
+
+
+# --- what the category filter left out is recorded on the run, not only its count ------------------
+
+async def test_a_resolved_category_pass_records_each_row_it_left_out_and_why(env):
+    env.rows = [TINT, LIPSTICK_NO_TYPE]  # no merchant type and no lip-title evidence: cannot be placed
+    out = await pipeline.run_stage(job(only_resolved_category=True), db=env.db)
+    assert out["status"] == "apply_due"
+    checks = list(env.ledger.runs.values())[-1]["checks"]
+    assert checks["kept"] == 1 and checks["left_out"]["count"] == 1
+    assert checks["left_out"]["by_reason"] == {"category_unresolved": 1}
+    [row] = checks["left_out"]["rows"]
+    assert row["handle"] == "soft-matte" and row["product_name"] == LIPSTICK_NO_TYPE[0]
+
+
+async def test_a_pass_that_keeps_nothing_still_records_what_it_left_out(env):
+    env.rows = [LIPSTICK_NO_TYPE, PALETTE]
+    out = await pipeline.run_stage(job(only_resolved_category=True), db=env.db)
+    assert out["status"] == "nothing" and out["outcome"] == "nothing_to_ingest"
+    checks = list(env.ledger.runs.values())[-1]["checks"]
+    assert checks["kept"] == 0 and checks["left_out"]["count"] == 2
+    assert {r["handle"] for r in checks["left_out"]["rows"]} == {"soft-matte", "new-take"}
+
+
+def test_the_left_out_list_is_capped_but_the_counts_are_complete():
+    entries = [{"reason": "category_unresolved", "product_name": f"p{i}", "merchant_product_type": "Misc",
+                "handle": f"h{i}"} for i in range(pipeline.LEFT_OUT_ROWS_CAP + 5)]
+    summary = pipeline._left_out_summary(entries)
+    assert summary["count"] == pipeline.LEFT_OUT_ROWS_CAP + 5 and summary["rows_truncated"]
+    assert len(summary["rows"]) == pipeline.LEFT_OUT_ROWS_CAP
+    assert summary["by_merchant_type"] == {"Misc": pipeline.LEFT_OUT_ROWS_CAP + 5}
