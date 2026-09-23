@@ -73,6 +73,11 @@ class FakeDB:
         sql = str(query)
         self.executed.append((sql, params))
 
+        if "pg_advisory_xact_lock" in sql:
+            assert self.transaction_count > 0, "the day lock must be taken inside the transaction"
+            self.day_locks = getattr(self, "day_locks", []) + [params["date"]]
+            return None
+
         if "INSERT INTO gmv_attribution_daily" in sql:
             key = (
                 params["date"],
@@ -80,7 +85,13 @@ class FakeDB:
                 params.get("agent_id") or "",
                 params.get("channel_partner_id") if params.get("channel_partner_id") is not None else -1,
             )
-            self.daily[key] = dict(params)
+            existing = self.daily.get(key)
+            row = dict(params)
+            if existing is not None:
+                # ON CONFLICT keeps the rate the day was first billed at.
+                row["take_rate_bp"] = existing["take_rate_bp"]
+                row["take_amount_cents"] = row["net_attributed_gmv_cents"] * existing["take_rate_bp"] // 10000
+            self.daily[key] = row
             return None
 
         if "UPDATE commerce_attribution_edges" in sql:
@@ -331,6 +342,39 @@ async def test_apply_refund_recomputes_daily_rollup(monkeypatch: pytest.MonkeyPa
 
     edge_update_sql = next(sql for sql, _ in fake_db.executed if "UPDATE commerce_attribution_edges" in sql)
     assert "net_attributed_gmv_cents" not in edge_update_sql
+
+
+@pytest.mark.asyncio
+async def test_a_reroll_keeps_the_rate_the_day_was_billed_at(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review of #2271 (P1): _take_rate_bp_for_merchant answers with the promo status NOW. A day
+    rolled up at the 5% promo rate and re-rolled after the promo ended must stay at 5%; otherwise
+    a refund raises what the merchant is billed."""
+    target_date = date(2026, 5, 19)
+    fake_db = FakeDB(
+        edges=[_edge(gross=4_500, refund=0, created_at=datetime(2026, 5, 19, 12, tzinfo=timezone.utc))]
+    )
+    monkeypatch.setattr(service, "database", fake_db)
+    rates = iter([service.PROMO_TAKE_RATE_BP, service.STANDARD_TAKE_RATE_BP])
+
+    async def flipping_rate(merchant_id: str) -> int:
+        return next(rates)
+
+    monkeypatch.setattr(service, "_take_rate_bp_for_merchant", flipping_rate)
+    await service.aggregate_daily(target_date)
+    assert _only_daily_row(fake_db)["take_amount_cents"] == 225
+
+    fake_db.edges[0]["refund_amount_cents"] = 500
+    await service.recompute_for_date(target_date, "merch_1")
+    row = _only_daily_row(fake_db)
+    assert row["take_rate_bp"] == service.PROMO_TAKE_RATE_BP
+    assert (row["net_attributed_gmv_cents"], row["take_amount_cents"]) == (4_000, 200)
+    assert fake_db.day_locks == [target_date, target_date]
+
+
+def test_the_upsert_keeps_the_stored_rate_on_conflict() -> None:
+    sql = service._UPSERT_ROLLUP_QUERY
+    assert "take_rate_bp = gmv_attribution_daily.take_rate_bp" in sql
+    assert "EXCLUDED.take_rate_bp" not in sql
 
 
 def test_rollup_query_casts_merchant_id_to_text() -> None:
