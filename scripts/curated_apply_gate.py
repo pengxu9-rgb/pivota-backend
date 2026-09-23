@@ -55,6 +55,10 @@ from typing import Any
 from urllib.parse import urlparse
 
 MARKER = "primary ingestion: "
+# One line per domain from onboard_curated_brands.py --only-category / --only-resolved-category.
+# Deliberately NOT a failure: narrowing is the operator's choice. It is reported so a gate that
+# passes a filtered run cannot read as "the whole storefront was onboarded".
+FILTER_MARKER = "category filter report: "
 
 # Every counter here was 0 on both clean canary applies, and each is a way for an apply to have
 # "succeeded" while writing something other than what was planned.
@@ -105,9 +109,20 @@ def _skip_key(row: dict) -> str:
     return f"{reason}:{row['matcher']}" if reason == "identity_skip" and row.get("matcher") else reason
 
 
+def _filter_summary(filters: list[dict]) -> dict | None:
+    """None when the run was not filtered; otherwise what the filter kept OUT, summed and per domain."""
+    if not filters:
+        return None
+    return {
+        "left_out": sum(int(f.get("left_out") or 0) for f in filters),
+        "kept": sum(int(f.get("kept") or 0) for f in filters),
+        "domains": filters,
+    }
+
+
 def evaluate_apply_log(text: str, *, domain: str | None = None) -> dict:
     """Return `{ok, reasons, apply_status, readiness_status, runner_rc, product_keys, applied,
-    skipped_products, skipped_by_reason}`.
+    skipped_products, skipped_by_reason, category_filter}`.
 
     `ok` is True only when the log carries exactly one post-apply report, every check on it passes,
     and the runner — when it said anything — said the job succeeded. Anything the log does not say
@@ -115,6 +130,7 @@ def evaluate_apply_log(text: str, *, domain: str | None = None) -> dict:
     """
     reasons: list[str] = []
     reports: list[dict] = []
+    filters: list[dict] = []
     runner_rc: int | None = None
     for raw in (text or "").splitlines():
         line = raw.strip()
@@ -123,6 +139,15 @@ def evaluate_apply_log(text: str, *, domain: str | None = None) -> dict:
         rc_match = _RUNNER_RC.match(line)
         if rc_match:
             runner_rc = int(rc_match.group(1))
+            continue
+        if FILTER_MARKER in line:
+            try:
+                parsed_filter = _json_after(line, FILTER_MARKER)
+            except ValueError:
+                reasons.append("unparsable_category_filter_line")
+                continue
+            if isinstance(parsed_filter, dict):
+                filters.append(parsed_filter)
             continue
         if MARKER in line:
             try:
@@ -161,6 +186,7 @@ def evaluate_apply_log(text: str, *, domain: str | None = None) -> dict:
             "applied": None,
             "skipped_products": [],
             "skipped_by_reason": {},
+            "category_filter": _filter_summary(filters),
         }
 
     applied = report["applied"]
@@ -223,6 +249,7 @@ def evaluate_apply_log(text: str, *, domain: str | None = None) -> dict:
         "applied": {k: applied.get(k) for k in ("pdps", "skus", "offers", "inci_written", *_MUST_BE_ZERO)},
         "skipped_products": skipped,
         "skipped_by_reason": skipped_tally,
+        "category_filter": _filter_summary(filters),
     }
 
 

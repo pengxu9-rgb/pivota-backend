@@ -12,7 +12,8 @@ import itertools
 
 import pytest
 
-from scripts.onboard_curated_brands import LEFT_OUT_PDP_PREFIX, _select_by_category
+from scripts.onboard_curated_brands import CATEGORY_FILTER_MARKER, LEFT_OUT_PDP_PREFIX, _select_by_category
+from scripts import curated_apply_gate as gate
 from services import curated_brand_feed as feed
 from services.catalog_enrichment_agent.ingestion import ingest_validated_jsonl
 from services.catalog_enrichment_agent.primary_ingestion import inspect_primary_plan
@@ -37,17 +38,20 @@ def evidence():
     ("BY TERRY | Rouge Opulent Lipstick", "Cosmetics", "beauty/makeup/lip/lipstick"),
     ("BY TERRY | Hyaluronic Lip Liner", "Cosmetics", "beauty/makeup/lip/liner"),
     ("Velvet Lipstick", "Makeup", "beauty/makeup/lip/lipstick"),
-    ("Velvet Lipstick", "HERA,Lip,Makeup,matte", "beauty/makeup/lip/lipstick"),
+    ("HERA Velvet Matte Lipstick", "HERA,Lip,Makeup,matte", "beauty/makeup/lip/lipstick"),
+    ("Velvet Lipstick", "Lips", "beauty/makeup/lip/lipstick"),
+    # sizes and SPF are not joiners
+    ("3CE - Soft Matte Lipstick 3.5g/0.12oz", None, "beauty/makeup/lip/lipstick"),
 ])
 def test_an_explicit_lip_title_resolves_where_the_type_says_nothing(title, ptype, want, evidence):
-    assert resolve(title, ptype) == (want, feed.CATEGORY_CONFIDENCE_EXPLICIT_TITLE)
+    assert resolve(title, ptype) == (want, feed.CATEGORY_CONFIDENCE_LIP_TITLE)
 
 
 @pytest.mark.parametrize("title,ptype", [
     ("3CE - Soft Matte Lipstick 3.5g - Warmish Move", None),
     ("3CE - Velvet Lip Tint 4g", "Cosmetics"),
     ("BY TERRY | Hyaluronic Lip Liner", "Cosmetics"),
-    ("Velvet Lipstick", "HERA,Lip,Makeup,matte"),
+    ("HERA Velvet Matte Lipstick", "HERA,Lip,Makeup,matte"),
 ])
 def test_the_main_route_is_unchanged_when_nobody_opts_in(title, ptype):
     """Default OFF: the worker / brand-official / repair-planner callers never set the switch."""
@@ -122,6 +126,37 @@ def test_the_cli_flag_enables_it_for_that_run_only(monkeypatch):
     ("Lip Tint", "Lip/Cheek"),
     # a comma tag list that never names the lip area
     ("Velvet Lipstick", "HERA,Face,Makeup,Cushion"),
+    # --- adversarial review of PR #2257 (each of these was placed in a lip leaf by the first cut) ---
+    # a merchant type no pattern reads is still the merchant saying what it is: allowlist, not denylist
+    ("Lip Care Gummies", "Supplements"), ("Lipstick Pretend Play", "Toys"), ("Lipstick", "Sets"),
+    ("Lipstick", "Gift Sets"), ("Lipstick", "Samples"), ("Lip Liner", "Kits"), ("Lip Liner", "Tools"),
+    ("Lip Liner", "Brushes"), ("Lip Liner", "Eye"), ("Lip Liner", "Eyes"), ("Lip Balm", "Pet"),
+    ("Lip Balm", "Masks"), ("Lip Gloss Tube", "Packaging"), ("Lipstick Rose", "Fragrance"),
+    # a tag list with ANY tag the title does not say
+    ("Lip Tint", "Lip,Cheek"), ("Lip Liner", "Eye,Lip"), ("Lip Liner", "Lips,Eyes"), ("Lipstick", "Makeup,Lips,Sets"),
+    # another area named anywhere, not only beside "lip"
+    ("Lip Tint & Cheek", None), ("Lip Tint + Cheek", None), ("Lipstick for Lips, Cheeks & Eyes", None),
+    ("Lip Balm and Cuticle Balm", None), ("Lip Stain for Cheeks Too", None), ("Lip Liner Eye Pencil", None),
+    ("Eye Lip Liner Pencil", None), ("Lip Tint & Cheek Balm", "Cosmetics"),
+    # more set words
+    ("Lip Combo - Nude", None), ("Lipstick Quad", None), ("Lipstick Palette", None), ("Lip Liner Wardrobe", None),
+    ("Mini Lipstick 3 Pack", None), ("Lip Liner Twin Pack", None), ("Lipstick Collection", None), ("Lipstick x3", None),
+    # not a lip product at all
+    ("Lipstick Charm", None), ("Lipstick Earrings", None), ("Lipstick Candle", None), ("Lipstick Lighter", None),
+    ("Lipstick Socks", None), ("Lipstick USB Drive", None), ("Lipstick Power Bank", None), ("Lip Gloss Keyring", None),
+    ("Lip Gloss Phone Charm", None), ("Lip Balm Lanyard", None), ("Lipstick Plush Toy", None),
+    ("Toy Lipstick for Girls", None), ("Lip Gloss Squishy Toy", None), ("Empty Lip Gloss Tubes", None),
+    ("Lip Balm Tin (Empty)", None), ("Lip Gloss Base", None), ("Lip Balm Base Beeswax", None), ("Lipstick Mold", None),
+    ("Lip Liner Stencil", None), ("Lip Balm Dispenser", None), ("Lip Balm Display Stand", None),
+    ("Lip Balm for Dogs", None), ("Lipstick Sample Card", None), ("Lip Gloss Tester", None),
+    # a multi-use joiner with no area word ("Liner" names no pattern on its own)
+    ("Lipstick & Liner", None), ("Lip Tint + Liner", None),
+    # an area only _NON_FACE_TITLE names
+    ("Lip Balm Beard Care", None), ("Lash Lip Tint", None),
+    # two LIP leaves at once: which one is not the door's to choose
+    ("Lip Gloss Lip Oil", None), ("Lip Liner Lipstick", None),
+    # a tag list of words the title says, none of them the lip area
+    ("HERA Velvet Lipstick", "HERA,Makeup"),
 ])
 def test_everything_short_of_one_explicit_lip_product_stays_unresolved(title, ptype, evidence):
     path, confidence = resolve(title, ptype)
@@ -189,13 +224,44 @@ def _cohort():
 
 
 def test_lip_pass_keeps_only_lip_rows_and_prints_every_row_it_left_out(capsys, evidence):
-    kept = _select_by_category(_cohort(), prefix="beauty/makeup/lip")
+    kept = _select_by_category(_cohort(), prefix="beauty/makeup/lip", domain="k-touch.us")
     assert [r["pdp"]["category_path"] for r in kept] == ["beauty/makeup/lip/lipstick"]
     out = capsys.readouterr().out
     left = [line for line in out.splitlines() if line.startswith(LEFT_OUT_PDP_PREFIX)]
     assert len(left) == 2
     assert '"reason": "outside_category_filter"' in out and '"reason": "category_unresolved"' in out
     assert "3 -> 1 products (2 left out)" in out
+    report = [line for line in out.splitlines() if line.startswith(CATEGORY_FILTER_MARKER)]
+    assert len(report) == 1 and '"left_out": 2' in report[0] and '"domain": "k-touch.us"' in report[0]
+
+
+def test_a_record_without_a_pdp_is_left_for_the_plan_to_refuse(evidence):
+    malformed = {"offers": []}
+    kept = _select_by_category(_cohort() + [malformed], prefix=None)
+    assert malformed in kept
+
+
+def test_a_domain_that_keeps_nothing_is_named_in_the_error():
+    only_unresolved = [record("3CE - New Take Eyeshadow Palette", "", "new-take")]
+    with pytest.raises(ValueError, match="^k-touch.us: category filter"):
+        _select_by_category(only_unresolved, prefix=None, domain="k-touch.us")
+
+
+def test_the_gate_reads_the_same_marker_the_cli_prints():
+    assert gate.FILTER_MARKER == CATEGORY_FILTER_MARKER
+
+
+def test_the_gate_reports_what_a_filter_kept_out_without_failing_on_it():
+    applied = ('primary ingestion: {"applied": {"primary_readiness": {"status": "complete", "products": '
+               '[{"canonical_url": "https://k-touch.us/products/a", "product_key": "k"}]}}, '
+               '"missing": {}, "status": "applied"}')
+    log = "\n".join([
+        CATEGORY_FILTER_MARKER + '{"domain": "k-touch.us", "filter": "beauty/makeup/lip", "kept": 3, "left_out": 21, "selected": 24}',
+        applied, "JOB=oneoff-1 RC=0"])
+    verdict = gate.evaluate_apply_log(log, domain="k-touch.us")
+    assert verdict["ok"] is True
+    assert verdict["category_filter"]["left_out"] == 21 and verdict["category_filter"]["kept"] == 3
+    assert gate.evaluate_apply_log(applied + "\nJOB=oneoff-1 RC=0", domain="k-touch.us")["category_filter"] is None
 
 
 def test_resolved_pass_unblocks_the_cohort_without_resolving_anything(evidence):
@@ -218,3 +284,34 @@ def test_a_filter_that_keeps_nothing_is_an_error():
     only_unresolved = [record("3CE - New Take Eyeshadow Palette", "", "new-take")]
     with pytest.raises(ValueError, match="kept none"):
         _select_by_category(only_unresolved, prefix=None)
+
+
+def test_the_cli_runs_the_door_and_the_filter_together(monkeypatch, capsys):
+    """End to end through main(): records are built INSIDE the run, as records_for_brand does, so
+    the switch must be on there; and the filter must drop exactly the unresolved rows."""
+    from unittest.mock import AsyncMock
+    import scripts.onboard_curated_brands as cli
+
+    async def fetch(**_):
+        return feed.ShopifyProductBatch(_cohort(), scanned_products=3, pages=1)
+    stub = AsyncMock(side_effect=fetch)
+    stub.last_vendor_filter_report = None
+    stub.last_brand_census = None
+    stub.last_fold_report = None
+    monkeypatch.setattr(cli, "records_for_brand", stub)
+    argv = ["--domain", "k-touch.us", "--category", "beauty", "--brand", "3CE", "--only-vendor", "3CE",
+            "--source-role", "retailer",
+            "--emit-real-variants", "--plan-print-limit", "0"]
+
+    assert cli.main(argv + ["--lip-title-evidence", "--only-category", "beauty/makeup/lip"]) == 0
+    out = capsys.readouterr().out
+    assert '"kept": 1' in out and '"left_out": 2' in out
+    assert '"category_path": "beauty/makeup/lip/lipstick"' in out
+    assert '"unresolved_category_count": 0' in out
+
+    # Without the switch the lipstick is unresolved again, so a lip-only pass keeps nothing:
+    # main() reports the refusal and exits 2, the same as an --only-gtin that matches nothing.
+    assert cli.main(argv + ["--only-category", "beauty/makeup/lip"]) == 2
+    captured = capsys.readouterr()
+    assert '"kept": 0' in captured.out
+    assert "k-touch.us: category filter beauty/makeup/lip kept none" in captured.err

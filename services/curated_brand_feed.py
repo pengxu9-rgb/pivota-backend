@@ -1576,24 +1576,50 @@ def lip_title_evidence():
 
 
 _LIP_LEAF_PREFIX = "beauty/makeup/lip/"
-# a multi-use product: "Lip & Cheek", "Eye and Lip Remover", "Lip/Cheek Tint"
-_LIP_MULTI_USE = re.compile(r"\blips?\s*(?:&|\+|/|\band\b)\s*\w|\w\s*(?:&|\+|/|\band\b)\s*lips?\b", re.I)
+# Distinct from every other writer's value (0.3/0.7/0.8/0.82/0.85/0.9/0.95), so a stored row this
+# door placed can be found by (category_label_source, category_confidence) without re-running it.
+# Nothing thresholds on category_confidence.
+CATEGORY_CONFIDENCE_LIP_TITLE = 0.78
+# two things joined: "Lip & Cheek", "Lipstick & Liner", "Eye and Lip Remover", "Lip/Cheek Tint". Any
+# "&", "+" or "and" refuses (a shade like "Rose & Honey" stays unresolved -- the safe side), except a
+# "+" after a digit ("SPF 30+"); "/" only beside "lip", because sizes read "3.5g/0.12oz".
+_LIP_MULTI_USE = re.compile(r"&|(?<!\d)\+|\band\b|\blips?\s*/|/\s*lips?\b", re.I)
+# ...and any other area named ANYWHERE: "Lip Tint & Cheek", "Lip Stain for Cheeks Too", "Lip Liner Eye Pencil"
+_LIP_OTHER_AREA = re.compile(r"\b(?:cheeks?|eyes?|eyelids?|face|facial|brows?|cuticles?|nails?|body|hands?|"
+                             r"hair|feet|foot)\b", re.I)
 # a set, kit or bundle: its own shelf (beauty/sets), whatever lip product is inside it
-_LIP_SET = re.compile(r"\b(?:sets?|kits?|bundles?|trio|gift|sampler|discovery|advent|vault|"
-                      r"\d+\s*-?\s*(?:pcs|pieces?|ea))\b", re.I)
+_LIP_SET = re.compile(r"\b(?:sets?|kits?|bundles?|packs?|combos?|duos?|trios?|quads?|twins?|palettes?|wardrobes?|"
+                      r"collections?|gift|sampler|discovery|advent|vault|\d+\s*-?\s*(?:pcs|pieces?|ea)|"
+                      r"\d+\s*x|x\s*\d+)\b", re.I)
 # a tool or accessory FOR a lip product, not a lip product
 _LIP_ACCESSORY = re.compile(r"\b(?:brush(?:es)?|sharpeners?|applicators?|cases?|holders?|pouch(?:es)?|"
-                            r"mirrors?|keychains?|removers?|wipes?|cleansers?|organi[sz]ers?)\b", re.I)
+                            r"mirrors?|removers?|wipes?|cleansers?|organi[sz]ers?)\b", re.I)
+# not a lip product at all: merch, toys, craft supplies, packaging, displays, samples, other
+# audiences, ingestibles, fragrance. Measured by adversarial review of PR #2257.
+_LIP_NOT_A_PRODUCT = re.compile(
+    r"\b(?:dogs?|cats?|pets?|kids?|girls?|boys?|bab(?:y|ies)|child(?:ren)?|toys?|plush|squishy|pretend|"
+    r"charms?|earrings?|jewel(?:ry|lery)|necklaces?|pendants?|candles?|lighters?|socks?|usb|power\s*banks?|"
+    r"key\s*rings?|keyrings?|key\s*chains?|keychains?|lanyards?|stickers?|decals?|magnets?|ornaments?|"
+    r"empty|base|beeswax|molds?|moulds?|stencils?|dispensers?|displays?|stands?|tubes?|tins?|containers?|"
+    r"bottles?|cards?|testers?|samples?|swatch(?:es)?|gumm(?:y|ies)|supplements?|vitamins?|capsules?|"
+    r"candy|chocolate|perfume|parfum|eau|cologne|fragrance)\b", re.I)
 # "Lip Color" is a family word, not a form: "Glossy Lip Color" is a gloss, "Lip Color Balm" a balm.
 _LIP_FAMILY_WORD = re.compile(r"\blip\s+colou?r\b", re.I)
 _LIP_FORM_WORD = re.compile(r"\b(?:gloss|glossy|tint|stain|balm|oil|liner|pencil|crayon|butter|serum)\b", re.I)
+# Merchant types that say "lip" and nothing more specific. With _GENERIC_PRODUCT_TYPES and a blank
+# type, the ONLY types the door accepts: an allowlist, because a type no pattern reads ("Toys",
+# "Supplements", "Gift Sets", "Eyes", "Packaging") is still the merchant saying what it is.
+_LIP_AREA_TYPES = frozenset({"lip", "lips", "lip makeup", "lip make up", "lip products", "lip product"})
+
+
+def _lip_word_tokens(text: str) -> set:
+    return set(re.findall(r"[a-z0-9]+", text.casefold()))
 
 
 def _explicit_lip_title_leaf(*, product_type: Optional[str], title: Optional[str]) -> Optional[str]:
     """The lip leaf a title names outright, or None. The caller asks only for UNRESOLVED rows."""
     if not _LIP_TITLE_EVIDENCE.get():
         return None
-    from services.pdp_category_classifier import CATEGORY_PATTERNS
     text = str(title or "")
     named = _title_paths(text)
     if len(named) != 1:
@@ -1602,26 +1628,31 @@ def _explicit_lip_title_leaf(*, product_type: Optional[str], title: Optional[str
     leaf = next(iter(named))
     if not leaf.startswith(_LIP_LEAF_PREFIX):
         return None
-    if (_LIP_MULTI_USE.search(text) or _LIP_SET.search(text) or _LIP_ACCESSORY.search(text)
-            or _NON_FACE_TITLE.search(text)):
+    if any(p.search(text) for p in (_LIP_MULTI_USE, _LIP_OTHER_AREA, _LIP_SET, _LIP_ACCESSORY,
+                                     _LIP_NOT_A_PRODUCT, _NON_FACE_TITLE)):
         return None
     if leaf == "beauty/makeup/lip/lipstick" and _LIP_FAMILY_WORD.search(text) and _LIP_FORM_WORD.search(text):
         return None
     ptype = " ".join(str(product_type or "").casefold().split())
-    # "An unclassifiable multi-use label (e.g. Lip & Cheek) is not permission to choose a competing
-    # category from its title" (_resolve_category_by_evidence) holds here too.
-    if re.search(r"[&/]|\band\b", ptype):
+    if not ptype or ptype in _GENERIC_PRODUCT_TYPES or ptype in _LIP_AREA_TYPES:
+        return leaf
+    if "," not in ptype:
         return None
-    # The type may name nothing, or only this same leaf -- never another class. A tag list naming
-    # "Powder" or "Cushion" is the merchant saying this is something other than a lip product.
-    typed = {path for _label, path, pattern in CATEGORY_PATTERNS if pattern.search(ptype)}
-    if typed - {leaf}:
-        return None
-    # A comma tag list IS the merchant's own classification, even where no pattern reads it
-    # ("HERA,Face,Makeup,Cushion" matches nothing): it must name the lip area for the title to count.
-    if "," in ptype and not any(re.search(r"\blips?\b", tag) for tag in ptype.split(",")):
-        return None
-    return leaf
+    # A comma tag list IS the merchant's own classification. Every tag must be generic, the lip
+    # area, or a word the title already says (the brand, a finish) -- so "Lip,Cheek",
+    # "Makeup,Lips,Sets" and "HERA,Face,Makeup,Cushion" say something the title does not -- and at
+    # least one tag must name the lip area.
+    title_words = _lip_word_tokens(text)
+    tags = [t.strip() for t in ptype.split(",") if t.strip()]
+    lip_tag = False
+    for tag in tags:
+        if tag in _LIP_AREA_TYPES or _title_paths(tag) == {leaf}:
+            lip_tag = True
+        elif tag in _GENERIC_PRODUCT_TYPES:
+            continue
+        elif not _lip_word_tokens(tag) or not _lip_word_tokens(tag) <= title_words:
+            return None
+    return leaf if lip_tag else None
 
 
 def _resolve_category(*, product_type: Optional[str], title: Optional[str], flag_path: str,
@@ -1677,7 +1708,7 @@ def _resolve_category_unguarded(*, product_type: Optional[str], title: Optional[
     # Last, and on the same terms as the shelf: fills only what everything above left unresolved.
     leaf = _explicit_lip_title_leaf(product_type=product_type, title=title)
     if leaf:
-        return leaf, CATEGORY_CONFIDENCE_EXPLICIT_TITLE
+        return leaf, CATEGORY_CONFIDENCE_LIP_TITLE
     return path, confidence
 
 

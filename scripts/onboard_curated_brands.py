@@ -205,8 +205,13 @@ def _select_by_gtin(records: List[Dict[str, Any]], canonical: set, *, domain: st
 #: Printed once per record a category filter left out of the run. Greppable, like SKIPPED_PDP_PREFIX.
 LEFT_OUT_PDP_PREFIX = "    left out pdp "
 
+#: Its own line per domain, like LEGACY_LISTINGS_MARKER: scripts/curated_apply_gate.py reads it so a
+#: gate that passes a filtered run also says how many products the filter kept out of it.
+CATEGORY_FILTER_MARKER = "category filter report: "
 
-def _select_by_category(records: List[Dict[str, Any]], *, prefix: Optional[str]) -> List[Dict[str, Any]]:
+
+def _select_by_category(records: List[Dict[str, Any]], *, prefix: Optional[str],
+                        domain: Optional[str] = None) -> List[Dict[str, Any]]:
     """Keep the records whose category RESOLVES (and, with `prefix`, sits under it).
 
     One unresolved row blocks a whole cohort (`category_unresolved`), and a retailer's feed mixes
@@ -216,13 +221,19 @@ def _select_by_category(records: List[Dict[str, Any]], *, prefix: Optional[str])
     a lip-only pass. It never resolves anything: a left-out row is printed, one line each, and stays
     out of the plan exactly as unresolved as it was.
 
-    A filter that keeps NOTHING raises, like --only-gtin and --only-vendor.
+    Called once PER DOMAIN, so a domain whose every product is left out raises instead of quietly
+    vanishing from a multi-domain --file run. A filter that keeps NOTHING raises, like --only-gtin
+    and --only-vendor. A record with no `pdp` is not a category question: it is kept, and the plan
+    refuses it exactly as it would without this filter.
     """
     from services.category_path_aliases import resolve
     want = (prefix or "").strip().strip("/").lower()
     kept, left_out = [], []
     for record in records:
-        pdp = record.get("pdp") or {}
+        pdp = record.get("pdp")
+        if not isinstance(pdp, dict):
+            kept.append(record)
+            continue
         leaf = resolve(pdp.get("category_path")) or ""
         if leaf and (not want or leaf == want or leaf.startswith(want + "/")):
             kept.append(record)
@@ -239,8 +250,14 @@ def _select_by_category(records: List[Dict[str, Any]], *, prefix: Optional[str])
         }, sort_keys=True, ensure_ascii=False))
     print(f"    category filter {want or '(resolved)'}: {len(records)} -> {len(kept)} products "
           f"({len(left_out)} left out)")
+    print(CATEGORY_FILTER_MARKER + json.dumps({
+        "domain": domain, "filter": want or "(resolved)", "selected": len(records),
+        "kept": len(kept), "left_out": len(left_out),
+    }, sort_keys=True))
     if not kept:
-        raise ValueError(f"category filter {want or '(resolved)'} kept none of the {len(records)} selected products")
+        where = f"{domain}: " if domain else ""
+        raise ValueError(f"{where}category filter {want or '(resolved)'} kept none of the "
+                         f"{len(records)} selected products")
     return kept
 
 
@@ -513,6 +530,8 @@ async def _run(args: argparse.Namespace) -> int:
             matched_gtins |= matched
             print(f"    gtin filter {sorted(wanted_gtins)}: {before} -> {len(recs)} products "
                   f"(matched {sorted(matched)})")
+        if args.only_category or args.only_resolved_category:
+            recs = _select_by_category(recs, prefix=args.only_category, domain=b["domain"])
         print(f"  {b['domain']}: {len(recs)} products")
         # A brand-family storefront must not ingest silently. misshaus.com shipped 17
         # A'pieu products into the index branded "Missha" because nothing printed the
@@ -546,8 +565,6 @@ async def _run(args: argparse.Namespace) -> int:
     if wanted_gtins - matched_gtins:
         raise ValueError(f"--only-gtin values matched no product in this run: "
                          f"{sorted(wanted_gtins - matched_gtins)}")
-    if args.only_category or args.only_resolved_category:
-        all_records = _select_by_category(all_records, prefix=args.only_category)
     plan = ingest_validated_jsonl(all_records)
     print(
         f"plan: pdps={len(plan.get('pdps') or [])} skus={len(plan.get('skus') or [])} "
