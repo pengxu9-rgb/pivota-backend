@@ -2224,15 +2224,23 @@ def _invoice_values(
         "billing_period_start": period_start,
         "billing_period_end": period_end,
         "stripe_invoice_id": _as_text(invoice.get("id")),
-        "total_cents": _invoice_amount_cents(invoice),
+        "total_cents": _invoice_amount_cents(invoice, status_value=status_value),
         "status": status_value,
         "due_date": _stripe_timestamp(invoice.get("due_date")),
         "finalized_at": _stripe_timestamp(status_transitions.get("finalized_at")),
     }
 
 
-def _invoice_amount_cents(invoice: Dict[str, Any]) -> int:
-    for key in ("amount_paid", "amount_due", "total"):
+def _invoice_amount_cents(invoice: Dict[str, Any], *, status_value: str) -> int:
+    # A paid invoice records the cash received (activation nets refunds off it).
+    # Anything else records what was billed: Stripe sends amount_paid=0, not
+    # null, on an unpaid invoice, so reading it first zeroed every
+    # payment_failed invoice's total.
+    if status_value == "paid":
+        keys: Tuple[str, ...] = ("amount_paid", "amount_due", "total")
+    else:
+        keys = ("amount_due", "total")
+    for key in keys:
         raw = invoice.get(key)
         if raw is not None:
             try:

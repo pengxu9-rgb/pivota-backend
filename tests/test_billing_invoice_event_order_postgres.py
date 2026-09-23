@@ -208,8 +208,8 @@ async def test_in_order_a_failed_attempt_then_the_paying_retry_ends_paid(db, cli
     """The guard is on 'paid' only: a failure still lands on an unpaid invoice, and paid still wins."""
     await _billed_invoice(db)
     await _deliver(client, _invoice_event("evt_failed", "invoice.payment_failed"))
-    after_failure = await _invoice(db)
-    assert (after_failure["status"], after_failure["paid_at"]) == ("payment_failed", None)
+    # The failure records what was billed, not amount_paid (0 on an unpaid invoice).
+    assert await _invoice(db) == {"status": "payment_failed", "paid_at": None, "total_cents": AMOUNT}
 
     await _deliver(client, _invoice_event("evt_paid", "invoice.paid"))
     after_paid = await _invoice(db)
@@ -219,7 +219,7 @@ async def test_in_order_a_failed_attempt_then_the_paying_retry_ends_paid(db, cli
 
 async def test_a_payment_failed_on_an_unknown_invoice_still_inserts_it(db, client):
     await _deliver(client, _invoice_event("evt_failed", "invoice.payment_failed"))
-    assert (await _invoice(db))["status"] == "payment_failed"
+    assert await _invoice(db) == {"status": "payment_failed", "paid_at": None, "total_cents": AMOUNT}
 
 
 async def test_a_replayed_invoice_paid_does_not_move_paid_at(db, client):
