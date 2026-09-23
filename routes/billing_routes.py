@@ -793,6 +793,47 @@ async def _handle_checkout_session_completed(event: Dict[str, Any], db: Database
         if not plan:
             raise ValueError("No active subscription plan found for checkout session")
 
+        # Stripe does not order events, so this can arrive after the
+        # subscription it fulfils was deleted: before any local row existed (the
+        # deletion then had nothing to cancel), or as a retry of a delivery that
+        # already fulfilled it. Fulfilling it would activate a subscription
+        # Stripe canceled, grant its credits, and cancel the merchant's other
+        # live plans in Stripe as superseded. Record it as canceled and stop.
+        if await _stripe_subscription_already_ended(db, stripe_subscription_id):
+            await db.execute(
+                """
+                INSERT INTO user_subscriptions (
+                  merchant_id,
+                  plan_id,
+                  stripe_subscription_id,
+                  status,
+                  started_at,
+                  canceled_at
+                )
+                VALUES (
+                  :merchant_id,
+                  :plan_id,
+                  :stripe_subscription_id,
+                  'canceled',
+                  NOW(),
+                  NOW()
+                )
+                ON CONFLICT (stripe_subscription_id) DO NOTHING
+                """,
+                {
+                    "merchant_id": merchant_id,
+                    "plan_id": plan["id"],
+                    "stripe_subscription_id": stripe_subscription_id,
+                },
+            )
+            logger.warning(
+                "Not fulfilling checkout.session.completed for subscription %s: "
+                "it was deleted before the checkout was processed",
+                stripe_subscription_id,
+            )
+            await _mark_event_processed(event_id, db)
+            return
+
         merchant_contact_email = await _lookup_merchant_contact_email(db, merchant_id)
         async with db.transaction():
             subscription_row = await db.fetch_one(
@@ -820,6 +861,13 @@ async def _handle_checkout_session_completed(event: Dict[str, Any], db: Database
                     "stripe_subscription_id": stripe_subscription_id,
                 },
             )
+            # Only checkout inserts subscription rows, and it grants in this same
+            # transaction, so a row that already exists was fulfilled by an
+            # earlier delivery: Stripe retries one that failed after committing.
+            # Granting again would add a second ledger grant, reset
+            # merchant_credits.balance to the full allowance (discarding what
+            # the merchant spent) and restart the promo.
+            first_fulfilment = subscription_row is not None
             if not subscription_row:
                 subscription_row = await db.fetch_one(
                     """
@@ -834,74 +882,82 @@ async def _handle_checkout_session_completed(event: Dict[str, Any], db: Database
                 raise ValueError("Unable to resolve local subscription row after insert")
 
             local_subscription_id = int(subscription_row["id"])
-            await _update_merchant_subscription_after_checkout(
-                db,
-                merchant_id=merchant_id,
-                contact_email=merchant_contact_email,
-                local_subscription_id=local_subscription_id,
-                tier_name=_as_text(plan["name"]),
-                monthly_credit_allowance=int(plan["monthly_credit_allowance"] or 0),
-            )
+            if first_fulfilment:
+                await _update_merchant_subscription_after_checkout(
+                    db,
+                    merchant_id=merchant_id,
+                    contact_email=merchant_contact_email,
+                    local_subscription_id=local_subscription_id,
+                    tier_name=_as_text(plan["name"]),
+                    monthly_credit_allowance=int(plan["monthly_credit_allowance"] or 0),
+                )
 
-            await db.execute(
-                """
-                INSERT INTO credit_ledger (
-                  merchant_id,
-                  operation_type,
-                  operation_id,
-                  credits_delta,
-                  balance_after,
-                  source_type,
-                  metadata
+                await db.execute(
+                    """
+                    INSERT INTO credit_ledger (
+                      merchant_id,
+                      operation_type,
+                      operation_id,
+                      credits_delta,
+                      balance_after,
+                      source_type,
+                      metadata
+                    )
+                    VALUES (
+                      :merchant_id,
+                      'subscription_initial_grant',
+                      :operation_id,
+                      :credits_delta,
+                      :balance_after,
+                      'subscription_grant',
+                      CAST(:metadata AS jsonb)
+                    )
+                    """,
+                    {
+                        "merchant_id": merchant_id,
+                        "operation_id": stripe_subscription_id,
+                        "credits_delta": int(plan["monthly_credit_allowance"] or 0),
+                        "balance_after": int(plan["monthly_credit_allowance"] or 0),
+                        "metadata": json.dumps(
+                            {
+                                "stripe_event_id": event_id,
+                                "stripe_customer_id": stripe_customer_id,
+                                "stripe_price_id": price_id,
+                            }
+                        ),
+                    },
                 )
-                VALUES (
-                  :merchant_id,
-                  'subscription_initial_grant',
-                  :operation_id,
-                  :credits_delta,
-                  :balance_after,
-                  'subscription_grant',
-                  CAST(:metadata AS jsonb)
-                )
-                """,
-                {
-                    "merchant_id": merchant_id,
-                    "operation_id": stripe_subscription_id,
-                    "credits_delta": int(plan["monthly_credit_allowance"] or 0),
-                    "balance_after": int(plan["monthly_credit_allowance"] or 0),
-                    "metadata": json.dumps(
-                        {
-                            "stripe_event_id": event_id,
-                            "stripe_customer_id": stripe_customer_id,
-                            "stripe_price_id": price_id,
-                        }
-                    ),
-                },
-            )
 
-            # Create / refresh the merchant_credits row T5 metering operates on.
-            # Without this, the first reserve() call fails because there's no
-            # row to SELECT FOR UPDATE. Idempotent: ON CONFLICT updates allowance
-            # if the merchant re-subscribes after cancellation.
-            tier_allowance = int(plan["monthly_credit_allowance"] or 0)
-            await db.execute(
-                """
-                INSERT INTO merchant_credits (
-                  merchant_id, balance, tier_allowance, period_start, created_at, last_updated
+                # Create / refresh the merchant_credits row T5 metering operates on.
+                # Without this, the first reserve() call fails because there's no
+                # row to SELECT FOR UPDATE. Idempotent: ON CONFLICT updates allowance
+                # if the merchant re-subscribes after cancellation.
+                tier_allowance = int(plan["monthly_credit_allowance"] or 0)
+                await db.execute(
+                    """
+                    INSERT INTO merchant_credits (
+                      merchant_id, balance, tier_allowance, period_start, created_at, last_updated
+                    )
+                    VALUES (
+                      :merchant_id, :balance, :tier_allowance, NOW(), NOW(), NOW()
+                    )
+                    ON CONFLICT (merchant_id) DO UPDATE SET
+                      balance = EXCLUDED.balance,
+                      tier_allowance = EXCLUDED.tier_allowance,
+                      last_updated = NOW()
+                    """,
+                    {
+                        "merchant_id": merchant_id,
+                        "balance": tier_allowance,
+                        "tier_allowance": tier_allowance,
+                    },
                 )
-                VALUES (
-                  :merchant_id, :balance, :tier_allowance, NOW(), NOW(), NOW()
-                )
-                ON CONFLICT (merchant_id) DO UPDATE SET
-                  balance = EXCLUDED.balance,
-                  tier_allowance = EXCLUDED.tier_allowance,
-                  last_updated = NOW()
-                """,
-                {
-                    "merchant_id": merchant_id,
-                    "balance": tier_allowance,
-                    "tier_allowance": tier_allowance,
-                },
+
+        if not first_fulfilment:
+            logger.warning(
+                "checkout.session.completed for subscription %s was already "
+                "fulfilled; not granting the plan again",
+                stripe_subscription_id,
             )
 
         # Stripe sends customer.subscription.updated soon after checkout, which
@@ -976,7 +1032,7 @@ async def _handle_subscription_updated(event: Dict[str, Any], db: Database) -> N
 
         existing = await db.fetch_one(
             """
-            SELECT id, merchant_id, plan_id
+            SELECT id, merchant_id, plan_id, status
             FROM user_subscriptions
             WHERE stripe_subscription_id = :stripe_subscription_id
             LIMIT 1
@@ -984,7 +1040,13 @@ async def _handle_subscription_updated(event: Dict[str, Any], db: Database) -> N
             {"stripe_subscription_id": stripe_subscription_id},
         )
 
-        await db.execute(
+        # Stripe does not order events, and a canceled subscription can never be
+        # reactivated. An update landing on a canceled row describes an earlier
+        # state (delivered after customer.subscription.deleted); applying it
+        # would put the row back to a live status that nothing later cancels,
+        # and the credit wallet and tier reconcile both count a live row as a
+        # paid plan. Leave the canceled row as it is.
+        updated = await db.fetch_one(
             """
             UPDATE user_subscriptions
             SET
@@ -995,6 +1057,8 @@ async def _handle_subscription_updated(event: Dict[str, Any], db: Database) -> N
               cancel_at_period_end = :cancel_at_period_end,
               canceled_at = :canceled_at
             WHERE stripe_subscription_id = :stripe_subscription_id
+              AND status <> 'canceled'
+            RETURNING id
             """,
             {
                 "stripe_subscription_id": stripe_subscription_id,
@@ -1015,6 +1079,18 @@ async def _handle_subscription_updated(event: Dict[str, Any], db: Database) -> N
             await _mark_event_processed(event_id, db)
             return
 
+        if not updated:
+            # The tier and allowance side effects below must not run either:
+            # the deletion already reconciled this merchant.
+            logger.warning(
+                "Ignoring customer.subscription.updated (status=%s) for canceled "
+                "subscription %s: delivered after the cancellation",
+                status_value,
+                stripe_subscription_id,
+            )
+            await _mark_event_processed(event_id, db)
+            return
+
         merchant_id = _as_text(existing["merchant_id"])
         contact_email = await _lookup_merchant_contact_email(db, merchant_id)
         if status_value in {"canceled", "unpaid"}:
@@ -1023,6 +1099,18 @@ async def _handle_subscription_updated(event: Dict[str, Any], db: Database) -> N
                 merchant_id=merchant_id,
                 contact_email=contact_email,
                 ended_stripe_subscription_id=stripe_subscription_id,
+            )
+        elif status_value in {"active", "trialing"} and _as_text(existing["status"]) == "unpaid":
+            # Paying the open invoice reactivates an unpaid subscription. The
+            # unpaid update downgraded the merchant to free and cleared
+            # merchants.subscription_id, which invoice generation joins through
+            # to find the Stripe customer, so re-resolve against every live
+            # subscription, this one included, rather than only on a plan change.
+            await _reconcile_after_subscription_ended(
+                db,
+                merchant_id=merchant_id,
+                contact_email=contact_email,
+                ended_stripe_subscription_id=None,
             )
         elif plan and int(existing["plan_id"]) != int(plan["id"]):
             await _update_merchant_tier(
@@ -1585,6 +1673,7 @@ async def _update_merchant_tier(
     merchant_id: str,
     contact_email: Optional[str],
     tier_name: str,
+    subscription_id: Optional[int] = None,
 ) -> None:
     where_clause, params = await _merchant_where_clause(
         db,
@@ -1598,10 +1687,11 @@ async def _update_merchant_tier(
     await db.execute(
         f"""
         UPDATE merchants
-        SET current_tier = :current_tier
+        SET current_tier = :current_tier,
+            subscription_id = COALESCE(CAST(:subscription_id AS BIGINT), subscription_id)
         WHERE {where_clause}
         """,
-        {**params, "current_tier": tier_name},
+        {**params, "current_tier": tier_name, "subscription_id": subscription_id},
     )
 
 
@@ -1661,10 +1751,14 @@ async def _reconcile_after_subscription_ended(
     still active. Prefer the richest remaining active subscription; only fall
     back to the free downgrade when none remain. Mirrors the
     richest-plan-wins ordering used by the tier resolvers.
+
+    With ended_stripe_subscription_id=None no Stripe subscription is set aside,
+    which is how a subscription recovering from unpaid puts the merchant back on
+    its plan.
     """
     remaining = await db.fetch_one(
         """
-        SELECT sp.name AS tier_name
+        SELECT sp.name AS tier_name, us.id AS subscription_id
           FROM user_subscriptions us
           JOIN subscription_plans sp ON sp.id = us.plan_id
          WHERE us.merchant_id = :merchant_id
@@ -1691,6 +1785,7 @@ async def _reconcile_after_subscription_ended(
         merchant_id=merchant_id,
         contact_email=contact_email,
         tier_name=_as_text(remaining["tier_name"]),
+        subscription_id=int(remaining["subscription_id"]),
     )
     if merchant_id:
         try:
@@ -1708,6 +1803,45 @@ async def _reconcile_after_subscription_ended(
             )
 
 
+async def _stripe_subscription_already_ended(
+    db: Database, stripe_subscription_id: str
+) -> bool:
+    """Whether this subscription is known to be canceled in Stripe.
+
+    Either its local row is canceled, or its customer.subscription.deleted
+    arrived before any local row existed. The deleted handler has nothing to
+    update then, so the signed event in stripe_events is the only record.
+    """
+    row = await db.fetch_one(
+        """
+        SELECT status
+        FROM user_subscriptions
+        WHERE stripe_subscription_id = :stripe_subscription_id
+        LIMIT 1
+        """,
+        {"stripe_subscription_id": stripe_subscription_id},
+    )
+    if row:
+        return _as_text(row["status"]) == "canceled"
+
+    payload_subscription_id = (
+        "payload_jsonb -> 'data' -> 'object' ->> 'id'"
+        if IS_POSTGRES
+        else "json_extract(payload_jsonb, '$.data.object.id')"
+    )
+    deleted = await db.fetch_one(
+        f"""
+        SELECT 1
+        FROM stripe_events
+        WHERE event_type = 'customer.subscription.deleted'
+          AND {payload_subscription_id} = :stripe_subscription_id
+        LIMIT 1
+        """,
+        {"stripe_subscription_id": stripe_subscription_id},
+    )
+    return deleted is not None
+
+
 async def _cancel_prior_active_subscriptions(
     db: Database,
     *,
@@ -1718,9 +1852,13 @@ async def _cancel_prior_active_subscriptions(
     keep_stripe_subscription_id — in Stripe (so billing stops) and locally.
 
     Called after a new subscription checkout completes so the merchant ends up
-    with a single active plan. Best-effort and isolated per subscription: a
-    failure to cancel one prior subscription is logged and never interrupts the
-    others or the new subscription's fulfillment. The resulting
+    with a single active plan. Isolated per subscription: a failure to cancel
+    one prior subscription never interrupts the others, and the new
+    subscription is already fulfilled. A prior subscription is recorded
+    canceled only once Stripe has nothing left to bill on it; otherwise it
+    stays live locally and this raises after trying the rest, so the checkout
+    event fails and Stripe redelivers it. The redelivery does not grant the
+    plan again and retries the cancel. The resulting
     customer.subscription.deleted webhook is reconciled by
     _reconcile_after_subscription_ended, which keeps the merchant on the
     just-activated plan rather than downgrading to free.
@@ -1746,6 +1884,7 @@ async def _cancel_prior_active_subscriptions(
         )
         return
 
+    still_billing: list[str] = []
     for row in rows or []:
         prior_id = _as_text(dict(row).get("stripe_subscription_id"))
         if not prior_id:
@@ -1755,16 +1894,20 @@ async def _cancel_prior_active_subscriptions(
                 stripe_client.v1.subscriptions.cancel, prior_id
             )
         except Exception:  # noqa: BLE001
-            # Already cancelled in Stripe, or a transient API failure — mark the
-            # local row cancelled regardless so tier resolution stops counting
-            # it; the deleted webhook (if any) is idempotent.
-            logger.warning(
-                "Stripe cancel failed for prior subscription %s (merchant_id=%s); "
-                "marking local row cancelled anyway",
-                prior_id,
-                merchant_id,
-                exc_info=True,
-            )
+            # Cancelling a subscription Stripe already ended (or never had) is
+            # an error too, so ask Stripe. Recording one it still bills as
+            # canceled would be permanent: updates to a canceled row are
+            # ignored, so the merchant would pay for both plans unseen.
+            if not await _stripe_has_nothing_to_bill(prior_id):
+                logger.warning(
+                    "Stripe cancel failed for prior subscription %s (merchant_id=%s); "
+                    "leaving it live until a redelivery cancels it",
+                    prior_id,
+                    merchant_id,
+                    exc_info=True,
+                )
+                still_billing.append(prior_id)
+                continue
         try:
             await db.execute(
                 """
@@ -1783,6 +1926,29 @@ async def _cancel_prior_active_subscriptions(
                 merchant_id,
                 exc_info=True,
             )
+
+    if still_billing:
+        raise RuntimeError(
+            "Could not cancel superseded subscription(s) in Stripe: "
+            + ", ".join(still_billing)
+        )
+
+
+async def _stripe_has_nothing_to_bill(stripe_subscription_id: str) -> bool:
+    """After a failed cancel: whether Stripe has the subscription canceled, or
+    no such subscription at all. False when Stripe cannot say."""
+    try:
+        subscription = _stripe_object_to_dict(
+            await asyncio.to_thread(
+                stripe_client.v1.subscriptions.retrieve, stripe_subscription_id
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        return (
+            type(exc).__name__ == "InvalidRequestError"
+            and getattr(exc, "code", None) == "resource_missing"
+        )
+    return _as_text(subscription.get("status")) == "canceled"
 
 
 async def _fetch_merchant_billing_row(
