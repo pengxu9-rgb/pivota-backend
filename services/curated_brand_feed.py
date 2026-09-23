@@ -1637,8 +1637,10 @@ _LIP_FORM_WORD = re.compile(r"\b(?:gloss|glossy|tint|stain|balm|oil|liner|pencil
 _LIP_AREA_TYPES = frozenset({"lip", "lips", "lip makeup", "lip make up", "lip products", "lip product"})
 # The neutral types the door accepts. NOT _GENERIC_PRODUCT_TYPES: that set also holds "hair care",
 # "face care" and "skin care", which say the product is something other than a lip product.
+# thisisbeauty.us (2026-09-23) types all 8,367 products "Misc": a catch-all says as little as a blank.
 _LIP_NEUTRAL_TYPES = frozenset({"beauty", "cosmetics", "makeup", "make up", "lip care", "lip treatment",
-                                "lip treatments", "lip color", "lip colour"})
+                                "lip treatments", "lip color", "lip colour",
+                                "misc", "miscellaneous", "other", "others", "general", "default"})
 
 
 def _lip_word_tokens(text: str) -> set:
