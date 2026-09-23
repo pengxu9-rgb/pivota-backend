@@ -40,10 +40,19 @@ def evidence():
     ("Velvet Lipstick", "Makeup", "beauty/makeup/lip/lipstick"),
     ("HERA Velvet Matte Lipstick", "HERA,Lip,Makeup,matte", "beauty/makeup/lip/lipstick"),
     ("Velvet Lipstick", "Lips", "beauty/makeup/lip/lipstick"),
+    # thisisbeauty.us types every product "Misc"
+    ("ILLAMASQUA Lipstick HOWL 0.14oz - Imperfect Box", "Misc", "beauty/makeup/lip/lipstick"),
+    # a count of one is a single product, not a set
+    ("3CE Velvet Lip Tint (1pc)", "Misc", "beauty/makeup/lip/tint"),
+    ("Soft Matte Lipstick 1 EA", "", "beauty/makeup/lip/lipstick"),
+    ("ILLAMASQUA Loaded Lip Polish FIZZ 0.05oz - New", "Other", None),
     # sizes and SPF are not joiners
     ("3CE - Soft Matte Lipstick 3.5g/0.12oz", None, "beauty/makeup/lip/lipstick"),
 ])
 def test_an_explicit_lip_title_resolves_where_the_type_says_nothing(title, ptype, want, evidence):
+    if want is None:  # a neutral type, but the title names no lip leaf ("Lip Polish") -> still unresolved
+        assert not resolve(title, ptype)[0].startswith("beauty/makeup/lip/")
+        return
     assert resolve(title, ptype) == (want, feed.CATEGORY_CONFIDENCE_LIP_TITLE)
 
 
@@ -142,7 +151,8 @@ def test_the_cli_flag_enables_it_for_that_run_only(monkeypatch):
     ("Eye Lip Liner Pencil", None), ("Lip Tint & Cheek Balm", "Cosmetics"),
     # more set words
     ("Lip Combo - Nude", None), ("Lipstick Quad", None), ("Lipstick Palette", None), ("Lip Liner Wardrobe", None),
-    ("Mini Lipstick 3 Pack", None), ("Lip Liner Twin Pack", None), ("Lipstick Collection", None), ("Lipstick x3", None),
+    ("Mini Lipstick 3 Pack", None),
+    ("ILLAMASQUA The Antimatter Lipstick Vault 5 pieces - Imperfect Box", "Misc"), ("Lip Liner Twin Pack", None), ("Lipstick Collection", None), ("Lipstick x3", None),
     # not a lip product at all
     ("Lipstick Charm", None), ("Lipstick Earrings", None), ("Lipstick Candle", None), ("Lipstick Lighter", None),
     ("Lipstick Socks", None), ("Lipstick USB Drive", None), ("Lipstick Power Bank", None), ("Lip Gloss Keyring", None),
@@ -151,6 +161,11 @@ def test_the_cli_flag_enables_it_for_that_run_only(monkeypatch):
     ("Lip Balm Tin (Empty)", None), ("Lip Gloss Base", None), ("Lip Balm Base Beeswax", None), ("Lipstick Mold", None),
     ("Lip Liner Stencil", None), ("Lip Balm Dispenser", None), ("Lip Balm Display Stand", None),
     ("Lip Balm for Dogs", None), ("Lipstick Sample Card", None), ("Lip Gloss Tester", None),
+    # review of #2263: catch-all types ("Misc") reach the door, so these must be refused by title
+    ("Lipstick Poster", "Misc"), ("Lipstick Enamel Pin", "Misc"), ("Lip Gloss Tumbler", "General"),
+    ("Lip Oil Diffuser", "Other"), ("Doll Lipstick", "Misc"), ("Lip Gloss Squishies", "Misc"),
+    ("Lip Balm Bulk Wholesale 100", "Misc"), ("Lip Balm GWP", "Misc"), ("Lip Balm Promo", "Misc"),
+    ("Lipstick 2-pc", "Misc"),
     # a multi-use joiner with no area word ("Liner" names no pattern on its own)
     ("Lipstick & Liner", None), ("Lip Tint + Liner", None),
     # an area only _NON_FACE_TITLE names
