@@ -124,6 +124,7 @@ _JOB_RUN_DEADLINES = {
     "catalog_invariant_sweep": 7200,
     "identity_reconcile_sweep": 7200,
     "gmv_aggregation_daily": 3600,
+    "agent_share_accrual_daily": 3600,
     "audit_stability_canary": 1800,
     # 6-hourly catalog sweeps (bounded per run, stalest-first)
     "pdp_scope_backfill": 7200,
@@ -917,6 +918,29 @@ async def start_scheduler() -> None:
             max_instances=1,
         )
 
+        # ADR-025 D5 — agent share accrual, daily at 02:30 UTC, after T6 has rolled up the day it
+        # reads the billed take rate from. DARK: the job returns at once unless
+        # AGENT_SHARE_ACCRUAL_ENABLED is set, and with no rows in agent_share_rates it writes nothing.
+        async def _run_agent_share_accrual() -> None:
+            from services.agent_share_accrual import accrue_recent, is_enabled as _share_enabled
+
+            if not _share_enabled():
+                return
+            summary = await accrue_recent()
+            logger.info("audit_scheduler: agent_share_accrual_daily -> %s", summary)
+
+        _add_job(
+            _run_agent_share_accrual,
+            "cron",
+            hour=2,
+            minute=30,
+            id="agent_share_accrual_daily",
+            replace_existing=True,
+            misfire_grace_time=900,
+            coalesce=True,
+            max_instances=1,
+        )
+
         # T7 — invoice generation, monthly on day 2 03:00 UTC (PAUSED).
         # Registered paused so Stage 4 promotion is `scheduler.resume_job(
         # "invoice_generation_monthly")` — no code change, no redeploy.
@@ -1358,6 +1382,7 @@ async def start_scheduler() -> None:
             "+ metering_expire_reservations (5min, ACTIVE) "
             "+ stamp_attribution_reaper (5min, ACTIVE) "
             "+ gmv_aggregation_daily (02:00 UTC, ACTIVE) "
+            "+ agent_share_accrual_daily (02:30 UTC, flag AGENT_SHARE_ACCRUAL_ENABLED) "
             "+ invoice_generation_monthly (day 2 03:00 UTC, PAUSED) "
             "+ partner_settlement_monthly (day 3 04:00 UTC, PAUSED) "
             "+ settlement_file_generate (day 5 02:00 UTC, ACTIVE) "

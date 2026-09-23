@@ -43,6 +43,7 @@ import db.canonical_commerce  # noqa: F401  (register canonical commerce tables 
 import db.commerce_interactions  # noqa: F401  (register canonical interaction ledger tables in metadata)
 import db.merchant_collector_tokens  # noqa: F401  (register collector token registry tables in metadata)
 import db.commerce_attribution  # noqa: F401  (register commerce attribution tables in metadata)
+import db.agent_share  # noqa: F401  (register agent share rate + ledger tables in metadata)
 import db.merchant_commerce_readiness  # noqa: F401  (register merchant commerce readiness state in metadata)
 import db.surface_listing_registry  # noqa: F401  (register surface listing registry tables in metadata)
 try:
