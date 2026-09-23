@@ -17,6 +17,12 @@ WHAT IT DOES NOT TOUCH. `category_label`, `category_confidence`, and `category_l
 left as they are on purpose. The source stamp is the only remaining evidence of WHICH lane wrote
 the bad path (`taxonomy_reconciler_v1`, `codex_review_v1`, `reviewed_ext_seed_mirror` — none of
 which exists in this repository); overwriting it would erase the audit trail for a cosmetic gain.
+`enrichment_agent_v1` is load-bearing beyond provenance: it decides pdp_scope, so re-stamping it
+would demote the row to merchant_owned.
+
+WHAT RECORDS THE RE-FILE. One `writer_audit_log` row per --apply run, via
+services.category_refile_audit: which rule ran, how many rows moved, and each row's from/to. That
+is where a re-file's provenance lives, because the row's own stamp keeps naming the ORIGIN.
 
   --dry-run   (default) report only, no writes
   --apply     perform the update
@@ -37,6 +43,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from db.database import database  # noqa: E402
+from services.category_refile_audit import record_category_refile  # noqa: E402
+from services.catalog_offer_writer_guard import make_batch_id  # noqa: E402
 from services.category_path_aliases import (  # noqa: E402
     ALIASES,
     TAXONOMY_GAPS,
@@ -103,6 +111,7 @@ async def main() -> int:
 
         if apply:
             updated = 0
+            moves: list[dict] = []
             for record in rows:
                 # RETURNING + fetch_val: `databases.execute()` gives NO rowcount for an UPDATE, so
                 # counting its return would count statements, not rows.
@@ -121,7 +130,18 @@ async def main() -> int:
                 )
                 if got:
                     updated += 1
+                    moves.append({"product_key": record["product_key"],
+                                  "from": record["category_path"], "to": record["target"]})
             report["rows_updated"] = updated
+            # Provenance of the re-file itself. Best-effort by construction: the rows above are
+            # already committed, so a failed audit row is reported, never raised.
+            report["audit_batch_id"] = await record_category_refile(
+                writer_name="category_refile_off_taxonomy",
+                batch_id=make_batch_id("off_taxonomy_refile"),
+                rule="services.category_path_aliases: snap an off-taxonomy path onto the leaf it meant",
+                moves=moves,
+                skipped=len(rows) - updated,
+            )
             # Re-measure rather than assert success: the whole point of this work is that a lane
             # reporting its own intentions is not evidence.
             remaining = await _candidates(None)
