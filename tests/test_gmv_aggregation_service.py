@@ -599,3 +599,42 @@ async def test_recompute_days_for_edges_rolls_each_merchant_day_once_and_never_r
         (date(2026, 5, 20), "merch_unknown"),
         (date(2026, 5, 21), "merch_1"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_reroll_stale_days_hands_the_changed_edges_to_the_guarded_recompute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sweep owns no billed-day rule: every stale day goes through recompute_days_for_edges.
+    The real queries are exercised in tests/test_gmv_rollup_stale_day_sweep_postgres.py."""
+    seen: dict[str, Any] = {}
+    edges = [{"edge_id": "e1", "merchant_id": "m", "created_at": datetime(2026, 5, 20, tzinfo=timezone.utc)}]
+
+    class Candidates:
+        async def fetch_all(self, query: str, values: dict[str, Any]):
+            assert "gmv_attribution_daily" in query
+            seen["values"] = values
+            return edges
+
+    async def fake_recompute_days(given):
+        seen["edges"] = given
+        return {
+            ("m", date(2026, 5, 20)): service.RECOMPUTED,
+            ("m", date(2026, 5, 19)): service.INVOICED_PERIOD_MANUAL_CREDIT,
+            ("n", date(2026, 5, 19)): service.RECOMPUTED,
+        }
+
+    monkeypatch.setattr(service, "database", Candidates())
+    monkeypatch.setattr(service, "recompute_days_for_edges", fake_recompute_days)
+    # 08:00 on the 22nd in Tokyo is 23:00 on the 21st in UTC: "today" is the UTC 21st.
+    now = datetime(2026, 5, 22, 8, tzinfo=timezone(timedelta(hours=9)))
+
+    summary = await service.reroll_stale_days(now=now)
+
+    assert summary == {"stale_days": 3, "recomputed": 2, "invoiced_period_manual_credit": 1}
+    assert seen["edges"] is edges
+    assert seen["values"] == {
+        "changed_since": datetime(2026, 5, 18, 23, tzinfo=timezone.utc),
+        "created_before": datetime(2026, 5, 21, tzinfo=timezone.utc),
+        "max_days": service.STALE_SWEEP_MAX_DAYS,
+    }

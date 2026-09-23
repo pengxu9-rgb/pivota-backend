@@ -29,7 +29,11 @@ SELECT
     SUM(e.gross_attributed_gmv_cents) AS gross_sum,
     SUM(COALESCE(e.refund_amount_cents, 0)) AS refund_sum
 FROM commerce_attribution_edges e
-WHERE (e.created_at AT TIME ZONE 'UTC')::date = :date
+-- The UTC day as a created_at range, not `(e.created_at AT TIME ZONE 'UTC')::date = :date`: a
+-- function of the column cannot use idx_commerce_attribution_edges_merchant_created (migration 237),
+-- so each one-merchant recompute scanned all of that merchant's edges. Same rows, any session tz.
+WHERE e.created_at >= CAST(CAST(:date AS DATE) AS TIMESTAMP) AT TIME ZONE 'UTC'
+  AND e.created_at < CAST(CAST(:date AS DATE) + 1 AS TIMESTAMP) AT TIME ZONE 'UTC'
   AND (CAST(:merchant_id AS TEXT) IS NULL OR e.merchant_id = CAST(:merchant_id AS TEXT))
   AND e.gross_attributed_gmv_cents IS NOT NULL
   -- Exclude fallback-INFERRED edges (#1481): token-less recoveries are recorded for
@@ -392,6 +396,93 @@ async def recompute_days_for_edges(edges: Iterable[Mapping[str, Any]]) -> dict[t
         (merchant_id, day): await _recompute_day_unless_invoiced(day, merchant_id, days[(merchant_id, day)])
         for merchant_id, day in sorted(days)
     }
+
+
+# The stale-day sweep. An edge bills on its UTC creation day, and the daily job rolls up only
+# yesterday, so any edge write after that roll-up leaves its day stale: a refund whose own
+# recompute failed (logged, and the Stripe webhook still answered 2xx, so nothing retries it), a
+# gross stamped when payment lands after the checkout day was rolled, a nightly run that never ran.
+# Every such write bumps edges.updated_at, and every roll-up of a (merchant, day) upserts all of its
+# rows with one NOW(), so the day is stale when an edge of it changed after MAX(rollup updated_at),
+# or it has a billable changed edge and no row at all.
+#
+# The hour of slack: an edge write stamps updated_at when its transaction STARTS (or from the app
+# clock, attach_refund's :now) but becomes visible when it commits, so a roll-up that started in
+# between can post-date the change yet not have read it. A day inside the slack is re-rolled once
+# more on the next night, and is then clear of it.
+#
+# The lookback bounds how long a change is retried. A day an invoice covers is never rewritten, so
+# its rows stay older than its edges; with a short lookback it is reported (by
+# recompute_days_for_edges, as a manual credit) on a few nights, not every night forever. Three
+# days survives two missed nightly runs. After a longer outage, call reroll_stale_days with a
+# larger lookback_days by hand.
+STALE_SWEEP_LOOKBACK_DAYS = 3
+STALE_SWEEP_MAX_DAYS = 500
+
+_STALE_DAY_EDGES_QUERY = """
+WITH changed AS (
+    SELECT e.merchant_id,
+           (e.created_at AT TIME ZONE 'UTC')::date AS day,
+           MAX(e.updated_at) AS last_changed_at,
+           BOOL_OR(e.gross_attributed_gmv_cents IS NOT NULL
+                   AND (e.metadata->>'inferred')::boolean IS NOT TRUE) AS any_billable
+    FROM commerce_attribution_edges e
+    WHERE e.updated_at >= :changed_since
+      AND e.created_at < :created_before
+    GROUP BY e.merchant_id, (e.created_at AT TIME ZONE 'UTC')::date
+),
+stale AS (
+    SELECT c.merchant_id, c.day
+    FROM changed c
+    LEFT JOIN LATERAL (
+        SELECT MAX(d.updated_at) AS rolled_at
+        FROM gmv_attribution_daily d
+        WHERE d.merchant_id = c.merchant_id AND d.date = c.day
+    ) r ON TRUE
+    WHERE (r.rolled_at IS NULL AND c.any_billable)
+       OR c.last_changed_at > r.rolled_at - INTERVAL '1 hour'
+    ORDER BY c.day, c.merchant_id
+    LIMIT :max_days
+)
+SELECT e.edge_id, e.merchant_id, e.created_at
+FROM stale s
+JOIN commerce_attribution_edges e
+  ON e.merchant_id = s.merchant_id
+ AND e.created_at >= CAST(s.day AS TIMESTAMP) AT TIME ZONE 'UTC'
+ AND e.created_at < CAST(s.day + 1 AS TIMESTAMP) AT TIME ZONE 'UTC'
+WHERE e.updated_at >= :changed_since
+ORDER BY s.day, s.merchant_id, e.edge_id
+"""
+
+
+async def reroll_stale_days(
+    *,
+    now: Optional[datetime] = None,
+    lookback_days: int = STALE_SWEEP_LOOKBACK_DAYS,
+    max_days: int = STALE_SWEEP_MAX_DAYS,
+) -> dict[str, int]:
+    """Re-roll every (merchant, UTC day) before today whose edges changed after its rollup rows.
+
+    Each stale day goes through recompute_days_for_edges with its changed edges, so the sweep
+    follows the same billed-day rule as every refund writer and never rewrites an invoiced day.
+    Today is left to tomorrow's daily run. Returns {"stale_days": n, <outcome>: count, ...};
+    raises only if the candidate query itself fails.
+    """
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    today_start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+    edges = await database.fetch_all(
+        _STALE_DAY_EDGES_QUERY,
+        {
+            "changed_since": now - timedelta(days=lookback_days),
+            "created_before": today_start,
+            "max_days": max_days,
+        },
+    )
+    outcomes = await recompute_days_for_edges(edges)
+    summary: dict[str, int] = {"stale_days": len(outcomes)}
+    for outcome in outcomes.values():
+        summary[outcome] = summary.get(outcome, 0) + 1
+    return summary
 
 
 async def apply_refund(edge_id: str, refund_amount_cents: int) -> None:
