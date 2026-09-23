@@ -602,6 +602,27 @@ async def _merchant_active_psp_is_test_mode(merchant_id: Optional[str]) -> bool:
     return True
 
 
+# Fulfilment switches the Stripe webhook and the payment reconcile sweep read off ORDER metadata to
+# skip creating the merchant's platform (Shopify) order. Only the server may set them: the ops
+# canary writes them itself through db.orders.create_order. Order metadata on the create endpoint
+# is caller-supplied (the agent gateway forwards it verbatim), so an honoured caller value would
+# let any API caller get a PAID order that is never pushed to the merchant.
+_SERVER_ONLY_ORDER_METADATA_KEYS = ("ops_canary", "skip_platform_order_creation")
+
+
+def _strip_server_only_order_metadata(metadata: Dict[str, Any], *, merchant_id: Optional[str]) -> None:
+    dropped = [key for key in _SERVER_ONLY_ORDER_METADATA_KEYS if key in metadata]
+    for key in dropped:
+        metadata.pop(key, None)
+    if dropped:
+        logger.warning(
+            "[OrderRoutes] dropped server-only order metadata keys %s from a caller-supplied "
+            "order for merchant=%s",
+            dropped,
+            str(merchant_id or "").strip(),
+        )
+
+
 async def _apply_server_granted_test_psp_stamp(
     metadata: Optional[Dict[str, Any]], merchant_id: Optional[str]
 ) -> bool:
@@ -4113,6 +4134,7 @@ async def create_new_order(
         
         # 合并订单元数据并记录促销信息（如果有）
         order_metadata: Dict[str, Any] = dict(order_request.metadata or {})
+        _strip_server_only_order_metadata(order_metadata, merchant_id=order_request.merchant_id)
         if getattr(order_request, "idempotency_key", None):
             order_metadata.setdefault("idempotency_key", str(order_request.idempotency_key))
         if getattr(order_request, "selected_payment_offer_id", None):
