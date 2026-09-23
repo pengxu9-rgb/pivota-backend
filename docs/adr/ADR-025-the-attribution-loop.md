@@ -92,13 +92,21 @@ schedule (stream `attributed_commission`). Accrual is bookkeeping. **Paying it o
 decision**, because of the 2026-09-06 rule that Pivota does not hold or move money. The existing
 payout rail already failed on "insufficient platform balance", which is that constraint showing up.
 
-### D6. The primary lane: a payment partner completes the UCP checkout with an agentic token
+### D6. The primary lane: a payment partner completes the checkout with an agentic token
 
-Most orders are expected to run like the Reap integration. Pivota creates a checkout session
-at a **payment partner** (Reap today; any Visa Intelligent Commerce / Mastercard Agent Pay
-partner later). The partner completes the purchase at the merchant with the buyer's agentic
-token, and Pivota learns the outcome from **the partner's checkout session**. Pivota does not
-integrate with the merchant.
+Most orders are expected to run through a **payment partner** (Reap today; any Visa Intelligent
+Commerce / Mastercard Agent Pay partner later). The partner completes the purchase at the merchant
+with the buyer's agentic token. Reap has **two lanes**, and they differ on links 3 and 4:
+
+- **Variant lane (D6a):** Pivota asks the partner for a quote on a variant and creates a checkout
+  session at the partner. The merchant order carries nothing of ours, and Pivota learns the
+  outcome only from the partner's checkout session. Pivota does not integrate with the merchant.
+- **Cart-link lane (D6b):** Pivota hands the partner the merchant's own checkout URL (a Shopify
+  cart permalink carrying our click id), and the partner fills the card token into the merchant's
+  own checkout session. The sale is an ordinary order on the merchant's store that carries our
+  click id.
+
+#### D6a. Variant lane
 
 - **Link 2** is our own call. The agent is known from the authenticated caller when Pivota
   creates the purchase (`reap_agentic_purchases.agent_id`). No click is needed.
@@ -168,6 +176,64 @@ commission and of the agent's accrual).
 **Measured 2026-09-23:** prod `reap_agentic_purchases` = **0 rows**. A completed checkout has
 been reported to Peng (plan note, 09-23), but it did not pass through Pivota's purchase ledger,
 so no edge exists for it.
+
+#### D6b. Cart-link lane
+
+The flow (Peng, 2026-09-23; code: `services/reap_cart_link.py`, `services/conversion_click_claims.py`):
+
+1. Pivota hands Reap the merchant's checkout URL. It is exactly one shape, validated by
+   `validate_cart_link`:
+   `https://<shop>/cart/<variant>:<qty>?attributes[pivota_click_id]=<click id>&country=<MARKET>`.
+   Reap confirmed (2026-09-18) that it checks the URL out **as received**.
+2. Reap fills the buyer's card token into **the merchant's own checkout session**. The order is
+   an ordinary order on the merchant's store. Our click id is in its cart attributes
+   (`note_attributes`), and Reap is only the payer.
+3. Reap reports completion to Pivota (poll to `COMPLETED` with an `orderId`, as in D6a), and
+   Pivota tells the agent frontend.
+
+What that changes against D6a:
+
+- **Link 3 is carried.** `attributes[pivota_click_id]` rides into the merchant's order. It is
+  the join the merchant-side evidence closes on.
+- **Link 4, confirmation, has two channels for one sale.** Reap closes under
+  `(merchant_domain, Reap orderId)`. A connected merchant's `orders/paid` webhook or read_orders
+  poller closes under `(tenant merchant_id, Shopify order id)`. The click claim (migration 230)
+  lets the first channel write the edge and the other skip, so there is one edge per sale.
+- **Reap's `orderId` is Reap's own id, not the merchant's order number.** It shares the checkout
+  session's ULID prefix (sandbox 2026-09-08: `ord_01M2H6CBJJ1W10BSJR79CR40JD`), and the checkout
+  schema has no merchant order field. The only joins between the two channels are the click id
+  and the domain.
+- **Link 4, after the order: the refund happens on the merchant's store**, so the merchant's
+  platform is where the refund is reported.
+  - An edge the merchant side closed (a connected Shopify store's `orders/paid` won the claim)
+    takes the merchant's `refunds/create` directly, keyed `shopify:<refund id>`
+    (`commerce_attribution_service.apply_external_order_refund`, #2282). The refund is capped at
+    what is left of the gross and re-rolls the edge's billed day.
+  - An edge Reap closed is keyed by Reap's orderId, which a Shopify refund cannot name. Today
+    its refunds reach it only through the operator script
+    (`scripts/record_partner_order_adjustment.py`, `partner_order_adjustments`), until the
+    partner provides item 1 above.
+  - **Deferred: linking the merchant's refund to Reap's edge.** A design was built and reviewed
+    in #2282. When the merchant side loses the claim, it would stamp its order on Reap's claim
+    row, with one refund source per edge. It was taken out before merge, for two reasons. It
+    only acts when a *connected* merchant also gets a Reap cart-link sale, which is about nobody
+    today. And the review found a lockout: a partner refund recorded before a late stamp made
+    both paths refuse the next refund. Revisit it when that overlap exists. The reviewed
+    design is commit `0d1b81043` (migration 237 plus tests) in #2282's force-push history.
+  - **Units, for when it is revisited.** Reap's gross is in true minor units
+    (`final_total_minor`), while the shared refund UPDATE stores major x 100. A platform refund
+    on a Reap edge must refuse a currency whose minor unit is not 1/100, as the partner script
+    does.
+- **Affiliate networks do not see this lane.** A network attributes through its own click redirect
+  (landing cookie and parameters) and the merchant's conversion tag. The permalink goes through
+  no network redirect. Wrapping it in one for Reap's headless checkout would set affiliate cookies
+  from an automated client, which is cookie stuffing under most programs' terms (D2 gives a
+  network-wrapped link only to a human-clicked `/r`). It needs a written yes from the program,
+  not a test.
+- **Still open on this lane:**
+  - Refunds of Reap-closed sales reach the edge only through the operator script (above).
+  - Refunds that arrive after their day is invoiced. Those days are frozen with no credit path;
+    see `gmv_aggregation_service.recompute_days_for_edges`.
 
 ## Proof gate
 

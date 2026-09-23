@@ -36,7 +36,10 @@ from config.settings import settings
 from utils.logger import logger
 from services.dispute_records_service import stripe_dispute_pack_status
 from services.shopify_webhook_ingest import verify_shopify_hmac, ingest_shopify_webhook
-from services.shopify_commerce_event_ingest import ingest_shopify_commerce_event_best_effort
+from services.shopify_commerce_event_ingest import (
+    apply_shopify_refund_to_attribution_edges,
+    ingest_shopify_commerce_event_best_effort,
+)
 from services.commerce_attribution_service import (
     close_external_order_conversion,
     extract_click_id_from_note_attributes,
@@ -3490,6 +3493,20 @@ async def _process_shopify_webhook_event(
                 merchant_id=merchant_id,
                 metadata={"topic": topic, "shopify_order_id": platform_order_id or None},
             )
+
+            # The attribution edge orders/paid closed for this Shopify order bills on its gross
+            # until the refund reaches it. Never raises; a no-op for an unattributed order.
+            if topic == "refunds/create":
+                edge_refund = await apply_shopify_refund_to_attribution_edges(
+                    merchant_id=merchant_id, payload=data
+                )
+                if edge_refund.get("status") != "no_edge":
+                    logger.info(
+                        "Shopify refund attribution merchant=%s shopify_order_id=%s result=%s",
+                        merchant_id,
+                        platform_order_id,
+                        edge_refund,
+                    )
 
             # Best-effort normalize using existing adapter.
             try:
