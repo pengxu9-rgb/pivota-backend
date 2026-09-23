@@ -125,7 +125,11 @@ JOIN gmv_attribution_daily g ON g.id = bri.source_id
 LEFT JOIN invoices inv ON inv.stripe_invoice_id = bri.stripe_invoice_id
 WHERE bri.source_type = 'gmv_rollup'
   AND (bri.created_at >= :since OR bri.voided_at >= :since OR inv.updated_at >= :since
-       OR inv.paid_at >= :since)
+       OR inv.paid_at >= :since
+       -- A run whose partner settlement completed recently, however old its lines: they waited on
+       -- it (partner_settlement_pending) and may have aged out of the other conditions.
+       OR bri.billing_run_id IN (
+         SELECT billing_run_id FROM partner_settlement_completions WHERE completed_at >= :since))
   AND ((g.agent_id IS NOT NULL AND g.agent_id <> '' AND g.agent_id <> :unknown)
        OR bri.id IN (SELECT DISTINCT billing_run_item_id FROM agent_share_ledger))
 ORDER BY bri.id

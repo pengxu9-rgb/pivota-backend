@@ -190,6 +190,8 @@ async def test_an_invoice_paid_long_after_it_was_billed_is_still_picked_up(db):
     line = await _billed_line(db, invoice_status="payment_failed"); await _rate()
     long_ago = datetime.now(timezone.utc) - timedelta(days=200)
     await db.execute("UPDATE billing_run_items SET created_at = :t", {"t": long_ago})
+    # Its run settled long ago too: only the payment is new.
+    await db.execute("UPDATE partner_settlement_completions SET completed_at = :t", {"t": long_ago})
     await db.execute("ALTER TABLE invoices DISABLE TRIGGER USER")
     await db.execute("UPDATE invoices SET updated_at = :t", {"t": long_ago})
     assert (await svc.accrue_recent(120))["lines"] == 0
@@ -482,3 +484,21 @@ async def test_a_line_without_its_invoice_row_accrues_nothing(db):
     await db.execute("DELETE FROM invoices")
     r = await accrue_for_line(line)
     assert (r.basis, r.status) == ("no_invoice", "unchanged")
+
+
+
+async def test_a_line_that_waited_past_the_lookback_is_swept_when_its_run_settles(db):
+    """Re-review of #2275 (P2): a line waiting on settlement longer than the lookback used to drop
+    out of the daily sweep for good once its run finally settled."""
+    from services import agent_share_accrual as svc
+
+    line = await _billed_line(db, amount=1000, settled=False); await _rate(bp=2500)
+    long_ago = datetime.now(timezone.utc) - timedelta(days=200)
+    await db.execute("UPDATE billing_run_items SET created_at = :t", {"t": long_ago})
+    await db.execute("ALTER TABLE invoices DISABLE TRIGGER USER")
+    await db.execute("UPDATE invoices SET updated_at = :t, paid_at = :t", {"t": long_ago})
+    assert (await svc.accrue_recent(120))["lines"] == 0
+    await _complete_settlement(db, line, [])
+    summary = await svc.accrue_recent(120)
+    assert summary["lines"] == 1 and summary.get("written") == 1
+    assert await _total(db, line) == 250
