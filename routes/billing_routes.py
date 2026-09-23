@@ -976,7 +976,7 @@ async def _handle_subscription_updated(event: Dict[str, Any], db: Database) -> N
 
         existing = await db.fetch_one(
             """
-            SELECT id, merchant_id, plan_id
+            SELECT id, merchant_id, plan_id, status
             FROM user_subscriptions
             WHERE stripe_subscription_id = :stripe_subscription_id
             LIMIT 1
@@ -1043,6 +1043,18 @@ async def _handle_subscription_updated(event: Dict[str, Any], db: Database) -> N
                 merchant_id=merchant_id,
                 contact_email=contact_email,
                 ended_stripe_subscription_id=stripe_subscription_id,
+            )
+        elif status_value in {"active", "trialing"} and _as_text(existing["status"]) == "unpaid":
+            # Paying the open invoice reactivates an unpaid subscription. The
+            # unpaid update downgraded the merchant to free and cleared
+            # merchants.subscription_id, which invoice generation joins through
+            # to find the Stripe customer, so re-resolve against every live
+            # subscription, this one included, rather than only on a plan change.
+            await _reconcile_after_subscription_ended(
+                db,
+                merchant_id=merchant_id,
+                contact_email=contact_email,
+                ended_stripe_subscription_id=None,
             )
         elif plan and int(existing["plan_id"]) != int(plan["id"]):
             await _update_merchant_tier(
@@ -1597,6 +1609,7 @@ async def _update_merchant_tier(
     merchant_id: str,
     contact_email: Optional[str],
     tier_name: str,
+    subscription_id: Optional[int] = None,
 ) -> None:
     where_clause, params = await _merchant_where_clause(
         db,
@@ -1610,10 +1623,11 @@ async def _update_merchant_tier(
     await db.execute(
         f"""
         UPDATE merchants
-        SET current_tier = :current_tier
+        SET current_tier = :current_tier,
+            subscription_id = COALESCE(CAST(:subscription_id AS BIGINT), subscription_id)
         WHERE {where_clause}
         """,
-        {**params, "current_tier": tier_name},
+        {**params, "current_tier": tier_name, "subscription_id": subscription_id},
     )
 
 
@@ -1673,10 +1687,14 @@ async def _reconcile_after_subscription_ended(
     still active. Prefer the richest remaining active subscription; only fall
     back to the free downgrade when none remain. Mirrors the
     richest-plan-wins ordering used by the tier resolvers.
+
+    With ended_stripe_subscription_id=None no Stripe subscription is set aside,
+    which is how a subscription recovering from unpaid puts the merchant back on
+    its plan.
     """
     remaining = await db.fetch_one(
         """
-        SELECT sp.name AS tier_name
+        SELECT sp.name AS tier_name, us.id AS subscription_id
           FROM user_subscriptions us
           JOIN subscription_plans sp ON sp.id = us.plan_id
          WHERE us.merchant_id = :merchant_id
@@ -1703,6 +1721,7 @@ async def _reconcile_after_subscription_ended(
         merchant_id=merchant_id,
         contact_email=contact_email,
         tier_name=_as_text(remaining["tier_name"]),
+        subscription_id=int(remaining["subscription_id"]),
     )
     if merchant_id:
         try:

@@ -39,8 +39,9 @@ async def test_reconcile_keeps_merchant_on_remaining_active_plan(monkeypatch):
     # merchant on that plan — never drop to free.
     calls: Dict[str, Any] = {}
 
-    async def fake_update_tier(db, *, merchant_id, contact_email, tier_name):
+    async def fake_update_tier(db, *, merchant_id, contact_email, tier_name, subscription_id=None):
         calls["tier"] = tier_name
+        calls["subscription_id"] = subscription_id
 
     async def fake_downgrade(db, *, merchant_id, contact_email):
         calls["downgraded"] = True
@@ -54,12 +55,13 @@ async def test_reconcile_keeps_merchant_on_remaining_active_plan(monkeypatch):
 
     monkeypatch.setattr(mcb, "apply_subscription_allowance", fake_apply)
 
-    db = FakeDB(remaining={"tier_name": "growth"})
+    db = FakeDB(remaining={"tier_name": "growth", "subscription_id": 42})
     await billing_routes._reconcile_after_subscription_ended(
         db, merchant_id="merch-A", contact_email=None,
         ended_stripe_subscription_id="sub_old",
     )
     assert calls.get("tier") == "growth"
+    assert calls.get("subscription_id") == 42
     assert calls.get("applied") == "merch-A"
     assert "downgraded" not in calls
 
@@ -68,7 +70,7 @@ async def test_reconcile_keeps_merchant_on_remaining_active_plan(monkeypatch):
 async def test_reconcile_downgrades_to_free_when_no_active_remains(monkeypatch):
     calls: Dict[str, Any] = {}
 
-    async def fake_update_tier(db, *, merchant_id, contact_email, tier_name):
+    async def fake_update_tier(db, *, merchant_id, contact_email, tier_name, subscription_id=None):
         calls["tier"] = tier_name
 
     async def fake_downgrade(db, *, merchant_id, contact_email):

@@ -41,6 +41,7 @@ _MIGRATIONS = ("100_stripe_events.sql", "101_subscription_plans.sql", "102_user_
                "141_track_direct_merchant_purchased_credits.sql", "142_direct_merchant_overage_state.sql")
 
 WEBHOOK_SECRET = "whsec_subscription_event_order_test"
+CUSTOMER = "cus_sub_event_order"
 MERCHANT = "merch_sub_event_order"
 EMAIL = "owner@sub-event-order.test"
 SUB = "sub_event_order_1"
@@ -135,7 +136,7 @@ def _subscription_event(event_id, event_type, *, status, plan="starter", sid=SUB
         "data": {"object": {
             "id": sid,
             "object": "subscription",
-            "customer": "cus_sub_event_order",
+            "customer": CUSTOMER,
             "status": status,
             "cancel_at_period_end": False,
             "canceled_at": int(canceled_at.timestamp()) if canceled_at else None,
@@ -189,9 +190,9 @@ async def _subscribed_merchant(db, subs=((SUB, "starter"),)):
     richest = max((plan for _, plan in subs), key=ALLOWANCE.__getitem__)
     local_id = await db.fetch_val("SELECT id FROM user_subscriptions ORDER BY id LIMIT 1")
     await db.execute(
-        "INSERT INTO merchants (business_name, legal_name, platform, contact_email, current_tier, subscription_id) "
-        "VALUES ('Event Order Co', 'Event Order Co LLC', 'custom', :e, :t, :s)",
-        {"e": EMAIL, "t": richest, "s": local_id})
+        "INSERT INTO merchants (business_name, legal_name, platform, contact_email, current_tier, subscription_id, "
+        "stripe_customer_id) VALUES ('Event Order Co', 'Event Order Co LLC', 'custom', :e, :t, :s, :c)",
+        {"e": EMAIL, "t": richest, "s": local_id, "c": CUSTOMER})
     await db.execute("INSERT INTO merchant_credit_balance (merchant_id, credits, purchased_credits) "
                      "VALUES (:m, :c, :c)", {"m": MERCHANT, "c": PURCHASED})
     wallet = await apply_subscription_allowance(MERCHANT)
@@ -208,6 +209,19 @@ async def _subscription(db, sid=SUB):
 async def _merchant(db):
     return dict(await db.fetch_one("SELECT current_tier, subscription_id FROM merchants WHERE contact_email = :e",
                                    {"e": EMAIL}))
+
+
+async def _local_id(db, sid=SUB):
+    return await db.fetch_val("SELECT id FROM user_subscriptions WHERE stripe_subscription_id = :s", {"s": sid})
+
+
+async def _invoiced_customer(db):
+    """The Stripe customer monthly GMV invoicing would bill. It joins merchants.subscription_id to
+    user_subscriptions, and skips the merchant when that finds nothing."""
+    from services.invoice_generation_service import _MERCHANT_STRIPE_CUSTOMER_QUERY
+
+    row = await db.fetch_one(_MERCHANT_STRIPE_CUSTOMER_QUERY, {"merchant_id": MERCHANT})
+    return row["stripe_customer_id"] if row else None
 
 
 async def _wallet_on_next_read():
@@ -278,7 +292,7 @@ async def test_in_order_updates_still_move_a_live_subscription(db, client):
                                                status="active", plan="growth"))
     assert (await _subscription(db))["status"] == "active"
     assert (await _subscription(db))["plan"] == "growth"
-    assert (await _merchant(db))["current_tier"] == "growth"
+    assert await _merchant(db) == {"current_tier": "growth", "subscription_id": await _local_id(db)}
     assert await _wallet_on_next_read() == (PURCHASED + ALLOWANCE["growth"], "growth")
 
 
@@ -287,12 +301,55 @@ async def test_an_unpaid_subscription_that_pays_goes_back_to_active(db, client):
     await _subscribed_merchant(db)
     await _deliver(client, _subscription_event("evt_unpaid", "customer.subscription.updated", status="unpaid"))
     assert (await _subscription(db))["status"] == "unpaid"
+    assert await _merchant(db) == {"current_tier": "free", "subscription_id": None}
+    assert await _invoiced_customer(db) is None
     assert await _wallet_on_next_read() == (PURCHASED, "free")
 
     await _deliver(client, _subscription_event("evt_paid_up", "customer.subscription.updated", status="active"))
 
     assert (await _subscription(db))["status"] == "active"
+    assert await _merchant(db) == {"current_tier": "starter", "subscription_id": await _local_id(db)}
+    assert await _invoiced_customer(db) == CUSTOMER
     assert await _wallet_on_next_read() == (PURCHASED + ALLOWANCE["starter"], "starter")
+
+
+async def test_an_unpaid_subscription_that_pays_on_a_new_plan_lands_on_that_plan(db, client):
+    await _subscribed_merchant(db)
+    await _deliver(client, _subscription_event("evt_unpaid", "customer.subscription.updated", status="unpaid"))
+
+    await _deliver(client, _subscription_event("evt_paid_up", "customer.subscription.updated", status="trialing",
+                                               plan="growth"))
+
+    assert await _merchant(db) == {"current_tier": "growth", "subscription_id": await _local_id(db)}
+    assert await _invoiced_customer(db) == CUSTOMER
+    assert await _wallet_on_next_read() == (PURCHASED + ALLOWANCE["growth"], "growth")
+
+
+async def test_a_recovered_plan_outranks_the_one_that_carried_the_merchant_meanwhile(db, client):
+    """Growth goes unpaid while starter stays live: the merchant rides on starter, then goes back to
+    growth when it is paid. Each time merchants.subscription_id follows the plan it is on."""
+    await _subscribed_merchant(db, subs=((SUB, "growth"), (SUB_OTHER, "starter")))
+    await _deliver(client, _subscription_event("evt_unpaid", "customer.subscription.updated", status="unpaid",
+                                               plan="growth", sid=SUB))
+    assert await _merchant(db) == {"current_tier": "starter", "subscription_id": await _local_id(db, SUB_OTHER)}
+
+    await _deliver(client, _subscription_event("evt_paid_up", "customer.subscription.updated", status="active",
+                                               plan="growth", sid=SUB))
+
+    assert await _merchant(db) == {"current_tier": "growth", "subscription_id": await _local_id(db, SUB)}
+    assert await _wallet_on_next_read() == (PURCHASED + ALLOWANCE["growth"], "growth")
+
+
+async def test_past_due_recovering_is_not_a_tier_change(db, client):
+    """Only unpaid downgraded the merchant, so only unpaid re-resolves on recovery: past_due -> active on
+    the same plan leaves merchants alone (a manual tier on the row survives it)."""
+    await _subscribed_merchant(db)
+    await _deliver(client, _subscription_event("evt_past_due", "customer.subscription.updated", status="past_due"))
+    await db.execute("UPDATE merchants SET current_tier = 'scale' WHERE contact_email = :e", {"e": EMAIL})
+
+    await _deliver(client, _subscription_event("evt_recovered", "customer.subscription.updated", status="active"))
+
+    assert await _merchant(db) == {"current_tier": "scale", "subscription_id": await _local_id(db)}
 
 
 async def test_a_subscription_updated_to_canceled_still_ends_a_live_subscription(db, client):
