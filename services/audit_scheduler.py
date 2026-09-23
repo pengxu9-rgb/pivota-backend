@@ -918,9 +918,10 @@ async def start_scheduler() -> None:
             max_instances=1,
         )
 
-        # ADR-025 D5 — agent share accrual, daily at 02:30 UTC, after T6 has rolled up the day it
-        # reads the billed take rate from. DARK: the job returns at once unless
-        # AGENT_SHARE_ACCRUAL_ENABLED is set, and with no rows in agent_share_rates it writes nothing.
+        # ADR-025 D5 — agent share accrual, daily at 02:30 UTC. It credits agents a share of what
+        # was INVOICED (billing_run_items), and reverses lines a dispute or a void cancelled since.
+        # DARK: returns at once unless AGENT_SHARE_ACCRUAL_ENABLED is set; with no rows in
+        # agent_share_rates, or no invoices (T7 is paused), it writes nothing.
         async def _run_agent_share_accrual() -> None:
             from services.agent_share_accrual import accrue_recent, is_enabled as _share_enabled
 

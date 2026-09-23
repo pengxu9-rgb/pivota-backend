@@ -1,24 +1,34 @@
-"""Accrue each agent's share of Pivota's commission on the orders it originated (ADR-025 D5).
+"""Accrue each agent's share of what Pivota invoiced for the orders it originated (ADR-025 D5).
 
-The rule, decided 2026-09-23:
-    share = floor( floor(net_gmv x take_rate_bp / 10000) x share_bp / 10000 )
-- net_gmv is the edge's gross minus its refunds, so a refund reduces the share.
-- take_rate_bp is the rate BILLING charged on the edge's day: the `gmv_attribution_daily` row the
-  invoice run reads for (day, merchant, agent, channel partner).
-- The commission is zero when the merchant cannot be invoiced (no Stripe customer through the
-  monetization bridge). Pivota earns nothing there, so neither does the agent. Pivota never owes
-  an agent more than it billed.
-- share_bp is the agent's rate in `agent_share_rates` at the moment the order converted. No rate
-  means 0. The table starts empty, so nothing accrues until someone sets a rate.
-Both floors round toward Pivota; the ledger stores every input, so any row can be re-derived.
+The rule, decided 2026-09-23: an agent gets a percentage of PIVOTA'S COMMISSION, never of order
+value, and nothing when Pivota earns nothing. "Commission" is what billing actually INVOICED, read
+from billing, never re-derived from rates (review of #2273):
 
-The ledger is APPEND-ONLY. `accrue_for_edge` computes the edge's target now, compares it with
-what the ledger already holds for the edge, and writes the signed difference. Re-running changes
-nothing, and a refund appears as its own negative adjustment. It runs under the edge's row lock,
-so two runs cannot both write the same difference.
+    for each invoiced line (billing_run_items, source_type 'gmv_rollup')
+        share = floor(line.amount_cents x share_bp / 10000)
 
-This is bookkeeping only. Nothing here moves money. Paying agents is an open decision (the
-2026-09-06 no-money rule).
+- A line bills one `gmv_attribution_daily` row, i.e. one (day, merchant, agent, channel partner)
+  group. The group's refunds, clamping and take rate are billing's, so the share can never exceed
+  what the merchant was billed, and every order the rollup bills (Pivota-checkout edges as well
+  as referral ones) is covered.
+- The line is credited to the rollup row's agent, if it is a real one (not the 'unknown' sentinel).
+- The line accrues only while it stands. A dispute voids it (`voided_at`), a void or uncollectible
+  invoice cancels it, and in both cases the share reverses to 0. A dispute's replacement line
+  (`dispute_adj`) carries no rollup link, so it is not credited to an agent. That errs in Pivota's
+  favour and needs a follow-up.
+- A line whose rollup row also names a CHANNEL PARTNER accrues 0 with basis
+  `channel_partner_row`. Partner settlement already pays a share of the same take, and how the two
+  combine is a decision not yet made (review of #2273).
+- share_bp is the agent's rate in force at 00:00 UTC of the billed day. Rates are forward-only
+  (set_agent_share_rate), so a billed day is never re-priced. No rate means 0, and the table starts
+  empty.
+
+Nothing accrues until invoices exist; the monthly invoice job is registered PAUSED today.
+
+The ledger is APPEND-ONLY. `accrue_for_line` computes the line's target now, compares it with
+what the ledger holds for the line, and writes the signed difference, all under the line's row
+lock. Re-running changes nothing. This is bookkeeping only; nothing here moves money. Paying agents
+is an open decision (the 2026-09-06 no-money rule).
 """
 
 from __future__ import annotations
@@ -26,7 +36,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from db.database import database
@@ -34,35 +44,33 @@ from db.database import database
 logger = logging.getLogger(__name__)
 
 FLAG = "AGENT_SHARE_ACCRUAL_ENABLED"
-DEFAULT_LOOKBACK_DAYS = 60
+DEFAULT_LOOKBACK_DAYS = 120
 #: services.traffic_taxonomy_service.UNKNOWN_TOKEN: written when traffic has no agent.
 UNKNOWN_AGENT = "unknown"
+#: Invoice items are created in USD (invoice_generation_service hardcodes "currency": "usd").
+INVOICE_CURRENCY = "USD"
+#: An invoice in these states bills nothing.
+_DEAD_INVOICE_STATES = ("void", "uncollectible")
+#: A rate may start at most this far in the past (clock skew between operator and database).
+RATE_START_SKEW = timedelta(minutes=5)
 
-_EDGE_FOR_UPDATE_SQL = """
-SELECT edge_id, merchant_id, agent_id, channel_partner_id, currency, state, created_at,
-       converted_at, gross_attributed_gmv_cents, COALESCE(refund_amount_cents, 0) AS refund_amount_cents,
-       (metadata ->> 'inferred') AS inferred
-FROM commerce_attribution_edges
-WHERE edge_id = :edge_id
-FOR UPDATE
+_LINE_FOR_UPDATE_SQL = """
+SELECT bri.id AS line_id, bri.merchant_id, bri.source_type, bri.source_id AS rollup_id,
+       bri.amount_cents, bri.voided_at, bri.stripe_invoice_id,
+       g.date AS billed_day, g.agent_id, g.channel_partner_id,
+       inv.status AS invoice_status
+FROM billing_run_items bri
+LEFT JOIN gmv_attribution_daily g ON g.id = bri.source_id AND bri.source_type = 'gmv_rollup'
+LEFT JOIN invoices inv ON inv.stripe_invoice_id = bri.stripe_invoice_id
+WHERE bri.id = :line_id
+FOR UPDATE OF bri
 """
 
 _LEDGER_SUMS_SQL = """
 SELECT agent_id, currency, COALESCE(SUM(amount_minor), 0) AS total, COUNT(*) AS n
 FROM agent_share_ledger
-WHERE edge_id = :edge_id
+WHERE billing_run_item_id = :line_id
 GROUP BY agent_id, currency
-"""
-
-# The row the invoice run bills for this edge: same grouping as gmv_aggregation_service._ROLLUP_QUERY.
-_BILLED_RATE_SQL = """
-SELECT take_rate_bp
-FROM gmv_attribution_daily
-WHERE date = (CAST(:created_at AS timestamptz) AT TIME ZONE 'UTC')::date
-  AND merchant_id = :merchant_id
-  AND COALESCE(agent_id, '') = COALESCE(CAST(:agent_id AS TEXT), '')
-  AND COALESCE(channel_partner_id, -1) = COALESCE(CAST(:channel_partner_id AS BIGINT), -1)
-LIMIT 1
 """
 
 _RATE_AT_SQL = """
@@ -77,19 +85,26 @@ LIMIT 1
 
 _INSERT_ENTRY_SQL = """
 INSERT INTO agent_share_ledger (
-  edge_id, agent_id, merchant_id, currency, entry_kind, amount_minor, net_gmv_minor,
-  take_rate_bp, commission_minor, share_bp, rate_id, target_minor, commission_source, created_at
+  billing_run_item_id, rollup_id, agent_id, merchant_id, currency, entry_kind, amount_minor,
+  billed_minor, share_bp, rate_id, target_minor, basis, created_at
 ) VALUES (
-  :edge_id, :agent_id, :merchant_id, :currency, :entry_kind, :amount_minor, :net_gmv_minor,
-  :take_rate_bp, :commission_minor, :share_bp, :rate_id, :target_minor, :commission_source, :now
+  :line_id, :rollup_id, :agent_id, :merchant_id, :currency, :entry_kind, :amount_minor,
+  :billed_minor, :share_bp, :rate_id, :target_minor, :basis, :now
 )
 """
 
-_RECENT_EDGES_SQL = """
-SELECT edge_id FROM commerce_attribution_edges
-WHERE (updated_at >= :since OR created_at >= :since)
-  AND (agent_id IS NOT NULL OR edge_id IN (SELECT DISTINCT edge_id FROM agent_share_ledger))
-ORDER BY edge_id
+# Lines whose state may have moved in the window: newly billed, voided, or on an invoice that
+# changed. Filtered to lines a real agent is on, or that the ledger already credited (to reverse).
+_RECENT_LINES_SQL = """
+SELECT bri.id AS line_id
+FROM billing_run_items bri
+JOIN gmv_attribution_daily g ON g.id = bri.source_id
+LEFT JOIN invoices inv ON inv.stripe_invoice_id = bri.stripe_invoice_id
+WHERE bri.source_type = 'gmv_rollup'
+  AND (bri.created_at >= :since OR bri.voided_at >= :since OR inv.updated_at >= :since)
+  AND ((g.agent_id IS NOT NULL AND g.agent_id <> '' AND g.agent_id <> :unknown)
+       OR bri.id IN (SELECT DISTINCT billing_run_item_id FROM agent_share_ledger))
+ORDER BY bri.id
 """
 
 
@@ -98,14 +113,14 @@ def is_enabled() -> bool:
 
 
 @dataclass
-class EdgeAccrual:
-    #: written | would_write | unchanged | rollup_pending | no_edge
+class LineAccrual:
+    #: written | would_write | unchanged | no_line
     status: str
-    edge_id: str
+    line_id: int
     agent_id: Optional[str] = None
     target_minor: int = 0
     written_minor: int = 0
-    commission_source: Optional[str] = None
+    basis: Optional[str] = None
     detail: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -118,116 +133,100 @@ def _real_agent(value: Any) -> Optional[str]:
     return agent if agent and agent != UNKNOWN_AGENT else None
 
 
-def compute_share(net_gmv_minor: int, take_rate_bp: int, share_bp: int) -> Dict[str, int]:
-    """The rule, pure: floor at each step, never negative."""
-    net = max(int(net_gmv_minor), 0)
-    commission = net * int(take_rate_bp) // 10000
-    target = commission * int(share_bp) // 10000
-    return {"net_gmv_minor": net, "commission_minor": commission, "target_minor": target}
+def compute_share(billed_minor: int, share_bp: int) -> int:
+    """The rule, pure: floor, never negative."""
+    return max(int(billed_minor), 0) * int(share_bp) // 10000
 
 
-async def _merchant_is_billable(merchant_id: str) -> bool:
-    # One owner: the same bridge the invoice run uses to find the merchant's Stripe customer.
-    from services.invoice_generation_service import _MERCHANT_STRIPE_CUSTOMER_QUERY
-
-    row = await database.fetch_one(_MERCHANT_STRIPE_CUSTOMER_QUERY, {"merchant_id": merchant_id})
-    return bool(row and dict(row).get("stripe_customer_id"))
+def _day_start(day: Any) -> datetime:
+    return datetime.combine(day, time.min, tzinfo=timezone.utc)
 
 
-async def accrue_for_edge(edge_id: str, *, apply: bool = True) -> EdgeAccrual:
-    """Bring one edge's ledger to its current target. Idempotent. `apply=False` computes the
+async def accrue_for_line(line_id: int, *, apply: bool = True) -> LineAccrual:
+    """Bring one invoiced line's ledger to its current target. Idempotent. `apply=False` computes the
     same entries under the same lock and writes none of them."""
     async with database.transaction():
-        row = await database.fetch_one(_EDGE_FOR_UPDATE_SQL, {"edge_id": edge_id})
+        row = await database.fetch_one(_LINE_FOR_UPDATE_SQL, {"line_id": line_id})
         if row is None:
-            return EdgeAccrual(status="no_edge", edge_id=edge_id)
-        edge = dict(row)
-        agent = _real_agent(edge["agent_id"])
-        currency = str(edge["currency"] or "").upper()
-        gross = edge["gross_attributed_gmv_cents"]
-        eligible = (
-            agent is not None
-            and edge["state"] == "converted"
-            and isinstance(gross, int) and gross > 0
-            and str(edge["inferred"] or "").lower() != "true"  # the rollup never bills inferred edges
-            and bool(currency)
-        )
+            return LineAccrual(status="no_line", line_id=line_id)
+        line = dict(row)
+        agent = _real_agent(line["agent_id"])
+        billed = int(line["amount_cents"] or 0)
 
-        take_bp = share_bp = 0
-        rate_id = None
-        source = "ineligible"
-        net = 0
-        if eligible:
-            billed = await database.fetch_one(_BILLED_RATE_SQL, {
-                "created_at": edge["created_at"], "merchant_id": edge["merchant_id"],
-                "agent_id": edge["agent_id"], "channel_partner_id": edge["channel_partner_id"],
-            })
-            if billed is None:
-                # The day has not been rolled up yet, so there is no billed rate to share. Come back.
-                return EdgeAccrual(status="rollup_pending", edge_id=edge_id, agent_id=agent)
-            if await _merchant_is_billable(str(edge["merchant_id"])):
-                take_bp = int(dict(billed)["take_rate_bp"] or 0)
-                source = "billed_take"
-            else:
-                source = "merchant_not_billable"
+        if line["source_type"] != "gmv_rollup" or line["billed_day"] is None:
+            basis = "not_a_rollup_line"
+        elif agent is None:
+            basis = "no_agent"
+        elif line["voided_at"] is not None:
+            basis = "line_voided"
+        elif line["invoice_status"] is None:
+            basis = "no_invoice"
+        elif str(line["invoice_status"]) in _DEAD_INVOICE_STATES:
+            basis = f"invoice_{line['invoice_status']}"
+        elif line["channel_partner_id"] is not None:
+            basis = "channel_partner_row"
+        else:
+            basis = "billed_line"
+
+        share_bp, rate_id = 0, None
+        if basis == "billed_line":
             rate = await database.fetch_one(
-                _RATE_AT_SQL, {"agent_id": agent, "at": edge["converted_at"] or edge["created_at"]}
+                _RATE_AT_SQL, {"agent_id": agent, "at": _day_start(line["billed_day"])}
             )
             if rate is not None:
                 rate_id, share_bp = int(dict(rate)["id"]), int(dict(rate)["share_bp"])
-            net = int(gross) - int(edge["refund_amount_cents"] or 0)
+            else:
+                basis = "no_rate"
+        target = compute_share(billed, share_bp) if basis == "billed_line" else 0
 
-        numbers = compute_share(net, take_bp, share_bp)
-        target = numbers["target_minor"] if eligible else 0
-
-        # What the ledger holds per (agent, currency). Anything not for the edge's current agent and
-        # currency is reversed to zero: an edge credits one agent, in one currency.
         held = {(r["agent_id"], r["currency"]): (int(r["total"]), int(r["n"]))
-                for r in (dict(x) for x in await database.fetch_all(_LEDGER_SUMS_SQL, {"edge_id": edge_id}))}
+                for r in (dict(x) for x in await database.fetch_all(_LEDGER_SUMS_SQL, {"line_id": line_id}))}
         entries_before = sum(n for _, n in held.values())
         writes: List[Dict[str, Any]] = []
+        # A line credits one agent in the invoice currency; anything else it holds goes back to 0.
         for (held_agent, held_cur), (total, _) in held.items():
-            if (held_agent, held_cur) != (agent, currency) and total != 0:
+            if (held_agent, held_cur) != (agent, INVOICE_CURRENCY) and total != 0:
                 writes.append({"agent_id": held_agent, "currency": held_cur, "amount": -total, "target": 0})
         if agent is not None:
-            current = held.get((agent, currency), (0, 0))[0]
+            current = held.get((agent, INVOICE_CURRENCY), (0, 0))[0]
             if target != current:
-                writes.append({"agent_id": agent, "currency": currency, "amount": target - current,
-                               "target": target})
+                writes.append({"agent_id": agent, "currency": INVOICE_CURRENCY,
+                               "amount": target - current, "target": target})
 
         now = _now()
         for i, w in enumerate(writes if apply else []):
             await database.execute(_INSERT_ENTRY_SQL, {
-                "edge_id": edge_id, "agent_id": w["agent_id"], "merchant_id": edge["merchant_id"],
-                "currency": w["currency"],
+                "line_id": line_id, "rollup_id": int(line["rollup_id"]), "agent_id": w["agent_id"],
+                "merchant_id": line["merchant_id"], "currency": w["currency"],
                 "entry_kind": "accrual" if entries_before == 0 and i == 0 else "adjustment",
-                "amount_minor": w["amount"], "net_gmv_minor": numbers["net_gmv_minor"],
-                "take_rate_bp": take_bp, "commission_minor": numbers["commission_minor"],
-                "share_bp": share_bp, "rate_id": rate_id, "target_minor": w["target"],
-                "commission_source": source, "now": now,
+                "amount_minor": w["amount"], "billed_minor": billed, "share_bp": share_bp,
+                "rate_id": rate_id, "target_minor": w["target"], "basis": basis, "now": now,
             })
 
-    return EdgeAccrual(
+    return LineAccrual(
         status=("written" if apply else "would_write") if writes else "unchanged",
-        edge_id=edge_id, agent_id=agent,
-        target_minor=target, written_minor=sum(w["amount"] for w in writes), commission_source=source,
-        detail={"take_rate_bp": take_bp, "share_bp": share_bp, "net_gmv_minor": numbers["net_gmv_minor"]},
+        line_id=line_id, agent_id=agent, target_minor=target,
+        written_minor=sum(w["amount"] for w in writes), basis=basis,
+        detail={"billed_minor": billed, "share_bp": share_bp, "invoice_status": line["invoice_status"]},
     )
 
 
 async def accrue_recent(lookback_days: int = DEFAULT_LOOKBACK_DAYS) -> Dict[str, int]:
-    """Accrue every edge touched in the lookback window, including edges the ledger already
-    credited, so an agent change or a refund reverses them. One edge failing never stops the rest."""
+    """Accrue every invoiced line whose state may have moved in the window. One line failing never
+    stops the rest; the next run retries it."""
     since = _now() - timedelta(days=lookback_days)
-    ids = [dict(r)["edge_id"] for r in await database.fetch_all(_RECENT_EDGES_SQL, {"since": since})]
-    summary: Dict[str, int] = {"edges": len(ids), "failed": 0}
-    for edge_id in ids:
+    ids = [int(dict(r)["line_id"]) for r in await database.fetch_all(
+        _RECENT_LINES_SQL, {"since": since, "unknown": UNKNOWN_AGENT})]
+    summary: Dict[str, int] = {"lines": len(ids), "failed": 0}
+    for line_id in ids:
         try:
-            result = await accrue_for_edge(edge_id)
+            result = await accrue_for_line(line_id)
             summary[result.status] = summary.get(result.status, 0) + 1
         except Exception as exc:  # noqa: BLE001 -- the next run retries; report, do not stop
             summary["failed"] += 1
-            logger.warning("agent_share: accrual failed edge=%s error_type=%s", edge_id, type(exc).__name__)
+            logger.warning("agent_share: accrual failed line=%s error_type=%s", line_id, type(exc).__name__)
+    if summary["failed"]:
+        logger.error("agent_share: %d of %d lines failed to accrue", summary["failed"], len(ids))
     return summary
 
 
@@ -254,12 +253,15 @@ RETURNING id
 
 async def set_agent_share_rate(
     *, agent_id: str, share_bp: int, effective_from: datetime, created_by: str, note: Optional[str] = None,
+    now: Optional[datetime] = None,
 ) -> int:
     """Start a new rate for an agent from `effective_from`, closing the open one at that instant.
 
-    Forward-only: a rate cannot start at or before the start of the agent's latest window. Changing
-    history would silently re-price orders already accrued, and the next run would rewrite their
-    shares. To correct a past rate, add a new window and re-accrue deliberately.
+    STRICTLY FORWARD: a rate cannot start in the past (beyond RATE_START_SKEW) or at or before the
+    start of the agent's latest window. So a day that was billed, and possibly already accrued, is
+    never re-priced (review of #2273: a start between the latest window and now used to be allowed,
+    and the next run re-priced accrued orders). To correct a past rate, reverse and re-accrue
+    deliberately; this function will not do it silently.
     """
     agent = _real_agent(agent_id)
     if agent is None or len(agent) > 64:
@@ -271,16 +273,19 @@ async def set_agent_share_rate(
     who = str(created_by or "").strip()
     if not who:
         raise RateRefused("created_by_required")
+    current = now or _now()
+    if effective_from < current - RATE_START_SKEW:
+        raise RateRefused("not_forward", f"a rate cannot start in the past ({effective_from.isoformat()})")
     async with database.transaction():
         await database.execute(_LOCK_AGENT_SQL, {"key": f"agent_share_rates:{agent}"})
         rates = [dict(r) for r in await database.fetch_all(_RATES_FOR_AGENT_SQL, {"agent_id": agent})]
         if rates and effective_from <= rates[-1]["effective_from"]:
             raise RateRefused("not_forward", f"latest window starts {rates[-1]['effective_from'].isoformat()}")
-        open_rates = [r for r in rates if r["effective_to"] is None or r["effective_to"] > effective_from]
-        for r in open_rates:
-            await database.execute(_CLOSE_RATE_SQL, {"to": effective_from, "id": r["id"]})
+        for r in rates:
+            if r["effective_to"] is None or r["effective_to"] > effective_from:
+                await database.execute(_CLOSE_RATE_SQL, {"to": effective_from, "id": r["id"]})
         row = await database.fetch_one(_INSERT_RATE_SQL, {
             "agent_id": agent, "share_bp": share_bp, "effective_from": effective_from,
-            "created_by": who, "note": note, "now": _now(),
+            "created_by": who, "note": note, "now": current,
         })
         return int(dict(row)["id"])

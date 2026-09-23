@@ -10,20 +10,18 @@ from services import agent_share_accrual as svc
 
 
 @pytest.mark.parametrize(
-    "net, take, share, commission, target",
+    "billed, share, target",
     [
-        (4500, 1000, 2500, 450, 112),   # 112.5 floors to 112: rounding favours Pivota
-        (3000, 1000, 2500, 300, 75),
-        (4500, 0, 2500, 0, 0),          # Pivota earned nothing, so neither does the agent
-        (4500, 1000, 0, 450, 0),        # no rate
-        (-100, 1000, 2500, 0, 0),       # a net below zero never becomes a negative share
-        (1, 1000, 10000, 0, 0),
-        (100000, 500, 10000, 5000, 5000),
+        (450, 2500, 112),     # 112.5 floors to 112: rounding favours Pivota
+        (300, 2500, 75),
+        (0, 2500, 0),         # nothing billed, nothing shared
+        (450, 0, 0),          # no rate
+        (-100, 2500, 0),      # never negative
+        (100000, 10000, 100000),
     ],
 )
-def test_the_share_rule(net, take, share, commission, target):
-    got = svc.compute_share(net, take, share)
-    assert (got["commission_minor"], got["target_minor"]) == (commission, target)
+def test_the_share_is_a_fraction_of_what_was_billed(billed, share, target):
+    assert svc.compute_share(billed, share) == target
 
 
 def test_the_unknown_sentinel_is_not_an_agent():
@@ -67,7 +65,7 @@ def test_the_ops_script_writes_nothing_without_apply():
     p = script.build_parser()
     assert p.parse_args(["set-rate", "--agent-id", "a", "--share-bp", "1", "--effective-from",
                          "2026-10-01T00:00:00Z", "--created-by", "x"]).apply is False
-    assert p.parse_args(["accrue", "--edge-id", "e"]).apply is False
+    assert p.parse_args(["accrue", "--line-id", "7"]).apply is False
     with pytest.raises(SystemExit):
         p.parse_args(["set-rate", "--agent-id", "a", "--share-bp", "1", "--effective-from",
                       "2026-10-01T00:00:00", "--created-by", "x"])

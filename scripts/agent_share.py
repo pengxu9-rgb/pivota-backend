@@ -5,15 +5,15 @@
     scripts/agent_share.py set-rate --agent-id agent_x --share-bp 2500 \\
         --effective-from 2026-10-01T00:00:00Z --created-by peng --note "pilot" --apply
 
-    # bring one edge's ledger to its target, or every edge touched in the last N days
-    scripts/agent_share.py accrue --edge-id cae_ext_...            # dry run: prints the entry it would write
-    scripts/agent_share.py accrue --recent-days 60 --apply
+    # bring one invoiced line's ledger to its target, or every line whose state moved in N days
+    scripts/agent_share.py accrue --line-id 1234                   # dry run: prints the entry it would write
+    scripts/agent_share.py accrue --recent-days 120 --apply
 
     # per-agent accrued totals, by currency
     scripts/agent_share.py show [--agent-id agent_x]
 
 In production run it through scripts/ops/run_oneoff_job.sh (the DB is VPC-only). The daily job
-`agent_share_accrual_daily` does the same as `accrue --recent-days 60 --apply` when
+`agent_share_accrual_daily` does the same as `accrue --recent-days 120 --apply` when
 AGENT_SHARE_ACCRUAL_ENABLED is set.
 """
 
@@ -26,7 +26,7 @@ from dataclasses import asdict
 from datetime import datetime
 
 _TOTALS_SQL = """
-SELECT agent_id, currency, COUNT(DISTINCT edge_id) AS edges, COALESCE(SUM(amount_minor), 0) AS accrued_minor
+SELECT agent_id, currency, COUNT(DISTINCT billing_run_item_id) AS lines, COALESCE(SUM(amount_minor), 0) AS accrued_minor
 FROM agent_share_ledger
 WHERE (CAST(:agent_id AS TEXT) IS NULL OR agent_id = CAST(:agent_id AS TEXT))
 GROUP BY agent_id, currency
@@ -53,7 +53,7 @@ def build_parser():
     s.add_argument("--apply", action="store_true")
     a = sub.add_parser("accrue")
     g = a.add_mutually_exclusive_group(required=True)
-    g.add_argument("--edge-id")
+    g.add_argument("--line-id", type=int)
     g.add_argument("--recent-days", type=int)
     a.add_argument("--apply", action="store_true")
     w = sub.add_parser("show")
@@ -85,12 +85,12 @@ async def run(args):
             print(json.dumps({"status": "set", "rate_id": rate_id}))
             return 0
         if args.cmd == "accrue":
-            if args.edge_id:
-                result = await svc.accrue_for_edge(args.edge_id, apply=args.apply)
+            if args.line_id is not None:
+                result = await svc.accrue_for_line(args.line_id, apply=args.apply)
                 print(json.dumps(asdict(result), default=str))
                 return 0
             if not args.apply:
-                print("accrue --recent-days writes; add --apply (use --edge-id for a dry run).", file=sys.stderr)
+                print("accrue --recent-days writes; add --apply (use --line-id for a dry run).", file=sys.stderr)
                 return 2
             print(json.dumps(await svc.accrue_recent(args.recent_days)))
             return 0
