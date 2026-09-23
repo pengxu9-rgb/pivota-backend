@@ -132,6 +132,8 @@ def test_the_cli_flag_enables_it_for_that_run_only(monkeypatch):
     ("Lipstick", "Gift Sets"), ("Lipstick", "Samples"), ("Lip Liner", "Kits"), ("Lip Liner", "Tools"),
     ("Lip Liner", "Brushes"), ("Lip Liner", "Eye"), ("Lip Liner", "Eyes"), ("Lip Balm", "Pet"),
     ("Lip Balm", "Masks"), ("Lip Gloss Tube", "Packaging"), ("Lipstick Rose", "Fragrance"),
+    # generic, but generic for ANOTHER area
+    ("Glossy Lip Oil", "Hair Care"), ("Lip Tint", "Skin Care"), ("Lip Liner", "Face Care"), ("Lip Oil", "HERA,Lip,Hair Care"),
     # a tag list with ANY tag the title does not say
     ("Lip Tint", "Lip,Cheek"), ("Lip Liner", "Eye,Lip"), ("Lip Liner", "Lips,Eyes"), ("Lipstick", "Makeup,Lips,Sets"),
     # another area named anywhere, not only beside "lip"
@@ -308,6 +310,8 @@ def test_the_cli_runs_the_door_and_the_filter_together(monkeypatch, capsys):
     assert '"kept": 1' in out and '"left_out": 2' in out
     assert '"category_path": "beauty/makeup/lip/lipstick"' in out
     assert '"unresolved_category_count": 0' in out
+    placed = [line for line in out.splitlines() if line.startswith("    lip title pdp ")]
+    assert len(placed) == 1 and "Soft Matte Lipstick" in placed[0]
 
     # Without the switch the lipstick is unresolved again, so a lip-only pass keeps nothing:
     # main() reports the refusal and exits 2, the same as an --only-gtin that matches nothing.

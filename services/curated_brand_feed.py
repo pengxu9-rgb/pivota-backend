@@ -1610,6 +1610,10 @@ _LIP_FORM_WORD = re.compile(r"\b(?:gloss|glossy|tint|stain|balm|oil|liner|pencil
 # type, the ONLY types the door accepts: an allowlist, because a type no pattern reads ("Toys",
 # "Supplements", "Gift Sets", "Eyes", "Packaging") is still the merchant saying what it is.
 _LIP_AREA_TYPES = frozenset({"lip", "lips", "lip makeup", "lip make up", "lip products", "lip product"})
+# The neutral types the door accepts. NOT _GENERIC_PRODUCT_TYPES: that set also holds "hair care",
+# "face care" and "skin care", which say the product is something other than a lip product.
+_LIP_NEUTRAL_TYPES = frozenset({"beauty", "cosmetics", "makeup", "make up", "lip care", "lip treatment",
+                                "lip treatments", "lip color", "lip colour"})
 
 
 def _lip_word_tokens(text: str) -> set:
@@ -1634,7 +1638,7 @@ def _explicit_lip_title_leaf(*, product_type: Optional[str], title: Optional[str
     if leaf == "beauty/makeup/lip/lipstick" and _LIP_FAMILY_WORD.search(text) and _LIP_FORM_WORD.search(text):
         return None
     ptype = " ".join(str(product_type or "").casefold().split())
-    if not ptype or ptype in _GENERIC_PRODUCT_TYPES or ptype in _LIP_AREA_TYPES:
+    if not ptype or ptype in _LIP_NEUTRAL_TYPES or ptype in _LIP_AREA_TYPES:
         return leaf
     if "," not in ptype:
         return None
@@ -1648,7 +1652,7 @@ def _explicit_lip_title_leaf(*, product_type: Optional[str], title: Optional[str
     for tag in tags:
         if tag in _LIP_AREA_TYPES or _title_paths(tag) == {leaf}:
             lip_tag = True
-        elif tag in _GENERIC_PRODUCT_TYPES:
+        elif tag in _LIP_NEUTRAL_TYPES:
             continue
         elif not _lip_word_tokens(tag) or not _lip_word_tokens(tag) <= title_words:
             return None

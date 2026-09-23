@@ -205,6 +205,25 @@ def _select_by_gtin(records: List[Dict[str, Any]], canonical: set, *, domain: st
 #: Printed once per record a category filter left out of the run. Greppable, like SKIPPED_PDP_PREFIX.
 LEFT_OUT_PDP_PREFIX = "    left out pdp "
 
+#: Printed once per record `--lip-title-evidence` placed, so an operator reads exactly those rows
+#: before --apply: no word list can name every non-product ("Lipstick Poster"). Greppable.
+LIP_TITLE_PDP_PREFIX = "    lip title pdp "
+
+
+def _print_lip_title_rows(records: List[Dict[str, Any]]) -> int:
+    from services.curated_brand_feed import CATEGORY_CONFIDENCE_LIP_TITLE
+    placed = [r for r in records if isinstance(r.get("pdp"), dict)
+              and r["pdp"].get("category_confidence") == CATEGORY_CONFIDENCE_LIP_TITLE]
+    for record in placed:
+        pdp = record["pdp"]
+        print(LIP_TITLE_PDP_PREFIX + json.dumps({
+            "product_name": pdp.get("product_name") or pdp.get("title"),
+            "category_path": pdp.get("category_path"),
+            "merchant_product_type": pdp.get("category_source_product_type"),
+        }, sort_keys=True, ensure_ascii=False))
+    return len(placed)
+
+
 #: Its own line per domain, like LEGACY_LISTINGS_MARKER: scripts/curated_apply_gate.py reads it so a
 #: gate that passes a filtered run also says how many products the filter kept out of it.
 CATEGORY_FILTER_MARKER = "category filter report: "
@@ -530,6 +549,8 @@ async def _run(args: argparse.Namespace) -> int:
             matched_gtins |= matched
             print(f"    gtin filter {sorted(wanted_gtins)}: {before} -> {len(recs)} products "
                   f"(matched {sorted(matched)})")
+        if args.lip_title_evidence:
+            print(f"    lip title evidence placed {_print_lip_title_rows(recs)} product(s) -- review each before --apply")
         if args.only_category or args.only_resolved_category:
             recs = _select_by_category(recs, prefix=args.only_category, domain=b["domain"])
         print(f"  {b['domain']}: {len(recs)} products")
