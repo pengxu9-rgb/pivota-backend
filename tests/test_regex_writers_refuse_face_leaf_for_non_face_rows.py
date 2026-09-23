@@ -67,6 +67,10 @@ def test_an_area_with_a_leaf_gets_that_leaf(title, ptype, category, want):
     ("Face & Body Lotion", None),
     ("Eye Cream for Crow’s Feet", None),
     ("Oil Cleanser (safe for eyelash extensions)", None),
+    ("Micellar Cleansing Water - safe for lashes", None),
+    ("Cleansing Oil, gentle on the eyelashes", None),
+    ("Hand Poured Cleansing Balm", None),
+    ("Second hand Toner", None),
     ("Nailed It Cleansing Balm", None),
     ("Body Sunscreen SPF 50", None),        # sun/sunscreen is not a face leaf
     ("Scalp Shampoo", None),                # already a hair leaf
@@ -78,16 +82,64 @@ def test_everything_else_is_the_first_regex_hit(title, ptype):
 
 
 def test_the_curated_resolver_and_the_regex_writers_share_one_rule():
+    # Identity, not behaviour: a copied rule would pass a behavioural check and then drift.
     import services.curated_brand_feed as feed
-    assert feed._FACE_SKINCARE_LEAF.pattern.startswith("^beauty/skincare/")
+    import services.pdp_category_classifier as pcc
+    assert feed.non_face_leaf is pcc.non_face_leaf
+    assert feed._FACE_SKINCARE_LEAF is pcc.FACE_SKINCARE_LEAF
     assert feed._non_face_leaf("beauty/skincare/treat/serum", title="My Lash Serum", product_type=None) == ""
-    assert non_face_leaf("beauty/skincare/treat/serum", "My Lash Serum") == ""
 
 
 def test_the_variant_fold_is_guarded_too():
     from services.pdp_category_classifier import fold_category_from_variants
     assert fold_category_from_variants(category=None, product_type="Nail Polish",
                                        title="Deep Lilac", variants=None) is None
+
+
+@pytest.mark.parametrize("ptype,title,variants", [
+    # A refused product-level answer ends the fold: the variant's own words lack the area.
+    ("Lash Serum", "Perfect Lash Serum", [{"title": "Serum 8ml"}]),
+    ("Nail Polish", "Deep Lilac", [{"title": "Polish"}]),
+    ("Nail Polish", "Chrome Nail Polish", [{"title": "Top Coat + Cuticle Oil"}]),   # not a fashion coat
+    ("Lash Serum", "Perfect Lash Serum", [{"title": "8ml", "platform_metadata": {"product_type": "Serum"}}]),
+    # No product-level hit, but the variant's face-leaf hit is judged on the product's words too.
+    (None, "Perfect Lash Booster", [{"title": "Serum"}]),
+    (None, "Deep Lilac", [{"title": "Nail Polish"}]),
+    # ...and a refused variant ends the fold too, rather than trying the next variant's noun.
+    (None, "Perfect Lash Booster", [{"title": "Serum"}, {"title": "Top Coat"}]),
+])
+def test_a_variant_cannot_bring_the_refused_face_leaf_back(ptype, title, variants):
+    from services.pdp_category_classifier import fold_category_from_variants
+    assert fold_category_from_variants(category=None, product_type=ptype, title=title, variants=variants) is None
+
+
+def test_a_variant_face_answer_for_a_face_product_is_unchanged():
+    from services.pdp_category_classifier import fold_category_from_variants
+    (hit, source, _conf) = fold_category_from_variants(category=None, product_type=None, title="Glow No. 3",
+                                                       variants=[{"title": "Serum 30ml"}])
+    assert hit == ("Serum", "beauty/skincare/treat/serum") and source == "variant_aggregate"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("title,ptype,llm_path,want", [
+    ("Perfect Lash Serum", "Lash Serum", "beauty/skincare/treat/serum", None),
+    ("Deep Lilac", "Nail Polish", "beauty/skincare/treat/exfoliant", None),
+    ("Silky Body Butter", None, "beauty/skincare/moisturize/cream", "beauty/body/care"),
+    ("Glow No. 3", None, "beauty/skincare/treat/serum", "beauty/skincare/treat/serum"),
+])
+async def test_the_llm_answer_is_guarded_too(monkeypatch, title, ptype, llm_path, want):
+    """The LLM backfill selects category_path IS NULL -- exactly where a refused row lands."""
+    import services.category_classifier_llm as cc
+    from services.pdp_category_classifier import fold_category_with_llm_fallback
+    monkeypatch.setenv("LLM_CATEGORY_CLASSIFIER_ENABLED", "true")
+    cc._invalidate_cache_for_tests()
+
+    async def fake(*, user_message, timeout_s=15.0):
+        return {"label": "X", "path": llm_path, "confidence": 0.9}
+
+    monkeypatch.setattr(cc, "_call_deepseek_classify", fake)
+    result = await fold_category_with_llm_fallback(title=title, product_type=ptype)
+    assert (result[0][1] if result else None) == want
 
 
 @pytest.mark.asyncio
