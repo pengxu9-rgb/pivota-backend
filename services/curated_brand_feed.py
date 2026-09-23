@@ -1614,7 +1614,7 @@ _LIP_OTHER_AREA = re.compile(r"\b(?:cheeks?|eyes?|eyelids?|face|facial|brows?|cu
                              r"hair|feet|foot)\b", re.I)
 # a set, kit or bundle: its own shelf (beauty/sets), whatever lip product is inside it
 _LIP_SET = re.compile(r"\b(?:sets?|kits?|bundles?|packs?|combos?|duos?|trios?|quads?|twins?|palettes?|wardrobes?|"
-                      r"collections?|gift|sampler|discovery|advent|vault|\d+\s*-?\s*(?:pcs|pieces?|ea)|"
+                      r"collections?|gift|sampler|discovery|advent|vault|\d+\s*-?\s*(?:pcs?|pieces?|ea)|"
                       r"\d+\s*x|x\s*\d+)\b", re.I)
 # a tool or accessory FOR a lip product, not a lip product
 _LIP_ACCESSORY = re.compile(r"\b(?:brush(?:es)?|sharpeners?|applicators?|cases?|holders?|pouch(?:es)?|"
@@ -1627,7 +1627,10 @@ _LIP_NOT_A_PRODUCT = re.compile(
     r"key\s*rings?|keyrings?|key\s*chains?|keychains?|lanyards?|stickers?|decals?|magnets?|ornaments?|"
     r"empty|base|beeswax|molds?|moulds?|stencils?|dispensers?|displays?|stands?|tubes?|tins?|containers?|"
     r"bottles?|cards?|testers?|samples?|swatch(?:es)?|gumm(?:y|ies)|supplements?|vitamins?|capsules?|"
-    r"candy|chocolate|perfume|parfum|eau|cologne|fragrance)\b", re.I)
+    r"candy|chocolate|perfume|parfum|eau|cologne|fragrance|"
+    # review of #2263 (catch-all types reach the door): merch, media, toys, trade stock
+    r"posters?|enamel\s+pins?|tumblers?|mugs?|diffusers?|dolls?|barbie|squish(?:y|ies)|wall\s+art|dvd|books?|"
+    r"e-?books?|labels?|mica|glitter\s+pigment|wholesale|bulk|gwp|promo(?:tional)?|starter)\b", re.I)
 # "Lip Color" is a family word, not a form: "Glossy Lip Color" is a gloss, "Lip Color Balm" a balm.
 _LIP_FAMILY_WORD = re.compile(r"\blip\s+colou?r\b", re.I)
 _LIP_FORM_WORD = re.compile(r"\b(?:gloss|glossy|tint|stain|balm|oil|liner|pencil|crayon|butter|serum)\b", re.I)

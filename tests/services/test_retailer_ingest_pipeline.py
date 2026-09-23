@@ -185,7 +185,10 @@ async def test_the_lip_title_option_reaches_the_crawl(env):
     env.rows = [LIPSTICK_NO_TYPE]
     assert (await pipeline.run_stage(job(only_category="beauty/makeup/lip"), db=env.db))["status"] == "nothing"
     out = await pipeline.run_stage(job(only_category="beauty/makeup/lip", lip_title_evidence=True), db=env.db)
-    assert out["status"] == "apply_due"
+    assert out["status"] == "held"  # the door placed it: held until that row is accepted
+    out = await pipeline.run_stage(job("apply_due", only_category="beauty/makeup/lip", lip_title_evidence=True,
+                                       accepted_flags=["placed_by_lip_title:soft-matte"]), db=env.db)
+    assert out["status"] == "done"
     assert feed._LIP_TITLE_EVIDENCE.get() is False  # scoped to the stage
 
 
@@ -261,9 +264,23 @@ async def test_a_read_error_is_transient(env):
     {"vendors": "3CE"},                                                    # a string splits into letters
     {"vendors": ["3CE"], "max_scan_products": "20000"},
     {"vendors": ["3CE"], "apply_now": True},
+    {"vendors": ["3CE"], "category_path": "beautyfoo/x"},
 ])
 async def test_invalid_options_are_refused_before_any_crawl(env, options):
     bad = job()
     bad["options"] = options
     out = await pipeline.run_stage(bad, db=env.db)
     assert out["status"] == "failed" and out["outcome"] == "invalid_job"
+
+
+async def test_a_null_option_is_an_absent_one(env):
+    out = await pipeline.run_stage(job(exclude_handles=None, accepted_flags=None), db=env.db)
+    assert out["status"] == "apply_due"
+
+
+async def test_an_exclusion_the_merchant_delisted_can_be_accepted(env):
+    out = await pipeline.run_stage(job("apply_due", exclude_handles=["gone-product"]), db=env.db)
+    assert out["status"] == "held"
+    out = await pipeline.run_stage(job("apply_due", exclude_handles=["gone-product"],
+                                       accepted_flags=["exclude_handle_unmatched:gone-product"]), db=env.db)
+    assert out["status"] == "done"

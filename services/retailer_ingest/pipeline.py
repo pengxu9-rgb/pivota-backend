@@ -56,10 +56,10 @@ def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
     unknown = set(options) - set(_OPTION_TYPES)
     if unknown:
         raise ValueError(f"unknown options {sorted(unknown)}")
+    for key in [k for k, v in options.items() if v is None and k != "vendors"]:
+        del options[key]  # a null option is an absent one (approve() merges lists into them)
     for key, value in options.items():
         want = _OPTION_TYPES[key]
-        if value is None and key not in {"vendors"}:
-            continue
         if want is int and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
             raise ValueError(f"options.{key} must be a positive integer")
         if want is not int and not isinstance(value, want):
@@ -69,7 +69,7 @@ def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
     if not options.get("vendors"):
         raise ValueError("options.vendors is required for a retailer cohort")
     path = str(options.get("category_path") or "beauty").strip().strip("/").lower()
-    if not path.startswith("beauty") or path.count("/") > 1:
+    if not (path == "beauty" or path.startswith("beauty/")) or path.count("/") > 1:
         raise ValueError(f"options.category_path must be coarse (beauty or beauty/<area>), got {path!r}")
     return options
 
@@ -147,7 +147,7 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
         checks["excluded"] = sorted(matched)
         for handle in sorted(excluded - matched):
             flags.append({"key": f"exclude_handle_unmatched:{handle}", "rule": "exclude_handle_unmatched",
-                          "severity": detectors.BLOCK, "acceptable": False, "handle": handle,
+                          "severity": detectors.BLOCK, "handle": handle,
                           "detail": "an approved exclusion no longer matches any product"})
     if o.get("only_category") or o.get("only_resolved_category"):
         try:

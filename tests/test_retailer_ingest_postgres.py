@@ -162,3 +162,27 @@ async def test_an_unfinished_run_is_found(db):
     assert await ledger.unfinished_run(job_id, db=db) is None
     counts = await ledger.status_counts(db=db)
     assert counts.get("queued", 0) >= 1
+
+
+
+async def test_approve_validates_and_is_null_safe(db):
+    job_id = await _enqueue(db, brand="NULLS", options={"vendors": ["X"], "exclude_handles": None})
+    await ledger.transition(job_id, status="held", reason="flag", run_id=None, db=db)
+    with pytest.raises(ValueError):
+        await ledger.approve(job_id, approved_by="peng", exclude_handles=[""], accepted_flags=[], db=db)
+    assert await ledger.approve(job_id, approved_by="peng", exclude_handles=["x"], accepted_flags=["k"], db=db)
+    row = await db.fetch_one("SELECT options FROM retailer_ingest_jobs WHERE id=:id", {"id": job_id})
+    import json as _json
+    options = row["options"] if isinstance(row["options"], dict) else _json.loads(row["options"])
+    assert options["exclude_handles"] == ["x"] and options["accepted_flags"] == ["k"]
+
+
+async def test_a_superseded_transition_still_releases_the_lease(db):
+    await _only_ours_due(db)
+    job_id = await _enqueue(db, brand="SUPERSEDED", options={"vendors": ["X"]})
+    await ledger.claim_due_job(lease_seconds=3600, db=db)
+    await db.execute("UPDATE retailer_ingest_jobs SET status='cancelled' WHERE id=:id", {"id": job_id})
+    assert not await ledger.transition(job_id, status="apply_due", reason="clean", run_id=None,
+                                       expected_status="queued", db=db)
+    row = await db.fetch_one("SELECT lease_until FROM retailer_ingest_jobs WHERE id=:id", {"id": job_id})
+    assert row["lease_until"] is None

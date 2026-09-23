@@ -8,8 +8,8 @@ Each rule is measured, not imagined:
     pasted description. -> lip_row_copy_not_about_lips.
   * 2026-09-09 limecrime.com: a literal `TEST Product` priced $999,999,999.00 in /products.json.
     -> placeholder_product.
-  * Rows the opt-in lip title door placed (#2257) are listed as INFO: they passed its guards, and an
-    operator reviewing a held store should see them, but they do not hold a store on their own.
+  * Rows the opt-in lip title door placed (#2257) are a per-row BLOCK: unattended, nothing but the
+    title vouches for them (review of #2263: "Lipstick Poster" typed "Misc" reaches a lip leaf).
 
 A BLOCK flag holds the job for review; INFO never does. A flag's `key` is stable across runs of
 the same cohort (rule + handle), so an approval can accept exactly the flags it looked at.
@@ -98,7 +98,7 @@ def _flag(rule: str, severity: str, record: Dict[str, Any], detail: str) -> Dict
 
 
 def detect(records: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    from services.curated_brand_feed import CATEGORY_CONFIDENCE_LIP_TITLE, _title_paths
+    from services.curated_brand_feed import CATEGORY_CONFIDENCE_LIP_TITLE, _NON_FACE_TITLE, _title_paths
 
     flags: List[Dict[str, Any]] = []
     for record in records or []:
@@ -128,14 +128,21 @@ def detect(records: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
             except (TypeError, ValueError):
                 door = False
             if door:
-                flags.append(_flag("placed_by_lip_title", INFO, record,
-                                   "category from the product's own title (--lip-title-evidence)"))
+                # Unattended, no merchant type vouches for this row, and no word list can name every
+                # non-product ("Lipstick Poster"). So it holds the cohort until someone accepts this
+                # row's key -- the pipeline's form of an operator reading each placed row.
+                flags.append(_flag("placed_by_lip_title", BLOCK, record,
+                                   "category from the product's own title (--lip-title-evidence); "
+                                   "no merchant type vouches for it -- accept this row to apply it"))
 
         # The title names one or more leaves and the row is filed under none of them: the merchant
         # type (or a measured shelf) and the product's own name disagree. "Essence Toner" on a
         # "Cleansers" shelf names serum AND toner -- neither is cleanser.
         named = _title_paths(title)
-        if category and named and category not in named and not _AREA_LEAF.match(category):
+        # Exempt only what the non-face rule moved on purpose: an area leaf whose OWN title names that
+        # area ("Hand Cream" -> body/care). A "Vitamin C Serum" typed "Hair" is still a contradiction.
+        moved_by_area_rule = bool(_AREA_LEAF.match(category) and _NON_FACE_TITLE.search(title))
+        if category and named and category not in named and not moved_by_area_rule:
             flags.append(_flag("title_contradicts_category", BLOCK, record,
                                f"filed under {category}; the title names {sorted(named)}"))
 

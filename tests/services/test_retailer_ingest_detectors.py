@@ -62,12 +62,15 @@ def test_placeholder_rows_are_held(kw):
     assert "placeholder_product" in rules(detectors.detect([rec]), detectors.BLOCK)
 
 
-def test_rows_the_lip_title_door_placed_are_listed_but_do_not_block():
+def test_rows_the_lip_title_door_placed_hold_until_that_row_is_accepted():
+    """Unattended, nothing but the title vouches for a door-placed row: it holds, per row."""
     with feed.lip_title_evidence():
         rec = record("3CE - Soft Matte Lipstick 3.5g", "", "soft-matte")
     flags = detectors.detect([rec])
     assert rules(flags) == {"placed_by_lip_title"}
-    assert detectors.blocking(flags) == []
+    [flag] = detectors.blocking(flags)
+    assert flag["key"] == "placed_by_lip_title:soft-matte"
+    assert detectors.blocking(flags, accepted=[flag["key"]]) == []
 
 
 def test_an_approval_accepts_exactly_the_flag_keys_it_names():
@@ -89,7 +92,8 @@ def test_a_lip_product_page_carrying_another_products_description_is_held():
     with feed.lip_title_evidence():  # the lip pass that placed these rows ran with the switch on
         wrong, right = _warmish_and_mood()
     flags = detectors.detect([wrong, right])
-    assert {f["handle"] for f in detectors.blocking(flags)} == {"3ce-soft-matte-lipstick-warmish-move"}
+    copy_holds = {f["handle"] for f in detectors.blocking(flags) if f["rule"] == "lip_row_copy_not_about_lips"}
+    assert copy_holds == {"3ce-soft-matte-lipstick-warmish-move"}
 
 
 def _warmish_and_mood():
@@ -126,3 +130,11 @@ def test_a_set_filed_as_one_product_is_held():
     rec = record("[OHUI] Miracle Moisture Cleansing Oil Special Set", "Cleansing Oil", "cleansing-oil-set",
                  body="<p>A cleansing oil set.</p>")
     assert "set_filed_as_single_product" in rules(detectors.detect([rec]), detectors.BLOCK)
+
+
+
+@pytest.mark.parametrize("title,ptype", [("Vitamin C Serum", "Hair"), ("Snail Mucin Essence", "Body Care")])
+def test_an_area_leaf_is_exempt_only_when_its_own_title_names_the_area(title, ptype):
+    rec = record(title, ptype, title.lower().replace(" ", "-"), body="<p>A serum.</p>")
+    assert rec is not None and rec["pdp"]["category_path"]
+    assert "title_contradicts_category" in rules(detectors.detect([rec]), detectors.BLOCK)

@@ -64,9 +64,12 @@ async def claim_due_job(*, lease_seconds: int, db: Any = None) -> Optional[Dict[
     write_db = db or database
     row = await write_db.fetch_one(
         """
+        WITH lane AS (SELECT pg_try_advisory_xact_lock(hashtext('retailer_ingest_drain')) AS mine)
         UPDATE retailer_ingest_jobs
         SET lease_until = NOW() + (CAST(:lease AS integer) * interval '1 second'), updated_at = NOW()
-        WHERE id = (
+        -- Two executions starting at the same instant would both pass the busy-lease check below;
+        -- the transaction-scoped advisory lock lets exactly one of them claim.
+        WHERE (SELECT mine FROM lane) AND id = (
             SELECT id FROM retailer_ingest_jobs
             WHERE status IN ('queued', 'apply_due')
               AND next_run_at <= NOW()
@@ -146,6 +149,9 @@ async def transition(job_id: str, *, status: str, reason: Optional[str], run_id:
          "next_run_at": next_run_at, "count": bool(count_attempt),
          **({"expected": expected_status} if expected_status else {})},
     )
+    if not row and expected_status:
+        # Superseded: the stage's verdict is dropped, but its lease must not block the lane.
+        await write_db.execute("UPDATE retailer_ingest_jobs SET lease_until = NULL WHERE id = :id", {"id": job_id})
     return bool(row)
 
 
@@ -154,6 +160,11 @@ async def approve(job_id: str, *, approved_by: str, exclude_handles: List[str],
     """held -> apply_due, recording who approved and which rows/flags the approval covers.
     The apply re-runs every check; only the exclusions and accepted flag keys named here change
     its verdict, so an approval cannot wave through a flag that appears later."""
+    for name, values in (("exclude_handles", exclude_handles), ("accepted_flags", accepted_flags)):
+        if not isinstance(values, (list, tuple)) or not all(isinstance(v, str) and v.strip() for v in values):
+            raise ValueError(f"{name} must be a list of non-empty strings")
+    if not str(approved_by or "").strip():
+        raise ValueError("approved_by is required")
     write_db = db or database
     row = await write_db.fetch_one(
         """
@@ -161,15 +172,17 @@ async def approve(job_id: str, *, approved_by: str, exclude_handles: List[str],
         SET status = 'apply_due', next_run_at = NOW(), approved_by = :by, approved_at = NOW(),
             options = options
               || jsonb_build_object('exclude_handles',
-                   COALESCE(options->'exclude_handles', '[]'::jsonb) || CAST(:excl AS jsonb))
+                   (CASE WHEN jsonb_typeof(options->'exclude_handles') = 'array'
+                         THEN options->'exclude_handles' ELSE '[]'::jsonb END) || CAST(:excl AS jsonb))
               || jsonb_build_object('accepted_flags',
-                   COALESCE(options->'accepted_flags', '[]'::jsonb) || CAST(:acc AS jsonb)),
+                   (CASE WHEN jsonb_typeof(options->'accepted_flags') = 'array'
+                         THEN options->'accepted_flags' ELSE '[]'::jsonb END) || CAST(:acc AS jsonb)),
             status_reason = 'approved', updated_at = NOW()
         WHERE id = :id AND status = 'held'
         RETURNING id
         """,
-        {"id": job_id, "by": approved_by, "excl": _dumps(list(exclude_handles or [])),
-         "acc": _dumps(list(accepted_flags or []))},
+        {"id": job_id, "by": approved_by, "excl": _dumps([v.strip() for v in exclude_handles]),
+         "acc": _dumps([v.strip() for v in accepted_flags])},
     )
     return bool(row)
 

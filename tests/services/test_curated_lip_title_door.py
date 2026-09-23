@@ -158,6 +158,11 @@ def test_the_cli_flag_enables_it_for_that_run_only(monkeypatch):
     ("Lip Balm Tin (Empty)", None), ("Lip Gloss Base", None), ("Lip Balm Base Beeswax", None), ("Lipstick Mold", None),
     ("Lip Liner Stencil", None), ("Lip Balm Dispenser", None), ("Lip Balm Display Stand", None),
     ("Lip Balm for Dogs", None), ("Lipstick Sample Card", None), ("Lip Gloss Tester", None),
+    # review of #2263: catch-all types ("Misc") reach the door, so these must be refused by title
+    ("Lipstick Poster", "Misc"), ("Lipstick Enamel Pin", "Misc"), ("Lip Gloss Tumbler", "General"),
+    ("Lip Oil Diffuser", "Other"), ("Doll Lipstick", "Misc"), ("Lip Gloss Squishies", "Misc"),
+    ("Lip Balm Bulk Wholesale 100", "Misc"), ("Lip Balm GWP", "Misc"), ("Lip Balm Promo", "Misc"),
+    ("Lipstick 2-pc", "Misc"),
     # a multi-use joiner with no area word ("Liner" names no pattern on its own)
     ("Lipstick & Liner", None), ("Lip Tint + Liner", None),
     # an area only _NON_FACE_TITLE names
