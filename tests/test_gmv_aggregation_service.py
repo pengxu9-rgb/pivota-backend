@@ -34,6 +34,7 @@ class FakeDB:
         self.fetch_all_calls: list[tuple[str, dict[str, Any]]] = []
         self.fetch_one_calls: list[tuple[str, dict[str, Any]]] = []
         self.transaction_count = 0
+        self.statements: list[str] = []
 
     def transaction(self) -> FakeTransaction:
         return FakeTransaction(self)
@@ -41,6 +42,7 @@ class FakeDB:
     async def fetch_all(self, query: str, values: Optional[dict[str, Any]] = None):
         params = dict(values or {})
         self.fetch_all_calls.append((str(query), params))
+        self.statements.append("rollup_read")
         if "FROM commerce_attribution_edges e" not in str(query):
             raise AssertionError(f"Unexpected fetch_all query: {query}")
         return self._rollup(params["date"], params.get("merchant_id"))
@@ -76,6 +78,7 @@ class FakeDB:
         if "pg_advisory_xact_lock" in sql:
             assert self.transaction_count > 0, "the day lock must be taken inside the transaction"
             self.day_locks = getattr(self, "day_locks", []) + [params["date"]]
+            self.statements.append(f"lock:{params['date']}")
             return None
 
         if "INSERT INTO gmv_attribution_daily" in sql:
@@ -474,3 +477,56 @@ def test_coerce_date_normalizes_non_utc_to_utc_day() -> None:
 
     iso_z_utc = "2026-05-22T00:00:00Z"
     assert service._coerce_date(iso_z_utc) == date(2026, 5, 22)
+
+
+@pytest.mark.asyncio
+async def test_the_day_lock_is_taken_before_the_rollup_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A lock taken after the read serialises nothing: the read it protects is already stale."""
+    target_date = date(2026, 5, 21)
+    fake_db = FakeDB(edges=[_edge(gross=10_000, created_at=datetime(2026, 5, 21, 12, tzinfo=timezone.utc))])
+    monkeypatch.setattr(service, "database", fake_db)
+
+    await service.recompute_for_date(target_date, "merch_1")
+    await service.aggregate_daily(target_date)
+
+    # Keyed on the day alone, so the all-merchant job and a one-merchant recompute serialise.
+    lock = f"lock:{target_date}"
+    assert fake_db.statements == [lock, "rollup_read", lock, "rollup_read"]
+
+
+@pytest.mark.asyncio
+async def test_recompute_days_for_edges_rolls_each_merchant_day_once_and_never_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[date, str]] = []
+
+    async def fake_recompute(d: date, merchant_id: str) -> None:
+        calls.append((d, merchant_id))
+        if merchant_id == "merch_down":
+            raise ConnectionError("db blip")
+
+    monkeypatch.setattr(service, "recompute_for_date", fake_recompute)
+    tokyo = timezone(timedelta(hours=9))
+    edges = [
+        # Two fan-out edges of one order on one day: one recompute.
+        {"edge_id": "e1", "merchant_id": "merch_1", "created_at": datetime(2026, 5, 21, 1, tzinfo=timezone.utc)},
+        {"edge_id": "e2", "merchant_id": "merch_1", "created_at": datetime(2026, 5, 21, 23, tzinfo=timezone.utc)},
+        # 02:30 Tokyo on the 22nd is the 21st in UTC, the day the rollup bucketed it on.
+        {"edge_id": "e3", "merchant_id": "merch_1", "created_at": datetime(2026, 5, 22, 2, 30, tzinfo=tokyo)},
+        {"edge_id": "e4", "merchant_id": "merch_1", "created_at": datetime(2026, 5, 19, 8, tzinfo=timezone.utc)},
+        {"edge_id": "e5", "merchant_id": "merch_down", "created_at": datetime(2026, 5, 20, tzinfo=timezone.utc)},
+        # Unusable rows are skipped, not raised.
+        {"edge_id": "e6", "merchant_id": "merch_1", "created_at": None},
+        {"edge_id": "e7", "merchant_id": None, "created_at": datetime(2026, 5, 18, tzinfo=timezone.utc)},
+    ]
+
+    assert await service.recompute_days_for_edges(edges) is False
+    assert sorted(calls) == [
+        (date(2026, 5, 19), "merch_1"),
+        (date(2026, 5, 20), "merch_down"),
+        (date(2026, 5, 21), "merch_1"),
+    ]
+
+    calls.clear()
+    assert await service.recompute_days_for_edges(edges[:4]) is True
+    assert sorted(calls) == [(date(2026, 5, 19), "merch_1"), (date(2026, 5, 21), "merch_1")]

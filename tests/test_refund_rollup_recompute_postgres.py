@@ -1,0 +1,392 @@
+"""A refund that arrives days after its order must reach that order's billed day.
+
+gmv_attribution_daily buckets an edge by its UTC creation day, and the daily job only rolls up
+yesterday. So every refund writer re-rolls the refunded edge's own day after its write commits:
+attach_refund_to_attribution_edge (the Stripe refund and chargeback webhooks) and
+RefundService.create_refund (merchant-initiated refunds). Without it, the invoice for that day
+bills the pre-refund gross.
+
+    DATABASE_URL=postgresql://postgres@localhost:5432/pivota_refund_rollup_test \\
+        .venv/bin/python -m pytest tests/test_refund_rollup_recompute_postgres.py
+"""
+
+import asyncio
+import os
+import sys
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
+_IS_PG = DATABASE_URL.startswith("postgresql://") or DATABASE_URL.startswith("postgres://")
+pytestmark = pytest.mark.skipif(not _IS_PG, reason="needs a Postgres DATABASE_URL")
+
+_SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")
+_TABLES = ("gmv_attribution_daily", "commerce_attribution_edges")
+_ROLLUP_DDL = Path(__file__).resolve().parent.parent / "db/migrations/110_gmv_attribution_daily.sql"
+
+MERCHANT = "m_late_refund"
+N_DAYS_AGO = 5
+BILLED_AT = datetime.now(timezone.utc).replace(hour=12, minute=0, second=0, microsecond=0) - timedelta(
+    days=N_DAYS_AGO
+)
+BILLED_DAY = BILLED_AT.date()
+
+
+def _assert_throwaway_database():
+    dbname = DATABASE_URL.rsplit("/", 1)[-1].split("?")[0]
+    if not any(m in dbname or m in DATABASE_URL for m in _SAFE_DB_MARKERS):
+        pytest.skip(f"refusing to drop tables in {dbname!r}; throwaway only")
+
+
+async def _build_schema(database):
+    from sqlalchemy.dialects import postgresql
+    from sqlalchemy.schema import CreateTable
+
+    from db.commerce_attribution import commerce_attribution_edges
+    from db.sql_migrations import split_statements
+
+    for table in _TABLES:
+        await database.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
+    await database.execute(str(CreateTable(commerce_attribution_edges).compile(dialect=postgresql.dialect())))
+    # Migration 109's columns; its channel_partners FK is not what is under test.
+    await database.execute(
+        "ALTER TABLE commerce_attribution_edges "
+        "ADD COLUMN channel_partner_id BIGINT, ADD COLUMN take_rate_applied_bp SMALLINT, "
+        "ADD COLUMN refund_amount_cents BIGINT NOT NULL DEFAULT 0, ADD COLUMN refunded_at TIMESTAMPTZ"
+    )
+    ddl = _ROLLUP_DDL.read_text(encoding="utf-8").replace(
+        "REFERENCES channel_partners(id) ON DELETE SET NULL", ""
+    )
+    for stmt in split_statements(ddl):
+        await database.execute(stmt)
+
+
+@pytest.fixture(autouse=True)
+async def db(monkeypatch):
+    from db.database import database
+    from services import commerce_attribution_service as cas
+    from services import gmv_aggregation_service as gmv
+
+    _assert_throwaway_database()
+    was_connected = database.is_connected
+    if not was_connected:
+        await database.connect()
+
+    async def _no_event(*a, **k):
+        return {"interaction_id": "int_stub"}
+
+    async def _flat_rate(merchant_id):
+        return 1000  # 10%; the promo lookup reads tables this test does not build
+
+    monkeypatch.setattr(cas, "record_commerce_event_best_effort", _no_event)
+    monkeypatch.setattr(gmv, "_take_rate_bp_for_merchant", _flat_rate)
+    await _build_schema(database)
+    try:
+        yield database
+    finally:
+        for table in _TABLES:
+            try:
+                await database.execute(f"DELETE FROM {table}")
+            except Exception:  # noqa: BLE001
+                continue
+        if not was_connected and database.is_connected:
+            await database.disconnect()
+
+
+async def _billed_edge(db, *, edge_id="cae_1", order_id="ord_late", gross=10_000, created_at=BILLED_AT):
+    """An edge created N days ago whose day the daily job has ALREADY rolled up."""
+    await db.execute(
+        "INSERT INTO commerce_attribution_edges "
+        "(edge_id, merchant_id, order_id, agent_id, gross_attributed_gmv_cents, currency, "
+        " refund_ids, refund_count, refunded_amount, created_at, updated_at) "
+        "VALUES (:edge_id, :merchant_id, :order_id, 'agent_1', :gross, 'USD', "
+        " '[]'::jsonb, 0, 0, :created_at, :created_at)",
+        {"edge_id": edge_id, "merchant_id": MERCHANT, "order_id": order_id, "gross": gross,
+         "created_at": created_at},
+    )
+    from services.gmv_aggregation_service import aggregate_daily
+
+    await aggregate_daily(created_at.date())
+
+
+async def _rollup(db, day=BILLED_DAY):
+    row = await db.fetch_one(
+        "SELECT gross_attributed_gmv_cents g, refund_amount_cents r, net_attributed_gmv_cents n, "
+        "take_amount_cents t FROM gmv_attribution_daily WHERE date = :d AND merchant_id = :m",
+        {"d": day, "m": MERCHANT},
+    )
+    return dict(row) if row else None
+
+
+async def _edge_refund_cents(db, edge_id="cae_1"):
+    return await db.fetch_val(
+        "SELECT refund_amount_cents FROM commerce_attribution_edges WHERE edge_id = :e", {"e": edge_id}
+    )
+
+
+# --- The webhook writer: attach_refund_to_attribution_edge -----------------------------------
+
+
+async def test_a_late_refund_reaches_the_edges_billed_day(db):
+    from services.commerce_attribution_service import attach_refund_to_attribution_edge
+
+    await _billed_edge(db)
+    assert await _rollup(db) == {"g": 10_000, "r": 0, "n": 10_000, "t": 1_000}
+
+    result = await attach_refund_to_attribution_edge(
+        order_id="ord_late", refund_id="re_1", amount=Decimal("25.00")
+    )
+
+    assert result is not None and result["edge_count"] == 1
+    assert await _rollup(db) == {"g": 10_000, "r": 2_500, "n": 7_500, "t": 750}
+    # Only the edge's own day is billed; no row appears for the day the refund arrived.
+    today = datetime.now(timezone.utc).date()
+    assert await _rollup(db, today) is None
+
+
+async def test_the_stripe_refund_webhook_finalizer_reaches_the_billed_day(db, monkeypatch):
+    """The real Stripe refund finalizer, minor units in, with the order-level write stubbed."""
+    import routes.webhook_routes as webhook_routes
+
+    async def _finalized(order, **kwargs):
+        return {"applied": True, "order_id": order["order_id"]}
+
+    monkeypatch.setattr(webhook_routes, "finalize_refund_success", _finalized)
+    monkeypatch.setenv("ATTRIBUTION_REVERSE_ON_REFUND", "true")
+    await _billed_edge(db)
+
+    await webhook_routes._finalize_stripe_refund_success(
+        {"order_id": "ord_late", "merchant_id": MERCHANT, "currency": "USD"},
+        refund_reference="re_hook",
+        refund_amount_minor=4_000,
+        currency="usd",
+        refund_total=Decimal("40.00"),
+    )
+
+    assert await _rollup(db) == {"g": 10_000, "r": 4_000, "n": 6_000, "t": 600}
+
+
+async def test_a_redelivered_refund_does_not_move_the_day_twice(db):
+    from services.commerce_attribution_service import attach_refund_to_attribution_edge
+
+    await _billed_edge(db)
+    for _ in range(2):
+        await attach_refund_to_attribution_edge(order_id="ord_late", refund_id="re_1", amount=Decimal("25.00"))
+    assert await _rollup(db) == {"g": 10_000, "r": 2_500, "n": 7_500, "t": 750}
+
+
+async def test_a_redelivery_heals_a_recompute_that_failed_the_first_time(db, monkeypatch):
+    from services import gmv_aggregation_service as gmv
+    from services.commerce_attribution_service import attach_refund_to_attribution_edge
+
+    await _billed_edge(db)
+    real = gmv.recompute_for_date
+
+    async def _down(*a, **k):
+        raise ConnectionError("db blip")
+
+    monkeypatch.setattr(gmv, "recompute_for_date", _down)
+    await attach_refund_to_attribution_edge(order_id="ord_late", refund_id="re_1", amount=Decimal("25.00"))
+    assert await _rollup(db) == {"g": 10_000, "r": 0, "n": 10_000, "t": 1_000}  # stale
+
+    monkeypatch.setattr(gmv, "recompute_for_date", real)
+    await attach_refund_to_attribution_edge(order_id="ord_late", refund_id="re_1", amount=Decimal("25.00"))
+    assert await _rollup(db) == {"g": 10_000, "r": 2_500, "n": 7_500, "t": 750}
+
+
+async def test_a_failed_recompute_never_fails_the_refund_or_undoes_it(db, monkeypatch):
+    from services import gmv_aggregation_service as gmv
+    from services.commerce_attribution_service import attach_refund_to_attribution_edge
+
+    await _billed_edge(db)
+
+    async def _down(*a, **k):
+        raise ConnectionError("db blip")
+
+    monkeypatch.setattr(gmv, "recompute_for_date", _down)
+    result = await attach_refund_to_attribution_edge(
+        order_id="ord_late", refund_id="re_1", amount=Decimal("25.00")
+    )
+    assert result is not None
+    assert await _edge_refund_cents(db) == 2_500
+
+
+async def test_a_failed_event_still_recomputes_the_day(db, monkeypatch):
+    from services import commerce_attribution_service as cas
+
+    async def _event_raises(*a, **k):
+        raise RuntimeError("event sink down")
+
+    monkeypatch.setattr(cas, "record_commerce_event_best_effort", _event_raises)
+    await _billed_edge(db)
+    with pytest.raises(RuntimeError):
+        await cas.attach_refund_to_attribution_edge(order_id="ord_late", refund_id="re_1", amount=Decimal("25.00"))
+    assert await _rollup(db) == {"g": 10_000, "r": 2_500, "n": 7_500, "t": 750}
+
+
+async def test_a_fanned_out_refund_recomputes_every_edges_own_day(db):
+    from services.commerce_attribution_service import attach_refund_to_attribution_edge
+
+    earlier = BILLED_AT - timedelta(days=2)
+    await _billed_edge(db, edge_id="cae_1")
+    await _billed_edge(db, edge_id="cae_2", created_at=earlier)
+
+    await attach_refund_to_attribution_edge(order_id="ord_late", refund_id="re_1", amount=Decimal("10.00"))
+
+    assert await _rollup(db) == {"g": 10_000, "r": 1_000, "n": 9_000, "t": 900}
+    assert await _rollup(db, earlier.date()) == {"g": 10_000, "r": 1_000, "n": 9_000, "t": 900}
+
+
+async def test_the_edge_day_is_its_utc_day_not_the_session_day(db):
+    """23:30 UTC is the next calendar day in Asia/Shanghai. The recompute must pick the UTC day
+    the rollup bucketed the edge on, or it re-rolls a day the edge is not in."""
+    from services.commerce_attribution_service import attach_refund_to_attribution_edge
+
+    late_evening = BILLED_AT.replace(hour=23, minute=30)
+    await db.execute("SET TIME ZONE 'Asia/Shanghai'")
+    try:
+        await _billed_edge(db, created_at=late_evening)
+        await attach_refund_to_attribution_edge(order_id="ord_late", refund_id="re_1", amount=Decimal("25.00"))
+        assert await _rollup(db, BILLED_DAY) == {"g": 10_000, "r": 2_500, "n": 7_500, "t": 750}
+    finally:
+        await db.execute("SET TIME ZONE 'UTC'")
+
+
+# --- The merchant-initiated writer: RefundService.create_refund -------------------------------
+
+
+def _stub_refund_service_io(monkeypatch, service, *, psp_success=True):
+    """Everything around the edge write, so the transaction and the edge write are real."""
+
+    async def _none(*a, **k):
+        return None
+
+    async def _order(order_id):
+        return {"order_id": order_id, "merchant_id": MERCHANT, "currency": "USD", "psp_used": "stripe"}
+
+    async def _valid(order, amount):
+        return {"valid": True}
+
+    async def _psp(*a, **k):
+        return {"success": True, "refund_id": "re_psp"} if psp_success else {"success": False, "error": "x"}
+
+    monkeypatch.setattr(service, "_check_existing_refund", _none)
+    monkeypatch.setattr(service, "_get_order_for_update", _order)
+    monkeypatch.setattr(service, "_validate_refund", _valid)
+    monkeypatch.setattr(service, "_create_refund_record", _none)
+    monkeypatch.setattr(service, "_process_psp_refund", _psp)
+    monkeypatch.setattr(service, "_update_refund_success", _none)
+    monkeypatch.setattr(service, "_update_refund_failed", _none)
+    monkeypatch.setattr(service, "_queue_for_retry", _none)
+
+
+async def test_a_merchant_refund_reaches_the_edges_billed_day(db, monkeypatch):
+    from services.refund_service import RefundService
+
+    service = RefundService()
+    _stub_refund_service_io(monkeypatch, service)
+    await _billed_edge(db)
+
+    result = await service.create_refund(order_id="ord_late", amount=30.0, reason="damaged")
+
+    assert result["status"] == "success"
+    assert await _rollup(db) == {"g": 10_000, "r": 3_000, "n": 7_000, "t": 700}
+
+
+async def test_a_merchant_refund_recomputes_only_after_its_transaction_commits(db, monkeypatch):
+    """At recompute time, a SECOND connection must already see the refund. Inside the refund's
+    transaction it would not, and a failed recompute there would abort the transaction."""
+    import asyncpg
+
+    import services.refund_service as refund_module
+    from services.refund_service import RefundService
+
+    service = RefundService()
+    _stub_refund_service_io(monkeypatch, service)
+    await _billed_edge(db)
+    seen_by_other_connection = []
+    real = refund_module.recompute_days_for_edges
+
+    async def _observed(rows):
+        other = await asyncpg.connect(DATABASE_URL)
+        try:
+            seen_by_other_connection.append(
+                await other.fetchval("SELECT refund_amount_cents FROM commerce_attribution_edges")
+            )
+        finally:
+            await other.close()
+        return await real(rows)
+
+    monkeypatch.setattr(refund_module, "recompute_days_for_edges", _observed)
+    await service.create_refund(order_id="ord_late", amount=30.0, reason="damaged")
+
+    assert seen_by_other_connection == [3_000]
+    assert await _rollup(db) == {"g": 10_000, "r": 3_000, "n": 7_000, "t": 700}
+
+
+async def test_a_failed_merchant_refund_recompute_keeps_the_refund(db, monkeypatch):
+    from services import gmv_aggregation_service as gmv
+    from services.refund_service import RefundService
+
+    service = RefundService()
+    _stub_refund_service_io(monkeypatch, service)
+    await _billed_edge(db)
+
+    async def _down(*a, **k):
+        raise ConnectionError("db blip")
+
+    monkeypatch.setattr(gmv, "recompute_for_date", _down)
+    result = await service.create_refund(order_id="ord_late", amount=30.0, reason="damaged")
+
+    assert result["status"] == "success"
+    assert await _edge_refund_cents(db) == 3_000
+
+
+async def test_a_failed_psp_refund_touches_neither_edge_nor_day(db, monkeypatch):
+    from services.refund_service import RefundService
+
+    service = RefundService()
+    _stub_refund_service_io(monkeypatch, service, psp_success=False)
+    await _billed_edge(db)
+
+    result = await service.create_refund(order_id="ord_late", amount=30.0, reason="damaged")
+
+    assert result["status"] == "failed"
+    assert await _edge_refund_cents(db) == 0
+    assert await _rollup(db) == {"g": 10_000, "r": 0, "n": 10_000, "t": 1_000}
+
+
+# --- The day lock ------------------------------------------------------------------------------
+
+
+async def test_a_recompute_waits_for_another_recompute_of_the_same_day(db):
+    """Two recomputes of one day must not interleave read and upsert: the one that read first
+    could upsert last and write back a total missing the other's refund."""
+    import asyncpg
+
+    from services.gmv_aggregation_service import recompute_for_date
+
+    await _billed_edge(db)
+    other = await asyncpg.connect(DATABASE_URL)
+    try:
+        tx = other.transaction()
+        await tx.start()
+        await other.execute(
+            "SELECT pg_advisory_xact_lock(CAST(hashtext(CAST($1 AS text)) AS bigint))",
+            f"gmv_attribution_daily:{BILLED_DAY.isoformat()}",
+        )
+        task = asyncio.ensure_future(recompute_for_date(BILLED_DAY, MERCHANT))
+        await asyncio.sleep(0.5)
+        assert not task.done(), "the recompute did not wait for the day's lock"
+        # A refund lands while the recompute waits. It must read it once the lock frees.
+        await other.execute("UPDATE commerce_attribution_edges SET refund_amount_cents = 1234")
+        await tx.commit()
+        await asyncio.wait_for(task, timeout=10)
+    finally:
+        await other.close()
+    assert (await _rollup(db))["r"] == 1_234

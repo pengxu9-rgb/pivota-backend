@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from datetime import date, datetime, timezone
-from typing import Any, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 from db.database import database
 
@@ -214,6 +214,44 @@ async def aggregate_daily(date: date) -> int:
 async def recompute_for_date(date: date, merchant_id: str) -> None:
     """Recompute daily GMV attribution rollups for one merchant and date."""
     await _aggregate_for_date(date, merchant_id=merchant_id)
+
+
+async def recompute_days_for_edges(edges: Iterable[Mapping[str, Any]]) -> bool:
+    """Best-effort: recompute each (merchant, UTC creation day) the given edges roll up into.
+
+    A refund changes an edge's refund_amount_cents, but the edge bills on the day it was
+    created, and the daily job only rolls up yesterday. Every refund writer calls this after
+    its write so a late refund reaches gmv_attribution_daily (and so the invoice).
+
+    Call it AFTER the refund has committed, never inside that transaction: a failed statement
+    here would leave the surrounding transaction aborted and take the refund with it. It never
+    raises. Returns True only when every day was recomputed; a failed day is logged and can be
+    re-run with recompute_for_date.
+    """
+    ok = True
+    days: set[tuple[str, date]] = set()
+    for edge in edges:
+        merchant_id = _get(edge, "merchant_id")
+        try:
+            if not merchant_id:
+                raise ValueError("edge has no merchant_id")
+            days.add((str(merchant_id), _coerce_date(_get(edge, "created_at"))))
+        except Exception as exc:  # noqa: BLE001 -- best-effort; the refund already stands
+            ok = False
+            logger.warning(
+                "gmv_rollup_recompute_skipped edge_id=%s merchant_id=%s error=%s",
+                _get(edge, "edge_id"), merchant_id, str(exc)[:200],
+            )
+    for merchant_id, day in sorted(days):
+        try:
+            await recompute_for_date(day, merchant_id)
+        except Exception as exc:  # noqa: BLE001 -- best-effort; the refund already stands
+            ok = False
+            logger.warning(
+                "gmv_rollup_recompute_failed merchant_id=%s date=%s error_type=%s error=%s",
+                merchant_id, day.isoformat(), type(exc).__name__, str(exc)[:200],
+            )
+    return ok
 
 
 async def apply_refund(edge_id: str, refund_amount_cents: int) -> None:
