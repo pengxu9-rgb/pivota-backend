@@ -42,6 +42,12 @@ class FakeDB:
     async def fetch_all(self, query: str, values: Optional[dict[str, Any]] = None):
         params = dict(values or {})
         self.fetch_all_calls.append((str(query), params))
+        if "UPDATE gmv_attribution_daily" in str(query):
+            # Zeroes the day's groups this run did not write; exercised on real Postgres in
+            # tests/test_gmv_rollup_stale_day_sweep_postgres.py.
+            assert self.transaction_count > 0, "the zeroing must run inside the roll-up's transaction"
+            self.statements.append("zero_unwritten")
+            return []
         if "FROM invoices" in str(query):
             # The billed-day check, which must run under the day lock.
             assert self.transaction_count > 0, "the invoice check must run inside the transaction"
@@ -60,6 +66,11 @@ class FakeDB:
         params = dict(values or {})
         self.fetch_one_calls.append((str(query), params))
         sql = str(query)
+        if "FROM gmv_attribution_daily" in sql:
+            # Has this merchant-day been rolled up before? Only a re-roll can be frozen by a run.
+            self.statements.append("rolled_check")
+            rolled = any(k[0] == params["date"] and k[1] == params["merchant_id"] for k in self.daily)
+            return {"hit": 1} if rolled else None
         if "FROM billing_runs" in sql:
             # A re-roll's unfinished-run check (never the nightly job's).
             self.statements.append("unfinished_run_check")
@@ -504,15 +515,20 @@ async def test_the_day_lock_is_taken_before_the_rollup_read(monkeypatch: pytest.
     fake_db = FakeDB(edges=[_edge(gross=10_000, created_at=datetime(2026, 5, 21, 12, tzinfo=timezone.utc))])
     monkeypatch.setattr(service, "database", fake_db)
 
-    await service.recompute_for_date(target_date, "merch_1")
     await service.aggregate_daily(target_date)
+    await service.recompute_for_date(target_date, "merch_1")
 
     # Keyed on the day alone, so the all-merchant job and a one-merchant recompute serialise. The
     # billed-day check runs after the lock and before the read: checked outside the lock, it races
-    # the invoice run. Only the refund re-roll bounds its wait; the nightly job does not.
+    # the invoice run. Only the refund re-roll bounds its wait; the nightly job does not. Only a
+    # re-roll of a day already rolled checks for an unfinished run. The groups a run did not write
+    # are zeroed last, inside the same lock.
     lock = f"lock:{target_date}"
-    assert fake_db.statements == ["lock_timeout", lock, "invoice_check", "unfinished_run_check", "rollup_read",
-                                  lock, "invoice_check", "rollup_read"]
+    assert fake_db.statements == [
+        lock, "invoice_check", "rollup_read", "zero_unwritten",
+        "lock_timeout", lock, "invoice_check", "rolled_check", "unfinished_run_check", "rollup_read",
+        "zero_unwritten",
+    ]
 
 
 @pytest.mark.asyncio
@@ -599,3 +615,139 @@ async def test_recompute_days_for_edges_rolls_each_merchant_day_once_and_never_r
         (date(2026, 5, 20), "merch_unknown"),
         (date(2026, 5, 21), "merch_1"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_reroll_stale_days_hands_the_changed_edges_to_the_guarded_recompute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sweep owns no billed-day rule: every stale day goes through recompute_days_for_edges.
+    The real queries are exercised in tests/test_gmv_rollup_stale_day_sweep_postgres.py."""
+    seen: dict[str, Any] = {}
+    edges = [{"edge_id": "e1", "merchant_id": "m", "created_at": datetime(2026, 5, 20, tzinfo=timezone.utc)}]
+
+    class Candidates:
+        async def fetch_all(self, query: str, values: dict[str, Any]):
+            assert "gmv_attribution_daily" in query
+            seen["values"] = values
+            return edges
+
+    async def fake_recompute_days(given):
+        seen["edges"] = given
+        return {
+            ("m", date(2026, 5, 20)): service.RECOMPUTED,
+            ("m", date(2026, 5, 19)): service.INVOICED_PERIOD_MANUAL_CREDIT,
+            ("n", date(2026, 5, 19)): service.RECOMPUTED,
+        }
+
+    monkeypatch.setattr(service, "database", Candidates())
+    monkeypatch.setattr(service, "recompute_days_for_edges", fake_recompute_days)
+    # 08:00 on the 22nd in Tokyo is 23:00 on the 21st in UTC: "today" is the UTC 21st.
+    now = datetime(2026, 5, 22, 8, tzinfo=timezone(timedelta(hours=9)))
+
+    summary = await service.reroll_stale_days(now=now)
+
+    assert summary == {"stale_days": 3, "recomputed": 2, "invoiced_period_manual_credit": 1}
+    assert seen["edges"] is edges
+    assert seen["values"] == {
+        "changed_since": datetime(2026, 5, 17, 23, tzinfo=timezone.utc),
+        "created_before": datetime(2026, 5, 21, tzinfo=timezone.utc),
+        "max_days": service.STALE_SWEEP_MAX_DAYS,
+    }
+
+
+def _nightly_stubs(monkeypatch: pytest.MonkeyPatch, *, rollup, sweep_summary=None) -> list[Any]:
+    calls: list[Any] = []
+
+    async def fake_aggregate_daily(d: date) -> int:
+        calls.append(("rollup", d))
+        return await rollup()
+
+    async def fake_sweep(*, now: datetime) -> dict[str, int]:
+        calls.append(("sweep", now))
+        return sweep_summary or {"stale_days": 1, "recomputed": 1}
+
+    monkeypatch.setattr(service, "aggregate_daily", fake_aggregate_daily)
+    monkeypatch.setattr(service, "reroll_stale_days", fake_sweep)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_the_nightly_job_rolls_up_yesterday_then_sweeps(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def ok() -> int:
+        return 3
+
+    calls = _nightly_stubs(monkeypatch, rollup=ok)
+    now = datetime(2026, 5, 22, 1, tzinfo=timezone(timedelta(hours=9)))  # 16:00 UTC on the 21st
+
+    assert await service.run_nightly_rollup(now=now) == {"stale_days": 1, "recomputed": 1}
+    assert calls == [("rollup", date(2026, 5, 20)), ("sweep", now.astimezone(timezone.utc))]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_rollup_still_sweeps_and_then_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def down() -> int:
+        raise ConnectionError("db blip")
+
+    calls = _nightly_stubs(monkeypatch, rollup=down)
+
+    with pytest.raises(ConnectionError):
+        await service.run_nightly_rollup(now=datetime(2026, 5, 22, tzinfo=timezone.utc))
+    assert [c[0] for c in calls] == ["rollup", "sweep"]
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_rollup_does_not_start_a_sweep(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The deadline watchdog, cancel-running and shutdown cancel the run: it must unwind, not sweep."""
+    import asyncio
+
+    async def cancelled() -> int:
+        raise asyncio.CancelledError()
+
+    calls = _nightly_stubs(monkeypatch, rollup=cancelled)
+
+    with pytest.raises(asyncio.CancelledError):
+        await service.run_nightly_rollup(now=datetime(2026, 5, 22, tzinfo=timezone.utc))
+    assert [c[0] for c in calls] == ["rollup"]
+
+
+@pytest.mark.asyncio
+async def test_a_day_the_sweep_could_not_heal_is_logged_as_a_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    async def ok() -> int:
+        return 0
+
+    _nightly_stubs(monkeypatch, rollup=ok,
+                   sweep_summary={"stale_days": 2, "recomputed": 1, "invoiced_period_manual_credit": 1})
+    with caplog.at_level(logging.INFO, logger="services.gmv_aggregation_service"):
+        await service.run_nightly_rollup(now=datetime(2026, 5, 22, tzinfo=timezone.utc))
+
+    sweep_logs = [r for r in caplog.records if "gmv_rollup_stale_day_sweep" in r.getMessage()]
+    assert [r.levelno for r in sweep_logs] == [logging.WARNING]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_sweep_after_a_failed_rollup_keeps_both_errors(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    async def down() -> int:
+        raise ConnectionError("rollup down")
+
+    _nightly_stubs(monkeypatch, rollup=down)
+
+    async def sweep_down(*, now: datetime) -> dict[str, int]:
+        raise TimeoutError("sweep down")
+
+    monkeypatch.setattr(service, "reroll_stale_days", sweep_down)
+    with caplog.at_level(logging.WARNING, logger="services.gmv_aggregation_service"):
+        with pytest.raises(TimeoutError) as raised:
+            await service.run_nightly_rollup(now=datetime(2026, 5, 22, tzinfo=timezone.utc))
+
+    assert isinstance(raised.value.__cause__, ConnectionError)
+    assert any("gmv_aggregation_daily_failed" in r.getMessage() and "rollup down" in r.getMessage()
+               for r in caplog.records)
