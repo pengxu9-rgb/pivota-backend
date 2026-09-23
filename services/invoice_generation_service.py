@@ -143,10 +143,14 @@ INSERT INTO invoices (
 )
 """
 
+# Only a not-yet-finalized invoice moves to 'finalizing'. auto_advance can finalize
+# and charge it before this runs, so a webhook may already have written paid or
+# payment_failed: never pull an invoice back from a later state.
 _MARK_INVOICE_FINALIZING_QUERY = """
 UPDATE invoices
 SET status = 'finalizing'
 WHERE stripe_invoice_id = :stripe_invoice_id
+  AND status IN ('draft', 'finalizing')
 """
 
 _SELECT_INVOICE_DISPUTE_QUERY = """
