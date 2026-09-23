@@ -1027,6 +1027,36 @@ async def ensure_required_schema_light() -> None:
                 )
             except Exception:  # noqa: BLE001
                 pass
+            # mig 237, second statement: the migration's >= 0 CHECK. Guarded on
+            # pg_constraint (as the apm_cadence_days heal is) so a boot does not
+            # re-validate the table every time. Its OWN try: a failure here must
+            # not undo, or be mistaken for, the column heal above.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        DO $$
+                        BEGIN
+                            IF to_regclass('public.commerce_attribution_edges') IS NOT NULL
+                               AND EXISTS (
+                                   SELECT 1 FROM information_schema.columns
+                                   WHERE table_name = 'commerce_attribution_edges'
+                                     AND column_name = 'dispute_amount_cents'
+                               )
+                               AND NOT EXISTS (
+                                   SELECT 1 FROM pg_constraint
+                                   WHERE conname = 'ck_commerce_attribution_edges_dispute_amount_cents'
+                               ) THEN
+                                ALTER TABLE commerce_attribution_edges
+                                    ADD CONSTRAINT ck_commerce_attribution_edges_dispute_amount_cents
+                                    CHECK (dispute_amount_cents >= 0);
+                            END IF;
+                        END $$;
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
             # mig 230: the per-click attribution CLAIM for cart-link Reap purchases,
             # and the index the merchant side needs to ask "is this click one of
             # those?". THIS DDL MUST BUILD THE SAME SCHEMA AS
