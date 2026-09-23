@@ -220,4 +220,8 @@ async def apply_shopify_refund_to_attribution_edges(
             f"{type(exc).__name__}: {str(exc)[:200]}"
         )
         return {"status": "error", "reason": type(exc).__name__}
-    return {"status": "applied" if edges else "no_edge", "edges": edges}
+    if not edges:
+        return {"status": "no_edge", "edges": edges}
+    # "applied" only when money reached an edge; a redelivery or a refused refund says so.
+    applied = any(edge.get("status") == "applied" for edge in edges)
+    return {"status": "applied" if applied else "not_applied", "edges": edges}

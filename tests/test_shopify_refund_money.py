@@ -69,3 +69,14 @@ async def test_the_refund_is_keyed_by_the_shopify_refund_id_in_major_units(monke
         "amount": Decimal("12.50"),
         "currency": "USD",
     }
+
+
+async def test_a_replayed_or_refused_refund_is_not_reported_as_applied(monkeypatch):
+    async def _replayed(**kwargs):
+        return [{"edge_id": "cae_ext_1", "status": "replayed", "applied_cents": 0}]
+
+    monkeypatch.setattr(ingest, "apply_external_order_refund", _replayed)
+    result = await ingest.apply_shopify_refund_to_attribution_edges(
+        merchant_id="m1", payload={"id": 9, "order_id": 7, "transactions": [_tx(1, "12.50")]}
+    )
+    assert result["status"] == "not_applied"
