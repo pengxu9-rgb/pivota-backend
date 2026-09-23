@@ -20,6 +20,7 @@ from observability.reliability_metrics import (
 from services.commerce_interaction_service import record_commerce_event_best_effort
 from services.commerce_ledger_provenance import ledger_provenance
 from services.commerce_order_ref import pivota_order_ref
+from services.gmv_aggregation_service import recompute_days_for_edges
 from services.canonical_commerce_service import (
     make_canonical_product_id,
     make_canonical_variant_id,
@@ -594,7 +595,9 @@ WHERE order_id = :order_id
 RETURNING edge_id, merchant_id, click_id, canonical_product_id,
           canonical_variant_id, surface, prompt_cluster, interaction_id,
           metadata, refund_ids, refund_count, refund_amount_cents,
-          refunded_amount, refunded_at, latest_refund_at
+          refunded_amount, refunded_at, latest_refund_at,
+          -- the edge's billing day, for recompute_days_for_edges
+          created_at
 """
 
 
@@ -673,10 +676,22 @@ async def attach_refund_to_attribution_edge(
     refund_id: str,
     amount: Any,
 ) -> Optional[Dict[str, Any]]:
+    """Apply a refund to the order's edges, emit the event, and recompute the billed days.
+
+    Must not be called inside a transaction: the event and the recompute are best-effort
+    writes, and a failed statement would abort the caller's transaction and lose the refund.
+    A caller that holds one uses `apply_attribution_refund_rows` inside it and the other two
+    after commit (services/refund_service.py).
+    """
     rows = await apply_attribution_refund_rows(order_id=order_id, refund_id=refund_id, amount=amount)
     if not rows:
         return None
-    await emit_attribution_refund_event(rows, order_id=order_id, refund_id=refund_id, amount=amount)
+    try:
+        await emit_attribution_refund_event(rows, order_id=order_id, refund_id=refund_id, amount=amount)
+    finally:
+        # Never raises. A redelivered refund matches its edges again, so a redelivery also
+        # re-runs a recompute that failed the first time.
+        await recompute_days_for_edges(rows)
     # Backwards-compatible return shape: callers expect a single dict.
     # When fan-out exists, surface the first edge with an added edge_count
     # field so callers can distinguish single-edge vs multi-edge refunds.

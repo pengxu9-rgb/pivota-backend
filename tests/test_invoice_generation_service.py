@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 import logging
-from datetime import date
+from datetime import date, timedelta
 from types import SimpleNamespace
 from typing import Any
 
@@ -145,6 +145,11 @@ class _FakeDatabase:
         if q.startswith("alter table"):
             return None
 
+        if "pg_advisory_xact_lock_shared" in q:
+            # The invoice run's shared day lock (gmv_aggregation_service.lock_billing_days).
+            self.billing_day_locks = getattr(self, "billing_day_locks", []) + [params["date"]]
+            return None
+
         if q.startswith("update billing_runs"):
             run_id = int(params["billing_run_id"])
             # Tell the two transition queries apart by their SET clause.
@@ -277,6 +282,29 @@ def _install_fakes(
     monkeypatch.setattr(service, "stripe_client", fake_stripe)
     monkeypatch.setattr(service, "_SCHEMA_GUARD_ATTEMPTED", False)
     return fake_stripe
+
+
+@pytest.mark.asyncio
+async def test_the_invoice_run_locks_every_billed_day_before_it_reads_and_bills(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Closes the read-then-rewrite race (review of #2271): the rows billed are read under the
+    shared day lock a refund's re-roll takes exclusively, and the lock spans the invoice write."""
+    period_start = date(2026, 4, 1)
+    period_end = date(2026, 4, 30)
+    db = _FakeDatabase(
+        merchants_to_bill=["merch_1"],
+        merchant_customers={"merch_1": "cus_1"},
+        gmv_rows_by_merchant={"merch_1": [_gmv_row(1, amount=125)]},
+    )
+    stripe_client = _install_fakes(monkeypatch, db)
+    await service.run_billing_cycle(period_start, period_end)
+    assert db.billing_day_locks == [period_start + timedelta(days=i) for i in range(30)]
+    executed = [q for q, _ in db.executed]
+    first_lock = next(i for i, q in enumerate(executed) if "pg_advisory_xact_lock_shared" in q)
+    invoice_insert = next(i for i, q in enumerate(executed) if q.startswith("insert into invoices"))
+    assert first_lock < invoice_insert
+    assert stripe_client.calls[0][0] == "invoice.create"
 
 
 @pytest.mark.asyncio
