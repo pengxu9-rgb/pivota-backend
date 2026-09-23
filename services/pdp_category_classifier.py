@@ -139,6 +139,37 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
     # while this file named `treat/toner` and nothing here could reach the 315 prod rows sitting on
     # the gateway's path. Two taxonomies over one column, each calling the other's rows corrupt.
     # Do not retarget this leaf without changing beautyTaxonomy.js in the same breath.
+    # An ACID or PEELING pad is an exfoliant, not a toner. The Toner entry below claims a bare
+    # "pad", which is right for the hydrating/soothing pads that dominate the shelf (Anua Heartleaf
+    # 77% Toner Pad, Torriden Multi Pad, NEOGEN Real Cica Pad) but wrong for an exfoliating one --
+    # measured on sokoglam's "Physical" and "Chemical" shelves, where SOME BY MI "AHA-BHA-PHA 30
+    # Days Miracle Truecica Clear Pad" and IOPE "Skin Booster Ampoule Peel Pad" both read as toners.
+    # This arm sits ABOVE Toner so first-match-wins reaches it, and it NARROWS nothing: a pad with
+    # no acid and no peel noun still falls through to Toner exactly as before. The acid list is the
+    # exfoliating acids only -- hyaluronic, azelaic and amino acids are NOT exfoliants, and a title
+    # naming an acid without a pad noun is left to the entries below; `lactic` declines "lactic acid
+    # BACTERIA ferment", which is a soothing ingredient. "Gauze" is deliberately NOT a noun here:
+    # prod holds a "Calming Gauze Pad" (a soothing pad), and NEOGEN's exfoliating gauzes all say
+    # "Bio-Peel ... Peeling" anyway. This DOES add a second path to the distinct-path count that
+    # services/curated_brand_feed._pattern_matches takes over a merchant product_type: a shelf
+    # literally named "BHA Pad" would read as ambiguous there. No host in the measured census files
+    # products under such a type.
+    ("Exfoliant", "beauty/skincare/treat/exfoliant", re.compile(
+        # \A + lookahead: a title that CALLS ITSELF a toner pad keeps the toner leaf, however many
+        # acids it lists ("Ji Woo Gae Cica BHA Blemish Toner Pad" is a BHA toner pad, measured in
+        # prod). The lookahead is DOTALL and takes one-or-more separators, so a line break or a
+        # double space inside the phrase cannot slip past it. "Toning pad" is NOT in the guard:
+        # unlike "toner pad" it names no product class on its own (the corpus holds no "toning pad"
+        # either way -- its one "toning" product is a lotion), and a toning pad with no acid never
+        # reaches this arm. A BUNDLE naming both ("AHA Peeling Pad + Toner Pad Set") stays a toner:
+        # the lookahead reads the whole title, which is the conservative answer and what main did.
+        # The rest scans the title for an exfoliating acid BEFORE a pad noun (an acid named after
+        # the noun -- "Clear Pad with AHA BHA" -- is left to Toner), or an explicit peel pad.
+        r"\A(?!(?s:.)*\btoner[-\s]+pads?\b)(?s:.)*?"
+        r"(?:\b(?:aha|bha|pha|glycolic|salicylic|mandelic|lactic(?![\s-]+acid[\s-]+bacteria))\b"
+        r"[^\n]{0,60}?\bpads?\b"
+        r"|\b(?:peel(?:ing)?|exfoliating|exfoliant)(?:-|[^\S\n\r])+pads?\b)",
+        re.IGNORECASE)),
     ("Toner", "beauty/skincare/tone/toner", re.compile(
         r"\b(toner|tonic|mist|pad|skin booster)\b", re.IGNORECASE)),
     # An acne / blemish patch is a TREATMENT, not a mask. Google Product Taxonomy 5976 and Shopify

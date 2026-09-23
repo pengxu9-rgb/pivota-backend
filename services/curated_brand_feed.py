@@ -1446,10 +1446,10 @@ def _pattern_matches(text: Optional[str]) -> int:
 # to the leaf -- or named a different leaf in its title, which `_resolve_category` checks per
 # product before using the entry. Shelves that were NOT one class are deliberately absent:
 # eyurs "Cotton Pads" (an accessory the toner pattern catches through "pad"), "Foot Masks"
-# (body care), ohlolly "Exfoliator" (body scrubs + facial peel pads), sokoglam "physical" /
-# "chemical" (exfoliant pads despite the names). Re-read 2026-09-22 and also left out: eyurs
-# "Exfoliators" (a peel-off mask among the exfoliants) and "Wrinkle Patch" (an acne patch among
-# the wrinkle patches).
+# (body care), ohlolly "Exfoliator" (body scrubs + facial peel pads), sokoglam "chemical" (an
+# azelaic treatment and a tea tree stick, not one class). Re-read 2026-09-22 and also left out:
+# eyurs "Exfoliators" (a peel-off mask among the exfoliants) and "Wrinkle Patch" (an acne patch
+# among the wrinkle patches). sokoglam "physical" moved IN on 2026-09-23 -- see its own note.
 _MEASURED_HOST_PRODUCT_TYPES = {
     "eyurs.com": {
         "sheet masks": "beauty/skincare/treat/mask",
@@ -1489,6 +1489,19 @@ _MEASURED_HOST_PRODUCT_TYPES = {
         "lip balms": "beauty/makeup/lip/balm",
         # 2026-09-22, every product on sokoglam.com (564): nine blemish patches and spot treatments.
         "spot": "beauty/skincare/treat/treatment",
+        # Read again 2026-09-23, once an acid/peel pad stopped reading as a toner: all six products
+        # on this shelf exfoliate (an AHA-BHA-PHA pad, a peel gel, three gauze peels) except
+        # NEOGEN's soothing Real Cica Pad, whose title names the toner leaf and steps the shelf
+        # aside. The shelf NAME is still no evidence on its own: the neighbouring "Chemical" shelf
+        # holds an azelaic treatment and a tea tree stick, and stays out.
+        # KNOWN FORWARD RISK: physical exfoliation is where TOOLS land, and the title check above is
+        # a membership test, so a konjac pad or a silicone applicator filed here would be claimed as
+        # a topical exfoliant. sokoglam files its tools under their own "Tools" shelf today (8
+        # products). A general tools veto was drafted and REJECTED in review: `_title_paths` matches
+        # a bare "brush", so it refused "Clay Mask with Applicator Brush" and "Lip Balm with Brush
+        # Applicator" on the shelves above -- and an unresolved row stops the whole cohort at the
+        # apply gate. Re-read this shelf before trusting it again.
+        "physical": "beauty/skincare/treat/exfoliant",
     },
 }
 
