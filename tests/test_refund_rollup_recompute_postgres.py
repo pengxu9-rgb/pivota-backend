@@ -279,8 +279,8 @@ async def test_a_failed_event_still_recomputes_the_day(db, monkeypatch):
 
 async def test_an_edge_with_metadata_still_reaches_its_billed_day(db, monkeypatch):
     """Real edges carry metadata, and this stack returns JSONB as a str. The unstubbed event
-    builder spreads it (`**metadata`) and raises TypeError, found 2026-09-23, not fixed here.
-    The recompute must not depend on the event succeeding."""
+    builder used to spread it (`**metadata`) and raise TypeError after the UPDATE had committed.
+    With that fixed, the real event path runs clean and the recompute still lands."""
     from services import commerce_attribution_service as cas
 
     monkeypatch.undo()  # the real event path, not the fixture's stub
@@ -295,10 +295,7 @@ async def test_an_edge_with_metadata_still_reaches_its_billed_day(db, monkeypatc
         "UPDATE commerce_attribution_edges SET metadata = jsonb_build_object('source', 'agent')"
     )
 
-    try:
-        await cas.attach_refund_to_attribution_edge(order_id="ord_late", refund_id="re_1", amount=Decimal("25.00"))
-    except TypeError:
-        pass  # the event bug above; the refund and the recompute must stand regardless
+    await cas.attach_refund_to_attribution_edge(order_id="ord_late", refund_id="re_1", amount=Decimal("25.00"))
 
     assert await _edge_refund_cents(db) == 2_500
     assert await _rollup(db) == {"g": 10_000, "r": 2_500, "n": 7_500, "t": 750}
