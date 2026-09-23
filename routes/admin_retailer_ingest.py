@@ -134,11 +134,18 @@ class EnqueueBody(BaseModel):
     scripts/enqueue_retailer_ingest._row_to_job -- the same validator the CLI uses."""
     model_config = ConfigDict(extra="forbid")
 
-    domain: StrictStr
-    brand: StrictStr
-    vendors: List[StrictStr]
+    domain: StrictStr = Field(max_length=253)
+    brand: StrictStr = Field(max_length=200)
+    vendors: List[StrictStr] = Field(max_length=20)
     options: Dict[str, Any] = Field(default_factory=dict)
-    priority: StrictInt = 0
+    priority: StrictInt = Field(default=0, ge=-1000, le=1000)  # the column is INTEGER: bound it
+
+    @field_validator("vendors")
+    @classmethod
+    def _vendor_lengths(cls, values: List[str]) -> List[str]:
+        if any(len(v) > 200 for v in values):
+            raise ValueError("vendor names must be at most 200 characters")
+        return values
 
 
 @router.get("/jobs", response_model=None)
@@ -170,6 +177,19 @@ async def approve_job(job_id: str, body: ApproveBody, admin: Dict[str, Any] = De
     job = await _job_or_404(job_id)
     if job.get("status") != "held":
         return _not_in_state(job, "approve", ("held",))
+    if body.accepted_flags:
+        # Only flags this job's latest held run actually raised, and only acceptable ones: an approval
+        # must not pre-accept a flag no run has shown ("placeholder_product:<future handle>") or claim
+        # to accept a cohort-level flag the pipeline never lets through ("plan_not_ready").
+        runs = [_decode(r, _RUN_JSON) for r in await ledger.job_runs(job_id)]
+        latest = runs[0] if runs else {}
+        acceptable = {f.get("key") for f in (latest.get("flags") or []) if isinstance(f, dict)
+                      and f.get("severity") == "block" and f.get("acceptable") is not False}
+        unknown = [k for k in body.accepted_flags if k not in acceptable]
+        if unknown:
+            raise HTTPException(status_code=422, detail={
+                "error": "accepted_flags must name acceptable BLOCK flags on the job's latest run",
+                "not_acceptable": unknown, "acceptable": sorted(k for k in acceptable if k)})
     try:
         approved = await ledger.approve(job_id, approved_by=_actor(admin), exclude_handles=body.exclude_handles,
                                         accepted_flags=body.accepted_flags)

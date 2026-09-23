@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
@@ -34,11 +35,21 @@ from services.retailer_ingest.pipeline import _OPTION_TYPES, validate_options  #
 _ALLOWED = set(_OPTION_TYPES) - {"vendors", "accepted_flags"}
 
 
+# A public DNS hostname only: the drain crawls https://<domain>/products.json from the crawl subnet,
+# so an IP literal, a port, a path or "localhost" would point it at something that is not a store.
+_HOSTNAME = re.compile(r"^(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
+
+
 def _row_to_job(row: Dict[str, Any]) -> Dict[str, Any]:
-    domain, brand = str(row.get("domain") or "").strip(), str(row.get("brand") or "").strip()
+    domain, brand = str(row.get("domain") or "").strip().lower(), str(row.get("brand") or "").strip()
     vendors = [str(v).strip() for v in (row.get("vendors") or []) if str(v).strip()]
     if not domain or not brand or not vendors:
         raise ValueError(f"every row needs domain, brand and vendors: {row}")
+    if not _HOSTNAME.match(domain) or re.fullmatch(r"[0-9.]+", domain):
+        raise ValueError(f"domain must be a public hostname (no scheme, port, path or IP): {domain!r}")
+    notes = (row.get("options") or {}).get("notes")
+    if isinstance(notes, str) and len(notes) > 1000:
+        raise ValueError("options.notes must be at most 1000 characters")
     options = dict(row.get("options") or {})
     unknown = set(options) - _ALLOWED
     if unknown:

@@ -268,12 +268,36 @@ async def test_summary_zero_fills_every_status_and_reports_held_and_recent_runs(
 # ---------------------------------------------------------------------------
 
 
+def _held_run(fake, *keys, cohort_level=()):
+    flags = [{"key": k, "rule": k.split(":")[0], "severity": "block"} for k in keys]
+    flags += [{"key": k, "rule": k, "severity": "block", "acceptable": False} for k in cohort_level]
+    flags += [{"key": "info:x", "rule": "info", "severity": "info"}]
+    fake.runs["rij_held"] = [{"id": "rir_held", "job_id": "rij_held", "stage": "dry_run", "outcome": "held",
+                              "flags": json.dumps(flags)}]
+
+
 async def test_approve_moves_a_held_job_and_records_the_admin_identity(fake):
+    _held_run(fake, "placed_by_lip_title:soft-matte")
     resp = await _send(_app(), "POST", "/admin/retailer-ingest/jobs/rij_held/approve",
-                       {"exclude_handles": [" 3ce-tone-up-tint-40ml "], "accepted_flags": ["plan_not_ready"]})
+                       {"exclude_handles": [" 3ce-tone-up-tint-40ml "],
+                        "accepted_flags": ["placed_by_lip_title:soft-matte"]})
     assert resp.status_code == 200, resp.text
     assert resp.json()["status"] == "apply_due" and resp.json()["approved_by"] == "ops@example.com"
-    assert ("approve", "rij_held", "ops@example.com", ["3ce-tone-up-tint-40ml"], ["plan_not_ready"]) in fake.calls
+    assert ("approve", "rij_held", "ops@example.com", ["3ce-tone-up-tint-40ml"],
+            ["placed_by_lip_title:soft-matte"]) in fake.calls
+
+
+@pytest.mark.parametrize("key", [
+    "placeholder_product:some-future-handle",  # no run raised it: an approval cannot pre-accept it
+    "plan_not_ready",                          # cohort-level: the pipeline never lets it through
+    "info:x",                                  # INFO flags do not hold anything
+])
+async def test_approve_refuses_a_flag_the_latest_held_run_did_not_raise_as_acceptable(fake, key):
+    _held_run(fake, "placed_by_lip_title:soft-matte", cohort_level=["plan_not_ready"])
+    resp = await _send(_app(), "POST", "/admin/retailer-ingest/jobs/rij_held/approve", {"accepted_flags": [key]})
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"]["not_acceptable"] == [key]
+    assert not [c for c in fake.calls if c[0] == "approve"]
 
 
 async def test_approve_falls_back_to_the_subject_when_the_admin_has_no_email(fake):
@@ -336,6 +360,7 @@ async def test_approve_refuses_a_malformed_body(fake, body):
 
 
 async def test_approve_accepts_exactly_100_entries(fake):
+    _held_run(fake, *[f"k{i}" for i in range(100)])
     resp = await _send(_app(), "POST", "/admin/retailer-ingest/jobs/rij_held/approve",
                        {"exclude_handles": [f"h{i}" for i in range(100)],
                         "accepted_flags": [f"k{i}" for i in range(100)]})
@@ -431,7 +456,7 @@ async def test_enqueue_queues_the_validated_cohort(fake):
     assert resp.json() == {"job_id": "rij_new1"}
     [call] = [c for c in fake.calls if c[0] == "enqueue_job"]
     # the shared validator's output: stripped domain, blank vendor dropped, vendors folded into options
-    assert call == ("enqueue_job", "K-Touch.us", "3CE",
+    assert call == ("enqueue_job", "k-touch.us", "3CE",
                     {"lip_title_evidence": True, "only_category": "beauty/makeup/lip", "vendors": ["3CE"]},
                     10, "admin:ops@example.com")
 
@@ -447,6 +472,12 @@ async def test_enqueueing_a_cohort_with_an_open_job_is_409(fake):
     {**COHORT, "vendors": []},                                    # validator: vendors required
     {**COHORT, "vendors": ["  "]},                                # validator: blank vendors are none
     {**COHORT, "domain": "  "},                                   # validator: domain required
+    {**COHORT, "domain": "10.8.0.3"},                             # validator: an IP literal
+    {**COHORT, "domain": "localhost"},                            # validator: not a public hostname
+    {**COHORT, "domain": "k-touch.us:8443"},                      # validator: a port
+    {**COHORT, "domain": "k-touch.us/products"},                  # validator: a path
+    {**COHORT, "priority": 3000000000},                           # model: INTEGER overflow
+    {**COHORT, "vendors": ["x" * 201]},                           # model: vendor length
     {**COHORT, "options": {"apply": True}},                       # validator: unknown option
     {**COHORT, "options": {"accepted_flags": ["k"]}},             # validator: approval-only key
     {**COHORT, "priority": "high"},                               # types
