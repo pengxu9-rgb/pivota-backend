@@ -201,6 +201,48 @@ def _select_by_gtin(records: List[Dict[str, Any]], canonical: set, *, domain: st
     return kept, matched
 
 
+#: Printed once per record a category filter left out of the run. Greppable, like SKIPPED_PDP_PREFIX.
+LEFT_OUT_PDP_PREFIX = "    left out pdp "
+
+
+def _select_by_category(records: List[Dict[str, Any]], *, prefix: Optional[str]) -> List[Dict[str, Any]]:
+    """Keep the records whose category RESOLVES (and, with `prefix`, sits under it).
+
+    One unresolved row blocks a whole cohort (`category_unresolved`), and a retailer's feed mixes
+    rows the taxonomy can place with rows it cannot: at k-touch.us 10 of 24 3CE products resolve.
+    --only-gtin is the narrowing tool for that, but these feeds carry almost no barcodes, so it
+    cannot select them. This narrows by the resolved category instead -- `beauty/makeup/lip` gives
+    a lip-only pass. It never resolves anything: a left-out row is printed, one line each, and stays
+    out of the plan exactly as unresolved as it was.
+
+    A filter that keeps NOTHING raises, like --only-gtin and --only-vendor.
+    """
+    from services.category_path_aliases import resolve
+    want = (prefix or "").strip().strip("/").lower()
+    kept, left_out = [], []
+    for record in records:
+        pdp = record.get("pdp") or {}
+        leaf = resolve(pdp.get("category_path")) or ""
+        if leaf and (not want or leaf == want or leaf.startswith(want + "/")):
+            kept.append(record)
+        else:
+            left_out.append((record, "category_unresolved" if not leaf else "outside_category_filter"))
+    for record, reason in left_out:
+        pdp = record.get("pdp") or {}
+        print(LEFT_OUT_PDP_PREFIX + json.dumps({
+            "reason": reason,
+            "product_name": pdp.get("product_name") or pdp.get("title"),
+            "category_path": pdp.get("category_path"),
+            "merchant_product_type": pdp.get("category_source_product_type"),
+            "canonical_url": pdp.get("canonical_url") or pdp.get("source_url"),
+        }, sort_keys=True, ensure_ascii=False))
+    print(f"    category filter {want or '(resolved)'}: {len(records)} -> {len(kept)} products "
+          f"({len(left_out)} left out)")
+    if not kept:
+        raise ValueError(f"category filter {want or '(resolved)'} kept none of the {len(records)} selected products")
+    return kept
+
+
 #: Its own line, never merged into `primary ingestion:` — scripts/curated_apply_gate.py parses that
 #: marker, and the plan inspection it prints must stay the pure-plan verdict the worker also computes.
 LEGACY_LISTINGS_MARKER = "legacy listings: "
@@ -503,6 +545,8 @@ async def _run(args: argparse.Namespace) -> int:
     if wanted_gtins - matched_gtins:
         raise ValueError(f"--only-gtin values matched no product in this run: "
                          f"{sorted(wanted_gtins - matched_gtins)}")
+    if args.only_category or args.only_resolved_category:
+        all_records = _select_by_category(all_records, prefix=args.only_category)
     plan = ingest_validated_jsonl(all_records)
     print(
         f"plan: pdps={len(plan.get('pdps') or [])} skus={len(plan.get('skus') or [])} "
@@ -629,6 +673,23 @@ def main(argv: Optional[List[str]] = None) -> int:
             "Every requested GTIN must be valid and must match somewhere in the run, and a host "
             "matching none of them is an error, not an empty run. It narrows the PLAN only: the "
             "crawl still reads the whole feed and GTIN recovery still spends its budget first."
+        ),
+    )
+    p.add_argument(
+        "--only-resolved-category",
+        action="store_true",
+        help=(
+            "keep only products whose category resolves to a taxonomy leaf; every other product is "
+            "printed ('left out pdp') and left out of the plan instead of blocking it with "
+            "category_unresolved. Resolves nothing itself. Keeping none is an error"
+        ),
+    )
+    p.add_argument(
+        "--only-category",
+        metavar="PATH",
+        help=(
+            "keep only products whose resolved category is PATH or under it (e.g. beauty/makeup/lip "
+            "for a lip-only pass); implies --only-resolved-category. Keeping none is an error"
         ),
     )
     p.add_argument("--plan-print-limit", type=int, default=None, metavar="N",

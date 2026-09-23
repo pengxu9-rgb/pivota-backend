@@ -1546,6 +1546,62 @@ def _measured_host_type_leaf(*, domain: Optional[str], product_type: Optional[st
     return leaf
 
 
+# A lip product's own title, where the merchant type says nothing. Measured 2026-09-23 on the
+# UCP-ready Meitu retailers: k-touch.us, belleandblush.com and openthebeauty.com file lipsticks
+# under a blank type, "Cosmetics", or a comma tag list ("HERA,Face,Makeup,..."), so every
+# "Soft Matte Lipstick" / "Rouge Opulent Lipstick" / "Lip Liner" landed unresolved and blocked
+# its whole cohort, while the same stores' mascaras resolved from a clean type.
+#
+# Deliberately NOT a general title classifier: only a lip leaf, only when the title names that
+# ONE leaf and nothing else, and only where the type and the measured shelf left the row
+# unresolved. What it refuses stays unresolved -- never a guessed leaf:
+_LIP_LEAF_PREFIX = "beauty/makeup/lip/"
+# a multi-use product: "Lip & Cheek", "Eye and Lip Remover", "Lip/Cheek Tint"
+_LIP_MULTI_USE = re.compile(r"\blips?\s*(?:&|\+|/|\band\b)\s*\w|\w\s*(?:&|\+|/|\band\b)\s*lips?\b", re.I)
+# a set, kit or bundle: its own shelf (beauty/sets), whatever lip product is inside it
+_LIP_SET = re.compile(r"\b(?:sets?|kits?|bundles?|trio|gift|sampler|discovery|advent|vault|"
+                      r"\d+\s*-?\s*(?:pcs|pieces?|ea))\b", re.I)
+# a tool or accessory FOR a lip product, not a lip product
+_LIP_ACCESSORY = re.compile(r"\b(?:brush(?:es)?|sharpeners?|applicators?|cases?|holders?|pouch(?:es)?|"
+                            r"mirrors?|keychains?|removers?|wipes?|cleansers?|organi[sz]ers?)\b", re.I)
+# "Lip Color" is a family word, not a form: "Glossy Lip Color" is a gloss, "Lip Color Balm" a balm.
+_LIP_FAMILY_WORD = re.compile(r"\blip\s+colou?r\b", re.I)
+_LIP_FORM_WORD = re.compile(r"\b(?:gloss|glossy|tint|stain|balm|oil|liner|pencil|crayon|butter|serum)\b", re.I)
+
+
+def _explicit_lip_title_leaf(*, product_type: Optional[str], title: Optional[str]) -> Optional[str]:
+    """The lip leaf a title names outright, or None. The caller asks only for UNRESOLVED rows."""
+    from services.pdp_category_classifier import CATEGORY_PATTERNS
+    text = str(title or "")
+    named = _title_paths(text)
+    if len(named) != 1:
+        # Zero is no evidence; two is PR #2158's ambiguity ("Powder Kiss Lipstick" names a powder).
+        return None
+    leaf = next(iter(named))
+    if not leaf.startswith(_LIP_LEAF_PREFIX):
+        return None
+    if (_LIP_MULTI_USE.search(text) or _LIP_SET.search(text) or _LIP_ACCESSORY.search(text)
+            or _NON_FACE_TITLE.search(text)):
+        return None
+    if leaf == "beauty/makeup/lip/lipstick" and _LIP_FAMILY_WORD.search(text) and _LIP_FORM_WORD.search(text):
+        return None
+    ptype = " ".join(str(product_type or "").casefold().split())
+    # "An unclassifiable multi-use label (e.g. Lip & Cheek) is not permission to choose a competing
+    # category from its title" (_resolve_category_by_evidence) holds here too.
+    if re.search(r"[&/]|\band\b", ptype):
+        return None
+    # The type may name nothing, or only this same leaf -- never another class. A tag list naming
+    # "Powder" or "Cushion" is the merchant saying this is something other than a lip product.
+    typed = {path for _label, path, pattern in CATEGORY_PATTERNS if pattern.search(ptype)}
+    if typed - {leaf}:
+        return None
+    # A comma tag list IS the merchant's own classification, even where no pattern reads it
+    # ("HERA,Face,Makeup,Cushion" matches nothing): it must name the lip area for the title to count.
+    if "," in ptype and not any(re.search(r"\blips?\b", tag) for tag in ptype.split(",")):
+        return None
+    return leaf
+
+
 def _resolve_category(*, product_type: Optional[str], title: Optional[str], flag_path: str,
                       domain: Optional[str] = None) -> Tuple[str, float]:
     """Resolve, then refuse a FACE skincare leaf for a product that names another body area.
@@ -1577,7 +1633,8 @@ def _resolve_category(*, product_type: Optional[str], title: Optional[str], flag
 
 def _resolve_category_unguarded(*, product_type: Optional[str], title: Optional[str], flag_path: str,
                                 domain: Optional[str] = None) -> Tuple[str, float]:
-    """Evidence policy, then -- ONLY where it left the product unresolved -- a measured host shelf.
+    """Evidence policy, then -- ONLY where it left the product unresolved -- a measured host shelf,
+    then an explicit lip title (`_explicit_lip_title_leaf`).
 
     Structural no-regression: anything the evidence policy resolves to a leaf, and every
     deliberate refusal (""), is returned untouched. The measured shelf fills only a coarse
@@ -1595,6 +1652,10 @@ def _resolve_category_unguarded(*, product_type: Optional[str], title: Optional[
     leaf = _measured_host_type_leaf(domain=domain, product_type=product_type, title=title)
     if leaf:
         return leaf, CATEGORY_CONFIDENCE_MEASURED_HOST_TYPE
+    # Last, and on the same terms as the shelf: fills only what everything above left unresolved.
+    leaf = _explicit_lip_title_leaf(product_type=product_type, title=title)
+    if leaf:
+        return leaf, CATEGORY_CONFIDENCE_EXPLICIT_TITLE
     return path, confidence
 
 
@@ -1605,8 +1666,9 @@ def _resolve_category_by_evidence(*, product_type: Optional[str], title: Optiona
     confidence semantics. Deliberately replace its storefront-area veto: strong
     per-product evidence can disagree with a COARSE storefront shelf (MISSHA tools
     were all labelled skincare). An explicit taxonomy leaf remains protected.
-    Title evidence has only two narrow doors: a tool noun suffix without formula
+    Title evidence has only two narrow doors here: a tool noun suffix without formula
     context, and an explicit lip-oil title refining the measured generic lip shelves.
+    (A third, `_explicit_lip_title_leaf`, runs after the measured shelf, on unresolved rows only.)
     """
     from services.pdp_category_classifier import CATEGORY_PATTERNS, classify
     fallback = str(flag_path or "").strip().strip("/").lower()
