@@ -632,6 +632,8 @@ async def test_the_attribution_hook_is_called_once_with_the_orders_own_numbers(
         "partner_reported": True,
         "purchase_id": purchase_id,
         "reap_checkout_id": "chk_7f3a",
+        # The agent whose authenticated call opened the purchase is what the order is credited to.
+        "agent_id": "agent_one",
     }
     assert isinstance(call["converted_at"], datetime)
 

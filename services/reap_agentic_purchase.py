@@ -2777,6 +2777,9 @@ async def _close_attribution(purchase: Mapping[str, Any]) -> bool:
                 "partner_reported": True,
                 "purchase_id": purchase.get("id"),
                 "reap_checkout_id": purchase.get("reap_checkout_id"),
+                # The agent whose authenticated call opened this purchase. The edge is credited
+                # to it; see commerce_attribution_service._trusted_agent_id.
+                "agent_id": purchase.get("agent_id"),
             },
             converting_shop_domain=converting_shop,
             is_self_report=False,
