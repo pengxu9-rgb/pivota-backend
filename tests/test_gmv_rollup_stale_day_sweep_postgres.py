@@ -260,6 +260,119 @@ async def test_a_change_just_before_a_rollup_is_rerolled_in_case_the_rollup_miss
     assert _sums(await _rollup(db))["r"] == (2_500 if stale else 0)
 
 
+async def _groups(db, day=DAY, merchant=MERCHANT):
+    rows = await db.fetch_all(
+        "SELECT agent_id, gross_attributed_gmv_cents g, net_attributed_gmv_cents n, take_amount_cents t "
+        "FROM gmv_attribution_daily WHERE date = :d AND merchant_id = :m ORDER BY agent_id",
+        {"d": day, "m": merchant},
+    )
+    return [(r["agent_id"], r["g"], r["n"], r["t"]) for r in rows]
+
+
+async def test_an_edge_that_moved_agent_is_billed_once_after_the_reroll(db):
+    """upsert_order_attribution_edge rewrites an edge's agent_id at payment time. A re-roll writes the
+    new agent's group; the old group must be zeroed, or the day bills the same gross twice (review of
+    #2283)."""
+    from services import gmv_aggregation_service as gmv
+
+    await _edge(db, edge_id="cae_1", order_id="ord_1", gross=10_000, created_at=_at(DAY, 12))
+    await _edge(db, edge_id="cae_2", order_id="ord_2", gross=3_000, created_at=_at(DAY, 13), agent="agent_3")
+    await _nightly(db)
+    assert await _groups(db) == [("agent_1", 10_000, 10_000, 1_000), ("agent_3", 3_000, 3_000, 300)]
+    await db.execute(
+        "UPDATE commerce_attribution_edges SET agent_id = 'agent_2', updated_at = :at WHERE edge_id = 'cae_1'",
+        {"at": datetime.now(timezone.utc) - timedelta(hours=2)},
+    )
+
+    assert await gmv.reroll_stale_days() == {"stale_days": 1, "recomputed": 1}
+    assert await _groups(db) == [
+        ("agent_1", 0, 0, 0), ("agent_2", 10_000, 10_000, 1_000), ("agent_3", 3_000, 3_000, 300),
+    ]
+    # Converged: the zeroed row is not rewritten again.
+    zeroed_at = await db.fetch_val(
+        "SELECT updated_at FROM gmv_attribution_daily WHERE agent_id = 'agent_1'"
+    )
+    await gmv.recompute_for_date(DAY, MERCHANT)
+    assert await db.fetch_val(
+        "SELECT updated_at FROM gmv_attribution_daily WHERE agent_id = 'agent_1'"
+    ) == zeroed_at
+
+
+async def test_the_nightly_rollup_also_zeroes_a_group_its_edges_left(db):
+    """The same double count through the all-merchant path: a refund's re-roll wrote yesterday early,
+    then the edge moved agent before the nightly run."""
+    from services import gmv_aggregation_service as gmv
+
+    await _edge(db, edge_id="cae_1", order_id="ord_1", gross=10_000, created_at=_at(DAY, 12))
+    await _edge(db, edge_id="cae_o", order_id="ord_o", gross=2_000, created_at=_at(DAY, 12), merchant="m_other")
+    await _nightly(db)
+    await db.execute("UPDATE commerce_attribution_edges SET agent_id = 'agent_2' WHERE edge_id = 'cae_1'")
+
+    await gmv.aggregate_daily(DAY)
+    assert await _groups(db) == [("agent_1", 0, 0, 0), ("agent_2", 10_000, 10_000, 1_000)]
+    assert await _groups(db, merchant="m_other") == [("agent_1", 2_000, 2_000, 200)]
+
+
+async def test_a_moved_edge_on_an_invoiced_day_leaves_every_billed_row_alone(db):
+    from services import gmv_aggregation_service as gmv
+
+    await _edge(db, edge_id="cae_1", order_id="ord_1", gross=10_000, created_at=_at(DAY, 12))
+    await _nightly(db)
+    await db.execute(
+        "INSERT INTO invoices (merchant_id, billing_period_start, billing_period_end, status, billing_run_id) "
+        "VALUES (:m, :s, :e, 'finalized', 1)",
+        {"m": MERCHANT, "s": DAY - timedelta(days=3), "e": DAY},
+    )
+    await db.execute("UPDATE commerce_attribution_edges SET agent_id = 'agent_2', updated_at = NOW()")
+
+    assert await gmv.reroll_stale_days() == {"stale_days": 1, "invoiced_period_manual_credit": 1}
+    await gmv.aggregate_daily(DAY)
+    assert await _groups(db) == [("agent_1", 10_000, 10_000, 1_000)]
+
+
+async def test_an_unfinished_run_freezes_a_reroll_but_not_a_first_rollup(db):
+    """#2280 freezes a day an unfinished billing run covers, for a RE-ROLL only: its draft already
+    holds the day's lines. A day never rolled up has no lines in any draft, so the sweep writing it is
+    a first roll-up, like the nightly job's (review of #2283)."""
+    from services import gmv_aggregation_service as gmv
+
+    await db.execute(
+        "INSERT INTO billing_runs (period_start, period_end, idempotency_key, status) "
+        "VALUES (:s, :e, 'open-run', 'failed')",
+        {"s": DAY - timedelta(days=5), "e": DAY + timedelta(days=1)},
+    )
+    missed = DAY - timedelta(days=1)
+    await _edge(db, edge_id="cae_missed", order_id="ord_m", gross=4_000, created_at=_at(missed, 12),
+                updated_at=datetime.now(timezone.utc) - timedelta(hours=2))
+    await _edge(db, edge_id="cae_rolled", order_id="ord_r", gross=10_000, created_at=_at(DAY, 12))
+    await _nightly(db)
+    await db.execute(
+        "UPDATE commerce_attribution_edges SET refund_amount_cents = 2500, updated_at = :at "
+        "WHERE edge_id = 'cae_rolled'",
+        {"at": datetime.now(timezone.utc) - timedelta(hours=2)},
+    )
+
+    assert await gmv.reroll_stale_days() == {
+        "stale_days": 2, "recomputed": 1, "invoiced_period_manual_credit": 1,
+    }
+    assert _sums(await _rollup(db, missed))["g"] == 4_000  # first roll-up: written
+    assert _sums(await _rollup(db))["r"] == 0  # re-roll under the unfinished run: frozen
+
+
+async def test_two_missed_nightly_runs_still_heal_an_early_morning_edge(db):
+    """An edge created at 01:00 on d is first eligible at d+1 02:00. With d+1 and d+2 missed, the
+    d+3 02:00 run must still see it (review of #2283: a 3-day window started at d 02:00)."""
+    from services import gmv_aggregation_service as gmv
+
+    d = TODAY - timedelta(days=3)
+    await _edge(db, edge_id="cae_early", order_id="ord_e", gross=5_000, created_at=_at(d, 0, 1))
+
+    assert await gmv.reroll_stale_days(now=_at(d + timedelta(days=3), 2, 30)) == {
+        "stale_days": 1, "recomputed": 1,
+    }
+    assert _sums(await _rollup(db, d))["g"] == 5_000
+
+
 # --- ... and leaves billed, fresh and current days alone -------------------------------------
 
 

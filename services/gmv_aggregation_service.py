@@ -120,6 +120,39 @@ LIMIT 1
 """
 
 
+# A merchant-day that has been rolled up before. The unfinished-run freeze applies to a RE-ROLL
+# only (above). A day with no rows was never read by any billing run, so writing it is a first
+# roll-up, as the nightly job's is, even when the re-roll path (a refund, the stale-day sweep)
+# writes it.
+_MERCHANT_DAY_ROLLED_QUERY = """
+SELECT 1 AS hit FROM gmv_attribution_daily
+WHERE date = CAST(:date AS DATE) AND merchant_id = CAST(:merchant_id AS TEXT)
+LIMIT 1
+"""
+
+# The day's groups this roll-up did not write, zeroed. The upsert only touches groups the edges
+# still form. An edge that moved to another agent or partner (upsert_order_attribution_edge rewrites
+# agent_id at payment time), or became inferred, would otherwise leave its old group billing the
+# same gross twice (review of #2283). Every upsert above stamped NOW(), the transaction's start, so
+# `updated_at < NOW()` is exactly the rows this run did not write. Frozen merchants are left as
+# billed. Zeroed, not deleted: an invoice item or settlement may already name the row's id.
+_ZERO_UNWRITTEN_GROUPS_QUERY = """
+UPDATE gmv_attribution_daily
+SET gross_attributed_gmv_cents = 0,
+    refund_amount_cents = 0,
+    net_attributed_gmv_cents = 0,
+    take_amount_cents = 0,
+    updated_at = NOW()
+WHERE date = CAST(:date AS DATE)
+  AND (CAST(:merchant_id AS TEXT) IS NULL OR merchant_id = CAST(:merchant_id AS TEXT))
+  AND NOT (merchant_id = ANY(CAST(:frozen AS TEXT[])))
+  AND updated_at < NOW()
+  AND (gross_attributed_gmv_cents <> 0 OR refund_amount_cents <> 0
+       OR net_attributed_gmv_cents <> 0 OR take_amount_cents <> 0)
+RETURNING id
+"""
+
+
 class BilledDayCheckFailed(RuntimeError):
     """The invoice check under the day lock failed; the day was not re-rolled (fail closed)."""
 
@@ -224,8 +257,9 @@ async def _aggregate_for_date(
 ) -> dict[str, Any]:
     """Roll one day up under its exclusive lock, leaving every INVOICED merchant's rows as billed.
 
-    Returns {"written": rows upserted, "invoiced_merchants": merchants left as billed}. Raises
-    BilledDayCheckFailed if the invoice check fails (the transaction is aborted, nothing written).
+    Returns {"written": rows upserted, "zeroed": stale groups zeroed, "invoiced_merchants": merchants
+    left as billed}. Raises BilledDayCheckFailed if the invoice check fails (the transaction is
+    aborted, nothing written).
     """
     written = 0
     async with database.transaction():
@@ -239,7 +273,14 @@ async def _aggregate_for_date(
                     _INVOICED_MERCHANTS_ON_DAY_QUERY, {"date": target_date, "merchant_id": merchant_id}
                 )
             }
-            if freeze_unfinished_runs and merchant_id is not None and merchant_id not in invoiced:
+            if (
+                freeze_unfinished_runs
+                and merchant_id is not None
+                and merchant_id not in invoiced
+                and await database.fetch_one(
+                    _MERCHANT_DAY_ROLLED_QUERY, {"date": target_date, "merchant_id": merchant_id}
+                ) is not None
+            ):
                 unfinished = await database.fetch_one(
                     _UNFINISHED_RUN_COVERS_MERCHANT_DAY_QUERY,
                     {"date": target_date, "merchant_id": merchant_id},
@@ -279,7 +320,12 @@ async def _aggregate_for_date(
             )
             written += 1
 
-    return {"written": written, "invoiced_merchants": sorted(invoiced)}
+        zeroed = await database.fetch_all(
+            _ZERO_UNWRITTEN_GROUPS_QUERY,
+            {"date": target_date, "merchant_id": merchant_id, "frozen": sorted(invoiced)},
+        )
+
+    return {"written": written, "zeroed": len(zeroed), "invoiced_merchants": sorted(invoiced)}
 
 
 async def aggregate_daily(date: date) -> int:
@@ -414,10 +460,12 @@ async def recompute_days_for_edges(edges: Iterable[Mapping[str, Any]]) -> dict[t
 #
 # The lookback bounds how long a change is retried. A day an invoice covers is never rewritten, so
 # its rows stay older than its edges; with a short lookback it is reported (by
-# recompute_days_for_edges, as a manual credit) on a few nights, not every night forever. Three
-# days survives two missed nightly runs. After a longer outage, call reroll_stale_days with a
-# larger lookback_days by hand.
-STALE_SWEEP_LOOKBACK_DAYS = 3
+# recompute_days_for_edges, as a manual credit) on a few nights, not every night forever. A change
+# to day D is first eligible at the 02:00 run of D+1 (the sweep leaves today alone), and one made
+# at D 00:00 must still be inside the window at D+3 02:00 to survive two missed runs: that is 3 days
+# and 2 hours, so 4 (review of #2283). After a longer outage, call reroll_stale_days with a larger
+# lookback_days by hand.
+STALE_SWEEP_LOOKBACK_DAYS = 4
 STALE_SWEEP_MAX_DAYS = 500
 
 _STALE_DAY_EDGES_QUERY = """
@@ -498,7 +546,16 @@ async def run_nightly_rollup(*, now: Optional[datetime] = None) -> dict[str, int
         logger.info("gmv_aggregation_daily date=%s rollup_rows=%d", yesterday.isoformat(), rows)
     except Exception as exc:  # noqa: BLE001 -- re-raised below, after the sweep
         rollup_error = exc
-    summary = await reroll_stale_days(now=now)
+        logger.warning(
+            "gmv_aggregation_daily_failed date=%s error_type=%s error=%s",
+            yesterday.isoformat(), type(exc).__name__, str(exc)[:200],
+        )
+    try:
+        summary = await reroll_stale_days(now=now)
+    except Exception as sweep_exc:
+        if rollup_error is not None:
+            raise sweep_exc from rollup_error  # both reach the traceback
+        raise
     # WARNING when a stale day was left stale: prod drops a module logger's INFO.
     log = logger.info if summary["stale_days"] == summary.get(RECOMPUTED, 0) else logger.warning
     log("gmv_rollup_stale_day_sweep %s", summary)

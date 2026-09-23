@@ -42,6 +42,12 @@ class FakeDB:
     async def fetch_all(self, query: str, values: Optional[dict[str, Any]] = None):
         params = dict(values or {})
         self.fetch_all_calls.append((str(query), params))
+        if "UPDATE gmv_attribution_daily" in str(query):
+            # Zeroes the day's groups this run did not write; exercised on real Postgres in
+            # tests/test_gmv_rollup_stale_day_sweep_postgres.py.
+            assert self.transaction_count > 0, "the zeroing must run inside the roll-up's transaction"
+            self.statements.append("zero_unwritten")
+            return []
         if "FROM invoices" in str(query):
             # The billed-day check, which must run under the day lock.
             assert self.transaction_count > 0, "the invoice check must run inside the transaction"
@@ -60,6 +66,11 @@ class FakeDB:
         params = dict(values or {})
         self.fetch_one_calls.append((str(query), params))
         sql = str(query)
+        if "FROM gmv_attribution_daily" in sql:
+            # Has this merchant-day been rolled up before? Only a re-roll can be frozen by a run.
+            self.statements.append("rolled_check")
+            rolled = any(k[0] == params["date"] and k[1] == params["merchant_id"] for k in self.daily)
+            return {"hit": 1} if rolled else None
         if "FROM billing_runs" in sql:
             # A re-roll's unfinished-run check (never the nightly job's).
             self.statements.append("unfinished_run_check")
@@ -504,15 +515,20 @@ async def test_the_day_lock_is_taken_before_the_rollup_read(monkeypatch: pytest.
     fake_db = FakeDB(edges=[_edge(gross=10_000, created_at=datetime(2026, 5, 21, 12, tzinfo=timezone.utc))])
     monkeypatch.setattr(service, "database", fake_db)
 
-    await service.recompute_for_date(target_date, "merch_1")
     await service.aggregate_daily(target_date)
+    await service.recompute_for_date(target_date, "merch_1")
 
     # Keyed on the day alone, so the all-merchant job and a one-merchant recompute serialise. The
     # billed-day check runs after the lock and before the read: checked outside the lock, it races
-    # the invoice run. Only the refund re-roll bounds its wait; the nightly job does not.
+    # the invoice run. Only the refund re-roll bounds its wait; the nightly job does not. Only a
+    # re-roll of a day already rolled checks for an unfinished run. The groups a run did not write
+    # are zeroed last, inside the same lock.
     lock = f"lock:{target_date}"
-    assert fake_db.statements == ["lock_timeout", lock, "invoice_check", "unfinished_run_check", "rollup_read",
-                                  lock, "invoice_check", "rollup_read"]
+    assert fake_db.statements == [
+        lock, "invoice_check", "rollup_read", "zero_unwritten",
+        "lock_timeout", lock, "invoice_check", "rolled_check", "unfinished_run_check", "rollup_read",
+        "zero_unwritten",
+    ]
 
 
 @pytest.mark.asyncio
@@ -634,7 +650,7 @@ async def test_reroll_stale_days_hands_the_changed_edges_to_the_guarded_recomput
     assert summary == {"stale_days": 3, "recomputed": 2, "invoiced_period_manual_credit": 1}
     assert seen["edges"] is edges
     assert seen["values"] == {
-        "changed_since": datetime(2026, 5, 18, 23, tzinfo=timezone.utc),
+        "changed_since": datetime(2026, 5, 17, 23, tzinfo=timezone.utc),
         "created_before": datetime(2026, 5, 21, tzinfo=timezone.utc),
         "max_days": service.STALE_SWEEP_MAX_DAYS,
     }
@@ -711,3 +727,27 @@ async def test_a_day_the_sweep_could_not_heal_is_logged_as_a_warning(
 
     sweep_logs = [r for r in caplog.records if "gmv_rollup_stale_day_sweep" in r.getMessage()]
     assert [r.levelno for r in sweep_logs] == [logging.WARNING]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_sweep_after_a_failed_rollup_keeps_both_errors(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    async def down() -> int:
+        raise ConnectionError("rollup down")
+
+    _nightly_stubs(monkeypatch, rollup=down)
+
+    async def sweep_down(*, now: datetime) -> dict[str, int]:
+        raise TimeoutError("sweep down")
+
+    monkeypatch.setattr(service, "reroll_stale_days", sweep_down)
+    with caplog.at_level(logging.WARNING, logger="services.gmv_aggregation_service"):
+        with pytest.raises(TimeoutError) as raised:
+            await service.run_nightly_rollup(now=datetime(2026, 5, 22, tzinfo=timezone.utc))
+
+    assert isinstance(raised.value.__cause__, ConnectionError)
+    assert any("gmv_aggregation_daily_failed" in r.getMessage() and "rollup down" in r.getMessage()
+               for r in caplog.records)
