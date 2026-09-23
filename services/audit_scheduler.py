@@ -125,6 +125,7 @@ _JOB_RUN_DEADLINES = {
     "identity_reconcile_sweep": 7200,
     "gmv_aggregation_daily": 3600,
     "agent_share_accrual_daily": 3600,
+    "gmv_invoice_credit_daily": 3600,
     "audit_stability_canary": 1800,
     # 6-hourly catalog sweeps (bounded per run, stalest-first)
     "pdp_scope_backfill": 7200,
@@ -941,6 +942,29 @@ async def start_scheduler() -> None:
             max_instances=1,
         )
 
+        # GMV invoice credits, daily at 02:15 UTC: what recent refunds took off days already invoiced,
+        # computed as PENDING credits. Nothing reaches Stripe here; an admin approves each credit
+        # (/admin/billing/invoice-credits). Also decides the channel partner's share of issued
+        # credits once their period is settled. With no invoices (T7 is paused) it writes nothing.
+        # Runs before agent_share_accrual_daily (02:30) so a credit issued that day nets first.
+        async def _run_gmv_invoice_credits() -> None:
+            from services.gmv_invoice_credits import run_daily
+
+            summary = await run_daily()
+            logger.info("audit_scheduler: gmv_invoice_credit_daily -> %s", summary)
+
+        _add_job(
+            _run_gmv_invoice_credits,
+            "cron",
+            hour=2,
+            minute=15,
+            id="gmv_invoice_credit_daily",
+            replace_existing=True,
+            misfire_grace_time=900,
+            coalesce=True,
+            max_instances=1,
+        )
+
         # T7 — invoice generation, monthly on day 2 03:00 UTC (PAUSED).
         # Registered paused so Stage 4 promotion is `scheduler.resume_job(
         # "invoice_generation_monthly")` — no code change, no redeploy.
@@ -1382,6 +1406,7 @@ async def start_scheduler() -> None:
             "+ metering_expire_reservations (5min, ACTIVE) "
             "+ stamp_attribution_reaper (5min, ACTIVE) "
             "+ gmv_aggregation_daily (02:00 UTC, ACTIVE) "
+            "+ gmv_invoice_credit_daily (02:15 UTC, pending credits only) "
             "+ agent_share_accrual_daily (02:30 UTC, flag AGENT_SHARE_ACCRUAL_ENABLED) "
             "+ invoice_generation_monthly (day 2 03:00 UTC, PAUSED) "
             "+ partner_settlement_monthly (day 3 04:00 UTC, PAUSED) "

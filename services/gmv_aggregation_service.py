@@ -110,8 +110,9 @@ WHERE billing_run_id IS NOT NULL
 # and has no invoice for the merchant yet. A failed attempt leaves Stripe draft items behind with
 # no local record (its transaction rolled back), and the resume reuses that draft. Re-rolling the
 # day in between makes the resume bill against a draft that still holds the old lines, silently
-# (review of #2280). Freezing keeps local and Stripe in agreement; the refund is logged for a
-# manual credit like an invoiced day. Only a RE-ROLL checks this: the nightly first roll-up of a
+# (review of #2280). Freezing keeps local and Stripe in agreement. Once the run invoices the day
+# (pre-refund), services/gmv_invoice_credits' daily job computes the credit the refund is owed,
+# as for any invoiced day. Only a RE-ROLL checks this: the nightly first roll-up of a
 # day must still write it, or a run over an open month (the debug billing route) would stop every
 # later day of that month from ever being billed. Completed and cancelled runs left no draft.
 _UNFINISHED_RUN_COVERS_MERCHANT_DAY_QUERY = """
@@ -258,6 +259,12 @@ async def _fetch_promo_period_until(merchant_id: str) -> datetime | None:
     return promo_period_until
 
 
+def take_cents(net_cents: int, take_rate_bp: int) -> int:
+    """Pivota's take on a net amount. The ONE formula: the rollup bills with it, and a GMV invoice
+    credit recomputes what a day should have billed with it (services/gmv_invoice_credits.py)."""
+    return max(int(net_cents), 0) * int(take_rate_bp) // 10000
+
+
 async def _take_rate_bp_for_merchant(merchant_id: str) -> int:
     promo_period_until = await _fetch_promo_period_until(merchant_id)
     if _promo_is_active(promo_period_until):
@@ -316,7 +323,7 @@ async def _aggregate_for_date(
             net = max(gross_sum - refund_sum, 0)
             row_merchant_id = str(_get(row, "merchant_id"))
             take_rate_bp = await _take_rate_bp_for_merchant(row_merchant_id)
-            take_amount_cents = net * take_rate_bp // 10000
+            take_amount_cents = take_cents(net, take_rate_bp)
 
             await database.execute(
                 _UPSERT_ROLLUP_QUERY,
@@ -412,11 +419,16 @@ async def _recompute_day_unless_invoiced(day: date, merchant_id: str, edge_ids: 
         )
         return RECOMPUTE_FAILED
     if outcome == INVOICED_PERIOD_MANUAL_CREDIT:
-        # The edges name what to credit: each carries its refund_ids and refund_amount_cents.
+        # The day stays as billed; what the refund took off it is owed back as a GMV invoice credit,
+        # computed here as `pending` and issued to Stripe only after an admin approves it.
+        from services.gmv_invoice_credits import compute_credits_for_day_best_effort
+
+        credits = await compute_credits_for_day_best_effort(day, merchant_id)
         logger.warning(
             "gmv_rollup_recompute_skipped_invoiced_day merchant_id=%s date=%s edge_ids=%s: "
-            "rollup left as billed, manual credit required",
+            "rollup left as billed; pending invoice credits=%s",
             merchant_id, day.isoformat(), edge_ids,
+            (credits or {}).get("credits") if credits is not None else "compute_failed",
         )
     return outcome
 
@@ -431,9 +443,9 @@ async def recompute_days_for_edges(edges: Iterable[Mapping[str, Any]]) -> dict[t
     A day an invoice already covers for the merchant is left as billed, checked under the day lock
     the invoice run also holds while it bills: invoice items point at its rollup rows
     and partner settlement reads them, so rewriting it would make the rollup disagree with the
-    invoice the merchant received. There is no credit-note path; the refund stays on the edge
-    and the day is logged for a manual credit. If the invoice check fails, the day is not
-    re-rolled either.
+    invoice the merchant received. The refund stays on the edge, and what it took off the billed
+    take is computed as a pending GMV invoice credit (services/gmv_invoice_credits.py) for an admin
+    to approve. If the invoice check fails, the day is not re-rolled either.
 
     Call it AFTER the refund has committed, never inside that transaction: a failed statement
     here would leave the surrounding transaction aborted and take the refund with it. It never
