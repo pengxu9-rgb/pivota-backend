@@ -88,16 +88,19 @@ BUCKET_ORDER = [
     "not_on_rakuten",
 ]
 
-# Second-level suffixes where the registrable domain is three labels, not two. Deliberately
-# small: it only has to be right for the hosts a beauty catalog actually sends buyers to, and an
-# unknown suffix degrades to "two labels", which can only merge hosts, never invent a match
-# between two unrelated sites under the same suffix (the suffix itself is never a key).
+# Second-level suffixes where the registrable domain is three labels, not two. The list is not a
+# public-suffix list; `site_key` also treats any second label in GENERIC_SECOND_LABELS as part of
+# the suffix (co.za, us.com, gov.uk, ...). That rule is what keeps a suffix from ever becoming a key
+# and merging unrelated sites (review of #2269: us.com and co.za did before it).
 MULTI_LABEL_SUFFIXES = frozenset(
     {
         "co.kr", "or.kr", "ne.kr", "com.sg", "edu.sg", "co.uk", "org.uk", "com.au", "net.au",
         "co.jp", "ne.jp", "or.jp", "com.my", "com.hk", "com.tw", "co.nz", "com.br", "com.cn",
         "com.ph", "co.id", "co.th", "com.vn", "com.mx", "co.in", "com.tr",
     }
+)
+GENERIC_SECOND_LABELS = frozenset(
+    {"com", "co", "net", "org", "ac", "go", "or", "ne", "gov", "edu", "us", "gen", "ltd", "plc", "nom", "biz"}
 )
 # Hosting platforms where every subdomain is a DIFFERENT merchant. Collapsing these to the
 # platform domain would credit one store's program to every store on the platform.
@@ -157,7 +160,7 @@ def site_key(value: Optional[str]) -> str:
     last2 = ".".join(labels[-2:])
     if last2 in SHARED_PLATFORM_DOMAINS:
         return ".".join(labels[-3:])
-    if last2 in MULTI_LABEL_SUFFIXES:
+    if last2 in MULTI_LABEL_SUFFIXES or labels[-2] in GENERIC_SECOND_LABELS:
         return ".".join(labels[-3:])
     return last2
 
@@ -320,6 +323,15 @@ PROD_QUERIES: Dict[str, str] = {
         "LEFT JOIN index_pipeline_state ips ON ips.content_key = p.content_key "
         "WHERE o.suppressed_at IS NULL AND " + _LIVE_P + " GROUP BY 1, 2, 3"
     ),
+    # Distinct products per checkout host. offer_pairs is also split by market, so summing it
+    # counts a product offered in two markets on one host twice (review of #2269).
+    "host_products": (
+        "SELECT " + _HOST_O + " host, count(DISTINCT p.product_key) n, "
+        "count(DISTINCT p.product_key) FILTER (WHERE ips.serving_eligible) se "
+        "FROM catalog_offers o JOIN catalog_products p ON p.product_key = o.product_key "
+        "LEFT JOIN index_pipeline_state ips ON ips.content_key = p.content_key "
+        "WHERE o.suppressed_at IS NULL AND " + _LIVE_P + " GROUP BY 1"
+    ),
     # Products with no live offer still name a store; counted on the product's own host.
     "product_only_pairs": (
         "SELECT " + _HOST_P + " host, " + _NB + " nb, count(*) n, "
@@ -365,13 +377,17 @@ def build_prod_program() -> str:
         "async def main():\n"
         "    await database.connect()\n"
         "    o = {}\n"
-        "    for k, sql in Q.items():\n"
-        "        t = time.time()\n"
-        "        try:\n"
-        "            o[k] = [dict(r) for r in await database.fetch_all(sql)]\n"
-        "        except Exception as e:\n"
-        "            o[k] = 'ERR ' + type(e).__name__ + ' ' + str(e)[:300]\n"
-        "        print('QDONE', k, round(time.time() - t, 1), len(o[k]) if isinstance(o[k], list) else o[k][:200], flush=True)\n"
+        # One connection, made read-only at the database, so the guarantee does not rest on the
+        # queries alone. Autocommit statements, so one failing query cannot abort the others.
+        "    async with database.connection() as conn:\n"
+        "        await conn.execute('SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY')\n"
+        "        for k, sql in Q.items():\n"
+        "            t = time.time()\n"
+        "            try:\n"
+        "                o[k] = [dict(r) for r in await conn.fetch_all(sql)]\n"
+        "            except Exception as e:\n"
+        "                o[k] = 'ERR ' + type(e).__name__ + ' ' + str(e)[:300]\n"
+        "            print('QDONE', k, round(time.time() - t, 1), len(o[k]) if isinstance(o[k], list) else o[k][:200], flush=True)\n"
         "    blob = json.dumps(o, default=str, separators=(',', ':'))\n"
         "    z = base64.b64encode(zlib.compress(blob.encode(), 9)).decode()\n"
         "    parts = [z[i:i+" + str(CHUNK_BYTES) + "] for i in range(0, len(z), " + str(CHUNK_BYTES) + ")]\n"
@@ -554,6 +570,40 @@ async def run_rakuten(out_dir: Path) -> None:
 # Stage 3: storefront signals
 # ------------------------------------------------------------------------------------------
 
+MAX_REDIRECTS = 5
+
+
+def is_public_hostname(host: str) -> bool:
+    """A DNS name that is not localhost and not an IP literal. Hosts come from our own catalog, but
+    a redirect chain is the site's to choose, so every hop is held to this."""
+    import ipaddress
+
+    h = (host or "").strip().lower().rstrip(".")
+    if not h or "." not in h or h == "localhost" or h.endswith(".localhost") or h.endswith(".internal"):
+        return False
+    try:
+        ipaddress.ip_address(h.strip("[]"))
+        return False
+    except ValueError:
+        return True
+
+
+async def fetch_public_https(client: Any, url: str, headers: Dict[str, str]) -> Any:
+    """GET following redirects by hand: https only, public hostnames only, at most MAX_REDIRECTS."""
+    from urllib.parse import urljoin
+
+    for _ in range(MAX_REDIRECTS + 1):
+        parsed = urlparse(url)
+        if parsed.scheme != "https" or not is_public_hostname(parsed.hostname or ""):
+            raise ValueError("redirect_to_non_public_or_non_https")
+        r = await client.get(url, headers=headers)
+        if r.status_code in (301, 302, 303, 307, 308) and r.headers.get("location"):
+            url = urljoin(str(r.url), r.headers["location"])
+            continue
+        return r
+    raise ValueError("too_many_redirects")
+
+
 async def run_signals(out_dir: Path, hosts: List[str], concurrency: int) -> None:
     import httpx
 
@@ -567,21 +617,28 @@ async def run_signals(out_dir: Path, hosts: List[str], concurrency: int) -> None
 
     async def probe(client: Any, host: str) -> None:
         async with sem:
+            if not is_public_hostname(host):
+                results[host] = {"status": None, "networks": [], "verdict": "skipped_not_public"}
+                return
             try:
-                r = await client.get(f"https://{host}/", headers=headers)
+                r = await fetch_public_https(client, f"https://{host}/", headers)
                 html = r.text[:2_000_000]
+                final_host = normalize_host(str(r.url))
+                # A tag found after a redirect to ANOTHER site is that site's, not this host's.
+                same_site = site_key(final_host) == site_key(host)
                 results[host] = {
                     "status": r.status_code,
-                    "final_host": normalize_host(str(r.url)),
-                    "networks": detect_networks(html) if r.status_code < 400 else [],
+                    "final_host": final_host,
+                    "networks": detect_networks(html) if r.status_code < 400 and same_site else [],
                     # A 403/429/503 here is a bot wall, not a finding about the program.
-                    "verdict": "fetched" if r.status_code < 400 else "unverifiable",
+                    "verdict": ("fetched" if same_site else "redirected_offsite")
+                    if r.status_code < 400 else "unverifiable",
                 }
             except Exception as e:  # transport failure = unverifiable, never "no program"
                 results[host] = {"status": None, "networks": [], "verdict": "unverifiable",
                                  "error": type(e).__name__}
 
-    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+    async with httpx.AsyncClient(timeout=20, follow_redirects=False) as client:
         await asyncio.gather(*(probe(client, h) for h in hosts))
     (out_dir / "signals.json").write_text(json.dumps(results, indent=1))
     found = sum(1 for v in results.values() if v["networks"])
@@ -630,9 +687,24 @@ def build_host_table(inv: dict) -> Dict[str, dict]:
         hosts[h]["seeds"] += int(r["n"])
         hosts[h]["markets"][r.get("mk") or ""] += 0
         hosts[h]["seed_partner_types"][r["pt"] or "none"] += int(r["n"])
+    distinct = inv.get("host_products")
+    if isinstance(distinct, list):
+        # Exact per-host counts replace the market-split sums; product-only rows are added back.
+        exact: Dict[str, List[int]] = defaultdict(lambda: [0, 0])
+        for r in distinct:
+            e = exact[normalize_host(r["host"])]
+            e[0] += int(r["n"])
+            e[1] += int(r["se"])
+        for r in _rows(inv, "product_only_pairs"):
+            e = exact[normalize_host(r["host"])]
+            e[0] += int(r["n"])
+            e[1] += int(r["se"])
+        for h, (n, se) in exact.items():
+            hosts[h]["products"], hosts[h]["serving"] = n, se
     hosts.pop("", None)
-    # NOTE: a product with offers on two hosts counts once per host; a brand's product total
-    # across hosts can therefore exceed its distinct products. Per-host numbers are exact.
+    # Per-host products/serving are distinct counts when the inventory carries host_products (an
+    # older inventory falls back to sums that count a product once per market). Brand counts are
+    # per (host, brand, market) and a brand's total across hosts can exceed its distinct products.
     return hosts
 
 

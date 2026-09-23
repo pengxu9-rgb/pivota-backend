@@ -26,6 +26,10 @@ from scripts import affiliate_coverage_census as census
         ("lookfantastic.com.sg", "lookfantastic.com.sg"),
         # Every subdomain of a hosting platform is a different merchant: never collapse.
         ("brand-a.myshopify.com", "brand-a.myshopify.com"),
+        # An unlisted two-part country suffix is never itself a key (review of #2269).
+        ("themedicube.us.com", "themedicube.us.com"),
+        ("shop.reddane.co.za", "reddane.co.za"),
+        ("reddane.co.za", "reddane.co.za"),
         ("", ""),
         (None, ""),
     ],
@@ -57,6 +61,7 @@ def test_prod_queries_are_read_only():
 def _run_program_against(rows_by_query, monkeypatch):
     """Execute the exact prod program text against a fake `db.database`, capture its log."""
     calls = []
+    session = []
 
     class FakeDB:
         async def connect(self):
@@ -65,7 +70,24 @@ def _run_program_against(rows_by_query, monkeypatch):
         async def disconnect(self):
             pass
 
+        def connection(self):
+            db = self
+
+            class _Conn:
+                async def __aenter__(self):
+                    return db
+
+                async def __aexit__(self, *exc):
+                    return False
+
+            return _Conn()
+
+        async def execute(self, sql):
+            session.append(sql)
+
         async def fetch_all(self, sql):
+            # The session must already be read-only when the first query runs.
+            assert session == ["SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY"]
             calls.append(sql)
             for name, q in census.PROD_QUERIES.items():
                 if q == sql:
@@ -338,3 +360,73 @@ def test_brand_spelling_variants_do_not_turn_a_brand_store_into_a_retailer():
     }
     rep = census.build_report(inv, None, None)
     assert rep["hosts"][0]["kind"] == "brand_store"
+
+
+def test_two_sites_under_an_unlisted_country_suffix_do_not_share_a_key():
+    assert census.site_key("a.co.za") != census.site_key("b.co.za")
+    assert census.site_key("x.us.com") != census.site_key("y.us.com")
+
+
+def test_per_host_counts_are_distinct_products_not_market_sums():
+    inv = {
+        "offer_pairs": [
+            {"host": "arencia.jp", "nb": "arencia", "mk": "JP", "n": 10, "se": 8},
+            {"host": "arencia.jp", "nb": "arencia", "mk": "US", "n": 10, "se": 8},
+        ],
+        "host_products": [{"host": "arencia.jp", "n": 10, "se": 8}],
+        "product_only_pairs": [{"host": "arencia.jp", "nb": "arencia", "n": 2, "se": 0}],
+        "offer_modes": [], "seeds": [], "totals": [{}],
+    }
+    row = census.build_report(inv, None, None)["hosts"][0]
+    assert (row["products"], row["serving"]) == (12, 8)
+    # An older inventory without host_products falls back to the sums.
+    inv.pop("host_products")
+    row = census.build_report(inv, None, None)["hosts"][0]
+    assert (row["products"], row["serving"]) == (22, 16)
+
+
+@pytest.mark.parametrize(
+    "host, public",
+    [("brand.com", True), ("shop.brand.co.kr", True), ("localhost", False), ("x.localhost", False),
+     ("10.0.0.5", False), ("169.254.169.254", False), ("[::1]", False), ("metadata.google.internal", False),
+     ("", False), ("nodots", False)],
+)
+def test_only_public_hostnames_are_probed(host, public):
+    assert census.is_public_hostname(host) is public
+
+
+class _Resp:
+    def __init__(self, url, status=200, location=None, text="<html></html>"):
+        self.url, self.status_code, self.text = url, status, text
+        self.headers = {"location": location} if location else {}
+
+
+class _Client:
+    def __init__(self, chain):
+        self.chain = dict(chain)
+        self.seen = []
+
+    async def get(self, url, headers=None):
+        self.seen.append(url)
+        return self.chain[url]
+
+
+def test_redirects_are_followed_only_to_public_https():
+    ok = _Client({
+        "https://brand.com/": _Resp("https://brand.com/", 301, "https://www.brand.com/"),
+        "https://www.brand.com/": _Resp("https://www.brand.com/", 200),
+    })
+    r = asyncio.run(census.fetch_public_https(ok, "https://brand.com/", {}))
+    assert r.status_code == 200 and ok.seen == ["https://brand.com/", "https://www.brand.com/"]
+
+    for bad in ("http://brand.com/", "https://169.254.169.254/latest", "https://localhost/"):
+        c = _Client({"https://brand.com/": _Resp("https://brand.com/", 302, bad)})
+        with pytest.raises(ValueError):
+            asyncio.run(census.fetch_public_https(c, "https://brand.com/", {}))
+        assert c.seen == ["https://brand.com/"]  # the unsafe hop is never requested
+
+
+def test_a_redirect_loop_stops():
+    loop = _Client({"https://a.com/": _Resp("https://a.com/", 302, "https://a.com/")})
+    with pytest.raises(ValueError, match="too_many_redirects"):
+        asyncio.run(census.fetch_public_https(loop, "https://a.com/", {}))

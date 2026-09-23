@@ -22,19 +22,19 @@ built around making link 4 exist for every merchant we send buyers to.
 
 ## Measured state, prod, 2026-09-23
 
-Read-only one-off jobs; programs in `reports/attribution_chain_2026_09_23/`.
+Read-only one-off jobs. The programs and their output are in the author's local `reports/attribution_chain_2026_09_23/` and are not committed, following this repo's practice for reports.
 
 | Link | Measurement | Verdict |
 |---|---|---|
 | 1 agent | 26 agents, 15 API keys | exists |
-| 2 click minted | `surface_click_events`: **18 rows ever**, 7 with `agent_id`, last 2026-08-27, 1 in the last 30 days | effectively not running |
+| 2 click minted | `surface_click_events`: **18 rows ever**, 7 with a non-empty `agent_id` (at least one is the `'unknown'` sentinel `traffic_taxonomy_service` writes when there is no agent), last 2026-08-27, 1 in the last 30 days | effectively not running |
 | 2 | `offers.resolve` mints a click id per offer (`agent_shop_gateway.py:4748`), but the row is written **only when a buyer hits `/r`**. The ctx it signs carries no agent id. An agent that hands out the published `pdp_url`/`cart_url` directly produces no click row at all. | gap |
 | 2 | `outbound_click_events`: 46 ever, 1 in the last 30 days (a script UA). `agent_product_events` over 30 days: 188 impressions, 7 clicks. | we cannot see click-outs |
-| 3 carried | Referral URLs carry `pvt_click_id` as a query param, cart links carry `attributes[pivota_click_id]`, the UCP stamp has **no production caller**, and Reap uses a cart attribute. | carried, but mostly to merchants who never read it |
+| 3 carried | Referral URLs carry `pvt_click_id` as a query param, cart links carry `attributes[pivota_click_id]`, the UCP stamp (`build_attribution`) has **no production caller**, and Reap uses a cart attribute. The warm handoff (`outbound_warm_handoff.py`, off by default) also sends `attribution: {pivota_click_id}` on the merchant's UCP `create_cart`. | carried, but mostly to merchants who never read it |
 | 4 evidence | Closure sources that exist: Shopify `orders/paid` webhook and poller, the WooCommerce poller, the self-report API, and a Reap report. **All four need a connected merchant or a partner.** Connected stores: 17 Shopify + 4 Wix (`merchant_stores`), versus **328 checkout hosts** in the serving catalog. There is no affiliate-network import. | **the break** |
 | 4 | `commerce_attribution_edges`: 15 rows, all one merchant (the test store), 2026-03-30 to 07-10. **0 have `converted_at`**, and 0 carry an external order id. | the loop has never closed a real order |
 | 5 commission | `gmv_attribution_daily`: 2 rows (test store, March), $175 GMV, 5% take. Real invoices: all $0. The take is computed as a flat 10%/5% per merchant (`gmv_aggregation_service.py:149`). A network-paid commission has nowhere to land. | model mismatch |
-| 6 agent share | `agent_payouts` holds only channel-partner rows, with test-dated periods (2036/2047), some failed with "insufficient platform balance". The legacy `commissions`/`merchant_commission_offers` system was retired 2026-05-23. | no agent accrual path |
+| 6 agent share | `agent_payouts` holds only channel-partner rows, several with test-dated periods (2036/2047), some failed with "insufficient platform balance". The legacy `commissions`/`merchant_commission_offers` system was retired 2026-05-23. | no agent accrual path |
 
 **Conclusion:** the attribution machinery exists as parts, but it has never carried one real
 order end to end. The reason isn't a missing affiliate program. For almost every merchant we send
@@ -69,7 +69,7 @@ A per-seller **evidence route** decides the carrier:
 A seller with **no evidence route** is still served, but it is recorded as `unattributable`.
 Nobody should mistake traffic to it for revenue. The coverage census
 (`scripts/affiliate_coverage_census.py`) is the tool that measures how much of the catalog
-falls there. Rakuten is its first adapter, not its premise.
+falls there. Rakuten is its first adapter, not its premise. When D2's network link wrapping lands, the warm-handoff affiliate denylist (`outbound_warm_handoff.AFFILIATE_HOST_SUFFIXES`) must cover every wrapper host it emits. Today it misses CJ's (anrdoezrs.net, jdoqocy.com, ...) and Impact vanity domains.
 
 ### D3. Evidence adapters share one contract
 
@@ -190,10 +190,10 @@ Payment-partner lane first (D6), because that is where the orders will be:
 
 Status, 2026-09-23:
 - **P1** is drafted for Peng to send (not sent).
-- **P2:** #2267 makes a completed purchase's edge carry the purchase's authenticated `agent_id`.
+- **P2:** #2267 (open at the time of writing) makes a completed purchase's edge carry the purchase's authenticated `agent_id`.
   Before it, the variant lane closed with no agent, because it writes no click row. The lane
   itself is still dark: prod `reap_agentic_purchases` = 0 rows.
-- **P4's measuring tool** is #2268, `scripts/agent_attribution_funnel.py`: per-agent issued →
+- **P4's measuring tool** is #2268 (open at the time of writing), `scripts/agent_attribution_funnel.py`: per-agent issued →
   clicked, opened → completed → credited, plus the integrity exceptions. Its prod baseline over
   30 days is 1 link issued, 0 purchases, 0 credited.
 
