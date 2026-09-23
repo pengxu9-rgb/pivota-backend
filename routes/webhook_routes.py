@@ -355,7 +355,8 @@ async def _resolve_stripe_order_for_refund(
 
 
 def _with_decoded_metadata(order: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """The order with `metadata` as a dict, decoded ONCE for every refund consumer.
+    """The order with `metadata` as a dict, decoded ONCE for every refund consumer (and for
+    `_resolve_stripe_order_for_payment_event`'s PaymentIntent lookup, which has the same raw query).
 
     On Postgres `orders.metadata` (a json column) reaches this resolver as its JSON TEXT from
     the raw `SELECT *`, which has no type to decode it. (`get_order` already hands back a
@@ -557,20 +558,16 @@ async def _resolve_stripe_order_for_payment_event(
 
     query = "SELECT * FROM orders WHERE payment_intent_id = :payment_intent_id"
     from db.database import database
-    from db.orders import _coerce_metadata_obj
 
     if payment_intent_id:
         result = await database.fetch_one(query, {"payment_intent_id": payment_intent_id})
         if result:
-            order = _db_row_to_dict(result)
             # The raw `SELECT *` hands `orders.metadata` (a json column) back as its JSON TEXT;
             # the metadata.order_id path below goes through `get_order`, which decodes it.
             # Decode here so both lookups give callers the same shape: the success path reads
             # skip_platform_order_creation / ops_canary off it, and the finalizers treat a
             # non-dict as {}.
-            if isinstance(order, dict) and "metadata" in order:
-                order = {**order, "metadata": _coerce_metadata_obj(order.get("metadata"))}
-            return _scoped(order)
+            return _scoped(_with_decoded_metadata(_db_row_to_dict(result)))
 
     order_hint = ""
     if isinstance(payment_meta, dict):
