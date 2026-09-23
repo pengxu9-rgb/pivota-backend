@@ -124,6 +124,7 @@ async def _affiliate_records(job: Dict[str, Any], payload: Dict[str, Any]) -> Li
     def incomplete(reason: str) -> CrawlIncomplete:
         return CrawlIncomplete(f"{job['domain']}: affiliate feed: {reason}", status="failed", next_page=0,
                                scanned_products=0, selected_products=0)
+    # httpx exceptions can carry the request URL (and so the token) in str(): only their TYPE is recorded.
     try:
         text = await fetch_feed_text(feed, env=dict(os.environ))
     except (httpx.TimeoutException, httpx.TransportError) as exc:
@@ -132,12 +133,14 @@ async def _affiliate_records(job: Dict[str, Any], payload: Dict[str, Any]) -> Li
         if re.search(r"HTTP (?:429|5\d\d)", str(exc)):
             raise incomplete(str(exc)) from exc
         raise _Stop("feed_invalid", "failed", f"affiliate feed: {exc}") from exc
+    except (httpx.HTTPError, httpx.InvalidURL, UnicodeError, ValueError) as exc:
+        raise _Stop("feed_invalid", "failed", f"affiliate feed download: {type(exc).__name__}") from exc
     try:
         rows = parse_feed(text, fmt=feed["format"], json_path=feed.get("json_path"))
         records = feed_rows_to_records(rows, feed, vendors=payload["only_vendors"],
                                        category_path=payload["category_path"],
                                        currency=payload["require_currency"])
-    except (FeedError, ValueError) as exc:
+    except (FeedError, ValueError, UnicodeError) as exc:
         raise _Stop("feed_invalid", "failed", f"affiliate feed: {exc}") from exc
     batch = ShopifyProductBatch(records, scanned_products=len(rows), pages=1)
     batch.crawl_report["source"] = f"affiliate_feed:{feed['network']}"

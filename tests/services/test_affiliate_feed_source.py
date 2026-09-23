@@ -16,7 +16,7 @@ PAGE = "https://global.oliveyoung.com/product/detail?prdtNo={}"
 LINK = "https://invl.example-network.com/c/{}"
 
 FEED = {
-    "network": "example_network", "url_env": "OLIVE_YOUNG_FEED_URL", "format": "csv",
+    "network": "example_network", "url_env": "AFFILIATE_FEED_OLIVE_YOUNG", "format": "csv",
     "retailer_host": OY, "link_hosts": ["invl.example-network.com"],
     "fields": {"id": "sku_id", "parent_id": "group_id", "title": "name", "brand": "brand_name",
                "product_url": "page", "link": "click", "price": "sale_price", "currency": "ccy",
@@ -93,10 +93,14 @@ def test_rows_become_retailer_records_with_the_page_as_listing_and_the_link_as_c
     assert offer["canonical_url"] == PAGE.format("GA1") and offer["destination_url"] == LINK.format("GA1")
 
 
-def test_variant_rows_group_under_their_parent():
-    [rec] = _records(_csv(_row("10000001", "GA1", "3CE Velvet Lip Tint", shade="Rose"),
-                          _row("10000002", "GA1", "3CE Velvet Lip Tint", shade="Taupe")))
-    assert len(rec["pdp"]["variants"]) == 2
+def test_an_all_digit_network_sku_never_becomes_a_storefront_variant_id():
+    """variant_identity classes 8+ digits as merchant-issued; a feed SKU must never be read that way."""
+    from services.variant_identity import MERCHANT_ISSUED
+    records = _records(_csv(_row("44012345678901", "GA1", "3CE Velvet Lip Tint", shade="Rose"),
+                            _row("44012345678902", "GA1", "3CE Velvet Lip Tint", shade="Taupe")))
+    assert len(records) == 1 and records[0]["pdp"].get("variants") in (None, [])
+    plan = ingest_validated_jsonl(records)
+    assert not any(MERCHANT_ISSUED in str(s.get("sku_payload")) for s in plan["skus"])
 
 
 def test_alphanumeric_variant_ids_still_land_the_product_as_one_listing():
@@ -149,6 +153,7 @@ def test_a_mapped_column_missing_from_the_header_refuses():
     {**FEED, "format": "xml"},
     {**FEED, "link_hosts": ["https://invl.example-network.com"]},
     {**FEED, "surprise": 1},
+    {**FEED, "url_env": "DATABASE_URL"},                               # another secret the job holds
 ])
 def test_feed_options_are_validated(bad):
     with pytest.raises(af.FeedError):
@@ -156,7 +161,7 @@ def test_feed_options_are_validated(bad):
 
 
 async def test_the_feed_url_comes_from_the_environment_never_the_job():
-    with pytest.raises(af.FeedError, match="OLIVE_YOUNG_FEED_URL is not set"):
+    with pytest.raises(af.FeedError, match="AFFILIATE_FEED_OLIVE_YOUNG is not set"):
         await af.fetch_feed_text(FEED, env={})
 
 
@@ -198,3 +203,110 @@ def test_a_storefront_product_with_an_unplaceable_variant_id_is_still_blocked():
         domain="k-touch.us", category_path="beauty", brand_override="3CE", currency="USD",
         source_role="retailer", retailer_name="k-touch.us", emit_native_variants=True)
     assert "no_native_retailer_commerce_chain" in inspect_primary_plan(ingest_validated_jsonl([rec]))["reasons"]
+
+
+# --- hardening (review of #2272) ------------------------------------------------------------------
+
+@pytest.mark.parametrize("kw,match", [
+    (dict(click="https://evil.example\\.invl.example-network.com/c/1"), "link host"),   # backslash
+    (dict(click="https://invl.example-network.com:8443/c/1"), "link host"),
+    (dict(click="https://user@invl.example-network.com/c/1"), "link host"),
+    (dict(page="https://shop.global.oliveyoung.com/product/detail?prdtNo=GA1"), "product_url"),
+    (dict(page="https://global.oliveyoung.com/product/detail"), "retailer_listing_identity_unproven"),
+])
+def test_lookalike_and_unlistable_urls_refuse_the_feed(kw, match):
+    with pytest.raises(af.FeedError, match=match):
+        _records(_csv(_row("1", "GA1", "3CE Velvet Lip Tint", **kw)))
+
+
+@pytest.mark.parametrize("second", [
+    dict(page=PAGE.format("GA9")),                       # same parent, another listing
+    dict(click=LINK.format("other")),                    # same parent, another click
+])
+def test_rows_of_one_product_that_disagree_refuse_the_feed(second):
+    with pytest.raises(af.FeedError, match="disagree"):
+        _records(_csv(_row("1", "GA1", "3CE Velvet Lip Tint"), _row("2", "GA1", "3CE Velvet Lip Tint", **second)))
+
+
+def test_a_row_id_equal_to_another_rows_parent_does_not_merge_into_it():
+    text = _csv(_row("GA1", "", "3CE Glow Lip Tint", page=PAGE.format("GA1")),
+                _row("7", "GA1", "3CE Velvet Lip Tint", page=PAGE.format("GA2"), click=LINK.format("GA2")))
+    assert len(_records(text)) == 2
+
+
+def test_a_repeated_row_id_refuses_the_feed():
+    with pytest.raises(af.FeedError, match="repeated"):
+        _records(_csv(_row("1", "GA1", "3CE Velvet Lip Tint"), _row("1", "GA2", "3CE Blur Water Tint")))
+
+
+def test_a_bom_and_a_long_html_description_parse():
+    text = "\ufeff" + _csv(_row("1", "GA1", "3CE Velvet Lip Tint")).replace(
+        "A soft velvet colour for lips.", "<p>" + "lips " * 40_000 + "</p>")
+    assert len(_records(text)) == 1
+
+
+def test_an_olive_young_listing_has_a_handle_approvals_can_name():
+    from scripts.onboard_curated_brands import _exclude_by_handle
+    from services.retailer_ingest.detectors import _handle
+    records = _records(_csv(_row("1", "GA1", "3CE Velvet Lip Tint"), _row("2", "GA2", "3CE Blur Water Tint")))
+    assert {_handle(r) for r in records} == {"ga1", "ga2"}
+    kept, matched = _exclude_by_handle(records, {"ga2"}, domain=OY)
+    assert matched == {"ga2"} and [r["pdp"]["product_name"] for r in kept] == ["3CE Velvet Lip Tint"]
+
+
+def test_storefront_handles_are_unchanged():
+    from services.catalog_enrichment_agent.ingestion import listing_handle
+    assert listing_handle("https://k-touch.us/products/3CE-Velvet/?variant=1#x") == "3ce-velvet"
+    assert listing_handle("https://k-touch.us/collections/lip") is None
+
+
+def _transport(monkeypatch, handler):
+    import httpx
+    real = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
+
+
+FEED_ENV = {"AFFILIATE_FEED_OLIVE_YOUNG": "https://feeds.example-network.com/p/1?token=SEKRET"}
+
+
+async def test_a_redirect_off_https_is_refused(monkeypatch):
+    import httpx
+    _transport(monkeypatch, lambda req: httpx.Response(302, headers={"location": "http://feeds.example-network.com/f"}))
+    with pytest.raises(af.FeedError, match="off https"):
+        await af.fetch_feed_text(FEED, env=FEED_ENV)
+
+
+async def test_an_https_redirect_is_followed_and_a_bom_is_dropped(monkeypatch):
+    import httpx
+    def handler(req):
+        if req.url.path == "/p/1":
+            return httpx.Response(302, headers={"location": "/final.csv"})
+        return httpx.Response(200, content="\ufeffa,b\n1,2\n".encode("utf-8"))
+    _transport(monkeypatch, handler)
+    assert await af.fetch_feed_text(FEED, env=FEED_ENV) == "a,b\n1,2\n"
+
+
+async def test_an_oversized_feed_is_refused_while_streaming(monkeypatch):
+    import httpx
+    monkeypatch.setattr(af, "MAX_FEED_BYTES", 1000)
+    _transport(monkeypatch, lambda req: httpx.Response(200, content=b"x" * 5000))
+    with pytest.raises(af.FeedError, match="size cap"):
+        await af.fetch_feed_text(FEED, env=FEED_ENV)
+
+
+def test_a_link_hiding_a_tab_is_refused():
+    """urlsplit silently DROPS tabs and newlines, so only the raw-character check sees this."""
+    with pytest.raises(af.FeedError, match="link host"):
+        _records(_csv(_row("1", "GA1", "3CE Velvet Lip Tint", click="https://invl.example-network.com/c/\t1")))
+
+
+async def test_an_oversized_feed_without_a_declared_length_is_refused_while_streaming(monkeypatch):
+    import httpx
+    monkeypatch.setattr(af, "MAX_FEED_BYTES", 1000)
+
+    async def body():
+        for _ in range(10):
+            yield b"x" * 600
+    _transport(monkeypatch, lambda req: httpx.Response(200, content=body()))
+    with pytest.raises(af.FeedError, match="size cap"):
+        await af.fetch_feed_text(FEED, env=FEED_ENV)

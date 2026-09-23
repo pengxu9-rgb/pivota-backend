@@ -55,10 +55,11 @@ def _pdp(record: Any) -> Dict[str, Any]:
 
 
 def _handle(record: Dict[str, Any]) -> Optional[str]:
+    from services.catalog_enrichment_agent.ingestion import listing_handle
     for offer in record.get("offers") or []:
-        url = str((offer or {}).get("canonical_url") or "")
-        if "/products/" in url:
-            return url.split("/products/", 1)[1].split("?", 1)[0].strip("/").casefold() or None
+        handle = listing_handle((offer or {}).get("canonical_url"))
+        if handle:
+            return handle
     return None
 
 

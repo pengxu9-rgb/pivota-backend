@@ -288,7 +288,7 @@ async def test_an_exclusion_the_merchant_delisted_can_be_accepted(env):
 
 # --- the affiliate datafeed source (services/retailer_ingest/affiliate_feed.py) ---------------------
 
-OY_FEED = {"network": "example_network", "url_env": "OY_TEST_FEED_URL", "format": "csv",
+OY_FEED = {"network": "example_network", "url_env": "AFFILIATE_FEED_OY_TEST", "format": "csv",
            "retailer_host": "global.oliveyoung.com", "link_hosts": ["invl.example-network.com"],
            "fields": {"id": "sku", "title": "name", "brand": "brand", "product_url": "page", "link": "click",
                       "price": "price", "currency": "ccy", "category": "cat", "description": "desc"}}
@@ -320,10 +320,11 @@ def oy(env, monkeypatch):
 
     from services.catalog_enrichment_agent import primary_ingestion as pi
 
-    def require_apply(preflight, counts):  # the apply gate matches readiness to the job's host
-        products = [{"product_key": p["product_key"],
-                     "canonical_url": f"https://global.oliveyoung.com/product/detail?prdtNo=GA{i}"}
-                    for i, p in enumerate(state.applied[-1]["pdps"])]
+    def require_apply(preflight, counts):  # readiness reports each applied product's real listing URL
+        import json
+        urls = {o["product_key"]: json.loads(o["offer_payload"])["canonical_url"] for o in state.applied[-1]["offers"]}
+        products = [{"product_key": p["product_key"], "canonical_url": urls[p["product_key"]]}
+                    for p in state.applied[-1]["pdps"]]
         return {"status": "applied", "missing": {}, "applied": {**counts, "primary_readiness":
                 {"status": "complete", "products": products}}}
     monkeypatch.setattr(pi, "require_primary_apply", require_apply)
@@ -396,20 +397,28 @@ async def test_invalid_feed_options_are_refused_before_any_download(oy, options)
 
 
 async def test_the_feed_url_never_reaches_the_ledger(env, monkeypatch):
-    """The URL embeds the publisher token. A refused download must not echo it into the run record."""
+    """The URL embeds the publisher token. Neither a refusal nor a transport error may echo it."""
     import httpx
     secret = "https://feeds.example-network.com/p/12345?token=SEKRET-TOKEN"
-    monkeypatch.setenv("OY_TEST_FEED_URL", secret)
+    monkeypatch.setenv("AFFILIATE_FEED_OY_TEST", secret)
     env.crawl_error = AssertionError("storefront crawler must not run")
+    real = httpx.AsyncClient
+    outcomes = iter([
+        lambda req: httpx.Response(401, text=f"bad token for {req.url}"),
+        lambda req: (_ for _ in ()).throw(httpx.ConnectError(f"cannot reach {req.url}", request=req)),
+        lambda req: (_ for _ in ()).throw(httpx.TooManyRedirects(f"loop at {req.url}", request=req)),
+    ])
+    for expected in ("feed_invalid", "crawl_throttled", "feed_invalid"):
+        handler = next(outcomes)
+        monkeypatch.setattr(httpx, "AsyncClient",
+                            lambda handler=handler, **kw: real(transport=httpx.MockTransport(handler), **kw))
+        out = await pipeline.run_stage(feed_job(), db=env.db)
+        assert out["outcome"] == expected
+    assert "SEKRET" not in repr(env.ledger.runs) + repr(env.ledger.transitions)
 
-    class Client:
-        def __init__(self, **kw): pass
-        async def __aenter__(self): return self
-        async def __aexit__(self, *a): return False
-        async def get(self, url):
-            assert url == secret
-            return httpx.Response(401, text=f"bad token for {url}", request=httpx.Request("GET", url))
-    monkeypatch.setattr(httpx, "AsyncClient", Client)
-    out = await pipeline.run_stage(feed_job(), db=env.db)
-    assert out["outcome"] == "feed_invalid"
-    assert "SEKRET" not in repr(env.ledger.runs) + repr(env.ledger.transitions) + repr(out)
+
+async def test_an_olive_young_product_can_be_excluded_by_its_product_id(oy):
+    j = feed_job("apply_due")
+    j["options"]["exclude_handles"] = ["GA2"]
+    out = await pipeline.run_stage(j, db=oy.db)
+    assert out["status"] == "done" and len(oy.applied[-1]["pdps"]) == 1

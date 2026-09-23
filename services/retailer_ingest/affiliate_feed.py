@@ -58,8 +58,9 @@ def validate_feed_options(feed: Any) -> Dict[str, Any]:
     for key in ("network", "url_env", "format", "retailer_host"):
         if not isinstance(feed.get(key), str) or not feed[key].strip():
             raise FeedError(f"options.feed.{key} is required")
-    if not re.fullmatch(r"[A-Z][A-Z0-9_]{2,63}", feed["url_env"]):
-        raise FeedError("options.feed.url_env must name an environment variable (UPPER_SNAKE)")
+    # The prefix keeps an enqueuer from pointing a job at some OTHER secret the drain job holds.
+    if not re.fullmatch(r"AFFILIATE_FEED_[A-Z0-9_]{2,48}", feed["url_env"]):
+        raise FeedError("options.feed.url_env must name an AFFILIATE_FEED_* environment variable")
     if feed["format"] not in {"csv", "tsv", "json"}:
         raise FeedError("options.feed.format must be csv, tsv or json")
     fields = feed.get("fields")
@@ -81,13 +82,23 @@ def validate_feed_options(feed: Any) -> Dict[str, Any]:
 def parse_feed(text: str, *, fmt: str, json_path: Optional[str] = None) -> List[Dict[str, str]]:
     """Rows as {column: string}. CSV/TSV by header; JSON as a list, or the list at `json_path`
     (dot-separated, e.g. "data.products")."""
-    if len(text.encode("utf-8", "ignore")) > MAX_FEED_BYTES:
+    if len(text) > MAX_FEED_BYTES:
         raise FeedError("feed exceeds the size cap")
+    text = text.removeprefix("\ufeff")  # a UTF-8 BOM would otherwise rename the first column
     if fmt in {"csv", "tsv"}:
+        # HTML descriptions routinely exceed the csv module's 128 KiB default field limit.
+        csv.field_size_limit(max(csv.field_size_limit(), 16 * 1024 * 1024))
         reader = csv.DictReader(io.StringIO(text), delimiter="\t" if fmt == "tsv" else ",")
-        rows = [{k.strip(): (v or "").strip() for k, v in row.items() if k} for row in reader]
+        try:
+            rows = [{k.strip(): (v or "").strip() for k, v in row.items() if isinstance(k, str) and k}
+                    for row in reader]
+        except csv.Error as exc:
+            raise FeedError(f"feed is not valid {fmt}: {exc}") from exc
     else:
-        data: Any = json.loads(text)
+        try:
+            data: Any = json.loads(text)
+        except ValueError as exc:
+            raise FeedError(f"feed is not valid JSON: {exc}") from exc
         for part in (json_path or "").split("."):
             if part:
                 if not isinstance(data, dict) or part not in data:
@@ -102,11 +113,25 @@ def parse_feed(text: str, *, fmt: str, json_path: Optional[str] = None) -> List[
     return rows
 
 
-def _https_on(url: str, hosts: set) -> bool:
-    parts = urlsplit(url)
-    host = (parts.hostname or "").lower().removeprefix("www.")
-    return parts.scheme == "https" and not parts.username and not parts.port and any(
-        host == h or host.endswith("." + h) for h in hosts)
+_UNSAFE_URL_CHAR = re.compile(r"[\\\s\x00-\x1f\x7f]")
+
+
+def _https_host(url: str) -> Optional[str]:
+    """The host of a plain https URL, or None. Refuses anything a browser could read differently
+    from urlsplit: a backslash ("https://evil.example\\.allowed.com" goes to evil.example),
+    whitespace, control characters, userinfo, a port, or a host outside [a-z0-9.-]."""
+    if not isinstance(url, str) or _UNSAFE_URL_CHAR.search(url):
+        return None
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return None
+    host = (parts.hostname or "").lower()
+    if (parts.scheme != "https" or parts.username or parts.password or port
+            or not re.fullmatch(r"[a-z0-9-]+(?:\.[a-z0-9-]+)+", host)):
+        return None
+    return host.removeprefix("www.")
 
 
 def _availability(value: str) -> Optional[bool]:
@@ -124,9 +149,13 @@ def feed_rows_to_records(rows: List[Dict[str, str]], feed: Dict[str, Any], *, ve
     absent = sorted(col for col in fields.values() if col not in header)
     if rows and absent:
         raise FeedError(f"mapped columns missing from the feed header: {absent}")
+    from services.catalog_enrichment_agent.ingestion import retailer_listing_identity
+
     host = feed["retailer_host"].strip().lower().removeprefix("www.")
     link_hosts = {h.lower().removeprefix("www.") for h in (feed.get("link_hosts") or [])} | {host}
     wanted = {" ".join(v.casefold().split()) for v in vendors}
+    network = str(feed.get("network") or "unknown")
+    seen_ids: set = set()
 
     def col(row: Dict[str, str], field: str) -> str:
         name = fields.get(field)
@@ -140,20 +169,38 @@ def feed_rows_to_records(rows: List[Dict[str, str]], feed: Dict[str, Any], *, ve
         row_currency = col(row, "currency").upper()
         if row_currency != currency:
             raise FeedError(f"feed row {col(row, 'id')!r} is priced in {row_currency or 'nothing'}, not {currency}")
+        row_id = col(row, "id")
+        if not row_id or row_id in seen_ids:
+            raise FeedError(f"feed row id {row_id!r} is blank or repeated")
+        seen_ids.add(row_id)
         product_url, link = col(row, "product_url"), col(row, "link")
-        if not _https_on(product_url, {host}):
-            raise FeedError(f"feed row {col(row, 'id')!r}: product_url is not an https page on {host}")
-        if not _https_on(link, link_hosts):
-            raise FeedError(f"feed row {col(row, 'id')!r}: link host is not in options.feed.link_hosts")
-        key = col(row, "parent_id") or col(row, "id")
+        # EXACTLY the retailer's host: a subdomain page would pass here and crash the listing identity.
+        if _https_host(product_url) != host:
+            raise FeedError(f"feed row {row_id!r}: product_url is not an https page on {host}")
+        try:
+            retailer_listing_identity(host, product_url)
+        except ValueError as exc:
+            raise FeedError(f"feed row {row_id!r}: {exc}") from exc
+        link_host = _https_host(link)
+        if not link_host or not any(link_host == h or link_host.endswith("." + h) for h in link_hosts):
+            raise FeedError(f"feed row {row_id!r}: link host is not in options.feed.link_hosts")
+        # Separate namespaces, so a row whose id equals another row's parent_id cannot merge into it.
+        key = f"p:{col(row, 'parent_id')}" if col(row, "parent_id") else f"i:{row_id}"
         product = products.setdefault(key, {
             "id": key, "title": col(row, "title"), "vendor": brand, "handle": _handle(key),
             "product_type": col(row, "category"), "body_html": col(row, "description"),
             "images": [{"src": col(row, "image")}] if col(row, "image") else [],
             "variants": [], "_product_url": product_url, "_link": link,
         })
+        # One product, one listing, one click. A group that disagrees is refused, never first-row-wins.
+        if (product["_product_url"], product["_link"], " ".join(product["vendor"].casefold().split())) != (
+                product_url, link, " ".join(brand.casefold().split())):
+            raise FeedError(f"feed rows under {key!r} disagree on product_url, link or brand")
         product["variants"].append({
-            "id": col(row, "id"), "title": col(row, "variant_title") or "Default Title",
+            # Namespaced: a network SKU is never a storefront's variant id, even when it is all digits
+            # (services.variant_identity would class 8+ digits as merchant-issued and a cart could be
+            # built from it). This keeps every feed id UNVERIFIABLE.
+            "id": f"feed:{network}:{row_id}", "title": col(row, "variant_title") or "Default Title",
             "price": col(row, "price"), "sku": col(row, "sku") or None, "barcode": col(row, "gtin") or None,
             "available": _availability(col(row, "availability")),
         })
@@ -190,18 +237,38 @@ def _handle(key: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", key.casefold()).strip("-") or "item"
 
 
+MAX_REDIRECTS = 5
+
+
 async def fetch_feed_text(feed: Dict[str, Any], *, env: Dict[str, str], timeout_s: float = 120.0) -> str:
-    """Download the feed from the URL in the named environment variable. The URL is never logged
-    or returned: it usually embeds the publisher token."""
+    """Download the feed from the URL in the named environment variable. The URL is never logged,
+    returned or put in an error: it usually embeds the publisher token. Every hop must be https,
+    and the body is streamed against MAX_FEED_BYTES instead of being buffered first."""
     import httpx
 
     url = (env.get(feed["url_env"]) or "").strip()
-    if not url.startswith("https://"):
+    if not _https_host(url):
         raise FeedError(f"{feed['url_env']} is not set to an https feed URL in this job's environment")
-    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout_s) as client:
-        resp = await client.get(url)
-    if resp.status_code != 200:
-        raise FeedError(f"feed download answered HTTP {resp.status_code}")
-    if len(resp.content) > MAX_FEED_BYTES:
-        raise FeedError("feed exceeds the size cap")
-    return resp.text
+    async with httpx.AsyncClient(follow_redirects=False, timeout=timeout_s) as client:
+        for _ in range(MAX_REDIRECTS + 1):
+            async with client.stream("GET", url) as resp:
+                if resp.is_redirect:
+                    url = str(resp.url.join(resp.headers.get("location", "")))
+                    if not _https_host(url):
+                        raise FeedError("feed download redirected off https")
+                    continue
+                if resp.status_code != 200:
+                    raise FeedError(f"feed download answered HTTP {resp.status_code}")
+                declared = resp.headers.get("content-length", "")
+                if declared.isdigit() and int(declared) > MAX_FEED_BYTES:
+                    raise FeedError("feed exceeds the size cap")
+                body = bytearray()
+                async for chunk in resp.aiter_bytes():
+                    body.extend(chunk)
+                    if len(body) > MAX_FEED_BYTES:
+                        raise FeedError("feed exceeds the size cap")
+                try:
+                    return bytes(body).decode("utf-8-sig")
+                except UnicodeDecodeError as exc:
+                    raise FeedError("feed is not UTF-8") from exc
+    raise FeedError(f"feed download redirected more than {MAX_REDIRECTS} times")

@@ -206,6 +206,25 @@ def retailer_listing_identity(source_domain: str, canonical_url: str) -> str:
     return identity
 
 
+def listing_handle(canonical_url: Optional[str]) -> Optional[str]:
+    """The per-product token an operator names to exclude or accept one listing: the Shopify handle
+    (/products/<handle>), or -- for a host in _LISTING_QUERY_KEYS -- the product id its URL carries
+    exactly once. None when the URL names neither. Casefolded."""
+    from urllib.parse import parse_qs, urlsplit
+
+    url = str(canonical_url or "")
+    parsed = urlsplit(url)
+    keys = _LISTING_QUERY_KEYS.get((parsed.hostname or "").lower().removeprefix("www."))
+    if keys:
+        query = parse_qs(parsed.query, keep_blank_values=False)
+        found = [v.strip() for key in keys for v in query.get(key, []) if v.strip()]
+        return found[0].casefold() if len(found) == 1 else None
+    marker = "/products/"
+    if marker not in url:
+        return None
+    return url.split(marker, 1)[1].split("?", 1)[0].split("#", 1)[0].strip("/").casefold() or None
+
+
 def _normalize_url(url: Optional[str]) -> str:
     if not url:
         return ""
