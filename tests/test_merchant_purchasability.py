@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 
@@ -36,6 +37,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import db.merchant_purchasability as mp  # noqa: E402
 import db.reap_agentic_ledger as ledger  # noqa: E402
 import jobs.merchant_purchasability_sweep as sweep  # noqa: E402
+from pivota_log_capture import (  # noqa: E402
+    capture_pivota_stdout,
+    pivota_lines,
+    root_as_in_prod,
+)
 from db.database import IS_POSTGRES, database  # noqa: E402
 from services.shopify_cart_link_preflight import (  # noqa: E402
     _json_values_after,
@@ -1511,7 +1517,7 @@ async def test_a_population_row_that_is_not_a_bare_host_is_not_swept(_population
 
 
 async def test_skipped_allowlist_rows_are_counted_in_the_report_and_logged_once(
-    _population, monkeypatch, caplog
+    _population, monkeypatch
 ):
     """Counted, not silently dropped: an unusable row is a merchant an operator meant to enable.
     One warning per RUN carrying the count, and no domain in the log or the report."""
@@ -1530,14 +1536,18 @@ async def test_skipped_allowlist_rows_are_counted_in_the_report_and_logged_once(
     monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "true")
     monkeypatch.setenv("MERCHANT_PURCHASABILITY_PAUSE_MS", "0")
     monkeypatch.setattr(sweep, "_preflight", _Fetcher({}))
-    caplog.set_level(logging.WARNING, logger=sweep.logger.name)
-    report = await sweep.run_merchant_purchasability_sweep()
+    # Off the pivota handler's own stream, with root where prod has it: this is an OPERATOR line,
+    # and the module logger's WARNING only ever reached prod through Python's stderr lastResort.
+    with root_as_in_prod(), capture_pivota_stdout() as out:
+        report = await sweep.run_merchant_purchasability_sweep()
     assert report.population_skipped_unusable == 2
     assert report.population == 2, "the two usable merchants are still swept"
-    skipped = [r.getMessage() for r in caplog.records if "allowlist row(s) skipped" in r.getMessage()]
-    assert skipped == [
-        "merchant_purchasability_sweep: 2 allowlist row(s) skipped: domain is not a bare host name"
-    ]
+    skipped = [line for line in pivota_lines(out) if "allowlist row(s) skipped" in line]
+    assert len(skipped) == 1, skipped
+    assert re.fullmatch(
+        r"\[[^\]]+\] WARNING - merchant_purchasability_sweep: 2 allowlist row\(s\) skipped: "
+        r"domain is not a bare host name", skipped[0],
+    ), skipped[0]
     for leak in ("urlshaped", "trailingdot"):
         assert leak not in repr(report) and leak not in " ".join(skipped)
 
@@ -1548,7 +1558,93 @@ async def test_a_clean_population_reports_zero_skipped(_population, monkeypatch,
     monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "true")
     monkeypatch.setenv("MERCHANT_PURCHASABILITY_PAUSE_MS", "0")
     monkeypatch.setattr(sweep, "_preflight", _Fetcher({}))
+    # Both channels: the module logger (caplog, root) AND the pivota handler the line moved to.
     caplog.set_level(logging.WARNING, logger=sweep.logger.name)
-    report = await sweep.run_merchant_purchasability_sweep()
+    with capture_pivota_stdout() as out:
+        report = await sweep.run_merchant_purchasability_sweep()
     assert report.population_skipped_unusable == 0
     assert not any("allowlist row(s) skipped" in r.getMessage() for r in caplog.records)
+    assert not any("allowlist row(s) skipped" in line for line in pivota_lines(out))
+
+
+# ══ the proof line ════════════════════════════════════════════════════════════════════════════
+#
+# Measured in prod 2026-09-23: /__scheduler_health `runs.merchant_purchasability_sweep` showed
+# runs_ok=1 at 08:43:20Z on worker-00167-pjr and Cloud Logging held ZERO
+# `merchant_purchasability_sweep:` lines. The report went through `logging.getLogger(__name__)`,
+# nothing configures root in this process, root sits at WARNING, and INFO is dropped at the
+# logger. Every test passed the whole time, because caplog hangs its handler on root and turns
+# the level down. These tests read the pivota handler's OWN stream with root where prod has it,
+# so they FAIL on a module-logger emit and pass only when the line takes the channel that lands.
+
+_PROOF_LINE = re.compile(r"\[[^\]]+\] INFO - merchant_purchasability_sweep: SweepReport\(.*\)$")
+
+
+async def test_the_report_line_lands_on_pivota_stdout_at_info_with_root_at_warning(
+    _db, monkeypatch, _population
+):
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "true")
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_PAUSE_MS", "0")
+    monkeypatch.setattr(sweep, "_preflight", _Fetcher({}))
+    with root_as_in_prod(), capture_pivota_stdout() as out:
+        report = await sweep.run_merchant_purchasability_sweep()
+    lines = pivota_lines(out)
+    proof = [line for line in lines if _PROOF_LINE.fullmatch(line)]
+    assert len(proof) == 1, f"expected exactly one report line on the pivota handler, got {lines!r}"
+    # The line IS the report: same content, same counts-only rule. `repr(report)` is what the
+    # counts-only test already polices, and the line carries nothing else.
+    assert proof[0].endswith(f"merchant_purchasability_sweep: {report!r}")
+    assert report.checked == 2 and report.population == 2
+    for leak in ("judydoll", "flowerbeauty", ".com", "5004"):
+        assert leak not in proof[0], f"{leak!r} leaked into the proof line"
+
+
+async def test_the_disabled_line_lands_on_pivota_stdout_at_info(_db, monkeypatch):
+    """The rollback step in the runbook says the sweep 'then returns skipped_disabled=1'; at the
+    hourly interval this line is the only sign the worker is still ticking with the dial off. It
+    was DEBUG on the module logger, which reached nobody."""
+    fetcher = _Fetcher({})
+    monkeypatch.setattr(sweep, "_preflight", fetcher)
+    with root_as_in_prod(), capture_pivota_stdout() as out:
+        report = await sweep.run_merchant_purchasability_sweep()
+    assert report.skipped_disabled == 1 and fetcher.calls == []
+    lines = pivota_lines(out)
+    assert len(lines) == 1, lines
+    assert re.fullmatch(
+        r"\[[^\]]+\] INFO - merchant_purchasability_sweep: disabled; no merchant was contacted",
+        lines[0],
+    ), lines[0]
+
+
+async def test_the_report_line_does_not_depend_on_the_root_logger(_db, monkeypatch, _population):
+    """The mirror image: with root wide open and a handler on it, the report line must NOT show up
+    there. A line that reaches root reaches it only by propagating from a module logger — the
+    exact path prod drops — so this pins the channel, not just the level."""
+    import logging
+
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "true")
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_PAUSE_MS", "0")
+    monkeypatch.setattr(sweep, "_preflight", _Fetcher({}))
+
+    class _Sink(logging.Handler):
+        def __init__(self):
+            super().__init__(level=logging.DEBUG)
+            self.messages = []
+
+        def emit(self, record):
+            self.messages.append(record.getMessage())
+
+    root, sink = logging.getLogger(), _Sink()
+    saved = root.level
+    root.setLevel(logging.DEBUG)
+    root.addHandler(sink)
+    try:
+        with capture_pivota_stdout() as out:
+            await sweep.run_merchant_purchasability_sweep()
+    finally:
+        root.removeHandler(sink)
+        root.setLevel(saved)
+    assert any(_PROOF_LINE.fullmatch(line) for line in pivota_lines(out))
+    assert not any(m.startswith("merchant_purchasability_sweep: SweepReport(") for m in sink.messages), (
+        "the report line propagated to root, i.e. it went through the module logger"
+    )

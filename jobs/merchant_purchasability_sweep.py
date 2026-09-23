@@ -100,8 +100,22 @@ from services.shopify_cart_link_preflight import (
     PreflightResult,
     preflight,
 )
+from utils.logger import logger as operator_logger
 
 logger = logging.getLogger(__name__)
+
+# THE OPERATOR LINES GO THROUGH THE "pivota" LOGGER, NOT THE MODULE LOGGER. Measured in prod on
+# 2026-09-23: /__scheduler_health showed `runs.merchant_purchasability_sweep.runs_ok=1` on the
+# worker and Cloud Logging held ZERO matching lines. Nothing in this process configures the root
+# logger — `middleware.structured_logging` configures only the `structured_logs` logger and
+# uvicorn only `uvicorn.*` — so root sits at Python's default WARNING and a module logger's INFO
+# is dropped at the logger before any handler sees it. `utils.logger` is the one logger in this
+# repo that carries its own INFO level and its own stdout handler (propagate=False, format
+# `[ts] LEVEL - msg`), which is why services/merchant_order_gap_alert.py's ticks land and this
+# job's did not. ONLY the per-run report and the two lines the runbook tells an operator to look
+# for go this way; everything else (dial warnings, per-check errors) stays on the module logger.
+# Reconfiguring root instead would flood prod with INFO from every module and change the
+# uvicorn access-log redaction path — see main.install_uvicorn_access_log_redaction.
 
 __all__ = [
     "SweepReport",
@@ -488,7 +502,10 @@ async def run_merchant_purchasability_sweep(*, worker_id: Optional[str] = None) 
     # THE GATE, INSIDE THE JOB. See the module header: with it off this touches no merchant.
     if not is_enabled():
         counts["skipped_disabled"] = 1
-        logger.debug("merchant_purchasability_sweep: disabled; no merchant was contacted")
+        # INFO, on the operator logger: the runbook's rollback step says "the sweep then
+        # returns skipped_disabled=1", and at the hourly interval this is the one line that
+        # shows the worker still ticking with the dial off. Counts-only, like the report.
+        operator_logger.info("merchant_purchasability_sweep: disabled; no merchant was contacted")
         return _report()
 
     batch = _env_int(DIALS["batch"])
@@ -506,7 +523,7 @@ async def run_merchant_purchasability_sweep(*, worker_id: Optional[str] = None) 
     if counts["population_skipped_unusable"]:
         # ONCE PER RUN, BY COUNT. Not the domains: the report rule is counts only, and the
         # runbook's census query names the rows for whoever reads this.
-        logger.warning(
+        operator_logger.warning(
             "merchant_purchasability_sweep: %d allowlist row(s) skipped: domain is not a bare "
             "host name", counts["population_skipped_unusable"],
         )
@@ -572,5 +589,8 @@ async def run_merchant_purchasability_sweep(*, worker_id: Optional[str] = None) 
             await asyncio.sleep(pause_s)
 
     report = _report()
-    logger.info("merchant_purchasability_sweep: %s", report)
+    # THE PROOF LINE. Lands on the worker's stdout as
+    # `[ts] INFO - merchant_purchasability_sweep: SweepReport(...)`; see the logger note at the
+    # top of the module for why it cannot go through `logger`.
+    operator_logger.info("merchant_purchasability_sweep: %s", report)
     return report
