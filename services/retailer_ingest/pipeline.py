@@ -36,14 +36,52 @@ class _Stop(Exception):
         self.next_run_at, self.count_attempt = next_run_at, count_attempt
 
 
+_OPTION_TYPES = {
+    "vendors": list, "require_currency": str, "category_path": str, "only_category": str,
+    "only_resolved_category": bool, "lip_title_evidence": bool, "exclude_handles": list,
+    "accepted_flags": list, "max_scan_products": int, "max_products": int,
+    "max_pdp_identity_fetches": int, "retailer_name": str, "notes": str,
+}
+
+
+def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
+    """The ONE validator for a job's options, used by the enqueue script and again at execution
+    (a row written by any other path is checked before it can crawl). Raises ValueError.
+
+    `category_path` must be coarse (beauty, or one level under it): it is the fallback for every
+    product the merchant type leaves unresolved, so a leaf here ("beauty/makeup/lip/lipstick")
+    would file every untyped product in the cohort under that leaf with no review."""
+    if not isinstance(options, dict):
+        raise ValueError("options must be an object")
+    unknown = set(options) - set(_OPTION_TYPES)
+    if unknown:
+        raise ValueError(f"unknown options {sorted(unknown)}")
+    for key, value in options.items():
+        want = _OPTION_TYPES[key]
+        if value is None and key not in {"vendors"}:
+            continue
+        if want is int and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
+            raise ValueError(f"options.{key} must be a positive integer")
+        if want is not int and not isinstance(value, want):
+            raise ValueError(f"options.{key} must be {want.__name__}")
+        if want is list and not all(isinstance(v, str) and v.strip() for v in value):
+            raise ValueError(f"options.{key} must be a list of non-empty strings")
+    if not options.get("vendors"):
+        raise ValueError("options.vendors is required for a retailer cohort")
+    path = str(options.get("category_path") or "beauty").strip().strip("/").lower()
+    if not path.startswith("beauty") or path.count("/") > 1:
+        raise ValueError(f"options.category_path must be coarse (beauty or beauty/<area>), got {path!r}")
+    return options
+
+
 def _feed_payload(job: Dict[str, Any]) -> Dict[str, Any]:
-    o = job.get("options") or {}
-    vendors = [str(v) for v in (o.get("vendors") or []) if str(v).strip()]
-    if not vendors:
-        raise _Stop("invalid_job", "failed", "options.vendors is required for a retailer cohort")
+    try:
+        o = validate_options(dict(job.get("options") or {}))
+    except ValueError as exc:
+        raise _Stop("invalid_job", "failed", str(exc)) from exc
     return {
         "domain": job["domain"], "brand": job["brand"], "category_path": o.get("category_path") or "beauty",
-        "source_role": "retailer", "retailer_name": o.get("retailer_name"), "only_vendors": vendors,
+        "source_role": "retailer", "retailer_name": o.get("retailer_name"), "only_vendors": list(o["vendors"]),
         "require_currency": o.get("require_currency") or "USD", "emit_real_variants": True,
         "enrich_missing_gtin": True, "max_products": int(o.get("max_products") or 200),
         "max_scan_products": int(o.get("max_scan_products") or 20000),
@@ -54,7 +92,8 @@ def _feed_payload(job: Dict[str, Any]) -> Dict[str, Any]:
 def _transient(crawl: Dict[str, Any]) -> bool:
     reason = str(crawl.get("reason") or "")
     return crawl.get("status") == "failed" and bool(
-        re.search(r"HTTP (?:429|5\d\d)|timeout|Timeout|TransportError|ConnectError", reason))
+        re.search(r"HTTP (?:429|5\d\d)|[Tt]imeout|TransportError|NetworkError|ConnectError|ReadError|"
+                  r"WriteError|RemoteProtocolError|ProtocolError|PoolTimeout", reason))
 
 
 async def _crawl(job: Dict[str, Any], stage: str) -> List[Dict[str, Any]]:
@@ -108,7 +147,7 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
         checks["excluded"] = sorted(matched)
         for handle in sorted(excluded - matched):
             flags.append({"key": f"exclude_handle_unmatched:{handle}", "rule": "exclude_handle_unmatched",
-                          "severity": detectors.BLOCK, "handle": handle,
+                          "severity": detectors.BLOCK, "acceptable": False, "handle": handle,
                           "detail": "an approved exclusion no longer matches any product"})
     if o.get("only_category") or o.get("only_resolved_category"):
         try:
@@ -122,7 +161,7 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
     inspection = inspect_primary_plan(plan)
     checks["plan"] = {k: inspection.get(k) for k in ("status", "reasons", "planned", "unresolved_category_count")}
     if inspection.get("reasons"):
-        flags.append({"key": "plan_not_ready", "rule": "plan_not_ready", "severity": detectors.BLOCK,
+        flags.append({"key": "plan_not_ready", "rule": "plan_not_ready", "severity": detectors.BLOCK, "acceptable": False,
                       "detail": f"primary plan {inspection.get('status')}: {inspection.get('reasons')}"})
 
     legacy = await cli._legacy_listing_report(plan, check=True)
@@ -131,7 +170,7 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
     checks["brand_host_guard"] = {k: guard.get(k) for k in ("status", "rows_at_risk", "planned_groups")}
     for name, report in (("legacy_listings", legacy), ("brand_host_guard", guard)):
         if report.get("status") in ("conflicts", "error"):
-            flags.append({"key": name, "rule": name, "severity": detectors.BLOCK,
+            flags.append({"key": name, "rule": name, "severity": detectors.BLOCK, "acceptable": False,
                           "detail": json.dumps(report, default=str)[:600]})
 
     flags.extend(detectors.detect(records))
@@ -176,9 +215,46 @@ async def _readback(product_keys: List[str], currency: str, db: Any) -> Dict[str
     return {"ok": not problems, "problems": problems, "rows": out}
 
 
+async def _move(job: Dict[str, Any], *, db: Any, **fields: Any) -> bool:
+    """Every transition is conditional on the status this stage claimed: a job an operator
+    cancelled while its crawl ran keeps its cancellation (the stage's verdict is recorded on the
+    run only)."""
+    moved = await ledger.transition(job["id"], expected_status=job["status"], db=db, **fields)
+    if not moved:
+        job["superseded"] = True
+    return moved
+
+
 async def run_stage(job: Dict[str, Any], *, db: Any) -> Dict[str, Any]:
-    """Run the job's due stage and record it. Returns {job_id, stage, outcome, status, reason}."""
+    """Run the job's due stage and record it. Returns {job_id, stage, outcome, status, reason}
+    (+ superseded=True when an operator changed the job while the stage ran)."""
+    out = await _run_stage(job, db=db)
+    if job.get("superseded"):
+        out = {**out, "superseded": True}
+    return out
+
+
+async def _run_stage(job: Dict[str, Any], *, db: Any) -> Dict[str, Any]:
     stage = APPLY if job["status"] == "apply_due" else DRY_RUN
+    # The previous execution was killed mid-stage (task timeout, OOM): its run never finished.
+    interrupted = await ledger.unfinished_run(job["id"], db=db)
+    if interrupted:
+        note = "execution ended before the stage finished (task timeout or OOM)"
+        await ledger.finish_run(interrupted["id"], outcome="interrupted", error=note, db=db)
+        if interrupted["stage"] == APPLY:
+            # It may have written part of the cohort. Never re-apply blindly.
+            reason = f"the previous apply was interrupted and may be partial; review before re-queueing"
+            await _move(job, status="failed", run_id=interrupted["id"], reason=reason, db=db)
+            return {"job_id": job["id"], "stage": APPLY, "outcome": "interrupted", "status": "failed",
+                    "reason": reason}
+        attempts = int(job.get("attempts") or 0) + 1
+        if attempts >= int(job.get("max_attempts") or 6):
+            await _move(job, status="failed", run_id=interrupted["id"], count_attempt=True,
+                        reason=f"retry budget spent: {note}", db=db)
+            return {"job_id": job["id"], "stage": DRY_RUN, "outcome": "interrupted", "status": "failed"}
+        await _move(job, status=job["status"], run_id=interrupted["id"], count_attempt=True,
+                    next_run_at=ledger.backoff_until(attempts - 1), reason=f"retry later: {note}", db=db)
+        return {"job_id": job["id"], "stage": DRY_RUN, "outcome": "interrupted", "status": job["status"]}
     run_id = await ledger.start_run(job_id=job["id"], stage=stage,
                                     image_sha=os.getenv("PIVOTA_COMMIT_SHA") or os.getenv("IMAGE_SHA"),
                                     execution=os.getenv("CLOUD_RUN_EXECUTION"), db=db)
@@ -190,14 +266,14 @@ async def run_stage(job: Dict[str, Any], *, db: Any) -> Dict[str, Any]:
                    "checks": result["checks"], "flags": result["flags"]}
         if result["blocking"]:
             await ledger.finish_run(run_id, outcome="held", **summary, db=db)
-            await ledger.transition(job["id"], status="held", run_id=run_id,
+            await _move(job, status="held", run_id=run_id,
                                     reason=f"{len(result['blocking'])} blocking flag(s): "
                                            + ", ".join(sorted({f['rule'] for f in result['blocking']})),
                                     db=db)
             return {"job_id": job["id"], "stage": stage, "outcome": "held", "status": "held"}
         if stage == DRY_RUN:
             await ledger.finish_run(run_id, outcome="clean", **summary, db=db)
-            await ledger.transition(job["id"], status="apply_due", run_id=run_id,
+            await _move(job, status="apply_due", run_id=run_id,
                                     reason="dry run clean; apply due", next_run_at=datetime.now(timezone.utc),
                                     db=db)
             return {"job_id": job["id"], "stage": stage, "outcome": "clean", "status": "apply_due"}
@@ -205,14 +281,14 @@ async def run_stage(job: Dict[str, Any], *, db: Any) -> Dict[str, Any]:
     except _Stop as stop:
         await ledger.finish_run(run_id, outcome=stop.outcome, checks=result.get("checks"),
                                 flags=result.get("flags"), error=stop.reason, db=db)
-        await ledger.transition(job["id"], status=stop.status, run_id=run_id, reason=stop.reason,
+        await _move(job, status=stop.status, run_id=run_id, reason=stop.reason,
                                 next_run_at=stop.next_run_at, count_attempt=stop.count_attempt, db=db)
         return {"job_id": job["id"], "stage": stage, "outcome": stop.outcome, "status": stop.status,
                 "reason": stop.reason}
     except Exception as exc:  # noqa: BLE001 -- recorded, then re-raised so the job execution fails loudly
         reason = f"{type(exc).__name__}: {exc}"
         await ledger.finish_run(run_id, outcome="error", checks=result.get("checks"), error=reason, db=db)
-        await ledger.transition(job["id"], status="failed", run_id=run_id, reason=reason[:2000], db=db)
+        await _move(job, status="failed", run_id=run_id, reason=reason[:2000], db=db)
         raise
 
 
@@ -233,7 +309,7 @@ async def _apply(job: Dict[str, Any], run_id: str, result: Dict[str, Any], summa
         report = getattr(exc, "report", None) or getattr(getattr(exc, "__cause__", None), "report", None)
         await ledger.finish_run(run_id, outcome="apply_refused", **summary, applied=report,
                                 error=str(exc), db=db)
-        await ledger.transition(job["id"], status="failed", run_id=run_id,
+        await _move(job, status="failed", run_id=run_id,
                                 reason=f"apply refused (may be partial): {str(exc)[:600]}", db=db)
         return {"job_id": job["id"], "stage": APPLY, "outcome": "apply_refused", "status": "failed"}
 
@@ -248,5 +324,5 @@ async def _apply(job: Dict[str, Any], run_id: str, result: Dict[str, Any], summa
                             db=db)
     reason = ("applied and verified" if ok else
               f"{outcome}: gate {gate.get('reasons')}; readback {readback.get('problems')}")
-    await ledger.transition(job["id"], status="done" if ok else "failed", run_id=run_id, reason=reason, db=db)
+    await _move(job, status="done" if ok else "failed", run_id=run_id, reason=reason, db=db)
     return {"job_id": job["id"], "stage": APPLY, "outcome": outcome, "status": "done" if ok else "failed"}

@@ -12,11 +12,17 @@ def test_creating_the_job_is_not_arming_it(monkeypatch, capsys):
     assert json.loads(capsys.readouterr().out.split(drain.SUMMARY_MARKER, 1)[1]) == {"outcome": "disabled"}
 
 
-async def test_nothing_due_is_idle(monkeypatch):
+async def _counts(**kw):
+    return {"held": 2, "queued": 5}
+
+
+async def test_nothing_due_is_idle_and_still_reports_held_jobs(monkeypatch):
     async def no_job(**kw):
         return None
     monkeypatch.setattr(drain.ledger, "claim_due_job", no_job)
-    assert await drain.drain_once(lease_seconds=60, db=object()) == {"outcome": "idle"}
+    monkeypatch.setattr(drain.ledger, "status_counts", _counts)
+    assert await drain.drain_once(lease_seconds=60, db=object()) == {"outcome": "idle",
+                                                                     "jobs": {"held": 2, "queued": 5}}
 
 
 async def test_one_claimed_job_runs_exactly_one_stage(monkeypatch):
@@ -29,6 +35,7 @@ async def test_one_claimed_job_runs_exactly_one_stage(monkeypatch):
         calls.append(job["id"])
         return {"job_id": job["id"], "outcome": "clean", "status": "apply_due"}
     monkeypatch.setattr(drain.ledger, "claim_due_job", one_job)
+    monkeypatch.setattr(drain.ledger, "status_counts", _counts)
     monkeypatch.setattr(drain, "run_stage", stage)
     assert (await drain.drain_once(lease_seconds=60, db=object()))["outcome"] == "clean"
     assert calls == ["rij_1"]

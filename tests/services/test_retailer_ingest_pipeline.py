@@ -37,6 +37,11 @@ PALETTE = ("3CE - New Take Eyeshadow Palette", "", "new-take")
 class Ledger:
     def __init__(self):
         self.runs, self.transitions = {}, []
+        self.unfinished = None      # the previous run a killed execution left behind
+        self.current_status = None  # set to simulate an operator changing the job mid-stage
+
+    async def unfinished_run(self, job_id, db=None):
+        return self.unfinished
 
     async def start_run(self, *, job_id, stage, image_sha, execution, db=None):
         run_id = f"run{len(self.runs)}"
@@ -45,11 +50,13 @@ class Ledger:
 
     async def finish_run(self, run_id, **fields):
         fields.pop("db", None)
-        self.runs[run_id].update(fields)
+        self.runs.setdefault(run_id, {}).update(fields)
 
     async def transition(self, job_id, **fields):
         fields.pop("db", None)
         self.transitions.append(fields)
+        expected = fields.get("expected_status")
+        return self.current_status is None or expected is None or expected == self.current_status
 
     @staticmethod
     def backoff_until(attempts, **kw):
@@ -201,3 +208,62 @@ async def test_a_record_in_another_currency_stops_the_stage(env):
     env.rows = [TINT + ("<p>Soft velvet lips.</p>", "SGD")]
     out = await pipeline.run_stage(job(), db=env.db)
     assert out["status"] == "failed" and out["outcome"] == "currency_unproven"
+
+
+async def test_a_cancel_while_the_crawl_ran_is_not_overwritten(env):
+    env.ledger.current_status = "cancelled"  # an operator cancelled mid-stage
+    out = await pipeline.run_stage(job(), db=env.db)
+    assert out.get("superseded") is True
+    assert env.ledger.transitions[-1]["expected_status"] == "queued"
+
+
+async def test_every_transition_is_conditional_on_the_claimed_status(env):
+    env.rows = [TINT, TONE_UP]
+    await pipeline.run_stage(job(), db=env.db)
+    await pipeline.run_stage(job("apply_due", exclude_handles=["3ce-tone-up-tint-40ml"]), db=env.db)
+    assert [t["expected_status"] for t in env.ledger.transitions] == ["queued", "apply_due"]
+
+
+async def test_an_interrupted_apply_fails_and_is_never_reapplied(env):
+    env.ledger.unfinished = {"id": "run_killed", "stage": "apply"}
+    out = await pipeline.run_stage(job("apply_due"), db=env.db)
+    assert out["status"] == "failed" and out["outcome"] == "interrupted"
+    assert env.applied == []
+    assert env.ledger.runs == {"run_killed": {"outcome": "interrupted",
+                                              "error": env.ledger.runs["run_killed"]["error"]}}
+
+
+async def test_an_interrupted_dry_run_spends_an_attempt_and_backs_off(env):
+    env.ledger.unfinished = {"id": "run_killed", "stage": "dry_run"}
+    out = await pipeline.run_stage(job(), db=env.db)
+    t = env.ledger.transitions[-1]
+    assert out["outcome"] == "interrupted" and t["status"] == "queued" and t["count_attempt"]
+    assert t["next_run_at"] is not None
+
+
+async def test_cohort_level_flags_cannot_be_accepted(env, monkeypatch):
+    async def conflict(plan, *, check):
+        return {"status": "conflicts", "conflict_count": 1, "rows_at_risk": 5}
+    monkeypatch.setattr(cli, "_brand_host_guard_report", conflict)
+    out = await pipeline.run_stage(job("apply_due", accepted_flags=["brand_host_guard"]), db=env.db)
+    assert out["status"] == "held" and env.applied == []
+
+
+async def test_a_read_error_is_transient(env):
+    env.crawl_error = feed.CrawlIncomplete("x: page 3: ReadError: connection reset", status="failed",
+                                           next_page=3, scanned_products=500, selected_products=2)
+    out = await pipeline.run_stage(job(), db=env.db)
+    assert out["outcome"] == "crawl_throttled" and out["status"] == "queued"
+
+
+@pytest.mark.parametrize("options", [
+    {"vendors": ["3CE"], "category_path": "beauty/makeup/lip/lipstick"},  # a leaf fallback
+    {"vendors": "3CE"},                                                    # a string splits into letters
+    {"vendors": ["3CE"], "max_scan_products": "20000"},
+    {"vendors": ["3CE"], "apply_now": True},
+])
+async def test_invalid_options_are_refused_before_any_crawl(env, options):
+    bad = job()
+    bad["options"] = options
+    out = await pipeline.run_stage(bad, db=env.db)
+    assert out["status"] == "failed" and out["outcome"] == "invalid_job"

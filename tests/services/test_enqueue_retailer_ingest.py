@@ -15,6 +15,8 @@ def test_a_row_becomes_a_job_with_vendors_in_its_options():
     {"domain": "k-touch.us", "brand": "3CE"},                                   # no vendors
     {"domain": "", "brand": "3CE", "vendors": ["3CE"]},                          # no domain
     {"domain": "k-touch.us", "brand": "3CE", "vendors": ["3CE"], "options": {"apply": True}},  # unknown option
+    {"domain": "k-touch.us", "brand": "3CE", "vendors": ["3CE"],
+     "options": {"category_path": "beauty/makeup/lip/lipstick"}},                            # leaf fallback
 ])
 def test_bad_rows_are_refused(row):
     with pytest.raises(ValueError):

@@ -71,6 +71,9 @@ async def claim_due_job(*, lease_seconds: int, db: Any = None) -> Optional[Dict[
             WHERE status IN ('queued', 'apply_due')
               AND next_run_at <= NOW()
               AND (lease_until IS NULL OR lease_until < NOW())
+              -- one crawl at a time: a slow stage still holding its lease blocks the next tick
+              AND NOT EXISTS (SELECT 1 FROM retailer_ingest_jobs busy
+                              WHERE busy.lease_until > NOW())
             ORDER BY priority DESC, next_run_at, created_at
             LIMIT 1
             FOR UPDATE SKIP LOCKED
@@ -120,22 +123,30 @@ async def finish_run(run_id: str, *, outcome: str, crawl: Any = None, plan: Any 
 
 async def transition(job_id: str, *, status: str, reason: Optional[str], run_id: Optional[str],
                      next_run_at: Optional[datetime] = None, count_attempt: bool = False,
-                     db: Any = None) -> None:
-    """Move a job to its next state and release the lease. `count_attempt` spends retry budget
-    (transient failures only: a clean dry run advancing to apply_due does not)."""
+                     expected_status: Optional[str] = None, db: Any = None) -> bool:
+    """Move a job to its next state and release the lease; returns whether it moved.
+
+    `expected_status` makes the move conditional on the status the stage CLAIMED: an operator who
+    cancelled the job while its crawl ran must not be overwritten by the stage's verdict (review of
+    #2263: cancelled -> apply_due -> applied). `count_attempt` spends retry budget (transient
+    failures only: a clean dry run advancing to apply_due does not)."""
     write_db = db or database
-    await write_db.execute(
-        """
+    guard = "AND status = :expected" if expected_status else ""
+    row = await write_db.fetch_one(
+        f"""
         UPDATE retailer_ingest_jobs
         SET status = :status, status_reason = :reason, last_run_id = COALESCE(:run_id, last_run_id),
-            next_run_at = COALESCE(:next_run_at, next_run_at),
-            attempts = attempts + CASE WHEN :count THEN 1 ELSE 0 END,
+            next_run_at = COALESCE(CAST(:next_run_at AS timestamptz), next_run_at),
+            attempts = attempts + CASE WHEN CAST(:count AS boolean) THEN 1 ELSE 0 END,
             lease_until = NULL, updated_at = NOW()
-        WHERE id = :id
+        WHERE id = :id {guard}
+        RETURNING id
         """,
         {"id": job_id, "status": status, "reason": (reason or None) and reason[:2000], "run_id": run_id,
-         "next_run_at": next_run_at, "count": bool(count_attempt)},
+         "next_run_at": next_run_at, "count": bool(count_attempt),
+         **({"expected": expected_status} if expected_status else {})},
     )
+    return bool(row)
 
 
 async def approve(job_id: str, *, approved_by: str, exclude_handles: List[str],
@@ -167,7 +178,9 @@ async def cancel(job_id: str, *, by: str, reason: str, db: Any = None) -> bool:
     write_db = db or database
     row = await write_db.fetch_one(
         "UPDATE retailer_ingest_jobs SET status='cancelled', status_reason=:r, lease_until=NULL, "
-        "updated_at=NOW() WHERE id=:id AND status IN ('queued','apply_due','held') RETURNING id",
+        "updated_at=NOW() WHERE id=:id AND status IN ('queued','apply_due','held') "
+        # A stage is running: its verdict would race the cancel. Refuse; the caller retries later.
+        "AND (lease_until IS NULL OR lease_until < NOW()) RETURNING id",
         {"id": job_id, "r": f"cancelled by {by}: {reason}"[:2000]},
     )
     return bool(row)
@@ -188,6 +201,21 @@ async def job_runs(job_id: str, *, db: Any = None) -> List[Dict[str, Any]]:
     rows = await read_db.fetch_all(
         "SELECT * FROM retailer_ingest_runs WHERE job_id = :id ORDER BY started_at DESC", {"id": job_id})
     return [dict(r) for r in rows]
+
+
+async def unfinished_run(job_id: str, *, db: Any = None) -> Optional[Dict[str, Any]]:
+    """The job's latest run, when it never finished: its execution was killed (timeout, OOM)."""
+    read_db = db or database
+    row = await read_db.fetch_one(
+        "SELECT id, stage, started_at, finished_at FROM retailer_ingest_runs WHERE job_id = :id "
+        "ORDER BY started_at DESC LIMIT 1", {"id": job_id})
+    return dict(row) if row and row["finished_at"] is None else None
+
+
+async def status_counts(*, db: Any = None) -> Dict[str, int]:
+    read_db = db or database
+    rows = await read_db.fetch_all("SELECT status, count(*) AS n FROM retailer_ingest_jobs GROUP BY status")
+    return {r["status"]: int(r["n"]) for r in rows}
 
 
 def backoff_until(attempts: int, *, now: Optional[datetime] = None, base_minutes: int = 30,

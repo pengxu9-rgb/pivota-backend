@@ -118,3 +118,47 @@ async def test_a_bad_status_is_refused_by_the_schema(db):
     job_id = await _enqueue(db, brand="HERA", options={"vendors": ["HERA"]})
     with pytest.raises(Exception):
         await ledger.transition(job_id, status="processing", reason="x", run_id=None, db=db)
+
+
+
+async def test_a_transition_is_conditional_on_the_claimed_status(db):
+    await _only_ours_due(db)
+    job_id = await _enqueue(db, brand="CANCEL", options={"vendors": ["X"]})
+    claimed = await ledger.claim_due_job(lease_seconds=3600, db=db)
+    assert claimed["id"] == job_id
+    # an operator cannot cancel a job whose stage is running...
+    assert not await ledger.cancel(job_id, by="peng", reason="mid-crawl", db=db)
+    # ...and if the status changed anyway, the stage's verdict does not overwrite it
+    await db.execute("UPDATE retailer_ingest_jobs SET status='cancelled' WHERE id=:id", {"id": job_id})
+    assert not await ledger.transition(job_id, status="apply_due", reason="clean", run_id=None,
+                                       expected_status="queued", db=db)
+    row = await db.fetch_one("SELECT status FROM retailer_ingest_jobs WHERE id=:id", {"id": job_id})
+    assert row["status"] == "cancelled"
+
+
+async def test_a_backoff_datetime_and_an_attempt_are_written(db):
+    job_id = await _enqueue(db, brand="BACKOFF", options={"vendors": ["X"]})
+    when = ledger.backoff_until(1)
+    assert await ledger.transition(job_id, status="queued", reason="429", run_id=None, next_run_at=when,
+                                   count_attempt=True, expected_status="queued", db=db)
+    row = await db.fetch_one("SELECT attempts, next_run_at FROM retailer_ingest_jobs WHERE id=:id", {"id": job_id})
+    assert row["attempts"] == 1 and abs((row["next_run_at"] - when).total_seconds()) < 1
+
+
+async def test_a_live_lease_blocks_every_other_claim(db):
+    await _only_ours_due(db)
+    first = await _enqueue(db, brand="ONE", options={"vendors": ["A"]})
+    await _enqueue(db, brand="TWO", options={"vendors": ["B"]})
+    assert (await ledger.claim_due_job(lease_seconds=3600, db=db))["id"] == first
+    assert await ledger.claim_due_job(lease_seconds=3600, db=db) is None  # one crawl at a time
+
+
+async def test_an_unfinished_run_is_found(db):
+    job_id = await _enqueue(db, brand="KILLED", options={"vendors": ["X"]})
+    run_id = await ledger.start_run(job_id=job_id, stage="apply", image_sha=None, execution=None, db=db)
+    found = await ledger.unfinished_run(job_id, db=db)
+    assert found["id"] == run_id and found["stage"] == "apply"
+    await ledger.finish_run(run_id, outcome="interrupted", db=db)
+    assert await ledger.unfinished_run(job_id, db=db) is None
+    counts = await ledger.status_counts(db=db)
+    assert counts.get("queued", 0) >= 1

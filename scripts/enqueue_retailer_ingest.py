@@ -27,9 +27,11 @@ if str(ROOT) not in sys.path:
 
 from db import retailer_ingest as ledger  # noqa: E402
 
-_ALLOWED = {"require_currency", "category_path", "only_category", "only_resolved_category",
-            "lip_title_evidence", "exclude_handles", "max_scan_products", "max_products",
-            "max_pdp_identity_fetches", "retailer_name", "notes"}
+from services.retailer_ingest.pipeline import _OPTION_TYPES, validate_options  # noqa: E402
+
+# Everything a row may put in `options` (vendors is a top-level row field). One source of truth:
+# the pipeline's own validator, which also re-checks every job at execution.
+_ALLOWED = set(_OPTION_TYPES) - {"vendors", "accepted_flags"}
 
 
 def _row_to_job(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -42,6 +44,7 @@ def _row_to_job(row: Dict[str, Any]) -> Dict[str, Any]:
     if unknown:
         raise ValueError(f"unknown options {sorted(unknown)} in {row}")
     options["vendors"] = vendors
+    validate_options(options)  # the same check the drain runs before any crawl
     return {"domain": domain, "brand": brand, "options": options, "priority": int(row.get("priority") or 0)}
 
 

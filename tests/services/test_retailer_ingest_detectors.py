@@ -105,3 +105,24 @@ def _warmish_and_mood():
 def test_an_absurd_price_alone_marks_a_placeholder():
     rec = record("Velvet Lip Tint Plush 4g", "LIP TINT", "priced-placeholder", price="1500.00")
     assert "placeholder_product" in rules(detectors.detect([rec]), detectors.BLOCK)
+
+
+
+@pytest.mark.parametrize("title,ptype,body", [
+    ("Pyunkang Yul Hand Cream", "Hand Cream", "<p>Rich cream for dry hands.</p>"),  # body/care on purpose
+    ("Vaseline Lip Therapy Original 20g", "Lip Balm", "<p>Soothes chapped skin in a tin.</p>"),
+    ("Healing Balm Tin 12g", "Lip Balm", "<p>Soothes and protects dry, chapped skin with pure petroleum jelly "
+                                        "in a handy travel tin for everyday use.</p>"),
+    ("Sugar Lip Scrub 30g", "Lip Scrub", "<p>Exfoliates dry, flaky skin.</p>"),
+    ("Velvet Lip Tint 4g", "LIP TINT", "<p>" + "벨벳 립 틴트, 입술에 부드럽게 발리는 컬러. " * 3 + "</p>"),
+])
+def test_review_false_positives_do_not_hold(title, ptype, body):
+    rec = record(title, ptype, title.lower().replace(" ", "-"), body=body)
+    assert rec is not None
+    assert detectors.blocking(detectors.detect([rec])) == [], detectors.detect([rec])
+
+
+def test_a_set_filed_as_one_product_is_held():
+    rec = record("[OHUI] Miracle Moisture Cleansing Oil Special Set", "Cleansing Oil", "cleansing-oil-set",
+                 body="<p>A cleansing oil set.</p>")
+    assert "set_filed_as_single_product" in rules(detectors.detect([rec]), detectors.BLOCK)

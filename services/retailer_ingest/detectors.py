@@ -30,8 +30,18 @@ _LIP_PREFIX = "beauty/makeup/lip/"
 # ("brighten ... your complexion", "dull skin") and a Soft Matte Lipstick page carrying a rice
 # CLEANSER's pasted description never do. A face-word list was tried first and held 4 of the 10 real
 # lipsticks ("flatters every skin tone", "brightens the complexion") -- lipstick copy uses those words.
-_LIP_WORD = re.compile(r"\b(?:lips?|lipsticks?|lip\s*(?:colou?r|tint|gloss|balm|liner|stain)|pout|mouth|smile)\b", re.I)
+_LIP_WORD = re.compile(r"\b(?:lips?|lipsticks?|lip\s*(?:colou?r|tint|gloss|balm|liner|stain)|pout|mouth|smile)\b|립|입술", re.I)
 _MIN_COPY_CHARS = 60  # shorter copy is not evidence either way
+# Balms and scrubs are the lip leaves whose copy talks about "chapped skin" and whose tins and jars
+# run 20-30 g (Vaseline Lip Therapy 20g, Sugar Lip Scrub 30g): the copy and size rules skip them.
+_LIP_COLOUR_LEAVES = frozenset({"beauty/makeup/lip/lipstick", "beauty/makeup/lip/tint", "beauty/makeup/lip/gloss",
+                                "beauty/makeup/lip/liner", "beauty/makeup/lip/oil"})
+# Area leaves the non-face rule (#2248) files a product under on purpose; its title names the face
+# leaf it was moved AWAY from ("Hand Cream" -> body/care), which is not a contradiction.
+_AREA_LEAF = re.compile(r"^beauty/(?:body|haircare)/")
+# A set/kit/multi-pack filed as ONE product: its own shelf is beauty/sets.
+_SET_TITLE = re.compile(r"\b(?:sets?|kits?|bundles?|trio|\d+\s*-?\s*(?:pcs|pieces?|ea)|special\s+edition|"
+                        r"duo\s+edition|double\s+edition|\d+\s*x\s*\d+\s*(?:ml|g))\b", re.I)
 
 # A lip product ships in a few ml/g (balm tins reach ~15-18 g); 20+ is a face or body format.
 _SIZE = re.compile(r"(\d+(?:\.\d+)?)\s*(ml|g|oz|fl\.?\s*oz)\b", re.I)
@@ -103,11 +113,13 @@ def detect(records: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
         is_lip = category.startswith(_LIP_PREFIX)
 
         if is_lip:
-            if len(copy.strip()) >= _MIN_COPY_CHARS and not _LIP_WORD.search(copy):
+            if (category in _LIP_COLOUR_LEAVES and len(copy.strip()) >= _MIN_COPY_CHARS
+                    and not _LIP_WORD.search(copy)):
                 flags.append(_flag("lip_row_copy_not_about_lips", BLOCK, record,
                                    f"filed under {category} but its {len(copy)}-char description never "
                                    f"mentions lips: {copy.strip()[:90]!r}"))
-            big = [s for s in _size_units(f"{title} {variant_titles}") if s >= 20]
+            big = [s for s in _size_units(f"{title} {variant_titles}") if s >= 20] \
+                if category in _LIP_COLOUR_LEAVES else []
             if big:
                 flags.append(_flag("lip_row_implausible_size", BLOCK, record,
                                    f"filed under {category} at {max(big):g} ml/g; lip formats are a few ml/g"))
@@ -123,9 +135,13 @@ def detect(records: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
         # type (or a measured shelf) and the product's own name disagree. "Essence Toner" on a
         # "Cleansers" shelf names serum AND toner -- neither is cleanser.
         named = _title_paths(title)
-        if category and named and category not in named:
+        if category and named and category not in named and not _AREA_LEAF.match(category):
             flags.append(_flag("title_contradicts_category", BLOCK, record,
                                f"filed under {category}; the title names {sorted(named)}"))
+
+        if category and not category.startswith("beauty/sets/") and _SET_TITLE.search(title):
+            flags.append(_flag("set_filed_as_single_product", BLOCK, record,
+                               f"the title names a set/multi-pack but it is filed under {category}"))
 
         prices = _prices(record)
         vendor = str(pdp.get("brand") or "")
@@ -137,6 +153,9 @@ def detect(records: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def blocking(flags: Iterable[Dict[str, Any]], *, accepted: Iterable[str] = ()) -> List[Dict[str, Any]]:
-    """The BLOCK flags an approval has not accepted by key."""
+    """The BLOCK flags an approval has not accepted by key (cohort-level flags are never accepted)."""
     ok = set(accepted or ())
-    return [f for f in flags if f.get("severity") == BLOCK and f.get("key") not in ok]
+    # A cohort-level flag (plan not ready, a guard conflict) names no row: accepting its key would
+    # accept every future instance of it, so it can never be accepted -- only fixed.
+    return [f for f in flags if f.get("severity") == BLOCK
+            and (f.get("acceptable") is False or f.get("key") not in ok)]

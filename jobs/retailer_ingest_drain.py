@@ -36,11 +36,13 @@ SUMMARY_MARKER = "retailer_ingest_drain: "
 
 
 async def drain_once(*, lease_seconds: int, db: Any = None) -> Dict[str, Any]:
+    """One stage, plus the lane's job counts by status on every execution -- including idle ones --
+    so a store held for review raises a signal even while nothing is being claimed."""
     db = db or database
     job = await ledger.claim_due_job(lease_seconds=lease_seconds, db=db)
-    if not job:
-        return {"outcome": "idle"}
-    return await run_stage(job, db=db)
+    summary = {"outcome": "idle"} if not job else await run_stage(job, db=db)
+    summary["jobs"] = await ledger.status_counts(db=db)
+    return summary
 
 
 def main() -> int:
