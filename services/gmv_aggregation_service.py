@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Optional
 
@@ -479,9 +480,30 @@ async def reroll_stale_days(
         },
     )
     outcomes = await recompute_days_for_edges(edges)
-    summary: dict[str, int] = {"stale_days": len(outcomes)}
-    for outcome in outcomes.values():
-        summary[outcome] = summary.get(outcome, 0) + 1
+    return {"stale_days": len(outcomes), **Counter(outcomes.values())}
+
+
+async def run_nightly_rollup(*, now: Optional[datetime] = None) -> dict[str, int]:
+    """The daily job: roll up yesterday, then re-roll every earlier day left stale since its roll-up.
+
+    The sweep runs even if yesterday's roll-up raised, because a day with no rows is one of the days
+    it heals; the roll-up's error is re-raised after it. A cancelled run (deadline, cancel-running,
+    shutdown) raises CancelledError, which is not an Exception, so it unwinds without starting a sweep.
+    """
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    yesterday = (now - timedelta(days=1)).date()
+    rollup_error: Optional[Exception] = None
+    try:
+        rows = await aggregate_daily(yesterday)
+        logger.info("gmv_aggregation_daily date=%s rollup_rows=%d", yesterday.isoformat(), rows)
+    except Exception as exc:  # noqa: BLE001 -- re-raised below, after the sweep
+        rollup_error = exc
+    summary = await reroll_stale_days(now=now)
+    # WARNING when a stale day was left stale: prod drops a module logger's INFO.
+    log = logger.info if summary["stale_days"] == summary.get(RECOMPUTED, 0) else logger.warning
+    log("gmv_rollup_stale_day_sweep %s", summary)
+    if rollup_error is not None:
+        raise rollup_error
     return summary
 
 

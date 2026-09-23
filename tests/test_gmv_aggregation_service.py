@@ -638,3 +638,76 @@ async def test_reroll_stale_days_hands_the_changed_edges_to_the_guarded_recomput
         "created_before": datetime(2026, 5, 21, tzinfo=timezone.utc),
         "max_days": service.STALE_SWEEP_MAX_DAYS,
     }
+
+
+def _nightly_stubs(monkeypatch: pytest.MonkeyPatch, *, rollup, sweep_summary=None) -> list[Any]:
+    calls: list[Any] = []
+
+    async def fake_aggregate_daily(d: date) -> int:
+        calls.append(("rollup", d))
+        return await rollup()
+
+    async def fake_sweep(*, now: datetime) -> dict[str, int]:
+        calls.append(("sweep", now))
+        return sweep_summary or {"stale_days": 1, "recomputed": 1}
+
+    monkeypatch.setattr(service, "aggregate_daily", fake_aggregate_daily)
+    monkeypatch.setattr(service, "reroll_stale_days", fake_sweep)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_the_nightly_job_rolls_up_yesterday_then_sweeps(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def ok() -> int:
+        return 3
+
+    calls = _nightly_stubs(monkeypatch, rollup=ok)
+    now = datetime(2026, 5, 22, 1, tzinfo=timezone(timedelta(hours=9)))  # 16:00 UTC on the 21st
+
+    assert await service.run_nightly_rollup(now=now) == {"stale_days": 1, "recomputed": 1}
+    assert calls == [("rollup", date(2026, 5, 20)), ("sweep", now.astimezone(timezone.utc))]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_rollup_still_sweeps_and_then_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def down() -> int:
+        raise ConnectionError("db blip")
+
+    calls = _nightly_stubs(monkeypatch, rollup=down)
+
+    with pytest.raises(ConnectionError):
+        await service.run_nightly_rollup(now=datetime(2026, 5, 22, tzinfo=timezone.utc))
+    assert [c[0] for c in calls] == ["rollup", "sweep"]
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_rollup_does_not_start_a_sweep(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The deadline watchdog, cancel-running and shutdown cancel the run: it must unwind, not sweep."""
+    import asyncio
+
+    async def cancelled() -> int:
+        raise asyncio.CancelledError()
+
+    calls = _nightly_stubs(monkeypatch, rollup=cancelled)
+
+    with pytest.raises(asyncio.CancelledError):
+        await service.run_nightly_rollup(now=datetime(2026, 5, 22, tzinfo=timezone.utc))
+    assert [c[0] for c in calls] == ["rollup"]
+
+
+@pytest.mark.asyncio
+async def test_a_day_the_sweep_could_not_heal_is_logged_as_a_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    async def ok() -> int:
+        return 0
+
+    _nightly_stubs(monkeypatch, rollup=ok,
+                   sweep_summary={"stale_days": 2, "recomputed": 1, "invoiced_period_manual_credit": 1})
+    with caplog.at_level(logging.INFO, logger="services.gmv_aggregation_service"):
+        await service.run_nightly_rollup(now=datetime(2026, 5, 22, tzinfo=timezone.utc))
+
+    sweep_logs = [r for r in caplog.records if "gmv_rollup_stale_day_sweep" in r.getMessage()]
+    assert [r.levelno for r in sweep_logs] == [logging.WARNING]
