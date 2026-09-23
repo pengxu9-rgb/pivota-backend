@@ -938,7 +938,7 @@ async def ensure_required_schema_light() -> None:
                 )
             except Exception:  # noqa: BLE001
                 pass
-            # mig 236: the partner's rate and cut on an agent-share ledger row (ADR-025 D5,
+            # mig 236: the partner's settled amount and cut on an agent-share ledger row (ADR-025 D5,
             # the agent's share is taken after a channel partner's). create_all built
             # agent_share_ledger without them and never alters an existing table, so this is what
             # lands them in prod. THIS DDL MUST MATCH db/migrations/236_agent_share_after_partner.sql
@@ -949,7 +949,8 @@ async def ensure_required_schema_light() -> None:
                     text(
                         """
                         ALTER TABLE IF EXISTS agent_share_ledger
-                            ADD COLUMN IF NOT EXISTS partner_share_bp INTEGER,
+                            ADD COLUMN IF NOT EXISTS partner_settled_minor BIGINT,
+                            ADD COLUMN IF NOT EXISTS merchant_billed_minor BIGINT,
                             ADD COLUMN IF NOT EXISTS partner_cut_minor BIGINT;
                         """
                     )

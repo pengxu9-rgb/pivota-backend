@@ -131,8 +131,13 @@ async def run_settlement(billing_run_id: int) -> int:
     return payout_count
 
 
-async def load_partner_commission_config(channel_partner_id: int) -> Optional[dict[str, Any]]:
-    """The partner's commission config, or None when the partner does not exist."""
+async def compute_partner_comp(
+    channel_partner_id: int,
+    period_start: date,
+    period_end: date,
+) -> dict[str, Any]:
+    """Compute one channel partner's compensation for a billing period."""
+
     partner_row = await database.fetch_one(
         """
         SELECT id, commission_config_json
@@ -142,35 +147,11 @@ async def load_partner_commission_config(channel_partner_id: int) -> Optional[di
         {"channel_partner_id": channel_partner_id},
     )
     if not partner_row:
-        return None
-    return _coerce_json(_row_get(partner_row, "commission_config_json"))
-
-
-def gmv_take_share_bp_from_config(config: dict[str, Any]) -> int:
-    """The partner's share of Pivota's GMV take, in bp. ONE reader of this field: settlement pays
-    the partner with it, and agent share accrual deducts the partner's cut with it."""
-    return _as_int(config.get("gmv_take_share_bp"))
-
-
-async def partner_gmv_take_share_bp(channel_partner_id: int) -> Optional[int]:
-    """The partner's GMV-take share in bp, or None when the partner does not exist."""
-    config = await load_partner_commission_config(channel_partner_id)
-    return None if config is None else gmv_take_share_bp_from_config(config)
-
-
-async def compute_partner_comp(
-    channel_partner_id: int,
-    period_start: date,
-    period_end: date,
-) -> dict[str, Any]:
-    """Compute one channel partner's compensation for a billing period."""
-
-    config = await load_partner_commission_config(channel_partner_id)
-    if config is None:
         raise ValueError(f"Channel partner not found: {channel_partner_id}")
 
+    config = _coerce_json(_row_get(partner_row, "commission_config_json"))
     subscription_share_bp = _as_int(config.get("subscription_rev_share_bp"))
-    gmv_take_share_bp = gmv_take_share_bp_from_config(config)
+    gmv_take_share_bp = _as_int(config.get("gmv_take_share_bp"))
     subsidy_cap_cents = _as_int(config.get("subsidy_cap_cents"))
 
     subscription_revenue_by_merchant = await _subscription_revenue_by_merchant(
@@ -271,6 +252,61 @@ async def compute_partner_comp(
         "period_start": period_start.isoformat(),
         "period_end": period_end.isoformat(),
     }
+
+
+# ── what a partner was actually paid, for agent share accrual (ADR-025 D5) ────────────────────
+
+_PARTNERS_ATTRIBUTED_TO_MERCHANT_SQL = """
+SELECT DISTINCT channel_partner_id FROM partner_attribution WHERE merchant_id = :merchant_id
+"""
+_SNAPSHOT_FOR_PARTNER_SQL = """
+SELECT snapshot_payload_jsonb FROM settlement_snapshots
+WHERE billing_run_id = :billing_run_id AND channel_partner_id = :channel_partner_id
+"""
+
+
+def merchant_gmv_share_cents(snapshot_payload: Any, merchant_id: str) -> int:
+    """A partner's GMV-take share for one merchant, from a settlement snapshot of EITHER engine.
+
+    v1 (compute_partner_comp) records it as merchant_accruals[m]["gmv_take_rev_cents"], and v2
+    (partner_rev_share_engine_v2) as ["gmv_share_cents"]. This is the gross share, before subsidy
+    caps and clawbacks, which only lower what is paid.
+    """
+    payload = _coerce_json(snapshot_payload)
+    accrual = (payload.get("merchant_accruals") or {}).get(str(merchant_id)) or {}
+    if not isinstance(accrual, dict):
+        return 0
+    value = accrual.get("gmv_share_cents", accrual.get("gmv_take_rev_cents"))
+    return max(_as_int(value), 0)
+
+
+async def settled_partner_gmv_share(
+    billing_run_id: int, merchant_id: str, also_partner_ids: Optional[set] = None,
+) -> Optional[dict[str, Any]]:
+    """What channel partners were PAID from one merchant's GMV take in one billing run.
+
+    The partners that can claim the merchant are the ones run_settlement settles for it: any
+    partner_attribution row for the merchant (any status), plus `also_partner_ids` (the rollup
+    row's channel_partner_id). Each is settled in the run for this merchant's period, because the
+    merchant has billed edges in it.
+
+    Returns None while any of them has no snapshot for the run (settlement has not run yet), else
+    {"partner_ids": [...], "settled_cents": total}. The amounts come from immutable snapshots, so
+    they never change afterwards, whichever engine (v1 or v2) wrote them.
+    """
+    partners = {int(_row_get(r, "channel_partner_id")) for r in await database.fetch_all(
+        _PARTNERS_ATTRIBUTED_TO_MERCHANT_SQL, {"merchant_id": merchant_id})}
+    partners |= {int(p) for p in (also_partner_ids or set()) if p is not None}
+    total = 0
+    for channel_partner_id in sorted(partners):
+        row = await database.fetch_one(
+            _SNAPSHOT_FOR_PARTNER_SQL,
+            {"billing_run_id": billing_run_id, "channel_partner_id": channel_partner_id},
+        )
+        if row is None:
+            return None
+        total += merchant_gmv_share_cents(_row_get(row, "snapshot_payload_jsonb"), merchant_id)
+    return {"partner_ids": sorted(partners), "settled_cents": total}
 
 
 async def write_settlement_snapshot(

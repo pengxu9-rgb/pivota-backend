@@ -55,7 +55,7 @@ def test_the_model_and_the_migrations_declare_the_same_tables():
     sql = (root / "db/migrations/235_agent_share_accrual.sql").read_text()
     added = _added_columns((root / "db/migrations/236_agent_share_after_partner.sql").read_text(),
                            "agent_share_ledger")
-    assert added == {"partner_share_bp", "partner_cut_minor"}
+    assert added == {"partner_settled_minor", "merchant_billed_minor", "partner_cut_minor"}
     assert _ddl_columns(sql, "agent_share_rates") == {c.name for c in agent_share_rates.columns}
     assert _ddl_columns(sql, "agent_share_ledger") | added == {c.name for c in agent_share_ledger.columns}
     for table in (agent_share_rates, agent_share_ledger):
@@ -84,28 +84,55 @@ def test_the_ops_script_writes_nothing_without_apply():
 def test_schema_guard_lands_migration_236_in_prod():
     # create_all never alters an existing table and prod skips numbered migrations.
     guard = (Path(__file__).resolve().parent.parent / "db/schema_guard.py").read_text()
-    assert _added_columns(guard, "agent_share_ledger") == {"partner_share_bp", "partner_cut_minor"}
+    assert _added_columns(guard, "agent_share_ledger") == {"partner_settled_minor", "merchant_billed_minor",
+                                                           "partner_cut_minor"}
 
 
 @pytest.mark.parametrize(
-    "billed, bp, cut",
+    "line, paid, total, cut",
     [
-        (450, 2000, 90),
-        (451, 2000, 91),       # 90.2 rounds UP: the agent never shares the partner's money
-        (1, 1, 1),
-        (0, 2000, 0),
-        (450, 0, 0),
-        (450, 10000, 450),
-        (450, 20000, 450),     # never more than the line
-        (-5, 2000, 0),
+        (450, 90, 450, 90),
+        (451, 90, 1000, 41),     # 40.59 rounds UP
+        (450, 0, 450, 0),        # the partner was paid nothing
+        (0, 90, 450, 0),
+        (450, 1000, 450, 450),   # paid more than the merchant was billed: the whole line
+        (450, 90, 0, 450),       # nothing billed in the run but a partner was paid: whole line
+        (-5, 90, 450, 0),
     ],
 )
-def test_the_partner_cut_rounds_up_and_stays_within_the_line(billed, bp, cut):
-    assert svc.partner_cut(billed, bp) == cut
+def test_the_partner_cut_rounds_up_and_stays_within_the_line(line, paid, total, cut):
+    assert svc.partner_cut(line, paid, total) == cut
 
 
-@pytest.mark.parametrize("billed", range(0, 2000, 7))
-@pytest.mark.parametrize("partner_bp, agent_bp", [(2000, 2500), (3333, 10000), (10000, 10000), (1, 9999)])
-def test_partner_plus_agent_never_exceeds_the_billed_line(billed, partner_bp, agent_bp):
-    cut = svc.partner_cut(billed, partner_bp)
-    assert cut + svc.compute_share(billed - cut, agent_bp) <= billed
+@pytest.mark.parametrize("lines", [[450], [100, 200, 151], [1, 1, 1, 997], [333] * 7, [5, 10000, 7, 1]])
+@pytest.mark.parametrize("paid_fraction", [0.0, 0.01, 0.2, 0.3333, 0.5, 0.99, 1.0])
+@pytest.mark.parametrize("agent_bp", [2500, 10000])
+def test_partner_plus_agents_never_exceed_what_the_merchant_was_billed(lines, paid_fraction, agent_bp):
+    total = sum(lines)
+    paid = int(total * paid_fraction)
+    cuts = [svc.partner_cut(line, paid, total) for line in lines]
+    # The cuts cover at least what the partners were paid...
+    assert sum(cuts) >= paid
+    # ...so partners + agents never exceed the merchant's billed total, nor any line exceed itself.
+    agents = [svc.compute_share(line - cut, agent_bp) for line, cut in zip(lines, cuts)]
+    assert paid + sum(agents) <= total
+    assert all(c + a <= line for line, c, a in zip(lines, cuts, agents))
+
+
+@pytest.mark.parametrize(
+    "payload, cents",
+    [
+        ({"merchant_accruals": {"m": {"gmv_share_cents": 90}}}, 90),          # v2 engine
+        ({"merchant_accruals": {"m": {"gmv_take_rev_cents": 70}}}, 70),       # v1 engine
+        ('{"merchant_accruals": {"m": {"gmv_share_cents": 55}}}', 55),        # JSONB returned as text
+        ({"merchant_accruals": {"other": {"gmv_share_cents": 90}}}, 0),       # not this merchant
+        ({"merchant_accruals": {"m": {"gmv_share_cents": -5}}}, 0),
+        ({}, 0),
+        ("not json", 0),
+        (None, 0),
+    ],
+)
+def test_the_settled_share_is_read_from_either_engine_s_snapshot(payload, cents):
+    from services.partner_settlement_service import merchant_gmv_share_cents
+
+    assert merchant_gmv_share_cents(payload, "m") == cents

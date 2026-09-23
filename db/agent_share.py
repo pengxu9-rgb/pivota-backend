@@ -74,9 +74,11 @@ agent_share_ledger = Table(
     Column("rate_id", BigInteger, nullable=True),
     Column("target_minor", BigInteger, nullable=False),
     Column("basis", String(32), nullable=False),
-    # Set only on a line whose rollup row names a channel partner: the partner's rate and the cut
-    # deducted before the agent's rate applied (migration 236; schema_guard adds them in prod).
-    Column("partner_share_bp", Integer, nullable=True),
+    # Set only when a channel partner can claim the merchant: what settlement paid the partner(s)
+    # from the merchant's take in the run, the merchant's billed total in the run, and this line's
+    # cut (migration 236; schema_guard adds them in prod).
+    Column("partner_settled_minor", BigInteger, nullable=True),
+    Column("merchant_billed_minor", BigInteger, nullable=True),
     Column("partner_cut_minor", BigInteger, nullable=True),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
     CheckConstraint("entry_kind IN ('accrual', 'adjustment')", name="ck_agent_share_ledger_kind"),

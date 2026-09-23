@@ -20,13 +20,16 @@ from billing, never re-derived from rates (review of #2273):
   are not mirrored locally yet; that is a follow-up. A dispute's replacement line
   (`dispute_adj`) carries no rollup link, so it is not credited to an agent. That errs in Pivota's
   favour and needs a follow-up.
-- A line whose rollup row also names a CHANNEL PARTNER is shared AFTER the partner (decision
-  2026-09-23): the partner's cut is deducted first, rounded UP, and the agent's rate applies to what
-  is left. So partner + agent never exceeds the billed line. The partner's rate is the one partner
-  settlement pays with (partner_settlement_service.partner_gmv_take_share_bp, one reader). A
-  partner that no longer exists accrues 0 (basis `partner_share_unknown`); we cannot size its cut.
-  Settlement's subsidy cap and clawbacks only ever LOWER what the partner is paid, so deducting the
-  full cut keeps the agent's share conservative.
+- The agent's share comes AFTER any channel partner's (decision 2026-09-23). The partner's cut is
+  what settlement actually PAID the partner(s) from this merchant's GMV take in this billing run,
+  read from the immutable settlement snapshots (partner_settlement_service.settled_partner_gmv_share,
+  which reads either engine's snapshot). That covers every line of a partner-attributed merchant,
+  not only partner-tagged rows, and it never re-prices once settled (review of #2275). The paid
+  amount is spread over the merchant's billed lines in the run, each line's cut rounded UP:
+      cut = min(line, ceil(line x partner_paid / merchant_billed_in_run))
+  so the cuts add up to at least what the partners were paid, and partner + agents never exceeds
+  what was billed. While any partner that can claim the merchant is not yet settled for the run,
+  the line waits (basis `partner_settlement_pending`, 0, retried).
 - share_bp is the agent's rate in force at 00:00 UTC of the billed day. Rates are forward-only
   (set_agent_share_rate), so a billed day is never re-priced. No rate means 0, and the table starts
   empty.
@@ -63,7 +66,7 @@ _PAID_INVOICE_STATUS = "paid"
 RATE_START_SKEW = timedelta(minutes=5)
 
 _LINE_FOR_UPDATE_SQL = """
-SELECT bri.id AS line_id, bri.merchant_id, bri.source_type, bri.source_id AS rollup_id,
+SELECT bri.id AS line_id, bri.billing_run_id, bri.merchant_id, bri.source_type, bri.source_id AS rollup_id,
        bri.amount_cents, bri.voided_at, bri.stripe_invoice_id,
        g.date AS billed_day, g.agent_id, g.channel_partner_id,
        inv.status AS invoice_status, inv.paid_at
@@ -72,6 +75,13 @@ LEFT JOIN gmv_attribution_daily g ON g.id = bri.source_id AND bri.source_type = 
 LEFT JOIN invoices inv ON inv.stripe_invoice_id = bri.stripe_invoice_id
 WHERE bri.id = :line_id
 FOR UPDATE OF bri
+"""
+
+# The denominator for spreading a partner's paid share: this merchant's billed lines in the run.
+_MERCHANT_BILLED_IN_RUN_SQL = """
+SELECT COALESCE(SUM(amount_cents), 0) AS total FROM billing_run_items
+WHERE billing_run_id = :billing_run_id AND merchant_id = :merchant_id
+  AND source_type = 'gmv_rollup' AND voided_at IS NULL
 """
 
 _LEDGER_SUMS_SQL = """
@@ -94,10 +104,12 @@ LIMIT 1
 _INSERT_ENTRY_SQL = """
 INSERT INTO agent_share_ledger (
   billing_run_item_id, rollup_id, agent_id, merchant_id, currency, entry_kind, amount_minor,
-  billed_minor, share_bp, rate_id, target_minor, basis, partner_share_bp, partner_cut_minor, created_at
+  billed_minor, share_bp, rate_id, target_minor, basis, partner_settled_minor, merchant_billed_minor,
+  partner_cut_minor, created_at
 ) VALUES (
   :line_id, :rollup_id, :agent_id, :merchant_id, :currency, :entry_kind, :amount_minor,
-  :billed_minor, :share_bp, :rate_id, :target_minor, :basis, :partner_share_bp, :partner_cut_minor, :now
+  :billed_minor, :share_bp, :rate_id, :target_minor, :basis, :partner_settled_minor, :merchant_billed_minor,
+  :partner_cut_minor, :now
 )
 """
 
@@ -148,13 +160,18 @@ def compute_share(billed_minor: int, share_bp: int) -> int:
     return max(int(billed_minor), 0) * int(share_bp) // 10000
 
 
-def partner_cut(billed_minor: int, partner_share_bp: int) -> int:
-    """The partner's cut of a billed line, rounded UP. Settlement floors the partner's share over a
-    merchant's whole period, which can exceed the sum of per-line floors; rounding each line's cut
-    up means the agent never shares money the partner is owed."""
-    billed = max(int(billed_minor), 0)
-    bp = max(int(partner_share_bp), 0)
-    return min(billed, -(-billed * bp // 10000))
+def partner_cut(line_minor: int, partner_paid_minor: int, merchant_billed_minor: int) -> int:
+    """This line's part of what partners were paid from the merchant's take, rounded UP and capped
+    at the line. Rounding up makes the cuts over the merchant's lines add to at least the amount
+    paid, so the agents never share money a partner received."""
+    line = max(int(line_minor), 0)
+    paid = max(int(partner_paid_minor), 0)
+    total = max(int(merchant_billed_minor), 0)
+    if paid == 0 or line == 0:
+        return 0
+    if total == 0 or paid >= total:
+        return line
+    return min(line, -(-line * paid // total))
 
 
 def _day_start(day: Any) -> datetime:
@@ -185,16 +202,24 @@ async def accrue_for_line(line_id: int, *, apply: bool = True) -> LineAccrual:
         else:
             basis = "billed_line"
 
-        partner_bp: Optional[int] = None
+        partner_paid: Optional[int] = None
+        merchant_billed: Optional[int] = None
         cut = 0
-        if basis == "billed_line" and line["channel_partner_id"] is not None:
-            from services.partner_settlement_service import partner_gmv_take_share_bp
+        if basis == "billed_line":
+            from services.partner_settlement_service import settled_partner_gmv_share
 
-            partner_bp = await partner_gmv_take_share_bp(int(line["channel_partner_id"]))
-            if partner_bp is None:
-                basis = "partner_share_unknown"
-            else:
-                cut = partner_cut(billed, partner_bp)
+            settled = await settled_partner_gmv_share(
+                int(line["billing_run_id"]), str(line["merchant_id"]),
+                {line["channel_partner_id"]} if line["channel_partner_id"] is not None else None,
+            )
+            if settled is None:
+                basis = "partner_settlement_pending"
+            elif settled["partner_ids"]:
+                partner_paid = int(settled["settled_cents"])
+                merchant_billed = int(dict(await database.fetch_one(_MERCHANT_BILLED_IN_RUN_SQL, {
+                    "billing_run_id": int(line["billing_run_id"]), "merchant_id": line["merchant_id"],
+                }))["total"])
+                cut = partner_cut(billed, partner_paid, merchant_billed)
                 basis = "billed_line_after_partner"
 
         share_bp, rate_id = 0, None
@@ -230,7 +255,8 @@ async def accrue_for_line(line_id: int, *, apply: bool = True) -> LineAccrual:
                 "entry_kind": "accrual" if entries_before == 0 and i == 0 else "adjustment",
                 "amount_minor": w["amount"], "billed_minor": billed, "share_bp": share_bp,
                 "rate_id": rate_id, "target_minor": w["target"], "basis": basis, "now": now,
-                "partner_share_bp": partner_bp, "partner_cut_minor": cut if partner_bp is not None else None,
+                "partner_settled_minor": partner_paid, "merchant_billed_minor": merchant_billed,
+                "partner_cut_minor": cut if partner_paid is not None else None,
             })
 
     return LineAccrual(
@@ -238,7 +264,8 @@ async def accrue_for_line(line_id: int, *, apply: bool = True) -> LineAccrual:
         line_id=line_id, agent_id=agent, target_minor=target,
         written_minor=sum(w["amount"] for w in writes), basis=basis,
         detail={"billed_minor": billed, "share_bp": share_bp, "invoice_status": line["invoice_status"],
-                "partner_share_bp": partner_bp, "partner_cut_minor": cut},
+                "partner_settled_minor": partner_paid, "merchant_billed_minor": merchant_billed,
+                "partner_cut_minor": cut},
     )
 
 
