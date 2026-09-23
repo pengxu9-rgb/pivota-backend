@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import contextlib
+import contextvars
 import html
 import json
 import logging
@@ -1555,6 +1557,24 @@ def _measured_host_type_leaf(*, domain: Optional[str], product_type: Optional[st
 # Deliberately NOT a general title classifier: only a lip leaf, only when the title names that
 # ONE leaf and nothing else, and only where the type and the measured shelf left the row
 # unresolved. What it refuses stays unresolved -- never a guessed leaf:
+#
+# OFF unless an operator asks for it on a manual run (`onboard_curated_brands.py
+# --lip-title-evidence`). The queue worker, the brand-official lane, the key-retirement script and
+# the repair planner all share `_resolve_category`, and none of them sets this: their output is
+# byte-identical to before the door existed.
+_LIP_TITLE_EVIDENCE: contextvars.ContextVar[bool] = contextvars.ContextVar("lip_title_evidence", default=False)
+
+
+@contextlib.contextmanager
+def lip_title_evidence():
+    """Enable `_explicit_lip_title_leaf` for the calls inside this block (and tasks they start)."""
+    token = _LIP_TITLE_EVIDENCE.set(True)
+    try:
+        yield
+    finally:
+        _LIP_TITLE_EVIDENCE.reset(token)
+
+
 _LIP_LEAF_PREFIX = "beauty/makeup/lip/"
 # a multi-use product: "Lip & Cheek", "Eye and Lip Remover", "Lip/Cheek Tint"
 _LIP_MULTI_USE = re.compile(r"\blips?\s*(?:&|\+|/|\band\b)\s*\w|\w\s*(?:&|\+|/|\band\b)\s*lips?\b", re.I)
@@ -1571,6 +1591,8 @@ _LIP_FORM_WORD = re.compile(r"\b(?:gloss|glossy|tint|stain|balm|oil|liner|pencil
 
 def _explicit_lip_title_leaf(*, product_type: Optional[str], title: Optional[str]) -> Optional[str]:
     """The lip leaf a title names outright, or None. The caller asks only for UNRESOLVED rows."""
+    if not _LIP_TITLE_EVIDENCE.get():
+        return None
     from services.pdp_category_classifier import CATEGORY_PATTERNS
     text = str(title or "")
     named = _title_paths(text)

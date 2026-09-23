@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import sys
 from pathlib import Path
@@ -37,7 +38,7 @@ from services.catalog_enrichment_agent.primary_ingestion import (  # noqa: E402
     skipped_by_reason,
 )
 from services.catalog_enrichment_agent.primary_readiness import PrimaryReadinessIncomplete  # noqa: E402
-from services.curated_brand_feed import CrawlIncomplete, records_for_brand  # noqa: E402
+from services.curated_brand_feed import CrawlIncomplete, lip_title_evidence, records_for_brand  # noqa: E402
 from services.catalog_onboard_worker import normalize_curated_brand_payload  # noqa: E402
 
 
@@ -676,6 +677,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         ),
     )
     p.add_argument(
+        "--lip-title-evidence",
+        action="store_true",
+        help=(
+            "let an explicit lip title ('Soft Matte Lipstick', 'Lip Liner') place a product whose "
+            "merchant type and measured shelf left it unresolved. OFF by default and only on this "
+            "run: the queue worker, brand-official lane and repair planner never enable it"
+        ),
+    )
+    p.add_argument(
         "--only-resolved-category",
         action="store_true",
         help=(
@@ -720,8 +730,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     p.add_argument("--apply", action="store_true", help="ingest (else dry-run plan)")
     args = p.parse_args(argv)
+    # asyncio.run copies this context into its task, so the switch covers exactly this run.
+    evidence = lip_title_evidence() if args.lip_title_evidence else contextlib.nullcontext()
     try:
-        return asyncio.run(_run(args))
+        with evidence:
+            return asyncio.run(_run(args))
     except CrawlIncomplete as exc:
         print(json.dumps({"crawl": exc.as_dict()}), file=sys.stderr)
         return 2
