@@ -82,10 +82,14 @@ async def db(monkeypatch):
     try:
         yield database
     finally:
+        # DROP, not DELETE: this file rebuilds these tables in a reduced shape (no migration-only
+        # indexes or generated columns, no channel_partners FK). Leaving that behind would hand
+        # later gate files a table `metadata.create_all(checkfirst=True)` skips. Absent tables are
+        # rebuilt whole by whoever needs them next.
         for table in _TABLES:
             try:
-                await database.execute(f"DELETE FROM {table}")
-            except Exception:  # noqa: BLE001
+                await database.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
+            except Exception:  # noqa: BLE001 -- best-effort cleanup must not mask the test result
                 continue
         if not was_connected and database.is_connected:
             await database.disconnect()
