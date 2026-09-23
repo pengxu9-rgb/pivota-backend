@@ -82,6 +82,11 @@ async def _build_schema(database):
     await database.execute(
         re.search(r"CREATE TABLE IF NOT EXISTS invoices \(.*?\n\);", billing_core, re.S).group(0)
     )
+    # Migration 119's invoices.billing_run_id: set on a GMV invoice, NULL on a mirrored subscription one.
+    assert "ADD COLUMN IF NOT EXISTS billing_run_id BIGINT" in (
+        _MIGRATIONS / "119_invoice_finalizing_status.sql"
+    ).read_text(encoding="utf-8")
+    await database.execute("ALTER TABLE invoices ADD COLUMN IF NOT EXISTS billing_run_id BIGINT")
     for stmt in split_statements((_MIGRATIONS / "120_invoices_billing_period_to_date.sql").read_text(encoding="utf-8")):
         await database.execute(stmt)
     await database.execute(
@@ -264,13 +269,21 @@ async def test_the_sweep_never_rewrites_an_invoiced_day(db, caplog):
     from services import gmv_aggregation_service as gmv
 
     await _edge(db, edge_id="cae_1", order_id="ord_1", gross=10_000, created_at=_at(DAY, 12))
-    # Same day, another merchant, no invoice: the sweep must still heal it.
-    await _edge(db, edge_id="cae_2", order_id="ord_2", gross=8_000, created_at=_at(DAY, 13), merchant="m_other")
+    # Another merchant on the day after the billed period: the sweep must go on and heal it.
+    after = DAY + timedelta(days=1)
+    await _edge(db, edge_id="cae_2", order_id="ord_2", gross=8_000, created_at=_at(after, 13), merchant="m_other")
     await _nightly(db)
+    await _nightly(db, after)
+    # A completed billing run invoiced MERCHANT for a period ending on DAY.
+    run_id = await db.fetch_val(
+        "INSERT INTO billing_runs (period_start, period_end, idempotency_key, status) "
+        "VALUES (:s, :e, 'sweep-run', 'completed') RETURNING id",
+        {"s": DAY - timedelta(days=3), "e": DAY},
+    )
     await db.execute(
-        "INSERT INTO invoices (merchant_id, billing_period_start, billing_period_end, status) "
-        "VALUES (:m, :s, :e, 'finalized')",
-        {"m": MERCHANT, "s": DAY.replace(day=1), "e": DAY + timedelta(days=1)},
+        "INSERT INTO invoices (merchant_id, billing_period_start, billing_period_end, status, billing_run_id) "
+        "VALUES (:m, :s, :e, 'finalized', :run)",
+        {"m": MERCHANT, "s": DAY - timedelta(days=3), "e": DAY, "run": run_id},
     )
     billed = await _rollup(db)
     # Both edges are refunded after the invoice went out.
@@ -283,7 +296,7 @@ async def test_the_sweep_never_rewrites_an_invoiced_day(db, caplog):
 
     assert summary == {"stale_days": 2, "invoiced_period_manual_credit": 1, "recomputed": 1}
     assert await _rollup(db) == billed  # untouched, updated_at included
-    assert _sums(await _rollup(db, merchant="m_other")) == {"g": 8_000, "r": 2_500, "n": 5_500, "bp": 1000, "t": 550}
+    assert _sums(await _rollup(db, after, merchant="m_other")) == {"g": 8_000, "r": 2_500, "n": 5_500, "bp": 1000, "t": 550}
     assert any(
         "gmv_rollup_recompute_skipped_invoiced_day" in r.getMessage() and "cae_1" in r.getMessage()
         for r in caplog.records
