@@ -41,7 +41,11 @@ _OPTION_TYPES = {
     "only_resolved_category": bool, "lip_title_evidence": bool, "exclude_handles": list,
     "accepted_flags": list, "max_scan_products": int, "max_products": int,
     "max_pdp_identity_fetches": int, "retailer_name": str, "notes": str,
+    # "storefront" (default: crawl the retailer's /products.json) or "affiliate_feed" (the network's
+    # product datafeed; services/retailer_ingest/affiliate_feed.py) -- for stores that block crawlers.
+    "source": str, "feed": dict,
 }
+SOURCES = ("storefront", "affiliate_feed")
 
 
 def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
@@ -68,6 +72,14 @@ def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
             raise ValueError(f"options.{key} must be a list of non-empty strings")
     if not options.get("vendors"):
         raise ValueError("options.vendors is required for a retailer cohort")
+    source = options.get("source") or "storefront"
+    if source not in SOURCES:
+        raise ValueError(f"options.source must be one of {list(SOURCES)}")
+    if source == "affiliate_feed":
+        from services.retailer_ingest.affiliate_feed import validate_feed_options
+        validate_feed_options(options.get("feed"))
+    elif "feed" in options:
+        raise ValueError("options.feed is only meaningful with options.source = affiliate_feed")
     path = str(options.get("category_path") or "beauty").strip().strip("/").lower()
     if not (path == "beauty" or path.startswith("beauty/")) or path.count("/") > 1:
         raise ValueError(f"options.category_path must be coarse (beauty or beauty/<area>), got {path!r}")
@@ -96,6 +108,42 @@ def _transient(crawl: Dict[str, Any]) -> bool:
                   r"WriteError|RemoteProtocolError|ProtocolError|PoolTimeout", reason))
 
 
+async def _affiliate_records(job: Dict[str, Any], payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The affiliate datafeed as records, reported like a complete crawl. A download that answers
+    429/5xx or times out is TRANSIENT (backs off exactly like a throttled crawl); a feed or mapping
+    that cannot be trusted fails the job with its reason."""
+    import httpx
+
+    from services.curated_brand_feed import CrawlIncomplete, ShopifyProductBatch
+    from services.retailer_ingest.affiliate_feed import FeedError, feed_rows_to_records, fetch_feed_text, parse_feed
+
+    feed = job["options"]["feed"]
+    if feed["retailer_host"].strip().lower().removeprefix("www.") != job["domain"].strip().lower().removeprefix("www."):
+        raise _Stop("invalid_job", "failed", "options.feed.retailer_host must be the job's domain")
+
+    def incomplete(reason: str) -> CrawlIncomplete:
+        return CrawlIncomplete(f"{job['domain']}: affiliate feed: {reason}", status="failed", next_page=0,
+                               scanned_products=0, selected_products=0)
+    try:
+        text = await fetch_feed_text(feed, env=dict(os.environ))
+    except (httpx.TimeoutException, httpx.TransportError) as exc:
+        raise incomplete(f"{type(exc).__name__}") from exc
+    except FeedError as exc:
+        if re.search(r"HTTP (?:429|5\d\d)", str(exc)):
+            raise incomplete(str(exc)) from exc
+        raise _Stop("feed_invalid", "failed", f"affiliate feed: {exc}") from exc
+    try:
+        rows = parse_feed(text, fmt=feed["format"], json_path=feed.get("json_path"))
+        records = feed_rows_to_records(rows, feed, vendors=payload["only_vendors"],
+                                       category_path=payload["category_path"],
+                                       currency=payload["require_currency"])
+    except (FeedError, ValueError) as exc:
+        raise _Stop("feed_invalid", "failed", f"affiliate feed: {exc}") from exc
+    batch = ShopifyProductBatch(records, scanned_products=len(rows), pages=1)
+    batch.crawl_report["source"] = f"affiliate_feed:{feed['network']}"
+    return batch
+
+
 async def _crawl(job: Dict[str, Any], stage: str) -> List[Dict[str, Any]]:
     from services.catalog_onboard_worker import normalize_curated_brand_payload
     from services.curated_brand_feed import CrawlIncomplete, lip_title_evidence, records_for_brand
@@ -105,7 +153,10 @@ async def _crawl(job: Dict[str, Any], stage: str) -> List[Dict[str, Any]]:
     evidence = lip_title_evidence() if (job.get("options") or {}).get("lip_title_evidence") else contextlib.nullcontext()
     try:
         with evidence:
-            records = await records_for_brand(**{k: v for k, v in payload.items() if k != "market"})
+            if (job.get("options") or {}).get("source") == "affiliate_feed":
+                records = await _affiliate_records(job, payload)
+            else:
+                records = await records_for_brand(**{k: v for k, v in payload.items() if k != "market"})
     except CrawlIncomplete as exc:
         crawl = exc.as_dict()
         if crawl.get("status") == "capped":

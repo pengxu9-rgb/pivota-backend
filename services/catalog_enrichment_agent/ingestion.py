@@ -170,9 +170,20 @@ def derive_product_key(brand: Optional[str], product_name: Optional[str]) -> str
     return f"ext:{prefix}::{digest}"
 
 
+# Hosts whose product URLs name the product in the QUERY, not the path. Measured 2026-09-23:
+# every global.oliveyoung.com product page is /product/detail?prdtNo=GA...; host+path alone would
+# collapse the whole store into ONE listing. For these hosts only, the named parameters join the
+# identity in the table's order (so URL parameter order and tracking params like utm_* never change it). Every other
+# host is byte-identical to host+path. One table, read by every caller of the function below --
+# the ingest key, the planned listings and the legacy-owner finder -- so they cannot disagree.
+_LISTING_QUERY_KEYS = {
+    "global.oliveyoung.com": ("prdtNo",),
+}
+
+
 def retailer_listing_identity(source_domain: str, canonical_url: str) -> str:
     """A retailer listing belongs to its storefront URL, independently of content identity."""
-    from urllib.parse import urlsplit
+    from urllib.parse import parse_qs, urlsplit
 
     host = str(source_domain or "").lower().removeprefix("www.")
     parsed = urlsplit(str(canonical_url or ""))
@@ -180,7 +191,19 @@ def retailer_listing_identity(source_domain: str, canonical_url: str) -> str:
     if (not host or host != url_host or parsed.scheme not in {"http", "https"}
             or parsed.username or parsed.password or parsed.port or not parsed.path.strip("/")):
         raise ValueError("retailer_listing_identity_unproven: source storefront URL must match its host")
-    return host + parsed.path.rstrip("/")
+    identity = host + parsed.path.rstrip("/")
+    keys = _LISTING_QUERY_KEYS.get(host)
+    if keys:
+        query = parse_qs(parsed.query, keep_blank_values=False)
+        values = []
+        for key in keys:
+            found = [v.strip() for v in query.get(key, []) if v.strip()]
+            if len(found) != 1:
+                raise ValueError(f"retailer_listing_identity_unproven: {host} names its product in "
+                                 f"?{key}=, which this URL does not carry exactly once")
+            values.append(f"{key}={found[0]}")
+        identity += "?" + "&".join(values)
+    return identity
 
 
 def _normalize_url(url: Optional[str]) -> str:
