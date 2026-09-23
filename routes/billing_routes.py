@@ -1110,11 +1110,12 @@ async def _handle_invoice_paid(event: Dict[str, Any], db: Database) -> None:
             k: invoice_values[k]
             for k in ("total_cents", "due_date", "finalized_at", "stripe_invoice_id")
         }
+        # paid_at is write-once: a replayed invoice.paid must not move it.
         updated = await db.fetch_one(
             """
             UPDATE invoices
             SET status = 'paid',
-                paid_at = NOW(),
+                paid_at = COALESCE(paid_at, NOW()),
                 total_cents = :total_cents,
                 due_date = :due_date,
                 finalized_at = COALESCE(finalized_at, :finalized_at)
@@ -1174,6 +1175,12 @@ async def _handle_invoice_payment_failed(event: Dict[str, Any], db: Database) ->
             k: invoice_values[k]
             for k in ("total_cents", "due_date", "finalized_at", "stripe_invoice_id")
         }
+        # Stripe does not order events: a failed first attempt can be delivered
+        # after the retry's invoice.paid. 'paid' is terminal for this handler, so
+        # a late payment_failed must never downgrade it (agent share accrual and
+        # partner activation read status='paid'). A paid row matches nothing
+        # here and falls through to _insert_minimal_invoice, whose ON CONFLICT
+        # carries the same guard.
         updated = await db.fetch_one(
             """
             UPDATE invoices
@@ -1182,6 +1189,7 @@ async def _handle_invoice_payment_failed(event: Dict[str, Any], db: Database) ->
                 due_date = :due_date,
                 finalized_at = COALESCE(finalized_at, :finalized_at)
             WHERE stripe_invoice_id = :stripe_invoice_id
+              AND status <> 'paid'
             RETURNING id
             """,
             update_params,
@@ -2014,6 +2022,9 @@ async def _resolve_invoice_merchant_id(db: Database, invoice: Dict[str, Any]) ->
 
 
 async def _insert_minimal_invoice(db: Database, values: Dict[str, Any]) -> None:
+    # The conflict branch keeps a 'paid' row untouched unless the incoming event
+    # is itself 'paid': a late payment_failed that lost the race to insert (or
+    # found the row already paid) must not downgrade it. paid_at is write-once.
     await db.execute(
         """
         INSERT INTO invoices (
@@ -2044,6 +2055,7 @@ async def _insert_minimal_invoice(db: Database, values: Dict[str, Any]) -> None:
             due_date = EXCLUDED.due_date,
             finalized_at = COALESCE(invoices.finalized_at, EXCLUDED.finalized_at),
             paid_at = COALESCE(invoices.paid_at, EXCLUDED.paid_at)
+        WHERE invoices.status <> 'paid' OR EXCLUDED.status = 'paid'
         """,
         values,
     )

@@ -34,6 +34,7 @@ class FakeDB:
         self.fetch_all_calls: list[tuple[str, dict[str, Any]]] = []
         self.fetch_one_calls: list[tuple[str, dict[str, Any]]] = []
         self.transaction_count = 0
+        self.statements: list[str] = []
 
     def transaction(self) -> FakeTransaction:
         return FakeTransaction(self)
@@ -41,6 +42,16 @@ class FakeDB:
     async def fetch_all(self, query: str, values: Optional[dict[str, Any]] = None):
         params = dict(values or {})
         self.fetch_all_calls.append((str(query), params))
+        if "FROM invoices" in str(query):
+            # The billed-day check, which must run under the day lock.
+            assert self.transaction_count > 0, "the invoice check must run inside the transaction"
+            self.statements.append("invoice_check")
+            if getattr(self, "invoice_check_raises", None):
+                raise self.invoice_check_raises
+            wanted = params.get("merchant_id")
+            return [{"merchant_id": m} for m in sorted(getattr(self, "invoiced", set()))
+                    if wanted is None or m == wanted]
+        self.statements.append("rollup_read")
         if "FROM commerce_attribution_edges e" not in str(query):
             raise AssertionError(f"Unexpected fetch_all query: {query}")
         return self._rollup(params["date"], params.get("merchant_id"))
@@ -49,6 +60,10 @@ class FakeDB:
         params = dict(values or {})
         self.fetch_one_calls.append((str(query), params))
         sql = str(query)
+        if "FROM billing_runs" in sql:
+            # A re-roll's unfinished-run check (never the nightly job's).
+            self.statements.append("unfinished_run_check")
+            return {"id": 9} if params.get("merchant_id") in getattr(self, "unfinished_run_merchants", set()) else None
         if "FOR UPDATE" in sql:
             edge_id = params["edge_id"]
             for edge in self.edges:
@@ -73,9 +88,15 @@ class FakeDB:
         sql = str(query)
         self.executed.append((sql, params))
 
+        if "SET LOCAL lock_timeout" in sql:
+            assert self.transaction_count > 0, "SET LOCAL only lasts inside a transaction"
+            self.statements.append("lock_timeout")
+            return None
+
         if "pg_advisory_xact_lock" in sql:
             assert self.transaction_count > 0, "the day lock must be taken inside the transaction"
             self.day_locks = getattr(self, "day_locks", []) + [params["date"]]
+            self.statements.append(f"lock:{params['date']}")
             return None
 
         if "INSERT INTO gmv_attribution_daily" in sql:
@@ -474,3 +495,107 @@ def test_coerce_date_normalizes_non_utc_to_utc_day() -> None:
 
     iso_z_utc = "2026-05-22T00:00:00Z"
     assert service._coerce_date(iso_z_utc) == date(2026, 5, 22)
+
+
+@pytest.mark.asyncio
+async def test_the_day_lock_is_taken_before_the_rollup_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A lock taken after the read serialises nothing: the read it protects is already stale."""
+    target_date = date(2026, 5, 21)
+    fake_db = FakeDB(edges=[_edge(gross=10_000, created_at=datetime(2026, 5, 21, 12, tzinfo=timezone.utc))])
+    monkeypatch.setattr(service, "database", fake_db)
+
+    await service.recompute_for_date(target_date, "merch_1")
+    await service.aggregate_daily(target_date)
+
+    # Keyed on the day alone, so the all-merchant job and a one-merchant recompute serialise. The
+    # billed-day check runs after the lock and before the read: checked outside the lock, it races
+    # the invoice run. Only the refund re-roll bounds its wait; the nightly job does not.
+    lock = f"lock:{target_date}"
+    assert fake_db.statements == ["lock_timeout", lock, "invoice_check", "unfinished_run_check", "rollup_read",
+                                  lock, "invoice_check", "rollup_read"]
+
+
+@pytest.mark.asyncio
+async def test_an_invoiced_merchant_s_day_is_left_as_billed(monkeypatch: pytest.MonkeyPatch) -> None:
+    target_date = date(2026, 5, 21)
+    fake_db = FakeDB(edges=[
+        _edge(gross=10_000, created_at=datetime(2026, 5, 21, 12, tzinfo=timezone.utc)),
+        {**_edge(gross=5_000, created_at=datetime(2026, 5, 21, 12, tzinfo=timezone.utc)),
+         "edge_id": "edge_2", "merchant_id": "merch_2"},
+    ])
+    fake_db.invoiced = {"merch_1"}
+    monkeypatch.setattr(service, "database", fake_db)
+
+    assert await service.recompute_for_date(target_date, "merch_1") == service.INVOICED_PERIOD_MANUAL_CREDIT
+    assert fake_db.daily == {}
+    # The nightly job writes the merchants no invoice covers and leaves the invoiced one alone.
+    assert await service.aggregate_daily(target_date) == 1
+    assert {k[1] for k in fake_db.daily} == {"merch_2"}
+    assert await service.recompute_for_date(target_date, "merch_2") == service.RECOMPUTED
+
+
+@pytest.mark.asyncio
+async def test_a_failed_invoice_check_writes_nothing_and_says_so(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_db = FakeDB(edges=[_edge(gross=10_000, created_at=datetime(2026, 5, 21, 12, tzinfo=timezone.utc))])
+    fake_db.invoice_check_raises = ConnectionError("invoices unreachable")
+    monkeypatch.setattr(service, "database", fake_db)
+    with pytest.raises(service.BilledDayCheckFailed):
+        await service.recompute_for_date(date(2026, 5, 21), "merch_1")
+    assert fake_db.daily == {}
+
+
+@pytest.mark.asyncio
+async def test_recompute_days_for_edges_rolls_each_merchant_day_once_and_never_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[date, str]] = []
+
+    # The billed-day check now runs INSIDE recompute_for_date, under the day lock; this pins how
+    # recompute_days_for_edges maps what it returns and raises.
+    async def fake_recompute(d: date, merchant_id: str) -> str:
+        calls.append((d, merchant_id))
+        if merchant_id == "merch_down":
+            raise ConnectionError("db blip")
+        if merchant_id == "merch_unknown":
+            raise service.BilledDayCheckFailed("ConnectionError: invoices unreachable")
+        if merchant_id == "merch_invoiced":
+            return service.INVOICED_PERIOD_MANUAL_CREDIT
+        return service.RECOMPUTED
+
+    monkeypatch.setattr(service, "recompute_for_date", fake_recompute)
+    tokyo = timezone(timedelta(hours=9))
+    edges = [
+        # Two fan-out edges of one order on one day: one recompute.
+        {"edge_id": "e1", "merchant_id": "merch_1", "created_at": datetime(2026, 5, 21, 1, tzinfo=timezone.utc)},
+        {"edge_id": "e2", "merchant_id": "merch_1", "created_at": datetime(2026, 5, 21, 23, tzinfo=timezone.utc)},
+        # 02:30 Tokyo on the 22nd is the 21st in UTC, the day the rollup bucketed it on.
+        {"edge_id": "e3", "merchant_id": "merch_1", "created_at": datetime(2026, 5, 22, 2, 30, tzinfo=tokyo)},
+        {"edge_id": "e4", "merchant_id": "merch_1", "created_at": datetime(2026, 5, 19, 8, tzinfo=timezone.utc)},
+        {"edge_id": "e5", "merchant_id": "merch_down", "created_at": datetime(2026, 5, 20, tzinfo=timezone.utc)},
+        {"edge_id": "e6", "merchant_id": "merch_invoiced", "created_at": datetime(2026, 5, 20, tzinfo=timezone.utc)},
+        {"edge_id": "e7", "merchant_id": "merch_unknown", "created_at": datetime(2026, 5, 20, tzinfo=timezone.utc)},
+        {"edge_id": "e10", "merchant_id": "merch_1", "created_at": datetime(2026, 5, 17, tzinfo=timezone.utc)},
+        # Unusable rows are skipped, not raised.
+        {"edge_id": "e8", "merchant_id": "merch_1", "created_at": None},
+        {"edge_id": "e9", "merchant_id": None, "created_at": datetime(2026, 5, 18, tzinfo=timezone.utc)},
+    ]
+
+    assert await service.recompute_days_for_edges(edges) == {
+        # A billing run no longer freezes a day by itself: the invoice run reads under the day lock,
+        # so only a merchant's committed invoice does (a not-yet-invoiced merchant re-reads fresh).
+        ("merch_1", date(2026, 5, 17)): "recomputed",
+        ("merch_1", date(2026, 5, 19)): "recomputed",
+        ("merch_1", date(2026, 5, 21)): "recomputed",
+        ("merch_down", date(2026, 5, 20)): "recompute_failed",
+        ("merch_invoiced", date(2026, 5, 20)): "invoiced_period_manual_credit",
+        ("merch_unknown", date(2026, 5, 20)): "invoice_check_failed",
+    }
+    # Every (merchant, day) is attempted once; the check and the skip happen inside the attempt.
+    assert sorted(calls) == [
+        (date(2026, 5, 17), "merch_1"),
+        (date(2026, 5, 19), "merch_1"),
+        (date(2026, 5, 20), "merch_down"),
+        (date(2026, 5, 20), "merch_invoiced"),
+        (date(2026, 5, 20), "merch_unknown"),
+        (date(2026, 5, 21), "merch_1"),
+    ]
