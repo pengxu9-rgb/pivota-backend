@@ -984,7 +984,13 @@ async def _handle_subscription_updated(event: Dict[str, Any], db: Database) -> N
             {"stripe_subscription_id": stripe_subscription_id},
         )
 
-        await db.execute(
+        # Stripe does not order events, and a canceled subscription can never be
+        # reactivated. An update landing on a canceled row describes an earlier
+        # state (delivered after customer.subscription.deleted); applying it
+        # would put the row back to a live status that nothing later cancels,
+        # and the credit wallet and tier reconcile both count a live row as a
+        # paid plan. Leave the canceled row as it is.
+        updated = await db.fetch_one(
             """
             UPDATE user_subscriptions
             SET
@@ -995,6 +1001,8 @@ async def _handle_subscription_updated(event: Dict[str, Any], db: Database) -> N
               cancel_at_period_end = :cancel_at_period_end,
               canceled_at = :canceled_at
             WHERE stripe_subscription_id = :stripe_subscription_id
+              AND status <> 'canceled'
+            RETURNING id
             """,
             {
                 "stripe_subscription_id": stripe_subscription_id,
@@ -1010,6 +1018,18 @@ async def _handle_subscription_updated(event: Dict[str, Any], db: Database) -> N
         if not existing:
             logger.warning(
                 "Subscription update received before local subscription exists: %s",
+                stripe_subscription_id,
+            )
+            await _mark_event_processed(event_id, db)
+            return
+
+        if not updated:
+            # The tier and allowance side effects below must not run either:
+            # the deletion already reconciled this merchant.
+            logger.warning(
+                "Ignoring customer.subscription.updated (status=%s) for canceled "
+                "subscription %s: delivered after the cancellation",
+                status_value,
                 stripe_subscription_id,
             )
             await _mark_event_processed(event_id, db)
