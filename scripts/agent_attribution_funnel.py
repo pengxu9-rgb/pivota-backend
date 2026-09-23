@@ -100,13 +100,17 @@ def build_queries(purchase_cols):
         "p.last_error_code AS last_error_code, p.terminal_at AS terminal_at, "
         "CASE WHEN coalesce(p.reap_order_id, '') = '' THEN 'no_order_id' "
         "WHEN coalesce(p.final_total_minor, 0) <= 0 THEN 'non_positive_amount' "
+        # The closure's ON CONFLICT keeps the FIRST writer for (merchant, order): another path may
+        # have closed this order without our purchase id on it. Found, but not as ours.
+        "WHEN EXISTS (SELECT 1 FROM commerce_attribution_edges e2 "
+        "WHERE e2.external_order_id = p.reap_order_id) THEN 'edge_without_provenance' "
         "ELSE 'missing_edge' END AS reason "
         "FROM reap_agentic_purchases p WHERE p.state = 'completed' AND p.created_at >= :since "
         "AND NOT EXISTS (" + edge_for_purchase + ") ORDER BY p.terminal_at DESC NULLS LAST"
     )
     queries["partner_edge_agent_check"] = (
         "SELECT e.edge_id AS edge_id, coalesce(e.agent_id, '') AS edge_agent, "
-        "coalesce(p.agent_id, '') AS purchase_agent, "
+        "coalesce(p.agent_id, '') AS purchase_agent, (p.id IS NOT NULL) AS purchase_found, "
         "e.metadata -> 'partner_provenance' ->> 'purchase_id' AS purchase_id, e.created_at AS created_at "
         "FROM commerce_attribution_edges e "
         "LEFT JOIN reap_agentic_purchases p ON p.id = e.metadata -> 'partner_provenance' ->> 'purchase_id' "
@@ -185,8 +189,11 @@ def build_funnel(rows, days, now=None):
     for r in missing:
         reasons[r["reason"]] += 1
     checks = rows.get("partner_edge_agent_check") or []
-    no_agent = [r for r in checks if not r["edge_agent"]]
-    mismatch = [r for r in checks if r["edge_agent"] and r["edge_agent"] != r["purchase_agent"]]
+    # An edge whose purchase row is gone is its own problem, not an agent disagreement.
+    orphan = [r for r in checks if not r.get("purchase_found", True)]
+    found = [r for r in checks if r.get("purchase_found", True)]
+    no_agent = [r for r in found if not r["edge_agent"]]
+    mismatch = [r for r in found if r["edge_agent"] and r["edge_agent"] != r["purchase_agent"]]
 
     agent_rows = all_rows[:MAX_AGENTS]
     # Totals are over EVERY agent; only the per-agent table is truncated.
@@ -210,6 +217,7 @@ def build_funnel(rows, days, now=None):
             "partner_edge_without_agent": {"count": len(no_agent),
                                            "rows": no_agent[:MAX_EXCEPTION_ROWS]},
             "agent_mismatch": {"count": len(mismatch), "rows": mismatch[:MAX_EXCEPTION_ROWS]},
+            "orphan_edge": {"count": len(orphan), "rows": orphan[:MAX_EXCEPTION_ROWS]},
         },
         "errors": rows.get("_errors") or {},
     }
@@ -219,10 +227,21 @@ def _pct(n, d):
     return f"{100.0 * n / d:.0f}%" if d else "-"
 
 
+# Display only; the JSON keeps raw minor units. The repo's authoritative lists live in
+# services.reap_webhooks / services.reap_agentic_purchase; this file stays self-contained so it
+# can run inline before it is deployed.
+_ZERO_DECIMAL = frozenset({"JPY", "KRW", "VND", "CLP", "ISK", "UGX", "XAF", "XOF", "PYG", "RWF"})
+_THREE_DECIMAL = frozenset({"KWD", "BHD", "JOD", "OMR", "TND", "LYD", "IQD"})
+
+
 def _money(minor_by_cur):
     if not minor_by_cur:
         return "-"
-    return ", ".join(f"{cur} {m / 100:,.2f}" for cur, m in sorted(minor_by_cur.items()))
+    out = []
+    for cur, m in sorted(minor_by_cur.items()):
+        exp = 0 if cur in _ZERO_DECIMAL else 3 if cur in _THREE_DECIMAL else 2
+        out.append(f"{cur} {m / (10 ** exp):,.{exp}f}")
+    return ", ".join(out)
 
 
 def render(funnel):
@@ -234,6 +253,8 @@ def render(funnel):
         f"partner lane  : opened {t['opened']}  ->  completed {t['completed']} ({_pct(t['completed'], t['opened'])})"
         f"  ->  credited to an agent {t['credited_partner_to_agent']} (partner edges: {t['credited_partner']})",
         f"all credited edges (any source): {t['credited']}",
+        "(each stage is windowed on its own created_at, so a purchase opened before the window and",
+        " credited inside it counts as credited but not opened)",
     ]
     if not funnel["purchases_table"]:
         lines.append("NOTE: reap_agentic_purchases is absent; the partner lane is not measured.")
@@ -258,6 +279,10 @@ def render(funnel):
     lines.append(f"partner edges crediting no agent : {pna['count']}")
     for r in pna["rows"]:
         lines.append(f"    {r['edge_id']}  purchase={r['purchase_id']}  purchase_agent={r['purchase_agent'] or NO_AGENT}")
+    oe = ex["orphan_edge"]
+    lines.append(f"partner edges with no purchase row: {oe['count']}")
+    for r in oe["rows"]:
+        lines.append(f"    {r['edge_id']}  purchase={r['purchase_id']}  edge_agent={r['edge_agent'] or NO_AGENT}")
     mm = ex["agent_mismatch"]
     lines.append(f"edge agent != purchase agent     : {mm['count']}")
     for r in mm["rows"]:
@@ -298,7 +323,9 @@ async def collect(days):
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Per-agent attribution funnel (read-only).")
     ap.add_argument("--days", type=int, default=30)
-    args = ap.parse_args([] if argv is None and sys.argv[:1] == ["-c"] else argv)
+    # Under `python -c`, sys.argv is ["-c", <user args>...], so the default argv=None already
+    # reads exactly the user's arguments -- inline runs honour --days like file runs do.
+    args = ap.parse_args(argv)
     rows = asyncio.run(collect(args.days))
     funnel = build_funnel(rows, args.days)
     print(render(funnel), flush=True)

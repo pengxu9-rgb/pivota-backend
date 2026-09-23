@@ -125,7 +125,9 @@ def test_render_says_when_the_partner_lane_is_unmeasured():
     assert "partner lane is not measured" in f.render(f.build_funnel(rows, 30, now=NOW))
 
 
-def test_inline_invocation_uses_the_defaults(monkeypatch):
+def test_inline_invocation_honours_its_arguments(monkeypatch):
+    # `python -c "$(cat file)" --days 7` puts ["-c", "--days", "7"] in sys.argv; the report must
+    # read --days from it exactly as a file run does (review of #2268).
     seen = {}
 
     async def fake_collect(days):
@@ -133,11 +135,32 @@ def test_inline_invocation_uses_the_defaults(monkeypatch):
         return {"clicks": [], "edges": [], "_errors": {}}
 
     monkeypatch.setattr(f, "collect", fake_collect)
-    monkeypatch.setattr(f.sys, "argv", ["-c"])
     monkeypatch.delenv("CLOUD_RUN_JOB", raising=False)
-    assert f.main() == 0
-    assert seen["days"] == 30
-    assert f.main(["--days", "7"]) == 0 and seen["days"] == 7
+    monkeypatch.setattr(f.sys, "argv", ["-c"])
+    assert f.main() == 0 and seen["days"] == 30
+    monkeypatch.setattr(f.sys, "argv", ["-c", "--days", "7"])
+    assert f.main() == 0 and seen["days"] == 7
+    assert f.main(["--days", "3"]) == 0 and seen["days"] == 3
+
+
+def test_an_edge_without_its_purchase_row_is_an_orphan_not_a_mismatch():
+    rows = {"clicks": [], "edges": [], "_errors": {}, "purchases": [], "completed_without_edge": [],
+            "partner_edge_agent_check": [
+                {"edge_id": "e_orphan", "edge_agent": "agent_x", "purchase_agent": "",
+                 "purchase_found": False, "purchase_id": "rp_gone", "created_at": None},
+                {"edge_id": "e_mm", "edge_agent": "agent_x", "purchase_agent": "agent_y",
+                 "purchase_found": True, "purchase_id": "rp_1", "created_at": None},
+            ]}
+    fn = f.build_funnel(rows, 30, now=NOW)
+    assert [r["edge_id"] for r in fn["exceptions"]["orphan_edge"]["rows"]] == ["e_orphan"]
+    assert [r["edge_id"] for r in fn["exceptions"]["agent_mismatch"]["rows"]] == ["e_mm"]
+    assert "partner edges with no purchase row: 1" in f.render(fn)
+
+
+def test_money_is_displayed_in_each_currency_s_own_minor_unit():
+    assert f._money({"USD": 4500}) == "USD 45.00"
+    assert f._money({"JPY": 4500}) == "JPY 4,500"
+    assert f._money({"KWD": 4500}) == "KWD 4.500"
 
 
 def test_a_query_error_makes_the_run_fail(monkeypatch):

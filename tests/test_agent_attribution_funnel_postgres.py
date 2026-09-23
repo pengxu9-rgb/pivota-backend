@@ -69,11 +69,14 @@ async def _db():
     try:
         yield database
     finally:
-        # Leave the shared gate database as other suites expect to find it.
+        # DROP, not DELETE. This file rebuilds these tables in a reduced shape (no migration-only
+        # indexes, a test that drops item_source). Leaving that behind would hand later gate files
+        # a table that `metadata.create_all(checkfirst=True)` skips, so their ON CONFLICT targets
+        # would be missing (review of #2268). Absent tables are rebuilt whole by whoever needs them.
         for table in _TABLES:
             try:
-                await database.execute(f"DELETE FROM {table}")
-            except Exception:  # noqa: BLE001 -- a table this run never built is not a leak
+                await database.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
+            except Exception:  # noqa: BLE001 -- best-effort cleanup must not mask the test result
                 continue
         if not was_connected and database.is_connected:
             await database.disconnect()
@@ -126,6 +129,15 @@ async def test_the_real_queries_fold_a_realistic_ledger(_db):
     await _purchase(db, "rp_noord", "agent_minds", "completed", order=None, final=3000)
     await _purchase(db, "rp_wait", "agent_minds", "awaiting_approval", source="cart_link")
     await _purchase(db, "rp_other", "agent_b", "completed", order="o5", final=1000)
+    # Closed by another path first: an edge for the order exists, but not with our purchase id.
+    await _purchase(db, "rp_foreign", "agent_minds", "completed", order="o7", final=2000)
+    await db.execute(
+        "INSERT INTO commerce_attribution_edges (edge_id, merchant_id, order_id, external_order_id, "
+        "state, refund_count, refunded_amount, metadata, created_at, updated_at, source) "
+        "VALUES ('e_foreign', 'brand.example', 'ext_foreign', 'o7', 'converted', 0, 0, "
+        "'{}'::jsonb, :now, :now, 'external_redirect')",
+        {"now": NOW},
+    )
     await _edge(db, "e_ok", "agent_minds", purchase_id="rp_ok", refunds=1)
     await _edge(db, "e_noagent", None, purchase_id="rp_other", gmv=1000)
     # Outside the window: must not count.
@@ -139,18 +151,21 @@ async def test_the_real_queries_fold_a_realistic_ledger(_db):
 
     m = by["agent_minds"]
     assert (m["issued"], m["clicked"]) == (1, 1)
-    assert (m["opened"], m["completed"], m["in_flight"]) == (4, 3, 1)
-    assert m["lanes"] == {"reap_variant": 3, "cart_link": 1}
+    assert (m["opened"], m["completed"], m["in_flight"]) == (5, 4, 1)
+    assert m["lanes"] == {"reap_variant": 4, "cart_link": 1}
     assert (m["credited"], m["credited_partner"], m["refunded_edges"]) == (1, 1, 1)
     assert m["credited_minor"] == {"USD": 4500}
     assert by[f.NO_AGENT]["issued"] == 1
 
     ex = fn["exceptions"]
-    assert ex["completed_without_edge"]["by_reason"] == {"missing_edge": 1, "no_order_id": 1}
-    assert {r["purchase_id"] for r in ex["completed_without_edge"]["rows"]} == {"rp_lost", "rp_noord"}
+    assert ex["completed_without_edge"]["by_reason"] == {
+        "missing_edge": 1, "no_order_id": 1, "edge_without_provenance": 1}
+    assert {r["purchase_id"] for r in ex["completed_without_edge"]["rows"]} == {
+        "rp_lost", "rp_noord", "rp_foreign"}
     assert [r["edge_id"] for r in ex["partner_edge_without_agent"]["rows"]] == ["e_noagent"]
     assert ex["partner_edge_without_agent"]["rows"][0]["purchase_agent"] == "agent_b"
     assert ex["agent_mismatch"]["count"] == 0
+    assert ex["orphan_edge"]["count"] == 0
     assert fn["totals"]["credited_partner_to_agent"] == 1
 
 
