@@ -144,6 +144,7 @@ async def _affiliate_records(job: Dict[str, Any], payload: Dict[str, Any]) -> Li
         raise _Stop("feed_invalid", "failed", f"affiliate feed: {exc}") from exc
     batch = ShopifyProductBatch(records, scanned_products=len(rows), pages=1)
     batch.crawl_report["source"] = f"affiliate_feed:{feed['network']}"
+    batch.crawl_report.update(getattr(records, "stats", None) or {})
     return batch
 
 

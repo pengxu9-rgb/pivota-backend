@@ -219,13 +219,28 @@ def test_lookalike_and_unlistable_urls_refuse_the_feed(kw, match):
         _records(_csv(_row("1", "GA1", "3CE Velvet Lip Tint", **kw)))
 
 
-@pytest.mark.parametrize("second", [
-    dict(page=PAGE.format("GA9")),                       # same parent, another listing
-    dict(click=LINK.format("other")),                    # same parent, another click
-])
-def test_rows_of_one_product_that_disagree_refuse_the_feed(second):
+def test_rows_of_one_product_on_another_page_refuse_the_feed():
     with pytest.raises(af.FeedError, match="disagree"):
-        _records(_csv(_row("1", "GA1", "3CE Velvet Lip Tint"), _row("2", "GA1", "3CE Velvet Lip Tint", **second)))
+        _records(_csv(_row("1", "GA1", "3CE Velvet Lip Tint"),
+                      _row("2", "GA1", "3CE Velvet Lip Tint", page=PAGE.format("GA9"))))
+
+
+def test_two_feed_products_on_one_listing_refuse_the_feed():
+    """Review of #2272: shades without a parent_id, each pointing at the shared page, must not merge
+    silently into one listing carrying both titles' prices and links."""
+    with pytest.raises(af.FeedError, match="same listing"):
+        _records(_csv(_row("S1", "", "3CE Velvet Lip Tint", price="18.00", page=PAGE.format("GA1")),
+                      _row("S2", "", "3CE Blur Water Tint", price="25.00", page=PAGE.format("GA1"),
+                           click=LINK.format("S2"))))
+
+
+def test_per_sku_links_and_tracked_pages_collapse_to_one_counted_offer():
+    records = _records(_csv(
+        _row("1", "GA1", "3CE Velvet Lip Tint"),
+        _row("2", "GA1", "3CE Velvet Lip Tint", click=LINK.format("sku2"),
+             page=PAGE.format("GA1") + "&utm_source=feed")))
+    assert len(records) == 1 and records[0]["offers"][0]["destination_url"] == LINK.format("GA1")
+    assert records.stats == {"rows_kept": 2, "products": 1, "sku_links_collapsed": 1}
 
 
 def test_a_row_id_equal_to_another_rows_parent_does_not_merge_into_it():
@@ -310,3 +325,44 @@ async def test_an_oversized_feed_without_a_declared_length_is_refused_while_stre
     _transport(monkeypatch, lambda req: httpx.Response(200, content=body()))
     with pytest.raises(af.FeedError, match="size cap"):
         await af.fetch_feed_text(FEED, env=FEED_ENV)
+
+
+async def test_a_redirect_without_a_location_is_refused_at_once(monkeypatch):
+    import httpx
+    calls = []
+    def handler(req):
+        calls.append(req)
+        return httpx.Response(302)
+    _transport(monkeypatch, handler)
+    with pytest.raises(af.FeedError, match="without a Location"):
+        await af.fetch_feed_text(FEED, env=FEED_ENV)
+    assert len(calls) == 1
+
+
+async def test_a_feed_in_its_declared_charset_decodes(monkeypatch):
+    import httpx
+    _transport(monkeypatch, lambda req: httpx.Response(
+        200, content="a,b\nCaf\u00e9,2\n".encode("latin-1"), headers={"content-type": "text/csv; charset=ISO-8859-1"}))
+    assert await af.fetch_feed_text(FEED, env=FEED_ENV) == "a,b\nCaf\u00e9,2\n"
+
+
+async def test_a_trickling_download_hits_the_overall_deadline(monkeypatch):
+    import httpx
+    async def body():
+        for _ in range(5):
+            yield b"x"
+    _transport(monkeypatch, lambda req: httpx.Response(200, content=body()))
+    with pytest.raises(httpx.ReadTimeout):
+        await af.fetch_feed_text(FEED, env=FEED_ENV, max_download_s=-1)
+
+
+def test_a_malformed_host_keeps_its_storefront_handle():
+    from services.catalog_enrichment_agent.ingestion import listing_handle
+    assert listing_handle("https://[bad/products/abc") == "abc"
+
+
+def test_the_detector_handle_is_decided_by_the_first_product_offer():
+    from services.retailer_ingest.detectors import _handle
+    record = {"offers": [{"canonical_url": "https://k-touch.us/products/"},
+                         {"canonical_url": "https://k-touch.us/products/abc"}]}
+    assert _handle(record) is None

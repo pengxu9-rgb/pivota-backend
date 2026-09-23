@@ -336,6 +336,7 @@ async def test_a_feed_job_dry_runs_clean_from_the_feed_not_the_storefront(oy):
     assert out["status"] == "apply_due" and out["outcome"] == "clean"
     run = list(oy.ledger.runs.values())[-1]
     assert run["checks"]["crawl"]["source"] == "affiliate_feed:example_network"
+    assert run["checks"]["crawl"]["rows_kept"] == 2 and run["checks"]["crawl"]["sku_links_collapsed"] == 0
     assert run["checks"]["selected"] == 2
 
 

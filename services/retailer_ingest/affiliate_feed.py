@@ -156,6 +156,8 @@ def feed_rows_to_records(rows: List[Dict[str, str]], feed: Dict[str, Any], *, ve
     wanted = {" ".join(v.casefold().split()) for v in vendors}
     network = str(feed.get("network") or "unknown")
     seen_ids: set = set()
+    listing_owner: Dict[str, str] = {}   # listing identity -> the one product (group key) that owns it
+    stats = {"rows_kept": 0, "products": 0, "sku_links_collapsed": 0}
 
     def col(row: Dict[str, str], field: str) -> str:
         name = fields.get(field)
@@ -178,7 +180,7 @@ def feed_rows_to_records(rows: List[Dict[str, str]], feed: Dict[str, Any], *, ve
         if _https_host(product_url) != host:
             raise FeedError(f"feed row {row_id!r}: product_url is not an https page on {host}")
         try:
-            retailer_listing_identity(host, product_url)
+            listing = retailer_listing_identity(host, product_url)
         except ValueError as exc:
             raise FeedError(f"feed row {row_id!r}: {exc}") from exc
         link_host = _https_host(link)
@@ -186,16 +188,27 @@ def feed_rows_to_records(rows: List[Dict[str, str]], feed: Dict[str, Any], *, ve
             raise FeedError(f"feed row {row_id!r}: link host is not in options.feed.link_hosts")
         # Separate namespaces, so a row whose id equals another row's parent_id cannot merge into it.
         key = f"p:{col(row, 'parent_id')}" if col(row, "parent_id") else f"i:{row_id}"
+        # One listing, one product: two feed products naming the same page would otherwise merge
+        # into one listing carrying both titles' prices and links.
+        if listing_owner.setdefault(listing, key) != key:
+            raise FeedError(f"feed rows {listing_owner[listing]!r} and {key!r} are different products "
+                            f"on the same listing {listing}")
         product = products.setdefault(key, {
             "id": key, "title": col(row, "title"), "vendor": brand, "handle": _handle(key),
             "product_type": col(row, "category"), "body_html": col(row, "description"),
             "images": [{"src": col(row, "image")}] if col(row, "image") else [],
-            "variants": [], "_product_url": product_url, "_link": link,
+            "variants": [], "_product_url": product_url, "_listing": listing, "_link": link,
         })
-        # One product, one listing, one click. A group that disagrees is refused, never first-row-wins.
-        if (product["_product_url"], product["_link"], " ".join(product["vendor"].casefold().split())) != (
-                product_url, link, " ".join(brand.casefold().split())):
-            raise FeedError(f"feed rows under {key!r} disagree on product_url, link or brand")
+        # One product, one listing, one brand: a group that disagrees is refused. The page is compared
+        # by listing identity, so a tracking parameter on one row's page does not count as a change.
+        if (product["_listing"], " ".join(product["vendor"].casefold().split())) != (
+                listing, " ".join(brand.casefold().split())):
+            raise FeedError(f"feed rows under {key!r} disagree on product_url or brand")
+        # Networks give each SKU its own tracking link. Feed SKUs never become variants (below), so the
+        # product has ONE offer and ONE click: the first row's link. Counted, never silent.
+        if link != product["_link"]:
+            stats["sku_links_collapsed"] += 1
+        stats["rows_kept"] += 1
         product["variants"].append({
             # Namespaced: a network SKU is never a storefront's variant id, even when it is all digits
             # (services.variant_identity would class 8+ digits as merchant-issued and a cart could be
@@ -205,9 +218,11 @@ def feed_rows_to_records(rows: List[Dict[str, str]], feed: Dict[str, Any], *, ve
             "available": _availability(col(row, "availability")),
         })
 
-    records: List[Dict[str, Any]] = []
+    records = FeedRecords()
+    records.stats = stats
     for product in products.values():
         product_url, link = product.pop("_product_url"), product.pop("_link")
+        product.pop("_listing")
         record = shopify_product_to_record(product, domain=host, category_path=category_path,
                                            brand_override=product["vendor"], emit_native_variants=True,
                                            currency=currency, source_role="retailer",
@@ -222,7 +237,13 @@ def feed_rows_to_records(rows: List[Dict[str, str]], feed: Dict[str, Any], *, ve
             # marker primary_ingestion.inspect_primary_plan reads to excuse the native-variant rule.
             offer["validated_at"] = feed_provenance(feed)
         records.append(record)
+    stats["products"] = len(records)
     return records
+
+
+class FeedRecords(list):
+    """The records, plus `stats` for the run's crawl report (rows kept, products, collapsed SKU links)."""
+    stats: Dict[str, int]
 
 
 FEED_PROVENANCE_PREFIX = "affiliate_feed:"
@@ -240,12 +261,17 @@ def _handle(key: str) -> str:
 MAX_REDIRECTS = 5
 
 
-async def fetch_feed_text(feed: Dict[str, Any], *, env: Dict[str, str], timeout_s: float = 120.0) -> str:
+async def fetch_feed_text(feed: Dict[str, Any], *, env: Dict[str, str], timeout_s: float = 120.0,
+                          max_download_s: float = 1200.0) -> str:
     """Download the feed from the URL in the named environment variable. The URL is never logged,
     returned or put in an error: it usually embeds the publisher token. Every hop must be https,
     and the body is streamed against MAX_FEED_BYTES instead of being buffered first."""
     import httpx
 
+    import asyncio
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max_download_s
     url = (env.get(feed["url_env"]) or "").strip()
     if not _https_host(url):
         raise FeedError(f"{feed['url_env']} is not set to an https feed URL in this job's environment")
@@ -253,7 +279,9 @@ async def fetch_feed_text(feed: Dict[str, Any], *, env: Dict[str, str], timeout_
         for _ in range(MAX_REDIRECTS + 1):
             async with client.stream("GET", url) as resp:
                 if resp.is_redirect:
-                    url = str(resp.url.join(resp.headers.get("location", "")))
+                    if not resp.headers.get("location"):
+                        raise FeedError(f"feed download answered HTTP {resp.status_code} without a Location")
+                    url = str(resp.url.join(resp.headers["location"]))
                     if not _https_host(url):
                         raise FeedError("feed download redirected off https")
                     continue
@@ -264,11 +292,16 @@ async def fetch_feed_text(feed: Dict[str, Any], *, env: Dict[str, str], timeout_
                     raise FeedError("feed exceeds the size cap")
                 body = bytearray()
                 async for chunk in resp.aiter_bytes():
+                    if loop.time() > deadline:  # the client timeout is per read, not per download
+                        raise httpx.ReadTimeout("feed download exceeded its overall deadline")
                     body.extend(chunk)
                     if len(body) > MAX_FEED_BYTES:
                         raise FeedError("feed exceeds the size cap")
+                charset = resp.charset_encoding or "utf-8-sig"
+                if charset.lower().replace("_", "-") in {"utf-8", "utf8"}:
+                    charset = "utf-8-sig"
                 try:
-                    return bytes(body).decode("utf-8-sig")
-                except UnicodeDecodeError as exc:
-                    raise FeedError("feed is not UTF-8") from exc
+                    return bytes(body).decode(charset)
+                except (UnicodeDecodeError, LookupError) as exc:
+                    raise FeedError(f"feed does not decode as its declared charset {charset!r}") from exc
     raise FeedError(f"feed download redirected more than {MAX_REDIRECTS} times")

@@ -213,8 +213,11 @@ def listing_handle(canonical_url: Optional[str]) -> Optional[str]:
     from urllib.parse import parse_qs, urlsplit
 
     url = str(canonical_url or "")
-    parsed = urlsplit(url)
-    keys = _LISTING_QUERY_KEYS.get((parsed.hostname or "").lower().removeprefix("www."))
+    try:
+        parsed = urlsplit(url)
+        keys = _LISTING_QUERY_KEYS.get((parsed.hostname or "").lower().removeprefix("www."))
+    except ValueError:  # a malformed host ("https://[bad/...") still has a readable /products/ handle
+        keys = None
     if keys:
         query = parse_qs(parsed.query, keep_blank_values=False)
         found = [v.strip() for key in keys for v in query.get(key, []) if v.strip()]
