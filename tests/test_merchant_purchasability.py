@@ -1517,7 +1517,7 @@ async def test_a_population_row_that_is_not_a_bare_host_is_not_swept(_population
 
 
 async def test_skipped_allowlist_rows_are_counted_in_the_report_and_logged_once(
-    _population, monkeypatch, caplog
+    _population, monkeypatch
 ):
     """Counted, not silently dropped: an unusable row is a merchant an operator meant to enable.
     One warning per RUN carrying the count, and no domain in the log or the report."""

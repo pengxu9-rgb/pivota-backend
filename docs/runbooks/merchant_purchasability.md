@@ -441,8 +441,9 @@ still land. The same applies to `jobs/reap_agentic_purchase_poll.py`'s
 
 A test cannot see this through `caplog`, which hangs its handler on root and turns the level
 down: `tests/pivota_log_capture.py` reads the pivota handler's own stream with root pinned at
-WARNING, and the two `test_the_report_line_lands_on_pivota_stdout_*` tests fail on a
-module-logger emit.
+WARNING; the `*_lands_on_pivota_stdout_*` and `*_does_not_depend_on_the_root_logger` tests in
+both job suites fail on a module-logger emit (4 of 5 sweep tests and all 3 poller tests on a plain
+revert, measured).
 
 ### Gateway (PIVOTA-Agent) change
 

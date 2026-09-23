@@ -166,6 +166,13 @@ logger = logging.getLogger(__name__)
 # own INFO level and stdout handler (propagate=False). Only the report line goes this way; the
 # per-row errors and dial warnings stay on the module logger, where WARNING and above still land.
 # See jobs/merchant_purchasability_sweep.py for the longer note and why root is left alone.
+#
+# DELIBERATELY NOT MOVED: the "step 4 skipped" DEBUG line below. With the rail off this job
+# returns BEFORE the report line, so a disarmed worker emits nothing per tick — unlike the sweep,
+# whose disabled line did move. That is the 30 s interval talking: one INFO line per tick while
+# dark is ~2,900 lines a day saying the same thing, and /__scheduler_health `runs` is the proof
+# of a tick in that state. If an operator needs a per-tick line while dark, move THAT line, not
+# the report's early return.
 
 __all__ = [
     "DIALS",
