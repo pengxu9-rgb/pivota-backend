@@ -139,6 +139,26 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
     # while this file named `treat/toner` and nothing here could reach the 315 prod rows sitting on
     # the gateway's path. Two taxonomies over one column, each calling the other's rows corrupt.
     # Do not retarget this leaf without changing beautyTaxonomy.js in the same breath.
+    # An ACID or PEELING pad is an exfoliant, not a toner. The Toner entry below claims a bare
+    # "pad", which is right for the hydrating/soothing pads that dominate the shelf (Anua Heartleaf
+    # 77% Toner Pad, Torriden Multi Pad, NEOGEN Real Cica Pad) but wrong for an exfoliating one --
+    # measured on sokoglam's own "Physical" shelf, where SOME BY MI "AHA-BHA-PHA 30 Days Miracle
+    # Truecica Clear Pad" and IOPE "Skin Booster Ampoule Peel Pad" both read as toners.
+    # This arm sits ABOVE Toner so first-match-wins reaches it, and it NARROWS nothing: a pad with
+    # no acid and no peel noun still falls through to Toner exactly as before. The acid list is the
+    # exfoliating acids only -- hyaluronic, azelaic and amino acids are NOT exfoliants, and a title
+    # naming an acid without a pad noun is left to the entries below. "Gauze" is deliberately NOT a
+    # noun here: prod holds a "Calming Gauze Pad" (a soothing pad), and NEOGEN's exfoliating gauzes
+    # all say "Bio-Peel ... Peeling" anyway.
+    ("Exfoliant", "beauty/skincare/treat/exfoliant", re.compile(
+        # \A + lookahead: a title that CALLS ITSELF a toner pad keeps the toner leaf, however many
+        # acids it lists ("Ji Woo Gae Cica BHA Blemish Toner Pad" is a BHA toner pad, measured in
+        # prod). The rest of the pattern then scans the whole title for an exfoliating acid near a
+        # pad noun, or an explicit peel/exfoliating pad.
+        r"\A(?!.*\b(?:toner|toning)[-\s]pads?\b)(?s:.)*?"
+        r"(?:\b(?:aha|bha|pha|glycolic|salicylic|lactic|mandelic)\b[^\n]{0,60}?\bpads?\b"
+        r"|\b(?:peel(?:ing)?|exfoliating|exfoliant)[-\s]pads?\b)",
+        re.IGNORECASE)),
     ("Toner", "beauty/skincare/tone/toner", re.compile(
         r"\b(toner|tonic|mist|pad|skin booster)\b", re.IGNORECASE)),
     # An acne / blemish patch is a TREATMENT, not a mask. Google Product Taxonomy 5976 and Shopify

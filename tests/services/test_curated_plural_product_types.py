@@ -46,6 +46,9 @@ def evidence_only(product_type, title, flag_path="beauty"):
     ("sokoglam.com", "Spot", "Mighty Patch - The Original", "beauty/skincare/treat/treatment"),
     ("sokoglam.com", "Spot", "Might Patch - Micropoint for Blemishes", "beauty/skincare/treat/treatment"),  # "blemishes" is no pattern
     ("sokoglam.com", "Spot", "A-Clear Soothing Pink Eraser", "beauty/skincare/treat/treatment"),
+    # 2026-09-23: this shelf became readable once an acid pad stopped reading as a toner.
+    ("sokoglam.com", "Physical", "AHA-BHA-PHA 30 Days Miracle Truecica Clear Pad", "beauty/skincare/treat/exfoliant"),
+    ("sokoglam.com", "Physical", "Bio-Peel Gauze Peeling Wine", "beauty/skincare/treat/exfoliant"),
 ])
 def test_a_measured_shelf_resolves_its_products(domain, ptype, title, want):
     assert resolve(ptype, title, domain) == (want, MEASURED)
@@ -108,7 +111,6 @@ ADVERSARIAL = [
     ("Exfoliators", "APRILSKIN Real Calendula Peel Off Pack (100g)"),
     ("Exfoliators", "Cosrx BHA Blackhead Power Liquid (100ml)"),
     ("Wrinkle Patch", "Anua Triple Acid Spot Care Microdart Patch – Exfoliate & Calm Spots"),
-    ("Physical", "AHA-BHA-PHA 30 Days Miracle Truecica Clear Pad"),
     ("Exfoliator", "Tiela Perfume Therapy Body Scrub Shine"),
 ]
 
@@ -214,6 +216,8 @@ def test_the_planner_never_lets_a_shelf_challenge_a_stored_leaf():
     ("eyurs.com", "Masks, Exfoliators", "Gentle Peeling Gel"),                              # invented
     # Real: "wash" is the cleanser pattern, so the title names a different leaf and the shelf yields.
     ("eyurs.com", "Masks, Exfoliators", "AXIS-Y Mugwort Pore Clarifying Wash Off Pack"),
+    # NEOGEN's soothing pad on the measured "Physical" shelf: its title names the toner leaf.
+    ("sokoglam.com", "Physical", "Dermalogy Real Cica Pad"),
     # Another body area on a face shelf.
     ("sokoglam.com", "Spot", "Body Acne Spot Treatment"),                                   # invented
     ("eyurs.com", "Masks, Exfoliators", "Argan Hair Mask"),                                 # invented
