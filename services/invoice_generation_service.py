@@ -143,10 +143,13 @@ INSERT INTO invoices (
 )
 """
 
+# auto_advance can finalize and charge the invoice before this runs, so
+# invoice.paid may already have landed: never pull a paid invoice back.
 _MARK_INVOICE_FINALIZING_QUERY = """
 UPDATE invoices
 SET status = 'finalizing'
 WHERE stripe_invoice_id = :stripe_invoice_id
+  AND status <> 'paid'
 """
 
 _SELECT_INVOICE_DISPUTE_QUERY = """
