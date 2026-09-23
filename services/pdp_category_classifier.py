@@ -407,18 +407,108 @@ def classify(text: Optional[str]) -> Optional[Tuple[str, str]]:
     return None
 
 
+# FACE skincare leaves: the four shelves a face routine is built from. Sunscreen is deliberately
+# absent -- a body sunscreen IS a sunscreen, and sun/sunscreen names no body area.
+FACE_SKINCARE_LEAF = re.compile(r"^beauty/skincare/(?:cleanse|tone|treat|moisturize)/")
+
+# The body area a product names, and the leaf that area belongs to -- None where the taxonomy has
+# NO honest leaf (no lash/brow-care, nail-care or men's-grooming leaf; see TAXONOMY_GAPS), so the
+# row is left unresolved rather than filed under a face shelf it does not belong to.
+#
+# Why this exists: a pattern keeps only the noun it recognises and drops its qualifier. Measured
+# on ohlolly.com / eyurs.com 2026-09-22: type "Hand Cream" -> moisturize/cream, "Eye Lash Serum"
+# -> treat/serum, a "Body Wash" filed under "Cleanser" -> cleanse/cleanser; and in prod, 60 live
+# seed-mirror rows such as "Peel Off Nail Polish" -> treat/exfoliant (via "peel" / "polish").
+#
+# Whole words only: "Handmade", "Behind", "Splash", "Brown", "Bodied", "Hairline" are not areas,
+# nor is a craft word ("Hand-Picked", "Hand Poured", "Second hand"). "The Body Shop" is a brand.
+_NON_FACE_AREAS = (
+    ("hand", re.compile(r"(?<!second[- ])\bhand(?:s|cream|wash)?\b"
+                        r"(?![- ](?:picked|made|crafted|poured|selected|blended|harvested|tied))", re.I),
+     "beauty/body/care"),
+    ("body", re.compile(r"\bbody\b(?!\s+shop\b)", re.I), "beauty/body/care"),
+    ("foot", re.compile(r"\b(?:foot|feet)\b", re.I), "beauty/body/care"),
+    ("hair", re.compile(r"\b(?:hair|scalp)\b", re.I), "beauty/haircare/general"),
+    ("lash", re.compile(r"\b(?:eye\s?)?lash(?:es)?\b", re.I), None),
+    ("brow", re.compile(r"\b(?:eye)?brows?\b", re.I), None),
+    ("nail", re.compile(r"\b(?:nails?|cuticles?)\b", re.I), None),
+    ("beard", re.compile(r"\bbeards?\b", re.I), None),
+)
+# A title that ALSO names the face ("Face & Body Lotion") is face care too; the old answer stands.
+_FACE_WORD = re.compile(r"\b(?:face|facial)\b", re.I)
+# Phrases that contain an area word but name no product area: "crow's feet" are eye wrinkles
+# (measured in prod on an eye serum; Shopify titles often use a curly apostrophe), and a cleanser
+# "safe for lash extensions" / "gentle on lashes" is a face cleanser.
+_NOT_AN_AREA = re.compile(r"\bcrow[\u2019']?s?[\s-]+feet\b|\b(?:eye\s?)?lash[\s-]+extensions?\b"
+                          r"|\b(?:safe|gentle)\s+(?:for|on)\s+(?:the\s+)?(?:eye\s?)?lash(?:es)?\b", re.I)
+# Hair REMOVAL is body care, not hair care: "Hair Removal Aftercare Serum", "Ingrown Hair Serum".
+_HAIR_REMOVAL = re.compile(r"\b(?:hair[\s-]+removal|ingrown[\s-]+hairs?)\b", re.I)
+
+
+_AREA_LABELS = {"beauty/body/care": "Body Care", "beauty/haircare/general": "Hair Care"}
+
+
+def non_face_leaf(path: Optional[str], *texts: Optional[str]) -> Optional[str]:
+    """The leaf a FACE-leaf answer must become when the product names another body area.
+
+    `texts` are the row's own words (title, merchant product_type, category). Returns None when the
+    rule does not apply -- `path` is not a face skincare leaf, or no non-face area is named, or the
+    face is named too -- so the caller keeps its answer unchanged. Otherwise returns that area's
+    leaf, or "" (no honest leaf: the areas disagree, or the taxonomy has none for them).
+    """
+    if not FACE_SKINCARE_LEAF.match(path or ""):
+        return None
+    text = " ".join(str(v or "") for v in texts)
+    if _FACE_WORD.search(text):
+        return None
+    text = _HAIR_REMOVAL.sub(" body ", _NOT_AN_AREA.sub(" ", text))
+    areas = {name: leaf for name, pattern, leaf in _NON_FACE_AREAS if pattern.search(text)}
+    if not areas:
+        return None
+    # A "Hand & Nail Cream" is a hand cream: nail care is part of the hand shelf.
+    if "hand" in areas:
+        areas.pop("nail", None)
+    leaves = set(areas.values())
+    if len(leaves) == 1 and None not in leaves:
+        return leaves.pop()
+    return ""
+
+
 def resolve_path_from_row(
     *,
     category: Optional[str],
     product_type: Optional[str],
     title: Optional[str],
 ) -> Optional[Tuple[str, str]]:
-    """Try category, product_type, title in priority order. Used by the backfill."""
-    for candidate in (category, product_type, title):
+    """Try category, product_type, title in priority order. Used by the backfill.
+
+    A FACE skincare answer for a row that names another body area is refused, judged on ALL of the
+    row's words: it becomes that area's leaf, or no answer at all where the taxonomy has no honest
+    leaf (nails, lashes, brows, beards). No answer is what keeps the row out of the regex backfill:
+    it is counted as unmatched and left alone, rather than re-filed under a face shelf every run.
+    """
+    return _guard_face_leaf(_first_hit(category, product_type, title), title, product_type, category)
+
+
+def _first_hit(*candidates: Optional[str]) -> Optional[Tuple[str, str]]:
+    for candidate in candidates:
         hit = classify(candidate)
         if hit is not None:
             return hit
     return None
+
+
+def _guard_face_leaf(hit: Optional[Tuple[str, str]], *texts: Optional[str]) -> Optional[Tuple[str, str]]:
+    """`hit` unless it is a face skincare leaf for a product whose `texts` name another body area:
+    then that area's leaf, or None where the taxonomy has no honest leaf."""
+    if hit is None:
+        return None
+    area_leaf = non_face_leaf(hit[1], *texts)
+    if area_leaf is None:
+        return hit
+    if not area_leaf:
+        return None
+    return (_AREA_LABELS.get(area_leaf, hit[0]), area_leaf)
 
 
 # Provenance enum values written to catalog_products.category_label_source.
@@ -449,19 +539,23 @@ def fold_category_from_variants(
     platform_metadata.get("category") / platform_metadata.get("product_type").
 
     Returns ((label, path), source, confidence) or None.
+
+    A product-level answer REFUSED by the non-face rule ends the fold: the product's own words said
+    "nail polish" / "lash serum", and a variant titled "Serum 8ml" or "Top Coat" must not bring the
+    face leaf (or a fashion coat) back. A variant hit is judged on the product's words as well.
     """
-    hit = resolve_path_from_row(category=category, product_type=product_type, title=title)
-    if hit is not None:
-        return (hit, CATEGORY_SOURCE_MERCHANT, CATEGORY_CONFIDENCE_MERCHANT)
+    raw = _first_hit(category, product_type, title)
+    if raw is not None:
+        hit = _guard_face_leaf(raw, title, product_type, category)
+        return (hit, CATEGORY_SOURCE_MERCHANT, CATEGORY_CONFIDENCE_MERCHANT) if hit else None
     for variant in variants or []:
         v_category = _variant_field(variant, "category")
         v_product_type = _variant_field(variant, "product_type")
         v_title = _variant_field(variant, "title")
-        v_hit = resolve_path_from_row(
-            category=v_category, product_type=v_product_type, title=v_title,
-        )
-        if v_hit is not None:
-            return (v_hit, CATEGORY_SOURCE_VARIANT, CATEGORY_CONFIDENCE_VARIANT)
+        v_raw = _first_hit(v_category, v_product_type, v_title)
+        if v_raw is not None:
+            v_hit = _guard_face_leaf(v_raw, title, product_type, category, v_title, v_product_type, v_category)
+            return (v_hit, CATEGORY_SOURCE_VARIANT, CATEGORY_CONFIDENCE_VARIANT) if v_hit else None
     return None
 
 
@@ -498,7 +592,13 @@ async def fold_category_with_llm_fallback(
     if llm is None:
         return None
     label, path, confidence = llm
-    return ((label, path), CATEGORY_SOURCE_LLM, confidence)
+    # The LLM backfill selects `category_path IS NULL`, which is exactly where a row the regex
+    # refused lands; an unguarded LLM answer would re-file a cleared lash serum as a face serum.
+    # Judged on the same words as the regex (not the description, which says "face and hands").
+    guarded = _guard_face_leaf((label, path), title, product_type, category)
+    if guarded is None:
+        return None
+    return (guarded, CATEGORY_SOURCE_LLM, confidence)
 
 
 def _variant_field(variant, key: str) -> Optional[str]:
