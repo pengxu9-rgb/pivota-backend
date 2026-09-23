@@ -990,6 +990,24 @@ async def ensure_required_schema_light() -> None:
                 )
             except Exception:  # noqa: BLE001
                 pass
+            # mig 236: the chargeback part of commerce_attribution_edges.refund_amount_cents.
+            # Every refund and dispute write to the edge names this column
+            # (services/commerce_attribution_service.py _APPLY_REFUND_TOTAL_QUERY,
+            # _ATTRIBUTE_DISPUTE_QUERY), so without it those writes fail, and
+            # RefundService.create_refund makes its write INSIDE its own transaction.
+            # A constant default is a catalog-only change on PG11+, so this does not
+            # rewrite the table. Its OWN try, per this block's rule.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS commerce_attribution_edges
+                            ADD COLUMN IF NOT EXISTS dispute_amount_cents BIGINT NOT NULL DEFAULT 0;
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
             # mig 230: the per-click attribution CLAIM for cart-link Reap purchases,
             # and the index the merchant side needs to ask "is this click one of
             # those?". THIS DDL MUST BUILD THE SAME SCHEMA AS
