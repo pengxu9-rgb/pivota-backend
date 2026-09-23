@@ -64,8 +64,11 @@ logger = logging.getLogger(__name__)
 stripe_client = stripe.StripeClient(api_key=settings.stripe_secret_key or "")
 
 DEFAULT_LOOKBACK_DAYS = 120
-#: A credit left `issuing` longer than this (a crash between Stripe and our write) may be retried.
-#: The retry first adopts a credit note Stripe already holds for it, so it cannot credit twice.
+#: A credit left `issuing` longer than this (a crash between Stripe and our write) may be retried,
+#: or cancelled; either first adopts a credit note Stripe already holds for it. The one race left: an
+#: issue() STILL inside its Stripe call after this long could create its note after a reclaim checked
+#: Stripe and moved on, so a retry would add a second note or a cancel would orphan it. Stripe's
+#: client times out in well under a minute, so the window is theoretical; keep this far above it.
 STALE_ISSUING = timedelta(minutes=15)
 OPEN_STATUSES = ("pending", "approved", "failed")
 _CREDIT_NOTE_REASON = "order_change"
@@ -543,10 +546,13 @@ async def cancel(credit_id: int, *, by: str, reason: str) -> str:
         return "not_cancellable"
     credit = dict(claimed)
     decided = False
+    release_error = "cancel interrupted before Stripe was checked; retry the cancel or the issue"
     try:
         try:
             note = await _existing_note(str(credit["stripe_invoice_id"]), credit_id)
         except Exception as exc:  # noqa: BLE001 -- never cancel blind: that could orphan a live note
+            release_error = (f"cancel refused: the Stripe check for an issued note failed "
+                             f"({type(exc).__name__}: {str(exc)[:300]}); retry the cancel")
             raise CreditActionRefused("stripe_unreachable", "could not check Stripe for an issued note") from exc
         if note is not None:
             await database.execute(_MARK_ISSUED_SQL, {"id": credit_id, "note_id": str(_field(note, "id")),
@@ -564,8 +570,7 @@ async def cancel(credit_id: int, *, by: str, reason: str) -> str:
             # Any exit short of a decision (Stripe unreachable, a cancelled task, a crash) hands the
             # claim back as `failed`, so the credit is never left stuck in `issuing`.
             await database.execute(_RELEASE_CANCEL_CLAIM_SQL, {
-                "id": credit_id, "now": _now(),
-                "error": "cancel interrupted before Stripe was checked; retry the cancel or the issue"})
+                "id": credit_id, "now": _now(), "error": release_error})
 
 
 @dataclass

@@ -875,6 +875,7 @@ async def test_a_failed_credit_is_not_cancelled_blind_when_stripe_cannot_be_aske
     assert r.status_code == 503
     (row,) = await _credits(db, line)
     assert row["status"] == "failed"  # still retryable, still decided
+    assert "Stripe check for an issued note failed" in row["last_error"] and "unreachable" in row["last_error"]
 
 
 async def test_a_partner_clawback_waits_for_the_runs_settlement_to_complete(db, fake_stripe):
@@ -961,6 +962,7 @@ async def test_an_interrupted_cancel_hands_the_credit_back_as_failed(db, fake_st
         await svc.cancel(credit["id"], by="ops", reason="give up")
     (row,) = await _credits(db, line)
     assert row["status"] == "failed"  # not stuck in issuing
+    assert row["last_error"].startswith("cancel interrupted before Stripe was checked")
 
 
 async def test_a_stale_issuing_credit_can_be_cancelled_after_checking_stripe(db, fake_stripe):
