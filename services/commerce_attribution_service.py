@@ -5,7 +5,7 @@ import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from sqlalchemy import select
@@ -598,15 +598,26 @@ RETURNING edge_id, merchant_id, click_id, canonical_product_id,
 """
 
 
-async def attach_refund_to_attribution_edge(
+def _refund_amounts(amount: Any) -> tuple[Decimal, int]:
+    amount_decimal = Decimal(str(amount or "0"))
+    return amount_decimal, int(amount_decimal * Decimal("100"))
+
+
+async def apply_attribution_refund_rows(
     *,
     order_id: str,
     refund_id: str,
     amount: Any,
-) -> Optional[Dict[str, Any]]:
-    amount_decimal = Decimal(str(amount or "0"))
-    amount_cents = int(amount_decimal * Decimal("100"))
-    now = _now()
+) -> List[Dict[str, Any]]:
+    """The refund UPDATE alone, with no side effects. Safe inside a caller's transaction.
+
+    Idempotent per ``refund_id`` on every edge of ``order_id``. `attach_refund_to_attribution_edge`
+    is this plus the commerce event. A caller holding a transaction (the partner adjustment
+    adapter) runs this inside it and emits the event after commit. The event write is
+    best-effort: it swallows a failed statement, and in Postgres that leaves the surrounding
+    transaction aborted.
+    """
+    amount_decimal, amount_cents = _refund_amounts(amount)
     rows = await database.fetch_all(
         _ATTRIBUTE_REFUND_QUERY,
         {
@@ -614,16 +625,25 @@ async def attach_refund_to_attribution_edge(
             "refund_id": refund_id,
             "amount_cents": amount_cents,
             "amount_decimal": amount_decimal,
-            "now": now,
+            "now": _now(),
         },
     )
+    return [dict(r) for r in rows]
+
+
+async def emit_attribution_refund_event(
+    rows: List[Dict[str, Any]],
+    *,
+    order_id: str,
+    refund_id: str,
+    amount: Any,
+) -> None:
+    """Emit ``refund.succeeded`` once for a refund, however many edges it fanned out to."""
     if not rows:
-        return None
-    # Emit the commerce event once per refund regardless of fan-out — one
-    # logical event maps to N attribution edges. Use the first edge's
-    # context for the event metadata since merchant_id is invariant across
+        return
+    # Use the first edge's context for the event metadata since merchant_id is invariant across
     # the fan-out and order_id is the same.
-    first = dict(rows[0])
+    first = rows[0]
     await record_commerce_event_best_effort(
         event_type="refund.succeeded",
         metadata={
@@ -644,9 +664,22 @@ async def attach_refund_to_attribution_edge(
         upstream_idempotency_key=f"refund:{refund_id}",
         **ledger_provenance("commerce_attribution_edge", "unknown"),
     )
+
+
+async def attach_refund_to_attribution_edge(
+    *,
+    order_id: str,
+    refund_id: str,
+    amount: Any,
+) -> Optional[Dict[str, Any]]:
+    rows = await apply_attribution_refund_rows(order_id=order_id, refund_id=refund_id, amount=amount)
+    if not rows:
+        return None
+    await emit_attribution_refund_event(rows, order_id=order_id, refund_id=refund_id, amount=amount)
     # Backwards-compatible return shape: callers expect a single dict.
     # When fan-out exists, surface the first edge with an added edge_count
     # field so callers can distinguish single-edge vs multi-edge refunds.
+    first = dict(rows[0])
     first["edge_count"] = len(rows)
     return first
 
