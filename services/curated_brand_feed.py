@@ -23,6 +23,7 @@ import contextvars
 import html
 import json
 import logging
+import os
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote, urljoin, urlsplit
@@ -40,6 +41,28 @@ logger = logging.getLogger("curated_brand_feed")
 
 _UA = "PivotaCommerceIndex/1.0 (+https://pivota.cc; catalog coverage)"
 _PER_PAGE = 250  # Shopify max
+
+# Attempts per /products.json page before a crawl gives up (CrawlIncomplete). Default 3 -- the value
+# every lane has always used. A large retailer (holiholic.com, koolseoul.com: 5,000-9,000 products)
+# that answers 429 once mid-crawl fails the whole run at 3, and the operator's retry starts again at
+# page 1: MORE requests to the same store than waiting on the throttled page. A one-off crawl may
+# raise it with CURATED_CRAWL_PAGE_ATTEMPTS; crawl_politeness still doubles its hold per consecutive
+# block, so extra attempts are patience, not pressure. Capped; a malformed value refuses.
+_PAGE_ATTEMPTS_DEFAULT = 3
+_PAGE_ATTEMPTS_MAX = 8
+
+
+def _page_attempts() -> int:
+    raw = os.getenv("CURATED_CRAWL_PAGE_ATTEMPTS")
+    if raw is None or not raw.strip():
+        return _PAGE_ATTEMPTS_DEFAULT
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        raise ValueError(f"CURATED_CRAWL_PAGE_ATTEMPTS must be an integer, got {raw!r}") from None
+    if not 1 <= value <= _PAGE_ATTEMPTS_MAX:
+        raise ValueError(f"CURATED_CRAWL_PAGE_ATTEMPTS must be 1..{_PAGE_ATTEMPTS_MAX}, got {value}")
+    return value
 # Lowest variant price (in the store's currency) that counts as a real offer. Across
 # the four Meitu-US feeds measured 2026-09-05 (2,108 products) exactly one variant sat
 # in (0, 1.00): the $0.01 stila promo described at the variant pick below. Nothing legitimate in a beauty D2C feed is
@@ -383,7 +406,8 @@ async def fetch_shopify_products(
     max_scan_products bounds the whole retailer scan, independently of the selected
     max_products budget. A cap or failed page raises CrawlIncomplete, never returns a
     misleading partial success. One lookahead request may establish exhaustion at an
-    exact budget boundary. Transient errors get three paced attempts per page.
+    exact budget boundary. Transient errors get paced attempts per page: three, unless the
+    process sets CURATED_CRAWL_PAGE_ATTEMPTS (see _page_attempts).
     """
     host = _clean_domain(domain)
     if not host:
@@ -399,6 +423,7 @@ async def fetch_shopify_products(
     seen_pages: set = set()
     timeout = httpx.Timeout(timeout_s, connect=5.0)
     headers = {"User-Agent": _UA, "Accept": "application/json"}
+    attempts = _page_attempts()
 
     def incomplete(reason: str, status: str = "failed",
                    reason_code: Optional[str] = None) -> CrawlIncomplete:
@@ -410,12 +435,12 @@ async def fetch_shopify_products(
         async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers=headers) as client:
             while True:
                 url = f"https://{host}/products.json?limit={_PER_PAGE}&page={page}"
-                for attempt in range(3):
+                for attempt in range(attempts):
                     await crawl_politeness.before_request(url, user_agent=_UA, max_wait=0)
                     try:
                         resp = await client.get(url)
                     except (httpx.TimeoutException, httpx.TransportError):
-                        if attempt == 2:
+                        if attempt == attempts - 1:
                             raise
                         await asyncio.sleep(0.5 * (2 ** attempt))
                         continue
@@ -427,7 +452,7 @@ async def fetch_shopify_products(
                         # A regional/sibling store can have a different catalog and
                         # currency. Never pair its prices with this host's locale.
                         raise incomplete(f"storefront host changed to {actual_host or '(unknown)'}")
-                    if resp.status_code not in {429, 500, 502, 503, 504} or attempt == 2:
+                    if resp.status_code not in {429, 500, 502, 503, 504} or attempt == attempts - 1:
                         break
                     await asyncio.sleep(0.5 * (2 ** attempt))
                 if resp.status_code != 200:
