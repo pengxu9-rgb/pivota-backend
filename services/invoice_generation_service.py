@@ -487,6 +487,26 @@ async def generate_merchant_invoice(
 
     try:
         async with database.transaction():
+            # Hold every billed day's rollup lock (shared) for the whole write, and read the rows
+            # to bill UNDER it. A refund's re-roll takes the same lock exclusively, so it either
+            # lands before this read or waits for the invoices row and then leaves the day as billed
+            # (gmv_aggregation_service._aggregate_for_date). The read above only decides whether
+            # there is anything to bill; this one is what gets billed.
+            from services.gmv_aggregation_service import lock_billing_days
+
+            await lock_billing_days(period_start, period_end, db=database)
+            rows = await database.fetch_all(
+                _GMV_ROWS_QUERY,
+                {
+                    "merchant_id": merchant_id,
+                    "period_start": period_start,
+                    "period_end": period_end,
+                },
+            )
+            if not rows:
+                return None
+            total_cents = sum(_as_int(_get(row, "take_amount_cents")) for row in rows)
+
             invoice = await asyncio.to_thread(
                 stripe_client.v1.invoices.create,
                 params={

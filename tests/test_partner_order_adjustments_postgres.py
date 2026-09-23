@@ -60,7 +60,7 @@ async def _build_schema(database):
         await database.execute(stmt)
     # Only the columns the invoiced-day guard reads (the real table carries Stripe ids and more).
     await database.execute(
-        "CREATE TABLE invoices (id BIGSERIAL PRIMARY KEY, merchant_id VARCHAR(50) NOT NULL, "
+        "CREATE TABLE invoices (id BIGSERIAL PRIMARY KEY, merchant_id VARCHAR(50) NOT NULL, billing_run_id BIGINT, "
         "billing_period_start DATE NOT NULL, billing_period_end DATE NOT NULL, status TEXT)"
     )
     await database.execute(
@@ -295,8 +295,8 @@ async def test_an_invoiced_day_is_left_as_billed_and_flagged(db):
 
     await _close_partner_edge(db)
     await db.execute(
-        "INSERT INTO invoices (merchant_id, billing_period_start, billing_period_end, status) "
-        "VALUES ('brand.example', :s, :e, 'paid')",
+        "INSERT INTO invoices (merchant_id, billing_period_start, billing_period_end, status, billing_run_id) "
+        "VALUES ('brand.example', :s, :e, 'paid', 1)",
         {"s": YESTERDAY.date() - timedelta(days=5), "e": YESTERDAY.date() + timedelta(days=5)},
     )
     r = await record_partner_order_adjustment(partner="reap", purchase_id="rp_abc", event_id="evt_1",
@@ -311,8 +311,8 @@ async def test_a_void_invoice_does_not_block_the_reroll(db):
 
     await _close_partner_edge(db)
     await db.execute(
-        "INSERT INTO invoices (merchant_id, billing_period_start, billing_period_end, status) "
-        "VALUES ('brand.example', :s, :e, 'void')",
+        "INSERT INTO invoices (merchant_id, billing_period_start, billing_period_end, status, billing_run_id) "
+        "VALUES ('brand.example', :s, :e, 'void', 1)",
         {"s": YESTERDAY.date(), "e": YESTERDAY.date()},
     )
     r = await record_partner_order_adjustment(partner="reap", purchase_id="rp_abc", event_id="evt_1",
@@ -358,9 +358,9 @@ async def test_a_reroll_waits_for_another_reroll_of_the_same_day(db):
 
 
 
-async def test_a_day_a_billing_run_covers_is_left_alone_before_its_invoice_exists(db):
-    """Re-review of #2271: the run is inserted before it reads the rollup; its invoice commits only
-    after the Stripe calls. The guard must see the run, not wait for the invoice."""
+async def test_an_unfinished_billing_run_freezes_the_day_for_a_merchant_it_has_not_invoiced(db):
+    """A failed attempt leaves a Stripe draft the resume reuses; re-rolling underneath it would bill
+    stale lines silently (review of #2280). Only a completed or cancelled run lets it re-roll."""
     from services.partner_order_adjustments import record_partner_order_adjustment
 
     await _close_partner_edge(db)
