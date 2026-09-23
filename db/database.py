@@ -1168,6 +1168,101 @@ if not _install_stranded_release_cleanup():
     raise RuntimeError("db.database: stranded-release cleanup failed to install")
 
 
+# ---------------------------------------------------------------------------
+# A cancelled sqlite checkout must let its worker thread finish.
+#
+# Every aiosqlite connection owns a NON-daemon worker thread that posts each
+# result back with `loop.call_soon_threadsafe`. When the connect is cancelled
+# (or fails), aiosqlite's `Connection._connect` queues the thread's stop and
+# re-raises WITHOUT awaiting it; a close cancelled while it awaits that stop
+# does the same. If the loop closes before the thread has answered, that post
+# raises "Event loop is closed" and the thread dies with an unhandled
+# exception, abandoning the sqlite3 connection it held.
+#
+# The sqlite backend is dev/test only, and tests hit this constantly: a bare
+# `TestClient` runs each request on its own loop and closes it on return, and
+# `asyncio.run` cancels whatever the request left behind — the usage logger's
+# `create_task` insert, the decision-event flush worker, fire-and-forget
+# executor dispatch — while its `databases` checkout is still connecting.
+# 2026-09-23 sweep runs logged 3-17 such dead threads each (94 of 97 in a local
+# repro were the connect, 3 the close); one of those runs hung at interpreter
+# exit until the job timed out.
+#
+# The fix: `SQLitePool.acquire` and `release` (0.7.0 bodies) wait,
+# uncancellably, for the worker thread to exit before re-raising, so its last
+# post lands on a live loop. The wait is one sqlite3 connect or close, bounded
+# anyway.
+_SQLITE_WORKER_EXIT_TIMEOUT_SECONDS = 5.0
+
+
+async def _wait_for_sqlite_worker_exit(connection) -> None:  # type: ignore[no-untyped-def]
+    worker = connection._thread
+    if worker.ident is None:
+        return  # never started: nothing will post
+    loop = asyncio.get_running_loop()
+    await _run_to_completion(
+        lambda: loop.run_in_executor(None, worker.join, _SQLITE_WORKER_EXIT_TIMEOUT_SECONDS)
+    )
+
+
+def _install_sqlite_checkout_waits_for_its_worker() -> bool:
+    """Make a failed sqlite checkout or release wait for aiosqlite's worker. Returns True if installed."""
+    import aiosqlite
+    from databases.backends.sqlite import SQLitePool
+
+    if getattr(SQLitePool.acquire, "_pivota_waits_for_worker", False):
+        return True
+
+    _require_source(
+        SQLitePool.acquire,
+        "databases.backends.sqlite.SQLitePool.acquire",
+        ("aiosqlite.connect(", "isolation_level=None", "await connection.__aenter__()"),
+    )
+    _require_source(
+        SQLitePool.release,
+        "databases.backends.sqlite.SQLitePool.release",
+        ("await connection.__aexit__(None, None, None)",),
+    )
+    _require_source(
+        aiosqlite.Connection._connect,
+        "aiosqlite.Connection._connect",
+        ("except BaseException:", "self.stop()", "raise"),
+    )
+    _require_source(
+        aiosqlite.Connection.close,
+        "aiosqlite.Connection.close",
+        ("future = self.stop()", "await future"),
+    )
+
+    async def acquire(self) -> aiosqlite.Connection:  # type: ignore[no-untyped-def]
+        connection = aiosqlite.connect(
+            database=self._url.database, isolation_level=None, **self._options
+        )
+        try:
+            await connection.__aenter__()
+        except BaseException:
+            await _wait_for_sqlite_worker_exit(connection)
+            raise
+        return connection
+
+    async def release(self, connection: aiosqlite.Connection) -> None:  # type: ignore[no-untyped-def]
+        try:
+            await connection.__aexit__(None, None, None)
+        except BaseException:
+            await _wait_for_sqlite_worker_exit(connection)
+            raise
+
+    acquire._pivota_waits_for_worker = True  # type: ignore[attr-defined]
+    SQLitePool.acquire = acquire  # type: ignore[assignment]
+    SQLitePool.release = release  # type: ignore[assignment]
+    return True
+
+
+# Unconditional, like the patches above: inert unless a sqlite checkout fails.
+if not _install_sqlite_checkout_waits_for_its_worker():
+    raise RuntimeError("db.database: sqlite checkout worker wait failed to install")
+
+
 database = Database(DATABASE_URL, **database_kwargs)
 
 
