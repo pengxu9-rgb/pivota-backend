@@ -799,37 +799,54 @@ async def _handle_checkout_session_completed(event: Dict[str, Any], db: Database
         # already fulfilled it. Fulfilling it would activate a subscription
         # Stripe canceled, grant its credits, and cancel the merchant's other
         # live plans in Stripe as superseded. Record it as canceled and stop.
+        # When Stripe completed the checkout; recorded as the subscription's
+        # started_at, and what decides which of a merchant's purchases is newer.
+        completed_at = _stripe_timestamp(event.get("created"))
         if await _stripe_subscription_already_ended(db, stripe_subscription_id):
-            await db.execute(
-                """
-                INSERT INTO user_subscriptions (
-                  merchant_id,
-                  plan_id,
-                  stripe_subscription_id,
-                  status,
-                  started_at,
-                  canceled_at
-                )
-                VALUES (
-                  :merchant_id,
-                  :plan_id,
-                  :stripe_subscription_id,
-                  'canceled',
-                  NOW(),
-                  NOW()
-                )
-                ON CONFLICT (stripe_subscription_id) DO NOTHING
-                """,
-                {
-                    "merchant_id": merchant_id,
-                    "plan_id": plan["id"],
-                    "stripe_subscription_id": stripe_subscription_id,
-                },
+            await _record_canceled_subscription(
+                db,
+                merchant_id=merchant_id,
+                plan_id=int(plan["id"]),
+                stripe_subscription_id=stripe_subscription_id,
+                started_at=completed_at,
             )
             logger.warning(
                 "Not fulfilling checkout.session.completed for subscription %s: "
                 "it was deleted before the checkout was processed",
                 stripe_subscription_id,
+            )
+            await _mark_event_processed(event_id, db)
+            return
+
+        # The newest purchase is the merchant's plan: fulfilling a checkout
+        # cancels the older ones (_cancel_prior_active_subscriptions). A checkout
+        # whose first delivery failed can be redelivered after the merchant
+        # bought another plan; fulfilling it then would cancel the newer plan in
+        # Stripe and put the merchant back on the older one. It is this one
+        # that is superseded, so cancel it instead. If Stripe cannot confirm the
+        # cancel, fail without recording anything and let the redelivery decide.
+        if await _merchant_has_newer_live_subscription(
+            db,
+            merchant_id=merchant_id,
+            stripe_subscription_id=stripe_subscription_id,
+            completed_at=completed_at,
+        ):
+            if not await _cancel_in_stripe(stripe_subscription_id):
+                raise RuntimeError(
+                    f"Could not cancel superseded subscription {stripe_subscription_id} in Stripe"
+                )
+            await _record_canceled_subscription(
+                db,
+                merchant_id=merchant_id,
+                plan_id=int(plan["id"]),
+                stripe_subscription_id=stripe_subscription_id,
+                started_at=completed_at,
+            )
+            logger.warning(
+                "Canceled subscription %s instead of fulfilling it: merchant_id=%s "
+                "bought a newer plan after this checkout completed",
+                stripe_subscription_id,
+                merchant_id,
             )
             await _mark_event_processed(event_id, db)
             return
@@ -850,7 +867,7 @@ async def _handle_checkout_session_completed(event: Dict[str, Any], db: Database
                   :plan_id,
                   :stripe_subscription_id,
                   'active',
-                  NOW()
+                  COALESCE(CAST(:started_at AS TIMESTAMPTZ), NOW())
                 )
                 ON CONFLICT (stripe_subscription_id) DO NOTHING
                 RETURNING id
@@ -859,6 +876,7 @@ async def _handle_checkout_session_completed(event: Dict[str, Any], db: Database
                     "merchant_id": merchant_id,
                     "plan_id": plan["id"],
                     "stripe_subscription_id": stripe_subscription_id,
+                    "started_at": completed_at,
                 },
             )
             # Only checkout inserts subscription rows, and it grants in this same
@@ -1007,6 +1025,7 @@ async def _handle_checkout_session_completed(event: Dict[str, Any], db: Database
             db,
             merchant_id=merchant_id,
             keep_stripe_subscription_id=stripe_subscription_id,
+            completed_at=completed_at,
         )
 
         await _mark_event_processed(event_id, db)
@@ -1100,12 +1119,18 @@ async def _handle_subscription_updated(event: Dict[str, Any], db: Database) -> N
                 contact_email=contact_email,
                 ended_stripe_subscription_id=stripe_subscription_id,
             )
-        elif status_value in {"active", "trialing"} and _as_text(existing["status"]) == "unpaid":
+        elif status_value in {"active", "trialing"} and (
+            _as_text(existing["status"]) not in {"active", "trialing"}
+        ):
             # Paying the open invoice reactivates an unpaid subscription. The
             # unpaid update downgraded the merchant to free and cleared
             # merchants.subscription_id, which invoice generation joins through
             # to find the Stripe customer, so re-resolve against every live
             # subscription, this one included, rather than only on a plan change.
+            # Any move into a live status does it, not only one from 'unpaid':
+            # a retried past_due can land after unpaid, and the row then reads
+            # past_due when the payment arrives. Re-resolving a merchant that was
+            # never downgraded lands where it already is.
             await _reconcile_after_subscription_ended(
                 db,
                 merchant_id=merchant_id,
@@ -1842,14 +1867,94 @@ async def _stripe_subscription_already_ended(
     return deleted is not None
 
 
+async def _merchant_has_newer_live_subscription(
+    db: Database,
+    *,
+    merchant_id: str,
+    stripe_subscription_id: str,
+    completed_at: Optional[datetime],
+) -> bool:
+    """Whether the merchant holds a live Stripe subscription that started after
+    this checkout completed. started_at is Stripe's completion time of the
+    checkout that created the row, so both sides are on Stripe's clock. A row
+    without a Stripe subscription is not a purchase that can supersede one."""
+    if completed_at is None:
+        return False
+    row = await db.fetch_one(
+        """
+        SELECT 1
+        FROM user_subscriptions
+        WHERE merchant_id = :merchant_id
+          AND status IN ('active', 'trialing')
+          AND stripe_subscription_id IS NOT NULL
+          AND stripe_subscription_id <> :stripe_subscription_id
+          AND started_at > :completed_at
+        LIMIT 1
+        """,
+        {
+            "merchant_id": merchant_id,
+            "stripe_subscription_id": stripe_subscription_id,
+            "completed_at": completed_at,
+        },
+    )
+    return row is not None
+
+
+async def _record_canceled_subscription(
+    db: Database,
+    *,
+    merchant_id: str,
+    plan_id: int,
+    stripe_subscription_id: str,
+    started_at: Optional[datetime],
+) -> None:
+    """Record a checkout's subscription as canceled without fulfilling it. An
+    existing row (a retry of a delivery that did fulfil it) is canceled too."""
+    await db.execute(
+        """
+        INSERT INTO user_subscriptions (
+          merchant_id,
+          plan_id,
+          stripe_subscription_id,
+          status,
+          started_at,
+          canceled_at
+        )
+        VALUES (
+          :merchant_id,
+          :plan_id,
+          :stripe_subscription_id,
+          'canceled',
+          COALESCE(CAST(:started_at AS TIMESTAMPTZ), NOW()),
+          NOW()
+        )
+        ON CONFLICT (stripe_subscription_id) DO UPDATE
+          SET status = 'canceled',
+              canceled_at = COALESCE(user_subscriptions.canceled_at, NOW())
+        """,
+        {
+            "merchant_id": merchant_id,
+            "plan_id": plan_id,
+            "stripe_subscription_id": stripe_subscription_id,
+            "started_at": started_at,
+        },
+    )
+
+
 async def _cancel_prior_active_subscriptions(
     db: Database,
     *,
     merchant_id: str,
     keep_stripe_subscription_id: str,
+    completed_at: Optional[datetime] = None,
 ) -> None:
     """Cancel every active/trialing subscription for the merchant other than
     keep_stripe_subscription_id — in Stripe (so billing stops) and locally.
+    Given completed_at (when Stripe completed the keeping checkout), only
+    subscriptions that started before it: a plan bought after this checkout
+    is newer and is never cancelled by it, even if it committed while this
+    checkout was being processed. A row with no started_at cannot be shown to
+    be newer (checkout always writes one) and is cancelled as before.
 
     Called after a new subscription checkout completes so the merchant ends up
     with a single active plan. Isolated per subscription: a failure to cancel
@@ -1873,8 +1978,17 @@ async def _cancel_prior_active_subscriptions(
              WHERE merchant_id = :merchant_id
                AND status IN ('active', 'trialing')
                AND stripe_subscription_id IS DISTINCT FROM :keep
+               AND (
+                 CAST(:completed_at AS TIMESTAMPTZ) IS NULL
+                 OR started_at IS NULL
+                 OR started_at < CAST(:completed_at AS TIMESTAMPTZ)
+               )
             """,
-            {"merchant_id": merchant_id, "keep": keep_stripe_subscription_id},
+            {
+                "merchant_id": merchant_id,
+                "keep": keep_stripe_subscription_id,
+                "completed_at": completed_at,
+            },
         )
     except Exception:  # noqa: BLE001
         logger.warning(
@@ -1889,25 +2003,18 @@ async def _cancel_prior_active_subscriptions(
         prior_id = _as_text(dict(row).get("stripe_subscription_id"))
         if not prior_id:
             continue
-        try:
-            await asyncio.to_thread(
-                stripe_client.v1.subscriptions.cancel, prior_id
+        # Recording one Stripe still bills as canceled would be permanent:
+        # updates to a canceled row are ignored, so the merchant would pay for
+        # both plans unseen.
+        if not await _cancel_in_stripe(prior_id):
+            logger.warning(
+                "Leaving prior subscription %s (merchant_id=%s) live until a "
+                "redelivery cancels it",
+                prior_id,
+                merchant_id,
             )
-        except Exception:  # noqa: BLE001
-            # Cancelling a subscription Stripe already ended (or never had) is
-            # an error too, so ask Stripe. Recording one it still bills as
-            # canceled would be permanent: updates to a canceled row are
-            # ignored, so the merchant would pay for both plans unseen.
-            if not await _stripe_has_nothing_to_bill(prior_id):
-                logger.warning(
-                    "Stripe cancel failed for prior subscription %s (merchant_id=%s); "
-                    "leaving it live until a redelivery cancels it",
-                    prior_id,
-                    merchant_id,
-                    exc_info=True,
-                )
-                still_billing.append(prior_id)
-                continue
+            still_billing.append(prior_id)
+            continue
         try:
             await db.execute(
                 """
@@ -1932,6 +2039,24 @@ async def _cancel_prior_active_subscriptions(
             "Could not cancel superseded subscription(s) in Stripe: "
             + ", ".join(still_billing)
         )
+
+
+async def _cancel_in_stripe(stripe_subscription_id: str) -> bool:
+    """Cancel the subscription in Stripe. True once Stripe has nothing left to
+    bill on it: the cancel succeeded, or it failed because Stripe already ended
+    the subscription (cancelling twice is an error too) or never had it."""
+    try:
+        await asyncio.to_thread(
+            stripe_client.v1.subscriptions.cancel, stripe_subscription_id
+        )
+        return True
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "Stripe cancel failed for subscription %s",
+            stripe_subscription_id,
+            exc_info=True,
+        )
+        return await _stripe_has_nothing_to_bill(stripe_subscription_id)
 
 
 async def _stripe_has_nothing_to_bill(stripe_subscription_id: str) -> bool:

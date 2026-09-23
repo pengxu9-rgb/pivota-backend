@@ -202,12 +202,13 @@ def _subscription_event(event_id, event_type, *, status, plan="starter", sid=SUB
     }
 
 
-def _checkout_completed(event_id, *, sid=SUB, plan="starter"):
+def _checkout_completed(event_id, *, sid=SUB, plan="starter", completed_at=None):
+    """completed_at: when Stripe completed the checkout (the event's `created`); defaults to now."""
     return {
         "id": event_id,
         "object": "event",
         "type": "checkout.session.completed",
-        "created": int(time.time()),
+        "created": int((completed_at or datetime.now(timezone.utc)).timestamp()),
         "data": {"object": {
             "id": f"cs_{event_id}",
             "object": "checkout.session",
@@ -424,16 +425,50 @@ async def test_a_recovered_plan_outranks_the_one_that_carried_the_merchant_meanw
     assert await _wallet_on_next_read() == (PURCHASED + ALLOWANCE["growth"], "growth")
 
 
-async def test_past_due_recovering_is_not_a_tier_change(db, client):
-    """Only unpaid downgraded the merchant, so only unpaid re-resolves on recovery: past_due -> active on
-    the same plan leaves merchants alone (a manual tier on the row survives it)."""
+async def test_a_merchant_that_was_never_downgraded_stays_where_it_is_when_past_due_recovers(db, client):
+    """past_due does not downgrade, so re-resolving on its recovery lands on the plan the merchant has."""
     await _subscribed_merchant(db)
     await _deliver(client, _subscription_event("evt_past_due", "customer.subscription.updated", status="past_due"))
-    await db.execute("UPDATE merchants SET current_tier = 'scale' WHERE contact_email = :e", {"e": EMAIL})
+    assert await _merchant(db) == {"current_tier": "starter", "subscription_id": await _local_id(db)}
 
     await _deliver(client, _subscription_event("evt_recovered", "customer.subscription.updated", status="active"))
 
-    assert await _merchant(db) == {"current_tier": "scale", "subscription_id": await _local_id(db)}
+    assert await _merchant(db) == {"current_tier": "starter", "subscription_id": await _local_id(db)}
+    assert await _wallet_on_next_read() == (PURCHASED + ALLOWANCE["starter"], "starter")
+
+
+async def test_an_unpaid_subscription_recovers_through_a_late_past_due(db, client):
+    """Stripe went active -> past_due -> unpaid -> active, but the past_due delivery was retried and
+    landed after unpaid. The row then reads past_due when the payment lands, and the merchant that
+    unpaid downgraded must still come back on its plan (and be invoiceable again)."""
+    await _subscribed_merchant(db)
+    await _deliver(client, _subscription_event("evt_unpaid", "customer.subscription.updated", status="unpaid"))
+    await _deliver(client, _subscription_event("evt_past_due_late", "customer.subscription.updated",
+                                               status="past_due"))
+    assert (await _subscription(db))["status"] == "past_due"
+
+    await _deliver(client, _subscription_event("evt_paid_up", "customer.subscription.updated", status="active"))
+
+    assert await _merchant(db) == {"current_tier": "starter", "subscription_id": await _local_id(db)}
+    assert await _invoiced_customer(db) == CUSTOMER
+    assert await _wallet_on_next_read() == (PURCHASED + ALLOWANCE["starter"], "starter")
+
+
+async def test_a_richer_plan_recovers_through_a_late_past_due_while_another_carried_the_merchant(db, client):
+    """Same late past_due, but a starter plan carried the merchant meanwhile, so subscription_id was
+    never NULL. The recovered growth plan must still win."""
+    await _subscribed_merchant(db, subs=((SUB, "growth"), (SUB_OTHER, "starter")))
+    await _deliver(client, _subscription_event("evt_unpaid", "customer.subscription.updated", status="unpaid",
+                                               plan="growth", sid=SUB))
+    await _deliver(client, _subscription_event("evt_past_due_late", "customer.subscription.updated",
+                                               status="past_due", plan="growth", sid=SUB))
+    assert await _merchant(db) == {"current_tier": "starter", "subscription_id": await _local_id(db, SUB_OTHER)}
+
+    await _deliver(client, _subscription_event("evt_paid_up", "customer.subscription.updated", status="active",
+                                               plan="growth", sid=SUB))
+
+    assert await _merchant(db) == {"current_tier": "growth", "subscription_id": await _local_id(db, SUB)}
+    assert await _wallet_on_next_read() == (PURCHASED + ALLOWANCE["growth"], "growth")
 
 
 async def test_a_subscription_updated_to_canceled_still_ends_a_live_subscription(db, client):
@@ -657,3 +692,184 @@ async def test_a_cancel_refused_while_stripe_still_bills_the_plan_is_not_recorde
                    expect="failed", status_code=500)
 
     assert (await _subscription(db, SUB_OTHER))["status"] == "active"
+
+
+async def test_a_late_first_delivery_of_an_older_checkout_does_not_replace_the_newer_plan(db, client, stripe_calls):
+    """Checkout A (starter) completed, but its first delivery failed before committing, so nothing
+    local knew about it. The merchant then bought growth (B), which was fulfilled. When Stripe
+    redelivers A, B is the newer purchase: A is the superseded plan, so A is the one to cancel."""
+    await _subscribed_merchant(db, subs=())
+    await _deliver(client, _checkout_completed("evt_checkout_B", sid=SUB, plan="growth",
+                                               completed_at=NOW - timedelta(minutes=5)))
+    stripe_calls.clear()
+
+    await _deliver(client, _checkout_completed("evt_checkout_A", sid=SUB_OTHER, plan="starter",
+                                               completed_at=NOW - timedelta(minutes=30)))
+
+    assert stripe_calls == [("cancel", SUB_OTHER)]
+    assert (await _subscription(db, SUB))["status"] == "active"
+    assert (await _subscription(db, SUB_OTHER))["status"] == "canceled"
+    assert await _merchant(db) == {"current_tier": "growth", "subscription_id": await _local_id(db, SUB)}
+    assert await _fulfilment(db) == {"ledger_grants": 1, "merchant_credits": ALLOWANCE["growth"],
+                                     "promo_period_until": (await _fulfilment(db))["promo_period_until"]}
+    assert await _wallet_on_next_read() == (PURCHASED + ALLOWANCE["growth"], "growth")
+
+
+async def test_the_newer_checkout_wins_even_when_the_older_one_was_processed_just_before_it(
+        db, client, stripe_calls):
+    """A completed 30 minutes ago but its delivery was only processed now; B completed after A and
+    arrives next. Recency is Stripe's completion time: A's row must not look newer than B just
+    because it was written a moment ago."""
+    await _subscribed_merchant(db, subs=())
+    await _deliver(client, _checkout_completed("evt_checkout_A", sid=SUB_OTHER, plan="starter",
+                                               completed_at=NOW - timedelta(minutes=30)))
+    stripe_calls.clear()
+
+    await _deliver(client, _checkout_completed("evt_checkout_B", sid=SUB, plan="growth",
+                                               completed_at=NOW - timedelta(minutes=5)))
+
+    assert stripe_calls == [("retrieve", SUB), ("cancel", SUB_OTHER)]
+    assert (await _subscription(db, SUB_OTHER))["status"] == "canceled"
+    assert await _merchant(db) == {"current_tier": "growth", "subscription_id": await _local_id(db, SUB)}
+
+
+async def test_the_older_checkout_is_the_one_canceled_even_when_it_is_the_richer_plan(db, client, stripe_calls):
+    """Recency decides, not the plan: the late growth checkout completed before the starter one the
+    merchant bought after it, so growth is the superseded purchase."""
+    await _subscribed_merchant(db, subs=())
+    await _deliver(client, _checkout_completed("evt_checkout_A", sid=SUB_OTHER, plan="starter",
+                                               completed_at=NOW - timedelta(minutes=5)))
+    stripe_calls.clear()
+
+    await _deliver(client, _checkout_completed("evt_checkout_B", sid=SUB, plan="growth",
+                                               completed_at=NOW - timedelta(minutes=30)))
+
+    assert stripe_calls == [("cancel", SUB)]
+    assert (await _subscription(db, SUB_OTHER))["status"] == "active"
+    assert (await _subscription(db, SUB))["status"] == "canceled"
+    assert await _merchant(db) == {"current_tier": "starter", "subscription_id": await _local_id(db, SUB_OTHER)}
+
+
+async def test_a_superseded_late_checkout_stripe_cannot_cancel_is_retried(db, client, stripe_calls):
+    """Cancelling the superseded subscription needs Stripe. If Stripe cannot confirm it, the event
+    fails and nothing is recorded, so the redelivery decides again."""
+    await _subscribed_merchant(db, subs=())
+    await _deliver(client, _checkout_completed("evt_checkout_B", sid=SUB, plan="growth",
+                                               completed_at=NOW - timedelta(minutes=5)))
+    stripe_calls.fail("cancel", SUB_OTHER, _stripe_down())
+    stripe_calls.fail("retrieve", SUB_OTHER, _stripe_down())
+    late_a = _checkout_completed("evt_checkout_A", sid=SUB_OTHER, plan="starter",
+                                 completed_at=NOW - timedelta(minutes=30))
+
+    await _deliver(client, late_a, expect="failed", status_code=500)
+    assert await _local_id(db, SUB_OTHER) is None
+    assert await _merchant(db) == {"current_tier": "growth", "subscription_id": await _local_id(db, SUB)}
+
+    await _deliver(client, late_a)
+    assert stripe_calls.status[SUB_OTHER] == "canceled"
+    assert (await _subscription(db, SUB_OTHER))["status"] == "canceled"
+    assert (await _fulfilment(db))["ledger_grants"] == 1
+
+
+async def test_a_retried_older_checkout_cancels_itself_not_the_newer_plan(db, client, stripe_calls):
+    """A was fulfilled but its delivery failed afterwards. The merchant then bought B, whose cancel of A
+    could not reach Stripe, so A is still live locally when Stripe redelivers A. A's retry would run
+    A's own prior-plan cancel, which cancels B; A is the superseded one, so A cancels itself."""
+    await _subscribed_merchant(db, subs=())
+    await _deliver(client, _checkout_completed("evt_checkout_A", sid=SUB_OTHER, plan="starter",
+                                               completed_at=NOW - timedelta(minutes=30)))
+    stripe_calls.fail("cancel", SUB_OTHER, _stripe_down())
+    stripe_calls.fail("retrieve", SUB_OTHER, _stripe_down())
+    await _deliver(client, _checkout_completed("evt_checkout_B", sid=SUB, plan="growth",
+                                               completed_at=NOW - timedelta(minutes=5)),
+                   expect="failed", status_code=500)
+    assert (await _subscription(db, SUB_OTHER))["status"] == "active"
+    await db.execute("UPDATE stripe_events SET status = 'failed' WHERE event_id = 'evt_checkout_A'")
+    stripe_calls.clear()
+
+    await _deliver(client, _checkout_completed("evt_checkout_A", sid=SUB_OTHER, plan="starter",
+                                               completed_at=NOW - timedelta(minutes=30)))
+
+    assert stripe_calls == [("cancel", SUB_OTHER)]
+    assert (await _subscription(db, SUB_OTHER))["status"] == "canceled"
+    assert (await _subscription(db, SUB))["status"] == "active"
+    assert await _merchant(db) == {"current_tier": "growth", "subscription_id": await _local_id(db, SUB)}
+    assert await _wallet_on_next_read() == (PURCHASED + ALLOWANCE["growth"], "growth")
+
+
+async def test_a_retry_over_a_row_written_before_started_at_was_stripes_time_is_not_superseded_by_itself(
+        db, client, stripe_calls):
+    """Rows fulfilled before this change carry started_at = when we processed them, later than Stripe's
+    completion time. A retry of such a checkout must not read its own row as a newer purchase."""
+    await _subscribed_merchant(db, subs=((SUB, "starter"),))
+    await db.execute("UPDATE user_subscriptions SET started_at = NOW() WHERE stripe_subscription_id = :s", {"s": SUB})
+    stripe_calls.clear()
+
+    await _deliver(client, _checkout_completed("evt_checkout", sid=SUB, plan="starter",
+                                               completed_at=NOW - timedelta(minutes=30)))
+
+    assert (await _subscription(db))["status"] == "active"
+    assert ("cancel", SUB) not in stripe_calls
+
+
+async def test_a_live_row_without_a_stripe_subscription_is_not_a_newer_purchase(db, client, stripe_calls):
+    """A live row with no Stripe subscription (none is written by checkout, but nothing forbids one)
+    is not a purchase this checkout can be superseded by; if it were, every checkout for the merchant
+    would cancel itself."""
+    await _subscribed_merchant(db, subs=())
+    await db.execute(
+        "INSERT INTO user_subscriptions (merchant_id, plan_id, status, started_at) VALUES (:m, :p, 'active', NOW())",
+        {"m": MERCHANT, "p": await _plan_id(db, "starter")})
+    stripe_calls.clear()
+
+    await _deliver(client, _checkout_completed("evt_checkout", sid=SUB, plan="growth",
+                                               completed_at=NOW - timedelta(minutes=5)))
+
+    assert ("cancel", SUB) not in stripe_calls
+    assert (await _subscription(db))["status"] == "active"
+    assert await _merchant(db) == {"current_tier": "growth", "subscription_id": await _local_id(db)}
+
+
+async def test_an_older_checkout_never_cancels_a_plan_that_started_after_it(db, client, stripe_calls, monkeypatch):
+    """The race: B commits after A's newer-plan check and before A cancels its prior plans. A's
+    prior-plan cancel must still leave B alone, since B started after A completed."""
+    from routes import billing_routes
+
+    await _subscribed_merchant(db, subs=((SUB_OTHER, "starter"),))  # started a day ago: A supersedes it
+    real_check = billing_routes._merchant_has_newer_live_subscription
+    newer = "sub_event_order_newer"
+
+    async def b_commits_right_after_the_check(db_, **kwargs):
+        result = await real_check(db_, **kwargs)
+        await db_.execute(
+            "INSERT INTO user_subscriptions (merchant_id, plan_id, stripe_subscription_id, status, started_at) "
+            "VALUES (:m, :p, :s, 'active', :t)",
+            {"m": MERCHANT, "p": await _plan_id(db_, "growth"), "s": newer, "t": NOW - timedelta(minutes=5)})
+        return result
+
+    monkeypatch.setattr(billing_routes, "_merchant_has_newer_live_subscription", b_commits_right_after_the_check)
+    stripe_calls.clear()
+
+    await _deliver(client, _checkout_completed("evt_checkout_A", sid=SUB, plan="starter",
+                                               completed_at=NOW - timedelta(minutes=30)))
+
+    assert ("cancel", newer) not in stripe_calls
+    assert (await _subscription(db, newer))["status"] == "active"
+    assert ("cancel", SUB_OTHER) in stripe_calls
+    assert (await _subscription(db, SUB_OTHER))["status"] == "canceled"
+
+
+async def test_a_prior_plan_with_no_start_time_is_still_superseded(db, client, stripe_calls):
+    """Only a row with a start time can be shown to be newer than this checkout. A live prior plan
+    without one is cancelled as before, rather than left billing next to the new plan."""
+    await _subscribed_merchant(db, subs=((SUB_OTHER, "starter"),))
+    await db.execute("UPDATE user_subscriptions SET started_at = NULL WHERE stripe_subscription_id = :s",
+                     {"s": SUB_OTHER})
+    stripe_calls.clear()
+
+    await _deliver(client, _checkout_completed("evt_upgrade", sid=SUB, plan="growth",
+                                               completed_at=NOW - timedelta(minutes=5)))
+
+    assert ("cancel", SUB_OTHER) in stripe_calls
+    assert (await _subscription(db, SUB_OTHER))["status"] == "canceled"
+    assert await _merchant(db) == {"current_tier": "growth", "subscription_id": await _local_id(db, SUB)}
