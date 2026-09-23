@@ -121,6 +121,24 @@ async def db(monkeypatch):
             await database.disconnect()
 
 
+class _StripeCalls(list):
+    """The calls made, in order. `status` is Stripe's side of each subscription (unlisted = active);
+    `errors[(method, sid)]` is raised by that call instead, once per queued exception."""
+
+    def __init__(self):
+        super().__init__()
+        self.status = {}
+        self.errors = {}
+
+    def fail(self, method, sid, *excs):
+        self.errors.setdefault((method, sid), []).extend(excs)
+
+    def raise_if_failing(self, method, sid):
+        queued = self.errors.get((method, sid))
+        if queued:
+            raise queued.pop(0)
+
+
 @pytest.fixture
 def stripe_calls(monkeypatch):
     """Checkout fulfilment calls Stripe: it retrieves the new subscription for its period, and cancels
@@ -129,15 +147,19 @@ def stripe_calls(monkeypatch):
 
     from routes import billing_routes
 
-    calls = []
+    calls = _StripeCalls()
 
     def retrieve(sid):
         calls.append(("retrieve", sid))
-        return {"id": sid, "items": {"data": [{"current_period_start": int(PERIOD[0].timestamp()),
-                                                "current_period_end": int(PERIOD[1].timestamp())}]}}
+        calls.raise_if_failing("retrieve", sid)
+        return {"id": sid, "status": calls.status.get(sid, "active"),
+                "items": {"data": [{"current_period_start": int(PERIOD[0].timestamp()),
+                                    "current_period_end": int(PERIOD[1].timestamp())}]}}
 
     def cancel(sid):
         calls.append(("cancel", sid))
+        calls.raise_if_failing("cancel", sid)
+        calls.status[sid] = "canceled"
         return {"id": sid, "status": "canceled"}
 
     subscriptions = SimpleNamespace(retrieve=retrieve, cancel=cancel)
@@ -202,13 +224,13 @@ def _deleted(event_id, sid=SUB, plan="starter"):
                                canceled_at=NOW)
 
 
-async def _deliver(client, event, *, expect="processed"):
+async def _deliver(client, event, *, expect="processed", status_code=200):
     payload = json.dumps(event)
     ts = int(time.time())
     sig = hmac.new(WEBHOOK_SECRET.encode(), f"{ts}.{payload}".encode(), hashlib.sha256).hexdigest()
     resp = await client.post("/webhooks/stripe/billing", content=payload,
                              headers={"stripe-signature": f"t={ts},v1={sig}", "content-type": "application/json"})
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == status_code, resp.text
     from db.database import database
 
     row = await database.fetch_one("SELECT status, error FROM stripe_events WHERE event_id = :e", {"e": event["id"]})
@@ -570,3 +592,68 @@ async def test_a_retried_checkout_still_cancels_the_plan_it_supersedes(db, clien
     assert (await _subscription(db, SUB_OTHER))["status"] == "canceled"
     assert await _fulfilment(db) == {"ledger_grants": 1, "merchant_credits": 400, "promo_period_until": PROMO_UNTIL}
     assert await _merchant(db) == {"current_tier": "growth", "subscription_id": await _local_id(db, SUB)}
+
+
+def _stripe_down():
+    import stripe
+
+    return stripe.APIConnectionError("Network error communicating with Stripe")
+
+
+async def test_a_superseded_plan_stripe_did_not_cancel_stays_live_until_a_retry_cancels_it(
+        db, client, stripe_calls):
+    """The upgrade is fulfilled, but Stripe cannot be reached to cancel the old plan. The old plan is
+    still billing, so it must not be recorded canceled: the event fails, Stripe redelivers it, and the
+    redelivery cancels it without granting the upgrade again."""
+    await _subscribed_merchant(db, subs=((SUB_OTHER, "starter"),))
+    stripe_calls.fail("cancel", SUB_OTHER, _stripe_down())
+    stripe_calls.fail("retrieve", SUB_OTHER, _stripe_down())
+
+    await _deliver(client, _checkout_completed("evt_upgrade", sid=SUB, plan="growth"),
+                   expect="failed", status_code=500)
+
+    assert stripe_calls.status.get(SUB_OTHER, "active") == "active"
+    assert (await _subscription(db, SUB_OTHER))["status"] == "active"
+    assert await _merchant(db) == {"current_tier": "growth", "subscription_id": await _local_id(db, SUB)}
+
+    await _deliver(client, _checkout_completed("evt_upgrade", sid=SUB, plan="growth"))
+
+    assert stripe_calls.status[SUB_OTHER] == "canceled"
+    assert (await _subscription(db, SUB_OTHER))["status"] == "canceled"
+    assert (await _fulfilment(db))["ledger_grants"] == 1
+    assert await _merchant(db) == {"current_tier": "growth", "subscription_id": await _local_id(db, SUB)}
+
+
+@pytest.mark.parametrize("stripe_side", ["already_canceled", "missing"])
+async def test_a_cancel_refused_because_stripe_has_nothing_to_bill_is_recorded(
+        db, client, stripe_calls, stripe_side):
+    """Cancelling a subscription Stripe already ended, or never had, is an error too. Stripe then has
+    nothing left to bill, so the local row is canceled and the event succeeds."""
+    import stripe
+
+    await _subscribed_merchant(db, subs=((SUB_OTHER, "starter"),))
+    stripe_calls.fail("cancel", SUB_OTHER, stripe.InvalidRequestError("cannot cancel", None))
+    if stripe_side == "already_canceled":
+        stripe_calls.status[SUB_OTHER] = "canceled"
+    else:
+        stripe_calls.fail("retrieve", SUB_OTHER,
+                          stripe.InvalidRequestError(f"No such subscription: '{SUB_OTHER}'", "id",
+                                                     code="resource_missing", http_status=404))
+
+    await _deliver(client, _checkout_completed("evt_upgrade", sid=SUB, plan="growth"))
+
+    assert (await _subscription(db, SUB_OTHER))["status"] == "canceled"
+    assert await _merchant(db) == {"current_tier": "growth", "subscription_id": await _local_id(db, SUB)}
+
+
+async def test_a_cancel_refused_while_stripe_still_bills_the_plan_is_not_recorded(db, client, stripe_calls):
+    """A refused cancel on a subscription Stripe still reports live: the local row stays live."""
+    import stripe
+
+    await _subscribed_merchant(db, subs=((SUB_OTHER, "starter"),))
+    stripe_calls.fail("cancel", SUB_OTHER, stripe.InvalidRequestError("cannot cancel", None))
+
+    await _deliver(client, _checkout_completed("evt_upgrade", sid=SUB, plan="growth"),
+                   expect="failed", status_code=500)
+
+    assert (await _subscription(db, SUB_OTHER))["status"] == "active"

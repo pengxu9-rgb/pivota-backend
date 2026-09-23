@@ -1844,9 +1844,13 @@ async def _cancel_prior_active_subscriptions(
     keep_stripe_subscription_id — in Stripe (so billing stops) and locally.
 
     Called after a new subscription checkout completes so the merchant ends up
-    with a single active plan. Best-effort and isolated per subscription: a
-    failure to cancel one prior subscription is logged and never interrupts the
-    others or the new subscription's fulfillment. The resulting
+    with a single active plan. Isolated per subscription: a failure to cancel
+    one prior subscription never interrupts the others, and the new
+    subscription is already fulfilled. A prior subscription is recorded
+    canceled only once Stripe has nothing left to bill on it; otherwise it
+    stays live locally and this raises after trying the rest, so the checkout
+    event fails and Stripe redelivers it. The redelivery does not grant the
+    plan again and retries the cancel. The resulting
     customer.subscription.deleted webhook is reconciled by
     _reconcile_after_subscription_ended, which keeps the merchant on the
     just-activated plan rather than downgrading to free.
@@ -1872,6 +1876,7 @@ async def _cancel_prior_active_subscriptions(
         )
         return
 
+    still_billing: list[str] = []
     for row in rows or []:
         prior_id = _as_text(dict(row).get("stripe_subscription_id"))
         if not prior_id:
@@ -1881,16 +1886,20 @@ async def _cancel_prior_active_subscriptions(
                 stripe_client.v1.subscriptions.cancel, prior_id
             )
         except Exception:  # noqa: BLE001
-            # Already cancelled in Stripe, or a transient API failure — mark the
-            # local row cancelled regardless so tier resolution stops counting
-            # it; the deleted webhook (if any) is idempotent.
-            logger.warning(
-                "Stripe cancel failed for prior subscription %s (merchant_id=%s); "
-                "marking local row cancelled anyway",
-                prior_id,
-                merchant_id,
-                exc_info=True,
-            )
+            # Cancelling a subscription Stripe already ended (or never had) is
+            # an error too, so ask Stripe. Recording one it still bills as
+            # canceled would be permanent: updates to a canceled row are
+            # ignored, so the merchant would pay for both plans unseen.
+            if not await _stripe_has_nothing_to_bill(prior_id):
+                logger.warning(
+                    "Stripe cancel failed for prior subscription %s (merchant_id=%s); "
+                    "leaving it live until a redelivery cancels it",
+                    prior_id,
+                    merchant_id,
+                    exc_info=True,
+                )
+                still_billing.append(prior_id)
+                continue
         try:
             await db.execute(
                 """
@@ -1909,6 +1918,29 @@ async def _cancel_prior_active_subscriptions(
                 merchant_id,
                 exc_info=True,
             )
+
+    if still_billing:
+        raise RuntimeError(
+            "Could not cancel superseded subscription(s) in Stripe: "
+            + ", ".join(still_billing)
+        )
+
+
+async def _stripe_has_nothing_to_bill(stripe_subscription_id: str) -> bool:
+    """After a failed cancel: whether Stripe has the subscription canceled, or
+    no such subscription at all. False when Stripe cannot say."""
+    try:
+        subscription = _stripe_object_to_dict(
+            await asyncio.to_thread(
+                stripe_client.v1.subscriptions.retrieve, stripe_subscription_id
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        return (
+            type(exc).__name__ == "InvalidRequestError"
+            and getattr(exc, "code", None) == "resource_missing"
+        )
+    return _as_text(subscription.get("status")) == "canceled"
 
 
 async def _fetch_merchant_billing_row(

@@ -88,15 +88,19 @@ async def test_reconcile_downgrades_to_free_when_no_active_remains(monkeypatch):
     assert "tier" not in calls
 
 
-def _fake_stripe(monkeypatch, *, fail=False):
+def _fake_stripe(monkeypatch, *, fail=(), stripe_status="active"):
+    """cancel raises for the ids in `fail`; retrieve then reports `stripe_status` for them."""
     cancelled: List[str] = []
 
     class FakeSubs:
         def cancel(self, sub_id):
-            if fail:
+            if fail is True or sub_id in fail:
                 raise RuntimeError("stripe unavailable")
             cancelled.append(sub_id)
             return {"id": sub_id, "status": "canceled"}
+
+        def retrieve(self, sub_id):
+            return {"id": sub_id, "status": stripe_status}
 
     class FakeV1:
         subscriptions = FakeSubs()
@@ -124,11 +128,41 @@ async def test_cancel_prior_subs_cancels_in_stripe_and_locally(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_cancel_prior_subs_marks_local_even_if_stripe_fails(monkeypatch):
-    _fake_stripe(monkeypatch, fail=True)
+async def test_cancel_prior_subs_leaves_local_live_while_stripe_still_bills_it(monkeypatch):
+    # A failed cancel on a subscription Stripe still reports live must not be
+    # recorded canceled: raise so the checkout event is redelivered and retried.
+    _fake_stripe(monkeypatch, fail=True, stripe_status="active")
+    db = FakeDB(prior_rows=[{"stripe_subscription_id": "sub_old1"}])
+    with pytest.raises(RuntimeError, match="sub_old1"):
+        await billing_routes._cancel_prior_active_subscriptions(
+            db, merchant_id="merch-A", keep_stripe_subscription_id="sub_new",
+        )
+    marked = [v["sid"] for (q, v) in db.executes if "UPDATE user_subscriptions" in q]
+    assert marked == []
+
+
+@pytest.mark.asyncio
+async def test_cancel_prior_subs_marks_local_when_stripe_already_canceled_it(monkeypatch):
+    _fake_stripe(monkeypatch, fail=True, stripe_status="canceled")
     db = FakeDB(prior_rows=[{"stripe_subscription_id": "sub_old1"}])
     await billing_routes._cancel_prior_active_subscriptions(
         db, merchant_id="merch-A", keep_stripe_subscription_id="sub_new",
     )
     marked = [v["sid"] for (q, v) in db.executes if "UPDATE user_subscriptions" in q]
     assert marked == ["sub_old1"]
+
+
+@pytest.mark.asyncio
+async def test_one_prior_sub_stripe_still_bills_does_not_stop_the_others(monkeypatch):
+    cancelled = _fake_stripe(monkeypatch, fail=("sub_old1",), stripe_status="active")
+    db = FakeDB(prior_rows=[
+        {"stripe_subscription_id": "sub_old1"},
+        {"stripe_subscription_id": "sub_old2"},
+    ])
+    with pytest.raises(RuntimeError, match="sub_old1"):
+        await billing_routes._cancel_prior_active_subscriptions(
+            db, merchant_id="merch-A", keep_stripe_subscription_id="sub_new",
+        )
+    assert cancelled == ["sub_old2"]
+    marked = [v["sid"] for (q, v) in db.executes if "UPDATE user_subscriptions" in q]
+    assert marked == ["sub_old2"]
