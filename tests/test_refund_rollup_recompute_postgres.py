@@ -12,6 +12,7 @@ bills the pre-refund gross.
 
 import asyncio
 import os
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -26,8 +27,9 @@ _IS_PG = DATABASE_URL.startswith("postgresql://") or DATABASE_URL.startswith("po
 pytestmark = pytest.mark.skipif(not _IS_PG, reason="needs a Postgres DATABASE_URL")
 
 _SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")
-_TABLES = ("gmv_attribution_daily", "commerce_attribution_edges")
-_ROLLUP_DDL = Path(__file__).resolve().parent.parent / "db/migrations/110_gmv_attribution_daily.sql"
+_TABLES = ("gmv_attribution_daily", "commerce_attribution_edges", "invoices")
+_MIGRATIONS = Path(__file__).resolve().parent.parent / "db/migrations"
+_ROLLUP_DDL = _MIGRATIONS / "110_gmv_attribution_daily.sql"
 
 MERCHANT = "m_late_refund"
 N_DAYS_AGO = 5
@@ -63,6 +65,13 @@ async def _build_schema(database):
         "REFERENCES channel_partners(id) ON DELETE SET NULL", ""
     )
     for stmt in split_statements(ddl):
+        await database.execute(stmt)
+    # invoices as production has it: migration 113's table, then 120's DATE periods.
+    billing_core = (_MIGRATIONS / "113_billing_core.sql").read_text(encoding="utf-8")
+    await database.execute(
+        re.search(r"CREATE TABLE IF NOT EXISTS invoices \(.*?\n\);", billing_core, re.S).group(0)
+    )
+    for stmt in split_statements((_MIGRATIONS / "120_invoices_billing_period_to_date.sql").read_text(encoding="utf-8")):
         await database.execute(stmt)
 
 
@@ -114,6 +123,14 @@ async def _billed_edge(db, *, edge_id="cae_1", order_id="ord_late", gross=10_000
     from services.gmv_aggregation_service import aggregate_daily
 
     await aggregate_daily(created_at.date())
+
+
+async def _invoice_the_month(db, *, status="finalized", day=BILLED_DAY, merchant=MERCHANT):
+    await db.execute(
+        "INSERT INTO invoices (merchant_id, billing_period_start, billing_period_end, status) "
+        "VALUES (:m, :s, :e, :status)",
+        {"m": merchant, "s": day - timedelta(days=3), "e": day + timedelta(days=3), "status": status},
+    )
 
 
 async def _rollup(db, day=BILLED_DAY):
@@ -257,6 +274,66 @@ async def test_the_edge_day_is_its_utc_day_not_the_session_day(db):
         assert await _rollup(db, BILLED_DAY) == {"g": 10_000, "r": 2_500, "n": 7_500, "t": 750}
     finally:
         await db.execute("SET TIME ZONE 'UTC'")
+
+
+# --- A day an invoice already covers ---------------------------------------------------------
+
+
+async def test_a_refund_on_an_invoiced_day_leaves_the_billed_rollup_and_keeps_the_refund(db):
+    from services.commerce_attribution_service import attach_refund_to_attribution_edge
+
+    await _billed_edge(db)
+    await _invoice_the_month(db)
+
+    result = await attach_refund_to_attribution_edge(
+        order_id="ord_late", refund_id="re_1", amount=Decimal("25.00")
+    )
+
+    assert result is not None
+    assert await _edge_refund_cents(db) == 2_500  # the truth, for a manual credit
+    assert await _rollup(db) == {"g": 10_000, "r": 0, "n": 10_000, "t": 1_000}  # as invoiced
+
+
+async def test_a_voided_invoice_does_not_freeze_the_day(db):
+    from services.commerce_attribution_service import attach_refund_to_attribution_edge
+
+    await _billed_edge(db)
+    await _invoice_the_month(db, status="void")
+    await _invoice_the_month(db, merchant="m_someone_else")
+
+    await attach_refund_to_attribution_edge(order_id="ord_late", refund_id="re_1", amount=Decimal("25.00"))
+
+    assert await _rollup(db) == {"g": 10_000, "r": 2_500, "n": 7_500, "t": 750}
+
+
+async def test_the_outcome_names_each_day_and_why(db, monkeypatch):
+    from services.gmv_aggregation_service import recompute_days_for_edges
+
+    other_day = BILLED_AT - timedelta(days=20)
+    await _billed_edge(db, edge_id="cae_1")
+    await _billed_edge(db, edge_id="cae_2", order_id="ord_other", created_at=other_day)
+    await _invoice_the_month(db)
+    edges = [dict(r) for r in await db.fetch_all("SELECT edge_id, merchant_id, created_at FROM commerce_attribution_edges")]
+
+    assert await recompute_days_for_edges(edges) == {
+        (MERCHANT, other_day.date()): "recomputed",
+        (MERCHANT, BILLED_DAY): "invoiced_period_manual_credit",
+    }
+
+
+async def test_an_invoice_check_that_fails_leaves_the_day_alone(db):
+    """Fail closed: a day we could not check is a day we must not rewrite."""
+    from services.commerce_attribution_service import attach_refund_to_attribution_edge
+
+    await _billed_edge(db)
+    await db.execute("DROP TABLE invoices")
+
+    result = await attach_refund_to_attribution_edge(
+        order_id="ord_late", refund_id="re_1", amount=Decimal("25.00")
+    )
+
+    assert result is not None and await _edge_refund_cents(db) == 2_500
+    assert await _rollup(db) == {"g": 10_000, "r": 0, "n": 10_000, "t": 1_000}
 
 
 # --- The merchant-initiated writer: RefundService.create_refund -------------------------------
