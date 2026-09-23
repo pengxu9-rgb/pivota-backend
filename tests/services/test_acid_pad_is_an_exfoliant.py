@@ -25,6 +25,7 @@ def leaf(title):
 @pytest.mark.parametrize("title", [
     "AHA-BHA-PHA 30 Days Miracle Truecica Clear Pad",   # sokoglam, the row this unblocks
     # One case per acid in the list, so truncating it fails here (all invented but for the shelf rows).
+    "AHA 8% Resurfacing Pad",                          # AHA alone: pins that acid on its own
     "Salicylic Acid Daily Clarifying Pad",
     "Mandelic Acid 5% Resurfacing Pad",
     "Lactic Acid 10% Smoothing Pad",
@@ -77,8 +78,16 @@ def test_lactic_acid_bacteria_ferment_is_not_an_exfoliating_acid():
     assert leaf("Lactic Acid 10% Smoothing Pad") == EXFOLIANT
 
 
-def test_the_peel_branch_does_not_glue_two_lines_together():
-    assert leaf("Peeling\nPad") == TONER
+def test_the_peel_branch_takes_any_in_line_separator_but_never_a_line_break():
+    assert leaf("Peeling Pad") == EXFOLIANT
+    assert leaf("Peeling-Pad") == EXFOLIANT
+    assert leaf("Peeling\u00a0Pad") == EXFOLIANT   # non-breaking space: real in merchant titles
+    assert leaf("Peeling\nPad") == TONER           # two lines are not one phrase
+
+
+def test_a_bundle_naming_both_stays_a_toner():
+    """The guard reads the whole title, so a bundle keeps main's answer rather than picking."""
+    assert leaf("AHA Peeling Pad + Toner Pad Set") == TONER
 
 
 @pytest.mark.parametrize("title,want", [

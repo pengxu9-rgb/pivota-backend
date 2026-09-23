@@ -159,14 +159,16 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         # acids it lists ("Ji Woo Gae Cica BHA Blemish Toner Pad" is a BHA toner pad, measured in
         # prod). The lookahead is DOTALL and takes one-or-more separators, so a line break or a
         # double space inside the phrase cannot slip past it. "Toning pad" is NOT in the guard:
-        # unlike "toner pad" it is the usual US name for a glycolic/salicylic exfoliating pad, and
-        # a toning pad with no acid never reaches this arm anyway.
+        # unlike "toner pad" it names no product class on its own (the corpus holds no "toning pad"
+        # either way -- its one "toning" product is a lotion), and a toning pad with no acid never
+        # reaches this arm. A BUNDLE naming both ("AHA Peeling Pad + Toner Pad Set") stays a toner:
+        # the lookahead reads the whole title, which is the conservative answer and what main did.
         # The rest scans the title for an exfoliating acid BEFORE a pad noun (an acid named after
         # the noun -- "Clear Pad with AHA BHA" -- is left to Toner), or an explicit peel pad.
         r"\A(?!(?s:.)*\btoner[-\s]+pads?\b)(?s:.)*?"
-        r"(?:\b(?:aha|bha|pha|glycolic|salicylic|mandelic|lactic(?!\s+acid\s+bacteria))\b"
+        r"(?:\b(?:aha|bha|pha|glycolic|salicylic|mandelic|lactic(?![\s-]+acid[\s-]+bacteria))\b"
         r"[^\n]{0,60}?\bpads?\b"
-        r"|\b(?:peel(?:ing)?|exfoliating|exfoliant)[-\x20\t]+pads?\b)",
+        r"|\b(?:peel(?:ing)?|exfoliating|exfoliant)(?:-|[^\S\n\r])+pads?\b)",
         re.IGNORECASE)),
     ("Toner", "beauty/skincare/tone/toner", re.compile(
         r"\b(toner|tonic|mist|pad|skin booster)\b", re.IGNORECASE)),

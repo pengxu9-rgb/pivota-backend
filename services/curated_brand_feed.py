@@ -1494,6 +1494,13 @@ _MEASURED_HOST_PRODUCT_TYPES = {
         # NEOGEN's soothing Real Cica Pad, whose title names the toner leaf and steps the shelf
         # aside. The shelf NAME is still no evidence on its own: the neighbouring "Chemical" shelf
         # holds an azelaic treatment and a tea tree stick, and stays out.
+        # KNOWN FORWARD RISK: physical exfoliation is where TOOLS land, and the title check above is
+        # a membership test, so a konjac pad or a silicone applicator filed here would be claimed as
+        # a topical exfoliant. sokoglam files its tools under their own "Tools" shelf today (8
+        # products). A general tools veto was drafted and REJECTED in review: `_title_paths` matches
+        # a bare "brush", so it refused "Clay Mask with Applicator Brush" and "Lip Balm with Brush
+        # Applicator" on the shelves above -- and an unresolved row stops the whole cohort at the
+        # apply gate. Re-read this shelf before trusting it again.
         "physical": "beauty/skincare/treat/exfoliant",
     },
 }
@@ -1587,12 +1594,6 @@ def _measured_host_type_leaf(*, domain: Optional[str], product_type: Optional[st
     # Cream" and a "Body Lotion"; a future "Argan Oil Hair Mask" on "Masks" would otherwise become a
     # facial mask, and a "Lip & Body Balm" is not only a lip balm.
     if _NON_FACE_TITLE.search(str(title or "")):
-        return None
-    # A TOOL is not a formula. The title check above is a membership test, so a title naming both
-    # the shelf's leaf and a tool ("Konjac Exfoliating Pad" on an exfoliant shelf) would otherwise
-    # take the shelf. Measured: sokoglam files its tools under their own "Tools" shelf today, so
-    # this refuses nothing that exists -- it is a guard for the next product filed there.
-    if not leaf.startswith("beauty/tools/") and any(p.startswith("beauty/tools/") for p in named):
         return None
     return leaf
 

@@ -275,9 +275,11 @@ def test_a_patch_type_resolves_rather_than_reading_as_ambiguous(ptype, want):
     assert evidence_only(ptype, "Some Product 36ct") == (want, feed.CATEGORY_CONFIDENCE_MERCHANT_TYPE)
 
 
-def test_a_tool_title_never_takes_a_formula_shelf():
-    """A physical-exfoliation shelf is where tools land. The title check is a membership test, so
-    a title naming BOTH the shelf leaf and a tool would otherwise take the shelf."""
-    assert resolve("Physical", "Silicone Exfoliating Brush Pad", "sokoglam.com") == evidence_only(
-        "Physical", "Silicone Exfoliating Brush Pad")
+def test_a_tool_filed_on_the_physical_shelf_is_a_known_gap_not_a_guard():
+    """Review rejected a general beauty/tools veto here: `_title_paths` matches a bare "brush", so
+    it refused "Clay Mask with Applicator Brush" on the Masks shelf, and an unresolved row stops the
+    whole cohort. This pins what the shelf DOES do, so the gap is visible rather than assumed shut."""
+    assert resolve("Physical", "Konjac Exfoliating Pad", "sokoglam.com")[0] == "beauty/skincare/treat/exfoliant"
+    # The formula rows the veto would have refused keep their measured leaf.
+    assert resolve("Masks", "Clay Mask with Applicator Brush", "eyurs.com")[0] == "beauty/skincare/treat/mask"
     assert resolve("Physical", "Bio-Peel Gauze Peeling Wine", "sokoglam.com")[0] == "beauty/skincare/treat/exfoliant"
