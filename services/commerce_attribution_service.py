@@ -601,6 +601,108 @@ RETURNING edge_id, merchant_id, click_id, canonical_product_id,
 """
 
 
+# A PSP refund on a Pivota order, applied as a CEILING rather than an increment.
+#
+# Stripe reports one refund under several ids: `charge.refunded` carries the
+# charge id (ch_) with the charge's CUMULATIVE amount, `refund.updated` carries
+# the refund id (re_) with that one refund's amount, and RefundService records a
+# merchant-initiated refund under its own REF_ id. _ATTRIBUTE_REFUND_QUERY dedupes
+# on the id it is handed, so the same money landed two or three times, and a
+# second partial refund's charge.refunded (same ch_) was dropped. Measured on
+# Postgres by tests/test_stripe_refund_attribution_edge_postgres.py.
+#
+# The order's reconciled total_refunded already gets these sequences right
+# (tests/test_stripe_refund_partial_accounting.py), so the edge follows it:
+# refund part = GREATEST(current refund part, order total). Replays, event order
+# and which ids arrive stop mattering, and the value can never go down.
+#
+# Chargebacks are NOT in orders.total_refunded. They stay additive per dispute id
+# (_ATTRIBUTE_DISPUTE_QUERY) and are also counted in dispute_amount_cents
+# (migration 237), so the ceiling applies to refund_amount_cents minus that part.
+#
+# `prior` locks every edge of the order and reads its value BEFORE the update, so
+# the caller can emit the ledger event for the money this call actually added.
+_APPLY_REFUND_TOTAL_QUERY = """
+WITH prior AS (
+  SELECT edge_id, COALESCE(refund_amount_cents, 0) AS prior_refund_amount_cents
+  FROM commerce_attribution_edges
+  WHERE order_id = :order_id
+  FOR UPDATE
+)
+UPDATE commerce_attribution_edges AS e
+SET
+  latest_refund_id = CAST(:refund_id AS text),
+  refund_ids = CASE
+    WHEN COALESCE(e.refund_ids, '[]'::jsonb) ? CAST(:refund_id AS text) THEN COALESCE(e.refund_ids, '[]'::jsonb)
+    ELSE COALESCE(e.refund_ids, '[]'::jsonb) || to_jsonb(CAST(:refund_id AS TEXT))
+  END,
+  refund_count = CASE
+    WHEN COALESCE(e.refund_ids, '[]'::jsonb) ? CAST(:refund_id AS text) THEN COALESCE(e.refund_count, 0)
+    ELSE COALESCE(e.refund_count, 0) + 1
+  END,
+  refund_amount_cents = GREATEST(
+    COALESCE(e.refund_amount_cents, 0) - COALESCE(e.dispute_amount_cents, 0),
+    CAST(:total_cents AS bigint)
+  ) + COALESCE(e.dispute_amount_cents, 0),
+  refunded_amount = GREATEST(
+    COALESCE(e.refunded_amount, 0) - COALESCE(e.dispute_amount_cents, 0) / 100.0,
+    CAST(:total_decimal AS numeric)
+  ) + COALESCE(e.dispute_amount_cents, 0) / 100.0,
+  refunded_at = COALESCE(e.refunded_at, :now),
+  latest_refund_at = :now,
+  updated_at = :now
+FROM prior
+WHERE e.edge_id = prior.edge_id
+RETURNING e.edge_id, e.merchant_id, e.click_id, e.canonical_product_id,
+          e.canonical_variant_id, e.surface, e.prompt_cluster, e.interaction_id,
+          e.metadata, e.refund_ids, e.refund_count, e.refund_amount_cents,
+          e.refunded_amount, e.refunded_at, e.latest_refund_at,
+          e.dispute_amount_cents, prior.prior_refund_amount_cents,
+          -- the edge's billing day, for recompute_days_for_edges
+          e.created_at
+"""
+
+
+# A chargeback: _ATTRIBUTE_REFUND_QUERY's additive, id-deduped increment, also
+# counted in dispute_amount_cents so the refund ceiling above leaves it alone.
+_ATTRIBUTE_DISPUTE_QUERY = """
+UPDATE commerce_attribution_edges
+SET
+  latest_refund_id = CAST(:dispute_id AS text),
+  refund_ids = CASE
+    WHEN COALESCE(refund_ids, '[]'::jsonb) ? CAST(:dispute_id AS text) THEN COALESCE(refund_ids, '[]'::jsonb)
+    ELSE COALESCE(refund_ids, '[]'::jsonb) || to_jsonb(CAST(:dispute_id AS TEXT))
+  END,
+  refund_count = CASE
+    WHEN COALESCE(refund_ids, '[]'::jsonb) ? CAST(:dispute_id AS text) THEN COALESCE(refund_count, 0)
+    ELSE COALESCE(refund_count, 0) + 1
+  END,
+  refund_amount_cents = COALESCE(refund_amount_cents, 0) + CASE
+    WHEN COALESCE(refund_ids, '[]'::jsonb) ? CAST(:dispute_id AS text) THEN 0
+    ELSE CAST(:amount_cents AS bigint)
+  END,
+  dispute_amount_cents = COALESCE(dispute_amount_cents, 0) + CASE
+    WHEN COALESCE(refund_ids, '[]'::jsonb) ? CAST(:dispute_id AS text) THEN 0
+    ELSE CAST(:amount_cents AS bigint)
+  END,
+  refunded_amount = COALESCE(refunded_amount, 0) + CASE
+    -- See _ATTRIBUTE_REFUND_QUERY: the CAST keeps the Decimal bind numeric.
+    WHEN COALESCE(refund_ids, '[]'::jsonb) ? CAST(:dispute_id AS text) THEN 0::numeric
+    ELSE CAST(:amount_decimal AS numeric)
+  END,
+  refunded_at = COALESCE(refunded_at, :now),
+  latest_refund_at = :now,
+  updated_at = :now
+WHERE order_id = :order_id
+RETURNING edge_id, merchant_id, click_id, canonical_product_id,
+          canonical_variant_id, surface, prompt_cluster, interaction_id,
+          metadata, refund_ids, refund_count, refund_amount_cents,
+          refunded_amount, refunded_at, latest_refund_at, dispute_amount_cents,
+          -- the edge's billing day, for recompute_days_for_edges
+          created_at
+"""
+
+
 def _refund_amounts(amount: Any) -> tuple[Decimal, int]:
     amount_decimal = Decimal(str(amount or "0"))
     return amount_decimal, int(amount_decimal * Decimal("100"))
@@ -696,6 +798,142 @@ async def attach_refund_to_attribution_edge(
     # When fan-out exists, surface the first edge with an added edge_count
     # field so callers can distinguish single-edge vs multi-edge refunds.
     first = dict(rows[0])
+    first["edge_count"] = len(rows)
+    return first
+
+
+async def apply_refund_total_rows(
+    *,
+    order_id: str,
+    refund_id: str,
+    total_refunded: Any,
+) -> List[Dict[str, Any]]:
+    """The refund-ceiling UPDATE alone, with no side effects. Safe inside a caller's transaction.
+
+    Raises every edge of ``order_id`` to the order's reconciled ``total_refunded`` (MAJOR
+    units): pass the order's total AFTER this refund was reconciled, never the single refund's
+    amount. ``refund_id`` is recorded for audit only; it no longer decides whether money is
+    added. See _APPLY_REFUND_TOTAL_QUERY. `apply_refund_total_to_attribution_edge` is this plus
+    `emit_refund_total_event` and the rollup recompute; a caller holding a transaction
+    (RefundService) runs this inside it and the other two after commit.
+    """
+    total_decimal, total_cents = _refund_amounts(total_refunded)
+    return [
+        dict(r)
+        for r in await database.fetch_all(
+            _APPLY_REFUND_TOTAL_QUERY,
+            {
+                "order_id": order_id,
+                "refund_id": refund_id,
+                "total_cents": total_cents,
+                "total_decimal": total_decimal,
+                "now": _now(),
+            },
+        )
+    ]
+
+
+def _refund_total_added_cents(rows: List[Dict[str, Any]]) -> int:
+    """What `apply_refund_total_rows` added, read off the first edge (the event's context)."""
+    if not rows:
+        return 0
+    first = rows[0]
+    added = int(first.get("refund_amount_cents") or 0) - int(first.get("prior_refund_amount_cents") or 0)
+    return max(added, 0)
+
+
+async def emit_refund_total_event(
+    rows: List[Dict[str, Any]],
+    *,
+    order_id: str,
+    refund_id: str,
+) -> None:
+    """Emit ``refund.succeeded`` for the money a ceiling write actually added, if any.
+
+    An echo of money another id already reported adds 0 and emits nothing.
+    """
+    added_cents = _refund_total_added_cents(rows)
+    if added_cents > 0:
+        await emit_attribution_refund_event(
+            rows,
+            order_id=order_id,
+            refund_id=refund_id,
+            amount=Decimal(added_cents) / Decimal("100"),
+        )
+
+
+async def apply_refund_total_to_attribution_edge(
+    *,
+    order_id: str,
+    refund_id: str,
+    total_refunded: Any,
+) -> Optional[Dict[str, Any]]:
+    """Raise the edge's refund to the order's reconciled total, emit, and recompute the billed days.
+
+    For PSP refunds on a Pivota order. Must not be called inside a transaction, for the reason
+    `attach_refund_to_attribution_edge` gives.
+    """
+    rows = await apply_refund_total_rows(
+        order_id=order_id, refund_id=refund_id, total_refunded=total_refunded
+    )
+    if not rows:
+        return None
+    try:
+        await emit_refund_total_event(rows, order_id=order_id, refund_id=refund_id)
+    finally:
+        # Never raises. A no-op re-roll (nothing added) is cheap and also retries one that
+        # failed on an earlier delivery.
+        await recompute_days_for_edges(rows)
+    first = dict(rows[0])
+    first["edge_count"] = len(rows)
+    first["added_refund_cents"] = _refund_total_added_cents(rows)
+    return first
+
+
+async def apply_attribution_dispute_rows(
+    *,
+    order_id: str,
+    dispute_id: str,
+    amount: Any,
+) -> List[Dict[str, Any]]:
+    """The chargeback UPDATE alone (MAJOR units), idempotent per ``dispute_id``. No side effects."""
+    amount_decimal, amount_cents = _refund_amounts(amount)
+    return [
+        dict(r)
+        for r in await database.fetch_all(
+            _ATTRIBUTE_DISPUTE_QUERY,
+            {
+                "order_id": order_id,
+                "dispute_id": dispute_id,
+                "amount_cents": amount_cents,
+                "amount_decimal": amount_decimal,
+                "now": _now(),
+            },
+        )
+    ]
+
+
+async def attach_dispute_to_attribution_edge(
+    *,
+    order_id: str,
+    dispute_id: str,
+    amount: Any,
+) -> Optional[Dict[str, Any]]:
+    """Add a chargeback to the edge (MAJOR units), once per ``dispute_id``, then recompute.
+
+    Chargebacks are not in ``orders.total_refunded``, so they stay additive and are
+    kept in ``dispute_amount_cents`` where the refund ceiling cannot absorb them.
+    Must not be called inside a transaction, for the reason
+    `attach_refund_to_attribution_edge` gives.
+    """
+    rows = await apply_attribution_dispute_rows(order_id=order_id, dispute_id=dispute_id, amount=amount)
+    if not rows:
+        return None
+    try:
+        await emit_attribution_refund_event(rows, order_id=order_id, refund_id=dispute_id, amount=amount)
+    finally:
+        await recompute_days_for_edges(rows)  # never raises
+    first = rows[0]
     first["edge_count"] = len(rows)
     return first
 

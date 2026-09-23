@@ -1137,8 +1137,11 @@ async def test_stripe_webhook_charge_refunded_reconciles_partial_refund(
     async def fake_log_order_event(**kwargs: Any) -> None:
         order_events.append(kwargs)
 
-    async def fake_attach_refund_to_attribution_edge(**kwargs: Any) -> None:
+    async def fake_apply_refund_total_to_attribution_edge(**kwargs: Any) -> None:
         attribution_calls.append(kwargs)
+
+    async def fail_additive_attach(**kwargs: Any) -> None:
+        raise AssertionError("a Stripe refund must not add to the edge per refund id")
 
     def fake_construct_event(payload: bytes, signature: str | None, secret: str) -> Dict[str, Any]:
         return event
@@ -1153,7 +1156,12 @@ async def test_stripe_webhook_charge_refunded_reconciles_partial_refund(
     monkeypatch.setattr(database_module.database, "fetch_one", fake_fetch_one)
     monkeypatch.setattr(webhook_routes_module, "update_order_status", fake_update_order_status)
     monkeypatch.setattr(webhook_routes_module, "log_order_event", fake_log_order_event)
-    monkeypatch.setattr(attribution_module, "attach_refund_to_attribution_edge", fake_attach_refund_to_attribution_edge)
+    monkeypatch.setattr(
+        attribution_module,
+        "apply_refund_total_to_attribution_edge",
+        fake_apply_refund_total_to_attribution_edge,
+    )
+    monkeypatch.setattr(attribution_module, "attach_refund_to_attribution_edge", fail_additive_attach)
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -1174,15 +1182,15 @@ async def test_stripe_webhook_charge_refunded_reconciles_partial_refund(
     assert order_events[0]["event_type"] == "refund_processed_webhook"
     assert order_events[0]["metadata"]["charge_id"] == "ch_refund_contract"
     assert order_events[0]["metadata"]["refund_amount"] == 1200
-    # MAJOR units. attach_refund_to_attribution_edge does `amount * 100`, so
-    # the 1200 this used to assert was a 100x refund. It was never caught
-    # because the statement it feeds could not PREPARE and so never ran — the
-    # assertion pinned the call shape, not a verified behaviour.
+    # MAJOR units, and the ORDER's reconciled total rather than the event's
+    # amount: the edge takes it as a ceiling, so the matching refund.updated
+    # (re_) cannot add the same $12 again. The edge arithmetic itself is
+    # measured on Postgres in tests/test_stripe_refund_attribution_edge_postgres.py.
     assert attribution_calls == [
         {
             "order_id": "ORD_STRIPE_REFUND",
             "refund_id": "ch_refund_contract",
-            "amount": Decimal("12"),
+            "total_refunded": Decimal("12"),
         }
     ]
 
@@ -1240,6 +1248,9 @@ async def test_stripe_webhook_charge_refunded_skips_attribution_when_disabled(
     monkeypatch.setattr(webhook_routes_module, "update_order_status", fake_update_order_status)
     monkeypatch.setattr(webhook_routes_module, "log_order_event", fake_log_order_event)
     monkeypatch.setattr(attribution_module, "attach_refund_to_attribution_edge", fail_attach_refund_to_attribution_edge)
+    monkeypatch.setattr(
+        attribution_module, "apply_refund_total_to_attribution_edge", fail_attach_refund_to_attribution_edge
+    )
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -1783,8 +1794,11 @@ async def test_stripe_webhook_dispute_event_upserts_record_without_mutating_orde
     async def fake_create_dispute_evidence_pack(**kwargs: Any) -> None:
         evidence_pack_calls.append(kwargs)
 
-    async def fake_attach_refund_to_attribution_edge(**kwargs: Any) -> None:
+    async def fake_attach_dispute_to_attribution_edge(**kwargs: Any) -> None:
         attribution_calls.append(kwargs)
+
+    async def fail_refund_writer(**kwargs: Any) -> None:
+        raise AssertionError("a chargeback must stay out of the refund writers")
 
     async def fake_log_order_event(**kwargs: Any) -> None:
         order_events.append(kwargs)
@@ -1808,7 +1822,11 @@ async def test_stripe_webhook_dispute_event_upserts_record_without_mutating_orde
         fake_upsert_stripe_dispute_record_best_effort,
     )
     monkeypatch.setattr(pcs_module, "create_dispute_evidence_pack", fake_create_dispute_evidence_pack)
-    monkeypatch.setattr(attribution_module, "attach_refund_to_attribution_edge", fake_attach_refund_to_attribution_edge)
+    monkeypatch.setattr(
+        attribution_module, "attach_dispute_to_attribution_edge", fake_attach_dispute_to_attribution_edge
+    )
+    monkeypatch.setattr(attribution_module, "attach_refund_to_attribution_edge", fail_refund_writer)
+    monkeypatch.setattr(attribution_module, "apply_refund_total_to_attribution_edge", fail_refund_writer)
     monkeypatch.setattr(webhook_routes_module, "mark_order_paid", fail_if_called)
     monkeypatch.setattr(webhook_routes_module, "update_order_status", fail_if_called)
     monkeypatch.setattr(webhook_routes_module, "log_order_event", fake_log_order_event)
@@ -1852,7 +1870,7 @@ async def test_stripe_webhook_dispute_event_upserts_record_without_mutating_orde
     assert attribution_calls == [
         {
             "order_id": "ORD_STRIPE_DISPUTE",
-            "refund_id": "dp_contract_1",
+            "dispute_id": "dp_contract_1",
             "amount": Decimal("15"),
         }
     ]

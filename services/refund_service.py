@@ -13,8 +13,8 @@ from db.orders import get_order, update_order
 from db.database import database as db
 from adapters.psp_adapter import get_psp_adapter
 from services.commerce_attribution_service import (
-    apply_attribution_refund_rows,
-    emit_attribution_refund_event,
+    apply_refund_total_rows,
+    emit_refund_total_event,
 )
 from services.gmv_aggregation_service import recompute_days_for_edges
 from services.merchant_psp_config_service import (
@@ -125,10 +125,22 @@ class RefundService:
                         # are best-effort writes that swallow a failed statement,
                         # which would leave this transaction aborted and lose the
                         # refund record, so they run after commit, below.
-                        attribution_rows = await apply_attribution_refund_rows(
+                        #
+                        # The order's total AFTER this refund, as a ceiling, not
+                        # this refund's amount: Stripe reports the same refund
+                        # again under ch_ and re_ ids, and those webhooks raise
+                        # the edge to the same total instead of adding to it.
+                        # Computed from the row locked FOR UPDATE above, exactly as
+                        # _update_refund_success wrote it, rather than read back:
+                        # one more statement here is one more way to abort this
+                        # transaction and lose the refund record.
+                        attribution_rows = await apply_refund_total_rows(
                             order_id=order_id,
                             refund_id=refund_id,
-                            amount=amount,
+                            total_refunded=(
+                                Decimal(str(order.get("total_refunded") or "0"))
+                                + Decimal(str(amount))
+                            ),
                         )
                     except Exception as attribution_exc:
                         logger.warning(
@@ -168,8 +180,8 @@ class RefundService:
         # Committed. Only the success branch reaches here.
         if attribution_rows:
             try:
-                await emit_attribution_refund_event(
-                    attribution_rows, order_id=order_id, refund_id=refund_id, amount=amount
+                await emit_refund_total_event(
+                    attribution_rows, order_id=order_id, refund_id=refund_id
                 )
             except Exception as event_exc:
                 logger.warning(

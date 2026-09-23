@@ -61,6 +61,11 @@ async def _build_schema(database):
         "ADD COLUMN channel_partner_id BIGINT, ADD COLUMN take_rate_applied_bp SMALLINT, "
         "ADD COLUMN refund_amount_cents BIGINT NOT NULL DEFAULT 0, ADD COLUMN refunded_at TIMESTAMPTZ"
     )
+    # Migration 237's chargeback part, which every refund and dispute write names.
+    for stmt in split_statements(
+        (_MIGRATIONS / "237_commerce_attribution_edges_dispute_amount.sql").read_text(encoding="utf-8")
+    ):
+        await database.execute(stmt)
     ddl = _ROLLUP_DDL.read_text(encoding="utf-8").replace(
         "REFERENCES channel_partners(id) ON DELETE SET NULL", ""
     )
@@ -202,7 +207,8 @@ async def test_the_stripe_refund_webhook_finalizer_reaches_the_billed_day(db, mo
     import routes.webhook_routes as webhook_routes
 
     async def _finalized(order, **kwargs):
-        return {"applied": True, "order_id": order["order_id"]}
+        # The edge follows the order's reconciled total, which the real finalizer returns.
+        return {"applied": True, "order_id": order["order_id"], "total_refunded": Decimal("40.00")}
 
     monkeypatch.setattr(webhook_routes, "finalize_refund_success", _finalized)
     monkeypatch.setenv("ATTRIBUTION_REVERSE_ON_REFUND", "true")

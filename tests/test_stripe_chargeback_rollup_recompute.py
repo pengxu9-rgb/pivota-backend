@@ -1,7 +1,8 @@
 """A Stripe chargeback reaches the refunded edge's billed day, through the real route.
 
-The charge.dispute.* branch calls attach_refund_to_attribution_edge with its own minor-unit
-conversion, then logs chargeback_received. This drives the real ASGI route and the real attach,
+The charge.dispute.* branch calls attach_dispute_to_attribution_edge with its own minor-unit
+conversion, then logs chargeback_received. A chargeback stays additive per dispute id and is
+kept apart from the refund ceiling (tests/test_stripe_refund_attribution_edge_postgres.py). This drives the real ASGI route and the real attach,
 stubbing only its three writes (the edge UPDATE, the event, the rollup recompute), so the wiring,
 the units and the recompute call are all checked. The recompute itself is covered on Postgres in
 tests/test_refund_rollup_recompute_postgres.py.
@@ -76,6 +77,9 @@ def _install(monkeypatch: pytest.MonkeyPatch, calls: Dict[str, list], *, event_r
     async def noop(*args: Any, **kwargs: Any) -> None:
         return None
 
+    async def fail_refund_writer(**kwargs: Any):
+        raise AssertionError("a chargeback must stay out of the refund writers")
+
     monkeypatch.delenv("ATTRIBUTION_REVERSE_ON_CHARGEBACK", raising=False)
     monkeypatch.setattr(webhook_routes_module.settings, "stripe_webhook_secret", "whsec_test", raising=False)
     monkeypatch.setattr(
@@ -83,7 +87,9 @@ def _install(monkeypatch: pytest.MonkeyPatch, calls: Dict[str, list], *, event_r
     )
     monkeypatch.setattr(dispute_records_module, "upsert_stripe_dispute_record_best_effort", noop)
     monkeypatch.setattr(pcs_module, "create_dispute_evidence_pack", noop)
-    monkeypatch.setattr(attribution_module, "apply_attribution_refund_rows", fake_apply)
+    monkeypatch.setattr(attribution_module, "apply_attribution_dispute_rows", fake_apply)
+    monkeypatch.setattr(attribution_module, "apply_attribution_refund_rows", fail_refund_writer)
+    monkeypatch.setattr(attribution_module, "apply_refund_total_rows", fail_refund_writer)
     monkeypatch.setattr(attribution_module, "emit_attribution_refund_event", fake_emit)
     monkeypatch.setattr(attribution_module, "recompute_days_for_edges", fake_recompute)
     monkeypatch.setattr(webhook_routes_module, "log_order_event", fake_log_order_event)
@@ -107,7 +113,7 @@ async def test_a_chargeback_applies_major_units_and_recomputes_the_edges_day(
     resp = await _post()
 
     assert resp.status_code == 200
-    assert calls["apply"] == [{"order_id": "ORD_CB", "refund_id": "dp_cb_1", "amount": Decimal("15")}]
+    assert calls["apply"] == [{"order_id": "ORD_CB", "dispute_id": "dp_cb_1", "amount": Decimal("15")}]
     assert calls["recompute"] == [["cae_cb"]]
     assert [e["event_type"] for e in calls["order_events"]] == ["chargeback_received"]
 
