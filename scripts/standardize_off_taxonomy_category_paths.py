@@ -135,13 +135,15 @@ async def main() -> int:
             report["rows_updated"] = updated
             # Provenance of the re-file itself. Best-effort by construction: the rows above are
             # already committed, so a failed audit row is reported, never raised.
-            report["audit_batch_id"] = await record_category_refile(
+            audit_batch_id = make_batch_id("off_taxonomy_refile")
+            report["audit_batch_id"] = audit_batch_id
+            report["audit_written"] = bool(await record_category_refile(
                 writer_name="category_refile_off_taxonomy",
-                batch_id=make_batch_id("off_taxonomy_refile"),
+                batch_id=audit_batch_id,
                 rule="services.category_path_aliases: snap an off-taxonomy path onto the leaf it meant",
                 moves=moves,
                 skipped=len(rows) - updated,
-            )
+            ))
             # Re-measure rather than assert success: the whole point of this work is that a lane
             # reporting its own intentions is not evidence.
             remaining = await _candidates(None)

@@ -8,9 +8,10 @@ path, and `enrichment_agent_v1` additionally decides pdp_scope
 
 The batch is therefore what carries the provenance of a re-file, and it belongs in the audit rail
 the offer writer already uses (`writer_audit_log`, migration 132) rather than in a second spelling
-of it. Two batches were recorded retroactively on 2026-09-23 -- the non-face-leaf repair (#2248 /
-#2253, 188 rows re-filed + 60 cleared) and the acid-pad repair (#2254, 6 rows) -- neither of which
-had left any trace at all.
+of it. Four batches were recorded retroactively on 2026-09-23, for two repairs that had left no trace at
+all: writer_name `category_refile_non_face` (batch_id `non_face_leaf_2026_09_23`, 188 rows, and
+`non_face_clear_2026_09_23`, 60 rows cleared; #2248 / #2253) and `category_refile_acid_pad`
+(`acid_pad_2026_09_23`, 5 rows, and `acid_pad_refill_2026_09_23`, 1 row; #2254).
 """
 
 from __future__ import annotations
@@ -47,7 +48,9 @@ def build_refile_audit(
     )
     audit.record_applied(len(landed))
     if skipped:
-        audit.record_skips({"not_at_target": int(skipped)})
+        # The row was no longer at its ORIGIN value when the guarded UPDATE ran, so the re-file
+        # declined it -- not "not at the target".
+        audit.record_skips({"no_longer_at_origin": int(skipped)})
     transitions: dict = {}
     for m in landed:
         key = f"{m['from'] or 'NULL'} -> {m['to'] or 'NULL'}"
@@ -76,7 +79,12 @@ async def record_category_refile(
     db: Any = None,
 ) -> Optional[str]:
     """Write the batch. Returns the batch_id, or None when nothing landed (an empty re-file is not
-    an event). Never raises: losing the audit row must not fail a repair that already committed."""
+    an event) or when the write failed.
+
+    A failed WRITE never raises: the rows are already committed when this runs, so losing the audit
+    row must not fail the repair. A malformed `moves` DOES raise, before any write is attempted --
+    that is a programming error in the caller, and silence there would mean a repair whose
+    provenance can never be reconstructed."""
     audit = build_refile_audit(
         writer_name=writer_name, batch_id=batch_id, rule=rule, moves=moves,
         manifest_sha=manifest_sha, skipped=skipped,
