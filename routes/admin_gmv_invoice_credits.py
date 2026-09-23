@@ -121,7 +121,17 @@ async def approve_credit(credit_id: int, body: ApproveBody, admin: Dict[str, Any
     credit = await _credit_or_404(credit_id)
     if credit.get("status") != "pending":
         return _not_in_state(credit, "approve", ("pending",))
-    if not await credits.approve(credit_id, by=_actor(admin), expected_amount_cents=body.amount_cents):
+    try:
+        approved = await credits.approve(credit_id, by=_actor(admin), expected_amount_cents=body.amount_cents)
+    except credits.CreditActionRefused as exc:
+        if exc.code == "line_voided":
+            # A dispute replaced the line after the credit was computed; cancel it now.
+            await credits.compute_credit_for_line(int(credit["billing_run_item_id"]))
+            return JSONResponse(status_code=409, content={
+                "detail": "the invoiced line was voided by a dispute; the credit has been cancelled",
+                "credit_id": credit_id})
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    if not approved:
         current = await _credit_or_404(credit_id)
         if current.get("status") == "pending":
             return JSONResponse(status_code=409, content={
@@ -149,7 +159,22 @@ async def cancel_credit(credit_id: int, body: CancelBody, admin: Dict[str, Any] 
     credit = await _credit_or_404(credit_id)
     if credit.get("status") not in credits.OPEN_STATUSES:
         return _not_in_state(credit, "cancel", credits.OPEN_STATUSES)
-    if not await credits.cancel(credit_id, by=_actor(admin), reason=body.reason):
+    try:
+        outcome = await credits.cancel(credit_id, by=_actor(admin), reason=body.reason)
+    except credits.CreditActionRefused as exc:
+        if exc.code == "stripe_unreachable":
+            return JSONResponse(status_code=503, content={
+                "detail": "Stripe could not be checked for a credit note this failed credit may have "
+                          "created; not cancelled. Retry the cancel.", "credit_id": credit_id})
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    if outcome == "issued":
+        current = await _credit_or_404(credit_id)
+        return JSONResponse(status_code=409, content={
+            "detail": "not cancelled: Stripe had already issued a credit note for this credit (its "
+                      "failure hid it); it is now recorded as issued",
+            "credit_id": credit_id, "status": "issued",
+            "stripe_credit_note_id": current.get("stripe_credit_note_id")})
+    if outcome != "cancelled":
         return _not_in_state(await _credit_or_404(credit_id), "cancel", credits.OPEN_STATUSES)
     return {"credit_id": credit_id, "status": "cancelled"}
 

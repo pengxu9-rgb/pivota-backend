@@ -949,9 +949,12 @@ async def start_scheduler() -> None:
         # Runs before agent_share_accrual_daily (02:30) so a credit issued that day nets first.
         async def _run_gmv_invoice_credits() -> None:
             from services.gmv_invoice_credits import run_daily
+            # The "pivota" logger, not the module one: prod leaves root at WARNING, so a module
+            # logger's INFO never reaches stdout (#2266).
+            from utils.logger import logger as operator_logger
 
             summary = await run_daily()
-            logger.info("audit_scheduler: gmv_invoice_credit_daily -> %s", summary)
+            operator_logger.info("audit_scheduler: gmv_invoice_credit_daily -> %s", summary)
 
         _add_job(
             _run_gmv_invoice_credits,

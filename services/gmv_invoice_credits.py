@@ -123,11 +123,23 @@ SET status = 'cancelled', status_reason = :superseded,
 WHERE id = :id AND status = 'pending'
 """
 
+# A voided line with an OPEN credit is selected too: computing it cancels that credit.
+_OPEN_CREDIT_ON_LINE = """EXISTS (SELECT 1 FROM gmv_invoice_credits oc
+               WHERE oc.billing_run_item_id = bri.id AND oc.status IN ('pending', 'approved', 'failed'))"""
+
+_CANCEL_OPEN_ON_VOIDED_LINE_SQL = """
+UPDATE gmv_invoice_credits
+SET status = 'cancelled', status_reason = 'line_voided', cancelled_by = 'system', cancelled_at = :now,
+    updated_at = :now
+WHERE billing_run_item_id = :line_id AND status IN ('pending', 'approved', 'failed')
+RETURNING id
+"""
+
 _LINES_FOR_DAY_SQL = """
 SELECT bri.id AS line_id
 FROM billing_run_items bri
 JOIN gmv_attribution_daily g ON g.id = bri.source_id
-WHERE bri.source_type = 'gmv_rollup' AND bri.voided_at IS NULL
+WHERE bri.source_type = 'gmv_rollup' AND (bri.voided_at IS NULL OR """ + _OPEN_CREDIT_ON_LINE + """)
   AND g.date = :day AND g.merchant_id = :merchant_id
 ORDER BY bri.id
 """
@@ -148,7 +160,12 @@ WHERE bri.source_type = 'gmv_rollup' AND bri.voided_at IS NULL
       AND COALESCE(e.refund_amount_cents, 0) > 0
       AND COALESCE(e.latest_refund_at, e.refunded_at, e.updated_at) >= :since
   )
-ORDER BY bri.id
+UNION
+-- A line a dispute voided after a credit was computed on it: computing it cancels the credit.
+SELECT bri.id AS line_id
+FROM billing_run_items bri
+WHERE bri.source_type = 'gmv_rollup' AND bri.voided_at IS NOT NULL AND """ + _OPEN_CREDIT_ON_LINE + """
+ORDER BY line_id
 """
 
 _RUN_LINES_OF_MERCHANT_SQL = """
@@ -160,6 +177,15 @@ ORDER BY id
 _CREDIT_SQL = "SELECT * FROM gmv_invoice_credits WHERE id = :id"
 _CREDIT_FOR_UPDATE_SQL = "SELECT * FROM gmv_invoice_credits WHERE id = :id FOR UPDATE"
 
+# The credit's line, locked: compute_credit_for_line holds the same lock while it adjusts or
+# supersedes a pending credit, so an approval never lands between its read and its write.
+_LOCK_LINE_OF_CREDIT_SQL = """
+SELECT bri.id, bri.voided_at FROM billing_run_items bri
+JOIN gmv_invoice_credits c ON c.billing_run_item_id = bri.id
+WHERE c.id = :id
+FOR UPDATE OF bri
+"""
+
 _APPROVE_SQL = """
 UPDATE gmv_invoice_credits
 SET status = 'approved', approved_by = :by, approved_at = :now, updated_at = :now
@@ -167,12 +193,31 @@ WHERE id = :id AND status = 'pending' AND amount_cents = :expected
 RETURNING id
 """
 
+_LINE_NOT_VOIDED = """NOT EXISTS (SELECT 1 FROM billing_run_items vb
+                  WHERE vb.id = gmv_invoice_credits.billing_run_item_id AND vb.voided_at IS NOT NULL)"""
+
+# Never reached Stripe: pending, or approved and not yet claimed (an approved credit has no attempt).
 _CANCEL_SQL = """
 UPDATE gmv_invoice_credits
 SET status = 'cancelled', status_reason = :reason, cancelled_by = :by, cancelled_at = :now,
     updated_at = :now
-WHERE id = :id AND status IN ('pending', 'approved', 'failed')
+WHERE id = :id AND status IN ('pending', 'approved')
 RETURNING id
+"""
+
+# A FAILED credit did reach Stripe, and a timeout may have hidden a note Stripe created. Claimed as
+# `issuing` while Stripe is asked, so no issue runs alongside the check.
+_CLAIM_FAILED_FOR_CANCEL_SQL = """
+UPDATE gmv_invoice_credits SET status = 'issuing', updated_at = :now
+WHERE id = :id AND status = 'failed'
+RETURNING *
+"""
+
+_CANCEL_CLAIMED_SQL = """
+UPDATE gmv_invoice_credits
+SET status = 'cancelled', status_reason = :reason, cancelled_by = :by, cancelled_at = :now,
+    updated_at = :now
+WHERE id = :id AND status = 'issuing'
 """
 
 _CLAIM_FOR_ISSUE_SQL = """
@@ -180,6 +225,7 @@ UPDATE gmv_invoice_credits
 SET status = 'issuing', issue_attempts = issue_attempts + 1, updated_at = :now
 WHERE id = :id
   AND (status IN ('approved', 'failed') OR (status = 'issuing' AND updated_at < :stale_before))
+  AND """ + _LINE_NOT_VOIDED + """
 RETURNING *
 """
 
@@ -219,6 +265,12 @@ SELECT id, snapshot_payload_jsonb FROM settlement_snapshots
 WHERE billing_run_id = :billing_run_id AND channel_partner_id = :channel_partner_id
 ORDER BY id LIMIT 1
 """
+
+_SETTLEMENT_COMPLETED_SQL = "SELECT 1 FROM partner_settlement_completions WHERE billing_run_id = :billing_run_id"
+
+# Serialises clawbacks against one (snapshot, merchant) cap: two credits reconciled at once would
+# each read the other's clawback as not yet taken and together claw past what was paid.
+_LOCK_CLAWBACK_CAP_SQL = "SELECT pg_advisory_xact_lock(hashtext(CAST(:key AS text)))"
 
 _CLAWED_FOR_SNAPSHOT_SQL = """
 SELECT COALESCE(SUM(partner_clawback_cents), 0) AS clawed
@@ -303,8 +355,14 @@ async def compute_credit_for_line(line_id: int) -> LineCredit:
         if line["source_type"] != "gmv_rollup" or line["billed_day"] is None:
             return LineCredit(status="skipped", line_id=line_id, reason="not_a_rollup_line")
         if line["voided_at"] is not None:
-            # A dispute replaced the line; the dispute's own adjustment is what the merchant owes.
-            return LineCredit(status="skipped", line_id=line_id, reason="line_voided")
+            # A dispute replaced the line; the dispute's own adjustment is what the merchant owes. A
+            # credit computed before the dispute would credit them AGAIN on top of it: cancel it.
+            cancelled = await database.fetch_all(_CANCEL_OPEN_ON_VOIDED_LINE_SQL, {"line_id": line_id, "now": _now()})
+            if cancelled:
+                logger.warning("gmv_invoice_credit_cancelled_line_voided line_id=%s credit_ids=%s",
+                               line_id, [int(_row(r)["id"]) for r in cancelled])
+            return LineCredit(status="skipped", line_id=line_id, reason="line_voided",
+                              detail={"cancelled_credit_ids": [int(_row(r)["id"]) for r in cancelled]})
 
         sums = await _group_sums(line["billed_day"], str(line["merchant_id"]), line["agent_id"],
                                  line["channel_partner_id"])
@@ -434,18 +492,51 @@ async def approve(credit_id: int, *, by: str, expected_amount_cents: int) -> boo
     if isinstance(expected_amount_cents, bool) or not isinstance(expected_amount_cents, int) \
             or expected_amount_cents <= 0:
         raise CreditActionRefused("invalid_expected_amount", "the positive amount in cents that was reviewed")
-    row = await database.fetch_one(_APPROVE_SQL, {"id": credit_id, "by": _actor(by), "now": _now(),
-                                                  "expected": expected_amount_cents})
+    actor = _actor(by)
+    async with database.transaction():
+        line = _row(await database.fetch_one(_LOCK_LINE_OF_CREDIT_SQL, {"id": credit_id}))
+        if not line:
+            return False
+        if line["voided_at"] is not None:
+            # A dispute replaced the line after the credit was computed: never credit on top of it.
+            raise CreditActionRefused("line_voided", "the invoiced line was voided by a dispute")
+        row = await database.fetch_one(_APPROVE_SQL, {"id": credit_id, "by": actor, "now": _now(),
+                                                      "expected": expected_amount_cents})
     return row is not None
 
 
-async def cancel(credit_id: int, *, by: str, reason: str) -> bool:
+async def cancel(credit_id: int, *, by: str, reason: str) -> str:
+    """Cancel an open credit. Returns `cancelled`, `issued` (Stripe already held a credit note for a
+    FAILED credit, e.g. a timeout hid its creation: it is recorded as issued, not cancelled, so the
+    agent and partner shares net it), or `not_cancellable`. Raises CreditActionRefused
+    `stripe_unreachable` when Stripe cannot be asked: a failed credit is never cancelled blind."""
     why = str(reason or "").strip()
     if not why:
         raise CreditActionRefused("reason_required")
-    row = await database.fetch_one(_CANCEL_SQL, {"id": credit_id, "by": _actor(by), "reason": why[:2000],
-                                                 "now": _now()})
-    return row is not None
+    who, why = _actor(by), why[:2000]
+    if await database.fetch_one(_CANCEL_SQL, {"id": credit_id, "by": who, "reason": why, "now": _now()}):
+        return "cancelled"
+
+    claimed = await database.fetch_one(_CLAIM_FAILED_FOR_CANCEL_SQL, {"id": credit_id, "now": _now()})
+    if claimed is None:
+        return "not_cancellable"
+    credit = dict(claimed)
+    try:
+        note = await _existing_note(str(credit["stripe_invoice_id"]), credit_id)
+    except Exception as exc:  # noqa: BLE001 -- back to failed; cancelling blind could orphan a live note
+        error = f"cancel refused, Stripe check failed: {type(exc).__name__}: {str(exc)[:400]}"
+        await database.execute(_MARK_FAILED_SQL, {"id": credit_id, "error": error, "now": _now()})
+        raise CreditActionRefused("stripe_unreachable", "could not check Stripe for an issued note") from exc
+    if note is not None:
+        kind = "customer_balance" if int(_field(note, "credit_amount") or 0) > 0 else "amount_due"
+        await database.execute(_MARK_ISSUED_SQL, {"id": credit_id, "note_id": str(_field(note, "id")),
+                                                  "kind": kind, "by": who, "now": _now()})
+        logger.warning("gmv_invoice_credit_cancel_found_issued credit_id=%s note=%s: recorded as issued",
+                       credit_id, _field(note, "id"))
+        await _after_issue(credit)
+        return "issued"
+    await database.execute(_CANCEL_CLAIMED_SQL, {"id": credit_id, "by": who, "reason": why, "now": _now()})
+    return "cancelled"
 
 
 @dataclass
@@ -597,11 +688,18 @@ async def reconcile_partner(credit_id: int) -> Optional[str]:
             await mark("not_applicable")
             return "not_applicable"
 
+        if await database.fetch_one(_SETTLEMENT_COMPLETED_SQL, {
+                "billing_run_id": int(credit["billing_run_id"])}) is None:
+            # Not settled yet, or mid-run: settlement will net this credit, or it completes and the
+            # daily job decides then. The same completion agent share accrual waits for.
+            return None
         snapshot = _row(await database.fetch_one(_SNAPSHOT_FOR_RUN_SQL, {
             "billing_run_id": int(credit["billing_run_id"]),
             "channel_partner_id": int(credit["channel_partner_id"])}))
         if not snapshot:
-            return None
+            # Settled, and this partner was paid nothing in the run: nothing to claw back.
+            await mark("netted")
+            return "netted"
         payload = _coerce_json(snapshot["snapshot_payload_jsonb"])
         snapshot_id = int(snapshot["id"])
         # Decided by the engine that WROTE the snapshot, not today's PARTNER_REV_SHARE_USE_V2: a flag
@@ -628,6 +726,8 @@ async def reconcile_partner(credit_id: int) -> Optional[str]:
         accrual = _coerce_json(_coerce_json(payload.get("merchant_accruals")).get(str(credit["merchant_id"])))
         paid_on_gmv = min(settlement.merchant_gmv_share_cents(payload, str(credit["merchant_id"])),
                           settlement._as_int(accrual.get("credited_comp_cents")))
+        await database.execute(_LOCK_CLAWBACK_CAP_SQL, {
+            "key": f"gmv_invoice_credit_clawback:{snapshot_id}:{credit['merchant_id']}"})
         clawed = int(_row(await database.fetch_one(_CLAWED_FOR_SNAPSHOT_SQL, {
             "snapshot_id": snapshot_id, "merchant_id": str(credit["merchant_id"])}))["clawed"])
         clawback = max(min(share, paid_on_gmv - clawed), 0)

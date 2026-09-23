@@ -290,7 +290,7 @@ async def test_an_admin_cancelled_credit_is_not_brought_back_by_the_daily_job(db
     line, _, _ = await _billed(db)
     await _refund("25.00", "re_1")
     (credit,) = await _credits(db, line)
-    assert await cancel(credit["id"], by="ops@pivota", reason="merchant agreed to net it themselves")
+    assert await cancel(credit["id"], by="ops@pivota", reason="merchant agreed to net it themselves") == "cancelled"
 
     await run_daily()
     assert [c["status"] for c in await _credits(db, line)] == ["cancelled"]
@@ -545,7 +545,6 @@ async def test_a_credit_after_settlement_moves_the_partner_and_the_agent_togethe
     await _agent_rate()
     credit, line, rollup_id, run_id = await _pending_credit(db, channel_partner=7)
     await _snapshot(db, run_id, counted=[rollup_id], bp=2000, paid_on_gmv=200)
-    await _settlement_completed(db, run_id, partner_ids=[7])
     assert (await accrue_for_line(line)).target_minor == 200  # 25% x (1000 - 200)
 
     await approve(credit["id"], by="ops@pivota", expected_amount_cents=credit["amount_cents"])
@@ -567,7 +566,7 @@ async def _issued_partner_credit(db, fake_stripe):
     return credit["id"], rollup_id, run_id
 
 
-async def _snapshot(db, run_id, *, counted, netted=(), bp=2000, paid_on_gmv=200, engine="v1"):
+async def _snapshot(db, run_id, *, counted, netted=(), bp=2000, paid_on_gmv=200, engine="v1", complete=True):
     payload = {"gmv_rollup_ids_counted": list(counted), "netted_invoice_credit_ids": list(netted),
                "commission_config": {"gmv_take_share_bp": bp},
                "merchant_accruals": {MERCHANT: {"gmv_take_rev_cents": paid_on_gmv, "credited_comp_cents": paid_on_gmv}}}
@@ -575,10 +574,13 @@ async def _snapshot(db, run_id, *, counted, netted=(), bp=2000, paid_on_gmv=200,
         payload = {"commission_config": {"source": "structured_contract_columns"},
                    "merchant_accruals": {MERCHANT: {"gmv_share_cents": paid_on_gmv, "credited_comp_cents": paid_on_gmv}},
                    "v2_metadata": {"channel_partner_id": 7}}
-    return await db.fetch_val(
+    snapshot_id = await db.fetch_val(
         "INSERT INTO settlement_snapshots (billing_run_id, channel_partner_id, snapshot_payload_jsonb, "
         "computed_comp_cents) VALUES (:r, 7, CAST(:p AS jsonb), :c) RETURNING id",
         {"r": run_id, "p": json.dumps(payload), "c": paid_on_gmv})
+    if complete:
+        await _settlement_completed(db, run_id, partner_ids=[7])
+    return snapshot_id
 
 
 async def _partner_ledger(db):
@@ -752,3 +754,166 @@ async def test_the_admin_routes_review_approve_and_refuse_a_second_approval(db, 
     assert summary["issued"] == {"count": 1, "cents": 350}
     assert (await admin_client.get(f"{base}/999999")).status_code == 404
     assert (await admin_client.get(base, params={"status": "bogus"})).status_code == 422
+
+
+# ── review of #2286 (the independent reviewer's reproductions, now fixed) ─────────────────────────
+
+
+async def _void_line_and_bill_dispute(db, line, run_id, amount=750):
+    """handle_dispute on a draft: void the line, bill the agreed amount as a dispute_adj replacement."""
+    await db.execute("UPDATE billing_run_items SET voided_at = NOW() WHERE id = :l", {"l": line})
+    await db.execute(
+        "INSERT INTO billing_run_items (billing_run_id, merchant_id, source_type, source_id, stripe_invoice_item_id,"
+        " stripe_invoice_id, amount_cents) VALUES (:r, :m, 'dispute_adj', 1, 'ii_adj', 'in_1', :a)",
+        {"r": run_id, "m": MERCHANT, "a": amount})
+
+
+async def test_a_pending_credit_is_cancelled_when_a_dispute_voids_its_line(db, fake_stripe):
+    """A refund computed a credit while the invoice was a draft; a dispute then voided the line and
+    billed its own adjustment. Crediting on top of that would credit the merchant twice."""
+    from services.gmv_invoice_credits import approve, run_daily, CreditActionRefused
+
+    credit, line, _, run_id = await _pending_credit(db, invoice_status="draft")
+    await _void_line_and_bill_dispute(db, line, run_id)
+
+    with pytest.raises(CreditActionRefused) as refused:  # approval refuses at once, before any job runs
+        await approve(credit["id"], by="ops", expected_amount_cents=250)
+    assert refused.value.code == "line_voided"
+    await run_daily()
+    (row,) = await _credits(db, line)
+    assert (row["status"], row["status_reason"], row["cancelled_by"]) == ("cancelled", "line_voided", "system")
+    assert fake_stripe.created == []
+
+
+async def test_an_approved_or_failed_credit_on_a_voided_line_is_never_issued(db, fake_stripe):
+    from services.gmv_invoice_credits import approve, compute_credit_for_line, issue
+
+    credit, line, _, run_id = await _pending_credit(db)
+    await approve(credit["id"], by="ops", expected_amount_cents=250)
+    await _void_line_and_bill_dispute(db, line, run_id)
+
+    assert (await issue(credit["id"], by="ops")).status == "not_issuable"
+    assert (await compute_credit_for_line(line)).reason == "line_voided"
+    assert [c["status"] for c in await _credits(db, line)] == ["cancelled"]
+    assert fake_stripe.created == []
+
+
+async def test_the_approve_route_refuses_a_voided_line_and_cancels_the_credit(db, fake_stripe, admin_client):
+    credit, line, _, run_id = await _pending_credit(db, invoice_status="draft")
+    await _void_line_and_bill_dispute(db, line, run_id)
+    fake_stripe.invoice_status = "open"
+
+    r = await admin_client.post(f"/admin/billing/invoice-credits/{credit['id']}/approve", json={"amount_cents": 250})
+    assert r.status_code == 409 and "voided" in r.json()["detail"]
+    assert [c["status"] for c in await _credits(db, line)] == ["cancelled"]
+    assert fake_stripe.created == []
+
+
+def _create_then_timeout(fake_stripe):
+    notes = fake_stripe.v1.credit_notes
+    real_create = type(notes).create
+
+    def create_then_timeout(params=None, options=None):
+        real_create(notes, params=params, options=options)
+        raise TimeoutError("read timed out")
+
+    notes.create = create_then_timeout
+
+
+async def test_cancelling_a_failed_credit_stripe_actually_issued_records_it_as_issued(db, fake_stripe, monkeypatch):
+    """Stripe created the note, the response was lost: `failed`. A cancel must not orphan the live
+    note; it is recorded as issued, so the agent (and partner) shares net it."""
+    from services.agent_share_accrual import accrue_for_line
+    from services.gmv_invoice_credits import approve, cancel, compute_credit_for_line, issue
+
+    monkeypatch.setenv("AGENT_SHARE_ACCRUAL_ENABLED", "true")
+    await _agent_rate()
+    credit, line, _, run_id = await _pending_credit(db)
+    await _settlement_completed(db, run_id)
+    await accrue_for_line(line)
+    _create_then_timeout(fake_stripe)
+    await approve(credit["id"], by="ops", expected_amount_cents=250)
+    assert (await issue(credit["id"], by="ops")).status == "failed"
+
+    assert await cancel(credit["id"], by="ops@later", reason="stripe error, giving up") == "issued"
+    (row,) = await _credits(db, line)
+    assert (row["status"], row["stripe_credit_note_id"], row["issued_by"]) == ("issued", "cn_1", "ops@later")
+    assert (await compute_credit_for_line(line)).status == "nothing_owed"
+    assert await _agent_total(db, line) == 187  # priced on the 750 kept
+
+
+async def test_a_failed_credit_with_no_note_at_stripe_is_cancelled(db, fake_stripe):
+    from services.gmv_invoice_credits import approve, cancel, issue
+
+    credit, line, _, _ = await _pending_credit(db)
+    await approve(credit["id"], by="ops", expected_amount_cents=250)
+    fake_stripe.fail_create = RuntimeError("card_error")
+    assert (await issue(credit["id"], by="ops")).status == "failed"
+
+    assert await cancel(credit["id"], by="ops", reason="merchant settled it offline") == "cancelled"
+    (row,) = await _credits(db, line)
+    assert (row["status"], row["cancelled_by"]) == ("cancelled", "ops")
+
+
+async def test_a_failed_credit_is_not_cancelled_blind_when_stripe_cannot_be_asked(db, fake_stripe, admin_client):
+    from services.gmv_invoice_credits import approve, issue
+
+    credit, line, _, _ = await _pending_credit(db)
+    await approve(credit["id"], by="ops", expected_amount_cents=250)
+    _create_then_timeout(fake_stripe)
+    assert (await issue(credit["id"], by="ops")).status == "failed"
+
+    def _list_down(params=None, options=None):
+        raise ConnectionError("stripe unreachable")
+
+    fake_stripe.v1.credit_notes.list = _list_down
+    r = await admin_client.post(f"/admin/billing/invoice-credits/{credit['id']}/cancel", json={"reason": "give up"})
+    assert r.status_code == 503
+    (row,) = await _credits(db, line)
+    assert row["status"] == "failed"  # still retryable, still decided
+
+
+async def test_a_partner_clawback_waits_for_the_runs_settlement_to_complete(db, fake_stripe):
+    from services.gmv_invoice_credits import reconcile_partner
+
+    credit_id, rollup_id, run_id = await _issued_partner_credit(db, fake_stripe)
+    await _snapshot(db, run_id, counted=[rollup_id], complete=False)  # mid-run: snapshot, no completion
+    assert await reconcile_partner(credit_id) is None
+    assert await _partner_ledger(db) == []
+
+    await _settlement_completed(db, run_id, partner_ids=[7])
+    assert await reconcile_partner(credit_id) == "clawed_back"
+
+
+async def test_a_settled_run_that_paid_this_partner_nothing_needs_no_clawback(db, fake_stripe):
+    from services.gmv_invoice_credits import reconcile_partner
+
+    credit_id, _, run_id = await _issued_partner_credit(db, fake_stripe)
+    await _settlement_completed(db, run_id)  # completed; no snapshot for partner 7
+
+    assert await reconcile_partner(credit_id) == "netted"
+    assert await _partner_ledger(db) == []
+
+
+async def test_the_model_and_migration_238_build_the_same_table(db):
+    """Prod gets the table from the model (metadata.create_all at startup); environments that apply
+    numbered migrations get it from 238. They must not drift."""
+    from sqlalchemy.dialects import postgresql
+    from sqlalchemy.schema import CreateIndex, CreateTable
+
+    from db.gmv_invoice_credits import gmv_invoice_credits
+    from db.sql_migrations import split_statements
+
+    facts = (
+        "SELECT 'col '||column_name||' '||data_type||' '||is_nullable||' '||coalesce(column_default,'') "
+        "FROM information_schema.columns WHERE table_name='gmv_invoice_credits' "
+        "UNION ALL SELECT 'con '||conname||' '||pg_get_constraintdef(oid) FROM pg_constraint "
+        "WHERE conrelid='gmv_invoice_credits'::regclass "
+        "UNION ALL SELECT 'idx '||indexname||' '||indexdef FROM pg_indexes WHERE tablename='gmv_invoice_credits'")
+    from_migration = sorted(r[0] for r in await db.fetch_all(facts))  # the fixture built it from 238
+    await db.execute("DROP TABLE gmv_invoice_credits")
+    await db.execute(str(CreateTable(gmv_invoice_credits).compile(dialect=postgresql.dialect())))
+    for index in gmv_invoice_credits.indexes:
+        await db.execute(str(CreateIndex(index).compile(dialect=postgresql.dialect())))
+    from_model = sorted(r[0] for r in await db.fetch_all(facts))
+    assert from_model == from_migration and len(from_model) > 40
