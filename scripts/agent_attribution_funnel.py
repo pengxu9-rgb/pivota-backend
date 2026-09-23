@@ -42,6 +42,9 @@ from datetime import datetime, timedelta, timezone
 MAX_EXCEPTION_ROWS = 20
 MAX_AGENTS = 50
 NO_AGENT = "(none)"
+#: services.traffic_taxonomy_service.UNKNOWN_TOKEN: written into agent_id when the traffic has no
+#: agent. It names nobody, so it is reported as no agent, never as an agent called "unknown".
+UNKNOWN_AGENT_TOKEN = "unknown"
 
 # Purchases: the ledger's own states (migration 224). Everything not listed as terminal is
 # still in flight.
@@ -65,12 +68,12 @@ def build_queries(purchase_cols):
     src = "coalesce(p.item_source, 'reap_variant')" if "item_source" in cols else "'reap_variant'"
     queries = {
         "clicks": (
-            "SELECT coalesce(nullif(c.agent_id, ''), :none) AS agent, coalesce(c.surface, '') AS surface, "
+            "SELECT coalesce(nullif(nullif(c.agent_id, ''), :unknown), :none) AS agent, coalesce(c.surface, '') AS surface, "
             "count(*) AS issued, count(*) FILTER (WHERE c.click_count > 0) AS clicked "
             "FROM surface_click_events c WHERE c.created_at >= :since GROUP BY 1, 2"
         ),
         "edges": (
-            "SELECT coalesce(nullif(e.agent_id, ''), :none) AS agent, "
+            "SELECT coalesce(nullif(nullif(e.agent_id, ''), :unknown), :none) AS agent, "
             "coalesce(e.metadata ->> 'agent_source', '') AS agent_source, "
             "(e.metadata -> 'partner_provenance' ->> 'partner_reported') = 'true' AS partner, "
             "coalesce(e.state, '') AS state, coalesce(e.currency, '') AS currency, "
@@ -109,14 +112,14 @@ def build_queries(purchase_cols):
         "AND NOT EXISTS (" + edge_for_purchase + ") ORDER BY p.terminal_at DESC NULLS LAST"
     )
     queries["partner_edge_agent_check"] = (
-        "SELECT e.edge_id AS edge_id, coalesce(e.agent_id, '') AS edge_agent, "
+        "SELECT e.edge_id AS edge_id, coalesce(nullif(e.agent_id, :unknown), '') AS edge_agent, "
         "coalesce(p.agent_id, '') AS purchase_agent, (p.id IS NOT NULL) AS purchase_found, "
         "e.metadata -> 'partner_provenance' ->> 'purchase_id' AS purchase_id, e.created_at AS created_at "
         "FROM commerce_attribution_edges e "
         "LEFT JOIN reap_agentic_purchases p ON p.id = e.metadata -> 'partner_provenance' ->> 'purchase_id' "
         "WHERE (e.metadata -> 'partner_provenance' ->> 'partner_reported') = 'true' "
         "AND e.created_at >= :since "
-        "AND (coalesce(e.agent_id, '') = '' OR coalesce(e.agent_id, '') <> coalesce(p.agent_id, '')) "
+        "AND (coalesce(nullif(e.agent_id, :unknown), '') = '' OR coalesce(e.agent_id, '') <> coalesce(p.agent_id, '')) "
         "ORDER BY e.created_at DESC"
     )
     return queries
@@ -310,6 +313,8 @@ async def collect(days):
             params = {"since": since}
             if ":none" in sql:
                 params["none"] = NO_AGENT
+            if ":unknown" in sql:
+                params["unknown"] = UNKNOWN_AGENT_TOKEN
             try:
                 rows[name] = [dict(r) for r in await database.fetch_all(sql, params)]
             except Exception as exc:  # noqa: BLE001 -- one failed query must not hide the rest

@@ -208,3 +208,24 @@ async def _purchase_without_source(db):
         "VALUES ('rp_s', 'buyer_x', 'agent_minds', 'resolving', :now)",
         {"now": NOW},
     )
+
+
+async def test_the_unknown_sentinel_is_reported_as_no_agent(_db):
+    """traffic_taxonomy_service writes agent_id='unknown' when there is no agent. It names nobody,
+    so it must count as no agent in every lane (review of #2269)."""
+    from scripts import agent_attribution_funnel as f
+
+    await _build_schema()
+    await _db.execute(
+        "INSERT INTO surface_click_events (click_id, surface, agent_id, impression_count, click_count, "
+        "created_at, updated_at) VALUES ('clk_u', 'offers.resolve', 'unknown', 0, 1, :now, :now)",
+        {"now": NOW},
+    )
+    await _purchase(_db, "rp_u", "agent_minds", "completed", order="o1", final=4500)
+    await _edge(_db, "e_u", "unknown", purchase_id="rp_u")
+    fn = f.build_funnel(await f.collect(30), 30)
+    agents = {a["agent"] for a in fn["agents"]}
+    assert "unknown" not in agents
+    assert next(a for a in fn["agents"] if a["agent"] == f.NO_AGENT)["issued"] == 1
+    assert fn["totals"]["credited_partner_to_agent"] == 0
+    assert [r["edge_id"] for r in fn["exceptions"]["partner_edge_without_agent"]["rows"]] == ["e_u"]
