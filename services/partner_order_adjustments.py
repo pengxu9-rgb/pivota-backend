@@ -23,9 +23,19 @@ What one adjustment does, in ONE transaction holding the edge's row lock:
      (`apply_attribution_refund_rows`), idempotent on `refund_id = "<partner>:<event id>"`.
   4. Appends the adjustment (kind, amounts, occurred_at) to `metadata.partner_adjustments`, so
      the edge says WHY its net moved, not only that it did.
-After commit, it emits the `refund.succeeded` event and recomputes the edge's day in
-`gmv_attribution_daily`. The daily job only rolls up yesterday, so without this recompute a refund
-arriving later would never reach billing.
+After commit, it emits the `refund.succeeded` event and re-rolls the edge's day in
+`gmv_attribution_daily`, keeping the take rate that day was billed at. The daily job only rolls
+up yesterday, so without the re-roll a refund arriving later would never reach the next invoice.
+
+UNLESS THAT DAY IS ALREADY INVOICED. An invoice's items point at the rollup rows it billed, and
+partner settlement reads those rows for paid periods. Rewriting one would make the rollup disagree
+with the invoice the merchant received. There is no credit-note path, so the adapter leaves the
+day alone, records the refund on the edge (the truth), and reports
+`rollup="invoiced_period_manual_credit"` for a human to credit. It fails closed: if the invoice
+check itself fails, the day is not re-rolled either.
+
+An event for a purchase whose edge does not exist yet returns `no_edge` and is NOT stored here. An
+operator re-runs it; a future webhook receiver must keep the event durably and retry.
 """
 
 from __future__ import annotations
@@ -57,7 +67,8 @@ _CURRENCY_RE = re.compile(r"^[A-Z]{3}$")
 _EDGE_FOR_PURCHASE_SQL = """
 SELECT edge_id, order_id, merchant_id, agent_id, currency, created_at,
        gross_attributed_gmv_cents, COALESCE(refund_amount_cents, 0) AS refund_amount_cents,
-       COALESCE(refund_ids, '[]'::jsonb) AS refund_ids
+       COALESCE(refund_ids, '[]'::jsonb) AS refund_ids,
+       COALESCE(metadata -> 'partner_adjustments', '[]'::jsonb) AS adjustments
 FROM commerce_attribution_edges
 WHERE metadata -> 'partner_provenance' ->> 'purchase_id' = :purchase_id
   AND (metadata -> 'partner_provenance' ->> 'partner_reported') = 'true'
@@ -91,6 +102,8 @@ class AdjustmentResult:
     status: str
     purchase_id: str
     refund_id: str
+    #: recomputed | invoiced_period_manual_credit | invoice_check_failed | recompute_failed
+    rollup: Optional[str] = None
     edge_id: Optional[str] = None
     agent_id: Optional[str] = None
     currency: Optional[str] = None
@@ -191,6 +204,21 @@ async def record_partner_order_adjustment(
         result.refunded_before_minor = before
 
         if v["refund_id"] in (refund_ids or []):
+            # Same event again. It must say the same thing: a redelivery is harmless, but a re-run
+            # with a different amount is an operator mistake that "replayed" would hide.
+            adjustments = edge["adjustments"]
+            if isinstance(adjustments, str):
+                adjustments = json.loads(adjustments)
+            stored = next((a for a in adjustments or []
+                           if a.get("partner") == v["partner"] and a.get("event_id") == v["event_id"]), None)
+            if stored is not None:
+                differs = [k for k, mine in (("kind", v["kind"]), ("currency", v["currency"]),
+                                             ("amount_minor", v["amount_minor"]))
+                           if mine is not None and stored.get(k) != mine]
+                if differs:
+                    raise AdjustmentRefused(
+                        "replay_mismatch", f"event {v['event_id']} was recorded with different {', '.join(differs)}"
+                    )
             result.status = "replayed"
             return result
         if result.currency != v["currency"]:
@@ -238,7 +266,8 @@ async def record_partner_order_adjustment(
 
     # After commit. Neither step may undo the refund, so each failure is reported, not raised.
     await _emit_refund_event(applied_rows, edge["order_id"], v["refund_id"], refund_major)
-    result.rollup_recomputed = await _recompute_rollup(edge)
+    result.rollup = await _recompute_rollup(edge)
+    result.rollup_recomputed = result.rollup == "recomputed"
     return result
 
 
@@ -262,16 +291,38 @@ async def _emit_refund_event(rows: List[Dict[str, Any]], order_id: str, refund_i
                        refund_id, type(exc).__name__)
 
 
-async def _recompute_rollup(edge: Dict[str, Any]) -> bool:
-    """Re-roll the edge's creation day, which is the day its gross was billed on."""
+_INVOICE_COVERING_DAY_SQL = """
+SELECT id FROM invoices
+WHERE merchant_id = :merchant_id
+  AND billing_period_start <= :day AND billing_period_end >= :day
+  AND COALESCE(status, '') <> 'void'
+LIMIT 1
+"""
+
+
+async def _recompute_rollup(edge: Dict[str, Any]) -> str:
+    """Re-roll the edge's creation day, the day its gross was billed on, unless it is invoiced."""
     from services.gmv_aggregation_service import _coerce_date, recompute_for_date
 
+    day = _coerce_date(edge["created_at"])
+    merchant_id = str(edge["merchant_id"])
     try:
-        await recompute_for_date(_coerce_date(edge["created_at"]), str(edge["merchant_id"]))
-        return True
+        invoiced = await database.fetch_one(_INVOICE_COVERING_DAY_SQL, {"merchant_id": merchant_id, "day": day})
+    except Exception as exc:  # noqa: BLE001 -- fail closed: never rewrite a day we could not check
+        logger.warning("partner_adjustment: invoice check failed edge=%s day=%s error_type=%s",
+                       edge.get("edge_id"), day, type(exc).__name__)
+        return "invoice_check_failed"
+    if invoiced is not None:
+        logger.warning(
+            "partner_adjustment: refund on edge=%s falls in invoiced day %s (invoice %s); rollup left "
+            "as billed, manual credit required", edge.get("edge_id"), day, dict(invoiced).get("id"))
+        return "invoiced_period_manual_credit"
+    try:
+        await recompute_for_date(day, merchant_id)
+        return "recomputed"
     except Exception as exc:  # noqa: BLE001 -- the refund stands; the day can be recomputed later
         logger.warning(
             "partner_adjustment: rollup recompute failed edge=%s day=%s error_type=%s",
-            edge.get("edge_id"), edge.get("created_at"), type(exc).__name__,
+            edge.get("edge_id"), day, type(exc).__name__,
         )
-        return False
+        return "recompute_failed"

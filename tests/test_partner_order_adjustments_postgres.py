@@ -20,7 +20,7 @@ _IS_PG = DATABASE_URL.startswith("postgresql://") or DATABASE_URL.startswith("po
 pytestmark = pytest.mark.skipif(not _IS_PG, reason="needs a Postgres DATABASE_URL")
 
 _SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")
-_TABLES = ("gmv_attribution_daily", "commerce_attribution_edges", "surface_click_events")
+_TABLES = ("gmv_attribution_daily", "commerce_attribution_edges", "surface_click_events", "invoices")
 _ROLLUP_DDL = (Path(__file__).resolve().parent.parent / "db/migrations/110_gmv_attribution_daily.sql")
 
 
@@ -57,6 +57,11 @@ async def _build_schema(database):
     )
     for stmt in split_statements(ddl):
         await database.execute(stmt)
+    # Only the columns the invoiced-day guard reads (the real table carries Stripe ids and more).
+    await database.execute(
+        "CREATE TABLE invoices (id BIGSERIAL PRIMARY KEY, merchant_id VARCHAR(50) NOT NULL, "
+        "billing_period_start DATE NOT NULL, billing_period_end DATE NOT NULL, status TEXT)"
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -256,3 +261,92 @@ async def test_the_edge_lock_serialises_two_refunds_that_together_exceed_the_gro
     finally:
         await other.close()
     assert (await _edge(db))["refund_amount_cents"] == 4000
+
+
+
+async def test_a_refund_after_the_promo_ended_never_raises_the_billed_take(db, monkeypatch):
+    """Review of #2271 (P1): the day was rolled up at the 5% promo rate; the promo has since ended.
+    The refund's re-roll must keep 5%, never re-rate the day at today's 10%."""
+    from services import gmv_aggregation_service as gmv
+    from services.partner_order_adjustments import record_partner_order_adjustment
+
+    rates = iter([gmv.PROMO_TAKE_RATE_BP, gmv.STANDARD_TAKE_RATE_BP, gmv.STANDARD_TAKE_RATE_BP])
+
+    async def flipping(merchant_id):
+        return next(rates)
+
+    monkeypatch.setattr(gmv, "_take_rate_bp_for_merchant", flipping)
+    await _close_partner_edge(db)
+    assert await _rollup(db) == {"g": 4500, "r": 0, "n": 4500, "t": 225}
+    await record_partner_order_adjustment(partner="reap", purchase_id="rp_abc", event_id="evt_1",
+                                          kind="refund", currency="USD", amount_minor=500)
+    assert await _rollup(db) == {"g": 4500, "r": 500, "n": 4000, "t": 200}
+    stored_bp = await db.fetch_val("SELECT take_rate_bp FROM gmv_attribution_daily")
+    assert stored_bp == gmv.PROMO_TAKE_RATE_BP  # the stored rate, not only the amount, is kept
+
+
+async def test_an_invoiced_day_is_left_as_billed_and_flagged(db):
+    from services.partner_order_adjustments import record_partner_order_adjustment
+
+    await _close_partner_edge(db)
+    await db.execute(
+        "INSERT INTO invoices (merchant_id, billing_period_start, billing_period_end, status) "
+        "VALUES ('brand.example', :s, :e, 'paid')",
+        {"s": YESTERDAY.date() - timedelta(days=5), "e": YESTERDAY.date() + timedelta(days=5)},
+    )
+    r = await record_partner_order_adjustment(partner="reap", purchase_id="rp_abc", event_id="evt_1",
+                                              kind="refund", currency="USD", amount_minor=1500)
+    assert (r.status, r.rollup, r.rollup_recomputed) == ("applied", "invoiced_period_manual_credit", False)
+    assert (await _edge(db))["refund_amount_cents"] == 1500  # the truth is recorded on the edge
+    assert await _rollup(db) == {"g": 4500, "r": 0, "n": 4500, "t": 450}  # billing untouched
+
+
+async def test_a_void_invoice_does_not_block_the_reroll(db):
+    from services.partner_order_adjustments import record_partner_order_adjustment
+
+    await _close_partner_edge(db)
+    await db.execute(
+        "INSERT INTO invoices (merchant_id, billing_period_start, billing_period_end, status) "
+        "VALUES ('brand.example', :s, :e, 'void')",
+        {"s": YESTERDAY.date(), "e": YESTERDAY.date()},
+    )
+    r = await record_partner_order_adjustment(partner="reap", purchase_id="rp_abc", event_id="evt_1",
+                                              kind="refund", currency="USD", amount_minor=1500)
+    assert r.rollup == "recomputed"
+    assert (await _rollup(db))["r"] == 1500
+
+
+async def test_the_invoice_check_fails_closed(db):
+    from services.partner_order_adjustments import record_partner_order_adjustment
+
+    await _close_partner_edge(db)
+    await db.execute("DROP TABLE invoices")
+    r = await record_partner_order_adjustment(partner="reap", purchase_id="rp_abc", event_id="evt_1",
+                                              kind="refund", currency="USD", amount_minor=1500)
+    assert (r.status, r.rollup) == ("applied", "invoice_check_failed")
+    assert (await _rollup(db))["r"] == 0
+
+
+async def test_a_reroll_waits_for_another_reroll_of_the_same_day(db):
+    """Review of #2271 (P2): two roll-ups of one day must not interleave read-then-upsert."""
+    import asyncio
+
+    import asyncpg
+
+    from services.gmv_aggregation_service import recompute_for_date
+
+    await _close_partner_edge(db)
+    other = await asyncpg.connect(DATABASE_URL)
+    try:
+        tx = other.transaction()
+        await tx.start()
+        await other.execute(
+            "SELECT pg_advisory_xact_lock(hashtext('gmv_attribution_daily:' || CAST($1::date AS TEXT)))",
+            YESTERDAY.date())
+        task = asyncio.ensure_future(recompute_for_date(YESTERDAY.date(), "brand.example"))
+        await asyncio.sleep(0.5)
+        assert not task.done(), "the re-roll did not wait for the day's lock"
+        await tx.commit()
+        await asyncio.wait_for(task, timeout=10)
+    finally:
+        await other.close()

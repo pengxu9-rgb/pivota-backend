@@ -15,7 +15,8 @@ T0 = datetime(2026, 9, 20, 12, tzinfo=timezone.utc)
 def _edge(**over):
     base = {"edge_id": "cae_ext_1", "order_id": "ext_1", "merchant_id": "brand.example",
             "agent_id": "agent_minds", "currency": "USD", "created_at": T0,
-            "gross_attributed_gmv_cents": 4500, "refund_amount_cents": 0, "refund_ids": []}
+            "gross_attributed_gmv_cents": 4500, "refund_amount_cents": 0, "refund_ids": [],
+            "adjustments": []}
     base.update(over)
     return base
 
@@ -63,7 +64,7 @@ def world(monkeypatch):
 
     async def fake_recompute(edge):
         state["recomputed"].append(edge["edge_id"])
-        return not state["recompute_raises"]
+        return "recompute_failed" if state["recompute_raises"] else "recomputed"
 
     monkeypatch.setattr(adj, "_apply_refund", fake_apply)
     monkeypatch.setattr(adj, "_emit_refund_event", fake_emit)
@@ -186,7 +187,7 @@ async def test_a_failed_recompute_is_reported_not_raised(monkeypatch, world):
     _use(monkeypatch, _edge())
     world["recompute_raises"] = True
     r = await _call()
-    assert r.status == "applied" and r.rollup_recomputed is False
+    assert r.status == "applied" and r.rollup_recomputed is False and r.rollup == "recompute_failed"
 
 
 @pytest.mark.parametrize(
@@ -238,3 +239,31 @@ def test_the_ops_script_refuses_a_naive_timestamp():
         script.build_parser().parse_args(
             ["--partner", "reap", "--purchase-id", "rp_1", "--event-id", "e1", "--kind", "refund",
              "--currency", "USD", "--amount-minor", "100", "--occurred-at", "2026-10-01T09:00:00"])
+
+
+def _stored(**over):
+    base = {"partner": "reap", "event_id": "evt_1", "kind": "refund", "amount_minor": 1500, "currency": "USD"}
+    base.update(over)
+    return base
+
+
+async def test_a_replay_with_the_same_values_is_harmless(monkeypatch, world):
+    _use(monkeypatch, _edge(refund_ids=["reap:evt_1"], refund_amount_cents=1500, adjustments=[_stored()]))
+    assert (await _call()).status == "replayed"
+
+
+@pytest.mark.parametrize("over", [dict(amount_minor=1600), dict(kind="chargeback_lost"), dict(currency="SGD")])
+async def test_a_replay_that_says_something_different_is_refused(monkeypatch, world, over):
+    _use(monkeypatch, _edge(refund_ids=["reap:evt_1"], refund_amount_cents=1500,
+                            adjustments=json.dumps([_stored()]), currency=over.get("currency", "USD")))
+    with pytest.raises(adj.AdjustmentRefused) as e:
+        await _call(**over)
+    assert e.value.code == "replay_mismatch"
+    assert world["applied"] == []
+
+
+async def test_a_cancellation_replay_is_compared_on_kind_only(monkeypatch, world):
+    # The cancellation's amount was computed (everything left); a re-run without one matches.
+    _use(monkeypatch, _edge(refund_ids=["reap:evt_1"], refund_amount_cents=4500,
+                            adjustments=[_stored(kind="cancellation", amount_minor=4500)]))
+    assert (await _call(kind="cancellation", amount_minor=None)).status == "replayed"

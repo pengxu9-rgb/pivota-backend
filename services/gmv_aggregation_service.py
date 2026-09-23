@@ -53,10 +53,24 @@ DO UPDATE SET
   gross_attributed_gmv_cents = EXCLUDED.gross_attributed_gmv_cents,
   refund_amount_cents = EXCLUDED.refund_amount_cents,
   net_attributed_gmv_cents = EXCLUDED.net_attributed_gmv_cents,
-  take_rate_bp = EXCLUDED.take_rate_bp,
-  take_amount_cents = EXCLUDED.take_amount_cents,
+  -- A re-roll keeps the rate the day was first billed at. `_take_rate_bp_for_merchant` answers
+  -- with the merchant's promo status NOW, so re-rating a past day after a promo ended would
+  -- RAISE its take when a refund triggers the recompute (review of #2271). Only a new group row
+  -- takes the current rate.
+  take_rate_bp = gmv_attribution_daily.take_rate_bp,
+  take_amount_cents = (EXCLUDED.net_attributed_gmv_cents * gmv_attribution_daily.take_rate_bp) / 10000,
   updated_at = NOW()
 """
+
+# One rollup of a day at a time. _aggregate_for_date reads the edge sums and then upserts. Without
+# this, a nightly roll-up and a refund's recompute of the same day can interleave, and the one that
+# read first writes last with sums that miss the other's refund. Per DAY, not per merchant, because
+# the nightly run covers every merchant of the day.
+# CAST(CAST(:date AS DATE) AS TEXT), not CAST(:date AS TEXT): asyncpg types the parameter from its
+# innermost cast and refuses a Python date for a text parameter, at bind time, after a clean PREPARE.
+_LOCK_DAY_QUERY = (
+    "SELECT pg_advisory_xact_lock(hashtext('gmv_attribution_daily:' || CAST(CAST(:date AS DATE) AS TEXT)))"
+)
 
 
 # `merchants.id` is an integer PK, while commerce rollups use the operational
@@ -155,6 +169,7 @@ async def _take_rate_bp_for_merchant(merchant_id: str) -> int:
 
 async def _aggregate_for_date(target_date: date, merchant_id: Optional[str] = None) -> int:
     async with database.transaction():
+        await database.execute(_LOCK_DAY_QUERY, {"date": target_date})
         rows = await database.fetch_all(
             _ROLLUP_QUERY,
             {"date": target_date, "merchant_id": merchant_id},

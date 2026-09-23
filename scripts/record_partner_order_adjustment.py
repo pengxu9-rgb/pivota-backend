@@ -17,7 +17,9 @@ Use the partner's own id for the refund, never a made-up one, or a later webhook
 refund would be applied a second time.
 
 Exit status: 0 applied / would_apply / replayed; 3 no_edge / nothing_remaining (nothing to do,
-and a human should look); 2 refused (the input can never apply as given).
+and a human should look); 2 refused (the input can never apply as given); 4 applied, but the
+order's day is already invoiced (or could not be checked), so billing was NOT changed: credit the
+merchant by hand.
 """
 
 import argparse
@@ -73,6 +75,9 @@ async def run(args):
         print(json.dumps(asdict(result), default=str))
         if not args.apply and result.status == "would_apply":
             print("DRY RUN: nothing written. Re-run with --apply to record it.", file=sys.stderr)
+        if result.status == "applied" and result.rollup != "recomputed":
+            print(f"APPLIED to the edge, but billing was NOT updated ({result.rollup}).", file=sys.stderr)
+            return 4
         return EXIT.get(result.status, 1)
     finally:
         if opened:
