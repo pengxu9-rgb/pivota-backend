@@ -49,7 +49,7 @@ async def _build_schema(database):
         "REFERENCES channel_partners(id) ON DELETE SET NULL", "")
     for stmt in split_statements(ddl):
         await database.execute(stmt)
-    for name in _BILLING_MIGRATIONS + ("235_agent_share_accrual.sql",):
+    for name in _BILLING_MIGRATIONS + ("235_agent_share_accrual.sql", "236_agent_share_after_partner.sql"):
         for stmt in split_statements((_MIG / name).read_text()):
             await database.execute(stmt)
 
@@ -197,13 +197,45 @@ async def test_no_agent_or_the_unknown_sentinel_accrues_nothing(db):
         assert (r.status, r.basis) == ("unchanged", "no_agent")
 
 
-async def test_a_channel_partner_line_accrues_nothing_until_the_split_is_decided(db):
-    """Review of #2273 (P2): partner settlement already pays a share of the same take."""
+async def test_a_channel_partner_line_is_shared_after_the_partner(db, monkeypatch):
+    """Decision 2026-09-23: the partner's cut comes off first (rounded up), the agent's rate applies
+    to what is left, and partner + agent never exceeds the billed line."""
+    from services import partner_settlement_service as pss
     from services.agent_share_accrual import accrue_for_line
 
+    async def partner_bp(channel_partner_id):
+        assert channel_partner_id == 7
+        return 2000
+
+    monkeypatch.setattr(pss, "partner_gmv_take_share_bp", partner_bp)
+    line = await _billed_line(db, channel_partner=7, amount=451); await _rate(bp=2500)
+    r = await accrue_for_line(line)
+    # cut = ceil(451 x 0.20) = 91; agent = floor((451 - 91) x 0.25) = 90
+    assert (r.basis, r.target_minor) == ("billed_line_after_partner", 90)
+    (row,) = await _ledger(db, line)
+    assert (row["partner_share_bp"], row["partner_cut_minor"], row["billed_minor"]) == (2000, 91, 451)
+
+
+async def test_a_line_whose_partner_is_gone_accrues_nothing(db, monkeypatch):
+    from services import partner_settlement_service as pss
+    from services.agent_share_accrual import accrue_for_line
+
+    async def missing(channel_partner_id):
+        return None
+
+    monkeypatch.setattr(pss, "partner_gmv_take_share_bp", missing)
     line = await _billed_line(db, channel_partner=7); await _rate()
     r = await accrue_for_line(line)
-    assert (r.basis, r.status) == ("channel_partner_row", "unchanged")
+    assert (r.basis, r.status) == ("partner_share_unknown", "unchanged")
+
+
+async def test_a_line_without_a_partner_records_no_partner_fields(db):
+    from services.agent_share_accrual import accrue_for_line
+
+    line = await _billed_line(db); await _rate()
+    await accrue_for_line(line)
+    (row,) = await _ledger(db, line)
+    assert (row["partner_share_bp"], row["partner_cut_minor"]) == (None, None)
 
 
 async def test_no_rate_means_no_share(db):

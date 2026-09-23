@@ -131,13 +131,8 @@ async def run_settlement(billing_run_id: int) -> int:
     return payout_count
 
 
-async def compute_partner_comp(
-    channel_partner_id: int,
-    period_start: date,
-    period_end: date,
-) -> dict[str, Any]:
-    """Compute one channel partner's compensation for a billing period."""
-
+async def load_partner_commission_config(channel_partner_id: int) -> Optional[dict[str, Any]]:
+    """The partner's commission config, or None when the partner does not exist."""
     partner_row = await database.fetch_one(
         """
         SELECT id, commission_config_json
@@ -147,11 +142,35 @@ async def compute_partner_comp(
         {"channel_partner_id": channel_partner_id},
     )
     if not partner_row:
+        return None
+    return _coerce_json(_row_get(partner_row, "commission_config_json"))
+
+
+def gmv_take_share_bp_from_config(config: dict[str, Any]) -> int:
+    """The partner's share of Pivota's GMV take, in bp. ONE reader of this field: settlement pays
+    the partner with it, and agent share accrual deducts the partner's cut with it."""
+    return _as_int(config.get("gmv_take_share_bp"))
+
+
+async def partner_gmv_take_share_bp(channel_partner_id: int) -> Optional[int]:
+    """The partner's GMV-take share in bp, or None when the partner does not exist."""
+    config = await load_partner_commission_config(channel_partner_id)
+    return None if config is None else gmv_take_share_bp_from_config(config)
+
+
+async def compute_partner_comp(
+    channel_partner_id: int,
+    period_start: date,
+    period_end: date,
+) -> dict[str, Any]:
+    """Compute one channel partner's compensation for a billing period."""
+
+    config = await load_partner_commission_config(channel_partner_id)
+    if config is None:
         raise ValueError(f"Channel partner not found: {channel_partner_id}")
 
-    config = _coerce_json(_row_get(partner_row, "commission_config_json"))
     subscription_share_bp = _as_int(config.get("subscription_rev_share_bp"))
-    gmv_take_share_bp = _as_int(config.get("gmv_take_share_bp"))
+    gmv_take_share_bp = gmv_take_share_bp_from_config(config)
     subsidy_cap_cents = _as_int(config.get("subsidy_cap_cents"))
 
     subscription_revenue_by_merchant = await _subscription_revenue_by_merchant(
