@@ -228,6 +228,7 @@ def ledger_emits(monkeypatch: pytest.MonkeyPatch) -> List[Dict[str, Any]]:
     import services.commerce_attribution_service as attribution
     import services.dispute_records_service as dispute_records
     import services.pcs_evidence_pack_service as evidence_packs
+    import services.refund_service as refund_service
 
     emits: List[Dict[str, Any]] = []
 
@@ -247,6 +248,15 @@ def ledger_emits(monkeypatch: pytest.MonkeyPatch) -> List[Dict[str, Any]]:
     monkeypatch.setattr(webhook_routes, "_record_stripe_canonical_event_best_effort", noop)
     monkeypatch.setattr(webhook_routes, "log_order_event", noop)
     monkeypatch.setattr(attribution, "record_commerce_event_best_effort", fake_emit)
+
+    # The rollup re-roll after each write is covered on Postgres by
+    # tests/test_refund_rollup_recompute_postgres.py. Here it would write
+    # gmv_attribution_daily rows into a database other gate modules share.
+    async def no_recompute(rows: Any) -> Dict[Any, str]:
+        return {}
+
+    monkeypatch.setattr(attribution, "recompute_days_for_edges", no_recompute)
+    monkeypatch.setattr(refund_service, "recompute_days_for_edges", no_recompute)
     # The dispute branch's own records (not the edge) live in tables this gate
     # does not build.
     monkeypatch.setattr(dispute_records, "upsert_stripe_dispute_record_best_effort", noop)

@@ -20,6 +20,7 @@ from observability.reliability_metrics import (
 from services.commerce_interaction_service import record_commerce_event_best_effort
 from services.commerce_ledger_provenance import ledger_provenance
 from services.commerce_order_ref import pivota_order_ref
+from services.gmv_aggregation_service import recompute_days_for_edges
 from services.canonical_commerce_service import (
     make_canonical_product_id,
     make_canonical_variant_id,
@@ -594,7 +595,9 @@ WHERE order_id = :order_id
 RETURNING edge_id, merchant_id, click_id, canonical_product_id,
           canonical_variant_id, surface, prompt_cluster, interaction_id,
           metadata, refund_ids, refund_count, refund_amount_cents,
-          refunded_amount, refunded_at, latest_refund_at
+          refunded_amount, refunded_at, latest_refund_at,
+          -- the edge's billing day, for recompute_days_for_edges
+          created_at
 """
 
 
@@ -654,7 +657,9 @@ RETURNING e.edge_id, e.merchant_id, e.click_id, e.canonical_product_id,
           e.canonical_variant_id, e.surface, e.prompt_cluster, e.interaction_id,
           e.metadata, e.refund_ids, e.refund_count, e.refund_amount_cents,
           e.refunded_amount, e.refunded_at, e.latest_refund_at,
-          e.dispute_amount_cents, prior.prior_refund_amount_cents
+          e.dispute_amount_cents, prior.prior_refund_amount_cents,
+          -- the edge's billing day, for recompute_days_for_edges
+          e.created_at
 """
 
 
@@ -692,7 +697,9 @@ WHERE order_id = :order_id
 RETURNING edge_id, merchant_id, click_id, canonical_product_id,
           canonical_variant_id, surface, prompt_cluster, interaction_id,
           metadata, refund_ids, refund_count, refund_amount_cents,
-          refunded_amount, refunded_at, latest_refund_at, dispute_amount_cents
+          refunded_amount, refunded_at, latest_refund_at, dispute_amount_cents,
+          -- the edge's billing day, for recompute_days_for_edges
+          created_at
 """
 
 
@@ -770,10 +777,22 @@ async def attach_refund_to_attribution_edge(
     refund_id: str,
     amount: Any,
 ) -> Optional[Dict[str, Any]]:
+    """Apply a refund to the order's edges, emit the event, and recompute the billed days.
+
+    Must not be called inside a transaction: the event and the recompute are best-effort
+    writes, and a failed statement would abort the caller's transaction and lose the refund.
+    A caller that holds one uses `apply_attribution_refund_rows` inside it and the other two
+    after commit (services/refund_service.py).
+    """
     rows = await apply_attribution_refund_rows(order_id=order_id, refund_id=refund_id, amount=amount)
     if not rows:
         return None
-    await emit_attribution_refund_event(rows, order_id=order_id, refund_id=refund_id, amount=amount)
+    try:
+        await emit_attribution_refund_event(rows, order_id=order_id, refund_id=refund_id, amount=amount)
+    finally:
+        # Never raises. A redelivered refund matches its edges again, so a redelivery also
+        # re-runs a recompute that failed the first time.
+        await recompute_days_for_edges(rows)
     # Backwards-compatible return shape: callers expect a single dict.
     # When fan-out exists, surface the first edge with an added edge_count
     # field so callers can distinguish single-edge vs multi-edge refunds.
@@ -782,23 +801,23 @@ async def attach_refund_to_attribution_edge(
     return first
 
 
-async def apply_refund_total_to_attribution_edge(
+async def apply_refund_total_rows(
     *,
     order_id: str,
     refund_id: str,
     total_refunded: Any,
-) -> Optional[Dict[str, Any]]:
-    """Raise the edge's refund to the order's reconciled ``total_refunded`` (MAJOR units).
+) -> List[Dict[str, Any]]:
+    """The refund-ceiling UPDATE alone, with no side effects. Safe inside a caller's transaction.
 
-    For PSP refunds on a Pivota order: pass the order's total AFTER this refund was
-    reconciled, never the single refund's amount. ``refund_id`` is recorded for audit
-    only; it no longer decides whether money is added. See _APPLY_REFUND_TOTAL_QUERY.
-
-    The ``refund.succeeded`` event is emitted only when this call raised the edge, and
-    carries the amount it added: an echo of money another id already reported adds 0.
+    Raises every edge of ``order_id`` to the order's reconciled ``total_refunded`` (MAJOR
+    units): pass the order's total AFTER this refund was reconciled, never the single refund's
+    amount. ``refund_id`` is recorded for audit only; it no longer decides whether money is
+    added. See _APPLY_REFUND_TOTAL_QUERY. `apply_refund_total_to_attribution_edge` is this plus
+    `emit_refund_total_event` and the rollup recompute; a caller holding a transaction
+    (RefundService) runs this inside it and the other two after commit.
     """
     total_decimal, total_cents = _refund_amounts(total_refunded)
-    rows = [
+    return [
         dict(r)
         for r in await database.fetch_all(
             _APPLY_REFUND_TOTAL_QUERY,
@@ -811,12 +830,28 @@ async def apply_refund_total_to_attribution_edge(
             },
         )
     ]
+
+
+def _refund_total_added_cents(rows: List[Dict[str, Any]]) -> int:
+    """What `apply_refund_total_rows` added, read off the first edge (the event's context)."""
     if not rows:
-        return None
+        return 0
     first = rows[0]
-    added_cents = int(first.get("refund_amount_cents") or 0) - int(
-        first.get("prior_refund_amount_cents") or 0
-    )
+    added = int(first.get("refund_amount_cents") or 0) - int(first.get("prior_refund_amount_cents") or 0)
+    return max(added, 0)
+
+
+async def emit_refund_total_event(
+    rows: List[Dict[str, Any]],
+    *,
+    order_id: str,
+    refund_id: str,
+) -> None:
+    """Emit ``refund.succeeded`` for the money a ceiling write actually added, if any.
+
+    An echo of money another id already reported adds 0 and emits nothing.
+    """
+    added_cents = _refund_total_added_cents(rows)
     if added_cents > 0:
         await emit_attribution_refund_event(
             rows,
@@ -824,24 +859,45 @@ async def apply_refund_total_to_attribution_edge(
             refund_id=refund_id,
             amount=Decimal(added_cents) / Decimal("100"),
         )
+
+
+async def apply_refund_total_to_attribution_edge(
+    *,
+    order_id: str,
+    refund_id: str,
+    total_refunded: Any,
+) -> Optional[Dict[str, Any]]:
+    """Raise the edge's refund to the order's reconciled total, emit, and recompute the billed days.
+
+    For PSP refunds on a Pivota order. Must not be called inside a transaction, for the reason
+    `attach_refund_to_attribution_edge` gives.
+    """
+    rows = await apply_refund_total_rows(
+        order_id=order_id, refund_id=refund_id, total_refunded=total_refunded
+    )
+    if not rows:
+        return None
+    try:
+        await emit_refund_total_event(rows, order_id=order_id, refund_id=refund_id)
+    finally:
+        # Never raises. A no-op re-roll (nothing added) is cheap and also retries one that
+        # failed on an earlier delivery.
+        await recompute_days_for_edges(rows)
+    first = dict(rows[0])
     first["edge_count"] = len(rows)
-    first["added_refund_cents"] = max(added_cents, 0)
+    first["added_refund_cents"] = _refund_total_added_cents(rows)
     return first
 
 
-async def attach_dispute_to_attribution_edge(
+async def apply_attribution_dispute_rows(
     *,
     order_id: str,
     dispute_id: str,
     amount: Any,
-) -> Optional[Dict[str, Any]]:
-    """Add a chargeback to the edge (MAJOR units), once per ``dispute_id``.
-
-    Chargebacks are not in ``orders.total_refunded``, so they stay additive and are
-    kept in ``dispute_amount_cents`` where the refund ceiling cannot absorb them.
-    """
+) -> List[Dict[str, Any]]:
+    """The chargeback UPDATE alone (MAJOR units), idempotent per ``dispute_id``. No side effects."""
     amount_decimal, amount_cents = _refund_amounts(amount)
-    rows = [
+    return [
         dict(r)
         for r in await database.fetch_all(
             _ATTRIBUTE_DISPUTE_QUERY,
@@ -854,9 +910,28 @@ async def attach_dispute_to_attribution_edge(
             },
         )
     ]
+
+
+async def attach_dispute_to_attribution_edge(
+    *,
+    order_id: str,
+    dispute_id: str,
+    amount: Any,
+) -> Optional[Dict[str, Any]]:
+    """Add a chargeback to the edge (MAJOR units), once per ``dispute_id``, then recompute.
+
+    Chargebacks are not in ``orders.total_refunded``, so they stay additive and are
+    kept in ``dispute_amount_cents`` where the refund ceiling cannot absorb them.
+    Must not be called inside a transaction, for the reason
+    `attach_refund_to_attribution_edge` gives.
+    """
+    rows = await apply_attribution_dispute_rows(order_id=order_id, dispute_id=dispute_id, amount=amount)
     if not rows:
         return None
-    await emit_attribution_refund_event(rows, order_id=order_id, refund_id=dispute_id, amount=amount)
+    try:
+        await emit_attribution_refund_event(rows, order_id=order_id, refund_id=dispute_id, amount=amount)
+    finally:
+        await recompute_days_for_edges(rows)  # never raises
     first = rows[0]
     first["edge_count"] = len(rows)
     return first

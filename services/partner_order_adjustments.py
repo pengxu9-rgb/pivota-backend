@@ -307,50 +307,14 @@ async def _emit_refund_event(rows: List[Dict[str, Any]], order_id: str, refund_i
                        refund_id, type(exc).__name__)
 
 
-_INVOICE_COVERING_DAY_SQL = """
-SELECT id FROM invoices
-WHERE merchant_id = :merchant_id
-  AND billing_period_start <= :day AND billing_period_end >= :day
-  AND COALESCE(status, '') <> 'void'
-LIMIT 1
-"""
-
-# A billing run is inserted BEFORE it reads any rollup row, and its invoices row only commits after
-# the Stripe calls, so an in-progress or failed run is visible only here (re-review of #2271). Any
-# run but a cancelled one covers every merchant of its period.
-_BILLING_RUN_COVERING_DAY_SQL = """
-SELECT id FROM billing_runs
-WHERE CAST(period_start AS DATE) <= :day AND CAST(period_end AS DATE) >= :day
-  AND status <> 'cancelled'
-LIMIT 1
-"""
-
-
 async def _recompute_rollup(edge: Dict[str, Any]) -> str:
-    """Re-roll the edge's creation day, the day its gross was billed on, unless it is invoiced."""
-    from services.gmv_aggregation_service import _coerce_date, recompute_for_date
+    """Re-roll the edge's creation day, the day its gross was billed on, unless it is invoiced.
 
-    day = _coerce_date(edge["created_at"])
-    merchant_id = str(edge["merchant_id"])
-    try:
-        invoiced = await database.fetch_one(_INVOICE_COVERING_DAY_SQL, {"merchant_id": merchant_id, "day": day})
-        if invoiced is None:
-            invoiced = await database.fetch_one(_BILLING_RUN_COVERING_DAY_SQL, {"day": day})
-    except Exception as exc:  # noqa: BLE001 -- fail closed: never rewrite a day we could not check
-        logger.warning("partner_adjustment: invoice check failed edge=%s day=%s error_type=%s",
-                       edge.get("edge_id"), day, type(exc).__name__)
-        return "invoice_check_failed"
-    if invoiced is not None:
-        logger.warning(
-            "partner_adjustment: refund on edge=%s falls in invoiced day %s (invoice %s); rollup left "
-            "as billed, manual credit required", edge.get("edge_id"), day, dict(invoiced).get("id"))
-        return "invoiced_period_manual_credit"
-    try:
-        await recompute_for_date(day, merchant_id)
-        return "recomputed"
-    except Exception as exc:  # noqa: BLE001 -- the refund stands; the day can be recomputed later
-        logger.warning(
-            "partner_adjustment: rollup recompute failed edge=%s day=%s error_type=%s",
-            edge.get("edge_id"), day, type(exc).__name__,
-        )
-        return "recompute_failed"
+    The rule (which days are frozen, failing closed) is owned by
+    gmv_aggregation_service.recompute_days_for_edges, shared with every other refund writer.
+    """
+    from services.gmv_aggregation_service import RECOMPUTE_FAILED, recompute_days_for_edges
+
+    outcomes = await recompute_days_for_edges([edge])
+    # An edge with no usable merchant or creation time was logged and left out.
+    return next(iter(outcomes.values()), RECOMPUTE_FAILED)
