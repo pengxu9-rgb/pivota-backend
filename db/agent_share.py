@@ -28,7 +28,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.sql import func
 
-from db.database import metadata
+from db.database import JSONB_TYPE, metadata
 
 #: One row per (agent, window). `effective_to` NULL means open-ended. Windows for one agent never
 #: overlap; services.agent_share_accrual.set_agent_share_rate enforces that under a lock.
@@ -74,6 +74,12 @@ agent_share_ledger = Table(
     Column("rate_id", BigInteger, nullable=True),
     Column("target_minor", BigInteger, nullable=False),
     Column("basis", String(32), nullable=False),
+    # Set only when a channel partner can claim the merchant: what settlement paid the partner(s)
+    # from the merchant's take in the run, the merchant's billed total in the run, and this line's
+    # cut (migration 236; schema_guard adds them in prod).
+    Column("partner_settled_minor", BigInteger, nullable=True),
+    Column("merchant_billed_minor", BigInteger, nullable=True),
+    Column("partner_cut_minor", BigInteger, nullable=True),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
     CheckConstraint("entry_kind IN ('accrual', 'adjustment')", name="ck_agent_share_ledger_kind"),
     CheckConstraint("amount_minor <> 0", name="ck_agent_share_ledger_nonzero"),
@@ -81,3 +87,17 @@ agent_share_ledger = Table(
 )
 Index("idx_agent_share_ledger_item", agent_share_ledger.c.billing_run_item_id)
 Index("idx_agent_share_ledger_agent_created", agent_share_ledger.c.agent_id, agent_share_ledger.c.created_at)
+
+
+#: One row per billing run whose partner settlement COMPLETED: every partner run_settlement
+#: selected has its immutable snapshot. Agent share accrual waits for it before it deducts what the
+#: partners were paid, so a partner attributed after settlement can never re-price an accrued line
+#: (review of #2275). Written by partner_settlement_service.run_settlement, never updated.
+partner_settlement_completions = Table(
+    "partner_settlement_completions",
+    metadata,
+    Column("billing_run_id", BigInteger, primary_key=True),
+    Column("partner_ids", JSONB_TYPE, nullable=False),
+    Column("engine", String(8), nullable=False),
+    Column("completed_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+)

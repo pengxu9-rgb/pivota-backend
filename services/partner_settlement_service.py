@@ -79,6 +79,7 @@ async def run_settlement(billing_run_id: int) -> int:
     )
 
     payout_count = 0
+    settled_partner_ids: list[int] = []
     for partner_row in partner_rows:
         channel_partner_id = int(_row_get(partner_row, "channel_partner_id"))
         if settings.partner_rev_share_use_v2:
@@ -98,6 +99,7 @@ async def run_settlement(billing_run_id: int) -> int:
             channel_partner_id,
             comp_dict,
         )
+        settled_partner_ids.append(channel_partner_id)
 
         # When the v2 flag is on, the settlement_file pipeline (PR #8 — the
         # day-5 generate + day-10 Stripe Connect transfer crons) handles
@@ -128,6 +130,9 @@ async def run_settlement(billing_run_id: int) -> int:
         if payout_id is not None:
             payout_count += 1
 
+    # Only reached once every selected partner has its snapshot for this run. Agent share accrual
+    # waits for this row before deducting what partners were paid (ADR-025 D5, review of #2275).
+    await record_settlement_completion(billing_run_id, settled_partner_ids)
     return payout_count
 
 
@@ -252,6 +257,72 @@ async def compute_partner_comp(
         "period_start": period_start.isoformat(),
         "period_end": period_end.isoformat(),
     }
+
+
+# ── what a partner was actually paid, for agent share accrual (ADR-025 D5) ────────────────────
+
+_RECORD_SETTLEMENT_COMPLETION_SQL = """
+INSERT INTO partner_settlement_completions (billing_run_id, partner_ids, engine, completed_at)
+VALUES (:billing_run_id, CAST(:partner_ids AS JSONB), :engine, NOW())
+ON CONFLICT (billing_run_id) DO NOTHING
+"""
+_SETTLEMENT_COMPLETION_SQL = """
+SELECT billing_run_id FROM partner_settlement_completions WHERE billing_run_id = :billing_run_id
+"""
+_SNAPSHOTS_FOR_RUN_SQL = """
+SELECT channel_partner_id, snapshot_payload_jsonb FROM settlement_snapshots
+WHERE billing_run_id = :billing_run_id
+ORDER BY channel_partner_id
+"""
+
+
+async def record_settlement_completion(billing_run_id: int, partner_ids: list[int]) -> None:
+    """Mark a billing run's partner settlement complete. Idempotent; never updated afterwards."""
+    await database.execute(
+        _RECORD_SETTLEMENT_COMPLETION_SQL,
+        {
+            "billing_run_id": billing_run_id,
+            "partner_ids": json.dumps(sorted(int(p) for p in partner_ids)),
+            "engine": "v2" if settings.partner_rev_share_use_v2 else "v1",
+        },
+    )
+
+
+def merchant_gmv_share_cents(snapshot_payload: Any, merchant_id: str) -> int:
+    """A partner's GMV-take share for one merchant, from a settlement snapshot of EITHER engine.
+
+    v1 (compute_partner_comp) records it as merchant_accruals[m]["gmv_take_rev_cents"], and v2
+    (partner_rev_share_engine_v2) as ["gmv_share_cents"]. This is the gross share, before subsidy
+    caps and clawbacks, which only lower what is paid.
+    """
+    payload = _coerce_json(snapshot_payload)
+    accrual = (payload.get("merchant_accruals") or {}).get(str(merchant_id)) or {}
+    if not isinstance(accrual, dict):
+        return 0
+    value = accrual.get("gmv_share_cents", accrual.get("gmv_take_rev_cents"))
+    return max(_as_int(value), 0)
+
+
+async def settled_partner_gmv_share(billing_run_id: int, merchant_id: str) -> Optional[dict[str, Any]]:
+    """What channel partners were PAID from one merchant's GMV take in one billing run.
+
+    Returns None until the run's partner settlement has COMPLETED (partner_settlement_completions),
+    else {"partner_ids": [partners paid anything for this merchant], "settled_cents": total}, summed
+    over every snapshot of the run. Both halves are fixed once settlement completes, whichever engine
+    (v1 or v2) wrote the snapshots and whatever attributions change later: settlement never re-runs
+    a run (a second run_settlement raises SettlementAlreadyExistsError). A partner attributed after
+    settlement therefore cannot re-price a line already accrued (review of #2275).
+    """
+    if await database.fetch_one(_SETTLEMENT_COMPLETION_SQL, {"billing_run_id": billing_run_id}) is None:
+        return None
+    total = 0
+    paid_partners: list[int] = []
+    for row in await database.fetch_all(_SNAPSHOTS_FOR_RUN_SQL, {"billing_run_id": billing_run_id}):
+        cents = merchant_gmv_share_cents(_row_get(row, "snapshot_payload_jsonb"), merchant_id)
+        if cents > 0:
+            paid_partners.append(int(_row_get(row, "channel_partner_id")))
+            total += cents
+    return {"partner_ids": paid_partners, "settled_cents": total}
 
 
 async def write_settlement_snapshot(

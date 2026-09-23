@@ -30,13 +30,15 @@ _IS_PG = DATABASE_URL.startswith("postgresql://") or DATABASE_URL.startswith("po
 pytestmark = pytest.mark.skipif(not _IS_PG, reason="needs a Postgres DATABASE_URL")
 
 _SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")
-_TABLES = ("agent_share_ledger", "agent_share_rates", "billing_run_items", "invoice_disputes", "invoices",
+_TABLES = ("agent_share_ledger", "agent_share_rates", "partner_settlement_completions", "settlement_snapshots",
+           "billing_run_items",
+           "invoice_disputes", "invoices",
            "billing_runs", "gmv_attribution_daily", "stripe_events")
 _MIG = Path(__file__).resolve().parent.parent / "db/migrations"
 _MIGRATIONS = ("100_stripe_events.sql", "113_billing_core.sql", "118_invoice_payment_failed_status.sql",
                "119_invoice_finalizing_status.sql", "120_invoices_billing_period_to_date.sql",
                "121_billing_runs_period_to_date.sql", "122_billing_runs_partial_failed_status.sql",
-               "235_agent_share_accrual.sql")
+               "235_agent_share_accrual.sql", "236_agent_share_after_partner.sql")
 
 WEBHOOK_SECRET = "whsec_invoice_event_order_test"
 MERCHANT = "merch_event_order"
@@ -67,6 +69,12 @@ async def _build_schema(database):
     for name in _MIGRATIONS:
         for stmt in split_statements((_MIG / name).read_text()):
             await database.execute(stmt)
+    # Agent share accrual reads a completed run's settlement snapshots (#2275). channel_partners
+    # itself is not under test.
+    ddl = (_MIG / "114_settlement_snapshots.sql").read_text().replace(
+        "REFERENCES channel_partners(id) ON DELETE RESTRICT", "")
+    for stmt in split_statements(ddl):
+        await database.execute(stmt)
 
 
 @pytest.fixture(autouse=True)
@@ -208,8 +216,8 @@ async def test_in_order_a_failed_attempt_then_the_paying_retry_ends_paid(db, cli
     """The guard is on 'paid' only: a failure still lands on an unpaid invoice, and paid still wins."""
     await _billed_invoice(db)
     await _deliver(client, _invoice_event("evt_failed", "invoice.payment_failed"))
-    after_failure = await _invoice(db)
-    assert (after_failure["status"], after_failure["paid_at"]) == ("payment_failed", None)
+    # The failure records what was billed, not amount_paid (0 on an unpaid invoice).
+    assert await _invoice(db) == {"status": "payment_failed", "paid_at": None, "total_cents": AMOUNT}
 
     await _deliver(client, _invoice_event("evt_paid", "invoice.paid"))
     after_paid = await _invoice(db)
@@ -219,7 +227,7 @@ async def test_in_order_a_failed_attempt_then_the_paying_retry_ends_paid(db, cli
 
 async def test_a_payment_failed_on_an_unknown_invoice_still_inserts_it(db, client):
     await _deliver(client, _invoice_event("evt_failed", "invoice.payment_failed"))
-    assert (await _invoice(db))["status"] == "payment_failed"
+    assert await _invoice(db) == {"status": "payment_failed", "paid_at": None, "total_cents": AMOUNT}
 
 
 async def test_a_replayed_invoice_paid_does_not_move_paid_at(db, client):
@@ -236,6 +244,11 @@ async def test_a_late_payment_failed_does_not_reverse_an_earned_agent_share(db, 
     from services.agent_share_accrual import accrue_for_line, set_agent_share_rate
 
     line = await _billed_invoice(db)
+    # An agent's share for a run accrues once that run's partner settlement has completed (#2275);
+    # this run settled with no partner paid.
+    await db.execute(
+        "INSERT INTO partner_settlement_completions (billing_run_id, partner_ids, engine) "
+        "SELECT billing_run_id, '[]'::jsonb, 'v2' FROM billing_run_items WHERE id = :l", {"l": line})
     await set_agent_share_rate(agent_id="agent_minds", share_bp=2500, created_by="test",
                                effective_from=datetime(2026, 8, 1, tzinfo=timezone.utc),
                                now=datetime(2026, 8, 1, tzinfo=timezone.utc))
