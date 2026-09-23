@@ -28,8 +28,10 @@ from billing, never re-derived from rates (review of #2273):
   amount is spread over the merchant's billed lines in the run, each line's cut rounded UP:
       cut = min(line, ceil(line x partner_paid / merchant_billed_in_run))
   so the cuts add up to at least what the partners were paid, and partner + agents never exceeds
-  what was billed. While any partner that can claim the merchant is not yet settled for the run,
-  the line waits (basis `partner_settlement_pending`, 0, retried).
+  what was billed. Every line of the merchant in the run uses the same paid amount. A line waits
+  (basis `partner_settlement_pending`, 0, retried) until the RUN's partner settlement has
+  completed; the decision then never changes, because settlement never re-runs a run. So an
+  agent's share for a run accrues only after that run's partner settlement (T8) has run.
 - share_bp is the agent's rate in force at 00:00 UTC of the billed day. Rates are forward-only
   (set_agent_share_rate), so a billed day is never re-priced. No rate means 0, and the table starts
   empty.
@@ -208,10 +210,7 @@ async def accrue_for_line(line_id: int, *, apply: bool = True) -> LineAccrual:
         if basis == "billed_line":
             from services.partner_settlement_service import settled_partner_gmv_share
 
-            settled = await settled_partner_gmv_share(
-                int(line["billing_run_id"]), str(line["merchant_id"]),
-                {line["channel_partner_id"]} if line["channel_partner_id"] is not None else None,
-            )
+            settled = await settled_partner_gmv_share(int(line["billing_run_id"]), str(line["merchant_id"]))
             if settled is None:
                 basis = "partner_settlement_pending"
             elif settled["partner_ids"]:
@@ -280,11 +279,18 @@ async def accrue_recent(lookback_days: int = DEFAULT_LOOKBACK_DAYS) -> Dict[str,
         try:
             result = await accrue_for_line(line_id)
             summary[result.status] = summary.get(result.status, 0) + 1
+            if result.basis == "partner_settlement_pending":
+                summary["partner_settlement_pending"] = summary.get("partner_settlement_pending", 0) + 1
         except Exception as exc:  # noqa: BLE001 -- the next run retries; report, do not stop
             summary["failed"] += 1
             logger.warning("agent_share: accrual failed line=%s error_type=%s", line_id, type(exc).__name__)
     if summary["failed"]:
         logger.error("agent_share: %d of %d lines failed to accrue", summary["failed"], len(ids))
+    if summary.get("partner_settlement_pending"):
+        # Not an error: a run's shares accrue once its partner settlement (T8) completes. Said out
+        # loud so a run T8 never settled is visible rather than silently unaccrued.
+        logger.warning("agent_share: %d lines wait on their run's partner settlement",
+                       summary["partner_settlement_pending"])
     return summary
 
 

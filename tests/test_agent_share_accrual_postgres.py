@@ -19,7 +19,8 @@ _IS_PG = DATABASE_URL.startswith("postgresql://") or DATABASE_URL.startswith("po
 pytestmark = pytest.mark.skipif(not _IS_PG, reason="needs a Postgres DATABASE_URL")
 
 _SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")
-_TABLES = ("agent_share_ledger", "agent_share_rates", "settlement_snapshots", "partner_attribution",
+_TABLES = ("agent_share_ledger", "agent_share_rates", "partner_settlement_completions", "settlement_snapshots",
+           "partner_attribution",
            "billing_run_items", "invoice_disputes", "invoices", "billing_runs", "gmv_attribution_daily")
 _MIG = Path(__file__).resolve().parent.parent / "db/migrations"
 _BILLING_MIGRATIONS = ("113_billing_core.sql", "118_invoice_payment_failed_status.sql",
@@ -80,7 +81,7 @@ async def db():
 
 
 async def _billed_line(db, *, agent="agent_minds", amount=450, invoice_status="paid", day=DAY,
-                       channel_partner=None, merchant="brand.example", tag="1"):
+                       channel_partner=None, merchant="brand.example", tag="1", settled=True):
     """One rollup row billed on one invoice line, as generate_merchant_invoice writes them."""
     rollup_id = await db.fetch_val(
         "INSERT INTO gmv_attribution_daily (date, merchant_id, agent_id, channel_partner_id, "
@@ -97,11 +98,17 @@ async def _billed_line(db, *, agent="agent_minds", amount=450, invoice_status="p
         {"m": merchant, "s": date(2026, 9, 1), "e": date(2026, 9, 30), "inv": "in_" + tag, "amt": amount,
          "st": invoice_status, "r": run_id,
          "paid": datetime.now(timezone.utc) if invoice_status == "paid" else None})
-    return await db.fetch_val(
+    line_id = await db.fetch_val(
         "INSERT INTO billing_run_items (billing_run_id, merchant_id, source_type, source_id, "
         "stripe_invoice_item_id, stripe_invoice_id, amount_cents) "
         "VALUES (:r, :m, 'gmv_rollup', :g, :ii, :inv, :amt) RETURNING id",
         {"r": run_id, "m": merchant, "g": rollup_id, "ii": "ii_" + tag, "inv": "in_" + tag, "amt": amount})
+    if settled:
+        # The run's partner settlement completed with no partner paid: the default case.
+        await db.execute(
+            "INSERT INTO partner_settlement_completions (billing_run_id, partner_ids, engine) "
+            "VALUES (:r, '[]'::jsonb, 'v2')", {"r": run_id})
+    return line_id
 
 
 async def _rate(agent="agent_minds", bp=2500, start=datetime(2026, 8, 1, tzinfo=timezone.utc), now=RATE_SET_AT):
@@ -218,16 +225,27 @@ async def _settle(db, line, partner_id, merchant_payload, engine="v2"):
         {"r": await _run_of(db, line), "p": partner_id, "pl": json.dumps(payload)})
 
 
+async def _complete_settlement(db, line, partner_ids=()):
+    """What run_settlement records once every selected partner has its snapshot."""
+    import json
+
+    await db.execute(
+        "INSERT INTO partner_settlement_completions (billing_run_id, partner_ids, engine) "
+        "VALUES (:r, CAST(:p AS JSONB), 'v2')",
+        {"r": await _run_of(db, line), "p": json.dumps(sorted(partner_ids))})
+
+
 @pytest.mark.parametrize("engine", ["v1", "v2"])
 async def test_the_agent_is_shared_after_what_the_partner_was_paid(db, engine):
     """Decision 2026-09-23, rebuilt on the #2275 review: the cut is what settlement PAID the partner
     from this merchant's take, read from its immutable snapshot, whichever engine wrote it."""
     from services.agent_share_accrual import accrue_for_line
 
-    line = await _billed_line(db, amount=451); await _rate(bp=2500)
+    line = await _billed_line(db, amount=451, settled=False); await _rate(bp=2500)
     await db.execute("INSERT INTO partner_attribution (merchant_id, channel_partner_id, status) "
                      "VALUES ('brand.example', 7, 'active')")
     await _settle(db, line, 7, {"brand.example": 90}, engine=engine)
+    await _complete_settlement(db, line, [7])
     r = await accrue_for_line(line)
     # the only billed line of the merchant: cut = ceil(451 x 90/451) = 90; agent = floor(361 x 0.25) = 90
     assert (r.basis, r.target_minor) == ("billed_line_after_partner", 90)
@@ -239,35 +257,72 @@ async def test_a_partner_attributed_merchant_is_cut_even_on_untagged_lines(db):
     """v2 pays the partner on the merchant's whole take, not only partner-tagged rollup rows."""
     from services.agent_share_accrual import accrue_for_line
 
-    line = await _billed_line(db, amount=1000); await _rate(bp=10000)
+    line = await _billed_line(db, amount=1000, settled=False); await _rate(bp=10000)
     await db.execute("INSERT INTO partner_attribution (merchant_id, channel_partner_id, status) "
                      "VALUES ('brand.example', 7, 'expired')")  # any status: settlement selects it
     await _settle(db, line, 7, {"brand.example": 300})
+    await _complete_settlement(db, line, [7])
     assert (await accrue_for_line(line)).target_minor == 700
 
 
-async def test_a_line_waits_until_every_claiming_partner_is_settled(db):
+async def test_a_line_waits_until_the_run_s_partner_settlement_has_completed(db):
     from services.agent_share_accrual import accrue_for_line
 
-    line = await _billed_line(db, amount=1000, channel_partner=8); await _rate(bp=10000)
-    await db.execute("INSERT INTO partner_attribution (merchant_id, channel_partner_id, status) "
-                     "VALUES ('brand.example', 7, 'active')")
+    line = await _billed_line(db, amount=1000, channel_partner=8, settled=False); await _rate(bp=10000)
     r = await accrue_for_line(line)
     assert (r.basis, r.status) == ("partner_settlement_pending", "unchanged")
     await _settle(db, line, 7, {"brand.example": 100})
-    assert (await accrue_for_line(line)).basis == "partner_settlement_pending"  # 8 (tagged) not settled
     await _settle(db, line, 8, {"brand.example": 200})
+    # Snapshots alone are not enough: settlement may still be writing the run's other partners.
+    assert (await accrue_for_line(line)).basis == "partner_settlement_pending"
+    await _complete_settlement(db, line, [7, 8])
     r = await accrue_for_line(line)
     assert (r.basis, r.target_minor) == ("billed_line_after_partner", 700)
+
+
+async def test_a_partner_attributed_after_settlement_never_reverses_an_accrued_share(db):
+    """Re-review of #2275 (P1): a new attribution used to flip accrued lines to pending forever."""
+    from services.agent_share_accrual import accrue_for_line
+
+    line = await _billed_line(db, amount=1000, settled=False); await _rate(bp=2500)
+    await _complete_settlement(db, line, [])          # the run settled; no partner for this merchant
+    r = await accrue_for_line(line)
+    assert (r.basis, r.target_minor) == ("billed_line", 250)
+    await db.execute("INSERT INTO partner_attribution (merchant_id, channel_partner_id, status) "
+                     "VALUES ('brand.example', 9, 'active')")
+    assert (await accrue_for_line(line)).status == "unchanged"
+    assert await _total(db, line) == 250
+
+
+async def test_tagged_and_untagged_lines_of_one_merchant_share_one_cut(db):
+    """Re-review of #2275 (P2): every line of the merchant in the run uses the same paid amount, so
+    the cuts sum to at least what was paid even when only one line is partner-tagged."""
+    from services.agent_share_accrual import accrue_for_line
+
+    a = await _billed_line(db, amount=1000, agent="agent_a", channel_partner=7, tag="a", settled=False)
+    b_rollup = await db.fetch_val(
+        "INSERT INTO gmv_attribution_daily (date, merchant_id, agent_id, gross_attributed_gmv_cents, "
+        "net_attributed_gmv_cents, take_rate_bp, take_amount_cents) VALUES (:d, 'brand.example', 'agent_b', "
+        "10000, 10000, 1000, 1000) RETURNING id", {"d": DAY})
+    b = await db.fetch_val(
+        "INSERT INTO billing_run_items (billing_run_id, merchant_id, source_type, source_id, stripe_invoice_item_id, "
+        "stripe_invoice_id, amount_cents) VALUES (:r, 'brand.example', 'gmv_rollup', :g, 'ii_b', 'in_a', 1000) "
+        "RETURNING id", {"r": await _run_of(db, a), "g": b_rollup})
+    await _rate(agent="agent_a", bp=10000); await _rate(agent="agent_b", bp=10000)
+    await _settle(db, a, 7, {"brand.example": 200})
+    await _complete_settlement(db, a, [7])
+    ra, rb = await accrue_for_line(a), await accrue_for_line(b)
+    assert (ra.target_minor, rb.target_minor) == (900, 900)  # cuts 100 + 100 = 200 paid; 200 + 1800 = 2000 billed
 
 
 async def test_settled_amounts_never_reprice_an_accrued_line(db):
     """Review of #2275 (P1-2): the partner's settled amount is immutable, so nothing re-prices."""
     from services.agent_share_accrual import accrue_for_line
 
-    line = await _billed_line(db, amount=1000); await _rate(bp=10000)
+    line = await _billed_line(db, amount=1000, settled=False); await _rate(bp=10000)
     await db.execute("INSERT INTO partner_attribution (merchant_id, channel_partner_id) VALUES ('brand.example', 7)")
     await _settle(db, line, 7, {"brand.example": 800})
+    await _complete_settlement(db, line, [7])
     assert (await accrue_for_line(line)).target_minor == 200
     assert (await accrue_for_line(line)).status == "unchanged"
 
@@ -276,7 +331,7 @@ async def test_the_cut_is_spread_over_all_the_merchant_s_billed_lines(db):
     """Two agents' lines of one merchant in one run share the partner's cut; neither is charged it all."""
     from services.agent_share_accrual import accrue_for_line
 
-    a = await _billed_line(db, amount=600, agent="agent_a", tag="a")
+    a = await _billed_line(db, amount=600, agent="agent_a", tag="a", settled=False)
     b_rollup = await db.fetch_val(
         "INSERT INTO gmv_attribution_daily (date, merchant_id, agent_id, gross_attributed_gmv_cents, "
         "net_attributed_gmv_cents, take_rate_bp, take_amount_cents) VALUES (:d, 'brand.example', 'agent_b', "
@@ -289,6 +344,7 @@ async def test_the_cut_is_spread_over_all_the_merchant_s_billed_lines(db):
     await _rate(agent="agent_a", bp=10000); await _rate(agent="agent_b", bp=10000)
     await db.execute("INSERT INTO partner_attribution (merchant_id, channel_partner_id) VALUES ('brand.example', 7)")
     await _settle(db, a, 7, {"brand.example": 250})
+    await _complete_settlement(db, a, [7])
     ra, rb = await accrue_for_line(a), await accrue_for_line(b)
     # cuts: ceil(600 x 250/1000) = 150, ceil(400 x 250/1000) = 100 -> agents 450 + 300; + partner 250 = 1000
     assert (ra.target_minor, rb.target_minor) == (450, 300)
