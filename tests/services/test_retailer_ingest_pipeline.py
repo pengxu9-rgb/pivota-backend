@@ -284,3 +284,142 @@ async def test_an_exclusion_the_merchant_delisted_can_be_accepted(env):
     out = await pipeline.run_stage(job("apply_due", exclude_handles=["gone-product"],
                                        accepted_flags=["exclude_handle_unmatched:gone-product"]), db=env.db)
     assert out["status"] == "done"
+
+
+# --- the affiliate datafeed source (services/retailer_ingest/affiliate_feed.py) ---------------------
+
+OY_FEED = {"network": "example_network", "url_env": "AFFILIATE_FEED_OY_TEST", "format": "csv",
+           "retailer_host": "global.oliveyoung.com", "link_hosts": ["invl.example-network.com"],
+           "fields": {"id": "sku", "title": "name", "brand": "brand", "product_url": "page", "link": "click",
+                      "price": "price", "currency": "ccy", "category": "cat", "description": "desc"}}
+OY_CSV = ("sku,name,brand,page,click,price,ccy,cat,desc\n"
+          "GA1,3CE Velvet Lip Tint,3CE,https://global.oliveyoung.com/product/detail?prdtNo=GA1,"
+          "https://invl.example-network.com/c/GA1,18.00,USD,Lip Tint,A soft velvet colour for lips.\n"
+          "GA2,3CE Blur Water Tint,3CE,https://global.oliveyoung.com/product/detail?prdtNo=GA2,"
+          "https://invl.example-network.com/c/GA2,17.00,USD,Lip Tint,A water tint for lips.\n")
+
+
+def feed_job(status="queued", **overrides):
+    j = job(status, source="affiliate_feed", feed=OY_FEED)
+    return {**j, "domain": "global.oliveyoung.com", **overrides}
+
+
+@pytest.fixture
+def oy(env, monkeypatch):
+    from services.retailer_ingest import affiliate_feed as af
+    env.crawl_error = AssertionError("the storefront crawler must not run for a feed job")
+    env.feed = OY_CSV
+    env.feed_error = None
+
+    async def fetch(feed, *, env: dict, timeout_s=120.0):
+        if state.feed_error:
+            raise state.feed_error
+        return state.feed
+    state = env
+    monkeypatch.setattr(af, "fetch_feed_text", fetch)
+
+    from services.catalog_enrichment_agent import primary_ingestion as pi
+
+    def require_apply(preflight, counts):  # readiness reports each applied product's real listing URL
+        import json
+        urls = {o["product_key"]: json.loads(o["offer_payload"])["canonical_url"] for o in state.applied[-1]["offers"]}
+        products = [{"product_key": p["product_key"], "canonical_url": urls[p["product_key"]]}
+                    for p in state.applied[-1]["pdps"]]
+        return {"status": "applied", "missing": {}, "applied": {**counts, "primary_readiness":
+                {"status": "complete", "products": products}}}
+    monkeypatch.setattr(pi, "require_primary_apply", require_apply)
+    return env
+
+
+async def test_a_feed_job_dry_runs_clean_from_the_feed_not_the_storefront(oy):
+    out = await pipeline.run_stage(feed_job(), db=oy.db)
+    assert out["status"] == "apply_due" and out["outcome"] == "clean"
+    run = list(oy.ledger.runs.values())[-1]
+    assert run["checks"]["crawl"]["source"] == "affiliate_feed:example_network"
+    assert run["checks"]["crawl"]["rows_kept"] == 2 and run["checks"]["crawl"]["sku_links_collapsed"] == 0
+    assert run["checks"]["selected"] == 2
+
+
+async def test_a_feed_job_applies_one_listing_per_product(oy):
+    out = await pipeline.run_stage(feed_job("apply_due"), db=oy.db)
+    assert out["status"] == "done"
+    [plan] = oy.applied
+    assert len(plan["pdps"]) == 2
+    assert {o["source_ref"] for o in plan["offers"]} == {
+        "https://invl.example-network.com/c/GA1", "https://invl.example-network.com/c/GA2"}
+
+
+@pytest.mark.parametrize("code", [429, 503])
+async def test_a_throttled_feed_download_backs_off(oy, code):
+    from services.retailer_ingest.affiliate_feed import FeedError
+    oy.feed_error = FeedError(f"feed download answered HTTP {code}")
+    out = await pipeline.run_stage(feed_job(), db=oy.db)
+    assert out["outcome"] == "crawl_throttled" and out["status"] == "queued"
+
+
+async def test_a_feed_timeout_backs_off(oy):
+    import httpx
+    oy.feed_error = httpx.ReadTimeout("slow")
+    out = await pipeline.run_stage(feed_job(), db=oy.db)
+    assert out["outcome"] == "crawl_throttled" and out["status"] == "queued"
+
+
+@pytest.mark.parametrize("error_or_text", [
+    "403",
+    "sku,name,brand\nGA1,3CE Velvet Lip Tint,3CE\n",   # the declared mapping is not this feed's header
+    OY_CSV.replace("invl.example-network.com/c/GA2", "evil.example.org/c/GA2"),
+])
+async def test_an_untrustworthy_feed_fails_the_job_for_a_human(oy, error_or_text):
+    from services.retailer_ingest.affiliate_feed import FeedError
+    if error_or_text == "403":
+        oy.feed_error = FeedError("feed download answered HTTP 403")
+    else:
+        oy.feed = error_or_text
+    out = await pipeline.run_stage(feed_job(), db=oy.db)
+    assert out["status"] == "failed" and out["outcome"] == "feed_invalid" and oy.applied == []
+
+
+async def test_a_feed_for_another_retailer_is_refused(oy):
+    out = await pipeline.run_stage(feed_job(domain="k-touch.us"), db=oy.db)
+    assert out["status"] == "failed" and out["outcome"] == "invalid_job"
+
+
+@pytest.mark.parametrize("options", [
+    {"vendors": ["3CE"], "source": "affiliate_feed"},                        # no feed block
+    {"vendors": ["3CE"], "feed": OY_FEED},                                   # a feed without the source
+    {"vendors": ["3CE"], "source": "scrape"},
+    {"vendors": ["3CE"], "source": "affiliate_feed", "feed": {**OY_FEED, "url_env": "https://x.example/f?t=1"}},
+])
+async def test_invalid_feed_options_are_refused_before_any_download(oy, options):
+    bad = feed_job()
+    bad["options"] = options
+    out = await pipeline.run_stage(bad, db=oy.db)
+    assert out["status"] == "failed" and out["outcome"] == "invalid_job"
+
+
+async def test_the_feed_url_never_reaches_the_ledger(env, monkeypatch):
+    """The URL embeds the publisher token. Neither a refusal nor a transport error may echo it."""
+    import httpx
+    secret = "https://feeds.example-network.com/p/12345?token=SEKRET-TOKEN"
+    monkeypatch.setenv("AFFILIATE_FEED_OY_TEST", secret)
+    env.crawl_error = AssertionError("storefront crawler must not run")
+    real = httpx.AsyncClient
+    outcomes = iter([
+        lambda req: httpx.Response(401, text=f"bad token for {req.url}"),
+        lambda req: (_ for _ in ()).throw(httpx.ConnectError(f"cannot reach {req.url}", request=req)),
+        lambda req: (_ for _ in ()).throw(httpx.TooManyRedirects(f"loop at {req.url}", request=req)),
+    ])
+    for expected in ("feed_invalid", "crawl_throttled", "feed_invalid"):
+        handler = next(outcomes)
+        monkeypatch.setattr(httpx, "AsyncClient",
+                            lambda handler=handler, **kw: real(transport=httpx.MockTransport(handler), **kw))
+        out = await pipeline.run_stage(feed_job(), db=env.db)
+        assert out["outcome"] == expected
+    assert "SEKRET" not in repr(env.ledger.runs) + repr(env.ledger.transitions)
+
+
+async def test_an_olive_young_product_can_be_excluded_by_its_product_id(oy):
+    j = feed_job("apply_due")
+    j["options"]["exclude_handles"] = ["GA2"]
+    out = await pipeline.run_stage(j, db=oy.db)
+    assert out["status"] == "done" and len(oy.applied[-1]["pdps"]) == 1

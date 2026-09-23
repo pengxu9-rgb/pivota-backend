@@ -55,10 +55,14 @@ def _pdp(record: Any) -> Dict[str, Any]:
 
 
 def _handle(record: Dict[str, Any]) -> Optional[str]:
+    from services.catalog_enrichment_agent.ingestion import listing_handle
+    # The FIRST offer that names a product decides, as before listing_handle existed (a /products/ URL
+    # with an empty handle still answers None rather than falling through to the next offer).
     for offer in record.get("offers") or []:
         url = str((offer or {}).get("canonical_url") or "")
-        if "/products/" in url:
-            return url.split("/products/", 1)[1].split("?", 1)[0].strip("/").casefold() or None
+        handle = listing_handle(url)
+        if handle or "/products/" in url:
+            return handle
     return None
 
 

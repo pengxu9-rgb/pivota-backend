@@ -80,9 +80,21 @@ def inspect_primary_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
     native_products = {o.get("product_key") for o in plan.get("offers", [])
                        if o.get("sku_key") in native_keys
                        and sku_products.get(o.get("sku_key")) == o.get("product_key")}
+    # A product sold ONLY through an affiliate network's feed (services/retailer_ingest/affiliate_feed.py)
+    # has no storefront variant id to verify; its click is the network's tracking link, never a cart
+    # built from a variant. Excused only when EVERY one of its offers carries that feed's stamp.
+    offer_sources: Dict[str, set] = {}
+    for offer in plan.get("offers", []):
+        payload = offer.get("offer_payload") or {}
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        offer_sources.setdefault(offer.get("product_key"), set()).add(
+            str(payload.get("validated_at") or "").startswith("affiliate_feed:"))
+    feed_only = {key for key, stamps in offer_sources.items() if stamps == {True}}
     missing_native = [p.get("product_key") for p in plan.get("pdps", [])
                       if str(p.get("product_key") or "").startswith("ext:retailer:")
-                      and p.get("product_key") not in native_products]
+                      and p.get("product_key") not in native_products
+                      and p.get("product_key") not in feed_only]
     if missing_native:
         reasons.append("no_native_retailer_commerce_chain")
     missing_chains = [p.get("product_key") for p in plan.get("pdps", [])

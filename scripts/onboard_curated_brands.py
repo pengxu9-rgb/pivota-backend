@@ -217,11 +217,8 @@ def _record_url(record: Dict[str, Any]) -> Optional[str]:
 
 
 def _record_handle(record: Dict[str, Any]) -> Optional[str]:
-    url = _record_url(record) or ""
-    marker = "/products/"
-    if marker not in url:
-        return None
-    return url.split(marker, 1)[1].split("?", 1)[0].split("#", 1)[0].strip("/").casefold() or None
+    from services.catalog_enrichment_agent.ingestion import listing_handle
+    return listing_handle(_record_url(record))
 
 
 #: Printed once per record --exclude-handle removed. Greppable.
