@@ -155,8 +155,17 @@ import db.reap_agentic_ledger as ledger
 import services.reap_agentic_client as rc
 import services.reap_agentic_purchase as purchase_svc
 from db.database import database
+from utils.logger import logger as operator_logger
 
 logger = logging.getLogger(__name__)
+
+# THE PER-RUN REPORT GOES THROUGH THE "pivota" LOGGER, NOT THE MODULE LOGGER. Measured in prod on
+# 2026-09-23: /__scheduler_health showed 155 ok runs of this job and Cloud Logging held ZERO
+# `reap_agentic_poll:` report lines. Nothing configures the root logger in this process, so it
+# sits at WARNING and a module logger's INFO is dropped at the logger. `utils.logger` carries its
+# own INFO level and stdout handler (propagate=False). Only the report line goes this way; the
+# per-row errors and dial warnings stay on the module logger, where WARNING and above still land.
+# See jobs/merchant_purchasability_sweep.py for the longer note and why root is left alone.
 
 __all__ = [
     "DIALS",
@@ -829,7 +838,8 @@ async def run_reap_agentic_purchase_poll(
         counts["errors"] += await _release_leftovers(worker)
 
     report = _report()
-    logger.info("reap_agentic_poll: %s", report)
+    # THE PROOF LINE: `[ts] INFO - reap_agentic_poll: PollReport(...)` on the worker's stdout.
+    operator_logger.info("reap_agentic_poll: %s", report)
     return report
 
 

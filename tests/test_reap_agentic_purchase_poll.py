@@ -31,6 +31,7 @@ import asyncio
 import inspect
 import logging
 import os
+import re
 import sys
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -46,6 +47,11 @@ import db.reap_agentic_ledger as ledger  # noqa: E402
 import services.reap_agentic_client as rc  # noqa: E402
 import services.reap_agentic_purchase as svc  # noqa: E402
 import jobs.reap_agentic_purchase_poll as job  # noqa: E402
+from pivota_log_capture import (  # noqa: E402
+    capture_pivota_stdout,
+    pivota_lines,
+    root_as_in_prod,
+)
 
 # The shared fixtures, from the state machine's own SQLite arm. Same directory, same dialect gate.
 from test_reap_agentic_purchase import (  # noqa: E402
@@ -1499,23 +1505,28 @@ async def test_no_pii_reaches_the_logs_or_the_report_on_any_path(monkeypatch, re
         "state_entered_at = '2020-01-01 00:00:00' WHERE id = :i",
         {"i": abandoned},
     )
-    reports.append(await _run(worker_id="w1"))
 
     async def _raises(pid, worker):
         raise _Boom(f"{EMAIL} {ADDRESS['addressLine1']}")
 
-    monkeypatch.setattr(job.purchase_svc, "advance", _raises)
-    await _raw(
-        "UPDATE reap_agentic_purchases SET next_poll_at = '2020-01-01 00:00:00' WHERE id = :i",
-        {"i": happy},
-    )
-    reports.append(await _run(worker_id="w2"))
+    with capture_pivota_stdout() as pivota_buffer:
+        reports.append(await _run(worker_id="w1"))
+        monkeypatch.setattr(job.purchase_svc, "advance", _raises)
+        await _raw(
+            "UPDATE reap_agentic_purchases SET next_poll_at = '2020-01-01 00:00:00' WHERE id = :i",
+            {"i": happy},
+        )
+        reports.append(await _run(worker_id="w2"))
 
     # `getMessage()` applies the %-args, which is what a handler would write. Both halves matter:
     # a PII value could arrive as the format string OR as an argument.
     records = [r for r in caplog.records if r.name.startswith(("jobs.reap", "services.reap"))]
     assert records, "the scoped loggers captured nothing; this test would pass vacuously"
-    blob = "\n".join(r.getMessage() for r in records)
+    # The per-run report line goes through the pivota logger (propagate=False), so caplog never
+    # sees it; its handler's output joins the blob so the line this rail relies on stays in scope.
+    report_lines = [line for line in pivota_lines(pivota_buffer) if "reap_agentic_poll: " in line]
+    assert len(report_lines) == 2, report_lines
+    blob = "\n".join([r.getMessage() for r in records] + report_lines)
     for secret in PII_STRINGS:
         assert secret not in blob, f"{secret!r} reached a log record"
         for report in reports:
@@ -1545,6 +1556,59 @@ async def test_the_default_worker_id_is_unique_per_run():
     ids = {job._worker_id() for _ in range(50)}
     assert len(ids) == 50
     assert all(part.strip() for part in next(iter(ids)).split(":"))
+
+
+# ══ 10b. the proof line ═══════════════════════════════════════════════════════════════════════
+#
+# Measured in prod 2026-09-23: /__scheduler_health showed 155 ok runs of this job and Cloud
+# Logging held ZERO `reap_agentic_poll:` report lines. The report went through
+# `logging.getLogger(__name__)`; nothing configures root in this process, root sits at WARNING,
+# and INFO is dropped at the logger. caplog could not see that — it hangs on root and turns the
+# level down — so this reads the pivota handler's OWN stream with root where prod has it, and
+# FAILS on a module-logger emit.
+
+_PROOF_LINE = re.compile(r"\[[^\]]+\] INFO - reap_agentic_poll: PollReport\(.*\)$")
+
+
+async def test_the_report_line_lands_on_pivota_stdout_at_info_with_root_at_warning(reap):
+    await _start()
+    with root_as_in_prod(), capture_pivota_stdout() as out:
+        report = await _run(worker_id="w1")
+    lines = pivota_lines(out)
+    proof = [line for line in lines if _PROOF_LINE.fullmatch(line)]
+    assert len(proof) == 1, f"expected exactly one report line on the pivota handler, got {lines!r}"
+    assert proof[0].endswith(f"reap_agentic_poll: {report!r}")
+    assert report.claimed == 1, "the run did real work; the line is not a no-op tick's"
+    for secret in PII_STRINGS:
+        assert secret not in proof[0]
+
+
+async def test_the_report_line_does_not_depend_on_the_root_logger(reap):
+    """With root wide open and a handler on it, the report line must NOT show up there: reaching
+    root means propagating from a module logger, the exact path prod drops."""
+
+    class _Sink(logging.Handler):
+        def __init__(self):
+            super().__init__(level=logging.DEBUG)
+            self.messages = []
+
+        def emit(self, record):
+            self.messages.append(record.getMessage())
+
+    root, sink = logging.getLogger(), _Sink()
+    saved = root.level
+    root.setLevel(logging.DEBUG)
+    root.addHandler(sink)
+    try:
+        with capture_pivota_stdout() as out:
+            await _run(worker_id="w1")
+    finally:
+        root.removeHandler(sink)
+        root.setLevel(saved)
+    assert any(_PROOF_LINE.fullmatch(line) for line in pivota_lines(out))
+    assert not any(m.startswith("reap_agentic_poll: PollReport(") for m in sink.messages), (
+        "the report line propagated to root, i.e. it went through the module logger"
+    )
 
 
 # ══ 11. registration ══════════════════════════════════════════════════════════════════════════

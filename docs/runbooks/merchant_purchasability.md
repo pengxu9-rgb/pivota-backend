@@ -383,6 +383,7 @@ and it is why their order is not negotiable.**
    errors / skipped_disabled / duration_ms`. A pass is complete when `checked` has covered
    `population` across ticks. **`errors` is the only count that should page anyone**; a high
    `unverifiable` is not an error, it is the egress telling you something, and §6 is where to look.
+   Where to read it, and what counts as proof of a run, is the next subsection.
 5. **Verify coverage merchant by merchant** through
    `GET /ops/merchant-purchasability?domain=…&market=…`. Every merchant you expect to be
    purchasable must read `"tier": "purchase"`. If one stays `browse_only`, the response's `note`
@@ -402,6 +403,46 @@ and it is why their order is not negotiable.**
 >
 > Steps 7–8 are independent of 1–6 and may be done at any point, but the **order between them**
 > is not optional, and for the same reason in reverse: gateway-first is silent. See §10.
+
+### Proof of a run, and where the report line lands
+
+**`/__scheduler_health` is the authoritative proof that the sweep ran.** On the worker,
+`runs.merchant_purchasability_sweep` carries `runs_started / runs_ok / runs_failed /
+runs_deadline_exceeded`, `last_started_at`, `last_finished_at`, `last_duration_ms` and
+`last_outcome`; `runs_ok` going up by one per interval is a run, whatever the logs say. The log
+line is the **content** of a run, not the evidence that it happened.
+
+The per-run report lands on the **worker's stdout** (Cloud Logging, the worker service, severity
+INFO) as one line in `utils.logger`'s format:
+
+```
+[2026-09-23 09:43:20,118] INFO - merchant_purchasability_sweep: SweepReport(population=20, population_skipped_unusable=0, checked=20, positive=14, negative=2, unverifiable=4, written=20, abandoned_budget=0, errors=0, skipped_disabled=0, duration_ms=48213)
+```
+
+With the dial off the run logs, at the same place and level,
+`merchant_purchasability_sweep: disabled; no merchant was contacted` and returns
+`skipped_disabled=1` — at the hourly interval that line is the sign the worker is still ticking
+while the rail is disarmed. A skipped allowlist row (a `merchant_domain` that is not a bare host
+name, §7's census query) logs once per run, as a count, at WARNING on the same channel.
+
+**Why this is spelled out.** Measured 2026-09-23: `/__scheduler_health` showed `runs_ok=1` at
+08:43:20Z on worker-00167-pjr and Cloud Logging held **zero** `merchant_purchasability_sweep:`
+lines. The report went through the module logger (`logging.getLogger(__name__)`), and nothing in
+this process configures the root logger — `middleware/structured_logging.py` configures only the
+`structured_logs` logger, uvicorn only `uvicorn.*` — so root sits at Python's default WARNING and
+a module logger's INFO is dropped at the logger. The only INFO that reaches prod is the `pivota`
+logger in `utils/logger.py` (own INFO level, own stdout handler, `propagate=False`), which is the
+channel the report, the disabled line and the skip line now use. **Do not "fix" a missing line by
+configuring root**: that floods prod with INFO from every module and changes the uvicorn
+access-log redaction path (`main.install_uvicorn_access_log_redaction`). Everything else this job
+logs — dial warnings, per-check errors — stays on the module logger, where WARNING and above
+still land. The same applies to `jobs/reap_agentic_purchase_poll.py`'s
+`reap_agentic_poll: PollReport(...)` line, which had 155 ok runs and zero lines the same day.
+
+A test cannot see this through `caplog`, which hangs its handler on root and turns the level
+down: `tests/pivota_log_capture.py` reads the pivota handler's own stream with root pinned at
+WARNING, and the two `test_the_report_line_lands_on_pivota_stdout_*` tests fail on a
+module-logger emit.
 
 ### Gateway (PIVOTA-Agent) change
 
@@ -489,7 +530,8 @@ fix — never the gate.
 * the sweep **keeps running** and keeps the facts fresh, so re-arming later needs no second wait.
 
 Unset `MERCHANT_PURCHASABILITY_SWEEP_ENABLED` as well to stop contacting merchants; the sweep then
-returns `skipped_disabled=1`. Unsetting only the sweep dial while leaving `ENFORCE` on is the
+returns `skipped_disabled=1` and logs `merchant_purchasability_sweep: disabled; no merchant was
+contacted` each tick (see "Proof of a run" above). Unsetting only the sweep dial while leaving `ENFORCE` on is the
 misordered state again — the facts age out through the TTL and merchants silently become
 `browse_only` one by one.
 
