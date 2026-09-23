@@ -4,6 +4,7 @@
 """
 
 import asyncio
+import json
 
 from sqlalchemy import Table, Column, Integer, String, Text, DateTime, JSON, Numeric, Boolean
 from sqlalchemy.sql import func
@@ -430,8 +431,23 @@ async def get_orders_by_customer(customer_email: str, limit: int = 50) -> List[D
     return [dict(r) for r in results]
 
 
+def _coerce_metadata_obj(value: Any) -> Dict[str, Any]:
+    """`orders.metadata` as a dict. Read through a raw TEXT query, asyncpg hands the JSON column
+    back as a `str` (no JSON codec is registered, and must not be: it double-encodes writes); only
+    a SQLAlchemy-typed select decodes it. Non-object / unparseable -> {}."""
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
 async def update_order_status(
-    order_id: str, 
+    order_id: str,
     status: str, 
     **additional_fields
 ) -> bool:
@@ -460,9 +476,7 @@ async def update_order_status(
     if isinstance(update_data.get("metadata"), dict):
         existing_metadata = {}
         try:
-            existing_raw = before["metadata"] if before else None
-            if isinstance(existing_raw, dict):
-                existing_metadata = dict(existing_raw)
+            existing_metadata = _coerce_metadata_obj(before["metadata"] if before else None)
         except Exception:
             existing_metadata = {}
         # Metadata updates are additive by default. This prevents webhook/aftercare
