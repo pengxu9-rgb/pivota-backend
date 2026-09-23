@@ -114,6 +114,26 @@ async def test_a_closed_job_no_longer_blocks_a_fresh_enqueue(db):
     assert await _enqueue(db, brand="ESPOIR", options={"vendors": ["Espoir"]})
 
 
+async def test_get_job_reads_one_job_and_none_for_an_unknown_id(db):
+    job_id = await _enqueue(db, brand="LANEIGE", options={"vendors": ["Laneige"]})
+    job = await ledger.get_job(job_id, db=db)
+    assert job["id"] == job_id and job["status"] == "queued" and job["brand"] == "LANEIGE"
+    assert await ledger.get_job("rij_does_not_exist", db=db) is None
+
+
+async def test_recent_runs_lists_runs_newest_first_with_their_job(db):
+    job_id = await _enqueue(db, brand="ROMAND", options={"vendors": ["rom&nd"]})
+    run_id = await ledger.start_run(job_id=job_id, stage="dry_run", image_sha="sha", execution="exec-s", db=db)
+    await ledger.finish_run(run_id, outcome="held", flags=[{"key": "k"}], db=db)
+    runs = await ledger.recent_runs(limit=500, db=db)
+    [ours] = [r for r in runs if r["id"] == run_id]
+    assert (ours["job_id"], ours["domain"], ours["brand"], ours["stage"], ours["outcome"]) == (
+        job_id, DOMAIN, "ROMAND", "dry_run", "held")
+    starts = [r["started_at"] for r in runs]
+    assert starts == sorted(starts, reverse=True)
+    assert len(await ledger.recent_runs(limit=1, db=db)) == 1
+
+
 async def test_a_bad_status_is_refused_by_the_schema(db):
     job_id = await _enqueue(db, brand="HERA", options={"vendors": ["HERA"]})
     with pytest.raises(Exception):

@@ -1132,6 +1132,11 @@ app.include_router(pool_health_router)  # GET /__pool_health: pool-vs-database p
 from routes.admin_scheduler_jobs import router as admin_scheduler_jobs_router
 app.include_router(admin_scheduler_jobs_router)
 
+# Admin: read the retailer ingest ledger, approve/cancel a held job, queue a
+# cohort (migration 234). require_admin sits on the router itself.
+from routes.admin_retailer_ingest import router as admin_retailer_ingest_router
+app.include_router(admin_retailer_ingest_router)
+
 # C1 Phase 2d — read-only trust table health (total rows, decision distribution,
 # drift count, stale rows). Mirrors /__scheduler_health in naming convention.
 from routes.__trust_health import router as trust_health_router
