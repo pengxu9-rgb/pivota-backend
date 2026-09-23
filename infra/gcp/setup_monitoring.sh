@@ -198,6 +198,44 @@ else
   echo "   created $METRIC"
 fi
 
+# The retailer ingest drain (jobs/retailer_ingest_drain.py) prints ONE summary line per execution,
+# sort_keys JSON with json.dumps' default ", " / ": " separators (the filters match that spacing),
+# carrying the lane's job counts by status on EVERY execution, idle ones included:
+#   retailer_ingest_drain: {"job_id": "rij_...", "jobs": {"held": 1, "queued": 3}, "outcome": "held", ...}
+#
+# These are the two conditions the "Cloud Run job failing" policy CANNOT see: the stage was
+# recorded, so the execution exits 0. An unexpected exception is NOT here - that exits 1 and is the
+# job-failing policy's.
+#
+#   HELD is a STANDING condition, so it keys on the count (`"held": N`, N >= 1), not only on the
+#   stage that produced it: a store waiting for review keeps matching on every tick, idle ticks
+#   included, until someone approves or cancels it. `"outcome": "held"` is kept as an alternative so
+#   the stage that holds a store alerts even if its line's count predates the transition. The regex
+#   cannot match `"outcome": "held"` or `"status": "held"` (a string, not a digit, follows the
+#   colon), nor anything inside a reason string (json.dumps escapes those quotes).
+#   FAILED is per EVENT (`"status": "failed"` on the stage that gave up). A failed job is terminal
+#   and stays failed, so a count-based alert would page forever.
+#
+# Created OR UPDATED, unlike pool_checkout_timeout above: these filters are keyed on the job's own
+# output format, so a change to either side has to reach the live metric on the next run.
+RID_HELD_FILTER='resource.type="cloud_run_job" AND resource.labels.job_name="retailer-ingest-drain" AND textPayload:"retailer_ingest_drain: " AND (textPayload=~"\"held\": [1-9]" OR textPayload:"\"outcome\": \"held\"")'
+RID_FAILED_FILTER='resource.type="cloud_run_job" AND resource.labels.job_name="retailer-ingest-drain" AND textPayload:"retailer_ingest_drain: " AND textPayload:"\"status\": \"failed\""'
+upsert_log_metric() { # NAME DESCRIPTION FILTER
+  if "$GCLOUD" logging metrics describe "$1" --project "$PROJECT" >/dev/null 2>&1; then
+    "$GCLOUD" logging metrics update "$1" --project "$PROJECT" --description "$2" --log-filter="$3" --quiet
+    echo "   updated $1"
+  else
+    "$GCLOUD" logging metrics create "$1" --project "$PROJECT" --description "$2" --log-filter="$3" --quiet
+    echo "   created $1"
+  fi
+}
+upsert_log_metric retailer_ingest_drain_held \
+  "Retailer ingest drain executions that saw a HELD job (a store needs review before it can be applied)" \
+  "$RID_HELD_FILTER"
+upsert_log_metric retailer_ingest_drain_failed \
+  "Retailer ingest drain stages that left a job FAILED - the ledger gave up on that store" \
+  "$RID_FAILED_FILTER"
+
 echo "== alert policies"
 upsert() { # DISPLAY_NAME BODY   -> replace by displayName so thresholds live in git
   OLD="$(api GET alertPolicies | python3 -c '
@@ -270,7 +308,7 @@ upsert "prod: load balancer 5xx" "$(policy \
 
 upsert "prod: Cloud Run job failing" "$(policy \
   "prod: Cloud Run job failing" \
-  "A scheduled Cloud Run job task is failing. reviews-invitation-send runs every minute and relgraph-sync daily; a persistent failure in either is otherwise completely silent." \
+  "A scheduled Cloud Run job task is failing. reviews-invitation-send runs every minute and relgraph-sync daily; a persistent failure in either is otherwise completely silent. For retailer-ingest-drain, a failure here is an UNEXPECTED exception (the run is recorded as outcome=error in retailer_ingest_runs); stages that end held or failed exit 0 and page through their own retailer-ingest policies instead." \
   'metric.type="run.googleapis.com/job/completed_task_attempt_count" AND resource.type="cloud_run_job" AND metric.label.result="failed"' \
   ALIGN_SUM REDUCE_SUM resource.label.job_name COMPARISON_GT 0 300s 300s 3600s)"
 
@@ -285,6 +323,27 @@ upsert "prod: database pool exhausted" "$(policy \
   "The backend cannot get a connection from its own pool (PoolCheckoutTimeout). Check Cloud SQL num_backends FIRST: if it is low - it was 28/300 on 2026-08-28 - the database is fine and the application is leaking pool slots, so restarting the revision restores service while the leak is found. There is no liveness probe on the web service, so a wedged instance is never recycled on its own." \
   'metric.type="logging.googleapis.com/user/pool_checkout_timeout" AND resource.type="cloud_run_revision"' \
   ALIGN_SUM REDUCE_SUM resource.label.service_name COMPARISON_GT 0 300s 300s 3600s)"
+
+# DURATION 0s, not the 300s the pool policy uses: a log-based counter writes no points between
+# matching lines, so a condition that must hold for 300s can miss a lone event entirely.
+#
+# HELD aligns over 3600s, TWICE the drain's 30-minute cadence. While a store is held every tick
+# matches, so the hour-wide sum never drops to 0 between ticks and this stays ONE open incident
+# rather than a fresh email every half hour; it closes about an hour after the last held job is
+# approved or cancelled. It also closes if the trigger is PAUSED - no executions, no lines - so a
+# disarmed drain with a held store is silent: check the ledger before disarming.
+# FAILED is a one-off event and keeps the 300s window.
+upsert "prod: retailer ingest held for review" "$(policy \
+  "prod: retailer ingest held for review" \
+  "At least one retailer ingest job is HELD: a BLOCK flag stopped the store and nothing is written until someone decides. This stays open while any job is held. Read the flags: \`SELECT id, domain, brand, status_reason FROM retailer_ingest_jobs WHERE status = 'held'\` and the job's latest retailer_ingest_runs row (checks, flags). Then approve (optionally excluding handles or accepting flag keys) or cancel it via db/retailer_ingest.py approve()/cancel()." \
+  'metric.type="logging.googleapis.com/user/retailer_ingest_drain_held" AND resource.type="cloud_run_job"' \
+  ALIGN_SUM REDUCE_SUM resource.label.job_name COMPARISON_GT 0 3600s 0s 3600s)"
+
+upsert "prod: retailer ingest job failed" "$(policy \
+  "prod: retailer ingest job failed" \
+  "A retailer-ingest-drain stage left a job FAILED: crawl capped or failed, currency unproven, retry budget spent, apply refused (MAY BE PARTIAL), or the apply gate / read-back disagreed. The execution itself exited 0, so the Cloud Run job-failing policy does not fire for this. Read \`SELECT id, domain, brand, status_reason FROM retailer_ingest_jobs WHERE status = 'failed' ORDER BY updated_at DESC\` and the job's latest retailer_ingest_runs row." \
+  'metric.type="logging.googleapis.com/user/retailer_ingest_drain_failed" AND resource.type="cloud_run_job"' \
+  ALIGN_SUM REDUCE_SUM resource.label.job_name COMPARISON_GT 0 300s 0s 3600s)"
 
 echo
 echo "channel : $ALERT_EMAIL"
