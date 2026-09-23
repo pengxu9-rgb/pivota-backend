@@ -73,7 +73,8 @@ _CREDIT_NOTE_REASON = "order_change"
 _LINE_FOR_UPDATE_SQL = """
 SELECT bri.id AS line_id, bri.billing_run_id, bri.merchant_id, bri.source_type,
        bri.source_id AS rollup_id, bri.amount_cents, bri.voided_at, bri.stripe_invoice_id,
-       g.date AS billed_day, g.agent_id, g.channel_partner_id, g.take_rate_bp
+       g.date AS billed_day, g.agent_id, g.channel_partner_id, g.take_rate_bp,
+       g.gross_attributed_gmv_cents AS billed_gross
 FROM billing_run_items bri
 LEFT JOIN gmv_attribution_daily g ON g.id = bri.source_id AND bri.source_type = 'gmv_rollup'
 WHERE bri.id = :line_id
@@ -206,11 +207,18 @@ RETURNING id
 """
 
 # A FAILED credit did reach Stripe, and a timeout may have hidden a note Stripe created. Claimed as
-# `issuing` while Stripe is asked, so no issue runs alongside the check.
+# `issuing` while Stripe is asked, so no issue runs alongside the check. A STALE issuing one too (an
+# issue or a cancel interrupted mid-way, or a line voided under it): otherwise the only way out
+# would be issue(), which sends the very note the admin wants cancelled.
 _CLAIM_FAILED_FOR_CANCEL_SQL = """
 UPDATE gmv_invoice_credits SET status = 'issuing', updated_at = :now
-WHERE id = :id AND status = 'failed'
+WHERE id = :id AND (status = 'failed' OR (status = 'issuing' AND updated_at < :stale_before))
 RETURNING *
+"""
+
+_RELEASE_CANCEL_CLAIM_SQL = """
+UPDATE gmv_invoice_credits SET status = 'failed', last_error = :error, updated_at = :now
+WHERE id = :id AND status = 'issuing'
 """
 
 _CANCEL_CLAIMED_SQL = """
@@ -373,6 +381,17 @@ async def compute_credit_for_line(line_id: int) -> LineCredit:
                            line_id, line["rollup_id"], line["billed_day"], line["merchant_id"])
             return LineCredit(status="skipped", line_id=line_id, reason="rollup_group_missing")
 
+        if sums["gross"] != int(line["billed_gross"] or 0):
+            # The group's GROSS moved since it was billed: an edge joined or left it (re-attributed
+            # to another agent, say), or a late gross stamp. Only REFUNDS are credited here; a
+            # recompute would credit whatever the move took out of the group, or credit refunds on
+            # gross that was never billed in it. Left for a human, pending credit and all.
+            logger.warning("gmv_invoice_credit_group_gross_changed line_id=%s rollup_id=%s billed_gross=%s "
+                           "gross_now=%s refund_now=%s", line_id, line["rollup_id"], line["billed_gross"],
+                           sums["gross"], sums["refund"])
+            return LineCredit(status="skipped", line_id=line_id, reason="group_gross_changed",
+                              detail={"billed_gross": int(line["billed_gross"] or 0), **sums})
+
         rate = int(line["take_rate_bp"] or 0)
         billed = int(line["amount_cents"] or 0)
         correct_take = take_cents(sums["gross"] - sums["refund"], rate)
@@ -517,26 +536,36 @@ async def cancel(credit_id: int, *, by: str, reason: str) -> str:
     if await database.fetch_one(_CANCEL_SQL, {"id": credit_id, "by": who, "reason": why, "now": _now()}):
         return "cancelled"
 
-    claimed = await database.fetch_one(_CLAIM_FAILED_FOR_CANCEL_SQL, {"id": credit_id, "now": _now()})
+    now = _now()
+    claimed = await database.fetch_one(_CLAIM_FAILED_FOR_CANCEL_SQL, {
+        "id": credit_id, "now": now, "stale_before": now - STALE_ISSUING})
     if claimed is None:
         return "not_cancellable"
     credit = dict(claimed)
+    decided = False
     try:
-        note = await _existing_note(str(credit["stripe_invoice_id"]), credit_id)
-    except Exception as exc:  # noqa: BLE001 -- back to failed; cancelling blind could orphan a live note
-        error = f"cancel refused, Stripe check failed: {type(exc).__name__}: {str(exc)[:400]}"
-        await database.execute(_MARK_FAILED_SQL, {"id": credit_id, "error": error, "now": _now()})
-        raise CreditActionRefused("stripe_unreachable", "could not check Stripe for an issued note") from exc
-    if note is not None:
-        kind = "customer_balance" if int(_field(note, "credit_amount") or 0) > 0 else "amount_due"
-        await database.execute(_MARK_ISSUED_SQL, {"id": credit_id, "note_id": str(_field(note, "id")),
-                                                  "kind": kind, "by": who, "now": _now()})
-        logger.warning("gmv_invoice_credit_cancel_found_issued credit_id=%s note=%s: recorded as issued",
-                       credit_id, _field(note, "id"))
-        await _after_issue(credit)
-        return "issued"
-    await database.execute(_CANCEL_CLAIMED_SQL, {"id": credit_id, "by": who, "reason": why, "now": _now()})
-    return "cancelled"
+        try:
+            note = await _existing_note(str(credit["stripe_invoice_id"]), credit_id)
+        except Exception as exc:  # noqa: BLE001 -- never cancel blind: that could orphan a live note
+            raise CreditActionRefused("stripe_unreachable", "could not check Stripe for an issued note") from exc
+        if note is not None:
+            await database.execute(_MARK_ISSUED_SQL, {"id": credit_id, "note_id": str(_field(note, "id")),
+                                                      "kind": _note_kind(note), "by": who, "now": _now()})
+            decided = True
+            logger.warning("gmv_invoice_credit_cancel_found_issued credit_id=%s note=%s: recorded as issued",
+                           credit_id, _field(note, "id"))
+            await _after_issue(credit)
+            return "issued"
+        await database.execute(_CANCEL_CLAIMED_SQL, {"id": credit_id, "by": who, "reason": why, "now": _now()})
+        decided = True
+        return "cancelled"
+    finally:
+        if not decided:
+            # Any exit short of a decision (Stripe unreachable, a cancelled task, a crash) hands the
+            # claim back as `failed`, so the credit is never left stuck in `issuing`.
+            await database.execute(_RELEASE_CANCEL_CLAIM_SQL, {
+                "id": credit_id, "now": _now(),
+                "error": "cancel interrupted before Stripe was checked; retry the cancel or the issue"})
 
 
 @dataclass
@@ -551,6 +580,12 @@ class IssueResult:
 
 async def _stripe(call, **kwargs):
     return await asyncio.to_thread(call, **kwargs)
+
+
+def _note_kind(note: Any) -> str:
+    """How a credit note landed: a note credited to the customer's balance carries the balance
+    transaction it created; otherwise it reduced the invoice's amount due."""
+    return "customer_balance" if _field(note, "customer_balance_transaction") else "amount_due"
 
 
 async def _existing_note(stripe_invoice_id: str, credit_id: int) -> Any:

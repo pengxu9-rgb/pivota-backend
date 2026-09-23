@@ -115,7 +115,9 @@ class _FakeStripe:
                 if outer.fail_create is not None:
                     raise outer.fail_create
                 note = {"id": f"cn_{len(outer.notes) + 1}", "status": "issued", "invoice": params["invoice"],
-                        "metadata": params.get("metadata") or {}}
+                        "metadata": params.get("metadata") or {},
+                        # as Stripe: a note credited to the customer balance carries its transaction
+                        "customer_balance_transaction": "cbtxn_1" if params.get("credit_amount") else None}
                 outer.created.append({"params": params, "options": options})
                 outer.notes.append(note)
                 return note
@@ -263,9 +265,10 @@ async def test_a_credit_is_only_ever_a_credit_never_a_charge(db, fake_stripe):
     from services.gmv_invoice_credits import compute_credit_for_line
 
     line, _, _ = await _billed(db)
-    # Gross went UP after invoicing (a late gross stamp): the line is not billed upward.
+    # Gross went UP after invoicing (a late gross stamp): the line is not billed upward. A gross that
+    # moved for any reason other than a refund is left for a human, not recomputed.
     await db.execute("UPDATE commerce_attribution_edges SET gross_attributed_gmv_cents = 20000")
-    assert (await compute_credit_for_line(line)).status == "nothing_owed"
+    assert (await compute_credit_for_line(line)).reason == "group_gross_changed"
     assert await _credits(db, line) == []
 
 
@@ -838,6 +841,7 @@ async def test_cancelling_a_failed_credit_stripe_actually_issued_records_it_as_i
     assert await cancel(credit["id"], by="ops@later", reason="stripe error, giving up") == "issued"
     (row,) = await _credits(db, line)
     assert (row["status"], row["stripe_credit_note_id"], row["issued_by"]) == ("issued", "cn_1", "ops@later")
+    assert row["stripe_credit_kind"] == "customer_balance"  # read off the note, not guessed
     assert (await compute_credit_for_line(line)).status == "nothing_owed"
     assert await _agent_total(db, line) == 187  # priced on the 750 kept
 
@@ -917,3 +921,80 @@ async def test_the_model_and_migration_238_build_the_same_table(db):
         await db.execute(str(CreateIndex(index).compile(dialect=postgresql.dialect())))
     from_model = sorted(r[0] for r in await db.fetch_all(facts))
     assert from_model == from_migration and len(from_model) > 40
+
+
+# ── re-review of #2286 ───────────────────────────────────────────────────────────────────────────
+
+
+async def test_a_group_whose_gross_moved_without_a_refund_is_left_for_a_human(db, fake_stripe):
+    """An edge re-attributed out of an invoiced group takes its gross with it; nothing was refunded.
+    Recomputing the group would credit what the move took out. Only refunds are credited."""
+    from services.gmv_aggregation_service import aggregate_daily
+    from services.gmv_invoice_credits import compute_credit_for_line
+
+    await _edge(db, edge_id="cae_1", order_id="ord_1", gross=10_000)
+    await _edge(db, edge_id="cae_2", order_id="ord_2", gross=5_000)
+    await aggregate_daily(DAY)
+    (line,) = await _invoice_the_day(db, await _billing_run(db))  # billed 1500
+    await db.execute("UPDATE commerce_attribution_edges SET agent_id = 'agent_2' WHERE edge_id = 'cae_2'")
+
+    result = await compute_credit_for_line(line)
+    assert (result.status, result.reason) == ("skipped", "group_gross_changed")
+    assert await _credits(db, line) == []
+
+
+async def test_an_interrupted_cancel_hands_the_credit_back_as_failed(db, fake_stripe, monkeypatch):
+    import asyncio
+
+    from services import gmv_invoice_credits as svc
+
+    credit, line, _, _ = await _pending_credit(db)
+    await svc.approve(credit["id"], by="ops", expected_amount_cents=250)
+    fake_stripe.fail_create = RuntimeError("api_error")
+    assert (await svc.issue(credit["id"], by="ops")).status == "failed"
+
+    async def _interrupted(*a, **k):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(svc, "_existing_note", _interrupted)
+    with pytest.raises(asyncio.CancelledError):
+        await svc.cancel(credit["id"], by="ops", reason="give up")
+    (row,) = await _credits(db, line)
+    assert row["status"] == "failed"  # not stuck in issuing
+
+
+async def test_a_stale_issuing_credit_can_be_cancelled_after_checking_stripe(db, fake_stripe):
+    """An issue interrupted mid-way, or a line voided under an issuing credit: cancel is the way out,
+    not issue(), which would send the note the admin is cancelling."""
+    from services.gmv_invoice_credits import approve, cancel
+
+    credit, line, _, run_id = await _pending_credit(db)
+    await approve(credit["id"], by="ops", expected_amount_cents=250)
+    await db.execute("UPDATE gmv_invoice_credits SET status = 'issuing', issue_attempts = 1, "
+                     "updated_at = NOW() - INTERVAL '1 hour' WHERE id = :i", {"i": credit["id"]})
+    await _void_line_and_bill_dispute(db, line, run_id)
+
+    assert await cancel(credit["id"], by="ops", reason="line voided under it") == "cancelled"
+    assert [c["status"] for c in await _credits(db, line)] == ["cancelled"]
+    assert fake_stripe.created == []
+
+
+async def test_a_fresh_issuing_credit_cannot_be_cancelled_under_a_running_issue(db, fake_stripe):
+    from services.gmv_invoice_credits import approve, cancel
+
+    credit, _, _, _ = await _pending_credit(db)
+    await approve(credit["id"], by="ops", expected_amount_cents=250)
+    await db.execute("UPDATE gmv_invoice_credits SET status = 'issuing', updated_at = NOW() WHERE id = :i",
+                     {"i": credit["id"]})
+    assert await cancel(credit["id"], by="ops", reason="too soon") == "not_cancellable"
+
+
+async def test_the_cancel_route_reaches_a_stale_issuing_credit(db, fake_stripe, admin_client):
+    from services.gmv_invoice_credits import approve
+
+    credit, line, _, _ = await _pending_credit(db)
+    await approve(credit["id"], by="ops", expected_amount_cents=250)
+    await db.execute("UPDATE gmv_invoice_credits SET status = 'issuing', updated_at = NOW() - INTERVAL '1 hour' "
+                     "WHERE id = :i", {"i": credit["id"]})
+    r = await admin_client.post(f"/admin/billing/invoice-credits/{credit['id']}/cancel", json={"reason": "stuck"})
+    assert r.status_code == 200 and r.json()["status"] == "cancelled"

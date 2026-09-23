@@ -157,8 +157,11 @@ async def retry_issue(credit_id: int, admin: Dict[str, Any] = Depends(require_ad
 @router.post("/{credit_id}/cancel", response_model=None)
 async def cancel_credit(credit_id: int, body: CancelBody, admin: Dict[str, Any] = Depends(require_admin)):
     credit = await _credit_or_404(credit_id)
-    if credit.get("status") not in credits.OPEN_STATUSES:
-        return _not_in_state(credit, "cancel", credits.OPEN_STATUSES)
+    # `issuing` too: a STALE one (an interrupted issue or cancel) is cancellable after a Stripe check;
+    # the service refuses a fresh one, which an issue is still working on.
+    cancellable = credits.OPEN_STATUSES + ("issuing",)
+    if credit.get("status") not in cancellable:
+        return _not_in_state(credit, "cancel", cancellable)
     try:
         outcome = await credits.cancel(credit_id, by=_actor(admin), reason=body.reason)
     except credits.CreditActionRefused as exc:
@@ -175,7 +178,7 @@ async def cancel_credit(credit_id: int, body: CancelBody, admin: Dict[str, Any] 
             "credit_id": credit_id, "status": "issued",
             "stripe_credit_note_id": current.get("stripe_credit_note_id")})
     if outcome != "cancelled":
-        return _not_in_state(await _credit_or_404(credit_id), "cancel", credits.OPEN_STATUSES)
+        return _not_in_state(await _credit_or_404(credit_id), "cancel", cancellable)
     return {"credit_id": credit_id, "status": "cancelled"}
 
 
