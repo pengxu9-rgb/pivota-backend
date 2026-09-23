@@ -804,6 +804,33 @@ async def reap_cart_link_seller_ref(click_id: str, converting_shop_domain: str) 
     return seller_ref
 
 
+_AGENT_ID_MAX = 64  # commerce_attribution_edges.agent_id is String(64)
+
+
+def _trusted_agent_id(provenance: Optional[Mapping[str, Any]]) -> Optional[str]:
+    """The originating agent from an internal partner-provenance mapping, or None.
+
+    A value that is not a non-blank string, or does not fit the column, is dropped rather than
+    truncated: a truncated id would credit an order to an agent that does not exist.
+    """
+    if not provenance:
+        return None
+    raw = provenance.get("agent_id")
+    if not isinstance(raw, str):
+        return None
+    value = raw.strip()
+    if not value or len(value) > _AGENT_ID_MAX:
+        return None
+    return value
+
+
+def _pick_click_agent(click_row: Optional[Mapping[str, Any]]) -> Optional[str]:
+    value = (click_row or {}).get("agent_id")
+    if value is None:
+        return None
+    return str(value).strip() or None
+
+
 def _ext_edge_keys(merchant_id: str, external_order_id: str) -> tuple[str, str]:
     """Deterministic (edge_id, synthetic order_id) for an external conversion.
 
@@ -1022,6 +1049,36 @@ async def close_external_order_conversion(
             provenance["partner_reported"] = True
         if provenance:
             metadata["partner_provenance"] = provenance
+    # WHO ORIGINATED THE ORDER. On a partner-reported close (Reap) the purchase row names the agent
+    # whose AUTHENTICATED call opened it, and that is the agent the order is credited to. The click
+    # row is not enough: the variant lane mints a click id without writing a click row, so a
+    # click-only reading leaves every such order with no agent at all. Only this internal argument
+    # can supply it -- never a note attribute or a request body.
+    partner_agent_id = _trusted_agent_id(trusted_partner_provenance)
+    raw_partner_agent = (trusted_partner_provenance or {}).get("agent_id")
+    if partner_agent_id is None and raw_partner_agent not in (None, ""):
+        # A partner named an agent we could not store. Losing an agent's credit silently is the
+        # failure this field exists to prevent, so leave the evidence (the reason, never the
+        # value) and say so.
+        reason = (
+            "too_long" if isinstance(raw_partner_agent, str) and len(raw_partner_agent.strip()) > _AGENT_ID_MAX
+            else "blank" if isinstance(raw_partner_agent, str)
+            else "not_a_string"
+        )
+        metadata["partner_agent_rejected"] = reason
+        logger.warning(
+            "commerce_attribution: partner agent_id rejected (%s) for external_order_id=%s",
+            reason,
+            external_order_id,
+        )
+    click_agent_id = _pick_click_agent(click_row)
+    edge_agent_id = partner_agent_id or click_agent_id
+    if edge_agent_id:
+        metadata["agent_source"] = "partner_purchase" if partner_agent_id else "click"
+    if partner_agent_id and click_agent_id and click_agent_id != partner_agent_id:
+        # Should not happen (both are written from the same authenticated caller); keep the
+        # evidence rather than silently picking one.
+        metadata["click_agent_id"] = click_agent_id
     # ADR-009 D3: record the seller subject (or the honest legacy gap).
     if click_seller_ref:
         metadata["seller_ref"] = click_seller_ref
@@ -1123,7 +1180,7 @@ async def close_external_order_conversion(
         "source_channel": _pick("source_channel"),
         "source_family": _pick("source_family"),
         "query_source": _pick("query_source"),
-        "agent_id": _pick("agent_id"),
+        "agent_id": edge_agent_id,
         "protocol_name": _pick("protocol_name"),
         "llm_provider": _pick("llm_provider"),
         "llm_model": _pick("llm_model"),
