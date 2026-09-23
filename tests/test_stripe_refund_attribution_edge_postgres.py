@@ -449,40 +449,25 @@ async def test_two_partial_refunds_reported_only_by_charge_refunded_count_their_
     assert edge["refund_amount_cents"] == 50000, _describe(edge, ledger_emits)
 
 
-# The ORDER-level total for this sequence is wrong today, on Postgres only.
-# `_resolve_stripe_order_for_refund` reads orders.metadata (a json column) through
-# a raw SELECT, which returns a STRING, so `_stripe_refund_level_cumulative` and
-# `finalize_refund_success` see {} and never sum the earlier refund. The same
-# string also makes the finalizer overwrite every other order metadata key.
-# Pinned rather than marked xfail, because postgres-dialect-gate counts an xfail
-# as a skip and refuses to go green on one.
-_KNOWN_ORDER_TOTAL_FOR_REFUND_UPDATED_ONLY = Decimal("300")
-
-
 @pytest.mark.asyncio
 async def test_two_partial_refunds_reported_only_by_refund_updated_follow_the_order_total(
     monkeypatch: pytest.MonkeyPatch, ledger_emits: List[Dict[str, Any]]
 ) -> None:
     """No charge.refunded at all: each refund.updated carries ONE refund's amount.
 
-    The edge must equal the order's reconciled total, whatever that is. The correct
-    total is 500. Today the order lands at 300 (see the constant above). When
-    that is fixed, the pin below fails: change the constant to 500 and the
-    expected edge follows. At 500 this test also catches the route passing the
-    event's amount instead of the reconciled total, which would leave the edge
-    at max(300, 200) = 300.
+    The ORDER total must sum them to 500. It landed at 300 on Postgres until
+    `_resolve_stripe_order_for_refund` decoded orders.metadata (a json column,
+    returned as a STRING by its raw SELECT), because `_stripe_refund_level_cumulative`
+    saw {} and never summed the earlier refund; see
+    tests/test_stripe_refund_order_metadata_postgres.py. The edge must then equal
+    that total, not the event's amount, which would leave it at max(300, 200) = 300.
     """
     await _send(monkeypatch, "refund.updated", _refund("re_first", 30000, "succeeded"))
     await _send(monkeypatch, "refund.updated", _refund("re_second", 20000, "succeeded"))
 
-    order_total = await _order_total_refunded()
-    assert order_total == _KNOWN_ORDER_TOTAL_FOR_REFUND_UPDATED_ONLY, (
-        f"orders.total_refunded is now {order_total}. If it is 500, the order-level "
-        "metadata-as-string bug is fixed: set _KNOWN_ORDER_TOTAL_FOR_REFUND_UPDATED_ONLY "
-        "to 500."
-    )
+    assert await _order_total_refunded() == Decimal("500")
     edge = await _edge()
-    assert edge["refund_amount_cents"] == int(order_total * 100), _describe(edge, ledger_emits)
+    assert edge["refund_amount_cents"] == 50000, _describe(edge, ledger_emits)
 
 
 # -- 3. merchant-initiated refund, then Stripe's webhooks for it -------------

@@ -20,7 +20,14 @@ import socket
 from datetime import datetime
 from decimal import Decimal
 
-from db.orders import get_order, update_order, update_order_status, mark_order_paid, mark_order_shipped
+from db.orders import (
+    _coerce_metadata_obj,
+    get_order,
+    mark_order_paid,
+    mark_order_shipped,
+    update_order,
+    update_order_status,
+)
 from db.merchant_onboarding import get_merchant_onboarding
 from utils.auth import get_current_employee
 from db.products import log_order_event
@@ -326,7 +333,7 @@ async def _resolve_stripe_order_for_refund(
 
     def _scoped(order: Optional[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
         return _scope_stripe_order_to_psp_owner(
-            order,
+            _with_decoded_metadata(order),
             psp_owner_merchant_id=psp_owner,
             psp_id=psp_id,
             payment_intent_id=payment_intent_id,
@@ -345,6 +352,22 @@ async def _resolve_stripe_order_for_refund(
         if order_hint:
             return _scoped(_db_row_to_dict(await get_order(order_hint)))
     return None, None
+
+
+def _with_decoded_metadata(order: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The order with `metadata` as a dict, decoded ONCE for every refund consumer.
+
+    On Postgres `orders.metadata` (a json column) reaches this resolver as its JSON TEXT from
+    the raw `SELECT *`, which has no type to decode it. (`get_order` already hands back a
+    decoded dict; decoding here too keeps the two lookups from diverging.) Every consumer
+    downstream (`finalize_refund_success`, `_stripe_refund_level_cumulative`,
+    `merge_refund_metadata`, the failure rollback) treats a non-dict as `{}`, so each refund
+    event rebuilt `psp_refund_refs` / `psp_refund_records` from nothing and the `update_order`
+    full-replace paths wrote that back over every other key.
+    """
+    if not isinstance(order, dict) or "metadata" not in order:
+        return order
+    return {**order, "metadata": _coerce_metadata_obj(order.get("metadata"))}
 
 
 async def _persist_stripe_refund_observability(
