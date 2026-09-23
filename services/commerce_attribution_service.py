@@ -1055,6 +1055,22 @@ async def close_external_order_conversion(
     # click-only reading leaves every such order with no agent at all. Only this internal argument
     # can supply it -- never a note attribute or a request body.
     partner_agent_id = _trusted_agent_id(trusted_partner_provenance)
+    raw_partner_agent = (trusted_partner_provenance or {}).get("agent_id")
+    if partner_agent_id is None and raw_partner_agent not in (None, ""):
+        # A partner named an agent we could not store. Losing an agent's credit silently is the
+        # failure this field exists to prevent, so leave the evidence (the reason, never the
+        # value) and say so.
+        reason = (
+            "too_long" if isinstance(raw_partner_agent, str) and len(raw_partner_agent.strip()) > _AGENT_ID_MAX
+            else "blank" if isinstance(raw_partner_agent, str)
+            else "not_a_string"
+        )
+        metadata["partner_agent_rejected"] = reason
+        logger.warning(
+            "commerce_attribution: partner agent_id rejected (%s) for external_order_id=%s",
+            reason,
+            external_order_id,
+        )
     click_agent_id = _pick_click_agent(click_row)
     edge_agent_id = partner_agent_id or click_agent_id
     if edge_agent_id:

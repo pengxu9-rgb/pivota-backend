@@ -498,6 +498,21 @@ async def test_an_unusable_partner_agent_is_dropped_not_truncated(monkeypatch, b
     stored = await _partner_close(fake, {"partner_reported": True, "agent_id": bad})
     # Falls back to the click's agent; an overlong id is never cut down to a different agent.
     assert stored["agent_id"] == "agent_x"
+    meta = json.loads(stored["metadata"])
+    if bad is None or bad == "":
+        # Nothing was supplied, so nothing was lost.
+        assert "partner_agent_rejected" not in meta
+    else:
+        # The loss is recorded, by reason and never by value.
+        if not isinstance(bad, str):
+            expected = "not_a_string"
+        elif bad.strip():
+            expected = "too_long"
+        else:
+            expected = "blank"
+        assert meta["partner_agent_rejected"] == expected
+        if isinstance(bad, str) and bad.strip():
+            assert bad not in json.dumps(meta)
 
 
 @pytest.mark.asyncio
