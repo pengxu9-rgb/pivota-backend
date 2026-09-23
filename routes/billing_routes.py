@@ -793,6 +793,47 @@ async def _handle_checkout_session_completed(event: Dict[str, Any], db: Database
         if not plan:
             raise ValueError("No active subscription plan found for checkout session")
 
+        # Stripe does not order events, so this can arrive after the
+        # subscription it fulfils was deleted: before any local row existed (the
+        # deletion then had nothing to cancel), or as a retry of a delivery that
+        # already fulfilled it. Fulfilling it would activate a subscription
+        # Stripe canceled, grant its credits, and cancel the merchant's other
+        # live plans in Stripe as superseded. Record it as canceled and stop.
+        if await _stripe_subscription_already_ended(db, stripe_subscription_id):
+            await db.execute(
+                """
+                INSERT INTO user_subscriptions (
+                  merchant_id,
+                  plan_id,
+                  stripe_subscription_id,
+                  status,
+                  started_at,
+                  canceled_at
+                )
+                VALUES (
+                  :merchant_id,
+                  :plan_id,
+                  :stripe_subscription_id,
+                  'canceled',
+                  NOW(),
+                  NOW()
+                )
+                ON CONFLICT (stripe_subscription_id) DO NOTHING
+                """,
+                {
+                    "merchant_id": merchant_id,
+                    "plan_id": plan["id"],
+                    "stripe_subscription_id": stripe_subscription_id,
+                },
+            )
+            logger.warning(
+                "Not fulfilling checkout.session.completed for subscription %s: "
+                "it was deleted before the checkout was processed",
+                stripe_subscription_id,
+            )
+            await _mark_event_processed(event_id, db)
+            return
+
         merchant_contact_email = await _lookup_merchant_contact_email(db, merchant_id)
         async with db.transaction():
             subscription_row = await db.fetch_one(
@@ -1737,6 +1778,45 @@ async def _reconcile_after_subscription_ended(
                 merchant_id,
                 exc_info=True,
             )
+
+
+async def _stripe_subscription_already_ended(
+    db: Database, stripe_subscription_id: str
+) -> bool:
+    """Whether this subscription is known to be canceled in Stripe.
+
+    Either its local row is canceled, or its customer.subscription.deleted
+    arrived before any local row existed. The deleted handler has nothing to
+    update then, so the signed event in stripe_events is the only record.
+    """
+    row = await db.fetch_one(
+        """
+        SELECT status
+        FROM user_subscriptions
+        WHERE stripe_subscription_id = :stripe_subscription_id
+        LIMIT 1
+        """,
+        {"stripe_subscription_id": stripe_subscription_id},
+    )
+    if row:
+        return _as_text(row["status"]) == "canceled"
+
+    payload_subscription_id = (
+        "payload_jsonb -> 'data' -> 'object' ->> 'id'"
+        if IS_POSTGRES
+        else "json_extract(payload_jsonb, '$.data.object.id')"
+    )
+    deleted = await db.fetch_one(
+        f"""
+        SELECT 1
+        FROM stripe_events
+        WHERE event_type = 'customer.subscription.deleted'
+          AND {payload_subscription_id} = :stripe_subscription_id
+        LIMIT 1
+        """,
+        {"stripe_subscription_id": stripe_subscription_id},
+    )
+    return deleted is not None
 
 
 async def _cancel_prior_active_subscriptions(

@@ -6,6 +6,10 @@ delivered after customer.subscription.deleted. Applied blindly it puts the local
 status, and nothing later sets it back to canceled: the credit wallet (apply_subscription_allowance,
 run on every balance read) and the tier reconcile both count an 'active' row as a paid plan.
 
+checkout.session.completed can be late the same way: after the subscription it fulfils was deleted.
+Fulfilling it then activates a subscription Stripe already canceled, and cancels the merchant's other
+live plan in Stripe as "superseded".
+
 Events go through the signed /webhooks/stripe/billing route, so the stripe_events claim and the
 dispatcher run too.
 
@@ -32,13 +36,16 @@ pytestmark = pytest.mark.skipif(not _IS_PG, reason="needs a Postgres DATABASE_UR
 
 _SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")
 _TABLES = ("merchant_credit_adjustments", "merchant_credit_balance", "merchants", "user_subscriptions",
-           "subscription_plans", "merchant_onboarding", "stripe_events")
+           "subscription_plans", "merchant_onboarding", "stripe_events", "credit_ledger", "credit_reservations",
+           "merchant_credits")
 _MIG = Path(__file__).resolve().parent.parent / "db/migrations"
 _MIGRATIONS = ("100_stripe_events.sql", "101_subscription_plans.sql", "102_user_subscriptions.sql",
                "103_extend_merchants_monetization.sql", "124_subscription_plans_test_live_modes.sql",
                "089_create_merchant_credit_balance.sql",
                "091_reconcile_merchant_credit_balance_single_credit.sql",
-               "141_track_direct_merchant_purchased_credits.sql", "142_direct_merchant_overage_state.sql")
+               "141_track_direct_merchant_purchased_credits.sql", "142_direct_merchant_overage_state.sql",
+               "104_merchant_credits.sql", "105_credit_reservations.sql", "106_credit_ledger.sql",
+               "117_metering_service_columns.sql")
 
 WEBHOOK_SECRET = "whsec_subscription_event_order_test"
 CUSTOMER = "cus_sub_event_order"
@@ -115,6 +122,30 @@ async def db(monkeypatch):
 
 
 @pytest.fixture
+def stripe_calls(monkeypatch):
+    """Checkout fulfilment calls Stripe: it retrieves the new subscription for its period, and cancels
+    the merchant's other live subscriptions as superseded. Record both instead."""
+    from types import SimpleNamespace
+
+    from routes import billing_routes
+
+    calls = []
+
+    def retrieve(sid):
+        calls.append(("retrieve", sid))
+        return {"id": sid, "items": {"data": [{"current_period_start": int(PERIOD[0].timestamp()),
+                                                "current_period_end": int(PERIOD[1].timestamp())}]}}
+
+    def cancel(sid):
+        calls.append(("cancel", sid))
+        return {"id": sid, "status": "canceled"}
+
+    subscriptions = SimpleNamespace(retrieve=retrieve, cancel=cancel)
+    monkeypatch.setattr(billing_routes, "stripe_client", SimpleNamespace(v1=SimpleNamespace(subscriptions=subscriptions)))
+    return calls
+
+
+@pytest.fixture
 async def client():
     import httpx
     from fastapi import FastAPI
@@ -149,12 +180,29 @@ def _subscription_event(event_id, event_type, *, status, plan="starter", sid=SUB
     }
 
 
+def _checkout_completed(event_id, *, sid=SUB, plan="starter"):
+    return {
+        "id": event_id,
+        "object": "event",
+        "type": "checkout.session.completed",
+        "created": int(time.time()),
+        "data": {"object": {
+            "id": f"cs_{event_id}",
+            "object": "checkout.session",
+            "mode": "subscription",
+            "subscription": sid,
+            "customer": CUSTOMER,
+            "metadata": {"merchant_id": MERCHANT, "price_id": PRICES[plan]},
+        }},
+    }
+
+
 def _deleted(event_id, sid=SUB, plan="starter"):
     return _subscription_event(event_id, "customer.subscription.deleted", status="canceled", plan=plan, sid=sid,
                                canceled_at=NOW)
 
 
-async def _deliver(client, event):
+async def _deliver(client, event, *, expect="processed"):
     payload = json.dumps(event)
     ts = int(time.time())
     sig = hmac.new(WEBHOOK_SECRET.encode(), f"{ts}.{payload}".encode(), hashlib.sha256).hexdigest()
@@ -164,7 +212,7 @@ async def _deliver(client, event):
     from db.database import database
 
     row = await database.fetch_one("SELECT status, error FROM stripe_events WHERE event_id = :e", {"e": event["id"]})
-    assert row["status"] == "processed", row["error"]
+    assert row["status"] == expect, row["error"]
 
 
 async def _plan_id(db, plan):
@@ -172,7 +220,8 @@ async def _plan_id(db, plan):
 
 
 async def _subscribed_merchant(db, subs=((SUB, "starter"),)):
-    """The state checkout fulfillment leaves: live subscription rows, a paid tier, a funded wallet."""
+    """The state checkout fulfillment leaves: live subscription rows, a paid tier, a funded wallet.
+    With subs=() it is a merchant on free that has not subscribed yet."""
     from services.merchant_credit_balance_service import apply_subscription_allowance
 
     for level, plan in enumerate(("starter", "growth"), start=1):
@@ -187,7 +236,7 @@ async def _subscribed_merchant(db, subs=((SUB, "starter"),)):
             "INSERT INTO user_subscriptions (merchant_id, plan_id, stripe_subscription_id, status, started_at, "
             "current_period_start, current_period_end) VALUES (:m, :p, :s, 'active', :ps, :ps, :pe)",
             {"m": MERCHANT, "p": await _plan_id(db, plan), "s": sid, "ps": PERIOD[0], "pe": PERIOD[1]})
-    richest = max((plan for _, plan in subs), key=ALLOWANCE.__getitem__)
+    richest = max((plan for _, plan in subs), key=ALLOWANCE.__getitem__, default="free")
     local_id = await db.fetch_val("SELECT id FROM user_subscriptions ORDER BY id LIMIT 1")
     await db.execute(
         "INSERT INTO merchants (business_name, legal_name, platform, contact_email, current_tier, subscription_id, "
@@ -196,7 +245,7 @@ async def _subscribed_merchant(db, subs=((SUB, "starter"),)):
     await db.execute("INSERT INTO merchant_credit_balance (merchant_id, credits, purchased_credits) "
                      "VALUES (:m, :c, :c)", {"m": MERCHANT, "c": PURCHASED})
     wallet = await apply_subscription_allowance(MERCHANT)
-    assert (wallet["credits"], wallet["plan_tier"]) == (PURCHASED + ALLOWANCE[richest], richest)
+    assert (wallet["credits"], wallet["plan_tier"]) == (PURCHASED + ALLOWANCE.get(richest, 0), richest)
 
 
 async def _subscription(db, sid=SUB):
@@ -222,6 +271,19 @@ async def _invoiced_customer(db):
 
     row = await db.fetch_one(_MERCHANT_STRIPE_CUSTOMER_QUERY, {"merchant_id": MERCHANT})
     return row["stripe_customer_id"] if row else None
+
+
+async def _fulfilment(db):
+    """What checkout fulfilment writes besides the subscription row and the tier."""
+    return {
+        "ledger_grants": await db.fetch_val(
+            "SELECT COUNT(*) FROM credit_ledger WHERE merchant_id = :m AND operation_type = 'subscription_initial_grant'",
+            {"m": MERCHANT}),
+        "merchant_credits": await db.fetch_val("SELECT balance FROM merchant_credits WHERE merchant_id = :m",
+                                               {"m": MERCHANT}),
+        "promo_period_until": await db.fetch_val("SELECT promo_period_until FROM merchants WHERE contact_email = :e",
+                                                 {"e": EMAIL}),
+    }
 
 
 async def _wallet_on_next_read():
@@ -361,3 +423,99 @@ async def test_a_subscription_updated_to_canceled_still_ends_a_live_subscription
     assert await _subscription(db) == {"status": "canceled", "canceled_at": NOW, "plan": "starter"}
     assert await _merchant(db) == {"current_tier": "free", "subscription_id": None}
     assert await _wallet_on_next_read() == (PURCHASED, "free")
+
+
+async def test_a_checkout_completed_after_its_subscription_was_deleted_does_not_activate_it(db, client, stripe_calls):
+    """The deletion arrives while there is no local row, so it has nothing to cancel. The checkout that
+    lands afterwards must not create a live one."""
+    await _subscribed_merchant(db, subs=())
+    await _deliver(client, _deleted("evt_deleted"))
+
+    await _deliver(client, _checkout_completed("evt_checkout_late"))
+
+    subscription = await _subscription(db)
+    assert (subscription["status"], subscription["plan"]) == ("canceled", "starter")
+    assert subscription["canceled_at"] is not None
+    assert await _merchant(db) == {"current_tier": "free", "subscription_id": None}
+    assert await _fulfilment(db) == {"ledger_grants": 0, "merchant_credits": None, "promo_period_until": None}
+    assert await _wallet_on_next_read() == (PURCHASED, "free")
+    assert stripe_calls == []
+
+
+async def test_a_late_checkout_does_not_cancel_the_plan_the_merchant_still_holds(db, client, stripe_calls):
+    """Fulfilment cancels every other live subscription as superseded. For a subscription that is already
+    gone that would end the merchant's real plan in Stripe."""
+    await _subscribed_merchant(db, subs=((SUB_OTHER, "starter"),))
+    await _deliver(client, _deleted("evt_deleted", sid=SUB, plan="growth"))
+
+    await _deliver(client, _checkout_completed("evt_checkout_late", sid=SUB, plan="growth"))
+
+    assert stripe_calls == []
+    assert (await _subscription(db, SUB_OTHER))["status"] == "active"
+    assert (await _subscription(db, SUB))["status"] == "canceled"
+    assert await _merchant(db) == {"current_tier": "starter", "subscription_id": await _local_id(db, SUB_OTHER)}
+    assert await _wallet_on_next_read() == (PURCHASED + ALLOWANCE["starter"], "starter")
+
+
+async def test_a_checkout_retried_after_the_subscription_was_deleted_does_not_fulfil_it_again(
+        db, client, stripe_calls):
+    """The first delivery committed its fulfilment but failed before it was marked processed, so Stripe
+    retries it; the subscription is deleted in between. The retry reaches a canceled row."""
+    await _subscribed_merchant(db, subs=())
+    await _deliver(client, _checkout_completed("evt_checkout"))
+    await _deliver(client, _deleted("evt_deleted"))
+    after_delete = await _fulfilment(db)
+    await db.execute("UPDATE stripe_events SET status = 'failed' WHERE event_id = 'evt_checkout'")
+    stripe_calls.clear()
+
+    await _deliver(client, _checkout_completed("evt_checkout"))
+
+    assert (await _subscription(db))["status"] == "canceled"
+    assert await _merchant(db) == {"current_tier": "free", "subscription_id": None}
+    assert await _fulfilment(db) == after_delete
+    assert after_delete["ledger_grants"] == 1
+    assert await _wallet_on_next_read() == (PURCHASED, "free")
+    assert stripe_calls == []
+
+
+async def test_a_checkout_in_order_activates_the_subscription(db, client, stripe_calls):
+    await _subscribed_merchant(db, subs=())
+
+    await _deliver(client, _checkout_completed("evt_checkout"))
+
+    assert await _subscription(db) == {"status": "active", "canceled_at": None, "plan": "starter"}
+    assert await _merchant(db) == {"current_tier": "starter", "subscription_id": await _local_id(db)}
+    fulfilment = await _fulfilment(db)
+    assert (fulfilment["ledger_grants"], fulfilment["merchant_credits"]) == (1, ALLOWANCE["starter"])
+    assert fulfilment["promo_period_until"] is not None
+    assert await _wallet_on_next_read() == (PURCHASED + ALLOWANCE["starter"], "starter")
+    assert stripe_calls == [("retrieve", SUB)]
+
+
+async def test_resubscribing_after_a_cancellation_activates_the_new_subscription(db, client, stripe_calls):
+    """Only the deletion of THIS subscription blocks its checkout: a merchant that canceled one plan and
+    bought another gets the new one."""
+    await _subscribed_merchant(db, subs=((SUB_OTHER, "starter"),))
+    await _deliver(client, _deleted("evt_deleted_old", sid=SUB_OTHER))
+
+    await _deliver(client, _checkout_completed("evt_checkout_new", sid=SUB, plan="growth"))
+
+    assert (await _subscription(db, SUB))["status"] == "active"
+    assert await _merchant(db) == {"current_tier": "growth", "subscription_id": await _local_id(db, SUB)}
+    assert await _wallet_on_next_read() == (PURCHASED + ALLOWANCE["growth"], "growth")
+    assert stripe_calls == [("retrieve", SUB)]
+
+
+async def test_the_subscription_events_around_a_checkout_do_not_block_it(db, client, stripe_calls):
+    """Stripe sends customer.subscription.created and .updated around every checkout, often first. They
+    are about the same subscription, and only its deletion may stop the fulfilment."""
+    await _subscribed_merchant(db, subs=())
+    await _deliver(client, _subscription_event("evt_created", "customer.subscription.created", status="active"),
+                   expect="ignored")
+    await _deliver(client, _subscription_event("evt_updated_first", "customer.subscription.updated",
+                                               status="active"))
+
+    await _deliver(client, _checkout_completed("evt_checkout"))
+
+    assert (await _subscription(db))["status"] == "active"
+    assert await _merchant(db) == {"current_tier": "starter", "subscription_id": await _local_id(db)}
