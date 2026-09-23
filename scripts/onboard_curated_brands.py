@@ -205,6 +205,53 @@ def _select_by_gtin(records: List[Dict[str, Any]], canonical: set, *, domain: st
 #: Printed once per record a category filter left out of the run. Greppable, like SKIPPED_PDP_PREFIX.
 LEFT_OUT_PDP_PREFIX = "    left out pdp "
 
+
+def _record_url(record: Dict[str, Any]) -> Optional[str]:
+    """The storefront product URL. A curated record carries it on its offers, not its pdp."""
+    pdp = record.get("pdp") if isinstance(record.get("pdp"), dict) else {}
+    for value in [pdp.get("canonical_url"), pdp.get("source_url"),
+                  *[(o or {}).get("canonical_url") for o in record.get("offers") or [] if isinstance(o, dict)]]:
+        if value:
+            return str(value)
+    return None
+
+
+def _record_handle(record: Dict[str, Any]) -> Optional[str]:
+    url = _record_url(record) or ""
+    marker = "/products/"
+    if marker not in url:
+        return None
+    return url.split(marker, 1)[1].split("?", 1)[0].split("#", 1)[0].strip("/").casefold() or None
+
+
+#: Printed once per record --exclude-handle removed. Greppable.
+EXCLUDED_PDP_PREFIX = "    excluded pdp "
+
+
+def _exclude_by_handle(records: List[Dict[str, Any]], handles: set, *, domain: str) -> tuple:
+    """Drop the records whose storefront handle is in `handles`; return (kept, handles that matched).
+
+    For a product the MERCHANT mislabels: measured 2026-09-23, k-touch.us types "3CE - TONE UP TINT
+    40ml" as `LIP TINT` while its own description calls it a tone-up cream for the complexion, and
+    it carries no GTIN, so no other flag can leave it out of a lip pass. Which requested handles went
+    unmatched is decided by the caller, across every domain in the run, like --only-gtin.
+    """
+    kept, matched = [], set()
+    for record in records:
+        handle = _record_handle(record)
+        if handle and handle in handles:
+            matched.add(handle)
+            pdp = record.get("pdp") if isinstance(record.get("pdp"), dict) else {}
+            print(EXCLUDED_PDP_PREFIX + json.dumps({
+                "handle": handle, "product_name": pdp.get("product_name") or pdp.get("title"),
+                "category_path": pdp.get("category_path"), "canonical_url": _record_url(record),
+            }, sort_keys=True, ensure_ascii=False))
+        else:
+            kept.append(record)
+    if matched:
+        print(f"    exclude-handle {sorted(matched)}: {len(records)} -> {len(kept)} products")
+    return kept, matched
+
 #: Printed once per record `--lip-title-evidence` placed, so an operator reads exactly those rows
 #: before --apply: no word list can name every non-product ("Lipstick Poster"). Greppable.
 LIP_TITLE_PDP_PREFIX = "    lip title pdp "
@@ -220,6 +267,7 @@ def _print_lip_title_rows(records: List[Dict[str, Any]]) -> int:
             "product_name": pdp.get("product_name") or pdp.get("title"),
             "category_path": pdp.get("category_path"),
             "merchant_product_type": pdp.get("category_source_product_type"),
+            "canonical_url": _record_url(record),
         }, sort_keys=True, ensure_ascii=False))
     return len(placed)
 
@@ -265,7 +313,7 @@ def _select_by_category(records: List[Dict[str, Any]], *, prefix: Optional[str],
             "product_name": pdp.get("product_name") or pdp.get("title"),
             "category_path": pdp.get("category_path"),
             "merchant_product_type": pdp.get("category_source_product_type"),
-            "canonical_url": pdp.get("canonical_url") or pdp.get("source_url"),
+            "canonical_url": _record_url(record),
         }, sort_keys=True, ensure_ascii=False))
     print(f"    category filter {want or '(resolved)'}: {len(records)} -> {len(kept)} products "
           f"({len(left_out)} left out)")
@@ -506,6 +554,10 @@ async def _run(args: argparse.Namespace) -> int:
     # Validated BEFORE the first fetch: a typo'd GTIN should cost nothing and stop everything.
     wanted_gtins = _canonical_gtins(args.only_gtin) if args.only_gtin else set()
     matched_gtins: set = set()
+    if any(not h.strip().strip("/") for h in args.exclude_handle):
+        raise ValueError("--exclude-handle needs a non-empty storefront handle each time")
+    excluded_handles = {h.strip().strip("/").casefold() for h in args.exclude_handle}
+    matched_handles: set = set()
     if not brands:
         print("no brands to onboard (need --domain or --file rows with domain+category)", file=sys.stderr)
         return 2
@@ -549,6 +601,9 @@ async def _run(args: argparse.Namespace) -> int:
             matched_gtins |= matched
             print(f"    gtin filter {sorted(wanted_gtins)}: {before} -> {len(recs)} products "
                   f"(matched {sorted(matched)})")
+        if excluded_handles:
+            recs, gone = _exclude_by_handle(recs, excluded_handles, domain=b["domain"])
+            matched_handles |= gone
         if args.lip_title_evidence:
             print(f"    lip title evidence placed {_print_lip_title_rows(recs)} product(s) -- review each before --apply")
         if args.only_category or args.only_resolved_category:
@@ -586,6 +641,10 @@ async def _run(args: argparse.Namespace) -> int:
     if wanted_gtins - matched_gtins:
         raise ValueError(f"--only-gtin values matched no product in this run: "
                          f"{sorted(wanted_gtins - matched_gtins)}")
+    # A handle that excluded nothing is a typo in a command line that decides what gets written.
+    if excluded_handles - matched_handles:
+        raise ValueError(f"--exclude-handle values matched no product in this run: "
+                         f"{sorted(excluded_handles - matched_handles)}")
     plan = ingest_validated_jsonl(all_records)
     print(
         f"plan: pdps={len(plan.get('pdps') or [])} skus={len(plan.get('skus') or [])} "
@@ -712,6 +771,17 @@ def main(argv: Optional[List[str]] = None) -> int:
             "Every requested GTIN must be valid and must match somewhere in the run, and a host "
             "matching none of them is an error, not an empty run. It narrows the PLAN only: the "
             "crawl still reads the whole feed and GTIN recovery still spends its budget first."
+        ),
+    )
+    p.add_argument(
+        "--exclude-handle",
+        action="append",
+        default=[],
+        metavar="HANDLE",
+        help=(
+            "leave out the product with this storefront handle (the /products/<handle> part; "
+            "repeatable) -- for a product the merchant mislabels. Each excluded row is printed; a "
+            "handle that matches nothing anywhere in the run is an error"
         ),
     )
     p.add_argument(
