@@ -12,7 +12,7 @@ from databases import Database
 from db.orders import get_order, update_order
 from db.database import database as db
 from adapters.psp_adapter import get_psp_adapter
-from services.commerce_attribution_service import attach_refund_to_attribution_edge
+from services.commerce_attribution_service import apply_refund_total_to_attribution_edge
 from services.merchant_psp_config_service import (
     build_runtime_adapter_kwargs,
     fetch_active_runtime_merchant_psp,
@@ -116,10 +116,14 @@ class RefundService:
                         amount=amount
                     )
                     try:
-                        await attach_refund_to_attribution_edge(
+                        # The order's total AFTER this refund, as a ceiling, not
+                        # this refund's amount: Stripe reports the same refund
+                        # again under ch_ and re_ ids, and those webhooks raise
+                        # the edge to the same total instead of adding to it.
+                        await apply_refund_total_to_attribution_edge(
                             order_id=order_id,
                             refund_id=refund_id,
-                            amount=amount,
+                            total_refunded=await self._total_refunded_on_order(order_id),
                         )
                     except Exception as attribution_exc:
                         logger.warning(
@@ -405,6 +409,14 @@ class RefundService:
             "order_id": order_id
         })
     
+    async def _total_refunded_on_order(self, order_id: str) -> Decimal:
+        """orders.total_refunded as it stands now, read inside the caller's transaction."""
+        row = await self.db.fetch_one(
+            "SELECT total_refunded FROM orders WHERE order_id = :order_id",
+            {"order_id": order_id},
+        )
+        return Decimal(str((row["total_refunded"] if row else None) or "0"))
+
     async def _update_refund_failed(self, refund_id: str, error: str):
         """Update refund record after failed PSP refund"""
         query = """

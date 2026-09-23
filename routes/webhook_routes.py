@@ -721,26 +721,26 @@ async def _finalize_stripe_refund_success(
         log_order_event_fn=log_order_event,
     )
     # FIX-05 C5: PSP-initiated refunds must reverse attribution like app-initiated do.
-    if os.getenv("ATTRIBUTION_REVERSE_ON_REFUND", "true").strip().lower() != "false":
+    reconciled_total = finalization.get("total_refunded") if finalization.get("applied") else None
+    if (
+        reconciled_total is not None
+        and os.getenv("ATTRIBUTION_REVERSE_ON_REFUND", "true").strip().lower() != "false"
+    ):
         try:
-            from services.commerce_attribution_service import attach_refund_to_attribution_edge
+            from services.commerce_attribution_service import apply_refund_total_to_attribution_edge
 
-            # MAJOR units. attach_refund_to_attribution_edge does
-            # `amount_cents = amount * 100`, so passing the minor-unit value
-            # recorded a 100x refund — and because
-            # net_attributed_gmv_cents = GREATEST(gross - refund, 0) is a stored
-            # generated column read by monthly_brand_statements_service, that
-            # clamps the edge to zero and drops it from the merchant's invoice.
-            # Never observable before: the statement failed to PREPARE, so this
-            # never ran. See the same conversion at _stripe_minor_unit_factor
-            # use below.
-            await attach_refund_to_attribution_edge(
+            # The ORDER's reconciled total, in MAJOR units, never this event's
+            # amount. Stripe reports one refund as charge.refunded (ch_,
+            # cumulative) AND refund.updated (re_, per refund), and a merchant
+            # refund also arrives under RefundService's REF_ id; adding each
+            # event's amount counted the same money two or three times, which
+            # net_attributed_gmv_cents = GREATEST(gross - refund, 0) then billed.
+            # finalize_refund_success already reconciles those sequences, so the
+            # edge takes its total as a ceiling.
+            await apply_refund_total_to_attribution_edge(
                 order_id=str(order.get("order_id") or ""),
                 refund_id=refund_reference,
-                amount=(
-                    Decimal(str(refund_amount_minor or "0"))
-                    / _stripe_minor_unit_factor(currency or str(order.get("currency") or ""))
-                ),
+                total_refunded=reconciled_total,
             )
         except Exception as edge_exc:
             logger.warning(
@@ -1123,7 +1123,7 @@ def _stripe_event_refund_matches_order(
     correct while `refund_total` was a monotonic ceiling; once refund-level events
     started contributing a SUM, two $400 refunds on a $500 order each passed the
     per-refund check and wrote total_refunded=800 — a number that feeds
-    `attach_refund_to_attribution_edge` and the merchant's statement.
+    `apply_refund_total_to_attribution_edge` and the merchant's statement.
 
     Returns (ok, reason_if_not).
     """
@@ -2212,7 +2212,7 @@ async def handle_stripe_webhook(
             # `data.metadata` — attacker-controlled on a signed event — and hand
             # them to three writers with no tenant predicate anywhere. That is the
             # same cross-tenant hole the refund branches had, against the same
-            # attribution edge (attach_refund_to_attribution_edge's UPDATE is keyed
+            # attribution edge (attach_dispute_to_attribution_edge's UPDATE is keyed
             # on order_id alone), which feeds the victim's monthly statement.
             # Identity now comes from the endpoint owner plus a SCOPED order
             # lookup; metadata is only ever a hint that must survive scoping.
@@ -2321,12 +2321,14 @@ async def handle_stripe_webhook(
                         else None
                     )
                     if order_id and dispute_id and dispute_amount_minor and dispute_amount_minor > 0:
-                        from services.commerce_attribution_service import attach_refund_to_attribution_edge
+                        from services.commerce_attribution_service import attach_dispute_to_attribution_edge
 
-                        # MAJOR units — see the note on the refund path above.
-                        await attach_refund_to_attribution_edge(
+                        # MAJOR units. Additive per dispute id and kept apart
+                        # from the refund ceiling: a chargeback is not in
+                        # orders.total_refunded.
+                        await attach_dispute_to_attribution_edge(
                             order_id=order_id,
-                            refund_id=dispute_id,
+                            dispute_id=dispute_id,
                             amount=(
                                 Decimal(str(dispute_amount_minor or "0"))
                                 / _stripe_minor_unit_factor(
