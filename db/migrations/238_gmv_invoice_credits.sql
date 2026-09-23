@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS gmv_invoice_credits (
   issue_attempts INTEGER NOT NULL DEFAULT 0,
   stripe_credit_note_id TEXT,
   stripe_credit_kind VARCHAR(32),
+  issued_by VARCHAR(255),
   issued_at TIMESTAMPTZ,
   last_error TEXT,
   partner_status VARCHAR(32),

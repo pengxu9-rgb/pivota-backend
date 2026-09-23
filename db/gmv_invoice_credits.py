@@ -69,6 +69,8 @@ gmv_invoice_credits = Table(
     Column("stripe_credit_note_id", Text, nullable=True),
     # How the credit landed at Stripe: 'amount_due' (open invoice) or 'customer_balance' (paid).
     Column("stripe_credit_kind", String(32), nullable=True),
+    # Who sent it to Stripe: the approver, or whoever retried a failed issue later.
+    Column("issued_by", String(255), nullable=True),
     Column("issued_at", DateTime(timezone=True), nullable=True),
     Column("last_error", Text, nullable=True),
     # The channel partner's share of this credit (partner settlement v1). NULL until decided:

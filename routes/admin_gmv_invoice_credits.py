@@ -130,15 +130,15 @@ async def approve_credit(credit_id: int, body: ApproveBody, admin: Dict[str, Any
                 "amount_cents": current.get("amount_cents")})
         # moved out of pending (a recompute superseded it, or another admin) between the reads
         return _not_in_state(current, "approve", ("pending",))
-    result = await credits.issue(credit_id)
+    result = await credits.issue(credit_id, by=_actor(admin))
     return jsonable_encoder({"credit_id": credit_id, "approved_by": _actor(admin), "issue": result.__dict__})
 
 
 @router.post("/{credit_id}/issue", response_model=None)
-async def retry_issue(credit_id: int):
-    """Retry a credit Stripe refused (`failed`), or one left `issuing` by a crash."""
+async def retry_issue(credit_id: int, admin: Dict[str, Any] = Depends(require_admin)):
+    """Retry a credit Stripe refused (`failed`), or one left `issuing` by a crash. Records who."""
     credit = await _credit_or_404(credit_id)
-    result = await credits.issue(credit_id)
+    result = await credits.issue(credit_id, by=_actor(admin))
     if result.status == "not_issuable":
         return _not_in_state(await _credit_or_404(credit_id), "issue", ("approved", "failed", "issuing (stale)"))
     return jsonable_encoder({"credit_id": credit_id, "issue": result.__dict__, "was": credit.get("status")})

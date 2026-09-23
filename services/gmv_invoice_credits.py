@@ -35,9 +35,9 @@ DOWNSTREAM.
 - Channel partner (settlement v1): a settlement that runs after the credit nets it out of the take
   it pays on, and records which credits it netted. A credit issued after its period was settled is
   clawed back from the partner's balance, pro rata to the partner's gmv_take_share_bp, capped at
-  what that settlement paid the partner on the merchant's GMV take. Settlement v2
-  (PARTNER_REV_SHARE_USE_V2) reads frozen brand statements instead; a credit under v2 is marked
-  `v2_unhandled` and logged.
+  what that settlement paid the partner on the merchant's GMV take. A settlement written by v2
+  (partner_rev_share_engine_v2, which reads frozen brand statements) is not clawed: the credit is
+  marked `v2_unhandled` and logged.
 
 Nothing here runs inside a caller's transaction, and nothing here raises into a refund path: the
 refund hook is `compute_credits_for_day_best_effort`.
@@ -186,7 +186,7 @@ RETURNING *
 _MARK_ISSUED_SQL = """
 UPDATE gmv_invoice_credits
 SET status = 'issued', stripe_credit_note_id = :note_id, stripe_credit_kind = :kind,
-    issued_at = :now, last_error = NULL, updated_at = :now
+    issued_by = :by, issued_at = :now, last_error = NULL, updated_at = :now
 WHERE id = :id AND status = 'issuing'
 """
 
@@ -463,19 +463,26 @@ async def _stripe(call, **kwargs):
 
 
 async def _existing_note(stripe_invoice_id: str, credit_id: int) -> Any:
-    """A credit note Stripe already holds for this credit (a crash after Stripe, before our write)."""
-    page = await _stripe(stripe_client.v1.credit_notes.list,
-                         params={"invoice": stripe_invoice_id, "limit": 100})
-    for note in _field(page, "data") or []:
-        metadata = _field(note, "metadata") or {}
-        if str(_field(metadata, "gmv_invoice_credit_id") or "") == str(credit_id) \
-                and _field(note, "status") != "void":
-            return note
-    return None
+    """A credit note Stripe already holds for this credit (a crash or timeout after Stripe created it,
+    before our write). Every page: missing it would issue a second note."""
+    params: Dict[str, Any] = {"invoice": stripe_invoice_id, "limit": 100}
+    while True:
+        page = await _stripe(stripe_client.v1.credit_notes.list, params=dict(params))
+        notes = list(_field(page, "data") or [])
+        for note in notes:
+            metadata = _field(note, "metadata") or {}
+            if str(_field(metadata, "gmv_invoice_credit_id") or "") == str(credit_id) \
+                    and _field(note, "status") != "void":
+                return note
+        if not _field(page, "has_more") or not notes:
+            return None
+        params["starting_after"] = _field(notes[-1], "id")
 
 
-async def issue(credit_id: int) -> IssueResult:
-    """Issue an APPROVED (or failed, or stale issuing) credit to Stripe as a credit note."""
+async def issue(credit_id: int, *, by: str) -> IssueResult:
+    """Issue an APPROVED (or failed, or stale issuing) credit to Stripe as a credit note. `by` is who
+    sent it (recorded as issued_by: a retry may be a different admin, days after the approval)."""
+    actor = _actor(by)
     now = _now()
     claimed = await database.fetch_one(_CLAIM_FOR_ISSUE_SQL, {
         "id": credit_id, "now": now, "stale_before": now - STALE_ISSUING})
@@ -522,8 +529,11 @@ async def issue(credit_id: int) -> IssueResult:
                 # Paid: to the customer's Stripe balance, applied to their next invoice. Never
                 # refund_amount (cash).
                 params["credit_amount"] = amount
-            note = await _stripe(stripe_client.v1.credit_notes.create, params=params,
-                                 options={"idempotency_key": f"gmv_invoice_credit:{credit_id}:{kind}"})
+            # One key per ATTEMPT: Stripe replays a key's first result, errors included, for 24h, so
+            # a retry of a refused create must not reuse it. A duplicate is prevented by the
+            # adoption just above, not by the key.
+            note = await _stripe(stripe_client.v1.credit_notes.create, params=params, options={
+                "idempotency_key": f"gmv_invoice_credit:{credit_id}:{kind}:{int(credit['issue_attempts'])}"})
         note_id = str(_field(note, "id") or "")
         if not note_id:
             raise CreditActionRefused("no_credit_note_id", "Stripe returned no credit note id")
@@ -534,7 +544,8 @@ async def issue(credit_id: int) -> IssueResult:
                        credit_id, invoice_id, error)
         return IssueResult(status="failed", credit_id=credit_id, error=error)
 
-    await database.execute(_MARK_ISSUED_SQL, {"id": credit_id, "note_id": note_id, "kind": kind, "now": _now()})
+    await database.execute(_MARK_ISSUED_SQL, {"id": credit_id, "note_id": note_id, "kind": kind, "by": actor,
+                                              "now": _now()})
     await _after_issue(credit)
     return IssueResult(status="adopted" if adopted else "issued", credit_id=credit_id,
                        stripe_credit_note_id=note_id, kind=kind)
@@ -585,11 +596,6 @@ async def reconcile_partner(credit_id: int) -> Optional[str]:
         if credit["channel_partner_id"] is None:
             await mark("not_applicable")
             return "not_applicable"
-        if settings.partner_rev_share_use_v2:
-            logger.warning("gmv_invoice_credit_partner_v2_unhandled credit_id=%s channel_partner_id=%s "
-                           "amount_cents=%s", credit_id, credit["channel_partner_id"], credit["amount_cents"])
-            await mark("v2_unhandled")
-            return "v2_unhandled"
 
         snapshot = _row(await database.fetch_one(_SNAPSHOT_FOR_RUN_SQL, {
             "billing_run_id": int(credit["billing_run_id"]),
@@ -598,6 +604,14 @@ async def reconcile_partner(credit_id: int) -> Optional[str]:
             return None
         payload = _coerce_json(snapshot["snapshot_payload_jsonb"])
         snapshot_id = int(snapshot["id"])
+        # Decided by the engine that WROTE the snapshot, not today's PARTNER_REV_SHARE_USE_V2: a flag
+        # flipped since would read a v2 payload with the v1 formula (no gmv_take_share_bp -> a silent
+        # 0 clawback), or leave a v1 settlement unclawed.
+        if "v2_metadata" in payload:
+            logger.warning("gmv_invoice_credit_partner_v2_unhandled credit_id=%s channel_partner_id=%s "
+                           "amount_cents=%s", credit_id, credit["channel_partner_id"], credit["amount_cents"])
+            await mark("v2_unhandled", snapshot_id)
+            return "v2_unhandled"
         counted = payload.get("gmv_rollup_ids_counted")
         if counted is not None and int(credit["rollup_id"]) not in {int(x) for x in counted}:
             # The settlement paid the partner nothing on this row (its invoice was not paid then).

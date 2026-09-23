@@ -93,6 +93,7 @@ class _FakeStripe:
         self.notes: List[Dict[str, Any]] = []
         self.created: List[Dict[str, Any]] = []
         self.fail_create: Exception | None = None
+        self.list_calls = 0
         outer = self
 
         class _Invoices:
@@ -101,7 +102,14 @@ class _FakeStripe:
 
         class _Notes:
             def list(self, params=None, options=None):
-                return {"data": [n for n in outer.notes if n["invoice"] == (params or {}).get("invoice")]}
+                params = params or {}
+                mine = [n for n in outer.notes if n["invoice"] == params.get("invoice")]
+                if params.get("starting_after"):
+                    ids = [n["id"] for n in mine]
+                    mine = mine[ids.index(params["starting_after"]) + 1:]
+                limit = int(params.get("limit") or 10)
+                outer.list_calls += 1
+                return {"data": mine[:limit], "has_more": len(mine) > limit}
 
             def create(self, params=None, options=None):
                 if outer.fail_create is not None:
@@ -335,7 +343,7 @@ async def test_approving_a_paid_invoices_credit_issues_it_to_the_customer_balanc
 
     credit, _, _, _ = await _pending_credit(db)
     assert await approve(credit["id"], by="ops@pivota", expected_amount_cents=credit["amount_cents"])
-    result = await issue(credit["id"])
+    result = await issue(credit["id"], by="ops@pivota")
 
     assert (result.status, result.kind, result.stripe_credit_note_id) == ("issued", "customer_balance", "cn_1")
     (call,) = fake_stripe.created
@@ -345,9 +353,10 @@ async def test_approving_a_paid_invoices_credit_issues_it_to_the_customer_balanc
     assert params["lines"] == [{"type": "custom_line_item", "description": params["lines"][0]["description"],
                                 "quantity": 1, "unit_amount": 250}]
     assert params["metadata"]["gmv_invoice_credit_id"] == str(credit["id"])
-    assert call["options"]["idempotency_key"] == f"gmv_invoice_credit:{credit['id']}:customer_balance"
+    assert call["options"]["idempotency_key"] == f"gmv_invoice_credit:{credit['id']}:customer_balance:1"
     (row,) = await _credits(db)
-    assert (row["status"], row["stripe_credit_note_id"], row["approved_by"]) == ("issued", "cn_1", "ops@pivota")
+    assert (row["status"], row["stripe_credit_note_id"], row["approved_by"], row["issued_by"]) == (
+        "issued", "cn_1", "ops@pivota", "ops@pivota")
 
 
 async def test_an_open_invoice_is_credited_against_its_amount_due(db, fake_stripe):
@@ -357,7 +366,7 @@ async def test_an_open_invoice_is_credited_against_its_amount_due(db, fake_strip
     credit, _, _, _ = await _pending_credit(db, invoice_status="finalized")
     await approve(credit["id"], by="ops@pivota", expected_amount_cents=credit["amount_cents"])
 
-    assert (await issue(credit["id"])).kind == "amount_due"
+    assert (await issue(credit["id"], by="ops@pivota")).kind == "amount_due"
     params = fake_stripe.created[0]["params"]
     assert "credit_amount" not in params and "refund_amount" not in params
 
@@ -366,7 +375,7 @@ async def test_a_pending_credit_cannot_be_issued_without_approval(db, fake_strip
     from services.gmv_invoice_credits import issue
 
     credit, _, _, _ = await _pending_credit(db)
-    assert (await issue(credit["id"])).status == "not_issuable"
+    assert (await issue(credit["id"], by="ops@pivota")).status == "not_issuable"
     assert fake_stripe.created == []
 
 
@@ -375,7 +384,7 @@ async def test_after_an_issued_credit_a_further_refund_owes_only_its_delta(db, f
 
     credit, line, _, _ = await _pending_credit(db)
     await approve(credit["id"], by="ops@pivota", expected_amount_cents=credit["amount_cents"])
-    await issue(credit["id"])
+    await issue(credit["id"], by="ops@pivota")
     await _refund("15.00", "re_2")
 
     assert [(c["status"], c["amount_cents"]) for c in await _credits(db, line)] == [("issued", 250), ("pending", 150)]
@@ -387,13 +396,13 @@ async def test_a_draft_invoice_fails_the_issue_and_a_retry_succeeds(db, fake_str
     fake_stripe.invoice_status = "draft"
     credit, _, _, _ = await _pending_credit(db)
     await approve(credit["id"], by="ops@pivota", expected_amount_cents=credit["amount_cents"])
-    failed = await issue(credit["id"])
+    failed = await issue(credit["id"], by="ops@pivota")
     assert failed.status == "failed" and "invoice_draft" in failed.error
     (row,) = await _credits(db)
     assert row["status"] == "failed" and row["stripe_credit_note_id"] is None
 
     fake_stripe.invoice_status = "paid"
-    assert (await issue(credit["id"])).status == "issued"
+    assert (await issue(credit["id"], by="ops@pivota")).status == "issued"
     assert len(fake_stripe.created) == 1
 
 
@@ -403,11 +412,52 @@ async def test_a_stripe_error_leaves_the_credit_failed_not_issued(db, fake_strip
     credit, _, _, _ = await _pending_credit(db)
     await approve(credit["id"], by="ops@pivota", expected_amount_cents=credit["amount_cents"])
     fake_stripe.fail_create = RuntimeError("card_error: nope")
-    result = await issue(credit["id"])
+    result = await issue(credit["id"], by="ops@pivota")
 
     assert result.status == "failed" and "nope" in result.error
     (row,) = await _credits(db)
     assert (row["status"], row["issue_attempts"]) == ("failed", 1)
+
+
+async def test_a_retry_after_a_stripe_error_uses_a_fresh_idempotency_key(db, fake_stripe):
+    """Stripe replays a key's first result, errors included, for 24h: a retry on the same key would
+    get the same failure back."""
+    from services.gmv_invoice_credits import approve, issue
+
+    credit, _, _, _ = await _pending_credit(db)
+    await approve(credit["id"], by="ops@pivota", expected_amount_cents=credit["amount_cents"])
+    keys = []
+    real_create = fake_stripe.v1.credit_notes.create
+
+    def _recording_create(params=None, options=None):
+        keys.append(options["idempotency_key"])
+        if len(keys) == 1:
+            raise RuntimeError("api_error: try again")
+        return real_create(params=params, options=options)
+
+    fake_stripe.v1.credit_notes.create = _recording_create
+    assert (await issue(credit["id"], by="ops@pivota")).status == "failed"
+    assert (await issue(credit["id"], by="ops@later")).status == "issued"
+    assert len(set(keys)) == 2
+    (row,) = await _credits(db)
+    assert (row["issue_attempts"], row["issued_by"], row["approved_by"]) == (2, "ops@later", "ops@pivota")
+
+
+async def test_adoption_finds_the_credits_note_beyond_the_first_page(db, fake_stripe):
+    from services.gmv_invoice_credits import approve, issue
+
+    credit, _, _, _ = await _pending_credit(db)
+    await approve(credit["id"], by="ops@pivota", expected_amount_cents=credit["amount_cents"])
+    for i in range(150):  # other credit notes on the same invoice
+        fake_stripe.notes.append({"id": f"cn_other_{i:03d}", "status": "issued", "invoice": "in_1", "metadata": {}})
+    fake_stripe.notes.append({"id": "cn_ours", "status": "issued", "invoice": "in_1",
+                              "metadata": {"gmv_invoice_credit_id": str(credit["id"])}})
+    await db.execute("UPDATE gmv_invoice_credits SET status = 'issuing', updated_at = NOW() - INTERVAL '1 hour' "
+                     "WHERE id = :i", {"i": credit["id"]})
+
+    result = await issue(credit["id"], by="ops@pivota")
+    assert (result.status, result.stripe_credit_note_id) == ("adopted", "cn_ours")
+    assert fake_stripe.created == [] and fake_stripe.list_calls == 2
 
 
 async def test_a_void_invoice_cancels_the_credit(db, fake_stripe):
@@ -417,7 +467,7 @@ async def test_a_void_invoice_cancels_the_credit(db, fake_stripe):
     credit, _, _, _ = await _pending_credit(db)
     await approve(credit["id"], by="ops@pivota", expected_amount_cents=credit["amount_cents"])
 
-    assert (await issue(credit["id"])).status == "cancelled"
+    assert (await issue(credit["id"], by="ops@pivota")).status == "cancelled"
     (row,) = await _credits(db)
     assert (row["status"], row["status_reason"]) == ("cancelled", "invoice_void")
     assert fake_stripe.created == []
@@ -434,7 +484,7 @@ async def test_a_crash_after_stripe_is_recovered_by_adopting_the_note_never_a_se
     await db.execute("UPDATE gmv_invoice_credits SET status = 'issuing', updated_at = NOW() - INTERVAL '1 hour' "
                      "WHERE id = :i", {"i": credit["id"]})
 
-    result = await issue(credit["id"])
+    result = await issue(credit["id"], by="ops@pivota")
     assert (result.status, result.stripe_credit_note_id) == ("adopted", "cn_earlier")
     assert fake_stripe.created == []
 
@@ -446,7 +496,7 @@ async def test_a_fresh_issuing_credit_is_not_reissued(db, fake_stripe):
     await approve(credit["id"], by="ops@pivota", expected_amount_cents=credit["amount_cents"])
     await db.execute("UPDATE gmv_invoice_credits SET status = 'issuing', updated_at = NOW() WHERE id = :i",
                      {"i": credit["id"]})
-    assert (await issue(credit["id"])).status == "not_issuable"
+    assert (await issue(credit["id"], by="ops@pivota")).status == "not_issuable"
 
 
 # ── agent share ────────────────────────────────────────────────────────────────────────────────
@@ -479,7 +529,7 @@ async def test_the_agents_share_follows_the_credit(db, fake_stripe, monkeypatch)
     await _settlement_completed(db, run_id)  # no partner on this merchant
     assert (await accrue_for_line(line)).target_minor == 250  # 25% of the 1000 invoiced
     await approve(credit["id"], by="ops@pivota", expected_amount_cents=credit["amount_cents"])
-    await issue(credit["id"])  # re-accrues the line after issuing
+    await issue(credit["id"], by="ops@pivota")  # re-accrues the line after issuing
 
     assert await _agent_total(db, line) == 187  # 25% of the 750 Pivota kept
 
@@ -499,7 +549,7 @@ async def test_a_credit_after_settlement_moves_the_partner_and_the_agent_togethe
     assert (await accrue_for_line(line)).target_minor == 200  # 25% x (1000 - 200)
 
     await approve(credit["id"], by="ops@pivota", expected_amount_cents=credit["amount_cents"])
-    await issue(credit["id"])
+    await issue(credit["id"], by="ops@pivota")
 
     assert [e["amount_cents"] for e in await _partner_ledger(db)] == [-50]
     assert await _agent_total(db, line) == 150
@@ -513,14 +563,18 @@ async def _issued_partner_credit(db, fake_stripe):
 
     credit, line, rollup_id, run_id = await _pending_credit(db, channel_partner=7)
     await approve(credit["id"], by="ops@pivota", expected_amount_cents=credit["amount_cents"])
-    assert (await issue(credit["id"])).status == "issued"
+    assert (await issue(credit["id"], by="ops@pivota")).status == "issued"
     return credit["id"], rollup_id, run_id
 
 
-async def _snapshot(db, run_id, *, counted, netted=(), bp=2000, paid_on_gmv=200):
+async def _snapshot(db, run_id, *, counted, netted=(), bp=2000, paid_on_gmv=200, engine="v1"):
     payload = {"gmv_rollup_ids_counted": list(counted), "netted_invoice_credit_ids": list(netted),
                "commission_config": {"gmv_take_share_bp": bp},
                "merchant_accruals": {MERCHANT: {"gmv_take_rev_cents": paid_on_gmv, "credited_comp_cents": paid_on_gmv}}}
+    if engine == "v2":  # what partner_rev_share_engine_v2 writes: its own shape, no v1 share bp
+        payload = {"commission_config": {"source": "structured_contract_columns"},
+                   "merchant_accruals": {MERCHANT: {"gmv_share_cents": paid_on_gmv, "credited_comp_cents": paid_on_gmv}},
+                   "v2_metadata": {"channel_partner_id": 7}}
     return await db.fetch_val(
         "INSERT INTO settlement_snapshots (billing_run_id, channel_partner_id, snapshot_payload_jsonb, "
         "computed_comp_cents) VALUES (:r, 7, CAST(:p AS jsonb), :c) RETURNING id",
@@ -617,7 +671,22 @@ async def test_a_row_the_settlement_did_not_pay_on_is_not_clawed_back(db, fake_s
     assert await _partner_ledger(db) == []
 
 
-async def test_partner_v2_is_marked_unhandled_not_guessed(db, fake_stripe, monkeypatch):
+@pytest.mark.parametrize("flag_now", [False, True])
+async def test_the_engine_that_wrote_the_snapshot_decides_not_todays_flag(db, fake_stripe, monkeypatch, flag_now):
+    """A v2 settlement is never run through the v1 formula (its payload has no gmv_take_share_bp:
+    a silent 0 clawback), whatever PARTNER_REV_SHARE_USE_V2 says today."""
+    from config.settings import settings
+    from services.gmv_invoice_credits import reconcile_partner
+
+    monkeypatch.setattr(settings, "partner_rev_share_use_v2", flag_now)
+    credit_id, _, run_id = await _issued_partner_credit(db, fake_stripe)
+    await _snapshot(db, run_id, counted=[], engine="v2")
+
+    assert await reconcile_partner(credit_id) == "v2_unhandled"
+    assert await _partner_ledger(db) == []
+
+
+async def test_a_v1_settlement_is_clawed_back_even_with_the_v2_flag_on_now(db, fake_stripe, monkeypatch):
     from config.settings import settings
     from services.gmv_invoice_credits import reconcile_partner
 
@@ -625,8 +694,8 @@ async def test_partner_v2_is_marked_unhandled_not_guessed(db, fake_stripe, monke
     monkeypatch.setattr(settings, "partner_rev_share_use_v2", True)
     await _snapshot(db, run_id, counted=[rollup_id])
 
-    assert await reconcile_partner(credit_id) == "v2_unhandled"
-    assert await _partner_ledger(db) == []
+    assert await reconcile_partner(credit_id) == "clawed_back"
+    assert [e["amount_cents"] for e in await _partner_ledger(db)] == [-50]
 
 
 async def test_a_credit_with_no_channel_partner_is_not_applicable(db, fake_stripe):
@@ -634,7 +703,7 @@ async def test_a_credit_with_no_channel_partner_is_not_applicable(db, fake_strip
 
     credit, _, _, _ = await _pending_credit(db)
     await approve(credit["id"], by="ops@pivota", expected_amount_cents=credit["amount_cents"])
-    await issue(credit["id"])
+    await issue(credit["id"], by="ops@pivota")
     assert (await _credits(db))[0]["partner_status"] == "not_applicable"
 
 
