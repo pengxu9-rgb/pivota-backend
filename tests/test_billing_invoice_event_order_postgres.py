@@ -251,10 +251,13 @@ async def test_a_late_payment_failed_does_not_reverse_an_earned_agent_share(db, 
     assert total == 112
 
 
-@pytest.mark.parametrize(("status", "expected"), [("paid", "paid"), ("draft", "finalizing")])
-async def test_finalize_invoice_never_pulls_a_paid_invoice_back_to_finalizing(db, monkeypatch, status, expected):
+@pytest.mark.parametrize(("status", "expected"), [
+    ("paid", "paid"), ("payment_failed", "payment_failed"), ("void", "void"),
+    ("draft", "finalizing"), ("finalizing", "finalizing"),
+])
+async def test_finalize_invoice_only_moves_a_not_yet_finalized_invoice(db, monkeypatch, status, expected):
     """auto_advance can finalize and charge the invoice before finalize_invoice runs, so its local
-    'finalizing' write can land after invoice.paid. It must only move an unpaid invoice."""
+    'finalizing' write can land after a webhook. It must only move draft (or a re-run's finalizing)."""
     from services import invoice_generation_service as svc
 
     await _billed_invoice(db, status=status)
