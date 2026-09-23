@@ -61,6 +61,9 @@ if _IS_PG:
         _dial_off,
         _no_real_network,
         _population,
+        # The sweep's catalog-hint case (`www.`-spelled Shopify product), which needs the catalog
+        # tables: the fixture builds them from the repo's own metadata and deletes its own rows.
+        _www_catalog,
         page,
         res,
     )

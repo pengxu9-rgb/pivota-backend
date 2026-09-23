@@ -92,6 +92,10 @@ _MIGRATIONS = (
     _MIGRATIONS_DIR / "228_tierb_cart_link_eligibility.sql",
     _MIGRATIONS_DIR / "229_reap_agentic_purchase_item_source.sql",
     _MIGRATIONS_DIR / "230_conversion_click_claims.sql",
+    # 231 is the purchasability fact table. Built here because the canonical-domain cases below
+    # drive the route's `is_purchasable` read against the sweep's own writer; it is dropped and
+    # rebuilt with the rail's tables (see `_RAIL_TABLES`).
+    _MIGRATIONS_DIR / "231_merchant_purchasability.sql",
     # 232 widens 228's verdict vocabulary in place. Same reason as 227 above: this file DROPS
     # tierb_cart_link_eligibility and rebuilds it from this list, and the self-heal carries 232,
     # so a migration build without it is not the schema production has. 226's parity fingerprint
@@ -119,6 +123,7 @@ _TABLES = (
 _RAIL_TABLES = _TABLES + (
     "reap_agentic_purchases", "reap_agentic_enrollments",
     "tierb_cart_link_eligibility", "conversion_click_claims",
+    "merchant_purchasability",
 )
 
 BASE = "/agent/v2/commerce/reap"
@@ -1767,6 +1772,312 @@ async def test_a_replay_moves_only_the_buyers_tag_on_postgres(client):
     assert await database.fetch_val(
         "SELECT consent_version FROM reap_agentic_purchases WHERE id = :i", {"i": purchase_id}
     ) == CONSENT
+
+
+# ── the merchant domain is matched canonically, on the production dialect ───────────────────
+#
+# Production's Shopify rows spell `source_domain` as `www.Brand.com`; operators write `brand.com`;
+# the gateway sends either. Every comparison the variant lane makes folds BOTH sides by one rule
+# (lower case, ONE leading `www.` removed), and the SQL half of that rule is a `CASE` over `LIKE`
+# and `substr` that must mean the same thing here as on SQLite — Postgres' LIKE is
+# case-sensitive, and SQLite's is not, which is exactly the kind of difference only this file can
+# see.
+
+PG_WWW_PRODUCT_DOMAIN = "www.Brand-PG.example"
+PG_CANONICAL_DOMAIN = "brand-pg.example"
+
+
+async def _seed_www_world(*, product_domain: str = PG_WWW_PRODUCT_DOMAIN,
+                          eligibility_domain: str = PG_CANONICAL_DOMAIN):
+    await _seed_catalog(domain=product_domain)
+    await _seed_eligibility(domain=eligibility_domain)
+    await _seed_link()
+
+
+@pytest.mark.parametrize(
+    "requested", ["www.brand-pg.example", "brand-pg.example", "WWW.BRAND-PG.EXAMPLE"]
+)
+async def test_every_spelling_of_one_merchant_reaches_the_same_row(client, requested):
+    await _seed_www_world()
+    resp = await client.post(f"{BASE}/purchases", json=_body(merchant_domain=requested))
+    assert resp.status_code == 202, (requested, resp.text)
+    row = await ledger.get_purchase_internal(resp.json()["purchase_id"])
+    assert row["product_key"] == PRODUCT_KEY and row["variant_key"] == SKU_KEY
+    assert row["our_price_minor"] == 4250
+    assert row["merchant_domain"] == requested.lower()
+
+
+async def test_an_eligibility_row_typed_with_the_www_still_matches(client):
+    """Mixed case AND the `www.` on the stored row: only a fold that lowercases BEFORE the LIKE
+    matches it on Postgres."""
+    await _seed_www_world(eligibility_domain="www.Brand-PG.example")
+    resp = await client.post(f"{BASE}/purchases", json=_body(merchant_domain="brand-pg.example"))
+    assert resp.status_code == 202, resp.text
+
+
+async def test_a_www_with_no_dot_after_it_is_part_of_the_name(client):
+    await _seed_www_world(product_domain=PG_CANONICAL_DOMAIN)
+    resp = await client.post(
+        f"{BASE}/purchases", json=_body(merchant_domain="wwwbrand-pg.example")
+    )
+    assert resp.status_code == 409
+    assert _error(resp) == "merchant_not_eligible"
+
+
+async def test_a_product_under_a_www_less_lookalike_is_not_this_merchants(client):
+    await _seed_www_world(product_domain="wwwbrand-pg.example")
+    resp = await client.post(f"{BASE}/purchases", json=_body(merchant_domain="brand-pg.example"))
+    assert resp.status_code == 409
+    assert _error(resp) == "row_not_found"
+
+
+async def test_only_one_www_is_stripped_from_the_request(client):
+    await _seed_www_world(product_domain=PG_CANONICAL_DOMAIN)
+    resp = await client.post(
+        f"{BASE}/purchases", json=_body(merchant_domain="www.www.brand-pg.example")
+    )
+    assert resp.status_code == 409
+    assert _error(resp) == "merchant_not_eligible"
+
+
+async def test_only_one_www_is_stripped_from_either_stored_column(client):
+    await _seed_www_world(
+        product_domain="www.www.brand-pg.example", eligibility_domain="www.www.brand-pg.example"
+    )
+    resp = await client.post(f"{BASE}/purchases", json=_body(merchant_domain="brand-pg.example"))
+    assert resp.status_code == 409
+    assert _error(resp) == "merchant_not_eligible"
+    resp = await client.post(
+        f"{BASE}/purchases", json=_body(merchant_domain="www.www.brand-pg.example")
+    )
+    assert resp.status_code == 202, resp.text
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["https://brand-pg.example/", "brand-pg.example:443", "127.0.0.1", "www.example",
+     "brand-pg.example.", "brand-pg.example.."],
+)
+async def test_a_merchant_domain_that_is_not_a_bare_host_is_refused_before_any_read(
+    client, value
+):
+    await _seed_catalog()
+    await _seed_eligibility()
+    resp = await client.post(f"{BASE}/purchases", json=_body(merchant_domain=value))
+    assert resp.status_code == 400, (value, resp.text)
+    assert _error(resp) == "invalid_request"
+    assert value not in resp.text
+    assert await database.fetch_val("SELECT COUNT(*) FROM buyer_identity_links") == 0
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+
+
+@pytest.mark.parametrize("disabled_first", [True, False], ids=["disabled_first", "enabled_first"])
+@pytest.mark.parametrize(
+    "disabled_spelling", ["brand-pg.example", "www.brand-pg.example"], ids=["bare_off", "www_off"]
+)
+async def test_a_disabled_twin_spelling_turns_the_merchant_off(
+    client, disabled_spelling, disabled_first
+):
+    """Which spelling is off x which was inserted first: whatever order Postgres returns the rows
+    in (heap order here), some case puts the ENABLED row last and some first, so "last row wins"
+    and "first row wins" each reach a 202 and die."""
+    enabled_spelling = (
+        "www.brand-pg.example" if disabled_spelling == "brand-pg.example" else "brand-pg.example"
+    )
+    await _seed_catalog(domain=PG_WWW_PRODUCT_DOMAIN)
+    rows = [(disabled_spelling, False), (enabled_spelling, True)]
+    for domain, enabled in (rows if disabled_first else list(reversed(rows))):
+        await _seed_eligibility(domain=domain, enabled=enabled)
+    await _seed_link()
+    for requested in ("brand-pg.example", "www.brand-pg.example"):
+        resp = await client.post(f"{BASE}/purchases", json=_body(merchant_domain=requested))
+        assert resp.status_code == 409, (requested, resp.text)
+        assert _error(resp) == "merchant_not_eligible"
+
+
+async def test_the_offer_seller_is_still_a_conjunct_under_the_www_spelling(client):
+    await _seed_www_world()
+    await _seed_competitor_offer(price="1.00")
+    resp = await client.post(
+        f"{BASE}/purchases", json=_body(merchant_domain="www.brand-pg.example")
+    )
+    assert resp.status_code == 202, resp.text
+    row = await ledger.get_purchase_internal(resp.json()["purchase_id"])
+    assert row["our_price_minor"] == 4250
+
+
+async def test_the_202_body_is_unchanged_by_canonical_matching(client):
+    await _seed_www_world()
+    for spelling in ("www.brand-pg.example", "brand-pg.example"):
+        resp = await client.post(f"{BASE}/purchases", json=_body(merchant_domain=spelling))
+        assert resp.status_code == 202, resp.text
+        body = resp.json()
+        assert body["purchase_id"].startswith("rp_")
+        assert sorted(body) == ["poll_after_seconds", "purchase_id", "status"]
+        assert {k: v for k, v in body.items() if k != "purchase_id"} == {
+            "status": "resolving",
+            "poll_after_seconds": svc.POLL_INTERVALS["resolving"],
+        }
+
+
+async def test_a_retry_in_the_other_spelling_replays_the_same_purchase(client):
+    await _seed_www_world()
+    first = await client.post(
+        f"{BASE}/purchases",
+        json=_body(merchant_domain="www.brand-pg.example", idempotency_key="k-pg-www"),
+    )
+    again = await client.post(
+        f"{BASE}/purchases",
+        json=_body(merchant_domain="Brand-PG.example", idempotency_key="k-pg-www"),
+    )
+    assert first.status_code == again.status_code == 202, again.text
+    assert again.json()["purchase_id"] == first.json()["purchase_id"]
+
+
+def _positive_preflight(host: str):
+    from services.shopify_cart_link_preflight import PreflightResult, Verdict
+
+    return PreflightResult(
+        host=host, verdict=Verdict.ELIGIBLE, retryable=False, market="US",
+        variant_id="50041364447509", variant_source="caller", payment_methods=("Airwallex",),
+        card_available=True, landed_price_minor=4250, landed_currency="USD", final_status=200,
+        final_host=host,
+        chain=((302, f"https://{host}/cart/1:1"), (200, f"https://{host}/checkouts/cn/T")),
+    )
+
+
+@pytest.mark.parametrize(
+    "eligibility_domain, product_domain, requested",
+    [
+        (PG_CANONICAL_DOMAIN, PG_WWW_PRODUCT_DOMAIN, "WWW.BRAND-PG.EXAMPLE"),
+        # The sweep folds `www.www.brand-pg.example` to `www.brand-pg.example` and `record_check`
+        # folds that again; only the canonical merchant, folded by `is_purchasable`, reads it.
+        ("www.www.brand-pg.example", "www.www.brand-pg.example", "www.www.brand-pg.example"),
+    ],
+)
+async def test_the_purchasability_lookup_is_keyed_as_the_sweep_keys_it(
+    client, monkeypatch, eligibility_domain, product_domain, requested
+):
+    """The fact is written by the SWEEP'S OWN population and writer, so the route is tested
+    against the key production writes rather than a key this test chose."""
+    import db.merchant_purchasability as facts
+    import jobs.merchant_purchasability_sweep as sweep
+
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_ENFORCE", "1")
+    monkeypatch.delenv("MERCHANT_PURCHASABILITY_BUYER_VANTAGE", raising=False)
+    await _seed_www_world(product_domain=product_domain, eligibility_domain=eligibility_domain)
+
+    refused = await client.post(f"{BASE}/purchases", json=_body(merchant_domain=requested))
+    assert refused.status_code == 409
+    assert _error(refused) == "merchant_not_purchasable", "control: no fact yet"
+
+    targets = await sweep.load_population(50)
+    assert len(targets) == 1
+    for target in targets:
+        assert await facts.record_check(
+            target.domain, target.market, _positive_preflight(target.domain)
+        ) is not None
+    resp = await client.post(f"{BASE}/purchases", json=_body(merchant_domain=requested))
+    assert resp.status_code == 202, resp.text
+
+
+async def test_the_cart_link_lane_keeps_the_host_it_was_given(client, monkeypatch):
+    """NOT canonicalised: the permalink's host and the storefront evidence's host are compared
+    byte-for-byte downstream, so the cart lane reads the catalog under, and builds its URL on,
+    the host the door observed."""
+    await _seed_catalog(domain="www.brand-pg.example")
+    await database.execute(
+        "UPDATE catalog_products SET seller_ref = 'm_pg' WHERE product_key = :pk",
+        {"pk": PRODUCT_KEY},
+    )
+    await database.execute(
+        "UPDATE catalog_skus SET source_variant_id = '50041364447509' WHERE sku_key = :sk",
+        {"sk": SKU_KEY},
+    )
+    await database.execute(
+        "INSERT INTO tierb_cart_link_eligibility "
+        "(shop_domain, market, verdict, checked_at, consecutive_same) "
+        "VALUES (:domain, 'US', 'ELIGIBLE', now(), 1)",
+        {"domain": PG_CANONICAL_DOMAIN},
+    )
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    monkeypatch.setattr(routes_reap.rc, "CART_LINK_QUOTE_FIELD", "hypotheticalCartUrl")
+    resp = await client.post(
+        f"{BASE}/purchases",
+        json=_body(item_source="cart_link", merchant_domain="www.brand-pg.example"),
+    )
+    assert resp.status_code == 202, resp.text
+    purchase = await ledger.get_purchase_internal(resp.json()["purchase_id"])
+    assert purchase["cart_url"].startswith("https://www.brand-pg.example/cart/50041364447509:1?")
+    assert purchase["merchant_domain"] == "www.brand-pg.example"
+
+
+async def test_a_www_spelled_shopify_product_gives_the_sweep_its_variant_and_price():
+    """THE SWEEP'S CATALOG HINT, on Postgres. `jobs/merchant_purchasability_sweep`'s
+    `_CATALOG_VARIANT_SQL` / `_CATALOG_PRICE_SQL` compared a bare `lower(source_domain)` to a
+    canonical population key, so a `www.Brand` Shopify merchant got no variant and no expected
+    price. A lookalike under `www-brand-pg.example` (which, minus four characters, IS
+    `brand-pg.example`) with a SHORTER variant id is what the variant query's ordering would pick
+    if the fold ever accepted a `www` with no dot."""
+    import jobs.merchant_purchasability_sweep as sweep
+
+    await _seed_catalog(domain=PG_WWW_PRODUCT_DOMAIN)
+    await _seed_eligibility(domain=PG_CANONICAL_DOMAIN)
+    lookalike = "prod::m_pg_lookalike::shopify::2002"
+    await database.execute(
+        "INSERT INTO catalog_products (product_key, merchant_id, platform, source_product_id, "
+        "title, source_domain) VALUES (:pk, 'm_pg_lookalike', 'shopify', '2002', 'Lookalike', "
+        "'www-brand-pg.example')",
+        {"pk": lookalike},
+    )
+    await database.execute(
+        "INSERT INTO catalog_skus (sku_key, product_key, merchant_id, platform, source_product_id, "
+        "source_variant_id, title, currency) VALUES (:sk, :pk, 'm_pg_lookalike', 'shopify', "
+        "'2002', '9', 'One', 'USD')",
+        {"sk": f"sku::{lookalike}::v", "pk": lookalike},
+    )
+
+    targets = {t.domain: t for t in await sweep.load_population(50)}
+    target = targets[PG_CANONICAL_DOMAIN]
+    assert target.variant_id == "v1", "no catalog variant for a `www.` Shopify merchant"
+    assert (target.expected_price_minor, target.expected_currency) == (4250, "USD")
+
+
+async def test_a_population_row_that_is_not_a_bare_host_is_not_swept():
+    """The route can never admit it, so a fact about it would gate nothing."""
+    import jobs.merchant_purchasability_sweep as sweep
+
+    await _seed_eligibility(domain=PG_CANONICAL_DOMAIN)
+    await _seed_eligibility(domain="https://urlshaped-pg.example/")
+    domains = {t.domain for t in await sweep.load_population(50)}
+    assert domains == {PG_CANONICAL_DOMAIN}
+
+
+async def test_the_sql_fold_agrees_with_the_python_canonicaliser():
+    """The fold lifted out of the route's own two statements, run on Postgres against the
+    Python canonicaliser. Includes the mixed-case inputs Postgres' case-sensitive LIKE would get
+    wrong without the inner `lower()`."""
+    import re as _re
+
+    pattern = _re.compile(
+        r"CASE WHEN lower\((?P<col>[\w.]+)\) LIKE 'www\.%'\s+THEN substr\(lower\((?P=col)\), 5\)"
+        r"\s+ELSE lower\((?P=col)\) END = :merchant_domain"
+    )
+    found = []
+    for statement in (routes_reap._ELIGIBILITY_SQL, routes_reap._PRODUCT_SQL):
+        match = pattern.search(statement)
+        assert match, "the canonical fold is missing from a statement the variant lane matches on"
+        text = match.group(0).split(" = :merchant_domain")[0]
+        found.append(" ".join(text.replace(match.group("col"), "COL").split()))
+    assert found[0] == found[1], "the two statements fold the domain differently"
+
+    expression = found[0].replace("COL", "CAST(:h AS TEXT)")
+    for host in (
+        "brand.example", "www.brand.example", "WWW.Brand.Example", "www.www.brand.example",
+        "wwwbrand.example", "shop.brand.example", "www-brand.example",
+    ):
+        folded = await database.fetch_val(f"SELECT {expression}", {"h": host})
+        assert folded == routes_reap.canonical_merchant_domain(host), host
 
 
 # ── the suite must leave the shared tables as it found them ─────────────────────────────────

@@ -1410,3 +1410,145 @@ async def _population(_db):
     yield
     await database.execute("DELETE FROM reap_agentic_eligibility")
     await database.execute("DELETE FROM tierb_cart_link_eligibility")
+
+
+# ══ the sweep's catalog hint is matched canonically ═══════════════════════════════════════
+#
+# The Shopify sync writes `catalog_products.source_domain` as Shopify's `shop_domain` —
+# `www.Brand.com` in production — and a population key is canonical (`brand.com`). A bare
+# `lower()` compare found no variant and no price for exactly those merchants, so the preflight
+# measured a variant it picked itself against no expected price. The catalog SQL now folds the
+# column by the purchase route's own expression.
+
+_WWW_PRODUCT = "prod::m_wwwsweep::shopify::7001"
+_LOOKALIKE_PRODUCT = "prod::m_wwwsweep_lookalike::shopify::7002"
+
+
+async def _seed_sweep_catalog_product(product_key, merchant_id, domain, variant_id, price):
+    sku_key = f"sku::{product_key}::v"
+    await database.execute(
+        "INSERT INTO catalog_products (product_key, merchant_id, platform, source_product_id, "
+        "title, source_domain) VALUES (:pk, :m, 'shopify', :spid, 'Sweep Hint', :d)",
+        {"pk": product_key, "m": merchant_id, "spid": product_key[-4:], "d": domain},
+    )
+    await database.execute(
+        "INSERT INTO catalog_skus (sku_key, product_key, merchant_id, platform, source_product_id, "
+        "source_variant_id, title, currency) VALUES (:sk, :pk, :m, 'shopify', :spid, :v, 'One', 'USD')",
+        {"sk": sku_key, "pk": product_key, "m": merchant_id, "spid": product_key[-4:], "v": variant_id},
+    )
+    await database.execute(
+        "INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id, currency, "
+        "merchant_effective_price) VALUES (:oid, :sk, :pk, :m, 'USD', :price)",
+        {"oid": f"off::{product_key}", "sk": sku_key, "pk": product_key, "m": merchant_id,
+         "price": price},
+    )
+
+
+@pytest.fixture
+async def _www_catalog(_population):
+    import sqlalchemy
+    from db.catalog import catalog_offers, catalog_products, catalog_skus
+    from db.database import metadata
+
+    # Both dialects: the Postgres gate star-imports this file (tests/test_merchant_purchasability_
+    # postgres.py) and this fixture by name.
+    url = (os.getenv("DATABASE_URL") or "").replace("sqlite+aiosqlite://", "sqlite://").replace(
+        "postgresql+asyncpg://", "postgresql://"
+    )
+    engine = sqlalchemy.create_engine(url)
+    metadata.create_all(engine, tables=[catalog_products, catalog_skus, catalog_offers],
+                        checkfirst=True)
+    engine.dispose()
+
+    async def _clean():
+        for table in ("catalog_offers", "catalog_skus", "catalog_products"):
+            await database.execute(
+                f"DELETE FROM {table} WHERE product_key IN (:a, :b)",
+                {"a": _WWW_PRODUCT, "b": _LOOKALIKE_PRODUCT},
+            )
+
+    await _clean()
+    await database.execute(
+        "INSERT INTO reap_agentic_eligibility (merchant_domain, product_key, variant_key, "
+        "market_country, enabled) VALUES ('brand-sweep.example', '', '', 'US', TRUE)"
+    )
+    # THE PRODUCTION SPELLING: mixed case, with the `www.`.
+    await _seed_sweep_catalog_product(
+        _WWW_PRODUCT, "m_wwwsweep", "www.Brand-Sweep.example", "44000000000017", "42.50"
+    )
+    # A LOOKALIKE with a SHORTER variant id, which `_CATALOG_VARIANT_SQL`'s ordering would pick
+    # first if the fold ever matched `www` without its dot: `www-brand-sweep.example` minus four
+    # characters IS `brand-sweep.example`.
+    await _seed_sweep_catalog_product(
+        _LOOKALIKE_PRODUCT, "m_wwwsweep_lookalike", "www-brand-sweep.example", "9", "1.00"
+    )
+    try:
+        yield
+    finally:
+        await _clean()
+
+
+async def test_a_www_spelled_shopify_product_gives_the_sweep_its_variant_and_price(_www_catalog):
+    targets = {t.domain: t for t in await sweep.load_population(50)}
+    target = targets["brand-sweep.example"]
+    assert target.variant_id == "44000000000017", (
+        "the sweep found no catalog variant for a `www.`-spelled Shopify merchant — or found the "
+        "`www-brand-sweep.example` lookalike's"
+    )
+    assert (target.expected_price_minor, target.expected_currency) == (4250, "USD")
+
+
+async def test_a_population_row_that_is_not_a_bare_host_is_not_swept(_population):
+    """The route can never admit it (its folded spelling never equals a validated request key),
+    so a fact about it would gate nothing."""
+    await database.execute(
+        "INSERT INTO reap_agentic_eligibility (merchant_domain, product_key, variant_key, "
+        "market_country, enabled) VALUES ('https://urlshaped.example/', '', '', 'US', TRUE)"
+    )
+    domains = {t.domain for t in await sweep.load_population(50)}
+    assert "urlshaped.example" not in domains and "https://urlshaped.example/" not in domains
+    assert {"flowerbeauty.com", "judydoll.com"} <= domains
+
+
+async def test_skipped_allowlist_rows_are_counted_in_the_report_and_logged_once(
+    _population, monkeypatch, caplog
+):
+    """Counted, not silently dropped: an unusable row is a merchant an operator meant to enable.
+    One warning per RUN carrying the count, and no domain in the log or the report."""
+    import logging
+
+    for bad in ("https://urlshaped.example/", "trailingdot.example."):
+        await database.execute(
+            "INSERT INTO reap_agentic_eligibility (merchant_domain, product_key, variant_key, "
+            "market_country, enabled) VALUES (:d, '', '', 'US', TRUE)",
+            {"d": bad},
+        )
+    tally = {}
+    await sweep.load_population(50, tally=tally)
+    assert tally == {sweep.UNUSABLE_TALLY: 2}
+
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "true")
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_PAUSE_MS", "0")
+    monkeypatch.setattr(sweep, "_preflight", _Fetcher({}))
+    caplog.set_level(logging.WARNING, logger=sweep.logger.name)
+    report = await sweep.run_merchant_purchasability_sweep()
+    assert report.population_skipped_unusable == 2
+    assert report.population == 2, "the two usable merchants are still swept"
+    skipped = [r.getMessage() for r in caplog.records if "allowlist row(s) skipped" in r.getMessage()]
+    assert skipped == [
+        "merchant_purchasability_sweep: 2 allowlist row(s) skipped: domain is not a bare host name"
+    ]
+    for leak in ("urlshaped", "trailingdot"):
+        assert leak not in repr(report) and leak not in " ".join(skipped)
+
+
+async def test_a_clean_population_reports_zero_skipped(_population, monkeypatch, caplog):
+    import logging
+
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "true")
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_PAUSE_MS", "0")
+    monkeypatch.setattr(sweep, "_preflight", _Fetcher({}))
+    caplog.set_level(logging.WARNING, logger=sweep.logger.name)
+    report = await sweep.run_merchant_purchasability_sweep()
+    assert report.population_skipped_unusable == 0
+    assert not any("allowlist row(s) skipped" in r.getMessage() for r in caplog.records)

@@ -90,6 +90,10 @@ import httpx
 import db.merchant_purchasability as facts
 import db.reap_agentic_ledger as ledger
 from db.database import database
+# THE ONE merchant-host canonicaliser — the same function `routes/agent_commerce_reap` validates
+# the purchase request with and `tierb_cart_link_eligibility` keys its rows by. See
+# `_population_key` for how it is used here.
+from services.tierb_cart_link_merchants import canonical_merchant_domain
 from services.shopify_cart_link_preflight import (
     REQUEST_TIMEOUT_S,
     USER_AGENT,
@@ -213,6 +217,16 @@ SELECT shop_domain AS domain, market AS market, variant_id
  WHERE verdict = 'ELIGIBLE'
 """
 
+#: `source_domain` IS FOLDED, BY THE ROUTE'S EXPRESSION, CHARACTER FOR CHARACTER. `:domain` is a
+#: population key, which is already canonical (lower case, one leading `www.` removed); the
+#: Shopify sync writes `source_domain` as Shopify's `shop_domain`, which in production is
+#: `www.Brand.com`. A bare `lower()` compare therefore found NO variant and NO price for exactly
+#: the `www.`-hosted Shopify merchants the purchase gate exists for — the preflight then ran with
+#: no variant hint and no expected price, measuring a representative variant it chose itself and
+#: no drift at all. The text is identical to `routes/agent_commerce_reap._PRODUCT_SQL`'s and
+#: identical on both dialects (SQLite has no `regexp_replace`), and it is a literal here so the
+#: PREPARE sweep plans it.
+#:
 #: OUR indexed unit price for a variant on a domain. `catalog_offers.market` is NOT a conjunct:
 #: it is a NOT NULL DEFAULT 'US' that the external-seed writer never sets, so it claims 'US' for
 #: rows that are not, and the base cart-link loader (`_CART_OFFER_SQL`) already excludes it for
@@ -224,7 +238,9 @@ SELECT s.source_variant_id AS variant_id,
   FROM catalog_products p
   JOIN catalog_skus s ON s.product_key = p.product_key
   JOIN catalog_offers o ON o.sku_key = s.sku_key
- WHERE lower(p.source_domain) = :domain
+ WHERE CASE WHEN lower(p.source_domain) LIKE 'www.%'
+            THEN substr(lower(p.source_domain), 5)
+            ELSE lower(p.source_domain) END = :domain
    AND s.source_variant_id = :variant_id
    AND COALESCE(o.merchant_effective_price, o.estimated_best_price, o.list_price) IS NOT NULL
  ORDER BY COALESCE(o.merchant_effective_price, o.estimated_best_price, o.list_price) ASC
@@ -232,12 +248,14 @@ SELECT s.source_variant_id AS variant_id,
 """
 
 #: A representative variant for a domain when the Tier B lane has none. Deterministic ordering so
-#: two runs pick the same variant and their prices are comparable.
+#: two runs pick the same variant and their prices are comparable. Folded exactly as above.
 _CATALOG_VARIANT_SQL = """
 SELECT s.source_variant_id AS variant_id
   FROM catalog_products p
   JOIN catalog_skus s ON s.product_key = p.product_key
- WHERE lower(p.source_domain) = :domain
+ WHERE CASE WHEN lower(p.source_domain) LIKE 'www.%'
+            THEN substr(lower(p.source_domain), 5)
+            ELSE lower(p.source_domain) END = :domain
    AND s.source_variant_id IS NOT NULL
    AND s.source_variant_id <> ''
  ORDER BY length(s.source_variant_id) ASC, s.source_variant_id ASC
@@ -268,8 +286,37 @@ async def _rows(statement: str) -> List[Dict[str, Any]]:
         return []
 
 
-async def load_population(limit: int) -> List[Target]:
+def _population_key(value: Any) -> str:
+    """One allowlist row's domain as the canonical merchant, or `""` (skipped by the caller).
+
+    THE ROUTE'S CANONICALISER, so a population key is exactly the merchant key the purchase route
+    matches a request under, and exactly what `_CATALOG_*_SQL`'s fold produces from a
+    `source_domain`. It agrees with `facts.normalize_domain` (the fact table's own key, applied
+    again by `record_check`) on every bare host name; where they differ is a row that is NOT a
+    bare host — `https://brand.com/`, a port, a path, a trailing dot — which
+    `facts.normalize_domain` would reduce to a host and this refuses (and `load_population`
+    counts, for `SweepReport.population_skipped_unusable`). Such a row can never be admitted by the route (its folded
+    spelling never equals a validated request key), so a fact about it would gate nothing, and
+    sweeping it would spend a preflight on a merchant nobody can buy from.
+    """
+    try:
+        return canonical_merchant_domain(value)
+    except ValueError:
+        return ""
+
+
+#: The `SweepReport` count of allowlist rows `_population_key` refused. A COUNT, never the rows.
+UNUSABLE_TALLY = "population_skipped_unusable"
+
+
+async def load_population(
+    limit: int, *, tally: Optional[Dict[str, int]] = None
+) -> List[Target]:
     """The merchant x market set to sweep, bounded and deduped.
+
+    `tally`, when given, has `UNUSABLE_TALLY` incremented once per allowlist ROW whose domain is
+    not a bare host name and was therefore left out. Counted rather than silently dropped: such a
+    row is an operator typo that makes a merchant unbuyable, and the run report is where it shows.
 
     The two lanes are unioned on (domain, market). WHERE THEY OVERLAP THE CART LANE WINS the
     variant, because its `variant_id` was confirmed available on the storefront for that market
@@ -281,15 +328,23 @@ async def load_population(limit: int) -> List[Target]:
     # helper filters on, so the population cannot be narrower than what the door accepts — which
     # it was, until a reviewer measured a merchant the route admitted and the sweep never visited
     # (the sweep additionally required `variant_key = ''`; the route never has).
+    def _unusable() -> None:
+        if tally is not None:
+            tally[UNUSABLE_TALLY] = tally.get(UNUSABLE_TALLY, 0) + 1
+
     for row in await ledger.list_enabled_merchant_markets():
         key = (
-            facts.normalize_domain(row.get("merchant_domain")),
+            _population_key(row.get("merchant_domain")),
             facts.normalize_market(row.get("market_country")),
         )
+        if not key[0]:
+            _unusable()
         if key[0] and len(key[1]) == 2:
             merged.setdefault(key, None)
     for row in await _rows(_CART_LANE_SQL):
-        key = (facts.normalize_domain(row.get("domain")), facts.normalize_market(row.get("market")))
+        key = (_population_key(row.get("domain")), facts.normalize_market(row.get("market")))
+        if not key[0]:
+            _unusable()
         variant = str(row.get("variant_id") or "").strip() or None
         if key[0] and len(key[1]) == 2 and (variant or key not in merged):
             merged[key] = variant
@@ -358,6 +413,10 @@ class SweepReport:
     """
 
     population: int = 0
+    #: Allowlist rows left out of the population because their domain is not a bare host name
+    #: (a URL, a port, a trailing dot...). The purchase route can never admit such a row, so each
+    #: one is a merchant an operator meant to enable and did not.
+    population_skipped_unusable: int = 0
     checked: int = 0
     positive: int = 0
     negative: int = 0
@@ -370,7 +429,7 @@ class SweepReport:
 
 
 _COUNTS = (
-    "population", "checked", "positive", "negative", "unverifiable", "written",
+    "population", "population_skipped_unusable", "checked", "positive", "negative", "unverifiable", "written",
     "abandoned_budget", "errors", "skipped_disabled",
 )
 
@@ -435,13 +494,22 @@ async def run_merchant_purchasability_sweep(*, worker_id: Optional[str] = None) 
     batch = _env_int(DIALS["batch"])
     pause_s = _env_int(DIALS["pause_ms"]) / 1000.0
 
+    tally: Dict[str, int] = {}
     try:
-        targets = await load_population(batch)
+        targets = await load_population(batch, tally=tally)
     except Exception:  # noqa: BLE001 — a population read must not end the run with a traceback
         counts["errors"] += 1
         logger.exception("merchant_purchasability_sweep: the population could not be built")
         return _report()
     counts["population"] = len(targets)
+    counts["population_skipped_unusable"] = tally.get(UNUSABLE_TALLY, 0)
+    if counts["population_skipped_unusable"]:
+        # ONCE PER RUN, BY COUNT. Not the domains: the report rule is counts only, and the
+        # runbook's census query names the rows for whoever reads this.
+        logger.warning(
+            "merchant_purchasability_sweep: %d allowlist row(s) skipped: domain is not a bare "
+            "host name", counts["population_skipped_unusable"],
+        )
 
     vantages: List[Tuple[str, Optional[str]]] = [(facts.WORKER_VANTAGE, None)]
     proxy = proxy_url()

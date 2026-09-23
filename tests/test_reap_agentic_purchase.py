@@ -2938,3 +2938,34 @@ async def test_the_consent_survives_the_purchase_reaching_a_terminal_state():
     assert row["state"] == "refused"
     assert row["buyer_email"] is None and row["shipping_address"] is None
     assert row["consent_version"] == CONSENT
+
+
+# ── attribution keys ONE merchant, whichever spelling bought ────────────────────────────────
+
+
+async def test_two_spellings_of_one_merchant_close_under_one_merchant_key(attribution):
+    """The purchase row keeps the host as the door observed it; the attribution ledger must not.
+    `www.brand.example` and `brand.example` are one merchant on the variant lane, and two
+    `merchant_id`s would split its GMV across two rows."""
+    import services.reap_agentic_purchase as svc
+
+    for n, spelling in enumerate(("www.brand.example", "brand.example", "WWW.Brand.Example")):
+        assert await svc._close_attribution(
+            {"id": f"rp_spell_{n}", "merchant_domain": spelling, "reap_order_id": f"ord_s{n}",
+             "final_total_minor": 4500, "currency": "USD", "click_id": f"clk_s{n}"}
+        )
+    assert len(attribution.calls) == 3
+    assert {c["merchant_id"] for c in attribution.calls} == {"brand.example"}
+    assert {c["converting_shop_domain"] for c in attribution.calls} == {"brand.example"}
+
+
+async def test_an_uncanonicalisable_stored_domain_still_closes_as_stored(attribution):
+    """NEVER RAISES: the closer swallows exceptions to protect a completed purchase, so a raise
+    in the key function would silently drop the edge. A legacy value is used as stored."""
+    import services.reap_agentic_purchase as svc
+
+    assert await svc._close_attribution(
+        {"id": "rp_legacy", "merchant_domain": "Legacy.Example.", "reap_order_id": "ord_leg",
+         "final_total_minor": 4500, "currency": "USD", "click_id": "clk_leg"}
+    )
+    assert [c["merchant_id"] for c in attribution.calls] == ["legacy.example."]

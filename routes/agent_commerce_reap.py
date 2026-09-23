@@ -132,6 +132,13 @@ from services.outbound_links_service import (
     extract_shopify_numeric_variant_id,
 )
 from services.shopify_variant_identity import sole_verified_cart_variant_id
+# THE ONE merchant-host canonicaliser, imported rather than re-implemented: lower case, ONE
+# leading `www.` removed, and a ValueError for anything that is not a bare DNS host name —
+# including a trailing dot. It is `tierb_cart_link_eligibility`'s own key function
+# (`normalize_domain`) plus that one refusal, and for every bare host it agrees with
+# `db.merchant_purchasability.normalize_domain`, the key of the purchasability facts. See
+# `_merchant_domain_key` for why the route needs it.
+from services.tierb_cart_link_merchants import canonical_merchant_domain
 
 logger = logging.getLogger(__name__)
 
@@ -245,7 +252,8 @@ def _identifier(value: Any, name: str, *, max_chars: int) -> str:
     refuses what is left, because a zero-width joiner pasted out of a web form is not an attack
     and refusing a whole purchase for it helps nobody. These four values are not prose. They are
     `merchant_domain`, `product_key`, `variant_key` and `idempotency_key`, and every one of them
-    is matched EXACTLY against something in storage. Silently removing a character from an
+    is matched EXACTLY against something in storage (the domain after one documented fold — see
+    `_merchant_domain_key` — which is a rule both sides apply, not a repair of the input). Silently removing a character from an
     identifier does not sanitise it — it turns it into a different identifier, which then either
     matches nothing or, worse, matches something else. So these refuse.
 
@@ -275,6 +283,54 @@ def _identifier(value: Any, name: str, *, max_chars: int) -> str:
             "invalid_request", f"{name} contains characters that are not printable"
         )
     return text
+
+
+def _merchant_domain_key(host: str) -> str:
+    """The MERCHANT this request names, as the key every allowlist and fact on this rail is
+    matched under, or `invalid_request`.
+
+    ── WHY `www.brand.com` AND `brand.com` HAVE TO BE ONE MERCHANT ──────────────────────────
+
+    Three parties spell the same store independently and none of them agree. Shopify's
+    `shop_domain` is what the sync writes into `catalog_products.source_domain`, and in
+    production that is `www.Brand.com` — mixed case, with the `www.`. An operator writes the
+    eligibility row by hand, and writes `brand.com`. The gateway sends the storefront host AS IT
+    OBSERVED IT, which is either. Every one of those comparisons used to be EXACT, so whichever
+    party disagreed with the other two got a refusal — `merchant_not_eligible` or
+    `row_not_found` — that names the wrong cause and cannot be fixed from the door.
+
+    So the rule is ONE canonical form, applied on BOTH sides of every comparison: this function
+    on the request, the identical SQL expression on each stored column (see `_ELIGIBILITY_SQL`
+    and `_PRODUCT_SQL`). It strips exactly ONE leading `www.`: `www.www.brand.com` is
+    `www.brand.com`, and `wwwbrand.com` is a different store from `brand.com`, because a prefix
+    that is not followed by a dot is part of the name.
+
+    ── WHY THIS REFUSES RATHER THAN REDUCES ───────────────────────────────────────────────
+
+    `https://brand.com/`, `brand.com:443`, `user@brand.com`, `brand.com.`, an IP literal or a
+    single label is not a spelling of a merchant; it is a caller bug. Reducing it to a host would be a guess, and
+    `_identifier` above already says what a guessed identifier turns into. Refused with the
+    value NOT echoed — the canonicaliser's own `ValueError` names it, so it is not carried.
+
+    ── THE FOLD RUNS EXACTLY ONCE, ON A SPELLING ─────────────────────────────────────────────
+
+    It is not idempotent: `www.www.brand.com` -> `www.brand.com` -> `brand.com`. So the key this
+    returns is compared only against a stored SPELLING folded by the same rule (the SQL), and it
+    is never handed to a consumer that folds a SPELLING for itself: the Tier B verdict gets the
+    observed host, and so does the purchase row, whose readers fold it — the resolver's
+    `merchant_domain_matches`, and the attribution close (`svc._attribution_merchant_key`),
+    which must key one merchant once whichever spelling bought. The one exception is
+    `is_purchasable`, whose WRITER folds twice — see the handler. The CART-LINK
+    lane's catalog read and URL get the observed host for a different reason: the permalink's host and the storefront
+    evidence's host are compared byte-for-byte downstream (`sole_verified_cart_variant_id`,
+    `cart_link_refusal`). See the handler.
+    """
+    try:
+        return canonical_merchant_domain(host)
+    except ValueError:
+        raise svc.PurchaseRefused(
+            "invalid_request", "merchant_domain is not a bare host name"
+        ) from None
 
 
 def _consent_version(value: Any) -> str:
@@ -472,11 +528,28 @@ _MARKET_CURRENCY: Dict[str, str] = {
     "NZ": "NZD",
 }
 
+#: THE STORED DOMAIN IS CANONICALISED IN THE SQL, not trusted to be canonical.
+#:
+#: `:merchant_domain` is `_merchant_domain_key`'s output. The column is folded by the SAME rule
+#: — lower case, ONE leading `www.` removed — spelled as a `CASE` over `LIKE` and `substr`
+#: because SQLite has no `regexp_replace`, and the text is IDENTICAL on both dialects so one
+#: statement is what both gates test. `LIKE 'www.%'` has no `_` in it, so the only wildcard is
+#: the trailing `%`; `lower()` runs first because Postgres' LIKE is case-sensitive. Rows are
+#: operator-entered and the runbook says to write them canonical; this expression is what
+#: keeps a row somebody typed as `www.Brand.com` from silently refusing every purchase. (The
+#: column is read as a SPELLING and folded once — see `_merchant_domain_key` — so the one host
+#: whose canonical form is not a fixed point, `www.www.<x>`, is written as observed.)
+#:
+#: THE PRIMARY KEY'S LEADING COLUMN IS NO LONGER USABLE FOR THIS READ, and that is accepted
+#: knowingly: the table is an allowlist of tens of hand-written rows, and a scan of it costs
+#: less than the second spelling rule it would take to keep the index.
 _ELIGIBILITY_SQL = """
     SELECT merchant_domain, product_key, variant_key, market_country, enabled,
            accept_variant_labels, also_accept_domains
       FROM reap_agentic_eligibility
-     WHERE merchant_domain = :merchant_domain
+     WHERE CASE WHEN lower(merchant_domain) LIKE 'www.%'
+                THEN substr(lower(merchant_domain), 5)
+                ELSE lower(merchant_domain) END = :merchant_domain
        AND market_country = :market_country
        AND product_key IN (:merchant_row, :product_key)
 """
@@ -541,13 +614,13 @@ async def _eligibility(
             "product_key": product_key,
         },
     )
-    merchant_row: Optional[Dict[str, Any]] = None
+    merchant_rows: List[Dict[str, Any]] = []
     labels: List[str] = []
     domains: List[str] = []
     for raw in rows:
         row = dict(raw)
         if str(row.get("product_key") or "") == _MERCHANT_ROW:
-            merchant_row = row
+            merchant_rows.append(row)
             continue
         row_variant = str(row.get("variant_key") or "")
         # An override pinned to a variant applies to THAT variant only; one with a blank variant
@@ -558,10 +631,18 @@ async def _eligibility(
         labels.extend(_decode_alias_list(row.get("accept_variant_labels")))
         domains.extend(_decode_alias_list(row.get("also_accept_domains")))
 
-    if not merchant_row or not bool(merchant_row.get("enabled")):
+    # EVERY MERCHANT ROW MUST BE ENABLED, not whichever one the database returned last. Since the
+    # domain is matched canonically, `www.brand.com` and `brand.com` written as two rows are two
+    # merchant rows for ONE merchant — and "turning a merchant off" is an UPDATE an operator runs
+    # against the spelling in front of them. A disabled twin therefore wins, which is the only
+    # order-independent answer and the one a payment gate should give. (Before canonical matching
+    # the same ambiguity existed for a merchant row typed with a `variant_key`, and the answer
+    # was row order.) The runbook's one-off collapses such twins.
+    if not merchant_rows or not all(bool(r.get("enabled")) for r in merchant_rows):
         raise svc.PurchaseRefused(
             "merchant_not_eligible", "no enabled eligibility row for this domain and market"
         )
+    merchant_row = merchant_rows[0]
 
     # Order-preserving dedupe: the ledger caps the list at 32 entries and raises past it, and two
     # override rows can legitimately name the same alias.
@@ -880,12 +961,20 @@ async def _reap_buyer_ref(buyer_id: str, *, consent_version: str) -> str:
 #:
 #: SUPPRESSION IS A CONJUNCT ON ALL THREE TABLES, both columns each. A suppressed row is one
 #: somebody took out of circulation; selling it is the one thing that must not still work.
+#:
+#: `source_domain` IS CANONICALISED BY THE SAME EXPRESSION `_ELIGIBILITY_SQL` USES, character
+#: for character. The Shopify sync writes Shopify's `shop_domain`, which in production is
+#: `www.Brand.com`; a bare `lower()` compared that to the canonical `brand.com` the eligibility
+#: row was read under and answered `row_not_found` for every product the merchant has. The
+#: domain stays a CONJUNCT (see `_load_catalog_row`); only its spelling rule changed.
 _PRODUCT_SQL = """
     SELECT p.product_key, p.merchant_id, p.title AS product_title, p.brand, p.category,
            p.product_type, p.platform, p.source_domain
       FROM catalog_products p
      WHERE p.product_key = :product_key
-       AND lower(p.source_domain) = :merchant_domain
+       AND CASE WHEN lower(p.source_domain) LIKE 'www.%'
+                THEN substr(lower(p.source_domain), 5)
+                ELSE lower(p.source_domain) END = :merchant_domain
        AND p.suppression_reason IS NULL
        AND p.suppressed_at IS NULL
 """
@@ -938,6 +1027,7 @@ _OFFER_SQL = """
 async def _load_catalog_row(
     *,
     merchant_domain: str,
+    storefront_host: str,
     product_key: str,
     variant_key: Optional[str],
     market_country: str,
@@ -952,7 +1042,7 @@ async def _load_catalog_row(
       `row_not_shopify` the row's intake lane is not `shopify`.
       `row_unpriced`    no usable offer, or an amount/currency this rail cannot convert exactly.
 
-    THE DOMAIN IS A CONJUNCT, not a check afterwards. `merchant_domain` is the key the
+    THE DOMAIN IS A CONJUNCT, not a check afterwards. `merchant_domain` is the CANONICAL key the
     eligibility allowlist was read under; if it were not also the key the product is read under,
     a caller could name an enabled merchant and a product belonging to a different one. A product
     that exists under another domain answers `row_not_found` — the same answer as one that does
@@ -1045,7 +1135,10 @@ async def _load_catalog_row(
 
     variant_title = str(sku.get("variant_title") or "").strip() or None
     return svc.PurchaseRow(
-        merchant_domain=merchant_domain,
+        # THE HOST AS OBSERVED, not the canonical key. Its readers fold it themselves: the
+        # resolver's `rc.merchant_domain_matches`, and the attribution close
+        # (`svc._attribution_merchant_key`). See `_merchant_domain_key`.
+        merchant_domain=storefront_host,
         product_key=product_key,
         variant_key=str(sku.get("sku_key") or "") or None,
         product_name=product_name,
@@ -1288,10 +1381,11 @@ def _request_hash(
     ours and a client retrying an identical request must hash identically even though the click
     id will differ.
 
-    BUILT FROM THE NORMALISED VALUES, not the raw body. The domain is already lowercased, the
-    keys stripped, the address already through `_buyer_address_for_client` with its fallbacks
-    applied. A retry that differs only in the casing of a domain or a missing-then-supplied
-    `buyer.name` that resolves to the same recipient is the SAME request and must replay; a
+    BUILT FROM THE NORMALISED VALUES, not the raw body. The domain is already the canonical
+    merchant (`_merchant_domain_key`: lowercased, one `www.` removed), the keys stripped, the
+    address already through `_buyer_address_for_client` with its fallbacks applied. A retry that
+    differs only in the casing of a domain, or in whether it carries the `www.`, or a
+    missing-then-supplied `buyer.name` that resolves to the same recipient is the SAME request and must replay; a
     retry that differs in the address is not, and must not.
 
     `sort_keys=True` and a fixed separator so two dicts with the same content hash the same
@@ -1615,9 +1709,25 @@ async def start_reap_purchase(
         # EVERY ROUTE-OWNED IDENTIFIER THROUGH ONE CHECKPOINT, before any of them can reach a
         # bind. `.lower()` after the check rather than before: the check is about what the string
         # CONTAINS, and lowercasing cannot add or remove an unprintable character.
-        merchant_domain = _identifier(
+        merchant_host = _identifier(
             req.merchant_domain, "merchant_domain", max_chars=255
         ).lower()
+        # TWO VALUES FROM ONE FIELD, and which one each consumer gets is the whole change.
+        #
+        # `merchant_domain` is the canonical MERCHANT: what the variant lane's eligibility and
+        # catalog reads compare against (each folding its stored column by the same rule), and
+        # what the idempotency hash carries (`www.` and apex are one merchant, so one purchase).
+        #
+        # `merchant_host` is the storefront host as the door observed it, lowercased. It goes to
+        # the purchase row, whose readers fold it (the resolver's `merchant_domain_matches`
+        # against Reap's own spelling of the host, and the attribution close, which keys the
+        # merchant canonically); to the Tier B verdict, whose reader folds
+        # it too; and to the CART-LINK lane's catalog read and URL, whose host is compared
+        # byte-for-byte downstream. The purchasability lookup is the exception — see there.
+        #
+        # Validated here, for BOTH lanes, so a host that is not a bare host name is refused
+        # before any read.
+        merchant_domain = _merchant_domain_key(merchant_host)
         product_key = _identifier(req.product_key, "product_key", max_chars=1024)
         variant_key = (
             _identifier(req.variant_key, "variant_key", max_chars=1024)
@@ -1715,6 +1825,14 @@ async def start_reap_purchase(
         # fact FROM THE BUYER VANTAGE is refused. `is_purchasable` fails CLOSED on a database
         # error, which is the right direction for a payment gate even though it is the wrong one
         # for a liveness check.
+        #
+        # HANDED THE CANONICAL MERCHANT, because that is what the WRITER hands its own fold. The
+        # sweep builds its population with `normalize_domain(<allowlist row's domain>)` and then
+        # passes that already-folded value to `record_check`, which folds it again; `is_purchasable`
+        # folds its argument the same way. So the fact is keyed fold(fold(spelling)), and the read
+        # matches it exactly when it is handed fold(spelling) — `merchant_domain`. For every host
+        # that does not begin `www.www.` the second fold is a no-op and the distinction vanishes;
+        # for the one that does, handing the observed host here would read a key no sweep writes.
         if purchasability.is_enforcement_enabled():
             if not await purchasability.is_purchasable(merchant_domain, market_country):
                 raise svc.PurchaseRefused(
@@ -1730,12 +1848,15 @@ async def start_reap_purchase(
         cart_seller = None
         cart_seed_kind = None
         if req.item_source == "cart_link":
+            # THE OBSERVED HOST, NOT THE CANONICAL MERCHANT — see `merchant_host` above. The Tier B
+            # verdict is keyed canonically by its own reader, so this is the same lookup either
+            # way; the catalog read, the storefront evidence and the permalink are not.
             if not await tierb_eligibility.is_cart_link_eligible(
-                merchant_domain, market_country
+                merchant_host, market_country
             ):
                 raise svc.PurchaseRefused("merchant_not_eligible")
             cart_facts, cart_seller, cart_variant, cart_seed_kind = await _load_cart_link_item(
-                merchant_domain=merchant_domain,
+                merchant_domain=merchant_host,
                 product_key=product_key,
                 variant_key=variant_key,
                 market_country=market_country,
@@ -1749,6 +1870,7 @@ async def start_reap_purchase(
             )
             row = await _load_catalog_row(
                 merchant_domain=merchant_domain,
+                storefront_host=merchant_host,
                 product_key=product_key,
                 variant_key=variant_key,
                 market_country=eligible.market_country,
@@ -1765,13 +1887,13 @@ async def start_reap_purchase(
         cart_link_item = None
         if cart_facts is not None:
             cart_url = build_shopify_cart_permalink(
-                shop_domain=merchant_domain, variant_id=cart_variant, click_id=click_id,
+                shop_domain=merchant_host, variant_id=cart_variant, click_id=click_id,
                 quantity=int(req.quantity), country=market_country,
             )
             if cart_url is None:
                 raise svc.PurchaseRefused("row_variant_unverified")
             await _record_cart_link_click(
-                click_id=click_id, cart_url=cart_url, shop_domain=merchant_domain,
+                click_id=click_id, cart_url=cart_url, shop_domain=merchant_host,
                 seller_ref=cart_seller, product_key=product_key, variant_key=variant_key,
                 agent_id=agent_id, seed_kind=cart_seed_kind,
             )
