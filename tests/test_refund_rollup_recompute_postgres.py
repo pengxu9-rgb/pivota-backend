@@ -89,9 +89,11 @@ async def db(monkeypatch):
     try:
         yield database
     finally:
+        # DROP, not DELETE: these are reduced tables, and a later create_all(checkfirst=True)
+        # in the same database would keep them instead of building the real ones.
         for table in _TABLES:
             try:
-                await database.execute(f"DELETE FROM {table}")
+                await database.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
             except Exception:  # noqa: BLE001
                 continue
         if not was_connected and database.is_connected:
