@@ -78,17 +78,40 @@ LOCK_DAY_SHARED_QUERY = "SELECT pg_advisory_xact_lock_shared(" + _DAY_LOCK_KEY +
 # day locks across its Stripe calls. Only recompute_for_date sets it; the nightly roll-up waits.
 _RECOMPUTE_LOCK_TIMEOUT_QUERY = "SET LOCAL lock_timeout = '5s'"
 
-# The merchants an invoice (not void) already covers on the day. Their rollup rows are frozen:
+# The merchants a GMV invoice (not void) already covers on the day. Their rollup rows are frozen:
 # invoice items point at them and partner settlement reads them. Checked INSIDE the day lock, where
 # it cannot race the invoice run (which reads its rows under the same lock, shared, and commits its
-# invoices row before releasing it). Per merchant, not per billing run: a merchant a run has not
-# invoiced yet reads the day fresh when it is, so freezing it would bill a stale take.
+# invoices row before releasing it).
+# GMV invoices only (billing_run_id set by generate_merchant_invoice). The billing webhook also
+# mirrors SUBSCRIPTION invoices into this table, over their own look-back periods; counting those
+# froze every GMV day a renewal covered, and the nightly job then never rolled them up (review of
+# #2280).
 _INVOICED_MERCHANTS_ON_DAY_QUERY = """
 SELECT DISTINCT merchant_id FROM invoices
-WHERE CAST(billing_period_start AS DATE) <= CAST(:date AS DATE)
+WHERE billing_run_id IS NOT NULL
+  AND CAST(billing_period_start AS DATE) <= CAST(:date AS DATE)
   AND CAST(billing_period_end AS DATE) >= CAST(:date AS DATE)
   AND COALESCE(status, '') <> 'void'
   AND (CAST(:merchant_id AS TEXT) IS NULL OR merchant_id = CAST(:merchant_id AS TEXT))
+"""
+
+# A billing run that has NOT FINISHED for this merchant: it covers the day, is running or failed,
+# and has no invoice for the merchant yet. A failed attempt leaves Stripe draft items behind with
+# no local record (its transaction rolled back), and the resume reuses that draft. Re-rolling the
+# day in between makes the resume bill against a draft that still holds the old lines, silently
+# (review of #2280). Freezing keeps local and Stripe in agreement; the refund is logged for a
+# manual credit like an invoiced day. Only a RE-ROLL checks this: the nightly first roll-up of a
+# day must still write it, or a run over an open month (the debug billing route) would stop every
+# later day of that month from ever being billed. Completed and cancelled runs left no draft.
+_UNFINISHED_RUN_COVERS_MERCHANT_DAY_QUERY = """
+SELECT br.id FROM billing_runs br
+WHERE CAST(br.period_start AS DATE) <= CAST(:date AS DATE)
+  AND CAST(br.period_end AS DATE) >= CAST(:date AS DATE)
+  AND br.status IN ('running', 'partial_failed', 'failed')
+  AND NOT EXISTS (
+    SELECT 1 FROM invoices i WHERE i.billing_run_id = br.id AND i.merchant_id = :merchant_id
+  )
+LIMIT 1
 """
 
 
@@ -192,6 +215,7 @@ async def _take_rate_bp_for_merchant(merchant_id: str) -> int:
 
 async def _aggregate_for_date(
     target_date: date, merchant_id: Optional[str] = None, *, lock_timeout: bool = False,
+    freeze_unfinished_runs: bool = False,
 ) -> dict[str, Any]:
     """Roll one day up under its exclusive lock, leaving every INVOICED merchant's rows as billed.
 
@@ -210,6 +234,13 @@ async def _aggregate_for_date(
                     _INVOICED_MERCHANTS_ON_DAY_QUERY, {"date": target_date, "merchant_id": merchant_id}
                 )
             }
+            if freeze_unfinished_runs and merchant_id is not None and merchant_id not in invoiced:
+                unfinished = await database.fetch_one(
+                    _UNFINISHED_RUN_COVERS_MERCHANT_DAY_QUERY,
+                    {"date": target_date, "merchant_id": merchant_id},
+                )
+                if unfinished is not None:
+                    invoiced.add(merchant_id)
         except Exception as exc:  # noqa: BLE001 -- re-raised, typed: never re-roll an unchecked day
             raise BilledDayCheckFailed(f"{type(exc).__name__}: {str(exc)[:200]}") from exc
         rows = await database.fetch_all(
@@ -261,13 +292,16 @@ async def aggregate_daily(date: date) -> int:
 
 
 async def recompute_for_date(date: date, merchant_id: str) -> str:
-    """Recompute one merchant's rollups for one day, unless an invoice already covers it.
+    """Recompute one merchant's rollups for one day, unless it is billed: a GMV invoice covers
+    it, or an unfinished billing run covers it and has not invoiced the merchant yet.
 
     Returns RECOMPUTED or INVOICED_PERIOD_MANUAL_CREDIT. Raises BilledDayCheckFailed when the
     invoice check fails, and asyncpg's LockNotAvailableError when an invoice run holds the day
     longer than the lock timeout; nothing is written in either case.
     """
-    result = await _aggregate_for_date(date, merchant_id=merchant_id, lock_timeout=True)
+    result = await _aggregate_for_date(
+        date, merchant_id=merchant_id, lock_timeout=True, freeze_unfinished_runs=True
+    )
     if merchant_id in result["invoiced_merchants"]:
         return INVOICED_PERIOD_MANUAL_CREDIT
     return RECOMPUTED

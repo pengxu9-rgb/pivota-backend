@@ -71,6 +71,11 @@ async def _build_schema(database):
     await database.execute(
         re.search(r"CREATE TABLE IF NOT EXISTS invoices \(.*?\n\);", billing_core, re.S).group(0)
     )
+    # Migration 119's invoices.billing_run_id marks a GMV invoice (subscription invoices have none).
+    # Only that statement: the rest of 119 alters billing tables this file does not build.
+    migration_119 = (_MIGRATIONS / "119_invoice_finalizing_status.sql").read_text(encoding="utf-8")
+    assert "ADD COLUMN IF NOT EXISTS billing_run_id BIGINT" in migration_119
+    await database.execute("ALTER TABLE invoices ADD COLUMN IF NOT EXISTS billing_run_id BIGINT")
     for stmt in split_statements((_MIGRATIONS / "120_invoices_billing_period_to_date.sql").read_text(encoding="utf-8")):
         await database.execute(stmt)
     # billing_runs likewise: 113's table, 121's DATE periods, 122's partial_failed status.
@@ -132,11 +137,20 @@ async def _billed_edge(db, *, edge_id="cae_1", order_id="ord_late", gross=10_000
     await aggregate_daily(created_at.date())
 
 
-async def _invoice_the_month(db, *, status="finalized", day=BILLED_DAY, merchant=MERCHANT):
+async def _invoice_the_month(db, *, status="finalized", day=BILLED_DAY, merchant=MERCHANT, gmv=True):
+    """A GMV invoice written by a (completed) billing run, or, with gmv=False, a subscription
+    invoice the billing webhook mirrors into the same table with no billing_run_id."""
+    run_id = None
+    if gmv:
+        run_id = await db.fetch_val(
+            "INSERT INTO billing_runs (period_start, period_end, idempotency_key, status) "
+            "VALUES (:s, :e, :k, 'completed') RETURNING id",
+            {"s": day - timedelta(days=3), "e": day + timedelta(days=3), "k": f"inv-{merchant}-{status}-{day}"},
+        )
     await db.execute(
-        "INSERT INTO invoices (merchant_id, billing_period_start, billing_period_end, status) "
-        "VALUES (:m, :s, :e, :status)",
-        {"m": merchant, "s": day - timedelta(days=3), "e": day + timedelta(days=3), "status": status},
+        "INSERT INTO invoices (merchant_id, billing_period_start, billing_period_end, status, billing_run_id) "
+        "VALUES (:m, :s, :e, :status, :r)",
+        {"m": merchant, "s": day - timedelta(days=3), "e": day + timedelta(days=3), "status": status, "r": run_id},
     )
 
 
@@ -354,13 +368,12 @@ async def test_a_voided_invoice_does_not_freeze_the_day(db):
     assert await _rollup(db) == {"g": 10_000, "r": 2_500, "n": 7_500, "t": 750}
 
 
-@pytest.mark.parametrize("status", ["running", "failed", "partial_failed", "completed"])
-async def test_a_billing_run_without_this_merchant_s_invoice_does_not_freeze_the_day(db, status):
-    """The invoice run reads its rows under the day lock (lock_billing_days), so a merchant it has
-    not invoiced yet reads the day fresh when it is: freezing it would bill a stale take. A
-    partial_failed resume of a merchant whose day was re-rolled meanwhile re-reads the new take;
-    Stripe then refuses the reused invoice_item idempotency key for the changed amount, so that
-    resume fails loudly instead of over-billing (#2274 review, carried here)."""
+@pytest.mark.parametrize("status", ["running", "failed", "partial_failed"])
+async def test_an_unfinished_billing_run_freezes_a_merchant_it_has_not_invoiced(db, status):
+    """A failed attempt leaves Stripe draft items with no local record, and the resume reuses the
+    draft. Re-rolling the day in between would make the resume bill against a draft that still holds
+    the old lines, silently (review of #2280). Freezing keeps local and Stripe in agreement; the
+    refund is logged for a manual credit like an invoiced day."""
     from services.commerce_attribution_service import attach_refund_to_attribution_edge
 
     await _billed_edge(db)
@@ -368,6 +381,47 @@ async def test_a_billing_run_without_this_merchant_s_invoice_does_not_freeze_the
 
     await attach_refund_to_attribution_edge(order_id="ord_late", refund_id="re_1", amount=Decimal("25.00"))
 
+    assert await _edge_refund_cents(db) == 2_500
+    assert await _rollup(db) == {"g": 10_000, "r": 0, "n": 10_000, "t": 1_000}
+
+
+async def test_a_completed_billing_run_that_did_not_invoice_the_merchant_does_not_freeze(db):
+    """A completed run left no draft for a merchant it skipped (no Stripe customer, nothing to bill)."""
+    from services.commerce_attribution_service import attach_refund_to_attribution_edge
+
+    await _billed_edge(db)
+    await _start_billing_run(db, status="completed")
+    await attach_refund_to_attribution_edge(order_id="ord_late", refund_id="re_1", amount=Decimal("25.00"))
+    assert await _rollup(db) == {"g": 10_000, "r": 2_500, "n": 7_500, "t": 750}
+
+
+async def test_the_nightly_first_rollup_is_not_frozen_by_an_unfinished_run(db):
+    """Only a RE-ROLL checks unfinished runs. The nightly job must still write a day's first roll-up,
+    or a run over an open month (the debug billing route) would stop the rest of it being billed."""
+    from services.gmv_aggregation_service import aggregate_daily
+
+    await _start_billing_run(db, status="running")
+    await db.execute(
+        "INSERT INTO commerce_attribution_edges (edge_id, merchant_id, order_id, agent_id, gross_attributed_gmv_cents, "
+        "currency, refund_ids, refund_count, refunded_amount, created_at, updated_at) VALUES ('cae_new', :m, 'ord_new', "
+        "'agent_1', 10000, 'USD', '[]'::jsonb, 0, 0, :c, :c)", {"m": MERCHANT, "c": BILLED_AT})
+    assert await aggregate_daily(BILLED_DAY) == 1
+    assert (await _rollup(db))["g"] == 10_000
+
+
+async def test_a_subscription_invoice_never_freezes_a_gmv_day(db):
+    """The billing webhook mirrors subscription invoices into `invoices` over their own look-back
+    periods (review of #2280): the nightly job and a re-roll must ignore them."""
+    from services.commerce_attribution_service import attach_refund_to_attribution_edge
+    from services.gmv_aggregation_service import aggregate_daily
+
+    await _invoice_the_month(db, status="paid", gmv=False)
+    await db.execute(
+        "INSERT INTO commerce_attribution_edges (edge_id, merchant_id, order_id, agent_id, gross_attributed_gmv_cents, "
+        "currency, refund_ids, refund_count, refunded_amount, created_at, updated_at) VALUES ('cae_1', :m, 'ord_late', "
+        "'agent_1', 10000, 'USD', '[]'::jsonb, 0, 0, :c, :c)", {"m": MERCHANT, "c": BILLED_AT})
+    assert await aggregate_daily(BILLED_DAY) == 1
+    await attach_refund_to_attribution_edge(order_id="ord_late", refund_id="re_1", amount=Decimal("25.00"))
     assert await _rollup(db) == {"g": 10_000, "r": 2_500, "n": 7_500, "t": 750}
 
 
@@ -394,8 +448,8 @@ async def test_an_invoice_being_written_blocks_the_reroll_until_it_commits_then_
         await asyncio.sleep(0.5)
         assert not task.done(), "the re-roll did not wait for the invoice run's shared day lock"
         await other.execute(
-            "INSERT INTO invoices (merchant_id, billing_period_start, billing_period_end, status) "
-            "VALUES ($1, $2, $3, 'draft')",
+            "INSERT INTO invoices (merchant_id, billing_period_start, billing_period_end, status, billing_run_id) "
+            "VALUES ($1, $2, $3, 'draft', 1)",
             MERCHANT, BILLED_DAY - timedelta(days=1), BILLED_DAY + timedelta(days=1),
         )
         await tx.commit()

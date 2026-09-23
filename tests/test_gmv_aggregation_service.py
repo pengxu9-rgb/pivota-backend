@@ -60,6 +60,10 @@ class FakeDB:
         params = dict(values or {})
         self.fetch_one_calls.append((str(query), params))
         sql = str(query)
+        if "FROM billing_runs" in sql:
+            # A re-roll's unfinished-run check (never the nightly job's).
+            self.statements.append("unfinished_run_check")
+            return {"id": 9} if params.get("merchant_id") in getattr(self, "unfinished_run_merchants", set()) else None
         if "FOR UPDATE" in sql:
             edge_id = params["edge_id"]
             for edge in self.edges:
@@ -507,7 +511,7 @@ async def test_the_day_lock_is_taken_before_the_rollup_read(monkeypatch: pytest.
     # billed-day check runs after the lock and before the read: checked outside the lock, it races
     # the invoice run. Only the refund re-roll bounds its wait; the nightly job does not.
     lock = f"lock:{target_date}"
-    assert fake_db.statements == ["lock_timeout", lock, "invoice_check", "rollup_read",
+    assert fake_db.statements == ["lock_timeout", lock, "invoice_check", "unfinished_run_check", "rollup_read",
                                   lock, "invoice_check", "rollup_read"]
 
 
