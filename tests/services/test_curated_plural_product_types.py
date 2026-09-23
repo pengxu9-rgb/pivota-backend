@@ -273,3 +273,11 @@ def test_an_acne_patch_type_names_one_leaf(text, paths):
 ])
 def test_a_patch_type_resolves_rather_than_reading_as_ambiguous(ptype, want):
     assert evidence_only(ptype, "Some Product 36ct") == (want, feed.CATEGORY_CONFIDENCE_MERCHANT_TYPE)
+
+
+def test_a_tool_title_never_takes_a_formula_shelf():
+    """A physical-exfoliation shelf is where tools land. The title check is a membership test, so
+    a title naming BOTH the shelf leaf and a tool would otherwise take the shelf."""
+    assert resolve("Physical", "Silicone Exfoliating Brush Pad", "sokoglam.com") == evidence_only(
+        "Physical", "Silicone Exfoliating Brush Pad")
+    assert resolve("Physical", "Bio-Peel Gauze Peeling Wine", "sokoglam.com")[0] == "beauty/skincare/treat/exfoliant"

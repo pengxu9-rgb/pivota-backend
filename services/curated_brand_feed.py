@@ -1588,6 +1588,12 @@ def _measured_host_type_leaf(*, domain: Optional[str], product_type: Optional[st
     # facial mask, and a "Lip & Body Balm" is not only a lip balm.
     if _NON_FACE_TITLE.search(str(title or "")):
         return None
+    # A TOOL is not a formula. The title check above is a membership test, so a title naming both
+    # the shelf's leaf and a tool ("Konjac Exfoliating Pad" on an exfoliant shelf) would otherwise
+    # take the shelf. Measured: sokoglam files its tools under their own "Tools" shelf today, so
+    # this refuses nothing that exists -- it is a guard for the next product filed there.
+    if not leaf.startswith("beauty/tools/") and any(p.startswith("beauty/tools/") for p in named):
+        return None
     return leaf
 
 

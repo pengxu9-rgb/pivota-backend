@@ -24,6 +24,15 @@ def leaf(title):
 
 @pytest.mark.parametrize("title", [
     "AHA-BHA-PHA 30 Days Miracle Truecica Clear Pad",   # sokoglam, the row this unblocks
+    # One case per acid in the list, so truncating it fails here (all invented but for the shelf rows).
+    "Salicylic Acid Daily Clarifying Pad",
+    "Mandelic Acid 5% Resurfacing Pad",
+    "Lactic Acid 10% Smoothing Pad",
+    "PHA Gentle Daily Pad",
+    "BHA Blackhead Clearing Pad",
+    "Glycolic Acid Resurfacing Pads",
+    # "Toning pad" is the usual US name for an acid pad, so it is NOT in the toner-pad guard.
+    "Salicylic Acid Daily Toning Pad",
     "Skin Booster Ampoule Peel Pad",                    # sokoglam IOPE
     "Mediheal Phyto-enzyme Peeling Pad",                # ohlolly, stored as a toner today
     "Ji Woo Gae Heartleaf BHA Peeling Pad",
@@ -51,14 +60,30 @@ def test_every_other_pad_is_still_the_toner_it_was(title):
 def test_a_title_that_calls_itself_a_toner_pad_keeps_the_toner_leaf():
     """Measured in prod: a BHA toner pad. The acids are ingredients, the noun is the product."""
     assert leaf("Ji Woo Gae Cica BHA Blemish Toner Pad") == TONER
+    # The guard is DOTALL and takes repeated separators: neither a line break nor a double space
+    # inside the phrase may slip the title past it.
+    assert leaf("AHA BHA Clear Pad\nToner Pad Refill") == TONER
+    assert leaf("Cica BHA Toner  Pad") == TONER
     # NOTE the plural: the Toner entry's bare "pad" has always been SINGULAR, so a plural pad
-    # resolves to nothing at all. The arm's own `pads?` is what makes plural acid pads resolve.
-    assert leaf("AHA BHA Toning Pads") is None  # invented
-    assert leaf("Glycolic Acid Resurfacing Pads") == EXFOLIANT  # invented: new, was None
+    # resolved to nothing at all. The arm's own `pads?` is what makes plural acid pads resolve --
+    # "Hydrating Pads" still resolves to nothing, exactly as before this PR.
+    assert leaf("Hydrating Pads") is None  # invented
+    assert leaf("AHA BHA Toning Pads") == EXFOLIANT  # invented: "toning" is not the guard's phrase
+
+
+def test_lactic_acid_bacteria_ferment_is_not_an_exfoliating_acid():
+    """A soothing ferment ingredient, the same family as the hyaluronic/azelaic exclusions."""
+    assert leaf("Lactic Acid Bacteria Ferment Pad") == TONER
+    assert leaf("Lactic Acid 10% Smoothing Pad") == EXFOLIANT
+
+
+def test_the_peel_branch_does_not_glue_two_lines_together():
+    assert leaf("Peeling\nPad") == TONER
 
 
 @pytest.mark.parametrize("title,want", [
     ("SOME BY MI AHA-BHA-PHA 30 Days Miracle Toner (150ml)", TONER),   # acids, no pad noun
+    ("Clear Pad with AHA BHA PHA", TONER),                             # acid AFTER the noun: not claimed
     ("AHA-BHA-PHA 30 Days Miracle Cream", "beauty/skincare/moisturize/cream"),
     ("Pyunkang Yul 1/3 Cotton Pads (160pcs)", None),                   # plural: unresolved before and after
 ])
