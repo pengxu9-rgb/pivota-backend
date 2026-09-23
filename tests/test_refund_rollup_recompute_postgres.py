@@ -321,19 +321,25 @@ async def test_the_edge_day_is_its_utc_day_not_the_session_day(db):
 # --- A day an invoice already covers ---------------------------------------------------------
 
 
-async def test_a_refund_on_an_invoiced_day_leaves_the_billed_rollup_and_keeps_the_refund(db):
+async def test_a_refund_on_an_invoiced_day_leaves_the_billed_rollup_and_keeps_the_refund(db, caplog):
+    import logging
+
     from services.commerce_attribution_service import attach_refund_to_attribution_edge
 
     await _billed_edge(db)
     await _invoice_the_month(db)
 
-    result = await attach_refund_to_attribution_edge(
-        order_id="ord_late", refund_id="re_1", amount=Decimal("25.00")
-    )
+    with caplog.at_level(logging.WARNING, logger="services.gmv_aggregation_service"):
+        result = await attach_refund_to_attribution_edge(
+            order_id="ord_late", refund_id="re_1", amount=Decimal("25.00")
+        )
 
     assert result is not None
     assert await _edge_refund_cents(db) == 2_500  # the truth, for a manual credit
     assert await _rollup(db) == {"g": 10_000, "r": 0, "n": 10_000, "t": 1_000}  # as invoiced
+    # The manual-credit signal must name what to credit, not only the merchant and day.
+    [flag] = [r.getMessage() for r in caplog.records if "skipped_invoiced_day" in r.getMessage()]
+    assert "cae_1" in flag and MERCHANT in flag and BILLED_DAY.isoformat() in flag
 
 
 async def test_a_voided_invoice_does_not_freeze_the_day(db):

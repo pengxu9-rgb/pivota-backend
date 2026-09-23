@@ -243,7 +243,7 @@ INVOICE_CHECK_FAILED = "invoice_check_failed"
 RECOMPUTE_FAILED = "recompute_failed"
 
 
-async def _recompute_day_unless_invoiced(day: date, merchant_id: str) -> str:
+async def _recompute_day_unless_invoiced(day: date, merchant_id: str, edge_ids: list[str]) -> str:
     try:
         invoiced = await database.fetch_one(
             _INVOICE_COVERING_DAY_QUERY, {"merchant_id": merchant_id, "day": day}
@@ -252,15 +252,17 @@ async def _recompute_day_unless_invoiced(day: date, merchant_id: str) -> str:
             invoiced = await database.fetch_one(_BILLING_RUN_COVERING_DAY_QUERY, {"day": day})
     except Exception as exc:  # noqa: BLE001 -- fail closed: never rewrite a day we could not check
         logger.warning(
-            "gmv_rollup_recompute_invoice_check_failed merchant_id=%s date=%s error_type=%s error=%s",
-            merchant_id, day.isoformat(), type(exc).__name__, str(exc)[:200],
+            "gmv_rollup_recompute_invoice_check_failed merchant_id=%s date=%s edge_ids=%s "
+            "error_type=%s error=%s",
+            merchant_id, day.isoformat(), edge_ids, type(exc).__name__, str(exc)[:200],
         )
         return INVOICE_CHECK_FAILED
     if invoiced is not None:
+        # The edges name what to credit: each carries its refund_ids and refund_amount_cents.
         logger.warning(
-            "gmv_rollup_recompute_skipped_invoiced_day merchant_id=%s date=%s invoice_or_run_id=%s: "
-            "rollup left as billed, manual credit required",
-            merchant_id, day.isoformat(), _get(invoiced, "id"),
+            "gmv_rollup_recompute_skipped_invoiced_day merchant_id=%s date=%s invoice_or_run_id=%s "
+            "edge_ids=%s: rollup left as billed, manual credit required",
+            merchant_id, day.isoformat(), _get(invoiced, "id"), edge_ids,
         )
         return INVOICED_PERIOD_MANUAL_CREDIT
     try:
@@ -268,8 +270,8 @@ async def _recompute_day_unless_invoiced(day: date, merchant_id: str) -> str:
         return RECOMPUTED
     except Exception as exc:  # noqa: BLE001 -- best-effort; the refund already stands
         logger.warning(
-            "gmv_rollup_recompute_failed merchant_id=%s date=%s error_type=%s error=%s",
-            merchant_id, day.isoformat(), type(exc).__name__, str(exc)[:200],
+            "gmv_rollup_recompute_failed merchant_id=%s date=%s edge_ids=%s error_type=%s error=%s",
+            merchant_id, day.isoformat(), edge_ids, type(exc).__name__, str(exc)[:200],
         )
         return RECOMPUTE_FAILED
 
@@ -293,20 +295,21 @@ async def recompute_days_for_edges(edges: Iterable[Mapping[str, Any]]) -> dict[t
     raises. Returns the outcome per (merchant_id, day); an edge with no merchant or creation
     time is logged and left out.
     """
-    days: set[tuple[str, date]] = set()
+    days: dict[tuple[str, date], list[str]] = {}
     for edge in edges:
         merchant_id = _get(edge, "merchant_id")
         try:
             if not merchant_id:
                 raise ValueError("edge has no merchant_id")
-            days.add((str(merchant_id), _coerce_date(_get(edge, "created_at"))))
+            key = (str(merchant_id), _coerce_date(_get(edge, "created_at")))
+            days.setdefault(key, []).append(str(_get(edge, "edge_id")))
         except Exception as exc:  # noqa: BLE001 -- best-effort; the refund already stands
             logger.warning(
                 "gmv_rollup_recompute_skipped edge_id=%s merchant_id=%s error=%s",
                 _get(edge, "edge_id"), merchant_id, str(exc)[:200],
             )
     return {
-        (merchant_id, day): await _recompute_day_unless_invoiced(day, merchant_id)
+        (merchant_id, day): await _recompute_day_unless_invoiced(day, merchant_id, days[(merchant_id, day)])
         for merchant_id, day in sorted(days)
     }
 
