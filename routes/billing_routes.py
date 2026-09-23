@@ -861,6 +861,13 @@ async def _handle_checkout_session_completed(event: Dict[str, Any], db: Database
                     "stripe_subscription_id": stripe_subscription_id,
                 },
             )
+            # Only checkout inserts subscription rows, and it grants in this same
+            # transaction, so a row that already exists was fulfilled by an
+            # earlier delivery: Stripe retries one that failed after committing.
+            # Granting again would add a second ledger grant, reset
+            # merchant_credits.balance to the full allowance (discarding what
+            # the merchant spent) and restart the promo.
+            first_fulfilment = subscription_row is not None
             if not subscription_row:
                 subscription_row = await db.fetch_one(
                     """
@@ -875,74 +882,82 @@ async def _handle_checkout_session_completed(event: Dict[str, Any], db: Database
                 raise ValueError("Unable to resolve local subscription row after insert")
 
             local_subscription_id = int(subscription_row["id"])
-            await _update_merchant_subscription_after_checkout(
-                db,
-                merchant_id=merchant_id,
-                contact_email=merchant_contact_email,
-                local_subscription_id=local_subscription_id,
-                tier_name=_as_text(plan["name"]),
-                monthly_credit_allowance=int(plan["monthly_credit_allowance"] or 0),
-            )
+            if first_fulfilment:
+                await _update_merchant_subscription_after_checkout(
+                    db,
+                    merchant_id=merchant_id,
+                    contact_email=merchant_contact_email,
+                    local_subscription_id=local_subscription_id,
+                    tier_name=_as_text(plan["name"]),
+                    monthly_credit_allowance=int(plan["monthly_credit_allowance"] or 0),
+                )
 
-            await db.execute(
-                """
-                INSERT INTO credit_ledger (
-                  merchant_id,
-                  operation_type,
-                  operation_id,
-                  credits_delta,
-                  balance_after,
-                  source_type,
-                  metadata
+                await db.execute(
+                    """
+                    INSERT INTO credit_ledger (
+                      merchant_id,
+                      operation_type,
+                      operation_id,
+                      credits_delta,
+                      balance_after,
+                      source_type,
+                      metadata
+                    )
+                    VALUES (
+                      :merchant_id,
+                      'subscription_initial_grant',
+                      :operation_id,
+                      :credits_delta,
+                      :balance_after,
+                      'subscription_grant',
+                      CAST(:metadata AS jsonb)
+                    )
+                    """,
+                    {
+                        "merchant_id": merchant_id,
+                        "operation_id": stripe_subscription_id,
+                        "credits_delta": int(plan["monthly_credit_allowance"] or 0),
+                        "balance_after": int(plan["monthly_credit_allowance"] or 0),
+                        "metadata": json.dumps(
+                            {
+                                "stripe_event_id": event_id,
+                                "stripe_customer_id": stripe_customer_id,
+                                "stripe_price_id": price_id,
+                            }
+                        ),
+                    },
                 )
-                VALUES (
-                  :merchant_id,
-                  'subscription_initial_grant',
-                  :operation_id,
-                  :credits_delta,
-                  :balance_after,
-                  'subscription_grant',
-                  CAST(:metadata AS jsonb)
-                )
-                """,
-                {
-                    "merchant_id": merchant_id,
-                    "operation_id": stripe_subscription_id,
-                    "credits_delta": int(plan["monthly_credit_allowance"] or 0),
-                    "balance_after": int(plan["monthly_credit_allowance"] or 0),
-                    "metadata": json.dumps(
-                        {
-                            "stripe_event_id": event_id,
-                            "stripe_customer_id": stripe_customer_id,
-                            "stripe_price_id": price_id,
-                        }
-                    ),
-                },
-            )
 
-            # Create / refresh the merchant_credits row T5 metering operates on.
-            # Without this, the first reserve() call fails because there's no
-            # row to SELECT FOR UPDATE. Idempotent: ON CONFLICT updates allowance
-            # if the merchant re-subscribes after cancellation.
-            tier_allowance = int(plan["monthly_credit_allowance"] or 0)
-            await db.execute(
-                """
-                INSERT INTO merchant_credits (
-                  merchant_id, balance, tier_allowance, period_start, created_at, last_updated
+                # Create / refresh the merchant_credits row T5 metering operates on.
+                # Without this, the first reserve() call fails because there's no
+                # row to SELECT FOR UPDATE. Idempotent: ON CONFLICT updates allowance
+                # if the merchant re-subscribes after cancellation.
+                tier_allowance = int(plan["monthly_credit_allowance"] or 0)
+                await db.execute(
+                    """
+                    INSERT INTO merchant_credits (
+                      merchant_id, balance, tier_allowance, period_start, created_at, last_updated
+                    )
+                    VALUES (
+                      :merchant_id, :balance, :tier_allowance, NOW(), NOW(), NOW()
+                    )
+                    ON CONFLICT (merchant_id) DO UPDATE SET
+                      balance = EXCLUDED.balance,
+                      tier_allowance = EXCLUDED.tier_allowance,
+                      last_updated = NOW()
+                    """,
+                    {
+                        "merchant_id": merchant_id,
+                        "balance": tier_allowance,
+                        "tier_allowance": tier_allowance,
+                    },
                 )
-                VALUES (
-                  :merchant_id, :balance, :tier_allowance, NOW(), NOW(), NOW()
-                )
-                ON CONFLICT (merchant_id) DO UPDATE SET
-                  balance = EXCLUDED.balance,
-                  tier_allowance = EXCLUDED.tier_allowance,
-                  last_updated = NOW()
-                """,
-                {
-                    "merchant_id": merchant_id,
-                    "balance": tier_allowance,
-                    "tier_allowance": tier_allowance,
-                },
+
+        if not first_fulfilment:
+            logger.warning(
+                "checkout.session.completed for subscription %s was already "
+                "fulfilled; not granting the plan again",
+                stripe_subscription_id,
             )
 
         # Stripe sends customer.subscription.updated soon after checkout, which

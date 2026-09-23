@@ -519,3 +519,54 @@ async def test_the_subscription_events_around_a_checkout_do_not_block_it(db, cli
 
     assert (await _subscription(db))["status"] == "active"
     assert await _merchant(db) == {"current_tier": "starter", "subscription_id": await _local_id(db)}
+
+
+PROMO_UNTIL = datetime(2027, 3, 1, tzinfo=timezone.utc)  # pinned, so "untouched" means equal
+
+
+async def _retry_after_a_committed_first_delivery(db, event_id):
+    """The first delivery committed its fulfilment and then failed before it was marked processed, so
+    Stripe delivers the event again and the claim reprocesses it. Pin what the retry must not move."""
+    await db.execute("UPDATE merchant_credits SET balance = 400 WHERE merchant_id = :m", {"m": MERCHANT})  # spent 600
+    await db.execute("UPDATE merchants SET promo_period_until = :p WHERE contact_email = :e",
+                     {"p": PROMO_UNTIL, "e": EMAIL})
+    await db.execute("UPDATE stripe_events SET status = 'failed' WHERE event_id = :e", {"e": event_id})
+
+
+async def test_a_retried_checkout_does_not_grant_the_plan_twice(db, client, stripe_calls):
+    await _subscribed_merchant(db, subs=())
+    await _deliver(client, _checkout_completed("evt_checkout"))
+    await _retry_after_a_committed_first_delivery(db, "evt_checkout")
+    stripe_calls.clear()
+
+    await _deliver(client, _checkout_completed("evt_checkout"))
+
+    assert await _fulfilment(db) == {"ledger_grants": 1, "merchant_credits": 400, "promo_period_until": PROMO_UNTIL}
+    assert await _subscription(db) == {"status": "active", "canceled_at": None, "plan": "starter"}
+    assert await _merchant(db) == {"current_tier": "starter", "subscription_id": await _local_id(db)}
+    assert stripe_calls == [("retrieve", SUB)]
+
+
+async def test_a_retried_checkout_still_cancels_the_plan_it_supersedes(db, client, stripe_calls, monkeypatch):
+    """The first delivery died after committing and before cancelling the merchant's prior plan. The
+    retry skips the grant, not the steps after it."""
+    from routes import billing_routes
+
+    await _subscribed_merchant(db, subs=((SUB_OTHER, "starter"),))
+    real_cancel_prior = billing_routes._cancel_prior_active_subscriptions
+
+    async def crashed_before_cancelling(db, **kwargs):
+        return None
+
+    monkeypatch.setattr(billing_routes, "_cancel_prior_active_subscriptions", crashed_before_cancelling)
+    await _deliver(client, _checkout_completed("evt_upgrade", sid=SUB, plan="growth"))
+    monkeypatch.setattr(billing_routes, "_cancel_prior_active_subscriptions", real_cancel_prior)
+    await _retry_after_a_committed_first_delivery(db, "evt_upgrade")
+    stripe_calls.clear()
+
+    await _deliver(client, _checkout_completed("evt_upgrade", sid=SUB, plan="growth"))
+
+    assert stripe_calls == [("retrieve", SUB), ("cancel", SUB_OTHER)]
+    assert (await _subscription(db, SUB_OTHER))["status"] == "canceled"
+    assert await _fulfilment(db) == {"ledger_grants": 1, "merchant_credits": 400, "promo_period_until": PROMO_UNTIL}
+    assert await _merchant(db) == {"current_tier": "growth", "subscription_id": await _local_id(db, SUB)}
