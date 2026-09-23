@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from decimal import Decimal, InvalidOperation
+from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlparse
 
 from db.database import database
+from services.commerce_attribution_service import apply_external_order_refund
 from services.merchant_event_ingest_service import ingest_merchant_event_batch
 from services.shopify_commerce_event_adapter import (
     UnsupportedShopifyCommerceEvent,
@@ -144,3 +146,78 @@ async def ingest_shopify_commerce_event_best_effort(
             f"merchant={merchant_id} topic={topic}: {exc}"
         )
         return {"status": "degraded", "reason": "canonical_ingest_failed"}
+
+
+def shopify_refund_money(refund: Dict[str, Any]) -> Tuple[Optional[Decimal], Optional[str], Optional[str]]:
+    """``(amount in major units, currency, refusal)`` for the money a refunds/create moved.
+
+    The sum of the refund's successful ``refund`` transactions, the same ones the canonical
+    adapter records as ``refund.succeeded``. A refunds/create body is only a refund object: a
+    pending transaction has moved no money yet. Refuses (``refusal`` set, no amount) a body whose
+    successful transactions are in more than one currency or carry an unreadable amount, rather
+    than count part of it.
+    """
+    total = Decimal("0")
+    currencies = set()
+    seen = set()
+    for index, transaction in enumerate(refund.get("transactions") or []):
+        if not isinstance(transaction, dict):
+            continue
+        kind = str(transaction.get("kind") or "").strip().lower()
+        status = str(transaction.get("status") or "").strip().lower()
+        if kind != "refund" or status != "success":
+            continue
+        transaction_id = str(transaction.get("id") or "").strip() or f"#{index}"
+        if transaction_id in seen:
+            continue
+        seen.add(transaction_id)
+        try:
+            amount = Decimal(str(transaction.get("amount")))
+        except (InvalidOperation, ValueError, TypeError):
+            return None, None, "unreadable_amount"
+        if not amount.is_finite() or amount < 0:
+            return None, None, "unreadable_amount"
+        total += amount
+        currencies.add(str(transaction.get("currency") or "").strip().upper() or None)
+    if not seen:
+        return None, None, "no_successful_refund_transaction"
+    if len(currencies) != 1 or None in currencies:
+        return None, None, "mixed_or_missing_currency"
+    return total, currencies.pop(), None
+
+
+async def apply_shopify_refund_to_attribution_edges(
+    *, merchant_id: str, payload: Any
+) -> Dict[str, Any]:
+    """Reduce the attribution edge of the Shopify order a refunds/create refunds. Never raises.
+
+    The edge is the one orders/paid closed through ``close_external_order_conversion``, keyed by
+    the Shopify order id (the refund body's ``order_id``). The refund is keyed ``shopify:<refund
+    id>``, so a redelivery of the same refund adds nothing. Stripe never sees these orders, so
+    this id is the only one this money is ever recorded under.
+    """
+    if not isinstance(payload, dict):
+        return {"status": "skipped", "reason": "payload_not_object"}
+    refund_id = str(payload.get("id") or "").strip()
+    shopify_order_id = str(payload.get("order_id") or "").strip()
+    if not refund_id or not shopify_order_id:
+        return {"status": "skipped", "reason": "missing_refund_or_order_id"}
+    amount, currency, refusal = shopify_refund_money(payload)
+    if refusal or amount is None or amount <= 0:
+        return {"status": "skipped", "reason": refusal or "zero_amount"}
+    try:
+        edges = await apply_external_order_refund(
+            merchant_id=merchant_id,
+            external_order_id=shopify_order_id,
+            refund_id=f"shopify:{refund_id}",
+            amount=amount,
+            currency=currency,
+        )
+    except Exception as exc:  # noqa: BLE001 -- must not change the webhook's acknowledgement
+        logger.warning(
+            "Shopify refund attribution failed "
+            f"merchant={merchant_id} shopify_order_id={shopify_order_id} refund_id={refund_id}: "
+            f"{type(exc).__name__}: {str(exc)[:200]}"
+        )
+        return {"status": "error", "reason": type(exc).__name__}
+    return {"status": "applied" if edges else "no_edge", "edges": edges}
