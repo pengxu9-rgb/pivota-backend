@@ -95,13 +95,6 @@ case "$CONFIG" in apply|preserve) ;; *) echo "CONFIG must be apply or preserve (
 # the mirrored catalog rows, which is a different blast radius and gets its own switch.
 : "${EXTERNAL_SEED_DESTINATION_SWEEP:=false}"
 : "${EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE:=false}"
-# The retailer ingest drain (jobs/retailer_ingest_drain.py) is DEFINED on every run and ARMED only by
-# this, which is written onto the job verbatim as RETAILER_INGEST_DRAIN_ENABLED. `0|1`, not
-# `true|false`, because the job compares against the exact string "1" - `true` would pass through
-# here and run nothing. See the job block for why a plain re-run DISARMS it.
-_RETAILER_INGEST_DRAIN_ENABLED_EXPLICIT="${RETAILER_INGEST_DRAIN_ENABLED+set}"
-: "${RETAILER_INGEST_DRAIN_ENABLED:=0}"
-case "$RETAILER_INGEST_DRAIN_ENABLED" in 0|1) ;; *) echo "RETAILER_INGEST_DRAIN_ENABLED must be exactly 0 or 1 (got '$RETAILER_INGEST_DRAIN_ENABLED')" >&2; exit 2 ;; esac
 case "$WORKERS" in true|false) ;; *) echo "WORKERS must be exactly true or false (got '$WORKERS')" >&2; exit 2 ;; esac
 case "$PAUSED"  in 0|1)         ;; *) echo "PAUSED must be exactly 0 or 1 (got '$PAUSED')" >&2; exit 2 ;; esac
 case "$RELGRAPH_PUBLICATION_WORKER" in true|false) ;; *) echo "RELGRAPH_PUBLICATION_WORKER must be exactly true or false (got '$RELGRAPH_PUBLICATION_WORKER')" >&2; exit 2 ;; esac
@@ -838,14 +831,17 @@ fi
 # RETAILER_INGEST_LEASE_SECONDS (4200) is deliberately LONGER than the task timeout: an expired lease
 # makes the job claimable again, so it must not expire under a stage that is still running.
 #
-# ⚠️ ARMING, AND WHY A PLAIN RE-RUN DISARMS IT. --set-env-vars REPLACES the job's whole env set, so
-# RETAILER_INGEST_DRAIN_ENABLED is whatever THIS run says - and when the operator says nothing it
-# says 0. Arming by `gcloud run jobs update --update-env-vars` would therefore be wiped by the next
-# reconcile of this script, for any reason, by anyone. Arm through the script, and carry the flag on
-# every later run:
-#   RETAILER_INGEST_DRAIN_ENABLED=1 ARM=retailer-ingest-drain-cron infra/gcp/setup_scheduler.sh prod <a> <b>
-# Failing towards disarmed is the safe direction, but it is silent (the job keeps exiting 0 with
-# {"outcome": "disabled"}), which is why the NOTE below is printed on every run that did not name it.
+# ⚠️ THE ARM/DISARM SWITCH IS THE TRIGGER, NOT THIS ENV. RETAILER_INGEST_DRAIN_ENABLED=1 is written
+# unconditionally. It used to be a script input defaulting to 0, and because --set-env-vars REPLACES
+# the whole env set, any later run of this script for an UNRELATED job (other sessions run it) wrote
+# 0 back and silently disarmed the drain. The trigger has no such problem: sched() leaves an
+# EXISTING trigger's pause state alone (its `(state unchanged: $name)` branch). So:
+#   arm:    gcloud scheduler jobs resume retailer-ingest-drain-cron --location us-west1 --project pivota-prod
+#   disarm: gcloud scheduler jobs pause  retailer-ingest-drain-cron --location us-west1 --project pivota-prod
+# and a re-run of this script changes neither. The job-level env check in jobs/retailer_ingest_drain.py
+# stays as a defense-in-depth kill switch: `gcloud run jobs update retailer-ingest-drain
+# --update-env-vars RETAILER_INGEST_DRAIN_ENABLED=0` stops executions immediately, but the next run
+# of this script puts the 1 back, so it is an emergency brake, not a disarm.
 #
 # DATABASE_URL, not DATABASE_URL_NOVERIFY: this is a Python (asyncpg) job, and every other
 # backend-image Python job here mounts DATABASE_URL; _NOVERIFY exists for node-pg.
@@ -855,17 +851,12 @@ fi
 # 2026-09-23 curated ingest one-offs ran with, copied rather than re-derived. PIVOTA_SERVING_PRICING_REGIONS
 # is US alone: the pipeline requires USD, and the multi-region value carries a comma, which
 # gcloud's comma-splitting of --set-env-vars would break (no value on that line may contain one).
-echo "== job: retailer-ingest-drain (RETAILER_INGEST_DRAIN_ENABLED=$RETAILER_INGEST_DRAIN_ENABLED)"
+echo "== job: retailer-ingest-drain (armed or not by its trigger's pause state)"
 mkcrawljob retailer-ingest-drain "$BACKEND_IMAGE" "$SA" \
   --set-secrets "DATABASE_URL=DATABASE_URL:latest" \
-  --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=retailer-ingest-drain,PIVOTA_COMMIT_SHA=$BACKEND_TAG,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=3,DB_STATEMENT_TIMEOUT_SECONDS=30,DB_COMMAND_TIMEOUT_SECONDS=600,RETAILER_INGEST_DRAIN_ENABLED=$RETAILER_INGEST_DRAIN_ENABLED,RETAILER_INGEST_LEASE_SECONDS=4200,CURATED_CRAWL_PAGE_ATTEMPTS=5,CRAWL_MIN_INTERVAL_SECONDS=4,CRAWL_BACKOFF_BASE_SECONDS=15,PIVOTA_SERVING_PRICING_REGIONS=US,ENABLE_INTAKE_IDENTITY_ENRICHMENT=1,ENABLE_INTAKE_IDENTITY_AUDIT=1,ENABLE_INTAKE_IDENTITY_BRAND_AUTHORED=1,ENABLE_INTAKE_IDENTITY_MIRROR=1,ENABLE_INTAKE_IDENTITY_SYNC=1,ENABLE_KBEAUTY_AGENT_DECISION_GATES=true,ENABLE_STORELESS_BRAND_CATALOG=1,INDEX_ELIGIBLE_READ=1,INDEX_ELIGIBLE_RECALL=1,INDEX_ELIGIBLE_SITEMAP=1,INDEXNOW_ENABLED=true,PDP_QUALITY_SCORE_SOURCE_BACKED_OPTIONAL_COMPONENTS=1,STRICT_BEAUTY_CATEGORY_TEXT_RECALL=true" \
+  --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=retailer-ingest-drain,PIVOTA_COMMIT_SHA=$BACKEND_TAG,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=3,DB_STATEMENT_TIMEOUT_SECONDS=30,DB_COMMAND_TIMEOUT_SECONDS=600,RETAILER_INGEST_DRAIN_ENABLED=1,RETAILER_INGEST_LEASE_SECONDS=4200,CURATED_CRAWL_PAGE_ATTEMPTS=5,CRAWL_MIN_INTERVAL_SECONDS=4,CRAWL_BACKOFF_BASE_SECONDS=15,PIVOTA_SERVING_PRICING_REGIONS=US,ENABLE_INTAKE_IDENTITY_ENRICHMENT=1,ENABLE_INTAKE_IDENTITY_AUDIT=1,ENABLE_INTAKE_IDENTITY_BRAND_AUTHORED=1,ENABLE_INTAKE_IDENTITY_MIRROR=1,ENABLE_INTAKE_IDENTITY_SYNC=1,ENABLE_KBEAUTY_AGENT_DECISION_GATES=true,ENABLE_STORELESS_BRAND_CATALOG=1,INDEX_ELIGIBLE_READ=1,INDEX_ELIGIBLE_RECALL=1,INDEX_ELIGIBLE_SITEMAP=1,INDEXNOW_ENABLED=true,PDP_QUALITY_SCORE_SOURCE_BACKED_OPTIONAL_COMPONENTS=1,STRICT_BEAUTY_CATEGORY_TEXT_RECALL=true" \
   --task-timeout 3600s --max-retries 0 --memory 2Gi --tasks 1 --parallelism 1 \
   --command python --args="-m,jobs.retailer_ingest_drain"
-if [ -z "$_RETAILER_INGEST_DRAIN_ENABLED_EXPLICIT" ]; then
-  echo "   NOTE: retailer-ingest-drain was written with RETAILER_INGEST_DRAIN_ENABLED=0 because this run" >&2
-  echo "   did not name it. If the drain was armed, this run DISARMED it. To keep it armed, re-run with" >&2
-  echo "   RETAILER_INGEST_DRAIN_ENABLED=1." >&2
-fi
 
 echo "== scheduler triggers"
 sched relgraph-sync-cron "37 10 * * *" relgraph-sync
@@ -915,16 +906,22 @@ sched commerce-index-relgraph-cron "*/10 * * * *" commerce-index-relgraph
 sched commerce-index-search-index-cron "*/5 * * * *" commerce-index-search-index
 sched commerce-index-checkout-validation-cron "*/5 * * * *" commerce-index-checkout-validation
 sched commerce-index-insight-refresh-cron "*/10 * * * *" commerce-index-insight-refresh
-# Every 30 minutes, created PAUSED like every new trigger (sched's $PAUSED). The trigger firing is
-# harmless while RETAILER_INGEST_DRAIN_ENABLED=0 - the execution prints {"outcome": "disabled"} and
-# exits - so arming is the env flag AND `ARM=retailer-ingest-drain-cron`, and either one disarms.
+# Every 30 minutes. THIS TRIGGER IS THE DRAIN'S ONE ARM/DISARM SWITCH (see the job block): the
+# job's env always says enabled, so a resumed trigger means crawling.
+#
+# Created PAUSED no matter what $PAUSED says: the 5th argument pins it, so `PAUSED=0` (which arms
+# every trigger a run creates) cannot arm the drain as a side effect of provisioning it. After
+# creation sched() leaves its state alone on every re-run. Arm and disarm with
+# `gcloud scheduler jobs resume|pause retailer-ingest-drain-cron`. `ARM=retailer-ingest-drain-cron`
+# also resumes it, since that is sched()'s generic explicit arm, but it is not needed and not the
+# documented path: a gcloud resume arms it without reconciling ~20 other jobs and the worker.
 #
 # 30 minutes is SHORTER than the 3600s task timeout, and Cloud Run starts a new execution whether
 # or not the last one is still running. That is safe only because claim_due_job()
 # (db/retailer_ingest.py) refuses to claim while ANY job holds an unexpired lease: a tick that lands
 # during a long stage exits idle instead of starting a second crawl from the one crawl NAT. Remove
 # that clause and this cadence becomes two crawls in flight.
-sched retailer-ingest-drain-cron "*/30 * * * *" retailer-ingest-drain
+sched retailer-ingest-drain-cron "*/30 * * * *" retailer-ingest-drain "$RUN_INVOKER" 1
 if [ "$STORE_AUDIT_UCP_REPROBE_WORKER" = true ]; then
   for job in store-audit-ucp-reprobe-enqueue store-audit-ucp-probe; do
     "$GCLOUD" run jobs add-iam-policy-binding "$job" --region "$REGION" \

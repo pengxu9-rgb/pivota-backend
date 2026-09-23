@@ -583,49 +583,61 @@ def test_the_drain_overrides_land_last(tmp_path):
     assert (REPO / "jobs" / "retailer_ingest_drain.py").is_file()
 
 
-def test_the_drain_ships_disarmed_with_the_proven_env(tmp_path):
-    calls, proc = _run_full(tmp_path, {"RETAILER_INGEST_DRAIN_ENABLED": None})
-    tokens = _drain_call(calls)
-    env = _env(tokens)
-    assert env["RETAILER_INGEST_DRAIN_ENABLED"] == "0", "creating the job must not arm it"
-    missing = {k: v for k, v in PROVEN_INGEST_ENV.items() if env.get(k) != v}
-    assert not missing, f"env differs from the proven ingest env: {missing}"
-    # The pipeline records the image it ran on (PIVOTA_COMMIT_SHA or IMAGE_SHA).
-    assert env["PIVOTA_COMMIT_SHA"] == "a" * 40
-    assert "--update-env-vars" not in tokens
-    assert _values(tokens, "--set-secrets") == ["DATABASE_URL=DATABASE_URL:latest"]
-    # Saying nothing DISARMS a previously armed drain (the env set is replaced), so say so.
-    assert "DISARMED" in proc.stderr
+def test_the_drain_env_is_always_enabled_with_the_proven_env(tmp_path):
+    """The TRIGGER is the arm/disarm switch; the env must not be one.
+
+    It used to be a script input defaulting to 0, and because --set-env-vars replaces the whole env
+    set, any run of this script for an unrelated job silently disarmed the drain. A leftover
+    RETAILER_INGEST_DRAIN_ENABLED=0 in the operator's shell must not reach the job either."""
+    for leftover in (None, "0"):
+        run_dir = tmp_path / str(leftover)    # one call log per run
+        run_dir.mkdir()
+        calls = _run(run_dir, {"RETAILER_INGEST_DRAIN_ENABLED": leftover})
+        tokens = _drain_call(calls)
+        env = _env(tokens)
+        assert env["RETAILER_INGEST_DRAIN_ENABLED"] == "1", leftover
+        missing = {k: v for k, v in PROVEN_INGEST_ENV.items() if env.get(k) != v}
+        assert not missing, f"env differs from the proven ingest env: {missing}"
+        # The pipeline records the image it ran on (PIVOTA_COMMIT_SHA or IMAGE_SHA).
+        assert env["PIVOTA_COMMIT_SHA"] == "a" * 40
+        assert "--update-env-vars" not in tokens
+        assert _values(tokens, "--set-secrets") == ["DATABASE_URL=DATABASE_URL:latest"]
 
 
-def test_the_drain_is_armed_only_by_its_exact_flag(tmp_path):
-    calls, proc = _run_full(tmp_path, {"RETAILER_INGEST_DRAIN_ENABLED": "1"})
-    assert _env(_drain_call(calls))["RETAILER_INGEST_DRAIN_ENABLED"] == "1"
-    assert "DISARMED" not in proc.stderr
+def _drain_state_changes(calls: list[str]) -> set[tuple[str, str]]:
+    return {c for c in _state_changes(calls) if c[1] == DRAIN_TRIGGER}
 
 
-@pytest.mark.parametrize("value", ["true", "yes", "on", "01"])
-def test_a_drain_flag_the_job_would_not_read_as_armed_is_refused(tmp_path, value):
-    """The job arms on the exact string "1"; `true` would look armed here and run nothing."""
-    calls, _ = _run_full(tmp_path, {"RETAILER_INGEST_DRAIN_ENABLED": value}, expect_rc=2)
-    assert not [c for c in calls if c.startswith("run jobs ")], "refused before any job was written"
-
-
-def test_the_drain_trigger_is_every_30_minutes_utc_and_created_paused(tmp_path):
+@pytest.mark.parametrize("paused_env", [None, "1", "0"])
+def test_the_drain_trigger_is_every_30_minutes_utc_and_created_paused(tmp_path, paused_env):
+    """Created paused even under PAUSED=0, which arms every OTHER trigger a run creates."""
     empty = tmp_path / "none.txt"
     empty.write_text("")
-    calls = _run(tmp_path, {"EXISTING_TRIGGERS_FILE": str(empty)})
+    calls = _run(tmp_path, {"EXISTING_TRIGGERS_FILE": str(empty), "PAUSED": paused_env,
+                            # PAUSED=0 resumes the Store Audit lanes' creates too; irrelevant here.
+                            "STORE_AUDIT_UCP_REPROBE_ARMED": "false",
+                            "STORE_AUDIT_COMMERCE_REPROBE_ARMED": "false"})
     creates = [c for c in calls if c.startswith(f"scheduler jobs create http {DRAIN_TRIGGER} ")]
     assert len(creates) == 1, creates
     assert "--schedule=*/30 * * * * --time-zone=Etc/UTC" in creates[0]
     assert f"/jobs/{DRAIN}:run" in creates[0]
-    changes = _state_changes(calls)
-    assert ("pause", DRAIN_TRIGGER) in changes and ("resume", DRAIN_TRIGGER) not in changes
+    assert _drain_state_changes(calls) == {("pause", DRAIN_TRIGGER)}
 
 
-def test_the_drain_trigger_is_armed_by_name_only(tmp_path):
-    changes = _state_changes(_run(tmp_path, {"ARM": DRAIN_TRIGGER, "RETAILER_INGEST_DRAIN_ENABLED": "1"}))
-    assert changes == {("resume", DRAIN_TRIGGER)}, changes
+@pytest.mark.parametrize("overrides", [
+    {},                                                    # a plain reconcile for another job
+    {"PAUSED": "0"},                                       # arms NEW triggers only
+    {"RETAILER_INGEST_DRAIN_ENABLED": "0"},                 # the retired input, left in a shell
+    {"DISARM": "reviews-invitation-send-cron"},            # surgery on a different trigger
+    {"ARM": "content-canonical-election-cron"},
+], ids=["plain", "paused0", "legacy-flag", "disarm-other", "arm-other"])
+def test_a_rerun_leaves_an_existing_drain_trigger_alone(tmp_path, overrides):
+    """Whatever state the live trigger is in - paused or resumed by `gcloud scheduler jobs
+    pause|resume` - a re-run issues neither pause nor resume for it, so that state stands. The
+    `update` must still happen (the definition is reconciled), just never the state."""
+    calls = _run(tmp_path, overrides)
+    assert [c for c in calls if c.startswith(f"scheduler jobs update http {DRAIN_TRIGGER} ")]
+    assert _drain_state_changes(calls) == set(), _drain_state_changes(calls)
 
 
 @pytest.mark.parametrize("script", ["setup_scheduler.sh", "setup_monitoring.sh"])
