@@ -20,7 +20,8 @@ _IS_PG = DATABASE_URL.startswith("postgresql://") or DATABASE_URL.startswith("po
 pytestmark = pytest.mark.skipif(not _IS_PG, reason="needs a Postgres DATABASE_URL")
 
 _SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")
-_TABLES = ("gmv_attribution_daily", "commerce_attribution_edges", "surface_click_events", "invoices")
+_TABLES = ("gmv_attribution_daily", "commerce_attribution_edges", "surface_click_events", "invoices",
+           "billing_runs")
 _ROLLUP_DDL = (Path(__file__).resolve().parent.parent / "db/migrations/110_gmv_attribution_daily.sql")
 
 
@@ -61,6 +62,10 @@ async def _build_schema(database):
     await database.execute(
         "CREATE TABLE invoices (id BIGSERIAL PRIMARY KEY, merchant_id VARCHAR(50) NOT NULL, "
         "billing_period_start DATE NOT NULL, billing_period_end DATE NOT NULL, status TEXT)"
+    )
+    await database.execute(
+        "CREATE TABLE billing_runs (id BIGSERIAL PRIMARY KEY, period_start TIMESTAMPTZ NOT NULL, "
+        "period_end TIMESTAMPTZ NOT NULL, status TEXT NOT NULL DEFAULT 'running')"
     )
 
 
@@ -350,3 +355,55 @@ async def test_a_reroll_waits_for_another_reroll_of_the_same_day(db):
         await asyncio.wait_for(task, timeout=10)
     finally:
         await other.close()
+
+
+
+async def test_a_day_a_billing_run_covers_is_left_alone_before_its_invoice_exists(db):
+    """Re-review of #2271: the run is inserted before it reads the rollup; its invoice commits only
+    after the Stripe calls. The guard must see the run, not wait for the invoice."""
+    from services.partner_order_adjustments import record_partner_order_adjustment
+
+    await _close_partner_edge(db)
+    await db.execute("INSERT INTO billing_runs (period_start, period_end, status) VALUES (:s, :e, 'running')",
+                     {"s": YESTERDAY - timedelta(days=5), "e": YESTERDAY + timedelta(days=5)})
+    r = await record_partner_order_adjustment(partner="reap", purchase_id="rp_abc", event_id="evt_1",
+                                              kind="refund", currency="USD", amount_minor=1500)
+    assert r.rollup == "invoiced_period_manual_credit"
+    assert (await _rollup(db))["r"] == 0
+
+
+async def test_a_cancelled_billing_run_does_not_block(db):
+    from services.partner_order_adjustments import record_partner_order_adjustment
+
+    await _close_partner_edge(db)
+    await db.execute("INSERT INTO billing_runs (period_start, period_end, status) VALUES (:s, :e, 'cancelled')",
+                     {"s": YESTERDAY - timedelta(days=5), "e": YESTERDAY + timedelta(days=5)})
+    r = await record_partner_order_adjustment(partner="reap", purchase_id="rp_abc", event_id="evt_1",
+                                              kind="refund", currency="USD", amount_minor=1500)
+    assert r.rollup == "recomputed"
+
+
+async def test_a_replay_heals_a_failed_reroll(db, monkeypatch):
+    """Re-review of #2271: the first re-roll fails; re-running the same event retries it."""
+    from services import gmv_aggregation_service as gmv
+    from services.partner_order_adjustments import record_partner_order_adjustment
+
+    await _close_partner_edge(db)
+    real = gmv.recompute_for_date
+    calls = {"n": 0}
+
+    async def fail_once(day, merchant_id):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("transient")
+        return await real(day, merchant_id)
+
+    monkeypatch.setattr(gmv, "recompute_for_date", fail_once)
+    kw = dict(partner="reap", purchase_id="rp_abc", event_id="evt_1", kind="refund", currency="USD",
+              amount_minor=1500)
+    first = await record_partner_order_adjustment(**kw)
+    assert (first.status, first.rollup) == ("applied", "recompute_failed")
+    assert (await _rollup(db))["r"] == 0
+    second = await record_partner_order_adjustment(**kw)
+    assert (second.status, second.rollup) == ("replayed", "recomputed")
+    assert await _rollup(db) == {"g": 4500, "r": 1500, "n": 3000, "t": 300}

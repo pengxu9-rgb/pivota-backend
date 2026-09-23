@@ -112,7 +112,36 @@ async def test_a_redelivered_event_changes_nothing(monkeypatch, world):
     db = _use(monkeypatch, _edge(refund_ids=["reap:evt_1"], refund_amount_cents=1500))
     r = await _call()
     assert r.status == "replayed"
-    assert world["applied"] == [] and db.executed == [] and world["recomputed"] == []
+    assert world["applied"] == [] and db.executed == []
+    # ...but it retries the re-roll, which is idempotent and guarded (re-review of #2271).
+    assert world["recomputed"] == ["cae_ext_1"] and r.rollup == "recomputed"
+
+
+async def test_a_dry_run_replay_does_not_reroll(monkeypatch, world):
+    _use(monkeypatch, _edge(refund_ids=["reap:evt_1"], refund_amount_cents=1500))
+    r = await _call(apply=False)
+    assert r.status == "replayed" and world["recomputed"] == []
+
+
+@pytest.mark.parametrize("rollup, code", [("recomputed", 0), ("invoiced_period_manual_credit", 4),
+                                          ("recompute_failed", 5), ("invoice_check_failed", 5)])
+def test_the_ops_script_tells_credit_by_hand_apart_from_retry(monkeypatch, rollup, code):
+    import asyncio
+
+    from scripts import record_partner_order_adjustment as script
+
+    async def fake_record(**kw):
+        return adj.AdjustmentResult(status="applied", purchase_id="rp", refund_id="reap:e", rollup=rollup)
+
+    class _DB:
+        is_connected = True
+
+    monkeypatch.setattr(adj, "record_partner_order_adjustment", fake_record)
+    monkeypatch.setattr("db.database.database", _DB(), raising=False)
+    args = script.build_parser().parse_args(["--partner", "reap", "--purchase-id", "rp", "--event-id", "e",
+                                             "--kind", "refund", "--currency", "USD", "--amount-minor", "1",
+                                             "--apply"])
+    assert asyncio.run(script.run(args)) == code
 
 
 async def test_refund_ids_stored_as_json_text_still_dedupe(monkeypatch, world):

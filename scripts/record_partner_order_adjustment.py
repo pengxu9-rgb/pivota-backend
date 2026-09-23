@@ -18,8 +18,9 @@ refund would be applied a second time.
 
 Exit status: 0 applied / would_apply / replayed; 3 no_edge / nothing_remaining (nothing to do,
 and a human should look); 2 refused (the input can never apply as given); 4 applied, but the
-order's day is already invoiced (or could not be checked), so billing was NOT changed: credit the
-merchant by hand.
+order's day is already billed (an invoice or a billing run covers it), so billing was NOT changed:
+credit the merchant by hand; 5 the billing re-roll failed or could not be checked: nothing to
+credit, re-run the same command to retry it (a re-run is a replay and only retries the re-roll).
 """
 
 import argparse
@@ -75,9 +76,14 @@ async def run(args):
         print(json.dumps(asdict(result), default=str))
         if not args.apply and result.status == "would_apply":
             print("DRY RUN: nothing written. Re-run with --apply to record it.", file=sys.stderr)
-        if result.status == "applied" and result.rollup != "recomputed":
-            print(f"APPLIED to the edge, but billing was NOT updated ({result.rollup}).", file=sys.stderr)
+        if result.status in ("applied", "replayed") and result.rollup == "invoiced_period_manual_credit":
+            print("Recorded on the edge; the day is already billed, so billing was NOT changed. "
+                  "Credit the merchant by hand.", file=sys.stderr)
             return 4
+        if result.status in ("applied", "replayed") and result.rollup in ("recompute_failed", "invoice_check_failed"):
+            print(f"Recorded on the edge; the billing re-roll did not run ({result.rollup}). "
+                  "Re-run this same command to retry it. Do NOT credit by hand.", file=sys.stderr)
+            return 5
         return EXIT.get(result.status, 1)
     finally:
         if opened:

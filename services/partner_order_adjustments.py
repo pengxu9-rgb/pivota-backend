@@ -88,6 +88,10 @@ WHERE edge_id = :edge_id
 """
 
 
+class _Replayed(Exception):
+    """Internal: leave the lock's transaction (writing nothing) and re-run the re-roll after it."""
+
+
 class AdjustmentRefused(ValueError):
     """The input can never be applied as given. `code` names why."""
 
@@ -103,6 +107,7 @@ class AdjustmentResult:
     purchase_id: str
     refund_id: str
     #: recomputed | invoiced_period_manual_credit | invoice_check_failed | recompute_failed
+    #: (invoiced_period_manual_credit also covers a day a billing run covers, even before its invoice)
     rollup: Optional[str] = None
     edge_id: Optional[str] = None
     agent_id: Optional[str] = None
@@ -181,88 +186,99 @@ async def record_partner_order_adjustment(
     refund_major: Optional[Decimal] = None
     edge: Optional[Dict[str, Any]] = None
 
-    async with database.transaction():
-        rows = [dict(r) for r in await database.fetch_all(
-            _EDGE_FOR_PURCHASE_SQL, {"purchase_id": v["purchase_id"]}
-        )]
-        if not rows:
-            # The purchase never closed an edge (not completed, or its close failed and is waiting
-            # on reconciliation). Nothing to reverse yet. The caller keeps the event and retries.
-            return result
-        if len(rows) > 1:
-            raise AdjustmentRefused("ambiguous_edge", f"{len(rows)} partner edges for one purchase")
-        edge = rows[0]
-        refund_ids = edge["refund_ids"]
-        if isinstance(refund_ids, str):
-            refund_ids = json.loads(refund_ids)
-        gross = edge["gross_attributed_gmv_cents"]
-        before = int(edge["refund_amount_cents"] or 0)
-        result.edge_id = edge["edge_id"]
-        result.agent_id = edge["agent_id"]
-        result.currency = (edge["currency"] or "").upper() or None
-        result.gross_minor = gross
-        result.refunded_before_minor = before
+    try:
+        async with database.transaction():
+            rows = [dict(r) for r in await database.fetch_all(
+                _EDGE_FOR_PURCHASE_SQL, {"purchase_id": v["purchase_id"]}
+            )]
+            if not rows:
+                # The purchase never closed an edge (not completed, or its close failed and is waiting
+                # on reconciliation). Nothing to reverse yet. The caller keeps the event and retries.
+                return result
+            if len(rows) > 1:
+                raise AdjustmentRefused("ambiguous_edge", f"{len(rows)} partner edges for one purchase")
+            edge = rows[0]
+            refund_ids = edge["refund_ids"]
+            if isinstance(refund_ids, str):
+                refund_ids = json.loads(refund_ids)
+            gross = edge["gross_attributed_gmv_cents"]
+            before = int(edge["refund_amount_cents"] or 0)
+            result.edge_id = edge["edge_id"]
+            result.agent_id = edge["agent_id"]
+            result.currency = (edge["currency"] or "").upper() or None
+            result.gross_minor = gross
+            result.refunded_before_minor = before
 
-        if v["refund_id"] in (refund_ids or []):
-            # Same event again. It must say the same thing: a redelivery is harmless, but a re-run
-            # with a different amount is an operator mistake that "replayed" would hide.
-            adjustments = edge["adjustments"]
-            if isinstance(adjustments, str):
-                adjustments = json.loads(adjustments)
-            stored = next((a for a in adjustments or []
-                           if a.get("partner") == v["partner"] and a.get("event_id") == v["event_id"]), None)
-            if stored is not None:
-                differs = [k for k, mine in (("kind", v["kind"]), ("currency", v["currency"]),
-                                             ("amount_minor", v["amount_minor"]))
-                           if mine is not None and stored.get(k) != mine]
-                if differs:
-                    raise AdjustmentRefused(
-                        "replay_mismatch", f"event {v['event_id']} was recorded with different {', '.join(differs)}"
-                    )
-            result.status = "replayed"
-            return result
-        if result.currency != v["currency"]:
-            raise AdjustmentRefused(
-                "currency_mismatch", f"edge is {result.currency}, adjustment is {v['currency']}"
+            if v["refund_id"] in (refund_ids or []):
+                # Same event again. It must say the same thing: a redelivery is harmless, but a re-run
+                # with a different amount is an operator mistake that "replayed" would hide.
+                adjustments = edge["adjustments"]
+                if isinstance(adjustments, str):
+                    adjustments = json.loads(adjustments)
+                stored = next((a for a in adjustments or []
+                               if a.get("partner") == v["partner"] and a.get("event_id") == v["event_id"]), None)
+                if stored is not None:
+                    differs = [k for k, mine in (("kind", v["kind"]), ("currency", v["currency"]),
+                                                 ("amount_minor", v["amount_minor"]))
+                               if mine is not None and stored.get(k) != mine]
+                    if differs:
+                        raise AdjustmentRefused(
+                            "replay_mismatch", f"event {v['event_id']} was recorded with different {', '.join(differs)}"
+                        )
+                result.status = "replayed"
+                raise _Replayed()
+            if result.currency != v["currency"]:
+                raise AdjustmentRefused(
+                    "currency_mismatch", f"edge is {result.currency}, adjustment is {v['currency']}"
+                )
+            if _minor_exponent(v["currency"]) != 2:
+                raise AdjustmentRefused(
+                    "unsupported_currency",
+                    f"{v['currency']} is not a 2-decimal currency; the shared refund ledger stores cents",
+                )
+            if not isinstance(gross, int) or gross <= 0:
+                raise AdjustmentRefused("edge_has_no_gross", "a partner edge always carries a positive gross")
+            remaining = gross - before
+            if remaining <= 0:
+                result.status = "nothing_remaining"
+                return result
+            amount = v["amount_minor"] if v["amount_minor"] is not None else remaining
+            if amount > remaining:
+                raise AdjustmentRefused(
+                    "exceeds_remaining", f"{amount} > {remaining} left of {gross} ({v['currency']} minor units)"
+                )
+            result.applied_minor = amount
+            if not apply:
+                result.status = "would_apply"
+                return result
+
+            refund_major = Decimal(amount) / Decimal(100)
+            applied_rows = await _apply_refund(edge["order_id"], v["refund_id"], refund_major)
+            if len(applied_rows) != 1:
+                # The lock is on the edge found by purchase id. Its order_id matching 0 or 2+ rows means
+                # the refund would land somewhere other than where we checked it.
+                raise RuntimeError(f"refund on order_id matched {len(applied_rows)} edges, expected 1")
+            adjustment = {
+                "partner": v["partner"], "event_id": v["event_id"], "kind": v["kind"],
+                "amount_minor": amount, "currency": v["currency"],
+                "occurred_at": v["occurred_at"].isoformat() if v["occurred_at"] else None,
+                "recorded_at": _now().isoformat(),
+            }
+            await database.execute(
+                _APPEND_ADJUSTMENT_SQL,
+                {"edge_id": edge["edge_id"], "adjustment": json.dumps(adjustment), "now": _now()},
             )
-        if _minor_exponent(v["currency"]) != 2:
-            raise AdjustmentRefused(
-                "unsupported_currency",
-                f"{v['currency']} is not a 2-decimal currency; the shared refund ledger stores cents",
-            )
-        if not isinstance(gross, int) or gross <= 0:
-            raise AdjustmentRefused("edge_has_no_gross", "a partner edge always carries a positive gross")
-        remaining = gross - before
-        if remaining <= 0:
-            result.status = "nothing_remaining"
-            return result
-        amount = v["amount_minor"] if v["amount_minor"] is not None else remaining
-        if amount > remaining:
-            raise AdjustmentRefused(
-                "exceeds_remaining", f"{amount} > {remaining} left of {gross} ({v['currency']} minor units)"
-            )
-        result.applied_minor = amount
+            result.status = "applied"
+
+    except _Replayed:
+        # A redelivery changes nothing on the edge, but it does retry the re-roll: an earlier
+        # attempt may have failed (recompute_failed / invoice_check_failed), and re-rolling from the
+        # edges is safe to repeat under the same guards (review of #2271). A dry run never re-rolls.
         if not apply:
-            result.status = "would_apply"
             return result
-
-        refund_major = Decimal(amount) / Decimal(100)
-        applied_rows = await _apply_refund(edge["order_id"], v["refund_id"], refund_major)
-        if len(applied_rows) != 1:
-            # The lock is on the edge found by purchase id. Its order_id matching 0 or 2+ rows means
-            # the refund would land somewhere other than where we checked it.
-            raise RuntimeError(f"refund on order_id matched {len(applied_rows)} edges, expected 1")
-        adjustment = {
-            "partner": v["partner"], "event_id": v["event_id"], "kind": v["kind"],
-            "amount_minor": amount, "currency": v["currency"],
-            "occurred_at": v["occurred_at"].isoformat() if v["occurred_at"] else None,
-            "recorded_at": _now().isoformat(),
-        }
-        await database.execute(
-            _APPEND_ADJUSTMENT_SQL,
-            {"edge_id": edge["edge_id"], "adjustment": json.dumps(adjustment), "now": _now()},
-        )
-        result.status = "applied"
+        result.rollup = await _recompute_rollup(edge)
+        result.rollup_recomputed = result.rollup == "recomputed"
+        return result
 
     # After commit. Neither step may undo the refund, so each failure is reported, not raised.
     await _emit_refund_event(applied_rows, edge["order_id"], v["refund_id"], refund_major)
@@ -299,6 +315,16 @@ WHERE merchant_id = :merchant_id
 LIMIT 1
 """
 
+# A billing run is inserted BEFORE it reads any rollup row, and its invoices row only commits after
+# the Stripe calls, so an in-progress or failed run is visible only here (re-review of #2271). Any
+# run but a cancelled one covers every merchant of its period.
+_BILLING_RUN_COVERING_DAY_SQL = """
+SELECT id FROM billing_runs
+WHERE CAST(period_start AS DATE) <= :day AND CAST(period_end AS DATE) >= :day
+  AND status <> 'cancelled'
+LIMIT 1
+"""
+
 
 async def _recompute_rollup(edge: Dict[str, Any]) -> str:
     """Re-roll the edge's creation day, the day its gross was billed on, unless it is invoiced."""
@@ -308,6 +334,8 @@ async def _recompute_rollup(edge: Dict[str, Any]) -> str:
     merchant_id = str(edge["merchant_id"])
     try:
         invoiced = await database.fetch_one(_INVOICE_COVERING_DAY_SQL, {"merchant_id": merchant_id, "day": day})
+        if invoiced is None:
+            invoiced = await database.fetch_one(_BILLING_RUN_COVERING_DAY_SQL, {"day": day})
     except Exception as exc:  # noqa: BLE001 -- fail closed: never rewrite a day we could not check
         logger.warning("partner_adjustment: invoice check failed edge=%s day=%s error_type=%s",
                        edge.get("edge_id"), day, type(exc).__name__)
