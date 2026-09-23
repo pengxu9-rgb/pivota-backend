@@ -1953,7 +1953,8 @@ async def _cancel_prior_active_subscriptions(
     Given completed_at (when Stripe completed the keeping checkout), only
     subscriptions that started before it: a plan bought after this checkout
     is newer and is never cancelled by it, even if it committed while this
-    checkout was being processed.
+    checkout was being processed. A row with no started_at cannot be shown to
+    be newer (checkout always writes one) and is cancelled as before.
 
     Called after a new subscription checkout completes so the merchant ends up
     with a single active plan. Isolated per subscription: a failure to cancel
@@ -1979,6 +1980,7 @@ async def _cancel_prior_active_subscriptions(
                AND stripe_subscription_id IS DISTINCT FROM :keep
                AND (
                  CAST(:completed_at AS TIMESTAMPTZ) IS NULL
+                 OR started_at IS NULL
                  OR started_at < CAST(:completed_at AS TIMESTAMPTZ)
                )
             """,

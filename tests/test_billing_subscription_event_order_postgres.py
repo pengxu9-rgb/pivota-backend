@@ -857,3 +857,19 @@ async def test_an_older_checkout_never_cancels_a_plan_that_started_after_it(db, 
     assert (await _subscription(db, newer))["status"] == "active"
     assert ("cancel", SUB_OTHER) in stripe_calls
     assert (await _subscription(db, SUB_OTHER))["status"] == "canceled"
+
+
+async def test_a_prior_plan_with_no_start_time_is_still_superseded(db, client, stripe_calls):
+    """Only a row with a start time can be shown to be newer than this checkout. A live prior plan
+    without one is cancelled as before, rather than left billing next to the new plan."""
+    await _subscribed_merchant(db, subs=((SUB_OTHER, "starter"),))
+    await db.execute("UPDATE user_subscriptions SET started_at = NULL WHERE stripe_subscription_id = :s",
+                     {"s": SUB_OTHER})
+    stripe_calls.clear()
+
+    await _deliver(client, _checkout_completed("evt_upgrade", sid=SUB, plan="growth",
+                                               completed_at=NOW - timedelta(minutes=5)))
+
+    assert ("cancel", SUB_OTHER) in stripe_calls
+    assert (await _subscription(db, SUB_OTHER))["status"] == "canceled"
+    assert await _merchant(db) == {"current_tier": "growth", "subscription_id": await _local_id(db, SUB)}
