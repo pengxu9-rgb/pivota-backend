@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import sys
 from pathlib import Path
@@ -37,7 +38,7 @@ from services.catalog_enrichment_agent.primary_ingestion import (  # noqa: E402
     skipped_by_reason,
 )
 from services.catalog_enrichment_agent.primary_readiness import PrimaryReadinessIncomplete  # noqa: E402
-from services.curated_brand_feed import CrawlIncomplete, records_for_brand  # noqa: E402
+from services.curated_brand_feed import CrawlIncomplete, lip_title_evidence, records_for_brand  # noqa: E402
 from services.catalog_onboard_worker import normalize_curated_brand_payload  # noqa: E402
 
 
@@ -199,6 +200,84 @@ def _select_by_gtin(records: List[Dict[str, Any]], canonical: set, *, domain: st
     if not kept:
         raise ValueError(f"{domain}: --only-gtin matched none of the selected products")
     return kept, matched
+
+
+#: Printed once per record a category filter left out of the run. Greppable, like SKIPPED_PDP_PREFIX.
+LEFT_OUT_PDP_PREFIX = "    left out pdp "
+
+#: Printed once per record `--lip-title-evidence` placed, so an operator reads exactly those rows
+#: before --apply: no word list can name every non-product ("Lipstick Poster"). Greppable.
+LIP_TITLE_PDP_PREFIX = "    lip title pdp "
+
+
+def _print_lip_title_rows(records: List[Dict[str, Any]]) -> int:
+    from services.curated_brand_feed import CATEGORY_CONFIDENCE_LIP_TITLE
+    placed = [r for r in records if isinstance(r.get("pdp"), dict)
+              and r["pdp"].get("category_confidence") == CATEGORY_CONFIDENCE_LIP_TITLE]
+    for record in placed:
+        pdp = record["pdp"]
+        print(LIP_TITLE_PDP_PREFIX + json.dumps({
+            "product_name": pdp.get("product_name") or pdp.get("title"),
+            "category_path": pdp.get("category_path"),
+            "merchant_product_type": pdp.get("category_source_product_type"),
+        }, sort_keys=True, ensure_ascii=False))
+    return len(placed)
+
+
+#: Its own line per domain, like LEGACY_LISTINGS_MARKER: scripts/curated_apply_gate.py reads it so a
+#: gate that passes a filtered run also says how many products the filter kept out of it.
+CATEGORY_FILTER_MARKER = "category filter report: "
+
+
+def _select_by_category(records: List[Dict[str, Any]], *, prefix: Optional[str],
+                        domain: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Keep the records whose category RESOLVES (and, with `prefix`, sits under it).
+
+    One unresolved row blocks a whole cohort (`category_unresolved`), and a retailer's feed mixes
+    rows the taxonomy can place with rows it cannot: at k-touch.us 10 of 24 3CE products resolve.
+    --only-gtin is the narrowing tool for that, but these feeds carry almost no barcodes, so it
+    cannot select them. This narrows by the resolved category instead -- `beauty/makeup/lip` gives
+    a lip-only pass. It never resolves anything: a left-out row is printed, one line each, and stays
+    out of the plan exactly as unresolved as it was.
+
+    Called once PER DOMAIN, so a domain whose every product is left out raises instead of quietly
+    vanishing from a multi-domain --file run. A filter that keeps NOTHING raises, like --only-gtin
+    and --only-vendor. A record with no `pdp` is not a category question: it is kept, and the plan
+    refuses it exactly as it would without this filter.
+    """
+    from services.category_path_aliases import resolve
+    want = (prefix or "").strip().strip("/").lower()
+    kept, left_out = [], []
+    for record in records:
+        pdp = record.get("pdp")
+        if not isinstance(pdp, dict):
+            kept.append(record)
+            continue
+        leaf = resolve(pdp.get("category_path")) or ""
+        if leaf and (not want or leaf == want or leaf.startswith(want + "/")):
+            kept.append(record)
+        else:
+            left_out.append((record, "category_unresolved" if not leaf else "outside_category_filter"))
+    for record, reason in left_out:
+        pdp = record.get("pdp") or {}
+        print(LEFT_OUT_PDP_PREFIX + json.dumps({
+            "reason": reason,
+            "product_name": pdp.get("product_name") or pdp.get("title"),
+            "category_path": pdp.get("category_path"),
+            "merchant_product_type": pdp.get("category_source_product_type"),
+            "canonical_url": pdp.get("canonical_url") or pdp.get("source_url"),
+        }, sort_keys=True, ensure_ascii=False))
+    print(f"    category filter {want or '(resolved)'}: {len(records)} -> {len(kept)} products "
+          f"({len(left_out)} left out)")
+    print(CATEGORY_FILTER_MARKER + json.dumps({
+        "domain": domain, "filter": want or "(resolved)", "selected": len(records),
+        "kept": len(kept), "left_out": len(left_out),
+    }, sort_keys=True))
+    if not kept:
+        where = f"{domain}: " if domain else ""
+        raise ValueError(f"{where}category filter {want or '(resolved)'} kept none of the "
+                         f"{len(records)} selected products")
+    return kept
 
 
 #: Its own line, never merged into `primary ingestion:` — scripts/curated_apply_gate.py parses that
@@ -470,6 +549,10 @@ async def _run(args: argparse.Namespace) -> int:
             matched_gtins |= matched
             print(f"    gtin filter {sorted(wanted_gtins)}: {before} -> {len(recs)} products "
                   f"(matched {sorted(matched)})")
+        if args.lip_title_evidence:
+            print(f"    lip title evidence placed {_print_lip_title_rows(recs)} product(s) -- review each before --apply")
+        if args.only_category or args.only_resolved_category:
+            recs = _select_by_category(recs, prefix=args.only_category, domain=b["domain"])
         print(f"  {b['domain']}: {len(recs)} products")
         # A brand-family storefront must not ingest silently. misshaus.com shipped 17
         # A'pieu products into the index branded "Missha" because nothing printed the
@@ -631,6 +714,32 @@ def main(argv: Optional[List[str]] = None) -> int:
             "crawl still reads the whole feed and GTIN recovery still spends its budget first."
         ),
     )
+    p.add_argument(
+        "--lip-title-evidence",
+        action="store_true",
+        help=(
+            "let an explicit lip title ('Soft Matte Lipstick', 'Lip Liner') place a product whose "
+            "merchant type and measured shelf left it unresolved. OFF by default and only on this "
+            "run: the queue worker, brand-official lane and repair planner never enable it"
+        ),
+    )
+    p.add_argument(
+        "--only-resolved-category",
+        action="store_true",
+        help=(
+            "keep only products whose category resolves to a taxonomy leaf; every other product is "
+            "printed ('left out pdp') and left out of the plan instead of blocking it with "
+            "category_unresolved. Resolves nothing itself. Keeping none is an error"
+        ),
+    )
+    p.add_argument(
+        "--only-category",
+        metavar="PATH",
+        help=(
+            "keep only products whose resolved category is PATH or under it (e.g. beauty/makeup/lip "
+            "for a lip-only pass); implies --only-resolved-category. Keeping none is an error"
+        ),
+    )
     p.add_argument("--plan-print-limit", type=int, default=None, metavar="N",
                    help="print identity (product_key/gtin/category_path/variant ids/...) for at "
                         "most N planned PDPs; 0 prints every row. Printed for dry-run AND --apply. "
@@ -659,8 +768,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     p.add_argument("--apply", action="store_true", help="ingest (else dry-run plan)")
     args = p.parse_args(argv)
+    # asyncio.run copies this context into its task, so the switch covers exactly this run.
+    evidence = lip_title_evidence() if args.lip_title_evidence else contextlib.nullcontext()
     try:
-        return asyncio.run(_run(args))
+        with evidence:
+            return asyncio.run(_run(args))
     except CrawlIncomplete as exc:
         print(json.dumps({"crawl": exc.as_dict()}), file=sys.stderr)
         return 2
