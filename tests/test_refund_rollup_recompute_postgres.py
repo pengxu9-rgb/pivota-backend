@@ -27,7 +27,7 @@ _IS_PG = DATABASE_URL.startswith("postgresql://") or DATABASE_URL.startswith("po
 pytestmark = pytest.mark.skipif(not _IS_PG, reason="needs a Postgres DATABASE_URL")
 
 _SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")
-_TABLES = ("gmv_attribution_daily", "commerce_attribution_edges", "invoices")
+_TABLES = ("gmv_attribution_daily", "commerce_attribution_edges", "invoices", "billing_runs")
 _MIGRATIONS = Path(__file__).resolve().parent.parent / "db/migrations"
 _ROLLUP_DDL = _MIGRATIONS / "110_gmv_attribution_daily.sql"
 
@@ -73,6 +73,13 @@ async def _build_schema(database):
     )
     for stmt in split_statements((_MIGRATIONS / "120_invoices_billing_period_to_date.sql").read_text(encoding="utf-8")):
         await database.execute(stmt)
+    # billing_runs likewise: 113's table, 121's DATE periods, 122's partial_failed status.
+    await database.execute(
+        re.search(r"CREATE TABLE IF NOT EXISTS billing_runs \(.*?\n\);", billing_core, re.S).group(0)
+    )
+    for name in ("121_billing_runs_period_to_date.sql", "122_billing_runs_partial_failed_status.sql"):
+        for stmt in split_statements((_MIGRATIONS / name).read_text(encoding="utf-8")):
+            await database.execute(stmt)
 
 
 @pytest.fixture(autouse=True)
@@ -130,6 +137,14 @@ async def _invoice_the_month(db, *, status="finalized", day=BILLED_DAY, merchant
         "INSERT INTO invoices (merchant_id, billing_period_start, billing_period_end, status) "
         "VALUES (:m, :s, :e, :status)",
         {"m": merchant, "s": day - timedelta(days=3), "e": day + timedelta(days=3), "status": status},
+    )
+
+
+async def _start_billing_run(db, *, status="running", day=BILLED_DAY):
+    await db.execute(
+        "INSERT INTO billing_runs (period_start, period_end, idempotency_key, status) "
+        "VALUES (:s, :e, :k, :status)",
+        {"s": day - timedelta(days=3), "e": day + timedelta(days=3), "k": f"{day}-{status}", "status": status},
     )
 
 
@@ -306,6 +321,33 @@ async def test_a_voided_invoice_does_not_freeze_the_day(db):
     assert await _rollup(db) == {"g": 10_000, "r": 2_500, "n": 7_500, "t": 750}
 
 
+@pytest.mark.parametrize("status", ["running", "failed", "partial_failed", "completed"])
+async def test_a_billing_run_that_has_read_the_day_freezes_it_before_its_invoice_exists(db, status):
+    """generate_merchant_invoice reads the rollup, calls Stripe, and only then writes invoices.
+    The run's row exists from the start, for every merchant of its period."""
+    from services.commerce_attribution_service import attach_refund_to_attribution_edge
+
+    await _billed_edge(db)
+    await _start_billing_run(db, status=status)
+
+    await attach_refund_to_attribution_edge(order_id="ord_late", refund_id="re_1", amount=Decimal("25.00"))
+
+    assert await _edge_refund_cents(db) == 2_500
+    assert await _rollup(db) == {"g": 10_000, "r": 0, "n": 10_000, "t": 1_000}
+
+
+async def test_a_cancelled_or_other_period_billing_run_does_not_freeze_the_day(db):
+    from services.commerce_attribution_service import attach_refund_to_attribution_edge
+
+    await _billed_edge(db)
+    await _start_billing_run(db, status="cancelled")
+    await _start_billing_run(db, day=BILLED_DAY - timedelta(days=40))
+
+    await attach_refund_to_attribution_edge(order_id="ord_late", refund_id="re_1", amount=Decimal("25.00"))
+
+    assert await _rollup(db) == {"g": 10_000, "r": 2_500, "n": 7_500, "t": 750}
+
+
 async def test_the_outcome_names_each_day_and_why(db, monkeypatch):
     from services.gmv_aggregation_service import recompute_days_for_edges
 
@@ -321,12 +363,13 @@ async def test_the_outcome_names_each_day_and_why(db, monkeypatch):
     }
 
 
-async def test_an_invoice_check_that_fails_leaves_the_day_alone(db):
+@pytest.mark.parametrize("table", ["invoices", "billing_runs"])
+async def test_an_invoice_check_that_fails_leaves_the_day_alone(db, table):
     """Fail closed: a day we could not check is a day we must not rewrite."""
     from services.commerce_attribution_service import attach_refund_to_attribution_edge
 
     await _billed_edge(db)
-    await db.execute("DROP TABLE invoices")
+    await db.execute(f"DROP TABLE {table}")
 
     result = await attach_refund_to_attribution_edge(
         order_id="ord_late", refund_id="re_1", amount=Decimal("25.00")

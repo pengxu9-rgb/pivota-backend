@@ -225,6 +225,17 @@ WHERE merchant_id = :merchant_id
 LIMIT 1
 """
 
+# A billing run covering the day, for every merchant of its period. generate_merchant_invoice reads
+# the rollup rows BEFORE its Stripe calls and commits the invoices row after them, so a run in
+# progress (or failed, awaiting resume) has read the day with no invoice to show for it yet. The
+# billing_runs row is inserted before any rollup read.
+_BILLING_RUN_COVERING_DAY_QUERY = """
+SELECT id FROM billing_runs
+WHERE CAST(period_start AS DATE) <= :day AND CAST(period_end AS DATE) >= :day
+  AND status <> 'cancelled'
+LIMIT 1
+"""
+
 #: recompute_days_for_edges outcomes, per (merchant_id, day).
 RECOMPUTED = "recomputed"
 INVOICED_PERIOD_MANUAL_CREDIT = "invoiced_period_manual_credit"
@@ -237,6 +248,8 @@ async def _recompute_day_unless_invoiced(day: date, merchant_id: str) -> str:
         invoiced = await database.fetch_one(
             _INVOICE_COVERING_DAY_QUERY, {"merchant_id": merchant_id, "day": day}
         )
+        if invoiced is None:
+            invoiced = await database.fetch_one(_BILLING_RUN_COVERING_DAY_QUERY, {"day": day})
     except Exception as exc:  # noqa: BLE001 -- fail closed: never rewrite a day we could not check
         logger.warning(
             "gmv_rollup_recompute_invoice_check_failed merchant_id=%s date=%s error_type=%s error=%s",
@@ -245,7 +258,7 @@ async def _recompute_day_unless_invoiced(day: date, merchant_id: str) -> str:
         return INVOICE_CHECK_FAILED
     if invoiced is not None:
         logger.warning(
-            "gmv_rollup_recompute_skipped_invoiced_day merchant_id=%s date=%s invoice_id=%s: "
+            "gmv_rollup_recompute_skipped_invoiced_day merchant_id=%s date=%s invoice_or_run_id=%s: "
             "rollup left as billed, manual credit required",
             merchant_id, day.isoformat(), _get(invoiced, "id"),
         )
@@ -268,7 +281,8 @@ async def recompute_days_for_edges(edges: Iterable[Mapping[str, Any]]) -> dict[t
     created, and the daily job only rolls up yesterday. Every refund writer calls this after
     its write so a late refund reaches gmv_attribution_daily before that month is invoiced.
 
-    A day an invoice already covers is left as billed: invoice items point at its rollup rows
+    A day an invoice (or a billing run, which reads the rollup before its invoice exists) already
+    covers is left as billed: invoice items point at its rollup rows
     and partner settlement reads them, so rewriting it would make the rollup disagree with the
     invoice the merchant received. There is no credit-note path; the refund stays on the edge
     and the day is logged for a manual credit. If the invoice check fails, the day is not

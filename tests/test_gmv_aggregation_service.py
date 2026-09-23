@@ -502,6 +502,10 @@ async def test_recompute_days_for_edges_rolls_each_merchant_day_once_and_never_r
 
     class InvoiceLookup:
         async def fetch_one(self, query: str, values: dict[str, Any]):
+            if "FROM billing_runs" in query:
+                # Not merchant-scoped: a run covers every merchant of its period.
+                assert "merchant_id" not in values
+                return {"id": 3} if values["day"] == date(2026, 5, 17) else None
             assert "FROM invoices" in query
             if values["merchant_id"] == "merch_invoiced":
                 return {"id": 7}
@@ -527,19 +531,21 @@ async def test_recompute_days_for_edges_rolls_each_merchant_day_once_and_never_r
         {"edge_id": "e5", "merchant_id": "merch_down", "created_at": datetime(2026, 5, 20, tzinfo=timezone.utc)},
         {"edge_id": "e6", "merchant_id": "merch_invoiced", "created_at": datetime(2026, 5, 20, tzinfo=timezone.utc)},
         {"edge_id": "e7", "merchant_id": "merch_unknown", "created_at": datetime(2026, 5, 20, tzinfo=timezone.utc)},
+        {"edge_id": "e10", "merchant_id": "merch_1", "created_at": datetime(2026, 5, 17, tzinfo=timezone.utc)},
         # Unusable rows are skipped, not raised.
         {"edge_id": "e8", "merchant_id": "merch_1", "created_at": None},
         {"edge_id": "e9", "merchant_id": None, "created_at": datetime(2026, 5, 18, tzinfo=timezone.utc)},
     ]
 
     assert await service.recompute_days_for_edges(edges) == {
+        ("merch_1", date(2026, 5, 17)): "invoiced_period_manual_credit",
         ("merch_1", date(2026, 5, 19)): "recomputed",
         ("merch_1", date(2026, 5, 21)): "recomputed",
         ("merch_down", date(2026, 5, 20)): "recompute_failed",
         ("merch_invoiced", date(2026, 5, 20)): "invoiced_period_manual_credit",
         ("merch_unknown", date(2026, 5, 20)): "invoice_check_failed",
     }
-    # An invoiced day, and a day whose invoice check failed, are never re-rolled.
+    # A day an invoice or billing run covers, and a day whose check failed, are never re-rolled.
     assert sorted(calls) == [
         (date(2026, 5, 19), "merch_1"),
         (date(2026, 5, 20), "merch_down"),
