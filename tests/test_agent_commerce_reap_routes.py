@@ -2421,3 +2421,308 @@ async def test_a_replay_moves_the_buyers_tag_but_not_the_purchases(client):
     assert await database.fetch_val(
         "SELECT consent_version FROM reap_agentic_purchases WHERE id = :i", {"i": purchase_id}
     ) == CONSENT
+
+
+# ── the merchant domain is matched canonically ──────────────────────────────────────────────
+#
+# Production's Shopify rows spell `catalog_products.source_domain` as Shopify's `shop_domain`,
+# `www.Brand.com`; operators write eligibility rows as `brand.com`; the gateway sends the host
+# it observed, which is either. One canonical form — lower case, ONE leading `www.` removed — on
+# BOTH sides of every comparison the variant lane makes. The spellings below are chosen so each
+# side can only match if IT is the side doing the folding.
+
+WWW_PRODUCT_DOMAIN = "www.Brand.example"  # the Shopify spelling, mixed case and all
+CANONICAL_DOMAIN = "brand.example"
+
+
+async def _seed_www_world(*, product_domain: str = WWW_PRODUCT_DOMAIN,
+                          eligibility_domain: str = CANONICAL_DOMAIN):
+    await _seed_catalog(domain=product_domain)
+    await _seed_eligibility(domain=eligibility_domain)
+
+
+@pytest.mark.parametrize("requested", ["www.brand.example", "brand.example", "WWW.BRAND.EXAMPLE"])
+async def test_every_spelling_of_one_merchant_reaches_the_same_row(client, requested):
+    """Product `www.Brand.example`, eligibility `brand.example`, and three request spellings:
+    all three pass eligibility and all three find the same product row at the same price. The
+    purchase keeps the host as observed (lowercased): its one reader folds it itself."""
+    await _seed_www_world()
+    resp = await client.post(f"{BASE}/purchases", json=_body(merchant_domain=requested))
+    assert resp.status_code == 202, (requested, resp.text)
+    row = await _purchase_row(resp.json()["purchase_id"])
+    assert row["product_key"] == PRODUCT_KEY
+    assert row["variant_key"] == SKU_KEY
+    assert row["our_price_minor"] == 4250
+    assert row["merchant_domain"] == requested.lower()
+
+
+async def test_an_eligibility_row_typed_with_the_www_still_matches(client):
+    """THE ELIGIBILITY SIDE FOLDS TOO. The runbook says to write rows canonical; a row somebody
+    typed as `www.Brand.example` must not silently refuse every purchase for the merchant."""
+    await _seed_www_world(eligibility_domain="www.Brand.example")
+    resp = await client.post(f"{BASE}/purchases", json=_body(merchant_domain="brand.example"))
+    assert resp.status_code == 202, resp.text
+
+
+async def test_a_www_with_no_dot_after_it_is_part_of_the_name(client):
+    """`wwwbrand.example` is a different store. Only `www.` followed by the dot is a prefix."""
+    await _seed_www_world(product_domain="brand.example")
+    resp = await client.post(f"{BASE}/purchases", json=_body(merchant_domain="wwwbrand.example"))
+    assert resp.status_code == 409
+    assert _error(resp) == "merchant_not_eligible"
+
+
+async def test_a_product_under_a_www_less_lookalike_is_not_this_merchants(client):
+    """The product side: a catalog row under `wwwbrand.example` is not `brand.example`'s, and the
+    answer is the same `row_not_found` as a product that does not exist."""
+    await _seed_www_world(product_domain="wwwbrand.example")
+    resp = await client.post(f"{BASE}/purchases", json=_body(merchant_domain="brand.example"))
+    assert resp.status_code == 409
+    assert _error(resp) == "row_not_found"
+
+
+async def test_only_one_www_is_stripped_from_the_request(client):
+    """`www.www.brand.example` is `www.brand.example`, not `brand.example`."""
+    await _seed_www_world(product_domain="brand.example")
+    resp = await client.post(
+        f"{BASE}/purchases", json=_body(merchant_domain="www.www.brand.example")
+    )
+    assert resp.status_code == 409
+    assert _error(resp) == "merchant_not_eligible"
+
+
+async def test_only_one_www_is_stripped_from_either_stored_column(client):
+    """The SQL folds exactly one `www.` too: a double-`www.` product and a `www.`-prefixed
+    eligibility row are the merchant `www.brand.example` — and never `brand.example`."""
+    await _seed_www_world(
+        product_domain="www.www.brand.example", eligibility_domain="www.www.brand.example"
+    )
+    resp = await client.post(f"{BASE}/purchases", json=_body(merchant_domain="brand.example"))
+    assert resp.status_code == 409
+    assert _error(resp) == "merchant_not_eligible"
+
+    resp = await client.post(
+        f"{BASE}/purchases", json=_body(merchant_domain="www.www.brand.example")
+    )
+    assert resp.status_code == 202, resp.text
+    row = await _purchase_row(resp.json()["purchase_id"])
+    assert row["product_key"] == PRODUCT_KEY
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://brand.example/",
+        "brand.example:443",
+        "user@brand.example",
+        "brand.example/path",
+        "127.0.0.1",
+        "localhost",
+        "www.example",  # one label once the `www.` is gone
+        "brand..example",
+        "brand.example.",  # a trailing dot: the SQL fold never strips one, so it names nothing
+        "brand.example..",
+        "www.brand.example.",
+    ],
+)
+async def test_a_merchant_domain_that_is_not_a_bare_host_is_refused_before_any_read(
+    client, value
+):
+    """Not reduced to a host — refused, before eligibility, the catalog or a buyer mint. The
+    value is not echoed back."""
+    await _seed_catalog()
+    await _seed_eligibility()
+    resp = await client.post(f"{BASE}/purchases", json=_body(merchant_domain=value))
+    assert resp.status_code == 400, (value, resp.text)
+    assert _error(resp) == "invalid_request"
+    assert value not in resp.text
+    assert await database.fetch_val("SELECT COUNT(*) FROM buyer_identity_links") == 0
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+
+
+@pytest.mark.parametrize("disabled_first", [True, False], ids=["disabled_first", "enabled_first"])
+@pytest.mark.parametrize(
+    "disabled_spelling", ["brand.example", "www.brand.example"], ids=["bare_off", "www_off"]
+)
+async def test_a_disabled_twin_spelling_turns_the_merchant_off(
+    client, disabled_spelling, disabled_first
+):
+    """Two merchant rows for one canonical merchant, one of them disabled: refused, whatever
+    order the database returns them in. Turning a merchant off is an UPDATE against whichever
+    spelling the operator has in front of them.
+
+    FOUR CASES, because one is not a test of order-independence: which spelling is off x which
+    was inserted first. Whatever order the engine returns the rows in — insertion order, or the
+    primary key's (`brand.example` sorts before `www.brand.example`) — at least one case puts the
+    ENABLED row last and one puts it first, so "the last row wins" and "the first row wins" each
+    reach a 202 somewhere and die."""
+    enabled_spelling = (
+        "www.brand.example" if disabled_spelling == "brand.example" else "brand.example"
+    )
+    await _seed_catalog(domain=WWW_PRODUCT_DOMAIN)
+    rows = [(disabled_spelling, False), (enabled_spelling, True)]
+    for domain, enabled in (rows if disabled_first else list(reversed(rows))):
+        await _seed_eligibility(domain=domain, enabled=enabled)
+    for requested in ("brand.example", "www.brand.example"):
+        resp = await client.post(f"{BASE}/purchases", json=_body(merchant_domain=requested))
+        assert resp.status_code == 409, (requested, resp.text)
+        assert _error(resp) == "merchant_not_eligible"
+
+
+async def test_the_offer_seller_is_still_a_conjunct_under_the_www_spelling(client):
+    """Canonical matching must not widen the offer read: a competitor's cheaper offer on the same
+    sku is still not our price."""
+    await _seed_www_world()
+    await _seed_competitor_offer(price="1.00")
+    resp = await client.post(f"{BASE}/purchases", json=_body(merchant_domain="www.brand.example"))
+    assert resp.status_code == 202, resp.text
+    row = await _purchase_row(resp.json()["purchase_id"])
+    assert row["our_price_minor"] == 4250
+
+
+async def test_the_202_body_is_unchanged_by_canonical_matching(client):
+    """A SNAPSHOT of the accepted body: the same three keys and the same values, whichever
+    spelling was sent. Only `purchase_id` varies, and only in value."""
+    await _seed_www_world()
+    bodies = []
+    for spelling in ("www.brand.example", "brand.example"):
+        resp = await client.post(f"{BASE}/purchases", json=_body(merchant_domain=spelling))
+        assert resp.status_code == 202, resp.text
+        bodies.append(resp.json())
+    for body in bodies:
+        assert body["purchase_id"].startswith("rp_")
+        assert {k: v for k, v in body.items() if k != "purchase_id"} == {
+            "status": "resolving",
+            "poll_after_seconds": svc.POLL_INTERVALS["resolving"],
+        }
+        assert sorted(body) == ["poll_after_seconds", "purchase_id", "status"]
+
+
+async def test_a_retry_in_the_other_spelling_replays_the_same_purchase(client):
+    """The idempotency hash carries the canonical merchant: `www.` and apex are one purchase."""
+    await _seed_www_world()
+    first = await client.post(
+        f"{BASE}/purchases",
+        json=_body(merchant_domain="www.brand.example", idempotency_key="k-www-apex"),
+    )
+    again = await client.post(
+        f"{BASE}/purchases",
+        json=_body(merchant_domain="Brand.Example", idempotency_key="k-www-apex"),
+    )
+    assert first.status_code == again.status_code == 202, again.text
+    assert again.json()["purchase_id"] == first.json()["purchase_id"]
+
+
+def _positive_preflight(host: str):
+    from services.shopify_cart_link_preflight import PreflightResult, Verdict
+
+    return PreflightResult(
+        host=host,
+        verdict=Verdict.ELIGIBLE,
+        retryable=False,
+        market="US",
+        variant_id="50041364447509",
+        variant_source="caller",
+        payment_methods=("Airwallex",),
+        card_available=True,
+        landed_price_minor=4250,
+        landed_currency="USD",
+        final_status=200,
+        final_host=host,
+        chain=((302, f"https://{host}/cart/1:1"), (200, f"https://{host}/checkouts/cn/T")),
+    )
+
+
+async def _record_sweep_facts() -> int:
+    """Write a positive fact for every merchant the SWEEP would visit, keyed exactly the way the
+    sweep keys it (its own `load_population`), so the route is tested against the writer's key
+    and not against a key this test chose."""
+    import db.merchant_purchasability as facts
+    import jobs.merchant_purchasability_sweep as sweep
+
+    targets = await sweep.load_population(50)
+    for target in targets:
+        assert await facts.record_check(
+            target.domain, target.market, _positive_preflight(target.domain)
+        ) is not None
+    return len(targets)
+
+
+@pytest.mark.parametrize(
+    "eligibility_domain, product_domain, requested",
+    [
+        (CANONICAL_DOMAIN, WWW_PRODUCT_DOMAIN, "WWW.BRAND.EXAMPLE"),
+        # The case that tells the canonical merchant from the observed host. The sweep folds the
+        # row `www.www.brand.example` to `www.brand.example` and `record_check` folds that again,
+        # to `brand.example`. `is_purchasable` handed the canonical `www.brand.example` folds to
+        # the same key; handed the observed `www.www.brand.example` it reads `www.brand.example`
+        # and misses.
+        ("www.www.brand.example", "www.www.brand.example", "www.www.brand.example"),
+    ],
+)
+async def test_the_purchasability_lookup_is_keyed_as_the_sweep_keys_it(
+    client, monkeypatch, eligibility_domain, product_domain, requested
+):
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_ENFORCE", "1")
+    monkeypatch.delenv("MERCHANT_PURCHASABILITY_BUYER_VANTAGE", raising=False)
+    await database.execute("DELETE FROM merchant_purchasability")
+    try:
+        await _seed_www_world(product_domain=product_domain, eligibility_domain=eligibility_domain)
+        refused = await client.post(f"{BASE}/purchases", json=_body(merchant_domain=requested))
+        assert refused.status_code == 409
+        assert _error(refused) == "merchant_not_purchasable", "control: no fact yet"
+
+        assert await _record_sweep_facts() == 1
+        resp = await client.post(f"{BASE}/purchases", json=_body(merchant_domain=requested))
+        assert resp.status_code == 202, resp.text
+    finally:
+        await database.execute("DELETE FROM merchant_purchasability")
+
+
+async def test_the_cart_link_lane_keeps_the_host_it_was_given(client, monkeypatch):
+    """NOT canonicalised, deliberately: the permalink's host and the storefront evidence's host
+    are compared byte-for-byte downstream, so this lane reads the catalog under — and builds its
+    URL on — the host the door observed."""
+    await _seed_tierb_shopify_item()
+    await database.execute(
+        "UPDATE catalog_products SET source_domain = 'www.brand.example' WHERE product_key = :pk",
+        {"pk": PRODUCT_KEY},
+    )
+    await _seed_tierb_verdict()  # keyed `brand.example`; its reader folds the `www.` itself
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    monkeypatch.setattr(routes_reap.rc, "CART_LINK_QUOTE_FIELD", "fakeCartUrl")
+    resp = await client.post(
+        f"{BASE}/purchases",
+        json=_body(item_source="cart_link", merchant_domain="www.brand.example"),
+    )
+    assert resp.status_code == 202, resp.text
+    purchase = await _purchase_row(resp.json()["purchase_id"])
+    assert purchase["cart_url"].startswith("https://www.brand.example/cart/50041364447509:1?")
+    assert purchase["merchant_domain"] == "www.brand.example"
+
+
+async def test_the_sql_fold_agrees_with_the_python_canonicaliser():
+    """The two halves of one rule, run against each other on the database this suite uses. The
+    expression is lifted OUT OF THE ROUTE'S OWN STATEMENTS, so a divergence between them — or
+    between either and the Python canonicaliser — fails here by name."""
+    import re as _re
+
+    pattern = _re.compile(
+        r"CASE WHEN lower\((?P<col>[\w.]+)\) LIKE 'www\.%'\s+THEN substr\(lower\((?P=col)\), 5\)"
+        r"\s+ELSE lower\((?P=col)\) END = :merchant_domain"
+    )
+    found = []
+    for statement in (routes_reap._ELIGIBILITY_SQL, routes_reap._PRODUCT_SQL):
+        match = pattern.search(statement)
+        assert match, "the canonical fold is missing from a statement the variant lane matches on"
+        text = match.group(0).split(" = :merchant_domain")[0]
+        found.append(" ".join(text.replace(match.group("col"), "COL").split()))
+    assert found[0] == found[1], "the two statements fold the domain differently"
+
+    expression = found[0].replace("COL", ":h")
+    for host in (
+        "brand.example", "www.brand.example", "WWW.Brand.Example", "www.www.brand.example",
+        "wwwbrand.example", "shop.brand.example", "www-brand.example",
+    ):
+        folded = await database.fetch_val(f"SELECT {expression}", {"h": host})
+        assert folded == routes_reap.canonical_merchant_domain(host), host

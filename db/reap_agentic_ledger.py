@@ -2916,9 +2916,13 @@ async def retire_buyer_refs_for_buyer(buyer_id: str, *, reason: str) -> RetireRe
 #: not a gate. Keep these two in step, or a merchant slips through again.
 ELIGIBILITY_MERCHANT_ROW = ""
 
-#: Every (domain, market) the variant lane admits. The predicate is EXACTLY the route's:
-#: `product_key = ''` marks the merchant row, `enabled` is read from that row, and NOTHING is
-#: said about `variant_key` — an override row's variant key is not part of merchant identity.
+#: Every (domain, market) the variant lane MAY admit — a SUPERSET of the route's decision, and
+#: deliberately so. It shares the route's row predicate (`product_key = ''` marks the merchant
+#: row, `enabled` is read from that row, NOTHING is said about `variant_key` — an override row's
+#: variant key is not part of merchant identity), but the route is stricter in two ways this set
+#: does not model: it matches domains canonically and refuses a merchant whose `www.`/apex twin
+#: row is disabled. So a merchant here can still be refused by the route; a merchant the route
+#: admits is always here, which is the direction a gate's population has to err in.
 _ENABLED_MERCHANT_MARKETS_SQL = """
 SELECT DISTINCT merchant_domain, market_country
   FROM reap_agentic_eligibility

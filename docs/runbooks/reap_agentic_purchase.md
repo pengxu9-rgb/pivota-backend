@@ -812,10 +812,17 @@ purchase. Adding one is a one-line change.
 > storefront quoted in USD is exactly the divergence the check exists for — but it will look like
 > a bug. Fix the catalogue, not the check.
 
-### 3. The domain must match `catalog_products.source_domain`
+### 3. The domain must name the same merchant as `catalog_products.source_domain`
 
-Lowercased, exactly. A domain that does not match answers `row_not_found` for every product on it,
-which reads as "we do not have this merchant" rather than "the eligibility row is wrong".
+Matched **canonically**: lower case, **one** leading `www.` removed, on both sides. The Shopify sync
+writes `source_domain` as Shopify's `shop_domain` — `www.Brand.com` in production — and the
+eligibility row, the request and the catalog row are all folded to `brand.com` before they are
+compared. `wwwbrand.com` is a different store (no dot after the prefix), and `www.www.brand.com`
+folds to `www.brand.com`, never to `brand.com`. A domain that still does not match answers
+`row_not_found` for every product on it, which reads as "we do not have this merchant" rather than
+"the eligibility row is wrong". A request `merchant_domain` that is not a bare host name
+(`https://…`, a port, a path, userinfo, an IP, one label) is refused `invalid_request` before any
+read.
 
 ### Before arming: eligibility rows need a fresh positive purchasability fact
 
@@ -854,10 +861,17 @@ ON CONFLICT (merchant_domain, market_country, product_key, variant_key)
 DO UPDATE SET enabled = EXCLUDED.enabled, updated_at = now();
 ```
 
-* `merchant_domain` must match `catalog_products.source_domain`, **lowercased**. Check it first:
+* `merchant_domain` is written **canonical**: lower case, bare host, **no leading `www.`** —
+  `brand.example`, never `www.Brand.example`. The route folds the stored column as well, so a
+  `www.` row still matches, but the canonical spelling is the one every runbook query below and
+  the purchasability sweep's population agree on, and it is the only way to have exactly one row
+  per merchant. (The one exception: a storefront whose host itself begins `www.www.` is written as
+  observed, because the fold strips only one `www.`.) Check it names the same merchant as the
+  catalog first:
   `SELECT DISTINCT source_domain, platform FROM catalog_products WHERE merchant_id = '<id>';`
-  A domain that does not match answers `row_not_found` for every product on it. Run the offer and
-  currency check under **Before arming** at the same time.
+  `www.Brand.example` there and `brand.example` here are the same merchant. A domain that does not
+  match answers `row_not_found` for every product on it. Run the offer and currency check under
+  **Before arming** at the same time.
 * `market_country` is ISO-3166-1 alpha-2, **uppercase**, and the match is EQUALITY against the
   buyer's `shipping_address.country`. **Domestic only.** A merchant that sells into two markets
   gets two rows.
@@ -882,15 +896,98 @@ than quietly resolving without the alias it was created to supply.
 
 ```sql
 -- 3. TURNING A MERCHANT OFF. Purchases already in flight are NOT affected: eligibility is read
---    once, at POST. They continue, and the poller finishes them.
+--    once, at POST. They continue, and the poller finishes them. Folded, so a `www.` twin row is
+--    turned off too — and a disabled twin is enough on its own: the route refuses a merchant if
+--    ANY of its merchant rows in that market is disabled.
 UPDATE reap_agentic_eligibility
    SET enabled = FALSE, updated_at = now()
- WHERE merchant_domain = 'brand.example';
+ WHERE CASE WHEN lower(merchant_domain) LIKE 'www.%'
+            THEN substr(lower(merchant_domain), 5)
+            ELSE lower(merchant_domain) END = 'brand.example';
 
 -- 4. WHAT IS ARMED RIGHT NOW.
 SELECT merchant_domain, market_country, enabled, updated_at
   FROM reap_agentic_eligibility
  WHERE product_key = '' ORDER BY merchant_domain;
+```
+
+### One-off: canonicalise rows written before canonical matching
+
+Rows are operator-entered, so there is no migration for this; run it once, by hand, on each
+environment that has eligibility rows. The route matches canonically either way — this is for the
+"one row per merchant" property the runbook queries and the sweep population rely on.
+
+**Order: (a) census, (b) merge every twin group BY HAND, (c) canonicalise.** A twin group is two
+or more rows that fold to the same canonical key — `brand.example` + `www.brand.example`, but
+also two non-canonical spellings with NO bare row at all (`www.dup.example` + `WWW.Dup.example`).
+The UPDATE in (c) would try to give both the same primary key and abort the whole statement, so
+(c) refuses to touch any member of a twin group and must run only after (a) shows none.
+
+```sql
+-- a. CENSUS, GROUPED BY THE CANONICAL FORM. Every group that is either a twin group
+--    (spellings > 1) or holds a non-canonical spelling. A disabled member turns the merchant
+--    off at the route (every merchant row must be enabled), so read `enabled_flags` first.
+SELECT canonical, market_country, product_key, variant_key,
+       count(*)                                          AS spellings,
+       string_agg(merchant_domain, ', ' ORDER BY merchant_domain) AS stored_as,
+       string_agg(enabled::text, ', ' ORDER BY merchant_domain)   AS enabled_flags
+  FROM (SELECT e.*,
+               CASE WHEN lower(e.merchant_domain) LIKE 'www.%'
+                    THEN substr(lower(e.merchant_domain), 5)
+                    ELSE lower(e.merchant_domain) END AS canonical
+          FROM reap_agentic_eligibility e) f
+ GROUP BY canonical, market_country, product_key, variant_key
+HAVING count(*) > 1 OR bool_or(merchant_domain <> canonical)
+ ORDER BY spellings DESC, canonical, market_country;
+
+-- b. MERGE EVERY GROUP WITH spellings > 1 BY HAND: decide the one `enabled` and the one set of
+--    aliases that are right, UPDATE one member to carry them, DELETE the others. Re-run (a) until
+--    every remaining row has spellings = 1.
+
+-- c. CANONICALISE, in one transaction. Refuses any row that still has a twin (any OTHER row
+--    folding to the same key) and any `www.www.` host (its fold is not a fixed point; it stays
+--    as observed). Expect the UPDATE count to equal (a)'s rows with spellings = 1 that do not
+--    begin `www.www.`.
+BEGIN;
+UPDATE reap_agentic_eligibility e
+   SET merchant_domain = CASE WHEN lower(e.merchant_domain) LIKE 'www.%'
+                              THEN substr(lower(e.merchant_domain), 5)
+                              ELSE lower(e.merchant_domain) END,
+       updated_at = now()
+ WHERE e.merchant_domain <> CASE WHEN lower(e.merchant_domain) LIKE 'www.%'
+                                 THEN substr(lower(e.merchant_domain), 5)
+                                 ELSE lower(e.merchant_domain) END
+   AND lower(e.merchant_domain) NOT LIKE 'www.www.%'
+   AND NOT EXISTS (
+       SELECT 1 FROM reap_agentic_eligibility t
+        WHERE t.merchant_domain <> e.merchant_domain
+          AND CASE WHEN lower(t.merchant_domain) LIKE 'www.%'
+                   THEN substr(lower(t.merchant_domain), 5)
+                   ELSE lower(t.merchant_domain) END
+            = CASE WHEN lower(e.merchant_domain) LIKE 'www.%'
+                   THEN substr(lower(e.merchant_domain), 5)
+                   ELSE lower(e.merchant_domain) END
+          AND t.market_country = e.market_country
+          AND t.product_key = e.product_key
+          AND t.variant_key = e.variant_key
+   );
+-- re-run (a): it must return only `www.www.` rows you chose to leave. Then:
+COMMIT;
+```
+
+The sweep reports allowlist rows it cannot use (a URL, a port, a trailing dot) as a COUNT,
+`population_skipped_unusable`, with one warning per run and no domains. The route can never admit
+such a row. To name them (a coarse shape check; the authority is
+`services.tierb_cart_link_merchants.canonical_merchant_domain`):
+
+```sql
+SELECT merchant_domain, market_country, product_key, enabled
+  FROM reap_agentic_eligibility
+ WHERE merchant_domain ~ '[^A-Za-z0-9.-]'      -- scheme, path, port, userinfo, whitespace
+    OR merchant_domain LIKE '%.'               -- trailing dot
+    OR merchant_domain LIKE '%..%'
+    OR merchant_domain NOT LIKE '%.%'          -- a single label
+ ORDER BY merchant_domain;
 ```
 
 > **Never `DELETE FROM reap_agentic_buyer_refs`.** It is the only record of which opaque owner id

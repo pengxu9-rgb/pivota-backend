@@ -122,6 +122,7 @@ import services.conversion_click_claims as ccc
 import services.reap_agentic_client as rc
 from db.database import database
 from services.reap_cart_link import cart_link_line, cart_link_refusal
+from services.tierb_cart_link_merchants import canonical_merchant_domain
 
 logger = logging.getLogger(__name__)
 
@@ -2676,6 +2677,28 @@ async def _complete(
     return moved
 
 
+def _attribution_merchant_key(value: Any) -> str:
+    """The stored `merchant_domain` as the MERCHANT the attribution ledger is keyed by.
+
+    The purchase row keeps the storefront host AS THE DOOR OBSERVED IT (lowercased), because the
+    resolver folds it itself and the cart lane needs the exact host. Attribution is the other
+    reader, and it must not key one merchant twice: `www.brand.com` and `brand.com` bought on the
+    variant lane are ONE merchant, and two `merchant_id`s would split its GMV across two rows
+    nobody would think to add together. So it is folded here by the same canonicaliser the route
+    matched the purchase under.
+
+    NEVER RAISES. `_close_attribution` swallows every exception to protect a completed purchase,
+    so a raise here would silently drop the edge. A stored value the canonicaliser refuses (a row
+    older than route validation, or written by something that is not the route) is used as
+    stored, lowercased — the pre-canonical behaviour, which is a split key and not a lost one.
+    """
+    text = str(value or "").strip()
+    try:
+        return canonical_merchant_domain(text)
+    except ValueError:
+        return text.lower()
+
+
 def _converting_shop_domain(purchase: Mapping[str, Any]) -> str:
     """The shop the sale happened on, in the form the seller-mismatch guard compares.
 
@@ -2684,12 +2707,17 @@ def _converting_shop_domain(purchase: Mapping[str, Any]) -> str:
     guard compares the two without folding `www.` (normalize_shop_host does not strip it). So
     passing the bare `merchant_domain` for a `www.` link stamps `seller_mismatch` and EXCLUDES a
     legitimate edge. Only this lane's argument changes; the shared normalisation does not.
+
+    Every OTHER case — the variant lane, and a cart-link row with no parseable URL — is the
+    canonical merchant (`_attribution_merchant_key`), so two spellings of one store close as one
+    converting shop. The variant lane records no click, so there is no `dest_domain` the folded
+    value could fail to equal.
     """
     if _is_cart_link(purchase):
         host = urlsplit(str(purchase.get("cart_url") or "")).hostname
         if host:
             return host
-    return str(purchase.get("merchant_domain") or "")
+    return _attribution_merchant_key(purchase.get("merchant_domain"))
 
 
 async def _close_attribution(purchase: Mapping[str, Any]) -> bool:
@@ -2728,7 +2756,9 @@ async def _close_attribution(purchase: Mapping[str, Any]) -> bool:
 
     try:
         converting_shop = _converting_shop_domain(purchase)
-        merchant_id = str(purchase.get("merchant_domain") or "")
+        # THE CANONICAL MERCHANT, not the stored spelling: see `_attribution_merchant_key`. A
+        # cart-link row's seller_ref (below) still replaces it when the click carries one.
+        merchant_id = _attribution_merchant_key(purchase.get("merchant_domain"))
         if _is_cart_link(purchase):
             seller_ref = await reap_cart_link_seller_ref(
                 str(purchase.get("click_id") or ""), converting_shop

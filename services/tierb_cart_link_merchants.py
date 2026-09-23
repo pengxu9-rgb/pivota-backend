@@ -79,6 +79,24 @@ def normalize_domain(value: Any) -> str:
     return host
 
 
+def canonical_merchant_domain(value: Any) -> str:
+    """The MERCHANT key the Reap rail matches under: `normalize_domain`, and a ValueError for a
+    trailing dot as well.
+
+    ONE FUNCTION, THREE READERS: `routes/agent_commerce_reap` (the purchase request),
+    `jobs/merchant_purchasability_sweep` (the population) and `services/reap_agentic_purchase`
+    (the attribution merchant key). It is `normalize_domain` rather than a second rule, stricter
+    in one respect only. `normalize_domain` strips trailing dots because it keys rows this job
+    wrote itself; a request or an operator row spelled `brand.com.` (or `brand.com..`) is not a
+    name anybody meant to type, and folding it silently is exactly the guessing the docstring
+    above refuses. Every stored column the rail matches is folded in SQL WITHOUT stripping dots,
+    so admitting one here would name a merchant the SQL can never find.
+    """
+    if isinstance(value, str) and value.strip().endswith("."):
+        raise ValueError("domain ends in a dot")
+    return normalize_domain(value)
+
+
 def normalize_market(value: Any) -> str:
     """ISO-2 shape, upper case. Raises ValueError otherwise."""
     if not isinstance(value, str) or not _MARKET.fullmatch(value.strip().upper()):

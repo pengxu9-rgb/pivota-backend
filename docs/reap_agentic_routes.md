@@ -118,7 +118,7 @@ poller drives the state machine afterwards, on another process, over the next mi
 | field | required | notes |
 |---|---|---|
 | `item_source` | no (default `reap_variant`) | Set to `cart_link` for Tier B. The entire cart-link lane remains a 404 fallback until `REAP_AGENTIC_CART_LINK_ENABLED` is on **and** Reap publishes the quote body field (`CART_LINK_QUOTE_FIELD`, currently unset). |
-| `merchant_domain` | yes | lowercased. Variant lane: must be enabled in `reap_agentic_eligibility`. Cart-link lane: must have a fresh `tierb_cart_link_eligibility` verdict. Both are checked in the buyer's market. |
+| `merchant_domain` | yes | a bare host name, sent as observed (`www.brand.example` or `brand.example`); anything else — a scheme, port, path, userinfo, IP or single label — is `400 invalid_request`. Matched **canonically**: lower case, one leading `www.` removed, so `www.brand.example` and `brand.example` are the same merchant (`wwwbrand.example` is not). Variant lane: must be enabled in `reap_agentic_eligibility`. Cart-link lane: must have a fresh `tierb_cart_link_eligibility` verdict, and builds its cart URL on the host as sent. Both are checked in the buyer's market. |
 | `product_key` | yes | our catalog key (`catalog_products.product_key`). |
 | `variant_key` | no | our sku key (`catalog_skus.sku_key`), matched **exactly**. Omit only when the product has exactly one variant; a multi-variant product with no `variant_key` is `row_not_found`. |
 | `quantity` | no (default 1) | 1..10 (`MAX_QUANTITY`). |
