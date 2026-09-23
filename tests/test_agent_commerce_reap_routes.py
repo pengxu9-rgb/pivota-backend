@@ -26,6 +26,8 @@ in the PR body.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import logging
 import os
@@ -731,19 +733,65 @@ async def test_the_minted_buyer_id_is_not_derived_from_the_email(client):
     `_buyer_prefill_from_identity_link` would then hand that agent the account's email and
     default shipping address. So the minted id must contain nothing from the request, and no
     `shop_users` row may be created for it.
+
+    ── WHY NOT `EMAIL` ─────────────────────────────────────────────────────────────────────
+
+    The minted id is `u_` + 16 hex characters. The module's EMAIL local part is "ada", which is
+    three HEX DIGITS, so `"ada" not in buyer_id` failed by pure chance (CI run 35808498872:
+    'u_4f49a0007fada0e3'). Any local part spelled only from [0-9a-f] can do that. This test's
+    email has a `z`, `q`, `w`, `y`, `x` and a `.` in its local part, none of which a minted id
+    can contain, so the substring checks below can only fail if the id really carries the text.
+
+    The substring checks are the weak half, though: `sha256(email)[:16]` contains no email text
+    and would pass them. What catches derivation is (1) the id is not a window of any obvious
+    encoding of the email, and (2) THE SAME EMAIL, sent by a different agent for a different
+    end user, gets a DIFFERENT id — so the id is not a function of the email, whatever the
+    encoding. Both are coincidence-proof: a random 64-bit id matches either by chance with
+    probability around 2**-58.
     """
+    email = "zoltan.qwyx@example.test"
+    local_part = email.split("@")[0]
+    body = _body(buyer=_buyer(email=email))
+
     await _seed_catalog()
     await _seed_eligibility()
-    await client.post(f"{BASE}/purchases", json=_body())
+    first = await client.post(f"{BASE}/purchases", json=body)
+    assert first.status_code == 202
 
     buyer_id = (await _links())[0]["buyer_id"]
-    assert EMAIL not in buyer_id
-    assert EMAIL.split("@")[0] not in buyer_id
-    assert USER_REF not in buyer_id
-    assert hash_agent_user_ref(USER_REF) not in buyer_id
     # The id space, so no reader can tell a minted buyer from a signed-up one by its shape.
     assert buyer_id.startswith("u_")
     assert len(buyer_id) == 18
+    int(buyer_id[2:], 16)  # hex, which is what makes the non-hex local part a sound probe
+
+    assert email not in buyer_id
+    assert local_part not in buyer_id
+    assert USER_REF not in buyer_id
+    assert hash_agent_user_ref(USER_REF) not in buyer_id
+
+    # (1) Not a window of a straightforward encoding of the email or of its local part.
+    digest = buyer_id[2:]
+    for source in {email, email.lower(), email.upper(), local_part}:
+        raw = source.encode()
+        encodings = [raw.hex(), base64.b16encode(raw).decode().lower()]
+        encodings += [
+            hashlib.new(name, raw).hexdigest()
+            for name in ("md5", "sha1", "sha224", "sha256", "sha384", "sha512", "blake2b", "blake2s")
+        ]
+        encodings += [base64.b64encode(raw).decode(), base64.urlsafe_b64encode(raw).decode()]
+        for encoded in encodings:
+            assert digest not in encoded, (source, encoded)
+
+    # (2) Not a function of the email. Same email, a different agent and end user: a different
+    # buyer. An id derived from the email alone — in any encoding — would be the same one here,
+    # which is exactly the collision that would hand one agent another's buyer.
+    CALLER.agent_id = OTHER_AGENT
+    CALLER.agent_user_ref = OTHER_USER_REF
+    second = await client.post(f"{BASE}/purchases", json=body)
+    assert second.status_code == 202
+    other = {l["buyer_id"] for l in await _links() if l["agent_id"] == OTHER_AGENT}
+    assert len(other) == 1
+    assert other != {buyer_id}
 
     #: No account row is created, and the prefill reader tolerates that — it returned None for
     #: this buyer yesterday, when there was no link at all, and it returns None now.
