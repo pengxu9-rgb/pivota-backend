@@ -330,6 +330,117 @@ async def test_a_moved_edge_on_an_invoiced_day_leaves_every_billed_row_alone(db)
     assert await _groups(db) == [("agent_1", 10_000, 10_000, 1_000)]
 
 
+async def test_an_edge_that_moved_channel_partner_is_billed_once(db):
+    """The group key is (agent, channel partner): a partner change leaves the old group too."""
+    from services import gmv_aggregation_service as gmv
+
+    await _edge(db, edge_id="cae_1", order_id="ord_1", gross=10_000, created_at=_at(DAY, 12))
+    await db.execute("UPDATE commerce_attribution_edges SET channel_partner_id = 7")
+    await _nightly(db)
+    await db.execute("UPDATE commerce_attribution_edges SET channel_partner_id = NULL")
+
+    await gmv.recompute_for_date(DAY, MERCHANT)
+    rows = await db.fetch_all(
+        "SELECT channel_partner_id p, gross_attributed_gmv_cents g FROM gmv_attribution_daily "
+        "WHERE date = :d ORDER BY channel_partner_id NULLS FIRST", {"d": DAY},
+    )
+    assert [(r["p"], r["g"]) for r in rows] == [(None, 10_000), (7, 0)]
+
+
+async def test_a_one_merchant_recompute_never_zeroes_another_merchants_rows(db):
+    """From the re-review of #2283: replacing the zeroing's merchant filter with a no-op passed
+    every other test."""
+    from services import gmv_aggregation_service as gmv
+
+    await _edge(db, edge_id="cae_1", order_id="ord_1", gross=10_000, created_at=_at(DAY, 12))
+    await _edge(db, edge_id="cae_o", order_id="ord_o", gross=2_000, created_at=_at(DAY, 12), merchant="m_other")
+    await _nightly(db)
+    # m_other's only edge stops billing (becomes inferred): its group is unformed, but only a roll-up
+    # of m_other, or of the whole day, may zero it.
+    await db.execute(
+        "UPDATE commerce_attribution_edges SET metadata = '{\"inferred\": true}'::jsonb WHERE edge_id = 'cae_o'"
+    )
+
+    assert await gmv.recompute_for_date(DAY, MERCHANT) == gmv.RECOMPUTED
+    assert await _groups(db, merchant="m_other") == [("agent_1", 2_000, 2_000, 200)]
+    await gmv.aggregate_daily(DAY)
+    assert await _groups(db, merchant="m_other") == [("agent_1", 0, 0, 0)]
+
+
+async def test_the_zeroing_never_wipes_what_the_same_rollup_wrote_outside_one_transaction(db, monkeypatch):
+    """From the re-review of #2283. If the statements ever run outside one server transaction (the
+    databases shared-connection residual: autocommit after an out-of-order root rollback), each gets
+    its own NOW(). A clock-based zeroing then wiped every row it had just written, and stamped them
+    fresh so the sweep never healed the day."""
+    import contextlib
+
+    from services import gmv_aggregation_service as gmv
+
+    await _edge(db, edge_id="cae_1", order_id="ord_1", gross=10_000, created_at=_at(DAY, 12))
+    await _edge(db, edge_id="cae_2", order_id="ord_2", gross=3_000, created_at=_at(DAY, 13), agent="agent_3")
+
+    @contextlib.asynccontextmanager
+    async def _autocommit():
+        yield
+
+    monkeypatch.setattr(gmv.database, "transaction", _autocommit)
+    result = await gmv._aggregate_for_date(DAY)
+
+    assert (result["written"], result["zeroed"]) == (2, 0)
+    assert await _groups(db) == [("agent_1", 10_000, 10_000, 1_000), ("agent_3", 3_000, 3_000, 300)]
+
+
+async def test_a_moved_edge_is_billed_once_with_the_production_trigger_on(db):
+    """From the re-review of #2283: 110's BEFORE UPDATE trigger on, as in prod, and nothing backdated."""
+    from services import gmv_aggregation_service as gmv
+
+    await db.execute("ALTER TABLE gmv_attribution_daily ENABLE TRIGGER trg_gmv_attribution_daily_updated_at")
+    await _edge(db, edge_id="cae_1", order_id="ord_1", gross=10_000, created_at=_at(DAY, 12))
+    await _edge(db, edge_id="cae_2", order_id="ord_2", gross=3_000, created_at=_at(DAY, 13), agent="agent_3")
+    await gmv.aggregate_daily(DAY)
+    await gmv.aggregate_daily(DAY)  # a plain re-roll zeroes nothing
+    assert await _groups(db) == [("agent_1", 10_000, 10_000, 1_000), ("agent_3", 3_000, 3_000, 300)]
+
+    await db.execute("UPDATE commerce_attribution_edges SET agent_id = 'agent_2' WHERE edge_id = 'cae_1'")
+    await gmv.recompute_for_date(DAY, MERCHANT)
+    assert await _groups(db) == [
+        ("agent_1", 0, 0, 0), ("agent_2", 10_000, 10_000, 1_000), ("agent_3", 3_000, 3_000, 300),
+    ]
+
+
+async def test_a_zeroed_group_that_regains_its_edge_keeps_its_first_rate(db):
+    from services import gmv_aggregation_service as gmv
+
+    await _edge(db, edge_id="cae_1", order_id="ord_1", gross=10_000, created_at=_at(DAY, 12))
+    await _nightly(db)
+    await db.execute("UPDATE gmv_attribution_daily SET take_rate_bp = 500, take_amount_cents = 500")
+    await db.execute("UPDATE commerce_attribution_edges SET agent_id = 'agent_2'")
+    await gmv.recompute_for_date(DAY, MERCHANT)
+    await db.execute("UPDATE commerce_attribution_edges SET agent_id = 'agent_1'")
+    await gmv.recompute_for_date(DAY, MERCHANT)
+
+    assert await _groups(db) == [("agent_1", 10_000, 10_000, 500), ("agent_2", 0, 0, 0)]
+
+
+async def test_an_unfinished_run_also_blocks_the_zeroing(db):
+    from services import gmv_aggregation_service as gmv
+
+    await db.execute(
+        "INSERT INTO billing_runs (period_start, period_end, idempotency_key, status) "
+        "VALUES (:s, :e, 'open-run', 'partial_failed')",
+        {"s": DAY - timedelta(days=5), "e": DAY + timedelta(days=1)},
+    )
+    await _edge(db, edge_id="cae_1", order_id="ord_1", gross=10_000, created_at=_at(DAY, 12))
+    await _nightly(db)
+    await db.execute(
+        "UPDATE commerce_attribution_edges SET agent_id = 'agent_2', updated_at = :at",
+        {"at": datetime.now(timezone.utc) - timedelta(hours=2)},
+    )
+
+    assert await gmv.reroll_stale_days() == {"stale_days": 1, "invoiced_period_manual_credit": 1}
+    assert await _groups(db) == [("agent_1", 10_000, 10_000, 1_000)]
+
+
 async def test_an_unfinished_run_freezes_a_reroll_but_not_a_first_rollup(db):
     """#2280 freezes a day an unfinished billing run covers, for a RE-ROLL only: its draft already
     holds the day's lines. A day never rolled up has no lines in any draft, so the sweep writing it is

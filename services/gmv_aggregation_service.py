@@ -17,6 +17,20 @@ PROMO_CACHE_TTL_SECONDS = 300
 _promo_cache: dict[str, tuple[datetime | None, float]] = {}
 
 
+# An edge `e` billed on the UTC day :date. One definition for _ROLLUP_QUERY, which sums these
+# edges into groups, and _ZERO_UNFORMED_GROUPS_QUERY, which zeroes the groups none of them forms: if
+# the two disagreed, a group would be zeroed that the roll-up still writes, or kept that it does not.
+#
+# The UTC day as a created_at range, not `(e.created_at AT TIME ZONE 'UTC')::date = :date`: a
+# function of the column cannot use idx_commerce_attribution_edges_merchant_created (migration 237),
+# so each one-merchant recompute scanned all of that merchant's edges. Same rows, any session tz.
+_BILLABLE_EDGE_ON_DAY = """e.created_at >= CAST(CAST(:date AS DATE) AS TIMESTAMP) AT TIME ZONE 'UTC'
+  AND e.created_at < CAST(CAST(:date AS DATE) + 1 AS TIMESTAMP) AT TIME ZONE 'UTC'
+  AND e.gross_attributed_gmv_cents IS NOT NULL
+  -- Exclude fallback-INFERRED edges (#1481): token-less recoveries are recorded for
+  -- coverage but never billed. NULL-safe (real edges lack the key → counted).
+  AND (e.metadata->>'inferred')::boolean IS NOT TRUE"""
+
 # DATE(timestamptz) and (timestamptz)::date both read session timezone.
 # Bucketing must be UTC to match billing-period DATE columns (migrations
 # 120/121) — otherwise an order created at 23:30 UTC drifts to the next
@@ -30,16 +44,8 @@ SELECT
     SUM(e.gross_attributed_gmv_cents) AS gross_sum,
     SUM(COALESCE(e.refund_amount_cents, 0)) AS refund_sum
 FROM commerce_attribution_edges e
--- The UTC day as a created_at range, not `(e.created_at AT TIME ZONE 'UTC')::date = :date`: a
--- function of the column cannot use idx_commerce_attribution_edges_merchant_created (migration 237),
--- so each one-merchant recompute scanned all of that merchant's edges. Same rows, any session tz.
-WHERE e.created_at >= CAST(CAST(:date AS DATE) AS TIMESTAMP) AT TIME ZONE 'UTC'
-  AND e.created_at < CAST(CAST(:date AS DATE) + 1 AS TIMESTAMP) AT TIME ZONE 'UTC'
+WHERE """ + _BILLABLE_EDGE_ON_DAY + """
   AND (CAST(:merchant_id AS TEXT) IS NULL OR e.merchant_id = CAST(:merchant_id AS TEXT))
-  AND e.gross_attributed_gmv_cents IS NOT NULL
-  -- Exclude fallback-INFERRED edges (#1481): token-less recoveries are recorded for
-  -- coverage but never billed. NULL-safe (real edges lack the key → counted).
-  AND (e.metadata->>'inferred')::boolean IS NOT TRUE
 GROUP BY (e.created_at AT TIME ZONE 'UTC')::date, e.merchant_id, e.agent_id, e.channel_partner_id
 """
 
@@ -130,26 +136,34 @@ WHERE date = CAST(:date AS DATE) AND merchant_id = CAST(:merchant_id AS TEXT)
 LIMIT 1
 """
 
-# The day's groups this roll-up did not write, zeroed. The upsert only touches groups the edges
-# still form. An edge that moved to another agent or partner (upsert_order_attribution_edge rewrites
-# agent_id at payment time), or became inferred, would otherwise leave its old group billing the
-# same gross twice (review of #2283). Every upsert above stamped NOW(), the transaction's start, so
-# `updated_at < NOW()` is exactly the rows this run did not write. Frozen merchants are left as
-# billed. Zeroed, not deleted: an invoice item or settlement may already name the row's id.
-_ZERO_UNWRITTEN_GROUPS_QUERY = """
-UPDATE gmv_attribution_daily
+# The day's groups that no billable edge forms any more, zeroed. The upsert only touches groups the
+# edges still form. An edge that moved to another agent or partner (upsert_order_attribution_edge
+# rewrites agent_id at payment time), or became inferred, would otherwise leave its old group
+# billing the same gross twice (review of #2283). Decided from the edges themselves, not from
+# updated_at against NOW(): that depended on the upserts and this statement sharing one server
+# transaction, and outside one it zeroed the rows the same call had just written (re-review of
+# #2283). The group key matches the upsert's conflict key. Frozen merchants are left as billed.
+# Zeroed, not deleted: an invoice item or settlement may already name the row's id.
+_ZERO_UNFORMED_GROUPS_QUERY = """
+UPDATE gmv_attribution_daily d
 SET gross_attributed_gmv_cents = 0,
     refund_amount_cents = 0,
     net_attributed_gmv_cents = 0,
     take_amount_cents = 0,
     updated_at = NOW()
-WHERE date = CAST(:date AS DATE)
-  AND (CAST(:merchant_id AS TEXT) IS NULL OR merchant_id = CAST(:merchant_id AS TEXT))
-  AND NOT (merchant_id = ANY(CAST(:frozen AS TEXT[])))
-  AND updated_at < NOW()
-  AND (gross_attributed_gmv_cents <> 0 OR refund_amount_cents <> 0
-       OR net_attributed_gmv_cents <> 0 OR take_amount_cents <> 0)
-RETURNING id
+WHERE d.date = CAST(:date AS DATE)
+  AND (CAST(:merchant_id AS TEXT) IS NULL OR d.merchant_id = CAST(:merchant_id AS TEXT))
+  AND NOT (d.merchant_id = ANY(CAST(:frozen AS TEXT[])))
+  AND (d.gross_attributed_gmv_cents <> 0 OR d.refund_amount_cents <> 0
+       OR d.net_attributed_gmv_cents <> 0 OR d.take_amount_cents <> 0)
+  AND NOT EXISTS (
+    SELECT 1 FROM commerce_attribution_edges e
+    WHERE """ + _BILLABLE_EDGE_ON_DAY + """
+      AND e.merchant_id = d.merchant_id
+      AND COALESCE(e.agent_id, '') = COALESCE(d.agent_id, '')
+      AND COALESCE(e.channel_partner_id, -1) = COALESCE(d.channel_partner_id, -1)
+  )
+RETURNING d.id
 """
 
 
@@ -321,7 +335,7 @@ async def _aggregate_for_date(
             written += 1
 
         zeroed = await database.fetch_all(
-            _ZERO_UNWRITTEN_GROUPS_QUERY,
+            _ZERO_UNFORMED_GROUPS_QUERY,
             {"date": target_date, "merchant_id": merchant_id, "frozen": sorted(invoiced)},
         )
 
