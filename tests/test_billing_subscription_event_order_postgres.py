@@ -810,3 +810,50 @@ async def test_a_retry_over_a_row_written_before_started_at_was_stripes_time_is_
 
     assert (await _subscription(db))["status"] == "active"
     assert ("cancel", SUB) not in stripe_calls
+
+
+async def test_a_live_row_without_a_stripe_subscription_is_not_a_newer_purchase(db, client, stripe_calls):
+    """A live row with no Stripe subscription (none is written by checkout, but nothing forbids one)
+    is not a purchase this checkout can be superseded by; if it were, every checkout for the merchant
+    would cancel itself."""
+    await _subscribed_merchant(db, subs=())
+    await db.execute(
+        "INSERT INTO user_subscriptions (merchant_id, plan_id, status, started_at) VALUES (:m, :p, 'active', NOW())",
+        {"m": MERCHANT, "p": await _plan_id(db, "starter")})
+    stripe_calls.clear()
+
+    await _deliver(client, _checkout_completed("evt_checkout", sid=SUB, plan="growth",
+                                               completed_at=NOW - timedelta(minutes=5)))
+
+    assert ("cancel", SUB) not in stripe_calls
+    assert (await _subscription(db))["status"] == "active"
+    assert await _merchant(db) == {"current_tier": "growth", "subscription_id": await _local_id(db)}
+
+
+async def test_an_older_checkout_never_cancels_a_plan_that_started_after_it(db, client, stripe_calls, monkeypatch):
+    """The race: B commits after A's newer-plan check and before A cancels its prior plans. A's
+    prior-plan cancel must still leave B alone, since B started after A completed."""
+    from routes import billing_routes
+
+    await _subscribed_merchant(db, subs=((SUB_OTHER, "starter"),))  # started a day ago: A supersedes it
+    real_check = billing_routes._merchant_has_newer_live_subscription
+    newer = "sub_event_order_newer"
+
+    async def b_commits_right_after_the_check(db_, **kwargs):
+        result = await real_check(db_, **kwargs)
+        await db_.execute(
+            "INSERT INTO user_subscriptions (merchant_id, plan_id, stripe_subscription_id, status, started_at) "
+            "VALUES (:m, :p, :s, 'active', :t)",
+            {"m": MERCHANT, "p": await _plan_id(db_, "growth"), "s": newer, "t": NOW - timedelta(minutes=5)})
+        return result
+
+    monkeypatch.setattr(billing_routes, "_merchant_has_newer_live_subscription", b_commits_right_after_the_check)
+    stripe_calls.clear()
+
+    await _deliver(client, _checkout_completed("evt_checkout_A", sid=SUB, plan="starter",
+                                               completed_at=NOW - timedelta(minutes=30)))
+
+    assert ("cancel", newer) not in stripe_calls
+    assert (await _subscription(db, newer))["status"] == "active"
+    assert ("cancel", SUB_OTHER) in stripe_calls
+    assert (await _subscription(db, SUB_OTHER))["status"] == "canceled"

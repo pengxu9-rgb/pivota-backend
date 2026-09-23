@@ -1025,6 +1025,7 @@ async def _handle_checkout_session_completed(event: Dict[str, Any], db: Database
             db,
             merchant_id=merchant_id,
             keep_stripe_subscription_id=stripe_subscription_id,
+            completed_at=completed_at,
         )
 
         await _mark_event_processed(event_id, db)
@@ -1873,9 +1874,10 @@ async def _merchant_has_newer_live_subscription(
     stripe_subscription_id: str,
     completed_at: Optional[datetime],
 ) -> bool:
-    """Whether the merchant holds a live subscription that started after this
-    checkout completed. started_at is Stripe's completion time of the checkout
-    that created the row, so both sides are on Stripe's clock."""
+    """Whether the merchant holds a live Stripe subscription that started after
+    this checkout completed. started_at is Stripe's completion time of the
+    checkout that created the row, so both sides are on Stripe's clock. A row
+    without a Stripe subscription is not a purchase that can supersede one."""
     if completed_at is None:
         return False
     row = await db.fetch_one(
@@ -1884,7 +1886,8 @@ async def _merchant_has_newer_live_subscription(
         FROM user_subscriptions
         WHERE merchant_id = :merchant_id
           AND status IN ('active', 'trialing')
-          AND stripe_subscription_id IS DISTINCT FROM :stripe_subscription_id
+          AND stripe_subscription_id IS NOT NULL
+          AND stripe_subscription_id <> :stripe_subscription_id
           AND started_at > :completed_at
         LIMIT 1
         """,
@@ -1943,9 +1946,14 @@ async def _cancel_prior_active_subscriptions(
     *,
     merchant_id: str,
     keep_stripe_subscription_id: str,
+    completed_at: Optional[datetime] = None,
 ) -> None:
     """Cancel every active/trialing subscription for the merchant other than
     keep_stripe_subscription_id — in Stripe (so billing stops) and locally.
+    Given completed_at (when Stripe completed the keeping checkout), only
+    subscriptions that started before it: a plan bought after this checkout
+    is newer and is never cancelled by it, even if it committed while this
+    checkout was being processed.
 
     Called after a new subscription checkout completes so the merchant ends up
     with a single active plan. Isolated per subscription: a failure to cancel
@@ -1969,8 +1977,16 @@ async def _cancel_prior_active_subscriptions(
              WHERE merchant_id = :merchant_id
                AND status IN ('active', 'trialing')
                AND stripe_subscription_id IS DISTINCT FROM :keep
+               AND (
+                 CAST(:completed_at AS TIMESTAMPTZ) IS NULL
+                 OR started_at < CAST(:completed_at AS TIMESTAMPTZ)
+               )
             """,
-            {"merchant_id": merchant_id, "keep": keep_stripe_subscription_id},
+            {
+                "merchant_id": merchant_id,
+                "keep": keep_stripe_subscription_id,
+                "completed_at": completed_at,
+            },
         )
     except Exception:  # noqa: BLE001
         logger.warning(
