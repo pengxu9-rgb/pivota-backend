@@ -647,7 +647,8 @@ async def emit_attribution_refund_event(
     await record_commerce_event_best_effort(
         event_type="refund.succeeded",
         metadata={
-            **(first.get("metadata") or {}),
+            # A RETURNING row from a text query: the JSONB comes back as a str, not a dict.
+            **_coerce_json_obj(first.get("metadata")),
             "merchant_id": first.get("merchant_id"),
             "interaction_id": first.get("interaction_id"),
             "order_id": order_id,
@@ -780,10 +781,11 @@ def shopify_order_total_to_cents(data: Dict[str, Any]) -> tuple[Optional[int], O
 
 
 def _coerce_json_obj(value: Any) -> Dict[str, Any]:
-    """Return `value` as a dict. surface_click_events.context is JSONB: asyncpg
-    (prod) decodes it to a dict, but the SQLite/JSON test path and some driver
-    modes hand back a JSON string — coerce both so closure reads are driver-
-    agnostic. Non-object / unparseable → {}."""
+    """Return `value` as a dict. A JSONB column read through a SQLAlchemy-typed
+    select comes back a dict, but through a text query (or RETURNING) it comes
+    back a JSON string: db/database.py registers no asyncpg JSON codec. Coerce
+    both so reads are driver- and query-shape-agnostic. Non-object /
+    unparseable → {}."""
     if isinstance(value, dict):
         return value
     if isinstance(value, str) and value.strip():
