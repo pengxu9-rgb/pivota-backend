@@ -62,14 +62,23 @@ async def drain_loop(*, lease_seconds: int, budget_seconds: int, db: Any = None,
     draw the same 429s and spend its retry budget -- the next tick is the cool-down. An unexpected
     error propagates (run_stage has recorded it on the job) and ends the loop."""
     start = clock()
+    longest = 0.0
     summaries: List[Dict[str, Any]] = []
     while True:
+        began = clock()
         summary = await drain_once(lease_seconds=lease_seconds, db=db)
+        ended = clock()
+        # Logged per stage so the budget/timeout margin can be tuned from data, not guessed.
+        summary["duration_s"] = round(ended - began, 1)
+        longest = max(longest, ended - began)
         summaries.append(summary)
         if report:
             report(summary)
+        # A stage starts only if one as long as the longest seen so far would still end inside the
+        # budget: full-catalog crawls (#2296) and 30k-product scans make stages longer than 12 min,
+        # and a stage the task timeout kills is failed as "may be partial".
         if (summary.get("outcome") in ("idle", "crawl_throttled") or budget_seconds <= 0
-                or clock() - start >= budget_seconds):
+                or (ended - start) + longest >= budget_seconds):
             return summaries
 
 

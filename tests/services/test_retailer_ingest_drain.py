@@ -98,11 +98,30 @@ async def test_stages_run_back_to_back_until_nothing_is_due(monkeypatch):
     assert [r["outcome"] for r in reported] == seen  # one summary line per stage
 
 
-async def test_no_stage_starts_after_the_budget(monkeypatch):
+class Script:
+    """A clock that reads the given times in order (start, then began/ended for each stage)."""
+    def __init__(self, times):
+        self.times = list(times)
+
+    def __call__(self):
+        return self.times.pop(0)
+
+
+async def test_a_stage_starts_only_if_the_longest_stage_so_far_still_fits(monkeypatch):
     seen = _loop_env(monkeypatch, ["clean"] * 10)
-    # each clock read advances 400s: start=400, after stage 1 -> 800 (elapsed 400), ... elapsed >= 1000 stops
-    await drain.drain_loop(lease_seconds=60, budget_seconds=1000, db=object(), clock=Clock(400))
+    # budget 1000s. stage 1: 0->300 (longest 300; 300+300 < 1000 go on); stage 2: 300->500
+    # (500+300 = 800 < 1000 go on); stage 3: 500->750 (750+300 >= 1000 stop).
+    await drain.drain_loop(lease_seconds=60, budget_seconds=1000, db=object(),
+                           clock=Script([0, 0, 300, 300, 500, 500, 750]))
     assert seen == ["clean", "clean", "clean"]
+
+
+async def test_each_stage_reports_its_duration(monkeypatch):
+    _loop_env(monkeypatch, ["clean"])
+    reported = []
+    await drain.drain_loop(lease_seconds=60, budget_seconds=0, db=object(), clock=Script([0, 5, 47.25]),
+                           report=reported.append)
+    assert reported[0]["duration_s"] == 42.2 or reported[0]["duration_s"] == 42.3
 
 
 async def test_a_throttled_crawl_ends_the_loop(monkeypatch):
