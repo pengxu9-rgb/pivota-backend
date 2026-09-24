@@ -377,3 +377,47 @@ async def test_merchant_diagnostics_do_not_flag_links_nobody_followed(monkeypatc
     assert len(missing) == 1 and missing[0]["count"] == 1
     assert [s["click_id"] for s in missing[0]["samples"]] == ["clk_followed"]
     assert out["summary"]["click_rows_total"] == 2
+
+
+# --- the MCP door, end to end: route -> real resolver -> real verifier -> issued click -----------------
+
+
+GATEWAY_KEY = "ak_live_" + "00" * 32
+
+
+def test_an_mcp_link_is_issued_to_the_agent_the_gateway_signed_for(resolve_offers, monkeypatch):
+    """The gateway's key plus a REALLY signed header, through the real invoke route, the real
+    resolve_issuing_agent_for_request and the real verifier. Only the key and agent lookups are stubbed."""
+    import time
+
+    from services.issuing_agent_assertion import sign_issuing_agent_assertion
+
+    call, minted, _, batches = resolve_offers
+    monkeypatch.setattr(gateway, "resolve_issuing_agent_for_request", agent_auth.resolve_issuing_agent_for_request)
+
+    async def get_agent_by_key(api_key, metrics_out=None):
+        return {GATEWAY_KEY: {"agent_id": GATEWAY_AGENT, "is_active": True},
+                AGENT_KEY: {"agent_id": "agent_other", "is_active": True}}.get(api_key)
+
+    async def get_agent(agent_id):
+        return {"agent_id": agent_id, "is_active": True} if agent_id == "agent_minds" else None
+
+    monkeypatch.setattr(agent_auth, "get_agent_by_key", get_agent_by_key)
+    monkeypatch.setattr("db.agents.get_agent", get_agent)
+    monkeypatch.setenv("ISSUING_AGENT_ASSERTION_SECRET", "route_secret")
+
+    def signed(sub, secret="route_secret"):
+        return sign_issuing_agent_assertion(
+            {"v": 1, "kind": "agent", "sub": sub, "op": "offers.resolve", "ts": int(time.time())}, secret)
+
+    call({"X-API-Key": GATEWAY_KEY, "X-Pivota-Issuing-Agent": signed("agent_minds")})
+    call({"X-API-Key": GATEWAY_KEY, "X-Pivota-Issuing-Agent": signed("agent_minds", secret="forged")})
+    call({"X-API-Key": AGENT_KEY, "X-Pivota-Issuing-Agent": signed("agent_minds")})
+    call({"X-Pivota-Issuing-Agent": signed("agent_minds")})
+
+    assert [{c.agent_id for c in batch} for batch in batches] == [
+        {"agent_minds"},   # the gateway vouched, signed with the shared secret
+        {None},            # forged signature
+        {"agent_other"},   # an agent's own key wins; it cannot vouch for another agent
+        {None},            # no service identity, no vouching
+    ]

@@ -42,6 +42,7 @@ def stubs(monkeypatch):
     monkeypatch.setattr("db.agents.get_agent", get_agent)
     monkeypatch.setenv("ISSUING_AGENT_ASSERTION_SECRET", SECRET)
     monkeypatch.delenv("ISSUING_AGENT_EXCLUDED_AGENT_IDS", raising=False)
+    monkeypatch.delenv("ISSUING_ASSERTION_VOUCHER_AGENT_IDS", raising=False)
 
 
 def _assert(sub, *, op=OP, secret=SECRET, ts=None):
@@ -93,6 +94,20 @@ async def test_a_forged_stale_or_misbound_assertion_names_no_one():
     assert await _resolve(GATEWAY_KEY, None) is None
 
 
-async def test_an_env_added_service_agent_can_vouch_too(monkeypatch):
+async def test_excluding_an_agent_never_makes_it_a_voucher(monkeypatch):
+    # An operator excludes a QA agent so its links stop being credited. Its key must not start
+    # vouching for others: only the explicit voucher list may.
     monkeypatch.setenv("ISSUING_AGENT_EXCLUDED_AGENT_IDS", "agent_other")
+    monkeypatch.delenv("ISSUING_ASSERTION_VOUCHER_AGENT_IDS", raising=False)
+    assert await _resolve(OTHER_AGENT_KEY, _assert("agent_minds")) is None
+
+
+async def test_an_env_added_voucher_can_vouch(monkeypatch):
+    monkeypatch.setenv("ISSUING_AGENT_EXCLUDED_AGENT_IDS", "agent_other")
+    monkeypatch.setenv("ISSUING_ASSERTION_VOUCHER_AGENT_IDS", "agent_other")
     assert await _resolve(OTHER_AGENT_KEY, _assert("agent_minds")) == "agent_minds"
+
+
+async def test_the_env_cannot_remove_the_gateway_voucher(monkeypatch):
+    monkeypatch.setenv("ISSUING_ASSERTION_VOUCHER_AGENT_IDS", "")
+    assert await _resolve(GATEWAY_KEY, _assert("agent_minds")) == "agent_minds"

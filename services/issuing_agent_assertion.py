@@ -19,9 +19,13 @@ Trust, in order, and every step fails to None ("not bound to one agent"), never 
   1. the header verifies: version, MAC, `op` equals the operation being served, `ts` within
      MAX_SKEW_SECONDS of now;
   2. the subject resolves to an ACTIVE agent that is not a service identity: an `agent` subject by
-     its agent_id, an `oauth` subject through its ACTIVE registration in agent_oauth_clients
-     (decision 2026-09-24: a frontier connector is credited to the agent its client is registered
-     to; an unregistered client stays agent-less).
+     its agent_id; an `oauth` subject (decision 2026-09-24: a frontier connector is credited to the
+     agent its client is registered to) only when it was issued by PIVOTA'S OWN authorization server
+     and EVERY redirect origin that server holds for the client is actively registered, in
+     agent_oauth_client_origins, to the SAME agent. Not the client_id itself: open dynamic
+     registration mints a random id per install; the redirect origin is what the server verifies
+     (see db/agent_oauth_client_origins.py). A foreign issuer, an unknown client, a loopback or
+     non-https redirect, or one unregistered origin all mean no agent.
 The caller of this module additionally requires the REQUEST to be authenticated as a service
 identity (the gateway) before consulting the header at all; see resolve_issuing_agent_for_request.
 """
@@ -34,9 +38,12 @@ import hmac
 import json
 import logging
 import os
+import ipaddress
+import re
 import time
 from dataclasses import dataclass
-from typing import Any, Collection, Mapping, Optional
+from typing import Any, Collection, Dict, Mapping, Optional
+from urllib.parse import urlsplit
 
 from db.database import database
 
@@ -52,13 +59,18 @@ MAX_SKEW_SECONDS = 300
 
 #: surface_click_events.agent_id is VARCHAR(64); a longer id is not an agent we can record.
 _MAX_AGENT_ID = 64
-#: agent_oauth_clients.issuer / client_id are VARCHAR(512).
+#: Bound on an asserted issuer / client_id (agent_oauth_client_origins.issuer is VARCHAR(512)).
 _MAX_OAUTH_FIELD = 512
 
-_ACTIVE_OAUTH_CLIENT_SQL = """
-SELECT agent_id FROM agent_oauth_clients
-WHERE issuer = :issuer AND client_id = :client_id AND disabled_at IS NULL
-LIMIT 1
+#: One compact-token part: unpadded base64url, nothing else. `urlsafe_b64decode` alone would skip
+#: characters outside the alphabet, making the MAC part malleable.
+_B64URL_PART = re.compile(r"^[A-Za-z0-9_-]+$")
+
+_CLIENT_REDIRECT_URIS_SQL = "SELECT redirect_uris FROM mcp_oauth_clients WHERE client_id = :client_id"
+
+_ACTIVE_ORIGINS_SQL = """
+SELECT redirect_origin, agent_id FROM agent_oauth_client_origins
+WHERE issuer = :issuer AND disabled_at IS NULL
 """
 
 
@@ -116,14 +128,16 @@ def verify_issuing_agent_assertion(
         if not key or not isinstance(token, str):
             return None
         parts = token.strip().split(".")
-        if len(parts) != 3 or parts[0] != _VERSION or not parts[1] or not parts[2]:
+        if len(parts) != 3 or parts[0] != _VERSION:
+            return None
+        if not _B64URL_PART.match(parts[1]) or not _B64URL_PART.match(parts[2]):
             return None
         signing_input = f"{parts[0]}.{parts[1]}"
         expected = hmac.new(key.encode("utf-8"), signing_input.encode("ascii"), hashlib.sha256).digest()
         if not hmac.compare_digest(expected, _b64url_decode(parts[2])):
             return None
         payload = json.loads(_b64url_decode(parts[1]).decode("utf-8"))
-        if not isinstance(payload, dict) or payload.get("v") != 1:
+        if not isinstance(payload, dict) or type(payload.get("v")) is not int or payload.get("v") != 1:
             return None
         if payload.get("op") != op or not op:
             return None
@@ -170,13 +184,66 @@ async def _active_agent_id(agent_id: Optional[str], excluded_agent_ids: Collecti
     return resolved if resolved == agent_id else None
 
 
+def normalize_redirect_origin(uri: Any) -> Optional[str]:
+    """The https origin of a redirect URI, lowercased, default port dropped; None when it cannot name
+    a connector: not https, userinfo, no host, or a loopback / IP-literal / *.localhost host (any
+    local program can receive a code there, so it proves nothing about who connected)."""
+    if not isinstance(uri, str) or not uri.strip():
+        return None
+    try:
+        parts = urlsplit(uri.strip())
+        port = parts.port
+    except ValueError:
+        return None
+    if parts.scheme.lower() != "https" or parts.username or parts.password:
+        return None
+    host = (parts.hostname or "").strip().lower().rstrip(".")
+    if not host or host == "localhost" or host.endswith(".localhost"):
+        return None
+    try:
+        ipaddress.ip_address(host)
+        return None
+    except ValueError:
+        pass
+    return f"https://{host}" if port in (None, 443) else f"https://{host}:{port}"
+
+
+def _own_issuer() -> Optional[str]:
+    try:
+        from services.mcp_oauth_as import issuer
+
+        return issuer()
+    except Exception:  # noqa: BLE001 -- no authorization server configured: no OAuth credit
+        return None
+
+
 async def agent_for_oauth_client(issuer: str, client_id: str) -> Optional[str]:
-    """The agent an OAuth client is ACTIVELY registered to, or None."""
-    row = await database.fetch_one(_ACTIVE_OAUTH_CLIENT_SQL, {"issuer": issuer, "client_id": client_id})
+    """The ONE agent every redirect origin of an OAuth client is actively registered to, or None.
+
+    Only for clients of Pivota's own authorization server, whose client records (redirect_uris) this
+    service holds. A foreign issuer's client cannot be verified here, so it names no agent.
+    """
+    own = _own_issuer()
+    if not own or issuer != own:
+        return None
+    row = await database.fetch_one(_CLIENT_REDIRECT_URIS_SQL, {"client_id": client_id})
     if row is None:
         return None
-    value = str(dict(row).get("agent_id") or "").strip()
-    return value or None
+    raw = dict(row).get("redirect_uris")
+    uris = json.loads(raw) if isinstance(raw, str) else raw
+    if not isinstance(uris, list) or not uris:
+        return None
+    origins = {normalize_redirect_origin(u) for u in uris}
+    if None in origins:
+        return None
+    registered: Dict[str, str] = {
+        str(dict(r)["redirect_origin"]): str(dict(r)["agent_id"])
+        for r in await database.fetch_all(_ACTIVE_ORIGINS_SQL, {"issuer": issuer})
+    }
+    agents = {registered.get(origin) for origin in origins}
+    if None in agents or len(agents) != 1:
+        return None
+    return agents.pop() or None
 
 
 async def resolve_asserted_agent_id(

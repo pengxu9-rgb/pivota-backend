@@ -61,6 +61,9 @@ def test_the_mirrored_signer_reproduces_the_gateway_bytes():
         lambda t: t.split(".")[0] + "." + t.split(".")[1],  # MAC missing
         lambda t: t + ".extra",  # four parts
         lambda t: "",
+        # Characters outside base64url are refused, not skipped: the MAC part is not malleable.
+        lambda t: t[:-4] + "!" + t[-4:],
+        lambda t: t.split(".")[0] + "." + t.split(".")[1] + ".=" + t.split(".")[2],
     ],
 )
 def test_a_tampered_or_malformed_token_names_no_one(mutate):
@@ -92,6 +95,7 @@ def test_an_assertion_is_only_good_inside_the_skew_window():
     "payload",
     [
         {"v": 2, "kind": "agent", "sub": "agent_minds", "op": OP, "ts": VECTOR_TS},
+        {"v": True, "kind": "agent", "sub": "agent_minds", "op": OP, "ts": VECTOR_TS},
         {"v": 1, "kind": "agent", "sub": "a" * 65, "op": OP, "ts": VECTOR_TS},
         {"v": 1, "kind": "agent", "sub": "", "op": OP, "ts": VECTOR_TS},
         {"v": 1, "kind": "agent", "sub": 7, "op": OP, "ts": VECTOR_TS},
@@ -138,3 +142,26 @@ async def test_a_lookup_failure_names_no_one(monkeypatch):
     monkeypatch.setattr("db.agents.get_agent", boom)
     monkeypatch.setenv(ia.ISSUING_AGENT_ASSERTION_SECRET_ENV, VECTOR_SECRET)
     assert await ia.resolve_asserted_agent_id(AGENT_VECTOR, op=OP, now=VECTOR_TS) is None
+
+
+@pytest.mark.parametrize(
+    "uri, origin",
+    [
+        ("https://claude.ai/api/mcp/auth_callback", "https://claude.ai"),
+        ("https://CLAUDE.ai:443/x?y=1", "https://claude.ai"),
+        ("https://chatgpt.com.:8443/cb", "https://chatgpt.com:8443"),
+        ("http://claude.ai/cb", None),
+        ("https://user:pw@claude.ai/cb", None),
+        ("https://localhost/cb", None),
+        ("https://app.localhost/cb", None),
+        ("https://127.0.0.1/cb", None),
+        ("https://[::1]/cb", None),
+        ("claude://oauth/cb", None),
+        ("https:///cb", None),
+        ("https://claude.ai:99999/cb", None),
+        ("", None),
+        (None, None),
+    ],
+)
+def test_a_redirect_uri_names_a_creditable_origin_only_when_it_is_public_https(uri, origin):
+    assert ia.normalize_redirect_origin(uri) == origin

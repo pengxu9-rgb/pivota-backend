@@ -175,8 +175,25 @@ async def resolve_issuing_agent_id(api_key: Optional[str]) -> Optional[str]:
 
 
 
+#: The service agents whose SIGNED assertion (X-Pivota-Issuing-Agent) may name another agent: the
+#: gateway's own agent, whose key its MCP commerce kernel sends upstream. Deliberately NOT
+#: issuing_excluded_agent_ids(): excluding an agent (a QA key on a laptop, say) must stop it being
+#: credited, never make it a voucher. The env var can only ADD vouchers, never remove the default.
+_ISSUING_VOUCHER_AGENT_IDS_DEFAULT = frozenset({"agent_982b1ea2df866206"})
+_ISSUING_VOUCHER_AGENT_IDS_ENV = "ISSUING_ASSERTION_VOUCHER_AGENT_IDS"
+
+
+def issuing_voucher_agent_ids() -> frozenset:
+    extra = {
+        part.strip()
+        for part in str(os.getenv(_ISSUING_VOUCHER_AGENT_IDS_ENV) or "").replace("\n", ",").split(",")
+        if part.strip()
+    }
+    return _ISSUING_VOUCHER_AGENT_IDS_DEFAULT | frozenset(extra)
+
+
 async def _is_service_caller(api_key: Optional[str]) -> bool:
-    """Is this request authenticated as one of Pivota's own services (the gateway), not an agent?
+    """Is this request authenticated as one of Pivota's own services allowed to vouch (the gateway)?
 
     Checked DIRECTLY, never inferred from resolve_issuing_agent_id returning None: None also means
     "no key", "unknown key" and "inactive agent", and none of those may vouch for anyone.
@@ -199,7 +216,7 @@ async def _is_service_caller(api_key: Optional[str]) -> bool:
         status = agent.get("status")
         is_active = (str(status).lower() == "active") if status else True
     agent_id = str(agent.get("agent_id") or "").strip()
-    return bool(is_active) and agent_id in issuing_excluded_agent_ids()
+    return bool(is_active) and agent_id in issuing_voucher_agent_ids()
 
 
 async def resolve_issuing_agent_for_request(
