@@ -1530,6 +1530,22 @@ _MEASURED_HOST_PRODUCT_TYPES = {
         # apply gate. Re-read this shelf before trusting it again.
         "physical": "beauty/skincare/treat/exfoliant",
     },
+    # Read 2026-09-24, every product on the host (5,120; USD storefront; Japanese beauty). Its types are
+    # breadcrumbs ("beauty & personal care / skincare / face masks"): each names two or more pattern
+    # families, so the evidence policy reads every one as ambiguous and NO beauty row resolved. Two
+    # shelves were one class: 97 masks and sheet packs, and 77 sunscreens. Their titles still step the
+    # shelf aside eight times: 5 UV primers/CC/concealer and 2 UV makeup-base gels name another leaf,
+    # and a cleansing mud paste names the cleanser. One row is a mask-and-cream SET, which the set
+    # detector holds. The shelves read and LEFT OUT, each for rows no title check would catch:
+    #   "skincare / cleansers" (203): blotting papers, pore strips, a clay face pack.
+    #   "skincare / japanese lotions" (126): toners (化粧水) AND milky emulsions (乳液), two classes.
+    #   "skincare / moisturizers" (121): a rice-bran beauty oil and an overnight sleeping pack.
+    #   "skincare / facial treatments" (83): serums, beauty oils, emulsions, balms, a massage gel.
+    #   "bath & body / body skincare" (189): liquid bandages, an antiseptic ointment, antiperspirants.
+    "japanesetaste.com": {
+        "beauty & personal care / skincare / face masks": "beauty/skincare/treat/mask",
+        "beauty & personal care / skincare / sun care": "beauty/skincare/sun/sunscreen",
+    },
 }
 
 
