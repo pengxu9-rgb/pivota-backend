@@ -111,7 +111,9 @@ def issuing_excluded_agent_ids() -> frozenset:
         for part in str(os.getenv(_ISSUING_EXCLUDED_AGENT_IDS_ENV) or "").replace("\n", ",").split(",")
         if part.strip()
     }
-    return _ISSUING_EXCLUDED_AGENT_IDS_DEFAULT | frozenset(extra)
+    # A voucher (issuing_voucher_agent_ids) is always excluded too: a service that vouches for others
+    # must never be credited itself, or its own key would win before its header is read.
+    return _ISSUING_EXCLUDED_AGENT_IDS_DEFAULT | frozenset(extra) | issuing_voucher_agent_ids()
 
 
 def request_api_key(request: Optional[Request]) -> Optional[str]:

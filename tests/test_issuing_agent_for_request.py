@@ -111,3 +111,13 @@ async def test_an_env_added_voucher_can_vouch(monkeypatch):
 async def test_the_env_cannot_remove_the_gateway_voucher(monkeypatch):
     monkeypatch.setenv("ISSUING_ASSERTION_VOUCHER_AGENT_IDS", "")
     assert await _resolve(GATEWAY_KEY, _assert("agent_minds")) == "agent_minds"
+
+
+async def test_an_env_added_voucher_is_excluded_so_its_header_is_read(monkeypatch):
+    # Added ONLY as a voucher: it must not be credited on its own key (which would win first and
+    # silently ignore its header). Vouchers are a subset of the exclusion list.
+    monkeypatch.delenv("ISSUING_AGENT_EXCLUDED_AGENT_IDS", raising=False)
+    monkeypatch.setenv("ISSUING_ASSERTION_VOUCHER_AGENT_IDS", "agent_other")
+    assert "agent_other" in agent_auth.issuing_excluded_agent_ids()
+    assert await _resolve(OTHER_AGENT_KEY, _assert("agent_minds")) == "agent_minds"
+    assert await _resolve(OTHER_AGENT_KEY, None) is None

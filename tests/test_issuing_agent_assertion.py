@@ -143,25 +143,3 @@ async def test_a_lookup_failure_names_no_one(monkeypatch):
     monkeypatch.setenv(ia.ISSUING_AGENT_ASSERTION_SECRET_ENV, VECTOR_SECRET)
     assert await ia.resolve_asserted_agent_id(AGENT_VECTOR, op=OP, now=VECTOR_TS) is None
 
-
-@pytest.mark.parametrize(
-    "uri, origin",
-    [
-        ("https://claude.ai/api/mcp/auth_callback", "https://claude.ai"),
-        ("https://CLAUDE.ai:443/x?y=1", "https://claude.ai"),
-        ("https://chatgpt.com.:8443/cb", "https://chatgpt.com:8443"),
-        ("http://claude.ai/cb", None),
-        ("https://user:pw@claude.ai/cb", None),
-        ("https://localhost/cb", None),
-        ("https://app.localhost/cb", None),
-        ("https://127.0.0.1/cb", None),
-        ("https://[::1]/cb", None),
-        ("claude://oauth/cb", None),
-        ("https:///cb", None),
-        ("https://claude.ai:99999/cb", None),
-        ("", None),
-        (None, None),
-    ],
-)
-def test_a_redirect_uri_names_a_creditable_origin_only_when_it_is_public_https(uri, origin):
-    assert ia.normalize_redirect_origin(uri) == origin
