@@ -609,7 +609,7 @@ def _drain_state_changes(calls: list[str]) -> set[tuple[str, str]]:
 
 
 @pytest.mark.parametrize("paused_env", [None, "1", "0"])
-def test_the_drain_trigger_is_every_30_minutes_utc_and_created_paused(tmp_path, paused_env):
+def test_the_drain_trigger_is_every_10_minutes_utc_and_created_paused(tmp_path, paused_env):
     """Created paused even under PAUSED=0, which arms every OTHER trigger a run creates."""
     empty = tmp_path / "none.txt"
     empty.write_text("")
@@ -619,7 +619,7 @@ def test_the_drain_trigger_is_every_30_minutes_utc_and_created_paused(tmp_path, 
                             "STORE_AUDIT_COMMERCE_REPROBE_ARMED": "false"})
     creates = [c for c in calls if c.startswith(f"scheduler jobs create http {DRAIN_TRIGGER} ")]
     assert len(creates) == 1, creates
-    assert "--schedule=*/30 * * * * --time-zone=Etc/UTC" in creates[0]
+    assert "--schedule=*/10 * * * * --time-zone=Etc/UTC" in creates[0]
     assert f"/jobs/{DRAIN}:run" in creates[0]
     assert _drain_state_changes(calls) == {("pause", DRAIN_TRIGGER)}
 
@@ -645,3 +645,20 @@ def test_the_edited_scripts_parse(script):
     proc = subprocess.run(["bash", "-n", str(REPO / "infra" / "gcp" / script)],
                           capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr
+
+
+def test_the_drain_budget_leaves_the_last_stage_room_inside_the_task_timeout():
+    """RETAILER_INGEST_DRAIN_BUDGET_SECONDS is when the loop stops STARTING stages; a stage started just
+    before it must still finish inside the 3600s task timeout (stages ran 4-12 min on 2026-09-24), and
+    the lease must outlive the task so a killed stage is never claimed twice."""
+    import re
+    text = SCRIPT.read_text(encoding="utf-8")
+    block = text[text.index("mkcrawljob retailer-ingest-drain"):]
+    block = block[:block.index("\n\n")]
+    env = dict(kv.split("=", 1) for kv in re.search(r'--set-env-vars "([^"]+)"', block).group(1).split(","))
+    timeouts = [int(t) for t in re.findall(r"--task-timeout (\d+)s", block)]
+    task_timeout = timeouts[-1]  # the later flag wins, as in gcloud
+    assert task_timeout == 3600
+    assert 0 < int(env["RETAILER_INGEST_DRAIN_BUDGET_SECONDS"]) <= task_timeout - 1800
+    assert int(env["RETAILER_INGEST_LEASE_SECONDS"]) > task_timeout
+    assert int(env["RETAILER_INGEST_TASK_TIMEOUT_SECONDS"]) == task_timeout  # the loop sizes leases from it

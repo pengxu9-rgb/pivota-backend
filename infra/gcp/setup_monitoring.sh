@@ -198,9 +198,10 @@ else
   echo "   created $METRIC"
 fi
 
-# The retailer ingest drain (jobs/retailer_ingest_drain.py) prints ONE summary line per execution,
-# sort_keys JSON with json.dumps' default ", " / ": " separators (the filters match that spacing),
-# carrying the lane's job counts by status on EVERY execution, idle ones included:
+# The retailer ingest drain (jobs/retailer_ingest_drain.py) prints ONE summary line per STAGE (an
+# execution may run several back to back), sort_keys JSON with json.dumps' default ", " / ": "
+# separators (the filters match that spacing), carrying the lane's job counts by status on EVERY
+# line, idle ones included:
 #   retailer_ingest_drain: {"job_id": "rij_...", "jobs": {"held": 1, "queued": 3}, "outcome": "held", ...}
 #
 # These are the two conditions the "Cloud Run job failing" policy CANNOT see: the stage was
@@ -230,7 +231,7 @@ upsert_log_metric() { # NAME DESCRIPTION FILTER
   fi
 }
 upsert_log_metric retailer_ingest_drain_held \
-  "Retailer ingest drain executions that saw a HELD job (a store needs review before it can be applied)" \
+  "Retailer ingest drain summary lines (one per stage) that saw a HELD job (a store needs review before it can be applied)" \
   "$RID_HELD_FILTER"
 upsert_log_metric retailer_ingest_drain_failed \
   "Retailer ingest drain stages that left a job FAILED - the ledger gave up on that store" \
