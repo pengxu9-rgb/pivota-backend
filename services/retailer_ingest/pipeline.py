@@ -187,21 +187,36 @@ async def _crawl(job: Dict[str, Any], stage: str) -> List[Dict[str, Any]]:
     return records
 
 
-#: Rows the category filter left out, recorded per run. Capped so one huge store cannot bloat a run
-#: row; the counts are always complete, and `rows_truncated` says when the list is not.
+#: Rows the category filter left out, recorded per run. Bounded so one huge store cannot bloat a run
+#: row: at most LEFT_OUT_ROWS_CAP rows and LEFT_OUT_TYPES_CAP merchant types, each string at most
+#: LEFT_OUT_STR_CAP chars. `count` and `by_reason` are always complete; the `*_truncated` flags say
+#: when a list is not.
 LEFT_OUT_ROWS_CAP = 300
+LEFT_OUT_TYPES_CAP = 25
+LEFT_OUT_STR_CAP = 200
+
+
+def _ledger_safe(value: Any) -> Optional[str]:
+    """A merchant string as Postgres jsonb will take it: no NUL (jsonb refuses \\u0000), no NaN
+    (refused as a token), bounded length. The run row must never fail to write over a product name --
+    a failed finish_run leaves the job wedged until its lease expires."""
+    if value is None or (isinstance(value, float) and value != value):
+        return None
+    return str(value).replace("\x00", "")[:LEFT_OUT_STR_CAP]
 
 
 def _left_out_summary(left_out: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Which rows a category filter left out and why: counts by reason and by the merchant's own
     product type (the usual culprit), plus the rows themselves up to LEFT_OUT_ROWS_CAP."""
     from collections import Counter
+    types = Counter(_ledger_safe(e.get("merchant_product_type")) or "(none)" for e in left_out)
     return {
         "count": len(left_out),
         "by_reason": dict(Counter(e["reason"] for e in left_out)),
-        "by_merchant_type": dict(Counter(str(e.get("merchant_product_type") or "(none)") for e in left_out)
-                                 .most_common(25)),
-        "rows": [{k: e.get(k) for k in ("reason", "product_name", "category_path", "merchant_product_type", "handle")}
+        "by_merchant_type": dict(types.most_common(LEFT_OUT_TYPES_CAP)),
+        "merchant_types_truncated": len(types) > LEFT_OUT_TYPES_CAP,
+        "rows": [{k: _ledger_safe(e.get(k)) for k in ("reason", "product_name", "category_path",
+                                                      "merchant_product_type", "handle")}
                  for e in left_out[:LEFT_OUT_ROWS_CAP]],
         "rows_truncated": len(left_out) > LEFT_OUT_ROWS_CAP,
     }
@@ -226,7 +241,10 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
                           "severity": detectors.BLOCK, "handle": handle,
                           "detail": "an approved exclusion no longer matches any product"})
     if o.get("only_category") or o.get("only_resolved_category"):
+        selected = len(records)
         records, left_out = cli._partition_by_category(records, prefix=o.get("only_category"))
+        cli._print_category_filter(selected, records, left_out, domain=job["domain"],
+                                   want=(o.get("only_category") or "").strip().strip("/").lower())
         checks["left_out"] = _left_out_summary(left_out)
         if not records:
             checks["kept"] = 0

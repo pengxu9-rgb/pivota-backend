@@ -447,10 +447,43 @@ async def test_a_pass_that_keeps_nothing_still_records_what_it_left_out(env):
     assert {r["handle"] for r in checks["left_out"]["rows"]} == {"soft-matte", "new-take"}
 
 
-def test_the_left_out_list_is_capped_but_the_counts_are_complete():
+@pytest.mark.parametrize("n,truncated", [(pipeline.LEFT_OUT_ROWS_CAP, False), (pipeline.LEFT_OUT_ROWS_CAP + 1, True)])
+def test_the_left_out_list_is_capped_but_the_counts_are_complete(n, truncated):
     entries = [{"reason": "category_unresolved", "product_name": f"p{i}", "merchant_product_type": "Misc",
-                "handle": f"h{i}"} for i in range(pipeline.LEFT_OUT_ROWS_CAP + 5)]
+                "handle": f"h{i}"} for i in range(n)]
     summary = pipeline._left_out_summary(entries)
-    assert summary["count"] == pipeline.LEFT_OUT_ROWS_CAP + 5 and summary["rows_truncated"]
-    assert len(summary["rows"]) == pipeline.LEFT_OUT_ROWS_CAP
-    assert summary["by_merchant_type"] == {"Misc": pipeline.LEFT_OUT_ROWS_CAP + 5}
+    assert summary["count"] == n and summary["rows_truncated"] is truncated
+    assert len(summary["rows"]) == min(n, pipeline.LEFT_OUT_ROWS_CAP)
+    assert summary["by_merchant_type"] == {"Misc": n}
+
+
+def test_merchant_types_are_capped_and_say_so():
+    entries = [{"reason": "category_unresolved", "merchant_product_type": f"T{i}"} for i in range(pipeline.LEFT_OUT_TYPES_CAP + 1)]
+    summary = pipeline._left_out_summary(entries)
+    assert len(summary["by_merchant_type"]) == pipeline.LEFT_OUT_TYPES_CAP and summary["merchant_types_truncated"]
+    assert not pipeline._left_out_summary(entries[:pipeline.LEFT_OUT_TYPES_CAP])["merchant_types_truncated"]
+
+
+def test_a_hostile_product_name_cannot_stop_the_run_row_being_written():
+    """jsonb refuses \\u0000 and NaN; the ledger serialises with db.retailer_ingest._dumps."""
+    from db.retailer_ingest import _dumps
+    summary = pipeline._left_out_summary([{"reason": "category_unresolved", "product_name": "a\x00b" + "x" * 5000,
+                                           "category_path": float("nan"), "merchant_product_type": "\x00Misc"}])
+    text = _dumps(summary)
+    assert "\\u0000" not in text and "NaN" not in text
+    [row] = summary["rows"]
+    assert row["product_name"].startswith("ab") and len(row["product_name"]) == pipeline.LEFT_OUT_STR_CAP
+    assert row["category_path"] is None and summary["by_merchant_type"] == {"Misc": 1}
+
+
+async def test_a_resolved_row_outside_the_prefix_is_recorded_as_outside_the_filter(env, capsys):
+    env.rows = [TINT, ("3CE - Multi Eye Color Palette", "Eyeshadow", "multi-eye")]  # resolves under eye
+    out = await pipeline.run_stage(job(only_category="beauty/makeup/lip", lip_title_evidence=True), db=env.db)
+    checks = list(env.ledger.runs.values())[-1]["checks"]
+    assert out["status"] in {"apply_due", "held"}
+    assert checks["left_out"]["by_reason"] == {"outside_category_filter": 1}
+    # ...and the job log carries the same per-row line the CLI prints, with exactly the printed keys.
+    import json
+    from scripts.onboard_curated_brands import LEFT_OUT_PDP_PREFIX, LEFT_OUT_PRINTED_KEYS
+    [line] = [l for l in capsys.readouterr().out.splitlines() if l.startswith(LEFT_OUT_PDP_PREFIX)]
+    assert set(json.loads(line[len(LEFT_OUT_PDP_PREFIX):])) == set(LEFT_OUT_PRINTED_KEYS)

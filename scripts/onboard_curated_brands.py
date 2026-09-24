@@ -319,21 +319,31 @@ def _select_by_category(records: List[Dict[str, Any]], *, prefix: Optional[str],
     """
     want = (prefix or "").strip().strip("/").lower()
     kept, left_out = _partition_by_category(records, prefix=prefix)
-    for entry in left_out:
-        print(LEFT_OUT_PDP_PREFIX + json.dumps({k: entry[k] for k in (
-            "reason", "product_name", "category_path", "merchant_product_type", "canonical_url")},
-            sort_keys=True, ensure_ascii=False))
-    print(f"    category filter {want or '(resolved)'}: {len(records)} -> {len(kept)} products "
-          f"({len(left_out)} left out)")
-    print(CATEGORY_FILTER_MARKER + json.dumps({
-        "domain": domain, "filter": want or "(resolved)", "selected": len(records),
-        "kept": len(kept), "left_out": len(left_out),
-    }, sort_keys=True))
+    _print_category_filter(len(records), kept, left_out, want=want, domain=domain)
     if not kept:
         where = f"{domain}: " if domain else ""
         raise ValueError(f"{where}category filter {want or '(resolved)'} kept none of the "
                          f"{len(records)} selected products")
     return kept
+
+
+#: The keys a `left out pdp` line prints -- a projection, so internal fields never leak into it.
+LEFT_OUT_PRINTED_KEYS = ("reason", "product_name", "category_path", "merchant_product_type", "canonical_url")
+
+
+def _print_category_filter(selected: int, kept: List[Dict[str, Any]], left_out: List[Dict[str, Any]], *,
+                           want: str, domain: Optional[str]) -> None:
+    """One `left out pdp` line per left-out row, then the summary and the greppable marker. Shared by
+    the CLI and the unattended pipeline, so job logs read the same either way."""
+    for entry in left_out:
+        print(LEFT_OUT_PDP_PREFIX + json.dumps({k: entry[k] for k in LEFT_OUT_PRINTED_KEYS},
+                                               sort_keys=True, ensure_ascii=False))
+    print(f"    category filter {want or '(resolved)'}: {selected} -> {len(kept)} products "
+          f"({len(left_out)} left out)")
+    print(CATEGORY_FILTER_MARKER + json.dumps({
+        "domain": domain, "filter": want or "(resolved)", "selected": selected,
+        "kept": len(kept), "left_out": len(left_out),
+    }, sort_keys=True))
 
 
 #: Its own line, never merged into `primary ingestion:` — scripts/curated_apply_gate.py parses that
