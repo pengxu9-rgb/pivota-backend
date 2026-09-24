@@ -1321,6 +1321,29 @@ RETAILER_BRAND_SPELLINGS = {
     # Purito renamed to Purito Seoul: eyurs "Purito SEOUL", sokoglam "Purito Seoul", ohlolly "Purito".
     "puritoseoul": "purito",
     "purito": "purito",
+    # Measured 2026-09-24 over every vendor at 400+ Japanese/Australian beauty storefronts (JP/AU
+    # coverage census): the same maker spelt with and without its accent. `_brand_key` keeps accented
+    # letters (isalnum), and so does normalize_brand, so each spelling below was a separate brand
+    # identity -- e.g. "Kose" at ichibanm.com (26), goodsania.com (185) vs "Kosé" at japanesetaste.com
+    # (47), japanwithlovestore.com (93). Generic-word names that happen to split the same way
+    # ("Elegance"/"Elégance", "Naive"/"Naïve") are deliberately NOT listed: an unrelated vendor
+    # called "Elegance" would be relabelled.
+    "kose": "kose", "kosé": "kose",
+    "biore": "biore", "bioré": "biore",
+    "curel": "curel", "curél": "curel",
+    # Decorté was "Cosme Decorté" until 2020: a rename sold under both names (sasa.com "Cosme Decorte",
+    # wafuu.com "COSME DECORTÉ", ichibanm.com "Decorte", decortecosmetics.com "Decorté").
+    "decorte": "decorte", "decorté": "decorte", "cosmedecorte": "decorte", "cosmedecorté": "decorte",
+    # sasa.com and nanamall.com shorten it to "Cle de Peau" / "Clé de Peau".
+    "cledepeaubeaute": "cledepeaubeaute", "clédepeaubeauté": "cledepeaubeaute",
+    "cledepeau": "cledepeaubeaute", "clédepeau": "cledepeaubeaute",
+    "naturaglace": "naturaglace", "naturaglacé": "naturaglace",
+    "visee": "visee", "visée": "visee",
+    "fiancee": "fiancee", "fiancée": "fiancee",
+    # lamourlife.com writes the Roman-numeral character "SK-Ⅱ" (U+2161), which casefolds to "ⅱ".
+    "skii": "skii", "skⅱ": "skii",
+    # AU: the brand's own store says "Lük Beautifood"; five US retailers say "Luk Beautifood".
+    "lukbeautifood": "lukbeautifood", "lükbeautifood": "lukbeautifood",
 }
 # The spelling each family is WRITTEN as -- in retailer AND brand-official mode, with or without
 # --brand. content_key is
@@ -1332,6 +1355,18 @@ RETAILER_BRAND_SPELLINGS = {
 RETAILER_BRAND_CANONICAL = {
     "manyo": "Ma:nyo",
     "purito": "Purito SEOUL",
+    # 2026-09-24: prod carried none of these as a brand (only two seed-mirror rows, "Biore UV" and
+    # "Clé de Peau"), so each family is written as the maker's own spelling on its own storefront.
+    "kose": "Kosé",
+    "biore": "Bioré",
+    "curel": "Curél",
+    "decorte": "Decorté",
+    "cledepeaubeaute": "Clé de Peau Beauté",
+    "naturaglace": "Naturaglacé",
+    "visee": "Visée",
+    "fiancee": "Fiancée",
+    "skii": "SK-II",
+    "lukbeautifood": "Lük Beautifood",
 }
 
 

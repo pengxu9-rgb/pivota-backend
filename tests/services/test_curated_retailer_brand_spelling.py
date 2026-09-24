@@ -117,3 +117,76 @@ def test_a_vendor_naming_the_store_is_still_refused_in_retailer_mode():
     that is the retailer's own name is not maker evidence, and no override may paper over it."""
     with pytest.raises(ValueError, match="retailer_maker_unproven"):
         brand_on("sokoglam.com", "Soko Glam", "Soko Glam")
+
+
+# 2026-09-24, JP/AU coverage census: the same maker spelt with and without its accent across stores.
+# Real (host, vendor) pairs from the probe; each family must write ONE spelling, so one product sold at
+# two stores gets ONE content key.
+JP_AU_FAMILIES = [
+    ("Kosé", [("ichibanm.com", "Kose"), ("goodsania.com", "KOSE"), ("japanesetaste.com", "Kosé"), ("miaumall.com", "KOSÉ")]),
+    ("Bioré", [("buymejapan.com", "Biore"), ("shibuyala.com", "BIORE"), ("japanesetaste.com", "Bioré"),
+               ("retailer.com", "BIORÉ")]),                                              # invented: upper-case accented
+    ("Curél", [("ichibanm.com", "Curel"), ("oceanbuy.ca", "CUREL"), ("japanesetaste.com", "Curél"),
+               ("retailer.com", "CURÉL")]),                                              # invented
+    ("Decorté", [("ichibanm.com", "Decorte"), ("beautygypsyrecommends.com", "DECORTE"), ("japanwithlovestore.com", "DECORTÉ"),
+                 ("sasa.com", "Cosme Decorte"), ("wafuu.com", "COSME DECORTÉ")]),
+    ("Clé de Peau Beauté", [("ichibanm.com", "Cle De Peau Beaute"), ("tokyobeautybox.com", "Clé de Peau Beauté"),
+                            ("nanamall.com", "Cle de Peau"), ("sasa.com", "Clé de Peau"),
+                            ("retailer.com", "CLÉ DE PEAU BEAUTÉ")]),                        # invented
+    ("Naturaglacé", [("japanwithlovestore.com", "Naturaglace"), ("ichibanm.com", "Naturaglacé"),
+                     ("tokyobeautybox.com", "naturaglacé")]),
+    ("Visée", [("ichibanm.com", "Visee"), ("everglowcosmetics.com", "Visée"), ("retailer.com", "VISÉE")]),  # last invented
+    ("Fiancée", [("buymejapan.com", "Fiancee"), ("japanwithlovestore.com", "FIANCÉE")]),
+    ("SK-II", [("ichibanm.com", "SK-II"), ("kokorojapanstore.com", "SK II"), ("lamourlife.com", "SK-Ⅱ")]),
+    ("Lük Beautifood", [("echo.market", "Luk Beautifood"), ("cleanbeautymarket.com.au", "LUK Beautifood"),
+                        ("lukbeautifood.com", "lük beautifood")]),
+]
+
+
+@pytest.mark.parametrize("want,spellings", JP_AU_FAMILIES)
+def test_an_accented_brand_is_one_brand_at_every_store(want, spellings):
+    for host, vendor in spellings:
+        assert brand_on(host, vendor, None) == want, (host, vendor)
+    keys = {make_content_key(brand_on(h, v, None), "Moisture Lotion 170ml", None) for h, v in spellings}
+    assert len(keys) == 1
+
+
+def test_the_accent_split_was_real_before_the_family():
+    # The control: normalize_brand keeps accents, so the two spellings were two identities.
+    assert make_content_key("Kose", "Moisture Lotion 170ml", None) != make_content_key("Kosé", "Moisture Lotion 170ml", None)
+
+
+def test_a_brand_official_store_writes_the_accented_family_spelling():
+    """Review of #2302: on decortecosmetics.com the store-name rule already chose the override, so the
+    family was untested there. On a host that does not name the brand, the vendor wins the override
+    disagreement ("Cosme Decorte" vs "Decorté"), and only the family turns it into "Decorté"."""
+    rec = feed.shopify_product_to_record(product("Cosme Decorte"), domain="jp-counter.example", category_path="beauty/skincare",
+                                         brand_override="Decorté", currency="USD", source_role="brand_official")
+    assert rec["pdp"]["brand"] == "Decorté"
+
+
+@pytest.mark.parametrize("vendor", [
+    "Kose Softymo",     # a Kosé sub-line spelt as its own vendor (buymejapan.com): not the family
+    "Men's Biore",      # Kao's men's line (goodsania.com): a different vendor
+    "Kao Curél",        # parent-prefixed (buymejapan.com)
+    "Elegance",         # generic word, deliberately unlisted though it splits the same way
+    "Naive",            # generic word (Kracie), deliberately unlisted
+])
+def test_a_neighbour_of_an_accent_family_keeps_its_own_name(vendor):
+    assert brand_on("retailer.com", vendor, None) == vendor
+
+
+@pytest.mark.parametrize("brands,ok", [
+    ({"Kose": "Kosé"}, True),              # the family's own spelling
+    ({"Kose": "KOSE"}, True),              # same letters: a plain respelling
+    ({"Kose": "Shiseido"}, False),         # review of #2302: a family vendor accepted ANY value, then wrote "Kosé"
+    ({"Kose": "Bioré"}, False),            # another family's spelling: would be silently ignored too
+])
+def test_multi_brand_respells_a_family_vendor_only_into_its_own_family(brands, ok):
+    from services.retailer_ingest.pipeline import validate_options
+    opts = {"vendors": list(brands), "multi_brand": True, "brands": dict(brands)}
+    if ok:
+        validate_options(opts)
+    else:
+        with pytest.raises(ValueError, match="respell"):
+            validate_options(opts)
