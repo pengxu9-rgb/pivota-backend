@@ -205,10 +205,11 @@ def resolve_offers(monkeypatch):
                                     merchant_id=kwargs.get("merchant_id"), link=link))
         return link
 
-    keys_seen, batches = [], []
+    keys_seen, batches, assertions_seen = [], [], []
 
-    async def fake_resolve(api_key):
+    async def fake_resolve(api_key, assertion=None, *, op=None):
         keys_seen.append(api_key)
+        assertions_seen.append((assertion, op))
         return "agent_minds" if api_key == AGENT_KEY else None
 
     async def fake_issue(clicks):
@@ -217,7 +218,7 @@ def resolve_offers(monkeypatch):
 
     monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
     monkeypatch.setattr(gateway, "_make_external_redirect_url", fake_redirect)
-    monkeypatch.setattr(gateway, "resolve_issuing_agent_id", fake_resolve)
+    monkeypatch.setattr(gateway, "resolve_issuing_agent_for_request", fake_resolve)
     monkeypatch.setattr(gateway, "issue_clicks", fake_issue)
     client = TestClient(app)
 
@@ -232,6 +233,7 @@ def resolve_offers(monkeypatch):
         assert res.status_code == 200, res.text
         return res.json()
 
+    call.assertions_seen = assertions_seen
     return call, minted, keys_seen, batches
 
 
@@ -246,6 +248,17 @@ def test_offers_resolve_records_each_link_it_hands_out_with_the_callers_agent(re
     assert [c.click_id for c in batches[0]] == minted
     # From the caller's key. The body's agent_id ("agent_spoofed") is never read.
     assert {c.agent_id for c in batches[0]} == {"agent_minds"}
+
+
+def test_offers_resolve_hands_the_gateways_signed_assertion_to_the_resolver(resolve_offers):
+    """The MCP door: the header travels from the invoke route to the resolver, bound to offers.resolve.
+    Whether it is TRUSTED is resolve_issuing_agent_for_request's job (tests/test_issuing_agent_for_request.py)."""
+    call, _, _, _ = resolve_offers
+
+    call({"X-API-Key": AGENT_KEY, "X-Pivota-Issuing-Agent": "v1.signed.token"})
+    call({"X-API-Key": AGENT_KEY})
+
+    assert call.assertions_seen == [("v1.signed.token", "offers.resolve"), (None, "offers.resolve")]
 
 
 def test_offers_resolve_without_a_key_issues_agentless_links(resolve_offers):
@@ -314,11 +327,11 @@ async def test_a_link_minted_but_not_served_is_never_issued(monkeypatch):
         batches.append(clicks)
         return len(clicks)
 
-    async def fake_resolve(api_key):
+    async def fake_resolve(api_key, assertion=None, *, op=None):
         return "agent_minds"
 
     monkeypatch.setattr(gateway, "issue_clicks", fake_issue)
-    monkeypatch.setattr(gateway, "resolve_issuing_agent_id", fake_resolve)
+    monkeypatch.setattr(gateway, "resolve_issuing_agent_for_request", fake_resolve)
     minted = [IssuedClick(click_id=f"clk_{i}", surface="offers_resolve", link=f"https://x/r?token=t{i}")
               for i in range(4)]
     offers = [
