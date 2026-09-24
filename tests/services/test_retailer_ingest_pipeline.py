@@ -530,3 +530,122 @@ async def test_the_run_reason_counts_every_noted_row(env):
 async def test_an_empty_readback_still_carries_its_notes_list():
     readback = await pipeline._readback([], "USD", db=None)
     assert readback == {"ok": False, "reason": "no product keys to read back", "notes": [], "rows": []}
+
+
+# ------------------------------------------------------------------ source_role (a brand's own store)
+
+async def test_the_source_role_option_reaches_the_crawl_and_defaults_to_retailer(env, monkeypatch):
+    seen = []
+    built = feed.records_for_brand
+
+    async def spy(**kw):
+        seen.append((kw.get("source_role"), kw.get("retailer_name")))
+        return await built(**kw)
+    monkeypatch.setattr(feed, "records_for_brand", spy)
+    await pipeline.run_stage(job(), db=env.db)
+    await pipeline.run_stage(job(source_role="brand_official"), db=env.db)
+    assert seen == [("retailer", "k-touch.us"), ("brand_official", None)]  # a retailer is named by its host
+
+
+async def test_a_brand_official_cohort_applies_with_brand_authority(env, monkeypatch):
+    """The brand's own store: offers carry the brand's merchant identity and brand-official INCI
+    authority, not a reseller's -- the same records Lane A (onboard_curated_brands.py) writes."""
+    def official(title, ptype, handle, body="<p>Ingredients: Water, Glycerin, Dimethicone</p>"):
+        return feed.shopify_product_to_record(
+            {"id": abs(hash(handle)) % 10**9, "vendor": "3CE", "title": title, "handle": handle,
+             "product_type": ptype, "body_html": body, "images": [{"src": "https://cdn.example/i.jpg"}],
+             "variants": [{"id": abs(hash(handle + "v")) % 10**12, "price": "20.00", "available": True,
+                           "sku": handle}]},
+            domain="k-touch.us", category_path="beauty", brand_override="3CE", currency="USD",
+            source_role="brand_official", emit_native_variants=True)
+
+    async def fetch(**kw):
+        assert kw["source_role"] == "brand_official"
+        return feed.ShopifyProductBatch([official(*TINT)], scanned_products=1, pages=1)
+    monkeypatch.setattr(feed, "records_for_brand", fetch)
+    # k-touch.us is not named 3CE: held until a human says it is 3CE's own store.
+    assert (await pipeline.run_stage(job(source_role="brand_official"), db=env.db))["status"] == "held"
+    accept = ["brand_official_domain_unproven:k-touch.us:3ce"]
+    assert (await pipeline.run_stage(job(source_role="brand_official", accepted_flags=accept),
+                                     db=env.db))["status"] == "apply_due"
+    out = await pipeline.run_stage(job("apply_due", source_role="brand_official", accepted_flags=accept), db=env.db)
+    assert out["status"] == "done", env.ledger.runs
+    import json
+    offer = env.applied[-1]["offers"][0]
+    assert not offer["merchant_id"].startswith("agent_seed::retailer::")
+    assert json.loads(offer["offer_payload"])["merchant_inferred"] == "3CE"
+    assert not env.applied[-1]["pdps"][0]["product_key"].startswith("ext:retailer:")
+
+
+@pytest.mark.parametrize("options", [
+    {"vendors": ["3CE"], "source_role": "brand"},                                   # not a role
+    {"vendors": ["3CE"], "source_role": "brand_official", "retailer_name": "X"},     # a retailer's name
+    {"vendors": ["3CE"], "source_role": True},                                      # typed
+])
+async def test_a_bad_source_role_is_refused_before_any_crawl(env, options):
+    env.crawl_error = AssertionError("must not crawl")
+    bad = job()
+    bad["options"] = options
+    out = await pipeline.run_stage(bad, db=env.db)
+    assert out["status"] == "failed" and out["outcome"] == "invalid_job"
+
+
+def test_an_affiliate_feed_is_retailer_only():
+    with pytest.raises(ValueError, match="source_role = retailer"):
+        pipeline.validate_options({"vendors": ["X"], "source": "affiliate_feed", "source_role": "brand_official",
+                                   "feed": {}})
+
+
+async def test_a_brand_store_named_for_the_brand_needs_no_approval(env):
+    j = job(source_role="brand_official")
+    j["domain"] = "3ce.com"
+    out = await pipeline.run_stage(j, db=env.db)
+    assert out["status"] == "apply_due"
+
+
+async def test_a_known_retailer_can_never_be_a_brand_official_store(env):
+    for accepted in ([], ["brand_official_on_a_retailer"]):
+        j = job(source_role="brand_official", accepted_flags=accepted)
+        j["domain"] = "sephora.com"
+        out = await pipeline.run_stage(j, db=env.db)
+        assert out["status"] == "held"
+        run = list(env.ledger.runs.values())[-1]
+        assert [f["rule"] for f in run["flags"] if f["rule"].startswith("brand_official")] == ["brand_official_on_a_retailer"]
+
+
+async def test_the_retailer_default_raises_no_domain_flag(env):
+    j = job()
+    j["domain"] = "sephora.com"
+    await pipeline.run_stage(j, db=env.db)
+    run = list(env.ledger.runs.values())[-1]
+    assert not [f for f in run.get("flags") or [] if f["rule"].startswith("brand_official")]
+
+
+async def test_naming_the_store_as_the_brand_cannot_write_another_brands_rows(env, monkeypatch):
+    """Review round 2: brand="K-Touch" owns k-touch.us, but the records' brand is their vendor (3CE),
+    whose canonical keys they would overwrite. Every written brand must own the host."""
+    def official(title, ptype, handle):
+        return feed.shopify_product_to_record(
+            {"id": abs(hash(handle)) % 10**9, "vendor": "3CE", "title": title, "handle": handle,
+             "product_type": ptype, "body_html": "<p>x</p>", "images": [{"src": "https://cdn.example/i.jpg"}],
+             "variants": [{"id": abs(hash(handle + "v")) % 10**12, "price": "20.00", "available": True, "sku": handle}]},
+            domain="k-touch.us", category_path="beauty", brand_override="K-Touch", currency="USD",
+            source_role="brand_official", emit_native_variants=True)
+
+    async def fetch(**kw):
+        return feed.ShopifyProductBatch([official(*TINT)], scanned_products=1, pages=1)
+    monkeypatch.setattr(feed, "records_for_brand", fetch)
+    j = job(source_role="brand_official")
+    j["brand"] = "K-Touch"
+    out = await pipeline.run_stage(j, db=env.db)
+    assert out["status"] == "held"
+    run = list(env.ledger.runs.values())[-1]
+    assert [f["key"] for f in run["flags"] if f["rule"] == "brand_official_domain_unproven"] == [
+        "brand_official_domain_unproven:k-touch.us:3ce"]
+
+
+def test_each_non_latin_brand_needs_its_own_acceptance():
+    keys = [f["key"] for f in pipeline.brand_official_domain_flags("k-touch.us", ["설화수", "헤라", "HERA"])]
+    assert keys == ["brand_official_domain_unproven:k-touch.us:설화수",
+                    "brand_official_domain_unproven:k-touch.us:헤라",
+                    "brand_official_domain_unproven:k-touch.us:hera"]

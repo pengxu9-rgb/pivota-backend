@@ -45,6 +45,10 @@ _OPTION_TYPES = {
     # "storefront" (default: crawl the retailer's /products.json) or "affiliate_feed" (the network's
     # product datafeed; services/retailer_ingest/affiliate_feed.py) -- for stores that block crawlers.
     "source": str, "feed": dict,
+    # Whose store this is: "retailer" (default) or "brand_official" (the brand's own storefront, the
+    # ADR-001 canonical anchor). services.catalog_onboard_worker.normalize_curated_brand_payload owns
+    # the allowed values and the retailer_name rule; enqueue runs that same normalization.
+    "source_role": str,
 }
 SOURCES = ("storefront", "affiliate_feed")
 
@@ -76,6 +80,9 @@ def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
     source = options.get("source") or "storefront"
     if source not in SOURCES:
         raise ValueError(f"options.source must be one of {list(SOURCES)}")
+    if source == "affiliate_feed" and options.get("source_role", "retailer") != "retailer":
+        # The feed mapping is retailer-shaped: a retailer-host listing clicked through a network link.
+        raise ValueError("options.source = affiliate_feed supports only source_role = retailer")
     if source == "affiliate_feed":
         from services.retailer_ingest.affiliate_feed import validate_feed_options
         validate_feed_options(options.get("feed"))
@@ -87,6 +94,42 @@ def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
     return options
 
 
+def brand_official_domain_flags(domain: str, brands: List[str]) -> List[Dict[str, Any]]:
+    """A brand_official cohort writes CANONICAL rows: a product's key derives from (brand, product
+    name) alone -- and its brand is the product's own VENDOR, not the job's `brand` -- so the same
+    product at any host lands on the same key, and the upsert re-points that key's source_domain /
+    canonical_url / payload at this host and labels its INCI brand-official. Nothing downstream checks
+    that the host is the brand's (the legacy-listing report and the native-variant rule look only at
+    ext:retailer: keys; the brand-host guard only at the same host), and a clean dry run auto-applies.
+    So the host must PROVE it is the store of EVERY brand the cohort would write (`brands`: the job's
+    brand and each record's):
+
+      * a known retailer host can never be a brand's own store (not acceptable -- fix the job);
+      * otherwise the domain's name must BE that brand (offer_seller_identity.brand_owns_domain, the
+        rule that types an offer brand_direct), or a human accepts the flag (tartecosmetics.com for
+        "Tarte", k18hair.com for "K18"): held, never auto-applied.
+    """
+    from services.offer_seller_identity import brand_owns_domain, is_known_retailer
+
+    if is_known_retailer(domain):
+        return [{"key": "brand_official_on_a_retailer", "rule": "brand_official_on_a_retailer",
+                 "severity": detectors.BLOCK, "acceptable": False,
+                 "detail": f"{domain} is a known retailer; source_role brand_official would overwrite "
+                           f"canonical rows of {sorted(set(brands))} with this retailer's listings"}]
+    flags: Dict[str, Dict[str, Any]] = {}
+    for brand in brands:
+        if brand_owns_domain(brand, domain):
+            continue
+        # The brand's own casefolded spelling, NOT normalize_brand: that strips every non-ASCII
+        # letter, so 설화수 and 헤라 would share one key and one acceptance would pass both.
+        key = f"brand_official_domain_unproven:{domain}:{' '.join(str(brand).split()).casefold()}"
+        flags.setdefault(key, {
+            "key": key, "rule": "brand_official_domain_unproven", "severity": detectors.BLOCK,
+            "detail": f"the domain name of {domain} is not the brand {brand!r}; accept this key only if "
+                      f"{domain} is {brand}'s own store (its rows become {brand}'s canonical rows)"})
+    return list(flags.values())
+
+
 def _feed_payload(job: Dict[str, Any]) -> Dict[str, Any]:
     try:
         o = validate_options(dict(job.get("options") or {}))
@@ -94,7 +137,8 @@ def _feed_payload(job: Dict[str, Any]) -> Dict[str, Any]:
         raise _Stop("invalid_job", "failed", str(exc)) from exc
     return {
         "domain": job["domain"], "brand": job["brand"], "category_path": o.get("category_path") or "beauty",
-        "source_role": "retailer", "retailer_name": o.get("retailer_name"), "only_vendors": list(o["vendors"]),
+        "source_role": o.get("source_role") or "retailer", "retailer_name": o.get("retailer_name"),
+        "only_vendors": list(o["vendors"]),
         "require_currency": o.get("require_currency") or "USD", "emit_real_variants": True,
         "enrich_missing_gtin": True, "max_products": int(o.get("max_products") or 200),
         "max_scan_products": int(o.get("max_scan_products") or 20000),
@@ -154,7 +198,10 @@ async def _crawl(job: Dict[str, Any], stage: str) -> List[Dict[str, Any]]:
     from services.curated_brand_feed import CrawlIncomplete, lip_title_evidence, records_for_brand
     import contextlib
 
-    payload = normalize_curated_brand_payload(_feed_payload(job))
+    try:
+        payload = normalize_curated_brand_payload(_feed_payload(job))
+    except ValueError as exc:  # e.g. an unknown source_role on a row written by another path
+        raise _Stop("invalid_job", "failed", str(exc)) from exc
     evidence = lip_title_evidence() if (job.get("options") or {}).get("lip_title_evidence") else contextlib.nullcontext()
     try:
         with evidence:
@@ -233,6 +280,10 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
     o = job.get("options") or {}
     checks: Dict[str, Any] = {"crawl": getattr(records, "crawl_report", None), "selected": len(records)}
     flags: List[Dict[str, Any]] = []
+    if o.get("source_role") == "brand_official":
+        # Every brand the cohort would write: the job's, and each record's own (its vendor's).
+        written = [job["brand"]] + sorted({str((r.get("pdp") or {}).get("brand") or "") for r in records} - {""})
+        flags.extend(brand_official_domain_flags(job["domain"], written))
 
     excluded = {str(h).strip().strip("/").casefold() for h in (o.get("exclude_handles") or []) if str(h).strip()}
     if excluded:
