@@ -372,6 +372,14 @@ class AgentNotFoundError(LookupError):
     """An agent-key operation named an agent_id with no agents row."""
 
 
+class AgentKeyNotFoundError(LookupError):
+    """A per-key operation named a key this agent does not have as an ACTIVE row."""
+
+
+class MultiKeyUnsupportedError(RuntimeError):
+    """Per-key operations need a hash key table; a legacy deployment has only agents.api_key."""
+
+
 # ── Key-table rows ─────────────────────────────────────────────────────────────
 # The two hash key tables auth can read (db.agents._lookup_agent_from_key_table) differ in shape:
 #   api_keys:        id SERIAL (the key's public id), status 'active'/'revoked', name
@@ -508,6 +516,95 @@ async def reset_agent_primary_api_key(*, agent_id: str, created_by: str) -> Tupl
 
     evict_agent_auth_cache(agent_id)
     return new_api_key, key_table or "legacy"
+
+
+# ── Per-key operations (employee portal) ──────────────────────────────────────
+
+
+async def _per_key_table(agent_id: str) -> str:
+    key_table = await _resolve_agent_key_table(for_write=True)
+    if key_table is None:
+        raise MultiKeyUnsupportedError("no hash key table: this deployment has one key per agent")
+    await _require_agent(agent_id)
+    return key_table
+
+
+async def issue_additional_agent_key(*, agent_id: str, created_by: str) -> Tuple[str, str]:
+    """Mint one more ACTIVE key for the agent, on the auth path. Returns (plaintext, key_id)."""
+    key_table = await _per_key_table(agent_id)
+    api_key, key_hash = _new_agent_api_key()
+    key_id = await _insert_key_row(
+        key_table, agent_id=agent_id, api_key=api_key, key_hash=key_hash, name="Additional Key", created_by=created_by
+    )
+    return api_key, key_id
+
+
+async def revoke_agent_key(*, agent_id: str, key_id: str) -> None:
+    """Retire one ACTIVE key; AgentKeyNotFoundError when the agent has no such active key."""
+    key_table = await _per_key_table(agent_id)
+    if not await _deactivate_key_rows(key_table, agent_id=agent_id, key_id=key_id):
+        raise AgentKeyNotFoundError(key_id)
+    evict_agent_auth_cache(agent_id)
+
+
+async def rotate_agent_key(*, agent_id: str, key_id: str, created_by: str) -> Tuple[str, str]:
+    """Retire one ACTIVE key and mint its replacement in one transaction. Returns (plaintext, new key_id)."""
+    key_table = await _per_key_table(agent_id)
+    api_key, key_hash = _new_agent_api_key()
+    async with database.transaction():
+        if not await _deactivate_key_rows(key_table, agent_id=agent_id, key_id=key_id):
+            raise AgentKeyNotFoundError(key_id)
+        new_key_id = await _insert_key_row(
+            key_table, agent_id=agent_id, api_key=api_key, key_hash=key_hash, name="Rotated Key", created_by=created_by
+        )
+    evict_agent_auth_cache(agent_id)
+    return api_key, new_key_id
+
+
+async def list_agent_keys(agent_id: str, *, active_only: bool = False) -> list:
+    """The agent's keys as auth sees them (the resolved key table), newest first, in the
+    employee portal's shape. scopes / ip_whitelist are [] and expires_at None: not enforced."""
+    key_table = await _resolve_agent_key_table()
+    if key_table == "api_keys":
+        rows = await database.fetch_all(
+            f"""
+            SELECT id::text AS key_id, key_prefix, (status = 'active') AS is_active,
+                   created_at, last_used AS last_used_at, NULL AS last_rotated_at
+            FROM api_keys
+            WHERE agent_id = :agent_id {"AND status = 'active'" if active_only else ""}
+            ORDER BY created_at DESC, id DESC
+            """,
+            {"agent_id": agent_id},
+        )
+    elif key_table == "agent_api_keys":
+        rows = await database.fetch_all(
+            f"""
+            SELECT key_id, key_prefix, COALESCE(is_active, TRUE) AS is_active,
+                   created_at, last_used_at, last_rotated_at
+            FROM agent_api_keys
+            WHERE agent_id = :agent_id {"AND COALESCE(is_active, TRUE) = TRUE" if active_only else ""}
+            ORDER BY created_at DESC, id DESC
+            """,
+            {"agent_id": agent_id},
+        )
+    else:
+        return []
+
+    keys = []
+    for row in rows:
+        r = dict(row)
+        keys.append({
+            "key_id": r["key_id"],
+            "key_prefix": r["key_prefix"],
+            "scopes": [],
+            "ip_whitelist": [],
+            "is_active": bool(r["is_active"]),
+            "created_at": str(r["created_at"]) if r.get("created_at") else None,
+            "expires_at": None,
+            "last_used_at": str(r["last_used_at"]) if r.get("last_used_at") else None,
+            "last_rotated_at": str(r["last_rotated_at"]) if r.get("last_rotated_at") else None,
+        })
+    return keys
 
 
 # ============================================================================

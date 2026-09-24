@@ -50,7 +50,9 @@ import warnings
 # deliberately to PIN this behaviour — left in the count rather than special-cased, because an
 # exclusion list that grows is how a ratchet stops meaning anything.
 # LOWER THIS when you convert a site; never raise it.
-WATERMARK = 47
+# 46 on 2026-09-24: the employee per-key revoke (routes/employee_agent_mgmt.py) 404'd every successful
+# revoke on `if not result`; it now counts retired rows via UPDATE ... RETURNING + fetch_all.
+WATERMARK = 46
 
 _SKIP_PARTS = {".claude", "node_modules", ".venv", "__pycache__", ".git", "build", "dist"}
 _WRITE_SQL = re.compile(r"\b(UPDATE|DELETE|INSERT)\b", re.IGNORECASE)

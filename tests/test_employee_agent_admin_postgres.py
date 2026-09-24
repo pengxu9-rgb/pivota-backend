@@ -5,7 +5,10 @@ real agent auth door (db.agents.get_agent_by_key / routes.agent_auth.get_agent_c
 Pinned:
 - deactivate / activate flip agents.is_active (the model has no status or deactivated_at column,
   which is what these handlers used to write) and a deactivated agent's key is refused at once;
-- a reset retires active keys in the key table auth is not reading, too.
+- a key issued by the per-key create / rotate endpoints authenticates, and rotate retires the old
+  one (they used to store secrets.token_hex(16) as the "hash", so no issued key ever worked);
+- revoke answers 200 when it revoked something and 404 when it did not (execute() returns None
+  for an UPDATE in this codebase, so a truthiness check 404'd every successful revoke).
 
 Parametrised over the two key tables auth can read. Both exist, as in prod; "api_keys" is the
 default resolution (auth prefers it), "agent_api_keys" is AGENT_AUTH_KEY_TABLE pinned to it.
@@ -235,6 +238,81 @@ async def test_agent_list_reports_is_active_from_the_column_auth_reads(db):
     assert all(a["is_active"] is False for a in inactive["agents"])
     active = await get_all_agents(status="active", date_range="7d", current_user=EMPLOYEE)
     assert AGENT_ID not in [a["agent_id"] for a in active["agents"]]
+
+
+# ── per-key create / rotate / revoke ─────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_created_key_authenticates(db):
+    from db.agents import get_agent_by_key
+    from routes.employee_agent_mgmt import CreateApiKeyRequest, create_agent_api_key
+
+    body = await create_agent_api_key(AGENT_ID, request=CreateApiKeyRequest(), current_user=EMPLOYEE)
+
+    assert (await get_agent_by_key(body["api_key"]))["agent_id"] == AGENT_ID
+    assert (await get_agent_by_key(OLD_KEY))["agent_id"] == AGENT_ID  # create does not retire others
+
+
+@pytest.mark.asyncio
+async def test_rotated_key_authenticates_and_the_old_key_stops(db):
+    from db.agents import get_agent_by_key
+    from routes.employee_agent_mgmt import rotate_agent_api_key
+
+    assert (await get_agent_by_key(OLD_KEY))["agent_id"] == AGENT_ID  # now cached
+
+    body = await rotate_agent_api_key(AGENT_ID, await _old_key_id(db), current_user=EMPLOYEE)
+
+    assert (await get_agent_by_key(body["new_api_key"]))["agent_id"] == AGENT_ID
+    assert await get_agent_by_key(OLD_KEY) is None
+
+
+@pytest.mark.asyncio
+async def test_a_failed_rotate_leaves_the_old_key_working(db, monkeypatch):
+    """Retire-then-insert is one transaction: if the insert fails, the retire rolls back."""
+    import routes.agent_account as agent_account
+    from fastapi import HTTPException
+
+    from db.agents import get_agent_by_key
+    from routes.employee_agent_mgmt import rotate_agent_api_key
+
+    async def failing_insert(*_args, **_kwargs):
+        raise RuntimeError("insert failed after the retire ran")
+
+    monkeypatch.setattr(agent_account, "_insert_key_row", failing_insert)
+
+    with pytest.raises(HTTPException) as exc:
+        await rotate_agent_api_key(AGENT_ID, await _old_key_id(db), current_user=EMPLOYEE)
+    assert exc.value.status_code == 500
+
+    assert (await get_agent_by_key(OLD_KEY))["agent_id"] == AGENT_ID
+
+
+@pytest.mark.asyncio
+async def test_revoke_is_200_when_it_revoked_and_404_when_it_did_not(db):
+    from fastapi import HTTPException
+
+    from db.agents import get_agent_by_key
+    from routes.employee_agent_mgmt import revoke_agent_api_key
+
+    assert (await get_agent_by_key(OLD_KEY))["agent_id"] == AGENT_ID  # now cached
+
+    body = await revoke_agent_api_key(AGENT_ID, await _old_key_id(db), current_user=EMPLOYEE)
+    assert body["status"] == "success"
+    assert await get_agent_by_key(OLD_KEY) is None
+
+    with pytest.raises(HTTPException) as exc:
+        await revoke_agent_api_key(AGENT_ID, "999999", current_user=EMPLOYEE)
+    assert exc.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_key_list_shows_the_table_auth_reads(db):
+    from routes.employee_agent_mgmt import get_agent_api_keys
+
+    body = await get_agent_api_keys(AGENT_ID, current_user=EMPLOYEE)
+
+    assert [k["key_id"] for k in body["api_keys"]] == [await _old_key_id(db)]
+    assert body["api_keys"][0]["is_active"] is True
 
 
 # ── reset vs the key table auth is not reading ────────────────────────────────
