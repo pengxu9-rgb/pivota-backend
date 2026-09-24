@@ -54,6 +54,10 @@ _OPTION_TYPES = {
     # 2026-09-24: a (brand, store) cohort re-crawls the whole store twice (dry run + apply), so 16 brands
     # at perfumania.com were 32 full crawls of one store; as one multi_brand cohort they are 2.
     "multi_brand": bool,
+    # A store too large for /products.json (> 100 pages of 250: page 101 answers HTTP 400) is crawled
+    # through the named brand collections instead (/collections/<handle>/products.json). The vendor
+    # filter still applies inside them, and the crawl is complete for THOSE collections, not the store.
+    "collections": list,
     # multi_brand only, REQUIRED there: {vendor: canonical brand spelling} for every vendor. Without an
     # override each row keeps the STORE's spelling, and normalize_brand keeps punctuation, so "Dr. Jart+"
     # at one store and "Dr.Jart+" everywhere else become two brands (review of #2301).
@@ -119,6 +123,11 @@ def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
         if ignored:
             raise ValueError(f"options.brands can only respell a vendor (same letters and digits); "
                              f"these would be ignored: {ignored}")
+    if "collections" in options:
+        from services.curated_brand_feed import valid_collection_handle
+        if source != "storefront" or not options["collections"] or not all(
+                valid_collection_handle(h) for h in options["collections"]):
+            raise ValueError("options.collections must be Shopify collection handles on a storefront cohort")
     if int(options.get("max_pdp_identity_fetches") or 0) > MAX_PDP_IDENTITY_FETCHES:
         # Each fetch waits CRAWL_MIN_INTERVAL_SECONDS (4s): 300 is ~20 min of one stage already.
         raise ValueError(f"options.max_pdp_identity_fetches must be at most {MAX_PDP_IDENTITY_FETCHES}")
@@ -244,6 +253,8 @@ async def _crawl(job: Dict[str, Any], stage: str) -> List[Dict[str, Any]]:
 
     try:
         payload = normalize_curated_brand_payload(_feed_payload(job))
+        if (job.get("options") or {}).get("collections"):
+            payload["collection_handles"] = list(job["options"]["collections"])
         if (job.get("options") or {}).get("multi_brand"):
             payload["brand_by_vendor"] = {" ".join(k.split()).casefold(): " ".join(v.split())
                                           for k, v in job["options"]["brands"].items()}
@@ -259,9 +270,12 @@ async def _crawl(job: Dict[str, Any], stage: str) -> List[Dict[str, Any]]:
     except CrawlIncomplete as exc:
         crawl = exc.as_dict()
         if crawl.get("status") == "capped":
-            raise _Stop("crawl_capped", "failed", f"crawl capped: {crawl.get('reason')} -- raise "
-                        "options.max_scan_products (store scan) or options.max_products (selected rows), "
-                        "whichever the reason names, or cancel the job") from exc
+            reason = str(crawl.get("reason") or "")
+            advice = ("crawl the brand's collections (options.collections) -- Shopify pages stop at 100"
+                      if "options.collections" in reason else
+                      "raise options.max_scan_products (store scan) or options.max_products (selected rows), "
+                      "whichever the reason names")
+            raise _Stop("crawl_capped", "failed", f"crawl capped: {reason} -- {advice}, or cancel the job") from exc
         if _transient(crawl):
             attempts = int(job.get("attempts") or 0) + 1
             if attempts >= int(job.get("max_attempts") or 6):
