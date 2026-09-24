@@ -793,3 +793,53 @@ def test_a_family_vendor_can_only_be_mapped_within_its_family(brands, ok):
     else:
         with pytest.raises(ValueError, match="ignored"):
             pipeline.validate_options(options)
+
+
+
+# --- a row the index refused on content is a note, not a failed store (westman-atelier.com, 2026-09-24) ----
+
+def _rows(blockers):
+    async def fetch_all(sql, values):
+        out = []
+        for i, k in enumerate(values["keys"]):
+            b = blockers[i] if i < len(blockers) else None
+            out.append({"product_key": k, "category_path": "beauty/makeup/lip/tint", "serving": b is None,
+                        "pipeline_stage": "public_indexed" if b is None else "extracted", "blocker_code": b or "none",
+                        "blocker_detail": "content_quality_score=71.2 < 71.4" if b else None,
+                        "lifecycle": "published", "offers": 1, "offers_in_currency": 1})
+        return out
+    return fetch_all
+
+
+@pytest.mark.parametrize("blocker", ["low_quality", "no_image", "short_description", "non_core_product"])
+async def test_a_row_the_index_refused_on_content_is_noted_and_the_store_still_applies(env, blocker):
+    env.rows = [TINT, ("3CE - Velvet Lip Tint Rose 4g", "LIP TINT", "velvet-lip-tint-rose")]
+    env.db.fetch_all = _rows([None, blocker])
+    out = await pipeline.run_stage(job("apply_due"), db=env.db)
+    assert (out["status"], out["outcome"]) == ("done", "applied")
+    run = list(env.ledger.runs.values())[-1]
+    assert run["readback"]["problems"] == []
+    [note] = run["readback"]["notes"]
+    assert note["kind"] == "index_refused" and blocker in note["note"]
+    assert env.ledger.transitions[-1]["reason"] == "applied and verified; 1 row(s) refused by the index content gate"
+
+
+@pytest.mark.parametrize("blocker", ["suppressed", "not_live", "no_seed", "no_extraction", "not_scored", "no_price",
+                                     "entity_unresolved", "seed_audit_fail", "no_leaf_category", "unknown_future_code", None])
+async def test_any_other_reason_a_row_is_not_served_still_fails_the_store(env, blocker):
+    async def fetch_all(sql, values):
+        return [{"product_key": k, "category_path": "beauty/makeup/lip/tint", "serving": False, "pipeline_stage": None,
+                 "blocker_code": blocker, "blocker_detail": None, "lifecycle": "published", "offers": 1,
+                 "offers_in_currency": 1} for k in values["keys"]]
+    env.db.fetch_all = fetch_all
+    out = await pipeline.run_stage(job("apply_due"), db=env.db)
+    assert (out["status"], out["outcome"]) == ("failed", "readback_failed")
+    problem = list(env.ledger.runs.values())[-1]["readback"]["problems"][0]["problem"]
+    assert problem.startswith("not serving-eligible")
+
+
+def test_the_content_refusal_codes_are_codes_the_index_assigns():
+    import pathlib, re
+    src = (pathlib.Path(__file__).resolve().parents[2] / "services" / "index_pipeline_state_service.py").read_text()
+    assigned = set(re.findall(r'blocker_code = "([a-z_]+)"', src))
+    assert set(pipeline.INDEX_CONTENT_REFUSALS) <= assigned, set(pipeline.INDEX_CONTENT_REFUSALS) - assigned

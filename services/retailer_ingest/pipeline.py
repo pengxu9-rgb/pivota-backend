@@ -404,6 +404,11 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
 #: serving_eligible only. Used to annotate a readback, never to fail one.
 BACKEND_RECALL_LIFECYCLE_STAGES = ("validated", "published")
 
+#: index_pipeline_state blocker codes that mean the index REFUSED a row on its content (thin copy, no image,
+#: low quality score, not a core product) -- services/index_pipeline_state_service.py. A readback notes these;
+#: any other blocker on an applied row fails the job.
+INDEX_CONTENT_REFUSALS = ("low_quality", "no_image", "short_description", "non_core_product")
+
 
 async def _readback(product_keys: List[str], currency: str, db: Any) -> Dict[str, Any]:
     """Did what the gate says landed actually land servable? One row per applied product."""
@@ -412,7 +417,7 @@ async def _readback(product_keys: List[str], currency: str, db: Any) -> Dict[str
     rows = await db.fetch_all(
         """
         SELECT p.product_key, p.category_path, coalesce(ips.serving_eligible, false) AS serving,
-               ips.pipeline_stage, p.pdp_lifecycle_stage AS lifecycle,
+               ips.pipeline_stage, ips.blocker_code, ips.blocker_detail, p.pdp_lifecycle_stage AS lifecycle,
                (SELECT count(*) FROM catalog_offers o WHERE o.product_key = p.product_key
                   AND o.suppressed_at IS NULL) AS offers,
                (SELECT count(*) FROM catalog_offers o WHERE o.product_key = p.product_key
@@ -432,14 +437,25 @@ async def _readback(product_keys: List[str], currency: str, db: Any) -> Dict[str
         if not r["category_path"]:
             problems.append({"product_key": r["product_key"], "problem": "no category_path"})
         if not r["serving"]:
-            problems.append({"product_key": r["product_key"], "problem": "not serving-eligible"})
+            # The index's own content gate refusing a thin row (measured 2026-09-24: a gift-with-purchase
+            # mini at westman-atelier.com, "Blush Stick", content_quality_score 71.2 < 71.4) is the
+            # system working, not a lost write: note it, keep the store applied. Every other reason --
+            # suppressed, not live, no seed/extraction, unscored, no price, unresolved identity -- can
+            # mean the write itself went wrong, and still fails the job.
+            if r.get("blocker_code") in INDEX_CONTENT_REFUSALS:
+                notes.append({"product_key": r["product_key"], "kind": "index_refused",
+                              "note": f"not served: the index refused it on content ({r.get('blocker_code')}"
+                                      f"{': ' + str(r.get('blocker_detail'))[:160] if r.get('blocker_detail') else ''})"})
+            else:
+                problems.append({"product_key": r["product_key"],
+                                 "problem": f"not serving-eligible (blocker {r.get('blocker_code') or 'unknown'})"})
         # Recorded, never a failure: the agent door (gateway) serves on serving-eligibility alone, while
         # backend global recall admits only BACKEND_RECALL_LIFECYCLE_STAGES (or NULL). Measured
         # 2026-09-24: 14 of 28 O HUI rows at buybeautykorea.com landed `candidate` (no taxonomy signal:
         # the store has no tags) and the agent door still returned them. The run says which rows
         # backend recall will not see.
         if r.get("lifecycle") is not None and r.get("lifecycle") not in BACKEND_RECALL_LIFECYCLE_STAGES:
-            notes.append({"product_key": r["product_key"],
+            notes.append({"product_key": r["product_key"], "kind": "outside_backend_recall",
                           "note": f"outside backend global recall: pdp_lifecycle_stage {r.get('lifecycle')!r}"})
         if not r["offers"] or r["offers_in_currency"] != r["offers"]:
             problems.append({"product_key": r["product_key"],
@@ -554,9 +570,11 @@ async def _apply(job: Dict[str, Any], run_id: str, result: Dict[str, Any], summa
     outcome = "applied" if ok else ("gate_failed" if not gate.get("ok") else "readback_failed")
     await ledger.finish_run(run_id, outcome=outcome, **summary, applied={"gate": gate}, readback=readback,
                             db=db)
-    noted = len(readback.get("notes") or [])
-    reason = ((f"applied and verified; {noted} row(s) outside backend global recall" if noted
-               else "applied and verified") if ok else
+    kinds = [n.get("kind") for n in readback.get("notes") or []]
+    said = [f"{kinds.count(k)} {label}" for k, label in (("outside_backend_recall", "row(s) outside backend global recall"),
+                                                          ("index_refused", "row(s) refused by the index content gate"))
+            if kinds.count(k)]
+    reason = ("; ".join(["applied and verified", *said]) if ok else
               f"{outcome}: gate {gate.get('reasons')}; readback {readback.get('problems')}")
     await _move(job, status="done" if ok else "failed", run_id=run_id, reason=reason, db=db)
     return {"job_id": job["id"], "stage": APPLY, "outcome": outcome, "status": "done" if ok else "failed"}
