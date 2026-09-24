@@ -1535,8 +1535,10 @@ _MEASURED_HOST_PRODUCT_TYPES = {
     # families, so the evidence policy reads every one as ambiguous and NO beauty row resolved. Two
     # shelves were one class: 97 masks and sheet packs, and 77 sunscreens. Their titles still step the
     # shelf aside eight times: 5 UV primers/CC/concealer and 2 UV makeup-base gels name another leaf,
-    # and a cleansing mud paste names the cleanser. One row is a mask-and-cream SET, which the set
-    # detector holds. The shelves read and LEFT OUT, each for rows no title check would catch:
+    # and a cleansing mud paste names the cleanser. The set detector holds three filled mask rows until
+    # someone accepts them: a mask-and-cream SET, a 6-sheet pack (a false positive: "6 Pieces"), and a
+    # 20-piece dry compressed sheet you soak in your own lotion (arguably an accessory, not a mask).
+    # The shelves read and LEFT OUT, each for rows no title check would catch:
     #   "skincare / cleansers" (203): blotting papers, pore strips, a clay face pack.
     #   "skincare / japanese lotions" (126): toners (化粧水) AND milky emulsions (乳液), two classes.
     #   "skincare / moisturizers" (121): a rice-bran beauty oil and an overnight sleeping pack.
