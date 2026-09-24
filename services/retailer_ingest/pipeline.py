@@ -415,12 +415,20 @@ async def _readback(product_keys: List[str], currency: str, db: Any,
     """Did what the gate says landed actually land servable? One row per applied product."""
     if not product_keys:
         return {"ok": False, "reason": "no product keys to read back", "notes": [], "rows": []}
+    from services.index_pipeline_state_service import _RESOLVED_PDP_SCOPES
+    from services.priced_offer_sql import priced_offer_exists_sql
     rows = await db.fetch_all(
         """
         SELECT p.product_key, p.category_path, coalesce(ips.serving_eligible, false) AS serving,
                ips.pipeline_stage, ips.blocker_code, ips.blocker_detail, p.pdp_lifecycle_stage AS lifecycle,
-               coalesce(ips.has_price, false) AS has_price, coalesce(ips.identity_resolved, false) AS identity_resolved,
-               coalesce(ips.has_image, false) AS has_image,
+               -- Per-PRODUCT evidence, never the IPS flags: an IPS row is per content_key, and when products
+               -- share one its flags are the best-ranked sibling's (index_pipeline_state_service warns
+               -- callers off exactly this), so a priced sibling could mask this row's lost price write.
+               """ + priced_offer_exists_sql("p.product_key") + """ AS row_priced,
+               (coalesce(p.image_url, '') <> '') AS row_image,
+               (p.pdp_scope = ANY(:resolved_scopes) OR EXISTS (
+                   SELECT 1 FROM product_group_members pgm WHERE pgm.merchant_id = p.merchant_id
+                     AND pgm.platform = p.platform AND pgm.platform_product_id = p.source_product_id)) AS row_identity,
                (SELECT count(*) FROM catalog_offers o WHERE o.product_key = p.product_key
                   AND o.suppressed_at IS NULL) AS offers,
                (SELECT count(*) FROM catalog_offers o WHERE o.product_key = p.product_key
@@ -428,7 +436,7 @@ async def _readback(product_keys: List[str], currency: str, db: Any,
         FROM catalog_products p LEFT JOIN index_pipeline_state ips USING (content_key)
         WHERE p.product_key = ANY(:keys)
         """,
-        {"keys": list(product_keys), "currency": currency},
+        {"keys": list(product_keys), "currency": currency, "resolved_scopes": sorted(_RESOLVED_PDP_SCOPES)},
     )
     out = [dict(r) for r in rows]
     problems, notes = [], []
@@ -447,11 +455,11 @@ async def _readback(product_keys: List[str], currency: str, db: Any,
             # mean the write itself went wrong, and still fails the job.
             # The index records only the FIRST failed check, and low_quality / non_core_product sit ahead of
             # no_price and entity_unresolved: a content code can mask a lost write. So a refusal is a note only
-            # when the index's own stored evidence also shows a priced offer and a resolved identity, and an
-            # image this plan wrote actually landed (apply overwrites image_url, so a missing one is ours).
+            # when THIS product's own row shows a priced offer and a resolved identity, and an image this plan
+            # wrote actually landed (apply overwrites image_url, so a missing one is ours).
             wrote_image = bool((planned_images or {}).get(r["product_key"]))
-            if (r.get("blocker_code") in INDEX_CONTENT_REFUSALS and r.get("has_price") and r.get("identity_resolved")
-                    and not (wrote_image and not r.get("has_image"))):
+            if (r.get("blocker_code") in INDEX_CONTENT_REFUSALS and r.get("row_priced") and r.get("row_identity")
+                    and not (wrote_image and not r.get("row_image"))):
                 notes.append({"product_key": r["product_key"], "kind": "index_refused",
                               "note": f"not served: the index refused it on content ({r.get('blocker_code')}"
                                       f"{': ' + str(r.get('blocker_detail'))[:160] if r.get('blocker_detail') else ''})"})

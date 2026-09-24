@@ -808,7 +808,7 @@ def _rows(blockers, **evidence):
                    "pipeline_stage": "public_indexed" if b is None else "extracted", "blocker_code": b or "none",
                    "blocker_detail": "content_quality_score=71.2 < 71.4" if b else None,
                    "lifecycle": "published", "offers": 1, "offers_in_currency": 1,
-                   "has_price": True, "identity_resolved": True, "has_image": True}
+                   "row_priced": True, "row_identity": True, "row_image": True}
             if b:
                 row.update(evidence)
             out.append(row)
@@ -851,7 +851,7 @@ def test_the_content_refusal_codes_are_codes_the_index_assigns():
 
 
 
-@pytest.mark.parametrize("evidence", [{"has_price": False}, {"identity_resolved": False}, {"has_image": False}],
+@pytest.mark.parametrize("evidence", [{"row_priced": False}, {"row_identity": False}, {"row_image": False}],
                          ids=["no_price_masked", "identity_masked", "planned_image_lost"])
 async def test_a_content_refusal_that_may_mask_a_lost_write_still_fails(env, evidence):
     """The index records only the first failed check: low_quality sits ahead of no_price and entity_unresolved,
@@ -871,8 +871,30 @@ async def test_a_product_the_store_publishes_without_an_image_is_still_only_a_no
             product = {**product, "images": []}
         return real(product, **kw)
     import services.curated_brand_feed as cbf
-    env.db.fetch_all = _rows([None, "no_image"], has_image=False)
+    env.db.fetch_all = _rows([None, "no_image"], row_image=False)
     import unittest.mock as um
     with um.patch.object(cbf, "shopify_product_to_record", side_effect=without_image):
         out = await pipeline.run_stage(job("apply_due"), db=env.db)
     assert (out["status"], out["outcome"]) == ("done", "applied")
+
+
+
+async def test_the_readback_reads_each_products_own_row_not_the_shared_index_flags(env):
+    """A priced, resolved, imaged sibling on the same content_key must not vouch for this product: the query
+    computes price, image and identity from p.* per product_key (IPS flags are the best-ranked sibling's)."""
+    seen = {}
+    async def fetch_all(sql, values):
+        seen["sql"], seen["values"] = sql, values
+        return [{"product_key": k, "category_path": "beauty/makeup/lip/tint", "serving": True, "pipeline_stage": "public_indexed",
+                 "blocker_code": "none", "blocker_detail": None, "lifecycle": "published", "offers": 1,
+                 "offers_in_currency": 1, "row_priced": True, "row_identity": True, "row_image": True}
+                for k in values["keys"]]
+    env.db.fetch_all = fetch_all
+    await pipeline.run_stage(job("apply_due"), db=env.db)
+    sql = " ".join(seen["sql"].split())
+    assert "ips.has_price" not in sql and "ips.identity_resolved" not in sql and "ips.has_image" not in sql
+    assert "p.product_key" in sql.split("AS row_priced")[0].rsplit("EXISTS", 1)[-1]
+    assert "coalesce(p.image_url, '') <> '') AS row_image" in sql
+    assert "pgm.platform_product_id = p.source_product_id" in sql
+    from services.index_pipeline_state_service import _RESOLVED_PDP_SCOPES
+    assert set(seen["values"]["resolved_scopes"]) == set(_RESOLVED_PDP_SCOPES)
