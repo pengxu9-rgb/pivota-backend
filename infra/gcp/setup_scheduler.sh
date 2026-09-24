@@ -922,9 +922,12 @@ sched commerce-index-insight-refresh-cron "*/10 * * * *" commerce-index-insight-
 #
 # 10 minutes is SHORTER than the 3600s task timeout, and Cloud Run starts a new execution whether
 # or not the last one is still running. That is safe only because claim_due_job()
-# (db/retailer_ingest.py) refuses to claim while ANY job holds an unexpired lease: a tick that lands
-# during a long stage exits idle instead of starting a second crawl from the one crawl NAT. Remove
-# that clause and this cadence becomes two crawls in flight.
+# (db/retailer_ingest.py) caps the leases in flight at RETAILER_INGEST_MAX_LEASES (unset = 1: a tick
+# that lands during a long stage exits idle) and never leases a host that already holds one, nor a
+# second apply. Remove those clauses and this cadence becomes N crawls in flight, some at one store.
+# The lane count is armed with `gcloud run jobs update retailer-ingest-drain --update-env-vars
+# RETAILER_INGEST_MAX_LEASES=2`; the --set-env-vars above does not carry it, so re-running this
+# script drops the drain back to one lane (the safe direction).
 sched retailer-ingest-drain-cron "*/10 * * * *" retailer-ingest-drain "$RUN_INVOKER" 1
 if [ "$STORE_AUDIT_UCP_REPROBE_WORKER" = true ]; then
   for job in store-audit-ucp-reprobe-enqueue store-audit-ucp-probe; do

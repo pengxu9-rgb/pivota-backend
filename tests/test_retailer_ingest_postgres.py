@@ -53,8 +53,9 @@ async def _enqueue(db, **kw):
 
 
 async def _only_ours_due(db):
-    """Other test modules may have due jobs; make ours the only claimable ones."""
-    await db.execute("UPDATE retailer_ingest_jobs SET next_run_at = NOW() + interval '1 day' "
+    """Other test modules may have due jobs or live leases; make ours the only claimable (and the only
+    leased) ones, since a foreign live lease takes a lane."""
+    await db.execute("UPDATE retailer_ingest_jobs SET next_run_at = NOW() + interval '1 day', lease_until = NULL "
                      "WHERE source IS DISTINCT FROM :s AND status IN ('queued','apply_due')", {"s": SOURCE})
 
 
@@ -171,6 +172,94 @@ async def test_a_live_lease_blocks_every_other_claim(db):
     await _enqueue(db, brand="TWO", options={"vendors": ["B"]})
     assert (await ledger.claim_due_job(lease_seconds=3600, db=db))["id"] == first
     assert await ledger.claim_due_job(lease_seconds=3600, db=db) is None  # one crawl at a time
+    # the default lane is one stage at a time even when the next job is at ANOTHER host
+    await ledger.enqueue_job(domain="lanes-b.example", brand="THREE", options={"vendors": ["C"]}, source=SOURCE, db=db)
+    assert await ledger.claim_due_job(lease_seconds=3600, db=db) is None
+
+
+async def _at(db, domain, brand, *, priority=0, status=None):
+    job_id = await ledger.enqueue_job(domain=domain, brand=brand, options={"vendors": [brand]}, priority=priority,
+                                      source=SOURCE, db=db)
+    if status:
+        await db.execute("UPDATE retailer_ingest_jobs SET status=:st WHERE id=:id", {"st": status, "id": job_id})
+    return job_id
+
+
+async def test_lanes_never_put_two_stages_on_one_host_whatever_the_cohort_shape(db):
+    await _only_ours_due(db)
+    recrawl = await _at(db, "lanes-a.example", "ONE BRAND", priority=3)
+    cohort = await _at(db, "WWW.Lanes-A.example", "lanes-a.example · 4 brands", priority=2)  # same host
+    other = await _at(db, "lanes-b.example", "OTHER", priority=1)
+    assert (await ledger.claim_due_job(lease_seconds=3600, max_leases=3, db=db))["id"] == recrawl
+    # the higher-priority cohort at the busy host is passed over, not waited on
+    assert (await ledger.claim_due_job(lease_seconds=3600, max_leases=3, db=db))["id"] == other
+    assert await ledger.claim_due_job(lease_seconds=3600, max_leases=3, db=db) is None
+    await ledger.transition(recrawl, status="done", reason="t", run_id=None, db=db)  # releases the host
+    assert (await ledger.claim_due_job(lease_seconds=3600, max_leases=3, db=db))["id"] == cohort
+
+
+async def test_the_lane_cap_bounds_the_stages_in_flight(db):
+    await _only_ours_due(db)
+    first = await _at(db, "lanes-a.example", "A", priority=3)
+    second = await _at(db, "lanes-b.example", "B", priority=2)
+    third = await _at(db, "lanes-c.example", "C", priority=1)
+    assert (await ledger.claim_due_job(lease_seconds=3600, max_leases=2, db=db))["id"] == first
+    assert (await ledger.claim_due_job(lease_seconds=3600, max_leases=2, db=db))["id"] == second
+    assert await ledger.claim_due_job(lease_seconds=3600, max_leases=2, db=db) is None  # two in flight
+    await db.execute("UPDATE retailer_ingest_jobs SET lease_until = NOW() - interval '1 second' WHERE id=:id",
+                     {"id": first})  # an expired lease frees its lane
+    assert (await ledger.claim_due_job(lease_seconds=3600, max_leases=2, db=db))["id"] == first
+    await ledger.transition(second, status="done", reason="t", run_id=None, db=db)
+    assert (await ledger.claim_due_job(lease_seconds=3600, max_leases=2, db=db))["id"] == third
+
+
+async def test_an_apply_waits_while_an_apply_at_another_host_is_in_flight(db):
+    await _only_ours_due(db)
+    applying = await _at(db, "lanes-a.example", "A", priority=3, status="apply_due")
+    waiting = await _at(db, "lanes-b.example", "B", priority=2, status="apply_due")
+    dry_run = await _at(db, "lanes-c.example", "C", priority=1)
+    assert (await ledger.claim_due_job(lease_seconds=3600, max_leases=3, db=db))["id"] == applying
+    # catalog writes stay serial, but a dry run (read-only on the catalog) still takes the free lane
+    assert (await ledger.claim_due_job(lease_seconds=3600, max_leases=3, db=db))["id"] == dry_run
+    assert await ledger.claim_due_job(lease_seconds=3600, max_leases=3, db=db) is None
+    await ledger.transition(applying, status="done", reason="t", run_id=None, db=db)
+    assert (await ledger.claim_due_job(lease_seconds=3600, max_leases=3, db=db))["id"] == waiting
+
+
+async def test_two_expired_leases_each_find_their_own_unfinished_run(db):
+    await _only_ours_due(db)
+    a = await _at(db, "lanes-a.example", "A", priority=2)
+    b = await _at(db, "lanes-b.example", "B", priority=1)
+    await ledger.claim_due_job(lease_seconds=3600, max_leases=2, db=db)
+    await ledger.claim_due_job(lease_seconds=3600, max_leases=2, db=db)
+    run_b = await ledger.start_run(job_id=b, stage="dry_run", image_sha=None, execution="exec-b", db=db)
+    run_a = await ledger.start_run(job_id=a, stage="dry_run", image_sha=None, execution="exec-a", db=db)
+    await db.execute("UPDATE retailer_ingest_jobs SET lease_until = NOW() - interval '1 second' "
+                     "WHERE id IN (:a, :b)", {"a": a, "b": b})  # both lanes killed at once
+    assert (await ledger.unfinished_run(a, db=db))["id"] == run_a
+    assert (await ledger.unfinished_run(b, db=db))["id"] == run_b
+
+
+async def test_a_claim_is_refused_while_another_claimer_holds_the_lane_lock(db):
+    import asyncpg
+    await _only_ours_due(db)
+    await _at(db, "lanes-a.example", "A")
+    other = await asyncpg.connect(URL)
+    try:
+        tx = other.transaction()
+        await tx.start()
+        await other.execute("SELECT pg_advisory_xact_lock(hashtext('retailer_ingest_drain'))")
+        assert await ledger.claim_due_job(lease_seconds=3600, max_leases=3, db=db) is None
+        await tx.rollback()
+    finally:
+        await other.close()
+    assert await ledger.claim_due_job(lease_seconds=3600, max_leases=3, db=db) is not None
+
+
+@pytest.mark.parametrize("bad", [0, -1, ledger.MAX_LEASES_CEILING + 1])
+async def test_a_lane_count_outside_the_ceiling_is_refused(db, bad):
+    with pytest.raises(ValueError):
+        await ledger.claim_due_job(lease_seconds=3600, max_leases=bad, db=db)
 
 
 async def test_an_unfinished_run_is_found(db):
