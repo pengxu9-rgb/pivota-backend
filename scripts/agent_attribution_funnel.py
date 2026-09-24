@@ -82,7 +82,7 @@ def build_queries(purchase_cols, click_cols=None):
             "count(*) FILTER (WHERE c.issued_at IS NOT NULL AND c.click_count > 0) AS clicked, "
             "count(*) FILTER (WHERE c.issued_at IS NULL) AS legacy, "
             "count(*) FILTER (WHERE c.issued_at IS NULL AND c.click_count > 0) AS legacy_clicked "
-            "FROM surface_click_events c WHERE coalesce(c.issued_at, c.created_at) >= :since"
+            "FROM surface_click_events c WHERE c.created_at >= :since"
         )
     else:
         click_counts = (

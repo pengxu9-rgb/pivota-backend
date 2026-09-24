@@ -198,11 +198,12 @@ def resolve_offers(monkeypatch):
 
     async def fake_redirect(**kwargs):
         minted.append(kwargs["click_id"])
+        link = f"https://example.com/r?token={kwargs['click_id']}"
         sink = kwargs.get("issued_clicks")
         if sink is not None:
             sink.append(IssuedClick(click_id=kwargs["click_id"], surface="offers_resolve",
-                                    merchant_id=kwargs.get("merchant_id")))
-        return f"https://example.com/r?token={kwargs['click_id']}"
+                                    merchant_id=kwargs.get("merchant_id"), link=link))
+        return link
 
     keys_seen, batches = [], []
 
@@ -268,3 +269,70 @@ def test_a_failed_issue_write_still_serves_the_offers(resolve_offers, monkeypatc
 
     assert body["status"] == "success"
     assert body.get("offers") and minted
+
+
+# --- Pivota's own service agents are never an issuing agent ---------------------------------------
+
+GATEWAY_AGENT = "agent_982b1ea2df866206"
+
+
+async def test_the_gateways_own_agent_issues_agentless_links(lookups):
+    """The gateway sends its own PIVOTA_API_KEY (agent_982b1ea2df866206, confirmed 2026-09-24) for
+    the MCP get_offers door and cached search results: those links must not credit the gateway."""
+    _, result = lookups
+    result["agent"] = {"agent_id": GATEWAY_AGENT, "is_active": True}
+    assert await agent_auth.resolve_issuing_agent_id(AGENT_KEY) is None
+
+
+async def test_the_env_can_only_add_excluded_agents_never_remove_the_default(lookups, monkeypatch):
+    _, result = lookups
+    monkeypatch.setenv("ISSUING_AGENT_EXCLUDED_AGENT_IDS", "agent_other_service")
+    assert agent_auth.issuing_excluded_agent_ids() >= {GATEWAY_AGENT, "agent_other_service"}
+
+    result["agent"] = {"agent_id": "agent_other_service", "is_active": True}
+    assert await agent_auth.resolve_issuing_agent_id(AGENT_KEY) is None
+    # An env list that omits the code default still excludes it.
+    result["agent"] = {"agent_id": GATEWAY_AGENT, "is_active": True}
+    assert await agent_auth.resolve_issuing_agent_id(AGENT_KEY) is None
+    # A real agent is unaffected.
+    result["agent"] = {"agent_id": "agent_minds", "is_active": True}
+    assert await agent_auth.resolve_issuing_agent_id(AGENT_KEY) == "agent_minds"
+
+
+# --- only what ships is issued ----------------------------------------------------------------------
+
+
+async def test_a_link_minted_but_not_served_is_never_issued(monkeypatch):
+    """Ranking truncates to `limit` and live verification drops dead offers AFTER links are
+    minted. The flush matches what actually ships: by the served link, or by the click id the
+    seed lane publishes under execution_spec.tracking."""
+    from services.commerce_attribution_service import IssuedClick
+
+    batches = []
+
+    async def fake_issue(clicks):
+        batches.append(clicks)
+        return len(clicks)
+
+    async def fake_resolve(api_key):
+        return "agent_minds"
+
+    monkeypatch.setattr(gateway, "issue_clicks", fake_issue)
+    monkeypatch.setattr(gateway, "resolve_issuing_agent_id", fake_resolve)
+    minted = [IssuedClick(click_id=f"clk_{i}", surface="offers_resolve", link=f"https://x/r?token=t{i}")
+              for i in range(4)]
+    offers = [
+        {"affiliate_url": "https://x/r?token=t0"},
+        {"execution_spec": {"tracking": {"click_id": "clk_2"}}},
+        {"tracking": {"click_id": "clk_3"}},
+    ]
+
+    await gateway._issue_served_clicks(minted, offers, AGENT_KEY)
+
+    assert len(batches) == 1
+    assert [c.click_id for c in batches[0]] == ["clk_0", "clk_2", "clk_3"]
+    assert {c.agent_id for c in batches[0]} == {"agent_minds"}
+
+    batches.clear()
+    await gateway._issue_served_clicks(minted, [{"affiliate_url": "https://x/r?token=other"}], AGENT_KEY)
+    assert batches == []

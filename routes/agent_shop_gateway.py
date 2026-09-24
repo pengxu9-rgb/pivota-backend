@@ -3993,6 +3993,36 @@ ResolutionMode = Literal[
 RESOLUTION_MODES: frozenset[str] = frozenset(get_args(ResolutionMode))
 
 
+async def _issue_served_clicks(
+    issued: List[IssuedClick], offers: List[Dict[str, Any]], caller_api_key: Optional[str]
+) -> None:
+    """Record the issued clicks whose link is in `offers`, with the caller's agent. Never raises."""
+    if not issued or not offers:
+        return
+    served_links: set = set()
+    served_ids: set = set()
+    for o in offers:
+        if not isinstance(o, dict):
+            continue
+        if o.get("affiliate_url"):
+            served_links.add(str(o["affiliate_url"]))
+        # The seed lane publishes its click id under execution_spec.tracking.
+        for holder in (o, o.get("execution_spec")):
+            tracking = holder.get("tracking") if isinstance(holder, dict) else None
+            if isinstance(tracking, dict) and tracking.get("click_id"):
+                served_ids.add(str(tracking["click_id"]))
+    served = [c for c in issued if (c.link and c.link in served_links) or c.click_id in served_ids]
+    if not served:
+        return
+    try:
+        agent_id = await resolve_issuing_agent_id(caller_api_key)
+        await issue_clicks([replace(click, agent_id=agent_id) for click in served])
+    except Exception as e:  # noqa: BLE001 -- FAIL OPEN, see the call site
+        logger.warning(
+            "offers.resolve.issue_clicks_failed count=%s error_type=%s", len(served), type(e).__name__,
+        )
+
+
 async def _handle_offers_resolve(
     payload: OffersResolvePayload,
     request_metadata: Optional[Dict[str, Any]],
@@ -5258,22 +5288,6 @@ async def _handle_offers_resolve(
             query=query_label,
         )
 
-    # ADR-025 D1: record the click ids these links carry, with the agent they were issued to.
-    # FAIL OPEN: a failed write is counted and the links are served anyway; losing a click record
-    # must never take down search. `/r` still records a click on a link whose issue was lost
-    # (as a legacy row, issued_at NULL), so the funnel under-counts issues, never clicks.
-    if _issued_clicks:
-        try:
-            _issuing_agent = await resolve_issuing_agent_id(caller_api_key)
-            await issue_clicks(
-                [replace(click, agent_id=_issuing_agent) for click in _issued_clicks]
-            )
-        except Exception as e:  # noqa: BLE001 -- see FAIL OPEN above
-            logger.warning(
-                "offers.resolve.issue_clicks_failed count=%s error_type=%s",
-                len(_issued_clicks), type(e).__name__,
-            )
-
     # 2) Internal checkout offers (primary)
     internal_offers: List[Dict[str, Any]] = []
     canonical_group_id: Optional[str] = None
@@ -6009,6 +6023,7 @@ async def _handle_offers_resolve(
                 cart_variant_id=None,
                 seller_ref=offer_merchant,
                 seed_kind="retailer_offer",
+                issued_clicks=_issued_clicks,
             )
             if not redirect_url:
                 unattributed += 1
@@ -6133,6 +6148,15 @@ async def _handle_offers_resolve(
             offers = live_offer_verification.apply_verdicts(offers, verdicts)
         except Exception as exc:  # noqa: BLE001
             logger.warning("live offer verification failed; serving unverified: %s", exc)
+
+    # ADR-025 D1: record the click ids of the links this response ACTUALLY hands out, with the
+    # agent they were issued to. Here, after every lane (including the retry lanes and the
+    # catalog arm) and after ranking, the `limit` cut and live verification, so a link that was
+    # minted and then dropped is never recorded as issued.
+    # FAIL OPEN: a failed write is logged and the links are served anyway; losing a click record
+    # must never take down search. `/r` still records a click on a link whose issue was lost (as
+    # a legacy row, issued_at NULL), so the funnel under-counts issues, never clicks.
+    await _issue_served_clicks(_issued_clicks, offers, caller_api_key)
 
     # RECONCILE resolution_mode AGAINST WHAT ACTUALLY SHIPS. Everything above describes
     # what we RESOLVED; `offers` is what the caller RECEIVES, and the two diverge twice:
@@ -9265,6 +9289,8 @@ async def _make_external_redirect_url(
             "ctx": enriched_ctx,
         }
     )
+    base = resolve_public_api_base_url()
+    link = f"{base}/r?token={token}"
     if issued_clicks is not None:
         issued_clicks.append(IssuedClick(
             click_id=stable_click_id,
@@ -9275,9 +9301,9 @@ async def _make_external_redirect_url(
             destination_url=dest,
             dest_domain=url_domain(dest) or None,
             context=dict(enriched_ctx),
+            link=link,
         ))
-    base = resolve_public_api_base_url()
-    return f"{base}/r?token={token}"
+    return link
 
 
 def _seed_attribution_from_redirect(

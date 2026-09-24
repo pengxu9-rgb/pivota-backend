@@ -958,7 +958,25 @@ def test_offers_resolve_attached_retry_serves_external_on_explicit_surface(
 
     monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
     monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
-    monkeypatch.setattr(gateway, "_make_external_redirect_url", AsyncMock(return_value="https://example.com/r?token=arm"))
+    from services.commerce_attribution_service import IssuedClick
+
+    minted, issued_batches = [], []
+
+    async def fake_redirect(**kwargs):
+        # Honours the `issued_clicks` sink the way the real builder does (ADR-025 D1).
+        link = f"https://example.com/r?token={kwargs['click_id']}"
+        minted.append(kwargs["click_id"])
+        sink = kwargs.get("issued_clicks")
+        if sink is not None:
+            sink.append(IssuedClick(click_id=kwargs["click_id"], surface="offers_resolve", link=link))
+        return link
+
+    async def fake_issue(clicks):
+        issued_batches.append([c.click_id for c in clicks])
+        return len(clicks)
+
+    monkeypatch.setattr(gateway, "_make_external_redirect_url", fake_redirect)
+    monkeypatch.setattr(gateway, "issue_clicks", fake_issue)
 
     res = client.post(
         "/agent/shop/v1/invoke",
@@ -989,6 +1007,14 @@ def test_offers_resolve_attached_retry_serves_external_on_explicit_surface(
         and str(source.get("query")) == "external_seed_by_canonical_attached_ref"
         for source in (metadata.get("sources") or [])
     )
+    # The retry lane runs after the primary lanes, so its links must still reach the one issue
+    # flush that runs on what actually ships: a served link is an issued link (ADR-025 D1).
+    served = {
+        str(offer.get("affiliate_url")) for offer in offers
+        if offer.get("purchase_route") == "affiliate_outbound"
+    }
+    assert served and len(issued_batches) == 1
+    assert {f"https://example.com/r?token={c}" for c in issued_batches[0]} == served
 
 
 def test_offers_resolve_strict_surface_substitutes_same_product_variant(

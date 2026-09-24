@@ -359,3 +359,38 @@ async def test_concurrent_fills_keep_the_first_value_not_the_last(db):
     await _hit("clk_issued_1", productId="prod_second")
 
     assert (await _row(db, "clk_issued_1"))["canonical_product_id"] == "prod_first"
+
+
+# --- readers that meant "a buyer clicked" must not count a link that was only issued ------------
+
+
+async def test_the_inferred_fallback_never_recovers_a_link_nobody_followed(db):
+    """#1481's fallback recovers "the most recent agent→merchant CLICK" for an order with no
+    signal. An issued row with no click or impression is an offer, not a click: inferring from it
+    would attribute an order to every agent that merely showed the merchant."""
+    from services import commerce_attribution_service as cas
+
+    await cas.issue_click(_issued("clk_inf_issued"))
+    now = datetime.now(timezone.utc)
+    assert await cas._infer_attribution_from_recent_click({"agent_id": "agent_minds"}, "m_anchor", now) is None
+
+    await _hit("clk_inf_issued")
+    got = await cas._infer_attribution_from_recent_click({"agent_id": "agent_minds"}, "m_anchor", now)
+    assert got is not None and got.get("canonical_product_id") == "prod_1"
+
+
+async def test_the_traffic_dashboard_counts_clicked_links_not_issued_ones(db, monkeypatch):
+    from services import commerce_attribution_service as cas
+    from services import traffic_analytics_service as tas
+
+    await cas.issue_clicks([_issued(f"clk_ta_{i}") for i in range(5)])
+    await _hit("clk_ta_0")
+    await _hit("clk_ta_1", event_type="impression")
+
+    async def _none(**_):
+        return []
+
+    monkeypatch.setattr(tas, "_fetch_request_rows", _none)
+    monkeypatch.setattr(tas, "_fetch_edge_rows", _none)
+    out = await tas.build_employee_traffic_overview(window="1d")
+    assert out["clicked_exposure"] == 2

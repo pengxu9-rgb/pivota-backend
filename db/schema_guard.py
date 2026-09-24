@@ -1116,11 +1116,26 @@ async def ensure_required_schema_light() -> None:
             # select(surface_click_events) needs it: its own try, and ADD COLUMN IF NOT EXISTS so
             # the coverage gate sees it.
             try:
+                # Guarded and bounded like the dispute heals (#2289): the ALTER runs only while
+                # the column is missing, and gives up after 500ms instead of queueing every read
+                # of surface_click_events behind it and eating the guard's startup budget.
                 await database.execute(
                     text(
                         """
-                        ALTER TABLE IF EXISTS surface_click_events
-                          ADD COLUMN IF NOT EXISTS issued_at TIMESTAMPTZ;
+                        DO $$
+                        BEGIN
+                            IF to_regclass('public.surface_click_events') IS NOT NULL
+                               AND NOT EXISTS (
+                                   SELECT 1 FROM information_schema.columns
+                                   WHERE table_schema = 'public'
+                                     AND table_name = 'surface_click_events'
+                                     AND column_name = 'issued_at'
+                               ) THEN
+                                PERFORM set_config('lock_timeout', '500ms', true);
+                                ALTER TABLE IF EXISTS surface_click_events
+                                  ADD COLUMN IF NOT EXISTS issued_at TIMESTAMPTZ;
+                            END IF;
+                        END $$;
                         """
                     )
                 )

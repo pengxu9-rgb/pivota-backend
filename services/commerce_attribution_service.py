@@ -98,6 +98,9 @@ class IssuedClick:
     destination_url: Optional[str] = None
     dest_domain: Optional[str] = None
     context: Optional[Dict[str, Any]] = None
+    #: The link that carries this click, as handed to the caller. NOT stored: a lane that mints
+    #: before it decides what to serve uses it to record only the clicks it actually served.
+    link: Optional[str] = None
 
 
 def _fits(column: str, value: Any) -> Optional[str]:
@@ -545,6 +548,9 @@ _INFERRED_CLICK_LOOKUP_SQL = (
     "source_channel, source_family, query_source, prompt_cluster "
     "FROM surface_click_events "
     "WHERE agent_id = :agent_id AND merchant_id = :merchant_id "
+    # Only rows /r touched: since ADR-025 D1 a row also exists for a link that was only ISSUED,
+    # and an order must not be inferred from a link the buyer never followed.
+    "AND (COALESCE(click_count, 0) > 0 OR COALESCE(impression_count, 0) > 0) "
     "AND COALESCE(last_click_at, created_at) >= :cutoff "
     "ORDER BY COALESCE(last_click_at, created_at) DESC LIMIT 1"
 )
