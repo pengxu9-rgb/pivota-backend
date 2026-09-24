@@ -607,17 +607,15 @@ async def login_agent(data: AgentLoginRequest):
         
         if not user:
             raise HTTPException(status_code=401, detail="Invalid email or password")
-        
-        if user["role"] != "agent":
-            raise HTTPException(status_code=403, detail="This login is for agents only")
-        
-        if not user["active"]:
-            raise HTTPException(status_code=403, detail="Account is deactivated")
-        
-        # 2. Verify password
+
+        # 2. Verify password before saying anything about the account, so a wrong
+        # password cannot learn its role or status.
         if not verify_password(data.password, user["password_hash"]):
             raise HTTPException(status_code=401, detail="Invalid email or password")
-        
+
+        if not user["active"]:
+            raise HTTPException(status_code=403, detail="Account is deactivated")
+
         # 3. Get agent record
         agent = await database.fetch_one(
             """
@@ -627,8 +625,15 @@ async def login_agent(data: AgentLoginRequest):
             """,
             {"email": email}
         )
-        
+
+        # users holds ONE role per email, and an employee login or reset rewrites it
+        # (routes/auth._sync_employee_auth_user), so an agent owner who is also staff
+        # stops being role='agent' while still owning the agent. Owning the agents row
+        # is the agent membership: the forgot/reset flow already accepts it
+        # (_email_has_portal_membership), so login must too.
         if not agent:
+            if user["role"] != "agent":
+                raise HTTPException(status_code=403, detail="This login is for agents only")
             raise HTTPException(status_code=404, detail="Agent record not found")
         
         # databases.Record → plain dict for safe .get() usage
