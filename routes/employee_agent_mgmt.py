@@ -4,7 +4,7 @@ Handles agent CRUD operations for employees
 """
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
 from utils.auth import EMPLOYEE_STAFF_ROLES, get_current_user
@@ -70,13 +70,6 @@ def parse_json_field(value):
     return []
 
 # ============== Models ==============
-
-class CreateAgentRequest(BaseModel):
-    name: str
-    email: EmailStr
-    company: str
-    use_case: str
-    expected_volume: Optional[int] = 100
 
 class UpdateAgentRequest(BaseModel):
     name: Optional[str] = None
@@ -405,68 +398,25 @@ async def get_agent_calls(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get calls: {str(e)}")
 
+# RETIRED (501). This handler was written for a legacy agents table (name, company, use_case,
+# status, request_count) that prod does not have; prod's table is the db/agents.py `agents`
+# model (agent_name, agent_type and api_key_hash NOT NULL), so its INSERT failed on every call.
+# It also stored a plaintext ak_live_ key in agents.api_key, while auth reads the sha256 in the
+# key table (api_keys when it exists) and consults agents.api_key only when no key table exists
+# or AGENT_AUTH_ENABLE_LEGACY_API_KEY_FALLBACK is on (default off).
+# Nothing calls it: the employee portal's createAgent sends {name, email, phone} and no page
+# uses it. Agents are created through self-serve POST /agent/account/register
+# (routes/agent_account.py), which mints the key hash-only and creates the users row and
+# membership. It takes no body, so it answers 501 for any payload rather than 422.
 @router.post("/agents/create")
-async def create_agent(
-    request: CreateAgentRequest,
-    current_user: dict = Depends(get_current_user)
-):
-    """Create a new agent (Employee only)"""
+async def create_agent(current_user: dict = Depends(get_current_user)):
+    """Retired (Employee only): answers 501; create agents through POST /agent/account/register."""
     if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
-    try:
-        # Check if email already exists
-        existing = await database.fetch_one(
-            "SELECT agent_id FROM agents WHERE email = :email",
-            {"email": request.email}
-        )
-        
-        if existing:
-            raise HTTPException(status_code=400, detail="Agent with this email already exists")
-        
-        # Generate agent credentials
-        agent_id = f"agent_{uuid.uuid4().hex[:12]}"
-        api_key = f"ak_live_{secrets.token_hex(32)}"
-        
-        # Create agent
-        await database.execute(
-            """INSERT INTO agents 
-               (agent_id, name, email, company, use_case, api_key, status, 
-                created_at, rate_limit, request_count, success_rate)
-               VALUES (:agent_id, :name, :email, :company, :use_case, :api_key, 
-                       :status, :created_at, :rate_limit, :request_count, :success_rate)""",
-            {
-                "agent_id": agent_id,
-                "name": request.name,
-                "email": request.email,
-                "company": request.company,
-                "use_case": request.use_case,
-                "api_key": api_key,
-                "status": "active",
-                "created_at": datetime.now(),
-                "rate_limit": min(request.expected_volume * 10, 10000),
-                "request_count": 0,
-                "success_rate": 0
-            }
-        )
-        
-        return {
-            "status": "success",
-            "message": "Agent created successfully",
-            "agent": {
-                "agent_id": agent_id,
-                "name": request.name,
-                "email": request.email,
-                "company": request.company,
-                "api_key": api_key,
-                "status": "active"
-            }
-        }
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to create agent: {str(e)}")
+    raise HTTPException(
+        status_code=501,
+        detail="Employee agent creation is retired; agents register through POST /agent/account/register",
+    )
 
 
 @router.patch("/agents/{agent_id}/tier")
