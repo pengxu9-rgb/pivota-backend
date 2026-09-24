@@ -43,6 +43,7 @@ async def db():
     try:
         yield database
     finally:
+        await database.execute("DELETE FROM product_group_members WHERE platform_product_id LIKE :p", {"p": PREFIX + "%"})
         await database.execute("DELETE FROM catalog_offers WHERE offer_id LIKE :p", {"p": PREFIX + "%"})
         await database.execute("DELETE FROM index_pipeline_state WHERE content_key LIKE :p", {"p": PREFIX + "%"})
         await database.execute("DELETE FROM catalog_products WHERE product_key LIKE :p", {"p": PREFIX + "%"})
@@ -115,3 +116,23 @@ async def test_an_unresolved_identity_fails_even_on_a_content_refusal(db):
     await _offer(db, key)
     await _ips(db, ck)
     assert not (await _readback([key], "USD", db, planned_images={key: True}))["ok"]
+
+
+async def _member(db, source_id, *, group="rbq-gate-g1"):
+    await db.execute(
+        "INSERT INTO product_group_members (product_group_id, merchant_id, platform, platform_product_id)"
+        " VALUES (:g, 'rbq_m', 'external_seed', :s) ON CONFLICT DO NOTHING", {"g": group, "s": source_id})
+
+
+async def test_identity_resolved_by_group_membership_on_the_products_own_source_id(db):
+    """A product outside the resolved pdp_scopes is resolved by a product_group_members row keyed on ITS OWN
+    (merchant_id, platform, source_product_id) -- the index's join -- and by no other product's row."""
+    from services.retailer_ingest.pipeline import _readback
+    key, other, ck = PREFIX + "mem", PREFIX + "mem-other", PREFIX + "ck-mem"
+    await _product(db, key, content_key=ck, scope="single_merchant")
+    await _offer(db, key)
+    await _ips(db, ck)
+    await _member(db, other)                       # a membership for a DIFFERENT source id does not count
+    assert not (await _readback([key], "USD", db, planned_images={key: True}))["ok"]
+    await _member(db, key)                         # this product's own membership resolves it
+    assert (await _readback([key], "USD", db, planned_images={key: True}))["ok"]
