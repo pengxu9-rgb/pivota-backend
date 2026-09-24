@@ -1623,3 +1623,134 @@ async def close_external_order_conversion(
         "state": EDGE_STATE_CONVERTED,
         "replayed": False,
     }
+
+
+# The edges a platform refund of an external order reduces. They are found by the key
+# close_external_order_conversion wrote: (subject merchant, external_order_id). The subject is the
+# seller when the click was seller-keyed; the merchant the platform webhook authenticated is then
+# only in metadata.converting_merchant_id, so both are matched. Their order_id is the synthetic
+# `ext_...` id, which is what the shared refund UPDATE keys on. FOR UPDATE: the ceiling below reads
+# the edge's refund total, and a second refund of the same order must wait for it.
+_EXTERNAL_EDGES_FOR_REFUND_SQL = """
+SELECT edge_id, order_id, merchant_id, currency, created_at,
+       gross_attributed_gmv_cents, refund_amount_cents, refund_ids
+FROM commerce_attribution_edges
+WHERE external_order_id = :external_order_id
+  AND (merchant_id = :merchant_id OR metadata->>'converting_merchant_id' = :merchant_id)
+ORDER BY edge_id
+FOR UPDATE
+"""
+
+
+async def apply_external_order_refund(
+    *,
+    merchant_id: str,
+    external_order_id: str,
+    refund_id: str,
+    amount: Any,
+    currency: Optional[str],
+) -> List[Dict[str, Any]]:
+    """Apply a platform refund to the edges `close_external_order_conversion` closed for that order.
+
+    ``amount`` is in MAJOR units, as the platform reports it. The shared refund UPDATE stores
+    major × 100, and the close stored the gross the same way (`shopify_order_total_to_cents`), so
+    the two agree in every currency. Per edge:
+
+    - ``replayed``: ``refund_id`` is already on the edge. Nothing is added.
+    - ``currency_mismatch``: the refund is not in the currency the gross was recorded in. Nothing
+      is added; subtracting it would mix units.
+    - ``nothing_remaining`` / ``edge_has_no_gross``: nothing to reduce.
+    - ``applied``: the refund, capped at what is left of the edge's gross, so one order's refund
+      can never reduce another order's net in the same rollup group.
+
+    After commit, emits ``refund.succeeded`` for each applied edge and re-rolls the billed day of
+    every applied or replayed edge (a replay retries a re-roll that failed the first time). Must
+    not be called inside a transaction. Returns one outcome per edge; ``[]`` when Pivota
+    attributed no edge to the order.
+    """
+    merchant_id = str(merchant_id or "").strip()
+    external_order_id = str(external_order_id or "").strip()
+    refund_id = str(refund_id or "").strip()
+    currency = str(currency or "").strip().upper() or None
+    try:
+        amount_major = Decimal(str(amount))
+    except (InvalidOperation, ValueError, TypeError):
+        amount_major = Decimal("0")
+    if not merchant_id or not external_order_id or not refund_id or not amount_major.is_finite() or amount_major <= 0:
+        # A zero refund recorded under its id would shadow the real one forever.
+        return []
+    # Same rounding as shopify_order_total_to_cents, which stored the gross.
+    amount_cents = int((amount_major * Decimal("100")).quantize(Decimal("1")))
+
+    outcomes: List[Dict[str, Any]] = []
+    applied: List[tuple[Dict[str, Any], List[Dict[str, Any]], Decimal]] = []
+    to_recompute: List[Dict[str, Any]] = []
+    async with database.transaction():
+        edges = [
+            dict(r)
+            for r in await database.fetch_all(
+                _EXTERNAL_EDGES_FOR_REFUND_SQL,
+                {"merchant_id": merchant_id, "external_order_id": external_order_id},
+            )
+        ]
+        for edge in edges:
+            refund_ids = edge.get("refund_ids")
+            if isinstance(refund_ids, str):
+                refund_ids = json.loads(refund_ids)
+            gross = edge.get("gross_attributed_gmv_cents")
+            before = int(edge.get("refund_amount_cents") or 0)
+            edge_currency = str(edge.get("currency") or "").strip().upper() or None
+            outcome = {"edge_id": edge["edge_id"], "order_id": edge["order_id"], "applied_cents": 0}
+            outcomes.append(outcome)
+            if refund_id in (refund_ids or []):
+                outcome["status"] = "replayed"
+                to_recompute.append(edge)
+                continue
+            if currency is None or edge_currency != currency:
+                outcome["status"] = "currency_mismatch"
+                logger.warning(
+                    "commerce_attribution: external refund NOT applied, currency %s != edge %s "
+                    "edge_id=%s external_order_id=%s refund_id=%s",
+                    currency, edge_currency, edge["edge_id"], external_order_id, refund_id,
+                )
+                continue
+            if isinstance(gross, bool) or not isinstance(gross, int) or gross <= 0:
+                outcome["status"] = "edge_has_no_gross"
+                continue
+            remaining = gross - before
+            if remaining <= 0:
+                outcome["status"] = "nothing_remaining"
+                continue
+            apply_cents = min(amount_cents, remaining)
+            if apply_cents < amount_cents:
+                logger.warning(
+                    "commerce_attribution: external refund capped at the edge's remaining gross "
+                    "(%s of %s cents) edge_id=%s external_order_id=%s refund_id=%s",
+                    apply_cents, amount_cents, edge["edge_id"], external_order_id, refund_id,
+                )
+            apply_major = Decimal(apply_cents) / Decimal(100)
+            rows = await apply_attribution_refund_rows(
+                order_id=edge["order_id"], refund_id=refund_id, amount=apply_major
+            )
+            if len(rows) != 1:
+                # order_id is UNIQUE, and the row is locked above.
+                raise RuntimeError(f"refund on order_id matched {len(rows)} edges, expected 1")
+            outcome["status"] = "applied"
+            outcome["applied_cents"] = apply_cents
+            applied.append((edge, rows, apply_major))
+            to_recompute.extend(rows)
+
+    # Committed. Neither step may undo the refund: each failure is logged, never raised.
+    for edge, rows, apply_major in applied:
+        try:
+            await emit_attribution_refund_event(
+                rows, order_id=edge["order_id"], refund_id=refund_id, amount=apply_major
+            )
+        except Exception as exc:  # noqa: BLE001 -- the refund already stands
+            logger.warning(
+                "commerce_attribution: external refund event failed edge_id=%s refund_id=%s: %s",
+                edge["edge_id"], refund_id, type(exc).__name__,
+            )
+    if to_recompute:
+        await recompute_days_for_edges(to_recompute)  # never raises
+    return outcomes

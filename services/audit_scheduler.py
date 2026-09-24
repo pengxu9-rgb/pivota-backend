@@ -793,7 +793,7 @@ async def start_scheduler() -> None:
         # docs/monetization/deploy/STAGE_1_SHADOW_MODE_ROLLOUT.md §0.
 
         from services.metering_service import expire_stale_reservations
-        from services.gmv_aggregation_service import aggregate_daily
+        from services.gmv_aggregation_service import run_nightly_rollup
         from services.invoice_generation_service import run_billing_cycle
         from services.partner_settlement_service import run_settlement
         from services import settlement_file_service
@@ -803,10 +803,9 @@ async def start_scheduler() -> None:
         from datetime import datetime as _dt, timedelta as _td, timezone as _tz
 
         async def _run_gmv_aggregation_yesterday() -> None:
-            """T6 daily wrapper: aggregate yesterday's edges into gmv_attribution_daily."""
-            yesterday = (_dt.now(_tz.utc) - _td(days=1)).date()
-            rows = await aggregate_daily(yesterday)
-            logger.info("audit_scheduler: gmv_aggregation_daily for %s -> %d rollup rows", yesterday, rows)
+            """T6 daily wrapper: roll up yesterday into gmv_attribution_daily, then re-roll every
+            earlier day whose edges changed after it was rolled up (run_nightly_rollup)."""
+            await run_nightly_rollup()
 
         async def _run_billing_cycle_previous_month() -> None:
             """T7 monthly wrapper: invoice the previous calendar month.
