@@ -36,3 +36,9 @@ def test_a_brand_official_row_is_accepted():
 def test_rows_the_drain_would_refuse_are_refused_at_enqueue(options):
     with pytest.raises(ValueError, match="source_role|retailer_name"):
         _row_to_job({"domain": "clinique.com", "brand": "Clinique", "vendors": ["Clinique"], "options": options})
+
+
+def test_a_known_retailer_is_refused_as_a_brand_official_store_at_enqueue():
+    with pytest.raises(ValueError, match="known retailer"):
+        _row_to_job({"domain": "sephora.com", "brand": "Clinique", "vendors": ["Clinique"],
+                     "options": {"source_role": "brand_official"}})

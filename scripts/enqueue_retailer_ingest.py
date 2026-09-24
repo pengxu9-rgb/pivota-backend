@@ -64,6 +64,11 @@ def _row_to_job(row: Dict[str, Any]) -> Dict[str, Any]:
         normalize_curated_brand_payload(_feed_payload({"domain": domain, "brand": brand, "options": options}))
     except _Stop as exc:
         raise ValueError(exc.reason) from None
+    if options.get("source_role") == "brand_official":
+        from services.retailer_ingest.pipeline import brand_official_domain_flags
+        fatal = [f for f in brand_official_domain_flags(domain, brand) if f.get("acceptable") is False]
+        if fatal:
+            raise ValueError(fatal[0]["detail"])
     return {"domain": domain, "brand": brand, "options": options, "priority": int(row.get("priority") or 0)}
 
 

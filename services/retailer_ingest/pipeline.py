@@ -94,6 +94,34 @@ def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
     return options
 
 
+def brand_official_domain_flags(domain: str, brand: str) -> List[Dict[str, Any]]:
+    """A brand_official cohort writes the brand's CANONICAL rows: its product keys derive from
+    (brand, product name) alone, so the same product at any host lands on the same key, and the
+    upsert re-points that key's source_domain / canonical_url / payload at this host and labels its
+    INCI brand-official. Nothing downstream checks that the host is the brand's (the legacy-listing
+    report and the native-variant rule look only at ext:retailer: keys; the brand-host guard looks
+    only at the same host), and a clean dry run auto-applies. So the host must PROVE it is the brand's:
+
+      * a known retailer host can never be a brand's own store (not acceptable -- fix the job);
+      * otherwise the domain's name must BE the brand (offer_seller_identity.brand_owns_domain, the
+        rule that types an offer brand_direct), or a human accepts the flag (tartecosmetics.com for
+        "Tarte", k18hair.com for "K18"): held, never auto-applied.
+    """
+    from services.offer_seller_identity import brand_owns_domain, is_known_retailer
+
+    if is_known_retailer(domain):
+        return [{"key": "brand_official_on_a_retailer", "rule": "brand_official_on_a_retailer",
+                 "severity": detectors.BLOCK, "acceptable": False,
+                 "detail": f"{domain} is a known retailer; source_role brand_official would overwrite "
+                           f"{brand}'s canonical rows with this retailer's listings"}]
+    if brand_owns_domain(brand, domain):
+        return []
+    return [{"key": f"brand_official_domain_unproven:{domain}", "rule": "brand_official_domain_unproven",
+             "severity": detectors.BLOCK,
+             "detail": f"the domain name of {domain} is not the brand {brand!r}; accept this key only if "
+                       f"{domain} is {brand}'s own store (its rows become {brand}'s canonical rows)"}]
+
+
 def _feed_payload(job: Dict[str, Any]) -> Dict[str, Any]:
     try:
         o = validate_options(dict(job.get("options") or {}))
@@ -244,6 +272,8 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
     o = job.get("options") or {}
     checks: Dict[str, Any] = {"crawl": getattr(records, "crawl_report", None), "selected": len(records)}
     flags: List[Dict[str, Any]] = []
+    if o.get("source_role") == "brand_official":
+        flags.extend(brand_official_domain_flags(job["domain"], job["brand"]))
 
     excluded = {str(h).strip().strip("/").casefold() for h in (o.get("exclude_handles") or []) if str(h).strip()}
     if excluded:

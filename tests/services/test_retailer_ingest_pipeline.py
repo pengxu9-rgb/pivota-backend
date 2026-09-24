@@ -563,8 +563,12 @@ async def test_a_brand_official_cohort_applies_with_brand_authority(env, monkeyp
         assert kw["source_role"] == "brand_official"
         return feed.ShopifyProductBatch([official(*TINT)], scanned_products=1, pages=1)
     monkeypatch.setattr(feed, "records_for_brand", fetch)
-    assert (await pipeline.run_stage(job(source_role="brand_official"), db=env.db))["status"] == "apply_due"
-    out = await pipeline.run_stage(job("apply_due", source_role="brand_official"), db=env.db)
+    # k-touch.us is not named 3CE: held until a human says it is 3CE's own store.
+    assert (await pipeline.run_stage(job(source_role="brand_official"), db=env.db))["status"] == "held"
+    accept = ["brand_official_domain_unproven:k-touch.us"]
+    assert (await pipeline.run_stage(job(source_role="brand_official", accepted_flags=accept),
+                                     db=env.db))["status"] == "apply_due"
+    out = await pipeline.run_stage(job("apply_due", source_role="brand_official", accepted_flags=accept), db=env.db)
     assert out["status"] == "done", env.ledger.runs
     import json
     offer = env.applied[-1]["offers"][0]
@@ -590,3 +594,28 @@ def test_an_affiliate_feed_is_retailer_only():
     with pytest.raises(ValueError, match="source_role = retailer"):
         pipeline.validate_options({"vendors": ["X"], "source": "affiliate_feed", "source_role": "brand_official",
                                    "feed": {}})
+
+
+async def test_a_brand_store_named_for_the_brand_needs_no_approval(env):
+    j = job(source_role="brand_official")
+    j["domain"] = "3ce.com"
+    out = await pipeline.run_stage(j, db=env.db)
+    assert out["status"] == "apply_due"
+
+
+async def test_a_known_retailer_can_never_be_a_brand_official_store(env):
+    for accepted in ([], ["brand_official_on_a_retailer"]):
+        j = job(source_role="brand_official", accepted_flags=accepted)
+        j["domain"] = "sephora.com"
+        out = await pipeline.run_stage(j, db=env.db)
+        assert out["status"] == "held"
+        run = list(env.ledger.runs.values())[-1]
+        assert [f["rule"] for f in run["flags"] if f["rule"].startswith("brand_official")] == ["brand_official_on_a_retailer"]
+
+
+async def test_the_retailer_default_raises_no_domain_flag(env):
+    j = job()
+    j["domain"] = "sephora.com"
+    await pipeline.run_stage(j, db=env.db)
+    run = list(env.ledger.runs.values())[-1]
+    assert not [f for f in run.get("flags") or [] if f["rule"].startswith("brand_official")]
