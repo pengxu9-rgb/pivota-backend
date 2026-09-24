@@ -659,5 +659,6 @@ def test_the_drain_budget_leaves_the_last_stage_room_inside_the_task_timeout():
     timeouts = [int(t) for t in re.findall(r"--task-timeout (\d+)s", block)]
     task_timeout = timeouts[-1]  # the later flag wins, as in gcloud
     assert task_timeout == 3600
-    assert 0 < int(env["RETAILER_INGEST_DRAIN_BUDGET_SECONDS"]) <= task_timeout - 1200
+    assert 0 < int(env["RETAILER_INGEST_DRAIN_BUDGET_SECONDS"]) <= task_timeout - 1800
     assert int(env["RETAILER_INGEST_LEASE_SECONDS"]) > task_timeout
+    assert int(env["RETAILER_INGEST_TASK_TIMEOUT_SECONDS"]) == task_timeout  # the loop sizes leases from it

@@ -54,9 +54,14 @@ async def drain_once(*, lease_seconds: int, db: Any = None) -> Dict[str, Any]:
     return summary
 
 
+#: A stage's lease outlives the TASK by this much, never more: a lease that outlives a killed task is
+#: the time the lane stays blocked before the next claim may mark the stage interrupted.
+LEASE_SLACK_SECONDS = 600
+
+
 async def drain_loop(*, lease_seconds: int, budget_seconds: int, db: Any = None,
-                     clock: Callable[[], float] = time.monotonic, report: Callable[[Dict[str, Any]], None] = None
-                     ) -> List[Dict[str, Any]]:
+                     clock: Callable[[], float] = time.monotonic, report: Callable[[Dict[str, Any]], None] = None,
+                     task_timeout_seconds: int = 3600) -> List[Dict[str, Any]]:
     """Stages back to back until nothing is due or the budget is spent. A budget of 0 is one stage.
     A throttled crawl also ends the loop: the crawl NAT is being rate-limited, and the next store would
     draw the same 429s and spend its retry budget -- the next tick is the cool-down. An unexpected
@@ -66,7 +71,10 @@ async def drain_loop(*, lease_seconds: int, budget_seconds: int, db: Any = None,
     summaries: List[Dict[str, Any]] = []
     while True:
         began = clock()
-        summary = await drain_once(lease_seconds=lease_seconds, db=db)
+        # The lease covers what is left of THIS task (+ slack), not a fixed 70 minutes from each claim:
+        # a stage killed at the task timeout 50 minutes in must not block the lane for another hour.
+        lease = min(lease_seconds, int(max(0.0, task_timeout_seconds - (began - start))) + LEASE_SLACK_SECONDS)
+        summary = await drain_once(lease_seconds=lease, db=db)
         ended = clock()
         # Logged per stage so the budget/timeout margin can be tuned from data, not guessed.
         summary["duration_s"] = round(ended - began, 1)
@@ -90,6 +98,9 @@ def main() -> int:
     # No new stage starts after this many seconds; keep it well inside the task timeout (3600s) so the
     # last stage finishes. 0 = one stage per execution.
     parser.add_argument("--budget", type=int, default=int(os.getenv("RETAILER_INGEST_DRAIN_BUDGET_SECONDS", "0")))
+    # The Cloud Run task timeout (setup_scheduler.sh: 3600s); Cloud Run does not expose it to the task.
+    parser.add_argument("--task-timeout", type=int,
+                        default=int(os.getenv("RETAILER_INGEST_TASK_TIMEOUT_SECONDS", "3600")))
     args = parser.parse_args()
 
     if str(os.getenv("RETAILER_INGEST_DRAIN_ENABLED", "")).strip() != "1":
@@ -103,7 +114,8 @@ def main() -> int:
     async def _run() -> None:
         await database.connect()
         try:
-            await drain_loop(lease_seconds=args.lease, budget_seconds=args.budget, report=report)
+            await drain_loop(lease_seconds=args.lease, budget_seconds=args.budget, report=report,
+                             task_timeout_seconds=args.task_timeout)
         finally:
             await database.disconnect()
 

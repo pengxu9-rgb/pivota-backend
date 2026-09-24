@@ -25,7 +25,7 @@ import json
 import logging
 import os
 import re
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import quote, urljoin, urlsplit
 
 import httpx
@@ -2353,6 +2353,7 @@ async def records_for_brand(
     domain: str,
     category_path: str,
     brand: Optional[str] = None,
+    brand_by_vendor: Optional[Mapping[str, str]] = None,
     max_products: int = 500,
     base_listings_only: bool = False,
     # Emit the merchant's OWN variants for products that are natively multi-variant
@@ -2495,7 +2496,10 @@ async def records_for_brand(
     pairs: List[Dict[str, Any]] = []  # (product, record) needing a PDP INCI try
     for p in products:
         rec = shopify_product_to_record(
-            p, domain=domain, category_path=category_path, brand_override=brand,
+            # brand_by_vendor (multi-brand retailer cohorts): each vendor's OWN canonical spelling, applied
+            # by the same resolve_record_brand rule a single-brand job's `brand` gets.
+            p, domain=domain, category_path=category_path,
+            brand_override=(brand_by_vendor or {}).get(" ".join(str(p.get("vendor") or "").split()).casefold(), brand),
             emit_variants=base_listings_only,
             emit_native_variants=emit_real_variants,
             currency=locale.get("currency"),

@@ -13,6 +13,8 @@ import scripts.onboard_curated_brands as cli
 from services import curated_brand_feed as feed
 from services.retailer_ingest import pipeline
 
+_REAL_RECORDS_FOR_BRAND = feed.records_for_brand
+
 
 def record(title, ptype, handle, body="<p>A lip colour for soft, velvet lips.</p>", currency="USD"):
     return feed.shopify_product_to_record(
@@ -668,7 +670,7 @@ async def test_a_multi_brand_cohort_crawls_once_and_keeps_every_vendor_as_its_br
                                                          ("rom&nd", "Juicy Lasting Tint", "juicy")])],
             scanned_products=2, pages=1)
     monkeypatch.setattr(feed, "records_for_brand", fetch)
-    opts = {"multi_brand": True, "vendors": ["3CE", "rom&nd"]}
+    opts = {"multi_brand": True, "vendors": ["3CE", "rom&nd"], "brands": {"3CE": "3CE", "rom&nd": "rom&nd"}}
     assert (await pipeline.run_stage({**job(**opts), "brand": "k-touch.us (2 brands)"}, db=env.db))["status"] == "apply_due"
     out = await pipeline.run_stage({**job("apply_due", **opts), "brand": "k-touch.us (2 brands)"}, db=env.db)
     assert out["status"] == "done", env.ledger.runs
@@ -691,3 +693,48 @@ async def test_multi_brand_is_retailer_storefront_only(env, options):
 def test_multi_brand_refuses_an_affiliate_feed():
     with pytest.raises(ValueError, match="multi_brand"):
         pipeline.validate_options({"vendors": ["X"], "multi_brand": True, "source": "affiliate_feed", "feed": {}})
+
+
+async def test_multi_brand_writes_each_vendors_canonical_spelling(env, monkeypatch):
+    """Review of #2301: with no override a row kept the STORE's spelling ("Dr. Jart+"), which
+    normalize_brand keys apart from the catalog's "Dr.Jart+". options.brands restores the per-brand
+    override, through the same resolve_record_brand rule, inside the one crawl."""
+    products = [
+        {"id": 9100001, "vendor": "Dr. Jart+", "title": "Cicapair Lip Tint", "handle": "cicapair",
+         "product_type": "LIP TINT", "body_html": "<p>A lip colour for soft, velvet lips.</p>",
+         "images": [{"src": "https://cdn.example/i.jpg"}],
+         "variants": [{"id": 45000000000001, "price": "48.00", "available": True, "sku": "cica"}]},
+        {"id": 9100002, "vendor": "SKIN1004", "title": "Centella Lip Tint", "handle": "ampoule",
+         "product_type": "LIP TINT", "body_html": "<p>A lip colour for soft, velvet lips.</p>",
+         "images": [{"src": "https://cdn.example/i.jpg"}],
+         "variants": [{"id": 45000000000002, "price": "20.00", "available": True, "sku": "amp"}]},
+    ]
+
+    async def fetch_products(domain, **kw):
+        return feed.ShopifyProductBatch(feed.filter_products_by_vendor(products, kw.get("only_vendors")),
+                                        scanned_products=2, pages=2)
+
+    async def locale(domain, **kw):
+        return {"currency": "USD"}
+    monkeypatch.setattr(feed, "fetch_shopify_products", fetch_products)
+    monkeypatch.setattr(feed, "fetch_shopify_shop_locale", locale)
+    monkeypatch.setattr(feed, "records_for_brand", _REAL_RECORDS_FOR_BRAND)
+    opts = dict(multi_brand=True, vendors=["Dr. Jart+", "SKIN1004"],
+                brands={"Dr. Jart+": "Dr.Jart+", "SKIN1004": "Skin1004"})
+    first = await pipeline.run_stage({**job(**opts), "brand": "store (2 brands)"}, db=env.db)
+    assert first["status"] == "apply_due", list(env.ledger.runs.values())[-1]
+    out = await pipeline.run_stage({**job("apply_due", **opts), "brand": "store (2 brands)"}, db=env.db)
+    assert out["status"] == "done", env.ledger.runs
+    assert sorted(p["brand"] for p in env.applied[-1]["pdps"]) == ["Dr.Jart+", "Skin1004"]
+
+
+@pytest.mark.parametrize("options", [
+    {"vendors": ["A", "B"], "multi_brand": True},                                   # brands required
+    {"vendors": ["A", "B"], "multi_brand": True, "brands": {"A": "A"}},             # every vendor mapped
+    {"vendors": ["A"], "multi_brand": True, "brands": {"A": "A", "C": "C"}},        # only vendors
+    {"vendors": ["A"], "brands": {"A": "A"}},                                       # only with multi_brand
+    {"vendors": ["A"], "max_pdp_identity_fetches": 301},                            # a stage must fit a task
+])
+def test_multi_brand_spellings_and_fetch_budget_are_validated(options):
+    with pytest.raises(ValueError):
+        pipeline.validate_options(dict(options))

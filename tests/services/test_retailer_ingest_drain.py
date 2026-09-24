@@ -153,3 +153,16 @@ def test_an_error_mid_loop_fails_the_execution_after_reporting_earlier_stages(mo
     assert drain.main() == 1
     out = capsys.readouterr().out
     assert out.count(drain.SUMMARY_MARKER) == 2 and '"outcome": "clean"' in out and '"outcome": "error"' in out
+
+
+async def test_each_claim_leases_only_what_is_left_of_the_task(monkeypatch):
+    leases = []
+
+    async def once(**kw):
+        leases.append(kw["lease_seconds"])
+        return {"outcome": "clean", "jobs": {}}
+    monkeypatch.setattr(drain, "drain_once", once)
+    # stage 1 claims at t=0 (3600 left), stage 2 at t=1000 (2600 left); budget stops after stage 2.
+    await drain.drain_loop(lease_seconds=4200, budget_seconds=1800, db=object(), task_timeout_seconds=3600,
+                           clock=Script([0, 0, 500, 1000, 1500]))
+    assert leases == [4200, 2600 + drain.LEASE_SLACK_SECONDS]
