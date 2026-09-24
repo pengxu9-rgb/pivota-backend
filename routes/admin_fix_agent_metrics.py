@@ -15,8 +15,8 @@ logger = logging.getLogger(__name__)
 # / total_requests * 100>. agents has no request_count column (db/agents.py), so that UPDATE
 # fails on prod's table on every call, after the view has already been swapped, and the
 # success_rate rewrite cannot run there. Dropping only request_count would arm it: a rewrite of
-# every agent's success_rate from two different populations (it can pass 100 and overflow
-# Numeric(5,2)).
+# success_rate for every agent with total_requests > 0, from two different populations (it can
+# pass 100, and at 1000 overflows Numeric(5,2)).
 @router.post("/agent-metrics")
 async def fix_agent_metrics(current_user: dict = Depends(get_current_user)):
     """Retired: answers 501 and writes nothing."""

@@ -1,6 +1,5 @@
 """
-Initialize API key for agent@test.com
-Temporary admin endpoint -- RETIRED (501), see below.
+RETIRED (501): used to mint an API key for agent@test.com. See below.
 """
 
 from fastapi import APIRouter, Depends, HTTPException

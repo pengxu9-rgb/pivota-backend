@@ -8,7 +8,11 @@ Pinned:
   route's UPDATE branch did exactly that to an existing agent@test.com);
 - POST /admin/fix/agent-metrics and /agent-metrics-v2 are retired: 501, the agents counters are
   untouched and the agent_metrics_24h view is not swapped (their UPDATE named request_count, so it
-  could never run; dropping only that column would have armed a bulk counter overwrite);
+  could never run; dropping only that column would have armed a bulk counter overwrite). The
+  fixture seeds a paid order and 2xx usage logs that disagree with the seeded counters, so either
+  UPDATE, run without request_count, would change them;
+- every admin route here still answers 403 to a non-admin, before any 501 or any data (the GETs
+  now return owner emails and per-agent GMV, which they never did while they 500'd);
 - GET /agent/metrics/agents, /admin/fix/agent-metrics-status and /admin/fix/agent-orders-check
   read agent_name / owner_email / is_active / total_requests and answer with real rows (they used
   to answer {"status": "error"} or 500 on every call). A NULL is_active counts as active, as it
@@ -88,6 +92,17 @@ async def db():
     for table in (orders_table, agents_db.agent_usage_logs):
         await database.execute(str(CreateTable(table).compile(dialect=dialect)))
     await database.execute(_AGENT_MERCHANTS_DDL)
+    # A paid order for ALPHA that disagrees with its seeded counters (7 requests, 2 orders, 30.00
+    # GMV), so the v2 UPDATE -- run without request_count -- would rewrite them.
+    await database.execute(
+        """
+        INSERT INTO orders (order_id, merchant_id, customer_email, shipping_address, items,
+                            subtotal, total, payment_status, agent_id)
+        VALUES ('ord_legacy_alpha', 'merch_legacy', 'buyer@example.com', '{}', '[]',
+                45.00, 45.00, 'paid', :agent_id)
+        """,
+        {"agent_id": ALPHA},
+    )
 
     for agent_id, name, is_active, email, total_requests in (
         (ALPHA, "Alpha", True, "agent@test.com", 7),
@@ -158,7 +173,7 @@ async def client(db, user):
     from routes.agent_metrics import router as agent_metrics_router
     from routes.employee_agent_mgmt import router as employee_agent_router
     from routes.init_agent_key import router as init_agent_key_router
-    from utils.auth import get_current_user, require_admin, require_admin_or_key
+    from utils.auth import get_current_user, require_admin_or_key
 
     app = FastAPI()
     for router in (
@@ -169,7 +184,10 @@ async def client(db, user):
         admin_fix_v2_router,
     ):
         app.include_router(router)
-    for dep in (get_current_user, require_admin, require_admin_or_key):
+    # require_admin is NOT overridden: it runs its real role check on the overridden user.
+    # require_admin_or_key is (it also reads X-ADMIN-KEY), so init's guard is pinned elsewhere
+    # (tests/test_unauthenticated_admin_ops_routes.py).
+    for dep in (get_current_user, require_admin_or_key):
         app.dependency_overrides[dep] = lambda: user
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
         yield c
@@ -289,4 +307,27 @@ async def test_admin_fix_agent_orders_check_reads_the_real_columns(client, db):
     assert "request_count" not in stats
     assert stats["total_requests"] == 7
     assert stats["total_orders"] == 2
+    assert resp.json()["direct_orders"]["total_orders"] == 1
     assert resp.json()["usage_logs_data"]["total_logs"] == 4
+
+
+@pytest.mark.parametrize("role", ["merchant", "employee"])
+@pytest.mark.parametrize(
+    "method,path",
+    [
+        ("GET", "/agent/metrics/agents"),
+        ("GET", "/admin/fix/agent-metrics-status"),
+        ("GET", f"/admin/fix/agent-orders-check?agent_id={ALPHA}"),
+        ("POST", "/admin/fix/agent-metrics"),
+        ("POST", "/admin/fix/agent-metrics-v2"),
+    ],
+)
+async def test_admin_routes_refuse_a_non_admin_before_anything_else(client, db, user, role, method, path):
+    user["role"] = role
+    before = await _counters(db)
+
+    resp = await client.request(method, path)
+
+    assert resp.status_code == 403, resp.text
+    assert await _counters(db) == before
+    assert await _view_exists(db) is False

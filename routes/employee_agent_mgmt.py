@@ -4,7 +4,7 @@ Handles agent CRUD operations for employees
 """
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
 from utils.auth import EMPLOYEE_STAFF_ROLES, get_current_user
