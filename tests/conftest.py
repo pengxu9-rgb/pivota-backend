@@ -42,6 +42,15 @@ os.environ.setdefault(
 
 import pytest
 
+# Session-end hooks that stop aiosqlite workers stranded by a closed event loop
+# and fail loudly on any other non-daemon thread, so the process exits after
+# its summary instead of hanging until the CI job cap. See the module docstring.
+from thread_exit_guard import (  # noqa: E402,F401
+    pytest_sessionfinish,
+    pytest_terminal_summary,
+    pytest_unconfigure,
+)
+
 
 @pytest.fixture(autouse=True)
 def _reset_anonymous_invoke_budget():
