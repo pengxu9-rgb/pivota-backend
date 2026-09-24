@@ -34,6 +34,7 @@ retire anything, and a host that stops talking to us freezes rather than decays.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -277,6 +278,7 @@ async def read_brand_catalogue(
     """
     handles: Set[str] = set()
     total = 0
+    seen_pages: Set[Tuple[str, ...]] = set()
     for page in range(1, MAX_CATALOGUE_PAGES + 1):
         url = f"https://{host}/products.json?limit={PAGE_LIMIT}&page={page}"
         kind, payload = await _get_catalogue_page(client, url, attempts)
@@ -296,6 +298,14 @@ async def read_brand_catalogue(
                 # exactly the hosts most likely to be refusing us.
                 return CatalogueRead(CATALOGUE_EMPTY, set(), 0, "page 1 listed no products")
             return CatalogueRead(CATALOGUE_OK, handles, total, f"{page - 1} page(s)")
+        # A store that ignores ?page serves page 1 forever: with no short-page stop, only this
+        # ends it (before MAX_CATALOGUE_PAGES identical requests), as an honest non-read.
+        page_key = tuple(json.dumps([(p or {}).get("id"), (p or {}).get("handle"), (p or {}).get("title")],
+                                    default=str) for p in payload)
+        if page_key in seen_pages:
+            return CatalogueRead(CATALOGUE_INCOMPLETE, set(), total,
+                                 f"page {page} repeated an earlier page; pagination did not advance")
+        seen_pages.add(page_key)
         total += len(payload)
         for product in payload:
             handle = str((product or {}).get("handle") or "").strip().lower()

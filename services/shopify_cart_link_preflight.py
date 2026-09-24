@@ -997,6 +997,7 @@ async def _resolve_from_catalog(
     every hop). Following redirects matters: robinsons.com.sg 301s this path to another host,
     and the first probe mistook that for no catalog."""
     many_variants = False
+    seen_pages: set = set()
     for page in range(1, MAX_CATALOG_PAGES + 1):
         landing = await _fetch_following(
             client,
@@ -1018,6 +1019,15 @@ async def _resolve_from_catalog(
             return
         if not products:
             break  # end of catalog
+        # A store that ignores ?page serves page 1 forever; with no short-page stop, absence can no
+        # longer be proven there, so say so at once instead of re-reading it to MAX_CATALOG_PAGES.
+        page_key = tuple(json.dumps([p.get("id"), p.get("handle"), p.get("title"),
+                                     [v.get("id") for v in p.get("variants") or [] if isinstance(v, dict)]],
+                                    default=str) if isinstance(p, dict) else "" for p in products)
+        if page_key in seen_pages:
+            res.verdict, res.detail = Verdict.VARIANT_UNVERIFIED, "pagination_stalled"
+            return
+        seen_pages.add(page_key)
         for product in products:
             if not isinstance(product, dict):
                 continue

@@ -122,6 +122,14 @@ def test_a_short_page_mid_catalogue_is_not_the_end():
     assert len(client.urls) == 3
 
 
+def test_a_store_that_ignores_page_is_an_incomplete_read_not_eighty_requests():
+    same = _page(["a", "b"])
+    client = _CannedClient([same, _page(["a", "b"])])
+    read = _run(liveness.read_brand_catalogue(client, "brand.com"))
+    assert read.status == liveness.CATALOGUE_INCOMPLETE and not read.usable
+    assert "did not advance" in read.note and len(client.urls) == 2
+
+
 def test_a_real_429_is_still_retried():
     """Without the challenge header, 429 keeps its ordinary back-off-and-retry treatment."""
     client = _CannedClient([httpx.Response(429), _page(["a"]), _page([])])
