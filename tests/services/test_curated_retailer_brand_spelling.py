@@ -119,6 +119,51 @@ def test_a_vendor_naming_the_store_is_still_refused_in_retailer_mode():
         brand_on("sokoglam.com", "Soko Glam", "Soko Glam")
 
 
+# ---- US top-100 families (measured 2026-09-24) -------------------------------------------------
+
+@pytest.mark.parametrize("vendor,want", [
+    ("Tom Ford", "Tom Ford Beauty"), ("TOM FORD", "Tom Ford Beauty"), ("Tom Ford Beauty", "Tom Ford Beauty"),
+    ("Christian Dior", "Dior"), ("DIOR", "Dior"),
+    ("Yves Saint Laurent", "YSL"), ("YSL Beauty", "YSL"),
+    ("Jo Malone London", "Jo Malone"), ("JO MALONE", "Jo Malone"),
+    ("Lancome", "Lancôme"), ("LANCÔME", "Lancôme"),
+    ("Estee Lauder", "Estée Lauder"), ("Estée Lauder", "Estée Lauder"),
+    ("Kiehl's", "Kiehl's Since 1851"), ("Kiehl's Since 1851", "Kiehl's Since 1851"),
+    ("Dolce & Gabbana", "Dolce and Gabbana"), ("Dolce and Gabbana", "Dolce and Gabbana"),
+    ("L'Oréal Paris", "L'Oreal Paris"), ("L'Oreal Paris", "L'Oreal Paris"),
+    ("Tresemme", "TRESemmé"), ("Avene", "Avène"), ("Kerastase", "Kérastase"),
+])
+def test_a_us_store_spelling_converges_on_the_catalogs(vendor, want):
+    assert brand_on("perfumania.com", vendor, None) == want
+
+
+def test_an_accent_is_a_brand_split_without_the_family():
+    """Why the accent families exist: the identity key keeps accents."""
+    assert make_content_key("Lancome", "Idole Eau de Parfum", None) != make_content_key("Lancôme", "Idole Eau de Parfum", None)
+    assert make_content_key(brand_on("perfumania.com", "Lancome", None), "Idole Eau de Parfum", None) == \
+        make_content_key("Lancôme", "Idole Eau de Parfum", None)
+
+
+@pytest.mark.parametrize("vendor", ["TF", "Tom Ford Men", "Dior Homme Parfums", "L'Oréal Professionnel", "REVIVE COLLAGEN"])
+def test_a_neighbour_of_a_us_family_keeps_its_own_name(vendor):
+    """Only listed spellings join: a sub-line or a different maker is never absorbed."""
+    assert brand_on("retailer.com", vendor, None) == vendor
+
+
+@pytest.mark.parametrize("host,vendor,override,want", [
+    ("yslbeautyus.com", "Yves Saint Laurent", "YSL", "YSL"),
+    ("jomalone.com", "Jo Malone London", "Jo Malone London", "Jo Malone"),
+    ("lancome-usa.com", "Lancome", "Lancome", "Lancôme"),
+    ("dior.com", "Christian Dior", "Dior", "Dior"),
+    ("kiehls.com", "Kiehl's", "Kiehl's", "Kiehl's Since 1851"),
+    ("tomfordbeauty.com", "TF", "Tom Ford Beauty", "TF"),   # "TF" is not a listed spelling
+])
+def test_a_brand_official_store_writes_the_us_familys_spelling(host, vendor, override, want):
+    rec = feed.shopify_product_to_record(product(vendor), domain=host, category_path="beauty/skincare",
+                                         brand_override=override, currency="USD", source_role="brand_official")
+    assert rec["pdp"]["brand"] == want
+
+
 # 2026-09-24, JP/AU coverage census: the same maker spelt with and without its accent across stores.
 # Real (host, vendor) pairs from the probe; each family must write ONE spelling, so one product sold at
 # two stores gets ONE content key.

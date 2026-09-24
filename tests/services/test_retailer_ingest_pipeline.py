@@ -741,3 +741,19 @@ async def test_multi_brand_writes_each_vendors_canonical_spelling(env, monkeypat
 def test_multi_brand_spellings_and_fetch_budget_are_validated(options):
     with pytest.raises(ValueError):
         pipeline.validate_options(dict(options))
+
+
+@pytest.mark.parametrize("brands,ok", [
+    ({"Lancome": "Lancôme"}, True),                # a measured family, named by its own spelling
+    ({"Christian Dior": "Dior"}, True),
+    ({"Dior": "Chanel"}, False),                   # a family vendor mapped outside its family: ignored
+    ({"Lancome": "Lancome Paris"}, False),
+    ({"Chanel": "Dior"}, False),                   # not a respelling
+])
+def test_a_family_vendor_can_only_be_mapped_within_its_family(brands, ok):
+    options = {"vendors": list(brands), "multi_brand": True, "brands": brands}
+    if ok:
+        pipeline.validate_options(options)
+    else:
+        with pytest.raises(ValueError, match="ignored"):
+            pipeline.validate_options(options)
