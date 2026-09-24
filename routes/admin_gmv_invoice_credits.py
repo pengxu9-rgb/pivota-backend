@@ -6,8 +6,15 @@ Approving issues the credit note at once (against the amount due on an open invo
 customer's Stripe balance on a paid one; never a cash refund).
 
 AUTH: the guard is on the ROUTER (`dependencies=[Depends(require_admin)]`), so a handler added to
-this file later inherits it instead of shipping open. Handlers that record WHO acted also take
-`require_admin` as a parameter to read the identity; FastAPI caches the dependency per request.
+this file later inherits it instead of shipping open. Reading (list, summary, detail, compute) needs
+only that. DECIDING (approve, issue, cancel: sending a credit note to Stripe, or deciding a merchant
+is not owed one) also needs `require_credit_approver`: an explicit `billing.credits.approve` grant,
+read LIVE from the employee's row on every call, so no admin holds it by role (super_admin
+included) and a revoked grant or a demotion stops working at once, not when the 24-hour token
+expires. Grant it with:
+
+    UPDATE employees SET permissions = permissions || '["billing.credits.approve"]'::jsonb
+    WHERE LOWER(email) = LOWER('<approver>') AND role IN ('admin', 'super_admin');
 """
 
 from __future__ import annotations
@@ -22,7 +29,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, field_v
 
 from db.database import database
 from services import gmv_invoice_credits as credits
-from utils.auth import require_admin
+from utils.auth import ADMIN_ROLES, BILLING_CREDITS_APPROVE, permissions_grant, require_admin
 
 router = APIRouter(
     prefix="/admin/billing/invoice-credits",
@@ -50,6 +57,29 @@ LIMIT 200
 
 def _actor(admin: Dict[str, Any]) -> str:
     return str(admin.get("email") or admin.get("sub") or "admin")
+
+
+def _missing_permission() -> HTTPException:
+    return HTTPException(status_code=403, detail={"error": "MISSING_PERMISSIONS", "missing": [BILLING_CREDITS_APPROVE]})
+
+
+async def require_credit_approver(admin: Dict[str, Any] = Depends(require_admin)) -> Dict[str, Any]:
+    """An admin whose employee row, read NOW, is active, still an admin, and explicitly granted
+    billing.credits.approve. The token's own role and permissions claims are not trusted for this:
+    they last 24 hours, and an employee edit wipes the membership copy of permissions."""
+    from routes.auth import _fetch_active_employee_identity  # the login's own lookup: one rule
+
+    email = str(admin.get("email") or "").strip()
+    if not email:
+        raise _missing_permission()
+    try:
+        employee = await _fetch_active_employee_identity(email)
+    except Exception:  # noqa: BLE001 -- fail closed, and say so: this is not a missing grant
+        raise HTTPException(status_code=503, detail="could not verify the approver's permission; retry") from None
+    if not employee or employee.get("role") not in ADMIN_ROLES \
+            or not permissions_grant(employee.get("permissions"), BILLING_CREDITS_APPROVE):
+        raise _missing_permission()
+    return admin
 
 
 async def _credit_or_404(credit_id: int) -> Dict[str, Any]:
@@ -116,7 +146,7 @@ async def credit_detail(credit_id: int):
 
 
 @router.post("/{credit_id}/approve", response_model=None)
-async def approve_credit(credit_id: int, body: ApproveBody, admin: Dict[str, Any] = Depends(require_admin)):
+async def approve_credit(credit_id: int, body: ApproveBody, admin: Dict[str, Any] = Depends(require_credit_approver)):
     """Approve a pending credit at the reviewed amount and issue it to Stripe now."""
     credit = await _credit_or_404(credit_id)
     if credit.get("status") != "pending":
@@ -145,7 +175,7 @@ async def approve_credit(credit_id: int, body: ApproveBody, admin: Dict[str, Any
 
 
 @router.post("/{credit_id}/issue", response_model=None)
-async def retry_issue(credit_id: int, admin: Dict[str, Any] = Depends(require_admin)):
+async def retry_issue(credit_id: int, admin: Dict[str, Any] = Depends(require_credit_approver)):
     """Retry a credit Stripe refused (`failed`), or one left `issuing` by a crash. Records who."""
     credit = await _credit_or_404(credit_id)
     result = await credits.issue(credit_id, by=_actor(admin))
@@ -155,7 +185,7 @@ async def retry_issue(credit_id: int, admin: Dict[str, Any] = Depends(require_ad
 
 
 @router.post("/{credit_id}/cancel", response_model=None)
-async def cancel_credit(credit_id: int, body: CancelBody, admin: Dict[str, Any] = Depends(require_admin)):
+async def cancel_credit(credit_id: int, body: CancelBody, admin: Dict[str, Any] = Depends(require_credit_approver)):
     credit = await _credit_or_404(credit_id)
     # `issuing` too: a STALE one (an interrupted issue or cancel) is cancellable after a Stripe check;
     # the service refuses a fresh one, which an issue is still working on.

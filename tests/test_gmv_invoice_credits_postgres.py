@@ -27,7 +27,7 @@ _IS_PG = DATABASE_URL.startswith("postgresql://") or DATABASE_URL.startswith("po
 pytestmark = pytest.mark.skipif(not _IS_PG, reason="needs a Postgres DATABASE_URL")
 
 _SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")
-_TABLES = ("gmv_invoice_credits", "partner_settlement_completions", "agent_share_ledger", "agent_share_rates",
+_TABLES = ("employees", "gmv_invoice_credits", "partner_settlement_completions", "agent_share_ledger", "agent_share_rates",
            "partner_balance_ledger",
            "partner_balance", "settlement_snapshots", "billing_run_items", "invoice_disputes", "invoices",
            "billing_runs", "gmv_attribution_daily", "commerce_attribution_edges")
@@ -78,6 +78,11 @@ async def _build_schema(database):
         "ADD COLUMN channel_partner_id BIGINT, ADD COLUMN take_rate_applied_bp SMALLINT, "
         "ADD COLUMN refund_amount_cents BIGINT NOT NULL DEFAULT 0, ADD COLUMN refunded_at TIMESTAMPTZ"
     )
+    # employees as the approver check reads it: 031's table, 040's permissions column.
+    for stmt in split_statements((_MIG / "031_create_employees_table.sql").read_text(encoding="utf-8")):
+        await database.execute(stmt)
+    await database.execute(
+        "ALTER TABLE IF EXISTS employees ADD COLUMN IF NOT EXISTS permissions JSONB NOT NULL DEFAULT '[]'::jsonb")
     names = ("110_gmv_attribution_daily.sql",) + _BILLING + _PARTNER + (
         "235_agent_share_accrual.sql", "236_agent_share_after_partner.sql", "238_gmv_invoice_credits.sql")
     for name in names:
@@ -715,8 +720,18 @@ async def test_a_credit_with_no_channel_partner_is_not_applicable(db, fake_strip
 # ── the admin routes ───────────────────────────────────────────────────────────────────────────
 
 
-@pytest.fixture
-async def admin_client():
+async def _employee(db, email="ops@pivota", *, role="admin", permissions=("billing.credits.approve",),
+                    status="active"):
+    await db.execute(
+        "INSERT INTO employees (employee_id, name, email, role, status, permissions) "
+        "VALUES (:id, :n, :e, :r, :s, CAST(:p AS jsonb)) "
+        "ON CONFLICT (email) DO UPDATE SET role = EXCLUDED.role, status = EXCLUDED.status, "
+        "permissions = EXCLUDED.permissions",
+        {"id": f"emp_{email}", "n": email, "e": email, "r": role, "s": status, "p": json.dumps(list(permissions))})
+
+
+def _client_as(email="ops@pivota", role="admin"):
+    """An app whose token says `role` for `email`. The approver check still reads the employee row."""
     from fastapi import FastAPI
 
     from routes.admin_gmv_invoice_credits import router
@@ -724,8 +739,14 @@ async def admin_client():
 
     app = FastAPI()
     app.include_router(router)
-    app.dependency_overrides[require_admin] = lambda: {"email": "ops@pivota", "role": "admin"}
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+    app.dependency_overrides[require_admin] = lambda: {"email": email, "role": role}
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
+
+
+@pytest.fixture
+async def admin_client(db):
+    await _employee(db)  # ops@pivota: an admin granted billing.credits.approve
+    async with _client_as() as client:
         yield client
 
 
@@ -1034,3 +1055,85 @@ async def test_the_nightly_sweep_credits_nothing_for_an_invoiced_group_whose_gro
 
     await reroll_stale_days()
     assert await _credits(db) == []
+
+
+# ── who may decide a credit: billing.credits.approve, read live ──────────────────────────────────
+
+_BASE = "/admin/billing/invoice-credits"
+
+
+async def _decisions(client, credit_id):
+    return {
+        "approve": (await client.post(f"{_BASE}/{credit_id}/approve", json={"amount_cents": 250})).status_code,
+        "issue": (await client.post(f"{_BASE}/{credit_id}/issue")).status_code,
+        "cancel": (await client.post(f"{_BASE}/{credit_id}/cancel", json={"reason": "no"})).status_code,
+    }
+
+
+@pytest.mark.parametrize("role", ["admin", "super_admin"])
+async def test_an_admin_without_the_grant_can_read_but_not_decide(db, fake_stripe, role):
+    """No role implies the permission, super_admin included."""
+    credit, line, _, _ = await _pending_credit(db)
+    await _employee(db, "boss@pivota", role=role, permissions=())
+    async with _client_as("boss@pivota", role) as client:
+        assert (await client.get(_BASE)).status_code == 200
+        assert (await client.get(f"{_BASE}/{credit['id']}")).status_code == 200
+        decisions = await _decisions(client, credit["id"])
+        denied = await client.post(f"{_BASE}/{credit['id']}/approve", json={"amount_cents": 250})
+
+    assert decisions == {"approve": 403, "issue": 403, "cancel": 403}
+    assert denied.json()["detail"] == {"error": "MISSING_PERMISSIONS", "missing": ["billing.credits.approve"]}
+    assert [c["status"] for c in await _credits(db, line)] == ["pending"] and fake_stripe.created == []
+
+
+@pytest.mark.parametrize("grant", ["billing.credits.approve", "billing.credits.*", "billing.*"])
+async def test_the_grant_or_a_wildcard_over_it_lets_an_admin_decide(db, fake_stripe, grant):
+    credit, _, _, _ = await _pending_credit(db)
+    await _employee(db, "billing@pivota", permissions=("reviews.read", grant))
+    async with _client_as("billing@pivota") as client:
+        r = await client.post(f"{_BASE}/{credit['id']}/approve", json={"amount_cents": 250})
+    assert r.status_code == 200 and r.json()["issue"]["status"] == "issued"
+
+
+async def test_a_neighbouring_permission_does_not_grant_it(db, fake_stripe):
+    credit, _, _, _ = await _pending_credit(db)
+    await _employee(db, "billing@pivota", permissions=("billing.credits.read", "billing.credit.approve", "reviews.*"))
+    async with _client_as("billing@pivota") as client:
+        assert (await _decisions(client, credit["id"])) == {"approve": 403, "issue": 403, "cancel": 403}
+
+
+async def test_revoking_or_demoting_takes_effect_on_the_next_call_not_at_token_expiry(db, fake_stripe):
+    """The token still says admin with the grant; the employee row no longer does."""
+    credit, _, _, _ = await _pending_credit(db)
+    await _employee(db, "billing@pivota")
+    async with _client_as("billing@pivota") as client:
+        await _employee(db, "billing@pivota", permissions=())  # grant revoked
+        revoked = (await client.post(f"{_BASE}/{credit['id']}/approve", json={"amount_cents": 250})).status_code
+        await _employee(db, "billing@pivota", role="employee")  # grant back, but demoted
+        demoted = (await client.post(f"{_BASE}/{credit['id']}/approve", json={"amount_cents": 250})).status_code
+        await _employee(db, "billing@pivota", status="inactive")  # admin again, but deactivated
+        inactive = (await client.post(f"{_BASE}/{credit['id']}/approve", json={"amount_cents": 250})).status_code
+    assert (revoked, demoted, inactive) == (403, 403, 403)
+    assert fake_stripe.created == []
+
+
+async def test_a_token_whose_email_has_no_employee_row_cannot_decide(db, fake_stripe):
+    credit, _, _, _ = await _pending_credit(db)
+    async with _client_as("stranger@pivota") as client:
+        assert (await _decisions(client, credit["id"])) == {"approve": 403, "issue": 403, "cancel": 403}
+
+
+async def test_an_unreadable_employee_row_fails_closed_with_503(db, fake_stripe, monkeypatch):
+    import routes.auth as auth_routes
+
+    credit, line, _, _ = await _pending_credit(db)
+    await _employee(db)
+
+    async def _down(email):
+        raise ConnectionError("db down")
+
+    monkeypatch.setattr(auth_routes, "_fetch_active_employee_identity", _down)
+    async with _client_as() as client:
+        r = await client.post(f"{_BASE}/{credit['id']}/approve", json={"amount_cents": 250})
+    assert r.status_code == 503
+    assert [c["status"] for c in await _credits(db, line)] == ["pending"]
