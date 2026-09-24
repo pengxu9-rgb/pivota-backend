@@ -411,3 +411,24 @@ def test_no_seed_in_the_repo_list_is_a_sample_gift_or_trial_by_its_handle():
 
     unfit = [(m.domain, m.product_handle) for m in load_merchants() if hints.is_unfit(None, m.product_handle)]
     assert unfit == []
+
+
+async def test_a_short_page_is_not_the_end_and_a_repeated_page_is():
+    # bluemercury.com, 2026-09-24: page 1 = 249, page 2 = 250 -- a short page is not the end.
+    short_then_lip = [[product(4, "Hydrating Cream", "cream", variants=[var(41)])],
+                      [product(5, "Tinted Lip Balm", "lip-balm", variants=[var(52)])]]
+    shop = Shop(catalog=short_then_lip)
+    async with shop.client() as client:
+        ranked = await hints.rank_replacements(client, "x.com", "US", max_pages=5)
+    assert [c["product_handle"] for c in ranked] == ["lip-balm", "cream"]
+    # A store that ignores ?page repeats page 1: read once, never counted twice.
+    class Stuck(Shop):
+        def handle(self, request):
+            if request.url.path == "/products.json":
+                self.requests.append(request)
+                return httpx.Response(200, json={"products": [product(4, "Hydrating Cream", "cream", variants=[var(41)])]})
+            return super().handle(request)
+    stuck = Stuck()
+    async with stuck.client() as client:
+        ranked = await hints.rank_replacements(client, "x.com", "US", max_pages=5)
+    assert [c["product_handle"] for c in ranked] == ["cream"] and len(stuck.requests) == 2
