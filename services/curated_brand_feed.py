@@ -69,6 +69,47 @@ def _page_attempts() -> int:
 # priced under a dollar; a floor this low cannot drop a real product.
 MIN_SELLABLE_PRICE = 1.0
 
+# Gift-with-purchase / free-sample items a store lists with a NOMINAL price, so the $1 floor above keeps them
+# (measured 2026-09-24: westman-atelier.com's $26 "Blush Stick" deluxe GWP mini, tagged `gwp`). Census
+# 2026-09-24, 24,523 products across 54 US stores: these EXACT tag tokens (casefolded, whole tag) mark only
+# gifts -- and a SUBSTRING match is not safe: paid products carry `solo_gwp_elta_pca`,
+# `rationale_4_eye_cream_gwp`, `excludefromgwp:sitewide`. Tags that LOOK related but mark sellable products and
+# must never be added here: yblocklist, searchanise_ignore, gorgias_do_not_recommend, brand promo, freesample
+# (Sol de Janeiro $26 mists), sample (travel sprays), free-gifts / free_gifts (perfumania $24.95 sets),
+# "sets not for sale" (sokoglam $199 routines). Measured cost of this rule on the census: 0 sellable dropped.
+GIFT_WITH_PURCHASE_TAGS = frozenset({
+    "gwp", "filter::type_gwp", "filter::type_sample", "_free_gift", "_free_gift_sample", "checkout-sample",
+    "motivator_hidden_product", "gwp:brand", "gwp:sitewide", "subscription gwp", "gwp-choice",
+    "gift with purchase",
+})
+# Titles that mark a paid-listed gift no tag marks: an EXACT "[FREE GIFT]" / "[FREE SAMPLE]" bracket, or an
+# unbracketed "FREE GIFT" / "FREE SAMPLE" followed by a dash or colon ("FREE GIFT - SkinMedica ... Sample"),
+# "... Gift with Purchase", "Loyalty Reward - ...". NOT a bare leading "Free" (ezenzia sells "Free Random
+# Fragrance" at $19.99), NOT "[Free Gift Set]" -- a product SOLD WITH a gift (dodoskin "[Free Gift Set] beaund
+# Nmode Pro + Booster Gel", $159). A title carrying "+" is such a bundle ("[Free Gift] 1+1 SAMJIWON ... + FREE
+# medicube Mask", $79) and is always kept (_GIFT_BUNDLE).
+_GIFT_WITH_PURCHASE_TITLE = re.compile(
+    r"^\[\s*free\s+(?:gift|sample)s?\s*\]|^free\s+(?:gift|sample)s?\s*[-–—:]|\bgift\s+with\s+purchase\b"
+    r"|^loyalty\s+reward\b", re.I)
+_GIFT_BUNDLE = re.compile(r"\+")
+# NOT the merchant product type: `GWP`-typed items include in-stock full-size products (elizabetharden.com
+# PREVAGE set $169, night capsules $99; beautybrands $44.99 hair dryer) -- measured 2026-09-25. Known gap.
+
+
+def gift_with_purchase_reason(product: Dict[str, Any]) -> Optional[str]:
+    """Why this Shopify product is a gift/sample rather than something a buyer can order, or None."""
+    raw = product.get("tags")
+    tags = raw if isinstance(raw, list) else str(raw or "").split(",")
+    tokens = {str(t).strip().casefold() for t in tags if str(t).strip()}
+    hit = sorted(tokens & GIFT_WITH_PURCHASE_TAGS)
+    if hit:
+        return f"tag:{hit[0]}"
+    title = str(product.get("title") or "").strip()
+    if _GIFT_BUNDLE.search(title):
+        return None  # sold WITH a gift, not a gift
+    m = _GIFT_WITH_PURCHASE_TITLE.search(title)
+    return f"title:{m.group(0).strip()}" if m else None
+
 # The axis a variant varies on, named the way the shop names it. Shopify reports
 # a product's axes in `options`, and `option1` is a value on the FIRST of them.
 # A shop with no axis at all reports the placeholder "Title" / "Default Title",
@@ -2615,6 +2656,18 @@ async def records_for_brand(
         records_for_brand.last_vendor_filter_report = {  # type: ignore[attr-defined]
             "vendors": list(only_vendors), "before": before, "after": len(products),
         }
+    # Gifts go BEFORE GTIN recovery and shade folding, so a gift costs no PDP fetch. Recorded, never silent.
+    gifts_dropped: List[Dict[str, Any]] = []
+    kept_products = []
+    for p in products:
+        gift = gift_with_purchase_reason(p)
+        if gift:
+            gifts_dropped.append({"handle": str(p.get("handle") or "")[:200], "title": str(p.get("title") or "")[:200],
+                                  "reason": gift[:120]})
+        else:
+            kept_products.append(p)
+    if gifts_dropped:
+        products = kept_products
     identity_report = None
     if enrich_missing_gtin:
         products, identity_report = await recover_missing_variant_gtins(
@@ -2696,7 +2749,9 @@ async def records_for_brand(
         records_for_brand.last_brand_spelling_folds = canonical  # type: ignore[attr-defined]
     else:
         records_for_brand.last_brand_spelling_folds = {}  # type: ignore[attr-defined]
-    report = {**crawl_report, "emitted_records": len(records)} if crawl_report is not None else None
+    report = {**crawl_report, "emitted_records": len(records),
+              "gift_items_dropped": len(gifts_dropped),
+              "gift_items_dropped_sample": gifts_dropped[:50]} if crawl_report is not None else None
     if report is not None and identity_report is not None:
         report["gtin_recovery"] = identity_report
     return CuratedRecordBatch(records, crawl_report=report)
