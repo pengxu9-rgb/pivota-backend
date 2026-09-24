@@ -565,7 +565,7 @@ async def test_a_brand_official_cohort_applies_with_brand_authority(env, monkeyp
     monkeypatch.setattr(feed, "records_for_brand", fetch)
     # k-touch.us is not named 3CE: held until a human says it is 3CE's own store.
     assert (await pipeline.run_stage(job(source_role="brand_official"), db=env.db))["status"] == "held"
-    accept = ["brand_official_domain_unproven:k-touch.us"]
+    accept = ["brand_official_domain_unproven:k-touch.us:3ce"]
     assert (await pipeline.run_stage(job(source_role="brand_official", accepted_flags=accept),
                                      db=env.db))["status"] == "apply_due"
     out = await pipeline.run_stage(job("apply_due", source_role="brand_official", accepted_flags=accept), db=env.db)
@@ -619,3 +619,26 @@ async def test_the_retailer_default_raises_no_domain_flag(env):
     await pipeline.run_stage(j, db=env.db)
     run = list(env.ledger.runs.values())[-1]
     assert not [f for f in run.get("flags") or [] if f["rule"].startswith("brand_official")]
+
+
+async def test_naming_the_store_as_the_brand_cannot_write_another_brands_rows(env, monkeypatch):
+    """Review round 2: brand="K-Touch" owns k-touch.us, but the records' brand is their vendor (3CE),
+    whose canonical keys they would overwrite. Every written brand must own the host."""
+    def official(title, ptype, handle):
+        return feed.shopify_product_to_record(
+            {"id": abs(hash(handle)) % 10**9, "vendor": "3CE", "title": title, "handle": handle,
+             "product_type": ptype, "body_html": "<p>x</p>", "images": [{"src": "https://cdn.example/i.jpg"}],
+             "variants": [{"id": abs(hash(handle + "v")) % 10**12, "price": "20.00", "available": True, "sku": handle}]},
+            domain="k-touch.us", category_path="beauty", brand_override="K-Touch", currency="USD",
+            source_role="brand_official", emit_native_variants=True)
+
+    async def fetch(**kw):
+        return feed.ShopifyProductBatch([official(*TINT)], scanned_products=1, pages=1)
+    monkeypatch.setattr(feed, "records_for_brand", fetch)
+    j = job(source_role="brand_official")
+    j["brand"] = "K-Touch"
+    out = await pipeline.run_stage(j, db=env.db)
+    assert out["status"] == "held"
+    run = list(env.ledger.runs.values())[-1]
+    assert [f["key"] for f in run["flags"] if f["rule"] == "brand_official_domain_unproven"] == [
+        "brand_official_domain_unproven:k-touch.us:3ce"]

@@ -94,32 +94,38 @@ def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
     return options
 
 
-def brand_official_domain_flags(domain: str, brand: str) -> List[Dict[str, Any]]:
-    """A brand_official cohort writes the brand's CANONICAL rows: its product keys derive from
-    (brand, product name) alone, so the same product at any host lands on the same key, and the
-    upsert re-points that key's source_domain / canonical_url / payload at this host and labels its
-    INCI brand-official. Nothing downstream checks that the host is the brand's (the legacy-listing
-    report and the native-variant rule look only at ext:retailer: keys; the brand-host guard looks
-    only at the same host), and a clean dry run auto-applies. So the host must PROVE it is the brand's:
+def brand_official_domain_flags(domain: str, brands: List[str]) -> List[Dict[str, Any]]:
+    """A brand_official cohort writes CANONICAL rows: a product's key derives from (brand, product
+    name) alone -- and its brand is the product's own VENDOR, not the job's `brand` -- so the same
+    product at any host lands on the same key, and the upsert re-points that key's source_domain /
+    canonical_url / payload at this host and labels its INCI brand-official. Nothing downstream checks
+    that the host is the brand's (the legacy-listing report and the native-variant rule look only at
+    ext:retailer: keys; the brand-host guard only at the same host), and a clean dry run auto-applies.
+    So the host must PROVE it is the store of EVERY brand the cohort would write (`brands`: the job's
+    brand and each record's):
 
       * a known retailer host can never be a brand's own store (not acceptable -- fix the job);
-      * otherwise the domain's name must BE the brand (offer_seller_identity.brand_owns_domain, the
+      * otherwise the domain's name must BE that brand (offer_seller_identity.brand_owns_domain, the
         rule that types an offer brand_direct), or a human accepts the flag (tartecosmetics.com for
         "Tarte", k18hair.com for "K18"): held, never auto-applied.
     """
-    from services.offer_seller_identity import brand_owns_domain, is_known_retailer
+    from services.offer_seller_identity import brand_owns_domain, is_known_retailer, normalize_brand
 
     if is_known_retailer(domain):
         return [{"key": "brand_official_on_a_retailer", "rule": "brand_official_on_a_retailer",
                  "severity": detectors.BLOCK, "acceptable": False,
                  "detail": f"{domain} is a known retailer; source_role brand_official would overwrite "
-                           f"{brand}'s canonical rows with this retailer's listings"}]
-    if brand_owns_domain(brand, domain):
-        return []
-    return [{"key": f"brand_official_domain_unproven:{domain}", "rule": "brand_official_domain_unproven",
-             "severity": detectors.BLOCK,
-             "detail": f"the domain name of {domain} is not the brand {brand!r}; accept this key only if "
-                       f"{domain} is {brand}'s own store (its rows become {brand}'s canonical rows)"}]
+                           f"canonical rows of {sorted(set(brands))} with this retailer's listings"}]
+    flags: Dict[str, Dict[str, Any]] = {}
+    for brand in brands:
+        if brand_owns_domain(brand, domain):
+            continue
+        key = f"brand_official_domain_unproven:{domain}:{normalize_brand(brand) or '-'}"
+        flags.setdefault(key, {
+            "key": key, "rule": "brand_official_domain_unproven", "severity": detectors.BLOCK,
+            "detail": f"the domain name of {domain} is not the brand {brand!r}; accept this key only if "
+                      f"{domain} is {brand}'s own store (its rows become {brand}'s canonical rows)"})
+    return list(flags.values())
 
 
 def _feed_payload(job: Dict[str, Any]) -> Dict[str, Any]:
@@ -273,7 +279,9 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
     checks: Dict[str, Any] = {"crawl": getattr(records, "crawl_report", None), "selected": len(records)}
     flags: List[Dict[str, Any]] = []
     if o.get("source_role") == "brand_official":
-        flags.extend(brand_official_domain_flags(job["domain"], job["brand"]))
+        # Every brand the cohort would write: the job's, and each record's own (its vendor's).
+        written = [job["brand"]] + sorted({str((r.get("pdp") or {}).get("brand") or "") for r in records} - {""})
+        flags.extend(brand_official_domain_flags(job["domain"], written))
 
     excluded = {str(h).strip().strip("/").casefold() for h in (o.get("exclude_handles") or []) if str(h).strip()}
     if excluded:
