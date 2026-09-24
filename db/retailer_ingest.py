@@ -86,7 +86,9 @@ _CLAIM_SQL = """
           AND regexp_replace(lower(domain), '^www[.]', '') NOT IN (SELECT host FROM busy)
           -- catalog writes stay serial: an apply waits while any other apply is in flight
           AND NOT (status = 'apply_due' AND EXISTS (SELECT 1 FROM busy WHERE busy.status = 'apply_due'))
-        ORDER BY priority DESC, next_run_at, created_at
+        -- within a priority, finish paid-for work first: a clean dry run's apply frees a cohort slot,
+        -- a new dry run starts more work (2026-09-24: a clean apply waited 9h behind older dry runs)
+        ORDER BY priority DESC, (status = 'apply_due') DESC, next_run_at, created_at
         LIMIT 1
         FOR UPDATE SKIP LOCKED
     )
@@ -116,7 +118,7 @@ def max_leases_from_env() -> int:
 async def claim_due_job(*, lease_seconds: int, max_leases: int = 1, db: Any = None) -> Optional[Dict[str, Any]]:
     """Claim ONE due job, or None. Up to `max_leases` stages run at once (default 1), never two at one
     host (a shared crawl IP stays polite to each store) and never two applies (catalog writes stay
-    serial).
+    serial). Among due jobs, higher priority first; within a priority, an apply before a dry run.
 
     Two statements in one transaction, not one: the lane lock must be held BEFORE the claim takes
     its snapshot. A single statement snapshots first and locks second, so a claim that wins the
