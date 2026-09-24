@@ -594,6 +594,26 @@ async def register_agent(data: AgentRegisterRequest, http_request: Request):
         )
 
 
+async def _is_active_staff_account(user) -> bool:
+    """Whether a non-agent users row is staff whose role an employee sync rewrote.
+
+    users holds ONE role per email, and an employee-portal login or reset rewrites it
+    to the employee role (routes/auth._sync_employee_auth_user), so an agent owner who
+    is also staff stops being role='agent' while still owning the agent. That is the
+    only rewrite admitted: the email must be a staff role AND an active employees row,
+    both of which only admins set. Owning the agents row alone is NOT enough, because a
+    merchant can move their own login email onto an unclaimed agent owner_email
+    (PUT /merchant/profile) and would then log in as that agent; and an admin moving
+    an email off role='agent' (admin_fix_merchant) must keep revoking the portal.
+    """
+    from routes.auth import EMPLOYEE_AUTH_ROLES, _fetch_active_employee_identity
+
+    role = (user["role"] or "").strip().lower()
+    if role not in EMPLOYEE_AUTH_ROLES:
+        return False
+    return bool(await _fetch_active_employee_identity(user["email"]))
+
+
 @router.post("/login", response_model=AgentLoginResponse)
 async def login_agent(data: AgentLoginRequest):
     """Agent login"""
@@ -626,14 +646,9 @@ async def login_agent(data: AgentLoginRequest):
             {"email": email}
         )
 
-        # users holds ONE role per email, and an employee login or reset rewrites it
-        # (routes/auth._sync_employee_auth_user), so an agent owner who is also staff
-        # stops being role='agent' while still owning the agent. Owning the agents row
-        # is the agent membership: the forgot/reset flow already accepts it
-        # (_email_has_portal_membership), so login must too.
+        if user["role"] != "agent" and not (agent and await _is_active_staff_account(user)):
+            raise HTTPException(status_code=403, detail="This login is for agents only")
         if not agent:
-            if user["role"] != "agent":
-                raise HTTPException(status_code=403, detail="This login is for agents only")
             raise HTTPException(status_code=404, detail="Agent record not found")
         
         # databases.Record → plain dict for safe .get() usage
