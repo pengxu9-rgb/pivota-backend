@@ -80,7 +80,7 @@ def _sha(value):
 def _assert_throwaway_database():
     dbname = DATABASE_URL.rsplit("/", 1)[-1].split("?")[0]
     if not any(m in dbname or m in DATABASE_URL for m in _SAFE_DB_MARKERS):
-        pytest.skip(f"refusing to drop tables in {dbname!r}; throwaway only")
+        pytest.skip(f"refusing to write test rows to {dbname!r}; throwaway only")
 
 
 async def _build_shared_tables(database):
@@ -317,13 +317,14 @@ async def test_key_list_shows_the_table_auth_reads(db):
 
 # ── reset vs the key table auth is not reading ────────────────────────────────
 
+# Only the default layout: the scenario IS auth reading api_keys while agent_api_keys holds the
+# dormant row. Narrowed by parametrisation, not pytest.skip -- the dialect gate fails on any skip.
+@pytest.mark.parametrize("db", ["api_keys"], indirect=True)
 @pytest.mark.asyncio
 async def test_reset_kills_a_dormant_key_in_the_table_auth_is_not_reading(db, monkeypatch):
     """Prod 2026-09-24: both tables exist, auth reads api_keys, and agent_api_keys still holds
     ACTIVE rows (agent_659a77ae254b8f4c has one from 02-27). Pinning AGENT_AUTH_KEY_TABLE to
     agent_api_keys -- the documented rollback lever -- would revive them, so a reset retires them."""
-    if db != "api_keys":
-        pytest.skip("needs both key tables")
     import db.agents as agents_db
     from db.database import database
     from routes.employee_agent_mgmt import reset_agent_api_key

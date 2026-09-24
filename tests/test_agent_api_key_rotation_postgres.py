@@ -55,7 +55,7 @@ def _sha(value):
 def _assert_throwaway_database():
     dbname = DATABASE_URL.rsplit("/", 1)[-1].split("?")[0]
     if not any(m in dbname or m in DATABASE_URL for m in _SAFE_DB_MARKERS):
-        pytest.skip(f"refusing to drop tables in {dbname!r}; throwaway only")
+        pytest.skip(f"refusing to write test rows to {dbname!r}; throwaway only")
 
 
 async def _delete_own_rows(database):
