@@ -61,15 +61,15 @@ class _FakeDb:
         if "to_regclass('public.api_keys')" in q:
             if self.probe_error:
                 raise RuntimeError("connection reset during probe")
+            # other_table_present: the key table auth is NOT resolving to exists too (prod's shape).
+            present = {self.key_table} | ({"api_keys", "agent_api_keys"} if self.other_table_present else set())
             return {
-                "api_keys_table": "api_keys" if self.key_table == "api_keys" else None,
-                "agent_api_keys_table": "agent_api_keys" if self.key_table == "agent_api_keys" else None,
+                "api_keys_table": "api_keys" if "api_keys" in present else None,
+                "agent_api_keys_table": "agent_api_keys" if "agent_api_keys" in present else None,
             }
         if q.startswith("SELECT agent_id FROM agents"):
             agent_id = (values or {}).get("agent_id")
             return {"agent_id": agent_id} if agent_id in self.agents else None
-        if q.endswith("AS present"):  # reset's probe for the key table auth is NOT reading
-            return {"present": "x" if self.other_table_present else None}
         if q.startswith("INSERT INTO api_keys") and q.endswith("RETURNING id"):
             await self.execute(query, values)
             return {"id": 41}
@@ -79,7 +79,7 @@ class _FakeDb:
         q = " ".join(str(query).split())
         if q.startswith("UPDATE") and "RETURNING" in q:  # key-row revokes report what they retired
             await self.execute(query, values)
-            return [{"id": 1}]
+            return [{"key_hash": "retired-hash"}]
         raise AssertionError(f"unexpected fetch_all: {q}")
 
     async def execute(self, query, values=None):

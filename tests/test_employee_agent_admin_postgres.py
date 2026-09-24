@@ -351,3 +351,106 @@ async def test_reset_kills_a_dormant_key_in_the_table_auth_is_not_reading(db, mo
 
     pin("agent_api_keys")
     assert await agents_db.get_agent_by_key(dormant) is None
+
+
+# ── review findings on #2306: a retired key must stay retired ─────────────────
+
+def _pin(monkeypatch, mode):
+    import db.agents as agents_db
+
+    monkeypatch.setattr(agents_db, "_AGENT_AUTH_KEY_TABLE_MODE", mode)
+    monkeypatch.setattr(agents_db, "_AGENT_AUTH_KEY_TABLE_CACHE", {"table": None, "expires_at": 0.0})
+    monkeypatch.setattr(agents_db, "_AGENT_AUTH_CACHE", OrderedDict())
+
+
+async def _employee_retire(op, layout):
+    from routes.employee_agent_mgmt import revoke_agent_api_key, rotate_agent_api_key
+
+    key_id = await _old_key_id(layout)
+    if op == "revoke":
+        await revoke_agent_api_key(AGENT_ID, key_id, current_user=EMPLOYEE)
+    else:
+        await rotate_agent_api_key(AGENT_ID, key_id, current_user=EMPLOYEE)
+
+
+@pytest.mark.parametrize("op", ["revoke", "rotate"])
+@pytest.mark.asyncio
+async def test_login_backfill_cannot_revive_a_retired_key(db, op):
+    """An agent whose agents.api_key still holds the plaintext (routes/agent_management.py /create
+    writes one today) gets it re-activated by /agent/account/login's backfill
+    (_ensure_agent_api_key_on_auth_path) unless retiring the key also clears the column."""
+    from db.agents import get_agent_by_key, is_redacted_agent_api_key
+    from db.database import database
+    from routes.agent_account import _ensure_agent_api_key_on_auth_path
+
+    await database.execute("UPDATE agents SET api_key = :k WHERE agent_id = :a", {"k": OLD_KEY, "a": AGENT_ID})
+
+    await _employee_retire(op, db)
+
+    # What login_agent does with the row (routes/agent_account.py, "legacy_plaintext_key").
+    row = await database.fetch_one("SELECT api_key FROM agents WHERE agent_id = :a", {"a": AGENT_ID})
+    if row["api_key"] and not is_redacted_agent_api_key(row["api_key"]):
+        await _ensure_agent_api_key_on_auth_path(
+            agent_id=AGENT_ID, api_key=row["api_key"], api_key_hash=_sha(row["api_key"])
+        )
+    assert await get_agent_by_key(OLD_KEY) is None
+
+
+@pytest.mark.parametrize("op", ["revoke", "rotate"])
+@pytest.mark.asyncio
+async def test_a_retired_key_stays_dead_in_the_table_auth_is_not_reading(db, op, monkeypatch):
+    """Migration 008 copied keys into agent_api_keys; a copy left active there revives under the
+    AGENT_AUTH_KEY_TABLE rollback lever."""
+    from db.agents import get_agent_by_key
+    from db.database import database
+
+    other = "agent_api_keys" if db == "api_keys" else "api_keys"
+    if other == "agent_api_keys":
+        await database.execute(
+            """
+            INSERT INTO agent_api_keys (agent_id, key_id, key_hash, key_prefix, is_active, created_by)
+            VALUES (:a, 'key_copy', :h, :p, TRUE, 'migration_008')
+            """,
+            {"a": AGENT_ID, "h": _sha(OLD_KEY), "p": OLD_KEY[:12] + "..."},
+        )
+    else:
+        await database.execute(
+            "INSERT INTO api_keys (agent_id, name, key_hash, key_prefix, status) VALUES (:a, 'copy', :h, :p, 'active')",
+            {"a": AGENT_ID, "h": _sha(OLD_KEY), "p": OLD_KEY[:10]},
+        )
+
+    await _employee_retire(op, db)
+
+    _pin(monkeypatch, other)
+    assert await get_agent_by_key(OLD_KEY) is None
+
+
+@pytest.mark.parametrize("db", ["api_keys"], indirect=True)
+@pytest.mark.parametrize("pinned", ["legacy_only", "agent_api_keys"])
+@pytest.mark.asyncio
+async def test_reset_retires_the_old_key_in_every_key_table_whatever_auth_reads(db, pinned, monkeypatch):
+    """A reset run while ops has AGENT_AUTH_KEY_TABLE pinned must not leave the old key live in a key
+    table auth is not reading at that moment: unpinning would revive it."""
+    from db.agents import get_agent_by_key
+    from routes.employee_agent_mgmt import reset_agent_api_key
+
+    _pin(monkeypatch, pinned)
+    body = await reset_agent_api_key(AGENT_ID, current_user=EMPLOYEE)
+    assert (await get_agent_by_key(body["new_api_key"]))["agent_id"] == AGENT_ID  # works while pinned
+
+    for mode in ("auto", "api_keys", "agent_api_keys", "legacy_only"):
+        _pin(monkeypatch, mode)
+        assert await get_agent_by_key(OLD_KEY) is None, mode
+
+
+@pytest.mark.parametrize("db", ["api_keys"], indirect=True)
+@pytest.mark.parametrize("key_id", ["99999999999", "²", "1e3", "-1"])
+@pytest.mark.asyncio
+async def test_an_unparseable_or_out_of_range_key_id_is_a_404_not_a_500(db, key_id):
+    from fastapi import HTTPException
+
+    from routes.employee_agent_mgmt import revoke_agent_api_key
+
+    with pytest.raises(HTTPException) as exc:
+        await revoke_agent_api_key(AGENT_ID, key_id, current_user=EMPLOYEE)
+    assert exc.value.status_code == 404

@@ -25,7 +25,6 @@ import uuid
 import secrets
 import random
 import logging
-import json as json_module
 
 logger = logging.getLogger(__name__)
 
@@ -69,17 +68,6 @@ def resolve_agent_display_name(agent: dict) -> str:
 
     return "Unknown Agent"
 
-
-def parse_json_field(value):
-    """Safely parse JSON field - handles both string and already-parsed JSON"""
-    if isinstance(value, list):
-        return value
-    if isinstance(value, str):
-        try:
-            return json_module.loads(value)
-        except:
-            return []
-    return []
 
 # ============== Models ==============
 

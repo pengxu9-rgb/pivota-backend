@@ -37,7 +37,6 @@ class _FakeDatabase:
             "api_keys_table": "api_keys",
             "agent_api_keys_table": None,
             "agent_id": (values or {}).get("agent_id"),
-            "present": None,
         }
 
     async def fetch_all(self, query, values=None):
