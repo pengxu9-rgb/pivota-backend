@@ -237,8 +237,7 @@ async def rank_replacements(
                 break  # one variant per product is enough to rank it
         if sum(1 for r, _, _ in found if r == 0) >= MAX_CANDIDATES:
             break
-        if len(products) < 250:
-            break
+        # Only an empty page ends the catalog (Shopify serves short pages mid-catalog).
     return [c for _, _, c in sorted(found, key=lambda t: (t[0], t[1])) if c.get("product_handle")]
 
 

@@ -301,8 +301,9 @@ async def read_brand_catalogue(
             handle = str((product or {}).get("handle") or "").strip().lower()
             if handle:
                 handles.add(handle)
-        if len(payload) < PAGE_LIMIT:
-            return CatalogueRead(CATALOGUE_OK, handles, total, f"{page} page(s)")
+        # Only the empty page above ends the catalogue: Shopify serves SHORT pages mid-catalogue
+        # (hidden products count toward `limit`; bluemercury.com page 1 = 249, page 2 = 250), and
+        # stopping on one reads every later handle as delisted.
     return CatalogueRead(
         CATALOGUE_INCOMPLETE, set(), total, f"hit MAX_CATALOGUE_PAGES={MAX_CATALOGUE_PAGES}"
     )

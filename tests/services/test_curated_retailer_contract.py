@@ -144,6 +144,16 @@ async def test_a_short_page_mid_catalog_is_not_the_end(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_a_store_that_ignores_page_is_not_a_complete_short_catalog(monkeypatch):
+    # A store (or a redirect dropping the query) that serves page 1 for every ?page used to read as a
+    # complete one-page catalog when page 1 was short. It now fails loudly on the repeat.
+    page = {"products": [product(1)]}
+    install_http(monkeypatch, [page, page])
+    with pytest.raises(feed.CrawlIncomplete, match="did not advance"):
+        await feed.fetch_shopify_products("retailer.com", max_products=10)
+
+
+@pytest.mark.asyncio
 async def test_scan_cap_is_not_vendor_absence(monkeypatch):
     install_http(monkeypatch, [{"products": [product(1, "Other"), product(2, "Other")]}, {"products": [product(3)]}])
     with pytest.raises(feed.CrawlIncomplete) as err:

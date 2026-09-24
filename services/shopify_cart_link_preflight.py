@@ -1048,8 +1048,9 @@ async def _resolve_from_catalog(
                     price=(str(variant.get("price")) if variant.get("price") is not None else None),
                 )
                 return
-        if len(products) < CATALOG_PAGE_SIZE:
-            break
+        # No short-page stop: only the empty page above ends the catalog. Shopify serves SHORT pages
+        # mid-catalog (hidden products count toward `limit`; bluemercury.com page 1 = 249, page 2 =
+        # 250), and stopping on one would call a variant on a later page VARIANT_GONE.
     else:
         # Cap reached with pages still full: absence is not proven.
         res.verdict, res.detail = Verdict.VARIANT_UNVERIFIED, "catalog_scan_cap"

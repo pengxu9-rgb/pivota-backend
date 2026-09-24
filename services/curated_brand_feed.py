@@ -406,7 +406,8 @@ async def fetch_shopify_products(
     max_scan_products bounds the whole retailer scan, independently of the selected
     max_products budget. A cap or failed page raises CrawlIncomplete, never returns a
     misleading partial success. Exhaustion is an EMPTY page, never a short one, so every
-    crawl ends with one lookahead request. Transient errors get paced attempts per page: three, unless the
+    crawl ends with one lookahead request. (Still an inference: a mid-catalog page whose every
+    slot is a hidden product would also come back empty. Not observed.) Transient errors get paced attempts per page: three, unless the
     process sets CURATED_CRAWL_PAGE_ATTEMPTS (see _page_attempts).
     """
     host = _clean_domain(domain)
