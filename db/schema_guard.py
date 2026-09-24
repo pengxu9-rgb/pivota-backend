@@ -1016,12 +1016,31 @@ async def ensure_required_schema_light() -> None:
             # RefundService.create_refund makes its write INSIDE its own transaction.
             # A constant default is a catalog-only change on PG11+, so this does not
             # rewrite the table. Its OWN try, per this block's rule.
+            #
+            # LOCKING. `ADD COLUMN IF NOT EXISTS` takes the table's ACCESS EXCLUSIVE
+            # lock BEFORE it finds the column exists, so run bare it queued every
+            # read of commerce_attribution_edges behind it on EVERY boot. The
+            # information_schema check means the statement only runs while the
+            # column is missing, and the transaction-local 500ms lock_timeout means
+            # that one run gives up (and is retried next boot) instead of stalling
+            # the table, and the heals after it, for the guard's whole budget.
             try:
                 await database.execute(
                     text(
                         """
-                        ALTER TABLE IF EXISTS commerce_attribution_edges
-                            ADD COLUMN IF NOT EXISTS dispute_amount_cents BIGINT NOT NULL DEFAULT 0;
+                        DO $$
+                        BEGIN
+                            IF to_regclass('public.commerce_attribution_edges') IS NOT NULL
+                               AND NOT EXISTS (
+                                   SELECT 1 FROM information_schema.columns
+                                   WHERE table_name = 'commerce_attribution_edges'
+                                     AND column_name = 'dispute_amount_cents'
+                               ) THEN
+                                PERFORM set_config('lock_timeout', '500ms', true);
+                                ALTER TABLE IF EXISTS commerce_attribution_edges
+                                    ADD COLUMN IF NOT EXISTS dispute_amount_cents BIGINT NOT NULL DEFAULT 0;
+                            END IF;
+                        END $$;
                         """
                     )
                 )
@@ -1029,8 +1048,9 @@ async def ensure_required_schema_light() -> None:
                 pass
             # mig 237, second statement: the migration's >= 0 CHECK. Guarded on
             # pg_constraint (as the apm_cadence_days heal is) so a boot does not
-            # re-validate the table every time. Its OWN try: a failure here must
-            # not undo, or be mistaken for, the column heal above.
+            # re-validate the table every time, and bounded by the same 500ms
+            # lock_timeout as the column heal above. Its OWN try: a failure here
+            # must not undo, or be mistaken for, the column heal.
             try:
                 await database.execute(
                     text(
@@ -1047,6 +1067,7 @@ async def ensure_required_schema_light() -> None:
                                    SELECT 1 FROM pg_constraint
                                    WHERE conname = 'ck_commerce_attribution_edges_dispute_amount_cents'
                                ) THEN
+                                PERFORM set_config('lock_timeout', '500ms', true);
                                 ALTER TABLE commerce_attribution_edges
                                     ADD CONSTRAINT ck_commerce_attribution_edges_dispute_amount_cents
                                     CHECK (dispute_amount_cents >= 0);
