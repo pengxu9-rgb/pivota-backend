@@ -82,10 +82,18 @@ GIFT_WITH_PURCHASE_TAGS = frozenset({
     "motivator_hidden_product", "gwp:brand", "gwp:sitewide", "subscription gwp", "gwp-choice",
     "gift with purchase",
 })
-# Titles that mark a paid-listed gift no tag marks ("[FREE GIFT] ...", "FREE SAMPLE ...", "... Gift with Purchase",
-# "Loyalty Reward - ..."). NOT a bare leading "Free": ezenzia sells "Free Random Fragrance" at $19.99.
+# Titles that mark a paid-listed gift no tag marks: an EXACT "[FREE GIFT]" / "[FREE SAMPLE]" bracket, or an
+# unbracketed "FREE GIFT" / "FREE SAMPLE" followed by a dash or colon ("FREE GIFT - SkinMedica ... Sample"),
+# "... Gift with Purchase", "Loyalty Reward - ...". NOT a bare leading "Free" (ezenzia sells "Free Random
+# Fragrance" at $19.99), NOT "[Free Gift Set]" -- a product SOLD WITH a gift (dodoskin "[Free Gift Set] beaund
+# Nmode Pro + Booster Gel", $159). A title carrying "+" is such a bundle ("[Free Gift] 1+1 SAMJIWON ... + FREE
+# medicube Mask", $79) and is always kept (_GIFT_BUNDLE).
 _GIFT_WITH_PURCHASE_TITLE = re.compile(
-    r"^\[?\s*free\s+(?:gift|sample)s?\s*\]?(?=[\W_]|$)|\bgift\s+with\s+purchase\b|^loyalty\s+reward\b", re.I)
+    r"^\[\s*free\s+(?:gift|sample)s?\s*\]|^free\s+(?:gift|sample)s?\s*[-–—:]|\bgift\s+with\s+purchase\b"
+    r"|^loyalty\s+reward\b", re.I)
+_GIFT_BUNDLE = re.compile(r"\+")
+# NOT the merchant product type: `GWP`-typed items include in-stock full-size products (elizabetharden.com
+# PREVAGE set $169, night capsules $99; beautybrands $44.99 hair dryer) -- measured 2026-09-25. Known gap.
 
 
 def gift_with_purchase_reason(product: Dict[str, Any]) -> Optional[str]:
@@ -96,7 +104,10 @@ def gift_with_purchase_reason(product: Dict[str, Any]) -> Optional[str]:
     hit = sorted(tokens & GIFT_WITH_PURCHASE_TAGS)
     if hit:
         return f"tag:{hit[0]}"
-    m = _GIFT_WITH_PURCHASE_TITLE.search(str(product.get("title") or "").strip())
+    title = str(product.get("title") or "").strip()
+    if _GIFT_BUNDLE.search(title):
+        return None  # sold WITH a gift, not a gift
+    m = _GIFT_WITH_PURCHASE_TITLE.search(title)
     return f"title:{m.group(0).strip()}" if m else None
 
 # The axis a variant varies on, named the way the shop names it. Shopify reports
@@ -2645,6 +2656,18 @@ async def records_for_brand(
         records_for_brand.last_vendor_filter_report = {  # type: ignore[attr-defined]
             "vendors": list(only_vendors), "before": before, "after": len(products),
         }
+    # Gifts go BEFORE GTIN recovery and shade folding, so a gift costs no PDP fetch. Recorded, never silent.
+    gifts_dropped: List[Dict[str, Any]] = []
+    kept_products = []
+    for p in products:
+        gift = gift_with_purchase_reason(p)
+        if gift:
+            gifts_dropped.append({"handle": str(p.get("handle") or "")[:200], "title": str(p.get("title") or "")[:200],
+                                  "reason": gift[:120]})
+        else:
+            kept_products.append(p)
+    if gifts_dropped:
+        products = kept_products
     identity_report = None
     if enrich_missing_gtin:
         products, identity_report = await recover_missing_variant_gtins(
@@ -2675,12 +2698,7 @@ async def records_for_brand(
         records_for_brand.last_fold_report = fold_report  # type: ignore[attr-defined]
     records: List[Dict[str, Any]] = []
     pairs: List[Dict[str, Any]] = []  # (product, record) needing a PDP INCI try
-    gifts_dropped: List[Dict[str, Any]] = []  # recorded, never silent: which products and why
     for p in products:
-        gift = gift_with_purchase_reason(p)
-        if gift:
-            gifts_dropped.append({"handle": p.get("handle"), "title": p.get("title"), "reason": gift})
-            continue
         rec = shopify_product_to_record(
             # brand_by_vendor (multi-brand retailer cohorts): each vendor's OWN canonical spelling, applied
             # by the same resolve_record_brand rule a single-brand job's `brand` gets.
