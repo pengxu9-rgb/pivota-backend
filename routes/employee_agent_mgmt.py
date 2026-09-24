@@ -8,6 +8,7 @@ from pydantic import BaseModel, EmailStr
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
 from utils.auth import EMPLOYEE_STAFF_ROLES, get_current_user
+from db.agents import evict_agent_auth_cache
 from db.database import database
 from routes.agent_account import AgentNotFoundError, KeyTableUnresolvedError, reset_agent_primary_api_key
 import uuid
@@ -140,10 +141,15 @@ async def get_all_agents(
         where_condition = ""
         params = {}
         
-        if status:
-            where_condition = "WHERE a.status = :status"
-            params["status"] = status
-        
+        # agents has no status column; is_active is the state auth enforces (NULL = active).
+        if status == "active":
+            where_condition = "WHERE COALESCE(a.is_active, TRUE) = TRUE"
+        elif status == "inactive":
+            where_condition = "WHERE a.is_active = FALSE"
+        elif status:
+            # Nothing else is representable (there is no "suspended" state to filter on).
+            where_condition = "WHERE FALSE"
+
         query = f"""
             SELECT 
                 a.*,
@@ -192,6 +198,7 @@ async def get_all_agents(
             api_key = agent_dict.get("api_key") or ""
             api_key_prefix = api_key[:10] + "..." if len(api_key) > 10 else None
             
+            is_active = agent_dict.get("is_active") is not False
             formatted_agents.append({
                 "agent_id": agent_dict.get("agent_id"),
                 # Keep both fields for frontend compatibility
@@ -202,8 +209,8 @@ async def get_all_agents(
                 "agent_type": agent_dict.get("agent_type") or "Generic",
                 "company": agent_dict.get("company"),
                 "api_key_prefix": api_key_prefix,
-                "status": agent_dict.get("status") or "active",
-                "is_active": (agent_dict.get("status") or "active") == "active",
+                "status": "active" if is_active else "inactive",
+                "is_active": is_active,
                 "created_at": str(agent_dict.get("created_at")) if agent_dict.get("created_at") else None,
                 "last_active": str(agent_dict.get("last_active")) if agent_dict.get("last_active") else None,
                 "request_count": agent_dict.get("request_count") or 0,
@@ -298,7 +305,9 @@ async def get_agent_details(
                 # Prefix only. The employee console never needs the secret, and rows written
                 # since the hash-only change carry a redacted marker here anyway.
                 "api_key": _mask_agent_api_key(agent.get("api_key")),
-                "status": agent.get("status") or "active",
+                # agents has no status column; is_active is what auth enforces (NULL = active).
+                "status": "active" if agent.get("is_active") is not False else "inactive",
+                "is_active": agent.get("is_active") is not False,
                 "agent_type": agent.get("agent_type"),  # [Phase 6.2] Include agent_type
                 "created_at": agent.get("created_at"),
                 "last_active": agent.get("last_active"),
@@ -566,6 +575,40 @@ async def reset_agent_api_key(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to reset API key: {str(e)}")
 
+async def _set_agent_active(agent_id: str, *, active: bool, actor: Optional[str]) -> None:
+    """Flip agents.is_active: the column the agent auth door enforces (routes/agent_auth.py
+    get_agent_context -> 403 "Agent is deactivated"). The agents table has no status or
+    deactivated_at column; these handlers used to write both and 500'd.
+
+    NULL is_active reads as active, matching db.agents._normalize_agent_row. The auth cache holds
+    the agent row (is_active included) for up to 60s, so it is evicted here; other instances
+    follow within that TTL.
+    """
+    agent = await database.fetch_one(
+        "SELECT agent_id, is_active FROM agents WHERE agent_id = :agent_id",
+        {"agent_id": agent_id},
+    )
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    currently_active = agent["is_active"] is not False
+    if currently_active == active:
+        raise HTTPException(
+            status_code=400,
+            detail="Agent is already active" if active else "Agent is already inactive",
+        )
+
+    await database.execute(
+        "UPDATE agents SET is_active = :is_active, updated_at = NOW() WHERE agent_id = :agent_id",
+        {"is_active": active, "agent_id": agent_id},
+    )
+    evict_agent_auth_cache(agent_id)
+
+    # WARNING, not INFO: prod drops INFO from plain module loggers, and this is an audit line.
+    logger.warning(
+        "Employee portal agent %s %s by %s", agent_id, "activated" if active else "deactivated", actor
+    )
+
+
 @router.post("/agents/{agent_id}/deactivate")
 async def deactivate_agent(
     agent_id: str,
@@ -576,29 +619,7 @@ async def deactivate_agent(
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
-        # Check if agent exists
-        agent = await database.fetch_one(
-            "SELECT agent_id, status FROM agents WHERE agent_id = :agent_id",
-            {"agent_id": agent_id}
-        )
-        
-        if not agent:
-            raise HTTPException(status_code=404, detail="Agent not found")
-        
-        if agent["status"] == "inactive":
-            raise HTTPException(status_code=400, detail="Agent is already inactive")
-        
-        # Deactivate agent
-        await database.execute(
-            """UPDATE agents 
-               SET status = 'inactive', deactivated_at = :deactivated_at
-               WHERE agent_id = :agent_id""",
-            {
-                "deactivated_at": datetime.now(),
-                "agent_id": agent_id
-            }
-        )
-        
+        await _set_agent_active(agent_id, active=False, actor=current_user.get("email"))
         return {
             "status": "success",
             "message": "Agent deactivated successfully"
@@ -609,7 +630,10 @@ async def deactivate_agent(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to deactivate agent: {str(e)}")
 
+# The portal's reactivateAgent() posts to /reactivate; this handler was only ever mounted at
+# /activate, so the portal's button 404'd. Both paths are served.
 @router.post("/agents/{agent_id}/activate")
+@router.post("/agents/{agent_id}/reactivate")
 async def activate_agent(
     agent_id: str,
     current_user: dict = Depends(get_current_user)
@@ -617,30 +641,9 @@ async def activate_agent(
     """Activate an agent (Employee only)"""
     if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
+
     try:
-        # Check if agent exists
-        agent = await database.fetch_one(
-            "SELECT agent_id, status FROM agents WHERE agent_id = :agent_id",
-            {"agent_id": agent_id}
-        )
-        
-        if not agent:
-            raise HTTPException(status_code=404, detail="Agent not found")
-        
-        if agent["status"] == "active":
-            raise HTTPException(status_code=400, detail="Agent is already active")
-        
-        # Activate agent
-        await database.execute(
-            """UPDATE agents 
-               SET status = 'active', deactivated_at = NULL
-               WHERE agent_id = :agent_id""",
-            {
-                "agent_id": agent_id
-            }
-        )
-        
+        await _set_agent_active(agent_id, active=True, actor=current_user.get("email"))
         return {
             "status": "success",
             "message": "Agent activated successfully"
