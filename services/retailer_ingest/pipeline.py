@@ -236,14 +236,21 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
     return {"plan": plan, "inspection": inspection, "checks": checks, "flags": flags, "blocking": blocking}
 
 
+#: The lifecycle stages backend global recall admits (services/pivot_query_service.py: `IN (...) OR
+#: pdp_lifecycle_stage IS NULL`; the filter is skipped for merchant-scoped lanes and for
+#: require_signature/canonical_entities_only). NOT the agent door's rule: the gateway gates on
+#: serving_eligible only. Used to annotate a readback, never to fail one.
+BACKEND_RECALL_LIFECYCLE_STAGES = ("validated", "published")
+
+
 async def _readback(product_keys: List[str], currency: str, db: Any) -> Dict[str, Any]:
     """Did what the gate says landed actually land servable? One row per applied product."""
     if not product_keys:
-        return {"ok": False, "reason": "no product keys to read back", "rows": []}
+        return {"ok": False, "reason": "no product keys to read back", "notes": [], "rows": []}
     rows = await db.fetch_all(
         """
         SELECT p.product_key, p.category_path, coalesce(ips.serving_eligible, false) AS serving,
-               ips.pipeline_stage,
+               ips.pipeline_stage, p.pdp_lifecycle_stage AS lifecycle,
                (SELECT count(*) FROM catalog_offers o WHERE o.product_key = p.product_key
                   AND o.suppressed_at IS NULL) AS offers,
                (SELECT count(*) FROM catalog_offers o WHERE o.product_key = p.product_key
@@ -254,7 +261,7 @@ async def _readback(product_keys: List[str], currency: str, db: Any) -> Dict[str
         {"keys": list(product_keys), "currency": currency},
     )
     out = [dict(r) for r in rows]
-    problems = []
+    problems, notes = [], []
     found = {r["product_key"] for r in out}
     for key in product_keys:
         if key not in found:
@@ -264,10 +271,18 @@ async def _readback(product_keys: List[str], currency: str, db: Any) -> Dict[str
             problems.append({"product_key": r["product_key"], "problem": "no category_path"})
         if not r["serving"]:
             problems.append({"product_key": r["product_key"], "problem": "not serving-eligible"})
+        # Recorded, never a failure: the agent door (gateway) serves on serving-eligibility alone, while
+        # backend global recall admits only BACKEND_RECALL_LIFECYCLE_STAGES (or NULL). Measured
+        # 2026-09-24: 14 of 28 O HUI rows at buybeautykorea.com landed `candidate` (no taxonomy signal:
+        # the store has no tags) and the agent door still returned them. The run says which rows
+        # backend recall will not see.
+        if r.get("lifecycle") is not None and r.get("lifecycle") not in BACKEND_RECALL_LIFECYCLE_STAGES:
+            notes.append({"product_key": r["product_key"],
+                          "note": f"outside backend global recall: pdp_lifecycle_stage {r.get('lifecycle')!r}"})
         if not r["offers"] or r["offers_in_currency"] != r["offers"]:
             problems.append({"product_key": r["product_key"],
                              "problem": f"offers {r['offers']}, in {currency}: {r['offers_in_currency']}"})
-    return {"ok": not problems, "problems": problems, "rows": out}
+    return {"ok": not problems, "problems": problems, "notes": notes, "rows": out}
 
 
 async def _move(job: Dict[str, Any], *, db: Any, **fields: Any) -> bool:
@@ -377,7 +392,9 @@ async def _apply(job: Dict[str, Any], run_id: str, result: Dict[str, Any], summa
     outcome = "applied" if ok else ("gate_failed" if not gate.get("ok") else "readback_failed")
     await ledger.finish_run(run_id, outcome=outcome, **summary, applied={"gate": gate}, readback=readback,
                             db=db)
-    reason = ("applied and verified" if ok else
+    noted = len(readback.get("notes") or [])
+    reason = ((f"applied and verified; {noted} row(s) outside backend global recall" if noted
+               else "applied and verified") if ok else
               f"{outcome}: gate {gate.get('reasons')}; readback {readback.get('problems')}")
     await _move(job, status="done" if ok else "failed", run_id=run_id, reason=reason, db=db)
     return {"job_id": job["id"], "stage": APPLY, "outcome": outcome, "status": "done" if ok else "failed"}
