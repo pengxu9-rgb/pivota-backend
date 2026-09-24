@@ -116,6 +116,25 @@ def _clear_auth_key_table_cache() -> None:
     _AGENT_AUTH_KEY_TABLE_CACHE["expires_at"] = 0.0
 
 
+def evict_agent_auth_cache(agent_id: str) -> int:
+    """Drop THIS process's positive auth-cache entries for agent_id; returns how many.
+
+    Called after a key rotation so the revoked key stops authenticating here at once. Other
+    instances keep their entry until it expires (AGENT_AUTH_CACHE_POSITIVE_TTL_SECONDS, 60s by
+    default): the cache is per-process and there is no cross-instance invalidation.
+    """
+    stale = [
+        cache_key
+        for cache_key, entry in _AGENT_AUTH_CACHE.items()
+        if isinstance(entry, dict)
+        and isinstance(entry.get("agent"), dict)
+        and entry["agent"].get("agent_id") == agent_id
+    ]
+    for cache_key in stale:
+        _AGENT_AUTH_CACHE.pop(cache_key, None)
+    return len(stale)
+
+
 def _is_missing_table_error(exc: Exception, table_name: str) -> bool:
     msg = str(exc or "").lower()
     table = str(table_name or "").strip().lower()

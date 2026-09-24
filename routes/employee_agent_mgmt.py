@@ -9,6 +9,7 @@ from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
 from utils.auth import EMPLOYEE_STAFF_ROLES, get_current_user
 from db.database import database
+from routes.agent_account import AgentNotFoundError, KeyTableUnresolvedError, reset_agent_primary_api_key
 import uuid
 import secrets
 import random
@@ -535,38 +536,33 @@ async def reset_agent_api_key(
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
-        # Check if agent exists
-        agent = await database.fetch_one(
-            "SELECT agent_id FROM agents WHERE agent_id = :agent_id",
-            {"agent_id": agent_id}
+        # The shared rotation path. This handler used to write only agents.api_key (in plaintext,
+        # plus a last_key_rotation column prod never had), so even had it run, the new key was not
+        # on the hash auth path and the old key stayed active.
+        new_api_key, key_sync_source = await reset_agent_primary_api_key(
+            agent_id=agent_id, created_by="employee_reset"
         )
-        
-        if not agent:
-            raise HTTPException(status_code=404, detail="Agent not found")
-        
-        # Generate new API key
-        new_api_key = f"ak_live_{secrets.token_hex(32)}"
-        
-        # Update agent
-        await database.execute(
-            """UPDATE agents 
-               SET api_key = :api_key, last_key_rotation = :rotation_time
-               WHERE agent_id = :agent_id""",
-            {
-                "api_key": new_api_key,
-                "rotation_time": datetime.now(),
-                "agent_id": agent_id
-            }
+
+        # WARNING, not INFO: prod drops INFO from plain module loggers, and this is an audit line.
+        logger.warning(
+            "Employee portal API key reset %s by %s (key_sync_source=%s)",
+            agent_id,
+            current_user.get("email"),
+            key_sync_source,
         )
-        
+
         return {
             "status": "success",
             "message": "API key reset successfully",
             "new_api_key": new_api_key
         }
-    
+
     except HTTPException:
         raise
+    except AgentNotFoundError:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    except KeyTableUnresolvedError:
+        raise HTTPException(status_code=503, detail="API key reset temporarily unavailable; retry")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to reset API key: {str(e)}")
 

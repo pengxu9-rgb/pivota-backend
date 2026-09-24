@@ -12,7 +12,7 @@ import secrets
 import hashlib
 import time
 
-from db.agents import is_redacted_agent_api_key, redacted_agent_api_key
+from db.agents import evict_agent_auth_cache, is_redacted_agent_api_key, redacted_agent_api_key
 from db.auth_identity import upsert_membership
 from db.database import database
 from services.agent_registration_notify import notify_agent_registered
@@ -366,6 +366,148 @@ async def _ensure_agent_api_key_on_auth_path(
         return "agent_api_keys"
 
     return "legacy"
+
+
+class AgentNotFoundError(LookupError):
+    """An agent-key operation named an agent_id with no agents row."""
+
+
+# ── Key-table rows ─────────────────────────────────────────────────────────────
+# The two hash key tables auth can read (db.agents._lookup_agent_from_key_table) differ in shape:
+#   api_keys:        id SERIAL (the key's public id), status 'active'/'revoked', name
+#   agent_api_keys:  key_id 'key_<hex>' (public id), is_active, created_by, last_rotated_at
+# Every write to either goes through the three functions below, so "which column means active"
+# and "what gets hashed" are decided once. Per-key scopes / ip_whitelist / expires_at are NOT
+# written: auth selects only the agents row and enforces none of them.
+
+
+def _new_agent_api_key() -> Tuple[str, str]:
+    api_key = f"ak_live_{secrets.token_hex(32)}"
+    return api_key, hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+
+
+async def _insert_key_row(
+    key_table: str, *, agent_id: str, api_key: str, key_hash: str, name: str, created_by: str
+) -> str:
+    """Insert an ACTIVE key row; returns its public id (api_keys.id / agent_api_keys.key_id)."""
+    if key_table == "api_keys":
+        row = await database.fetch_one(
+            """
+            INSERT INTO api_keys (agent_id, name, key_hash, key_prefix, status)
+            VALUES (:agent_id, :name, :key_hash, :key_prefix, 'active')
+            RETURNING id
+            """,
+            {"agent_id": agent_id, "name": name, "key_hash": key_hash, "key_prefix": api_key[:10]},
+        )
+        return str(row["id"])
+
+    key_id = f"key_{secrets.token_hex(8)}"
+    await database.execute(
+        """
+        INSERT INTO agent_api_keys (key_id, agent_id, key_hash, key_prefix, is_active, created_by, created_at)
+        VALUES (:key_id, :agent_id, :key_hash, :key_prefix, TRUE, :created_by, NOW())
+        """,
+        {
+            "key_id": key_id,
+            "agent_id": agent_id,
+            "key_hash": key_hash,
+            "key_prefix": api_key[:12] + "...",
+            "created_by": created_by,
+        },
+    )
+    return key_id
+
+
+async def _deactivate_key_rows(key_table: str, *, agent_id: str, key_id: Optional[str] = None) -> int:
+    """Retire the agent's ACTIVE key rows in key_table: one (key_id) or all (key_id=None).
+    Returns how many rows it retired. RETURNING, because execute() gives no rowcount here."""
+    if key_table == "api_keys":
+        where, values = "agent_id = :agent_id AND status = 'active'", {"agent_id": agent_id}
+        if key_id is not None:
+            if not str(key_id).isdigit():
+                return 0
+            where, values = where + " AND id = :id", {**values, "id": int(key_id)}
+        rows = await database.fetch_all(
+            f"UPDATE api_keys SET status = 'revoked' WHERE {where} RETURNING id", values
+        )
+        return len(rows)
+
+    where, values = "agent_id = :agent_id AND COALESCE(is_active, TRUE) = TRUE", {"agent_id": agent_id}
+    if key_id is not None:
+        where, values = where + " AND key_id = :key_id", {**values, "key_id": str(key_id)}
+    rows = await database.fetch_all(
+        f"UPDATE agent_api_keys SET is_active = FALSE, last_rotated_at = NOW() WHERE {where} RETURNING key_id",
+        values,
+    )
+    return len(rows)
+
+
+async def _require_agent(agent_id: str) -> None:
+    agent = await database.fetch_one(
+        "SELECT agent_id FROM agents WHERE agent_id = :agent_id",
+        {"agent_id": agent_id},
+    )
+    if not agent:
+        raise AgentNotFoundError(agent_id)
+
+
+async def _other_key_table(key_table: Optional[str]) -> Optional[str]:
+    """The hash key table auth is NOT reading right now, if it exists. A key left active there is
+    dormant, not dead: pinning AGENT_AUTH_KEY_TABLE to it (the rollback lever) revives it."""
+    if key_table not in ("api_keys", "agent_api_keys"):
+        return None
+    other = "agent_api_keys" if key_table == "api_keys" else "api_keys"
+    row = await database.fetch_one(f"SELECT to_regclass('public.{other}') AS present")
+    return other if row and dict(row).get("present") else None
+
+
+async def reset_agent_primary_api_key(*, agent_id: str, created_by: str) -> Tuple[str, str]:
+    """
+    Replace an agent's API key: the ONE rotation path, shared by the agent portal
+    (routes/agent_keys.py) and the employee portal (routes/employee_agent_mgmt.py).
+    Returns (new plaintext key, key_sync_source); the plaintext is never persisted when a key
+    table exists.
+
+    A rotation must do all of the following, or it is not a rotation:
+      - write the new key where AUTH reads it (the key table resolved exactly as register does);
+      - revoke every previously active key for the agent, in BOTH key tables (see
+        _other_key_table), so no old key keeps working or can come back;
+      - leave agents.api_key holding the redacted marker, never the plaintext (legacy deployments
+        with no key table excepted: there that column IS the auth lookup);
+      - evict this process's auth cache for the agent.
+    The writes run in one transaction so a failure cannot leave the agent with no active key.
+    """
+    key_table = await _resolve_agent_key_table(for_write=True)
+    await _require_agent(agent_id)
+    other_table = await _other_key_table(key_table)
+
+    new_api_key, new_key_hash = _new_agent_api_key()
+    stored_api_key = new_api_key if key_table is None else redacted_agent_api_key(agent_id)
+
+    async with database.transaction():
+        await database.execute(
+            """
+            UPDATE agents
+            SET api_key = :api_key, api_key_hash = :api_key_hash, updated_at = NOW()
+            WHERE agent_id = :agent_id
+            """,
+            {"api_key": stored_api_key, "api_key_hash": new_key_hash, "agent_id": agent_id},
+        )
+        if key_table is not None:
+            await _deactivate_key_rows(key_table, agent_id=agent_id)
+            await _insert_key_row(
+                key_table,
+                agent_id=agent_id,
+                api_key=new_api_key,
+                key_hash=new_key_hash,
+                name="Primary Key (Rotated)",
+                created_by=created_by,
+            )
+        if other_table is not None:
+            await _deactivate_key_rows(other_table, agent_id=agent_id)
+
+    evict_agent_auth_cache(agent_id)
+    return new_api_key, key_table or "legacy"
 
 
 # ============================================================================

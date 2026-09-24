@@ -4,8 +4,18 @@ from datetime import datetime
 import pytest
 from fastapi import FastAPI, HTTPException
 
+import db.agents as agents_db
+from routes import agent_account as agent_account_module
 from routes import agent_management as agent_management_module
 from routes import agent_keys as agent_keys_module
+
+
+class _FakeTransaction:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
 
 
 class _FakeDatabase:
@@ -19,14 +29,24 @@ class _FakeDatabase:
 
     async def fetch_one(self, query, values=None):
         self.fetch_one_calls.append((str(query), values or {}))
+        if "RETURNING id" in str(query):
+            self.execute_calls.append((str(query), values or {}))
+            return {"id": 1}
         # Simulate api_keys table present.
         return {
             "api_keys_table": "api_keys",
             "agent_api_keys_table": None,
+            "agent_id": (values or {}).get("agent_id"),
+            "present": None,
         }
 
     async def fetch_all(self, query, values=None):
+        if "RETURNING" in str(query):
+            self.execute_calls.append((str(query), values or {}))
         return []
+
+    def transaction(self):
+        return _FakeTransaction()
 
 
 class _FakeApiKeysListDatabase(_FakeDatabase):
@@ -47,7 +67,12 @@ class _FakeApiKeysListDatabase(_FakeDatabase):
 @pytest.mark.asyncio
 async def test_reset_api_key_generates_ak_live_64hex_and_syncs_api_keys_table(monkeypatch):
     fake_db = _FakeDatabase()
-    monkeypatch.setattr(agent_keys_module, "database", fake_db)
+    # The reset runs through routes.agent_account.reset_agent_primary_api_key, which resolves the key
+    # table the way auth does (Postgres-gated, env-gated): pin both so the probe runs.
+    monkeypatch.setattr(agent_account_module, "database", fake_db)
+    monkeypatch.setattr(agents_db, "IS_POSTGRES", True)
+    monkeypatch.setattr(agents_db, "_AGENT_AUTH_KEY_TABLE_MODE", "auto")
+    monkeypatch.setattr(agents_db, "_AGENT_AUTH_KEY_TABLE_CACHE", {"table": None, "expires_at": 0.0})
 
     response = await agent_keys_module.reset_agent_api_key(
         "agent_demo_1",
