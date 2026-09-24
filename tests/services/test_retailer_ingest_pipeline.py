@@ -743,6 +743,42 @@ def test_multi_brand_spellings_and_fetch_budget_are_validated(options):
         pipeline.validate_options(dict(options))
 
 
+async def test_the_collections_option_reaches_the_crawl(env, monkeypatch):
+    seen = []
+    built = feed.records_for_brand
+
+    async def spy(**kw):
+        seen.append(kw.get("collection_handles"))
+        return await built(**kw)
+    monkeypatch.setattr(feed, "records_for_brand", spy)
+    await pipeline.run_stage(job(collections=["3ce", "3ce-lip"]), db=env.db)
+    await pipeline.run_stage(job(), db=env.db)
+    assert seen == [["3ce", "3ce-lip"], None]
+
+
+@pytest.mark.parametrize("collections", [[], ["../x"], ["Upper"], "3ce"])
+def test_bad_collections_are_refused(collections):
+    with pytest.raises(ValueError):
+        pipeline.validate_options({"vendors": ["3CE"], "collections": collections})
+
+
+async def test_a_store_past_shopifys_last_page_is_told_to_use_collections(env):
+    env.crawl_error = feed.CrawlIncomplete(
+        "big.com: page 101: Shopify serves at most 100 pages of /products.json; this listing is larger -- "
+        "crawl the brand's collection (options.collections) instead", status="capped", next_page=101,
+        scanned_products=25000, selected_products=0)
+    out = await pipeline.run_stage(job(), db=env.db)
+    assert out["outcome"] == "crawl_capped" and "options.collections" in out["reason"]
+    assert "raise options.max_scan_products" not in out["reason"]
+
+
+async def test_an_ordinary_capped_crawl_is_told_to_raise_its_budget(env):
+    env.crawl_error = feed.CrawlIncomplete("k.com: page 81: scan budget 20000 exhausted", status="capped",
+                                           next_page=81, scanned_products=20000, selected_products=0)
+    out = await pipeline.run_stage(job(), db=env.db)
+    assert "raise options.max_scan_products" in out["reason"] and "options.collections" not in out["reason"]
+
+
 @pytest.mark.parametrize("brands,ok", [
     ({"Lancome": "Lancôme"}, True),                # a measured family, named by its own spelling
     ({"Christian Dior": "Dior"}, True),

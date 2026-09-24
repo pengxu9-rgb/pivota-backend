@@ -386,11 +386,25 @@ def classify_transport_failure(exc: BaseException) -> Optional[Dict[str, str]]:
 
 
 class ShopifyProductBatch(list):
-    """List-compatible result; successful results always represent an exhausted feed."""
-    def __init__(self, products: list, *, scanned_products: int, pages: int):
+    """List-compatible result; successful results always represent an exhausted feed -- of the
+    store, or (scope "collection:<handle>") of one collection only, never claimed for the store."""
+    def __init__(self, products: list, *, scanned_products: int, pages: int, scope: str = "store"):
         super().__init__(products)
         self.crawl_report = {"status": "complete", "scanned_products": scanned_products,
                              "selected_products": len(products), "pages": pages}
+        if scope != "store":
+            self.crawl_report["scope"] = scope
+
+
+#: Shopify serves /products.json pages 1..100 only: page 101 answers HTTP 400 (measured 2026-09-24 on
+#: beautycarebag.com, japanwithlovestore.com, marissacollections.com, shopcgx.com). A store with more
+#: than 100 * 250 products cannot reach its empty page; crawl its brand collections instead.
+SHOPIFY_MAX_PAGES = 100
+_COLLECTION_HANDLE = re.compile(r"[a-z0-9][a-z0-9_-]{0,254}")
+
+
+def valid_collection_handle(handle: Any) -> bool:
+    return isinstance(handle, str) and bool(_COLLECTION_HANDLE.fullmatch(handle))
 
 
 async def fetch_shopify_products(
@@ -400,8 +414,13 @@ async def fetch_shopify_products(
     timeout_s: float = 15.0,
     only_vendors: Optional[Sequence[str]] = None,
     max_scan_products: Optional[int] = None,
+    collection: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Enumerate to exhaustion, selecting vendors before the product budget.
+
+    `collection` pages /collections/<handle>/products.json instead of the whole store: the batch is
+    complete for THAT collection only (crawl_report.scope) -- a store's brand collection can hold other
+    vendors (the vendor filter still applies) and can miss some of the brand's products.
 
     max_scan_products bounds the whole retailer scan, independently of the selected
     max_products budget. A cap or failed page raises CrawlIncomplete, never returns a
@@ -418,6 +437,10 @@ async def fetch_shopify_products(
         raise ValueError("product and scan budgets must be positive")
     if only_vendors is not None and not any(str(v or "").strip() for v in only_vendors):
         raise ValueError("only_vendors cannot contain only blank values")
+    if collection is not None and not valid_collection_handle(collection):
+        raise ValueError(f"not a Shopify collection handle: {collection!r}")
+    listing = f"/collections/{collection}/products.json" if collection else "/products.json"
+    scope = f"collection:{collection}" if collection else "store"
     out: List[Dict[str, Any]] = []
     scanned = 0
     page = 1
@@ -435,7 +458,11 @@ async def fetch_shopify_products(
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers=headers) as client:
             while True:
-                url = f"https://{host}/products.json?limit={_PER_PAGE}&page={page}"
+                if page > SHOPIFY_MAX_PAGES:
+                    raise incomplete(
+                        f"Shopify serves at most {SHOPIFY_MAX_PAGES} pages of {listing}; this listing is "
+                        "larger -- crawl the brand's collection (options.collections) instead", "capped")
+                url = f"https://{host}{listing}?limit={_PER_PAGE}&page={page}"
                 for attempt in range(attempts):
                     await crawl_politeness.before_request(url, user_agent=_UA, max_wait=0)
                     try:
@@ -467,7 +494,7 @@ async def fetch_shopify_products(
                 if not all(isinstance(p, dict) for p in products):
                     raise incomplete("products.json contains a non-object product")
                 if not products:
-                    return ShopifyProductBatch(out, scanned_products=scanned, pages=page)
+                    return ShopifyProductBatch(out, scanned_products=scanned, pages=page, scope=scope)
                 fingerprint = json.dumps(products, sort_keys=True, default=str)
                 if fingerprint in seen_pages:
                     raise incomplete("repeated page; pagination did not advance")
@@ -506,6 +533,58 @@ async def fetch_shopify_products(
             f"Next: {_BLAME_NEXT_STEP[classified['blame']]}.",
             reason_code=classified["reason_code"],
         ) from exc
+
+
+async def fetch_shopify_collections(
+    domain: str,
+    collections: Sequence[str],
+    *,
+    only_vendors: Optional[Sequence[str]],
+    max_products: int,
+    max_scan_products: int,
+) -> "ShopifyProductBatch":
+    """The listed brand collections of a store too large for /products.json (> 100 pages), each crawled
+    to ITS empty page, vendor-filtered, and merged by product id. Complete for those collections only:
+    the report's scope names them, never the store. A collection that lists none of the vendors fails
+    the crawl loudly -- a mistyped or re-purposed handle must not read as "the store carries nothing"."""
+    handles = list(dict.fromkeys(str(h) for h in collections))
+    if not handles or not all(valid_collection_handle(h) for h in handles):
+        raise ValueError(f"collections must be Shopify collection handles: {list(collections)!r}")
+    merged: Dict[Any, Dict[str, Any]] = {}
+    per: Dict[str, Dict[str, Any]] = {}
+    scanned = pages = 0
+    for handle in handles:
+        remaining = max_scan_products - scanned  # the scan budget bounds ALL collections together
+        if remaining < 1:
+            raise CrawlIncomplete(f"{_clean_domain(domain)}: scan budget {max_scan_products} exhausted before "
+                                  f"collection {handle!r}", status="capped", next_page=0,
+                                  scanned_products=scanned, selected_products=len(merged))
+        try:
+            batch = await fetch_shopify_products(domain, only_vendors=only_vendors, max_products=max_products,
+                                                 max_scan_products=remaining, collection=handle)
+        except CrawlIncomplete as exc:
+            # Report the WHOLE crawl so far, not just this collection's share.
+            exc.scanned_products += scanned
+            exc.selected_products += len(merged)
+            raise
+        report = batch.crawl_report
+        per[handle] = {k: report.get(k) for k in ("pages", "scanned_products", "selected_products")}
+        scanned += int(report.get("scanned_products") or 0)
+        pages += int(report.get("pages") or 0)
+        if not batch:
+            raise CrawlIncomplete(
+                f"{_clean_domain(domain)}: collection {handle!r} lists no product from vendors "
+                f"{list(only_vendors or [])} ({report.get('scanned_products')} scanned)",
+                status="failed", next_page=0, scanned_products=scanned, selected_products=len(merged))
+        for product in batch:
+            merged.setdefault(product.get("id") or product.get("handle"), product)
+    if len(merged) > max_products:
+        raise CrawlIncomplete(f"{_clean_domain(domain)}: selected-product budget {max_products} exhausted",
+                              status="capped", next_page=0, scanned_products=scanned, selected_products=len(merged))
+    out = ShopifyProductBatch(list(merged.values()), scanned_products=scanned, pages=pages,
+                              scope="collections:" + ",".join(handles))
+    out.crawl_report["collections"] = per
+    return out
 
 
 def _native_shopify_id(value: Any) -> Optional[str]:
@@ -2420,6 +2499,7 @@ async def records_for_brand(
     domain: str,
     category_path: str,
     brand: Optional[str] = None,
+    collection_handles: Optional[Sequence[str]] = None,
     brand_by_vendor: Optional[Mapping[str, str]] = None,
     max_products: int = 500,
     base_listings_only: bool = False,
@@ -2483,7 +2563,11 @@ async def records_for_brand(
     fetch_options: Dict[str, Any] = {"max_products": max_products}
     if only_vendors is not None or source_role == "retailer":
         fetch_options.update(only_vendors=only_vendors, max_scan_products=max_scan_products)
-    products = await fetch_shopify_products(domain, **fetch_options)
+    if collection_handles:  # NOT `collections`: that name is the stdlib module this function uses
+        products = await fetch_shopify_collections(domain, collection_handles, only_vendors=only_vendors,
+                                                   max_products=max_products, max_scan_products=max_scan_products)
+    else:
+        products = await fetch_shopify_products(domain, **fetch_options)
     crawl_report = getattr(products, "crawl_report", None)
     # Compatibility/debug only; callers must use the returned batch's own report.
     records_for_brand.last_crawl_report = crawl_report  # type: ignore[attr-defined]
