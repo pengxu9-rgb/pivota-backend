@@ -69,6 +69,36 @@ def _page_attempts() -> int:
 # priced under a dollar; a floor this low cannot drop a real product.
 MIN_SELLABLE_PRICE = 1.0
 
+# Gift-with-purchase / free-sample items a store lists with a NOMINAL price, so the $1 floor above keeps them
+# (measured 2026-09-24: westman-atelier.com's $26 "Blush Stick" deluxe GWP mini, tagged `gwp`). Census
+# 2026-09-24, 24,523 products across 54 US stores: these EXACT tag tokens (casefolded, whole tag) mark only
+# gifts -- and a SUBSTRING match is not safe: paid products carry `solo_gwp_elta_pca`,
+# `rationale_4_eye_cream_gwp`, `excludefromgwp:sitewide`. Tags that LOOK related but mark sellable products and
+# must never be added here: yblocklist, searchanise_ignore, gorgias_do_not_recommend, brand promo, freesample
+# (Sol de Janeiro $26 mists), sample (travel sprays), free-gifts / free_gifts (perfumania $24.95 sets),
+# "sets not for sale" (sokoglam $199 routines). Measured cost of this rule on the census: 0 sellable dropped.
+GIFT_WITH_PURCHASE_TAGS = frozenset({
+    "gwp", "filter::type_gwp", "filter::type_sample", "_free_gift", "_free_gift_sample", "checkout-sample",
+    "motivator_hidden_product", "gwp:brand", "gwp:sitewide", "subscription gwp", "gwp-choice",
+    "gift with purchase",
+})
+# Titles that mark a paid-listed gift no tag marks ("[FREE GIFT] ...", "FREE SAMPLE ...", "... Gift with Purchase",
+# "Loyalty Reward - ..."). NOT a bare leading "Free": ezenzia sells "Free Random Fragrance" at $19.99.
+_GIFT_WITH_PURCHASE_TITLE = re.compile(
+    r"^\[?\s*free\s+(?:gift|sample)s?\s*\]?(?=[\W_]|$)|\bgift\s+with\s+purchase\b|^loyalty\s+reward\b", re.I)
+
+
+def gift_with_purchase_reason(product: Dict[str, Any]) -> Optional[str]:
+    """Why this Shopify product is a gift/sample rather than something a buyer can order, or None."""
+    raw = product.get("tags")
+    tags = raw if isinstance(raw, list) else str(raw or "").split(",")
+    tokens = {str(t).strip().casefold() for t in tags if str(t).strip()}
+    hit = sorted(tokens & GIFT_WITH_PURCHASE_TAGS)
+    if hit:
+        return f"tag:{hit[0]}"
+    m = _GIFT_WITH_PURCHASE_TITLE.search(str(product.get("title") or "").strip())
+    return f"title:{m.group(0).strip()}" if m else None
+
 # The axis a variant varies on, named the way the shop names it. Shopify reports
 # a product's axes in `options`, and `option1` is a value on the FIRST of them.
 # A shop with no axis at all reports the placeholder "Title" / "Default Title",
@@ -2645,7 +2675,12 @@ async def records_for_brand(
         records_for_brand.last_fold_report = fold_report  # type: ignore[attr-defined]
     records: List[Dict[str, Any]] = []
     pairs: List[Dict[str, Any]] = []  # (product, record) needing a PDP INCI try
+    gifts_dropped: List[Dict[str, Any]] = []  # recorded, never silent: which products and why
     for p in products:
+        gift = gift_with_purchase_reason(p)
+        if gift:
+            gifts_dropped.append({"handle": p.get("handle"), "title": p.get("title"), "reason": gift})
+            continue
         rec = shopify_product_to_record(
             # brand_by_vendor (multi-brand retailer cohorts): each vendor's OWN canonical spelling, applied
             # by the same resolve_record_brand rule a single-brand job's `brand` gets.
@@ -2696,7 +2731,9 @@ async def records_for_brand(
         records_for_brand.last_brand_spelling_folds = canonical  # type: ignore[attr-defined]
     else:
         records_for_brand.last_brand_spelling_folds = {}  # type: ignore[attr-defined]
-    report = {**crawl_report, "emitted_records": len(records)} if crawl_report is not None else None
+    report = {**crawl_report, "emitted_records": len(records),
+              "gift_items_dropped": len(gifts_dropped),
+              "gift_items_dropped_sample": gifts_dropped[:50]} if crawl_report is not None else None
     if report is not None and identity_report is not None:
         report["gtin_recovery"] = identity_report
     return CuratedRecordBatch(records, crawl_report=report)

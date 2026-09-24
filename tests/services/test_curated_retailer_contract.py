@@ -123,6 +123,7 @@ async def test_vendor_selection_scans_past_selected_product_budget(monkeypatch):
     assert len(records) == 1 and len(reqs) == 4
     assert records.crawl_report == {
         "status": "complete", "pages": 4, "scanned_products": 5, "selected_products": 1, "emitted_records": 1,
+        "gift_items_dropped": 0, "gift_items_dropped_sample": [],
     }
 
 
