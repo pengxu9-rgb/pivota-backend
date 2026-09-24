@@ -101,7 +101,8 @@ def env(monkeypatch):
             if state.readback_rows is not None:
                 return state.readback_rows
             return [{"product_key": k, "category_path": "beauty/makeup/lip/tint", "serving": True,
-                     "pipeline_stage": "public_indexed", "offers": 1, "offers_in_currency": 1}
+                     "pipeline_stage": "public_indexed", "lifecycle": "published", "offers": 1,
+                     "offers_in_currency": 1}
                     for k in values["keys"]]
     state.db = DB()
     return state
@@ -190,6 +191,29 @@ async def test_the_lip_title_option_reaches_the_crawl(env):
                                        accepted_flags=["placed_by_lip_title:soft-matte"]), db=env.db)
     assert out["status"] == "done"
     assert feed._LIP_TITLE_EVIDENCE.get() is False  # scoped to the stage
+
+
+@pytest.mark.parametrize("lifecycle,ok", [("candidate", False), ("draft", False), (None, False),
+                                          ("validated", True), ("published", True)])
+async def test_a_row_search_cannot_see_fails_the_readback(env, lifecycle, ok):
+    """Serving-eligible is not searchable: recall reads only validated/published (pivot_query_service)."""
+    async def fetch_all(sql, values):
+        return [{"product_key": k, "category_path": "beauty/skincare/moisturize/cream", "serving": True,
+                 "pipeline_stage": "shadow_indexed", "lifecycle": lifecycle, "offers": 2, "offers_in_currency": 2}
+                for k in values["keys"]]
+    env.db.fetch_all = fetch_all
+    out = await pipeline.run_stage(job("apply_due"), db=env.db)
+    assert (out["status"], out["outcome"]) == (("done", "applied") if ok else ("failed", "readback_failed"))
+    if not ok:
+        run = list(env.ledger.runs.values())[-1]
+        assert run["readback"]["problems"][0]["problem"] == f"not searchable: pdp_lifecycle_stage {lifecycle!r}"
+
+
+def test_the_searchable_stages_are_the_ones_recall_filters_on():
+    import pathlib, re
+    src = pathlib.Path("services/pivot_query_service.py").read_text()
+    filters = set(re.findall(r"pdp_lifecycle_stage IN \(([^)]*)\)", src))
+    assert filters and all(set(re.findall(r"'(\w+)'", f)) == set(pipeline.SEARCHABLE_LIFECYCLE_STAGES) for f in filters)
 
 
 async def test_a_readback_problem_fails_the_job_after_apply(env):

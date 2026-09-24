@@ -236,6 +236,10 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
     return {"plan": plan, "inspection": inspection, "checks": checks, "flags": flags, "blocking": blocking}
 
 
+#: The lifecycle stages recall serves (services/pivot_query_service.py filters on exactly these).
+SEARCHABLE_LIFECYCLE_STAGES = ("validated", "published")
+
+
 async def _readback(product_keys: List[str], currency: str, db: Any) -> Dict[str, Any]:
     """Did what the gate says landed actually land servable? One row per applied product."""
     if not product_keys:
@@ -243,7 +247,7 @@ async def _readback(product_keys: List[str], currency: str, db: Any) -> Dict[str
     rows = await db.fetch_all(
         """
         SELECT p.product_key, p.category_path, coalesce(ips.serving_eligible, false) AS serving,
-               ips.pipeline_stage,
+               ips.pipeline_stage, p.pdp_lifecycle_stage AS lifecycle,
                (SELECT count(*) FROM catalog_offers o WHERE o.product_key = p.product_key
                   AND o.suppressed_at IS NULL) AS offers,
                (SELECT count(*) FROM catalog_offers o WHERE o.product_key = p.product_key
@@ -264,6 +268,13 @@ async def _readback(product_keys: List[str], currency: str, db: Any) -> Dict[str
             problems.append({"product_key": r["product_key"], "problem": "no category_path"})
         if not r["serving"]:
             problems.append({"product_key": r["product_key"], "problem": "not serving-eligible"})
+        # Serving-eligible is not searchable: recall (services.pivot_query_service) reads only
+        # validated/published rows. Measured 2026-09-24: 14 of 28 O HUI rows at buybeautykorea.com
+        # landed serving-eligible but `candidate` (no taxonomy signal: the store has no tags), and this
+        # readback called them verified.
+        if r.get("lifecycle") not in SEARCHABLE_LIFECYCLE_STAGES:
+            problems.append({"product_key": r["product_key"],
+                             "problem": f"not searchable: pdp_lifecycle_stage {r.get('lifecycle')!r}"})
         if not r["offers"] or r["offers_in_currency"] != r["offers"]:
             problems.append({"product_key": r["product_key"],
                              "problem": f"offers {r['offers']}, in {currency}: {r['offers_in_currency']}"})
