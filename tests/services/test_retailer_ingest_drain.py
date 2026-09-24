@@ -1,6 +1,8 @@
 """The drain entrypoint: disabled by default, one stage per execution, errors fail the execution."""
 import json
 
+import pytest
+
 import jobs.retailer_ingest_drain as drain
 
 
@@ -166,3 +168,33 @@ async def test_each_claim_leases_only_what_is_left_of_the_task(monkeypatch):
     await drain.drain_loop(lease_seconds=4200, budget_seconds=1800, db=object(), task_timeout_seconds=3600,
                            clock=Script([0, 0, 500, 1000, 1500]))
     assert leases == [4200, 2600 + drain.LEASE_SLACK_SECONDS]
+
+
+# ------------------------------------------------------------------ lanes (RETAILER_INGEST_MAX_LEASES)
+
+
+@pytest.mark.parametrize("env, lanes", [(None, 1), ("2", 2), (" 3 ", 3), ("0", 1), ("99", 1), ("two", 1), ("", 1)])
+def test_the_lane_count_reaches_the_claim_and_a_bad_value_is_one_lane(monkeypatch, capsys, env, lanes):
+    seen = []
+
+    class DB:
+        async def connect(self):
+            return None
+
+        async def disconnect(self):
+            return None
+
+    async def claim(**kw):
+        seen.append(kw["max_leases"])
+        return None
+    if env is None:
+        monkeypatch.delenv("RETAILER_INGEST_MAX_LEASES", raising=False)
+    else:
+        monkeypatch.setenv("RETAILER_INGEST_MAX_LEASES", env)
+    monkeypatch.setenv("RETAILER_INGEST_DRAIN_ENABLED", "1")
+    monkeypatch.setattr("sys.argv", ["drain"])
+    monkeypatch.setattr(drain, "database", DB())
+    monkeypatch.setattr(drain.ledger, "claim_due_job", claim)
+    monkeypatch.setattr(drain.ledger, "status_counts", _counts)
+    assert drain.main() == 0
+    assert seen == [lanes]

@@ -12,11 +12,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import os
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from db.database import database
+
+logger = logging.getLogger(__name__)
 
 STATUSES = ("queued", "apply_due", "held", "done", "nothing", "failed", "cancelled")  # migration 234 CHECK
 OPEN_STATUSES = ("queued", "apply_due", "held")
@@ -60,32 +64,75 @@ async def enqueue_job(*, domain: str, brand: str, options: Dict[str, Any], prior
     return row["id"] if row else None
 
 
-async def claim_due_job(*, lease_seconds: int, db: Any = None) -> Optional[Dict[str, Any]]:
-    """Claim ONE due job (one crawl per tick keeps a shared crawl IP polite)."""
-    write_db = db or database
-    row = await write_db.fetch_one(
-        """
-        WITH lane AS (SELECT pg_try_advisory_xact_lock(hashtext('retailer_ingest_drain')) AS mine)
-        UPDATE retailer_ingest_jobs
-        SET lease_until = NOW() + (CAST(:lease AS integer) * interval '1 second'), updated_at = NOW()
-        -- Two executions starting at the same instant would both pass the busy-lease check below;
-        -- the transaction-scoped advisory lock lets exactly one of them claim.
-        WHERE (SELECT mine FROM lane) AND id = (
-            SELECT id FROM retailer_ingest_jobs
-            WHERE status IN ('queued', 'apply_due')
-              AND next_run_at <= NOW()
-              AND (lease_until IS NULL OR lease_until < NOW())
-              -- one crawl at a time: a slow stage still holding its lease blocks the next tick
-              AND NOT EXISTS (SELECT 1 FROM retailer_ingest_jobs busy
-                              WHERE busy.lease_until > NOW())
-            ORDER BY priority DESC, next_run_at, created_at
-            LIMIT 1
-            FOR UPDATE SKIP LOCKED
-        )
-        RETURNING *
-        """,
-        {"lease": int(lease_seconds)},
+_CLAIM_LANE_LOCK_SQL = "SELECT pg_try_advisory_xact_lock(hashtext('retailer_ingest_drain')) AS mine"
+
+#: A job's host is compared lowercased with "www." dropped: a store's single-brand re-crawl job and
+#: its multi_brand store cohort are different scope_keys but ONE host. (A literal, not an f-string:
+#: tests/test_repo_sql_prepare_postgres.py PREPAREs module-level literals.)
+_CLAIM_SQL = """
+    WITH busy AS (
+        SELECT regexp_replace(lower(domain), '^www[.]', '') AS host, status FROM retailer_ingest_jobs WHERE lease_until > NOW()
     )
+    UPDATE retailer_ingest_jobs
+    SET lease_until = NOW() + (CAST(:lease AS integer) * interval '1 second'), updated_at = NOW()
+    WHERE id = (
+        SELECT id FROM retailer_ingest_jobs
+        WHERE status IN ('queued', 'apply_due')
+          AND next_run_at <= NOW()
+          AND (lease_until IS NULL OR lease_until < NOW())
+          -- at most :max_leases stages in flight (1 = one crawl at a time, the default)
+          AND (SELECT count(*) FROM busy) < CAST(:max_leases AS integer)
+          -- never two crawls at one host, whatever the cohort shape of the job holding it
+          AND regexp_replace(lower(domain), '^www[.]', '') NOT IN (SELECT host FROM busy)
+          -- catalog writes stay serial: an apply waits while any other apply is in flight
+          AND NOT (status = 'apply_due' AND EXISTS (SELECT 1 FROM busy WHERE busy.status = 'apply_due'))
+        ORDER BY priority DESC, next_run_at, created_at
+        LIMIT 1
+        FOR UPDATE SKIP LOCKED
+    )
+    RETURNING *
+"""
+
+
+#: Every lane is its own execution with its own pool (DB_POOL_MAX_SIZE), and every crawl leaves from
+#: the one crawl NAT: a typo must not become 30 crawls.
+MAX_LEASES_CEILING = 4
+
+
+def max_leases_from_env() -> int:
+    """RETAILER_INGEST_MAX_LEASES: stages the lane may run at once (default 1). Overlapping */10
+    executions are the lanes; this caps them. Bad values fall back to 1, never to unlimited."""
+    raw = str(os.getenv("RETAILER_INGEST_MAX_LEASES", "1")).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if 1 <= value <= MAX_LEASES_CEILING:
+        return value
+    logger.warning("RETAILER_INGEST_MAX_LEASES=%r is not 1..%d; running one lane", raw, MAX_LEASES_CEILING)
+    return 1
+
+
+async def claim_due_job(*, lease_seconds: int, max_leases: int = 1, db: Any = None) -> Optional[Dict[str, Any]]:
+    """Claim ONE due job, or None. Up to `max_leases` stages run at once (default 1), never two at one
+    host (a shared crawl IP stays polite to each store) and never two applies (catalog writes stay
+    serial).
+
+    Two statements in one transaction, not one: the lane lock must be held BEFORE the claim takes
+    its snapshot. A single statement snapshots first and locks second, so a claim that wins the
+    lock just after another commits reads the lease table from before that claim, and can put a
+    second crawl on the same host. An execution that loses the lock exits idle; the next tick retries.
+    This relies on READ COMMITTED (every statement takes a fresh snapshot), which is what prod runs;
+    under REPEATABLE READ the snapshot would be the lock statement's and the race would return.
+    """
+    if not 1 <= int(max_leases) <= MAX_LEASES_CEILING:
+        raise ValueError(f"max_leases must be 1..{MAX_LEASES_CEILING}")
+    write_db = db or database
+    async with write_db.transaction():
+        lane = await write_db.fetch_one(_CLAIM_LANE_LOCK_SQL)
+        if not (lane and lane["mine"]):
+            return None
+        row = await write_db.fetch_one(_CLAIM_SQL, {"lease": int(lease_seconds), "max_leases": int(max_leases)})
     if not row:
         return None
     job = dict(row)
