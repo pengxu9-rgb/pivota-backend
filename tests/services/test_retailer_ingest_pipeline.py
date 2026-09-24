@@ -798,15 +798,20 @@ def test_a_family_vendor_can_only_be_mapped_within_its_family(brands, ok):
 
 # --- a row the index refused on content is a note, not a failed store (westman-atelier.com, 2026-09-24) ----
 
-def _rows(blockers):
+def _rows(blockers, **evidence):
+    """One readback row per key; `evidence` overrides the IPS columns on the refused row(s)."""
     async def fetch_all(sql, values):
         out = []
         for i, k in enumerate(values["keys"]):
             b = blockers[i] if i < len(blockers) else None
-            out.append({"product_key": k, "category_path": "beauty/makeup/lip/tint", "serving": b is None,
-                        "pipeline_stage": "public_indexed" if b is None else "extracted", "blocker_code": b or "none",
-                        "blocker_detail": "content_quality_score=71.2 < 71.4" if b else None,
-                        "lifecycle": "published", "offers": 1, "offers_in_currency": 1})
+            row = {"product_key": k, "category_path": "beauty/makeup/lip/tint", "serving": b is None,
+                   "pipeline_stage": "public_indexed" if b is None else "extracted", "blocker_code": b or "none",
+                   "blocker_detail": "content_quality_score=71.2 < 71.4" if b else None,
+                   "lifecycle": "published", "offers": 1, "offers_in_currency": 1,
+                   "has_price": True, "identity_resolved": True, "has_image": True}
+            if b:
+                row.update(evidence)
+            out.append(row)
         return out
     return fetch_all
 
@@ -843,3 +848,31 @@ def test_the_content_refusal_codes_are_codes_the_index_assigns():
     src = (pathlib.Path(__file__).resolve().parents[2] / "services" / "index_pipeline_state_service.py").read_text()
     assigned = set(re.findall(r'blocker_code = "([a-z_]+)"', src))
     assert set(pipeline.INDEX_CONTENT_REFUSALS) <= assigned, set(pipeline.INDEX_CONTENT_REFUSALS) - assigned
+
+
+
+@pytest.mark.parametrize("evidence", [{"has_price": False}, {"identity_resolved": False}, {"has_image": False}],
+                         ids=["no_price_masked", "identity_masked", "planned_image_lost"])
+async def test_a_content_refusal_that_may_mask_a_lost_write_still_fails(env, evidence):
+    """The index records only the first failed check: low_quality sits ahead of no_price and entity_unresolved,
+    and apply overwrites image_url -- so the note path needs the index's own evidence that the write landed."""
+    env.rows = [TINT, ("3CE - Velvet Lip Tint Rose 4g", "LIP TINT", "velvet-lip-tint-rose")]  # both carry an image
+    env.db.fetch_all = _rows([None, "low_quality"], **evidence)
+    out = await pipeline.run_stage(job("apply_due"), db=env.db)
+    assert (out["status"], out["outcome"]) == ("failed", "readback_failed")
+
+
+async def test_a_product_the_store_publishes_without_an_image_is_still_only_a_note(env):
+    no_image = ("3CE - Velvet Lip Tint Nude 4g", "LIP TINT", "velvet-lip-tint-nude")
+    env.rows = [TINT, no_image]
+    real = feed.shopify_product_to_record
+    def without_image(product, **kw):
+        if product.get("handle") == "velvet-lip-tint-nude":
+            product = {**product, "images": []}
+        return real(product, **kw)
+    import services.curated_brand_feed as cbf
+    env.db.fetch_all = _rows([None, "no_image"], has_image=False)
+    import unittest.mock as um
+    with um.patch.object(cbf, "shopify_product_to_record", side_effect=without_image):
+        out = await pipeline.run_stage(job("apply_due"), db=env.db)
+    assert (out["status"], out["outcome"]) == ("done", "applied")

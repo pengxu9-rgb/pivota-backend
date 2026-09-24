@@ -410,7 +410,8 @@ BACKEND_RECALL_LIFECYCLE_STAGES = ("validated", "published")
 INDEX_CONTENT_REFUSALS = ("low_quality", "no_image", "short_description", "non_core_product")
 
 
-async def _readback(product_keys: List[str], currency: str, db: Any) -> Dict[str, Any]:
+async def _readback(product_keys: List[str], currency: str, db: Any,
+                    planned_images: Optional[Dict[str, bool]] = None) -> Dict[str, Any]:
     """Did what the gate says landed actually land servable? One row per applied product."""
     if not product_keys:
         return {"ok": False, "reason": "no product keys to read back", "notes": [], "rows": []}
@@ -418,6 +419,8 @@ async def _readback(product_keys: List[str], currency: str, db: Any) -> Dict[str
         """
         SELECT p.product_key, p.category_path, coalesce(ips.serving_eligible, false) AS serving,
                ips.pipeline_stage, ips.blocker_code, ips.blocker_detail, p.pdp_lifecycle_stage AS lifecycle,
+               coalesce(ips.has_price, false) AS has_price, coalesce(ips.identity_resolved, false) AS identity_resolved,
+               coalesce(ips.has_image, false) AS has_image,
                (SELECT count(*) FROM catalog_offers o WHERE o.product_key = p.product_key
                   AND o.suppressed_at IS NULL) AS offers,
                (SELECT count(*) FROM catalog_offers o WHERE o.product_key = p.product_key
@@ -442,7 +445,13 @@ async def _readback(product_keys: List[str], currency: str, db: Any) -> Dict[str
             # system working, not a lost write: note it, keep the store applied. Every other reason --
             # suppressed, not live, no seed/extraction, unscored, no price, unresolved identity -- can
             # mean the write itself went wrong, and still fails the job.
-            if r.get("blocker_code") in INDEX_CONTENT_REFUSALS:
+            # The index records only the FIRST failed check, and low_quality / non_core_product sit ahead of
+            # no_price and entity_unresolved: a content code can mask a lost write. So a refusal is a note only
+            # when the index's own stored evidence also shows a priced offer and a resolved identity, and an
+            # image this plan wrote actually landed (apply overwrites image_url, so a missing one is ours).
+            wrote_image = bool((planned_images or {}).get(r["product_key"]))
+            if (r.get("blocker_code") in INDEX_CONTENT_REFUSALS and r.get("has_price") and r.get("identity_resolved")
+                    and not (wrote_image and not r.get("has_image"))):
                 notes.append({"product_key": r["product_key"], "kind": "index_refused",
                               "note": f"not served: the index refused it on content ({r.get('blocker_code')}"
                                       f"{': ' + str(r.get('blocker_detail'))[:160] if r.get('blocker_detail') else ''})"})
@@ -565,7 +574,8 @@ async def _apply(job: Dict[str, Any], run_id: str, result: Dict[str, Any], summa
     gate = evaluate_apply_log("primary ingestion: " + json.dumps(report, default=str) + "\nJOB=pipeline RC=0",
                               domain=job["domain"])
     currency = (job.get("options") or {}).get("require_currency") or "USD"
-    readback = await _readback(gate.get("product_keys") or [], currency, db)
+    readback = await _readback(gate.get("product_keys") or [], currency, db,
+                               planned_images={p.get("product_key"): bool(p.get("image_url")) for p in plan.get("pdps") or []})
     ok = bool(gate.get("ok")) and readback["ok"]
     outcome = "applied" if ok else ("gate_failed" if not gate.get("ok") else "readback_failed")
     await ledger.finish_run(run_id, outcome=outcome, **summary, applied={"gate": gate}, readback=readback,
