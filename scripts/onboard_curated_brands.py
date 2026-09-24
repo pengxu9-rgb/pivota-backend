@@ -274,12 +274,17 @@ def _print_lip_title_rows(records: List[Dict[str, Any]]) -> int:
 CATEGORY_FILTER_MARKER = "category filter report: "
 
 
+def _normalize_category_prefix(prefix: Optional[str]) -> str:
+    """The one spelling of a category filter prefix: trimmed, no edge slashes, lower case."""
+    return (prefix or "").strip().strip("/").lower()
+
+
 def _partition_by_category(records: List[Dict[str, Any]], *, prefix: Optional[str]) -> tuple:
     """(kept, left_out) for the category filter below. Pure: no printing, no raising. Each left-out
     entry names the row and WHY -- `category_unresolved` (the taxonomy cannot place it) or
     `outside_category_filter` (it resolves, but not under `prefix`)."""
     from services.category_path_aliases import resolve
-    want = (prefix or "").strip().strip("/").lower()
+    want = _normalize_category_prefix(prefix)
     kept, left_out = [], []
     for record in records:
         pdp = record.get("pdp")
@@ -317,7 +322,7 @@ def _select_by_category(records: List[Dict[str, Any]], *, prefix: Optional[str],
     and --only-vendor. A record with no `pdp` is not a category question: it is kept, and the plan
     refuses it exactly as it would without this filter.
     """
-    want = (prefix or "").strip().strip("/").lower()
+    want = _normalize_category_prefix(prefix)
     kept, left_out = _partition_by_category(records, prefix=prefix)
     _print_category_filter(len(records), kept, left_out, want=want, domain=domain)
     if not kept:

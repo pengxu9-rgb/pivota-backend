@@ -198,11 +198,13 @@ LEFT_OUT_STR_CAP = 200
 
 def _ledger_safe(value: Any) -> Optional[str]:
     """A merchant string as Postgres jsonb will take it: no NUL (jsonb refuses \\u0000), no NaN
-    (refused as a token), bounded length. The run row must never fail to write over a product name --
-    a failed finish_run leaves the job wedged until its lease expires."""
+    (refused as a token), no lone surrogate (not encodable as UTF-8), bounded length. The run row must
+    never fail to write over a product name: a failed finish_run leaves the run unfinished, and the
+    next execution treats the stage as interrupted and spends an attempt on it."""
     if value is None or (isinstance(value, float) and value != value):
         return None
-    return str(value).replace("\x00", "")[:LEFT_OUT_STR_CAP]
+    text = str(value).replace("\x00", "").encode("utf-8", "replace").decode("utf-8")
+    return text[:LEFT_OUT_STR_CAP]
 
 
 def _left_out_summary(left_out: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -244,7 +246,7 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
         selected = len(records)
         records, left_out = cli._partition_by_category(records, prefix=o.get("only_category"))
         cli._print_category_filter(selected, records, left_out, domain=job["domain"],
-                                   want=(o.get("only_category") or "").strip().strip("/").lower())
+                                   want=cli._normalize_category_prefix(o.get("only_category")))
         checks["left_out"] = _left_out_summary(left_out)
         if not records:
             checks["kept"] = 0

@@ -467,10 +467,12 @@ def test_merchant_types_are_capped_and_say_so():
 def test_a_hostile_product_name_cannot_stop_the_run_row_being_written():
     """jsonb refuses \\u0000 and NaN; the ledger serialises with db.retailer_ingest._dumps."""
     from db.retailer_ingest import _dumps
-    summary = pipeline._left_out_summary([{"reason": "category_unresolved", "product_name": "a\x00b" + "x" * 5000,
+    summary = pipeline._left_out_summary([{"reason": "category_unresolved", "handle": "bad\ud800name",
+                                           "product_name": "a\x00b" + "x" * 5000,
                                            "category_path": float("nan"), "merchant_product_type": "\x00Misc"}])
     text = _dumps(summary)
     assert "\\u0000" not in text and "NaN" not in text
+    text.encode("utf-8")  # a lone surrogate would raise here
     [row] = summary["rows"]
     assert row["product_name"].startswith("ab") and len(row["product_name"]) == pipeline.LEFT_OUT_STR_CAP
     assert row["category_path"] is None and summary["by_merchant_type"] == {"Misc": 1}
