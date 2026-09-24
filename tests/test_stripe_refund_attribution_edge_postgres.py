@@ -608,3 +608,103 @@ async def test_two_merchant_refunds_raise_the_edge_to_the_order_total(
     assert await _order_total_refunded() == Decimal("500")
     edge = await _edge()
     assert edge["refund_amount_cents"] == 50000, _describe(edge, ledger_emits)
+
+
+# -- 6. the ledger keeps every partial refund, through its REAL dedupe --------
+
+
+@pytest.mark.asyncio
+async def test_each_partial_refund_under_one_charge_id_reaches_the_real_ledger(
+    monkeypatch: pytest.MonkeyPatch, ledger_emits: List[Dict[str, Any]]
+) -> None:
+    """Stripe reports both partials under the SAME ch_. The ledger keeps one event
+    per (merchant, event type, upstream key), so a key built from the refund id kept
+    only the first partial. The `ledger_emits` fake above never dedupes, which is why
+    this test swaps in the real writer and reads the real table."""
+    from sqlalchemy import create_engine
+
+    import services.commerce_attribution_service as attribution
+    from db.commerce_interactions import commerce_interaction_events, commerce_interactions
+    from db.database import database, metadata
+    from services.commerce_interaction_service import record_commerce_event_best_effort
+
+    engine = create_engine(DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://"))
+    try:
+        metadata.create_all(
+            engine, tables=[commerce_interactions, commerce_interaction_events], checkfirst=True
+        )
+    finally:
+        engine.dispose()
+
+    async def delete_ledger_rows() -> None:
+        await database.execute(
+            "DELETE FROM commerce_interaction_events WHERE merchant_id = :m", {"m": MERCHANT_ID}
+        )
+        await database.execute(
+            "DELETE FROM commerce_interactions WHERE merchant_id = :m", {"m": MERCHANT_ID}
+        )
+
+    await delete_ledger_rows()
+    monkeypatch.setattr(attribution, "record_commerce_event_best_effort", record_commerce_event_best_effort)
+    try:
+        await _send(monkeypatch, "charge.refunded", _charge_refunded(30000))
+        await _send(monkeypatch, "charge.refunded", _charge_refunded(50000))
+        # A redelivery of the second report adds 0 and must not add a third event.
+        await _send(monkeypatch, "charge.refunded", _charge_refunded(50000))
+
+        edge = await _edge()
+        assert edge["refund_amount_cents"] == 50000, _describe(edge, ledger_emits)
+        rows = await database.fetch_all(
+            "SELECT upstream_idempotency_key FROM commerce_interaction_events "
+            "WHERE merchant_id = :m AND event_type = 'refund.succeeded' ORDER BY upstream_idempotency_key",
+            {"m": MERCHANT_ID},
+        )
+        assert [r["upstream_idempotency_key"] for r in rows] == [
+            f"refund_total:{ORDER_ID}:30000",
+            f"refund_total:{ORDER_ID}:50000",
+        ]
+    finally:
+        await delete_ledger_rows()
+
+
+# -- 7. a failed edge write cannot take create_refund's refund record with it --
+
+
+@pytest.mark.asyncio
+async def test_a_failed_edge_write_inside_create_refund_keeps_the_refund_record(
+    monkeypatch: pytest.MonkeyPatch, ledger_emits: List[Dict[str, Any]]
+) -> None:
+    """create_refund writes the edge INSIDE its own transaction, after the PSP has
+    refunded. Here the edge UPDATE fails ON THE SERVER exactly the way it would if
+    dispute_amount_cents were missing (the schema_guard heal did not run). Without a
+    savepoint that failed statement aborts the transaction: refund_records and
+    orders.total_refunded are lost while the buyer has their money back."""
+    import services.commerce_attribution_service as attribution
+    from db.database import database
+    from services.refund_service import RefundService
+
+    monkeypatch.setattr(
+        attribution,
+        "_APPLY_REFUND_TOTAL_QUERY",
+        attribution._APPLY_REFUND_TOTAL_QUERY.replace("dispute_amount_cents", "dispute_amount_cents_gone"),
+    )
+    service = RefundService(database)
+
+    async def fake_psp_refund(order, refund_id, amount, reason, *, idempotency_key=None):
+        return {"success": True, "refund_id": "re_psp_ok"}
+
+    monkeypatch.setattr(service, "_process_psp_refund", fake_psp_refund)
+
+    result = await service.create_refund(
+        order_id=ORDER_ID, amount=300.0, reason="requested_by_customer", idempotency_key="edge_savepoint"
+    )
+
+    assert result["status"] == "success", result
+    record = await database.fetch_one(
+        "SELECT status, psp_refund_id FROM refund_records WHERE order_id = :o", {"o": ORDER_ID}
+    )
+    assert record is not None, "the refund record was lost with the aborted transaction"
+    assert (record["status"], record["psp_refund_id"]) == ("completed", "re_psp_ok")
+    assert await _order_total_refunded() == Decimal("300")
+    edge = await _edge()
+    assert edge["refund_amount_cents"] == 0, "the failed edge write is rolled back on its own"

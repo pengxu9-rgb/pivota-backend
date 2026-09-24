@@ -134,14 +134,23 @@ class RefundService:
                         # _update_refund_success wrote it, rather than read back:
                         # one more statement here is one more way to abort this
                         # transaction and lose the refund record.
-                        attribution_rows = await apply_refund_total_rows(
-                            order_id=order_id,
-                            refund_id=refund_id,
-                            total_refunded=(
-                                Decimal(str(order.get("total_refunded") or "0"))
-                                + Decimal(str(amount))
-                            ),
-                        )
+                        #
+                        # In its OWN savepoint (a nested transaction): a failed
+                        # statement here, such as dispute_amount_cents missing
+                        # because the schema_guard heal did not run, would
+                        # otherwise abort this whole transaction. The PSP has
+                        # already refunded, so that would lose refund_records and
+                        # total_refunded. With the savepoint, only the edge write
+                        # is rolled back.
+                        async with self.db.transaction():
+                            attribution_rows = await apply_refund_total_rows(
+                                order_id=order_id,
+                                refund_id=refund_id,
+                                total_refunded=(
+                                    Decimal(str(order.get("total_refunded") or "0"))
+                                    + Decimal(str(amount))
+                                ),
+                            )
                     except Exception as attribution_exc:
                         logger.warning(
                             "Failed to attach refund attribution edge for %s: %s",

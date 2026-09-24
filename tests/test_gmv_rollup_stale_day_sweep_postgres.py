@@ -145,13 +145,23 @@ async def _edge(db, *, edge_id, order_id, gross, created_at, merchant=MERCHANT, 
 
 
 async def _nightly(db, day=DAY):
-    """The daily job's roll-up of `day`, as it ran at 02:00 UTC the morning after."""
+    """The daily job's roll-up of `day`, as it ran at 02:00 UTC the morning after.
+
+    Only for a day before yesterday. Yesterday's 02:00 roll-up is TODAY 02:00, in the future before
+    that hour, and a future stamp makes every later change look older than the roll-up: a test that
+    used it passed or failed by the time of day it ran (found on main at 00:07 UTC).
+    """
     from services.gmv_aggregation_service import aggregate_daily
 
+    # By date, not hour, so the misuse fails at every hour of the day.
+    assert day <= datetime.now(timezone.utc).date() - timedelta(days=2), (
+        f"_nightly({day}): its 02:00 roll-up stamp is not safely in the past; use a day before yesterday"
+    )
+    at = _at(day + timedelta(days=1), 2)
     await aggregate_daily(day)
     await db.execute(
         "UPDATE gmv_attribution_daily SET updated_at = :at WHERE date = :d",
-        {"at": _at(day + timedelta(days=1), 2), "d": day},
+        {"at": at, "d": day},
     )
 
 
@@ -492,24 +502,25 @@ async def test_the_sweep_never_rewrites_an_invoiced_day(db, caplog):
 
     from services import gmv_aggregation_service as gmv
 
-    await _edge(db, edge_id="cae_1", order_id="ord_1", gross=10_000, created_at=_at(DAY, 12))
-    # Another merchant on the day after the billed period: the sweep must go on and heal it.
-    after = DAY + timedelta(days=1)
+    # MERCHANT's day is billed; another merchant sits on the day after the billed period, and the
+    # sweep must go on and heal it. Both days are before yesterday (see _nightly).
+    billed_day, after = DAY - timedelta(days=1), DAY
+    await _edge(db, edge_id="cae_1", order_id="ord_1", gross=10_000, created_at=_at(billed_day, 12))
     await _edge(db, edge_id="cae_2", order_id="ord_2", gross=8_000, created_at=_at(after, 13), merchant="m_other")
-    await _nightly(db)
+    await _nightly(db, billed_day)
     await _nightly(db, after)
-    # A completed billing run invoiced MERCHANT for a period ending on DAY.
+    # A completed billing run invoiced MERCHANT for a period ending on billed_day.
     run_id = await db.fetch_val(
         "INSERT INTO billing_runs (period_start, period_end, idempotency_key, status) "
         "VALUES (:s, :e, 'sweep-run', 'completed') RETURNING id",
-        {"s": DAY - timedelta(days=3), "e": DAY},
+        {"s": billed_day - timedelta(days=3), "e": billed_day},
     )
     await db.execute(
         "INSERT INTO invoices (merchant_id, billing_period_start, billing_period_end, status, billing_run_id) "
         "VALUES (:m, :s, :e, 'finalized', :run)",
-        {"m": MERCHANT, "s": DAY - timedelta(days=3), "e": DAY, "run": run_id},
+        {"m": MERCHANT, "s": billed_day - timedelta(days=3), "e": billed_day, "run": run_id},
     )
-    billed = await _rollup(db)
+    billed = await _rollup(db, billed_day)
     # Both edges are refunded after the invoice went out.
     await db.execute(
         "UPDATE commerce_attribution_edges SET refund_amount_cents = 2500, updated_at = NOW()"
@@ -519,7 +530,7 @@ async def test_the_sweep_never_rewrites_an_invoiced_day(db, caplog):
         summary = await gmv.reroll_stale_days()
 
     assert summary == {"stale_days": 2, "invoiced_period_manual_credit": 1, "recomputed": 1}
-    assert await _rollup(db) == billed  # untouched, updated_at included
+    assert await _rollup(db, billed_day) == billed  # untouched, updated_at included
     assert _sums(await _rollup(db, after, merchant="m_other")) == {"g": 8_000, "r": 2_500, "n": 5_500, "bp": 1000, "t": 550}
     assert any(
         "gmv_rollup_recompute_skipped_invoiced_day" in r.getMessage() and "cae_1" in r.getMessage()
@@ -534,9 +545,10 @@ async def test_the_sweep_leaves_fresh_days_today_and_old_changes_alone(db):
     await _edge(db, edge_id="cae_fresh", order_id="ord_fresh", gross=10_000, created_at=_at(DAY, 12))
     await _nightly(db)
     fresh = await _rollup(db)
-    # Today's edge is tomorrow's nightly run's to roll.
-    await _edge(db, edge_id="cae_today", order_id="ord_today", gross=3_000,
-                created_at=datetime.now(timezone.utc) - timedelta(seconds=1))
+    # Today's edge is tomorrow's nightly run's to roll. One clock for the edge and both sweeps, so a
+    # run straddling midnight UTC cannot turn "today" into yesterday.
+    now = datetime.now(timezone.utc)
+    await _edge(db, edge_id="cae_today", order_id="ord_today", gross=3_000, created_at=now)
     # A change older than the lookback: stale, but outside what the nightly sweep retries.
     old_day = TODAY - timedelta(days=10)
     await _edge(db, edge_id="cae_old", order_id="ord_old", gross=5_000, created_at=_at(old_day, 12))
@@ -546,13 +558,13 @@ async def test_the_sweep_leaves_fresh_days_today_and_old_changes_alone(db):
         {"at": datetime.now(timezone.utc) - timedelta(days=gmv.STALE_SWEEP_LOOKBACK_DAYS, hours=1)},
     )
 
-    assert await gmv.reroll_stale_days() == {"stale_days": 0}
+    assert await gmv.reroll_stale_days(now=now) == {"stale_days": 0}
     assert await _rollup(db) == fresh
-    assert await _rollup(db, TODAY) is None
+    assert await _rollup(db, now.date()) is None
     assert _sums(await _rollup(db, old_day))["r"] == 0
 
     # After an outage, an operator widens the lookback by hand.
-    assert await gmv.reroll_stale_days(lookback_days=14) == {"stale_days": 1, "recomputed": 1}
+    assert await gmv.reroll_stale_days(now=now, lookback_days=14) == {"stale_days": 1, "recomputed": 1}
     assert _sums(await _rollup(db, old_day))["r"] == 1_000
 
 

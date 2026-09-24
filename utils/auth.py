@@ -411,6 +411,11 @@ AGENT_OR_ADMIN_ROLES = ["agent"] + ADMIN_ROLES
 # name — see the note in check_permission's permission_map.
 MANAGE_OPERATIONS = "manage_operations"
 
+# Approving, issuing (or retrying) and cancelling a GMV invoice credit: the decisions that send a
+# credit note to Stripe, or decide a merchant is not owed one (routes/admin_gmv_invoice_credits.py).
+# Held only by an EXPLICIT grant in employees.permissions; no role implies it, super_admin included.
+BILLING_CREDITS_APPROVE = "billing.credits.approve"
+
 
 def is_employee(role: str) -> bool:
     """Check if role is an employee role"""
@@ -622,20 +627,30 @@ def has_permission(current_user: Dict[str, Any], required_permission: str) -> bo
     if role in {"employee"} and perm.startswith("reviews."):
         return True
 
-    raw = current_user.get("permissions") or []
+    return permissions_grant(current_user.get("permissions"), perm)
+
+
+def permissions_grant(raw_permissions: Any, required_permission: str) -> bool:
+    """Whether an explicit permissions list grants one permission. No role implies anything here.
+
+    The list is a list, or a comma-separated string (has_permission's parsing, unchanged). Exact
+    match ("reviews.read"), or a wildcard prefix ("reviews.*" grants "reviews.group.manage").
+    has_permission layers its role rules on top of this; a check that must hold for every role
+    (billing credits) uses it alone.
+    """
+    perm = (required_permission or "").strip()
+    if not perm:
+        return False
+    raw = raw_permissions or []
     if isinstance(raw, str):
         perms: List[str] = [p.strip() for p in raw.split(",") if p.strip()]
     elif isinstance(raw, list):
         perms = [str(p).strip() for p in raw if str(p).strip()]
     else:
         perms = []
-
     if perm in perms:
         return True
-    for p in perms:
-        if p.endswith(".*") and perm.startswith(p[:-1]):
-            return True
-    return False
+    return any(p.endswith(".*") and perm.startswith(p[:-1]) for p in perms)
 
 
 def require_employee_permissions(required_permissions: Iterable[str]):

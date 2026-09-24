@@ -101,7 +101,8 @@ def env(monkeypatch):
             if state.readback_rows is not None:
                 return state.readback_rows
             return [{"product_key": k, "category_path": "beauty/makeup/lip/tint", "serving": True,
-                     "pipeline_stage": "public_indexed", "offers": 1, "offers_in_currency": 1}
+                     "pipeline_stage": "public_indexed", "lifecycle": "published", "offers": 1,
+                     "offers_in_currency": 1}
                     for k in values["keys"]]
     state.db = DB()
     return state
@@ -190,6 +191,29 @@ async def test_the_lip_title_option_reaches_the_crawl(env):
                                        accepted_flags=["placed_by_lip_title:soft-matte"]), db=env.db)
     assert out["status"] == "done"
     assert feed._LIP_TITLE_EVIDENCE.get() is False  # scoped to the stage
+
+
+@pytest.mark.parametrize("lifecycle,noted", [("candidate", True), ("draft", True), (None, False),
+                                             ("validated", False), ("published", False)])
+async def test_a_row_backend_recall_cannot_see_is_noted_but_never_fails_the_job(env, lifecycle, noted):
+    """The agent door serves on serving-eligibility alone (2026-09-24: it returned `candidate` O HUI
+    rows); backend global recall admits validated/published/NULL. The run records the difference."""
+    async def fetch_all(sql, values):
+        return [{"product_key": k, "category_path": "beauty/skincare/moisturize/cream", "serving": True,
+                 "pipeline_stage": "shadow_indexed", "lifecycle": lifecycle, "offers": 2, "offers_in_currency": 2}
+                for k in values["keys"]]
+    env.db.fetch_all = fetch_all
+    out = await pipeline.run_stage(job("apply_due"), db=env.db)
+    assert (out["status"], out["outcome"]) == ("done", "applied")
+    readback = list(env.ledger.runs.values())[-1]["readback"]
+    assert readback["problems"] == []
+    assert bool(readback["notes"]) is noted
+    reason = env.ledger.transitions[-1]["reason"]
+    if noted:
+        assert readback["notes"][0]["note"] == f"outside backend global recall: pdp_lifecycle_stage {lifecycle!r}"
+        assert reason.endswith("row(s) outside backend global recall")
+    else:
+        assert reason == "applied and verified"
 
 
 async def test_a_readback_problem_fails_the_job_after_apply(env):
@@ -489,3 +513,20 @@ async def test_a_resolved_row_outside_the_prefix_is_recorded_as_outside_the_filt
     from scripts.onboard_curated_brands import LEFT_OUT_PDP_PREFIX, LEFT_OUT_PRINTED_KEYS
     [line] = [l for l in capsys.readouterr().out.splitlines() if l.startswith(LEFT_OUT_PDP_PREFIX)]
     assert set(json.loads(line[len(LEFT_OUT_PDP_PREFIX):])) == set(LEFT_OUT_PRINTED_KEYS)
+
+
+async def test_the_run_reason_counts_every_noted_row(env):
+    env.rows = [TINT, ("3CE - Velvet Lip Tint Rose 4g", "LIP TINT", "velvet-lip-tint-rose")]
+    async def fetch_all(sql, values):
+        return [{"product_key": k, "category_path": "beauty/makeup/lip/tint", "serving": True,
+                 "pipeline_stage": "shadow_indexed", "lifecycle": "candidate", "offers": 1, "offers_in_currency": 1}
+                for k in values["keys"]]
+    env.db.fetch_all = fetch_all
+    out = await pipeline.run_stage(job("apply_due"), db=env.db)
+    assert out["status"] == "done"
+    assert env.ledger.transitions[-1]["reason"] == "applied and verified; 2 row(s) outside backend global recall"
+
+
+async def test_an_empty_readback_still_carries_its_notes_list():
+    readback = await pipeline._readback([], "USD", db=None)
+    assert readback == {"ok": False, "reason": "no product keys to read back", "notes": [], "rows": []}

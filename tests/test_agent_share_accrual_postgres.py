@@ -19,7 +19,7 @@ _IS_PG = DATABASE_URL.startswith("postgresql://") or DATABASE_URL.startswith("po
 pytestmark = pytest.mark.skipif(not _IS_PG, reason="needs a Postgres DATABASE_URL")
 
 _SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")
-_TABLES = ("agent_share_ledger", "agent_share_rates", "partner_settlement_completions", "settlement_snapshots",
+_TABLES = ("gmv_invoice_credits", "agent_share_ledger", "agent_share_rates", "partner_settlement_completions", "settlement_snapshots",
            "partner_attribution",
            "billing_run_items", "invoice_disputes", "invoices", "billing_runs", "gmv_attribution_daily")
 _MIG = Path(__file__).resolve().parent.parent / "db/migrations"
@@ -50,7 +50,8 @@ async def _build_schema(database):
         "REFERENCES channel_partners(id) ON DELETE SET NULL", "")
     for stmt in split_statements(ddl):
         await database.execute(stmt)
-    for name in _BILLING_MIGRATIONS + ("235_agent_share_accrual.sql", "236_agent_share_after_partner.sql"):
+    for name in _BILLING_MIGRATIONS + ("235_agent_share_accrual.sql", "236_agent_share_after_partner.sql",
+                                          "238_gmv_invoice_credits.sql"):
         for stmt in split_statements((_MIG / name).read_text()):
             await database.execute(stmt)
     # The partner tables, from their real migrations; channel_partners itself is not under test.
