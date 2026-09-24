@@ -386,7 +386,10 @@ jobs:
           # 2026-09-22: 21,380 executed on main at 1d4e7383a (#2250). The services subtree tripped
           # its own cap (below) while the global count sat 290 under this one (cap 21,670) -- one
           # test-heavy merge from the same trip. Re-floated at the same ~97%: 20,700, cap 22,770.
-          FLOOR = 20700
+          # 2026-09-24: 22,475 executed on main at b8dd06440 (#2304), 295 under this cap while the
+          # services subtree tripped its own (below). Re-floated ahead of the trip at the same ~97%:
+          # 21,800, cap 23,980.
+          FLOOR = 21800
           # Slack allowance, global and per-subtree: 10% of the floor, but never
           # fewer than ABS_SLACK tests. The absolute term is not decoration — a
           # pure percentage is unusable on a small tree. readiness.tests
@@ -472,7 +475,12 @@ jobs:
           # ingest suites) against the 2,776 floor (cap 3,053) -- 23 tests from tripping on the next push.
           # Re-floated ahead of the trip within the window (2,778..3,030) at the same ~97%-of-measured:
           # 2,939, ~91 of deletion headroom, cap 3,232.
-          SUBTREES = {'tests.services': 2939, 'readiness.tests': 120}
+          # tests.services: 3,249 executed on 2026-09-24 at b8dd06440 (#2301..#2304 added the drain loop,
+          # store-level and collection-scoped cohorts) against the 2,939 floor (cap 3,233) -- tripped on the
+          # push run with every test PASSING, so the deploy gate refused #2304, #2305 and #2306 and prod
+          # stayed on 3206c7a7d. Re-floated within the printed window (2,954..3,249) at the same
+          # ~97%-of-measured: 3,151, ~98 of deletion headroom, cap 3,466.
+          SUBTREES = {'tests.services': 3151, 'readiness.tests': 120}
           try:
               root = ET.parse('sweep.xml').getroot()
           except Exception as e:
