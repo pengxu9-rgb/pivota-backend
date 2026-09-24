@@ -6,7 +6,6 @@ from the content_key-grain index_pipeline_state flags a sibling can own, and the
 against the real schema (column names, the EXISTS helpers, the ANY(:list) binds).
 """
 import os
-from pathlib import Path
 from urllib.parse import urlsplit
 
 import pytest
@@ -15,7 +14,26 @@ URL = os.getenv("DATABASE_URL", "")
 pytestmark = pytest.mark.skipif(not URL.startswith("postgres"), reason="requires test Postgres")
 
 PREFIX = "rbq-gate-"
-ROOT = Path(__file__).resolve().parents[1]
+
+# The dialect gate shares ONE database across files, and other files create these tables first with narrower
+# schemas -- so never run the full migrations here (098's CREATE INDEX on a column an earlier file's table
+# lacks fails). Add exactly the columns this file reads and writes, idempotently, like its siblings do.
+_LIGHTWEIGHT_DDL = """
+CREATE TABLE IF NOT EXISTS index_pipeline_state (content_key text PRIMARY KEY);
+ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS pipeline_stage text;
+ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS blocker_code text;
+ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS blocker_detail text;
+ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS serving_eligible boolean;
+ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS has_price boolean;
+ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS identity_resolved boolean;
+ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS has_image boolean;
+CREATE TABLE IF NOT EXISTS product_group_members (product_group_id text, merchant_id text, platform text,
+                                                  platform_product_id text);
+ALTER TABLE product_group_members ADD COLUMN IF NOT EXISTS product_group_id text;
+ALTER TABLE product_group_members ADD COLUMN IF NOT EXISTS merchant_id text;
+ALTER TABLE product_group_members ADD COLUMN IF NOT EXISTS platform text;
+ALTER TABLE product_group_members ADD COLUMN IF NOT EXISTS platform_product_id text;
+"""
 
 
 @pytest.fixture
@@ -34,8 +52,7 @@ async def db():
     engine.dispose()
     connection = await asyncpg.connect(URL)
     try:
-        for mig in ("045_product_groups.sql", "098_index_pipeline_state.sql"):
-            await connection.execute((ROOT / "db" / "migrations" / mig).read_text())
+        await connection.execute(_LIGHTWEIGHT_DDL)
     finally:
         await connection.close()
     database = Database(URL)
@@ -121,7 +138,7 @@ async def test_an_unresolved_identity_fails_even_on_a_content_refusal(db):
 async def _member(db, source_id, *, group="rbq-gate-g1"):
     await db.execute(
         "INSERT INTO product_group_members (product_group_id, merchant_id, platform, platform_product_id)"
-        " VALUES (:g, 'rbq_m', 'external_seed', :s) ON CONFLICT DO NOTHING", {"g": group, "s": source_id})
+        " VALUES (:g, 'rbq_m', 'external_seed', :s)", {"g": group, "s": source_id})
 
 
 async def test_identity_resolved_by_group_membership_on_the_products_own_source_id(db):
