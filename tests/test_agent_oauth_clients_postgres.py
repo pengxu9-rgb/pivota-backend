@@ -30,6 +30,7 @@ SECRET = "oauth_client_test_secret"
 ISS = "https://as.pivota.test"
 OP = "offers.resolve"
 CLAUDE_CALLBACK = "https://claude.ai/api/mcp/auth_callback"
+OPERATOR_SECRET = "a1" * 32  # what `openssl rand -hex 32` produces
 
 # Agents are not under test; the real get_agent reads a table this suite must not rebuild.
 _AGENTS = {
@@ -94,11 +95,12 @@ async def _resolve(client_id, *, iss=ISS):
     return await resolve_asserted_agent_id(token, op=OP, excluded_agent_ids={"agent_gw"}, now=now)
 
 
-async def _provision(store, agent="agent_acme", uris=(CLAUDE_CALLBACK,)):
+async def _provision(store, agent="agent_acme", uris=(CLAUDE_CALLBACK,), secret=OPERATOR_SECRET):
     from services.agent_oauth_clients import provision_oauth_client
 
     return await provision_oauth_client(agent_id=agent, redirect_uris=list(uris), client_name="Acme on Claude",
-                                        registered_by="test", excluded_agent_ids={"agent_gw"}, store=store)
+                                        registered_by="test", client_secret=secret,
+                                        excluded_agent_ids={"agent_gw"}, store=store)
 
 
 def _pkce():
@@ -133,13 +135,52 @@ def auth_server(monkeypatch):
     monkeypatch.setenv("MCP_OAUTH_AS_ALLOWED_RESOURCES", "https://agent.pivota.test/mcp")
 
 
-async def test_a_provisioned_client_is_credited_and_its_secret_is_shown_once(db):
+async def test_a_provisioned_client_is_credited_and_the_secret_is_never_returned_or_stored(db):
     out = await _provision(db)
-    assert out["client_secret"].startswith("mcps_")
     assert out["token_endpoint_auth_method"] == "client_secret_basic"
+    assert OPERATOR_SECRET not in str(out), "the secret must never reach a job log"
     stored = await db.get_client(out["client_id"])
-    assert stored["client_secret_hash"] and out["client_secret"] not in str(stored)
+    assert stored["client_secret_hash"] and OPERATOR_SECRET not in str(stored)
     assert await _resolve(out["client_id"]) == "agent_acme"
+
+
+@pytest.mark.parametrize("secret", ["", "short", "x" * 31, "has spaces " * 4, "slash/plus+equals=" * 3])
+async def test_a_weak_or_unsafe_operator_secret_is_refused_before_anything_is_created(db, secret):
+    from services.agent_oauth_clients import OAuthClientRegistrationError
+
+    before = await db_fetch_val("SELECT COUNT(*) FROM mcp_oauth_clients")
+    with pytest.raises(OAuthClientRegistrationError):
+        await _provision(db, secret=secret)
+    assert await db_fetch_val("SELECT COUNT(*) FROM mcp_oauth_clients") == before
+
+
+async def test_a_secret_with_a_trailing_newline_authenticates_as_the_partner_will_send_it(db, auth_server):
+    out = await _provision(db, secret=OPERATOR_SECRET + "\n")
+    claims = await _grant(db, out["client_id"], client_secret=OPERATOR_SECRET)
+    assert await _resolve(claims["client_id"]) == "agent_acme"
+
+
+async def test_provisioning_without_an_issuer_creates_nothing(db, monkeypatch):
+    from services.agent_oauth_clients import OAuthClientRegistrationError
+
+    monkeypatch.delenv("MCP_OAUTH_AS_ISSUER")
+    before = await db_fetch_val("SELECT COUNT(*) FROM mcp_oauth_clients")
+    with pytest.raises(OAuthClientRegistrationError):
+        await _provision(db)
+    assert await db_fetch_val("SELECT COUNT(*) FROM mcp_oauth_clients") == before
+
+
+async def test_a_failed_registration_removes_the_client_it_just_created(db, monkeypatch):
+    import services.agent_oauth_clients as svc
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("registry insert failed")
+
+    monkeypatch.setattr(svc, "_write_registration", boom)
+    before = await db_fetch_val("SELECT COUNT(*) FROM mcp_oauth_clients")
+    with pytest.raises(RuntimeError):
+        await _provision(db)
+    assert await db_fetch_val("SELECT COUNT(*) FROM mcp_oauth_clients") == before
 
 
 async def test_the_squatter_path_credits_no_one(db, auth_server):
@@ -165,16 +206,22 @@ async def test_a_provisioned_clients_real_grant_needs_its_secret_and_then_credit
     out = await _provision(db)
     with pytest.raises(OAuthFlowError):
         await _grant(db, out["client_id"], client_secret=None)
-    claims = await _grant(db, out["client_id"], client_secret=out["client_secret"])
+    with pytest.raises(OAuthFlowError):
+        await _grant(db, out["client_id"], client_secret="b2" * 32)
+    claims = await _grant(db, out["client_id"], client_secret=OPERATOR_SECRET)
     assert await _resolve(claims["client_id"]) == "agent_acme"
 
 
-async def test_registration_refuses_a_public_or_unknown_client(db):
+async def test_registration_refuses_a_public_unknown_or_stranger_provisioned_client(db):
     from services import mcp_oauth_flow as flow
     from services.agent_oauth_clients import OAuthClientRegistrationError, register_oauth_client
 
     public = await flow.register_client(db, {"redirect_uris": [CLAUDE_CALLBACK]})
-    for client_id in (public["client_id"], "mcpc_never_registered"):
+    # Open registration also mints CONFIDENTIAL clients, for whoever asks: a client_id a stranger sends
+    # us must never be credited, since the stranger holds its secret.
+    stranger = await flow.register_client(db, {"redirect_uris": [CLAUDE_CALLBACK],
+                                               "token_endpoint_auth_method": "client_secret_basic"})
+    for client_id in (public["client_id"], stranger["client_id"], "mcpc_never_registered"):
         with pytest.raises(OAuthClientRegistrationError):
             await register_oauth_client(client_id=client_id, agent_id="agent_acme", registered_by="t")
     assert (await db_fetch_val("SELECT COUNT(*) FROM agent_oauth_clients")) == 0

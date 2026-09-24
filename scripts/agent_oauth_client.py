@@ -8,22 +8,36 @@ client_id + secret to the partner out of band, and the partner enters them in th
 settings. Public clients from open dynamic registration stay agent-less: anyone can register one with
 any callback URL, so it identifies no one.
 
-    # mint a confidential client for a partner and credit it (prints the secret ONCE)
-    scripts/agent_oauth_client.py provision --agent-id agent_x \\
+PROVISIONING A PARTNER (the secret never passes through a job log):
+
+    # 1. the operator generates the secret and keeps it in Secret Manager
+    openssl rand -hex 32 | tr -d '\\n' | gcloud secrets create oauth-client-agent_x --data-file=- --project pivota-prod
+
+    # 2. mint the client with that secret, credited to the partner's agent. Prints the client_id only.
+    #    MCP_OAUTH_AS_ISSUER must be the value the `web` service runs with (read it off the service):
+    #    a different issuer registers a client no token will ever match.
+    SECRETS=OAUTH_CLIENT_SECRET=oauth-client-agent_x:latest ENV_VARS=MCP_OAUTH_AS_ISSUER=<web's value> \\
+      scripts/ops/run_oneoff_job.sh python scripts/agent_oauth_client.py provision --agent-id agent_x \\
         --redirect-uri https://claude.ai/api/mcp/auth_callback --client-name "Acme on Claude" \\
         --registered-by peng --note "Acme connector" --apply
 
-    # credit an existing confidential client (replaces an active registration; history kept)
-    scripts/agent_oauth_client.py register --client-id mcpc_... --agent-id agent_x --registered-by peng --apply
+    # 3. hand the partner the client_id, and the secret from Secret Manager, out of band
+    gcloud secrets versions access latest --secret oauth-client-agent_x --project pivota-prod
 
-    # stop crediting a client (it keeps working for OAuth)
+    If the job's log comes back empty (ingestion lag), run `list` before provisioning again: a second
+    provision makes a second credited client.
+
+OTHER COMMANDS
+
+    # re-point a client `provision` created (replaces the active registration; history kept)
+    scripts/agent_oauth_client.py register --client-id mcpc_... --agent-id agent_y --registered-by peng --apply
+
+    # stop crediting a client: the kill switch for a leaked secret. The client keeps working for OAuth;
+    # to rotate, provision a new client for the partner and disable this one.
     scripts/agent_oauth_client.py disable --client-id mcpc_... --apply
 
     # every registration, active and disabled
     scripts/agent_oauth_client.py list
-
-In production run it through scripts/ops/run_oneoff_job.sh (the DB is VPC-only). The provisioned
-secret appears in that job's log: copy it to the partner, then treat the log line as sensitive.
 """
 
 import argparse
@@ -79,6 +93,9 @@ async def run(args):
                 result = await svc.provision_oauth_client(
                     agent_id=args.agent_id, redirect_uris=args.redirect_uris, client_name=args.client_name,
                     registered_by=args.registered_by, note=args.note,
+                    # Mounted from Secret Manager (SECRETS=OAUTH_CLIENT_SECRET=...); never an argument,
+                    # never printed.
+                    client_secret=os.getenv("OAUTH_CLIENT_SECRET") or "",
                     excluded_agent_ids=issuing_excluded_agent_ids(),
                 )
             elif args.cmd == "register":
