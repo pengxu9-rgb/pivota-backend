@@ -447,3 +447,20 @@ async def test_an_olive_young_product_can_be_excluded_by_its_product_id(oy):
     j["options"]["exclude_handles"] = ["GA2"]
     out = await pipeline.run_stage(j, db=oy.db)
     assert out["status"] == "done" and len(oy.applied[-1]["pdps"]) == 1
+
+
+async def test_the_run_reason_counts_every_noted_row(env):
+    env.rows = [TINT, ("3CE - Velvet Lip Tint Rose 4g", "LIP TINT", "velvet-lip-tint-rose")]
+    async def fetch_all(sql, values):
+        return [{"product_key": k, "category_path": "beauty/makeup/lip/tint", "serving": True,
+                 "pipeline_stage": "shadow_indexed", "lifecycle": "candidate", "offers": 1, "offers_in_currency": 1}
+                for k in values["keys"]]
+    env.db.fetch_all = fetch_all
+    out = await pipeline.run_stage(job("apply_due"), db=env.db)
+    assert out["status"] == "done"
+    assert env.ledger.transitions[-1]["reason"] == "applied and verified; 2 row(s) outside backend global recall"
+
+
+async def test_an_empty_readback_still_carries_its_notes_list():
+    readback = await pipeline._readback([], "USD", db=None)
+    assert readback == {"ok": False, "reason": "no product keys to read back", "notes": [], "rows": []}
