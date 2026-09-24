@@ -793,3 +793,108 @@ def test_a_family_vendor_can_only_be_mapped_within_its_family(brands, ok):
     else:
         with pytest.raises(ValueError, match="ignored"):
             pipeline.validate_options(options)
+
+
+
+# --- a row the index refused on content is a note, not a failed store (westman-atelier.com, 2026-09-24) ----
+
+def _rows(blockers, **evidence):
+    """One readback row per key; `evidence` overrides the IPS columns on the refused row(s)."""
+    async def fetch_all(sql, values):
+        out = []
+        for i, k in enumerate(values["keys"]):
+            b = blockers[i] if i < len(blockers) else None
+            row = {"product_key": k, "category_path": "beauty/makeup/lip/tint", "serving": b is None,
+                   "pipeline_stage": "public_indexed" if b is None else "extracted", "blocker_code": b or "none",
+                   "blocker_detail": "content_quality_score=71.2 < 71.4" if b else None,
+                   "lifecycle": "published", "offers": 1, "offers_in_currency": 1,
+                   "row_priced": True, "row_identity": True, "row_image": True}
+            if b:
+                row.update(evidence)
+            out.append(row)
+        return out
+    return fetch_all
+
+
+@pytest.mark.parametrize("blocker", ["low_quality", "no_image", "short_description", "non_core_product"])
+async def test_a_row_the_index_refused_on_content_is_noted_and_the_store_still_applies(env, blocker):
+    env.rows = [TINT, ("3CE - Velvet Lip Tint Rose 4g", "LIP TINT", "velvet-lip-tint-rose")]
+    env.db.fetch_all = _rows([None, blocker])
+    out = await pipeline.run_stage(job("apply_due"), db=env.db)
+    assert (out["status"], out["outcome"]) == ("done", "applied")
+    run = list(env.ledger.runs.values())[-1]
+    assert run["readback"]["problems"] == []
+    [note] = run["readback"]["notes"]
+    assert note["kind"] == "index_refused" and blocker in note["note"]
+    assert env.ledger.transitions[-1]["reason"] == "applied and verified; 1 row(s) refused by the index content gate"
+
+
+@pytest.mark.parametrize("blocker", ["suppressed", "not_live", "no_seed", "no_extraction", "not_scored", "no_price",
+                                     "entity_unresolved", "seed_audit_fail", "no_leaf_category", "unknown_future_code", None])
+async def test_any_other_reason_a_row_is_not_served_still_fails_the_store(env, blocker):
+    async def fetch_all(sql, values):
+        return [{"product_key": k, "category_path": "beauty/makeup/lip/tint", "serving": False, "pipeline_stage": None,
+                 "blocker_code": blocker, "blocker_detail": None, "lifecycle": "published", "offers": 1,
+                 "offers_in_currency": 1} for k in values["keys"]]
+    env.db.fetch_all = fetch_all
+    out = await pipeline.run_stage(job("apply_due"), db=env.db)
+    assert (out["status"], out["outcome"]) == ("failed", "readback_failed")
+    problem = list(env.ledger.runs.values())[-1]["readback"]["problems"][0]["problem"]
+    assert problem.startswith("not serving-eligible")
+
+
+def test_the_content_refusal_codes_are_codes_the_index_assigns():
+    import pathlib, re
+    src = (pathlib.Path(__file__).resolve().parents[2] / "services" / "index_pipeline_state_service.py").read_text()
+    assigned = set(re.findall(r'blocker_code = "([a-z_]+)"', src))
+    assert set(pipeline.INDEX_CONTENT_REFUSALS) <= assigned, set(pipeline.INDEX_CONTENT_REFUSALS) - assigned
+
+
+
+@pytest.mark.parametrize("evidence", [{"row_priced": False}, {"row_identity": False}, {"row_image": False}],
+                         ids=["no_price_masked", "identity_masked", "planned_image_lost"])
+async def test_a_content_refusal_that_may_mask_a_lost_write_still_fails(env, evidence):
+    """The index records only the first failed check: low_quality sits ahead of no_price and entity_unresolved,
+    and apply overwrites image_url -- so the note path needs the index's own evidence that the write landed."""
+    env.rows = [TINT, ("3CE - Velvet Lip Tint Rose 4g", "LIP TINT", "velvet-lip-tint-rose")]  # both carry an image
+    env.db.fetch_all = _rows([None, "low_quality"], **evidence)
+    out = await pipeline.run_stage(job("apply_due"), db=env.db)
+    assert (out["status"], out["outcome"]) == ("failed", "readback_failed")
+
+
+async def test_a_product_the_store_publishes_without_an_image_is_still_only_a_note(env):
+    no_image = ("3CE - Velvet Lip Tint Nude 4g", "LIP TINT", "velvet-lip-tint-nude")
+    env.rows = [TINT, no_image]
+    real = feed.shopify_product_to_record
+    def without_image(product, **kw):
+        if product.get("handle") == "velvet-lip-tint-nude":
+            product = {**product, "images": []}
+        return real(product, **kw)
+    import services.curated_brand_feed as cbf
+    env.db.fetch_all = _rows([None, "no_image"], row_image=False)
+    import unittest.mock as um
+    with um.patch.object(cbf, "shopify_product_to_record", side_effect=without_image):
+        out = await pipeline.run_stage(job("apply_due"), db=env.db)
+    assert (out["status"], out["outcome"]) == ("done", "applied")
+
+
+
+async def test_the_readback_reads_each_products_own_row_not_the_shared_index_flags(env):
+    """A priced, resolved, imaged sibling on the same content_key must not vouch for this product: the query
+    computes price, image and identity from p.* per product_key (IPS flags are the best-ranked sibling's)."""
+    seen = {}
+    async def fetch_all(sql, values):
+        seen["sql"], seen["values"] = sql, values
+        return [{"product_key": k, "category_path": "beauty/makeup/lip/tint", "serving": True, "pipeline_stage": "public_indexed",
+                 "blocker_code": "none", "blocker_detail": None, "lifecycle": "published", "offers": 1,
+                 "offers_in_currency": 1, "row_priced": True, "row_identity": True, "row_image": True}
+                for k in values["keys"]]
+    env.db.fetch_all = fetch_all
+    await pipeline.run_stage(job("apply_due"), db=env.db)
+    sql = " ".join(seen["sql"].split())
+    assert "ips.has_price" not in sql and "ips.identity_resolved" not in sql and "ips.has_image" not in sql
+    assert "p.product_key" in sql.split("AS row_priced")[0].rsplit("EXISTS", 1)[-1]
+    assert "coalesce(p.image_url, '') <> '') AS row_image" in sql
+    assert "pgm.platform_product_id = p.source_product_id" in sql
+    from services.index_pipeline_state_service import _RESOLVED_PDP_SCOPES
+    assert set(seen["values"]["resolved_scopes"]) == set(_RESOLVED_PDP_SCOPES)
