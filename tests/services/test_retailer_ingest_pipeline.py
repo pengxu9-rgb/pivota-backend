@@ -770,3 +770,10 @@ async def test_a_store_past_shopifys_last_page_is_told_to_use_collections(env):
     out = await pipeline.run_stage(job(), db=env.db)
     assert out["outcome"] == "crawl_capped" and "options.collections" in out["reason"]
     assert "raise options.max_scan_products" not in out["reason"]
+
+
+async def test_an_ordinary_capped_crawl_is_told_to_raise_its_budget(env):
+    env.crawl_error = feed.CrawlIncomplete("k.com: page 81: scan budget 20000 exhausted", status="capped",
+                                           next_page=81, scanned_products=20000, selected_products=0)
+    out = await pipeline.run_stage(job(), db=env.db)
+    assert "raise options.max_scan_products" in out["reason"] and "options.collections" not in out["reason"]

@@ -368,3 +368,21 @@ async def test_the_merged_selection_respects_the_product_budget(monkeypatch):
         await feed.fetch_shopify_collections("retailer.com", ["a", "b"], only_vendors=["A'PIEU"],
                                              max_products=3, max_scan_products=100)
     assert err.value.status == "capped"
+
+
+@pytest.mark.asyncio
+async def test_a_budget_spent_exactly_by_earlier_collections_caps_before_the_next(monkeypatch):
+    reqs = install_http(monkeypatch, [{"products": [product(1), product(2)]}, {"products": []}])
+    with pytest.raises(feed.CrawlIncomplete, match="before collection 'b'") as err:
+        await feed.fetch_shopify_collections("retailer.com", ["a", "b"], only_vendors=["A'PIEU"],
+                                             max_products=10, max_scan_products=2)
+    assert err.value.status == "capped" and len(reqs) == 2   # collection b never requested
+
+
+@pytest.mark.asyncio
+async def test_a_later_collections_failure_counts_what_earlier_ones_selected(monkeypatch):
+    install_http(monkeypatch, [{"products": [product(1), product(2)]}, {"products": []}, 404])
+    with pytest.raises(feed.CrawlIncomplete) as err:
+        await feed.fetch_shopify_collections("retailer.com", ["a", "b"], only_vendors=["A'PIEU"],
+                                             max_products=10, max_scan_products=100)
+    assert err.value.scanned_products == 2 and err.value.selected_products == 2
