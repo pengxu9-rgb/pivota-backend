@@ -9,7 +9,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
@@ -349,6 +349,38 @@ def _as_json_obj(value: Any) -> Dict[str, Any]:
     return {}
 
 
+def _settle_context_agent(merged: Dict[str, Any], stored: Dict[str, Any], *, issued: bool) -> None:
+    """The agent keys in a click row's context follow the same rule as its agent_id column.
+
+    Traffic taxonomy puts agent_id='unknown' (and agent_identity_confidence) into every hit's
+    context when the token names no agent; that sentinel never lands. On an ISSUED row the hit
+    cannot add an agent the issue did not record, so only what was stored stays. In place.
+    """
+    traffic = merged.get("traffic") if isinstance(merged.get("traffic"), dict) else None
+    stored_traffic = stored.get("traffic") if isinstance(stored.get("traffic"), dict) else {}
+    if issued:
+        for key in ("agent_id", "agent_identity_confidence"):
+            if key in stored:
+                merged[key] = stored[key]
+            else:
+                merged.pop(key, None)
+        if traffic is not None:
+            traffic = dict(traffic)
+            if "agent_id" in stored_traffic:
+                traffic["agent_id"] = stored_traffic["agent_id"]
+            else:
+                traffic.pop("agent_id", None)
+            merged["traffic"] = traffic
+        return
+    if _issued_agent_id(merged.get("agent_id")) is None:
+        merged.pop("agent_id", None)
+        merged.pop("agent_identity_confidence", None)
+    if traffic is not None and _issued_agent_id(traffic.get("agent_id")) is None:
+        traffic = dict(traffic)
+        traffic.pop("agent_id", None)
+        merged["traffic"] = traffic
+
+
 async def _count_surface_event(click_id: str, event_type: str, now: datetime) -> Optional[Dict[str, Any]]:
     sql = _COUNT_CLICK_SQL if event_type == "click" else _COUNT_IMPRESSION_SQL
     row = await database.fetch_one(sql, {"click_id": click_id, "now": now})
@@ -394,6 +426,14 @@ async def record_surface_event(
         "ip": request_meta.get("ip"),
         "context": context_with_taxonomy,
     }
+    # The same normalisation issue_clicks applies, on everything /r writes. Traffic taxonomy says
+    # agent_id='unknown' whenever the token names no agent; that sentinel is never a column value.
+    for field in _CLICK_COLUMN_MAX:
+        if field in common_values and field != "agent_id":
+            common_values[field] = _fits(field, common_values[field])
+    common_values["agent_id"] = _issued_agent_id(common_values.get("agent_id"))
+    common_values["surface"] = common_values["surface"] or "unknown"
+    common_values["commerce_surface"] = common_values["commerce_surface"] or common_values["surface"]
 
     counted = await _count_surface_event(click_id, event_type, now)
     if counted is None:
@@ -410,18 +450,26 @@ async def record_surface_event(
         }]))
         counted = await _count_surface_event(click_id, event_type, now) or {}
 
-    # Fill what the row lacks; keep what it has. `user_agent` / `ip` describe THIS hit, so the
-    # latest wins, as before.
+    # Fill what the row lacks; keep what it has, decided IN SQL (COALESCE) so two concurrent hits
+    # cannot overwrite each other either. `user_agent` / `ip` describe THIS hit, so the latest
+    # wins, as before (the row describes the last clicker, not the converting device).
+    #
+    # On an ISSUED row agent_id is not fillable at all: an issued NULL is a decision (a shared
+    # search link, an internal key, degraded auth), not a gap, and the only thing that could fill
+    # it is a value from the token, which is never how an agent is named (ADR-025 D1).
+    issued = counted.get("issued_at") is not None
+    fillable = [f for f in _FILL_ONLY_FIELDS if not (issued and f == "agent_id")]
     fill: Dict[str, Any] = {
-        field: common_values[field]
-        for field in _FILL_ONLY_FIELDS
-        if counted.get(field) in (None, "") and common_values.get(field) not in (None, "")
+        field: func.coalesce(surface_click_events.c[field], common_values[field])
+        for field in fillable
+        if common_values.get(field) not in (None, "")
     }
     stored_context = _as_json_obj(counted.get("context"))
     merged_context = {
         **{k: v for k, v in context_with_taxonomy.items() if v is not None},
         **{k: v for k, v in stored_context.items() if v is not None},
     }
+    _settle_context_agent(merged_context, stored_context, issued=issued)
     fill["context"] = merged_context
     fill["user_agent"] = common_values["user_agent"]
     fill["ip"] = common_values["ip"]
@@ -429,10 +477,22 @@ async def record_surface_event(
     await database.execute(
         surface_click_events.update().where(surface_click_events.c.click_id == click_id).values(**fill)
     )
+    filled_view = {
+        field: common_values[field]
+        for field in fillable
+        if counted.get(field) in (None, "") and common_values.get(field) not in (None, "")
+    }
 
     # The ledger event describes the row as it now stands: issued identity first, this hit's
     # context filling the gaps.
-    row_view = {**common_values, **{k: v for k, v in counted.items() if v not in (None, "")}, **fill}
+    row_view = {
+        **common_values,
+        **{k: v for k, v in counted.items() if v not in (None, "")},
+        **filled_view,
+        "context": merged_context,
+    }
+    if issued:
+        row_view["agent_id"] = counted.get("agent_id")
     interaction_id = _first_nonempty(counted, "interaction_id") or _first_nonempty(merged_context, "interaction_id")
     interaction_event = await record_commerce_event_best_effort(
         event_type=f"surface.{event_type}",
@@ -1281,10 +1341,9 @@ def _trusted_agent_id(provenance: Optional[Mapping[str, Any]]) -> Optional[str]:
 
 
 def _pick_click_agent(click_row: Optional[Mapping[str, Any]]) -> Optional[str]:
-    value = (click_row or {}).get("agent_id")
-    if value is None:
-        return None
-    return str(value).strip() or None
+    # The same rule as issue_clicks: 'unknown' (which /r wrote on legacy rows before ADR-025 D1)
+    # or an id that does not fit names nobody, so an edge never credits a sentinel.
+    return _issued_agent_id((click_row or {}).get("agent_id"))
 
 
 def _ext_edge_keys(merchant_id: str, external_order_id: str) -> tuple[str, str]:

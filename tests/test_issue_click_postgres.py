@@ -284,3 +284,78 @@ async def test_an_order_on_a_link_nobody_clicked_still_closes_against_its_issued
     assert closed["seller_ref"] == "m_seller"
     edge = await db.fetch_one("SELECT agent_id FROM commerce_attribution_edges WHERE external_order_id = '5551'")
     assert dict(edge)["agent_id"] == "agent_minds"
+
+
+# --- an agent-less issued link stays agent-less (review of #2294) ---------------------------------
+
+
+async def test_a_click_on_an_agentless_issued_link_leaves_it_agentless(db):
+    """Traffic taxonomy says agent_id='unknown' whenever the token names no agent. The first click
+    used to fill that into the issued NULL, and the edge then credited 'unknown'."""
+    from services.commerce_attribution_service import issue_clicks
+
+    await issue_clicks([_issued(agent_id=None)])
+    await _hit("clk_issued_1")
+
+    row = await _row(db, "clk_issued_1")
+    assert row["agent_id"] is None
+    assert row["context"].get("agent_id") in (None,)
+    assert (row["context"].get("traffic") or {}).get("agent_id") is None
+
+
+async def test_a_token_cannot_name_the_agent_of_an_issued_link(db):
+    """An issued NULL is a decision (shared search link, internal key, degraded auth). A value in
+    the token, possibly body-supplied at mint time, must never fill it."""
+    from services.commerce_attribution_service import close_external_order_conversion, issue_clicks
+
+    await issue_clicks([_issued(agent_id=None, merchant_id="m_seller",
+                                context={"seller_ref": "m_seller", "seed_kind": "self"})])
+    await _hit("clk_issued_1", agent_id="agent_x")
+
+    row = await _row(db, "clk_issued_1")
+    assert row["agent_id"] is None
+    assert row["context"].get("agent_id") is None
+
+    await close_external_order_conversion(
+        merchant_id="m_seller", click_id="clk_issued_1", external_order_id="5552",
+        gross_amount_cents=12_000, currency="USD", converting_shop_domain="brand.example",
+    )
+    edge = await db.fetch_one("SELECT agent_id FROM commerce_attribution_edges WHERE external_order_id = '5552'")
+    assert dict(edge)["agent_id"] is None
+
+
+async def test_a_legacy_click_with_no_agent_stores_none_not_the_sentinel(db):
+    await _hit("clk_legacy_2")
+
+    row = await _row(db, "clk_legacy_2")
+    assert row["agent_id"] is None
+    assert row["context"].get("agent_id") is None
+
+
+async def test_an_edge_never_credits_the_sentinel_a_legacy_row_already_holds(db):
+    """Rows /r wrote before this change can hold agent_id='unknown'."""
+    from services.commerce_attribution_service import close_external_order_conversion
+
+    await db.execute(
+        "INSERT INTO surface_click_events (click_id, merchant_id, surface, agent_id, impression_count, "
+        "click_count, created_at, updated_at) VALUES ('clk_old', 'm_seller', 'offers_resolve', 'unknown', "
+        "0, 1, now(), now())"
+    )
+    await close_external_order_conversion(
+        merchant_id="m_seller", click_id="clk_old", external_order_id="5553",
+        gross_amount_cents=5_000, currency="USD", converting_shop_domain="brand.example",
+    )
+    edge = await db.fetch_one("SELECT agent_id FROM commerce_attribution_edges WHERE external_order_id = '5553'")
+    assert dict(edge)["agent_id"] is None
+
+
+async def test_concurrent_fills_keep_the_first_value_not_the_last(db):
+    """Fill-only is decided in SQL (COALESCE), not against a snapshot: two hits carrying different
+    values for a NULL column leave the value of whichever wrote first."""
+    from services.commerce_attribution_service import issue_clicks
+
+    await issue_clicks([_issued(canonical_product_id=None)])
+    await _hit("clk_issued_1", productId="prod_first")
+    await _hit("clk_issued_1", productId="prod_second")
+
+    assert (await _row(db, "clk_issued_1"))["canonical_product_id"] == "prod_first"
