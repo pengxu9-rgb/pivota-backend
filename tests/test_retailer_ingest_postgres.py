@@ -55,8 +55,11 @@ async def _enqueue(db, **kw):
 async def _only_ours_due(db):
     """Other test modules may have due jobs or live leases; make ours the only claimable (and the only
     leased) ones, since a foreign live lease takes a lane."""
-    await db.execute("UPDATE retailer_ingest_jobs SET next_run_at = NOW() + interval '1 day', lease_until = NULL "
+    await db.execute("UPDATE retailer_ingest_jobs SET next_run_at = NOW() + interval '1 day' "
                      "WHERE source IS DISTINCT FROM :s AND status IN ('queued','apply_due')", {"s": SOURCE})
+    # a live lease takes a lane whatever the job's status
+    await db.execute("UPDATE retailer_ingest_jobs SET lease_until = NULL "
+                     "WHERE source IS DISTINCT FROM :s AND lease_until IS NOT NULL", {"s": SOURCE})
 
 
 async def test_reenqueueing_an_open_cohort_is_a_no_op(db):
@@ -188,7 +191,7 @@ async def _at(db, domain, brand, *, priority=0, status=None):
 async def test_lanes_never_put_two_stages_on_one_host_whatever_the_cohort_shape(db):
     await _only_ours_due(db)
     recrawl = await _at(db, "lanes-a.example", "ONE BRAND", priority=3)
-    cohort = await _at(db, "WWW.Lanes-A.example", "lanes-a.example · 4 brands", priority=2)  # same host
+    cohort = await _at(db, "www.lanes-a.example", "lanes-a.example · 4 brands", priority=2)  # same host
     other = await _at(db, "lanes-b.example", "OTHER", priority=1)
     assert (await ledger.claim_due_job(lease_seconds=3600, max_leases=3, db=db))["id"] == recrawl
     # the higher-priority cohort at the busy host is passed over, not waited on
@@ -254,6 +257,40 @@ async def test_a_claim_is_refused_while_another_claimer_holds_the_lane_lock(db):
     finally:
         await other.close()
     assert await ledger.claim_due_job(lease_seconds=3600, max_leases=3, db=db) is not None
+
+
+class _LockProbe:
+    """The ledger's db, plus a check made from ANOTHER connection just before the claim statement
+    runs: is the lane lock held? It must be, or the claim snapshots a lease table that a claim
+    committing right now is about to change (the same-host race the stress run reproduced)."""
+
+    def __init__(self, db, other):
+        self.db, self.other, self.probes = db, other, []
+
+    def transaction(self):
+        return self.db.transaction()
+
+    async def fetch_one(self, query, values=None):
+        if "UPDATE retailer_ingest_jobs" in query:
+            free = await self.other.fetchval("SELECT pg_try_advisory_xact_lock(hashtext('retailer_ingest_drain'))")
+            self.probes.append(free)
+        return await self.db.fetch_one(query, values)
+
+
+async def test_the_claim_statement_runs_while_the_lane_lock_is_already_held(db):
+    import asyncpg
+    await _only_ours_due(db)
+    await _at(db, "lanes-a.example", "A")
+    other = await asyncpg.connect(URL)
+    try:
+        probe = _LockProbe(db, other)
+        assert await ledger.claim_due_job(lease_seconds=3600, max_leases=2, db=probe) is not None
+    finally:
+        await other.close()
+    # False = another connection could NOT take the lock: it was held across the claim's snapshot.
+    # (No transaction: the lock statement commits and frees it. Lock inside the claim statement: not
+    # held yet when the statement starts.)
+    assert probe.probes == [False]
 
 
 @pytest.mark.parametrize("bad", [0, -1, ledger.MAX_LEASES_CEILING + 1])

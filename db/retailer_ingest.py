@@ -12,12 +12,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from db.database import database
+
+logger = logging.getLogger(__name__)
 
 STATUSES = ("queued", "apply_due", "held", "done", "nothing", "failed", "cancelled")  # migration 234 CHECK
 OPEN_STATUSES = ("queued", "apply_due", "held")
@@ -99,11 +102,15 @@ MAX_LEASES_CEILING = 4
 def max_leases_from_env() -> int:
     """RETAILER_INGEST_MAX_LEASES: stages the lane may run at once (default 1). Overlapping */10
     executions are the lanes; this caps them. Bad values fall back to 1, never to unlimited."""
+    raw = str(os.getenv("RETAILER_INGEST_MAX_LEASES", "1")).strip()
     try:
-        value = int(str(os.getenv("RETAILER_INGEST_MAX_LEASES", "1")).strip())
+        value = int(raw)
     except ValueError:
-        return 1
-    return value if 1 <= value <= MAX_LEASES_CEILING else 1
+        value = 0
+    if 1 <= value <= MAX_LEASES_CEILING:
+        return value
+    logger.warning("RETAILER_INGEST_MAX_LEASES=%r is not 1..%d; running one lane", raw, MAX_LEASES_CEILING)
+    return 1
 
 
 async def claim_due_job(*, lease_seconds: int, max_leases: int = 1, db: Any = None) -> Optional[Dict[str, Any]]:
@@ -115,6 +122,8 @@ async def claim_due_job(*, lease_seconds: int, max_leases: int = 1, db: Any = No
     its snapshot. A single statement snapshots first and locks second, so a claim that wins the
     lock just after another commits reads the lease table from before that claim, and can put a
     second crawl on the same host. An execution that loses the lock exits idle; the next tick retries.
+    This relies on READ COMMITTED (every statement takes a fresh snapshot), which is what prod runs;
+    under REPEATABLE READ the snapshot would be the lock statement's and the race would return.
     """
     if not 1 <= int(max_leases) <= MAX_LEASES_CEILING:
         raise ValueError(f"max_leases must be 1..{MAX_LEASES_CEILING}")

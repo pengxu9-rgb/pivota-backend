@@ -15,7 +15,10 @@ single lane every other store waited behind it (~2 stages/hour, 26 queued). The 
 already overlap (task timeout 3600s); a claim now lets up to N of them hold a lease at once, but
 never two at the same host (lowercased, "www." dropped, whatever the cohort shape) and never two
 applies (catalog writes stay serial). Each lane is its own execution with its own DB pool
-(DB_POOL_MAX_SIZE, 3 in prod), so N lanes hold up to 3N connections.
+(DB_POOL_MAX_SIZE, 3 in prod), so N lanes hold up to 3N connections. Host exclusivity does NOT bound
+the total request rate from the one crawl NAT (pacing is per host, per process): N lanes are N times
+the traffic, so arm at 2 and watch crawl_throttled before going higher. A throttled crawl ends only
+its own lane's loop. "idle" covers nothing due, every lane busy, and a lost lane lock alike.
 
 BACK TO BACK WITHIN A BUDGET, when RETAILER_INGEST_DRAIN_BUDGET_SECONDS > 0 (default 0 = exactly one
 stage, the original behaviour). 2026-09-24: stages took 4-12 minutes, so one stage per 30-minute tick
