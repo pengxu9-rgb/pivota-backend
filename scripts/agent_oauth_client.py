@@ -13,11 +13,15 @@ PROVISIONING A PARTNER (the secret never passes through a job log):
     # 1. the operator generates the secret and keeps it in Secret Manager
     openssl rand -hex 32 | tr -d '\\n' | gcloud secrets create oauth-client-agent_x --data-file=- --project pivota-prod
 
+    #    The job runs as sa-worker: grant it roles/secretmanager.secretAccessor on this secret.
+
     # 2. mint the client with that secret, credited to the partner's agent. Prints the client_id only.
-    #    MCP_OAUTH_AS_ISSUER must be the value the `web` service runs with (read it off the service):
-    #    a different issuer registers a client no token will ever match.
-    SECRETS=OAUTH_CLIENT_SECRET=oauth-client-agent_x:latest ENV_VARS=MCP_OAUTH_AS_ISSUER=<web's value> \\
-      scripts/ops/run_oneoff_job.sh python scripts/agent_oauth_client.py provision --agent-id agent_x \\
+    #    SECRETS and ENV_VARS REPLACE run_oneoff_job.sh's defaults, so restate DATABASE_URL and the DB
+    #    guardrails. MCP_OAUTH_AS_ISSUER must be the value the `web` service runs with (read it off the
+    #    service): a different issuer registers a client no token will ever match.
+    SECRETS=DATABASE_URL=DATABASE_URL:latest,OAUTH_CLIENT_SECRET=oauth-client-agent_x:latest \\
+    ENV_VARS=PIVOTA_ENV=production,DB_STATEMENT_TIMEOUT_SECONDS=30,DB_COMMAND_TIMEOUT_SECONDS=600,MCP_OAUTH_AS_ISSUER=<web's value> \\
+      scripts/ops/run_oneoff_job.sh scripts/agent_oauth_client.py provision --agent-id agent_x \\
         --redirect-uri https://claude.ai/api/mcp/auth_callback --client-name "Acme on Claude" \\
         --registered-by peng --note "Acme connector" --apply
 

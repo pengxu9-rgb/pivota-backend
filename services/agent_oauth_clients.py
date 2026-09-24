@@ -183,8 +183,11 @@ async def provision_oauth_client(
     })
     try:
         registration = await _write_registration(issuer, shaped.client_id, agent_id, registered_by, note)
-    except Exception:
-        await database.execute("DELETE FROM mcp_oauth_clients WHERE client_id = :c", {"c": shaped.client_id})
+    except BaseException:  # a cancellation must not leave an unregistered client behind either
+        try:
+            await database.execute("DELETE FROM mcp_oauth_clients WHERE client_id = :c", {"c": shaped.client_id})
+        except Exception:  # noqa: BLE001 -- keep the ORIGINAL error; a leftover client credits no one
+            pass
         raise
     return {**registration, "redirect_uris": list(shaped.redirect_uris),
             "token_endpoint_auth_method": shaped.token_endpoint_auth_method}
