@@ -777,3 +777,19 @@ async def test_an_ordinary_capped_crawl_is_told_to_raise_its_budget(env):
                                            next_page=81, scanned_products=20000, selected_products=0)
     out = await pipeline.run_stage(job(), db=env.db)
     assert "raise options.max_scan_products" in out["reason"] and "options.collections" not in out["reason"]
+
+
+@pytest.mark.parametrize("brands,ok", [
+    ({"Lancome": "Lancôme"}, True),                # a measured family, named by its own spelling
+    ({"Christian Dior": "Dior"}, True),
+    ({"Dior": "Chanel"}, False),                   # a family vendor mapped outside its family: ignored
+    ({"Lancome": "Lancome Paris"}, False),
+    ({"Chanel": "Dior"}, False),                   # not a respelling
+])
+def test_a_family_vendor_can_only_be_mapped_within_its_family(brands, ok):
+    options = {"vendors": list(brands), "multi_brand": True, "brands": brands}
+    if ok:
+        pipeline.validate_options(options)
+    else:
+        with pytest.raises(ValueError, match="ignored"):
+            pipeline.validate_options(options)

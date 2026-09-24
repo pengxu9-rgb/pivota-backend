@@ -1400,6 +1400,22 @@ RETAILER_BRAND_SPELLINGS = {
     # Purito renamed to Purito Seoul: eyurs "Purito SEOUL", sokoglam "Purito Seoul", ohlolly "Purito".
     "puritoseoul": "purito",
     "purito": "purito",
+    # US top-100 wave, measured 2026-09-24 (prod catalog_products + store vendors). A store's spelling
+    # of a prestige brand is a different brand key otherwise -- words (Tom Ford / Tom Ford Beauty,
+    # Christian Dior / Dior, Yves Saint Laurent / YSL) or ACCENTS, which _brand_key and
+    # normalize_brand both keep (perfumania "Lancome" vs the catalog's "Lancôme").
+    "tomford": "tomford", "tomfordbeauty": "tomford",                        # tomfordbeauty.com 145 rows
+    "dior": "dior", "christiandior": "dior", "diorbeauty": "dior",           # perfumania "Christian Dior"
+    "ysl": "ysl", "yslbeauty": "ysl", "yvessaintlaurent": "ysl", "yvessaintlaurentbeauty": "ysl",
+    "jomalone": "jomalone", "jomalonelondon": "jomalone",                    # bluemercury "Jo Malone London"
+    "lancome": "lancome", "lancôme": "lancome",
+    "esteelauder": "esteelauder", "estéelauder": "esteelauder",
+    "kiehls": "kiehls", "kiehlssince1851": "kiehls",
+    "dolceandgabbana": "dolcegabbana", "dolcegabbana": "dolcegabbana",
+    "lorealparis": "lorealparis", "loréalparis": "lorealparis",
+    "tresemme": "tresemme", "tresemmé": "tresemme",
+    "avene": "avene", "avène": "avene",                                      # bluemercury Avène, bigelow Avene
+    "kerastase": "kerastase", "kérastase": "kerastase",
     # Measured 2026-09-24 over every vendor at 400+ Japanese/Australian beauty storefronts (JP/AU
     # coverage census): the same maker spelt with and without its accent. `_brand_key` keeps accented
     # letters (isalnum), and so does normalize_brand, so each spelling below was a separate brand
@@ -1434,6 +1450,22 @@ RETAILER_BRAND_SPELLINGS = {
 RETAILER_BRAND_CANONICAL = {
     "manyo": "Ma:nyo",
     "purito": "Purito SEOUL",
+    # The catalog's own spelling, measured 2026-09-24 (rows): Tom Ford Beauty 145 (vs "Tom Ford" 4),
+    # Dior 23, YSL 6, Jo Malone 4, Lancôme 12, Estée Lauder 14 (vs "Estee Lauder" 2), Kiehl's Since
+    # 1851 10, Dolce and Gabbana 38 (vs "Dolce & Gabbana" 1), L'Oreal Paris 12. No rows yet for
+    # TRESemmé, Avène, Kérastase: the brand's own spelling.
+    "tomford": "Tom Ford Beauty",
+    "dior": "Dior",
+    "ysl": "YSL",
+    "jomalone": "Jo Malone",
+    "lancome": "Lancôme",
+    "esteelauder": "Estée Lauder",
+    "kiehls": "Kiehl's Since 1851",
+    "dolcegabbana": "Dolce and Gabbana",
+    "lorealparis": "L'Oreal Paris",
+    "tresemme": "TRESemmé",
+    "avene": "Avène",
+    "kerastase": "Kérastase",
     # 2026-09-24: prod carried none of these as a brand (only two seed-mirror rows, "Biore UV" and
     # "Clé de Peau"), so each family is written as the maker's own spelling on its own storefront.
     "kose": "Kosé",
