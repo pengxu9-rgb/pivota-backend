@@ -642,3 +642,10 @@ async def test_naming_the_store_as_the_brand_cannot_write_another_brands_rows(en
     run = list(env.ledger.runs.values())[-1]
     assert [f["key"] for f in run["flags"] if f["rule"] == "brand_official_domain_unproven"] == [
         "brand_official_domain_unproven:k-touch.us:3ce"]
+
+
+def test_each_non_latin_brand_needs_its_own_acceptance():
+    keys = [f["key"] for f in pipeline.brand_official_domain_flags("k-touch.us", ["설화수", "헤라", "HERA"])]
+    assert keys == ["brand_official_domain_unproven:k-touch.us:설화수",
+                    "brand_official_domain_unproven:k-touch.us:헤라",
+                    "brand_official_domain_unproven:k-touch.us:hera"]

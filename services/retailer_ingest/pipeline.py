@@ -109,7 +109,7 @@ def brand_official_domain_flags(domain: str, brands: List[str]) -> List[Dict[str
         rule that types an offer brand_direct), or a human accepts the flag (tartecosmetics.com for
         "Tarte", k18hair.com for "K18"): held, never auto-applied.
     """
-    from services.offer_seller_identity import brand_owns_domain, is_known_retailer, normalize_brand
+    from services.offer_seller_identity import brand_owns_domain, is_known_retailer
 
     if is_known_retailer(domain):
         return [{"key": "brand_official_on_a_retailer", "rule": "brand_official_on_a_retailer",
@@ -120,7 +120,9 @@ def brand_official_domain_flags(domain: str, brands: List[str]) -> List[Dict[str
     for brand in brands:
         if brand_owns_domain(brand, domain):
             continue
-        key = f"brand_official_domain_unproven:{domain}:{normalize_brand(brand) or '-'}"
+        # The brand's own casefolded spelling, NOT normalize_brand: that strips every non-ASCII
+        # letter, so 설화수 and 헤라 would share one key and one acceptance would pass both.
+        key = f"brand_official_domain_unproven:{domain}:{' '.join(str(brand).split()).casefold()}"
         flags.setdefault(key, {
             "key": key, "rule": "brand_official_domain_unproven", "severity": detectors.BLOCK,
             "detail": f"the domain name of {domain} is not the brand {brand!r}; accept this key only if "
