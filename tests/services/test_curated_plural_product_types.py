@@ -283,3 +283,59 @@ def test_a_tool_filed_on_the_physical_shelf_is_a_known_gap_not_a_guard():
     # The formula rows the veto would have refused keep their measured leaf.
     assert resolve("Masks", "Clay Mask with Applicator Brush", "eyurs.com")[0] == "beauty/skincare/treat/mask"
     assert resolve("Physical", "Bio-Peel Gauze Peeling Wine", "sokoglam.com")[0] == "beauty/skincare/treat/exfoliant"
+
+
+# japanesetaste.com, read 2026-09-24 (every product: 5,120). Breadcrumb types name several pattern
+# families, so the evidence policy resolved none of its beauty rows. Titles are the real ones.
+JT = "japanesetaste.com"
+JT_MASKS = "beauty & personal care / skincare / face masks"
+JT_SUN = "beauty & personal care / skincare / sun care"
+
+
+@pytest.mark.parametrize("ptype,title,want", [
+    (JT_MASKS, "Lululun Precious Red Moisturizing Face Mask 32 Sheets", "beauty/skincare/treat/mask"),
+    (JT_MASKS, "Hada Labo Gokujyun 3D Hyaluronic Acid Anti Aging Facial Sheet Mask 30 Sheets", "beauty/skincare/treat/mask"),
+    # Titles that name no leaf at all: the shelf is the only evidence, and it was read.
+    (JT_MASKS, "Quality 1st Derma Laser Super Tea Tree 100 Soothing Sheet Masks 7 ct.", "beauty/skincare/treat/mask"),
+    (JT_MASKS, "Ishizawa Lab Keana Rice Pack For Clogged Pores & Dull Skin 6oz", "beauty/skincare/treat/mask"),
+    (JT_SUN, "Anessa Perfect UV Sunscreen Skincare Milk NA SPF50+ 2 fl oz", "beauty/skincare/sun/sunscreen"),
+    (JT_SUN, "Skin Aqua Super Moisture Gel SPF50+ PA++++ 3.9oz", "beauty/skincare/sun/sunscreen"),
+])
+def test_japanesetaste_measured_shelves_resolve_their_products(ptype, title, want):
+    assert evidence_only(ptype, title)[0] == "beauty"  # unresolved before the shelf was read
+    assert resolve(ptype, title, JT) == (want, MEASURED)
+
+
+def test_japanesetaste_shelf_match_ignores_case_and_spacing():
+    spelled = "Beauty & Personal Care /  Skincare / Sun Care"
+    assert resolve(spelled, "Canmake Mermaid Skin Gel UV Sunscreen SPF50+ PA++++ 1.4oz", "www.japanesetaste.com") == (
+        "beauty/skincare/sun/sunscreen", MEASURED)
+
+
+@pytest.mark.parametrize("ptype,title", [
+    # Real rows on the two shelves whose titles name another leaf: the shelf steps aside.
+    (JT_SUN, "SK-II Genoptics CC Primer Tone Up Sunscreen SPF50+ 1.1oz"),
+    (JT_SUN, "Transino UV Concealer Skin Lightening Waterproof Concealer SPF50+ PA++++ 0.1oz"),
+    (JT_SUN, "Allie Chrono UV Gel For Foundation-Free Makeup Sunny Apricot SPF50+ 1.4oz"),
+    (JT_MASKS, "BCL Tsururi Herbal Facial Cleansing Paste Mud Pack 4.2oz"),
+])
+def test_japanesetaste_shelves_step_aside_for_a_title_naming_another_leaf(ptype, title):
+    assert resolve(ptype, title, JT) == evidence_only(ptype, title)
+
+
+@pytest.mark.parametrize("ptype,title", [
+    # Shelves read and deliberately NOT listed. Each row is real and would have been misfiled.
+    ("beauty & personal care / skincare / cleansers", "Gatsby Oil Clear Absorbing Sheet Blotting Paper Film 75 Sheets"),
+    ("beauty & personal care / skincare / japanese lotions", "Kosé Lecheri Lift Glow Emulsion Skin Glowing Face Milk 4.1 fl oz"),
+    ("beauty & personal care / skincare / moisturizers", "Inaho Balancing Rice Bran Beauty Oil Non-Sticky Skincare Oil 1 fl oz"),
+    ("beauty & personal care / skincare / facial treatments", "SHiKI Luxurious Fermented Beauty Oil Summer Green 3.4 fl oz"),
+    ("beauty & personal care / bath & body / body skincare", "Mentholatum Liquid Bandage Waterproof Invisible Gel Bandage 0.4oz"),
+])
+def test_japanesetaste_mixed_shelves_stay_unmeasured(ptype, title):
+    assert resolve(ptype, title, JT) == evidence_only(ptype, title)
+
+
+@pytest.mark.parametrize("domain", ["unknown.com", "eyurs.com", "ichibanm.com"])
+def test_japanesetaste_shelves_mean_nothing_on_another_host(domain):
+    title = "Anessa Perfect UV Sunscreen Skincare Milk NA SPF50+ 2 fl oz"
+    assert resolve(JT_SUN, title, domain) == evidence_only(JT_SUN, title)
