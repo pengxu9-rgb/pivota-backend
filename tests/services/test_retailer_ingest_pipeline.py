@@ -741,3 +741,22 @@ async def test_multi_brand_writes_each_vendors_canonical_spelling(env, monkeypat
 def test_multi_brand_spellings_and_fetch_budget_are_validated(options):
     with pytest.raises(ValueError):
         pipeline.validate_options(dict(options))
+
+
+async def test_the_collections_option_reaches_the_crawl(env, monkeypatch):
+    seen = []
+    built = feed.records_for_brand
+
+    async def spy(**kw):
+        seen.append(kw.get("collection_handles"))
+        return await built(**kw)
+    monkeypatch.setattr(feed, "records_for_brand", spy)
+    await pipeline.run_stage(job(collections=["3ce", "3ce-lip"]), db=env.db)
+    await pipeline.run_stage(job(), db=env.db)
+    assert seen == [["3ce", "3ce-lip"], None]
+
+
+@pytest.mark.parametrize("collections", [[], ["../x"], ["Upper"], "3ce"])
+def test_bad_collections_are_refused(collections):
+    with pytest.raises(ValueError):
+        pipeline.validate_options({"vendors": ["3CE"], "collections": collections})

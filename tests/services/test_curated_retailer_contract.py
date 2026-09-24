@@ -305,3 +305,46 @@ def test_generic_lip_care_does_not_assume_every_product_is_an_oil():
     rec = map_record("retailer.com", title="Honey & Milk Moisture", product_type="Lip Care")
     assert rec["pdp"]["category_path"] is None
     assert rec["pdp"]["category_confidence"] == feed.CATEGORY_CONFIDENCE_FEED_DEFAULT
+
+
+# ---- collection-scoped crawl (stores over Shopify's 100-page /products.json limit) -------------
+
+@pytest.mark.asyncio
+async def test_collections_are_crawled_to_their_own_empty_page_merged_and_vendor_filtered(monkeypatch):
+    reqs = install_http(monkeypatch, [
+        {"products": [product(1), product(2, "Other")]}, {"products": []},          # collection a-pieu
+        {"products": [product(1), product(3)]}, {"products": []},                   # collection sale (1 repeats)
+    ])
+    batch = await feed.fetch_shopify_collections("retailer.com", ["a-pieu", "sale"], only_vendors=["A'PIEU"],
+                                                 max_products=10, max_scan_products=100)
+    assert [p["id"] for p in batch] == [9000001, 9000003]                            # other vendor out, dedupe by id
+    assert [r.url.path for r in reqs] == ["/collections/a-pieu/products.json"] * 2 + ["/collections/sale/products.json"] * 2
+    report = batch.crawl_report
+    assert report["status"] == "complete" and report["scope"] == "collections:a-pieu,sale"  # never "store"
+    assert report["collections"]["a-pieu"]["selected_products"] == 1 and report["scanned_products"] == 4
+
+
+@pytest.mark.asyncio
+async def test_a_collection_without_the_vendor_fails_loudly(monkeypatch):
+    install_http(monkeypatch, [{"products": [product(1, "Other")]}, {"products": []}])
+    with pytest.raises(feed.CrawlIncomplete, match="lists no product") as err:
+        await feed.fetch_shopify_collections("retailer.com", ["wrong-handle"], only_vendors=["A'PIEU"],
+                                             max_products=10, max_scan_products=100)
+    assert err.value.status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_past_shopifys_last_page_the_crawl_is_capped_and_says_use_collections(monkeypatch):
+    install_http(monkeypatch, [{"products": [product(1), product(2)]}, {"products": [product(3), product(4)]}])
+    monkeypatch.setattr(feed, "SHOPIFY_MAX_PAGES", 2)
+    with pytest.raises(feed.CrawlIncomplete, match="options.collections") as err:
+        await feed.fetch_shopify_products("big.com", max_products=10, max_scan_products=100)
+    assert err.value.status == "capped"
+
+
+@pytest.mark.parametrize("handle", ["", "../products", "Clinique", "a/b", "a b", "x" * 300])
+def test_only_a_shopify_collection_handle_is_accepted(handle):
+    assert not feed.valid_collection_handle(handle)
+    with pytest.raises(ValueError):
+        import asyncio
+        asyncio.run(feed.fetch_shopify_products("retailer.com", collection=handle))
