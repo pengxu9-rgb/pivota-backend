@@ -336,3 +336,31 @@ async def test_a_link_minted_but_not_served_is_never_issued(monkeypatch):
     batches.clear()
     await gateway._issue_served_clicks(minted, [{"affiliate_url": "https://x/r?token=other"}], AGENT_KEY)
     assert batches == []
+
+
+async def test_merchant_diagnostics_do_not_flag_links_nobody_followed(monkeypatch):
+    """The catalog arm issues links with no variant id. Until a buyer follows one it is an offer,
+    so it must not raise "Click rows are missing canonical variant ids" or count as a click row."""
+    import services.merchant_commerce_diagnostics_service as diag
+
+    clicks = [
+        {"click_id": "clk_issued", "click_count": 0, "impression_count": 0, "canonical_variant_id": None},
+        {"click_id": "clk_followed", "click_count": 1, "impression_count": 0, "canonical_variant_id": None},
+        {"click_id": "clk_seen", "click_count": 0, "impression_count": 2, "canonical_variant_id": "v1"},
+    ]
+
+    async def fake_fetch_all(query, values=None):
+        return clicks if "surface_click_events" in str(query) else []
+
+    async def no_listings(*a, **k):
+        return []
+
+    monkeypatch.setattr(diag.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(diag, "fetch_listing_rows_with_catalog_fallback", no_listings)
+
+    out = await diag.build_merchant_commerce_funnel_issues(merchant_id="m_anchor")
+
+    missing = [i for i in out["issues"] if i["code"] == "MISSING_INFO"]
+    assert len(missing) == 1 and missing[0]["count"] == 1
+    assert [s["click_id"] for s in missing[0]["samples"]] == ["clk_followed"]
+    assert out["summary"]["click_rows_total"] == 2
