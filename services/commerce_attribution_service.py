@@ -545,12 +545,12 @@ async def get_order_attribution_edge_id(order_id: Optional[str]) -> Optional[str
         return None
 
 
-# Atomic refund attribution UPDATE that handles the multi-edge fan-out case
-# correctly. v1.3 T9 stamps every commerce_attribution_edges row sharing an
-# order_id with the same gross_attributed_gmv_cents — by design (one edge per
-# surface_click_event). The matching refund behavior is to apply the same
-# refund delta to every edge, so per-rollup-group (date, merchant, agent,
-# channel_partner) net math stays symmetric.
+# Atomic refund attribution UPDATE. It is written for a multi-edge fan-out
+# (v1.3 T9 stamped every edge sharing an order_id with the same
+# gross_attributed_gmv_cents), but idx_commerce_attribution_edges_order is
+# UNIQUE on order_id (migration 060, db/commerce_attribution.py), so today an
+# order has at most one edge and "every edge" means that one. The per-edge,
+# single-statement form still matters for the atomicity reasons below.
 #
 # Prior implementation read one edge via fetch_one, computed new totals in
 # Python, and wrote the same values to all N edges via a bulk UPDATE. Two
@@ -742,8 +742,15 @@ async def emit_attribution_refund_event(
     order_id: str,
     refund_id: str,
     amount: Any,
+    upstream_idempotency_key: Optional[str] = None,
 ) -> None:
-    """Emit ``refund.succeeded`` once for a refund, however many edges it fanned out to."""
+    """Emit ``refund.succeeded`` once for a refund, however many edges it fanned out to.
+
+    The ledger keeps ONE event per (merchant, event type, upstream key). The default key,
+    ``refund:<refund_id>``, suits a writer that adds each id once. A writer whose id repeats
+    across different money (the refund ceiling: Stripe reuses one ch_ for every partial
+    refund) must pass its own key, or every event after the first is silently dropped.
+    """
     if not rows:
         return
     # Use the first edge's context for the event metadata since merchant_id is invariant across
@@ -767,7 +774,7 @@ async def emit_attribution_refund_event(
             "edge_count": len(rows),
         },
         source="commerce_attribution_edges",
-        upstream_idempotency_key=f"refund:{refund_id}",
+        upstream_idempotency_key=upstream_idempotency_key or f"refund:{refund_id}",
         **ledger_provenance("commerce_attribution_edge", "unknown"),
     )
 
@@ -850,15 +857,24 @@ async def emit_refund_total_event(
 ) -> None:
     """Emit ``refund.succeeded`` for the money a ceiling write actually added, if any.
 
-    An echo of money another id already reported adds 0 and emits nothing.
+    An echo of money another id already reported adds 0 and emits nothing. Keyed on the
+    order and the refund total this write reached, not on ``refund_id``: Stripe reports
+    every partial refund of a charge under the SAME ch_ id, so ``refund:<ch_…>`` kept only
+    the first partial in the ledger. Each ceiling step reaches a distinct total, and a
+    redelivery of the same step adds 0 and never gets here.
     """
     added_cents = _refund_total_added_cents(rows)
     if added_cents > 0:
+        first = rows[0]
+        refund_part_cents = int(first.get("refund_amount_cents") or 0) - int(
+            first.get("dispute_amount_cents") or 0
+        )
         await emit_attribution_refund_event(
             rows,
             order_id=order_id,
             refund_id=refund_id,
             amount=Decimal(added_cents) / Decimal("100"),
+            upstream_idempotency_key=f"refund_total:{order_id}:{refund_part_cents}",
         )
 
 
