@@ -348,3 +348,23 @@ def test_only_a_shopify_collection_handle_is_accepted(handle):
     with pytest.raises(ValueError):
         import asyncio
         asyncio.run(feed.fetch_shopify_products("retailer.com", collection=handle))
+
+
+@pytest.mark.asyncio
+async def test_the_scan_budget_bounds_all_collections_together(monkeypatch):
+    install_http(monkeypatch, [{"products": [product(1), product(2)]}, {"products": []},
+                              {"products": [product(3), product(4)]}])
+    with pytest.raises(feed.CrawlIncomplete) as err:
+        await feed.fetch_shopify_collections("retailer.com", ["a", "b"], only_vendors=["A'PIEU"],
+                                             max_products=10, max_scan_products=3)
+    assert err.value.status == "capped" and err.value.scanned_products == 2  # the whole crawl so far
+
+
+@pytest.mark.asyncio
+async def test_the_merged_selection_respects_the_product_budget(monkeypatch):
+    install_http(monkeypatch, [{"products": [product(1), product(2)]}, {"products": []},
+                              {"products": [product(3), product(4)]}, {"products": []}])
+    with pytest.raises(feed.CrawlIncomplete, match="selected-product budget 3") as err:
+        await feed.fetch_shopify_collections("retailer.com", ["a", "b"], only_vendors=["A'PIEU"],
+                                             max_products=3, max_scan_products=100)
+    assert err.value.status == "capped"

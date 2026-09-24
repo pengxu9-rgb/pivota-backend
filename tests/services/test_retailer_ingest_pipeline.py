@@ -760,3 +760,13 @@ async def test_the_collections_option_reaches_the_crawl(env, monkeypatch):
 def test_bad_collections_are_refused(collections):
     with pytest.raises(ValueError):
         pipeline.validate_options({"vendors": ["3CE"], "collections": collections})
+
+
+async def test_a_store_past_shopifys_last_page_is_told_to_use_collections(env):
+    env.crawl_error = feed.CrawlIncomplete(
+        "big.com: page 101: Shopify serves at most 100 pages of /products.json; this listing is larger -- "
+        "crawl the brand's collection (options.collections) instead", status="capped", next_page=101,
+        scanned_products=25000, selected_products=0)
+    out = await pipeline.run_stage(job(), db=env.db)
+    assert out["outcome"] == "crawl_capped" and "options.collections" in out["reason"]
+    assert "raise options.max_scan_products" not in out["reason"]

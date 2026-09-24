@@ -554,8 +554,19 @@ async def fetch_shopify_collections(
     per: Dict[str, Dict[str, Any]] = {}
     scanned = pages = 0
     for handle in handles:
-        batch = await fetch_shopify_products(domain, only_vendors=only_vendors, max_products=max_products,
-                                             max_scan_products=max_scan_products, collection=handle)
+        remaining = max_scan_products - scanned  # the scan budget bounds ALL collections together
+        if remaining < 1:
+            raise CrawlIncomplete(f"{_clean_domain(domain)}: scan budget {max_scan_products} exhausted before "
+                                  f"collection {handle!r}", status="capped", next_page=0,
+                                  scanned_products=scanned, selected_products=len(merged))
+        try:
+            batch = await fetch_shopify_products(domain, only_vendors=only_vendors, max_products=max_products,
+                                                 max_scan_products=remaining, collection=handle)
+        except CrawlIncomplete as exc:
+            # Report the WHOLE crawl so far, not just this collection's share.
+            exc.scanned_products += scanned
+            exc.selected_products += len(merged)
+            raise
         report = batch.crawl_report
         per[handle] = {k: report.get(k) for k in ("pages", "scanned_products", "selected_products")}
         scanned += int(report.get("scanned_products") or 0)

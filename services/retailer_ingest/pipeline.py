@@ -270,9 +270,12 @@ async def _crawl(job: Dict[str, Any], stage: str) -> List[Dict[str, Any]]:
     except CrawlIncomplete as exc:
         crawl = exc.as_dict()
         if crawl.get("status") == "capped":
-            raise _Stop("crawl_capped", "failed", f"crawl capped: {crawl.get('reason')} -- raise "
-                        "options.max_scan_products (store scan) or options.max_products (selected rows), "
-                        "whichever the reason names, or cancel the job") from exc
+            reason = str(crawl.get("reason") or "")
+            advice = ("crawl the brand's collections (options.collections) -- Shopify pages stop at 100"
+                      if "options.collections" in reason else
+                      "raise options.max_scan_products (store scan) or options.max_products (selected rows), "
+                      "whichever the reason names")
+            raise _Stop("crawl_capped", "failed", f"crawl capped: {reason} -- {advice}, or cancel the job") from exc
         if _transient(crawl):
             attempts = int(job.get("attempts") or 0) + 1
             if attempts >= int(job.get("max_attempts") or 6):
