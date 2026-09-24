@@ -45,6 +45,10 @@ _OPTION_TYPES = {
     # "storefront" (default: crawl the retailer's /products.json) or "affiliate_feed" (the network's
     # product datafeed; services/retailer_ingest/affiliate_feed.py) -- for stores that block crawlers.
     "source": str, "feed": dict,
+    # Whose store this is: "retailer" (default) or "brand_official" (the brand's own storefront, the
+    # ADR-001 canonical anchor). services.catalog_onboard_worker.normalize_curated_brand_payload owns
+    # the allowed values and the retailer_name rule; enqueue runs that same normalization.
+    "source_role": str,
 }
 SOURCES = ("storefront", "affiliate_feed")
 
@@ -76,6 +80,9 @@ def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
     source = options.get("source") or "storefront"
     if source not in SOURCES:
         raise ValueError(f"options.source must be one of {list(SOURCES)}")
+    if source == "affiliate_feed" and options.get("source_role", "retailer") != "retailer":
+        # The feed mapping is retailer-shaped: a retailer-host listing clicked through a network link.
+        raise ValueError("options.source = affiliate_feed supports only source_role = retailer")
     if source == "affiliate_feed":
         from services.retailer_ingest.affiliate_feed import validate_feed_options
         validate_feed_options(options.get("feed"))
@@ -94,7 +101,8 @@ def _feed_payload(job: Dict[str, Any]) -> Dict[str, Any]:
         raise _Stop("invalid_job", "failed", str(exc)) from exc
     return {
         "domain": job["domain"], "brand": job["brand"], "category_path": o.get("category_path") or "beauty",
-        "source_role": "retailer", "retailer_name": o.get("retailer_name"), "only_vendors": list(o["vendors"]),
+        "source_role": o.get("source_role") or "retailer", "retailer_name": o.get("retailer_name"),
+        "only_vendors": list(o["vendors"]),
         "require_currency": o.get("require_currency") or "USD", "emit_real_variants": True,
         "enrich_missing_gtin": True, "max_products": int(o.get("max_products") or 200),
         "max_scan_products": int(o.get("max_scan_products") or 20000),
@@ -154,7 +162,10 @@ async def _crawl(job: Dict[str, Any], stage: str) -> List[Dict[str, Any]]:
     from services.curated_brand_feed import CrawlIncomplete, lip_title_evidence, records_for_brand
     import contextlib
 
-    payload = normalize_curated_brand_payload(_feed_payload(job))
+    try:
+        payload = normalize_curated_brand_payload(_feed_payload(job))
+    except ValueError as exc:  # e.g. an unknown source_role on a row written by another path
+        raise _Stop("invalid_job", "failed", str(exc)) from exc
     evidence = lip_title_evidence() if (job.get("options") or {}).get("lip_title_evidence") else contextlib.nullcontext()
     try:
         with evidence:

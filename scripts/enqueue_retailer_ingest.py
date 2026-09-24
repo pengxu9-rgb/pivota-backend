@@ -56,6 +56,14 @@ def _row_to_job(row: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError(f"unknown options {sorted(unknown)} in {row}")
     options["vendors"] = vendors
     validate_options(options)  # the same check the drain runs before any crawl
+    # ...and the same payload normalization it runs (source_role values, retailer_name only for a
+    # retailer): a row the drain would refuse at crawl time is refused here, by the same function.
+    from services.catalog_onboard_worker import normalize_curated_brand_payload
+    from services.retailer_ingest.pipeline import _feed_payload, _Stop
+    try:
+        normalize_curated_brand_payload(_feed_payload({"domain": domain, "brand": brand, "options": options}))
+    except _Stop as exc:
+        raise ValueError(exc.reason) from None
     return {"domain": domain, "brand": brand, "options": options, "priority": int(row.get("priority") or 0)}
 
 

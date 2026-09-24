@@ -21,3 +21,18 @@ def test_a_row_becomes_a_job_with_vendors_in_its_options():
 def test_bad_rows_are_refused(row):
     with pytest.raises(ValueError):
         _row_to_job(row)
+
+
+def test_a_brand_official_row_is_accepted():
+    job = _row_to_job({"domain": "clinique.com", "brand": "Clinique", "vendors": ["Clinique"],
+                       "options": {"source_role": "brand_official", "max_products": 1500}})
+    assert job["options"]["source_role"] == "brand_official"
+
+
+@pytest.mark.parametrize("options", [
+    {"source_role": "brand"},                                       # the drain's normalization refuses it
+    {"source_role": "brand_official", "retailer_name": "Clinique"},  # a retailer's name on a brand store
+])
+def test_rows_the_drain_would_refuse_are_refused_at_enqueue(options):
+    with pytest.raises(ValueError, match="source_role|retailer_name"):
+        _row_to_job({"domain": "clinique.com", "brand": "Clinique", "vendors": ["Clinique"], "options": options})

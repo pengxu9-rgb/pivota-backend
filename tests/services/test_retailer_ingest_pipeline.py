@@ -530,3 +530,63 @@ async def test_the_run_reason_counts_every_noted_row(env):
 async def test_an_empty_readback_still_carries_its_notes_list():
     readback = await pipeline._readback([], "USD", db=None)
     assert readback == {"ok": False, "reason": "no product keys to read back", "notes": [], "rows": []}
+
+
+# ------------------------------------------------------------------ source_role (a brand's own store)
+
+async def test_the_source_role_option_reaches_the_crawl_and_defaults_to_retailer(env, monkeypatch):
+    seen = []
+    built = feed.records_for_brand
+
+    async def spy(**kw):
+        seen.append((kw.get("source_role"), kw.get("retailer_name")))
+        return await built(**kw)
+    monkeypatch.setattr(feed, "records_for_brand", spy)
+    await pipeline.run_stage(job(), db=env.db)
+    await pipeline.run_stage(job(source_role="brand_official"), db=env.db)
+    assert seen == [("retailer", "k-touch.us"), ("brand_official", None)]  # a retailer is named by its host
+
+
+async def test_a_brand_official_cohort_applies_with_brand_authority(env, monkeypatch):
+    """The brand's own store: offers carry the brand's merchant identity and brand-official INCI
+    authority, not a reseller's -- the same records Lane A (onboard_curated_brands.py) writes."""
+    def official(title, ptype, handle, body="<p>Ingredients: Water, Glycerin, Dimethicone</p>"):
+        return feed.shopify_product_to_record(
+            {"id": abs(hash(handle)) % 10**9, "vendor": "3CE", "title": title, "handle": handle,
+             "product_type": ptype, "body_html": body, "images": [{"src": "https://cdn.example/i.jpg"}],
+             "variants": [{"id": abs(hash(handle + "v")) % 10**12, "price": "20.00", "available": True,
+                           "sku": handle}]},
+            domain="k-touch.us", category_path="beauty", brand_override="3CE", currency="USD",
+            source_role="brand_official", emit_native_variants=True)
+
+    async def fetch(**kw):
+        assert kw["source_role"] == "brand_official"
+        return feed.ShopifyProductBatch([official(*TINT)], scanned_products=1, pages=1)
+    monkeypatch.setattr(feed, "records_for_brand", fetch)
+    assert (await pipeline.run_stage(job(source_role="brand_official"), db=env.db))["status"] == "apply_due"
+    out = await pipeline.run_stage(job("apply_due", source_role="brand_official"), db=env.db)
+    assert out["status"] == "done", env.ledger.runs
+    import json
+    offer = env.applied[-1]["offers"][0]
+    assert not offer["merchant_id"].startswith("agent_seed::retailer::")
+    assert json.loads(offer["offer_payload"])["merchant_inferred"] == "3CE"
+    assert not env.applied[-1]["pdps"][0]["product_key"].startswith("ext:retailer:")
+
+
+@pytest.mark.parametrize("options", [
+    {"vendors": ["3CE"], "source_role": "brand"},                                   # not a role
+    {"vendors": ["3CE"], "source_role": "brand_official", "retailer_name": "X"},     # a retailer's name
+    {"vendors": ["3CE"], "source_role": True},                                      # typed
+])
+async def test_a_bad_source_role_is_refused_before_any_crawl(env, options):
+    env.crawl_error = AssertionError("must not crawl")
+    bad = job()
+    bad["options"] = options
+    out = await pipeline.run_stage(bad, db=env.db)
+    assert out["status"] == "failed" and out["outcome"] == "invalid_job"
+
+
+def test_an_affiliate_feed_is_retailer_only():
+    with pytest.raises(ValueError, match="source_role = retailer"):
+        pipeline.validate_options({"vendors": ["X"], "source": "affiliate_feed", "source_role": "brand_official",
+                                   "feed": {}})
