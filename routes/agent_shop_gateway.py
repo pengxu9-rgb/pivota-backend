@@ -15,6 +15,7 @@ Path: POST /agent/shop/v1/invoke
 
 import asyncio
 import copy
+from dataclasses import replace
 import hashlib
 import json
 import logging
@@ -74,7 +75,7 @@ from services.similarity_service import (
     similarity_service,
 )
 from services.similarity_config import get_similarity_scoring_weights
-from routes.agent_auth import AgentContext, get_agent_context
+from routes.agent_auth import AgentContext, get_agent_context, request_api_key, resolve_issuing_agent_id
 from db.merchant_tasks import match_recovery_key
 from services.outbound_links_service import (
     DEFAULT_UTM_TEMPLATE,
@@ -92,6 +93,7 @@ from services.outbound_links_service import (
     normalize_shop_host,
     parse_redirect_token_verified,
     shopify_cart_base_url,
+    url_domain,
 )
 from services import checkout_preflight
 from services import live_offer_verification
@@ -112,6 +114,8 @@ from services.commerce_attribution_service import (
     PVT_PRODUCT_ID,
     PVT_SURFACE,
     PVT_VARIANT_ID,
+    IssuedClick,
+    issue_clicks,
     new_click_id,
     normalize_surface,
 )
@@ -3993,6 +3997,9 @@ async def _handle_offers_resolve(
     payload: OffersResolvePayload,
     request_metadata: Optional[Dict[str, Any]],
     background_tasks: BackgroundTasks,
+    # ADR-025 D1: the API key the CALLER authenticated with (the gateway forwards the agent's own
+    # key). Resolved to an agent only when a click is actually issued; never read from the body.
+    caller_api_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Resolve purchasable offers for a given sku_id/product_id.
@@ -4769,6 +4776,7 @@ async def _handle_offers_resolve(
                     platform=redirect_identity["platform"],
                     seller_ref=redirect_identity["seller_ref"],
                     seed_kind=redirect_identity["seed_kind"],
+                    issued_clicks=_issued_clicks,
                 )
                 if not redirect_url:
                     continue
@@ -5018,6 +5026,8 @@ async def _handle_offers_resolve(
 
     # 1) External offers from external seeds (affiliate outbound)
     external_offers: List[Dict[str, Any]] = []
+    # ADR-025 D1: every click id handed out below, recorded in ONE write after this section.
+    _issued_clicks: List[IssuedClick] = []
     external_started = time.perf_counter()
     try:
         # Fuzzy (external_product_id/title/url LIKE) is the default label; the
@@ -5247,6 +5257,22 @@ async def _handle_offers_resolve(
             error=type(e).__name__,
             query=query_label,
         )
+
+    # ADR-025 D1: record the click ids these links carry, with the agent they were issued to.
+    # FAIL OPEN: a failed write is counted and the links are served anyway; losing a click record
+    # must never take down search. `/r` still records a click on a link whose issue was lost
+    # (as a legacy row, issued_at NULL), so the funnel under-counts issues, never clicks.
+    if _issued_clicks:
+        try:
+            _issuing_agent = await resolve_issuing_agent_id(caller_api_key)
+            await issue_clicks(
+                [replace(click, agent_id=_issuing_agent) for click in _issued_clicks]
+            )
+        except Exception as e:  # noqa: BLE001 -- see FAIL OPEN above
+            logger.warning(
+                "offers.resolve.issue_clicks_failed count=%s error_type=%s",
+                len(_issued_clicks), type(e).__name__,
+            )
 
     # 2) Internal checkout offers (primary)
     internal_offers: List[Dict[str, Any]] = []
@@ -9156,6 +9182,10 @@ async def _make_external_redirect_url(
     click_id: Optional[str] = None,
     seller_ref: Optional[str] = None,
     seed_kind: Optional[str] = None,
+    # ADR-025 D1: when given, the click this link carries is appended here, built from the SAME
+    # ctx, destination and ids signed into the token, so the row recorded at issue time and the
+    # one `/r` fills can never describe different clicks. The caller writes the batch.
+    issued_clicks: Optional[List[IssuedClick]] = None,
 ) -> Optional[str]:
     if not destination_url.startswith(("http://", "https://")):
         return None
@@ -9235,6 +9265,17 @@ async def _make_external_redirect_url(
             "ctx": enriched_ctx,
         }
     )
+    if issued_clicks is not None:
+        issued_clicks.append(IssuedClick(
+            click_id=stable_click_id,
+            surface=str(enriched_ctx.get(PVT_SURFACE) or ""),
+            merchant_id=merchant_id,
+            canonical_product_id=product_id,
+            canonical_variant_id=variant_id,
+            destination_url=dest,
+            dest_domain=url_domain(dest) or None,
+            context=dict(enriched_ctx),
+        ))
     base = resolve_public_api_base_url()
     return f"{base}/r?token={token}"
 
@@ -16053,7 +16094,10 @@ async def invoke_shop_operation(
         payload = OffersResolvePayload(
             **_normalize_offers_resolve_payload(request.payload)
         )
-        return await _handle_offers_resolve(payload, normalized_metadata, background_tasks)
+        return await _handle_offers_resolve(
+            payload, normalized_metadata, background_tasks,
+            caller_api_key=request_api_key(http_request),
+        )
 
     if operation == "find_similar_products":
         payload = FindSimilarProductsPayload(**request.payload)

@@ -3,15 +3,18 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from db.commerce_attribution import commerce_attribution_edges, surface_click_events
-from db.database import database
+from db.database import IS_POSTGRES, database
 from observability.reliability_metrics import (
     record_commerce_attribution_inferred_recovered,
     record_commerce_attribution_silent_reject,
@@ -51,6 +54,124 @@ EDGE_SOURCE_EXTERNAL_REDIRECT = "external_redirect"
 
 def new_click_id() -> str:
     return f"clk_{uuid.uuid4().hex[:24]}"
+
+
+# ── Issuing a click (ADR-025 D1) ────────────────────────────────────────────────────────────────
+#
+# A click id is RECORDED when the link carrying it is issued to an agent, not when a buyer first
+# follows it. Before this, surface_click_events got a row only on a `/r` hit, so a link an agent
+# handed out and nobody followed left no trace, and the agent that issued it was never known:
+# the signed `/r` token carries no agent. Now the row is written here at issue time with
+# click_count = 0 and issued_at set, and `/r` (record_surface_event) only increments it.
+#
+# "Issued" = the row exists with issued_at set; "clicked" = click_count > 0. There is no state
+# column to keep in sync. issued_at NULL marks a LEGACY row: one `/r` created for a link issued
+# before this change (or by a lane that does not issue yet).
+
+#: surface_click_events column widths. A value that does not fit is DROPPED, never truncated:
+#: a truncated agent or merchant id is a different identity, and would credit the wrong one.
+_CLICK_COLUMN_MAX = {
+    "click_id": 64, "merchant_id": 50, "surface": 64, "commerce_surface": 64,
+    "canonical_product_id": 64, "canonical_variant_id": 64, "source_channel": 128,
+    "agent_id": 64, "dest_domain": 256,
+}
+
+#: What traffic taxonomy writes when it has no agent. Stored as NULL here: the funnel reads
+#: 'unknown' as "no agent", and a real column value must never collide with it.
+_NO_AGENT_SENTINELS = frozenset({"unknown", "none", "null"})
+
+
+@dataclass(frozen=True)
+class IssuedClick:
+    """One click id handed to an agent inside a link. `agent_id` is the AUTHENTICATED caller
+    (never a request body value), or None when the link is not bound to one agent (a cached
+    search result, degraded auth, an internal key)."""
+
+    click_id: str
+    surface: str
+    agent_id: Optional[str] = None
+    merchant_id: Optional[str] = None
+    canonical_product_id: Optional[str] = None
+    canonical_variant_id: Optional[str] = None
+    commerce_surface: Optional[str] = None
+    source_channel: Optional[str] = None
+    destination_url: Optional[str] = None
+    dest_domain: Optional[str] = None
+    context: Optional[Dict[str, Any]] = None
+
+
+def _fits(column: str, value: Any) -> Optional[str]:
+    text = str(value or "").strip()
+    if not text or len(text) > _CLICK_COLUMN_MAX.get(column, 1 << 30):
+        return None
+    return text
+
+
+def _issued_agent_id(value: Any) -> Optional[str]:
+    text = _fits("agent_id", value)
+    if text is None or text.lower() in _NO_AGENT_SENTINELS:
+        return None
+    return text
+
+
+def _insert_ignoring_existing_click(rows: List[Dict[str, Any]]):
+    """INSERT … ON CONFLICT (click_id) DO NOTHING, in the engine's own dialect. The primary key is
+    the only guard needed: a click id is written once, and every later writer only increments."""
+    stmt = (pg_insert if IS_POSTGRES else sqlite_insert)(surface_click_events).values(rows)
+    return stmt.on_conflict_do_nothing(index_elements=["click_id"])
+
+
+def _issued_row(click: IssuedClick, now: datetime) -> Optional[Dict[str, Any]]:
+    click_id = _fits("click_id", click.click_id)
+    if click_id is None:
+        return None
+    surface = _fits("surface", click.surface) or "unknown"
+    return {
+        "click_id": click_id,
+        "merchant_id": _fits("merchant_id", click.merchant_id),
+        "surface": surface,
+        "commerce_surface": _fits("commerce_surface", click.commerce_surface) or surface,
+        "canonical_product_id": _fits("canonical_product_id", click.canonical_product_id),
+        "canonical_variant_id": _fits("canonical_variant_id", click.canonical_variant_id),
+        "source_channel": _fits("source_channel", click.source_channel),
+        "agent_id": _issued_agent_id(click.agent_id),
+        "destination_url": str(click.destination_url or "").strip() or None,
+        "dest_domain": _fits("dest_domain", click.dest_domain),
+        "context": dict(click.context) if click.context else None,
+        "impression_count": 0,
+        "click_count": 0,
+        "issued_at": now,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
+async def issue_clicks(clicks: Sequence[IssuedClick]) -> int:
+    """Record click ids at issue time, in ONE statement. Returns how many rows were offered.
+
+    Raises on a database error; each caller decides its failure policy. A lane that serves many
+    links per request (offers.resolve) catches it and serves the links anyway, because losing
+    the click record must never take down search. A lane whose purchase depends on the click
+    (the Reap cart link) lets it raise and refuses.
+
+    An id already recorded is left as it is (ON CONFLICT DO NOTHING): issuing is not a click, and
+    a retried request must not reset a row a buyer has already followed.
+    """
+    now = _now()
+    rows: Dict[str, Dict[str, Any]] = {}
+    for click in clicks:
+        row = _issued_row(click, now)
+        if row is not None:
+            rows.setdefault(row["click_id"], row)
+    if not rows:
+        return 0
+    await database.execute(_insert_ignoring_existing_click(list(rows.values())))
+    return len(rows)
+
+
+async def issue_click(click: IssuedClick) -> None:
+    """issue_clicks for one click. Raises on a database error."""
+    await issue_clicks([click])
 
 
 def _now() -> datetime:
@@ -186,6 +307,54 @@ def apply_pvt_params(destination_url: str, attribution: Dict[str, Optional[str]]
     return urlunparse(parsed._replace(query=urlencode(existing, doseq=True)))
 
 
+# `/r` only INCREMENTS: one statement per event type, atomic under concurrent hits (the old
+# read-then-write lost an increment when two hits interleaved). No CASE and no casts, so the same
+# text runs on Postgres and SQLite (RETURNING is native on both).
+_COUNT_CLICK_SQL = """
+UPDATE surface_click_events
+SET click_count = COALESCE(click_count, 0) + 1,
+    first_click_at = COALESCE(first_click_at, :now),
+    last_click_at = :now,
+    updated_at = :now
+WHERE click_id = :click_id
+RETURNING click_id, interaction_id, context, merchant_id, surface, commerce_surface,
+          canonical_product_id, canonical_variant_id, prompt_cluster, rule_id, job_id, session_id,
+          source_channel, source_family, query_source, agent_id, protocol_name, llm_provider,
+          llm_model, caller_id, destination_url, dest_domain, issued_at
+"""
+
+_COUNT_IMPRESSION_SQL = _COUNT_CLICK_SQL.replace("click_count", "impression_count").replace(
+    "first_click_at", "first_impression_at"
+).replace("last_click_at", "last_impression_at")
+
+#: Descriptive fields `/r` may FILL but never overwrite. Whatever issue_clicks recorded (above all
+#: the authenticated agent, which the `/r` token does not carry) stays as issued.
+_FILL_ONLY_FIELDS = (
+    "merchant_id", "surface", "commerce_surface", "canonical_product_id", "canonical_variant_id",
+    "prompt_cluster", "rule_id", "job_id", "session_id", "source_channel", "source_family",
+    "query_source", "agent_id", "protocol_name", "llm_provider", "llm_model", "caller_id",
+    "destination_url", "dest_domain",
+)
+
+
+def _as_json_obj(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+async def _count_surface_event(click_id: str, event_type: str, now: datetime) -> Optional[Dict[str, Any]]:
+    sql = _COUNT_CLICK_SQL if event_type == "click" else _COUNT_IMPRESSION_SQL
+    row = await database.fetch_one(sql, {"click_id": click_id, "now": now})
+    return dict(row) if row is not None else None
+
+
 async def record_surface_event(
     *,
     token_payload: Dict[str, Any],
@@ -201,12 +370,6 @@ async def record_surface_event(
     context_with_taxonomy = attach_traffic_taxonomy({**ctx, **attribution}, attribution)
     click_id = attribution[PVT_CLICK_ID]
     now = _now()
-    existing = await database.fetch_one(
-        select(surface_click_events).where(surface_click_events.c.click_id == click_id)
-    )
-
-    impression_increment = 1 if event_type == "impression" else 0
-    click_increment = 1 if event_type == "click" else 0
     common_values = {
         "merchant_id": attribution.get("merchant_id"),
         "surface": attribution[PVT_SURFACE] or "unknown",
@@ -232,66 +395,56 @@ async def record_surface_event(
         "context": context_with_taxonomy,
     }
 
-    if existing:
-        row = dict(existing)
-        interaction_id = _first_nonempty(row, "interaction_id") or _first_nonempty(common_values["context"], "interaction_id")
-        values = {
+    counted = await _count_surface_event(click_id, event_type, now)
+    if counted is None:
+        # Never issued: a link from before issue_clicks, or from a lane that does not issue yet.
+        # Write it as a LEGACY row (issued_at NULL, counts 0), ignoring a concurrent writer that got
+        # there first, then count exactly like an issued one, so no increment is lost either way.
+        await database.execute(_insert_ignoring_existing_click([{
+            "click_id": click_id,
             **common_values,
-            "interaction_id": interaction_id,
-            "impression_count": int(row.get("impression_count") or 0) + impression_increment,
-            "click_count": int(row.get("click_count") or 0) + click_increment,
-            "last_impression_at": now if impression_increment else row.get("last_impression_at"),
-            "last_click_at": now if click_increment else row.get("last_click_at"),
-            "first_impression_at": row.get("first_impression_at") or (now if impression_increment else None),
-            "first_click_at": row.get("first_click_at") or (now if click_increment else None),
+            "impression_count": 0,
+            "click_count": 0,
+            "created_at": now,
             "updated_at": now,
-        }
-        await database.execute(
-            surface_click_events.update()
-            .where(surface_click_events.c.click_id == click_id)
-            .values(**values)
-        )
-        interaction_event = await record_commerce_event_best_effort(
-            event_type=f"surface.{event_type}",
-            metadata={
-                **common_values["context"],
-                "merchant_id": common_values["merchant_id"],
-                "platform": _first_nonempty(ctx, "platform"),
-                "surface": common_values["surface"],
-                "click_id": click_id,
-                "canonical_product_id": common_values["canonical_product_id"],
-                "canonical_variant_id": common_values["canonical_variant_id"],
-                "session_id": common_values["session_id"],
-            },
-            source="surface_click_events",
-            upstream_idempotency_key=f"{click_id}:{event_type}",
-            **ledger_provenance("surface_click_attribution", "unknown"),
-        )
-        if event_type == "click":
-            record_traffic_taxonomy(
-                stage="click",
-                taxonomy=attribution,
-            )
-        if not interaction_id:
-            values["interaction_id"] = interaction_event["interaction_id"]
-            await database.execute(
-                surface_click_events.update()
-                .where(surface_click_events.c.click_id == click_id)
-                .values(interaction_id=interaction_event["interaction_id"], updated_at=_now())
-            )
-        return values
+        }]))
+        counted = await _count_surface_event(click_id, event_type, now) or {}
 
+    # Fill what the row lacks; keep what it has. `user_agent` / `ip` describe THIS hit, so the
+    # latest wins, as before.
+    fill: Dict[str, Any] = {
+        field: common_values[field]
+        for field in _FILL_ONLY_FIELDS
+        if counted.get(field) in (None, "") and common_values.get(field) not in (None, "")
+    }
+    stored_context = _as_json_obj(counted.get("context"))
+    merged_context = {
+        **{k: v for k, v in context_with_taxonomy.items() if v is not None},
+        **{k: v for k, v in stored_context.items() if v is not None},
+    }
+    fill["context"] = merged_context
+    fill["user_agent"] = common_values["user_agent"]
+    fill["ip"] = common_values["ip"]
+    fill["updated_at"] = now
+    await database.execute(
+        surface_click_events.update().where(surface_click_events.c.click_id == click_id).values(**fill)
+    )
+
+    # The ledger event describes the row as it now stands: issued identity first, this hit's
+    # context filling the gaps.
+    row_view = {**common_values, **{k: v for k, v in counted.items() if v not in (None, "")}, **fill}
+    interaction_id = _first_nonempty(counted, "interaction_id") or _first_nonempty(merged_context, "interaction_id")
     interaction_event = await record_commerce_event_best_effort(
         event_type=f"surface.{event_type}",
         metadata={
-            **common_values["context"],
-            "merchant_id": common_values["merchant_id"],
+            **merged_context,
+            "merchant_id": row_view.get("merchant_id"),
             "platform": _first_nonempty(ctx, "platform"),
-            "surface": common_values["surface"],
+            "surface": row_view.get("surface"),
             "click_id": click_id,
-            "canonical_product_id": common_values["canonical_product_id"],
-            "canonical_variant_id": common_values["canonical_variant_id"],
-            "session_id": common_values["session_id"],
+            "canonical_product_id": row_view.get("canonical_product_id"),
+            "canonical_variant_id": row_view.get("canonical_variant_id"),
+            "session_id": row_view.get("session_id"),
         },
         source="surface_click_events",
         upstream_idempotency_key=f"{click_id}:{event_type}",
@@ -302,21 +455,20 @@ async def record_surface_event(
             stage="click",
             taxonomy=attribution,
         )
-    values = {
+    if not interaction_id and interaction_event.get("interaction_id"):
+        interaction_id = interaction_event["interaction_id"]
+        await database.execute(
+            surface_click_events.update()
+            .where(surface_click_events.c.click_id == click_id)
+            .where(surface_click_events.c.interaction_id.is_(None))
+            .values(interaction_id=interaction_id, updated_at=_now())
+        )
+    return {
         "click_id": click_id,
-        **common_values,
-        "interaction_id": interaction_event["interaction_id"],
-        "impression_count": impression_increment,
-        "click_count": click_increment,
-        "first_impression_at": now if impression_increment else None,
-        "last_impression_at": now if impression_increment else None,
-        "first_click_at": now if click_increment else None,
-        "last_click_at": now if click_increment else None,
-        "created_at": now,
-        "updated_at": now,
+        **row_view,
+        "interaction_id": interaction_id,
+        "issued_at": counted.get("issued_at"),
     }
-    await database.execute(surface_click_events.insert().values(**values))
-    return values
 
 
 # Bounded window for the token-less fallback join (#1481). Tighter than the

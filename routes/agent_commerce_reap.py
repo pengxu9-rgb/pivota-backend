@@ -126,7 +126,7 @@ from db.commerce_attribution import surface_click_events
 from db.database import database
 from routes.agent_auth import AgentContext, get_agent_context
 from routes.agent_user_auth import AgentUserContext, get_agent_user_context
-from services.commerce_attribution_service import new_click_id
+from services.commerce_attribution_service import IssuedClick, issue_click, new_click_id
 from services.outbound_links_service import (
     build_shopify_cart_permalink,
     extract_shopify_numeric_variant_id,
@@ -1318,15 +1318,19 @@ async def _record_cart_link_click(
     product_key: str, variant_key: Optional[str], agent_id: str,
     seed_kind: Optional[str],
 ) -> None:
-    """Persist the click identity before a purchase can be opened; failure closes the door."""
-    await database.execute(surface_click_events.insert().values(
-        click_id=click_id, merchant_id=seller_ref if len(seller_ref) <= 50 else None,
-        surface="reap_cart_link", commerce_surface="reap_cart_link",
-        source_channel="agent", agent_id=agent_id if len(agent_id) <= 64 else None,
+    """Persist the click identity before a purchase can be opened; failure closes the door.
+
+    Recorded as ISSUED (ADR-025 D1): the link is handed to Reap, not followed by a buyer, so
+    click_count stays 0 until something actually clicks. `issue_click` raises on a database error,
+    which is what keeps this lane fail-closed: no click row, no purchase. It drops an agent id over
+    64 characters or a seller over 50, as this function did before, rather than truncating them.
+    """
+    await issue_click(IssuedClick(
+        click_id=click_id, surface="reap_cart_link", commerce_surface="reap_cart_link",
+        source_channel="agent", agent_id=agent_id, merchant_id=seller_ref,
         destination_url=cart_url, dest_domain=shop_domain,
         context={"seller_ref": seller_ref, "seed_kind": seed_kind, "item_source": "cart_link",
                  "product_key": product_key, "variant_key": variant_key},
-        impression_count=0, click_count=1, first_click_at=_now(), last_click_at=_now(),
     ))
 
 

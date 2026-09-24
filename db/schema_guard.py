@@ -1111,6 +1111,21 @@ async def ensure_required_schema_light() -> None:
                 )
             except Exception:  # noqa: BLE001
                 pass
+            # mig 239 (ADR-025 D1): when a click id was ISSUED to an agent; NULL = legacy row
+            # first written by /r. The surface_click_events model names it, so every
+            # select(surface_click_events) needs it: its own try, and ADD COLUMN IF NOT EXISTS so
+            # the coverage gate sees it.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS surface_click_events
+                          ADD COLUMN IF NOT EXISTS issued_at TIMESTAMPTZ;
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
             # mig 212: the recovery key — the join the Prove stage rests on.
             # Early and wrapped for the same reason as mig 210 below: this
             # branch is ONE try, and an unguarded CREATE INDEX further down
@@ -3612,6 +3627,13 @@ async def ensure_required_schema_light() -> None:
                         );
                         """
                     )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 239, SQLite twin: one column, and an existing one raises, so its own try.
+            try:
+                await database.execute(
+                    text("ALTER TABLE surface_click_events ADD COLUMN issued_at TIMESTAMP")
                 )
             except Exception:  # noqa: BLE001
                 pass
