@@ -734,6 +734,9 @@ async def test_multi_brand_writes_each_vendors_canonical_spelling(env, monkeypat
     {"vendors": ["A"], "multi_brand": True, "brands": {"A": "A", "C": "C"}},        # only vendors
     {"vendors": ["A"], "brands": {"A": "A"}},                                       # only with multi_brand
     {"vendors": ["A"], "max_pdp_identity_fetches": 301},                            # a stage must fit a task
+    {"vendors": ["ROMAND"], "multi_brand": True, "brands": {"ROMAND": "rom&nd"}},   # not a respelling: ignored
+    {"vendors": ["Dr. Jart+"], "multi_brand": True,
+     "brands": {"Dr. Jart+": "X", "dr.  jart+": "Dr.Jart+"}},                       # two keys, one vendor
 ])
 def test_multi_brand_spellings_and_fetch_budget_are_validated(options):
     with pytest.raises(ValueError):

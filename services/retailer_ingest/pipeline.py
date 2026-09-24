@@ -97,7 +97,7 @@ def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
         brands = options.get("brands")
         if not options.get("multi_brand"):
             raise ValueError("options.brands is only meaningful with options.multi_brand")
-        fold = lambda v: " ".join(str(v).split()).casefold()
+        from services.curated_brand_feed import _retailer_brand_family, _vendor_token as fold
         if not isinstance(brands, dict) or not all(isinstance(k, str) and k.strip() and isinstance(v, str) and v.strip()
                                                    for k, v in brands.items()):
             raise ValueError("options.brands must map every vendor to its canonical brand spelling")
@@ -105,6 +105,17 @@ def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
         extra = sorted({fold(k) for k in brands} - {fold(v) for v in options["vendors"]})
         if missing or extra:
             raise ValueError(f"options.brands must name exactly the vendors: missing {missing}, not a vendor {extra}")
+        if len({fold(k) for k in brands}) != len(brands):
+            raise ValueError("options.brands has two keys for the same vendor")
+        # Retailer mode applies an override only to the SAME brand spelt differently (equal letters and
+        # digits) or a measured family (RETAILER_BRAND_SPELLINGS). Anything else would be silently
+        # ignored at crawl time -- refuse it here instead of letting the operator think it applied.
+        alnum = lambda v: "".join(c for c in str(v).casefold() if c.isalnum())
+        ignored = sorted(k for k, v in brands.items()
+                         if alnum(k) != alnum(v) and not (_retailer_brand_family(alnum(k)) or None))
+        if ignored:
+            raise ValueError(f"options.brands can only respell a vendor (same letters and digits); "
+                             f"these would be ignored: {ignored}")
     if int(options.get("max_pdp_identity_fetches") or 0) > MAX_PDP_IDENTITY_FETCHES:
         # Each fetch waits CRAWL_MIN_INTERVAL_SECONDS (4s): 300 is ~20 min of one stage already.
         raise ValueError(f"options.max_pdp_identity_fetches must be at most {MAX_PDP_IDENTITY_FETCHES}")

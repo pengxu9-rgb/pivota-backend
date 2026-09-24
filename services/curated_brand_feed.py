@@ -2499,7 +2499,7 @@ async def records_for_brand(
             # brand_by_vendor (multi-brand retailer cohorts): each vendor's OWN canonical spelling, applied
             # by the same resolve_record_brand rule a single-brand job's `brand` gets.
             p, domain=domain, category_path=category_path,
-            brand_override=(brand_by_vendor or {}).get(" ".join(str(p.get("vendor") or "").split()).casefold(), brand),
+            brand_override=(brand_by_vendor or {}).get(_vendor_token(p.get("vendor")), brand),
             emit_variants=base_listings_only,
             emit_native_variants=emit_real_variants,
             currency=locale.get("currency"),
