@@ -148,3 +148,17 @@ def test_an_accent_is_a_brand_split_without_the_family():
 def test_a_neighbour_of_a_us_family_keeps_its_own_name(vendor):
     """Only listed spellings join: a sub-line or a different maker is never absorbed."""
     assert brand_on("retailer.com", vendor, None) == vendor
+
+
+@pytest.mark.parametrize("host,vendor,override,want", [
+    ("yslbeautyus.com", "Yves Saint Laurent", "YSL", "YSL"),
+    ("jomalone.com", "Jo Malone London", "Jo Malone London", "Jo Malone"),
+    ("lancome-usa.com", "Lancome", "Lancome", "Lancôme"),
+    ("dior.com", "Christian Dior", "Dior", "Dior"),
+    ("kiehls.com", "Kiehl's", "Kiehl's", "Kiehl's Since 1851"),
+    ("tomfordbeauty.com", "TF", "Tom Ford Beauty", "TF"),   # "TF" is not a listed spelling
+])
+def test_a_brand_official_store_writes_the_us_familys_spelling(host, vendor, override, want):
+    rec = feed.shopify_product_to_record(product(vendor), domain=host, category_path="beauty/skincare",
+                                         brand_override=override, currency="USD", source_role="brand_official")
+    assert rec["pdp"]["brand"] == want
