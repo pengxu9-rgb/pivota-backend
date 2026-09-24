@@ -88,9 +88,20 @@ where no source reports an amount. Reversals (network locks, returns) update the
 ### D5. The agent's share accrues from closed edges
 
 A closed edge whose click carries `agent_id` accrues that agent's share under a per-agent rate
-schedule (stream `attributed_commission`). Accrual is bookkeeping. **Paying it out is an open
-decision**, because of the 2026-09-06 rule that Pivota does not hold or move money. The existing
-payout rail already failed on "insufficient platform balance", which is that constraint showing up.
+schedule (stream `attributed_commission`). Accrual is bookkeeping until the commission is settled.
+
+**Payout (decided, Peng, 2026-09-24).** Pivota pays its agent partners their share under each
+partner's revenue-share agreement, against a statement, **only out of commission a network or
+partner has already settled to Pivota**.
+- The 2026-09-06 no-money rule is about the buyer's money and the checkout flow: no float, no
+  custody, no prefunding. It does not forbid paying out Pivota's own settled revenue.
+- It does forbid paying an accrual before the commission behind it is settled.
+- So an agent statement line moves through three states: accrued (edge closed), then settled
+  (the network paid Pivota for that order), then payable.
+- A reversal before settlement cancels the accrual. A reversal after payout is netted against
+  the agent's next statement.
+- The existing payout rail failed on "insufficient platform balance" because it tried to pay
+  before settlement. That is exactly what this rule forbids.
 
 ### D6. The primary lane: a payment partner completes the checkout with an agentic token
 
@@ -165,9 +176,10 @@ partner):
 4. **An attribution pass-through.** A field on checkout create that the partner copies into the
    merchant's UCP `attribution` member (referrer `pivota`, our click id), so the merchant's own
    order shows Pivota as the originator. That is what any merchant-side commission rests on.
-5. **Revenue terms.** Who pays Pivota for an originated order: a partner revenue share (e.g. on
-   the token/issuing economics), or a merchant fee evidenced by item 4. Protocol mechanics do not
-   decide this; the contract does.
+5. **Revenue terms.** Pivota asks for **both** (decided, Peng, 2026-09-24): a partner revenue share
+   (e.g. on the token/issuing economics), **and** item 4, so that a merchant fee stays possible.
+   Item 4 is therefore **required**, not optional. Protocol mechanics do not decide the split;
+   the contract does.
 
 Pivota's side: keep polling after `COMPLETED` at a slow cadence for the return window once
 item 1 exists; store every event against the purchase; update the edge (refund → reversal of
@@ -255,7 +267,7 @@ Payment-partner lane first (D6), because that is where the orders will be:
   refund.
 
 Status, 2026-09-23:
-- **P1** is drafted for Peng to send (not sent).
+- **P1** is drafted for Peng to send (not sent). The draft was updated 2026-09-24 with the Q3 decision: ask for both, item 4 required.
 - **P2:** #2267 (open at the time of writing) makes a completed purchase's edge carry the purchase's authenticated `agent_id`.
   Before it, the variant lane closed with no agent, because it writes no click row. The lane
   itself is still dark: prod `reap_agentic_purchases` = 0 rows.
@@ -268,6 +280,13 @@ Then the referral lanes:
 1. **`issue_click` at issue time with `agent_id`** (offers.resolve, `/r`, the Reap cart link,
    and UCP create). Add an "issued vs clicked vs converted" funnel query. Nothing else is
    measurable until this ships.
+   - **Shipped 2026-09-24 (#2294)** for offers.resolve, `/r` and the Reap cart link. The agent
+     comes from the caller's own API key only.
+   - Pivota's own service agents (the gateway's key) issue agent-less links. MCP and OAuth
+     callers get their agent from the follow-up that adds a signed gateway assertion and an
+     OAuth client-to-agent map.
+   - Still minting without issuing: find_products, get_product_detail, the prefetched seed
+     wrappers, `mint_external_seed_links`, `agent_api.py`, `agent_sdk_fixed.py`, and UCP create.
 2. **Evidence-route registry per seller**, with network sub-id link wrapping in
    `compose_attributed_destinations`. Only a human-clicked `/r` gets the network link; bots get
    the unwrapped URL, because prefetchers setting cookies is cookie stuffing.
@@ -278,13 +297,18 @@ Then the referral lanes:
 6. **Agentic lanes**: a UCP stamp caller, the gateway injecting the stamp instead of dropping it,
    and Reap arming. These wait on 1–3, because they close through the same evidence contract.
 
-## Open questions (owner: Peng)
+## Decisions on the open questions (Peng, 2026-09-24)
 
-1. **Agent payouts:** is paying agents out of commission Pivota receives within the no-money
-   rule, or do agents get statements only?
-2. **Merchant visibility:** do merchants and networks see only Pivota, or also which agent
-   originated an order? This record assumes only Pivota (click id only).
-3. **Revenue source on the partner lane:** a share from the payment partner, a merchant fee, or
-   both. This decides whether item 4 (the merchant sees Pivota) is required or only nice to have.
-4. **Unattributable sellers:** do we keep serving sellers with no evidence route at the same
-   rank, or prefer attributable sellers when products are equivalent?
+1. **Agent payouts: paid, from settled revenue only.** Pivota joins the affiliate networks. Once
+   a network (or payment partner) settles commission to Pivota, Pivota pays each agent partner
+   its share under their revenue-share agreement, against a statement. Nothing is paid before
+   settlement, and nothing is paid from buyer funds. See D5.
+2. **Merchant visibility: Pivota only.** Merchants and networks see referrer `pivota` and an
+   opaque click id. Which agent originated an order stays inside Pivota. The click id carries no
+   agent, and D2's network sub-id is the click id, never the agent id.
+3. **Revenue on the partner lane: both.** Ask the partner for a revenue share **and** the
+   attribution pass-through (D6 item 4), which is therefore required, so a merchant fee stays
+   possible.
+4. **Unattributable sellers: same rank, attribution-blind.** Ranking stays merit-first (T2-4
+   index neutrality). Whether Pivota can earn on a seller never moves it up or down, including
+   as a tie-break. D2's registry decides only which link a seller gets, never its rank.
