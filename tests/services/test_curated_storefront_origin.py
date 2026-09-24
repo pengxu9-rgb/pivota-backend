@@ -59,10 +59,11 @@ async def test_apex_www_redirects_keep_one_storefront_for_feed_and_currency(monk
         # storefront_currency normalizes requested www away before fetching meta;
         # therefore redirect products only, and serve meta from either allowed host.
         if request.url.path == "/products.json" and request.url.host == requested:
-            return httpx.Response(302,headers={"location":f"https://{actual}/products.json"})
+            # A same-path redirect keeps the query (limit/page); dropping it would re-serve page 1.
+            return httpx.Response(302,headers={"location":f"https://{actual}/products.json?{request.url.query.decode()}"})
         if request.url.path == "/meta.json":
             return httpx.Response(200,json={"currency":"USD"})
-        return httpx.Response(200,json={"products":[product(1)]})
+        return httpx.Response(200,json={"products":[product(1)] if request.url.params.get("page") == "1" else []})
     install(monkeypatch,handler)
     records=await feed.records_for_brand(domain=requested,category_path="beauty",source_role="retailer",only_vendors=["A'PIEU"])
     assert records.crawl_report["status"] == "complete"
@@ -73,7 +74,7 @@ async def test_apex_www_redirects_keep_one_storefront_for_feed_and_currency(monk
 async def test_regional_currency_redirect_cannot_relabel_same_host_prices(monkeypatch):
     def handler(request):
         if request.url.path == "/products.json":
-            return httpx.Response(200,json={"products":[product(1)]})
+            return httpx.Response(200,json={"products":[product(1)] if request.url.params.get("page") == "1" else []})
         if request.url.host == "store.com":
             return httpx.Response(302,headers={"location":"https://uk.store.com/meta.json"})
         return httpx.Response(200,json={"currency":"GBP"})

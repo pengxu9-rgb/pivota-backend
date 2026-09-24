@@ -212,6 +212,7 @@ async def rank_replacements(
     lip, any), then catalog order. Stops early once MAX_CANDIDATES rank-0 candidates are in hand."""
     found: List[Tuple[int, int, Dict[str, Any]]] = []
     order = 0
+    seen_pages: set = set()
     for page in range(1, max_pages + 1):
         response = await client.get(
             f"https://{domain}/products.json", params={"limit": 250, "page": page, "country": market},
@@ -225,6 +226,10 @@ async def rank_replacements(
             break
         if not products:
             break
+        page_key = tuple(str(p.get("id")) for p in products)
+        if page_key in seen_pages:
+            break  # the store ignores ?page: every later page repeats this one
+        seen_pages.add(page_key)
         for product in products:
             for variant in product.get("variants") or []:
                 if not _qualifies(product, variant):
@@ -237,8 +242,7 @@ async def rank_replacements(
                 break  # one variant per product is enough to rank it
         if sum(1 for r, _, _ in found if r == 0) >= MAX_CANDIDATES:
             break
-        if len(products) < 250:
-            break
+        # Only an empty page ends the catalog (Shopify serves short pages mid-catalog).
     return [c for _, _, c in sorted(found, key=lambda t: (t[0], t[1])) if c.get("product_handle")]
 
 

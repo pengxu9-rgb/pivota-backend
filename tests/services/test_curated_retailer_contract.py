@@ -115,14 +115,42 @@ async def test_vendor_selection_scans_past_selected_product_budget(monkeypatch):
         {"products": [product(1, "Other"), product(2, "Other")]},
         {"products": [product(3, "Other"), product(4, "Other")]},
         {"products": [product(5)]},
+        {"products": []},
     ])
     monkeypatch.setattr(feed, "fetch_shopify_shop_locale", AsyncMock(return_value={"currency": "USD"}))
     records = await feed.records_for_brand(domain="retailer.com", category_path="beauty", source_role="retailer",
                                           only_vendors=["A'PIEU"], max_products=1, max_scan_products=10)
-    assert len(records) == 1 and len(reqs) == 3
+    assert len(records) == 1 and len(reqs) == 4
     assert records.crawl_report == {
-        "status": "complete", "pages": 3, "scanned_products": 5, "selected_products": 1, "emitted_records": 1,
+        "status": "complete", "pages": 4, "scanned_products": 5, "selected_products": 1, "emitted_records": 1,
     }
+
+
+@pytest.mark.asyncio
+async def test_a_short_page_mid_catalog_is_not_the_end(monkeypatch):
+    # bluemercury.com, 2026-09-24: page 1 = 249 products, page 2 = 250. Hidden products count toward
+    # `limit`, so only an EMPTY page proves exhaustion. The vendor sits past the short page.
+    reqs = install_http(monkeypatch, [
+        {"products": [product(1, "Other")]},
+        {"products": [product(2), product(3, "Other")]},
+        {"products": [product(4)]},
+        {"products": []},
+    ])
+    result = await feed.fetch_shopify_products("retailer.com", only_vendors=["A'PIEU"], max_products=10,
+                                               max_scan_products=10)
+    assert [p["id"] for p in result] == [9000002, 9000004]
+    assert len(reqs) == 4 and [r.url.params["page"] for r in reqs] == ["1", "2", "3", "4"]
+    assert result.crawl_report["status"] == "complete" and result.crawl_report["scanned_products"] == 4
+
+
+@pytest.mark.asyncio
+async def test_a_store_that_ignores_page_is_not_a_complete_short_catalog(monkeypatch):
+    # A store (or a redirect dropping the query) that serves page 1 for every ?page used to read as a
+    # complete one-page catalog when page 1 was short. It now fails loudly on the repeat.
+    page = {"products": [product(1)]}
+    install_http(monkeypatch, [page, page])
+    with pytest.raises(feed.CrawlIncomplete, match="did not advance"):
+        await feed.fetch_shopify_products("retailer.com", max_products=10)
 
 
 @pytest.mark.asyncio
@@ -162,9 +190,9 @@ async def test_page_two_throttle_has_bounded_retries_and_no_partial_return(monke
 
 @pytest.mark.asyncio
 async def test_transient_page_failure_can_recover(monkeypatch):
-    reqs = install_http(monkeypatch, [503, {"products": [product(1)]}])
+    reqs = install_http(monkeypatch, [503, {"products": [product(1)]}, {"products": []}])
     result = await feed.fetch_shopify_products("retailer.com", max_products=10)
-    assert len(reqs) == 2 and len(result) == 1
+    assert len(reqs) == 3 and len(result) == 1
 
 
 @pytest.mark.asyncio

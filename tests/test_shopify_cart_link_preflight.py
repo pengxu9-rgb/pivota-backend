@@ -489,8 +489,9 @@ async def test_a_named_variant_is_found_on_a_later_catalog_page():
 
 async def test_a_catalog_scan_that_hits_its_cap_is_unverified_not_gone(monkeypatch):
     monkeypatch.setattr(pf, "MAX_CATALOG_PAGES", 2)
-    full_page = {"products": [{"title": f"P{i}", "variants": [cvar(str(10_000 + i))]} for i in range(250)]}
-    store = Store({("s.com", "/products.json"): products_json(full_page, full_page, catalog(cvar()))})
+    full = [{"products": [{"title": f"P{i}", "variants": [cvar(str(10_000 + n * 250 + i))]} for i in range(250)]}
+            for n in range(2)]
+    store = Store({("s.com", "/products.json"): products_json(*full, catalog(cvar()))})
     result = await run(store, host="s.com", variant_id=VID)
     assert result.verdict is Verdict.VARIANT_UNVERIFIED
     assert result.detail == "catalog_scan_cap"
@@ -645,6 +646,37 @@ async def test_catalog_availability_is_read_for_the_us_market(variant_id):
     assert [r.url.params.get("country") for r in store.hit("/products.json")] == ["US"]
 
 
+async def test_a_variant_past_a_short_catalog_page_is_not_gone():
+    # bluemercury.com, 2026-09-24: page 1 = 249, page 2 = 250 (hidden products count toward `limit`).
+    # Stopping on the short page 1 called this variant VARIANT_GONE.
+    def short_then_variant(request):
+        page = request.url.params.get("page", "1")
+        if page == "1":
+            return httpx.Response(200, json={"products": [{"title": "Other", "handle": "other",
+                                  "variants": [cvar("41000000000001", available=True, price="5.00", title="x")]}]})
+        if page == "2":
+            return podl_catalog(httpx.Request("GET", "https://podl.us/products.json?page=1&country=US"))
+        return httpx.Response(200, json={"products": []})
+    store = Store({
+        ("podl.us", "/products.json"): short_then_variant,
+        ("podl.us", "/products/chestnut-balm-to-foam-cleanser.js"): podl_product_js,
+        **_login_routes("podl.us", PODL_VID, via_host="www.podl.global"),
+    })
+    result = await run(store, host="podl.us", market="US", variant_id=PODL_VID)
+    assert result.verdict is Verdict.LOGIN_REQUIRED and result.variant_id == PODL_VID
+    assert [r.url.params.get("page") for r in store.hit("/products.json")] == ["1", "2"]
+
+
+async def test_a_store_that_ignores_page_is_unverified_at_once():
+    def page_one_forever(request):
+        return httpx.Response(200, json={"products": [{"title": "Other", "handle": "other",
+                              "variants": [cvar("41000000000001", available=True, price="5.00", title="x")]}]})
+    store = Store({("podl.us", "/products.json"): page_one_forever})
+    result = await run(store, host="podl.us", market="US", variant_id=PODL_VID)
+    assert result.verdict is Verdict.VARIANT_UNVERIFIED and result.detail == "pagination_stalled"
+    assert len(store.hit("/products.json")) == 2
+
+
 @pytest.mark.parametrize("variant_id", [PODL_VID, None])
 async def test_the_same_catalog_read_for_jp_is_unavailable(variant_id):
     store = _podl_store()
@@ -652,7 +684,10 @@ async def test_the_same_catalog_read_for_jp_is_unavailable(variant_id):
     assert result.verdict is Verdict.VARIANT_UNAVAILABLE
     assert result.market == "JP"
     assert store.hit("/cart/") == [], "no checkout for a variant the buyer's market cannot buy"
-    assert [r.url.params.get("country") for r in store.hit("/products.json")] == ["JP"]
+    # Without a caller variant the scan reads to the EMPTY page that ends the catalog (page 2);
+    # every page is read for the buyer's market.
+    want = ["JP"] if variant_id else ["JP", "JP"]
+    assert [r.url.params.get("country") for r in store.hit("/products.json")] == want
 
 
 @pytest.mark.parametrize("variant_id", [PODL_VID, None])
@@ -691,8 +726,9 @@ async def test_accept_language_no_longer_decides_availability(monkeypatch, accep
 
 
 async def test_country_is_sent_on_every_catalog_page():
-    full_page = {"products": [{"title": f"P{i}", "variants": [cvar(str(10_000 + i))]} for i in range(250)]}
-    store = Store({("s.com", "/products.json"): products_json(full_page, full_page, catalog(cvar())),
+    full = [{"products": [{"title": f"P{i}", "variants": [cvar(str(10_000 + n * 250 + i))]} for i in range(250)]}
+            for n in range(2)]
+    store = Store({("s.com", "/products.json"): products_json(*full, catalog(cvar())),
                    **cart_to_checkout(host="s.com", body=checkout_body(country="SG", total=("40.0", "SGD")))})
     result = await run(store, host="s.com", market="SG", variant_id=VID)
     assert result.verdict is Verdict.ELIGIBLE

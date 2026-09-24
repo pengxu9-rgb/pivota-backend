@@ -36,7 +36,8 @@ def _client(statuses, calls):
         async def get(self, url):
             calls.append(url)
             status = statuses.pop(0) if statuses else 200
-            return _Resp(status, {"products": [product]} if status == 200 else None)
+            # One product on page 1, then the empty page that ends the catalog.
+            return _Resp(status, {"products": [product] if "page=1" in url else []} if status == 200 else None)
     return _Client()
 
 
@@ -70,7 +71,7 @@ async def test_a_raised_setting_waits_out_a_throttled_page(monkeypatch, offline)
     calls = _install(monkeypatch, [429, 429, 429, 429, 200])
     products = await cbf.fetch_shopify_products("big.example", max_products=10)
     assert len(products) == 1
-    assert len(calls) == 5  # four 429s on page 1, then the page -- never restarted
+    assert len(calls) == 6  # four 429s on page 1, then the page -- never restarted -- then empty page 2
 
 
 @pytest.mark.asyncio
@@ -113,7 +114,7 @@ def _flaky_client(failures, calls):
             calls.append(url)
             if len(calls) <= failures:
                 raise httpx.ConnectTimeout("slow")
-            return _Resp(200, {"products": [product]})
+            return _Resp(200, {"products": [product] if "page=1" in url else []})
     return _Client()
 
 
@@ -129,4 +130,4 @@ async def test_transport_errors_follow_the_same_setting(monkeypatch, offline):
     monkeypatch.setenv("CURATED_CRAWL_PAGE_ATTEMPTS", "5")
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _flaky_client(3, calls))
     assert len(await cbf.fetch_shopify_products("big.example", max_products=10)) == 1
-    assert len(calls) == 4
+    assert len(calls) == 5  # three timeouts, page 1, then the empty page 2
