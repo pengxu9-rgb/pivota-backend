@@ -485,8 +485,10 @@ async def recompute_days_for_edges(edges: Iterable[Mapping[str, Any]]) -> dict[t
 # more on the next night, and is then clear of it.
 #
 # The lookback bounds how long a change is retried. A day an invoice covers is never rewritten, so
-# its rows stay older than its edges; with a short lookback it is reported (by
-# recompute_days_for_edges, as a manual credit) on a few nights, not every night forever. A change
+# its rows stay older than its edges; with a short lookback it is revisited (by
+# recompute_days_for_edges, which computes what its refunds took off as a PENDING GMV invoice credit,
+# services/gmv_invoice_credits.py: idempotent, so the repeat nights change nothing) on a few nights,
+# not every night forever. A change
 # to day D is first eligible at the 02:00 run of D+1 (the sweep leaves today alone), and one made
 # at D 00:00 must still be inside the window at D+3 02:00 to survive two missed runs: that is 3 days
 # and 2 hours, so 4 (review of #2283). After a longer outage, call reroll_stale_days with a larger

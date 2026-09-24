@@ -1000,3 +1000,37 @@ async def test_the_cancel_route_reaches_a_stale_issuing_credit(db, fake_stripe, 
                      "WHERE id = :i", {"i": credit["id"]})
     r = await admin_client.post(f"/admin/billing/invoice-credits/{credit['id']}/cancel", json={"reason": "stuck"})
     assert r.status_code == 200 and r.json()["status"] == "cancelled"
+
+
+# ── with #2283's nightly stale-day sweep ────────────────────────────────────────────────────────
+
+
+async def test_the_nightly_sweep_turns_a_refund_on_an_invoiced_day_into_a_pending_credit(db, fake_stripe):
+    """A refund that reached the edge without its writer's recompute (a failed recompute, a writer
+    that never called it) is found by the sweep; the invoiced day stays as billed, and the credit
+    is computed. Idempotent on the repeat nights of the lookback."""
+    from services.gmv_aggregation_service import reroll_stale_days
+
+    line, _, _ = await _billed(db)
+    await db.execute("UPDATE commerce_attribution_edges SET refund_amount_cents = 2500, "
+                     "updated_at = NOW() + INTERVAL '1 second'")
+
+    assert (await reroll_stale_days())["invoiced_period_manual_credit"] == 1
+    assert await _rollup_take(db) == 1_000
+    assert [(c["status"], c["amount_cents"]) for c in await _credits(db, line)] == [("pending", 250)]
+    await reroll_stale_days()
+    assert [(c["status"], c["amount_cents"]) for c in await _credits(db, line)] == [("pending", 250)]
+
+
+async def test_the_nightly_sweep_credits_nothing_for_an_invoiced_group_whose_gross_moved(db, fake_stripe):
+    from services.gmv_aggregation_service import aggregate_daily, reroll_stale_days
+
+    await _edge(db, edge_id="cae_1", order_id="ord_1", gross=10_000)
+    await _edge(db, edge_id="cae_2", order_id="ord_2", gross=5_000)
+    await aggregate_daily(DAY)
+    await _invoice_the_day(db, await _billing_run(db))
+    await db.execute("UPDATE commerce_attribution_edges SET agent_id = 'agent_2', "
+                     "updated_at = NOW() + INTERVAL '1 second' WHERE edge_id = 'cae_2'")
+
+    await reroll_stale_days()
+    assert await _credits(db) == []
