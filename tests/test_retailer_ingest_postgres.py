@@ -259,6 +259,45 @@ async def test_a_claim_is_refused_while_another_claimer_holds_the_lane_lock(db):
     assert await ledger.claim_due_job(lease_seconds=3600, max_leases=3, db=db) is not None
 
 
+async def test_within_a_priority_a_due_apply_is_claimed_before_an_older_dry_run(db):
+    await _only_ours_due(db)
+    older_dry_run = await _at(db, "lanes-a.example", "A", priority=10)
+    apply = await _at(db, "lanes-b.example", "B", priority=10, status="apply_due")
+    assert (await ledger.claim_due_job(lease_seconds=3600, max_leases=3, db=db))["id"] == apply
+    assert (await ledger.claim_due_job(lease_seconds=3600, max_leases=3, db=db))["id"] == older_dry_run
+
+
+async def test_a_backed_off_apply_does_not_jump_a_due_dry_run(db):
+    await _only_ours_due(db)
+    dry_run = await _at(db, "lanes-a.example", "A", priority=10)
+    throttled = await _at(db, "lanes-b.example", "B", priority=10, status="apply_due")
+    await db.execute("UPDATE retailer_ingest_jobs SET next_run_at = NOW() + interval '1 hour' WHERE id=:id",
+                     {"id": throttled})  # crawl_throttled backoff
+    assert (await ledger.claim_due_job(lease_seconds=3600, max_leases=3, db=db))["id"] == dry_run
+    assert await ledger.claim_due_job(lease_seconds=3600, max_leases=3, db=db) is None
+
+
+async def test_priority_still_beats_applies_first(db):
+    await _only_ours_due(db)
+    urgent = await _at(db, "lanes-a.example", "A", priority=20)
+    apply = await _at(db, "lanes-b.example", "B", priority=10, status="apply_due")
+    assert (await ledger.claim_due_job(lease_seconds=3600, max_leases=3, db=db))["id"] == urgent
+    assert (await ledger.claim_due_job(lease_seconds=3600, max_leases=3, db=db))["id"] == apply
+
+
+async def test_applies_first_still_runs_one_apply_at_a_time(db):
+    await _only_ours_due(db)
+    first = await _at(db, "lanes-a.example", "A", priority=10, status="apply_due")
+    second = await _at(db, "lanes-b.example", "B", priority=10, status="apply_due")
+    dry_run = await _at(db, "lanes-c.example", "C", priority=10)
+    assert (await ledger.claim_due_job(lease_seconds=3600, max_leases=3, db=db))["id"] == first
+    # the second apply is first in ORDER BY but an apply is in flight: the dry run takes the lane
+    assert (await ledger.claim_due_job(lease_seconds=3600, max_leases=3, db=db))["id"] == dry_run
+    assert await ledger.claim_due_job(lease_seconds=3600, max_leases=3, db=db) is None
+    await ledger.transition(first, status="done", reason="t", run_id=None, db=db)
+    assert (await ledger.claim_due_job(lease_seconds=3600, max_leases=3, db=db))["id"] == second
+
+
 class _LockProbe:
     """The ledger's db, plus a check made from ANOTHER connection just before the claim statement
     runs: is the lane lock held? It must be, or the claim snapshots a lease table that a claim
