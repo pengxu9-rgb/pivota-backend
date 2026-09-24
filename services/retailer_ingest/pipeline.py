@@ -111,12 +111,11 @@ def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
         # digits) or a measured family (RETAILER_BRAND_SPELLINGS). Anything else would be silently
         # ignored at crawl time -- refuse it here instead of letting the operator think it applied.
         alnum = lambda v: "".join(c for c in str(v).casefold() if c.isalnum())
-        # A vendor in a measured family is ALWAYS written as that family's canonical spelling, so the
-        # map's value must name the same family (else it is ignored); any other vendor may only be
-        # respelt with equal letters and digits.
+        # A measured family writes ITS spelling whatever the value says, so a family vendor may only be
+        # respelt into that same family (review of #2302: {"Kose": "Shiseido"} passed, then wrote "Kosé").
         ignored = sorted(k for k, v in brands.items()
-                         if (_retailer_brand_family(alnum(k)) != _retailer_brand_family(alnum(v))
-                             if _retailer_brand_family(alnum(k)) else alnum(k) != alnum(v)))
+                         if alnum(k) != alnum(v) and (_retailer_brand_family(alnum(k)) is None
+                                                      or _retailer_brand_family(alnum(k)) != _retailer_brand_family(alnum(v))))
         if ignored:
             raise ValueError(f"options.brands can only respell a vendor (same letters and digits); "
                              f"these would be ignored: {ignored}")
