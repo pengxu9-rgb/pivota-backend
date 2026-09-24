@@ -854,7 +854,7 @@ fi
 echo "== job: retailer-ingest-drain (armed or not by its trigger's pause state)"
 mkcrawljob retailer-ingest-drain "$BACKEND_IMAGE" "$SA" \
   --set-secrets "DATABASE_URL=DATABASE_URL:latest" \
-  --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=retailer-ingest-drain,PIVOTA_COMMIT_SHA=$BACKEND_TAG,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=3,DB_STATEMENT_TIMEOUT_SECONDS=30,DB_COMMAND_TIMEOUT_SECONDS=600,RETAILER_INGEST_DRAIN_ENABLED=1,RETAILER_INGEST_LEASE_SECONDS=4200,CURATED_CRAWL_PAGE_ATTEMPTS=5,CRAWL_MIN_INTERVAL_SECONDS=4,CRAWL_BACKOFF_BASE_SECONDS=15,PIVOTA_SERVING_PRICING_REGIONS=US,ENABLE_INTAKE_IDENTITY_ENRICHMENT=1,ENABLE_INTAKE_IDENTITY_AUDIT=1,ENABLE_INTAKE_IDENTITY_BRAND_AUTHORED=1,ENABLE_INTAKE_IDENTITY_MIRROR=1,ENABLE_INTAKE_IDENTITY_SYNC=1,ENABLE_KBEAUTY_AGENT_DECISION_GATES=true,ENABLE_STORELESS_BRAND_CATALOG=1,INDEX_ELIGIBLE_READ=1,INDEX_ELIGIBLE_RECALL=1,INDEX_ELIGIBLE_SITEMAP=1,INDEXNOW_ENABLED=true,PDP_QUALITY_SCORE_SOURCE_BACKED_OPTIONAL_COMPONENTS=1,STRICT_BEAUTY_CATEGORY_TEXT_RECALL=true" \
+  --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=retailer-ingest-drain,PIVOTA_COMMIT_SHA=$BACKEND_TAG,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=3,DB_STATEMENT_TIMEOUT_SECONDS=30,DB_COMMAND_TIMEOUT_SECONDS=600,RETAILER_INGEST_DRAIN_ENABLED=1,RETAILER_INGEST_LEASE_SECONDS=4200,RETAILER_INGEST_DRAIN_BUDGET_SECONDS=2400,CURATED_CRAWL_PAGE_ATTEMPTS=5,CRAWL_MIN_INTERVAL_SECONDS=4,CRAWL_BACKOFF_BASE_SECONDS=15,PIVOTA_SERVING_PRICING_REGIONS=US,ENABLE_INTAKE_IDENTITY_ENRICHMENT=1,ENABLE_INTAKE_IDENTITY_AUDIT=1,ENABLE_INTAKE_IDENTITY_BRAND_AUTHORED=1,ENABLE_INTAKE_IDENTITY_MIRROR=1,ENABLE_INTAKE_IDENTITY_SYNC=1,ENABLE_KBEAUTY_AGENT_DECISION_GATES=true,ENABLE_STORELESS_BRAND_CATALOG=1,INDEX_ELIGIBLE_READ=1,INDEX_ELIGIBLE_RECALL=1,INDEX_ELIGIBLE_SITEMAP=1,INDEXNOW_ENABLED=true,PDP_QUALITY_SCORE_SOURCE_BACKED_OPTIONAL_COMPONENTS=1,STRICT_BEAUTY_CATEGORY_TEXT_RECALL=true" \
   --task-timeout 3600s --max-retries 0 --memory 2Gi --tasks 1 --parallelism 1 \
   --command python --args="-m,jobs.retailer_ingest_drain"
 
@@ -906,7 +906,11 @@ sched commerce-index-relgraph-cron "*/10 * * * *" commerce-index-relgraph
 sched commerce-index-search-index-cron "*/5 * * * *" commerce-index-search-index
 sched commerce-index-checkout-validation-cron "*/5 * * * *" commerce-index-checkout-validation
 sched commerce-index-insight-refresh-cron "*/10 * * * *" commerce-index-insight-refresh
-# Every 30 minutes. THIS TRIGGER IS THE DRAIN'S ONE ARM/DISARM SWITCH (see the job block): the
+# Every 10 minutes (was 30 until 2026-09-24: stages take 4-12 min, so a 30-min tick left the one-crawl
+# lane idle ~70% while three coverage waves queued; Peng: "we should not have queue being the
+# bottleneck"). Each execution also runs stages back to back for up to
+# RETAILER_INGEST_DRAIN_BUDGET_SECONDS (2400s, inside the 3600s task timeout), so ticks mostly find the
+# lane busy and exit idle. THIS TRIGGER IS THE DRAIN'S ONE ARM/DISARM SWITCH (see the job block): the
 # job's env always says enabled, so a resumed trigger means crawling.
 #
 # Created PAUSED no matter what $PAUSED says: the 5th argument pins it, so `PAUSED=0` (which arms
@@ -916,12 +920,12 @@ sched commerce-index-insight-refresh-cron "*/10 * * * *" commerce-index-insight-
 # also resumes it, since that is sched()'s generic explicit arm, but it is not needed and not the
 # documented path: a gcloud resume arms it without reconciling ~20 other jobs and the worker.
 #
-# 30 minutes is SHORTER than the 3600s task timeout, and Cloud Run starts a new execution whether
+# 10 minutes is SHORTER than the 3600s task timeout, and Cloud Run starts a new execution whether
 # or not the last one is still running. That is safe only because claim_due_job()
 # (db/retailer_ingest.py) refuses to claim while ANY job holds an unexpired lease: a tick that lands
 # during a long stage exits idle instead of starting a second crawl from the one crawl NAT. Remove
 # that clause and this cadence becomes two crawls in flight.
-sched retailer-ingest-drain-cron "*/30 * * * *" retailer-ingest-drain "$RUN_INVOKER" 1
+sched retailer-ingest-drain-cron "*/10 * * * *" retailer-ingest-drain "$RUN_INVOKER" 1
 if [ "$STORE_AUDIT_UCP_REPROBE_WORKER" = true ]; then
   for job in store-audit-ucp-reprobe-enqueue store-audit-ucp-probe; do
     "$GCLOUD" run jobs add-iam-policy-binding "$job" --region "$REGION" \

@@ -49,6 +49,11 @@ _OPTION_TYPES = {
     # ADR-001 canonical anchor). services.catalog_onboard_worker.normalize_curated_brand_payload owns
     # the allowed values and the retailer_name rule; enqueue runs that same normalization.
     "source_role": str,
+    # One crawl for MANY brands at one retailer: the job's `brand` is only a label, every product keeps
+    # its own vendor as its brand (no override), and `vendors` names every brand the cohort selects.
+    # 2026-09-24: a (brand, store) cohort re-crawls the whole store twice (dry run + apply), so 16 brands
+    # at perfumania.com were 32 full crawls of one store; as one multi_brand cohort they are 2.
+    "multi_brand": bool,
 }
 SOURCES = ("storefront", "affiliate_feed")
 
@@ -80,6 +85,9 @@ def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
     source = options.get("source") or "storefront"
     if source not in SOURCES:
         raise ValueError(f"options.source must be one of {list(SOURCES)}")
+    if options.get("multi_brand") and (options.get("source_role", "retailer") != "retailer" or source != "storefront"):
+        # A brand's own store is one brand (its domain must prove it); a feed maps one retailer listing.
+        raise ValueError("options.multi_brand supports only a retailer storefront cohort")
     if source == "affiliate_feed" and options.get("source_role", "retailer") != "retailer":
         # The feed mapping is retailer-shaped: a retailer-host listing clicked through a network link.
         raise ValueError("options.source = affiliate_feed supports only source_role = retailer")
@@ -136,7 +144,9 @@ def _feed_payload(job: Dict[str, Any]) -> Dict[str, Any]:
     except ValueError as exc:
         raise _Stop("invalid_job", "failed", str(exc)) from exc
     return {
-        "domain": job["domain"], "brand": job["brand"], "category_path": o.get("category_path") or "beauty",
+        # multi_brand: no override at all, so no product can be renamed to the job's label.
+        "domain": job["domain"], "brand": None if o.get("multi_brand") else job["brand"],
+        "category_path": o.get("category_path") or "beauty",
         "source_role": o.get("source_role") or "retailer", "retailer_name": o.get("retailer_name"),
         "only_vendors": list(o["vendors"]),
         "require_currency": o.get("require_currency") or "USD", "emit_real_variants": True,

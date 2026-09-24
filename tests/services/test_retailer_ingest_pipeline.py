@@ -649,3 +649,45 @@ def test_each_non_latin_brand_needs_its_own_acceptance():
     assert keys == ["brand_official_domain_unproven:k-touch.us:설화수",
                     "brand_official_domain_unproven:k-touch.us:헤라",
                     "brand_official_domain_unproven:k-touch.us:hera"]
+
+
+# ------------------------------------------------------------------ multi_brand (one crawl, many brands)
+
+async def test_a_multi_brand_cohort_crawls_once_and_keeps_every_vendor_as_its_brand(env, monkeypatch):
+    seen = []
+
+    async def fetch(**kw):
+        seen.append({k: kw.get(k) for k in ("brand", "only_vendors", "source_role")})
+        return feed.ShopifyProductBatch([feed.shopify_product_to_record(
+            {"id": 9100000 + i, "vendor": vendor, "title": title, "handle": handle, "product_type": "LIP TINT",
+             "body_html": "<p>A lip colour for soft, velvet lips.</p>", "images": [{"src": "https://cdn.example/i.jpg"}],
+             "variants": [{"id": 45000000000000 + i, "price": "20.00", "available": True, "sku": handle}]},
+            domain="k-touch.us", category_path="beauty", brand_override=kw.get("brand"), currency="USD",
+            source_role="retailer", retailer_name="k-touch.us", emit_native_variants=True)
+            for i, (vendor, title, handle) in enumerate([("3CE", "3CE Velvet Lip Tint", "velvet"),
+                                                         ("rom&nd", "Juicy Lasting Tint", "juicy")])],
+            scanned_products=2, pages=1)
+    monkeypatch.setattr(feed, "records_for_brand", fetch)
+    opts = {"multi_brand": True, "vendors": ["3CE", "rom&nd"]}
+    assert (await pipeline.run_stage({**job(**opts), "brand": "k-touch.us (2 brands)"}, db=env.db))["status"] == "apply_due"
+    out = await pipeline.run_stage({**job("apply_due", **opts), "brand": "k-touch.us (2 brands)"}, db=env.db)
+    assert out["status"] == "done", env.ledger.runs
+    assert seen[0]["brand"] is None and sorted(seen[0]["only_vendors"]) == ["3ce", "rom&nd"]
+    assert sorted(p["brand"] for p in env.applied[-1]["pdps"]) == ["3CE", "Rom&nd"]  # vendor, proper-cased
+
+
+@pytest.mark.parametrize("options", [
+    {"vendors": ["3CE"], "multi_brand": True, "source_role": "brand_official"},
+    {"vendors": ["3CE"], "multi_brand": "yes"},
+])
+async def test_multi_brand_is_retailer_storefront_only(env, options):
+    env.crawl_error = AssertionError("must not crawl")
+    bad = job()
+    bad["options"] = options
+    out = await pipeline.run_stage(bad, db=env.db)
+    assert out["status"] == "failed" and out["outcome"] == "invalid_job"
+
+
+def test_multi_brand_refuses_an_affiliate_feed():
+    with pytest.raises(ValueError, match="multi_brand"):
+        pipeline.validate_options({"vendors": ["X"], "multi_brand": True, "source": "affiliate_feed", "feed": {}})

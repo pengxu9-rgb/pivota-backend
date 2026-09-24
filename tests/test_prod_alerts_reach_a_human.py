@@ -328,15 +328,15 @@ def test_the_drain_filters_name_the_job_the_scheduler_creates(source) -> None:
 def test_the_drain_alerts_exist_and_fire_on_one_event(source) -> None:
     body = _uncommented(source)
     # DURATION 0s on both: a log counter writes no points between matching lines. HELD aligns over
-    # 3600s - more than the 30-minute cadence - so a standing hold is one incident, not one per tick.
+    # 3600s - more than the 10-minute cadence - so a standing hold is one incident, not one per tick.
     for metric, window in (("retailer_ingest_drain_held", "3600s"), ("retailer_ingest_drain_failed", "300s")):
         assert f"upsert_log_metric {metric} " in body
         at = body.index(f'metric.type="logging.googleapis.com/user/{metric}"')
         tail = body[at: at + 250]
         assert f"COMPARISON_GT 0 {window} 0s " in tail, tail
     scheduler = SCHEDULER.read_text(encoding="utf-8")
-    assert 'sched retailer-ingest-drain-cron "*/30 * * * *"' in scheduler, (
-        "the held window is sized against a 30-minute cadence; re-derive it if the cadence moves"
+    assert 'sched retailer-ingest-drain-cron "*/10 * * * *"' in scheduler, (
+        "the held window is sized against a 10-minute cadence; re-derive it if the cadence moves"
     )
     assert '"prod: retailer ingest held for review"' in body
     assert '"prod: retailer ingest job failed"' in body

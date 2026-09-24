@@ -1,12 +1,20 @@
-"""Run the next due (brand, retailer) ingest stage: one crawl per execution.
+"""Run the due (brand, retailer) ingest stages: one crawl at a time, back to back within a budget.
 
 Runs as a Cloud Run Job on a Cloud Scheduler trigger (`infra/gcp/setup_scheduler.sh`), on the
 crawl-egress subnet, NOT as an APScheduler entry in the `worker` service: that service leaves from
 the default NAT, whose address is the payment IP, and a retailer crawl must never share it.
 
-ONE JOB PER EXECUTION, on purpose. 2026-09-23: four retailer crawls in parallel from the crawl NAT
-drew Shopify 429s on every store, and back-to-back crawls kept drawing them. The scheduler cadence
-is the spacing; this entrypoint never loops.
+ONE CRAWL AT A TIME, always. 2026-09-23: four retailer crawls in parallel from the crawl NAT drew
+Shopify 429s on every store. (Back-to-back crawls drew them too, but at the old pacing; since then
+every crawl is paced by CRAWL_MIN_INTERVAL_SECONDS=4, and each stage makes the same requests whether
+it follows a sleep or another stage.)
+
+BACK TO BACK WITHIN A BUDGET, when RETAILER_INGEST_DRAIN_BUDGET_SECONDS > 0 (default 0 = exactly one
+stage, the original behaviour). 2026-09-24: stages took 4-12 minutes, so one stage per 30-minute tick
+left the drain idle ~70% of the time while three coverage waves queued behind it. After each stage
+the execution claims the next due job if the budget has not run out; it never starts a stage past the
+budget, and the budget sits well inside the task timeout so the last stage can finish. Parallelism
+does not change: the claim still refuses while any job holds a lease, so an overlapping tick exits idle.
 
 It does nothing unless RETAILER_INGEST_DRAIN_ENABLED=1, so creating the job is not arming it.
 
@@ -23,7 +31,8 @@ import asyncio
 import json
 import logging
 import os
-from typing import Any, Dict
+import time
+from typing import Any, Callable, Dict, List
 
 from db.database import database
 from db import retailer_ingest as ledger
@@ -45,31 +54,56 @@ async def drain_once(*, lease_seconds: int, db: Any = None) -> Dict[str, Any]:
     return summary
 
 
+async def drain_loop(*, lease_seconds: int, budget_seconds: int, db: Any = None,
+                     clock: Callable[[], float] = time.monotonic, report: Callable[[Dict[str, Any]], None] = None
+                     ) -> List[Dict[str, Any]]:
+    """Stages back to back until nothing is due or the budget is spent. A budget of 0 is one stage.
+    A throttled crawl also ends the loop: the crawl NAT is being rate-limited, and the next store would
+    draw the same 429s and spend its retry budget -- the next tick is the cool-down. An unexpected
+    error propagates (run_stage has recorded it on the job) and ends the loop."""
+    start = clock()
+    summaries: List[Dict[str, Any]] = []
+    while True:
+        summary = await drain_once(lease_seconds=lease_seconds, db=db)
+        summaries.append(summary)
+        if report:
+            report(summary)
+        if (summary.get("outcome") in ("idle", "crawl_throttled") or budget_seconds <= 0
+                or clock() - start >= budget_seconds):
+            return summaries
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     # Longer than the slowest stage (a 20k-product crawl at 4s/page + apply): an expired lease makes
     # the job claimable again, so it must not expire under a stage that is still running.
     parser.add_argument("--lease", type=int, default=int(os.getenv("RETAILER_INGEST_LEASE_SECONDS", "4200")))
+    # No new stage starts after this many seconds; keep it well inside the task timeout (3600s) so the
+    # last stage finishes. 0 = one stage per execution.
+    parser.add_argument("--budget", type=int, default=int(os.getenv("RETAILER_INGEST_DRAIN_BUDGET_SECONDS", "0")))
     args = parser.parse_args()
 
     if str(os.getenv("RETAILER_INGEST_DRAIN_ENABLED", "")).strip() != "1":
         print(SUMMARY_MARKER + json.dumps({"outcome": "disabled"}))
         return 0
 
-    async def _run() -> Dict[str, Any]:
+    def report(summary: Dict[str, Any]) -> None:
+        # One greppable line per STAGE (the held/failed log metrics count lines), printed as it ends.
+        print(SUMMARY_MARKER + json.dumps(summary, default=str, sort_keys=True), flush=True)
+
+    async def _run() -> None:
         await database.connect()
         try:
-            return await drain_once(lease_seconds=args.lease)
+            await drain_loop(lease_seconds=args.lease, budget_seconds=args.budget, report=report)
         finally:
             await database.disconnect()
 
     try:
-        summary = asyncio.run(_run())
+        asyncio.run(_run())
     except Exception as exc:  # noqa: BLE001 -- run_stage already recorded it on the job
         print(SUMMARY_MARKER + json.dumps({"outcome": "error", "error": f"{type(exc).__name__}: {exc}"[:1000]}))
         logger.exception("retailer ingest drain failed")
         return 1
-    print(SUMMARY_MARKER + json.dumps(summary, default=str, sort_keys=True))
     return 0
 
 
