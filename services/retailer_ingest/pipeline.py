@@ -236,8 +236,10 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
     return {"plan": plan, "inspection": inspection, "checks": checks, "flags": flags, "blocking": blocking}
 
 
-#: The lifecycle stages recall serves (services/pivot_query_service.py filters on exactly these).
-SEARCHABLE_LIFECYCLE_STAGES = ("validated", "published")
+#: The lifecycle stages backend global recall admits (services/pivot_query_service.py: `IN (...) OR
+#: pdp_lifecycle_stage IS NULL`, skipped for merchant-scoped lanes). NOT the agent door's rule: the
+#: gateway gates on serving_eligible only. Used to annotate a readback, never to fail one.
+BACKEND_RECALL_LIFECYCLE_STAGES = ("validated", "published")
 
 
 async def _readback(product_keys: List[str], currency: str, db: Any) -> Dict[str, Any]:
@@ -258,7 +260,7 @@ async def _readback(product_keys: List[str], currency: str, db: Any) -> Dict[str
         {"keys": list(product_keys), "currency": currency},
     )
     out = [dict(r) for r in rows]
-    problems = []
+    problems, notes = [], []
     found = {r["product_key"] for r in out}
     for key in product_keys:
         if key not in found:
@@ -268,17 +270,18 @@ async def _readback(product_keys: List[str], currency: str, db: Any) -> Dict[str
             problems.append({"product_key": r["product_key"], "problem": "no category_path"})
         if not r["serving"]:
             problems.append({"product_key": r["product_key"], "problem": "not serving-eligible"})
-        # Serving-eligible is not searchable: recall (services.pivot_query_service) reads only
-        # validated/published rows. Measured 2026-09-24: 14 of 28 O HUI rows at buybeautykorea.com
-        # landed serving-eligible but `candidate` (no taxonomy signal: the store has no tags), and this
-        # readback called them verified.
-        if r.get("lifecycle") not in SEARCHABLE_LIFECYCLE_STAGES:
-            problems.append({"product_key": r["product_key"],
-                             "problem": f"not searchable: pdp_lifecycle_stage {r.get('lifecycle')!r}"})
+        # Recorded, never a failure: the agent door (gateway) serves on serving-eligibility alone, while
+        # backend global recall (services/pivot_query_service.py, non-merchant-scoped lanes) admits only
+        # validated/published/NULL. Measured 2026-09-24: 14 of 28 O HUI rows at buybeautykorea.com
+        # landed `candidate` (no taxonomy signal: the store has no tags) and the agent door still
+        # returned them. The run says which rows backend recall will not see.
+        if r.get("lifecycle") is not None and r.get("lifecycle") not in BACKEND_RECALL_LIFECYCLE_STAGES:
+            notes.append({"product_key": r["product_key"],
+                          "note": f"outside backend global recall: pdp_lifecycle_stage {r.get('lifecycle')!r}"})
         if not r["offers"] or r["offers_in_currency"] != r["offers"]:
             problems.append({"product_key": r["product_key"],
                              "problem": f"offers {r['offers']}, in {currency}: {r['offers_in_currency']}"})
-    return {"ok": not problems, "problems": problems, "rows": out}
+    return {"ok": not problems, "problems": problems, "notes": notes, "rows": out}
 
 
 async def _move(job: Dict[str, Any], *, db: Any, **fields: Any) -> bool:
