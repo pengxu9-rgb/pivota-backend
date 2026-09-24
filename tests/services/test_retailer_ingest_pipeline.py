@@ -208,8 +208,12 @@ async def test_a_row_backend_recall_cannot_see_is_noted_but_never_fails_the_job(
     readback = list(env.ledger.runs.values())[-1]["readback"]
     assert readback["problems"] == []
     assert bool(readback["notes"]) is noted
+    reason = env.ledger.transitions[-1]["reason"]
     if noted:
         assert readback["notes"][0]["note"] == f"outside backend global recall: pdp_lifecycle_stage {lifecycle!r}"
+        assert reason.endswith("row(s) outside backend global recall")
+    else:
+        assert reason == "applied and verified"
 
 
 async def test_a_readback_problem_fails_the_job_after_apply(env):
