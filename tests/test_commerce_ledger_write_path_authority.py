@@ -565,8 +565,10 @@ def test_every_direct_ledger_write_splats_a_literal_provenance():
     )
 
     calls = _direct_ledger_calls()
-    # 6 agent-commerce + 5 attribution + 2 listing-registry writers.
-    assert len(calls) >= 13, sorted({str(p) for p, _ in calls})
+    # 6 agent-commerce + 4 attribution + 2 listing-registry writers. record_surface_event had
+    # one surface.<event> write per branch (update / insert); since ADR-025 D1 both branches
+    # count through the same UPDATE and share one write.
+    assert len(calls) >= 12, sorted({str(p) for p, _ in calls})
     allowed_paths = set(WritePath.__args__)
     for path, node in calls:
         splats = [

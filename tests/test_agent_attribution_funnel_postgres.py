@@ -117,11 +117,14 @@ async def test_the_real_queries_fold_a_realistic_ledger(_db):
 
     await _build_schema()
     db = _db
+    # clk1 and clk2 were recorded when ISSUED (issued_at, ADR-025 D1); clk_legacy is a row /r
+    # created for a link with no issue record, which must not count as issued.
     await db.execute(
         "INSERT INTO surface_click_events (click_id, surface, agent_id, impression_count, click_count, "
-        "created_at, updated_at) "
-        "VALUES ('clk1', 'reap_cart_link', 'agent_minds', 0, 1, :now, :now), "
-        "('clk2', 'offers.resolve', NULL, 1, 0, :now, :now)",
+        "issued_at, created_at, updated_at) "
+        "VALUES ('clk1', 'reap_cart_link', 'agent_minds', 0, 1, :now, :now, :now), "
+        "('clk2', 'offers.resolve', NULL, 1, 0, :now, :now, :now), "
+        "('clk_legacy', 'offers.resolve', 'agent_minds', 0, 1, NULL, :now, :now)",
         {"now": NOW},
     )
     await _purchase(db, "rp_ok", "agent_minds", "completed", order="o1", final=4500)
@@ -151,6 +154,8 @@ async def test_the_real_queries_fold_a_realistic_ledger(_db):
 
     m = by["agent_minds"]
     assert (m["issued"], m["clicked"]) == (1, 1)
+    assert (m["legacy"], m["legacy_clicked"]) == (1, 1)
+    assert (fn["totals"]["issued"], fn["totals"]["legacy"]) == (2, 1)
     assert (m["opened"], m["completed"], m["in_flight"]) == (5, 4, 1)
     assert m["lanes"] == {"reap_variant": 4, "cart_link": 1}
     assert (m["credited"], m["credited_partner"], m["refunded_edges"]) == (1, 1, 1)
@@ -218,7 +223,8 @@ async def test_the_unknown_sentinel_is_reported_as_no_agent(_db):
     await _build_schema()
     await _db.execute(
         "INSERT INTO surface_click_events (click_id, surface, agent_id, impression_count, click_count, "
-        "created_at, updated_at) VALUES ('clk_u', 'offers.resolve', 'unknown', 0, 1, :now, :now)",
+        "issued_at, created_at, updated_at) "
+        "VALUES ('clk_u', 'offers.resolve', 'unknown', 0, 1, :now, :now, :now)",
         {"now": NOW},
     )
     await _purchase(_db, "rp_u", "agent_minds", "completed", order="o1", final=4500)

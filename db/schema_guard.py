@@ -1111,6 +1111,36 @@ async def ensure_required_schema_light() -> None:
                 )
             except Exception:  # noqa: BLE001
                 pass
+            # mig 239 (ADR-025 D1): when a click id was ISSUED to an agent; NULL = legacy row
+            # first written by /r. The surface_click_events model names it, so every
+            # select(surface_click_events) needs it: its own try, and ADD COLUMN IF NOT EXISTS so
+            # the coverage gate sees it.
+            try:
+                # Guarded and bounded like the dispute heals (#2289): the ALTER runs only while
+                # the column is missing, and gives up after 500ms instead of queueing every read
+                # of surface_click_events behind it and eating the guard's startup budget.
+                await database.execute(
+                    text(
+                        """
+                        DO $$
+                        BEGIN
+                            IF to_regclass('public.surface_click_events') IS NOT NULL
+                               AND NOT EXISTS (
+                                   SELECT 1 FROM information_schema.columns
+                                   WHERE table_schema = 'public'
+                                     AND table_name = 'surface_click_events'
+                                     AND column_name = 'issued_at'
+                               ) THEN
+                                PERFORM set_config('lock_timeout', '500ms', true);
+                                ALTER TABLE IF EXISTS surface_click_events
+                                  ADD COLUMN IF NOT EXISTS issued_at TIMESTAMPTZ;
+                            END IF;
+                        END $$;
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
             # mig 212: the recovery key — the join the Prove stage rests on.
             # Early and wrapped for the same reason as mig 210 below: this
             # branch is ONE try, and an unguarded CREATE INDEX further down
@@ -3612,6 +3642,13 @@ async def ensure_required_schema_light() -> None:
                         );
                         """
                     )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 239, SQLite twin: one column, and an existing one raises, so its own try.
+            try:
+                await database.execute(
+                    text("ALTER TABLE surface_click_events ADD COLUMN issued_at TIMESTAMP")
                 )
             except Exception:  # noqa: BLE001
                 pass

@@ -27,6 +27,7 @@ import os
 import base64
 import hashlib
 import hmac
+import re
 import json
 
 
@@ -87,6 +88,90 @@ def _build_internal_trusted_agent(api_key: str) -> Dict[str, Any]:
             "api_key_hash": key_hash,
         },
     }
+
+
+_AGENT_API_KEY_RE = re.compile(r"^ak_(live_)?[0-9a-f]{64}$")
+
+#: Agent identities that are PIVOTA'S OWN SERVICES, not agents a link can be issued to (ADR-025 D1).
+#: agent_982b1ea2df866206 ("Pivota Shopping") owns the gateway's PIVOTA_API_KEY: confirmed on
+#: 2026-09-24 by hashing the gateway secret in prod and matching api_keys. The gateway sends that
+#: key for the MCP get_offers door and for cached search results, which are shared across callers,
+#: so without this every such link would be credited to the gateway itself. The backend has no
+#: internal-trusted key configured, so that key takes the ordinary agent path.
+#: The code list is the floor: ISSUING_AGENT_EXCLUDED_AGENT_IDS can only ADD ids, never replace
+#: these, so a wiped environment cannot switch the exclusion off.
+_ISSUING_EXCLUDED_AGENT_IDS_DEFAULT = frozenset({"agent_982b1ea2df866206"})
+_ISSUING_EXCLUDED_AGENT_IDS_ENV = "ISSUING_AGENT_EXCLUDED_AGENT_IDS"
+_issuing_exclusions_logged: set = set()
+
+
+def issuing_excluded_agent_ids() -> frozenset:
+    extra = {
+        part.strip()
+        for part in str(os.getenv(_ISSUING_EXCLUDED_AGENT_IDS_ENV) or "").replace("\n", ",").split(",")
+        if part.strip()
+    }
+    return _ISSUING_EXCLUDED_AGENT_IDS_DEFAULT | frozenset(extra)
+
+
+def request_api_key(request: Optional[Request]) -> Optional[str]:
+    """The API key a request carries in X-API-Key, or as `Authorization: Bearer <key>`."""
+    if request is None:
+        return None
+    key = (request.headers.get("x-api-key") or "").strip()
+    if key:
+        return key
+    auth = (request.headers.get("authorization") or "").strip()
+    scheme, _, credentials = auth.partition(" ")
+    if scheme.lower() == "bearer" and credentials.strip():
+        return credentials.strip()
+    return None
+
+
+async def resolve_issuing_agent_id(api_key: Optional[str]) -> Optional[str]:
+    """The agent a link is issued to, from the caller's OWN API key (ADR-025 D1). Never raises.
+
+    The same lookup get_agent_context uses (get_agent_by_key, cached per key), without its rate
+    limit, quota or stats: this runs on a request that has already been admitted, only to name
+    the agent on a click record.
+
+    None, meaning "not bound to one agent", for:
+      * no key, or a key that is not an agent key;
+      * an INTERNAL trusted key (PIVOTA_API_KEY and friends). Its synthetic
+        agent_internal_trusted_<hash> is a service, not an agent. The gateway sends it on purpose
+        for cached search results, which are shared across callers and must stay agent-less;
+      * an unknown, inactive or unreadable agent. A lookup failure must never break the link
+        being served, and a wrong agent is worse than none;
+      * one of Pivota's own service agents (issuing_excluded_agent_ids), such as the one the
+        gateway's own key belongs to.
+
+    No request field or header can name the agent: only the key the caller authenticated with.
+    """
+    candidate = str(api_key or "").strip()
+    if not candidate or _is_internal_trusted_api_key(candidate):
+        return None
+    if not _AGENT_API_KEY_RE.match(candidate):
+        return None
+    try:
+        agent = await get_agent_by_key(candidate)
+    except Exception as exc:  # noqa: BLE001 -- the link is still served; its click is agent-less
+        logger.warning(f"[AgentAuth] issuing-agent lookup failed: {type(exc).__name__}")
+        return None
+    if not agent:
+        return None
+    is_active = agent.get("is_active")
+    if is_active is None:
+        status = agent.get("status")
+        is_active = (str(status).lower() == "active") if status else True
+    if not is_active:
+        return None
+    agent_id = str(agent.get("agent_id") or "").strip()
+    if agent_id and agent_id in issuing_excluded_agent_ids():
+        if agent_id not in _issuing_exclusions_logged:
+            _issuing_exclusions_logged.add(agent_id)
+            logger.warning(f"[AgentAuth] issuing agent {agent_id} is a Pivota service; its links are issued agent-less")
+        return None
+    return agent_id or None
 
 
 class AgentContext:

@@ -40,6 +40,7 @@ _PK = "prod::m_arm::external_seed::snail-essence"
 @pytest.fixture(scope="module")
 def pg_engine():
     import db.catalog  # noqa: F401
+    import db.commerce_attribution  # noqa: F401  (surface_click_events: the issued links)
     from sqlalchemy import create_engine
 
     from db.database import metadata
@@ -432,3 +433,34 @@ def test_a_price_tie_is_cut_by_offer_id_the_same_way_every_time(pg_engine):
                   "agent_seed::retailer::ohlolly.com", "of_tie_a", 15.00,
                   "https://ohlolly.com/products/tie")
     assert _order(_resolve("ck_tie", limit=1)) == ["of_tie_a"]
+
+
+def test_every_catalog_link_served_is_issued_and_nothing_else_is(pg_engine):
+    """ADR-025 D1: a link handed out is recorded when it is handed out, with click_count 0. The
+    catalog arm builds its links after the seed lanes, so it must feed the same issue flush, and
+    that flush writes only what ships (the planted rows that are filtered out mint nothing)."""
+    from urllib.parse import parse_qs, urlparse
+
+    from sqlalchemy import text
+
+    from services.outbound_links_service import parse_and_verify_redirect_token
+
+    _seed(pg_engine)
+    with pg_engine.begin() as conn:
+        conn.execute(text("DELETE FROM surface_click_events"))
+
+    offers = _resolve(_SIG).get("offers") or []
+    served = set()
+    for o in offers:
+        token = parse_qs(urlparse(str(o.get("affiliate_url") or "")).query).get("token")
+        if token:
+            served.add(parse_and_verify_redirect_token(token[0])["ctx"]["pvt_click_id"])
+    assert len(served) == 2, [o.get("affiliate_url") for o in offers]
+
+    with pg_engine.begin() as conn:
+        rows = conn.execute(text(
+            "SELECT click_id, click_count, issued_at, agent_id FROM surface_click_events"
+        )).mappings().all()
+    assert {r["click_id"] for r in rows} == served
+    assert all(r["click_count"] == 0 and r["issued_at"] is not None for r in rows)
+    assert all(r["agent_id"] is None for r in rows), "no caller key: the link is agent-less"

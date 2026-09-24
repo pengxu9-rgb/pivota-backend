@@ -3,7 +3,9 @@
 
 Read-only. For a time window it reports, per agent:
 
-  referral lane   links issued (surface_click_events rows) -> clicked (click_count > 0)
+  referral lane   links issued (surface_click_events rows with issued_at, ADR-025 D1)
+                  -> clicked (click_count > 0); rows /r created with no issue record are
+                  reported apart as legacy, so the issued -> clicked ratio cannot be inflated
   partner lane    purchases opened (reap_agentic_purchases) -> completed -> credited
                   (a converted commerce_attribution_edges row carrying that agent)
   money           credited GMV per currency, and refunds recorded against credited edges
@@ -51,26 +53,47 @@ UNKNOWN_AGENT_TOKEN = "unknown"
 PURCHASE_TERMINAL = ("completed", "failed", "refused", "expired")
 
 
-def purchase_columns_sql():
+def columns_sql(table):
     return (
         "SELECT column_name FROM information_schema.columns "
-        "WHERE table_schema = 'public' AND table_name = 'reap_agentic_purchases'"
+        f"WHERE table_schema = 'public' AND table_name = '{table}'"
     )
 
 
-def build_queries(purchase_cols):
-    """The read-only queries, adapted to the purchase columns prod actually has.
+def purchase_columns_sql():
+    return columns_sql("reap_agentic_purchases")
+
+
+def build_queries(purchase_cols, click_cols=None):
+    """The read-only queries, adapted to the columns prod actually has.
 
     `item_source` arrived in migration 229, and numbered migrations are not applied by deploy
     in prod, so a missing column is reported as the default lane rather than failing the report.
+
+    `issued_at` (migration 239, ADR-025 D1) separates links recorded when they were ISSUED from
+    LEGACY rows that `/r` created at click time. Without the column every row is legacy: nothing
+    was recorded at issue time, so nothing is claimed as issued.
     """
     cols = set(purchase_cols or ())
     src = "coalesce(p.item_source, 'reap_variant')" if "item_source" in cols else "'reap_variant'"
+    if "issued_at" in set(click_cols or ()):
+        click_counts = (
+            "count(*) FILTER (WHERE c.issued_at IS NOT NULL) AS issued, "
+            "count(*) FILTER (WHERE c.issued_at IS NOT NULL AND c.click_count > 0) AS clicked, "
+            "count(*) FILTER (WHERE c.issued_at IS NULL) AS legacy, "
+            "count(*) FILTER (WHERE c.issued_at IS NULL AND c.click_count > 0) AS legacy_clicked "
+            "FROM surface_click_events c WHERE c.created_at >= :since"
+        )
+    else:
+        click_counts = (
+            "0 AS issued, 0 AS clicked, count(*) AS legacy, "
+            "count(*) FILTER (WHERE c.click_count > 0) AS legacy_clicked "
+            "FROM surface_click_events c WHERE c.created_at >= :since"
+        )
     queries = {
         "clicks": (
             "SELECT coalesce(nullif(nullif(c.agent_id, ''), :unknown), :none) AS agent, coalesce(c.surface, '') AS surface, "
-            "count(*) AS issued, count(*) FILTER (WHERE c.click_count > 0) AS clicked "
-            "FROM surface_click_events c WHERE c.created_at >= :since GROUP BY 1, 2"
+            + click_counts + " GROUP BY 1, 2"
         ),
         "edges": (
             "SELECT coalesce(nullif(nullif(e.agent_id, ''), :unknown), :none) AS agent, "
@@ -136,7 +159,7 @@ def build_funnel(rows, days, now=None):
     """Fold the query results into one row per agent plus the exception lists. Pure."""
     now = now or datetime.now(timezone.utc)
     agents = defaultdict(lambda: {
-        "issued": 0, "clicked": 0,
+        "issued": 0, "clicked": 0, "legacy": 0, "legacy_clicked": 0,
         "opened": 0, "completed": 0, "in_flight": 0, "failed": 0,
         "credited": 0, "credited_partner": 0,
         "credited_minor": defaultdict(int), "refunded_edges": 0,
@@ -146,6 +169,8 @@ def build_funnel(rows, days, now=None):
         a = agents[r["agent"]]
         a["issued"] += _int(r["issued"])
         a["clicked"] += _int(r["clicked"])
+        a["legacy"] += _int(r.get("legacy"))
+        a["legacy_clicked"] += _int(r.get("legacy_clicked"))
     for r in rows.get("purchases") or []:
         a = agents[r["agent"]]
         n = _int(r["n"])
@@ -179,6 +204,7 @@ def build_funnel(rows, days, now=None):
         all_rows.append({
             "agent": name,
             "issued": a["issued"], "clicked": a["clicked"],
+            "legacy": a["legacy"], "legacy_clicked": a["legacy_clicked"],
             "opened": a["opened"], "in_flight": a["in_flight"], "completed": a["completed"],
             "failed": a["failed"],
             "credited": a["credited"], "credited_partner": a["credited_partner"],
@@ -201,7 +227,8 @@ def build_funnel(rows, days, now=None):
     agent_rows = all_rows[:MAX_AGENTS]
     # Totals are over EVERY agent; only the per-agent table is truncated.
     totals = {k: sum(r[k] for r in all_rows) for k in
-              ("issued", "clicked", "opened", "completed", "credited", "credited_partner")}
+              ("issued", "clicked", "legacy", "legacy_clicked", "opened", "completed", "credited",
+               "credited_partner")}
     # "Credited to an agent" means a named agent: an edge with no agent credits nobody, however
     # it was closed, and counting it here would report the exact gap this report exists to find.
     totals["credited_partner_to_agent"] = sum(
@@ -252,7 +279,8 @@ def render(funnel):
     lines = [
         f"AGENT ATTRIBUTION FUNNEL  last {funnel['window_days']}d  (generated {funnel['generated_at']})",
         "",
-        f"referral lane : issued {t['issued']}  ->  clicked {t['clicked']} ({_pct(t['clicked'], t['issued'])})",
+        f"referral lane : issued {t['issued']}  ->  clicked {t['clicked']} ({_pct(t['clicked'], t['issued'])})"
+        f"   | legacy (no issue record): {t['legacy']} rows, {t['legacy_clicked']} clicked",
         f"partner lane  : opened {t['opened']}  ->  completed {t['completed']} ({_pct(t['completed'], t['opened'])})"
         f"  ->  credited to an agent {t['credited_partner_to_agent']} (partner edges: {t['credited_partner']})",
         f"all credited edges (any source): {t['credited']}",
@@ -309,7 +337,14 @@ async def collect(days):
         except Exception as exc:  # noqa: BLE001 -- reported, never fatal
             rows["_errors"]["purchase_columns"] = type(exc).__name__ + " " + str(exc)[:200]
             cols = []
-        for name, sql in build_queries(cols).items():
+        try:
+            click_cols = [
+                r["column_name"] for r in await database.fetch_all(columns_sql("surface_click_events"))
+            ]
+        except Exception as exc:  # noqa: BLE001 -- reported, never fatal
+            rows["_errors"]["click_columns"] = type(exc).__name__ + " " + str(exc)[:200]
+            click_cols = []
+        for name, sql in build_queries(cols, click_cols).items():
             params = {"since": since}
             if ":none" in sql:
                 params["none"] = NO_AGENT
