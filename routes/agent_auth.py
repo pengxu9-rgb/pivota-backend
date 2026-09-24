@@ -111,7 +111,9 @@ def issuing_excluded_agent_ids() -> frozenset:
         for part in str(os.getenv(_ISSUING_EXCLUDED_AGENT_IDS_ENV) or "").replace("\n", ",").split(",")
         if part.strip()
     }
-    return _ISSUING_EXCLUDED_AGENT_IDS_DEFAULT | frozenset(extra)
+    # A voucher (issuing_voucher_agent_ids) is always excluded too: a service that vouches for others
+    # must never be credited itself, or its own key would win before its header is read.
+    return _ISSUING_EXCLUDED_AGENT_IDS_DEFAULT | frozenset(extra) | issuing_voucher_agent_ids()
 
 
 def request_api_key(request: Optional[Request]) -> Optional[str]:
@@ -173,6 +175,73 @@ async def resolve_issuing_agent_id(api_key: Optional[str]) -> Optional[str]:
         return None
     return agent_id or None
 
+
+
+#: The service agents whose SIGNED assertion (X-Pivota-Issuing-Agent) may name another agent: the
+#: gateway's own agent, whose key its MCP commerce kernel sends upstream. Deliberately NOT
+#: issuing_excluded_agent_ids(): excluding an agent (a QA key on a laptop, say) must stop it being
+#: credited, never make it a voucher. The env var can only ADD vouchers, never remove the default.
+_ISSUING_VOUCHER_AGENT_IDS_DEFAULT = frozenset({"agent_982b1ea2df866206"})
+_ISSUING_VOUCHER_AGENT_IDS_ENV = "ISSUING_ASSERTION_VOUCHER_AGENT_IDS"
+
+
+def issuing_voucher_agent_ids() -> frozenset:
+    extra = {
+        part.strip()
+        for part in str(os.getenv(_ISSUING_VOUCHER_AGENT_IDS_ENV) or "").replace("\n", ",").split(",")
+        if part.strip()
+    }
+    return _ISSUING_VOUCHER_AGENT_IDS_DEFAULT | frozenset(extra)
+
+
+async def _is_service_caller(api_key: Optional[str]) -> bool:
+    """Is this request authenticated as one of Pivota's own services allowed to vouch (the gateway)?
+
+    Checked DIRECTLY, never inferred from resolve_issuing_agent_id returning None: None also means
+    "no key", "unknown key" and "inactive agent", and none of those may vouch for anyone.
+    """
+    candidate = str(api_key or "").strip()
+    if not candidate:
+        return False
+    if _is_internal_trusted_api_key(candidate):
+        return True
+    if not _AGENT_API_KEY_RE.match(candidate):
+        return False
+    try:
+        agent = await get_agent_by_key(candidate)
+    except Exception:  # noqa: BLE001 -- an unreadable caller vouches for no one
+        return False
+    if not agent:
+        return False
+    is_active = agent.get("is_active")
+    if is_active is None:
+        status = agent.get("status")
+        is_active = (str(status).lower() == "active") if status else True
+    agent_id = str(agent.get("agent_id") or "").strip()
+    return bool(is_active) and agent_id in issuing_voucher_agent_ids()
+
+
+async def resolve_issuing_agent_for_request(
+    api_key: Optional[str], assertion: Optional[str], *, op: str
+) -> Optional[str]:
+    """The agent a link is issued to: the caller's OWN key first, then, only when the caller is one of
+    Pivota's own services, the agent that service VERIFIED and signed (X-Pivota-Issuing-Agent). Never
+    raises.
+
+    The second step exists for the MCP door: the gateway's commerce kernel calls upstream with its own
+    service key, so its callers' keys never arrive here, and an MCP OAuth caller has none. Any other
+    caller's assertion is ignored: an agent cannot vouch for another agent, and a request with no
+    service identity cannot vouch at all. See services/issuing_agent_assertion.py for what the header
+    must prove (MAC, op, freshness) and how its subject maps to an active, non-service agent.
+    """
+    own = await resolve_issuing_agent_id(api_key)
+    if own is not None or not assertion:
+        return own
+    if not await _is_service_caller(api_key):
+        return None
+    from services.issuing_agent_assertion import resolve_asserted_agent_id
+
+    return await resolve_asserted_agent_id(assertion, op=op, excluded_agent_ids=issuing_excluded_agent_ids())
 
 class AgentContext:
     """Agent 请求上下文"""

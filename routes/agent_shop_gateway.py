@@ -75,7 +75,13 @@ from services.similarity_service import (
     similarity_service,
 )
 from services.similarity_config import get_similarity_scoring_weights
-from routes.agent_auth import AgentContext, get_agent_context, request_api_key, resolve_issuing_agent_id
+from routes.agent_auth import (
+    AgentContext,
+    get_agent_context,
+    request_api_key,
+    resolve_issuing_agent_for_request,
+)
+from services.issuing_agent_assertion import ISSUING_AGENT_ASSERTION_HEADER
 from db.merchant_tasks import match_recovery_key
 from services.outbound_links_service import (
     DEFAULT_UTM_TEMPLATE,
@@ -3994,7 +4000,10 @@ RESOLUTION_MODES: frozenset[str] = frozenset(get_args(ResolutionMode))
 
 
 async def _issue_served_clicks(
-    issued: List[IssuedClick], offers: List[Dict[str, Any]], caller_api_key: Optional[str]
+    issued: List[IssuedClick],
+    offers: List[Dict[str, Any]],
+    caller_api_key: Optional[str],
+    caller_assertion: Optional[str] = None,
 ) -> None:
     """Record the issued clicks whose link is in `offers`, with the caller's agent. Never raises."""
     if not issued or not offers:
@@ -4015,7 +4024,9 @@ async def _issue_served_clicks(
     if not served:
         return
     try:
-        agent_id = await resolve_issuing_agent_id(caller_api_key)
+        agent_id = await resolve_issuing_agent_for_request(
+            caller_api_key, caller_assertion, op="offers.resolve"
+        )
         await issue_clicks([replace(click, agent_id=agent_id) for click in served])
     except Exception as e:  # noqa: BLE001 -- FAIL OPEN, see the call site
         logger.warning(
@@ -4030,6 +4041,9 @@ async def _handle_offers_resolve(
     # ADR-025 D1: the API key the CALLER authenticated with (the gateway forwards the agent's own
     # key). Resolved to an agent only when a click is actually issued; never read from the body.
     caller_api_key: Optional[str] = None,
+    # ...and, when that key is the gateway's own (the MCP door), the agent the gateway verified,
+    # signed. Trusted only from a Pivota service caller; see resolve_issuing_agent_for_request.
+    caller_assertion: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Resolve purchasable offers for a given sku_id/product_id.
@@ -6156,7 +6170,7 @@ async def _handle_offers_resolve(
     # FAIL OPEN: a failed write is logged and the links are served anyway; losing a click record
     # must never take down search. `/r` still records a click on a link whose issue was lost (as
     # a legacy row, issued_at NULL), so the funnel under-counts issues, never clicks.
-    await _issue_served_clicks(_issued_clicks, offers, caller_api_key)
+    await _issue_served_clicks(_issued_clicks, offers, caller_api_key, caller_assertion)
 
     # RECONCILE resolution_mode AGAINST WHAT ACTUALLY SHIPS. Everything above describes
     # what we RESOLVED; `offers` is what the caller RECEIVES, and the two diverge twice:
@@ -16123,6 +16137,9 @@ async def invoke_shop_operation(
         return await _handle_offers_resolve(
             payload, normalized_metadata, background_tasks,
             caller_api_key=request_api_key(http_request),
+            caller_assertion=(
+                http_request.headers.get(ISSUING_AGENT_ASSERTION_HEADER) if http_request is not None else None
+            ),
         )
 
     if operation == "find_similar_products":
