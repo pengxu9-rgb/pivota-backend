@@ -261,3 +261,39 @@ async def test_agent_portal_reset_shares_the_path_and_no_longer_stores_plaintext
     assert agents_update["api_key"] == f"redacted:{AGENT_ID}"
     [(insert, _)] = fake.statements("INSERT INTO api_keys")
     assert insert["key_hash"] == hashlib.sha256(body["api_key"].encode()).hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_key_table_inventory_is_503_and_writes_nothing(install):
+    """_existing_key_tables probes after the resolver: its failure is 'retry', not a bare 500."""
+    fake = install(_FakeDb(key_table="api_keys"))
+    probes = {"n": 0}
+    real_fetch_one = fake.fetch_one
+
+    async def second_probe_fails(query, values=None):
+        if "to_regclass('public.api_keys')" in str(query):
+            probes["n"] += 1
+            if probes["n"] == 2:
+                raise RuntimeError("connection reset during probe")
+        return await real_fetch_one(query, values)
+
+    fake.fetch_one = second_probe_fails
+
+    with pytest.raises(HTTPException) as exc:
+        await _employee_reset()
+
+    assert exc.value.status_code == 503
+    assert fake.executed == []
+
+
+@pytest.mark.asyncio
+async def test_off_postgres_reset_skips_the_key_table_inventory(install, monkeypatch):
+    """No to_regclass off Postgres: the resolver already answers 'no key table' there."""
+    fake = install(_FakeDb(key_table="api_keys"))
+    monkeypatch.setattr(agents_db, "IS_POSTGRES", False)
+
+    body = await _employee_reset()
+
+    [(agents_update, _)] = fake.statements("UPDATE agents")
+    assert agents_update["api_key"] == body["new_api_key"]  # legacy: the column is the auth lookup
+    assert not fake.statements("UPDATE api_keys") and not fake.statements("UPDATE agent_api_keys")

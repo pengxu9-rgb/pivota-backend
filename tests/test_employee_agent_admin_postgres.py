@@ -454,3 +454,53 @@ async def test_an_unparseable_or_out_of_range_key_id_is_a_404_not_a_500(db, key_
     with pytest.raises(HTTPException) as exc:
         await revoke_agent_api_key(AGENT_ID, key_id, current_user=EMPLOYEE)
     assert exc.value.status_code == 404
+
+
+@pytest.mark.parametrize("db", ["agent_api_keys"], indirect=True)
+@pytest.mark.asyncio
+async def test_login_backfill_cannot_revive_a_retired_md5_era_key(db):
+    """Migration 008 stored md5(key) in agent_api_keys, and the auth lookup (and the login backfill)
+    still match md5 there. Retiring such a row must clear a plaintext agents.api_key too."""
+    import hashlib
+
+    from db.agents import get_agent_by_key, is_redacted_agent_api_key
+    from db.database import database
+    from routes.agent_account import _ensure_agent_api_key_on_auth_path
+    from routes.employee_agent_mgmt import revoke_agent_api_key
+
+    await database.execute(
+        "UPDATE agent_api_keys SET key_hash = :h WHERE agent_id = :a AND key_id = 'key_old'",
+        {"h": hashlib.md5(OLD_KEY.encode()).hexdigest(), "a": AGENT_ID},
+    )
+    await database.execute("UPDATE agents SET api_key = :k WHERE agent_id = :a", {"k": OLD_KEY, "a": AGENT_ID})
+    assert (await get_agent_by_key(OLD_KEY))["agent_id"] == AGENT_ID  # the md5 row authenticates today
+
+    await revoke_agent_api_key(AGENT_ID, "key_old", current_user=EMPLOYEE)
+
+    row = await database.fetch_one("SELECT api_key FROM agents WHERE agent_id = :a", {"a": AGENT_ID})
+    if row["api_key"] and not is_redacted_agent_api_key(row["api_key"]):
+        await _ensure_agent_api_key_on_auth_path(
+            agent_id=AGENT_ID, api_key=row["api_key"], api_key_hash=_sha(row["api_key"])
+        )
+    assert await get_agent_by_key(OLD_KEY) is None
+
+
+@pytest.mark.asyncio
+async def test_a_failed_revoke_rolls_back_the_retire(db, monkeypatch):
+    """Retire-in-auth's-table and retire-everywhere-else commit together."""
+    import routes.agent_account as agent_account
+    from fastapi import HTTPException
+
+    from db.agents import get_agent_by_key
+    from routes.employee_agent_mgmt import revoke_agent_api_key
+
+    async def failing_retire(*_args, **_kwargs):
+        raise RuntimeError("retire-everywhere failed after the first retire ran")
+
+    monkeypatch.setattr(agent_account, "_retire_key_everywhere", failing_retire)
+
+    with pytest.raises(HTTPException) as exc:
+        await revoke_agent_api_key(AGENT_ID, await _old_key_id(db), current_user=EMPLOYEE)
+    assert exc.value.status_code == 500
+
+    assert (await get_agent_by_key(OLD_KEY))["agent_id"] == AGENT_ID

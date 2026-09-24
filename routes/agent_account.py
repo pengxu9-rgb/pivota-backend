@@ -475,14 +475,25 @@ async def _require_agent(agent_id: str) -> None:
 async def _existing_key_tables() -> list:
     """Every hash key table that EXISTS, whichever one auth reads right now. A key left active in a
     table auth is not reading is dormant, not dead: moving AGENT_AUTH_KEY_TABLE (the rollback lever,
-    including legacy_only and back) revives it. So retiring a key retires it in all of them."""
-    row = await database.fetch_one(
-        """
-        SELECT
-          to_regclass('public.api_keys') AS api_keys_table,
-          to_regclass('public.agent_api_keys') AS agent_api_keys_table
-        """
-    )
+    including legacy_only and back) revives it. So retiring a key retires it in all of them.
+
+    Called only on write paths: a failed probe raises KeyTableUnresolvedError (503, retry) rather
+    than guessing "none". Off Postgres there are no key tables to find (to_regclass is Postgres-only).
+    """
+    from db.agents import IS_POSTGRES
+
+    if not IS_POSTGRES:
+        return []
+    try:
+        row = await database.fetch_one(
+            """
+            SELECT
+              to_regclass('public.api_keys') AS api_keys_table,
+              to_regclass('public.agent_api_keys') AS agent_api_keys_table
+            """
+        )
+    except Exception as exc:
+        raise KeyTableUnresolvedError(f"key table inventory failed: {type(exc).__name__}") from exc
     row = dict(row or {})
     return [t for t in ("api_keys", "agent_api_keys") if row.get(f"{t}_table")]
 
@@ -490,7 +501,8 @@ async def _existing_key_tables() -> list:
 async def _retire_key_everywhere(agent_id: str, key_hashes: list, *, tables: list) -> None:
     """After a per-key retire: the same key's copies in the other key tables, and agents.api_key
     when it still holds that key in plaintext -- /agent/account/login re-activates a revoked row for
-    any plaintext it finds there (_ensure_agent_api_key_on_auth_path)."""
+    any plaintext it finds there (_ensure_agent_api_key_on_auth_path). The plaintext is matched by
+    sha256 AND md5: migration 008 stored md5(key) in agent_api_keys, and auth still accepts it."""
     for key_hash in key_hashes:
         for table in tables:
             await _deactivate_key_rows(table, agent_id=agent_id, key_hash=key_hash)
@@ -500,7 +512,10 @@ async def _retire_key_everywhere(agent_id: str, key_hashes: list, *, tables: lis
             SET api_key = :marker, updated_at = NOW()
             WHERE agent_id = :agent_id
               AND api_key NOT LIKE 'redacted:%'
-              AND encode(sha256(convert_to(api_key, 'UTF8')), 'hex') = :key_hash
+              AND (
+                encode(sha256(convert_to(api_key, 'UTF8')), 'hex') = :key_hash
+                OR md5(api_key) = :key_hash
+              )
             """,
             {"marker": redacted_agent_api_key(agent_id), "agent_id": agent_id, "key_hash": key_hash},
         )
