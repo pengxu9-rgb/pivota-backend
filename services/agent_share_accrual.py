@@ -16,8 +16,9 @@ from billing, never re-derived from rates (review of #2273):
   line is not voided. Nothing locally ever marks an invoice void or uncollectible (the Stripe
   webhooks mirror only invoice.paid and invoice.payment_failed), so crediting anything short of
   `paid` could leave an agent a share of money never collected (re-review of #2273). A dispute
-  voids the line (`voided_at`) and the share reverses to 0. Refunds after payment (credit notes)
-  are not mirrored locally yet; that is a follow-up. A dispute's replacement line
+  voids the line (`voided_at`) and the share reverses to 0. A GMV invoice credit issued against
+  the line (services/gmv_invoice_credits.py: a refund after the day was invoiced) gives that take
+  back, so the line accrues on its amount LESS its issued credits. A dispute's replacement line
   (`dispute_adj`) carries no rollup link, so it is not credited to an agent. That errs in Pivota's
   favour and needs a follow-up.
 - The agent's share comes AFTER any channel partner's (decision 2026-09-23). The partner's cut is
@@ -71,7 +72,9 @@ _LINE_FOR_UPDATE_SQL = """
 SELECT bri.id AS line_id, bri.billing_run_id, bri.merchant_id, bri.source_type, bri.source_id AS rollup_id,
        bri.amount_cents, bri.voided_at, bri.stripe_invoice_id,
        g.date AS billed_day, g.agent_id, g.channel_partner_id,
-       inv.status AS invoice_status, inv.paid_at
+       inv.status AS invoice_status, inv.paid_at,
+       (SELECT COALESCE(SUM(c.amount_cents), 0) FROM gmv_invoice_credits c
+        WHERE c.billing_run_item_id = bri.id AND c.status = 'issued') AS credited_cents
 FROM billing_run_items bri
 LEFT JOIN gmv_attribution_daily g ON g.id = bri.source_id AND bri.source_type = 'gmv_rollup'
 LEFT JOIN invoices inv ON inv.stripe_invoice_id = bri.stripe_invoice_id
@@ -79,11 +82,27 @@ WHERE bri.id = :line_id
 FOR UPDATE OF bri
 """
 
-# The denominator for spreading a partner's paid share: this merchant's billed lines in the run.
+# The denominator for spreading a partner's paid share: this merchant's billed lines in the run,
+# each net of the GMV invoice credits issued against it (what Pivota kept), like the line itself.
 _MERCHANT_BILLED_IN_RUN_SQL = """
-SELECT COALESCE(SUM(amount_cents), 0) AS total FROM billing_run_items
+SELECT COALESCE(SUM(bri.amount_cents), 0)
+       - COALESCE((SELECT SUM(c.amount_cents) FROM gmv_invoice_credits c
+                   JOIN billing_run_items b2 ON b2.id = c.billing_run_item_id
+                   WHERE c.status = 'issued' AND b2.billing_run_id = :billing_run_id
+                     AND b2.merchant_id = :merchant_id AND b2.source_type = 'gmv_rollup'
+                     AND b2.voided_at IS NULL), 0) AS total
+FROM billing_run_items bri
+WHERE bri.billing_run_id = :billing_run_id AND bri.merchant_id = :merchant_id
+  AND bri.source_type = 'gmv_rollup' AND bri.voided_at IS NULL
+"""
+
+# What was clawed back from partners for this merchant's run after it settled, because a GMV invoice
+# credit gave part of the take back (services/gmv_invoice_credits.reconcile_partner). The partner
+# was paid that much less, so the agent's share after the partner's is taken from that much more.
+_PARTNER_CLAWED_IN_RUN_SQL = """
+SELECT COALESCE(SUM(partner_clawback_cents), 0) AS total FROM gmv_invoice_credits
 WHERE billing_run_id = :billing_run_id AND merchant_id = :merchant_id
-  AND source_type = 'gmv_rollup' AND voided_at IS NULL
+  AND partner_status = 'clawed_back'
 """
 
 _LEDGER_SUMS_SQL = """
@@ -129,7 +148,11 @@ WHERE bri.source_type = 'gmv_rollup'
        -- A run whose partner settlement completed recently, however old its lines: they waited on
        -- it (partner_settlement_pending) and may have aged out of the other conditions.
        OR bri.billing_run_id IN (
-         SELECT billing_run_id FROM partner_settlement_completions WHERE completed_at >= :since))
+         SELECT billing_run_id FROM partner_settlement_completions WHERE completed_at >= :since)
+       -- A GMV invoice credit issued, or a partner clawback decided, against a line of the run.
+       OR bri.billing_run_id IN (
+         SELECT billing_run_id FROM gmv_invoice_credits
+         WHERE issued_at >= :since OR partner_decided_at >= :since))
   AND ((g.agent_id IS NOT NULL AND g.agent_id <> '' AND g.agent_id <> :unknown)
        OR bri.id IN (SELECT DISTINCT billing_run_item_id FROM agent_share_ledger))
 ORDER BY bri.id
@@ -193,7 +216,8 @@ async def accrue_for_line(line_id: int, *, apply: bool = True) -> LineAccrual:
             return LineAccrual(status="no_line", line_id=line_id)
         line = dict(row)
         agent = _real_agent(line["agent_id"])
-        billed = int(line["amount_cents"] or 0)
+        # What Pivota keeps of the line: its amount less the GMV invoice credits issued against it.
+        billed = max(int(line["amount_cents"] or 0) - int(line["credited_cents"] or 0), 0)
 
         if line["source_type"] != "gmv_rollup" or line["billed_day"] is None:
             basis = "not_a_rollup_line"
@@ -218,7 +242,10 @@ async def accrue_for_line(line_id: int, *, apply: bool = True) -> LineAccrual:
             if settled is None:
                 basis = "partner_settlement_pending"
             elif settled["partner_ids"]:
-                partner_paid = int(settled["settled_cents"])
+                clawed = int(dict(await database.fetch_one(_PARTNER_CLAWED_IN_RUN_SQL, {
+                    "billing_run_id": int(line["billing_run_id"]), "merchant_id": line["merchant_id"],
+                }))["total"])
+                partner_paid = max(int(settled["settled_cents"]) - clawed, 0)
                 merchant_billed = int(dict(await database.fetch_one(_MERCHANT_BILLED_IN_RUN_SQL, {
                     "billing_run_id": int(line["billing_run_id"]), "merchant_id": line["merchant_id"],
                 }))["total"])

@@ -30,7 +30,7 @@ _IS_PG = DATABASE_URL.startswith("postgresql://") or DATABASE_URL.startswith("po
 pytestmark = pytest.mark.skipif(not _IS_PG, reason="needs a Postgres DATABASE_URL")
 
 _SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")
-_TABLES = ("agent_share_ledger", "agent_share_rates", "partner_settlement_completions", "settlement_snapshots",
+_TABLES = ("gmv_invoice_credits", "agent_share_ledger", "agent_share_rates", "partner_settlement_completions", "settlement_snapshots",
            "billing_run_items",
            "invoice_disputes", "invoices",
            "billing_runs", "gmv_attribution_daily", "stripe_events")
@@ -38,7 +38,8 @@ _MIG = Path(__file__).resolve().parent.parent / "db/migrations"
 _MIGRATIONS = ("100_stripe_events.sql", "113_billing_core.sql", "118_invoice_payment_failed_status.sql",
                "119_invoice_finalizing_status.sql", "120_invoices_billing_period_to_date.sql",
                "121_billing_runs_period_to_date.sql", "122_billing_runs_partial_failed_status.sql",
-               "235_agent_share_accrual.sql", "236_agent_share_after_partner.sql")
+               "235_agent_share_accrual.sql", "236_agent_share_after_partner.sql",
+               "238_gmv_invoice_credits.sql")
 
 WEBHOOK_SECRET = "whsec_invoice_event_order_test"
 MERCHANT = "merch_event_order"

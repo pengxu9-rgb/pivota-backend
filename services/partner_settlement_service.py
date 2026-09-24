@@ -163,11 +163,11 @@ async def compute_partner_comp(
         channel_partner_id,
         period_start,
     )
-    gmv_take_by_merchant = await _gmv_take_revenue_by_merchant(
-        channel_partner_id,
-        period_start,
-        period_end,
-    )
+    # ONE read gives both what the partner is paid on and which GMV invoice credits that already
+    # nets, so a credit issued mid-settlement is either in both or in neither: never netted here
+    # and clawed back again (services/gmv_invoice_credits.reconcile_partner), nor in neither.
+    gmv_rows = await _gmv_take_rows(channel_partner_id, period_start, period_end)
+    gmv_take_by_merchant = _gmv_take_by_merchant_from_rows(gmv_rows)
     attributed_merchants = await _attributed_merchants(channel_partner_id)
 
     merchant_ids = sorted(
@@ -253,6 +253,12 @@ async def compute_partner_comp(
         "clawbacks": clawbacks,
         "net_comp_cents": net_comp_cents,
         "merchant_accruals": merchant_accruals,
+        # What services.gmv_invoice_credits.reconcile_partner reads: the rollup rows this
+        # settlement paid the partner on, and the issued credits it already netted out of them.
+        "gmv_rollup_ids_counted": sorted(int(r["rollup_id"]) for r in gmv_rows),
+        "netted_invoice_credit_ids": sorted(
+            int(credit_id) for r in gmv_rows for credit_id in (r.get("credit_ids") or [])
+        ),
         "commission_config": config,
         "period_start": period_start.isoformat(),
         "period_end": period_end.isoformat(),
@@ -702,15 +708,24 @@ async def _subscription_revenue_by_merchant(
     }
 
 
-async def _gmv_take_revenue_by_merchant(
+async def _gmv_take_rows(
     channel_partner_id: int,
     period_start: date,
     period_end: date,
-) -> dict[str, int]:
+) -> list[dict[str, Any]]:
+    """The partner's GMV rollup rows on paid invoices, each net of the GMV invoice credits issued
+    against it (services/gmv_invoice_credits.py): a credit gave that take back to the merchant."""
     rows = await database.fetch_all(
         """
-        SELECT gad.merchant_id, COALESCE(SUM(gad.take_amount_cents), 0) AS revenue_cents
+        SELECT gad.id AS rollup_id, gad.merchant_id, gad.take_amount_cents,
+               COALESCE(cr.credited_cents, 0) AS credited_cents, cr.credit_ids
         FROM gmv_attribution_daily gad
+        LEFT JOIN (
+          SELECT rollup_id, SUM(amount_cents) AS credited_cents, array_agg(id ORDER BY id) AS credit_ids
+          FROM gmv_invoice_credits
+          WHERE status = 'issued'
+          GROUP BY rollup_id
+        ) cr ON cr.rollup_id = gad.id
         WHERE gad.channel_partner_id = :channel_partner_id
           AND gad.date BETWEEN :period_start AND :period_end
           AND EXISTS (
@@ -721,7 +736,7 @@ async def _gmv_take_revenue_by_merchant(
               AND gad.date <= i.billing_period_end
               AND i.status = 'paid'
           )
-        GROUP BY gad.merchant_id
+        ORDER BY gad.id
         """,
         {
             "channel_partner_id": channel_partner_id,
@@ -729,10 +744,16 @@ async def _gmv_take_revenue_by_merchant(
             "period_end": period_end,
         },
     )
-    return {
-        str(_row_get(row, "merchant_id")): _as_int(_row_get(row, "revenue_cents"))
-        for row in rows
-    }
+    return [dict(row) for row in rows]
+
+
+def _gmv_take_by_merchant_from_rows(rows: list[dict[str, Any]]) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for row in rows:
+        merchant_id = str(row["merchant_id"])
+        net = max(_as_int(row["take_amount_cents"]) - _as_int(row["credited_cents"]), 0)
+        out[merchant_id] = out.get(merchant_id, 0) + net
+    return out
 
 
 async def _credit_overage_for_partner(
