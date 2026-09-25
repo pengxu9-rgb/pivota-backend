@@ -2530,6 +2530,15 @@ def _checkout_failed_code(row: Mapping[str, Any], from_state: str) -> str:
     the future, cannot be the reason the partner failed the checkout, so it is not named as one.
     The clock is `_now()` (aware UTC) against the ledger's normalised aware value, through
     `_parse_ts`, the same comparison the quoting step's P2-9 check makes.
+
+    A HEURISTIC, NOT A DIAGNOSIS, and the name should be read that way. The partner's FAILED
+    payload carries no reason field, so there is nothing in it to tell an unapproved checkout
+    from one the buyer approved late that then failed at the merchant. The machine already
+    admits PROCESSING can be skipped between two polls ('awaiting_approval' → 'completed' is an
+    edge), so a buyer who approves inside the last poll interval before the quote expires, whose
+    checkout then fails after it, is read here as a lapsed window. The ambiguity is one poll
+    interval wide (30 s, doubled per transport failure); the code says "most likely", never
+    "certainly".
     """
     if from_state != "awaiting_approval":
         return "checkout_failed"

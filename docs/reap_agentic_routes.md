@@ -345,8 +345,9 @@ flips to **FAILED — not EXPIRED — 1–10 s after the quote's `expiresAt`** (
 never passes PROCESSING. A door that read `hosted_url_expires_at` as the deadline showed the
 buyer ten minutes of a link that no longer works. `hosted_url` is dropped once the approval
 deadline has passed, not only once the page's expiry has; `approval_deadline` itself stays in the
-body, past or not, until the poller moves the row (to `failed` with
-`last_error_code: "approval_window_lapsed"`).
+body, past or not, until the row leaves `awaiting_approval` — usually the poller moving it to
+`failed` with `last_error_code: "approval_window_lapsed"`, but also the expiry sweep (`expired`)
+if the poller is dark, or `completed` when an approval landed inside the last poll interval.
 
 `completed` — note that `hosted_url` and `hosted_url_expires_at` are **gone**, not null, and
 `order_reference` has appeared:

@@ -54,8 +54,13 @@ quote's is. Consequences in this package:
   was never observed for an unapproved checkout, but the mapping is kept for a partner that one
   day sends it.
 
-A spike in `approval_window_lapsed` is buyers not reaching the approval page inside five minutes
-— a door showing the link late, or not at all — not a partner outage.
+A spike in `approval_window_lapsed` is **most likely** buyers not reaching the approval page
+inside five minutes — a door showing the link late, or not at all. It is a heuristic, not a
+diagnosis: Reap's `FAILED` payload carries no reason, and a buyer who approves inside the last
+poll interval before the quote expires, whose checkout then fails at the merchant after it, gets
+the same code (the machine admits `PROCESSING` can be skipped between two polls). The ambiguity
+is one poll interval wide (30 s, doubled per transport failure). Read a spike against
+`checkout_failed` on `processing` rows from the same window before calling it a door problem.
 
 ### What the quote is checked against
 

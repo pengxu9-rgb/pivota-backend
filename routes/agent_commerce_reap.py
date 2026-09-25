@@ -1581,7 +1581,12 @@ def _aware(value: Any) -> Optional[datetime]:
 
 def _iso_utc(value: datetime) -> str:
     """ISO-8601 with an explicit `+00:00` offset — the SAME spelling FastAPI's encoder gives the
-    sibling timestamps in this body, so a door that parses one parses all of them."""
+    sibling timestamps in this body, so a door that parses one parses all of them.
+
+    The `astimezone` is defensive: every value that reaches here is already UTC-aware (the
+    ledger normalises both dialects), so it is a no-op today. If a non-UTC aware value ever
+    arrived, the sibling column would be spelled with its own offset by FastAPI while this key
+    is re-spelled `+00:00` — the route test that pins the two equal is what would notice."""
     return value.astimezone(timezone.utc).isoformat()
 
 
@@ -1598,10 +1603,13 @@ def approval_deadline(quote_expires_at: Any, hosted_url_expires_at: Any) -> Opti
 
     MIN, NOT "THE QUOTE": the quote can be absent (the spec does not require `expiresAt`), and a
     partner that one day kills the page before the quote is still a partner we read correctly.
-    Both inputs go through `_aware`, which is the route's one parser for the three shapes a
-    timestamp arrives in (aware datetime, naive datetime, SQLite text) — a comparison between an
-    aware and a naive datetime raises, and a string skipped as "not a datetime" would be a
-    deadline silently ignored.
+    Both inputs go through `_aware`, the route's one parser for the three shapes a timestamp can
+    arrive in (aware datetime, naive datetime, SQLite text). On THIS path both values are already
+    aware UTC — the owner reads go through the ledger's `_normalize_row` on both dialects — so
+    the naive and text branches are defence in depth for a caller that hands this function a raw
+    row, not a shape the routes produce today. A comparison between an aware and a naive
+    datetime raises, and a string skipped as "not a datetime" would be a deadline silently
+    ignored, which is why the parser is applied rather than assumed.
     """
     candidates = [
         value
