@@ -1319,6 +1319,49 @@ async def test_an_expired_hosted_url_is_not_shown(client):
     assert "hosted_url_expires_at" not in body
 
 
+async def test_a_lapsed_quote_drops_the_link_while_the_page_is_still_live(client):
+    """Two `timestamptz` columns compared against an aware `now()`: the approval deadline is the
+    EARLIER of the quote's expiry and the page's. Measured 2026-09-25 in the sandbox — the
+    checkout is FAILED at the quote's expiry, ten minutes before the page's. On SQLite both
+    columns are text and the comparison runs through a parse, so this arm is the one that proves
+    the aware path on the production dialect."""
+    await _seed_all()
+    purchase_id = (await client.post(f"{BASE}/purchases", json=_body())).json()["purchase_id"]
+    await ledger.transition(purchase_id, from_states=("resolving",), to_state="quoting")
+    await ledger.transition(
+        purchase_id,
+        from_states=("quoting",),
+        to_state="awaiting_approval",
+        reap_quote_expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        hosted_url="https://pay.prava.space/checkout/chk_7f3a",
+        hosted_url_expires_at=datetime.now(timezone.utc) + timedelta(minutes=9),
+    )
+    body = (await client.get(f"{BASE}/purchases/{purchase_id}")).json()
+    assert "hosted_url" not in body
+    assert "hosted_url_expires_at" not in body
+    assert body["approval_deadline"] == body["reap_quote_expires_at"]
+    assert datetime.fromisoformat(body["approval_deadline"]) < datetime.now(timezone.utc)
+
+
+async def test_a_live_quote_names_itself_as_the_deadline_and_keeps_the_link(client):
+    """CONTROL for the arm above on this dialect."""
+    await _seed_all()
+    purchase_id = (await client.post(f"{BASE}/purchases", json=_body())).json()["purchase_id"]
+    await ledger.transition(purchase_id, from_states=("resolving",), to_state="quoting")
+    await ledger.transition(
+        purchase_id,
+        from_states=("quoting",),
+        to_state="awaiting_approval",
+        reap_quote_expires_at=datetime.now(timezone.utc) + timedelta(minutes=4),
+        hosted_url="https://pay.prava.space/checkout/chk_7f3a",
+        hosted_url_expires_at=datetime.now(timezone.utc) + timedelta(minutes=14),
+    )
+    body = (await client.get(f"{BASE}/purchases/{purchase_id}")).json()
+    assert body["hosted_url"] == "https://pay.prava.space/checkout/chk_7f3a"
+    assert body["approval_deadline"] == body["reap_quote_expires_at"]
+    assert body["approval_deadline"] < body["hosted_url_expires_at"]
+
+
 async def test_a_live_hosted_url_is_shown(client):
     """The control for the test above: an absence assertion passes when the mechanism is absent
     too, so this proves a hosted URL reaches the buyer at all on this dialect."""

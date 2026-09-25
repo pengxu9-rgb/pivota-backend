@@ -923,6 +923,104 @@ async def test_processing_cannot_expire_because_the_buyer_already_approved(reap,
     assert (await _get(purchase_id))["last_error_code"] == "checkout_expired"
 
 
+# ── 4b. FAILED at the quote's expiry is a lapsed approval window ─────────────────────────────
+#
+# MEASURED 2026-09-25 in the Reap sandbox, twice: an unapproved checkout flips to FAILED — not
+# EXPIRED, never PROCESSING — 1–10 s after the QUOTE's `expiresAt`. Reported as `checkout_failed`,
+# that is a buyer who took six minutes shown as a failed purchase with no hint why.
+
+
+async def _set_quote_expiry(purchase_id: str, when) -> None:
+    await database.execute(
+        "UPDATE reap_agentic_purchases SET reap_quote_expires_at = :t WHERE id = :i",
+        {"t": ledger._bind_dt(when), "i": purchase_id},
+    )
+
+
+async def _drive_to_awaiting_approval(reap) -> str:
+    purchase_id = await _start()
+    await _step(purchase_id)
+    await _step(purchase_id)
+    result = await _step(purchase_id)
+    assert result.state == "awaiting_approval", result
+    return purchase_id
+
+
+async def test_a_failed_read_on_a_lapsed_quote_names_the_lapsed_window(reap, attribution):
+    purchase_id = await _drive_to_awaiting_approval(reap)
+    await _set_quote_expiry(purchase_id, datetime.now(timezone.utc) - timedelta(seconds=5))
+    reap.get_checkout = _ok(dict(CHECKOUT_COMPLETED, status="FAILED"))
+    result = await _step(purchase_id)
+    assert result.state == "failed", "the TARGET state does not move — only the reason does"
+    row = await _get(purchase_id)
+    assert row["state"] == "failed"
+    assert row["last_error_code"] == "approval_window_lapsed"
+    assert row["buyer_email"] is None
+    assert attribution.calls == []
+
+
+async def test_a_failed_read_on_a_live_quote_is_still_a_checkout_failure(reap, attribution):
+    """KILLS the mutant that names every FAILED a lapsed window. A quote still four minutes
+    from expiry cannot be why the partner failed the checkout."""
+    purchase_id = await _drive_to_awaiting_approval(reap)
+    await _set_quote_expiry(purchase_id, datetime.now(timezone.utc) + timedelta(minutes=4))
+    reap.get_checkout = _ok(dict(CHECKOUT_COMPLETED, status="FAILED"))
+    assert (await _step(purchase_id)).state == "failed"
+    assert (await _get(purchase_id))["last_error_code"] == "checkout_failed"
+
+
+async def test_a_failed_read_with_no_quote_expiry_is_a_checkout_failure(reap, attribution):
+    """The spec does not require `expiresAt`; an absent expiry is not a lapsed one."""
+    purchase_id = await _drive_to_awaiting_approval(reap)
+    await _set_quote_expiry(purchase_id, None)
+    reap.get_checkout = _ok(dict(CHECKOUT_COMPLETED, status="FAILED"))
+    assert (await _step(purchase_id)).state == "failed"
+    assert (await _get(purchase_id))["last_error_code"] == "checkout_failed"
+
+
+async def test_a_failed_read_on_processing_is_never_a_lapsed_window(reap, attribution):
+    """'processing' means the buyer DID approve in time. Whatever the quote column says, a
+    FAILED there is a failure after approval and keeps its own code."""
+    purchase_id = await _drive_to_awaiting_approval(reap)
+    await _raw_state(purchase_id, "processing")
+    await _set_quote_expiry(purchase_id, datetime.now(timezone.utc) - timedelta(minutes=10))
+    reap.get_checkout = _ok(dict(CHECKOUT_COMPLETED, status="FAILED"))
+    assert (await _step(purchase_id)).state == "failed"
+    assert (await _get(purchase_id))["last_error_code"] == "checkout_failed"
+
+
+async def test_an_expired_read_on_a_lapsed_quote_keeps_its_own_edge(reap, attribution):
+    """CONTROL: the new code is for FAILED only. A partner EXPIRED still takes the 'expired'
+    edge with `checkout_expired`, lapsed quote or not."""
+    purchase_id = await _drive_to_awaiting_approval(reap)
+    await _set_quote_expiry(purchase_id, datetime.now(timezone.utc) - timedelta(minutes=1))
+    reap.get_checkout = _ok(dict(CHECKOUT_COMPLETED, status="EXPIRED"))
+    assert (await _step(purchase_id)).state == "expired"
+    assert (await _get(purchase_id))["last_error_code"] == "checkout_expired"
+
+
+def test_the_lapsed_window_code_is_a_legal_error_code():
+    """`release_claim` validates against ERROR_CODE_RE; `transition` does not. A code that fails
+    the shape would be stored by one writer and refused by the other."""
+    assert svc.ERROR_CODE_RE.match(svc.APPROVAL_WINDOW_LAPSED)
+    assert svc.APPROVAL_WINDOW_LAPSED == "approval_window_lapsed"
+
+
+@pytest.mark.parametrize(
+    "from_state,quote,expected",
+    [
+        ("awaiting_approval", datetime(2020, 1, 1, tzinfo=timezone.utc), "approval_window_lapsed"),
+        ("awaiting_approval", "2020-01-01 00:00:00", "approval_window_lapsed"),
+        ("awaiting_approval", datetime(2099, 1, 1, tzinfo=timezone.utc), "checkout_failed"),
+        ("awaiting_approval", None, "checkout_failed"),
+        ("awaiting_approval", "not a timestamp", "checkout_failed"),
+        ("processing", datetime(2020, 1, 1, tzinfo=timezone.utc), "checkout_failed"),
+    ],
+)
+def test_the_failed_code_decision_table(from_state, quote, expected):
+    assert svc._checkout_failed_code({"reap_quote_expires_at": quote}, from_state) == expected
+
+
 # ── 5. the hostile hosted URL ────────────────────────────────────────────────────────────────
 
 

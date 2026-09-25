@@ -2489,7 +2489,8 @@ async def _step_checkout_poll(
         return await _complete(row, worker_id, from_state, read.data)
     if state == "failed":
         return await _move(
-            row, worker_id, [from_state], "failed", last_error_code="checkout_failed"
+            row, worker_id, [from_state], "failed",
+            last_error_code=_checkout_failed_code(row, from_state),
         )
     if state == "expired":
         if "expired" not in ledger.ALLOWED_TRANSITIONS[from_state]:
@@ -2509,6 +2510,42 @@ async def _step_checkout_poll(
         return await _release(row, worker_id, error_code=None)
     # unknown — never advances, in either state.
     return await _release(row, worker_id, error_code="unknown_checkout_status")
+
+
+#: `last_error_code` for a Reap FAILED that landed on an approval the buyer simply did not give in
+#: time. MEASURED 2026-09-25 in the sandbox: an unapproved checkout is FAILED — not EXPIRED, and
+#: never PROCESSING — 1–10 s after the QUOTE's `expiresAt` (created + 5 min), while the hosted
+#: page's own `expiresAt` still says created + 15 min. Without this code a buyer who took six
+#: minutes is reported as a failed purchase with no hint that the window lapsed.
+APPROVAL_WINDOW_LAPSED = "approval_window_lapsed"
+
+
+def _checkout_failed_code(row: Mapping[str, Any], from_state: str) -> str:
+    """The code a partner FAILED writes: `approval_window_lapsed` when the row was still waiting
+    for the buyer AND its quote had already expired at read time; `checkout_failed` otherwise.
+
+    ONLY 'awaiting_approval', and only on a quote that is genuinely in the past. A FAILED on
+    'processing' is a failure AFTER approval — the buyer did act in time — and stays
+    `checkout_failed` whatever the quote says; a quote with no recorded expiry, or one still in
+    the future, cannot be the reason the partner failed the checkout, so it is not named as one.
+    The clock is `_now()` (aware UTC) against the ledger's normalised aware value, through
+    `_parse_ts`, the same comparison the quoting step's P2-9 check makes.
+
+    A HEURISTIC, NOT A DIAGNOSIS, and the name should be read that way. The partner's FAILED
+    payload carries no reason field, so there is nothing in it to tell an unapproved checkout
+    from one the buyer approved late that then failed at the merchant. The machine already
+    admits PROCESSING can be skipped between two polls ('awaiting_approval' → 'completed' is an
+    edge), so a buyer who approves inside the last poll interval before the quote expires, whose
+    checkout then fails after it, is read here as a lapsed window. The ambiguity is one poll
+    interval wide (30 s, doubled per transport failure); the code says "most likely", never
+    "certainly".
+    """
+    if from_state != "awaiting_approval":
+        return "checkout_failed"
+    quote_expires = _parse_ts(row.get("reap_quote_expires_at"))
+    if quote_expires is None or quote_expires > _now():
+        return "checkout_failed"
+    return APPROVAL_WINDOW_LAPSED
 
 
 async def _step_awaiting_approval(row: Mapping[str, Any], worker_id: str) -> AdvanceResult:
