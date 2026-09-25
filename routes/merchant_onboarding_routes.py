@@ -312,6 +312,36 @@ async def sync_merchant_auth_user(
         credential_source="merchant_sync",
     )
 
+async def keep_converted_agent_memberships(email: str) -> List[str]:
+    """Keep agent-portal access for an agent account converted into a merchant.
+
+    The conversion (resolve_public_merchant_identity_merge) verifies the agent's own
+    password, then sync_merchant_auth_user rewrites users.role to 'merchant' -- and
+    users holds one role per email, so the owner could no longer sign in to the
+    developer portal ("This login is for agents only"). The owner proved the agent is
+    theirs, so record that as an active agent membership per owned agent; agent login
+    admits a non-agent role only through a membership bound to that exact agent.
+    """
+    rows = await database.fetch_all(
+        "SELECT agent_id, agent_name FROM agents WHERE LOWER(owner_email) = LOWER(:email)",
+        {"email": email},
+    )
+    kept: List[str] = []
+    for row in rows:
+        agent = dict(row)
+        await upsert_membership(
+            email=email,
+            membership_type="agent",
+            role="agent",
+            entity_id=str(agent["agent_id"]),
+            status="active",
+            full_name=agent.get("agent_name"),
+            source="merchant_conversion_keeps_agent",
+        )
+        kept.append(str(agent["agent_id"]))
+    return kept
+
+
 async def resolve_public_merchant_identity_merge(
     *,
     existing_user: Optional[Dict[str, Any]],
@@ -717,6 +747,12 @@ async def register_merchant(
             # Generate password if not provided
             password = merchant_data.password if merchant_data.password else secrets.token_urlsafe(12)
             
+            # Before the role rewrite, so a failure leaves an intact agent account that can
+            # retry; a membership written ahead of a failed rewrite changes nothing, since
+            # role='agent' already admits the agent login.
+            if identity_merge and identity_merge.get("converted_from_role") == "agent":
+                await keep_converted_agent_memberships(normalized_email)
+
             print(f"🔐 Syncing merchant auth user for {normalized_email}")
             await sync_merchant_auth_user(
                 contact_email=normalized_email,
