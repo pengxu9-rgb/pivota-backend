@@ -36,6 +36,7 @@ import secrets
 from urllib.parse import quote, urlparse, urlencode
 
 from db.database import IS_POSTGRES, database
+from db.schema_guard import guarded_statements
 from db.startup_ddl import _asyncpg_dsn, _connect_kwargs
 from utils.auth import (
     MERCHANT_OR_ADMIN_ROLES,
@@ -479,17 +480,41 @@ async def _ensure_shopify_oauth_tables() -> None:
         logger.warning("Shopify OAuth table bootstrap failed", exc_info=True)
         return
 
-    for ddl in (
+    # Guarded on Postgres (db/schema_guard.guarded_statements): this runs on every install
+    # and callback, and bare each ALTER took the table's ACCESS EXCLUSIVE lock with no
+    # lock_timeout even with the column there. A lock timeout lands in the except below.
+    for ddl in guarded_statements([
         "ALTER TABLE shopify_oauth_states ADD COLUMN IF NOT EXISTS install_source VARCHAR(50)",
         "ALTER TABLE shopify_oauth_states ADD COLUMN IF NOT EXISTS return_to TEXT",
         "ALTER TABLE shopify_oauth_states ADD COLUMN IF NOT EXISTS host TEXT",
-    ):
+    ]):
         try:
             await database.execute(ddl)
         except Exception:
             # Some local SQLite versions do not support ADD COLUMN IF NOT EXISTS.
             # Existing deployments with the old schema can still use the legacy JSON callback.
             logger.debug("Shopify OAuth state schema extension skipped: %s", ddl, exc_info=True)
+
+
+_SUPPORT_EMAIL_HEAL = guarded_statements(
+    ["ALTER TABLE merchant_stores ADD COLUMN IF NOT EXISTS support_email TEXT"]
+)
+
+
+async def _ensure_support_email_column() -> None:
+    """Backward compatibility: the column may not exist on some deployments.
+
+    Guarded on Postgres (db/schema_guard.guarded_statements): both support-email routes
+    run this on every request, and bare it took merchant_stores' ACCESS EXCLUSIVE lock
+    with no lock_timeout even with the column there, queueing behind any open
+    transaction on the table while every store lookup queued behind it. Best-effort as
+    before: a failure (a lock timeout included) is swallowed and the next request retries.
+    """
+    for statement in _SUPPORT_EMAIL_HEAL:
+        try:
+            await database.execute(statement)
+        except Exception:
+            pass
 
 
 async def _insert_shopify_oauth_state(
@@ -4603,11 +4628,7 @@ async def merchant_update_store_support_email(
         except ValidationError:
             raise HTTPException(status_code=400, detail="Invalid support_email")
 
-    # Backward compatibility: column may not exist on some deployments.
-    try:
-        await database.execute("ALTER TABLE merchant_stores ADD COLUMN IF NOT EXISTS support_email TEXT")
-    except Exception:
-        pass
+    await _ensure_support_email_column()
 
     store_row = await database.fetch_one(
         """
@@ -4651,11 +4672,7 @@ async def merchant_get_store_support_email(
     if not can_access_merchant(current_user, target_merchant_id):
         raise HTTPException(status_code=403, detail="Can only view your own store")
 
-    # Backward compatibility: column may not exist on some deployments.
-    try:
-        await database.execute("ALTER TABLE merchant_stores ADD COLUMN IF NOT EXISTS support_email TEXT")
-    except Exception:
-        pass
+    await _ensure_support_email_column()
 
     store_row = await database.fetch_one(
         """

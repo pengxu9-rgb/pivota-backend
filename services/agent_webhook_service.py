@@ -16,6 +16,7 @@ import httpx
 
 from config.settings import resolve_public_api_base_url
 from db.database import database
+from db.schema_guard import guarded_statements, is_lock_timeout
 from db.startup_ddl import execute_ddl
 
 
@@ -234,7 +235,12 @@ def _next_retry_at(attempt_count: int) -> Optional[datetime]:
 
 _AGENT_WEBHOOK_DDL_READY = False
 
-_AGENT_WEBHOOK_DDL_STATEMENTS = (
+# Index builds guarded on Postgres (db/schema_guard.guarded_statements). Bare,
+# each took its table's SHARE lock BEFORE finding the index already there, with no
+# lock_timeout, so every boot queued behind any open writer of the deliveries table
+# and blocked every later writer behind it. One that cannot get its lock within
+# the lock_timeout is deferred to a later call (see the ensure function below).
+_AGENT_WEBHOOK_DDL_STATEMENTS = guarded_statements((
     """
     CREATE TABLE IF NOT EXISTS agent_webhook_configs (
         id SERIAL PRIMARY KEY,
@@ -302,7 +308,7 @@ _AGENT_WEBHOOK_DDL_STATEMENTS = (
     CREATE INDEX IF NOT EXISTS idx_agent_webhook_managed_inbox_agent_received
     ON agent_webhook_managed_inbox_events(agent_id, received_at DESC)
     """,
-)
+))
 
 
 async def ensure_agent_webhook_tables() -> None:
@@ -318,9 +324,21 @@ async def ensure_agent_webhook_tables() -> None:
     global _AGENT_WEBHOOK_DDL_READY
     if _AGENT_WEBHOOK_DDL_READY:
         return
+    # A lock timeout (a guarded index build on a busy table) defers that build
+    # to a later call instead of failing the boot, which calls this unguarded
+    # by any try; nothing is memoized until every statement has run. Any other
+    # failure raises as before.
+    deferred = False
     for stmt in _AGENT_WEBHOOK_DDL_STATEMENTS:
-        await execute_ddl(stmt, db=database)
-    _AGENT_WEBHOOK_DDL_READY = True
+        try:
+            await execute_ddl(stmt, db=database)
+        except Exception as exc:
+            if not is_lock_timeout(exc):
+                raise
+            deferred = True
+            logger.warning("webhook DDL deferred to a later call: %s", exc)
+    if not deferred:
+        _AGENT_WEBHOOK_DDL_READY = True
 
 
 async def _sync_legacy_agent_webhook_url(agent_id: str, destination_url: Optional[str]) -> None:

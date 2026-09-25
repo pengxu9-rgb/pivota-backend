@@ -31,7 +31,7 @@ def text(sql: str) -> str:
 HEAL_LOCK_TIMEOUT = "500ms"
 
 _HEAL_ALTER_RE = re.compile(
-    r"ALTER\s+TABLE\s+IF\s+EXISTS\s+(\w+)\s+(.*?);", re.IGNORECASE | re.DOTALL
+    r"ALTER\s+TABLE\s+(IF\s+EXISTS\s+)?(\w+)\s+(.*?);", re.IGNORECASE | re.DOTALL
 )
 _HEAL_CLAUSE_RE = re.compile(r"ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+(\w+)\s", re.IGNORECASE)
 
@@ -70,13 +70,20 @@ def guarded_add_columns(sql: str) -> List[str]:
     the name through search_path exactly as the ALTER does, and reads the
     catalog without taking a lock on the table.
 
+    `ALTER TABLE <t>` without IF EXISTS (the request-path self-heals) keeps its
+    raise on a missing table: there no pg_attribute row matches, so the ALTER
+    runs and fails with UndefinedTable exactly as it did bare.
+
     Raises ValueError for any statement that is not purely column adds, so
     the guard cannot swallow a clause that has to run on every boot.
     """
     statements: List[str] = []
+    sql = sql.strip()
+    if not sql.endswith(";"):
+        sql += ";"
     rest = sql
     for match in _HEAL_ALTER_RE.finditer(sql):
-        table, body = match.group(1).lower(), match.group(2)
+        if_exists, table, body = match.group(1), match.group(2).lower(), match.group(3)
         # Every clause must be a column add with IF NOT EXISTS. Anything else
         # (ALTER COLUMN, ADD CONSTRAINT, DROP ...) has to run on a boot where
         # the columns exist too, which this guard would silently stop.
@@ -94,8 +101,8 @@ def guarded_add_columns(sql: str) -> List[str]:
                 IF EXISTS (
                     SELECT 1
                     FROM unnest(ARRAY[{wanted}]::text[]) AS wanted(column_name)
-                    WHERE to_regclass('{table}') IS NOT NULL
-                      AND NOT EXISTS (
+                    WHERE {"to_regclass('" + table + "') IS NOT NULL AND" if if_exists else ""}
+                      NOT EXISTS (
                           SELECT 1 FROM pg_attribute
                           WHERE attrelid = to_regclass('{table}')
                             AND attname = wanted.column_name
@@ -284,9 +291,66 @@ async def _ensure_index(sql: str) -> None:
     try:
         await database.execute(text(guarded_index(sql)))
     except Exception as exc:
-        if getattr(exc, "sqlstate", None) != _LOCK_NOT_AVAILABLE:
+        if not is_lock_timeout(exc):
             raise
         logger.warning("schema guard: index build deferred to next boot: %s", exc)
+
+
+def is_lock_timeout(exc: BaseException) -> bool:
+    """True when `exc` is a guarded statement giving up on its lock_timeout
+    (SQLSTATE 55P03), the one failure a bare statement never had: it waited.
+
+    A caller that memoizes its heal must not memoize past one of these, and one
+    whose request used to wait for the lock should defer the heal to a later
+    call rather than fail the request. Reads the driver error under a
+    SQLAlchemy wrapper too."""
+    for err in (exc, getattr(exc, "orig", None)):
+        if err is not None and getattr(err, "sqlstate", None) == _LOCK_NOT_AVAILABLE:
+            return True
+    return False
+
+
+def constraint_exists(table: str, name: str) -> str:
+    """True while `table` holds a constraint `name` (its DROP CONSTRAINT IF EXISTS is needed)."""
+    return f"""EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conrelid = to_regclass('{table}')
+                  AND conname = '{name}'
+            )"""
+
+
+_GUARDED_BLOCK_RE = re.compile(r"^\s*DO\s+\$(heal|guard|index)\$", re.IGNORECASE)
+_CREATE_TABLE_RE = re.compile(r"^\s*CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s", re.IGNORECASE)
+
+
+def guarded_statements(statements: Sequence[str], *, postgres: bool = IS_POSTGRES) -> List[str]:
+    """An `ensure_*` DDL list (run on the request path, once per process or
+    after a failure) with every statement that locks an existing table in its
+    guarded form: column-add ALTERs through `guarded_add_columns`, index builds
+    through `guarded_index`. CREATE TABLE IF NOT EXISTS locks nothing that
+    exists and passes through verbatim, as do blocks already guarded by hand
+    (`guarded_ddl` for an ALTER COLUMN or a constraint).
+
+    Anything else raises ValueError, so a statement added to one of these
+    lists later is guarded or refused at import, never sent out bare.
+
+    Off Postgres the list comes back unchanged: DO blocks are Postgres-only,
+    and on SQLite the bare CREATE INDEX statements are what build the test
+    databases' indexes (unique ones included).
+    """
+    if not postgres:
+        return list(statements)
+    out: List[str] = []
+    for statement in statements:
+        if _GUARDED_BLOCK_RE.match(statement) or _CREATE_TABLE_RE.match(statement):
+            out.append(statement)
+        elif _INDEX_RE.match(statement):
+            out.append(guarded_index(statement))
+        elif re.match(r"^\s*ALTER\s+TABLE\s", statement, re.IGNORECASE):
+            out.extend(guarded_add_columns(statement))
+        else:
+            raise ValueError(f"no guarded form for: {statement.strip()[:80]!r}")
+    return out
 
 
 @dataclass(frozen=True)

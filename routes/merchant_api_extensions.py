@@ -5,6 +5,7 @@ from utils.auth import MERCHANT_OR_ADMIN_ROLES, get_current_user
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from db.database import database
+from db.schema_guard import guarded_statements
 from db.orders import get_order, mark_order_shipped
 from db.products import log_order_event
 from services.refund_service import refund_service
@@ -218,7 +219,11 @@ async def _ensure_refund_tables_best_effort() -> None:
     Best-effort: do not raise on failures (keeps merchant UI stable during partial deploys).
     """
     try:
-        await database.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS total_refunded DECIMAL(10,2) DEFAULT 0")
+        # Guarded (db/schema_guard.py): see the definition below, which is the one that runs.
+        for statement in guarded_statements(
+            ["ALTER TABLE orders ADD COLUMN IF NOT EXISTS total_refunded DECIMAL(10,2) DEFAULT 0"]
+        ):
+            await database.execute(statement)
     except Exception:
         return
 
@@ -248,8 +253,11 @@ async def _ensure_refund_tables_best_effort() -> None:
             )
             """
         )
-        await database.execute("CREATE INDEX IF NOT EXISTS idx_order_refunds ON refund_records (order_id, created_at DESC)")
-        await database.execute("CREATE INDEX IF NOT EXISTS idx_merchant_refunds ON refund_records (merchant_id, created_at DESC)")
+        for statement in guarded_statements([
+            "CREATE INDEX IF NOT EXISTS idx_order_refunds ON refund_records (order_id, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_merchant_refunds ON refund_records (merchant_id, created_at DESC)",
+        ]):
+            await database.execute(statement)
     except Exception:
         return
 
@@ -598,8 +606,15 @@ async def _ensure_refund_tables_best_effort() -> None:
     Best-effort defensive DDL for refund tables/columns.
     Production should normally rely on SQL migrations, but the migration runner can be best-effort.
     """
+    # Guarded (db/schema_guard.py): this runs on EVERY refund call, and bare the ALTER took
+    # ACCESS EXCLUSIVE on orders (every checkout's table) with no lock_timeout even with the
+    # column there, and each index build its table's SHARE lock. Each now runs only while
+    # it is still needed; a lock timeout is one more failure these excepts already absorb.
     try:
-        await database.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS total_refunded NUMERIC(10,2) DEFAULT 0;")
+        for statement in guarded_statements(
+            ["ALTER TABLE orders ADD COLUMN IF NOT EXISTS total_refunded NUMERIC(10,2) DEFAULT 0;"]
+        ):
+            await database.execute(statement)
     except Exception:
         pass
 
@@ -652,13 +667,14 @@ async def _ensure_refund_tables_best_effort() -> None:
         pass
 
     try:
-        await database.execute("CREATE INDEX IF NOT EXISTS idx_merchant_refunds ON refund_records (merchant_id, created_at DESC);")
-        await database.execute("CREATE INDEX IF NOT EXISTS idx_order_refunds ON refund_records (order_id, created_at DESC);")
-        await database.execute("CREATE INDEX IF NOT EXISTS idx_idempotency ON refund_records (idempotency_key);")
-        await database.execute("CREATE INDEX IF NOT EXISTS idx_platform_refund ON refund_records (platform_type, platform_refund_id);")
-        await database.execute(
-            "CREATE INDEX IF NOT EXISTS idx_retry_queue_next ON refund_retry_queue (next_retry_at) WHERE retry_count < max_retries;"
-        )
+        for statement in guarded_statements([
+            "CREATE INDEX IF NOT EXISTS idx_merchant_refunds ON refund_records (merchant_id, created_at DESC);",
+            "CREATE INDEX IF NOT EXISTS idx_order_refunds ON refund_records (order_id, created_at DESC);",
+            "CREATE INDEX IF NOT EXISTS idx_idempotency ON refund_records (idempotency_key);",
+            "CREATE INDEX IF NOT EXISTS idx_platform_refund ON refund_records (platform_type, platform_refund_id);",
+            "CREATE INDEX IF NOT EXISTS idx_retry_queue_next ON refund_retry_queue (next_retry_at) WHERE retry_count < max_retries;",
+        ]):
+            await database.execute(statement)
     except Exception:
         pass
 

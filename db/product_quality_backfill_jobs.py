@@ -12,6 +12,7 @@ from sqlalchemy import Boolean, Column, DateTime, Index, Integer, JSON, String, 
 from sqlalchemy.sql import func
 
 from db.database import IS_POSTGRES, database, metadata
+from db.schema_guard import guarded_statements
 
 
 logger = logging.getLogger(__name__)
@@ -91,7 +92,14 @@ async def ensure_product_quality_backfill_jobs_table() -> None:
         if _DDL_READY:
             return
         try:
-            statements = [
+            # Guarded on Postgres (db/schema_guard.guarded_statements): bare, each
+            # ALTER took the table's ACCESS EXCLUSIVE lock (the index build its SHARE
+            # lock) with no lock_timeout, even with nothing to add, so the first call
+            # of every process queued behind any open transaction on the table and
+            # stalled every later one behind it. A guarded statement that cannot get
+            # its lock in time raises, which this pass already treats as "not ready,
+            # retry later".
+            statements = guarded_statements([
                 """
                 CREATE TABLE IF NOT EXISTS product_quality_backfill_jobs (
                   job_id VARCHAR(64) PRIMARY KEY,
@@ -123,7 +131,7 @@ async def ensure_product_quality_backfill_jobs_table() -> None:
                 "ALTER TABLE product_quality_backfill_jobs ADD COLUMN IF NOT EXISTS force_refresh BOOLEAN NOT NULL DEFAULT FALSE;",
                 "ALTER TABLE product_quality_backfill_jobs ADD COLUMN IF NOT EXISTS missing_only BOOLEAN NOT NULL DEFAULT TRUE;",
                 f"ALTER TABLE product_quality_backfill_jobs ADD COLUMN IF NOT EXISTS errors_sample {_json_type_sql()};",
-            ]
+            ])
             for statement in statements:
                 await database.execute(statement)
         except Exception as exc:

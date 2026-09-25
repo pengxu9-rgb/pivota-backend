@@ -37,6 +37,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 
 from db._ddl_guard import apply_ddl_statements
+from db.schema_guard import guarded_statements
 from db.database import database, metadata
 
 logger = logging.getLogger(__name__)
@@ -142,7 +143,14 @@ STALE_LEASE_GRACE_SECONDS = 30
 _DDL_READY = False
 _DDL_LOCK = asyncio.Lock()
 
-_DDL_STATEMENTS = [
+# Guarded on Postgres (db/schema_guard.guarded_statements). Bare, each ALTER took
+# its table's ACCESS EXCLUSIVE lock, and each index build its SHARE lock, BEFORE
+# finding the column or index already there, with no lock_timeout: the first call
+# of every process queued behind any open transaction on the table, and every
+# later reader and writer queued behind it. A guarded statement runs only while
+# its column or index is missing, and one that cannot get its lock within the
+# lock_timeout fails instead, so apply_ddl_statements retries it on a later pass.
+_DDL_STATEMENTS = guarded_statements([
     """
     CREATE TABLE IF NOT EXISTS executor_runs (
       run_id              UUID PRIMARY KEY,
@@ -192,7 +200,7 @@ _DDL_STATEMENTS = [
     "ON executor_runs (idempotency_key) "
     "WHERE idempotency_key IS NOT NULL "
     "AND stage IN ('queued', 'claimed');",
-]
+])
 
 
 async def ensure_executor_runs_table() -> None:

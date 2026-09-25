@@ -41,6 +41,7 @@ from sqlalchemy import and_, func, select
 
 from config.settings import settings
 from db.database import database
+from db.schema_guard import guarded_statements, is_lock_timeout
 from db.accounts import (
     shop_users,
     shop_user_memberships,
@@ -148,13 +149,24 @@ async def _ensure_browse_history_schema() -> None:
     async with _browse_history_schema_lock:
         if _browse_history_schema_ready:
             return
-        statements = [
-            "ALTER TABLE shop_browse_history_events ADD COLUMN IF NOT EXISTS brand TEXT;",
-            "ALTER TABLE shop_browse_history_events ADD COLUMN IF NOT EXISTS category TEXT;",
-            "ALTER TABLE shop_browse_history_events ADD COLUMN IF NOT EXISTS product_type TEXT;",
-        ]
-        for statement in statements:
-            await database.execute(statement)
+        # Guarded (db/schema_guard.py): bare, this took the table's ACCESS EXCLUSIVE
+        # lock with no lock_timeout on the first browse-history call of every process,
+        # even with every column there. It now runs only while one is missing; one that
+        # cannot get its lock in time leaves the schema not-ready for the next call
+        # instead of failing this request, which the bare statement made wait instead.
+        try:
+            for statement in guarded_statements([
+                "ALTER TABLE shop_browse_history_events "
+                "ADD COLUMN IF NOT EXISTS brand TEXT, "
+                "ADD COLUMN IF NOT EXISTS category TEXT, "
+                "ADD COLUMN IF NOT EXISTS product_type TEXT;",
+            ]):
+                await database.execute(statement)
+        except Exception as exc:
+            if not is_lock_timeout(exc):
+                raise
+            logger.warning("browse history self-heal deferred to a later call: %s", exc)
+            return
         _browse_history_schema_ready = True
 
 
@@ -169,9 +181,13 @@ async def _mark_email_verified_best_effort(user_id: str) -> None:
     if not uid:
         return
     try:
-        await database.execute(
-            "ALTER TABLE shop_users ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMPTZ"
-        )
+        # Guarded (db/schema_guard.py): this runs on every sign-in, and bare it took
+        # shop_users' ACCESS EXCLUSIVE lock with no lock_timeout even with the column
+        # there. A lock timeout (column missing, table busy) returns like any failure.
+        for statement in guarded_statements(
+            ["ALTER TABLE shop_users ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMPTZ"]
+        ):
+            await database.execute(statement)
         await database.execute(
             "UPDATE shop_users SET email_verified_at = NOW() WHERE id = :id AND email_verified_at IS NULL",
             {"id": uid},
