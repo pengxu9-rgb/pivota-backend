@@ -422,7 +422,7 @@ def test_dry_run_predicts_the_skip_with_one_finder_query_per_brand_host(monkeypa
     [(sql, values)] = database.queries
     assert "lower(btrim(brand)) = lower(btrim(:brand))" in sql and "merchant_id <> :merchant_id" in sql
     assert values == {"brand": "A'PIEU", "merchant_id": plan["pdps"][0]["merchant_id"],
-                      "host": "first.example", "host_like": "%first.example%"}
+                      "host": "first.example", "host_url_re": aii.host_url_pattern("first.example")}
     # The plan verdict line the gate parses is untouched.
     assert '"status": "ready_to_apply"' in out
 
@@ -496,3 +496,18 @@ async def test_batch_row_rejected_before_bind_is_still_named(real_resolver):
     counts = await writer.apply_ingest_plan(plan, batch_label="t", db=CatalogDB(), batch=True)
     assert counts["skipped_products"] == [{"product_key": broken["product_key"], "reason": "insert_failed"}]
     assert counts["pdps"] == 1
+
+
+@pytest.mark.parametrize("url,match", [
+    ("https://palacebeauty.com/products/x", True),
+    ("http://www.palacebeauty.com", True),
+    ("https://PalaceBeauty.com:8443/x?y=1", True),
+    ("https://shoppalacebeauty.com/products/x", False),
+    ("https://palacebeauty.com.evil.io/x", False),
+    ("https://other.com/?r=palacebeauty.com", False),
+    ("https://palacebeautyxcom/x", False),
+])
+def test_host_url_pattern_anchors_on_the_url_host(url, match):
+    """Python's `re` agrees with a Postgres ARE on this subset; tests/test_brand_host_guard_postgres.py runs `~*`."""
+    import re
+    assert bool(re.search(aii.host_url_pattern("palacebeauty.com"), url, re.IGNORECASE)) is match

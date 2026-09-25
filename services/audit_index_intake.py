@@ -449,6 +449,18 @@ def brand_host_guard_key(fields: Dict[str, Any]) -> tuple:
     return brand, host
 
 
+def host_url_pattern(host: str) -> str:
+    """A Postgres regex matching a URL whose HOST is `host` (or `www.` + host), any scheme, port or path.
+
+    The finder used `canonical_url ILIKE '%host%'`, a substring: `palacebeauty.com` matched every
+    `shoppalacebeauty.com` URL, so a multi-brand ingest of palacebeauty.com was told its O HUI rows
+    conflict with another store's O HUI (2026-09-25, 25 rows at risk). Anchoring on the authority keeps
+    `www.` (which `_host` strips) and refuses suffix hosts and a host named only in a path or query.
+    Every non-alphanumeric character is backslash-escaped: in an ARE that is always a literal."""
+    escaped = "".join(ch if ch.isalnum() else "\\" + ch for ch in host.lower())
+    return rf"^https?://(www\.)?{escaped}([:/?#]|$)"
+
+
 async def _existing_brand_canonical_conflict(
     merchant_id: str, fields: Dict[str, Any], *, database: Any = None,
 ) -> Optional[Dict[str, Any]]:
@@ -471,7 +483,7 @@ async def _existing_brand_canonical_conflict(
         FROM catalog_products
         WHERE lower(btrim(brand)) = lower(btrim(:brand))
           AND merchant_id <> :merchant_id
-          AND (source_domain = :host OR canonical_url ILIKE :host_like)
+          AND (source_domain = :host OR canonical_url ~* :host_url_re)
           AND (pivota_signature_id IS NOT NULL OR merchant_id = 'external_seed')
           AND suppression_reason IS NULL
         LIMIT 1
@@ -480,7 +492,7 @@ async def _existing_brand_canonical_conflict(
             "brand": brand,
             "merchant_id": merchant_id,
             "host": host,
-            "host_like": f"%{host}%",
+            "host_url_re": host_url_pattern(host),
         },
     )
     return dict(row) if row else None
