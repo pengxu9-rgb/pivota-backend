@@ -3,7 +3,9 @@
 routes/debug_agent_key.py, routes/debug_agents_table.py and routes/create_test_agent.py were
 mounted only when DEBUG_MODE=true, with no auth at all: one returned agent@test.com's full
 api_key, one returned `SELECT * FROM agents` (api_key_hash, owner_email, metadata), and one
-wrote a plaintext ak_live_ key into a legacy-shaped agents row and returned it. They are deleted.
+wrote a plaintext ak_live_ key into a legacy-shaped agents row and returned it. (`SELECT *`
+also carried agents.api_key: a redacted marker in prod today, the plaintext key wherever it
+is not.) They are deleted.
 Neither prod nor staging sets DEBUG_MODE (checked 2026-09-25), so this pins the flag, not a
 deployment: turning it on for some unrelated debug router must not bring these back.
 
@@ -27,6 +29,7 @@ REMOVED_PATHS = {
 
 _LIST_ROUTES = """
 import json, main
+print("DEBUG_MODE=" + json.dumps(main.DEBUG_MODE))
 print("ROUTES=" + json.dumps(sorted({getattr(r, "path", "") for r in main.app.routes})))
 """
 
@@ -42,15 +45,18 @@ def _mounted_paths(debug_mode):
         timeout=300,
     )
     assert proc.returncode == 0, proc.stderr[-4000:]
-    line = next(l for l in proc.stdout.splitlines() if l.startswith("ROUTES="))
-    return set(json.loads(line[len("ROUTES="):]))
+    out = {}
+    for line in proc.stdout.splitlines():
+        for key in ("DEBUG_MODE=", "ROUTES="):
+            if line.startswith(key):
+                out[key] = json.loads(line[len(key):])
+    return out["DEBUG_MODE="], set(out["ROUTES="])
 
 
 def test_debug_mode_does_not_mount_the_agents_debug_routes():
-    paths = _mounted_paths("true")
-    # Positive control: DEBUG_MODE really took effect -- routes/debug_usage_logs.py, mounted only
-    # under it, is there. Without this, a subprocess that ignored the flag would pass vacuously.
-    assert any(p.startswith("/admin/debug/usage-logs") for p in paths), sorted(
-        p for p in paths if "debug" in p
-    )
+    debug_mode, paths = _mounted_paths("true")
+    # Positive control: main really read the flag as on. Without it, a subprocess that ignored
+    # DEBUG_MODE would pass vacuously. (Read from main itself, not inferred from some other debug
+    # router being mounted, so deleting the remaining debug routers cannot break this test.)
+    assert debug_mode is True
     assert not (paths & REMOVED_PATHS), sorted(paths & REMOVED_PATHS)
