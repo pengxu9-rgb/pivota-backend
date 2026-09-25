@@ -43,8 +43,12 @@ class LockServer:
     def __init__(self):
         self.holder = None
         self.sessions = []
+        self.connect_error = None  # opening the lock connection fails
+        self.try_error = None      # the try-lock statement fails
 
     async def connect(self):
+        if self.connect_error:
+            raise self.connect_error
         conn = FakeLockConnection(self)
         self.sessions.append(conn)
         return conn
@@ -58,6 +62,8 @@ class FakeLockConnection:
         assert not self.closed
         self.statements.append(sql)
         if "pg_try_advisory_lock" in sql:
+            if self.server.try_error:
+                raise self.server.try_error
             if self.server.holder in (None, self):
                 self.server.holder = self
                 return True
@@ -91,6 +97,14 @@ class Ledger:
         self.events = []  # ordering of the write marker vs the catalog write
 
     from db.retailer_ingest import CATALOG_WRITE_NOT_STARTED, CATALOG_WRITE_STARTED
+
+    async def consecutive_outcomes(self, job_id, outcomes, *, limit, db=None):
+        count = 0
+        for run in reversed([r for r in self.runs.values() if "outcome" in r][-limit:]):
+            if run["outcome"] not in outcomes:
+                break
+            count += 1
+        return count
 
     async def mark_write_started(self, run_id, db=None):
         import asyncio
@@ -546,6 +560,106 @@ async def test_a_busy_lock_never_runs_the_block_and_closes_its_session():
         async with catalog_write_lock(wait_s=0.03, poll_s=0.01, connect=server.connect):
             ran.append(True)
     assert ran == [] and server.sessions[1].closed and server.holder is holder
+
+
+# ------------------------------------------------------------------ the write deadline, lock errors, starvation
+
+async def test_no_time_left_for_the_write_means_no_marker_no_write_and_back_to_apply_due(env):
+    out = await pipeline.run_stage(job("apply_due"), db=env.db, time_left_s=pipeline.WRITE_MARGIN_S - 1)
+    assert out["outcome"] == "write_lock_busy" and out["status"] == "apply_due"
+    assert "no time left" in out["reason"]
+    assert env.ledger.events == [] and env.applied == []          # never marked, never written
+    assert env.ledger.lock_server.sessions == []                   # never even waited for the lock
+    t = env.ledger.transitions[-1]
+    assert t["status"] == "apply_due" and not t["count_attempt"] and t["next_run_at"] is not None
+    run = list(env.ledger.runs.values())[-1]
+    assert run["checks"]["catalog_write"] == "not_started" and run["checks"]["timings"]["write_lock_wait_s"] == 0.0
+
+
+async def test_the_lock_wait_is_cut_to_the_task_deadline(env, monkeypatch):
+    monkeypatch.setattr(pipeline, "WRITE_LOCK_WAIT_S", 1.0)
+    monkeypatch.setattr(pipeline, "WRITE_LOCK_POLL_S", 0.01)
+    other_apply = await env.ledger.lock_server.connect()
+    assert await other_apply.fetchval(_TRY)
+    out = await pipeline.run_stage(job("apply_due"), db=env.db, time_left_s=pipeline.WRITE_MARGIN_S + 0.1)
+    assert out["outcome"] == "write_lock_busy" and env.ledger.events == [] and env.applied == []
+    [wait] = env.ledger.lock_waits
+    assert 0 < wait["wait_s"] <= 0.1  # the deadline, not WRITE_LOCK_WAIT_S
+    assert list(env.ledger.runs.values())[-1]["checks"]["timings"]["write_lock_wait_s"] < 0.5
+
+
+async def test_with_time_to_spare_the_wait_is_the_full_wait(env):
+    out = await pipeline.run_stage(job("apply_due"), db=env.db, time_left_s=3600)
+    assert out["outcome"] == "applied" and env.ledger.lock_waits[0]["wait_s"] == pipeline.WRITE_LOCK_WAIT_S
+
+
+@pytest.mark.parametrize("where", ["connect", "try_lock"])
+async def test_a_lock_connection_failure_is_retried_not_failed(env, where):
+    if where == "connect":
+        env.ledger.lock_server.connect_error = ConnectionRefusedError("db proxy down")
+    else:
+        env.ledger.lock_server.try_error = OSError("connection reset")
+    out = await pipeline.run_stage(job("apply_due"), db=env.db)
+    assert out["outcome"] == "write_lock_unavailable" and out["status"] == "apply_due"
+    assert ("ConnectionRefusedError" if where == "connect" else "OSError") in out["reason"]
+    assert env.ledger.events == [] and env.applied == []
+    t = env.ledger.transitions[-1]
+    assert t["status"] == "apply_due" and not t["count_attempt"] and t["next_run_at"] is not None
+    assert list(env.ledger.runs.values())[-1]["checks"]["catalog_write"] == "not_started"
+    assert all(s.closed for s in env.ledger.lock_server.sessions)
+
+
+async def test_every_apply_that_ends_before_its_write_records_that_nothing_was_written(env):
+    # finish_run replaces the run's checks: the not_started evidence start_run wrote must survive it
+    env.crawl_error = feed.CrawlIncomplete("x: HTTP 429", status="failed", next_page=1, scanned_products=0,
+                                           selected_products=0)
+    await pipeline.run_stage(job("apply_due"), db=env.db)   # stopped in its crawl
+    assert list(env.ledger.runs.values())[-1]["checks"]["catalog_write"] == "not_started"
+    env.crawl_error, env.rows = None, [TINT, TONE_UP]
+    assert (await pipeline.run_stage(job("apply_due"), db=env.db))["outcome"] == "held"  # held by a new flag
+    assert list(env.ledger.runs.values())[-1]["checks"]["catalog_write"] == "not_started"
+    await pipeline.run_stage(job(), db=env.db)              # a dry run carries no write marker
+    assert "catalog_write" not in list(env.ledger.runs.values())[-1]["checks"]
+
+
+def _prior_runs(env, outcomes):
+    for i, outcome in enumerate(outcomes):
+        env.ledger.runs[f"prior{i}"] = {"job_id": "rij_1", "stage": "apply", "outcome": outcome}
+
+
+class _Warnings:
+    def __init__(self):
+        self.lines = []
+
+    def warning(self, msg, *args):
+        self.lines.append(msg % args)
+
+
+@pytest.mark.parametrize("prior, starved", [
+    (["write_lock_busy"] * (pipeline.WRITE_LOCK_STARVED_AFTER - 1), True),
+    (["write_lock_busy", "write_lock_unavailable"] * 5 + ["write_lock_busy"], True),  # both kinds count
+    (["write_lock_busy"] * (pipeline.WRITE_LOCK_STARVED_AFTER - 2), False),
+    # a streak broken by any other outcome starts again (a hold that was approved breaks it too)
+    (["write_lock_busy"] * 20 + ["write_lock_starved"] + ["write_lock_busy"] * 3, False),
+    (["write_lock_busy"] * 20 + ["clean"], False),
+])
+async def test_consecutive_busy_applies_hold_the_job_and_warn_at_the_threshold(env, monkeypatch, prior, starved):
+    warnings = _Warnings()
+    monkeypatch.setattr(pipeline, "logger", warnings)
+    monkeypatch.setattr(pipeline, "WRITE_LOCK_WAIT_S", 0.02)
+    monkeypatch.setattr(pipeline, "WRITE_LOCK_POLL_S", 0.01)
+    _prior_runs(env, prior)
+    other_apply = await env.ledger.lock_server.connect()
+    assert await other_apply.fetchval(_TRY)
+    out = await pipeline.run_stage(job("apply_due"), db=env.db)
+    assert env.applied == [] and env.ledger.events == []
+    t = env.ledger.transitions[-1]
+    assert not t["count_attempt"]
+    if starved:
+        assert out["outcome"] == "write_lock_starved" and out["status"] == "held" and t["status"] == "held"
+        assert len(warnings.lines) == 1 and "rij_1" in warnings.lines[0]
+    else:
+        assert out["outcome"] == "write_lock_busy" and out["status"] == "apply_due" and warnings.lines == []
 
 
 async def test_cohort_level_flags_cannot_be_accepted(env, monkeypatch):

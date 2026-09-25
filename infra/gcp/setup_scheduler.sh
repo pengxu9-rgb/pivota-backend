@@ -923,13 +923,25 @@ sched commerce-index-insight-refresh-cron "*/10 * * * *" commerce-index-insight-
 # 10 minutes is SHORTER than the 3600s task timeout, and Cloud Run starts a new execution whether
 # or not the last one is still running. That is safe only because claim_due_job()
 # (db/retailer_ingest.py) caps the leases in flight at RETAILER_INGEST_MAX_LEASES (unset = 1: a tick
-# that lands during a long stage exits idle) and never leases a host that already holds one, nor a
-# second apply. Remove those clauses and this cadence becomes N crawls in flight, some at one store.
+# that lands during a long stage exits idle) and never leases a host that already holds one. Remove
+# those clauses and this cadence becomes N crawls in flight, some at one store. Two APPLIES at
+# different hosts may be in flight (#2330): only their catalog writes are serial, under the advisory
+# lock db.retailer_ingest.catalog_write_lock that each apply holds around apply_ingest_plan alone.
 # RETAILER_INGEST_MAX_LEASES in the --set-env-vars above is the lane count, a literal like the budget
 # and timeout (never a script input: a leftover shell value must not reach the job). Arming more
 # lanes is a reviewed change to that literal, so a re-run keeps what is committed and cannot quietly
-# undo or exceed it. 2026-09-25: armed at 2 (Peng) -- two stages in flight, never two at one host, never
-# two applies; watch crawl_throttled before raising it (every lane shares the one crawl NAT).
+# undo or exceed it. 2026-09-25: armed at 2 (Peng) -- two stages in flight, never two at one host;
+# watch crawl_throttled before raising it (every lane shares the one crawl NAT).
+#
+# ⚠️ RE-IMAGING THE DRAIN ACROSS #2330 (or any change to how applies serialize) IS A DRAINED ROLL.
+# An image from before #2330 writes WITHOUT the catalog write lock and relies on the old claim rule
+# (no second apply while one is leased); a newer image's apply does not wait for it. During a roll,
+# an old-image execution and a new-image one can therefore write the catalog at once. So:
+#   1. pause:   gcloud scheduler jobs pause retailer-ingest-drain-cron --location us-west1 --project pivota-prod
+#   2. wait until no stage is in flight: no row with lease_until > now() in retailer_ingest_jobs, or
+#      every running retailer-ingest-drain execution has finished (gcloud run jobs executions list)
+#   3. roll the image (this script, or gcloud run jobs update --image)
+#   4. resume:  gcloud scheduler jobs resume retailer-ingest-drain-cron --location us-west1 --project pivota-prod
 sched retailer-ingest-drain-cron "*/10 * * * *" retailer-ingest-drain "$RUN_INVOKER" 1
 if [ "$STORE_AUDIT_UCP_REPROBE_WORKER" = true ]; then
   for job in store-audit-ucp-reprobe-enqueue store-audit-ucp-probe; do

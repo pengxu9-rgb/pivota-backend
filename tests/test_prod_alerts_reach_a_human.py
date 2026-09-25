@@ -252,7 +252,7 @@ def _summary_line(monkeypatch, capsys, stage, counts) -> str:
     async def _claim(**kw):
         return None if stage is None else {"id": "rij_1", "status": "queued"}
 
-    async def _run_stage(job, *, db):
+    async def _run_stage(job, *, db, time_left_s=None):
         return dict(stage)
 
     async def _counts(**kw):
@@ -279,6 +279,9 @@ HELD = [
     (None, {"held": 1, "queued": 4}),
     (None, {"held": 12}),
     ({"job_id": "rij_2", "stage": "apply", "outcome": "applied", "status": "done"}, {"done": 3, "held": 2}),
+    # WRITE_LOCK_STARVED_AFTER applies in a row ended before the catalog write: held, so it alerts
+    ({"job_id": "rij_1", "stage": "apply", "outcome": "write_lock_starved", "status": "held",
+      "reason": "12 applies in a row ended before the catalog write, nothing written"}, {"held": 1}),
 ]
 FAILED = [
     ({"job_id": "rij_1", "stage": "apply", "outcome": "apply_refused", "status": "failed"}, {"failed": 1}),
@@ -298,6 +301,9 @@ QUIET = [
     # another apply held the catalog write lock: nothing written, retried shortly -- not a failure
     ({"job_id": "rij_1", "stage": "apply", "outcome": "write_lock_busy", "status": "apply_due",
       "reason": "catalog write lock busy for 600s (another apply is writing); nothing written, retry in 120s"},
+     {"apply_due": 3}),
+    ({"job_id": "rij_1", "stage": "apply", "outcome": "write_lock_unavailable", "status": "apply_due",
+      "reason": "catalog write lock unavailable (ConnectionRefusedError); nothing written, retry in 120s"},
      {"apply_due": 3}),
 ]
 

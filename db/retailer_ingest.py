@@ -174,6 +174,15 @@ class CatalogWriteLockBusy(Exception):
         self.waited_s = waited_s
 
 
+class CatalogWriteLockUnavailable(Exception):
+    """The lock connection could not be opened, or a try-lock failed, before the lock was held:
+    nothing was written, so the caller retries rather than failing the job."""
+
+    def __init__(self, cause: BaseException):
+        self.error_type = type(cause).__name__
+        super().__init__(f"catalog write lock unavailable: {self.error_type}")
+
+
 async def _open_lock_connection() -> Any:
     """A DEDICATED raw asyncpg connection, never a pool connection: `databases` 0.7 shares one
     Connection across a task and its child tasks, so a session lock taken through the pool handle
@@ -216,10 +225,20 @@ async def catalog_write_lock(*, wait_s: float, poll_s: float = 5.0,
     CatalogWriteLockBusy, and the block never runs. The lock is released on every path: unlocked
     explicitly, then the connection is closed (or terminated), which releases it even when the
     unlock did not run or failed."""
-    conn = await (connect or _open_lock_connection)()
+    try:
+        conn = await (connect or _open_lock_connection)()
+    except Exception as exc:  # not BaseException: a cancellation stays a cancellation
+        raise CatalogWriteLockUnavailable(exc) from exc
     try:
         started = clock()
-        while not await asyncio.wait_for(conn.fetchval(_CATALOG_WRITE_TRY_SQL), timeout=_LOCK_STATEMENT_TIMEOUT_S):
+        while True:
+            try:
+                acquired = await asyncio.wait_for(conn.fetchval(_CATALOG_WRITE_TRY_SQL),
+                                                  timeout=_LOCK_STATEMENT_TIMEOUT_S)
+            except Exception as exc:
+                raise CatalogWriteLockUnavailable(exc) from exc
+            if acquired:
+                break
             waited = clock() - started
             if waited >= wait_s:
                 raise CatalogWriteLockBusy(waited)
@@ -425,6 +444,27 @@ async def job_runs(job_id: str, *, db: Any = None) -> List[Dict[str, Any]]:
     rows = await read_db.fetch_all(
         "SELECT * FROM retailer_ingest_runs WHERE job_id = :id ORDER BY started_at DESC", {"id": job_id})
     return [dict(r) for r in rows]
+
+
+_RECENT_OUTCOMES_SQL = """
+    SELECT outcome FROM retailer_ingest_runs
+    WHERE job_id = :id AND finished_at IS NOT NULL
+    ORDER BY started_at DESC, id DESC
+    LIMIT :n
+"""
+
+
+async def consecutive_outcomes(job_id: str, outcomes: Any, *, limit: int, db: Any = None) -> int:
+    """How many of the job's most recent FINISHED runs, newest first and without a break, ended in
+    one of `outcomes` (at most `limit`). Derived from the ledger itself, so it survives executions."""
+    read_db = db or database
+    rows = await read_db.fetch_all(_RECENT_OUTCOMES_SQL, {"id": job_id, "n": int(limit)})
+    count = 0
+    for row in rows:
+        if row["outcome"] not in outcomes:
+            break
+        count += 1
+    return count
 
 
 async def unfinished_run(job_id: str, *, db: Any = None) -> Optional[Dict[str, Any]]:

@@ -480,6 +480,18 @@ async def test_an_apply_run_carries_its_write_marker_until_the_write_starts(db):
     assert (await ledger.unfinished_run(old, db=db))["catalog_write"] is None
 
 
+async def test_consecutive_outcomes_counts_the_newest_finished_streak(db):
+    job_id = await _enqueue(db, brand="STREAK", options={"vendors": ["X"]})
+    busy = ("write_lock_busy", "write_lock_unavailable")
+    for outcome in ["clean", "write_lock_starved", "write_lock_busy", "write_lock_unavailable", "write_lock_busy"]:
+        run_id = await ledger.start_run(job_id=job_id, stage="apply", image_sha=None, execution=None, db=db)
+        await ledger.finish_run(run_id, outcome=outcome, db=db)
+    await ledger.start_run(job_id=job_id, stage="apply", image_sha=None, execution=None, db=db)  # running now
+    assert await ledger.consecutive_outcomes(job_id, busy, limit=12, db=db) == 3  # the starved hold breaks it
+    assert await ledger.consecutive_outcomes(job_id, busy, limit=2, db=db) == 2
+    assert await ledger.consecutive_outcomes(job_id, ("clean",), limit=12, db=db) == 0
+
+
 async def test_approve_validates_and_is_null_safe(db):
     job_id = await _enqueue(db, brand="NULLS", options={"vendors": ["X"], "exclude_handles": None})
     await ledger.transition(job_id, status="held", reason="flag", run_id=None, db=db)
