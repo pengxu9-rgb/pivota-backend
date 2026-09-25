@@ -39,6 +39,7 @@ async def _run(
     graphql_side_effect=None,
     token="tok",
     stores_side_effect=None,
+    actor_kind=None,
 ):
     from services.shopify_content_writeback import publish_content_to_store
     if graphql_side_effect is not None:
@@ -54,9 +55,15 @@ async def _run(
          patch("services.shopify_access_token_service.resolve_shopify_admin_access_token",
                new=AsyncMock(return_value=(token, {}))), \
          patch("services.shopify_graphql_client.shopify_admin_graphql", new=gql):
+        # actor_kind is REQUIRED by publish_content_to_store: the only write to a
+        # merchant's live store must not inherit "approved" from an omitted argument.
+        # These cases exercise the human-asked path; the model path has its own tests
+        # in tests/services/test_merchant_write_guardrails_wiring.py.
+        from services.merchant_write_guardrails import ACTOR_HUMAN
         res = await publish_content_to_store(
             merchant_id="m1", platform=platform, platform_product_id="p1",
-            enrichment=enrichment)
+            enrichment=enrichment,
+            actor_kind=actor_kind if actor_kind is not None else ACTOR_HUMAN)
     return res, gql
 
 

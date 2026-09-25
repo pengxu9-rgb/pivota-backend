@@ -298,10 +298,21 @@ def test_ensure_route_activates_pixel_without_returning_tokens(monkeypatch):
         "issue_shopify_pixel_token",
         lambda **_kwargs: {
             "token": "collector-secret",
+            "jti": "ct_fake",
             "expires_at": "2026-12-01T00:00:00Z",
+            "renewal_due_at": "2026-11-01T00:00:00Z",
         },
     )
     monkeypatch.setattr(route, "ensure_shopify_web_pixel", fake_ensure)
+
+    async def fake_version(_store_id):
+        return 1
+
+    async def fake_register(**kwargs):
+        return kwargs
+
+    monkeypatch.setattr(route, "current_store_token_version", fake_version)
+    monkeypatch.setattr(route, "register_issued_token", fake_register)
     response = TestClient(
         _route_app({"role": "merchant", "merchant_id": "merchant_1"})
     ).post(

@@ -79,6 +79,7 @@ async def run_settlement(billing_run_id: int) -> int:
     )
 
     payout_count = 0
+    settled_partner_ids: list[int] = []
     for partner_row in partner_rows:
         channel_partner_id = int(_row_get(partner_row, "channel_partner_id"))
         if settings.partner_rev_share_use_v2:
@@ -98,6 +99,7 @@ async def run_settlement(billing_run_id: int) -> int:
             channel_partner_id,
             comp_dict,
         )
+        settled_partner_ids.append(channel_partner_id)
 
         # When the v2 flag is on, the settlement_file pipeline (PR #8 — the
         # day-5 generate + day-10 Stripe Connect transfer crons) handles
@@ -128,6 +130,9 @@ async def run_settlement(billing_run_id: int) -> int:
         if payout_id is not None:
             payout_count += 1
 
+    # Only reached once every selected partner has its snapshot for this run. Agent share accrual
+    # waits for this row before deducting what partners were paid (ADR-025 D5, review of #2275).
+    await record_settlement_completion(billing_run_id, settled_partner_ids)
     return payout_count
 
 
@@ -158,11 +163,11 @@ async def compute_partner_comp(
         channel_partner_id,
         period_start,
     )
-    gmv_take_by_merchant = await _gmv_take_revenue_by_merchant(
-        channel_partner_id,
-        period_start,
-        period_end,
-    )
+    # ONE read gives both what the partner is paid on and which GMV invoice credits that already
+    # nets, so a credit issued mid-settlement is either in both or in neither: never netted here
+    # and clawed back again (services/gmv_invoice_credits.reconcile_partner), nor in neither.
+    gmv_rows = await _gmv_take_rows(channel_partner_id, period_start, period_end)
+    gmv_take_by_merchant = _gmv_take_by_merchant_from_rows(gmv_rows)
     attributed_merchants = await _attributed_merchants(channel_partner_id)
 
     merchant_ids = sorted(
@@ -248,10 +253,82 @@ async def compute_partner_comp(
         "clawbacks": clawbacks,
         "net_comp_cents": net_comp_cents,
         "merchant_accruals": merchant_accruals,
+        # What services.gmv_invoice_credits.reconcile_partner reads: the rollup rows this
+        # settlement paid the partner on, and the issued credits it already netted out of them.
+        "gmv_rollup_ids_counted": sorted(int(r["rollup_id"]) for r in gmv_rows),
+        "netted_invoice_credit_ids": sorted(
+            int(credit_id) for r in gmv_rows for credit_id in (r.get("credit_ids") or [])
+        ),
         "commission_config": config,
         "period_start": period_start.isoformat(),
         "period_end": period_end.isoformat(),
     }
+
+
+# ── what a partner was actually paid, for agent share accrual (ADR-025 D5) ────────────────────
+
+_RECORD_SETTLEMENT_COMPLETION_SQL = """
+INSERT INTO partner_settlement_completions (billing_run_id, partner_ids, engine, completed_at)
+VALUES (:billing_run_id, CAST(:partner_ids AS JSONB), :engine, NOW())
+ON CONFLICT (billing_run_id) DO NOTHING
+"""
+_SETTLEMENT_COMPLETION_SQL = """
+SELECT billing_run_id FROM partner_settlement_completions WHERE billing_run_id = :billing_run_id
+"""
+_SNAPSHOTS_FOR_RUN_SQL = """
+SELECT channel_partner_id, snapshot_payload_jsonb FROM settlement_snapshots
+WHERE billing_run_id = :billing_run_id
+ORDER BY channel_partner_id
+"""
+
+
+async def record_settlement_completion(billing_run_id: int, partner_ids: list[int]) -> None:
+    """Mark a billing run's partner settlement complete. Idempotent; never updated afterwards."""
+    await database.execute(
+        _RECORD_SETTLEMENT_COMPLETION_SQL,
+        {
+            "billing_run_id": billing_run_id,
+            "partner_ids": json.dumps(sorted(int(p) for p in partner_ids)),
+            "engine": "v2" if settings.partner_rev_share_use_v2 else "v1",
+        },
+    )
+
+
+def merchant_gmv_share_cents(snapshot_payload: Any, merchant_id: str) -> int:
+    """A partner's GMV-take share for one merchant, from a settlement snapshot of EITHER engine.
+
+    v1 (compute_partner_comp) records it as merchant_accruals[m]["gmv_take_rev_cents"], and v2
+    (partner_rev_share_engine_v2) as ["gmv_share_cents"]. This is the gross share, before subsidy
+    caps and clawbacks, which only lower what is paid.
+    """
+    payload = _coerce_json(snapshot_payload)
+    accrual = (payload.get("merchant_accruals") or {}).get(str(merchant_id)) or {}
+    if not isinstance(accrual, dict):
+        return 0
+    value = accrual.get("gmv_share_cents", accrual.get("gmv_take_rev_cents"))
+    return max(_as_int(value), 0)
+
+
+async def settled_partner_gmv_share(billing_run_id: int, merchant_id: str) -> Optional[dict[str, Any]]:
+    """What channel partners were PAID from one merchant's GMV take in one billing run.
+
+    Returns None until the run's partner settlement has COMPLETED (partner_settlement_completions),
+    else {"partner_ids": [partners paid anything for this merchant], "settled_cents": total}, summed
+    over every snapshot of the run. Both halves are fixed once settlement completes, whichever engine
+    (v1 or v2) wrote the snapshots and whatever attributions change later: settlement never re-runs
+    a run (a second run_settlement raises SettlementAlreadyExistsError). A partner attributed after
+    settlement therefore cannot re-price a line already accrued (review of #2275).
+    """
+    if await database.fetch_one(_SETTLEMENT_COMPLETION_SQL, {"billing_run_id": billing_run_id}) is None:
+        return None
+    total = 0
+    paid_partners: list[int] = []
+    for row in await database.fetch_all(_SNAPSHOTS_FOR_RUN_SQL, {"billing_run_id": billing_run_id}):
+        cents = merchant_gmv_share_cents(_row_get(row, "snapshot_payload_jsonb"), merchant_id)
+        if cents > 0:
+            paid_partners.append(int(_row_get(row, "channel_partner_id")))
+            total += cents
+    return {"partner_ids": paid_partners, "settled_cents": total}
 
 
 async def write_settlement_snapshot(
@@ -631,15 +708,24 @@ async def _subscription_revenue_by_merchant(
     }
 
 
-async def _gmv_take_revenue_by_merchant(
+async def _gmv_take_rows(
     channel_partner_id: int,
     period_start: date,
     period_end: date,
-) -> dict[str, int]:
+) -> list[dict[str, Any]]:
+    """The partner's GMV rollup rows on paid invoices, each net of the GMV invoice credits issued
+    against it (services/gmv_invoice_credits.py): a credit gave that take back to the merchant."""
     rows = await database.fetch_all(
         """
-        SELECT gad.merchant_id, COALESCE(SUM(gad.take_amount_cents), 0) AS revenue_cents
+        SELECT gad.id AS rollup_id, gad.merchant_id, gad.take_amount_cents,
+               COALESCE(cr.credited_cents, 0) AS credited_cents, cr.credit_ids
         FROM gmv_attribution_daily gad
+        LEFT JOIN (
+          SELECT rollup_id, SUM(amount_cents) AS credited_cents, array_agg(id ORDER BY id) AS credit_ids
+          FROM gmv_invoice_credits
+          WHERE status = 'issued'
+          GROUP BY rollup_id
+        ) cr ON cr.rollup_id = gad.id
         WHERE gad.channel_partner_id = :channel_partner_id
           AND gad.date BETWEEN :period_start AND :period_end
           AND EXISTS (
@@ -650,7 +736,7 @@ async def _gmv_take_revenue_by_merchant(
               AND gad.date <= i.billing_period_end
               AND i.status = 'paid'
           )
-        GROUP BY gad.merchant_id
+        ORDER BY gad.id
         """,
         {
             "channel_partner_id": channel_partner_id,
@@ -658,10 +744,16 @@ async def _gmv_take_revenue_by_merchant(
             "period_end": period_end,
         },
     )
-    return {
-        str(_row_get(row, "merchant_id")): _as_int(_row_get(row, "revenue_cents"))
-        for row in rows
-    }
+    return [dict(row) for row in rows]
+
+
+def _gmv_take_by_merchant_from_rows(rows: list[dict[str, Any]]) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for row in rows:
+        merchant_id = str(row["merchant_id"])
+        net = max(_as_int(row["take_amount_cents"]) - _as_int(row["credited_cents"]), 0)
+        out[merchant_id] = out.get(merchant_id, 0) + net
+    return out
 
 
 async def _credit_overage_for_partner(

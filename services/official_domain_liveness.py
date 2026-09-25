@@ -37,19 +37,15 @@ ENABLED defaults on). The host must pass `brand_claim_service.
 is_valid_public_hostname` first, which rejects bare IP literals, `localhost`
 and single-label names.
 
-KNOWN GAP (not yet closed; the sweep has no caller, so nothing reaches this):
-that validator does NOT reject a name that RESOLVES to a private address —
-`127.0.0.1.nip.io`, `169.254.169.254.nip.io` and `metadata.google.internal`
-all pass it — and `follow_redirects=True` does not validate the redirect
-target, so a public host can 302 to a link-local address. Rows reach here from
-`merchant_onboarding.store_url`, which merchants control. Address-family
-validation after resolution, plus a redirect-target check, are owed before
-this sweep is registered anywhere.
+Scheduled probes pin public addresses for apex AND robots requests, including
+redirect hops, using PublicHTTPSTransport. A private target, DNS failure or
+oversized response is unverifiable; it never establishes that a domain is dead.
 """
 
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import time
 from dataclasses import dataclass
@@ -57,6 +53,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Iterable, Optional
 
 import httpx
+from services.public_https_transport import PublicHTTPSTransport
 
 from db import merchant_official_domains as mod
 from services import crawl_politeness
@@ -76,6 +73,14 @@ UNCHECKED = mod.LIVENESS_UNCHECKED
 HTTP_TIMEOUT_SECONDS = 12.0
 DNS_TIMEOUT_SECONDS = 5.0
 
+# HTTP_TIMEOUT_SECONDS is PER HOP and httpx applies it afresh to each redirect:
+# 12s x (max_redirects=5 + 1) is 72 seconds for ONE domain, inside a sweep the
+# scheduler gives run_deadline_seconds=60. One host redirecting slowly in a
+# loop would eat the whole window and starve every domain behind it. This bounds
+# the entire chain; PublicHTTPSTransport enforces it and a chain that runs out
+# raises, which classify_host_liveness reads as `unverifiable` — never as dead.
+HTTP_TOTAL_TIMEOUT_SECONDS = 25.0
+
 # How long a liveness verdict stands before the sweep re-asks. A week: the
 # consumer is a BD report, not a checkout, and a domain that goes dark is
 # caught inside the same reporting cycle. It also keeps the probe volume at one
@@ -90,10 +95,8 @@ DEFAULT_SWEEP_LIMIT = 100
 # round number: DEFAULT_SWEEP_LIMIT (100) domains, each at most one DNS lookup
 # (DNS_TIMEOUT_SECONDS=5) plus one HTTP GET (HTTP_TIMEOUT_SECONDS=12) plus the
 # politeness gate's default minimum interval (~1s) => ~1,800s worst case. The
-# sweep enforces this itself, in-process, because it is NOT registered with
-# services/audit_scheduler.py yet — when it is, this value is the
-# `_JOB_RUN_DEADLINES` entry to add, and the scheduler's own guard test will
-# refuse the registration without one.
+# sweep enforces this itself. The scheduler's bounded tick uses a smaller
+# batch and its own 180-second outer deadline.
 DEFAULT_RUN_DEADLINE_SECONDS = 1800.0
 
 
@@ -226,6 +229,7 @@ async def probe_host_liveness(
     client: Optional[httpx.AsyncClient] = None,
     resolver: Optional[Callable[[str], Optional[bool]]] = None,
     max_wait: Optional[float] = 0,
+    dns_only: bool = False,
 ) -> HostLiveness:
     """DNS first, then ONE politeness-gated GET of `https://<host>/`.
 
@@ -246,7 +250,23 @@ async def probe_host_liveness(
     if dns_resolved is False:
         return classify_host_liveness(dns_resolved=False)
 
+    if dns_only:
+        return classify_host_liveness(dns_resolved=dns_resolved, transport_error="dns_only_http_not_checked")
+
     url = f"https://{normalized}/"
+    # THE CHAIN BUDGET HAS TO TRAVEL WITH THE FACTORY. crawl_politeness calls
+    # whatever this ContextVar holds with NO arguments, so handing it the bare
+    # class gave the robots.txt fetch PublicHTTPSTransport's own default
+    # (DEFAULT_TOTAL_TIMEOUT_SECONDS = 30s) while this caller had chosen 25s
+    # for the apex GET two statements below — the robots fetch, which happens
+    # FIRST, could outlast the budget the whole probe was bounded by. The
+    # sweep's per-domain deadline is what keeps a slow host from starving the
+    # 100 domains behind it, so the looser number is the one that decides.
+    token = crawl_politeness.ROBOTS_TRANSPORT_FACTORY.set(
+        functools.partial(
+            PublicHTTPSTransport, total_timeout=HTTP_TOTAL_TIMEOUT_SECONDS
+        )
+    )
     try:
         await crawl_politeness.before_request(url, user_agent=USER_AGENT, max_wait=max_wait)
     except crawl_politeness.RobotsDisallowed:
@@ -259,9 +279,16 @@ async def probe_host_liveness(
             dns_resolved=dns_resolved, transport_error=type(exc).__name__
         )
 
+    finally:
+        crawl_politeness.ROBOTS_TRANSPORT_FACTORY.reset(token)
+
     owns_client = client is None
     client = client or httpx.AsyncClient(
-        timeout=HTTP_TIMEOUT_SECONDS, follow_redirects=True
+        timeout=HTTP_TIMEOUT_SECONDS, follow_redirects=True, max_redirects=5,
+        transport=PublicHTTPSTransport(
+            total_timeout=HTTP_TOTAL_TIMEOUT_SECONDS,
+        ),
+        trust_env=False
     )
     try:
         resp = await client.get(url, headers={"User-Agent": USER_AGENT})
@@ -286,7 +313,7 @@ async def probe_host_liveness(
 
 # --------------------------------------------------------------------------- sweep
 
-async def seed_inferred_domains(merchant_id: str, *, now: Optional[datetime] = None) -> int:
+async def seed_inferred_domains(merchant_id: str, *, now: Optional[datetime] = None, strict: bool = False) -> int:
     """Give the inferred tier rows the sweep can actually check.
 
     Without this the sweep only ever sees domains someone asserted, and the
@@ -296,21 +323,51 @@ async def seed_inferred_domains(merchant_id: str, *, now: Optional[datetime] = N
     it grants nothing that inference did not already grant. It only makes the
     domain addressable by a liveness verdict.
 
-    Existing rows are left alone. `upsert_official_domain` would otherwise
-    rewrite an asserted/verified row's source back down to `inferred` and blank
-    the verdict a previous run recorded.
+    Existing rows are left alone -- with ONE exception. `upsert_official_domain`
+    would otherwise rewrite an asserted/verified row's source back down to
+    `inferred` and blank the verdict a previous run recorded.
+
+    The exception is a `declared` row whose host inference now produces. The
+    declare guard refuses a host already inferred, but that covers only the
+    order in which inference came FIRST: declare anua.us, then ingest the
+    catalog that carries it, and the row is `declared` while the inferred
+    branch counts the host official. The due-queues skip `declared` and the
+    audit basis drops it, so the host could never be measured dead. Promoting
+    it to `inferred` here makes the row what it would have been had inference
+    come first; it grants nothing, because the host was already in the used
+    set. Counted in the return value: it is a row the sweep can now check.
     """
     from services.brand_claim_service import _inferred_merchant_hosts
 
     if not merchant_id:
         return 0
-    hosts = await _inferred_merchant_hosts(merchant_id)
+    hosts = await _inferred_merchant_hosts(merchant_id, strict=True) if strict else await _inferred_merchant_hosts(merchant_id)
     if not hosts:
         return 0
-    known = {str(r.get("domain") or "") for r in await mod.list_official_domains(merchant_id)}
+    # STRICT. This read decides what the loop below WRITES: an empty `known` on a DB blip
+    # would send every inferred host to the upsert, whose `source = excluded.source` and
+    # liveness COALESCE turn a `verified`/`dead` row into `inferred`/`unchecked` -- a dead
+    # domain back in the official set, the UCP fence losing the merchant, and the
+    # cross-tenant guard losing its proof. Reproduced against the real table. A seeder that
+    # cannot see what exists must not write; it logs and seeds nothing this run.
+    try:
+        known = {
+            str(r.get("domain") or ""): str(r.get("source") or "")
+            for r in await mod.list_official_domains(merchant_id, strict=True)
+        }
+    except Exception as exc:  # noqa: BLE001 -- fails CLOSED: no known-set, no writes
+        if strict:
+            raise
+        logger.warning("seed_inferred_domains: could not read the stored set for %s, seeding nothing: %s",
+                       merchant_id, str(exc)[:200])
+        return 0
     seeded = 0
     for host in sorted(hosts):
         if host in known:
+            if known[host] == mod.SOURCE_DECLARED and await mod.promote_declared_to_inferred(
+                merchant_id=merchant_id, domain=host, now=now,
+            ):
+                seeded += 1
             continue
         if await mod.upsert_official_domain(
             merchant_id=merchant_id,
@@ -326,6 +383,7 @@ async def seed_inferred_domains(merchant_id: str, *, now: Optional[datetime] = N
 async def refresh_official_domain_liveness(
     merchant_id: Optional[str] = None,
     *,
+    dns_only: bool = False,
     limit: int = DEFAULT_SWEEP_LIMIT,
     ttl: timedelta = LIVENESS_TTL,
     run_deadline_seconds: float = DEFAULT_RUN_DEADLINE_SECONDS,
@@ -356,6 +414,7 @@ async def refresh_official_domain_liveness(
         "due": 0,
         "checked": 0,
         "seeded": 0,
+        "seed_failed": False,
         "deadline_hit": False,
         "verdicts": {LIVE: 0, DEAD: 0, UNVERIFIABLE: 0},
     }
@@ -364,7 +423,11 @@ async def refresh_official_domain_liveness(
     # merchant to infer for without walking every merchant in the catalog, which
     # is a different job with a different budget — it sweeps the rows that exist.
     if merchant_id and seed_inferred:
-        summary["seeded"] = await seed_inferred_domains(merchant_id, now=now)
+        try:
+            summary["seeded"] = await seed_inferred_domains(merchant_id, now=now, strict=True)
+        except Exception:
+            summary["seed_failed"] = True
+            logger.warning("official-domain seed failed", exc_info=True)
 
     due = await mod.list_domains_due_for_liveness(
         ttl=ttl, limit=limit, merchant_id=merchant_id, now=now
@@ -375,7 +438,11 @@ async def refresh_official_domain_liveness(
 
     owns_client = client is None
     client = client or httpx.AsyncClient(
-        timeout=HTTP_TIMEOUT_SECONDS, follow_redirects=True
+        timeout=HTTP_TIMEOUT_SECONDS, follow_redirects=True, max_redirects=5,
+        transport=PublicHTTPSTransport(
+            total_timeout=HTTP_TOTAL_TIMEOUT_SECONDS,
+        ),
+        trust_env=False
     )
     try:
         for row in due:
@@ -393,7 +460,7 @@ async def refresh_official_domain_liveness(
             if not row_merchant or not domain:
                 continue
             observation = await probe_host_liveness(
-                domain, client=client, resolver=resolver
+                domain, client=client, resolver=resolver, **({"dns_only": True} if dns_only else {})
             )
             summary["checked"] += 1
             summary["verdicts"][observation.status] = (
@@ -425,6 +492,7 @@ __all__: Iterable[str] = (
     "DEAD",
     "DEFAULT_RUN_DEADLINE_SECONDS",
     "DEFAULT_SWEEP_LIMIT",
+    "HTTP_TOTAL_TIMEOUT_SECONDS",
     "HostLiveness",
     "LIVE",
     "LIVENESS_TTL",

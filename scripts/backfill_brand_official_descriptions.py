@@ -15,14 +15,28 @@ record — brand-authored copy only (ADR-001), never synthesized, never from a
 retailer.
 
 Rows whose storefront has no usable body_html (some brands leave it empty) are
-left untouched and reported — they stay draft honestly and route to the LLM
-enrichment lane later.
+left untouched and reported — they stay draft honestly.
+
+--pdp-fallback (OPT-IN) tries one more BRAND-AUTHORED source before giving up on
+such a row: the product's own PDP meta description. Measured on jsmbeauty.sg
+2026-09-06, 158 of 232 products publish under 50 chars of body_html text while
+their PDPs carry 150-340 chars. It costs one merchant-host request per
+already-skipped row (plus one per domain for the shop blurb), which is why it is
+not the default. Meta copy that is storefront-wide boilerplate rather than this
+product's description -- the theme's shop blurb, an app vendor's operational text
+-- is dropped by drop_shared_boilerplate and those rows stay blocked. Rows filled
+this way are recorded under REFRESH_SOURCE_PDP_META, not the body_html source. Anything still
+empty after that routes to the LLM enrichment lane, as before.
 
 Dry-run (default): report per-domain fill/skip counts, write nothing.
     DATABASE_URL=... python3 scripts/backfill_brand_official_descriptions.py
 
 Apply:
     DATABASE_URL=... python3 scripts/backfill_brand_official_descriptions.py --apply
+
+With the PDP fallback (one extra request per empty-body row):
+    DATABASE_URL=... python3 scripts/backfill_brand_official_descriptions.py \\
+        --domains jsmbeauty.sg --pdp-fallback --apply
 """
 
 from __future__ import annotations
@@ -30,8 +44,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import re
 import sys
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -43,11 +58,21 @@ from services.agent_pdp_view_assembler import (  # noqa: E402
 from services.catalog_enrichment_agent.bulk_writer import is_transport_error  # noqa: E402
 from services.curated_brand_feed import (  # noqa: E402
     body_html_to_text,
+    fetch_pdp_description,
+    fetch_shop_description,
+    fetch_shop_description_from_meta,
     fetch_shopify_products,
 )
 from services.pdp_lifecycle import compute_lifecycle_stage  # noqa: E402
 
 REFRESH_SOURCE = "brand_official_description_backfill_v1"
+# PROVENANCE, recorded rather than left implicit. ADR-001's closing item asks for "provenance
+# tagging on each canonical field", and this lane honours it elsewhere (`inci_source`,
+# readiness/sources/shopify_live.py's `field_sources`). Before --pdp-fallback,
+# catalog_products.description on this lane had exactly ONE possible origin; it now has two, and
+# a later reader must be able to tell which filled a given row -- both to audit PDP-meta copy and
+# to find it again if the meta-description route is ever judged a lower tier than body copy.
+REFRESH_SOURCE_PDP_META = "brand_official_description_backfill_pdp_meta_v1"
 MIN_DESC_LEN = 50          # is_candidate_ready's CANDIDATE_DESCRIPTION_MIN_LEN
 
 # Population: Path-C enrichment-minted rows stuck below 'published' whose
@@ -107,7 +132,7 @@ async def _reconnect() -> None:
     raise RuntimeError("could not re-establish DB connection")
 
 
-async def _load_body_map(domain: str, max_products: int) -> Dict[str, str]:
+async def _load_body_map(domain: str, max_products: int) -> Tuple[Dict[str, str], bool]:
     # fetch_shopify_products swallows errors into [] — a transient network
     # failure would silently mark a whole domain "not_in_feed" (4 domains, 292
     # rows on the first prod run). It also returns a PARTIAL list when
@@ -125,14 +150,394 @@ async def _load_body_map(domain: str, max_products: int) -> Dict[str, str]:
             shape = "empty" if not products else f"suspiciously page-aligned ({len(products)})"
             print(f"  ({domain}: {shape} feed on attempt {attempt} — retrying)")
             await asyncio.sleep(10 * attempt)
-    return {
+    # RETURN THE TRUNCATION FACT. This is the only place that knows whether the feed terminated
+    # cleanly; the caller cannot re-derive it from the map, because the map is keyed on handle and
+    # so shrinks on any duplicate or blank one -- a capped feed with a single repeated handle
+    # (routine when a catalog mutates across 250-item page boundaries) looks under the cap. And a
+    # partial from a mid-feed pagination death, which the retry above can only heuristically spot,
+    # leaves the map far BELOW the cap while covering a fraction of the storefront.
+    truncated = bool(products) and (
+        len(products) >= max_products
+        or (len(products) % 250 == 0 and len(products) < max_products)
+    )
+    body_map = {
         str(p.get("handle") or "").strip(): body_html_to_text(p.get("body_html"))
         for p in products
         if isinstance(p, dict) and p.get("handle")
     }
+    return body_map, truncated
 
 
-async def run(apply: bool, domains_filter: List[str], max_products: int) -> int:
+def _norm_copy(value: str) -> str:
+    """Compare copy the way a reader would: case- and whitespace-insensitively."""
+    return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
+
+
+async def _load_shop_blurb(domain: str, attempts: int = 3) -> Tuple[Optional[str], bool]:
+    """The storefront's blurb and whether it is VERIFIED -> (blurb|None, verified).
+
+    Retried like `_load_body_map` and for the same reason: `fetch_shop_description` swallows every
+    failure into None, exactly as `fetch_shopify_products` does, and here the silent failure is in
+    the DANGEROUS direction -- an unavailable blurb disarms mechanism 1 and the counters would
+    print `boilerplate=0` as though nothing had happened. Retry first; `drop_shared_boilerplate`
+    handles a genuine absence.
+
+    VERIFIED MEANS "RENDERED BY THE SAME THEME AS THE PDP". Mechanism 1 is an EXACT string
+    comparison, and the homepage door is self-calibrating: `fetch_shop_description` and
+    `fetch_pdp_description` both read a themed page through `description_from_pdp_html`, so
+    whatever the theme does to `shop.description` (HTML-escaping, truncation at 320 chars,
+    `| append: shop.name`) it does to BOTH sides and the two cancel. `/meta.json` does not go
+    through the theme at all: it returns `shop.description` raw. The string it hands back is
+    therefore a plausible-but-unproven stand-in, and the difference is not cosmetic --
+    a non-empty blurb that can never match anything is the one input that ARMS nothing while
+    switching OFF the fail-closed singleton refusal. So the JSON door reports `verified=False`
+    and `drop_shared_boilerplate` decides what an unverified blurb may lift.
+    """
+    for attempt in range(1, attempts + 1):
+        blurb = await fetch_shop_description(domain)
+        # LONG ENOUGH TO BE A BLURB. glossier.com's homepage description is "Glossier" -- 8
+        # characters. Accepting it would arm mechanism 1 in name only (no candidate over the
+        # 50-char floor can ever equal it) while simultaneously switching OFF the fail-closed
+        # refusal below, so singletons on that domain would pass with nothing checking them.
+        if blurb and len(blurb) >= MIN_DESC_LEN:
+            return blurb, True
+        if attempt < attempts:
+            await asyncio.sleep(0.5 * attempt)
+    # THE JSON DOOR WHEN THE HTML DOOR IS SHUT. Measured 2026-09-08 on jsmbeauty.sg: three runs
+    # in a row reported `blurb_unavailable` (60 candidates refused, fill=0) while a cold job
+    # fetched the same homepage and parsed the same 135-char blurb — the homepage is refused
+    # once the run has pulled dozens of product pages from the host, the JSON endpoints are not.
+    # `/meta.json` `description` IS `shop.description`, the string a theme substitutes for a
+    # missing product SEO description, so the comparison it arms is the same comparison --
+    # WHEN the theme passes it through untouched, which is exactly what we cannot check from
+    # here. Hence `verified=False`.
+    meta_blurb = await fetch_shop_description_from_meta(domain)
+    if meta_blurb and len(meta_blurb) >= MIN_DESC_LEN:
+        return meta_blurb, False
+    return None, False
+
+
+# A candidate whose only content beyond the product's own title is this much or less is a
+# title echo, not a description. "Kylie Cosmetics - Glossy Pink Makeup Bag + Deluxe Samples"
+# leaves "kylie cosmetics" (15 chars) once the title is removed.
+_ECHO_REMAINDER_MIN = 30
+
+
+def _is_title_echo(value: str, title: Optional[str]) -> bool:
+    """Is this value just the product's title with a brand name bolted on?
+
+    THE THIRD BOILERPLATE FAMILY, and the one both other mechanisms are blind to. kyliecosmetics
+    .com renders its name tag from a template, `"Kylie Cosmetics - {title}"`. That is PER-PRODUCT,
+    so repetition never fires, and it is not the shop blurb, so the comparison never fires -- yet
+    it carries zero product information and is admitted or refused purely by whether the title is
+    long enough to clear the 50-char floor (2 of 3 accepted values on that storefront; 34 chars
+    saved a third by accident). Auto-published as brand-official copy.
+
+    THE THRESHOLD IS A MARGIN, NOT A TUNING, AND NOT A BOUND. Measured 2026-09-06: the rule fired
+    on 1 of 35 real candidates and that one was the true positive it was built for; 0 false
+    rejects among 18 genuine values, only 2 of which even contained their own title. Observed
+    echoes leave 5-15 characters once the title is removed and observed genuine copy leaves 76-101,
+    so 30 sits in a wide gap -- but 76 is a floor of a 7-storefront SAMPLE, not a guarantee. A real
+    80-character jsmbeauty.sg title ("BeginS by JUNGSAEMMOOL Blue Hydrangea Hyaluronic Acid
+    Moisturizing Plumping Mist") inside a 108-character description leaves 26 and IS refused: long
+    product names are where this rule costs real copy, and the direction is safe (the row stays
+    blocked and routes to LLM enrichment) rather than free. It is deliberately NOT raised to catch
+    every template I can imagine
+    -- a longer SEO scaffold such as "Buy {title} online at {brand} {country}" leaves 36 and is
+    MISSED. That family was not observed in the 2026-09-06 sweep, and fitting the number to a case
+    I invented rather than measured is how the previous version of this guard went wrong. Raising
+    it also costs real copy: genuine text only just over the 50-char floor leaves roughly
+    `50 - len(title)`, so a high threshold starts refusing short descriptions of long-named
+    products.
+    """
+    if not title:
+        return False
+    v, t = _norm_copy(value), _norm_copy(title)
+    if not t or t not in v:
+        return False
+    remainder = re.sub(r"[^a-z0-9]+", " ", v.replace(t, " ")).strip()
+    return len(remainder) < _ECHO_REMAINDER_MIN
+
+
+# A leading bracketed tag is how this storefront family labels an EDITION of a product, not a
+# different product: "[Devil Wears Prada II x JUNGSAEMMOOL] LIP-PRESSION Metal Serum Gloss",
+# "[Special Set] New Classic Glaze Lipstick", "[SUMMER EDITION] ...", "[9.9 EXCLUSIVE] ...".
+_EDITION_PREFIX = re.compile(r"^\s*(?:\[[^\]]*\]\s*)+")
+# Words that mark a handle affix as an EDITION of the same product: `-special-set`,
+# `summer-edition-`, `-9-9-exclusive`. Deliberately a short list, and an affix must be short
+# (`_MAX_AFFIX_TOKENS`) and contain one of them: a handle that differs by any other word alone
+# ("-refill", "-brush", "-mini") or by the bare "-1" Shopify appends to de-duplicate a handle is
+# a different product. The cost of missing an edition word is a row that stays blocked, which
+# is where it already was.
+_EDITION_WORDS = frozenset({
+    "set", "edition", "exclusive", "limited", "special", "collab", "collaboration",
+})
+# Words that mark a page as an APP's, not a product's edition: BOGOS free-gift pages are
+# `gwp-<handle>_freegift` titled `[GWP] ...`, bundle apps emit `<handle>-bundle` titled
+# `[Bundle] ...`. A family whose tag text or handle carries one of these is a mechanism whatever
+# else it looks like -- the one-base rule reads a title-formatting convention the app itself
+# controls, so it needs this mechanism-side conjunct. `bundle`, `kit`, `gwp` were in the
+# edition list with zero measured support; every observed tag is a set, an edition, an
+# exclusive or a collab.
+_APP_PAGE_MARKERS = ("gwp", "freegift", "free gift", "free-gift", "bundle")
+_MAX_AFFIX_TOKENS = 3
+# An edition family is a handful of pages. Twenty pages sharing one string is a MECHANISM (app
+# vendor, theme template), whatever their titles say, and the title/handle test above must not
+# be the only thing standing between it and auto-publication.
+_MAX_EDITION_FAMILY = 4
+
+
+def _base_title(title: Optional[str]) -> str:
+    """The product's title with every leading bracketed edition tag removed, normalized."""
+    return _norm_copy(_EDITION_PREFIX.sub("", str(title or "")))
+
+
+def _is_edition_affix(tokens: list) -> bool:
+    """A short affix carrying an edition word: `special-set`, `summer-edition`, `9-9-exclusive`;
+    not `refill`, not `1`, and not a six-word collaboration name (the title rule covers that)."""
+    if not tokens or any(t == "" for t in tokens):      # `x--set` is not an edition of `x`
+        return False
+    # The edition word is the affix's HEAD -- what the whole affix says the page is: `special
+    # -set`, `summer-edition`, `9-9-exclusive`. `kit-refill` says "refill", a different product
+    # that happens to mention a kit; an edition word buried before another noun is not one.
+    return len(tokens) <= _MAX_AFFIX_TOKENS and tokens[-1] in _EDITION_WORDS
+
+
+def _handles_are_editions(a: str, b: str) -> bool:
+    """Is one handle the other plus an edition affix -- `x-special-set`, `summer-edition-x`?"""
+    a, b = (a or "").strip().casefold(), (b or "").strip().casefold()
+    if not a or not b or a == b:
+        return False
+    short, long_ = sorted((a, b), key=len)
+    if long_.startswith(short + "-"):
+        return _is_edition_affix(long_[len(short) + 1:].split("-"))
+    if long_.endswith("-" + short):
+        return _is_edition_affix(long_[: -len(short) - 1].split("-"))
+    return False
+
+
+def _are_sibling_editions(a: tuple, b: tuple) -> bool:
+    """Do these two (handle, title) pairs name editions of ONE product?
+
+    Safe ONLY under `_is_one_product_family`'s exactly-one-base rule: on its own this returns
+    True for two untagged pages with the same name, which that rule refuses.
+
+    NARROW ON PURPOSE. Two pages are siblings only if their titles agree once a leading
+    bracketed edition tag is stripped, or one handle is the other plus an edition affix. Two
+    palettes that share family copy have different base titles and different handle stems, so
+    they stay "shared" and are dropped, as before.
+    """
+    (ha, ta), (hb, tb) = a, b
+    base_a, base_b = _base_title(ta), _base_title(tb)
+    # "At least one title carried an edition tag" -- two products that merely share a name
+    # (handles "x" / "x-1") are not editions, and the handle signal never stands alone either:
+    # `bundle`, `kit`, `set`, `gwp` are also the vocabulary of app-generated pages
+    # (`<handle>-bundle` with the product name interpolated repeats exactly twice per product,
+    # a family of two every time). Both are enforced ONCE, at family level, by
+    # `_is_one_product_family`'s exactly-one-base rule: a pair with no tagged member has two
+    # bases. A per-pair check here would be a second guard on the same door, and two guards
+    # pin neither (the mutant that dropped it survived every test).
+    if base_a and base_a == base_b:
+        return True
+    return _handles_are_editions(ha, hb)
+
+
+def _is_one_product_family(pages: Dict[str, tuple]) -> bool:
+    """Are ALL these pages (handle -> (handle, title)) editions of one product?
+
+    Every pair must be siblings -- not merely connected through a chain -- so that a base
+    product cannot vouch for two unrelated things that each happen to look like its edition.
+    """
+    if not 1 < len(pages) <= _MAX_EDITION_FAMILY:
+        return False
+    members = list(pages.values())
+    # Exactly ONE member is the base product (an untagged title). A set of pages that are ALL
+    # tagged the same way -- four `[GWP] Free Gift` pages carrying an app's "do not delete"
+    # text -- has no product they are editions OF; that is a mechanism at small N.
+    if sum(1 for _h, t in members if _base_title(t) == _norm_copy(t)) != 1:
+        return False
+    for h, t in members:
+        tag_text = _norm_copy(str(t or ""))[: len(_norm_copy(str(t or ""))) - len(_base_title(t))]
+        haystack = f"{(h or '').casefold()} {tag_text}"
+        if any(m in haystack for m in _APP_PAGE_MARKERS):
+            return False
+    return all(_are_sibling_editions(members[i], members[j])
+               for i in range(len(members)) for j in range(i + 1, len(members)))
+
+
+def blurb_arming(
+    candidates: Dict[str, str],
+    shop_blurb: Optional[str],
+    blurb_verified: bool = True,
+) -> Tuple[str, bool]:
+    """-> (the normalised blurb or "", whether it LIFTS the fail-closed singleton refusal).
+
+    ONE implementation, used by `drop_shared_boilerplate` to decide and by `run` to report, so
+    the counter an operator reads can never disagree with the verdict the rows got. (Two copies
+    of this rule would be two guards on one door; see `_are_sibling_editions`.)
+
+    A VERIFIED blurb -- one the storefront's own theme rendered, see `_load_shop_blurb` -- arms
+    mechanism 1 outright: it is the string a PDP without SEO copy repeats, byte for byte.
+
+    An UNVERIFIED blurb (`/meta.json`, raw `shop.description`, no theme) still ARMS THE EXACT
+    MATCH -- a hit is a true positive whatever the door, and on jsmbeauty.sg the two strings are
+    byte-identical -- but it does NOT lift the refusal on its own. It lifts the refusal only when
+    it CORROBORATES: some candidate in this run's census equals it, which proves the theme does
+    render this exact string on a PDP. Measured counter-example, and the reason this exists:
+    glossier.com's homepage description is "Glossier" (8 chars, under the floor), so #2129's
+    fallback reaches `/meta.json` and gets the real, long `shop.description` -- a string that
+    domain's theme never renders on a PDP. `blurb` is then non-empty, matches nothing, and the
+    pre-#2129 code would admit EVERY singleton on the domain, including the storefront blurb
+    served on a PDP with no SEO description, while printing `boilerplate=0 blurb_unavailable=0`.
+    """
+    blurb = _norm_copy(shop_blurb) if len(shop_blurb or "") >= MIN_DESC_LEN else ""
+    armed = bool(blurb) and (
+        blurb_verified or any(_norm_copy(v) == blurb for v in candidates.values())
+    )
+    return blurb, armed
+
+
+def drop_shared_boilerplate(
+    candidates: Dict[str, str],
+    shop_blurb: Optional[str] = None,
+    *,
+    blurb_verified: bool = True,
+    handles: Optional[Dict[str, str]] = None,
+    titles: Optional[Dict[str, str]] = None,
+) -> Dict[str, str]:
+    """Keep only the PDP meta descriptions that are about ONE product. Pure; no I/O.
+
+    WHY A WHOLE-DOMAIN DECISION. Body copy from /products.json is per-product by construction.
+    PDP meta copy is not: several mechanisms put the same string on many PDPs at once, and none of
+    them is detectable in a single page's markup.
+
+      1. THE SHOP BLURB. A theme renders og:description as
+         `page_description | default: shop.description`, so a product with no SEO description
+         serves the storefront's own blurb. Caught by exact comparison against
+         `fetch_shop_description`. LOAD-BEARING and not redundant with (2): measured 2026-09-06,
+         jsmbeauty.sg's `artist-eyelash-ampoule-serum` served the blurb as the ONLY product in its
+         batch to do so, and repetition could not see it.
+      2. APP-VENDOR TEXT. Apps write operational strings into the name tag --
+         "This product is used for the app BOGOS.io ... Please do not delete/edit it". 231
+         characters, over the floor, on 20+ `gwp-*_freegift` products of jsmbeauty.sg. No
+         shop-blurb comparison reaches it; repetition does. ONE EXCEPTION, and a narrow one:
+         copy shared only among SIBLING EDITIONS of a single product ("LIP-PRESSION Metal
+         Serum Gloss" and "[Devil Wears Prada II x JUNGSAEMMOOL] LIP-PRESSION Metal Serum
+         Gloss"; "New Classic Glaze Lipstick" and "[Special Set] New Classic Glaze Lipstick")
+         is that product's copy, not boilerplate, and passes on to mechanisms 1 and 3 like a
+         singleton. See `_are_sibling_editions` for what "sibling" means; measured 2026-09-08
+         on jsmbeauty.sg, this exception was the whole difference between two Meitu Tier-A lip
+         lines staying blocked `low_quality` (9- and 8-char descriptions) and serving.
+      3. A TITLE ECHO from a themed name-tag template -- see `_is_title_echo`. Per-product, not
+         the blurb, invisible to both of the above.
+
+    THE REPETITION UNIT IS THE PRODUCT PAGE, NOT THE ROW. Two catalog rows can share one
+    canonical_url; they fetch the same PDP and produce the same value, and counting rows would
+    drop both as "shared" when it is one product represented twice. `handles` supplies the
+    identity to count by.
+
+    AN UNAVAILABLE BLURB DISARMS THE FALLBACK FOR SINGLETONS, rather than letting them through.
+    With `shop_blurb=None` mechanism 1 is off, so a value with no sibling has nothing checking it
+    at all -- and a homepage 403 would silently re-open exactly the hole this exists to close.
+    `blurb_verified=False` says the blurb did not come from the theme that renders the PDPs, and
+    is treated the same way UNLESS it corroborates; `blurb_arming` holds that rule and the
+    measured glossier.com case that makes it necessary.
+
+    MEASURED COST, because "the safe direction" is not the same as "free". Over 39 candidates on
+    7 storefronts (2026-09-06), 21 were dropped and 4 of those were genuine per-product copy
+    shared by a sibling -- 10% of candidates, and 17% on jsmbeauty.sg, the storefront this lane
+    exists for. Two eyeshadow palettes share family copy; a merchant copy-pasted one brush kit's
+    description onto another, and the second kit's own real copy is lost with it. We take that
+    knowingly: a rejected row keeps its description and stays blocked exactly where it was, and
+    routes to the LLM enrichment lane, whereas a false ACCEPT auto-publishes boilerplate as
+    brand-official copy (`is_published_ready`). The sibling-edition exception recovers only the
+    part of that cost where the sharing IS one product; the palettes and the brush kits are
+    still dropped, and a family of more than `_MAX_EDITION_FAMILY` pages is never a family.
+
+    KNOWN LIMIT, not closed here: the census covers the candidates of THIS run. The population
+    query excludes rows already at >= 50 chars, so if another lane fills one member of a shared
+    pair, the survivor becomes a singleton in a later run and only mechanism 1 still guards it.
+    The sibling-edition exception is narrower still: it needs the BASE product in this run's
+    census, so two editions whose base was filled elsewhere are refused (they look exactly like
+    an app's tagged pages from inside one run), as is a base whose own title carries a marketing
+    bracket (`[NEW] X`). Both are the cheap side of the cost asymmetry above.
+    A stable verdict across runs needs a persisted per-domain ledger of rejected values.
+    """
+    handles = handles or {}
+    titles = titles or {}
+    # Count DISTINCT product pages per value, so one product behind two rows is not "shared".
+    # Each page keeps its (handle, title) so a shared value can be asked whether its pages are
+    # editions of ONE product.
+    seen: Dict[str, Dict[str, tuple]] = {}
+    # EVERY candidate title per value, not one per handle: `seen` keeps the first row behind a
+    # handle, so a second row behind the same handle with a different title would have its own
+    # echo judged only when it happened to sort first -- an order-dependent verdict, which the
+    # #2097 determinism invariant forbids.
+    all_titles: Dict[str, set] = {}
+    for pk, v in candidates.items():
+        h = handles.get(pk, pk)
+        n = _norm_copy(v)
+        seen.setdefault(n, {}).setdefault(h, (h, titles.get(pk)))
+        all_titles.setdefault(n, set()).add(titles.get(pk) or "")
+    # A blurb under the floor is treated as ABSENT, not as an armed comparison: no candidate that
+    # cleared the floor can equal it, so it would disarm the refusal below while guarding nothing.
+    # An UNVERIFIED blurb is the same hazard through a different door -- see `blurb_arming`.
+    blurb, armed = blurb_arming(candidates, shop_blurb, blurb_verified)
+
+    kept = {}
+    for pk, v in candidates.items():
+        n = _norm_copy(v)
+        if len(seen[n]) > 1 and not _is_one_product_family(seen[n]):
+            continue                               # (2) shared across UNRELATED product pages
+        # (1) THE EXACT MATCH FIRES WHATEVER THE DOOR. An unverified blurb that DOES equal a
+        # candidate has proved itself on that candidate; refusing to use it would throw away the
+        # measured jsmbeauty.sg win (`/meta.json` byte-identical to the homepage) for nothing.
+        if blurb and n == blurb:                   # (1) the storefront's own blurb
+            continue
+        if not armed:                              # (1) unarmed -> nothing guards a singleton
+            continue
+        # (3) the title with a brand bolted on. A value admitted as ONE product's copy is judged
+        # against every name that product goes by: the base product's echo, rendered again on
+        # its edition page, is still nothing but the title.
+        if any(_is_title_echo(v, t) for t in all_titles[n] if t):
+            continue
+        kept[pk] = v
+    return kept
+
+
+async def resolve_description(
+    body: str,
+    domain: str,
+    handle: str,
+    *,
+    pdp_fallback: bool,
+    fetch=None,
+) -> tuple:
+    """Which copy fills this row, and did the PDP supply it? -> (description|None, from_pdp).
+
+    EXTRACTED so the two safety properties are testable at all. They were prose in a docstring,
+    and mutation proved that: making the fetch unconditional, or ignoring `--pdp-fallback`, left
+    the whole suite green because nothing drove this decision. It decides whether a routine re-run
+    quietly starts crawling merchant hosts and prefers meta copy over real body copy, which is too
+    load-bearing to leave as a comment inside a loop nothing tests.
+
+    Order matters and is the whole contract: usable body copy wins and costs NO request; the
+    fallback is consulted only after body copy has already failed the floor, and only when asked
+    for; and the SAME floor applies to what comes back -- a 9-character meta description is how
+    these rows got blocked in the first place.
+    """
+    if len(body or "") >= MIN_DESC_LEN:
+        return body, False
+    if not pdp_fallback:
+        return None, False
+    meta = await (fetch or fetch_pdp_description)(domain, handle)
+    if meta and len(meta) >= MIN_DESC_LEN:
+        return meta, True
+    return None, False
+
+
+async def run(apply: bool, domains_filter: List[str], max_products: int,
+              pdp_fallback: bool = False) -> int:
     # initial connect through the same healer as mid-run reconnects —
     # a proxy TLS bad-window at process start must not burn a whole
     # stage attempt (observed 2026-07-17).
@@ -171,22 +576,117 @@ async def run(apply: bool, domains_filter: List[str], max_products: int) -> int:
     print(f"[population] {sum(len(v) for v in by_domain.values())} rows "
           f"across {len(by_domain)} domain(s)  (apply={apply})")
 
-    totals = {"filled": 0, "published": 0, "validated": 0, "no_body": 0,
-              "not_in_feed": 0, "update_failed": 0, "refresh_failed": 0}
-    touched_cks: List[str] = []
+    totals = {"filled": 0, "published": 0, "validated": 0, "no_body": 0, "from_pdp": 0,
+              "not_in_feed": 0, "boilerplate": 0, "blurb_unavailable": 0,
+              "blurb_unverified_uncorroborated": 0,
+              "update_failed": 0, "refresh_failed": 0}
+    # content_key -> did ANY row behind it come from PDP meta. A flat list cannot carry this:
+    # the refresh runs in its own loop below, and an earlier version read a LEAKED `r` from the
+    # fill loop there, stamping every key with the last row of the last domain's provenance.
+    touched_cks: Dict[str, bool] = {}
 
     for domain in sorted(by_domain):
         drows = by_domain[domain]
-        body_map = await _load_body_map(domain, max_products)
-        filled = no_body = not_in_feed = 0
+        body_map, feed_truncated = await _load_body_map(domain, max_products)
+        filled = no_body = not_in_feed = from_pdp = boilerplate = 0
+
+        # PASS 1 — DECIDE, writing nothing. Body copy could be written as it is resolved, but PDP
+        # meta copy cannot: whether a value is this product's description or storefront-wide
+        # boilerplate is only answerable once every candidate for the domain is in hand
+        # (drop_shared_boilerplate). So both take the same two-pass route.
+        resolved: Dict[str, str] = {}    # product_key -> body copy
+        candidates: Dict[str, str] = {}  # product_key -> PDP meta copy, still suspect
+        # A TRUNCATED FEED MAKES THE CENSUS NON-DETERMINISTIC. `drop_shared_boilerplate` votes on
+        # the candidates it is given, so a storefront split by --max-products is judged in halves:
+        # measured on jsmbeauty.sg 2026-09-06, the same 24 candidates kept 13 as one batch and 15
+        # as two, and the string that survived the split was a shared one. Rather than write a
+        # verdict that depends on the cut, refuse the fallback for this domain and say so.
+        domain_pdp_fallback = pdp_fallback
+        if pdp_fallback and feed_truncated:
+            print(f"  WARN {domain}: the storefront feed did not terminate cleanly (cap "
+                  f"--max-products={max_products}) — the boilerplate census would cover only part "
+                  f"of the storefront, so the PDP fallback is skipped here. Re-run with a higher "
+                  f"--max-products.")
+            domain_pdp_fallback = False
+        # THE BLURB IS THE FIRST HTML REQUEST TO THE HOST, NOT THE LAST. It used to be fetched
+        # after every PDP in the domain, i.e. as the sixty-first or hundredth page from one
+        # egress — the point at which a Cloudflare-fronted store stops answering the 700 KB
+        # homepage while still serving product pages. Measured 2026-09-08 on jsmbeauty.sg: three
+        # consecutive runs `blurb_unavailable` with 60 candidates refused, a cold job fine. An
+        # unavailable blurb does not merely lose mechanism 1; it disarms the fallback for every
+        # singleton, so the whole PDP pass silently fills nothing. Asked for only when the PDP
+        # fallback can use it, so a body-only run still costs the host nothing extra.
+        #
+        # ...AND ONLY WHEN A ROW WILL ACTUALLY NEED IT. `body_map` is already in hand and it
+        # answers "will any row here reach the PDP fallback?" exactly: `resolve_description`
+        # consults the PDP only for a row whose body copy is under the floor. Without this gate a
+        # `--pdp-fallback` sweep pays 3 homepage attempts + /meta.json + robots.txt + ~4.5 s of
+        # pacing on EVERY domain whose rows all have usable body copy -- a per-domain cost, on a
+        # merchant host, for a blurb that is then handed to `drop_shared_boilerplate` with an
+        # empty candidate set. A row that is not in the feed at all (body is None) is skipped
+        # before `resolve_description`, so it does not count as needing the blurb.
+        needs_blurb = any(
+            len(body_map.get(r["_handle"]) or "") < MIN_DESC_LEN
+            for r in drows
+            if body_map.get(r["_handle"]) is not None
+        )
+        blurb: Optional[str] = None
+        blurb_verified = False
+        if domain_pdp_fallback and needs_blurb:
+            blurb, blurb_verified = await _load_shop_blurb(domain)
         for r in drows:
             body = body_map.get(r["_handle"])
             if body is None:
                 not_in_feed += 1
                 continue
-            if len(body) < MIN_DESC_LEN:
+            body, from_pdp_row = await resolve_description(
+                body, domain, r["_handle"], pdp_fallback=domain_pdp_fallback
+            )
+            if body is None:
                 no_body += 1
                 continue
+            (candidates if from_pdp_row else resolved)[str(r["product_key"])] = body
+
+        if candidates:
+            # THE SAME PREDICATE THE ROWS ARE JUDGED BY, so the counters cannot drift from the
+            # verdict. `blurb_unavailable` and `blurb_unverified_uncorroborated` are two DISTINCT
+            # operator actions: the first says the host refused us and a retry may fix it; the
+            # second says we did get a string, from `/meta.json`, that this storefront's theme
+            # demonstrably does not render on any of its PDPs — no retry will change that, and
+            # the domain's singletons stay refused on purpose.
+            _, armed = blurb_arming(candidates, blurb, blurb_verified)
+            if not armed:
+                # Not a warning to skim past: with mechanism 1 off, every singleton candidate is
+                # dropped below, so this line explains a sudden `boilerplate` spike.
+                if blurb:
+                    print(f"  WARN {domain}: the shop blurb came from /meta.json (raw "
+                          f"shop.description, not rendered by the theme) and matches no candidate "
+                          f"— the blurb comparison is unverified, so unrepeated candidates will "
+                          f"be refused")
+                    totals["blurb_unverified_uncorroborated"] += 1
+                else:
+                    print(f"  WARN {domain}: shop blurb unavailable — the blurb comparison is "
+                          f"disarmed and unrepeated candidates will be refused")
+                    totals["blurb_unavailable"] += 1
+            kept = drop_shared_boilerplate(
+                candidates, blurb,
+                blurb_verified=blurb_verified,
+                handles={str(r["product_key"]): r["_handle"] for r in drows},
+                titles={str(r["product_key"]): r.get("title") for r in drows},
+            )
+            boilerplate = len(candidates) - len(kept)
+            totals["boilerplate"] += boilerplate
+            candidates = kept
+
+        # PASS 2 — WRITE.
+        for r in drows:
+            pk = str(r["product_key"])
+            from_pdp_row = pk in candidates
+            body = candidates.get(pk) if from_pdp_row else resolved.get(pk)
+            if body is None:
+                continue
+            if from_pdp_row:
+                from_pdp += 1
             new_row = {**r, "description": body}
             new_stage = compute_lifecycle_stage(new_row)
             totals[new_stage] = totals.get(new_stage, 0) + 1
@@ -200,7 +700,11 @@ async def run(apply: bool, domains_filter: List[str], max_products: int) -> int:
                             "product_key": r["product_key"],
                         })
                         if r.get("content_key"):
-                            touched_cks.append(str(r["content_key"]))
+                            ck_w = str(r["content_key"])
+                            # Several product_keys can share one content_key. If ANY contributing
+                            # row was filled from PDP meta, the view's copy may be meta copy, so
+                            # the marker has to say so — OR, never overwrite.
+                            touched_cks[ck_w] = touched_cks.get(ck_w, False) or from_pdp_row
                         break
                     except Exception as exc:  # noqa: BLE001 — heal a poisoned
                         # connection and retry once; a bad row must not abort
@@ -214,17 +718,23 @@ async def run(apply: bool, domains_filter: List[str], max_products: int) -> int:
                         break
         totals["filled"] += filled
         totals["no_body"] += no_body
+        totals["from_pdp"] = totals.get("from_pdp", 0) + from_pdp
         totals["not_in_feed"] += not_in_feed
         print(f"  {domain:22s} rows={len(drows):4d} feed={len(body_map):4d} "
-              f"fill={filled:4d} empty_body={no_body:3d} not_in_feed={not_in_feed:3d}")
+              f"fill={filled:4d} empty_body={no_body:3d} not_in_feed={not_in_feed:3d} "
+              f"from_pdp={from_pdp:3d} boilerplate={boilerplate:3d}")
 
     if apply and touched_cks:
-        distinct = sorted(set(touched_cks))
+        distinct = sorted(touched_cks)
         print(f"[view] refreshing {len(distinct)} content_key view(s) ...")
         for ck in distinct:
             for attempt in (1, 2):
                 try:
-                    await refresh_agent_pdp_view_for_content_key(ck, refresh_source=REFRESH_SOURCE)
+                    await refresh_agent_pdp_view_for_content_key(
+                        ck,
+                        refresh_source=(REFRESH_SOURCE_PDP_META if touched_cks[ck]
+                                       else REFRESH_SOURCE),
+                    )
                     break
                 except Exception as exc:  # noqa: BLE001 — a transport failure
                     # poisons the pinned connection ("Connection is already
@@ -248,9 +758,13 @@ def main() -> int:
     p.add_argument("--apply", action="store_true", help="write updates (default: dry-run)")
     p.add_argument("--domains", default="", help="comma-separated domain allowlist")
     p.add_argument("--max-products", type=int, default=800)
+    # OPT-IN. It costs one PDP fetch per row whose body_html already failed, against a merchant
+    # host, so it must be a choice rather than something a routine re-run starts doing.
+    p.add_argument("--pdp-fallback", action="store_true",
+                   help="when body_html is empty, take the PDP's own meta description")
     args = p.parse_args()
     domains = [d.strip().lower() for d in args.domains.split(",") if d.strip()]
-    return asyncio.run(run(args.apply, domains, args.max_products))
+    return asyncio.run(run(args.apply, domains, args.max_products, args.pdp_fallback))
 
 
 if __name__ == "__main__":

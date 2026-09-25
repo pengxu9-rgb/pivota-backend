@@ -302,7 +302,26 @@ async def process_one_verification_run() -> bool:
         )
         return True
 
-    # status='failed' or anything else → retry routing
+    # status='failed' or anything else → retry routing.
+    #
+    # "ANYTHING ELSE" NOW INCLUDES A VOCABULARY THIS CANNOT ROUTE. The four
+    # no-verdict states (`unverified`, `skipped`, `provider_failed`,
+    # `unparseable`) are TERMINAL and describe a check that will not be
+    # retried — but VerifierResult.status is documented as
+    # "succeeded | failed | blocked", so a verifier returning one of them falls
+    # through to here and is retried to `exhausted_retries` with
+    # error_message="verifier_returned_failed": a permanent fact, retried, and
+    # then mislabelled. Log it loudly rather than pretending it is a failure;
+    # the correct handling is ae.mark_verification_no_verdict, and wiring a
+    # verifier to emit these is a separate change.
+    if result.status in ae.VERIFICATION_NO_VERDICT:
+        logger.error(
+            "verification_run_worker: verifier %s returned no-verdict status "
+            "%r for verify=%s, which this worker cannot route — retrying it as "
+            "a failure. Use mark_verification_no_verdict instead.",
+            verifier_id, result.status, verify_id,
+        )
+
     new_stage = await ae.mark_verification_failed_with_retry(
         verify_id=verify_id, worker_id=WORKER_ID,
         error_message=(

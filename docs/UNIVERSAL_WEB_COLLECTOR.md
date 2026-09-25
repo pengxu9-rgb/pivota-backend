@@ -123,6 +123,39 @@ the attribution context, and queued events. The collector never reads or sends
 page URL, referrer, cookies, IP address, user agent, names, email, phone, address,
 or payment-card fields.
 
+## Token lifecycle
+
+A collector token is a public browser credential that cannot be recalled from
+the pages it was pasted into, so its life is bounded and every issuance is
+recorded.
+
+- **TTL cap: 90 days** (`ttl_days` above 90 is refused with 422). Renewal is a
+  route, not a re-install.
+- Every token carries a `jti` and is recorded in `merchant_collector_tokens`
+  with its store, type, origins, issuance, and expiry. The credential itself
+  is never stored or listed.
+- Every store has a token generation (`merchant_collector_token_policy`). A
+  token whose `sv` claim is below the store's generation is refused whether or
+  not its row exists, which is how tokens issued before the registry (format
+  v1, no `jti`) are revoked as a set.
+- Verification checks the registry after the signature: revoked, unregistered,
+  or wrong-store tokens are refused with 401; a registry outage refuses with
+  503 (a browser token only writes observational rows into the same database).
+
+Management routes, all tenant-scoped through the connected store:
+
+| Route | Purpose |
+| --- | --- |
+| `GET /merchant-events/v1/tokens?store_id=` | every token issued for a store with `state` (active, expired, revoked, superseded) and `renewal_due` |
+| `GET /merchant-events/v1/tokens/expiring?within_days=30` | live, not-yet-renewed tokens expiring inside the window; merchants see their own, staff see all. This is the renewal alert source |
+| `POST /merchant-events/v1/tokens/{jti}/renew` | issue a successor for the same store and origins; the old token keeps working until its own expiry unless `revoke_previous` is set |
+| `POST /merchant-events/v1/tokens/{jti}/revoke` | refuse one token |
+| `POST /merchant-events/v1/stores/{store_id}/tokens/revoke-all` | bump the store's generation; every earlier token, registered or not, is refused |
+
+Issuance responses include `jti`, `expires_at`, and `renewal_due_at`
+(30 days before expiry). Unknown and foreign `jti`s are indistinguishable to a
+merchant (404).
+
 ## Event API
 
 ```js

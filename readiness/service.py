@@ -29,6 +29,7 @@ from services.refund_service import refund_service
 from services.merchant_store_service import get_primary_store
 from services.surface_listing_registry_service import persist_channel_export
 from services.shopify_access_token_service import resolve_shopify_admin_access_token
+from services.shopify_domain import normalize_myshopify_domain
 from services.shopify_returns_service import (
     probe_shopify_return_eligibility_best_effort,
     sync_shopify_returns_best_effort,
@@ -1144,7 +1145,13 @@ async def _resolve_shopify_return_context(
             }
         )
 
-    shop_domain = str(shopify_cfg.get("shop_domain") or store_info.get("domain") or "").strip()
+    # Pinned before the resolver, which POSTs the app's client_id + client_secret to
+    # {shop_domain}/admin/oauth/access_token. Review proved a real dial to a hostile stored host from
+    # here -- one await BEFORE the returns helpers refuse, so pinning only those helpers left the
+    # stronger credential exposed on this path.
+    shop_domain = normalize_myshopify_domain(
+        shopify_cfg.get("shop_domain") or store_info.get("domain")
+    ) or ""
     access_token = ""
     if shop_domain:
         access_token, _ = await resolve_shopify_admin_access_token(
@@ -1253,6 +1260,13 @@ def _build_return_eligibility_summary(
     warnings: List[str] = []
     recommendations: List[str] = []
 
+    if platform_probe.get("ok") is False:
+        # Every warning below reads a key the probe's REFUSAL shape omits, so without this the
+        # surface answers "checked, found nothing" when in fact it never reached Shopify at all --
+        # the exact shape #2074 was merged to stop. A refusal is a louder signal than a failed
+        # probe, not a quieter one.
+        warnings.append("shopify_return_probe_refused")
+        blockers.append(str(platform_probe.get("reason") or "shopify_return_probe_refused"))
     if platform_probe.get("rest_error"):
         warnings.append("shopify_order_rest_probe_failed")
     if return_capabilities.get("queryroot_returnable_fulfillments_available") is False:

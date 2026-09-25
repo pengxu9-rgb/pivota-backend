@@ -53,6 +53,7 @@ def _args(tmp_path: Path, *, write: bool) -> argparse.Namespace:
         merchant_jwt="jwt-secret-value",
         merchant_api_key="merchant-hmac-secret" if write else None,
         write_canary=write,
+        confirm_dedicated_canary_store="store_canary" if write else None,
         run_id="run_20260831",
         amount_minor=100,
         refund_minor=25,
@@ -120,6 +121,15 @@ def test_signed_batch_uses_exact_compact_body() -> None:
     assert signature == hmac.new(b"secret", body, hashlib.sha256).hexdigest()
 
 
+def test_signed_batch_marks_the_probe_synthetic_at_batch_level() -> None:
+    body, signature = module._signed_batch(
+        [{"event_id": "evt_1"}], "secret", synthetic=True
+    )
+
+    assert body == b'{"events":[{"event_id":"evt_1"}],"synthetic":true}'
+    assert signature == hmac.new(b"secret", body, hashlib.sha256).hexdigest()
+
+
 def test_read_only_audit_never_posts_and_redacts_jwt(tmp_path: Path) -> None:
     args = _args(tmp_path, write=False)
     session = _Session(
@@ -182,10 +192,20 @@ def test_write_canary_proves_ingest_replay_trace_and_stages(tmp_path: Path) -> N
     )
 
     assert report["overall_ok"] is True
+    funnel_calls = [
+        call
+        for call in session.calls
+        if call[0] == "GET" and call[1].endswith("/merchant/analytics/commerce-funnel")
+    ]
+    assert funnel_calls
+    assert all(call[2]["params"]["surface"] == "ops_canary" for call in funnel_calls)
     post_calls = [call for call in session.calls if call[0] == "POST"]
     assert len(post_calls) == 2
     assert all("Authorization" not in call[2]["headers"] for call in post_calls)
     assert post_calls[0][2]["data"] == post_calls[1][2]["data"]
+    # The probe declares itself synthetic at batch level so the ledger stamps
+    # the column; the surface string alone is caller-supplied and not trusted.
+    assert json.loads(post_calls[0][2]["data"])["synthetic"] is True
     assert (
         post_calls[0][2]["headers"]["X-Pivota-Signature"]
         == post_calls[1][2]["headers"]["X-Pivota-Signature"]
@@ -193,6 +213,20 @@ def test_write_canary_proves_ingest_replay_trace_and_stages(tmp_path: Path) -> N
     assert "merchant-hmac-secret" not in (tmp_path / "report.json").read_text(
         encoding="utf-8"
     )
+
+
+def test_write_canary_rejects_missing_or_mismatched_dedicated_store_confirmation(
+    tmp_path: Path,
+) -> None:
+    args = _args(tmp_path, write=True)
+    args.confirm_dedicated_canary_store = "another-store"
+
+    try:
+        module.run(args, session=_Session([]))
+    except ValueError as exc:
+        assert "dedicated canary store" in str(exc)
+    else:
+        raise AssertionError("write canary accepted an unconfirmed store")
 
 
 def test_missing_trace_event_fails_closed(tmp_path: Path) -> None:

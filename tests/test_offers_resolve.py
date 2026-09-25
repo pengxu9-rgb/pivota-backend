@@ -958,7 +958,25 @@ def test_offers_resolve_attached_retry_serves_external_on_explicit_surface(
 
     monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
     monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
-    monkeypatch.setattr(gateway, "_make_external_redirect_url", AsyncMock(return_value="https://example.com/r?token=arm"))
+    from services.commerce_attribution_service import IssuedClick
+
+    minted, issued_batches = [], []
+
+    async def fake_redirect(**kwargs):
+        # Honours the `issued_clicks` sink the way the real builder does (ADR-025 D1).
+        link = f"https://example.com/r?token={kwargs['click_id']}"
+        minted.append(kwargs["click_id"])
+        sink = kwargs.get("issued_clicks")
+        if sink is not None:
+            sink.append(IssuedClick(click_id=kwargs["click_id"], surface="offers_resolve", link=link))
+        return link
+
+    async def fake_issue(clicks):
+        issued_batches.append([c.click_id for c in clicks])
+        return len(clicks)
+
+    monkeypatch.setattr(gateway, "_make_external_redirect_url", fake_redirect)
+    monkeypatch.setattr(gateway, "issue_clicks", fake_issue)
 
     res = client.post(
         "/agent/shop/v1/invoke",
@@ -989,6 +1007,14 @@ def test_offers_resolve_attached_retry_serves_external_on_explicit_surface(
         and str(source.get("query")) == "external_seed_by_canonical_attached_ref"
         for source in (metadata.get("sources") or [])
     )
+    # The retry lane runs after the primary lanes, so its links must still reach the one issue
+    # flush that runs on what actually ships: a served link is an issued link (ADR-025 D1).
+    served = {
+        str(offer.get("affiliate_url")) for offer in offers
+        if offer.get("purchase_route") == "affiliate_outbound"
+    }
+    assert served and len(issued_batches) == 1
+    assert {f"https://example.com/r?token={c}" for c in issued_batches[0]} == served
 
 
 def test_offers_resolve_strict_surface_substitutes_same_product_variant(
@@ -1159,24 +1185,21 @@ def test_rank_offers_merit_first_higher_merit_external_beats_lower_merit_interna
     assert ranked[0]["confidence"] > ranked[1]["confidence"]
 
 
-def test_rank_offers_merit_first_transactability_breaks_ties() -> None:
-    """Tiebreaker ONLY: when fit is equal, the transactable (buy-here) offer wins."""
+def test_rank_offers_merit_first_checkout_transport_does_not_break_ties() -> None:
+    """Equal-fit offers keep stable order regardless of checkout transport."""
     import routes.agent_shop_gateway as gateway
 
     external = _external_offer("of:external", 0.9)
     internal = _internal_offer("of:internal", 0.9)
 
-    # External is listed first in the input; the tiebreaker must still promote internal.
     ranked = gateway._rank_offers_merit_first([external, internal])
 
-    assert [o["offer_id"] for o in ranked] == ["of:internal", "of:external"]
-    assert ranked[0]["purchase_route"] == "internal_checkout"
+    assert [o["offer_id"] for o in ranked] == ["of:external", "of:internal"]
 
 
 def test_rank_offers_merit_first_exact_tiers_collapse_across_scales() -> None:
     """Scale-artifact guard: internal exact (0.95) and external exact (1.0) are the SAME fit
-    tier, so the transactability tiebreaker fires and buy-here (internal) ranks first — the
-    0.05 cross-scale gap must NOT invert the demotion."""
+    tier; the raw fit score is the final deterministic tiebreak."""
     import routes.agent_shop_gateway as gateway
 
     external_exact = _external_offer("of:external_exact", 1.0)
@@ -1184,8 +1207,7 @@ def test_rank_offers_merit_first_exact_tiers_collapse_across_scales() -> None:
 
     ranked = gateway._rank_offers_merit_first([external_exact, internal_exact])
 
-    assert [o["offer_id"] for o in ranked] == ["of:internal_exact", "of:external_exact"]
-    assert ranked[0]["purchase_route"] == "internal_checkout"
+    assert [o["offer_id"] for o in ranked] == ["of:external_exact", "of:internal_exact"]
 
 
 def test_rank_offers_merit_first_exact_external_beats_lower_tier_internal() -> None:
@@ -1217,6 +1239,118 @@ def test_rank_offers_merit_first_pure_internal_order_unchanged() -> None:
     ranked = gateway._rank_offers_merit_first(list(internal_offers))
 
     assert [o["offer_id"] for o in ranked] == [o["offer_id"] for o in internal_offers]
+
+
+def test_rank_offers_merit_first_puts_a_sold_out_offer_behind_a_sellable_one_of_equal_fit() -> None:
+    """The Purito case at the ranker: equal fit, the cheaper-but-sold-out seller must not lead.
+    Every lane spells "cannot sell" through `in_stock`; the catalog arm also ships `availability`."""
+    import routes.agent_shop_gateway as gateway
+
+    sold_out = {**_external_offer("of:eyurs", 0.8), "availability": "out_of_stock",
+                "in_stock": False}
+    in_stock = {**_external_offer("of:sokoglam", 0.8), "availability": "in_stock",
+                "in_stock": True}
+    ranked = gateway._rank_offers_merit_first([sold_out, in_stock])
+    assert [o["offer_id"] for o in ranked] == ["of:sokoglam", "of:eyurs"]
+
+
+def test_rank_offers_merit_first_reads_the_flag_alone_when_a_lane_ships_no_availability() -> None:
+    """The seed and internal lanes emit `in_stock` and no `availability` key at all."""
+    import routes.agent_shop_gateway as gateway
+
+    sold_out = {**_external_offer("of:seed_sold_out", 0.8), "in_stock": False}
+    sellable = {**_external_offer("of:seed_sellable", 0.8), "in_stock": True}
+    ranked = gateway._rank_offers_merit_first([sold_out, sellable])
+    assert [o["offer_id"] for o in ranked] == ["of:seed_sellable", "of:seed_sold_out"]
+
+
+def test_rank_offers_merit_first_does_not_demote_unknown_availability() -> None:
+    """Unknown is not out of stock: an offer that states nothing keeps its place (stable sort)
+    ahead of a later in-stock one — only an explicit "cannot sell" moves an offer down."""
+    import routes.agent_shop_gateway as gateway
+
+    unknown = {**_external_offer("of:unknown", 0.8), "availability": "unknown", "in_stock": True}
+    silent = _external_offer("of:silent", 0.8)  # no stock statement of any kind
+    in_stock = {**_external_offer("of:in_stock", 0.8), "availability": "in_stock",
+                "in_stock": True}
+    ranked = gateway._rank_offers_merit_first([unknown, silent, in_stock])
+    assert [o["offer_id"] for o in ranked] == ["of:unknown", "of:silent", "of:in_stock"]
+
+
+def test_rank_offers_merit_first_puts_a_sold_out_buy_here_offer_behind_an_equal_fit_referral() -> None:
+    """The internal exemption is gone: a buy-here offer whose flag says sold out no longer wins
+    an equal-fit tie on transactability. Its flag is the eligibility gate's own stock verdict
+    now, so False means the gate would refuse the variant (see `_build_internal_offer_summary`).
+    """
+    import routes.agent_shop_gateway as gateway
+
+    internal_sold_out = {**_internal_offer("of:internal", 0.95), "in_stock": False}
+    external_in_stock = {**_external_offer("of:external", 1.0), "in_stock": True}
+    ranked = gateway._rank_offers_merit_first([internal_sold_out, external_in_stock])
+    assert [o["offer_id"] for o in ranked] == ["of:external", "of:internal"]
+
+
+def test_rank_offers_merit_first_sellable_checkout_routes_compete_on_merit() -> None:
+    import routes.agent_shop_gateway as gateway
+
+    internal_in_stock = {**_internal_offer("of:internal", 0.95), "in_stock": True}
+    external_in_stock = {**_external_offer("of:external", 1.0), "in_stock": True}
+    ranked = gateway._rank_offers_merit_first([external_in_stock, internal_in_stock])
+    assert [o["offer_id"] for o in ranked] == ["of:external", "of:internal"]
+
+
+# The internal offer's `in_stock` IS the gate's stock verdict. Each row: the variant the offer
+# ships (None = no variant; the product is read the way the gate reads a product with none), the
+# product around it, and the flag an agent must see. Expected values are spelled out rather than
+# only compared to the gate, so a change that broke both the same way would still fail here.
+_INTERNAL_STOCK_CASES = [
+    # untracked / keep-selling: the platform says buyable at quantity 0
+    pytest.param({"available": True, "inventory_quantity": 0}, {}, True, id="untracked_available_qty0"),
+    pytest.param({"available": False, "inventory_quantity": 5}, {}, False, id="available_false_beats_qty"),
+    pytest.param({"inventory_quantity": 0}, {}, False, id="qty0"),
+    pytest.param({"inventory_quantity": 3}, {}, True, id="qty3"),
+    pytest.param({"availability": "out_of_stock"}, {}, False, id="availability_oos"),
+    pytest.param({"availability": "in_stock"}, {}, True, id="availability_in_stock"),
+    pytest.param({}, {"inventory_quantity": 0, "in_stock": False}, True,
+                 id="variant_states_nothing_is_not_oos_whatever_the_product_says"),
+    pytest.param(None, {"in_stock": False, "inventory_quantity": 5}, False,
+                 id="no_variant_product_in_stock_false_beats_qty"),
+    pytest.param(None, {"inventory_quantity": 0}, False, id="no_variant_product_qty0"),
+    pytest.param(None, {"inventory_quantity": 4}, True, id="no_variant_product_qty4"),
+]
+
+
+@pytest.mark.parametrize("variant, product_extra, expected", _INTERNAL_STOCK_CASES)
+def test_internal_offer_in_stock_is_the_eligibility_gates_verdict(variant, product_extra, expected) -> None:
+    import routes.agent_shop_gateway as gateway
+    from services.product_exposure_service import (
+        _standard_variant_reason_codes,
+        product_as_standard_variant,
+    )
+
+    product = {"id": "p1", "title": "P", "price": 10.0, "currency": "USD", **product_extra}
+    variant_payload = {"id": "v1", "price": 10.0, **variant} if variant is not None else {}
+    summary = gateway._build_internal_offer_summary(
+        merchant_id="m1", platform="shopify", product_payload=product,
+        variant_payload=variant_payload, confidence=0.95,
+        canonical_ref=None, canonical_group_id=None,
+    )
+    gate_view = variant_payload or product_as_standard_variant(product)
+    gate_says_in_stock = "out_of_stock" not in _standard_variant_reason_codes(
+        gate_view, product_currency="USD")
+    assert summary["in_stock"] is expected
+    assert summary["in_stock"] is gate_says_in_stock
+
+
+def test_rank_offers_merit_first_stock_does_not_jump_a_fit_tier() -> None:
+    """A product-grain "in stock" says SOME variant is on the shelf, not the one that matched
+    exactly, so it stays behind an exact match even when that match is sold out."""
+    import routes.agent_shop_gateway as gateway
+
+    exact_sold_out = {**_external_offer("of:exact", 1.0), "in_stock": False}
+    product_in_stock = {**_external_offer("of:product", 0.8), "in_stock": True}
+    ranked = gateway._rank_offers_merit_first([product_in_stock, exact_sold_out])
+    assert [o["offer_id"] for o in ranked] == ["of:exact", "of:product"]
 
 
 def test_offers_resolve_ranks_higher_merit_external_above_lower_merit_internal(
@@ -1317,13 +1451,10 @@ def test_offers_resolve_ranks_higher_merit_external_above_lower_merit_internal(
     assert isinstance(internal["internal_checkout_items"], list)
 
 
-def test_offers_resolve_exact_internal_beats_exact_external_end_to_end(
+def test_offers_resolve_exact_offers_do_not_rank_by_checkout_transport_end_to_end(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:
-    """End-to-end tiebreaker (now REACHABLE): when the SAME sku matches both an internal
-    (buy-here, confidence 0.95) and an external (referral, confidence 1.0) offer, they are the
-    same fit tier -> transactability breaks the tie -> the internal buy-here offer ranks first.
-    The 0.95-vs-1.0 cross-scale gap must not invert the demotion."""
+    """An exact external offer can lead an exact internal offer on merit."""
     import routes.agent_shop_gateway as gateway
 
     async def fake_fetch_all(query: str, values=None):
@@ -1400,19 +1531,191 @@ def test_offers_resolve_exact_internal_beats_exact_external_end_to_end(
     offers = body.get("offers") or []
     assert len(offers) >= 2, "both the exact internal and exact external offer should be present"
 
-    # Same fit tier (exact) -> transactability tiebreaker -> buy-here (internal) first.
-    assert offers[0]["purchase_route"] == "internal_checkout"
-    assert offers[0]["source"]["type"] == "internal_product"
+    assert offers[0]["purchase_route"] == "affiliate_outbound"
     external = next(o for o in offers if o["purchase_route"] == "affiliate_outbound")
-    assert offers.index(offers[0]) < offers.index(external)
-    # Despite the external carrying a numerically higher raw confidence.
-    assert external["confidence"] > offers[0]["confidence"]
+    internal = next(o for o in offers if o["purchase_route"] == "internal_checkout")
+    assert offers.index(external) < offers.index(internal)
+    assert external["confidence"] > internal["confidence"]
 
     # Honest labels remain on both.
-    assert offers[0]["affiliate_url"] is None
-    assert isinstance(offers[0]["internal_checkout_items"], list)
+    assert internal["affiliate_url"] is None
+    assert isinstance(internal["internal_checkout_items"], list)
     assert external["affiliate_url"].startswith("https://example.com/r?token=")
     assert external["internal_checkout_items"] is None
+
+
+def _stock_tie_fetch_all(internal_variant: dict):
+    """One exact internal row (the queried sku, confidence 0.95) and one exact, in-stock
+    referral seed for the same sku (1.0) -- the same fit tier, so stock and then merit
+    decide the order. The cache product is a valid StandardProduct so the
+    gate exercises the same normalization path as real synced products."""
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM external_product_seeds" in q:
+            return [
+                {
+                    "id": "eps_stock_1",
+                    "external_product_id": "ext_stock_1",
+                    "market": "US",
+                    "tool": "*",
+                    "destination_url": "https://brand.example/products/serum",
+                    "canonical_url": "https://brand.example/products/serum",
+                    "domain": "brand.example",
+                    "title": "Brand Serum (referral)",
+                    "price_amount": 25.0,
+                    "price_currency": "USD",
+                    "availability": "in_stock",
+                    "utm_template": None,
+                    "seed_data": {
+                        "snapshot": dict(_VERIFIED_CONTENT),
+                        "brand": "Brand Example",
+                        "variants": [
+                            {
+                                "variant_id": "SKU_STOCK_EXACT",
+                                "title": "Brand Serum 30ml",
+                                "price_amount": 25.0,
+                                "price_currency": "USD",
+                                "availability": "in_stock",
+                            }
+                        ],
+                    },
+                    "status": "active",
+                    **_VERIFIED_DESTINATION,
+                }
+            ]
+        if "FROM products_cache" in q:
+            return [
+                {
+                    "merchant_id": "merch_stock",
+                    "product_data": {
+                        "id": "prod_stock_1",
+                        "platform": "shopify",
+                        "merchant_id": "merch_stock",
+                        "title": "Internal Serum (buy-here)",
+                        "currency": "USD",
+                        "price": 24.0,
+                        "merchant_name": "Buy-Here Store",
+                        "variants": [{"id": "SKU_STOCK_EXACT", "title": "30ml", "price": 24.0,
+                                      **internal_variant}],
+                    },
+                }
+            ]
+        return []
+
+    return fake_fetch_all
+
+
+def _post_stock_tie(monkeypatch, client, internal_variant: dict, *, limit: int,
+                    commerce_surface=None) -> dict:
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
+
+    monkeypatch.setattr(gateway.database, "fetch_all", _stock_tie_fetch_all(internal_variant))
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(
+        gateway, "_make_external_redirect_url", AsyncMock(return_value="https://example.com/r?token=stock")
+    )
+    payload = {"product": {"sku_id": "SKU_STOCK_EXACT"}, "limit": limit, "market": "US", "tool": "*"}
+    if commerce_surface:
+        payload["commerce_surface"] = commerce_surface
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={"operation": "offers.resolve", "payload": payload,
+              "metadata": {"source": "creator-agent-ui"}},
+    )
+    assert res.status_code == 200
+    return res.json()
+
+
+def test_relaxed_fallback_sold_out_buy_here_offer_ranks_behind_an_in_stock_referral(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """RELAXED mode (no commerce_surface): no variant passes the gate, so the handler falls back
+    to variants[0] and ships a buy-here offer that cannot be bought. While internal offers were
+    exempt from the stock rank, it won the equal-fit tie over the in-stock referral on
+    transactability. It now prints the gate's verdict (False) and ranks behind it."""
+    body = _post_stock_tie(monkeypatch, client, {"inventory_quantity": 0}, limit=10)
+    offers = body.get("offers") or []
+    assert [o["purchase_route"] for o in offers] == ["affiliate_outbound", "internal_checkout"]
+    assert [o["in_stock"] for o in offers] == [True, False]
+    # Both still ship, so the internal row is still the resolution; the order is what changed.
+    assert body["resolution_mode"] == "exact_match"
+
+
+def test_relaxed_fallback_sold_out_buy_here_offer_at_limit_1_reports_external_only(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """limit=1 cuts the sold-out buy-here offer, and resolution_mode is reconciled against what
+    SHIPS: a response holding one referral says external_only, names no resolved_target, and
+    does not claim an internal offer."""
+    body = _post_stock_tie(monkeypatch, client, {"inventory_quantity": 0}, limit=1)
+    offers = body.get("offers") or []
+    assert [o["purchase_route"] for o in offers] == ["affiliate_outbound"]
+    assert offers[0]["in_stock"] is True
+    assert body["resolution_mode"] == "external_only"
+    assert body.get("resolved_target") is None
+    assert body["substitution_reason_codes"] == []
+    assert body["metadata"]["has_internal"] is False
+    assert body["metadata"]["has_external"] is True
+
+
+@pytest.mark.parametrize("commerce_surface", [None, "agent_api"], ids=["relaxed", "strict"])
+def test_untracked_inventory_does_not_create_a_checkout_transport_preference_at_limit_1(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, commerce_surface
+) -> None:
+    """A sellable internal offer remains eligible but does not outrank by source."""
+    body = _post_stock_tie(
+        monkeypatch, client, {"inventory_quantity": 0, "available": True},
+        limit=1, commerce_surface=commerce_surface,
+    )
+    offers = body.get("offers") or []
+    assert [o["purchase_route"] for o in offers] == ["affiliate_outbound"]
+    assert offers[0]["in_stock"] is True
+    assert body["resolution_mode"] == "external_only"
+    assert body.get("resolved_target") is None
+    assert body["metadata"]["has_internal"] is False
+
+
+@pytest.mark.parametrize(
+    "inventory_management, inventory_policy, expected",
+    [
+        pytest.param(None, "deny", True, id="untracked"),
+        pytest.param("shopify", "continue", True, id="keep_selling"),
+        pytest.param("shopify", "deny", False, id="tracked_sold_out"),
+    ],
+)
+def test_shopify_variant_sellability_survives_cache_roundtrip(
+    inventory_management, inventory_policy, expected
+) -> None:
+    import json
+
+    from adapters.product_adapters import ShopifyProductAdapter
+    from models.standard_product import StandardProduct
+    from services.product_exposure_service import pick_first_eligible_variant_from_standard_product
+
+    raw = {
+        "id": 100,
+        "title": "Shopify serum",
+        "status": "active",
+        "variants": [{
+            "id": 200,
+            "title": "30ml",
+            "price": "24.00",
+            "inventory_quantity": 0,
+            "inventory_management": inventory_management,
+            "inventory_policy": inventory_policy,
+        }],
+    }
+    product = ShopifyProductAdapter.convert_to_standard(raw, merchant_id="merch_stock")
+    # The sync caches product.json(); the gate then validates that JSON as StandardProduct.
+    cached = json.loads(product.model_dump_json())
+    revived = StandardProduct.model_validate(cached)
+    assert revived.variants[0].available is expected
+    assert bool(pick_first_eligible_variant_from_standard_product(cached)) is expected
+    assert product.in_stock is expected
 
 
 def test_offers_resolve_pure_internal_order_unchanged_end_to_end(
@@ -2639,6 +2942,7 @@ def test_the_allowlist_still_sees_the_destination_without_the_join_key(
     url = asyncio.run(
         gateway._make_external_redirect_url(
             market="US", tool="*",
+            market_observed=True,
             destination_url="https://brand.com/products/serum",
             utm_template=None, ctx={},
             merchant_id=None, product_id=None, variant_id="SKU-1",
@@ -3666,3 +3970,967 @@ def test_verification_dropping_an_internal_substitution_clears_the_target_too(
     assert body["resolved_target"] is None
     assert body["substitution_reason_codes"] == []
     assert (body.get("metadata") or {}).get("has_internal") is False
+
+
+# --- catalog_offers arm -------------------------------------------------------------------
+#
+# WHAT WAS DARK. offers.resolve sourced internal offers from `products_cache` and external offers
+# from `external_product_seeds`, and read `catalog_offers` nowhere. Measured in prod 2026-09-06:
+# 13,151 priced offers over 137 merchants, 1,246 of them `offer_type='retailer'` on 729
+# multi-seller products — and `get_offers` returned a retailer for none of them, because
+# `products_cache` held 24 unexpired rows against 15,419 catalog products.
+
+_CATALOG_OFFER_ROW = {
+    "offer_id": "of_sk_1",
+    "product_key": "prod::merch_obs_x::external_seed::cosrx-snail-essence",
+    "merchant_id": "stylekorean_global",
+    "currency": "USD",
+    "availability": "in_stock",
+    "offer_type": "retailer",
+    "is_first_party": False,
+    "readiness_tier": "referral_only",
+    "price_confidence": 0.9,
+    "updated_at": None,
+    "price_amount": 17.50,
+    "destination_url": "https://www.stylekorean.com/product/detail?pid=123",
+    "merchant_name": "StyleKorean",
+    "content_key": "ck_cosrx_snail",
+}
+
+
+def _catalog_arm_fetch_all(query: str, values=None, *, offer_rows=None):
+    """Every OTHER source misses, so only the catalog arm can answer."""
+    q = str(query)
+    if "FROM catalog_products" in q and "JOIN catalog_offers" in q:
+        return list(offer_rows if offer_rows is not None else [_CATALOG_OFFER_ROW])
+    return []
+
+
+def test_catalog_offers_arm_surfaces_a_retailer_by_signature(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """A retailer offer attached by scripts/attach_retailer_offer.py becomes visible to an agent."""
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        return _catalog_arm_fetch_all(query, values)
+
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(
+        gateway, "_make_external_redirect_url",
+        AsyncMock(return_value="https://example.com/r?token=catalog"))
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={"operation": "offers.resolve",
+              "payload": {"product": {"product_id": "sig_catalog_1"}, "limit": 10,
+                          "market": "US", "tool": "*", "commerce_surface": "agent_api"},
+              "metadata": {"source": "creator-agent-ui"}},
+    )
+    assert res.status_code == 200
+    body = res.json()
+    offers = body.get("offers") or []
+    assert offers, "an attached retailer offer must reach the agent"
+    o = offers[0]
+    # THE SHAPE THE GATEWAY READS. offerToSignal reads TOP-LEVEL merchant_id/merchant_name/
+    # availability/url; the seed and internal lanes emit seller/in_stock/source.merchant_id only,
+    # which is why their offers reach an agent that cannot name the merchant.
+    assert o["merchant_id"] == "stylekorean_global"
+    assert o["merchant_name"] == "StyleKorean"
+    assert o["availability"] == "in_stock"
+    assert o["url"] == "https://www.stylekorean.com/product/detail?pid=123"
+    assert o["price"] == 17.5 and o["currency"] == "USD"
+    assert o["purchase_route"] == "affiliate_outbound"
+    assert o["affiliate_url"] == "https://example.com/r?token=catalog"
+    assert o["cart_prefilled"] is None, "we do not know what a retailer destination lands on"
+    metadata = body.get("metadata") or {}
+    assert metadata.get("has_external") is True
+    assert any(
+        str(s.get("source")) == "catalog_offers"
+        and str(s.get("status")) == "ok"
+        and str(s.get("query")) == "catalog_offers_by_canonical_identity"
+        for s in (metadata.get("sources") or [])
+    )
+    # No new resolution_mode literal: an external-only answer keeps the existing vocabulary.
+    assert body.get("resolution_mode") == "external_only"
+
+
+def test_catalog_offers_arm_ships_an_in_stock_seller_ahead_of_a_cheaper_sold_out_one(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """Measured 2026-09-18 on the Purito Oat-in Calming Gel Cream: best offer eyurs.com $13
+    out_of_stock over sokoglam.com $19.50 in_stock. The fake returns the rows in the old
+    price-only order, so this proves the ranker downstream of the SQL holds the line too (the
+    SQL half, ORDER BY before LIMIT, can only be proved on Postgres — see
+    tests/test_offers_resolve_catalog_arm_postgres.py). It also pins that the SQL is handed the
+    SAME vocabulary the `in_stock` flag is computed from."""
+    import routes.agent_shop_gateway as gateway
+
+    rows = [
+        {**_CATALOG_OFFER_ROW, "offer_id": "of_eyurs", "merchant_id": "eyurs",
+         "merchant_name": "eyurs", "availability": "out_of_stock", "price_amount": 13.00,
+         "destination_url": "https://eyurs.com/products/purito-oat"},
+        {**_CATALOG_OFFER_ROW, "offer_id": "of_sokoglam", "merchant_id": "sokoglam",
+         "merchant_name": "Soko Glam", "availability": "in_stock", "price_amount": 19.50,
+         "destination_url": "https://sokoglam.com/products/purito-oat"},
+        {**_CATALOG_OFFER_ROW, "offer_id": "of_ohlolly", "merchant_id": "ohlolly",
+         "merchant_name": "Oh Lolly", "availability": "OUT_OF_STOCK ", "price_amount": 21.00,
+         "destination_url": "https://ohlolly.com/products/purito-oat"},
+    ]
+    bound = {}
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM catalog_products" in q and "JOIN catalog_offers" in q:
+            bound.update(values or {})
+        return _catalog_arm_fetch_all(query, values, offer_rows=rows)
+
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(
+        gateway, "_make_external_redirect_url",
+        AsyncMock(return_value="https://example.com/r?token=catalog"))
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={"operation": "offers.resolve",
+              "payload": {"product": {"product_id": "ext:retailer:purito"}, "limit": 10,
+                          "market": "US", "tool": "*", "commerce_surface": "agent_api"},
+              "metadata": {"source": "creator-agent-ui"}},
+    )
+    assert res.status_code == 200
+    offers = res.json().get("offers") or []
+    assert [o["source"]["offer_id"] for o in offers] == ["of_sokoglam", "of_eyurs", "of_ohlolly"]
+    assert [o["in_stock"] for o in offers] == [True, False, False]
+    assert bound.get("unavailable") == sorted(gateway.OFFER_UNAVAILABLE_AVAILABILITIES)
+
+
+def test_catalog_offers_arm_now_RUNS_beside_the_seed_lane(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """UNGATED. The first cut ran only when nothing else resolved, which made it nearly inert:
+    measured 2026-09-06, 1,124 products carry an unsuppressed retailer offer and 1,110 of them are
+    ALSO seeded — so the gate left the arm serving about 14. The competition worth showing lives
+    on exactly the products the gate excluded."""
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM catalog_products" in q and "JOIN catalog_offers" in q:
+            return [_CATALOG_OFFER_ROW]
+        return _sig_lane_fetch_all(query, values)
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
+
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(
+        gateway, "_make_external_redirect_url",
+        AsyncMock(return_value="https://example.com/r?token=x"))
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={"operation": "offers.resolve",
+              "payload": {"product": {"product_id": "sig_test_mirror_1"}, "limit": 10,
+                          "market": "US", "tool": "*", "commerce_surface": "agent_api"},
+              "metadata": {"source": "creator-agent-ui"}},
+    )
+    assert res.status_code == 200
+    offers = res.json().get("offers") or []
+    ids = [str(o.get("offer_id") or "") for o in offers]
+    assert any(i.startswith("of:external_seed:") for i in ids), "the seed lane still answers"
+    assert any(i.startswith("of:catalog_offer:") for i in ids), (
+        "the retailer must now appear BESIDE the seed offer — that is the competition"
+    )
+    # `row_count` is what the query FOUND; `emitted` is what this arm APPENDED. Without the second
+    # number a fully-truncated arm reads as "ok, row_count=1" while the buyer saw nothing from it.
+    assert any(
+        str(src.get("source")) == "catalog_offers" and src.get("emitted") == 1
+        for src in ((res.json().get("metadata") or {}).get("sources") or [])
+    ), "the arm must report what it actually emitted"
+
+
+def test_the_same_destination_is_not_offered_twice(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """`external_offer_dual_write` writes some destinations into BOTH stores, so the same retailer
+    can arrive twice. Measured over 400 product/offer/seed triples, 19 shared a destination host.
+    The key is the HOST, not the product: same host means we would send the buyer to the same
+    place twice."""
+    import routes.agent_shop_gateway as gateway
+
+    # a catalog offer pointing at the SAME host the seed lane's offer uses
+    same_host_row = {**_CATALOG_OFFER_ROW,
+                     "destination_url": "https://www.sigbrand.example/products/dup",
+                     "merchant_id": "dup_merchant"}
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM catalog_products" in q and "JOIN catalog_offers" in q:
+            return [same_host_row]
+        return _sig_lane_fetch_all(query, values)
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
+
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(
+        gateway, "_make_external_redirect_url",
+        AsyncMock(return_value="https://example.com/r?token=x"))
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={"operation": "offers.resolve",
+              "payload": {"product": {"product_id": "sig_test_mirror_1"}, "limit": 10,
+                          "market": "US", "tool": "*", "commerce_surface": "agent_api"},
+              "metadata": {"source": "creator-agent-ui"}},
+    )
+    assert res.status_code == 200
+    body = res.json()
+    ids = [str(o.get("offer_id") or "") for o in (body.get("offers") or [])]
+    assert not any(i.startswith("of:catalog_offer:") for i in ids), (
+        "a catalog offer pointing at a host the seed lane already claimed is a duplicate"
+    )
+    assert any(
+        str(s.get("source")) == "catalog_offers" and s.get("deduped") == 1
+        and s.get("emitted") is None  # deduped away, so nothing was emitted
+        for s in ((body.get("metadata") or {}).get("sources") or [])
+    ), "the dedupe must be counted, not silent"
+
+
+def test_catalog_offers_arm_reports_an_empty_answer_as_such(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """A zero must be diagnosable. The failure this system keeps producing is a silent empty that
+    reads as 'nothing matched' when a filter quietly dropped everything."""
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        return _catalog_arm_fetch_all(query, values, offer_rows=[])
+
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={"operation": "offers.resolve",
+              "payload": {"product": {"product_id": "sig_catalog_empty"}, "limit": 10,
+                          "market": "US", "tool": "*", "commerce_surface": "agent_api"},
+              "metadata": {"source": "creator-agent-ui"}},
+    )
+    assert res.status_code == 200
+    metadata = res.json().get("metadata") or {}
+    assert any(
+        str(s.get("source")) == "catalog_offers" and str(s.get("status")) == "empty"
+        and str(s.get("reason_code")) == "no_candidates"
+        for s in (metadata.get("sources") or [])
+    ), "the arm must record that it ran and matched nothing"
+
+
+def test_catalog_offers_arm_ships_the_offer_even_when_attribution_fails(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """_make_external_redirect_url returns None for a destination it will not sign. The seed lane
+    `continue`s on that — a silent drop. Here the offer still ships with its plain destination and
+    the shortfall is COUNTED, because an agent seeing nothing cannot tell 'no offers' from
+    'we refused to sign the link'. The outbound allowlist is empty in every market today
+    (measured 2026-09-06) and an empty allowlist allows all, so this is the guard, not the norm."""
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        return _catalog_arm_fetch_all(query, values)
+
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "_make_external_redirect_url", AsyncMock(return_value=None))
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={"operation": "offers.resolve",
+              "payload": {"product": {"product_id": "sig_catalog_1"}, "limit": 10,
+                          "market": "US", "tool": "*", "commerce_surface": "agent_api"},
+              "metadata": {"source": "creator-agent-ui"}},
+    )
+    assert res.status_code == 200
+    body = res.json()
+    offers = body.get("offers") or []
+    assert offers, "an unsignable destination must not silently drop the offer"
+    # VISIBLE, but not mislabelled: `affiliate_url` means an attributed /r link, so a refusal
+    # leaves it None rather than smuggling the raw destination under the signed-link key.
+    assert offers[0]["affiliate_url"] is None
+    assert offers[0]["url"] == "https://www.stylekorean.com/product/detail?pid=123"
+    assert any(
+        str(s.get("source")) == "catalog_offers" and s.get("unattributed") == 1
+        for s in ((body.get("metadata") or {}).get("sources") or [])
+    ), "the unattributed count must be visible in the source entry"
+
+
+def test_catalog_offers_arm_sources_only_retailer_offers(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """DEDUPE GUARD. `catalog_offers` also holds a `brand_direct` row for the same product, and the
+    seed lane already emits that destination — sourcing both would double-list the brand.
+
+    The fake SIMULATES THE DATABASE rather than ignoring the query: it applies the conjunct the way
+    Postgres would, so deleting the filter from the SQL changes what comes back. A fake that
+    returns its row whatever the query says cannot see this filter at all — the first version of
+    this suite had exactly that hole, and the mutant survived."""
+    import routes.agent_shop_gateway as gateway
+
+    brand_direct_row = {
+        **_CATALOG_OFFER_ROW,
+        "offer_id": "of_brand_1",
+        "merchant_id": "cosrx_direct",
+        "merchant_name": "COSRX",
+        "offer_type": "brand_direct",
+        "is_first_party": True,
+        "destination_url": "https://cosrx.com/products/snail-essence",
+    }
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM catalog_products" in q and "JOIN catalog_offers" in q:
+            # apply the conjunct as the DB would
+            if "offer_type = 'retailer'" in q:
+                return [_CATALOG_OFFER_ROW]
+            return [brand_direct_row, _CATALOG_OFFER_ROW]
+        return []
+
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(
+        gateway, "_make_external_redirect_url",
+        AsyncMock(return_value="https://example.com/r?token=catalog"))
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={"operation": "offers.resolve",
+              "payload": {"product": {"product_id": "sig_catalog_1"}, "limit": 10,
+                          "market": "US", "tool": "*", "commerce_surface": "agent_api"},
+              "metadata": {"source": "creator-agent-ui"}},
+    )
+    assert res.status_code == 200
+    offers = res.json().get("offers") or []
+    assert offers, "the retailer offer must still ship"
+    assert all(o["source"]["offer_type"] == "retailer" for o in offers), (
+        "a brand_direct row must never be sourced here — the seed lane already emits that "
+        "destination"
+    )
+    assert all(o["merchant_id"] != "cosrx_direct" for o in offers)
+
+
+def test_a_sku_matched_seed_offer_outranks_a_catalog_offer(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """RANKING, now that both sources compete. A catalog retailer offer names a PRODUCT page, so
+    it carries the handler's product-grain confidence (0.8); a seed offer that matched a variant
+    carries 1.0 and must stay ahead of it. Before the merge nothing ranked against this arm, so
+    its earlier 1.0 was an unfalsifiable overclaim — this is the test that would have caught it."""
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM catalog_products" in q and "JOIN catalog_offers" in q:
+            # cheaper than the seed offer, to prove ordering is by tier and not by price alone
+            return [{**_CATALOG_OFFER_ROW, "price_amount": 1.00}]
+        return _sig_lane_fetch_all(query, values)
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
+
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(
+        gateway, "_make_external_redirect_url",
+        AsyncMock(return_value="https://example.com/r?token=x"))
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={"operation": "offers.resolve",
+              "payload": {"product": {"product_id": "sig_test_mirror_1"}, "limit": 10,
+                          "market": "US", "tool": "*", "commerce_surface": "agent_api"},
+              "metadata": {"source": "creator-agent-ui"}},
+    )
+    assert res.status_code == 200
+    offers = res.json().get("offers") or []
+    ids = [str(o.get("offer_id") or "") for o in offers]
+    assert len(ids) >= 2, ids
+    seed_at = next(i for i, x in enumerate(ids) if x.startswith("of:external_seed:"))
+    cat_at = next(i for i, x in enumerate(ids) if x.startswith("of:catalog_offer:"))
+    assert seed_at < cat_at, (
+        "a variant-matched seed offer must outrank a product-grain catalog offer even when the "
+        "catalog offer is cheaper"
+    )
+    assert offers[cat_at]["confidence"] == 0.8
+
+
+def _many_variant_seed_row(n: int):
+    row = _sig_lane_seed_row()
+    data = dict(row.get("seed_data") or {})
+    data["variants"] = [
+        {"variant_id": f"v{i}", "id": f"v{i}", "title": f"Shade {i}", "sku": f"S{i}",
+         "price_amount": 45.0 + i, "price": 45.0 + i, "currency": "USD",
+         "price_currency": "USD", "availability": "in_stock", "in_stock": True,
+         "image_url": f"https://cdn.x/{i}.jpg"}
+        for i in range(n)
+    ]
+    row["seed_data"] = data
+    return row
+
+
+def test_a_variant_fan_out_cannot_truncate_the_competing_retailer_away(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """THE BLOCKING CASE. With no sku_id the seed lane emits one offer PER VARIANT — all to the
+    SAME host, all at the same confidence as a catalog retailer offer. Stable sort plus
+    seeds-first meant a ten-shade lipstick shipped ten links to one seller and truncated the
+    competing retailer away, while `metadata.sources` still said `catalog_offers: ok`.
+
+    Measured against the real route before the fix: 10 variants at limit=10 shipped 0 catalog
+    offers; 3 variants at limit=3 the same. In prod that is 6 products at limit=10 but 50 at
+    limit=3 and 98 at limit=2 — and the caller picks the limit."""
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM catalog_products" in q and "JOIN catalog_offers" in q:
+            return [_CATALOG_OFFER_ROW]
+        if "FROM catalog_products" in q and "pivota_signature_id = ANY" in q:
+            return [{"source_ref": "eps_sig_1"}]
+        if "FROM external_product_seeds" in q and "id = ANY(:mapped_seed_ids)" in q:
+            return [_many_variant_seed_row(12)]
+        return []
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
+
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(
+        gateway, "_make_external_redirect_url",
+        AsyncMock(return_value="https://example.com/r?token=x"))
+
+    for limit in (10, 3, 2):
+        res = client.post(
+            "/agent/shop/v1/invoke",
+            json={"operation": "offers.resolve",
+                  "payload": {"product": {"product_id": "sig_test_mirror_1"}, "limit": limit,
+                              "market": "US", "tool": "*", "commerce_surface": "agent_api"},
+                  "metadata": {"source": "creator-agent-ui"}},
+        )
+        assert res.status_code == 200
+        offers = res.json().get("offers") or []
+        ids = [str(o.get("offer_id") or "") for o in offers]
+        assert len(ids) <= limit, f"limit={limit} must still be honoured: {ids}"
+        # ...and the head must FILL: 12 seed variants + 1 retailer is 13 offers, so a limit of 10
+        # ships 10. Taking only one per host and stopping would ship 2 and waste the budget.
+        assert len(ids) == limit, f"limit={limit} must be filled, not just diversified: {ids}"
+        assert any(i.startswith("of:catalog_offer:") for i in ids), (
+            f"limit={limit}: the competing retailer must survive a variant fan-out — {ids}"
+        )
+        assert any(i.startswith("of:external_seed:") for i in ids), (
+            f"limit={limit}: the seed must still be represented — {ids}"
+        )
+
+
+def test_host_diverse_head_treats_hostless_offers_as_distinct() -> None:
+    """Internal (buy-here) offers name no destination host at all. Keying them all on the empty
+    string would collapse every one of them into a single slot and hand back one offer where the
+    caller asked for five — the opposite of the starvation this function exists to prevent."""
+    from routes.agent_shop_gateway import _host_diverse_head
+
+    hostless = [{"offer_id": f"of:internal:{i}", "source": {}} for i in range(5)]
+    assert len(_host_diverse_head(hostless, 5)) == 5
+    assert [o["offer_id"] for o in _host_diverse_head(hostless, 3)] == [
+        "of:internal:0", "of:internal:1", "of:internal:2"
+    ]
+
+    # THE CASE THAT DISTINGUISHES THE SENTINEL. Two hostless offers must BOTH reach the head in
+    # rank order; keying them on the empty string collapses them to one and lets a lower-ranked
+    # real host take the freed slot. The fill pass hides this whenever there is room, so the
+    # fixture must carry more offers than `limit`.
+    mixed = [
+        {"offer_id": "of:a", "url": "https://one.example/p"},
+        {"offer_id": "of:b", "source": {}},
+        {"offer_id": "of:c", "source": {}},
+        {"offer_id": "of:d", "url": "https://two.example/p"},
+        {"offer_id": "of:e", "url": "https://three.example/p"},
+    ]
+    assert [o["offer_id"] for o in _host_diverse_head(mixed, 3)] == ["of:a", "of:b", "of:c"]
+
+
+def test_enforced_preflight_degrades_the_cart_handoff_in_the_resolve_lane(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """The CALL SITE, on the population the gate actually applies to.
+
+    Two things this pins that unit tests on the helper cannot:
+
+    1. A mutation deleting the `continue` that consumes the verdict survives every helper test
+       — the decision computed and thrown away, which is the shape of every gate-that-does-not-
+       gate bug in this repo.
+    2. The gate only runs where a PRE-FILLED CART is handed over. The stock harness seed is
+       referral-only (`cart_prefilled: False`, `rail: 'referral'`), so an earlier version of
+       this test drove a population the gate is deliberately blind to and would have passed
+       with the wiring removed entirely. The seed here is stamped so `sole_stamped_variant_id`
+       answers and `cart_variant_id` is set.
+    """
+    import copy
+
+    import routes.agent_shop_gateway as gateway
+    from services import checkout_preflight as cp
+
+    CART_VID = "43062643884185"
+
+    def _stamped(rows):
+        """One snapshot variant carrying a NUMERIC shopify_variant_id — the only shape that
+        makes storefront_is_shopify true AND sole_stamped_variant_id answer."""
+        out = []
+        for r in rows or []:
+            if isinstance(r, dict) and isinstance(r.get("seed_data"), dict):
+                r = copy.deepcopy(r)
+                snap = r["seed_data"].setdefault("snapshot", {})
+                snap["storefront_platform"] = "shopify"
+                snap["variants"] = [{
+                    "shopify_variant_id": CART_VID,
+                    "variant_id": "SKU_SIG_1",
+                    "title": "Sig Brand Treatment 50ml",
+                    "price_amount": 45.0,
+                    "price_currency": "USD",
+                    "availability": "in_stock",
+                }]
+            out.append(r)
+        return out
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM catalog_products" in q and "JOIN catalog_offers" in q:
+            return [_CATALOG_OFFER_ROW]
+        return _stamped(_sig_lane_fetch_all(query, values))
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
+
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(
+        gateway, "_make_external_redirect_url",
+        AsyncMock(return_value="https://example.com/r?token=x"))
+
+    asked = []
+
+    async def refusing_preflight(offer):
+        asked.append(offer)
+        return cp.PreflightVerdict(
+            outcome=cp.BLOCK, reason=cp.R_GONE, would_block=True, mode=cp.mode())
+
+    monkeypatch.setattr(cp, "preflight_and_record", refusing_preflight)
+
+    def _seed_offers():
+        res = client.post(
+            "/agent/shop/v1/invoke",
+            json={"operation": "offers.resolve",
+                  "payload": {"product": {"product_id": "sig_test_mirror_1"}, "limit": 10,
+                              "market": "US", "tool": "*", "commerce_surface": "agent_api"},
+                  "metadata": {"source": "creator-agent-ui"}},
+        )
+        assert res.status_code == 200
+        return [o for o in (res.json().get("offers") or [])
+                if str(o.get("offer_id") or "").startswith("of:external_seed:")]
+
+    # NORMALISE, do not exclude. A first cut subtracted every field that differed between two
+    # identical calls, which swept up `execution_spec` wholesale — and cart_url/pdp_url live
+    # INSIDE it, so a mutant rewriting cart_url in shadow passed. Only the click id and the
+    # expiry legitimately vary per call.
+    _VOLATILE = re.compile(r"clk_[0-9a-f]+")
+
+    def _stable(obj):
+        if isinstance(obj, str):
+            return _VOLATILE.sub("clk_X", obj)
+        if isinstance(obj, dict):
+            return {k: _stable(v) for k, v in obj.items()
+                    if k not in {"click_id", "expires_at"}}
+        if isinstance(obj, list):
+            return [_stable(v) for v in obj]
+        return obj
+
+    # OFF: the baseline. No call at all, so no HTTP and no observation row.
+    monkeypatch.delenv("CHECKOUT_PREFLIGHT_MODE", raising=False)
+    baseline = _seed_offers()
+    assert baseline, "off must leave the lane untouched"
+    assert asked == [], "off must not spend a request"
+    assert _stable(baseline) == _stable(_seed_offers()), (
+        "two identical OFF calls differ after normalisation — the shadow comparison below "
+        "cannot be evidence")
+
+    # The gate must be asking about the CART variant, not the seed's SKU. Asking about
+    # `vid` (a plain SKU) is the round-5 fallback this file forbids and would refuse live
+    # referral links while poisoning the shadow number.
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
+    shadow = _seed_offers()
+    assert asked, "shadow must ASK on a cart-prefilled handoff — otherwise it measures nothing"
+    assert asked[0]["execution_spec"]["variant_id"] == CART_VID, (
+        f"preflight asked about {asked[0]['execution_spec']['variant_id']!r}, not the cart "
+        "variant the redirect will use")
+    assert _stable(shadow) == _stable(baseline), (
+        "shadow changed the buyer-facing payload — including anything nested in "
+        "execution_spec, where cart_url and pdp_url live")
+
+    # ENFORCE: the same verdict now takes the CART away — and only the cart. Deleting the
+    # offer would hide a still-reachable PDP; the refusal is evidence about the variant, not
+    # about the product page.
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "enforce")
+    enforced = _seed_offers()
+    assert enforced, "an enforced refusal must not delete the offer"
+    assert all(o.get("cart_prefilled") is False for o in enforced), (
+        "the refused handoff must degrade to a referral")
+    assert any(o.get("cart_prefilled") for o in baseline), (
+        "the baseline must actually have been cart-prefilled, or this proves nothing")
+
+
+def test_a_referral_only_offer_is_not_gated(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """The population the gate is deliberately blind to.
+
+    `cart_variant_id` is None whenever we cannot name the variant with evidence, and the
+    redirect degrades to an honest referral. Asking the merchant about the seed's `vid` there
+    means asking about a plain SKU — `variant_absent` — which would refuse live referral links
+    and fill the shadow report with refusals that are artifacts of the question. The stock
+    harness seed is exactly that shape, so this uses it unmodified.
+    """
+    import routes.agent_shop_gateway as gateway
+    from services import checkout_preflight as cp
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM catalog_products" in q and "JOIN catalog_offers" in q:
+            return [_CATALOG_OFFER_ROW]
+        return _sig_lane_fetch_all(query, values)
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
+
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(
+        gateway, "_make_external_redirect_url",
+        AsyncMock(return_value="https://example.com/r?token=x"))
+
+    asked = []
+
+    async def refusing_preflight(offer):
+        asked.append(offer)
+        return cp.PreflightVerdict(
+            outcome=cp.BLOCK, reason=cp.R_GONE, would_block=True, mode=cp.mode())
+
+    monkeypatch.setattr(cp, "preflight_and_record", refusing_preflight)
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "enforce")
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={"operation": "offers.resolve",
+              "payload": {"product": {"product_id": "sig_test_mirror_1"}, "limit": 10,
+                          "market": "US", "tool": "*", "commerce_surface": "agent_api"},
+              "metadata": {"source": "creator-agent-ui"}},
+    )
+    assert res.status_code == 200
+    offers = [o for o in (res.json().get("offers") or [])
+              if str(o.get("offer_id") or "").startswith("of:external_seed:")]
+    assert offers, "a referral-only offer must survive even a REFUSING preflight under enforce"
+    assert all(o.get("cart_prefilled") is False for o in offers), "fixture is referral-only"
+    assert asked == [], "the gate must not ask about a variant the redirect declined to use"
+
+
+def _preflight_harness(monkeypatch, *, rows, stamped=True, stamped_indices=None):
+    """offers.resolve with N seed rows and a counting preflight. Returns the ask log.
+
+    `stamped=False` builds referral-only rows (no cart variant) -- the population the gate is
+    blind to by design; `stamped_indices` stamps only those row indices, for a MIXED request."""
+    import copy
+
+    import routes.agent_shop_gateway as gateway
+    from services import checkout_preflight as cp
+
+    CART_VID = "43062643884185"
+
+    def _prep(fetched):
+        out = []
+        for i, r in enumerate(fetched or []):
+            if isinstance(r, dict) and isinstance(r.get("seed_data"), dict):
+                r = copy.deepcopy(r)
+                # DISTINCT question per row. Every row being a copy of one seed made the memo
+                # dedup them to a single ask, which MASKED the budget: dropping `available()`
+                # at the call site still produced one ask and the test passed. The budget and
+                # the memo must be separable, so each row gets its own pdp_url and its own
+                # cart variant.
+                r["id"] = f"{r.get('id')}_{i}"
+                r["external_product_id"] = f"{r.get('external_product_id')}_{i}"
+                for _k in ("destination_url", "canonical_url"):
+                    r[_k] = f"{r[_k]}-{i}"
+                if stamped and (stamped_indices is None or i in stamped_indices):
+                    snap = r["seed_data"].setdefault("snapshot", {})
+                    snap["storefront_platform"] = "shopify"
+                    snap["variants"] = [{
+                        "shopify_variant_id": f"{CART_VID}{i}", "variant_id": "SKU_SIG_1",
+                        "title": "T", "price_amount": 45.0, "price_currency": "USD",
+                        "availability": "in_stock"}]
+                # the CANDIDATE list the loop iterates is seed_data["variants"], which is a
+                # different key from snapshot.variants that cart_variant_id comes from
+                r["seed_data"]["variants"] = [
+                    {"variant_id": f"SKU_{n}", "title": f"V{n}", "price_amount": 45.0,
+                     "price_currency": "USD", "availability": "in_stock"}
+                    for n in range(rows["variants_per_row"])
+                ]
+            out.append(r)
+        return out
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM catalog_products" in q and "JOIN catalog_offers" in q:
+            return [_CATALOG_OFFER_ROW]
+        fetched = _sig_lane_fetch_all(query, values)
+        if fetched and isinstance(fetched[0], dict) and "seed_data" in fetched[0]:
+            fetched = fetched * rows["n_rows"]
+        return _prep(fetched)
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
+
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(
+        gateway, "_make_external_redirect_url",
+        AsyncMock(return_value="https://example.com/r?token=x"))
+
+    asked = []
+
+    async def counting(offer):
+        asked.append(offer)
+        return cp.PreflightVerdict(outcome=cp.OK, reason=cp.R_OK, would_block=False,
+                                   mode=cp.mode())
+
+    monkeypatch.setattr(cp, "preflight_and_record", counting)
+    return asked
+
+
+def test_the_budget_is_one_per_request_not_one_per_seed_row(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """`_PreflightBudget()` was constructed inside `for row in seed_rows`, so it reset on every
+    row: six rows under a cap of two ran six preflights, and 240 rows x 8 is 1,920 asks. One
+    budget for the whole request is the only thing that bounds a resolve."""
+    asked = _preflight_harness(monkeypatch, rows={"n_rows": 4, "variants_per_row": 1})
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MAX_PER_REQUEST", "1")
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={"operation": "offers.resolve",
+              "payload": {"product": {"product_id": "sig_test_mirror_1"}, "limit": 20,
+                          "market": "US", "tool": "*", "commerce_surface": "agent_api"},
+              "metadata": {"source": "creator-agent-ui"}},
+    )
+    assert res.status_code == 200
+    # Each row carries a DISTINCT question, so the memo cannot account for the limit — only
+    # the budget can. Without that, dropping `available()` at the call site still produced a
+    # single ask and this test passed.
+    assert len(asked) == 1, (
+        f"cap of 1 across the whole request, but the preflight was asked {len(asked)} times — "
+        "the budget is resetting per seed row, or is not consulted at all")
+
+
+def test_one_row_asks_once_however_many_variants_it_has(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """`cart_variant_id` comes from snapshot.variants (a ROW property) while the gate sits
+    inside `for v in matched_variants` — so every candidate asks the merchant the IDENTICAL
+    question. Twelve variants burned the cap on eight duplicates and multiplied that row's
+    contribution to the shadow denominator eightfold."""
+    asked = _preflight_harness(monkeypatch, rows={"n_rows": 1, "variants_per_row": 6})
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MAX_PER_REQUEST", "50")
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={"operation": "offers.resolve",
+              "payload": {"product": {"product_id": "sig_test_mirror_1"}, "limit": 20,
+                          "market": "US", "tool": "*", "commerce_surface": "agent_api"},
+              "metadata": {"source": "creator-agent-ui"}},
+    )
+    assert res.status_code == 200
+    assert len(asked) <= 1, (
+        f"one distinct question, asked {len(asked)} times — the verdict is not memoised")
+
+
+def test_a_refused_cart_prefill_degrades_to_a_referral_rather_than_deleting_the_offer(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """The merchant saying this VARIANT is gone is evidence about the cart prefill, not about
+    the product page. Deleting the offer would hide a still-reachable PDP and silently shrink
+    results — the gate-that-deletes-supply shape. It ships as an honest referral instead."""
+    import routes.agent_shop_gateway as gateway
+    from services import checkout_preflight as cp
+
+    _preflight_harness(monkeypatch, rows={"n_rows": 1, "variants_per_row": 1})
+
+    async def refusing(offer):
+        return cp.PreflightVerdict(outcome=cp.BLOCK, reason=cp.R_GONE, would_block=True,
+                                   mode=cp.mode())
+
+    monkeypatch.setattr(cp, "preflight_and_record", refusing)
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "enforce")
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={"operation": "offers.resolve",
+              "payload": {"product": {"product_id": "sig_test_mirror_1"}, "limit": 20,
+                          "market": "US", "tool": "*", "commerce_surface": "agent_api"},
+              "metadata": {"source": "creator-agent-ui"}},
+    )
+    assert res.status_code == 200
+    offers = [o for o in (res.json().get("offers") or [])
+              if str(o.get("offer_id") or "").startswith("of:external_seed:")]
+    assert offers, "a refused cart prefill must not delete the offer"
+    assert all(o.get("cart_prefilled") is False for o in offers), (
+        "the refused offer must ship as a referral, not a cart")
+
+
+def test_the_resolve_emits_its_preflight_coverage(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, caplog
+) -> None:
+    """The CALL, not the emitter.
+
+    `_emit_preflight_coverage` has its own unit test, and that test passes with the call site
+    deleted — the third time in this PR that a helper was covered while nothing pinned that it
+    is invoked. The counters are useless unless the request actually reads them, so this drives
+    the real loop and asserts the line appears.
+    """
+    import logging
+
+    asked = _preflight_harness(monkeypatch, rows={"n_rows": 2, "variants_per_row": 3})
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MAX_PER_REQUEST", "50")
+
+    with caplog.at_level(logging.INFO):
+        res = client.post(
+            "/agent/shop/v1/invoke",
+            json={"operation": "offers.resolve",
+                  "payload": {"product": {"product_id": "sig_test_mirror_1"}, "limit": 20,
+                              "market": "US", "tool": "*", "commerce_surface": "agent_api"},
+                  "metadata": {"source": "creator-agent-ui"}},
+        )
+    assert res.status_code == 200
+    assert asked, "the harness must have produced at least one ask"
+    rec = next((r for r in caplog.records
+                if getattr(r, "event", None) == "offers.resolve.summary"), None)
+    assert rec is not None, "the summary record is the carrier for coverage"
+    assert getattr(rec, "preflight_gated", 0) > 0, (
+        "the request ended without reading its own counters — the coverage denominator does "
+        "not exist")
+    assert hasattr(rec, "preflight_answered_fraction")
+    assert getattr(rec, "preflight_mode") == "shadow"
+
+
+def _summary_record(caplog):
+    return next((r for r in caplog.records
+                 if getattr(r, "event", None) == "offers.resolve.summary"), None)
+
+
+def _resolve(client):
+    return client.post(
+        "/agent/shop/v1/invoke",
+        json={"operation": "offers.resolve",
+              "payload": {"product": {"product_id": "sig_test_mirror_1"}, "limit": 20,
+                          "market": "US", "tool": "*", "commerce_surface": "agent_api"},
+              "metadata": {"source": "creator-agent-ui"}},
+    )
+
+
+def test_a_referral_only_request_attaches_no_coverage(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, caplog
+) -> None:
+    """The POPULATION pin. `cart_prefilled` must be counted inside `if _cart_vid:`; hoisting it
+    out made every referral-only resolve (the majority, blind by design) report
+    answered_fraction=0.000 -- the round-1 defect -- and passed 140/140 because no test ever
+    built referral-only rows. `_preflight_harness(stamped=False)` existed for this and was
+    never used."""
+    import logging
+
+    asked = _preflight_harness(monkeypatch, rows={"n_rows": 3, "variants_per_row": 4}, stamped=False)
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
+    with caplog.at_level(logging.INFO):
+        assert _resolve(client).status_code == 200
+    assert asked == [], "a referral-only row must never be asked about"
+    rec = _summary_record(caplog)
+    assert rec is not None
+    assert not any(k.startswith("preflight_") for k in vars(rec)), (
+        "the gate applied to nothing on this request; a coverage field here is a 0.000 that "
+        "someone will read as 'the gate covers nothing'")
+    assert " preflight " not in rec.getMessage(), (
+        "the preflight half of the message must be absent for the same reason the fields are")
+    # #2151: the HAND-OVER half is present, and deliberately so. It is the answer to "why did
+    # the gate apply to nothing", and suppressing it on exactly the requests where everything
+    # was refused would hide the only population worth reading. It carries no preflight_ field
+    # and no fraction anyone can mistake for gate coverage.
+    assert "handover considered=12" in rec.getMessage()
+    assert "resolved=0" in rec.getMessage()
+
+
+def test_a_mixed_request_counts_only_gated_rows_in_the_denominator(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, caplog
+) -> None:
+    """candidates counts every seed offer; `gated` only the ones the gate applies to."""
+    import logging
+
+    asked = _preflight_harness(monkeypatch, rows={"n_rows": 4, "variants_per_row": 3},
+                               stamped_indices={0, 2})
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MAX_PER_REQUEST", "50")
+    with caplog.at_level(logging.INFO):
+        assert _resolve(client).status_code == 200
+    rec = _summary_record(caplog)
+    assert rec is not None and asked
+    assert rec.preflight_candidates == 12
+    assert rec.preflight_gated == 6
+    assert rec.preflight_carts_built == 6
+    assert rec.preflight_candidates > rec.preflight_gated
+    assert rec.preflight_answered_fraction == 1.0
+    # and the values are in the MESSAGE, not only in `extra`, which no formatter here renders
+    msg = rec.getMessage()
+    assert "gated=6" in msg and "carts_built=6" in msg
+    assert "answered_fraction=1.000" in msg and "mode=shadow" in msg
+
+
+def test_no_coverage_line_when_the_preflight_is_off(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, caplog
+) -> None:
+    """Off must not put a line in every resolve."""
+    import logging
+
+    _preflight_harness(monkeypatch, rows={"n_rows": 1, "variants_per_row": 2})
+    monkeypatch.delenv("CHECKOUT_PREFLIGHT_MODE", raising=False)
+
+    with caplog.at_level(logging.INFO):
+        res = client.post(
+            "/agent/shop/v1/invoke",
+            json={"operation": "offers.resolve",
+                  "payload": {"product": {"product_id": "sig_test_mirror_1"}, "limit": 20,
+                              "market": "US", "tool": "*", "commerce_surface": "agent_api"},
+                  "metadata": {"source": "creator-agent-ui"}},
+        )
+    assert res.status_code == 200
+    rec = next((r for r in caplog.records
+                if getattr(r, "event", None) == "offers.resolve.summary"), None)
+    assert rec is None or not hasattr(rec, "preflight_answered_fraction"), (
+        "off must not attach coverage fields")

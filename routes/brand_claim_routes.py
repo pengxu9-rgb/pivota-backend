@@ -67,6 +67,84 @@ class AttestBody(BaseModel):
     )
 
 
+class DeclareDomainBody(BaseModel):
+    domain: str = Field(
+        ...,
+        description=(
+            "An additional domain this merchant operates. Stored as `declared` "
+            "and NOT counted as official until control is proven via a claim."
+        ),
+    )
+
+
+@router.post("/official-domains/declare")
+async def declare_official_domain(
+    body: DeclareDomainBody,
+    merchant_id: str = Depends(get_current_merchant),
+):
+    """P0 item 5 — declare an additional official domain for the AUTHENTICATED
+    merchant.
+
+    Scoped to the caller's own merchant_id from the token, never a body field:
+    the whole hazard here is attaching someone else's storefront to your audit.
+    A domain another merchant has PROVEN is refused outright.
+
+    The declaration does not count toward the official-domain set. It is stored
+    so the portal can offer verification and so a claim can be started against
+    it — POST /claim with this domain, publish the TXT record, POST
+    /claim/verify — which is what promotes it to `verified`.
+    """
+    result = await svc.declare_official_domain(merchant_id, body.domain)
+    status = result.get("status")
+    if status == svc.DECLARE_INVALID_HOST:
+        raise HTTPException(
+            status_code=422,
+            detail="domain must be a valid public hostname",
+        )
+    if status == svc.DECLARE_NOT_REGISTRABLE:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "that is a public suffix or shared platform host, not a "
+                "domain a single merchant owns"
+            ),
+        )
+    if status == svc.DECLARE_TOO_MANY:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "too many unverified declarations; verify the existing ones "
+                "before adding more"
+            ),
+        )
+    if status == svc.DECLARE_UNAVAILABLE:
+        # 503: the owned-set read failed, so whether the merchant already has
+        # this host could not be answered. Refusing is the only safe answer —
+        # granting here is how a verified row could be downgraded — and it is
+        # OUR outage, so neither 4xx nor "taken".
+        raise HTTPException(
+            status_code=503,
+            detail="could not read your official-domain set; retry shortly",
+        )
+    if status == svc.DECLARE_WRITE_FAILED:
+        # 500, and explicitly NOT 422: the hostname was fine, the write was
+        # not. Answering 422 here is how a missing migration presented as
+        # "domain must be a valid public hostname".
+        raise HTTPException(
+            status_code=500, detail="could not record the declaration",
+        )
+    if status == svc.DECLARE_TAKEN:
+        # 409, not 403: the caller is authenticated and allowed here; the
+        # DOMAIN is the thing in conflict. Deliberately does not say which
+        # merchant proved it — that would leak the mapping to anyone who can
+        # guess a hostname.
+        raise HTTPException(
+            status_code=409,
+            detail="that domain is already proven by another merchant",
+        )
+    return result
+
+
 @router.post("/claim")
 async def start_claim(
     body: StartClaimBody,

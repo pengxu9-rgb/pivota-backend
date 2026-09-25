@@ -402,3 +402,122 @@ def test_extract_click_id_absent_returns_none():
     assert svc.extract_click_id_from_note_attributes([]) is None
     assert svc.extract_click_id_from_note_attributes(None) is None
     assert svc.extract_click_id_from_note_attributes([{"name": "pivota_click_id", "value": " "}]) is None
+
+
+# --- partner-reported closes credit the agent that opened the purchase ----------
+
+
+async def _partner_close(fake: "FakeDB", provenance: Dict[str, Any], **over: Any) -> Dict[str, Any]:
+    kwargs: Dict[str, Any] = dict(
+        merchant_id="merch_test",
+        click_id="clk_known",
+        external_order_id="7001",
+        gross_amount_cents=4500,
+        currency="USD",
+        trusted_partner_provenance=provenance,
+    )
+    kwargs.update(over)
+    await svc.close_external_order_conversion(**kwargs)
+    return next(iter(fake.edges.values()))
+
+
+@pytest.mark.asyncio
+async def test_partner_agent_is_credited_when_no_click_row_exists(monkeypatch):
+    # The Reap variant lane mints a click id but writes no click row: without the partner's
+    # agent the edge would carry no agent at all.
+    fake = FakeDB(click_row=None)
+    monkeypatch.setattr(svc, "database", fake)
+    stored = await _partner_close(
+        fake, {"partner_reported": True, "purchase_id": "rp_1", "agent_id": "agent_minds"}
+    )
+    assert stored["agent_id"] == "agent_minds"
+    meta = json.loads(stored["metadata"])
+    assert meta["agent_source"] == "partner_purchase"
+    assert meta["click_matched"] is False
+
+
+@pytest.mark.asyncio
+async def test_partner_agent_wins_over_a_disagreeing_click_and_the_click_agent_is_kept(monkeypatch):
+    fake = FakeDB(click_row=_click_row(agent_id="agent_other"))
+    monkeypatch.setattr(svc, "database", fake)
+    stored = await _partner_close(fake, {"partner_reported": True, "agent_id": "agent_minds"})
+    assert stored["agent_id"] == "agent_minds"
+    meta = json.loads(stored["metadata"])
+    assert meta["agent_source"] == "partner_purchase"
+    assert meta["click_agent_id"] == "agent_other"
+
+
+@pytest.mark.asyncio
+async def test_an_agreeing_click_leaves_no_conflict_marker(monkeypatch):
+    fake = FakeDB(click_row=_click_row(agent_id="agent_minds"))
+    monkeypatch.setattr(svc, "database", fake)
+    stored = await _partner_close(fake, {"partner_reported": True, "agent_id": "agent_minds"})
+    assert stored["agent_id"] == "agent_minds"
+    assert "click_agent_id" not in json.loads(stored["metadata"])
+
+
+@pytest.mark.asyncio
+async def test_without_partner_provenance_the_click_agent_is_used_as_before(monkeypatch):
+    fake = FakeDB(click_row=_click_row(agent_id="agent_x"))
+    monkeypatch.setattr(svc, "database", fake)
+    stored = await _partner_close(fake, None)
+    assert stored["agent_id"] == "agent_x"
+    assert json.loads(stored["metadata"])["agent_source"] == "click"
+
+
+@pytest.mark.asyncio
+async def test_no_agent_anywhere_records_no_agent_and_no_source(monkeypatch):
+    fake = FakeDB(click_row=None)
+    monkeypatch.setattr(svc, "database", fake)
+    stored = await _partner_close(fake, {"partner_reported": True})
+    assert stored["agent_id"] is None
+    assert "agent_source" not in json.loads(stored["metadata"])
+
+
+@pytest.mark.asyncio
+async def test_note_attributes_can_never_supply_the_agent(monkeypatch):
+    # Merchant/buyer-supplied order data claiming an agent must not credit one.
+    fake = FakeDB(click_row=None)
+    monkeypatch.setattr(svc, "database", fake)
+    stored = await _partner_close(
+        fake,
+        None,
+        note_attrs_or_payload={"id": 1, "agent_id": "agent_forged", "partner_reported": True},
+    )
+    assert stored["agent_id"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad",
+    ["", "   ", "a" * 65, 12345, None, ["agent_minds"]],
+)
+async def test_an_unusable_partner_agent_is_dropped_not_truncated(monkeypatch, bad):
+    fake = FakeDB(click_row=_click_row(agent_id="agent_x"))
+    monkeypatch.setattr(svc, "database", fake)
+    stored = await _partner_close(fake, {"partner_reported": True, "agent_id": bad})
+    # Falls back to the click's agent; an overlong id is never cut down to a different agent.
+    assert stored["agent_id"] == "agent_x"
+    meta = json.loads(stored["metadata"])
+    if bad is None or bad == "":
+        # Nothing was supplied, so nothing was lost.
+        assert "partner_agent_rejected" not in meta
+    else:
+        # The loss is recorded, by reason and never by value.
+        if not isinstance(bad, str):
+            expected = "not_a_string"
+        elif bad.strip():
+            expected = "too_long"
+        else:
+            expected = "blank"
+        assert meta["partner_agent_rejected"] == expected
+        if isinstance(bad, str) and bad.strip():
+            assert bad not in json.dumps(meta)
+
+
+@pytest.mark.asyncio
+async def test_a_64_character_partner_agent_fits_exactly(monkeypatch):
+    fake = FakeDB(click_row=None)
+    monkeypatch.setattr(svc, "database", fake)
+    stored = await _partner_close(fake, {"partner_reported": True, "agent_id": " " + "a" * 64 + " "})
+    assert stored["agent_id"] == "a" * 64

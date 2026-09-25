@@ -9,6 +9,8 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
+from services.llm_fence import REVIEW_DATA_FENCE
+
 POLICY_NAME = "text_rules_v1"
 DEEPSEEK_POLICY_NAME = "deepseek_review_moderation_v1"
 DEEPSEEK_DEFAULT_MODEL = "deepseek-v4-flash"
@@ -33,7 +35,7 @@ low-confidence, or policy-adjacent cases. Medical/legal advice, diagnosis, treat
 prescription replacement, or use with a medical condition should be needs_human_review unless it is
 clearly dangerous enough to reject. Approve only ordinary product-review, product-question, or
 product-answer content with low safety risk and clear product relevance.
-""".strip()
+""".strip() + "\n\n" + REVIEW_DATA_FENCE.notice
 
 _ALLOWED_DECISIONS = {"approve", "reject", "needs_human_review"}
 _ALLOWED_RISK_LEVELS = {"low", "medium", "high"}
@@ -247,6 +249,19 @@ def _moderation_payload_from_deepseek_response(data: Dict[str, Any]) -> Dict[str
     return _extract_json_object(content)
 
 
+def build_moderation_messages(*, title: Optional[str], body: Optional[str]) -> List[Dict[str, str]]:
+    """The chat messages moderation sends: our rubric, then the shopper's review
+    fenced as data. A review is the one text on this platform an anonymous
+    outsider can write straight into a prompt."""
+    fenced = REVIEW_DATA_FENCE.fence_payload(
+        {"review_title": _norm_text(title), "review_body": _norm_text(body)}
+    )
+    return [
+        {"role": "system", "content": _MODERATION_SYSTEM_PROMPT},
+        {"role": "user", "content": fenced},
+    ]
+
+
 async def _call_deepseek_review_moderation(
     *,
     title: Optional[str],
@@ -256,19 +271,7 @@ async def _call_deepseek_review_moderation(
 ) -> Dict[str, Any]:
     payload = {
         "model": model,
-        "messages": [
-            {"role": "system", "content": _MODERATION_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {
-                        "review_title": _norm_text(title),
-                        "review_body": _norm_text(body),
-                    },
-                    ensure_ascii=False,
-                ),
-            },
-        ],
+        "messages": build_moderation_messages(title=title, body=body),
         "temperature": 0,
         "max_tokens": 350,
         "response_format": {"type": "json_object"},

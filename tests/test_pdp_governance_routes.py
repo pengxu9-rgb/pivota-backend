@@ -1244,6 +1244,15 @@ def test_gpt55_gate_requires_codex_rubric_artifact_for_low_risk_publish():
 
 
 def test_gpt55_gate_does_not_publish_human_required_gallery():
+    """gallery never published here; what changed is WHERE it is stopped.
+
+    It used to reach review_module_version and come back 200 /
+    needs_human_review. The employee gpt55-review route now fences itself to
+    LLM_ONLY_PUBLISH_MODULES before the service call (an LLM-only pass has no
+    role check behind it), so a human-co-review module is refused at the door.
+    Same data outcome -- nothing published -- and an explicit answer instead of
+    a silent one. See tests/test_employee_pdp_gpt55_module_allowlist.py.
+    """
     with _client() as client:
         resolved = client.get(
             "/employee/pdps/resolve",
@@ -1267,10 +1276,13 @@ def test_gpt55_gate_does_not_publish_human_required_gallery():
             f"/employee/pdps/{pdp_id}/modules/gallery/gpt55-review",
             json={"version_id": draft.json()["module"]["id"]},
         )
-        assert reviewed.status_code == 200
-        body = reviewed.json()
-        assert body["decision"] == "needs_human_review"
-        assert body["published"] is False
+        assert reviewed.status_code == 400
+        assert reviewed.json()["detail"] == "MODULE_NOT_LLM_REVIEWABLE"
+
+        detail = client.get(f"/employee/pdps/{pdp_id}").json()
+        gallery = next(m for m in detail["modules"] if m["module_key"] == "gallery")
+        assert gallery["published_payload"] is None
+        assert gallery["review_actor_type"] is None
 
 
 def test_merchant_contribution_is_staged_not_directly_published():

@@ -16,6 +16,7 @@ tests/test_checkout_webhook_contract.py.
 import hashlib
 import logging
 import os
+from db.merchant_order_sync_jobs import enqueue_merchant_order_create
 from fastapi import APIRouter, HTTPException, Request, BackgroundTasks
 
 from config.platform import is_production
@@ -217,7 +218,6 @@ async def checkout_webhook(
         from db.orders import get_order, mark_order_paid, update_payment_info
         from routes.order_routes import log_order_event
         from services.merchant_store_service import get_primary_store
-        from routes.order_routes import create_shopify_order
         
         order = await get_order(order_id)
         if not order:
@@ -229,15 +229,17 @@ async def checkout_webhook(
             shopify_sync = "already_linked" if order.get("shopify_order_id") else "initiated"
             if not order.get("shopify_order_id"):
 
-                async def create_shopify_order_task_already_paid():
-                    try:
-                        store_info = await get_primary_store(order["merchant_id"])
-                        if store_info and store_info.get("platform") == "shopify":
-                            await create_shopify_order(order_id)
-                    except Exception as e:
-                        logger.error(f"[Checkout webhook] Shopify sync failed for {order_id}: {e}")
-
-                background_tasks.add_task(create_shopify_order_task_already_paid)
+                # Durable enqueue — replaces `background_tasks.add_task`, which
+                # ran in this process with no retry and died with a revision
+                # swap. The store guard stays HERE, where this webhook has
+                # always applied it: carrying it as a payload flag made the
+                # stored job depend on which caller won the race to enqueue.
+                _store = await get_primary_store(order["merchant_id"])
+                if _store and _store.get("platform") == "shopify":
+                    await enqueue_merchant_order_create(
+                        order_id=order_id,
+                        merchant_id=str(order.get("merchant_id") or ""),
+                    )
 
             logger.info(
                 f"Order {order_id} already paid, marking webhook as processed (shopify_sync={shopify_sync})"
@@ -272,16 +274,13 @@ async def checkout_webhook(
             log_order_event_fn=log_order_event,
         )
         
-        # Background: create Shopify order if applicable
-        async def create_shopify_order_task():
-            try:
-                store_info = await get_primary_store(order["merchant_id"])
-                if store_info and store_info.get("platform") == "shopify":
-                    await create_shopify_order(order_id)
-            except Exception as e:
-                logger.error(f"[Checkout webhook] Shopify sync failed for {order_id}: {e}")
-        
-        background_tasks.add_task(create_shopify_order_task)
+        # Durable enqueue — see the already-paid branch above.
+        store_info = await get_primary_store(order["merchant_id"])
+        if store_info and store_info.get("platform") == "shopify":
+            await enqueue_merchant_order_create(
+                order_id=order_id,
+                merchant_id=str(order.get("merchant_id") or ""),
+            )
         
         # Mark webhook as processed
         await WebhookService.update_event_status(event_id, "processed")

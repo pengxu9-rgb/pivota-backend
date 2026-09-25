@@ -32,12 +32,18 @@ import json
 import logging
 import math
 import re
-from typing import AbstractSet, Any, Dict, FrozenSet, Iterable, List, Mapping, Optional, Tuple
+from typing import AbstractSet, Any, Dict, FrozenSet, Iterable, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
 from services import agent_center_llm_client as llm_client
 from services.audit_delta import build_reaudit_delta, measurement_basis_between
 from services.outreach_outcomes import build_outreach_outcomes
+from services.selection_gap import (
+    build_selection_gap,
+    lost_queries_from_reports,
+    per_prompt_evidence,
+    won_queries_from_reports,
+)
 from services.prompt_basis import basis_meta_from_probe_runs, PROMPT_BASIS_VERSION
 from services.audit_facts import (
     AXIS_UNCLASSIFIED,
@@ -108,6 +114,7 @@ from services.cited_host_classifier import (
     ROLE_RELATIVE_UNCLASSIFIED,
 )
 from services.merchant_narrative_builder import build_merchant_narrative
+from services.primary_destination import select_primary_destination
 from services.win_plan_builder import build_win_plan, is_broad_head_query
 from services.coverage_profiles import (
     resolve_coverage_profile,
@@ -3440,6 +3447,7 @@ def _flatten_probe_runs(per_sku_probe_runs: Any) -> List[Dict[str, Any]]:
                 if not isinstance(run, dict):
                     continue
                 row = dict(run)
+                row["_scan_mode"] = probe.get("scan_mode") or row.get("_scan_mode")
                 row.setdefault("_provider", probe.get("provider"))
                 row.setdefault("_probe_run_id", probe_run_id or f"{probe.get('provider') or 'probe'}:{idx}")
                 out.append(row)
@@ -6282,9 +6290,64 @@ async def _winning_products_not_carried(
     return out[:cap]
 
 
+async def _merchant_catalog_rows_for_selection_gap(
+    merchant_id: str, *, cap: int = 500
+) -> List[Dict[str, Any]]:
+    """C1 — the live catalog rows the selection gap matches lost queries against.
+    Best-effort (`_fetch_all_dicts` already swallows + logs); the caller emits no
+    section when this is empty rather than guessing at what the merchant sells."""
+    if not str(merchant_id or "").strip():
+        return []
+    return await _fetch_all_dicts(
+        """
+        SELECT product_key, title, brand, product_type, category,
+               category_label, category_path, tags, use_case_tags
+          FROM catalog_products
+         WHERE merchant_id = :merchant_id
+           AND sync_status = 'live'
+           AND title IS NOT NULL
+           AND title <> ''
+         ORDER BY product_key
+         LIMIT :cap
+        """,
+        {"merchant_id": str(merchant_id), "cap": int(cap)},
+    )
+
+
+async def _selection_gap_section(
+    merchant_id: str,
+    per_sku_reports: Sequence[Mapping[str, Any]],
+    *,
+    merchant_name: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """C1 — "products you sell × queries you lose".
+
+    Reads the merchant's catalog and joins it to the queries the audit already
+    measured: the lost side is `_failing_prompts`' output as carried on each
+    per-SKU report (consumed, never re-derived); the won side and the per-query
+    counts come from the per-prompt rows the opportunity scorer already built.
+    Returns None when there is no catalog to match against — a gap list is only
+    honest when we actually know what the merchant sells."""
+    catalog_rows = await _merchant_catalog_rows_for_selection_gap(str(merchant_id))
+    if not catalog_rows:
+        return None
+    reports = list(per_sku_reports or [])
+    return build_selection_gap(
+        catalog_rows=catalog_rows,
+        lost_queries=lost_queries_from_reports(reports),
+        won_queries=won_queries_from_reports(reports),
+        query_evidence=per_prompt_evidence(reports),
+        merchant_name=merchant_name,
+    )
+
+
 def _grounding_evidence(probe_runs: Any, cap: int = 12) -> List[Dict[str, Any]]:
     evidence: List[Dict[str, Any]] = []
     for run in _flatten_probe_runs(probe_runs):
+        if run.get("identity_mismatch"):
+            # This is still retained in the raw checkpoint/failing prompts,
+            # but the merchant UI treats every row here as positive SKU proof.
+            continue
         sources = run.get("grounding_sources") or []
         parsed = run.get("parsed") if isinstance(run.get("parsed"), dict) else {}
         excerpt = (
@@ -6300,6 +6363,7 @@ def _grounding_evidence(probe_runs: Any, cap: int = 12) -> List[Dict[str, Any]]:
             "axis_metadata": run.get("axis_metadata"),
             "grounding_sources": sources,
             "evidence_excerpt": excerpt or None,
+            "identity_mismatch": run.get("identity_mismatch"),
             # Whether the SKU was actually found in this answer — lets the
             # narrative use an excerpt as "what's working" proof only when it is
             # a positive result, never a "couldn't find it" line (Fix 3).
@@ -6866,6 +6930,8 @@ def sanitize_report_for_merchant(report: Any) -> Any:
     if not isinstance(report, (dict, list)):
         return report
     clone = copy.deepcopy(report)
+    from services.audit_content_repair import repair_report_content
+    clone = repair_report_content(clone)
     _strip_score_breakdowns(clone)
     _strip_internal_deep_tier(clone)
     return clone
@@ -7291,6 +7357,9 @@ async def build_per_sku_report(
     )
     probe_runs = _merchant_visible_probe_payloads(raw_probe_runs)
     product = _get_product(sku_ctx)
+    from services.probe_identity_guard import guard_probe_identity
+
+    probe_runs = guard_probe_identity(probe_runs, product, sku_ctx)
     deep_landscape_internal = None
     try:
         from services.deep_tier_prompts import build_deep_landscape_rollup
@@ -7449,19 +7518,26 @@ async def build_per_sku_report(
     # "unassessed-competitor-attribute" and even the deterministic fallback was
     # rejected (brief_status=unavailable, run b29d6a0f). The depth is also
     # surfaced on competitor_intel for the UI.
-    next_best_action = await attach_sku_strategic_brief(
-        next_best_action,
-        opportunity=opportunity,
-        attribute_graph=attribute_graph,
-        primary_gaps=primary_gaps,
-        scores=scores,
-        identity=identity,
-        sku_title=(_get_sku(sku_ctx).get("title") or product.get("title")),
-        merchant_host=normalize_host(product.get("canonical_url") or product.get("pdp_url")),
-        competitor_attributes=(
-            competitor_attributes if competitor_attributes != "not_assessed" else None
-        ),
-    )
+    if any(run.get("identity_mismatch") for run in _flatten_probe_runs(probe_runs)):
+        # The free-form brief could turn a wrong-brand retailer source into a
+        # merchant listing/review claim. Keep the deterministic action until
+        # the conflicting source has been re-audited.
+        next_best_action["brief_status"] = "unavailable"
+        next_best_action["brief_debug"] = {"outcome": "identity_conflict"}
+    else:
+        next_best_action = await attach_sku_strategic_brief(
+            next_best_action,
+            opportunity=opportunity,
+            attribute_graph=attribute_graph,
+            primary_gaps=primary_gaps,
+            scores=scores,
+            identity=identity,
+            sku_title=(_get_sku(sku_ctx).get("title") or product.get("title")),
+            merchant_host=normalize_host(product.get("canonical_url") or product.get("pdp_url")),
+            competitor_attributes=(
+                competitor_attributes if competitor_attributes != "not_assessed" else None
+            ),
+        )
     # Surface the competitor intelligence on the report so the merchant/UI can
     # see "what AI says <winner> is known for" directly.
     if isinstance(competitor_attributes, Mapping) and competitor_attributes.get("status") == "assessed":
@@ -7588,6 +7664,9 @@ async def build_per_sku_report(
             )
         ),
         "verbatim_grounding_evidence": _grounding_evidence(probe_runs),
+        "identity_rejected_evidence_count": sum(
+            bool(run.get("identity_mismatch")) for run in _flatten_probe_runs(probe_runs)
+        ),
         "axis_coverage": _axis_coverage(probe_runs),
         "query_class_coverage": _query_class_coverage(probe_runs),
         # INTERNAL-FIRST (founder 2026-07-21): substitution-rate + contest map
@@ -8936,7 +9015,17 @@ def build_authority_map(
             _axis_meta = run.get("axis_metadata") if isinstance(run.get("axis_metadata"), dict) else {}
             axis_explicit = bool(str(_axis_meta.get("axis") or "").strip())
             excerpt = run.get("evidence_excerpt") or parsed.get("evidence_excerpt") or parsed.get("evidence_text")
-            for source in run.get("grounding_sources") or []:
+            # B3: `ordinal` is the zero-based position of this grounding source
+            # WITHIN THIS RESPONSE — the order the model attached its citations
+            # in. This loop is the only place that order still exists: every
+            # downstream structure (`sku["authority_hosts"]`, and therefore
+            # services/audit_evidence_builder.extract_citation_observations) is
+            # a HOST-keyed aggregate, so position is gone by the time anything
+            # else could read it. Enumerating BEFORE the two `continue`s below
+            # is deliberate: the ordinal must be the position in the answer's
+            # citation list, not the position among the citations we managed to
+            # resolve — a dropped redirector must not renumber the ones after it.
+            for ordinal, source in enumerate(run.get("grounding_sources") or []):
                 if not isinstance(source, dict):
                     continue
                 uri = source.get("uri") or ""
@@ -8990,7 +9079,20 @@ def build_authority_map(
                     "evidence_excerpt": None,
                     "competitors_named": [],
                     "_queries": set(),
-                    "_observations": set(),
+                    # B3: was a SET of (query, query_class, provider). It is now
+                    # a DICT keyed by that same tuple, valued by the BEST (lowest)
+                    # ordinal this host reached in that response. The dedupe
+                    # semantics of the set are preserved exactly — still one
+                    # entry per (query, query_class, provider) — because turning
+                    # the ordinal into part of the key would emit two
+                    # `query_observations` for one response/host pair, and
+                    # citation_observations has no ordinal in its identity
+                    # ((audit_run_id, content_key, provider, query, cited_host)),
+                    # so the second row would collide on idempotency_key and be
+                    # silently dropped. Keeping the LOWEST is the honest fold: a
+                    # host the answer cited at both position 0 and position 5 was
+                    # reached at position 0.
+                    "_observations": {},
                 })
                 if query_class == QUERY_CLASS_CATEGORY:
                     row["cited_on_category_query"] = True
@@ -9005,8 +9107,12 @@ def build_authority_map(
                     row["prompts_cited_count"] += 1
                 # P0.2: retain per-(query, provider) linkage for
                 # citation_observations (otherwise lost at the pop below).
+                # B3: and the position the host reached in that response.
                 if query and provider:
-                    row["_observations"].add((query, query_class, provider))
+                    _obs_key = (query, query_class, provider)
+                    _prior = row["_observations"].get(_obs_key)
+                    if _prior is None or ordinal < _prior:
+                        row["_observations"][_obs_key] = ordinal
                 if provider not in row["providers"]:
                     row["providers"].append(provider)
                 row["provider_counts"][provider] = (
@@ -9073,6 +9179,32 @@ def build_authority_map(
                         "about_merchant": covers_merchant,
                     })
 
+        # B3: resolve the PRIMARY COMMERCE DESTINATION of each response before
+        # the host rows are flattened. A response is identified by
+        # (query, query_class, provider) — the same identity
+        # citation_observations keys on, minus the run/content_key that are
+        # constant here — and the candidates for it are every host that reached
+        # it, with the best ordinal each reached. Selection is
+        # services/primary_destination.select_primary_destination: at most one
+        # winner, and legitimately none when the answer cited no place to buy.
+        _response_candidates: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = defaultdict(list)
+        for row in host_rows.values():
+            for _obs_key, _ordinal in (row.get("_observations") or {}).items():
+                _response_candidates[_obs_key].append({
+                    "host": row.get("host"),
+                    "ordinal": _ordinal,
+                    "host_type": row.get("host_type"),
+                    "first_party": row.get("first_party"),
+                })
+        _primary_by_response: Dict[Tuple[str, str, str], str] = {}
+        for _key, _cands in _response_candidates.items():
+            _winner = select_primary_destination(_cands)
+            # A response with no commerce host is left OUT of the map, not
+            # stored as None: "no actionable destination" is the absence of a
+            # primary, and no host row may then match it.
+            if _winner is not None:
+                _primary_by_response[_key] = _winner.host
+
         authority_hosts = []
         for row in host_rows.values():
             row.pop("_queries", None)
@@ -9080,10 +9212,23 @@ def build_authority_map(
             # into a clean, JSON-safe field the deposit builder reads into
             # citation_observations. Replaces the discard that killed the
             # per-query citation matrix.
-            _obs = row.pop("_observations", set())
+            # B3: each observation now also carries the host's position in that
+            # response (`destination_rank`) and whether it WON that response
+            # (`is_primary_destination`). At most one host per response key can
+            # answer True, by construction — the winner is looked up from a
+            # single map, not recomputed per row.
+            _obs = row.pop("_observations", {})
             row["query_observations"] = [
-                {"query": q, "query_class": qc, "provider": p}
-                for (q, qc, p) in sorted(_obs)
+                {
+                    "query": q,
+                    "query_class": qc,
+                    "provider": p,
+                    "destination_rank": rank,
+                    "is_primary_destination": (
+                        _primary_by_response.get((q, qc, p)) == row.get("host")
+                    ),
+                }
+                for (q, qc, p), rank in sorted(_obs.items())
             ]
             row["providers"] = sorted(row.get("providers") or [])
             row["provider_counts"] = dict(sorted((row.get("provider_counts") or {}).items()))
@@ -13395,6 +13540,10 @@ async def run_brand_report(
                 sku_key, str(merchant_id), audit_run_id,
             )
             sku_ctx = await load_sku_context(sku_key, str(merchant_id))
+            from services.probe_identity_guard import guard_probe_identity
+            probe_runs_by_sku[sku_key] = guard_probe_identity(
+                probe_runs_by_sku[sku_key], _get_product(sku_ctx), sku_ctx,
+            )
             verify_summary, verify_outputs = await _run_deepseek_verify_pass(
                 sku_ctx=sku_ctx,
                 probe_runs=probe_runs_by_sku[sku_key],
@@ -13634,6 +13783,19 @@ async def run_brand_report(
                 )
             except Exception:  # noqa: BLE001
                 logger.warning("C3 winning_products_not_carried failed", exc_info=True)
+        # C1 — the selection gap: the products the merchant SELLS crossed with
+        # the unbranded queries they LOSE ("you sell a niacinamide serum and AI
+        # never names you for 'best affordable niacinamide serum'"). A two-sided
+        # list of named queries, deliberately not a rate. Best-effort like the
+        # C3 sibling above: a failure logs and leaves the audit untouched.
+        try:
+            _selection_gap = await _selection_gap_section(
+                str(merchant_id), per_sku_reports, merchant_name=merchant_name
+            )
+            if _selection_gap is not None:
+                brand_rollup["selection_gap"] = _selection_gap
+        except Exception:  # noqa: BLE001
+            logger.warning("C1 selection_gap failed", exc_info=True)
         # Fix 3 — merchant-grade narrative assembled from the Fix 1 resolved
         # hosts + Fix 2 findability/endorsement split + verify rollup + the Fix 4
         # win-plan rollup. No fabrication: degrades to honest "not available"
@@ -13689,6 +13851,36 @@ async def run_brand_report(
         # rendered number reads from it yet (phase-2 cutover); W7 invariants
         # and parity logging do. Best-effort: a stamp failure must never sink
         # the report.
+        # The selection-observation loop gets its OWN try. Sharing the
+        # run_facts try meant one bad observation — a `_probe_run_id` that
+        # json.dumps could not serialize, say — dropped run_facts for the whole
+        # run, and the two have no dependency on each other. Counted so a
+        # partial stamp is visible instead of silent.
+        _selection_observation_failures = 0
+        try:
+            from services.selection_measurement import response_observations
+            for _r in per_sku_reports:
+                try:
+                    _r["selection_observations"] = response_observations(
+                        _flatten_probe_runs(probe_runs_by_sku.get(_r.get("sku_key"), [])),
+                        sku_key=_r.get("sku_key"), merchant_host=_merchant_host,
+                        merchant_brand=merchant_name, merchant_vendors=_merchant_vendors,
+                    )
+                except Exception:  # noqa: BLE001
+                    _selection_observation_failures += 1
+                    _r["selection_observations"] = []
+                    logger.warning(
+                        "selection observations failed for sku=%s",
+                        _r.get("sku_key"), exc_info=True,
+                    )
+        except Exception:  # noqa: BLE001
+            _selection_observation_failures += 1
+            logger.warning("selection observation stamp failed", exc_info=True)
+        if _selection_observation_failures:
+            brand_rollup["selection_observation_failures"] = (
+                _selection_observation_failures
+            )
+
         try:
             _facts_by_sku = {
                 _sku_key: compute_run_facts(
@@ -16510,6 +16702,41 @@ def _build_history_trend(
     }
 
 
+
+async def _basis_pair_for_delta(
+    report: Mapping[str, Any],
+    merchant_id: Optional[str],
+    prior_run_id: Optional[str],
+) -> tuple:
+    """(current_basis, prior_basis) for audit_delta's comparability check.
+
+    The CURRENT run's basis is built in memory, not read: persist_canonical_
+    evidence writes it later (from the worker), so at attach time the row does
+    not exist and a read would make the check permanently inert. The PRIOR run's
+    basis is a real stored row.
+
+    Best-effort and returns (None, None) on any failure, which falls audit_delta
+    back to its prompt-set-only verdict — the behaviour before this wiring.
+    """
+    if not merchant_id or not prior_run_id:
+        return (None, None)
+    try:
+        from db.audit_basis import get_basis_for_run
+        from services.audit_evidence_builder import record_audit_basis
+
+        prior = await get_basis_for_run(str(prior_run_id))
+        if not prior:
+            return (None, None)
+        current = await record_audit_basis(
+            audit_run_id="", brand_report=report,
+            merchant_id=merchant_id, persist=False,
+        )
+        return (current, prior)
+    except Exception as exc:  # noqa: BLE001 - comparability must not sink the audit
+        logger.warning("basis pair for delta failed: %s", str(exc)[:200])
+        return (None, None)
+
+
 async def _attach_reaudit_delta(
     report: Dict[str, Any],
     *,
@@ -16565,11 +16792,16 @@ async def _attach_reaudit_delta(
         )
         if not isinstance(prior_report, dict):
             return report
+        # A3: the two runs' measurement bases, so a model / official-domain /
+        # tier-mix change is not narrated to the merchant as their own movement.
+        _legacy_bases = await _basis_pair_for_delta(report, merchant_id, prior_run_id)
         merchant_view["reaudit_delta"] = build_reaudit_delta(
             current_report=report,
             prior_report=prior_report,
             prior_row=prior_row,
             days_since=_days_between(prior_row.get("requested_at")),
+            current_basis=_legacy_bases[0],
+            prior_basis=_legacy_bases[1],
         )
         # Audit→action→outcome loop: what changed at the hosts the PRIOR
         # report told the merchant to target. Reuses the measurement basis
@@ -16689,12 +16921,17 @@ async def _attach_outreach_outcomes_per_sku(
         )
         if not isinstance(prior_report, dict):
             return report
+        # A3: the two runs' measurement bases, so a model / official-domain /
+        # tier-mix change is not narrated to the merchant as their own movement.
+        _delta_bases = await _basis_pair_for_delta(report, merchant_id, prior_run_id)
         report["outreach_outcomes"] = build_outreach_outcomes(
             current_report=report,
             prior_report=prior_report,
             # Same W2 basis verdict build_reaudit_delta computes — via
             # audit_delta's single source of truth, never re-derived here.
-            measurement_basis=measurement_basis_between(report, prior_report),
+            measurement_basis=measurement_basis_between(
+                report, prior_report, *_delta_bases
+            ),
             completed_actions=await _completed_outreach_actions(merchant_id),
         )
         # Wave-1 A1: per-SKU sibling of the legacy merchant_view attach —
@@ -16706,6 +16943,8 @@ async def _attach_outreach_outcomes_per_sku(
             days_since=_days_between(
                 str(prior_row.get("requested_at") or "") or None
             ),
+            current_basis=_delta_bases[0],
+            prior_basis=_delta_bases[1],
         )
     except Exception as exc:  # noqa: BLE001 - audit must not fail on history
         logger.warning(

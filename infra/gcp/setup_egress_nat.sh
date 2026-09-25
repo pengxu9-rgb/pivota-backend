@@ -32,7 +32,15 @@
 # that changes. Natural trigger: when ADR-023 (PR #2005) merges and Antom session work begins,
 # revisit whatever enforcement is available rather than relying on this comment.
 #
-# CRAWL EGRESS MUST NOT SHARE THIS IP. This script creates ONE router + ONE NAT covering
+# CRAWL EGRESS MUST NOT SHARE THIS IP. *** THE SPLIT BELOW IS DONE — this paragraph describes
+# the world before it. *** prod now runs TWO NATs, both LIST_OF_SUBNETWORKS: `pivota-nat` on
+# subnet `default` (8.231.167.230, payment) and `pivota-crawl-nat` on `pivota-crawl`
+# (34.82.199.35, crawl), built by infra/gcp/setup_crawl_egress.sh and narrowed onto `default` by
+# infra/gcp/migrate_payment_nat_to_default_subnet.sh. `catalog-intelligence` runs on the crawl
+# subnet; a one-off crawl job gets there with SUBNET=pivota-crawl (scripts/ops/run_oneoff_job.sh).
+# This script stays create-if-missing, so re-running it against prod is a no-op. The rule and the
+# measurement below are still the authority; only the "not done yet" framing is stale.
+# This script creates ONE router + ONE NAT covering
 # ALL_SUBNETWORKS_ALL_IP_RANGES, so every service shares 8.231.167.230. A scheduled re-crawl would
 # then share both IP reputation and the NAT port pool with the payment path - and NAT port
 # exhaustion is per-IP, so a burst crawl can starve payment egress even with clean reputation.

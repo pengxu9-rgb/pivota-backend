@@ -905,3 +905,114 @@ async def test_enqueue_is_not_skipped_when_the_bound_store_cannot_be_resolved(mo
 
     assert len(calls) == 1, "a refund with a bound store_id was silently dropped"
     assert calls[0]["payload"]["store_id"] == "st_stale"
+
+
+# ---------------------------------------------------------------------------
+# The merchant-order CREATE op, which replaced `background_tasks.add_task` at
+# five call sites.
+# ---------------------------------------------------------------------------
+
+
+def _wire_create(monkeypatch, *, sync_returns=True, linked=True):
+    """`linked` controls whether the order carries a linked platform order after
+    the sync — the handler verifies that rather than trusting the return, because
+    every platform creator returns True when another holder has the create lock."""
+    import db.orders as orders_module
+    import routes.order_routes as order_routes
+
+    calls = {"sync": []}
+
+    async def fake_sync(order_id):
+        calls["sync"].append(order_id)
+        return sync_returns
+
+    async def fake_get_order(order_id):
+        return (
+            {"metadata": {"merchant_order": {"platform_order_id": "shop-1"}}}
+            if linked else {}
+        )
+
+    monkeypatch.setattr(order_routes, "sync_order_to_connected_store", fake_sync)
+    monkeypatch.setattr(orders_module, "get_order", fake_get_order)
+    return calls
+
+
+def _create_payload(**over):
+    base = {"order_id": "ORD_1", "merchant_id": "merch_1"}
+    base.update(over)
+    return base
+
+
+@pytest.mark.asyncio
+async def test_create_job_syncs_the_order(monkeypatch):
+    calls = _wire_create(monkeypatch, sync_returns=True, linked=True)
+
+    result = await drain._run_merchant_order_create_job(_create_payload(), {}, None)
+
+    assert result == {"created": True}
+    assert calls["sync"] == ["ORD_1"]
+
+
+@pytest.mark.asyncio
+async def test_a_create_is_attempted_at_most_once(monkeypatch):
+    """THE rule, after three designs. Two earlier ones tried to classify
+    retryability after the fact — from the sync's boolean, then from the failure
+    marker — and both leaked, because the paths that are dangerous to retry are
+    exactly the ones that report nothing: an exception escaping the sync writes
+    no marker, and a contended advisory lock returns True having done nothing.
+    Measured on the marker design: ten Wix orders for one buyer.
+
+    `max_attempts=1` makes a second POST structurally impossible.
+    """
+    from db.merchant_order_sync_jobs import MERCHANT_ORDER_CREATE_MAX_ATTEMPTS
+
+    assert MERCHANT_ORDER_CREATE_MAX_ATTEMPTS == 1
+
+
+@pytest.mark.asyncio
+async def test_create_job_failure_is_terminal_and_visible(monkeypatch):
+    """Raising lands the job `failed` after its single attempt, so it appears in
+    list_failed_merchant_order_sync_jobs and the tick emits its money-path
+    ERROR — rather than completing quietly."""
+    _wire_create(monkeypatch, sync_returns=False)
+
+    with pytest.raises(drain._RetryableSyncError):
+        await drain._run_merchant_order_create_job(_create_payload(), {}, None)
+
+
+@pytest.mark.asyncio
+async def test_create_job_does_not_claim_success_on_lock_contention(monkeypatch):
+    """Every platform creator returns True when another holder has the per-order
+    advisory lock. Recording `created` there would report a merchant order that
+    may never arrive; raising would queue a second POST behind a create that is
+    already running."""
+    calls = _wire_create(monkeypatch, sync_returns=True, linked=False)
+
+    result = await drain._run_merchant_order_create_job(_create_payload(), {}, None)
+
+    assert result == {"created": False, "skipped": "create_in_progress_elsewhere"}
+    assert calls["sync"] == ["ORD_1"], "exactly one attempt"
+
+
+@pytest.mark.asyncio
+async def test_the_tick_routes_a_create_job_to_the_create_handler(monkeypatch):
+    """Pins the `_HANDLERS` registration itself.
+
+    Every other create test calls `_run_merchant_order_create_job` directly, so
+    deleting the `OP_MERCHANT_ORDER_CREATE` entry from `_HANDLERS` left the whole
+    suite green — while in production every create job would take the
+    `no handler for op` branch, burn its attempts and land terminal `failed`,
+    stopping merchant-order creation platform-wide.
+    """
+    from db.merchant_order_sync_jobs import OP_MERCHANT_ORDER_CREATE
+
+    calls = _wire_create(monkeypatch, sync_returns=True, linked=True)
+    job = _job(op=OP_MERCHANT_ORDER_CREATE)
+    job["payload"] = _create_payload()
+    seen = _wire_drain(monkeypatch, job)  # NO handler override: real dispatch
+
+    summary = await drain.run_merchant_order_sync_worker_tick()
+
+    assert summary["done"] == 1, "the tick did not route the job to a handler"
+    assert calls["sync"] == ["ORD_1"], "the create handler never ran"
+    assert seen["failed"] == []

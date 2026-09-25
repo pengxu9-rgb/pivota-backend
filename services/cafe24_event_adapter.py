@@ -8,6 +8,7 @@ from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import urlparse
 
 from adapters.cafe24_adapter import normalize_cafe24_mall_id
+from services.commerce_order_ref import build_order_ref
 from services.merchant_event_ingest_service import MerchantCommerceEvent, MerchantEventBatch
 
 
@@ -229,6 +230,7 @@ def _data_bridge_batch(
                 visitor_id=visitor_id,
                 buyer_id=_text(data.get("member_id")),
                 order_id=order_id,
+                order_ref=build_order_ref("cafe24", order_id),
                 trace_id=trace_id,
                 query_source=_source_from_url(source_url),
                 amount_cents=_amount_cents(amount, currency),
@@ -369,6 +371,7 @@ def _store_webhook_batch(
                 buyer_id=_text(resource.get("member_id")),
                 cart_id=cart_id,
                 order_id=order_id,
+                order_ref=build_order_ref("cafe24", order_id),
                 payment_id=payment_id,
                 refund_id=refund_id,
                 return_id=return_id,

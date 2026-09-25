@@ -13,6 +13,7 @@ from datetime import datetime
 
 from config.platform import pytest_bypass_allowed
 from db.agents import (
+    agent_is_active,
     get_agent_by_key,
     AgentAuthLookupTransientError,
     get_agent,
@@ -27,6 +28,7 @@ import os
 import base64
 import hashlib
 import hmac
+import re
 import json
 
 
@@ -88,6 +90,149 @@ def _build_internal_trusted_agent(api_key: str) -> Dict[str, Any]:
         },
     }
 
+
+_AGENT_API_KEY_RE = re.compile(r"^ak_(live_)?[0-9a-f]{64}$")
+
+#: Agent identities that are PIVOTA'S OWN SERVICES, not agents a link can be issued to (ADR-025 D1).
+#: agent_982b1ea2df866206 ("Pivota Shopping") owns the gateway's PIVOTA_API_KEY: confirmed on
+#: 2026-09-24 by hashing the gateway secret in prod and matching api_keys. The gateway sends that
+#: key for the MCP get_offers door and for cached search results, which are shared across callers,
+#: so without this every such link would be credited to the gateway itself. The backend has no
+#: internal-trusted key configured, so that key takes the ordinary agent path.
+#: The code list is the floor: ISSUING_AGENT_EXCLUDED_AGENT_IDS can only ADD ids, never replace
+#: these, so a wiped environment cannot switch the exclusion off.
+_ISSUING_EXCLUDED_AGENT_IDS_DEFAULT = frozenset({"agent_982b1ea2df866206"})
+_ISSUING_EXCLUDED_AGENT_IDS_ENV = "ISSUING_AGENT_EXCLUDED_AGENT_IDS"
+_issuing_exclusions_logged: set = set()
+
+
+def issuing_excluded_agent_ids() -> frozenset:
+    extra = {
+        part.strip()
+        for part in str(os.getenv(_ISSUING_EXCLUDED_AGENT_IDS_ENV) or "").replace("\n", ",").split(",")
+        if part.strip()
+    }
+    # A voucher (issuing_voucher_agent_ids) is always excluded too: a service that vouches for others
+    # must never be credited itself, or its own key would win before its header is read.
+    return _ISSUING_EXCLUDED_AGENT_IDS_DEFAULT | frozenset(extra) | issuing_voucher_agent_ids()
+
+
+def request_api_key(request: Optional[Request]) -> Optional[str]:
+    """The API key a request carries in X-API-Key, or as `Authorization: Bearer <key>`."""
+    if request is None:
+        return None
+    key = (request.headers.get("x-api-key") or "").strip()
+    if key:
+        return key
+    auth = (request.headers.get("authorization") or "").strip()
+    scheme, _, credentials = auth.partition(" ")
+    if scheme.lower() == "bearer" and credentials.strip():
+        return credentials.strip()
+    return None
+
+
+async def resolve_issuing_agent_id(api_key: Optional[str]) -> Optional[str]:
+    """The agent a link is issued to, from the caller's OWN API key (ADR-025 D1). Never raises.
+
+    The same lookup get_agent_context uses (get_agent_by_key, cached per key), without its rate
+    limit, quota or stats: this runs on a request that has already been admitted, only to name
+    the agent on a click record.
+
+    None, meaning "not bound to one agent", for:
+      * no key, or a key that is not an agent key;
+      * an INTERNAL trusted key (PIVOTA_API_KEY and friends). Its synthetic
+        agent_internal_trusted_<hash> is a service, not an agent. The gateway sends it on purpose
+        for cached search results, which are shared across callers and must stay agent-less;
+      * an unknown, inactive or unreadable agent. A lookup failure must never break the link
+        being served, and a wrong agent is worse than none;
+      * one of Pivota's own service agents (issuing_excluded_agent_ids), such as the one the
+        gateway's own key belongs to.
+
+    No request field or header can name the agent: only the key the caller authenticated with.
+    """
+    candidate = str(api_key or "").strip()
+    if not candidate or _is_internal_trusted_api_key(candidate):
+        return None
+    if not _AGENT_API_KEY_RE.match(candidate):
+        return None
+    try:
+        agent = await get_agent_by_key(candidate)
+    except Exception as exc:  # noqa: BLE001 -- the link is still served; its click is agent-less
+        logger.warning(f"[AgentAuth] issuing-agent lookup failed: {type(exc).__name__}")
+        return None
+    if not agent_is_active(agent):
+        return None
+    agent_id = str(agent.get("agent_id") or "").strip()
+    if agent_id and agent_id in issuing_excluded_agent_ids():
+        if agent_id not in _issuing_exclusions_logged:
+            _issuing_exclusions_logged.add(agent_id)
+            logger.warning(f"[AgentAuth] issuing agent {agent_id} is a Pivota service; its links are issued agent-less")
+        return None
+    return agent_id or None
+
+
+
+#: The service agents whose SIGNED assertion (X-Pivota-Issuing-Agent) may name another agent: the
+#: gateway's own agent, whose key its MCP commerce kernel sends upstream. Deliberately NOT
+#: issuing_excluded_agent_ids(): excluding an agent (a QA key on a laptop, say) must stop it being
+#: credited, never make it a voucher. The env var can only ADD vouchers, never remove the default.
+_ISSUING_VOUCHER_AGENT_IDS_DEFAULT = frozenset({"agent_982b1ea2df866206"})
+_ISSUING_VOUCHER_AGENT_IDS_ENV = "ISSUING_ASSERTION_VOUCHER_AGENT_IDS"
+
+
+def issuing_voucher_agent_ids() -> frozenset:
+    extra = {
+        part.strip()
+        for part in str(os.getenv(_ISSUING_VOUCHER_AGENT_IDS_ENV) or "").replace("\n", ",").split(",")
+        if part.strip()
+    }
+    return _ISSUING_VOUCHER_AGENT_IDS_DEFAULT | frozenset(extra)
+
+
+async def _is_service_caller(api_key: Optional[str]) -> bool:
+    """Is this request authenticated as one of Pivota's own services allowed to vouch (the gateway)?
+
+    Checked DIRECTLY, never inferred from resolve_issuing_agent_id returning None: None also means
+    "no key", "unknown key" and "inactive agent", and none of those may vouch for anyone.
+    """
+    candidate = str(api_key or "").strip()
+    if not candidate:
+        return False
+    if _is_internal_trusted_api_key(candidate):
+        return True
+    if not _AGENT_API_KEY_RE.match(candidate):
+        return False
+    try:
+        agent = await get_agent_by_key(candidate)
+    except Exception:  # noqa: BLE001 -- an unreadable caller vouches for no one
+        return False
+    if not agent_is_active(agent):
+        return False
+    agent_id = str(agent.get("agent_id") or "").strip()
+    return agent_id in issuing_voucher_agent_ids()
+
+
+async def resolve_issuing_agent_for_request(
+    api_key: Optional[str], assertion: Optional[str], *, op: str
+) -> Optional[str]:
+    """The agent a link is issued to: the caller's OWN key first, then, only when the caller is one of
+    Pivota's own services, the agent that service VERIFIED and signed (X-Pivota-Issuing-Agent). Never
+    raises.
+
+    The second step exists for the MCP door: the gateway's commerce kernel calls upstream with its own
+    service key, so its callers' keys never arrive here, and an MCP OAuth caller has none. Any other
+    caller's assertion is ignored: an agent cannot vouch for another agent, and a request with no
+    service identity cannot vouch at all. See services/issuing_agent_assertion.py for what the header
+    must prove (MAC, op, freshness) and how its subject maps to an active, non-service agent.
+    """
+    own = await resolve_issuing_agent_id(api_key)
+    if own is not None or not assertion:
+        return own
+    if not await _is_service_caller(api_key):
+        return None
+    from services.issuing_agent_assertion import resolve_asserted_agent_id
+
+    return await resolve_asserted_agent_id(assertion, op=op, excluded_agent_ids=issuing_excluded_agent_ids())
 
 class AgentContext:
     """Agent 请求上下文"""
@@ -308,14 +453,8 @@ async def get_agent_context(
             detail="Invalid API Key"
         )
     
-    # 4. 检查是否激活 (support both is_active and status fields)
-    is_active = agent.get("is_active")
-    if is_active is None:
-        # Fallback to status field
-        status = agent.get("status")
-        is_active = (str(status).lower() == "active") if status else True
-    
-    if not is_active:
+    # 4. 检查是否激活 (db.agents.agent_is_active: is_active, else status; NULL is active)
+    if not agent_is_active(agent):
         raise HTTPException(
             status_code=403,
             detail="Agent is deactivated"
@@ -462,12 +601,7 @@ async def _get_agent_context_from_checkout_token(request: Request, token: str) -
     if "allowed_merchants" not in agent:
         agent["allowed_merchants"] = None
 
-    # Active check: support both is_active and status fields
-    is_active = agent.get("is_active")
-    if is_active is None:
-        status = agent.get("status")
-        is_active = (str(status).lower() == "active") if status else True
-    if not is_active:
+    if not agent_is_active(agent):
         raise HTTPException(status_code=403, detail="Agent is deactivated")
 
     context = AgentContext(agent, request)

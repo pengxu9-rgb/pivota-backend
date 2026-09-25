@@ -13,6 +13,7 @@ someone ran the suite.
 
 from __future__ import annotations
 
+from typing import Optional
 import asyncio
 from types import SimpleNamespace
 from typing import Any, Dict, List
@@ -783,7 +784,16 @@ _GATED_CRAWL_LANES = {
     "services/external_seed_destination_liveness.py": 2,
     "services/brand_product_discovery.py": 1,
     "services/co_occurrence_finder.py": 1,
-    "services/curated_brand_feed.py": 2,       # products.json paging + PDP INCI fetch
+    # products.json paging + PDP INCI fetch + meta.json (the storefront's own currency/market,
+    # added 2026-09-06 so a Singapore storefront is not ingested as USD) + the PDP meta
+    # description (added 2026-09-06: 158 of jsmbeauty.sg's 232 products publish no body_html
+    # text, so the copy the 50-char floor wants is only on the PDP itself) + the storefront
+    # homepage's own blurb (added 2026-09-06, one request per DOMAIN, so a theme substituting
+    # shop.description into a product's og tag can be recognised by comparison, not by guessing
+    # at the theme's markup).
+    # 6 since fetch_shop_description_from_meta (2026-09-08): the /meta.json blurb door, gated
+    # exactly like the homepage one it falls back from.
+    "services/curated_brand_feed.py": 7,  # includes optional bounded product identity recovery
     "services/bd_cold_start_service.py": 2,      # Shopify .json + the generic PDP-HTML fallback
     "services/executor_agents/sitemap_freshness.py": 2,  # sitemap + child indexes
 }
@@ -1002,7 +1012,8 @@ def test_a_batch_only_lane_opts_into_waiting(monkeypatch: pytest.MonkeyPatch, la
     if lane == "curated_feed":
         from services import curated_brand_feed as m
         _http_stub(monkeypatch, m, status=404, text="")
-        asyncio.run(m.fetch_shopify_products("shop.example", max_products=1))
+        with pytest.raises(m.CrawlIncomplete):
+            asyncio.run(m.fetch_shopify_products("shop.example", max_products=1))
     else:
         from services.executor_agents import sitemap_freshness as m
         _http_stub(monkeypatch, m, status=404, text="")

@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 import json
 
 from db.database import database
-from utils.auth import get_current_user
+from utils.auth import ADMIN_ROLES, get_current_user
 
 router = APIRouter(
     prefix="/admin/seed",
@@ -19,7 +19,7 @@ router = APIRouter(
 async def seed_routing_logs(current_user: dict = Depends(get_current_user)):
     """Create test routing logs for demo purposes"""
     
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Admin access required")
     
     try:

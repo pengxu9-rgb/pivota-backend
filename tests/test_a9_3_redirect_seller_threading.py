@@ -68,6 +68,7 @@ def test_redirect_identity_legacy_null_seller_is_none_not_self():
 async def test_token_ctx_carries_seller_ref_alongside_anchor():
     redirect_url = await gateway._make_external_redirect_url(
         market="US",
+        market_observed=True,
         tool="offers.resolve",
         destination_url="https://brand.com/products/widget",
         utm_template=None,
@@ -94,6 +95,7 @@ async def test_token_ctx_carries_seller_ref_alongside_anchor():
 async def test_token_ctx_omits_seller_keys_for_legacy_seed():
     redirect_url = await gateway._make_external_redirect_url(
         market="US",
+        market_observed=True,
         tool="offers.resolve",
         destination_url="https://brand.com/products/widget",
         utm_template=None,
@@ -120,17 +122,27 @@ async def test_token_ctx_omits_seller_keys_for_legacy_seed():
 
 
 class _CaptureDB:
-    """Captures the surface_click_events INSERT that record_surface_event emits."""
+    """Captures the surface_click_events INSERT that record_surface_event emits.
+
+    The `/r` write is several statements (ADR-025 D1): an atomic count, which finds no row here,
+    so the legacy INSERT … ON CONFLICT DO NOTHING, then the fill. `inserted` is the INSERT's row;
+    a multi-row VALUES compiles its parameters as `<column>_m0`, which is folded back.
+    """
 
     def __init__(self) -> None:
         self.inserted: Optional[Dict[str, Any]] = None
+        self.executed: list = []
 
     async def fetch_one(self, query: Any, values: Any = None):
         return None  # no existing click row → the INSERT path
 
     async def execute(self, query: Any, values: Any = None):
         params = dict(query.compile().params)
-        self.inserted = params
+        self.executed.append(params)
+        if self.inserted is None and getattr(query, "is_insert", False):
+            self.inserted = {
+                (k[: -len("_m0")] if k.endswith("_m0") else k): v for k, v in params.items()
+            }
         return 1
 
 

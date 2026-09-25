@@ -91,7 +91,7 @@ def _shim(tmp_path: Path) -> Path:
     return shim
 
 
-def _deploy_argv(tmp_path: Path, env_name: str) -> list[str]:
+def _deploy_argv(tmp_path: Path, env_name: str, extra_env: dict | None = None) -> list[str]:
     """Capture the real `gcloud run deploy` argv for an environment.
 
     A MINIMAL env, deliberately: the script honours MAX_INSTANCES/MIN_INSTANCES/POOL_FLEET_BUDGET
@@ -105,6 +105,7 @@ def _deploy_argv(tmp_path: Path, env_name: str) -> list[str]:
         "CONFIG": "preserve",
         "PROMOTE": "0",
     }
+    env.update(extra_env or {})
     result = subprocess.run(
         ["bash", str(SCRIPT), env_name, "deadbeefcafe"],
         capture_output=True, text=True, env=env, timeout=180,
@@ -175,3 +176,80 @@ def test_concurrency_has_not_regressed_above_the_post_incident_ceiling() -> None
         f"prod CONCURRENCY={concurrency} exceeds the post-incident ceiling of "
         f"{CONCURRENCY_CEILING}; 80 against a pool of 6 wedged production twice"
     )
+
+
+# ── the shape overrides, added 2026-09-05 with proof-issuer's auto-deploy ───────────────────────
+# deploy_backend.sh now honours CPU_LIMIT / MEMORY_LIMIT / CONCURRENCY_LIMIT, because the
+# constants above are WEB's connection budget and every OTHER service deployed through this script
+# was silently adopting them. proof-issuer had been running concurrency 80 / maxScale 20 since
+# 2026-08-27, so an unpinned automatic roll would have cut it to 20 / 10 — an eightfold capacity
+# change as a side effect of shipping a commit.
+#
+# That mechanism is also, unavoidably, a way to set `web`'s concurrency to 80 without touching the
+# constants these tests guard. So it gets a fence: the override exists for the services the budget
+# above is NOT about, and `web` must keep answering to the constants.
+
+WORKFLOW = REPO / ".github" / "workflows" / "deploy-prod.yml"
+SHAPE_OVERRIDES = ("CPU_LIMIT", "MEMORY_LIMIT", "CONCURRENCY_LIMIT",
+                   "MIN_INSTANCES", "MAX_INSTANCES")
+
+
+def test_the_web_deploy_does_not_override_the_shape_it_is_budgeted_for() -> None:
+    """Every test above measures the CONSTANTS. If the `web` job passed CONCURRENCY_LIMIT=80,
+    all of them would still pass and production would still be running the shape that wedged
+    twice — the guard would be measuring a number the deploy no longer uses."""
+    import yaml
+
+    job = yaml.safe_load(WORKFLOW.read_text())["jobs"]["deploy"]
+    # Strip SHELL comments out of the dumped job. These files are heavily commented, and a
+    # future comment inside the `web` step that happens to write `MAX_INSTANCES: 20` while
+    # explaining something would fail this test with no behaviour change at all — a ratchet
+    # that cries wolf gets deleted, and then it is not guarding anything.
+    body = "\n".join(l for l in yaml.dump(job).splitlines() if "#" not in l)
+    # BOTH SPELLINGS. `VAR=value cmd` inline in a `run:` and a YAML `env:` mapping
+    # (`CONCURRENCY_LIMIT: 80`) reach deploy_backend.sh identically, and checking only the
+    # first let the second through — restoring the shape that wedged production twice, with
+    # this test green. A ratchet matching one syntactic form permits the others. Found by a
+    # mutation audit, 2026-09-05.
+    for override in SHAPE_OVERRIDES:
+        assert f"{override}:" not in body, (
+            f"the `web` deploy job sets {override} as an `env:` key, which reaches "
+            "deploy_backend.sh exactly as the inline form does and bypasses the connection "
+            "budget every other test in this module pins."
+        )
+        assert f"{override}=" not in body, (
+            f"the `web` deploy job sets {override}, bypassing the connection budget that "
+            f"every other test in this module is pinning. web's shape lives in "
+            f"{SCRIPT.name}'s constants, where a change to it is reviewed against the "
+            "2026-08-28/29 outages."
+        )
+
+
+def test_an_override_reaches_the_deploy_when_it_is_given(tmp_path: Path) -> None:
+    """The counterpart, and the reason the test above is not vacuous: the mechanism has to
+    actually work, or `web` is 'safe' only because the flags do nothing and proof-issuer is
+    being silently reshaped after all."""
+    # EVERY VALUE HERE MUST DIFFER FROM THE PROD CONSTANT IT OVERRIDES, or the case cannot
+    # tell a plumbed flag from an unplumbed one. Measured: with CPU_LIMIT=2 against the prod
+    # constant CPU=2, deleting the override entirely still produced `--cpu 2` and this test
+    # passed. prod is MIN=2 MAX=10 CPU=2 MEM=4Gi CONCURRENCY=20, so none of these may repeat
+    # those. They are deliberately NOT proof-issuer's real values — that is the job of
+    # test_the_proof_issuer_deploy_pins_the_shape_it_is_not_allowed_to_change; this case is
+    # only asking whether an override reaches gcloud at all.
+    argv = _deploy_argv(tmp_path, "prod", {
+        "CONCURRENCY_LIMIT": "80", "MAX_INSTANCES": "20", "MIN_INSTANCES": "3",
+        "CPU_LIMIT": "4", "MEMORY_LIMIT": "8Gi",
+        # The preserve-mode pool guard multiplies the LIVE pool by the maxScale this deploy
+        # would apply, and the shim reports a live pool. 20 instances trips the default
+        # budget, which is correct behaviour and not what this case is measuring.
+        "POOL_FLEET_BUDGET": "0",
+    })
+    # ALL of them. Asserting only two left --cpu and --memory unplumbed-and-unnoticed; they
+    # are harmless today only because proof-issuer's values coincide with web's constants,
+    # which the workflow's own comment calls a coincidence. Found by a mutation audit.
+    for flag, want in (("--concurrency", "80"), ("--max-instances", "20"), ("--cpu", "4"),
+                       ("--memory", "8Gi"), ("--min-instances", "3")):
+        assert _flag(argv, flag) == want, (
+            f"the override for {flag} did not reach the deploy (got {_flag(argv, flag)!r}, "
+            f"want {want!r}): {argv}"
+        )

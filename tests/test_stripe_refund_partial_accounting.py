@@ -119,7 +119,7 @@ def _install(monkeypatch: pytest.MonkeyPatch, order: _StatefulOrder) -> None:
     monkeypatch.setattr(
         webhook_routes_module, "_mark_stripe_webhook_event_status_best_effort", fake_mark_status
     )
-    monkeypatch.setattr(attribution_module, "attach_refund_to_attribution_edge", fake_attach)
+    monkeypatch.setattr(attribution_module, "apply_refund_total_to_attribution_edge", fake_attach)
 
 
 async def _send(monkeypatch: pytest.MonkeyPatch, event_type: str, obj: Dict[str, Any]) -> Dict[str, Any]:

@@ -36,14 +36,18 @@ class _Ctx:
 class _Issuer:
     name = "mock"
 
-    def __init__(self, fail_code: Optional[str] = None):
+    def __init__(self, fail_code: Optional[str] = None, orphan_ref: Optional[str] = None):
         self.fail_code = fail_code
+        # A ref on the failure means a card EXISTS at the issuer that we refused to accept —
+        # the constraint-verdict path, and the only thing that makes the revocation sweep
+        # reachable. See services/card_issuers/__init__.py.
+        self.orphan_ref = orphan_ref
         self.requests: List[Any] = []
 
     async def issue(self, request):
         self.requests.append(request)
         if self.fail_code:
-            raise CardIssuerError(self.fail_code, "boom")
+            raise CardIssuerError(self.fail_code, "boom", issuer_card_ref=self.orphan_ref)
         return IssuedCard(issuer_card_ref="mockcard_1", reveal_handle="https://mock.invalid/r/1")
 
 
@@ -70,6 +74,10 @@ def rig(monkeypatch: pytest.MonkeyPatch):
         "created_id": "will-be-set",
         "issued": [],
         "failed": [],
+        # The orphan writer is a SEPARATE recorder from `failed` on purpose: the whole point of
+        # the branch under test is that these are two different events, and a double that folded
+        # them into one list could not tell which one ran.
+        "orphaned": [],
     }
 
     monkeypatch.setenv("AGENT_CARD_ISSUANCE_ENABLED", "1")
@@ -92,6 +100,9 @@ def rig(monkeypatch: pytest.MonkeyPatch):
 
     async def fake_mark_failed(card_id, reason):
         state["failed"].append((card_id, reason))
+
+    async def fake_mark_failed_with_orphan(card_id, reason, issuer_card_ref):
+        state["orphaned"].append((card_id, reason, issuer_card_ref))
 
     async def fake_get(card_id, agent_id):
         state["get_args"] = (card_id, agent_id)
@@ -123,6 +134,7 @@ def rig(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(mod, "create_card_guarded", fake_create)
     monkeypatch.setattr(mod, "mark_issued", fake_mark_issued)
     monkeypatch.setattr(mod, "mark_failed", fake_mark_failed)
+    monkeypatch.setattr(mod, "mark_failed_with_orphan", fake_mark_failed_with_orphan)
     monkeypatch.setattr(mod, "get_card", fake_get)
     monkeypatch.setattr(mod, "resolve_issuer", lambda: state["issuer"])
 
@@ -538,3 +550,101 @@ def test_a_non_dict_snapshot_does_not_500_the_mint(rig, bad):
     snap = _json.loads(state["creates"][-1]["quote_snapshot"])
     assert snap["headroom"]["headroom_minor"] == 1778
     assert "unexpected_snapshot_shape" in snap
+
+
+# --- the orphan branch: which writer runs decides whether the sweep can ever see the card -----
+
+def test_a_refusal_CARRYING_a_ref_takes_the_orphan_path(rig):
+    """SURVIVOR: `if err.issuer_card_ref:` -> `if False:` passed all 196 tests.
+
+    This branch is the entire bridge between a constraint refusal and
+    jobs/agent_card_revocation_sweep.py. A card EXISTS at the issuer — possibly uncapped,
+    possibly not merchant-locked, holding a reveal handle — and `issuer_card_ref` on the failed
+    row is the only handle anything has to go kill it. Down the wrong arm, `mark_failed` writes
+    no ref, `list_orphaned_cards` finds nothing, and every sweep run reports a cheerful zero
+    while the card sits at the issuer until its own expiry. A log line is not a work queue.
+    """
+    client, state = rig
+    state["issuer"] = _Issuer(fail_code="REAP_CONSTRAINTS_UNCONFIRMED", orphan_ref="reap_1")
+
+    r = _post(client)
+
+    assert r.status_code == 502
+    assert state["orphaned"] == [
+        (state["created_id"], "REAP_CONSTRAINTS_UNCONFIRMED", "reap_1")
+    ]
+    assert state["failed"] == [], "the plain writer must NOT also run — it would drop the ref"
+    assert state["issued"] == []
+
+
+def test_a_refusal_with_NO_ref_takes_the_plain_path(rig):
+    """The other arm, and the reason the two writers are separate functions rather than one with
+    an optional argument: a failure that minted nothing must never leave a stray ref for the
+    sweep to chase into someone else's namespace."""
+    client, state = rig
+    state["issuer"] = _Issuer(fail_code="REAP_UNREACHABLE")  # transport failure: nothing minted
+
+    r = _post(client)
+
+    assert r.status_code == 502
+    assert state["failed"] == [(state["created_id"], "REAP_UNREACHABLE")]
+    assert state["orphaned"] == [], "no card exists, so nothing may be queued for revocation"
+
+
+def test_the_orphan_alarm_names_the_card(rig, monkeypatch):
+    """The row is the work queue; the log is the page. Asserted on the logger the route actually
+    calls — caplog observes an empty string here (utils.logger does not propagate), so it would
+    have passed with the logging deleted."""
+    import routes.agent_cards as mod
+
+    recorded = []
+
+    class _Recorder:
+        def error(self, msg, *args):
+            recorded.append(msg % args if args else msg)
+
+        def warning(self, *a, **k):
+            pass
+
+    monkeypatch.setattr(mod, "logger", _Recorder())
+    client, state = rig
+    state["issuer"] = _Issuer(fail_code="REAP_CONSTRAINTS_MISMATCH", orphan_ref="reap_1")
+
+    _post(client)
+
+    assert len(recorded) == 1
+    assert "ORPHAN" in recorded[0]
+    assert state["created_id"] in recorded[0]
+    assert "REAP_CONSTRAINTS_MISMATCH" in recorded[0]
+
+
+# --- three parties, three statuses -------------------------------------------------------------
+
+def test_OUR_misconfiguration_is_a_502_not_a_422(rig):
+    """`caller_fault` on MerchantUcpError means "not the merchant's fault", and the route read it
+    as "the API caller's fault" -> 422. So an unreachable Pivota agent profile, or a discovery
+    handshake WE got wrong, told the agent its request was invalid — sending it to debug a body
+    that was fine, on a failure it cannot affect and retrying will not fix.
+
+    `our_fault` is the third party the two-way flag could not express.
+    """
+    client, state = rig
+    state["quote"] = MerchantQuoteError("UCP_AGENT_PROFILE_URL is unreachable", our_fault=True)
+
+    r = _post(client)
+
+    assert r.status_code == 502
+    # And the detail is GENERIC: the specific cause names our env vars and internal config, which
+    # is our operational surface and nothing an external caller can act on. It belongs in the log.
+    assert "UCP_AGENT_PROFILE_URL" not in r.text
+    assert r.json()["detail"] == "merchant negotiation is not configured"
+    assert state["creates"] == [], "nothing may be minted against a quote we could not resolve"
+
+
+def test_our_fault_wins_over_caller_fault(rig):
+    """Both flags set is not a contradiction to resolve by ordering luck: a caller cannot fix our
+    misconfiguration, so `our_fault` decides."""
+    client, state = rig
+    state["quote"] = MerchantQuoteError("both", caller_fault=True, our_fault=True)
+
+    assert _post(client).status_code == 502

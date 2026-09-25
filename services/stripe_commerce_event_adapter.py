@@ -5,6 +5,7 @@ import json
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from services.commerce_order_ref import pivota_order_ref
 from services.merchant_event_ingest_service import MerchantCommerceEvent, MerchantEventBatch
 
 
@@ -100,6 +101,12 @@ def _common_event(
     order_id = _text(order.get("order_id"))
     if not order_id:
         raise ValueError("Stripe canonical event requires an order id")
+    # `order` is the PIVOTA order row this webhook was resolved against, so
+    # this bridge always knows the purchase originated in Pivota — and names
+    # it the same way the agent checkout and the store platform's own webhook
+    # (via the writeback marker) do. Naming it `stripe:<payment intent>`
+    # instead would re-open the double count this column exists to close.
+    order_ref = pivota_order_ref(order_id)
     order_meta = _order_metadata(order)
     click_id = _text(
         order_meta.get("pivota_click_id") or order_meta.get("click_id"),
@@ -119,6 +126,7 @@ def _common_event(
         checkout_id=_text(order_meta.get("checkout_id")),
         payment_id=_text(payment_id),
         order_id=order_id,
+        order_ref=order_ref,
         refund_id=_text(refund_id),
         trace_id=_text(stripe_event_id),
         brief_id=_text(order_meta.get("brief_id")),

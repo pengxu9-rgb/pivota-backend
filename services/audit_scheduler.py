@@ -49,6 +49,21 @@ Job registration happens at start-up time. Currently registers:
 - `cafe24_reconciliation` — every 15 minutes, replays Cafe24 webhook and
   Data Bridge logs for a bounded least-recently-run store batch. It is dormant
   unless CAFE24_RECONCILIATION_ENABLED is explicitly enabled.
+- `reap_agentic_purchase_poll` — every REAP_AGENTIC_POLL_INTERVAL_SECONDS
+  (default 30), drives jobs/reap_agentic_purchase_poll: requeue stale claims,
+  expire overdue purchases (the PII deadline), fail attempt-exhausted ones, then
+  claim due rows and take ONE state-machine step on each. Dormant unless
+  REAP_AGENTIC_ENABLED is set AND the Reap client is configured — the gate is
+  inside the job, so registering it here is inert.
+- `merchant_purchasability_sweep` — every
+  MERCHANT_PURCHASABILITY_INTERVAL_SECONDS (default 3600), renders the landed
+  checkout of a bounded batch of merchant x market rows from the two Reap
+  eligibility allowlists and records whether that checkout offers a CARD and at
+  what price (jobs/merchant_purchasability_sweep). A merchant carries a purchase
+  affordance only while it holds a fresh POSITIVE fact; "unverifiable" is not
+  positive. Dormant unless MERCHANT_PURCHASABILITY_SWEEP_ENABLED is set — the gate is
+  inside the job, so registering it here is inert. It must stay dormant by
+  default because every check creates an abandoned checkout on a live store.
 
 Best-effort: scheduler init failure logs a warning but does not crash
 the API. The audit endpoints still work; only the cron is degraded.
@@ -64,7 +79,9 @@ force a run with POST /admin/scheduler/jobs/{id}/run-now.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import math
 import os
 from typing import Optional
 
@@ -98,6 +115,7 @@ _STATE_NAMES = {0: "STOPPED", 1: "RUNNING", 2: "PAUSED"}
 # explicit entry, so nobody inherits the default by accident.
 _DEFAULT_RUN_DEADLINE_SECONDS = 3600.0
 _JOB_RUN_DEADLINES = {
+    "official_domain_liveness": 180,
     # daily / weekly crons: heavy sweeps. daily_audit_check runs LLM audits
     # INLINE (gather of 3, each routinely >15 min): 4h.
     "daily_audit_check": 14400,
@@ -106,6 +124,8 @@ _JOB_RUN_DEADLINES = {
     "catalog_invariant_sweep": 7200,
     "identity_reconcile_sweep": 7200,
     "gmv_aggregation_daily": 3600,
+    "agent_share_accrual_daily": 3600,
+    "gmv_invoice_credit_daily": 3600,
     "audit_stability_canary": 1800,
     # 6-hourly catalog sweeps (bounded per run, stalest-first)
     "pdp_scope_backfill": 7200,
@@ -124,6 +144,20 @@ _JOB_RUN_DEADLINES = {
     "catalog_onboard_queue_drain": 1500,
     "external_conversion_poll": 600,
     "external_seed_catalog_materialization": 600,
+    # Orphan card revocation: up to AGENT_CARD_REVOCATION_BATCH (100) orphans per run, each one
+    # a serial issuer call.
+    #
+    # THE ADAPTER'S `timeout=15.0` IS NOT A 15s BUDGET PER CALL. httpx spreads a bare float
+    # across connect, read, write AND pool as 15s EACH, so one revoke can legitimately take
+    # ~60s before it gives up — 100 of them is up to ~6000s, well past this deadline, not the
+    # 1500s the arithmetic here used to claim. That is fine and is what the deadline is FOR:
+    # 1800s cuts a wedged run well inside the hourly cadence so it cannot overlap the next one,
+    # and rule 2 of the sweep makes the cut harmless — retry is unbounded by design, so the
+    # orphans a cut run did not reach are simply the head of the next run's oldest-first queue.
+    # What the deadline must not be read as is a guarantee that a full batch completes; only a
+    # smaller AGENT_CARD_REVOCATION_BATCH, or a real total-timeout on the adapter, would buy
+    # that. Idle runs are a single indexed query.
+    "agent_card_revocation_sweep": 1800,
     # queue drainers: MAX_RUNS_PER_TICK runs each, serial. Audits routinely
     # run >15 min each (a cut run loses its LLM spend and re-runs after the
     # 15-min lease expires) so 3 get 2h; executor agents (sitemap fetch, GSC
@@ -162,8 +196,65 @@ _JOB_RUN_DEADLINES = {
     # money path: 20 jobs x (store read + token resolve + 2 Shopify calls at a
     # 10s timeout). Comfortably over the worst realistic tick, under the 300s
     # job lease so a cut run's lease expires and a sibling re-claims it.
-    "merchant_order_sync_worker_tick": 240,
+    # 20 serial merchant-order creates, each a Shopify round trip — well past
+    # the old 240s, which was sized when this queue carried only rare refunds.
+    # Kept UNDER the 300s job lease so a cut run's job is re-claimable rather
+    # than stranded.
+    "merchant_order_sync_worker_tick": 280,
     "merchant_order_sync_lease_reaper": 120,
+    # Two COUNT(*)s over `orders` plus a bounded listing.
+    "merchant_order_gap_alert": 300,
+    # A bounded SELECT plus one INSERT per lost enqueue; no platform calls.
+    "merchant_order_create_reconcile": 300,
+    # Reap agentic purchase poller. The job carries its OWN wall-clock budget
+    # (REAP_AGENTIC_POLL_BUDGET_SECONDS, default 240) which stops it STARTING new
+    # work; a row already in flight runs to completion, so a run can legitimately
+    # exceed the budget by one whole step. This deadline must therefore sit above
+    # budget + the slowest SINGLE step.
+    #
+    # THE SLOWEST STEP IS NOT ~40s. That figure was inherited from WP2b's runbook
+    # and is wrong for `_step_quoting` as it now stands. Re-derived from
+    # services/reap_agentic_client's per-path read timeouts:
+    #   resolve_our_row   up to MAX_SEARCH_ATTEMPTS (3) products/search at 25s,
+    #                     plus one products/variant at 25s          -> 100s
+    #   request_quote     35s   (13-16s measured across nine merchants)
+    #   create_checkout   35s
+    #                                                    worst realistic  170s
+    # 240 + 170 = 410; 600 leaves headroom for the three bulk sweeps that run
+    # before any claiming. Raise the budget and this must move with it.
+    #
+    # AND EVEN 600 IS NOT A GUARANTEE, deliberately. The client hands httpx a
+    # BARE FLOAT timeout, which httpx spreads across connect, read, write AND
+    # pool as that value EACH -- the same trap the agent_card_revocation_sweep
+    # note above describes -- so the strict bound on one `quoting` step is ~4x
+    # 170s. This deadline is a backstop against a WEDGE, not a promise that a
+    # batch completes. That is safe here because the job wraps its row loop in a
+    # try/finally that releases every claim on CancelledError, so a cut run
+    # strands no leases and the next tick simply re-claims what it did not reach.
+    "reap_agentic_purchase_poll": 600,
+    # Merchant purchasability sweep. Like the poller above, the job carries its
+    # OWN wall-clock budget (MERCHANT_PURCHASABILITY_BUDGET_SECONDS, default 600)
+    # which stops it STARTING a new merchant; a merchant already in flight runs to
+    # completion, so a run can legitimately exceed the budget by one merchant's
+    # worth of fetches. This deadline must therefore sit above budget + that one
+    # merchant.
+    #
+    # ONE MERCHANT'S WORST CASE, re-derived from the preflight's own bounds rather
+    # than guessed: REQUEST_TIMEOUT_S is 30 s and a check makes at most
+    # MAX_CATALOG_PAGES (20) catalog reads plus MAX_REDIRECT_HOPS (10) permalink
+    # hops. That is a 900 s ceiling per vantage on paper — but, exactly as the
+    # reap note above records, the preflight hands httpx a BARE FLOAT timeout,
+    # which httpx spreads across connect, read, write AND pool as that value
+    # EACH, so the strict bound is ~4x that again. A realistic worst case is far
+    # smaller (a whole check measured in seconds on three live merchants), and
+    # this deadline is a backstop against a WEDGE, not a promise that a batch
+    # completes: 600 + 300 = 900, and a cut run strands nothing, because this job
+    # holds no leases and writes each fact as it goes. The next tick simply
+    # re-reads the due list, which is least-recently-checked first.
+    #
+    # WITH VANTAGE_PROXY_URL SET EACH MERCHANT IS CHECKED TWICE, so raise this
+    # with the budget if a second vantage is configured on a large population.
+    "merchant_purchasability_sweep": 900,
 }
 
 
@@ -339,6 +430,24 @@ async def start_scheduler() -> None:
             coalesce=True,
         )
 
+        # Orphan card revocation: kill cards that exist at the issuer but that we refused to
+        # accept because the constraints came back unconfirmed or contradicted. Runs HOURLY, not
+        # daily, and that is the point — an orphan may be an uncapped, unlocked card, so the
+        # window in which it is spendable is the thing being minimised. Cheap when idle: one
+        # indexed query that returns nothing unless a mint actually failed that way.
+        # Its own kill switch (AGENT_CARD_REVOCATION_SWEEP_ENABLED, default off) gates the
+        # provider calls, so registering it here is inert until that is set.
+        from jobs.agent_card_revocation_sweep import run_agent_card_revocation_sweep
+        _add_job(
+            run_agent_card_revocation_sweep,
+            "cron",
+            minute=17,          # off the hour, away from the :00 cron pile-up
+            id="agent_card_revocation_sweep",
+            replace_existing=True,
+            misfire_grace_time=1800,
+            coalesce=True,
+        )
+
         # Outcome aggregation: roll the decision -> order -> paid/refund loop into
         # per-merchant + per-product outcome metrics (aggregated_outcomes). Daily at
         # 05:00 UTC (after nightly_index_health). Min-sample-gated, so it surfaces
@@ -375,6 +484,80 @@ async def start_scheduler() -> None:
             id="external_conversion_poll",
             replace_existing=True,
             misfire_grace_time=600,
+            coalesce=True,
+        )
+
+        # Reap agentic purchase poller (WP3): the only thing that moves a
+        # buyer-funded Reap purchase through its state machine. There are NO
+        # WEBHOOKS on that rail, so this poll is the sole way a checkout outcome
+        # is ever learned, and it is also what runs the two bulk sweeps — the PII
+        # deadline for purchases waiting on a buyer, and the attempt ceiling.
+        #
+        # OFF BY DEFAULT and the gate is INSIDE the job (REAP_AGENTIC_ENABLED plus
+        # a configured Reap client), exactly like external_conversion_poll above:
+        # registering it here is inert, so deploying this never starts autonomous
+        # partner polling, and arming the rail needs an env var rather than a
+        # scheduler restart. A SECOND gate here would be a second thing to keep
+        # in step with the first.
+        #
+        # `max_instances=1` is explicit rather than inherited from APScheduler's
+        # default: two overlapping runs would each mint their own worker id and
+        # claim disjoint rows, so it is not a correctness fence — it is what stops
+        # a slow tick stacking partner call chains on a partner that rate-limits.
+        # `misfire_grace_time` is deliberately SHORT (one interval): a poll tick
+        # that missed its slot has nothing to catch up on, because the next tick
+        # selects on `next_poll_at <= now` and therefore sees everything the
+        # skipped one would have.
+        from jobs.reap_agentic_purchase_poll import (
+            job_interval_seconds,
+            run_reap_agentic_purchase_poll,
+        )
+        _reap_agentic_interval = job_interval_seconds()
+        _add_job(
+            run_reap_agentic_purchase_poll,
+            "interval",
+            seconds=_reap_agentic_interval,
+            id="reap_agentic_purchase_poll",
+            replace_existing=True,
+            max_instances=1,
+            misfire_grace_time=_reap_agentic_interval,
+            coalesce=True,
+        )
+
+        # Merchant purchasability sweep (WP6): the only thing that gathers the
+        # POSITIVE fact a merchant x market row needs before the door may offer to
+        # buy from it. It renders the landed checkout and reads the checkout's own
+        # payment accept-list; nothing else in this system looks at whether a
+        # merchant takes a CARD, which is how flowerbeauty.com came to be served
+        # as purchasable with a PayPal-only checkout.
+        #
+        # OFF BY DEFAULT and the gate is INSIDE the job
+        # (MERCHANT_PURCHASABILITY_SWEEP_ENABLED), exactly like reap_agentic_purchase_poll
+        # above: registering it here is inert, so deploying this contacts no
+        # merchant, and arming it needs an env var rather than a scheduler restart.
+        # A SECOND gate here would be a second thing to keep in step with the first.
+        #
+        # DORMANT-BY-DEFAULT MATTERS MORE HERE THAN ON MOST JOBS: every check this
+        # job makes CREATES AN ABANDONED CHECKOUT on a live merchant's store.
+        #
+        # `max_instances=1` is explicit rather than inherited: two overlapping runs
+        # would sweep the same least-recently-checked merchants and double that
+        # side effect. `misfire_grace_time` is one interval — a tick that missed
+        # its slot has nothing to catch up on, because the next tick re-reads the
+        # due list and sees everything the skipped one would have.
+        from jobs.merchant_purchasability_sweep import (
+            job_interval_seconds as _purchasability_interval_seconds,
+            run_merchant_purchasability_sweep,
+        )
+        _purchasability_interval = _purchasability_interval_seconds()
+        _add_job(
+            run_merchant_purchasability_sweep,
+            "interval",
+            seconds=_purchasability_interval,
+            id="merchant_purchasability_sweep",
+            replace_existing=True,
+            max_instances=1,
+            misfire_grace_time=_purchasability_interval,
             coalesce=True,
         )
 
@@ -611,7 +794,7 @@ async def start_scheduler() -> None:
         # docs/monetization/deploy/STAGE_1_SHADOW_MODE_ROLLOUT.md §0.
 
         from services.metering_service import expire_stale_reservations
-        from services.gmv_aggregation_service import aggregate_daily
+        from services.gmv_aggregation_service import run_nightly_rollup
         from services.invoice_generation_service import run_billing_cycle
         from services.partner_settlement_service import run_settlement
         from services import settlement_file_service
@@ -621,10 +804,9 @@ async def start_scheduler() -> None:
         from datetime import datetime as _dt, timedelta as _td, timezone as _tz
 
         async def _run_gmv_aggregation_yesterday() -> None:
-            """T6 daily wrapper: aggregate yesterday's edges into gmv_attribution_daily."""
-            yesterday = (_dt.now(_tz.utc) - _td(days=1)).date()
-            rows = await aggregate_daily(yesterday)
-            logger.info("audit_scheduler: gmv_aggregation_daily for %s -> %d rollup rows", yesterday, rows)
+            """T6 daily wrapper: roll up yesterday into gmv_attribution_daily, then re-roll every
+            earlier day whose edges changed after it was rolled up (run_nightly_rollup)."""
+            await run_nightly_rollup()
 
         async def _run_billing_cycle_previous_month() -> None:
             """T7 monthly wrapper: invoice the previous calendar month.
@@ -730,6 +912,56 @@ async def start_scheduler() -> None:
             hour=2,
             minute=0,
             id="gmv_aggregation_daily",
+            replace_existing=True,
+            misfire_grace_time=900,
+            coalesce=True,
+            max_instances=1,
+        )
+
+        # ADR-025 D5 — agent share accrual, daily at 02:30 UTC. It credits agents a share of what
+        # was INVOICED (billing_run_items), and reverses lines a dispute or a void cancelled since.
+        # DARK: returns at once unless AGENT_SHARE_ACCRUAL_ENABLED is set; with no rows in
+        # agent_share_rates, or no invoices (T7 is paused), it writes nothing.
+        async def _run_agent_share_accrual() -> None:
+            from services.agent_share_accrual import accrue_recent, is_enabled as _share_enabled
+
+            if not _share_enabled():
+                return
+            summary = await accrue_recent()
+            logger.info("audit_scheduler: agent_share_accrual_daily -> %s", summary)
+
+        _add_job(
+            _run_agent_share_accrual,
+            "cron",
+            hour=2,
+            minute=30,
+            id="agent_share_accrual_daily",
+            replace_existing=True,
+            misfire_grace_time=900,
+            coalesce=True,
+            max_instances=1,
+        )
+
+        # GMV invoice credits, daily at 02:15 UTC: what recent refunds took off days already invoiced,
+        # computed as PENDING credits. Nothing reaches Stripe here; an admin approves each credit
+        # (/admin/billing/invoice-credits). Also decides the channel partner's share of issued
+        # credits once their period is settled. With no invoices (T7 is paused) it writes nothing.
+        # Runs before agent_share_accrual_daily (02:30) so a credit issued that day nets first.
+        async def _run_gmv_invoice_credits() -> None:
+            from services.gmv_invoice_credits import run_daily
+            # The "pivota" logger, not the module one: prod leaves root at WARNING, so a module
+            # logger's INFO never reaches stdout (#2266).
+            from utils.logger import logger as operator_logger
+
+            summary = await run_daily()
+            operator_logger.info("audit_scheduler: gmv_invoice_credit_daily -> %s", summary)
+
+        _add_job(
+            _run_gmv_invoice_credits,
+            "cron",
+            hour=2,
+            minute=15,
+            id="gmv_invoice_credit_daily",
             replace_existing=True,
             misfire_grace_time=900,
             coalesce=True,
@@ -1045,6 +1277,61 @@ async def start_scheduler() -> None:
             max_instances=1,
         )
 
+        # Makes `paid_missing_merchant_order_count` an actual signal. It has
+        # carried `page_if_greater_than_zero_for_live_merchants` since #1967
+        # while being served only by an admin pull that nothing scrapes — and
+        # the durable-queue work leaned on it three times as the standing trace
+        # for a create that cannot be retried. Read-only, so not flag-gated.
+        from services.merchant_order_gap_alert import run_merchant_order_gap_alert_tick
+        _add_job(
+            run_merchant_order_gap_alert_tick,
+            "interval",
+            seconds=900,
+            id="merchant_order_gap_alert",
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+        )
+
+        # Repairs orders whose merchant-order create was never QUEUED — an
+        # enqueue lost to a DB failure, or an order predating the queue. It
+        # ENQUEUES rather than creating, and skips any order that already has a
+        # create job in any state, so it cannot re-attempt work the queue owns.
+        #
+        # Flag-gated anyway: it writes on the money path, staging shares the
+        # prod Postgres, and its first prod run will pick up the pre-queue
+        # backlog. Arm it deliberately after a `--dry-run` has sized that.
+        from jobs.agentic_commerce_reconciliation import (
+            run_merchant_order_create_reconcile_tick,
+        )
+        _add_job(
+            run_merchant_order_create_reconcile_tick,
+            "interval",
+            seconds=900,
+            id="merchant_order_create_reconcile",
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+            misfire_grace_time=120,
+        )
+
+        # B1 official-domain seeding + liveness. DORMANT unless
+        # OFFICIAL_DOMAIN_LIVENESS_ENABLED is set (the tick checks the flag
+        # itself, like identity_reconcile_sweep below): the first prod run
+        # seeds merchant_official_domains for EVERY merchant, and
+        # official_domains is a comparability field, so it moves attribution
+        # and makes the next re-audit of every merchant non-comparable.
+        # Arm it after a dry run has sized the seed.
+        from jobs.official_domain_liveness import (
+            liveness_job_enabled,
+            run_official_domain_liveness_tick,
+        )
+        _add_job(
+            run_official_domain_liveness_tick, "interval", hours=6,
+            id="official_domain_liveness", replace_existing=True,
+            coalesce=True, max_instances=1, misfire_grace_time=120,
+        )
+
         # ADR-010 D-2 Phase B: weekly catalog identity-reconcile sweep —
         # classify -> propose -> auto-apply ONLY the mechanical allowlist
         # (same_url_dup, junk_url) -> review batches for the rest -> alert
@@ -1122,6 +1409,8 @@ async def start_scheduler() -> None:
             "+ metering_expire_reservations (5min, ACTIVE) "
             "+ stamp_attribution_reaper (5min, ACTIVE) "
             "+ gmv_aggregation_daily (02:00 UTC, ACTIVE) "
+            "+ gmv_invoice_credit_daily (02:15 UTC, pending credits only) "
+            "+ agent_share_accrual_daily (02:30 UTC, flag AGENT_SHARE_ACCRUAL_ENABLED) "
             "+ invoice_generation_monthly (day 2 03:00 UTC, PAUSED) "
             "+ partner_settlement_monthly (day 3 04:00 UTC, PAUSED) "
             "+ settlement_file_generate (day 5 02:00 UTC, ACTIVE) "
@@ -1132,7 +1421,25 @@ async def start_scheduler() -> None:
             "+ payment_reconcile_tick (5min, flag-gated PAYMENT_RECONCILE_SWEEP_ENABLED) "
             "+ merchant_order_sync_worker_tick (30s, ACTIVE) "
             "+ merchant_order_sync_lease_reaper (60s, ACTIVE) "
+            "+ merchant_order_gap_alert (15min, ACTIVE) "
+            "+ merchant_order_create_reconcile (15min, flag-gated "
+            "MERCHANT_ORDER_CREATE_RECONCILE_ENABLED) "
             "+ identity_reconcile_sweep (Mon 04:30 UTC, flag-gated ENABLE_IDENTITY_RECONCILE_SWEEP) "
+            # RAW VALUE AND PARSED POSTURE, both, for the same reason the
+            # drain line below carries a resolved posture — and one more.
+            # `liveness_job_enabled` arms on the LITERAL string "true", so
+            # OFFICIAL_DOMAIN_LIVENESS_ENABLED=1 (or "yes", or "True " with a
+            # stray space, which does strip and lower fine, or "TRUE" which
+            # also arms) is an operator who believes they armed a job that is
+            # still parked. Printing only the posture hides the typo; printing
+            # only the raw value makes every reader re-derive the rule. The
+            # first prod run of this job seeds merchant_official_domains for
+            # every merchant in the catalog and makes each of their next
+            # re-audits non-comparable, so "did I actually arm it?" has to be
+            # answerable from the boot line alone.
+            "+ official_domain_liveness (6h, DORMANT unless "
+            "OFFICIAL_DOMAIN_LIVENESS_ENABLED is literally 'true' — raw %r, "
+            "resolved now as %s) "
             # Both listed so a mistyped kill switch is not indistinguishable from
             # a working one: the drain resolves its flag per-run and returns
             # {"reason": "disabled"} silently, so this line is the one place an
@@ -1140,6 +1447,8 @@ async def start_scheduler() -> None:
             "+ catalog_import_drain_tick (30s, ON by default; kill switch "
             "CATALOG_IMPORT_DRAIN_ENABLED=false — resolved now as %s) "
             "+ catalog_import_stale_reaper (5min, ACTIVE, not flag-gated)",
+            os.getenv("OFFICIAL_DOMAIN_LIVENESS_ENABLED"),
+            "ON" if liveness_job_enabled() else "OFF",
             "ON" if _catalog_import_drain_enabled() else "OFF",
         )
     except Exception as exc:  # noqa: BLE001
@@ -1167,19 +1476,171 @@ async def restart_scheduler() -> dict:
     return scheduler_diagnostics()
 
 
-async def stop_scheduler() -> None:
-    """Graceful shutdown of the scheduler. Called from
-    main.shutdown_event. Best-effort."""
-    global _SCHEDULER
-    if _SCHEDULER is None:
+# How long shutdown may wait for in-flight runs before cancelling them.
+#
+# SMALL ON PURPOSE, and the ceiling is not ours to choose: Cloud Run sends SIGTERM and then
+# kills the container, and uvicorn is started with no --timeout-graceful-shutdown, so it waits
+# on this lifespan indefinitely. Overrun the platform's grace and the process is SIGKILLed
+# MID-DRAIN, before `database.disconnect()` has run -- losing the connection teardown to save a
+# job is a strictly worse trade than cancelling the job.
+#
+# That sentence is only true because main.app_lifespan now calls shutdown_event() BEFORE
+# shutdown(); when it was the other way round the pool was already closed by the time this
+# ran, so the drain could not let a DB-touching job finish at all -- it just gave it a few
+# seconds to fail its recording write. If that ordering is ever reverted, this budget argument
+# stops holding and so does the drain.
+# Set SCHEDULER_DRAIN_SECONDS=0 to restore the previous cancel-immediately behaviour.
+# 3s, not 5. The drain now runs BEFORE `database.disconnect()`, so it and the pool close share
+# one grace budget of roughly 10s -- 5s was half of it for a benefit that is almost entirely
+# realised in the first second. The jobs this helps are the short ticks (an indexed query on an
+# idle queue) which land in milliseconds; the ones that would use the full budget are the long
+# drainers, and an audit run that "routinely runs >15 min" is not going to land in 5s either.
+# So the extra 2s buys almost nothing and spends a fifth of the shutdown window.
+_DRAIN_DEFAULT_SECONDS = 3.0
+# An absolute ceiling on what the env var may ask for. Not a tuning limit — a blast-radius
+# bound: the whole argument above is that overrunning the platform's grace loses
+# `database.disconnect()`, so a value that does that is never what anyone meant. Chosen
+# against Cloud Run's documented ~10s SIGTERM grace, leaving room for the rest of
+# main.shutdown_event. A larger request is honoured up to here and says so.
+_DRAIN_MAX_SECONDS = 8.0
+
+
+def _read_drain_seconds() -> float:
+    """SCHEDULER_DRAIN_SECONDS, parsed so a typo cannot cost more than the drain.
+
+    THIS FUNCTION EXISTS BECAUSE THE ONE-LINER IT REPLACED WAS A LANDMINE. It was
+    `float(os.getenv(...))` evaluated at IMPORT, so `SCHEDULER_DRAIN_SECONDS=5s` raised
+    ValueError while this module was being imported — and main.py:891 imports it inside
+    `except Exception`, which turns that into "audit_scheduler boot failed (continuing
+    degraded ... no worker will drain them)". A typo in a shutdown-timing knob would have
+    silently disabled EVERY cron and drainer on the worker. That is not a proportionate
+    consequence, so nothing here may raise.
+    """
+    raw = (os.getenv("SCHEDULER_DRAIN_SECONDS") or "").strip()
+    if not raw:
+        return _DRAIN_DEFAULT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "audit_scheduler: SCHEDULER_DRAIN_SECONDS=%r is not a number - using the "
+            "default %.1fs. Set 0 to disable the shutdown drain.", raw, _DRAIN_DEFAULT_SECONDS,
+        )
+        return _DRAIN_DEFAULT_SECONDS
+    # NON-FINITE FIRST, because the comparisons below cannot reject them: `nan <= 0` is
+    # False AND `nan > _DRAIN_MAX_SECONDS` is False, so a value of `nan` would fall straight
+    # through both guards and reach `asyncio.wait(timeout=nan)`, which never fires — shutdown
+    # hangs until the platform kills the container. `inf` is caught by the ceiling below, but
+    # is rejected here too so the reason in the log is the true one.
+    if not math.isfinite(value):
+        logger.warning(
+            "audit_scheduler: SCHEDULER_DRAIN_SECONDS=%r is not a finite number - using the "
+            "default %.1fs.", raw, _DRAIN_DEFAULT_SECONDS,
+        )
+        return _DRAIN_DEFAULT_SECONDS
+    if value <= 0:
+        return 0.0          # explicit opt-out
+    if value > _DRAIN_MAX_SECONDS:
+        logger.warning(
+            "audit_scheduler: SCHEDULER_DRAIN_SECONDS=%s exceeds the %.1fs ceiling and would "
+            "risk the container being killed mid-shutdown, losing database.disconnect(). "
+            "Using %.1fs.", raw, _DRAIN_MAX_SECONDS, _DRAIN_MAX_SECONDS,
+        )
+        return _DRAIN_MAX_SECONDS
+    return value
+
+
+_DRAIN_SECONDS = _read_drain_seconds()
+
+
+async def _drain_running_jobs(seconds: float) -> None:
+    """Wait, briefly, for in-flight scheduler runs to finish. Never raises."""
+    if seconds <= 0:
         return
     try:
-        # AsyncIOScheduler.shutdown(wait=False) cancels in-flight
-        # jobs immediately. We prefer wait=True so a re-audit in
-        # progress completes — but capped at 30s so deploys aren't
-        # blocked by a hanging job.
-        _SCHEDULER.shutdown(wait=False)
+        from services.scheduler_job_runner import active_tasks
+        tasks = active_tasks()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("audit_scheduler: could not read in-flight runs: %s", exc)
+        return
+    if not tasks:
+        return
+    # WARNING, not info: this process ships no logging config, so the root logger sits at
+    # WARNING and every logger.info is dropped. A drain that only logged at info would be
+    # invisible in exactly the situation someone is reading logs to understand.
+    logger.warning("audit_scheduler: draining %d in-flight run(s), up to %.1fs", len(tasks), seconds)
+    try:
+        _done, pending = await asyncio.wait(tasks, timeout=seconds)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("audit_scheduler: drain failed, cancelling instead: %s", exc)
+        return
+    if pending:
+        logger.warning(
+            "audit_scheduler: %d run(s) still going after %.1fs - cancelling them",
+            len(pending), seconds,
+        )
+
+
+async def stop_scheduler() -> None:
+    """Shut the scheduler down, letting in-flight runs finish first if they can.
+
+    WHY THIS IS NOT JUST `shutdown(wait=True)`, which is what this function used to claim
+    it wanted. For an AsyncIOScheduler the `wait` argument IS A NO-OP. APScheduler 3.11's
+    AsyncIOExecutor.shutdown says so in its own body -- "there is no way to honor wait=True
+    without converting this method into a coroutine method" -- and then cancels every pending
+    future regardless of the flag. So `wait=True` and `wait=False` are byte-identical here,
+    and the old comment ("we prefer wait=True ... capped at 30s") described behaviour that
+    could not exist: `shutdown()` takes no timeout either. Flipping the flag would have
+    turned a visible mismatch into an invisible one.
+
+    Draining therefore has to be done BY US, before handing control to APScheduler, and the
+    runner already tracks the real asyncio.Tasks so no private state is touched.
+
+    WHY IT IS WORTH DOING AT ALL. Since 2026-09-06 the worker is rolled on every push to main
+    (15-34 merges/day), so this path now runs constantly rather than at a human's pace. Every
+    cancelled in-flight run takes `run_isolated`'s wrapper-cancelled branch, which adopts it
+    as a ZOMBIE: an ERROR log naming the #1754 wedge class, plus a terminated DB connection.
+    Those are the right responses to a run that would not unwind; they are noise for an
+    ordinary redeploy, and repeated dozens of times a day they teach people to ignore an
+    error that elsewhere means something is genuinely stuck. THAT is the benefit, and it is
+    the idle and short ticks that supply it.
+
+    What this does NOT promise: that a tick with real work will land. `payment_reconcile_tick`
+    is 50 orders x (PSP verify + finalize + Shopify order); `merchant_order_sync_worker_tick`
+    is 20 jobs x 2 Shopify calls at 10s timeouts. Neither finishes in 3s, and neither was ever
+    going to — they are cancelled at the cap exactly as before. Read this as "settlement runs
+    are now safe from redeploys" and it will mislead you.
+
+    Best-effort throughout: nothing here may raise, and nothing may hang.
+    """
+    global _SCHEDULER
+    sched = _SCHEDULER
+    if sched is None:
+        return
+    try:
+        # PAUSE FIRST. Without it the timer keeps firing during the drain and we would be
+        # waiting on a set of runs that grows while we wait.
+        try:
+            sched.pause()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("audit_scheduler: pause before drain failed: %s", exc)
+        await _drain_running_jobs(_DRAIN_SECONDS)
     except Exception as exc:  # noqa: BLE001
         logger.warning("audit_scheduler: stop error: %s", exc)
     finally:
+        # SHUTDOWN GOES IN THE `finally`, and this is not tidiness. The drain introduced an
+        # await into a function that used to be entirely synchronous, so a CancelledError can
+        # now land in the middle of it — and CancelledError is not an Exception, so it would
+        # sail past the handler above, SKIP the shutdown, and still hit `_SCHEDULER = None`
+        # below. That leaves APScheduler RUNNING with its timer armed and no reference left to
+        # stop it, while shutdown_event's own `finally` closes the pool underneath it.
+        # Measured, not theorised: `sched.calls == ['pause']` with `_SCHEDULER is None`.
+        #
+        # main.py:911's `finally: await database.disconnect()` was added in the same review
+        # round on exactly this premise; this is the same premise applied one level down.
+        try:
+            # Whatever is still running is cancelled here, exactly as before.
+            sched.shutdown(wait=False)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("audit_scheduler: shutdown error: %s", exc)
         _SCHEDULER = None

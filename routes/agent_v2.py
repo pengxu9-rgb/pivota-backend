@@ -67,11 +67,12 @@ class SearchProductsRequest(BaseModel):
     merchant_ids: Optional[List[str]] = None
     search_all_merchants: bool = False
     query: Optional[str] = None
+    market: Optional[str] = None
     category: Optional[str] = None
     catalog_surface: Optional[str] = None
     min_price: Optional[float] = None
     max_price: Optional[float] = None
-    in_stock_only: bool = True
+    in_stock_only: bool = False
     limit: int = Field(default=20, ge=1, le=200)
     offset: int = Field(default=0, ge=0)
     allow_external_seed: bool = True
@@ -375,6 +376,20 @@ def _canonicalize_search_product(product: Dict[str, Any]) -> Dict[str, Any]:
             }
         )
 
+    # A row whose commerce facts need live verification (the external-seed builder
+    # in agent_api withholds price and stock on purpose) must stay UNKNOWN here.
+    # This used to print the withheld price as "0" and the withheld stock as
+    # in_stock: true, and drop the mark saying why -- measured on prod 2026-09-24,
+    # "Round Lab" served five rows at "0" whose seeds carry real prices, one of
+    # them out of stock. Keyed on ABSENCE / the explicit mark, never falsiness: a
+    # real 0.00 price and a real in_stock: false pass through unchanged.
+    verification = product.get("commerce_verification")
+    verification = dict(verification) if isinstance(verification, dict) else None
+    live_verification_required = bool(verification and verification.get("required") is True)
+    raw_price = product.get("price")
+    offer_price = None if (live_verification_required or raw_price is None) else _money_str(raw_price)
+    offer_in_stock = None if live_verification_required else bool(product.get("in_stock", True))
+
     offers: List[Dict[str, Any]] = []
     for variant in normalized_variants:
         variant_id = variant["variant_id"]
@@ -387,10 +402,10 @@ def _canonicalize_search_product(product: Dict[str, Any]) -> Dict[str, Any]:
                 "merchant_id": merchant_id,
                 "variant_id": variant_id,
                 "merchant_sku": product.get("sku"),
-                "price": _money_str(product.get("price")),
+                "price": offer_price,
                 "currency": product.get("currency") or "USD",
                 "availability": {
-                    "in_stock": bool(product.get("in_stock", True)),
+                    "in_stock": offer_in_stock,
                     "inventory_quantity": product.get("inventory_quantity"),
                 },
                 "shipping_summary": _shipping_summary_from_product(product),
@@ -432,6 +447,9 @@ def _canonicalize_search_product(product: Dict[str, Any]) -> Dict[str, Any]:
             "source_type": product.get("source") or "catalog_cache",
             "freshness_ts": _utc_iso(product.get("cached_at") or product.get("updated_at")),
         },
+        # The gateway reads this mark (transport whitelist + shopping-agent price
+        # contract): PIVOTA-Agent tests/integration/invoke.find_products_multi_unverified_price.test.js.
+        **({"commerce_verification": verification} if verification is not None else {}),
     }
 
 
@@ -702,6 +720,7 @@ async def search_products_v2(
         min_price=body.min_price,
         max_price=body.max_price,
         in_stock_only=body.in_stock_only,
+        in_stock_filter_explicit="in_stock_only" in body.model_fields_set,
         limit=body.limit,
         offset=body.offset,
         allow_external_seed=body.allow_external_seed,
@@ -709,7 +728,11 @@ async def search_products_v2(
         allow_stale_cache=body.allow_stale_cache,
         external_seed_strategy=body.external_seed_strategy,
         fast_mode=body.fast_mode,
-        market=body.request_context.country if body.request_context and body.request_context.country else None,
+        market=body.market or (
+            body.request_context.country
+            if body.request_context and body.request_context.country
+            else None
+        ),
         psp=body.payment_context.psp if body.payment_context else None,
         payment_method_type=body.payment_context.payment_method_type if body.payment_context else None,
         card_network=body.payment_context.card_network if body.payment_context else None,

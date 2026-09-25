@@ -5,7 +5,7 @@
 from fastapi import APIRouter, HTTPException, Depends
 
 from db.database import database
-from utils.auth import get_current_user
+from utils.auth import ADMIN_ROLES, get_current_user
 
 router = APIRouter(
     prefix="/admin/cleanup",
@@ -17,7 +17,7 @@ router = APIRouter(
 async def cleanup_routing_test_data(current_user: dict = Depends(get_current_user)):
     """Clean up all routing test data"""
     
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Admin access required")
     
     try:
@@ -90,7 +90,7 @@ async def cleanup_routing_test_data(current_user: dict = Depends(get_current_use
 async def cleanup_all_routing_data(current_user: dict = Depends(get_current_user)):
     """⚠️ DANGEROUS: Clean up ALL routing data including production data"""
     
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Admin access required")
     
     try:

@@ -88,6 +88,11 @@ class ErrorCode(Enum):
         404,
         "Merchant not found"
     )
+    MERCHANT_LISTING_UNAVAILABLE = ErrorDefinition(
+        "MERCHANT_LISTING_UNAVAILABLE",
+        404,
+        "Catalog listing is not available for this merchant; find its products with search"
+    )
     ORDER_NOT_FOUND = ErrorDefinition(
         "ORDER_NOT_FOUND",
         404,

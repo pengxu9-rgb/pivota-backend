@@ -4,11 +4,12 @@ Webhook 处理路由
 """
 
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
+from db.merchant_order_sync_jobs import enqueue_merchant_order_create
 from services.shopify_access_token_service import resolve_shopify_admin_access_token
+from services.shopify_domain import canonicalize_shop_domain, normalize_myshopify_domain
 from fastapi import APIRouter, BackgroundTasks, Request, HTTPException, Header, Response, Depends
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from typing import Optional, Dict, Any, Tuple, List
-from urllib.parse import urlparse
 import stripe
 import os
 import hmac
@@ -19,7 +20,14 @@ import socket
 from datetime import datetime
 from decimal import Decimal
 
-from db.orders import get_order, update_order, update_order_status, mark_order_paid, mark_order_shipped
+from db.orders import (
+    _coerce_metadata_obj,
+    get_order,
+    mark_order_paid,
+    mark_order_shipped,
+    update_order,
+    update_order_status,
+)
 from db.merchant_onboarding import get_merchant_onboarding
 from utils.auth import get_current_employee
 from db.products import log_order_event
@@ -28,12 +36,16 @@ from config.settings import settings
 from utils.logger import logger
 from services.dispute_records_service import stripe_dispute_pack_status
 from services.shopify_webhook_ingest import verify_shopify_hmac, ingest_shopify_webhook
-from services.shopify_commerce_event_ingest import ingest_shopify_commerce_event_best_effort
+from services.shopify_commerce_event_ingest import (
+    apply_shopify_refund_to_attribution_edges,
+    ingest_shopify_commerce_event_best_effort,
+)
 from services.commerce_attribution_service import (
     close_external_order_conversion,
     extract_click_id_from_note_attributes,
     shopify_order_total_to_cents,
 )
+from services.conversion_click_claims import close_merchant_conversion_with_claim
 from services.catalog_sync_service import (
     create_catalog_sync_job,
     mark_catalog_sync_event_processed,
@@ -324,7 +336,7 @@ async def _resolve_stripe_order_for_refund(
 
     def _scoped(order: Optional[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
         return _scope_stripe_order_to_psp_owner(
-            order,
+            _with_decoded_metadata(order),
             psp_owner_merchant_id=psp_owner,
             psp_id=psp_id,
             payment_intent_id=payment_intent_id,
@@ -343,6 +355,23 @@ async def _resolve_stripe_order_for_refund(
         if order_hint:
             return _scoped(_db_row_to_dict(await get_order(order_hint)))
     return None, None
+
+
+def _with_decoded_metadata(order: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The order with `metadata` as a dict, decoded ONCE for every refund consumer (and for
+    `_resolve_stripe_order_for_payment_event`'s PaymentIntent lookup, which has the same raw query).
+
+    On Postgres `orders.metadata` (a json column) reaches this resolver as its JSON TEXT from
+    the raw `SELECT *`, which has no type to decode it. (`get_order` already hands back a
+    decoded dict; decoding here too keeps the two lookups from diverging.) Every consumer
+    downstream (`finalize_refund_success`, `_stripe_refund_level_cumulative`,
+    `merge_refund_metadata`, the failure rollback) treats a non-dict as `{}`, so each refund
+    event rebuilt `psp_refund_refs` / `psp_refund_records` from nothing and the `update_order`
+    full-replace paths wrote that back over every other key.
+    """
+    if not isinstance(order, dict) or "metadata" not in order:
+        return order
+    return {**order, "metadata": _coerce_metadata_obj(order.get("metadata"))}
 
 
 async def _persist_stripe_refund_observability(
@@ -536,7 +565,12 @@ async def _resolve_stripe_order_for_payment_event(
     if payment_intent_id:
         result = await database.fetch_one(query, {"payment_intent_id": payment_intent_id})
         if result:
-            return _scoped(_db_row_to_dict(result))
+            # The raw `SELECT *` hands `orders.metadata` (a json column) back as its JSON TEXT;
+            # the metadata.order_id path below goes through `get_order`, which decodes it.
+            # Decode here so both lookups give callers the same shape: the success path reads
+            # skip_platform_order_creation / ops_canary off it, and the finalizers treat a
+            # non-dict as {}.
+            return _scoped(_with_decoded_metadata(_db_row_to_dict(result)))
 
     order_hint = ""
     if isinstance(payment_meta, dict):
@@ -719,26 +753,26 @@ async def _finalize_stripe_refund_success(
         log_order_event_fn=log_order_event,
     )
     # FIX-05 C5: PSP-initiated refunds must reverse attribution like app-initiated do.
-    if os.getenv("ATTRIBUTION_REVERSE_ON_REFUND", "true").strip().lower() != "false":
+    reconciled_total = finalization.get("total_refunded") if finalization.get("applied") else None
+    if (
+        reconciled_total is not None
+        and os.getenv("ATTRIBUTION_REVERSE_ON_REFUND", "true").strip().lower() != "false"
+    ):
         try:
-            from services.commerce_attribution_service import attach_refund_to_attribution_edge
+            from services.commerce_attribution_service import apply_refund_total_to_attribution_edge
 
-            # MAJOR units. attach_refund_to_attribution_edge does
-            # `amount_cents = amount * 100`, so passing the minor-unit value
-            # recorded a 100x refund — and because
-            # net_attributed_gmv_cents = GREATEST(gross - refund, 0) is a stored
-            # generated column read by monthly_brand_statements_service, that
-            # clamps the edge to zero and drops it from the merchant's invoice.
-            # Never observable before: the statement failed to PREPARE, so this
-            # never ran. See the same conversion at _stripe_minor_unit_factor
-            # use below.
-            await attach_refund_to_attribution_edge(
+            # The ORDER's reconciled total, in MAJOR units, never this event's
+            # amount. Stripe reports one refund as charge.refunded (ch_,
+            # cumulative) AND refund.updated (re_, per refund), and a merchant
+            # refund also arrives under RefundService's REF_ id; adding each
+            # event's amount counted the same money two or three times, which
+            # net_attributed_gmv_cents = GREATEST(gross - refund, 0) then billed.
+            # finalize_refund_success already reconciles those sequences, so the
+            # edge takes its total as a ceiling.
+            await apply_refund_total_to_attribution_edge(
                 order_id=str(order.get("order_id") or ""),
                 refund_id=refund_reference,
-                amount=(
-                    Decimal(str(refund_amount_minor or "0"))
-                    / _stripe_minor_unit_factor(currency or str(order.get("currency") or ""))
-                ),
+                total_refunded=reconciled_total,
             )
         except Exception as edge_exc:
             logger.warning(
@@ -842,19 +876,16 @@ async def _finalize_stripe_refund_failure(
     )
 
 
-def _canonicalize_shop_domain(value: Optional[str]) -> Optional[str]:
-    if not value:
-        return None
-    raw = value.strip()
-    if not raw:
-        return None
-    candidate = raw if "://" in raw else f"https://{raw}"
-    try:
-        parsed = urlparse(candidate)
-        host = (parsed.hostname or "").strip().lower()
-        return host or None
-    except Exception:
-        return raw.lower()
+# Re-exported under the module-local name so the six call sites below read unchanged. The body was
+# byte-identical to services/shopify_domain.canonicalize_shop_domain; keeping two copies of a host
+# rule that decides where a credential may be sent is how they drift.
+#
+# WHAT THIS DELIBERATELY DOES NOT DO: canonicalising is not pinning. Five of the six call sites here
+# COMPARE hosts -- the untrusted X-Shopify-Shop-Domain header against the stores connected to a
+# merchant -- and pinning those to *.myshopify.com would make any store whose stored domain is not
+# canonical stop matching its own webhooks, silently dropping deliveries. Only the site that turns a
+# domain into an Admin API URL is pinned, at that site.
+_canonicalize_shop_domain = canonicalize_shop_domain
 
 
 async def _stripe_webhook_secret_candidates(psp_id: Optional[str]) -> list[str]:
@@ -1124,7 +1155,7 @@ def _stripe_event_refund_matches_order(
     correct while `refund_total` was a monotonic ceiling; once refund-level events
     started contributing a SUM, two $400 refunds on a $500 order each passed the
     per-refund check and wrote total_refunded=800 — a number that feeds
-    `attach_refund_to_attribution_edge` and the merchant's statement.
+    `apply_refund_total_to_attribution_edge` and the merchant's statement.
 
     Returns (ok, reason_if_not).
     """
@@ -1690,20 +1721,22 @@ async def handle_stripe_webhook(
                 )
 
                 if not skip_platform_order_creation:
-                    # 触发 Shopify 订单创建
-                    from routes.order_routes import create_shopify_order
-
+                    # Durable enqueue — this was a single INLINE attempt whose
+                    # failure was swallowed, after which the handler fell through
+                    # to its normal 200. Stripe therefore acked and never retried,
+                    # so one transient Shopify error lost the merchant order while
+                    # the buyer was already charged. Same failure mode as the five
+                    # `add_task` sites, reached by a different mechanism — which is
+                    # why it did not show up in an add_task sweep.
+                    #
+                    # The store guard stays HERE, where this path has always
+                    # applied it, rather than travelling as a payload flag.
                     store_info = await get_primary_store(merchant_id)
                     if store_info and store_info.get("platform") == "shopify":
-                        logger.info(f"🔄 Creating Shopify order for {order_id} after webhook payment confirmation")
-                        try:
-                            success = await create_shopify_order(order_id)
-                            if success:
-                                logger.info(f"✅ Shopify order created via webhook for {order_id}")
-                            else:
-                                logger.error(f"❌ Shopify order creation failed for {order_id}")
-                        except Exception as shop_err:
-                            logger.error(f"❌ Shopify order creation error: {shop_err}")
+                        await enqueue_merchant_order_create(
+                            order_id=order_id,
+                            merchant_id=merchant_id,
+                        )
             else:
                 logger.info(
                     "Stripe payment success replay skipped for order %s due to settled or terminal state",
@@ -2211,7 +2244,7 @@ async def handle_stripe_webhook(
             # `data.metadata` — attacker-controlled on a signed event — and hand
             # them to three writers with no tenant predicate anywhere. That is the
             # same cross-tenant hole the refund branches had, against the same
-            # attribution edge (attach_refund_to_attribution_edge's UPDATE is keyed
+            # attribution edge (attach_dispute_to_attribution_edge's UPDATE is keyed
             # on order_id alone), which feeds the victim's monthly statement.
             # Identity now comes from the endpoint owner plus a SCOPED order
             # lookup; metadata is only ever a hint that must survive scoping.
@@ -2320,12 +2353,14 @@ async def handle_stripe_webhook(
                         else None
                     )
                     if order_id and dispute_id and dispute_amount_minor and dispute_amount_minor > 0:
-                        from services.commerce_attribution_service import attach_refund_to_attribution_edge
+                        from services.commerce_attribution_service import attach_dispute_to_attribution_edge
 
-                        # MAJOR units — see the note on the refund path above.
-                        await attach_refund_to_attribution_edge(
+                        # MAJOR units. Additive per dispute id and kept apart
+                        # from the refund ceiling: a chargeback is not in
+                        # orders.total_refunded.
+                        await attach_dispute_to_attribution_edge(
                             order_id=order_id,
-                            refund_id=dispute_id,
+                            dispute_id=dispute_id,
                             amount=(
                                 Decimal(str(dispute_amount_minor or "0"))
                                 / _stripe_minor_unit_factor(
@@ -3061,19 +3096,32 @@ async def _process_shopify_webhook_event(
                 from db.database import database
 
                 canon_domain = _canonicalize_shop_domain(shop_domain)
-                if canon_domain:
-                    await database.execute(
-                        """
-                        UPDATE merchant_stores
-                        SET status = 'disconnected',
-                            api_key = NULL,
-                            last_sync = NOW()
-                        WHERE merchant_id = :merchant_id
-                          AND platform = 'shopify'
-                          AND lower(domain) = :domain
-                        """,
-                        {"merchant_id": merchant_id, "domain": canon_domain},
+                if not canon_domain:
+                    # Refuse to act on an uninstall whose shop we cannot name. The store UPDATE
+                    # is domain-scoped, but the merchant_onboarding one is keyed on merchant_id
+                    # ALONE -- so an uninstall we could not attribute still cleared that
+                    # merchant's MCP token and delisted them from public recall. Reachable only
+                    # by an allowlisted shop now that the allowlist no longer short-circuits on
+                    # a falsy canonical host, but a destructive branch must not depend on a
+                    # caller's guard for its safety.
+                    logger.warning(
+                        "Shopify app/uninstalled ignored: shop domain not canonicalisable merchant=%s",
+                        merchant_id,
                     )
+                    return {"status": "ignored", "topic": topic, "reason": "unidentifiable_shop"}
+
+                await database.execute(
+                    """
+                    UPDATE merchant_stores
+                    SET status = 'disconnected',
+                        api_key = NULL,
+                        last_sync = NOW()
+                    WHERE merchant_id = :merchant_id
+                      AND platform = 'shopify'
+                      AND lower(domain) = :domain
+                    """,
+                    {"merchant_id": merchant_id, "domain": canon_domain},
+                )
                 await database.execute(
                     """
                     UPDATE merchant_onboarding
@@ -3087,7 +3135,7 @@ async def _process_shopify_webhook_event(
                     event_type="shopify_app_uninstalled",
                     order_id=f"shopify_app_uninstalled_{merchant_id}",
                     merchant_id=merchant_id,
-                    metadata={"shop_domain": canon_domain or shop_domain},
+                    metadata={"shop_domain": canon_domain},
                 )
                 # Public recall gates on catalog_merchants.status, which nothing
                 # used to write — so an uninstalled merchant kept serving on
@@ -3214,7 +3262,14 @@ async def _process_shopify_webhook_event(
                     )
                     if click_id:
                         amount_cents, order_currency = shopify_order_total_to_cents(data)
-                        await close_external_order_conversion(
+                        # mig 230: a cart-link Reap purchase's click is ALSO closed by
+                        # Reap, under a different key. The helper claims the click
+                        # first-writer-wins for THOSE clicks only, and calls the same
+                        # close with the same arguments for every other click. It
+                        # defers attribution on claim failure (the order webhook itself still
+                        # succeeds); the read_orders poller holds its watermark and retries.
+                        await close_merchant_conversion_with_claim(
+                            close_external_order_conversion,
                             merchant_id=merchant_id,
                             click_id=click_id,
                             external_order_id=shopify_order_id,
@@ -3438,6 +3493,20 @@ async def _process_shopify_webhook_event(
                 merchant_id=merchant_id,
                 metadata={"topic": topic, "shopify_order_id": platform_order_id or None},
             )
+
+            # The attribution edge orders/paid closed for this Shopify order bills on its gross
+            # until the refund reaches it. Never raises; a no-op for an unattributed order.
+            if topic == "refunds/create":
+                edge_refund = await apply_shopify_refund_to_attribution_edges(
+                    merchant_id=merchant_id, payload=data
+                )
+                if edge_refund.get("status") != "no_edge":
+                    logger.info(
+                        "Shopify refund attribution merchant=%s shopify_order_id=%s result=%s",
+                        merchant_id,
+                        platform_order_id,
+                        edge_refund,
+                    )
 
             # Best-effort normalize using existing adapter.
             try:
@@ -3779,7 +3848,18 @@ async def handle_shopify_webhook(
                     got_canon,
                 )
                 raise HTTPException(status_code=400, detail="No Shopify store connected")
-            if got_canon and got_canon not in allowed_domains:
+            # `not got_canon or ...`, NOT `got_canon and ...`.
+            #
+            # The 401 above tests the RAW header; this tests the CANONICALISED one, and several
+            # non-empty headers canonicalise to None -- "/", "://", "?", "#", " ", "\t",
+            # "//victim.myshopify.com". Each of those cleared the 401 and then SKIPPED this check
+            # entirely, because a falsy got_canon short-circuits the `and`. This allowlist is the
+            # only binding between the merchant_id in the URL path and the shop the payload came
+            # from (the HMAC covers the body alone), so skipping it let any app-secret-signed body
+            # be replayed into any merchant's path -- including app/uninstalled, which clears that
+            # merchant's stored token and delists them. A header we cannot canonicalise is not a
+            # header that matches; it is one we cannot check, and it must be refused.
+            if not got_canon or got_canon not in allowed_domains:
                 record_shopify_webhook(result="error", reason="shop_domain_mismatch", topic=topic)
                 logger.error(
                     "Shopify webhook shop_domain mismatch merchant=%s allowed=%s got=%s topic=%s",
@@ -3894,19 +3974,27 @@ async def register_shopify_webhooks(
         if not shopify_store:
             raise HTTPException(status_code=400, detail="No Shopify store connected")
 
-        shop_domain = shopify_store.get("domain")
+        # Pinned BEFORE the token resolve, not after. The resolver POSTs client credentials to
+        # {domain}/admin/oauth/access_token, and the loop below POSTs a live Admin token to
+        # {domain}/admin/api/.../webhooks.json once per topic -- about twenty requests. The old order
+        # canonicalised only after the resolver had already been handed the raw column.
+        shop_domain_canon = normalize_myshopify_domain(shopify_store.get("domain"))
+        if not shop_domain_canon:
+            # Does not echo the stored value: it is untrusted text and the merchant id already
+            # identifies the row.
+            raise HTTPException(
+                status_code=400,
+                detail="Stored Shopify domain is not a *.myshopify.com host",
+            )
+
         access_token, _ = await resolve_shopify_admin_access_token(
-            shop_domain=shop_domain,
+            shop_domain=shop_domain_canon,
             api_key_raw=shopify_store.get("api_key_raw") or shopify_store.get("api_key"),
             store_id=str(shopify_store.get("store_id") or "").strip() or None,
         )
-        
-        if not shop_domain or not access_token:
-            raise HTTPException(status_code=400, detail="Missing Shopify credentials")
 
-        shop_domain_canon = _canonicalize_shop_domain(shop_domain)
-        if not shop_domain_canon:
-            raise HTTPException(status_code=400, detail="Invalid Shopify store domain")
+        if not access_token:
+            raise HTTPException(status_code=400, detail="Missing Shopify credentials")
         
         # 要注册的 webhook topics
         topics = [
@@ -3970,7 +4058,7 @@ async def register_shopify_webhooks(
                         "topic": topic,
                         "webhook_id": webhook["id"]
                     })
-                    logger.info(f"Registered webhook for {topic} on {shop_domain}")
+                    logger.info(f"Registered webhook for {topic} on {shop_domain_canon}")
                 else:
                     # Common idempotency response: address already taken
                     if response.status_code == 422:

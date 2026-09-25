@@ -76,6 +76,30 @@ async def _get_principal(
         raise HTTPException(status_code=401, detail="Invalid token")
 
 
+def _parse_window_bound(name: str, raw: Optional[str]) -> Optional[datetime]:
+    """ISO-8601 -> aware UTC, or 422.
+
+    A naive value is read as UTC. It is never read as process-local: asyncpg
+    binds a naive datetime with the client process timezone, which would move
+    the window by the deploy's offset without saying so.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{name} must be an ISO-8601 datetime (e.g. 2026-06-01T00:00:00Z)",
+        )
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 @router.get("/analytics/commerce-funnel")
 async def get_commerce_funnel(
     surface: Optional[str] = Query(None),
@@ -90,11 +114,27 @@ async def get_commerce_funnel(
     commerce_surface: Optional[str] = Query(None),
     platform: Optional[str] = Query(None),
     store_id: Optional[str] = Query(None),
+    since: Optional[str] = Query(
+        None,
+        description=(
+            "ISO-8601 start of the canonical-event window (inclusive). "
+            "Defaults to COMMERCE_FUNNEL_DEFAULT_WINDOW_DAYS before `until`; "
+            "a span wider than COMMERCE_FUNNEL_MAX_WINDOW_DAYS is clamped and "
+            "the response reports event_funnel.window.clamped=true."
+        ),
+    ),
+    until: Optional[str] = Query(
+        None, description="ISO-8601 end of the canonical-event window (inclusive). Defaults to now."
+    ),
     principal: Dict[str, Any] = Depends(_get_principal),
 ):
     merchant_id = principal.get("merchant_id")
     if not merchant_id:
         raise HTTPException(status_code=400, detail="Missing merchant_id")
+    parsed_since = _parse_window_bound("since", since)
+    parsed_until = _parse_window_bound("until", until)
+    if parsed_since is not None and parsed_until is not None and parsed_since > parsed_until:
+        raise HTTPException(status_code=422, detail="since must not be after until")
     if group_by not in SUPPORTED_COMMERCE_FUNNEL_GROUP_BYS:
         raise HTTPException(
             status_code=400,
@@ -117,6 +157,8 @@ async def get_commerce_funnel(
         commerce_surface=str(commerce_surface).strip().lower() if commerce_surface else None,
         platform=(str(platform).strip().lower() or None) if platform else None,
         store_id=(str(store_id).strip() or None) if store_id else None,
+        since=parsed_since,
+        until=parsed_until,
     )
 
 

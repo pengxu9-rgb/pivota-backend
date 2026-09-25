@@ -23,7 +23,10 @@ from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from fastapi.middleware.cors import CORSMiddleware
 from middleware.rate_limiter import RateLimitMiddleware
 from middleware.usage_logger import UsageLoggerMiddleware
-from middleware.structured_logging import StructuredLoggingMiddleware
+from middleware.structured_logging import (
+    StructuredLoggingMiddleware,
+    install_uvicorn_access_log_redaction,
+)
 from middleware.error_handler import ErrorHandlerMiddleware
 from middleware.ap2_security import AP2SecurityMiddleware
 from middleware.security_headers import SecurityHeadersMiddleware
@@ -33,12 +36,17 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 # Database
 from db.database import database, metadata, engine
 from db.startup_ddl import StartupDdlLock, startup_ddl_lock
+import db.agents  # noqa: F401  (register agents in metadata; startup() relies on create_all building it)
 import db.auth_identity  # noqa: F401  (register canonical auth identity tables in metadata)
 import db.pcs_tables  # noqa: F401  (register PCS v0.1 tables/constraints in metadata)
 import db.id_bridge  # noqa: F401  (register id_bridge table in metadata)
 import db.canonical_commerce  # noqa: F401  (register canonical commerce tables in metadata)
 import db.commerce_interactions  # noqa: F401  (register canonical interaction ledger tables in metadata)
+import db.merchant_collector_tokens  # noqa: F401  (register collector token registry tables in metadata)
 import db.commerce_attribution  # noqa: F401  (register commerce attribution tables in metadata)
+import db.agent_share  # noqa: F401  (register agent share rate + ledger tables in metadata)
+import db.agent_oauth_clients  # noqa: F401  (register the provisioned OAuth client -> agent table in metadata)
+import db.gmv_invoice_credits  # noqa: F401  (register the GMV invoice credit table in metadata)
 import db.merchant_commerce_readiness  # noqa: F401  (register merchant commerce readiness state in metadata)
 import db.surface_listing_registry  # noqa: F401  (register surface listing registry tables in metadata)
 try:
@@ -92,6 +100,28 @@ def _guard_single_order_routes_py() -> None:
 
 # Core routers (only include what exists)
 _guard_single_order_routes_py()
+
+# AT IMPORT, before a single request can be served. `uvicorn.access` writes the
+# raw request line — `get_path_with_query_string(scope)` — at INFO on every
+# response, 200s and 401s alike, and infra/gcp/Dockerfile starts uvicorn with
+# neither `--no-access-log` nor a `--log-config`, so on Cloud Run that line goes
+# straight to Cloud Logging. `POST /webhooks/webflow/{store_id}/{url_secret}`
+# authenticates with a secret IN THE PATH (Webflow does not sign a site-token
+# webhook), so without this the credential is in the access line of every
+# delivery.
+#
+# It is installed here rather than only in the startup hook because uvicorn
+# imports `main:app` after it has configured logging and before it serves
+# anything: an import-time install is in place for the first request under
+# `uvicorn main:app`, under `uvicorn.run` below, and under `--reload`. The
+# lifespan calls it again, idempotently, to cover a deployment whose own
+# `--log-config` reconfigures logging in between.
+#
+# It cannot cover the LOAD BALANCER's `httpRequest.requestUrl`, which the
+# platform records regardless of this process — that surface is the argument for
+# configuring `WEBFLOW_CLIENT_SECRET`, and it is the ONLY one left.
+install_uvicorn_access_log_redaction()
+
 from routes.agent_routes import router as agent_router
 from routes.agent_briefs import router as agent_briefs_router
 from routes.quote_routes import router as quote_router
@@ -111,6 +141,7 @@ from routes.auth import router as auth_api_router  # API auth endpoints
 from routes.mcp_oauth_as import router as mcp_oauth_as_router  # MCP OAuth Authorization Server (flag-gated)
 from routes.agent_account import router as agent_account_router  # Agent account management
 from routes.agent_commerce import router as agent_commerce_router
+from routes.agent_commerce_reap import router as agent_commerce_reap_router
 from routes.admin_api import router as admin_api_router
 from routes.admin_partner_cohort import router as admin_partner_cohort_router
 from routes.admin_partner_comms import router as admin_partner_comms_router
@@ -364,7 +395,11 @@ from routes.agent_shop_gateway import router as agent_shop_gateway_router
 from routes.agent_internal_auth import router as agent_internal_auth_router
 from routes.store_audit_probe_internal import router as store_audit_probe_internal_router
 from routes.store_audit_commerce_probe_internal import router as store_audit_commerce_probe_internal_router
+from routes.store_audit_ops import router as store_audit_ops_router
+from routes.merchant_purchasability_ops import router as merchant_purchasability_ops_router
 from routes.store_audit_public_intake import router as store_audit_public_intake_router
+from routes.store_audit_public_intake import claim_router as store_audit_claim_router
+from routes.store_readiness import router as store_readiness_router
 from routes.agent_internal_products import router as agent_internal_products_router
 from routes.subject_resolve import router as subject_resolve_router
 from routes.accounts_orders_api import router as accounts_orders_router
@@ -380,8 +415,13 @@ from routes.magento_integration import router as magento_integration_router
 from routes.adobe_commerce_events import router as adobe_commerce_events_router
 from routes.cafe24_webhooks import router as cafe24_webhooks_router
 from routes.woocommerce_webhooks import router as woocommerce_webhooks_router
+from routes.bigcommerce_webhooks import router as bigcommerce_webhooks_router
+from routes.wix_webhooks import router as wix_webhooks_router
+from routes.squarespace_webhooks import router as squarespace_webhooks_router
+from routes.webflow_webhooks import router as webflow_webhooks_router
 from routes.sfcc_integration import router as sfcc_integration_router
 from routes.sfcc_events import router as sfcc_events_router
+from routes.prestashop_webhooks import router as prestashop_webhooks_router
 from routes.shopline_integrations import router as shopline_integrations_router
 from routes.shopline_family_webhooks import router as shopline_family_webhooks_router
 from routes.ap2_agent_registration import router as ap2_agent_registration_router
@@ -902,7 +942,21 @@ async def shutdown_event():
         await stop_scheduler()
     except Exception:
         pass
-    await database.disconnect()
+    finally:
+        # `finally`, not a bare next statement: stop_scheduler now contains an await (the
+        # shutdown drain), so a CancelledError landing inside it would propagate past an
+        # `except Exception` and skip the disconnect entirely. Cancellation still propagates
+        # -- swallowing it would break cancellation semantics -- but the pool is closed first.
+        #
+        # GUARDED, because the reorder made THIS the disconnect that actually runs. It is
+        # asyncpg's Pool.close(); if it raises, the exception escapes app_lifespan's own
+        # `finally` and `await shutdown()` never runs, which uvicorn reports as a failed
+        # lifespan shutdown. Previously the guarded copy in shutdown() ran first and this one
+        # hit databases' idempotent no-op path, so the raise had nowhere to go.
+        try:
+            await database.disconnect()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Error closing the database pool during shutdown: %s", exc)
 
 # CORS middleware - configurable allow list (supports Railway ALLOWED_ORIGINS env)
 dev_mode = os.getenv("DEV_MODE", "false").lower() == "true"
@@ -1082,6 +1136,13 @@ app.include_router(pool_health_router)  # GET /__pool_health: pool-vs-database p
 from routes.admin_scheduler_jobs import router as admin_scheduler_jobs_router
 app.include_router(admin_scheduler_jobs_router)
 
+# Admin: read the retailer ingest ledger, approve/cancel a held job, queue a
+# cohort (migration 234). require_admin sits on the router itself.
+from routes.admin_retailer_ingest import router as admin_retailer_ingest_router
+app.include_router(admin_retailer_ingest_router)
+from routes.admin_gmv_invoice_credits import router as admin_gmv_invoice_credits_router
+app.include_router(admin_gmv_invoice_credits_router)  # GMV invoice credits: review/approve/issue (admin only)
+
 # C1 Phase 2d — read-only trust table health (total rows, decision distribution,
 # drift count, stale rows). Mirrors /__scheduler_health in naming convention.
 from routes.__trust_health import router as trust_health_router
@@ -1105,6 +1166,12 @@ app.include_router(agent_pdp_v1_router)  # Agent PDP v1 denormalized read path (
 app.include_router(agent_citation_v1_router)  # External citation read API (/agent/v1/citation/*) — ADR-007 P0
 app.include_router(agent_account_router)  # Agent account management (/agent/account/*)
 app.include_router(agent_commerce_router)  # Agent v2 commerce execute contract
+# Agent v2 Reap agentic purchase rail (/agent/v2/commerce/reap/*). DARK: every route on it
+# answers 404 while REAP_AGENTIC_ENABLED is off or the Reap client is unconfigured, which is
+# the state of production. Mounted anyway, and deliberately: a router that is only mounted
+# when a dial is on is a router whose mounting is itself untested, and the dial is read per
+# request so flipping it must not need a redeploy.
+app.include_router(agent_commerce_reap_router)
 app.include_router(admin_api_router)  # Admin API endpoints
 app.include_router(admin_partner_cohort_router)  # Admin channel-partner cohort progress/evaluation
 app.include_router(admin_partner_comms_router)  # Admin channel-partner contact, send log, send settlement email
@@ -1294,8 +1361,13 @@ app.include_router(magento_integration_router)  # Magento/Adobe Commerce native 
 app.include_router(adobe_commerce_events_router)  # Signed Adobe I/O order/payment/refund events
 app.include_router(cafe24_webhooks_router)  # Cafe24 Data Bridge + order lifecycle events
 app.include_router(woocommerce_webhooks_router)  # Signed WooCommerce order lifecycle events
+app.include_router(bigcommerce_webhooks_router)  # Header-authenticated BigCommerce order lifecycle events
+app.include_router(wix_webhooks_router)  # JWT-verified Wix eCom order + transaction events (static, app-level)
+app.include_router(squarespace_webhooks_router)  # HMAC-signed Squarespace order notifications (OAuth-connected sites only)
+app.include_router(webflow_webhooks_router)  # Webflow Ecommerce order triggers, authenticated by a per-store URL secret (+ signature when an OAuth app is configured)
 app.include_router(sfcc_integration_router)  # Salesforce B2C Commerce SCAPI catalog adapter
 app.include_router(sfcc_events_router)  # Signed SFCC cartridge order/cart/payment events
+app.include_router(prestashop_webhooks_router)  # Signed PrestaShop module order/refund events (no native webhooks)
 app.include_router(shopline_integrations_router)  # SHOPLINE / Shoplazza native REST catalog adapters
 app.include_router(shopline_family_webhooks_router)  # Signed SHOPLINE / Shoplazza order lifecycle events
 app.include_router(ap2_agent_registration_router)  # AP2 agent signing-key ADMIN backfill (#1442) — pilot provisioning (ADR-012 carve-out)
@@ -1341,12 +1413,16 @@ app.include_router(agent_recommendations_router)  # Agent recommendations (proxy
 app.include_router(agent_events_router)  # Agent events (click tracking etc.)
 app.include_router(card_rail_outcomes_router)  # POST /agent/v1/outcomes — handoff results
 app.include_router(agent_cards_router)  # POST /agent/v1/cards — Reap rail card minting (503 unless AGENT_CARD_ISSUANCE_ENABLED)
-app.include_router(reap_webhooks_router)  # POST /webhooks/reap — issuer reconciliation (503 unless REAP_WEBHOOK_SECRET)
+app.include_router(reap_webhooks_router)  # POST /webhooks/reap — issuer reconciliation (503 unless REAP_WEBHOOK_SECRET); POST /webhooks/reap/authorize — live external authorization (503 unless REAP_EXTERNAL_AUTH_ENABLED + REAP_AUTH_WEBHOOK_SECRET)
 app.include_router(agent_shop_gateway_router)  # Agent shopping gateway (/agent/shop/v1/invoke)
 app.include_router(agent_internal_auth_router)  # Internal auth introspection (/agent/internal/auth/introspect)
 app.include_router(store_audit_probe_internal_router)  # Store Audit UCP worker receipt (flag + key gated)
 app.include_router(store_audit_commerce_probe_internal_router)  # Store Audit commerce receipt/capability (flag + key gated)
+app.include_router(store_audit_ops_router)  # Admin-only Store Audit lane diagnostics (no caller SQL; redacted)
+app.include_router(merchant_purchasability_ops_router)  # Admin-only merchant purchasability facts (no caller SQL; no buyer data)
 app.include_router(store_audit_public_intake_router)  # Public store-audit intake/teaser for the marketing funnel (flag gated, UCP lane only)
+app.include_router(store_audit_claim_router)  # AUTHENTICATED claim of an anonymous funnel run (same flag; not under /public/*)
+app.include_router(store_readiness_router)  # Merchant-triggered storefront journey: search -> PDP -> cart -> address -> checkout
 app.include_router(agent_internal_products_router)  # Thin internal search primitive (/agent/internal/products/search)
 app.include_router(agent_management_router)  # Agent management
 app.include_router(fulfillment_api_router)  # Fulfillment tracking for agents
@@ -1579,26 +1655,12 @@ async def startup():
         
         # Create integration tables
         try:
-            # Create agents table if not exists
-            await database.execute("""
-                CREATE TABLE IF NOT EXISTS agents (
-                    agent_id VARCHAR(50) PRIMARY KEY,
-                    name VARCHAR(255) NOT NULL,
-                    email VARCHAR(255) UNIQUE NOT NULL,
-                    company VARCHAR(255),
-                    use_case TEXT,
-                    api_key VARCHAR(255) UNIQUE,
-                    status VARCHAR(50) DEFAULT 'active',
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    last_active TIMESTAMP WITH TIME ZONE,
-                    last_key_rotation TIMESTAMP WITH TIME ZONE,
-                    deactivated_at TIMESTAMP WITH TIME ZONE,
-                    request_count INTEGER DEFAULT 0,
-                    success_rate FLOAT DEFAULT 0,
-                    rate_limit INTEGER DEFAULT 1000
-                )
-            """)
-            
+            # No agents DDL here: metadata.create_all above builds agents from the db/agents.py
+            # model (imported explicitly at the top of this file), so a raw CREATE TABLE IF NOT
+            # EXISTS at this point never creates anything. The one that stood here described a
+            # legacy table (name, company, use_case, status, request_count) that prod's table does
+            # not have (probe 2026-09-24; routes written against those columns: pivota-backend#2305).
+
             # Fix missing columns in agents table (2024-10-30)
             logger.info("🔧 Applying database fixes for agents table...")
             try:
@@ -2079,6 +2141,13 @@ async def app_lifespan(_app: FastAPI):
     # CLOUD_RUN_JOB/CLOUD_RUN_EXECUTION for a job -- and no RAILWAY_*) resolve
     # "development" and pass straight through.
     resolved_env = require_platform_env()
+    # Again, idempotently: a deployment that hands uvicorn its own
+    # `--log-config` reconfigures logging AFTER this module was imported, and
+    # `dictConfig` on a named logger drops handlers. It does not drop filters,
+    # so this is belt and braces rather than the load-bearing call — but the
+    # channel it guards carries a live credential, and a second `addFilter` on
+    # an already-installed filter is a no-op by construction.
+    install_uvicorn_access_log_redaction()
     logger.info("🌍 Platform: %s", platform_metadata())
     logger.info("🌍 Resolved environment: %s", resolved_env)
 
@@ -2101,8 +2170,25 @@ async def app_lifespan(_app: FastAPI):
         # shutdown()/shutdown_event() entirely (review round 20).
         with suppress(asyncio.CancelledError, Exception):
             await reconnect_supervisor
-        await shutdown()
+        # ORDER IS LOAD-BEARING, and it was the wrong way round.
+        #
+        # `shutdown()` is `database.disconnect()`, which closes the asyncpg pool.
+        # `shutdown_event()` stops the webhook workers and the audit scheduler. Running the
+        # disconnect FIRST meant every still-running scheduler job was cut off from the pool
+        # while it was being asked to stop: `PostgresConnection.acquire` asserts
+        # "DatabaseBackend is not running", so a run that had already made its external call
+        # (settlement, refund) then FAILED ITS RECORDING WRITE rather than completing. Worse,
+        # once audit_scheduler grew a shutdown drain, that run got seconds of extra life in
+        # which to do it, and could reach its own end and be booked `ok` — a silent
+        # half-completed run on the money path, where the old behaviour was a prompt cancel.
+        #
+        # Stopping the producers before tearing down the resource they use is the right order
+        # regardless of the drain, and it also removes a pre-existing hazard: asyncpg's
+        # `Pool.close()` waits for every holder to be released (it only warns at 60s), and it
+        # was being called while every scheduler job still held connections and had not been
+        # told to stop.
         await shutdown_event()
+        await shutdown()
 
 
 app.router.lifespan_context = app_lifespan

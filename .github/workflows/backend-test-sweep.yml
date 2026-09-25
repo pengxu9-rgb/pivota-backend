@@ -51,10 +51,18 @@ on:
       - 'config/**'
       - 'mvp/**'
       - 'adapters/**'
+      # The Shopify Web Pixel mapper is JavaScript and is not imported by the
+      # Python sweep. Watch integration-only changes so its Node contract test
+      # cannot be skipped when the runtime mapper changes.
+      - 'integrations/**'
       - 'jobs/**'
       - 'middleware/**'
       - 'core/**'
       - 'catalog/**'
+      # The commerce-agents adapter's tests run in this file's
+      # commerce-agents-adapter job; without this line a change to the adapter
+      # or its tests would skip that job entirely.
+      - 'integrations/commerce-agents/**'
       # dashboard/ and orchestrator/ matched NO filter, and two of the tests in
       # tests/test_operations_authz_and_jwt_secret_enforcement.py exist to guard
       # exactly those two files — the orchestrator's publisher call signatures
@@ -95,6 +103,31 @@ on:
       - 'infra/**'
       - 'main.py'
       - 'requirements*.txt'
+      # ruff.toml decides what the lint step even looks at. Without it here, a PR that touches
+      # ONLY the linter config never runs this workflow — so widening `exclude`, or adding
+      # `ignore = ["F821"]`, would land without the gate or its ratchet ever executing.
+      - 'ruff.toml'
+      # The OTHER files that can change what the linter sees. A second ruff config anywhere in
+      # the tree takes precedence over ruff.toml (a root `.ruff.toml`) or captures a subtree (a
+      # nested `pyproject.toml`/`.ruff.toml`), and .gitignore used to be able to hide a source
+      # file from it. Each is a silent bypass if this workflow does not even run.
+      - '.ruff.toml'
+      - 'pyproject.toml'
+      - '**/pyproject.toml'
+      - '**/.ruff.toml'
+      - '.gitignore'
+      # Root modules with no directory prefix: openapi_config.py is imported by main.py:455 and
+      # proof_issuer_main.py is deployed by deploy-prod.yml, yet a PR touching only them ran
+      # neither the linter nor the compile test.
+      - '*.py'
+      # AND EVERY OTHER .py, wherever it lands. The list above enumerates the 22 top-level
+      # packages that exist TODAY, which means a PR introducing a NEW one -- `api/`, `workers/`,
+      # an `alembic/versions/` tree -- matches no filter, runs neither the linter nor the compile
+      # test, and `CI Entrypoint` goes green having enforced nothing against it. Verified against
+      # the entrypoint's own matcher: `api/new_module.py` matched nothing before this line.
+      # Enumerating packages is the same hand-maintained-list failure this whole job replaced.
+      - '**/*.py'
+      - 'reports/**'
       # Same shape, one directory over: tests/test_no_scheduled_workflow_reaches_cloud_sql.py
       # parses EVERY workflow off disk to stop a new scheduled lane from being
       # given a production DSN a GitHub runner cannot route to. Adding such a
@@ -118,18 +151,45 @@ concurrency:
 jobs:
   sweep:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # #2213's sweep took 12m30s; #2214's larger suite hit the 15m job timeout
+    # before finishing. Keep the full suite and its floor checks, with room for
+    # the added cart-link cases and runner variance.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: pip
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Run Shopify Web Pixel mapper contract
+        run: node --test tests/shopify_web_pixel_mapper.node.test.mjs
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt -r requirements-dev.txt
+
+      # BEFORE THE TESTS, because a name that cannot resolve is not a test failure — it is a
+      # crash on whichever branch happens to reach it, and this repo had no linter at all until
+      # 2026-09-10. The gap was not theoretical: `scripts/seed_category_taxonomy.py` shipped a
+      # NameError in a branch only reachable under `--apply` (`--dry-run` passed, no test imported
+      # the script), and `services/pdp_governance_service.py:2747` has called a function that has
+      # never existed in this repository since 2026-04-25, inside a `try/except` that logs a
+      # fallback. Neither is findable by pytest; both take ruff about two seconds.
+      #
+      # Narrow on purpose — eight "this file is broken" rules, no style rules. The four files
+      # still carrying a pre-existing undefined name are baselined in ruff.toml with a reason
+      # each, and tests/test_lint_baseline_only_shrinks.py stops that list growing, stops a
+      # second ruff config appearing, and stops the four other keys that switch the gate off.
+      # The linter moved to .github/workflows/lint.yml, which has NO `paths:` filter and is
+      # meant to be a REQUIRED check. Running it here too would give one gate two owners that
+      # can disagree -- and this job is path-filtered and skippable, which is exactly the
+      # property the move exists to escape. The gate's own tests still run in the sweep below,
+      # and again in lint.yml, because they are stdlib-only and cost 0.5s.
 
       # THE QUARANTINE. Visible, justified, and meant to SHRINK.
       #
@@ -138,9 +198,12 @@ jobs:
       # exists to replace. Each entry states what is wrong and who should fix it.
       # Removing an entry is the definition of progress here.
       #
-      #   test_runtime_hardcode_guard          — RED. Reports 3 hardcoded merchant
-      #     ids in comments (services/pdp_renderability.py:219 and two siblings).
-      #     A real finding; the guard is doing its job and the debt is unpaid.
+      #   test_runtime_hardcode_guard          — ✅ FIXED and REMOVED from this list.
+      #     It reported a rig merchant id in two full-line COMMENTS and in the
+      #     denylist that EXCLUDES that rig from serving — none a runtime default.
+      #     The guard now classifies a line by how the id can reach runtime
+      #     (scripts/audit_runtime_hardcodes.line_is_violation) and its tests pin
+      #     both directions, so it is back in the sweep and green.
       #   test_schema_guard_migration_coverage — ✅ FIXED and REMOVED from this
       #     list (#1624, issue #1617). It was the most valuable entry here:
       #     migration 187 added `merchant_onboarding.signup_source` with no
@@ -149,9 +212,16 @@ jobs:
       #     entry is a promise to come back, and this is what honouring one looks
       #     like. 46 of 46 column-adding migrations are now covered, so this
       #     gate should stay green.
-      #   test_audit_scheduler_worker_env_gate — RED (2 tests). Appeared after the
-      #     2026-07-28 recon, so it is a recent regression, not ancient debt.
-      #   test_external_seed_csv_import        — RED alone AND in the sweep.
+      #   test_audit_scheduler_worker_env_gate — ✅ REMOVED from this list. Listed
+      #     RED (2 tests) on 2026-07-28; on 2026-09-07 it passes alone (16) and
+      #     inside the exact sweep command with every quarantine entry lifted
+      #     (16,449 passed, 0 failed), so whatever regressed it has since been
+      #     fixed at the source. If it reddens again, the entry comes back WITH
+      #     the failing test names, not a count.
+      #   test_external_seed_csv_import        — ✅ FIXED and REMOVED from this list.
+      #     The import path's seller-of-record derivation reads `brand_claims`
+      #     and deliberately propagates a failed read; the hermetic test never
+      #     built the table. It now builds it from the model.
       #   test_winnable_prompts                — RESOLVED, entry removed. The
       #     diagnosis written here was right: `tests/test_vertex_gemini_credentials.py`
       #     reloaded `config.settings` + `services.vertex_gemini` under patched
@@ -205,9 +275,6 @@ jobs:
         run: |
           set -o pipefail
           python -m pytest tests readiness/tests \
-            --ignore=tests/test_runtime_hardcode_guard.py \
-            --ignore=tests/test_audit_scheduler_worker_env_gate.py \
-            --ignore=tests/test_external_seed_csv_import.py \
             --ignore=readiness/tests/test_real_merchant_goldens.py \
             --ignore=readiness/tests/test_shopify_live_source.py \
             --deselect 'readiness/tests/test_summary.py::test_build_readiness_optimization_serves_stale_then_refreshes_in_background' \
@@ -279,7 +346,50 @@ jobs:
         run: |
           python - <<'PY'
           import os, sys, math, collections, xml.etree.ElementTree as ET
-          FLOOR = 12000
+          # 2026-09-20: 20,312 executed on main at 5aa07481f. The 18,340 floor's
+          # cap was 20,174, so all tests passed but the post-merge deployment
+          # gate failed. Re-float to ~97% of the measured count, leaving 612
+          # tests of deletion headroom and a cap of 21,670.
+          # 2026-09-18: 18,905 executed on main at f30956c01 (Reap WP1 at 7b274ed55
+          # had already crossed the cap at 18,869; #2205 added 36). The 16,950 floor
+          # had grown 1,955 of slack (cap 18,645), the cap tripped on both push runs,
+          # and the deploy gate refused both -- prod stayed on 6c5b695ce from 00:42Z.
+          # Every test PASSED; the failure was only this assert. Re-floated into the
+          # printed window (17,187..18,905) at the same ~97%-of-measured: ~565 tests
+          # of deletion headroom, cap 20,174.
+          #
+          # 2026-09-14: 17,479 executed on main at e793a2c15 (#2180, which added
+          # ~200 tests); the 15,700 floor had grown 1,779 of slack (cap 17,270)
+          # and the cap tripped on the push run, so the deploy gate refused and
+          # prod stayed on 1bdfcdd77. Every test PASSED — the failure was only
+          # this assert. Re-floated into the printed window (15,890..17,479) at
+          # the same ~97%-of-measured: ~530 tests of deletion headroom, cap 18,645.
+          #
+          # 2026-09-06: 16,182 executed on main; the 14,500 floor had grown 1,682
+          # of slack (cap 15,950) and the cap tripped, as designed, on the push
+          # run for the Webflow telemetry PR (#2103), after passing advisory on
+          # the PR itself. The deploy gate refused, so prod stayed on the prior
+          # commit until this re-float landed. Re-floated into the window the
+          # assert printed (14,711..16,182) at the same ~97%-of-measured:
+          # ~480 tests of deletion headroom, cap 17,270.
+          #
+          # 2026-09-05: 14,973 executed on main; the 13,600 floor had grown 1,373
+          # of slack (cap 14,960) and the cap tripped, as designed — on the
+          # push-to-main run, where it is fatal, after passing advisory on the
+          # PR that carried the tests. Re-floated into the window the assert
+          # printed (13,612..14,973), at the same ~97%-of-measured the last
+          # re-float used: ~470 tests of deletion headroom, cap 16,470.
+          #
+          # 2026-09-03: 14,027 executed on main; the 12,000 floor had grown 2,027
+          # of slack (cap 13,200) and the cap tripped, as designed. Re-floated
+          # into the window the assert printed (12,752..14,027).
+          # 2026-09-22: 21,380 executed on main at 1d4e7383a (#2250). The services subtree tripped
+          # its own cap (below) while the global count sat 290 under this one (cap 21,670) -- one
+          # test-heavy merge from the same trip. Re-floated at the same ~97%: 20,700, cap 22,770.
+          # 2026-09-24: 22,475 executed on main at b8dd06440 (#2304), 295 under this cap while the
+          # services subtree tripped its own (below). Re-floated ahead of the trip at the same ~97%:
+          # 21,800, cap 23,980.
+          FLOOR = 21800
           # Slack allowance, global and per-subtree: 10% of the floor, but never
           # fewer than ABS_SLACK tests. The absolute term is not decoration — a
           # pure percentage is unusable on a small tree. readiness.tests
@@ -338,7 +448,39 @@ jobs:
           # not a floor" failure this file documents above, reproduced by the
           # un-quarantine itself. 120 leaves 13 for a legitimate deletion while
           # still noticing the file leaving; cap(120) = 270 stays clear of 133.
-          SUBTREES = {'tests.services': 1600, 'readiness.tests': 120}
+          # tests.services: 1,852 executed on 2026-09-03 against a 1,600 floor
+          # (cap 1,760); re-floated into its window (1,684..1,852).
+          # tests.services: 1,967 executed on 2026-09-06 against the 1,800 floor
+          # (cap 1,980) -- 13 tests from tripping on the next services test
+          # added. Re-floated within its window (1,789..1,967) to 1,900:
+          # ~67 of deletion headroom, cap 2,090.
+          # tests.services: 2,328 executed on 2026-09-14 at e793a2c15 against the
+          # 1,900 floor (cap 2,090) -- tripped with the global cap. Re-floated
+          # within its window (2,117..2,328) to 2,260: ~68 of deletion headroom,
+          # cap 2,486.
+          # tests.services: 2,503 executed on 2026-09-18 at 88cc58549 (#2211 and #2212 added
+          # 111 tests there) against the 2,260 floor (cap 2,486) -- tripped with the push run for
+          # #2212 while every test PASSED, so the deploy gate refused it. Re-floated within the
+          # printed window (2,276..2,503) at the same ~97%-of-measured: 2,428, ~75 of deletion
+          # headroom, cap 2,670.
+          # tests.services: 2,681 executed on 2026-09-22 at 1d4e7383a (#2250) against the 2,428
+          # floor (cap 2,671) -- tripped on the push run with every test PASSING, so the deploy gate
+          # refused the merge. Re-floated within the printed window (2,438..2,681) at the same
+          # ~97%-of-measured: 2,600, ~81 of deletion headroom, cap 2,860.
+          # tests.services: 2,862 executed on 2026-09-23 at a79757f6a (#2257/#2259/#2261 added ~95
+          # tests there) against the 2,600 floor (cap 2,860) -- tripped on the push run with every test
+          # PASSING, so the deploy gate refused the merge. Re-floated within the printed window
+          # (2,602..2,862) at the same ~97%-of-measured: 2,776, ~86 of deletion headroom, cap 3,053.
+          # tests.services: 3,030 executed on 2026-09-23 at a78b158fe (#2263/#2264 added the retailer
+          # ingest suites) against the 2,776 floor (cap 3,053) -- 23 tests from tripping on the next push.
+          # Re-floated ahead of the trip within the window (2,778..3,030) at the same ~97%-of-measured:
+          # 2,939, ~91 of deletion headroom, cap 3,232.
+          # tests.services: 3,249 executed on 2026-09-24 at b8dd06440 (#2301..#2304 added the drain loop,
+          # store-level and collection-scoped cohorts) against the 2,939 floor (cap 3,233) -- tripped on the
+          # push run with every test PASSING, so the deploy gate refused #2304, #2305 and #2306 and prod
+          # stayed on 3206c7a7d. Re-floated within the printed window (2,954..3,249) at the same
+          # ~97%-of-measured: 3,151, ~98 of deletion headroom, cap 3,466.
+          SUBTREES = {'tests.services': 3151, 'readiness.tests': 120}
           try:
               root = ET.parse('sweep.xml').getroot()
           except Exception as e:
@@ -428,9 +570,14 @@ jobs:
 
   # NEW TEST FILES MUST LAND INSIDE THE SWEPT TREES.
   #
-  # The sweep covers `tests/**` and `readiness/tests/**`, so the realistic way to
-  # create a new invisible test is to put it somewhere else. Cheap insurance
-  # against the exact habit that produced the 92%.
+  # The sweep covers `tests/**` and `readiness/tests/**`, and the
+  # commerce-agents-adapter job below covers `integrations/commerce-agents/tests/`,
+  # so the realistic way to create a new invisible test is to put it somewhere
+  # else. Cheap insurance against the exact habit that produced the 92%. A tree
+  # is listed as swept here ONLY while a job in this file runs it; the adapter
+  # tree went red on main on 2026-09-03 for exactly that reason (its tests
+  # needed packages the sweep does not install), and the job is the remedy, not
+  # an exemption.
   #
   # ⚠️ IT KEYS ON CONTENT, NOT FILENAME — and the first version did not, which is
   # why it was RED on its own branch. Two pre-existing files start with `test_`
@@ -458,7 +605,7 @@ jobs:
         run: |
           python - <<'PY'
           import subprocess, sys, os, re
-          SWEPT = ('tests/', 'readiness/tests/')
+          SWEPT = ('tests/', 'readiness/tests/', 'integrations/commerce-agents/tests/')
           COLLECTABLE = re.compile(r'^\s*(async\s+)?def\s+test_|^\s*class\s+Test', re.M)
 
           tracked = subprocess.run(['git', 'ls-files', '*.py'],
@@ -486,4 +633,51 @@ jobs:
           skipped = len(candidates) - len(stray)
           print(f"clean — {len(candidates)} test_*.py outside swept trees, "
                 f"{skipped} of them define no tests (production modules / manual helpers)")
+          PY
+
+  # integrations/commerce-agents/tests/ is swept by THIS job, not by `sweep`.
+  # Those tests import the blueprint's packages (shopping_agent, commerce_common),
+  # which are not on PyPI and not in requirements.txt, so the sweep cannot
+  # collect them; they went red on main on 2026-09-03 as "collectable tests
+  # outside the swept trees". The packages are installed here from the blueprint
+  # repo at a pinned commit, and an executed-count floor keeps a green job that
+  # ran nothing from counting as coverage.
+  commerce-agents-adapter:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # anthropics/commerce-agents, "building commerce agents using claude",
+      # 2026-08-31. Bump deliberately: the adapter is written against this
+      # commit's StorefrontBackend contract.
+      COMMERCE_AGENTS_REF: fd4d59224ab96b43c6dc6888207c67b3bd5a24cf
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install the blueprint's packages at the pinned commit
+        run: |
+          git clone --quiet https://github.com/anthropics/commerce-agents.git "$RUNNER_TEMP/commerce-agents"
+          git -C "$RUNNER_TEMP/commerce-agents" checkout --quiet "$COMMERCE_AGENTS_REF"
+          python -m pip install --upgrade pip
+          pip install -e "$RUNNER_TEMP/commerce-agents/commerce-common" \
+                      -e "$RUNNER_TEMP/commerce-agents/shopping-agent/core" \
+                      pytest pytest-asyncio httpx
+      - name: Run the adapter tests
+        working-directory: integrations/commerce-agents
+        env:
+          PYTHONPATH: .:tests
+        run: |
+          set -o pipefail
+          python -m pytest -q -p no:cacheprovider --junitxml=adapter.xml
+          python - <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          root = ET.parse('adapter.xml').getroot()
+          suite = root if root.tag == 'testsuite' else root.find('testsuite')
+          ran = int(suite.get('tests', 0)) - int(suite.get('skipped', 0))
+          FLOOR = 20  # 24 measured on 2026-09-03
+          print(f"adapter tests executed={ran} floor={FLOOR}")
+          if ran < FLOOR:
+              sys.exit(f"::error::only {ran} adapter tests executed against a floor of {FLOOR} "
+                       "— a green job that ran nothing is the failure this floor exists for")
           PY

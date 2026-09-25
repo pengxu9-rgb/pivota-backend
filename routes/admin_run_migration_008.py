@@ -1,6 +1,6 @@
 """Admin endpoint to run migration 008 - Agents Phase 2"""
 from fastapi import APIRouter, Depends, HTTPException
-from utils.auth import get_current_user
+from utils.auth import ADMIN_ROLES, get_current_user
 from db.database import database
 import logging
 
@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 @router.post("/run-008-agents-phase2")
 async def run_migration_008(current_user: dict = Depends(get_current_user)):
     """Execute migration 008: Agents Advanced Schema"""
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Admin only")
     
     try:
@@ -183,7 +183,7 @@ async def run_migration_008(current_user: dict = Depends(get_current_user)):
 @router.get("/check-008-status")
 async def check_migration_008_status(current_user: dict = Depends(get_current_user)):
     """Check if migration 008 has been run"""
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Admin only")
     
     try:
@@ -230,7 +230,12 @@ async def check_migration_008_status(current_user: dict = Depends(get_current_us
 
 
 from fastapi import APIRouter, Depends, HTTPException
-from utils.auth import get_current_user
+# NOTE: this module's whole body appears TWICE; `router` is rebound here, so
+# main.py mounts THIS copy's routes and the ones above are dead. ADMIN_ROLES
+# is therefore imported on both sides -- the live guards below use it, and
+# relying on the dead copy's import to bind it would turn the obvious
+# de-duplication cleanup into a NameError on every admin route here.
+from utils.auth import ADMIN_ROLES, get_current_user
 from db.database import database
 import logging
 
@@ -240,7 +245,7 @@ logger = logging.getLogger(__name__)
 @router.post("/run-008-agents-phase2")
 async def run_migration_008(current_user: dict = Depends(get_current_user)):
     """Execute migration 008: Agents Advanced Schema"""
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Admin only")
     
     try:
@@ -413,7 +418,7 @@ async def run_migration_008(current_user: dict = Depends(get_current_user)):
 @router.get("/check-008-status")
 async def check_migration_008_status(current_user: dict = Depends(get_current_user)):
     """Check if migration 008 has been run"""
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Admin only")
     
     try:

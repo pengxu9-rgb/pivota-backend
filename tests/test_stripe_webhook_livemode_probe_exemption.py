@@ -143,6 +143,9 @@ def _install_webhook_plumbing(
     async def fake_get_primary_store(merchant_id: str) -> Dict[str, Any]:
         return {"platform": "shopify"}
 
+    async def _noop_enqueue(*, order_id, merchant_id, require_shopify_primary=False):
+        return "job-1"
+
     async def fake_create_shopify_order(order_id: str) -> bool:
         return True
 
@@ -170,7 +173,12 @@ def _install_webhook_plumbing(
     monkeypatch.setattr(
         webhook_routes_module, "create_order_snapshot_evidence_pack", _noop
     )
-    monkeypatch.setattr(webhook_routes_module, "get_primary_store", fake_get_primary_store)
+    # webhook_routes no longer resolves the store itself — it enqueues, and the
+    # worker makes the primary-store check. Stub the enqueue so a dropped event
+    # still cannot reach the merchant.
+    monkeypatch.setattr(
+        webhook_routes_module, "enqueue_merchant_order_create", _noop_enqueue
+    )
     monkeypatch.setattr(
         webhook_routes_module, "emit_merchant_webhook_event", fake_emit_merchant_webhook_event
     )

@@ -19,4 +19,33 @@
         </rules>
         <triggers/>
     </job>
+    <!-- Per-site template, same rule: duplicate for every connected site.
+         Schedule this OFFSET from the drain (e.g. drain every minute, sweep
+         every five minutes starting at :02) so a long sweep and a drain do not
+         contend for the same outbox rows. The sweep only writes rows; the
+         drain sends and deletes them, so overlapping is safe, just wasteful. -->
+    <job job-id="PivotaSettlementSweep-RefArch">
+        <description>Observes settled, cancelled and refunded orders SFCC fires no event for.</description>
+        <flow>
+            <context site-id="RefArch"/>
+            <step step-id="PivotaSettlementSweep" type="custom.PivotaSettlementSweep" enforce-restart="false">
+                <parameters>
+                    <parameter name="MaxOrders">500</parameter>
+                    <parameter name="OverlapMinutes">10</parameter>
+                    <parameter name="InitialLookbackHours">24</parameter>
+                    <!-- An order that fails on every tick would otherwise pin the
+                         cursor forever and stall the whole site's settlement
+                         telemetry. Past this lag the sweep abandons it and logs
+                         the order numbers at ERROR so they can be replayed. -->
+                    <parameter name="MaxFailureLagHours">24</parameter>
+                </parameters>
+            </step>
+        </flow>
+        <rules>
+            <on-running runtime-threshold="30m" enabled="true">
+                <mark-job-as-hanging/>
+            </on-running>
+        </rules>
+        <triggers/>
+    </job>
 </jobs>

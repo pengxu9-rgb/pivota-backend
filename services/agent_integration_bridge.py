@@ -4,6 +4,7 @@ Aggregates data from EXISTING tables for Agent Portal visualization
 NO NEW ROUTING LOGIC - only reads existing logs
 """
 
+import json
 from typing import Dict, List, Any
 from datetime import datetime, timedelta
 import logging

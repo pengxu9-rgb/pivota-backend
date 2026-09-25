@@ -336,3 +336,436 @@ async def test_complete_is_lease_fenced_and_reports_why():
         {"j": a["job_id"]},
     ))
     assert row["status"] == "done"
+
+
+async def test_five_call_sites_racing_on_one_order_enqueue_once():
+    """The create op keys on a constant, so an agent confirm and a PSP webhook
+    both landing for the same order produce ONE job, not five."""
+    from db.database import database
+    from db.merchant_order_sync_jobs import enqueue_merchant_order_create
+
+    order_id = _order_id()
+    ids = []
+    for _ in range(5):
+        ids.append(await enqueue_merchant_order_create(
+            order_id=order_id, merchant_id="merch_test",
+        ))
+
+    assert all(i is not None for i in ids)
+    assert len(set(ids)) == 1, f"five enqueues produced {len(set(ids))} distinct jobs"
+
+    row = await database.fetch_one(
+        "SELECT COUNT(*) AS c FROM merchant_order_sync_jobs WHERE order_id = :o",
+        {"o": order_id},
+    )
+    assert dict(row)["c"] == 1
+
+
+async def test_a_create_and_a_refund_job_coexist_for_one_order():
+    """Different ops, so the create must not dedupe against a refund_sync job."""
+    from db.database import database
+    from db.merchant_order_sync_jobs import enqueue_merchant_order_create
+
+    order_id = _order_id()
+    await enqueue_merchant_order_create(order_id=order_id, merchant_id="merch_test")
+    await _enqueue(order_id, dedupe="re_1")
+
+    row = await database.fetch_one(
+        "SELECT COUNT(*) AS c FROM merchant_order_sync_jobs WHERE order_id = :o",
+        {"o": order_id},
+    )
+    assert dict(row)["c"] == 2
+
+
+async def test_a_terminal_create_job_does_not_tombstone_the_order():
+    """Two call sites exist ONLY to be retries — the agent and Checkout.com
+    already-paid branches, which answer "Shopify sync initiated". Without
+    revival a `done`/`failed` job is permanent: the unique index has no status
+    column, the claim reads only pending/running, and nothing resets a terminal
+    row. Those sites would return the tombstone's id and never run again."""
+    from db.database import database
+    from db.merchant_order_sync_jobs import (
+        claim_next_merchant_order_sync_job,
+        complete_merchant_order_sync_job,
+        enqueue_merchant_order_create,
+    )
+
+    order_id = _order_id()
+    first = await enqueue_merchant_order_create(order_id=order_id, merchant_id="m1")
+    job = await claim_next_merchant_order_sync_job(worker_id="worker-a")
+    await complete_merchant_order_sync_job(job_id=job["job_id"], worker_id="worker-a")
+
+    row = dict(await database.fetch_one(
+        "SELECT status FROM merchant_order_sync_jobs WHERE job_id=:j", {"j": first}))
+    assert row["status"] == "done"
+
+    # The retry site enqueues again.
+    again = await enqueue_merchant_order_create(order_id=order_id, merchant_id="m1")
+    assert again == first, "still one row per order"
+
+    revived = await claim_next_merchant_order_sync_job(worker_id="worker-b")
+    assert revived is not None, "the re-enqueue was a silent no-op"
+    assert str(revived["job_id"]) == first
+    assert revived["attempts"] == 1, "attempts reset, so it gets its one attempt"
+    assert revived["progress"] == {}
+
+
+async def test_repeat_enqueues_share_one_identical_payload():
+    """The payload no longer carries a caller-specific flag, so a repeat enqueue
+    cannot change the stored job's meaning. An earlier cut adopted the newer
+    payload on every conflict — including onto a RUNNING row, where the worker
+    had already read the old one, finished the old work, and the newer caller's
+    request vanished with a success return."""
+    from db.merchant_order_sync_jobs import (
+        claim_next_merchant_order_sync_job,
+        enqueue_merchant_order_create,
+    )
+
+    order_id = _order_id()
+    await enqueue_merchant_order_create(order_id=order_id, merchant_id="m1")
+    await enqueue_merchant_order_create(order_id=order_id, merchant_id="m1")
+
+    job = await claim_next_merchant_order_sync_job(worker_id="worker-a")
+    # Every caller's payload is identical now — the store guard is applied at
+    # the call site, so nothing about the stored job depends on which caller
+    # won the race to enqueue.
+    assert job["payload"] == {"order_id": order_id, "merchant_id": "m1"}
+
+
+async def test_a_repeat_refund_enqueue_still_does_not_revive():
+    """The refund op keys on the PSP refund id — one unrepeatable event — so a
+    repeat enqueue must NOT re-run a completed sync."""
+    from db.merchant_order_sync_jobs import (
+        claim_next_merchant_order_sync_job,
+        complete_merchant_order_sync_job,
+    )
+
+    order_id = _order_id()
+    first = await _enqueue(order_id, dedupe="re_once")
+    job = await claim_next_merchant_order_sync_job(worker_id="worker-a")
+    await complete_merchant_order_sync_job(job_id=job["job_id"], worker_id="worker-a")
+
+    again = await _enqueue(order_id, dedupe="re_once")
+    assert again == first
+    assert await claim_next_merchant_order_sync_job(worker_id="worker-b") is None
+
+
+async def test_a_create_job_is_stored_with_a_single_attempt():
+    """At-most-once is enforced by the ROW, not by the handler remembering to
+    ask. A second attempt on Woo/Wix/BigCommerce is a second merchant order."""
+    from db.database import database
+    from db.merchant_order_sync_jobs import enqueue_merchant_order_create
+
+    order_id = _order_id()
+    job_id = await enqueue_merchant_order_create(order_id=order_id, merchant_id="m1")
+
+    row = dict(await database.fetch_one(
+        "SELECT max_attempts FROM merchant_order_sync_jobs WHERE job_id=:j",
+        {"j": job_id}))
+    assert row["max_attempts"] == 1
+
+
+async def test_a_revive_does_not_disturb_a_running_job():
+    """The revive is NOT lease-fenced, so it must not touch an in-flight row.
+    An earlier cut swapped the payload under a worker that had already read it:
+    the worker finished the old work, completed the job, and the newer caller's
+    request disappeared having returned a job id."""
+    from db.database import database
+    from db.merchant_order_sync_jobs import (
+        claim_next_merchant_order_sync_job,
+        enqueue_merchant_order_create,
+    )
+
+    order_id = _order_id()
+    first = await enqueue_merchant_order_create(order_id=order_id, merchant_id="m1")
+    claimed = await claim_next_merchant_order_sync_job(worker_id="worker-a")
+    assert claimed is not None
+
+    again = await enqueue_merchant_order_create(order_id=order_id, merchant_id="m1")
+    assert again == first
+
+    row = dict(await database.fetch_one(
+        "SELECT status, attempts, claimed_by_worker FROM merchant_order_sync_jobs "
+        "WHERE job_id=:j", {"j": first}))
+    assert row["status"] == "running", "a running job must not be revived"
+    assert row["attempts"] == 1
+    assert row["claimed_by_worker"] == "worker-a", "the lease must survive"
+
+
+async def test_the_reconciler_only_repairs_orders_the_queue_never_heard_of():
+    """It used to call `create_shopify_order` directly on every candidate. On a
+    schedule that re-POSTs, and the create is not remotely idempotent on
+    Woo/Wix/BigCommerce — an order whose create partially landed matches the
+    query forever, so every tick would make another merchant order."""
+    from sqlalchemy.schema import CreateTable
+    from sqlalchemy.dialects import postgresql
+    from datetime import datetime, timedelta, timezone
+
+    from db.database import database
+    from db.orders import orders as orders_table
+    from db.merchant_order_sync_jobs import enqueue_merchant_order_create
+    from jobs.agentic_commerce_reconciliation import (
+        reconcile_paid_orders_missing_merchant_order,
+    )
+
+    try:
+        await database.execute(
+            str(CreateTable(orders_table).compile(dialect=postgresql.dialect())))
+    except Exception:
+        pass
+
+    merchant = f"merch_recon_{uuid.uuid4().hex[:6]}"
+    old = datetime.now(timezone.utc) - timedelta(hours=6)
+
+    async def ins(oid, meta=None):
+        await database.execute(orders_table.insert().values(
+            order_id=oid, merchant_id=merchant, customer_email="r@x.test",
+            shipping_address={}, items=[], subtotal=10, total=10, currency="USD",
+            payment_status="paid", status="paid", shopify_order_id=None,
+            metadata=meta or {}, is_deleted=False, created_at=old, paid_at=old))
+
+    await ins("ORD_LOST_ENQUEUE")                       # must be repaired
+    await ins("ORD_ALREADY_QUEUED")                     # queue owns it
+    await ins("ORD_ON_WOO", {"merchant_order": {"platform_order_id": "woo-5"}})
+    await enqueue_merchant_order_create(
+        order_id="ORD_ALREADY_QUEUED", merchant_id=merchant)
+
+    try:
+        result = await reconcile_paid_orders_missing_merchant_order(
+            merchant_id=merchant, limit=50, min_age_seconds=60, dry_run=True)
+        assert result["candidates"] == ["ORD_LOST_ENQUEUE"], result
+
+        done = await reconcile_paid_orders_missing_merchant_order(
+            merchant_id=merchant, limit=50, min_age_seconds=60, dry_run=False)
+        assert done["queued"] == 1
+
+        # And it is now inert for that order: a second pass sees the job it made.
+        again = await reconcile_paid_orders_missing_merchant_order(
+            merchant_id=merchant, limit=50, min_age_seconds=60, dry_run=True)
+        assert again["candidates"] == [], "the reconciler re-attempted its own work"
+    finally:
+        await database.execute(
+            "DELETE FROM orders WHERE merchant_id = :m", {"m": merchant})
+
+
+async def test_a_dead_worker_does_not_get_an_at_most_once_create_reattempted():
+    """The premise the reconciler's whole safety argument rests on.
+
+    `max_attempts` used to be consulted only by `fail_...`, i.e. only when a
+    worker survived long enough to REPORT. A worker that died mid-POST — the
+    Cloud Run revision swap this queue exists to survive — had its work
+    re-claimed once the lease expired, handing the same non-idempotent
+    Woo/Wix/BigCommerce create to a second worker.
+    """
+    from db.database import database
+    from db.merchant_order_sync_jobs import (
+        claim_next_merchant_order_sync_job,
+        enqueue_merchant_order_create,
+        release_stale_merchant_order_sync_leases,
+    )
+
+    order_id = _order_id()
+    job_id = await enqueue_merchant_order_create(order_id=order_id, merchant_id="m1")
+    claimed = await claim_next_merchant_order_sync_job(worker_id="worker-dies")
+    assert claimed is not None and claimed["attempts"] == 1
+
+    # The worker dies mid-attempt: the lease is held by nobody.
+    await database.execute(
+        "UPDATE merchant_order_sync_jobs SET claimed_until = NOW() - INTERVAL "
+        "'10 minutes' WHERE job_id = :j", {"j": job_id})
+
+    assert await claim_next_merchant_order_sync_job(worker_id="worker-b") is None, \
+        "an at-most-once create was handed out a second time"
+
+    # And the reaper retires it rather than parking it `pending` where nothing
+    # would ever claim it again.
+    await release_stale_merchant_order_sync_leases(grace_seconds=0)
+    row = dict(await database.fetch_one(
+        "SELECT status, last_error FROM merchant_order_sync_jobs WHERE job_id=:j",
+        {"j": job_id}))
+    assert row["status"] == "failed"
+    assert "no attempts left" in (row["last_error"] or "")
+
+
+async def test_a_refund_job_with_budget_left_is_still_recovered():
+    """Positive counterpart: the budget guard must not strand a job that has
+    attempts remaining — that is the dead-worker recovery the queue is for."""
+    from db.database import database
+    from db.merchant_order_sync_jobs import (
+        claim_next_merchant_order_sync_job,
+        release_stale_merchant_order_sync_leases,
+    )
+
+    order_id = _order_id()
+    await _enqueue(order_id, dedupe="re_budget")   # refund op: max_attempts=10
+    first = await claim_next_merchant_order_sync_job(worker_id="worker-dies")
+    assert first["attempts"] == 1
+
+    await database.execute(
+        "UPDATE merchant_order_sync_jobs SET claimed_until = NOW() - INTERVAL "
+        "'10 minutes' WHERE job_id = :j", {"j": first["job_id"]})
+    released = await release_stale_merchant_order_sync_leases(grace_seconds=0)
+    assert released >= 1
+
+    again = await claim_next_merchant_order_sync_job(worker_id="worker-b")
+    assert again is not None and again["attempts"] == 2
+
+
+async def test_the_reconciler_is_inert_on_the_scheduled_unfiltered_path():
+    """The tick always passes merchant_id=None, and the NOT EXISTS guard FAILS
+    OPEN: an unbound named parameter renders as NULL under databases/asyncpg
+    with no error, so `j.op = NULL` is never true and every candidate is
+    re-enqueued. The filtered path alone could not catch that."""
+    from sqlalchemy.schema import CreateTable
+    from sqlalchemy.dialects import postgresql
+    from datetime import datetime, timedelta, timezone
+
+    from db.database import database
+    from db.orders import orders as orders_table
+    from db.merchant_order_sync_jobs import enqueue_merchant_order_create
+    from jobs.agentic_commerce_reconciliation import (
+        reconcile_paid_orders_missing_merchant_order,
+    )
+
+    try:
+        await database.execute(
+            str(CreateTable(orders_table).compile(dialect=postgresql.dialect())))
+    except Exception:
+        pass
+
+    merchant = f"merch_unfiltered_{uuid.uuid4().hex[:6]}"
+    old = datetime.now(timezone.utc) - timedelta(hours=6)
+    order_id = f"ORD_UNFILTERED_{uuid.uuid4().hex[:8]}"
+    await database.execute(orders_table.insert().values(
+        order_id=order_id, merchant_id=merchant, customer_email="u@x.test",
+        shipping_address={}, items=[], subtotal=10, total=10, currency="USD",
+        payment_status="paid", status="paid", shopify_order_id=None,
+        metadata={}, is_deleted=False, created_at=old, paid_at=old))
+    await enqueue_merchant_order_create(order_id=order_id, merchant_id=merchant)
+
+    try:
+        # merchant_id=None — exactly what run_merchant_order_create_reconcile_tick does.
+        result = await reconcile_paid_orders_missing_merchant_order(
+            merchant_id=None, limit=200, min_age_seconds=60, dry_run=True)
+        assert order_id not in result["candidates"], \
+            "the queue already owns this order; re-enqueuing would revive it every tick"
+    finally:
+        await database.execute(
+            "DELETE FROM orders WHERE merchant_id = :m", {"m": merchant})
+
+
+async def test_the_reconciler_repairs_an_order_with_a_null_is_deleted():
+    """`orders.is_deleted` is nullable with only a CLIENT-side default, and two
+    raw-SQL insert paths omit it entirely (scripts/shakeout/c_full_order_pipeline
+    and routes/init_orders_table). A bare `is_deleted = false` is NULL for those
+    rows, so the counter (which COALESCEs) paged on them forever while this
+    repair lane could never touch them."""
+    from sqlalchemy.schema import CreateTable
+    from sqlalchemy.dialects import postgresql
+    from datetime import datetime, timedelta, timezone
+
+    from db.database import database
+    from db.orders import orders as orders_table
+    from jobs.agentic_commerce_reconciliation import (
+        reconcile_paid_orders_missing_merchant_order,
+    )
+
+    try:
+        await database.execute(
+            str(CreateTable(orders_table).compile(dialect=postgresql.dialect())))
+    except Exception:
+        pass
+
+    merchant = f"merch_nulldel_{uuid.uuid4().hex[:6]}"
+    order_id = f"ORD_NULLDEL_{uuid.uuid4().hex[:8]}"
+    old = datetime.now(timezone.utc) - timedelta(hours=6)
+
+    # Raw insert that OMITS is_deleted, as those two production paths do.
+    await database.execute(
+        """
+        INSERT INTO orders (order_id, merchant_id, customer_email, shipping_address,
+                            items, subtotal, total, currency, payment_status, status,
+                            created_at, paid_at)
+        VALUES (:oid, :mid, 'n@x.test', '{}', '[]', 10, 10, 'USD', 'paid', 'paid',
+                :old, :old)
+        """,
+        {"oid": order_id, "mid": merchant, "old": old},
+    )
+    row = dict(await database.fetch_one(
+        "SELECT is_deleted FROM orders WHERE order_id = :o", {"o": order_id}))
+    assert row["is_deleted"] is None, "fixture must reproduce the NULL, not a false"
+
+    try:
+        result = await reconcile_paid_orders_missing_merchant_order(
+            merchant_id=merchant, limit=50, min_age_seconds=60, dry_run=True)
+        assert result["candidates"] == [order_id], \
+            "an order the alert pages on must be repairable by this lane"
+    finally:
+        await database.execute(
+            "DELETE FROM orders WHERE merchant_id = :m", {"m": merchant})
+
+
+@pytest.mark.parametrize(
+    "process_tz,age_seconds,min_age_seconds,expect_candidate",
+    [
+        # Ahead of UTC: a naive `utcnow()` cutoff reads as 8h EARLIER, so a
+        # 6h-old order the alert already pages on was never repaired.
+        ("Asia/Shanghai", 6 * 3600, 60, True),
+        # Behind UTC: the same cutoff reads as 7h LATER, so an order paid 30s
+        # ago — whose own enqueue may still be in flight — was taken as lost.
+        ("America/Los_Angeles", 30, 3600, False),
+    ],
+)
+async def test_the_reconciler_age_cutoff_ignores_the_process_timezone(
+    process_tz, age_seconds, min_age_seconds, expect_candidate
+):
+    """The age cutoff must be the database clock, like the
+    paid_missing_merchant_order_count alert it pairs with. asyncpg encodes a
+    naive datetime bound to a timestamptz as THIS PROCESS's local time, so a
+    Python `utcnow()` cutoff is correct only on a UTC host — which CI and Cloud
+    Run both are, so nothing but a forced TZ makes this reproducible there."""
+    import time
+    from datetime import datetime, timedelta, timezone
+    from sqlalchemy.schema import CreateTable
+    from sqlalchemy.dialects import postgresql
+
+    from db.database import database
+    from db.orders import orders as orders_table
+    from jobs.agentic_commerce_reconciliation import (
+        reconcile_paid_orders_missing_merchant_order,
+    )
+
+    try:
+        await database.execute(
+            str(CreateTable(orders_table).compile(dialect=postgresql.dialect())))
+    except Exception:
+        pass
+
+    merchant = f"merch_tz_{uuid.uuid4().hex[:6]}"
+    order_id = f"ORD_TZ_{uuid.uuid4().hex[:8]}"
+    paid = datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
+    await database.execute(orders_table.insert().values(
+        order_id=order_id, merchant_id=merchant, customer_email="tz@x.test",
+        shipping_address={}, items=[], subtotal=10, total=10, currency="USD",
+        payment_status="paid", status="paid", shopify_order_id=None,
+        metadata={}, is_deleted=False, created_at=paid, paid_at=paid))
+
+    previous_tz = os.environ.get("TZ")
+    os.environ["TZ"] = process_tz
+    time.tzset()
+    try:
+        result = await reconcile_paid_orders_missing_merchant_order(
+            merchant_id=merchant, limit=50, min_age_seconds=min_age_seconds,
+            dry_run=True)
+    finally:
+        if previous_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous_tz
+        time.tzset()
+        await database.execute(
+            "DELETE FROM orders WHERE merchant_id = :m", {"m": merchant})
+
+    assert result["candidates"] == ([order_id] if expect_candidate else []), (
+        f"from a {process_tz} process the lane's cutoff drifted off the database clock"
+    )

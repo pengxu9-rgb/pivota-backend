@@ -167,6 +167,8 @@ async def _replay_stream(
         result = await ingest_merchant_event_batch(
             merchant_id=merchant_id,
             batch=batch,
+            agent_identity_confidence="platform_asserted",
+            write_path="cafe24_reconciliation",
         )
         stats["accepted"] += int(result.get("accepted") or 0)
         stats["duplicates"] += int(result.get("duplicates") or 0)

@@ -107,12 +107,18 @@ async def refresh_agent_pdp_view_for_seed(
     seed_id: str,
     proposal_id: Optional[int],
     refresh_source: str,
-) -> None:
+) -> Optional[str]:
     """Refresh the denormalized agent_pdp_view row touched by a seed write.
 
     agent_pdp_view is a cache; callers intentionally isolate failures so
     a stale PDP row never rolls back the external_product_seeds source of
     truth commit.
+
+    RETURNS THE OUTCOME, as one of "refreshed", "skipped_no_attached_key",
+    "skipped_no_content_key", "skipped_not_refreshable". Every early return
+    used to be a bare `return` logged at INFO -- filtered in production -- so a
+    caller that counts projections could not tell a rebuilt PDP row from a seed
+    with no attached product. The nightly refresh counts these now.
     """
     seed_row = await database.fetch_one(
         """
@@ -128,7 +134,7 @@ async def refresh_agent_pdp_view_for_seed(
             "agent_pdp_view refresh skipped for seed_id=%s: no attached_product_key",
             seed_id,
         )
-        return
+        return "skipped_no_attached_key"
 
     catalog_row = await database.fetch_one(
         """
@@ -146,7 +152,7 @@ async def refresh_agent_pdp_view_for_seed(
             seed_id,
             attached_product_key,
         )
-        return
+        return "skipped_no_content_key"
 
     # 🚨 DO NOT reintroduce a local assemble_row + UPSERT here. This function
     # used to do exactly that, with no `evidence=` / `enrichment=` /
@@ -174,7 +180,7 @@ async def refresh_agent_pdp_view_for_seed(
             seed_id,
             content_key,
         )
-        return
+        return "skipped_not_refreshable"
     if content_key:
         try:
             from services.index_pipeline_state_service import recompute_serving_eligibility
@@ -190,6 +196,7 @@ async def refresh_agent_pdp_view_for_seed(
                 "content_key": content_key,
                 "error": str(exc),
             })
+    return "refreshed"
 
 
 # ---------------------------------------------------------------------------

@@ -487,7 +487,10 @@ async def test_reconciliation_replays_both_log_streams_and_persists_cursors(monk
     async def fake_resolve(credentials):
         return "access-1"
 
+    confidence_levels = []
+
     async def fake_ingest(**kwargs):
+        confidence_levels.append(kwargs["agent_identity_confidence"])
         ingested.append([event.event_type for event in kwargs["batch"].events])
         return {
             "accepted": len(kwargs["batch"].events),
@@ -509,6 +512,7 @@ async def test_reconciliation_replays_both_log_streams_and_persists_cursors(monk
 
     assert result["accepted"] == 3
     assert ingested == [["order.created", "order.paid"], ["product.viewed"]]
+    assert confidence_levels == ["platform_asserted", "platform_asserted"]
     assert fetched[0][1]["requested_start_date"]
     assert "since_log_id" not in fetched[0][1]
     state = persisted[0]["updates"]["reconciliation"]
@@ -678,6 +682,8 @@ def test_verified_cafe24_webhook_reaches_canonical_ingest(patched_webhook):
     assert response.json()["accepted"] == 2
     assert len(patched_webhook) == 1
     assert patched_webhook[0]["merchant_id"] == "merchant-1"
+    assert patched_webhook[0]["agent_identity_confidence"] == "platform_asserted"
+    assert patched_webhook[0]["write_path"] == "cafe24_webhook"
 
 
 def test_bad_cafe24_webhook_key_is_rejected_before_ingest(patched_webhook):

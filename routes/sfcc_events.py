@@ -10,6 +10,7 @@ from fastapi import APIRouter, Header, HTTPException, Request, status
 
 from db.database import database
 from services.merchant_event_ingest_service import MerchantEventBatch, ingest_merchant_event_batch
+from services.telemetry_ingress import current_ingress, telemetry_ingress_route
 from services.sfcc_event_adapter import (
     UnsupportedSFCCEvent,
     map_sfcc_integration_event,
@@ -65,10 +66,24 @@ def _events(payload: Any) -> List[Dict[str, Any]]:
     return [dict(event) for event in values]
 
 
+def _same_site(expected: str, supplied: str) -> bool:
+    """Constant-time equality that a non-ASCII site id cannot turn into a 500.
+
+    ``hmac.compare_digest`` raises ``TypeError`` when either ``str`` holds a
+    code point above U+00FF, and BOTH sides here are attacker-reachable text:
+    Starlette decodes the ``X-Pivota-SFCC-Site-Id`` header as latin-1, and the
+    per-event ``site_id`` comes straight out of the signed JSON, which may hold
+    any code point at all. Comparing UTF-8 bytes never raises and is exact for
+    every pair, so a malformed site id answers 401 like any other mismatch
+    instead of becoming an unauthenticated 500.
+    """
+    return hmac.compare_digest(expected.encode("utf-8"), supplied.encode("utf-8"))
+
+
 def _verify_event_sites(events: List[Dict[str, Any]], expected_site_id: str) -> None:
     for event in events:
         event_site_id = str(event.get("site_id") or "").strip()
-        if not event_site_id or not hmac.compare_digest(expected_site_id, event_site_id):
+        if not event_site_id or not _same_site(expected_site_id, event_site_id):
             raise HTTPException(status_code=401, detail="Invalid SFCC event site")
 
 
@@ -93,11 +108,22 @@ def _verify_signature(
         str(timestamp_int).encode("ascii") + b"." + raw,
         hashlib.sha256,
     ).hexdigest()
-    if not hmac.compare_digest(expected, supplied[7:]):
+    # BYTES, not str. `hmac.compare_digest` raises TypeError when either str
+    # holds a non-ASCII code point, and Starlette decodes header bytes as
+    # latin-1 — so a header of `sha256=\xe9...` reached this line as a str the
+    # comparison could not accept and became an UNAUTHENTICATED 500. Encoding
+    # here turns every malformed value back into the one 401. Same fix as
+    # `routes/prestashop_webhooks.py`.
+    try:
+        candidate = supplied[7:].encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise HTTPException(status_code=401, detail="Invalid SFCC event signature") from exc
+    if not hmac.compare_digest(expected.encode("ascii"), candidate):
         raise HTTPException(status_code=401, detail="Invalid SFCC event signature")
 
 
 @router.post("/{store_id}")
+@telemetry_ingress_route("sfcc_cartridge")
 async def receive_sfcc_events(
     store_id: str,
     request: Request,
@@ -125,9 +151,12 @@ async def receive_sfcc_events(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid SFCC event credentials",
         )
-    if not site_id or not hmac.compare_digest(expected_site_id, str(site_id).strip()):
+    if not site_id or not _same_site(expected_site_id, str(site_id).strip()):
         raise HTTPException(status_code=401, detail="Invalid SFCC event site")
     _verify_signature(raw, secret=secret, signature=signature, timestamp=timestamp)
+    ingress = current_ingress(request)
+    ingress.identify(merchant_id=dict(store)["merchant_id"], store_id=store_id)
+    await ingress.enforce_rate_limit("platform", store_id)
     try:
         payload = json.loads(raw or b"{}")
     except Exception as exc:
@@ -154,6 +183,23 @@ async def receive_sfcc_events(
             # rejected counts remain observable without echoing payload details.
             rejected += 1
     if not mapped:
+        if rejected:
+            # NOT `status: "ignored"`. `TelemetryIngress.record_result`
+            # short-circuits on that one status and records exactly one
+            # `ignored` event, so a delivery whose every event was REJECTED was
+            # counted as ignored and the rejection never reached the metrics.
+            # Returning the normal summary shape (with `accepted = 0`) makes the
+            # ingress walk its accepted/duplicate/ignored/rejected fields
+            # instead. Same fix as `routes/prestashop_webhooks.py`.
+            return {
+                "status": "rejected",
+                "platform": "salesforce_commerce_cloud",
+                "accepted": 0,
+                "duplicates": 0,
+                "events": [],
+                "ignored": ignored,
+                "rejected": rejected,
+            }
         return {
             "status": "ignored",
             "platform": "salesforce_commerce_cloud",
@@ -163,6 +209,8 @@ async def receive_sfcc_events(
     result = await ingest_merchant_event_batch(
         merchant_id=str(store["merchant_id"]),
         batch=MerchantEventBatch(events=mapped),
+        agent_identity_confidence="platform_asserted",
+        write_path="sfcc_cartridge",
     )
     return {
         "status": "recorded",

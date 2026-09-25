@@ -42,6 +42,7 @@ from models.standard_product import StandardProduct, StandardProductVariant
 from services.beauty_field_authoring import product_usage_guide_id
 from services.catalog_identity import make_content_key
 from services.category_kind import resolve_category_kind
+from services.product_exposure_service import standard_variant_in_stock
 from services.vertical_profiles import (
     is_vertical_unresolved,
     normalize_category,
@@ -1772,7 +1773,24 @@ async def ingest_standard_products(
                 offer_id = make_catalog_offer_id(sku_key, "default", "internal_merchant")
                 list_price = compare_at if compare_at and variant_price and compare_at > variant_price else variant_price
                 merchant_effective_price = variant_price
-                availability = "in_stock" if (inventory_quantity or 0) > 0 else "out_of_stock"
+                # The gate's stock verdict for a variant, not quantity alone: an untracked or
+                # keep-selling Shopify variant is `available` at quantity 0, and the eligibility gate
+                # ships it (see standard_variant_in_stock). Writing it out_of_stock here made
+                # agent_pdp_view rank a sellable buy-here offer behind every retailer. `available`
+                # absent (legacy cache rows, non-Shopify adapters, the no-variant fallback) ->
+                # quantity, exactly as before. For a product with no variants the gate reads
+                # product.in_stock (quantity AND orderable) instead; that case is unchanged here, and
+                # a non-orderable product is written merchant_view_only below.
+                availability = (
+                    "in_stock"
+                    if standard_variant_in_stock(
+                        {
+                            "available": getattr(variant, "available", None),
+                            "inventory_quantity": inventory_quantity or 0,
+                        }
+                    )
+                    else "out_of_stock"
+                )
                 offer_mode = "merchant_checkout" if product.orderable is not False else "merchant_view_only"
 
                 offer_values = {
@@ -2665,13 +2683,17 @@ async def run_catalog_sync_job(job_id: str) -> Dict[str, Any]:
         # serving-eligibility gate depend on it). Best-effort: never fail the
         # catalog sync on this hook.
         try:
-            from db.product_quality_backfill_jobs import create_quality_backfill_job
-            await create_quality_backfill_job(
+            from db.product_quality_backfill_jobs import enqueue_quality_backfill_if_needed
+            await enqueue_quality_backfill_if_needed(
                 merchant_id=merchant_id,
                 platform=str(scope.get("platform") or connector or "shopify"),
                 requested_by="catalog_sync_autodrain",
                 force_refresh=False,
                 missing_only=True,
+                # Scheduled reconciliation (jobs/agentic_commerce_reconciliation
+                # stamps scope.scheduled) is folded into a recent job; a job a
+                # person requested always enqueues.
+                unattended=bool(scope.get("scheduled")),
             )
         except Exception as exc:  # noqa: BLE001 - readiness hook is best-effort
             logger.warning(

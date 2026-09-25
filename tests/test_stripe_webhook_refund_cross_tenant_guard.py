@@ -173,9 +173,22 @@ def _install(
     monkeypatch.setattr(
         webhook_routes_module, "_mark_stripe_webhook_event_status_best_effort", fake_mark_status
     )
+    # Every edge writer records into the same list, so the `== []` assertions
+    # below hold whichever writer a branch uses (an absence check against a
+    # writer the route no longer calls would pass for free).
     monkeypatch.setattr(
         attribution_module,
         "attach_refund_to_attribution_edge",
+        fake_attach_refund_to_attribution_edge,
+    )
+    monkeypatch.setattr(
+        attribution_module,
+        "apply_refund_total_to_attribution_edge",
+        fake_attach_refund_to_attribution_edge,
+    )
+    monkeypatch.setattr(
+        attribution_module,
+        "attach_dispute_to_attribution_edge",
         fake_attach_refund_to_attribution_edge,
     )
     return h
@@ -664,7 +677,7 @@ async def test_dispute_for_the_endpoint_owners_own_order_still_reverses_attribut
     assert resp.json() == {"status": "success", "event": "charge.dispute.created"}
     assert h.owner_lookups == [MERCHANT_A_PSP]
     assert h.attribution_calls == [
-        {"order_id": "ORD_MERCHANT_A", "refund_id": "dp_own_order", "amount": Decimal("500")}
+        {"order_id": "ORD_MERCHANT_A", "dispute_id": "dp_own_order", "amount": Decimal("500")}
     ]
 
 

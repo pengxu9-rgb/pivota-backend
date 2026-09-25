@@ -74,7 +74,7 @@ def _run(coro):
 # --------------------------------------------------------------- stage 1: catalogue read
 
 def test_complete_catalogue_is_ok_and_carries_every_handle():
-    client = _CannedClient([_page(["a", "b", "c"])])
+    client = _CannedClient([_page(["a", "b", "c"]), _page([])])
     read = _run(liveness.read_brand_catalogue(client, "brand.com"))
     assert read.status == liveness.CATALOGUE_OK
     assert read.usable
@@ -111,13 +111,32 @@ def test_bot_challenge_is_not_retried_and_is_its_own_outcome():
     assert len(client.urls) == 1, "a challenge must cost exactly one request, not `attempts`"
 
 
+def test_a_short_page_mid_catalogue_is_not_the_end():
+    """bluemercury.com, 2026-09-24: page 1 = 249, page 2 = 250. Hidden products count toward
+    `limit`; stopping on the short page would read every later handle as delisted."""
+    short = _page([f"a{i}" for i in range(liveness.PAGE_LIMIT - 1)])
+    client = _CannedClient([short, _page(["late"]), _page([])])
+    read = _run(liveness.read_brand_catalogue(client, "brand.com"))
+    assert read.status == liveness.CATALOGUE_OK
+    assert "late" in read.handles and read.product_count == liveness.PAGE_LIMIT
+    assert len(client.urls) == 3
+
+
+def test_a_store_that_ignores_page_is_an_incomplete_read_not_eighty_requests():
+    same = _page(["a", "b"])
+    client = _CannedClient([same, _page(["a", "b"])])
+    read = _run(liveness.read_brand_catalogue(client, "brand.com"))
+    assert read.status == liveness.CATALOGUE_INCOMPLETE and not read.usable
+    assert "did not advance" in read.note and len(client.urls) == 2
+
+
 def test_a_real_429_is_still_retried():
     """Without the challenge header, 429 keeps its ordinary back-off-and-retry treatment."""
-    client = _CannedClient([httpx.Response(429), _page(["a"])])
+    client = _CannedClient([httpx.Response(429), _page(["a"]), _page([])])
     read = _run(liveness.read_brand_catalogue(client, "brand.com", attempts=3))
     assert read.status == liveness.CATALOGUE_OK
     assert read.handles == {"a"}
-    assert len(client.urls) == 2
+    assert len(client.urls) == 3  # 429, page 1, then the empty page 2 that ends the catalogue
 
 
 def test_a_404_on_page_one_is_reported_as_the_status_not_as_an_empty_catalogue():
@@ -251,6 +270,16 @@ class _FakeDb:
 
     async def execute(self, query, params=None):
         self.executed.append((query, params))
+
+    async def fetch_all(self, query, params=None):
+        """Recorded too. The mirror suppression now uses `RETURNING product_key`
+        (no rowcount from `databases`+asyncpg, and the keys feed the offer
+        cascade), so a fake that watched only `execute` would have stopped
+        seeing the statement these tests are about the day it changed."""
+        self.executed.append((query, params))
+        if "RETURNING" in str(query).upper():
+            return [{"product_key": "prod::pg1", "offer_id": "offer::pg1"}]
+        return []
 
 
 def _observe(monkeypatch, row, observation, now=None):
@@ -547,7 +576,10 @@ def test_one_exploding_host_does_not_void_the_rest_of_the_pass(monkeypatch):
         async def get(self, url, headers=None):  # noqa: ANN001
             if "bad.com" in url:
                 raise RuntimeError("host exploded")
-            resp = _page(["toner"]) if "/products.json" in url else httpx.Response(200)
+            if "/products.json" in url:
+                resp = _page(["toner"] if "page=1" in url else [])
+            else:
+                resp = httpx.Response(200)
             resp.request = httpx.Request("GET", url)
             return resp
 
@@ -736,3 +768,38 @@ def test_retirement_scopes_the_mirror_by_source_system_and_stamps_updated_at(mon
     assert mirror_params["source_system"] == liveness.MIRROR_SOURCE_SYSTEM
     assert "updated_at = NOW()" in mirror_sql
     assert mirror_params["reason"] == liveness.SUPPRESSION_REASON
+
+
+def test_retirement_cascades_to_the_products_offers(monkeypatch):
+    """Suppressing the mirror product does NOT gate its offers: catalog_offers
+    carries its OWN suppressed_at and that is what priced_offer_sql,
+    fetch_offers_for_keys and the recall candidate CTE filter on. Without the
+    cascade this nightly, unattended lane keeps a price live on a URL it has just
+    proved is dead — a large share of the 2,171 suppressed-product-with-live-offer
+    rows measured on prod 2026-09-08.
+
+    Both columns are asserted, and the product statement is asserted to project
+    the keys the cascade consumes: reading them from a separate SELECT would race
+    its own `suppressed_at IS NULL` filter and gate offers of a product this call
+    did not suppress.
+    """
+    db = _FakeDb({"status": "active"})
+    monkeypatch.setattr(liveness, "database", db)
+    obs = liveness.DestinationObservation(liveness.VERDICT_DEAD_404, 404, None, corroborated=True)
+    result = _run(liveness.retire_seed_for_dead_destination("eps_1", obs, now=NOW))
+
+    mirror_sql = next(sql for sql, _ in db.executed if "catalog_products" in sql)
+    assert "RETURNING product_key" in mirror_sql
+
+    offer_sql, offer_params = next(
+        (sql, params) for sql, params in db.executed if "catalog_offers" in sql
+    )
+    assert "suppressed_at = NOW()" in offer_sql
+    assert "suppression_reason" in offer_sql
+    assert "suppressed_at IS NULL" in offer_sql, (
+        "the cascade must be idempotent — re-stamping a row another lane "
+        "tombstoned rewrites somebody else's decision"
+    )
+    assert offer_params["reason"] == "product_suppressed"
+    assert offer_params["product_keys"] == ["prod::pg1"]
+    assert result["offers_suppressed"] == 1

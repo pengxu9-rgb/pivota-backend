@@ -15,6 +15,7 @@ Path: POST /agent/shop/v1/invoke
 
 import asyncio
 import copy
+from dataclasses import replace
 import hashlib
 import json
 import logging
@@ -35,7 +36,13 @@ from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field, ConfigDict
 
 from config.settings import resolve_public_api_base_url, settings
+from services.seed_variant_options import seed_variant_options_as_mapping
 from services.outbound_warm_handoff import could_upgrade_at_click_time
+from services.offer_buyability import (
+    OFFER_UNAVAILABLE_AVAILABILITIES,
+    availability_is_known_unavailable,
+)
+from services import market_telemetry
 from db.database import database
 from models.catalog import PivotPaymentContext, PivotQueryRequest, PivotResultItem
 from models.reviews_refs import SkuRef as ReviewsSkuRef
@@ -68,7 +75,14 @@ from services.similarity_service import (
     similarity_service,
 )
 from services.similarity_config import get_similarity_scoring_weights
-from routes.agent_auth import AgentContext, get_agent_context
+from routes.agent_auth import (
+    AgentContext,
+    get_agent_context,
+    request_api_key,
+    resolve_issuing_agent_for_request,
+)
+from services.issuing_agent_assertion import ISSUING_AGENT_ASSERTION_HEADER
+from db.merchant_tasks import match_recovery_key
 from services.outbound_links_service import (
     DEFAULT_UTM_TEMPLATE,
     apply_utm,
@@ -80,11 +94,23 @@ from services.outbound_links_service import (
     REFERRAL_CLICK_PARAM,
     SHOPIFY_CART_CLICK_ATTRIBUTE,
     make_redirect_token,
+    market_is_observed,
+    TOKEN_MARKET_OBSERVED_KEY,
     normalize_shop_host,
     parse_redirect_token_verified,
     shopify_cart_base_url,
+    url_domain,
 )
+from services import checkout_preflight
 from services import live_offer_verification
+from services.handover_variant_identity import (
+    HandoverVariant,
+    HandoverVariantResolver,
+    canonical_variant_id,
+    handover_coverage_fields,
+    handover_coverage_message,
+    names_a_merchant_issued_variant,
+)
 from services.shopify_variant_identity import (
     sole_stamped_variant_id,
     storefront_is_shopify,
@@ -94,6 +120,8 @@ from services.commerce_attribution_service import (
     PVT_PRODUCT_ID,
     PVT_SURFACE,
     PVT_VARIANT_ID,
+    IssuedClick,
+    issue_clicks,
     new_click_id,
     normalize_surface,
 )
@@ -107,6 +135,8 @@ from services.commerce_surface_service import (
 from services.product_exposure_service import (
     build_agent_push_projection_from_standard_variant,
     pick_first_eligible_variant_from_standard_product,
+    product_as_standard_variant,
+    standard_variant_in_stock,
 )
 from observability.reliability_metrics import (
     record_catalog_pivot_shadow_compare,
@@ -137,7 +167,10 @@ AGENT_API_KEY = os.getenv("SHOP_GATEWAY_AGENT_API_KEY") or os.getenv("PIVOTA_API
 logger = logging.getLogger(__name__)
 
 try:
-    from services.external_referral_readiness import should_block_external_referral_runtime
+    from services.external_referral_readiness import (
+        external_referral_live_verification_reasons,
+        should_block_external_referral_runtime,
+    )
 except ModuleNotFoundError:
     class _FallbackExternalReferralStatus:
         def __init__(self, *, seed_id: Optional[str] = None, matched_via: str = "runtime") -> None:
@@ -158,6 +191,11 @@ except ModuleNotFoundError:
             seed_id=str((row or {}).get("id") or "").strip() or None,
             matched_via=matched_via,
         )
+
+    def external_referral_live_verification_reasons(
+        status: _FallbackExternalReferralStatus,
+    ) -> List[str]:
+        return list(status.blocker_anomaly_types)
 
 
 def _bootstrap_env_int(name: str, default: int, *, min_value: int, max_value: int) -> int:
@@ -265,10 +303,10 @@ PIVOT_MULTI_SERVE_SOURCE_ALLOWLIST = _bootstrap_env_csv_set(
     "AGENT_SHOP_PIVOT_MULTI_SERVE_SOURCE_ALLOWLIST",
     {"shopping_agent"},
 )
-PIVOT_MULTI_SERVE_INCLUDE_EXTERNAL = _bootstrap_env_bool(
-    "AGENT_SHOP_PIVOT_MULTI_SERVE_INCLUDE_EXTERNAL",
-    True,
-)
+# External offers are part of the normal shopping recall universe. Keep the
+# symbol for compatibility with tests and call sites, but retire the env kill
+# switch so a stale deployment setting cannot hide future external merchants.
+PIVOT_MULTI_SERVE_INCLUDE_EXTERNAL = True
 PIVOT_MULTI_SERVE_INCLUDE_INCENTIVES = _bootstrap_env_bool(
     "AGENT_SHOP_PIVOT_MULTI_SERVE_INCLUDE_INCENTIVES",
     True,
@@ -3383,6 +3421,27 @@ def _seed_offer_variant_id(v: Dict[str, Any]) -> str:
     return str(raw).strip()
 
 
+def _seed_variant_identity_claim(v: Dict[str, Any]) -> str:
+    """The subset of `_seed_offer_variant_id`'s chain that CLAIMS to be a variant id.
+
+    `sku` and `sku_id` are deliberately absent. A stock-keeping string is not a claim about
+    which variant the merchant issued — and on this corpus it is routinely an EAN-13 or UPC-12
+    barcode, which is 8+ digits and therefore reads as a Shopify variant id to
+    `services/variant_identity` by shape alone.
+
+    That distinction only matters in ONE direction, and round 3 of review found the direction
+    that bites. Matching may use the broad chain: a SKU string that happens to equal a stored
+    `source_variant_id` IS that variant, and treating the equality as a coincidence would throw
+    away real hand-overs. CONTRADICTING may not: a barcode that names no variant is an ABSENCE
+    of information, and letting it refuse a variant we did resolve would have made the
+    seed-stamp rule veto precisely the hand-overs `backfill_shopify_variant_ids.py` is run to
+    enable — `stamp_variant_ids` writes only `shopify_variant_id` and leaves `sku` untouched,
+    so the two would sit side by side in one snapshot entry and disagree.
+    """
+    raw = v.get("variant_id") or v.get("variantId") or v.get("id") or ""
+    return str(raw).strip()
+
+
 def _classify_db_reason_code(exc: Exception) -> str:
     msg = str(exc or "").lower()
     exc_type = type(exc).__name__.lower()
@@ -3470,9 +3529,23 @@ def _offers_scope_or_none(raw: Any) -> Optional[str]:
     here as a "scope" pointing at a merchant that does not exist. Treat it as unscoped (same
     rule as the gateway's services/sourcingSentinel), so seed products resolve by identity
     instead of dying inside a fake merchant's empty catalog.
+
+    A HOST IS NOT A MERCHANT SCOPE EITHER, and that is no longer hypothetical. Seed and
+    retailer offers advertise `merchant_id` so an agent can NAME the seller, and the seed
+    lane's identity is a destination host (`rovectin.com`) because a seed has no
+    `catalog_merchants` row. Callers echo advertised fields back, so that host arrives here
+    as a "scope" — and `catalog_products.merchant_id` is always `merch_obs_…`, never a host,
+    so scoping to it matches zero rows, disables the canonical-context prefetch, and returns
+    an empty list for the agent's most obvious follow-up call. Naming the merchant and then
+    refusing to answer about it is worse than not naming it.
+
+    So the rule is a SHAPE, not a list of known sentinels: a real Pivota merchant id has no
+    dot in it. One more sentinel would have been the third patch to the same allowlist.
     """
     s = str(raw or "").strip()
     if not s or s.lower() in {"external_seed", "external seed"}:
+        return None
+    if "." in s:
         return None
     return s
 
@@ -3642,16 +3715,19 @@ def _build_internal_offer_summary(
         variant_payload.get("compare_at_price")
         or product_payload.get("compare_at_price")
     )
-    inventory_quantity = _coerce_int(
-        variant_payload.get("inventory_quantity")
-        if variant_payload.get("inventory_quantity") is not None
-        else product_payload.get("inventory_quantity")
+    # THE GATE'S VERDICT, not a second opinion. This flag used to read `inventory_quantity`
+    # alone, while the eligibility gate that picks the variant reads `available` first — so an
+    # untracked / keep-selling variant (`available: true`, quantity 0) shipped as a buy-here
+    # offer printed `in_stock: false`, and ranking had to exempt every internal offer to avoid
+    # demoting it. Reading the gate's own function makes the two agree by construction; with no
+    # variant to ship, it reads the product the way the gate does for a product with none.
+    #
+    # StandardProductVariant retains `available`, including the sellability that the Shopify
+    # adapter derives from inventory tracking and continue-selling policy. Legacy cache rows
+    # lacking that field still fall back to quantity until refreshed.
+    in_stock = standard_variant_in_stock(
+        variant_payload if variant_payload else product_as_standard_variant(product_payload)
     )
-    in_stock = True
-    if inventory_quantity is not None:
-        in_stock = inventory_quantity > 0
-    elif isinstance(product_payload.get("in_stock"), bool):
-        in_stock = bool(product_payload.get("in_stock"))
 
     seller = (
         str(
@@ -3664,6 +3740,15 @@ def _build_internal_offer_summary(
     offer_id = f"of:internal_checkout:{merchant_id}:{product_id}:{variant_id or '∅'}"
     return {
         "offer_id": offer_id,
+        # BOTH SPELLINGS. `offerToSignal` in the gateway
+        # (PIVOTA-Agent src/agentSignals/offerToSignal.js:90-97) reads TOP-LEVEL `merchant_id` /
+        # `merchant_name` and projects neither `seller` nor `internal_checkout_items`. This lane
+        # emitted the merchant only as `seller` and inside `internal_checkout_items[0]`, so its
+        # offers reached an agent as `merchant_id: null` — a row in a cross-merchant list with no
+        # seller to name and no way to attribute it. The catalog_offers arm already emits both
+        # (see its SHAPE note); this is the "separate change" that note defers to.
+        "merchant_id": merchant_id or None,
+        "merchant_name": seller or None,
         "seller": seller,
         "price": price_amount,
         "currency": currency,
@@ -3787,14 +3872,45 @@ def _attach_eligible_serving_fields_to_items(
     return attached_items
 
 
+# "THIS SELLER CANNOT SELL IT" is spelled once: OFFER_UNAVAILABLE_AVAILABILITIES, in
+# services/offer_buyability.py (moved from here so agent_pdp_view's offer order binds the same set
+# without a service importing a router; why unknown ranks WITH in stock is documented there). The
+# catalog arm's SQL ORDER BY binds it, the `in_stock` flag that arm emits is derived from it, and
+# `_rank_offers_merit_first` reads that flag — so the order an offer ships in can never contradict
+# the stock claim printed on it.
+
+
+def _offer_is_known_unavailable(offer: Dict[str, Any]) -> bool:
+    """True only on an explicit statement that this seller cannot sell it now.
+
+    Reads the `in_stock` flag, which every lane emits (the catalog arm derives it from
+    OFFER_UNAVAILABLE_AVAILABILITIES). There is no separate `availability` check here on purpose:
+    no lane ships an unavailable `availability` beside a True flag, so one would be dead code.
+
+    INTERNAL (buy-here) OFFERS ARE READ THE SAME WAY. They used to be exempt because their flag
+    read `inventory_quantity` alone and so called an untracked / keep-selling variant
+    (`available: true`, quantity 0) sold out; demoting on that cut a buyable exact match at
+    limit=1. The flag now IS the eligibility gate's stock verdict
+    (`standard_variant_in_stock`, see `_build_internal_offer_summary`), so False means what it
+    says. What the exemption cost, and why it had to go: in RELAXED mode (no commerce_surface)
+    the handler falls back to `variants[0]` when no variant passes the gate, so a genuinely sold
+    out buy-here offer shipped and, exempt, won an equal-fit tie over an in-stock referral.
+
+    Legacy Shopify cache rows without per-variant `available` still use quantity until refreshed.
+    The 2026-09-18 census found three possible keep-selling rows, all expired; none of the 24
+    live rows had that shape.
+    """
+    return offer.get("in_stock") is False
+
+
 def _rank_offers_merit_first(offers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Rank offers MERIT-FIRST, never by in-agent integration status (T2-4, decision #3).
 
     Index neutrality is a core differentiator: an external (referred, ``orderable:false``)
     offer must not be demoted purely for being un-integrated. Internal (buy-here) and
     external (referral) offers compete on the same relevance/quality signal — the per-offer
-    match ``confidence`` — and in-agent transactability is applied ONLY as a tiebreaker
-    between otherwise-equal-FIT offers (an orderable/buy-here offer wins the tie).
+    match ``confidence``. Checkout transport is not a ranking signal: external merchants can
+    complete through their own checkout and the constrained card rail.
 
     The two tiers score match ``confidence`` on non-comparable scales (internal exact = 0.95
     at ``_build_internal_offer_summary``; external exact = 1.0 in ``_append_external_...``), so
@@ -3805,9 +3921,19 @@ def _rank_offers_merit_first(offers: List[Dict[str, Any]]) -> List[Dict[str, Any
     Raw confidence is a final deterministic tiebreak within a tier. We do NOT mutate the source
     confidence values (other code reads them) — the bucketing is local to the sort key.
 
-    Sort key (all ascending): (fit_tier_rank, transactability_rank, -confidence). The sort is
-    stable, so equal-key offers keep prior order — a pure-internal set (same-product offers
-    share a confidence) is ordered byte-identically to the old ``internal + external`` list.
+    STOCK, inside the fit tier. An offer that says it cannot be sold (see
+    ``_offer_is_known_unavailable``) ranks after every offer of the same fit that can — measured
+    2026-09-18, ``get_offers`` on the Purito Oat-in Calming Gel Cream led with eyurs.com at $13,
+    out of stock, over sokoglam.com at $19.50, in stock. It is INSIDE the fit tier, not above it,
+    on purpose: a product-grain "in stock" says some variant is on the shelf, not the one that
+    matched exactly, so it must not jump an exact match. It applies to buy-here offers too:
+    their flag is the eligibility gate's own verdict (see ``_offer_is_known_unavailable``), so
+    a sold-out buy-here offer no longer wins a tie on transactability alone.
+
+    Sort key (all ascending): (fit_tier_rank, unavailable, transactability_rank, -confidence).
+    The sort is stable, so equal-key offers keep prior order — a pure-internal set (same-product
+    offers share a confidence) is ordered byte-identically to the old ``internal + external``
+    list, and the catalog arm's in-stock-then-price SQL order survives into the response.
     """
 
     def _merit(offer: Dict[str, Any]) -> float:
@@ -3825,13 +3951,13 @@ def _rank_offers_merit_first(offers: List[Dict[str, Any]]) -> List[Dict[str, Any
             return 1  # product-level match
         return 2  # loose match
 
-    def _transactability_rank(offer: Dict[str, Any]) -> int:
-        # Tiebreaker only: 0 = transactable in-agent (buy-here) wins ties, 1 = referral.
-        return 0 if str(offer.get("purchase_route") or "") == "internal_checkout" else 1
-
     def _key(offer: Dict[str, Any]) -> Tuple[int, int, float]:
         confidence = _merit(offer)
-        return (_fit_tier_rank(confidence), _transactability_rank(offer), -confidence)
+        return (
+            _fit_tier_rank(confidence),
+            1 if _offer_is_known_unavailable(offer) else 0,
+            -confidence,
+        )
 
     return sorted(offers, key=_key)
 
@@ -3873,10 +3999,51 @@ ResolutionMode = Literal[
 RESOLUTION_MODES: frozenset[str] = frozenset(get_args(ResolutionMode))
 
 
+async def _issue_served_clicks(
+    issued: List[IssuedClick],
+    offers: List[Dict[str, Any]],
+    caller_api_key: Optional[str],
+    caller_assertion: Optional[str] = None,
+) -> None:
+    """Record the issued clicks whose link is in `offers`, with the caller's agent. Never raises."""
+    if not issued or not offers:
+        return
+    served_links: set = set()
+    served_ids: set = set()
+    for o in offers:
+        if not isinstance(o, dict):
+            continue
+        if o.get("affiliate_url"):
+            served_links.add(str(o["affiliate_url"]))
+        # The seed lane publishes its click id under execution_spec.tracking.
+        for holder in (o, o.get("execution_spec")):
+            tracking = holder.get("tracking") if isinstance(holder, dict) else None
+            if isinstance(tracking, dict) and tracking.get("click_id"):
+                served_ids.add(str(tracking["click_id"]))
+    served = [c for c in issued if (c.link and c.link in served_links) or c.click_id in served_ids]
+    if not served:
+        return
+    try:
+        agent_id = await resolve_issuing_agent_for_request(
+            caller_api_key, caller_assertion, op="offers.resolve"
+        )
+        await issue_clicks([replace(click, agent_id=agent_id) for click in served])
+    except Exception as e:  # noqa: BLE001 -- FAIL OPEN, see the call site
+        logger.warning(
+            "offers.resolve.issue_clicks_failed count=%s error_type=%s", len(served), type(e).__name__,
+        )
+
+
 async def _handle_offers_resolve(
     payload: OffersResolvePayload,
     request_metadata: Optional[Dict[str, Any]],
     background_tasks: BackgroundTasks,
+    # ADR-025 D1: the API key the CALLER authenticated with (the gateway forwards the agent's own
+    # key). Resolved to an agent only when a click is actually issued; never read from the body.
+    caller_api_key: Optional[str] = None,
+    # ...and, when that key is the gateway's own (the MCP door), the agent the gateway verified,
+    # signed. Trusted only from a Pivota service caller; see resolve_issuing_agent_for_request.
+    caller_assertion: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Resolve purchasable offers for a given sku_id/product_id.
@@ -4281,7 +4448,49 @@ async def _handle_offers_resolve(
             "variant_aliases": variant_aliases,
         }
 
+    # ONE budget and ONE memo for the WHOLE request. Both were first written inside the
+    # per-seed-row loop, which defeated them: the budget reset on every row (6 rows under a
+    # cap of 2 ran 6 preflights; 240 rows x 8 is 1,920 asks), and nothing deduplicated the
+    # question. `_append_external_offers_from_seed_rows` is a closure over this scope, so all
+    # three of its call sites share these without threading a parameter.
+    #
+    # The memo matters as much as the cap. It was introduced when the gate's id came from
+    # `sole_stamped_variant_id(seed_data)`, a property of the ROW, while the gate sat inside
+    # `for v in matched_variants` — so every candidate in a row asked the merchant the IDENTICAL
+    # question. One row with 12 variants burned 8 asks on duplicates, published candidates 9-12
+    # unverified under enforce, and multiplied that row's contribution to the shadow denominator
+    # eightfold.
+    #
+    # #2151 CHANGED WHAT IT DEDUPS, and the difference is worth stating rather than leaving the
+    # old sentence to rot. The gate now keys on the resolved hand-over id, which VARIES PER
+    # VARIANT on the exact-match path (8.5% of seeds) — so a row with two named variants is two
+    # genuinely different questions and correctly costs two asks where it used to cost one. What
+    # the memo still collapses is the sole-candidate and seed-stamp cases, where the id remains a
+    # property of the row, plus any repeat across rows resolving to the same product. Keyed on
+    # the question actually asked, (pdp_url, variant).
+    _preflight_budget = _PreflightBudget()
+    _preflight_memo: Dict[Tuple[str, str], bool] = {}
+    # READ at the end of the request by `_emit_preflight_coverage`. A first version only
+    # INCREMENTED these — five writes, zero reads, discarded at function exit — while a comment
+    # claimed they gave the rate a denominator. They did not, and a counter nobody reads is
+    # indistinguishable from one that is always zero.
+    _preflight_stats: Dict[str, int] = {"candidates": 0, "gated": 0, "cart_prefilled": 0,
+                                        "asked": 0, "memo_hits": 0, "skipped_by_budget": 0,
+                                        "degraded_to_referral": 0}
+    # ONE resolver for the WHOLE request, for the same reason the budget and the memo are one:
+    # `_append_external_offers_from_seed_rows` is called from three sites, and a resolver built
+    # per call would re-ask for product keys the previous call already loaded. It holds only a
+    # memo and counters; every lookup failure inside it answers "no id", never a wrong one.
+    _handover_resolver = HandoverVariantResolver()
+
     async def _append_external_offers_from_seed_rows(seed_rows: List[Any]) -> None:
+        # ONE statement for every product key this batch is about to hand over, BEFORE the
+        # loop. Inside the loop it would be a query per card, which is the shape the
+        # `list_open_recovery_tasks` note below already had to be corrected for.
+        await _handover_resolver.prime(
+            _handover_product_key(_row_to_dict(r), _ensure_seed_data_obj(_row_to_dict(r).get("seed_data")))
+            for r in seed_rows
+        )
         for row in seed_rows:
             row_dict = _row_to_dict(row)
             blocked, gate_status = await should_block_external_referral_runtime(
@@ -4297,6 +4506,22 @@ async def _handle_offers_resolve(
                         {
                             "seed_id": row_dict.get("id"),
                             "blockers": list(gate_status.blocker_anomaly_types),
+                        },
+                    )
+                )
+                continue
+            live_verification_reasons = external_referral_live_verification_reasons(gate_status)
+            if live_verification_reasons:
+                # Recall can return a referral-only card, but offer resolution
+                # cannot synthesize commerce facts before a live merchant check.
+                mapping_candidates.append(
+                    _conf(
+                        "external_seed",
+                        0.0,
+                        "external_seed_requires_live_verification",
+                        {
+                            "seed_id": row_dict.get("id"),
+                            "blockers": live_verification_reasons,
                         },
                     )
                 )
@@ -4328,6 +4553,51 @@ async def _handle_offers_resolve(
             used_market = str(row_dict.get("market") or market_hint or "US")
             used_tool = str(row_dict.get("tool") or tool_hint or "*")
 
+            # ONCE per seed, not once per variant. This is an agent-facing
+            # resolve path and matched_variants can be long; a lookup inside
+            # the loop is a query per variant.
+            #
+            # The identity is derived HERE, from the row, rather than reusing
+            # the loop's `redirect_identity`: that name is bound INSIDE the
+            # loop below, so reading it here raised UnboundLocalError on the
+            # first seed — swallowed by the except, so the feature silently
+            # never ran — and on later seeds held the PREVIOUS seed's value,
+            # stamping one merchant's key onto another's link. merchant_id and
+            # shop_domain come from attached_product_key, which is per-row, so
+            # deriving them without a variant is correct.
+            # DELIBERATELY no `handover=` here. This derivation is read for `merchant_id` and
+            # `shop_domain` only — the cart identity is derived per variant below — and asking
+            # the resolver here would add one `handover_considered` per row for a decision
+            # nothing publishes, which is the counter-inflation `preflight_coverage_fields`
+            # had to be corrected for from the other direction.
+            _seed_identity = _external_seed_redirect_identity(
+                row=row_dict, seed_data=seed_data, offer_variant_id=None,
+            )
+            _seed_merchant_id = str(_seed_identity.get("merchant_id") or "")
+            _seed_shop_domain = _seed_identity.get("shop_domain")
+
+            # Only the DB call is guarded, and only for DB failures. A blanket
+            # try around the derivation is what turned a programming error
+            # into silence last time.
+            _open_recovery_tasks: List[Dict[str, Any]] = []
+            if _seed_merchant_id:
+                try:
+                    from db.merchant_tasks import list_open_recovery_tasks
+
+                    # Same 0.5s budget every neighbouring query on this path
+                    # uses. Fail-soft catches errors, not latency — without a
+                    # timeout a slow Postgres holds offer resolution for the
+                    # full statement time, for a read that only decorates.
+                    _open_recovery_tasks = await asyncio.wait_for(
+                        list_open_recovery_tasks(merchant_id=_seed_merchant_id),
+                        timeout=0.5,
+                    )
+                except Exception:  # noqa: BLE001
+                    # Fail-soft: a link without a key is still attributable
+                    # through click_id -> commerce_interactions row, so this
+                    # costs a shortcut, never a sale.
+                    _open_recovery_tasks = []
+
             for v in matched_variants:
                 vid = _seed_offer_variant_id(v) or (sku_id or "∅")
                 offer_id = f"of:external_seed:{seed_id}:{vid}"
@@ -4358,11 +4628,169 @@ async def _handle_offers_resolve(
                 if isinstance(availability, str):
                     in_stock = availability.lower() not in {"out_of_stock", "outofstock", "sold_out"}
 
+                # RESOLVED ONCE and read twice — by the identity below and by the preflight
+                # gate under it. Two calls would count this hand-over twice in the coverage
+                # line and, worse, could answer differently if either input drifted.
+                #
+                # `offer_variant_id` is the variant this candidate IS, so a product with
+                # several live merchant-issued SKUs can still be named when the hand-over
+                # points at exactly one of them. `choose` requires string equality against a
+                # stored merchant-issued id — it will not rank candidates, and it refuses
+                # outright when the name matches none of them or more than one.
+                _handover = _handover_resolver.choose(
+                    product_key=_handover_product_key(row_dict, seed_data),
+                    product_id=row_dict.get("external_product_id"),
+                    seed_data=seed_data,
+                    offer_variant_id=_seed_offer_variant_id(v) or None,
+                    # NARROWER on purpose — see `_seed_variant_identity_claim`. A SKU may match
+                    # a candidate; it may not refuse one.
+                    named_variant_id=_seed_variant_identity_claim(v),
+                )
                 redirect_identity = _external_seed_redirect_identity(
                     row=row_dict,
                     seed_data=seed_data,
                     offer_variant_id=_seed_offer_variant_id(v) or None,
+                    handover=_handover,
                 )
+                # PREFLIGHT — wherever we can NAME the variant, and ONCE per distinct question.
+                #
+                # #2151 MOVED THIS GATE OFF `cart_variant_id`, and the move is the point of the
+                # change, so read why. `cart_variant_id` is the intersection of two independent
+                # facts: we can name the merchant's variant, AND the storefront is one we can
+                # build a Shopify cart permalink on. The second fact is stored on 0 of 11,834
+                # active seeds (`snapshot.storefront_platform`, measured on prod 2026-09-08),
+                # so keying the gate on the intersection kept the shadow report's denominator
+                # empty even for the 3,871 seeds whose variant we CAN now name. The question
+                # the preflight asks the merchant — "does this variant still exist, is it in
+                # stock" — needs only the first fact. So it is asked on the resolved hand-over
+                # id, and the cart, which needs both, is still decided by
+                # `resolve_cart_permalink` and nothing else.
+                #
+                # A first cut asked about `cart_variant_id or vid`, which reintroduced exactly
+                # the fallback the ROUND-5 CORRECTION below forbids: `vid` comes from
+                # _seed_offer_variant_id (variant_id | variantId | sku | sku_id | id), and a
+                # plain numeric SKU satisfies extract_shopify_numeric_variant_id by design. On
+                # referral-only offers — the majority — it asked about a number Shopify never
+                # issued, got `variant_absent`, and would have refused live referral links.
+                # `_handover_id` is NOT that: it is only ever a `catalog_skus` id the classifier
+                # placed as merchant-issued, or a storefront-stamped one. Passing
+                # variant_id=None does not fix it either: `_check_one` answers
+                # `ambiguous_variant` on any multi-variant product, the same false refusal
+                # under another name.
+                #
+                # A REFUSAL DEGRADES THE RAIL, IT DOES NOT DELETE THE OFFER. The merchant
+                # telling us this variant is gone is evidence about the CART PREFILL, not
+                # about the product page — dropping the row would hide a still-reachable PDP
+                # and silently shrink results, which is the "gate that deletes supply" shape
+                # this repo has been bitten by. So the offer ships as an honest referral. Where
+                # there was no cart to begin with, a refusal changes nothing at all, which is
+                # why the added population brings no new way to refuse supply.
+                #
+                # THE GATE'S POPULATION IS A UNION, NOT A REPLACEMENT. Round 3 of review found
+                # the first cut keying it on `_handover_id` ALONE, which is a SWAP: the two
+                # values are not nested. An attach-lane seed with an operator-typed
+                # `attached_variant_id` and no merchant-issued `catalog_skus` row — 67.1% of the
+                # corpus has no such row — still builds a real Shopify cart from
+                # `_catalog_vid or _operator_vid`, and that cart stopped being gated at all.
+                # Under `enforce` the merchant saying "that variant is gone" no longer withdrew
+                # it, which is a safety REGRESSION against the merge base, on the one cohort
+                # that ships prefilled carts today. The union restores it and keeps the
+                # widening.
+                _handover_id = _handover.variant_id if _handover is not None else None
+                _cart_vid = redirect_identity.get("cart_variant_id")
+                # The id the gate asks about: the resolved one when we have it, otherwise the
+                # one the buyer would actually be handed. Never both, never None while a cart
+                # exists.
+                #
+                # The `or` half can be a value this module would NOT call identity — the attach
+                # branch ships `extract_shopify_numeric_variant_id(attached_variant_id)`, which
+                # accepts any digit string, when catalog says nothing. That is deliberate and it
+                # costs no merchant request: `checkout_preflight.preflight` classifies the id
+                # FIRST and answers `BLOCK / no_merchant_issued_variant_id` before any egress.
+                # So under `enforce` a cart built from a number Shopify never issued is
+                # withdrawn without asking anyone, which is exactly the right outcome and is the
+                # behaviour the merge base already had.
+                _gate_vid = _handover_id or _cart_vid
+                # `candidates` is every seed offer considered; `gated` is the subset the gate
+                # applies to. Coverage MUST be measured against the second: dividing by the
+                # first mixes in offers the gate is blind to by design — the majority — so a
+                # request the gate covered 6-of-6 reported 0.333 and a referral-only one
+                # reported 0.000. Week one of shadow would have read "the gate covers almost
+                # nothing", which is a statement about the denominator. `cart_prefilled` is
+                # kept as its own counter because it is a different question (how many
+                # hand-overs actually got a cart) and folding the two lost it.
+                _preflight_stats["candidates"] += 1
+                # `is_enabled()` here, not only inside the helper. The helper short-circuits so
+                # no request is spent when off — but the COUNTERS still moved, so an off
+                # request attached coverage fields describing work nobody did.
+                if _gate_vid and checkout_preflight.is_enabled():
+                    _preflight_stats["gated"] += 1
+                    _q = (str(canonical_url or destination_url), str(_gate_vid))
+                    if _q in _preflight_memo:
+                        _preflight_stats["memo_hits"] += 1
+                        _allowed = _preflight_memo[_q]
+                    elif _preflight_budget.available():
+                        _preflight_budget.spend()
+                        _preflight_stats["asked"] += 1
+                        _allowed = await _preflight_allows_external_offer({
+                            "offer_id": offer_id,
+                            "product_key": row_dict.get("attached_product_key") or None,
+                            "source_product_id": row_dict.get("external_product_id") or None,
+                            "sku_key": sku_id or None,
+                            "merchant_id": redirect_identity["merchant_id"],
+                            "currency": currency,
+                            "merchant_effective_price": price_amount,
+                            "suppressed_at": row_dict.get("suppressed_at"),
+                            "suppression_reason": row_dict.get("suppression_reason"),
+                            # The SAME url the redirect is about to be built from, so the
+                            # preflight verifies the claim we are actually publishing.
+                            # The SAME id the gate keyed on, which is the id we would hand a
+                            # buyer. Passing only `_cart_vid` would ask about None on every
+                            # storefront we cannot build a cart for — and `_check_one` answers
+                            # `ambiguous_variant` to that, a refusal about nothing. Passing only
+                            # `_handover_id` skipped the attach-lane cart entirely (round 3).
+                            "execution_spec": {
+                                "pdp_url": str(canonical_url or destination_url),
+                                "variant_id": _gate_vid,
+                            },
+                            "source": {
+                                "seed_data": seed_data,
+                                "canonical_url": canonical_url,
+                                "destination_url": destination_url,
+                            },
+                        })
+                        _preflight_memo[_q] = _allowed
+                    else:
+                        # Budget exhausted. #2151 DECIDED THIS EXPLICITLY, and the decision is
+                        # FAIL CLOSED: exhausting the budget is "we could not ask the
+                        # merchant", which is precisely `unverifiable`, and
+                        # `checkout_preflight`'s whole contract is that under `enforce` an
+                        # unverifiable answer refuses. The previous unconditional `True` was a
+                        # fail-open that the mode could not override, so an operator who had
+                        # armed enforcement still shipped unverified carts on any request wide
+                        # enough to run out of budget.
+                        #
+                        # It is MODE-RESPECTING rather than a hard False, because a hard False
+                        # would make `shadow` change what the buyer is handed, and shadow's
+                        # one guarantee is that it never does. This is the same rule
+                        # `_preflight_allows_external_offer` already applies to an exception,
+                        # which is the other way of not getting an answer.
+                        _preflight_stats["skipped_by_budget"] += 1
+                        _allowed = (
+                            checkout_preflight.mode() != checkout_preflight.MODE_ENFORCE
+                        )
+                    if not _allowed:
+                        _preflight_stats["degraded_to_referral"] += 1
+                        redirect_identity = dict(redirect_identity)
+                        redirect_identity["cart_variant_id"] = None
+
+                # COUNTED AFTER THE GATE, not before it. Its comment defines it as "how many
+                # hand-overs actually got a cart"; counted at `_cart_vid` above it also counted
+                # the ones this very request then withdrew, so the number contradicted its own
+                # definition by exactly `degraded_to_referral`.
+                if redirect_identity.get("cart_variant_id"):
+                    _preflight_stats["cart_prefilled"] += 1
+
                 # T2-12: mint the join key HERE, not inside the builder, and hand the same one
                 # to both. The id has to be identical on the surface_click_events row, on the
                 # merchant's order, and on the `cart_url` / `pdp_url` we publish below — if the
@@ -4371,6 +4799,7 @@ async def _handle_offers_resolve(
                 stable_click_id = new_click_id()
                 redirect_url = await _make_external_redirect_url(
                     market=used_market,
+                    market_observed=market_is_observed(row_dict.get("market"), market_hint),
                     tool=used_tool,
                     destination_url=str(canonical_url or destination_url),
                     utm_template=row_dict.get("utm_template") or seed_data.get("utm_template"),
@@ -4391,6 +4820,7 @@ async def _handle_offers_resolve(
                     platform=redirect_identity["platform"],
                     seller_ref=redirect_identity["seller_ref"],
                     seed_kind=redirect_identity["seed_kind"],
+                    issued_clicks=_issued_clicks,
                 )
                 if not redirect_url:
                     continue
@@ -4398,6 +4828,17 @@ async def _handle_offers_resolve(
                 # EXECUTION SPEC v0. Composed by the SAME function the redirect itself used, with
                 # the SAME click id, so `cart_url` cannot describe a different destination from
                 # the one `affiliate_url` resolves to.
+                # Which recovery action, if any, this destination belongs
+                # to — so an order following this link is attributable to the
+                # fix that produced it, not merely to a click. Pure match over
+                # the list fetched once above.
+                _recovery_key = match_recovery_key(
+                    _open_recovery_tasks,
+                    product_key=str(row_dict.get("attached_product_key") or "")
+                    or None,
+                    target_host=_seed_shop_domain,
+                )
+
                 composed_spec = compose_attributed_destinations(
                     # The SAME value the builder above was called with (`canonical_url or
                     # destination_url`), not the raw column — _seed_domain_from_url reads the
@@ -4410,6 +4851,7 @@ async def _handle_offers_resolve(
                     platform=redirect_identity.get("platform"),
                     cart_variant_id=redirect_identity.get("cart_variant_id"),
                     click_id=stable_click_id,
+                    recovery_key=_recovery_key,
                 )
                 # ONE decision, read twice. `cart_prefilled` and `execution_spec.rail` answer the
                 # same question — what does following our link land the buyer in — so computing
@@ -4525,9 +4967,39 @@ async def _handle_offers_resolve(
                     )
                 )
 
+                # The SELLER'S IDENTITY, not ours. A seed has no `catalog_merchants` row, so
+                # its merchant is the destination host — rovectin.com, stylekorean.com.
+                #
+                # ⚠️ THE TWO LANES DO NOT AGREE ON THE IDENTIFIER, and an earlier version of this
+                # comment claimed they did. The catalog_offers arm DEDUPES on host but sets
+                # `merchant_id` from `catalog_offers.merchant_id` joined to `catalog_merchants` —
+                # a real merchant id. So one list can carry ids from two namespaces. They agree
+                # on the dedupe KEY, not on the identifier, and `_offers_scope_or_none` is what
+                # stops the difference hurting a caller who echoes one back.
+                #
+                # `external_seed` would still be wrong here: every seed would collapse to one
+                # merchant and destroy the comparison this list exists for. (An earlier comment
+                # cited src/server.js:1998 as the gateway substituting a host label for that id —
+                # that is the PDP `resolveOfferSellerName` path, not `offerToSignal`, which does
+                # no substitution at all. The conclusion holds; the citation did not.)
+                # `normalize_shop_host`, and the SAME url the link resolves to — both
+                # deliberately, and both were wrong in the first cut. A bare `.strip().lower()`
+                # ships `merchant_id: "https://x.com/"` beside `merchant_domain: "x.com"` for
+                # any seed whose `domain` column holds a URL; and `_seed_domain_from_url` on the
+                # RAW `destination_url` names a host the buyer never lands on whenever a
+                # `canonical_url` overrides it — which the two comments above this block already
+                # warn about in those exact words. This matches `merchant_domain` at :4729.
+                seed_merchant_id = (
+                    normalize_shop_host(row_dict.get("domain") or seed_data.get("domain"))
+                    or _seed_domain_from_url(str(canonical_url or destination_url))
+                    or None
+                )
                 external_offers.append(
                     {
                         "offer_id": offer_id,
+                        # Both spellings — see the note in `_build_internal_offer_summary`.
+                        "merchant_id": seed_merchant_id,
+                        "merchant_name": seller or None,
                         "seller": seller,
                         "price": price_amount,
                         "currency": currency,
@@ -4598,6 +5070,8 @@ async def _handle_offers_resolve(
 
     # 1) External offers from external seeds (affiliate outbound)
     external_offers: List[Dict[str, Any]] = []
+    # ADR-025 D1: every click id handed out below, recorded in ONE write after this section.
+    _issued_clicks: List[IssuedClick] = []
     external_started = time.perf_counter()
     try:
         # Fuzzy (external_product_id/title/url LIKE) is the default label; the
@@ -5362,17 +5836,323 @@ async def _handle_offers_resolve(
                 query="external_seed_by_internal_identity",
             )
 
+    # CATALOG OFFERS — the third source, and the one that holds the retailer competition.
+    #
+    # WHAT WAS DARK. This handler sources internal offers from `products_cache` and external
+    # offers from `external_product_seeds`, and reads `catalog_offers` nowhere. Measured in prod
+    # 2026-09-06: `catalog_offers` held 13,151 priced offers over 137 merchants — 1,246 of them
+    # `offer_type='retailer'` across 14 retailers, on 729 products with more than one seller — and
+    # `get_offers` returned a retailer for exactly none of them. `products_cache` had 24 unexpired
+    # rows against 15,419 catalog products, so the internal path can resolve ~0.2% of the index and
+    # the seed path only reaches products that were mirrored from a seed. Everything the
+    # `attach_retailer_offer.py` lane has ever written was invisible to an agent.
+    #
+    # WHY HERE AND WHY GATED. Only when nothing else resolved. That is deliberate and it is what
+    # makes this safe to ship: it cannot reorder, dedupe against, or otherwise change ANY response
+    # that is non-empty today. The seed lane already emits the brand-direct destination for
+    # mirrored products, and merging the two sources needs a destination-host dedupe that is its
+    # own change.
+    #
+    # IDENTITY. The catalog already carries the identity the agent actually holds —
+    # `search_catalog` hands out `pivota_signature_id`, and `resolved_target` is built ONLY from a
+    # `products_cache` row (it stays None on every external-only answer by contract), so a catalog
+    # match must not try to populate it. It reports itself through `mapping.candidates` and
+    # `metadata.sources` instead, and ships `purchase_route="affiliate_outbound"` so the
+    # reconciliation below lands on `external_only` — no new `resolution_mode` literal, which
+    # tests/test_offers_resolve.py::test_every_resolution_mode_assignment_is_in_the_vocabulary
+    # AST-walks this function to forbid.
+    #
+    # DESTINATION, not the view. `agent_pdp_view.offers` looks like the obvious source and is the
+    # wrong one: its `url` comes from a per-merchant map built only from `catalog_products` rows in
+    # the content_key cluster, and a retailer owns no product row — so the view carries `url: None`
+    # for precisely the offers worth showing. `catalog_offers` has the real destination, written by
+    # the attach lane into `offer_payload->>'destination_url'` with `source_ref` as its twin.
+    #
+    # SHAPE. `offerToSignal` in the gateway reads TOP-LEVEL `merchant_id` / `merchant_name` /
+    # `availability` / `url`; the other two lanes here emit `seller` / `in_stock` /
+    # `source.merchant_id`, so their offers reach an agent unable to name the merchant. This arm
+    # emits both spellings. Fixing the other two lanes is a separate change and is why an offer
+    # here carries `seller` as well.
+    # UNGATED, and deduped on destination host.
+    #
+    # The first cut of this arm ran only when nothing else resolved, which made it safe to ship
+    # and nearly inert: measured 2026-09-06, 1,124 products carry an unsuppressed retailer offer
+    # and 1,110 of them are ALSO seeded, so the gate left it serving about 14. The competition
+    # worth showing — a StyleKorean price beside the brand's own — lives on exactly the products
+    # the gate excluded.
+    #
+    # WHAT THE DEDUPE IS FOR, and what it must NOT eat. `external_offer_dual_write` writes some
+    # destinations into both stores, so the same retailer can arrive twice: measured over 400
+    # product/offer/seed triples, 19 shared a destination host. The other 381 are the case we are
+    # here for — offer host `stylekorean.com` beside seed host `rovectin.com` is two real sellers,
+    # not a duplicate. So the key is the DESTINATION HOST, not the product: same host means we
+    # would send the buyer to the same place twice.
+    catalog_started = time.perf_counter()
+    try:
+        ident_aliases = [a for a in (product_id_aliases + sku_id_aliases) if a]
+        catalog_rows = []
+        if ident_aliases:
+            catalog_rows = await asyncio.wait_for(
+                database.fetch_all(
+                    """
+                    SELECT o.offer_id, o.product_key, o.merchant_id, o.currency,
+                           o.availability, o.offer_type, o.is_first_party, o.readiness_tier,
+                           o.price_confidence, o.updated_at,
+                           coalesce(o.merchant_effective_price, o.estimated_best_price,
+                                    o.list_price) AS price_amount,
+                           coalesce(o.offer_payload->>'destination_url', o.source_ref)
+                               AS destination_url,
+                           m.merchant_name AS merchant_name,
+                           p.content_key AS content_key
+                      FROM catalog_products p
+                      JOIN catalog_offers o ON o.product_key = p.product_key
+                      LEFT JOIN catalog_merchants m ON m.merchant_id = o.merchant_id
+                     WHERE p.product_key IN (
+                           SELECT d.product_key FROM catalog_products d
+                            WHERE d.pivota_signature_id = ANY(:aliases)
+                               OR d.content_key = ANY(:aliases)
+                               OR d.product_key = ANY(:aliases)
+                           -- SIBLING LISTINGS. A listing id (its product_key or signature)
+                           -- widens to every listing sharing its content_key, so asking by
+                           -- ANY seller's listing returns every seller of the product — the
+                           -- same set a `ck_` id already returns. Without this the second
+                           -- retailer is reachable only by a content_key that search, the PDP
+                           -- and this door never hand out: measured 2026-09-17 on the Pyunkang
+                           -- Yul canary, get_offers(listing) = 1 seller, get_offers(ck_) = 2.
+                           -- The anchor must itself be live: a withdrawn listing id answers
+                           -- nothing, exactly as it did before this widening.
+                           UNION
+                           SELECT s.product_key
+                             FROM catalog_products a
+                             JOIN catalog_products s ON s.content_key = a.content_key
+                            WHERE (a.pivota_signature_id = ANY(:aliases)
+                                   OR a.product_key = ANY(:aliases))
+                              AND a.content_key IS NOT NULL
+                              AND a.suppressed_at IS NULL
+                              AND a.suppression_reason IS NULL)
+                       -- The PRODUCT's own suppression, not just the offer's. Every serving
+                       -- read in services/pivot_query_service.py applies this pair, and
+                       -- scripts/withdraw_catalog_rows.py takes a product down by setting
+                       -- exactly these — so without it a withdrawn product still ships its
+                       -- retailer offer here, and the takedown silently misses this lane.
+                       AND p.suppressed_at IS NULL
+                       AND p.suppression_reason IS NULL
+                       -- Market, mirroring the seed lane at the attached-ref query above.
+                       -- Latent today (the gateway sends no market and the retailer ingest
+                       -- writes 'US'), and live the moment a caller passes market=KR.
+                       AND (CAST(:market AS TEXT) IS NULL OR o.market = CAST(:market AS TEXT))
+                       AND o.offer_type = 'retailer'
+                       AND o.offer_mode = 'redirect'
+                       AND o.suppressed_at IS NULL
+                       AND coalesce(o.merchant_effective_price, o.estimated_best_price,
+                                    o.list_price) > 0
+                       AND coalesce(o.offer_payload->>'destination_url', o.source_ref)
+                           IS NOT NULL
+                     -- IN STOCK FIRST, then price, and BEFORE the LIMIT. Price alone put
+                     -- eyurs.com $13 out_of_stock ahead of sokoglam.com $19.50 in_stock (prod,
+                     -- 2026-09-18), and because the LIMIT cuts this list it could also drop
+                     -- the only in-stock seller for cheaper ones that cannot sell — measured
+                     -- the same day on 6 content_keys at limit 1 or 2. Unknown ranks with in
+                     -- stock: see OFFER_UNAVAILABLE_AVAILABILITIES, which this binds, so the
+                     -- order matches the `in_stock` flag computed below. `offer_id` makes a
+                     -- price tie cut the same way every time.
+                     -- The btrim set is the common ASCII whitespace (space, tab, newline,
+                     -- CR, FF, VT), so a tab- or newline-padded value sorts the way its flag
+                     -- reads. Python's .strip() also removes 0x1C-0x1F and Unicode spaces
+                     -- (NBSP); a value padded with those would still sort as sellable while
+                     -- flagged not — no live row is (only in_stock/out_of_stock, 2026-09-18).
+                     ORDER BY (lower(btrim(coalesce(o.availability, ''),
+                                           E' \t\n\r\f\v'))
+                               = ANY(:unavailable)) ASC,
+                              price_amount ASC,
+                              o.offer_id ASC
+                     LIMIT :limit
+                    """,
+                    {"aliases": ident_aliases, "limit": max(limit, 1),
+                     "market": market_hint,
+                     "unavailable": sorted(OFFER_UNAVAILABLE_AVAILABILITIES)},
+                ),
+                timeout=min(OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS, 1.0),
+            )
+
+        # Hosts the seed lane already claimed. Read from `source`, which carries the raw
+        # destination — `affiliate_url` is a signed /r link and every one of them shares OUR
+        # host, so comparing those would collapse every offer into one.
+        #
+        # THREE KEYS ON PURPOSE, and they are redundant on a row that has all three: a seed
+        # may carry `domain` without a usable url, or a url without `domain`. Removing either
+        # source alone leaves the dedupe working (neither mutant dies); removing BOTH lets a
+        # duplicate through. Noted because one of them otherwise reads as dead code.
+        seen_hosts = set()
+        for prior in external_offers:
+            src = prior.get("source") or {}
+            for key in ("canonical_url", "destination_url"):
+                h = _offer_destination_host(src.get(key))
+                if h:
+                    seen_hosts.add(h)
+            domain_host = _offer_destination_host(f"https://{src.get('domain')}"
+                                                  if src.get("domain") else None)
+            if domain_host:
+                seen_hosts.add(domain_host)
+
+        unattributed = 0
+        deduped = 0
+        for row in catalog_rows or []:
+            r = dict(row)
+            destination = str(r.get("destination_url") or "").strip()
+            if not destination.startswith(("http://", "https://")):
+                continue
+            dest_host = _offer_destination_host(destination)
+            if dest_host and dest_host in seen_hosts:
+                deduped += 1
+                continue
+            if dest_host:
+                seen_hosts.add(dest_host)
+            offer_merchant = str(r.get("merchant_id") or "").strip() or None
+
+            # ATTRIBUTED when we can, VISIBLE either way. The outbound allowlist is empty in
+            # every market today (measured 2026-09-06), and an empty allowlist means allow-all
+            # — so this should mint a signed /r link. If it ever cannot, the offer still ships
+            # with its plain destination and the shortfall is COUNTED into the source entry,
+            # because the failure this system keeps producing is a silent zero that reads as
+            # "nothing matched".
+            redirect_url = await _make_external_redirect_url(
+                market=market_hint or "US",
+                market_observed=market_is_observed(market_hint),
+                tool=tool_hint or "offers.resolve",
+                destination_url=destination,
+                utm_template=None,
+                ctx={
+                    "eventType": "outbound_opened",
+                    "source": "offers.resolve.catalog_offer",
+                    "offerId": str(r.get("offer_id") or ""),
+                    **({"productId": product_id} if product_id else {}),
+                },
+                merchant_id=offer_merchant,
+                product_id=str(r.get("product_key") or "") or None,
+                variant_id=None,
+                # The retailer's own page, never a Shopify cart permalink: this lane has no
+                # merchant-issued variant id it could justify, and the parameter has no default
+                # precisely so a caller must say so explicitly.
+                cart_variant_id=None,
+                seller_ref=offer_merchant,
+                seed_kind="retailer_offer",
+                issued_clicks=_issued_clicks,
+            )
+            if not redirect_url:
+                unattributed += 1
+
+            availability = str(r.get("availability") or "").strip() or None
+            price_amount = r.get("price_amount")
+            external_offers.append(
+                {
+                    "offer_id": f"of:catalog_offer:{r.get('offer_id')}",
+                    # Both spellings — see SHAPE above.
+                    "merchant_id": offer_merchant,
+                    "merchant_name": str(r.get("merchant_name") or "").strip() or offer_merchant,
+                    "seller": str(r.get("merchant_name") or "").strip() or offer_merchant,
+                    "price": float(price_amount) if price_amount is not None else None,
+                    "currency": str(r.get("currency") or "USD").strip() or "USD",
+                    "availability": availability,
+                    "in_stock": not availability_is_known_unavailable(availability),
+                    "url": destination,
+                    "purchase_route": "affiliate_outbound",
+                    # NEVER the raw destination under this key. `affiliate_url` MEANS an
+                    # attributed `/r` link: the gateway's sanitizer only passes it verbatim
+                    # when it matches the signed-token shape, and everything else goes
+                    # through the normal scrub — so an unsigned value here is both a
+                    # mislabel and liable to be rewritten. `_make_external_redirect_url`
+                    # declines for exactly one reachable reason, an allowlist refusal, and
+                    # that is a serving decision: the offer stays visible under `url`, the
+                    # signed key stays honest at None, and the shortfall is counted.
+                    "affiliate_url": redirect_url,
+                    # UNKNOWN, stated as such. A retailer destination is a product page as far
+                    # as we know; `null` is the vocabulary's "we do not know", and claiming
+                    # `false` would license an agent to tell a buyer what they will land on.
+                    "cart_prefilled": None,
+                    "internal_checkout_items": None,
+                    # PRODUCT grain, like the seed lane's own 0.8. The identity match is
+                    # exact, but a retailer offer names a product page, not a variant — and
+                    # 1.0 is what this handler reserves for a SKU-level match. Claiming it
+                    # here would outrank a seed offer that really did match a variant.
+                    "confidence": 0.8,
+                    **({"price_confidence": r.get("price_confidence")}
+                       if r.get("price_confidence") is not None else {}),
+                    **({"updated_at": r.get("updated_at")}
+                       if r.get("updated_at") is not None else {}),
+                    "source": {
+                        "type": "catalog_offer",
+                        "offer_id": str(r.get("offer_id") or ""),
+                        "product_key": str(r.get("product_key") or ""),
+                        "content_key": str(r.get("content_key") or ""),
+                        "merchant_id": offer_merchant,
+                        # `live_offer_verification._target` reads
+                        # `source.canonical_url or source.destination_url`; without one of
+                        # them every offer from this arm is UNVERIFIED "no_verifiable_url".
+                        "destination_url": destination,
+                        "offer_type": str(r.get("offer_type") or ""),
+                        "is_first_party": bool(r.get("is_first_party")),
+                        "readiness_tier": str(r.get("readiness_tier") or ""),
+                    },
+                }
+            )
+            if catalog_rows:
+                mapping_candidates.append(
+                    _conf(
+                        "catalog_offer",
+                        0.8,
+                        "matched_canonical_identity",
+                        {"product_key": str(r.get("product_key") or "")},
+                    )
+                )
+
+        _record_source(
+            source="catalog_offers",
+            status="ok" if catalog_rows else "empty",
+            reason_code="ok" if catalog_rows else "no_candidates",
+            source_started=catalog_started,
+            row_count=len(catalog_rows or []),
+            query="catalog_offers_by_canonical_identity",
+            # `row_count` is what the QUERY found; `emitted` is what this arm actually
+            # appended. Reporting only the former let a fully-truncated arm read as
+            # "ok, row_count=1" while the buyer saw nothing from it.
+            extra={k: v for k, v in
+                   (("unattributed", unattributed), ("deduped", deduped),
+                    ("emitted", len(catalog_rows or []) - deduped)) if v} or None,
+        )
+    except Exception as e:
+        logger.info("offers.resolve.catalog_offers.failed", extra={"error": str(e)})
+        _record_source(
+            source="catalog_offers",
+            status="error",
+            reason_code=_classify_db_reason_code(e),
+            source_started=catalog_started,
+            error=type(e).__name__,
+            query="catalog_offers_by_canonical_identity",
+        )
+
     # T2-4 (decision #3 — index neutrality): rank internal (buy-here) and external (referred)
     # offers MERIT-FIRST in one list, never by integration status (was: internal-first block).
     offers = _rank_offers_merit_first(internal_offers + external_offers)
-    offers = offers[:limit]
+    # HOST-DIVERSE, not merely top-N — see _host_diverse_head. A plain [:limit] lets one seller's
+    # variant fan-out truncate away every competing merchant, which is the one thing this op is for.
+    offers = _host_diverse_head(offers, limit)
 
     # LIVE VERIFICATION (audit item 6). Ranking decides WHICH offers we would hand over; this
     # decides whether the top few are still true. It runs AFTER the truncation on purpose — the
     # 1.5s budget is per turn, so verifying anything the caller will not see spends it for nothing.
     #
-    # Default OFF. Arming it adds request-path egress to third parties on the shared crawl NAT IP,
-    # which is exactly the traffic the dedicated crawl subnet exists to isolate.
+    # Default OFF, and DOUBLY so since review: this comment used to say the egress went out "on
+    # the shared crawl NAT IP", which was the reverse of the truth and read as an all-clear. This
+    # code runs in `web`, `web` is on the `default` subnet, and that subnet's NAT holds
+    # 8.231.167.230 — the address payment partners allowlist. `_host_diverse_head` above
+    # guarantees the offers are on DISTINCT hosts, and each one costs a robots.txt plus a
+    # /meta.json, so arming this alone put the exact ~50-requests-over-37-Cloudflare-domains
+    # pattern that trips a 15-minute IP-level block onto the payment address.
+    #
+    # So `verify_offers` is now fenced by default too: `LIVE_OFFER_VERIFICATION_ENABLED` turns the
+    # lane on, and `LIVE_OFFER_VERIFICATION_ALLOW_REQUEST_PATH_EGRESS` is what lets it leave the
+    # process. Both are needed, deliberately.
     #
     # Failure here must never cost the turn: a verifier that raised would turn the 31.1%
     # wrong-spec problem into a 100% no-answer problem, which is strictly worse.
@@ -5382,6 +6162,15 @@ async def _handle_offers_resolve(
             offers = live_offer_verification.apply_verdicts(offers, verdicts)
         except Exception as exc:  # noqa: BLE001
             logger.warning("live offer verification failed; serving unverified: %s", exc)
+
+    # ADR-025 D1: record the click ids of the links this response ACTUALLY hands out, with the
+    # agent they were issued to. Here, after every lane (including the retry lanes and the
+    # catalog arm) and after ranking, the `limit` cut and live verification, so a link that was
+    # minted and then dropped is never recorded as issued.
+    # FAIL OPEN: a failed write is logged and the links are served anyway; losing a click record
+    # must never take down search. `/r` still records a click on a link whose issue was lost (as
+    # a legacy row, issued_at NULL), so the funnel under-counts issues, never clicks.
+    await _issue_served_clicks(_issued_clicks, offers, caller_api_key, caller_assertion)
 
     # RECONCILE resolution_mode AGAINST WHAT ACTUALLY SHIPS. Everything above describes
     # what we RESOLVED; `offers` is what the caller RECEIVES, and the two diverge twice:
@@ -5514,8 +6303,28 @@ async def _handle_offers_resolve(
         reason = "no_candidates"
     latency_ms = int((time.perf_counter() - started) * 1000)
 
+    _coverage = preflight_coverage_fields(_preflight_stats)
+    # The values ride in the MESSAGE as well as in `extra`: no formatter in this repo renders
+    # `extra`, so a record carrying them only there prints as the bare string
+    # "offers.resolve.summary". See preflight_coverage_fields' NOTE ON OBSERVABILITY.
+    # #2151: the hand-over counters are emitted whether or not the preflight ran, and
+    # whether or not anything resolved. They are the answer to "why is the preflight
+    # denominator what it is", and on a corpus where most seeds have no merchant-issued
+    # identity at all, the REFUSAL counts are the informative half.
+    _handover_fields = handover_coverage_fields(_handover_resolver.stats)
+    _summary_msg = "offers.resolve.summary" + (
+        " preflight mode=%s gated=%d carts_built=%d asked=%d memo_hits=%d"
+        " skipped_by_budget=%d degraded_to_referral=%d answered_fraction=%.3f" % (
+            _coverage["preflight_mode"], _coverage["preflight_gated"],
+            _coverage["preflight_carts_built"],
+            _coverage["preflight_asked"], _coverage["preflight_memo_hits"],
+            _coverage["preflight_skipped_by_budget"],
+            _coverage["preflight_degraded_to_referral"],
+            _coverage["preflight_answered_fraction"],
+        ) if _coverage else ""
+    ) + handover_coverage_message(_handover_fields)
     logger.info(
-        "offers.resolve.summary",
+        _summary_msg,
         extra={
             "event": "offers.resolve.summary",
             "product_id": product_id,
@@ -5527,6 +6336,11 @@ async def _handle_offers_resolve(
             "latency_ms": latency_ms,
             "sources": source_status,
             "canonical_ref": canonical_ref,
+            # READ the counters. Without this they are increments with no reads — the round-3
+            # finding. Folded into THIS record rather than a second line so coverage carries
+            # the request's identity, mode and latency alongside it.
+            **_coverage,
+            **_handover_fields,
         },
     )
 
@@ -6106,6 +6920,11 @@ async def _attach_connected_product_redirects(
             else:
                 redirect_url = await _make_external_redirect_url(
                     market=used_market,
+                    # `_attach_connected_product_redirects` is called by every caller today
+                    # WITHOUT a market, so `used_market` is the "US" default. Threaded from
+                    # the parameter anyway, so a caller that starts naming one is observed
+                    # without a second change here.
+                    market_observed=market_is_observed(market),
                     tool=used_tool,
                     destination_url=dest,
                     utm_template=None,
@@ -7099,6 +7918,11 @@ async def _handle_find_products_multi_via_pivot(
     # candidate set that never contained a single row of that brand.
     brand_anchor_terms, brand_anchor_source = await _resolve_brand_anchor_terms(query)
 
+    # Resolved once, and the SAME value is both recorded and handed to recall, so the record is
+    # what recall received rather than a second derivation of it (services/market_telemetry.py).
+    pivot_market = _pivot_market_from_payload(payload, request_metadata)
+    market_telemetry.observe_resolved(request_metadata, pivot_market)
+
     pivot_result = await search_pivot_catalog(
         PivotQueryRequest(
             query=query,
@@ -7107,7 +7931,7 @@ async def _handle_find_products_multi_via_pivot(
             # the exact opposite, and contradict the contract the field documents.
             brand_anchor_terms=brand_anchor_terms,
             merchant_id=None,
-            market=_pivot_market_from_payload(payload, request_metadata),
+            market=pivot_market,
             limit=raw_limit,
             include_external=(
                 False if canonical_sig_mode else PIVOT_MULTI_SERVE_INCLUDE_EXTERNAL
@@ -7475,7 +8299,15 @@ def _normalize_seed_variants(seed_data: Dict[str, Any]) -> List[Dict[str, Any]]:
                 },
                 "availability": v.get("availability"),
                 "image_url": v.get("image_url") or v.get("image"),
-                "options": v.get("options") or {},
+                # Either stored shape -> the {name: value} mapping THIS lane has
+                # always emitted. The field was a raw passthrough of a column
+                # only ever written as a mapping, and the enrichment lane now
+                # writes a list of pairs into it. Normalising here keeps this
+                # lane's own output shape unchanged, which is the conservative
+                # choice: flipping a public field's type as a side effect of a
+                # writer-side change is not something to do on the strength of
+                # having traced the consumers we happened to look at.
+                "options": seed_variant_options_as_mapping(v.get("options")),
             }
         )
         if len(variants) >= 30:
@@ -7498,6 +8330,64 @@ def _seed_domain_from_url(url: Optional[str]) -> str:
     if ":" in host:
         host = host.split(":")[0]
     return host.lower()
+
+
+def _offer_destination_host(url: Optional[str]) -> str:
+    """The host two offers must share to be the SAME destination, for dedupe.
+
+    Deliberately not `_format_domain_display_name`, which returns a human label
+    ("Ulta Official Site"), and deliberately stripping only `www.`: collapsing
+    `shop.` or `store.` too would merge storefronts that can genuinely differ,
+    and over-merging here DROPS a real competing offer, which is the worse error.
+    """
+    host = _seed_domain_from_url(url)
+    return host[4:] if host.startswith("www.") else host
+
+
+def _host_diverse_head(offers: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+    """Truncate to `limit` while keeping one offer per DESTINATION HOST at the front.
+
+    WHY. This op exists to show cross-merchant competition, and a plain `[:limit]` destroys exactly
+    that. With no `sku_id` the seed lane fans out one offer PER VARIANT — up to `min(12, limit)`
+    of them, all to the same host and all at the same confidence as a catalog retailer offer.
+    Stable sort plus seeds-appended-first means a ten-shade lipstick ships ten links to ONE seller
+    and truncates the competing retailer away. Measured against the real route: 10 variants at
+    limit=10 shipped 0 catalog offers; 3 variants at limit=3 the same. In prod that is 6 products
+    at limit=10, 50 at limit=3 and 98 at limit=2 — and the CALLER picks the limit.
+
+    The head takes the first offer of each distinct host in RANK order — never reordering within a
+    host, never promoting a worse offer above a better one from the same seller — then fills the
+    remaining slots in rank order. An offer whose host cannot be derived counts as its own host:
+    collapsing those would merge every internal offer, which names no destination at all, into a
+    single slot.
+    """
+    if limit <= 0 or len(offers) <= limit:
+        return offers[:limit]
+
+    seen: set = set()
+    head: List[Dict[str, Any]] = []
+    head_ids: set = set()
+    for idx, offer in enumerate(offers):
+        src = offer.get("source") or {}
+        host = _offer_destination_host(
+            offer.get("url") or src.get("canonical_url") or src.get("destination_url")
+        )
+        key = host or f"no-host-{idx}"
+        if key in seen:
+            continue
+        seen.add(key)
+        head.append(offer)
+        head_ids.add(id(offer))
+        if len(head) >= limit:
+            return head
+
+    for offer in offers:
+        if id(offer) in head_ids:
+            continue
+        head.append(offer)
+        if len(head) >= limit:
+            break
+    return head
 
 
 def _format_domain_display_name(domain: str) -> str:
@@ -7685,11 +8575,27 @@ def _build_external_seed_filter_product(
     )
 
 
+def _handover_product_key(row: Any, seed_data: Any) -> Optional[str]:
+    """The key the resolver looks up, read from the SAME two places the identity parse reads it.
+
+    `_external_seed_redirect_identity` takes `attached_product_key` from the row OR from
+    `seed_data`; the first cut of #2151 primed from the row only, so a seed carrying the key
+    solely inside its snapshot got a parsed merchant and platform but no catalog lookup at all —
+    a silent half-wiring that reads exactly like "this product has no identity".
+    """
+    row = row if isinstance(row, dict) else {}
+    seed_data = seed_data if isinstance(seed_data, dict) else {}
+    return str(
+        row.get("attached_product_key") or seed_data.get("attached_product_key") or ""
+    ).strip() or None
+
+
 def _external_seed_redirect_identity(
     *,
     row: Dict[str, Any],
     seed_data: Dict[str, Any],
     offer_variant_id: Optional[str] = None,
+    handover: Optional[HandoverVariant] = None,
 ) -> Dict[str, Optional[str]]:
     """Derive the attribution identity for an external-seed redirect.
 
@@ -7714,17 +8620,29 @@ def _external_seed_redirect_identity(
     # the pipe form is a never-persisted transport (Trap T1). The old parse only
     # handled pipe, so on every real (double-colon) seed merchant/platform/
     # product stayed None → surface_click_events.merchant_id NULL. Handle both.
+    # The BARE source product id, kept beside the full key. `variant_identity` compares a
+    # variant id against its parent with `startswith`, so the full `prod::m::platform::<spid>`
+    # key never matches a bare `<spid>` — passing the key twice, as the first cut of the attach
+    # branch did, is a parent pair that catches half of what it looks like it catches, which is
+    # exactly the defect round 2 added `Candidate.source_product_id` to fix in the resolver.
+    source_product_id: Optional[str] = None
     if attached_key.startswith("prod::"):
         parts = attached_key.split("::")
         if len(parts) >= 4:
             merchant_id = parts[1].strip() or None
             platform = parts[2].strip() or None
             canonical_product_id = attached_key
+            # Rejoined, because a source product id may itself contain the separator.
+            source_product_id = "::".join(parts[3:]).strip() or None
     elif attached_key.count("|") >= 2:
-        merchant_part, platform_part, _rest = attached_key.split("|", 2)
+        merchant_part, platform_part, rest = attached_key.split("|", 2)
         merchant_id = merchant_part.strip() or None
         platform = (platform_part.strip() or None)
         canonical_product_id = attached_key
+        source_product_id = rest.strip() or None
+    source_product_id = source_product_id or str(
+        row.get("external_product_id") or seed_data.get("external_product_id") or ""
+    ).strip() or None
 
     attached_variant_id = str(
         row.get("attached_variant_id") or seed_data.get("attached_variant_id") or ""
@@ -7810,9 +8728,22 @@ def _external_seed_redirect_identity(
         #
         # When the platform label is EVIDENCE-DERIVED, the stamped id is the only value we
         # have any evidence for, so it is used unconditionally or the permalink is declined.
-        # Stamped from the storefront's own /products/x.js — the only Shopify-issued id we
-        # have for a crawl seed. None when the product has more than one variant.
-        cart_variant_id = sole_stamped_variant_id(seed_data)
+        #
+        # #2151: the STAMP IS NOT THE ONLY EVIDENCE ANY MORE, and measured on prod
+        # 2026-09-08 it was never any evidence at all — `snapshot.variants[].shopify_variant_id`
+        # is present on 0 of 11,834 active seeds, because its producer
+        # (scripts/backfill_shopify_variant_ids.py) has never run at scale. The identity the
+        # 2026-09-08 backfill recovered lives in `catalog_skus.source_variant_id`, and
+        # `services/handover_variant_identity` resolves it there under the same refusals this
+        # branch has always applied (merchant-issued only, never a guess between candidates).
+        #
+        # `handover` is THE decision when a caller supplied one — it already contains the
+        # seed-stamp path as its own zero-candidate case, so there is no `or` here and no
+        # second decision-maker. A caller that did not wire a resolver keeps the previous
+        # behaviour byte for byte, which is what every pre-#2151 test asserts.
+        cart_variant_id = (
+            handover.variant_id if handover is not None else sole_stamped_variant_id(seed_data)
+        )
     elif platform == "shopify":
         # Writer-verified Shopify attachment. `attached_variant_id` is INTENDED to be catalog
         # identity (catalog_skus.source_variant_id), which for platform='shopify' is the
@@ -7823,9 +8754,49 @@ def _external_seed_redirect_identity(
         # variant_id/sku. So this is the one branch here whose input is operator-typed.
         # extract_shopify_numeric_variant_id bounds the damage to all-digit values, and the
         # branch is strictly narrower than the pre-round-5 behaviour it replaced — but if a
-        # wrong-cart report ever traces back here, this is why. The offer/SKU chain is
-        # deliberately NOT consulted.
-        cart_variant_id = extract_shopify_numeric_variant_id(attached_variant_id)
+        # wrong-cart report ever traces back here, this is why.
+        #
+        # #2151: the SKU chain is consulted now, and it is consulted FIRST. That is the
+        # opposite of what the sentence above used to say, and the reason is the sentence above
+        # it: this is the one branch whose input is operator-typed, with no catalog lookup
+        # behind it. A `catalog_skus` row that `services/variant_identity` calls MERCHANT_ISSUED
+        # is better provenance than a string somebody pasted into an attach form.
+        #
+        # THREE ANSWERS, and the middle one is the round-1 P1. The first cut let a lone catalog
+        # row win unconditionally: an operator had attached the $140 Standard, catalog held one
+        # merchant-issued row for the $95 Mini, and the buyer's prefilled cart named the Mini —
+        # the wrong-size hazard this lane refuses on the other branch, reached through the one
+        # door left open. So: they agree, or catalog speaks alone, and we use the id; they are
+        # two DIFFERENT merchant-issued ids, and we do not know which physical thing the buyer
+        # would receive, so the honest answer is a referral; catalog says nothing, and the
+        # operator value is used exactly as before.
+        #
+        # ONE PREDICATE DECIDES THE VETO — and, precisely, only the veto. Round 2 found this
+        # branch asking `extract_shopify_numeric_variant_id`, which accepts ANY digit string,
+        # while the resolver required 8+ digits or a gid, so a 5-digit operator SKU could veto a
+        # real catalog id under a comment claiming both applied the same rule.
+        # `names_a_merchant_issued_variant` is that rule, parent-aware, shared with the
+        # resolver's admission and contradiction checks.
+        #
+        # `extract_shopify_numeric_variant_id` IS STILL HERE, deliberately, and round 3 was
+        # right that the earlier wording hid it: it decides what value SHIPS when catalog is
+        # silent, and that is the pre-#2151 behaviour this branch preserves byte for byte. So a
+        # 5-digit operator SKU can still become `cart_variant_id` on a product with no catalog
+        # row — as it always could — but it can no longer withdraw one we resolved. Two
+        # questions, two predicates, on purpose.
+        _operator_vid = extract_shopify_numeric_variant_id(attached_variant_id)
+        _catalog_vid = handover.variant_id if handover is not None else None
+        _operator_is_identity = names_a_merchant_issued_variant(
+            attached_variant_id, product_key=attached_key, product_id=source_product_id
+        )
+        if (
+            _catalog_vid
+            and _operator_is_identity
+            and canonical_variant_id(attached_variant_id) != _catalog_vid
+        ):
+            cart_variant_id = None
+        else:
+            cart_variant_id = _catalog_vid or _operator_vid
 
     return {
         "merchant_id": merchant_id,
@@ -7872,6 +8843,141 @@ def resolve_cart_permalink(
         variant_id=cart_variant_id,
         quantity=quantity,
     )
+
+
+def preflight_coverage_fields(stats: Dict[str, int]) -> Dict[str, Any]:
+    """Coverage of the population the gate ACTUALLY applies to, or {} when it applied to none.
+
+    `answered_fraction` divides by `gated`, not by `candidates`. A first version used
+    candidates, which counts every seed offer considered — including offers the gate is
+    deliberately blind to, and they are the majority. It also put memo hits in the denominator
+    and not the numerator, so a request whose six gated handoffs were all answered from one ask
+    plus five memo hits reported 0.333. Both errors push the same way: they make a working gate
+    look absent.
+
+    Returned as fields rather than logged directly so they ride on the existing
+    `offers.resolve.summary` record, which already carries the request's identity and latency. A
+    second bare line would have had neither, and nothing to join it to.
+
+    #2151 MOVED THE DENOMINATOR. It was `cart_prefilled`, and that was right while the gate
+    keyed on `cart_variant_id`. The gate now keys on the UNION `_handover_id or _cart_vid` —
+    wherever we can name the merchant's variant OR would hand the buyer a cart. A UNION and not
+    a replacement, because the two are not nested: a cart needs storefront evidence the catalog
+    does not carry and the merchant question does not need it, but the attach lane ships carts
+    for which no `catalog_skus` row exists. `gated` is that population, and every cart gated
+    before this PR is still gated. `cart_prefilled` survives as its own counter — how many
+    hand-overs actually got a cart — which is a different question that folding the two together
+    would have silently lost.
+
+    (An earlier revision of this paragraph said the gate keys on the resolved hand-over id
+    alone. That was true for one commit and round 3 of review called it a safety regression;
+    the sentence outlived the fix, which is the stale-doc failure this file has been bitten by
+    before. Its test twin in `tests/test_checkout_preflight.py` said the opposite for a while,
+    which is how it was found.)
+
+    NOTE ON OBSERVABILITY -- read before trusting these numbers. (1) They are NOT in
+    `checkout_preflight_observations`; that table holds one row per ask and none of these
+    counters. An earlier docstring claimed otherwise. (2) The record they ride on is a
+    `logger.info` on this module's logger. In production (`uvicorn main:app`, no --log-config;
+    `setup_structured_logging()` is defined and NEVER called from main -- see
+    routes/scheduler_health.py, which exists because of exactly this) the root logger sits at
+    WARNING, so this INFO record is NOT EMITTED AT ALL until that changes. That is not
+    "best-effort sampling"; the record does not leave the process. (3) Even where it is emitted,
+    no formatter in this repo renders `extra`, so the values are also written into the message
+    text by the caller. Persisting the counters (a request-coverage row that `shadow_report`
+    can join) is the named follow-up; until it lands, the shadow report's would_block_rate has
+    no coverage denominator anyone can read in prod.
+    """
+    covered = stats.get("gated", 0)
+    if not covered:
+        # Not "nothing happened" — the gate applied to nothing on this request, which is the
+        # normal case for a referral-only resolve. Keying this on `candidates` put a coverage
+        # line on every such request with a fraction of 0.000.
+        return {}
+    answered = stats.get("asked", 0) + stats.get("memo_hits", 0)
+    return {
+        "preflight_mode": checkout_preflight.mode(),
+        "preflight_candidates": stats.get("candidates", 0),
+        "preflight_gated": covered,
+        # RENAMED from `preflight_cart_prefilled`, because its meaning changed. It used to BE
+        # the denominator; it is now "how many hand-overs actually got a cart", a number that
+        # drops to roughly zero on today's corpus. Keeping the old name would have shown a
+        # log-based dashboard a real-looking regression instead of a rename.
+        "preflight_carts_built": stats.get("cart_prefilled", 0),
+        "preflight_asked": stats.get("asked", 0),
+        "preflight_memo_hits": stats.get("memo_hits", 0),
+        "preflight_skipped_by_budget": stats.get("skipped_by_budget", 0),
+        "preflight_degraded_to_referral": stats.get("degraded_to_referral", 0),
+        "preflight_answered_fraction": round(answered / covered, 3),
+    }
+
+
+class _PreflightBudget:
+    """Bounds how much of a single resolve the preflight may consume.
+
+    Two limits because they fail differently: a COUNT cap bounds a wide result set even when
+    every merchant answers instantly, and a WALL-CLOCK cap bounds a few slow ones. Exhausting
+    either stops the gate for the rest of that request.
+    """
+
+    def __init__(self) -> None:
+        # Started LAZILY, on the first question rather than at construction. The budget is
+        # built at the top of the resolve, and 0.7-1.1s of the request's own fetch_all lanes
+        # run between there and the first preflight — so a clock started here spent part of
+        # itself on work the gate did not do. Worse, it biased the measurement against exactly
+        # the population worth measuring: a slow-DB request reached the retry lanes with the
+        # budget already gone and the gate silently absent, so the slowest merchants were the
+        # least likely to be checked.
+        self._started: Optional[float] = None
+        self._spent = 0
+        try:
+            self._max_calls = max(0, int(os.getenv("CHECKOUT_PREFLIGHT_MAX_PER_REQUEST") or 8))
+        except (TypeError, ValueError):
+            self._max_calls = 8
+        try:
+            self._budget_s = max(0.0, float(os.getenv("CHECKOUT_PREFLIGHT_REQUEST_BUDGET_SECONDS") or 6.0))
+        except (TypeError, ValueError):
+            self._budget_s = 6.0
+
+    def available(self) -> bool:
+        if self._spent >= self._max_calls:
+            return False
+        if self._started is None:
+            # No question asked yet, so no time has been spent on this gate.
+            return True
+        return (time.monotonic() - self._started) < self._budget_s
+
+    def spend(self) -> None:
+        if self._started is None:
+            self._started = time.monotonic()
+        self._spent += 1
+
+
+async def _preflight_allows_external_offer(offer: Dict[str, Any]) -> bool:
+    """May this external offer be published as a buyable link?
+
+    Named and extracted so the decision can be TESTED rather than asserted about: the inline
+    version could only be pinned by grepping the route's source, which is the text-ratchet
+    problem this repo keeps re-learning. It is also the single place the mode is interpreted, so
+    the call sites cannot drift apart on what shadow means.
+
+    Fail-open when disabled, fail-open in shadow, and on an unexpected exception the answer
+    follows the operator's own instruction: under `enforce` they asked us to refuse what cannot
+    be verified, and an exception IS "could not verify". `checkout_preflight.preflight` is total
+    — it catches its own failures and returns `unverifiable` — so reaching the handler at all
+    means something structural.
+    """
+    if not checkout_preflight.is_enabled():
+        return True
+    try:
+        verdict = await checkout_preflight.preflight_and_record(offer)
+        return verdict.allows_checkout
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[offers.resolve] preflight raised for %s (mode=%s): %s",
+            offer.get("offer_id"), checkout_preflight.mode(), repr(exc)[:200],
+        )
+        return checkout_preflight.mode() != checkout_preflight.MODE_ENFORCE
 
 
 def _redirect_token_from_url(redirect_url: str) -> str:
@@ -8005,6 +9111,7 @@ def compose_attributed_destinations(
     platform: Optional[str],
     cart_variant_id: Optional[str],
     click_id: str,
+    recovery_key: Optional[str] = None,
     quantity: int = 1,
 ) -> Dict[str, Any]:
     """Compose every attributed URL for one external offer, ONCE.
@@ -8018,6 +9125,15 @@ def compose_attributed_destinations(
     `click_id` is REQUIRED and caller-minted on purpose. The join key has to be identical on
     the surface_click_events row, the merchant's order, and the URLs we hand the agent; a
     default here would mint a second id and silently split the join.
+
+    `recovery_key` is OPTIONAL and caller-resolved, for the same reason. It says which
+    recovery action this destination belongs to, so an order can be attributed to the fix
+    that produced it rather than only to a click. Resolving it needs a DB read
+    (db.merchant_tasks.active_recovery_key_for_destination), and this function is a pure
+    composer two consumers must agree on — putting a query inside it would make it async
+    and give the two callers a way to disagree, which is the drift this function exists to
+    prevent. Absent is fine: an order stays attributable through
+    click_id -> commerce_interactions row -> recovery_key.
 
     Returns `primary` (what the redirect signs), `cart_url` (None for an honest referral),
     `pdp_url` (always the product page, attributed), and `join_mode`.
@@ -8040,9 +9156,11 @@ def compose_attributed_destinations(
     pdp_utm = apply_utm(destination_url, template, utm_ctx)
     cart_utm = apply_utm(cart_base, template, utm_ctx) if cart_base else None
 
-    pdp_url = append_referral_click_param(pdp_utm, click_id)
+    pdp_url = append_referral_click_param(pdp_utm, click_id, recovery_key)
     cart_url = (
-        append_shopify_cart_click_attribute(cart_utm, click_id) if cart_utm else None
+        append_shopify_cart_click_attribute(cart_utm, click_id, recovery_key)
+        if cart_utm
+        else None
     )
     return {
         "primary": cart_url or pdp_url,
@@ -8060,6 +9178,17 @@ def compose_attributed_destinations(
 async def _make_external_redirect_url(
     *,
     market: str,
+    # DID THE CALLER OBSERVE THIS MARKET, or is `market` the "US" DEFAULT? Every call site
+    # below serves `<something> or "US"`, and once the token's market is forwarded to the
+    # gateway's merchant-purchasability gate the two stop being interchangeable: a defaulted
+    # "US" would gate a non-US buyer against the US fact. See the MARKET PROVENANCE note in
+    # `services/outbound_links_service`.
+    #
+    # NO DEFAULT, deliberately, for the same reason `cart_variant_id` has none: a defaulted
+    # one makes OMISSION silent, so a new call site (or a deleted line) would quietly start
+    # stamping tokens as unobserved — or, worse under the opposite default, as observed —
+    # with nothing failing. Required turns that into a TypeError the suite catches.
+    market_observed: bool,
     tool: str,
     destination_url: str,
     utm_template: Optional[str],
@@ -8091,6 +9220,10 @@ async def _make_external_redirect_url(
     click_id: Optional[str] = None,
     seller_ref: Optional[str] = None,
     seed_kind: Optional[str] = None,
+    # ADR-025 D1: when given, the click this link carries is appended here, built from the SAME
+    # ctx, destination and ids signed into the token, so the row recorded at issue time and the
+    # one `/r` fills can never describe different clicks. The caller writes the batch.
+    issued_clicks: Optional[List[IssuedClick]] = None,
 ) -> Optional[str]:
     if not destination_url.startswith(("http://", "https://")):
         return None
@@ -8163,12 +9296,28 @@ async def _make_external_redirect_url(
         {
             "market": market,
             "tool": tool,
+            # Absent rather than `false` for an unobserved market, so the token is
+            # byte-identical to a pre-provenance mint on that (majority) path.
+            **({TOKEN_MARKET_OBSERVED_KEY: True} if market_observed is True else {}),
             "dest": dest,
             "ctx": enriched_ctx,
         }
     )
     base = resolve_public_api_base_url()
-    return f"{base}/r?token={token}"
+    link = f"{base}/r?token={token}"
+    if issued_clicks is not None:
+        issued_clicks.append(IssuedClick(
+            click_id=stable_click_id,
+            surface=str(enriched_ctx.get(PVT_SURFACE) or ""),
+            merchant_id=merchant_id,
+            canonical_product_id=product_id,
+            canonical_variant_id=variant_id,
+            destination_url=dest,
+            dest_domain=url_domain(dest) or None,
+            context=dict(enriched_ctx),
+            link=link,
+        ))
+    return link
 
 
 def _seed_attribution_from_redirect(
@@ -8420,6 +9569,15 @@ async def mint_external_seed_links(body: ExternalSeedLinksRequest) -> Dict[str, 
     default_market = str(body.market or "US").strip().upper() or "US"
     default_tool = str(body.tool or "*").strip() or "*"
     links: List[Dict[str, Any]] = []
+    # #2151: same hand-over identity as every other lane. Primed ONCE for the whole body —
+    # the request is capped at EXTERNAL_SEED_LINKS_MAX_CANDIDATES, so this is one bounded
+    # statement, not fifty. A caller that sends no attached_product_key gets exactly today's
+    # behaviour: `choose` answers `no_attached_product_key`, which carries no id.
+    _handover_resolver = HandoverVariantResolver()
+    await _handover_resolver.prime(
+        _handover_product_key(c.model_dump(), _ensure_seed_data_obj(c.seed_data))
+        for c in body.candidates
+    )
     # ONE MINT PER CANDIDATE, DELIBERATELY NO CACHE. The signed token carries per-seed context
     # (seedId, merchant/product/variant identity, shop domain), so two candidates that share
     # a destination are still two different tokens. Review of the first cut reproduced a
@@ -8436,10 +9594,23 @@ async def mint_external_seed_links(body: ExternalSeedLinksRequest) -> Dict[str, 
         row = candidate.model_dump()
         seed_data = _ensure_seed_data_obj(candidate.seed_data) or {}
         redirect_identity = _external_seed_redirect_identity(
-            row=row, seed_data=seed_data, offer_variant_id=candidate.variant_id
+            row=row, seed_data=seed_data, offer_variant_id=candidate.variant_id,
+            handover=_handover_resolver.choose(
+                product_key=_handover_product_key(row, seed_data),
+                # The BARE product id. `product_key` alone cannot catch a variant id that
+                # restates it (`startswith` never matches a full key against a bare id), and a
+                # lane that is parent-blind admits a stamp that restates the product as
+                # identity. Zero cost today — 0 seeds are stamped — and live the moment
+                # `backfill_shopify_variant_ids.py` runs, which is the same argument that put
+                # the contradiction rule in now.
+                product_id=candidate.external_product_id,
+                seed_data=seed_data,
+                offer_variant_id=candidate.variant_id,
+            ),
         )
         redirect_url = await _make_external_redirect_url(
             market=market,
+            market_observed=market_is_observed(candidate.market, body.market),
             tool=tool,
             destination_url=destination_url,
             utm_template=candidate.utm_template,
@@ -8537,6 +9708,12 @@ async def _build_prefetched_external_seed_wrappers(
 
     wrappers: List[Dict[str, Any]] = []
     redirect_cache: Dict[str, Optional[str]] = {}
+    # #2151: one bounded lookup for the whole prefetched batch, before the loop.
+    _handover_resolver = HandoverVariantResolver()
+    await _handover_resolver.prime(
+        _handover_product_key(c, _ensure_seed_data_obj(c.get("seed_data")))
+        for c in candidates if isinstance(c, dict)
+    )
     for candidate in candidates:
         destination_url = str(
             candidate.get("destination_url")
@@ -8555,10 +9732,27 @@ async def _build_prefetched_external_seed_wrappers(
         # Hoisted out of the mint branch: the attributed `destination_url` below needs the same
         # identity (shop_domain / platform / cart variant) whether we mint here or were handed a
         # link the caller already minted from these same inputs.
+        _candidate_seed_data = _ensure_seed_data_obj(candidate.get("seed_data")) or {}
         redirect_identity = _external_seed_redirect_identity(
             row=candidate,
-            seed_data=_ensure_seed_data_obj(candidate.get("seed_data")) or {},
+            seed_data=_candidate_seed_data,
             offer_variant_id=candidate.get("variant_id"),
+            handover=_handover_resolver.choose(
+                product_key=_handover_product_key(candidate, _candidate_seed_data),
+                # THIS LANE'S OWN CHAIN, not the bare key. `_build_prefetched_external_seed_wrappers`
+                # takes caller-supplied dicts, and its canonical payload carries `id` and
+                # `product_id` rather than `external_product_id` — the row it builds below
+                # spells the same fallback. Reading only the one key handed the resolver None
+                # here while lanes 1, 3 and 4 passed a real id, so one seed got two answers
+                # depending on which lane resolved it.
+                product_id=(
+                    candidate.get("external_product_id")
+                    or candidate.get("product_id")
+                    or candidate.get("id")
+                ),
+                seed_data=_candidate_seed_data,
+                offer_variant_id=candidate.get("variant_id"),
+            ),
         )
         if not redirect_url:
             # ADR-009 D3: seller_ref/seed_kind ride in the token ctx, so a cache
@@ -8574,6 +9768,7 @@ async def _build_prefetched_external_seed_wrappers(
             else:
                 redirect_url = await _make_external_redirect_url(
                     market=market,
+                    market_observed=market_is_observed(candidate.get("market")),
                     tool=tool,
                     destination_url=destination_url,
                     utm_template=utm_template,
@@ -9029,7 +10224,7 @@ async def _invoke_multi_upstream_fallback(
     if not MULTI_SEARCH_UPSTREAM_FALLBACK_BASE_URL:
         return None
 
-    metadata_payload: Dict[str, Any] = dict(request_metadata or {})
+    metadata_payload: Dict[str, Any] = market_telemetry.strip_for_forwarding(dict(request_metadata or {}))
     metadata_payload["upstream_fallback_hop"] = hop + 1
     body: Dict[str, Any] = {
         "operation": "find_products_multi",
@@ -9144,7 +10339,14 @@ async def _handle_find_products_multi(
     an intermediate, not what gets served. Those callers pass False so the
     decision-layer ledger records exactly one event per SERVED slate, not the
     intermediate queries (which would pollute the behavioral baseline)."""
-    result = await _handle_find_products_multi_inner(payload, request_metadata, background_tasks)
+    # Every seed bind this request makes, in any lane, is recorded by fetch_external_seed_rows into
+    # this request's observation -- opened here, INSIDE the request's own task, so it never crosses
+    # the task queue (services/market_telemetry.py explains why that distinction matters).
+    seed_bind_sink = market_telemetry.open_seed_bind_sink(request_metadata)
+    try:
+        result = await _handle_find_products_multi_inner(payload, request_metadata, background_tasks)
+    finally:
+        market_telemetry.close_seed_bind_sink(seed_bind_sink)
     # Exclude test/demo rigs BEFORE redirect stamping + decision recording, so a
     # rig is neither /r-attributed nor deposited in the behavioral ledger. This
     # is the wrapper over EVERY inner return branch (cached, pivot, fallback,
@@ -10386,11 +11588,10 @@ async def _handle_find_products_multi_inner(
         # Never let brand detection break recall — fall back to the prior gate.
         brand_query_detected = False
         brand_query_terms = []
-    semantic_external_seed_fallback_allowed = bool(
-        strict_serving_mode
-        or query_semantic_class in {"beauty", "fragrance"}
-        or brand_query_detected
-    )
+    # External offers are part of the same recall universe. Semantic class and
+    # brand detection still influence ranking and precision checks, but cannot
+    # remove an otherwise eligible catalog source.
+    semantic_external_seed_fallback_allowed = True
 
     # Detect special intents for downstream filtering/UX.
     look_intent = False
@@ -10838,6 +12039,14 @@ async def _handle_find_products_multi_inner(
 
         seen_external_ids: set[str] = set()
         external_redirect_cache: Dict[str, Optional[str]] = {}
+        # #2151: one bounded lookup for the ranked set, before the build loop — the loop is
+        # under a wall-clock budget (`seed_build_deadline`), so a per-card query here would
+        # spend that budget on round trips instead of on cards.
+        _handover_resolver = HandoverVariantResolver()
+        await _handover_resolver.prime(
+            _handover_product_key(dict(c.row or {}), dict(c.seed_data or {}))
+            for c in ranked_seed_candidates
+        )
         seed_budget_ms = int(FIND_PRODUCTS_MULTI_SEED_BUDGET_MS or 0)
         seed_build_deadline = (
             time.perf_counter() + (seed_budget_ms / 1000.0)
@@ -10899,6 +12108,15 @@ async def _handle_find_products_multi_inner(
                 row=row_dict,
                 seed_data=seed_data,
                 offer_variant_id=getattr(candidate, "variant_id", None),
+                handover=_handover_resolver.choose(
+                    product_key=_handover_product_key(row_dict, seed_data),
+                    product_id=(
+                        row_dict.get("external_product_id")
+                        or seed_data.get("external_product_id")
+                    ),
+                    seed_data=seed_data,
+                    offer_variant_id=getattr(candidate, "variant_id", None),
+                ),
             )
             # ADR-009 D3: include seller_ref/seed_kind in the cache key so a cache
             # hit never reuses a redirect built for a different seller.
@@ -10917,6 +12135,7 @@ async def _handle_find_products_multi_inner(
             else:
                 redirect_url = await _make_external_redirect_url(
                     market=market,
+                    market_observed=market_is_observed(row_dict.get("market")),
                     tool=tool,
                     destination_url=dest,
                     utm_template=utm_template,
@@ -14700,9 +15919,15 @@ async def invoke_shop_operation(
         dedup_cache_hit = False
         dedup_inflight_joined = False
         dedup_key: Optional[str] = None
+        # This request's own observation of which market it resolved and bound. It rides in the
+        # request's metadata dict -- captured by the queued closure below -- rather than a
+        # ContextVar: the task queue starts waiting tasks from inside whichever request just
+        # finished, so an ambient context would hand the observation to the wrong request.
+        market_observation: Dict[str, Any] = {}
         try:
             multi_request_metadata = dict(normalized_metadata)
             multi_request_metadata["_pivot_shadow_schedule_suppressed"] = True
+            multi_request_metadata[market_telemetry.OBSERVATION_KEY] = market_observation
             if INVOKE_MULTI_BYPASS_QUEUE_SHOPPING and is_shopping_surface:
                 if MULTI_SEARCH_PAGE_REQUEST_DEDUP_ENABLED:
                     dedup_key = _build_multi_page_request_dedup_key(
@@ -14857,6 +16082,28 @@ async def invoke_shop_operation(
             raise
         finally:
             duration_seconds = max(0.0, time.time() - started)
+            # One market record per find_products_multi request, on every outcome -- success,
+            # HTTPException, disconnect. It cannot fail the request: any error is recorded as
+            # such instead of the fields.
+            # Through market_telemetry.emit, NOT logger.info(..., extra=...): on this module's logger
+            # INFO is never emitted in prod and `extra` is never rendered (review of this PR,
+            # confirmed on prod logs). emit writes one JSON line Cloud Run stores as jsonPayload.
+            try:
+                market_telemetry.emit({
+                    "status_code": status_code,
+                    "source": source_normalized,
+                    "duration_ms": round(duration_seconds * 1000.0, 1),
+                    **market_telemetry.build_record(
+                        raw_payload=request.payload,
+                        envelope_metadata=request.metadata,
+                        observation=market_observation,
+                        result=locals().get("result"),
+                        dedup_cache_hit=dedup_cache_hit,
+                        dedup_inflight_joined=dedup_inflight_joined,
+                    ),
+                })
+            except Exception as telemetry_error:  # pragma: no cover - defensive
+                market_telemetry.emit({"market_telemetry_error": str(telemetry_error)[:120]})
             if duration_seconds >= 2.0:
                 logger.info(
                     "multi.invoke.slow",
@@ -14887,7 +16134,13 @@ async def invoke_shop_operation(
         payload = OffersResolvePayload(
             **_normalize_offers_resolve_payload(request.payload)
         )
-        return await _handle_offers_resolve(payload, normalized_metadata, background_tasks)
+        return await _handle_offers_resolve(
+            payload, normalized_metadata, background_tasks,
+            caller_api_key=request_api_key(http_request),
+            caller_assertion=(
+                http_request.headers.get(ISSUING_AGENT_ASSERTION_HEADER) if http_request is not None else None
+            ),
+        )
 
     if operation == "find_similar_products":
         payload = FindSimilarProductsPayload(**request.payload)

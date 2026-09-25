@@ -26,6 +26,7 @@ from db.agent_issued_cards import (
     create_card_guarded,
     get_card,
     mark_failed,
+    mark_failed_with_orphan,
     mark_issued,
     mint_card_id,
 )
@@ -68,8 +69,102 @@ def _snapshot_with_headroom(quote: Dict[str, Any], cap: Dict[str, Any]) -> Dict[
     """
     base = quote.get("quote_snapshot")
     if not isinstance(base, dict):
+        # LOG IT, because nothing else will and the mint SUCCEEDS. `resolve_merchant_quote`
+        # always builds a dict, so reaching here means one of the causes this docstring names --
+        # all of them OURS. And measured: a non-dict snapshot does NOT fail the request. It
+        # renders to `{"unexpected_snapshot_shape": "None"}`, serialises cleanly, and the card
+        # issues 200. (Only a DEEP non-dict reaches a 502, via `repr()` recursing below.)
+        #
+        # SCOPED, because an earlier draft of this comment called it "a live card with no
+        # provenance" and that overstates it. The audited NUMBERS survive: `quote_total_minor`,
+        # `amount_cap_minor` and `currency` are their own columns on the row, `headroom` survives
+        # inside the degraded snapshot, and `cap_for_quote` never reads `quote_snapshot` at all --
+        # so the cap is not corrupted and nothing declines or overspends. What is lost is the
+        # merchant's raw payload -- `totals`, `picked`, `covers` -- the EVIDENCE BEHIND those
+        # numbers. Forensic only: nothing in the codebase reads this column back.
+        #
+        # The TYPE, never the value. `base` is unbounded and partly merchant-derived, and this
+        # goes to a log sink; the shape is the whole diagnostic anyway.
+        logger.warning(
+            "agent-card quote_snapshot was not a dict (type=%s); the card still mints and its "
+            "audited amounts are intact, but the merchant payload behind them is not recorded",
+            type(base).__name__,
+        )
         base = {"unexpected_snapshot_shape": repr(base)[:200]}
     return {**base, "headroom": cap}
+
+
+def _dump_snapshot(quote: Dict[str, Any], cap: Dict[str, Any]) -> str:
+    """Serialise the audit snapshot without letting merchant JSON pick the status code.
+
+    `allow_nan=False` is the BELT here, not the fix: `resolve_merchant_quote` already refuses a
+    non-finite snapshot as a 502, which is where that check belongs. But `json.dumps` RECURSES
+    over merchant-controlled `totals`, and a RecursionError on this line is caught by nothing
+    above it -- a 500, the exact failure the belt was added to prevent, arriving by a different
+    exception type.
+
+    502, NOT 422. The handler below spells out the house rule: a bad request is 422 (which the
+    error middleware rewrites to 400 INVALID_REQUEST), and a merchant that refused or answered
+    unreadably is 502. An earlier draft raised 422 here, so a merchant nesting its own reply
+    made the agent read "Request validation failed" about a request that was fine. The
+    middleware does copy this string through to `body["detail"]`, but it replaces the STATUS and
+    the MESSAGE, which are what an agent switches on. Deep merchant JSON is the merchant's
+    fault, so it gets the merchant's status.
+
+    DEFENCE IN DEPTH, not a reachable path. `json.dumps` and `json.loads` are the same C encoder
+    sharing one limit -- measured identical on both runtimes (993/993 on 3.11, 9997/9997 on
+    3.12.8) -- and `resp.json()` parses strictly deeper in the chain, so the parser always
+    refuses first and this never fires in production. An earlier comment claimed it was "forward
+    cover for 3.12+"; that is true of the pure-Python walk in `_is_quoted_amount` (996 vs 9997),
+    not of this dump. Kept because the cost is one clause and the alternative is a 500 if that
+    ordering ever changes.
+    """
+    # BUILT OUTSIDE THE TRY, deliberately. `MerchantQuoteError` and `MerchantUcpError` are both
+    # ValueError SUBCLASSES, so the `except (ValueError, TypeError)` below catches far more than
+    # the encoder it was written for -- with this call inside the try, any ValueError or
+    # TypeError from the snapshot builder would be reported to the agent as the MERCHANT sending
+    # an unserialisable amount. Nothing in `_snapshot_with_headroom` raises either today (it
+    # self-guards a non-dict `base`, and `cap` carries only ints and strs), so this masked
+    # nothing; it is hoisted so that stays true if that guard is ever removed. The same
+    # ValueError-subclass overlap is already called out at merchant_ucp_checkout.py:800.
+    try:
+        snapshot = _snapshot_with_headroom(quote, cap)
+    except RecursionError:
+        # Logged separately from the encoder's identical-detail raise below: the two are
+        # indistinguishable in the response, and they mean different things -- this one is the
+        # SNAPSHOT BUILDER's own `repr()` recursing, that one is the encoder walking `totals`.
+        logger.warning("agent-card snapshot builder recursed while rendering an unexpected shape")
+        # RecursionError ONLY, which is the asymmetry the hoist above exists to create. The
+        # builder's non-dict fallback does `repr(base)[:200]`, and `repr()` RECURSES -- so
+        # hoisting it out of the encoder's guard moved that recursion out of cover: a 12,000-deep
+        # non-dict `quote_snapshot` answered 502 before the hoist and an UNCAUGHT 500 after it.
+        # Hardening one hypothetical while opening the equal and opposite one.
+        #
+        # So the two exception families are split deliberately. A ValueError/TypeError from the
+        # builder is OURS and must stay loud (MerchantQuoteError and MerchantUcpError are both
+        # ValueError subclasses, so catching those here would relabel our bug as the merchant's).
+        # A RecursionError is a depth property of the DATA, which is the merchant's, and gets the
+        # merchant's status either way.
+        raise HTTPException(
+            status_code=502, detail="merchant quote nested beyond the readable depth"
+        )
+    try:
+        return json.dumps(snapshot, allow_nan=False)
+    except RecursionError:
+        logger.warning("agent-card quote_snapshot nested beyond the encoder's depth")
+        raise HTTPException(
+            status_code=502, detail="merchant quote nested beyond the readable depth"
+        )
+    except (ValueError, TypeError):
+        # The clause this docstring calls "the BELT" -- `allow_nan=False` raises ValueError, and
+        # an unserialisable value raises TypeError. Catching only RecursionError left the belt
+        # itself uncaught: a 500 one exception type over from the one just guarded. Unreachable
+        # today (`resolve_merchant_quote` dumps the same totals first and `to_minor_units`
+        # refuses non-finite `picked`), and kept for the reason above -- one clause against a
+        # 500 if that ordering changes.
+        raise HTTPException(
+            status_code=502, detail="merchant quote carried an unserialisable amount"
+        )
 
 
 def _card_view(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -115,9 +210,19 @@ async def issue_card(
     try:
         quote = await resolve_merchant_quote(body.merchant_domain, body.checkout_id)
     except MerchantQuoteError as err:
-        # The distinction the caller needs: their input was bad (422->400 house mapping) vs the
-        # merchant was unreachable (502). The exception carries the verdict — no string
-        # matching on messages.
+        # THREE parties, not two. Their input was bad (422->400 house mapping); the merchant was
+        # unreachable or refused (502); or WE are misconfigured — our agent profile is dead, our
+        # discovery handshake was refused — which is also a 502 and used to be a 422. Telling an
+        # agent its request was invalid because of OUR configuration sends it debugging a request
+        # that was fine. The exception carries the verdict; no string matching on messages.
+        if err.our_fault:
+            # Generic detail on purpose: the specific cause names our env vars and internal
+            # config, which is our operational surface and nothing the caller can act on. The
+            # log is where the cause belongs.
+            logger.error("card issuance blocked by OUR merchant-negotiation config: %s", err)
+            raise HTTPException(
+                status_code=502, detail="merchant negotiation is not configured"
+            )
         raise HTTPException(status_code=422 if err.caller_fault else 502, detail=str(err))
 
     policy = issuance_policy()
@@ -150,7 +255,9 @@ async def issue_card(
             # tell" is a decline waiting to happen. `ceiling` vs `flat_plus_bps` is the signal for
             # whether the ceiling ever engages at real order sizes — the question #1923 left open
             # about its own defaults, and the one this record exists to answer.
-            "quote_snapshot": json.dumps(_snapshot_with_headroom(quote, cap)),
+            # `_dump_snapshot` carries the reasoning: allow_nan is a belt behind
+            # `resolve_merchant_quote`'s 502, and the dump's own recursion is guarded there too.
+            "quote_snapshot": _dump_snapshot(quote, cap),
             "issuer": issuer.name,
             "single_use": True,
             "expires_at": expires_at,
@@ -174,8 +281,20 @@ async def issue_card(
             )
         )
     except CardIssuerError as err:
-        await mark_failed(card_id, err.code)
-        logger.warning(f"card issuance failed card_id={card_id} code={err.code}")
+        if err.issuer_card_ref:
+            # A card EXISTS at the issuer that we refused to accept (constraints unconfirmed or
+            # contradicted). Persisting the ref on the failed row is what puts it in front of
+            # jobs/agent_card_revocation_sweep.py — without it the orphan is unreachable and the
+            # only record is a log line, which nothing sweeps.
+            await mark_failed_with_orphan(card_id, err.code, err.issuer_card_ref)
+            logger.error(
+                "card issuance failed with an ORPHAN card_id=%s code=%s — queued for revocation",
+                card_id,
+                err.code,
+            )
+        else:
+            await mark_failed(card_id, err.code)
+            logger.warning(f"card issuance failed card_id={card_id} code={err.code}")
         raise HTTPException(status_code=502, detail=f"issuer refused: {err.code}")
 
     await mark_issued(card_id, issued.issuer_card_ref, issued.reveal_handle)

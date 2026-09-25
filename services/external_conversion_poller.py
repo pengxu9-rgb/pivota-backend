@@ -45,6 +45,11 @@ from services.commerce_attribution_service import (
     extract_click_id_from_note_attributes,
     shopify_order_total_to_cents,
 )
+from services.conversion_click_claims import (
+    ClickClaimUnavailable,
+    close_merchant_conversion_with_claim,
+    is_skipped_claimed,
+)
 from services.shopify_transactions_service import DEFAULT_API_VERSION
 
 logger = logging.getLogger("external_conversion_poller")
@@ -406,7 +411,8 @@ async def _process_order(
     shop_domain: Optional[str] = None,
 ) -> str:
     """Close one order if it carries our click id AND is paid. Returns an outcome
-    tag: 'closed' | 'no_click' | 'unpaid' | 'no_order_id' | 'invalid'.
+    tag: 'closed' | 'no_click' | 'unpaid' | 'no_order_id' | 'invalid' | 'skipped_claimed'
+    (a cart-link Reap purchase's click whose edge Reap already wrote, mig 230).
 
     ``shop_domain`` is the polled store's Shopify domain (the store the sale
     happened on); it is forwarded as ``converting_shop_domain`` for the ADR-009
@@ -424,8 +430,12 @@ async def _process_order(
         return "no_order_id"
     cents, currency = shopify_order_total_to_cents(order)
     converted_at = _parse_dt(order.get("processed_at")) or _parse_dt(order.get("created_at")) or converted_at_default
-    # Idempotency + click gate + edge upsert all live inside this call (T2-2).
-    await close_external_order_conversion(
+    # Idempotency + click gate + edge upsert all live inside this call (T2-2). mig 230: a
+    # cart-link Reap purchase's click is also closed by Reap under another key, so it goes
+    # through the first-writer-wins claim; every other click reaches the same close with the
+    # same arguments. An uncertain claim defers closure. See services/conversion_click_claims.
+    result = await close_merchant_conversion_with_claim(
+        close_external_order_conversion,
         merchant_id=merchant_id,
         click_id=click_id,
         external_order_id=external_order_id,
@@ -436,6 +446,9 @@ async def _process_order(
         # ADR-009 §D3: the store we polled IS the converting store-of-record.
         converting_shop_domain=shop_domain,
     )
+    if is_skipped_claimed(result):
+        # Reap already closed this cart-link sale's click (mig 230). NOT "closed": nothing was.
+        return "skipped_claimed"
     return "closed"
 
 
@@ -461,6 +474,7 @@ async def poll_external_conversions_for_merchant(
         "scanned": 0,
         "skipped_no_click": 0,
         "skipped_unpaid": 0,
+        "skipped_claimed": 0,
         "pages": 0,
         "errors": 0,
     }
@@ -495,6 +509,7 @@ async def poll_external_conversions_for_merchant(
 
     page_info: Optional[str] = None
     fetch_failed = False
+    claim_unavailable = False
     scan_complete = False
     while summary["pages"] < MAX_PAGES:
         # Shopify forbids other filter params alongside a page_info cursor, so
@@ -524,6 +539,16 @@ async def poll_external_conversions_for_merchant(
                     converted_at_default=now,
                     shop_domain=shop_domain,  # ADR-009 §D3: the polled store-of-record
                 )
+            except ClickClaimUnavailable as e:
+                summary["errors"] += 1
+                claim_unavailable = True
+                logger.warning(
+                    "external_conversion_poller: claim unavailable merchant=%s order=%s error_type=%s",
+                    merchant_id,
+                    (order.get("id") if isinstance(order, dict) else None),
+                    type(e).__name__,
+                )
+                continue
             except Exception as e:
                 summary["errors"] += 1
                 logger.warning(
@@ -539,6 +564,8 @@ async def poll_external_conversions_for_merchant(
                 summary["skipped_no_click"] += 1
             elif outcome == "unpaid":
                 summary["skipped_unpaid"] += 1
+            elif outcome == "skipped_claimed":
+                summary["skipped_claimed"] += 1
 
         if not next_cursor:
             scan_complete = True  # genuinely no more pages — the window is fully scanned
@@ -551,14 +578,16 @@ async def poll_external_conversions_for_merchant(
     #    run_started] never fetched;
     #  - a MAX_PAGES cap exit with a page still pending (page_cap_hit, F1 #1485)
     #    left the tail past the cap never fetched (Shopify 20×250 = 5000 orders).
-    # Either way, advancing past the unscanned orders would drop them forever
+    # A click-claim failure is another hold: that order was scanned, but its conversion cannot
+    # safely close without knowing whether Reap already owns the click. Retry the same window.
+    # Otherwise, advancing past the unscanned orders would drop them forever
     # (idempotency dedups replays but cannot recover an unscanned window), so HOLD
     # the watermark and re-poll the window next tick. Only a genuine end-of-pages
     # exit (next_cursor is None) advances. A per-ORDER close failure does NOT hold —
     # idempotency retries that order; the window WAS fully scanned. Persist even on
     # a zero-close run so the window advances.
     page_cap_hit = (not fetch_failed) and (not scan_complete)
-    if fetch_failed or page_cap_hit:
+    if fetch_failed or page_cap_hit or claim_unavailable:
         _note_watermark_hold(
             summary,
             merchant_id=merchant_id,
@@ -567,6 +596,8 @@ async def poll_external_conversions_for_merchant(
             page_cap_hit=page_cap_hit,
             log=logger,
         )
+        if claim_unavailable:
+            summary["claim_unavailable"] = True
         # NB: the ATTEMPT (last_run_at, for fair rotation) is recorded by the batch
         # loop for EVERY dispatched merchant — success, hold, or an early cred-miss
         # return — so no merchant can re-sort to the front and monopolize the cap.

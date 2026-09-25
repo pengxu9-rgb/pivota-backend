@@ -43,7 +43,7 @@ currency code, and it comes out of this fixed map — never out of caller input.
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Dict, Optional, Sequence
 
 from services.priced_offer_sql import priced_offer_exists_sql
 
@@ -143,3 +143,47 @@ def has_offer_priced_for_region_sql(
         alias=alias,
         extra_predicate=region_currency_predicate(region, alias=alias),
     )
+
+
+def has_offer_priced_for_any_region_sql(
+    product_key_expr: str, regions: "Sequence[str]", *, alias: str = "co"
+) -> str:
+    """``EXISTS`` for ANY of `regions` — the OR of `has_offer_priced_for_region_sql`.
+
+    A DISJUNCTION OF MEMBERSHIP TESTS, still no conversion and still no comparison
+    of amounts across currencies (ADR-024 commitment 5). "This product has a real
+    price in a currency SOME region we serve expects" is the honest weakening of
+    "…in the currency the US expects"; it is not a claim that the row is buyable
+    from any particular one of them, which remains unmodelled (Phase 2b).
+
+    ONE region emits the byte-identical string `has_offer_priced_for_region_sql`
+    does — no wrapping parens, no `OR` — so a caller configured with the default
+    single region produces exactly the SQL it produced before this function
+    existed. Asserted in tests/test_region_pricing.py: the whole safety argument
+    for reading the region list from config is that the default cannot drift.
+
+    Duplicates are collapsed and order is preserved (so 'US,SG,US' is 'US,SG'),
+    because the emitted SQL is compared byte-for-byte in tests and an operator's
+    repeated entry must not change it. An empty `regions` RAISES: "serve no
+    region" is never what a caller meant, and silently emitting a predicate that
+    is false for every row would take the whole index dark.
+    """
+    ordered: list = []
+    for region in regions or []:
+        normalized = normalize_region(region)
+        # Validates membership as a side effect — an unknown region raises here
+        # rather than emitting a predicate that quietly matches nothing.
+        pricing_currency_for_region(normalized)
+        if normalized not in ordered:
+            ordered.append(normalized)
+    if not ordered:
+        raise ValueError(
+            "has_offer_priced_for_any_region_sql needs at least one region; "
+            "an empty list would emit a predicate false for every row."
+        )
+    if len(ordered) == 1:
+        return has_offer_priced_for_region_sql(product_key_expr, ordered[0], alias=alias)
+    return "(" + " OR ".join(
+        has_offer_priced_for_region_sql(product_key_expr, region, alias=alias)
+        for region in ordered
+    ) + ")"

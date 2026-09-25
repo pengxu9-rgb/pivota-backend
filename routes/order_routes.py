@@ -34,6 +34,7 @@ from db.merchant_onboarding import get_merchant_onboarding
 from services.store_lifecycle_service import SUPPRESSED_ONBOARDING_STATUSES
 from db.products import log_order_event
 from db.database import database, IS_POSTGRES
+from db.merchant_order_sync_jobs import enqueue_merchant_order_create
 from utils.auth import require_admin, require_admin_or_key, get_current_user
 from adapters.psp_adapter import get_psp_adapter
 from adapters.multi_psp_orchestrator import create_payment_with_failover
@@ -52,6 +53,7 @@ from services.merchant_capability_gate import (
     capability_gate_permits_order_create,
 )
 from services.commerce_attribution_service import (
+    PIVOTA_ORDER_ID_NOTE_ATTR,
     PVT_CLICK_ID,
     PVT_PRODUCT_ID,
     PVT_PROMPT_CLUSTER,
@@ -598,6 +600,27 @@ async def _merchant_active_psp_is_test_mode(merchant_id: Optional[str]) -> bool:
             if value and normalize_psp_environment(provider, value, None) == "live":
                 return False
     return True
+
+
+# Fulfilment switches the Stripe webhook and the payment reconcile sweep read off ORDER metadata to
+# skip creating the merchant's platform (Shopify) order. Only the server may set them: the ops
+# canary writes them itself through db.orders.create_order. Order metadata on the create endpoint
+# is caller-supplied (the agent gateway forwards it verbatim), so an honoured caller value would
+# let any API caller get a PAID order that is never pushed to the merchant.
+_SERVER_ONLY_ORDER_METADATA_KEYS = ("ops_canary", "skip_platform_order_creation")
+
+
+def _strip_server_only_order_metadata(metadata: Dict[str, Any], *, merchant_id: Optional[str]) -> None:
+    dropped = [key for key in _SERVER_ONLY_ORDER_METADATA_KEYS if key in metadata]
+    for key in dropped:
+        metadata.pop(key, None)
+    if dropped:
+        logger.warning(
+            "[OrderRoutes] dropped server-only order metadata keys %s from a caller-supplied "
+            "order for merchant=%s",
+            dropped,
+            str(merchant_id or "").strip(),
+        )
 
 
 async def _apply_server_granted_test_psp_stamp(
@@ -2304,8 +2327,16 @@ def _build_shopify_discount_order_annotations(
     order_id: str,
     pricing_quote_meta: Dict[str, Any],
 ) -> Tuple[List[str], List[Dict[str, str]]]:
+    # The Pivota order id is stamped on EVERY written-back order, quote or no
+    # quote. It is what lets the Shopify orders/* webhook recognise this order
+    # as Pivota-originated from its own body and emit the same canonical
+    # `pivota:<order id>` order_ref the Stripe bridge does — without it, the
+    # same purchase counts its GMV twice, once per namespace. It used to be
+    # built only alongside discount annotations, so a plain order carried no
+    # marker at all.
+    order_marker = [{"name": PIVOTA_ORDER_ID_NOTE_ATTR, "value": str(order_id)}]
     if not isinstance(pricing_quote_meta, dict) or not pricing_quote_meta:
-        return [], []
+        return [], order_marker
 
     tags: List[str] = []
     note_attributes: List[Dict[str, str]] = []
@@ -2331,7 +2362,7 @@ def _build_shopify_discount_order_annotations(
         note_attributes.append({"name": "pivota_payment_offer_evidence_hash", "value": payment_offer_hash})
 
     # Keep a stable cross-system join key even if the quote id is absent on a legacy row.
-    note_attributes.append({"name": "pivota_order_id", "value": str(order_id)})
+    note_attributes.extend(order_marker)
     return tags, note_attributes
 
 
@@ -4103,6 +4134,7 @@ async def create_new_order(
         
         # 合并订单元数据并记录促销信息（如果有）
         order_metadata: Dict[str, Any] = dict(order_request.metadata or {})
+        _strip_server_only_order_metadata(order_metadata, merchant_id=order_request.merchant_id)
         if getattr(order_request, "idempotency_key", None):
             order_metadata.setdefault("idempotency_key", str(order_request.idempotency_key))
         if getattr(order_request, "selected_payment_offer_id", None):
@@ -4908,20 +4940,13 @@ async def confirm_payment(
                 }
             )
             
-            # 后台任务：创建 Shopify 订单
-            async def create_shopify_order_task():
-                """创建 Shopify 订单通知商户发货"""
-                try:
-                    logger.info(f"Creating Shopify order for {payment_request.order_id}")
-                    success = await create_shopify_order(payment_request.order_id)
-                    if success:
-                        logger.info(f"Shopify order created successfully for {payment_request.order_id}")
-                    else:
-                        logger.error(f"Failed to create Shopify order for {payment_request.order_id}")
-                except Exception as e:
-                    logger.error(f"Error in Shopify order creation task: {e}")
-            
-            background_tasks.add_task(create_shopify_order_task)
+            # Durable enqueue — replaces `background_tasks.add_task`, which ran
+            # after the response in this process, with no retry, and died with a
+            # Cloud Run revision swap while the buyer was already charged.
+            await enqueue_merchant_order_create(
+                order_id=payment_request.order_id,
+                merchant_id=str(order.get("merchant_id") or ""),
+            )
 
             # Legacy Phase 5.5/6 merchant→agent commission system was deprecated
             # 2026-05-23. See docs/monetization/LEGACY_COMMISSION_SYSTEM_AUDIT.md.
@@ -5689,6 +5714,14 @@ async def create_woocommerce_order(order_id: str) -> bool:
                     "payment_method": "pivota_external",
                     "payment_method_title": "Pivota External Payment",
                     "customer_note": f"Pivota Order ID: {order_id}",
+                    # Machine-readable twin of the customer_note above: the
+                    # WooCommerce webhook adapter reads it to emit the same
+                    # canonical `pivota:<order id>` order_ref the Stripe bridge
+                    # does, instead of a second `woocommerce:<native id>`
+                    # identity for the same purchase.
+                    "meta_data": [
+                        {"key": PIVOTA_ORDER_ID_NOTE_ATTR, "value": str(order_id)}
+                    ],
                     "billing": billing_address,
                     "shipping": shipping_address,
                     "line_items": line_items,

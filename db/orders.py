@@ -4,6 +4,7 @@
 """
 
 import asyncio
+import json
 
 from sqlalchemy import Table, Column, Integer, String, Text, DateTime, JSON, Numeric, Boolean
 from sqlalchemy.sql import func
@@ -430,8 +431,23 @@ async def get_orders_by_customer(customer_email: str, limit: int = 50) -> List[D
     return [dict(r) for r in results]
 
 
+def _coerce_metadata_obj(value: Any) -> Dict[str, Any]:
+    """`orders.metadata` as a dict. Read through a raw TEXT query, asyncpg hands the JSON column
+    back as a `str` (no JSON codec is registered, and must not be: it double-encodes writes); only
+    a SQLAlchemy-typed select decodes it. Non-object / unparseable -> {}."""
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
 async def update_order_status(
-    order_id: str, 
+    order_id: str,
     status: str, 
     **additional_fields
 ) -> bool:
@@ -460,9 +476,7 @@ async def update_order_status(
     if isinstance(update_data.get("metadata"), dict):
         existing_metadata = {}
         try:
-            existing_raw = before["metadata"] if before else None
-            if isinstance(existing_raw, dict):
-                existing_metadata = dict(existing_raw)
+            existing_metadata = _coerce_metadata_obj(before["metadata"] if before else None)
         except Exception:
             existing_metadata = {}
         # Metadata updates are additive by default. This prevents webhook/aftercare
@@ -728,6 +742,13 @@ async def update_fulfillment_info(
                 ful = str((row["fulfillment_status"] if row else "") or "").strip().lower()
                 merchant_id = str((row["merchant_id"] if row else "") or "").strip()
                 if paid and merchant_id and ful in {"shipped", "delivered"}:
+                    # Imported HERE, not at module scope: db/ -> services/ is a cycle. The name
+                    # was simply never imported, so every paid+shipped order raised NameError into
+                    # the enclosing except and no invitation was ever enqueued from this path.
+                    from services.reviews_invitation_send_jobs_service import (
+                        enqueue_invitation_send_job_from_order,
+                    )
+
                     await enqueue_invitation_send_job_from_order(
                         merchant_id=merchant_id,
                         order_id=order_id,
@@ -765,14 +786,29 @@ async def mark_order_shipped(
     if not ok:
         return False
     row = await database.fetch_one(
-        "SELECT merchant_id FROM orders WHERE order_id = :order_id LIMIT 1",
+        "SELECT merchant_id, payment_status FROM orders WHERE order_id = :order_id LIMIT 1",
         {"order_id": order_id},
     )
 
     # Best-effort invitation scheduling: enqueue a job for a worker service to send the email.
     try:
         merchant_id = str((row["merchant_id"] if row else "") or "").strip()
-        if merchant_id:
+        # PAID, like the two sibling sites. This one never checked, and it did not matter while
+        # the enqueue was dead — the missing import above meant every call raised NameError into
+        # the `except` below. Making the site live without the check would have let a merchant
+        # shipping an UNPAID order queue an invitation job. Two gates downstream still refuse it
+        # (`buyer_submit_enabled()` defaults off, and `_order_is_paid` 403s at send time), so the
+        # worst case was a junk pending row — but a site that relies on a downstream refusal is
+        # not guarded, it is lucky, and its two siblings guard it here.
+        paid = str((row["payment_status"] if row else "") or "").strip().lower() == "paid"
+        if paid and merchant_id:
+            # Same local import as the two sites above — db/ -> services/ is a cycle at module
+            # scope. This one was missing too, so the `except Exception: pass` below swallowed a
+            # NameError on every call and no invitation was ever enqueued from this path either.
+            from services.reviews_invitation_send_jobs_service import (
+                enqueue_invitation_send_job_from_order,
+            )
+
             await enqueue_invitation_send_job_from_order(
                 merchant_id=merchant_id,
                 order_id=order_id,

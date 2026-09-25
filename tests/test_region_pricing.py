@@ -152,3 +152,117 @@ class TestPricingCurrencyForRegionOrNone:
         assert pricing_currency_for_region_or_none("DE") is None
         assert pricing_currency_for_region_or_none("") is None
         assert pricing_currency_for_region_or_none("usa") is None
+
+
+# --- the MULTI-region disjunction, and its zero-change default ---------------
+
+class TestHasOfferPricedForAnyRegion:
+    """Serving more than one region must not change what serving ONE region emits.
+
+    The whole safety argument for reading the region list from configuration is
+    that the default is not merely equivalent but byte-identical to the string
+    the US gate has always emitted. Everything else in this class is downstream
+    of that.
+    """
+
+    def test_a_single_region_is_byte_identical_to_the_single_region_helper(self):
+        from services.region_pricing import has_offer_priced_for_any_region_sql
+        assert has_offer_priced_for_any_region_sql("cp.product_key", ["US"]) == (
+            has_offer_priced_for_region_sql("cp.product_key", "US")
+        )
+
+    def test_the_default_serving_region_still_emits_the_original_us_string(self):
+        """The live constant the eligibility SQL interpolates, with no env set."""
+        assert ips._HAS_SERVING_REGION_OFFER_EXISTS == priced_offer_exists_sql(
+            "cp.product_key", extra_predicate=US_PREDICATE
+        )
+
+    def test_no_parens_or_or_appear_in_the_single_region_form(self):
+        """A wrapped single region would still be CORRECT SQL and would still
+        break the byte-identity the test above depends on. Pin the shape too."""
+        from services.region_pricing import has_offer_priced_for_any_region_sql
+        sql = has_offer_priced_for_any_region_sql("cp.product_key", ["US"])
+        assert " OR " not in sql
+        assert not sql.startswith("(")
+
+    def test_two_regions_or_the_two_single_region_predicates(self):
+        from services.region_pricing import has_offer_priced_for_any_region_sql
+        sql = has_offer_priced_for_any_region_sql("cp.product_key", ["US", "SG"])
+        assert sql == (
+            "("
+            + has_offer_priced_for_region_sql("cp.product_key", "US")
+            + " OR "
+            + has_offer_priced_for_region_sql("cp.product_key", "SG")
+            + ")"
+        )
+        assert "'USD'" in sql and "'SGD'" in sql
+
+    def test_it_is_a_membership_test_and_never_a_conversion(self):
+        """ADR-024 commitment 5. Widening the gate to a second region must not
+        smuggle in a rate, a multiplication, or a cross-currency comparison."""
+        from services.region_pricing import has_offer_priced_for_any_region_sql
+        sql = has_offer_priced_for_any_region_sql("cp.product_key", ["US", "SG", "JP"])
+        for forbidden in ("*", "/", "rate", "convert", "fx"):
+            assert forbidden not in sql.lower()
+
+    def test_duplicates_collapse_and_order_is_preserved(self):
+        from services.region_pricing import has_offer_priced_for_any_region_sql
+        assert has_offer_priced_for_any_region_sql("cp.product_key", ["US", "SG", "us"]) == (
+            has_offer_priced_for_any_region_sql("cp.product_key", ["US", "SG"])
+        )
+        # A repeated entry must not re-collapse to the single-region form either.
+        assert has_offer_priced_for_any_region_sql("cp.product_key", ["SG", "sg"]) == (
+            has_offer_priced_for_region_sql("cp.product_key", "SG")
+        )
+
+    def test_an_unknown_region_raises_rather_than_matching_nothing(self):
+        from services.region_pricing import has_offer_priced_for_any_region_sql
+        with pytest.raises(ValueError, match="unknown pricing region"):
+            has_offer_priced_for_any_region_sql("cp.product_key", ["US", "DE"])
+
+    def test_no_regions_at_all_raises_rather_than_taking_the_index_dark(self):
+        """An empty list would emit a predicate false for every row — every
+        product blocked, and nothing in the output saying why."""
+        from services.region_pricing import has_offer_priced_for_any_region_sql
+        with pytest.raises(ValueError, match="at least one region"):
+            has_offer_priced_for_any_region_sql("cp.product_key", [])
+
+
+class TestServingPricingRegions:
+    """Reading the region list from the environment."""
+
+    def test_unset_means_us_only(self, monkeypatch):
+        monkeypatch.delenv(ips._SERVING_REGIONS_ENV, raising=False)
+        assert ips.serving_pricing_regions() == ["US"]
+
+    def test_the_sql_constant_is_fixed_at_import_so_the_env_must_be_set_per_process(self, monkeypatch):
+        """The predicate is a module-level constant. Setting the env AFTER import changes
+        `serving_pricing_regions()` and nothing else — which is exactly why the runbook says
+        the variable must be present on every PROCESS that recomputes eligibility (the
+        onboarding job, `web`, and the worker's nightly index-health job), not just one.
+        A refactor to a lazy read would silently change that deploy contract; this pins it."""
+        monkeypatch.setenv(ips._SERVING_REGIONS_ENV, "US,SG")
+        assert ips.serving_pricing_regions() == ["US", "SG"]
+        assert ips._HAS_SERVING_REGION_OFFER_EXISTS == ips._HAS_US_OFFER_EXISTS
+
+    @pytest.mark.parametrize("blank", ["", "   ", ",", " , "])
+    def test_a_blank_setting_is_us_only_not_no_regions(self, monkeypatch, blank):
+        """An operator who clears the var, or a deploy that sets it empty, must
+        land on today's behaviour — not on a value that blocks every row."""
+        monkeypatch.setenv(ips._SERVING_REGIONS_ENV, blank)
+        assert ips.serving_pricing_regions() == ["US"]
+
+    def test_it_parses_a_list_and_normalises_each_entry(self, monkeypatch):
+        monkeypatch.setenv(ips._SERVING_REGIONS_ENV, " us , sg ")
+        assert ips.serving_pricing_regions() == ["US", "SG"]
+
+    def test_the_configured_list_reaches_the_sql(self, monkeypatch):
+        """THE SEAM. The parser can be perfect and the builder can be perfect and
+        the gate is still US-only if nothing joins them — the constant is built at
+        import, so this asserts the composition rather than the module global."""
+        from services.region_pricing import has_offer_priced_for_any_region_sql
+        monkeypatch.setenv(ips._SERVING_REGIONS_ENV, "US,SG")
+        sql = has_offer_priced_for_any_region_sql(
+            "cp.product_key", ips.serving_pricing_regions()
+        )
+        assert "'SGD'" in sql

@@ -29,6 +29,7 @@ TEXT instead would pass for a flag that is constructed and then never passed.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -120,6 +121,10 @@ class Run:
     def err(self) -> str:
         return self.proc.stderr
 
+    @property
+    def out(self) -> str:
+        return self.proc.stdout
+
     def _match(self, *head: str) -> list[list[str]]:
         return [c for c in self.calls if tuple(c[: len(head)]) == head]
 
@@ -154,6 +159,7 @@ def _run(
     log_output: str = "",
     ported_files: "bool | str" = False,
     curl_out: str = "404",
+    overrides: "dict[str, str] | None" = None,
 ) -> Run:
     """Run the REAL deploy_gateway.sh against stubs.
 
@@ -200,8 +206,14 @@ def _run(
         "STUB_ENV_FILE_COPY": str(tmp_path / "env-vars-file.snapshot"),
     }
     env.pop("CONFIG", None)
+    # The shape overrides are read from the ENVIRONMENT, so an operator who exported the incident
+    # runbook's own `CONCURRENCY=20` in this shell would otherwise inject it into every test here -
+    # and the default tests would pass while asserting nothing about the default.
+    for shape_var in ("CONCURRENCY", "CONCURRENCY_LIMIT", "MIN_INSTANCES", "MAX_INSTANCES"):
+        env.pop(shape_var, None)
     if config is not None:
         env["CONFIG"] = config
+    env.update(overrides or {})
 
     proc = subprocess.run(
         ["bash", str(script), env_arg, tag],
@@ -459,3 +471,284 @@ def test_apply_can_still_create_a_service_from_scratch(tmp_path):
     assert "--env-vars-file" in argv
     # A first revision already holds 100%; shifting traffic to itself is not attempted.
     assert not any("--to-latest" in c for c in r.traffic_calls())
+
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# THE SHAPE OVERRIDES
+#
+# `preserve` keeps env and secrets but REASSERTS the shape, so every gateway deploy re-sends
+# --concurrency/--min-instances/--max-instances. The 2026-09-15 pivota-pg CPU incident was mitigated
+# by hand-setting the live gateway to concurrency 20 / min 4; without these overrides the next
+# scripted deploy would have silently restored 80 / 2 while reporting success.
+#
+# Each knob is pinned in BOTH directions. A test that only checks the default passes when the flag
+# does nothing; a test that only checks the override passes when the default has drifted. Before
+# these existed the whole suite passed identically with the override code removed.
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+
+def test_unset_overrides_keep_the_prod_shape_constants(tmp_path):
+    r = _run(tmp_path, config="preserve")
+    assert r.rc == 0, r.err
+    assert r.flag(r.deploy(), "--concurrency") == "80"
+    assert r.flag(r.deploy(), "--min-instances") == "2"
+    assert r.flag(r.deploy(), "--max-instances") == "20"
+
+
+@pytest.mark.parametrize("name", ["CONCURRENCY", "CONCURRENCY_LIMIT"])
+def test_either_concurrency_name_reaches_gcloud(tmp_path, name):
+    """CONCURRENCY_LIMIT is the repo's vocabulary; CONCURRENCY is the incident runbook's. An
+    operator reaching for this mid-incident must not get 80 because they typed the other one."""
+    r = _run(tmp_path, config="preserve", overrides={name: "20"})
+    assert r.rc == 0, r.err
+    assert r.flag(r.deploy(), "--concurrency") == "20"
+
+
+def test_disagreeing_concurrency_names_are_refused(tmp_path):
+    r = _run(tmp_path, config="preserve", overrides={"CONCURRENCY": "20", "CONCURRENCY_LIMIT": "40"})
+    assert r.rc == 2
+    assert "disagree" in r.err
+    assert not r.calls or all(c[:2] != ["run", "deploy"] for c in r.calls)
+
+
+def test_agreeing_concurrency_names_are_accepted(tmp_path):
+    r = _run(tmp_path, config="preserve", overrides={"CONCURRENCY": "20", "CONCURRENCY_LIMIT": "20"})
+    assert r.rc == 0, r.err
+    assert r.flag(r.deploy(), "--concurrency") == "20"
+
+
+@pytest.mark.parametrize("bad", ["0", "default", "007", "-5", "abc", "20 --min-instances 0"])
+def test_a_concurrency_that_would_silently_widen_is_refused(tmp_path, bad):
+    """`0` reads as UNLIMITED and `default` CLEARS the limit - both restore the 80 this override
+    exists to hold off, while the deploy reports success. They must fail before any revision
+    exists, not after."""
+    r = _run(tmp_path, config="preserve", overrides={"CONCURRENCY": bad})
+    assert r.rc == 2, f"{bad!r} was accepted: {r.err}"
+    assert all(c[:2] != ["run", "deploy"] for c in r.calls)
+
+
+@pytest.mark.parametrize(
+    "overrides,flag,expected",
+    [
+        ({"MIN_INSTANCES": "4"}, "--min-instances", "4"),
+        ({"MIN_INSTANCES": "0"}, "--min-instances", "0"),
+        ({"MAX_INSTANCES": "8"}, "--max-instances", "8"),
+    ],
+)
+def test_instance_overrides_reach_gcloud(tmp_path, overrides, flag, expected):
+    r = _run(tmp_path, config="preserve", overrides=overrides)
+    assert r.rc == 0, r.err
+    assert r.flag(r.deploy(), flag) == expected
+
+
+@pytest.mark.parametrize("overrides", [{"MIN_INSTANCES": "04"}, {"MIN_INSTANCES": "two"}, {"MAX_INSTANCES": "0"}, {"MAX_INSTANCES": "0x10"}])
+def test_malformed_instance_overrides_are_refused(tmp_path, overrides):
+    r = _run(tmp_path, config="preserve", overrides=overrides)
+    assert r.rc == 2, r.err
+    assert all(c[:2] != ["run", "deploy"] for c in r.calls)
+
+
+def test_an_override_reaches_the_candidate_revision_itself(tmp_path):
+    """The candidate IS the revision that gets promoted - `update-traffic --to-latest` carries no
+    shape flags - so an override that only landed on a later call would never take effect."""
+    r = _run(tmp_path, config="preserve", overrides={"CONCURRENCY_LIMIT": "20"})
+    assert r.rc == 0, r.err
+    deploy = r.deploy()
+    assert "--no-traffic" in deploy
+    assert r.flag(deploy, "--concurrency") == "20"
+    assert deploy.count("--concurrency") == 1
+    for call in r.traffic_calls():
+        assert "--concurrency" not in call
+
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# THE SHAPE IS ANNOUNCED BEFORE IT IS APPLIED
+#
+# The overrides above are only half a control. A successful run used to print exactly one line -
+# `deployed gateway -> ... (100% traffic)` - which is byte-identical whether CONCURRENCY_LIMIT=20
+# took effect or the operator fat-fingered the prefix and shipped the default 80. Mid-incident that
+# is the difference between a mitigation held and a mitigation silently reverted, with nothing on
+# screen to tell them apart.
+#
+# Every test here asserts the PRINTED value against the RECORDED ARGV of the same run. Asserting the
+# text alone would pass for a line that prints `concurrency=20` while gcloud receives 80 - which is
+# the whole failure the line exists to catch, reproduced inside its own test.
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+SHAPE_RE = re.compile(
+    r"^shape: concurrency=(?P<c>\S+) \((?P<c_src>[^)]*)\) "
+    r"min-instances=(?P<min>\S+) \((?P<min_src>[^)]*)\) "
+    r"max-instances=(?P<max>\S+) \((?P<max_src>[^)]*)\)$",
+    re.M,
+)
+
+
+def _shape(r: Run) -> dict[str, str]:
+    """The printed shape line, and the same three flags as gcloud actually received them.
+
+    Returned together on purpose: every assertion below gets to compare the two halves, and a
+    helper that returned only the text would quietly re-enable the failure mode being tested.
+    """
+    m = SHAPE_RE.search(r.out)
+    assert m, f"no `shape:` line on stdout:\n{r.out}"
+    deploy = r.deploy()
+    return {
+        **m.groupdict(),
+        "argv_c": r.flag(deploy, "--concurrency"),
+        "argv_min": r.flag(deploy, "--min-instances"),
+        "argv_max": r.flag(deploy, "--max-instances"),
+    }
+
+
+def test_the_printed_shape_is_the_shape_gcloud_gets_with_no_overrides(tmp_path):
+    r = _run(tmp_path, config="preserve")
+    assert r.rc == 0, r.err
+    s = _shape(r)
+    assert (s["c"], s["min"], s["max"]) == ("80", "2", "20")
+    assert (s["argv_c"], s["argv_min"], s["argv_max"]) == (s["c"], s["min"], s["max"])
+    # Concurrency's fallback is a literal 80 shared by both environments, not a per-env constant,
+    # and is labelled so - an operator told `prod constant` would go looking for a value the script
+    # does not have.
+    assert s["c_src"] == "default"
+    assert (s["min_src"], s["max_src"]) == ("prod constant", "prod constant")
+
+
+def test_the_printed_shape_is_the_shape_gcloud_gets_with_the_incident_overrides(tmp_path):
+    """The literal 2026-09-15 mitigation shape, and the case that makes the SOURCE tag load-bearing.
+
+    MAX_INSTANCES=20 is also the prod constant, so the printed VALUE is `20` whether the override
+    was read or dropped on the floor. Only the source tag separates "my override landed" from "the
+    default happened to agree with me" - which is the question the operator is actually asking.
+    """
+    r = _run(
+        tmp_path,
+        config="preserve",
+        overrides={"CONCURRENCY_LIMIT": "20", "MIN_INSTANCES": "4", "MAX_INSTANCES": "20"},
+    )
+    assert r.rc == 0, r.err
+    s = _shape(r)
+    assert (s["c"], s["min"], s["max"]) == ("20", "4", "20")
+    assert (s["argv_c"], s["argv_min"], s["argv_max"]) == (s["c"], s["min"], s["max"])
+    assert (s["c_src"], s["min_src"], s["max_src"]) == ("CONCURRENCY_LIMIT", "MIN_INSTANCES", "MAX_INSTANCES")
+
+
+@pytest.mark.parametrize("name", ["CONCURRENCY", "CONCURRENCY_LIMIT"])
+def test_the_printed_source_names_the_concurrency_variable_that_was_read(tmp_path, name):
+    """Both names work, so the line has to say which one it took. An operator who typed the alias
+    and saw the canonical name echoed back would have no way to tell the alias was honoured."""
+    r = _run(tmp_path, config="preserve", overrides={name: "20"})
+    assert r.rc == 0, r.err
+    s = _shape(r)
+    assert s["c"] == s["argv_c"] == "20"
+    assert s["c_src"] == name
+
+
+def test_a_zero_min_instances_prints_as_an_override_not_as_the_constant(tmp_path):
+    """MIN_INSTANCES=0 is a legitimate override (scale to zero) whose value is falsy. Reported as
+    `prod constant` it would read as "your override was ignored" on the one deploy where it was not."""
+    r = _run(tmp_path, config="preserve", overrides={"MIN_INSTANCES": "0"})
+    assert r.rc == 0, r.err
+    s = _shape(r)
+    assert s["min"] == s["argv_min"] == "0"
+    assert s["min_src"] == "MIN_INSTANCES"
+
+
+def test_the_printed_shape_follows_the_environments_own_constants(tmp_path):
+    """Staging's constants differ from prod's in both value and name. Pins the line to the env the
+    script resolved rather than to a prod-shaped string that happens to be right one time in two."""
+    r = _run(tmp_path, "staging", config="preserve")
+    assert r.rc == 0, r.err
+    s = _shape(r)
+    assert (s["min"], s["max"]) == ("1", "4")
+    assert (s["argv_min"], s["argv_max"]) == (s["min"], s["max"])
+    assert (s["min_src"], s["max_src"]) == ("staging constant", "staging constant")
+
+
+def test_the_shape_is_printed_before_the_deploy_it_describes(tmp_path):
+    """Order is the point. Printed after the promote it is a receipt for a shape already serving
+    traffic; printed before, a `(default)` where an override was expected is still cancellable with
+    ^C. `verifying candidate at` is echoed strictly after `run deploy` returns, so it anchors this."""
+    r = _run(tmp_path, config="preserve", overrides={"CONCURRENCY_LIMIT": "20"})
+    assert r.rc == 0, r.err
+    shape_at = r.out.index("shape: concurrency=")
+    assert shape_at < r.out.index("verifying candidate at"), r.out
+    assert shape_at < r.out.index("(100% traffic)"), r.out
+
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# THE RUNBOOK QUOTES THIS LINE, SO THE RUNBOOK IS PINNED TO IT
+#
+# docs/runbooks/operating_on_gcp_production.md teaches the operator to read the `shape:` line by
+# showing two of them verbatim, and its whole argument rests on which SOURCE TAG appears where.
+# Prose about output drifts silently from the output. It drifted once while this was being written:
+# the second block was first pasted from a run that omitted MAX_INSTANCES rather than misspelling
+# it, so it showed `(prod constant)` for a variable the documented command actually sets.
+#
+# A runbook that quotes output the script cannot produce is worse than one that quotes none: it is
+# read mid-incident, and it teaches the operator to accept a line that never appears.
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+RUNBOOK = REPO / "docs" / "runbooks" / "operating_on_gcp_production.md"
+
+# (documented line, the overrides the runbook says produce it). The second is the first with
+# MAX_INSTANCES misspelt - the runbook's point is that every NUMBER is identical and only the tag
+# moves, which is only true if both of these are real.
+RUNBOOK_SHAPE_LINES = [
+    ({"CONCURRENCY_LIMIT": "20", "MIN_INSTANCES": "4", "MAX_INSTANCES": "20"},
+     "shape: concurrency=20 (CONCURRENCY_LIMIT) min-instances=4 (MIN_INSTANCES) max-instances=20 (MAX_INSTANCES)"),
+    ({"CONCURRENCY_LIMIT": "20", "MIN_INSTANCES": "4", "MAX_INSTANCE": "20"},
+     "shape: concurrency=20 (CONCURRENCY_LIMIT) min-instances=4 (MIN_INSTANCES) max-instances=20 (prod constant)"),
+]
+
+
+def test_the_runbook_quotes_the_shape_lines_this_script_actually_prints():
+    """Both blocks must still be in the runbook, in order, exactly as written."""
+    doc = RUNBOOK.read_text()
+    quoted = re.findall(r"^shape: .*$", doc, re.M)
+    assert quoted == [line for _, line in RUNBOOK_SHAPE_LINES], (
+        "docs/runbooks/operating_on_gcp_production.md no longer quotes these lines in this order:\n"
+        + "\n".join(quoted)
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides,documented", RUNBOOK_SHAPE_LINES, ids=["as-documented", "MAX_INSTANCES-misspelt"]
+)
+def test_the_documented_shape_line_is_byte_exact_and_matches_gcloud(tmp_path, overrides, documented):
+    r = _run(tmp_path, "prod", config="preserve", overrides=overrides)
+    assert r.rc == 0, r.err
+    printed = [l for l in r.out.splitlines() if l.startswith("shape:")]
+    assert printed == [documented], f"runbook quotes:\n  {documented}\nscript printed:\n  " + "\n  ".join(printed)
+    # And the documented line is not merely text the script emits - it is the shape gcloud got.
+    s = _shape(r)
+    assert (s["argv_c"], s["argv_min"], s["argv_max"]) == (s["c"], s["min"], s["max"])
+
+
+RUNBOOK_GATEWAY_COMMAND = re.compile(
+    r"^(?P<prefix>(?:[A-Z_]+=\S+ )+)bash infra/gcp/deploy_gateway\.sh prod <full sha>$", re.M
+)
+
+
+def test_the_runbooks_gateway_command_is_the_one_this_script_accepts(tmp_path):
+    """The runbook's headline gateway invocation, RUN rather than grepped. A command whose variable
+    names have drifted from the script's is a mid-incident dead end - and the misspelt-variable
+    failure it warns about is precisely the one it would then be causing.
+
+    A `name in script_text` check cannot catch that: the old names survive in comments, and as
+    substrings of a renamed variable. So the prefix is parsed out of the runbook and handed to the
+    real script, and every shape knob must come back tagged with the name that was passed - not
+    `(default)` or `(prod constant)` - and reach gcloud with the documented value.
+    """
+    commands = RUNBOOK_GATEWAY_COMMAND.findall(RUNBOOK.read_text())
+    assert len(commands) == 1, f"expected one documented prod gateway command, found {commands}"
+    prefix = dict(kv.split("=", 1) for kv in commands[0].split())
+    assert prefix.pop("CONFIG") == "preserve"
+    assert set(prefix) == {"CONCURRENCY_LIMIT", "MIN_INSTANCES", "MAX_INSTANCES"}, prefix
+
+    r = _run(tmp_path, "prod", config="preserve", overrides=prefix)
+    assert r.rc == 0, r.err
+    s = _shape(r)
+    assert (s["c_src"], s["min_src"], s["max_src"]) == ("CONCURRENCY_LIMIT", "MIN_INSTANCES", "MAX_INSTANCES")
+    assert (s["argv_c"], s["argv_min"], s["argv_max"]) == (
+        prefix["CONCURRENCY_LIMIT"], prefix["MIN_INSTANCES"], prefix["MAX_INSTANCES"],
+    )

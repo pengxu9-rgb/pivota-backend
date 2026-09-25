@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
@@ -22,8 +23,12 @@ from services.agent_decision_gates import (
     agent_decision_gates_enabled,
     evaluate_agent_decision_gates,
 )
+from services.category_path_aliases import resolve as resolve_category_path
 from services.priced_offer_sql import priced_offer_exists_sql
-from services.region_pricing import has_offer_priced_for_region_sql
+from services.region_pricing import (
+    has_offer_priced_for_any_region_sql,
+    has_offer_priced_for_region_sql,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -192,6 +197,70 @@ def _extract_domain(url: str) -> Optional[str]:
         return host or None
     except Exception:  # noqa: BLE001
         return None
+
+
+def _leaf_category_required_for_serving() -> bool:
+    """OFF by default, and DO NOT TURN IT ON YET. The number is now measured.
+
+    This flag DELISTS rows, so it was written needing a count before anyone flipped it. That count
+    was taken against production on 2026-09-11 (in-VPC one-off job; the DB is on a private address,
+    see docs and pivota-backend#2172):
+
+        multi-segment rows            12,799   (serving-eligible 7,901)
+        ... that do NOT resolve()      4,154   (serving-eligible 2,987)
+
+    So flipping this today removes 2,987 of 7,901 serving rows -- 37.8% of the served index. By
+    writer:
+
+        enrichment_agent_v1        2,708      <-- one writer is almost the whole number
+        reviewed_ext_seed_mirror     206
+        codex_review_v1               71
+        regex_backfill                 2
+
+    AND THE CAUSE IS NOT BAD DATA, IT IS A BRANCH NODE. `enrichment_agent_v1` writes two-segment
+    paths that name a real branch of the taxonomy but not a leaf -- `beauty/makeup` (1,843 rows,
+    1,667 serving) and `beauty/skincare` (1,693 rows, 1,039 serving). Those rows are browsable
+    (`has_category_door` is True for both); they simply have no leaf. Delisting them would be
+    punishing a writer for being imprecise, not for being wrong, and would take a third of the index
+    off the shelf to do it.
+
+    THE ORDER IS: fix `enrichment_agent_v1` to emit a leaf, re-run the backfill in
+    scripts/backfill_pdp_category_path.py (which this change teaches to revisit bare domains), take
+    the count again, and only then flip this. Flipping first is an outage.
+    """
+    return str(os.getenv("CATEGORY_LEAF_REQUIRED_FOR_SERVING", "") or "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _has_resolvable_leaf_category(category_path: Optional[str]) -> bool:
+    """A row is categorised only when its path resolves to a taxonomy LEAF.
+
+    THIS IS THE ONE FENCE THAT REACHES EVERY WRITER. `category_path` is written by at least four
+    committed lanes across two repos and two languages -- the external-seed mirror, the Ulta
+    retailer mirror, the reviewed-category patch script, the enrichment agent -- plus at least one
+    out-of-repo actor (`category_label_source = 'codex_review_v1'` appears in prod and in ZERO
+    commits in either repository, i.e. hand-run SQL). No writer-side guard can reach that last one.
+    This predicate runs once per row, here, wherever the row came from.
+
+    USE resolve(), NOT has_category_door(). That is the whole bug:
+
+        resolve("beauty")            -> None
+        has_category_door("beauty")  -> True
+
+    `ANCESTOR_NODES` is built with `range(1, len(parts))`, so i == 1 is included and EVERY top-level
+    domain -- `beauty`, `fashion`, `electronics` -- is a taxonomy node with a "category door". A row
+    parked on a bare domain therefore passes every off-taxonomy health check while being unretrievable
+    by category at serving. That is why this cohort survived a taxonomy standardisation pass: nothing
+    was measuring it. Measured on the live index, 16 of 50 rows returned for "eau de parfum" sit on
+    bare `beauty`, including the whole Ariana Grande fragrance line and every PixiPerfume row.
+
+    Generic by construction: it asks for a leaf, so `fashion` and `electronics` are caught on the
+    same rule without naming them.
+    """
+    if not category_path:
+        return False
+    return resolve_category_path(str(category_path).strip()) is not None
 
 
 def _classify_product(
@@ -374,6 +443,14 @@ def _classify_product(
     elif domain_has_regression:
         blocker_code = "extractor_regression"
         blocker_detail = f"domain {domain!r} has regression alert in domain_extractor_baselines"
+    elif _leaf_category_required_for_serving() and not _has_resolvable_leaf_category(
+        row.get("category_path")
+    ):
+        blocker_code = "no_leaf_category"
+        blocker_detail = (
+            f"category_path {row.get('category_path')!r} does not resolve to a taxonomy LEAF; "
+            "a row that has not been categorised cannot be retrieved by category"
+        )
     elif agent_decision_gates_enabled():
         # Additive agent-decision-grade gates (PR4), only after all PDP gates
         # pass. Flag-gated, so default behavior is unchanged. Picked up by the
@@ -561,6 +638,42 @@ _HAS_PRICE_EXISTS = priced_offer_exists_sql("cp.product_key")
 # has_offer_priced_for_region_sql directly rather than reading this bit.
 _HAS_US_OFFER_EXISTS = has_offer_priced_for_region_sql("cp.product_key", "US")
 
+# The regions this deployment is willing to serve a priced offer for. DEFAULT "US",
+# so with nothing set the column below is the byte-identical string
+# `_HAS_US_OFFER_EXISTS` is — asserted in tests/test_region_pricing.py.
+#
+# WHY THIS IS CONFIGURATION AND NOT A CONSTANT. `no_us_offer` is a real, ENABLED
+# blocker in production, measured 2026-09-07: 398 of cocomo.sg's 399 rows and the
+# residual 12 of jsmbeauty.sg's 170 are blocked by it, and every one of them is a
+# correctly-ingested SGD row from a Singapore storefront whose UCP checkout reaches
+# ready_for_complete. The gate is doing exactly what it was written to do — it was
+# written for "the US K-beauty wedge" (services/agent_decision_gates) — so the
+# defect is not in the predicate, it is that a single deployment-wide US answer is
+# baked into a per-row bit. ADR-024 Phase 2a un-bakes that consumer by consumer;
+# this is one env var, not that refactor, and it changes nothing until an operator
+# names a second region.
+#
+# NOT DERIVED FROM THE ROW. A row's own market cannot be read here: catalog_offers
+# .market is a NOT NULL DEFAULT 'US' that no external-seed writer sets (mig 149),
+# so it says 'US' for the SGD rows too. Currency is the only truthful signal, and
+# this asks the only question currency can answer — "is this priced in something
+# one of our served regions expects" — never "convert it".
+_SERVING_REGIONS_ENV = "PIVOTA_SERVING_PRICING_REGIONS"
+
+
+def serving_pricing_regions() -> List[str]:
+    """The configured served regions, e.g. ['US'] or ['US', 'SG']. Never empty."""
+    import os
+
+    raw = os.getenv(_SERVING_REGIONS_ENV, "") or ""
+    regions = [part.strip().upper() for part in raw.split(",") if part.strip()]
+    return regions or ["US"]
+
+
+_HAS_SERVING_REGION_OFFER_EXISTS = has_offer_priced_for_any_region_sql(
+    "cp.product_key", serving_pricing_regions()
+)
+
 _ELIGIBILITY_COLUMNS = f"""
     cp.content_key,
     cp.product_key,
@@ -573,6 +686,7 @@ _ELIGIBILITY_COLUMNS = f"""
     cp.suppressed_at,
     cp.canonical_url,
     cp.category_kind,
+    cp.category_path,
     pqs.content_quality_score,
     pqs.model_readiness_score,
     pqs.conversion_potential_score,
@@ -611,6 +725,14 @@ _ELIGIBILITY_COLUMNS = f"""
     -- value is TRUE/FALSE and never NULL — an ABSENT key then unambiguously means
     -- "not computed by this query" rather than "no US offer".
     {_HAS_US_OFFER_EXISTS}      AS has_us_offer,
+    -- The same question asked of every region this deployment serves, not of the US
+    -- alone. Identical to has_us_offer until an operator sets PIVOTA_SERVING_PRICING
+    -- _REGIONS; it is what the agent-decision gate reads, so an SGD row can stop
+    -- being blocked as `no_us_offer` without anyone converting an amount.
+    -- has_us_offer stays beside it and stays literally about the US: it is a
+    -- meaningful stored fact, and overloading its name with a configurable answer
+    -- is how a column starts lying.
+    {_HAS_SERVING_REGION_OFFER_EXISTS}      AS has_serving_region_offer,
     -- Category concern list (skin concern for skincare, hair concern for
     -- haircare); both read the shared concerns_json. The category-attributes
     -- gate selects which category_kind this blocks for.
@@ -662,7 +784,9 @@ LEFT JOIN LATERAL (
     WHERE merchant_id = cp.merchant_id
       AND platform = cp.platform
       AND platform_product_id = cp.source_product_id
-    ORDER BY snapshot_date DESC
+    -- NOW() is transaction-stable: a replay can create equal timestamps with
+    -- different scores. The latest inserted snapshot must win that tie.
+    ORDER BY snapshot_date DESC, id DESC
     LIMIT 1
 ) pqs ON TRUE
 LEFT JOIN agent_pdp_view apv
@@ -750,7 +874,7 @@ SELECT
         WHERE pqs.merchant_id = cp.merchant_id
           AND pqs.platform = cp.platform
           AND pqs.platform_product_id = cp.source_product_id
-        ORDER BY pqs.snapshot_date DESC
+        ORDER BY pqs.snapshot_date DESC, pqs.id DESC
         LIMIT 1
     ) AS content_quality_score,
     (
@@ -759,7 +883,7 @@ SELECT
         WHERE pqs.merchant_id = cp.merchant_id
           AND pqs.platform = cp.platform
           AND pqs.platform_product_id = cp.source_product_id
-        ORDER BY pqs.snapshot_date DESC
+        ORDER BY pqs.snapshot_date DESC, pqs.id DESC
         LIMIT 1
     ) AS model_readiness_score,
     (
@@ -768,7 +892,7 @@ SELECT
         WHERE pqs.merchant_id = cp.merchant_id
           AND pqs.platform = cp.platform
           AND pqs.platform_product_id = cp.source_product_id
-        ORDER BY pqs.snapshot_date DESC
+        ORDER BY pqs.snapshot_date DESC, pqs.id DESC
         LIMIT 1
     ) AS conversion_potential_score,
     (
@@ -777,7 +901,7 @@ SELECT
         WHERE pqs.merchant_id = cp.merchant_id
           AND pqs.platform = cp.platform
           AND pqs.platform_product_id = cp.source_product_id
-        ORDER BY pqs.snapshot_date DESC
+        ORDER BY pqs.snapshot_date DESC, pqs.id DESC
         LIMIT 1
     ) AS quality_rules_version,
     (
@@ -786,7 +910,7 @@ SELECT
         WHERE pqs.merchant_id = cp.merchant_id
           AND pqs.platform = cp.platform
           AND pqs.platform_product_id = cp.source_product_id
-        ORDER BY pqs.snapshot_date DESC
+        ORDER BY pqs.snapshot_date DESC, pqs.id DESC
         LIMIT 1
     ) AS quality_scored_at,
     apv.image_url,
@@ -816,6 +940,7 @@ SELECT
     -- The two columns BELOW remain column-independent placeholders: beauty
     -- concerns/actives are computed only on the Postgres path.
     {_HAS_US_OFFER_EXISTS} AS has_us_offer,
+    {_HAS_SERVING_REGION_OFFER_EXISTS} AS has_serving_region_offer,
     NULL AS has_category_concern,
     NULL AS has_key_actives,
     EXISTS (
@@ -959,25 +1084,25 @@ WHERE content_key = :content_key
 """
 
 
-def _is_sqlite_database() -> bool:
-    db_url = str(getattr(database, "url", "") or "").lower()
+def _is_sqlite_database(db: Any = None) -> bool:
+    db_url = str(getattr(db or database, "url", "") or "").lower()
     return db_url.startswith(("sqlite://", "sqlite+aiosqlite://"))
 
 
-async def _fetch_regression_domains() -> Set[str]:
-    rows = await database.fetch_all(
+async def _fetch_regression_domains(*, db: Any = None) -> Set[str]:
+    rows = await (db or database).fetch_all(
         "SELECT domain FROM domain_extractor_baselines "
         "WHERE alert_state = 'regression'"
     )
     return {dict(row)["domain"] for row in rows}
 
 
-async def _fetch_eligibility_inputs(content_key: str) -> List[Dict[str, Any]]:
+async def _fetch_eligibility_inputs(content_key: str, *, db: Any = None) -> List[Dict[str, Any]]:
     """Fetch the current eligibility signal rows for one content_key."""
     if not content_key:
         return []
-    query = _SINGLE_QUERY_SQLITE if _is_sqlite_database() else _SINGLE_QUERY
-    rows = await database.fetch_all(query, {"content_key": content_key})
+    query = _SINGLE_QUERY_SQLITE if _is_sqlite_database(db) else _SINGLE_QUERY
+    rows = await (db or database).fetch_all(query, {"content_key": content_key})
     return [dict(row) for row in rows]
 
 
@@ -1010,11 +1135,13 @@ async def _fetch_eligibility_inputs_for_content_keys(
 async def _upsert_index_pipeline_state(
     content_key: str,
     state: Dict[str, Any],
+    *,
+    db: Any = None,
 ) -> None:
     """Upsert one classified state row into index_pipeline_state."""
     upsert_values = dict(state)
     upsert_values["content_key"] = content_key
-    await database.execute(_UPSERT_QUERY, upsert_values)
+    await (db or database).execute(_UPSERT_QUERY, upsert_values)
 
 
 async def _fetch_serving_eligible_index_rows(
@@ -1233,6 +1360,8 @@ async def recompute_serving_eligibility(
     content_key: str,
     *,
     reason: Optional[str] = None,
+    db: Any = None,
+    strict: bool = False,
 ) -> bool:
     """Re-evaluate serving_eligible for one content_key and upsert.
 
@@ -1240,18 +1369,27 @@ async def recompute_serving_eligibility(
     result + UPSERT. Safe under concurrent callers; the UPSERT handles
     last-writer-wins and subsequent callers see the latest data.
 
+    With strict=True, missing inputs and execution errors raise; a successfully
+    computed policy rejection still returns False. db pins every core read/write
+    to the caller's connection. Legacy defaults remain best-effort.
+
     Returns the computed serving_eligible boolean, or False if the row didn't
     exist / couldn't be evaluated. Never raises: failures are logged and the
     row stays in its current state for the nightly safety net to catch.
     """
     try:
-        rows = await _fetch_eligibility_inputs(content_key)
+        db_args = {"db": db} if db is not None else {}
+        rows = await _fetch_eligibility_inputs(content_key, **db_args)
         if not rows:
+            if strict:
+                raise ValueError("eligibility_inputs_missing")
             return False
 
-        regression_domains = await _fetch_regression_domains()
+        regression_domains = await _fetch_regression_domains(**db_args)
         new_state = _classify_content_key_rows(rows, regression_domains)
         if new_state is None:
+            if strict:
+                raise ValueError("eligibility_classification_missing")
             return False
 
         # Capture prior eligibility AND the prior sig (one cheap PK lookup) to
@@ -1260,7 +1398,7 @@ async def recompute_serving_eligibility(
         # after a takedown the newly-classified sig may differ from the sig that
         # was actually advertised — the engines must re-crawl the URL that WAS
         # public, not the survivor's.
-        prev_row = await database.fetch_one(
+        prev_row = await (db or database).fetch_one(
             "SELECT serving_eligible, pivota_signature_id FROM index_pipeline_state "
             "WHERE content_key = :ck",
             {"ck": content_key},
@@ -1268,30 +1406,36 @@ async def recompute_serving_eligibility(
         prev_eligible = bool(prev_row and prev_row["serving_eligible"])
         prev_sig = str((prev_row and prev_row["pivota_signature_id"]) or "")
 
-        await _upsert_index_pipeline_state(content_key, new_state)
+        await _upsert_index_pipeline_state(content_key, new_state, **db_args)
 
         # IndexNow, both directions — non-blocking + best-effort, never affects
         # the recompute result. IndexNow has no "removed" verb: resubmitting the
         # URL asks the engine to re-crawl, see the 404/410, and drop it — which
         # is exactly what a takedown needs instead of waiting for organic
         # re-crawl while Search Console accumulates 404 churn.
-        if new_state.get("serving_eligible") and not prev_eligible:
-            # Newly citable: ask engines (Bing → ChatGPT search, Yandex, …) to
-            # crawl the canonical PDP.
-            sig = new_state.get("pivota_signature_id")
-            if sig and str(sig).startswith("sig_"):
-                from services.catalog_sync_service import pivota_canonical_pdp_url
-                from services.indexnow import schedule_submit_url
+        try:
+            if new_state.get("serving_eligible") and not prev_eligible:
+                # Newly citable: ask engines (Bing → ChatGPT search, Yandex, …) to
+                # crawl the canonical PDP.
+                sig = new_state.get("pivota_signature_id")
+                if sig and str(sig).startswith("sig_"):
+                    from services.catalog_sync_service import pivota_canonical_pdp_url
+                    from services.indexnow import schedule_submit_url
 
-                schedule_submit_url(pivota_canonical_pdp_url(str(sig)))
-        elif prev_eligible and not new_state.get("serving_eligible"):
-            # Taken down: ask engines to re-crawl the previously-advertised URL
-            # so the dead page leaves their index promptly.
-            if prev_sig.startswith("sig_"):
-                from services.catalog_sync_service import pivota_canonical_pdp_url
-                from services.indexnow import schedule_submit_url
+                    schedule_submit_url(pivota_canonical_pdp_url(str(sig)))
+            elif prev_eligible and not new_state.get("serving_eligible"):
+                # Taken down: ask engines to re-crawl the previously-advertised URL
+                # so the dead page leaves their index promptly.
+                if prev_sig.startswith("sig_"):
+                    from services.catalog_sync_service import pivota_canonical_pdp_url
+                    from services.indexnow import schedule_submit_url
 
-                schedule_submit_url(pivota_canonical_pdp_url(prev_sig))
+                    schedule_submit_url(pivota_canonical_pdp_url(prev_sig))
+        except Exception as exc:  # notifications never redefine the persisted policy result
+            logger.warning({
+                "event": "serving_eligibility_indexnow_failed",
+                "content_key": content_key, "error": str(exc),
+            })
 
         if reason:
             logger.info({
@@ -1309,4 +1453,6 @@ async def recompute_serving_eligibility(
             "reason": reason,
             "error": str(exc),
         })
+        if strict:
+            raise
         return False

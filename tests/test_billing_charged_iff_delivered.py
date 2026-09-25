@@ -8,14 +8,16 @@ Enforced three ways:
      silently skip the refund).
   2. The refund is idempotent PER RUN + CREDIT KIND (reason excluded from the
      ledger key), so two failure paths reaching the same run can't double-pay.
-  3. /actions/start charges BEFORE drafting and refunds a failed draft (the
-     old order handed out free drafts when the charge failed after the fact).
+  3. /actions/start persists a measured draft, debit and task atomically.
+     Failed generation is never charged; task failure rolls back the transaction.
 
 The free-allowance counter (count_runs_for_merchant_by_subject) excludes
 failed runs for the same reason — a failed audit must not burn a free credit.
 """
 from __future__ import annotations
+from contextlib import asynccontextmanager
 
+import json
 import os
 import re
 import tempfile
@@ -25,6 +27,7 @@ from types import SimpleNamespace
 from typing import Any, Dict, List
 
 import pytest
+from fastapi import HTTPException
 
 WORKER_SRC = Path("services/audit_run_worker.py").read_text()
 
@@ -316,7 +319,7 @@ def actions_env(monkeypatch):
     monkeypatch.setattr(mar_routes, "fetch_audit_run_by_id", fake_fetch)
     monkeypatch.setattr(mar_routes, "consume_credits", fake_consume)
     monkeypatch.setattr(mar_routes, "refund_credits", fake_refund)
-    monkeypatch.setattr(mar_routes, "answer_grounded_question", fake_answer)
+    monkeypatch.setattr(mar_routes, "generate_measured_text", fake_answer)
     monkeypatch.setattr(
         mar_routes, "_build_ask_context", lambda report, pk: {"ctx": 1},
     )
@@ -330,19 +333,33 @@ def actions_env(monkeypatch):
         tasks_db, "find_pending_supersede_candidates", fake_candidates,
     )
     monkeypatch.setattr(tasks_db, "record_task_created", fake_record_task)
+    @asynccontextmanager
+    async def transaction():
+        yield
+    async def execute(*a, **kw):
+        return None
+    monkeypatch.setattr(mar_routes, "database", SimpleNamespace(transaction=transaction, execute=execute))
+    async def measured(**kw):
+        if env.consume_raises:
+            raise env.consume_raises
+        answer = await kw["generate"]()
+        if not answer:
+            raise ValueError("No draft")
+        log.append("consume")
+        return {"answer": answer, "credits_charged": 0.0672}
+    monkeypatch.setattr(mar_routes, "run_measured_generation", measured)
     env.routes = mar_routes
     return env
 
 
 @pytest.mark.asyncio
-async def test_action_draft_charges_before_generating(actions_env):
+async def test_action_draft_charges_measured_usage_after_generating(actions_env):
     out = await actions_env.routes.start_merchant_audit_action(
         _action_body(actions_env.routes), merchant_id="m1",
     )
-    # Order is the invariant: the charge lands before the LLM call, so a
-    # failed/raced charge can never produce a free deliverable.
-    assert actions_env.log.index("consume") < actions_env.log.index("draft")
-    assert out["credits_charged"] == 5
+    # Actual usage is available only after generation; transaction tests cover rollback.
+    assert actions_env.log.index("draft") < actions_env.log.index("consume")
+    assert out["credits_charged"] == 0.0672
     assert out["draft"] == "the draft"
 
 
@@ -353,7 +370,8 @@ async def test_action_draft_refunds_when_generation_fails(actions_env):
         _action_body(actions_env.routes), merchant_id="m1",
     )
     refunds = [e for e in actions_env.log if e.startswith("refund:5:refund:action_draft:")]
-    assert refunds, f"no refund recorded; log={actions_env.log}"
+    assert not refunds
+    assert "consume" not in actions_env.log
     assert out["credits_charged"] == 0
     assert out["draft"] is None
     assert out["task_id"] == "task-1"  # the tracked task is still created
@@ -432,3 +450,163 @@ async def test_action_draft_returns_placement(actions_env, monkeypatch):
     out3 = await mar_routes.start_merchant_audit_action(lever_only, merchant_id="m1")
     assert out3["placement"]["kind"] == "channel"
     assert out3["placement"]["target_host"] is None
+
+
+# ---- 7. /ask: the recovery projection is EXTRA context, not a replacement --
+
+
+def _ask_report():
+    """A retained report with a narrative and two SKUs, plus enough for the
+    recovery projection to have something in it."""
+    return {
+        "merchant_narrative": {
+            "headline_story": "AI sends your buyers to retailers.",
+            "whats_working": {"summary": "You are named on category questions."},
+            "where_youre_losing": {"summary": "No first-party citation."},
+            "prioritized_actions": [
+                {"headline": "Publish a comparison page",
+                 "title": "Publish a comparison page",
+                 "severity": "high"},
+            ],
+            "honest_limits": ["Only 12 queries were probed."],
+        },
+        "per_sku_reports": [
+            {"sku_key": "sku-a", "sku_title": "Alpha Serum",
+             "identity": {"name": "Alpha Serum"}, "band": "blocked"},
+            {"sku_key": "sku-b", "sku_title": "Beta Cream",
+             "identity": {"name": "Beta Cream"}, "band": "partial"},
+        ],
+    }
+
+
+@pytest.fixture
+def ask_env(monkeypatch):
+    import routes.merchant_audit_routes as mar_routes
+
+    log: List[str] = []
+    env = SimpleNamespace(log=log, report=_ask_report(), context=None,
+                          routes=mar_routes)
+
+    async def fake_fetch(run_id):
+        return {"merchant_id": "m1", "subject_type": "merchant_url",
+                "report_jsonb": env.report}
+
+    async def fake_answer(*, system_prompt, user_message):
+        log.append("answer")
+        env.context = json.loads(
+            user_message.split("CONTEXT:\n", 1)[1].split("\n\nQUESTION:", 1)[0]
+        )
+        return "here you go"
+
+    async def fake_consume(merchant_id, op, idem, *, probes=None, **kwargs):
+        log.append("consume")
+        return {"credits": 1}
+
+    async def fake_paid(merchant_id):
+        return True
+
+    monkeypatch.setattr(mar_routes, "fetch_audit_run_by_id", fake_fetch)
+    monkeypatch.setattr(mar_routes, "generate_measured_text", fake_answer)
+    monkeypatch.setattr(mar_routes, "consume_credits", fake_consume)
+    monkeypatch.setattr(mar_routes, "merchant_is_paid_tier", fake_paid)
+    monkeypatch.setattr(mar_routes, "estimate_probe_credits", lambda spec: (1, 0))
+    async def measured(**kw):
+        answer = await kw["generate"]()
+        log.append("consume")
+        return {"answer": answer, "credits_charged": 0.0672}
+    monkeypatch.setattr(mar_routes, "run_measured_generation", measured)
+    return env
+
+
+def _ask_body(mar_module, **kw):
+    return mar_module.MerchantAuditAskRequest(
+        run_id="run-12345678", question="Where am I losing?", **kw
+    )
+
+
+@pytest.mark.asyncio
+async def test_ask_context_keeps_the_narrative_and_the_product_key_focus(ask_env):
+    """recovery_from_report REPLACED _build_ask_context, dropping the overview,
+    whats_working, where_youre_losing, honest limits and the per-SKU slice —
+    while `product_key` still keyed the idempotent debit. It focuses nothing if
+    the context it focuses is gone."""
+    await ask_env.routes.answer_merchant_audit_question(
+        _ask_body(ask_env.routes, product_key="sku-b"), merchant_id="m1",
+    )
+
+    context = ask_env.context
+    assert context["overview"]["headline"] == "AI sends your buyers to retailers."
+    assert context["overview"]["whats_working"]
+    assert context["overview"]["where_youre_losing"]
+    assert context["overview"]["honest_limits"]
+    # The FOCUS: product_key picked one SKU, and it is the one in the context.
+    assert context["product"]["name"] == "Beta Cream"
+    assert "products" not in context
+    # ...and the recovery projection is merged in beside it, at the top level
+    # where the paywall can see stages[].actions.
+    assert context["audience"] == "revenue_recovery"
+    assert [s["stage"] for s in context["stages"]]
+
+
+@pytest.mark.asyncio
+async def test_ask_without_a_product_key_still_lists_the_skus(ask_env):
+    await ask_env.routes.answer_merchant_audit_question(
+        _ask_body(ask_env.routes), merchant_id="m1",
+    )
+    names = [p["name"] for p in ask_env.context["products"]]
+    assert names == ["Alpha Serum", "Beta Cream"]
+
+
+@pytest.mark.asyncio
+async def test_ask_409s_on_a_contentless_report_and_never_debits(ask_env):
+    """`if not context` went dead when the context became a projection: a
+    projection is ALWAYS a populated dict (audience, builder version, three
+    stage scaffolds), so an audit that used to 409 for free started charging a
+    credit to answer from nothing."""
+    ask_env.report = {}
+    with pytest.raises(HTTPException) as exc:
+        await ask_env.routes.answer_merchant_audit_question(
+            _ask_body(ask_env.routes), merchant_id="m1",
+        )
+    assert exc.value.status_code == 409
+    assert ask_env.log == [], "a 409'd ask must neither answer nor debit"
+
+
+@pytest.mark.asyncio
+async def test_ask_charges_when_it_answers(ask_env):
+    out = await ask_env.routes.answer_merchant_audit_question(
+        _ask_body(ask_env.routes), merchant_id="m1",
+    )
+    assert ask_env.log == ["answer", "consume"]
+    assert out["credits_charged"] == 0.0672
+
+
+def test_the_rebuilt_recovery_projection_carries_actions_for_the_paywall():
+    """recovery_from_report hardcoded actions=[], so every stage's action list
+    was empty on every rebuilt projection — the "what to do" layer vanished,
+    and _strip_actions_for_free_tier (which counts and empties
+    stages[].actions) had nothing to strip and stamped a lock over zero
+    counts. extract_actions is the same reader persist_canonical_evidence uses
+    to WRITE action_plan_items, so a rebuilt projection now carries what a
+    persisted one carries."""
+    import routes.merchant_audit_routes as mar_routes
+    from services.revenue_recovery_report import recovery_from_report
+
+    report = {
+        "per_product": [{
+            "product_key": "shopify|sig_abc",
+            "merchant_view": {"actions": [
+                {"title": "Publish a comparison page", "severity": "high",
+                 "lever": "content", "body": "Write it."},
+            ]},
+        }],
+    }
+    projection = recovery_from_report(report, run_id="run-12345678")
+    actions = [a for s in projection["stages"] for a in s["actions"]]
+    assert actions, "no actions reached the projection; the paywall strips nothing"
+    assert any(a["title"] == "Publish a comparison page" for a in actions)
+
+    # ...and the paywall can now actually see and strip them.
+    locked = mar_routes._strip_actions_for_free_tier(projection)
+    assert locked["locked_counts"]["prioritized_actions"] == len(actions)
+    assert all(not s["actions"] for s in locked["stages"])

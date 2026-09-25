@@ -310,4 +310,8 @@ async def test_brand_broad_fallback_triggers_when_strict_rows_have_no_brand_rele
     assert metrics.get("brand_relevant_rows") == 0
     assert metrics.get("broad_scope_fallback_used") is True
     assert metrics.get("broad_scope_rows_fetched") == 1
-    assert any(call.get("market") is None for call in calls)
+    # Broad brand fallback expands recall terms, but it must stay inside the
+    # requested/default market. Dropping the market here can leak CA offers
+    # into a US result page (and was the source of the SG cross-market bug).
+    assert calls
+    assert all(call.get("market") == "US" for call in calls)

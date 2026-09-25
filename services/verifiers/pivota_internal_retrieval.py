@@ -24,6 +24,7 @@ Evidence:
 
 from __future__ import annotations
 
+from typing import Optional
 import logging
 from typing import Any, Dict
 

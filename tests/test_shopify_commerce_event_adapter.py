@@ -1,6 +1,11 @@
 from datetime import datetime, timezone
 
+import databases
 import pytest
+from sqlalchemy import create_engine, select
+
+from db.commerce_interactions import commerce_interaction_events, commerce_interactions
+from db.database import metadata
 
 
 def _order():
@@ -19,6 +24,7 @@ def _order():
         "gateway": "shopify_payments",
         "cart_token": "cart-1",
         "checkout_id": 2001,
+        "checkout_token": "checkout-token-1",
         "customer": {
             "id": 3001,
             "email": "private@example.com",
@@ -66,7 +72,8 @@ def test_shopify_order_lifecycle_maps_to_safe_canonical_event(topic, event_type,
     assert event.buyer_id == "3001"
     assert event.click_id == "clk_abcdefgh"
     assert event.cart_id == "cart-1"
-    assert event.checkout_id == "2001"
+    assert event.checkout_id == "checkout-token-1"
+    assert event.metadata["native_checkout_id"] == "2001"
     assert event.amount_cents == 2550
     assert event.currency == "USD"
     assert event.metadata["native_line_items"] == [
@@ -82,6 +89,109 @@ def test_shopify_order_lifecycle_maps_to_safe_canonical_event(topic, event_type,
     serialized = event.model_dump_json()
     for private in ("private@example.com", "555-0100", "Private", "private street", "secret"):
         assert private not in serialized
+
+
+def test_shopify_order_falls_back_to_numeric_checkout_id_when_token_is_absent():
+    from services.shopify_commerce_event_adapter import map_shopify_webhook
+
+    order = _order()
+    order.pop("checkout_token")
+    event = map_shopify_webhook(
+        order,
+        topic="orders/create",
+        delivery_id="delivery-numeric-checkout",
+        store_id="store-shopify",
+    ).events[0]
+
+    assert event.checkout_id == "2001"
+    assert event.metadata["native_checkout_id"] == "2001"
+
+
+@pytest.mark.asyncio
+async def test_shopify_pixel_and_order_webhook_with_same_checkout_token_stitch(
+    tmp_path, monkeypatch
+):
+    from services import commerce_interaction_service as interaction_service
+    from services.merchant_event_ingest_service import ingest_merchant_event_batch
+    from services.merchant_web_collector_service import build_web_collector_batch
+    from services.shopify_commerce_event_adapter import map_shopify_webhook
+
+    db_path = tmp_path / "shopify-checkout-token-stitch.sqlite3"
+    sync_engine = create_engine(f"sqlite:///{db_path}")
+    metadata.create_all(
+        sync_engine,
+        tables=[commerce_interactions, commerce_interaction_events],
+        checkfirst=True,
+    )
+    sync_engine.dispose()
+
+    test_database = databases.Database(f"sqlite+aiosqlite:///{db_path}")
+    await test_database.connect()
+    monkeypatch.setattr(interaction_service, "database", test_database)
+    monkeypatch.setattr(interaction_service, "IS_POSTGRES", False)
+
+    try:
+        pixel_batch = build_web_collector_batch(
+            {
+                "events": [
+                    {
+                        "event_id": "shopify_pixel:checkout-completed-1",
+                        "event_type": "checkout.submitted",
+                        "occurred_at": "2026-08-30T09:59:00Z",
+                        "session_id": "shopify-client-1",
+                        "checkout_id": "checkout-token-1",
+                    }
+                ]
+            },
+            claims={
+                "merchant_id": "merchant-shopify",
+                "store_id": "store-shopify",
+                "platform": "shopify",
+            },
+            source="shopify_web_pixel",
+            now=datetime(2026, 8, 30, 10, 0, tzinfo=timezone.utc),
+        )
+        webhook_batch = map_shopify_webhook(
+            _order(),
+            topic="orders/create",
+            delivery_id="delivery-order-1",
+            store_id="store-shopify",
+        )
+        # SQLite drops timezone information on persisted datetimes. Production
+        # Postgres retains it; normalize this SQLite-only fixture so the test
+        # remains focused on cross-source identifier stitching.
+        for batch in (pixel_batch, webhook_batch):
+            for event in batch.events:
+                event.occurred_at = event.occurred_at.replace(tzinfo=None)
+
+        pixel_result = await ingest_merchant_event_batch(
+            merchant_id="merchant-shopify",
+            batch=pixel_batch,
+            agent_identity_confidence="browser_observed",
+            write_path="shopify_web_pixel",
+        )
+        webhook_result = await ingest_merchant_event_batch(
+            merchant_id="merchant-shopify",
+            batch=webhook_batch,
+            agent_identity_confidence="platform_asserted",
+            write_path="shopify_webhook",
+        )
+
+        interactions = await test_database.fetch_all(select(commerce_interactions))
+        events = await test_database.fetch_all(select(commerce_interaction_events))
+
+        assert len(interactions) == 1
+        assert len(events) == 2
+        assert pixel_result["events"][0]["interaction_id"] == webhook_result["events"][0][
+            "interaction_id"
+        ]
+        interaction = dict(interactions[0])
+        assert interaction["session_id"] == "shopify-client-1"
+        assert interaction["checkout_id"] == "checkout-token-1"
+        assert interaction["order_id"] == "1001"
+        assert interaction["metadata"]["native_checkout_id"] == "2001"
+    finally:
+        await test_database.disconnect()
 
 
 def test_shopify_event_id_is_entity_stable_across_webhook_deliveries():
@@ -246,6 +356,8 @@ async def test_shopify_best_effort_ingest_resolves_store_and_writes_batch(monkey
     assert result["status"] == "accepted"
     assert result["store_id"] == "store-1"
     assert captured[0]["merchant_id"] == "merchant-1"
+    assert captured[0]["agent_identity_confidence"] == "platform_asserted"
+    assert captured[0]["write_path"] == "shopify_webhook"
     assert captured[0]["batch"].events[0].event_type == "order.paid"
 
 

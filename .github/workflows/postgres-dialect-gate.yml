@@ -118,6 +118,19 @@ on:
       - "core/**"
       - "db/migrations/**"
       - "tests/test_*_postgres.py"
+      # The subprocess entrypoint one stamping-backfill gate test runs `main()` through. It
+      # carries no `test_` prefix (pytest must not collect it), so the glob above misses it,
+      # and a PR touching only this file would not run the one test that executes it. The
+      # narrow-filter warning above, once more.
+      - "tests/backfill_variant_id_provenance_stamps_fault_driver.py"
+      # Same reason, for the Reap cart-link lane. Every case its Postgres gate runs lives in a
+      # shared, non-`test_` module that tests/test_reap_agentic_cart_link_postgres.py collects
+      # by `import *`, and that module imports the validator's accept/refuse table from
+      # tests/test_reap_cart_link.py, which the `_postgres` glob does not match either. A PR
+      # touching only one of these would otherwise skip the gate that runs them on Postgres.
+      - "tests/reap_cart_link_cases.py"
+      - "tests/test_reap_cart_link.py"
+      - "tests/integration/test_recovery_postgres.py"
       # The two files that can neuter this ENTIRE job, neither matched above.
       # tests/conftest.py pins DATABASE_URL — today conditionally, but making
       # that unconditional turns every gate file's `pytestmark` into a skip,
@@ -134,12 +147,25 @@ on:
       # this file would not run the job that gives it its Postgres arm — and the
       # Postgres arm is the half that tests the statements which actually ship.
       - "tests/test_quality_backfill_partial_update.py"
+      - "tests/test_quality_backfill_enqueue_dedupe.py"
+      # tests/test_tierb_cart_link_eligibility_postgres.py IMPORTS its database cases from these
+      # two (so the storage rules and the mocked end-to-end job run on Postgres). Neither matches
+      # the `_postgres` glob, so a PR touching only them would not run the gate that runs them.
+      - "tests/test_tierb_cart_link_eligibility.py"
+      - "tests/test_tierb_cart_link_eligibility_job.py"
       - "requirements.txt"
       - "requirements-dev.txt"
       - ".github/workflows/postgres-dialect-gate.yml"
 
+# Cancel a SUPERSEDED run on a PR branch only. On main every push is a merge commit whose
+# gate result deploy-prod REQUIRES on that exact SHA (`require a green test sweep`): keying
+# the group on `github.ref` made two merges inside one gate window cancel the first commit's
+# gate, and deploy-prod then refused that deploy as "cancelled before it reached a verdict" --
+# #2115 (cancelled by #2112, 2026-09-07) and #2118 (cancelled by #2123 nine seconds later,
+# 2026-09-08), both green changes. Same key the Backend Test Sweep already uses: a PR number
+# on pull_request, the run id on push, so main runs never share a group.
 concurrency:
-  group: postgres-dialect-gate-${{ github.ref }}
+  group: postgres-dialect-gate-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 jobs:
@@ -282,10 +308,14 @@ jobs:
           # (`skipif(not IS_POSTGRES)`, on cases about asyncpg's datetime
           # encoding), inert here because IS_POSTGRES is true — the preflight
           # asserts that — so the zero-skip check below still holds.
-          # KEEP THIS ENTRY LAST: one of those cases ALTERs the timestamp columns
-          # of product_quality_backfill_jobs and restores them, so a ride-along
-          # added after it would run while that switch is in flight.
-          for f in tests/test_pdp_renderability.py tests/test_databases_textclause_params.py tests/test_quality_backfill_partial_update.py; do
+          # KEEP test_quality_backfill_partial_update.py LAST: one of its cases
+          # ALTERs the timestamp columns of product_quality_backfill_jobs and
+          # restores them, so a ride-along added after it would run while that
+          # switch is in flight. test_quality_backfill_enqueue_dedupe.py rides
+          # along for the same reason it exists: the cooldown lookup has a
+          # Postgres twin that is different text from the SQLite one, and its
+          # time-zone cases can only fail here.
+          for f in tests/test_pdp_renderability.py tests/test_databases_textclause_params.py tests/test_quality_backfill_enqueue_dedupe.py tests/test_quality_backfill_partial_update.py; do
             [ -e "$f" ] && files="$files $f"
           done
           echo "files=$files" >> "$GITHUB_OUTPUT"
@@ -374,10 +404,45 @@ jobs:
           print(f"gate modules executed: {', '.join(sorted(ran))}")
           PY
 
+      # AFTER the gate steps, deliberately. This step creates its own
+      # database and runs its own pytest; when it sat before the
+      # preflight/discover/execute/assert chain, a failure in it aborted
+      # the job before the gate those four steps exist to enforce had run
+      # at all — a red build that proves nothing about the dialect gate,
+      # and one whose message points somewhere else entirely. It keeps its
+      # own junit assertion (a skipped recovery test is still a failure).
+      - name: Recovery report JSONB to authenticated HTTP
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PYDB'
+          import asyncio
+          import asyncpg
+          async def create_test_database():
+              connection = await asyncpg.connect(
+                  host="localhost", port=5432, user="postgres",
+                  password="postgres", database="postgres")
+              try:
+                  await connection.execute("CREATE DATABASE recovery_contract_test")
+              finally:
+                  await connection.close()
+          asyncio.run(create_test_database())
+          PYDB
+          RUN_RECOVERY_POSTGRES=1 \
+            DATABASE_URL=postgresql://postgres:postgres@localhost:5432/recovery_contract_test \
+            python -m pytest tests/integration/test_recovery_postgres.py -q --junitxml=pytest-recovery-postgres.xml
+          python - <<'PYTEST'
+          import xml.etree.ElementTree as ET
+          cases = list(ET.parse("pytest-recovery-postgres.xml").getroot().iter("testcase"))
+          assert cases and not any(c.find("skipped") is not None for c in cases), "Recovery PostgreSQL test did not execute"
+          PYTEST
+
       - name: Upload junit report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: postgres-dialect-gate-${{ github.run_id }}
-          path: pytest-postgres.xml
+          path: |
+            pytest-postgres.xml
+            pytest-recovery-postgres.xml
           retention-days: 14

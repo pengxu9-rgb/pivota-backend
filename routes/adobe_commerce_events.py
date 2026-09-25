@@ -20,6 +20,7 @@ from services.adobe_io_webhook_auth import (
     verify_adobe_io_signature,
 )
 from services.merchant_event_ingest_service import MerchantEventBatch, ingest_merchant_event_batch
+from services.telemetry_ingress import current_ingress, telemetry_ingress_route
 
 
 router = APIRouter(prefix="/webhooks/adobe-commerce", tags=["Adobe Commerce Events"])
@@ -115,6 +116,7 @@ async def validate_adobe_io_webhook(
 
 
 @router.post("/{store_id}")
+@telemetry_ingress_route("adobe_io_events")
 async def receive_adobe_commerce_event(
     store_id: str,
     request: Request,
@@ -178,6 +180,9 @@ async def receive_adobe_commerce_event(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid Adobe I/O event signature",
         )
+    ingress = current_ingress(request)
+    ingress.identify(merchant_id=store["merchant_id"], store_id=store_id)
+    await ingress.enforce_rate_limit("platform", store_id)
 
     mapped = []
     ignored = 0
@@ -203,6 +208,8 @@ async def receive_adobe_commerce_event(
             batch=MerchantEventBatch(
                 events=mapped[offset: offset + MAX_ADOBE_IO_EVENTS_PER_BATCH]
             ),
+            agent_identity_confidence="platform_asserted",
+            write_path="adobe_io_events",
         )
         aggregate["accepted"] += int(result.get("accepted") or 0)
         aggregate["duplicates"] += int(result.get("duplicates") or 0)

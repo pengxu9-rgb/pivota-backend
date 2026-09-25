@@ -83,6 +83,9 @@ def to_validated_record(crawled: Dict[str, Any]) -> Dict[str, Any]:
             "attribute_summary": (crawled.get("description") or "")[:400],
             "image_url": crawled.get("image_url"),
             "source_domain": SOURCE_DOMAIN,
+            # Carry the page observation to the canonical planner as well as
+            # the offer intake. Unknown currency stays unknown and is refused.
+            "currency": crawled.get("currency"),
             "gtin": None,  # StyleKorean does not expose GTIN; hardened via brand-official enrich
             "rating_value": crawled.get("rating_value"),
             "rating_count": crawled.get("rating_count"),

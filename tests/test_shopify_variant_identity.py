@@ -16,6 +16,7 @@ against a real Postgres, by tests/test_backfill_shopify_variant_ids_postgres.py.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
 import pytest
@@ -25,6 +26,7 @@ from services.shopify_variant_identity import (
     parse_product_js,
     product_js_url,
     sole_stamped_variant_id,
+    sole_verified_cart_variant_id,
     stamp_variant_ids,
     storefront_is_shopify,
 )
@@ -40,6 +42,42 @@ def _live(vid: str, title: str, *, options: List[str] | None = None, price: int 
         "available": available,
         "sku": sku,
     }
+
+
+def test_cart_proof_requires_fresh_same_url_sole_live_variant() -> None:
+    now = datetime.now(timezone.utc)
+    seed = {"snapshot": {"variants": [{"shopify_variant_id": "11"}],
+                         "shopify_cart_proof": {
+                             "source": "products_js_v1",
+                             "product_js_url": "https://brand.com/products/serum.js",
+                             "live_variant_count": 1,
+                             "variant_id": "11",
+                             "checked_at": now.isoformat(),
+                         }}}
+    url = ["https://brand.com/products/serum"]
+    assert sole_verified_cart_variant_id(seed, product_urls=url, shop_domain="brand.com", now=now) == "11"
+    seed["snapshot"]["shopify_cart_proof"]["live_variant_count"] = 2
+    assert sole_verified_cart_variant_id(seed, product_urls=url, shop_domain="brand.com", now=now) is None
+    seed["snapshot"]["shopify_cart_proof"]["live_variant_count"] = 1
+    assert sole_verified_cart_variant_id(seed, product_urls=["https://brand.com/products/other"], shop_domain="brand.com", now=now) is None
+    assert sole_verified_cart_variant_id(
+        seed, product_urls=["https://brand.com/products/new"],
+        shop_domain="brand.com", now=now,
+    ) is None
+    assert sole_verified_cart_variant_id(seed, product_urls=url, shop_domain="other.com", now=now) is None
+    for unsafe_url in ("http://brand.com/products/serum.js",
+                       "https://brand.com:8080/products/serum.js"):
+        seed["snapshot"]["shopify_cart_proof"]["product_js_url"] = unsafe_url
+        assert sole_verified_cart_variant_id(
+            seed, product_urls=[unsafe_url], shop_domain="brand.com", now=now,
+        ) is None
+    seed["snapshot"]["shopify_cart_proof"]["product_js_url"] = "https://brand.com/products/serum.js"
+    assert sole_verified_cart_variant_id(seed, product_urls=url, shop_domain="brand.com", now=now + timedelta(days=8)) is None
+    seed["snapshot"]["variants"].append("unknown second variant")
+    assert sole_verified_cart_variant_id(seed, product_urls=url, shop_domain="brand.com", now=now) is None
+    seed["snapshot"]["variants"].pop()
+    seed["snapshot"].pop("shopify_cart_proof")
+    assert sole_verified_cart_variant_id(seed, product_urls=url, shop_domain="brand.com", now=now) is None
 
 
 # ---------------------------------------------------------------- URL derivation
@@ -425,6 +463,7 @@ def test_end_to_end_an_evidence_stamped_seed_redirects_into_a_prefilled_cart() -
     redirect_url = asyncio.run(
         _make_external_redirect_url(
             market="US",
+            market_observed=True,
             tool="*",
             destination_url="https://genabelle.com/products/melacare-jelly-touch-dual-pad",
             utm_template=None,
@@ -467,6 +506,7 @@ def test_end_to_end_control_the_same_seed_without_evidence_stays_referral_only()
     redirect_url = asyncio.run(
         _make_external_redirect_url(
             market="US",
+            market_observed=True,
             tool="*",
             destination_url="https://genabelle.com/products/melacare-jelly-touch-dual-pad",
             utm_template=None,
@@ -576,6 +616,7 @@ def test_a_declined_prefill_is_not_rescued_by_a_numeric_sku() -> None:
     redirect_url = asyncio.run(
         _make_external_redirect_url(
             market="US", tool="*",
+            market_observed=True,
             destination_url="https://genabelle.com/products/melacare-jelly-touch-dual-pad",
             utm_template=None, ctx={"seedId": "eps_1"}, allowed_domains=["genabelle.com"],
             merchant_id=identity["merchant_id"], product_id=identity["product_id"],
@@ -602,6 +643,7 @@ def test_a_caller_that_cannot_justify_an_id_gets_no_cart_at_all() -> None:
     without = asyncio.run(
         _make_external_redirect_url(
             market="US", tool="*", destination_url="https://shop.example/products/x",
+            market_observed=True,
             utm_template=None, ctx={"source": "connected_catalog"},
             allowed_domains=["shop.example"], merchant_id="merch_1", product_id="p1",
             variant_id="41234567890123", cart_variant_id=None,
@@ -614,6 +656,7 @@ def test_a_caller_that_cannot_justify_an_id_gets_no_cart_at_all() -> None:
     with_claim = asyncio.run(
         _make_external_redirect_url(
             market="US", tool="*", destination_url="https://shop.example/products/x",
+            market_observed=True,
             utm_template=None, ctx={"source": "connected_catalog"},
             allowed_domains=["shop.example"], merchant_id="merch_1", product_id="p1",
             variant_id="41234567890123", cart_variant_id="41234567890123",

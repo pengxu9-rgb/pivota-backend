@@ -10,6 +10,118 @@ from services import commerce_interaction_service as service
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "sequence",
+    [
+        [("verified-agent", "verified"), ("browser-claim", "browser_observed")],
+        [("browser-claim", "browser_observed"), ("verified-agent", "verified")],
+        [("verified-agent", "verified"), (None, "platform_asserted")],
+    ],
+)
+async def test_stitched_interaction_preserves_highest_confidence_agent_identity(
+    tmp_path, monkeypatch, sequence
+):
+    from services import merchant_event_ingest_service as ingest_module
+    from services.merchant_event_ingest_service import (
+        MerchantEventBatch,
+        ingest_merchant_event_batch,
+    )
+
+    db_path = tmp_path / "commerce-agent-identity-merge.sqlite3"
+    sync_engine = create_engine(f"sqlite:///{db_path}")
+    metadata.create_all(
+        sync_engine,
+        tables=[commerce_interactions, commerce_interaction_events],
+        checkfirst=True,
+    )
+    sync_engine.dispose()
+
+    test_database = databases.Database(f"sqlite+aiosqlite:///{db_path}")
+    await test_database.connect()
+    monkeypatch.setattr(service, "database", test_database)
+    monkeypatch.setattr(service, "IS_POSTGRES", False)
+
+    try:
+        for index, (agent_id, confidence) in enumerate(sequence):
+            identity_context = (
+                {
+                    "source_channel": "chatgpt",
+                    "query_source": "agent_recommendation",
+                    "protocol_name": "mcp",
+                    "llm_provider": "openai",
+                    "llm_model": "gpt-5.4",
+                }
+                if agent_id == "verified-agent"
+                else {}
+            )
+            batch = MerchantEventBatch.model_validate(
+                {
+                    "events": [
+                        {
+                            "event_id": f"identity-event-{index}",
+                            "event_type": (
+                                "product.viewed" if index == 0 else "checkout.started"
+                            ),
+                            "occurred_at": f"2026-08-26T12:0{index}:00Z",
+                            "platform": "custom",
+                            "store_id": "store-a",
+                            "session_id": "shared-session",
+                            "agent_id": agent_id,
+                            **identity_context,
+                        }
+                    ]
+                }
+            )
+            # SQLite drops timezone data; keep comparisons within this fixture naive.
+            batch.events[0].occurred_at = batch.events[0].occurred_at.replace(tzinfo=None)
+            # The identity-precedence rule under test spans tiers no single
+            # production write path may assert; bypass the pairing guard.
+            # Both the batch ingest and record_commerce_event check the pairing.
+            monkeypatch.setattr(
+                ingest_module, "resolve_ledger_authority", lambda _wp, _c: "merchant"
+            )
+            monkeypatch.setattr(
+                service, "resolve_ledger_authority", lambda _wp, _c: "merchant"
+            )
+            await ingest_merchant_event_batch(
+                merchant_id="merchant-a",
+                batch=batch,
+                agent_identity_confidence=confidence,
+                write_path="merchant_hmac_batch",
+            )
+
+        rows = await test_database.fetch_all(select(commerce_interactions))
+        assert len(rows) == 1
+        interaction = dict(rows[0])
+        assert interaction["agent_id"] == "verified-agent"
+        assert interaction["metadata"]["agent_id"] == "verified-agent"
+        assert interaction["metadata"]["agent_identity_confidence"] == "verified"
+        assert interaction["metadata"]["traffic"]["agent_id"] == "verified-agent"
+        for field, expected in {
+            "source_channel": "chatgpt",
+            "query_source": "agent_recommendation",
+            "protocol_name": "mcp",
+            "llm_provider": "openai",
+            "llm_model": "gpt-5.4",
+        }.items():
+            assert interaction[field] == expected
+            assert interaction["metadata"][field] == expected
+            assert interaction["metadata"]["traffic"][field] == expected
+
+        from services.traffic_taxonomy_service import taxonomy_from_row
+
+        derived = taxonomy_from_row(interaction)
+        assert derived["agent_id"] == "verified-agent"
+        assert derived["source_channel"] == "chatgpt"
+        assert derived["query_source"] == "agent_recommendation"
+        assert derived["protocol_name"] == "mcp"
+        assert derived["llm_provider"] == "openai"
+        assert derived["llm_model"] == "gpt-5.4"
+    finally:
+        await test_database.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_merge_rejects_cross_store_candidates_before_mutation():
     with pytest.raises(
         ValueError, match="cannot merge commerce interactions across stores"

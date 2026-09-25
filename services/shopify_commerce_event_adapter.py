@@ -7,8 +7,10 @@ from typing import Any, Dict, List, Optional
 
 from services.commerce_attribution_service import (
     extract_click_id_from_note_attributes,
+    extract_pivota_order_id_from_note_attributes,
     shopify_order_total_to_cents,
 )
+from services.commerce_order_ref import build_order_ref, pivota_order_ref
 from services.merchant_event_ingest_service import MerchantCommerceEvent, MerchantEventBatch
 
 
@@ -91,6 +93,10 @@ def _order_metadata(
         "native_financial_status": _text(order.get("financial_status")),
         "native_fulfillment_status": _text(order.get("fulfillment_status")),
         "native_payment_method": _text(order.get("gateway")),
+        # Shopify pixels expose checkout.token, while order webhooks can expose
+        # both checkout_token and the numeric checkout_id. Keep the numeric ID
+        # for diagnostics without using it as the cross-source stitch key.
+        "native_checkout_id": _text(order.get("checkout_id")),
         "native_line_items": _line_items(order.get("line_items")),
         "native_discount_total": order.get("current_total_discounts")
         or order.get("total_discounts"),
@@ -108,6 +114,32 @@ def _order_metadata(
     }
 
 
+def _resolve_order_ref(
+    order_id: str,
+    *,
+    marker_source: Any,
+    pivota_order_id: Optional[str],
+) -> Optional[str]:
+    """The canonical ref for a Shopify order: Pivota's if it originated here.
+
+    Two independent ways to recognise a Pivota-originated order, in the order
+    they are cheap:
+
+    1. the ``pivota_order_id`` note attribute Pivota's own order writeback
+       stamps onto the platform order — present in the webhook body itself;
+    2. the ``orders.shopify_order_id`` lookup the ingest performs and passes
+       in, which covers orders written back before the marker existed.
+
+    Neither → the order was placed on the storefront and its system of record
+    IS Shopify, so the ref is ``shopify:<native id>``.
+    """
+    marker = extract_pivota_order_id_from_note_attributes(marker_source)
+    pivota_id = _text(marker) or _text(pivota_order_id)
+    if pivota_id:
+        return pivota_order_ref(pivota_id)
+    return build_order_ref("shopify", order_id)
+
+
 def _order_events(
     order: Dict[str, Any],
     *,
@@ -115,6 +147,7 @@ def _order_events(
     delivery_id: Optional[str],
     store_id: str,
     fallback_occurred_at: Optional[datetime],
+    pivota_order_id: Optional[str] = None,
 ) -> MerchantEventBatch:
     order_id = _text(order.get("id") or order.get("order_number") or order.get("name"))
     if not order_id:
@@ -147,8 +180,13 @@ def _order_events(
                 buyer_id=_text(customer.get("id")),
                 click_id=extract_click_id_from_note_attributes(order.get("note_attributes")),
                 cart_id=_text(order.get("cart_token")),
-                checkout_id=_text(order.get("checkout_id") or order.get("checkout_token")),
+                checkout_id=_text(order.get("checkout_token") or order.get("checkout_id")),
                 order_id=order_id,
+                order_ref=_resolve_order_ref(
+                    order_id,
+                    marker_source=order.get("note_attributes"),
+                    pivota_order_id=pivota_order_id,
+                ),
                 trace_id=trace_id,
                 amount_cents=amount_cents,
                 currency=currency,
@@ -165,11 +203,17 @@ def _refund_events(
     delivery_id: Optional[str],
     store_id: str,
     fallback_occurred_at: Optional[datetime],
+    pivota_order_id: Optional[str] = None,
 ) -> MerchantEventBatch:
     refund_id = _text(refund.get("id"))
     order_id = _text(refund.get("order_id"))
     if not refund_id or not order_id:
         raise ValueError("Shopify refund webhook is missing refund or order id")
+    # A refund body carries no note_attributes, so the ingest's
+    # orders.shopify_order_id lookup is the only marker available here.
+    order_ref = _resolve_order_ref(
+        order_id, marker_source=None, pivota_order_id=pivota_order_id
+    )
     trace_id = _text(delivery_id) or _payload_fingerprint(refund)
     created_at = _occurred_at(
         refund.get("processed_at"), refund.get("created_at"), fallback_occurred_at
@@ -191,6 +235,7 @@ def _refund_events(
             source="shopify_webhook",
             store_id=store_id,
             order_id=order_id,
+            order_ref=order_ref,
             refund_id=refund_id,
             trace_id=trace_id,
             metadata=base_metadata,
@@ -229,6 +274,7 @@ def _refund_events(
                 store_id=store_id,
                 payment_id=transaction_id,
                 order_id=order_id,
+                order_ref=order_ref,
                 refund_id=refund_id,
                 trace_id=trace_id,
                 amount_cents=amount_cents,
@@ -250,8 +296,14 @@ def map_shopify_webhook(
     delivery_id: Optional[str],
     store_id: str,
     occurred_at: Optional[datetime] = None,
+    pivota_order_id: Optional[str] = None,
 ) -> MerchantEventBatch:
-    """Map a verified Shopify lifecycle webhook into the canonical ledger."""
+    """Map a verified Shopify lifecycle webhook into the canonical ledger.
+
+    ``pivota_order_id`` is the ingest's ``orders.shopify_order_id`` resolution:
+    the fallback that recognises a Pivota-originated order written back before
+    the ``pivota_order_id`` note attribute existed.
+    """
     normalized_topic = str(topic or "").strip().lower()
     if normalized_topic not in SUPPORTED_SHOPIFY_TOPICS:
         raise UnsupportedShopifyCommerceEvent(
@@ -268,6 +320,7 @@ def map_shopify_webhook(
             delivery_id=delivery_id,
             store_id=store_id,
             fallback_occurred_at=occurred_at,
+            pivota_order_id=pivota_order_id,
         )
     return _order_events(
         payload,
@@ -275,4 +328,5 @@ def map_shopify_webhook(
         delivery_id=delivery_id,
         store_id=store_id,
         fallback_occurred_at=occurred_at,
+        pivota_order_id=pivota_order_id,
     )

@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 from db.database import database
 from services.merchant_store_service import get_primary_store
 from services.shopify_access_token_service import resolve_shopify_admin_access_token
+from services.shopify_domain import normalize_myshopify_domain
 from services.shopify_integration_verify import register_webhooks_best_effort, verify_shopify_integration
 from utils.auth import get_current_employee
 
@@ -48,6 +49,7 @@ _SWEEP_WEBHOOK_TOPICS: List[str] = [
     "orders/updated",
     "orders/paid",
     "orders/cancelled",
+    "refunds/create",
     "fulfillments/create",
     "fulfillments/update",
     "orders/fulfilled",
@@ -82,11 +84,17 @@ async def ops_verify_shopify(
     """
     if not request.callback_base_url or not request.callback_base_url.strip():
         raise HTTPException(status_code=400, detail="callback_base_url is required")
-    report = await verify_shopify_integration(
-        merchant_id=merchant_id,
-        callback_base_url=request.callback_base_url,
-        api_version=request.api_version or "2025-10",
-    )
+    try:
+        report = await verify_shopify_integration(
+            merchant_id=merchant_id,
+            callback_base_url=request.callback_base_url,
+            api_version=request.api_version or "2025-10",
+        )
+    except ValueError as exc:
+        # Without this the deliberately-worded refusal below reaches the generic handler as a bare
+        # 500 with no detail — on exactly the misconfigured merchant an operator is here to debug.
+        # Matches how /integrations/shopify/verify already maps it.
+        raise HTTPException(status_code=400, detail=str(exc))
     return {"status": "success", "report": report, "requested_by": current_user.get("sub")}
 
 
@@ -123,7 +131,12 @@ async def ops_resubscribe_shopify_webhooks(
     if not store_info or (store_info.get("platform") or "").lower() != "shopify":
         raise HTTPException(status_code=400, detail="Primary store is not Shopify")
 
-    shop_domain = store_info.get("domain") or ""
+    # Pinned before the resolve, which POSTs client credentials to {domain}/admin/oauth/access_token.
+    shop_domain = normalize_myshopify_domain(store_info.get("domain")) or ""
+    if not shop_domain:
+        raise HTTPException(
+            status_code=400, detail="Stored Shopify domain is not a *.myshopify.com host"
+        )
     access_token, _ = await resolve_shopify_admin_access_token(
         shop_domain=shop_domain,
         api_key_raw=store_info.get("api_key_raw") or store_info.get("api_key"),
@@ -205,8 +218,9 @@ async def ops_resubscribe_all_shopify_webhooks(
     for row in rows or []:
         store = dict(row)
         merchant_id = store.get("merchant_id")
-        shop_domain = (store.get("domain") or "").strip()
         store_id = str(store.get("store_id") or "").strip() or None
+        # Bound before the try so the except handler below can log it whatever happens.
+        shop_domain = ""
         summary: Dict[str, Any] = {
             "merchant_id": merchant_id,
             "shop_domain": shop_domain,
@@ -216,6 +230,20 @@ async def ops_resubscribe_all_shopify_webhooks(
             "error": None,
         }
         try:
+            # Inside the try ON PURPOSE. One unpinnable row must not abort the sweep, and a guard
+            # placed above the try would do exactly that for any input it cannot handle -- the
+            # failure mode this loop exists to prevent.
+            shop_domain = normalize_myshopify_domain(store.get("domain")) or ""
+            summary["shop_domain"] = shop_domain
+            if not shop_domain:
+                # Recorded with its OWN reason rather than falling through to
+                # "missing_credentials", which would send an operator looking for a token problem
+                # that is not there. store_id is carried because shop_domain is deliberately not
+                # echoed, and merchant_id alone does not name the offending row.
+                summary["error"] = "domain_not_a_myshopify_host"
+                summary["store_id"] = store_id
+                results.append(summary)
+                continue
             access_token, _meta = await resolve_shopify_admin_access_token(
                 shop_domain=shop_domain,
                 api_key_raw=store.get("api_key"),
@@ -265,7 +293,7 @@ async def ops_sync_shopify_returns(
     if not store_info or (store_info.get("platform") or "").lower() != "shopify":
         raise HTTPException(status_code=400, detail="Primary store is not Shopify")
 
-    shop_domain = store_info.get("domain") or ""
+    shop_domain = normalize_myshopify_domain(store_info.get("domain")) or ""
     access_token = store_info.get("api_key") or ""
     if not shop_domain or not access_token:
         raise HTTPException(status_code=400, detail="Missing Shopify credentials")

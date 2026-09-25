@@ -15,6 +15,8 @@ esac
 [ -n "$BACKEND_TAG" ] && [ -n "$GATEWAY_TAG" ] || { echo "backend-tag and gateway-tag are required" >&2; exit 2; }
 
 GCLOUD="${GCLOUD:-gcloud}"; REGION=us-west1; SHARED=pivota-shared
+# shellcheck source=infra/gcp/_serving_revision.sh
+. "$(cd "$(dirname "$0")" && pwd)/_serving_revision.sh"
 SECRET=STORE_AUDIT_UCP_PROBE_INTERNAL_KEY
 CRAWL_SA="sa-store-audit-ucp-crawl@$PROJECT.iam.gserviceaccount.com"
 SELECTOR_SA="sa-store-audit-ucp-selector@$PROJECT.iam.gserviceaccount.com"
@@ -41,13 +43,8 @@ WEB_URL="$(printf '%s' "$WEB_SPEC" | python3 -c 'import json,sys; print(json.loa
 # The serving revision may appear either as a pinned revisionName or as a
 # latestRevision=true target (deploy_backend.sh promotion leaves the candidate
 # tag riding on the latest entry), so resolve both shapes.
-WEB_REVISION="$(printf '%s' "$WEB_SPEC" | python3 -c '
-import json,sys
-status=json.load(sys.stdin).get("status",{})
-full=[x for x in status.get("traffic",[]) if x.get("percent")==100]
-if len(full)!=1: print(""); raise SystemExit
-entry=full[0]
-print(status.get("latestReadyRevisionName","") if entry.get("latestRevision") else entry.get("revisionName",""))')"
+# THE 100%-TRAFFIC REVISION, via the shared helper — one definition rather than a fifth copy.
+WEB_REVISION="$(serving_revision web || true)"
 [ -n "$WEB_REVISION" ] || { echo "web needs exactly one 100%-traffic revision" >&2; exit 2; }
 READY="$("$GCLOUD" run revisions describe "$WEB_REVISION" --region "$REGION" --format=json | python3 -c '
 import json,sys

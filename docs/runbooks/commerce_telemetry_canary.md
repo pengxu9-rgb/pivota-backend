@@ -8,15 +8,17 @@ stitching, and funnel-stage materialization.
 ## Safety boundary
 
 The harness is read-only unless `--write-canary` is supplied. Write mode appends
-eight synthetic events to the selected connected store. Use a dedicated canary
-merchant/store whenever possible. Event, interaction, session, click, cart,
+eight synthetic events to the selected connected store and is permitted only for
+a dedicated canary store. Event, interaction, session, click, cart,
 checkout, payment, order, and refund IDs are namespaced with
 `telemetry_canary_*`, and the source/surface are `ops_commerce_telemetry_canary`
 and `ops_canary`.
 
 The canary never calls a platform API, creates a real order, charges a PSP,
 issues a real refund, changes webhook subscriptions, or writes buyer PII. The
-amounts are synthetic analytics facts in the canary store scope only.
+amounts are synthetic analytics facts in the canary store scope only. Default
+merchant funnel summaries exclude `surface=ops_canary`; operators can inspect
+these events only by explicitly requesting that surface.
 
 Deployment liveness is read from the backend's public `/health` route; `/version`
 supplies the commit used by `--expected-git-sha`.
@@ -28,6 +30,7 @@ supplies the commit used by `--expected-git-sha`.
 - The merchant has an active connected store matching `--store-id`.
 - A merchant JWT is available for scoped analytics reads.
 - Write mode additionally requires the merchant HMAC API key.
+- `--confirm-dedicated-canary-store` must exactly repeat `--store-id` in write mode.
 
 ## Read-only audit
 
@@ -55,6 +58,7 @@ python scripts/smoke_commerce_telemetry_canary.py \
   --merchant-jwt "$MERCHANT_JWT" \
   --merchant-api-key "$PIVOTA_MERCHANT_API_KEY" \
   --write-canary \
+  --confirm-dedicated-canary-store store_cafe24_canary \
   --output-json reports/commerce-telemetry-cafe24-signoff.json \
   --output-md reports/commerce-telemetry-cafe24-signoff.md
 ```
@@ -73,7 +77,7 @@ Re-run a previous proof without adding ledger events by passing its `--run-id`.
 
 ## Pilot matrix
 
-Run one write signoff for each production pilot store:
+Run one write signoff for a dedicated canary store representing each pilot adapter:
 
 1. Cafe24
 2. Shopify after the Web Pixel bridge lands
@@ -85,7 +89,7 @@ Run one write signoff for each production pilot store:
 
 For native adapters, this synthetic signoff proves the shared event bus and
 stitching layer. It does not replace a signed native-webhook canary. Complete
-each pilot with one real platform lifecycle delivery and compare its order,
+each pilot separately with one real platform lifecycle delivery and compare its order,
 payment, and refund facts with the platform/PSP source of truth.
 
 ## Pass criteria

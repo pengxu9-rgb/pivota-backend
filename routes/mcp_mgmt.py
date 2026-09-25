@@ -14,7 +14,7 @@ from time import monotonic
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
-from utils.auth import get_current_user
+from utils.auth import EMPLOYEE_STAFF_ROLES, get_current_user
 from db.database import database
 
 SUPPORTED_PLATFORMS = ["shopify", "wix", "woocommerce", "bigcommerce"]
@@ -37,7 +37,7 @@ async def get_mcp_status(
     current_user: dict = Depends(get_current_user)
 ):
     """Configuration-derived MCP status: every field comes from the database."""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
 
     try:
@@ -112,7 +112,7 @@ async def test_mcp_connection(
     platform API (the old implementation returned random.randint "response
     times" and hardcoded "connected" verdicts, so a real outage looked healthy).
     """
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
 
     try:
@@ -196,7 +196,7 @@ async def get_mcp_merchants(
     current_user: dict = Depends(get_current_user)
 ):
     """Get merchants with MCP connections"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -246,7 +246,7 @@ async def get_mcp_analytics(
     current_user: dict = Depends(get_current_user)
 ):
     """Get MCP analytics"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -323,7 +323,7 @@ async def sync_all_stores(
     Uses the same universal sync pipeline as the merchant-facing Shopify/Wix
     sync endpoints, instead of just updating last_sync timestamps.
     """
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -433,7 +433,7 @@ async def get_mcp_logs(
     up as logs: a fresh random log_id on every request and an unconditional
     "success" status for syncs whose outcome was never recorded.
     """
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
 
     try:

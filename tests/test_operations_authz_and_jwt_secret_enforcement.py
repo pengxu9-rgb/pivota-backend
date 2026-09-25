@@ -790,22 +790,61 @@ def test_no_operations_route_depends_on_the_query_string_verifier():
 
     utils.auth.verify_jwt_token takes a bare `token: str`. Anything using it as
     a dependency puts the credential back in the URL, and the failure is silent
-    — the route keeps working, it just leaks. routes/auth_routes.py defines its
-    OWN bearer-based function of the same name, which is easy to confuse at an
-    import site.
+    — the route keeps working, it just leaks. routes/auth_routes.py defines a
+    bearer-based function of the SAME NAME (now a thin adapter over
+    utils.auth.get_current_user), which is easy to confuse at an import site.
     """
+    # routes/auth_routes.py DEFINES the bearer-based verify_jwt_token, so
+    # depending on that name there is correct -- but the exemption is
+    # CONDITIONAL, and that condition is the whole point. An audit of the
+    # first cut caught it: exempting the file outright meant that if
+    # auth_routes itself imported utils.auth's query-string version, shadowing
+    # its own definition, this guard went quiet -- in precisely the file the
+    # docstring calls "easy to confuse at an import site". The heuristic it
+    # replaced ("is 'verify_jwt_token' within 300 characters after
+    # 'from utils.auth import'") did still clear the file correctly, but on a
+    # character count rather than a rule; it says nothing about which
+    # definition is in scope.
+    #
+    # So: ask the AST who actually bound the name. A file is an offender if it
+    # depends on `verify_jwt_token` and imported it from utils.auth -- whoever
+    # it is, auth_routes included.
+    import ast
+
+    def _imports_it_from_utils_auth(src: str) -> bool:
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            # Unparseable: fall back to the conservative textual answer rather
+            # than silently exempting the file.
+            return "from utils.auth import" in src and "verify_jwt_token" in src
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module == "utils.auth":
+                if any(a.name == "verify_jwt_token" for a in node.names):
+                    return True
+        return False
+
+    def _defines_it(src: str) -> bool:
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            return False
+        return any(
+            isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and n.name == "verify_jwt_token"
+            for n in ast.walk(tree)
+        )
+
     offenders = []
     for route_file in sorted((REPO_ROOT / "routes").glob("*.py")):
         src = route_file.read_text(encoding="utf-8")
         if "Depends(verify_jwt_token)" not in src:
             continue
-        # routes/auth_routes.py defines its OWN header-based verify_jwt_token,
-        # so depending on it there is correct. Only utils.auth's version binds a
-        # query parameter, and importing THAT is what makes the difference.
-        imported_from_utils = "from utils.auth import" in src and "verify_jwt_token" in (
-            src.split("from utils.auth import")[1][:300]
-        )
-        if imported_from_utils:
+        if _imports_it_from_utils_auth(src):
+            offenders.append(route_file.name)
+        elif not _defines_it(src):
+            # Depends on a name it neither defined nor imported from
+            # utils.auth -- a star-import or a re-export. Not provably safe.
             offenders.append(route_file.name)
     assert not offenders, (
         "these bind the credential as a query parameter by depending on "

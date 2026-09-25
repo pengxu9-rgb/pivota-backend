@@ -151,11 +151,7 @@ def test_contract_envelope_and_score_block():
     assert score["band_thresholds"] == [6.0, 7.5, 9.0]
     # None subscores (category_visibility on per_sku runs) are omitted, not zeroed.
     assert [s["key"] for s in score["subscores"]] == ["visibility", "attribution"]
-    assert score["delta"] == {
-        "raw": 5,
-        "previous_audit_run_id": "audit-0",
-        "days_since_last_audit": 14,
-    }
+    assert score["delta"] is None  # Unqualified historical deltas are not comparable.
 
 
 def test_display_score_preserves_small_deltas():
@@ -629,7 +625,7 @@ def test_no_exclusions_keeps_historical_semantics():
     assert score["unmeasured_excluded"] == []
     assert score["weakest_dimension"]["key"] == "routability"
     assert score["explainer"] and "Not counted" not in score["explainer"]
-    assert score["delta"] is not None
+    assert score["delta"] is None
 
 
 def test_wedge_route_declares_routability_unmeasurable():
@@ -668,8 +664,8 @@ def test_since_last_audit_passthrough_and_absence():
     }
     out = build_report_summary(report)["since_last_audit"]
     assert out["days_since_last"] == 7
-    assert out["material_movements"] == 1
-    assert out["basis_same"] is True
+    assert out["material_movements"] == 0
+    assert out["basis_same"] is None
     assert out["movements"][0]["label"] == "AI visibility"  # verbatim
 
 
@@ -713,11 +709,11 @@ def test_reaudit_delta_end_to_end_on_real_per_sku_shape():
     # visibility = weakest dim (20 -> 33), attribution = citation (20 -> 46)
     assert moves["visibility"]["from"] == 20 and moves["visibility"]["to"] == 33
     assert moves["attribution"]["from"] == 20 and moves["attribution"]["to"] == 46
-    assert moves["attribution"]["is_material"] is True
+    assert moves["attribution"]["is_material"] is False
     # And the contract counter reads the real key end-to-end.
     current["reaudit_delta"] = delta
     out = build_report_summary(current)["since_last_audit"]
-    assert out["material_movements"] >= 1
+    assert out["material_movements"] == 0
 
 
 def test_share_of_voice_prompt_level_counts():
@@ -913,3 +909,87 @@ def test_progress_block_reads_root_outreach_outcomes():
     # First audit / absent → empty, no crash.
     assert _progress({})["available"] is False
     assert _progress({"outreach_outcomes": {"is_first_audit": True}})["is_first_audit"] is True
+
+
+# ---------------------------------------------------------------------------
+# A RETAINED report re-serves a delta decided by whatever contract was live
+# when the run completed. _since_last_audit already rewrites its movements
+# against today's basis rule — it just passed the persisted HEADLINE through
+# verbatim, so "Material change … improved: AI visibility" rendered directly
+# beside movements that all read unknown / not_comparable.
+# ---------------------------------------------------------------------------
+
+
+def _persisted_improved_delta(basis: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "is_first_audit": False,
+        "days_since_last": 30,
+        "headline": "Material change since your last audit 30 days ago: "
+                    "improved: AI visibility.",
+        "measurement_basis": basis,
+        "movements": [
+            {
+                "signal": "visibility",
+                "label": "AI visibility",
+                "from": 41,
+                "to": 63,
+                "is_material": True,
+                "direction": "improved",
+            }
+        ],
+    }
+
+
+def test_retained_improved_delta_on_a_non_comparable_basis_loses_the_claim():
+    from services.report_summary_builder import _since_last_audit
+
+    out = _since_last_audit(
+        {"reaudit_delta": _persisted_improved_delta(
+            {"same": None, "reason": "measurement_basis_missing"}
+        )}
+    )
+
+    assert out["movements"][0]["direction"] == "unknown"
+    assert out["movements"][0]["detection"]["verdict"] == "not_comparable"
+    # The headline must agree with the movements beside it.
+    assert out["headline"].startswith("Not comparable to your last audit")
+    assert "improved" not in out["headline"]
+    assert "Material change" not in out["headline"]
+    assert "keep the current plan running" not in out["headline"]
+
+
+def test_retained_delta_headline_shares_the_producer_helper():
+    from services.audit_delta import not_comparable_headline
+    from services.report_summary_builder import _since_last_audit
+
+    basis = {"same": False, "reason": "measurement_basis_changed",
+             "basis_divergence": "measurement_basis"}
+    out = _since_last_audit({"reaudit_delta": _persisted_improved_delta(basis)})
+    assert out["headline"] == not_comparable_headline(basis, 30)
+
+
+def test_retained_comparable_delta_keeps_its_persisted_headline():
+    from services.report_summary_builder import _since_last_audit
+
+    out = _since_last_audit(
+        {"reaudit_delta": _persisted_improved_delta(
+            {"same": True, "contract_version": "2"}
+        )}
+    )
+    assert out["headline"].startswith("Material change since your last audit")
+    assert out["movements"][0]["direction"] == "improved"
+
+
+def test_since_last_audit_reaches_the_served_summary():
+    """The rewrite is on the LIVE path, not a helper nobody calls."""
+    summary = build_report_summary(
+        {
+            "per_sku_reports": [_sku_report()],
+            "reaudit_delta": _persisted_improved_delta(
+                {"same": None, "reason": "prompt_basis_missing"}
+            ),
+        }
+    )
+    assert summary["since_last_audit"]["headline"].startswith(
+        "Not comparable to your last audit"
+    )

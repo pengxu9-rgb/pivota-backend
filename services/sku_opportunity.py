@@ -1718,6 +1718,7 @@ def _substitution_alert(per_prompt: List[Dict[str, Any]]) -> Dict[str, Any]:
     sub = top_row["substitution"]
     return {
         "present": True,
+        "evidence_kind": "diagnostic_probe",
         "prompt": sub.get("prompt") or top_row.get("query"),
         "substituted_by": sub.get("substituted_by"),
         "engines": sub.get("engines") or [],

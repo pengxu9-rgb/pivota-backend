@@ -35,6 +35,11 @@ class UniversalSyncRequest(BaseModel):
     merchant_id: str
     force_refresh: bool = False
     limit: int = 50
+    # True for syncs no person is waiting on (the gateway's catalog auto-sync
+    # via routes/platform_products_sync_api). Only these are subject to the
+    # quality-backfill enqueue cooldown; a merchant's own Sync always enqueues.
+    # Honoured only when the caller is the admin/internal role — see the hook.
+    unattended: bool = False
     # Optional platform hint: shopify, wix, woocommerce, etc.
     # When provided, we will try to sync that specific platform first.
     platform: Optional[str] = None
@@ -294,9 +299,9 @@ async def universal_product_sync(
                 # the sync that just succeeded.
                 try:
                     from db.product_quality_backfill_jobs import (
-                        create_quality_backfill_job,
+                        enqueue_quality_backfill_if_needed,
                     )
-                    await create_quality_backfill_job(
+                    await enqueue_quality_backfill_if_needed(
                         merchant_id=request.merchant_id,
                         platform=platform,
                         requested_by="universal_product_sync",
@@ -321,6 +326,24 @@ async def universal_product_sync(
                         # force_refresh=True and were silently downgraded here.
                         force_refresh=bool(request.force_refresh),
                         missing_only=True,
+                        # The gateway's auto-sync arrives here with
+                        # force_refresh=True several times a day; unattended
+                        # requests are folded into a recent job instead of
+                        # rescoring an unchanged catalog every time.
+                        # ...and only an admin caller can say so (ADMIN_ROLES,
+                        # the same set the merchant-scope check above trusts):
+                        # the merchant-facing endpoint parses the same body,
+                        # and a client must not be able to opt its own Sync
+                        # out of being the delivery path for its edits. The
+                        # isinstance guard keeps a malformed current_user from
+                        # raising INSIDE the best-effort try, which would
+                        # delete the whole readiness enqueue rather than the
+                        # dedupe.
+                        unattended=(
+                            bool(request.unattended)
+                            and isinstance(current_user, dict)
+                            and current_user.get("role") in ADMIN_ROLES
+                        ),
                     )
                 except Exception as enqueue_error:  # noqa: BLE001 — best-effort
                     logger.warning(

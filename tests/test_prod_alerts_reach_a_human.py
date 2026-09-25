@@ -14,6 +14,7 @@ Same family as tests/test_setup_scheduler_is_safe_to_rerun.py: assertions agains
 because there is nothing importable here.
 """
 
+import re
 from pathlib import Path
 
 import pytest
@@ -186,3 +187,174 @@ def test_the_log_metric_is_idempotent(source: str) -> None:
     # `set -e` aborts the run before any policy below is reached.
     line = body[body.rindex("\n", 0, describe) + 1 : describe]
     assert "!" not in line, "the existence guard is inverted"
+
+
+# ---- retailer-ingest-drain: the two outcomes that exit 0 ------------------------------------
+#
+# The drain records a held or failed stage and exits 0, so "prod: Cloud Run job failing" never sees
+# them. Two log-based metrics key on the job's one summary line instead. These tests feed that line
+# - produced by the job's REAL main(), not restated here - through the filters' own substring
+# predicates, so a change to the job's output format or to the filter fails here rather than as a
+# metric that silently never increments.
+SCHEDULER = SCRIPT.parent / "setup_scheduler.sh"
+
+
+def _filter(source: str, var: str) -> str:
+    m = re.search(rf"^{var}='(.*)'$", source, re.M)
+    assert m, f"{var} not found as a single-quoted assignment"
+    return m.group(1)
+
+
+_ATOM = re.compile(r'^textPayload(:|=~)"((?:[^"\\]|\\.)*)"$')
+
+
+def _matches(log_filter: str, line: str) -> bool:
+    """Evaluate the filter's textPayload clauses against one log line.
+
+    Understands exactly the shapes the drain filters use: top-level AND of atoms or of one
+    parenthesised OR group; `textPayload:"..."` is a case-insensitive substring (Logging's `:`),
+    `textPayload=~"..."` an RE2 search. resource.* atoms are checked by their own test. Anything
+    else fails loudly rather than being skipped, so a new clause cannot go unevaluated.
+    """
+    def atom(text: str) -> bool:
+        m = _ATOM.match(text.strip())
+        assert m, f"unrecognised clause {text!r}"
+        value = m.group(2).replace('\\"', '"')
+        return value.lower() in line.lower() if m.group(1) == ":" else bool(re.search(value, line))
+
+    evaluated = 0
+    for clause in log_filter.split(" AND "):
+        clause = clause.strip()
+        if clause.startswith("resource."):
+            continue
+        evaluated += 1
+        if clause.startswith("(") and clause.endswith(")"):
+            if not any(atom(a) for a in clause[1:-1].split(" OR ")):
+                return False
+        elif not atom(clause):
+            return False
+    assert evaluated >= 2, f"expected the marker and an outcome clause in {log_filter!r}"
+    return True
+
+
+def _summary_line(monkeypatch, capsys, stage, counts) -> str:
+    """The line the REAL main() + drain_once() print. Only the ledger and the stage are faked;
+    `stage=None` is an idle tick (nothing claimed), which still reports the lane's counts."""
+    import jobs.retailer_ingest_drain as drain
+
+    class _DB:
+        async def connect(self):
+            return None
+
+        async def disconnect(self):
+            return None
+
+    async def _claim(**kw):
+        return None if stage is None else {"id": "rij_1", "status": "queued"}
+
+    async def _run_stage(job, *, db):
+        return dict(stage)
+
+    async def _counts(**kw):
+        return dict(counts)
+
+    monkeypatch.setenv("RETAILER_INGEST_DRAIN_ENABLED", "1")
+    monkeypatch.setattr("sys.argv", ["drain"])
+    monkeypatch.setattr(drain, "database", _DB())
+    monkeypatch.setattr(drain.ledger, "claim_due_job", _claim)
+    monkeypatch.setattr(drain.ledger, "status_counts", _counts)
+    monkeypatch.setattr(drain, "run_stage", _run_stage)
+    assert drain.main() == 0
+    (line,) = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith(drain.SUMMARY_MARKER)]
+    return line
+
+
+# (stage summary, lane counts by status). status_counts() GROUPs BY status, so a status with no
+# jobs is ABSENT rather than 0; both shapes are covered.
+HELD_STAGE = {"job_id": "rij_1", "stage": "dry_run", "outcome": "held", "status": "held"}
+HELD = [
+    (HELD_STAGE, {"held": 1}),
+    (HELD_STAGE, {"queued": 2}),                     # counts read before the hold landed
+    # A STANDING hold: nothing claimed, or another store's stage ran - still alerting.
+    (None, {"held": 1, "queued": 4}),
+    (None, {"held": 12}),
+    ({"job_id": "rij_2", "stage": "apply", "outcome": "applied", "status": "done"}, {"done": 3, "held": 2}),
+]
+FAILED = [
+    ({"job_id": "rij_1", "stage": "apply", "outcome": "apply_refused", "status": "failed"}, {"failed": 1}),
+    ({"job_id": "rij_1", "stage": "dry_run", "outcome": "crawl_failed", "status": "failed",
+      "reason": 'crawl failed: upstream said {"outcome": "held"} and {"held": 3}'}, {"failed": 1}),
+    ({"job_id": "rij_1", "stage": "apply", "outcome": "readback_failed", "status": "failed"}, {"failed": 2}),
+]
+QUIET = [
+    (None, {}),
+    (None, {"queued": 3, "done": 10, "failed": 4}),     # a terminal failure is not re-alerted per tick
+    (None, {"held": 0}),
+    ({"job_id": "rij_1", "stage": "dry_run", "outcome": "clean", "status": "apply_due"}, {"apply_due": 1}),
+    ({"job_id": "rij_1", "stage": "apply", "outcome": "applied", "status": "done"}, {"done": 1}),
+    ({"job_id": "rij_1", "stage": "dry_run", "outcome": "crawl_throttled", "status": "queued",
+      "reason": 'throttled, retry later: {"status": "failed"}'}, {"queued": 1}),
+    ({"job_id": "rij_1", "stage": "dry_run", "outcome": "nothing_to_ingest", "status": "nothing"}, {"nothing": 1}),
+]
+
+
+def test_the_held_metric_counts_every_tick_while_a_store_is_held(source, monkeypatch, capsys) -> None:
+    held = _filter(source, "RID_HELD_FILTER")
+    for stage, counts in HELD:
+        assert _matches(held, _summary_line(monkeypatch, capsys, stage, counts)), (stage, counts)
+    for stage, counts in FAILED + QUIET:
+        assert not _matches(held, _summary_line(monkeypatch, capsys, stage, counts)), (stage, counts)
+
+
+def test_the_failed_metric_counts_exactly_the_failed_stages(source, monkeypatch, capsys) -> None:
+    failed = _filter(source, "RID_FAILED_FILTER")
+    for stage, counts in FAILED:
+        assert _matches(failed, _summary_line(monkeypatch, capsys, stage, counts)), (stage, counts)
+    for stage, counts in HELD + QUIET:
+        assert not _matches(failed, _summary_line(monkeypatch, capsys, stage, counts)), (stage, counts)
+
+
+def test_the_drain_filters_name_the_job_the_scheduler_creates(source) -> None:
+    scheduler = SCHEDULER.read_text(encoding="utf-8")
+    for var in ("RID_HELD_FILTER", "RID_FAILED_FILTER"):
+        f = _filter(source, var)
+        assert 'resource.type="cloud_run_job"' in f
+        (job,) = re.findall(r'resource\.labels\.job_name="([^"]+)"', f)
+        assert re.search(rf"^mkcrawljob {re.escape(job)} ", scheduler, re.M), (
+            f"{var} watches job {job!r}, which setup_scheduler.sh does not create"
+        )
+
+
+def test_the_drain_alerts_exist_and_fire_on_one_event(source) -> None:
+    body = _uncommented(source)
+    # DURATION 0s on both: a log counter writes no points between matching lines. HELD aligns over
+    # 3600s - more than the 10-minute cadence - so a standing hold is one incident, not one per tick.
+    for metric, window in (("retailer_ingest_drain_held", "3600s"), ("retailer_ingest_drain_failed", "300s")):
+        assert f"upsert_log_metric {metric} " in body
+        at = body.index(f'metric.type="logging.googleapis.com/user/{metric}"')
+        tail = body[at: at + 250]
+        assert f"COMPARISON_GT 0 {window} 0s " in tail, tail
+    scheduler = SCHEDULER.read_text(encoding="utf-8")
+    assert 'sched retailer-ingest-drain-cron "*/10 * * * *"' in scheduler, (
+        "the held window is sized against a 10-minute cadence; re-derive it if the cadence moves"
+    )
+    assert '"prod: retailer ingest held for review"' in body
+    assert '"prod: retailer ingest job failed"' in body
+
+
+def test_a_drain_crash_is_still_the_job_failing_policy(source) -> None:
+    """An unexpected exception exits 1: the generic policy must not be scoped to other jobs."""
+    body = _uncommented(source)
+    at = body.index('metric.type="run.googleapis.com/job/completed_task_attempt_count"')
+    line = body[at: body.index("\n", at)]
+    assert 'metric.label.result="failed"' in line
+    assert "job_name" not in line, "the job-failing policy is scoped; the drain would page nowhere"
+
+
+def test_the_drain_metrics_are_idempotent(source) -> None:
+    body = _uncommented(source)
+    at = body.index("upsert_log_metric() {")
+    fn = body[at: body.index("\n}", at)]
+    assert fn.index("logging metrics describe") < fn.index("logging metrics update") < fn.index("logging metrics create")
+    guard = fn[fn.rindex("\n", 0, fn.index("logging metrics describe")) + 1: fn.index("logging metrics describe")]
+    assert "!" not in guard, "the existence guard is inverted"

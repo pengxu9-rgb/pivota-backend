@@ -414,6 +414,8 @@ def test_adobe_commerce_route_validates_challenge_recipient_signature_and_batch(
     assert response.status_code == 200
     assert response.json()["accepted"] == 2
     assert ingested[0]["merchant_id"] == "merchant-1"
+    assert ingested[0]["agent_identity_confidence"] == "platform_asserted"
+    assert ingested[0]["write_path"] == "adobe_io_events"
     assert verification_calls[0][0] == raw
 
     wrong_recipient = [dict(payload[0], recipientclientid="another-client")]

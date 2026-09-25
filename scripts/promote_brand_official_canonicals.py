@@ -88,6 +88,16 @@ _SELECT_ROWS_PAGE = """
 # Step 0 (APV heal): the serving classifier reads agent_pdp_view.description,
 # so a cohort row whose catalog description is real but whose view row is
 # missing/stale would classify short_description forever. Refresh exactly those.
+# The serving classifier reads the VIEW, not the catalog row: `low_quality`
+# compares the quality snapshot, but `no_image` reads agent_pdp_view.image_url and
+# `short_description` reads agent_pdp_view.description. So a row whose catalog
+# content improved after the view was last built stays blocked on the stale copy.
+#
+# This heal used to check DESCRIPTION only. Measured 2026-09-05: re-ingesting
+# maccosmetics.com with images (PR #2069) fixed the quality score — low_quality
+# fell by 239 — and every one of those rows immediately re-blocked on `no_image`,
+# because their agent_pdp_view.image_url was still the null from the first ingest
+# and nothing in this heal looked at it. Check every field the classifier reads.
 _SELECT_STALE_APV = """
     SELECT DISTINCT p.content_key
     FROM catalog_products p
@@ -95,8 +105,14 @@ _SELECT_STALE_APV = """
     WHERE p.source_system = 'catalog_enrichment_agent_v1'
       AND p.sync_status = 'live'
       AND p.content_key IS NOT NULL
-      AND length(coalesce(p.description, '')) >= 50
-      AND (a.content_key IS NULL OR length(coalesce(a.description, '')) < 50)
+      AND (
+            -- description the row has and the view does not
+            (length(coalesce(p.description, '')) >= 50
+             AND (a.content_key IS NULL OR length(coalesce(a.description, '')) < 50))
+            -- image the row has and the view does not
+         OR (coalesce(p.image_url, '') <> ''
+             AND (a.content_key IS NULL OR coalesce(a.image_url, '') = ''))
+      )
 """
 
 
@@ -183,7 +199,7 @@ async def run(apply: bool, limit: int) -> int:
     # 0. APV heal — refresh views whose description lags the catalog row.
     if apply:
         stale_cks = [r["content_key"] for r in await _fetch_all_hardened(_SELECT_STALE_APV)]
-        print(f"[apv-heal] {len(stale_cks)} content_key view(s) missing/stale vs catalog description")
+        print(f"[apv-heal] {len(stale_cks)} content_key view(s) missing/stale vs the catalog row (description or image)")
         healed = 0
         for i, ck in enumerate(stale_cks, 1):
             for attempt in (1, 2):

@@ -41,6 +41,13 @@ from typing import Any, Dict, Optional, Tuple
 import httpx
 
 from config.settings import settings
+from services.llm_fence import PRODUCT_DATA_FENCE
+
+from services.category_path_aliases import (
+    TAXONOMY_ROOTS as _TAXONOMY_ROOTS,
+    has_category_door,
+    resolve as resolve_category_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -96,21 +103,25 @@ _SYSTEM_PROMPT = (
     "'beauty/skincare/treat/serum', 'fashion/apparel/tops/sweater', "
     "'electronics/audio/headphones', 'home/kitchen/cookware/pan', "
     "'pet/accessory/leash'. If genuinely unclassifiable, return "
-    "value=null and reason='insufficient_signal'."
+    "value=null and reason='insufficient_signal'. "
+    + PRODUCT_DATA_FENCE.notice
 )
 
 
 def _build_user_message(*, category: Optional[str], product_type: Optional[str], title: Optional[str], description: Optional[str]) -> str:
+    # Every value is merchant text; the field labels are ours. The block is
+    # fenced as one unit and the instruction that follows stays outside it.
+    clean = PRODUCT_DATA_FENCE.sanitize_text
     parts = []
-    if title: parts.append(f"Title: {title}")
-    if product_type: parts.append(f"Product type: {product_type}")
-    if category: parts.append(f"Merchant category hint: {category}")
+    if title: parts.append(f"Title: {clean(title)}")
+    if product_type: parts.append(f"Product type: {clean(product_type)}")
+    if category: parts.append(f"Merchant category hint: {clean(category)}")
     if description:
         # Cap description to avoid blowing up the prompt — first 500 chars
         # is plenty for classification.
-        snippet = description[:500].replace("\n", " ")
+        snippet = clean(description[:500].replace("\n", " "))
         parts.append(f"Description: {snippet}")
-    body = "\n".join(parts) if parts else "(no signal)"
+    body = PRODUCT_DATA_FENCE.wrap("\n".join(parts) if parts else "(no signal)")
     return (
         f"{body}\n\n"
         "Return JSON only: "
@@ -157,13 +168,42 @@ async def _call_deepseek_classify(*, user_message: str, timeout_s: float = 15.0)
 
 
 def _validate_path(raw_path: Any) -> Optional[str]:
-    """Reject anything not matching the path shape. Return validated
-    lowercase path or None."""
+    """Return a path that is a REAL TAXONOMY LEAF, or None.
+
+    ⚠️ SHAPE IS NOT MEMBERSHIP, and this function used to check only shape. `_PATH_RE` accepts
+    `beauty/skincare/tone/toner` — correct casing, correct separators, allowed root — and the caller
+    stored it. But recall matches `category_path LIKE 'beauty/skincare/treat/%'`, so a plausible
+    path that is not in the taxonomy has NO category door at all: it cannot match a prefix, and
+    #2122's ancestor rule cannot rescue it either, because a sibling typo is not an ancestor.
+    Shape-valid and unreachable is strictly worse than rejected, because rejected leaves the row
+    NULL and visible to the brand-gated escape, while this looks classified.
+
+    That is not hypothetical: 710 serving-eligible rows are in exactly that state, from three
+    writers that are not in this repository. This one IS, so it gets the membership check.
+
+    A near-miss is SNAPPED to its real leaf rather than dropped — services.category_path_aliases
+    holds the map, and the model saying `beauty/makeup/lips/lip-gloss` clearly meant
+    `beauty/makeup/lip/gloss`. Anything with no honest target returns None and the row stays
+    unclassified, which is a state the rest of the pipeline already handles.
+    """
     if not isinstance(raw_path, str):
         return None
     path = raw_path.strip().lower().strip("/")
     if not path or not _PATH_RE.match(path):
         return None
+    snapped = resolve_category_path(path)
+    if snapped is not None:
+        return snapped
+    if has_category_door(path):
+        # Reachable without being a leaf: `electronics/laptops/gaming` matches `electronics/%`.
+        return path
+    if path.split("/", 1)[0] in _TAXONOMY_ROOTS:
+        # Inside a root recall INDEXES, but with no door — the harmful case, and the only one
+        # rejected here.
+        return None
+    # `sports/yoga/mat`, `food/...`, `toys/...`: legitimate classifications that recall has no
+    # prefix for. Not this function's business, and rejecting them would delete a working
+    # classification to fix a beauty problem.
     return path
 
 
@@ -209,9 +249,12 @@ async def classify_via_llm(
         if isinstance(self_report, (int, float)) and 0.0 <= float(self_report) <= 1.0
         else 0.5
     )
-    # If the LLM proposed a top-level segment outside the recognized
-    # taxonomy, coerce to 'other' and downgrade — protects the taxonomy
-    # tree from accidentally growing new branches.
+    # If the LLM proposed a top-level segment outside the recognized taxonomy, coerce to 'other'
+    # and downgrade. This is UNCHANGED and load-bearing — five tests cover it, and an earlier
+    # version of this change deleted it, which killed every non-beauty classification (a yoga mat
+    # came back as None). It never protected the beauty tree, though: it inspects only the FIRST
+    # segment, so `beauty/skincare/tone/toner` always sailed through it. `_validate_path` is where
+    # that hole is closed now; the two guards answer different questions.
     root = path.split("/", 1)[0]
     if root not in _ALLOWED_ROOTS:
         path = "other/" + path

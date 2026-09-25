@@ -15,9 +15,11 @@ from __future__ import annotations
 import os
 import socket
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from db.merchant_order_sync_jobs import (
+    OP_MERCHANT_ORDER_CREATE,
     OP_REFUND_SYNC,
     claim_next_merchant_order_sync_job,
     complete_merchant_order_sync_job,
@@ -308,7 +310,80 @@ async def _run_refund_sync_job(
     )
 
 
-_HANDLERS = {OP_REFUND_SYNC: _run_refund_sync_job}
+async def _run_merchant_order_create_job(
+    payload: Dict[str, Any],
+    progress: Optional[Dict[str, Any]] = None,
+    on_progress=None,
+) -> Dict[str, Any]:
+    """Create the merchant-side order for an order the buyer has already paid.
+
+    AT-MOST-ONCE BY CONSTRUCTION. Enqueued with `max_attempts=1`, so any
+    outcome — returned or raised — is terminal.
+
+    That is deliberate, and it is the third design here. Two earlier ones tried
+    to decide retryability after the fact: from the boolean
+    `sync_order_to_connected_store` returns, then from the failure marker it
+    writes. Both leaked, because the paths that are dangerous to retry are
+    exactly the ones that report nothing. An exception escaping the sync writes
+    no marker and requeued; a contended advisory lock returns True having done
+    nothing. Measured on the marker design: ten Wix orders and ten shipments for
+    one buyer, from a single link-write timeout after a successful POST.
+
+    Only Shopify looks for an existing order before creating
+    (`_find_existing_order_id_best_effort` plus tag reuse). Woo, Wix and
+    BigCommerce POST unconditionally, so a second attempt is a second order.
+
+    What this queue therefore delivers is the failure the six call sites
+    actually had: the work no longer dies with the API process between the
+    response and the sync. It is durable intent, attempted once — not retries.
+    A repeat enqueue from a call site revives the job for one more attempt,
+    which is exactly what those sites did before this queue existed.
+    """
+    from db.orders import get_order
+    from routes.order_routes import (
+        _get_linked_platform_order as _linked_platform_order,
+        sync_order_to_connected_store,
+    )
+
+    order_id = str(payload.get("order_id") or "")
+    if not order_id:
+        return {"skipped": "no_order_id"}
+
+    created = await sync_order_to_connected_store(order_id)
+
+    # `True` is not proof of delivery: every platform creator returns True when
+    # another holder has the per-order advisory lock — "someone else is doing
+    # it", not "it is done". Verify against the order rather than the return.
+    order = await get_order(order_id) or {}
+    if created and _linked_platform_order(order):
+        return {"created": True}
+
+    if created:
+        # Contended lock. The other holder owns this create; a second attempt
+        # from here would be a second POST on a platform that cannot dedupe it.
+        logger.warning(
+            "merchant_order_sync: %s for order %s reported success with no "
+            "linked platform order — another holder has the create lock and "
+            "owns the outcome",
+            OP_MERCHANT_ORDER_CREATE, order_id,
+        )
+        return {"created": False, "skipped": "create_in_progress_elsewhere"}
+
+    # Terminal by construction. Raise so the job lands `failed` and appears in
+    # `list_failed_merchant_order_sync_jobs`, and so the tick emits its
+    # money-path ERROR. The order also stays paid with no merchant order, which
+    # `paid_missing_merchant_order_count` reports — though note nothing scrapes
+    # that endpoint today and the reconcile lane has no scheduler registration,
+    # so both traces need a human to go looking.
+    raise _RetryableSyncError(
+        f"merchant order creation did not succeed for {order_id}"
+    )
+
+
+_HANDLERS = {
+    OP_REFUND_SYNC: _run_refund_sync_job,
+    OP_MERCHANT_ORDER_CREATE: _run_merchant_order_create_job,
+}
 
 
 async def run_merchant_order_sync_worker_tick() -> Dict[str, Any]:
@@ -396,7 +471,9 @@ async def run_merchant_order_sync_worker_tick() -> Dict[str, Any]:
             elif wrote == "write_failed":
                 # The work reached Shopify; only the row does not say so. Do NOT
                 # report this as a lost lease — nobody else owns the job, it is
-                # simply unrecorded until the reaper hands it back.
+                # simply unrecorded until the reaper hands it back. A redo is
+                # safe here because the refund write dedupes and a create that
+                # linked short-circuits on the linked-order check.
                 summary["write_failed"] += 1
                 logger.error(
                     "merchant_order_sync: job=%s order=%s SUCCEEDED but the "
@@ -406,8 +483,9 @@ async def run_merchant_order_sync_worker_tick() -> Dict[str, Any]:
                     job.get("order_id"),
                 )
             else:
-                # Our lease expired and a sibling owns the job now. The work
-                # itself was idempotent, so the sibling redoing it is safe.
+                # Our lease expired and a sibling owns the job now. A redo is
+                # safe for the same reason as above: the refund write dedupes,
+                # and a create that already linked short-circuits.
                 summary["lease_lost"] += 1
         except Exception as exc:  # noqa: BLE001
             status = await fail_merchant_order_sync_job(
@@ -434,8 +512,9 @@ async def run_merchant_order_sync_worker_tick() -> Dict[str, Any]:
                 )
             elif status == "failed":
                 summary["failed"] += 1
-                # Terminal on this queue means the buyer was refunded and the
-                # merchant's store was never told. That is an incident.
+                # Terminal on this queue means the buyer paid (or was refunded)
+                # and the merchant's store was never told. That is an incident.
+                # The log line carries `op`, so triage can tell which.
                 logger.error(
                     "merchant_order_sync: GAVE UP on %s job=%s order=%s after %s "
                     "attempts — merchant store not updated: %s",

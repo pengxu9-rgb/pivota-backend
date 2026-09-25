@@ -1,3 +1,28 @@
+"""Pure mapper: one event from the Pivota SFCC cartridge -> the canonical ledger.
+
+SFCC B2C has no outbound webhooks for commerce lifecycle, so Pivota ships the
+sender: ``integrations/sfcc-cartridge/``. Two senders live inside it, and they
+reach this mapper through the same signed outbox:
+
+* five OCAPI/SCAPI **hooks** on the shopper path (basket, checkout, order
+  creation, payment authorization);
+* the **PivotaSettlementSweep** job step, which exists because SFCC fires
+  nothing at all when ``Order.paymentStatus`` becomes PAID, when
+  ``Order.status`` becomes CANCELLED, or when a credit ``Invoice`` appears.
+  It observes those states on a cursor and enqueues ``order.paid``,
+  ``order.cancelled`` and ``refund.succeeded`` with a DETERMINISTIC
+  ``event_id`` (``order.paid:<orderNo>``,
+  ``refund.succeeded:<invoiceNumber>:<cumulative>``) so a redelivery dedupes
+  here rather than writing a second ledger row. A refund's amount is a DELTA
+  against that invoice's cumulative refunded figure, which is why its key
+  carries the cumulative total: a second partial refund on the same invoice
+  raises `Invoice.refundedAmount` instead of creating a second invoice, and
+  keyed on the invoice number alone it was permanently lost.
+
+Verification status of the SFCC API facts the cartridge relies on is recorded
+in ``docs/SFCC_TELEMETRY.md``.
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -6,6 +31,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional
 
+from services.commerce_order_ref import build_order_ref
 from services.merchant_event_ingest_service import MerchantCommerceEvent, MerchantEventBatch
 
 
@@ -42,6 +68,30 @@ _CANONICAL_TYPES = {
     "payment.failed": "payment.failed",
     "refund.succeeded": "refund.succeeded",
 }
+
+
+# The three events that carry settled money. Each is keyed on a native id the
+# cartridge derives from the order or the credit invoice, and the ledger dedupes
+# first-write-wins on that key — so an event carrying a zero or missing amount
+# is not a harmless under-report, it is a PERMANENT SHADOW: the real figure for
+# the same order or invoice can never be written afterwards. They are rejected
+# instead. Same rule as `services/prestashop_event_adapter.py`.
+_MONEY_EVENT_TYPES = frozenset({"order.paid", "payment.succeeded", "refund.succeeded"})
+
+# `order.paid` is emitted by the settlement sweep from `Order.totalGrossPrice`,
+# not from a capture. Naming the basis is what makes a divergence from the PSP's
+# figure diagnosable rather than invisible.
+_ORDER_PAID_AMOUNT_SEMANTICS = "order_total_gross"
+
+# A sweep `refund.succeeded` amount is the DIFFERENCE between the credit
+# invoice's cumulative `refundedAmount` and the last figure the cartridge
+# observed for that same invoice — never the invoice's own total. That is what
+# lets a second partial refund against ONE invoice land as a second row (its
+# `refund_id` is `<invoiceNumber>:<cumulative>`) and still sum to the invoice's
+# cumulative figure, because the funnel takes `max(amount)` per `refund_id` and
+# sums distinct `refund_id`s inside one authority. Reading a row's amount as the
+# invoice total would over-report; naming the basis is what stops that.
+_REFUND_AMOUNT_SEMANTICS = "invoice_cumulative_delta"
 
 
 class UnsupportedSFCCEvent(ValueError):
@@ -145,6 +195,16 @@ def map_sfcc_integration_event(
         raise ValueError("SFCC refund event is missing refund_id or order_id")
 
     currency = str(payload.get("currency") or "").strip().upper() or None
+    amount_cents = _amount_cents(payload.get("amount"), currency)
+    if native_type in _MONEY_EVENT_TYPES:
+        # A money event the funnel cannot count is worse than no event: it
+        # occupies the dedupe key. `merchant_commerce_event_funnel_service`
+        # drops any money row without a currency, and a zero amount would
+        # shadow the real one forever.
+        if not currency:
+            raise ValueError(f"SFCC {native_type} is missing currency")
+        if not amount_cents or amount_cents <= 0:
+            raise ValueError(f"SFCC {native_type} requires a positive settled amount")
     metadata = {
         "native_event_name": native_type,
         "native_status": _text(payload.get("status")),
@@ -152,6 +212,10 @@ def map_sfcc_integration_event(
         "native_line_items": _line_items(payload.get("items")),
         "webhook_delivery_id": _text(delivery_id),
     }
+    if native_type == "order.paid":
+        metadata["native_amount_semantics"] = _ORDER_PAID_AMOUNT_SEMANTICS
+    elif native_type == "refund.succeeded":
+        metadata["native_amount_semantics"] = _REFUND_AMOUNT_SEMANTICS
     metadata = {key: value for key, value in metadata.items() if value not in (None, [], {})}
     canonical_type = _CANONICAL_TYPES[native_type]
     return MerchantCommerceEvent(
@@ -168,9 +232,10 @@ def map_sfcc_integration_event(
         checkout_id=checkout_id,
         payment_id=payment_id,
         order_id=order_id,
+        order_ref=build_order_ref("salesforce_commerce_cloud", order_id),
         refund_id=refund_id,
         trace_id=_text(payload.get("trace_id") or delivery_id or native_event_id),
-        amount_cents=_amount_cents(payload.get("amount"), currency),
+        amount_cents=amount_cents,
         currency=currency,
         metadata=metadata,
     )

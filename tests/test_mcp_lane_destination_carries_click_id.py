@@ -105,6 +105,7 @@ async def test_prefetched_wrapper_with_a_caller_supplied_redirect_reads_that_tok
     # not a fresh one — the whole point is one id across the redirect and the published URL.
     redirect_url = await gw._make_external_redirect_url(
         market="US",
+        market_observed=True,
         tool="*",
         destination_url="https://example.com/products/serum",
         utm_template=None,
@@ -139,6 +140,7 @@ async def test_a_redirect_we_did_not_sign_yields_no_attribution_not_an_error():
 async def _mint_cart_redirect(*, destination_url: str = "https://teststore.com/products/widget") -> str:
     return await gw._make_external_redirect_url(
         market="US",
+        market_observed=True,
         tool="*",
         destination_url=destination_url,
         utm_template=None,

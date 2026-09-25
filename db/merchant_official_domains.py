@@ -50,10 +50,28 @@ logger = logging.getLogger(__name__)
 SOURCE_ASSERTED = "asserted"
 SOURCE_VERIFIED = "verified"
 SOURCE_INFERRED = "inferred"
-VALID_SOURCES = frozenset({SOURCE_ASSERTED, SOURCE_VERIFIED, SOURCE_INFERRED})
+# A merchant SAID this domain is theirs, and nothing has been proven.
+#
+# The distinction from `asserted` is the point. Both existing sources mean
+# CONTROL WAS PROVEN — `verified` adds "and the domain is bound to this
+# merchant's brand identity", `asserted` means proven but unbound. A
+# self-declaration has neither, and recording one as `asserted` would put an
+# unproven host into a tier whose whole meaning is proof.
+SOURCE_DECLARED = "declared"
+
+VALID_SOURCES = frozenset({
+    SOURCE_ASSERTED, SOURCE_VERIFIED, SOURCE_INFERRED, SOURCE_DECLARED,
+})
 
 # The two tiers a merchant (or a proven claim) put there on purpose. Membership
 # of the official set is granted by these regardless of what inference found.
+#
+# SOURCE_DECLARED IS DELIBERATELY ABSENT. A declared domain is stored so the
+# portal can offer to verify it and so a claim can be started against it, but it
+# must not widen the set that decides `first_party` on every cited host: a
+# merchant who declared a retailer — by mistake or otherwise — would otherwise
+# reclassify that retailer's citations as their own and inflate their official
+# share. Declaration is an intent to prove, not evidence.
 OFFICIAL_SOURCES = frozenset({SOURCE_ASSERTED, SOURCE_VERIFIED})
 
 LIVENESS_LIVE = "live"
@@ -116,7 +134,7 @@ merchant_official_domains = Table(
         name="ck_merchant_official_domains_domain",
     ),
     CheckConstraint(
-        "source IN ('asserted', 'verified', 'inferred')",
+        "source IN ('asserted', 'verified', 'inferred', 'declared')",
         name="ck_merchant_official_domains_source",
     ),
     CheckConstraint(
@@ -134,6 +152,10 @@ merchant_official_domains = Table(
     ),
     Index("idx_merchant_official_domains_merchant", "merchant_id", "source"),
     Index("idx_merchant_official_domains_liveness_due", "last_checked_at"),
+    # The cross-tenant proof lookup (PROVEN_BY_OTHER_SQL) leads with `domain`, and no
+    # other index does: measured as a Seq Scan removing 50k rows at 50k rows. Two such
+    # scans per unrate-limited authenticated declare call.
+    Index("idx_merchant_official_domains_domain", "domain"),
     extend_existing=True,
 )
 
@@ -170,7 +192,7 @@ _DDL_STATEMENTS = [
             AND domain NOT LIKE 'www.%'
           ),
         CONSTRAINT ck_merchant_official_domains_source
-          CHECK (source IN ('asserted', 'verified', 'inferred')),
+          CHECK (source IN ('asserted', 'verified', 'inferred', 'declared')),
         CONSTRAINT ck_merchant_official_domains_verification
           CHECK (
             verification_status IS NULL
@@ -186,6 +208,8 @@ _DDL_STATEMENTS = [
     "ON merchant_official_domains (merchant_id, source);",
     "CREATE INDEX IF NOT EXISTS idx_merchant_official_domains_liveness_due "
     "ON merchant_official_domains (last_checked_at);",
+    "CREATE INDEX IF NOT EXISTS idx_merchant_official_domains_domain "
+    "ON merchant_official_domains (domain);",
 ]
 
 _DDL_LABEL = "ensure_merchant_official_domains_table"
@@ -260,6 +284,45 @@ ON CONFLICT (merchant_id, domain) DO UPDATE SET
     updated_at          = excluded.updated_at
 """
 
+# The DECLARED write. INSERT-ONLY: a declaration is the weakest source there is,
+# so it must never overwrite a row of any other source — `source =
+# excluded.source` in the upsert above is exactly the lever that flipped an
+# inferred row to `declared` (blinding the liveness sweep) and could flip a
+# verified row to declared/pending when the owned-set read failed open. The
+# guards in declare_official_domain run first; this statement makes the guard
+# unnecessary for CORRECTNESS and leaves it only for a better error message.
+# `databases` returns no rowcount on Postgres, so the caller re-reads the row
+# to learn whether it was ours.
+INSERT_DECLARED_DOMAIN_SQL = """
+INSERT INTO merchant_official_domains (
+    merchant_id, domain, source, verification_status,
+    liveness_status, last_checked_at, is_primary, created_at, updated_at
+) VALUES (
+    :merchant_id, :domain, :source, :verification_status,
+    'unchecked', NULL, FALSE, :now, :now
+)
+ON CONFLICT (merchant_id, domain) DO NOTHING
+"""
+
+# THE HEAL. A `declared` row whose host inference has since started producing is
+# in the USED set (the inferred branch counts it) but the liveness due-queues
+# skip `declared` and the audit basis drops it -- a host that can never be
+# measured dead while it stays counted official, reachable with no DB error and
+# no race: declare anua.us before the catalog carries it, then ingest. Refusing
+# the declaration only covers the order in which inference came FIRST. The
+# liveness seeder runs this when inference catches up: the row becomes what it
+# would have been had inference come first. Grants nothing new -- the host was
+# already used -- and touches only `declared` rows, never a proven one.
+PROMOTE_DECLARED_TO_INFERRED_SQL = """
+UPDATE merchant_official_domains
+   SET source              = 'inferred',
+       verification_status = NULL,
+       updated_at          = :now
+ WHERE merchant_id = :merchant_id
+   AND domain = :domain
+   AND source = 'declared'
+"""
+
 # The liveness sweep's write. It touches ONLY the liveness columns: a probe
 # knows nothing about who asserted the domain, and an observation must never
 # rewrite provenance.
@@ -272,6 +335,39 @@ UPDATE merchant_official_domains
    AND domain = :domain
 """
 
+# The one predicate for "this domain is provably this merchant's storefront",
+# shared by both readers below. They MUST agree: if the resolver admits a row the
+# counter does not, a merchant resolves on its domain and then counts zero
+# storefronts, and the caller silently skips forever.
+#
+#   verification_status='verified' — proven, not pending/failed/NULL.
+#   source='verified'             — brand-BOUND. record_official_domain writes
+#     SOURCE_ASSERTED when merchant_owns_domain FAILED: domain control was shown
+#     but Pivota does not associate the domain with this merchant. That gap is
+#     load-bearing here, because the caller POSTs a create_checkout built from
+#     the merchant's catalogue at whatever storefront answers on this domain.
+#     The email claim method accepts any mailbox at the exact host, so on a
+#     shared or multi-tenant domain an employee could otherwise point our probe
+#     at a stranger's store. (That method is default-off today; this does not
+#     rely on it staying that way.)
+#   liveness                      — `dead` is the module's one excluding verdict
+#     (is_excluded); counting dead rows would let a merchant who MIGRATED
+#     domains look like two storefronts forever.
+_PROVEN_STOREFRONT_WHERE = """
+       verification_status = :verified
+   AND source = :verified_source
+   AND (liveness_status IS NULL OR liveness_status <> :dead)
+"""
+
+RESOLVE_VERIFIED_MERCHANT_SQL = """
+SELECT merchant_id
+  FROM merchant_official_domains
+ WHERE lower(domain) = :domain
+   AND """ + _PROVEN_STOREFRONT_WHERE + """
+ ORDER BY merchant_id ASC
+ LIMIT 2
+"""
+
 LIST_OFFICIAL_DOMAINS_SQL = """
 SELECT merchant_id, domain, source, verification_status,
        liveness_status, last_checked_at, is_primary
@@ -282,10 +378,19 @@ SELECT merchant_id, domain, source, verification_status,
 # Stalest first, and NEVER-CHECKED first of all. The ordering is written as an
 # explicit `IS NULL DESC` rather than relying on NULL ordering, because the two
 # engines disagree: Postgres sorts NULLS LAST on ASC, SQLite sorts them first.
+# `declared` rows are EXCLUDED from the sweep. Every other source is either
+# proof-gated (asserted/verified) or catalog-derived (inferred); a declaration
+# is the only path that puts a fully merchant-chosen host into an outbound
+# GET. probe_host_liveness follows redirects and is gated only by
+# is_valid_public_hostname, which checks SHAPE and does not resolve — so
+# sweeping declarations would hand any merchant a blind liveness oracle for
+# internal hosts, and let one merchant's declarations starve the global due
+# queue. A declaration earns liveness checks when a claim proves it.
 DUE_FOR_LIVENESS_SQL = """
 SELECT merchant_id, domain, source, liveness_status, last_checked_at
   FROM merchant_official_domains
  WHERE (last_checked_at IS NULL OR last_checked_at < :cutoff)
+   AND source <> 'declared'
  ORDER BY (last_checked_at IS NULL) DESC, last_checked_at ASC
  LIMIT :limit
 """
@@ -295,6 +400,7 @@ SELECT merchant_id, domain, source, liveness_status, last_checked_at
   FROM merchant_official_domains
  WHERE merchant_id = :merchant_id
    AND (last_checked_at IS NULL OR last_checked_at < :cutoff)
+   AND source <> 'declared'
  ORDER BY (last_checked_at IS NULL) DESC, last_checked_at ASC
  LIMIT :limit
 """
@@ -365,10 +471,212 @@ async def upsert_official_domain(
         return False
 
 
-async def list_official_domains(merchant_id: str) -> List[Dict[str, Any]]:
+
+async def insert_declared_domain(*, merchant_id: str, domain: str) -> Optional[str]:
+    """Write a `declared` row IF AND ONLY IF the merchant has no row for the host.
+
+    Returns the row's source afterwards — `declared` when this write created it,
+    the pre-existing source when a row was already there (nothing was touched),
+    or None when the row cannot be read back. RAISES on a DB error: this is the
+    one write in the module whose caller must not mistake "could not write" for
+    "wrote", because it answers a merchant-facing request with a status code.
+    """
+    if not merchant_id or not domain:
+        return None
+    await ensure_merchant_official_domains_table()
+    stamp = _now_utc()
+    await database.execute(
+        INSERT_DECLARED_DOMAIN_SQL,
+        {
+            "merchant_id": merchant_id,
+            "domain": domain,
+            "source": SOURCE_DECLARED,
+            "verification_status": VERIFICATION_PENDING,
+            "now": stamp,
+        },
+    )
+    row = await database.fetch_one(
+        "SELECT source FROM merchant_official_domains "
+        "WHERE merchant_id = :merchant_id AND domain = :domain",
+        {"merchant_id": merchant_id, "domain": domain},
+    )
+    return str(row["source"]) if row is not None and row["source"] else None
+
+
+async def promote_declared_to_inferred(
+    *, merchant_id: str, domain: str, now: Optional[datetime] = None,
+) -> bool:
+    """Turn a `declared` row into `inferred` because inference now produces the
+    host. Returns True when the row is now `inferred` (whether this call changed
+    it), False when there is no row or it carries another source. Guarded in SQL
+    by `source = 'declared'`, so it can never touch a proven row. RAISES on a DB
+    error: the caller is the liveness seeder, which treats a failed heal as a
+    failed seed rather than as a row it can skip.
+    """
+    if not merchant_id or not domain:
+        return False
+    await ensure_merchant_official_domains_table()
+    await database.execute(
+        PROMOTE_DECLARED_TO_INFERRED_SQL,
+        {"merchant_id": merchant_id, "domain": domain, "now": now or _now_utc()},
+    )
+    row = await database.fetch_one(
+        "SELECT source FROM merchant_official_domains "
+        "WHERE merchant_id = :merchant_id AND domain = :domain",
+        {"merchant_id": merchant_id, "domain": domain},
+    )
+    return row is not None and str(row["source"]) == SOURCE_INFERRED
+
+async def resolve_verified_merchant_for_domain(
+    domain: str, *, strict: bool = False,
+) -> Optional[str]:
+    """The merchant that has PROVEN this domain is theirs, or None.
+
+    `execution_routes.merchant_id` looks like the natural answer to "whose store
+    is this route?" and is the wrong one twice over: nothing in the tree writes
+    it (`claim_execution_route` has no callers), and the association it was
+    designed to hold comes from a self-declared `store_url`. This asks the one
+    table that records a domain association someone had to prove.
+
+    FAILS CLOSED, and every branch matters to a caller that will act on the
+    answer against a live storefront:
+      * the row must satisfy _PROVEN_STOREFRONT_WHERE — proven status, a
+        brand-BOUND source, and a liveness verdict that is not `dead`. Read
+        that constant's comment before loosening any of the three; each one is
+        load-bearing for a caller that transacts against the resulting store.
+      * two merchants verified on one domain is ambiguity, not a tie to break.
+        LIMIT 2 exists to SEE the second row rather than silently take the first.
+      * a lookup failure is not an absence; it returns None either way, but the
+        caller must treat None as "we do not know", never as "not a merchant".
+        A caller that cannot do that -- a GUARD deciding whether to WRITE --
+        passes `strict=True` and gets the exception instead: `None` reads as
+        "nobody owns it" in `if owner and ...`, which is a grant.
+    """
+    normalized = str(domain or "").strip().lower().lstrip(".")
+    if not normalized:
+        return None
+    await ensure_merchant_official_domains_table()
+    try:
+        rows = await database.fetch_all(
+            RESOLVE_VERIFIED_MERCHANT_SQL,
+            {
+                "domain": normalized,
+                "verified": VERIFICATION_VERIFIED,
+                "verified_source": SOURCE_VERIFIED,
+                "dead": LIVENESS_DEAD,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        if strict:
+            raise
+        logger.warning(
+            "resolve_verified_merchant_for_domain failed for %s: %s",
+            normalized, str(exc)[:200],
+        )
+        return None
+    rows = list(rows or [])
+    if len(rows) != 1:
+        if len(rows) > 1:
+            logger.warning(
+                "resolve_verified_merchant_for_domain: %s is verified by %d "
+                "merchants; refusing to pick one", normalized, len(rows),
+            )
+        return None
+    return str(rows[0]["merchant_id"] or "").strip() or None
+
+
+LIST_VERIFIED_DOMAINS_SQL = """
+SELECT domain
+  FROM merchant_official_domains
+ WHERE merchant_id = :merchant_id
+   AND """ + _PROVEN_STOREFRONT_WHERE
+
+
+async def list_verified_domains(merchant_id: str) -> List[str]:
+    """Every domain this merchant has proven, so a caller can tell whether the
+    merchant is one storefront or several.
+
+    Exists because `canonical_variants` carries `merchant_id` but no store key,
+    while Shopify variant ids are per-STORE. A merchant with two proven domains
+    that are two different Shopify stores (anua.com alongside anua.us, a pairing
+    this codebase has already met) cannot have its catalogue attributed to one
+    of them, and a caller that guesses will hand storefront A a variant only
+    storefront B sells. Returns [] on failure, which callers must read as "we do
+    not know", never as "none".
+    """
+    if not merchant_id:
+        return []
+    await ensure_merchant_official_domains_table()
+    try:
+        rows = await database.fetch_all(
+            LIST_VERIFIED_DOMAINS_SQL,
+            {
+                "merchant_id": merchant_id,
+                "verified": VERIFICATION_VERIFIED,
+                "verified_source": SOURCE_VERIFIED,
+                "dead": LIVENESS_DEAD,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "list_verified_domains failed for %s: %s", merchant_id, str(exc)[:200]
+        )
+        return []
+    return [str(r["domain"] or "").strip().lower() for r in rows or [] if r["domain"]]
+
+
+PROVEN_BY_OTHER_SQL = """
+SELECT 1
+  FROM merchant_official_domains
+ WHERE domain = :domain
+   AND merchant_id <> :merchant_id
+   AND source IN ('verified', 'asserted')
+   AND (liveness_status IS NULL OR liveness_status <> 'dead')
+ LIMIT 1
+"""
+
+
+async def domain_is_proven_by_other_merchant(
+    domain: str, merchant_id: str,
+) -> bool:
+    """True when ANOTHER merchant has PROVEN control of this domain.
+
+    Wider than `resolve_verified_merchant_for_domain`, which requires
+    `verified` — bound to the brand identity. `asserted` also means control was
+    proven, it is simply unbound, and a proof is a proof for the purpose of
+    refusing somebody else's UNPROVEN declaration. Checking only `verified`
+    left a gap.
+
+    RAISES on a database error rather than returning False: the caller treats
+    an unanswerable ownership question as a refusal, and swallowing it here
+    would turn "we could not check" into "nobody owns it".
+    """
+    await ensure_merchant_official_domains_table()
+    host = (domain or "").strip().lower()
+    if not host or not merchant_id:
+        return False
+    row = await database.fetch_one(
+        PROVEN_BY_OTHER_SQL, {"domain": host, "merchant_id": str(merchant_id)},
+    )
+    return row is not None
+
+
+async def list_official_domains(
+    merchant_id: str, *, strict: bool = False,
+) -> List[Dict[str, Any]]:
     """Every stored row for the merchant — including `dead` ones, which the
     caller filters. Returning them lets a report say WHY a host it once counted
-    is gone, which dropping them here would make impossible."""
+    is gone, which dropping them here would make impossible.
+
+    Best-effort by default: a DB error logs and returns [], so a report
+    degrades to the inferred set rather than to nothing. `strict=True` RAISES
+    instead. A GUARD must use strict: `declare_official_domain` asks this
+    function "does the merchant already own this host", and an empty answer on
+    a DB error read as "no" — so the declaration went through, and the upsert's
+    `source = excluded.source` downgraded a VERIFIED row to declared/pending.
+    Failing open in a reader is a degraded report; failing open in a guard is a
+    write that should not have happened.
+    """
     if not merchant_id:
         return []
     await ensure_merchant_official_domains_table()
@@ -378,6 +686,8 @@ async def list_official_domains(merchant_id: str) -> List[Dict[str, Any]]:
         )
         return [dict(r) for r in rows or []]
     except Exception as exc:  # noqa: BLE001
+        if strict:
+            raise
         logger.warning(
             "list_official_domains failed for %s: %s", merchant_id, str(exc)[:200]
         )
@@ -463,6 +773,12 @@ def is_excluded(liveness_status: Optional[str]) -> bool:
 
 __all__: Sequence[str] = (
     "EXCLUDING_LIVENESS",
+    "INSERT_DECLARED_DOMAIN_SQL",
+    "PROMOTE_DECLARED_TO_INFERRED_SQL",
+    "SOURCE_DECLARED",
+    "insert_declared_domain",
+    "promote_declared_to_inferred",
+    "domain_is_proven_by_other_merchant",
     "LIVENESS_DEAD",
     "LIVENESS_LIVE",
     "LIVENESS_UNCHECKED",
@@ -480,6 +796,8 @@ __all__: Sequence[str] = (
     "is_excluded",
     "list_domains_due_for_liveness",
     "list_official_domains",
+    "list_verified_domains",
+    "resolve_verified_merchant_for_domain",
     "merchant_official_domains",
     "record_liveness",
     "reset_ddl_ready_for_tests",
