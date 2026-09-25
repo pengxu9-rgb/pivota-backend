@@ -22,7 +22,7 @@ WHAT THIS PINS, on the production dialect, because only Postgres has the lock:
   * a guarded `ALTER TABLE t` (no IF EXISTS) still raises UndefinedTable on a missing t, as the
     bare statement did, so an apply_ddl_statements pass still counts it as a failure to retry.
 
-ISOLATION. Every heal here runs in its own schema (`rp_heal`, through a `Database` whose
+ISOLATION. Every test runs its heals in a fresh schema (`rp_heal_<hex>`, through a `Database` whose
 connections set search_path to it), so nothing this file creates can narrow or widen a table a
 sibling gate file builds, and no sibling's table shape can break a heal here. The modules'
 `database` is swapped for that one for the duration of each test.
@@ -37,6 +37,7 @@ import importlib
 import os
 import sys
 import time
+import uuid
 from typing import Callable, List, Optional, Tuple
 
 import pytest
@@ -56,7 +57,13 @@ assert "main" not in sys.modules or not _IS_PG, (
     "and poisons later create_all calls in the Postgres gate"
 )
 
+#: This test's scratch schema; the fixture replaces it with a fresh `rp_heal_<hex>` per test.
 SCHEMA = "rp_heal"
+
+#: Databases this file may create scratch schemas in: a throwaway local one, or the dialect
+#: gate's CI database (pivota_dialect_check), whose name carries no `_test` — the same markers
+#: as tests/test_schema_guard_boot_ddl_lock_postgres.py, so the gate RUNS these, not skips them.
+_SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")
 
 #: How long the lock holder keeps its lock before this harness lets go on its own. Far above
 #: the guard's lock_timeout, so a heal that finishes only after this was waiting on the holder.
@@ -241,20 +248,21 @@ async def _db(monkeypatch):
     import db._ddl_guard as ddl_guard
 
     dbname = DATABASE_URL.rsplit("/", 1)[-1].split("?")[0]
-    if not dbname.endswith("_test"):
-        pytest.skip(f"refusing to build schemas in {dbname!r} — throwaway *_test only")
+    if not any(m in dbname or m in DATABASE_URL for m in _SAFE_DB_MARKERS):
+        pytest.skip(f"refusing to create scratch schemas in {dbname!r} — throwaway only")
 
+    schema = f"rp_heal_{uuid.uuid4().hex[:10]}"
+    monkeypatch.setattr(sys.modules[__name__], "SCHEMA", schema)
     admin = await asyncpg.connect(_asyncpg_dsn())
     try:
-        await admin.execute(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE")
-        await admin.execute(f"CREATE SCHEMA {SCHEMA}")
-        await admin.execute(f"SET search_path = {SCHEMA}")
+        await admin.execute(f"CREATE SCHEMA {schema}")
+        await admin.execute(f"SET search_path = {schema}")
         for ddl in _PREREQUISITES:
             await admin.execute(ddl)
     finally:
         await admin.close()
 
-    db = Database(_asyncpg_dsn(), min_size=1, max_size=4, server_settings={"search_path": SCHEMA})
+    db = Database(_asyncpg_dsn(), min_size=1, max_size=4, server_settings={"search_path": schema})
     await db.connect()
     monkeypatch.setattr(ddl_guard, "_state", {})
     try:
@@ -263,7 +271,7 @@ async def _db(monkeypatch):
         await db.disconnect()
         admin = await asyncpg.connect(_asyncpg_dsn())
         try:
-            await admin.execute(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE")
+            await admin.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
         finally:
             await admin.close()
 
