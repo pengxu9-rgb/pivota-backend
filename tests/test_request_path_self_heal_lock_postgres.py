@@ -83,8 +83,8 @@ _PREREQUISITES = (
     "CREATE TABLE shop_users (id TEXT PRIMARY KEY)",
     "CREATE TABLE product_reviews (id BIGSERIAL PRIMARY KEY)",
     # The UGC tables as the pre-order_id migration built them (legacy unique constraint, no
-    # order_id, no risk_flags). ensure_ugc_tables_exist's own CREATE branch sends several
-    # statements in one prepared query, which `databases` refuses, so it cannot build them.
+    # order_id, no risk_flags), so the heal has that shape to harden. Its CREATE branch, which
+    # builds the current shape instead, is pinned in tests/test_ugc_tables_create_postgres.py.
     """CREATE TABLE buyer_review_user_subject (
         id BIGSERIAL PRIMARY KEY, user_id TEXT NOT NULL, subject_type VARCHAR(32) NOT NULL,
         subject_id TEXT NOT NULL, review_id BIGINT NOT NULL REFERENCES product_reviews(id),
