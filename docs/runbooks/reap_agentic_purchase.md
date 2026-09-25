@@ -122,6 +122,16 @@ handle is quoting against something nobody has checked since.
 | `REAP_AGENTIC_ENABLED` | **unset = off** | `start_purchase` refuses `rail_disabled`. Truthy spellings: `1`, `true`, `on`, `yes` (case/space-insensitive). An allowlist, so a typo cannot arm the rail. |
 | `REAP_API_BASE_URL` + `REAP_API_KEY` | unset | both required; otherwise `start_purchase` refuses `rail_unconfigured`. |
 | `REAP_RETURN_URL_HOSTS` | `agent.pivota.cc` | host allowlist for our own `returnUrl`. Empty/unset means the default, not "no hosts". |
+| `REAP_AGENTIC_SIMULATE_CHECKOUT` | **unset = off** | **Sandbox only.** Exactly `COMPLETED` (case-sensitive; anything else is ignored with a WARNING on the `pivota` logger) adds `X-Simulate-Checkout: COMPLETED` to `POST /agentic/checkouts` and to no other request — and only when `REAP_API_BASE_URL`'s host is exactly `sandbox.api.reap.global` or `mx.sandbox.api.reap.global` (any other host: header withheld, WARNING). See below. |
+
+**`REAP_AGENTIC_SIMULATE_CHECKOUT`, measured 25 Sep in the sandbox.** It does not skip the buyer:
+the checkout is still created `REQUIRES_ACTION` with a hosted approval URL, and a human must approve
+it within the **quote's** ~5-minute TTL — an unapproved checkout goes `FAILED` (not `EXPIRED`) when
+the quote expires. After approval it goes `PROCESSING` → `COMPLETED` with an `orderId` in about
+70 s, where the un-simulated sandbox ends `FAILED`. When sent, the header is part of the checkout's
+idempotency material, so a simulated and an unsimulated checkout on one quote are different
+requests; with the dial unset the key is byte-identical to before. Reap's spec says the header is
+rejected in production, so the host guard is belt and braces, not the only lock.
 
 `REAP_AGENTIC_ENABLED` gates `start_purchase` only. `advance` does **not** re-check it: a
 purchase already in flight must be allowed to finish (or fail cleanly) after the dial is turned

@@ -108,6 +108,9 @@ from urllib.parse import urlparse
 
 # Stdlib-only, like this module; the structural check `build_cart_link_quote_request` applies.
 from services.reap_cart_link import cart_link_line
+# The `pivota` logger (stdlib-only too): the only one whose INFO/WARNING reliably lands in prod
+# logs. Used for the sandbox-simulate dial, where a silently ignored setting must be visible.
+from utils.logger import logger as _ops_logger
 
 logger = logging.getLogger("reap_agentic_client")
 
@@ -351,6 +354,71 @@ def validate_base_url(raw: Optional[str] = None) -> str:
     return url
 
 
+# --- sandbox-only: simulate a completed checkout --------------------------------------------------
+#
+# Reap's sandbox accepts `X-Simulate-Checkout: COMPLETED` on `POST /agentic/checkouts` (spec
+# re-read 25 Sep: optional header, `const: COMPLETED`, "rejected in production"). Measured: it does
+# NOT skip the buyer's approval -- the checkout is still REQUIRES_ACTION with a hosted URL -- but
+# once a human approves, it goes PROCESSING -> COMPLETED with an `orderId` in ~70 s instead of the
+# FAILED the un-simulated sandbox returns. That is what makes our own rail runnable end to end.
+#
+# It must never reach production, however an operator sets the environment. So the header is
+# emitted only when BOTH the dial is the exact string and the base URL's host is one of the two
+# sandbox hosts, compared as an exact string. `ALLOWED_HOST_SUFFIXES` is NOT reused for this: it
+# admits `prod.api.reap.global` by design. Reap rejecting the header in production is the second
+# lock, not the first.
+
+#: The dial. Read on every call, never cached at import.
+SIMULATE_CHECKOUT_DIAL = "REAP_AGENTIC_SIMULATE_CHECKOUT"
+SIMULATE_CHECKOUT_HEADER = "X-Simulate-Checkout"
+#: The ONLY accepted dial value, and the only value the spec admits for the header. Case-sensitive
+#: and not coerced: `completed`, `1`, `true` are ignored rather than read as "on".
+SIMULATE_CHECKOUT_VALUE = "COMPLETED"
+#: Exact hostnames, from the spec's `servers` block. Exact, not suffix: `x.sandbox.api.reap.global`
+#: is not one of them, and `prod.api.reap.global` must never be.
+SIMULATE_CHECKOUT_SANDBOX_HOSTS = frozenset({"sandbox.api.reap.global", "mx.sandbox.api.reap.global"})
+
+
+def simulate_checkout_header(
+    base_url_value: Optional[str], dial_value: Optional[str]
+) -> Optional[Dict[str, str]]:
+    """`{"X-Simulate-Checkout": "COMPLETED"}` or None. Pure apart from the WARNING it logs.
+
+    None unless the dial is exactly `COMPLETED` (after `.strip()`) AND `base_url_value` passes
+    `validate_base_url` AND its hostname is exactly one of `SIMULATE_CHECKOUT_SANDBOX_HOSTS`.
+    Never raises: a base URL `validate_base_url` refuses is simply not the sandbox.
+
+    WARNINGs go through the `pivota` logger (the one whose WARNINGs reliably reach prod logs),
+    because a dial someone set that silently does nothing is a debugging session.
+    """
+    if dial_value is None:
+        return None
+    raw = dial_value.strip() if isinstance(dial_value, str) else str(dial_value)
+    if not raw:
+        return None
+    if raw != SIMULATE_CHECKOUT_VALUE:
+        _ops_logger.warning(
+            "%s value not recognised (%r); only the exact string %s is accepted; header withheld",
+            SIMULATE_CHECKOUT_DIAL, raw[:32], SIMULATE_CHECKOUT_VALUE,
+        )
+        return None
+    host = ""
+    # `is not None` matters: `validate_base_url(None)` falls back to the ENVIRONMENT, and this
+    # function must judge only the value it was handed.
+    if base_url_value is not None and base_url_value.strip():
+        try:
+            host = (urlparse(validate_base_url(base_url_value.strip())).hostname or "").lower()
+        except ReapConfigError:
+            host = ""
+    if host not in SIMULATE_CHECKOUT_SANDBOX_HOSTS:
+        # The host is not named: a refused base URL can carry userinfo, which is a credential.
+        _ops_logger.warning(
+            "simulate dial set but base is not the Reap sandbox; header withheld"
+        )
+        return None
+    return {SIMULATE_CHECKOUT_HEADER: SIMULATE_CHECKOUT_VALUE}
+
+
 #: Reap retains an idempotency key for 24 h, but a quote's `expiresAt` is roughly 5 minutes. A
 #: key derived from the body ALONE therefore replays a long-dead quote to the same cart the next
 #: day -- the caller gets a 200 carrying an expired `expiresAt` and prices that may have moved.
@@ -442,6 +510,7 @@ def _headers(
     *,
     method: str = "POST",
     idempotency_extra: Optional[Dict[str, Any]] = None,
+    extra_headers: Optional[Dict[str, str]] = None,
 ) -> Dict[str, str]:
     """`method` is not cosmetic. `_IDEMPOTENT_PATHS` is matched by PATH, and `/agentic/enrollments`
     is both a create and a list -- so keying off the path alone would put an Idempotency-Key on
@@ -451,6 +520,11 @@ def _headers(
     `idempotency_extra` carries material that is NOT a field of the request body -- today only
     the enrollment `attempt_id`, which identifies which of our attempts this is and has no place
     in a body whose schema does not have it.
+
+    `extra_headers` is added verbatim and may not replace a header set here (the key, the version,
+    the idempotency key). It is passed EXPLICITLY by the one caller that needs it --
+    `create_checkout`, for the sandbox simulate header -- rather than chosen here by sniffing the
+    path, so no other request can pick it up by sharing a prefix.
     """
     headers = {
         "Authorization": f"Bearer {key}",
@@ -468,6 +542,10 @@ def _headers(
                 bucket_seconds=(None if path in _UNBUCKETED_IDEMPOTENT_PATHS
                                 else _IDEMPOTENCY_BUCKET_S),
             )
+    for name, value in (extra_headers or {}).items():
+        if any(name.lower() == existing.lower() for existing in headers):
+            raise ReapRequestError(f"extra header {name!r} would replace a header this module sets")
+        headers[name] = value
     return headers
 
 
@@ -1690,6 +1768,7 @@ async def _post(
     *,
     timeout_seconds: Optional[float] = None,
     idempotency_extra: Optional[Dict[str, Any]] = None,
+    extra_headers: Optional[Dict[str, str]] = None,
 ) -> ReapResponse:
     """One POST. Returns a result; raises only on misconfiguration.
 
@@ -1729,7 +1808,8 @@ async def _post(
             # steps of at most 64 KiB, and the read is abandoned once the cap is passed.
             async with client.stream(
                 "POST", f"{url}{path}", json=body,
-                headers=_headers(key, path, body, idempotency_extra=idempotency_extra),
+                headers=_headers(key, path, body, idempotency_extra=idempotency_extra,
+                                 extra_headers=extra_headers),
             ) as resp:
                 if resp.status_code >= 400:
                     # The response BODY is deliberately not logged or returned to a serving
@@ -3228,12 +3308,28 @@ async def create_checkout(
     timeout_seconds: Optional[float] = None,
 ) -> ReapResponse:
     """`POST /agentic/checkouts`. Already in the slow-path set: it is the leg that talks to the
-    merchant, and it carries the quote's 35 s bound rather than the 12 s default."""
+    merchant, and it carries the quote's 35 s bound rather than the 12 s default.
+
+    SANDBOX ONLY: when `REAP_AGENTIC_SIMULATE_CHECKOUT=COMPLETED` AND the base URL is a Reap
+    sandbox host, `X-Simulate-Checkout: COMPLETED` is added -- here and on no other request. See
+    `simulate_checkout_header`. The dial is read on every call.
+
+    When the header is sent it is ALSO idempotency material: a checkout opened with it and one
+    opened without are different requests to Reap. Keyed on the body alone, a replay after the
+    dial was toggled would either hit IDEMPOTENT_PARAMETER_MISMATCH or silently return the other
+    checkout. With the dial unset the material -- and so the key -- is exactly what it was.
+    """
     body = build_checkout_request(
         quote_id=quote_id, enrollment_id=enrollment_id, return_url=return_url
     )
+    simulate = simulate_checkout_header(base_url(), os.getenv(SIMULATE_CHECKOUT_DIAL))
     return _refuse_unsafe_hosted_url(
-        await _post("/agentic/checkouts", body, timeout_seconds=timeout_seconds)
+        await _post(
+            "/agentic/checkouts", body, timeout_seconds=timeout_seconds,
+            extra_headers=simulate,
+            idempotency_extra=(
+                {"simulate": simulate[SIMULATE_CHECKOUT_HEADER]} if simulate else None),
+        )
     )
 
 
