@@ -17,6 +17,7 @@ Two executors share one set of SQL constants:
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -1704,6 +1705,154 @@ async def _refuse_parallel_retailer_listings(plan: Dict[str, Any], database: Any
         raise ValueError(legacy_listing_refusal(findings[0]))
 
 
+#: Multi-market storefronts ADR section 3.4 item 4 (approved by Peng 2026-09-26). A brand may run one
+#: brand-official storefront per market (us.frankbody.com and frankbody.com are separate Shopify stores),
+#: and both land on ONE product row: a brand_official product_key is ext:<brand-title>::<sha1>, no host
+#: in it. Exactly one storefront owns that row's canonical copy -- the canonical market's -- and every
+#: other one attaches its offers (they are per destination URL, so they never collide) WITHOUT
+#: overwriting the owner's copy. Before this guard the second apply silently re-pointed the row's
+#: source_domain / canonical_url / payload at itself and re-labelled its INCI.
+DEFAULT_CANONICAL_MARKET = "US"
+
+#: What an offer-only apply keeps from the stored row. Each is filled from the plan only when the
+#: stored value is blank. (title and description are not in _PDP_UPSERT_SQL's DO UPDATE at all.)
+CANONICAL_OWNER_COLUMNS = ("source_domain", "canonical_url", "image_url", "product_payload")
+#: Rows named in counts["canonical_owner_kept"]; the count itself is always complete.
+CANONICAL_OWNER_KEPT_CAP = 50
+
+_CANONICAL_OWNER_SQL = """
+                SELECT product_key, brand, source_domain, canonical_url, image_url, product_payload
+                FROM catalog_products
+                WHERE product_key = ANY(:keys)
+                """
+
+
+def canonical_market(brand: Optional[str]) -> str:
+    """The market whose brand-official storefront owns a brand's canonical product copy: the index's
+    primary served market for every brand, until a per-brand decision exists (ADR open question 1)."""
+    return DEFAULT_CANONICAL_MARKET
+
+
+def _storefront_host(value: Any) -> str:
+    """A host as storefronts are told apart: lowercased, `www.` dropped. A SUBDOMAIN is kept --
+    us.frankbody.com is a different store from frankbody.com (curated_brand_feed._same_storefront_host)."""
+    return str(value or "").strip().lower().rstrip(".").removeprefix("www.")
+
+
+def _enrichment_meta(payload: Any) -> Dict[str, Any]:
+    if isinstance(payload, (str, bytes)):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            return {}
+    meta = payload.get("enrichment_meta") if isinstance(payload, dict) else None
+    return meta if isinstance(meta, dict) else {}
+
+
+def _is_brand_official_pdp(pdp: Dict[str, Any]) -> bool:
+    """A planned row a brand's own storefront writes (ingestion stamps enrichment_meta.source_role; a
+    retailer listing is stamped "retailer" and keyed ext:retailer:<listing>, so it never gets here)."""
+    return _enrichment_meta(pdp.get("product_payload")).get("source_role") == "brand_official"
+
+
+def canonical_owner_of(row: Dict[str, Any]) -> Optional[str]:
+    """The host of the brand-official storefront whose copy a STORED product row holds, or None.
+
+    A row stamped enrichment_meta.source_role = brand_official is owned by its source_domain. A row
+    written before that stamp existed (no source_role) counts as brand-owned only when its domain's name
+    IS its brand (offer_seller_identity.brand_owns_domain, Tier A) and it is not a known retailer: a
+    legacy copy taken from a reseller's listing has no owner, and the brand's store may replace it
+    (ADR-001: the brand's own copy is the canonical anchor)."""
+    host = _storefront_host(row.get("source_domain"))
+    if not host:
+        return None
+    role = _enrichment_meta(row.get("product_payload")).get("source_role")
+    if role == "brand_official":
+        return host
+    if role is None:
+        from services.offer_seller_identity import brand_owns_domain, is_known_retailer
+        if brand_owns_domain(row.get("brand"), host) and not is_known_retailer(host):
+            return host
+    return None
+
+
+async def _guard_canonical_owner(
+    plan: Dict[str, Any], database: Any, *, market: str,
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Keep a product row's canonical copy with the storefront that owns it (see
+    DEFAULT_CANONICAL_MARKET). Returns (plan, counts).
+
+    A planned brand_official row whose stored row is owned by a DIFFERENT brand-official storefront is
+    applied OFFER-ONLY: CANONICAL_OWNER_COLUMNS keep the stored values and the plan's INCI for it is
+    dropped, while its SKUs and offers still land (the row is still upserted, so the apply's counts and
+    the primary-apply gate see every planned product). Two cases:
+
+      * the job's market is not the brand's canonical market -- the ADR's rule;
+      * the SAME (canonical) market, a second host -- nothing proves which of two storefronts is the
+        right owner, so the one that already owns the row keeps it (first owner wins). A brand that
+        MOVED its store to a new domain therefore keeps its old canonical_url until someone re-points
+        it: an open question on the PR, deliberately not guessed here.
+
+    A row with no stored copy is created as today. Created by a job whose market is not the canonical
+    one, it is counted canonical_created_off_market for review (the ADR's flag); unreachable while
+    retailer_ingest allows only US.
+
+    `counts` carries a key only when the guard changed or flagged something, so an apply it had nothing
+    to say about reports exactly what it did before."""
+    counts: Dict[str, Any] = {}
+    pdps = plan.get("pdps") or []
+    planned = {str(p.get("product_key")): p for p in pdps if _is_brand_official_pdp(p)}
+    if not planned:
+        return plan, counts
+    rows = await database.fetch_all(_CANONICAL_OWNER_SQL, {"keys": sorted(planned)})
+    stored_by_key = {}
+    for row in rows or []:
+        data = dict(row)
+        stored_by_key[str(data.get("product_key") or "")] = data
+    kept: List[Dict[str, Any]] = []
+    out_pdps = []
+    for pdp in pdps:
+        key = str(pdp.get("product_key") or "")
+        if key not in planned:
+            out_pdps.append(pdp)
+            continue
+        off_market = market != canonical_market(pdp.get("brand"))
+        stored = stored_by_key.get(key)
+        if stored is None:
+            if off_market:
+                counts["canonical_created_off_market"] = counts.get("canonical_created_off_market", 0) + 1
+                logger.warning("canonical_created_off_market: %s created by a %s-market apply from %s",
+                               key, market, pdp.get("source_domain"))
+            out_pdps.append(pdp)
+            continue
+        owner = canonical_owner_of(stored)
+        writer = _storefront_host(pdp.get("source_domain"))
+        if owner is None or owner == writer:
+            out_pdps.append(pdp)
+            continue
+        row = dict(pdp)
+        for column in CANONICAL_OWNER_COLUMNS:
+            value = stored.get(column)
+            if value not in (None, ""):
+                row[column] = json.dumps(value) if isinstance(value, (dict, list)) else value
+        out_pdps.append(row)
+        kept.append({"product_key": key, "owner": owner, "writer": writer,
+                     "reason": "off_market" if off_market else "owned_by_another_storefront"})
+    if not kept:
+        return plan, counts
+    offer_only = {k["product_key"] for k in kept}
+    incis = plan.get("incis") or []
+    plan = dict(plan)
+    plan["pdps"] = out_pdps
+    plan["incis"] = [r for r in incis if str(r.get("product_key") or "") not in offer_only]
+    counts["pdps_offer_only_canonical_owner"] = len(kept)
+    counts["incis_skipped_canonical_owner"] = len(incis) - len(plan["incis"])
+    counts["canonical_owner_kept"] = kept[:CANONICAL_OWNER_KEPT_CAP]
+    logger.warning("apply_ingest_plan: %d product(s) applied offer-only, their canonical copy kept with its "
+                   "owning storefront: %s", len(kept), kept[:CANONICAL_OWNER_KEPT_CAP])
+    return plan, counts
+
+
 async def apply_ingest_plan(
     plan: Dict[str, Any],
     *,
@@ -1711,6 +1860,7 @@ async def apply_ingest_plan(
     db: Any = None,
     batch: bool = False,
     primary_readiness: bool = False,
+    market: str = DEFAULT_CANONICAL_MARKET,
 ) -> Dict[str, Any]:
     """Persist an ingest plan, optionally handing curated rows to serving policy.
 
@@ -1718,12 +1868,15 @@ async def apply_ingest_plan(
     existing door retains the original counts and best-effort persistence path.
     A failed handoff leaves its persisted counts on the typed exception so an
     operator can retry the same identities without calling a partial run done.
+
+    `market`: the buyer market the plan's offers are priced for (the retailer_ingest job's); it decides
+    whether a brand_official plan is its brand's canonical-market storefront (_guard_canonical_owner).
     """
     from db.database import database as global_db
     from services.catalog_enrichment_agent.primary_ingestion import require_primary_plan, require_primary_apply
 
     preflight = require_primary_plan(plan) if primary_readiness else None
-    counts = await _apply_ingest_plan(plan, batch_label=batch_label, db=db, batch=batch)
+    counts = await _apply_ingest_plan(plan, batch_label=batch_label, db=db, batch=batch, market=market)
     if not primary_readiness:
         return counts
     from services.catalog_enrichment_agent.primary_readiness import (
@@ -1750,6 +1903,7 @@ async def _apply_ingest_plan(
     batch_label: str,
     db: Any = None,
     batch: bool = False,
+    market: str = DEFAULT_CANONICAL_MARKET,
 ) -> Dict[str, int]:
     """Execute an ingest plan (from `ingest_validated_jsonl`) against the DB in FK
     order. Returns counts. Per-row failures are logged and skipped (never abort the
@@ -1766,9 +1920,13 @@ async def _apply_ingest_plan(
 
     await _refuse_parallel_retailer_listings(plan, database)
     plan = await _prepare_seller_of_record(plan, database)
+    # BOTH executors: the guard rewrites the planned rows before either one writes them.
+    plan, owner_counts = await _guard_canonical_owner(plan, database, market=market)
 
     if batch:
-        return await _apply_ingest_plan_batched(plan, batch_label=batch_label, database=database)
+        counts = await _apply_ingest_plan_batched(plan, batch_label=batch_label, database=database)
+        counts.update(owner_counts)
+        return counts
 
     pdps = plan.get("pdps") or []
     skus = plan.get("skus") or []
@@ -1778,6 +1936,7 @@ async def _apply_ingest_plan(
     audit_reasons = plan.get("audit_reasons") or {}
 
     counts = {"merchants": 0, "pdps": 0, "skus": 0, "offers": 0, "seeds": 0, "offers_skipped": 0}
+    counts.update(owner_counts)
     audit = WriterAuditAccumulator(
         writer_name=AGENT_VERSION,
         batch_id=make_batch_id(AGENT_VERSION, batch_label),

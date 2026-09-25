@@ -189,7 +189,7 @@ def env(monkeypatch):
                 return state.readback_rows
             return [{"product_key": k, "category_path": "beauty/makeup/lip/tint", "serving": True,
                      "pipeline_stage": "public_indexed", "lifecycle": "published", "offers": 1,
-                     "offers_in_currency": 1}
+                     "offers_in_currency": 1, "offers_in_market": 1}
                     for k in values["keys"]]
     state.db = DB()
     return state
@@ -287,7 +287,7 @@ async def test_a_row_backend_recall_cannot_see_is_noted_but_never_fails_the_job(
     rows); backend global recall admits validated/published/NULL. The run records the difference."""
     async def fetch_all(sql, values):
         return [{"product_key": k, "category_path": "beauty/skincare/moisturize/cream", "serving": True,
-                 "pipeline_stage": "shadow_indexed", "lifecycle": lifecycle, "offers": 2, "offers_in_currency": 2}
+                 "pipeline_stage": "shadow_indexed", "lifecycle": lifecycle, "offers": 2, "offers_in_currency": 2, "offers_in_market": 2}
                 for k in values["keys"]]
     env.db.fetch_all = fetch_all
     out = await pipeline.run_stage(job("apply_due"), db=env.db)
@@ -913,7 +913,7 @@ async def test_the_run_reason_counts_every_noted_row(env):
     env.rows = [TINT, ("3CE - Velvet Lip Tint Rose 4g", "LIP TINT", "velvet-lip-tint-rose")]
     async def fetch_all(sql, values):
         return [{"product_key": k, "category_path": "beauty/makeup/lip/tint", "serving": True,
-                 "pipeline_stage": "shadow_indexed", "lifecycle": "candidate", "offers": 1, "offers_in_currency": 1}
+                 "pipeline_stage": "shadow_indexed", "lifecycle": "candidate", "offers": 1, "offers_in_currency": 1, "offers_in_market": 1}
                 for k in values["keys"]]
     env.db.fetch_all = fetch_all
     out = await pipeline.run_stage(job("apply_due"), db=env.db)
@@ -1199,7 +1199,7 @@ def _rows(blockers, **evidence):
             row = {"product_key": k, "category_path": "beauty/makeup/lip/tint", "serving": b is None,
                    "pipeline_stage": "public_indexed" if b is None else "extracted", "blocker_code": b or "none",
                    "blocker_detail": "content_quality_score=71.2 < 71.4" if b else None,
-                   "lifecycle": "published", "offers": 1, "offers_in_currency": 1,
+                   "lifecycle": "published", "offers": 1, "offers_in_currency": 1, "offers_in_market": 1,
                    "row_priced": True, "row_identity": True, "row_image": True}
             if b:
                 row.update(evidence)
@@ -1227,7 +1227,7 @@ async def test_any_other_reason_a_row_is_not_served_still_fails_the_store(env, b
     async def fetch_all(sql, values):
         return [{"product_key": k, "category_path": "beauty/makeup/lip/tint", "serving": False, "pipeline_stage": None,
                  "blocker_code": blocker, "blocker_detail": None, "lifecycle": "published", "offers": 1,
-                 "offers_in_currency": 1} for k in values["keys"]]
+                 "offers_in_currency": 1, "offers_in_market": 1} for k in values["keys"]]
     env.db.fetch_all = fetch_all
     out = await pipeline.run_stage(job("apply_due"), db=env.db)
     assert (out["status"], out["outcome"]) == ("failed", "readback_failed")
@@ -1279,7 +1279,7 @@ async def test_the_readback_reads_each_products_own_row_not_the_shared_index_fla
         seen["sql"], seen["values"] = sql, values
         return [{"product_key": k, "category_path": "beauty/makeup/lip/tint", "serving": True, "pipeline_stage": "public_indexed",
                  "blocker_code": "none", "blocker_detail": None, "lifecycle": "published", "offers": 1,
-                 "offers_in_currency": 1, "row_priced": True, "row_identity": True, "row_image": True}
+                 "offers_in_currency": 1, "offers_in_market": 1, "row_priced": True, "row_identity": True, "row_image": True}
                 for k in values["keys"]]
     env.db.fetch_all = fetch_all
     await pipeline.run_stage(job("apply_due"), db=env.db)

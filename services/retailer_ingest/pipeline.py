@@ -75,8 +75,25 @@ _OPTION_TYPES = {
     # override each row keeps the STORE's spelling, and normalize_brand keeps punctuation, so "Dr. Jart+"
     # at one store and "Dr.Jart+" everywhere else become two brands (review of #2301).
     "brands": dict,
+    # The buyer market this cohort's offers are priced FOR (ISO-3166-1 alpha-2; absent = DEFAULT_MARKET).
+    # It decides the currency the store must prove (require_currency defaults to the market's) and what
+    # the readback checks every offer is stamped. Multi-market storefronts ADR, Phase 1.
+    "market": str,
 }
 SOURCES = ("storefront", "affiliate_feed")
+DEFAULT_MARKET = "US"
+#: The markets a job may name. US ONLY in this phase: every offer this lane writes is stamped
+#: catalog_offers.market 'US' (catalog_enrichment_agent.ingestion) and normalize_curated_brand_payload
+#: refuses any other market, so an AU or JP job today would crawl an AUD/JPY store and then have
+#: nowhere truthful to put it. AU/JP become ACQUISITION markets (rows stored, not served) in the
+#: multi-market storefronts ADR's Phase 2, and served markets in its Phase 3 -- each is one entry here
+#: plus that phase's writer change, never this list alone.
+INGEST_MARKETS = ("US",)
+_ISO_ALPHA2 = re.compile(r"[A-Z]{2}")
+#: Tier B (brand_official_domain_flags) matches the brand inside the store's /meta.json name after
+#: collapsing both to letters and digits. A brand shorter than this collapses to a string too common to
+#: be evidence ("ZA" is inside "BAZAAR"), so such a brand needs Tier A or a human, as before.
+TIER_B_MIN_BRAND_CHARS = 3
 #: The one shelf a reviewed set is re-filed to: canonical in both taxonomies (pivota-backend
 #: category_path_aliases, PIVOTA-Agent beautyTaxonomy.js `gift_set`).
 REFILE_SETS_LEAF = "beauty/sets/gift-set"
@@ -202,10 +219,76 @@ def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
     path = str(options.get("category_path") or "beauty").strip().strip("/").lower()
     if not (path == "beauty" or path.startswith("beauty/")) or path.count("/") > 1:
         raise ValueError(f"options.category_path must be coarse (beauty or beauty/<area>), got {path!r}")
+    if "market" in options:
+        from services.region_pricing import normalize_region
+        market = normalize_region(options["market"])
+        if not _ISO_ALPHA2.fullmatch(market):
+            raise ValueError(f"options.market must be an ISO-3166-1 alpha-2 code, got {options['market']!r}")
+        if market not in INGEST_MARKETS:
+            raise ValueError(f"options.market {market} is not an ingest market yet (allowed: {list(INGEST_MARKETS)}); "
+                             f"AU/JP arrive with the multi-market storefronts ADR's Phase 2/3")
+        options["market"] = market  # "us" and "US" are one cohort (db.retailer_ingest.scope_key agrees)
+    # The currency is the MARKET's, never a second free choice: the /products.json crawl sees only the
+    # store's base currency, so "base currency = the market's currency" is the one honest rule for it
+    # (ADR section 3.3). Given, it must say the same; absent, it is derived.
+    if "require_currency" in options and options["require_currency"] != job_currency(options):
+        raise ValueError(f"options.require_currency {options['require_currency']!r} is not market "
+                         f"{job_market(options)}'s currency {job_currency(options)}")
     return options
 
 
-def brand_official_domain_flags(domain: str, brands: List[str]) -> List[Dict[str, Any]]:
+def job_market(options: Optional[Dict[str, Any]]) -> str:
+    """The job's market: options.market, else DEFAULT_MARKET (every job queued before the option)."""
+    from services.region_pricing import normalize_region
+    return normalize_region((options or {}).get("market") or DEFAULT_MARKET)
+
+
+def job_currency(options: Optional[Dict[str, Any]]) -> str:
+    """The currency the job's store and offers must be in: its market's (services.region_pricing).
+    validate_options refuses a require_currency that says anything else."""
+    from services.region_pricing import pricing_currency_for_region
+    return pricing_currency_for_region(job_market(options))
+
+
+def _fold(value: Any) -> str:
+    """Casefolded letters and digits only: "Bali Body US" -> "balibodyus"."""
+    return "".join(c for c in str(value or "").casefold() if c.isalnum())
+
+
+def storefront_tier_b(brand: str, storefront: Optional[Dict[str, Any]], market: str) -> Dict[str, Any]:
+    """Tier B of the brand-official evidence ladder (multi-market storefronts ADR section 3.2): the
+    store's own /meta.json names the brand, ships to the job's market, and prices in that market's
+    currency. {"passed": bool, <each conjunct>: bool, + what was read}.
+
+    CONJUNCTIVE on purpose: a name alone would pass a distributor's store that names the brand it
+    resells ("Sukin Stockist"), and a US-shipping USD store alone proves nothing about whose it is.
+    Measured positives (2026-09-26): "Sukin Naturals USA" (sukinnaturals.com), "Bali Body US"
+    (us.balibodyco.com), "MineTan USA", "DHC Skincare" -- each USD, ships_to [US]."""
+    from services.region_pricing import pricing_currency_for_region_or_none
+    sf = storefront if isinstance(storefront, dict) else {}
+    want = _fold(brand)
+    ships = sf.get("ships_to_countries")
+    expected = pricing_currency_for_region_or_none(market)
+    out: Dict[str, Any] = {
+        "name": sf.get("name"), "myshopify_domain": sf.get("myshopify_domain"), "currency": sf.get("currency"),
+        "market": market,
+        "name_contains_brand": len(want) >= TIER_B_MIN_BRAND_CHARS and want in _fold(sf.get("name")),
+        "ships_to_market": isinstance(ships, list) and market in ships,
+        "currency_is_market_currency": bool(expected) and sf.get("currency") == expected,
+    }
+    out["passed"] = bool(out["name_contains_brand"] and out["ships_to_market"] and out["currency_is_market_currency"])
+    return out
+
+
+def brand_official_domain_flags(domain: str, brands: List[str], *, storefront: Optional[Dict[str, Any]] = None,
+                                market: str = DEFAULT_MARKET) -> List[Dict[str, Any]]:
+    """The BLOCK flags of `brand_official_domain_review` (see there); enqueue calls it with no
+    storefront, where only the known-retailer refusal and Tier A can decide."""
+    return brand_official_domain_review(domain, brands, storefront=storefront, market=market)[0]
+
+
+def brand_official_domain_review(domain: str, brands: List[str], *, storefront: Optional[Dict[str, Any]] = None,
+                                 market: str = DEFAULT_MARKET) -> tuple:
     """A brand_official cohort writes CANONICAL rows: a product's key derives from (brand, product
     name) alone -- and its brand is the product's own VENDOR, not the job's `brand` -- so the same
     product at any host lands on the same key, and the upsert re-points that key's source_domain /
@@ -216,29 +299,50 @@ def brand_official_domain_flags(domain: str, brands: List[str]) -> List[Dict[str
     brand and each record's):
 
       * a known retailer host can never be a brand's own store (not acceptable -- fix the job);
-      * otherwise the domain's name must BE that brand (offer_seller_identity.brand_owns_domain, the
-        rule that types an offer brand_direct), or a human accepts the flag (tartecosmetics.com for
-        "Tarte", k18hair.com for "K18"): held, never auto-applied.
+      * Tier A: the domain's name IS that brand (offer_seller_identity.brand_owns_domain, the rule
+        that types an offer brand_direct) -- us.frankbody.com for "Frank Body";
+      * Tier B: the store's own /meta.json (`storefront`, from the crawl) names the brand, ships to
+        the job's `market` and prices in its currency (storefront_tier_b) -- sukinnaturals.com,
+        "Sukin Naturals USA", for "Sukin". Peng approved it as automatic on 2026-09-26;
+      * otherwise a human accepts the flag (tartecosmetics.com for "Tarte", k18hair.com for "K18"):
+        held, never auto-applied. A failed Tier B yields exactly that flag, same key.
+
+    Returns (flags, evidence): `evidence` says which tier admitted each brand (or what Tier B read
+    when none did) and is recorded on the run as checks.brand_official_evidence.
     """
     from services.offer_seller_identity import brand_owns_domain, is_known_retailer
 
     if is_known_retailer(domain):
-        return [{"key": "brand_official_on_a_retailer", "rule": "brand_official_on_a_retailer",
-                 "severity": detectors.BLOCK, "acceptable": False,
-                 "detail": f"{domain} is a known retailer; source_role brand_official would overwrite "
-                           f"canonical rows of {sorted(set(brands))} with this retailer's listings"}]
+        # Before any tier: a retailer's /meta.json may well name the brand it sells.
+        refused = {"key": "brand_official_on_a_retailer", "rule": "brand_official_on_a_retailer",
+                   "severity": detectors.BLOCK, "acceptable": False,
+                   "detail": f"{domain} is a known retailer; source_role brand_official would overwrite "
+                             f"canonical rows of {sorted(set(brands))} with this retailer's listings"}
+        return [refused], {"domain": domain, "known_retailer": True}
     flags: Dict[str, Dict[str, Any]] = {}
+    evidence: Dict[str, Any] = {"domain": domain, "market": market, "brands": {}}
     for brand in brands:
-        if brand_owns_domain(brand, domain):
-            continue
         # The brand's own casefolded spelling, NOT normalize_brand: that strips every non-ASCII
         # letter, so 설화수 and 헤라 would share one key and one acceptance would pass both.
-        key = f"brand_official_domain_unproven:{domain}:{' '.join(str(brand).split()).casefold()}"
+        label = " ".join(str(brand).split()).casefold()
+        if brand_owns_domain(brand, domain):
+            evidence["brands"].setdefault(label, {"tier": "A"})
+            continue
+        tier_b = storefront_tier_b(brand, storefront, market)
+        if tier_b["passed"]:
+            evidence["brands"].setdefault(label, {"tier": "B", **tier_b})
+            continue
+        evidence["brands"].setdefault(label, {"tier": None, "tier_b": tier_b})
+        key = f"brand_official_domain_unproven:{domain}:{label}"
         flags.setdefault(key, {
             "key": key, "rule": "brand_official_domain_unproven", "severity": detectors.BLOCK,
-            "detail": f"the domain name of {domain} is not the brand {brand!r}; accept this key only if "
-                      f"{domain} is {brand}'s own store (its rows become {brand}'s canonical rows)"})
-    return list(flags.values())
+            "detail": f"the domain name of {domain} is not the brand {brand!r}, and its /meta.json does not "
+                      f"prove it for {market} (name {tier_b['name']!r} names the brand: "
+                      f"{tier_b['name_contains_brand']}, ships to {market}: {tier_b['ships_to_market']}, "
+                      f"{tier_b['currency']!r} is {market}'s currency: {tier_b['currency_is_market_currency']}); "
+                      f"accept this key only if {domain} is {brand}'s own store (its rows become {brand}'s "
+                      f"canonical rows)"})
+    return list(flags.values()), evidence
 
 
 def _feed_payload(job: Dict[str, Any]) -> Dict[str, Any]:
@@ -252,7 +356,10 @@ def _feed_payload(job: Dict[str, Any]) -> Dict[str, Any]:
         "category_path": o.get("category_path") or "beauty",
         "source_role": o.get("source_role") or "retailer", "retailer_name": o.get("retailer_name"),
         "only_vendors": list(o["vendors"]),
-        "require_currency": o.get("require_currency") or "USD", "emit_real_variants": True,
+        # The market's currency (validate_options has refused any other require_currency), and the market
+        # itself, which normalize_curated_brand_payload refuses unless it is US -- a second lock on the
+        # INGEST_MARKETS allowlist, owned by the writer that stamps the offers.
+        "require_currency": job_currency(o), "market": job_market(o), "emit_real_variants": True,
         "enrich_missing_gtin": True, "max_products": int(o.get("max_products") or 200),
         "max_scan_products": int(o.get("max_scan_products") or 20000),
         "max_pdp_identity_fetches": int(o.get("max_pdp_identity_fetches") or 200),
@@ -352,7 +459,7 @@ async def _crawl(job: Dict[str, Any], stage: str) -> List[Dict[str, Any]]:
     report = getattr(records, "crawl_report", None)
     if not isinstance(report, dict) or report.get("status") != "complete":
         raise _Stop("crawl_unproven", "failed", "crawl completeness was not proven")
-    currency = (job.get("options") or {}).get("require_currency") or "USD"
+    currency = payload["require_currency"]  # job_currency: the market's (validated in _feed_payload)
     for record in records:
         seen = (record.get("pdp") or {}).get("currency")
         if seen != currency:
@@ -434,10 +541,24 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
     o = job.get("options") or {}
     checks: Dict[str, Any] = {"crawl": getattr(records, "crawl_report", None), "selected": len(records)}
     flags: List[Dict[str, Any]] = []
+    market = job_market(o)
+    storefront = (checks["crawl"] or {}).get("storefront") if isinstance(checks["crawl"], dict) else None
+    if isinstance(storefront, dict):
+        # WHICH Shopify store this crawl read (a us.<brand> host is usually a separate store from the
+        # brand's home one, not an alias) and whether it ships to the job's market. Recorded, never gated.
+        ships = storefront.get("ships_to_countries")
+        checks["storefront"] = {
+            "name": storefront.get("name"), "myshopify_domain": storefront.get("myshopify_domain"),
+            "currency": storefront.get("currency"), "market": market,
+            "ships_to_count": len(ships) if isinstance(ships, list) else None,
+            "ships_to_market": (market in ships) if isinstance(ships, list) else None,
+        }
     if o.get("source_role") == "brand_official":
         # Every brand the cohort would write: the job's, and each record's own (its vendor's).
         written = [job["brand"]] + sorted({str((r.get("pdp") or {}).get("brand") or "") for r in records} - {""})
-        flags.extend(brand_official_domain_flags(job["domain"], written))
+        domain_flags, checks["brand_official_evidence"] = brand_official_domain_review(
+            job["domain"], written, storefront=storefront, market=market)
+        flags.extend(domain_flags)
 
     excluded = {str(h).strip().strip("/").casefold() for h in (o.get("exclude_handles") or []) if str(h).strip()}
     if excluded:
@@ -521,8 +642,15 @@ INDEX_CONTENT_REFUSALS = ("low_quality", "no_image", "short_description", "non_c
 
 
 async def _readback(product_keys: List[str], currency: str, db: Any,
-                    planned_images: Optional[Dict[str, bool]] = None) -> Dict[str, Any]:
-    """Did what the gate says landed actually land servable? One row per applied product."""
+                    planned_images: Optional[Dict[str, bool]] = None, *, market: str = DEFAULT_MARKET) -> Dict[str, Any]:
+    """Did what the gate says landed actually land servable? One row per applied product.
+
+    Every live offer of the product must be in the job's currency AND stamped the job's market
+    (catalog_offers.market): currency = market, always (multi-market storefronts ADR section 3.3).
+    SG rows are the one deliberate exception in the catalog -- stored market 'US', currency 'SGD',
+    because external_product_seeds.market is a hard serving partition (curated_brand_feed.
+    fetch_shopify_shop_locale) -- and this lane never writes them: INGEST_MARKETS is US only and the
+    crawl refuses a non-USD store for a US job."""
     if not product_keys:
         return {"ok": False, "reason": "no product keys to read back", "notes": [], "rows": []}
     from services.index_pipeline_state_service import _RESOLVED_PDP_SCOPES
@@ -542,11 +670,14 @@ async def _readback(product_keys: List[str], currency: str, db: Any,
                (SELECT count(*) FROM catalog_offers o WHERE o.product_key = p.product_key
                   AND o.suppressed_at IS NULL) AS offers,
                (SELECT count(*) FROM catalog_offers o WHERE o.product_key = p.product_key
-                  AND o.suppressed_at IS NULL AND o.currency = :currency) AS offers_in_currency
+                  AND o.suppressed_at IS NULL AND o.currency = :currency) AS offers_in_currency,
+               (SELECT count(*) FROM catalog_offers o WHERE o.product_key = p.product_key
+                  AND o.suppressed_at IS NULL AND upper(o.market) = :market) AS offers_in_market
         FROM catalog_products p LEFT JOIN index_pipeline_state ips USING (content_key)
         WHERE p.product_key = ANY(:keys)
         """,
-        {"keys": list(product_keys), "currency": currency, "resolved_scopes": sorted(_RESOLVED_PDP_SCOPES)},
+        {"keys": list(product_keys), "currency": currency, "market": market,
+         "resolved_scopes": sorted(_RESOLVED_PDP_SCOPES)},
     )
     out = [dict(r) for r in rows]
     problems, notes = [], []
@@ -587,6 +718,9 @@ async def _readback(product_keys: List[str], currency: str, db: Any,
         if not r["offers"] or r["offers_in_currency"] != r["offers"]:
             problems.append({"product_key": r["product_key"],
                              "problem": f"offers {r['offers']}, in {currency}: {r['offers_in_currency']}"})
+        if r["offers_in_market"] != r["offers"]:
+            problems.append({"product_key": r["product_key"],
+                             "problem": f"offers {r['offers']}, stamped market {market}: {r['offers_in_market']}"})
     return {"ok": not problems, "problems": problems, "notes": notes, "rows": out}
 
 
@@ -758,7 +892,7 @@ async def _apply(job: Dict[str, Any], run_id: str, result: Dict[str, Any], summa
             result["checks"]["catalog_write"] = ledger.CATALOG_WRITE_STARTED  # kept when the run finishes
             with _timed(timings, "write_s"):
                 counts = await apply_ingest_plan(plan, batch_label=f"retailer_ingest:{job['id']}", db=db,
-                                                 primary_readiness=True)
+                                                 primary_readiness=True, market=job_market(job.get("options")))
         report = require_primary_apply(preflight, counts)
     except CatalogWriteLockBusy as busy:
         timings["write_lock_wait_s"] = round(time.monotonic() - waiting, 3)
@@ -783,9 +917,9 @@ async def _apply(job: Dict[str, Any], run_id: str, result: Dict[str, Any], summa
     # The same gate an operator ran on the log, fed the same line the CLI prints.
     gate = evaluate_apply_log("primary ingestion: " + json.dumps(report, default=str) + "\nJOB=pipeline RC=0",
                               domain=job["domain"])
-    currency = (job.get("options") or {}).get("require_currency") or "USD"
+    currency, market = job_currency(job.get("options")), job_market(job.get("options"))
     with _timed(timings, "readback_s"):
-        readback = await _readback(gate.get("product_keys") or [], currency, db,
+        readback = await _readback(gate.get("product_keys") or [], currency, db, market=market,
                                    planned_images={p.get("product_key"): bool(p.get("image_url"))
                                                    for p in plan.get("pdps") or []})
     ok = bool(gate.get("ok")) and readback["ok"]

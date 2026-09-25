@@ -45,6 +45,15 @@ def scope_key(domain: str, brand: str, options: Dict[str, Any]) -> str:
     exclusions added at review) is NOT scope: approving a job must not let a duplicate enqueue."""
     scope = {k: v for k, v in (options or {}).items()
              if k not in {"accepted_flags", "exclude_handles", "refile_to_sets", "notes"}}
+    # options.market IS scope ((host, brand, market) is one cohort), but an absent market MEANS "US"
+    # (pipeline.DEFAULT_MARKET; a literal here because the pipeline imports this module). So "US" in any
+    # case is dropped and every other value upper-cased: {"market": "US"} and no market at all are one
+    # key, and it is the key every job queued before the option existed already has. require_currency is
+    # NOT folded the same way: jobs stored with "USD" hold keys that include it, and dropping it now would
+    # let a re-enqueue of such a cohort miss its open job and duplicate it.
+    market = str(scope.pop("market", None) or "").strip().upper()
+    if market and market != "US":
+        scope["market"] = market
     raw = json.dumps({"domain": domain.strip().lower(), "brand": brand.strip(), "scope": scope},
                      sort_keys=True, ensure_ascii=False, default=str)
     return f"rij:{domain.strip().lower()}:{hashlib.sha256(raw.encode()).hexdigest()[:24]}"

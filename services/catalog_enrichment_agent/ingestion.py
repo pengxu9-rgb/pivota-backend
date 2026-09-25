@@ -598,6 +598,10 @@ def _build_pdp_insert(
         "category_resolution_status": pdp_payload.get("category_resolution_status"),
         "category_input_path": pdp_payload.get("category_input_path"),
         "category_source_product_type": pdp_payload.get("category_source_product_type"),
+        # WHOSE copy this row holds: "brand_official" marks the brand's own storefront as the row's
+        # canonical owner, which apply._guard_canonical_owner reads back so a second storefront of
+        # the brand attaches offers without overwriting it (multi-market storefronts ADR 3.4 item 4).
+        "source_role": pdp_payload.get("source_role"),
     }
     return {
         "product_key": product_key,
