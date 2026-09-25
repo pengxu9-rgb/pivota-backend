@@ -746,7 +746,13 @@ def test_the_repair_scripts_simulate_mode_reconciles_without_writing(monkeypatch
     async def refuse_write(*_a, **_k):
         raise AssertionError("simulate must not write")
 
+    def _reached(kwargs):
+        observed = kwargs.get("observed")
+        if observed is not None:
+            observed.update(status_code=200, final_url=DEST)
+
     async def fetch_html(url, **_k):
+        _reached(_k)
         return _html(AGGREGATE), "text/html"
 
     monkeypatch.setattr(script.database, "fetch_one", fetch_one)
@@ -757,8 +763,100 @@ def test_the_repair_scripts_simulate_mode_reconciles_without_writing(monkeypatch
     assert report["not_re_read"] == ["50ml-shopify-id"] and report["replaced"] == []
 
     async def fetch_html_one_offer(url, **_k):
+        _reached(_k)
         return _html([_offer(28, IN, sku="RL")]), "text/html"
 
     monkeypatch.setattr("services.external_offers_service._fetch_html", fetch_html_one_offer)
     report = asyncio.run(script._simulate(row["id"]))
     assert report["replaced"][0]["after"] == {"price_amount": 28.0, "availability": "in_stock"}
+
+
+
+# ----------------------------------------------------------------- the served URL, www or not
+
+
+@pytest.mark.parametrize(
+    "fetched,served,same",
+    [
+        ("https://eyurs.com/products/x", "https://www.eyurs.com/products/x", True),
+        ("https://www.eyurs.com/products/x/", "https://eyurs.com/products/x", True),
+        ("https://EYURS.com/products/x", "https://eyurs.com/products/x", True),
+        # Exactly one `www.` label comes off, nothing more: a host that starts with "w" keeps it.
+        ("https://www.web.com/products/x", "https://web.com/products/x", True),
+        # Everything but the host prefix and case stays exact.
+        ("https://eyurs.com/products/x", "https://eyurs.com/products/X", False),
+        ("https://eyurs.com/products/x?variant=1", "https://www.eyurs.com/products/x?variant=2", False),
+        ("http://eyurs.com/products/x", "https://www.eyurs.com/products/x", False),
+        ("https://eyurs.com:8443/products/x", "https://www.eyurs.com/products/x", False),
+        ("https://fentybeauty.com/products/a-shade", "https://fentybeauty.com/products/b-shade", False),
+        # `www.` is stripped from the front only; a different registrable name is another site.
+        ("https://eyurs.com/products/x", "https://www2.eyurs.com/products/x", False),
+        ("https://wwweyurs.com/products/x", "https://eyurs.com/products/x", False),
+        ("", "https://eyurs.com/products/x", False),
+        (None, None, False),
+    ],
+)
+def test_same_destination_forgives_only_a_www_prefix(fetched, served, same):
+    from routes.employee_products import _same_destination
+
+    assert _same_destination(fetched, served) is same
+
+
+def test_a_www_canonical_no_longer_locks_the_row_out_of_every_refresh(monkeypatch):
+    """eyurs: the 03:44Z refresh wrote canonical `www.eyurs.com` from the page's canonical tag;
+    `destination_url` stayed `eyurs.com`, so every later refresh was `not_read` and the stale
+    16.0 / out-of-stock stayed trusted until its stamp aged out."""
+    apex = DEST  # https://eyurs.com/... ; the harness's fetch lands on it
+    row = _seed_row(variants=[_variant("41820844753079", 16.0, "out_of_stock")], price=17.0, availability="in_stock")
+    row.update(destination_url=apex, canonical_url=apex.replace("://", "://www."))
+    result, stored = _refresh(monkeypatch, row, _page([_offer(17, IN, sku="RL")]))
+
+    assert result["variant_refresh"]["status"] == "all_re_read"
+    assert stored["seed_data"]["variants"][0]["price_amount"] == 17.0
+    assert stored["seed_data"]["variants"][0]["availability"] == "in_stock"
+
+
+def test_a_canonical_naming_another_product_still_blocks_the_read(monkeypatch):
+    """fenty: the canonical tag names a sibling shade's handle -- a different product."""
+    row = _seed_row(variants=[_variant("1", 16.0, "out_of_stock")], price=16.0, availability="out_of_stock")
+    row.update(canonical_url=DEST + "-other-shade")
+    result, stored = _refresh(monkeypatch, row, _page([_offer(17, IN, sku="RL")]))
+
+    assert result["variant_refresh"] == {"status": "not_read"}
+    assert stored["seed_data"]["variants"][0]["price_amount"] == 16.0
+
+
+@pytest.mark.parametrize("canonical,expect_read", [(DEST.replace("://", "://www."), True), (DEST + "-other-shade", False)])
+def test_the_preview_reads_exactly_the_rows_the_refresh_reads(monkeypatch, canonical, expect_read):
+    """`--simulate` used to fetch `canonical_url` and skip the served-URL rule, so it reported
+    writes for eyurs and fenty that `--apply` then refused."""
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location(
+        "refresh_seeds_with_unverified_variants_2",
+        pathlib.Path(__file__).resolve().parents[1] / "scripts/ops/refresh_seeds_with_unverified_variants.py",
+    )
+    script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script)
+
+    row = _seed_row(variants=[_variant("1", 16.0, "out_of_stock")], price=16.0, availability="out_of_stock")
+    row.update(canonical_url=canonical)
+    fetched: List[str] = []
+
+    async def fetch_one(_q, values=None):
+        return row
+
+    async def fetch_html(url, **kwargs):
+        fetched.append(url)
+        kwargs["observed"].update(status_code=200, final_url=url)
+        return _html([_offer(17, IN, sku="RL")]), "text/html"
+
+    monkeypatch.setattr(script.database, "fetch_one", fetch_one)
+    monkeypatch.setattr("services.external_offers_service._fetch_html", fetch_html)
+    preview = asyncio.run(script._simulate(row["id"]))
+    _, refreshed = _refresh(monkeypatch, row, _page([_offer(17, IN, sku="RL")]))
+
+    assert fetched == [DEST], "the preview fetches the url the refresh fetches"
+    assert (preview.get("status") != "not_read") is expect_read
+    assert (refreshed["seed_data"]["variants"][0]["price_amount"] == 17.0) is expect_read
