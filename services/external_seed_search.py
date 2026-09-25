@@ -346,6 +346,35 @@ def _is_external_seed_query_timeout(exc: Exception) -> bool:
 _SEED_QUARANTINE_DOMAIN_EXPR = "external_product_seeds.domain"
 
 
+# THE COLUMNS A SERVED SEED ROW CARRIES — one list, for every serving SELECT.
+#
+# Every row selected here goes through `should_block_external_referral_runtime`, and that gate
+# reads the row, not the table. A column left out of this list is not "unused": the gate sees
+# it as absent and answers as if it were NULL. That is how the destination-liveness columns
+# (migration 200) went missing for the life of the sweep that fills them: every served seed read
+# as `destination_never_verified`, so no seed's catalog facts were ever accepted, and a
+# confirmed-dead link could never trip `destination_dead` at serve time.
+#
+# This list used to be written out twice (here and in routes/agent_api's PDP-by-id loader), and
+# the two copies had already drifted — the PDP copy had no `seller_ref` / `seed_kind`, so that
+# lane dropped the seller-of-record the builder threads into the click. Keep ONE list;
+# tests/test_external_seed_serving_select_carries_gate_columns.py records what the gate
+# actually reads and fails if a serving SELECT does not load it.
+EXTERNAL_SEED_SERVING_COLUMNS = (
+    "id", "external_product_id", "market", "tool", "utm_template", "partner_type", "disclosure_text",
+    "destination_url", "canonical_url", "domain", "title", "image_url",
+    "price_amount", "price_currency", "availability",
+    "seed_data",
+    "status", "notes", "created_by_employee_id",
+    "attached_product_key", "attached_variant_id",
+    "seller_ref", "seed_kind",
+    # Destination liveness (migration 200) — read by the referral gate.
+    "destination_checked_at", "destination_http_status", "destination_verdict", "destination_failure_streak",
+    "created_at", "updated_at",
+)
+EXTERNAL_SEED_SERVING_SELECT_LIST = ", ".join(EXTERNAL_SEED_SERVING_COLUMNS)
+
+
 def build_seed_quarantine_anti_join() -> str:
     """The shared quarantine anti-join, scoped to what a seed row can supply.
 
@@ -462,14 +491,7 @@ async def fetch_external_seed_rows(
 
     query_sql = f"""
                 SELECT
-                  id, external_product_id, market, tool, utm_template, partner_type, disclosure_text,
-                  destination_url, canonical_url, domain, title, image_url,
-                  price_amount, price_currency, availability,
-                  seed_data,
-                  status, notes, created_by_employee_id,
-                  attached_product_key, attached_variant_id,
-                  seller_ref, seed_kind,
-                  created_at, updated_at,
+                  {EXTERNAL_SEED_SERVING_SELECT_LIST},
                   {rank_expr} AS brand_term_hit
                 FROM external_product_seeds
                 WHERE {" AND ".join(where)}

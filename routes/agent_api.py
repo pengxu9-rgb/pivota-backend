@@ -64,6 +64,7 @@ from services.outbound_links_service import (
     TOKEN_MARKET_OBSERVED_KEY,
 )
 from services.external_seed_search import (
+    EXTERNAL_SEED_SERVING_SELECT_LIST as _EXTERNAL_SEED_SERVING_SELECT_LIST,
     build_seed_quarantine_anti_join as _seed_quarantine_clause,
     dedupe_external_seed_rows,
     fetch_external_seed_rows,
@@ -4509,14 +4510,7 @@ async def _load_external_seed_product_by_product_id(*, req: Request, product_id:
     try:
         row = await database.fetch_one(
             f"""
-            SELECT
-              id, external_product_id, market, tool, utm_template, partner_type, disclosure_text,
-              destination_url, canonical_url, domain, title, image_url,
-              price_amount, price_currency, availability,
-              seed_data,
-              status, notes, created_by_employee_id,
-              attached_product_key, attached_variant_id,
-              created_at, updated_at
+            SELECT {_EXTERNAL_SEED_SERVING_SELECT_LIST}
             FROM external_product_seeds
             WHERE status = 'active'
               AND attached_product_key IS NULL
@@ -4549,14 +4543,7 @@ async def _load_external_seed_product_by_product_id(*, req: Request, product_id:
             try:
                 row = await database.fetch_one(
                     f"""
-                    SELECT
-                      id, external_product_id, market, tool, utm_template, partner_type, disclosure_text,
-                      destination_url, canonical_url, domain, title, image_url,
-                      price_amount, price_currency, availability,
-                      seed_data,
-                      status, notes, created_by_employee_id,
-                      attached_product_key, attached_variant_id,
-                      created_at, updated_at
+                    SELECT {_EXTERNAL_SEED_SERVING_SELECT_LIST}
                     FROM external_product_seeds
                     WHERE status = 'active'
                       AND attached_product_key IS NULL

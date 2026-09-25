@@ -289,7 +289,9 @@ class _SqliteBackedDatabase:
             " domain TEXT, title TEXT, image_url TEXT, price_amount REAL, price_currency TEXT,"
             " availability TEXT, seed_data TEXT, status TEXT, notes TEXT,"
             " created_by_employee_id TEXT, attached_product_key TEXT, attached_variant_id TEXT,"
-            " seller_ref TEXT, seed_kind TEXT, created_at TEXT, updated_at TEXT)"
+            " seller_ref TEXT, seed_kind TEXT,"
+            " destination_checked_at TEXT, destination_http_status INTEGER, destination_verdict TEXT,"
+            " destination_failure_streak INTEGER DEFAULT 0, created_at TEXT, updated_at TEXT)"
         )
         self._conn.execute(
             "CREATE TABLE catalog_source_quarantine (quarantine_id INTEGER, match_type TEXT,"
