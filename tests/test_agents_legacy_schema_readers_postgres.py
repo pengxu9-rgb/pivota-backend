@@ -3,6 +3,8 @@ against real Postgres, on the agents table the app's own model builds (db.agents
 create_all gives prod) plus the email column prod carries out-of-band (probe 2026-09-24).
 
 Pinned:
+- POST /admin/fix/agents-data and GET /admin/fix/agents-status are retired: 501, agents untouched
+  (the POST filled empty names/emails with company/use_case and `<company>@example.com`);
 - POST /admin/fix/agents-table is retired: 501, and agents keeps its rows and its model columns
   (it ran DROP TABLE agents CASCADE and re-created the legacy shape for an admin caller);
 - POST /employee/agents/create and POST /admin/init/agent-test-key are retired: 501 for any body,
@@ -172,6 +174,7 @@ async def client(db, user):
 
     from routes.admin_fix_agent_metrics import router as admin_fix_router
     from routes.admin_fix_agent_metrics_v2 import router as admin_fix_v2_router
+    from routes.admin_fix_agents import router as admin_fix_agents_router
     from routes.agent_metrics import router as agent_metrics_router
     from routes.employee_agent_mgmt import router as employee_agent_router
     from routes.fix_agents_table import router as fix_agents_table_router
@@ -186,6 +189,7 @@ async def client(db, user):
         admin_fix_router,
         admin_fix_v2_router,
         fix_agents_table_router,
+        admin_fix_agents_router,
     ):
         app.include_router(router)
     # require_admin is NOT overridden: it runs its real role check on the overridden user.
@@ -293,6 +297,20 @@ async def test_fix_agents_table_is_retired_and_keeps_the_table(client, db):
     assert await _agents_table_snapshot(db) == before
 
 
+@pytest.mark.parametrize("method,path", [("POST", "/admin/fix/agents-data"), ("GET", "/admin/fix/agents-status")])
+async def test_admin_fix_agents_routes_are_retired_and_write_nothing(client, db, method, path):
+    # Agents with no email -- NULL or '' -- are exactly what the old POST "fixed" with a made-up
+    # address; it matched both.
+    await db.execute("UPDATE agents SET email = NULL WHERE agent_id = :a", {"a": BRAVO})
+    await db.execute("UPDATE agents SET email = '' WHERE agent_id = :a", {"a": CHARLIE})
+    before = await _agents_table_snapshot(db)
+
+    resp = await client.request(method, path)
+
+    assert resp.status_code == 501, resp.text
+    assert await _agents_table_snapshot(db) == before
+
+
 @pytest.mark.parametrize("path", ["/admin/fix/agent-metrics", "/admin/fix/agent-metrics-v2"])
 async def test_admin_fix_metrics_posts_are_retired_and_write_nothing(client, db, path):
     before = await _counters(db)
@@ -357,14 +375,16 @@ async def test_admin_fix_agent_orders_check_reads_the_real_columns(client, db):
         ("GET", f"/admin/fix/agent-orders-check?agent_id={ALPHA}"),
         ("POST", "/admin/fix/agent-metrics"),
         ("POST", "/admin/fix/agent-metrics-v2"),
+        ("POST", "/admin/fix/agents-data"),
+        ("GET", "/admin/fix/agents-status"),
     ],
 )
 async def test_admin_routes_refuse_a_non_admin_before_anything_else(client, db, user, role, method, path):
     user["role"] = role
-    before = await _counters(db)
+    before = await _agents_table_snapshot(db)
 
     resp = await client.request(method, path)
 
     assert resp.status_code == 403, resp.text
-    assert await _counters(db) == before
+    assert await _agents_table_snapshot(db) == before
     assert await _view_exists(db) is False
