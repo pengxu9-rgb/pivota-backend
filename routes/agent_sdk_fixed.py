@@ -38,6 +38,11 @@ from services.outbound_links_service import (
     market_is_observed,
     TOKEN_MARKET_OBSERVED_KEY,
 )
+from services.external_seed_stock import (
+    seed_stock_fields,
+    seed_stock_state,
+    seed_variant_in_stock,
+)
 from services.external_seed_search import (
     dedupe_external_seed_rows,
     fetch_external_seed_rows,
@@ -218,17 +223,6 @@ def _seed_image_urls(seed_data: Dict[str, Any]) -> List[str]:
     return urls
 
 
-def _availability_to_in_stock(availability: Any) -> bool:
-    if availability is None:
-        return True
-    if isinstance(availability, bool):
-        return availability
-    raw = str(availability).strip().lower()
-    if not raw:
-        return True
-    return raw not in {"out_of_stock", "outofstock", "sold_out", "soldout", "unavailable"}
-
-
 def _request_base_url(req: Request) -> str:
     return str(req.base_url).rstrip("/")
 
@@ -367,6 +361,11 @@ async def _build_external_seed_product(
         price = 0.0
 
     seed_variants = _seed_variants(seed_data)
+    # One rule for both routed builders: services/external_seed_stock. Not computed
+    # on the live-verification path, which withholds stock and serves no variants.
+    stock_state = (
+        None if requires_live_verification else seed_stock_state(seed_row, seed_data)
+    )
     variants: List[Dict[str, Any]] = []
     seen_variant_ids: set[str] = set()
     for idx, v in enumerate(seed_variants):
@@ -387,7 +386,7 @@ async def _build_external_seed_product(
             variant_price = price
 
         availability = v.get("availability")
-        in_stock = _availability_to_in_stock(availability)
+        in_stock = seed_variant_in_stock(availability, stock_state)
         image_url = v.get("image_url") or v.get("image")
         if isinstance(image_url, str):
             image_url = image_url.strip() or None
@@ -419,6 +418,7 @@ async def _build_external_seed_product(
         if len(variants) >= 30:
             break
 
+    stock_fields = seed_stock_fields(stock_state)
     if requires_live_verification:
         variants = []
     elif not variants:
@@ -429,8 +429,7 @@ async def _build_external_seed_product(
                 "title": "Default",
                 "price": price,
                 "currency": price_currency,
-                "inventory_quantity": 999,
-                "in_stock": True,
+                **stock_fields,
             }
         ]
 
@@ -448,7 +447,7 @@ async def _build_external_seed_product(
         "image_url": image_url,
         "image_urls": image_urls,
         **(
-            {"in_stock": True, "inventory_quantity": 999}
+            stock_fields
             if not requires_live_verification
             else {
                 "availability": "unknown",
