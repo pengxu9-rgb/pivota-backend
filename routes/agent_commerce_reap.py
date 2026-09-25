@@ -1579,14 +1579,46 @@ def _aware(value: Any) -> Optional[datetime]:
     return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
 
 
+def _iso_utc(value: datetime) -> str:
+    """ISO-8601 with an explicit `+00:00` offset — the SAME spelling FastAPI's encoder gives the
+    sibling timestamps in this body, so a door that parses one parses all of them."""
+    return value.astimezone(timezone.utc).isoformat()
+
+
+def approval_deadline(quote_expires_at: Any, hosted_url_expires_at: Any) -> Optional[datetime]:
+    """The instant after which the buyer's approval can no longer succeed: the EARLIER of the two
+    expiries the row holds, ignoring an absent one. None only when both are absent.
+
+    MEASURED 2026-09-25 IN THE REAP SANDBOX, twice (with and without `X-Simulate-Checkout`,
+    neither approved): `POST /agentic/checkouts` answers REQUIRES_ACTION with
+    `nextAction.expiresAt` = created + 15 min, but the checkout flips to FAILED — not EXPIRED —
+    1–10 s after the QUOTE's `expiresAt` (created + 5 min), and never passes PROCESSING. The
+    hosted page's expiry is therefore ten minutes of a link that no longer works, and a deadline
+    read from `hosted_url_expires_at` alone tells the buyer they have time they do not have.
+
+    MIN, NOT "THE QUOTE": the quote can be absent (the spec does not require `expiresAt`), and a
+    partner that one day kills the page before the quote is still a partner we read correctly.
+    Both inputs go through `_aware`, which is the route's one parser for the three shapes a
+    timestamp arrives in (aware datetime, naive datetime, SQLite text) — a comparison between an
+    aware and a naive datetime raises, and a string skipped as "not a datetime" would be a
+    deadline silently ignored.
+    """
+    candidates = [
+        value
+        for value in (_aware(quote_expires_at), _aware(hosted_url_expires_at))
+        if value is not None
+    ]
+    return min(candidates) if candidates else None
+
+
 def _public_body(view: Mapping[str, Any]) -> Dict[str, Any]:
     """The owner-facing shape, built FROM the ledger's allowlist and never from the row.
 
     `view` is already `ledger.public_purchase_view` output, so the only keys that can appear are
-    `PUBLIC_PURCHASE_COLUMNS`. This function only ever REMOVES keys and adds ones it computes; it
-    never reads a column. That is what makes "a buyer id cannot appear in this response" a
-    property of the code rather than a thing the tests hope for — there is no expression here
-    that could put one there.
+    `PUBLIC_PURCHASE_COLUMNS`. This function only ever REMOVES keys and adds ones it computes
+    from keys already in the view; it never reads a column of the row. That is what makes "a
+    buyer id cannot appear in this response" a property of the code rather than a thing the
+    tests hope for — there is no expression here that could put one there.
     """
     body = {key: value for key, value in view.items()}
     state = str(body.get("state") or "")
@@ -1605,14 +1637,28 @@ def _public_body(view: Mapping[str, Any]) -> Dict[str, Any]:
     # is nowhere to send the buyer, which is exactly what an absent key says.
     hosted_url = body.pop("hosted_url", None)
     hosted_expires = body.pop("hosted_url_expires_at", None)
-    expires_at = _aware(hosted_expires)
+    # THE LINK DIES AT THE APPROVAL DEADLINE, NOT AT THE PAGE'S OWN EXPIRY. On 'awaiting_approval'
+    # that is the earlier of the quote's expiry and the page's (see `approval_deadline`); on
+    # 'needs_enrollment' nothing has been quoted — the row re-quotes after the card is added, so
+    # the quote column, always NULL there by the legal edges, is not consulted. `_now()` is the
+    # same aware-UTC clock the idempotency window uses; `reap_quote_expires_at` itself stays in
+    # the body untouched, as the raw column it has always been.
+    if state == "awaiting_approval":
+        deadline = approval_deadline(body.get("reap_quote_expires_at"), hosted_expires)
+    else:
+        deadline = approval_deadline(None, hosted_expires)
     if (
         state in _HOSTED_STATES
         and rc.hosted_url_is_allowed(hosted_url)
-        and (expires_at is None or expires_at > _now())
+        and (deadline is None or deadline > _now())
     ):
         body["hosted_url"] = hosted_url
         body["hosted_url_expires_at"] = hosted_expires
+    # Surfaced whether or not it has passed: a deadline in the past beside a missing `hosted_url`
+    # is the honest reading of a row the poller has not yet flipped, and a door that only ever
+    # saw the key on live rows would learn to treat its absence as "still open".
+    if state == "awaiting_approval" and deadline is not None:
+        body["approval_deadline"] = _iso_utc(deadline)
 
     # Reap's order id is EVIDENCE on every other state and an ANSWER on `completed`. Renamed on
     # the way out because the caller is being told "your order exists and this is its reference",

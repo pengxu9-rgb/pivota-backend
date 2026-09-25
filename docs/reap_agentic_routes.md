@@ -332,9 +332,21 @@ one that does not exist, so this endpoint cannot be used to probe for ids.
   },
   "hosted_url": "https://pay.prava.space/checkout/chk_7f3a",
   "hosted_url_expires_at": "2026-09-18T08:15:49.964985+00:00",
+  "approval_deadline": "2026-09-18T07:20:49.964987+00:00",
   "poll_after_seconds": 30
 }
 ```
+
+**`approval_deadline` is the instant the buyer must approve by** — the EARLIER of
+`reap_quote_expires_at` and `hosted_url_expires_at` (whichever is present; absent only when both
+are null). It is NOT the page's own expiry. Measured 2026-09-25 in the Reap sandbox (two
+checkouts, neither approved): the hosted page's `expiresAt` is created + 15 min, but the checkout
+flips to **FAILED — not EXPIRED — 1–10 s after the quote's `expiresAt`** (created + 5 min) and
+never passes PROCESSING. A door that read `hosted_url_expires_at` as the deadline showed the
+buyer ten minutes of a link that no longer works. `hosted_url` is dropped once the approval
+deadline has passed, not only once the page's expiry has; `approval_deadline` itself stays in the
+body, past or not, until the poller moves the row (to `failed` with
+`last_error_code: "approval_window_lapsed"`).
 
 `completed` — note that `hosted_url` and `hosted_url_expires_at` are **gone**, not null, and
 `order_reference` has appeared:
@@ -382,8 +394,12 @@ one that does not exist, so this endpoint cannot be used to probe for ids.
   null** before anything has been quoted, and so are the unfilled members of `totals`. Read with
   `.get()`, and do not treat a missing key as an error.
 * **`hosted_url` / `hosted_url_expires_at` appear only when** `state` is `needs_enrollment` or
-  `awaiting_approval`, the URL still passes the host allowlist, and it has not expired. Never
-  cache one past `hosted_url_expires_at`.
+  `awaiting_approval`, the URL still passes the host allowlist, and the approval deadline has not
+  passed. Never cache one past `approval_deadline` (on `awaiting_approval`) or
+  `hosted_url_expires_at` (on `needs_enrollment`, where nothing is quoted yet).
+* **`approval_deadline` appears only on `awaiting_approval`**, and only when at least one of the
+  two expiries is known. Use it, not `hosted_url_expires_at`, as the buyer's deadline; fall back
+  to `hosted_url_expires_at` only when it is absent.
 * **`order_reference` appears only on `completed`.**
 * **`poll_after_seconds`** is the rail's interval for the current state, and `null` on a terminal
   state (`completed`, `failed`, `refused`, `expired`).

@@ -860,6 +860,45 @@ async def test_an_unknown_checkout_status_never_advances(reap, attribution):
     assert attribution.calls == []
 
 
+async def test_a_failed_read_on_a_lapsed_quote_names_the_lapsed_window(reap, attribution):
+    """`reap_quote_expires_at` is a `timestamptz` here, read back aware and compared against the
+    service's aware `_now()`. Measured 2026-09-25: an unapproved checkout is FAILED — not
+    EXPIRED — seconds after the quote's expiry, so the code says the window lapsed."""
+    from datetime import datetime, timedelta, timezone
+
+    purchase_id = await _start()
+    for _ in range(3):
+        result = await _step(purchase_id)
+    assert result.state == "awaiting_approval", result
+    await _raw(
+        "UPDATE reap_agentic_purchases SET reap_quote_expires_at = :t WHERE id = :i",
+        {"t": datetime.now(timezone.utc) - timedelta(seconds=5), "i": purchase_id},
+    )
+    reap.get_checkout = _ok(dict(CHECKOUT_COMPLETED, status="FAILED"))
+    result = await _step(purchase_id)
+    assert result.state == "failed"
+    row = await _get(purchase_id)
+    assert row["last_error_code"] == "approval_window_lapsed"
+    assert row["buyer_email"] is None
+    assert attribution.calls == []
+
+
+async def test_a_failed_read_on_a_live_quote_is_still_a_checkout_failure(reap, attribution):
+    """CONTROL on this dialect: a quote four minutes from expiry is not a lapsed window."""
+    from datetime import datetime, timedelta, timezone
+
+    purchase_id = await _start()
+    for _ in range(3):
+        await _step(purchase_id)
+    await _raw(
+        "UPDATE reap_agentic_purchases SET reap_quote_expires_at = :t WHERE id = :i",
+        {"t": datetime.now(timezone.utc) + timedelta(minutes=4), "i": purchase_id},
+    )
+    reap.get_checkout = _ok(dict(CHECKOUT_COMPLETED, status="FAILED"))
+    assert (await _step(purchase_id)).state == "failed"
+    assert (await _get(purchase_id))["last_error_code"] == "checkout_failed"
+
+
 async def test_every_start_refusal_leaves_the_table_empty(reap):
     """The same ordering contract as the SQLite arm, re-run here because an INSERT that fails at
     BIND time on asyncpg is a DIFFERENT failure from one refused in Python, and only one of them

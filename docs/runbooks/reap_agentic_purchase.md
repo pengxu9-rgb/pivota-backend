@@ -34,6 +34,29 @@ claim — in the same UPDATE, so a crash cannot skip the PII half.
 A quote expires in ~5 minutes; a poll cycle is not guaranteed to be shorter, and there is no
 legal state for the row to sit in between the two (`quoting` → `quoting` is not an edge).
 
+### The lifecycle of an unapproved checkout — the quote TTL is the approval window
+
+**Measured 2026-09-25 in the Reap sandbox**, on two checkouts (one with and one without the
+`X-Simulate-Checkout` header, neither approved): `POST /agentic/checkouts` answers
+`REQUIRES_ACTION` with `nextAction.expiresAt` = created + **15 min**, but the checkout flips to
+**`FAILED` — not `EXPIRED` — 1–10 s after the QUOTE's `expiresAt`** (created + **5 min**), and
+never passes `PROCESSING`. The hosted page's expiry is therefore not the buyer's deadline; the
+quote's is. Consequences in this package:
+
+* the owner view carries **`approval_deadline`** on `awaiting_approval` = the earlier of
+  `reap_quote_expires_at` and `hosted_url_expires_at`, and drops `hosted_url` once *that* has
+  passed (`routes/agent_commerce_reap.approval_deadline`);
+* a partner `FAILED` read on an `awaiting_approval` row whose `reap_quote_expires_at` is already
+  in the past at read time is written as `failed` with **`last_error_code = approval_window_lapsed`**
+  rather than `checkout_failed` (`_checkout_failed_code`). The target state is unchanged; a
+  `FAILED` on `processing` — after approval — is still `checkout_failed` whatever the quote says;
+* a partner `EXPIRED` still takes the `expired` edge with `checkout_expired`. In the sandbox it
+  was never observed for an unapproved checkout, but the mapping is kept for a partner that one
+  day sends it.
+
+A spike in `approval_window_lapsed` is buyers not reaching the approval page inside five minutes
+— a door showing the link late, or not at all — not a partner outage.
+
 ### What the quote is checked against
 
 The unit price is not the charge, so the quote is verified in **integer minor units** before
@@ -378,7 +401,9 @@ Obligations, in order of how expensive they are to get wrong:
 
 Visible: state, our product identity, quantity, currency, `our_price_minor`, the quote/final
 totals, `hosted_url` + `hosted_url_expires_at` (the link to show the buyer),
-`reap_quote_expires_at`, `reap_order_id`, `refusal_reason`, `last_error_code`, timestamps.
+`reap_quote_expires_at`, `approval_deadline` (computed, `awaiting_approval` only: the earlier of
+the quote's and the page's expiry — see the lifecycle note above), `reap_order_id`,
+`refusal_reason`, `last_error_code`, timestamps.
 
 **Not visible, and each absence is deliberate:** `buyer_email`, `shipping_address` (PII);
 `buyer_ref`, `agent_id`, `agent_user_ref_hash` (identity we minted); `reap_product_id`,
@@ -402,7 +427,9 @@ link. Nothing from Reap's product-media fields is ever stored or forwarded.
 `last_error_code` (on `failed`, or alongside a refusal): the four quote-check codes in the table
 above, plus `ENROLLMENT_NOT_ACTIVE`, `enrollment_dead`, `enrollment_no_hosted_action`,
 `enrollment_row_unreadable`, `partner_id_malformed`, `checkout_no_hosted_action`,
-`checkout_failed`, `checkout_expired`, `checkout_id_missing`, `quote_id_missing`, `quote_expired`,
+`checkout_failed`, `approval_window_lapsed` (a partner `FAILED` on `awaiting_approval` after the
+quote's expiry — the buyer did not approve in time), `checkout_expired`, `checkout_id_missing`,
+`quote_id_missing`, `quote_expired`,
 `no_active_enrollment`, `completed_without_order_id`, `final_amount_missing`, and
 `reap_status_<n>` / `AGENTIC_*` codes passed through from the partner.
 
