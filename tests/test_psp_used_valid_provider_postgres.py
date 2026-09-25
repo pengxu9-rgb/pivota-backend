@@ -464,7 +464,7 @@ async def test_the_schema_guard_twin_really_installs_it() -> None:
     # On a CLEAN table the guard must end up VALIDATED. It adds NOT VALID first —
     # load-bearing, because on a database where 006 never ran this is an ADD and a
     # validating ADD would scan a whole unconstrained table and abort the boot —
-    # and then re-earns the flag with a bounded, swallowed VALIDATE. Production
+    # and then re-earns the flag with a swallowed VALIDATE. Production
     # had this constraint convalidated=TRUE before the widen (measured
     # 2026-09-02); ending NOT VALID would be a silent downgrade.
     #
@@ -698,3 +698,144 @@ async def test_every_provider_the_endpoint_accepts_the_constraint_accepts() -> N
             )
         )
         assert stored["psp_used"] == provider
+
+
+def _schema_guard_heal(constraint_name: str) -> str:
+    """The REAL DO block db/schema_guard.py runs for this constraint, never retyped.
+
+    ensure_required_schema_light() cannot be used to test these two blocks' locking.
+    Earlier heals in the same function (the unguarded merchant_psps and orders ADD
+    COLUMN IF NOT EXISTS statements) wait for the same ACCESS EXCLUSIVE lock first.
+    So the block is lifted out of the source and run on its own.
+    """
+    tree = ast.parse((REPO_ROOT / "db" / "schema_guard.py").read_text(encoding="utf-8"))
+    found = [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and "DO $$" in node.value
+        and constraint_name in node.value
+        and "ADD CONSTRAINT" in node.value
+    ]
+    assert len(found) == 1, f"expected one schema_guard heal for {constraint_name}, found {len(found)}"
+    return found[0]
+
+
+async def _narrow_orders_back_to_006() -> None:
+    from db.database import database
+
+    await database.execute(
+        f"ALTER TABLE orders DROP CONSTRAINT IF EXISTS {ORDERS_PROVIDER_CONSTRAINT}"
+    )
+    await database.execute(
+        _constraint_statement(_migration("006_psp_fields_constraints.sql"), ORDERS_PROVIDER_CONSTRAINT)
+    )
+
+
+@pytest.mark.parametrize(
+    "table, constraint_name",
+    [
+        ("merchant_psps", "check_merchant_psps_psp_id_format"),
+        ("orders", ORDERS_PROVIDER_CONSTRAINT),
+    ],
+)
+async def test_the_heal_gives_up_instead_of_queueing_behind_a_long_transaction(
+    table: str, constraint_name: str
+) -> None:
+    """A boot ALTER queued behind a long transaction blocks every reader behind IT.
+
+    ACCESS EXCLUSIVE conflicts with everything, and a waiting request blocks every
+    later request on the table. Without lock_timeout, one long-running report
+    would stall checkout for as long as it ran. The heal must fail fast (and be
+    retried next boot) instead.
+    """
+    import asyncio
+
+    import asyncpg
+
+    from db.database import database
+
+    # Put the table in the state where the heal has work to do.
+    if table == "merchant_psps":
+        await database.execute(
+            "ALTER TABLE merchant_psps DROP CONSTRAINT IF EXISTS check_merchant_psps_psp_id_format"
+        )
+    else:
+        await _narrow_orders_back_to_006()
+
+    heal = _schema_guard_heal(constraint_name)
+    url = DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
+    holder = await asyncpg.connect(url)
+    runner = await asyncpg.connect(url)
+    try:
+        long_txn = holder.transaction()
+        await long_txn.start()
+        await holder.execute(f"LOCK TABLE {table} IN ACCESS SHARE MODE")
+        try:
+            with pytest.raises(asyncpg.exceptions.LockNotAvailableError):
+                await asyncio.wait_for(runner.execute(heal), timeout=10)
+        except asyncio.TimeoutError:
+            pytest.fail(
+                f"the {constraint_name} heal waited >10s for its lock on {table} — "
+                "with no lock_timeout it blocks every reader queued behind it"
+            )
+        finally:
+            await long_txn.rollback()
+    finally:
+        await holder.close()
+        await runner.close()
+
+    # And once the long transaction is gone, the same block does its job.
+    await database.execute(heal)
+    row = await database.fetch_one(
+        "SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint"
+        " WHERE conname = :n AND conrelid = to_regclass(:t)",
+        {"n": constraint_name, "t": table},
+    )
+    assert row is not None, f"the heal did not install {constraint_name} once the lock was free"
+    if table == "orders":
+        assert "'antom'" in dict(row)["def"], dict(row)["def"]
+
+
+async def test_a_failing_241_heal_does_not_skip_the_242_heal(monkeypatch) -> None:
+    """Two instances booting together both see no 241 constraint; the loser's ADD fails.
+
+    That failure has to stay inside the 241 block. ensure_required_schema_light is
+    one large try, so an exception that escapes one heal skips every heal after it
+    for that boot, including the orders widen below. The concurrent boot is
+    simulated by making the 241 ADD raise the error the loser really gets.
+    """
+    import asyncpg
+
+    from db import schema_guard as sg
+    from db.database import database
+
+    await database.execute(
+        "ALTER TABLE merchant_psps DROP CONSTRAINT IF EXISTS check_merchant_psps_psp_id_format"
+    )
+    await _narrow_orders_back_to_006()
+
+    real_execute = database.execute
+
+    async def _lose_the_race(query, *args, **kwargs):
+        sql = str(query)
+        if "check_merchant_psps_psp_id_format" in sql and "ADD CONSTRAINT" in sql:
+            raise asyncpg.exceptions.DuplicateObjectError(
+                'constraint "check_merchant_psps_psp_id_format" for relation "merchant_psps" already exists'
+            )
+        return await real_execute(query, *args, **kwargs)
+
+    monkeypatch.setattr(database, "execute", _lose_the_race)
+    await sg.ensure_required_schema_light()
+    monkeypatch.undo()
+
+    row = await database.fetch_one(
+        "SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint"
+        " WHERE conname = :n AND conrelid = to_regclass('orders')",
+        {"n": ORDERS_PROVIDER_CONSTRAINT},
+    )
+    assert row is not None and "'antom'" in dict(row)["def"], (
+        "a failed merchant_psps heal skipped the orders widen — every antom order "
+        "would 500 until some later boot happened to win"
+    )

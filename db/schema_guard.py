@@ -1534,9 +1534,18 @@ async def ensure_required_schema_light() -> None:
             # scripts/audit_malformed_psp_ids.py). The IF NOT EXISTS guard keeps
             # this a no-op after the first boot -- a DROP+ADD every startup would
             # take an ACCESS EXCLUSIVE lock on a table every checkout reads.
-            await database.execute(
-                text(
-                    """
+            #
+            # Its OWN try, and a 500ms lock_timeout, like the mig-237 heals. The
+            # ADD still takes ACCESS EXCLUSIVE on its one run; queued bare behind
+            # a long transaction it would block every reader of merchant_psps
+            # while it waited. And two instances booting together can both pass
+            # the pg_constraint check, so the loser's ADD raises DuplicateObject.
+            # Either failure is retried next boot and must not skip the heals
+            # after this one.
+            try:
+                await database.execute(
+                    text(
+                        """
                     DO $$
                     BEGIN
                       IF to_regclass('merchant_psps') IS NULL THEN
@@ -1548,6 +1557,7 @@ async def ensure_required_schema_light() -> None:
                          WHERE conname = 'check_merchant_psps_psp_id_format'
                            AND conrelid = to_regclass('merchant_psps')
                       ) THEN
+                        PERFORM set_config('lock_timeout', '500ms', true);
                         ALTER TABLE merchant_psps
                           ADD CONSTRAINT check_merchant_psps_psp_id_format
                           CHECK (psp_id ~* '^psp_[a-z0-9]+_[a-z0-9]{12}$')
@@ -1555,8 +1565,10 @@ async def ensure_required_schema_light() -> None:
                       END IF;
                     END $$;
                     """
+                    )
                 )
-            )
+            except Exception:  # noqa: BLE001
+                pass
             # Multi-use partner invite links (migration 171). Production fast
             # mode skips db/migrations/, so ensure the columns the invite-token
             # service reads/writes (use_count, max_uses) exist at startup —
@@ -1627,9 +1639,16 @@ async def ensure_required_schema_light() -> None:
             # EXCLUSIVE lock on it once per instance start. Matching on the two
             # NEW tokens (rather than the exact text) also re-widens if something
             # re-narrows the constraint.
-            await database.execute(
-                text(
-                    """
+            #
+            # Its OWN try, and a 500ms lock_timeout, for the same two reasons as
+            # the mig-241 block above: an unbounded wait for ACCESS EXCLUSIVE on
+            # `orders` blocks every checkout behind it, and a concurrent boot can
+            # make this DROP/ADD fail. Either way it is retried next boot and the
+            # heals after it still run.
+            try:
+                await database.execute(
+                    text(
+                        """
                     DO $$
                     BEGIN
                       IF to_regclass('orders') IS NULL THEN
@@ -1645,6 +1664,7 @@ async def ensure_required_schema_light() -> None:
                       ) THEN
                         RETURN;
                       END IF;
+                      PERFORM set_config('lock_timeout', '500ms', true);
                       ALTER TABLE orders
                         DROP CONSTRAINT IF EXISTS check_psp_used_valid_provider;
                       ALTER TABLE orders
@@ -1667,14 +1687,20 @@ async def ensure_required_schema_light() -> None:
                       -- bare DROP + ADD NOT VALID would DOWNGRADE a proven
                       -- invariant to a merely-enforced one. The new list is a
                       -- strict SUPERSET of the old, so nothing that passed the old
-                      -- one can fail this. Bounded and swallowed: a table too
-                      -- large to scan in time, or one with genuinely bad rows
-                      -- because 006 never ran, keeps it NOT VALID -- still
+                      -- one can fail this. Swallowed: a table with genuinely bad
+                      -- rows because 006 never ran keeps it NOT VALID -- still
                       -- enforcing every new INSERT/UPDATE -- and the boot
-                      -- continues. VALIDATE takes only SHARE UPDATE EXCLUSIVE and
-                      -- blocks neither reads nor writes.
+                      -- continues.
+                      --
+                      -- NOT bounded, and NOT a light lock. This VALIDATE runs in
+                      -- the same statement as the DROP/ADD, so it scans `orders`
+                      -- under the ACCESS EXCLUSIVE lock they already hold. A
+                      -- statement_timeout set in here cannot help, because
+                      -- Postgres arms that timer when the statement starts. That
+                      -- is fine at ~593 rows, and it only runs on the one boot
+                      -- that widens the constraint. On a large `orders`, move the
+                      -- VALIDATE into its own statement instead.
                       BEGIN
-                        SET LOCAL statement_timeout = '15s';
                         ALTER TABLE orders
                           VALIDATE CONSTRAINT check_psp_used_valid_provider;
                       EXCEPTION WHEN OTHERS THEN
@@ -1682,8 +1708,10 @@ async def ensure_required_schema_light() -> None:
                       END;
                     END $$;
                     """
+                    )
                 )
-            )
+            except Exception:  # noqa: BLE001
+                pass
             # Merchant portal primary-store selection (migration 089).
             # Production fast mode skips db/migrations/, so keep the
             # critical column and invariant available at startup.

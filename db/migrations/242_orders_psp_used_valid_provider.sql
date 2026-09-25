@@ -144,14 +144,17 @@ BEGIN
     -- strict SUPERSET of the old, so on any database whose old constraint was
     -- validated, no existing row can fail the new one.
     --
-    -- VALIDATE takes only SHARE UPDATE EXCLUSIVE: it does not block reads or
-    -- writes. Bounded by a local timeout and swallowed, so the two cases this
-    -- file was originally written for still behave exactly as before -- a table
-    -- too large to scan in time, or one holding genuinely bad rows because 006
-    -- never ran, simply keeps the constraint NOT VALID, which still enforces
-    -- every new INSERT and UPDATE. The boot is never blocked and never aborted.
+    -- Swallowed, so a table holding genuinely bad rows because 006 never ran
+    -- simply keeps the constraint NOT VALID, which still enforces every new
+    -- INSERT and UPDATE.
+    --
+    -- NOT bounded, and NOT a light lock. This VALIDATE runs inside the same
+    -- statement as the DROP/ADD above, so it scans `orders` under the ACCESS
+    -- EXCLUSIVE lock they already hold. A statement_timeout set in here cannot
+    -- help, because Postgres arms that timer when the statement starts. That is
+    -- harmless at ~593 rows. On a large `orders`, run the DROP/ADD and then a
+    -- standalone VALIDATE (see above), which takes only SHARE UPDATE EXCLUSIVE.
     BEGIN
-        SET LOCAL statement_timeout = '15s';
         ALTER TABLE orders VALIDATE CONSTRAINT check_psp_used_valid_provider;
     EXCEPTION WHEN OTHERS THEN
         RAISE NOTICE 'check_psp_used_valid_provider left NOT VALID: %', SQLERRM;
