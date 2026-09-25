@@ -451,6 +451,35 @@ async def test_an_unfinished_run_is_found(db):
 
 
 
+async def test_an_apply_run_carries_its_write_marker_until_the_write_starts(db):
+    job_id = await _enqueue(db, brand="MARKER", options={"vendors": ["X"]})
+    run_id = await ledger.start_run(job_id=job_id, stage="apply", image_sha=None, execution=None, db=db)
+    assert (await ledger.unfinished_run(job_id, db=db))["catalog_write"] == "not_started"
+    await ledger.mark_write_started(run_id, db=db)
+    assert (await ledger.unfinished_run(job_id, db=db))["catalog_write"] == "started"
+    # committed on its own, not held in a transaction the write could roll back
+    import asyncpg
+    other = await asyncpg.connect(URL)
+    try:
+        row = await other.fetchrow("SELECT checks FROM retailer_ingest_runs WHERE id = $1", run_id)
+    finally:
+        await other.close()
+    import json as _json
+    checks = row["checks"] if isinstance(row["checks"], dict) else _json.loads(row["checks"])
+    assert checks["catalog_write"] == "started" and checks["write_started_at"]
+    await ledger.finish_run(run_id, outcome="interrupted", db=db)
+    with pytest.raises(RuntimeError):  # a finished run cannot be marked: the write never starts unmarked
+        await ledger.mark_write_started(run_id, db=db)
+    # a dry run has no marker; a run with none (older image) reads as None, never as not_started
+    dry = await _enqueue(db, brand="MARKER-DRY", options={"vendors": ["X"]})
+    await ledger.start_run(job_id=dry, stage="dry_run", image_sha=None, execution=None, db=db)
+    assert (await ledger.unfinished_run(dry, db=db))["catalog_write"] is None
+    old = await _enqueue(db, brand="MARKER-OLD", options={"vendors": ["X"]})
+    await db.execute("INSERT INTO retailer_ingest_runs (id, job_id, stage) VALUES (:id, :job, 'apply')",
+                     {"id": f"rir_old_{old}", "job": old})
+    assert (await ledger.unfinished_run(old, db=db))["catalog_write"] is None
+
+
 async def test_approve_validates_and_is_null_safe(db):
     job_id = await _enqueue(db, brand="NULLS", options={"vendors": ["X"], "exclude_handles": None})
     await ledger.transition(job_id, status="held", reason="flag", run_id=None, db=db)

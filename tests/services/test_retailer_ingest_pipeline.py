@@ -88,6 +88,18 @@ class Ledger:
         self.current_status = None  # set to simulate an operator changing the job mid-stage
         self.lock_server = LockServer()
         self.lock_waits = []
+        self.events = []  # ordering of the write marker vs the catalog write
+
+    from db.retailer_ingest import CATALOG_WRITE_NOT_STARTED, CATALOG_WRITE_STARTED
+
+    async def mark_write_started(self, run_id, db=None):
+        import asyncio
+        await asyncio.sleep(0)  # a marker that is not awaited to completion lands AFTER the write
+        if getattr(self, "mark_error", None):
+            raise self.mark_error
+        holder = self.lock_server.holder
+        self.events.append(("mark_write_started", run_id, holder is not None and not holder.closed))
+        self.runs[run_id]["catalog_write"] = self.CATALOG_WRITE_STARTED
 
     def catalog_write_lock(self, **kw):
         """The REAL lock, over a fake server: what the pipeline holds is what prod holds."""
@@ -143,6 +155,7 @@ def env(monkeypatch):
     async def fake_apply(plan, **kw):
         holder = ledger.lock_server.holder
         state.locked_during_apply.append(holder is not None and not holder.closed)
+        ledger.events.append(("apply_ingest_plan",))
         if state.apply_error:
             raise state.apply_error
         state.applied.append(plan)
@@ -318,6 +331,61 @@ async def test_an_interrupted_apply_fails_and_is_never_reapplied(env):
     assert env.applied == []
     assert env.ledger.runs == {"run_killed": {"outcome": "interrupted",
                                               "error": env.ledger.runs["run_killed"]["error"]}}
+
+
+async def test_an_apply_interrupted_after_its_write_marker_fails_as_may_be_partial(env):
+    env.ledger.unfinished = {"id": "run_killed", "stage": "apply", "catalog_write": "started"}
+    out = await pipeline.run_stage(job("apply_due"), db=env.db)
+    assert out["status"] == "failed" and out["outcome"] == "interrupted" and "may be partial" in out["reason"]
+    assert env.applied == [] and env.ledger.transitions[-1]["status"] == "failed"
+    assert not env.ledger.transitions[-1].get("count_attempt")
+
+
+async def test_an_apply_interrupted_before_its_write_began_is_retried_not_failed(env):
+    # Killed in its crawl, checks or lock wait: the run still says catalog_write = not_started.
+    env.ledger.unfinished = {"id": "run_killed", "stage": "apply", "catalog_write": "not_started"}
+    out = await pipeline.run_stage(job("apply_due"), db=env.db)
+    assert out == {"job_id": "rij_1", "stage": "apply", "outcome": "interrupted", "status": "apply_due"}
+    t = env.ledger.transitions[-1]
+    assert t["status"] == "apply_due" and t["expected_status"] == "apply_due" and t["count_attempt"]
+    assert t["next_run_at"] is not None and "may be partial" not in t["reason"]
+    assert env.ledger.runs["run_killed"]["outcome"] == "interrupted"
+    assert "nothing was written" in env.ledger.runs["run_killed"]["error"]
+    assert env.applied == []  # the retry is the next execution's stage, not this one
+
+
+async def test_an_apply_interrupted_before_its_write_still_respects_the_retry_budget(env):
+    env.ledger.unfinished = {"id": "run_killed", "stage": "apply", "catalog_write": "not_started"}
+    spent = job("apply_due")
+    spent["attempts"] = 5
+    out = await pipeline.run_stage(spent, db=env.db)
+    assert out["status"] == "failed" and env.ledger.transitions[-1]["reason"].startswith("retry budget spent")
+
+
+async def test_the_write_marker_is_durable_before_the_catalog_write_starts(env):
+    out = await pipeline.run_stage(job("apply_due"), db=env.db)
+    assert out["outcome"] == "applied"
+    run_id = list(env.ledger.runs)[-1]
+    # marked while holding the lock, and before (not alongside) the write
+    assert env.ledger.events == [("mark_write_started", run_id, True), ("apply_ingest_plan",)]
+    assert env.ledger.runs[run_id]["checks"]["catalog_write"] == "started"
+
+
+async def test_a_failed_write_marker_means_no_write(env):
+    env.ledger.mark_error = OSError("ledger unreachable")
+    with pytest.raises(OSError):
+        await pipeline.run_stage(job("apply_due"), db=env.db)
+    assert env.applied == [] and env.locked_during_apply == []
+    assert _released(env.ledger.lock_server)
+
+
+async def test_a_busy_write_lock_never_marks_the_write_started(env, monkeypatch):
+    monkeypatch.setattr(pipeline, "WRITE_LOCK_WAIT_S", 0.02)
+    monkeypatch.setattr(pipeline, "WRITE_LOCK_POLL_S", 0.01)
+    other_apply = await env.ledger.lock_server.connect()
+    assert await other_apply.fetchval(_TRY)
+    assert (await pipeline.run_stage(job("apply_due"), db=env.db))["outcome"] == "write_lock_busy"
+    assert env.ledger.events == []
 
 
 async def test_an_interrupted_dry_run_spends_an_attempt_and_backs_off(env):

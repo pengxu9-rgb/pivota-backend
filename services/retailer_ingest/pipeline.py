@@ -621,8 +621,15 @@ async def _run_stage(job: Dict[str, Any], *, db: Any) -> Dict[str, Any]:
     interrupted = await ledger.unfinished_run(job["id"], db=db)
     if interrupted:
         note = "execution ended before the stage finished (task timeout or OOM)"
+        # An apply whose run was never marked write-started died in its crawl, checks or lock wait:
+        # nothing was written. Only the explicit "not_started" marker proves that; a run without any
+        # marker (started by an older image) may have been writing.
+        write_may_have_started = (interrupted["stage"] == APPLY
+                                  and interrupted.get("catalog_write") != ledger.CATALOG_WRITE_NOT_STARTED)
+        if interrupted["stage"] == APPLY and not write_may_have_started:
+            note += "; the catalog write had not started, nothing was written"
         await ledger.finish_run(interrupted["id"], outcome="interrupted", error=note, db=db)
-        if interrupted["stage"] == APPLY:
+        if write_may_have_started:
             # It may have written part of the cohort. Never re-apply blindly.
             reason = f"the previous apply was interrupted and may be partial; review before re-queueing"
             await _move(job, status="failed", run_id=interrupted["id"], reason=reason, db=db)
@@ -632,10 +639,10 @@ async def _run_stage(job: Dict[str, Any], *, db: Any) -> Dict[str, Any]:
         if attempts >= int(job.get("max_attempts") or 6):
             await _move(job, status="failed", run_id=interrupted["id"], count_attempt=True,
                         reason=f"retry budget spent: {note}", db=db)
-            return {"job_id": job["id"], "stage": DRY_RUN, "outcome": "interrupted", "status": "failed"}
+            return {"job_id": job["id"], "stage": interrupted["stage"], "outcome": "interrupted", "status": "failed"}
         await _move(job, status=job["status"], run_id=interrupted["id"], count_attempt=True,
                     next_run_at=ledger.backoff_until(attempts - 1), reason=f"retry later: {note}", db=db)
-        return {"job_id": job["id"], "stage": DRY_RUN, "outcome": "interrupted", "status": job["status"]}
+        return {"job_id": job["id"], "stage": interrupted["stage"], "outcome": "interrupted", "status": job["status"]}
     run_id = await ledger.start_run(job_id=job["id"], stage=stage,
                                     image_sha=os.getenv("PIVOTA_COMMIT_SHA") or os.getenv("IMAGE_SHA"),
                                     execution=os.getenv("CLOUD_RUN_EXECUTION"), db=db)
@@ -694,6 +701,10 @@ async def _apply(job: Dict[str, Any], run_id: str, result: Dict[str, Any], summa
         # checks above ran unlocked. The lock is released when this block exits, however it exits.
         async with ledger.catalog_write_lock(wait_s=WRITE_LOCK_WAIT_S, poll_s=WRITE_LOCK_POLL_S) as waited:
             timings["write_lock_wait_s"] = round(waited, 3)
+            # Durable BEFORE the first catalog write: an execution killed from here on is "may be
+            # partial"; one killed before it (crawl, checks, lock wait) is retried, nothing written.
+            await ledger.mark_write_started(run_id, db=db)
+            result["checks"]["catalog_write"] = ledger.CATALOG_WRITE_STARTED  # kept when the run finishes
             with _timed(timings, "write_s"):
                 counts = await apply_ingest_plan(plan, batch_label=f"retailer_ingest:{job['id']}", db=db,
                                                  primary_readiness=True)

@@ -241,16 +241,48 @@ async def catalog_write_lock(*, wait_s: float, poll_s: float = 5.0,
         await _close_lock_connection(conn)
 
 
+#: An unfinished APPLY run's `checks.catalog_write` says whether its catalog write can have begun:
+#:   "not_started"  written by start_run: the execution died before the write (crawl, checks, lock
+#:                  wait) -- nothing was written, so the apply is retried like a dry run;
+#:   "started"      written by mark_write_started, and COMMITTED, before apply_ingest_plan is called --
+#:                  the cohort may be partial, never re-applied blindly;
+#:   absent         a run started by an image older than this marker: treated as "started".
+CATALOG_WRITE_NOT_STARTED = "not_started"
+CATALOG_WRITE_STARTED = "started"
+
+
 async def start_run(*, job_id: str, stage: str, image_sha: Optional[str], execution: Optional[str],
                     db: Any = None) -> str:
     write_db = db or database
     run_id = f"rir_{uuid.uuid4().hex}"
+    checks = {"catalog_write": CATALOG_WRITE_NOT_STARTED} if stage == "apply" else None
     await write_db.execute(
-        "INSERT INTO retailer_ingest_runs (id, job_id, stage, image_sha, execution) "
-        "VALUES (:id, :job_id, :stage, :image_sha, :execution)",
-        {"id": run_id, "job_id": job_id, "stage": stage, "image_sha": image_sha, "execution": execution},
+        "INSERT INTO retailer_ingest_runs (id, job_id, stage, image_sha, execution, checks) "
+        "VALUES (:id, :job_id, :stage, :image_sha, :execution, CAST(:checks AS jsonb))",
+        {"id": run_id, "job_id": job_id, "stage": stage, "image_sha": image_sha, "execution": execution,
+         "checks": _dumps(checks)},
     )
     return run_id
+
+
+_MARK_WRITE_STARTED_SQL = """
+    UPDATE retailer_ingest_runs
+    SET checks = COALESCE(checks, '{}'::jsonb)
+                 || jsonb_build_object('catalog_write', CAST(:started AS text), 'write_started_at', NOW())
+    WHERE id = :id AND finished_at IS NULL
+    RETURNING id
+"""
+
+
+async def mark_write_started(run_id: str, *, db: Any = None) -> None:
+    """Record, durably, that this apply run is about to write the catalog. The caller awaits it
+    BEFORE apply_ingest_plan: a crash between the two reads as "may be partial" (safe), never as
+    "nothing written" (a re-apply over a partial write). Raises when no unfinished run matched, so
+    the write never starts unmarked."""
+    write_db = db or database
+    row = await write_db.fetch_one(_MARK_WRITE_STARTED_SQL, {"id": run_id, "started": CATALOG_WRITE_STARTED})
+    if not row:
+        raise RuntimeError(f"cannot mark the catalog write started: no unfinished run {run_id}")
 
 
 async def finish_run(run_id: str, *, outcome: str, crawl: Any = None, plan: Any = None,
@@ -396,10 +428,12 @@ async def job_runs(job_id: str, *, db: Any = None) -> List[Dict[str, Any]]:
 
 
 async def unfinished_run(job_id: str, *, db: Any = None) -> Optional[Dict[str, Any]]:
-    """The job's latest run, when it never finished: its execution was killed (timeout, OOM)."""
+    """The job's latest run, when it never finished: its execution was killed (timeout, OOM).
+    `catalog_write` is the apply's write marker (see CATALOG_WRITE_STARTED), None when absent."""
     read_db = db or database
     row = await read_db.fetch_one(
-        "SELECT id, stage, started_at, finished_at FROM retailer_ingest_runs WHERE job_id = :id "
+        "SELECT id, stage, started_at, finished_at, checks ->> 'catalog_write' AS catalog_write "
+        "FROM retailer_ingest_runs WHERE job_id = :id "
         "ORDER BY started_at DESC LIMIT 1", {"id": job_id})
     return dict(row) if row and row["finished_at"] is None else None
 
