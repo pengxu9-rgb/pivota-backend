@@ -396,6 +396,13 @@ and it is why their order is not negotiable.**
 7. **AUTH: the two OIDC envs, ON THE BACKEND FIRST** — `OPS_GATEWAY_OIDC_AUDIENCE` and
    `OPS_GATEWAY_SERVICE_ACCOUNTS`. Both or neither. See §10.
 8. **THEN the gateway's `PIVOTA_OPS_OIDC_AUDIENCE`,** the same string byte for byte. See §10.
+9. **`MERCHANT_PURCHASABILITY_GATE_ENABLED` on the gateway must not be set until PIVOTA-Agent
+   makes "enforced AND unkeyable → browse-only (no warm cart)".** That change is
+   **PIVOTA-Agent #2276**; check it is MERGED and DEPLOYED to the gateway before this step is
+   taken. Until
+   then an unkeyable request — every click whose market was never known, which since
+   2026-09-26 includes every market-less seed-lane click (see "Market is never defaulted") — is
+   answered `{offer: true, source: 'failed'}` by the gateway's client and gets a warm cart.
 
 > **Arming these in the other order is the outage.** With `ENFORCE` on and no facts gathered,
 > every merchant reads `browse_only` and the Reap rail refuses `merchant_not_purchasable` (409)
@@ -417,8 +424,12 @@ The per-run report lands on the **worker's stdout** (Cloud Logging, the worker s
 INFO) as one line in `utils.logger`'s format:
 
 ```
-[2026-09-23 09:43:20,118] INFO - merchant_purchasability_sweep: SweepReport(population=20, population_skipped_unusable=0, checked=20, positive=14, negative=2, unverifiable=4, written=20, abandoned_budget=0, errors=0, skipped_disabled=0, duration_ms=48213)
+[2026-09-23 09:43:20,118] INFO - merchant_purchasability_sweep: SweepReport(population=20, population_skipped_unusable=0, population_skipped_market_unknown=0, checked=20, positive=14, negative=2, unverifiable=4, written=20, abandoned_budget=0, errors=0, skipped_disabled=0, duration_ms=48213)
 ```
+
+(The line as measured on 2026-09-23 had no `population_skipped_market_unknown` — the field was
+added on 2026-09-26, after `population_skipped_unusable`; the sample above shows the current
+shape with that run's counts.)
 
 With the dial off the run logs, at the same place and level,
 `merchant_purchasability_sweep: disabled; no merchant was contacted` and returns
@@ -527,39 +538,67 @@ fix — never the gate.
 **An unknown market is unknown.** On every path that feeds this gate, an attribution key or a
 purchase decision, a market that was never known is carried as NULL / absent — never as `"US"`,
 never as a truncation (`"USA"` is not `"US"`), and never as the market a seed or catalog row is
-*listed* in. The consumer then makes **no purchasability claim**: browse and links-out are
-untouched, a purchase is never offered on it. This is the same thing the gateway does with an
-unkeyable request.
+*listed* in. **This backend then makes no purchasability claim for it** — `is_purchasable` is
+False, the ops route answers `market_unknown`, and the warm-handoff sink sends the gateway **no
+`market` key**.
+
+**WHAT HAPPENS NEXT IS THE GATEWAY'S DECISION, AND TODAY IT FAILS OPEN.** Not "a purchase is never
+offered". The warm-handoff sink omits the market for such a click
+(`services/outbound_warm_handoff.resolve_warm_handoff` via `warm_market_decision`), the gateway's
+`merchantPurchasabilityClient` logs `merchant_purchasability_unkeyable` and returns
+`{offer: true, source: 'failed'}` — the previous behaviour — and **the warm cart is built**. The
+consequence of this change, stated plainly: market-less seed-lane clicks that main stamped as
+"observed US" (and that the gateway gate therefore judged against the US fact) are now UNKEYABLE,
+so once the gateway gate is armed they fail open into a purchase offer instead of being judged
+against a market that was never the buyer's. That trades a wrong answer for no answer; it is only
+safe once the gateway treats "enforced AND unkeyable" as browse-only (PIVOTA-Agent #2276), which
+is why step 9 of the arming order holds `MERCHANT_PURCHASABILITY_GATE_ENABLED` until that change
+is merged and deployed.
+Until then, the Reap rail is unaffected (its market is the buyer's shipping country, validated,
+never defaulted), and browse / links-out are untouched either way.
 
 * **One helper.** `utils/market_code.iso2_market` is the only normaliser: strip, upper-case,
   `^[A-Z]{2}$`, else `None`. `db/merchant_purchasability.normalize_market`,
-  `services/outbound_warm_handoff.click_market` and `services/outbound_links_service.iso2_market`
-  are the **same function object** (identity-asserted in
-  `tests/test_purchase_gate_market_not_defaulted.py`); the Tier B allowlist
-  (`services/tierb_cart_link_merchants.normalize_market`, its raising face) and the Reap rail's
-  shipping-country check call it. Until 2026-09-26 the fact store carried its own rule,
+  `services/outbound_warm_handoff.click_market`, `services/outbound_links_service.iso2_market` and
+  the name `iso2_market` in `services/tierb_cart_link_merchants` are the **same function object**
+  (identity-asserted in `tests/test_purchase_gate_market_not_defaulted.py`). Tier B's raising
+  `normalize_market` and its `parse_merchants` (which additionally demands canonical spelling:
+  the helper must return the value unchanged) both call it, as does the Reap rail's
+  shipping-country check. Until 2026-09-26 the fact store carried its own rule,
   `str(v or "").strip().upper()[:2]`, which read `"USA"` as `"US"`.
 * **Consumers.** `is_purchasable`, `get_fact` and `list_facts` answer False / None / `[]` for an
   unusable market **before** touching the database and **without a log line** (it is an expected
   input, not an error — logging it would storm). `record_check` refuses the write. The ops route
-  now accepts a request with **no** `market` and answers `200` with `tier: "browse_only"`,
-  `reason: "market_unknown"`, `market: null`, `facts: []` (a present-but-invalid 2-character value
-  such as `U1` answers the same); a request that names a valid market gets exactly the previous
-  body plus `reason: null`. The sweep skips an allowlist row whose market is not ISO-2 and counts
-  it in `SweepReport.population_skipped_market_unknown` with one warning per run (both allowlist
-  tables CHECK their market column, so expect 0).
-* **Producers.** The `/r` mint sites derive `market_observed` from the **request's** market only.
-  The seed row's `market` (`external_product_seeds.market` is NOT NULL, so it always "named" one)
-  is where the card is listed, and on `routes/agent_sdk_fixed` the seed fetch is filtered on
-  `DEFAULT_EXTERNAL_SEED_MARKET`, so under the previous rule every click there was an "observed
-  US" click — a defaulted US laundered through a WHERE clause. The served `market` on the token
-  (rule row, allowlist, UTM, click event) is unchanged; only the provenance flag moved. A request
-  that names its market mints byte-identical tokens to before (pinned in the test above).
-* **Known remaining gap (unchanged on purpose).** On the seed lanes the token's `market` is the
-  *row's* listing market even when the request named a different one (request `SG`, row `US` →
-  token `market=US, market_observed=true`). Fixing that changes a token for a request that named
-  its market, which this change deliberately does not; it is the next thing to fix on the minter
-  side.
+  accepts **any** `market` string (or none) and puts it through the helper: absent, `""`,
+  `"USA"`, `"U1"` answer `200` with `tier: "browse_only"`, `reason: "market_unknown"`,
+  `market: null`, `facts: []`; `" us"` is `US`. A request that names a valid market gets exactly
+  the previous body plus `reason: null`. The sweep skips an allowlist row whose market is not
+  ISO-2 and counts it in `SweepReport.population_skipped_market_unknown`, one warning per run
+  (both allowlist tables CHECK their market column, so expect 0).
+* **Producers.** Every `/r` mint site decides `market_observed` through ONE function,
+  `services/outbound_links_service.request_market_observed(request_market, listing_market=…,
+  require_same=…)`. Its first argument is the **request's** raw market and is the only thing
+  that can turn the flag on. A row's market may be passed only as `listing_market`, which can
+  only turn it **off**: a row with no market serves the US fallback, so it is never observed.
+  The find_products_multi lanes read the request market from `search.market` first, then
+  `metadata.market` (`_request_market_for_multi`) — the gateway sends `search.market`, and
+  `MultiSearchFilters` now keeps it (excluded from every dump). The prefetched lane additionally
+  passes `require_same=True`: its served market is the candidate's, so a candidate listed in a
+  market other than the one the request named is not observed. The seed row's `market` is
+  where the card is listed (`external_product_seeds.market` is NOT NULL), and on
+  `routes/agent_sdk_fixed` the seed fetch is filtered on `DEFAULT_EXTERNAL_SEED_MARKET`, so
+  under the previous rule every click there was an "observed US" click — a defaulted US
+  laundered through a WHERE clause. The served `market` on the token (rule row, allowlist, UTM,
+  click event) is unchanged; only the provenance flag moved. A request that names its market
+  mints byte-identical tokens to main except on the prefetched lane's `require_same` case
+  (digests pinned in the test).
+* **Known remaining gap: case (c), deliberately not fixed here.** On the other seed lanes the
+  token's `market` is the *row's* listing market even when the request named a different one
+  (request `SG`, row `US` → token `market=US, market_observed=true`, forwarded to the gate as the
+  buyer's). It is not a minter one-liner: the token's `market` selects the outbound rule, the
+  domain allowlist and the UTM **for the listing** (serving state), while the gate needs the
+  **buyer's** market. Fixing it needs a separate `buyer_market` carrier on the token that the
+  warm-handoff sink reads for the gate, leaving `market` to serving.
 
 **For the gateway (PIVOTA-Agent), no change made from this repo:** its `get_checkout` re-read
 carries no market today, so it cannot be keyed and keeps failing open; it must first carry a

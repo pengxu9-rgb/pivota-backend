@@ -35,7 +35,7 @@ from services.outbound_links_service import (
     get_allowed_domains_for_market,
     is_destination_domain_allowed,
     make_redirect_token,
-    market_is_observed,
+    request_market_observed,
     TOKEN_MARKET_OBSERVED_KEY,
 )
 from services.external_seed_stock import (
@@ -345,11 +345,13 @@ async def _build_external_seed_product(
             # sees says "US" whatever the buyer is. Stamping the row's market made every click
             # here an "observed US" click, which the warm-handoff lane forwards to the gateway's
             # purchasability gate — a defaulted US laundered through a WHERE clause. This lane
-            # carries no request market, so `request_market` is None and nothing is stamped. See
-            # the MARKET PROVENANCE note in `services/outbound_links_service`.
+            # carries no request market, so `request_market` is None and nothing is stamped. The
+            # row's raw market is passed only as `listing_market`, which can turn the flag OFF
+            # (a row with no market serves the US fallback) and never ON. See the MARKET
+            # PROVENANCE note in `services/outbound_links_service`.
             **(
                 {TOKEN_MARKET_OBSERVED_KEY: True}
-                if market_is_observed(request_market)
+                if request_market_observed(request_market, listing_market=seed_row.get("market"))
                 else {}
             ),
             "dest": dest_with_utm,

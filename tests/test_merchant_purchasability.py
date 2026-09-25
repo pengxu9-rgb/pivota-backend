@@ -1712,7 +1712,9 @@ async def test_a_present_market_is_normalised_and_bound_on_both_sides(_db, spell
     assert await mp.is_purchasable("judydoll.com", "US") is True
 
 
-@pytest.mark.parametrize("query", ["", "&market=U1"])
+@pytest.mark.parametrize(
+    "query", ["", "&market=", "&market=%20%20", "&market=U1", "&market=USA", "&market=united%20states"]
+)
 async def test_the_ops_route_reports_market_unknown_for_a_missing_market(_db, ops_app, monkeypatch, query):
     """No market -> tier browse_only with reason `market_unknown`, market null, no facts — even
     though a fresh positive US fact exists. A 200 with a distinct reason, not a 422 the gateway
@@ -1727,6 +1729,16 @@ async def test_the_ops_route_reports_market_unknown_for_a_missing_market(_db, op
     assert body["market"] is None
     assert body["facts"] == []
     assert body["enforced"] is True
+
+
+@pytest.mark.parametrize("spelled", ["%20us", "us%20", "Us"])
+async def test_the_ops_route_normalises_a_present_market_instead_of_refusing_it(_db, ops_app, spelled):
+    """Any string is accepted and put through the one helper: " us" is US (it was a 422)."""
+    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
+    response = await ops_get(ops_app, f"/ops/merchant-purchasability?domain=judydoll.com&market={spelled}")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert (body["market"], body["tier"], body["reason"]) == ("US", "purchase", None)
 
 
 async def test_the_ops_route_with_a_market_is_unchanged_apart_from_a_null_reason(_db, ops_app):

@@ -42,7 +42,6 @@ DEFAULT_MERCHANTS_PATH = Path(__file__).resolve().parents[1] / "config" / "tierb
 _ALLOWED_KEYS = frozenset({"domain", "market", "variant_id", "product_handle"})
 _LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 _TLD = re.compile(r"[a-z]{2,63}")
-_MARKET = re.compile(r"[A-Z]{2}")
 _VARIANT_ID = re.compile(r"[0-9]{1,20}")
 # The preflight's own shape for a handle, minus control characters and `%`: a handle is stored
 # DECODED, because the preflight percent-encodes it and an encoded one would be encoded twice.
@@ -133,7 +132,9 @@ def parse_merchants(raw: Any) -> List[Merchant]:
         if domain != canonical:
             raise MerchantListError(f"{where}: domain {domain!r} is not canonical (expected {canonical!r})")
         market = row.get("market")
-        if not isinstance(market, str) or not _MARKET.fullmatch(market):
+        # The one market rule, held to CANONICAL spelling: the helper must return the value
+        # unchanged (so "us" and " US" are refused here, exactly as the old regex refused them).
+        if not isinstance(market, str) or iso2_market(market) != market:
             raise MerchantListError(f"{where}: market {market!r} is not an upper-case ISO-2 code")
         variant = row.get("variant_id")
         if variant is not None and (not isinstance(variant, str) or not _VARIANT_ID.fullmatch(variant)):

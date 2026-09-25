@@ -111,16 +111,19 @@ def normalize_market(market: Optional[str]) -> str:
 # So the minters additionally stamp `market_observed: true` on the token payload when, and only
 # when, the market came from the CALLER / REQUEST — the buyer side. The warm-handoff sink forwards
 # `market` only for an OBSERVED one. A token minted before this existed carries no flag, reads as
-# unobserved, and leaves the gate inert for its remaining TTL — which is the safe direction.
+# unobserved, and leaves the gate unkeyed for its remaining TTL. UNKEYED IS NOT REFUSED: the
+# gateway keeps its previous behaviour for an unkeyable click, which today is to build the warm
+# cart (fail-open) — see the runbook's "Market is never defaulted" and arming-order step 9.
 #
 # A SEED / CATALOG ROW'S `market` IS NOT AN OBSERVATION OF THE BUYER. It is the market the row is
 # LISTED in (and `external_product_seeds.market` is NOT NULL, so "the row names a market" was true
 # of every row). Worse, several lanes FILTER seeds by a defaulted "US" when the request named
 # none (`routes/agent_sdk_fixed` always does; `routes/agent_api` does for a market-less request),
-# so a row's "US" was frequently the default itself, laundered through a WHERE clause. A mint
-# site therefore passes `market_is_observed` the REQUEST's market only — never the row's. (Until
-# 2026-09-26 the seed lanes passed the row's market; see docs/runbooks/merchant_purchasability.md
-# "Market is never defaulted".)
+# so a row's "US" was frequently the default itself, laundered through a WHERE clause. Every mint
+# site therefore decides through `request_market_observed`, whose first argument is the REQUEST's
+# market; a row's market may only be its `listing_market`, which can turn the flag off, never on.
+# (Until 2026-09-26 the seed lanes passed the row's market; see
+# docs/runbooks/merchant_purchasability.md "Market is never defaulted".)
 # ---------------------------------------------------------------------------------------------
 
 TOKEN_MARKET_OBSERVED_KEY = "market_observed"
@@ -146,6 +149,34 @@ def market_is_observed(*raws: Any) -> bool:
     are separate questions and collapsing them would hide one of them.
     """
     return any(isinstance(raw, str) and raw.strip() for raw in raws)
+
+
+_NO_LISTING = object()
+
+
+def request_market_observed(
+    request_market: Any, *, listing_market: Any = _NO_LISTING, require_same: bool = False
+) -> bool:
+    """THE PROVENANCE DECISION every `/r` mint site makes: may this token say `market_observed`?
+
+    `request_market` is the RAW market the buyer's request named (never a served/defaulted
+    value, never a row's). It is the only thing that can turn the flag ON.
+
+    `listing_market` is passed by a site whose SERVED market is `<row>.market or <fallback>`: the
+    row's raw market. It can only turn the flag OFF — when the row names no market, the served
+    market is the fallback default and says nothing about the buyer. `require_same` additionally
+    demands the request and the row name the same market (after strip+upper), for a lane whose
+    served market is the row's even when the request named another.
+    """
+    if not market_is_observed(request_market):
+        return False
+    if listing_market is _NO_LISTING:
+        return True
+    if not market_is_observed(listing_market):
+        return False
+    if require_same:
+        return str(request_market).strip().upper() == str(listing_market).strip().upper()
+    return True
 
 
 def normalize_scope(scope: str) -> str:
@@ -858,7 +889,7 @@ async def resolve_outbound_link(input: Dict[str, Any], request_base_url: str) ->
         # byte-identical for a defaulted market.
         **(
             {TOKEN_MARKET_OBSERVED_KEY: True}
-            if market_is_observed(input.get("market"))
+            if request_market_observed(input.get("market"))
             else {}
         ),
         "ruleId": matched.get("id"),
