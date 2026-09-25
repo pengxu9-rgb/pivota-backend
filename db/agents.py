@@ -54,6 +54,20 @@ def _agent_auth_cache_key(api_key: str) -> str:
     return hashlib.sha256(str(api_key or "").encode("utf-8")).hexdigest()
 
 
+def agent_is_active(agent: Optional[Dict[str, Any]]) -> bool:
+    """THE activity rule for an agent row: is_active when set, else status == 'active', and an
+    agent with neither (NULL is_active, no status) is active. Every door that admits an agent's
+    key reads this one function: get_agent_context (403), resolve_agent_id_by_api_key, the
+    internal introspection verdict the gateway 403s on, and ADR-025 issuing-agent attribution."""
+    if not agent:
+        return False
+    is_active = agent.get("is_active")
+    if is_active is None:
+        status = agent.get("status")
+        return (str(status).strip().lower() == "active") if status else True
+    return bool(is_active)
+
+
 def _normalize_agent_row(result: Any) -> Dict[str, Any]:
     agent = dict(result)
     raw_allowed = agent.get("allowed_merchants")
@@ -73,8 +87,7 @@ def _normalize_agent_row(result: Any) -> Dict[str, Any]:
         agent["agent_name"] = agent["name"]
 
     if "is_active" not in agent:
-        status = agent.get("status")
-        agent["is_active"] = (str(status).lower() == "active") if status is not None else True
+        agent["is_active"] = agent_is_active(agent)
 
     if "allowed_merchants" not in agent:
         agent["allowed_merchants"] = None
@@ -556,22 +569,47 @@ async def get_agent_by_key(api_key: str, metrics_out: Optional[Dict[str, Any]] =
 
 
 async def resolve_agent_id_by_api_key(api_key: str) -> Optional[str]:
-    """agent_id for an X-API-Key value, or None.
+    """agent_id for an X-API-Key value of an ACTIVE agent, or None.
 
     Routes that only need the caller's agent_id used to run
     `SELECT agent_id FROM agents WHERE api_key = :key`, which matches the plaintext column
     only. Keys are now persisted hash-only (agents.api_key holds a redacted marker), so every
     resolver must go through get_agent_by_key: hash table first, legacy plaintext fallback
     second, and the same auth cache.
+
+    A deactivated agent's key resolves to None here, so every caller refuses it the way it
+    refuses an unknown key: these routes use the agent_id as the caller's identity, and
+    get_agent_context 403s the same agent. get_agent_by_key itself stays neutral (it returns
+    inactive agents) so get_agent_context can answer 403 rather than 401 and introspection
+    can report is_active.
     """
     key = str(api_key or "").strip()
     if not key:
         return None
     agent = await get_agent_by_key(key)
-    if not agent:
+    if not agent_is_active(agent):
         return None
     agent_id = agent.get("agent_id")
     return str(agent_id) if agent_id else None
+
+
+async def resolve_active_agent_id(agent_id: Any) -> Optional[str]:
+    """agent_id when it names an existing ACTIVE agent, else None.
+
+    For an agent_id read from a signed claim, e.g. the agent-portal JWT (7-day session). The
+    signature proves which agent the caller was at login, not that the agent is still active:
+    deactivation does not revoke issued tokens, and portal login checks users.active, not
+    agents.is_active. Reads the row (get_agent), not the per-key auth cache, so a deactivation
+    is seen on the next request. A missing or unreadable row is None: fail closed.
+    """
+    candidate = str(agent_id or "").strip()
+    if not candidate:
+        return None
+    agent = await get_agent(candidate)
+    if not agent_is_active(agent):
+        return None
+    resolved = str(agent.get("agent_id") or "").strip()
+    return resolved if resolved == candidate else None
 
 
 async def get_agent(agent_id: str) -> Optional[Dict[str, Any]]:

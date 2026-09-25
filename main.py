@@ -36,6 +36,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 # Database
 from db.database import database, metadata, engine
 from db.startup_ddl import StartupDdlLock, startup_ddl_lock
+import db.agents  # noqa: F401  (register agents in metadata; startup() relies on create_all building it)
 import db.auth_identity  # noqa: F401  (register canonical auth identity tables in metadata)
 import db.pcs_tables  # noqa: F401  (register PCS v0.1 tables/constraints in metadata)
 import db.id_bridge  # noqa: F401  (register id_bridge table in metadata)
@@ -1654,26 +1655,12 @@ async def startup():
         
         # Create integration tables
         try:
-            # Create agents table if not exists
-            await database.execute("""
-                CREATE TABLE IF NOT EXISTS agents (
-                    agent_id VARCHAR(50) PRIMARY KEY,
-                    name VARCHAR(255) NOT NULL,
-                    email VARCHAR(255) UNIQUE NOT NULL,
-                    company VARCHAR(255),
-                    use_case TEXT,
-                    api_key VARCHAR(255) UNIQUE,
-                    status VARCHAR(50) DEFAULT 'active',
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    last_active TIMESTAMP WITH TIME ZONE,
-                    last_key_rotation TIMESTAMP WITH TIME ZONE,
-                    deactivated_at TIMESTAMP WITH TIME ZONE,
-                    request_count INTEGER DEFAULT 0,
-                    success_rate FLOAT DEFAULT 0,
-                    rate_limit INTEGER DEFAULT 1000
-                )
-            """)
-            
+            # No agents DDL here: metadata.create_all above builds agents from the db/agents.py
+            # model (imported explicitly at the top of this file), so a raw CREATE TABLE IF NOT
+            # EXISTS at this point never creates anything. The one that stood here described a
+            # legacy table (name, company, use_case, status, request_count) that prod's table does
+            # not have (probe 2026-09-24; routes written against those columns: pivota-backend#2305).
+
             # Fix missing columns in agents table (2024-10-30)
             logger.info("🔧 Applying database fixes for agents table...")
             try:

@@ -13,7 +13,16 @@ def _client():
     return TestClient(app)
 
 
-def test_api_auth_login_prefers_active_employee_identity_over_existing_public_user(monkeypatch):
+def test_api_auth_login_does_not_promote_a_merchant_row_with_the_merchant_password(monkeypatch):
+    """A merchant password is not an employee password.
+
+    This test used to assert the opposite: an employees row with no password
+    of its own, plus a merchant users row at the same address, and the MERCHANT
+    password came back as an admin token, with the users row rewritten to
+    role=admin. A merchant can move its login email onto an unclaimed address
+    without proving the mailbox, so that was a merchant -> staff escalation.
+    The login now authenticates the account whose password it verified.
+    """
     password = "Admin123!"
     user_record = {
         "id": 44,
@@ -51,8 +60,19 @@ def test_api_auth_login_prefers_active_employee_identity_over_existing_public_us
         executed.append((query, values))
         return None
 
+    memberships = []
+
+    async def fake_upsert_membership(**kwargs):
+        memberships.append(kwargs)
+        return None
+
+    async def no_membership(email, membership_type):
+        return None
+
     monkeypatch.setattr(auth_module.database, "fetch_one", fake_fetch_one)
     monkeypatch.setattr(auth_module.database, "execute", fake_execute)
+    monkeypatch.setattr(auth_module, "_safe_upsert_membership", fake_upsert_membership)
+    monkeypatch.setattr(auth_module, "_safe_get_active_membership", no_membership)
 
     res = _client().post(
         "/api/auth/login",
@@ -63,16 +83,90 @@ def test_api_auth_login_prefers_active_employee_identity_over_existing_public_us
     payload = res.json()
     assert payload["success"] is True
     assert payload["user"]["email"] == "peng@pivota.cc"
-    assert payload["user"]["role"] == "admin"
-    assert payload["user"]["employee_id"] == "emp_peng"
-    assert "merchant_id" not in payload["user"]
+    assert payload["user"]["role"] == "merchant"
+    assert payload["user"]["merchant_id"] == "merch_old"
+    assert "employee_id" not in payload["user"]
 
     token_payload = decode_token(payload["token"])
-    assert token_payload["role"] == "admin"
-    assert token_payload["employee_id"] == "emp_peng"
-    assert "merchant_id" not in token_payload
+    assert token_payload["role"] == "merchant"
+    assert "employee_id" not in token_payload
 
-    assert any("UPDATE users" in query and "merchant_id = NULL" in query for query, _ in executed)
+    # The users row was not rewritten to staff, and no employee membership was
+    # seeded with the merchant's password hash.
+    assert not any("UPDATE users" in query and ":role" in query for query, _ in executed)
+    assert not any("INSERT INTO users" in query for query, _ in executed)
+    assert not any(m.get("membership_type") == "employee" for m in memberships)
+
+    # Portal-scoped: the employee portal is refused outright.
+    res = _client().post(
+        "/api/auth/login",
+        json={"email": "peng@pivota.cc", "password": password, "portal": "employee"},
+    )
+    assert res.status_code == 403
+
+
+def test_api_auth_login_employee_password_still_reclaims_a_merchant_row(monkeypatch):
+    """The employee's own (legacy employees.password) password is proof: the
+    row is promoted and its password replaced by the employee's."""
+    merchant_password = "Merchant123!"
+    employee_password = "Employee123!"
+    user_record = {
+        "id": 44,
+        "email": "peng@pivota.cc",
+        "password_hash": hash_password(merchant_password),
+        "full_name": "Public Peng",
+        "role": "merchant",
+        "active": True,
+        "merchant_id": "merch_old",
+    }
+    employee_record = {
+        "employee_id": "emp_peng",
+        "name": "Peng Xu",
+        "email": "peng@pivota.cc",
+        "password": hashlib.sha256(f"{employee_password}pivota_employee_salt_v1".encode()).hexdigest(),
+        "role": "admin",
+        "status": "active",
+        "permissions": [],
+    }
+    executed = []
+
+    async def fake_fetch_one(*args, **kwargs):
+        query = str(kwargs.get("query") or (args[0] if args else ""))
+        if "FROM employees" in query:
+            return employee_record
+        if "FROM users" in query:
+            return user_record
+        return None
+
+    async def fake_execute(*args, **kwargs):
+        query = str(kwargs.get("query") or (args[0] if args else ""))
+        values = kwargs.get("values")
+        if values is None and len(args) > 1:
+            values = args[1]
+        executed.append((query, values))
+        return None
+
+    async def no_membership(email, membership_type):
+        return None
+
+    monkeypatch.setattr(auth_module.database, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(auth_module.database, "execute", fake_execute)
+    monkeypatch.setattr(auth_module, "_safe_get_active_membership", no_membership)
+
+    res = _client().post(
+        "/api/auth/login",
+        json={"email": "peng@pivota.cc", "password": employee_password},
+    )
+
+    assert res.status_code == 200
+    payload = res.json()
+    assert payload["user"]["role"] == "admin"
+    assert payload["user"]["employee_id"] == "emp_peng"
+
+    upserts = [values for query, values in executed if "INSERT INTO users" in query]
+    assert upserts and upserts[0]["role"] == "admin"
+    assert upserts[0]["password_hash"].startswith("$2")
+    assert auth_module.verify_password(employee_password, upserts[0]["password_hash"])
 
 
 def test_api_auth_login_employee_portal_uses_scoped_employee_membership(monkeypatch):

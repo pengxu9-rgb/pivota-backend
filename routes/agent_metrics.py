@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, Query, Request, Header, HTTPException
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta, timezone
 from db.database import database
-from db.agents import resolve_agent_id_by_api_key
+from db.agents import resolve_active_agent_id, resolve_agent_id_by_api_key
 from utils.auth import ADMIN_ROLES, require_admin, decode_token
 
 router = APIRouter(prefix="/agent/metrics", tags=["Agent Metrics"])
@@ -38,7 +38,7 @@ async def get_metrics_summary(
                 role = payload.get("role")
                 if role in ["super_admin", "admin", "employee", "outsourced"]:
                     employee_context = True
-                agent_id = payload.get("agent_id")
+                agent_id = await resolve_active_agent_id(payload.get("agent_id"))
             except:
                 pass
         if not agent_id and x_api_key:
@@ -245,8 +245,9 @@ async def resolve_recent_activity_scope(
 
     - admin / super_admin JWT (ADMIN_ROLES, what require_admin admits): every agent, or the one
       named by `agent_id`;
-    - agent JWT (its agent_id claim, the agent portal's session) or x-api-key (through
-      resolve_agent_id_by_api_key): that agent only; naming another agent is a 403;
+    - agent JWT (its agent_id claim, the agent portal's session, through resolve_active_agent_id)
+      or x-api-key (through resolve_agent_id_by_api_key), of an ACTIVE agent: that agent only;
+      naming another agent is a 403;
     - anything else: 401.
     """
     payload: Dict[str, Any] = {}
@@ -258,7 +259,8 @@ async def resolve_recent_activity_scope(
     if payload.get("role") in ADMIN_ROLES:
         return requested_agent_id or None
 
-    caller_agent_id = payload.get("agent_id")
+    # The claim proves who the caller was at login, not that the agent is still active.
+    caller_agent_id = await resolve_active_agent_id(payload.get("agent_id"))
     if not caller_agent_id and x_api_key:
         try:
             caller_agent_id = await resolve_agent_id_by_api_key(x_api_key)
@@ -344,7 +346,7 @@ async def get_metrics_timeline(
         if authorization and authorization.startswith("Bearer "):
             try:
                 payload = decode_token(authorization.split(" ")[1])
-                agent_id = payload.get("agent_id")
+                agent_id = await resolve_active_agent_id(payload.get("agent_id"))
             except:
                 pass
         if not agent_id and x_api_key:
@@ -384,6 +386,8 @@ async def get_metrics_timeline(
             "timestamp": datetime.now().isoformat()
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         return {
             "status": "error",

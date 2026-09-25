@@ -16,7 +16,7 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, Header, HTTPException, status
 from pydantic import BaseModel
 
-from db.agents import AgentAuthLookupTransientError, get_agent_by_key
+from db.agents import AgentAuthLookupTransientError, agent_is_active, get_agent_by_key
 from utils.transient_errors import db_busy_http_exception
 
 router = APIRouter(prefix="/agent/internal/auth", tags=["agent-internal-auth"])
@@ -57,18 +57,6 @@ def _require_internal_key(x_internal_key: Optional[str]) -> None:
         )
 
 
-def _resolve_is_active(agent: Dict[str, Any]) -> bool:
-    if not isinstance(agent, dict):
-        return False
-    is_active = agent.get("is_active")
-    if is_active is None:
-        status_value = agent.get("status")
-        if status_value is None:
-            return True
-        return str(status_value).strip().lower() == "active"
-    return bool(is_active)
-
-
 @router.post("/introspect", response_model=IntrospectResponse)
 async def introspect_agent_api_key(
     payload: IntrospectRequest,
@@ -98,6 +86,6 @@ async def introspect_agent_api_key(
     return IntrospectResponse(
         valid=True,
         agent_id=str(agent.get("agent_id") or "").strip() or None,
-        is_active=_resolve_is_active(agent),
+        is_active=agent_is_active(agent),
         auth_source=str(metrics.get("auth_source") or "unknown"),
     )

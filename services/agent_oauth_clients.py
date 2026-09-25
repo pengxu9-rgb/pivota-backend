@@ -15,7 +15,8 @@ import time
 from typing import Any, Collection, Dict, List, Optional, Sequence
 
 from db.database import database
-from services.issuing_agent_assertion import agent_is_active, is_confidential_client
+from db.agents import agent_is_active
+from services.issuing_agent_assertion import is_confidential_client
 
 _MAX_FIELD = 512
 

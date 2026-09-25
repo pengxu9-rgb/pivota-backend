@@ -898,11 +898,10 @@ async def _is_active_staff_account(user) -> bool:
     users holds ONE role per email, and an employee-portal login or reset rewrites it
     to the employee role (routes/auth._sync_employee_auth_user), so an agent owner who
     is also staff stops being role='agent' while still owning the agent. That is the
-    only rewrite admitted: the email must be a staff role AND an active employees row,
-    both of which only admins set. Owning the agents row alone is NOT enough, because a
-    merchant can move their own login email onto an unclaimed agent owner_email
-    (PUT /merchant/profile) and would then log in as that agent; and an admin moving
-    an email off role='agent' (admin_fix_merchant) must keep revoking the portal.
+    role rewrite admitted by role alone: the email must be a staff role AND an active
+    employees row, both of which only admins set. Owning the agents row alone is NOT
+    enough, because a merchant can move their own login email onto an unclaimed agent
+    owner_email (PUT /merchant/profile) and would then log in as that agent.
     """
     from routes.auth import EMPLOYEE_AUTH_ROLES, _fetch_active_employee_identity
 
@@ -912,6 +911,38 @@ async def _is_active_staff_account(user) -> bool:
     return bool(await _fetch_active_employee_identity(user["email"]))
 
 
+async def _holds_agent_membership(user, agent) -> bool:
+    """Whether this email holds an active agent membership for exactly this agent.
+
+    auth_memberships is the model built for one email holding several portals, and only
+    verified flows write an agent membership: agent registration/login, the
+    password-verified agent->merchant conversion (which now keeps it), or an admin. A
+    merchant who moved their login email onto an agent's owner_email gets none, so this
+    admits the real owner of a converted account without reopening that takeover. A
+    membership last written before this users row existed does not count: it belongs
+    to a deleted account whose email was re-registered.
+
+    Revocation: users.role alone no longer locks such an account out (admin_fix_merchant
+    changing the role leaves memberships alone); set the agent membership inactive or
+    users.active false.
+    """
+    from db.auth_identity import has_active_membership_for_entity
+
+    try:
+        user_created_at = user["created_at"]
+    except (KeyError, IndexError, TypeError):
+        user_created_at = None
+    if user_created_at is None:
+        # Without the row's age the membership cannot be shown to be this account's.
+        return False
+    return await has_active_membership_for_entity(
+        email=user["email"],
+        membership_type="agent",
+        entity_id=agent["agent_id"],
+        not_before=user_created_at,
+    )
+
+
 @router.post("/login", response_model=AgentLoginResponse)
 async def login_agent(data: AgentLoginRequest):
     """Agent login"""
@@ -919,7 +950,7 @@ async def login_agent(data: AgentLoginRequest):
         email = _normalize_email(data.email)
         # 1. Find user
         user = await database.fetch_one(
-            "SELECT id, email, password_hash, full_name, role, active FROM users WHERE LOWER(email) = LOWER(:email)",
+            "SELECT id, email, password_hash, full_name, role, active, created_at FROM users WHERE LOWER(email) = LOWER(:email)",
             {"email": email}
         )
         
@@ -944,7 +975,9 @@ async def login_agent(data: AgentLoginRequest):
             {"email": email}
         )
 
-        if user["role"] != "agent" and not (agent and await _is_active_staff_account(user)):
+        if user["role"] != "agent" and not (
+            agent and (await _is_active_staff_account(user) or await _holds_agent_membership(user, agent))
+        ):
             raise HTTPException(status_code=403, detail="This login is for agents only")
         if not agent:
             raise HTTPException(status_code=404, detail="Agent record not found")

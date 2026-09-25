@@ -1305,6 +1305,66 @@ async def get_readiness_job(
     except JobNotFoundError:
         raise HTTPException(status_code=404, detail={"code": "OPTIMIZATION_JOB_NOT_FOUND", "message": "Job not found."})
 
+
+async def _login_email_claimed_by(new_email: str, merchant_id: str) -> Optional[str]:
+    """Which principal already holds `new_email`, or None if it is free.
+
+    A merchant's login email is not verified when it changes, so every table the
+    login flow resolves an address against has to be checked here, not only
+    users/auth_identities. /api/auth/login trusts an `employees` row matched by
+    email (and promotes the users row at that address to staff), resolves an
+    agent by agents.owner_email/email, and resolves a merchant by
+    merchant_onboarding.contact_email. Moving a merchant login onto any of those
+    addresses hands the merchant that principal's identity.
+
+    `new_email` is already normalized (trimmed, lowercased). A check that cannot
+    run fails closed: it raises rather than letting the change through.
+    """
+    from routes.agent_management import _agent_email_columns
+
+    checks = [
+        ("users", "SELECT id FROM users WHERE LOWER(email) = :email LIMIT 1"),
+        (
+            "auth_identities",
+            "SELECT identity_id FROM auth_identities WHERE email_normalized = :email LIMIT 1",
+        ),
+        # Any status: an inactive employee can be reactivated after the merchant
+        # has moved onto the address.
+        ("employees", "SELECT employee_id FROM employees WHERE LOWER(TRIM(email)) = :email LIMIT 1"),
+    ]
+    try:
+        # owner_email always; agents.email only where the live table has it.
+        # An empty answer means the probe could not reach the table at all.
+        agent_columns = await _agent_email_columns()
+        if not agent_columns:
+            raise RuntimeError("agents email columns could not be probed")
+        for name in agent_columns:
+            # `name` is one of agent_management._CANDIDATE_EMAIL_COLUMNS, never input.
+            checks.append(
+                (f"agents.{name}", f"SELECT agent_id FROM agents WHERE LOWER(TRIM({name})) = :email LIMIT 1")
+            )
+        for label, query in checks:
+            if await database.fetch_one(query, {"email": new_email}):
+                return label
+        other_merchant = await database.fetch_one(
+            """
+            SELECT merchant_id FROM merchant_onboarding
+            WHERE LOWER(TRIM(contact_email)) = :email AND merchant_id <> :merchant_id
+            LIMIT 1
+            """,
+            {"email": new_email, "merchant_id": merchant_id},
+        )
+        if other_merchant and str(other_merchant["merchant_id"]) != str(merchant_id):
+            return "merchant_onboarding"
+    except Exception as exc:
+        logger.error("[MerchantProfile] Login-email availability check failed: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="Could not verify that this email is available; try again later",
+        )
+    return None
+
+
 @router.put("/merchant/profile")
 async def update_merchant_profile(
     profile_data: Dict[str, Any] = Body(...),
@@ -1351,15 +1411,16 @@ async def update_merchant_profile(
         except Exception:
             raise HTTPException(status_code=422, detail="Invalid email address")
 
-        existing_user = await database.fetch_one(
-            "SELECT id FROM users WHERE LOWER(email) = :email LIMIT 1",
-            {"email": new_email},
-        )
-        existing_identity = await database.fetch_one(
-            "SELECT identity_id FROM auth_identities WHERE email_normalized = :email LIMIT 1",
-            {"email": new_email},
-        )
-        if existing_user or existing_identity:
+        claimed_by = await _login_email_claimed_by(new_email, merchant_id)
+        if claimed_by:
+            # One message for every kind of claim: the caller learns only that
+            # the address is unavailable, not whether it is staff or an agent.
+            logger.warning(
+                "[MerchantProfile] Refused login-email change for merchant %s: "
+                "address is held by %s",
+                merchant_id,
+                claimed_by,
+            )
             raise HTTPException(
                 status_code=409,
                 detail="An account with this email already exists",

@@ -3,6 +3,8 @@ against real Postgres, on the agents table the app's own model builds (db.agents
 create_all gives prod) plus the email column prod carries out-of-band (probe 2026-09-24).
 
 Pinned:
+- POST /admin/fix/agents-table is retired: 501, and agents keeps its rows and its model columns
+  (it ran DROP TABLE agents CASCADE and re-created the legacy shape for an admin caller);
 - POST /employee/agents/create and POST /admin/init/agent-test-key are retired: 501 for any body,
   no agents row written, no plaintext ak_live_ key over a redacted:<agent_id> marker (the init
   route's UPDATE branch did exactly that to an existing agent@test.com);
@@ -172,6 +174,7 @@ async def client(db, user):
     from routes.admin_fix_agent_metrics_v2 import router as admin_fix_v2_router
     from routes.agent_metrics import router as agent_metrics_router
     from routes.employee_agent_mgmt import router as employee_agent_router
+    from routes.fix_agents_table import router as fix_agents_table_router
     from routes.init_agent_key import router as init_agent_key_router
     from utils.auth import get_current_user, require_admin_or_key
 
@@ -182,6 +185,7 @@ async def client(db, user):
         agent_metrics_router,
         admin_fix_router,
         admin_fix_v2_router,
+        fix_agents_table_router,
     ):
         app.include_router(router)
     # require_admin is NOT overridden: it runs its real role check on the overridden user.
@@ -254,6 +258,39 @@ async def test_init_agent_test_key_writes_no_row_when_the_test_agent_is_absent(c
 
     assert resp.status_code == 501, resp.text
     assert await _counters(db) == before
+
+
+async def _agents_table_snapshot(db):
+    """Every row and column value, plus the column types / nullability and the indexes: a handler
+    that UPDATEs, ALTERs or re-creates agents before its 501 changes at least one of these."""
+    rows = [
+        tuple(sorted((k, str(v)) for k, v in dict(r).items()))
+        for r in await db.fetch_all("SELECT * FROM agents ORDER BY agent_id")
+    ]
+    columns = [
+        tuple(dict(r).values())
+        for r in await db.fetch_all(
+            "SELECT column_name, data_type, is_nullable, character_maximum_length "
+            "FROM information_schema.columns WHERE table_name = 'agents' ORDER BY ordinal_position"
+        )
+    ]
+    indexes = [
+        tuple(dict(r).values())
+        for r in await db.fetch_all(
+            "SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'agents' ORDER BY indexname"
+        )
+    ]
+    return rows, columns, indexes
+
+
+async def test_fix_agents_table_is_retired_and_keeps_the_table(client, db):
+    before = await _agents_table_snapshot(db)
+    assert len(before[0]) == 3 and before[2]  # seeded rows and the model's indexes are there
+
+    resp = await client.post("/admin/fix/agents-table")
+
+    assert resp.status_code == 501, resp.text
+    assert await _agents_table_snapshot(db) == before
 
 
 @pytest.mark.parametrize("path", ["/admin/fix/agent-metrics", "/admin/fix/agent-metrics-v2"])

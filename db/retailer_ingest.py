@@ -31,11 +31,17 @@ def _dumps(value: Any) -> Optional[str]:
     return None if value is None else json.dumps(value, ensure_ascii=False, default=str, sort_keys=True)
 
 
+def handle_key(value: Any) -> str:
+    """How a storefront handle is compared everywhere (approval lists, the pipeline's re-file and
+    exclusion matching): trimmed, slashes stripped, casefolded -- as listing_handle returns it."""
+    return str(value).strip().strip("/").casefold()
+
+
 def scope_key(domain: str, brand: str, options: Dict[str, Any]) -> str:
     """One open job per (host, brand, scope). Operator bookkeeping (approvals, accepted flags,
     exclusions added at review) is NOT scope: approving a job must not let a duplicate enqueue."""
     scope = {k: v for k, v in (options or {}).items()
-             if k not in {"accepted_flags", "exclude_handles", "notes"}}
+             if k not in {"accepted_flags", "exclude_handles", "refile_to_sets", "notes"}}
     raw = json.dumps({"domain": domain.strip().lower(), "brand": brand.strip(), "scope": scope},
                      sort_keys=True, ensure_ascii=False, default=str)
     return f"rij:{domain.strip().lower()}:{hashlib.sha256(raw.encode()).hexdigest()[:24]}"
@@ -206,36 +212,66 @@ async def transition(job_id: str, *, status: str, reason: Optional[str], run_id:
     return bool(row)
 
 
+_APPROVE_READ_SQL = "SELECT options FROM retailer_ingest_jobs WHERE id = :id AND status = 'held'"
+
+#: Compare-and-set on the options read above: an approval computed from a stale read must not land.
+_APPROVE_SQL = """
+    UPDATE retailer_ingest_jobs
+    SET status = 'apply_due', next_run_at = NOW(), approved_by = :by, approved_at = NOW(),
+        options = options || CAST(:patch AS jsonb), status_reason = 'approved', updated_at = NOW()
+    WHERE id = :id AND status = 'held' AND options = CAST(:old AS jsonb)
+    RETURNING id
+"""
+
+
+def _as_list(value: Any) -> List[str]:
+    return [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
+
+
 async def approve(job_id: str, *, approved_by: str, exclude_handles: List[str],
-                  accepted_flags: List[str], db: Any = None) -> bool:
+                  accepted_flags: List[str], refile_handles: Optional[List[str]] = None,
+                  db: Any = None) -> bool:
     """held -> apply_due, recording who approved and which rows/flags the approval covers.
     The apply re-runs every check; only the exclusions and accepted flag keys named here change
-    its verdict, so an approval cannot wave through a flag that appears later."""
-    for name, values in (("exclude_handles", exclude_handles), ("accepted_flags", accepted_flags)):
+    its verdict, so an approval cannot wave through a flag that appears later.
+
+    `refile_handles` are bundles re-filed to the gift-set shelf instead of excluded
+    (options.refile_to_sets). A handle is in at most ONE of the two lists: re-filing a handle an
+    earlier approval excluded MOVES it (and the reverse), because the drain refuses a job holding
+    both -- as a failed job no approval can reopen (review of #2316)."""
+    refile_handles = [] if refile_handles is None else refile_handles
+    for name, values in (("exclude_handles", exclude_handles), ("accepted_flags", accepted_flags),
+                         ("refile_handles", refile_handles)):
         if not isinstance(values, (list, tuple)) or not all(isinstance(v, str) and v.strip() for v in values):
             raise ValueError(f"{name} must be a list of non-empty strings")
     if not str(approved_by or "").strip():
         raise ValueError("approved_by is required")
+    new_excl = [v.strip() for v in exclude_handles]
+    new_refile = [v.strip() for v in refile_handles]
+    both = sorted({handle_key(h) for h in new_excl} & {handle_key(h) for h in new_refile})
+    if both:
+        raise ValueError(f"a handle cannot be both re-filed and excluded: {both}")
     write_db = db or database
-    row = await write_db.fetch_one(
-        """
-        UPDATE retailer_ingest_jobs
-        SET status = 'apply_due', next_run_at = NOW(), approved_by = :by, approved_at = NOW(),
-            options = options
-              || jsonb_build_object('exclude_handles',
-                   (CASE WHEN jsonb_typeof(options->'exclude_handles') = 'array'
-                         THEN options->'exclude_handles' ELSE '[]'::jsonb END) || CAST(:excl AS jsonb))
-              || jsonb_build_object('accepted_flags',
-                   (CASE WHEN jsonb_typeof(options->'accepted_flags') = 'array'
-                         THEN options->'accepted_flags' ELSE '[]'::jsonb END) || CAST(:acc AS jsonb)),
-            status_reason = 'approved', updated_at = NOW()
-        WHERE id = :id AND status = 'held'
-        RETURNING id
-        """,
-        {"id": job_id, "by": approved_by, "excl": _dumps([v.strip() for v in exclude_handles]),
-         "acc": _dumps([v.strip() for v in accepted_flags])},
-    )
-    return bool(row)
+    row = await write_db.fetch_one(_APPROVE_READ_SQL, {"id": job_id})
+    if not row:
+        return False
+    options = row["options"]
+    if isinstance(options, str):
+        options = json.loads(options)
+    options = options if isinstance(options, dict) else {}
+    refile_keys, excl_keys = {handle_key(h) for h in new_refile}, {handle_key(h) for h in new_excl}
+    patch = {
+        "exclude_handles": [h for h in _as_list(options.get("exclude_handles")) if handle_key(h) not in refile_keys]
+                           + new_excl,
+        "accepted_flags": _as_list(options.get("accepted_flags")) + [v.strip() for v in accepted_flags],
+    }
+    refiles = [h for h in _as_list(options.get("refile_to_sets")) if handle_key(h) not in excl_keys] + new_refile
+    # Only a job that names a re-file carries the key: a drain image older than the option refuses it.
+    if refiles or "refile_to_sets" in options:
+        patch["refile_to_sets"] = refiles
+    done = await write_db.fetch_one(_APPROVE_SQL, {"id": job_id, "by": approved_by,
+                                                   "patch": _dumps(patch), "old": _dumps(options)})
+    return bool(done)
 
 
 async def cancel(job_id: str, *, by: str, reason: str, db: Any = None) -> bool:
