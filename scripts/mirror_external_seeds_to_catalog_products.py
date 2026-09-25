@@ -5,9 +5,33 @@ Mirror active external_product_seeds into catalog_products.
 This is intentionally a narrow bridge for the canonical PDP migration:
   - source table: external_product_seeds
   - destination: catalog_products
-  - identity tuple: (merchant_id='external_seed',
+  - identity tuple: (merchant_id=<per-brand observed seller, merch_obs_*>,
                      platform='external_seed',
                      source_product_id=external_product_id)
+
+CORRECTED 2026-09-11. This block used to say ``merchant_id='external_seed'``. It has
+not been true since ADR-009 D2 moved mirroring onto per-brand observed sellers (see the
+note at the seed_candidates SQL below, and the ``services.seller_identity`` import): the
+forward Path B mirror passes the minted ``merch_obs_*`` seller, and ``MERCHANT_ID`` below
+is only the default for the legacy repair/backfill callers that heal EXISTING sentinel
+rows. Prod bears that out — 11,765 of 11,819 active seeds resolve to a ``merch_obs_*``
+row and ZERO catalog_products rows carry the sentinel.
+
+The stale wording is worth a correction rather than a shrug, because
+``services/seller_identity.py`` names ``external_seed`` as BANNED_BUCKET_MERCHANT_ID —
+"the placeholder bucket ADR-009 D2 bans for new writes". A docstring saying this script
+writes that bucket reads as "running the mirror would mint banned rows", which is the
+opposite of what it does, and is exactly the reading that nearly stopped a legitimate
+run of it.
+
+Two matching-key gotchas, recorded because getting either wrong produces a confident
+wrong answer about how much work is outstanding:
+  - 11,814 of the 11,819 active seeds are ATTACHED, and attach to their catalog row via
+    ``attached_product_key``, not ``source_product_id``. A backlog query that joins only
+    on ``source_product_id`` reports thousands of seeds as unmirrored when none are. It
+    reported 3,671 for me; the true figure is 0, which this script's own
+    ``missing_catalog_products`` counter states directly.
+  - ``external_total`` counts every seed row; only ``external_active`` is mirrorable.
 
 It is idempotent. Dry-run is the default; pass --apply to insert missing
 catalog_products rows. Existing catalog_products rows are not overwritten.

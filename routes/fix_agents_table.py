@@ -1,10 +1,8 @@
 """
-Fix agents table schema - add missing columns
-This endpoint can be called once to update the agents table structure
+Fix agents table schema -- RETIRED (501), see below.
 """
 from fastapi import APIRouter, Depends, HTTPException
 from utils.auth import require_admin_or_key
-from db.database import database
 
 # AUTHENTICATION. Every route on this router was reachable with NO credentials
 # of any kind: no Depends, no header check, no role check. The guard is applied
@@ -14,48 +12,21 @@ from db.database import database
 # JWT and fails closed (401) when neither is present.
 #
 # POST /admin/fix/agents-table ran `DROP TABLE IF EXISTS agents CASCADE`
-# (line 18 below) for an anonymous caller.
+# for an anonymous caller.
 router = APIRouter(prefix="/admin/fix", tags=["admin-fix"], dependencies=[Depends(require_admin_or_key)])
 
+# RETIRED (501). For an admin caller it ran `DROP TABLE IF EXISTS agents CASCADE` -- every agent,
+# and every constraint and view that depends on the table -- then re-created agents in a legacy
+# shape (name, email, company, use_case, status, request_count, ...) that prod's table does not
+# have (probe 2026-09-24: the db/agents.py model's columns plus `email`). The table it left was
+# empty and had no agent_name, agent_type, owner_email, api_key_hash or is_active, so neither
+# self-serve registration (routes/agent_account.py register_agent) nor db/agents.py create_agent
+# could insert an agent into it afterwards. The table is built by metadata.create_all at startup;
+# there is no "fix" to run here.
 @router.post("/agents-table")
 async def fix_agents_table():
-    """
-    Fix the agents table by dropping and recreating with correct schema
-    WARNING: This will delete all existing agents!
-    """
-    try:
-        # Drop the old table
-        await database.execute("DROP TABLE IF EXISTS agents CASCADE")
-        
-        # Create with correct schema
-        await database.execute("""
-            CREATE TABLE agents (
-                agent_id VARCHAR(50) PRIMARY KEY,
-                name VARCHAR(255) NOT NULL,
-                email VARCHAR(255) UNIQUE NOT NULL,
-                company VARCHAR(255),
-                use_case TEXT,
-                api_key VARCHAR(255) UNIQUE,
-                status VARCHAR(50) DEFAULT 'active',
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-                last_active TIMESTAMP WITH TIME ZONE,
-                last_key_rotation TIMESTAMP WITH TIME ZONE,
-                deactivated_at TIMESTAMP WITH TIME ZONE,
-                request_count INTEGER DEFAULT 0,
-                success_rate FLOAT DEFAULT 0,
-                rate_limit INTEGER DEFAULT 1000
-            )
-        """)
-        
-        return {
-            "status": "success",
-            "message": "Agents table recreated with correct schema"
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fix agents table: {str(e)}")
-
-
-
-
-
-
+    """Retired: answers 501 and touches nothing."""
+    raise HTTPException(
+        status_code=501,
+        detail="The agents table fix is retired; the table is built from the db/agents.py model",
+    )

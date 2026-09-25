@@ -4,6 +4,7 @@ Temporary debug endpoint for Agent data verification
 from fastapi import APIRouter, Depends, Header
 from typing import Dict, Any, Optional
 from datetime import datetime
+from db.agents import resolve_active_agent_id
 from db.database import database
 from utils.auth import decode_token
 
@@ -24,7 +25,7 @@ async def check_usage_logs(
         if authorization and authorization.startswith("Bearer "):
             try:
                 payload = decode_token(authorization.split(" ")[1])
-                agent_id = payload.get("agent_id")
+                agent_id = await resolve_active_agent_id(payload.get("agent_id"))
             except:
                 pass
         
@@ -114,7 +115,7 @@ async def check_orders(
         if authorization and authorization.startswith("Bearer "):
             try:
                 payload = decode_token(authorization.split(" ")[1])
-                agent_id = payload.get("agent_id")
+                agent_id = await resolve_active_agent_id(payload.get("agent_id"))
             except:
                 pass
         

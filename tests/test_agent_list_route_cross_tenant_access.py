@@ -118,7 +118,7 @@ def _sqlite_agents_table(
         if col.name not in drop
     ]
     # `add` carries columns the MODEL does not declare but the deployed table
-    # may -- `email`, written by routes/employee_agent_mgmt.py:433. A fixture
+    # may -- `email`, which prod's table carries out-of-band (probe 2026-09-24). A fixture
     # derived from the model alone cannot represent those rows, which is how
     # the first cut of this file was green against the lockout it should have
     # caught.
@@ -245,8 +245,8 @@ def agents_db(monkeypatch) -> _AgentsDbSpy:
 
 @pytest.fixture
 def legacy_agents_db(monkeypatch) -> _AgentsDbSpy:
-    """The shape routes/employee_agent_mgmt.py:433 writes: the address lives in
-    `email`, and owner_email is NULL."""
+    """The shape the retired employee create route wrote (pivota-backend#2305): the
+    address lives in `email`, and owner_email is NULL."""
     from routes import agent_management as mod
 
     spy = _AgentsDbSpy(
@@ -500,10 +500,10 @@ def test_the_refusal_happens_before_the_query(client, agents_db):
 def test_agent_whose_address_lives_in_email_sees_its_own_record(client, legacy_agents_db):
     """The lockout this file could not previously see.
 
-    routes/employee_agent_mgmt.py:433 creates agents with
-    `INSERT INTO agents (agent_id, name, email, ...)` and never writes
-    owner_email. An agent created that way, holding a token with only the email
-    identity, matched nothing when the filter looked only at owner_email -- and
+    The employee create route (retired in pivota-backend#2305) wrote
+    `INSERT INTO agents (agent_id, name, email, ...)` and never wrote
+    owner_email; prod's table does have `email`. An agent whose address lives
+    there, holding a token with only the email identity, matched nothing when the filter looked only at owner_email -- and
     got 200 with an EMPTY list, a silent lockout rather than the detail route's
     explicit 403. The earlier fixture was built from the SQLAlchemy model,
     which has no `email` column, so it could not represent such a row at all.

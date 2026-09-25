@@ -703,3 +703,69 @@ async def test_the_reconciler_repairs_an_order_with_a_null_is_deleted():
     finally:
         await database.execute(
             "DELETE FROM orders WHERE merchant_id = :m", {"m": merchant})
+
+
+@pytest.mark.parametrize(
+    "process_tz,age_seconds,min_age_seconds,expect_candidate",
+    [
+        # Ahead of UTC: a naive `utcnow()` cutoff reads as 8h EARLIER, so a
+        # 6h-old order the alert already pages on was never repaired.
+        ("Asia/Shanghai", 6 * 3600, 60, True),
+        # Behind UTC: the same cutoff reads as 7h LATER, so an order paid 30s
+        # ago — whose own enqueue may still be in flight — was taken as lost.
+        ("America/Los_Angeles", 30, 3600, False),
+    ],
+)
+async def test_the_reconciler_age_cutoff_ignores_the_process_timezone(
+    process_tz, age_seconds, min_age_seconds, expect_candidate
+):
+    """The age cutoff must be the database clock, like the
+    paid_missing_merchant_order_count alert it pairs with. asyncpg encodes a
+    naive datetime bound to a timestamptz as THIS PROCESS's local time, so a
+    Python `utcnow()` cutoff is correct only on a UTC host — which CI and Cloud
+    Run both are, so nothing but a forced TZ makes this reproducible there."""
+    import time
+    from datetime import datetime, timedelta, timezone
+    from sqlalchemy.schema import CreateTable
+    from sqlalchemy.dialects import postgresql
+
+    from db.database import database
+    from db.orders import orders as orders_table
+    from jobs.agentic_commerce_reconciliation import (
+        reconcile_paid_orders_missing_merchant_order,
+    )
+
+    try:
+        await database.execute(
+            str(CreateTable(orders_table).compile(dialect=postgresql.dialect())))
+    except Exception:
+        pass
+
+    merchant = f"merch_tz_{uuid.uuid4().hex[:6]}"
+    order_id = f"ORD_TZ_{uuid.uuid4().hex[:8]}"
+    paid = datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
+    await database.execute(orders_table.insert().values(
+        order_id=order_id, merchant_id=merchant, customer_email="tz@x.test",
+        shipping_address={}, items=[], subtotal=10, total=10, currency="USD",
+        payment_status="paid", status="paid", shopify_order_id=None,
+        metadata={}, is_deleted=False, created_at=paid, paid_at=paid))
+
+    previous_tz = os.environ.get("TZ")
+    os.environ["TZ"] = process_tz
+    time.tzset()
+    try:
+        result = await reconcile_paid_orders_missing_merchant_order(
+            merchant_id=merchant, limit=50, min_age_seconds=min_age_seconds,
+            dry_run=True)
+    finally:
+        if previous_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous_tz
+        time.tzset()
+        await database.execute(
+            "DELETE FROM orders WHERE merchant_id = :m", {"m": merchant})
+
+    assert result["candidates"] == ([order_id] if expect_candidate else []), (
+        f"from a {process_tz} process the lane's cutoff drifted off the database clock"
+    )
