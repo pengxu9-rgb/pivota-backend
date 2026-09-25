@@ -13,7 +13,9 @@ resolve_recent_activity_scope, shared by both):
 
 /agent/metrics/recent also computed `datetime.now() - timestamp`: naive minus aware raises on a
 timestamptz row, and its catch-all answered {"status": "success", "activities": [], "count": 0}
-to every caller. The own-rows assertions below pin that it now serves the row.
+to every caller. The own-rows assertions below pin that it now serves the row. Its rows now also
+carry the fields the agent portal renders (method / endpoint / status_code / response_time_ms and an
+ISO timestamp), as /agent/v1/metrics/recent's do.
 
     DATABASE_URL=postgresql://postgres:postgres@localhost:5432/pivota_key_rotation_test \\
         .venv/bin/python -m pytest tests/test_agent_metrics_recent_auth_postgres.py
@@ -36,7 +38,7 @@ _SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect
 AGENT_A = "agent_recent_auth_pg_a"
 AGENT_B = "agent_recent_auth_pg_b"
 KEYS = {AGENT_A: "ak_live_" + "6" * 64, AGENT_B: "ak_live_" + "7" * 64}
-# Distinct endpoints: the v0 route does not echo agent_id, so a row is identified by its endpoint.
+# Distinct endpoints, so a leak check can match a row even where agent_id is not echoed (a refusal).
 ENDPOINTS = {AGENT_A: "/agent/v1/recent-auth-pg/a", AGENT_B: "/agent/v1/recent-auth-pg/b"}
 REQUEST_IDS = {AGENT_A: "req_recent_auth_pg_a", AGENT_B: "req_recent_auth_pg_b"}
 ROUTES = ["/agent/metrics/recent", "/agent/v1/metrics/recent"]
@@ -168,12 +170,11 @@ async def client():
 
 
 def _seen(resp):
-    """Which of this file's two agents' rows a 200 served (the v0 route has no agent_id field)."""
+    """Which of this file's two agents' rows a 200 served."""
     assert resp.status_code == 200, (resp.status_code, resp.text)
     body = resp.json()
     assert body["status"] == "success", body
-    text = resp.text
-    return {agent_id for agent_id, endpoint in ENDPOINTS.items() if endpoint in text}
+    return {a["agent_id"] for a in body["activities"] if a["agent_id"] in ENDPOINTS}
 
 
 def _assert_leaks_nothing(resp):
@@ -199,12 +200,47 @@ async def test_an_anonymous_caller_is_refused(db, client, path, query):
 async def test_an_agent_key_reads_its_own_rows_only(db, client, path):
     resp = await client.get(path, params={"limit": 100}, headers={"x-api-key": KEYS[AGENT_A]})
     assert _seen(resp) == {AGENT_A}, resp.text
+    assert {a["agent_id"] for a in resp.json()["activities"]} == {AGENT_A}, resp.text
     if path == "/agent/metrics/recent":
         # The timestamptz row survived the "time ago" arithmetic (it used to raise into an empty 200).
-        [row] = [a for a in resp.json()["activities"] if ENDPOINTS[AGENT_A] in a["description"]]
-        assert row["timestamp"] == "Just now", row
-    else:
-        assert {a["agent_id"] for a in resp.json()["activities"]} == {AGENT_A}, resp.text
+        [row] = resp.json()["activities"]
+        assert row["time_ago"] == "Just now", row
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ROUTES)
+async def test_each_activity_carries_the_fields_the_agent_portal_renders(db, client, path):
+    """pivota-agents-portal (app/dashboard/page.tsx, components/pages/LogsPage.tsx) renders
+    event.id / method / endpoint / status_code / response_time_ms and parses event.timestamp as a
+    date. /agent/metrics/recent served type / action / description / response_time and a relative
+    "Just now" timestamp, so every row rendered blank with an Invalid Date."""
+    from datetime import datetime, timedelta, timezone
+
+    resp = await client.get(path, params={"limit": 100}, headers={"x-api-key": KEYS[AGENT_A]})
+    assert resp.status_code == 200, resp.text
+    [row] = resp.json()["activities"]
+    assert row["id"], row
+    assert (row["method"], row["endpoint"], row["status_code"], row["response_time_ms"]) == (
+        "GET", ENDPOINTS[AGENT_A], 200, 42
+    ), row
+    served_at = datetime.fromisoformat(row["timestamp"])
+    assert served_at.tzinfo is not None, row
+    assert abs(datetime.now(timezone.utc) - served_at) < timedelta(minutes=5), row
+
+
+@pytest.mark.asyncio
+async def test_a_row_with_no_status_or_timestamp_does_not_empty_the_list(db, client):
+    """status_code and timestamp are nullable columns; one such row used to raise inside the
+    formatting loop and the route's catch-all answered an empty "success" for the whole page."""
+    await db.execute(
+        "UPDATE agent_usage_logs SET status_code = NULL, timestamp = NULL WHERE request_id = :r",
+        {"r": REQUEST_IDS[AGENT_A]},
+    )
+    resp = await client.get("/agent/metrics/recent", params={"limit": 100}, headers={"x-api-key": KEYS[AGENT_A]})
+    assert resp.status_code == 200, resp.text
+    [row] = resp.json()["activities"]
+    assert row["endpoint"] == ENDPOINTS[AGENT_A], row
+    assert (row["status_code"], row["timestamp"], row["time_ago"], row["status"]) == (None, None, None, "error"), row
 
 
 @pytest.mark.asyncio

@@ -481,27 +481,30 @@ async def get_recent_activity(
         )
         
         # Format activities. agent_usage_logs.timestamp is timestamptz: a naive now() raised on the
-        # first row and the catch-all below answered an empty "success".
+        # first row and the catch-all below answered an empty "success". status_code and timestamp
+        # are nullable, and one row that raised here emptied the whole list the same way.
         now = datetime.now(timezone.utc)
         formatted_activities = []
         for activity in activities:
             timestamp = activity["timestamp"]
-            time_diff = now - timestamp
-            
-            if time_diff.days > 0:
-                time_ago = f"{time_diff.days} days ago"
-            elif time_diff.seconds > 3600:
-                time_ago = f"{time_diff.seconds // 3600} hours ago"
-            elif time_diff.seconds > 60:
-                time_ago = f"{time_diff.seconds // 60} minutes ago"
-            else:
-                time_ago = "Just now"
+            status_code = activity["status_code"]
+            time_ago = None
+            if timestamp is not None:
+                time_diff = now - timestamp
+                if time_diff.days > 0:
+                    time_ago = f"{time_diff.days} days ago"
+                elif time_diff.seconds > 3600:
+                    time_ago = f"{time_diff.seconds // 3600} hours ago"
+                elif time_diff.seconds > 60:
+                    time_ago = f"{time_diff.seconds // 60} minutes ago"
+                else:
+                    time_ago = "Just now"
             
             # Determine activity type from endpoint
             endpoint = activity["endpoint"]
             if "/orders" in endpoint:
                 activity_type = "order"
-                action = "Order Completed" if activity["status_code"] < 300 else "Order Failed"
+                action = "Order Completed" if status_code is not None and status_code < 300 else "Order Failed"
             elif "/catalog/search" in endpoint or "/products" in endpoint:
                 activity_type = "search"
                 action = "Product Search"
@@ -515,14 +518,25 @@ async def get_recent_activity(
                 activity_type = "api"
                 action = f"{activity['method']} {endpoint}"
             
+            # The raw row fields and an ISO timestamp are what the agent portal renders
+            # (pivota-agents-portal: dashboard + LogsPage read method / endpoint / status_code /
+            # response_time_ms and parse `timestamp` as a date), the same fields
+            # /agent/v1/metrics/recent serves. `timestamp` used to be the relative string, now
+            # `time_ago`; nothing read it.
             formatted_activities.append({
                 "id": str(activity["id"]),
+                "agent_id": activity["agent_id"],
+                "method": activity["method"],
+                "endpoint": endpoint,
+                "status_code": status_code,
+                "response_time_ms": activity["response_time_ms"],
+                "timestamp": timestamp.isoformat() if timestamp is not None else None,
+                "time_ago": time_ago,
                 "type": activity_type,
                 "action": action,
-                "description": f"{activity['method']} {endpoint} → {activity['status_code']}",
+                "description": f"{activity['method']} {endpoint} → {status_code}",
                 "response_time": activity["response_time_ms"],
-                "timestamp": time_ago,
-                "status": "success" if activity["status_code"] < 400 else "error"
+                "status": "success" if status_code is not None and status_code < 400 else "error"
             })
         
         return {
