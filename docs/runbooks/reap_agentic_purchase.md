@@ -1097,17 +1097,28 @@ order is simulated. Pivota never sees card data; the script prints hosted URLs a
 What it refuses, before anything is built or sent:
 
 * a `DATABASE_URL` that is not a SQLite **file** or a Postgres on exactly `localhost` /
-  `127.0.0.1` / `::1` (dotted hosts, private IPs, `user@remote`, `?host=` overrides, multi-host
-  lists and host-less URLs all refuse);
+  `127.0.0.1` / `::1` (dotted hosts, private IPs, `user@remote`, more than one `@`,
+  `?host=`/`?hostaddr=`/`?service=` overrides, multi-host lists and host-less URLs all refuse).
+  The full table is `REFUSED_DATABASE_URLS` in the script. The check is repeated as the FIRST
+  statement of every writer (`build_schema`, `seed_rows`, the in-process purchase, the poll loop),
+  against the URL `db.database` actually bound;
 * a Reap base URL — from `--reap-base-url`, your shell's `REAP_API_BASE_URL`, or the env file —
   that is not exactly `https://sandbox.api.reap.global`;
-* egress from the poll process to any host but the sandbox.
+* egress from the poll process to any host but the sandbox;
+* **any command at all while `REAP_API_KEY` is exported in your shell.** A shell key has no
+  provenance (it may be a production key), so it is refused rather than ignored: unset it.
 
-The Reap key is **loaded at runtime** from `~/.config/pivota/reap_sandbox.env` (or
-`$REAP_SANDBOX_ENV`) by `serve` and `poll` only; it is never printed, never written to the state
-file, and `Authorization` is redacted in the call log. `serve` gets an **allowlisted** environment
-(PATH/HOME/locale/proxy/CA vars plus the keys below), so a shell exporting a production
-`DATABASE_URL`, `REDIS_URL`, `SENTRY_DSN` or a Cloud Run marker leaks nothing into the run.
+The Reap key is **loaded at runtime, by `poll`/`run` only, and only from the env file**
+`~/.config/pivota/reap_sandbox.env` (or `$REAP_SANDBOX_ENV`). If that file names a
+`REAP_API_BASE_URL`/`REAP_API_BASE` that is not the sandbox, the key beside it is refused. `serve`
+**never** holds the real key: it makes no Reap call (the routes only write the ledger and the
+scheduler registers no jobs), so it gets a placeholder that is just enough to arm the route. The
+key is never printed, never written to the state file, and `Authorization` is redacted in the
+call log. `serve` and the harness process both run on an **allowlisted** environment
+(PATH/HOME/locale/proxy/CA vars plus the keys below; the harness's own `os.environ` is cleared
+first), so a shell exporting a production `DATABASE_URL`, `REDIS_URL`, `SENTRY_DSN`, a Cloud Run
+marker, or libpq's `PGHOST`/`PGHOSTADDR`/`PGSERVICE`/`PGPASSFILE` (psycopg2 honours `PGHOSTADDR`
+and `PGSERVICE` even beside `host=localhost`) leaks nothing into the run.
 
 ### The commands, in order
 
@@ -1122,11 +1133,33 @@ $PY scripts/ops/reap_local_e2e.py serve
 $PY scripts/ops/reap_local_e2e.py run            # = `purchase` then `poll`
 ```
 
-State lives in `$TMPDIR/pivota-reap-local-e2e/` (`--state-dir` to move it): `local.db`,
-`state.json` (0600), `jwks.json`, `signing_key.pem` (0600). Add `--database-url
-postgresql://localhost/<db>` to `seed` to use a local Postgres instead; the later commands read it
-back from `state.json`. Every Reap call is logged, redacted, to `./reap_local_e2e_<ts>.json`
-(git-ignored; `--reap-log` to choose). The bodies contain the test buyer's address and email.
+State lives in `$TMPDIR/pivota-reap-local-e2e/` (`--state-dir` to move it; with `TMPDIR` unset the
+script refuses rather than fall back to a shared `/tmp`). The directory is created **0700** and
+must be yours: an existing one that is a symlink, someone else's, or has group/other bits is
+refused. Every file in it — `local.db` (created 0600 before anything writes it), `state.json`,
+`jwks.json`, `signing_key.pem` — is 0600, written to a temp file and renamed into place. Relative
+`--state-dir`, `--reap-log` and SQLite paths are resolved against YOUR cwd before the script
+changes into the repo. Every Reap call is logged, redacted, to `./reap_local_e2e_<ts>.json` in
+the directory you ran from (0600, git-ignored; `--reap-log` to choose). The bodies contain the test
+buyer's address and email.
+
+**A local Postgres must be a THROWAWAY database** (`--database-url postgresql://localhost/<db>` on
+`seed`; the later commands read it back from `state.json`). `seed` runs `metadata.create_all` over
+every table `main` registers and then `ensure_required_schema_light`, which issues `CREATE` and
+`ALTER TABLE` statements, and it **deletes rows by key** before inserting its own:
+
+| table | rows deleted |
+|---|---|
+| `catalog_offers` | `offer_id = off_sku::prod::<merchant-id>::shopify::<source-product-id>::v1` |
+| `catalog_skus` | `sku_key = sku::prod::<merchant-id>::shopify::<source-product-id>::v1` |
+| `catalog_products` | `product_key = prod::<merchant-id>::shopify::<source-product-id>` |
+| `catalog_merchants` | `merchant_id = <merchant-id>` (default `m_local_fashionnova`) |
+| `reap_agentic_eligibility` | `merchant_domain = <domain> AND market_country = 'US'` |
+| `reap_agentic_buyer_refs` (with `--seed-enrollment`) | the local buyer's row, and ANY row whose `reap_buyer_ref` is `--buyer-ref` |
+| `reap_agentic_enrollments` (with `--seed-enrollment`) | the row whose `reap_enrollment_id` is the one given |
+
+Never point it at a database whose contents you want to keep — the host check stops a remote
+database, not a local copy of one.
 
 `seed` defaults are the product measured quotable in the sandbox on 2026-09-25 (its index holds
 fashion merchants only): `fashionnova.com`, "Maven Lipstick - Snatched", variant `OS`, $1.98.
@@ -1134,7 +1167,8 @@ fashion merchants only): `fashionnova.com`, "Maven Lipstick - Snatched", variant
 product with no variants), `--price`, `--brand`, `--category` override them.
 
 `serve` sets exactly: `DATABASE_URL` (local), `PIVOTA_ENV=development`, `REAP_AGENTIC_ENABLED=1`,
-`REAP_API_BASE_URL=https://sandbox.api.reap.global`, `REAP_API_KEY` (from the env file),
+`REAP_API_BASE_URL=https://sandbox.api.reap.global`, `REAP_API_KEY` (a **placeholder**, never the
+real key), `serve` refuses any `--host` but loopback,
 `REAP_AGENTIC_SIMULATE_CHECKOUT=COMPLETED`, `AUDIT_WORKER_ENABLED=false` (the scheduler registers
 **no** jobs — the poller is driven by hand), `SKIP_HEAVY_STARTUP_INIT=true`,
 `AGENT_USER_JWKS_FILE` / `AGENT_USER_JWT_ISSUER` / `AGENT_USER_JWT_AUDIENCE` (the local buyer-JWT
@@ -1192,8 +1226,8 @@ On Postgres, a completed row with no edge names the reason in `last_error_code` 
 the hosted-URL allowlist all run), simulates the human (card entry on the 2nd enrollment read,
 approval on the 2nd checkout read), and posts the purchase through the real app in-process with
 the real agent-key and JWT auth. No network, no key; `--fast` (dry run only) shrinks the per-state
-poll intervals to 1 s. `serve --dry-run` boots the server with a placeholder key so the HTTP path
-can be rehearsed: `serve --dry-run`, then `purchase`, then `poll --dry-run`.
+poll intervals to 1 s. Because `serve` never holds the real key, the HTTP path is rehearsed
+without it as `serve`, then `purchase`, then `poll --dry-run`.
 
 ## Tests
 
