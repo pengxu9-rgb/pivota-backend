@@ -14,10 +14,21 @@ absent value as in stock and missed "out of stock" with a space. Unknown stays u
 Measured 2026-09-25 across 12,020 active seeds: the `availability` column is always
 populated (10,636 in_stock / 1,384 out_of_stock), and 272 seeds have a column that an
 explicit variant contradicts (156 column-out/variant-in, 116 the reverse).
+
+THE COLUMN IS THE FRESH FACT; STORED VARIANTS MAY NOT BE. The nightly refresh
+(`routes/employee_products._refresh_external_seed_by_id`) rewrites the column and
+`snapshot.availability` from the page on every successful read, but writes
+`seed_data.availability` only when it is missing and replaces `seed_data.variants` only when
+its overwrite predicates allow. Measured on the live serving image 2026-09-25: 27 accepted
+seeds with column out_of_stock serve an explicit in-stock variant, every one refreshed in the
+same pass, ~20 of them single-variant (column + snapshot out, the lone variant still "in"
+from ingest). So a contradicted column withholds the VARIANTS' booleans too, not only the
+product's — otherwise the stale variant becomes the in-stock claim the gateway card shows.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from utils.availability_vocabulary import IN_STOCK, OUT_OF_STOCK, normalize_availability
@@ -45,13 +56,25 @@ def _stored_variants(seed_data: Dict[str, Any]) -> List[Dict[str, Any]]:
     return []
 
 
-def seed_stock_state(seed_row: Dict[str, Any], seed_data: Dict[str, Any]) -> Optional[bool]:
-    """The seed's OWN product-level stock claim, or None when it makes none.
+@dataclass(frozen=True)
+class SeedStock:
+    """What a seed claims about stock: the product, and whether its variants may speak.
 
-    Precedence: the `availability` column, which every writer stamps as the seed's
-    summary. An explicit variant that CONTRADICTS the column makes the claim unknown
-    rather than picking a side. With no usable column, explicit variants decide (any in
-    -> in, every variant out -> out), then seed_data / snapshot `availability`.
+    `variants_trusted` is False when the fresh column is contradicted by a stored variant:
+    the variants are then the likelier-stale side, so none of them gets a boolean.
+    """
+
+    product: Optional[bool]
+    variants_trusted: bool = True
+
+
+def seed_stock(seed_row: Dict[str, Any], seed_data: Dict[str, Any]) -> SeedStock:
+    """The seed's OWN stock claim.
+
+    Precedence: the `availability` column, which the nightly refresh re-reads from the page.
+    An explicit variant that CONTRADICTS the column makes the product unknown AND withholds
+    every variant's boolean. With no usable column, explicit variants decide (any in -> in,
+    every variant out -> out), then seed_data / snapshot `availability`.
     """
     seed_variants = _stored_variants(seed_data)
     variant_states = [
@@ -69,10 +92,10 @@ def seed_stock_state(seed_row: Dict[str, Any], seed_data: Dict[str, Any]) -> Opt
     column_state = _state(seed_row.get("availability"))
     if column_state is not None:
         if variant_state is not None and variant_state != column_state:
-            return None
-        return column_state
+            return SeedStock(product=None, variants_trusted=False)
+        return SeedStock(product=column_state)
     if variant_state is not None:
-        return variant_state
+        return SeedStock(product=variant_state)
     snapshot = seed_data.get("snapshot")
     for value in (
         seed_data.get("availability"),
@@ -80,29 +103,37 @@ def seed_stock_state(seed_row: Dict[str, Any], seed_data: Dict[str, Any]) -> Opt
     ):
         state = _state(value)
         if state is not None:
-            return state
-    return None
+            return SeedStock(product=state)
+    return SeedStock(product=None)
 
 
-def seed_variant_in_stock(availability: Any, product_state: Optional[bool]) -> bool:
-    """A served variant's stock: its own explicit signal, else the product's claim.
+def seed_variant_stock_fields(availability: Any, stock: Optional[SeedStock]) -> Dict[str, Any]:
+    """A served variant's stock fields: its own explicit signal, else the product's claim.
 
-    A variant with no signal of its own INHERITS the product claim, the same fallback
-    `services/external_seed_audit` applies. Without it, an out-of-stock product served
-    in-stock variants, and the gateway's offer card reads the variant's `in_stock` first.
-    A variant of an unknown product with no signal keeps the builders' pre-existing
-    in-stock default; that default is out of this module's scope.
+    A variant with no signal of its own INHERITS a known product claim, the same fallback
+    `services/external_seed_audit` applies (an out-of-stock product must not serve in-stock
+    variants: the gateway's offer card reads the variant's `in_stock` first). With nothing
+    to go on — an unknown product, or variants the fresh column contradicts — the variant
+    gets no boolean at all, the same `availability: "unknown"` shape as the product.
+    `stock=None` is the live-verification path, which trusts nothing.
     """
-    own = _state(availability)
-    if own is not None:
-        return own
-    if product_state is not None:
-        return product_state
-    return True
+    state: Optional[bool] = None
+    if stock is not None and stock.variants_trusted:
+        state = _state(availability)
+        if state is None:
+            state = stock.product
+    if state is None:
+        return {"availability": "unknown"}
+    return {
+        "inventory_quantity": 999 if state else 0,
+        "in_stock": state,
+        **({"availability": availability} if availability is not None else {}),
+    }
 
 
-def seed_stock_fields(stock_state: Optional[bool]) -> Dict[str, Any]:
+def seed_stock_fields(stock: Optional[SeedStock]) -> Dict[str, Any]:
     """Product-level stock fields for a seed whose catalog facts are trusted."""
+    stock_state = stock.product if stock is not None else None
     if stock_state is True:
         return {"in_stock": True, "inventory_quantity": 999}
     if stock_state is False:

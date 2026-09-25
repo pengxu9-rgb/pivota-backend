@@ -39,9 +39,9 @@ from services.outbound_links_service import (
     TOKEN_MARKET_OBSERVED_KEY,
 )
 from services.external_seed_stock import (
+    seed_stock,
     seed_stock_fields,
-    seed_stock_state,
-    seed_variant_in_stock,
+    seed_variant_stock_fields,
 )
 from services.external_seed_search import (
     dedupe_external_seed_rows,
@@ -363,8 +363,8 @@ async def _build_external_seed_product(
     seed_variants = _seed_variants(seed_data)
     # One rule for both routed builders: services/external_seed_stock. Not computed
     # on the live-verification path, which withholds stock and serves no variants.
-    stock_state = (
-        None if requires_live_verification else seed_stock_state(seed_row, seed_data)
+    stock = (
+        None if requires_live_verification else seed_stock(seed_row, seed_data)
     )
     variants: List[Dict[str, Any]] = []
     seen_variant_ids: set[str] = set()
@@ -386,7 +386,6 @@ async def _build_external_seed_product(
             variant_price = price
 
         availability = v.get("availability")
-        in_stock = seed_variant_in_stock(availability, stock_state)
         image_url = v.get("image_url") or v.get("image")
         if isinstance(image_url, str):
             image_url = image_url.strip() or None
@@ -408,9 +407,7 @@ async def _build_external_seed_product(
                 "title": v.get("title") or v.get("name") or f"Variant {idx + 1}",
                 "price": variant_price,
                 "currency": str(raw_currency or "USD").strip() or "USD",
-                "inventory_quantity": 999 if in_stock else 0,
-                "in_stock": in_stock,
-                **({"availability": availability} if availability is not None else {}),
+                **seed_variant_stock_fields(availability, stock),
                 **({"image_url": image_url} if image_url else {}),
                 **({"options": options} if options else {}),
             }
@@ -418,7 +415,7 @@ async def _build_external_seed_product(
         if len(variants) >= 30:
             break
 
-    stock_fields = seed_stock_fields(stock_state)
+    stock_fields = seed_stock_fields(stock)
     if requires_live_verification:
         variants = []
     elif not variants:
