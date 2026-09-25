@@ -17,10 +17,16 @@ WHAT THIS PINS, on the production dialect, because only Postgres has the lock:
     the lock_timeout instead of waiting, and the next boot heals it;
   * a column missing, no reader -> the heal builds exactly what the bare ALTER built.
 
+EVERY TEST RUNS THE GUARD IN A SCRATCH SCHEMA. The dialect gate runs every
+test_*_postgres.py against ONE shared database, and these tests drop columns and rebuild
+tables. So each test creates `bootlock_<hex>`, and gives the guard (and the tierb helper it
+calls) a pool whose search_path is that schema ALONE: every unqualified name the guard
+creates, alters or resolves through to_regclass lands there, none can fall through to
+`public`, and the schema is dropped afterwards. It also means the guard sees the same empty
+schema locally and in CI.
+
 THIS MODULE MUST NOT IMPORT `main` (the gate runs every test_*_postgres.py in one process;
-see tests/test_merchant_purchasability_postgres.py). It never DROPs `orders`, which the
-gate shares with other files; `merchant_psps` has no other user in the gate, so this file
-owns its shape.
+see tests/test_merchant_purchasability_postgres.py).
 """
 
 from __future__ import annotations
@@ -75,57 +81,62 @@ _MERCHANT_PSPS_HEALED = (
 _ORDERS_HEALED = ("buyer_id", "intent_id", "agent_user_ref", "agent_scoped_buyer_ref")
 
 
+_SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")
+
+
 def _asyncpg_dsn() -> str:
-    return DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://", 1)
+    from db.database import DATABASE_URL as normalized
+
+    return normalized.replace("postgresql+asyncpg://", "postgresql://", 1)
 
 
 @pytest.fixture
-async def _db():
+async def _db(monkeypatch):
+    """A pool pinned to a fresh scratch schema, installed as the guard's `database`."""
+    import uuid
+
+    import asyncpg
+    from databases import Database
     from sqlalchemy.dialects import postgresql
     from sqlalchemy.schema import CreateTable
 
-    from db.database import database
+    import db.schema_guard as sg
+    import db.tierb_cart_link_eligibility_schema as tierb
+    from db.commerce_interactions import commerce_interaction_events, commerce_interactions
+    from db.database import DATABASE_URL as normalized
     from db.orders import orders
 
-    dbname = DATABASE_URL.rsplit("/", 1)[-1].split("?")[0]
-    if not dbname.endswith("_test"):
-        pytest.skip(f"refusing to rebuild merchant_psps in {dbname!r} — throwaway *_test only")
+    if not any(m in DATABASE_URL for m in _SAFE_DB_MARKERS):
+        pytest.skip("throwaway databases only (see _SAFE_DB_MARKERS)")
 
-    was_connected = database.is_connected
-    if not was_connected:
-        await database.connect()
+    schema = f"bootlock_{uuid.uuid4().hex[:12]}"
+    admin = await asyncpg.connect(_asyncpg_dsn())
+    await admin.execute(f"CREATE SCHEMA {schema}")
+    scratch = Database(normalized, server_settings={"search_path": schema})
     try:
-        await database.execute(str(CreateTable(orders).compile(dialect=postgresql.dialect())))
-    except Exception:
-        # Another gate file already built it from the same model. Never DROP it.
-        pass
-    # The guard's commerce_interactions block is not in a try of its own: on a database
-    # without the table its CREATE INDEX raises and abandons every heal after it, orders and
-    # merchant_psps included. Production has the table; build it from the model so the guard
-    # reaches the heals under test (checkfirst: another gate file may have built it already).
-    from sqlalchemy import create_engine
-
-    from db.commerce_interactions import commerce_interaction_events, commerce_interactions
-    from db.database import metadata
-
-    engine = create_engine(_asyncpg_dsn())
-    try:
-        metadata.create_all(
-            engine, tables=[commerce_interactions, commerce_interaction_events], checkfirst=True
-        )
+        await scratch.connect()
+        monkeypatch.setattr(sg, "database", scratch)
+        monkeypatch.setattr(tierb, "database", scratch)
+        assert await scratch.fetch_val("SELECT current_schema()") == schema
+        # The guard's commerce_interactions block is not in a try of its own: without the
+        # table its CREATE INDEX raises and abandons every heal after it, orders and
+        # merchant_psps included. Production has both; build them, and orders, from the
+        # repo's own models.
+        for table in (orders, commerce_interactions, commerce_interaction_events):
+            await scratch.execute(str(CreateTable(table).compile(dialect=postgresql.dialect())))
+        await scratch.execute(_MERCHANT_PSPS_BASE)
+        yield scratch
     finally:
-        engine.dispose()
-    await database.execute("DROP TABLE IF EXISTS merchant_psps")
-    await database.execute(_MERCHANT_PSPS_BASE)
-    yield database
-    if not was_connected and database.is_connected:
-        await database.disconnect()
+        if scratch.is_connected:
+            await scratch.disconnect()
+        await admin.execute(f"DROP SCHEMA {schema} CASCADE")
+        await admin.close()
 
 
 async def _columns(table: str) -> List[Tuple]:
-    from db.database import database
+    import db.schema_guard as sg
 
-    rows = await database.fetch_all(
+    rows = await sg.database.fetch_all(
         """
         SELECT column_name, data_type, character_maximum_length, column_default, is_nullable
         FROM information_schema.columns
@@ -179,6 +190,7 @@ async def _boot_while_a_reader_holds(
 
     import db.schema_guard as sg
 
+    schema = await sg.database.fetch_val("SELECT current_schema()")
     recording = _Recording(sg.database)
     monkeypatch.setattr(sg, "database", recording)
     reader = await asyncpg.connect(_asyncpg_dsn())
@@ -188,7 +200,7 @@ async def _boot_while_a_reader_holds(
     blocked: List[str] = []
     boot = None
     try:
-        await reader.execute(f"LOCK TABLE {table} IN ACCESS SHARE MODE")
+        await reader.execute(f"LOCK TABLE {schema}.{table} IN ACCESS SHARE MODE")
         reader_pid = await reader.fetchval("SELECT pg_backend_pid()")
         started = time.monotonic()
         boot = asyncio.ensure_future(sg.ensure_required_schema_light())
