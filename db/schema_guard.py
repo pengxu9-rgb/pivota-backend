@@ -1522,6 +1522,53 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
+            # Migration 241: merchant_psps.psp_id must satisfy the SAME regex
+            # `orders.psp_id` has enforced since migration 006. Order creation
+            # copies this column into orders.psp_id, so a malformed id written
+            # here is a 500 the merchant only meets at their first sale. Prod
+            # fast mode skips db/migrations/, so own the apply here too.
+            #
+            # NOT VALID: enforce every new INSERT/UPDATE without scanning the
+            # existing rows. A validating ADD would abort startup on the legacy
+            # malformed rows this exists to surface (see
+            # scripts/audit_malformed_psp_ids.py). The IF NOT EXISTS guard keeps
+            # this a no-op after the first boot -- a DROP+ADD every startup would
+            # take an ACCESS EXCLUSIVE lock on a table every checkout reads.
+            #
+            # Its OWN try, and a 500ms lock_timeout, like the mig-237 heals. The
+            # ADD still takes ACCESS EXCLUSIVE on its one run; queued bare behind
+            # a long transaction it would block every reader of merchant_psps
+            # while it waited. And two instances booting together can both pass
+            # the pg_constraint check, so the loser's ADD raises DuplicateObject.
+            # Either failure is retried next boot and must not skip the heals
+            # after this one.
+            try:
+                await database.execute(
+                    text(
+                        """
+                    DO $$
+                    BEGIN
+                      IF to_regclass('merchant_psps') IS NULL THEN
+                        RETURN;
+                      END IF;
+                      IF NOT EXISTS (
+                        SELECT 1
+                          FROM pg_constraint
+                         WHERE conname = 'check_merchant_psps_psp_id_format'
+                           AND conrelid = to_regclass('merchant_psps')
+                      ) THEN
+                        PERFORM set_config('lock_timeout', '500ms', true);
+                        ALTER TABLE merchant_psps
+                          ADD CONSTRAINT check_merchant_psps_psp_id_format
+                          CHECK (psp_id ~* '^psp_[a-z0-9]+_[a-z0-9]{12}$')
+                          NOT VALID;
+                      END IF;
+                    END $$;
+                    """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
             # Multi-use partner invite links (migration 171). Production fast
             # mode skips db/migrations/, so ensure the columns the invite-token
             # service reads/writes (use_count, max_uses) exist at startup —
@@ -1562,6 +1609,109 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
+            # NOTE ON PLACEMENT: this block is deliberately NOT next to the
+            # merchant_psps ADD COLUMN statements above, which is where it
+            # naturally belongs by subject. That seam is where the sibling psp_id
+            # fix (20f4542c, migration 241) also inserts, and two independent
+            # additions at one anchor merge as a CONFLICT whose correct resolution
+            # is a UNION -- precisely the resolution someone drops a block during.
+            # Order does not matter here: the statement is self-guarding on
+            # to_regclass('orders') and touches nothing else in this function.
+            # Migration 242: `orders.psp_used` must accept every provider this
+            # code WRITES. Migration 006 froze the list at five names
+            # ('stripe','adyen','checkout','paypal','braintree'); the code moved
+            # on. `_resolve_active_order_psp` copies merchant_psps.provider into
+            # orders.psp_used, and that column can hold 'antom'
+            # (SUPPORTED_CANONICAL_PSPS) — so onboarding succeeded and then EVERY
+            # order creation 500'd on the CHECK. 'protocol_deferred' is the
+            # capability-gated deferred lane's sentinel and was the same defect a
+            # feature flag away. Prod fast mode skips db/migrations/, so own the
+            # apply here too.
+            #
+            # NOT VALID: enforce every new INSERT/UPDATE without scanning the
+            # existing rows. The new list is a strict superset of 006's, so a
+            # widen cannot fail — but on a database where 006 never ran this is
+            # an ADD, and a validating one would scan years of an unconstrained
+            # vocabulary and abort the boot.
+            #
+            # The definition guard is load-bearing: `orders` is the table every
+            # checkout writes, and an unconditional DROP+ADD would take an ACCESS
+            # EXCLUSIVE lock on it once per instance start. Matching on the two
+            # NEW tokens (rather than the exact text) also re-widens if something
+            # re-narrows the constraint.
+            #
+            # Its OWN try, and a 500ms lock_timeout, for the same two reasons as
+            # the mig-241 block above: an unbounded wait for ACCESS EXCLUSIVE on
+            # `orders` blocks every checkout behind it, and a concurrent boot can
+            # make this DROP/ADD fail. Either way it is retried next boot and the
+            # heals after it still run.
+            try:
+                await database.execute(
+                    text(
+                        """
+                    DO $$
+                    BEGIN
+                      IF to_regclass('orders') IS NULL THEN
+                        RETURN;
+                      END IF;
+                      IF EXISTS (
+                        SELECT 1
+                          FROM pg_constraint
+                         WHERE conname = 'check_psp_used_valid_provider'
+                           AND conrelid = to_regclass('orders')
+                           AND pg_get_constraintdef(oid) LIKE '%antom%'
+                           AND pg_get_constraintdef(oid) LIKE '%protocol_deferred%'
+                      ) THEN
+                        RETURN;
+                      END IF;
+                      PERFORM set_config('lock_timeout', '500ms', true);
+                      ALTER TABLE orders
+                        DROP CONSTRAINT IF EXISTS check_psp_used_valid_provider;
+                      ALTER TABLE orders
+                        ADD CONSTRAINT check_psp_used_valid_provider
+                        CHECK (
+                          psp_used IS NULL OR psp_used IN (
+                            'stripe',
+                            'adyen',
+                            'checkout',
+                            'paypal',
+                            'braintree',
+                            'antom',
+                            'protocol_deferred'
+                          )
+                        )
+                        NOT VALID;
+                      -- Earn the validated status back where it is earnable. In
+                      -- production this constraint is already convalidated=TRUE
+                      -- over a clean 593-row `orders` (measured 2026-09-02), so a
+                      -- bare DROP + ADD NOT VALID would DOWNGRADE a proven
+                      -- invariant to a merely-enforced one. The new list is a
+                      -- strict SUPERSET of the old, so nothing that passed the old
+                      -- one can fail this. Swallowed: a table with genuinely bad
+                      -- rows because 006 never ran keeps it NOT VALID -- still
+                      -- enforcing every new INSERT/UPDATE -- and the boot
+                      -- continues.
+                      --
+                      -- NOT bounded, and NOT a light lock. This VALIDATE runs in
+                      -- the same statement as the DROP/ADD, so it scans `orders`
+                      -- under the ACCESS EXCLUSIVE lock they already hold. A
+                      -- statement_timeout set in here cannot help, because
+                      -- Postgres arms that timer when the statement starts. That
+                      -- is fine at ~593 rows, and it only runs on the one boot
+                      -- that widens the constraint. On a large `orders`, move the
+                      -- VALIDATE into its own statement instead.
+                      BEGIN
+                        ALTER TABLE orders
+                          VALIDATE CONSTRAINT check_psp_used_valid_provider;
+                      EXCEPTION WHEN OTHERS THEN
+                        RAISE NOTICE 'check_psp_used_valid_provider left NOT VALID: %', SQLERRM;
+                      END;
+                    END $$;
+                    """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
             # Merchant portal primary-store selection (migration 089).
             # Production fast mode skips db/migrations/, so keep the
             # critical column and invariant available at startup.

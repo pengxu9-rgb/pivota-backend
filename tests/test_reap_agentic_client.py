@@ -4227,9 +4227,11 @@ def test_an_unknown_source_is_refused_rather_than_defaulted(source, clean_env):
 def test_the_external_branch_is_the_one_that_does_build(clean_env):
     """THE CONTROL for the three refusals above. Without it they would all still pass if the
     builder raised on everything, which is not a client."""
-    body = rc.build_enrollment_request(owner_id="cust_42", return_url=RETURN_URL)
+    body = rc.build_enrollment_request(owner_id="cust_42", return_url=RETURN_URL,
+                                       email="buyer@example.com")
     assert body["source"] == "EXTERNAL"
-    assert body["owner"] == {"type": "CLIENT_REFERENCE", "id": "cust_42"}
+    assert body["owner"] == {"type": "CLIENT_REFERENCE", "id": "cust_42",
+                             "email": "buyer@example.com"}
     assert body["presentation"] == {"type": "REDIRECT", "returnUrl": RETURN_URL}
     assert "cardId" not in json.dumps(body)
 
@@ -4242,16 +4244,26 @@ def test_an_enrollment_body_has_exactly_the_spec_keys(clean_env):
     assert set(body["presentation"]) == {"type", "returnUrl"}
 
 
-def test_an_enrollment_without_an_email_omits_the_key_rather_than_sending_null(clean_env):
-    """`email` is optional in the schema and is real buyer PII. A `null` would be a key we sent
-    to a third party for no reason; absence is the honest encoding of "we did not supply one"."""
-    body = rc.build_enrollment_request(owner_id="cust_42", return_url=RETURN_URL)
-    assert "email" not in body["owner"]
+@pytest.mark.parametrize("email", ["", "   ", None])
+def test_an_enrollment_without_an_email_is_refused_not_defaulted(clean_env, email):
+    """`email` WAS optional. On 2026-09-25 Reap made it a required property of
+    `ClientReferenceOwner` -- inside a `$ref`, with `info.version` still 1.0.0 -- and the differ
+    of the day compared the reference string, so nothing noticed. The builder now refuses rather
+    than omitting the key (the old behaviour) or inventing a value: a body the pinned spec
+    refuses must not be the thing we find out from in production."""
+    with pytest.raises(rc.ReapRequestError) as exc:
+        rc.build_enrollment_request(owner_id="cust_42", return_url=RETURN_URL, email=email)
+    # The GUARD'S message, not the address-shape check's. A mutant that deleted the guard still
+    # refused "" -- as "not an email address", which tells an operator the wrong thing about a
+    # value they never supplied -- and survived a looser assertion.
+    assert "needs the owner's email" in str(exc.value)
 
 
 def test_an_enrollment_needs_an_owner_id(clean_env):
-    with pytest.raises(rc.ReapRequestError):
-        rc.build_enrollment_request(owner_id="  ", return_url=RETURN_URL)
+    with pytest.raises(rc.ReapRequestError) as exc:
+        rc.build_enrollment_request(owner_id="  ", return_url=RETURN_URL,
+                                    email="buyer@example.com")
+    assert "owner id" in str(exc.value)
 
 
 def test_an_unknown_enrollment_field_is_refused_not_dropped(clean_env):
@@ -4405,7 +4417,7 @@ def test_a_response_carrying_a_foreign_hosted_url_is_refused_whole(wire, clean_e
     payload = json.loads(json.dumps(ENROLLMENT_CREATED))
     payload["nextAction"]["url"] = "https://evil.example/enroll/3fa85f64"
     wire.next_payload = payload
-    got = _run(rc.create_enrollment(attempt_id=ATTEMPT_ID, owner_id="cust_42", return_url=RETURN_URL))
+    got = _run(rc.create_enrollment(email="buyer@example.com", attempt_id=ATTEMPT_ID, owner_id="cust_42", return_url=RETURN_URL))
     assert not got.ok
     assert got.error == "hosted_url_not_allowed"
     assert got.data == {}
@@ -4416,7 +4428,7 @@ def test_an_allowed_hosted_url_does_come_through(wire, clean_env):
     """THE CONTROL. Without it, a `_refuse_unsafe_hosted_url` that refused everything would pass
     the test above and break every real call."""
     wire.next_payload = ENROLLMENT_CREATED
-    got = _run(rc.create_enrollment(attempt_id=ATTEMPT_ID, owner_id="cust_42", return_url=RETURN_URL))
+    got = _run(rc.create_enrollment(email="buyer@example.com", attempt_id=ATTEMPT_ID, owner_id="cust_42", return_url=RETURN_URL))
     assert got.ok
     assert got.data["nextAction"]["url"] == "https://pay.prava.space/enroll/3fa85f64"
 
@@ -4543,7 +4555,7 @@ def test_the_enrollment_CREATE_on_that_same_path_does_carry_one(wire, clean_env)
     """THE CONTROL for the test above: if `_headers` never attached a key at all, that test would
     pass and every retried create would mint a second enrollment."""
     wire.next_payload = ENROLLMENT_CREATED
-    _run(rc.create_enrollment(attempt_id=ATTEMPT_ID, owner_id="cust_42", return_url=RETURN_URL))
+    _run(rc.create_enrollment(email="buyer@example.com", attempt_id=ATTEMPT_ID, owner_id="cust_42", return_url=RETURN_URL))
     assert "Idempotency-Key" in wire.calls[0]["headers"]
     assert wire.calls[0]["method"] == "POST"
 
@@ -4772,7 +4784,7 @@ def test_no_call_follows_redirects(wire, clean_env):
     Asserted at the transport rather than by reading the source, and on both verbs, because this
     is a constructor argument and `_post` and `_get` build their own clients."""
     wire.next_payload = ENROLLMENT_CREATED
-    _run(rc.create_enrollment(attempt_id=ATTEMPT_ID, owner_id="cust_42", return_url=RETURN_URL))
+    _run(rc.create_enrollment(email="buyer@example.com", attempt_id=ATTEMPT_ID, owner_id="cust_42", return_url=RETURN_URL))
     wire.next_payload = ENROLLMENT_ACTIVE
     _run(rc.get_enrollment(ENROLLMENT_UUID))
     assert [c["follow_redirects"] for c in wire.calls] == [False, False]
@@ -4791,7 +4803,7 @@ def test_an_enrollment_create_is_a_FAST_path(wire, clean_env):
     """It is not talking to a merchant's commerce layer the way a quote is. Letting the 35 s
     bound leak onto it would put a 35 s hang in a serving path."""
     wire.next_payload = ENROLLMENT_CREATED
-    _run(rc.create_enrollment(attempt_id=ATTEMPT_ID, owner_id="cust_42", return_url=RETURN_URL))
+    _run(rc.create_enrollment(email="buyer@example.com", attempt_id=ATTEMPT_ID, owner_id="cust_42", return_url=RETURN_URL))
     assert wire.calls[0]["timeout"] == rc._DEFAULT_TIMEOUT_S
     assert wire.calls[0]["timeout"] != rc._QUOTE_TIMEOUT_S
 
@@ -4889,8 +4901,8 @@ def test_the_enrollment_key_carries_no_buyer_email(wire, clean_env, monkeypatch)
 def test_a_different_owner_gets_a_different_enrollment_key(wire, clean_env, monkeypatch):
     monkeypatch.setattr(rc.time, "time", lambda: 1_000_000.0)
     wire.next_payload = ENROLLMENT_CREATED
-    _run(rc.create_enrollment(attempt_id=ATTEMPT_ID, owner_id="cust_42", return_url=RETURN_URL))
-    _run(rc.create_enrollment(attempt_id=ATTEMPT_ID, owner_id="cust_99", return_url=RETURN_URL))
+    _run(rc.create_enrollment(email="buyer@example.com", attempt_id=ATTEMPT_ID, owner_id="cust_42", return_url=RETURN_URL))
+    _run(rc.create_enrollment(email="buyer@example.com", attempt_id=ATTEMPT_ID, owner_id="cust_99", return_url=RETURN_URL))
     assert wire.calls[0]["headers"]["Idempotency-Key"] != wire.calls[1]["headers"]["Idempotency-Key"]
 
 
@@ -5055,6 +5067,28 @@ def test_an_unknown_detail_code_gets_None_rather_than_a_guess():
     assert rc.explain_detail_code("") is None
 
 
+def test_the_2026_09_25_conflict_codes_are_explained_from_either_field():
+    """The 409s put their code at `error.code`, where the older 400s put it at
+    `error.detail.code`. Same table, so whichever field carries it the operator gets the move:
+    QUOTE_EXPIRED means re-quote, not retry."""
+    assert "Unrecognised" not in rc.explain_refusal("reap_status_409")
+    assert "QUOTE_EXPIRED" in rc.explain_refusal("reap_status_409")
+    quote = rc.explain_detail_code("QUOTE_EXPIRED")
+    assert quote and "NEW" in quote and "not retry" in quote
+    assert rc.explain_detail_code("IDEMPOTENCY_REQUEST_IN_PROGRESS")
+
+
+def test_the_steps_script_explains_a_code_carried_at_error_code(capsys):
+    """`_report_failure` asked `explain_detail_code` for `error_detail_code` only, so a 409
+    QUOTE_EXPIRED -- code at `error.code`, detail null -- printed the generic 409 paragraph and
+    not the move."""
+    module = _purchase_steps()
+    module._report_failure(rc, rc.ReapResponse(ok=False, status=409, error="reap_status_409",
+                                               error_code="QUOTE_EXPIRED"))
+    out = capsys.readouterr().out
+    assert "request a NEW" in out, out
+
+
 def test_the_two_explainers_stay_separate():
     """`explain_refusal` keeps ONE parameter and returns a string -- the base's signature, with
     four tests pinning it. Widening it to take a detail code would have made those tests assert
@@ -5105,7 +5139,7 @@ def test_the_updated_quote_comes_back_with_a_new_breakdown(wire, clean_env):
 
 def test_enroll_then_poll_then_checkout_reaches_the_paths_in_order(wire, clean_env):
     wire.next_payload = ENROLLMENT_CREATED
-    created = _run(rc.create_enrollment(attempt_id=ATTEMPT_ID, owner_id="cust_42", return_url=RETURN_URL))
+    created = _run(rc.create_enrollment(email="buyer@example.com", attempt_id=ATTEMPT_ID, owner_id="cust_42", return_url=RETURN_URL))
     assert rc.enrollment_state(created.data) == "pending"
     assert rc.hosted_action(created.data)[0].startswith("https://pay.prava.space/")
 
@@ -5145,7 +5179,7 @@ def test_enroll_then_poll_then_checkout_reaches_the_paths_in_order(wire, clean_e
 # people learn to ignore.
 
 SPEC_FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures",
-                            "reap_openapi_agentic_2026_09_17.json")
+                            "reap_openapi_agentic_2026_09_25.json")
 
 
 def _spec():
@@ -5154,8 +5188,12 @@ def _spec():
 
 
 def _request_schema(spec, path, method="post"):
+    """DEREFERENCED, through the differ's own resolver. The fixture keeps `$ref`s as Reap wrote
+    them, and the enrollment owner is one: `ClientReferenceOwner`. A checker that stopped at the
+    reference passed a body with no email against a spec that requires one -- for eight days."""
     op = spec["paths"][path][method]
-    return op["requestBody"]["content"]["application/json"]["schema"]
+    schema = op["requestBody"]["content"]["application/json"]["schema"]
+    return _spec_diff().dereference(schema, spec["components"]["schemas"])
 
 
 def _branches(schema):
@@ -5188,14 +5226,30 @@ def _check_against(schema, body, *, label):
 
 
 def test_the_enrollment_body_validates_against_the_pinned_spec(clean_env):
+    """With an email it passes; without one the builder refuses, AND a body assembled by hand
+    without one fails the pinned spec. The second half is the control that the checker reaches
+    the owner schema through its `$ref` -- before 2026-09-25 it did not, and a body with no
+    email validated against a spec that required one."""
     spec = _spec()
     schema = _request_schema(spec, "/agentic/enrollments")
-    for body in (
-        rc.build_enrollment_request(owner_id="cust_42", return_url=RETURN_URL),
-        rc.build_enrollment_request(owner_id="cust_42", return_url=RETURN_URL,
-                                    email="buyer@example.com"),
-    ):
-        _check_against(schema, body, label="enrollment")
+    body = rc.build_enrollment_request(owner_id="cust_42", return_url=RETURN_URL,
+                                       email="buyer@example.com")
+    _check_against(schema, body, label="enrollment")
+
+    with pytest.raises(rc.ReapRequestError):
+        rc.build_enrollment_request(owner_id="cust_42", return_url=RETURN_URL, email="")
+
+    without = json.loads(json.dumps(body))
+    del without["owner"]["email"]
+    with pytest.raises(AssertionError):
+        _check_against(schema, without, label="enrollment without email")
+
+
+def test_the_pinned_spec_requires_the_enrollment_owner_email():
+    """The 2026-09-25 change, pinned by name: if a re-pin makes `email` optional again, the
+    builder's refusal is stricter than the partner and somebody should read that diff."""
+    owner = _spec()["components"]["schemas"]["ClientReferenceOwner"]
+    assert "email" in owner["required"]
 
 
 def test_the_checkout_body_validates_against_the_pinned_spec(clean_env):
@@ -5509,7 +5563,8 @@ def test_the_diff_script_reports_a_removed_required_field():
     schema["properties"].pop("enrollmentId")
 
     problems = module.diff(pinned, live)
-    assert any("REQUIRED FIELD REMOVED" in p and "enrollmentId" in p for p in problems)
+    assert "POST /agentic/checkouts: request.required - enrollmentId" in problems, problems
+    assert "POST /agentic/checkouts: request.properties - enrollmentId" in problems, problems
     # THE CONTROL: an unchanged spec must diff clean, or "it reported a problem" means nothing.
     assert module.diff(pinned, json.loads(json.dumps(pinned))) == []
 
@@ -5606,9 +5661,9 @@ def test_an_enrollment_key_is_stable_across_a_bucket_edge_for_one_attempt(
         wire, clean_env, monkeypatch):
     wire.next_payload = ENROLLMENT_CREATED
     monkeypatch.setattr(rc.time, "time", lambda: float(BUCKET) - 1.0)
-    _run(rc.create_enrollment(owner_id="cust_42", return_url=RETURN_URL, attempt_id=ATTEMPT_ID))
+    _run(rc.create_enrollment(email="buyer@example.com", owner_id="cust_42", return_url=RETURN_URL, attempt_id=ATTEMPT_ID))
     monkeypatch.setattr(rc.time, "time", lambda: float(BUCKET) + 2.0)
-    _run(rc.create_enrollment(owner_id="cust_42", return_url=RETURN_URL, attempt_id=ATTEMPT_ID))
+    _run(rc.create_enrollment(email="buyer@example.com", owner_id="cust_42", return_url=RETURN_URL, attempt_id=ATTEMPT_ID))
     assert _keys(wire)[0] == _keys(wire)[1]
 
 
@@ -5621,14 +5676,14 @@ def test_a_new_attempt_id_gets_a_new_enrollment(wire, clean_env, monkeypatch):
     would be no way to hand them a working link."""
     wire.next_payload = ENROLLMENT_CREATED
     monkeypatch.setattr(rc.time, "time", lambda: 1_000_000.0)
-    _run(rc.create_enrollment(owner_id="cust_42", return_url=RETURN_URL, attempt_id="attempt-1"))
-    _run(rc.create_enrollment(owner_id="cust_42", return_url=RETURN_URL, attempt_id="attempt-2"))
+    _run(rc.create_enrollment(email="buyer@example.com", owner_id="cust_42", return_url=RETURN_URL, attempt_id="attempt-1"))
+    _run(rc.create_enrollment(email="buyer@example.com", owner_id="cust_42", return_url=RETURN_URL, attempt_id="attempt-2"))
     assert _keys(wire)[0] != _keys(wire)[1]
 
 
 def test_an_enrollment_cannot_be_created_without_an_attempt_id(wire, clean_env):
     with pytest.raises(TypeError):
-        _run(rc.create_enrollment(owner_id="cust_42", return_url=RETURN_URL))
+        _run(rc.create_enrollment(email="buyer@example.com", owner_id="cust_42", return_url=RETURN_URL))
     assert wire.calls == []
 
 
@@ -5637,7 +5692,7 @@ def test_an_attempt_id_is_validated_as_an_opaque_id(wire, clean_env, bad):
     """It reaches a partner inside a header, so it must not be an email or anything else that
     identifies a person, and it must not be unbounded."""
     with pytest.raises(rc.ReapRequestError):
-        _run(rc.create_enrollment(owner_id="cust_42", return_url=RETURN_URL, attempt_id=bad))
+        _run(rc.create_enrollment(email="buyer@example.com", owner_id="cust_42", return_url=RETURN_URL, attempt_id=bad))
     assert wire.calls == []
 
 
@@ -5645,7 +5700,7 @@ def test_the_attempt_id_is_not_sent_in_the_body(wire, clean_env):
     """It is idempotency material, not a field. The schema has no place for it, and Reap drops
     unknown keys silently — so sending it would look exactly like it worked."""
     wire.next_payload = ENROLLMENT_CREATED
-    _run(rc.create_enrollment(owner_id="cust_42", return_url=RETURN_URL, attempt_id=ATTEMPT_ID))
+    _run(rc.create_enrollment(email="buyer@example.com", owner_id="cust_42", return_url=RETURN_URL, attempt_id=ATTEMPT_ID))
     assert set(wire.calls[0]["body"]) == {"source", "owner", "presentation"}
     assert ATTEMPT_ID not in json.dumps(wire.calls[0]["body"])
     # THE CONTROL: it really did reach the key.
@@ -5716,7 +5771,7 @@ def test_a_next_action_that_is_not_an_object_is_refused(wire, clean_env, action)
     payload = json.loads(json.dumps(ENROLLMENT_CREATED))
     payload["nextAction"] = action
     wire.next_payload = payload
-    got = _run(rc.create_enrollment(owner_id="cust_42", return_url=RETURN_URL,
+    got = _run(rc.create_enrollment(email="buyer@example.com", owner_id="cust_42", return_url=RETURN_URL,
                                     attempt_id=ATTEMPT_ID))
     assert not got.ok and got.error == "hosted_url_not_allowed"
 
@@ -5733,7 +5788,7 @@ def test_every_wrapped_call_refuses_a_poisoned_action(wire, clean_env):
     poisoned = json.loads(json.dumps(ENROLLMENT_CREATED))
     poisoned["nextAction"]["url"] = "https://evil.example/x"
     for call in (
-        lambda: rc.create_enrollment(owner_id="c", return_url=RETURN_URL, attempt_id=ATTEMPT_ID),
+        lambda: rc.create_enrollment(email="buyer@example.com", owner_id="c", return_url=RETURN_URL, attempt_id=ATTEMPT_ID),
         lambda: rc.get_enrollment(ENROLLMENT_UUID),
         lambda: rc.list_enrollments(owner_id="c"),
         lambda: rc.create_checkout(quote_id="q", enrollment_id=ENROLLMENT_UUID,
@@ -5799,7 +5854,7 @@ def test_a_crlf_hosted_url_never_reaches_a_buyer(wire, clean_env):
     payload["nextAction"]["url"] = CRLF_HOSTED_URL
     assert rc.hosted_action(payload) is None
     wire.next_payload = payload
-    got = _run(rc.create_enrollment(owner_id="c", return_url=RETURN_URL, attempt_id=ATTEMPT_ID))
+    got = _run(rc.create_enrollment(email="buyer@example.com", owner_id="c", return_url=RETURN_URL, attempt_id=ATTEMPT_ID))
     assert not got.ok and got.error == "hosted_url_not_allowed"
 
 
@@ -5827,7 +5882,7 @@ def test_a_non_redirect_action_refuses_the_whole_response(wire, clean_env):
     payload = json.loads(json.dumps(ENROLLMENT_CREATED))
     payload["nextAction"]["type"] = "REVEAL_PAN"
     wire.next_payload = payload
-    got = _run(rc.create_enrollment(owner_id="c", return_url=RETURN_URL, attempt_id=ATTEMPT_ID))
+    got = _run(rc.create_enrollment(email="buyer@example.com", owner_id="c", return_url=RETURN_URL, attempt_id=ATTEMPT_ID))
     assert not got.ok and got.error == "hosted_url_not_allowed"
 
 
@@ -5927,7 +5982,8 @@ def test_an_owner_id_with_whitespace_or_controls_is_refused(bad, clean_env):
 
 def test_an_ordinary_owner_id_is_still_accepted(clean_env):
     """THE CONTROL."""
-    body = rc.build_enrollment_request(owner_id="cust_42-abc", return_url=RETURN_URL)
+    body = rc.build_enrollment_request(owner_id="cust_42-abc", return_url=RETURN_URL,
+                                       email="buyer@example.com")
     assert body["owner"]["id"] == "cust_42-abc"
 
 
@@ -6079,10 +6135,9 @@ def test_an_inserted_oneOf_branch_does_not_misalign_every_later_branch():
     schema["oneOf"].insert(0, {"type": "object", "properties": {"source": {"type": "string"}},
                                "required": ["source"]})
     problems = module.diff(pinned, live)
-    added = [p for p in problems if "schema branch ADDED" in p or "REQUIRED FIELD" in p]
-    assert added, problems
+    assert any(p.startswith("POST /agentic/enrollments: request.oneOf[0] ADDED") for p in problems), problems
     # The real point: it does NOT claim every pre-existing branch changed.
-    assert sum("REQUIRED FIELD REMOVED" in p for p in problems) <= 1, problems
+    assert not any("required -" in p or "required +" in p for p in problems), problems
 
 
 def _spec_diff():
@@ -6208,7 +6263,7 @@ def test_a_quote_failure_body_is_still_never_read(wire, clean_env):
     lambda: rc.create_checkout(quote_id="f1e2d3c4", enrollment_id=ENROLLMENT_UUID,
                                return_url=RETURN_URL),
     lambda: rc.get_checkout("chk_7f3a"),
-    lambda: rc.create_enrollment(owner_id="c", return_url=RETURN_URL, attempt_id=ATTEMPT_ID),
+    lambda: rc.create_enrollment(email="buyer@example.com", owner_id="c", return_url=RETURN_URL, attempt_id=ATTEMPT_ID),
     lambda: rc.get_enrollment(ENROLLMENT_UUID),
     lambda: rc.list_enrollments(owner_id="c"),
 ])
@@ -6504,7 +6559,8 @@ def test_the_enrollment_BUILDER_refuses_a_hostile_return_url(bad, clean_env):
     tests green while `presentation.returnUrl` became whatever the caller passed. A guard that
     nothing proves is reached is a guard that can be deleted by accident."""
     with pytest.raises(rc.ReapRequestError):
-        rc.build_enrollment_request(owner_id="cust_42", return_url=bad)
+        rc.build_enrollment_request(owner_id="cust_42", return_url=bad,
+                                    email="buyer@example.com")
 
 
 @pytest.mark.parametrize("bad", HOSTILE_RETURN_URLS)
@@ -6519,7 +6575,7 @@ def test_create_enrollment_refuses_a_hostile_return_url_before_egress(bad, wire,
     """At the CALL SITE, with zero transport calls. The builder refusing is necessary; what
     matters operationally is that nothing reaches Reap."""
     with pytest.raises(rc.ReapRequestError):
-        _run(rc.create_enrollment(owner_id="cust_42", return_url=bad, attempt_id=ATTEMPT_ID))
+        _run(rc.create_enrollment(email="buyer@example.com", owner_id="cust_42", return_url=bad, attempt_id=ATTEMPT_ID))
     assert wire.calls == []
 
 
@@ -6535,7 +6591,7 @@ def test_the_return_url_that_reaches_the_wire_is_the_validated_one(wire, clean_e
     """THE CONTROL for all four above, and the positive half of the same claim: a good URL does
     arrive, unchanged, in `presentation.returnUrl`."""
     wire.next_payload = ENROLLMENT_CREATED
-    _run(rc.create_enrollment(owner_id="cust_42", return_url=RETURN_URL, attempt_id=ATTEMPT_ID))
+    _run(rc.create_enrollment(email="buyer@example.com", owner_id="cust_42", return_url=RETURN_URL, attempt_id=ATTEMPT_ID))
     assert wire.calls[0]["body"]["presentation"]["returnUrl"] == RETURN_URL
     wire.next_payload = CHECKOUT_CREATED
     _run(rc.create_checkout(quote_id="f1e2d3c4", enrollment_id=ENROLLMENT_UUID,
@@ -6677,7 +6733,7 @@ def test_a_non_string_id_is_refused_not_coerced(value, wire, clean_env):
 
 def test_a_non_string_attempt_id_is_refused_at_the_call_site(wire, clean_env):
     with pytest.raises(rc.ReapRequestError):
-        _run(rc.create_enrollment(owner_id="c", return_url=RETURN_URL, attempt_id=True))
+        _run(rc.create_enrollment(email="buyer@example.com", owner_id="c", return_url=RETURN_URL, attempt_id=True))
     assert wire.calls == []
 
 
@@ -6841,7 +6897,7 @@ def test_a_malformed_attempt_id_is_a_message_not_a_traceback(tmp_path, bad):
     """N5. The CLIENT validates ids and raises; the script called it unwrapped, so every one of
     these ended in a stack trace. The exception already carries a sentence written for an
     operator — a traceback buries it."""
-    out = _run_steps(tmp_path, "enroll", "--owner-id", "ops-1", "--attempt-id", bad)
+    out = _run_steps(tmp_path, "enroll", "--owner-id", "ops-1", "--email", "ops@example.com", "--attempt-id", bad)
     assert out.returncode == 2, out.stdout + out.stderr
     assert "Traceback" not in out.stderr
     assert "BAD ENROLLMENT ATTEMPT ID" in out.stdout
@@ -6885,7 +6941,7 @@ def test_a_malformed_id_in_the_STATE_FILE_is_a_message(tmp_path):
 def test_the_script_still_runs_with_well_formed_ids(tmp_path):
     """THE CONTROL: validation that refused everything would pass every test above and make the
     script useless. A dry-run enroll with a good attempt id must still reach its dry-run exit."""
-    out = _run_steps(tmp_path, "enroll", "--owner-id", "ops-1", "--attempt-id", "enr-row-1")
+    out = _run_steps(tmp_path, "enroll", "--owner-id", "ops-1", "--email", "ops@example.com", "--attempt-id", "enr-row-1")
     assert out.returncode == 0, out.stdout + out.stderr
     assert "DRY RUN" in out.stdout
 

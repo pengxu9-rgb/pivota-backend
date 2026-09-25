@@ -24,10 +24,23 @@ partner edits their docs teaches people to ignore it. The FIXTURE is what the te
 `test_every_builder_body_validates_against_the_pinned_spec` -- and this script is what an
 operator runs, on a schedule or before a release, to find out whether the fixture is still true.
 
-WHAT IT COMPARES. Only `/agentic/*` paths, and for each operation only the things a client can
-get wrong: the request body schema, the 200 response schema, and the parameter list (name, in,
-required). Descriptions, examples and titles are stripped, because a partner rewording a
-description is not a change we need to react to and a diff that cries wolf is a diff nobody runs.
+WHAT IT COMPARES. Only `/agentic/*` paths, and for each operation everything a client can get
+wrong, DEREFERENCED: the request schema with every `$ref` followed, the schema of EVERY response
+code (not only the 200 -- a new 409 is a new thing the client has to classify), and the
+parameter list with each parameter's schema. Descriptions, examples, titles and summaries are
+stripped, because a partner rewording a description is not a change we need to react to and a
+diff that cries wolf is a diff nobody runs. Everything else -- `required`, `enum`, `const`,
+`properties`, `oneOf`/`anyOf`/`allOf`, `pattern`, `format`, `type` -- is compared, and every
+difference is reported with its path:
+
+    POST /agentic/enrollments: request.oneOf[2].properties.owner.required + email
+
+THE 2026-09-25 LESSON. The first version of this script compared the request body AS A `$ref`
+-- the reference string, not the schema it pointed at -- and only the 200 response. Reap made
+the enrollment owner's `email` required inside `components.schemas.ClientReferenceOwner` and
+added 409 responses on three operations, and the script reported neither: the ref string had
+not changed, and a 409 is not a 200. ~1,900 lines of fixture churn, one line of diff output.
+A pin that is compared through a reference is a pin on the reference.
 
 THE DOCS HOST IS NOT THE API. `docs.reap.global` serves documentation; it takes no credential and
 this script sends none. It never reads `REAP_API_KEY` and never touches `*.api.reap.global`.
@@ -40,7 +53,7 @@ import json
 import os
 import sys
 import urllib.request
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 #: The PUBLIC documentation URL. Not the API. No credential is sent, and none is read: this
 #: script does not look at REAP_API_KEY at all.
@@ -48,11 +61,24 @@ SPEC_URL = "https://docs.reap.global/api-reference/openapi.json"
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 FIXTURE_PATH = os.path.join(
-    _REPO_ROOT, "tests", "fixtures", "reap_openapi_agentic_2026_09_17.json"
+    _REPO_ROOT, "tests", "fixtures", "reap_openapi_agentic_2026_09_25.json"
 )
 
 #: Keys dropped everywhere before comparison. Prose, not contract.
 _NOISE_KEYS = ("description", "summary", "example", "examples", "title", "operationId", "tags")
+
+#: The verbs an OpenAPI path item can carry. Anything else at that level (`parameters`,
+#: `summary`, `servers`, `x-*`) is not an operation.
+_HTTP_METHODS = ("get", "put", "post", "delete", "options", "head", "patch", "trace")
+
+#: Lists whose ORDER is not part of the contract: compared as sets, reported as `+ x` / `- x`.
+_SET_LISTS = ("required", "enum")
+
+#: Lists of alternative schemas. Compared by pairing branches on what they ARE, not where they
+#: sit -- see `_pair_branches`.
+_BRANCH_LISTS = ("oneOf", "anyOf", "allOf")
+
+_COMPONENTS_PREFIX = "#/components/schemas/"
 
 
 def _strip(node: Any) -> Any:
@@ -71,7 +97,7 @@ def _strip(node: Any) -> Any:
 def _refs(node: Any, out: set) -> None:
     if isinstance(node, dict):
         ref = node.get("$ref")
-        if isinstance(ref, str) and ref.startswith("#/components/schemas/"):
+        if isinstance(ref, str) and ref.startswith(_COMPONENTS_PREFIX):
             out.add(ref.rsplit("/", 1)[-1])
         for value in node.values():
             _refs(value, out)
@@ -80,12 +106,56 @@ def _refs(node: Any, out: set) -> None:
             _refs(value, out)
 
 
+def dereference(node: Any, schemas: Dict[str, Any], *, _stack: Tuple[str, ...] = ()) -> Any:
+    """Follow every `#/components/schemas/<name>` reference, recursively, until none is left.
+
+    THE REF STRING IS NOT THE SCHEMA. Comparing `{"$ref": ".../ClientReferenceOwner"}` on both
+    sides says the two documents agree on the NAME of the owner schema; it says nothing about
+    whether `email` became required inside it. That is exactly what happened, and the old
+    reference-as-value comparison reported nothing.
+
+    Cycles are guarded by the chain of names being expanded on THIS path: a schema that refers
+    back to one of its own ancestors is replaced by `{"$cycle": name}` rather than expanded
+    forever. A schema referenced twice from sibling positions is expanded twice, which is what
+    makes the two positions comparable. A reference to a schema the document does not define
+    is kept as `{"$missing": name}` so that it is still a comparable value rather than a crash.
+    Sibling keys next to a `$ref` (OpenAPI 3.1 allows them) are merged over the target.
+    """
+    if isinstance(node, dict):
+        ref = node.get("$ref")
+        if isinstance(ref, str):
+            if not ref.startswith(_COMPONENTS_PREFIX):
+                # Not a schema component. Kept verbatim: it still compares, and a value that
+                # started to point somewhere new is a difference worth seeing.
+                return {k: dereference(v, schemas, _stack=_stack) for k, v in node.items()}
+            name = ref[len(_COMPONENTS_PREFIX):]
+            if name in _stack:
+                return {"$cycle": name}
+            target = schemas.get(name)
+            if target is None:
+                resolved: Any = {"$missing": name}
+            else:
+                resolved = dereference(target, schemas, _stack=_stack + (name,))
+            siblings = {k: dereference(v, schemas, _stack=_stack)
+                        for k, v in node.items() if k != "$ref"}
+            if siblings and isinstance(resolved, dict):
+                merged = dict(resolved)
+                merged.update(siblings)
+                return merged
+            return resolved
+        return {k: dereference(v, schemas, _stack=_stack) for k, v in node.items()}
+    if isinstance(node, list):
+        return [dereference(v, schemas, _stack=_stack) for v in node]
+    return node
+
+
 def extract_agentic(spec: Dict[str, Any]) -> Dict[str, Any]:
     """The `/agentic/*` paths plus, TRANSITIVELY, every component schema they reference.
 
     Transitively, because a `$ref` that resolves to a schema we did not pin would let the thing
     the ref points at change while the pin stayed byte-identical -- the pin would be true and
-    useless at the same time.
+    useless at the same time. The fixture keeps the refs as written; `dereference` follows them
+    at comparison time, on both sides.
     """
     paths = {k: v for k, v in (spec.get("paths") or {}).items() if k.startswith("/agentic/")}
     schemas = spec.get("components", {}).get("schemas", {}) or {}
@@ -110,26 +180,213 @@ def extract_agentic(spec: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _media_schemas(holder: Optional[Dict[str, Any]], schemas: Dict[str, Any]) -> Dict[str, Any]:
+    """`content.<media type>.schema`, dereferenced and stripped, for every media type."""
+    out: Dict[str, Any] = {}
+    for media, entry in ((holder or {}).get("content") or {}).items():
+        if isinstance(entry, dict):
+            out[str(media)] = _strip(dereference(entry.get("schema"), schemas))
+    return out
+
+
 def _operations(subset: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-    """`"POST /agentic/checkouts"` -> the three things a client can get wrong."""
+    """`"POST /agentic/checkouts"` -> everything a client can get wrong, fully dereferenced.
+
+    `request` is the `application/json` request schema (the one we send); any other media type
+    the operation accepts sits under `request_media` so it is still compared. `responses` is
+    keyed by status code -- EVERY code, because a response code that appears is a response the
+    client has never classified.
+    """
+    schemas = (subset.get("components") or {}).get("schemas") or {}
     out: Dict[str, Dict[str, Any]] = {}
     for path, item in (subset.get("paths") or {}).items():
-        for method, op in (item or {}).items():
-            if not isinstance(op, dict):
+        if not isinstance(item, dict):
+            continue
+        shared_params = [p for p in (item.get("parameters") or []) if isinstance(p, dict)]
+        for method, op in item.items():
+            if method not in _HTTP_METHODS or not isinstance(op, dict):
                 continue
-            body = (((op.get("requestBody") or {}).get("content") or {})
-                    .get("application/json") or {}).get("schema")
-            ok = (((op.get("responses") or {}).get("200") or {}).get("content") or {})
-            ok = (ok.get("application/json") or {}).get("schema")
+            body = op.get("requestBody") if isinstance(op.get("requestBody"), dict) else None
+            request_media = _media_schemas(body, schemas)
+            responses: Dict[str, Any] = {}
+            for code, response in (op.get("responses") or {}).items():
+                if not isinstance(response, dict):
+                    continue
+                media = _media_schemas(response, schemas)
+                responses[str(code)] = {
+                    "content": media,
+                    "headers": _strip(dereference(response.get("headers"), schemas)),
+                }
+            parameters: List[Dict[str, Any]] = []
+            for p in shared_params + [q for q in (op.get("parameters") or [])
+                                      if isinstance(q, dict)]:
+                p = dereference(p, schemas)
+                parameters.append({
+                    "name": str(p.get("name")),
+                    "in": str(p.get("in")),
+                    "required": bool(p.get("required")),
+                    "schema": _strip(p.get("schema")),
+                })
+            parameters.sort(key=lambda p: (p["in"], p["name"]))
             out[f"{method.upper()} {path}"] = {
-                "parameters": sorted(
-                    (str(p.get("name")), str(p.get("in")), bool(p.get("required")))
-                    for p in (op.get("parameters") or []) if isinstance(p, dict)
-                ),
-                "requestBody": _strip(body),
-                "response200": _strip(ok),
+                "parameters": parameters,
+                "request": request_media.pop("application/json", None),
+                "request_media": request_media,
+                "request_required": bool((body or {}).get("required")),
+                "responses": responses,
             }
     return out
+
+
+# --- the structural walk ------------------------------------------------------------------------
+
+
+def _consts(node: Any, out: List[str]) -> None:
+    if isinstance(node, dict):
+        if "const" in node:
+            out.append(json.dumps(node["const"], sort_keys=True))
+        for value in node.values():
+            _consts(value, out)
+    elif isinstance(node, list):
+        for value in node:
+            _consts(value, out)
+
+
+def _branch_identity(node: Any) -> str:
+    """Name a schema branch by WHAT IT IS, not by where it sits in the list.
+
+    A positional label (`oneOf[1]`) is not an identity: inserting one branch at the front --
+    which is exactly what a partner does when they add an enrollment source -- renumbers every
+    branch after it, and a positional diff then reports a change on each of them while the one
+    real difference scrolls past. The property-name set plus the `const` values inside the
+    branch is stable under insertion and reordering: `{source,cardId}` alone is shared by
+    REAP_CARD and BIN_SPONSOR, and the error-response branches are all `{error}`, so the consts
+    are what tell those apart.
+    """
+    if isinstance(node, dict):
+        names = sorted(node["properties"]) if isinstance(node.get("properties"), dict) else []
+        consts: List[str] = []
+        _consts(node, consts)
+        if names and consts:
+            return "{" + ",".join(names) + "}=" + "|".join(sorted(set(consts)))
+        if names:
+            return "{" + ",".join(names) + "}"
+        if consts:
+            return "|".join(sorted(set(consts)))
+        return json.dumps(node, sort_keys=True)
+    return json.dumps(node, sort_keys=True)
+
+
+def _parameter_identity(node: Any) -> str:
+    """A parameter is the same parameter when it has the same name in the same place."""
+    if isinstance(node, dict):
+        return f"{node.get('in')}:{node.get('name')}"
+    return json.dumps(node, sort_keys=True)
+
+
+def _pair_branches(old: Sequence[Any], new: Sequence[Any], identity=_branch_identity):
+    """Pairs `(old_index, new_index)`, then unmatched old indexes, then unmatched new indexes.
+
+    Two passes. Pass one pairs branches whose identity is equal, which survives insertion and
+    reordering; identities are NOT unique, so it is a multiset match against a list of unclaimed
+    branches. Pass two pairs whatever is left IN ORDER, because a branch that gained or lost a
+    property has a different identity on each side while still being the same branch -- that is
+    the `enrollmentId` case, and reporting it as one removal plus one addition would lose the
+    field name, which is the whole reason this exists.
+    """
+    unclaimed = list(range(len(new)))
+    pairs: List[Tuple[int, int]] = []
+    leftover_old: List[int] = []
+    for i, branch in enumerate(old):
+        ident = identity(branch)
+        for pos, j in enumerate(unclaimed):
+            if identity(new[j]) == ident:
+                pairs.append((i, j))
+                unclaimed.pop(pos)
+                break
+        else:
+            leftover_old.append(i)
+    while leftover_old and unclaimed:
+        pairs.append((leftover_old.pop(0), unclaimed.pop(0)))
+    return pairs, leftover_old, unclaimed
+
+
+def _shape(node: Any) -> Optional[str]:
+    """`oneOf` / `anyOf` / `allOf` for a schema that is a list of alternatives, else None. The
+    KIND only, never the count: a branch inserted into an existing `oneOf` is a branch diff, not
+    a shape change. The 2026-09-25 spec turned twelve single-object error responses into an
+    `anyOf` of per-code shapes; reported key by key that is four lines per operation
+    (`- properties`, `- required`, `- type`, `+ anyOf`), and none of the four says what the new
+    alternatives ARE."""
+    if isinstance(node, dict):
+        for key in _BRANCH_LISTS:
+            if isinstance(node.get(key), list):
+                return key
+    return None
+
+
+def _describe(node: Any) -> str:
+    """One line for a whole subtree: the branch identity, or the identities of each alternative."""
+    key = _shape(node)
+    if key:
+        return f"{key}[" + ", ".join(_branch_identity(b) for b in node[key]) + "]"
+    return _branch_identity(node)
+
+
+def _short(value: Any) -> str:
+    text = json.dumps(value, sort_keys=True)
+    return text if len(text) <= 80 else text[:77] + "..."
+
+
+def _join(path: str, key: str) -> str:
+    return f"{path}.{key}" if path else key
+
+
+def _walk(old: Any, new: Any, path: str, out: List[str]) -> None:
+    """Every difference between two stripped, dereferenced values, each with its path."""
+    if old == new:
+        return
+    if isinstance(old, dict) and isinstance(new, dict):
+        if _shape(old) != _shape(new):
+            # An object became a list of alternatives (or the reverse). One line naming both
+            # sides beats four lines of removed and added keys that name neither.
+            out.append(f"{path}: {_describe(old)} -> {_describe(new)}")
+            return
+        for key in sorted(set(old) - set(new)):
+            out.append(f"{path} - {key}" if path else f"- {key}")
+        for key in sorted(set(new) - set(old)):
+            what = _describe(new[key]) if isinstance(new[key], dict) else ""
+            suffix = f" ({what})" if what and not what.startswith(("{}", "{\"")) else ""
+            out.append((f"{path} + {key}" if path else f"+ {key}") + suffix)
+        for key in sorted(set(old) & set(new)):
+            _walk(old[key], new[key], _join(path, str(key)), out)
+        return
+    if isinstance(old, list) and isinstance(new, list):
+        leaf = path.rsplit(".", 1)[-1]
+        if leaf in _SET_LISTS and all(not isinstance(v, (dict, list)) for v in old + new):
+            for value in sorted(set(old) - set(new), key=str):
+                out.append(f"{path} - {value}")
+            for value in sorted(set(new) - set(old), key=str):
+                out.append(f"{path} + {value}")
+            return
+        if leaf in _BRANCH_LISTS or leaf == "parameters":
+            identity = _parameter_identity if leaf == "parameters" else _branch_identity
+            pairs, gone, added = _pair_branches(old, new, identity)
+            for i in gone:
+                out.append(f"{path}[{i}] REMOVED: {identity(old[i])}")
+            for j in added:
+                out.append(f"{path}[{j}] ADDED: {identity(new[j])}")
+            for i, j in sorted(pairs, key=lambda p: p[1]):
+                _walk(old[i], new[j], f"{path}[{j}]", out)
+            return
+        for i in range(min(len(old), len(new))):
+            _walk(old[i], new[i], f"{path}[{i}]", out)
+        for i in range(len(new), len(old)):
+            out.append(f"{path}[{i}] REMOVED: {_short(old[i])}")
+        for i in range(len(old), len(new)):
+            out.append(f"{path}[{i}] ADDED: {_short(new[i])}")
+        return
+    out.append(f"{path}: {_short(old)} -> {_short(new)}")
 
 
 def diff(pinned: Dict[str, Any], live: Dict[str, Any]) -> List[str]:
@@ -148,95 +405,14 @@ def diff(pinned: Dict[str, Any], live: Dict[str, Any]) -> List[str]:
         problems.append(f"operation added: {added}")
 
     for name in sorted(set(old) & set(new)):
-        for field in ("parameters", "requestBody", "response200"):
-            if old[name][field] == new[name][field]:
-                continue
-            problems.append(f"{name}: {field} changed")
-            if field == "requestBody":
-                # Named explicitly: a required request field appearing or disappearing is the
-                # exact failure this script was built for, and "requestBody changed" buries it.
-                for line in _required_delta(old[name][field], new[name][field]):
-                    problems.append(f"    {line}")
+        lines: List[str] = []
+        _walk(old[name], new[name], "", lines)
+        for line in lines:
+            problems.append(f"{name}: {line}")
     return problems
 
 
-def _required_delta(old: Any, new: Any) -> List[str]:
-    """Required-key changes across a schema, including inside a `oneOf`."""
-    def branch_identity(node: Any, fallback: str) -> str:
-        """Name a schema branch by WHAT IT IS, not by where it sits in the list.
-
-        A positional label (`oneOf[1]`) is not an identity: inserting one branch at the front --
-        which is exactly what a partner does when they add an enrollment source -- renumbers
-        every branch after it, and the diff then reports a required-field change on each of them
-        while the one real difference scrolls past. The property-name set is stable under
-        insertion, reordering and renaming of the branch itself, and it changes only when the
-        branch's shape changes, which is the thing worth reporting.
-        """
-        if isinstance(node, dict) and isinstance(node.get("properties"), dict):
-            names = ",".join(sorted(node["properties"]))
-            if names:
-                return f"{{{names}}}"
-        return fallback
-
-    def required_sets(node: Any, out: List[Tuple[str, frozenset]], label: str = "") -> None:
-        if isinstance(node, dict):
-            if isinstance(node.get("required"), list):
-                out.append((branch_identity(node, label or "<body>"),
-                            frozenset(str(r) for r in node["required"])))
-            for branch in ("oneOf", "anyOf", "allOf"):
-                for i, sub in enumerate(node.get(branch) or []):
-                    required_sets(sub, out, f"{label}{branch}[{i}]")
-        return None
-
-    before: List[Tuple[str, frozenset]] = []
-    after: List[Tuple[str, frozenset]] = []
-    required_sets(old, before)
-    required_sets(new, after)
-
-    # MATCHED BY IDENTITY, NOT BY POSITION. `zip` lined the two lists up by index, so inserting
-    # one `oneOf` branch -- exactly what a partner does when they add an enrollment source --
-    # shifted every branch after it and reported a required-field change on each, burying the one
-    # real difference in a wall of noise.
-    #
-    # Two passes, and the second matters as much as the first. Pass one pairs branches whose
-    # property sets are identical, which survives insertion and reordering. Note that identities
-    # are NOT unique -- REAP_CARD and BIN_SPONSOR both have exactly {source, cardId} -- so this
-    # is a multiset match against a list of unclaimed branches, not a dict lookup, which would
-    # have silently dropped one of the two. Pass two pairs whatever is left IN ORDER, because a
-    # branch that gained or lost a property has a different identity on each side while still
-    # being the same branch: that is the `enrollmentId` case, and reporting it as one removal
-    # plus one addition would lose the field name, which is the whole reason this exists.
-    unclaimed = list(after)
-    pairs: List[Tuple[str, frozenset, frozenset]] = []
-    leftover_old: List[Tuple[str, frozenset]] = []
-    for label, was in before:
-        for i, (other_label, now) in enumerate(unclaimed):
-            if other_label == label:
-                pairs.append((label, was, now))
-                unclaimed.pop(i)
-                break
-        else:
-            leftover_old.append((label, was))
-
-    lines: List[str] = []
-    while leftover_old and unclaimed:
-        label, was = leftover_old.pop(0)
-        _, now = unclaimed.pop(0)
-        pairs.append((label, was, now))
-    for label, was in leftover_old:
-        lines.append(f"schema branch REMOVED: {label} (was required: {sorted(was)})")
-    for label, now in unclaimed:
-        lines.append(f"schema branch ADDED: {label} (required: {sorted(now)})")
-
-    for label, was, now in pairs:
-        for key in sorted(was - now):
-            lines.append(f"REQUIRED FIELD REMOVED from {label}: {key}")
-        for key in sorted(now - was):
-            lines.append(f"REQUIRED FIELD ADDED to {label}: {key}")
-    return lines
-
-
-#: The published spec is ~1.7 MB. 8 MiB is far clear of that and still bounded: `response.read()`
+#: The published spec is ~1.9 MB. 8 MiB is far clear of that and still bounded: `response.read()`
 #: with no argument reads whatever the host sends, and this script is pointed at a URL an operator
 #: can override.
 MAX_SPEC_BYTES = 8 * 1024 * 1024

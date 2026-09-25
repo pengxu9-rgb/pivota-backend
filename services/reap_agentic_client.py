@@ -2694,6 +2694,14 @@ REFUSAL_EXPLANATIONS: List[Tuple[str, str]] = [
     ("unparseable_response",
      "A 2xx whose body was not JSON. Unverifiable rather than failed: we do not know what the\n"
      "other end did. On a create, retry inside the same idempotency window."),
+    # --- 2026-09-25 spec re-pin: the 409s -------------------------------------------------
+    ("reap_status_409",
+     "A CONFLICT with the state of the thing being acted on, not a malformed request. Since the\n"
+     "2026-09-25 spec the code is at `error.code` (NOT `error.detail.code`): ENROLLMENT_NOT_ACTIVE\n"
+     "(checkout create / revoke; `detail.reason` says CARD_NOT_CAPTURED), QUOTE_EXPIRED (checkout\n"
+     "create, quote, shipping-option: re-quote, do not retry the create), VARIANT_UNAVAILABLE\n"
+     "(quote) and IDEMPOTENCY_REQUEST_IN_PROGRESS (a retry overtook the original; wait for it).\n"
+     "Pass `error_code` to `explain_detail_code` for the per-code move."),
 ]
 
 #: `error.detail.code` -> what to DO about it, for the enrollment and checkout legs.
@@ -2707,6 +2715,15 @@ DETAIL_CODE_EXPLANATIONS: List[Tuple[str, str]] = [
      "The enrollment is not ACTIVE, so there is no card to charge. The buyer has not finished\n"
      "the hosted card page, or it expired. Poll the enrollment; if it is `pending`, send them\n"
      "back to its `nextAction.url`. Creating the checkout again will not help."),
+    # Since the 2026-09-25 spec these arrive on a 409 at `error.code`, not `error.detail.code`.
+    # Same table on purpose: the question ("what do I do about this code") is the same
+    # whichever field the partner put it in, and `_report_failure` asks it for both.
+    ("QUOTE_EXPIRED",
+     "The quote is dead (about five minutes). Do not retry the checkout create: request a NEW\n"
+     "quote and create the checkout from that one, inside its window."),
+    ("IDEMPOTENCY_REQUEST_IN_PROGRESS",
+     "A request with this Idempotency-Key is still being processed -- a retry overtook the\n"
+     "original. Nothing to fix: wait for the first request to finish, then read the resource."),
 ]
 
 
@@ -2758,7 +2775,7 @@ def explain_refusal(reason: Optional[str]) -> str:
 # THE SHAPE CHANGED UNDER US. Checkout creation no longer takes an `owner` block -- the owner is
 # now carried by the enrollment, and `enrollmentId` replaced it. `info.version` is still 1.0.0,
 # so the document gives no signal that anything moved. That is the whole reason
-# `tests/fixtures/reap_openapi_agentic_2026_09_17.json` and `scripts/ops/reap_spec_diff.py`
+# `tests/fixtures/reap_openapi_agentic_2026_09_25.json` and `scripts/ops/reap_spec_diff.py`
 # exist: the spec is pinned to a file in this repo, and a difference is a failing diff rather
 # than a 400 in production.
 
@@ -3050,9 +3067,15 @@ def build_enrollment_request(
     -- and this module must not be the place someone accidentally reopens it. A default would
     have been a suggestion; this is a wall.
 
-    `email` is optional and prefills the hosted page. It is real buyer PII crossing to a third
-    party, so it is included only when a caller passes it, and it is deliberately NOT part of
-    the idempotency key.
+    `email` is REQUIRED: the `None` default exists only so that leaving it out is a
+    `ReapRequestError` -- the refusal every other invalid input gets, printed by the ops script
+    as REFUSED BEFORE EGRESS -- rather than a TypeError. It was optional until 2026-09-25, when
+    Reap made it a required property of `ClientReferenceOwner` -- inside a `$ref`, with
+    `info.version` still 1.0.0, and invisible to the spec differ of the day. It is real buyer PII crossing to a third party, so
+    it is validated for shape before it goes and it is deliberately NOT part of the idempotency
+    key. A missing or empty email RAISES rather than defaulting or omitting the key: Reap accepts
+    a body silently in some places and rejects it in others, and a body we already know the spec
+    refuses must not be the thing we find out from.
     """
     wanted = str(source or "").strip().upper()
     if wanted in _CARD_ISSUANCE_SOURCES:
@@ -3094,16 +3117,20 @@ def build_enrollment_request(
     if email is not None and not isinstance(email, str):
         raise ReapRequestError(f"enrollment owner email must be a string, got {type(email).__name__}")
     address = (email or "").strip()
-    if address:
-        # `"@" in address` accepted `a@b@c`, `@b.com`, `a@` and `" a@b.com "` -- a check that
-        # fires on nothing a caller is likely to get wrong. This is still not RFC validation and
-        # is not trying to be: it is the set of shapes that are definitely not an address, and
-        # the address itself is REAL BUYER PII being prefilled onto a third party's page.
-        local, _, domain = address.partition("@")
-        if (address.count("@") != 1 or not local or not domain or "." not in domain
-                or _URL_FORBIDDEN_CHARS.search(address)):
-            raise ReapRequestError("enrollment owner email is not an email address")
-        owner["email"] = address
+    if not address:
+        # Required by the spec since 2026-09-25 (`ClientReferenceOwner.required` gained `email`).
+        # Not defaulted and not omitted: an enrollment without an owner email is a body the
+        # pinned spec refuses, and this builder is the last place that can say so before egress.
+        raise ReapRequestError("an enrollment needs the owner's email (required by Reap's spec)")
+    # `"@" in address` accepted `a@b@c`, `@b.com`, `a@` and `" a@b.com "` -- a check that
+    # fires on nothing a caller is likely to get wrong. This is still not RFC validation and
+    # is not trying to be: it is the set of shapes that are definitely not an address, and
+    # the address itself is REAL BUYER PII being prefilled onto a third party's page.
+    local, _, domain = address.partition("@")
+    if (address.count("@") != 1 or not local or not domain or "." not in domain
+            or _URL_FORBIDDEN_CHARS.search(address)):
+        raise ReapRequestError("enrollment owner email is not an email address")
+    owner["email"] = address
     return {
         "source": "EXTERNAL",
         "owner": owner,
@@ -3164,7 +3191,7 @@ async def create_enrollment(
     owner_id: str,
     return_url: str,
     attempt_id: str,
-    email: Optional[str] = None,
+    email: str,
     timeout_seconds: Optional[float] = None,
 ) -> ReapResponse:
     """Start a hosted card-entry flow. Returns an enrollment whose `nextAction.url` a HUMAN opens.
@@ -3182,6 +3209,10 @@ async def create_enrollment(
     the decision about what counts as a retry. It is validated as an opaque id: it is ours, but
     it reaches a partner inside a header, and it must not be an email or anything else that
     identifies a person.
+
+    `email` is required (spec, 2026-09-25); the builder raises `ReapRequestError` on an empty
+    one BEFORE anything is sent, so a caller that cannot supply it must refuse earlier still --
+    see `_resolving_to_enrollment` in the purchase service.
 
     Fast path: the enrollment create is not talking to a merchant's commerce layer the way a
     quote is, so it keeps the default timeout rather than the 35 s quote bound.
@@ -3208,7 +3239,7 @@ async def revoke_enrollment(
 ) -> ReapResponse:
     """`POST /agentic/enrollments/{id}/revoke` — tell Reap to stop honouring this card.
 
-    WP4c ADDED THIS BECAUSE THE SPEC HAS IT. `tests/fixtures/reap_openapi_agentic_2026_09_17.json`
+    WP4c ADDED THIS BECAUSE THE SPEC HAS IT. `tests/fixtures/reap_openapi_agentic_2026_09_25.json`
     carries `revokeEnrollment_agentic` on this path, taking the id and the `Reap-Version` header
     and no body. Before WP4c the runbook's orphan section said flatly that "the enrollment at
     Reap is never revoked" — we stop using it and never tell Reap to stop honouring it. This is
