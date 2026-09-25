@@ -1654,26 +1654,12 @@ async def startup():
         
         # Create integration tables
         try:
-            # Create agents table if not exists
-            await database.execute("""
-                CREATE TABLE IF NOT EXISTS agents (
-                    agent_id VARCHAR(50) PRIMARY KEY,
-                    name VARCHAR(255) NOT NULL,
-                    email VARCHAR(255) UNIQUE NOT NULL,
-                    company VARCHAR(255),
-                    use_case TEXT,
-                    api_key VARCHAR(255) UNIQUE,
-                    status VARCHAR(50) DEFAULT 'active',
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    last_active TIMESTAMP WITH TIME ZONE,
-                    last_key_rotation TIMESTAMP WITH TIME ZONE,
-                    deactivated_at TIMESTAMP WITH TIME ZONE,
-                    request_count INTEGER DEFAULT 0,
-                    success_rate FLOAT DEFAULT 0,
-                    rate_limit INTEGER DEFAULT 1000
-                )
-            """)
-            
+            # No agents DDL here: metadata.create_all above builds agents from the db/agents.py
+            # model (registered by the time main is imported), so a raw CREATE TABLE IF NOT EXISTS
+            # at this point never creates anything. The one that stood here described a legacy
+            # table (name, company, use_case, status, request_count) that prod never had, and was
+            # what routes written against those columns were built from (see pivota-backend#2305).
+
             # Fix missing columns in agents table (2024-10-30)
             logger.info("🔧 Applying database fixes for agents table...")
             try:
