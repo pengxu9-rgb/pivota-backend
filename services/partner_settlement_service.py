@@ -564,12 +564,11 @@ async def approve_payout(payout_id: int, approved_by: str) -> None:
 
     agent_payout_columns = await _table_columns("agent_payouts")
     assignments = ["status = 'approved'"]
-    values: dict[str, Any] = {
-        "payout_id": payout_id,
-        "approved_by": approved_by,
-    }
+    values: dict[str, Any] = {"payout_id": payout_id}
     if "approved_by" in agent_payout_columns:
         assignments.append("approved_by = :approved_by")
+        # Bound only when referenced: `databases` .bindparams() raises on an unused key.
+        values["approved_by"] = approved_by
     if "approved_at" in agent_payout_columns:
         assignments.append(f"approved_at = {_now_sql()}")
 
