@@ -118,10 +118,11 @@ async def eligibility_db():
 
 def test_the_repo_merchant_list_loads_and_matches_the_measured_population():
     merchants = load_merchants()
-    assert len(merchants) == 40
-    assert len({(m.domain, m.market) for m in merchants}) == 40
+    # 40 measured on 2026-09-18, plus the rows in _ADDED_AFTER_POPULATION.
+    assert len(merchants) == 41
+    assert len({(m.domain, m.market) for m in merchants}) == 41
     assert {m.market for m in merchants} == {"US", "JP", "SG"}
-    assert sum(1 for m in merchants if m.variant_id) == 36
+    assert sum(1 for m in merchants if m.variant_id) == 37
     by_domain = {m.domain: m for m in merchants}
     for known in ("forbeaut.us", "podl.us", "luafee.jp", "judydoll.com", "robinsons.com.sg"):
         assert known in by_domain
@@ -153,10 +154,26 @@ _REPLACED = {
 }
 
 
+# Rows added after the 2026-09-18 measurement, (domain, market) -> variant_id. They are not in
+# population.json, and they carry NO product_handle: the validator does not require one, and
+# none was read off the storefront to add them. Without a handle the preflight scans the catalog
+# for the variant instead of reading one /products/<handle>.js;
+# scripts/ops/refresh_tierb_seed_hints.py can fill it in later.
+_ADDED_AFTER_POPULATION = {
+    # the Reap entry-link variant ("Tap Secret Refill"); card checkout via Shopify Payments
+    # verified 2026-09-23 by the purchasability sweep
+    ("idewcare.com", "US"): "46722440036604",
+}
+
+
 def test_the_repo_merchant_list_carries_a_handle_for_every_seeded_variant():
     merchants = {m.domain: m for m in load_merchants()}
-    seeded = [m for m in merchants.values() if m.variant_id]
+    added = {domain for domain, _market in _ADDED_AFTER_POPULATION}
+    seeded = [m for m in merchants.values() if m.variant_id and m.domain not in added]
     assert len(seeded) == 36 and all(m.product_handle for m in seeded)
+    for (domain, market), variant in _ADDED_AFTER_POPULATION.items():
+        assert (merchants[domain].market, merchants[domain].variant_id, merchants[domain].product_handle) == \
+            (market, variant, None)
     assert all(m.product_handle is None for m in merchants.values() if not m.variant_id)
     for domain, (_old, new, handle) in _REPLACED.items():
         assert (merchants[domain].variant_id, merchants[domain].product_handle) == (new, handle)
@@ -165,7 +182,8 @@ def test_the_repo_merchant_list_carries_a_handle_for_every_seeded_variant():
 
 def test_the_repo_merchant_list_is_the_2026_09_18_population_row_for_row():
     """The list is the measured population with `variant` renamed and a handle added: no row
-    dropped or moved to another market, and no variant changed except those in _REPLACED."""
+    dropped or moved to another market, and no variant changed except those in _REPLACED. The
+    only rows beyond it are _ADDED_AFTER_POPULATION's, with exactly their variants."""
     population = os.environ.get("TIERB_POPULATION_JSON") or os.path.join(
         os.path.dirname(__file__), "..", "reports", "tierb_cart_permalink_2026_09_18", "population.json"
     )
@@ -180,9 +198,16 @@ def test_the_repo_merchant_list_is_the_2026_09_18_population_row_for_row():
              _REPLACED[r["domain"]][1] if r["domain"] in _REPLACED else r.get("variant"))
             for r in theirs
         ]
-        assert expected == [(r["domain"], r["market"], r.get("variant_id")) for r in ours]
+        assert expected == [
+            (r["domain"], r["market"], r.get("variant_id")) for r in ours
+            if (r["domain"], r["market"]) not in _ADDED_AFTER_POPULATION
+        ]
+        assert not any((r["domain"], r["market"]) in _ADDED_AFTER_POPULATION for r in theirs)
         for domain, (old, _new, _handle) in _REPLACED.items():
             assert any(r["domain"] == domain and r.get("variant") == old for r in theirs)
+    added = {(r["domain"], r["market"]): r.get("variant_id") for r in ours
+             if (r["domain"], r["market"]) in _ADDED_AFTER_POPULATION}
+    assert added == _ADDED_AFTER_POPULATION
 
 
 def _row(**over):
