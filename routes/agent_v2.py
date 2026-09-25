@@ -36,6 +36,7 @@ from services.psp_capabilities import get_psp_capabilities
 from services.quote_service import QuoteError, QuoteService
 from services.refund_observability import build_order_refund_tracking_payload
 from services.traffic_taxonomy_service import attach_traffic_taxonomy, build_traffic_taxonomy
+from utils.availability_vocabulary import IN_STOCK, OUT_OF_STOCK, normalize_availability
 
 
 router = APIRouter(prefix="/agent/v2", tags=["agent-v2"])
@@ -345,6 +346,24 @@ def _shipping_summary_from_product(product: Dict[str, Any]) -> Dict[str, Any]:
     return summary
 
 
+def _product_offer_in_stock(product: Dict[str, Any]) -> Optional[bool]:
+    """The product-level stock an offer falls back to: a real boolean, None when unknown.
+
+    The external-seed builders (services/external_seed_stock.seed_stock_fields) serve
+    a seed with no stock claim of its own as `availability: "unknown"` and NO
+    `in_stock` key. The legacy default below read that as in stock. Unknown is
+    published as null, never folded into False (a sold-out claim) either; the
+    gateway's canonical flattener reads only a boolean and otherwise falls through.
+    Every other shape keeps the legacy default unchanged.
+    """
+    if (
+        product.get("in_stock") is None
+        and str(product.get("availability") or "").strip().lower() == "unknown"
+    ):
+        return None
+    return bool(product.get("in_stock", True))
+
+
 def _canonicalize_search_product(product: Dict[str, Any]) -> Dict[str, Any]:
     merchant_id = str(product.get("merchant_id") or "").strip()
     product_id = str(product.get("product_id") or product.get("id") or "").strip()
@@ -394,7 +413,7 @@ def _canonicalize_search_product(product: Dict[str, Any]) -> Dict[str, Any]:
     live_verification_required = bool(verification and verification.get("required") is True)
     product_price = product.get("price")
     product_currency = product.get("currency")
-    product_in_stock = bool(product.get("in_stock", True))
+    product_in_stock = _product_offer_in_stock(product)
     product_inventory_quantity = product.get("inventory_quantity")
 
     offers: List[Dict[str, Any]] = []
@@ -417,8 +436,17 @@ def _canonicalize_search_product(product: Dict[str, Any]) -> Dict[str, Any]:
         # seed builder's key). Internal StandardProductVariant rows carry
         # `inventory_quantity` defaulting to 0 even when untracked, so it is not a
         # stock claim on its own; the quantity travels with the in_stock it matches.
-        if isinstance(raw.get("in_stock"), bool):
-            in_stock = raw["in_stock"]
+        # Under an UNKNOWN product a variant's bool may be inherited, not observed
+        # (the seed builders default a no-signal variant to in stock), so it counts
+        # only when the variant carries a KNOWN availability of its own. "" and
+        # unrecognised strings are copied onto the variant too, so presence is not enough.
+        variant_in_stock = raw.get("in_stock")
+        own_stock_signal = isinstance(variant_in_stock, bool) and (
+            product_in_stock is not None
+            or normalize_availability(raw.get("availability")) in (IN_STOCK, OUT_OF_STOCK)
+        )
+        if own_stock_signal:
+            in_stock = variant_in_stock
             inventory_quantity = raw.get("inventory_quantity", product_inventory_quantity)
         else:
             in_stock = product_in_stock
