@@ -562,6 +562,41 @@ def test_one_unmatched_sibling_is_enough_to_withhold_trust(monkeypatch):
     assert not _trusted(_serve(stored))
 
 
+def test_a_positional_offer_id_is_not_an_identifier(monkeypatch):
+    """Review of #2340: the extractor names id-less offers `offer_1..N`, and seeds adopted from
+    sku-less pages STORE those names. Today's page lists one id-less Offer at 32; the stored
+    `offer_1` is the 30ml at 20, sold out. Position 1 then is not position 1 now."""
+    sizes = [
+        _variant("offer_1", 20.0, "out_of_stock", "30ml"),
+        _variant("offer_2", 32.0, "in_stock", "50ml"),
+        _variant("offer_3", 45.0, "in_stock", "100ml"),
+    ]
+    row = _seed_row(variants=sizes, price=20.0, availability="out_of_stock")
+    page = _page([{"@type": "Offer", "price": "32", "priceCurrency": "USD", "availability": IN}])
+    assert page.evidence["variants"][0]["variant_id"] == "offer_1", "the real extractor's invented id"
+
+    result, stored = _refresh(monkeypatch, row, page)
+
+    assert [(v["price_amount"], v["availability"]) for v in stored["seed_data"]["variants"]] == [
+        (20.0, "out_of_stock"), (32.0, "in_stock"), (45.0, "in_stock"),
+    ]
+    assert result["variant_refresh"]["replaced"] == []
+    assert result["variant_refresh"]["not_re_read"] == ["offer_1", "offer_2", "offer_3"]
+    assert not _trusted(_serve(stored))
+
+
+def test_the_last_write_survives_a_night_that_changes_nothing(monkeypatch):
+    row = _seed_row(variants=[_variant("1", 16.0, "out_of_stock")], price=16.0, availability="out_of_stock")
+    first, stored = _refresh(monkeypatch, row, _page([_offer(17, IN, sku="RL")]))
+    written = stored["seed_data"]["snapshot"]["variant_refresh_last_write"]
+    assert written["replaced"] == first["variant_refresh"]["replaced"] != []
+
+    second, stored_again = _refresh(monkeypatch, stored, _page([_offer(17, IN, sku="RL")]))
+
+    assert second["variant_refresh"]["replaced"] == []
+    assert stored_again["seed_data"]["snapshot"]["variant_refresh_last_write"] == written
+
+
 def test_two_stored_variants_claiming_one_page_offer_are_both_unread(monkeypatch):
     """A SKU the merchant reused across shades names neither of them."""
     row = _seed_row(

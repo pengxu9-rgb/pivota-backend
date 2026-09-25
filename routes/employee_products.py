@@ -4485,6 +4485,16 @@ def _seed_variant_key(variant: Dict[str, Any]) -> str:
     return str(variant.get("variant_id") or variant.get("id") or variant.get("sku") or "").strip()
 
 
+# THE EXTRACTOR'S INVENTED ID FOR AN OFFER THAT HAS NONE (`_offer_variants_from_node`:
+# `f"offer_{idx + 1}"`). It is a POSITION, and seeds adopted from sku-less pages store it, so
+# matching on it pairs "the first offer on today's page" with "the first variant stored months
+# ago": a page now listing one id-less offer at 32 would rewrite a stored `offer_1` 30ml at 20
+# to 32 / in stock (review of #2340). A read offer keyed by one is never indexed for matching
+# in `_reconcile_seed_variants_with_read`; a match needs the id on both sides, so that one
+# exclusion also covers a stored `offer_N`.
+_POSITIONAL_OFFER_ID = re.compile(r"^offer_\d+$")
+
+
 def _seed_variant_identifiers(variant: Dict[str, Any]) -> List[str]:
     """Every id a stored variant is known by, for matching against what a page listed.
 
@@ -4494,7 +4504,7 @@ def _seed_variant_identifiers(variant: Dict[str, Any]) -> List[str]:
     2026-09-25: 3,700 of 3,728 stored multi-variant entries carry a `sku`, and matching on it
     alone re-reads 383 of the 777 fresh multi-variant rows the variant-id match missed
     (perfumania, bluemercury, holiholic). Each is still an exact equality on an identifier the
-    merchant issued, never a title or a position.
+    merchant issued, never a title or a position (see `_POSITIONAL_OFFER_ID`).
     """
     out: List[str] = []
     for key in ("variant_id", "id", "sku", "sku_id", "barcode", "gtin13", "mpn"):
@@ -4590,7 +4600,7 @@ def _reconcile_seed_variants_with_read(
     read_variants = [rv for rv in (read or []) if isinstance(rv, dict)] if isinstance(census, dict) else []
     for pos, rv in enumerate(read_variants):
         key = _seed_variant_key(rv)
-        if key:
+        if key and not _POSITIONAL_OFFER_ID.match(key):
             read_by_id.setdefault(key, []).append(pos)
 
     # Which read offer each stored variant names, through ANY of its own identifiers. A read
@@ -5285,6 +5295,14 @@ async def _refresh_external_seed_by_id(
             "all_re_read" if not variant_refresh["not_re_read_count"] else "not_all_re_read"
         )
         seed_data["snapshot"]["variant_refresh"] = variant_refresh
+        # `variant_refresh` is rewritten every run, so the next no-change night would blank
+        # the before/after record of an overwrite. Keep the LAST run that wrote anything,
+        # bounded, until a later write replaces it.
+        if variant_refresh.get("replaced"):
+            seed_data["snapshot"]["variant_refresh_last_write"] = {
+                "at": _to_iso(datetime.now(timezone.utc)),
+                "replaced": variant_refresh["replaced"][:50],
+            }
     if read_the_served_product and price_re_read:
         if variant_refresh.get("not_re_read_count"):
             seed_data["snapshot"].pop("extracted_at", None)
