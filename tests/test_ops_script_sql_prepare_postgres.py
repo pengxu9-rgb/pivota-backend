@@ -190,19 +190,37 @@ ALTER TABLE product_enrichment ADD COLUMN IF NOT EXISTS usage_scenarios JSONB;
 """
 
 
+def _strip_sql_comments(sql: str) -> str:
+    """Drop `--` line comments and `/* */` block comments. Test-side only.
+
+    Quote-naive on purpose: it is used to CLASSIFY a statement, never to build
+    one, and the statements it classifies are DDL with no string literals.
+    """
+    sql = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
+    return re.sub(r"--[^\n]*", " ", sql)
+
+
 def _agent_pdp_view_catchup_ddl() -> List[str]:
     """`ALTER TABLE agent_pdp_view ...` statements from db/migrations, in order.
 
-    agent_pdp_view IS a db.catalog table, so `metadata.create_all` creates it —
-    but db/catalog.py's Table definition is BEHIND the migrations:
-    evidence_profile, required_disclaimers, bullet_points and usage_scenarios
-    exist only in db/migrations/*.sql. Statements naming them therefore failed
-    with UndefinedColumn against a fixture that looked complete.
+    agent_pdp_view IS a db.catalog table, so `metadata.create_all` creates it,
+    and db/catalog.py's Table definition now declares the full migration column
+    set (evidence_profile, required_disclaimers, rating_value, rating_count,
+    bullet_points, usage_scenarios) — on a genuinely fresh database these ALTERs
+    are no-ops.
+
+    They stay because the database is SHARED and reused: `create_all` is
+    checkfirst-only and will not widen a table that already exists, so a
+    catalog table built by an OLDER db/catalog.py keeps its narrow shape and
+    statements naming the newer columns fail with UndefinedColumn against a
+    fixture that looks complete.
 
     Additive ALTERs lifted from the migrations themselves, never hand-written —
     the 🚨 rule above forbids hand-rolling DDL for a table db.catalog owns, and
     ADD COLUMN IF NOT EXISTS is safe to replay in the shared database.
     """
+    from db.sql_migrations import split_statements
+
     out: List[str] = []
     paths = sorted(
         (REPO_ROOT / "db" / "migrations").glob("*.sql"),
@@ -212,10 +230,41 @@ def _agent_pdp_view_catchup_ddl() -> List[str]:
         body = path.read_text(encoding="utf-8")
         if "agent_pdp_view" not in body:
             continue
-        for statement in filter(None, (s.strip() for s in body.split(";"))):
-            collapsed = " ".join(statement.split()).lower()
-            if collapsed.startswith("alter table agent_pdp_view") and "add column" in collapsed:
-                out.append(statement)
+        # `split_statements`, NOT `body.split(";")`. The naive split is wrong
+        # twice over, and both were live defects:
+        #
+        #   * it cuts on a `;` inside a `--` comment. Migration 096 line 17 has
+        #     "(or absence of intent); shadowing it with" in prose, so the
+        #     fragment carrying its real ALTER begins mid-comment and fails any
+        #     prefix test — 096 was dropped no matter how the prefix was spelled.
+        #   * the prefix test itself matched only `alter table agent_pdp_view`,
+        #     dropping migration 186, which writes `ALTER TABLE IF EXISTS`.
+        #
+        # 186 cost `report_agent_depth_scorecard`'s APV_DEPTH_SQL a PREPARE
+        # (`column "rating_value" does not exist`) on a fresh database, masked
+        # because a sibling gate file that sorts earlier
+        # (tests/test_citation_read_surfaces_postgres.py) patches the SHARED
+        # database first. This splitter is the one the real migration runner
+        # uses, so it is quote-, dollar-quote- and comment-aware.
+        for statement in filter(None, (s.strip() for s in split_statements(body))):
+            # Comments STRIPPED before the prefix test, because `split_statements`
+            # keeps the comment block that precedes a statement attached to it —
+            # migration 096's ALTER arrives as `-- Idempotent: ...\nALTER TABLE
+            # IF EXISTS agent_pdp_view ...` and no `startswith` can see past that.
+            # Executed unstripped: only the TEST needs the bare SQL.
+            collapsed = " ".join(_strip_sql_comments(statement).split()).lower()
+            if "add column" not in collapsed:
+                continue
+            if collapsed.startswith(("alter table agent_pdp_view",
+                                    "alter table if exists agent_pdp_view")):
+                # The STRIPPED text is what we emit, not the original. The
+                # fixture below joins these with ";" and re-splits the blob on
+                # ";" — and 096's comment block contains a prose semicolon
+                # ("(or absence of intent); shadowing it with"), which that
+                # re-split turns into a comment-only fragment and psycopg2
+                # rejects as "can't execute an empty query". Stripping here
+                # keeps the statement whole through the naive split downstream.
+                out.append(" ".join(_strip_sql_comments(statement).split()))
     return out
 
 
@@ -415,6 +464,39 @@ def _collect_remediate() -> List[Tuple[str, str]]:
     )
 
 
+def _collect_withdraw_catalog_rows() -> List[Tuple[str, str]]:
+    """Named takedown: the per-table jsonb_build_object UPDATE with a jsonb bind,
+    the CASE-on-bind + metadata-subtraction reverts, the ANY(:ids) seed writes
+    and the ANY(:pks) loader — every statement it sends (13)."""
+    import scripts.withdraw_catalog_rows as module
+
+    row = {
+        "product_key": "prod::probe", "content_key": "ck_probe", "title": "probe",
+        "brand": "Probe", "source_system": "catalog_enrichment_agent_v1",
+        "source_domain": "example.com", "suppression_reason": None, "suppressed_at": None,
+        "suppression_metadata": None, "skus": 1, "offers": 1, "seeds": 1,
+        "active_seeds": 1, "rows_on_key": 1,
+    }
+    ours = dict(row, suppressed_at="2026-01-01",
+                suppression_metadata={"script": module.SCRIPT_NAME, "reason": "probe",
+                                      "deactivated_seed_ids": ["seed_probe"]})
+
+    async def _trust(*, db, product_keys, **kw):
+        return len(product_keys)
+
+    async def _go() -> None:
+        await module._load_rows(["prod::probe"])
+        await module._load_ours(None)
+        await module._withdraw([dict(row)], "probe")
+        await module._revert([ours])
+
+    return _drive(
+        module, _go, "withdraw_catalog_rows",
+        recompute_serving_eligibility=_noop_recompute,
+        upsert_catalog_row_trust_many=_trust,
+    )
+
+
 def _collect_seed_content_audit() -> List[Tuple[str, str]]:
     import scripts.run_seed_content_audit as module
 
@@ -511,6 +593,66 @@ def _collect_us_market_capture() -> List[Tuple[str, str]]:
     return [
         (f"{origin}.{name}", getattr(module, name)) for name in (
             "CANDIDATES_SQL", "OFFER_UPSERT_SQL",
+            # The SKU precondition, added when this lane was found to have
+            # minted 529 live orphan offers. MINT_CANONICAL_SKU_SQL is an
+            # INSERT ... SELECT with an ON CONFLICT on a FOUR-column index and a
+            # WHERE on the DO UPDATE, and SUPPRESSED_IDENTITY_PROBE_SQL compares
+            # two columns of the same row inside `= ANY(:binds)` — both are
+            # shapes Postgres can refuse to plan and SQLite types not at all.
+            "MINT_CANONICAL_SKU_SQL", "SUPPRESSED_IDENTITY_PROBE_SQL",
+            # The suppressed-PRODUCT refusal. Separate from the SKU probe above
+            # and separately plannable: this one reads catalog_products, and the
+            # lane read that table's gate column nowhere until it was found
+            # writing live offers onto withdrawn products.
+            "SUPPRESSED_PRODUCT_PROBE_SQL",
+        )
+    ]
+
+
+def _collect_reconcile_catalog_offers() -> List[Tuple[str, str]]:
+    """The reconciler SUPPRESSES offers table-wide. An unplannable statement here
+    aborts a sweep partway through and leaves the table in a state no report
+    describes.
+
+    EVERY SQL CONSTANT THE MODULE DEFINES IS LISTED, and the completeness guard
+    below re-derives that list from the module so a new constant cannot be added
+    without either being driven here or being named as deliberately skipped. Three
+    of these reached Postgres only through a module-local `_fetch()` wrapper until
+    2026-09-08, which made them invisible to the repo-wide AST sweep in
+    tests/test_repo_sql_prepare_postgres.py — the sweep follows
+    `database.<accessor>(CONSTANT, ...)` and nothing else. The call sites now pass
+    the constant as the accessor's first positional argument, and they are driven
+    here as well.
+    """
+    import scripts.reconcile_catalog_offers as module
+
+    origin = "reconcile_catalog_offers"
+    return [
+        (f"{origin}.{name}", getattr(module, name)) for name in (
+            "ORPHAN_SELECT_SQL", "DUPLICATE_SELECT_SQL",
+            "DUPLICATE_GROUP_COUNT_SQL", "CASCADE_SELECT_SQL",
+            "SUPPRESS_OFFERS_SQL",
+            # The revert: its per-row decision (a CASE over two anti-joins and
+            # an EXISTS on the shelf tuple, with two array binds), the UPDATE
+            # that moves what the decision cleared, and the audit-row read that
+            # sizes `healed_since_batch`.
+            "REVERT_CANDIDATES_SQL", "REVERT_BATCH_SQL", "BATCH_AUDIT_SQL",
+        )
+    ]
+
+
+def _collect_variant_id_provenance_stamps() -> List[Tuple[str, str]]:
+    """The stamping backfill WRITES, and its UPDATE builds jsonb with `jsonb_build_object` —
+    the exact variadic-`"any"` shape that made #1703's statement unplannable on every row while
+    the script exited 0 having written nothing. Both constants are registered here rather than
+    driven, because driving the scan against a recorder yields only the SELECT: the UPDATE is
+    reached only once a page comes back non-empty."""
+    import scripts.backfill_variant_id_provenance_stamps as module
+
+    origin = "backfill_variant_id_provenance_stamps"
+    return [
+        (f"{origin}.{name}", getattr(module, name)) for name in (
+            "SELECT_PAGE_SQL", "STAMP_SQL",
         )
     ]
 
@@ -644,6 +786,7 @@ def _collect_enrichment_baseline() -> List[Tuple[str, str]]:
 # so a script cannot be registered here and left half-covered in silence.
 _COVERED_SCRIPTS: Dict[str, Callable[[], List[Tuple[str, str]]]] = {
     "scripts/remediate_unpublished_crawl_rows.py": _collect_remediate,
+    "scripts/withdraw_catalog_rows.py": _collect_withdraw_catalog_rows,
     "scripts/run_seed_content_audit.py": _collect_seed_content_audit,
     "scripts/source_pdp_content_repair.py": _collect_source_pdp_content_repair,
     "scripts/source_pdp_offer_image_repair.py": _collect_source_pdp_offer_image_repair,
@@ -654,9 +797,11 @@ _COVERED_SCRIPTS: Dict[str, Callable[[], List[Tuple[str, str]]]] = {
     "scripts/report_inci_ingestion_quality.py": _collect_inci_quality,
     "scripts/reattribute_orphaned_enrichment.py": _collect_reattribution,
     "scripts/capture_us_market_offers.py": _collect_us_market_capture,
+    "scripts/reconcile_catalog_offers.py": _collect_reconcile_catalog_offers,
     "scripts/dispose_sentinel_orphans.py": _collect_dispose_sentinel_orphans,
     "scripts/report_quality_scale_population.py": _collect_quality_scale_population,
     "scripts/repair_a9_4_orphaned_quality_snapshots.py": _collect_a9_4_quality_repair,
+    "scripts/backfill_variant_id_provenance_stamps.py": _collect_variant_id_provenance_stamps,
 }
 
 # What each collector yields TODAY, not a slack lower bound. Guards the failure
@@ -667,6 +812,7 @@ _COVERED_SCRIPTS: Dict[str, Callable[[], List[Tuple[str, str]]]] = {
 # losing them needs a deliberate edit here, with the reason.
 _MIN_STATEMENTS = {
     "scripts/remediate_unpublished_crawl_rows.py": 11,
+    "scripts/withdraw_catalog_rows.py": 13,
     "scripts/run_seed_content_audit.py": 4,
     "scripts/source_pdp_content_repair.py": 3,
     "scripts/source_pdp_offer_image_repair.py": 6,
@@ -676,10 +822,12 @@ _MIN_STATEMENTS = {
     "scripts/report_agent_depth_scorecard.py": 6,
     "scripts/report_inci_ingestion_quality.py": 6,
     "scripts/reattribute_orphaned_enrichment.py": 8,
-    "scripts/capture_us_market_offers.py": 2,
+    "scripts/capture_us_market_offers.py": 5,
+    "scripts/reconcile_catalog_offers.py": 8,
     "scripts/dispose_sentinel_orphans.py": 8,
     "scripts/report_quality_scale_population.py": 5,
     "scripts/repair_a9_4_orphaned_quality_snapshots.py": 3,
+    "scripts/backfill_variant_id_provenance_stamps.py": 2,
 }
 
 

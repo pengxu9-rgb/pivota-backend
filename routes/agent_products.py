@@ -25,7 +25,7 @@ from services.payment_offer_evidence_service import (
 )
 from db.agent_ranking_log import log_ranking_batch
 from db.agent_product_events import log_product_events
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from typing import List, Optional, Dict, Any
 import httpx
 import logging
@@ -43,6 +43,7 @@ from models.catalog import PivotPaymentContext
 from models.standard_product import StandardProduct
 from db.product_quality import product_quality_snapshot
 from config.settings import settings
+from services import agent_product_detail_gateway_proxy as detail_proxy
 from utils.redis_client import get_redis_client
 
 router = APIRouter(prefix="/agent/v1/products", tags=["Agent Products"])
@@ -542,7 +543,24 @@ async def get_merchant_products(
         # Verify agent has access to this merchant
         if not context.can_access_merchant(merchant_id):
             raise HTTPException(status_code=403, detail="Not authorized for this merchant")
-        
+
+        # An observed external retailer (merch_obs_*, e.g. jsmbeauty.sg) has no catalog here: no
+        # onboarding, no products cache, no realtime API. The hybrid query below answers 200 with
+        # an EMPTY list for it, which reads as "this store sells nothing" -- measured 2026-09-22 for
+        # the JSM seller whose product search and detail both serve. Refuse explicitly instead, and
+        # say where its products are: search (by brand) finds them, product/variant detail opens them.
+        if str(merchant_id or "").strip().startswith(detail_proxy.OBSERVED_SELLER_PREFIX):
+            background_tasks.add_task(log_agent_request, context=context, status_code=404, merchant_id=merchant_id)
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    "Catalog listing is not available for external retailer sellers. Find their products "
+                    "with GET /agent/v1/products/search (for example by brand), and open one with "
+                    "GET /agent/v1/products/merchants/{merchant_id}/product/{product_id}."
+                ),
+                headers={"X-Error-Code": "MERCHANT_LISTING_UNAVAILABLE"},
+            )
+
         # Use hybrid query service (decides cache vs realtime)
         products, query_source, error = await get_products_hybrid(
             merchant_id=merchant_id,
@@ -778,8 +796,48 @@ async def get_merchant_products(
         raise HTTPException(status_code=500, detail=f"Failed to get products: {str(e)}")
 
 
+async def _external_seller_detail_via_gateway(
+    req: Request,
+    background_tasks: BackgroundTasks,
+    context: AgentContext,
+    merchant_id: str,
+    *,
+    product_ref: Optional[str] = None,
+    variant_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Detail for an observed external seller (merch_obs_*), served by the gateway -- see
+    services/agent_product_detail_gateway_proxy.py. None: not forwarded, the local path runs as
+    before. Otherwise the detail in this endpoint's contract, or an HTTPException -- a failed
+    forward is reported, never replaced by the local path (which has no such merchant)."""
+    forward, _reason = detail_proxy.enabled_for(merchant_id, req.headers)
+    if not forward:
+        return None
+    signature, why = await detail_proxy.resolve_signature(
+        database, merchant_id, product_ref=product_ref, variant_id=variant_id,
+    )
+    if not signature:
+        background_tasks.add_task(log_agent_request, context=context, status_code=404, merchant_id=merchant_id)
+        raise HTTPException(status_code=404, detail="Product not found", headers={"X-Error-Code": f"DETAIL_{why.upper()}"})
+    product, why, status = await detail_proxy.fetch_detail(
+        base_url=settings.pivota_agent_internal_url,
+        merchant_id=merchant_id,
+        signature=signature,
+        variant_id=variant_id,
+        headers=req.headers,
+    )
+    background_tasks.add_task(log_agent_request, context=context, status_code=status, merchant_id=merchant_id)
+    if product is None:
+        raise HTTPException(
+            status_code=status,
+            detail="Product not found" if status == 404 else "Product detail unavailable",
+            headers={"X-Error-Code": why.upper()},
+        )
+    return detail_proxy.to_backend_detail(product, merchant_id=merchant_id)
+
+
 @router.get("/merchants/{merchant_id}/product/{product_id}")
 async def get_product_details(
+    req: Request,
     merchant_id: str,
     product_id: str,
     background_tasks: BackgroundTasks,
@@ -797,6 +855,12 @@ async def get_product_details(
         # Verify access
         if not context.can_access_merchant(merchant_id):
             raise HTTPException(status_code=403, detail="Not authorized")
+
+        forwarded = await _external_seller_detail_via_gateway(
+            req, background_tasks, context, merchant_id, product_ref=product_id,
+        )
+        if forwarded is not None:
+            return forwarded
 
         merchant = await get_merchant_onboarding(merchant_id)
         if not merchant:
@@ -1149,6 +1213,7 @@ async def get_product_details(
 
 @router.get("/merchants/{merchant_id}/variant/{variant_id}")
 async def get_product_details_by_variant(
+    req: Request,
     merchant_id: str,
     variant_id: str,
     background_tasks: BackgroundTasks,
@@ -1157,6 +1222,14 @@ async def get_product_details_by_variant(
     """Resolve a platform variant_id to its parent product and return product details."""
     if not context.can_access_merchant(merchant_id):
         raise HTTPException(status_code=403, detail="Not authorized")
+
+    forwarded = await _external_seller_detail_via_gateway(
+        req, background_tasks, context, merchant_id, variant_id=variant_id,
+    )
+    if forwarded is not None:
+        # Where the local variant path puts it: top level, beside `product`.
+        forwarded["selected_variant_id"] = str(variant_id)
+        return forwarded
 
     merchant = await get_merchant_onboarding(merchant_id)
     if not merchant:
@@ -1174,6 +1247,7 @@ async def get_product_details_by_variant(
     if platform != "shopify":
         # Best-effort: treat variant_id as product_id for non-Shopify cached products.
         resp = await get_product_details(
+            req=req,
             merchant_id=merchant_id,
             product_id=variant_id,
             background_tasks=background_tasks,
@@ -1235,6 +1309,7 @@ async def get_product_details_by_variant(
                 pass
 
     resp = await get_product_details(
+        req=req,
         merchant_id=merchant_id,
         product_id=product_id,
         background_tasks=background_tasks,

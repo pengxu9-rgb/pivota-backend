@@ -40,7 +40,28 @@ SCRIPT = REPO / "infra" / "gcp" / "setup_scheduler.sh"
 
 # Everything that exists in prod today. `describe` succeeding is how the script decides
 # create-vs-update and, previously, nothing else.
+#
+# ONE ENTRY IS AHEAD OF PROD: `relgraph-health-cron` is defined by the script but not yet
+# provisioned. It is listed here because these tests are about RERUN SAFETY — that ARM and DISARM
+# stay surgical once a trigger exists — and a permanently-absent entry would make every run of the
+# script look like it touches an extra trigger, which is the assertion below, not a real finding.
+# Verified: without this entry, test_arm_changes_exactly_one_trigger and its disarm partner FAIL.
+# Adding it does not blunt them — a foreign trigger added to the script still fails both.
+#
+# (An earlier version of this note said new triggers are "created by hand". That contradicts
+# `sched()`, which creates them PAUSED precisely so running this script is safe; the hand step is
+# `ARM=relgraph-health-cron`, and only after a gateway image carrying PIVOTA-Agent #2171's script is
+# rolled onto the job — an older image fails with npm's `Missing script`.)
+# REMOVE THIS NOTE once it is live.
+#
+# `retailer-ingest-drain-cron` is AHEAD OF PROD on the same terms: it ships with the retailer
+# ingest pipeline's infra and does not exist until someone runs this script. Without it every run
+# here also creates-and-pauses it, which the ARM/DISARM surgery tests would read as a foreign
+# trigger. The drain tests at the bottom that need the CREATE path pass their own empty
+# EXISTING_TRIGGERS_FILE. REMOVE THIS NOTE once it is live.
 EXISTING_TRIGGERS = {
+    "relgraph-health-cron",
+    "retailer-ingest-drain-cron",
     "relgraph-sync-cron", "reviews-invitation-send-cron",
     "commerce-index-relgraph-cron", "commerce-index-search-index-cron",
     "commerce-index-checkout-validation-cron", "commerce-index-insight-refresh-cron",
@@ -59,7 +80,11 @@ WEB_JSON = (
     '"traffic":[{"revisionName":"web-00088-kaz","percent":100}]}}'
 )
 REVISION_JSON = (
-    '{"spec":{"containers":[{"env":['
+    # A revision declares the commit it was built from; deploy_worker.sh refuses one that does
+    # not (it could not restamp a rollback truthfully), so the fake must carry it.
+    '{"spec":{"containers":[{"image":"us-west1-docker.pkg.dev/pivota-shared/pivota/backend@sha256:'
+    + "e" * 64 + '","env":['
+    '{"name":"PIVOTA_COMMIT_SHA","value":"' + "e" * 40 + '"},'
     '{"name":"STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED","value":"true"},'
     '{"name":"STORE_AUDIT_UCP_PROBE_INTERNAL_KEY","valueFrom":{"secretKeyRef":'
     '{"name":"STORE_AUDIT_UCP_PROBE_INTERNAL_KEY"}}},'
@@ -89,7 +114,13 @@ FAKE_GCLOUD = textwrap.dedent(
 )
 
 def _run(tmp_path: Path, env_overrides: dict[str, str | None]) -> list[str]:
-    """Run the real script against a fake gcloud; return the recorded invocations.
+    """Run the real script against a fake gcloud; return the recorded invocations."""
+    return _run_full(tmp_path, env_overrides)[0]
+
+
+def _run_full(tmp_path: Path, env_overrides: dict[str, str | None],
+              *, expect_rc: int = 0) -> tuple[list[str], subprocess.CompletedProcess]:
+    """Run the real script against a fake gcloud; return (recorded invocations, process).
 
     A value of None DELETES the key from the child environment. That distinction is
     load-bearing: the script separates "operator said false" from "operator said nothing"
@@ -128,11 +159,11 @@ def _run(tmp_path: Path, env_overrides: dict[str, str | None]) -> list[str]:
         ["bash", str(SCRIPT), "prod", "a" * 40, "b" * 40],
         capture_output=True, text=True, env=env, cwd=str(REPO),
     )
-    assert proc.returncode == 0, (
+    assert proc.returncode == expect_rc, (
         f"the script must run to completion against live-prod-shaped state.\n"
         f"rc={proc.returncode}\nstderr:\n{proc.stderr[-3000:]}"
     )
-    return log.read_text().splitlines()
+    return log.read_text().splitlines(), proc
 
 
 def _state_changes(calls: list[str]) -> set[tuple[str, str]]:
@@ -272,27 +303,40 @@ _ACTIVE_RE = re.compile(r"python3 -c '\n(import json,sys\no=json\.load\(sys\.std
 
 
 def _preflight_blocks():
-    src = (REPO / "infra" / "gcp" / "setup_scheduler.sh").read_text(encoding="utf-8")
-    blocks = [b for b in _ACTIVE_RE.findall(src) if "revisionName" in b and "percent" in b]
-    assert len(blocks) == 2, (
-        f"expected 2 active-revision preflight blocks in setup_scheduler.sh, found {len(blocks)}. "
-        "If the shape changed, fix this extractor - do NOT restate the predicate here, or these "
-        "tests stop testing the script."
+    """The ONE predicate both preflights now use, lifted out of the shared helper.
+
+    This used to extract TWO inline copies from setup_scheduler.sh and assert they agreed —
+    which was the right test for the code as it stood, and it is why the tagged-revision
+    regression below was caught here in the first place. The copies are gone: both preflights
+    call `serving_revision` from infra/gcp/_serving_revision.sh, so there is one predicate to
+    run and nothing left to disagree.
+
+    That consolidation was not cosmetic. A FIFTH copy of this rule lived in
+    setup_store_audit_commerce_jobs.sh and still carried the `not x.get("tag")` conjunct these
+    very tests exist to forbid — so that script exited 2 on every run against production. The
+    guard was right, the tests were right, and the drift happened in the copy nobody was
+    testing.
+    """
+    src = (REPO / "infra" / "gcp" / "_serving_revision.sh").read_text(encoding="utf-8")
+    marker = "python3 -c '"
+    i = src.index(marker, src.index("serving_revision()")) + len(marker)
+    block = src[i:src.index("'", i)]
+    assert "revisionName" in block and "percent" in block, (
+        "could not lift the predicate out of _serving_revision.sh - fix this extractor, do "
+        "NOT restate the predicate here, or these tests stop testing the shipped code."
     )
-    return blocks
+    return [block]
 
 
 def _active_revision(traffic):
-    """Run the script's OWN predicate over a traffic list; assert both copies agree."""
+    """Run the shipped predicate over a traffic list. '' means it refused to answer."""
     payload = json.dumps({"status": {"traffic": traffic}})
-    results = set()
-    for block in _preflight_blocks():
-        proc = subprocess.run(["python3", "-c", block], input=payload,
-                              capture_output=True, text=True)
-        assert proc.returncode == 0, f"preflight block failed: {proc.stderr}"
-        results.add(proc.stdout.strip())
-    assert len(results) == 1, f"the UCP and commerce preflights disagree: {results}"
-    return results.pop()
+    (block,) = _preflight_blocks()
+    proc = subprocess.run(["python3", "-c", block], input=payload,
+                          capture_output=True, text=True)
+    # The helper signals "no single answer" with a non-zero exit and no output, where the
+    # inline copies printed an empty string. Both mean the same thing to every caller.
+    return proc.stdout.strip() if proc.returncode == 0 else ""
 
 
 def test_a_tagged_serving_revision_is_still_the_serving_revision():
@@ -337,10 +381,21 @@ def test_two_revisions_at_100_is_refused():
     ]) == ""
 
 
-def test_both_preflights_use_the_same_predicate():
-    """The UCP and commerce guards are two copies of one rule; they must not drift apart."""
-    blocks = _preflight_blocks()
-    assert blocks[0] == blocks[1], "the two preflight blocks have diverged"
+def test_both_preflights_use_the_shared_predicate():
+    """They were two copies of one rule and could drift apart; now they cannot, because there
+    is one rule. Asserted on comment-stripped source so an explanatory comment cannot satisfy
+    it — and the point is not that the string appears but that no inline copy remains."""
+    body = "\n".join(
+        l for l in (REPO / "infra" / "gcp" / "setup_scheduler.sh").read_text().splitlines()
+        if not l.lstrip().startswith("#")
+    )
+    assert body.count("serving_revision web") == 2, (
+        "both Store Audit preflights must resolve the serving revision through the shared "
+        f"helper; found {body.count('serving_revision web')} call(s)"
+    )
+    assert 'percent") == 100' not in body and 'percent")==100' not in body, (
+        "setup_scheduler.sh has grown its own copy of the predicate again"
+    )
 
 
 def _secrets_for(calls: list[str], job: str) -> str:
@@ -424,3 +479,191 @@ def test_no_args_value_beginning_with_a_dash_uses_the_space_form():
         "(or a variable that may): gcloud will reject them. Use --args=<value>.\n  "
         + "\n  ".join(offenders)
     )
+
+
+# ---- retailer-ingest-drain: the unattended retailer ingest Job ----------------------------
+#
+# Asserted on the gcloud line the script WOULD issue, not on its source: the overrides ride
+# mkcrawljob's "$@" and only mean anything if they land AFTER its defaults, where gcloud takes the
+# last occurrence. A source grep would pass with the override placed anywhere.
+DRAIN = "retailer-ingest-drain"
+DRAIN_TRIGGER = "retailer-ingest-drain-cron"
+# The env the 2026-09-23 curated-ingest one-offs ran with. PIVOTA_SERVING_PRICING_REGIONS is US
+# alone: the pipeline requires USD and the multi-region value carries a comma.
+PROVEN_INGEST_ENV = {
+    "ENABLE_INTAKE_IDENTITY_ENRICHMENT": "1",
+    "ENABLE_INTAKE_IDENTITY_AUDIT": "1",
+    "ENABLE_INTAKE_IDENTITY_BRAND_AUTHORED": "1",
+    "ENABLE_INTAKE_IDENTITY_MIRROR": "1",
+    "ENABLE_INTAKE_IDENTITY_SYNC": "1",
+    "ENABLE_KBEAUTY_AGENT_DECISION_GATES": "true",
+    "ENABLE_STORELESS_BRAND_CATALOG": "1",
+    "INDEX_ELIGIBLE_READ": "1",
+    "INDEX_ELIGIBLE_RECALL": "1",
+    "INDEX_ELIGIBLE_SITEMAP": "1",
+    "INDEXNOW_ENABLED": "true",
+    "PDP_QUALITY_SCORE_SOURCE_BACKED_OPTIONAL_COMPONENTS": "1",
+    "STRICT_BEAUTY_CATEGORY_TEXT_RECALL": "true",
+    "PIVOTA_SERVING_PRICING_REGIONS": "US",
+    "DB_STATEMENT_TIMEOUT_SECONDS": "30",
+    "DB_COMMAND_TIMEOUT_SECONDS": "600",
+    "CURATED_CRAWL_PAGE_ATTEMPTS": "5",
+    "CRAWL_MIN_INTERVAL_SECONDS": "4",
+    "CRAWL_BACKOFF_BASE_SECONDS": "15",
+    "RETAILER_INGEST_LEASE_SECONDS": "4200",
+    # The drain's shape, carried so a re-run cannot quietly downgrade it: back to back inside 1800s
+    # of a 3600s task, and the lane count (jobs/retailer_ingest_drain.py; armed at 2 on 2026-09-25).
+    "RETAILER_INGEST_DRAIN_BUDGET_SECONDS": "1800",
+    "RETAILER_INGEST_TASK_TIMEOUT_SECONDS": "3600",
+    "RETAILER_INGEST_MAX_LEASES": "2",
+    "PIVOTA_ENV": "production",
+}
+
+
+def _drain_call(calls: list[str]) -> list[str]:
+    hits = [c for c in calls if c.startswith(f"run jobs create {DRAIN} ")
+            or c.startswith(f"run jobs update {DRAIN} ")]
+    assert len(hits) == 1, f"expected exactly one create/update of {DRAIN}, got {len(hits)}"
+    return hits[0].split()
+
+
+def _values(tokens: list[str], flag: str) -> list[str]:
+    """Every value given for `flag`, in order, whether as `--flag v` or `--flag=v`."""
+    out = []
+    for i, t in enumerate(tokens):
+        if t == flag and i + 1 < len(tokens):
+            out.append(tokens[i + 1])
+        elif t.startswith(flag + "="):
+            out.append(t[len(flag) + 1:])
+    return out
+
+
+def _env(tokens: list[str]) -> dict[str, str]:
+    (raw,) = _values(tokens, "--set-env-vars")  # ONE line: the reconcile replaces the whole set
+    items = raw.split(",")
+    env = {}
+    for item in items:
+        # gcloud splits on EVERY comma, so a comma inside a value leaves a fragment with no
+        # `KEY=` of its own. That fragment is what this catches.
+        assert re.fullmatch(r"[A-Z][A-Z0-9_]*=[^,]*", item), f"not a KEY=VALUE item: {item!r}"
+        key, value = item.split("=", 1)
+        assert key not in env, f"{key} set twice on one --set-env-vars line"
+        env[key] = value
+    return env
+
+
+def _seconds(value: str) -> int:
+    m = re.fullmatch(r"(\d+)s", value)
+    assert m, f"unexpected duration {value!r}"
+    return int(m.group(1))
+
+
+def _gib(value: str) -> float:
+    m = re.fullmatch(r"(\d+)(Gi|Mi)", value)
+    assert m, f"unexpected memory {value!r}"
+    return int(m.group(1)) / (1 if m.group(2) == "Gi" else 1024)
+
+
+def test_the_drain_crawls_only_from_the_crawl_subnet(tmp_path):
+    """The default subnet's NAT address is the payment IP; a retailer crawl must never use it."""
+    tokens = _drain_call(_run(tmp_path, {}))
+    assert _values(tokens, "--subnet") == ["pivota-crawl"], _values(tokens, "--subnet")
+    assert _values(tokens, "--vpc-egress")[-1] == "all-traffic"
+
+
+def test_the_drain_overrides_land_last(tmp_path):
+    """gcloud takes the last occurrence, so the LAST value is the one the job gets."""
+    tokens = _drain_call(_run(tmp_path, {}))
+    assert _seconds(_values(tokens, "--task-timeout")[-1]) >= 3600, (
+        "mkcrawljob's 300s default would kill a 20k-product crawl mid-stage"
+    )
+    assert _values(tokens, "--max-retries")[-1] == "0", (
+        "the pipeline retries through its ledger; a Cloud Run retry re-crawls the store uncounted"
+    )
+    assert _gib(_values(tokens, "--memory")[-1]) >= 1
+    assert _values(tokens, "--tasks")[-1] == "1"
+    assert _values(tokens, "--parallelism")[-1] == "1"
+    assert _values(tokens, "--command") == ["python"]
+    assert _values(tokens, "--args") == ["-m,jobs.retailer_ingest_drain"]
+    assert (REPO / "jobs" / "retailer_ingest_drain.py").is_file()
+
+
+def test_the_drain_env_is_always_enabled_with_the_proven_env(tmp_path):
+    """The TRIGGER is the arm/disarm switch; the env must not be one.
+
+    It used to be a script input defaulting to 0, and because --set-env-vars replaces the whole env
+    set, any run of this script for an unrelated job silently disarmed the drain. A leftover
+    RETAILER_INGEST_DRAIN_ENABLED=0 in the operator's shell must not reach the job either."""
+    for leftover in (None, "0"):
+        run_dir = tmp_path / str(leftover)    # one call log per run
+        run_dir.mkdir()
+        calls = _run(run_dir, {"RETAILER_INGEST_DRAIN_ENABLED": leftover})
+        tokens = _drain_call(calls)
+        env = _env(tokens)
+        assert env["RETAILER_INGEST_DRAIN_ENABLED"] == "1", leftover
+        missing = {k: v for k, v in PROVEN_INGEST_ENV.items() if env.get(k) != v}
+        assert not missing, f"env differs from the proven ingest env: {missing}"
+        # The pipeline records the image it ran on (PIVOTA_COMMIT_SHA or IMAGE_SHA).
+        assert env["PIVOTA_COMMIT_SHA"] == "a" * 40
+        assert "--update-env-vars" not in tokens
+        assert _values(tokens, "--set-secrets") == ["DATABASE_URL=DATABASE_URL:latest"]
+
+
+def _drain_state_changes(calls: list[str]) -> set[tuple[str, str]]:
+    return {c for c in _state_changes(calls) if c[1] == DRAIN_TRIGGER}
+
+
+@pytest.mark.parametrize("paused_env", [None, "1", "0"])
+def test_the_drain_trigger_is_every_10_minutes_utc_and_created_paused(tmp_path, paused_env):
+    """Created paused even under PAUSED=0, which arms every OTHER trigger a run creates."""
+    empty = tmp_path / "none.txt"
+    empty.write_text("")
+    calls = _run(tmp_path, {"EXISTING_TRIGGERS_FILE": str(empty), "PAUSED": paused_env,
+                            # PAUSED=0 resumes the Store Audit lanes' creates too; irrelevant here.
+                            "STORE_AUDIT_UCP_REPROBE_ARMED": "false",
+                            "STORE_AUDIT_COMMERCE_REPROBE_ARMED": "false"})
+    creates = [c for c in calls if c.startswith(f"scheduler jobs create http {DRAIN_TRIGGER} ")]
+    assert len(creates) == 1, creates
+    assert "--schedule=*/10 * * * * --time-zone=Etc/UTC" in creates[0]
+    assert f"/jobs/{DRAIN}:run" in creates[0]
+    assert _drain_state_changes(calls) == {("pause", DRAIN_TRIGGER)}
+
+
+@pytest.mark.parametrize("overrides", [
+    {},                                                    # a plain reconcile for another job
+    {"PAUSED": "0"},                                       # arms NEW triggers only
+    {"RETAILER_INGEST_DRAIN_ENABLED": "0"},                 # the retired input, left in a shell
+    {"DISARM": "reviews-invitation-send-cron"},            # surgery on a different trigger
+    {"ARM": "content-canonical-election-cron"},
+], ids=["plain", "paused0", "legacy-flag", "disarm-other", "arm-other"])
+def test_a_rerun_leaves_an_existing_drain_trigger_alone(tmp_path, overrides):
+    """Whatever state the live trigger is in - paused or resumed by `gcloud scheduler jobs
+    pause|resume` - a re-run issues neither pause nor resume for it, so that state stands. The
+    `update` must still happen (the definition is reconciled), just never the state."""
+    calls = _run(tmp_path, overrides)
+    assert [c for c in calls if c.startswith(f"scheduler jobs update http {DRAIN_TRIGGER} ")]
+    assert _drain_state_changes(calls) == set(), _drain_state_changes(calls)
+
+
+@pytest.mark.parametrize("script", ["setup_scheduler.sh", "setup_monitoring.sh"])
+def test_the_edited_scripts_parse(script):
+    proc = subprocess.run(["bash", "-n", str(REPO / "infra" / "gcp" / script)],
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_the_drain_budget_leaves_the_last_stage_room_inside_the_task_timeout():
+    """RETAILER_INGEST_DRAIN_BUDGET_SECONDS is when the loop stops STARTING stages; a stage started just
+    before it must still finish inside the 3600s task timeout (stages ran 4-12 min on 2026-09-24), and
+    the lease must outlive the task so a killed stage is never claimed twice."""
+    import re
+    text = SCRIPT.read_text(encoding="utf-8")
+    block = text[text.index("mkcrawljob retailer-ingest-drain"):]
+    block = block[:block.index("\n\n")]
+    env = dict(kv.split("=", 1) for kv in re.search(r'--set-env-vars "([^"]+)"', block).group(1).split(","))
+    timeouts = [int(t) for t in re.findall(r"--task-timeout (\d+)s", block)]
+    task_timeout = timeouts[-1]  # the later flag wins, as in gcloud
+    assert task_timeout == 3600
+    assert 0 < int(env["RETAILER_INGEST_DRAIN_BUDGET_SECONDS"]) <= task_timeout - 1800
+    assert int(env["RETAILER_INGEST_LEASE_SECONDS"]) > task_timeout
+    assert int(env["RETAILER_INGEST_TASK_TIMEOUT_SECONDS"]) == task_timeout  # the loop sizes leases from it

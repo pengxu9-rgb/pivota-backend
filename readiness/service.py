@@ -6,7 +6,6 @@ from datetime import datetime, timezone
 from decimal import Decimal
 import json
 import logging
-import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -30,6 +29,7 @@ from services.refund_service import refund_service
 from services.merchant_store_service import get_primary_store
 from services.surface_listing_registry_service import persist_channel_export
 from services.shopify_access_token_service import resolve_shopify_admin_access_token
+from services.shopify_domain import normalize_myshopify_domain
 from services.shopify_returns_service import (
     probe_shopify_return_eligibility_best_effort,
     sync_shopify_returns_best_effort,
@@ -74,15 +74,6 @@ def _coerce_readiness_bool(value: Any) -> Optional[bool]:
     return None
 
 
-def _test_psp_probe_enabled() -> bool:
-    return str(os.getenv("ALLOW_TEST_PSP_PROBE", "")).strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _test_psp_probe_merchants() -> set[str]:
-    raw = os.getenv("TEST_PSP_PROBE_MERCHANTS", "") or ""
-    return {m.strip().lower() for m in raw.split(",") if m.strip()}
-
-
 def _explicit_readiness_test_psp_probe_requested(
     *,
     psp_mode: Optional[str],
@@ -99,6 +90,23 @@ def _resolve_checkout_live_readiness_requirement(
     psp_mode: Optional[str] = None,
     test_psp_probe: Any = None,
 ) -> bool:
+    """Whether this readiness checkout must charge a LIVE-ready processor.
+
+    The scoped test-processor probe relaxes live-readiness only when all three
+    conjuncts hold: the caller explicitly asked for the probe, the server-side
+    master switch ALLOW_TEST_PSP_PROBE is on (default OFF), and the merchant is
+    in TEST_PSP_PROBE_MERCHANTS. Dropping any one of them would let a charge
+    route to a TEST processor and the order be marked paid with no real money.
+
+    The two env readers are imported from routes.order_routes rather than
+    reimplemented here: this module used to carry byte-identical private copies,
+    which meant a future tightening of the canonical gate (or of the env
+    vocabulary it accepts) would silently skip this lane. Imported lazily,
+    matching the existing `sync_order_to_connected_store` import below, so
+    readiness does not pull the whole order_routes graph at module import.
+    """
+    from routes.order_routes import _test_psp_probe_enabled, _test_psp_probe_merchants
+
     if (
         _explicit_readiness_test_psp_probe_requested(psp_mode=psp_mode, test_psp_probe=test_psp_probe)
         and _test_psp_probe_enabled()
@@ -1137,7 +1145,13 @@ async def _resolve_shopify_return_context(
             }
         )
 
-    shop_domain = str(shopify_cfg.get("shop_domain") or store_info.get("domain") or "").strip()
+    # Pinned before the resolver, which POSTs the app's client_id + client_secret to
+    # {shop_domain}/admin/oauth/access_token. Review proved a real dial to a hostile stored host from
+    # here -- one await BEFORE the returns helpers refuse, so pinning only those helpers left the
+    # stronger credential exposed on this path.
+    shop_domain = normalize_myshopify_domain(
+        shopify_cfg.get("shop_domain") or store_info.get("domain")
+    ) or ""
     access_token = ""
     if shop_domain:
         access_token, _ = await resolve_shopify_admin_access_token(
@@ -1246,6 +1260,13 @@ def _build_return_eligibility_summary(
     warnings: List[str] = []
     recommendations: List[str] = []
 
+    if platform_probe.get("ok") is False:
+        # Every warning below reads a key the probe's REFUSAL shape omits, so without this the
+        # surface answers "checked, found nothing" when in fact it never reached Shopify at all --
+        # the exact shape #2074 was merged to stop. A refusal is a louder signal than a failed
+        # probe, not a quieter one.
+        warnings.append("shopify_return_probe_refused")
+        blockers.append(str(platform_probe.get("reason") or "shopify_return_probe_refused"))
     if platform_probe.get("rest_error"):
         warnings.append("shopify_order_rest_probe_failed")
     if return_capabilities.get("queryroot_returnable_fulfillments_available") is False:
@@ -2189,6 +2210,87 @@ async def create_refund_for_checkout(
             except Exception:
                 logger.warning("Refund transaction sync failed for checkout=%s", checkout_id, exc_info=True)
                 transaction_sync = {"ok": False, "skipped": False, "reason": "refund_transaction_sync_failed"}
+
+    if isinstance(transaction_sync, dict) and transaction_sync.get("retryable"):
+        # `ensure_external_refund_transaction_best_effort` refuses to write when
+        # it cannot read the existing transaction list, because an unreadable
+        # list is the one thing that could let it create a DUPLICATE refund row.
+        # That refusal is safe only where something retries — and this surface
+        # has no retrier: the endpoint answers 200 with the refusal embedded in
+        # the response. Hand it to the durable queue so a transient Shopify 429
+        # does not mean the refund is never mirrored to the merchant at all.
+        #
+        # `skip_cancel` because this path mirrors the refund transaction only;
+        # cancelling the merchant order is the refund_api flow's business.
+        try:
+            from db.merchant_order_sync_jobs import (
+                OP_REFUND_SYNC,
+                enqueue_merchant_order_sync_job,
+            )
+
+            deferred_job_id = await enqueue_merchant_order_sync_job(
+                order_id=str(order_id),
+                merchant_id=str(merchant_id),
+                op=OP_REFUND_SYNC,
+                dedupe_key="txn:"
+                + (
+                    str(psp_refund_id or refund_id or "").strip()
+                    or f"readiness-{checkout_id}"
+                ),
+                payload={
+                    "order_id": str(order_id),
+                    "merchant_id": str(merchant_id),
+                    "shopify_order_id": str(
+                        (refreshed_order or order_row).get("shopify_order_id") or ""
+                    ),
+                    "store_id": str(
+                        (refreshed_order or order_row).get("store_id") or ""
+                    ).strip()
+                    or None,
+                    "psp_used": str(
+                        (refreshed_order or order_row).get("psp_used")
+                        or payload.get("payment_psp_used")
+                        or ""
+                    ).strip()
+                    or None,
+                    "refund_id": psp_refund_id or refund_id,
+                    "amount": float(refund_amount),
+                    "currency": str(
+                        (refreshed_order or order_row).get("currency") or "USD"
+                    ),
+                    "is_partial": False,
+                    "skip_cancel": True,
+                    # This surface already resolved the parent; the writer's
+                    # fallback only accepts kind in (sale, capture), so an
+                    # `authorization`-kind parent would otherwise be invisible
+                    # to the deferred job and it would soft-skip to `done`.
+                    "parent_transaction_id": known_parent_transaction_id,
+                },
+            )
+            if deferred_job_id is None:
+                transaction_sync = {
+                    **transaction_sync,
+                    "deferred_to_queue": False,
+                    "deferred_enqueue_failed": True,
+                }
+                logger.error(
+                    "readiness: could not defer refund transaction sync for "
+                    "checkout=%s order=%s — this work is now lost",
+                    checkout_id,
+                    order_id,
+                )
+            else:
+                transaction_sync = {
+                    **transaction_sync,
+                    "deferred_to_queue": True,
+                    "deferred_job_id": deferred_job_id,
+                }
+        except Exception:
+            logger.warning(
+                "Could not defer refund transaction sync for checkout=%s",
+                checkout_id,
+                exc_info=True,
+            )
 
     await log_order_event(
         event_type="readiness_refund_transaction_sync",

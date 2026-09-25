@@ -858,6 +858,15 @@ async def create_payment(
 
         try:
             if not _acp_offsession:
+                # Same resolver create_order used when it persisted this order's
+                # metadata: the gateway's allow_test_psp_surfaces stamp relaxes
+                # live-readiness ONLY while ALLOW_TEST_PSP_PROBE is on AND the
+                # merchant is in TEST_PSP_PROBE_MERCHANTS. Resolved from the
+                # DB-loaded order row — request-supplied fields must never reach
+                # this resolver, or any caller could route a charge to a test
+                # processor and have the order marked paid with no real money.
+                from routes.order_routes import _resolve_order_live_readiness_requirement
+
                 success, payment_intent, error, psp_used = await asyncio.wait_for(
                     create_payment_with_failover(
                         merchant_id=merchant_id,
@@ -875,10 +884,16 @@ async def create_payment(
                         preferred_psps=preferred_psps,
                         restrict_to_preferred_psps=bool(auth_first_manual_capture or requested_psp_mode),
                         canonical_psp_required=True,
-                        # P-T2.3.2: only the scoped ACP test-capture canary bypasses
-                        # live-readiness (to let a test-mode PSP transact). Every other
-                        # charge — all production flows — still enforces it.
-                        enforce_live_readiness=not acp_test_capture.bypass_live_readiness,
+                        # P-T2.3.2: the scoped ACP test-capture canary bypasses
+                        # live-readiness, and so does the order-level test-processor
+                        # probe stamped into the order's persisted metadata at
+                        # create_order. Every other charge still enforces it.
+                        enforce_live_readiness=(
+                            not acp_test_capture.bypass_live_readiness
+                            and _resolve_order_live_readiness_requirement(
+                                order_metadata, merchant_id=str(merchant_id)
+                            )
+                        ),
                     ),
                     timeout=AGENT_PAYMENT_INITIATION_TIMEOUT_SECONDS,
                 )

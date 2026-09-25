@@ -1,0 +1,26 @@
+# Generate this extension with Shopify CLI, then retain Shopify's generated uid.
+type = "web_pixel_extension"
+name = "Pivota Commerce Telemetry"
+uid = "__SHOPIFY_CLI_GENERATED_UID__"
+runtime_context = "strict"
+
+[customer_privacy]
+analytics = true
+marketing = false
+preferences = false
+sale_of_data = "disabled"
+
+[settings]
+type = "object"
+
+[settings.fields.collectorToken]
+name = "Collector token"
+description = "Origin-independent, store-bound Pivota Shopify pixel write token"
+type = "single_line_text_field"
+validations = [{ name = "min", value = "1" }]
+
+[settings.fields.endpoint]
+name = "Collector endpoint"
+description = "Pivota Shopify pixel batch endpoint"
+type = "single_line_text_field"
+validations = [{ name = "min", value = "1" }]

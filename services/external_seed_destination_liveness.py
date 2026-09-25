@@ -34,6 +34,7 @@ retire anything, and a host that stops talking to us freezes rather than decays.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -44,6 +45,7 @@ import httpx
 
 from db.database import database
 from services import crawl_politeness
+from services.catalog_offer_suppression import cascade_offer_suppression
 from services.external_offer_dual_write import MIRROR_SOURCE_SYSTEM
 from services.outbound_warm_handoff import extract_product_handle
 
@@ -276,6 +278,7 @@ async def read_brand_catalogue(
     """
     handles: Set[str] = set()
     total = 0
+    seen_pages: Set[Tuple[str, ...]] = set()
     for page in range(1, MAX_CATALOGUE_PAGES + 1):
         url = f"https://{host}/products.json?limit={PAGE_LIMIT}&page={page}"
         kind, payload = await _get_catalogue_page(client, url, attempts)
@@ -295,13 +298,22 @@ async def read_brand_catalogue(
                 # exactly the hosts most likely to be refusing us.
                 return CatalogueRead(CATALOGUE_EMPTY, set(), 0, "page 1 listed no products")
             return CatalogueRead(CATALOGUE_OK, handles, total, f"{page - 1} page(s)")
+        # A store that ignores ?page serves page 1 forever: with no short-page stop, only this
+        # ends it (before MAX_CATALOGUE_PAGES identical requests), as an honest non-read.
+        page_key = tuple(json.dumps([(p or {}).get("id"), (p or {}).get("handle"), (p or {}).get("title")],
+                                    default=str) for p in payload)
+        if page_key in seen_pages:
+            return CatalogueRead(CATALOGUE_INCOMPLETE, set(), total,
+                                 f"page {page} repeated an earlier page; pagination did not advance")
+        seen_pages.add(page_key)
         total += len(payload)
         for product in payload:
             handle = str((product or {}).get("handle") or "").strip().lower()
             if handle:
                 handles.add(handle)
-        if len(payload) < PAGE_LIMIT:
-            return CatalogueRead(CATALOGUE_OK, handles, total, f"{page} page(s)")
+        # Only the empty page above ends the catalogue: Shopify serves SHORT pages mid-catalogue
+        # (hidden products count toward `limit`; bluemercury.com page 1 = 249, page 2 = 250), and
+        # stopping on one reads every later handle as delisted.
     return CatalogueRead(
         CATALOGUE_INCOMPLETE, set(), total, f"hit MAX_CATALOGUE_PAGES={MAX_CATALOGUE_PAGES}"
     )
@@ -503,7 +515,12 @@ async def retire_seed_for_dead_destination(
         """,
         {"id": seed_id, "note": note},
     )
-    await database.execute(
+    # RETURNING product_key, not execute(): `databases` + asyncpg gives no
+    # rowcount, and the keys are needed anyway to cascade the suppression to the
+    # product's offers below. Reading them from a separate SELECT would race the
+    # UPDATE's own WHERE (`suppressed_at IS NULL`) and cascade offers belonging to
+    # a product this call did not actually gate.
+    suppressed = await database.fetch_all(
         """
         UPDATE catalog_products
         SET suppressed_at = :stamp,
@@ -512,6 +529,7 @@ async def retire_seed_for_dead_destination(
         WHERE source_ref = :id
           AND source_system = :source_system
           AND suppressed_at IS NULL
+        RETURNING product_key
         """,
         {
             "id": seed_id,
@@ -527,11 +545,30 @@ async def retire_seed_for_dead_destination(
             # incremental work off catalog_products.updated_at must be able to see a withdrawal.
         },
     )
+    # CASCADE TO THE OFFERS. `catalog_products.suppressed_at` gates the PRODUCT;
+    # every offer-grain read lane (priced_offer_sql, fetch_offers_for_keys, the
+    # recall candidate CTE) filters on `catalog_offers.suppressed_at` instead. So
+    # retiring a product whose destination is DEAD while leaving its offers live
+    # keeps quoting a price for a URL this very function just proved is gone.
+    # This lane is nightly and unattended, which is why it is a large share of
+    # the 2,171 suppressed-product-with-live-offer rows measured on prod
+    # 2026-09-08.
+    # `db=database` explicitly: the cascade must run through the SAME handle
+    # this function is already writing on, not through its own module-level
+    # import. In production they are one object; in a test they are not, and a
+    # helper that reached past the caller's handle would write to a different
+    # database than the statement above.
+    cascaded = await cascade_offer_suppression(
+        [str(row["product_key"]) for row in (suppressed or [])], db=database
+    )
     logger.info(
         "external seed retired for dead destination",
-        extra={"seed_id": seed_id, "verdict": observation.verdict},
+        extra={"seed_id": seed_id, "verdict": observation.verdict,
+               "products_suppressed": len(suppressed or []),
+               "offers_cascaded": len(cascaded)},
     )
-    return {"seed_id": seed_id, "retired": True, "verdict": observation.verdict}
+    return {"seed_id": seed_id, "retired": True, "verdict": observation.verdict,
+            "offers_suppressed": len(cascaded)}
 
 
 async def get_sweep_candidates(limit: int) -> List[Dict[str, Any]]:

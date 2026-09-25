@@ -47,6 +47,11 @@ from services.executor_agents.base import (
 # PIVOTA_GEMINI_API_KEY) — shared with the content-brief executor.
 from services.executor_agents.content_brief import _resolve_gemini_api_key
 from services import vertex_gemini
+from services.merchant_write_guardrails import (
+    KIND_PRODUCT_ENRICHMENT,
+    check_guardrails,
+    items_from_payload,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -770,21 +775,49 @@ class CanonicalPdpEnrichmentAgent(BaseExecutorAgent):
 
             # Persist to the enrichment overlay (candidate filter already
             # excluded rows with existing description_markdown, so no clobber).
+            overlay = {
+                "description_markdown": gen["description_markdown"],
+                "summary_short": gen.get("summary_short"),
+                "bullet_points": gen.get("bullet_points"),
+                "usage_scenarios": gen.get("usage_scenarios"),
+                "audience_tags": gen.get("audience_tags"),
+                "title_override": gen.get("title_override"),
+                "llm_safety_flags": {"auto_generated_by": self.name},
+            }
+
+            # STAGE-time guardrails. This is the point the model's copy becomes a
+            # proposed merchant-visible change: the overlay it lands in is what the
+            # served PDP renders and what `publish_content_to_store` later sends to the
+            # merchant's live store. Refused copy is blocked like any other gate
+            # failure — counted, reasoned, and never written.
+            violations = check_guardrails(
+                KIND_PRODUCT_ENRICHMENT,
+                items_from_payload(
+                    f"{cand['merchant_id']}:{cand['platform']}:{cand['source_product_id']}",
+                    overlay,
+                ),
+            )
+            if violations:
+                logger.warning(
+                    "canonical_pdp_enrichment: write guardrails BLOCKED %s/%s/%s: %s",
+                    ident["merchant_id"], ident["platform"],
+                    ident["source_product_id"], "; ".join(violations)[:300],
+                )
+                blocked.append({
+                    **ident,
+                    "reason": "write_guardrail",
+                    "gate": "merchant_write_guardrails",
+                    "violations": violations,
+                })
+                continue
+
             try:
                 await upsert_enrichment(
                     cand["merchant_id"],
                     cand["platform"],
                     cand["source_product_id"],
                     "default",
-                    {
-                        "description_markdown": gen["description_markdown"],
-                        "summary_short": gen.get("summary_short"),
-                        "bullet_points": gen.get("bullet_points"),
-                        "usage_scenarios": gen.get("usage_scenarios"),
-                        "audience_tags": gen.get("audience_tags"),
-                        "title_override": gen.get("title_override"),
-                        "llm_safety_flags": {"auto_generated_by": self.name},
-                    },
+                    overlay,
                 )
             except Exception as exc:  # noqa: BLE001
                 failed.append({**ident, "reason": f"upsert_failed: {exc!r}"})

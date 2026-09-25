@@ -53,11 +53,14 @@ def test_canonical_search_selects_pdp_scope_for_consumers():
 # ---------------------------------------------------------------------------
 
 
-def test_canonical_search_filters_to_live_lifecycle_stages_for_global_queries():
-    """The whole point of O-5: drafts and candidates (thin content,
-    no taxonomy) must NOT surface in global recall. Pin both the
-    enum and the IS NULL grandfather so a future "tighten the gate"
-    PR is intentional, not accidental."""
+def test_broad_global_recall_filters_to_live_lifecycle_stages():
+    """Content-led global recall keeps the O-5 lifecycle gate.
+
+    Strict canonical-SIG commerce recall deliberately bypasses the content
+    workflow gate because its product/SKU/offer/seller gates establish
+    sellability independently. Pin that split so neither path silently
+    regresses into the other.
+    """
     src = _src(pivot_query_service._fetch_canonical_search_rows)
     assert "p.pdp_lifecycle_stage IN ('validated', 'published')" in src, (
         "global recall must hard-filter on live lifecycle stages "
@@ -69,21 +72,16 @@ def test_canonical_search_filters_to_live_lifecycle_stages_for_global_queries():
     )
 
 
-def test_canonical_search_lifecycle_filter_skips_merchant_scoped_queries():
-    """A merchant calling find_products with their own merchant_id
-    should always see their inventory regardless of stage — they
-    haven't promised the gateway anything about taxonomy fill yet,
-    and hiding their candidate-stage products from their own dashboard
-    is wrong."""
+def test_lifecycle_filter_skips_merchant_scoped_and_canonical_sig_queries():
+    """Merchant inventory and canonical product-card commerce recall must not
+    be blocked by the asynchronous content-enrichment lifecycle."""
     src = _src(pivot_query_service._fetch_canonical_search_rows)
-    # The lifecycle clause must be inside an `if not merchant_id`
-    # branch so merchant-scoped queries skip it.
-    assert "if not merchant_id" in src, (
-        "lifecycle filter must be merchant_id-conditional to keep merchant-scoped "
-        "recall returning all of a merchant's inventory"
+    assert "if not merchant_id and not require_signature" in src, (
+        "lifecycle filter must skip both merchant-scoped and canonical-SIG "
+        "commerce recall"
     )
     assert "lifecycle_clause" in src, (
-        "the merchant_id-conditional lifecycle SQL fragment must be a named variable "
+        "the lifecycle SQL fragment must be a named variable "
         "for clarity at the SQL site"
     )
 

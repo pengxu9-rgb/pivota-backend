@@ -1,0 +1,52 @@
+-- 227: the consent tag a buyer's stored-card enrollment hangs off.
+--
+-- WHY THIS LANDS ON reap_agentic_buyer_refs AND NOT ON THE PURCHASE ROW.
+--
+-- Consent here is not consent to ONE purchase — that is what approving Reap's hosted page is,
+-- and it is recorded by the purchase's own state machine. This column records the version of the
+-- terms under which we were willing to hold a DURABLE buyer identity for an agent's end user and
+-- enrol a card against it. That fact belongs to the buyer, lasts across purchases, and has
+-- exactly one row per buyer here. A copy per purchase would be the same string repeated, and the
+-- question a regulator or an auditor asks is "under which version is this buyer enrolled", which
+-- a per-purchase column answers N times and possibly N different ways.
+--
+-- WHY IT IS A VERSION TAG AND NOT THE TEXT. The wording is the owner's and lives wherever the
+-- door renders it. What the backend must be able to prove is WHICH wording was shown, and a tag
+-- is the only part of that a client can be trusted to send: the prose itself, accepted from a
+-- caller, would be a caller-authored record of the caller's own obligation.
+--
+-- NULLABLE, AND THAT IS NOT A LOOSE END. `routes/agent_commerce_reap.start_reap_purchase`
+-- REQUIRES `buyer.consent_version` and refuses `consent_required` (400) before it writes
+-- anything, so no row this rail creates from today on can have a NULL here. The column is
+-- nullable because rows minted before this migration exist and a NOT NULL would need a
+-- backfilled value — which would mean inventing a consent nobody gave. NULL reads as "we do not
+-- know", which is the truth about those rows and is distinguishable from every value.
+--
+-- VARCHAR(32) because the route caps the tag at 32 printable characters before it binds. A value
+-- past the cap is refused as `consent_required` rather than silently truncated at the driver:
+-- a truncated version tag names a different version.
+--
+-- consented_at IS THE LATEST, NOT THE FIRST. Every POST rewrites both columns together, so the
+-- pair always answers "the most recent consent this buyer gave, and when". A first-consent
+-- timestamp would be `created_at`, which the table already has.
+--
+-- Production deploys skip db/migrations/, so both ADD COLUMNs are ALSO in
+-- db/schema_guard.ensure_required_schema_light, in BOTH dialect branches, each statement in its
+-- own try. The two must build the SAME SCHEMA, not the same bytes (the SQLite twin substitutes
+-- TIMESTAMP for TIMESTAMPTZ, which it must). The catalog-parity test
+-- tests/test_agent_commerce_reap_routes_postgres.py::
+-- test_the_self_heal_builds_the_same_schema_as_migration_226 reads what the DATABASE built from
+-- each, so a divergence here is a failure there rather than a surprise in production.
+--
+-- WHAT THE COVERAGE GATE ACTUALLY COVERS HERE — less than it looks.
+-- tests/test_schema_guard_migration_coverage.py matches this file's two ADD COLUMNs against the
+-- POSTGRES branch's statement only. The SQLite twin builds its DDL with an f-string
+-- (`ADD COLUMN {_consent_column} …`), and the gate's regex reads source text, so the column name
+-- is a placeholder it cannot see. Deleting the SQLite heal would therefore NOT turn that gate
+-- red. What defends it is the runtime suite — tests/test_agent_commerce_reap_routes.py builds
+-- its schema through the self-heal and every consent assertion in it fails without these
+-- columns — and that is the check to keep working, not the coverage gate.
+
+ALTER TABLE IF EXISTS reap_agentic_buyer_refs
+    ADD COLUMN IF NOT EXISTS consent_version VARCHAR(32),
+    ADD COLUMN IF NOT EXISTS consented_at TIMESTAMPTZ;

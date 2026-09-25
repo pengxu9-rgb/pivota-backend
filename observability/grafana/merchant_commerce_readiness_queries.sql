@@ -103,7 +103,9 @@ WITH issue_rollup AS (
     'MISSING_INFO' AS issue_code,
     COUNT(*) AS issue_count
   FROM surface_click_events
-  WHERE canonical_variant_id IS NULL OR TRIM(canonical_variant_id) = ''
+  WHERE (canonical_variant_id IS NULL OR TRIM(canonical_variant_id) = '')
+    -- an issued link nobody followed yet is not a click (ADR-025 D1)
+    AND (COALESCE(click_count, 0) > 0 OR COALESCE(impression_count, 0) > 0)
   GROUP BY merchant_id
   UNION ALL
   SELECT

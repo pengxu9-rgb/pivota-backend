@@ -69,7 +69,7 @@ class FakeCreditConn:
         sql = str(query)
         if "merchant_credit_balance/active_subscription_allowance" in sql:
             row = self.subscriptions.get(str(values["merchant_id"]))
-            if row and row.get("status") in {"active", "trialing"}:
+            if row and row.get("status") in {"active", "trialing"} and not row.get("expired"):
                 return {
                     "monthly_credit_allowance": row["monthly_credit_allowance"],
                     "plan_tier": row["plan_tier"],
@@ -190,6 +190,14 @@ class FakeCreditConn:
     async def execute(self, query: str, values: Optional[Dict[str, Any]] = None):
         values = values or {}
         sql = str(query)
+        if "merchant_credit_balance/expire_stale_subscription_allowance" in sql:
+            mid = str(values['merchant_id'])
+            row = self.balances.get(mid)
+            sub = self.subscriptions.get(mid) or {}
+            if row and sub.get('expired'):
+                row.update(credits=row['purchased_credits'], allowance_credits=0,
+                           allowance_period_start=None, plan_tier='free')
+            return None
         if "merchant_credit_balance/ensure_row" in sql:
             merchant_id = str(values["merchant_id"])
             if merchant_id not in self.balances:
@@ -1190,3 +1198,24 @@ def test_credits_for_probe_uses_seeded_provider_config():
     assert credits_for_probe("gemini", grounded=True) == pytest.approx(4.4)
     assert credits_for_probe("chatgpt", grounded=True) == pytest.approx(11.7)
     assert credits_for_probe("deepseek", grounded=False) == pytest.approx(0.1)
+
+
+@pytest.mark.asyncio
+async def test_expired_active_subscription_cannot_refill_and_retains_granted_credits():
+    from services import merchant_credit_balance_service as svc
+    fake = FakeCreditConn()
+    fake.seed('expired', credits=4997, purchased_credits=1000, allowance_credits=4000, plan_tier='starter')
+    fake.seed_subscription('expired', allowance=4000)
+    fake.subscriptions['expired']['expired'] = True
+    first = await svc.apply_subscription_allowance('expired', conn=fake)
+    second = await svc.apply_subscription_allowance('expired', conn=fake)
+    assert first['credits'] == second['credits'] == 1000
+    assert first['allowance_credits'] == 0 and first['plan_tier'] == 'free'
+
+
+@pytest.mark.asyncio
+async def test_manual_wallet_without_expired_subscription_is_preserved():
+    from services import merchant_credit_balance_service as svc
+    fake = FakeCreditConn()
+    fake.seed('manual', credits=1000, purchased_credits=1000)
+    assert (await svc.apply_subscription_allowance('manual', conn=fake))['credits'] == 1000

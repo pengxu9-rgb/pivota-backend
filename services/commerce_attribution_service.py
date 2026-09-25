@@ -3,21 +3,27 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from db.commerce_attribution import commerce_attribution_edges, surface_click_events
-from db.database import database
+from db.database import IS_POSTGRES, database
 from observability.reliability_metrics import (
     record_commerce_attribution_inferred_recovered,
     record_commerce_attribution_silent_reject,
     record_traffic_taxonomy,
 )
 from services.commerce_interaction_service import record_commerce_event_best_effort
+from services.commerce_ledger_provenance import ledger_provenance
+from services.commerce_order_ref import pivota_order_ref
+from services.gmv_aggregation_service import recompute_days_for_edges
 from services.canonical_commerce_service import (
     make_canonical_product_id,
     make_canonical_variant_id,
@@ -37,6 +43,10 @@ PVT_PROMPT_CLUSTER = "pvt_prompt_cluster"
 # the join key on the way back in (orders/paid webhook). Keep in lockstep with
 # services/outbound_links_service.build_shopify_cart_permalink.
 EXTERNAL_CLICK_NOTE_ATTR = "pivota_click_id"
+# The marker Pivota's Shopify/WooCommerce order writeback stamps on the
+# platform order, so a later webhook for that order can be recognised as
+# Pivota-originated without a database lookup. See services/commerce_order_ref.py.
+PIVOTA_ORDER_ID_NOTE_ATTR = "pivota_order_id"
 EDGE_STATE_REFERRED = "referred"
 EDGE_STATE_CONVERTED = "converted"
 EDGE_SOURCE_EXTERNAL_REDIRECT = "external_redirect"
@@ -44,6 +54,127 @@ EDGE_SOURCE_EXTERNAL_REDIRECT = "external_redirect"
 
 def new_click_id() -> str:
     return f"clk_{uuid.uuid4().hex[:24]}"
+
+
+# ── Issuing a click (ADR-025 D1) ────────────────────────────────────────────────────────────────
+#
+# A click id is RECORDED when the link carrying it is issued to an agent, not when a buyer first
+# follows it. Before this, surface_click_events got a row only on a `/r` hit, so a link an agent
+# handed out and nobody followed left no trace, and the agent that issued it was never known:
+# the signed `/r` token carries no agent. Now the row is written here at issue time with
+# click_count = 0 and issued_at set, and `/r` (record_surface_event) only increments it.
+#
+# "Issued" = the row exists with issued_at set; "clicked" = click_count > 0. There is no state
+# column to keep in sync. issued_at NULL marks a LEGACY row: one `/r` created for a link issued
+# before this change (or by a lane that does not issue yet).
+
+#: surface_click_events column widths. A value that does not fit is DROPPED, never truncated:
+#: a truncated agent or merchant id is a different identity, and would credit the wrong one.
+_CLICK_COLUMN_MAX = {
+    "click_id": 64, "merchant_id": 50, "surface": 64, "commerce_surface": 64,
+    "canonical_product_id": 64, "canonical_variant_id": 64, "source_channel": 128,
+    "agent_id": 64, "dest_domain": 256,
+}
+
+#: What traffic taxonomy writes when it has no agent. Stored as NULL here: the funnel reads
+#: 'unknown' as "no agent", and a real column value must never collide with it.
+_NO_AGENT_SENTINELS = frozenset({"unknown", "none", "null"})
+
+
+@dataclass(frozen=True)
+class IssuedClick:
+    """One click id handed to an agent inside a link. `agent_id` is the AUTHENTICATED caller
+    (never a request body value), or None when the link is not bound to one agent (a cached
+    search result, degraded auth, an internal key)."""
+
+    click_id: str
+    surface: str
+    agent_id: Optional[str] = None
+    merchant_id: Optional[str] = None
+    canonical_product_id: Optional[str] = None
+    canonical_variant_id: Optional[str] = None
+    commerce_surface: Optional[str] = None
+    source_channel: Optional[str] = None
+    destination_url: Optional[str] = None
+    dest_domain: Optional[str] = None
+    context: Optional[Dict[str, Any]] = None
+    #: The link that carries this click, as handed to the caller. NOT stored: a lane that mints
+    #: before it decides what to serve uses it to record only the clicks it actually served.
+    link: Optional[str] = None
+
+
+def _fits(column: str, value: Any) -> Optional[str]:
+    text = str(value or "").strip()
+    if not text or len(text) > _CLICK_COLUMN_MAX.get(column, 1 << 30):
+        return None
+    return text
+
+
+def _issued_agent_id(value: Any) -> Optional[str]:
+    text = _fits("agent_id", value)
+    if text is None or text.lower() in _NO_AGENT_SENTINELS:
+        return None
+    return text
+
+
+def _insert_ignoring_existing_click(rows: List[Dict[str, Any]]):
+    """INSERT … ON CONFLICT (click_id) DO NOTHING, in the engine's own dialect. The primary key is
+    the only guard needed: a click id is written once, and every later writer only increments."""
+    stmt = (pg_insert if IS_POSTGRES else sqlite_insert)(surface_click_events).values(rows)
+    return stmt.on_conflict_do_nothing(index_elements=["click_id"])
+
+
+def _issued_row(click: IssuedClick, now: datetime) -> Optional[Dict[str, Any]]:
+    click_id = _fits("click_id", click.click_id)
+    if click_id is None:
+        return None
+    surface = _fits("surface", click.surface) or "unknown"
+    return {
+        "click_id": click_id,
+        "merchant_id": _fits("merchant_id", click.merchant_id),
+        "surface": surface,
+        "commerce_surface": _fits("commerce_surface", click.commerce_surface) or surface,
+        "canonical_product_id": _fits("canonical_product_id", click.canonical_product_id),
+        "canonical_variant_id": _fits("canonical_variant_id", click.canonical_variant_id),
+        "source_channel": _fits("source_channel", click.source_channel),
+        "agent_id": _issued_agent_id(click.agent_id),
+        "destination_url": str(click.destination_url or "").strip() or None,
+        "dest_domain": _fits("dest_domain", click.dest_domain),
+        "context": dict(click.context) if click.context else None,
+        "impression_count": 0,
+        "click_count": 0,
+        "issued_at": now,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
+async def issue_clicks(clicks: Sequence[IssuedClick]) -> int:
+    """Record click ids at issue time, in ONE statement. Returns how many rows were offered.
+
+    Raises on a database error; each caller decides its failure policy. A lane that serves many
+    links per request (offers.resolve) catches it and serves the links anyway, because losing
+    the click record must never take down search. A lane whose purchase depends on the click
+    (the Reap cart link) lets it raise and refuses.
+
+    An id already recorded is left as it is (ON CONFLICT DO NOTHING): issuing is not a click, and
+    a retried request must not reset a row a buyer has already followed.
+    """
+    now = _now()
+    rows: Dict[str, Dict[str, Any]] = {}
+    for click in clicks:
+        row = _issued_row(click, now)
+        if row is not None:
+            rows.setdefault(row["click_id"], row)
+    if not rows:
+        return 0
+    await database.execute(_insert_ignoring_existing_click(list(rows.values())))
+    return len(rows)
+
+
+async def issue_click(click: IssuedClick) -> None:
+    """issue_clicks for one click. Raises on a database error."""
+    await issue_clicks([click])
 
 
 def _now() -> datetime:
@@ -179,6 +310,86 @@ def apply_pvt_params(destination_url: str, attribution: Dict[str, Optional[str]]
     return urlunparse(parsed._replace(query=urlencode(existing, doseq=True)))
 
 
+# `/r` only INCREMENTS: one statement per event type, atomic under concurrent hits (the old
+# read-then-write lost an increment when two hits interleaved). No CASE and no casts, so the same
+# text runs on Postgres and SQLite (RETURNING is native on both).
+_COUNT_CLICK_SQL = """
+UPDATE surface_click_events
+SET click_count = COALESCE(click_count, 0) + 1,
+    first_click_at = COALESCE(first_click_at, :now),
+    last_click_at = :now,
+    updated_at = :now
+WHERE click_id = :click_id
+RETURNING click_id, interaction_id, context, merchant_id, surface, commerce_surface,
+          canonical_product_id, canonical_variant_id, prompt_cluster, rule_id, job_id, session_id,
+          source_channel, source_family, query_source, agent_id, protocol_name, llm_provider,
+          llm_model, caller_id, destination_url, dest_domain, issued_at
+"""
+
+_COUNT_IMPRESSION_SQL = _COUNT_CLICK_SQL.replace("click_count", "impression_count").replace(
+    "first_click_at", "first_impression_at"
+).replace("last_click_at", "last_impression_at")
+
+#: Descriptive fields `/r` may FILL but never overwrite. Whatever issue_clicks recorded (above all
+#: the authenticated agent, which the `/r` token does not carry) stays as issued.
+_FILL_ONLY_FIELDS = (
+    "merchant_id", "surface", "commerce_surface", "canonical_product_id", "canonical_variant_id",
+    "prompt_cluster", "rule_id", "job_id", "session_id", "source_channel", "source_family",
+    "query_source", "agent_id", "protocol_name", "llm_provider", "llm_model", "caller_id",
+    "destination_url", "dest_domain",
+)
+
+
+def _as_json_obj(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _settle_context_agent(merged: Dict[str, Any], stored: Dict[str, Any], *, issued: bool) -> None:
+    """The agent keys in a click row's context follow the same rule as its agent_id column.
+
+    Traffic taxonomy puts agent_id='unknown' (and agent_identity_confidence) into every hit's
+    context when the token names no agent; that sentinel never lands. On an ISSUED row the hit
+    cannot add an agent the issue did not record, so only what was stored stays. In place.
+    """
+    traffic = merged.get("traffic") if isinstance(merged.get("traffic"), dict) else None
+    stored_traffic = stored.get("traffic") if isinstance(stored.get("traffic"), dict) else {}
+    if issued:
+        for key in ("agent_id", "agent_identity_confidence"):
+            if key in stored:
+                merged[key] = stored[key]
+            else:
+                merged.pop(key, None)
+        if traffic is not None:
+            traffic = dict(traffic)
+            if "agent_id" in stored_traffic:
+                traffic["agent_id"] = stored_traffic["agent_id"]
+            else:
+                traffic.pop("agent_id", None)
+            merged["traffic"] = traffic
+        return
+    if _issued_agent_id(merged.get("agent_id")) is None:
+        merged.pop("agent_id", None)
+        merged.pop("agent_identity_confidence", None)
+    if traffic is not None and _issued_agent_id(traffic.get("agent_id")) is None:
+        traffic = dict(traffic)
+        traffic.pop("agent_id", None)
+        merged["traffic"] = traffic
+
+
+async def _count_surface_event(click_id: str, event_type: str, now: datetime) -> Optional[Dict[str, Any]]:
+    sql = _COUNT_CLICK_SQL if event_type == "click" else _COUNT_IMPRESSION_SQL
+    row = await database.fetch_one(sql, {"click_id": click_id, "now": now})
+    return dict(row) if row is not None else None
+
+
 async def record_surface_event(
     *,
     token_payload: Dict[str, Any],
@@ -194,12 +405,6 @@ async def record_surface_event(
     context_with_taxonomy = attach_traffic_taxonomy({**ctx, **attribution}, attribution)
     click_id = attribution[PVT_CLICK_ID]
     now = _now()
-    existing = await database.fetch_one(
-        select(surface_click_events).where(surface_click_events.c.click_id == click_id)
-    )
-
-    impression_increment = 1 if event_type == "impression" else 0
-    click_increment = 1 if event_type == "click" else 0
     common_values = {
         "merchant_id": attribution.get("merchant_id"),
         "surface": attribution[PVT_SURFACE] or "unknown",
@@ -224,90 +429,109 @@ async def record_surface_event(
         "ip": request_meta.get("ip"),
         "context": context_with_taxonomy,
     }
+    # The same normalisation issue_clicks applies, on everything /r writes. Traffic taxonomy says
+    # agent_id='unknown' whenever the token names no agent; that sentinel is never a column value.
+    for field in _CLICK_COLUMN_MAX:
+        if field in common_values and field != "agent_id":
+            common_values[field] = _fits(field, common_values[field])
+    common_values["agent_id"] = _issued_agent_id(common_values.get("agent_id"))
+    common_values["surface"] = common_values["surface"] or "unknown"
+    common_values["commerce_surface"] = common_values["commerce_surface"] or common_values["surface"]
 
-    if existing:
-        row = dict(existing)
-        interaction_id = _first_nonempty(row, "interaction_id") or _first_nonempty(common_values["context"], "interaction_id")
-        values = {
+    counted = await _count_surface_event(click_id, event_type, now)
+    if counted is None:
+        # Never issued: a link from before issue_clicks, or from a lane that does not issue yet.
+        # Write it as a LEGACY row (issued_at NULL, counts 0), ignoring a concurrent writer that got
+        # there first, then count exactly like an issued one, so no increment is lost either way.
+        await database.execute(_insert_ignoring_existing_click([{
+            "click_id": click_id,
             **common_values,
-            "interaction_id": interaction_id,
-            "impression_count": int(row.get("impression_count") or 0) + impression_increment,
-            "click_count": int(row.get("click_count") or 0) + click_increment,
-            "last_impression_at": now if impression_increment else row.get("last_impression_at"),
-            "last_click_at": now if click_increment else row.get("last_click_at"),
-            "first_impression_at": row.get("first_impression_at") or (now if impression_increment else None),
-            "first_click_at": row.get("first_click_at") or (now if click_increment else None),
+            "impression_count": 0,
+            "click_count": 0,
+            "created_at": now,
             "updated_at": now,
-        }
-        await database.execute(
-            surface_click_events.update()
-            .where(surface_click_events.c.click_id == click_id)
-            .values(**values)
-        )
-        interaction_event = await record_commerce_event_best_effort(
-            event_type=f"surface.{event_type}",
-            metadata={
-                **common_values["context"],
-                "merchant_id": common_values["merchant_id"],
-                "platform": _first_nonempty(ctx, "platform"),
-                "surface": common_values["surface"],
-                "click_id": click_id,
-                "canonical_product_id": common_values["canonical_product_id"],
-                "canonical_variant_id": common_values["canonical_variant_id"],
-                "session_id": common_values["session_id"],
-            },
-            source="surface_click_events",
-            upstream_idempotency_key=f"{click_id}:{event_type}",
-        )
-        if event_type == "click":
-            record_traffic_taxonomy(
-                stage="click",
-                taxonomy=attribution,
-            )
-        if not interaction_id:
-            values["interaction_id"] = interaction_event["interaction_id"]
-            await database.execute(
-                surface_click_events.update()
-                .where(surface_click_events.c.click_id == click_id)
-                .values(interaction_id=interaction_event["interaction_id"], updated_at=_now())
-            )
-        return values
+        }]))
+        counted = await _count_surface_event(click_id, event_type, now) or {}
 
+    # Fill what the row lacks; keep what it has, decided IN SQL (COALESCE) so two concurrent hits
+    # cannot overwrite each other either. `user_agent` / `ip` describe THIS hit, so the latest
+    # wins, as before (the row describes the last clicker, not the converting device).
+    #
+    # On an ISSUED row agent_id is not fillable at all: an issued NULL is a decision (a shared
+    # search link, an internal key, degraded auth), not a gap, and the only thing that could fill
+    # it is a value from the token, which is never how an agent is named (ADR-025 D1).
+    issued = counted.get("issued_at") is not None
+    fillable = [f for f in _FILL_ONLY_FIELDS if not (issued and f == "agent_id")]
+    fill: Dict[str, Any] = {
+        field: func.coalesce(surface_click_events.c[field], common_values[field])
+        for field in fillable
+        if common_values.get(field) not in (None, "")
+    }
+    stored_context = _as_json_obj(counted.get("context"))
+    merged_context = {
+        **{k: v for k, v in context_with_taxonomy.items() if v is not None},
+        **{k: v for k, v in stored_context.items() if v is not None},
+    }
+    _settle_context_agent(merged_context, stored_context, issued=issued)
+    fill["context"] = merged_context
+    fill["user_agent"] = common_values["user_agent"]
+    fill["ip"] = common_values["ip"]
+    fill["updated_at"] = now
+    await database.execute(
+        surface_click_events.update().where(surface_click_events.c.click_id == click_id).values(**fill)
+    )
+    filled_view = {
+        field: common_values[field]
+        for field in fillable
+        if counted.get(field) in (None, "") and common_values.get(field) not in (None, "")
+    }
+
+    # The ledger event describes the row as it now stands: issued identity first, this hit's
+    # context filling the gaps.
+    row_view = {
+        **common_values,
+        **{k: v for k, v in counted.items() if v not in (None, "")},
+        **filled_view,
+        "context": merged_context,
+    }
+    if issued:
+        row_view["agent_id"] = counted.get("agent_id")
+    interaction_id = _first_nonempty(counted, "interaction_id") or _first_nonempty(merged_context, "interaction_id")
     interaction_event = await record_commerce_event_best_effort(
         event_type=f"surface.{event_type}",
         metadata={
-            **common_values["context"],
-            "merchant_id": common_values["merchant_id"],
+            **merged_context,
+            "merchant_id": row_view.get("merchant_id"),
             "platform": _first_nonempty(ctx, "platform"),
-            "surface": common_values["surface"],
+            "surface": row_view.get("surface"),
             "click_id": click_id,
-            "canonical_product_id": common_values["canonical_product_id"],
-            "canonical_variant_id": common_values["canonical_variant_id"],
-            "session_id": common_values["session_id"],
+            "canonical_product_id": row_view.get("canonical_product_id"),
+            "canonical_variant_id": row_view.get("canonical_variant_id"),
+            "session_id": row_view.get("session_id"),
         },
         source="surface_click_events",
         upstream_idempotency_key=f"{click_id}:{event_type}",
+        **ledger_provenance("surface_click_attribution", "unknown"),
     )
     if event_type == "click":
         record_traffic_taxonomy(
             stage="click",
             taxonomy=attribution,
         )
-    values = {
+    if not interaction_id and interaction_event.get("interaction_id"):
+        interaction_id = interaction_event["interaction_id"]
+        await database.execute(
+            surface_click_events.update()
+            .where(surface_click_events.c.click_id == click_id)
+            .where(surface_click_events.c.interaction_id.is_(None))
+            .values(interaction_id=interaction_id, updated_at=_now())
+        )
+    return {
         "click_id": click_id,
-        **common_values,
-        "interaction_id": interaction_event["interaction_id"],
-        "impression_count": impression_increment,
-        "click_count": click_increment,
-        "first_impression_at": now if impression_increment else None,
-        "last_impression_at": now if impression_increment else None,
-        "first_click_at": now if click_increment else None,
-        "last_click_at": now if click_increment else None,
-        "created_at": now,
-        "updated_at": now,
+        **row_view,
+        "interaction_id": interaction_id,
+        "issued_at": counted.get("issued_at"),
     }
-    await database.execute(surface_click_events.insert().values(**values))
-    return values
 
 
 # Bounded window for the token-less fallback join (#1481). Tighter than the
@@ -324,6 +548,9 @@ _INFERRED_CLICK_LOOKUP_SQL = (
     "source_channel, source_family, query_source, prompt_cluster "
     "FROM surface_click_events "
     "WHERE agent_id = :agent_id AND merchant_id = :merchant_id "
+    # Only rows /r touched: since ADR-025 D1 a row also exists for a link that was only ISSUED,
+    # and an order must not be inferred from a link the buyer never followed.
+    "AND (COALESCE(click_count, 0) > 0 OR COALESCE(impression_count, 0) > 0) "
     "AND COALESCE(last_click_at, created_at) >= :cutoff "
     "ORDER BY COALESCE(last_click_at, created_at) DESC LIMIT 1"
 )
@@ -456,6 +683,12 @@ async def upsert_order_attribution_edge(
             "merchant_id": merchant_id,
             "interaction_id": _first_nonempty(payload, "interaction_id"),
             "order_id": order_id,
+            # Always a Pivota `orders.order_id` (every caller passes one), so
+            # this edge names the same purchase the Stripe bridge and the
+            # Shopify adapter do. Without it this row counted a second
+            # `order.created` against the platform adapter's, under a scope
+            # with no store_id at all.
+            "order_ref": pivota_order_ref(order_id),
             "platform": _first_nonempty(payload, "platform"),
             "trace_id": _first_nonempty(payload, "trace_id"),
             "brief_id": _first_nonempty(payload, "brief_id"),
@@ -464,6 +697,7 @@ async def upsert_order_attribution_edge(
         },
         source="commerce_attribution_edges",
         upstream_idempotency_key=f"order:{order_id}",
+        **ledger_provenance("commerce_attribution_edge", "unknown"),
     )
     record_traffic_taxonomy(stage="order", taxonomy=attribution)
     values["interaction_id"] = interaction_event["interaction_id"]
@@ -529,12 +763,12 @@ async def get_order_attribution_edge_id(order_id: Optional[str]) -> Optional[str
         return None
 
 
-# Atomic refund attribution UPDATE that handles the multi-edge fan-out case
-# correctly. v1.3 T9 stamps every commerce_attribution_edges row sharing an
-# order_id with the same gross_attributed_gmv_cents — by design (one edge per
-# surface_click_event). The matching refund behavior is to apply the same
-# refund delta to every edge, so per-rollup-group (date, merchant, agent,
-# channel_partner) net math stays symmetric.
+# Atomic refund attribution UPDATE. It is written for a multi-edge fan-out
+# (v1.3 T9 stamped every edge sharing an order_id with the same
+# gross_attributed_gmv_cents), but idx_commerce_attribution_edges_order is
+# UNIQUE on order_id (migration 060, db/commerce_attribution.py), so today an
+# order has at most one edge and "every edge" means that one. The per-edge,
+# single-statement form still matters for the atomicity reasons below.
 #
 # Prior implementation read one edge via fetch_one, computed new totals in
 # Python, and wrote the same values to all N edges via a bulk UPDATE. Two
@@ -579,19 +813,134 @@ WHERE order_id = :order_id
 RETURNING edge_id, merchant_id, click_id, canonical_product_id,
           canonical_variant_id, surface, prompt_cluster, interaction_id,
           metadata, refund_ids, refund_count, refund_amount_cents,
-          refunded_amount, refunded_at, latest_refund_at
+          refunded_amount, refunded_at, latest_refund_at,
+          -- the edge's billing day, for recompute_days_for_edges
+          created_at
 """
 
 
-async def attach_refund_to_attribution_edge(
+# A PSP refund on a Pivota order, applied as a CEILING rather than an increment.
+#
+# Stripe reports one refund under several ids: `charge.refunded` carries the
+# charge id (ch_) with the charge's CUMULATIVE amount, `refund.updated` carries
+# the refund id (re_) with that one refund's amount, and RefundService records a
+# merchant-initiated refund under its own REF_ id. _ATTRIBUTE_REFUND_QUERY dedupes
+# on the id it is handed, so the same money landed two or three times, and a
+# second partial refund's charge.refunded (same ch_) was dropped. Measured on
+# Postgres by tests/test_stripe_refund_attribution_edge_postgres.py.
+#
+# The order's reconciled total_refunded already gets these sequences right
+# (tests/test_stripe_refund_partial_accounting.py), so the edge follows it:
+# refund part = GREATEST(current refund part, order total). Replays, event order
+# and which ids arrive stop mattering, and the value can never go down.
+#
+# Chargebacks are NOT in orders.total_refunded. They stay additive per dispute id
+# (_ATTRIBUTE_DISPUTE_QUERY) and are also counted in dispute_amount_cents
+# (migration 237), so the ceiling applies to refund_amount_cents minus that part.
+#
+# `prior` locks every edge of the order and reads its value BEFORE the update, so
+# the caller can emit the ledger event for the money this call actually added.
+_APPLY_REFUND_TOTAL_QUERY = """
+WITH prior AS (
+  SELECT edge_id, COALESCE(refund_amount_cents, 0) AS prior_refund_amount_cents
+  FROM commerce_attribution_edges
+  WHERE order_id = :order_id
+  FOR UPDATE
+)
+UPDATE commerce_attribution_edges AS e
+SET
+  latest_refund_id = CAST(:refund_id AS text),
+  refund_ids = CASE
+    WHEN COALESCE(e.refund_ids, '[]'::jsonb) ? CAST(:refund_id AS text) THEN COALESCE(e.refund_ids, '[]'::jsonb)
+    ELSE COALESCE(e.refund_ids, '[]'::jsonb) || to_jsonb(CAST(:refund_id AS TEXT))
+  END,
+  refund_count = CASE
+    WHEN COALESCE(e.refund_ids, '[]'::jsonb) ? CAST(:refund_id AS text) THEN COALESCE(e.refund_count, 0)
+    ELSE COALESCE(e.refund_count, 0) + 1
+  END,
+  refund_amount_cents = GREATEST(
+    COALESCE(e.refund_amount_cents, 0) - COALESCE(e.dispute_amount_cents, 0),
+    CAST(:total_cents AS bigint)
+  ) + COALESCE(e.dispute_amount_cents, 0),
+  refunded_amount = GREATEST(
+    COALESCE(e.refunded_amount, 0) - COALESCE(e.dispute_amount_cents, 0) / 100.0,
+    CAST(:total_decimal AS numeric)
+  ) + COALESCE(e.dispute_amount_cents, 0) / 100.0,
+  refunded_at = COALESCE(e.refunded_at, :now),
+  latest_refund_at = :now,
+  updated_at = :now
+FROM prior
+WHERE e.edge_id = prior.edge_id
+RETURNING e.edge_id, e.merchant_id, e.click_id, e.canonical_product_id,
+          e.canonical_variant_id, e.surface, e.prompt_cluster, e.interaction_id,
+          e.metadata, e.refund_ids, e.refund_count, e.refund_amount_cents,
+          e.refunded_amount, e.refunded_at, e.latest_refund_at,
+          e.dispute_amount_cents, prior.prior_refund_amount_cents,
+          -- the edge's billing day, for recompute_days_for_edges
+          e.created_at
+"""
+
+
+# A chargeback: _ATTRIBUTE_REFUND_QUERY's additive, id-deduped increment, also
+# counted in dispute_amount_cents so the refund ceiling above leaves it alone.
+_ATTRIBUTE_DISPUTE_QUERY = """
+UPDATE commerce_attribution_edges
+SET
+  latest_refund_id = CAST(:dispute_id AS text),
+  refund_ids = CASE
+    WHEN COALESCE(refund_ids, '[]'::jsonb) ? CAST(:dispute_id AS text) THEN COALESCE(refund_ids, '[]'::jsonb)
+    ELSE COALESCE(refund_ids, '[]'::jsonb) || to_jsonb(CAST(:dispute_id AS TEXT))
+  END,
+  refund_count = CASE
+    WHEN COALESCE(refund_ids, '[]'::jsonb) ? CAST(:dispute_id AS text) THEN COALESCE(refund_count, 0)
+    ELSE COALESCE(refund_count, 0) + 1
+  END,
+  refund_amount_cents = COALESCE(refund_amount_cents, 0) + CASE
+    WHEN COALESCE(refund_ids, '[]'::jsonb) ? CAST(:dispute_id AS text) THEN 0
+    ELSE CAST(:amount_cents AS bigint)
+  END,
+  dispute_amount_cents = COALESCE(dispute_amount_cents, 0) + CASE
+    WHEN COALESCE(refund_ids, '[]'::jsonb) ? CAST(:dispute_id AS text) THEN 0
+    ELSE CAST(:amount_cents AS bigint)
+  END,
+  refunded_amount = COALESCE(refunded_amount, 0) + CASE
+    -- See _ATTRIBUTE_REFUND_QUERY: the CAST keeps the Decimal bind numeric.
+    WHEN COALESCE(refund_ids, '[]'::jsonb) ? CAST(:dispute_id AS text) THEN 0::numeric
+    ELSE CAST(:amount_decimal AS numeric)
+  END,
+  refunded_at = COALESCE(refunded_at, :now),
+  latest_refund_at = :now,
+  updated_at = :now
+WHERE order_id = :order_id
+RETURNING edge_id, merchant_id, click_id, canonical_product_id,
+          canonical_variant_id, surface, prompt_cluster, interaction_id,
+          metadata, refund_ids, refund_count, refund_amount_cents,
+          refunded_amount, refunded_at, latest_refund_at, dispute_amount_cents,
+          -- the edge's billing day, for recompute_days_for_edges
+          created_at
+"""
+
+
+def _refund_amounts(amount: Any) -> tuple[Decimal, int]:
+    amount_decimal = Decimal(str(amount or "0"))
+    return amount_decimal, int(amount_decimal * Decimal("100"))
+
+
+async def apply_attribution_refund_rows(
     *,
     order_id: str,
     refund_id: str,
     amount: Any,
-) -> Optional[Dict[str, Any]]:
-    amount_decimal = Decimal(str(amount or "0"))
-    amount_cents = int(amount_decimal * Decimal("100"))
-    now = _now()
+) -> List[Dict[str, Any]]:
+    """The refund UPDATE alone, with no side effects. Safe inside a caller's transaction.
+
+    Idempotent per ``refund_id`` on every edge of ``order_id``. `attach_refund_to_attribution_edge`
+    is this plus the commerce event. A caller holding a transaction (the partner adjustment
+    adapter) runs this inside it and emits the event after commit. The event write is
+    best-effort: it swallows a failed statement, and in Postgres that leaves the surrounding
+    transaction aborted.
+    """
+    amount_decimal, amount_cents = _refund_amounts(amount)
     rows = await database.fetch_all(
         _ATTRIBUTE_REFUND_QUERY,
         {
@@ -599,20 +948,37 @@ async def attach_refund_to_attribution_edge(
             "refund_id": refund_id,
             "amount_cents": amount_cents,
             "amount_decimal": amount_decimal,
-            "now": now,
+            "now": _now(),
         },
     )
+    return [dict(r) for r in rows]
+
+
+async def emit_attribution_refund_event(
+    rows: List[Dict[str, Any]],
+    *,
+    order_id: str,
+    refund_id: str,
+    amount: Any,
+    upstream_idempotency_key: Optional[str] = None,
+) -> None:
+    """Emit ``refund.succeeded`` once for a refund, however many edges it fanned out to.
+
+    The ledger keeps ONE event per (merchant, event type, upstream key). The default key,
+    ``refund:<refund_id>``, suits a writer that adds each id once. A writer whose id repeats
+    across different money (the refund ceiling: Stripe reuses one ch_ for every partial
+    refund) must pass its own key, or every event after the first is silently dropped.
+    """
     if not rows:
-        return None
-    # Emit the commerce event once per refund regardless of fan-out — one
-    # logical event maps to N attribution edges. Use the first edge's
-    # context for the event metadata since merchant_id is invariant across
+        return
+    # Use the first edge's context for the event metadata since merchant_id is invariant across
     # the fan-out and order_id is the same.
-    first = dict(rows[0])
+    first = rows[0]
     await record_commerce_event_best_effort(
         event_type="refund.succeeded",
         metadata={
-            **(first.get("metadata") or {}),
+            # A RETURNING row from a text query: the JSONB comes back as a str, not a dict.
+            **_coerce_json_obj(first.get("metadata")),
             "merchant_id": first.get("merchant_id"),
             "interaction_id": first.get("interaction_id"),
             "order_id": order_id,
@@ -626,11 +992,182 @@ async def attach_refund_to_attribution_edge(
             "edge_count": len(rows),
         },
         source="commerce_attribution_edges",
-        upstream_idempotency_key=f"refund:{refund_id}",
+        upstream_idempotency_key=upstream_idempotency_key or f"refund:{refund_id}",
+        **ledger_provenance("commerce_attribution_edge", "unknown"),
     )
+
+
+async def attach_refund_to_attribution_edge(
+    *,
+    order_id: str,
+    refund_id: str,
+    amount: Any,
+) -> Optional[Dict[str, Any]]:
+    """Apply a refund to the order's edges, emit the event, and recompute the billed days.
+
+    Must not be called inside a transaction: the event and the recompute are best-effort
+    writes, and a failed statement would abort the caller's transaction and lose the refund.
+    A caller that holds one uses `apply_attribution_refund_rows` inside it and the other two
+    after commit (services/refund_service.py).
+    """
+    rows = await apply_attribution_refund_rows(order_id=order_id, refund_id=refund_id, amount=amount)
+    if not rows:
+        return None
+    try:
+        await emit_attribution_refund_event(rows, order_id=order_id, refund_id=refund_id, amount=amount)
+    finally:
+        # Never raises. A redelivered refund matches its edges again, so a redelivery also
+        # re-runs a recompute that failed the first time.
+        await recompute_days_for_edges(rows)
     # Backwards-compatible return shape: callers expect a single dict.
     # When fan-out exists, surface the first edge with an added edge_count
     # field so callers can distinguish single-edge vs multi-edge refunds.
+    first = dict(rows[0])
+    first["edge_count"] = len(rows)
+    return first
+
+
+async def apply_refund_total_rows(
+    *,
+    order_id: str,
+    refund_id: str,
+    total_refunded: Any,
+) -> List[Dict[str, Any]]:
+    """The refund-ceiling UPDATE alone, with no side effects. Safe inside a caller's transaction.
+
+    Raises every edge of ``order_id`` to the order's reconciled ``total_refunded`` (MAJOR
+    units): pass the order's total AFTER this refund was reconciled, never the single refund's
+    amount. ``refund_id`` is recorded for audit only; it no longer decides whether money is
+    added. See _APPLY_REFUND_TOTAL_QUERY. `apply_refund_total_to_attribution_edge` is this plus
+    `emit_refund_total_event` and the rollup recompute; a caller holding a transaction
+    (RefundService) runs this inside it and the other two after commit.
+    """
+    total_decimal, total_cents = _refund_amounts(total_refunded)
+    return [
+        dict(r)
+        for r in await database.fetch_all(
+            _APPLY_REFUND_TOTAL_QUERY,
+            {
+                "order_id": order_id,
+                "refund_id": refund_id,
+                "total_cents": total_cents,
+                "total_decimal": total_decimal,
+                "now": _now(),
+            },
+        )
+    ]
+
+
+def _refund_total_added_cents(rows: List[Dict[str, Any]]) -> int:
+    """What `apply_refund_total_rows` added, read off the first edge (the event's context)."""
+    if not rows:
+        return 0
+    first = rows[0]
+    added = int(first.get("refund_amount_cents") or 0) - int(first.get("prior_refund_amount_cents") or 0)
+    return max(added, 0)
+
+
+async def emit_refund_total_event(
+    rows: List[Dict[str, Any]],
+    *,
+    order_id: str,
+    refund_id: str,
+) -> None:
+    """Emit ``refund.succeeded`` for the money a ceiling write actually added, if any.
+
+    An echo of money another id already reported adds 0 and emits nothing. Keyed on the
+    order and the refund total this write reached, not on ``refund_id``: Stripe reports
+    every partial refund of a charge under the SAME ch_ id, so ``refund:<ch_…>`` kept only
+    the first partial in the ledger. Each ceiling step reaches a distinct total, and a
+    redelivery of the same step adds 0 and never gets here.
+    """
+    added_cents = _refund_total_added_cents(rows)
+    if added_cents > 0:
+        first = rows[0]
+        refund_part_cents = int(first.get("refund_amount_cents") or 0) - int(
+            first.get("dispute_amount_cents") or 0
+        )
+        await emit_attribution_refund_event(
+            rows,
+            order_id=order_id,
+            refund_id=refund_id,
+            amount=Decimal(added_cents) / Decimal("100"),
+            upstream_idempotency_key=f"refund_total:{order_id}:{refund_part_cents}",
+        )
+
+
+async def apply_refund_total_to_attribution_edge(
+    *,
+    order_id: str,
+    refund_id: str,
+    total_refunded: Any,
+) -> Optional[Dict[str, Any]]:
+    """Raise the edge's refund to the order's reconciled total, emit, and recompute the billed days.
+
+    For PSP refunds on a Pivota order. Must not be called inside a transaction, for the reason
+    `attach_refund_to_attribution_edge` gives.
+    """
+    rows = await apply_refund_total_rows(
+        order_id=order_id, refund_id=refund_id, total_refunded=total_refunded
+    )
+    if not rows:
+        return None
+    try:
+        await emit_refund_total_event(rows, order_id=order_id, refund_id=refund_id)
+    finally:
+        # Never raises. A no-op re-roll (nothing added) is cheap and also retries one that
+        # failed on an earlier delivery.
+        await recompute_days_for_edges(rows)
+    first = dict(rows[0])
+    first["edge_count"] = len(rows)
+    first["added_refund_cents"] = _refund_total_added_cents(rows)
+    return first
+
+
+async def apply_attribution_dispute_rows(
+    *,
+    order_id: str,
+    dispute_id: str,
+    amount: Any,
+) -> List[Dict[str, Any]]:
+    """The chargeback UPDATE alone (MAJOR units), idempotent per ``dispute_id``. No side effects."""
+    amount_decimal, amount_cents = _refund_amounts(amount)
+    return [
+        dict(r)
+        for r in await database.fetch_all(
+            _ATTRIBUTE_DISPUTE_QUERY,
+            {
+                "order_id": order_id,
+                "dispute_id": dispute_id,
+                "amount_cents": amount_cents,
+                "amount_decimal": amount_decimal,
+                "now": _now(),
+            },
+        )
+    ]
+
+
+async def attach_dispute_to_attribution_edge(
+    *,
+    order_id: str,
+    dispute_id: str,
+    amount: Any,
+) -> Optional[Dict[str, Any]]:
+    """Add a chargeback to the edge (MAJOR units), once per ``dispute_id``, then recompute.
+
+    Chargebacks are not in ``orders.total_refunded``, so they stay additive and are
+    kept in ``dispute_amount_cents`` where the refund ceiling cannot absorb them.
+    Must not be called inside a transaction, for the reason
+    `attach_refund_to_attribution_edge` gives.
+    """
+    rows = await apply_attribution_dispute_rows(order_id=order_id, dispute_id=dispute_id, amount=amount)
+    if not rows:
+        return None
+    try:
+        await emit_attribution_refund_event(rows, order_id=order_id, refund_id=dispute_id, amount=amount)
+    finally:
+        await recompute_days_for_edges(rows)  # never raises
+    first = rows[0]
     first["edge_count"] = len(rows)
     return first
 
@@ -656,27 +1193,43 @@ async def trace_click_id(click_id: str) -> Dict[str, Any]:
 # recovers it here and materializes a self-contained `converted` edge (gap #4).
 
 
-def extract_click_id_from_note_attributes(note_attributes: Any) -> Optional[str]:
-    """Pull `pivota_click_id` out of a Shopify order's ``note_attributes``.
+def extract_note_attribute(note_attributes: Any, name: str) -> Optional[str]:
+    """Pull one named attribute out of a Shopify order's ``note_attributes``.
 
     Shopify sends note_attributes as ``[{"name": ..., "value": ...}, ...]``.
     Tolerate a dict shape too (some connectors flatten it). Returns None when
-    the attribute is absent/blank — a normal, non-attributed order.
+    the attribute is absent/blank.
     """
     if isinstance(note_attributes, dict):
-        value = note_attributes.get(EXTERNAL_CLICK_NOTE_ATTR)
+        value = note_attributes.get(name)
         text = str(value).strip() if value is not None else ""
         return text or None
     if isinstance(note_attributes, (list, tuple)):
         for attr in note_attributes:
             if not isinstance(attr, dict):
                 continue
-            if str(attr.get("name") or "").strip() == EXTERNAL_CLICK_NOTE_ATTR:
+            if str(attr.get("name") or "").strip() == name:
                 value = attr.get("value")
                 text = str(value).strip() if value is not None else ""
                 if text:
                     return text
     return None
+
+
+def extract_click_id_from_note_attributes(note_attributes: Any) -> Optional[str]:
+    """The `pivota_click_id` an attributed order carries, else None."""
+    return extract_note_attribute(note_attributes, EXTERNAL_CLICK_NOTE_ATTR)
+
+
+def extract_pivota_order_id_from_note_attributes(note_attributes: Any) -> Optional[str]:
+    """The Pivota order id the writeback stamped, else None.
+
+    Its presence is what makes a platform order recognisable as
+    Pivota-originated from the webhook payload alone. Absent (an order written
+    back before the marker existed, or one the buyer placed on the storefront)
+    the Shopify ingest falls back to the `orders.shopify_order_id` lookup.
+    """
+    return extract_note_attribute(note_attributes, PIVOTA_ORDER_ID_NOTE_ATTR)
 
 
 def shopify_order_total_to_cents(data: Dict[str, Any]) -> tuple[Optional[int], Optional[str]]:
@@ -715,10 +1268,11 @@ def shopify_order_total_to_cents(data: Dict[str, Any]) -> tuple[Optional[int], O
 
 
 def _coerce_json_obj(value: Any) -> Dict[str, Any]:
-    """Return `value` as a dict. surface_click_events.context is JSONB: asyncpg
-    (prod) decodes it to a dict, but the SQLite/JSON test path and some driver
-    modes hand back a JSON string — coerce both so closure reads are driver-
-    agnostic. Non-object / unparseable → {}."""
+    """Return `value` as a dict. A JSONB column read through a SQLAlchemy-typed
+    select comes back a dict, but through a text query (or RETURNING) it comes
+    back a JSON string: db/database.py registers no asyncpg JSON codec. Coerce
+    both so reads are driver- and query-shape-agnostic. Non-object /
+    unparseable → {}."""
     if isinstance(value, dict):
         return value
     if isinstance(value, str) and value.strip():
@@ -739,6 +1293,63 @@ def _seed_seller_from_click(row: Optional[Dict[str, Any]]) -> tuple[Optional[str
     seller_ref = str(ctx.get("seller_ref") or "").strip() or None
     seed_kind = str(ctx.get("seed_kind") or "").strip() or None
     return seller_ref, seed_kind
+
+
+async def reap_cart_link_seller_ref(click_id: str, converting_shop_domain: str) -> Optional[str]:
+    """Resolve a Reap cart sale's seller identity from its recorded click, if present.
+
+    The purchase ledger stores a Shopify *domain*, but seller-keyed attribution expects the
+    seller's tenant identity. Never take that identity from the purchase request. A seller-keyed
+    click is usable only when its recorded redirect destination is the cart URL's store; a
+    mismatched or missing destination cannot authorize a conversion for that seller.
+    Return None for a legacy click so its caller keeps the purchase's original merchant domain.
+    """
+    from services.outbound_links_service import normalize_shop_host  # local: import cycle
+
+    host = normalize_shop_host(converting_shop_domain)
+    if not host:
+        raise ValueError("cart-link converting shop is missing")
+    click = str(click_id or "").strip()
+    if not click:
+        raise ValueError("cart-link click is missing")
+    raw = await database.fetch_one(
+        select(surface_click_events).where(surface_click_events.c.click_id == click)
+    )
+    if raw is None:
+        return None
+    row = dict(raw)
+    seller_ref, _ = _seed_seller_from_click(row)
+    if not seller_ref:
+        return None
+    if normalize_shop_host(row.get("dest_domain")) != host:
+        raise ValueError("seller-keyed click destination does not match cart shop")
+    return seller_ref
+
+
+_AGENT_ID_MAX = 64  # commerce_attribution_edges.agent_id is String(64)
+
+
+def _trusted_agent_id(provenance: Optional[Mapping[str, Any]]) -> Optional[str]:
+    """The originating agent from an internal partner-provenance mapping, or None.
+
+    A value that is not a non-blank string, or does not fit the column, is dropped rather than
+    truncated: a truncated id would credit an order to an agent that does not exist.
+    """
+    if not provenance:
+        return None
+    raw = provenance.get("agent_id")
+    if not isinstance(raw, str):
+        return None
+    value = raw.strip()
+    if not value or len(value) > _AGENT_ID_MAX:
+        return None
+    return value
+
+
+def _pick_click_agent(click_row: Optional[Mapping[str, Any]]) -> Optional[str]:
+    # The same rule as issue_clicks: 'unknown' (which /r wrote on legacy rows before ADR-025 D1)
+    # or an id that does not fit names nobody, so an edge never credits a sentinel.
+    return _issued_agent_id((click_row or {}).get("agent_id"))
 
 
 def _ext_edge_keys(merchant_id: str, external_order_id: str) -> tuple[str, str]:
@@ -794,6 +1405,7 @@ async def close_external_order_conversion(
     note_attrs_or_payload: Optional[Dict[str, Any]] = None,
     converting_shop_domain: Optional[str] = None,
     is_self_report: bool = False,
+    trusted_partner_provenance: Optional[Mapping[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Materialize a `converted` external attribution edge from an orders/paid webhook.
 
@@ -945,6 +1557,49 @@ async def close_external_order_conversion(
             for k in ("id", "name", "order_number", "financial_status")
             if note_attrs_or_payload.get(k) is not None
         }
+    # This is a separate INTERNAL argument: Shopify note attributes are merchant/buyer supplied
+    # and must never be able to assert partner provenance by choosing JSON keys.
+    if trusted_partner_provenance:
+        provenance = {
+            key: str(trusted_partner_provenance[key]).strip()
+            for key in ("purchase_id", "reap_checkout_id")
+            if trusted_partner_provenance.get(key) is not None
+            and str(trusted_partner_provenance[key]).strip()
+        }
+        if trusted_partner_provenance.get("partner_reported") is True:
+            provenance["partner_reported"] = True
+        if provenance:
+            metadata["partner_provenance"] = provenance
+    # WHO ORIGINATED THE ORDER. On a partner-reported close (Reap) the purchase row names the agent
+    # whose AUTHENTICATED call opened it, and that is the agent the order is credited to. The click
+    # row is not enough: the variant lane mints a click id without writing a click row, so a
+    # click-only reading leaves every such order with no agent at all. Only this internal argument
+    # can supply it -- never a note attribute or a request body.
+    partner_agent_id = _trusted_agent_id(trusted_partner_provenance)
+    raw_partner_agent = (trusted_partner_provenance or {}).get("agent_id")
+    if partner_agent_id is None and raw_partner_agent not in (None, ""):
+        # A partner named an agent we could not store. Losing an agent's credit silently is the
+        # failure this field exists to prevent, so leave the evidence (the reason, never the
+        # value) and say so.
+        reason = (
+            "too_long" if isinstance(raw_partner_agent, str) and len(raw_partner_agent.strip()) > _AGENT_ID_MAX
+            else "blank" if isinstance(raw_partner_agent, str)
+            else "not_a_string"
+        )
+        metadata["partner_agent_rejected"] = reason
+        logger.warning(
+            "commerce_attribution: partner agent_id rejected (%s) for external_order_id=%s",
+            reason,
+            external_order_id,
+        )
+    click_agent_id = _pick_click_agent(click_row)
+    edge_agent_id = partner_agent_id or click_agent_id
+    if edge_agent_id:
+        metadata["agent_source"] = "partner_purchase" if partner_agent_id else "click"
+    if partner_agent_id and click_agent_id and click_agent_id != partner_agent_id:
+        # Should not happen (both are written from the same authenticated caller); keep the
+        # evidence rather than silently picking one.
+        metadata["click_agent_id"] = click_agent_id
     # ADR-009 D3: record the seller subject (or the honest legacy gap).
     if click_seller_ref:
         metadata["seller_ref"] = click_seller_ref
@@ -1046,7 +1701,7 @@ async def close_external_order_conversion(
         "source_channel": _pick("source_channel"),
         "source_family": _pick("source_family"),
         "query_source": _pick("query_source"),
-        "agent_id": _pick("agent_id"),
+        "agent_id": edge_agent_id,
         "protocol_name": _pick("protocol_name"),
         "llm_provider": _pick("llm_provider"),
         "llm_model": _pick("llm_model"),
@@ -1134,6 +1789,7 @@ async def close_external_order_conversion(
         # Idempotency keyed on the SUBJECT (matches the edge guard): self/legacy
         # subject == merchant_id (unchanged); cross subject == seller_ref.
         upstream_idempotency_key=f"external_order:{subject_merchant_id}:{external_order_id}",
+        **ledger_provenance("commerce_attribution_edge", "unknown"),
     )
     if not click_matched:
         logger.info(
@@ -1184,3 +1840,134 @@ async def close_external_order_conversion(
         "state": EDGE_STATE_CONVERTED,
         "replayed": False,
     }
+
+
+# The edges a platform refund of an external order reduces. They are found by the key
+# close_external_order_conversion wrote: (subject merchant, external_order_id). The subject is the
+# seller when the click was seller-keyed; the merchant the platform webhook authenticated is then
+# only in metadata.converting_merchant_id, so both are matched. Their order_id is the synthetic
+# `ext_...` id, which is what the shared refund UPDATE keys on. FOR UPDATE: the ceiling below reads
+# the edge's refund total, and a second refund of the same order must wait for it.
+_EXTERNAL_EDGES_FOR_REFUND_SQL = """
+SELECT edge_id, order_id, merchant_id, currency, created_at,
+       gross_attributed_gmv_cents, refund_amount_cents, refund_ids
+FROM commerce_attribution_edges
+WHERE external_order_id = :external_order_id
+  AND (merchant_id = :merchant_id OR metadata->>'converting_merchant_id' = :merchant_id)
+ORDER BY edge_id
+FOR UPDATE
+"""
+
+
+async def apply_external_order_refund(
+    *,
+    merchant_id: str,
+    external_order_id: str,
+    refund_id: str,
+    amount: Any,
+    currency: Optional[str],
+) -> List[Dict[str, Any]]:
+    """Apply a platform refund to the edges `close_external_order_conversion` closed for that order.
+
+    ``amount`` is in MAJOR units, as the platform reports it. The shared refund UPDATE stores
+    major × 100, and the close stored the gross the same way (`shopify_order_total_to_cents`), so
+    the two agree in every currency. Per edge:
+
+    - ``replayed``: ``refund_id`` is already on the edge. Nothing is added.
+    - ``currency_mismatch``: the refund is not in the currency the gross was recorded in. Nothing
+      is added; subtracting it would mix units.
+    - ``nothing_remaining`` / ``edge_has_no_gross``: nothing to reduce.
+    - ``applied``: the refund, capped at what is left of the edge's gross, so one order's refund
+      can never reduce another order's net in the same rollup group.
+
+    After commit, emits ``refund.succeeded`` for each applied edge and re-rolls the billed day of
+    every applied or replayed edge (a replay retries a re-roll that failed the first time). Must
+    not be called inside a transaction. Returns one outcome per edge; ``[]`` when Pivota
+    attributed no edge to the order.
+    """
+    merchant_id = str(merchant_id or "").strip()
+    external_order_id = str(external_order_id or "").strip()
+    refund_id = str(refund_id or "").strip()
+    currency = str(currency or "").strip().upper() or None
+    try:
+        amount_major = Decimal(str(amount))
+    except (InvalidOperation, ValueError, TypeError):
+        amount_major = Decimal("0")
+    if not merchant_id or not external_order_id or not refund_id or not amount_major.is_finite() or amount_major <= 0:
+        # A zero refund recorded under its id would shadow the real one forever.
+        return []
+    # Same rounding as shopify_order_total_to_cents, which stored the gross.
+    amount_cents = int((amount_major * Decimal("100")).quantize(Decimal("1")))
+
+    outcomes: List[Dict[str, Any]] = []
+    applied: List[tuple[Dict[str, Any], List[Dict[str, Any]], Decimal]] = []
+    to_recompute: List[Dict[str, Any]] = []
+    async with database.transaction():
+        edges = [
+            dict(r)
+            for r in await database.fetch_all(
+                _EXTERNAL_EDGES_FOR_REFUND_SQL,
+                {"merchant_id": merchant_id, "external_order_id": external_order_id},
+            )
+        ]
+        for edge in edges:
+            refund_ids = edge.get("refund_ids")
+            if isinstance(refund_ids, str):
+                refund_ids = json.loads(refund_ids)
+            gross = edge.get("gross_attributed_gmv_cents")
+            before = int(edge.get("refund_amount_cents") or 0)
+            edge_currency = str(edge.get("currency") or "").strip().upper() or None
+            outcome = {"edge_id": edge["edge_id"], "order_id": edge["order_id"], "applied_cents": 0}
+            outcomes.append(outcome)
+            if refund_id in (refund_ids or []):
+                outcome["status"] = "replayed"
+                to_recompute.append(edge)
+                continue
+            if currency is None or edge_currency != currency:
+                outcome["status"] = "currency_mismatch"
+                logger.warning(
+                    "commerce_attribution: external refund NOT applied, currency %s != edge %s "
+                    "edge_id=%s external_order_id=%s refund_id=%s",
+                    currency, edge_currency, edge["edge_id"], external_order_id, refund_id,
+                )
+                continue
+            if isinstance(gross, bool) or not isinstance(gross, int) or gross <= 0:
+                outcome["status"] = "edge_has_no_gross"
+                continue
+            remaining = gross - before
+            if remaining <= 0:
+                outcome["status"] = "nothing_remaining"
+                continue
+            apply_cents = min(amount_cents, remaining)
+            if apply_cents < amount_cents:
+                logger.warning(
+                    "commerce_attribution: external refund capped at the edge's remaining gross "
+                    "(%s of %s cents) edge_id=%s external_order_id=%s refund_id=%s",
+                    apply_cents, amount_cents, edge["edge_id"], external_order_id, refund_id,
+                )
+            apply_major = Decimal(apply_cents) / Decimal(100)
+            rows = await apply_attribution_refund_rows(
+                order_id=edge["order_id"], refund_id=refund_id, amount=apply_major
+            )
+            if len(rows) != 1:
+                # order_id is UNIQUE, and the row is locked above.
+                raise RuntimeError(f"refund on order_id matched {len(rows)} edges, expected 1")
+            outcome["status"] = "applied"
+            outcome["applied_cents"] = apply_cents
+            applied.append((edge, rows, apply_major))
+            to_recompute.extend(rows)
+
+    # Committed. Neither step may undo the refund: each failure is logged, never raised.
+    for edge, rows, apply_major in applied:
+        try:
+            await emit_attribution_refund_event(
+                rows, order_id=edge["order_id"], refund_id=refund_id, amount=apply_major
+            )
+        except Exception as exc:  # noqa: BLE001 -- the refund already stands
+            logger.warning(
+                "commerce_attribution: external refund event failed edge_id=%s refund_id=%s: %s",
+                edge["edge_id"], refund_id, type(exc).__name__,
+            )
+    if to_recompute:
+        await recompute_days_for_edges(to_recompute)  # never raises
+    return outcomes

@@ -34,6 +34,7 @@ class FakeDB:
         self.fetch_all_calls: list[tuple[str, dict[str, Any]]] = []
         self.fetch_one_calls: list[tuple[str, dict[str, Any]]] = []
         self.transaction_count = 0
+        self.statements: list[str] = []
 
     def transaction(self) -> FakeTransaction:
         return FakeTransaction(self)
@@ -41,6 +42,22 @@ class FakeDB:
     async def fetch_all(self, query: str, values: Optional[dict[str, Any]] = None):
         params = dict(values or {})
         self.fetch_all_calls.append((str(query), params))
+        if "UPDATE gmv_attribution_daily" in str(query):
+            # Zeroes the day's groups this run did not write; exercised on real Postgres in
+            # tests/test_gmv_rollup_stale_day_sweep_postgres.py.
+            assert self.transaction_count > 0, "the zeroing must run inside the roll-up's transaction"
+            self.statements.append("zero_unwritten")
+            return []
+        if "FROM invoices" in str(query):
+            # The billed-day check, which must run under the day lock.
+            assert self.transaction_count > 0, "the invoice check must run inside the transaction"
+            self.statements.append("invoice_check")
+            if getattr(self, "invoice_check_raises", None):
+                raise self.invoice_check_raises
+            wanted = params.get("merchant_id")
+            return [{"merchant_id": m} for m in sorted(getattr(self, "invoiced", set()))
+                    if wanted is None or m == wanted]
+        self.statements.append("rollup_read")
         if "FROM commerce_attribution_edges e" not in str(query):
             raise AssertionError(f"Unexpected fetch_all query: {query}")
         return self._rollup(params["date"], params.get("merchant_id"))
@@ -49,6 +66,15 @@ class FakeDB:
         params = dict(values or {})
         self.fetch_one_calls.append((str(query), params))
         sql = str(query)
+        if "FROM gmv_attribution_daily" in sql:
+            # Has this merchant-day been rolled up before? Only a re-roll can be frozen by a run.
+            self.statements.append("rolled_check")
+            rolled = any(k[0] == params["date"] and k[1] == params["merchant_id"] for k in self.daily)
+            return {"hit": 1} if rolled else None
+        if "FROM billing_runs" in sql:
+            # A re-roll's unfinished-run check (never the nightly job's).
+            self.statements.append("unfinished_run_check")
+            return {"id": 9} if params.get("merchant_id") in getattr(self, "unfinished_run_merchants", set()) else None
         if "FOR UPDATE" in sql:
             edge_id = params["edge_id"]
             for edge in self.edges:
@@ -73,6 +99,17 @@ class FakeDB:
         sql = str(query)
         self.executed.append((sql, params))
 
+        if "SET LOCAL lock_timeout" in sql:
+            assert self.transaction_count > 0, "SET LOCAL only lasts inside a transaction"
+            self.statements.append("lock_timeout")
+            return None
+
+        if "pg_advisory_xact_lock" in sql:
+            assert self.transaction_count > 0, "the day lock must be taken inside the transaction"
+            self.day_locks = getattr(self, "day_locks", []) + [params["date"]]
+            self.statements.append(f"lock:{params['date']}")
+            return None
+
         if "INSERT INTO gmv_attribution_daily" in sql:
             key = (
                 params["date"],
@@ -80,7 +117,13 @@ class FakeDB:
                 params.get("agent_id") or "",
                 params.get("channel_partner_id") if params.get("channel_partner_id") is not None else -1,
             )
-            self.daily[key] = dict(params)
+            existing = self.daily.get(key)
+            row = dict(params)
+            if existing is not None:
+                # ON CONFLICT keeps the rate the day was first billed at.
+                row["take_rate_bp"] = existing["take_rate_bp"]
+                row["take_amount_cents"] = row["net_attributed_gmv_cents"] * existing["take_rate_bp"] // 10000
+            self.daily[key] = row
             return None
 
         if "UPDATE commerce_attribution_edges" in sql:
@@ -333,6 +376,39 @@ async def test_apply_refund_recomputes_daily_rollup(monkeypatch: pytest.MonkeyPa
     assert "net_attributed_gmv_cents" not in edge_update_sql
 
 
+@pytest.mark.asyncio
+async def test_a_reroll_keeps_the_rate_the_day_was_billed_at(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review of #2271 (P1): _take_rate_bp_for_merchant answers with the promo status NOW. A day
+    rolled up at the 5% promo rate and re-rolled after the promo ended must stay at 5%; otherwise
+    a refund raises what the merchant is billed."""
+    target_date = date(2026, 5, 19)
+    fake_db = FakeDB(
+        edges=[_edge(gross=4_500, refund=0, created_at=datetime(2026, 5, 19, 12, tzinfo=timezone.utc))]
+    )
+    monkeypatch.setattr(service, "database", fake_db)
+    rates = iter([service.PROMO_TAKE_RATE_BP, service.STANDARD_TAKE_RATE_BP])
+
+    async def flipping_rate(merchant_id: str) -> int:
+        return next(rates)
+
+    monkeypatch.setattr(service, "_take_rate_bp_for_merchant", flipping_rate)
+    await service.aggregate_daily(target_date)
+    assert _only_daily_row(fake_db)["take_amount_cents"] == 225
+
+    fake_db.edges[0]["refund_amount_cents"] = 500
+    await service.recompute_for_date(target_date, "merch_1")
+    row = _only_daily_row(fake_db)
+    assert row["take_rate_bp"] == service.PROMO_TAKE_RATE_BP
+    assert (row["net_attributed_gmv_cents"], row["take_amount_cents"]) == (4_000, 200)
+    assert fake_db.day_locks == [target_date, target_date]
+
+
+def test_the_upsert_keeps_the_stored_rate_on_conflict() -> None:
+    sql = service._UPSERT_ROLLUP_QUERY
+    assert "take_rate_bp = gmv_attribution_daily.take_rate_bp" in sql
+    assert "EXCLUDED.take_rate_bp" not in sql
+
+
 def test_rollup_query_casts_merchant_id_to_text() -> None:
     """Regression: bug C surfaced in Step 6 staging run 2026-05-21.
 
@@ -430,3 +506,248 @@ def test_coerce_date_normalizes_non_utc_to_utc_day() -> None:
 
     iso_z_utc = "2026-05-22T00:00:00Z"
     assert service._coerce_date(iso_z_utc) == date(2026, 5, 22)
+
+
+@pytest.mark.asyncio
+async def test_the_day_lock_is_taken_before_the_rollup_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A lock taken after the read serialises nothing: the read it protects is already stale."""
+    target_date = date(2026, 5, 21)
+    fake_db = FakeDB(edges=[_edge(gross=10_000, created_at=datetime(2026, 5, 21, 12, tzinfo=timezone.utc))])
+    monkeypatch.setattr(service, "database", fake_db)
+
+    await service.aggregate_daily(target_date)
+    await service.recompute_for_date(target_date, "merch_1")
+
+    # Keyed on the day alone, so the all-merchant job and a one-merchant recompute serialise. The
+    # billed-day check runs after the lock and before the read: checked outside the lock, it races
+    # the invoice run. Only the refund re-roll bounds its wait; the nightly job does not. Only a
+    # re-roll of a day already rolled checks for an unfinished run. The groups a run did not write
+    # are zeroed last, inside the same lock.
+    lock = f"lock:{target_date}"
+    assert fake_db.statements == [
+        lock, "invoice_check", "rollup_read", "zero_unwritten",
+        "lock_timeout", lock, "invoice_check", "rolled_check", "unfinished_run_check", "rollup_read",
+        "zero_unwritten",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_an_invoiced_merchant_s_day_is_left_as_billed(monkeypatch: pytest.MonkeyPatch) -> None:
+    target_date = date(2026, 5, 21)
+    fake_db = FakeDB(edges=[
+        _edge(gross=10_000, created_at=datetime(2026, 5, 21, 12, tzinfo=timezone.utc)),
+        {**_edge(gross=5_000, created_at=datetime(2026, 5, 21, 12, tzinfo=timezone.utc)),
+         "edge_id": "edge_2", "merchant_id": "merch_2"},
+    ])
+    fake_db.invoiced = {"merch_1"}
+    monkeypatch.setattr(service, "database", fake_db)
+
+    assert await service.recompute_for_date(target_date, "merch_1") == service.INVOICED_PERIOD_MANUAL_CREDIT
+    assert fake_db.daily == {}
+    # The nightly job writes the merchants no invoice covers and leaves the invoiced one alone.
+    assert await service.aggregate_daily(target_date) == 1
+    assert {k[1] for k in fake_db.daily} == {"merch_2"}
+    assert await service.recompute_for_date(target_date, "merch_2") == service.RECOMPUTED
+
+
+@pytest.mark.asyncio
+async def test_a_failed_invoice_check_writes_nothing_and_says_so(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_db = FakeDB(edges=[_edge(gross=10_000, created_at=datetime(2026, 5, 21, 12, tzinfo=timezone.utc))])
+    fake_db.invoice_check_raises = ConnectionError("invoices unreachable")
+    monkeypatch.setattr(service, "database", fake_db)
+    with pytest.raises(service.BilledDayCheckFailed):
+        await service.recompute_for_date(date(2026, 5, 21), "merch_1")
+    assert fake_db.daily == {}
+
+
+@pytest.mark.asyncio
+async def test_recompute_days_for_edges_rolls_each_merchant_day_once_and_never_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[date, str]] = []
+
+    # The billed-day check now runs INSIDE recompute_for_date, under the day lock; this pins how
+    # recompute_days_for_edges maps what it returns and raises.
+    async def fake_recompute(d: date, merchant_id: str) -> str:
+        calls.append((d, merchant_id))
+        if merchant_id == "merch_down":
+            raise ConnectionError("db blip")
+        if merchant_id == "merch_unknown":
+            raise service.BilledDayCheckFailed("ConnectionError: invoices unreachable")
+        if merchant_id == "merch_invoiced":
+            return service.INVOICED_PERIOD_MANUAL_CREDIT
+        return service.RECOMPUTED
+
+    monkeypatch.setattr(service, "recompute_for_date", fake_recompute)
+    tokyo = timezone(timedelta(hours=9))
+    edges = [
+        # Two fan-out edges of one order on one day: one recompute.
+        {"edge_id": "e1", "merchant_id": "merch_1", "created_at": datetime(2026, 5, 21, 1, tzinfo=timezone.utc)},
+        {"edge_id": "e2", "merchant_id": "merch_1", "created_at": datetime(2026, 5, 21, 23, tzinfo=timezone.utc)},
+        # 02:30 Tokyo on the 22nd is the 21st in UTC, the day the rollup bucketed it on.
+        {"edge_id": "e3", "merchant_id": "merch_1", "created_at": datetime(2026, 5, 22, 2, 30, tzinfo=tokyo)},
+        {"edge_id": "e4", "merchant_id": "merch_1", "created_at": datetime(2026, 5, 19, 8, tzinfo=timezone.utc)},
+        {"edge_id": "e5", "merchant_id": "merch_down", "created_at": datetime(2026, 5, 20, tzinfo=timezone.utc)},
+        {"edge_id": "e6", "merchant_id": "merch_invoiced", "created_at": datetime(2026, 5, 20, tzinfo=timezone.utc)},
+        {"edge_id": "e7", "merchant_id": "merch_unknown", "created_at": datetime(2026, 5, 20, tzinfo=timezone.utc)},
+        {"edge_id": "e10", "merchant_id": "merch_1", "created_at": datetime(2026, 5, 17, tzinfo=timezone.utc)},
+        # Unusable rows are skipped, not raised.
+        {"edge_id": "e8", "merchant_id": "merch_1", "created_at": None},
+        {"edge_id": "e9", "merchant_id": None, "created_at": datetime(2026, 5, 18, tzinfo=timezone.utc)},
+    ]
+
+    assert await service.recompute_days_for_edges(edges) == {
+        # A billing run no longer freezes a day by itself: the invoice run reads under the day lock,
+        # so only a merchant's committed invoice does (a not-yet-invoiced merchant re-reads fresh).
+        ("merch_1", date(2026, 5, 17)): "recomputed",
+        ("merch_1", date(2026, 5, 19)): "recomputed",
+        ("merch_1", date(2026, 5, 21)): "recomputed",
+        ("merch_down", date(2026, 5, 20)): "recompute_failed",
+        ("merch_invoiced", date(2026, 5, 20)): "invoiced_period_manual_credit",
+        ("merch_unknown", date(2026, 5, 20)): "invoice_check_failed",
+    }
+    # Every (merchant, day) is attempted once; the check and the skip happen inside the attempt.
+    assert sorted(calls) == [
+        (date(2026, 5, 17), "merch_1"),
+        (date(2026, 5, 19), "merch_1"),
+        (date(2026, 5, 20), "merch_down"),
+        (date(2026, 5, 20), "merch_invoiced"),
+        (date(2026, 5, 20), "merch_unknown"),
+        (date(2026, 5, 21), "merch_1"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reroll_stale_days_hands_the_changed_edges_to_the_guarded_recompute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sweep owns no billed-day rule: every stale day goes through recompute_days_for_edges.
+    The real queries are exercised in tests/test_gmv_rollup_stale_day_sweep_postgres.py."""
+    seen: dict[str, Any] = {}
+    edges = [{"edge_id": "e1", "merchant_id": "m", "created_at": datetime(2026, 5, 20, tzinfo=timezone.utc)}]
+
+    class Candidates:
+        async def fetch_all(self, query: str, values: dict[str, Any]):
+            assert "gmv_attribution_daily" in query
+            seen["values"] = values
+            return edges
+
+    async def fake_recompute_days(given):
+        seen["edges"] = given
+        return {
+            ("m", date(2026, 5, 20)): service.RECOMPUTED,
+            ("m", date(2026, 5, 19)): service.INVOICED_PERIOD_MANUAL_CREDIT,
+            ("n", date(2026, 5, 19)): service.RECOMPUTED,
+        }
+
+    monkeypatch.setattr(service, "database", Candidates())
+    monkeypatch.setattr(service, "recompute_days_for_edges", fake_recompute_days)
+    # 08:00 on the 22nd in Tokyo is 23:00 on the 21st in UTC: "today" is the UTC 21st.
+    now = datetime(2026, 5, 22, 8, tzinfo=timezone(timedelta(hours=9)))
+
+    summary = await service.reroll_stale_days(now=now)
+
+    assert summary == {"stale_days": 3, "recomputed": 2, "invoiced_period_manual_credit": 1}
+    assert seen["edges"] is edges
+    assert seen["values"] == {
+        "changed_since": datetime(2026, 5, 17, 23, tzinfo=timezone.utc),
+        "created_before": datetime(2026, 5, 21, tzinfo=timezone.utc),
+        "max_days": service.STALE_SWEEP_MAX_DAYS,
+    }
+
+
+def _nightly_stubs(monkeypatch: pytest.MonkeyPatch, *, rollup, sweep_summary=None) -> list[Any]:
+    calls: list[Any] = []
+
+    async def fake_aggregate_daily(d: date) -> int:
+        calls.append(("rollup", d))
+        return await rollup()
+
+    async def fake_sweep(*, now: datetime) -> dict[str, int]:
+        calls.append(("sweep", now))
+        return sweep_summary or {"stale_days": 1, "recomputed": 1}
+
+    monkeypatch.setattr(service, "aggregate_daily", fake_aggregate_daily)
+    monkeypatch.setattr(service, "reroll_stale_days", fake_sweep)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_the_nightly_job_rolls_up_yesterday_then_sweeps(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def ok() -> int:
+        return 3
+
+    calls = _nightly_stubs(monkeypatch, rollup=ok)
+    now = datetime(2026, 5, 22, 1, tzinfo=timezone(timedelta(hours=9)))  # 16:00 UTC on the 21st
+
+    assert await service.run_nightly_rollup(now=now) == {"stale_days": 1, "recomputed": 1}
+    assert calls == [("rollup", date(2026, 5, 20)), ("sweep", now.astimezone(timezone.utc))]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_rollup_still_sweeps_and_then_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def down() -> int:
+        raise ConnectionError("db blip")
+
+    calls = _nightly_stubs(monkeypatch, rollup=down)
+
+    with pytest.raises(ConnectionError):
+        await service.run_nightly_rollup(now=datetime(2026, 5, 22, tzinfo=timezone.utc))
+    assert [c[0] for c in calls] == ["rollup", "sweep"]
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_rollup_does_not_start_a_sweep(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The deadline watchdog, cancel-running and shutdown cancel the run: it must unwind, not sweep."""
+    import asyncio
+
+    async def cancelled() -> int:
+        raise asyncio.CancelledError()
+
+    calls = _nightly_stubs(monkeypatch, rollup=cancelled)
+
+    with pytest.raises(asyncio.CancelledError):
+        await service.run_nightly_rollup(now=datetime(2026, 5, 22, tzinfo=timezone.utc))
+    assert [c[0] for c in calls] == ["rollup"]
+
+
+@pytest.mark.asyncio
+async def test_a_day_the_sweep_could_not_heal_is_logged_as_a_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    async def ok() -> int:
+        return 0
+
+    _nightly_stubs(monkeypatch, rollup=ok,
+                   sweep_summary={"stale_days": 2, "recomputed": 1, "invoiced_period_manual_credit": 1})
+    with caplog.at_level(logging.INFO, logger="services.gmv_aggregation_service"):
+        await service.run_nightly_rollup(now=datetime(2026, 5, 22, tzinfo=timezone.utc))
+
+    sweep_logs = [r for r in caplog.records if "gmv_rollup_stale_day_sweep" in r.getMessage()]
+    assert [r.levelno for r in sweep_logs] == [logging.WARNING]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_sweep_after_a_failed_rollup_keeps_both_errors(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    async def down() -> int:
+        raise ConnectionError("rollup down")
+
+    _nightly_stubs(monkeypatch, rollup=down)
+
+    async def sweep_down(*, now: datetime) -> dict[str, int]:
+        raise TimeoutError("sweep down")
+
+    monkeypatch.setattr(service, "reroll_stale_days", sweep_down)
+    with caplog.at_level(logging.WARNING, logger="services.gmv_aggregation_service"):
+        with pytest.raises(TimeoutError) as raised:
+            await service.run_nightly_rollup(now=datetime(2026, 5, 22, tzinfo=timezone.utc))
+
+    assert isinstance(raised.value.__cause__, ConnectionError)
+    assert any("gmv_aggregation_daily_failed" in r.getMessage() and "rollup down" in r.getMessage()
+               for r in caplog.records)

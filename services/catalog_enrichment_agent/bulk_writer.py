@@ -37,7 +37,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("catalog_enrichment_agent.bulk_writer")
 
@@ -150,9 +150,18 @@ async def _replay_rows(
     transport_retries: int,
     backoff: float,
     label: str,
+    on_row_error: Optional[Callable[[Dict[str, Any], BaseException], None]] = None,
 ) -> Tuple[int, int, List[Dict[str, Any]]]:
     """Per-row replay: the SAME `single_sql` + the SAME row dicts. Bad rows are
-    logged and skipped (never abort). Returns (applied, skipped, skipped_rows)."""
+    logged and skipped (never abort). Returns (applied, skipped, skipped_rows).
+
+    `on_row_error` lets the CALLER classify the failure it alone can name — the
+    exception object never leaves this function otherwise, so a caller that needs
+    to tell one SQLSTATE from another (catalog_skus: 23505 on the second unique
+    constraint, versus any other write failure) would be left inferring it from
+    the skipped row. It replaces the generic log line for that row, is called at
+    most once per row, and its own failure is contained: a broken callback must
+    not turn a skipped row into an aborted batch."""
     applied = 0
     skipped = 0
     skipped_rows: List[Dict[str, Any]] = []
@@ -168,10 +177,20 @@ async def _replay_rows(
                     attempt += 1
                     await asyncio.sleep(backoff * attempt)
                     continue
-                logger.exception(
-                    "bulk_upsert[%s] row skipped (%s): %s",
-                    label, type(exc).__name__, str(exc)[:200],
-                )
+                if on_row_error is not None:
+                    try:
+                        on_row_error(row, exc)
+                    except Exception:  # noqa: BLE001 — a classifier must never abort the batch
+                        logger.exception(
+                            "bulk_upsert[%s] on_row_error callback raised; original "
+                            "row failure (%s): %s",
+                            label, type(exc).__name__, str(exc)[:200],
+                        )
+                else:
+                    logger.exception(
+                        "bulk_upsert[%s] row skipped (%s): %s",
+                        label, type(exc).__name__, str(exc)[:200],
+                    )
                 skipped += 1
                 skipped_rows.append(row)
                 break
@@ -187,12 +206,17 @@ async def bulk_upsert(
     transport_retries: int = 2,
     backoff: float = 1.0,
     label: str = "rows",
+    on_row_error: Optional[Callable[[Dict[str, Any], BaseException], None]] = None,
 ) -> Tuple[int, int, List[Dict[str, Any]]]:
     """Upsert `rows` via chunked multi-row VALUES statements built from the exact
     `single_sql` (no SQL drift — one source of truth for columns + ON CONFLICT).
 
     Returns (applied, skipped, skipped_rows). Bad rows are skipped and returned so
     the caller can prevent orphan children (exclude dependents of skipped parents).
+
+    `on_row_error(row, exc)` — optional — is called for each row the per-row replay
+    finally skips, in place of the generic log line, so the caller can classify the
+    failure by SQLSTATE. See `_replay_rows`.
     """
     row_list = list(rows or [])
     if not row_list:
@@ -236,6 +260,7 @@ async def bulk_upsert(
         a, s, sr = await _replay_rows(
             database, single_sql=single_sql, chunk=chunk,
             transport_retries=transport_retries, backoff=backoff, label=label,
+            on_row_error=on_row_error,
         )
         applied += a
         skipped += s

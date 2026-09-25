@@ -3,6 +3,7 @@
 import pytest
 
 import services.curated_brand_feed as cbf
+
 from services.curated_brand_feed import inci_from_pdp_html, shopify_product_to_record
 
 
@@ -25,7 +26,7 @@ def test_maps_shopify_product_to_validated_record():
     pdp, offers = rec["pdp"], rec["offers"]
     assert pdp["brand"] == "COSRX"
     assert pdp["product_name"] == "Snail Mucin Gel Cleanser"
-    assert pdp["category_path"] == "beauty/skincare/cleanser"
+    assert pdp["category_path"] == "beauty/skincare/cleanse/cleanser"
     assert pdp["barcode"] == "8809416470016"  # GTIN carried (strongest deposit basis)
     assert pdp["source_domain"] == "cosrx.com"
     assert pdp["tags"] == ["k-beauty", "cleanser"]
@@ -33,6 +34,276 @@ def test_maps_shopify_product_to_validated_record():
     assert offers[0]["merchant_inferred"] == "COSRX"
     assert offers[0]["in_stock"] is True
     assert offers[0]["price"] == 16.0  # coerced to float (numeric columns reject strings)
+
+
+def test_fold_replaces_a_parent_stub_with_its_shades():
+    """MAC shape: the base row is a single P2000_ placeholder whose option1 is its
+    own title; the shade rows are the purchasable SKUs. The base keeps one PDP and
+    the shades become its variants — the stub variant is gone, not kept beside them."""
+    base = _product(title="Retro Matte Lipstick", handle="retro-matte-lipstick",
+                    variants=[{"id": 1, "sku": "P2000_1", "price": "24.00", "option1": "Retro Matte Lipstick", "available": True}])
+    ruby = _product(title="Retro Matte Lipstick - Ruby Woo", handle="retro-matte-lipstick-ruby-woo",
+                    images=[{"src": "https://cdn.x/ruby.jpg"}],
+                    variants=[{"id": 2, "sku": "M0N904", "barcode": "773602049363", "price": "24.00", "available": True}])
+    bronx = _product(title="Retro Matte Lipstick - Bronx", handle="retro-matte-lipstick-bronx",
+                     variants=[{"id": 3, "sku": "M0N901", "price": "24.00", "available": False}])
+    out, report = cbf.fold_shade_listings([ruby, base, bronx])
+    assert [p["title"] for p in out] == ["Retro Matte Lipstick"]
+    vs = out[0]["variants"]
+    assert [(v["title"], v["sku"]) for v in vs] == [("Ruby Woo", "M0N904"), ("Bronx", "M0N901")]
+    assert vs[0]["image_src"] == "https://cdn.x/ruby.jpg"
+    assert vs[0][cbf.FOLDED_FROM_KEY] == "retro-matte-lipstick-ruby-woo"
+    # images_adopted 0: this base carries its own image, so the fold leaves it alone
+    # (the adoption path has its own test below).
+    assert report == {"bases": 1, "shades": 2, "stubs_replaced": 1, "refused": [], "images_adopted": 0,
+                      "folded": {"retro-matte-lipstick": ["retro-matte-lipstick-ruby-woo", "retro-matte-lipstick-bronx"]}}
+    assert out[0][cbf.FOLDED_INTO_KEY] == 2  # marks the row the mapper may emit variants for
+
+
+def test_fold_keeps_a_real_base_variant_and_appends_shades():
+    """A base whose single variant names a real shade is not a stub: it stays and
+    the folded shades join it."""
+    base = _product(title="Lip Pencil", handle="lip-pencil",
+                    variants=[{"id": 1, "sku": "LP01", "price": "20.00", "option1": "Whirl", "available": True}])
+    shade = _product(title="Lip Pencil - Brick-O-La", handle="lip-pencil-brick-o-la",
+                     variants=[{"id": 2, "sku": "LP02", "price": "20.00", "available": True}])
+    out, report = cbf.fold_shade_listings([base, shade])
+    assert [v["title"] for v in out[0]["variants"]] == ["Whirl", "Brick-O-La"]
+    assert report["stubs_replaced"] == 0
+
+
+def _multi(**over):
+    return _product(variants=[
+        {"id": 11, "sku": "A", "price": "24.00", "option1": "Ruby Woo", "available": True,
+         "featured_image": {"src": "https://cdn.x/a.jpg"}},
+        {"id": 12, "sku": "B", "price": "0.01", "option1": "Promo", "available": True},   # under the floor
+        {"id": 13, "sku": "C", "price": "24.00", "option1": "Bronx", "available": False},
+    ], **over)
+
+
+#: A natively multi-variant product, in the shape `/products.json` actually serves it:
+#: one product, several shades, each carrying a real numeric Shopify variant id.
+def _native(**over):
+    kw = {
+        "id": 6644068515910,
+        "variants": [
+            {"id": 39406294532166, "sku": "A", "price": "11.99", "option1": "Dune",
+             "available": True, "featured_image": {"src": "https://cdn.x/a.jpg"}},
+            {"id": 39406294532167, "sku": "B", "price": "0.01", "option1": "Promo",
+             "available": True},
+            {"id": 39406294532168, "sku": "C", "price": "11.99", "option1": "Rose",
+             "available": False},
+        ],
+    }
+    kw.update(over)
+    return _product(**kw)
+
+
+def test_mapper_emits_variants_only_when_a_caller_asked_for_them():
+    """Writing variants costs one SKU + offer each downstream, so it stays opt-in —
+    the callers that do not ask must keep emitting exactly one SKU per product."""
+    assert shopify_product_to_record(_native(), domain="x.com", category_path="x")["pdp"]["variants"] == []
+    assert shopify_product_to_record(_multi(), domain="x.com", category_path="x")["pdp"]["variants"] == []
+    # The fold lane's switch alone must NOT reach a native row: a `--base-listings-only`
+    # run (MAC) keeps emitting exactly one SKU for every product it did not fold.
+    assert shopify_product_to_record(_native(), domain="x.com", category_path="x",
+                                     emit_variants=True)["pdp"]["variants"] == []
+
+
+def test_native_multi_variant_rows_emit_their_real_merchant_ids():
+    """The gate used to require FOLDED_INTO_KEY, so a storefront that publishes its
+    shades natively — the NORMAL Shopify shape — contributed no purchasable SKU at
+    all. Measured on flowerbeauty.com 2026-09-07: 29 of 49 products multi-variant,
+    185 real variant ids, ZERO folded, so the fold gate refused every one."""
+    rec = shopify_product_to_record(
+        _native(), domain="x.com", category_path="x", emit_native_variants=True)
+    vs = rec["pdp"]["variants"]
+    assert [(v["variant_id"], v["title"], v["price"], v["in_stock"]) for v in vs] == [
+        ("39406294532166", "Dune", 11.99, True),
+        ("39406294532168", "Rose", 11.99, False),
+    ]   # the 0.01 promo row is under MIN_SELLABLE_PRICE, as before
+
+
+def test_a_native_row_drops_an_id_it_cannot_place_as_the_merchants():
+    """A native row's ids come straight off the merchant's feed, so there is no
+    excuse for one we cannot place. Emitting it would mint a decoy SKU that looks
+    purchasable and is not — the failure the gateway's isRestatedProductId catches.
+    `_multi`'s ids are 11/13: too short to be a Shopify variant id."""
+    rec = shopify_product_to_record(
+        _multi(), domain="x.com", category_path="x", emit_native_variants=True)
+    assert rec["pdp"]["variants"] == []
+    # ...and an id that merely restates the product's own id is refused on shape alone.
+    restated = _native(variants=[{"id": 6644068515910, "price": "11.99",
+                                  "option1": "Only", "available": True}])
+    assert shopify_product_to_record(
+        restated, domain="x.com", category_path="x", emit_native_variants=True)["pdp"]["variants"] == []
+
+
+def test_a_native_single_variant_row_still_earns_its_real_id():
+    """One shade is not a reason to drop identity: flowerbeauty's Petal Pout Lip
+    Color is a one-variant product whose variant id (17281773207622) is real."""
+    one = _native(id=1759336595526, variants=[
+        {"id": 17281773207622, "price": "8.00", "option1": "Flamingo Flirt", "available": True}])
+    vs = shopify_product_to_record(
+        one, domain="x.com", category_path="x", emit_native_variants=True)["pdp"]["variants"]
+    assert [v["variant_id"] for v in vs] == ["17281773207622"]
+
+
+def test_mapper_emits_variants_for_a_folded_row_that_asked_for_them():
+    """The fold lane is unchanged, and admits on a DIFFERENT rule: its variants were
+    assembled by us out of separate per-shade listings and may carry a synthesised
+    id, which the shade selector needs. Ingestion's own provenance check decides
+    whether such a row may also be sold."""
+    folded = _multi(**{cbf.FOLDED_INTO_KEY: 2})
+    rec = shopify_product_to_record(folded, domain="x.com", category_path="x", emit_variants=True)
+    vs = rec["pdp"]["variants"]
+    assert [(v["variant_id"], v["title"], v["price"], v["in_stock"]) for v in vs] == [
+        ("11", "Ruby Woo", 24.0, True), ("13", "Bronx", 24.0, False)]
+    # a real Shopify variant carries its swatch in featured_image; the product image is the fallback
+    assert vs[0]["image_url"] == "https://cdn.x/a.jpg" and vs[1]["image_url"] == "https://cdn.x/img.jpg"
+    assert rec["offers"][0]["price"] == 24.0  # primary offer unchanged: first sellable variant
+
+
+def test_fold_adopts_shade_images_when_the_base_stub_has_none():
+    """maccosmetics.com: 106 of 109 folded bases have an EMPTY images list while the
+    shade rows carry the swatches. The product row is what the quality scorer reads,
+    so an imageless base forfeits the whole images component — MAC scored 66.7
+    against the 71.4 gate and every row was blocked low_quality."""
+    base = _product(title="Retro Matte Lipstick", handle="rml", images=[],
+                    variants=[{"id": 1, "sku": "P2000_1", "price": "24.00", "option1": "Retro Matte Lipstick", "available": True}])
+    ruby = _product(title="Retro Matte Lipstick - Ruby Woo", handle="rml-ruby",
+                    images=[{"src": "https://cdn.x/ruby.jpg"}],
+                    variants=[{"id": 2, "sku": "M0N904", "price": "24.00", "available": True}])
+    bronx = _product(title="Retro Matte Lipstick - Bronx", handle="rml-bronx",
+                     images=[{"src": "https://cdn.x/bronx.jpg"}],
+                     variants=[{"id": 3, "sku": "M0N901", "price": "24.00", "available": True}])
+    out, report = cbf.fold_shade_listings([base, ruby, bronx])
+    assert [i["src"] for i in out[0]["images"]] == ["https://cdn.x/ruby.jpg", "https://cdn.x/bronx.jpg"]
+    assert report["images_adopted"] == 1
+    # ...and the record the mapper builds now names a real product image
+    rec = shopify_product_to_record(out[0], domain="x.com", category_path="x", emit_variants=True)
+    assert rec["offers"][0]["image_url"] == "https://cdn.x/ruby.jpg"
+
+
+def test_fold_never_overwrites_a_base_that_has_its_own_images():
+    base = _product(title="Lip Pencil", handle="lp", images=[{"src": "https://cdn.x/own.jpg"}],
+                    variants=[{"id": 1, "sku": "LP01", "price": "20.00", "option1": "Whirl", "available": True}])
+    shade = _product(title="Lip Pencil - Brick-O-La", handle="lp-b", images=[{"src": "https://cdn.x/shade.jpg"}],
+                     variants=[{"id": 2, "sku": "LP02", "price": "20.00", "available": True}])
+    out, report = cbf.fold_shade_listings([base, shade])
+    assert [i["src"] for i in out[0]["images"]] == ["https://cdn.x/own.jpg"]
+    assert report["images_adopted"] == 0
+
+
+def test_mapper_falls_back_to_a_variant_image_when_the_product_has_none():
+    """Safety net for any imageless product row, folded or not: a variant's own
+    swatch is a real image of the product and beats publishing an imageless row."""
+    rec = shopify_product_to_record(
+        _product(images=[], variants=[{"id": 9, "sku": "A", "price": "24.00",
+                                        "featured_image": {"src": "https://cdn.x/v.jpg"}, "available": True}]),
+        domain="x.com", category_path="x",
+    )
+    assert rec["offers"][0]["image_url"] == "https://cdn.x/v.jpg"
+
+
+def test_fold_keeps_the_shade_rows_own_option1_over_the_title_suffix():
+    """stila's 'Calligraphy Lip Stain - Last Chance Shade' carries option1
+    'Elizabeth (Pinky Nude)'; taking the title suffix minted a second SKU for the
+    same merchant code."""
+    base = _product(title="Calligraphy Lip Stain", handle="cls",
+                    variants=[{"id": 1, "sku": "SE08010001", "price": "24.00", "option1": "Elizabeth (Pinky Nude)", "available": True}])
+    dup = _product(title="Calligraphy Lip Stain - Some Shade", handle="cls-x",
+                   variants=[{"id": 2, "sku": "SE08010002", "price": "24.00", "option1": "Elizabeth (Pinky Nude)", "available": True}])
+    out, _ = cbf.fold_shade_listings([base, dup])
+    assert [v["title"] for v in out[0]["variants"]] == ["Elizabeth (Pinky Nude)", "Elizabeth (Pinky Nude)"]
+
+
+def test_fold_refuses_accessories_and_price_mismatches():
+    """tarte sells '<line> - <X> charm' as a separate $10 accessory and stila
+    suffixes '- Last Chance' onto whole palettes: folding those destroys a real PDP."""
+    base = _product(title="maracuja juicy loop", handle="loop",
+                    variants=[{"id": 1, "price": "6.00", "option1": "multi", "available": True}])
+    charm = _product(title="maracuja juicy loop - daisy charm", handle="loop-daisy",
+                     variants=[{"id": 2, "price": "10.00", "available": True}])
+    palette = _product(title="Pocket Play Shadow Palette", handle="pp",
+                       variants=[{"id": 3, "price": "30.00", "option1": "Default Title", "available": True}])
+    last = _product(title="Pocket Play Shadow Palette - Last Chance", handle="pp-lc",
+                    variants=[{"id": 4, "price": "30.00", "available": True}])
+    out, report = cbf.fold_shade_listings([base, charm, palette, last])
+    assert [p["handle"] for p in out] == ["loop", "loop-daisy", "pp", "pp-lc"]   # nothing folded
+    assert report["bases"] == 0
+    assert sorted(r["reason"] for r in report["refused"]) == ["non_shade_suffix", "non_shade_suffix"]
+
+
+def test_drop_shade_listings_collapses_onto_present_base():
+    """maccosmetics.com shape: every shade is its own single-variant product beside
+    the base listing. Only rows whose base title is IN the feed collapse."""
+    base = _product(title="Retro Matte Lipstick", handle="retro-matte-lipstick")
+    ruby = _product(title="Retro Matte Lipstick - Ruby Woo", handle="retro-matte-lipstick-ruby-woo")
+    bronx = _product(title="Retro Matte Lipstick - Bronx", handle="retro-matte-lipstick-bronx")
+    out = cbf.drop_shade_listings([ruby, base, bronx])
+    assert [p["title"] for p in out] == ["Retro Matte Lipstick"]
+
+
+def test_drop_shade_listings_keeps_suffixed_title_without_base_row():
+    """'Lipglass / Mini M·A·C - Nymphette' with no 'Lipglass / Mini M·A·C' row in the
+    feed is a real product name, not a shade of something else in the feed."""
+    lone = _product(title="Cream & Chrome Eyeliner Duo - Holiday", handle="ccd-holiday")
+    other = _product(title="Amplified Lipstick", handle="amplified-lipstick")
+    out = cbf.drop_shade_listings([lone, other])
+    assert [p["title"] for p in out] == ["Cream & Chrome Eyeliner Duo - Holiday", "Amplified Lipstick"]
+
+
+def test_drop_shade_listings_handles_hyphenated_shade_names():
+    """21 of MAC's collapsible rows carry a hyphen INSIDE the shade name; a
+    single `[^-]+` capture kept every one of them as a duplicate PDP."""
+    base = _product(title="Retro Matte Liquid Lipcolour", handle="rmll")
+    lady = _product(title="Retro Matte Liquid Lipcolour - Lady-Be-Good", handle="rmll-lady-be-good")
+    pencil = _product(title="Lip Pencil", handle="lip-pencil")
+    brick = _product(title="Lip Pencil - Brick-O-La", handle="lip-pencil-brick-o-la")
+    out = cbf.drop_shade_listings([base, lady, pencil, brick])
+    assert [p["title"] for p in out] == ["Retro Matte Liquid Lipcolour", "Lip Pencil"]
+
+
+def test_drop_shade_listings_compares_normalised_titles():
+    """stila: 'HUGE™ …' base vs 'Huge™ … - Intense Black' shade, and a curly vs
+    straight apostrophe — the same normaliser make_content_key uses decides."""
+    base = _product(title="HUGE\u2122 Extreme Lash Mascara", handle="huge")
+    shade = _product(title="Huge\u2122 Extreme Lash Mascara - Intense Black", handle="huge-black")
+    balm = _product(title="Heaven's Dew\u2122 Honey Glow Balm", handle="balm")
+    balm_shade = _product(title="Heaven\u2019s Dew\u2122 Honey Glow Balm - Golden Sun", handle="balm-golden")
+    out = cbf.drop_shade_listings([base, shade, balm, balm_shade])
+    assert [p["handle"] for p in out] == ["huge", "balm"]
+
+
+def test_drop_shade_listings_never_drops_multi_variant_rows():
+    """A multi-variant row already carries its shades as variants; a suffixed title
+    on such a row is a distinct line (tarte's 'X - travel size' style), so it stays."""
+    base = _product(title="Stay All Day Liquid Lipstick", handle="sad")
+    multi = _product(
+        title="Stay All Day Liquid Lipstick - Shimmer",
+        handle="sad-shimmer",
+        variants=[{"price": "25.00", "available": True}, {"price": "25.00", "available": True}],
+    )
+    out = cbf.drop_shade_listings([base, multi])
+    assert [p["title"] for p in out] == ["Stay All Day Liquid Lipstick", "Stay All Day Liquid Lipstick - Shimmer"]
+
+
+@pytest.mark.asyncio
+async def test_records_for_brand_base_listings_only_is_off_by_default_and_threads(monkeypatch):
+    base = _product(title="Retro Matte Lipstick", handle="retro-matte-lipstick")
+    ruby = _product(title="Retro Matte Lipstick - Ruby Woo", handle="retro-matte-lipstick-ruby-woo")
+
+    async def fake_fetch(domain, *, max_products=500, timeout_s=15.0):
+        return [base, ruby]
+
+    monkeypatch.setattr(cbf, "fetch_shopify_products", fake_fetch)
+    default = await cbf.records_for_brand(domain="maccosmetics.com", category_path="beauty/makeup")
+    assert [r["pdp"]["product_name"] for r in default] == ["Retro Matte Lipstick", "Retro Matte Lipstick - Ruby Woo"]
+    filtered = await cbf.records_for_brand(
+        domain="maccosmetics.com", category_path="beauty/makeup", base_listings_only=True
+    )
+    assert [r["pdp"]["product_name"] for r in filtered] == ["Retro Matte Lipstick"]
 
 
 def test_brand_override_and_domain_cleaning():
@@ -63,6 +334,26 @@ def test_drops_unpriced_gift_items():
     assert shopify_product_to_record(_product(variants=[]), domain="x.com", category_path="x") is None
 
 
+def test_drops_token_priced_promo_items():
+    # stilacosmetics.com "Free Travel … (TikTok Shop)" at $0.01 cleared the old `> 0`
+    # test and served as a canonical anchor. A token price is a promo, not an offer.
+    assert shopify_product_to_record(_product(variants=[{"price": "0.01"}]), domain="x.com", category_path="x") is None
+    assert shopify_product_to_record(_product(variants=[{"price": "0.99"}]), domain="x.com", category_path="x") is None
+    # Exactly the floor is sellable.
+    rec = shopify_product_to_record(_product(variants=[{"price": "1.00"}]), domain="x.com", category_path="x")
+    assert rec is not None and rec["offers"][0]["price"] == 1.0
+
+
+def test_price_floor_skips_to_the_first_real_variant():
+    rec = shopify_product_to_record(
+        _product(variants=[{"price": "0.01", "barcode": "PROMO"}, {"price": "15.00", "barcode": "8809416470016"}]),
+        domain="x.com",
+        category_path="x",
+    )
+    assert rec["offers"][0]["price"] == 15.0
+    assert rec["pdp"]["barcode"] is None  # Price selection cannot establish PDP identity.
+
+
 def test_picks_first_positive_priced_variant():
     # First variant unpriced, second priced → keep the product, use the priced variant.
     rec = shopify_product_to_record(
@@ -72,7 +363,7 @@ def test_picks_first_positive_priced_variant():
     )
     assert rec is not None
     assert rec["offers"][0]["price"] == 24.0
-    assert rec["pdp"]["barcode"] == "8809416470016"  # GTIN from the priced variant
+    assert rec["pdp"]["barcode"] is None  # Multi-variant PDP cannot take one item's identity.
 
 
 # --- inci_from_pdp_html: the metafield / accordion INCI source (pure; no network)
@@ -470,3 +761,1401 @@ async def test_records_for_brand_enrich_skips_when_body_html_has_inci(monkeypatc
     recs = await cbf.records_for_brand(domain="cosrx.com", category_path="x", brand="COSRX",
                                        enrich_missing_inci=True, pdp_delay_s=0.0)
     assert recs[0]["pdp"]["raw_inci"].startswith("Water, Glycerin")
+
+
+
+
+@pytest.fixture(autouse=True)
+def _no_live_meta_json(monkeypatch, request):
+    """Keep `records_for_brand` off the live network.
+
+    It gained an unconditional `fetch_shopify_shop_locale(domain)`, and the four older
+    `records_for_brand` tests stub only `fetch_shopify_products` -- so from that change onward this
+    file really did GET maccosmetics.com/robots.txt and /meta.json on every suite run. Measured:
+    those tests took 0.73s and 0.69s against <0.02s for everything else in the file, and returned
+    a REAL currency from the live host. It never failed without egress (`_gated_fetch` swallows
+    the error), which is what made it invisible -- a non-hermetic test that passes either way.
+    Worse, `max_wait=0` means an unbounded wait in the politeness gate, so a merchant Crawl-delay
+    could stall the suite.
+
+    Autouse so a future `records_for_brand` test cannot reintroduce it by omission. Tests that are
+    ABOUT the locale opt out via `@pytest.mark.live_locale` and stub it themselves.
+    """
+    if request.node.get_closest_marker("live_locale"):
+        return
+
+    async def _offline(domain, **kw):
+        return {"currency": "USD"}  # Explicit observed-currency fixture; no network.
+
+    monkeypatch.setattr(cbf, "fetch_shopify_shop_locale", _offline)
+
+
+def _clear_locale_cache():
+    """`storefront_currency` caches per domain for the PROCESS lifetime, negatives included.
+
+    Without this, the first test to record a None for a host fixes that answer for every later
+    test -- and the assertions would then be measuring the cache, not the code.
+    """
+    from services import storefront_currency
+
+    storefront_currency.clear_cache()
+
+
+def _silence_politeness(monkeypatch):
+    """Neutralise the shared crawl politeness gate for a unit test.
+
+    It issues its own robots.txt GET through whatever httpx client is installed, so a stubbed
+    client answers robots.txt with the meta.json body and the function under test never gets its
+    turn. Stubbed rather than worked around so these tests fail for meta.json reasons only.
+    """
+    async def _before(*a, **kw):
+        return None
+
+    monkeypatch.setattr(cbf.crawl_politeness, "before_request", _before)
+    monkeypatch.setattr(cbf.crawl_politeness, "note_response", lambda *a, **kw: None)
+
+
+
+# -- storefront currency / market ---------------------------------------------------------------
+
+
+def test_the_record_carries_the_storefronts_currency_and_market():
+    """`/products.json` carries prices but never the currency they are in, so every record this
+    module produced was currency-less and the ingest lane stamped USD on all of them. Measured
+    2026-09-06 on jsmbeauty.sg: 170 offers, all USD, against a storefront whose /meta.json says
+    SGD/SG and whose LIP-PRESSION Glowy Tint is SGD 30.00."""
+    rec = shopify_product_to_record(_product(), domain="jsmbeauty.sg",
+                                    category_path="beauty/makeup/lip", currency="SGD")
+
+    assert rec["pdp"]["currency"] == "SGD"
+    # market is NOT carried: it is a hard serving partition on seeds, not this lane's axis.
+    assert "market" not in rec["pdp"]
+
+
+def test_a_record_from_a_storefront_we_could_not_read_carries_no_currency():
+    """None, NOT a USD default. The ingest lane owns the fallback, and defaulting here would make
+    a storefront we failed to read indistinguishable from one that genuinely sells in USD --
+    which is the difference between a known fact and a guess in a currency column."""
+    rec = shopify_product_to_record(_product(), domain="x.com", category_path="x")
+
+    assert rec["pdp"]["currency"] is None
+
+
+@pytest.mark.parametrize(
+    "body,expected",
+    [
+        ({"currency": "SGD", "country": "SG"}, {"currency": "SGD"}),
+        ({"currency": "sgd", "country": "sg"}, {"currency": "SGD"}),
+        ({"currency": "USD", "country": "US"}, {"currency": "USD"}),
+        # merchant-controlled: anything not ISO-shaped is refused, not written through
+        # An unparseable currency invalidates the WHOLE record, country included:
+        # `storefront_currency` returns None rather than half an answer, because it "returns None
+        # when it cannot prove the answer". Asserted as its behaviour, not worked around.
+        ({"currency": "dollars", "country": "SG"}, {"currency": None}),
+        ({"currency": "SGD", "country": "SGP"}, {"currency": "SGD"}),
+        ({"currency": 5, "country": None}, {"currency": None}),
+        ({}, {"currency": None}),
+        ([], {"currency": None}),
+    ],
+)
+@pytest.mark.asyncio
+@pytest.mark.live_locale
+async def test_meta_json_is_validated_before_it_is_believed(monkeypatch, body, expected):
+    """The value lands in a currency column that is a join key for price comparison, and it comes
+    from the merchant. Shape-check it at the door."""
+    import httpx
+
+    class _Resp:
+        url = httpx.URL("https://jsmbeauty.sg/meta.json")
+        status_code = 200
+        headers = {"content-type": "application/json"}
+
+        # TEXT, not .json(). `fetch_storefront_meta`'s injected-fetch seam consumes the response
+        # BODY as a string and parses it itself, so a double exposing only .json() returns None
+        # for every case and the parametrisation silently tests nothing.
+        @property
+        def text(self):
+            import json as _j
+
+            return _j.dumps(body)
+
+        def json(self):
+            return body
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url):
+            return _Resp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Client())
+    # The politeness gate fetches robots.txt through this same client, so without stubbing it the
+    # stub answers robots.txt with JSON and the function under test never runs. It has its own
+    # tests; this one is about the meta.json contract.
+    _silence_politeness(monkeypatch)
+    _clear_locale_cache()
+    assert await cbf.fetch_shopify_shop_locale("jsmbeauty.sg") == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.live_locale
+async def test_an_unreadable_meta_json_is_best_effort_not_an_exception(monkeypatch):
+    """A non-Shopify host, a 404 or a hung socket must not fail the whole brand's ingest -- the
+    caller keeps its default and the crawl proceeds."""
+    import httpx
+
+    class _Boom:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url):
+            raise httpx.ConnectError("no route")
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Boom())
+    _silence_politeness(monkeypatch)
+    _clear_locale_cache()
+    assert await cbf.fetch_shopify_shop_locale("x.com") == {"currency": None}
+
+
+@pytest.mark.asyncio
+@pytest.mark.live_locale
+async def test_records_for_brand_wires_the_locale_into_every_record(monkeypatch):
+    """THE SEAM. `fetch_shopify_shop_locale` can be perfect and `shopify_product_to_record` can
+    stamp perfectly, and the feature is still dead in production if the caller never passes one
+    to the other. Deleting that one argument left both unit files green -- the same shape as the
+    whitelist drop on the ingest side, where every consumer read a field nobody ever set.
+
+    Stubs both fetches so this asserts the WIRING and nothing else.
+    """
+    async def _products(domain, **kw):
+        return [_product()]
+
+    async def _locale(domain, **kw):
+        return {"currency": "SGD"}
+
+    monkeypatch.setattr(cbf, "fetch_shopify_products", _products)
+    monkeypatch.setattr(cbf, "fetch_shopify_shop_locale", _locale)
+
+    recs = await cbf.records_for_brand(domain="jsmbeauty.sg", category_path="beauty/makeup/lip")
+
+    assert recs, "the stub returned a product, so a record must come back"
+    assert {r["pdp"]["currency"] for r in recs} == {"SGD"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.live_locale
+async def test_records_for_brand_reads_the_locale_once_per_brand_not_once_per_product(monkeypatch):
+    """It is one storefront-wide setting. A per-product fetch would multiply outbound requests by
+    the catalogue size against a single host -- 170 extra requests for jsmbeauty.sg alone -- which
+    is exactly the shape the shared politeness gate exists to prevent."""
+    calls = []
+
+    async def _products(domain, **kw):
+        return [_product(), _product(handle="second", title="Second Product")]
+
+    async def _locale(domain, **kw):
+        calls.append(domain)
+        return {"currency": "SGD"}
+
+    monkeypatch.setattr(cbf, "fetch_shopify_products", _products)
+    monkeypatch.setattr(cbf, "fetch_shopify_shop_locale", _locale)
+
+    recs = await cbf.records_for_brand(domain="jsmbeauty.sg", category_path="beauty/makeup/lip")
+
+    assert len(recs) >= 2, "two products in, so the per-product count is meaningful"
+    assert calls == ["jsmbeauty.sg"], f"locale fetched {len(calls)} times for one brand"
+
+
+@pytest.mark.parametrize(
+    "status,ctype,label",
+    [
+        (404, "application/json", "a 404 body"),
+        (500, "application/json", "an error page"),
+        (200, "text/html", "an HTML soft-404"),
+        (200, "", "a response with no content-type"),
+    ],
+)
+@pytest.mark.asyncio
+@pytest.mark.live_locale
+async def test_meta_json_refuses_anything_that_is_not_a_json_200(monkeypatch, status, ctype, label):
+    """Both gates matter and neither was pinned. Storefronts that are not Shopify commonly answer
+    /meta.json with a 200 HTML soft-404, and `resp.json()` on that either raises or -- worse --
+    parses embedded JSON. Refuse on the status AND on the content-type, so the caller keeps its
+    default instead of inheriting a currency from someone's error page."""
+    import httpx
+
+    class _Resp:
+        status_code = status
+        headers = {"content-type": ctype}
+
+        @property
+        def text(self):
+            return '{"currency": "XXX", "country": "ZZ"}'
+
+        def json(self):
+            return {"currency": "XXX", "country": "ZZ"}
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url):
+            return _Resp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Client())
+    _silence_politeness(monkeypatch)
+    _clear_locale_cache()
+
+    assert await cbf.fetch_shopify_shop_locale("x.com") == {"currency": None}, label
+
+
+@pytest.mark.asyncio
+@pytest.mark.live_locale
+async def test_the_meta_json_fetch_goes_through_the_politeness_gate(monkeypatch):
+    """PINNED DELIBERATELY, not incidentally.
+
+    This lane crawls merchant hosts from the shared crawl-egress IP, and the ratchet in
+    tests/test_crawl_politeness.py counts the string `crawl_politeness.before_request` in this
+    file -- which a nested function nobody calls would satisfy. Measured: with
+    `fetch=_gated_fetch` removed, the ratchet still PASSED, and the only thing failing was a test
+    double that happened to lack `raise_for_status`. That is a guard held up by an accident.
+
+    So: assert the gate actually saw the meta.json URL, with the same user agent the request
+    carries, and that the response was reported back to it.
+    """
+    import httpx
+
+    seen = {"before": [], "note": []}
+
+    async def _before(url, **kw):
+        seen["before"].append((url, kw.get("user_agent"), kw.get("max_wait")))
+
+    monkeypatch.setattr(cbf.crawl_politeness, "before_request", _before)
+    monkeypatch.setattr(
+        cbf.crawl_politeness, "note_response",
+        lambda url, status, **kw: seen["note"].append((url, status)),
+    )
+
+    class _Resp:
+        url = httpx.URL("https://jsmbeauty.sg/meta.json")
+        status_code = 200
+        headers = {"content-type": "application/json"}
+        text = '{"currency": "SGD", "country": "SG"}'
+
+        def raise_for_status(self):
+            return None
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url):
+            return _Resp()
+
+    sent = {}
+
+    def _client(**kw):
+        sent.update(kw)          # capture what the REQUEST carries, not just what the gate hears
+        return _Client()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _client)
+    _clear_locale_cache()
+
+    assert await cbf.fetch_shopify_shop_locale("jsmbeauty.sg") == {"currency": "SGD"}
+
+    assert seen["before"], "the politeness gate never saw the meta.json request"
+    url, ua, max_wait = seen["before"][0]
+    assert url.endswith("/meta.json")
+    assert ua == cbf._UA, "the gate must be asked about the SAME agent the request then sends"
+    # AND the request must actually send it. Asserting only the gate side is the same accident
+    # this test replaced, one layer down: a mutant changing the outgoing header survived.
+    assert (sent.get("headers") or {}).get("User-Agent") == cbf._UA
+    assert max_wait == 0, "batch lane: wait rather than drop"
+    assert seen["note"] and seen["note"][0][1] == 200, "the response must be reported back"
+
+
+@pytest.mark.asyncio
+@pytest.mark.live_locale
+async def test_a_failed_meta_json_is_not_cached_against_the_next_brand(monkeypatch):
+    """`fetch_storefront_meta` caches per domain for the PROCESS lifetime, NEGATIVES INCLUDED, and
+    this lane runs inside a queue-draining worker with its own retry budget. One transient failure
+    would otherwise pin that brand to None -> USD for the whole process, silently defeating both
+    the retry and this entire change."""
+    import httpx
+
+    calls = {"n": 0}
+
+    class _Resp:
+        url = httpx.URL("https://jsmbeauty.sg/meta.json")
+        def __init__(self, ok):
+            self.status_code = 200 if ok else 503
+            self.headers = {"content-type": "application/json"}
+            self.text = '{"currency": "SGD", "country": "SG"}' if ok else ""
+
+        def raise_for_status(self):
+            return None
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url):
+            calls["n"] += 1
+            return _Resp(calls["n"] > 1)      # first attempt fails, second succeeds
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Client())
+    _silence_politeness(monkeypatch)
+    _clear_locale_cache()
+
+    assert await cbf.fetch_shopify_shop_locale("jsmbeauty.sg") == {"currency": None}
+    # the retry must actually reach the network again, not read a cached None
+    assert await cbf.fetch_shopify_shop_locale("jsmbeauty.sg") == {"currency": "SGD"}
+    assert calls["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_no_test_in_this_file_reaches_the_live_network_by_default(monkeypatch):
+    """Pins the autouse offline stub, which is otherwise invisible: removing it fails nothing, it
+    just makes the suite quietly crawl merchant hosts again (measured: 0.56s -> 1.74s for this
+    file, with real GETs to maccosmetics.com/robots.txt and /meta.json).
+
+    A non-hermetic test that passes either way is the worst kind, so this asserts the property
+    directly: with `httpx.AsyncClient` rigged to explode, `records_for_brand` must still complete.
+    """
+    import httpx
+
+    class _LiveRequestAttempted(BaseException):
+        """BaseException on purpose. `_gated_fetch` wraps its request in `except Exception`, so an
+        ordinary error -- including AssertionError -- is SWALLOWED and the test passes anyway.
+        That broad catch is exactly why the live calls were invisible for two rounds."""
+
+    def _explode(**kw):
+        raise _LiveRequestAttempted("a default-path test attempted a live HTTP request")
+
+    async def _products(domain, **kw):
+        return [_product()]
+
+    monkeypatch.setattr(cbf, "fetch_shopify_products", _products)
+    monkeypatch.setattr(httpx, "AsyncClient", _explode)
+
+    recs = await cbf.records_for_brand(domain="maccosmetics.com", category_path="beauty/makeup")
+
+    assert recs, "the stub returned a product, so a record must come back"
+    assert recs[0]["pdp"]["currency"] == "USD", "offline: no currency learned, ingest defaults USD"
+
+def _folded(base_options, own_variants, shade_titles):
+    """Drive the REAL fold. A hand-marked `_multi(FOLDED_INTO_KEY=2)` product is
+    NOT what the fold produces: `fold_shade_listings` stamps each folded-in
+    variant with the handle it came from, and that marker is what tells a shade
+    apart from one of the base's own variants."""
+    base = _product(title="Studio Fix Fluid", handle="sff", images=[{"src": "https://cdn.x/b.jpg"}],
+                    options=base_options, variants=own_variants)
+    shades = [
+        _product(title=f"Studio Fix Fluid - {t}", handle=f"sff-{t.lower()}",
+                 images=[{"src": f"https://cdn.x/{t}.jpg"}],
+                 options=[{"name": "Title", "values": ["Default Title"]}],
+                 variants=[{"id": 100 + i, "sku": f"S{i}", "price": "42.00", "available": True}])
+        for i, t in enumerate(shade_titles)
+    ]
+    out, _ = cbf.fold_shade_listings([base] + shades)
+    vs = shopify_product_to_record(out[0], domain="x.com", category_path="x",
+                                   emit_variants=True)["pdp"]["variants"]
+    return {v["title"]: v["option_name"] for v in vs}
+
+
+def test_mapper_carries_the_shops_own_name_for_a_real_shade_axis():
+    """Shopify shops name the axis themselves ("Color", "Colour", "Shade"); using
+    the shop's own word keeps the PDP reading the way their store does."""
+    by_title = _folded(
+        base_options=[{"name": "Colour", "position": 1, "values": ["NC15"]}],
+        own_variants=[{"id": 11, "sku": "A", "price": "42.00", "option1": "NC15", "available": True}],
+        shade_titles=["NC20"],
+    )
+    assert by_title == {"NC15": "Colour", "NC20": "Colour"}
+
+
+def test_a_folded_shade_is_never_named_for_the_bases_own_axis():
+    """THE MISLABEL. `fold_shade_listings` appends variants taken from OTHER
+    products onto a base that keeps its own `options`. A foundation really sold
+    in 30ml and 50ml published its shades as "Size: NC15" — and because the
+    renderer only demands a swatch when the axis READS as a shade, a mislabelled
+    shade also rendered without one."""
+    by_title = _folded(
+        base_options=[{"name": "Size", "position": 1, "values": ["30ml", "50ml"]}],
+        own_variants=[{"id": 11, "sku": "A", "price": "42.00", "option1": "30ml", "available": True},
+                      {"id": 12, "sku": "B", "price": "52.00", "option1": "50ml", "available": True}],
+        shade_titles=["NC15", "NC20"],
+    )
+    assert by_title["30ml"] == "Size" and by_title["50ml"] == "Size"    # the base's OWN axis survives
+    assert by_title["NC15"] == "Color" and by_title["NC20"] == "Color"  # folded shades are shades
+
+
+def test_a_collapsed_per_shade_listing_falls_back_to_the_shade_axis():
+    """A stub base has no variants of its own and reports the placeholder axis
+    "Title", which names nothing. The fold is what established the axis."""
+    by_title = _folded(
+        base_options=[{"name": "Title", "values": ["Default Title"]}],
+        own_variants=[{"id": 11, "sku": "A", "price": "42.00", "option1": "Default Title",
+                       "available": True}],
+        shade_titles=["NC15", "NC20"],
+    )
+    assert by_title["NC15"] == "Color" and by_title["NC20"] == "Color"
+
+
+def test_a_bases_own_variant_gets_no_axis_invented_when_the_shop_names_none():
+    """A guessed axis is a label the merchant never wrote. The base's own
+    variants keep the base's axis — and nothing when there is none to keep."""
+    by_title = _folded(
+        base_options=[],
+        own_variants=[{"id": 11, "sku": "A", "price": "42.00", "option1": "One", "available": True},
+                      {"id": 12, "sku": "B", "price": "43.00", "option1": "Two", "available": True}],
+        shade_titles=["NC15"],
+    )
+    assert by_title["NC15"] == "Color"
+    assert by_title["One"] == "" and by_title["Two"] == ""
+
+
+def test_a_folded_shade_with_an_empty_handle_is_still_a_shade():
+    """PRESENCE, not truthiness. The fold stamps the key with the handle it took
+    the variant from; an empty handle stored "" and a truthiness test read that
+    as "not folded", handing the shade the base's own axis — the exact mislabel
+    the per-variant rule exists to prevent."""
+    base = _product(title="Studio Fix Fluid", handle="sff", images=[{"src": "https://cdn.x/b.jpg"}],
+                    options=[{"name": "Size", "values": ["30ml"]}],
+                    variants=[{"id": 11, "sku": "A", "price": "42.00", "option1": "30ml",
+                               "available": True}])
+    shade = _product(title="Studio Fix Fluid - NC15", handle="",
+                     images=[{"src": "https://cdn.x/nc15.jpg"}],
+                     options=[{"name": "Title", "values": ["Default Title"]}],
+                     variants=[{"id": 101, "sku": "S1", "price": "42.00", "available": True}])
+    out, _ = cbf.fold_shade_listings([base, shade])
+    vs = shopify_product_to_record(out[0], domain="x.com", category_path="x",
+                                   emit_variants=True)["pdp"]["variants"]
+    by_title = {v["title"]: v["option_name"] for v in vs}
+    assert by_title["NC15"] == "Color"
+    assert by_title["30ml"] == "Size"
+
+
+@pytest.mark.parametrize("axis", ["Color", "Colour", "Shade", "SHADE", "Tone", "Hue",
+                                  "COLOR", " color ", " shade "])
+def test_every_recognised_shade_axis_keeps_the_shops_own_spelling(axis):
+    """`_SHADE_AXIS_NAMES` was pinned at ONE element by the tests — deleting
+    `color`, the commonest spelling on a US storefront, stayed green while
+    silently relabelling every such shop's axis as "Shade"."""
+    by_title = _folded(
+        base_options=[{"name": axis, "position": 1, "values": ["NC15"]}],
+        own_variants=[{"id": 11, "sku": "A", "price": "42.00", "option1": "NC15",
+                       "available": True}],
+        shade_titles=["NC20"],
+    )
+    assert by_title["NC20"] == axis.strip(), f"{axis} should be kept as the shop wrote it"
+
+
+@pytest.mark.parametrize("axis", ["Size", "Finish", "Format", "Colour Family", "Color/Shade"])
+def test_an_axis_the_renderer_will_not_read_as_a_shade_is_replaced(axis):
+    """The renderer matches the axis name EXACTLY against its own shade
+    vocabulary, so "Colour Family" is not a shade axis to it. A folded-in
+    variant is a shade whatever the base calls itself."""
+    by_title = _folded(
+        base_options=[{"name": axis, "position": 1, "values": ["A"]}],
+        own_variants=[{"id": 11, "sku": "A", "price": "42.00", "option1": "A", "available": True}],
+        shade_titles=["NC20"],
+    )
+    assert by_title["NC20"] == "Color"
+    assert by_title["A"] == axis      # the base's own variants keep their real axis
+
+
+@pytest.mark.parametrize("placeholder", ["Title", "Option", "Variant", "Selection", "Default Title"])
+def test_a_placeholder_axis_name_is_not_published_for_a_bases_own_variants(placeholder):
+    """The placeholder set was entirely unexercised: every existing case used a
+    STUB base, whose own variants the fold discards, so the folded shades
+    returned "Shade" regardless of whether the placeholder was ever filtered.
+    This drives a base that KEEPS its own variants."""
+    by_title = _folded(
+        base_options=[{"name": placeholder, "values": ["Default Title"]}],
+        own_variants=[{"id": 11, "sku": "A", "price": "42.00", "option1": "Regular",
+                       "available": True},
+                      {"id": 12, "sku": "B", "price": "42.00", "option1": "Deluxe",
+                       "available": True}],
+        shade_titles=["NC20"],
+    )
+    assert by_title["Regular"] == "" and by_title["Deluxe"] == ""
+    assert by_title["NC20"] == "Color"
+
+
+# "travel size" / "mini" / "refill" are refused by the FOLD itself, so they never
+# reach the axis namer — these are the size-shaped suffixes that do fold.
+@pytest.mark.parametrize("suffix", ["3.4 fl oz", "50ml", "100 g", "2 pack",
+                                    "Medium", "One Size"])
+def test_a_size_suffix_is_never_published_as_a_colour(suffix):
+    """The fold collapses listings that differ by a TITLE SUFFIX, and a suffix is
+    not always a shade — "Fix+ - 3.4 fl oz" folds exactly like
+    "Retro Matte Lipstick - Ruby Woo". Inventing a colour axis over a quantity
+    publishes "Color: 3.4 fl oz"."""
+    by_title = _folded(
+        base_options=[{"name": "Title", "values": ["Default Title"]}],
+        own_variants=[{"id": 11, "sku": "A", "price": "42.00", "option1": "Default Title",
+                       "available": True}],
+        shade_titles=[suffix],
+    )
+    assert by_title[suffix] == "", f"{suffix} must not be named as a colour axis"
+
+
+@pytest.mark.parametrize("shade", ["Ruby Woo", "NC15", "Lavender", "M0N904", "01 Nude",
+                                   "Relentlessly Red"])
+def test_a_real_shade_is_still_published(shade):
+    """The positive counterpart — the size guard must not eat real shade names,
+    including numeric merchant codes."""
+    by_title = _folded(
+        base_options=[{"name": "Title", "values": ["Default Title"]}],
+        own_variants=[{"id": 11, "sku": "A", "price": "42.00", "option1": "Default Title",
+                       "available": True}],
+        shade_titles=[shade],
+    )
+    assert by_title[shade] == "Color"
+
+
+# -- PDP meta description fallback ---------------------------------------------------------------
+# 158 of jsmbeauty.sg's 232 products publish under 50 chars of body_html TEXT (LIP-PRESSION Glowy
+# Tint: 123 chars of markup rendering to zero), so the whole cohort failed the 50-char floor and
+# stayed blocked -- while the same PDPs serve 150-340 chars in og:description. The copy was never
+# missing from the site, only from the field the backfill read.
+
+
+def test_the_pdp_meta_description_is_recovered():
+    from services.curated_brand_feed import description_from_pdp_html
+
+    page = """
+      <html><head>
+        <meta property="og:description" content="A lip tint that gives off a watery glow." />
+      </head><body>x</body></html>
+    """
+    assert description_from_pdp_html(page) == "A lip tint that gives off a watery glow."
+
+
+def test_the_per_product_name_tag_wins_over_the_theme_generated_og_one():
+    """og is NOT the richer copy, which an earlier version of this asserted.
+
+    The og tag is frequently theme-generated; `name="description"` is the per-product SEO field a
+    merchant fills. Measured live on kyliecosmetics.com: og carried the STORE blurb while name
+    carried the product's own line, so preferring og took the strictly worse string on a real page.
+
+    This asserts the PREFERENCE only. The name value here is a thin brand+title echo, and calling
+    it good copy would over-claim -- but it is at least about this product, where the og value is
+    about the shop. Storefront-wide strings that reach the name tag (an app vendor's operational
+    text, say) are dropped downstream by repetition, not here.
+    """
+    from services.curated_brand_feed import description_from_pdp_html
+
+    page = """
+      <meta property="og:description" content="Shop award-winning makeup and skincare.">
+      <meta name="description" content="Kylie Cosmetics - Glossy Pink Makeup Bag + Samples">
+    """
+    assert description_from_pdp_html(page) == "Kylie Cosmetics - Glossy Pink Makeup Bag + Samples"
+
+
+def test_the_parser_does_NOT_try_to_recognise_the_shops_blurb_by_itself():
+    """The boilerplate decision is NOT a property of one page, and an earlier version of this
+    file asserted that it was.
+
+    That version keyed on a PRESENT-BUT-EMPTY `name="description"`, because on jsmbeauty.sg every
+    boilerplate page carried one. It is a THEME detail, not the substitution mechanism: Dawn-family
+    themes wrap the name tag in `{% if page_description %}` and OMIT it, so a 60-PDP sweep across
+    10 storefronts (2026-09-06) found the shop blurb served under an ABSENT name tag 9 times
+    (cosrx.com, mixsoon.us, medicube.us) and under a present-but-empty one 0 times outside the one
+    storefront the rule came from. The guard fired only where it was born.
+
+    So the parser now reports what the page says, and `drop_shared_boilerplate` decides — with the
+    whole domain and the shop's own blurb in hand. Here that means the og value comes back, and it
+    is the CALLER's job to throw it away.
+    """
+    from services.curated_brand_feed import description_from_pdp_html
+
+    page = """
+      <meta name="description" content="">
+      <meta property="og:description" content="Discover JUNGSAEMMOOL, the epitome of Korean
+      makeup and cosmetic products, blending artistry with skincare for every day.">
+    """
+    out = description_from_pdp_html(page)
+    assert out is not None and out.startswith("Discover JUNGSAEMMOOL")
+
+
+def test_an_ABSENT_name_tag_is_not_the_same_signal_as_an_empty_one():
+    """A theme that emits no name tag at all is the COMMON case (Dawn-family), not a special one,
+    and its og value is read normally. Whether that value is this product's copy or the shop's
+    blurb is settled downstream by comparison, not here."""
+    from services.curated_brand_feed import description_from_pdp_html
+
+    page = '<meta property="og:description" content="A lip tint with a watery glow and vivid colour.">'
+    assert description_from_pdp_html(page) == "A lip tint with a watery glow and vivid colour."
+
+
+def test_an_apostrophe_inside_a_double_quoted_attribute_does_not_truncate():
+    """The capture must match the OPENING delimiter. A character class of both quotes ends at the
+    first apostrophe inside a double-quoted attribute -- measured live on kyliecosmetics.com, an
+    88-character sentence truncated to 25 at "that's", which still cleared the 50-char floor and
+    was written as a mid-sentence fragment. Raw apostrophes are ubiquitous in this copy, and the
+    earlier entity test only covered the ones a theme had already escaped.
+    """
+    from services.curated_brand_feed import description_from_pdp_html
+
+    page = ("<meta property=\"og:description\" content=\"Clean vegan skincare that's "
+            "dermatologist-tested and cruelty-free for every skin type.\">")
+    out = description_from_pdp_html(page)
+    assert out == "Clean vegan skincare that's dermatologist-tested and cruelty-free for every skin type."
+    assert not out.endswith("that"), "truncated at the apostrophe"
+
+
+def test_a_single_quoted_content_attribute_still_parses():
+    """The mirror case: matching only double quotes would drop these entirely."""
+    from services.curated_brand_feed import description_from_pdp_html
+
+    page = "<meta property='og:description' content='A tint with a glassy, watery finish.'>"
+    assert description_from_pdp_html(page) == "A tint with a glassy, watery finish."
+
+
+def test_the_plain_description_is_used_when_there_is_no_og_one():
+    from services.curated_brand_feed import description_from_pdp_html
+
+    assert description_from_pdp_html('<meta name="description" content="Only this one.">') \
+        == "Only this one."
+
+
+@pytest.mark.parametrize(
+    "page",
+    [
+        "",
+        "<html><head><title>no meta at all</title></head></html>",
+        '<meta property="og:description" content="">',
+        '<meta property="og:description" content="   ">',
+        '<meta property="og:image" content="https://x/i.jpg">',      # a meta tag, wrong key
+        '<meta name="keywords" content="lip, tint, glow">',
+    ],
+)
+def test_nothing_usable_returns_None_rather_than_a_guess(page):
+    """None, never a partial. The caller treats a short string as 'no copy' and leaves the row
+    honestly blocked; inventing something here would publish copy nobody wrote."""
+    from services.curated_brand_feed import description_from_pdp_html
+
+    assert description_from_pdp_html(page) is None
+
+
+def test_attribute_order_and_entities_are_handled():
+    """Real themes put `content` before `property`, and the copy is HTML-escaped. A regex that
+    assumes the order, or forgets to unescape, silently drops or mangles real descriptions."""
+    from services.curated_brand_feed import description_from_pdp_html
+
+    page = '<meta content="Glass &amp; glow &#8212; non-sticky" property="og:description">'
+    assert description_from_pdp_html(page) == "Glass & glow — non-sticky"
+
+
+def test_whitespace_is_collapsed_so_the_length_floor_measures_words():
+    """The gate compares LENGTH against 50, so a description padded with newlines would pass the
+    floor while carrying almost no copy."""
+    from services.curated_brand_feed import description_from_pdp_html
+
+    page = '<meta property="og:description" content="A   lip\n\n  tint.">'
+    assert description_from_pdp_html(page) == "A lip tint."
+
+
+@pytest.mark.live_locale
+@pytest.mark.asyncio
+async def test_a_pdp_that_is_down_yields_None_and_never_raises(monkeypatch):
+    """It runs inside a backfill loop over hundreds of rows; one dead PDP must not end the batch."""
+    import httpx
+
+    class _Boom:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url):
+            raise httpx.ConnectError("no route")
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Boom())
+    _silence_politeness(monkeypatch)
+
+    assert await cbf.fetch_pdp_description("jsmbeauty.sg", "lip-pression-glowy-tint") is None
+
+
+# --- the opt-in must reach the mapper, and the record must reach a purchasable row ---
+
+@pytest.mark.asyncio
+async def test_records_for_brand_wires_emit_real_variants_through(monkeypatch):
+    """`emit_real_variants` is the whole point of the flag: prove it reaches the
+    mapper, and that it stays OFF unless a caller asks."""
+    async def _fake_products(domain, max_products=500):
+        return [_native()]
+
+    async def _fake_locale(domain, **kw):
+        return {"currency": "USD"}
+
+    monkeypatch.setattr(cbf, "fetch_shopify_products", _fake_products)
+    monkeypatch.setattr(cbf, "fetch_shopify_shop_locale", _fake_locale)
+
+    off = await cbf.records_for_brand(domain="x.com", category_path="c")
+    assert off[0]["pdp"]["variants"] == []
+
+    # The MAC lane's flag on its own must not change what a native row yields.
+    fold_only = await cbf.records_for_brand(
+        domain="x.com", category_path="c", base_listings_only=True)
+    assert fold_only[0]["pdp"]["variants"] == []
+
+    on = await cbf.records_for_brand(domain="x.com", category_path="c", emit_real_variants=True)
+    assert [v["variant_id"] for v in on[0]["pdp"]["variants"]] == [
+        "39406294532166", "39406294532168"]
+
+
+@pytest.mark.asyncio
+async def test_a_native_variant_becomes_a_sku_AND_a_priced_offer(monkeypatch):
+    """A SKU written without a catalog_offers row is INERT — the serving price gate
+    and recall both read catalog_offers. So the end of this lane is the PAIR, at the
+    variant's OWN price, not the product's."""
+    import json as _json
+
+    from services.catalog_enrichment_agent.ingestion import ingest_validated_jsonl
+
+    async def _fake_products(domain, max_products=500):
+        return [_native()]
+
+    async def _fake_locale(domain, **kw):
+        return {"currency": "USD"}
+
+    monkeypatch.setattr(cbf, "fetch_shopify_products", _fake_products)
+    monkeypatch.setattr(cbf, "fetch_shopify_shop_locale", _fake_locale)
+
+    recs = await cbf.records_for_brand(
+        domain="x.com", category_path="c", emit_real_variants=True)
+    plan = ingest_validated_jsonl(recs)
+
+    variant_skus = [s for s in plan["skus"] if "::v:" in s["sku_key"]]
+    assert sorted(s["source_variant_id"] for s in variant_skus) == [
+        "39406294532166", "39406294532168"]
+
+    offer_keys = {o["sku_key"] for o in plan["offers"]}
+    assert all(s["sku_key"] in offer_keys for s in variant_skus), (
+        "a variant SKU with no catalog_offers row is invisible to the price gate")
+
+    # ...and it is stamped with where the id came from, so the money path can filter
+    # without re-deriving it from the string.
+    provs = {_json.loads(s["sku_payload"])["variant_id_provenance"] for s in variant_skus}
+    assert provs == {"merchant_issued"}
+
+
+def test_a_duplicated_native_variant_id_is_emitted_once():
+    """The dedupe at the native gate is load-bearing, not cosmetic: a record carrying the
+    same variant_id twice makes ingestion's `_drop_options_that_do_not_distinguish` see
+    non-distinct labels and strip `options` from EVERY seed variant of the product — the
+    shade selector disappears for the whole PDP. Shopify feeds do repeat a variant across
+    `variants` and `options` shapes; the mapper must emit each id once."""
+    twice = _native(variants=[
+        {"id": 39406294532166, "price": "11.99", "option1": "Dune", "available": True},
+        {"id": 39406294532166, "price": "11.99", "option1": "Dune", "available": True},
+        {"id": 39406294532168, "price": "11.99", "option1": "Rose", "available": True},
+    ])
+    vs = shopify_product_to_record(
+        twice, domain="x.com", category_path="x", emit_native_variants=True)["pdp"]["variants"]
+    assert [v["variant_id"] for v in vs] == ["39406294532166", "39406294532168"]
+# -- multi-brand retailer feeds: SELECT a vendor, don't RENAME every product ---------------------
+
+
+def _retailer_feed():
+    """A cocomo.sg-shaped feed: several vendors, one of them the target."""
+    return [
+        _product(vendor="VELY VELY", title="[VELY VELY] Dewy Glow Lip Gloss 4ml", handle="vv-gloss"),
+        _product(vendor="MEDICUBE", title="Zero Pore Pad 2.0", handle="mc-pad"),
+        _product(vendor="ANUA", title="Heartleaf 77 Toner", handle="anua-toner"),
+        _product(vendor="vely  vely", title="[VELY VELY] Ampoule Blusher", handle="vv-blush"),
+    ]
+
+
+def test_the_vendor_filter_selects_only_the_named_brand():
+    kept = cbf.filter_products_by_vendor(_retailer_feed(), ["VELY VELY"])
+    assert [p["handle"] for p in kept] == ["vv-gloss", "vv-blush"]
+
+
+def test_the_vendor_filter_normalises_case_and_spacing_only():
+    """'vely  vely' is the same vendor; a NEIGHBOUR brand never is. A looser match on a
+    224-vendor retailer feed would deposit another brand's products as this brand's."""
+    feed = _retailer_feed() + [_product(vendor="VELY VELY BEAUTY", handle="other")]
+    kept = cbf.filter_products_by_vendor(feed, ["  Vely Vely  "])
+    assert [p["handle"] for p in kept] == ["vv-gloss", "vv-blush"]
+
+
+def test_no_vendor_filter_asked_for_keeps_every_product():
+    """Every existing single-brand caller passes nothing and must be unaffected."""
+    feed = _retailer_feed()
+    assert cbf.filter_products_by_vendor(feed, []) == feed
+    assert cbf.filter_products_by_vendor(feed, None) == feed
+
+
+@pytest.mark.asyncio
+async def test_records_for_brand_filters_by_vendor_before_it_renames(monkeypatch):
+    """THE SEAM, and the trap it exists for. `brand` is a brand_override: it RENAMES every
+    product the feed yields. Pointing it at a retailer without a filter deposits that
+    retailer's whole catalogue under the target brand's name -- 1,000 cocomo.sg products
+    (MEDICUBE, ANUA, BEAUTY OF JOSEON, ...) as brand-official 'VELY VELY' anchors."""
+    async def _products(domain, **kw):
+        return _retailer_feed()
+
+    monkeypatch.setattr(cbf, "fetch_shopify_products", _products)
+
+    recs = await cbf.records_for_brand(
+        domain="cocomo.sg", category_path="beauty/makeup",
+        brand="VELY VELY", only_vendors=["VELY VELY"],
+    )
+
+    assert [r["pdp"]["product_name"] for r in recs] == [
+        "[VELY VELY] Dewy Glow Lip Gloss 4ml", "[VELY VELY] Ampoule Blusher",
+    ]
+    assert {r["pdp"]["brand"] for r in recs} == {"VELY VELY"}
+
+
+@pytest.mark.asyncio
+async def test_a_vendor_filter_that_matches_nothing_is_loud(monkeypatch):
+    """It must not read as 'this brand has nothing here'. An empty return is what a
+    non-Shopify storefront already yields, so a typo would be indistinguishable from a
+    legitimately absent brand -- and the operator would move on."""
+    async def _products(domain, **kw):
+        return _retailer_feed()
+
+    monkeypatch.setattr(cbf, "fetch_shopify_products", _products)
+
+    with pytest.raises(ValueError, match="matched 0 of 4"):
+        await cbf.records_for_brand(
+            domain="cocomo.sg", category_path="beauty/makeup", only_vendors=["Vely-Vely"],
+        )
+
+
+# -- an unproven currency must refuse, never fall back to USD ------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.live_locale
+@pytest.mark.parametrize(
+    "proved, label",
+    [
+        (None, "unreadable /meta.json — measured 2026-09-07: cocomo.sg answered the "
+               "meta.json GET with a 429 bot-check page while serving /products.json fine"),
+        ("USD", "a storefront that really does price in USD"),
+        ("MYR", "the neighbouring-market mistake"),
+    ],
+)
+async def test_a_currency_we_cannot_prove_refuses_instead_of_defaulting_to_usd(
+    monkeypatch, proved, label
+):
+    """`ingestion._currency_of` defaults to USD for a record that carries no currency. That
+    default is right for the US corpus it preserves and is a silent mispricing for an SGD
+    store: SGD 30.00 served as USD 30.00, 1.35x overstated, with nothing marking it wrong.
+    So an operator who KNOWS the market can demand it, and the run stops rather than guesses."""
+    async def _products(domain, **kw):
+        return [_product()]
+
+    async def _locale(domain, **kw):
+        return {"currency": proved}
+
+    monkeypatch.setattr(cbf, "fetch_shopify_products", _products)
+    monkeypatch.setattr(cbf, "fetch_shopify_shop_locale", _locale)
+
+    with pytest.raises(cbf.CurrencyNotProven, match="SGD"):
+        await cbf.records_for_brand(
+            domain="cocomo.sg", category_path="beauty/makeup", require_currency="SGD",
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.live_locale
+async def test_the_proven_currency_passes_the_gate_and_reaches_the_record(monkeypatch):
+    """The gate must not be a wall: a storefront that proves what was asked for ingests,
+    and the record carries that currency rather than the lane's USD default."""
+    async def _products(domain, **kw):
+        return [_product()]
+
+    async def _locale(domain, **kw):
+        return {"currency": "SGD"}
+
+    monkeypatch.setattr(cbf, "fetch_shopify_products", _products)
+    monkeypatch.setattr(cbf, "fetch_shopify_shop_locale", _locale)
+
+    recs = await cbf.records_for_brand(
+        domain="jsmbeauty.sg", category_path="beauty/makeup", require_currency="sgd",
+    )
+
+    assert {r["pdp"]["currency"] for r in recs} == {"SGD"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.live_locale
+async def test_the_currency_gate_refuses_before_any_record_is_built(monkeypatch):
+    """A refusal that happened after the mapping would still be safe here, but the lane
+    also fetches PDPs for INCI — a brand we are going to refuse must cost the merchant
+    nothing, and must not half-ingest under a partial-failure path."""
+    built = []
+
+    async def _products(domain, **kw):
+        return [_product()]
+
+    async def _locale(domain, **kw):
+        return {"currency": None}
+
+    monkeypatch.setattr(cbf, "fetch_shopify_products", _products)
+    monkeypatch.setattr(cbf, "fetch_shopify_shop_locale", _locale)
+    monkeypatch.setattr(
+        cbf, "shopify_product_to_record",
+        lambda *a, **kw: built.append(1),
+    )
+
+    with pytest.raises(cbf.CurrencyNotProven):
+        await cbf.records_for_brand(
+            domain="cocomo.sg", category_path="beauty/makeup", require_currency="SGD",
+        )
+    assert built == [], "no record may be built for a brand the gate refuses"
+
+
+@pytest.mark.asyncio
+@pytest.mark.live_locale
+async def test_unproven_currency_is_refused_without_an_expected_currency(monkeypatch):
+    """Opt-in. Every brand already onboarded ran without it and must keep running: an
+    unreadable /meta.json still yields records, still currency-less, still USD downstream."""
+    async def _products(domain, **kw):
+        return [_product()]
+
+    async def _locale(domain, **kw):
+        return {"currency": None}
+
+    monkeypatch.setattr(cbf, "fetch_shopify_products", _products)
+    monkeypatch.setattr(cbf, "fetch_shopify_shop_locale", _locale)
+
+    with pytest.raises(cbf.CurrencyNotProven, match="currency is unproven"):
+        await cbf.records_for_brand(domain="jsmbeauty.sg", category_path="beauty/makeup")
+
+
+@pytest.mark.asyncio
+async def test_a_blank_vendor_filter_is_refused_not_ignored(monkeypatch):
+    """`--only-vendor "$VENDOR"` with the variable unset, or a jsonl row `[""]`, used to
+    normalise to an EMPTY set, which `filter_products_by_vendor` reads as "no filter" —
+    the whole retailer feed came through and the brand override relabelled it. Asking
+    for a filter and naming nothing is an error."""
+    async def _products(domain, **kw):
+        return _retailer_feed()
+
+    monkeypatch.setattr(cbf, "fetch_shopify_products", _products)
+
+    for blank in ([""], ["   "], ["", " "]):
+        with pytest.raises(ValueError, match="every entry is blank"):
+            await cbf.records_for_brand(
+                domain="cocomo.sg", category_path="beauty/makeup",
+                brand="VELY VELY", only_vendors=blank,
+            )
+
+
+@pytest.mark.asyncio
+async def test_the_vendor_filter_runs_before_the_shade_fold(monkeypatch):
+    """The fold matches on normalised TITLE only and never consults `vendor`. Filtering
+    after folding lets a neighbour brand's "<base> - <shade>" row fold into the target
+    brand's base and ship as its SKU + priced offer. Filter first, so no fold can cross a
+    brand boundary."""
+    feed = [
+        {"id": 7001, "handle": "dewy-glow-lip-gloss", "title": "Dewy Glow Lip Gloss",
+         "vendor": "VELY VELY", "product_type": "Lip Gloss", "body_html": "<p>x</p>",
+         "images": [{"src": "https://cdn.x/a.jpg"}],
+         "variants": [{"id": 44922188071158, "price": "21.90", "option1": "Default Title",
+                       "available": True}]},
+        {"id": 7002, "handle": "dewy-glow-lip-gloss-coral", "title": "Dewy Glow Lip Gloss - Coral",
+         "vendor": "MEDICUBE", "product_type": "Lip Gloss", "body_html": "<p>y</p>",
+         "images": [{"src": "https://cdn.x/b.jpg"}],
+         "variants": [{"id": 44922188071999, "price": "22.90", "option1": "Coral",
+                       "available": True}]},
+    ]
+
+    async def _products(domain, **kw):
+        return feed
+
+    async def _locale(domain, **kw):
+        return {"currency": "SGD"}
+
+    monkeypatch.setattr(cbf, "fetch_shopify_products", _products)
+    monkeypatch.setattr(cbf, "fetch_shopify_shop_locale", _locale)
+
+    recs = await cbf.records_for_brand(
+        domain="cocomo.sg", category_path="beauty/makeup", brand="VELY VELY",
+        only_vendors=["VELY VELY"], base_listings_only=True,
+    )
+    assert [r["pdp"]["product_name"] for r in recs] == ["Dewy Glow Lip Gloss"]
+    # Fold-then-filter would have folded MEDICUBE's Coral into this base as a variant.
+    assert [v["title"] for v in recs[0]["pdp"]["variants"]] == []
+
+
+# -- the /meta.json blurb door -------------------------------------------------------------------
+#
+# `fetch_shop_description_from_meta` had no unit test at all. It is read by
+# scripts/backfill_brand_official_descriptions.py to ARM an exact-match guard that decides whether
+# PDP meta copy is auto-published as brand-official description, so anything it returns other than
+# this storefront's own `shop.description` is a defect with a publication consequence.
+
+
+class _MetaResp:
+    """A minimal httpx-shaped response. `url` carries the FINAL host of the redirect chain."""
+
+    def __init__(self, *, status_code=200, payload=None, text=None, host="jsmbeauty.sg"):
+        self.status_code = status_code
+        self.headers = {"content-type": "application/json"}
+        self._payload = payload
+        self._text = text
+        self.url = type("_U", (), {"host": host})()
+
+    def json(self):
+        if self._text is not None:
+            import json as _j
+
+            return _j.loads(self._text)          # a Cloudflare HTML body raises here, as live
+        return self._payload
+
+
+def _install_meta_client(monkeypatch, resp):
+    import httpx
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url):
+            return resp
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Client())
+    _silence_politeness(monkeypatch)
+
+
+_SHOP_BLURB = ("Discover JUNGSAEMMOOL, the epitome of Korean makeup and cosmetic products, "
+               "blending artistry with skincare for every day.")
+
+
+@pytest.mark.asyncio
+async def test_the_meta_json_blurb_is_read_and_whitespace_collapsed(monkeypatch):
+    """The positive case, so every refusal below is a refusal and not a function that never
+    worked. `/meta.json` is raw JSON, so a merchant's newlines reach us verbatim; the backfill
+    compares it with `_norm_copy`, but the value is also what a human reads in a log."""
+    _install_meta_client(monkeypatch, _MetaResp(
+        payload={"description": "  Discover JUNGSAEMMOOL,\n  the epitome of Korean makeup.  "}))
+
+    assert await cbf.fetch_shop_description_from_meta("jsmbeauty.sg") == \
+        "Discover JUNGSAEMMOOL, the epitome of Korean makeup."
+
+
+@pytest.mark.asyncio
+async def test_a_404_meta_json_is_no_blurb_not_an_exception(monkeypatch):
+    """A non-Shopify host, or one that has disabled the endpoint. The caller's contract is
+    "None on any failure" -- raising here would abort a whole backfill domain."""
+    _install_meta_client(monkeypatch, _MetaResp(status_code=404, payload={}))
+
+    assert await cbf.fetch_shop_description_from_meta("jsmbeauty.sg") is None
+
+
+@pytest.mark.asyncio
+async def test_an_HTML_200_challenge_page_is_not_a_blurb(monkeypatch):
+    """A Cloudflare interstitial answers 200 with HTML. This is the exact condition the JSON door
+    exists to route around, so it is also the one most likely to be met -- and `resp.json()` on
+    that body raises inside the same try, which must read as "no blurb"."""
+    _install_meta_client(monkeypatch, _MetaResp(
+        text="<!DOCTYPE html><html><head><title>Just a moment...</title></head></html>"))
+
+    assert await cbf.fetch_shop_description_from_meta("jsmbeauty.sg") is None
+
+
+@pytest.mark.parametrize("desc", [
+    ["Line one of the description", "Line two of the description, also long"],
+    {"value": "A description hidden one level down inside an object, over fifty chars"},
+    12345678901234567890,
+    None,
+])
+@pytest.mark.asyncio
+async def test_a_non_STRING_description_is_refused_rather_than_stringified(monkeypatch, desc):
+    """`str(desc)` of a list renders `['Line one...', 'Line two...']` -- brackets, quotes and
+    all, comfortably over the backfill's 50-char floor. It could never equal a PDP's meta
+    description, so it would arrive as a non-empty blurb that matches nothing: precisely the
+    input that arms no comparison while switching OFF the fail-closed refusal that protects
+    every unrepeated candidate on the domain."""
+    _install_meta_client(monkeypatch, _MetaResp(payload={"description": desc}))
+
+    assert await cbf.fetch_shop_description_from_meta("jsmbeauty.sg") is None
+
+
+@pytest.mark.asyncio
+async def test_a_redirect_to_a_DIFFERENT_storefront_is_refused(monkeypatch):
+    """`follow_redirects=True` with no check reads `/meta.json` off whatever host the chain ends
+    on. A regional redirect (brand.com -> uk.brand.com) lands on a different Shopify store with
+    a different `shop.description` -- a blurb for a storefront whose theme never renders it."""
+    _install_meta_client(monkeypatch, _MetaResp(
+        payload={"description": _SHOP_BLURB}, host="uk.jsmbeauty.sg"))
+
+    assert await cbf.fetch_shop_description_from_meta("jsmbeauty.sg") is None
+
+
+@pytest.mark.parametrize("requested,final", [
+    ("jsmbeauty.sg", "www.jsmbeauty.sg"),
+    ("www.jsmbeauty.sg", "jsmbeauty.sg"),
+    ("jsmbeauty.sg", "JSMBeauty.sg"),
+])
+@pytest.mark.asyncio
+async def test_the_www_and_apex_forms_are_the_SAME_storefront(monkeypatch, requested, final):
+    """The host pin must not cost the ordinary case: almost every storefront redirects one of
+    these to the other, and both serve one `shop.description`. A pin that refused them would
+    silently disarm the guard on most domains -- the same outcome by the opposite mistake."""
+    _install_meta_client(monkeypatch, _MetaResp(
+        payload={"description": _SHOP_BLURB}, host=final))
+
+    assert await cbf.fetch_shop_description_from_meta(requested) == _SHOP_BLURB
+
+
+def test_a_suffix_match_is_not_a_host_match():
+    """The pin compares whole hosts. `endswith` would accept `uk.brand.com` for `brand.com` --
+    the case above -- and also `evilbrand.com` for `brand.com`."""
+    assert cbf._same_storefront_host("brand.com", "evilbrand.com") is False
+    assert cbf._same_storefront_host("brand.com", "uk.brand.com") is False
+    assert cbf._same_storefront_host("brand.com", "brand.com.co") is False
+    assert cbf._same_storefront_host("brand.com", None) is False
+    assert cbf._same_storefront_host("brand.com", "brand.com") is True
+
+
+@pytest.mark.asyncio
+async def test_a_politeness_gate_that_REFUSES_yields_no_blurb(monkeypatch):
+    """`crawl_politeness.before_request` can raise (robots.txt disallow, a budget refusal). The
+    request must not go out, and the failure must reach the caller as "no blurb" rather than as
+    an exception that aborts the domain -- and certainly not as a fetch that skipped the gate."""
+    import httpx
+
+    fetched = []
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url):
+            fetched.append(url)
+            return _MetaResp(payload={"description": _SHOP_BLURB})
+
+    async def _refuse(*a, **kw):
+        raise RuntimeError("robots.txt disallows /meta.json")
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Client())
+    monkeypatch.setattr(cbf.crawl_politeness, "before_request", _refuse)
+    monkeypatch.setattr(cbf.crawl_politeness, "note_response", lambda *a, **kw: None)
+
+    assert await cbf.fetch_shop_description_from_meta("jsmbeauty.sg") is None
+    assert fetched == [], "the gate refused, so no request may reach the merchant host"
+
+
+# --- brand attribution on a BRAND-FAMILY storefront -------------------------------
+# Measured live 2026-09-11: misshaus.com publishes 125 products under six vendor
+# values — MISSHA 89, APIEU 16, MISSHA US 8, CHOGONGJIN 7, Time Revolution 2,
+# Apieu 1 — and was onboarded with brand="Missha". The 17 A'pieu products landed in
+# the index branded `Missha`, which also made them invisible to brand-strict recall
+# (a live search for `A'PIEU` returned all 15 of the rows we hold while reporting
+# `external_seed_brand_strict_rows: 0`).
+
+def _misshaus(vendor, title, handle):
+    return _product(vendor=vendor, title=title, handle=handle,
+                    variants=[{"price": "12.00", "available": True}])
+
+
+def test_a_sibling_brand_keeps_its_own_vendor_not_the_override():
+    """The exact row that shipped wrong: A'pieu's lip oil on Missha's storefront."""
+    rec = shopify_product_to_record(
+        _misshaus("APIEU", "A'pieu Honey & Milk Lip Oil", "honey-milk-lip-oil-1"),
+        domain="misshaus.com", category_path="beauty/skincare", brand_override="Missha",
+    )
+    assert rec["pdp"]["brand"] == "APIEU"
+    assert rec["pdp"]["brand"] != "Missha"
+    # The merchant is still the storefront — the brand moved, the seller did not.
+    assert rec["offers"][0]["merchant_inferred"] == "Missha"
+
+
+def test_the_override_still_normalises_the_same_brands_spelling():
+    """The override's legitimate job. `MISSHA US` and `Missha` are one brand."""
+    for vendor in ("MISSHA", "MISSHA US", "Missha"):
+        rec = shopify_product_to_record(
+            _misshaus(vendor, "Time Revolution Essence", "tr-essence"),
+            domain="misshaus.com", category_path="beauty/skincare", brand_override="Missha",
+        )
+        assert rec["pdp"]["brand"] == "Missha", vendor
+
+
+def test_punctuation_only_differences_are_the_same_brand():
+    rec = shopify_product_to_record(
+        _misshaus("Apieu", "A pieu Juicy Pang", "juicy-pang"),
+        domain="apieu.com", category_path="beauty/makeup", brand_override="A'PIEU",
+    )
+    assert rec["pdp"]["brand"] == "A'PIEU"
+
+
+def test_the_override_wins_when_the_vendor_names_the_store():
+    """metro.com.sg publishes `vendor: "Metro Singapore Departmental Store -
+    Celebrating 69 Years in SG"` — the shop, not a brand, and (unlike
+    thefaceshopny.com, whose store name happens to CONTAIN its brand and is therefore
+    settled one rule earlier) it shares nothing with the brand but the host label."""
+    rec = shopify_product_to_record(
+        _misshaus(
+            "Metro Singapore Departmental Store - Celebrating 69 Years in SG",
+            "Etude House Drawing Eye Brow", "drawing-eye-brow",
+        ),
+        domain="metro.com.sg", category_path="beauty/makeup",
+        brand_override="ETUDE HOUSE",
+    )
+    assert rec["pdp"]["brand"] == "ETUDE HOUSE"
+    assert cbf.resolve_record_brand(
+        "Metro Singapore Departmental Store - Celebrating 69 Years in SG",
+        "ETUDE HOUSE", "metro.com.sg",
+    )[1] == "override_vendor_is_store"
+
+
+def test_a_supplier_code_is_never_adopted_as_a_brand():
+    """sukoshi.com publishes `vendor: "VC-B004"` on 11 measured rows whose brand is in
+    the title only. A code in the brand column is worse than the override it replaced."""
+    rec = shopify_product_to_record(
+        _misshaus("VC-B004", "A'pieu Honey & Milk Lip Scrub", "lip-scrub"),
+        domain="sukoshi.com", category_path="beauty/skincare", brand_override="A'PIEU",
+    )
+    assert rec["pdp"]["brand"] == "A'PIEU"
+    assert cbf.resolve_record_brand("VC-B004", "A'PIEU", "sukoshi.com") == (
+        "A'PIEU", "override_vendor_is_not_a_name",
+    )
+
+
+def test_the_store_name_guard_is_not_shadowed_by_containment():
+    """thefaceshopny IS settled by containment — pinned so a future reader does not
+    mistake it for evidence that the store-name guard works."""
+    assert cbf.resolve_record_brand(
+        "thefaceshopny", "THE FACE SHOP", "thefaceshopny.com"
+    ) == ("THE FACE SHOP", "override_same_brand")
+
+
+def test_an_absent_vendor_still_takes_the_override():
+    rec = shopify_product_to_record(
+        _misshaus("", "Some Product", "some-product"),
+        domain="misshaus.com", category_path="beauty/skincare", brand_override="Missha",
+    )
+    assert rec["pdp"]["brand"] == "Missha"
+
+
+def test_no_override_is_unchanged_vendor_only():
+    rec = shopify_product_to_record(
+        _misshaus("COSRX", "Snail Gel", "snail-gel"),
+        domain="cosrx.com", category_path="beauty/skincare",
+    )
+    assert rec["pdp"]["brand"] == "COSRX"
+
+
+def test_resolve_record_brand_reasons_are_exhaustive_over_the_measured_feed():
+    """Every vendor misshaus.com actually publishes, and what each resolves to."""
+    seen = {
+        v: cbf.resolve_record_brand(v, "Missha", "misshaus.com")
+        for v in ("MISSHA", "APIEU", "MISSHA US", "CHOGONGJIN", "Time Revolution", "Apieu", "")
+    }
+    assert seen["MISSHA"] == ("Missha", "override_same_brand")
+    assert seen["MISSHA US"] == ("Missha", "override_same_brand")
+    assert seen["APIEU"] == ("APIEU", "vendor_disagrees")
+    assert seen["Apieu"] == ("Apieu", "vendor_disagrees")
+    assert seen["CHOGONGJIN"] == ("CHOGONGJIN", "vendor_disagrees")
+    assert seen["Time Revolution"] == ("Time Revolution", "vendor_disagrees")
+    assert seen[""] == ("Missha", "override_no_vendor")
+
+
+def test_a_short_actual_brand_is_not_relabelled_by_the_override():
+    # 3M is a maker, just as Meitu's 3CE is: short does not mean supplier code.
+    assert cbf.resolve_record_brand("3M", "M3 Cosmetics", "shop.com") == (
+        "3M", "vendor_disagrees",
+    )
+
+
+@pytest.mark.asyncio
+async def test_records_for_brand_reports_every_vendor_it_refused_to_rename(monkeypatch):
+    """The census must be driven by the real call, not recomputed in the test."""
+    feed = [
+        _misshaus("MISSHA", "Time Revolution Essence", "tr-essence"),
+        _misshaus("MISSHA", "Artemisia Ampoule", "artemisia"),
+        _misshaus("APIEU", "A'pieu Honey & Milk Lip Oil", "honey-milk-lip-oil-1"),
+        _misshaus("CHOGONGJIN", "Chogongjin Cream", "chogongjin-cream"),
+    ]
+
+    async def fake_fetch(domain, *, max_products=500, timeout_s=15.0):
+        return feed
+
+    monkeypatch.setattr(cbf, "fetch_shopify_products", fake_fetch)
+    recs = await cbf.records_for_brand(
+        domain="misshaus.com", category_path="beauty/skincare", brand="Missha"
+    )
+    assert [r["pdp"]["brand"] for r in recs] == ["Missha", "Missha", "APIEU", "CHOGONGJIN"]
+
+    census = cbf.records_for_brand.last_brand_census
+    assert census["brand_override"] == "Missha"
+    assert census["kept_vendor_count"] == 2
+    assert census["vendors"]["APIEU"] == {
+        "count": 1, "resolved_brand": "APIEU", "reason": "vendor_disagrees",
+    }
+    assert census["vendors"]["MISSHA"]["reason"] == "override_same_brand"
+
+
+@pytest.mark.asyncio
+async def test_one_brand_never_lands_under_two_spellings(monkeypatch):
+    """misshaus.com publishes `APIEU` on 16 products and `Apieu` on 1. Kept verbatim
+    they are two brands to any consumer that groups by the brand string."""
+    feed = [
+        _misshaus("MISSHA", "Time Revolution Essence", "tr-essence"),
+        _misshaus("APIEU", "A'pieu Honey & Milk Lip Oil", "lip-oil"),
+        _misshaus("APIEU", "A'pieu Hair Vinegar", "hair-vinegar"),
+        _misshaus("Apieu", "A pieu Juicy Pang", "juicy-pang"),
+    ]
+
+    async def fake_fetch(domain, *, max_products=500, timeout_s=15.0):
+        return feed
+
+    monkeypatch.setattr(cbf, "fetch_shopify_products", fake_fetch)
+    recs = await cbf.records_for_brand(
+        domain="misshaus.com", category_path="beauty/skincare", brand="Missha"
+    )
+    brands = [r["pdp"]["brand"] for r in recs]
+    assert brands == ["Missha", "APIEU", "APIEU", "APIEU"]  # modal spelling wins
+    assert "Apieu" not in brands
+    assert cbf.records_for_brand.last_brand_spelling_folds == {"apieu": "APIEU"}
+
+
+@pytest.mark.asyncio
+async def test_the_fold_does_not_touch_a_feed_with_one_spelling_each(monkeypatch):
+    feed = [
+        _misshaus("MISSHA", "Essence", "essence"),
+        _misshaus("CHOGONGJIN", "Cream", "cream"),
+    ]
+
+    async def fake_fetch(domain, *, max_products=500, timeout_s=15.0):
+        return feed
+
+    monkeypatch.setattr(cbf, "fetch_shopify_products", fake_fetch)
+    recs = await cbf.records_for_brand(
+        domain="misshaus.com", category_path="beauty/skincare", brand="Missha"
+    )
+    assert [r["pdp"]["brand"] for r in recs] == ["Missha", "CHOGONGJIN"]
+    assert cbf.records_for_brand.last_brand_spelling_folds == {}

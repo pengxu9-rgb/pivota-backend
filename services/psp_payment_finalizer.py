@@ -12,9 +12,13 @@ AwaitableAnyFn = Callable[..., Awaitable[Any]]
 logger = logging.getLogger(__name__)
 database: Any = None
 
+# updated_at is how the nightly stale-day sweep (gmv_aggregation_service.reroll_stale_days) finds
+# an edge whose checkout day was rolled up before its payment landed. Without it, that gross never
+# reaches gmv_attribution_daily.
 _STAMP_GROSS_ATTRIBUTED_GMV_QUERY = """
 UPDATE commerce_attribution_edges
-SET gross_attributed_gmv_cents = :gross
+SET gross_attributed_gmv_cents = :gross,
+    updated_at = NOW()
 WHERE order_id = :order_id
   AND gross_attributed_gmv_cents IS NULL
 """

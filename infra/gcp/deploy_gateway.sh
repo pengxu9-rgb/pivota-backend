@@ -80,6 +80,10 @@ case "$CONFIG" in preserve|apply) ;; *) echo "CONFIG must be preserve or apply (
 # --concurrency, --timeout, --ingress, --vpc-egress, --labels, --service-account. Those match live
 # prod today, so nothing drifts; but an operator who widened --max-instances by hand during an
 # incident will have it pulled back silently by the next deploy.
+# CONCURRENCY_LIMIT (or its alias CONCURRENCY) / MIN_INSTANCES / MAX_INSTANCES override those three
+# for one invocation, and are validated below. The 2026-09-15 pivota-pg CPU incident set the live
+# gateway to concurrency 20 / min 4 by hand; a deploy without CONCURRENCY_LIMIT=20 MIN_INSTANCES=4
+# would revert that to 80 / 2.
 #
 # PIVOTA_ENV, PIVOTA_SERVICE_NAME and the four GW_POOL_* sizings travel in the env FILE, so under
 # `preserve` they are computed and then not sent. The running service already carries them, and a
@@ -101,6 +105,46 @@ case "$CONFIG" in preserve|apply) ;; *) echo "CONFIG must be preserve or apply (
 : "${PUBLIC:=$([ "$ENV" = prod ] && echo 1 || echo 0)}"
 [ "$PUBLIC" = 1 ] && PUBLIC_FLAG=--allow-unauthenticated || PUBLIC_FLAG=--no-allow-unauthenticated
 GCLOUD="${GCLOUD:-gcloud}"
+# ── SHAPE OVERRIDES ────────────────────────────────────────────────────────────────────────────
+# `CONCURRENCY_LIMIT` is the name the rest of the repo uses (deploy_backend.sh, the proof-issuer
+# job in deploy-prod.yml, the runbook footer prod-deploy-drift.yml prints). `CONCURRENCY` is what
+# the 2026-09-15 incident runbook used. BOTH work: an operator reaching for this mid-incident must
+# not get 80 because they typed the other one and nothing said so.
+#
+# THE TRAP, because the same name means the opposite thing one file over: in deploy_backend.sh
+# `CONCURRENCY` is the internal per-env CONSTANT (assigned unconditionally in its case block) and
+# only `CONCURRENCY_LIMIT` overrides. So `CONCURRENCY=20` exported for a gateway deploy takes
+# effect HERE and is silently discarded THERE. Nothing leaks - the unconditional assignment there
+# is what prevents it - but the asymmetry is invisible at the call site, which is why the runbook
+# tells operators to reach for CONCURRENCY_LIMIT: it is the one spelling that means "override" in
+# both scripts, in deploy-prod.yml, and in the prod-deploy-drift.yml footer.
+: "${CONCURRENCY_LIMIT:=}"
+: "${CONCURRENCY:=}"
+if [ -n "$CONCURRENCY_LIMIT" ] && [ -n "$CONCURRENCY" ] && [ "$CONCURRENCY_LIMIT" != "$CONCURRENCY" ]; then
+  echo "CONCURRENCY_LIMIT='$CONCURRENCY_LIMIT' and CONCURRENCY='$CONCURRENCY' disagree - set one." >&2
+  exit 2
+fi
+CONCURRENCY_VALUE="${CONCURRENCY_LIMIT:-$CONCURRENCY}"
+# Validated, not passed straight through, because two accepted values fail in the UNSAFE direction -
+# the deploy SUCCEEDS carrying a shape the operator did not ask for, at the one moment they are
+# watching a live incident rather than a diff:
+#   `0`       Cloud Run reads as UNLIMITED, so the tightest-looking budget removes the budget;
+#   `default` gcloud accepts and CLEARS the limit back to the server default - i.e. exactly the 80
+#             this override exists to hold off.
+# A leading-zero form (`007`) is refused for the same reason deploy_backend.sh refuses it: gcloud
+# reads it as 7 while a human skimming a diff reads octal. Everything else gcloud rejects itself,
+# and `set -e` aborts before any revision exists.
+[ -z "$CONCURRENCY_VALUE" ] || case "$CONCURRENCY_VALUE" in
+  *[!0-9]*|''|0|0*) echo "CONCURRENCY must be a positive integer with no leading zero (got '$CONCURRENCY_VALUE'). Cloud Run reads 0 as UNLIMITED and 'default' as no limit - both silently restore 80." >&2; exit 2 ;;
+esac
+# min-instances 0 is legitimate (scale to zero); max-instances 0 is not.
+[ -z "${MIN_INSTANCES:-}" ] || case "$MIN_INSTANCES" in
+  0) ;;
+  *[!0-9]*|''|0*) echo "MIN_INSTANCES must be a non-negative integer with no leading zero (got '$MIN_INSTANCES')." >&2; exit 2 ;;
+esac
+[ -z "${MAX_INSTANCES:-}" ] || case "$MAX_INSTANCES" in
+  *[!0-9]*|''|0|0*) echo "MAX_INSTANCES must be a positive integer with no leading zero (got '$MAX_INSTANCES')." >&2; exit 2 ;;
+esac
 REGION=us-west1
 SERVICE="${SERVICE:-gateway}"
 IMAGE="$REGION-docker.pkg.dev/pivota-shared/pivota/gateway:$TAG"
@@ -190,7 +234,9 @@ grep -vE '^(PIVOTA_ENV|PIVOTA_SERVICE_NAME|PIVOTA_COMMIT_SHA|PIVOTA_PLATFORM|SKI
   # repo, so that sizing was inert. Measure the variable names before trusting a budget.
   #
   # BUDGET against max_connections=300 (raised from 200):
-  #   web 20x6=120 + gateway 20x5=100 + worker 1x10=10 = 230, leaving 70 for ops and superuser.
+  #   web 10x12=120 + gateway 20x5=100 + worker 1x10=10 = 230, leaving 70 for ops and superuser.
+  #   (web was 20x6 until 2026-08-29; same 120 ceiling, but concurrency 80->20 so its pool is
+  #    1.7x oversubscribed instead of 13x — see deploy_backend.sh's prod case arm.)
   #   proof-issuer and acp mount no DATABASE_URL at all, so they contribute 0.
   printf 'DB_POOL_MAX: "%s"\nPCI_KB_DB_POOL_MAX: "%s"\nINGREDIENT_REFERENCE_DB_POOL_MAX: "%s"\nINGREDIENT_SIGNAL_DB_POOL_MAX: "%s"\n' \
     "$GW_POOL_MAIN" "$GW_POOL_AUX" "$GW_POOL_AUX" "$GW_POOL_AUX"
@@ -290,13 +336,47 @@ probe_health(){ # url -> echoes the status code
   echo "${out:-000}"
 }
 
+# ── SAY WHAT SHAPE IS BEING APPLIED ────────────────────────────────────────────────────────────
+# The three values are resolved into variables HERE, and the `gcloud run deploy` below reads THOSE
+# variables - not a second copy of `${MIN_INSTANCES:-$MIN}`. Two copies of the expression is exactly
+# how a line reading `concurrency=20` ships 80: the echo and the flag would be free to drift apart,
+# and the echo is the half the operator believes. One expression each, so the print cannot be wrong
+# about the deploy.
+#
+# WHY PRINT IT AT ALL. Until now the only output of a successful run was
+# `deployed gateway -> ... (100% traffic)`, which is byte-identical whether CONCURRENCY_LIMIT=20
+# landed or the operator typed CONCURENCY_LIMIT=20 and silently shipped the default 80 - and 80 is
+# the shape the 2026-09-15 pivota-pg CPU mitigation was hand-set to hold off. An override with no
+# confirmation is a mitigation the operator cannot tell they lost. The SOURCE tag is what closes
+# that loop: `(default)` sitting where an override name was expected is the typo, legible before the
+# candidate is promoted rather than after the database CPU climbs again.
+SHAPE_CONCURRENCY="${CONCURRENCY_VALUE:-80}"
+SHAPE_MIN="${MIN_INSTANCES:-$MIN}"
+SHAPE_MAX="${MAX_INSTANCES:-$MAX}"
+# Concurrency's fallback is reported as `default`, NOT as a per-env constant, because that is what
+# it is: unlike MIN/MAX it is the literal 80 below, identical in staging and prod. Naming it after
+# the env would invite an operator to go looking for a per-env value that does not exist.
+if [ -n "$CONCURRENCY_LIMIT" ]; then
+  SHAPE_CONCURRENCY_SRC=CONCURRENCY_LIMIT
+elif [ -n "$CONCURRENCY" ]; then
+  SHAPE_CONCURRENCY_SRC=CONCURRENCY
+else
+  SHAPE_CONCURRENCY_SRC=default
+fi
+# `${MIN_INSTANCES:-}` and not `$MIN_INSTANCES`: these two are never given a default above, so under
+# `set -u` the bare form aborts the deploy on the ordinary no-override path. MIN_INSTANCES=0 is a
+# real override (scale to zero) and is non-empty, so -n reports it as one.
+if [ -n "${MIN_INSTANCES:-}" ]; then SHAPE_MIN_SRC=MIN_INSTANCES; else SHAPE_MIN_SRC="$ENV constant"; fi
+if [ -n "${MAX_INSTANCES:-}" ]; then SHAPE_MAX_SRC=MAX_INSTANCES; else SHAPE_MAX_SRC="$ENV constant"; fi
+echo "shape: concurrency=$SHAPE_CONCURRENCY ($SHAPE_CONCURRENCY_SRC) min-instances=$SHAPE_MIN ($SHAPE_MIN_SRC) max-instances=$SHAPE_MAX ($SHAPE_MAX_SRC)"
+
 "$GCLOUD" run deploy "$SERVICE" --project "$PROJECT" --region "$REGION" \
   --image "$IMAGE" \
   --service-account "sa-gateway@$PROJECT.iam.gserviceaccount.com" \
   --network default --subnet default --vpc-egress "$VPC_EGRESS" \
   ${CONFIG_ARGS[@]+"${CONFIG_ARGS[@]}"} \
-  --port 8080 --cpu "$CPU" --memory "$MEM" --concurrency 80 --timeout 300 \
-  --min-instances "${MIN_INSTANCES:-$MIN}" --max-instances "${MAX_INSTANCES:-$MAX}" \
+  --port 8080 --cpu "$CPU" --memory "$MEM" --concurrency "$SHAPE_CONCURRENCY" --timeout 300 \
+  --min-instances "$SHAPE_MIN" --max-instances "$SHAPE_MAX" \
   --no-cpu-throttling --cpu-boost --execution-environment gen2 \
   --ingress "$INGRESS" \
   $PUBLIC_FLAG \

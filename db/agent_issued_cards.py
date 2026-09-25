@@ -113,6 +113,22 @@ async def get_card(card_id: str, agent_id: str) -> Optional[Dict[str, Any]]:
 
 
 async def find_by_issuer_ref(issuer_card_ref: str) -> Optional[Dict[str, Any]]:
+    """The issuer's reference is NOT unique in this table — there is no constraint making it so,
+    and a re-issue against the same Reap card would produce two rows. Without an ORDER BY the
+    row that came back was whatever the plan happened to emit first, which on the external
+    authorization path means the CAP and the CURRENCY of an arbitrary one of them.
+
+    LIVE ROWS FIRST, then newest. `ORDER BY created_at DESC` alone disagreed with the ambiguity
+    check that guards this function: count_issued_by_issuer_ref counts only 'issued' rows, so one
+    live older row plus one revoked NEWER row counts 1 — not ambiguous — while this lookup
+    returned the revoked one and the decision declined `card_not_live` on a perfectly good card.
+    A re-issue that revokes the old instrument is the ordinary way to reach that state, so the
+    two orderings have to agree on which row is "the" card: the live one.
+
+    Deterministic, but still NOT a safety property on its own — a caller that must not act on an
+    ambiguous card has to detect the ambiguity itself. services.reap_external_auth does, via
+    count_issued_by_issuer_ref, and declines `ambiguous_card` rather than picking a cap.
+    """
     row = await database.fetch_one(
         """
         SELECT card_id, agent_id, recommendation_id, merchant_domain, checkout_id,
@@ -120,10 +136,33 @@ async def find_by_issuer_ref(issuer_card_ref: str) -> Optional[Dict[str, Any]]:
                status, single_use, expires_at, auth_count
           FROM agent_issued_cards
          WHERE issuer_card_ref = :ref
+         ORDER BY (status = 'issued') DESC, created_at DESC
+         LIMIT 1
         """,
         {"ref": issuer_card_ref},
     )
     return dict(row) if row else None
+
+
+async def count_issued_by_issuer_ref(issuer_card_ref: str) -> int:
+    """How many LIVE cards claim this issuer reference.
+
+    Two is not a near-miss: it means a spend against this reference could be bounded by either
+    of two different caps, at either of two different merchants, and we cannot tell which. The
+    external-authorization path turns >1 into a decline rather than choosing.
+
+    Scoped to 'issued' on purpose — revoked, exhausted and failed siblings are history, not
+    competing instruments, and counting them would decline a perfectly unambiguous re-issue.
+    """
+    value = await database.fetch_val(
+        """
+        SELECT COUNT(*)
+          FROM agent_issued_cards
+         WHERE issuer_card_ref = :ref AND status = 'issued'
+        """,
+        {"ref": issuer_card_ref},
+    )
+    return int(value or 0)
 
 
 async def record_event_once(event_id: str, event_type: str, card_id: Optional[str]) -> bool:
@@ -199,5 +238,86 @@ async def apply_settlement(card_id: str, settled_amount_minor: int) -> bool:
         RETURNING card_id
         """,
         {"card_id": card_id, "amount": settled_amount_minor},
+    )
+    return row is not None
+
+
+# ---------------------------------------------------------------------------------------------
+# Orphan revocation
+# ---------------------------------------------------------------------------------------------
+#
+# AN ORPHAN IS A ROW THAT SAYS `failed` WHILE HOLDING AN `issuer_card_ref`. That combination
+# cannot arise on the success path — a ref means `issued` there — so it is precisely the set of
+# cards that exist at the issuer but that we refused to accept. Today only the constraint
+# verdicts (REAP_CONSTRAINTS_MISMATCH / REAP_CONSTRAINTS_UNCONFIRMED) produce it, because those
+# are the only failures raised AFTER a card id came back.
+#
+# The predicate is STRUCTURAL rather than a list of failure_reason codes on purpose: a future
+# failure path that also gets past a 2xx would be an orphan too, and a hardcoded code list would
+# silently stop sweeping it. `failure_reason` is still recorded, and read for the alarm.
+
+
+async def mark_failed_with_orphan(card_id: str, reason: str, issuer_card_ref: str) -> None:
+    """Fail the row but KEEP the issuer's card id, because that card is real.
+
+    Separate from `mark_failed` rather than an optional argument: these are different events.
+    `mark_failed` means nothing was minted; this means something was minted and we would not
+    accept it. Making the caller choose keeps a plain failure from ever landing a stray ref that
+    the sweep would then try to revoke.
+    """
+    await database.execute(
+        """
+        UPDATE agent_issued_cards
+           SET status = 'failed', failure_reason = :reason, issuer_card_ref = :ref,
+               updated_at = now()
+         WHERE card_id = :card_id AND status = 'requested'
+        """,
+        {"card_id": card_id, "reason": (reason or "")[:500], "ref": issuer_card_ref},
+    )
+
+
+async def list_orphaned_cards(limit: int = 100) -> list:
+    """Cards that may be live at the issuer while our row says failed.
+
+    Ordered oldest-first so a persistent failure at the head of the queue cannot starve newer
+    orphans forever — each run still reaches them once the bounded head is retried.
+    """
+    rows = await database.fetch_all(
+        """
+        SELECT card_id, agent_id, issuer, issuer_card_ref, merchant_domain,
+               amount_cap_minor, currency, failure_reason, created_at
+          FROM agent_issued_cards
+         WHERE status = 'failed'
+           AND issuer_card_ref IS NOT NULL
+         ORDER BY created_at ASC
+         LIMIT :limit
+        """,
+        {"limit": int(limit)},
+    )
+    return [dict(r) for r in rows]
+
+
+async def mark_revoked(card_id: str) -> bool:
+    """Record a CONFIRMED revocation. Returns False if the row moved underneath us.
+
+    Guarded on `status = 'failed'` so this can only ever advance an orphan. It must not be able
+    to revoke a live `issued` card as a side effect of a sweep bug — that path needs its own
+    deliberate design, not this one widened.
+
+    FETCH_ONE + RETURNING, not `execute`. On databases==0.7.0/asyncpg a non-RETURNING UPDATE
+    answers None ALWAYS — success and no-match alike — so `execute(...) is not None` was a
+    constant False. Every successful revoke reported "the row did not advance", the sweep logged
+    it as unconfirmed at ERROR and left it to be retried forever, and the one signal that says a
+    live card was killed never fired. THE ROW COMING BACK IS THE CLAIM, which is the idiom every
+    other transition in this file already uses (record_event_once, apply_auth_*, apply_settlement).
+    """
+    row = await database.fetch_one(
+        """
+        UPDATE agent_issued_cards
+           SET status = 'revoked', updated_at = now()
+         WHERE card_id = :card_id AND status = 'failed' AND issuer_card_ref IS NOT NULL
+        RETURNING card_id
+        """,
+        {"card_id": card_id},
     )
     return row is not None

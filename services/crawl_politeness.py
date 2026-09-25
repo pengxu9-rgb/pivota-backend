@@ -32,6 +32,8 @@ site ROOT, so a `Disallow: /products/` never bites the very paths we crawl.
 
 from __future__ import annotations
 
+from contextvars import ContextVar
+
 import asyncio
 import logging
 import math
@@ -43,6 +45,8 @@ from urllib.parse import urlparse
 from urllib.robotparser import RobotFileParser
 
 import httpx
+
+ROBOTS_TRANSPORT_FACTORY = ContextVar("robots_transport_factory", default=None)
 
 logger = logging.getLogger(__name__)
 
@@ -241,6 +245,8 @@ async def _load_robots(host: str, user_agent: str) -> Tuple[Optional[RobotFilePa
             follow_redirects=True,
             max_redirects=_MAX_ROBOTS_REDIRECTS,
             headers={"User-Agent": user_agent},
+            **({"transport": ROBOTS_TRANSPORT_FACTORY.get()(), "trust_env": False}
+               if ROBOTS_TRANSPORT_FACTORY.get() else {}),
         ) as client:
             resp = await client.get(f"https://{host}/robots.txt")
         if resp.status_code == 200:

@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<metadata xmlns="http://www.demandware.com/xml/impex/metadata/2006-10-31">
+    <custom-type type-id="PivotaTelemetryOutbox">
+        <display-name xml:lang="x-default">Pivota Telemetry Outbox</display-name>
+        <description xml:lang="x-default">Short-lived, PII-free commerce events waiting for asynchronous delivery.</description>
+        <staging-mode>no-staging</staging-mode>
+        <storage-scope>site</storage-scope>
+        <key-definition attribute-id="ID">
+            <display-name xml:lang="x-default">Event ID</display-name>
+            <type>string</type>
+            <min-length>1</min-length>
+            <field-length>256</field-length>
+        </key-definition>
+        <attribute-definitions>
+            <attribute-definition attribute-id="payload">
+                <display-name xml:lang="x-default">Allowlisted event payload</display-name>
+                <type>text</type>
+                <localizable-flag>false</localizable-flag>
+                <mandatory-flag>true</mandatory-flag>
+                <externally-managed-flag>false</externally-managed-flag>
+            </attribute-definition>
+            <attribute-definition attribute-id="attempts">
+                <display-name xml:lang="x-default">Delivery attempts</display-name>
+                <type>int</type>
+                <localizable-flag>false</localizable-flag>
+                <mandatory-flag>true</mandatory-flag>
+                <externally-managed-flag>false</externally-managed-flag>
+                <min-value>0</min-value>
+                <default-value>0</default-value>
+            </attribute-definition>
+            <attribute-definition attribute-id="availableAt">
+                <display-name xml:lang="x-default">Next delivery time</display-name>
+                <type>datetime</type>
+                <localizable-flag>false</localizable-flag>
+                <mandatory-flag>true</mandatory-flag>
+                <externally-managed-flag>false</externally-managed-flag>
+            </attribute-definition>
+            <attribute-definition attribute-id="expiresAt">
+                <display-name xml:lang="x-default">Expiry time</display-name>
+                <type>datetime</type>
+                <localizable-flag>false</localizable-flag>
+                <mandatory-flag>true</mandatory-flag>
+                <externally-managed-flag>false</externally-managed-flag>
+            </attribute-definition>
+        </attribute-definitions>
+        <group-definitions>
+            <attribute-group group-id="pivotaTelemetryOutbox">
+                <display-name xml:lang="x-default">Pivota Telemetry Outbox</display-name>
+                <attribute attribute-id="ID"/>
+                <attribute attribute-id="payload"/>
+                <attribute attribute-id="attempts"/>
+                <attribute attribute-id="availableAt"/>
+                <attribute attribute-id="expiresAt"/>
+            </attribute-group>
+        </group-definitions>
+    </custom-type>
+    <custom-type type-id="PivotaTelemetrySweepCursor">
+        <display-name xml:lang="x-default">Pivota Telemetry Sweep Cursor</display-name>
+        <description xml:lang="x-default">Where the settlement sweep last reached. One row per site, key "settlement".</description>
+        <staging-mode>no-staging</staging-mode>
+        <!-- SITE scope is load-bearing, and must match PivotaTelemetryOutbox above.
+             `OrderMgr.searchOrders` only ever sees the current site's orders, so a
+             cursor shared across sites would let one site's watermark hide another
+             site's orders entirely. Because the scope is `site`, the sweep may use
+             the bare id "settlement"; if this is ever changed to `organization`,
+             SweepPivotaSettlements.js MUST key CURSOR_ID on the current site id. -->
+        <storage-scope>site</storage-scope>
+        <key-definition attribute-id="ID">
+            <display-name xml:lang="x-default">Cursor ID</display-name>
+            <type>string</type>
+            <min-length>1</min-length>
+            <field-length>64</field-length>
+        </key-definition>
+        <attribute-definitions>
+            <attribute-definition attribute-id="cursorAt">
+                <display-name xml:lang="x-default">Orders modified at or after this instant are swept</display-name>
+                <type>datetime</type>
+                <localizable-flag>false</localizable-flag>
+                <mandatory-flag>false</mandatory-flag>
+                <externally-managed-flag>false</externally-managed-flag>
+            </attribute-definition>
+            <attribute-definition attribute-id="updatedAt">
+                <display-name xml:lang="x-default">Last sweep run</display-name>
+                <type>datetime</type>
+                <localizable-flag>false</localizable-flag>
+                <mandatory-flag>false</mandatory-flag>
+                <externally-managed-flag>false</externally-managed-flag>
+            </attribute-definition>
+        </attribute-definitions>
+        <group-definitions>
+            <attribute-group group-id="pivotaTelemetrySweepCursor">
+                <display-name xml:lang="x-default">Pivota Telemetry Sweep Cursor</display-name>
+                <attribute attribute-id="ID"/>
+                <attribute attribute-id="cursorAt"/>
+                <attribute attribute-id="updatedAt"/>
+            </attribute-group>
+        </group-definitions>
+    </custom-type>
+</metadata>

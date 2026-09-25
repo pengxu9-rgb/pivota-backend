@@ -34,7 +34,8 @@ skip):
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+from collections import Counter
+from typing import Any, Dict, List, Mapping, Optional
 
 from observability.citation_deposit_metrics import record_deposit_dropped
 
@@ -196,6 +197,11 @@ def extract_evidence_items(
                 "confidence": CONFIDENCE_EVIDENCE_HIGH,
             })
 
+    from services.selection_measurement import report_observations
+    for observation in report_observations(brand_report):
+        out.append({"evidence_type": "selection_response", "payload": observation,
+                    "product_key": observation.get("product_key"), "confidence": None})
+
     # P0.2: stamp the canonical entity key on every evidence dict that maps to
     # a depositable (resolved) content_key. Section-agnostic final pass so new
     # evidence sections inherit it for free. Unresolved / unmapped product_keys
@@ -211,6 +217,22 @@ def extract_evidence_items(
     return out
 
 
+def _clean_destination_rank(value: Any) -> Optional[int]:
+    """B3: the stored position must be a non-negative int or absent. A report
+    written before B3 carries no rank at all, and NULL is the honest answer for
+    it — coercing a missing position to 0 would say "the answer's first
+    citation", which is a claim the old payload never made.
+
+    STRICTLY `int`, not "anything int() accepts". The only producer is
+    build_authority_map's `enumerate`, so being strict drops nothing real —
+    whereas a permissive coercion would turn 2.9 into position 2 and a stray
+    `True` into position 1 (bool is an int subclass, hence the explicit check
+    first), inventing an ordering no answer ever had."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value >= 0 else None
+
+
 def extract_citation_observations(
     brand_report: Dict[str, Any],
     content_key_map: Optional[Dict[str, Any]] = None,
@@ -224,6 +246,16 @@ def extract_citation_observations(
     accrete). Without a map (pure tests), the sku-entry's own content_key is
     used with basis 'unknown'. Rows missing a query or provider are skipped
     (both are NOT NULL in citation_observations).
+
+    B3: each observation also carries `destination_rank` (the host's zero-based
+    position in that response's citation list) and `is_primary_destination`
+    (services/primary_destination.py picked it as the one place the answer sent
+    the buyer). AT MOST ONE row per response may claim primary, and that is
+    ENFORCED HERE rather than assumed: build_authority_map guarantees it by
+    construction, but this function also runs over authority maps loaded from
+    stored report_jsonb written by other builds, and a second primary would make
+    every "AI sends buyers to X" count double-book. A duplicate claim is demoted
+    to False and logged.
     """
     out: List[Dict[str, Any]] = []
     if not isinstance(brand_report, dict):
@@ -231,6 +263,12 @@ def extract_citation_observations(
     authority = brand_report.get("authority_map")
     if not isinstance(authority, dict):
         return out
+
+    # Response identity within one audit run: (content_key, provider, query) —
+    # the citation_observations key minus audit_run_id (constant per call) and
+    # cited_host (the thing being ranked).
+    primary_claimed: set = set()
+    demoted_primaries = 0
 
     dropped_skus = 0
     dropped_observations = 0
@@ -271,6 +309,17 @@ def extract_citation_observations(
                 provider = obs.get("provider")
                 if not q or not provider:
                     continue
+                is_primary = bool(obs.get("is_primary_destination"))
+                if is_primary:
+                    response_key = (content_key, provider, q)
+                    if response_key in primary_claimed:
+                        # Second claim on the same response — demote, don't
+                        # persist. Two primaries would mean one answer sent the
+                        # buyer to two places, which the signal cannot express.
+                        is_primary = False
+                        demoted_primaries += 1
+                    else:
+                        primary_claimed.add(response_key)
                 out.append({
                     "content_key": content_key,
                     "product_key": product_key,
@@ -285,7 +334,18 @@ def extract_citation_observations(
                     "first_party": host.get("first_party"),
                     "is_competitor": host.get("is_competitor"),
                     "evidence_url": evidence_url,
+                    "destination_rank": _clean_destination_rank(
+                        obs.get("destination_rank")
+                    ),
+                    "is_primary_destination": is_primary,
                 })
+    if demoted_primaries:
+        logger.warning(
+            "citation_deposit.duplicate_primary_destination demoted=%d — an "
+            "authority map claimed more than one primary destination for the "
+            "same (content_key, provider, query); only the first was kept",
+            demoted_primaries,
+        )
     if dropped_skus:
         logger.info(
             "citation_deposit.dropped skus=%d observations=%d "
@@ -300,6 +360,295 @@ def extract_citation_observations(
 # =====================================================================
 
 
+# Bands the rollup uses. `blocked` and `partial` are the report's own words for
+# "an agent cannot resolve this" and "it resolves sometimes" — they are findings
+# by the report's own reckoning, so a projection that showed nothing for them
+# would be contradicting the same run's headline.
+_ROLLUP_FINDING_BANDS = {"blocked": "high", "partial": "medium"}
+
+# What each dimension means to the merchant, in the report's own language, so a
+# finding does not invent a claim the rollup did not make.
+_ROLLUP_DIMENSION_FINDING = {
+    "identity": "product_identity_unresolvable",
+    "citation": "category_citation_weak",
+    "routability": "pivota_serving_not_ready",
+    "content_richness": "content_too_thin_to_cite",
+}
+
+# Dimensions that measure PIVOTA'S OWN readiness, not the brand's AI
+# visibility. Every one of routability's buckets reads our data and only our
+# data — serving_eligibility (30) is our index pipeline state,
+# offer_orderability (25) and price_currency_confidence (15) read our
+# `catalog_offers` rows, and the last 10 read our merchant/verification record.
+# Not one of them reads a model's answer.
+#
+# The writer already knows this and says so: _INTERNAL_STATE_GAPS (#1504) — a
+# product deliberately held out of serving scores 0 here, and the gap was
+# annotated and STOPPED FROM HEADLINING precisely so it could not be read as
+# "brand isn't AI-visible". Emitting it to the merchant as high-severity
+# "destination unroutable, AI has no buyable offer to send anyone to" undid
+# that demotion in a new place, and filed it under GET CITED, where it reads as
+# a citation failure. On the live Anuko run this dimension banded `blocked`
+# with median 6 — the merchant would have read our own un-ingested catalog as
+# their AI-visibility failure, and had nothing they could do about it.
+#
+# It is still measured, still carried in the headline distribution, and still
+# visible to internal_ops. It is just not a defect the merchant is told to fix.
+_PIVOTA_INTERNAL_DIMENSIONS = frozenset({"routability"})
+
+
+# The headline finding's type. `low` severity on purpose: the projection's
+# stage lists take critical/high/medium only, so this row carries the
+# distribution to the headline WITHOUT appearing to the merchant as a problem
+# of its own. It is a measurement, not a defect.
+FINDING_HEADLINE_DISTRIBUTION = "brand_headline_distribution"
+
+
+# Emitted when the rollup is readable but scored nothing. Distinct from
+# report_shape_unreadable ("I could not read this") — this one means "I read it
+# and it measured nothing". Both are meta-findings about the RUN, not claims
+# about the merchant; see _META_FINDING_TYPES in audit_projection_builder.
+FINDING_NO_DIMENSION_SCORED = "no_dimension_was_scored"
+
+
+def _rollup_bands_seen(rollup: Dict[str, Any]) -> List[str]:
+    dims = rollup.get("dimensions")
+    if not isinstance(dims, dict):
+        return []
+    return sorted({
+        str(d.get("band") or "missing")
+        for d in dims.values() if isinstance(d, dict)
+    })
+
+
+def _rollup_scored_any_dimension(rollup: Dict[str, Any]) -> bool:
+    """True when at least one dimension carries a band the writer scored."""
+    dims = rollup.get("dimensions")
+    if not isinstance(dims, dict) or not dims:
+        return False
+    for dim in dims.values():
+        if not isinstance(dim, dict):
+            continue
+        band = str(dim.get("band") or "").strip().lower()
+        if band and band not in ("unscored", "unknown"):
+            return True
+    return False
+
+
+def _prompt_split_from_rollup(rollup: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The branded-vs-unbranded citation split, with n, or None.
+
+    The §6 definition of done asks the merchant surface for this split. It is
+    NOT a new measurement: `prompt_mix.branded_axes` already says which intent
+    axes are branded, and `citation_by_intent` already reports cited/total per
+    axis. This classifies the second by the first and sums. Nothing is
+    estimated, and an axis the report did not classify is named in
+    `unclassified_axes` rather than being quietly counted as unbranded.
+
+    Returns None when either input is missing — an absent split must read as
+    absent, never as parity.
+    """
+    mix = rollup.get("prompt_mix")
+    by_intent = rollup.get("citation_by_intent")
+    if not isinstance(mix, dict) or not isinstance(by_intent, dict):
+        return None
+    branded_axes = mix.get("branded_axes")
+    if not isinstance(branded_axes, list) or not branded_axes:
+        return None
+    branded_set = {str(a) for a in branded_axes}
+
+    buckets = {
+        "branded": {"cited": 0, "answered": 0, "axes": []},
+        "unbranded": {"cited": 0, "answered": 0, "axes": []},
+    }
+    unclassified: List[str] = []
+    for axis, stats in by_intent.items():
+        if not isinstance(stats, dict):
+            unclassified.append(str(axis))
+            continue
+        cited = stats.get("cited")
+        total = stats.get("total")
+        if not isinstance(cited, int) or not isinstance(total, int):
+            unclassified.append(str(axis))
+            continue
+        side = "branded" if str(axis) in branded_set else "unbranded"
+        buckets[side]["cited"] += cited
+        buckets[side]["answered"] += total
+        buckets[side]["axes"].append(str(axis))
+
+    # An axis the mix calls branded but the report never scored would silently
+    # shrink the branded denominator. Say it instead.
+    axes_without_data = sorted(branded_set - set(buckets["branded"]["axes"]))
+
+    for side in buckets.values():
+        side["axes"] = sorted(side["axes"])
+        answered = side["answered"]
+        # No answered prompts means no rate. 0/0 is not 0%.
+        side["rate"] = (
+            round(side["cited"] / answered, 3) if answered else None
+        )
+
+    if not buckets["branded"]["axes"] and not buckets["unbranded"]["axes"]:
+        return None
+
+    return {
+        "basis": (
+            "citation_by_intent axes classified by prompt_mix.branded_axes; "
+            "cited and answered are prompt counts, not SKU counts"
+        ),
+        "branded": buckets["branded"],
+        "unbranded": buckets["unbranded"],
+        "unclassified_axes": sorted(unclassified),
+        "branded_axes_without_citation_data": axes_without_data,
+        "branded_prompt_count": mix.get("branded"),
+        "unbranded_prompt_count": mix.get("unbranded"),
+        # Rule: scores are not comparable across a prompt_mix_version change.
+        # Whoever renders or diffs this must be able to see which version it is.
+        "prompt_mix_version": rollup.get("prompt_mix_version"),
+    }
+
+
+def _headline_finding_from_rollup(
+    rollup: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Every dimension the rollup banded, plus the split, as ONE finding.
+
+    Deliberately carries dimensions the merchant PASSED as well as the ones
+    that blocked. _findings_from_brand_rollup emits a finding only for
+    blocked/partial, so a headline built from those alone would show the bad
+    dimensions with no denominator — the reader could not tell four-of-four
+    from four-of-nine. `dimensions_considered` is that denominator.
+    """
+    dims = rollup.get("dimensions")
+    if not isinstance(dims, dict):
+        return None
+    rows: List[Dict[str, Any]] = []
+    for key, dim in sorted(dims.items(), key=lambda kv: str(kv[0])):
+        if not isinstance(dim, dict):
+            continue
+        rows.append({
+            "dimension": str(key),
+            "label": dim.get("dimension_label") or str(key),
+            "band": dim.get("band"),
+            # The raw enum above is internal vocabulary; anything rendering
+            # this row to a merchant must use band_label. Both travel so the
+            # renderer never has to re-derive one from the other.
+            "band_label": dim.get("band_label"),
+            "measures": (
+                "pivota_readiness"
+                if str(key) in _PIVOTA_INTERNAL_DIMENSIONS
+                else "brand_ai_visibility"
+            ),
+            "median": dim.get("median"),
+            "p25": dim.get("p25"),
+            "p75": dim.get("p75"),
+            # n travels WITH the number. A band over 3 SKUs is not a band over
+            # 300 and the reader is entitled to know which one this is.
+            "n": dim.get("total_count"),
+            "above_count": dim.get("above_count"),
+        })
+    split = _prompt_split_from_rollup(rollup)
+    if not rows and split is None:
+        return None
+    return {
+        "finding_type": FINDING_HEADLINE_DISTRIBUTION,
+        # "low" so the projection's stage lists (critical/high/medium) skip it.
+        "severity": "low",
+        "payload": {
+            "dimensions": rows,
+            "dimensions_considered": len(rows),
+            "prompt_split": split,
+            "skus_audited": rollup.get("skus_audited"),
+            "verdict_label": rollup.get("brand_verdict_label"),
+        },
+        "confidence": CONFIDENCE_FINDING_HIGH,
+        "short_summary": (
+            f"Per-dimension distribution over {len(rows)} dimension(s)"
+            + ("" if split else "; no branded/unbranded split available")
+        ),
+    }
+
+
+def _findings_from_brand_rollup(
+    brand_report: Dict[str, Any], rollup: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Findings from the shape production writes.
+
+    Deliberately conservative: it reports ONLY what the rollup already asserts —
+    a dimension's own band and median — and derives nothing. Mapping these onto
+    the legacy avg_visibility/avg_attribution numbers would be inventing a
+    comparison the report never made, which is how the /100-score-rendered-as-a-
+    percentage defect got in next door.
+    """
+    from services.selection_measurement import report_observations, selection_measurement
+    out: List[Dict[str, Any]] = [{
+        "finding_type": "recovery_measurement", "severity": "low",
+        "payload": {"selection": selection_measurement(report_observations(brand_report)),
+                    "selection_gap": rollup.get("selection_gap"),
+                    "catalog_available": brand_report.get("catalog_dimensions_available") is not False},
+        "short_summary": "Response-level measurement basis", "confidence": None,
+    }]
+    dims = rollup.get("dimensions")
+    if not isinstance(dims, dict):
+        return out
+    for key, dim in dims.items():
+        if not isinstance(dim, dict):
+            continue
+        if key == "routability" and brand_report.get("catalog_dimensions_available") is False:
+            continue
+        band = str(dim.get("band") or "").lower()
+        severity = _ROLLUP_FINDING_BANDS.get(band)
+        if not severity:
+            continue
+        if str(key) in _PIVOTA_INTERNAL_DIMENSIONS:
+            # `low` keeps it out of the projection's merchant stage lists
+            # (critical/high/medium) without discarding the measurement.
+            severity = "low"
+        label = dim.get("dimension_label") or key
+        meaning = dim.get("meaning") or ""
+        # The band enum is INTERNAL vocabulary the writer forbids reaching a
+        # merchant as a raw token; `band_label` ("Needs work" / "Not yet
+        # visible") is the merchant-safe rendering it publishes for exactly
+        # this. "Identity: blocked" was shipping the raw enum into
+        # findings_summary[].summary on the merchant projection.
+        band_text = dim.get("band_label") or band or "unscored"
+        out.append({
+            "finding_type": _ROLLUP_DIMENSION_FINDING.get(
+                str(key), f"dimension_{key}_below_band",
+            ),
+            "severity": severity,
+            "payload": {
+                "dimension": key,
+                "band": dim.get("band"),
+                "median": dim.get("median"),
+                "p25": dim.get("p25"),
+                "p75": dim.get("p75"),
+                # n, because a band from 3 SKUs is not a band from 300 and the
+                # reader is entitled to know which one this is.
+                "above_count": dim.get("above_count"),
+                "total_count": dim.get("total_count"),
+                "verdict_label": brand_report.get("brand_verdict_label"),
+            },
+            "confidence": CONFIDENCE_FINDING_HIGH,
+            "short_summary": (
+                # For an internal-state dimension the report's own `meaning`
+                # ("AI has no buyable offer to route a shopper to") describes
+                # the merchant's AI visibility, which is not what the buckets
+                # measured. It does not reach the merchant at `low` severity,
+                # but it does reach internal_ops and the findings table, and
+                # the same sentence misleads whoever reads it there.
+                f"{label}: {band_text} — Pivota has not finished ingesting "
+                f"and serving this store's offers. This measures our own "
+                f"readiness, not the brand's AI visibility."
+                if str(key) in _PIVOTA_INTERNAL_DIMENSIONS
+                else f"{label}: diagnostic score {dim.get('median') if dim.get('median') is not None else 'not retained'}/100. "
+                "This score does not establish verified AI identification, mention, or recommendation. "
+                "Review the underlying evidence before changing the product page."
+            ),
+        })
+    return out
+
+
 def extract_findings(
     brand_report: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
@@ -310,7 +659,88 @@ def extract_findings(
     """
     out: List[Dict[str, Any]] = []
     if not isinstance(brand_report, dict):
+        # A MISSING report is not an all-clear either. Returning [] put it on
+        # exactly the same footing as "read the report, found nothing", which
+        # is the ambiguity this function was silently trading on.
+        return [{
+            "finding_type": "report_shape_unreadable",
+            "severity": "high",
+            "payload": {"received_type": type(brand_report).__name__},
+            "confidence": CONFIDENCE_FINDING_HIGH,
+            "short_summary": (
+                "No brand report was available to extract findings from. "
+                "This is NOT an all-clear."
+            ),
+        }]
+
+    # WHICH REPORT SHAPE IS THIS?
+    #
+    # Everything below reads the LEGACY shape: `aggregate` + `per_product`. The
+    # per-SKU report that production actually writes has neither — its top level
+    # is `brand_rollup` / `brand_verdict_label`, with the per-product detail in
+    # `per_sku_reports` — which IS on the brand report
+    # (agent_center_bd_report_service.py writes it there), not only on the
+    # response as an earlier revision of this comment claimed. That matters:
+    # the per-SKU breakdowns are readable from here, which is where a finding
+    # that needs bucket-level detail would get it. So on every real run this
+    # function fell
+    # through every branch and returned [], and
+    # build_revenue_recovery_projection turned that empty list into
+    # `NO_FINDINGS` — "we checked and found nothing" — for audits that had found
+    # blocked dimensions. Verified against a live run on 2026-09-05:
+    # get_selected and get_cited both rendered NO_FINDINGS while the same run
+    # scored the brand 1.6/10 with identity and routability BLOCKED.
+    #
+    # The empty list was never the bug on its own; the AMBIGUITY was. "[] because
+    # nothing is wrong" and "[] because I could not read this" are different
+    # facts and only one of them is an all-clear. `unreadable_shape` is appended
+    # as a finding so the caller cannot mistake the second for the first, and so
+    # the projection has a row to cite instead of inventing a pass.
+    _legacy = ("aggregate" in brand_report) or ("per_product" in brand_report)
+    _rollup = brand_report.get("brand_rollup")
+    _modern = isinstance(_rollup, dict) and bool(_rollup)
+    if not _legacy and not _modern:
+        out.append({
+            "finding_type": "report_shape_unreadable",
+            "severity": "high",
+            "payload": {"top_level_keys": sorted(brand_report.keys())[:20]},
+            "confidence": CONFIDENCE_FINDING_HIGH,
+            "short_summary": (
+                "The findings extractor did not recognise this report's shape, "
+                "so no finding could be derived from it. This is NOT an "
+                "all-clear."
+            ),
+        })
         return out
+
+    if _modern:
+        out.extend(_findings_from_brand_rollup(brand_report, _rollup))
+        _headline = _headline_finding_from_rollup(_rollup)
+        if _headline is not None:
+            out.append(_headline)
+        # A rollup whose dimensions all came back `unscored` — or that carries
+        # no `dimensions` at all — passes the _modern shape check, produces no
+        # band finding, and used to leave `out` empty for the rollup lane. The
+        # projection renders empty as NO_FINDINGS: "we checked and found
+        # nothing". It is the SAME false all-clear this function was rewritten
+        # to close, one level in. `_dimension_band(None)` returns "unscored",
+        # which happens when every SKU hit missing_inputs — nothing was
+        # measured, so nothing may be passed.
+        if not _rollup_scored_any_dimension(_rollup):
+            out.append({
+                "finding_type": FINDING_NO_DIMENSION_SCORED,
+                "severity": "high",
+                "payload": {
+                    "bands_seen": _rollup_bands_seen(_rollup),
+                    "skus_audited": _rollup.get("skus_audited"),
+                },
+                "confidence": CONFIDENCE_FINDING_HIGH,
+                "short_summary": (
+                    "This audit scored none of the four dimensions, so nothing "
+                    "was established about this store. This is NOT an "
+                    "all-clear."
+                ),
+            })
 
     aggregate = brand_report.get("aggregate") or {}
     avg_vis = aggregate.get("avg_visibility")
@@ -786,6 +1216,341 @@ async def _resolve_content_keys(
     return out
 
 
+# =====================================================================
+# A3 — the run-level audit basis
+# =====================================================================
+
+
+def _per_sku_reports(brand_report: Mapping[str, Any]) -> List[Mapping[str, Any]]:
+    """The run's per-product report rows, in BOTH shapes they arrive in.
+
+    `per_sku_reports` is the per-SKU wedge shape; `per_product` is what
+    `build_structured_report` (the legacy lane, still live) produces. The
+    comparability reader on the other side of this contract —
+    `audit_delta._prompt_set_id` — has always tolerated both, so a writer that
+    saw only one of them recorded NULL set ids for every legacy run while the
+    delta happily resolved an id from the same report. Two such bases then
+    compared NULL == NULL on the pinned-set fields.
+
+    PREFERENCE ORDER DIFFERS FROM `audit_delta._basis_rows`, DELIBERATELY NOT
+    CHANGED HERE. This reader takes `per_sku_reports` first and falls back to
+    `per_product`; `_basis_rows` takes `per_product` first and falls back to
+    `per_sku_reports`. On every shape either lane actually sees the two agree,
+    because a report carries one key or the other, never both — the orders can
+    only diverge on a hybrid report no writer emits. Aligning them is still
+    the right end state (one order, one place), but doing it inside this PR
+    would change which row a hybrid resolves from with no test able to prove
+    the change is inert, and this PR's whole point is that the writer and the
+    reader must not disagree. The set-id path is already converged:
+    `_prompt_basis_blocks` delegates to `audit_delta.prompt_basis_blocks`.
+    Follow-up: give `_per_sku_reports` and `_basis_rows` one shared helper.
+    """
+    reports = brand_report.get("per_sku_reports")
+    if not isinstance(reports, list):
+        reports = brand_report.get("per_product")
+    if not isinstance(reports, list):
+        return []
+    return [r for r in reports if isinstance(r, Mapping)]
+
+
+def build_providers_and_models(
+    brand_report: Mapping[str, Any],
+) -> Dict[str, Dict[str, Any]]:
+    """A3: `{provider_id: {"model_id": str, "temperature": float|None}}`.
+
+    Read from the report's own `provider_models` block (written by
+    services/coverage_profiles.resolve_provider_models plus any per-run
+    override), so the recorded model is the one the run actually used rather
+    than whatever the config says at read time.
+
+    TEMPERATURE IS RECORDED AS NULL, and that is a fact rather than a gap: the
+    audit probe path pins a temperature in exactly one place
+    (services/llm_providers/deepseek_probe.py, 0.2, inside the request body) and
+    passes none for the other providers, which therefore run at whatever the
+    provider's default is. Inventing a number here would put a value in an
+    immutable record that no code ever set. Recording null means that if the
+    probe path ever starts pinning temperatures, the basis changes and
+    `bases_are_comparable` correctly refuses to compare across the change.
+    """
+    raw = brand_report.get("provider_models")
+    out: Dict[str, Dict[str, Any]] = {}
+    if not isinstance(raw, Mapping):
+        return out
+    for provider, payload in raw.items():
+        provider_id = str(provider or "").strip().lower()
+        if not provider_id:
+            continue
+        if isinstance(payload, Mapping):
+            model_id = str(payload.get("model") or payload.get("model_id") or "").strip()
+        else:
+            model_id = str(payload or "").strip()
+        if not model_id:
+            continue
+        out[provider_id] = {"model_id": model_id, "temperature": None}
+    return out
+
+
+def build_tier_mix(brand_report: Mapping[str, Any]) -> Dict[str, int]:
+    """A3: counts per QUERY CLASS over the questions the run actually probed.
+
+    The vocabulary is `services.audit_facts.intent_axis_for` — the CURRENT one,
+    imported rather than restated, so this can never drift into a parallel
+    taxonomy. It reads the pinned `selected_specs` (W2.1: the exact
+    `{query, axis}` records that were probed), which is the only record of the
+    mix that survives into the report.
+
+    Why the mix matters on top of `selected_set_id`: two runs can carry the same
+    prompt-set identity and still be measured differently if the branded /
+    discovery balance moved (PROMPT_BASIS_VERSION 3 rebalanced exactly that),
+    and every share-style number in the report is a function of that balance.
+    """
+    from services.audit_facts import intent_axis_for
+
+    counts: Counter = Counter()
+    for sku_report in _per_sku_reports(brand_report):
+        basis = sku_report.get("prompt_basis")
+        if not isinstance(basis, Mapping):
+            continue
+        for spec in basis.get("selected_specs") or []:
+            if not isinstance(spec, Mapping):
+                continue
+            query = spec.get("query")
+            if not query:
+                continue
+            counts[intent_axis_for(query, spec.get("axis"))] += 1
+    return dict(sorted(counts.items()))
+
+
+def _prompt_basis_blocks(brand_report: Mapping[str, Any]) -> List[Mapping[str, Any]]:
+    """Every place a run's `prompt_basis` block can live, in reading order.
+
+    THE READER'S PRECEDENCE, NOT A MIRROR OF IT. This used to be a
+    hand-matched second implementation of `audit_delta._prompt_set_id`'s
+    tolerance, and hand-matched is exactly what it stopped being: it took
+    per-product ROWS first from both containers, while the reader takes the
+    PRIMARY report's own block first. On a report carrying a root
+    `prompt_basis` beside a nested `brand_report.per_sku_reports` — the shape
+    `_primary_report` resolves to the report ITSELF — this writer recorded the
+    nested row's id into the immutable basis row while the delta resolved the
+    root's, so two runs of that shape compared a recorded id against a
+    resolved one.
+
+    So there is now ONE ordering, and it lives on the reader's side:
+    `audit_delta.prompt_basis_blocks`. A precedence change there moves both
+    sides of the contract together, which is the only way this can stay true.
+    """
+    from services.audit_delta import prompt_basis_blocks
+
+    return list(prompt_basis_blocks(brand_report))
+
+
+def _pinned_set_ids(brand_report: Mapping[str, Any]) -> Dict[str, Optional[str]]:
+    """The first non-empty `prompt_set_id` / `selected_set_id` across the run's
+    per-SKU bases. Each is taken independently: a run whose SKUs predate W2.1
+    has a prompt_set_id and no selected_set_id, and recording the one it has is
+    strictly better than recording neither."""
+    prompt_set_id: Optional[str] = None
+    selected_set_id: Optional[str] = None
+    for basis in _prompt_basis_blocks(brand_report):
+        if not prompt_set_id:
+            prompt_set_id = str(basis.get("prompt_set_id") or "") or None
+        if not selected_set_id:
+            selected_set_id = str(basis.get("selected_set_id") or "") or None
+        if prompt_set_id and selected_set_id:
+            break
+    return {"prompt_set_id": prompt_set_id, "selected_set_id": selected_set_id}
+
+
+async def record_audit_basis(
+    *,
+    audit_run_id: str,
+    brand_report: Mapping[str, Any],
+    merchant_id: Optional[str],
+    persist: bool = True,
+) -> Optional[Dict[str, Any]]:
+    """A3: record, immutably, what this run was measured WITH.
+
+    With ``persist=False`` this builds and returns the basis PAYLOAD without
+    writing it — what services/audit_delta needs for the CURRENT run, whose row
+    does not exist yet when the delta is attached.
+
+    Called at audit completion, from `persist_canonical_evidence` — the one
+    place that already receives the assembled report, the run id and the
+    merchant id together. Best-effort in the same way every other write here is:
+    a failure logs and returns None, and never touches the audit lifecycle.
+
+    A second call for the same run is a no-op that returns the stored row
+    (db/audit_basis.record_basis), so a worker reclaim after a crash re-enters
+    this path safely.
+    """
+    # audit_run_id is only needed to WRITE. The comparability path builds the
+    # current run's basis before that run has an id to write under, and passes
+    # "" deliberately — gating on it there made this whole feature inert.
+    if not merchant_id or (persist and not audit_run_id):
+        return None
+    from db.audit_basis import METHODOLOGY_VERSION, record_basis
+    from db.merchant_official_domains import is_excluded, list_official_domains
+    from services.primary_destination import PRIMARY_DESTINATION_VERSION
+
+    try:
+        # The official-domain set AS IT STOOD AT RUN TIME. Snapshotting it is
+        # the whole point: this set decides `first_party` on every cited host,
+        # so a domain added between two runs moves the headline number with no
+        # change in the world. `dead` rows are excluded here for the same reason
+        # the report excludes them — the set recorded must be the set used.
+        # `declared` EXCLUDED -- unless inference ALSO produces the host. The
+        # comment above says "the set recorded must be the set used", and a
+        # `declared` row is stored but NOT used: it does not widen the set that
+        # decides first_party. Recording it would write a false claim into an
+        # INSERT-ONLY basis row and, because official_domains is a
+        # COMPARABILITY key, make the run non-comparable while moving no
+        # number. But the used set is (stored official) UNION (inferred), and a
+        # host declared BEFORE the catalog carried it is used by the inferred
+        # branch while its row still says `declared`. A source-only filter
+        # dropped a host the run demonstrably used -- the D2 shape, one
+        # ordering later. So the filter asks the same question the report
+        # asks: is this host in the used set. Best-effort like the rest of
+        # this snapshot: an inference failure records the source-only view.
+        from db.merchant_official_domains import SOURCE_DECLARED
+        from services.brand_claim_service import _inferred_merchant_hosts
+
+        rows = await list_official_domains(str(merchant_id))
+        inferred = set()
+        if any(str(r.get("source") or "") == SOURCE_DECLARED for r in rows):
+            inferred = await _inferred_merchant_hosts(str(merchant_id))
+        domains = [
+            row.get("domain")
+            for row in rows
+            if row.get("domain")
+            and not is_excluded(row.get("liveness_status"))
+            and (str(row.get("source") or "") != SOURCE_DECLARED
+                 or row.get("domain") in inferred)
+        ]
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        logger.warning(
+            "record_audit_basis: official-domain snapshot failed for %s: %s",
+            merchant_id, str(exc)[:200],
+        )
+        domains = []
+
+    set_ids = _pinned_set_ids(brand_report)
+    # Market/language come from the audit's single-market default
+    # (config.settings.audit_default_market_locale, e.g. "en-US"); the multi-
+    # market path (services/multi_market_audit.py) is flag-off in production.
+    # CURRENCY IS RECORDED AS NULL: the audit measures citations, not prices, and
+    # no currency is pinned anywhere on this path. A guessed "USD" in an
+    # immutable record would be a fabrication.
+    market: Optional[str] = None
+    language: Optional[str] = None
+    try:
+        from config.settings import settings
+
+        locale = str(getattr(settings, "audit_default_market_locale", "") or "").strip()
+        if "-" in locale:
+            language, market = locale.split("-", 1)
+        elif locale:
+            language = locale
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        logger.warning("record_audit_basis: locale read failed: %s", str(exc)[:200])
+
+    # Normalise EXACTLY as db.audit_basis.record_basis does before storing.
+    # It writes sorted({lower(strip(d))}); this path returned the raw
+    # list_official_domains order, which has no ORDER BY. Comparing the two
+    # shapes made a run non-comparable with ITSELF, so every multi-domain
+    # merchant would have been told their basis changed on every re-audit —
+    # the same defect as the one being fixed, pointing the other way.
+    domains = sorted({str(d).strip().lower() for d in domains if str(d).strip()})
+
+    payload = {
+        "providers_and_models": build_providers_and_models(brand_report),
+        "prompt_set_id": set_ids["prompt_set_id"],
+        "selected_set_id": set_ids["selected_set_id"],
+        "tier_mix": build_tier_mix(brand_report),
+        "official_domains": domains,
+        "primary_destination_version": PRIMARY_DESTINATION_VERSION,
+        "market": market,
+        "language": language,
+        "currency": None,
+    }
+    if not persist:
+        # The comparability path wants the SHAPE, not a row: at delta-attach
+        # time this run's basis has not been written yet (persist_canonical_
+        # evidence runs later, from the worker), so reading it back would always
+        # return None and the check would be permanently inert.
+        payload["methodology_version"] = METHODOLOGY_VERSION
+        return payload
+
+    return await record_basis(
+        audit_run_id=str(audit_run_id),
+        merchant_id=str(merchant_id),
+        **payload,
+    )
+
+
+
+async def _deposit_citation_observations(
+    *,
+    brand_report: Any,
+    content_key_map: Optional[Dict[str, Any]],
+    audit_run_id: str,
+    merchant_id: Optional[str],
+    summary: Dict[str, Any],
+) -> None:
+    """Deposit the cross-channel citation matrix, content_key-keyed.
+
+    Extracted from persist_canonical_evidence so the hand-off into
+    insert_citation_observation is reachable by a test. It was not: mutants
+    forcing `destination_rank=None` or `is_primary_destination=False` at this
+    boundary survived the whole suite, which meant the two columns B3 exists to
+    produce could be zeroed here and ship green.
+
+    Best-effort and idempotent; only depositable products emit (gated inside
+    extract_citation_observations via content_key_map).
+    """
+    # Imported here, not at module scope: this module is imported during report
+    # assembly and db.audit_evidence pulls in the DB layer.
+    from db.audit_evidence import (
+        compute_canonical_idempotency_key,
+        insert_citation_observation,
+    )
+
+    summary["citation_observations_inserted"] = 0
+    summary["citation_observations_skipped"] = 0
+    for obs in extract_citation_observations(brand_report, content_key_map):
+        idem_key = compute_canonical_idempotency_key(
+            audit_run_id=audit_run_id,
+            item_type="citation_observation",
+            item_signature="{}|{}|{}|{}".format(
+                obs.get("content_key"), obs.get("provider"),
+                obs.get("query"), obs.get("cited_host"),
+            ),
+        )
+        new_obs_id = await insert_citation_observation(
+            audit_run_id=audit_run_id,
+            merchant_id=merchant_id,
+            content_key=obs["content_key"],
+            product_key=obs.get("product_key"),
+            provider=obs["provider"],
+            query=obs["query"],
+            axis=obs.get("axis"),
+            query_class=obs.get("query_class"),
+            cited_host=obs.get("cited_host"),
+            host_type=obs.get("host_type"),
+            citation_role=obs.get("citation_role"),
+            first_party=obs.get("first_party"),
+            is_competitor=obs.get("is_competitor"),
+            evidence_url=obs.get("evidence_url"),
+            content_key_basis=obs.get("content_key_basis") or "unknown",
+            destination_rank=obs.get("destination_rank"),
+            is_primary_destination=obs.get("is_primary_destination"),
+            idempotency_key=idem_key,
+        )
+        if new_obs_id is None:
+            summary["citation_observations_skipped"] += 1
+        else:
+            summary["citation_observations_inserted"] += 1
+
+
 async def persist_canonical_evidence(
     *,
     audit_run_id: str,
@@ -866,8 +1631,20 @@ async def persist_canonical_evidence(
     extracted_evidence = list(
         extract_evidence_items(brand_report, content_key_map)
     )
+    summary["evidence_items_skipped_unidentified"] = 0
     for ev in extracted_evidence:
         signature = _evidence_signature(ev)
+        if not signature:
+            # No stable identity => no idempotency key => a re-run would
+            # duplicate it. Counted so a systematic producer bug is visible
+            # rather than showing up as a quietly short evidence table.
+            summary["evidence_items_skipped_unidentified"] += 1
+            logger.warning(
+                "persist_canonical_evidence: evidence_type=%s carries no "
+                "identity for audit=%s; skipped",
+                ev.get("evidence_type"), audit_run_id,
+            )
+            continue
         idem_key = compute_canonical_idempotency_key(
             audit_run_id=audit_run_id,
             item_type="evidence",
@@ -985,39 +1762,31 @@ async def persist_canonical_evidence(
     # P0.2: citation_observations — the cross-channel matrix, content_key-keyed.
     # Best-effort, idempotent; only depositable products emit (gated inside
     # extract_citation_observations via content_key_map).
-    summary["citation_observations_inserted"] = 0
-    summary["citation_observations_skipped"] = 0
-    for obs in extract_citation_observations(brand_report, content_key_map):
-        idem_key = compute_canonical_idempotency_key(
+    await _deposit_citation_observations(
+        brand_report=brand_report,
+        content_key_map=content_key_map,
+        audit_run_id=audit_run_id,
+        merchant_id=merchant_id,
+        summary=summary,
+    )
+
+    # A3: record what this run was measured WITH, once and immutably. Placed
+    # AFTER the citation deposit so the basis describes a run whose evidence has
+    # landed; a failure here is logged inside record_audit_basis and only shows
+    # up as basis_recorded=False.
+    try:
+        basis_row = await record_audit_basis(
             audit_run_id=audit_run_id,
-            item_type="citation_observation",
-            item_signature="{}|{}|{}|{}".format(
-                obs.get("content_key"), obs.get("provider"),
-                obs.get("query"), obs.get("cited_host"),
-            ),
-        )
-        new_obs_id = await insert_citation_observation(
-            audit_run_id=audit_run_id,
+            brand_report=brand_report,
             merchant_id=merchant_id,
-            content_key=obs["content_key"],
-            product_key=obs.get("product_key"),
-            provider=obs["provider"],
-            query=obs["query"],
-            axis=obs.get("axis"),
-            query_class=obs.get("query_class"),
-            cited_host=obs.get("cited_host"),
-            host_type=obs.get("host_type"),
-            citation_role=obs.get("citation_role"),
-            first_party=obs.get("first_party"),
-            is_competitor=obs.get("is_competitor"),
-            evidence_url=obs.get("evidence_url"),
-            content_key_basis=obs.get("content_key_basis") or "unknown",
-            idempotency_key=idem_key,
         )
-        if new_obs_id is None:
-            summary["citation_observations_skipped"] += 1
-        else:
-            summary["citation_observations_inserted"] += 1
+    except Exception as exc:  # noqa: BLE001 — defensive; must not fail the audit
+        logger.warning(
+            "persist_canonical_evidence: record_audit_basis raised for "
+            "audit=%s: %s", audit_run_id, str(exc)[:200],
+        )
+        basis_row = None
+    summary["basis_recorded"] = basis_row is not None
 
     return summary
 
@@ -1036,6 +1805,17 @@ def _evidence_signature(ev: Dict[str, Any]) -> str:
     canonical truth (same type + product + host + excerpt prefix).
     """
     payload = ev.get("payload") or {}
+    if ev.get("evidence_type") == "selection_response":
+        # `.get`, not `[...]`. A KeyError here does not fail one row — it
+        # escapes this helper into persist_canonical_evidence's UNGUARDED
+        # signature line (the try starts at the insert), so one malformed
+        # observation would abort the whole run's evidence persistence. An
+        # observation with no id has no stable identity, so the caller skips
+        # and counts it instead.
+        observation_id = payload.get("observation_id")
+        if not observation_id:
+            return ""
+        return "selection_response:" + str(observation_id)
     excerpt = (payload.get("excerpt_text") or "")[:80]
     host = payload.get("host") or ""
     matched_url = payload.get("matched_url") or ""

@@ -68,6 +68,9 @@ _INSIGHT_REFRESH_WORKER_EXPLICIT="${INSIGHT_REFRESH_WORKER+set}"
 _STORE_AUDIT_UCP_REPROBE_WORKER_EXPLICIT="${STORE_AUDIT_UCP_REPROBE_WORKER+set}"
 _STORE_AUDIT_COMMERCE_REPROBE_WORKER_EXPLICIT="${STORE_AUDIT_COMMERCE_REPROBE_WORKER+set}"
 _EXTERNAL_SEED_DESTINATION_SWEEP_EXPLICIT="${EXTERNAL_SEED_DESTINATION_SWEEP+set}"
+# Did the CALLER ask for a WORKERS value, or is this the default? The summary at the end needs
+# that distinction to tell "you asked and we ignored it" from "nobody mentioned it".
+WORKERS_REQUESTED="${WORKERS-}"
 : "${CONFIG:=preserve}"
 case "$CONFIG" in apply|preserve) ;; *) echo "CONFIG must be apply or preserve (got '$CONFIG')" >&2; exit 2 ;; esac
 : "${WORKERS:=false}"
@@ -142,6 +145,8 @@ if [ "$STORE_AUDIT_COMMERCE_REPROBE_WORKER" = true ]; then
   STORE_AUDIT_COMMERCE_PROBE_BACKEND_BASE_URL="${STORE_AUDIT_COMMERCE_PROBE_BACKEND_BASE_URL%/}"
 fi
 GCLOUD="${GCLOUD:-gcloud}"; REGION=us-west1; HERE="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=infra/gcp/_serving_revision.sh
+. "$HERE/_serving_revision.sh"
 export CLOUDSDK_CORE_PROJECT="$PROJECT"
 BACKEND_IMAGE="$REGION-docker.pkg.dev/pivota-shared/pivota/backend:$BACKEND_TAG"
 GATEWAY_IMAGE="$REGION-docker.pkg.dev/pivota-shared/pivota/gateway:$GATEWAY_TAG"
@@ -163,30 +168,14 @@ if [ "$STORE_AUDIT_UCP_REPROBE_WORKER" = true ]; then
   EXPECTED_UCP_BACKEND_BASE_URL="$(printf '%s' "$WEB_UCP_SPEC" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status",{}).get("url", ""))')"
   [ "$STORE_AUDIT_UCP_PROBE_BACKEND_BASE_URL" = "$EXPECTED_UCP_BACKEND_BASE_URL" ] \
     || { echo "STORE_AUDIT_UCP_PROBE_BACKEND_BASE_URL must exactly match web service URL ($EXPECTED_UCP_BACKEND_BASE_URL)" >&2; exit 2; }
-  # The service template can describe a 0%-traffic candidate. The untagged
-  # service URL used by the Job instead reaches the single untagged 100%
-  # revision. Refuse a split/candidate state rather than declaring receipt
+  # The service template can describe a 0%-traffic candidate. The service URL
+  # used by the Job instead reaches the single 100%-traffic revision (which
+  # normally carries its c-<sha> tag: deploy_backend.sh promotes the tagged
+  # candidate). Refuse a split/candidate state rather than declaring receipt
   # ready based on code that is not actually serving the URL.
-  WEB_ACTIVE_REVISION="$(printf '%s' "$WEB_UCP_SPEC" | python3 -c '
-import json,sys
-o=json.load(sys.stdin)
-# percent==100 ONLY. The `not t.get("tag")` conjunct that used to be here refused the
-# normal post-deploy state: deploy_backend.sh ships every candidate with `--tag c-<sha>`
-# and then promotes it, so the SERVING revision keeps its own candidate tag until a later
-# deploy retires it. Verified in prod 2026-08-26 — web-00098-kax held 100% traffic AND
-# tag c-6f8b201ba7dc, and this guard refused, making setup_scheduler.sh unrunnable
-# whenever Store Audit is armed.
-#
-# A tag is an ADDITIONAL address for a revision, not a replacement for the plain service
-# URL, so it says nothing about whether that revision serves the untagged URL. What the
-# guard is actually for is unchanged and still enforced: exactly one revision at 100%.
-# A split (50/50) yields no 100% entry and is still refused; a 0%-traffic candidate is
-# still excluded, because it has no percent.
-active=[t.get("revisionName", "") for t in o.get("status",{}).get("traffic", []) if t.get("percent") == 100]
-print(active[0] if len(active) == 1 else "")
-')"
+  WEB_ACTIVE_REVISION="$(serving_revision web || true)"
   [ -n "$WEB_ACTIVE_REVISION" ] \
-    || { echo "web must have exactly one untagged 100%-traffic revision before Store Audit Jobs are created" >&2; exit 2; }
+    || { echo "web has no single 100%-traffic revision (traffic is split, or a rollout is half-finished) - resolve that before Store Audit Jobs are created" >&2; exit 2; }
   WEB_ACTIVE_SPEC="$("$GCLOUD" run revisions describe "$WEB_ACTIVE_REVISION" --region "$REGION" --format=json)"
   # Refuse to create or arm a crawler against a revision where Cloud Run would
   # accept OIDC but the app would still return a disabled-receipt 404. This
@@ -211,26 +200,9 @@ if [ "$STORE_AUDIT_COMMERCE_REPROBE_WORKER" = true ]; then
   EXPECTED_COMMERCE_BACKEND_BASE_URL="$(printf '%s' "$WEB_COMMERCE_SPEC" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status",{}).get("url", ""))')"
   [ "$STORE_AUDIT_COMMERCE_PROBE_BACKEND_BASE_URL" = "$EXPECTED_COMMERCE_BACKEND_BASE_URL" ] \
     || { echo "STORE_AUDIT_COMMERCE_PROBE_BACKEND_BASE_URL must exactly match web service URL ($EXPECTED_COMMERCE_BACKEND_BASE_URL)" >&2; exit 2; }
-  WEB_COMMERCE_ACTIVE_REVISION="$(printf '%s' "$WEB_COMMERCE_SPEC" | python3 -c '
-import json,sys
-o=json.load(sys.stdin)
-# percent==100 ONLY. The `not t.get("tag")` conjunct that used to be here refused the
-# normal post-deploy state: deploy_backend.sh ships every candidate with `--tag c-<sha>`
-# and then promotes it, so the SERVING revision keeps its own candidate tag until a later
-# deploy retires it. Verified in prod 2026-08-26 — web-00098-kax held 100% traffic AND
-# tag c-6f8b201ba7dc, and this guard refused, making setup_scheduler.sh unrunnable
-# whenever Store Audit is armed.
-#
-# A tag is an ADDITIONAL address for a revision, not a replacement for the plain service
-# URL, so it says nothing about whether that revision serves the untagged URL. What the
-# guard is actually for is unchanged and still enforced: exactly one revision at 100%.
-# A split (50/50) yields no 100% entry and is still refused; a 0%-traffic candidate is
-# still excluded, because it has no percent.
-active=[t.get("revisionName", "") for t in o.get("status",{}).get("traffic", []) if t.get("percent") == 100]
-print(active[0] if len(active) == 1 else "")
-')"
+  WEB_COMMERCE_ACTIVE_REVISION="$(serving_revision web || true)"
   [ -n "$WEB_COMMERCE_ACTIVE_REVISION" ] \
-    || { echo "web must have exactly one untagged 100%-traffic revision before Store Audit commerce Jobs are created" >&2; exit 2; }
+    || { echo "web has no single 100%-traffic revision (traffic is split, or a rollout is half-finished) - resolve that before Store Audit commerce Jobs are created" >&2; exit 2; }
   WEB_COMMERCE_ACTIVE_SPEC="$("$GCLOUD" run revisions describe "$WEB_COMMERCE_ACTIVE_REVISION" --region "$REGION" --format=json)"
   WEB_COMMERCE_RECEIPT_READY="$(printf '%s' "$WEB_COMMERCE_ACTIVE_SPEC" | python3 -c '
 import json,sys
@@ -266,44 +238,55 @@ print("true" if flag and secret else "false")
 fi
 
 # ---------------------------------------------------------------- 1. the single-instance worker
+# THE WORKER'S SHAPE IS NOT DEFINED HERE ANY MORE. It lives in deploy_worker.sh, which is also what
+# .github/workflows/deploy-prod.yml calls on every push to main, so the service that CI rolls and
+# the service this script reconciles are the same service by construction rather than by two
+# people remembering to edit two files.
+#
+# Why that mattered enough to move: rolling the worker used to mean running THIS script, which
+# also reconciles ~20 Cloud Run Jobs and every Scheduler trigger and demands a <gateway-tag>. So
+# nobody ran it to ship an image - they hand-copied these eight lines instead (2026-09-02
+# worker-00016-rmv, 2026-09-05 worker-00018-rm6), and in between the worker sat 94 commits behind
+# `web` for a month with no alarm able to see it.
+#
+# CONFIG, WORKERS and the env-file merge all still behave exactly as they did; they are that
+# script's arguments now. It additionally verifies /__scheduler_health from inside the VPC before
+# calling the roll a success, which this block never did.
+#
+# ENV_FILE / SECRETS_FILE stay defined HERE even though the worker no longer reads them from this
+# file: the Cloud Run Jobs further down (commerce-index-checkout-validation, -insight-refresh,
+# reviews-invitation-send) each `paste` $SECRETS_FILE into their own --set-secrets. Deleting these
+# two lines with the worker block would take those jobs out with it, under `set -u`, at the first
+# mkjob that touches one.
 ENV_FILE="$HERE/env.$ENV.yaml"; SECRETS_FILE="$HERE/secrets.$ENV.list"
 # CONFIG=preserve (the default) needs NEITHER file. See the CONFIG note in the header: both are
 # generated by port_railway_env.py from `railway variables --json`, Railway was decommissioned
 # 2026-08-22, and on a fresh checkout they cannot be regenerated - so this hard exit was the
 # outcome of EVERY run of this script, in both environments, before the first job was touched.
-# deploy_gateway.sh hit the same wall and answered it the same way.
 if [ "$CONFIG" = apply ]; then
   [ -f "$ENV_FILE" ] && [ -f "$SECRETS_FILE" ] || { echo "CONFIG=apply needs $ENV_FILE / $SECRETS_FILE - run port_railway_env.py first (it reads Railway, which is retired)" >&2; exit 1; }
 fi
-MERGED=$(mktemp); chmod 600 "$MERGED"; trap 'rm -f "$MERGED"' EXIT INT TERM
+
+echo "== worker service (delegating to deploy_worker.sh)"
+# WORKERS is passed ONLY under `apply`, and that is the contract, not a shortcut. It reaches the
+# service exclusively through the env file, so it is inert under `preserve` - and deploy_worker.sh
+# REFUSES an explicit WORKERS under `preserve` rather than accepting one it would ignore. Since
+# this script defaults WORKERS to false unconditionally, forwarding it always would make every
+# ordinary `setup_scheduler.sh prod <a> <b>` reconcile run die on that guard.
+#
+# `env -u WORKERS` IS LOAD-BEARING, and omitting it broke a documented command. An operator who
+# writes `WORKERS=true ... setup_scheduler.sh prod <a> <b>` puts WORKERS in THIS script's own
+# environment, so the child inherits it no matter which branch below runs - simply not naming it
+# on the preserve branch does nothing. The arming command in infra/gcp/README.md is exactly that
+# shape, and with CONFIG at its default `preserve` it would hit deploy_worker.sh's guard, exit 2,
+# and `set -e` would kill this script before ONE Cloud Run Job or Scheduler trigger was
+# reconciled. Unsetting it in the child's environment is what actually restores "inert under
+# preserve". Caught in review, 2026-09-05.
 if [ "$CONFIG" = apply ]; then
-# Drop keys we are about to set ourselves: the ported file may already carry them from the
-# overrides, and a duplicate YAML key is a warning today and an error in a future gcloud.
-grep -vE '^(PIVOTA_ENV|PIVOTA_SERVICE_NAME|PIVOTA_COMMIT_SHA|SKIP_HEAVY_STARTUP_INIT|AUDIT_WORKER_ENABLED|REVIEWS_INVITATION_WORKER_ENABLED|DB_POOL_MIN_SIZE|DB_POOL_MAX_SIZE):' "$ENV_FILE" > "$MERGED"
-{ printf 'PIVOTA_ENV: "%s"\nPIVOTA_SERVICE_NAME: "worker"\nPIVOTA_COMMIT_SHA: "%s"\n' "$PIVOTA_ENV" "$BACKEND_TAG"
-  printf 'SKIP_HEAVY_STARTUP_INIT: "true"\n'
-  printf 'AUDIT_WORKER_ENABLED: "%s"\nREVIEWS_INVITATION_WORKER_ENABLED: "%s"\n' "$WORKERS" "$WORKERS"
-  printf 'DB_POOL_MIN_SIZE: "2"\nDB_POOL_MAX_SIZE: "10"\n'
-} >> "$MERGED"
-fi
-WORKER_CONFIG_ARGS=()
-if [ "$CONFIG" = apply ]; then
-  WORKER_CONFIG_ARGS=(--env-vars-file "$MERGED"
-    --set-secrets "DATABASE_URL=DATABASE_URL:latest,REDIS_URL=REDIS_URL:latest,PCI_KB_DATABASE_URL=PCI_KB_DATABASE_URL:latest,$(paste -sd, "$SECRETS_FILE")")
+  env CONFIG=apply WORKERS="$WORKERS" GCLOUD="$GCLOUD" "$HERE/deploy_worker.sh" "$ENV" "$BACKEND_TAG"
 else
-  # PRESERVE. Restamp the commit and re-pin the two knobs this script owns, and NOTHING else:
-  # `--update-env-vars` leaves every other variable and every secret mount exactly as the running
-  # revision has them. AUDIT_WORKER_ENABLED is deliberately absent - see the WORKERS note below.
-  WORKER_CONFIG_ARGS=(--update-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=worker,PIVOTA_COMMIT_SHA=$BACKEND_TAG,SKIP_HEAVY_STARTUP_INIT=true,DB_POOL_MIN_SIZE=2,DB_POOL_MAX_SIZE=10")
+  env -u WORKERS CONFIG=preserve GCLOUD="$GCLOUD" "$HERE/deploy_worker.sh" "$ENV" "$BACKEND_TAG"
 fi
-echo "== worker service (min=max=1, ingress internal, CONFIG=$CONFIG)"
-"$GCLOUD" run deploy worker --region "$REGION" --image "$BACKEND_IMAGE" --service-account "$SA" \
-  --network default --subnet default --vpc-egress all-traffic \
-  "${WORKER_CONFIG_ARGS[@]}" \
-  --port 8080 --cpu 1 --memory 2Gi --concurrency 1 \
-  --min-instances 1 --max-instances 1 \
-  --no-cpu-throttling --execution-environment gen2 --ingress internal \
-  --labels "env=$ENV,service=worker,managed-by=infra-gcp" --quiet
 
 # ---------------------------------------------------------------- 2. Cloud Run Jobs
 mkjob(){ # name image service-account command...
@@ -331,10 +314,106 @@ mkbrowserauditjob(){ # Browser is intentionally isolated to the crawl subnet.
     --labels "env=$ENV,managed-by=infra-gcp,lane=store-audit-crawl" --quiet "$@"
 }
 echo "== job: relgraph-sync (Railway cron 37 10 * * *)"
+# --task-timeout OVERRIDES mkjob's 3600s: "$@" lands after the defaults on mkjob's gcloud line and
+# gcloud takes the last occurrence. Thirteen other callers in this file already rely on that, so it
+# is this file's established shape rather than a new assumption — though nothing here TESTS it, and
+# no test asserts it, so treat it as convention-backed, not proven.
+#
+# 3600s is NOT this job's binding constraint today: the cron entry point caps itself well before the
+# clock at 200 anchors over 250 selected rows in a 24h window, which finishes in ~4 minutes
+# (measured 2026-09-09 10:37Z). It becomes the wall the moment anyone raises those caps to rebuild
+# the graph for real: measured the same day, a --limit 1000 build over a 5,000-row selection was
+# TERMINATED at exactly 3600s mid-build, producing no audit and no edges. With --max-retries 1 above
+# that costs two attempts, so 3600s really means two wasted hours; 14400s likewise means eight.
+#
+# ⚠️ THE CAPS ARE NOT SET HERE AND CANNOT BE SET LIVE. They are RELGRAPH_SYNC_LIMIT (default 200,
+# max 2000) and RELGRAPH_SYNC_SELECT_LIMIT (default 250, max 5000), read inside the GATEWAY image by
+# PIVOTA-Agent's scripts/run-relationship-graph-sync-routine-cron.js — grepping THIS repo for them
+# finds nothing. Raising them means adding them to the --set-env-vars line below, because that flag
+# REPLACES the whole env set: an operator who adds them with `gcloud run jobs update` has them wiped
+# by the next reconcile of this script. That is the same drift this timeout override exists to
+# prevent, and it applies to the caps too.
+#
+# So this raise removes ONE of three walls. It changes nothing about the daily run, which exits in
+# minutes either way.
+#
+# COST: infra/gcp/setup_monitoring.sh alerts on relgraph-sync via completed_task_attempt_count
+# {result=failed} — it fires only AFTER a task dies, and there is no duration-based alert. A wedged
+# job is therefore silent for 4h instead of 1h (8h instead of 2h across the retry). Accepted here
+# because the daily run exits in minutes, so a run that is still alive at 1h is already anomalous —
+# but if these caps are ever raised, add a duration alert rather than relying on the failure signal.
+#
+# Precedent for raising, not just lowering: the twelve other mkjob callers all LOWER 3600s, but
+# external-seed-destination-sweep raises mkcrawljob's 300s to 3600s. This is the first override to
+# exceed 3600s.
 mkjob relgraph-sync "$GATEWAY_IMAGE" "$SA" \
   --set-secrets "DATABASE_URL=DATABASE_URL_NOVERIFY:latest,PCI_KB_DATABASE_URL=PCI_KB_DATABASE_URL_NOVERIFY:latest" \
   --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=relgraph-sync,PIVOTA_COMMIT_SHA=$GATEWAY_TAG,DB_POOL_MAX=3,PCI_KB_DB_POOL_MAX=1,INGREDIENT_REFERENCE_DB_POOL_MAX=1,INGREDIENT_SIGNAL_DB_POOL_MAX=1" \
+  --task-timeout 14400s \
   --command npm --args "run,relgraph:sync-routine:cron"
+
+echo "== job: relgraph-health (was GH Actions cron 0 10 * * *)"
+# THE SECOND HALF OF THE 2026-08-25 MIGRATION, finished 2026-09-09.
+#
+# external-seed-sentinel-nongrowth below was moved off its GitHub workflow the day the Railway
+# DATABASE_URL was decommissioned. `Relationship Graph Serving Guard Audit` was missed. It broke the
+# next morning, stayed broken for two weeks, then stopped firing altogether.
+#
+# ⚠️ NOT "no signal at all" — an earlier version of this comment said that and it was false, in the
+# overclaiming way this whole change is meant to stop. `relgraph-sync` runs `serving_guard_audit`
+# itself, at 1% / 25 rows with critical-reason gating on by default
+# — the defaults live in run-relationship-graph-SYNC-routine.js:23-36, which forwards them;
+# run-relationship-graph-routine-job.js itself defaults them to null and gates only when
+# passed, so do not read that file alone and conclude the opposite. That is real coverage. What this job adds is a TIGHTER
+# gate (0 rows / 0%), the expiry alarm, and the no-op detector — the last being the one that would
+# have noticed relgraph-sync passing every day over a graph that gained nothing.
+#
+# It could not be repaired in GitHub. prod Postgres is private-only: `pivota-pg` has
+# `ipv4Enabled: false`, one RFC1918 address (10.25.0.2) and no authorized networks, so a
+# GitHub-hosted runner has no route to it and the `read ECONNRESET` in those runs is GitHub's
+# network resetting traffic to a non-routable address. Repairing it there would have meant putting a
+# public IP back on the production database.
+#
+# Three checks in one execution (PIVOTA-Agent scripts/run-relgraph-health-job.js): the serving
+# guard, whose thresholds used to live as an inline `node -e` in the workflow YAML and are now code
+# with tests; the expiry alarm, which was a SECOND step in the retired workflow; and the no-op-run
+# detector, which catches the ledger passing while nothing is applied. Thresholds come through ENV
+# because gcloud splits --args on commas.
+#
+# THE THRESHOLDS THE RETIRED WORKFLOW SET. Review found the first version of this block set neither
+# the critical reasons nor the expiry thresholds, so those checks would have run green having
+# evaluated nothing — a job whose purpose is to report exactly that, committing it.
+#
+# The two numeric ones are passed. THE CRITICAL-REASON LIST DELIBERATELY IS NOT, and passing it
+# would be strictly LESS safe. `--set-env-vars` is comma-separated, so a three-item list has to
+# travel joined by something else (`;`, or gcloud's `^DELIM^` form). PIVOTA-Agent's parser falls
+# back to its built-in three ONLY when the parsed list comes out EMPTY. A future image that split on
+# `,` alone would parse `a;b;c` as ONE bogus reason — length 1, so the fallback is bypassed, and the
+# check matches nothing and passes every run. Silently. Not passing it means the only path is the
+# script's own default, which cannot be mis-parsed. The list is written here so a reader of this
+# file still knows what is enforced:
+#
+#     ai_approved_dupe_quarantined
+#     candidate_ref_unresolvable_nested_product_prefix
+#     anchor_ref_unresolvable_nested_product_prefix
+#
+# To override, set RELGRAPH_CRITICAL_REASONS on the job by hand; the parser accepts `,` or `;`.
+#
+# RELGRAPH_FAIL_ON_NOOP is deliberately NOT set, so the no-op detector REPORTS in the execution log
+# and does not page. The serving-guard thresholds were already enforcing before the move and stay
+# enforcing; flipping a second severity in the same migration would make a migration bug and a real
+# finding indistinguishable. Turn it on once the graph has demonstrably been applying for a week.
+#
+# Exit 1 = a threshold was breached, and that fails the execution and pages via the "prod: Cloud Run
+# job failing" alert policy, the same replacement for the GH failure email the sentinel uses. Exit 2
+# = the job itself failed. GATEWAY_TAG must be at or after PIVOTA-Agent #2171, which adds the script;
+# an older image fails with npm's `Missing script: "relgraph:health-job"` (not "Cannot find module" —
+# the entrypoint is `npm run`), twice, given --max-retries 1.
+mkjob relgraph-health "$GATEWAY_IMAGE" "$SA" \
+  --set-secrets "DATABASE_URL=DATABASE_URL_NOVERIFY:latest" \
+  --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=relgraph-health,PIVOTA_COMMIT_SHA=$GATEWAY_TAG,DB_POOL_MAX=3,RELGRAPH_MARKET=US,RELGRAPH_MAX_SUPPRESSED_ROWS=0,RELGRAPH_MAX_SUPPRESSED_PCT=0,RELGRAPH_MAX_EXPIRING_14D_PCT=30,RELGRAPH_MIN_TOTAL_ROWS=500" \
+  --task-timeout 1800s \
+  --command npm --args "run,relgraph:health-job"
 
 echo "== job: external-seed-sentinel-nongrowth (GH Actions cron 23 10 * * *)"
 # ADR-009 data-side ratchet, migrated from PIVOTA-Agent's scheduled GitHub workflow
@@ -747,8 +826,64 @@ else
   echo "== external-seed destination sweep not created (EXTERNAL_SEED_DESTINATION_SWEEP=false)"
 fi
 
+# ---- retailer ingest drain -----------------------------------------------------------------
+# One (brand, retailer) ingest stage per execution - dry run, or apply + read-back - claimed from
+# the retailer_ingest_jobs ledger (migration 234). See jobs/retailer_ingest_drain.py.
+#
+# `mkcrawljob`, not `mkjob`: every stage crawls a third-party retailer's storefront, so it must
+# leave from the pivota-crawl NAT. The default subnet's NAT address is the PAYMENT IP; a crawl from
+# it spends that address's reputation with the very hosts that rate-limit us.
+#
+# OVERRIDES of mkcrawljob's defaults, each passed through "$@" and so landing AFTER the default on
+# the same gcloud line, where gcloud takes the last occurrence. That is this file's established
+# shape (relgraph-sync raises mkjob's timeout the same way; read back live 2026-09-23, the job
+# carries 14400s, not the default):
+#   --task-timeout 3600s  the 300s default is a status probe's budget. A 20k-product scan at
+#                         CRAWL_MIN_INTERVAL_SECONDS=4 plus the apply needs up to ~60 minutes.
+#   --max-retries 0       the pipeline retries through its ledger (backoff_until, max_attempts); a
+#                         Cloud Run retry would re-crawl the same store immediately, uncounted.
+#   --memory 2Gi          a stage holds the whole crawled cohort and its plan in memory.
+#   --tasks/--parallelism 1  one stage per execution is the pipeline's politeness contract.
+#
+# RETAILER_INGEST_LEASE_SECONDS (4200) is deliberately LONGER than the task timeout: an expired lease
+# makes the job claimable again, so it must not expire under a stage that is still running.
+#
+# ⚠️ THE ARM/DISARM SWITCH IS THE TRIGGER, NOT THIS ENV. RETAILER_INGEST_DRAIN_ENABLED=1 is written
+# unconditionally. It used to be a script input defaulting to 0, and because --set-env-vars REPLACES
+# the whole env set, any later run of this script for an UNRELATED job (other sessions run it) wrote
+# 0 back and silently disarmed the drain. The trigger has no such problem: sched() leaves an
+# EXISTING trigger's pause state alone (its `(state unchanged: $name)` branch). So:
+#   arm:    gcloud scheduler jobs resume retailer-ingest-drain-cron --location us-west1 --project pivota-prod
+#   disarm: gcloud scheduler jobs pause  retailer-ingest-drain-cron --location us-west1 --project pivota-prod
+# and a re-run of this script changes neither. The job-level env check in jobs/retailer_ingest_drain.py
+# stays as a defense-in-depth kill switch: `gcloud run jobs update retailer-ingest-drain
+# --update-env-vars RETAILER_INGEST_DRAIN_ENABLED=0` stops executions immediately, but the next run
+# of this script puts the 1 back, so it is an emergency brake, not a disarm.
+#
+# DATABASE_URL, not DATABASE_URL_NOVERIFY: this is a Python (asyncpg) job, and every other
+# backend-image Python job here mounts DATABASE_URL; _NOVERIFY exists for node-pg.
+# DB_STATEMENT_TIMEOUT_SECONDS/DB_COMMAND_TIMEOUT_SECONDS are re-supplied because a Job inherits
+# nothing and db/database.py defaults both to OFF.
+# The ENABLE_INTAKE_IDENTITY_* / INDEX_ELIGIBLE_* / PDP_QUALITY_* / STRICT_* flags are the env the
+# 2026-09-23 curated ingest one-offs ran with, copied rather than re-derived. PIVOTA_SERVING_PRICING_REGIONS
+# is US alone: the pipeline requires USD, and the multi-region value carries a comma, which
+# gcloud's comma-splitting of --set-env-vars would break (no value on that line may contain one).
+echo "== job: retailer-ingest-drain (armed or not by its trigger's pause state)"
+mkcrawljob retailer-ingest-drain "$BACKEND_IMAGE" "$SA" \
+  --set-secrets "DATABASE_URL=DATABASE_URL:latest" \
+  --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=retailer-ingest-drain,PIVOTA_COMMIT_SHA=$BACKEND_TAG,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=3,DB_STATEMENT_TIMEOUT_SECONDS=30,DB_COMMAND_TIMEOUT_SECONDS=600,RETAILER_INGEST_DRAIN_ENABLED=1,RETAILER_INGEST_LEASE_SECONDS=4200,RETAILER_INGEST_DRAIN_BUDGET_SECONDS=1800,RETAILER_INGEST_TASK_TIMEOUT_SECONDS=3600,RETAILER_INGEST_MAX_LEASES=2,CURATED_CRAWL_PAGE_ATTEMPTS=5,CRAWL_MIN_INTERVAL_SECONDS=4,CRAWL_BACKOFF_BASE_SECONDS=15,PIVOTA_SERVING_PRICING_REGIONS=US,ENABLE_INTAKE_IDENTITY_ENRICHMENT=1,ENABLE_INTAKE_IDENTITY_AUDIT=1,ENABLE_INTAKE_IDENTITY_BRAND_AUTHORED=1,ENABLE_INTAKE_IDENTITY_MIRROR=1,ENABLE_INTAKE_IDENTITY_SYNC=1,ENABLE_KBEAUTY_AGENT_DECISION_GATES=true,ENABLE_STORELESS_BRAND_CATALOG=1,INDEX_ELIGIBLE_READ=1,INDEX_ELIGIBLE_RECALL=1,INDEX_ELIGIBLE_SITEMAP=1,INDEXNOW_ENABLED=true,PDP_QUALITY_SCORE_SOURCE_BACKED_OPTIONAL_COMPONENTS=1,STRICT_BEAUTY_CATEGORY_TEXT_RECALL=true" \
+  --task-timeout 3600s --max-retries 0 --memory 2Gi --tasks 1 --parallelism 1 \
+  --command python --args="-m,jobs.retailer_ingest_drain"
+
 echo "== scheduler triggers"
 sched relgraph-sync-cron "37 10 * * *" relgraph-sync
+# 10:00 UTC, the slot the retired GitHub workflow held. Nothing else uses it.
+#
+# An earlier version of this comment justified the slot as "37 minutes BEFORE relgraph-sync so the
+# verdict describes yesterday's state". That reasoning is empty and was removed: the serving-guard
+# predicate already filters `expires_at > now()`, and the no-op detector reads 48h/14d windows, so
+# neither check can tell 10:00 from 10:37. It is simply the old slot.
+sched relgraph-health-cron "0 10 * * *" relgraph-health
 sched external-seed-sentinel-nongrowth-cron "23 10 * * *" external-seed-sentinel-nongrowth
 sched pdp-identity-graph-backfill-cron "40 3 * * 1" pdp-identity-graph-backfill
 if [ "$EXTERNAL_SEED_DESTINATION_SWEEP" = true ]; then
@@ -788,6 +923,31 @@ sched commerce-index-relgraph-cron "*/10 * * * *" commerce-index-relgraph
 sched commerce-index-search-index-cron "*/5 * * * *" commerce-index-search-index
 sched commerce-index-checkout-validation-cron "*/5 * * * *" commerce-index-checkout-validation
 sched commerce-index-insight-refresh-cron "*/10 * * * *" commerce-index-insight-refresh
+# Every 10 minutes (was 30 until 2026-09-24: stages take 4-12 min, so a 30-min tick left the one-crawl
+# lane idle ~70% while three coverage waves queued; Peng: "we should not have queue being the
+# bottleneck"). Each execution also runs stages back to back for up to
+# RETAILER_INGEST_DRAIN_BUDGET_SECONDS (1800s: the last stage starts with >= 30 min left of the 3600s task), so ticks mostly find the
+# lane busy and exit idle. THIS TRIGGER IS THE DRAIN'S ONE ARM/DISARM SWITCH (see the job block): the
+# job's env always says enabled, so a resumed trigger means crawling.
+#
+# Created PAUSED no matter what $PAUSED says: the 5th argument pins it, so `PAUSED=0` (which arms
+# every trigger a run creates) cannot arm the drain as a side effect of provisioning it. After
+# creation sched() leaves its state alone on every re-run. Arm and disarm with
+# `gcloud scheduler jobs resume|pause retailer-ingest-drain-cron`. `ARM=retailer-ingest-drain-cron`
+# also resumes it, since that is sched()'s generic explicit arm, but it is not needed and not the
+# documented path: a gcloud resume arms it without reconciling ~20 other jobs and the worker.
+#
+# 10 minutes is SHORTER than the 3600s task timeout, and Cloud Run starts a new execution whether
+# or not the last one is still running. That is safe only because claim_due_job()
+# (db/retailer_ingest.py) caps the leases in flight at RETAILER_INGEST_MAX_LEASES (unset = 1: a tick
+# that lands during a long stage exits idle) and never leases a host that already holds one, nor a
+# second apply. Remove those clauses and this cadence becomes N crawls in flight, some at one store.
+# RETAILER_INGEST_MAX_LEASES in the --set-env-vars above is the lane count, a literal like the budget
+# and timeout (never a script input: a leftover shell value must not reach the job). Arming more
+# lanes is a reviewed change to that literal, so a re-run keeps what is committed and cannot quietly
+# undo or exceed it. 2026-09-25: armed at 2 (Peng) -- two stages in flight, never two at one host, never
+# two applies; watch crawl_throttled before raising it (every lane shares the one crawl NAT).
+sched retailer-ingest-drain-cron "*/10 * * * *" retailer-ingest-drain "$RUN_INVOKER" 1
 if [ "$STORE_AUDIT_UCP_REPROBE_WORKER" = true ]; then
   for job in store-audit-ucp-reprobe-enqueue store-audit-ucp-probe; do
     "$GCLOUD" run jobs add-iam-policy-binding "$job" --region "$REGION" \
@@ -844,5 +1004,22 @@ if [ "$INSIGHT_REFRESH_WORKER" != true ] && [ -n "$_INSIGHT_REFRESH_WORKER_EXPLI
 fi
 
 echo
-echo "worker:    $("$GCLOUD" run services describe worker --region "$REGION" --format='value(status.url)') (min=max=1, AUDIT_WORKER_ENABLED=$WORKERS)"
+# REPORT WHAT WAS APPLIED, NOT WHAT WAS ASKED FOR. Under `preserve` this script does not send
+# AUDIT_WORKER_ENABLED at all - it is applied through the env file, which only `apply` writes -
+# so printing "AUDIT_WORKER_ENABLED=$WORKERS" here stated as fact something the run had not
+# done. That is worse than the crash it replaced: `WORKERS=true ... setup_scheduler.sh` used to
+# die loudly at deploy_worker.sh's guard, and briefly instead exited 0 having reconciled
+# everything while telling the operator the drainers were armed. Read the live service.
+# THE SERVING REVISION, because the line below says "live" and an operator will read it that
+# way. `spec.template` is what the last deploy ASKED FOR; if that deploy did not take, the two
+# disagree and this would report the arming state of a revision serving nobody. Written the
+# first time as a template read, in the same commit whose comment said "Read the live service".
+WORKER_ARMED="$(serving_env worker AUDIT_WORKER_ENABLED || true)"
+echo "worker:    $("$GCLOUD" run services describe worker --region "$REGION" --format='value(status.url)') (min=max=1, AUDIT_WORKER_ENABLED=${WORKER_ARMED:-<unreadable>})"
+if [ "$CONFIG" != apply ] && [ -n "${WORKERS_REQUESTED:-}" ] && [ "${WORKERS_REQUESTED:-}" != "$WORKER_ARMED" ]; then
+  echo "   NOTE: you passed WORKERS=$WORKERS_REQUESTED, and CONFIG=preserve did NOT apply it." >&2
+  echo "   AUDIT_WORKER_ENABLED is still '${WORKER_ARMED:-<unreadable>}'. To change it:" >&2
+  echo "     gcloud run services update worker --region $REGION --project $PROJECT \\" >&2
+  echo "       --update-env-vars AUDIT_WORKER_ENABLED=$WORKERS_REQUESTED" >&2
+fi
 "$GCLOUD" scheduler jobs list --location "$REGION" --format="table(name.basename(),schedule,state)"

@@ -3,12 +3,17 @@ import asyncio
 
 from fastapi import APIRouter, Depends, HTTPException
 from typing import Optional
-from utils.auth import get_current_user
+from utils.auth import (
+    MERCHANT_OR_EMPLOYEE_STAFF_ROLES,
+    can_access_merchant,
+    get_current_user,
+)
 from db.database import database
 from datetime import datetime
 import uuid
 from services.wix_connection import (
     WixConnectionValidationError,
+    merge_wix_credential,
     validate_wix_catalog_access,
 )
 
@@ -35,7 +40,7 @@ async def _sync_connected_platform_products(
 ):
     platform_label = _PLATFORM_LABELS.get(platform, platform.title())
 
-    if current_user["role"] not in ["merchant", "employee", "admin"]:
+    if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
 
     merchant_id = current_user.get("merchant_id")
@@ -75,6 +80,15 @@ async def _sync_connected_platform_products(
     merchant_id = store_dict.get("merchant_id")
     if not merchant_id:
         raise HTTPException(status_code=400, detail="Merchant ID not found in store record")
+
+    # OWNERSHIP, not just role. A caller-supplied `store_id` selects the row on
+    # store_id + platform alone, so before this check any signed-in merchant
+    # could drive a sync of ANOTHER merchant's store -- and the response echoed
+    # that store's name back. The role gate above only decided who may attempt
+    # the route. Re-checked here rather than at the top because the owning
+    # merchant is a property of the row, not of the request.
+    if not can_access_merchant(current_user, merchant_id):
+        raise HTTPException(status_code=403, detail="Can only sync your own store")
 
     from routes.product_sync import sync_products, SyncRequest
     from fastapi import BackgroundTasks
@@ -246,19 +260,19 @@ async def merchant_sync_status(
     exception ([portal-sync] lines), and the honest client message is
     "still running or failed — retry", not a fabricated success.
     """
-    if current_user["role"] not in ["merchant", "employee", "admin"]:
+    if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
 
     merchant_id = current_user.get("merchant_id")
     if store_id:
         row = await database.fetch_one(
-            """SELECT store_id, name, platform, status, last_sync, product_count
+            """SELECT store_id, merchant_id, name, platform, status, last_sync, product_count
                FROM merchant_stores WHERE store_id = :store_id AND platform = :platform""",
             {"store_id": store_id, "platform": platform},
         )
     elif merchant_id:
         row = await database.fetch_one(
-            """SELECT store_id, name, platform, status, last_sync, product_count
+            """SELECT store_id, merchant_id, name, platform, status, last_sync, product_count
                FROM merchant_stores
                WHERE merchant_id = :merchant_id AND platform = :platform
                  AND status IN ('active', 'connected')
@@ -272,6 +286,13 @@ async def merchant_sync_status(
         raise HTTPException(status_code=404, detail="store not found")
 
     d = dict(row)
+    # Same store_id hazard as the sibling POSTs: the lookup above keys on a
+    # caller-supplied store_id, so the row can belong to anyone. Poll results
+    # (store name, status, product_count, last_sync) are another merchant's
+    # business data.
+    row_merchant_id = d.get("merchant_id")
+    if not row_merchant_id or not can_access_merchant(current_user, row_merchant_id):
+        raise HTTPException(status_code=403, detail="Can only read your own store")
     last_sync = d.get("last_sync")
     return {
         "store_id": d.get("store_id"),
@@ -292,8 +313,15 @@ async def connect_wix_store_sync(
     current_user: dict = Depends(get_current_user)
 ):
     """Connect a Wix store"""
-    if current_user["role"] not in ["merchant", "employee", "admin"]:
+    if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
+    # The merchant_id is a caller-supplied query parameter and the only check
+    # on it below is "does this merchant exist". Without this, a signed-in
+    # merchant could point another merchant's Wix connection at their own site
+    # and api_key -- a store hijack, and a credential overwrite on the UPDATE
+    # branch. Staff keep cross-merchant access; a `merchant` gets their own.
+    if not can_access_merchant(current_user, merchant_id):
+        raise HTTPException(status_code=403, detail="Can only connect your own store")
     
     try:
         # Verify merchant exists
@@ -316,7 +344,7 @@ async def connect_wix_store_sync(
 
         existing = await database.fetch_one(
             """
-            SELECT store_id
+            SELECT store_id, api_key
             FROM merchant_stores
             WHERE merchant_id = :merchant_id
               AND platform = 'wix'
@@ -327,6 +355,12 @@ async def connect_wix_store_sync(
 
         if existing:
             store_id = existing["store_id"]
+            # `normalized_api_key` is the BARE key `normalize_wix_api_key`
+            # extracted out of whatever was stored, so writing it back plain
+            # erased the rest of the credential blob -- including the
+            # `instance_id` that `POST /webhooks/wix` resolves this store by.
+            # Merge instead; a store that never had a blob still gets the bare
+            # key, byte-identical to before.
             await database.execute(
                 """
                 UPDATE merchant_stores
@@ -339,7 +373,11 @@ async def connect_wix_store_sync(
                 {
                     "store_id": store_id,
                     "name": store_name or normalized_site_id,
-                    "api_key": normalized_api_key,
+                    "api_key": merge_wix_credential(
+                        dict(existing).get("api_key"),
+                        api_key=normalized_api_key,
+                        site_id=normalized_site_id,
+                    ),
                     "connected_at": datetime.now(),
                 },
             )
@@ -386,8 +424,13 @@ async def test_wix_connection(
     current_user: dict = Depends(get_current_user)
 ):
     """Test Wix store connection"""
-    if current_user["role"] not in ["merchant", "employee", "admin"]:
+    if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
+    # Reads another merchant's store row and calls Wix with THEIR stored
+    # api_key, then returns their store name and site_id. A role gate cannot
+    # express that; ownership can.
+    if not can_access_merchant(current_user, merchant_id):
+        raise HTTPException(status_code=403, detail="Can only test your own store")
     
     try:
         # Get Wix store

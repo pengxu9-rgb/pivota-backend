@@ -6,7 +6,7 @@ Handle governance action proposals, approvals, and execution
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from typing import Optional
-from utils.auth import get_current_user
+from utils.auth import ADMIN_ROLES, get_current_user
 from db.database import database
 import logging
 
@@ -27,7 +27,7 @@ class RejectActionRequest(BaseModel):
 @router.get("/pending-actions")
 async def get_pending_governance_actions(current_user: dict = Depends(get_current_user)):
     """List all pending governance actions awaiting approval"""
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Admin only")
     
     try:
@@ -64,7 +64,7 @@ async def approve_governance_action(
     current_user: dict = Depends(get_current_user)
 ):
     """Approve and execute a governance action"""
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Admin only")
     
     try:
@@ -96,7 +96,7 @@ async def reject_governance_action(
     current_user: dict = Depends(get_current_user)
 ):
     """Reject a governance action"""
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Admin only")
     
     try:
@@ -132,7 +132,7 @@ async def get_agent_governance_history(
     current_user: dict = Depends(get_current_user)
 ):
     """Get governance action history for an agent"""
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Admin only")
     
     try:
@@ -168,7 +168,7 @@ async def get_agent_governance_history(
 @router.post("/metrics/collect-now")
 async def collect_metrics_now(current_user: dict = Depends(get_current_user)):
     """Manually trigger metrics collection for all agents"""
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Admin only")
     
     try:

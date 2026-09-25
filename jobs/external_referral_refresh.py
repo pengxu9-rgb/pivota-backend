@@ -1,14 +1,21 @@
 """Re-read the price and availability of the external seeds we serve.
 
-CLI-ONLY TODAY, AND THAT IS NOT A DESIGN CHOICE. Nothing schedules this: `services/audit_scheduler`
-does not register it and `infra/gcp/setup_scheduler.sh` has no entry for it
-(`docs/card-rail-readiness-audit.md` row A3, `docs/external-seed-dead-pdp-link-audit.md` §4.3).
-When it is armed it must be a Cloud Run Job on a Cloud Scheduler trigger, NOT a 33rd APScheduler
-entry, and it must run on the `pivota-crawl` subnet like its sibling
-`jobs/external_seed_destination_sweep.py`: it fetches third-party storefronts, so it has to leave
-from the reserved crawl-egress NAT (`infra/gcp/setup_crawl_egress.sh`) or most brand hosts answer
-it with a bot challenge. A GitHub Actions cron is not an option at all — Cloud SQL `pivota-pg` is
-private-IP only, so a runner has no route to the database (`tests/test_run_oneoff_job.py`).
+ARMED. Cloud Scheduler `external-referral-refresh-cron` (us-west1, `15 5 * * *` UTC) invokes the
+Cloud Run job `external-referral-refresh`, which runs `--limit 4000 --budget-seconds 3300` on
+subnet `pivota-crawl` — the reserved crawl-egress NAT, without which most brand hosts answer a bot
+challenge. Verified running daily 2026-09-06. (This docstring previously said "nothing schedules
+this"; that was true when written and is not now. A GitHub Actions cron remains impossible — Cloud
+SQL `pivota-pg` is private-IP only, so a runner has no route to the DB, `tests/test_run_oneoff_job.py`.)
+
+WHAT THE JOB DOES NOT DO, and why the exit code matters. It refreshes `external_product_seeds`.
+The search/offers lane reads the seed, so it sees fresh prices; the PDP (`agent_pdp_view`) and the
+index's `serving_eligible.has_price` gate read `catalog_offers`, which is re-projected only when
+`EXTERNAL_OFFER_DUAL_WRITE_ENABLED` is armed (see
+`routes/employee_products._project_refreshed_seed_to_serving_surfaces`). With that flag off this
+job runs green while a quarter of the catalogue serves a stale price on the product page.
+
+The image is pinned on the Cloud Run job and does NOT auto-deploy on merge — a change here ships
+only when someone rebuilds and updates the job.
 
 Usage:
 
@@ -99,6 +106,21 @@ def main() -> int:
     summary = asyncio.run(_run())
     print(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
     logger.info("external referral refresh completed", extra={"summary": summary})
+    # EXIT CODE FOLLOWS THE SUMMARY. This used to `return 0` unconditionally, so Cloud Run
+    # showed a green tick over every run — including nights that stopped on budget with 659
+    # rows untouched, or that served half their rows from cache without reaching an origin.
+    # A scheduler tick is the only place anyone would notice, so the summary has to reach it.
+    # `maxRetries` is 0 on the job, so a non-zero exit surfaces the run without a retry storm.
+    status = str(summary.get("status") or "").strip().lower()
+    if status != "success":
+        logger.warning(
+            "external referral refresh finished %s (stopped_early=%s origin_yield=%s reasons=%s)",
+            status,
+            summary.get("stopped_early"),
+            summary.get("origin_yield"),
+            summary.get("degraded_reason_counts"),
+        )
+        return 1
     return 0
 
 

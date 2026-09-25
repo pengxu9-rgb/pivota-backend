@@ -22,9 +22,51 @@ def _receipt(**overrides):
 
 
 def test_receipt_is_structured_and_redacted():
-    receipt = _receipt()
+    receipt = _receipt(steps=[
+        {"step": "storefront_access", "status": "passed", "reason": "storefront_loaded"},
+        {"step": "checkout", "status": "blocked", "reason": "challenge"},
+    ])
     assert receipt.checkout.status == "security_challenged_pre_address"
     assert receipt.cart.currency == "USD"
+    assert receipt.steps[0].step == "storefront_access"
+
+
+def test_receipt_accepts_truthful_required_selection_failure():
+    receipt = _receipt(
+        cart={"status": "selection_required"},
+        checkout={"status": "unavailable"},
+        steps=[{
+            "step": "add_to_cart",
+            "status": "failed",
+            "reason": "required_selection_unresolved",
+        }],
+    )
+    assert receipt.cart.status == "selection_required"
+    assert receipt.steps[0].reason == "required_selection_unresolved"
+
+
+def test_receipt_accepts_cart_item_not_observed_failure():
+    receipt = _receipt(
+        cart={"status": "unknown"},
+        checkout={"status": "unavailable"},
+        steps=[{
+            "step": "add_to_cart",
+            "status": "failed",
+            "reason": "cart_item_not_observed",
+        }],
+    )
+    assert receipt.cart.status == "unknown"
+    assert receipt.steps[0].reason == "cart_item_not_observed"
+
+
+def test_receipt_rejects_free_form_or_duplicate_journey_steps():
+    with pytest.raises(ValidationError):
+        _receipt(steps=[{"step": "checkout", "status": "passed", "reason": "https://secret"}])
+    with pytest.raises(ValidationError, match="must be unique"):
+        _receipt(steps=[
+            {"step": "checkout", "status": "passed", "reason": "checkout_reached"},
+            {"step": "checkout", "status": "failed", "reason": "checkout_route_missing"},
+        ])
 
 
 @pytest.mark.parametrize("value", [

@@ -254,7 +254,12 @@ class RefundMetrics:
 
 # API endpoints for metrics
 from fastapi import APIRouter, Depends
-from utils.auth import get_current_user, require_admin
+from utils.auth import ADMIN_ROLES, get_current_user, require_admin
+
+# The `admin` conjunct below is the CROSS-MERCHANT escape hatch: a caller with
+# no merchant_id of their own reads every merchant's refund figures. It stays
+# at ADMIN_ROLES (super_admin + admin) for exactly that reason -- the omission
+# being fixed is super_admin's, not staff's.
 
 metrics_router = APIRouter(prefix="/metrics/refunds", tags=["refund-metrics"])
 
@@ -269,7 +274,7 @@ async def get_refund_metrics(
     
     if not merchant_id:
         # Admin can view global stats
-        if current_user.get("role") != "admin":
+        if current_user.get("role") not in ADMIN_ROLES:
             from fastapi import HTTPException
             raise HTTPException(status_code=403, detail="Not authorized")
         merchant_id = None
@@ -286,7 +291,7 @@ async def get_refund_reason_breakdown(
     """Get refund breakdown by reason"""
     merchant_id = current_user.get("merchant_id")
     
-    if not merchant_id and current_user.get("role") != "admin":
+    if not merchant_id and current_user.get("role") not in ADMIN_ROLES:
         from fastapi import HTTPException
         raise HTTPException(status_code=403, detail="Not authorized")
     
@@ -302,7 +307,7 @@ async def get_refund_daily_trend(
     """Get daily refund trend"""
     merchant_id = current_user.get("merchant_id")
     
-    if not merchant_id and current_user.get("role") != "admin":
+    if not merchant_id and current_user.get("role") not in ADMIN_ROLES:
         from fastapi import HTTPException
         raise HTTPException(status_code=403, detail="Not authorized")
     

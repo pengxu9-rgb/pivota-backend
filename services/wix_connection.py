@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Dict
+from typing import Any, Dict, List
 from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
@@ -57,6 +57,97 @@ def coerce_wix_credential_blob(value: Any) -> Dict[str, Any]:
             except Exception:
                 return {}
     return {}
+
+
+# A Wix app instance id is a GUID. This class carries NEITHER SQL LIKE
+# wildcard: `%` and `_` are both excluded, so a shape-checked instance id can
+# be interpolated into a LIKE needle without escaping. `-` is kept because a
+# GUID needs it. A value that cannot be an instance id is refused before it
+# ever reaches the database.
+WIX_INSTANCE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{7,63}$")
+
+
+def is_wix_instance_id(value: Any) -> bool:
+    """True when `value` can be a Wix app instance id (and carries no wildcard)."""
+    return bool(WIX_INSTANCE_ID_RE.match(str(value or "").strip()))
+
+
+def stored_wix_instance_id(api_key: Any) -> str:
+    """The instance id inside a stored credential, or ``""`` for a bare key."""
+    blob = coerce_wix_credential_blob(api_key)
+    return str(blob.get("instance_id") or blob.get("wix_instance_id") or "").strip()
+
+
+async def find_wix_stores_by_instance_id(database: Any, instance_id: str) -> List[Dict[str, Any]]:
+    """EVERY active Wix store whose stored instance id is exactly `instance_id`.
+
+    The instance id lives inside the credential JSON, which SQLite and Postgres
+    cannot be asked to index the same way, so the `LIKE` only NARROWS the scan
+    and the exact comparison happens in Python — a substring match is never
+    allowed to resolve a store.
+
+    ALL matches are returned, never the first: `merchant_stores` carries no
+    uniqueness on the instance id, so both the receiver (which must refuse an
+    ambiguous delivery) and the connect route (which must refuse a claim on
+    another merchant's instance) need to see the whole set.
+    """
+    instance_id = str(instance_id or "").strip()
+    if not is_wix_instance_id(instance_id):
+        return []
+    rows = await database.fetch_all(
+        """
+        SELECT store_id, merchant_id, domain, api_key
+        FROM merchant_stores
+        WHERE platform = 'wix'
+          AND lower(COALESCE(status, 'active')) IN ('active', 'connected')
+          AND api_key LIKE :needle
+        """,
+        {"needle": f"%{instance_id}%"},
+    )
+    matches: List[Dict[str, Any]] = []
+    for row in rows or []:
+        store = dict(row)
+        if stored_wix_instance_id(store.get("api_key")) == instance_id:
+            matches.append(store)
+    return matches
+
+
+# Token keys `normalize_wix_api_key` prefers over `api_key`. An API-key connect
+# has just validated fresh auth material, so a stale OAuth token left in the
+# blob must not go on shadowing it.
+_WIX_SUPERSEDED_TOKEN_KEYS = ("access_token", "wix_access_token", "token")
+
+
+def merge_wix_credential(
+    existing: Any,
+    *,
+    api_key: str,
+    site_id: str = "",
+    instance_id: str = "",
+) -> str:
+    """What to persist in `merchant_stores.api_key` on an API-key (re)connect.
+
+    A bare key stays a bare key — byte-identical to what every writer produced
+    before the blob existed — unless an `instance_id` is being added. When the
+    stored credential IS already a blob it is merged into rather than replaced,
+    so a reconnect cannot erase the `instance_id` that `POST /webhooks/wix`
+    resolves the store by (or the `site_id` a reader may hold).
+    """
+    api_key = str(api_key or "")
+    blob = coerce_wix_credential_blob(existing)
+    instance_id = str(instance_id or "").strip()
+    if not blob and not instance_id:
+        return api_key
+    merged = dict(blob)
+    for key in _WIX_SUPERSEDED_TOKEN_KEYS:
+        merged.pop(key, None)
+    merged["api_key"] = api_key
+    site_id = str(site_id or "").strip()
+    if site_id:
+        merged["site_id"] = site_id
+    if instance_id:
+        merged["instance_id"] = instance_id
+    return json.dumps(merged)
 
 
 def _validate_wix_site_id(site_id: Any) -> str:

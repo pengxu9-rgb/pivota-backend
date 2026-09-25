@@ -9,7 +9,7 @@ with explicit portal memberships.
 from __future__ import annotations
 
 import secrets
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from sqlalchemy import Column, DateTime, Index, String, Table, Text, UniqueConstraint
@@ -348,6 +348,57 @@ async def get_active_membership_by_email(
             membership["identity"] = identity
             return membership
     return None
+
+
+def _as_utc(value: Optional[datetime]) -> Optional[datetime]:
+    if value is None:
+        return None
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
+async def has_active_membership_for_entity(
+    *,
+    email: str,
+    membership_type: str,
+    entity_id: str,
+    not_before: Optional[datetime] = None,
+) -> bool:
+    """Whether `email`'s active identity holds an active `membership_type` membership
+    for exactly `entity_id`. Unlike get_active_membership_by_email this is bound to one
+    entity, so a membership for some other agent/merchant never answers for this one.
+
+    `not_before` (the users row's created_at) refuses a membership last written before
+    that row existed. Identities and memberships outlive a deleted users row, and a
+    later signup with the same email reuses the identity (ensure_identity), so without
+    this a stranger re-registering a deleted account's email would inherit its access.
+    Every legitimate writer (registration, login, conversion, backfill) writes the
+    membership after the users row exists."""
+    if not entity_id:
+        return False
+    identity = await get_identity_by_email(email)
+    if not identity or identity.get("status") != AUTH_MEMBERSHIP_ACTIVE:
+        return False
+    row = await database.fetch_one(
+        auth_memberships.select().where(
+            (auth_memberships.c.identity_id == identity["identity_id"])
+            & (auth_memberships.c.membership_type == membership_type)
+            & (auth_memberships.c.entity_id == str(entity_id))
+            & (auth_memberships.c.status == AUTH_MEMBERSHIP_ACTIVE)
+        )
+    )
+    membership = record_to_dict(row)
+    if not membership:
+        return False
+    floor = _as_utc(not_before)
+    if floor is not None:
+        written = [
+            _as_utc(membership.get(key))
+            for key in ("created_at", "updated_at")
+            if membership.get(key) is not None
+        ]
+        if not written or max(written) < floor:
+            return False
+    return True
 
 
 async def record_identity_event(

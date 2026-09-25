@@ -114,8 +114,66 @@ def offer_market_availability(
     return MARKET_DOMESTIC if om == sm else MARKET_CROSS_BORDER
 
 
+# The one in-stock vocabulary. Exported because a second caller (the UCP probe's
+# variant selector) needs the SAME answer this module gives: two copies of this
+# set drift, and a drift here means one lane calls a variant buyable while the
+# other calls it dead.
+IN_STOCK_AVAILABILITY = frozenset({"in_stock", "instock", "available"})
+
+
 def _in_stock(availability: Any) -> bool:
-    return str(availability or "").strip().lower() in {"in_stock", "instock", "available"}
+    return str(availability or "").strip().lower() in IN_STOCK_AVAILABILITY
+
+
+# "THIS SELLER CANNOT SELL IT", spelled once. The ORDER vocabulary, and the other half of the one
+# above: IN_STOCK_AVAILABILITY is an explicit "yes", this is an explicit "no", and a value in
+# neither (`unknown`, NULL, empty) is no statement at all. Two orderings bind it:
+#   - offers.resolve's catalog arm (routes/agent_shop_gateway): its SQL ORDER BY, the `in_stock`
+#     flag it emits, and `_rank_offers_merit_first`, which reads that flag. (Internal offers are
+#     read the same way since #2221: their flag is the eligibility gate's verdict.)
+#   - agent_pdp_view.offers (services/agent_pdp_view_assembler.aggregate_offers), before the
+#     top-N cut, through `availability_is_known_unavailable` below.
+# It lived in the gateway until the second caller needed it; a service importing a router to
+# read one frozenset would be the wrong way round.
+#
+# NOT THE REPO'S RAW-STRING VOCABULARY. utils.availability_vocabulary owns "is this out of stock"
+# for raw platform/feed strings (phrases, schema.org IRIs, `discontinued`, `reserved`, ...). This
+# set is the literal subset SQL can bind (`= ANY(:unavailable)`) to read STORED catalog_offers
+# values, and it is only complete while those values are canonical. They are TODAY — prod
+# 2026-09-22, all 33,344 rows are in_stock / out_of_stock / `unknown` — but that is a measured
+# fact, not an enforced one: most writers emit those literals, and
+# services/external_offer_dual_write copies a seed's availability string as-is, so a raw
+# "sold out" landing there would rank as sellable. A test pins that every token here is out of
+# stock to the owner. Do not point a reader of raw strings at this set — use the owner.
+#
+# UNKNOWN IS NOT OUT OF STOCK. `unknown` (the column's server default), NULL, empty or any value
+# not in this set ranks WITH the in-stock offers, by price, and never behind them. Two reasons, both measured rather than preferred:
+#   1. Every lane already reports it that way: the seed lane maps `availability: "unknown"` to
+#      `in_stock: True`, and the catalog arm maps NULL to `in_stock: True`. A three-way rank (in
+#      stock > unknown > out of stock) could only be applied where the raw column survives, i.e.
+#      to that arm alone, and would then order offers by a distinction the flag on them does not
+#      show — and that the gateway's `best_offer` (PIVOTA-Agent offersToSignals, which reads the
+#      flag since PIVOTA-Agent#2240) could not reproduce.
+#   2. Absence of a stock statement is not evidence against a seller. Demoting it is the same
+#      error the gateway's verification tier refuses to make for an unchecked offer.
+# In prod on 2026-09-18 every live retailer offer said `in_stock` (1,178) or `out_of_stock` (86),
+# so the choice changes no row served today; it decides what the next feed with gaps gets.
+# (All unsuppressed catalog_offers the same day: in_stock 19,480, out_of_stock 1,197, unknown 682
+# — no other spelling.)
+#
+# NOT the buy pick's rule. `annotate_offer_buyability` above asks the positive question (is it
+# explicitly in stock?), so there an `unknown` offer loses to an in-stock one. That picks ONE offer
+# to present as the buy; this orders the list. They agree on every explicit value.
+OFFER_UNAVAILABLE_AVAILABILITIES: frozenset[str] = frozenset(
+    {"out_of_stock", "outofstock", "sold_out", "soldout", "unavailable"}
+)
+
+
+def availability_is_known_unavailable(availability: Any) -> bool:
+    """True only on an explicit statement that this seller cannot sell it now: an
+    ``availability`` in OFFER_UNAVAILABLE_AVAILABILITIES, trimmed and case-insensitive.
+    None, empty, ``unknown`` and any other value are False."""
+    return str(availability or "").strip().lower() in OFFER_UNAVAILABLE_AVAILABILITIES
 
 
 def annotate_offer_buyability(

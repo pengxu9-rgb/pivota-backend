@@ -20,7 +20,13 @@ CREATE TABLE IF NOT EXISTS webhook_events (
     headers JSONB,                            -- Request headers (for signature verification)
     
     -- Processing status
-    status VARCHAR(50) NOT NULL DEFAULT 'pending',  -- pending, processed, failed, ignored, duplicate
+    -- 'unmatched' is written by the Stripe handler for a signed event it
+    -- REFUSED to apply (cross-tenant block, or an amount that does not match the
+    -- order). It is terminal and has NO automated consumer — see the column
+    -- comment below. Only 'processed' and 'ignored' count as duplicates in
+    -- WebhookService.check_duplicate_event, so an 'unmatched' row reprocesses if
+    -- the event is redelivered.
+    status VARCHAR(50) NOT NULL DEFAULT 'pending',  -- pending, processed, failed, ignored, duplicate, unmatched
     processed_at TIMESTAMP WITH TIME ZONE,
     error_message TEXT,
     
@@ -67,6 +73,6 @@ CREATE TRIGGER trigger_update_webhook_events_updated_at
 -- Add comment
 COMMENT ON TABLE webhook_events IS 'Stores all incoming webhook events for idempotency, auditing, and debugging';
 COMMENT ON COLUMN webhook_events.event_id IS 'Unique external event ID from PSP';
-COMMENT ON COLUMN webhook_events.status IS 'Processing status: pending, processed, failed, ignored, duplicate';
+COMMENT ON COLUMN webhook_events.status IS 'Processing status: pending, processed, failed, ignored, duplicate, unmatched. "unmatched" = a signed event we permanently refused to apply (cross-tenant block or amount mismatch); it is terminal and nothing sweeps it, so it needs human follow-up from the accompanying alert. A possibly-transient refusal is NOT recorded here as terminal: the handler answers 503 so Stripe redelivers, and the row lands as "failed" until a redelivery succeeds.';
 COMMENT ON COLUMN webhook_events.signature_verified IS 'Whether the webhook signature was verified';
 

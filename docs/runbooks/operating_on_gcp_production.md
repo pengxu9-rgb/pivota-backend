@@ -100,6 +100,9 @@ gcloud run jobs create "$JOB" --project pivota-prod --region us-west1 \
   --image us-west1-docker.pkg.dev/pivota-shared/pivota/backend:latest \
   --service-account sa-worker@pivota-prod.iam.gserviceaccount.com \
   --network default --subnet default --vpc-egress all-traffic \
+  `# ^ if this job FETCHES FROM A MERCHANT, use --subnet pivota-crawl instead: the default` \
+  `# subnet egresses from 8.231.167.230, the payment-allowlisted address, and NAT port` \
+  `# exhaustion is per-IP. pivota-crawl egresses from 34.82.199.35.` \
   --set-secrets DATABASE_URL=DATABASE_URL:latest \
   --set-env-vars PIVOTA_ENV=production \
   --max-retries 0 --task-timeout 600s \
@@ -136,7 +139,7 @@ occur in the payload. Note that non-zero is not the container's OWN code —
 failure surfaces as 1 alike; that is why the helper prints gcloud's stderr on
 failure rather than discarding it.
 Reach for the raw form above when you need to change something it does not expose
-(`SECRETS`, `IMAGE`, `TASK_TIMEOUT`, `SERVICE_ACCOUNT` and `JOB_PREFIX` are
+(`SECRETS`, `IMAGE`, `TASK_TIMEOUT`, `SERVICE_ACCOUNT`, `JOB_PREFIX`, `NETWORK` and `SUBNET` are
 environment overrides).
 
 Three things that are easy to get wrong:
@@ -167,6 +170,57 @@ are how three of those ended up running old code against live secrets on 2026-08
 ```bash
 CONFIG=preserve infra/gcp/deploy_backend.sh prod <sha>
 ```
+
+The gateway is a separate service with its own script, and prod requires the **full 40-character**
+sha — a short sha matches no image tag in Artifact Registry:
+
+```bash
+CONFIG=preserve CONCURRENCY_LIMIT=20 MIN_INSTANCES=4 MAX_INSTANCES=20 bash infra/gcp/deploy_gateway.sh prod <full sha>
+```
+
+### Why the gateway command carries a shape prefix
+
+**`preserve` does not preserve the shape.** It keeps every environment variable and secret mount
+exactly as the running service has them — that is the whole reason it is the gateway's default — but
+it **REASSERTS** `--cpu`, `--memory`, `--concurrency`, `--min/--max-instances`, `--timeout`,
+`--ingress`, `--vpc-egress`, `--labels` and `--service-account` from the script itself on every
+run. So a deploy *without* the prefix silently pulls a hand-set shape back to the script's values.
+For prod that is **concurrency 80 / min 2 / max 20**: min and max are per-env constants, while 80 is
+a single default shared by staging and prod — which is why the `shape:` line tags it `(default)`
+rather than `(prod constant)`.
+
+That is not hypothetical. The **2026-09-15 pivota-pg CPU incident** was mitigated by setting the
+live gateway to **concurrency 20 / min 4 by hand** — and a bare `CONFIG=preserve
+infra/gcp/deploy_gateway.sh prod <sha>` is exactly the command that undoes it, while reporting
+success. If a mitigation is live on the gateway, every deploy until it is made permanent has to
+restate it.
+
+**Read the `shape:` line before the promote.** The script prints the three values and where each one
+came from immediately before it calls `gcloud run deploy`, and before the candidate takes traffic:
+
+```
+shape: concurrency=20 (CONCURRENCY_LIMIT) min-instances=4 (MIN_INSTANCES) max-instances=20 (MAX_INSTANCES)
+```
+
+**Read the tags in brackets, not the numbers.** A `(default)` or `(prod constant)` where you expected
+an override name means that variable was never read — you fat-fingered the prefix. The same command
+with `MAX_INSTANCES` misspelt prints:
+
+```
+shape: concurrency=20 (CONCURRENCY_LIMIT) min-instances=4 (MIN_INSTANCES) max-instances=20 (prod constant)
+```
+
+Every **number** is identical to the block above. One tag changed. That is the whole point: 20 *is*
+the prod constant, so `max-instances=20` cannot tell you whether your override landed — only
+`(MAX_INSTANCES)` versus `(prod constant)` can. Catch it here; once
+`deployed gateway -> ... (100% traffic)` prints, the wrong shape is already serving.
+
+**`CONCURRENCY_LIMIT` is the canonical name; `CONCURRENCY` is accepted as an alias.** Both reach
+`--concurrency` on the gateway, and setting them to different values is refused rather than resolved.
+Prefer `CONCURRENCY_LIMIT`: it is the spelling `deploy_backend.sh`, the proof-issuer job in
+`deploy-prod.yml`, and the runbook footer `prod-deploy-drift.yml` prints all use. Beware that in
+`deploy_backend.sh` the bare name `CONCURRENCY` means the **opposite** thing — there it is the
+internal per-env constant, not an override, and exporting it changes nothing.
 
 ## Railway: decommissioned as of 2026-08-25 (#1872)
 

@@ -12,7 +12,7 @@ import logging
 
 from db.database import database
 from db.payout_repo import PayoutRepo
-from utils.auth import get_current_user
+from utils.auth import EMPLOYEE_STAFF_ROLES, get_current_user
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +67,7 @@ async def list_all_payouts(
     Employees can see payouts across all merchants
     """
     # Verify employee access
-    if current_user.get("role") not in ["employee", "admin"]:
+    if current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Only employees can access this endpoint")
     
     try:
@@ -200,7 +200,7 @@ async def confirm_single_payout(
     """
     Confirm a single payout (uploaded -> paid).
     """
-    if current_user.get("role") not in ["employee", "admin"]:
+    if current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Only employees can confirm payouts")
     
     try:
@@ -225,7 +225,7 @@ async def confirm_bulk_payouts(
     Only payouts with status='uploaded' can be confirmed
     """
     # Verify employee access
-    if current_user.get("role") not in ["employee", "admin"]:
+    if current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Only employees can access this endpoint")
     
     try:
@@ -295,7 +295,7 @@ async def get_payout_dashboard(
     Get payout dashboard statistics for employee overview
     """
     # Verify employee access
-    if current_user.get("role") not in ["employee", "admin"]:
+    if current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Only employees can access this endpoint")
     
     try:

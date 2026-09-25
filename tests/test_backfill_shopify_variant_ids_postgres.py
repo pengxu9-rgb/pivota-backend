@@ -44,15 +44,15 @@ pytestmark = pytest.mark.skipif(
 
 DDL = """
 CREATE TABLE IF NOT EXISTS external_product_seeds (
-  id TEXT PRIMARY KEY,
-  market TEXT NOT NULL DEFAULT 'US',
-  tool TEXT NOT NULL DEFAULT '*',
-  destination_url TEXT NOT NULL,
+  id TEXT,
+  market TEXT DEFAULT 'US',
+  tool TEXT DEFAULT '*',
+  destination_url TEXT,
   canonical_url TEXT NULL,
   domain TEXT NULL,
-  seed_data JSONB NOT NULL DEFAULT '{}'::jsonb,
-  status TEXT NOT NULL DEFAULT 'active',
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  seed_data JSONB DEFAULT '{}'::jsonb,
+  status TEXT DEFAULT 'active',
+  updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 """
 
@@ -68,7 +68,24 @@ async def _db():
     was_connected = database.is_connected
     if not was_connected:
         await database.connect()
+    # The full Postgres gate shares one throwaway database across modules. Earlier tests
+    # leave minimal same-named seed tables; IF NOT EXISTS alone keeps that incompatible
+    # shape. Extend only the columns this fixture needs. Dropping/recreating the table
+    # instead poisons later modules whose lightweight seed INSERTs omit `id`.
     await database.execute(DDL)
+    for name, column_type in (
+        ("market", "TEXT DEFAULT 'US'"),
+        ("tool", "TEXT DEFAULT '*'"),
+        ("destination_url", "TEXT"),
+        ("canonical_url", "TEXT"),
+        ("domain", "TEXT"),
+        ("seed_data", "JSONB DEFAULT '{}'::jsonb"),
+        ("status", "TEXT DEFAULT 'active'"),
+        ("updated_at", "TIMESTAMPTZ DEFAULT NOW()"),
+    ):
+        await database.execute(
+            f"ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS {name} {column_type}"
+        )
     await database.execute("TRUNCATE external_product_seeds")
     yield database
     if not was_connected and database.is_connected:
@@ -182,12 +199,12 @@ async def test_the_write_refuses_a_double_encoded_row_instead_of_raising(_db) ->
     assert await _stamp(_db, "encoded", [{"shopify_variant_id": "11"}], stamp) is None
 
 
-async def test_a_fully_stamped_row_retires_but_a_partial_one_stays_eligible(_db) -> None:
-    """Retiring a partially-covered row would permanently strand its unstamped siblings."""
+async def test_a_fully_stamped_sole_row_is_rechecked_for_cart_proof(_db) -> None:
+    """Historical stamps lack sole-storefront proof; partial rows still need recovery."""
     await _insert(_db, "done", _snapshot({"title": "a", "shopify_variant_id": "1"}))
     await _insert(_db, "partial", _snapshot({"title": "a", "shopify_variant_id": "1"}, {"title": "b"}))
 
-    assert [r["id"] for r in await _select()] == ["partial"]
+    assert [r["id"] for r in await _select()] == ["done", "partial"]
 
 
 async def test_an_empty_canonical_url_falls_through_to_destination_url(_db) -> None:
@@ -224,7 +241,8 @@ async def test_like_metacharacters_in_the_domain_cannot_widen_the_cohort(_db) ->
 
 # ---------------------------------------------------------------------------- the write
 
-async def _stamp(db, seed_id: str, variants: List[Dict[str, Any]], updated_at: Any) -> Optional[str]:
+async def _stamp(db, seed_id: str, variants: List[Dict[str, Any]], updated_at: Any,
+                 cart_proof: Optional[Dict[str, Any]] = None) -> Optional[str]:
     from scripts.backfill_shopify_variant_ids import (
         STAMP_UPDATE_SQL,
         STOREFRONT_PLATFORM,
@@ -238,6 +256,7 @@ async def _stamp(db, seed_id: str, variants: List[Dict[str, Any]], updated_at: A
             "variants": json.dumps(variants),
             "platform": STOREFRONT_PLATFORM,
             "platform_source": STOREFRONT_PLATFORM_SOURCE,
+            "cart_proof": json.dumps(cart_proof),
             "updated_at": updated_at,
         },
     )
@@ -421,6 +440,36 @@ async def test_run_end_to_end_against_postgres_with_a_faked_storefront(_db) -> N
     after = await _seed_data(_db, "s1")
     assert after["snapshot"]["variants"][0]["shopify_variant_id"] == "41234567890123"
     assert after["snapshot"]["storefront_platform"] == "shopify"
+    assert after["snapshot"]["shopify_cart_proof"]["variant_id"] == "41234567890123"
+    assert after["snapshot"]["shopify_cart_proof"]["live_variant_count"] == 1
+
+
+async def test_a_multivariant_storefront_revokes_old_sole_cart_proof(_db) -> None:
+    """A prior sole proof cannot survive a fresh .js response with two live choices."""
+    from scripts.backfill_shopify_variant_ids import run
+
+    await _insert(_db, "s1", _snapshot(
+        {"title": "30ml", "shopify_variant_id": "11"},
+        shopify_cart_proof={"source": "products_js_v1", "variant_id": "11"},
+    ))
+
+    class _Resp:
+        status_code = 200
+        headers = {"content-type": "application/json"}
+
+        @staticmethod
+        def json():
+            return {"variants": [
+                {"id": 11, "title": "30ml", "options": ["30ml"]},
+                {"id": 22, "title": "50ml", "options": ["50ml"]},
+            ]}
+
+    class _Client:
+        async def get(self, url, **kwargs):
+            return _Resp()
+
+    await run(limit=10, domain=None, apply=True, client=_Client())
+    assert (await _seed_data(_db, "s1"))["snapshot"]["shopify_cart_proof"] is None
 
 
 async def test_a_dry_run_writes_nothing_but_reports_what_it_would_do(_db) -> None:
@@ -524,7 +573,7 @@ async def test_junk_in_shopify_variant_id_does_not_retire_a_row(_db) -> None:
     await _insert(_db, "obj", _snapshot({"title": "a", "shopify_variant_id": {"a": 1}}))
     await _insert(_db, "real", _snapshot({"title": "a", "shopify_variant_id": "41234567890123"}))
 
-    assert sorted(r["id"] for r in await _select()) == ["junk", "obj"]
+    assert sorted(r["id"] for r in await _select()) == ["junk", "obj", "real"]
 
 
 async def test_a_brands_dead_handles_do_not_abort_the_whole_sweep(_db) -> None:

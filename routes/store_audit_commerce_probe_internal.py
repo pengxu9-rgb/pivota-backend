@@ -91,6 +91,24 @@ class CheckoutRouteObservation(BaseModel):
     challenge_stage: Optional[Literal["pre_address", "pre_checkout", "checkout"]] = None
 
 
+class StoreJourneyStep(BaseModel):
+    step: Literal[
+        "storefront_access", "product_search", "product_detail",
+        "add_to_cart", "shipping_address", "checkout",
+    ]
+    status: Literal["passed", "failed", "blocked", "not_supported", "not_run"]
+    reason: Optional[Literal[
+        "storefront_loaded", "search_result_found", "search_unavailable",
+        "search_no_result", "pdp_confirmed", "pdp_unconfirmed",
+        "cart_item_added", "cart_control_unavailable", "cart_item_not_observed",
+        "required_selection_unresolved",
+        "checkout_reached",
+        "checkout_route_missing", "address_fields_filled",
+        "address_form_unavailable", "challenge", "login_required",
+        "network", "timeout", "not_attempted",
+    ]] = None
+
+
 class CommerceProbeReceipt(BaseModel):
     audit_run_id: str = Field(..., min_length=1, max_length=128)
     verification_run_id: str = Field(..., min_length=1, max_length=128)
@@ -103,6 +121,7 @@ class CommerceProbeReceipt(BaseModel):
     platform: Optional[CommercePlatform] = None
     checkout: Optional[CheckoutRouteObservation] = None
     cart: Optional[CartObservation] = None
+    steps: list[StoreJourneyStep] = Field(default_factory=list, max_length=6)
 
     @field_validator("audit_run_id", "verification_run_id", "worker_id", "probe_id")
     @classmethod
@@ -113,6 +132,9 @@ class CommerceProbeReceipt(BaseModel):
     def receipt_is_semantically_complete(self) -> "CommerceProbeReceipt":
         if self.verification_status == "succeeded" and not self.checkout:
             raise ValueError("successful checkout probe requires checkout evidence")
+        names = [step.step for step in self.steps]
+        if len(names) != len(set(names)):
+            raise ValueError("store journey steps must be unique")
         return self
 
 
@@ -160,6 +182,7 @@ def _terminal_evidence(receipt: CommerceProbeReceipt) -> dict:
         "outcome_code": receipt.outcome_code,
         "observed_at": receipt.observed_at.isoformat(),
         "probe_id": receipt.probe_id,
+        "steps": [step.model_dump(exclude_none=True) for step in receipt.steps],
     }
 
 
@@ -285,6 +308,26 @@ async def _persist_receipt(receipt: CommerceProbeReceipt) -> CommerceProbeReceip
         completed = resulting_status in {"pending", "exhausted_retries"}
     if not completed:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail={"error": "VERIFICATION_NOT_CLAIMED"})
+    # Dedicated Store Readiness runs are intentionally absent from visibility
+    # audit history, but still get a truthful terminal lifecycle in their
+    # owning table. Scheduled legacy probes point at other subject types and
+    # must not rewrite those audit results.
+    try:
+        from db.merchant_audit_runs import fetch_audit_run_by_id, record_audit_run_completed
+        parent = await fetch_audit_run_by_id(run_id=receipt.audit_run_id)
+        if (
+            parent
+            and parent.get("merchant_id") == merchant_id
+            and parent.get("subject_type") == "store_readiness"
+        ):
+            await record_audit_run_completed(
+                run_id=receipt.audit_run_id,
+                status="succeeded" if resulting_status == VERIFICATION_STATUS_SUCCEEDED else "failed",
+                report_jsonb={"store_readiness": evidence_jsonb},
+                error_message=None if resulting_status == VERIFICATION_STATUS_SUCCEEDED else (receipt.outcome_code or resulting_status),
+            )
+    except Exception:  # noqa: BLE001 - receipt state is already durable
+        pass
     capability = resolve_merchant_capability(
         merchant_id=merchant_id,
         evidence=await fetch_active_commerce_evidence(merchant_id=merchant_id),

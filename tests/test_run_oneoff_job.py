@@ -334,6 +334,42 @@ def test_create_carries_the_identity_image_and_vpc_route(tmp_path: Path) -> None
     assert r.flag(create, "--task-timeout") == "600s"
 
 
+def test_the_egress_subnet_is_overridable_and_defaults_to_the_payment_one(tmp_path: Path) -> None:
+    """MUTANT: hardcode `--subnet default` again.
+
+    prod has TWO NAT addresses. The `default` subnet egresses from 8.231.167.230, the address
+    payment partners allowlist; `pivota-crawl` egresses from 34.82.199.35. NAT port exhaustion
+    is per-IP, so a burst crawl on the payment address can starve payment egress even with
+    clean reputation, which is why anything fetching from a merchant must move.
+
+    Asserting on the recorded argv, not on the script's text: a flag that is constructed and
+    then never passed would satisfy a grep and still leave every crawl on the payment IP.
+    """
+    # One directory per run: `run()` records argv into <tmp_path>/calls.tsv, and `call()`
+    # demands exactly one matching invocation, so two runs sharing a directory collide.
+    def at(name: str, **env: str):
+        d = tmp_path / name
+        d.mkdir()
+        r = run(d, ["scripts/x.py"], **env)
+        return r, r.call("run", "jobs", "create")
+
+    plain, create = at("plain")
+    assert plain.flag(create, "--subnet") == "default", (
+        "the default must not move — every existing caller depends on it")
+    assert plain.flag(create, "--network") == "default"
+
+    crawl, create_crawl = at("crawl", SUBNET="pivota-crawl")
+    assert crawl.flag(create_crawl, "--subnet") == "pivota-crawl"
+    assert crawl.flag(create_crawl, "--network") == "default", (
+        "SUBNET alone must not move the network")
+    # The route to Cloud SQL must survive the move, or the job cannot reach the database.
+    assert crawl.flag(create_crawl, "--vpc-egress") == "all-traffic"
+
+    both, create_both = at("both", NETWORK="vpc-prod", SUBNET="pivota-crawl")
+    assert both.flag(create_both, "--network") == "vpc-prod"
+    assert both.flag(create_both, "--subnet") == "pivota-crawl"
+
+
 def test_the_database_guardrails_are_resupplied(tmp_path: Path) -> None:
     """A job inherits nothing — including the timeouts that bound a bad query.
 

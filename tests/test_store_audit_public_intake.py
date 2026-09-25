@@ -61,6 +61,19 @@ def db(monkeypatch):
         intake_module, "fetch_latest_route_evidence_for_domain", no_evidence)
     monkeypatch.setattr(
         intake_module, "fetch_latest_verification_for_domain", no_run)
+    # classify_run_pointer reads through db.merchant_audit_runs.database, a
+    # DIFFERENT handle from the one this fixture stubs — so without an
+    # explicit answer here the fence's verdict depends on suite state, and the
+    # test passes alone and fails in the full run. Say which case is modelled.
+    async def pointer_is_someone_elses(*, run_id):
+        from db.merchant_audit_runs import (
+            RUN_POINTER_ABSENT, RUN_POINTER_OTHER,
+        )
+        return RUN_POINTER_OTHER if run_id else RUN_POINTER_ABSENT
+
+    monkeypatch.setattr(
+        intake_module, "classify_run_pointer", pointer_is_someone_elses,
+    )
     monkeypatch.setattr(intake_module, "fetch_route_for_domain", no_route)
     monkeypatch.setattr(intake_module, "upsert_execution_route", fake_upsert)
     monkeypatch.setattr(intake_module, "enqueue_verification_run", fake_enqueue)
@@ -196,6 +209,9 @@ def test_expired_positive_is_stale_not_negative_and_reprobes(db, monkeypatch):
     assert db["upsert"] == []
     assert len(db["enqueue"]) == 1
     assert db["enqueue"][0]["execution_route_id"] == "route-real"
+    # STILL "audit-9": this route points at a run the fake DB answers for, so
+    # classify_run_pointer returns OTHER and the funnel producer declines —
+    # the merchant's own pointer is preserved exactly as it was pre-#2019.
     assert db["enqueue"][0]["audit_run_id"] == "audit-9"
 
 

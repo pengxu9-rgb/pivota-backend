@@ -56,6 +56,64 @@ _SOURCES: Dict[str, CommerceSourceDefinition] = {
     "wix": CommerceSourceDefinition("wix", "storefront", _CATALOG_CAPABILITIES),
     "woocommerce": CommerceSourceDefinition("woocommerce", "storefront", _CATALOG_CAPABILITIES),
     "bigcommerce": CommerceSourceDefinition("bigcommerce", "storefront", _CATALOG_CAPABILITIES),
+    "cafe24": CommerceSourceDefinition("cafe24", "storefront", _CATALOG_CAPABILITIES),
+    # Phase 1 is an authenticated native catalog pull. Commerce telemetry is
+    # already coverable by the universal collectors, but no Magento-native
+    # catalog-event, quote, or checkout connector is claimed yet.
+    "magento": CommerceSourceDefinition(
+        "magento",
+        "storefront",
+        CommerceSourceCapabilities(catalog_pull=True),
+    ),
+    # SCAPI Shopper Search/Products is a native, site-scoped sellable catalog
+    # source. Checkout remains unclaimed. Commerce lifecycle telemetry is a
+    # separate signed cartridge/outbox contract; this registry has no commerce-
+    # telemetry flag, and catalog_events intentionally remains false.
+    "salesforce_commerce_cloud": CommerceSourceDefinition(
+        "salesforce_commerce_cloud",
+        "storefront",
+        CommerceSourceCapabilities(catalog_pull=True),
+    ),
+    "shopline": CommerceSourceDefinition(
+        "shopline", "storefront", CommerceSourceCapabilities(catalog_pull=True)
+    ),
+    "shoplazza": CommerceSourceDefinition(
+        "shoplazza", "storefront", CommerceSourceCapabilities(catalog_pull=True)
+    ),
+    # Squarespace ships COMMERCE TELEMETRY only: a signed webhook receiver and
+    # an Orders-API reconciliation sweep that feed the canonical ledger. No
+    # catalogue capability is claimed — nothing in this repo reads Squarespace's
+    # Products API, so `catalog_pull` here would make an empty product sync
+    # report success. Telemetry is not a flag this registry models (the SFCC
+    # cartridge is the same shape), so every capability stays false and the
+    # guidance says why.
+    "squarespace": CommerceSourceDefinition(
+        "squarespace",
+        "storefront",
+        CommerceSourceCapabilities(),
+        "catalog",
+        "Squarespace is connected for commerce telemetry only (order, refund, "
+        "and cancellation events). No Squarespace catalogue adapter exists yet; "
+        "connect a merchant-authorized catalogue feed before running Commerce "
+        "Index product sync.",
+    ),
+    # Webflow ships COMMERCE TELEMETRY only: a webhook receiver and an
+    # Orders-list reconciliation sweep that feed the canonical ledger. No
+    # catalogue capability is claimed — nothing in this repo reads Webflow's CMS
+    # or Products API, so `catalog_pull` here would make an empty product sync
+    # report success instead of an honest blocker. Telemetry is not a flag this
+    # registry models (Squarespace and the SFCC cartridge are the same shape),
+    # so every capability stays false and the guidance says why.
+    "webflow": CommerceSourceDefinition(
+        "webflow",
+        "storefront",
+        CommerceSourceCapabilities(),
+        "catalog",
+        "Webflow is connected for commerce telemetry only (order, payment, and "
+        "refund events). No Webflow catalogue adapter exists yet; connect a "
+        "merchant-authorized catalogue feed before running Commerce Index "
+        "product sync.",
+    ),
     # Square is retained because the existing sync endpoint accepts its credentials;
     # its fetch adapter can be enabled independently of this policy contract.
     "square": CommerceSourceDefinition("square", "storefront", _CATALOG_CAPABILITIES),

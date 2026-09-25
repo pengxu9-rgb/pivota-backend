@@ -79,12 +79,15 @@ def db_url():
     # The real table, from the real Table definition — never a stub. A stub whose
     # column types drift is exactly the false confidence these gates exist to stop.
     metadata.tables["agent_pdp_view"].create(engine, checkfirst=True)
-    # ...but db/catalog.py's Table is BEHIND the migrations: evidence_profile,
-    # required_disclaimers, bullet_points and usage_scenarios exist only in
-    # db/migrations. Layer every migration that touches agent_pdp_view on top, in
-    # version order, so the fixture is the shipped shape rather than the model's
-    # stale idea of it. Failures are tolerated: several of these files also touch
-    # tables this private database does not have.
+    # ...and then layer every migration that touches agent_pdp_view on top, in
+    # version order. Since db/catalog.py was realigned to the migrations these
+    # are all no-ops HERE — this fixture drops and recreates its own private
+    # database above, so the table is always built by the CURRENT model. Kept
+    # anyway, cheaply: it is what makes the fixture the shipped shape rather
+    # than the model's word for it, which is the whole claim the file rests on,
+    # and it fails loudly the day the two diverge again. Do not read it as
+    # evidence the model is behind. Failures are tolerated: several of these
+    # files also touch tables this private database does not have.
     import re as _re
     from sqlalchemy import text as _text
 

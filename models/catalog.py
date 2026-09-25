@@ -99,6 +99,10 @@ class PivotQueryRequest(BaseModel):
     market: str = "US"
     limit: int = Field(default=20, ge=1, le=100)
     include_external: bool = True
+    # Canonical catalog mode: product identity must be a public sig_*. Supply
+    # provenance remains offer-scoped, so this disables the legacy direct-seed
+    # result lane without excluding external referral offers in catalog_offers.
+    canonical_entities_only: bool = False
     include_incentives: bool = True
     payment_context: Optional[PivotPaymentContext] = None
     # ADR-007 SLICE 3: the intent signal threaded down from the gateway. When the
@@ -108,6 +112,15 @@ class PivotQueryRequest(BaseModel):
     # lane MAY contribute when INDEX_ELIGIBLE_RECALL is on. The flag still gates
     # whether the lane runs at all; this only narrows WHEN it may contribute.
     strict_serving_mode: bool = False
+    # The brand anchor the CALLER already resolved, threaded down so recall and the
+    # gateway's post-filter agree. Before this existed both sides independently called
+    # `_category_brand_anchor_terms`, so a caller that resolved a brand the recall SQL
+    # could not was left post-filtering a candidate set that never contained the brand.
+    # None means "decide it yourself" and preserves every other caller's behaviour.
+    # Bounded because POST /v1/pivot/query binds this model as the request body directly, and
+    # every term becomes three more LIKE predicates over the catalog join. The service clamps
+    # again — this is the outer bound, not the only one.
+    brand_anchor_terms: Optional[List[str]] = Field(default=None, max_length=8)
 
 
 class PivotPricing(BaseModel):
@@ -214,6 +227,7 @@ class MerchantNode(BaseModel):
 
 class ProductNode(BaseModel):
     product_key: Optional[str] = None
+    pivota_signature_id: Optional[str] = None
     source_product_id: Optional[str] = None
     title: Optional[str] = None
     description: Optional[str] = None
@@ -264,6 +278,8 @@ class SkuNode(BaseModel):
 
 class OfferNode(BaseModel):
     offer_id: str
+    merchant_id: Optional[str] = None
+    merchant_name: Optional[str] = None
     catalog_track: str
     truth_tier: str
     readiness_tier: str

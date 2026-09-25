@@ -34,9 +34,18 @@ DEGRADATION IS NEVER SILENT (audit F3):
   * `unverified` — timed out, blocked, or not a storefront we can read. Keep the snapshot, but the
                    caller must demote it and must not return it as rank 1.
 
-REQUEST-PATH TRAFFIC ON THE SHARED CRAWL IP. This is the primary consumer of the egress isolation
-in §3.2, so every fetch goes through `crawl_politeness` with the BOUNDED wait — never `max_wait=0`.
-An unbounded pace wait here would be #1854's P1 re-introduced on a live path.
+REQUEST-PATH TRAFFIC LEAVES BY THE PAYMENT ADDRESS, NOT THE CRAWL ONE. This paragraph used to
+claim the opposite — "the shared crawl IP" — and that was never true of the request path. Every
+caller of this module on a request runs inside `web`, and `web` is on the `default` subnet, whose
+NAT holds 8.231.167.230, the address payment partners allowlist. `pivota-crawl` and its
+34.82.199.35 belong to `catalog-intelligence` and to one-off jobs that pass SUBNET=pivota-crawl.
+So a fetch from here shares IP reputation AND the NAT port pool with the payment path, and port
+exhaustion is per-IP.
+
+That is why both request-path lanes are now fenced by default — `verify_offers` below and
+`checkout_preflight` — and why arming either is a deliberate act rather than a flag flip. Every
+fetch still goes through `crawl_politeness` with the BOUNDED wait, never `max_wait=0`; an
+unbounded pace wait here would be #1854's P1 re-introduced on a live path.
 """
 
 from __future__ import annotations
@@ -65,6 +74,14 @@ logger = logging.getLogger(__name__)
 
 VERIFIED = "verified"
 UNVERIFIED = "unverified"
+#: Reason returned when a `cache_only` caller misses. Exported because `checkout_preflight`
+#: branches on it to tell "nobody warmed this URL" from "the merchant did not answer", and a bare
+#: literal compared across a module boundary is a coupling nobody can see.
+NO_CACHED_EVIDENCE = "no_cached_evidence"
+#: Returned when the offer carries no `/products/<handle>`-shaped url to ask about. Exported for
+#: the same reason: `checkout_preflight` must be able to tell a no-contact refusal from a merchant
+#: one, and this is decided before the cache is even read.
+NO_VERIFIABLE_URL = "no_verifiable_url"
 GONE = "gone"
 
 _DEFAULT_TOP_K = 3
@@ -349,11 +366,25 @@ def _target(offer: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
 
 
 async def _check_one(
-    offer: Dict[str, Any], *, max_wait: Optional[float] = None
+    offer: Dict[str, Any], *, max_wait: Optional[float] = None, cache_only: bool = False
 ) -> Verdict:
+    """`cache_only` FORBIDS this call from touching a merchant. It is an EGRESS fence, not a
+    performance hint, and the caller that sets it cannot be made to egress by any answer here.
+
+    prod runs two NAT addresses: `default` holds 8.231.167.230, the address payment partners
+    allowlist, and `pivota-crawl` holds 34.82.199.35. Every user-facing service — `web` included,
+    which is where `checkout_preflight` runs — is on `default`. So a merchant fetch from the
+    request path leaves by the payment address, and NAT port exhaustion is per-IP, which means a
+    burst of them can starve payment egress even with clean reputation.
+
+    A cache miss under this flag answers `no_cached_evidence`, which is deliberately NOT the same
+    as `_target` failing or a merchant refusing. The caller must be able to tell "nobody has asked
+    this merchant yet" apart from "we asked and did not get an answer", because those two produce
+    the same BLOCK and completely different follow-up work.
+    """
     js_url, variant_id = _target(offer)
     if not js_url:
-        return Verdict(UNVERIFIED, "no_verifiable_url")
+        return Verdict(UNVERIFIED, NO_VERIFIABLE_URL)
 
     # S3: `gone` DELETES a merchant from the shortlist, so it may only be concluded from positive
     # evidence that this is a Shopify storefront. `/products/<slug>` in a path is a URL SHAPE, not
@@ -364,6 +395,11 @@ async def _check_one(
     shopify_evidenced = storefront_is_shopify(seed.get("seed_data") or seed)
 
     doc = await _cache_get(_cache_key(js_url))
+    if doc is None and cache_only:
+        # The ONLY early return between here and the fetch. Everything below this line is the
+        # egress path, so the fence has to sit above all of it — including the politeness and
+        # robots calls, which are themselves outbound requests to the merchant's host.
+        return Verdict(UNVERIFIED, NO_CACHED_EVIDENCE)
     if doc is None:
         try:
             # S1: the gate is given the CALLER'S remaining budget, not its own 10s default.
@@ -448,7 +484,19 @@ async def _check_one(
     # not an error — a JPY shop and a USD-presentment offer are both correct — it simply means
     # this source cannot speak to that offer's price.
     host = crawl_politeness.host_of(js_url)
-    shop_currency = await _shop_currency(host) if host else None
+    # THE FENCE APPLIES HERE TOO, and the first cut of it did not — review proved a cache HIT
+    # still fetched `robots.txt` and `/meta.json` from the merchant, from `web`, on the payment
+    # NAT. `_shop_currency` keys a DIFFERENT cache (`lov:cur:{host}`), so a warm document says
+    # nothing about whether that one is warm, and its refresh is fire-and-forget — it escapes the
+    # caller's `wait_for` and outlives the HTTP response. With 8 asks per resolve against
+    # deliberately DISTINCT hosts, one request could emit 16 outbound merchant requests.
+    #
+    # Skipping it costs the preflight NOTHING: `checkout_preflight` pins `price_verified=False`
+    # at the pass-through whatever this says, because a shop-currency inference is not a quote
+    # from the merchant's checkout. So under the fence we decline to infer rather than decline to
+    # answer — `comparable` goes False, which is exactly what it already was for every shop whose
+    # currency we had not cached.
+    shop_currency = await _shop_currency(host) if host and not cache_only else None
     offer_currency = str(offer.get("currency") or "").strip().upper() or None
     comparable = bool(
         live is not None and shop_currency and offer_currency and shop_currency == offer_currency
@@ -464,11 +512,25 @@ async def _check_one(
     )
 
 
+def request_path_egress_allowed() -> bool:
+    """May a REQUEST-PATH lane in this process fetch a merchant? Default NO.
+
+    Separate from `checkout_preflight`'s own flag on purpose: these are two lanes with different
+    owners, different populations and different blast radii, and one switch that opened both would
+    make arming the cheap one silently arm the expensive one. Both default closed.
+
+    Read per call so it can be shut off on a running service without a deploy.
+    """
+    raw = str(os.getenv("LIVE_OFFER_VERIFICATION_ALLOW_REQUEST_PATH_EGRESS", "")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 async def verify_offers(
     offers: List[Dict[str, Any]],
     *,
     top_k: Optional[int] = None,
     deadline_s: Optional[float] = None,
+    cache_only: Optional[bool] = None,
 ) -> Dict[int, Verdict]:
     """Verify the first `top_k` offers in parallel within `deadline_s`. Keyed by list index.
 
@@ -490,8 +552,13 @@ async def verify_offers(
     # The gate is handed the BATCH budget, not its own 10s default. `await_slot` refuses before
     # reserving, so a host that cannot be served inside this turn says so immediately instead of
     # consuming a slot it will be cancelled out of.
+    # `None` means "ask the flag", so an explicit False from a lane that KNOWS it may crawl (a
+    # batch on `pivota-crawl`) still works, and the request path gets the closed default without
+    # every caller having to remember it.
+    fenced = (not request_path_egress_allowed()) if cache_only is None else bool(cache_only)
     tasks = {
-        asyncio.ensure_future(_check_one(o, max_wait=budget)): i for i, o in targets
+        asyncio.ensure_future(_check_one(o, max_wait=budget, cache_only=fenced)): i
+        for i, o in targets
     }
 
     # `asyncio.wait`, not `wait_for(gather(...))`. A gather that times out cancels EVERY task, so
@@ -541,8 +608,17 @@ def apply_verdicts(
     kept: List[Tuple[int, Dict[str, Any]]] = []
     for index, offer in enumerate(offers):
         verdict = verdicts.get(index)
-        if verdict is None:
-            # Never checked (outside top-K). Not a claim either way.
+        if verdict is None or verdict.reason == NO_CACHED_EVIDENCE:
+            # Never checked. Not a claim either way — so it is NOT stamped, exactly as an offer
+            # outside top-K is not stamped.
+            #
+            # `no_cached_evidence` belongs here and not below. Review found it taking the
+            # `unverified` path, which stamps `stock_verified: false`,
+            # `verification_confidence: "unverified"`, `rank_one_unverified: true` and nulls
+            # `expected_item_total` — an agent-visible downgrade of every offer, caused by OUR
+            # cold cache, on a flag whose name says "enabled". "Nobody asked" is not "we asked
+            # and got nothing", which is the same distinction the preflight draws between
+            # not_yet_checked and could_not_ask_merchant.
             kept.append((2, offer))
             continue
         if verdict.status == GONE:

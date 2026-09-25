@@ -1,0 +1,131 @@
+{
+  "version": 1,
+  "input_basis": "Historical Meitu US/SG exports dated 2026-09-04; candidate sellers from stored Sept 11 review. This is a test matrix, not evidence of current assortment, matching lines/shades, shipping, or successful ingestion. The pyunkang_yul_two_us_retailers row is NOT Meitu-derived: it carries no brand_id or roster, and exists to prove the two-retailer lane while the lip cohort is blocked.",
+  "cases": [
+    {
+      "case_id": "flower_us_native_variants",
+      "brand_id": 518,
+      "roster": "meitu_us_2026_09_04/brands.tsv",
+      "accepted_brands": [
+        "Flower Beauty",
+        "FLOWER Beauty",
+        "Flower Beauty (Drew Barrymore)"
+      ],
+      "market": "US",
+      "currency": "USD",
+      "seller_hosts": [
+        "flowerbeauty.com"
+      ],
+      "inci_source": "brand_official",
+      "lane": "curated_brand_queue",
+      "source_role": "brand_official"
+    },
+    {
+      "case_id": "stila_us_lip_category",
+      "brand_id": 469,
+      "roster": "meitu_us_2026_09_04/brands.tsv",
+      "accepted_brands": [
+        "Stila",
+        "stila",
+        "stila cosmetics"
+      ],
+      "market": "US",
+      "currency": "USD",
+      "seller_hosts": [
+        "stilacosmetics.com"
+      ],
+      "inci_source": "brand_official",
+      "lane": "curated_brand_queue",
+      "source_role": "brand_official"
+    },
+    {
+      "case_id": "apieu_two_us_retailers",
+      "brand_id": 531,
+      "roster": "meitu_sg_2026_09_04/meitu_sg_products.csv",
+      "roster_product_id": "531001_APAC",
+      "accepted_brands": [
+        "A'PIEU",
+        "APIEU",
+        "Apieu"
+      ],
+      "market": "US",
+      "currency": "USD",
+      "seller_hosts": [
+        "asianbeautyessentials.com",
+        "eyurs.com"
+      ],
+      "inci_source": "reseller_listing",
+      "lane": "curated_brand_queue",
+      "source_role": "retailer",
+      "note": "Source extraction and local plans proven, including same GTIN and distinct native seller variants. Post-deployment canonical attachment, search/PDP/offers visibility and idempotent apply remain pending. Brand selected from SG roster; this case tests US retailers, not SG delivery.",
+      "target_product": "A'PIEU Honey & Milk Lip Oil (5g)",
+      "target_gtin": "8809530070499",
+      "observed_source_variants": {
+        "asianbeautyessentials.com": "43603819692287",
+        "eyurs.com": "41807436316855"
+      },
+      "discovery_evidence": "Fresh public products.json/product.js observations 2026-09-12; complete feeds 677/434 products, selected A'PIEU products 17/3, USD at both sellers."
+    },
+    {
+      "case_id": "vely_sg_large_retailer",
+      "brand_id": 507,
+      "roster": "meitu_sg_2026_09_04/meitu_sg_products.csv",
+      "roster_product_id": "201961_APAC",
+      "accepted_brands": [
+        "VELY VELY",
+        "Vely Vely"
+      ],
+      "market": "SG",
+      "currency": "SGD",
+      "seller_hosts": [
+        "cocomo.sg"
+      ],
+      "inci_source": "reseller_listing",
+      "lane": "onboard_external_brand_from_crawl",
+      "source_role": "retailer",
+      "note": "Use full retailer scan and independently validate SG offer eligibility. US-only curated queue must reject this target market."
+    },
+    {
+      "case_id": "3ce_sg_non_shopify",
+      "brand_id": 499,
+      "roster": "meitu_sg_2026_09_04/meitu_sg_products.csv",
+      "roster_product_id": "201904_APAC",
+      "accepted_brands": [
+        "3CE"
+      ],
+      "market": "SG",
+      "currency": "SGD",
+      "seller_hosts": [
+        "stylekorean.com"
+      ],
+      "inci_source": "reseller_listing",
+      "lane": "reviewed_retailer_extract_then_market_aware_crawl_ingest",
+      "source_role": "retailer",
+      "note": "Candidate acceptance target only: retailer protocol, present SGD pricing and SG delivery must be freshly proven. If retailer cannot provide the target, report unsupported; do not convert currency or call this case passed."
+    },
+    {
+      "case_id": "pyunkang_yul_two_us_retailers",
+      "accepted_brands": [
+        "Pyunkang Yul"
+      ],
+      "market": "US",
+      "currency": "USD",
+      "seller_hosts": [
+        "eyurs.com",
+        "ohlolly.com"
+      ],
+      "inci_source": "reseller_listing",
+      "lane": "curated_brand_queue",
+      "source_role": "retailer",
+      "required_category_prefix": "beauty/skincare/cleanse/",
+      "target_product": "Pyunkang Yul Deep Clear Cleansing Balm",
+      "target_gtin": "08809486681497",
+      "note": "Proves the curated two-retailer LANE, not Meitu lip coverage: this is a cleanser, outside the lip-only Meitu cohort, and declares required_category_prefix beauty/skincare/cleanse/ (the shelf both hosts' merchant product types resolve to) rather than being admitted under the lip shelf. It exists because case 2 is blocked twice over: asianbeautyessentials.com was first observed refusing TLS at 2026-09-15T04:39Z and was still refusing at 2026-09-16T01:19Z, and the A'PIEU lip oil publishes no INCI at eyurs.com, so no beauty_sku_ingredients row is written and inci_source cannot be a stored fact there. The vendor cohort must be narrowed with --only-gtin 8809486681497: a Pyunkang Yul run selects 10 products at eyurs and 28 at ohlolly, of which 7 and 3 carry a merchant product_type this taxonomy does not map (Cleansers, Moisturizers, Sheet Masks, Cotton Pads, Hair Conditioner, Exfoliator, Accessories), so the whole cohort lands category_unresolved and apply refuses it over products this case never wanted. Post-ingest canonical attachment, search/PDP/offer visibility and idempotent apply remain pending here exactly as for the other cases.",
+      "discovery_evidence": "Fresh public /products.json observations 2026-09-16 on SUBNET=pivota-crawl, image 3ad4f857 (jobs oneoff-28060-25660, oneoff-28467-16408, oneoff-29088-24940): eyurs.com 434 products, ohlolly.com 510, both Shopify and native USD, vendor spelled 'Pyunkang Yul' at both. The same barcode 08809486681497 was obtained at each host via the lane's own GTIN path (feed variant barcode, else product .js recovery), and an INCI list is published at both (868 chars eyurs / 869 ohlolly) via the lane's own extractors. Scope of that sweep: of ten probed US retailers only eyurs/sokoglam/ohlolly serve /products.json (jolse, stylekorean, beautynetkorea 404; yesstyle 403; kbeautyoutlet, ibuybeauti do not resolve); those three share 12 normalised titles across ~1,500 products and none of the 12 has a lip product_type. Title-level intersection is discovery only, never identity. Phase 1 dry-runs 2026-09-16 (image c662d874, jobs oneoff-12481-16589 / oneoff-12818-2528) read 434/510 products, selected 10/28, recovered every GTIN, and planned the target at BOTH hosts with the same content_key ck_d70f720d8ae203f788b801efdee569bb, leaf beauty/skincare/cleanse/cleanser and one merchant-issued variant each, now recorded in observed_source_variants. A shared content_key at plan time is deterministic from brand/name/GTIN and is NOT proof of database-level product_group convergence, which apply decides.",
+      "observed_source_variants": {
+        "eyurs.com": "41793713995959",
+        "ohlolly.com": "40825422381214"
+      }
+    }
+  ]
+}

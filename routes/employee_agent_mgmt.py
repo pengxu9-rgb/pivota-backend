@@ -4,16 +4,27 @@ Handles agent CRUD operations for employees
 """
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
-from utils.auth import get_current_user
+from utils.auth import EMPLOYEE_STAFF_ROLES, get_current_user
+from db.agents import evict_agent_auth_cache
 from db.database import database
+from routes.agent_account import (
+    AgentKeyNotFoundError,
+    AgentNotFoundError,
+    KeyTableUnresolvedError,
+    MultiKeyUnsupportedError,
+    issue_additional_agent_key,
+    list_agent_keys,
+    reset_agent_primary_api_key,
+    revoke_agent_key,
+    rotate_agent_key,
+)
 import uuid
 import secrets
 import random
 import logging
-import json as json_module
 
 logger = logging.getLogger(__name__)
 
@@ -58,25 +69,7 @@ def resolve_agent_display_name(agent: dict) -> str:
     return "Unknown Agent"
 
 
-def parse_json_field(value):
-    """Safely parse JSON field - handles both string and already-parsed JSON"""
-    if isinstance(value, list):
-        return value
-    if isinstance(value, str):
-        try:
-            return json_module.loads(value)
-        except:
-            return []
-    return []
-
 # ============== Models ==============
-
-class CreateAgentRequest(BaseModel):
-    name: str
-    email: EmailStr
-    company: str
-    use_case: str
-    expected_volume: Optional[int] = 100
 
 class UpdateAgentRequest(BaseModel):
     name: Optional[str] = None
@@ -122,7 +115,7 @@ async def get_all_agents(
     current_user: dict = Depends(get_current_user)
 ):
     """Get all agents (Employee only) with metrics filtered by date_range"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -139,10 +132,15 @@ async def get_all_agents(
         where_condition = ""
         params = {}
         
-        if status:
-            where_condition = "WHERE a.status = :status"
-            params["status"] = status
-        
+        # agents has no status column; is_active is the state auth enforces (NULL = active).
+        if status == "active":
+            where_condition = "WHERE COALESCE(a.is_active, TRUE) = TRUE"
+        elif status == "inactive":
+            where_condition = "WHERE a.is_active = FALSE"
+        elif status:
+            # Nothing else is representable (there is no "suspended" state to filter on).
+            where_condition = "WHERE FALSE"
+
         query = f"""
             SELECT 
                 a.*,
@@ -191,6 +189,7 @@ async def get_all_agents(
             api_key = agent_dict.get("api_key") or ""
             api_key_prefix = api_key[:10] + "..." if len(api_key) > 10 else None
             
+            is_active = agent_dict.get("is_active") is not False
             formatted_agents.append({
                 "agent_id": agent_dict.get("agent_id"),
                 # Keep both fields for frontend compatibility
@@ -201,8 +200,8 @@ async def get_all_agents(
                 "agent_type": agent_dict.get("agent_type") or "Generic",
                 "company": agent_dict.get("company"),
                 "api_key_prefix": api_key_prefix,
-                "status": agent_dict.get("status") or "active",
-                "is_active": (agent_dict.get("status") or "active") == "active",
+                "status": "active" if is_active else "inactive",
+                "is_active": is_active,
                 "created_at": str(agent_dict.get("created_at")) if agent_dict.get("created_at") else None,
                 "last_active": str(agent_dict.get("last_active")) if agent_dict.get("last_active") else None,
                 "request_count": agent_dict.get("request_count") or 0,
@@ -229,7 +228,7 @@ async def get_agent_details(
     current_user: dict = Depends(get_current_user)
 ):
     """Get detailed agent information (Employee only)"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -265,14 +264,8 @@ async def get_agent_details(
         )
         merchant_count = dict(merchant_count_result).get("count", 0) if merchant_count_result else 0
         
-        # Phase 2: Get API keys
-        api_keys = await database.fetch_all(
-            """SELECT key_id, key_prefix, scopes, is_active, created_at, expires_at, last_used_at
-               FROM agent_api_keys
-               WHERE agent_id = :agent_id AND is_active = true
-               ORDER BY created_at DESC""",
-            {"agent_id": agent_id}
-        )
+        # Phase 2: the agent's active keys, from the table auth reads (not always agent_api_keys).
+        api_keys = await list_agent_keys(agent_id, active_only=True)
         
         # Phase 2: Get protocols
         protocols = await database.fetch_all(
@@ -297,7 +290,9 @@ async def get_agent_details(
                 # Prefix only. The employee console never needs the secret, and rows written
                 # since the hash-only change carry a redacted marker here anyway.
                 "api_key": _mask_agent_api_key(agent.get("api_key")),
-                "status": agent.get("status") or "active",
+                # agents has no status column; is_active is what auth enforces (NULL = active).
+                "status": "active" if agent.get("is_active") is not False else "inactive",
+                "is_active": agent.get("is_active") is not False,
                 "agent_type": agent.get("agent_type"),  # [Phase 6.2] Include agent_type
                 "created_at": agent.get("created_at"),
                 "last_active": agent.get("last_active"),
@@ -318,19 +313,7 @@ async def get_agent_details(
                     for mc in merchant_connections
                 ],
                 # Phase 2: Include API keys and protocols
-                "api_keys": [
-                    {
-                        "key_id": dict(k).get("key_id"),
-                        "key_prefix": dict(k).get("key_prefix"),
-                        "scopes": parse_json_field(dict(k).get("scopes")),
-                        "ip_whitelist": parse_json_field(dict(k).get("ip_whitelist")),
-                        "is_active": dict(k).get("is_active"),
-                        "created_at": str(dict(k).get("created_at")) if dict(k).get("created_at") else None,
-                        "expires_at": str(dict(k).get("expires_at")) if dict(k).get("expires_at") else None,
-                        "last_used_at": str(dict(k).get("last_used_at")) if dict(k).get("last_used_at") else None
-                    }
-                    for k in api_keys
-                ],
+                "api_keys": api_keys,
                 "protocols": [
                     {
                         "id": dict(p).get("id"),
@@ -357,7 +340,7 @@ async def get_agent_calls(
     current_user: dict = Depends(get_current_user)
 ):
     """Get agent API call logs"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -405,68 +388,25 @@ async def get_agent_calls(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get calls: {str(e)}")
 
+# RETIRED (501). This handler was written for a legacy agents table (name, company, use_case,
+# status, request_count) that prod does not have; prod's table is the db/agents.py `agents`
+# model (agent_name, agent_type and api_key_hash NOT NULL), so its INSERT failed on every call.
+# It also stored a plaintext ak_live_ key in agents.api_key, while auth reads the sha256 in the
+# key table (api_keys when it exists) and consults agents.api_key only when no key table exists
+# or AGENT_AUTH_ENABLE_LEGACY_API_KEY_FALLBACK is on (default off).
+# Nothing calls it: the employee portal's createAgent sends {name, email, phone} and no page
+# uses it. Agents are created through self-serve POST /agent/account/register
+# (routes/agent_account.py), which mints the key hash-only and creates the users row and
+# membership. It takes no body, so it answers 501 for any payload rather than 422.
 @router.post("/agents/create")
-async def create_agent(
-    request: CreateAgentRequest,
-    current_user: dict = Depends(get_current_user)
-):
-    """Create a new agent (Employee only)"""
-    if current_user["role"] not in ["employee", "admin"]:
+async def create_agent(current_user: dict = Depends(get_current_user)):
+    """Retired (Employee only): answers 501; create agents through POST /agent/account/register."""
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
-    try:
-        # Check if email already exists
-        existing = await database.fetch_one(
-            "SELECT agent_id FROM agents WHERE email = :email",
-            {"email": request.email}
-        )
-        
-        if existing:
-            raise HTTPException(status_code=400, detail="Agent with this email already exists")
-        
-        # Generate agent credentials
-        agent_id = f"agent_{uuid.uuid4().hex[:12]}"
-        api_key = f"ak_live_{secrets.token_hex(32)}"
-        
-        # Create agent
-        await database.execute(
-            """INSERT INTO agents 
-               (agent_id, name, email, company, use_case, api_key, status, 
-                created_at, rate_limit, request_count, success_rate)
-               VALUES (:agent_id, :name, :email, :company, :use_case, :api_key, 
-                       :status, :created_at, :rate_limit, :request_count, :success_rate)""",
-            {
-                "agent_id": agent_id,
-                "name": request.name,
-                "email": request.email,
-                "company": request.company,
-                "use_case": request.use_case,
-                "api_key": api_key,
-                "status": "active",
-                "created_at": datetime.now(),
-                "rate_limit": min(request.expected_volume * 10, 10000),
-                "request_count": 0,
-                "success_rate": 0
-            }
-        )
-        
-        return {
-            "status": "success",
-            "message": "Agent created successfully",
-            "agent": {
-                "agent_id": agent_id,
-                "name": request.name,
-                "email": request.email,
-                "company": request.company,
-                "api_key": api_key,
-                "status": "active"
-            }
-        }
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to create agent: {str(e)}")
+    raise HTTPException(
+        status_code=501,
+        detail="Employee agent creation is retired; agents register through POST /agent/account/register",
+    )
 
 
 @router.patch("/agents/{agent_id}/tier")
@@ -476,7 +416,7 @@ async def employee_update_agent_tier(
     current_user: dict = Depends(get_current_user)
 ):
     """Employee portal endpoint to switch agent tier between basic/premium."""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
 
     try:
@@ -531,44 +471,73 @@ async def reset_agent_api_key(
     current_user: dict = Depends(get_current_user)
 ):
     """Reset agent's API key (Employee only)"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
-        # Check if agent exists
-        agent = await database.fetch_one(
-            "SELECT agent_id FROM agents WHERE agent_id = :agent_id",
-            {"agent_id": agent_id}
+        # The shared rotation path. This handler used to write only agents.api_key (in plaintext,
+        # plus a last_key_rotation column prod never had), so even had it run, the new key was not
+        # on the hash auth path and the old key stayed active.
+        new_api_key, key_sync_source = await reset_agent_primary_api_key(
+            agent_id=agent_id, created_by="employee_reset"
         )
-        
-        if not agent:
-            raise HTTPException(status_code=404, detail="Agent not found")
-        
-        # Generate new API key
-        new_api_key = f"ak_live_{secrets.token_hex(32)}"
-        
-        # Update agent
-        await database.execute(
-            """UPDATE agents 
-               SET api_key = :api_key, last_key_rotation = :rotation_time
-               WHERE agent_id = :agent_id""",
-            {
-                "api_key": new_api_key,
-                "rotation_time": datetime.now(),
-                "agent_id": agent_id
-            }
+
+        # WARNING, not INFO: prod drops INFO from plain module loggers, and this is an audit line.
+        logger.warning(
+            "Employee portal API key reset %s by %s (key_sync_source=%s)",
+            agent_id,
+            current_user.get("email"),
+            key_sync_source,
         )
-        
+
         return {
             "status": "success",
             "message": "API key reset successfully",
             "new_api_key": new_api_key
         }
-    
+
     except HTTPException:
         raise
+    except AgentNotFoundError:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    except KeyTableUnresolvedError:
+        raise HTTPException(status_code=503, detail="API key reset temporarily unavailable; retry")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to reset API key: {str(e)}")
+
+async def _set_agent_active(agent_id: str, *, active: bool, actor: Optional[str]) -> None:
+    """Flip agents.is_active: the column the agent auth door enforces (routes/agent_auth.py
+    get_agent_context -> 403 "Agent is deactivated"). The agents table has no status or
+    deactivated_at column; these handlers used to write both and 500'd.
+
+    NULL is_active reads as active, matching db.agents._normalize_agent_row. The auth cache holds
+    the agent row (is_active included) for up to 60s, so it is evicted here; other instances
+    follow within that TTL.
+    """
+    agent = await database.fetch_one(
+        "SELECT agent_id, is_active FROM agents WHERE agent_id = :agent_id",
+        {"agent_id": agent_id},
+    )
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    currently_active = agent["is_active"] is not False
+    if currently_active == active:
+        raise HTTPException(
+            status_code=400,
+            detail="Agent is already active" if active else "Agent is already inactive",
+        )
+
+    await database.execute(
+        "UPDATE agents SET is_active = :is_active, updated_at = NOW() WHERE agent_id = :agent_id",
+        {"is_active": active, "agent_id": agent_id},
+    )
+    evict_agent_auth_cache(agent_id)
+
+    # WARNING, not INFO: prod drops INFO from plain module loggers, and this is an audit line.
+    logger.warning(
+        "Employee portal agent %s %s by %s", agent_id, "activated" if active else "deactivated", actor
+    )
+
 
 @router.post("/agents/{agent_id}/deactivate")
 async def deactivate_agent(
@@ -576,33 +545,11 @@ async def deactivate_agent(
     current_user: dict = Depends(get_current_user)
 ):
     """Deactivate an agent (Employee only)"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
-        # Check if agent exists
-        agent = await database.fetch_one(
-            "SELECT agent_id, status FROM agents WHERE agent_id = :agent_id",
-            {"agent_id": agent_id}
-        )
-        
-        if not agent:
-            raise HTTPException(status_code=404, detail="Agent not found")
-        
-        if agent["status"] == "inactive":
-            raise HTTPException(status_code=400, detail="Agent is already inactive")
-        
-        # Deactivate agent
-        await database.execute(
-            """UPDATE agents 
-               SET status = 'inactive', deactivated_at = :deactivated_at
-               WHERE agent_id = :agent_id""",
-            {
-                "deactivated_at": datetime.now(),
-                "agent_id": agent_id
-            }
-        )
-        
+        await _set_agent_active(agent_id, active=False, actor=current_user.get("email"))
         return {
             "status": "success",
             "message": "Agent deactivated successfully"
@@ -613,38 +560,20 @@ async def deactivate_agent(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to deactivate agent: {str(e)}")
 
+# The portal's reactivateAgent() posts to /reactivate; this handler was only ever mounted at
+# /activate, so the portal's button 404'd. Both paths are served.
 @router.post("/agents/{agent_id}/activate")
+@router.post("/agents/{agent_id}/reactivate")
 async def activate_agent(
     agent_id: str,
     current_user: dict = Depends(get_current_user)
 ):
     """Activate an agent (Employee only)"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
+
     try:
-        # Check if agent exists
-        agent = await database.fetch_one(
-            "SELECT agent_id, status FROM agents WHERE agent_id = :agent_id",
-            {"agent_id": agent_id}
-        )
-        
-        if not agent:
-            raise HTTPException(status_code=404, detail="Agent not found")
-        
-        if agent["status"] == "active":
-            raise HTTPException(status_code=400, detail="Agent is already active")
-        
-        # Activate agent
-        await database.execute(
-            """UPDATE agents 
-               SET status = 'active', deactivated_at = NULL
-               WHERE agent_id = :agent_id""",
-            {
-                "agent_id": agent_id
-            }
-        )
-        
+        await _set_agent_active(agent_id, active=True, actor=current_user.get("email"))
         return {
             "status": "success",
             "message": "Agent activated successfully"
@@ -656,6 +585,26 @@ async def activate_agent(
         raise HTTPException(status_code=500, detail=f"Failed to activate agent: {str(e)}")
 
 # ============== Phase 2: API Keys Management ==============
+# Keys live in the table the agent auth door reads (routes.agent_account resolves it the way
+# registration and auth do) and are stored as sha256 hashes. These handlers used to write
+# agent_api_keys with secrets.token_hex(16) as the "hash", so no key they issued ever
+# authenticated. Per-key scopes / ip_whitelist / expiry are not stored: auth enforces none of them.
+
+
+def _per_key_http_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, AgentNotFoundError):
+        return HTTPException(status_code=404, detail="Agent not found")
+    if isinstance(exc, AgentKeyNotFoundError):
+        return HTTPException(status_code=404, detail="API key not found or not active")
+    if isinstance(exc, MultiKeyUnsupportedError):
+        return HTTPException(status_code=409, detail="This deployment supports one API key per agent; use reset-api-key")
+    if isinstance(exc, KeyTableUnresolvedError):
+        return HTTPException(status_code=503, detail="API key store temporarily unavailable; retry")
+    return HTTPException(status_code=500, detail=f"API key operation failed: {exc}")
+
+
+_PER_KEY_ERRORS = (AgentNotFoundError, AgentKeyNotFoundError, MultiKeyUnsupportedError, KeyTableUnresolvedError)
+
 
 @router.get("/agents/{agent_id}/api-keys")
 async def get_agent_api_keys(
@@ -663,40 +612,15 @@ async def get_agent_api_keys(
     current_user: dict = Depends(get_current_user)
 ):
     """List all API keys for an agent"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
+
     try:
-        keys = await database.fetch_all(
-            """SELECT id, agent_id, key_id, key_prefix, scopes, ip_whitelist,
-                      is_active, created_at, expires_at, last_used_at, last_rotated_at
-               FROM agent_api_keys
-               WHERE agent_id = :agent_id
-               ORDER BY created_at DESC""",
-            {"agent_id": agent_id}
-        )
-        
-        return {
-            "status": "success",
-            "api_keys": [
-                {
-                    "key_id": dict(k).get("key_id"),
-                    "key_prefix": dict(k).get("key_prefix"),
-                    "scopes": parse_json_field(dict(k).get("scopes")),
-                    "ip_whitelist": parse_json_field(dict(k).get("ip_whitelist")),
-                    "is_active": dict(k).get("is_active"),
-                    "created_at": str(dict(k).get("created_at")) if dict(k).get("created_at") else None,
-                    "expires_at": str(dict(k).get("expires_at")) if dict(k).get("expires_at") else None,
-                    "last_used_at": str(dict(k).get("last_used_at")) if dict(k).get("last_used_at") else None,
-                    "last_rotated_at": str(dict(k).get("last_rotated_at")) if dict(k).get("last_rotated_at") else None
-                }
-                for k in keys
-            ],
-            "total": len(keys)
-        }
-    
+        keys = await list_agent_keys(agent_id)
+        return {"status": "success", "api_keys": keys, "total": len(keys)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get API keys: {str(e)}")
+
 
 @router.post("/agents/{agent_id}/api-keys")
 async def create_agent_api_key(
@@ -704,68 +628,32 @@ async def create_agent_api_key(
     request: CreateApiKeyRequest,
     current_user: dict = Depends(get_current_user)
 ):
-    """Generate a new API key for an agent"""
-    if current_user["role"] not in ["employee", "admin"]:
+    """Generate a new API key for an agent. request.scopes / ip_whitelist / expires_in_days are
+    accepted for compatibility and ignored: nothing enforces them."""
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
+
     try:
-        # Check if agent exists
-        agent = await database.fetch_one(
-            "SELECT agent_id FROM agents WHERE agent_id = :agent_id",
-            {"agent_id": agent_id}
+        raw_key, key_id = await issue_additional_agent_key(
+            agent_id=agent_id, created_by=current_user.get("email") or "employee"
         )
-        
-        if not agent:
-            raise HTTPException(status_code=404, detail="Agent not found")
-        
-        # Generate new API key
-        key_id = f"key_{uuid.uuid4().hex[:16]}"
-        raw_key = f"ak_live_{secrets.token_hex(32)}"
-        key_hash = secrets.token_hex(16)  # In production, use proper hashing
-        key_prefix = raw_key[:12] + "..."
-        
-        # Calculate expiration
-        expires_at = None
-        if request.expires_in_days:
-            expires_at = datetime.now() + timedelta(days=request.expires_in_days)
-        
-        # Insert into database
-        await database.execute(
-            """INSERT INTO agent_api_keys 
-               (agent_id, key_id, key_hash, key_prefix, scopes, ip_whitelist, 
-                is_active, created_at, expires_at, created_by)
-               VALUES (:agent_id, :key_id, :key_hash, :key_prefix, :scopes, :ip_whitelist,
-                       :is_active, :created_at, :expires_at, :created_by)""",
-            {
-                "agent_id": agent_id,
-                "key_id": key_id,
-                "key_hash": key_hash,
-                "key_prefix": key_prefix,
-                "scopes": str(request.scopes),  # Convert to JSON string
-                "ip_whitelist": str(request.ip_whitelist),
-                "is_active": True,
-                "created_at": datetime.now(),
-                "expires_at": expires_at,
-                "created_by": current_user.get("email")
-            }
-        )
-        
-        logger.info(f"New API key {key_id} created for agent {agent_id} by {current_user.get('email')}")
-        
-        return {
-            "status": "success",
-            "message": "API key created successfully",
-            "api_key": raw_key,  # Only shown once!
-            "key_id": key_id,
-            "key_prefix": key_prefix,
-            "scopes": request.scopes,
-            "expires_at": expires_at.isoformat() if expires_at else None
-        }
-    
-    except HTTPException:
-        raise
+    except _PER_KEY_ERRORS as e:
+        raise _per_key_http_error(e)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to create API key: {str(e)}")
+
+    # WARNING, not INFO: prod drops INFO from plain module loggers, and this is an audit line.
+    logger.warning("Employee portal API key %s created for agent %s by %s", key_id, agent_id, current_user.get("email"))
+    return {
+        "status": "success",
+        "message": "API key created successfully",
+        "api_key": raw_key,  # Only shown once!
+        "key_id": key_id,
+        "key_prefix": raw_key[:12] + "...",
+        "scopes": [],
+        "expires_at": None,
+    }
+
 
 @router.delete("/agents/{agent_id}/api-keys/{key_id}")
 async def revoke_agent_api_key(
@@ -774,32 +662,22 @@ async def revoke_agent_api_key(
     current_user: dict = Depends(get_current_user)
 ):
     """Revoke an API key"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
+
     try:
-        # Deactivate the key
-        result = await database.execute(
-            """UPDATE agent_api_keys 
-               SET is_active = false
-               WHERE agent_id = :agent_id AND key_id = :key_id""",
-            {"agent_id": agent_id, "key_id": key_id}
-        )
-        
-        if not result:
-            raise HTTPException(status_code=404, detail="API key not found")
-        
-        logger.info(f"API key {key_id} revoked for agent {agent_id} by {current_user.get('email')}")
-        
-        return {
-            "status": "success",
-            "message": "API key revoked successfully"
-        }
-    
-    except HTTPException:
-        raise
+        await revoke_agent_key(agent_id=agent_id, key_id=key_id)
+    except _PER_KEY_ERRORS as e:
+        raise _per_key_http_error(e)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to revoke API key: {str(e)}")
+
+    logger.warning("Employee portal API key %s revoked for agent %s by %s", key_id, agent_id, current_user.get("email"))
+    return {
+        "status": "success",
+        "message": "API key revoked successfully"
+    }
+
 
 @router.post("/agents/{agent_id}/api-keys/{key_id}/rotate")
 async def rotate_agent_api_key(
@@ -807,68 +685,29 @@ async def rotate_agent_api_key(
     key_id: str,
     current_user: dict = Depends(get_current_user)
 ):
-    """Rotate an API key (generate new key, mark old as rotated)"""
-    if current_user["role"] not in ["employee", "admin"]:
+    """Rotate an API key: retire it and issue its replacement in one transaction."""
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
+
     try:
-        # Get existing key
-        existing = await database.fetch_one(
-            "SELECT * FROM agent_api_keys WHERE agent_id = :agent_id AND key_id = :key_id",
-            {"agent_id": agent_id, "key_id": key_id}
+        raw_key, new_key_id = await rotate_agent_key(
+            agent_id=agent_id, key_id=key_id, created_by=current_user.get("email") or "employee"
         )
-        
-        if not existing:
-            raise HTTPException(status_code=404, detail="API key not found")
-        
-        existing_dict = dict(existing)
-        
-        # Generate new key
-        new_key_id = f"key_{uuid.uuid4().hex[:16]}"
-        raw_key = f"ak_live_{secrets.token_hex(32)}"
-        key_hash = secrets.token_hex(16)
-        key_prefix = raw_key[:12] + "..."
-        
-        # Deactivate old key and create new one in a transaction
-        await database.execute(
-            "UPDATE agent_api_keys SET is_active = false, last_rotated_at = :now WHERE key_id = :key_id",
-            {"now": datetime.now(), "key_id": key_id}
-        )
-        
-        await database.execute(
-            """INSERT INTO agent_api_keys 
-               (agent_id, key_id, key_hash, key_prefix, scopes, ip_whitelist, 
-                is_active, created_at, expires_at, created_by)
-               VALUES (:agent_id, :key_id, :key_hash, :key_prefix, :scopes, :ip_whitelist,
-                       :is_active, :created_at, :expires_at, :created_by)""",
-            {
-                "agent_id": agent_id,
-                "key_id": new_key_id,
-                "key_hash": key_hash,
-                "key_prefix": key_prefix,
-                "scopes": existing_dict.get("scopes"),
-                "ip_whitelist": existing_dict.get("ip_whitelist"),
-                "is_active": True,
-                "created_at": datetime.now(),
-                "expires_at": existing_dict.get("expires_at"),
-                "created_by": current_user.get("email")
-            }
-        )
-        
-        logger.info(f"API key rotated for agent {agent_id}: {key_id} → {new_key_id} by {current_user.get('email')}")
-        
-        return {
-            "status": "success",
-            "message": "API key rotated successfully",
-            "new_api_key": raw_key,  # Only shown once!
-            "new_key_id": new_key_id,
-            "old_key_id": key_id
-        }
-    
-    except HTTPException:
-        raise
+    except _PER_KEY_ERRORS as e:
+        raise _per_key_http_error(e)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to rotate API key: {str(e)}")
+
+    logger.warning(
+        "Employee portal API key rotated for agent %s: %s -> %s by %s", agent_id, key_id, new_key_id, current_user.get("email")
+    )
+    return {
+        "status": "success",
+        "message": "API key rotated successfully",
+        "new_api_key": raw_key,  # Only shown once!
+        "new_key_id": new_key_id,
+        "old_key_id": key_id
+    }
 
 # ============== Phase 2: Protocol Management ==============
 
@@ -878,7 +717,7 @@ async def get_agent_protocols(
     current_user: dict = Depends(get_current_user)
 ):
     """List all supported protocols for an agent"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -917,7 +756,7 @@ async def add_agent_protocol(
     current_user: dict = Depends(get_current_user)
 ):
     """Add a supported protocol for an agent"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -977,7 +816,7 @@ async def update_agent_protocol_status(
     current_user: dict = Depends(get_current_user)
 ):
     """Update protocol status (active/deprecated/disabled)"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     if status not in ["active", "deprecated", "disabled"]:
@@ -1015,7 +854,7 @@ async def get_agent_performance(
     current_user: dict = Depends(get_current_user)
 ):
     """Get aggregated performance stats for an agent"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -1102,7 +941,7 @@ async def get_agent_metrics_history(
     current_user: dict = Depends(get_current_user)
 ):
     """Get agent metrics history from agent_metrics table"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -1139,7 +978,7 @@ async def get_agent_alerts(
     current_user: dict = Depends(get_current_user)
 ):
     """Get alerts for an agent"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -1180,7 +1019,7 @@ async def resolve_agent_alert(
     current_user: dict = Depends(get_current_user)
 ):
     """Resolve an alert"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -1212,7 +1051,7 @@ async def get_all_alerts(
     current_user: dict = Depends(get_current_user)
 ):
     """Get all alerts across all agents"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -1267,7 +1106,7 @@ async def get_agent_health_score(
     current_user: dict = Depends(get_current_user)
 ):
     """Calculate agent health score (0-100)"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:

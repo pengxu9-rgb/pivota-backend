@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from typing import Mapping
 import json
 from typing import Any, Dict, List
 
@@ -728,7 +729,7 @@ def test_sku_nba_head_only_substitution_reframes_not_vs_flagship():
     assert nba["primary_gap"] == PRIMARY_SKU_SUBSTITUTION_LEAK
     # Names the reality without selling the head fight...
     assert "Bose" in nba["headline"]
-    assert "owns the broad" in nba["headline"]
+    assert "diagnostic test of the broad" in nba["headline"]
     # ...and the first move is the winnable beachhead, not a comparison page.
     assert "bone conduction headphones for lap swimming" in nba["first_move"]
     assert "comparison —" not in nba["first_move"]
@@ -763,7 +764,7 @@ def test_sku_nba_head_only_substitution_skips_head_shaped_beachhead():
         identity=_sku_identity(),
         sku_title="Purra Swim Headphones",
     )
-    assert "owns the broad" in nba["headline"]
+    assert "diagnostic test of the broad" in nba["headline"]
     # Falls back to the generic specific-ask copy, never "win <head Q> first".
     assert 'Win "best waterproof earbuds" first' not in nba["first_move"]
     assert "specific" in nba["first_move"].lower()
@@ -803,7 +804,7 @@ def test_sku_nba_head_reframe_routed_lane_prescribes_why_buy_direct():
         identity=_sku_identity(),
         sku_title="Purra Swim Headphones",
     )
-    assert "owns the broad" in nba["headline"]
+    assert "diagnostic test of the broad" in nba["headline"]
     assert "routed through ebay.com" in nba["first_move"]
     # Lane phrased from attributes; the raw stacked spec never quoted.
     assert "the ip68 waterproof certified, bone conduction headphones, open-ear ask" in nba["first_move"]
@@ -863,7 +864,7 @@ def test_sku_nba_head_only_substitution_without_beachhead_stays_specific():
     )
 
     assert nba["primary_gap"] == PRIMARY_SKU_SUBSTITUTION_LEAK
-    assert "owns the broad" in nba["headline"]
+    assert "diagnostic test of the broad" in nba["headline"]
     assert "specific" in nba["first_move"].lower()
     assert "comparison —" not in nba["first_move"]
 

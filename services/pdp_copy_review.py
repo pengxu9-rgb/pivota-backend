@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 
 from config.settings import settings
+from services.llm_fence import PRODUCT_DATA_FENCE
 from db.llm_probe_runs import (
     STATUS_COST_CAPPED,
     STATUS_FAILED,
@@ -106,8 +107,19 @@ _SYSTEM_PROMPT = (
     '"machine_publish_allowed_module":bool},"confidence":0..1,'
     '"evidence_refs":["short quote from the copy"],'
     '"reviewed_in":"codex_external_window"}. '
-    'decision must be "pass" only if every check is true.'
+    'decision must be "pass" only if every check is true. '
+    + PRODUCT_DATA_FENCE.notice
 )
+
+
+def build_review_messages(copy_text: str) -> List[Dict[str, str]]:
+    """The chat messages the review sends: our rubric, then the merchant's copy
+    fenced as data. No cap: the lane had none, and the rubric reads the whole copy."""
+    fenced = PRODUCT_DATA_FENCE.fence_text(copy_text, max_chars=None)
+    return [
+        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "user", "content": f"Product description to review:\n\n{fenced}"},
+    ]
 
 
 def _extract_copy_text(payload: Dict[str, Any]) -> str:
@@ -175,10 +187,7 @@ async def _call_deepseek_review(
     base_url = settings.deepseek_api_base_url.rstrip("/")
     payload = {
         "model": settings.deepseek_model,
-        "messages": [
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": f"Product description to review:\n\n{copy_text}"},
-        ],
+        "messages": build_review_messages(copy_text),
         "temperature": 0,
         "response_format": {"type": "json_object"},
         "max_tokens": COPY_REVIEW_MAX_OUTPUT_TOKENS,

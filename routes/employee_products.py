@@ -14,6 +14,7 @@ import io
 import json
 import hashlib
 import logging
+import time
 import math
 import re
 from urllib.parse import urlparse
@@ -39,6 +40,8 @@ from services.outbound_links_service import (
     _is_domain_allowed,
     apply_utm,
     make_redirect_token,
+    market_is_observed,
+    TOKEN_MARKET_OBSERVED_KEY,
 )
 from services.seed_content_audit import audit_seed_data
 from services.external_seed_audit import (
@@ -1472,6 +1475,10 @@ async def _make_redirect_url(
         {
             "market": market,
             "tool": tool,
+            # `market` arrives here RAW (the seed row's / the request's own value), and is
+            # exactly what gets stamped — so its own emptiness is the provenance question.
+            # See the MARKET PROVENANCE note in `services/outbound_links_service`.
+            **({TOKEN_MARKET_OBSERVED_KEY: True} if market_is_observed(market) else {}),
             "dest": dest_with_utm,
             "ctx": ctx,
         }
@@ -4408,7 +4415,27 @@ async def update_external_seed(
         f"UPDATE external_product_seeds SET {', '.join(set_clauses)} WHERE id = :id",
         updates,
     )
-    return {"status": "success"}
+
+    # An employee price edit has to reach the BUYER's surfaces, not just the seed.
+    # `_refresh_external_seed_by_id` already projects after a re-read; this manual
+    # edit path wrote external_product_seeds and stopped, so a corrected price sat
+    # in the seed while catalog_offers -- which the PDP and the serving gate read --
+    # kept the old one. Same split-brain, different door.
+    #
+    # Best-effort and post-write, exactly like the refresh path: the projection is
+    # a mirror, and failing to mirror must never fail the authorized edit the
+    # employee just made.
+    projected: Dict[str, int] = {}
+    if any(k in updates for k in ("price_amount", "price_currency", "availability")):
+        try:
+            projected = await _project_refreshed_seed_to_serving_surfaces(seed_id)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "employee seed edit: serving-surface projection failed for seed_id=%r",
+                seed_id, exc_info=True,
+            )
+
+    return {"status": "success", "projected": projected}
 
 
 def _same_destination(fetched: Optional[str], served: Optional[str]) -> bool:
@@ -4432,6 +4459,109 @@ def _same_destination(fetched: Optional[str], served: Optional[str]) -> bool:
 # be described as freshly extracted. `unchanged` counts: we read the page and it still says
 # what we store.
 _PRICE_STATUSES_THAT_RE_READ_THE_STORED_PRICE = frozenset({"applied", "filled", "unchanged"})
+
+
+async def _project_refreshed_seed_to_serving_surfaces(seed_id: str) -> Dict[str, int]:
+    """Push a freshly re-read seed onto the surfaces a BUYER reads.
+
+    THE BUG THIS CLOSES. `_refresh_external_seed_by_id` writes `external_product_seeds` and
+    nothing else. The search/offers lane reads the seed, so it saw fresh prices — but the PDP
+    (`agent_pdp_view`, via `agent_pdp_view_assembler.fetch_offers_for_keys`) and the index's
+    `serving_eligible.has_price` gate both read `catalog_offers`, and NOTHING re-projected a
+    seed that was already mirrored. Measured on prod 2026-09-06: 1,321 of 5,316 live products
+    (25%) served a different price on the PDP than in search, 917 with a seed read inside 7 days.
+
+    GATED AS A WHOLE, and that is a correction. The first version relied on
+    `sync_offer_for_seed` self-gating on EXTERNAL_OFFER_DUAL_WRITE_ENABLED and left
+    `refresh_agent_pdp_view_for_seed` UNGATED — which has no flag of its own. With the flag off
+    that meant every refreshed seed (~2,000/night) still ran `build_agent_pdp_view_row`
+    (~1s/key; the reconciler caps ITSELF at 300 keys/6h for that reason), the agent_pdp_view
+    upsert and `recompute_serving_eligibility` — inside the sequential 3,300s crawl budget,
+    while `catalog_offers` stayed untouched. All of the cost, none of the fix, and it would have
+    made `stopped_early` near-certain, slowing rotation and making prices STALER. The claim
+    "inert until armed" has to be true of the whole helper, so the flag is now checked here.
+
+    Called for `unchanged` as well as `applied`/`filled` ON PURPOSE: re-projecting a price that
+    did not move is what makes the nightly rotation self-healing for rows that already drifted,
+    instead of needing a separate backfill pass.
+
+    Returns counters so the batch can tell "healed 2,000" from "healed 0" — `sync_offer_for_seed`
+    has seven statuses and six of them mean "did nothing" (`no_mirror_product` is expected to be
+    common: the mirror is insert-only and matches on `source_ref = seed_id`). Dropping that dict
+    is how a run that projected nothing would still have reported success.
+
+    Best-effort and non-raising, mirroring the `seed_data_writer` hooks it stands in for: the
+    seed row is the committed source of truth, so a projection failure must never turn a good
+    price read into a failed refresh.
+    """
+    counts: Dict[str, Any] = {
+        "attempted": 0, "projected": 0, "skipped": 0, "errored": 0, "seconds": 0.0,
+    }
+    if not seed_id:
+        return counts
+    _started = time.monotonic()
+    from services.external_offer_dual_write import dual_write_enabled
+
+    if not dual_write_enabled():
+        # Inert, and cheap: no offer write AND no view rebuild. See the gating note above.
+        return counts
+
+    counts["attempted"] = 1
+    try:
+        from services.external_offer_dual_write import sync_offer_for_seed
+
+        from services.external_offer_dual_write import (
+            OFFER_SYNC_ERROR_STATUSES,
+            OFFER_SYNC_WRITTEN_STATUSES,
+        )
+
+        outcome = await sync_offer_for_seed(seed_id)
+        status = str((outcome or {}).get("status") or "").strip().lower()
+        # Derived from the writer, never restated here. The first version guessed
+        # {"synced","inserted","updated","ok"} — three statuses it cannot emit — and the tests
+        # stubbed "ok", so the whole positive path was calibrated against a value production
+        # never produces.
+        if status in OFFER_SYNC_WRITTEN_STATUSES:
+            counts["projected"] = 1
+        elif status in OFFER_SYNC_ERROR_STATUSES:
+            # The writer swallowed an exception. That is an error, not a skip: a skip means
+            # "nothing to do", and counting a failed write as one hides it from the summary.
+            counts["errored"] = 1
+            counts["skip_" + (status or "unknown")] = 1
+        else:
+            counts["skipped"] = 1
+            counts["skip_" + (status or "unknown")] = 1
+    except Exception as exc:  # noqa: BLE001 - a cache write must not break the source of truth
+        counts["errored"] = 1
+        logger.warning(
+            "external seed refresh: catalog_offers projection failed seed_id=%s err=%s",
+            seed_id, str(exc)[:200],
+        )
+    try:
+        from services.seed_data_writer import refresh_agent_pdp_view_for_seed
+
+        # THE PDP HALF REPORTS ITS OWN OUTCOME. `projected` means the OFFER was written; the
+        # view rebuild used to fold into nothing -- a raising or silently no-op'ing refresh (no
+        # attached_product_key, no content_key) left `projected: 1` and no skip, so the surface
+        # this hook is named for could fail on every row while the summary read healed.
+        pdp = await refresh_agent_pdp_view_for_seed(
+            seed_id=seed_id, proposal_id=None, refresh_source="external_referral_refresh",
+        )
+        if pdp == "refreshed":
+            counts["pdp_refreshed"] = 1
+        else:
+            counts["pdp_skipped"] = 1
+            counts["pdp_skip_" + str(pdp or "unknown")] = 1
+    except Exception as exc:  # noqa: BLE001 - same isolation the assembler documents
+        counts["errored"] = 1
+        counts["pdp_errored"] = 1
+        logger.warning(
+            "external seed refresh: agent_pdp_view projection failed seed_id=%s err=%s",
+            seed_id, str(exc)[:200],
+        )
+    # Measured AFTER both surfaces: the PDP rebuild is the ~1s/key half.
+    counts["seconds"] = round(time.monotonic() - _started, 4)
+    return counts
 
 
 async def _stamp_crawl_attempt(seed_id: str) -> None:
@@ -4479,8 +4609,23 @@ async def _refresh_external_seed_by_id(
     market = row.get("market")
     tool = row.get("tool")
     dest = row.get("destination_url")
+    # The host, resolved BEFORE any degraded return can fire. `domain` further down is read off
+    # the snapshot, which by definition does not exist on the paths that degrade — so the
+    # summary's `top_degraded_hosts` was structurally always {"unknown": N}. Prefer the seed's
+    # own column, fall back to the destination URL's netloc.
+    report_host = str(row.get("domain") or "").strip().lower()
+    if not report_host and dest:
+        try:
+            report_host = (urlparse(str(dest)).hostname or "").strip().lower()
+        except Exception:  # noqa: BLE001 - a malformed URL must not break the refresh
+            report_host = ""
     previous_canonical_url = row.get("canonical_url")
     if not dest:
+        # Stamp FIRST. The candidate query orders by `last_crawl_attempt_at ASC NULLS FIRST`,
+        # so a row that raises before the stamp keeps a null attempt time, heads the queue
+        # again tomorrow, and every night after — a permanent backlog that crowds out rows
+        # that could actually be read.
+        await _stamp_crawl_attempt(seed_id)
         raise HTTPException(status_code=400, detail="INVALID_URL")
 
     # THE REFRESH USED TO BE BLIND TO A DEAD LINK, and worse than blind: `raise_for_status()`
@@ -4509,6 +4654,7 @@ async def _refresh_external_seed_by_id(
             return {
                 "status": "degraded",
                 "error": f"destination_unavailable: http {exc.status_code}",
+                "domain": report_host or None,
                 "destination_refresh": {"status": "not_observed", "reason": "not_the_served_url"},
             }
         observation = destination_liveness.classify_destination(
@@ -4531,13 +4677,18 @@ async def _refresh_external_seed_by_id(
         return {
             "status": "degraded",
             "error": f"destination_unavailable: http {exc.status_code}",
+            "domain": report_host or None,
             "destination_refresh": destination_refresh,
         }
     except Exception as exc:
         # We never reached the origin (timeout, TLS, DNS, robots). That is NOT evidence about
         # the product, so no observation is recorded and the failure streak does not move.
         await _stamp_crawl_attempt(seed_id)
-        return {"status": "degraded", "error": f"snapshot_failed: {str(exc)[:200]}"}
+        return {
+            "status": "degraded",
+            "error": f"snapshot_failed: {str(exc)[:200]}",
+            "domain": report_host or None,
+        }
 
     canonical_url = getattr(snapshot, "canonical_url", None) if snapshot else None
     domain = getattr(snapshot, "domain", None) if snapshot else None
@@ -4910,8 +5061,19 @@ async def _refresh_external_seed_by_id(
         # — an unreachable retirement reads like a live one to the next person.
         # Retirement belongs to jobs/external_seed_destination_sweep, which has stage 1.
 
+    # The seed is committed; now make the buyer-facing surfaces agree with it. See the helper
+    # for why this is gated on a price we actually re-read, and why `unchanged` is included.
+    projection: Dict[str, int] = {}
+    # BOTH conjuncts, matching the `extracted_at` stamp above. A cache-served fallback (a quarter
+    # of rows on 09-05) also yields `unchanged`, and projecting it would stamp
+    # catalog_offers.updated_at = NOW() on a row nobody re-read — claiming a freshness we did not
+    # earn, which is exactly what the projection exists to stop.
+    if read_the_served_product and price_status in _PRICE_STATUSES_THAT_RE_READ_THE_STORED_PRICE:
+        projection = await _project_refreshed_seed_to_serving_surfaces(seed_id)
+
     return {
         "status": "success",
+        "projection": projection,
         "seed_id": seed_id,
         "market": market,
         "tool": tool,

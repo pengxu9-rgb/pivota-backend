@@ -78,6 +78,7 @@ from services.provider_credit_rates import (
     provider_prompt_fraction,
 )
 from services.credit_consumption_service import estimate_probe_credits
+from services.consumer_capture_plan import plan_for_launch, quote_plan
 from utils.auth import get_current_merchant
 
 logger = logging.getLogger(__name__)
@@ -148,6 +149,7 @@ class CreateAuditRequest(BaseModel):
             "never billed for a tier the worker won't run."
         ),
     )
+    consumer_answer_queries: Optional[List[str]] = Field(default=None, max_length=8)
     custom_prompts: Optional[List[str]] = Field(
         default=None,
         max_length=10,
@@ -228,6 +230,7 @@ class AuditPreviewRequest(BaseModel):
     # CreateAuditRequest so preview and launch always price the same count.
     prompts_per_sku: Optional[int] = Field(default=None, ge=1, le=200)
     audit_tier: str = Field(default="standard", max_length=16)
+    consumer_answer_queries: Optional[List[str]] = Field(default=None, max_length=8)
     custom_prompts: Optional[List[str]] = Field(default=None, max_length=10)
     coverage_profile: str = Field(
         default_factory=default_coverage_profile,
@@ -658,8 +661,8 @@ def _audit_metering(
 
 def _balance_public_shape(balance: Dict[str, Any]) -> Dict[str, Any]:
     return {
-        "credits": int(balance.get("credits") or 0),
-        "allowance_credits": int(balance.get("allowance_credits") or 0),
+        "credits": float(balance.get("credits") or 0),
+        "allowance_credits": float(balance.get("allowance_credits") or 0),
         "plan_tier": str(balance.get("plan_tier") or "free"),
     }
 
@@ -668,7 +671,7 @@ def _credit_gaps(
     *, requirements: Dict[str, int], balance: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
     required = sum(int(value) for value in requirements.values())
-    available = int(balance.get("credits") or 0)
+    available = float(balance.get("credits") or 0)
     if required <= available:
         return []
     return [{
@@ -782,6 +785,7 @@ async def _build_preview(
     prompts_per_sku: int,
     custom_prompts: Optional[List[str]],
     coverage: Dict[str, Any],
+    consumer_answer_queries: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     providers = list(coverage.get("providers") or [])
     # Default answer-quality verify to the engine's supported verifier(s) for the
@@ -850,6 +854,12 @@ async def _build_preview(
         }
         _PREVIEW_CACHE[cache_key] = (now, cost_part)
 
+    consumer_plan = plan_for_launch(product_keys=sku_keys, queries=consumer_answer_queries, providers=providers)
+    supplement = quote_plan(consumer_plan) if consumer_plan else None
+    cost_part = dict(cost_part)
+    if supplement:
+        cost_part["consumer_capture"] = supplement
+        cost_part["estimated_audit_credits"] += supplement["credits"]
     balance = await get_balance(merchant_id)
     requirements = _credit_requirements(
         sku_count=int(cost_part["sku_count"]),
@@ -859,6 +869,8 @@ async def _build_preview(
         verify_sample=cost_part.get("verify_sample") or {},
         custom_prompts=custom_prompts,
     )
+    if supplement:
+        requirements["audit"] += supplement["credits"]
     gaps = _credit_gaps(requirements=requirements, balance=balance)
     # A PAID tier can launch on overage — the launch gate only hard-blocks the
     # FREE tier (`if gaps and not paid_tier`, below). So the preview must report
@@ -925,6 +937,7 @@ async def preview_audit_run(
             ),
             custom_prompts=body.custom_prompts,
             coverage=coverage,
+            **({"consumer_answer_queries": body.consumer_answer_queries} if body.consumer_answer_queries else {}),
         )
         preview["audit_tier"] = audit_tier
         return preview
@@ -1007,13 +1020,21 @@ async def create_audit_run(
         force=body.force,
     )
 
+    try:
+        consumer_plan = plan_for_launch(
+            product_keys=body.product_keys, queries=body.consumer_answer_queries,
+            providers=list(_resolve_audit_coverage(coverage_profile=body.coverage_profile, providers=body.providers).get("providers") or []),
+        ) if body.consumer_answer_queries else None
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    consumer_scope = body.subject_type + ":" + consumer_plan["sha256"] if consumer_plan else body.subject_type
     # Idempotency dedupe (unless force=true).
     debit_idempotency_key: Optional[str]
     if not body.force:
         idempotency_key = compute_audit_idempotency_key(
             merchant_id=body.merchant_id,
             product_keys=body.product_keys,
-            subject_type=body.subject_type,
+            subject_type=consumer_scope,
         )
         existing = await find_in_flight_by_idempotency_key(
             idempotency_key=idempotency_key,
@@ -1034,7 +1055,7 @@ async def create_audit_run(
         debit_idempotency_key = compute_audit_idempotency_key(
             merchant_id=body.merchant_id,
             product_keys=body.product_keys,
-            subject_type=body.subject_type,
+            subject_type=consumer_scope,
         )
 
     # Tier resolution BEFORE metering: billing, launch options, and the worker
@@ -1073,6 +1094,10 @@ async def create_audit_run(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=str(exc),
         ) from exc
+    if consumer_plan:
+        consumer_quote = quote_plan(consumer_plan)
+        audit_required += consumer_quote["credits"]
+        audit_usd_cogs += consumer_quote["estimated_usd_cogs"]
     requirements = {
         "audit": audit_required,
         "prompt": len(_normalize_nonempty(body.custom_prompts)),
@@ -1148,7 +1173,7 @@ async def create_audit_run(
                 audit_required,
                 bool(audit_debit.get("replay")),
                 audit_usd_cogs,
-                int(audit_debit.get("purchased_credits_debited") or 0),
+                Decimal(str(audit_debit.get("purchased_credits_debited") or 0)),
             ))
         prompt_required = int(requirements["prompt"])
         if prompt_required:
@@ -1164,7 +1189,7 @@ async def create_audit_run(
                 prompt_required,
                 bool(prompt_debit.get("replay")),
                 Decimal("0"),
-                int(prompt_debit.get("purchased_credits_debited") or 0),
+                Decimal(str(prompt_debit.get("purchased_credits_debited") or 0)),
             ))
 
         # Use origin/main's race-safe enqueue (returns run_id +
@@ -1179,6 +1204,8 @@ async def create_audit_run(
             requested_by_user_id=auth_merchant_id,
             request_options_jsonb={
                 "launch": {
+                    "paid_actions_unlocked_at_launch": paid_tier,
+                    **({"consumer_capture_plan": consumer_plan, "consumer_capture_quote": consumer_quote} if consumer_plan else {}),
                     "audit_mode": "per_sku",
                     "coverage_profile": coverage.get("profile"),
                     "coverage_profile_label": coverage.get("label"),
@@ -1232,7 +1259,7 @@ async def create_audit_run(
                             "kind": kind,
                             "amount": int(amount),
                             "replay": bool(replay),
-                            "purchased_credits": int(purchased_credits),
+                            "purchased_credits": float(purchased_credits),
                         }
                         for (
                             kind,
@@ -1337,6 +1364,24 @@ async def create_audit_run(
     )
 
 
+@router.get("/products")
+async def list_audit_products(auth_merchant_id: str = Depends(get_current_merchant), limit: int = 500, offset: int = 0):
+    from sqlalchemy import select
+    from db.catalog import catalog_products
+    from db.database import database
+    if not 1 <= limit <= 500 or offset < 0:
+        raise HTTPException(status_code=422, detail="Invalid pagination")
+    rows = await database.fetch_all(select(
+        catalog_products.c.product_key, catalog_products.c.platform,
+        catalog_products.c.source_product_id, catalog_products.c.title,
+    ).where(catalog_products.c.merchant_id == auth_merchant_id)
+      .order_by(catalog_products.c.product_key).offset(offset).limit(limit + 1))
+    return {"products": [{"product_key": r["product_key"], "platform": r["platform"],
+                          "platform_product_id": r["source_product_id"], "title": r["title"]}
+                         for r in rows[:limit]],
+            "next_offset": offset + limit if len(rows) > limit else None}
+
+
 @router.get("/readiness")
 async def get_audit_readiness(
     auth_merchant_id: str = Depends(get_current_merchant),
@@ -1422,9 +1467,64 @@ async def get_audit_run(
                     "canonical shape)."
                 ),
             )
+        # SERVED IFF DELIVERED — the read side of charged-iff-delivered.
+        #
+        # Projections are committed DURING verifying, before the run
+        # transitions to completed. A run that then fails is transitioned to
+        # `failed` and the launch debit is refunded (audit_run_worker.
+        # _fail_run_and_refund) — but its committed `report_projections` rows
+        # survive, and this route served them to anyone who asked by audience.
+        # A strict read-back mismatch is one of the two things that fails a
+        # URL run, so the very rows most likely to be left behind are the ones
+        # we could not prove we stored correctly. The merchant got their money
+        # back and kept the deliverable, and support saw a run that reads
+        # `failed` in one surface and answers with a full report in another.
+        #
+        # Gated HERE rather than deleting the rows in the refund path: the
+        # refund path is best-effort and runs while the process is already
+        # failing, so a delete there is one more thing that can not happen,
+        # and it would destroy the evidence of what a failed run had built.
+        # One read-side condition cannot be skipped.
+        #
+        # The condition is `completed`, not merely `not failed`: cancelled
+        # runs are refunded too (`_should_refund_cancelled_launch`), and an
+        # in-flight run has not been delivered either. It is what the 409
+        # below has always claimed the rule was.
+        if str(row.get("stage") or "") != "completed":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "message": (
+                        f"Audit run {run_id} is at stage "
+                        f"{row.get('stage')!r}; projections are served only "
+                        "for a completed run."
+                    ),
+                    "current_stage": row.get("stage"),
+                    "fallback": (
+                        f"GET /api/audits/{run_id} (no audience) "
+                        f"returns the canonical shape."
+                    ),
+                },
+            )
         proj = await fetch_projection(
             audit_run_id=run_id, audience=audience,
         )
+        if audience == "revenue_recovery" and row.get("stage") == "completed":
+            from services.audit_projection_builder import _BUILDER_VERSION
+            if proj is None or proj.get("builder_version") != _BUILDER_VERSION:
+                from services.revenue_recovery_report import recovery_from_report
+                from services.audit_projection_builder import coerce_jsonb_to_dict
+                report = coerce_jsonb_to_dict(row.get("report_jsonb"))
+                # A stale cache cannot establish the new evidence contract.
+                # Without the retained report, keep the original report fallback.
+                proj = None
+                if report:
+                    payload = recovery_from_report(
+                        report, run_id=run_id,
+                        catalog_available=False if row.get("subject_type") == "merchant_url" else None,
+                    )
+                    payload["historical_rebuild"] = True
+                    proj = {"payload_jsonb": payload}
         if proj is None:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
@@ -1440,12 +1540,37 @@ async def get_audit_run(
                     ),
                 },
             )
-        return sanitize_report_for_merchant(
-            _strip_brand_facing_internal_money(proj.get("payload_jsonb"))
+        # PAYWALL. Both returns on this route served the paid "what to do"
+        # layer — selection_gap, where_you_can_win, win_plan,
+        # prioritized_actions — while the sibling poll in
+        # merchant_audit_routes stripped it for free-tier owners. A free
+        # merchant could read the locked layer by fetching the same run here.
+        #
+        # Keyed to the run's OWNER, not the caller: ownership is already
+        # enforced above (404 on mismatch), so they are the same merchant,
+        # and using the row's value keeps this correct if that ever changes.
+        # Reusing merchant_audit_routes' helper rather than reimplementing —
+        # a second copy of a paywall is how the two drift apart.
+        from routes.merchant_audit_routes import _apply_actions_paywall
+
+        return await _apply_actions_paywall(
+            sanitize_report_for_merchant(
+                _strip_brand_facing_internal_money(proj.get("payload_jsonb"))
+            ),
+            str(row.get("merchant_id") or ""),
+            row,
         )
 
+    from routes.merchant_audit_routes import _apply_actions_paywall
+
     return AuditRunDetail(
-        **sanitize_report_for_merchant(_strip_brand_facing_internal_money(dict(row)))
+        **await _apply_actions_paywall(
+            sanitize_report_for_merchant(
+                _strip_brand_facing_internal_money(dict(row))
+            ),
+            str(row.get("merchant_id") or ""),
+            row,
+        )
     )
 
 

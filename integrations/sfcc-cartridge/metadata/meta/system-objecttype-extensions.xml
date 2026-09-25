@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    The settlement sweep's once-only markers.
+
+    Written on the Order only AFTER the matching event reached the outbox, so
+    a failed enqueue is retried on the next tick. They are the FIRST of two
+    layers: the second is the deterministic event id the sweep sends
+    (`order.paid:<orderNo>`, `refund.succeeded:<invoiceNumber>`), which the
+    Pivota ledger dedupes first-write-wins. A marker that is lost — a Business
+    Manager user clearing it, a restore, or an invoice number ageing out of the
+    capped set — therefore costs a redundant delivery, never a double count.
+
+    Writing a custom attribute updates the order's `lastModified`, so an order
+    the sweep has just marked is re-examined on the following tick and then
+    skipped without a write. That converges after one extra pass; it is not a
+    loop.
+-->
+<metadata xmlns="http://www.demandware.com/xml/impex/metadata/2006-10-31">
+    <type-extension type-id="Order">
+        <custom-attribute-definitions>
+            <attribute-definition attribute-id="pivotaPaidEmittedAt">
+                <display-name xml:lang="x-default">Pivota order.paid emitted at</display-name>
+                <description xml:lang="x-default">Set by PivotaSettlementSweep once order.paid reached the outbox.</description>
+                <type>datetime</type>
+                <localizable-flag>false</localizable-flag>
+                <mandatory-flag>false</mandatory-flag>
+                <externally-managed-flag>false</externally-managed-flag>
+            </attribute-definition>
+            <attribute-definition attribute-id="pivotaCancelledEmittedAt">
+                <display-name xml:lang="x-default">Pivota order.cancelled emitted at</display-name>
+                <description xml:lang="x-default">Set by PivotaSettlementSweep once order.cancelled reached the outbox.</description>
+                <type>datetime</type>
+                <localizable-flag>false</localizable-flag>
+                <mandatory-flag>false</mandatory-flag>
+                <externally-managed-flag>false</externally-managed-flag>
+            </attribute-definition>
+            <attribute-definition attribute-id="pivotaRefundedInvoices">
+                <display-name xml:lang="x-default">Pivota refunded invoice numbers</display-name>
+                <description xml:lang="x-default">Credit invoice numbers already reported as refund.succeeded. Capped at 200 by the sweep.</description>
+                <type>set-of-string</type>
+                <localizable-flag>false</localizable-flag>
+                <mandatory-flag>false</mandatory-flag>
+                <externally-managed-flag>false</externally-managed-flag>
+                <field-length>256</field-length>
+            </attribute-definition>
+        </custom-attribute-definitions>
+        <group-definitions>
+            <attribute-group group-id="pivotaTelemetry">
+                <display-name xml:lang="x-default">Pivota Telemetry</display-name>
+                <attribute attribute-id="pivotaPaidEmittedAt"/>
+                <attribute attribute-id="pivotaCancelledEmittedAt"/>
+                <attribute attribute-id="pivotaRefundedInvoices"/>
+            </attribute-group>
+        </group-definitions>
+    </type-extension>
+</metadata>

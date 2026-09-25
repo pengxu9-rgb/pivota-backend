@@ -19,7 +19,9 @@ execute, and because a check that silently counts 0 everywhere would look exactl
 like a healthy catalog — so the tests below prove it counts BOTH ways.
 
 🚨 THESE GATE FILES SHARE ONE DATABASE. `metadata.create_all` + DELETE only —
-never hand-roll DDL for a table `db.catalog` owns.
+never hand-roll DDL for a table `db.catalog` owns — and every row this module
+writes is deleted BY KEY when its test ends (`_note`), because the last test's
+rows otherwise outlive the run and poison a neighbour's scan on the next one.
 """
 
 from __future__ import annotations
@@ -76,6 +78,9 @@ def _check():
     raise AssertionError("serving_eligible_not_renderable is not registered")
 
 
+_TABLES_TO_RESET = ("catalog_products", "index_pipeline_state", "external_product_seeds")
+
+
 @pytest.fixture(scope="module")
 def pg_engine():
     import db.catalog  # noqa: F401
@@ -89,14 +94,59 @@ def pg_engine():
         for stmt in filter(None, (s.strip() for s in _LIGHTWEIGHT_DDL.split(";"))):
             conn.execute(text(stmt))
     yield engine
+    # Nothing this module wrote may outlive it — see the row-scoped teardown.
+    # `_reset` emptied these tables when each test began, so anything still in
+    # them now is a row written here without `_note`.
+    with engine.begin() as conn:
+        residue = {t: conn.execute(text(f"SELECT count(*) FROM {t}")).scalar()
+                   for t in _TABLES_TO_RESET}
     engine.dispose()
+    assert not any(residue.values()), (
+        f"this module left rows behind for the next gate run: {residue}")
 
 
 def _reset(conn):
     from sqlalchemy import text
 
-    for t in ("catalog_products", "index_pipeline_state", "external_product_seeds"):
+    for t in _TABLES_TO_RESET:
         conn.execute(text(f"DELETE FROM {t}"))
+
+
+# ---------------------------------------------------------------------------
+# Row-scoped teardown
+# ---------------------------------------------------------------------------
+# `_reset` empties these tables at the START of every test, so this module never
+# saw its own leftovers. Its NEIGHBOURS did: the gate files share one database,
+# and the last test here used to leave `pk_sample` (platform='external_seed')
+# behind. tests/test_backfill_variant_identity_skus_postgres.py scans every
+# external_seed catalog_products row, so a SECOND `pytest tests/test_*_postgres.py`
+# against the same database failed four of its tests. CI never sees that — it
+# provisions a fresh database per job — so it bit only local runs.
+#
+# Every helper that writes a row records (table, key column, key) here, and the
+# autouse fixture below deletes exactly those rows when the test ends. By KEY,
+# never `DROP`, never the whole table — the contract that file's `_clear` sets.
+# `pg_engine`'s teardown then asserts the tables are empty, so a new raw INSERT
+# that forgets to `_note` turns the module red instead of poisoning a neighbour.
+_WRITTEN: list = []   # (table, key column, key value)
+
+
+def _note(table, column, value):
+    _WRITTEN.append((table, column, value))
+
+
+@pytest.fixture(autouse=True)
+def _delete_what_this_test_wrote(pg_engine):
+    from sqlalchemy import text
+
+    _WRITTEN.clear()
+    yield
+    if not _WRITTEN:
+        return
+    with pg_engine.begin() as conn:
+        for table, column, value in reversed(_WRITTEN):
+            conn.execute(text(f"DELETE FROM {table} WHERE {column} = :v"), {"v": value})
+    _WRITTEN.clear()
 
 
 def _row(conn, *, pk, ck="ck_x", platform="external_seed", serving=True,
@@ -115,6 +165,7 @@ def _row(conn, *, pk, ck="ck_x", platform="external_seed", serving=True,
                  "VALUES (:spid, 'active')"),
             {"spid": pk},
         )
+        _note("external_product_seeds", "external_product_id", pk)
     conn.execute(
         text(
             "INSERT INTO catalog_products "
@@ -127,6 +178,8 @@ def _row(conn, *, pk, ck="ck_x", platform="external_seed", serving=True,
         {"pk": pk, "mid": merchant_id, "plat": platform, "ck": ck,
          "reason": suppression_reason},
     )
+    _note("index_pipeline_state", "content_key", ck)
+    _note("catalog_products", "product_key", pk)
 
 
 def _count(conn):
@@ -252,3 +305,30 @@ def test_it_asks_a_different_question_from_public_not_renderable():
     assert "catalog_row_trust" in a["count_sql"]
     assert "index_pipeline_state" in b["count_sql"]
     assert "catalog_row_trust" not in b["count_sql"]
+
+
+@pytest.mark.asyncio
+async def test_sample_rows_carry_subject_key_through_the_production_reader(pg_engine):
+    """test_sample_sql_returns_the_offending_keys reads `r[0]`; the runner reads
+    `r["subject_key"]`, and on asyncpg a `databases` Record raises KeyError for
+    a column the row does not carry. This sample_sql was compiled from
+    `select(_cp.c.product_key)` with no label until 2026-09-02, so the daily
+    sweep on worker logged a KeyError traceback for this check instead of its
+    samples — with the positional test green. Read it the way the runner does,
+    through the production client."""
+    from databases import Database
+
+    from services.catalog_invariant_checks import SAMPLE_KEY_COLUMN
+
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _row(conn, pk="pk_sample", ck="ck_sample", serving=True, with_seed=False)
+
+    db = Database(DATABASE_URL.replace("postgres://", "postgresql://", 1))
+    await db.connect()
+    try:
+        rows = await db.fetch_all(_check()["sample_sql"])
+        keys = [r[SAMPLE_KEY_COLUMN] for r in rows]
+    finally:
+        await db.disconnect()
+    assert keys == ["pk_sample"]

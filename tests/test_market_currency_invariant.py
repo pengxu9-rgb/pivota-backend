@@ -367,6 +367,37 @@ class _RunnerDb:
     async def fetch_one(self, sql, values=None):
         return {"c": self._sql_counts.get(self._name_for(sql), 0)}
 
+    async def fetch_val(self, sql, values=None):
+        """The share-based checks read scalars. Without this the fake raises AttributeError, the
+        runner records an error, and three checks are silently absent from every assertion in this
+        file — a fake that stubs one accessor is blind to the next feature's."""
+        return self._sql_counts.get(self._name_for(sql), 0)
+
+    def _taxonomy_rows(self):
+        """A DB WITH THE SHARED VOCABULARY IN IT, seeded from this repo's own constants so
+        `taxonomy_code_vs_table_drift` sees agreement. Returning [] instead would make the table
+        look ABSENT, which that check reports as a violation on purpose — an unreadable shared
+        vocabulary is not the same thing as agreeing with it."""
+        from services.category_path_aliases import (
+            ALIASES,
+            ANCESTOR_NODES,
+            TAXONOMY_LEAVES,
+        )
+
+        rows = [
+            {"path": path, "label": path, "is_leaf": True, "alias_of": None}
+            for path in sorted(TAXONOMY_LEAVES)
+        ]
+        rows += [
+            {"path": path, "label": path, "is_leaf": False, "alias_of": None}
+            for path in sorted(ANCESTOR_NODES)
+        ]
+        rows += [
+            {"path": src, "label": src, "is_leaf": False, "alias_of": tgt}
+            for src, tgt in sorted(ALIASES.items())
+        ]
+        return rows
+
     async def fetch_all(self, sql, values=None):
         if (
             "GROUP BY market_norm" in sql
@@ -374,6 +405,8 @@ class _RunnerDb:
             or "catalog_source_quarantine" in sql
         ):
             return await self._market.fetch_all(sql, values)
+        if "FROM category_taxonomy" in sql:
+            return self._taxonomy_rows()
         name = self._name_for(sql)
         n = min(self._sql_counts.get(name, 0), 5)
         return [{"subject_key": f"pk_{name}_{i}"} for i in range(n)]
@@ -396,10 +429,21 @@ class TestReportOnlyTier:
             "live cohort from failing the build"
         )
 
-    def test_it_is_the_only_warn_only_check(self):
-        # If `warn_only` ever leaks onto another check, the module quietly
-        # stops enforcing something it used to enforce.
-        assert [c["name"] for c in _CHECKS if c.get("warn_only")] == [CHECK_NAME]
+    def test_the_warn_only_tier_holds_exactly_the_checks_listed_here(self):
+        # If `warn_only` ever leaks onto another check, the module quietly stops
+        # enforcing something it used to enforce. So the tier is an EXPLICIT
+        # list: adding a check to it is a deliberate edit here, with the reason
+        # written down, not a key that appears in a diff nobody reads.
+        #
+        #   market_currency_disagreement                — the 433-EUR-as-US
+        #       cohort's disposition is a human decision (see this class).
+        #   skus_without_merchant_issued_identity_share — the variant identity
+        #       provenance backfill (#2113) is outstanding; most live SKUs carry
+        #       no provenance marker at all, so an enforcing check would ship
+        #       permanently red and a threshold raised to today's count would
+        #       bless the exact rows that arc exists to fix.
+        expected = [CHECK_NAME, "skus_without_merchant_issued_identity_share"]
+        assert [c["name"] for c in _CHECKS if c.get("warn_only")] == expected
 
     @pytest.mark.asyncio
     async def test_violations_are_reported_but_do_not_fail_the_build(self):

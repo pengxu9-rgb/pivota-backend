@@ -362,7 +362,7 @@ Tracked from the review of this PR; none is covered by these scripts yet.
    cutover and the late-Sep launch. ENTERPRISE (not ENTERPRISE_PLUS) means maintenance is a real
    restart, so this is not cosmetic.
 9. **Cloud SQL connection budget — RESOLVED, measured.** `max_connections` raised 200 → 300.
-   Measured worst case 230/300 (headroom 70): web 20x6, gateway 20x5, worker 1x10, and
+   Measured worst case 230/300 (headroom 70): web 10x12, gateway 20x5, worker 1x10, and
    proof-issuer + acp contribute **0** because they mount no `DATABASE_URL` at all. Re-derive this
    from the live services (not from comments) whenever a service or a pool default changes.
 10. **Dependency pinning** — `requirements.txt` pins only a few packages, so rebuilding the same git
@@ -404,7 +404,15 @@ Tracked from the review of this PR; none is covered by these scripts yet.
 ## Gateway (PIVOTA-Agent) on Cloud Run
 
 **Shipping a code change (the normal path).** `CONFIG=preserve` is the default: it rolls the image
-forward and restamps `PIVOTA_COMMIT_SHA`, and touches nothing else. No Railway, no generated files.
+forward and restamps `PIVOTA_COMMIT_SHA`, and rewrites no environment variable or secret mount. No
+Railway, no generated files.
+
+It does **not** leave the service SHAPE alone, and the difference matters mid-incident: `preserve`
+reasserts `--concurrency` / `--min-instances` / `--max-instances` on every run (prod: 80 / 2 / 20 -
+min and max are per-env constants, 80 is one default for both envs), so a bare deploy reverts a hand-set concurrency. Pass
+`CONCURRENCY_LIMIT=` / `MIN_INSTANCES=` / `MAX_INSTANCES=` to carry one through, and read the
+`shape:` line the script prints before it deploys to confirm each one was read — see **Deploy** in
+`docs/runbooks/operating_on_gcp_production.md`.
 
 ```bash
 # from a PIVOTA-Agent checkout

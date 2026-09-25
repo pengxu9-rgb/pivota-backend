@@ -376,7 +376,7 @@ JSON/JSONB is used for payloads, flexible metadata, request/response snapshots, 
 
 Dialect handling:
 
-- `db/database.py` defines `JSONB_TYPE`: Postgres gets SQLAlchemy PostgreSQL `JSONB`; SQLite compiles JSONB/ARRAY to JSON for local dev/tests.
+- `db/database.py` defines `JSONB_TYPE` as `JSON().with_variant(JSONB, "postgresql")`: the compiling dialect picks the type, so Postgres gets `JSONB` and SQLite gets `JSON`. (It used to select from `DATABASE_URL` at import time; the sqlite `@compiles` shims for JSONB/UUID/ARRAY now register unconditionally, so a Postgres URL no longer leaves them unregistered.)
 - Some older SQLAlchemy modules use generic `JSON`, which compiles to Postgres `JSON`, not `JSONB`.
 - Runtime self-heal DDL sometimes adds missing `orders` JSON columns as `JSONB`, so live DB type can differ from metadata.
 

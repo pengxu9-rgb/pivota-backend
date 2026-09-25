@@ -200,10 +200,10 @@ async def get_orders_stats(current_user: dict = Depends(require_admin)):
         stats_query = """
             SELECT 
                 COUNT(*) as total_orders,
-                SUM(amount) as total_revenue,
-                AVG(amount) as avg_order_value,
+                SUM(total) as total_revenue,
+                AVG(total) as avg_order_value,
                 SUM(CASE WHEN status IN ('completed', 'delivered') THEN 1 ELSE 0 END) as successful_orders,
-                SUM(CASE WHEN created_at >= CURRENT_DATE THEN amount ELSE 0 END) as revenue_today,
+                SUM(CASE WHEN created_at >= CURRENT_DATE THEN total ELSE 0 END) as revenue_today,
                 COUNT(DISTINCT customer_email) as unique_customers
             FROM orders 
             WHERE merchant_id = :merchant_id
@@ -212,7 +212,7 @@ async def get_orders_stats(current_user: dict = Depends(require_admin)):
         
         # Get status distribution
         status_query = """
-            SELECT status, COUNT(*) as count, SUM(amount) as revenue
+            SELECT status, COUNT(*) as count, SUM(total) as revenue
             FROM orders
             WHERE merchant_id = :merchant_id
             GROUP BY status

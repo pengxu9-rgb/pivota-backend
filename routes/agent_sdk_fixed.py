@@ -3,6 +3,7 @@ SDK-Ready Agent API Endpoints - COMPREHENSIVE FIX
 Properly handles all database schema issues and edge cases
 """
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, BackgroundTasks
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 from datetime import datetime
@@ -18,6 +19,7 @@ import time
 import asyncio
 import uuid
 
+from services.seed_variant_options import normalize_seed_variant_options
 from services.agent_ranking_service import (
     AgentRankingFeatures,
     get_agent_ranking_config,
@@ -33,14 +35,22 @@ from services.outbound_links_service import (
     get_allowed_domains_for_market,
     is_destination_domain_allowed,
     make_redirect_token,
+    market_is_observed,
+    TOKEN_MARKET_OBSERVED_KEY,
 )
 from services.external_seed_search import (
     dedupe_external_seed_rows,
     fetch_external_seed_rows,
 )
-from services.external_referral_readiness import should_block_external_referral_runtime
+from services.external_referral_readiness import (
+    external_referral_live_verification_reasons,
+    should_block_external_referral_runtime,
+)
 from db.agent_ranking_log import log_ranking_batch
 from db.agent_product_events import log_product_events
+from routes.agent_auth import log_agent_request
+from services import agent_search_gateway_proxy
+from config.settings import settings as _app_settings
 
 router = APIRouter(prefix="/agent/v1", tags=["agent-sdk"])
 
@@ -257,13 +267,15 @@ async def _build_external_seed_product(
     if not external_product_id:
         return None
 
-    blocked, _gate_status = await should_block_external_referral_runtime(
+    blocked, gate_status = await should_block_external_referral_runtime(
         seed_row,
         matched_via="agent_sdk_fixed",
         allowed_domains=allowed_domains,
     )
     if blocked:
         return None
+    live_verification_reasons = external_referral_live_verification_reasons(gate_status)
+    requires_live_verification = bool(live_verification_reasons)
 
     disclosure_text = seed_row.get("disclosure_text") or seed_data.get("disclosure_text") or DEFAULT_DISCLOSURE_TEXT
     utm_template = seed_row.get("utm_template") or seed_data.get("utm_template") or DEFAULT_UTM_TEMPLATE
@@ -330,6 +342,16 @@ async def _build_external_seed_product(
         {
             "market": market,
             "tool": tool,
+            # The seed row's OWN market, when it has one. A NULL market row serves
+            # DEFAULT_EXTERNAL_SEED_MARKET ("US") — a placeholder, not a fact about the
+            # buyer — so it is left unstamped and the warm-handoff lane leaves the gateway's
+            # purchasability gate un-keyed for it. See the MARKET PROVENANCE note in
+            # `services/outbound_links_service`.
+            **(
+                {TOKEN_MARKET_OBSERVED_KEY: True}
+                if market_is_observed(seed_row.get("market"))
+                else {}
+            ),
             "dest": dest_with_utm,
             "ctx": _redirect_ctx,
         }
@@ -372,6 +394,14 @@ async def _build_external_seed_product(
         else:
             image_url = None
 
+        # The axis, carried through. This builder whitelists variant fields, so
+        # an axis written into the seed reached here and stopped. It is read
+        # through the shared normalizer because the column holds TWO shapes —
+        # a list of pairs from the enrichment lane, a {name: value} mapping from
+        # the employee CSV lane — and a list-only reader silently discards the
+        # axis the CSV lane already had.
+        options = normalize_seed_variant_options(v.get("options"))
+
         variants.append(
             {
                 "id": variant_id,
@@ -383,12 +413,15 @@ async def _build_external_seed_product(
                 "in_stock": in_stock,
                 **({"availability": availability} if availability is not None else {}),
                 **({"image_url": image_url} if image_url else {}),
+                **({"options": options} if options else {}),
             }
         )
         if len(variants) >= 30:
             break
 
-    if not variants:
+    if requires_live_verification:
+        variants = []
+    elif not variants:
         variants = [
             {
                 "id": external_product_id,
@@ -411,12 +444,18 @@ async def _build_external_seed_product(
         "title": title or destination_url,
         "name": title or destination_url,
         "description": str(seed_data.get("description") or "") or "",
-        "price": price,
-        "currency": price_currency,
+        **({"price": price, "currency": price_currency} if not requires_live_verification else {}),
         "image_url": image_url,
         "image_urls": image_urls,
-        "in_stock": True,
-        "inventory_quantity": 999,
+        **(
+            {"in_stock": True, "inventory_quantity": 999}
+            if not requires_live_verification
+            else {
+                "availability": "unknown",
+                "buyable": False,
+                "checkout_ready": False,
+            }
+        ),
         "product_type": "external",
         "source": "external_seed",
         "external_seed_id": seed_id,
@@ -425,6 +464,25 @@ async def _build_external_seed_product(
         "external_url": canonical_url or destination_url,
         "disclosure_text": str(disclosure_text or DEFAULT_DISCLOSURE_TEXT),
         "brand": brand,
+        "external_referral_status": {
+            "status": str(getattr(gate_status, "status", "") or "unknown"),
+            "gating_policy_version": str(
+                getattr(gate_status, "gating_policy_version", "") or "unknown"
+            ),
+            "blocker_anomaly_types": list(
+                getattr(gate_status, "blocker_anomaly_types", []) or []
+            ),
+            "review_anomaly_types": list(
+                getattr(gate_status, "review_anomaly_types", []) or []
+            ),
+        },
+        "commerce_verification": {
+            "required": requires_live_verification,
+            "status": "live_quote_required" if requires_live_verification else "catalog_facts_accepted",
+            "reasons": live_verification_reasons,
+            "price_trusted": not requires_live_verification,
+            "availability_trusted": not requires_live_verification,
+        },
         "variants": variants,
     }
 
@@ -790,6 +848,7 @@ async def search_products(
     allow_stale_cache: bool = Query(default=True),
     external_seed_strategy: str = Query(default="legacy"),
     fast_mode: bool = Query(default=False),
+    market: Optional[str] = Query(default=None),
     context: AgentContext = Depends(get_agent_context)
 ):
     """
@@ -1029,13 +1088,75 @@ async def search_products(
     # Contract: allow callers to request above 200, but clamp internally.
     limit = max(1, min(int(limit or 20), AGENT_SDK_FIXED_SEARCH_LIMIT_MAX))
     offset = max(0, int(offset or 0))
-    effective_in_stock_only = (
+    stock_filter_explicit = in_stock_only is not None or in_stock is not None
+    requested_in_stock_only = (
         in_stock_only
         if in_stock_only is not None
         else in_stock
         if in_stock is not None
-        else True
+        else False
     )
+    effective_in_stock_only = bool(requested_in_stock_only and stock_filter_explicit)
+
+    # Partners still using this legacy URL receive the gateway's single recall
+    # implementation. The caller's obsolete allow_external_seed=false switch
+    # cannot hide eligible offers. Keep scoped callers on the local path until
+    # the gateway can enforce their trusted merchant ACL.
+    proxy_on, proxy_reason = agent_search_gateway_proxy.enabled_for(
+        getattr(context, "agent_id", None), req.headers,
+    )
+    if proxy_reason == "already_proxied":
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error": {"code": "gateway_search_proxy_loop"}},
+        )
+    if proxy_on:
+        if limit > 100 or offset % limit != 0:
+            return JSONResponse(
+                status_code=422,
+                content={"status": "error", "error": {"code": "gateway_pagination_unsupported"}},
+            )
+        requested_merchants = ([merchant_id] if merchant_id else list(merchant_ids or []))
+        if any(not context.can_access_merchant(mid) for mid in requested_merchants):
+            return JSONResponse(
+                status_code=403,
+                content={"status": "error", "error": {"code": "merchant_forbidden"}},
+            )
+        if getattr(context, "allowed_merchants", None) is not None:
+            return JSONResponse(
+                status_code=403,
+                content={"status": "error", "error": {"code": "gateway_merchant_scope_unavailable"}},
+            )
+        gateway_body, why, gateway_status = await agent_search_gateway_proxy.search(
+            base_url=_app_settings.pivota_agent_internal_url,
+            query_items=list(req.query_params.multi_items()),
+            headers=req.headers,
+            catalog_surface=(normalized_catalog_surface if normalized_catalog_surface == "beauty" else None),
+        )
+        background_tasks.add_task(
+            log_agent_request,
+            context=context,
+            status_code=gateway_status,
+            merchant_id=merchant_id or "cross_merchant_search",
+        )
+        if gateway_body is None:
+            return JSONResponse(
+                status_code=gateway_status,
+                content={"status": "error", "error": {"code": "gateway_search_failed", "reason": why}},
+            )
+        return agent_search_gateway_proxy.to_backend_envelope(
+            gateway_body,
+            limit=limit,
+            offset=offset,
+            query=query,
+            category=category,
+            min_price=min_price,
+            max_price=max_price,
+            in_stock_only=bool(effective_in_stock_only),
+            merchant_id=merchant_id,
+            merchant_ids=merchant_ids,
+            catalog_surface=normalized_catalog_surface,
+        )
 
     try:
         delegate_timeout_s = _resolve_delegate_timeout_seconds(merchant_id)
@@ -1052,12 +1173,14 @@ async def search_products(
                 min_price=min_price,
                 max_price=max_price,
                 in_stock_only=bool(effective_in_stock_only),
+                in_stock_filter_explicit=stock_filter_explicit,
                 limit=limit,
                 offset=offset,
                 allow_external_seed=allow_external_seed,
                 allow_stale_cache=allow_stale_cache,
                 external_seed_strategy=external_seed_strategy,
                 fast_mode=fast_mode,
+                market=market,
                 context=context,
             ),
             delegate_timeout_s,

@@ -67,6 +67,7 @@ def test_build_shopify_cart_permalink_none_without_variant():
 async def test_shopify_seed_builds_cart_permalink_with_matching_ctx():
     redirect_url = await gateway._make_external_redirect_url(
         market="US",
+        market_observed=True,
         tool="offers.resolve",
         destination_url="https://teststore.com/products/widget",
         utm_template=None,
@@ -108,6 +109,7 @@ async def test_shopify_seed_builds_cart_permalink_with_matching_ctx():
 async def test_non_shopify_seed_falls_back_to_referral_only():
     redirect_url = await gateway._make_external_redirect_url(
         market="US",
+        market_observed=True,
         tool="offers.resolve",
         destination_url="https://teststore.com/products/widget",
         utm_template=None,
@@ -141,6 +143,7 @@ async def test_shopify_platform_but_non_numeric_variant_does_not_fabricate():
     # never a fabricated cart permalink.
     redirect_url = await gateway._make_external_redirect_url(
         market="US",
+        market_observed=True,
         tool="offers.resolve",
         destination_url="https://teststore.com/products/widget",
         utm_template=None,
@@ -163,6 +166,7 @@ async def test_shopify_platform_but_non_numeric_variant_does_not_fabricate():
 async def test_disallowed_domain_returns_none_even_for_shopify():
     redirect_url = await gateway._make_external_redirect_url(
         market="US",
+        market_observed=True,
         tool="offers.resolve",
         destination_url="https://teststore.com/products/widget",
         utm_template=None,
@@ -183,6 +187,7 @@ async def test_disallowed_domain_returns_none_even_for_shopify():
 async def test_ctx_click_id_is_used_by_materialize_not_a_fresh_id():
     redirect_url = await gateway._make_external_redirect_url(
         market="US",
+        market_observed=True,
         tool="offers.resolve",
         destination_url="https://teststore.com/products/widget",
         utm_template=None,
