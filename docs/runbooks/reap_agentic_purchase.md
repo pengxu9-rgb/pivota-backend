@@ -1086,6 +1086,115 @@ can be read back. This procedure does not call Reap or change a charge. The merc
 path remains with webhook/poller replay, not this repair command. Do not treat this repair as
 proof of the Reap cart-link quote contract or as authorization for a paid canary.
 
+## Local end-to-end run against the sandbox
+
+`scripts/ops/reap_local_e2e.py` runs the whole machine on a laptop — purchase route → ledger →
+poller → Reap **sandbox** → `completed` + attribution edge — against a LOCAL database, with a human
+approving on Reap's hosted page. Nothing is deployed, nothing touches the prod database, and
+**nothing is charged**: it is the sandbox, and with `X-Simulate-Checkout: COMPLETED` the merchant
+order is simulated. Pivota never sees card data; the script prints hosted URLs and never opens them.
+
+What it refuses, before anything is built or sent:
+
+* a `DATABASE_URL` that is not a SQLite **file** or a Postgres on exactly `localhost` /
+  `127.0.0.1` / `::1` (dotted hosts, private IPs, `user@remote`, `?host=` overrides, multi-host
+  lists and host-less URLs all refuse);
+* a Reap base URL — from `--reap-base-url`, your shell's `REAP_API_BASE_URL`, or the env file —
+  that is not exactly `https://sandbox.api.reap.global`;
+* egress from the poll process to any host but the sandbox.
+
+The Reap key is **loaded at runtime** from `~/.config/pivota/reap_sandbox.env` (or
+`$REAP_SANDBOX_ENV`) by `serve` and `poll` only; it is never printed, never written to the state
+file, and `Authorization` is redacted in the call log. `serve` gets an **allowlisted** environment
+(PATH/HOME/locale/proxy/CA vars plus the keys below), so a shell exporting a production
+`DATABASE_URL`, `REDIS_URL`, `SENTRY_DSN` or a Cloud Run marker leaks nothing into the run.
+
+### The commands, in order
+
+```
+PY=.venv/bin/python
+# 1. schema + rows + local agent key + buyer JWT (printed: LOCAL test credentials only)
+$PY scripts/ops/reap_local_e2e.py seed --reset --seed-enrollment <reap enrollment uuid>
+#    (omit --seed-enrollment to go through card entry instead; see below)
+# 2. terminal 1 — the app on 127.0.0.1:8765; leave it running
+$PY scripts/ops/reap_local_e2e.py serve
+# 3. terminal 2 — POST the purchase over HTTP, then drive the poller in-process
+$PY scripts/ops/reap_local_e2e.py run            # = `purchase` then `poll`
+```
+
+State lives in `$TMPDIR/pivota-reap-local-e2e/` (`--state-dir` to move it): `local.db`,
+`state.json` (0600), `jwks.json`, `signing_key.pem` (0600). Add `--database-url
+postgresql://localhost/<db>` to `seed` to use a local Postgres instead; the later commands read it
+back from `state.json`. Every Reap call is logged, redacted, to `./reap_local_e2e_<ts>.json`
+(git-ignored; `--reap-log` to choose). The bodies contain the test buyer's address and email.
+
+`seed` defaults are the product measured quotable in the sandbox on 2026-09-25 (its index holds
+fashion merchants only): `fashionnova.com`, "Maven Lipstick - Snatched", variant `OS`, $1.98.
+`--product-title`, `--variant-title` (must equal Reap's option label **exactly**; `''` for a
+product with no variants), `--price`, `--brand`, `--category` override them.
+
+`serve` sets exactly: `DATABASE_URL` (local), `PIVOTA_ENV=development`, `REAP_AGENTIC_ENABLED=1`,
+`REAP_API_BASE_URL=https://sandbox.api.reap.global`, `REAP_API_KEY` (from the env file),
+`REAP_AGENTIC_SIMULATE_CHECKOUT=COMPLETED`, `AUDIT_WORKER_ENABLED=false` (the scheduler registers
+**no** jobs — the poller is driven by hand), `SKIP_HEAVY_STARTUP_INIT=true`,
+`AGENT_USER_JWKS_FILE` / `AGENT_USER_JWT_ISSUER` / `AGENT_USER_JWT_AUDIENCE` (the local buyer-JWT
+issuer `seed` created), `NO_PROXY`/`no_proxy` (this Mac's proxy drops `reap.global`), and
+`MVP_EVENTS_FILE`. `MERCHANT_PURCHASABILITY_ENFORCE` is left unset. On SQLite the boot prints a
+best-effort `no such table: webhook_events` traceback; it is harmless.
+
+### Enrollment: reuse, or card entry
+
+* **`--seed-enrollment <uuid>` (preferred).** `seed` writes the chain the route and the poller
+  walk: `buyer_identity_links` (agent, hash(`<iss>:<sub>`)) → a buyer id minted by the route's own
+  `_buyer_id_for`; `reap_agentic_buyer_refs` buyer → `pivota-probe-buyer-001` (`--buyer-ref`), the
+  owner the sandbox enrollment already belongs to; and an **active** `reap_agentic_enrollments`
+  row via `upsert_pending_enrollment` + `mark_enrollment_active`, bound to that Reap enrollment id.
+  The purchase then goes `resolving → quoting` with no card page, and the checkout is created
+  against that enrollment. The id must be the full UUID of an enrollment that is ACTIVE at Reap
+  (the two known ones start `5a3637e1` and `a5166ce3`).
+* **No flag.** The route mints a fresh buyer ref, the poller creates an enrollment, and `poll`
+  prints a **CARD ENTRY** URL. A human opens it and types their own (sandbox test) card; the next
+  `needs_enrollment` poll (every 30 s) sees ACTIVE and moves on.
+
+### What the human does, and the timings to expect
+
+`poll` narrates each transition. With a seeded enrollment, on the real cadence:
+
+| transition | when | why |
+|---|---|---|
+| `resolving → quoting` | first tick (≤ 5 s) | search → details → variant (each search up to ~9 s) |
+| `quoting → awaiting_approval` | next tick | quote (13–16 s) and checkout created **in the same step** |
+| — human — | **within 5 minutes** | open the printed **APPROVE** URL and approve. `poll` prints the quote total ($8.97 = 1.98 + 6.99 shipping), the quote expiry, the page expiry and **APPROVE BEFORE**: the quote's expiry, not the page's. An unapproved checkout goes FAILED 1–10 s after the quote expires (`last_error_code=approval_window_lapsed`) |
+| `awaiting_approval → processing` | next 30 s poll after approval | |
+| `processing → completed` | ~70 s after approval (polled every 15 s) | the sandbox places the simulated order and returns an `orderId` |
+
+`poll` stops at a terminal state or `--timeout` (default 900 s). A timed-out row is left as is;
+`poll` again resumes it (`--purchase-id` to pick one).
+
+### Reading the attribution edge
+
+On `completed`, `poll` prints the ledger row's public columns (`PUBLIC_PURCHASE_COLUMNS`), the
+order reference (Reap's `orderId`), and every `commerce_attribution_edges` row with that
+`external_order_id`: `merchant_id` = the canonical merchant (`fashionnova.com`), `agent_id` = the
+local agent (`agent_source: partner_purchase`), `gross_attributed_gmv_cents` = the final total
+(897), `metadata.partner_provenance` = the purchase id and Reap checkout id.
+
+**On SQLite there is no edge, and that is expected.** `_CLOSE_EXTERNAL_CONVERSION_SQL` is
+Postgres-only (`'[]'::jsonb`), so `_close_attribution` logs `error_type=OperationalError` and the
+purchase still completes. Seed with `--database-url postgresql://localhost/<db>` to see the edge.
+On Postgres, a completed row with no edge names the reason in `last_error_code` (see
+["The three codes that suppress the attribution edge"](#the-three-codes-that-suppress-the-attribution-edge)).
+
+### Rehearsing without the key
+
+`--dry-run` on `purchase` / `poll` / `run` replaces Reap with an in-process fake that sits
+**under** the real client (search, option matching, quote verification, the simulate header and
+the hosted-URL allowlist all run), simulates the human (card entry on the 2nd enrollment read,
+approval on the 2nd checkout read), and posts the purchase through the real app in-process with
+the real agent-key and JWT auth. No network, no key; `--fast` (dry run only) shrinks the per-state
+poll intervals to 1 s. `serve --dry-run` boots the server with a placeholder key so the HTTP path
+can be rehearsed: `serve --dry-run`, then `purchase`, then `poll --dry-run`.
+
 ## Tests
 
 | file | dialect | what it is for |
@@ -1096,6 +1205,8 @@ proof of the Reap cart-link quote contract or as authorization for a paid canary
 | `tests/test_reap_agentic_purchase_poll_postgres.py` | Postgres (dialect gate) | the poller across **two real backend connections**, its SQL constants under PREPARE, the error backoff against the server clock, `include_processing=False` on the real statement, the PII deadline with the rail off, claim release on cancellation |
 | `tests/test_agent_commerce_reap_routes.py` | SQLite | the three routes over the real app: the router is MOUNTED, the 404 on all three while dark **and for every shape of malformed input**, the ownership conjuncts, eligibility and the market, the price coming from our catalog and from THIS merchant's own offer, the market-currency rule, the buyer ref, idempotency including the request-hash conflict, unprintable identifiers, the hosted-URL vetting, the per-statement self-heal, and that no response or log line carries the buyer; **WP4b**: the first purchase minting exactly one buyer/link/ref, the second reusing them, a hosted-checkout link never being re-minted, two agents sharing a user ref getting two buyers, a link racing in at the write seam winning, and consent being required, ordered after the dial, and stored |
 | `tests/test_agent_commerce_reap_routes_postgres.py` | Postgres (dialect gate) | migrations 226+227 vs the self-heal through the **catalog** (columns, `indexdef`, `pg_get_constraintdef`), the `numeric`→`Decimal` price path the `CAST` exists for, the `market_country` regex CHECK, **a NUL byte in an identifier being a refusal and not a 500** (asyncpg raises where SQLite stores it happily, so only this arm can see it), and every security-relevant refusal re-run on the production dialect; **WP4b**: the mint against the REAL unique constraint (`ON CONFLICT DO NOTHING` as Postgres implements it), the `VARCHAR(32)` consent cap refusing rather than truncating, and `consented_at` being a real aware `timestamptz` |
+
+| `tests/test_reap_local_e2e_harness.py` | SQLite | the local e2e harness: both safety guards (local DB, sandbox-only base), the allowlisted env, call-log redaction, sandbox-only egress, `seed` read back through the route's own catalog SQL, and `run --dry-run` driven to `completed` with and without a seeded enrollment |
 
 All four drive the **real** ledger and the client's **real** pure helpers; only the client's six
 transport functions are faked, and an autouse fixture makes an unpatched `httpx.AsyncClient`
