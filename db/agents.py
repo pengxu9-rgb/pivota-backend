@@ -593,6 +593,25 @@ async def resolve_agent_id_by_api_key(api_key: str) -> Optional[str]:
     return str(agent_id) if agent_id else None
 
 
+async def resolve_active_agent_id(agent_id: Any) -> Optional[str]:
+    """agent_id when it names an existing ACTIVE agent, else None.
+
+    For an agent_id read from a signed claim, e.g. the agent-portal JWT (7-day session). The
+    signature proves which agent the caller was at login, not that the agent is still active:
+    deactivation does not revoke issued tokens, and portal login checks users.active, not
+    agents.is_active. Reads the row (get_agent), not the per-key auth cache, so a deactivation
+    is seen on the next request. A missing or unreadable row is None: fail closed.
+    """
+    candidate = str(agent_id or "").strip()
+    if not candidate:
+        return None
+    agent = await get_agent(candidate)
+    if not agent_is_active(agent):
+        return None
+    resolved = str(agent.get("agent_id") or "").strip()
+    return resolved if resolved == candidate else None
+
+
 async def get_agent(agent_id: str) -> Optional[Dict[str, Any]]:
     """获取 Agent 信息（不含 API Key）"""
     try:

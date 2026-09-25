@@ -601,12 +601,7 @@ async def _get_agent_context_from_checkout_token(request: Request, token: str) -
     if "allowed_merchants" not in agent:
         agent["allowed_merchants"] = None
 
-    # Active check: support both is_active and status fields
-    is_active = agent.get("is_active")
-    if is_active is None:
-        status = agent.get("status")
-        is_active = (str(status).lower() == "active") if status else True
-    if not is_active:
+    if not agent_is_active(agent):
         raise HTTPException(status_code=403, detail="Agent is deactivated")
 
     context = AgentContext(agent, request)
