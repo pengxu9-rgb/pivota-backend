@@ -105,6 +105,21 @@ def build_queries(purchase_cols, click_cols=None):
             "coalesce(sum(e.refunded_amount), 0) AS refunded_amount "
             "FROM commerce_attribution_edges e WHERE e.created_at >= :since GROUP BY 1, 2, 3, 4, 5"
         ),
+        # MCP OAuth connectors by the platform their OAuth client registered (claude.ai, chatgpt.com,
+        # loopback, ...). An UNVERIFIED label unless oauth_platform_verified: analytics, never credit,
+        # which is why it is reported beside the agents, not as one.
+        "platforms": (
+            "SELECT c.context ->> 'oauth_platform' AS platform, "
+            "coalesce(c.context ->> 'oauth_platform_verified', 'false') = 'true' AS verified, "
+            # DISTINCT: the edge join yields one row per ORDER, and one link can lead to several.
+            "count(DISTINCT c.click_id) AS issued, "
+            "count(DISTINCT c.click_id) FILTER (WHERE c.click_count > 0) AS clicked, "
+            "count(DISTINCT e.edge_id) FILTER (WHERE e.state = 'converted') AS converted "
+            "FROM surface_click_events c "
+            "LEFT JOIN commerce_attribution_edges e ON e.click_id = c.click_id "
+            "WHERE c.created_at >= :since AND c.context ->> 'oauth_platform' IS NOT NULL "
+            "GROUP BY 1, 2"
+        ),
     }
     if not cols:
         return queries
@@ -235,12 +250,19 @@ def build_funnel(rows, days, now=None):
         r["credited_partner"] for r in all_rows if r["agent"] != NO_AGENT
     )
     totals["agents_truncated"] = max(0, len(ordered) - MAX_AGENTS)
+    platforms = sorted(
+        ({"platform": str(r["platform"]), "verified": bool(r.get("verified")), "issued": _int(r["issued"]),
+          "clicked": _int(r["clicked"]), "converted": _int(r.get("converted"))}
+         for r in rows.get("platforms") or []),
+        key=lambda p: (-p["converted"], -p["clicked"], -p["issued"], p["platform"], not p["verified"]),
+    )
     return {
         "window_days": days,
         "generated_at": now.isoformat(),
         "purchases_table": "purchases" in rows,
         "totals": totals,
         "agents": agent_rows,
+        "platforms": platforms[:MAX_AGENTS],
         "exceptions": {
             "completed_without_edge": {"count": len(missing), "by_reason": dict(reasons),
                                        "rows": missing[:MAX_EXCEPTION_ROWS]},
@@ -299,6 +321,15 @@ def render(funnel):
         )
     if t["agents_truncated"]:
         lines.append(f"... {t['agents_truncated']} more agents not shown")
+    if funnel.get("platforms"):
+        lines += ["", "MCP OAUTH PLATFORMS  (from each client's registered redirect URIs; analytics, never credit;",
+                  " 'claimed' = a public client, which anyone can register with any callback)",
+                  f"{'platform':<44} {'label':<9} {'issued':>6} {'click':>6} {'conv':>5}"]
+        for p in funnel["platforms"]:
+            # Registrant-controlled text: never let a stored label drive the terminal.
+            name = "".join(ch if ch.isprintable() and ord(ch) < 0x2000 else "?" for ch in p["platform"])
+            lines.append(f"{name[:44]:<44} {'verified' if p['verified'] else 'claimed':<9} "
+                         f"{p['issued']:>6} {p['clicked']:>6} {p['converted']:>5}")
     ex = funnel["exceptions"]
     lines += ["", "INTEGRITY"]
     cwe = ex["completed_without_edge"]

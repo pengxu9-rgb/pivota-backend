@@ -235,3 +235,40 @@ async def test_the_unknown_sentinel_is_reported_as_no_agent(_db):
     assert next(a for a in fn["agents"] if a["agent"] == f.NO_AGENT)["issued"] == 1
     assert fn["totals"]["credited_partner_to_agent"] == 0
     assert [r["edge_id"] for r in fn["exceptions"]["partner_edge_without_agent"]["rows"]] == ["e_u"]
+
+
+async def test_mcp_oauth_platforms_are_reported_beside_the_agents_never_as_one(_db):
+    """The OAuth platform label (analytics) is counted per platform, and a converted edge on its click
+    counts as converted, while the agent table keeps those clicks under no agent."""
+    from scripts import agent_attribution_funnel as f
+
+    await _build_schema()
+    await _db.execute(
+        "INSERT INTO surface_click_events (click_id, surface, agent_id, impression_count, click_count, "
+        "issued_at, context, created_at, updated_at) VALUES "
+        "('clk_c1', 'offers.resolve', NULL, 0, 1, :now, CAST(:claude AS JSONB), :now, :now), "
+        "('clk_c2', 'offers.resolve', NULL, 0, 0, :now, CAST(:claude AS JSONB), :now, :now), "
+        "('clk_p1', 'offers.resolve', 'agent_acme', 0, 1, :now, CAST(:acme AS JSONB), :now, :now), "
+        "('clk_none', 'offers.resolve', NULL, 0, 1, :now, NULL, :now, :now)",
+        {"now": NOW,
+         "claude": json.dumps({"oauth_platform": "claude.ai", "oauth_platform_verified": False}),
+         "acme": json.dumps({"oauth_platform": "claude.ai", "oauth_platform_verified": True})},
+    )
+    await _db.execute(
+        "INSERT INTO commerce_attribution_edges (edge_id, merchant_id, order_id, click_id, state, "
+        "refund_count, refunded_amount, metadata, created_at, updated_at, source) "
+        "VALUES ('e_c1', 'brand.example', 'ext_c1', 'clk_c1', 'converted', 0, 0, '{}'::jsonb, :now, :now, "
+        "'external_redirect'), "
+        # A SECOND order on the same link: the link must still count once as issued and clicked.
+        "('e_c1b', 'brand.example', 'ext_c1b', 'clk_c1', 'converted', 0, 0, '{}'::jsonb, :now, :now, "
+        "'external_redirect')",
+        {"now": NOW},
+    )
+    fn = f.build_funnel(await f.collect(30), 30)
+    assert fn["platforms"] == [
+        {"platform": "claude.ai", "verified": False, "issued": 2, "clicked": 1, "converted": 2},
+        {"platform": "claude.ai", "verified": True, "issued": 1, "clicked": 1, "converted": 0},
+    ]
+    assert {a["agent"] for a in fn["agents"]} == {f.NO_AGENT, "agent_acme"}
+    text = f.render(fn)
+    assert "MCP OAUTH PLATFORMS" in text and "claimed" in text and "verified" in text

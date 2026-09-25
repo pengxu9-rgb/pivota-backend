@@ -143,3 +143,32 @@ async def test_a_lookup_failure_names_no_one(monkeypatch):
     monkeypatch.setenv(ia.ISSUING_AGENT_ASSERTION_SECRET_ENV, VECTOR_SECRET)
     assert await ia.resolve_asserted_agent_id(AGENT_VECTOR, op=OP, now=VECTOR_TS) is None
 
+
+
+@pytest.mark.parametrize(
+    "uris, label",
+    [
+        (["https://claude.ai/api/mcp/auth_callback"], "claude.ai"),
+        (["https://claude.ai/cb", "https://claude.com/api/mcp/auth_callback"], "claude.ai+claude.com"),
+        (["https://www.ChatGPT.com/connector_platform_oauth_redirect"], "chatgpt.com"),
+        (["http://localhost:33418/callback"], "(loopback)"),
+        (["http://127.0.0.1:8080/cb", "http://[::1]/cb"], "(loopback)"),
+        (["https://10.1.2.3/cb"], "(ip)"),
+        (["cursor://anysphere.cursor-retrieval/oauth/callback"], "app:cursor"),
+        (["https://vscode.dev/redirect", "http://127.0.0.1:1234/"], "(loopback)+vscode.dev"),
+        # Registrant-controlled hosts: terminal escapes, bidi overrides and look-alikes never pass.
+        (["https://claude\x1b[1A.ai/cb"], "(invalid)"),
+        (["https://ia.edualc\u202e/cb"], "(invalid)"),
+        (["https://\x9b2Aevil.com/cb"], "(invalid)"),
+        (["https://claude.ai+chatgpt.com/cb"], "(invalid)"),
+        (["https://loopback/cb"], "loopback"),
+        (["https://bücher.example/cb"], "xn--bcher-kva.example"),
+        ([], None),
+        (["", None, 7], None),
+        ("https://claude.ai/cb", None),
+    ],
+)
+def test_a_platform_label_names_where_the_client_says_it_lives(uris, label):
+    uris = [u.encode().decode("unicode_escape") if isinstance(u, str) and "\\" in u else u for u in uris] \
+        if isinstance(uris, list) else uris
+    assert ia.platform_label(uris) == label

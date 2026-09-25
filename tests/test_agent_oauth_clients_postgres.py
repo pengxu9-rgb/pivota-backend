@@ -298,3 +298,42 @@ async def db_fetch_val(sql, values=None):
     from db.database import database
 
     return await database.fetch_val(sql, values or {})
+
+
+async def _resolve_full(client_id, *, iss=ISS):
+    from services.issuing_agent_assertion import resolve_asserted_issuing, sign_issuing_agent_assertion
+
+    now = int(time.time())
+    token = sign_issuing_agent_assertion(
+        {"v": 1, "kind": "oauth", "iss": iss, "cid": client_id, "op": OP, "ts": now}, SECRET)
+    return await resolve_asserted_issuing(token, op=OP, excluded_agent_ids={"agent_gw"}, now=now)
+
+
+async def test_a_public_connector_gets_a_claimed_platform_label_and_no_agent(db):
+    from services import mcp_oauth_flow as flow
+
+    public = await flow.register_client(db, {"redirect_uris": [CLAUDE_CALLBACK]})
+    out = await _resolve_full(public["client_id"])
+    assert out.agent_id is None
+    assert out.context == {"oauth_platform": "claude.ai", "oauth_platform_verified": False}
+
+
+async def test_a_provisioned_client_gets_a_verified_label_and_its_agent(db):
+    out = await _resolve_full((await _provision(db))["client_id"])
+    assert out.agent_id == "agent_acme"
+    assert out.context == {"oauth_platform": "claude.ai", "oauth_platform_verified": True}
+
+
+async def test_a_desktop_client_is_labelled_loopback(db):
+    from services import mcp_oauth_flow as flow
+
+    local = await flow.register_client(db, {"redirect_uris": ["http://localhost:33418/callback"]})
+    assert (await _resolve_full(local["client_id"])).context["oauth_platform"] == "(loopback)"
+
+
+async def test_a_foreign_issuer_or_unknown_client_gets_no_label(db):
+    from services import mcp_oauth_flow as flow
+
+    public = await flow.register_client(db, {"redirect_uris": [CLAUDE_CALLBACK]})
+    assert (await _resolve_full(public["client_id"], iss="https://other-as.example")).context == {}
+    assert (await _resolve_full("mcpc_never_registered")).context == {}
