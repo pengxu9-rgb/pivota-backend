@@ -391,3 +391,27 @@ async def test_a_superseded_transition_still_releases_the_lease(db):
                                        expected_status="queued", db=db)
     row = await db.fetch_one("SELECT lease_until FROM retailer_ingest_jobs WHERE id=:id", {"id": job_id})
     assert row["lease_until"] is None
+
+
+async def test_a_refile_moves_a_handle_an_earlier_approval_excluded_and_back(db):
+    # Review of #2316: appending left the handle in BOTH lists; the drain then failed the job for good.
+    job_id = await _enqueue(db, brand="MOVE", options={"vendors": ["X"], "exclude_handles": ["Cream-Duo", "other"]})
+    await ledger.transition(job_id, status="held", reason="flag", run_id=None, db=db)
+    assert await ledger.approve(job_id, approved_by="peng", exclude_handles=[], accepted_flags=[],
+                                refile_handles=["cream-duo/"], db=db)
+
+    async def options():
+        import json as _json
+        row = await db.fetch_one("SELECT options FROM retailer_ingest_jobs WHERE id=:id", {"id": job_id})
+        return row["options"] if isinstance(row["options"], dict) else _json.loads(row["options"])
+    got = await options()
+    assert got["exclude_handles"] == ["other"] and got["refile_to_sets"] == ["cream-duo/"]
+    from services.retailer_ingest.pipeline import validate_options
+    validate_options(dict(got))  # the drain accepts what the approval wrote
+    await ledger.transition(job_id, status="held", reason="flag", run_id=None, db=db)
+    assert await ledger.approve(job_id, approved_by="peng", exclude_handles=["CREAM-DUO"], accepted_flags=[], db=db)
+    got = await options()
+    assert got["exclude_handles"] == ["other", "CREAM-DUO"] and got["refile_to_sets"] == []
+    with pytest.raises(ValueError, match="both re-filed and excluded"):
+        await ledger.approve(job_id, approved_by="peng", exclude_handles=["a"], accepted_flags=[],
+                             refile_handles=["A/"], db=db)

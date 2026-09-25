@@ -76,12 +76,11 @@ REFILE_SETS_LEAF = "beauty/sets/gift-set"
 #: 0.8/0.82/0.85/0.9/0.95), so a stored row placed this way can be found without the ledger.
 CATEGORY_CONFIDENCE_REVIEW_REFILE = 0.74
 #: The flags a re-file answers: the reviewer decided the row IS a set, so "a set on a single-product
-#: shelf" and "the title names another shelf" (its contents) are resolved. Every other flag still runs.
+#: shelf" and "the title names another shelf" (its contents) are resolved. Every other flag still runs
+#: -- on the row as the STORE filed it too, since the lip rules key on the store's shelf.
 REFILE_RESOLVES_RULES = frozenset({"set_filed_as_single_product", "title_contradicts_category"})
 
-
-def _handle_key(value: Any) -> str:
-    return str(value).strip().strip("/").casefold()
+_handle_key = ledger.handle_key
 MAX_PDP_IDENTITY_FETCHES = 300
 # PDP INCI enrichment in an unattended stage: the worker's default (300 fetches, no time limit) ran luxiface.com
 # past the 3600 s task timeout twice (2.2 s CPU per ~2 MB page). The drain fetches at most this many by default
@@ -371,18 +370,21 @@ def _left_out_summary(left_out: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def _refile_to_sets(records: List[Dict[str, Any]], handles: Any, checks: Dict[str, Any],
-                    flags: List[Dict[str, Any]]) -> set:
-    """File the reviewer-named bundles under REFILE_SETS_LEAF; returns the handles re-filed. A named
-    handle the crawl no longer carries blocks (like an unmatched exclusion) -- accept its key to go on."""
+                    flags: List[Dict[str, Any]]) -> tuple:
+    """File the reviewer-named bundles under REFILE_SETS_LEAF; returns (handles re-filed, each re-filed
+    record AS THE STORE FILED IT, for the detectors). A named handle the crawl no longer carries blocks
+    (like an unmatched exclusion) -- accept its key to go on."""
+    import copy
     import scripts.onboard_curated_brands as cli
     wanted = {_handle_key(h) for h in (handles or []) if str(h).strip()}
     if not wanted:
-        return set()
-    matched = set()
+        return set(), []
+    matched, as_filed = set(), []
     for record in records:
         handle = cli._record_handle(record)
         pdp = record.get("pdp")
         if handle in wanted and isinstance(pdp, dict):
+            as_filed.append(copy.deepcopy(record))
             pdp["category_path"] = REFILE_SETS_LEAF
             pdp["category_resolution_status"] = "resolved"
             pdp["category_confidence"] = CATEGORY_CONFIDENCE_REVIEW_REFILE
@@ -392,7 +394,7 @@ def _refile_to_sets(records: List[Dict[str, Any]], handles: Any, checks: Dict[st
         flags.append({"key": f"refile_handle_unmatched:{handle}", "rule": "refile_handle_unmatched",
                       "severity": detectors.BLOCK, "handle": handle,
                       "detail": "an approved re-file to gift sets no longer matches any product"})
-    return matched
+    return matched, as_filed
 
 
 async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -417,10 +419,19 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
             flags.append({"key": f"exclude_handle_unmatched:{handle}", "rule": "exclude_handle_unmatched",
                           "severity": detectors.BLOCK, "handle": handle,
                           "detail": "an approved exclusion no longer matches any product"})
-    refiled = _refile_to_sets(records, o.get("refile_to_sets"), checks, flags)
+    refiled, refiled_as_filed = _refile_to_sets(records, o.get("refile_to_sets"), checks, flags)
     if o.get("only_category") or o.get("only_resolved_category"):
         selected = len(records)
-        records, left_out = cli._partition_by_category(records, prefix=o.get("only_category"))
+        # A reviewer's re-file is kept whatever the cohort's category filter: a lip pass that re-files a
+        # lip duo must not drop it as "outside beauty/makeup/lip" and still report it re-filed.
+        kept_refiled = [r for r in records if cli._record_handle(r) in refiled]
+        records, left_out = cli._partition_by_category(
+            [r for r in records if cli._record_handle(r) not in refiled], prefix=o.get("only_category"))
+        if kept_refiled:
+            outside, _ = cli._partition_by_category(kept_refiled, prefix=o.get("only_category"))
+            checks["refiled_kept_outside_filter"] = sorted(
+                {cli._record_handle(r) for r in kept_refiled} - {cli._record_handle(r) for r in outside})
+            records = records + kept_refiled
         cli._print_category_filter(selected, records, left_out, domain=job["domain"],
                                    want=cli._normalize_category_prefix(o.get("only_category")))
         checks["left_out"] = _left_out_summary(left_out)
@@ -449,6 +460,10 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
 
     row_flags = detectors.detect(records)
     if refiled:
+        # Judge each re-filed row on BOTH shelves: the rules keyed on the store's shelf (lip size, lip
+        # copy, the lip title door) cannot fire on the gift-set shelf, and a re-file must not hide them.
+        seen = {f["key"] for f in row_flags}
+        row_flags += [f for f in detectors.detect(refiled_as_filed) if f["key"] not in seen]
         answered = [f for f in row_flags if f.get("handle") in refiled and f.get("rule") in REFILE_RESOLVES_RULES]
         row_flags = [f for f in row_flags if f not in answered]
         checks["refile_resolved_flags"] = sorted(f["key"] for f in answered)

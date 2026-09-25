@@ -119,7 +119,7 @@ class ApproveBody(BaseModel):
 
     @model_validator(mode="after")
     def _refile_or_exclude(self) -> "ApproveBody":
-        key = lambda h: h.strip().strip("/").casefold()
+        key = ledger.handle_key
         both = sorted({key(h) for h in self.refile_handles} & {key(h) for h in self.exclude_handles})
         if both:
             raise ValueError(f"a handle cannot be both re-filed and excluded: {both}")

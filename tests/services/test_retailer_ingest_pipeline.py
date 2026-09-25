@@ -947,8 +947,8 @@ async def test_a_refiled_set_lands_on_the_gift_set_shelf_and_the_store_applies(s
     assert pdps["velvet-cream"]["category_path"] != pipeline.REFILE_SETS_LEAF
     run = _last_run(sets_env)
     assert run["checks"]["refiled_to_sets"] == ["cream-duo-gift-set"]
-    # On the gift-set shelf the set rule no longer fires at all: nothing was waved through.
-    assert run["checks"]["refile_resolved_flags"] == []
+    # The set rule fired where the store filed it; the re-file is what answered it.
+    assert run["checks"]["refile_resolved_flags"] == ["set_filed_as_single_product:cream-duo-gift-set"]
 
 
 async def test_a_refiled_system_whose_title_names_only_its_contents_is_not_a_contradiction(sets_env):
@@ -992,3 +992,34 @@ def test_a_handle_cannot_be_both_refiled_and_excluded():
 def test_the_refile_shelf_is_a_leaf_both_taxonomies_serve():
     from services.category_path_aliases import resolve
     assert resolve(pipeline.REFILE_SETS_LEAF) == pipeline.REFILE_SETS_LEAF
+
+
+async def test_a_refile_answers_its_own_rows_not_another_rows_set_flag(sets_env):
+    # Review of #2316: clearing by rule alone would let one re-file wave through every set in the store.
+    sets_env.products = [product("3CE Cream & Hand Cream Duo Gift Set", "Moisturizer", "cream-duo-gift-set"),
+                         product("3CE Cleansing Oil Set", "Cleanser", "oil-set")]
+    out = await pipeline.run_stage(job("apply_due", refile_to_sets=["cream-duo-gift-set"]), db=sets_env.db)
+    assert out["status"] == "held"
+    assert [f["key"] for f in _last_run(sets_env)["flags"]] == ["set_filed_as_single_product:oil-set"]
+
+
+async def test_a_refile_does_not_hide_the_rules_keyed_on_the_stores_shelf(env):
+    # Review of #2316: on the gift-set shelf the lip rules cannot fire, so they run on the row as the
+    # store filed it. A 40 ml "lip tint" that is a complexion cream still holds after a re-file.
+    env.rows = [TINT, TONE_UP]
+    out = await pipeline.run_stage(job("apply_due", refile_to_sets=["3ce-tone-up-tint-40ml"]), db=env.db)
+    assert out["status"] == "held"
+    rules = {f["rule"] for f in list(env.ledger.runs.values())[-1]["flags"]}
+    assert rules & {"lip_row_implausible_size", "lip_row_copy_not_about_lips"}
+
+
+async def test_a_lip_pass_keeps_a_refiled_lip_set_instead_of_dropping_it(env):
+    # Review of #2316: an only_category=beauty/makeup/lip cohort filtered the re-filed row out as
+    # "outside the filter" while still reporting it re-filed -- a re-file turned into an exclusion.
+    env.rows = [TINT, ("3CE - Velvet Lip Tint Duo Set", "LIP TINT", "lip-duo-set")]
+    out = await pipeline.run_stage(job("apply_due", only_category="beauty/makeup/lip", refile_to_sets=["lip-duo-set"]),
+                                   db=env.db)
+    assert out["status"] == "done"
+    paths = {p["canonical_url"].rsplit("/", 1)[-1]: p["category_path"] for p in env.applied[0]["pdps"]}
+    assert paths["lip-duo-set"] == pipeline.REFILE_SETS_LEAF and "velvet-lip-tint-plush" in paths
+    assert list(env.ledger.runs.values())[-1]["checks"]["refiled_kept_outside_filter"] == ["lip-duo-set"]
