@@ -15,7 +15,6 @@ import argparse
 import asyncio
 import logging
 import os
-from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from db.database import database
@@ -127,14 +126,13 @@ async def reconcile_paid_orders_missing_merchant_order(
 
     await ensure_merchant_order_sync_jobs_table()
 
-    cutoff = datetime.utcnow() - timedelta(seconds=int(min_age_seconds))
     merchant_clause = "AND merchant_id = :merchant_id" if merchant_id else ""
     # Bind ONLY what `merchant_clause` actually interpolates. `databases` hands
     # this dict straight to text().bindparams(), which raises ArgumentError for
     # a parameter the query never declared — and the scheduled caller always
     # passes merchant_id=None, so an unconditional bind fails every real run.
     values: Dict[str, Any] = {
-        "cutoff": cutoff,
+        "min_age_seconds": int(min_age_seconds),
         "limit": int(limit),
         "op": OP_MERCHANT_ORDER_CREATE,
         "dedupe_key": MERCHANT_ORDER_CREATE_DEDUPE_KEY,
@@ -152,10 +150,14 @@ async def reconcile_paid_orders_missing_merchant_order(
           -- leaves shopify_order_id empty, so without this every successfully
           -- delivered non-Shopify order matched this query forever.
           AND COALESCE(metadata -> 'merchant_order' ->> 'platform_order_id', '') = ''
-          AND (
-            (paid_at IS NOT NULL AND paid_at <= :cutoff)
-            OR (paid_at IS NULL AND created_at <= :cutoff)
-          )
+          -- The age cutoff is the DATABASE clock, exactly as the
+          -- paid_missing_merchant_order_count alert computes it. A Python
+          -- `utcnow()` bound here is naive, and asyncpg encodes a naive
+          -- datetime for a timestamptz as the PROCESS's local time: on a
+          -- UTC+8 host the cutoff landed 8h early and orders the alert pages
+          -- on were invisible to the lane that repairs them.
+          AND COALESCE(paid_at, created_at)
+              <= (NOW() - (:min_age_seconds * INTERVAL '1 second'))
           -- Only orders the queue has never been told about. A job in ANY state
           -- means the queue owns this order; re-enqueuing would revive it for
           -- another attempt on every tick, which is the amplification this
