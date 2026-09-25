@@ -248,10 +248,10 @@ async def test_in_stock_only_and_agent_v2_read_the_seeds_own_claim(monkeypatch):
 
     assert [o["availability"]["in_stock"] for o in _canonicalize_search_product(out)["offers"]] == [False]
     assert [o["availability"]["in_stock"] for o in _canonicalize_search_product(in_)["offers"]] == [True]
-    # KNOWN GAP, pinned so changing it is deliberate: agent_v2 defaults a missing
-    # `in_stock` to True, exactly as it already does for every live-verification row.
-    # Publishing unknown as null is an agent_v2 contract change with its own blast radius.
-    assert [o["availability"]["in_stock"] for o in _canonicalize_search_product(unknown)["offers"]] == [True]
+    # Was a KNOWN GAP (agent_v2 defaulted the missing `in_stock` to True); flipped
+    # deliberately: unknown is published as null, never True and never False. Consumer
+    # audit + gateway run: tests/test_agent_v2_unknown_seed_stock_is_null.py.
+    assert [o["availability"]["in_stock"] for o in _canonicalize_search_product(unknown)["offers"]] == [None]
 
 
 @pytest.mark.parametrize("module_path", _MODULES)
