@@ -38,6 +38,16 @@ ALLOWED_WRITER_FILES = {
     "services/audit_index_intake.py",               # door 5: audit / URL-wedge
 }
 
+# NOT DOORS. Operator scripts that seed a LOCAL fixture database and can never write the
+# production catalog. Each entry is exempt only while `_local_fixture_guard_holds` proves, by
+# CALLING the script's own guard, that it refuses a non-local DATABASE_URL — a comment saying
+# "local only" is not the exemption, the passing guard is. Same drift rule as the doors: an entry
+# that stops writing must leave the set.
+LOCAL_FIXTURE_WRITERS = {
+    # seeds one catalog row for the Reap sandbox e2e run; refuses any non-local DATABASE_URL
+    "scripts/ops/reap_local_e2e.py": "check_local_database_url",
+}
+
 # All four live insert idioms, matched against whitespace-collapsed source so
 # multi-line calls (the `_upsert_by_pk(\n    catalog_products, ...` shape that
 # a literal grep misses) are caught.
@@ -79,6 +89,33 @@ def _writer_hits(path: Path) -> list[str]:
     return [p.pattern for p in WRITER_PATTERNS if p.search(collapsed)]
 
 
+def _local_fixture_guard_holds(rel: str, guard_name: str) -> bool:
+    """Load the script by path and call its guard: it must refuse remote databases and accept a
+    SQLite file. Any other outcome (missing guard, a guard that accepts a remote host) is False."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "_tripwire_fixture_" + rel.replace("/", "_").replace(".", "_"), REPO_ROOT / rel
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    guard = getattr(module, guard_name, None)
+    if guard is None:
+        return False
+    for remote in ("postgresql://10.25.0.2/pivota", "postgresql://db.pivota.cc/pivota",
+                   "postgresql://localhost@34.120.1.9/pivota"):
+        try:
+            guard(remote)
+        except Exception:  # noqa: BLE001 — any refusal is a refusal
+            continue
+        return False
+    try:
+        guard("sqlite+aiosqlite:////tmp/tripwire_probe.db")
+    except Exception:  # noqa: BLE001
+        return False
+    return True
+
+
 def test_catalog_products_writers_are_exactly_the_five_chokepoints():
     violations = {}
     seen_writers = set()
@@ -88,6 +125,10 @@ def test_catalog_products_writers_are_exactly_the_five_chokepoints():
             continue
         rel = path.relative_to(REPO_ROOT).as_posix()
         seen_writers.add(rel)
+        if rel in LOCAL_FIXTURE_WRITERS and _local_fixture_guard_holds(
+            rel, LOCAL_FIXTURE_WRITERS[rel]
+        ):
+            continue
         if rel not in ALLOWED_WRITER_FILES:
             violations[rel] = hits
     assert not violations, (
@@ -99,7 +140,7 @@ def test_catalog_products_writers_are_exactly_the_five_chokepoints():
     # Drift guard in the other direction: if a chokepoint stops writing (door
     # refactor/move), the allowlist must shrink in the same reviewed change —
     # a stale allowlist would quietly re-open the door somewhere else.
-    missing = ALLOWED_WRITER_FILES - seen_writers
+    missing = (ALLOWED_WRITER_FILES | set(LOCAL_FIXTURE_WRITERS)) - seen_writers
     assert not missing, (
         f"Allowlisted chokepoint(s) no longer write catalog_products: {missing}. "
         "Update ALLOWED_WRITER_FILES (and ADR-011's door table) in this change."

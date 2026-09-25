@@ -74,3 +74,6 @@ reports/meitu_final_2026_09_07/gateway_env_before.yaml
 # this checkout is shared, and that has happened here before. Ignoring it does NOT remove it
 # from the gate: ruff.toml sets respect-gitignore = false.
 zz_lint_canary_probe.py
+# scripts/ops/reap_local_e2e.py writes its JSON log of Reap sandbox calls to the cwd by default.
+# Authorization is redacted, but the bodies carry the operator's test buyer address and email.
+reap_local_e2e_*.json
