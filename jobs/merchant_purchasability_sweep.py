@@ -322,6 +322,12 @@ def _population_key(value: Any) -> str:
 #: The `SweepReport` count of allowlist rows `_population_key` refused. A COUNT, never the rows.
 UNUSABLE_TALLY = "population_skipped_unusable"
 
+#: The `SweepReport` count of allowlist rows whose MARKET the one ISO-2 rule could not key. Both
+#: allowlist tables CHECK their market column today, so this is expected to read 0 — it exists so
+#: that a row which does get past them is visible rather than silently dropped (or, as before
+#: 2026-09-26, silently swept under a truncated market).
+MARKET_UNKNOWN_TALLY = "population_skipped_market_unknown"
+
 
 async def load_population(
     limit: int, *, tally: Optional[Dict[str, int]] = None
@@ -342,25 +348,33 @@ async def load_population(
     # helper filters on, so the population cannot be narrower than what the door accepts — which
     # it was, until a reviewer measured a merchant the route admitted and the sweep never visited
     # (the sweep additionally required `variant_key = ''`; the route never has).
-    def _unusable() -> None:
+    def _count(name: str) -> None:
         if tally is not None:
-            tally[UNUSABLE_TALLY] = tally.get(UNUSABLE_TALLY, 0) + 1
+            tally[name] = tally.get(name, 0) + 1
+
+    # THE MARKET IS NEVER DEFAULTED. `facts.normalize_market` is the one ISO-2 rule and answers
+    # None for anything it cannot key; such a row is SKIPPED and COUNTED (MARKET_UNKNOWN_TALLY),
+    # never swept as "US" and never truncated ("USA" is not "US"). Counted independently of the
+    # domain tally, so a row wrong in both ways shows up in both counts.
+    def _key(domain: Any, market: Any) -> Optional[Tuple[str, str]]:
+        key_domain = _population_key(domain)
+        key_market = facts.normalize_market(market)
+        if not key_domain:
+            _count(UNUSABLE_TALLY)
+        if key_market is None:
+            _count(MARKET_UNKNOWN_TALLY)
+        if not key_domain or key_market is None:
+            return None
+        return (key_domain, key_market)
 
     for row in await ledger.list_enabled_merchant_markets():
-        key = (
-            _population_key(row.get("merchant_domain")),
-            facts.normalize_market(row.get("market_country")),
-        )
-        if not key[0]:
-            _unusable()
-        if key[0] and len(key[1]) == 2:
+        key = _key(row.get("merchant_domain"), row.get("market_country"))
+        if key is not None:
             merged.setdefault(key, None)
     for row in await _rows(_CART_LANE_SQL):
-        key = (_population_key(row.get("domain")), facts.normalize_market(row.get("market")))
-        if not key[0]:
-            _unusable()
+        key = _key(row.get("domain"), row.get("market"))
         variant = str(row.get("variant_id") or "").strip() or None
-        if key[0] and len(key[1]) == 2 and (variant or key not in merged):
+        if key is not None and (variant or key not in merged):
             merged[key] = variant
 
     # Least-recently-checked FIRST, and never-checked first of all — ordered before the catalog
@@ -431,6 +445,10 @@ class SweepReport:
     #: (a URL, a port, a trailing dot...). The purchase route can never admit such a row, so each
     #: one is a merchant an operator meant to enable and did not.
     population_skipped_unusable: int = 0
+    #: Allowlist rows left out because their MARKET is not ISO-2 (absent, blank, "USA"...). The
+    #: market is never defaulted or truncated, so such a row is not swept; see
+    #: `MARKET_UNKNOWN_TALLY`.
+    population_skipped_market_unknown: int = 0
     checked: int = 0
     positive: int = 0
     negative: int = 0
@@ -443,8 +461,8 @@ class SweepReport:
 
 
 _COUNTS = (
-    "population", "population_skipped_unusable", "checked", "positive", "negative", "unverifiable", "written",
-    "abandoned_budget", "errors", "skipped_disabled",
+    "population", "population_skipped_unusable", "population_skipped_market_unknown", "checked",
+    "positive", "negative", "unverifiable", "written", "abandoned_budget", "errors", "skipped_disabled",
 )
 
 #: Indirected so a test can make the budget elapse without sleeping. MONOTONIC: the budget must
@@ -526,6 +544,12 @@ async def run_merchant_purchasability_sweep(*, worker_id: Optional[str] = None) 
         operator_logger.warning(
             "merchant_purchasability_sweep: %d allowlist row(s) skipped: domain is not a bare "
             "host name", counts["population_skipped_unusable"],
+        )
+    counts["population_skipped_market_unknown"] = tally.get(MARKET_UNKNOWN_TALLY, 0)
+    if counts["population_skipped_market_unknown"]:
+        operator_logger.warning(
+            "merchant_purchasability_sweep: %d allowlist row(s) skipped: market is not an ISO-2 "
+            "code (never defaulted)", counts["population_skipped_market_unknown"],
         )
 
     vantages: List[Tuple[str, Optional[str]]] = [(facts.WORKER_VANTAGE, None)]

@@ -29,6 +29,8 @@ from urllib.parse import urlparse
 
 import httpx
 
+from utils.market_code import iso2_market
+
 logger = logging.getLogger("outbound_warm_handoff")
 
 # Affiliate/redirector networks are NEVER warm-handed (founder decision, spec §4.1): a warm
@@ -105,18 +107,16 @@ _MARKET_UNOBSERVED = "none_unobserved"
 _MARKET_INVALID = "none_invalid"
 
 
-def click_market(market: Any) -> Optional[str]:
-    """The ISO-2 market, upper-cased, or ``None``. Validity only — see `warm_market_decision`
-    for the observed-vs-defaulted question, which this deliberately does not answer.
-
-    Delegates to `services.outbound_links_service.iso2_market` so there is exactly ONE
-    normaliser for this vocabulary and the sink cannot drift from the minters.
-
-    ``"us"`` -> ``"US"``. ``"USA"``, ``""``, ``None``, ``"U1"``, a non-string -> ``None``.
-    """
-    from services.outbound_links_service import iso2_market
-
-    return iso2_market(market)
+#: The ISO-2 market, upper-cased, or ``None``. Validity only — see `warm_market_decision` for
+#: the observed-vs-defaulted question, which this deliberately does not answer.
+#:
+#: THE SAME FUNCTION OBJECT as `utils.market_code.iso2_market` (and so as the fact store's
+#: `normalize_market`), bound rather than wrapped, so there is exactly ONE normaliser for this
+#: vocabulary and the sink cannot drift from the gate it feeds. Identity-asserted in
+#: tests/test_purchase_gate_market_not_defaulted.py.
+#:
+#: ``"us"`` -> ``"US"``. ``"USA"``, ``""``, ``None``, ``"U1"``, a non-string -> ``None``.
+click_market = iso2_market
 
 
 def warm_market_decision(market: Any, market_observed: Any) -> Tuple[Optional[str], str]:

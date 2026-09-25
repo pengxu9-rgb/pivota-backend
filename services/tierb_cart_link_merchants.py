@@ -35,6 +35,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, List, Optional, Sequence, Tuple, Union
 
+from utils.market_code import iso2_market
+
 DEFAULT_MERCHANTS_PATH = Path(__file__).resolve().parents[1] / "config" / "tierb_cart_link_merchants.json"
 
 _ALLOWED_KEYS = frozenset({"domain", "market", "variant_id", "product_handle"})
@@ -98,10 +100,15 @@ def canonical_merchant_domain(value: Any) -> str:
 
 
 def normalize_market(value: Any) -> str:
-    """ISO-2 shape, upper case. Raises ValueError otherwise."""
-    if not isinstance(value, str) or not _MARKET.fullmatch(value.strip().upper()):
+    """ISO-2 shape, upper case. Raises ValueError otherwise.
+
+    The RAISING face of the one rule, `utils.market_code.iso2_market` — not a second copy of it.
+    A cart-link eligibility row is a purchase decision keyed per market, so an unknown market is
+    an error here rather than a default."""
+    code = iso2_market(value)
+    if code is None:
         raise ValueError(f"market {value!r} is not an ISO-2 code")
-    return value.strip().upper()
+    return code
 
 
 def parse_merchants(raw: Any) -> List[Merchant]:

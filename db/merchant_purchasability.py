@@ -66,6 +66,7 @@ from typing import Any, Dict, FrozenSet, List, Optional
 
 from db.database import IS_POSTGRES, database
 from services.shopify_cart_link_preflight import PreflightResult, Verdict
+from utils.market_code import MARKET_UNKNOWN, iso2_market
 
 __all__ = [
     "TABLE",
@@ -79,6 +80,7 @@ __all__ = [
     "ttl_hours",
     "normalize_domain",
     "normalize_market",
+    "MARKET_UNKNOWN",
     "record_check",
     "get_fact",
     "is_purchasable",
@@ -212,8 +214,17 @@ def normalize_domain(value: Any) -> str:
     return text[:255]
 
 
-def normalize_market(value: Any) -> str:
-    return str(value or "").strip().upper()[:2]
+#: THE BUYER MARKET KEY: ISO-2 upper-cased, or None. BOUND to `utils.market_code.iso2_market` —
+#: the same function object the warm-handoff sink (`click_market`), the Tier B allowlist, the
+#: Reap rail and the sweep use — so there is ONE rule for "is this a market we can key a
+#: purchasability fact on", identity-asserted in tests/test_purchase_gate_market_not_defaulted.py.
+#:
+#: AN UNKNOWN MARKET IS UNKNOWN. None, "", "  " and anything that is not exactly two letters after
+#: strip+upper answer None — never "US", and never a truncation: the previous rule here was
+#: `str(v or "").strip().upper()[:2]`, which read "USA" as "US" and would have answered a
+#: three-letter caller with the US fact. Every reader below treats None as "no purchasability
+#: claim" (False / no rows) WITHOUT touching the database.
+normalize_market = iso2_market
 
 
 # ── writes ──────────────────────────────────────────────────────────────────────────────────
@@ -519,7 +530,7 @@ async def record_check(
     """
     key_domain = normalize_domain(domain)
     key_market = normalize_market(market)
-    if not key_domain or len(key_market) != 2 or not key_market.isalpha():
+    if not key_domain or key_market is None:
         logger.warning("merchant_purchasability: refusing a write with an unusable key")
         return None
 
@@ -559,11 +570,15 @@ async def get_fact(domain: Any, market: Any) -> Optional[Dict[str, Any]]:
     Across vantages ON PURPOSE: this is the human-facing read ("does anything say this merchant
     can be paid?"). The door must not use it — see `is_purchasable`, which pins the vantage.
     """
+    key_market = normalize_market(market)
+    if key_market is None:
+        # No market, no fact: nothing is ever written under an unknown market.
+        return None
     statement = _SELECT_FACT_SQL if IS_POSTGRES else _SELECT_FACT_SQL_SQLITE
     try:
         record = await database.fetch_one(
             statement,
-            {"merchant_domain": normalize_domain(domain), "market_country": normalize_market(market)},
+            {"merchant_domain": normalize_domain(domain), "market_country": key_market},
         )
     except Exception:  # noqa: BLE001
         logger.exception("merchant_purchasability: get_fact failed")
@@ -572,11 +587,15 @@ async def get_fact(domain: Any, market: Any) -> Optional[Dict[str, Any]]:
 
 
 async def list_facts(domain: Any, market: Any) -> List[Dict[str, Any]]:
-    """Every row for this merchant x market, positive or not, one per vantage. The ops read."""
+    """Every row for this merchant x market, positive or not, one per vantage. The ops read.
+    An unknown market has no rows by definition — nothing is ever written under one."""
+    key_market = normalize_market(market)
+    if key_market is None:
+        return []
     try:
         records = await database.fetch_all(
             _SELECT_ALL_SQL,
-            {"merchant_domain": normalize_domain(domain), "market_country": normalize_market(market)},
+            {"merchant_domain": normalize_domain(domain), "market_country": key_market},
         )
     except Exception:  # noqa: BLE001
         logger.exception("merchant_purchasability: list_facts failed")
@@ -598,11 +617,20 @@ async def is_purchasable(domain: Any, market: Any, *, now: Optional[datetime] = 
     `now` is accepted for tests and is compared in PYTHON against the row's `positive_until`,
     ON TOP OF the server-side comparison the statement already makes — never instead of it. A
     caller-supplied clock may narrow the answer; it can never widen it.
+
+    AN UNKNOWN MARKET IS NO CLAIM. A market `normalize_market` cannot key (None, blank, not ISO-2)
+    answers False BEFORE the database is asked and WITHOUT a log line: it is an expected input (a
+    click whose market was never known), not an error, and a gate that logged it would storm. It
+    is never substituted with "US" — that would gate a non-US buyer against the US fact. The ops
+    route reports this state as `reason == MARKET_UNKNOWN`.
     """
+    key_market = normalize_market(market)
+    if key_market is None:
+        return False
     statement = _SELECT_PURCHASABLE_SQL if IS_POSTGRES else _SELECT_PURCHASABLE_SQL_SQLITE
     values = {
         "merchant_domain": normalize_domain(domain),
-        "market_country": normalize_market(market),
+        "market_country": key_market,
         "vantage": buyer_vantage(),
     }
     try:

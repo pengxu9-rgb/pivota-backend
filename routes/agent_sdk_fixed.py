@@ -232,7 +232,10 @@ async def _build_external_seed_product(
     req: Request,
     seed_row: Dict[str, Any],
     allowed_domains: Optional[List[str]] = None,
+    request_market: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
+    """`request_market` is the BUYER-side market the request named, raw — the only thing that
+    may stamp the token's `market_observed`. The seed row's own `market` is serving state."""
     seed_id = str(seed_row.get("id") or "").strip()
     if not seed_id:
         return None
@@ -336,14 +339,17 @@ async def _build_external_seed_product(
         {
             "market": market,
             "tool": tool,
-            # The seed row's OWN market, when it has one. A NULL market row serves
-            # DEFAULT_EXTERNAL_SEED_MARKET ("US") — a placeholder, not a fact about the
-            # buyer — so it is left unstamped and the warm-handoff lane leaves the gateway's
-            # purchasability gate un-keyed for it. See the MARKET PROVENANCE note in
-            # `services/outbound_links_service`.
+            # OBSERVED ONLY FROM THE REQUEST, NEVER FROM THE SEED ROW. The row's market is the
+            # market it is LISTED in, and on this lane it is always DEFAULT_EXTERNAL_SEED_MARKET
+            # ("US"): the seed fetch below filters on that constant, so every row this builder
+            # sees says "US" whatever the buyer is. Stamping the row's market made every click
+            # here an "observed US" click, which the warm-handoff lane forwards to the gateway's
+            # purchasability gate — a defaulted US laundered through a WHERE clause. This lane
+            # carries no request market, so `request_market` is None and nothing is stamped. See
+            # the MARKET PROVENANCE note in `services/outbound_links_service`.
             **(
                 {TOKEN_MARKET_OBSERVED_KEY: True}
-                if market_is_observed(seed_row.get("market"))
+                if market_is_observed(request_market)
                 else {}
             ),
             "dest": dest_with_utm,

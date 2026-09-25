@@ -4814,7 +4814,13 @@ async def _handle_offers_resolve(
                 stable_click_id = new_click_id()
                 redirect_url = await _make_external_redirect_url(
                     market=used_market,
-                    market_observed=market_is_observed(row_dict.get("market"), market_hint),
+                    # THE REQUEST'S market only. The seed row's `market` is the market it is
+                    # LISTED in (the column is NOT NULL, so it always "names" one); with no
+                    # `market_hint` the SQL above returns rows of EVERY market, and stamping the
+                    # row's would forward a listing market to the purchasability gate as the
+                    # buyer's. With a hint the SQL admits only `market = hint` or `'*'`, so this
+                    # is True exactly when it was before.
+                    market_observed=market_is_observed(market_hint),
                     tool=used_tool,
                     destination_url=str(canonical_url or destination_url),
                     utm_template=row_dict.get("utm_template") or seed_data.get("utm_template"),
@@ -9625,7 +9631,11 @@ async def mint_external_seed_links(body: ExternalSeedLinksRequest) -> Dict[str, 
         )
         redirect_url = await _make_external_redirect_url(
             market=market,
-            market_observed=market_is_observed(candidate.market, body.market),
+            # THE REQUEST'S market (`body.market`) only. `candidate.market` is the SEED ROW's
+            # (the gateway's own contract: "the per-candidate market / tool describe the SEED
+            # ROW"), i.e. the market the card is LISTED in — never an observation of the buyer.
+            # With `body.market` present this is True exactly when it was before.
+            market_observed=market_is_observed(body.market),
             tool=tool,
             destination_url=destination_url,
             utm_template=candidate.utm_template,
@@ -9685,6 +9695,21 @@ async def external_seed_links_endpoint(
     """Credentialed only: the gateway calls this with its internal key. Anonymous callers get
     the same 401 every other agent route gives them — a mint is not a public read."""
     return await mint_external_seed_links(body)
+
+
+def _request_market_from_metadata(request_metadata: Optional[Dict[str, Any]]) -> Optional[str]:
+    """The market the BUYER'S REQUEST named on the find_products_multi lanes, raw, or None.
+
+    `metadata.market` is the only market carrier this request has (the gateway reads the same
+    field: `search.market || metadata.market`). It is PROVENANCE ONLY — the input to
+    `market_is_observed` for a minted `/r` token — and is never defaulted: a request that named
+    no market mints tokens the warm-handoff lane will not key the purchasability gate on. A seed
+    row's own `market` is the market the row is LISTED in and is deliberately not consulted.
+    """
+    if not isinstance(request_metadata, dict):
+        return None
+    raw = request_metadata.get("market")
+    return raw if isinstance(raw, str) else None
 
 
 def _normalize_prefetched_external_seed_candidates(
@@ -9783,7 +9808,10 @@ async def _build_prefetched_external_seed_wrappers(
             else:
                 redirect_url = await _make_external_redirect_url(
                     market=market,
-                    market_observed=market_is_observed(candidate.get("market")),
+                    # The REQUEST's market, never the candidate's: a prefetched candidate is a
+                    # seed row the caller handed us, and its `market` is the market it is
+                    # LISTED in. See `_request_market_from_metadata`.
+                    market_observed=market_is_observed(_request_market_from_metadata(request_metadata)),
                     tool=tool,
                     destination_url=destination_url,
                     utm_template=utm_template,
@@ -12150,7 +12178,10 @@ async def _handle_find_products_multi_inner(
             else:
                 redirect_url = await _make_external_redirect_url(
                     market=market,
-                    market_observed=market_is_observed(row_dict.get("market")),
+                    # The REQUEST's market, never the row's: this lane fetches seeds with
+                    # `market=None` (every market), so the row's market is only where it is
+                    # LISTED. See `_request_market_from_metadata`.
+                    market_observed=market_is_observed(_request_market_from_metadata(request_metadata)),
                     tool=tool,
                     destination_url=dest,
                     utm_template=utm_template,

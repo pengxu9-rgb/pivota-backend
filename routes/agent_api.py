@@ -2938,6 +2938,7 @@ def _schedule_external_seed_cache_refresh(
     brand_required_terms: Optional[List[str]],
     brand_prefer_terms: Optional[List[str]],
     brand_query_detected: bool,
+    request_market: Optional[str] = None,
 ) -> bool:
     existing = _EXTERNAL_SEED_SEARCH_CACHE_INFLIGHT.get(cache_key)
     if existing is not None and not existing.done():
@@ -2963,6 +2964,7 @@ def _schedule_external_seed_cache_refresh(
                 brand_prefer_terms=brand_prefer_terms,
                 brand_query_detected=brand_query_detected,
                 metrics_out=refresh_metrics,
+                request_market=request_market,
             )
             if _should_cache_external_seed_result(products=refreshed or [], metrics=refresh_metrics):
                 _put_cached_external_seed_products(cache_key, refreshed or [])
@@ -3043,6 +3045,7 @@ async def _load_external_seed_products_with_cache(
             brand_prefer_terms=normalized_brand_prefer_terms,
             brand_query_detected=brand_query_detected,
             metrics_out=metrics,
+            request_market=market,
         )
 
     is_first_screen = int(page_offset or 0) == 0
@@ -3066,6 +3069,7 @@ async def _load_external_seed_products_with_cache(
             brand_prefer_terms=normalized_brand_prefer_terms,
             brand_query_detected=brand_query_detected,
             metrics_out=metrics,
+            request_market=market,
         )
 
     cache_scope = (
@@ -3073,9 +3077,18 @@ async def _load_external_seed_products_with_cache(
         if enable_broad_fallback
         else ("brand_strict" if brand_query_detected else "default")
     )
+    # THE CACHED PRODUCTS CARRY MINTED `/r` TOKENS, and a token's `market_observed` depends on
+    # whether THIS request named a market. A market-less request and a `market=US` request both
+    # serve the US partition, but only the second may stamp its tokens observed — so they must
+    # not share one entry, or whichever filled it first would decide for the other. The key is
+    # split ONLY for the market-less case: a request that names its market builds exactly the
+    # key it always did.
+    cache_market = (
+        normalized_market if market_is_observed(market) else f"{normalized_market}~unobserved"
+    )
     cache_key = _build_external_seed_cache_key(
         query=query,
-        market=normalized_market,
+        market=cache_market,
         strategy=normalized_seed_strategy,
         surface=normalized_catalog_surface,
         scope=cache_scope,
@@ -3153,6 +3166,7 @@ async def _load_external_seed_products_with_cache(
                     brand_required_terms=normalized_brand_required_terms,
                     brand_prefer_terms=normalized_brand_prefer_terms,
                     brand_query_detected=brand_query_detected,
+                    request_market=market,
                 )
             )
         return cached_products[:limit]
@@ -3175,6 +3189,7 @@ async def _load_external_seed_products_with_cache(
         brand_prefer_terms=normalized_brand_prefer_terms,
         brand_query_detected=brand_query_detected,
         metrics_out=metrics,
+        request_market=market,
     )
     metrics["executed"] = True
     if sync_rows:
@@ -3205,6 +3220,7 @@ async def _load_external_seed_products_with_cache(
             brand_required_terms=normalized_brand_required_terms,
             brand_prefer_terms=normalized_brand_prefer_terms,
             brand_query_detected=brand_query_detected,
+            request_market=market,
         )
     return sync_rows[:limit]
 
@@ -3652,7 +3668,11 @@ async def _build_external_seed_product(
     seed_row: Dict[str, Any],
     allowed_domains: Optional[List[str]] = None,
     metrics_out: Optional[Dict[str, Any]] = None,
+    request_market: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
+    """`request_market` is the BUYER-side market the request named, raw (before any default) —
+    the only thing that may stamp the token's `market_observed`. The seed row's own `market` is
+    serving state and is never read as the buyer's."""
     seed_id = str(seed_row.get("id") or "").strip()
     if not seed_id:
         _increment_external_seed_metric_reason(metrics_out, "missing_seed_id")
@@ -3844,14 +3864,16 @@ async def _build_external_seed_product(
         {
             "market": market,
             "tool": tool,
-            # The seed row's OWN market, when it has one. A NULL market row serves
-            # DEFAULT_EXTERNAL_SEED_MARKET ("US") — a placeholder, not a fact about the
-            # buyer — so it is left unstamped and the warm-handoff lane leaves the gateway's
-            # purchasability gate un-keyed for it. See the MARKET PROVENANCE note in
-            # `services/outbound_links_service`.
+            # OBSERVED ONLY FROM THE REQUEST, NEVER FROM THE SEED ROW. The row's market is the
+            # market it is LISTED in, and for a request that named no market the seed search
+            # filters on DEFAULT_EXTERNAL_SEED_MARKET ("US") — so the row's "US" was the default
+            # itself, laundered through a WHERE clause, and stamping it forwarded a defaulted
+            # US to the gateway's purchasability gate via the warm-handoff lane. The search
+            # lane passes the request's raw market; the by-id lanes have none. See the MARKET
+            # PROVENANCE note in `services/outbound_links_service`.
             **(
                 {TOKEN_MARKET_OBSERVED_KEY: True}
-                if market_is_observed(seed_row.get("market"))
+                if market_is_observed(request_market)
                 else {}
             ),
             "dest": dest_with_utm,
@@ -4027,9 +4049,14 @@ async def _load_external_seed_products_for_search(
     brand_prefer_terms: Optional[List[str]] = None,
     brand_query_detected: bool = False,
     metrics_out: Optional[Dict[str, Any]] = None,
+    request_market: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Load employee-managed external products (unattached external seeds) and surface as first-class products.
+
+    `market` selects the seed partition (and is defaulted to DEFAULT_EXTERNAL_SEED_MARKET for
+    serving); `request_market` is the RAW market the buyer's request named, if any, and is the
+    only thing the minted `/r` token may stamp as observed.
     """
     metrics = metrics_out if isinstance(metrics_out, dict) else None
     if metrics is not None:
@@ -4363,6 +4390,7 @@ async def _load_external_seed_products_for_search(
                     seed_row=seed_row,
                     allowed_domains=None,
                     metrics_out=task_metrics,
+                    request_market=request_market,
                 )
                 if metrics is not None:
                     _merge_external_seed_metric_bucket(

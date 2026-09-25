@@ -75,7 +75,14 @@ class _FetchScript:
         return [c for c in self.calls if c.get("fast_multiterm") and c.get("lean_where_min_tokens") == 1]
 
 
-async def _fake_build(*, req: Any, seed_row: Dict[str, Any], allowed_domains: Any = None, metrics_out: Any = None) -> Dict[str, Any]:
+async def _fake_build(
+    *,
+    req: Any,
+    seed_row: Dict[str, Any],
+    allowed_domains: Any = None,
+    metrics_out: Any = None,
+    request_market: Any = None,
+) -> Dict[str, Any]:
     return {
         "id": seed_row["external_product_id"],
         "product_id": seed_row["external_product_id"],
