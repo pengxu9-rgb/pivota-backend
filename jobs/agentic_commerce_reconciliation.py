@@ -18,8 +18,7 @@ import os
 from typing import Any, Dict, List, Optional
 
 from db.database import database
-from services.catalog_sync_service import create_catalog_sync_job, run_catalog_sync_job
-from services.shopify_products_sync import sync_shopify_products_for_merchant
+from services.catalog_sync_service import create_catalog_sync_job, run_claimed_catalog_sync_job
 
 logger = logging.getLogger(__name__)
 
@@ -53,14 +52,11 @@ async def reconcile_shopify_catalog_for_merchant(
     limit_products: int,
     force_refresh: bool,
 ) -> Dict[str, Any]:
-    refresh_summary: Optional[Dict[str, Any]] = None
-    if force_refresh:
-        refresh_summary = await sync_shopify_products_for_merchant(
-            merchant_id=merchant_id,
-            limit=limit_products,
-            ingest_catalog=False,
-        )
-
+    # Runs the job INLINE, so the row is created already `running`
+    # (`claimed=True`): the catalog_sync_drain tick drains `pending` rows, and a
+    # row created pending here could be claimed by the tick before this call
+    # reaches it. The Shopify re-pull is the runner's, driven by
+    # scope.force_refresh — running it here as well would pull the catalog twice.
     job = await create_catalog_sync_job(
         merchant_id=merchant_id,
         connector="shopify",
@@ -74,14 +70,15 @@ async def reconcile_shopify_catalog_for_merchant(
             "scheduled": True,
         },
         requested_by="agentic-commerce-reconciliation",
+        claimed=True,
     )
-    completed = await run_catalog_sync_job(str(job.get("job_id") or ""))
+    completed = await run_claimed_catalog_sync_job(job)
     return {
         "merchant_id": merchant_id,
         "job_id": str(job.get("job_id") or ""),
         "status": completed.get("status"),
         "stats": completed.get("stats_json") or completed.get("stats") or {},
-        "refresh": refresh_summary,
+        "refresh": completed.get("refresh"),
     }
 
 

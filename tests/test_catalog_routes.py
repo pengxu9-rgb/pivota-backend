@@ -45,11 +45,7 @@ def test_create_sync_job_route(monkeypatch) -> None:
             "updated_at": datetime.now(timezone.utc),
         }
 
-    async def fake_run_background(**kwargs):
-        return None
-
     monkeypatch.setattr(module, "create_catalog_sync_job", fake_create_catalog_sync_job)
-    monkeypatch.setattr(module, "_run_catalog_job_background", fake_run_background)
 
     client = TestClient(app)
     response = client.post(
