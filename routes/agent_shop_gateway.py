@@ -79,7 +79,7 @@ from routes.agent_auth import (
     AgentContext,
     get_agent_context,
     request_api_key,
-    resolve_issuing_agent_for_request,
+    resolve_issuing_context_for_request,
 )
 from services.issuing_agent_assertion import ISSUING_AGENT_ASSERTION_HEADER
 from db.merchant_tasks import match_recovery_key
@@ -4024,10 +4024,16 @@ async def _issue_served_clicks(
     if not served:
         return
     try:
-        agent_id = await resolve_issuing_agent_for_request(
+        issuing = await resolve_issuing_context_for_request(
             caller_api_key, caller_assertion, op="offers.resolve"
         )
-        await issue_clicks([replace(click, agent_id=agent_id) for click in served])
+        # `context` holds analytics about the caller (the OAuth platform label), never credit: only
+        # agent_id credits. Merged under the click's own context keys, which it never overrides.
+        await issue_clicks([
+            replace(click, agent_id=issuing.agent_id,
+                    context={**issuing.context, **(click.context or {})} if issuing.context else click.context)
+            for click in served
+        ])
     except Exception as e:  # noqa: BLE001 -- FAIL OPEN, see the call site
         logger.warning(
             "offers.resolve.issue_clicks_failed count=%s error_type=%s", len(served), type(e).__name__,
@@ -4042,7 +4048,7 @@ async def _handle_offers_resolve(
     # key). Resolved to an agent only when a click is actually issued; never read from the body.
     caller_api_key: Optional[str] = None,
     # ...and, when that key is the gateway's own (the MCP door), the agent the gateway verified,
-    # signed. Trusted only from a Pivota service caller; see resolve_issuing_agent_for_request.
+    # signed. Trusted only from a Pivota service caller; see resolve_issuing_context_for_request.
     caller_assertion: Optional[str] = None,
 ) -> Dict[str, Any]:
     """

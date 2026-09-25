@@ -234,14 +234,21 @@ async def resolve_issuing_agent_for_request(
     service identity cannot vouch at all. See services/issuing_agent_assertion.py for what the header
     must prove (MAC, op, freshness) and how its subject maps to an active, non-service agent.
     """
+    return (await resolve_issuing_context_for_request(api_key, assertion, op=op)).agent_id
+
+
+async def resolve_issuing_context_for_request(api_key: Optional[str], assertion: Optional[str], *, op: str):
+    """resolve_issuing_agent_for_request, plus what the vouched-for caller says about itself that is
+    NOT credit: for an MCP OAuth caller, the platform label of its OAuth client (analytics only; see
+    services.issuing_agent_assertion.OAUTH_PLATFORM_KEY). Same trust order; never raises."""
+    from services.issuing_agent_assertion import IssuingContext, resolve_asserted_issuing
+
     own = await resolve_issuing_agent_id(api_key)
     if own is not None or not assertion:
-        return own
+        return IssuingContext(agent_id=own)
     if not await _is_service_caller(api_key):
-        return None
-    from services.issuing_agent_assertion import resolve_asserted_agent_id
-
-    return await resolve_asserted_agent_id(assertion, op=op, excluded_agent_ids=issuing_excluded_agent_ids())
+        return IssuingContext()
+    return await resolve_asserted_issuing(assertion, op=op, excluded_agent_ids=issuing_excluded_agent_ids())
 
 class AgentContext:
     """Agent 请求上下文"""

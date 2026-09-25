@@ -143,3 +143,23 @@ async def test_a_lookup_failure_names_no_one(monkeypatch):
     monkeypatch.setenv(ia.ISSUING_AGENT_ASSERTION_SECRET_ENV, VECTOR_SECRET)
     assert await ia.resolve_asserted_agent_id(AGENT_VECTOR, op=OP, now=VECTOR_TS) is None
 
+
+
+@pytest.mark.parametrize(
+    "uris, label",
+    [
+        (["https://claude.ai/api/mcp/auth_callback"], "claude.ai"),
+        (["https://claude.ai/cb", "https://claude.com/api/mcp/auth_callback"], "claude.ai+claude.com"),
+        (["https://www.ChatGPT.com/connector_platform_oauth_redirect"], "chatgpt.com"),
+        (["http://localhost:33418/callback"], "loopback"),
+        (["http://127.0.0.1:8080/cb", "http://[::1]/cb"], "loopback"),
+        (["https://10.1.2.3/cb"], "ip"),
+        (["cursor://anysphere.cursor-retrieval/oauth/callback"], "app:cursor"),
+        (["https://vscode.dev/redirect", "http://127.0.0.1:1234/"], "loopback+vscode.dev"),
+        ([], None),
+        (["", None, 7], None),
+        ("https://claude.ai/cb", None),
+    ],
+)
+def test_a_platform_label_names_where_the_client_says_it_lives(uris, label):
+    assert ia.platform_label(uris) == label

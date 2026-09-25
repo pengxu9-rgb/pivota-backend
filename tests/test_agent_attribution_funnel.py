@@ -23,7 +23,7 @@ def test_every_query_is_read_only():
 
 
 def test_without_the_purchases_table_only_the_referral_queries_run():
-    assert set(f.build_queries([])) == {"clicks", "edges"}
+    assert set(f.build_queries([])) == {"clicks", "edges", "platforms"}
 
 
 def test_a_prod_without_item_source_still_reports_the_partner_lane():
@@ -170,3 +170,9 @@ def test_a_query_error_makes_the_run_fail(monkeypatch):
     monkeypatch.setattr(f, "collect", fake_collect)
     monkeypatch.delenv("CLOUD_RUN_JOB", raising=False)
     assert f.main(["--days", "1"]) == 1
+
+
+def test_no_platform_rows_means_no_platform_block():
+    fn = f.build_funnel({"clicks": [], "edges": []}, 30)
+    assert fn["platforms"] == []
+    assert "MCP OAUTH PLATFORMS" not in f.render(fn)

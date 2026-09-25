@@ -38,10 +38,12 @@ import hmac
 import json
 import logging
 import os
+import ipaddress
 import re
 import time
-from dataclasses import dataclass
-from typing import Any, Collection, Mapping, Optional
+from dataclasses import dataclass, field
+from typing import Any, Collection, Dict, Mapping, Optional
+from urllib.parse import urlsplit
 
 from db.database import database
 
@@ -71,6 +73,17 @@ CONFIDENTIAL_AUTH_METHODS = frozenset({"client_secret_basic", "client_secret_pos
 _CLIENT_AUTH_SQL = (
     "SELECT token_endpoint_auth_method, client_secret_hash FROM mcp_oauth_clients WHERE client_id = :client_id"
 )
+
+_CLIENT_REDIRECT_URIS_SQL = "SELECT redirect_uris FROM mcp_oauth_clients WHERE client_id = :client_id"
+
+#: Context keys an OAuth caller's click carries: WHICH PLATFORM the connector says it is, from the
+#: redirect URIs its OAuth client registered (e.g. "claude.ai", "chatgpt.com", "loopback"). ANALYTICS
+#: ONLY, never credit: open dynamic registration lets anyone register any callback URL, so the label
+#: is unverified and never touches agent_id. `oauth_platform_verified` is true only when the client is
+#: one Pivota PROVISIONED (and so credits an agent); a label on a public client is a claim, not a fact.
+OAUTH_PLATFORM_KEY = "oauth_platform"
+OAUTH_PLATFORM_VERIFIED_KEY = "oauth_platform_verified"
+_MAX_PLATFORM_LABEL = 128
 
 _ACTIVE_CLIENT_AGENT_SQL = """
 SELECT agent_id FROM agent_oauth_clients
@@ -225,6 +238,98 @@ async def agent_for_oauth_client(issuer: str, client_id: str) -> Optional[str]:
     return value or None
 
 
+def platform_label(redirect_uris: Any) -> Optional[str]:
+    """A short platform label from an OAuth client's registered redirect URIs, or None.
+
+    https host (lowercased, `www.` dropped) for a web connector; "loopback" for localhost / a loopback
+    IP (desktop and CLI clients: Claude Desktop, Claude Code, Gemini CLI); "ip" for any other IP
+    literal; "app:<scheme>" for a custom scheme (e.g. "app:cursor"). Several distinct labels are
+    joined with "+", sorted, so the same client always gets the same label.
+    """
+    if not isinstance(redirect_uris, list):
+        return None
+    labels = set()
+    for uri in redirect_uris:
+        if not isinstance(uri, str) or not uri.strip():
+            continue
+        try:
+            parts = urlsplit(uri.strip())
+        except ValueError:
+            continue
+        scheme = (parts.scheme or "").lower()
+        if scheme in ("http", "https"):
+            host = (parts.hostname or "").strip().lower().rstrip(".")
+            if not host:
+                continue
+            if host == "localhost" or host.endswith(".localhost"):
+                labels.add("loopback")
+                continue
+            try:
+                labels.add("loopback" if ipaddress.ip_address(host).is_loopback else "ip")
+                continue
+            except ValueError:
+                pass
+            labels.add(host[4:] if host.startswith("www.") else host)
+        elif re.fullmatch(r"[a-z][a-z0-9+.-]{0,30}", scheme):
+            labels.add(f"app:{scheme}")
+    if not labels:
+        return None
+    return "+".join(sorted(labels))[:_MAX_PLATFORM_LABEL]
+
+
+async def oauth_platform_for_client(issuer: str, client_id: str) -> Optional[str]:
+    """The platform label of a client of OUR authorization server, or None (foreign issuer, unknown client)."""
+    own = _own_issuer()
+    if not own or issuer != own:
+        return None
+    row = await database.fetch_one(_CLIENT_REDIRECT_URIS_SQL, {"client_id": client_id})
+    if row is None:
+        return None
+    raw = dict(row).get("redirect_uris")
+    try:
+        uris = json.loads(raw) if isinstance(raw, str) else raw
+    except ValueError:
+        return None
+    return platform_label(uris)
+
+
+@dataclass(frozen=True)
+class IssuingContext:
+    """Who a link is issued to (`agent_id`: credit) and what else is known about the caller
+    (`context`: analytics only, e.g. the OAuth platform label). Empty when nothing is known."""
+
+    agent_id: Optional[str] = None
+    context: Dict[str, Any] = field(default_factory=dict)
+
+
+async def resolve_asserted_issuing(
+    token: Optional[str],
+    *,
+    op: str,
+    excluded_agent_ids: Collection[str] = (),
+    now: Optional[float] = None,
+) -> IssuingContext:
+    """The ACTIVE, non-service agent a verified assertion names, plus, for an OAuth subject, its
+    unverified platform label. Never raises."""
+    subject = verify_issuing_agent_assertion(token, op=op, now=now)
+    if subject is None:
+        return IssuingContext()
+    agent_id: Optional[str] = None
+    context: Dict[str, Any] = {}
+    try:
+        if subject.kind == "agent":
+            agent_id = await _active_agent_id(subject.agent_id, excluded_agent_ids)
+        elif subject.kind == "oauth":
+            registered = await agent_for_oauth_client(subject.issuer or "", subject.client_id or "")
+            agent_id = await _active_agent_id(registered, excluded_agent_ids)
+            label = await oauth_platform_for_client(subject.issuer or "", subject.client_id or "")
+            if label:
+                context = {OAUTH_PLATFORM_KEY: label, OAUTH_PLATFORM_VERIFIED_KEY: agent_id is not None}
+    except Exception as exc:  # noqa: BLE001 -- the link is still served; its click is agent-less
+        logger.warning("issuing-agent assertion: subject lookup failed: %s", type(exc).__name__)
+    return IssuingContext(agent_id=agent_id, context=context)
+
+
 async def resolve_asserted_agent_id(
     token: Optional[str],
     *,
@@ -233,15 +338,5 @@ async def resolve_asserted_agent_id(
     now: Optional[float] = None,
 ) -> Optional[str]:
     """The ACTIVE, non-service agent a verified assertion names, or None. Never raises."""
-    subject = verify_issuing_agent_assertion(token, op=op, now=now)
-    if subject is None:
-        return None
-    try:
-        if subject.kind == "agent":
-            return await _active_agent_id(subject.agent_id, excluded_agent_ids)
-        if subject.kind == "oauth":
-            registered = await agent_for_oauth_client(subject.issuer or "", subject.client_id or "")
-            return await _active_agent_id(registered, excluded_agent_ids)
-    except Exception as exc:  # noqa: BLE001 -- the link is still served; its click is agent-less
-        logger.warning("issuing-agent assertion: subject lookup failed: %s", type(exc).__name__)
-    return None
+    resolved = await resolve_asserted_issuing(token, op=op, excluded_agent_ids=excluded_agent_ids, now=now)
+    return resolved.agent_id
