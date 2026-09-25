@@ -36,11 +36,64 @@ LIPSTICK_NO_TYPE = ("3CE - Soft Matte Lipstick 3.5g", "", "soft-matte")
 PALETTE = ("3CE - New Take Eyeshadow Palette", "", "new-take")
 
 
+class LockServer:
+    """One Postgres server's advisory lock, as seen by FakeLockConnection sessions: held by at most
+    one session, released by an unlock or by the holding session ending."""
+
+    def __init__(self):
+        self.holder = None
+        self.sessions = []
+
+    async def connect(self):
+        conn = FakeLockConnection(self)
+        self.sessions.append(conn)
+        return conn
+
+
+class FakeLockConnection:
+    def __init__(self, server):
+        self.server, self.closed, self.statements = server, False, []
+
+    async def fetchval(self, sql):
+        assert not self.closed
+        self.statements.append(sql)
+        if "pg_try_advisory_lock" in sql:
+            if self.server.holder in (None, self):
+                self.server.holder = self
+                return True
+            return False
+        if "pg_advisory_unlock" in sql:
+            if self.server.holder is self:
+                self.server.holder = None
+                return True
+            return False
+        raise AssertionError(sql)
+
+    def _end_session(self):
+        self.closed = True
+        if self.server.holder is self:
+            self.server.holder = None
+
+    async def close(self):
+        self._end_session()
+
+    def terminate(self):
+        self._end_session()
+
+
 class Ledger:
     def __init__(self):
         self.runs, self.transitions = {}, []
         self.unfinished = None      # the previous run a killed execution left behind
         self.current_status = None  # set to simulate an operator changing the job mid-stage
+        self.lock_server = LockServer()
+        self.lock_waits = []
+
+    def catalog_write_lock(self, **kw):
+        """The REAL lock, over a fake server: what the pipeline holds is what prod holds."""
+        from db.retailer_ingest import catalog_write_lock
+        self.lock_waits.append(kw)
+        return catalog_write_lock(connect=self.lock_server.connect, **kw)
 
     async def unfinished_run(self, job_id, db=None):
         return self.unfinished
@@ -70,7 +123,8 @@ class Ledger:
 def env(monkeypatch):
     ledger = Ledger()
     monkeypatch.setattr(pipeline, "ledger", ledger)
-    state = SimpleNamespace(ledger=ledger, rows=[TINT], crawl_error=None, applied=[], readback_rows=None)
+    state = SimpleNamespace(ledger=ledger, rows=[TINT], crawl_error=None, applied=[], readback_rows=None,
+                            apply_error=None, locked_during_apply=[])
 
     async def fetch(**kw):
         if state.crawl_error:
@@ -87,6 +141,10 @@ def env(monkeypatch):
     from services.catalog_enrichment_agent import apply as apply_mod, primary_ingestion as pi
 
     async def fake_apply(plan, **kw):
+        holder = ledger.lock_server.holder
+        state.locked_during_apply.append(holder is not None and not holder.closed)
+        if state.apply_error:
+            raise state.apply_error
         state.applied.append(plan)
         return {"pdps": len(plan["pdps"]), "skus": len(plan["skus"]), "offers": len(plan["offers"])}
     monkeypatch.setattr(apply_mod, "apply_ingest_plan", fake_apply)
@@ -268,6 +326,158 @@ async def test_an_interrupted_dry_run_spends_an_attempt_and_backs_off(env):
     t = env.ledger.transitions[-1]
     assert out["outcome"] == "interrupted" and t["status"] == "queued" and t["count_attempt"]
     assert t["next_run_at"] is not None
+
+
+# ------------------------------------------------------------------ the catalog write lock
+
+_TRY = "SELECT pg_try_advisory_lock(hashtext('retailer_ingest_catalog_write'))"
+
+
+def _released(server):
+    """Nobody holds the lock and every session the pipeline opened has ended."""
+    return server.holder is None and all(s.closed for s in server.sessions)
+
+
+async def test_an_apply_writes_only_while_holding_the_catalog_write_lock_then_releases_it(env):
+    out = await pipeline.run_stage(job("apply_due"), db=env.db)
+    assert out["outcome"] == "applied" and env.locked_during_apply == [True]
+    assert _released(env.ledger.lock_server)
+    assert env.ledger.lock_waits == [{"wait_s": pipeline.WRITE_LOCK_WAIT_S, "poll_s": pipeline.WRITE_LOCK_POLL_S}]
+
+
+async def test_a_dry_run_never_takes_the_catalog_write_lock(env):
+    await pipeline.run_stage(job(), db=env.db)
+    assert env.ledger.lock_server.sessions == [] and env.ledger.lock_waits == []
+
+
+async def test_a_busy_write_lock_writes_nothing_and_returns_the_job_to_apply_due_without_an_attempt(env, monkeypatch):
+    monkeypatch.setattr(pipeline, "WRITE_LOCK_WAIT_S", 0.05)
+    monkeypatch.setattr(pipeline, "WRITE_LOCK_POLL_S", 0.01)
+    other_apply = await env.ledger.lock_server.connect()
+    assert await other_apply.fetchval(_TRY)
+    before = datetime.now(timezone.utc)
+    out = await pipeline.run_stage(job("apply_due"), db=env.db)
+    assert out["outcome"] == "write_lock_busy" and out["status"] == "apply_due"
+    assert env.locked_during_apply == [] and env.applied == []  # apply_ingest_plan never called
+    t = env.ledger.transitions[-1]
+    assert t["status"] == "apply_due" and t["expected_status"] == "apply_due" and not t["count_attempt"]
+    retry_in = (t["next_run_at"] - before).total_seconds()
+    assert pipeline.WRITE_LOCK_BUSY_RETRY_S - 5 <= retry_in <= pipeline.WRITE_LOCK_BUSY_RETRY_S + 5
+    run = list(env.ledger.runs.values())[-1]
+    assert run["outcome"] == "write_lock_busy" and "nothing written" in run["error"]
+    timings = run["checks"]["timings"]
+    assert timings["write_lock_wait_s"] >= 0.05 and "write_s" not in timings
+    # the other apply still holds its lock; the waiter's own session ended
+    assert env.ledger.lock_server.holder is other_apply
+    assert all(s.closed for s in env.ledger.lock_server.sessions if s is not other_apply)
+
+
+async def test_a_write_lock_freed_during_the_wait_is_taken_and_the_apply_writes(env, monkeypatch):
+    monkeypatch.setattr(pipeline, "WRITE_LOCK_POLL_S", 0.01)
+    other_apply = await env.ledger.lock_server.connect()
+    assert await other_apply.fetchval(_TRY)
+
+    import asyncio
+
+    async def finish_other_write():
+        await asyncio.sleep(0.05)
+        await other_apply.close()
+    finisher = asyncio.ensure_future(finish_other_write())
+    out = await pipeline.run_stage(job("apply_due"), db=env.db)
+    await finisher
+    assert out["outcome"] == "applied" and env.locked_during_apply == [True]
+    assert list(env.ledger.runs.values())[-1]["checks"]["timings"]["write_lock_wait_s"] >= 0.05
+    assert _released(env.ledger.lock_server)
+
+
+@pytest.mark.parametrize("error, outcome", [(RuntimeError("connection lost mid-write"), "error"),
+                                            (ValueError("primary apply incomplete"), "apply_refused")])
+async def test_the_write_lock_is_released_when_the_catalog_write_raises(env, error, outcome):
+    env.apply_error = error
+    if outcome == "error":
+        with pytest.raises(RuntimeError):
+            await pipeline.run_stage(job("apply_due"), db=env.db)
+    else:
+        assert (await pipeline.run_stage(job("apply_due"), db=env.db))["outcome"] == outcome
+    assert env.locked_during_apply == [True]
+    assert _released(env.ledger.lock_server)
+    run = list(env.ledger.runs.values())[-1]
+    assert run["outcome"] == outcome and env.ledger.transitions[-1]["status"] == "failed"
+    # the next apply can take the lock
+    env.apply_error = None
+    assert (await pipeline.run_stage(job("apply_due"), db=env.db))["outcome"] == "applied"
+
+
+async def test_every_stage_records_its_phase_timings(env):
+    import json as _json
+
+    await pipeline.run_stage(job(), db=env.db)
+    dry = list(env.ledger.runs.values())[-1]["checks"]["timings"]
+    assert set(dry) == {"crawl_s", "check_s"}
+    await pipeline.run_stage(job("apply_due"), db=env.db)
+    applied = list(env.ledger.runs.values())[-1]["checks"]["timings"]
+    assert set(applied) == {"crawl_s", "check_s", "write_lock_wait_s", "write_s", "readback_s"}
+    for value in [*dry.values(), *applied.values()]:
+        assert isinstance(value, float) and value >= 0
+    _json.loads(_json.dumps(applied, allow_nan=False))  # JSON-safe as recorded
+    # a stage that stops in its crawl still records how long the crawl took
+    env.crawl_error = feed.CrawlIncomplete("x: HTTP 429", status="failed", next_page=1, scanned_products=0,
+                                           selected_products=0)
+    await pipeline.run_stage(job(), db=env.db)
+    assert set(list(env.ledger.runs.values())[-1]["checks"]["timings"]) == {"crawl_s"}
+
+
+async def test_the_lock_is_released_by_the_session_ending_when_the_unlock_fails():
+    from db.retailer_ingest import catalog_write_lock
+
+    server = LockServer()
+
+    class UnlockFails(FakeLockConnection):
+        async def fetchval(self, sql):
+            if "pg_advisory_unlock" in sql:
+                raise OSError("connection reset")
+            return await super().fetchval(sql)
+
+    async def connect():
+        conn = UnlockFails(server)
+        server.sessions.append(conn)
+        return conn
+    async with catalog_write_lock(wait_s=1, connect=connect):
+        assert server.holder is server.sessions[0]
+    assert _released(server)
+
+
+async def test_a_cancelled_write_still_ends_the_lock_session():
+    import asyncio
+
+    from db.retailer_ingest import catalog_write_lock
+
+    server = LockServer()
+    entered = asyncio.Event()
+
+    async def write():
+        async with catalog_write_lock(wait_s=1, connect=server.connect):
+            entered.set()
+            await asyncio.sleep(3600)
+    task = asyncio.ensure_future(write())
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert _released(server)
+
+
+async def test_a_busy_lock_never_runs_the_block_and_closes_its_session():
+    from db.retailer_ingest import CatalogWriteLockBusy, catalog_write_lock
+
+    server = LockServer()
+    holder = await server.connect()
+    assert await holder.fetchval(_TRY)
+    ran = []
+    with pytest.raises(CatalogWriteLockBusy):
+        async with catalog_write_lock(wait_s=0.03, poll_s=0.01, connect=server.connect):
+            ran.append(True)
+    assert ran == [] and server.sessions[1].closed and server.holder is holder
 
 
 async def test_cohort_level_flags_cannot_be_accepted(env, monkeypatch):

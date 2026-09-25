@@ -9,17 +9,24 @@ Policy (Peng, 2026-09-23): a dry run with zero BLOCK flags is applied automatica
 holds the job until someone approves it (optionally excluding handles or accepting flag keys).
 The apply stage re-crawls and RE-RUNS every check before writing, so a store that changed between
 its dry run and its apply cannot slip a new row past the review.
+
+Applies at different hosts run in parallel lanes; only the catalog write (apply_ingest_plan) is
+serial, under db.retailer_ingest.catalog_write_lock. Every run records how long each phase took
+(checks.timings), so the lock wait and the write can be told apart from the crawl.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from db import retailer_ingest as ledger
+from db.retailer_ingest import CatalogWriteLockBusy
 from services.retailer_ingest import detectors
 
 DRY_RUN = "dry_run"
@@ -88,6 +95,14 @@ MAX_PDP_IDENTITY_FETCHES = 300
 DRAIN_PDP_INCI_FETCHES = 60
 MAX_PDP_INCI_FETCHES = 300
 DRAIN_PDP_INCI_BUDGET_S = 900
+# The catalog write lock (db.retailer_ingest.catalog_write_lock): an apply that has crawled and checked
+# waits at most WRITE_LOCK_WAIT_S for another apply's write to finish, polling every WRITE_LOCK_POLL_S.
+# On timeout it writes NOTHING and goes back to apply_due, retried after WRITE_LOCK_BUSY_RETRY_S without
+# spending an attempt (a busy lock is not the store's failure). The retry re-crawls and re-checks, as
+# every apply does.
+WRITE_LOCK_WAIT_S = 600
+WRITE_LOCK_POLL_S = 5
+WRITE_LOCK_BUSY_RETRY_S = 120
 # Integer options where 0 is meaningful ("fetch none"); every other integer option must be >= 1.
 _ZERO_ALLOWED_INT_OPTIONS = frozenset({"max_pdp_inci_fetches"})
 
@@ -581,6 +596,25 @@ async def run_stage(job: Dict[str, Any], *, db: Any) -> Dict[str, Any]:
     return out
 
 
+@contextlib.contextmanager
+def _timed(timings: Dict[str, float], key: str):
+    """Record the seconds the block took under `key`, also when it raised."""
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        timings[key] = round(time.monotonic() - started, 3)
+
+
+def _with_timings(checks: Any, timings: Dict[str, float]) -> Any:
+    """The run's checks with the phase timings in them (a stage that stopped before any check
+    returned records the timings alone)."""
+    if isinstance(checks, dict):
+        checks.setdefault("timings", timings)
+        return checks
+    return {"timings": timings} if checks is None and timings else checks
+
+
 async def _run_stage(job: Dict[str, Any], *, db: Any) -> Dict[str, Any]:
     stage = APPLY if job["status"] == "apply_due" else DRY_RUN
     # The previous execution was killed mid-stage (task timeout, OOM): its run never finished.
@@ -606,9 +640,14 @@ async def _run_stage(job: Dict[str, Any], *, db: Any) -> Dict[str, Any]:
                                     image_sha=os.getenv("PIVOTA_COMMIT_SHA") or os.getenv("IMAGE_SHA"),
                                     execution=os.getenv("CLOUD_RUN_EXECUTION"), db=db)
     result: Dict[str, Any] = {}
+    # Seconds per phase: crawl_s, check_s (every stage), write_lock_wait_s, write_s, readback_s (apply).
+    timings: Dict[str, float] = {}
     try:
-        records = await _crawl(job, stage)
-        result = await _check(job, records)
+        with _timed(timings, "crawl_s"):
+            records = await _crawl(job, stage)
+        with _timed(timings, "check_s"):
+            result = await _check(job, records)
+        result["checks"]["timings"] = timings
         summary = {"crawl": result["checks"].get("crawl"), "plan": result["checks"].get("plan"),
                    "checks": result["checks"], "flags": result["flags"]}
         if result["blocking"]:
@@ -624,9 +663,10 @@ async def _run_stage(job: Dict[str, Any], *, db: Any) -> Dict[str, Any]:
                                     reason="dry run clean; apply due", next_run_at=datetime.now(timezone.utc),
                                     db=db)
             return {"job_id": job["id"], "stage": stage, "outcome": "clean", "status": "apply_due"}
-        return await _apply(job, run_id, result, summary, db=db)
+        return await _apply(job, run_id, result, summary, timings, db=db)
     except _Stop as stop:
-        await ledger.finish_run(run_id, outcome=stop.outcome, checks=stop.checks or result.get("checks"),
+        await ledger.finish_run(run_id, outcome=stop.outcome,
+                                checks=_with_timings(stop.checks or result.get("checks"), timings),
                                 flags=result.get("flags"), error=stop.reason, db=db)
         await _move(job, status=stop.status, run_id=run_id, reason=stop.reason,
                                 next_run_at=stop.next_run_at, count_attempt=stop.count_attempt, db=db)
@@ -634,23 +674,37 @@ async def _run_stage(job: Dict[str, Any], *, db: Any) -> Dict[str, Any]:
                 "reason": stop.reason}
     except Exception as exc:  # noqa: BLE001 -- recorded, then re-raised so the job execution fails loudly
         reason = f"{type(exc).__name__}: {exc}"
-        await ledger.finish_run(run_id, outcome="error", checks=result.get("checks"), error=reason, db=db)
+        await ledger.finish_run(run_id, outcome="error", checks=_with_timings(result.get("checks"), timings),
+                                error=reason, db=db)
         await _move(job, status="failed", run_id=run_id, reason=reason[:2000], db=db)
         raise
 
 
 async def _apply(job: Dict[str, Any], run_id: str, result: Dict[str, Any], summary: Dict[str, Any],
-                 *, db: Any) -> Dict[str, Any]:
+                 timings: Dict[str, float], *, db: Any) -> Dict[str, Any]:
     from scripts.curated_apply_gate import evaluate_apply_log
     from services.catalog_enrichment_agent.apply import apply_ingest_plan
     from services.catalog_enrichment_agent.primary_ingestion import require_primary_apply, require_primary_plan
 
     plan = result["plan"]
     preflight = require_primary_plan(plan)
+    waiting = time.monotonic()
     try:
-        counts = await apply_ingest_plan(plan, batch_label=f"retailer_ingest:{job['id']}", db=db,
-                                         primary_readiness=True)
+        # The ONLY catalog write of the stage, and the only part serialized across lanes: the crawl and
+        # checks above ran unlocked. The lock is released when this block exits, however it exits.
+        async with ledger.catalog_write_lock(wait_s=WRITE_LOCK_WAIT_S, poll_s=WRITE_LOCK_POLL_S) as waited:
+            timings["write_lock_wait_s"] = round(waited, 3)
+            with _timed(timings, "write_s"):
+                counts = await apply_ingest_plan(plan, batch_label=f"retailer_ingest:{job['id']}", db=db,
+                                                 primary_readiness=True)
         report = require_primary_apply(preflight, counts)
+    except CatalogWriteLockBusy as busy:
+        timings["write_lock_wait_s"] = round(time.monotonic() - waiting, 3)
+        raise _Stop("write_lock_busy", "apply_due",
+                    f"catalog write lock busy for {busy.waited_s:.0f}s (another apply is writing); "
+                    f"nothing written, retry in {WRITE_LOCK_BUSY_RETRY_S}s",
+                    next_run_at=datetime.now(timezone.utc) + timedelta(seconds=WRITE_LOCK_BUSY_RETRY_S),
+                    count_attempt=False) from busy
     except ValueError as exc:
         # A refused apply may have written part of the cohort: failed, never retried blindly.
         report = getattr(exc, "report", None) or getattr(getattr(exc, "__cause__", None), "report", None)
@@ -664,8 +718,10 @@ async def _apply(job: Dict[str, Any], run_id: str, result: Dict[str, Any], summa
     gate = evaluate_apply_log("primary ingestion: " + json.dumps(report, default=str) + "\nJOB=pipeline RC=0",
                               domain=job["domain"])
     currency = (job.get("options") or {}).get("require_currency") or "USD"
-    readback = await _readback(gate.get("product_keys") or [], currency, db,
-                               planned_images={p.get("product_key"): bool(p.get("image_url")) for p in plan.get("pdps") or []})
+    with _timed(timings, "readback_s"):
+        readback = await _readback(gate.get("product_keys") or [], currency, db,
+                                   planned_images={p.get("product_key"): bool(p.get("image_url"))
+                                                   for p in plan.get("pdps") or []})
     ok = bool(gate.get("ok")) and readback["ok"]
     outcome = "applied" if ok else ("gate_failed" if not gate.get("ok") else "readback_failed")
     await ledger.finish_run(run_id, outcome=outcome, **summary, applied={"gate": gate}, readback=readback,

@@ -295,6 +295,10 @@ QUIET = [
     ({"job_id": "rij_1", "stage": "dry_run", "outcome": "crawl_throttled", "status": "queued",
       "reason": 'throttled, retry later: {"status": "failed"}'}, {"queued": 1}),
     ({"job_id": "rij_1", "stage": "dry_run", "outcome": "nothing_to_ingest", "status": "nothing"}, {"nothing": 1}),
+    # another apply held the catalog write lock: nothing written, retried shortly -- not a failure
+    ({"job_id": "rij_1", "stage": "apply", "outcome": "write_lock_busy", "status": "apply_due",
+      "reason": "catalog write lock busy for 600s (another apply is writing); nothing written, retry in 120s"},
+     {"apply_due": 3}),
 ]
 
 

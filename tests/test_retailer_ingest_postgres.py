@@ -236,17 +236,99 @@ async def test_the_lane_cap_bounds_the_stages_in_flight(db):
     assert (await ledger.claim_due_job(lease_seconds=3600, max_leases=2, db=db))["id"] == third
 
 
-async def test_an_apply_waits_while_an_apply_at_another_host_is_in_flight(db):
+async def test_two_applies_at_different_hosts_are_both_claimed(db):
+    # 2026-09-25: an apply re-crawls and re-checks for 4-40 minutes before it writes, and one apply at a
+    # time left 20 jobs in apply_due. Only the write is serial now (catalog_write_lock), not the claim.
     await _only_ours_due(db)
-    applying = await _at(db, "lanes-a.example", "A", priority=3, status="apply_due")
-    waiting = await _at(db, "lanes-b.example", "B", priority=2, status="apply_due")
+    first = await _at(db, "lanes-a.example", "A", priority=3, status="apply_due")
+    second = await _at(db, "lanes-b.example", "B", priority=2, status="apply_due")
     dry_run = await _at(db, "lanes-c.example", "C", priority=1)
-    assert (await ledger.claim_due_job(lease_seconds=3600, max_leases=3, db=db))["id"] == applying
-    # catalog writes stay serial, but a dry run (read-only on the catalog) still takes the free lane
-    assert (await ledger.claim_due_job(lease_seconds=3600, max_leases=3, db=db))["id"] == dry_run
-    assert await ledger.claim_due_job(lease_seconds=3600, max_leases=3, db=db) is None
-    await ledger.transition(applying, status="done", reason="t", run_id=None, db=db)
-    assert (await ledger.claim_due_job(lease_seconds=3600, max_leases=3, db=db))["id"] == waiting
+    assert (await ledger.claim_due_job(lease_seconds=3600, max_leases=2, db=db))["id"] == first
+    assert (await ledger.claim_due_job(lease_seconds=3600, max_leases=2, db=db))["id"] == second
+    assert await ledger.claim_due_job(lease_seconds=3600, max_leases=2, db=db) is None  # the cap still holds
+    await ledger.transition(first, status="done", reason="t", run_id=None, db=db)
+    assert (await ledger.claim_due_job(lease_seconds=3600, max_leases=2, db=db))["id"] == dry_run
+
+
+async def test_an_apply_is_never_claimed_at_a_host_another_apply_holds(db):
+    await _only_ours_due(db)
+    first = await _at(db, "lanes-a.example", "A", priority=3, status="apply_due")
+    same_host = await _at(db, "www.lanes-a.example", "B", priority=2, status="apply_due")  # www vs bare
+    assert (await ledger.claim_due_job(lease_seconds=3600, max_leases=2, db=db))["id"] == first
+    assert await ledger.claim_due_job(lease_seconds=3600, max_leases=2, db=db) is None
+    await ledger.transition(first, status="done", reason="t", run_id=None, db=db)
+    assert (await ledger.claim_due_job(lease_seconds=3600, max_leases=2, db=db))["id"] == same_host
+
+
+async def test_one_lane_still_claims_one_apply_at_a_time(db):
+    await _only_ours_due(db)
+    first = await _at(db, "lanes-a.example", "A", priority=3, status="apply_due")
+    second = await _at(db, "lanes-b.example", "B", priority=2, status="apply_due")
+    assert (await ledger.claim_due_job(lease_seconds=3600, max_leases=1, db=db))["id"] == first
+    assert await ledger.claim_due_job(lease_seconds=3600, max_leases=1, db=db) is None
+    await ledger.transition(first, status="done", reason="t", run_id=None, db=db)
+    assert (await ledger.claim_due_job(lease_seconds=3600, max_leases=1, db=db))["id"] == second
+
+
+_WRITE_LOCK_TRY = "SELECT pg_try_advisory_lock(hashtext('retailer_ingest_catalog_write'))"
+_WRITE_LOCK_UNLOCK = "SELECT pg_advisory_unlock(hashtext('retailer_ingest_catalog_write'))"
+
+
+async def _write_lock_is_free(conn):
+    """Probe from another session: take the lock and give it straight back."""
+    if not await conn.fetchval(_WRITE_LOCK_TRY):
+        return False
+    assert await conn.fetchval(_WRITE_LOCK_UNLOCK)
+    return True
+
+
+class _KeptConnections:
+    """The lock's real connection opener, keeping a reference to each connection it opens: a
+    connection nobody references is closed by the garbage collector, which would release a lock the
+    code under test forgot to release, and make the probe pass for the wrong reason."""
+
+    def __init__(self):
+        self.opened = []
+
+    async def __call__(self):
+        conn = await ledger._open_lock_connection()
+        self.opened.append(conn)
+        return conn
+
+
+async def test_the_catalog_write_lock_serializes_writes_across_sessions(db):
+    import asyncpg
+    other = await asyncpg.connect(URL)
+    kept = _KeptConnections()
+    try:
+        assert await other.fetchval(_WRITE_LOCK_TRY)  # another apply is writing
+        with pytest.raises(ledger.CatalogWriteLockBusy) as busy:
+            async with ledger.catalog_write_lock(wait_s=0.3, poll_s=0.1, connect=kept):
+                pytest.fail("wrote while another apply held the catalog write lock")
+        assert busy.value.waited_s >= 0.3
+        assert await other.fetchval(_WRITE_LOCK_UNLOCK)  # its write ends
+        async with ledger.catalog_write_lock(wait_s=5, poll_s=0.1, connect=kept) as waited:
+            assert waited < 5
+            assert not await _write_lock_is_free(other)  # held for the whole block
+        assert await _write_lock_is_free(other)  # and released after it
+        assert len(kept.opened) == 2 and all(c.is_closed() for c in kept.opened)
+    finally:
+        await other.close()
+
+
+async def test_the_catalog_write_lock_is_released_when_the_write_raises(db):
+    import asyncpg
+    other = await asyncpg.connect(URL)
+    kept = _KeptConnections()
+    try:
+        with pytest.raises(RuntimeError):
+            async with ledger.catalog_write_lock(wait_s=5, poll_s=0.1, connect=kept):
+                assert not await _write_lock_is_free(other)
+                raise RuntimeError("apply_ingest_plan failed mid-write")
+        assert await _write_lock_is_free(other)  # no session, pooled or not, kept it
+        assert all(c.is_closed() for c in kept.opened)
+    finally:
+        await other.close()
 
 
 async def test_two_expired_leases_each_find_their_own_unfinished_run(db):
@@ -305,17 +387,16 @@ async def test_priority_still_beats_applies_first(db):
     assert (await ledger.claim_due_job(lease_seconds=3600, max_leases=3, db=db))["id"] == apply
 
 
-async def test_applies_first_still_runs_one_apply_at_a_time(db):
+async def test_applies_first_fills_the_free_lanes_with_applies(db):
     await _only_ours_due(db)
     first = await _at(db, "lanes-a.example", "A", priority=10, status="apply_due")
     second = await _at(db, "lanes-b.example", "B", priority=10, status="apply_due")
     dry_run = await _at(db, "lanes-c.example", "C", priority=10)
     assert (await ledger.claim_due_job(lease_seconds=3600, max_leases=3, db=db))["id"] == first
-    # the second apply is first in ORDER BY but an apply is in flight: the dry run takes the lane
+    # an apply in flight no longer holds the second one back: it is first in ORDER BY and takes the lane
+    assert (await ledger.claim_due_job(lease_seconds=3600, max_leases=3, db=db))["id"] == second
     assert (await ledger.claim_due_job(lease_seconds=3600, max_leases=3, db=db))["id"] == dry_run
     assert await ledger.claim_due_job(lease_seconds=3600, max_leases=3, db=db) is None
-    await ledger.transition(first, status="done", reason="t", run_id=None, db=db)
-    assert (await ledger.claim_due_job(lease_seconds=3600, max_leases=3, db=db))["id"] == second
 
 
 class _LockProbe:

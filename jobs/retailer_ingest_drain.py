@@ -13,8 +13,11 @@ LANES, when RETAILER_INGEST_MAX_LEASES > 1 (default 1; ceiling db.retailer_inges
 2026-09-24: a K-beauty dry run spends 35 minutes on 200 paced PDP fetches at ONE host, and with a
 single lane every other store waited behind it (~2 stages/hour, 26 queued). The */10 executions
 already overlap (task timeout 3600s); a claim now lets up to N of them hold a lease at once, but
-never two at the same host (lowercased, "www." dropped, whatever the cohort shape) and never two
-applies (catalog writes stay serial). Each lane is its own execution with its own DB pool
+never two at the same host (lowercased, "www." dropped, whatever the cohort shape). Two applies at
+different hosts may run at once (2026-09-25: an apply's re-crawl + checks took 244-2310 s, and one
+apply at a time left 20 jobs waiting in apply_due); only their catalog WRITES are serial, under
+db.retailer_ingest.catalog_write_lock (an apply that cannot get it within
+pipeline.WRITE_LOCK_WAIT_S writes nothing and returns to apply_due, outcome write_lock_busy). Each lane is its own execution with its own DB pool
 (DB_POOL_MAX_SIZE, 3 in prod), so N lanes hold up to 3N connections. Host exclusivity does NOT bound
 the total request rate from the one crawl NAT (pacing is per host, per process): N lanes are N times
 the traffic, so arm at 2 and watch crawl_throttled before going higher. A throttled crawl ends only
