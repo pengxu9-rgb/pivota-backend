@@ -20,7 +20,7 @@ from fastapi import (
     Request, Response, status,
 )
 from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
-from fastapi.middleware.cors import CORSMiddleware
+from middleware.cors import TieredCORSMiddleware, resolve_trusted_origins
 from middleware.rate_limiter import RateLimitMiddleware
 from middleware.usage_logger import UsageLoggerMiddleware
 from middleware.structured_logging import (
@@ -955,43 +955,14 @@ async def shutdown_event():
         except Exception as exc:  # noqa: BLE001
             logger.error("Error closing the database pool during shutdown: %s", exc)
 
-# CORS middleware - configurable allow list (supports Railway ALLOWED_ORIGINS env)
-dev_mode = os.getenv("DEV_MODE", "false").lower() == "true"
-
-if dev_mode:
-    raw_cors_origins = ["*"]
-else:
-    raw_cors_origins = getattr(settings, "cors_origins", None)
-    if not raw_cors_origins:
-        raw_cors_origins = getattr(settings, "allowed_origins", [])
-
-if isinstance(raw_cors_origins, str):
-    cors_origins = [origin.strip() for origin in raw_cors_origins.split(",") if origin.strip()]
-else:
-    cors_origins = list(raw_cors_origins or [])
-
-if not cors_origins and not dev_mode:
-    cors_origins = [
-        "https://agents.pivota.cc",
-        "https://agent.pivota.cc",
-        "https://developer.pivota.cc",
-        "https://employee.pivota.cc",
-        "https://merchant.pivota.cc",
-        "https://admin.pivota.cc",
-        "https://pivota-agents-portal.vercel.app",
-    ]
-
-# For now we allow all origins via regex to avoid CORS issues across
-# multiple portals (merchant / agent / admin) while still letting
-# FastAPI handle credentials and headers safely.
-if "*" in cors_origins:
-    allow_origin_regex = ".*"
-    allow_origins = []
-else:
-    # Even when an explicit allow list is configured, also enable a
-    # permissive regex so new portals don't get blocked by CORS.
-    allow_origin_regex = ".*"
-    allow_origins = []
+# CORS. Two tiers, resolved in middleware/cors.py (the module docstring is the design record):
+# first-party portals + ALLOWED_ORIGINS get browser credentials; every other Origin gets a plain
+# `*` with NO credentials. The previous code parsed ALLOWED_ORIGINS and then set
+# allow_origin_regex=".*" with allow_credentials=True on both branches, which reflected any Origin
+# with credentials - the 2026-09-25 finding against #2346.
+trusted_cors_origins, trusted_cors_origin_regex = resolve_trusted_origins(
+    settings.cors_origins, dev_mode=settings.dev_mode
+)
 
 # Add usage logging middleware (tracks Agent API calls)
 app.add_middleware(UsageLoggerMiddleware)
@@ -1047,14 +1018,16 @@ app.add_middleware(AP2SecurityMiddleware, enabled=settings.enable_ap2_routes)
 @app.middleware("http")
 async def cors_preflight_passthrough(request: Request, call_next):
     if request.method == "OPTIONS":
-        origin = request.headers.get("Origin", "*")
+        # No Allow-Origin / Allow-Credentials here. This response leaves through the tiered CORS
+        # middleware below, which decorates it by Origin exactly like any other response: a
+        # first-party origin gets itself reflected plus credentials, anything else gets `*` and
+        # no credentials. The old hand-written headers reflected ANY Origin with credentials -
+        # the same finding as the middleware config, on a second path.
         return Response(
             status_code=200,
             headers={
-                "Access-Control-Allow-Origin": origin,
                 "Access-Control-Allow-Headers": "Content-Type, Authorization, X-API-Key, X-Request-Id, X-Buyer-Issuer-Key, Idempotency-Key",
                 "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
-                "Access-Control-Allow-Credentials": "true",
             },
         )
     return await call_next(request)
@@ -1062,10 +1035,9 @@ async def cors_preflight_passthrough(request: Request, call_next):
 
 # CORS should be outermost so error responses still include headers.
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allow_origins,
-    allow_origin_regex=allow_origin_regex,
-    allow_credentials=True,
+    TieredCORSMiddleware,
+    trusted_origins=trusted_cors_origins,
+    trusted_origin_regex=trusted_cors_origin_regex,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=[
         "Content-Type",
@@ -1091,7 +1063,12 @@ app.add_middleware(
 # Log CORS configuration for debugging
 import logging
 logger = logging.getLogger(__name__)
-logger.info(f"🌐 CORS configured: allow_origins={allow_origins}, allow_origin_regex={allow_origin_regex}")
+logger.info(
+    "🌐 CORS configured: credentialed origins=%s, credentialed regex=%s; every other Origin gets "
+    "`*` without credentials",
+    trusted_cors_origins,
+    trusted_cors_origin_regex,
+)
 
 # Include available routers
 app.include_router(agent_router)
