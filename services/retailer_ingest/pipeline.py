@@ -428,9 +428,9 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
         records, left_out = cli._partition_by_category(
             [r for r in records if cli._record_handle(r) not in refiled], prefix=o.get("only_category"))
         if kept_refiled:
-            outside, _ = cli._partition_by_category(kept_refiled, prefix=o.get("only_category"))
+            inside, _ = cli._partition_by_category(kept_refiled, prefix=o.get("only_category"))
             checks["refiled_kept_outside_filter"] = sorted(
-                {cli._record_handle(r) for r in kept_refiled} - {cli._record_handle(r) for r in outside})
+                {cli._record_handle(r) for r in kept_refiled} - {cli._record_handle(r) for r in inside})
             records = records + kept_refiled
         cli._print_category_filter(selected, records, left_out, domain=job["domain"],
                                    want=cli._normalize_category_prefix(o.get("only_category")))
