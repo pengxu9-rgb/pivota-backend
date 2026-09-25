@@ -18,9 +18,11 @@ router = APIRouter(prefix="/admin/fix", tags=["admin-fix"], dependencies=[Depend
 # RETIRED (501). For an admin caller it ran `DROP TABLE IF EXISTS agents CASCADE` -- every agent,
 # and every constraint and view that depends on the table -- then re-created agents in a legacy
 # shape (name, email, company, use_case, status, request_count, ...) that prod's table does not
-# have (probe 2026-09-24: the db/agents.py model's columns plus `email`). Nothing it produced
-# could serve: agent auth reads the model's columns (agent_name, api_key_hash, is_active). The
-# table is built by metadata.create_all at startup; there is no "fix" to run here.
+# have (probe 2026-09-24: the db/agents.py model's columns plus `email`). The table it left was
+# empty and had no agent_name, agent_type, owner_email, api_key_hash or is_active, so neither
+# self-serve registration (routes/agent_account.py register_agent) nor db/agents.py create_agent
+# could insert an agent into it afterwards. The table is built by metadata.create_all at startup;
+# there is no "fix" to run here.
 @router.post("/agents-table")
 async def fix_agents_table():
     """Retired: answers 501 and touches nothing."""

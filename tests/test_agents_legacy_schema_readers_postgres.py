@@ -260,20 +260,37 @@ async def test_init_agent_test_key_writes_no_row_when_the_test_agent_is_absent(c
     assert await _counters(db) == before
 
 
+async def _agents_table_snapshot(db):
+    """Every row and column value, plus the column types / nullability and the indexes: a handler
+    that UPDATEs, ALTERs or re-creates agents before its 501 changes at least one of these."""
+    rows = [
+        tuple(sorted((k, str(v)) for k, v in dict(r).items()))
+        for r in await db.fetch_all("SELECT * FROM agents ORDER BY agent_id")
+    ]
+    columns = [
+        tuple(dict(r).values())
+        for r in await db.fetch_all(
+            "SELECT column_name, data_type, is_nullable, character_maximum_length "
+            "FROM information_schema.columns WHERE table_name = 'agents' ORDER BY ordinal_position"
+        )
+    ]
+    indexes = [
+        tuple(dict(r).values())
+        for r in await db.fetch_all(
+            "SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'agents' ORDER BY indexname"
+        )
+    ]
+    return rows, columns, indexes
+
+
 async def test_fix_agents_table_is_retired_and_keeps_the_table(client, db):
-    columns_sql = (
-        "SELECT column_name FROM information_schema.columns "
-        "WHERE table_name = 'agents' ORDER BY ordinal_position"
-    )
-    columns_before = [r[0] for r in await db.fetch_all(columns_sql)]
-    before = await _counters(db)
+    before = await _agents_table_snapshot(db)
+    assert len(before[0]) == 3 and before[2]  # seeded rows and the model's indexes are there
 
     resp = await client.post("/admin/fix/agents-table")
 
     assert resp.status_code == 501, resp.text
-    assert [r[0] for r in await db.fetch_all(columns_sql)] == columns_before
-    assert await _counters(db) == before
-    assert len(before) == 3
+    assert await _agents_table_snapshot(db) == before
 
 
 @pytest.mark.parametrize("path", ["/admin/fix/agent-metrics", "/admin/fix/agent-metrics-v2"])
