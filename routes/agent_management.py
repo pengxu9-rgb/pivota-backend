@@ -405,16 +405,17 @@ _AGENT_EMAIL_COLUMNS: Optional[Tuple[str, ...]] = None
 # leak being fixed). A deployed table without the column would already be
 # raising, not leaking.
 #
-# `email` is the open question. routes/employee_agent_mgmt.py:433 creates
-# agents with `INSERT INTO agents (agent_id, name, email, ...)` and never
-# writes owner_email, and five read paths in that module coalesce
-# `agent.get("email") or agent.get("owner_email")` -- so rows whose address
-# lives only in `email` either exist or that creation path has been failing.
-# Which one is true depends on how the deployed table was built (the SQLAlchemy
-# model in db/agents.py, or the raw CREATE TABLE at main.py:1588, which have
-# different column sets), and prod Postgres is private-IP only, so it cannot be
-# settled from a checkout. scripts/backfill_auth_identities.py:85 settles it
-# the same way at runtime, with a try/except around the same question.
+# `email` is not in the db/agents.py model, but prod's table has it: a
+# read-only probe on 2026-09-24 found the model's columns plus an out-of-band
+# `email`. No migration adds it; the code paths here that produced it were the
+# legacy raw CREATE TABLE in main.py's startup (removed) and the admin endpoint
+# routes/fix_agents_table.py (dropped and re-created agents in that shape;
+# retired), both in pivota-backend#2317. How prod's table got it is not
+# recorded. The employee INSERT
+# that wrote `email` without owner_email failed on every call and is retired
+# (pivota-backend#2305). Still probed rather than assumed: a fresh database
+# built from the model has no `email`, and scripts/backfill_auth_identities.py:85
+# answers the same question at runtime with a try/except.
 #
 # Probing keeps the answer out of the guess: if `email` is absent the filter is
 # exactly what it would have been anyway, and if it is present an agent whose
