@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, Query, Request, Header, HTTPException
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 from db.database import database
-from db.agents import resolve_agent_id_by_api_key
+from db.agents import resolve_active_agent_id, resolve_agent_id_by_api_key
 from utils.auth import require_admin, decode_token
 
 router = APIRouter(prefix="/agent/metrics", tags=["Agent Metrics"])
@@ -38,7 +38,7 @@ async def get_metrics_summary(
                 role = payload.get("role")
                 if role in ["super_admin", "admin", "employee", "outsourced"]:
                     employee_context = True
-                agent_id = payload.get("agent_id")
+                agent_id = await resolve_active_agent_id(payload.get("agent_id"))
             except:
                 pass
         if not agent_id and x_api_key:
@@ -247,7 +247,7 @@ async def get_recent_activity(
         if authorization and authorization.startswith("Bearer "):
             try:
                 payload = decode_token(authorization.split(" ")[1])
-                agent_id = payload.get("agent_id")
+                agent_id = await resolve_active_agent_id(payload.get("agent_id"))
             except:
                 pass
         if not agent_id and x_api_key:
@@ -357,7 +357,7 @@ async def get_metrics_timeline(
         if authorization and authorization.startswith("Bearer "):
             try:
                 payload = decode_token(authorization.split(" ")[1])
-                agent_id = payload.get("agent_id")
+                agent_id = await resolve_active_agent_id(payload.get("agent_id"))
             except:
                 pass
         if not agent_id and x_api_key:
@@ -397,6 +397,8 @@ async def get_metrics_timeline(
             "timestamp": datetime.now().isoformat()
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         return {
             "status": "error",

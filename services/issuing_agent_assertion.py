@@ -43,6 +43,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Collection, Mapping, Optional
 
+from db.agents import agent_is_active
 from db.database import database
 
 logger = logging.getLogger(__name__)
@@ -164,17 +165,6 @@ def verify_issuing_agent_assertion(
         return None
     except Exception:  # noqa: BLE001 -- a malformed header is "no agent", never a failed request
         return None
-
-
-def agent_is_active(agent: Optional[Mapping[str, Any]]) -> bool:
-    """The same activity rule get_agent_context applies: is_active, else status == 'active'."""
-    if not agent:
-        return False
-    is_active = agent.get("is_active")
-    if is_active is None:
-        status = agent.get("status")
-        return (str(status).strip().lower() == "active") if status else True
-    return bool(is_active)
 
 
 async def _active_agent_id(agent_id: Optional[str], excluded_agent_ids: Collection[str]) -> Optional[str]:
