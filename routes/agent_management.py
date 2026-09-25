@@ -407,9 +407,10 @@ _AGENT_EMAIL_COLUMNS: Optional[Tuple[str, ...]] = None
 #
 # `email` is not in the db/agents.py model, but prod's table has it: a
 # read-only probe on 2026-09-24 found the model's columns plus an out-of-band
-# `email`. No migration adds it; the admin endpoint routes/fix_agents_table.py
-# (drops and re-creates agents with a legacy shape) is the one code path here
-# that produces it. How prod's table got it is not recorded. The employee INSERT
+# `email`. No migration adds it; the one code path here that produced it was
+# the admin endpoint routes/fix_agents_table.py (dropped and re-created agents
+# with a legacy shape; retired in pivota-backend#2317). How prod's table got it
+# is not recorded. The employee INSERT
 # that wrote `email` without owner_email failed on every call and is retired
 # (pivota-backend#2305). Still probed rather than assumed: a fresh database
 # built from the model has no `email`, and scripts/backfill_auth_identities.py:85
