@@ -26,6 +26,8 @@ import ast
 import re
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # The five audited chokepoints (ADR-011's five-door audit, file:line-verified),
@@ -138,12 +140,24 @@ def _calls(node, name: str) -> bool:
     )
 
 
+def _is_direct_call(node, name: str) -> bool:
+    """`node` IS a call to `name` — not an expression that merely contains one."""
+    return isinstance(node, ast.Call) and (
+        (isinstance(node.func, ast.Name) and node.func.id == name)
+        or (isinstance(node.func, ast.Attribute) and node.func.attr == name)
+    )
+
+
 def _first_statement_calls(fn, name: str) -> bool:
+    """The first statement after the docstring is the bare expression `name(...)`.
+
+    NOT "the first statement contains a call to `name`": `(lambda: name())` and
+    `False and name()` both contain one and neither runs it."""
     body = list(fn.body)
     if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
             and isinstance(body[0].value.value, str):
         body = body[1:]  # the docstring
-    return bool(body) and isinstance(body[0], ast.Expr) and _calls(body[0], name)
+    return bool(body) and isinstance(body[0], ast.Expr) and _is_direct_call(body[0].value, name)
 
 
 def _guard_is_in_the_write_path(source: str, guard_name: str, check_name: str) -> bool:
@@ -287,8 +301,14 @@ def test_the_probe_tries_every_entry_of_the_table_not_a_prefix(tmp_path):
     assert not _local_fixture_guard_holds(path, _SPEC)
 
 
-def test_the_probe_rejects_a_write_that_does_not_open_with_the_check(tmp_path):
-    path = _fixture(tmp_path, _TABLE, _STRICT, _WRITER.format(first="pass"))
+@pytest.mark.parametrize("first", [
+    "pass",
+    "(lambda: _bound_check())",        # contains the call, never runs it
+    "False and _bound_check()",        # contains the call, short-circuits it away
+    "[_bound_check for _ in ()]",      # names it, never calls it
+])
+def test_the_probe_rejects_a_write_that_does_not_open_with_the_check(tmp_path, first):
+    path = _fixture(tmp_path, _TABLE, _STRICT, _WRITER.format(first=first))
     assert not _local_fixture_guard_holds(path, _SPEC)
 
 

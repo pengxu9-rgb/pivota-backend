@@ -417,7 +417,6 @@ def _ensure_state_dir(path: Path, *, create: bool) -> Path:
     if create and not os.path.lexists(str(path)):
         path.parent.mkdir(parents=True, exist_ok=True)
         os.mkdir(str(path), 0o700)
-        os.chmod(str(path), 0o700)  # mkdir's mode is filtered by the umask
     try:
         st = os.lstat(str(path))
     except FileNotFoundError:

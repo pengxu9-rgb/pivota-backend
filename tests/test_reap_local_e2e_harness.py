@@ -444,6 +444,33 @@ def test_a_symlinked_state_dir_is_refused(tmp_path):
         H._ensure_state_dir(tmp_path / "link", create=True)
 
 
+def test_a_state_dir_owned_by_someone_else_is_refused(tmp_path, monkeypatch):
+    """A 0700 directory that is not OURS: another user pre-created it and can read it."""
+    path = tmp_path / "state"
+    path.mkdir(mode=0o700)
+    real_uid = os.getuid()
+    monkeypatch.setattr(H.os, "getuid", lambda: real_uid + 1)
+    with pytest.raises(H.HarnessRefused, match="is owned by uid"):
+        H._ensure_state_dir(path, create=True)
+
+
+@pytest.mark.parametrize("url", ["sqlite:///rel/local.db", "sqlite+aiosqlite:///local.db",
+                                 "sqlite:///./x/y.db"])
+def test_a_relative_sqlite_url_is_made_absolute_against_the_callers_cwd(url, tmp_path,
+                                                                         monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    scheme, rel = url.split(":///", 1)
+    assert H._absolutize_sqlite_url(url) == f"{scheme}:///{tmp_path / rel}".replace("/./", "/")
+    assert H._sqlite_file(H._absolutize_sqlite_url(url)).is_absolute()
+
+
+@pytest.mark.parametrize("url", ["sqlite+aiosqlite:////abs/local.db",
+                                 "sqlite+aiosqlite:///:memory:",
+                                 "postgresql://localhost/pivota", None, ""])
+def test_absolute_non_sqlite_and_empty_urls_are_left_alone(url):
+    assert H._absolutize_sqlite_url(url) == url
+
+
 def test_there_is_no_tmp_fallback_without_tmpdir(tmp_path):
     with pytest.raises(H.HarnessRefused, match="TMPDIR is unset"):
         H._resolve_state_dir(None, {})
