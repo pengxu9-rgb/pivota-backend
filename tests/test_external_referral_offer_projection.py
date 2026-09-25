@@ -193,6 +193,86 @@ def test_an_empty_attempted_set_is_not_a_false_alarm(monkeypatch):
     assert _status(monkeypatch, candidate=0, origin_reads=0) == "success"
 
 
+def _budget_status(monkeypatch, *, candidates, skipped, stopped_early=True, reach_env="",
+                   attempted=None, origin_reads=None) -> str:
+    """A budget stop, judged on REACH. Origin yield is held healthy so only the new rule moves."""
+    monkeypatch.setenv("EXTERNAL_REFERRAL_REFRESH_MIN_ORIGIN_YIELD", "")
+    monkeypatch.setenv("EXTERNAL_REFERRAL_REFRESH_MIN_BUDGET_REACH", reach_env)
+    reached = candidates - skipped
+    attempted = reached if attempted is None else attempted
+    return err.batch_run_status(
+        failed=0, stopped_early=stopped_early,
+        attempted_count=attempted,
+        origin_reads=attempted if origin_reads is None else origin_reads,
+        candidate_count=candidates, skipped_for_budget=skipped,
+    )
+
+
+@pytest.mark.parametrize(
+    "night,skipped",
+    [
+        # The measured prod nights (09-05..09-24, --limit 4000) that stopped on budget in the
+        # steady state. These MUST stay green: failing a 3-night drain on night one would make
+        # the alarm meaningless.
+        ("09-10", 353), ("09-11", 356), ("09-07", 357), ("09-05", 659), ("09-12", 881),
+    ],
+)
+def test_a_steady_state_budget_stop_stays_green(monkeypatch, night, skipped):
+    assert _budget_status(monkeypatch, candidates=4000, skipped=skipped) == "success", night
+
+
+@pytest.mark.parametrize(
+    "night,skipped,origin_reads",
+    [
+        # The starved nights. Every one of these printed "status": "success" and exited 0.
+        # 09-23 is the case the yield rule cannot see: 231 origin reads over 369 attempts is a
+        # 0.63 yield, comfortably above the 0.5 floor.
+        ("09-23", 3631, 231), ("09-22", 3917, None), ("09-20", 3919, None),
+        ("09-16", 3711, None), ("09-14", 2797, None), ("09-09", 2398, None),
+    ],
+)
+def test_a_budget_stop_far_short_of_the_queue_is_degraded(monkeypatch, night, skipped, origin_reads):
+    assert _budget_status(
+        monkeypatch, candidates=4000, skipped=skipped, origin_reads=origin_reads,
+    ) == "degraded", night
+
+
+def test_the_reach_floor_sits_exactly_at_half(monkeypatch):
+    """Boundary pinned so a `<=` / `<` swap or a moved default is caught."""
+    assert _budget_status(monkeypatch, candidates=4000, skipped=2000) == "success"
+    assert _budget_status(monkeypatch, candidates=4000, skipped=2001) == "degraded"
+
+
+def test_a_short_run_that_did_not_stop_on_budget_is_not_judged_on_reach(monkeypatch):
+    """Reach only means something when the BUDGET cut the run short. A run that simply had few
+    candidates, or finished them all, reached everything it was given."""
+    assert _budget_status(monkeypatch, candidates=4000, skipped=3900, stopped_early=False) == "success"
+
+
+def test_the_reach_floor_is_tunable_without_a_deploy(monkeypatch):
+    assert _budget_status(monkeypatch, candidates=4000, skipped=3631, reach_env="0.05") == "success"
+    assert _budget_status(monkeypatch, candidates=4000, skipped=881, reach_env="0.9") == "degraded"
+    # A malformed or non-finite value falls back to the default rather than disabling the rule.
+    for junk in ("abc", "nan", "inf"):
+        assert _budget_status(monkeypatch, candidates=4000, skipped=3631, reach_env=junk) == "degraded", junk
+
+
+def test_host_skipped_rows_do_not_count_against_reach(monkeypatch):
+    """The breaker passes rows over INSIDE the reached span, so they are not budget skips: a
+    night that skipped 2,500 throttled rows and finished the rest did its job."""
+    assert _budget_status(
+        monkeypatch, candidates=4000, skipped=400, attempted=1100, origin_reads=1100,
+    ) == "success"
+
+
+@pytest.mark.parametrize(
+    "streak,trip,expected",
+    [(0, 4, False), (3, 4, False), (4, 4, True), (9, 4, True), (99, 0, False), (99, -1, False)],
+)
+def test_the_host_breaker_trips_on_a_streak_and_can_be_disabled(streak, trip, expected):
+    assert err.host_backoff_tripped(streak, trip) is expected
+
+
 @pytest.mark.parametrize(
     "err_text,bucket",
     [

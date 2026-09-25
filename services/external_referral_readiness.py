@@ -31,6 +31,7 @@ from services.external_seed_destination_liveness import (
     CONFIRMED_DEAD_VERDICTS,
     RETIREMENT_STREAK,
 )
+from services import crawl_politeness
 from services.outbound_links_service import (
     DEFAULT_UTM_TEMPLATE,
     apply_utm,
@@ -51,6 +52,23 @@ EXTERNAL_REFERRAL_STALE_DAYS = 7
 # the failure we are trying to make visible. Tunable without a deploy while hosts are triaged.
 _MIN_ORIGIN_YIELD_DEFAULT = 0.5
 
+# Minimum share of a run's candidates the loop must REACH before a budget stop counts as the
+# steady state rather than an incident. Measured over the 20 nights 09-05..09-24 (prod, image
+# 8caa012e9, --limit 4000): the healthy budget stops reached 3,119-3,647 rows (0.78-0.91) and the
+# starved ones 81-1,602 (0.02-0.40), with nothing in between. Half sits in that gap, and it is
+# also the drain arithmetic: 0.5 x 4,000 = 2,000 rows/night is roughly what it takes to touch
+# ~14.4k attached seeds inside the 7-day `EXTERNAL_REFERRAL_STALE_DAYS` window. Tunable without
+# a deploy, like the origin-yield floor.
+_MIN_BUDGET_REACH_DEFAULT = 0.5
+
+# A host that has answered this many 429/503s IN A ROW is skipped for the rest of the run. One
+# host used to be able to spend the whole budget: `max_wait=0` waits out every hold, each hold
+# doubles to the 300s cap, and fentybeauty.com answered 429 x9, let one request through, and
+# started again — ~810s a cycle, four cycles a night, 81-85 rows refreshed on 09-20/21/22 out of
+# 4,000. Four is the measured knee: across 208 host-nights with any 429, 151 never reached a
+# streak of 4, and a streak of 4 costs 2+4+8 = 14s of holds before it trips. `<= 0` disables.
+_HOST_BLOCK_TRIP_DEFAULT = 4
+
 # The only two HTTPException details that mean "this seed can never be crawled", as opposed to
 # "something went wrong this time". Kept as an explicit set so a new 4xx cannot quietly join them.
 _UNPROCESSABLE_SEED_DETAILS = frozenset({"SEED_NOT_FOUND", "INVALID_URL"})
@@ -65,6 +83,33 @@ def _min_origin_yield() -> float:
     return min(max(value, 0.0), 1.0)
 
 
+def _min_budget_reach() -> float:
+    raw = os.getenv("EXTERNAL_REFERRAL_REFRESH_MIN_BUDGET_REACH", "").strip()
+    try:
+        value = float(raw) if raw else _MIN_BUDGET_REACH_DEFAULT
+    except ValueError:
+        return _MIN_BUDGET_REACH_DEFAULT
+    if not math.isfinite(value):
+        return _MIN_BUDGET_REACH_DEFAULT
+    return min(max(value, 0.0), 1.0)
+
+
+def _host_block_trip() -> int:
+    raw = os.getenv("EXTERNAL_REFERRAL_REFRESH_HOST_BLOCK_TRIP", "").strip()
+    try:
+        return int(raw) if raw else _HOST_BLOCK_TRIP_DEFAULT
+    except ValueError:
+        return _HOST_BLOCK_TRIP_DEFAULT
+
+
+def host_backoff_tripped(consecutive_blocks: int, trip: int) -> bool:
+    """Should the batch stop asking this host for the rest of the run? Pure.
+
+    `trip <= 0` disables the breaker, which restores the old unbounded behaviour exactly.
+    """
+    return trip > 0 and int(consecutive_blocks or 0) >= trip
+
+
 def batch_run_status(
     *,
     failed: int,
@@ -75,6 +120,8 @@ def batch_run_status(
     projections_attempted: int = 0,
     projections_written: int = 0,
     projections_errored: int = 0,
+    candidate_count: int = 0,
+    skipped_for_budget: int = 0,
 ) -> str:
     """The run's health, as one word. Pure so it can be tested without a database.
 
@@ -88,10 +135,19 @@ def batch_run_status(
     """
     if failed:
         return "degraded"
-    # `stopped_early` is REPORTED, not failed on. With --limit 4000 over 11,769 seeds the queue
-    # is designed to be drained across ~3 nights, so a budget stop is the steady state, not an
-    # incident. Conflating the two would make the alarm meaningless on night one. The yield
-    # below is the signal that actually distinguishes a short run from an empty one.
+    # A budget stop ALONE is the steady state, not an incident: with --limit 4000 over ~14k
+    # attached seeds the queue drains across several nights, and healthy nights stop with
+    # 78-91% of their candidates reached. What is an incident is a stop FAR short of that. The
+    # yield rule below cannot see it — 09-23 reached 369/4,000 rows and still read 0.63 yield,
+    # because the few rows it did reach mostly read fine. Judged on rows REACHED (candidates
+    # minus `skipped_for_budget`), so rows the host breaker deliberately passed over do not
+    # count against the run; they are reported on their own.
+    if (
+        stopped_early
+        and candidate_count > 0
+        and (candidate_count - max(0, skipped_for_budget)) / candidate_count < _min_budget_reach()
+    ):
+        return "degraded"
     if attempted_count and (origin_reads / attempted_count) < _min_origin_yield():
         return "degraded"
     # Projection ran and healed nothing while prices were moving: the offers table is still
@@ -1711,6 +1767,42 @@ def _refresh_budget_seconds(explicit: Optional[float]) -> float:
     return EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS if resolved is None else resolved
 
 
+async def _fetch_refresh_candidate_hosts(seed_ids: Sequence[str]) -> Dict[str, str]:
+    """seed id -> the host `crawl_politeness` paces its fetch on.
+
+    `host_of(destination_url)`, NOT the seed's `domain` column: the pacing state is keyed by the
+    host of the URL actually requested (`_fetch_html` -> `note_response(url, ...)`), and the two
+    disagree whenever `domain` drops a `www.`. A breaker keyed on the other spelling would never
+    see the streak it is meant to act on.
+
+    FAILS OPEN TO "NO BREAKER", loudly. A lookup error must not stop the refresh itself; without
+    hosts the run behaves exactly as it did before the breaker existed.
+    """
+    hosts: Dict[str, str] = {}
+    ids = [str(s) for s in seed_ids if s]
+    try:
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            params = {f"id{i}": seed_id for i, seed_id in enumerate(chunk)}
+            placeholders = ", ".join(f":id{i}" for i in range(len(chunk)))
+            rows = await database.fetch_all(
+                f"SELECT id, destination_url FROM external_product_seeds WHERE id IN ({placeholders})",
+                params,
+            )
+            for row in rows or []:
+                row_dict = _row_to_dict(row)
+                host = crawl_politeness.host_of(str(row_dict.get("destination_url") or ""))
+                if host:
+                    hosts[str(row_dict.get("id"))] = host
+    except Exception as exc:  # noqa: BLE001 - the breaker is an optimisation, the refresh is not
+        logger.warning(
+            "external referral refresh: host lookup failed (%s); the per-host 429 breaker is "
+            "OFF for this run", str(exc)[:200],
+        )
+        return {}
+    return hosts
+
+
 async def run_external_referral_refresh_batch(
     *,
     refresh_seed_by_id: Callable[[str], Awaitable[Dict[str, Any]]],
@@ -1719,6 +1811,15 @@ async def run_external_referral_refresh_batch(
 ) -> Dict[str, Any]:
     candidate_seed_ids = await get_external_referral_refresh_candidate_seed_ids(limit=limit)
     budget = _refresh_budget_seconds(budget_seconds)
+    host_trip = _host_block_trip()
+    candidate_hosts = (
+        await _fetch_refresh_candidate_hosts(candidate_seed_ids) if host_trip > 0 else {}
+    )
+    # Hosts this run has stopped asking, and how many of their rows it passed over. Those rows
+    # are NOT stamped (`refresh_seed_by_id` is never called), so they keep their place at the
+    # head of tomorrow's queue instead of being recorded as an attempt that never happened.
+    tripped_hosts: Dict[str, int] = {}
+    skipped_for_host_backoff = 0
     started = time.monotonic()
     skipped_for_budget = 0
     degraded_reasons: Dict[str, int] = {}
@@ -1784,6 +1885,11 @@ async def run_external_referral_refresh_batch(
                 budget, index, len(candidate_seed_ids), skipped_for_budget,
             )
             break
+        host = candidate_hosts.get(seed_id, "")
+        if host and host in tripped_hosts:
+            tripped_hosts[host] += 1
+            skipped_for_host_backoff += 1
+            continue
         try:
             result = await refresh_seed_by_id(seed_id)
             status = str(result.get("status") or "success")
@@ -1857,6 +1963,18 @@ async def run_external_referral_refresh_batch(
         except Exception as exc:
             failed += 1
             errors.append({"seed_id": seed_id, "status": "failed", "error": str(exc)[:300]})
+        # AFTER the row, from the pacing layer's own counter rather than from this row's result:
+        # a streak is only visible there (the result says "degraded: http 429", not how many in
+        # a row), and it also sees 503s and any 429 a projection fetch earned on the same host.
+        # The breaker changes WHETHER we ask the host again this run, never how fast.
+        if host and host not in tripped_hosts and host_backoff_tripped(
+            crawl_politeness.consecutive_blocks(host), host_trip
+        ):
+            tripped_hosts[host] = 0
+            logger.warning(
+                "external referral refresh: %s answered %d 429/503s in a row; skipping its "
+                "remaining rows this run", host, crawl_politeness.consecutive_blocks(host),
+            )
     # Real origin contact, not the success count: `refreshed` includes rows served from the
     # cached snapshot because the gate refused, timed out or paced out. This ratio is the one
     # number that says whether the run did its job.
@@ -1867,7 +1985,11 @@ async def run_external_referral_refresh_batch(
     # `unprocessable` rows leave the denominator too: a seed with no usable destination was
     # never a candidate for an origin read, so charging the yield for it understates a healthy
     # run by roughly the size of that permanent backlog (~628 today).
-    attempted_count = max(0, len(candidate_seed_ids) - skipped_for_budget - unprocessable)
+    # Rows the host breaker passed over leave it too, for the same reason as budget skips: they
+    # were never tried.
+    attempted_count = max(
+        0, len(candidate_seed_ids) - skipped_for_budget - unprocessable - skipped_for_host_backoff
+    )
     origin_yield = (origin_reads / attempted_count) if attempted_count else 1.0
     min_yield = _min_origin_yield()
     low_yield = bool(attempted_count) and origin_yield < min_yield
@@ -1893,6 +2015,8 @@ async def run_external_referral_refresh_batch(
             projections_attempted=proj_attempted,
             projections_written=proj_written,
             projections_errored=proj_errored,
+            candidate_count=len(candidate_seed_ids),
+            skipped_for_budget=skipped_for_budget,
         ),
         # "healed 2,000" vs "healed 0" — the projection OUTCOME, not just that it was called.
         "unprocessable": unprocessable,
@@ -1926,6 +2050,19 @@ async def run_external_referral_refresh_batch(
         "budget_seconds": budget,
         "elapsed_seconds": round(time.monotonic() - started, 3),
         "skipped_for_budget": skipped_for_budget,
+        # Share of candidates the loop got to before the budget ran out; `batch_run_status`
+        # degrades a budget stop below `min_budget_reach`.
+        "budget_reach": round(
+            (len(candidate_seed_ids) - skipped_for_budget) / len(candidate_seed_ids), 4
+        ) if candidate_seed_ids else 1.0,
+        "min_budget_reach": _min_budget_reach(),
+        # Rows NOT attempted because their host tripped the 429/503 breaker, per host. Kept
+        # apart from `skipped_for_budget` because the fix differs: a budget skip is a slow
+        # night, a host skip is one merchant throttling our egress IP.
+        "skipped_for_host_backoff": skipped_for_host_backoff,
+        "host_backoff_skips": dict(sorted(tripped_hosts.items(), key=lambda kv: -kv[1])[:10]),
+        "host_block_trip": host_trip,
+        "host_breaker_armed": bool(candidate_hosts),
         "refreshed": refreshed,
         # SUBSET of `refreshed`, not a separate bucket: these rows took the success path on a
         # cached snapshot without reaching the origin. `refreshed - refreshed_from_cache` is
