@@ -138,6 +138,7 @@ def test_worker_forwards_all_supported_controls(monkeypatch):
         "require_currency": "USD", "emit_real_variants": True, "base_listings_only": True,
         "enrich_missing_inci": False, "max_pdp_inci_fetches": 0, "max_products": 700,
         "max_scan_products": 12000, "enrich_missing_gtin": True, "max_pdp_identity_fetches": 7,
+        "pdp_inci_budget_s": None,  # the worker sets no INCI time budget (only the unattended drain does)
     }]
 
 

@@ -4,6 +4,8 @@ The rule is EXACT tag tokens plus a few title phrases, measured on a 24,523-prod
 (2026-09-24): it dropped 13 priced items there, all of them gifts, and no sellable product. Both halves are
 pinned here -- what must be dropped AND the look-alikes that are sellable and must be kept.
 """
+from unittest.mock import AsyncMock
+
 import pytest
 
 from services import curated_brand_feed as cbf
@@ -85,6 +87,7 @@ async def test_records_for_brand_drops_gifts_and_records_each_drop(monkeypatch):
         return cbf.ShopifyProductBatch([real, gift, titled], scanned_products=3, pages=1)
 
     monkeypatch.setattr(cbf, "fetch_shopify_products", fake_fetch)
+    monkeypatch.setattr(cbf, "fetch_shopify_shop_locale", AsyncMock(return_value={"currency": "USD"}))  # no network
     records = await cbf.records_for_brand(domain="westman-atelier.com", category_path="beauty/makeup")
     assert [r["pdp"]["product_name"] for r in records] == ["Baby Cheeks Blush Stick"]
     report = records.crawl_report
@@ -114,6 +117,7 @@ async def test_gifts_are_dropped_before_gtin_recovery_and_the_sample_is_capped(m
         return products, {"attempted": 0}
 
     monkeypatch.setattr(cbf, "fetch_shopify_products", fake_fetch)
+    monkeypatch.setattr(cbf, "fetch_shopify_shop_locale", AsyncMock(return_value={"currency": "USD"}))  # no network
     monkeypatch.setattr(cbf, "recover_missing_variant_gtins", fake_recover)
     records = await cbf.records_for_brand(domain="westman-atelier.com", category_path="beauty/makeup",
                                           enrich_missing_gtin=True)

@@ -41,7 +41,7 @@ _OPTION_TYPES = {
     "vendors": list, "require_currency": str, "category_path": str, "only_category": str,
     "only_resolved_category": bool, "lip_title_evidence": bool, "exclude_handles": list,
     "accepted_flags": list, "max_scan_products": int, "max_products": int,
-    "max_pdp_identity_fetches": int, "retailer_name": str, "notes": str,
+    "max_pdp_identity_fetches": int, "max_pdp_inci_fetches": int, "retailer_name": str, "notes": str,
     # "storefront" (default: crawl the retailer's /products.json) or "affiliate_feed" (the network's
     # product datafeed; services/retailer_ingest/affiliate_feed.py) -- for stores that block crawlers.
     "source": str, "feed": dict,
@@ -65,6 +65,14 @@ _OPTION_TYPES = {
 }
 SOURCES = ("storefront", "affiliate_feed")
 MAX_PDP_IDENTITY_FETCHES = 300
+# PDP INCI enrichment in an unattended stage: the worker's default (300 fetches, no time limit) ran luxiface.com
+# past the 3600 s task timeout twice (2.2 s CPU per ~2 MB page). The drain fetches at most this many by default
+# (options.max_pdp_inci_fetches overrides, 0 = none, at most MAX_PDP_INCI_FETCHES) and stops at the budget.
+DRAIN_PDP_INCI_FETCHES = 60
+MAX_PDP_INCI_FETCHES = 300
+DRAIN_PDP_INCI_BUDGET_S = 900
+# Integer options where 0 is meaningful ("fetch none"); every other integer option must be >= 1.
+_ZERO_ALLOWED_INT_OPTIONS = frozenset({"max_pdp_inci_fetches"})
 
 
 def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
@@ -83,8 +91,9 @@ def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
         del options[key]  # a null option is an absent one (approve() merges lists into them)
     for key, value in options.items():
         want = _OPTION_TYPES[key]
-        if want is int and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
-            raise ValueError(f"options.{key} must be a positive integer")
+        floor = 0 if key in _ZERO_ALLOWED_INT_OPTIONS else 1
+        if want is int and (isinstance(value, bool) or not isinstance(value, int) or value < floor):
+            raise ValueError(f"options.{key} must be a {'nonnegative' if floor == 0 else 'positive'} integer")
         if want is not int and not isinstance(value, want):
             raise ValueError(f"options.{key} must be {want.__name__}")
         if want is list and not all(isinstance(v, str) and v.strip() for v in value):
@@ -128,6 +137,8 @@ def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
         if source != "storefront" or not options["collections"] or not all(
                 valid_collection_handle(h) for h in options["collections"]):
             raise ValueError("options.collections must be Shopify collection handles on a storefront cohort")
+    if int(options.get("max_pdp_inci_fetches") or 0) > MAX_PDP_INCI_FETCHES:
+        raise ValueError(f"options.max_pdp_inci_fetches must be at most {MAX_PDP_INCI_FETCHES}")
     if int(options.get("max_pdp_identity_fetches") or 0) > MAX_PDP_IDENTITY_FETCHES:
         # Each fetch waits CRAWL_MIN_INTERVAL_SECONDS (4s): 300 is ~20 min of one stage already.
         raise ValueError(f"options.max_pdp_identity_fetches must be at most {MAX_PDP_IDENTITY_FETCHES}")
@@ -196,6 +207,10 @@ def _feed_payload(job: Dict[str, Any]) -> Dict[str, Any]:
         "enrich_missing_gtin": True, "max_products": int(o.get("max_products") or 200),
         "max_scan_products": int(o.get("max_scan_products") or 20000),
         "max_pdp_identity_fetches": int(o.get("max_pdp_identity_fetches") or 200),
+        # 0 is a real choice (no INCI fetches), so no `or` here.
+        "max_pdp_inci_fetches": (DRAIN_PDP_INCI_FETCHES if o.get("max_pdp_inci_fetches") is None
+                                 else int(o["max_pdp_inci_fetches"])),
+        "pdp_inci_budget_s": DRAIN_PDP_INCI_BUDGET_S,
     }
 
 
