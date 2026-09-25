@@ -520,3 +520,9 @@ def test_host_url_pattern_anchors_on_the_url_host(url, match):
                                   "//palacebeauty.com", "  PalaceBeauty.com "])
 def test_host_url_pattern_reduces_a_host_given_with_a_scheme(host):
     assert aii.host_url_pattern(host) == aii.host_url_pattern("palacebeauty.com")
+
+
+@pytest.mark.parametrize("host", ["[Official] Palace Store", "palace]beauty.com", "ｘ.com／a"])
+def test_host_url_pattern_never_raises_on_free_text(host):
+    import re
+    re.compile(aii.host_url_pattern(host))

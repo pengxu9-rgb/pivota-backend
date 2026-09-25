@@ -122,3 +122,10 @@ async def test_a_host_passed_with_its_scheme_still_matches(db):
     await _row(db, "scheme", url="https://palacebeauty-bhg.com/products/lipstick")
     assert (await _find(db, "https://palacebeauty-bhg.com"))["product_key"] == PREFIX + "scheme"
     assert (await _find(db, "https://www.palacebeauty-bhg.com/"))["product_key"] == PREFIX + "scheme"
+
+
+@pytest.mark.asyncio
+async def test_a_source_domain_urlparse_refuses_still_matches_by_equality(db):
+    # source_domain is free text; urlparse raises "Invalid IPv6 URL" on '[' -- the lookup must not.
+    await _row(db, "freetext", url=None, source_domain="[Official] BHG Store")
+    assert (await _find(db, "[Official] BHG Store"))["product_key"] == PREFIX + "freetext"

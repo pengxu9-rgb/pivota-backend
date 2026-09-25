@@ -463,7 +463,10 @@ def host_url_pattern(host: str) -> str:
     as source_domain) is reduced to its hostname first; used raw it could never match a URL.
     Every non-alphanumeric character is backslash-escaped: in an ARE that is always a literal."""
     raw = str(host or "").strip()
-    bare = _host(raw if "://" in raw else ("https:" + raw if raw.startswith("//") else "https://" + raw))
+    try:
+        bare = _host(raw if "://" in raw else ("https:" + raw if raw.startswith("//") else "https://" + raw))
+    except ValueError:  # urlparse refuses '[', ']' and some separators; source_domain is free text
+        bare = ""
     escaped = "".join(ch if ch.isalnum() else "\\" + ch for ch in (bare or raw).lower())
     return rf"^https?://([^/?#@]*\.)?{escaped}([:/?#]|$)"
 
