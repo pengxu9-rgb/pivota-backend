@@ -142,6 +142,7 @@ from routes.mcp_oauth_as import router as mcp_oauth_as_router  # MCP OAuth Autho
 from routes.agent_account import router as agent_account_router  # Agent account management
 from routes.agent_commerce import router as agent_commerce_router
 from routes.agent_commerce_reap import router as agent_commerce_reap_router
+from routes.reap_return import router as reap_return_router
 from routes.admin_api import router as admin_api_router
 from routes.admin_partner_cohort import router as admin_partner_cohort_router
 from routes.admin_partner_comms import router as admin_partner_comms_router
@@ -1168,6 +1169,11 @@ app.include_router(agent_commerce_router)  # Agent v2 commerce execute contract
 # when a dial is on is a router whose mounting is itself untested, and the dial is read per
 # request so flipping it must not need a redeploy.
 app.include_router(agent_commerce_reap_router)
+# GET/HEAD /reap/return: the static page Reap's hosted checkout sends the buyer's browser back to
+# (the rail's default returnUrl is https://api.pivota.cc/reap/return). Public and NOT dialled:
+# a buyer mid-purchase must never land on a 404 because an operator turned the rail off. It
+# reads nothing, writes nothing, and says nothing about the order (routes/reap_return.py).
+app.include_router(reap_return_router)
 app.include_router(admin_api_router)  # Admin API endpoints
 app.include_router(admin_partner_cohort_router)  # Admin channel-partner cohort progress/evaluation
 app.include_router(admin_partner_comms_router)  # Admin channel-partner contact, send log, send settlement email

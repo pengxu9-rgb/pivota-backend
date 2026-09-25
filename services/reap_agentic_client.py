@@ -143,9 +143,14 @@ ALLOWED_HOSTED_URL_SUFFIXES = ("prava.space", "reap.global")
 
 #: Hosts our OWN `returnUrl` may name. Read from the environment because the agent front end
 #: moves between environments faster than this file does, and a wrong value here is not a
-#: security hole so much as a buyer who lands nowhere after paying. Default is the one host that
-#: exists today. See `return_url_hosts`.
-DEFAULT_RETURN_URL_HOSTS = ("agent.pivota.cc",)
+#: security hole so much as a buyer who lands nowhere after paying. See `return_url_hosts`.
+#:
+#: ORDER MATTERS: `routes.agent_commerce_reap._default_return_url` builds the rail's default
+#: `https://<hosts[0]>/reap/return`, so the FIRST entry is where a buyer lands. It is the API host
+#: because that is the only host with a page at `/reap/return` (routes/reap_return.py, served by
+#: this backend); agent.pivota.cc has none while its UI is on hold. agent.pivota.cc stays in the
+#: list so a caller- or operator-supplied return URL naming it keeps validating as before.
+DEFAULT_RETURN_URL_HOSTS = ("api.pivota.cc", "agent.pivota.cc")
 
 #: Required header on EVERY agentic endpoint, and enum-constrained to this single value in the
 #: spec. Its absence is a 4xx, not a default -- omitting it was one of #2136's four defects.

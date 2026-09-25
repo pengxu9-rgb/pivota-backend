@@ -4383,6 +4383,47 @@ def test_an_empty_allowlist_variable_means_the_default_not_nothing(clean_env):
     assert rc.return_url_hosts() == rc.DEFAULT_RETURN_URL_HOSTS
 
 
+# --- the default landing host: api.pivota.cc, which serves /reap/return -----------------------
+
+def test_the_default_return_host_is_the_api_host_and_it_comes_first(clean_env):
+    """`routes.agent_commerce_reap._default_return_url` takes `hosts[0]`, so ORDER is behaviour.
+    api.pivota.cc is the only host with a page at `/reap/return` (routes/reap_return.py);
+    agent.pivota.cc has none, and it stays in the list only so URLs naming it keep validating."""
+    assert rc.DEFAULT_RETURN_URL_HOSTS == ("api.pivota.cc", "agent.pivota.cc")
+    assert rc.return_url_hosts()[0] == "api.pivota.cc"
+
+
+@pytest.mark.parametrize("url", [
+    "https://api.pivota.cc.evil.example/reap/return",   # our host as a PREFIX of theirs
+    "https://evil.example/api.pivota.cc/reap/return",   # our host in the PATH
+    "https://api-pivota.cc/reap/return",                # lookalike, not a subdomain
+    "https://u:p@api.pivota.cc/reap/return",            # userinfo on our own host
+    "http://api.pivota.cc/reap/return",                 # plain http
+])
+def test_a_return_url_that_only_resembles_the_api_host_is_refused(url, clean_env):
+    with pytest.raises(rc.ReapRequestError):
+        rc.validate_return_url(url)
+
+
+@pytest.mark.parametrize("url", [
+    "https://api.pivota.cc/reap/return",
+    "https://api.pivota.cc/reap/return?stage=checkout&click_id=clk_1",
+    "https://API.PIVOTA.CC/reap/return",                # hostnames compare case-insensitively
+    "https://agent.pivota.cc/reap/return",              # the old default, still allowlisted
+])
+def test_a_return_url_on_the_default_hosts_is_accepted_verbatim(url, clean_env):
+    assert rc.validate_return_url(url) == url
+
+
+def test_an_explicit_port_on_an_allowlisted_host_is_ACCEPTED(clean_env):
+    """PINNED AS ACCEPTED, which is today's behaviour, not an endorsement of it: the allowlist
+    compares `urlparse(...).hostname`, which carries no port, so `:8443` passes. It is still our
+    host over https -- a different port on api.pivota.cc is not an attacker's origin -- but if the
+    validator is ever tightened to refuse non-default ports, this test is the one to flip."""
+    url = "https://api.pivota.cc:8443/reap/return"
+    assert rc.validate_return_url(url) == url
+
+
 # --- the hosted URL on the way IN: we hand this to a buyer ---------------------------------------
 
 @pytest.mark.parametrize("url", [

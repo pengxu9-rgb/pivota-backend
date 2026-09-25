@@ -109,7 +109,7 @@ poller drives the state machine afterwards, on another process, over the next mi
       "country": "US"
     }
   },
-  "return_url": "https://agent.pivota.cc/reap/return",
+  "return_url": "https://api.pivota.cc/reap/return",
   "idempotency_key": "door-7f3a-2026-09-18",
   "click_context": { "surface": "chat" }
 }
@@ -126,7 +126,7 @@ poller drives the state machine afterwards, on another process, over the next mi
 | `buyer.consent_version` | **yes** | the version tag of the terms your user accepted, ≤ 32 printable characters. Missing, blank, over-long or unprintable ⇒ `400 consent_required`. Stored against the buyer and **overwritten on every purchase**, so it is always the latest version they accepted. Not an enum — we record the tag, we do not adjudicate it — and not part of the idempotency hash, so re-consenting mid-retry still replays. |
 | `buyer.shipping_address` | yes | **the Reap client's field names**, not the snake_case shape `/agent/v2/commerce/checkouts` uses. Required: `firstName`, `lastName`, `phone`, `addressLine1`, `city`, `country`. Optional: `addressLine2`, `region`, `postalCode`. Unknown keys are dropped. |
 | `buyer.name`, `buyer.phone` | no | **fallbacks only.** Used when the address omits the field; never override it. `name` splits on the last space. |
-| `return_url` | no | defaults to `REAP_AGENTIC_RETURN_URL`, else `https://agent.pivota.cc/reap/return`. Must be https, no userinfo, on a host in `REAP_RETURN_URL_HOSTS`. |
+| `return_url` | no | defaults to `REAP_AGENTIC_RETURN_URL`, else `https://<first REAP_RETURN_URL_HOSTS host>/reap/return` — with nothing set, `https://api.pivota.cc/reap/return`, a static page this backend serves. Must be https, no userinfo, on a host in `REAP_RETURN_URL_HOSTS`. |
 | `idempotency_key` | no | honoured for **24 hours**, scoped to `(agent, buyer)`. |
 | `click_context` | no | accepted and not forwarded. The click id this rail records is one **we** mint. |
 

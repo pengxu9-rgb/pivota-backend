@@ -121,7 +121,8 @@ handle is quoting against something nobody has checked since.
 |---|---|---|
 | `REAP_AGENTIC_ENABLED` | **unset = off** | `start_purchase` refuses `rail_disabled`. Truthy spellings: `1`, `true`, `on`, `yes` (case/space-insensitive). An allowlist, so a typo cannot arm the rail. |
 | `REAP_API_BASE_URL` + `REAP_API_KEY` | unset | both required; otherwise `start_purchase` refuses `rail_unconfigured`. |
-| `REAP_RETURN_URL_HOSTS` | `agent.pivota.cc` | host allowlist for our own `returnUrl`. Empty/unset means the default, not "no hosts". |
+| `REAP_RETURN_URL_HOSTS` | `api.pivota.cc,agent.pivota.cc` | host allowlist for our own `returnUrl`. Empty/unset means the default, not "no hosts". **Order matters:** the first host is the default return URL's host. |
+| `REAP_AGENTIC_RETURN_URL` | unset | the return URL the routes use when the caller sends none. Unset ⇒ `https://<first REAP_RETURN_URL_HOSTS host>/reap/return`. Validated like a caller's (https, allowlisted host, no userinfo). |
 | `REAP_AGENTIC_SIMULATE_CHECKOUT` | **unset = off** | **Sandbox only.** Exactly `COMPLETED` (case-sensitive; anything else is ignored with a WARNING on the `pivota` logger) adds `X-Simulate-Checkout: COMPLETED` to `POST /agentic/checkouts` and to no other request — and only when `REAP_API_BASE_URL`'s host is exactly `sandbox.api.reap.global` or `mx.sandbox.api.reap.global` (any other host: header withheld, WARNING). See below. |
 
 **`REAP_AGENTIC_SIMULATE_CHECKOUT`, measured 25 Sep in the sandbox.** It does not skip the buyer:
@@ -132,6 +133,22 @@ the quote expires. After approval it goes `PROCESSING` → `COMPLETED` with an `
 idempotency material, so a simulated and an unsimulated checkout on one quote are different
 requests; with the dial unset the key is byte-identical to before. Reap's spec says the header is
 rejected in production, so the host guard is belt and braces, not the only lock.
+
+### The return URL and its landing page
+
+With neither variable above set, Reap sends the buyer's browser back to
+`https://api.pivota.cc/reap/return` — a static page this backend serves (`routes/reap_return.py`,
+`web` service, public, no auth, not behind `REAP_AGENTIC_ENABLED`), titled "Back to your
+assistant". Buyers reach it after BOTH hosted steps — the enrollment (card saved) and the checkout
+approval — and it reads no input, so its copy is stage-neutral: Reap has their response, the
+assistant will confirm the next step once it is settled, nothing is charged without their approval
+on Reap's page. **Landing there proves nothing about the order:** the buyer's approval on Reap's page authorises the charge, arriving at the URL only means
+a browser followed a redirect, and the outcome is known only when the poller reads
+`GET /agentic/checkouts/{id}`. The page reads no parameter, writes nothing and logs nothing of its
+own, but the click id in its query string does appear in uvicorn's access line (the redaction
+filter rewrites path secrets only). To send buyers elsewhere, set `REAP_AGENTIC_RETURN_URL` to a
+full https URL on an allowlisted host, or put a different host first in `REAP_RETURN_URL_HOSTS`
+(that host must then serve `/reap/return` itself).
 
 `REAP_AGENTIC_ENABLED` gates `start_purchase` only. `advance` does **not** re-check it: a
 purchase already in flight must be allowed to finish (or fail cleanly) after the dial is turned

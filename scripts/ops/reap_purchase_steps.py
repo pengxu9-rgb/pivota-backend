@@ -62,8 +62,10 @@ from typing import Any, Dict, Optional
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 #: Where the buyer's browser lands after the hosted page. Ours, and validated against
-#: REAP_RETURN_URL_HOSTS by the client before it is ever sent.
-DEFAULT_RETURN_URL = "https://agent.pivota.cc/reap/return"
+#: REAP_RETURN_URL_HOSTS by the client before it is ever sent. The API host, because that is the
+#: only host with a page at /reap/return (routes/reap_return.py); the rail's own default is the
+#: same URL.
+DEFAULT_RETURN_URL = "https://api.pivota.cc/reap/return"
 
 
 # --- state ---------------------------------------------------------------------------------

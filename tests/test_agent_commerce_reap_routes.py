@@ -1548,11 +1548,38 @@ async def test_a_return_url_with_userinfo_is_refused(client):
 
 
 async def test_the_default_return_url_is_used_and_is_allowlisted(client):
+    """The default is the API host's landing page (routes/reap_return.py), NOT agent.pivota.cc:
+    nothing answers `/reap/return` there, so the old default sent every buyer who had just
+    approved a payment to a 404. Pinned as the exact origin + path, because `startswith` on the
+    host alone would pass a default that pointed at a page this backend does not serve."""
     await _seed_all()
     resp = await client.post(f"{BASE}/purchases", json=_body(return_url=None))
     assert resp.status_code == 202
     row = await _purchase_row(resp.json()["purchase_id"])
-    assert row["return_url"].startswith("https://agent.pivota.cc/")
+    stored = row["return_url"]
+    assert stored == "https://api.pivota.cc/reap/return" \
+        or stored.startswith("https://api.pivota.cc/reap/return?"), stored
+
+
+async def test_an_operator_allowlist_still_picks_the_default_host(client, monkeypatch):
+    """`REAP_RETURN_URL_HOSTS` keeps working exactly as before the default moved: its FIRST host
+    is the default's host, and the shipped default list plays no part."""
+    monkeypatch.setenv("REAP_RETURN_URL_HOSTS", "staging.pivota.cc,api.pivota.cc")
+    await _seed_all()
+    resp = await client.post(f"{BASE}/purchases", json=_body(return_url=None))
+    assert resp.status_code == 202
+    row = await _purchase_row(resp.json()["purchase_id"])
+    assert row["return_url"].startswith("https://staging.pivota.cc/reap/return")
+
+
+async def test_an_operator_configured_return_url_that_is_allowlisted_is_used(client, monkeypatch):
+    """`REAP_AGENTIC_RETURN_URL` still overrides the code default, verbatim."""
+    monkeypatch.setenv("REAP_AGENTIC_RETURN_URL", "https://agent.pivota.cc/landing?src=ops")
+    await _seed_all()
+    resp = await client.post(f"{BASE}/purchases", json=_body(return_url=None))
+    assert resp.status_code == 202
+    row = await _purchase_row(resp.json()["purchase_id"])
+    assert row["return_url"].startswith("https://agent.pivota.cc/landing?src=ops")
 
 
 async def test_an_operator_configured_return_url_is_validated_too(client, monkeypatch):

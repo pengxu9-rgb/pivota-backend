@@ -1338,6 +1338,8 @@ async def _record_cart_link_click(
 
 #: Where Reap sends the buyer's browser after a hosted page. There is no such constant in the
 #: client — it validates a return URL but never supplies one — so this rail's default lives here.
+#: With neither env var set it is `https://api.pivota.cc/reap/return`, the static page in
+#: routes/reap_return.py (the first entry of `rc.DEFAULT_RETURN_URL_HOSTS`).
 #:
 #: A CODE DEFAULT, derived from the client's own host allowlist, with the env var as an override.
 #: The other order (env var required, code fallback absent) is the shape that took five flags
