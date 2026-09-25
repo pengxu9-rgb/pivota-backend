@@ -138,9 +138,11 @@ rejected in production, so the host guard is belt and braces, not the only lock.
 
 With neither variable above set, Reap sends the buyer's browser back to
 `https://api.pivota.cc/reap/return` — a static page this backend serves (`routes/reap_return.py`,
-`web` service, public, no auth, not behind `REAP_AGENTIC_ENABLED`) that says the approval was
-received and the assistant will confirm the order. **Landing there proves nothing about the
-order:** the buyer's approval on Reap's page authorises the charge, arriving at the URL only means
+`web` service, public, no auth, not behind `REAP_AGENTIC_ENABLED`), titled "Back to your
+assistant". Buyers reach it after BOTH hosted steps — the enrollment (card saved) and the checkout
+approval — and it reads no input, so its copy is stage-neutral: Reap has their response, the
+assistant will confirm the next step once it is settled, nothing is charged without their approval
+on Reap's page. **Landing there proves nothing about the order:** the buyer's approval on Reap's page authorises the charge, arriving at the URL only means
 a browser followed a redirect, and the outcome is known only when the poller reads
 `GET /agentic/checkouts/{id}`. The page reads no parameter, writes nothing and logs nothing of its
 own, but the click id in its query string does appear in uvicorn's access line (the redaction

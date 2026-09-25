@@ -4,7 +4,7 @@ Every agentic purchase hands Reap a `presentation.returnUrl`; the default, built
 `routes.agent_commerce_reap._default_return_url` from the first host in
 `services.reap_agentic_client.DEFAULT_RETURN_URL_HOSTS`, is `https://api.pivota.cc/reap/return`.
 Before this router existed nothing answered at that address on any host, so a buyer who had just
-approved a payment landed on a 404.
+approved a payment (or saved a card) landed on a 404.
 
 WHAT THIS PAGE IS NOT: evidence about the order. The buyer's approval on Reap's page is what
 authorises the charge; arriving here proves only that a browser followed a redirect (or that
@@ -36,10 +36,15 @@ router = APIRouter(tags=["reap-agentic"])
 
 RETURN_PATH = "/reap/return"
 
-TITLE = "Payment approved"
-APPROVED_SENTENCE = (
-    "Your approval was received. You can close this window: your assistant will confirm "
-    "the order once the merchant accepts it."
+#: STAGE-NEUTRAL COPY, on purpose. The rail sends the buyer here after BOTH hosted steps -- the
+#: enrollment (card saved on Reap's page, `stage=enroll`) and the checkout approval
+#: (`stage=checkout`) -- and the page reads no input, so it cannot tell which one just happened.
+#: Every sentence has to be true after either; "Payment approved" was false after an enrollment.
+TITLE = "Back to your assistant"
+RECEIVED_SENTENCE = "Reap has received your response and you can close this window."
+NEXT_STEP_SENTENCE = (
+    "Your assistant will confirm the next step \u2014 saving your card or placing the order "
+    "\u2014 once it is settled; nothing is charged without your approval on Reap's page."
 )
 IGNORE_SENTENCE = "If you did not approve anything, you can ignore this page."
 
@@ -64,7 +69,8 @@ p{{margin:0 0 1rem}}
 <body>
 <main>
 <h1>{TITLE}</h1>
-<p>{APPROVED_SENTENCE}</p>
+<p>{RECEIVED_SENTENCE}</p>
+<p>{NEXT_STEP_SENTENCE}</p>
 <p class="muted">{IGNORE_SENTENCE}</p>
 </main>
 </body>

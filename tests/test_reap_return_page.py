@@ -50,12 +50,18 @@ EXPECTED_HEADERS = {
 
 #: Written out, not imported from the module: a test that took its expectation from the code
 #: under test could not notice the sentence being changed in both.
+#: Stage-neutral: the page follows BOTH the enrollment (card saved) and the checkout approval, and
+#: reads no input, so no sentence may claim which of the two just happened.
 SENTENCES = (
-    "Payment approved",
-    "Your approval was received. You can close this window: your assistant will confirm "
-    "the order once the merchant accepts it.",
+    "Back to your assistant",
+    "Reap has received your response and you can close this window.",
+    "Your assistant will confirm the next step \u2014 saving your card or placing the order "
+    "\u2014 once it is settled; nothing is charged without your approval on Reap's page.",
     "If you did not approve anything, you can ignore this page.",
 )
+
+#: Wording that is true after only ONE of the two steps. None of it may come back.
+STAGE_SPECIFIC = ("Payment approved", "approval was received", "the merchant accepts it")
 
 SCRIPT_PROBE = "<script>alert(1)</script>"
 PLAIN_PROBE = "PROBE_9f3a"
@@ -122,16 +128,19 @@ async def test_head_answers_200_with_the_same_headers(app):
     _assert_css_only_csp(resp.headers.get("content-security-policy", ""))
 
 
-async def test_the_body_says_the_three_things_and_nothing_active(app):
+async def test_the_body_says_the_stage_neutral_things_and_nothing_active(app):
     resp = await _request(app, "GET", PATH)
     body = resp.text
     for sentence in SENTENCES:
         assert sentence in body, sentence
-    assert "<title>Payment approved</title>" in body
+    assert "<title>Back to your assistant</title>" in body
+    for stale in STAGE_SPECIFIC:
+        assert stale not in body, stale
     lowered = body.lower()
     # No script, no external asset, no form, no link anywhere (not to Reap, not to the merchant).
+    # The copy NAMES Reap, so the check is on Reap's domains, not on the word.
     for forbidden in ("<script", "<form", "<a ", "<a>", "<link", "<img", "<iframe",
-                      "src=", "href=", "http://", "https://", "reap", "prava"):
+                      "src=", "href=", "http://", "https://", "//", "reap.global", "prava"):
         assert forbidden not in lowered, forbidden
 
 
