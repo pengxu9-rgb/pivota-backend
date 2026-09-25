@@ -328,7 +328,7 @@ async def test_a_desktop_client_is_labelled_loopback(db):
     from services import mcp_oauth_flow as flow
 
     local = await flow.register_client(db, {"redirect_uris": ["http://localhost:33418/callback"]})
-    assert (await _resolve_full(local["client_id"])).context["oauth_platform"] == "loopback"
+    assert (await _resolve_full(local["client_id"])).context["oauth_platform"] == "(loopback)"
 
 
 async def test_a_foreign_issuer_or_unknown_client_gets_no_label(db):

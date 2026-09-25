@@ -258,12 +258,15 @@ async def test_mcp_oauth_platforms_are_reported_beside_the_agents_never_as_one(_
         "INSERT INTO commerce_attribution_edges (edge_id, merchant_id, order_id, click_id, state, "
         "refund_count, refunded_amount, metadata, created_at, updated_at, source) "
         "VALUES ('e_c1', 'brand.example', 'ext_c1', 'clk_c1', 'converted', 0, 0, '{}'::jsonb, :now, :now, "
+        "'external_redirect'), "
+        # A SECOND order on the same link: the link must still count once as issued and clicked.
+        "('e_c1b', 'brand.example', 'ext_c1b', 'clk_c1', 'converted', 0, 0, '{}'::jsonb, :now, :now, "
         "'external_redirect')",
         {"now": NOW},
     )
     fn = f.build_funnel(await f.collect(30), 30)
     assert fn["platforms"] == [
-        {"platform": "claude.ai", "verified": False, "issued": 2, "clicked": 1, "converted": 1},
+        {"platform": "claude.ai", "verified": False, "issued": 2, "clicked": 1, "converted": 2},
         {"platform": "claude.ai", "verified": True, "issued": 1, "clicked": 1, "converted": 0},
     ]
     assert {a["agent"] for a in fn["agents"]} == {f.NO_AGENT, "agent_acme"}

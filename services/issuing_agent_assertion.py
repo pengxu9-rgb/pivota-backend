@@ -84,6 +84,7 @@ _CLIENT_REDIRECT_URIS_SQL = "SELECT redirect_uris FROM mcp_oauth_clients WHERE c
 OAUTH_PLATFORM_KEY = "oauth_platform"
 OAUTH_PLATFORM_VERIFIED_KEY = "oauth_platform_verified"
 _MAX_PLATFORM_LABEL = 128
+_DNS_HOST = re.compile(r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?")
 
 _ACTIVE_CLIENT_AGENT_SQL = """
 SELECT agent_id FROM agent_oauth_clients
@@ -241,10 +242,15 @@ async def agent_for_oauth_client(issuer: str, client_id: str) -> Optional[str]:
 def platform_label(redirect_uris: Any) -> Optional[str]:
     """A short platform label from an OAuth client's registered redirect URIs, or None.
 
-    https host (lowercased, `www.` dropped) for a web connector; "loopback" for localhost / a loopback
-    IP (desktop and CLI clients: Claude Desktop, Claude Code, Gemini CLI); "ip" for any other IP
-    literal; "app:<scheme>" for a custom scheme (e.g. "app:cursor"). Several distinct labels are
-    joined with "+", sorted, so the same client always gets the same label.
+    https host (IDNA-encoded, lowercased, `www.` dropped) for a web connector; "(loopback)" for
+    localhost / a loopback IP (desktop and CLI clients: Claude Desktop, Claude Code, Gemini CLI); "(ip)"
+    for any other IP literal; "app:<scheme>" for a custom scheme (e.g. "app:cursor"); "(invalid)" for
+    a host that is not a plain DNS name. Several distinct labels are joined with "+", sorted, so the
+    same client always gets the same label.
+
+    The URIs are registrant-controlled. A host must survive IDNA and match [a-z0-9.-] or it becomes
+    "(invalid)", so no control, bidi or escape character reaches a terminal or report, and the
+    built-in labels use characters no host can contain, so no registrant can impersonate them.
     """
     if not isinstance(redirect_uris, list):
         return None
@@ -254,7 +260,9 @@ def platform_label(redirect_uris: Any) -> Optional[str]:
             continue
         try:
             parts = urlsplit(uri.strip())
+            parts.port  # a malformed port raises here too
         except ValueError:
+            labels.add("(invalid)")
             continue
         scheme = (parts.scheme or "").lower()
         if scheme in ("http", "https"):
@@ -262,13 +270,21 @@ def platform_label(redirect_uris: Any) -> Optional[str]:
             if not host:
                 continue
             if host == "localhost" or host.endswith(".localhost"):
-                labels.add("loopback")
+                labels.add("(loopback)")
                 continue
             try:
-                labels.add("loopback" if ipaddress.ip_address(host).is_loopback else "ip")
+                labels.add("(loopback)" if ipaddress.ip_address(host).is_loopback else "(ip)")
                 continue
             except ValueError:
                 pass
+            try:
+                host = host.encode("idna").decode("ascii").lower()
+            except (UnicodeError, ValueError):
+                labels.add("(invalid)")
+                continue
+            if not _DNS_HOST.fullmatch(host):
+                labels.add("(invalid)")
+                continue
             labels.add(host[4:] if host.startswith("www.") else host)
         elif re.fullmatch(r"[a-z][a-z0-9+.-]{0,30}", scheme):
             labels.add(f"app:{scheme}")

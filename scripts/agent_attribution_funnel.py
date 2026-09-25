@@ -111,7 +111,9 @@ def build_queries(purchase_cols, click_cols=None):
         "platforms": (
             "SELECT c.context ->> 'oauth_platform' AS platform, "
             "coalesce(c.context ->> 'oauth_platform_verified', 'false') = 'true' AS verified, "
-            "count(*) AS issued, count(*) FILTER (WHERE c.click_count > 0) AS clicked, "
+            # DISTINCT: the edge join yields one row per ORDER, and one link can lead to several.
+            "count(DISTINCT c.click_id) AS issued, "
+            "count(DISTINCT c.click_id) FILTER (WHERE c.click_count > 0) AS clicked, "
             "count(DISTINCT e.edge_id) FILTER (WHERE e.state = 'converted') AS converted "
             "FROM surface_click_events c "
             "LEFT JOIN commerce_attribution_edges e ON e.click_id = c.click_id "
@@ -324,7 +326,9 @@ def render(funnel):
                   " 'claimed' = a public client, which anyone can register with any callback)",
                   f"{'platform':<44} {'label':<9} {'issued':>6} {'click':>6} {'conv':>5}"]
         for p in funnel["platforms"]:
-            lines.append(f"{p['platform'][:44]:<44} {'verified' if p['verified'] else 'claimed':<9} "
+            # Registrant-controlled text: never let a stored label drive the terminal.
+            name = "".join(ch if ch.isprintable() and ord(ch) < 0x2000 else "?" for ch in p["platform"])
+            lines.append(f"{name[:44]:<44} {'verified' if p['verified'] else 'claimed':<9} "
                          f"{p['issued']:>6} {p['clicked']:>6} {p['converted']:>5}")
     ex = funnel["exceptions"]
     lines += ["", "INTEGRITY"]
