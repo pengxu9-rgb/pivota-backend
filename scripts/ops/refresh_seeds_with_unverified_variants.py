@@ -14,11 +14,20 @@ carry that unearned stamp today:
 
 The nightly `external-referral-refresh` heals both as it rotates; this only gets there sooner.
 
-DRY RUN BY DEFAULT: lists the cohorts and exits. `--apply` FETCHES EACH MERCHANT PAGE and
-WRITES the seed rows, so it needs the crawl subnet and an explicit go:
+THREE MODES, in the order to run them:
+  (default)   lists the cohorts and exits. Reads the DB, fetches nothing, writes nothing.
+  --simulate  FETCHES each page with the fixed extractor and runs the fixed reconcile IN
+              MEMORY: what `--apply` would write, per variant, before and after. Writes
+              nothing (not even the offer-snapshot cache). Needs the crawl subnet.
+  --apply     runs the real refresh: fetches, and WRITES the seed rows. Needs an explicit go.
 
     SUBNET=pivota-crawl scripts/ops/run_oneoff_job.sh \
+        scripts/ops/refresh_seeds_with_unverified_variants.py --cohort drift --simulate
+    SUBNET=pivota-crawl scripts/ops/run_oneoff_job.sh \
         scripts/ops/refresh_seeds_with_unverified_variants.py --cohort drift --apply
+
+`--simulate` approximates the column decision (a positive price in the row's own currency);
+the refresh's full rules live in `routes/employee_products._refresh_external_seed_by_id`.
 
 Must run on an image that CONTAINS the fix; on an older image `--apply` re-stamps the same
 unearned freshness. The script refuses to apply when the refresh it imports has no
@@ -79,6 +88,42 @@ async def _select(cohort: str) -> List[Dict[str, Any]]:
     return rows
 
 
+async def _simulate(row_id: str) -> Dict[str, Any]:
+    """What the fixed refresh would write to one row's variants. Fetches; writes nothing."""
+    import routes.employee_products as ep
+    from services.external_offers_service import (
+        _extract_from_html,
+        _fetch_html,
+        _normalize_url,
+        evidence_variant_fields,
+    )
+
+    row = await database.fetch_one("SELECT * FROM external_product_seeds WHERE id = :id", {"id": row_id})
+    row = dict(row)
+    seed_data = ep._ensure_json_obj(row.get("seed_data"))
+    url = _normalize_url(str(row.get("canonical_url") or row.get("destination_url")))
+    html, _ = await _fetch_html(url, max_wait=0)
+    extracted = _extract_from_html(url, html)
+    fields = evidence_variant_fields(extracted)
+    market = str(row.get("market") or "US").upper()
+    fresh_cur = (extracted.get("price_currency") or ("JPY" if market == "JP" else "USD")).upper()
+    col_cur = str(row.get("price_currency") or "").strip().upper() or None
+    amount = ep._as_price(extracted.get("price_amount"))
+    re_read = amount is not None and amount > 0 and (col_cur is None or col_cur == fresh_cur)
+    availability = str(extracted.get("availability") or "").strip()
+    snapshot = seed_data.get("snapshot") if isinstance(seed_data.get("snapshot"), dict) else {}
+    served = seed_data.get("variants") if isinstance(seed_data.get("variants"), list) else snapshot.get("variants")
+    _, report = ep._reconcile_seed_variants_with_read(
+        [v for v in (served or []) if isinstance(v, dict)],
+        fields.get("variants") or [],
+        product_amount=amount if re_read else None,
+        product_currency=col_cur or fresh_cur,
+        product_availability=availability if availability.lower() not in ("", "unknown") else None,
+        census=fields.get("variant_census"),
+    )
+    return report
+
+
 async def _run(args: argparse.Namespace) -> Dict[str, Any]:
     await database.connect()
     try:
@@ -86,12 +131,12 @@ async def _run(args: argparse.Namespace) -> Dict[str, Any]:
         if args.limit:
             rows = rows[: args.limit]
         summary: Dict[str, Any] = {
-            "mode": "apply" if args.apply else "dry_run",
+            "mode": "apply" if args.apply else "simulate" if args.simulate else "dry_run",
             "selected": len(rows),
             "by_cohort": dict(collections.Counter(r["cohort"] for r in rows)),
             "top_domains": collections.Counter(r["domain"] for r in rows).most_common(15),
         }
-        if not args.apply:
+        if not (args.apply or args.simulate):
             summary["sample_ids"] = [r["id"] for r in rows[:20]]
             return summary
 
@@ -99,6 +144,23 @@ async def _run(args: argparse.Namespace) -> Dict[str, Any]:
 
         if not hasattr(ep, "_reconcile_seed_variants_with_read"):
             raise SystemExit("this image predates the variant fix; --apply would re-stamp stale rows")
+
+        if args.simulate:
+            outcomes_sim: collections.Counter = collections.Counter()
+            samples: List[Dict[str, Any]] = []
+            for row in rows:
+                try:
+                    report = await _simulate(row["id"])
+                except Exception as exc:  # noqa: BLE001 - one unreachable page must not end the preview
+                    outcomes_sim[f"{row['cohort']}:error:{type(exc).__name__}"] += 1
+                    continue
+                verdict = "all_re_read" if not report["not_re_read_count"] else "not_all_re_read"
+                outcomes_sim[f"{row['cohort']}:{verdict}:{'writes' if report['replaced'] else 'no_write'}"] += 1
+                if report["replaced"] and len(samples) < 40:
+                    samples.append({"id": row["id"], "replaced": report["replaced"][:3]})
+            summary["outcomes"] = dict(outcomes_sim)
+            summary["replaced_samples"] = samples
+            return summary
 
         outcomes: collections.Counter = collections.Counter()
         for row in rows:
@@ -119,7 +181,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--cohort", choices=("drift", "multi", "all"), default="drift")
     parser.add_argument("--limit", type=int, default=0, help="0 = every selected row")
-    parser.add_argument("--apply", action="store_true", help="FETCH and WRITE; default is a dry run")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--simulate", action="store_true", help="FETCH, reconcile in memory, write nothing")
+    mode.add_argument("--apply", action="store_true", help="FETCH and WRITE; default is a dry run")
     args = parser.parse_args()
     print(json.dumps(asyncio.run(_run(args)), ensure_ascii=False, indent=2, default=str))
     return 0

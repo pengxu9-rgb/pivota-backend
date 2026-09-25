@@ -33,7 +33,11 @@ from models.standard_product import StandardProduct
 from utils.auth import get_current_employee, require_employee_permissions
 
 from services import external_seed_destination_liveness as destination_liveness
-from services.external_offers_service import ExternalOfferUnavailable, resolve_external_offer
+from services.external_offers_service import (
+    ExternalOfferUnavailable,
+    resolve_external_offer,
+    seed_variants_from_evidence,
+)
 from services.outbound_links_service import (
     DEFAULT_DISCLOSURE_TEXT,
     DEFAULT_UTM_TEMPLATE,
@@ -3788,9 +3792,7 @@ async def create_external_seed(
         raw_desc = evidence.get("description")
         if isinstance(raw_desc, str) and raw_desc.strip():
             snap_description = raw_desc.strip()
-        raw_variants = evidence.get("variants")
-        if isinstance(raw_variants, list) and raw_variants:
-            snap_variants = [v for v in raw_variants if isinstance(v, dict)]
+        snap_variants = seed_variants_from_evidence(evidence)
 
     match_url = canonical_url or dest
     existing_row = await database.fetch_one(
@@ -4513,6 +4515,33 @@ def _seed_variant_stored_price(variant: Dict[str, Any]) -> Any:
     return raw
 
 
+_MISSING = object()
+
+
+def _census_prices(census: Dict[str, Any]) -> set:
+    return {
+        round(float(p), 2)
+        for p in list(census.get("exact_prices") or []) + list(census.get("data_attr_exact_prices") or [])
+        if _as_price(p) is not None
+    }
+
+
+def _census_states(census: Dict[str, Any]) -> set:
+    return {
+        normalize_availability(a)
+        for a in list(census.get("availabilities") or []) + list(census.get("data_attr_availabilities") or [])
+    }
+
+
+def _page_names_one_value(census: Dict[str, Any]) -> bool:
+    """Did the page list at most one distinct offer, in either variant source?
+
+    Only meaningful behind `census_ok` in the reconcile, which has already refused a census
+    that is aggregate, truncated, or hid data-attribute duplicates.
+    """
+    return max(int(census.get("offers") or 0), int(census.get("data_attr_skus") or 0)) <= 1
+
+
 def _reconcile_seed_variants_with_read(
     stored: List[Dict[str, Any]],
     read: List[Dict[str, Any]],
@@ -4520,43 +4549,52 @@ def _reconcile_seed_variants_with_read(
     product_amount: Optional[float],
     product_currency: Optional[str],
     product_availability: Optional[str],
+    census: Optional[Dict[str, Any]],
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Write what this refresh re-read into the STORED variants the builders serve.
 
     THE BUG THIS CLOSES. The refresh corrected the `price_amount`/`availability` columns and
     stamped `snapshot.extracted_at`, but the serving builders price and stock every offer from
-    `seed_data.variants[]` -- which the refresh left alone. Prod 2026-09-25: eyurs Round Lab
+    the stored variants -- which the refresh left alone. Prod 2026-09-25: eyurs Round Lab
     sunscreen re-crawled to 17.0/in_stock, served 16.0/out-of-stock with `price_trusted: true`.
 
+    READ WHAT THE EXTRACTOR EMITS, NOT WHAT A PAGE CONTAINS. `_extract_jsonld_variants` keeps
+    the first offer per id and drops the rest, and an AggregateOffer arrives as one `offer_1`
+    at `lowPrice`; the product-level price is `offers[0]` or `lowPrice`. A first version of this
+    function guarded against duplicate ids and sibling sizes on the list it was handed, where
+    neither can appear, and rewrote a 50ml stored at 32 to the 30ml's 20 (review of #2340). The
+    extractor now marks each read variant (`price_exact`, `offer_aggregate`, `id_collided`) and
+    hands a `census` of the distinct offers; this function trusts nothing those do not vouch for.
+
     WHAT COUNTS AS A RE-READ of a stored variant, and nothing else does:
-      * an UNAMBIGUOUS identifier match against a variant the page listed (see
-        `_seed_variant_identifiers`: one read offer carries that id, and no other stored
-        variant claims the same offer) whose price is a positive finite amount in the
-        variant's own currency;
+      * an UNAMBIGUOUS identifier match (see `_seed_variant_identifiers`: one read variant
+        carries the id, no other stored variant claims it, and the extractor saw no other offer
+        under that id) to an offer that is not an AggregateOffer. Its price is taken only when
+        it is that offer's own `price` (not a range bound), positive, finite, and in a
+        currency the offer itself states that matches the variant's; its stock whenever the
+        page stated one;
       * or, when the seed stores exactly ONE variant, the product-level values the caller
         re-read this run (`product_amount` is None unless the column price was re-read), when
-        they cannot belong to another variant (see `single_takes_price`). One stored variant
-        is the product the builder serves, whatever id the page used for it.
-    Measured 2026-09-25 over 3,471 gate-fresh seeds with variants: the page's JSON-LD offers
-    carry a SKU, an `@id` path or a positional `offer_N`, and a page often lists ONE offer (or
-    none) for a four-shade product. Siblings the page did not name were NOT re-read, and the
-    report says so; the caller then refuses to call the row fresh. No inference from a shared
-    price: "every shade was 34 and the page says 35" does not say what the other shades cost.
+        the census shows they cannot belong to another variant: one distinct offer, or every
+        distinct offer agrees, with no range and nothing truncated.
+    No inference from a shared price: "every shade was 34 and the page says 35" does not say
+    what the other shades cost.
 
     Returns (new variant list, report). The input list is not mutated. `not_re_read` lists
     only variants that carry something the builders serve as a fact (a price, or an explicit
     availability); a bare variant with neither inherits the product values and needs no read.
+    `replaced` records every field this call changed, before and after, per variant, so an
+    overwrite can be undone.
     """
     read_by_id: Dict[str, List[int]] = {}
-    read_variants = [rv for rv in (read or []) if isinstance(rv, dict)]
+    read_variants = [rv for rv in (read or []) if isinstance(rv, dict)] if isinstance(census, dict) else []
     for pos, rv in enumerate(read_variants):
         key = _seed_variant_key(rv)
         if key:
             read_by_id.setdefault(key, []).append(pos)
 
-    # Which read offer each stored variant names, through ANY of its own identifiers. A read id
-    # listed twice on the page (misshaus: four offers all carrying the product `@id`) names no
-    # one; a read offer two stored variants both claim is ambiguous for both.
+    # Which read offer each stored variant names, through ANY of its own identifiers. A read
+    # offer two stored variants both claim is ambiguous for both.
     claims: List[Optional[int]] = []
     claimants: Dict[int, int] = {}
     for v in stored:
@@ -4571,30 +4609,32 @@ def _reconcile_seed_variants_with_read(
             claimants[pos] = claimants.get(pos, 0) + 1
 
     product_cur = (str(product_currency or "").strip().upper() or None)
-    # ONE STORED VARIANT TAKES THE PRODUCT-LEVEL READING only when that reading cannot belong
-    # to a different variant: the page listed at most one offer, or every offer it listed
-    # agrees. A page listing 30ml at 20 and 50ml at 32 gives a product price that is one of the
-    # two, and a seed curated to the 50ml alone must not be restated at the 30ml's price.
-    read_prices = {
-        round(p, 2) for p in (_as_price(rv.get("price_amount")) for rv in read_variants) if p is not None
-    }
-    read_states = {
-        normalize_availability(rv.get("availability"))
-        for rv in read_variants
-        if str(rv.get("availability") or "").strip().lower() not in _NO_AVAILABILITY_OBSERVATION
-    }
-    one_offer = len(read_variants) <= 1
     single = len(stored) == 1
-    single_takes_price = single and product_amount is not None and (
-        one_offer or read_prices == {round(product_amount, 2)}
+    census_ok = isinstance(census, dict) and not (
+        census.get("aggregate") or census.get("truncated") or census.get("data_attr_duplicate_ids")
     )
-    single_takes_availability = single and bool(product_availability) and (
-        one_offer or read_states <= {normalize_availability(product_availability)}
+    single_takes_price = (
+        single
+        and product_amount is not None
+        and census_ok
+        and bool(census.get("product_price_exact"))
+        and not census.get("inexact")
+        and (_page_names_one_value(census) or _census_prices(census) == {round(product_amount, 2)})
     )
+    single_takes_availability = (
+        single
+        and bool(product_availability)
+        and census_ok
+        and (
+            _page_names_one_value(census)
+            or _census_states(census) <= {normalize_availability(product_availability)}
+        )
+    )
+
     out: List[Dict[str, Any]] = []
     not_re_read: List[str] = []
+    replaced: List[Dict[str, Any]] = []
     re_read = 0
-    changed = 0
     for idx, original in enumerate(stored):
         v = dict(original)
         stored_amount = _as_price(_seed_variant_stored_price(v))
@@ -4610,21 +4650,32 @@ def _reconcile_seed_variants_with_read(
         pos = claims[idx]
         if pos is not None and claimants.get(pos) == 1:
             rv = read_variants[pos]
+            per_variant = not rv.get("id_collided") and not rv.get("offer_aggregate")
             amount = _as_price(rv.get("price_amount"))
-            cur = (str(rv.get("price_currency") or "").strip().upper() or product_cur)
-            if amount is not None and amount > 0 and cur and (stored_cur is None or cur == stored_cur):
+            # The offer's OWN currency, never a fallback. The product-level currency reaching
+            # this function is the column's (`resolve_external_offer` fabricates USD when the
+            # page states none), so inheriting it would read "3600" off a geo-served page as
+            # $3,600 -- seen in the #2340 spot-check against a JPY-served sigmabeauty page.
+            cur = str(rv.get("price_currency") or "").strip().upper() or None
+            if (
+                per_variant
+                and rv.get("price_exact") is True
+                and amount is not None
+                and amount > 0
+                and cur
+                and (stored_cur is None or cur == stored_cur)
+            ):
                 new_amount, new_cur = amount, cur
             avail = str(rv.get("availability") or "").strip()
-            if avail.lower() not in _NO_AVAILABILITY_OBSERVATION:
+            if per_variant and avail.lower() not in _NO_AVAILABILITY_OBSERVATION:
                 new_avail = avail
         if single_takes_price and new_amount is None:
             new_amount, new_cur = product_amount, product_cur
         if single_takes_availability and new_avail is None:
             new_avail = product_availability
 
-        moved = False
+        before = dict(v)
         if new_amount is not None:
-            moved = stored_amount is None or abs(new_amount - stored_amount) >= 0.005
             # Every stored copy of the price moves together. `price` sits beside `price_amount`
             # on most enrichment rows and `external_seed_audit` falls back to it; a corrected
             # `price_amount` next to a stale `price` hands a reader the contradiction back.
@@ -4636,7 +4687,6 @@ def _reconcile_seed_variants_with_read(
                 if "currency" in v:
                     v["currency"] = new_cur
         if new_avail is not None:
-            moved = moved or normalize_availability(new_avail) != normalize_availability(stored_avail)
             v["availability"] = new_avail
             # Same for stock: the boolean and the audit's `stock` / `stock_status` fallbacks.
             state = normalize_availability(new_avail)
@@ -4645,7 +4695,19 @@ def _reconcile_seed_variants_with_read(
             for twin in ("stock", "stock_status"):
                 if twin in v:
                     v[twin] = new_avail
-        changed += int(moved)
+        diff_keys = [k for k in v if before.get(k, _MISSING) != v[k]]
+        price_moved = new_amount is not None and (
+            stored_amount is None or abs(new_amount - stored_amount) >= 0.005
+        )
+        stock_moved = new_avail is not None and normalize_availability(new_avail) != normalize_availability(stored_avail)
+        if price_moved or stock_moved:
+            replaced.append(
+                {
+                    "variant_id": _seed_variant_key(v) or f"#{idx + 1}",
+                    "before": {k: before.get(k) for k in diff_keys},
+                    "after": {k: v[k] for k in diff_keys},
+                }
+            )
 
         was_re_read = new_amount is not None if stored_amount is not None else new_avail is not None
         if serves_a_fact:
@@ -4658,8 +4720,10 @@ def _reconcile_seed_variants_with_read(
     return out, {
         "stored": len(stored),
         "read": len(read_variants),
+        "census": "present" if isinstance(census, dict) else "absent",
         "re_read": re_read,
-        "changed": changed,
+        "changed": len(replaced),
+        "replaced": replaced,
         "not_re_read": not_re_read[:30],
         "not_re_read_count": len(not_re_read),
     }
@@ -4905,6 +4969,7 @@ async def _refresh_external_seed_by_id(
     snap_image_urls: list[str] = []
     snap_description: Optional[str] = None
     snap_variants: Optional[List[Dict[str, Any]]] = None
+    snap_variant_census: Optional[Dict[str, Any]] = None
     evidence = getattr(snapshot, "evidence", None)
     if isinstance(evidence, dict):
         raw_images = evidence.get("image_urls") or evidence.get("images")
@@ -4917,6 +4982,11 @@ async def _refresh_external_seed_by_id(
         raw_variants = evidence.get("variants")
         if isinstance(raw_variants, list) and raw_variants:
             snap_variants = [v for v in raw_variants if isinstance(v, dict)]
+        if isinstance(evidence.get("variant_census"), dict):
+            snap_variant_census = evidence["variant_census"]
+    # The page's variants as a SEED would store them; `snap_variants` keeps the per-read
+    # provenance marks the reconcile below reads.
+    adoptable_variants = seed_variants_from_evidence(evidence)
 
     seed_data = _ensure_json_obj(row.get("seed_data"))
     seed_data.setdefault("snapshot", {})
@@ -4960,21 +5030,21 @@ async def _refresh_external_seed_by_id(
         seed_data["image_urls"] = snap_image_urls
     if not seed_data.get("availability"):
         seed_data["availability"] = snap_availability
-    if snap_variants:
+    if adoptable_variants:
         existing_variants = _seed_variants(seed_data)
         product_title = seed_data.get("title") or snap_title
-        if _should_overwrite_seed_variants(existing=existing_variants, incoming=snap_variants, product_title=product_title):
-            seed_data["variants"] = snap_variants
+        if _should_overwrite_seed_variants(existing=existing_variants, incoming=adoptable_variants, product_title=product_title):
+            seed_data["variants"] = adoptable_variants
         elif _should_replace_seed_variant_content(
             existing=existing_variants,
-            incoming=snap_variants,
+            incoming=adoptable_variants,
             market=market,
             previous_canonical_url=previous_canonical_url,
             refreshed_canonical_url=canonical_url,
         ):
-            seed_data["variants"] = snap_variants
+            seed_data["variants"] = adoptable_variants
         elif not existing_variants:
-            seed_data["variants"] = snap_variants
+            seed_data["variants"] = adoptable_variants
 
     pending_row = dict(row)
     pending_row["seed_data"] = seed_data
@@ -5185,15 +5255,26 @@ async def _refresh_external_seed_by_id(
     price_re_read = price_status in _PRICE_STATUSES_THAT_RE_READ_THE_STORED_PRICE
     variant_refresh: Dict[str, Any] = {"status": "not_read"}
     if read_the_served_product:
+        # THE LIST THE BUILDER SERVES, wherever it lives. `routes/agent_api._seed_variants` (and
+        # `services/external_seed_stock`) fall back to `snapshot.variants` when the seed has no
+        # top-level list; reconciling only the top level left that list stale AND stamped fresh.
+        served_container = (
+            seed_data["snapshot"]
+            if not isinstance(seed_data.get("variants"), list)
+            and isinstance(seed_data["snapshot"].get("variants"), list)
+            else seed_data
+        )
         reconciled, variant_refresh = _reconcile_seed_variants_with_read(
-            _seed_variants(seed_data),
+            [v for v in (served_container.get("variants") or []) if isinstance(v, dict)],
             snap_variants or [],
             product_amount=next_amount if price_re_read else None,
             product_currency=next_currency,
             product_availability=fresh_availability,
+            census=snap_variant_census,
         )
         if reconciled:
-            seed_data["variants"] = reconciled
+            served_container["variants"] = reconciled
+        variant_refresh["served_from"] = "snapshot" if served_container is not seed_data else "seed_data"
         if fresh_availability:
             # The top-level copies are the same fact; see `services/external_seed_stock`.
             seed_data["availability"] = fresh_availability

@@ -353,6 +353,48 @@ def _offer_price_and_currency(offer: Dict[str, Any]) -> Tuple[Optional[str], Opt
     return (str(price).strip() if price is not None else None, str(currency).strip().upper() if currency else None)
 
 
+def _is_aggregate_offer(offer: Dict[str, Any]) -> bool:
+    t = offer.get("@type")
+    types = {str(x).lower() for x in t} if isinstance(t, list) else ({str(t).lower()} if t else set())
+    return "aggregateoffer" in types
+
+
+def _offer_price_is_exact(offer: Dict[str, Any]) -> bool:
+    """Is the amount `_offer_price_and_currency` returned THIS offer's own price?
+
+    Not when it came from `lowPrice` / `highPrice` / `minPrice` / `maxPrice`, and never for an
+    AggregateOffer: those are the bounds of a RANGE across variants (an AggregateOffer with no
+    nested `offers` arrives here as one `offer_1` at `lowPrice`). Such an amount is fine as a
+    product summary, but it names no variant, so the seed refresh must not write it into one.
+    """
+    if _is_aggregate_offer(offer):
+        return False
+    if offer.get("price") not in (None, ""):
+        return True
+    spec = offer.get("priceSpecification")
+    first = spec if isinstance(spec, dict) else (spec[0] if isinstance(spec, list) and spec and isinstance(spec[0], dict) else None)
+    return bool(first and first.get("price") not in (None, "") and not offer.get("lowPrice") and not offer.get("highPrice"))
+
+
+# Per-variant provenance the extractor attaches for `routes/employee_products`'s reconcile.
+# Stored on the snapshot evidence; never on a seed (see `seed_variants_from_evidence`).
+READ_PROVENANCE_KEYS = ("price_exact", "offer_aggregate", "id_collided")
+
+
+def seed_variants_from_evidence(evidence: Any) -> Optional[list[Dict[str, Any]]]:
+    """A snapshot's variants as a SEED stores them: without the per-read provenance marks.
+
+    The marks describe one fetch (was this offer's price exact, did its id collide) and are
+    read from the evidence by the seed refresh; copied into `seed_data.variants` they would
+    outlive the fetch they describe. Every writer that adopts page variants into a seed goes
+    through here. None when the evidence lists no variants.
+    """
+    raw = evidence.get("variants") if isinstance(evidence, dict) else None
+    if not isinstance(raw, list) or not raw:
+        return None
+    return [{k: val for k, val in v.items() if k not in READ_PROVENANCE_KEYS} for v in raw if isinstance(v, dict)]
+
+
 def _offer_variants_from_node(offers: Any, product_name: Optional[str]) -> list[Dict[str, Any]]:
     if offers is None:
         return []
@@ -426,6 +468,12 @@ def _offer_variants_from_node(offers: Any, product_name: Optional[str]) -> list[
                 "price_amount": _parse_price(price_raw) if price_raw else None,
                 "price_currency": currency,
                 "availability": availability,
+                "price_exact": bool(price_raw) and _offer_price_is_exact(offer),
+                **({"offer_aggregate": True} if _is_aggregate_offer(offer) else {}),
+                # Transient: WHICH offer object this came from. `_iter_jsonld_nodes` visits a
+                # Product's offers twice (via the Product, then as Offer nodes), so only object
+                # identity tells a real id collision from a second visit. Popped by the caller.
+                "_offer_ref": id(offer),
             }
         )
 
@@ -495,7 +543,13 @@ def _extract_variants_from_data_attrs(html: str, fallback_currency: Optional[str
         if not variant_id:
             continue
         variant_id = str(variant_id).strip()
-        if not variant_id or variant_id in seen:
+        if variant_id in seen:
+            # Same silent de-dupe as the JSON-LD reader; say so on the variant that was kept.
+            for kept in variants:
+                if kept.get("variant_id") == variant_id:
+                    kept["id_collided"] = True
+            continue
+        if not variant_id:
             continue
 
         title = _extract_size_label_from_sku(sku) or sku.get("size") or sku.get("name") or sku.get("title")
@@ -550,6 +604,7 @@ def _extract_variants_from_data_attrs(html: str, fallback_currency: Optional[str
                 "price_amount": _parse_price(str(price_amount)) if price_amount is not None else None,
                 "price_currency": str(currency).strip().upper() if currency else None,
                 "availability": availability,
+                "price_exact": price_amount is not None,
                 **({"image_url": image_url} if image_url else {}),
                 **({"label_image_url": label_image_url} if label_image_url else {}),
             }
@@ -633,6 +688,21 @@ def _extract_image_urls_from_data_attrs(html: str, base_url: str) -> list[str]:
 
 
 def _extract_jsonld_variants(parsed_objs: list[Any]) -> list[Dict[str, Any]]:
+    return _extract_jsonld_variants_with_census(parsed_objs)[0]
+
+
+def _extract_jsonld_variants_with_census(
+    parsed_objs: list[Any],
+) -> Tuple[list[Dict[str, Any]], Dict[str, Any]]:
+    """The page's JSON-LD variants, one per id, plus what the de-dupe would otherwise hide.
+
+    THE DE-DUPE BELOW KEEPS THE FIRST OFFER PER ID AND DROPS THE REST SILENTLY. A page whose
+    offers all carry the product `@id` (misshaus) comes out as ONE variant at the first offer's
+    price, indistinguishable from a page that really lists one offer. The seed refresh writes
+    per-variant prices from this list, so it has to be able to tell: the kept variant is marked
+    `id_collided` when a DIFFERENT offer object carried its id, and the census counts the
+    distinct offers and their exact prices before anything is dropped.
+    """
     variants: list[Dict[str, Any]] = []
     seen: set[str] = set()
 
@@ -657,17 +727,44 @@ def _extract_jsonld_variants(parsed_objs: list[Any]) -> list[Dict[str, Any]]:
         if len(variants) >= MAX_VARIANTS:
             break
 
+    truncated = len(variants) >= MAX_VARIANTS
+    refs_by_id: Dict[str, set] = {}
+    by_ref: Dict[int, Dict[str, Any]] = {}
+    for v in variants:
+        ref = v.get("_offer_ref")
+        refs_by_id.setdefault(str(v.get("variant_id") or "").strip(), set()).add(ref)
+        by_ref.setdefault(ref, v)
+
     normalized: list[Dict[str, Any]] = []
     for v in variants:
         vid = str(v.get("variant_id") or "").strip()
         if not vid or vid in seen:
             continue
         seen.add(vid)
+        if len(refs_by_id.get(vid) or ()) > 1:
+            v["id_collided"] = True
         normalized.append(v)
         if len(normalized) >= MAX_VARIANTS:
+            truncated = True
             break
 
-    return normalized
+    distinct = list(by_ref.values())
+    census = {
+        "offers": len(distinct),
+        "exact_prices": sorted(
+            {round(v["price_amount"], 2) for v in distinct if v.get("price_exact") and v.get("price_amount") is not None}
+        ),
+        "availabilities": sorted(
+            {str(v.get("availability")) for v in distinct if str(v.get("availability") or "unknown") != "unknown"}
+        ),
+        "inexact": any(v.get("price_amount") is not None and not v.get("price_exact") for v in distinct),
+        "aggregate": any(v.get("offer_aggregate") for v in distinct),
+        "duplicate_ids": sum(1 for refs in refs_by_id.values() if len(refs) > 1),
+        "truncated": truncated,
+    }
+    for v in variants:
+        v.pop("_offer_ref", None)
+    return normalized, census
 
 
 def _extract_jsonld_image_urls(parsed_objs: list[Any], base_url: str) -> list[str]:
@@ -1076,10 +1173,12 @@ def _extract_jsonld_offer(parsed_objs: list[Any]) -> Dict[str, Any]:
             price = None
             currency = None
             availability = None
+            price_exact = False
             if isinstance(offers, dict):
                 price = offers.get("price") or offers.get("lowPrice") or offers.get("highPrice")
                 currency = offers.get("priceCurrency")
                 availability = offers.get("availability")
+                price_exact = bool(offers.get("price")) and not _is_aggregate_offer(offers)
 
             # Prefer nodes that include price/currency.
             score = 0
@@ -1103,6 +1202,8 @@ def _extract_jsonld_offer(parsed_objs: list[Any]) -> Dict[str, Any]:
                     "brand": str(brand).strip() if brand else None,
                     "image_url": str(image_url).strip() if image_url else None,
                     "price_raw": str(price).strip() if price is not None else None,
+                    # False for an AggregateOffer's lowPrice/highPrice: a range bound, not a price.
+                    "price_exact": price_exact,
                     "currency": str(currency).strip().upper() if currency else None,
                     "availability_raw": str(availability).strip() if availability else None,
                     # Optional review signal off the winning Product node — null when
@@ -1325,7 +1426,7 @@ def _extract_from_html(base_url: str, html: str) -> Dict[str, Any]:
     meta_image_urls = _extract_meta_image_urls(p, canonical)
     data_attr_image_urls = _extract_image_urls_from_data_attrs(html, canonical)
     dom_image_urls = _extract_dom_image_urls(p, canonical)
-    variants_jsonld = _extract_jsonld_variants(parsed_jsonld)
+    variants_jsonld, jsonld_census = _extract_jsonld_variants_with_census(parsed_jsonld)
     fallback_currency = (jsonld.get("currency") or currency or "").strip().upper() or None
     variants_data_attr = _extract_variants_from_data_attrs(html, fallback_currency, canonical)
 
@@ -1421,7 +1522,37 @@ def _extract_from_html(base_url: str, html: str) -> Dict[str, Any]:
         if jsonld.get("price_raw") or jsonld.get("title")
         else ("data_attr" if variants else ("og" if title or image else "manual")),
         "variants": variants,
+        # What the variant list alone cannot say (see `_extract_jsonld_variants_with_census`).
+        # `data_attr_skus` counts the data-attribute payload, the other variant source.
+        "variant_census": {
+            **jsonld_census,
+            "data_attr_skus": len(variants_data_attr),
+            "data_attr_exact_prices": sorted(
+                {round(v["price_amount"], 2) for v in variants_data_attr if v.get("price_amount") is not None}
+            ),
+            "data_attr_availabilities": sorted(
+                {str(v.get("availability")) for v in variants_data_attr if str(v.get("availability") or "unknown") != "unknown"}
+            ),
+            "data_attr_duplicate_ids": sum(1 for v in variants_data_attr if v.get("id_collided")),
+            # The product-level amount above: JSON-LD's own when it has one (exact unless it is an
+            # AggregateOffer bound), else a meta-tag `product:price:amount`, which names one price.
+            "product_price_exact": bool(jsonld.get("price_exact")) if jsonld.get("price_raw") else True,
+        },
     }
+    return out
+
+
+def evidence_variant_fields(extracted: Dict[str, Any]) -> Dict[str, Any]:
+    """The variant part of a snapshot's `evidence`, from one `_extract_from_html` result.
+
+    One function so the seed refresh's tests can build evidence exactly as production does.
+    """
+    out: Dict[str, Any] = {}
+    variants = extracted.get("variants") or []
+    if variants:
+        out["variants"] = variants[:MAX_VARIANTS]
+    if isinstance(extracted.get("variant_census"), dict):
+        out["variant_census"] = extracted["variant_census"]
     return out
 
 
@@ -1572,9 +1703,7 @@ async def resolve_external_offer(
         description = extracted.get("description")
         if isinstance(description, str) and description.strip():
             evidence["description"] = description.strip()
-        variants = extracted.get("variants") or []
-        if variants:
-            evidence["variants"] = variants[:MAX_VARIANTS]
+        evidence.update(evidence_variant_fields(extracted))
         image_urls = extracted.get("image_urls") or []
         if isinstance(image_urls, list):
             cleaned = [str(u).strip() for u in image_urls if isinstance(u, str) and str(u).strip()]
