@@ -10,13 +10,16 @@ of sitting in a "processing" state nothing ever clears (the gap migration 158 le
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import hashlib
 import json
 import logging
 import os
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional
 
 from db.database import database
 
@@ -90,8 +93,8 @@ _CLAIM_SQL = """
           AND (SELECT count(*) FROM busy) < CAST(:max_leases AS integer)
           -- never two crawls at one host, whatever the cohort shape of the job holding it
           AND regexp_replace(lower(domain), '^www[.]', '') NOT IN (SELECT host FROM busy)
-          -- catalog writes stay serial: an apply waits while any other apply is in flight
-          AND NOT (status = 'apply_due' AND EXISTS (SELECT 1 FROM busy WHERE busy.status = 'apply_due'))
+          -- two applies at different hosts may both run: an apply's crawl and checks are read-only on
+          -- the catalog, and its catalog write is serialized by catalog_write_lock, not by the claim
         -- within a priority, finish paid-for work first: a clean dry run's apply frees a cohort slot,
         -- a new dry run starts more work (2026-09-24: a clean apply waited 9h behind older dry runs)
         ORDER BY priority DESC, (status = 'apply_due') DESC, next_run_at, created_at
@@ -123,8 +126,11 @@ def max_leases_from_env() -> int:
 
 async def claim_due_job(*, lease_seconds: int, max_leases: int = 1, db: Any = None) -> Optional[Dict[str, Any]]:
     """Claim ONE due job, or None. Up to `max_leases` stages run at once (default 1), never two at one
-    host (a shared crawl IP stays polite to each store) and never two applies (catalog writes stay
-    serial). Among due jobs, higher priority first; within a priority, an apply before a dry run.
+    host (a shared crawl IP stays polite to each store). Two applies at different hosts may both be
+    claimed: an apply re-crawls and re-checks for minutes before it writes (2026-09-25: 244-2310 s per
+    apply, INCI enrichment up to 499 s of it), so only the catalog WRITE is serial, under
+    catalog_write_lock. Among due jobs, higher priority first; within a priority, an apply before a
+    dry run.
 
     Two statements in one transaction, not one: the lane lock must be held BEFORE the claim takes
     its snapshot. A single statement snapshots first and locks second, so a claim that wins the
@@ -149,16 +155,153 @@ async def claim_due_job(*, lease_seconds: int, max_leases: int = 1, db: Any = No
     return job
 
 
+#: Catalog writes stay serial across lanes: an apply holds this SESSION advisory lock around its
+#: catalog write (apply_ingest_plan) and nothing else, so two applies' crawls and checks overlap but
+#: their writes to the shared catalog / identity index never do. A key of its own: the lane key above
+#: is a transaction lock the claim takes and drops in one transaction. Plain literals (no
+#: parameters): tests/test_repo_sql_prepare_postgres.py PREPAREs module-level SQL.
+_CATALOG_WRITE_TRY_SQL = "SELECT pg_try_advisory_lock(hashtext('retailer_ingest_catalog_write'))"
+_CATALOG_WRITE_UNLOCK_SQL = "SELECT pg_advisory_unlock(hashtext('retailer_ingest_catalog_write'))"
+_LOCK_STATEMENT_TIMEOUT_S = 30.0
+_LOCK_CLOSE_TIMEOUT_S = 10.0
+
+
+class CatalogWriteLockBusy(Exception):
+    """Another apply held the catalog write lock for the whole wait; nothing was written."""
+
+    def __init__(self, waited_s: float):
+        super().__init__(f"catalog write lock busy for {waited_s:.0f}s")
+        self.waited_s = waited_s
+
+
+class CatalogWriteLockUnavailable(Exception):
+    """The lock connection could not be opened, or a try-lock failed, before the lock was held:
+    nothing was written, so the caller retries rather than failing the job."""
+
+    def __init__(self, cause: BaseException):
+        self.error_type = type(cause).__name__
+        super().__init__(f"catalog write lock unavailable: {self.error_type}")
+
+
+async def _open_lock_connection() -> Any:
+    """A DEDICATED raw asyncpg connection, never a pool connection: `databases` 0.7 shares one
+    Connection across a task and its child tasks, so a session lock taken through the pool handle
+    could be held by (or released under) queries that are not this apply's, and would stay on the
+    pooled connection if an unlock were missed. Closing this connection releases the lock whatever
+    happened before. Same DSN and per-connection settings as the startup DDL lock."""
+    import asyncpg
+
+    from db.startup_ddl import _asyncpg_dsn, _connect_kwargs
+
+    dsn = _asyncpg_dsn()
+    if not dsn:
+        # Fail closed: an apply never writes unserialized because the lock could not be built.
+        raise RuntimeError("the catalog write lock needs a Postgres DATABASE_URL")
+    return await asyncio.wait_for(asyncpg.connect(dsn, **_connect_kwargs()), timeout=_LOCK_STATEMENT_TIMEOUT_S)
+
+
+async def _close_lock_connection(conn: Any) -> None:
+    """Close, or terminate: either ends the session, and a session's advisory locks end with it.
+    A failed close is logged, never raised -- after a successful write it must not fail the job."""
+    try:
+        await asyncio.wait_for(conn.close(), timeout=_LOCK_CLOSE_TIMEOUT_S)
+    except asyncio.CancelledError:
+        conn.terminate()  # synchronous: works on the cancellation path
+        raise
+    except Exception as exc:  # noqa: BLE001
+        conn.terminate()
+        logger.warning("catalog write lock: close failed, connection terminated: %s", str(exc)[:200])
+
+
+@contextlib.asynccontextmanager
+async def catalog_write_lock(*, wait_s: float, poll_s: float = 5.0,
+                             connect: Optional[Callable[[], Awaitable[Any]]] = None,
+                             clock: Callable[[], float] = time.monotonic,
+                             sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep) -> AsyncIterator[float]:
+    """Hold the catalog write lock for the enclosed block; yields the seconds spent waiting for it.
+
+    Polls pg_try_advisory_lock every `poll_s` (never a blocking pg_advisory_lock: that holds a
+    statement open on the waiter for the whole wait). Not acquired within `wait_s` ->
+    CatalogWriteLockBusy, and the block never runs. The lock is released on every path: unlocked
+    explicitly, then the connection is closed (or terminated), which releases it even when the
+    unlock did not run or failed."""
+    try:
+        conn = await (connect or _open_lock_connection)()
+    except Exception as exc:  # not BaseException: a cancellation stays a cancellation
+        raise CatalogWriteLockUnavailable(exc) from exc
+    try:
+        started = clock()
+        while True:
+            try:
+                acquired = await asyncio.wait_for(conn.fetchval(_CATALOG_WRITE_TRY_SQL),
+                                                  timeout=_LOCK_STATEMENT_TIMEOUT_S)
+            except Exception as exc:
+                raise CatalogWriteLockUnavailable(exc) from exc
+            if acquired:
+                break
+            waited = clock() - started
+            if waited >= wait_s:
+                raise CatalogWriteLockBusy(waited)
+            await sleep(min(poll_s, wait_s - waited))
+        try:
+            yield clock() - started
+        finally:
+            try:
+                released = await asyncio.wait_for(conn.fetchval(_CATALOG_WRITE_UNLOCK_SQL),
+                                                  timeout=_LOCK_CLOSE_TIMEOUT_S)
+                if not released:
+                    # The session lost it mid-write (its connection was dropped): the write ran
+                    # unserialized for part of its length. Loud, so it is found; the close below
+                    # still runs.
+                    logger.error("catalog write lock was no longer held at release")
+            except Exception as exc:  # noqa: BLE001 -- the close below releases it
+                logger.warning("catalog write lock: unlock failed, closing the connection: %s", str(exc)[:200])
+    finally:
+        await _close_lock_connection(conn)
+
+
+#: An unfinished APPLY run's `checks.catalog_write` says whether its catalog write can have begun:
+#:   "not_started"  written by start_run: the execution died before the write (crawl, checks, lock
+#:                  wait) -- nothing was written, so the apply is retried like a dry run;
+#:   "started"      written by mark_write_started, and COMMITTED, before apply_ingest_plan is called --
+#:                  the cohort may be partial, never re-applied blindly;
+#:   absent         a run started by an image older than this marker: treated as "started".
+CATALOG_WRITE_NOT_STARTED = "not_started"
+CATALOG_WRITE_STARTED = "started"
+
+
 async def start_run(*, job_id: str, stage: str, image_sha: Optional[str], execution: Optional[str],
                     db: Any = None) -> str:
     write_db = db or database
     run_id = f"rir_{uuid.uuid4().hex}"
+    checks = {"catalog_write": CATALOG_WRITE_NOT_STARTED} if stage == "apply" else None
     await write_db.execute(
-        "INSERT INTO retailer_ingest_runs (id, job_id, stage, image_sha, execution) "
-        "VALUES (:id, :job_id, :stage, :image_sha, :execution)",
-        {"id": run_id, "job_id": job_id, "stage": stage, "image_sha": image_sha, "execution": execution},
+        "INSERT INTO retailer_ingest_runs (id, job_id, stage, image_sha, execution, checks) "
+        "VALUES (:id, :job_id, :stage, :image_sha, :execution, CAST(:checks AS jsonb))",
+        {"id": run_id, "job_id": job_id, "stage": stage, "image_sha": image_sha, "execution": execution,
+         "checks": _dumps(checks)},
     )
     return run_id
+
+
+_MARK_WRITE_STARTED_SQL = """
+    UPDATE retailer_ingest_runs
+    SET checks = COALESCE(checks, '{}'::jsonb)
+                 || jsonb_build_object('catalog_write', CAST(:started AS text), 'write_started_at', NOW())
+    WHERE id = :id AND finished_at IS NULL
+    RETURNING id
+"""
+
+
+async def mark_write_started(run_id: str, *, db: Any = None) -> None:
+    """Record, durably, that this apply run is about to write the catalog. The caller awaits it
+    BEFORE apply_ingest_plan: a crash between the two reads as "may be partial" (safe), never as
+    "nothing written" (a re-apply over a partial write). Raises when no unfinished run matched, so
+    the write never starts unmarked."""
+    write_db = db or database
+    row = await write_db.fetch_one(_MARK_WRITE_STARTED_SQL, {"id": run_id, "started": CATALOG_WRITE_STARTED})
+    if not row:
+        raise RuntimeError(f"cannot mark the catalog write started: no unfinished run {run_id}")
 
 
 async def finish_run(run_id: str, *, outcome: str, crawl: Any = None, plan: Any = None,
@@ -303,11 +446,34 @@ async def job_runs(job_id: str, *, db: Any = None) -> List[Dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+_RECENT_OUTCOMES_SQL = """
+    SELECT outcome FROM retailer_ingest_runs
+    WHERE job_id = :id AND finished_at IS NOT NULL
+    ORDER BY started_at DESC, id DESC
+    LIMIT :n
+"""
+
+
+async def consecutive_outcomes(job_id: str, outcomes: Any, *, limit: int, db: Any = None) -> int:
+    """How many of the job's most recent FINISHED runs, newest first and without a break, ended in
+    one of `outcomes` (at most `limit`). Derived from the ledger itself, so it survives executions."""
+    read_db = db or database
+    rows = await read_db.fetch_all(_RECENT_OUTCOMES_SQL, {"id": job_id, "n": int(limit)})
+    count = 0
+    for row in rows:
+        if row["outcome"] not in outcomes:
+            break
+        count += 1
+    return count
+
+
 async def unfinished_run(job_id: str, *, db: Any = None) -> Optional[Dict[str, Any]]:
-    """The job's latest run, when it never finished: its execution was killed (timeout, OOM)."""
+    """The job's latest run, when it never finished: its execution was killed (timeout, OOM).
+    `catalog_write` is the apply's write marker (see CATALOG_WRITE_STARTED), None when absent."""
     read_db = db or database
     row = await read_db.fetch_one(
-        "SELECT id, stage, started_at, finished_at FROM retailer_ingest_runs WHERE job_id = :id "
+        "SELECT id, stage, started_at, finished_at, checks ->> 'catalog_write' AS catalog_write "
+        "FROM retailer_ingest_runs WHERE job_id = :id "
         "ORDER BY started_at DESC LIMIT 1", {"id": job_id})
     return dict(row) if row and row["finished_at"] is None else None
 

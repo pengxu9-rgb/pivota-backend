@@ -108,6 +108,9 @@ from urllib.parse import urlparse
 
 # Stdlib-only, like this module; the structural check `build_cart_link_quote_request` applies.
 from services.reap_cart_link import cart_link_line
+# The `pivota` logger (stdlib-only too): the only one whose INFO/WARNING reliably lands in prod
+# logs. Used for the sandbox-simulate dial, where a silently ignored setting must be visible.
+from utils.logger import logger as _ops_logger
 
 logger = logging.getLogger("reap_agentic_client")
 
@@ -351,6 +354,71 @@ def validate_base_url(raw: Optional[str] = None) -> str:
     return url
 
 
+# --- sandbox-only: simulate a completed checkout --------------------------------------------------
+#
+# Reap's sandbox accepts `X-Simulate-Checkout: COMPLETED` on `POST /agentic/checkouts` (spec
+# re-read 25 Sep: optional header, `const: COMPLETED`, "rejected in production"). Measured: it does
+# NOT skip the buyer's approval -- the checkout is still REQUIRES_ACTION with a hosted URL -- but
+# once a human approves, it goes PROCESSING -> COMPLETED with an `orderId` in ~70 s instead of the
+# FAILED the un-simulated sandbox returns. That is what makes our own rail runnable end to end.
+#
+# It must never reach production, however an operator sets the environment. So the header is
+# emitted only when BOTH the dial is the exact string and the base URL's host is one of the two
+# sandbox hosts, compared as an exact string. `ALLOWED_HOST_SUFFIXES` is NOT reused for this: it
+# admits `prod.api.reap.global` by design. Reap rejecting the header in production is the second
+# lock, not the first.
+
+#: The dial. Read on every call, never cached at import.
+SIMULATE_CHECKOUT_DIAL = "REAP_AGENTIC_SIMULATE_CHECKOUT"
+SIMULATE_CHECKOUT_HEADER = "X-Simulate-Checkout"
+#: The ONLY accepted dial value, and the only value the spec admits for the header. Case-sensitive
+#: and not coerced: `completed`, `1`, `true` are ignored rather than read as "on".
+SIMULATE_CHECKOUT_VALUE = "COMPLETED"
+#: Exact hostnames, from the spec's `servers` block. Exact, not suffix: `x.sandbox.api.reap.global`
+#: is not one of them, and `prod.api.reap.global` must never be.
+SIMULATE_CHECKOUT_SANDBOX_HOSTS = frozenset({"sandbox.api.reap.global", "mx.sandbox.api.reap.global"})
+
+
+def simulate_checkout_header(
+    base_url_value: Optional[str], dial_value: Optional[str]
+) -> Optional[Dict[str, str]]:
+    """`{"X-Simulate-Checkout": "COMPLETED"}` or None. Pure apart from the WARNING it logs.
+
+    None unless the dial is exactly `COMPLETED` (after `.strip()`) AND `base_url_value` passes
+    `validate_base_url` AND its hostname is exactly one of `SIMULATE_CHECKOUT_SANDBOX_HOSTS`.
+    Never raises: a base URL `validate_base_url` refuses is simply not the sandbox.
+
+    WARNINGs go through the `pivota` logger (the one whose WARNINGs reliably reach prod logs),
+    because a dial someone set that silently does nothing is a debugging session.
+    """
+    if dial_value is None:
+        return None
+    raw = dial_value.strip() if isinstance(dial_value, str) else str(dial_value)
+    if not raw:
+        return None
+    if raw != SIMULATE_CHECKOUT_VALUE:
+        _ops_logger.warning(
+            "%s value not recognised (%r); only the exact string %s is accepted; header withheld",
+            SIMULATE_CHECKOUT_DIAL, raw[:32], SIMULATE_CHECKOUT_VALUE,
+        )
+        return None
+    host = ""
+    # `is not None` matters: `validate_base_url(None)` falls back to the ENVIRONMENT, and this
+    # function must judge only the value it was handed.
+    if base_url_value is not None and base_url_value.strip():
+        try:
+            host = (urlparse(validate_base_url(base_url_value.strip())).hostname or "").lower()
+        except ReapConfigError:
+            host = ""
+    if host not in SIMULATE_CHECKOUT_SANDBOX_HOSTS:
+        # The host is not named: a refused base URL can carry userinfo, which is a credential.
+        _ops_logger.warning(
+            "simulate dial set but base is not the Reap sandbox; header withheld"
+        )
+        return None
+    return {SIMULATE_CHECKOUT_HEADER: SIMULATE_CHECKOUT_VALUE}
+
+
 #: Reap retains an idempotency key for 24 h, but a quote's `expiresAt` is roughly 5 minutes. A
 #: key derived from the body ALONE therefore replays a long-dead quote to the same cart the next
 #: day -- the caller gets a 200 carrying an expired `expiresAt` and prices that may have moved.
@@ -442,6 +510,7 @@ def _headers(
     *,
     method: str = "POST",
     idempotency_extra: Optional[Dict[str, Any]] = None,
+    extra_headers: Optional[Dict[str, str]] = None,
 ) -> Dict[str, str]:
     """`method` is not cosmetic. `_IDEMPOTENT_PATHS` is matched by PATH, and `/agentic/enrollments`
     is both a create and a list -- so keying off the path alone would put an Idempotency-Key on
@@ -451,6 +520,11 @@ def _headers(
     `idempotency_extra` carries material that is NOT a field of the request body -- today only
     the enrollment `attempt_id`, which identifies which of our attempts this is and has no place
     in a body whose schema does not have it.
+
+    `extra_headers` is added verbatim and may not replace a header set here (the key, the version,
+    the idempotency key). It is passed EXPLICITLY by the one caller that needs it --
+    `create_checkout`, for the sandbox simulate header -- rather than chosen here by sniffing the
+    path, so no other request can pick it up by sharing a prefix.
     """
     headers = {
         "Authorization": f"Bearer {key}",
@@ -468,6 +542,10 @@ def _headers(
                 bucket_seconds=(None if path in _UNBUCKETED_IDEMPOTENT_PATHS
                                 else _IDEMPOTENCY_BUCKET_S),
             )
+    for name, value in (extra_headers or {}).items():
+        if any(name.lower() == existing.lower() for existing in headers):
+            raise ReapRequestError(f"extra header {name!r} would replace a header this module sets")
+        headers[name] = value
     return headers
 
 
@@ -1690,6 +1768,7 @@ async def _post(
     *,
     timeout_seconds: Optional[float] = None,
     idempotency_extra: Optional[Dict[str, Any]] = None,
+    extra_headers: Optional[Dict[str, str]] = None,
 ) -> ReapResponse:
     """One POST. Returns a result; raises only on misconfiguration.
 
@@ -1729,7 +1808,8 @@ async def _post(
             # steps of at most 64 KiB, and the read is abandoned once the cap is passed.
             async with client.stream(
                 "POST", f"{url}{path}", json=body,
-                headers=_headers(key, path, body, idempotency_extra=idempotency_extra),
+                headers=_headers(key, path, body, idempotency_extra=idempotency_extra,
+                                 extra_headers=extra_headers),
             ) as resp:
                 if resp.status_code >= 400:
                     # The response BODY is deliberately not logged or returned to a serving
@@ -2611,6 +2691,14 @@ REFUSAL_EXPLANATIONS: List[Tuple[str, str]] = [
     ("unparseable_response",
      "A 2xx whose body was not JSON. Unverifiable rather than failed: we do not know what the\n"
      "other end did. On a create, retry inside the same idempotency window."),
+    # --- 2026-09-25 spec re-pin: the 409s -------------------------------------------------
+    ("reap_status_409",
+     "A CONFLICT with the state of the thing being acted on, not a malformed request. Since the\n"
+     "2026-09-25 spec the code is at `error.code` (NOT `error.detail.code`): ENROLLMENT_NOT_ACTIVE\n"
+     "(checkout create / revoke; `detail.reason` says CARD_NOT_CAPTURED), QUOTE_EXPIRED (checkout\n"
+     "create, quote, shipping-option: re-quote, do not retry the create), VARIANT_UNAVAILABLE\n"
+     "(quote) and IDEMPOTENCY_REQUEST_IN_PROGRESS (a retry overtook the original; wait for it).\n"
+     "Pass `error_code` to `explain_detail_code` for the per-code move."),
 ]
 
 #: `error.detail.code` -> what to DO about it, for the enrollment and checkout legs.
@@ -2624,6 +2712,15 @@ DETAIL_CODE_EXPLANATIONS: List[Tuple[str, str]] = [
      "The enrollment is not ACTIVE, so there is no card to charge. The buyer has not finished\n"
      "the hosted card page, or it expired. Poll the enrollment; if it is `pending`, send them\n"
      "back to its `nextAction.url`. Creating the checkout again will not help."),
+    # Since the 2026-09-25 spec these arrive on a 409 at `error.code`, not `error.detail.code`.
+    # Same table on purpose: the question ("what do I do about this code") is the same
+    # whichever field the partner put it in, and `_report_failure` asks it for both.
+    ("QUOTE_EXPIRED",
+     "The quote is dead (about five minutes). Do not retry the checkout create: request a NEW\n"
+     "quote and create the checkout from that one, inside its window."),
+    ("IDEMPOTENCY_REQUEST_IN_PROGRESS",
+     "A request with this Idempotency-Key is still being processed -- a retry overtook the\n"
+     "original. Nothing to fix: wait for the first request to finish, then read the resource."),
 ]
 
 
@@ -2675,7 +2772,7 @@ def explain_refusal(reason: Optional[str]) -> str:
 # THE SHAPE CHANGED UNDER US. Checkout creation no longer takes an `owner` block -- the owner is
 # now carried by the enrollment, and `enrollmentId` replaced it. `info.version` is still 1.0.0,
 # so the document gives no signal that anything moved. That is the whole reason
-# `tests/fixtures/reap_openapi_agentic_2026_09_17.json` and `scripts/ops/reap_spec_diff.py`
+# `tests/fixtures/reap_openapi_agentic_2026_09_25.json` and `scripts/ops/reap_spec_diff.py`
 # exist: the spec is pinned to a file in this repo, and a difference is a failing diff rather
 # than a 400 in production.
 
@@ -2967,9 +3064,15 @@ def build_enrollment_request(
     -- and this module must not be the place someone accidentally reopens it. A default would
     have been a suggestion; this is a wall.
 
-    `email` is optional and prefills the hosted page. It is real buyer PII crossing to a third
-    party, so it is included only when a caller passes it, and it is deliberately NOT part of
-    the idempotency key.
+    `email` is REQUIRED: the `None` default exists only so that leaving it out is a
+    `ReapRequestError` -- the refusal every other invalid input gets, printed by the ops script
+    as REFUSED BEFORE EGRESS -- rather than a TypeError. It was optional until 2026-09-25, when
+    Reap made it a required property of `ClientReferenceOwner` -- inside a `$ref`, with
+    `info.version` still 1.0.0, and invisible to the spec differ of the day. It is real buyer PII crossing to a third party, so
+    it is validated for shape before it goes and it is deliberately NOT part of the idempotency
+    key. A missing or empty email RAISES rather than defaulting or omitting the key: Reap accepts
+    a body silently in some places and rejects it in others, and a body we already know the spec
+    refuses must not be the thing we find out from.
     """
     wanted = str(source or "").strip().upper()
     if wanted in _CARD_ISSUANCE_SOURCES:
@@ -3011,16 +3114,20 @@ def build_enrollment_request(
     if email is not None and not isinstance(email, str):
         raise ReapRequestError(f"enrollment owner email must be a string, got {type(email).__name__}")
     address = (email or "").strip()
-    if address:
-        # `"@" in address` accepted `a@b@c`, `@b.com`, `a@` and `" a@b.com "` -- a check that
-        # fires on nothing a caller is likely to get wrong. This is still not RFC validation and
-        # is not trying to be: it is the set of shapes that are definitely not an address, and
-        # the address itself is REAL BUYER PII being prefilled onto a third party's page.
-        local, _, domain = address.partition("@")
-        if (address.count("@") != 1 or not local or not domain or "." not in domain
-                or _URL_FORBIDDEN_CHARS.search(address)):
-            raise ReapRequestError("enrollment owner email is not an email address")
-        owner["email"] = address
+    if not address:
+        # Required by the spec since 2026-09-25 (`ClientReferenceOwner.required` gained `email`).
+        # Not defaulted and not omitted: an enrollment without an owner email is a body the
+        # pinned spec refuses, and this builder is the last place that can say so before egress.
+        raise ReapRequestError("an enrollment needs the owner's email (required by Reap's spec)")
+    # `"@" in address` accepted `a@b@c`, `@b.com`, `a@` and `" a@b.com "` -- a check that
+    # fires on nothing a caller is likely to get wrong. This is still not RFC validation and
+    # is not trying to be: it is the set of shapes that are definitely not an address, and
+    # the address itself is REAL BUYER PII being prefilled onto a third party's page.
+    local, _, domain = address.partition("@")
+    if (address.count("@") != 1 or not local or not domain or "." not in domain
+            or _URL_FORBIDDEN_CHARS.search(address)):
+        raise ReapRequestError("enrollment owner email is not an email address")
+    owner["email"] = address
     return {
         "source": "EXTERNAL",
         "owner": owner,
@@ -3081,7 +3188,7 @@ async def create_enrollment(
     owner_id: str,
     return_url: str,
     attempt_id: str,
-    email: Optional[str] = None,
+    email: str,
     timeout_seconds: Optional[float] = None,
 ) -> ReapResponse:
     """Start a hosted card-entry flow. Returns an enrollment whose `nextAction.url` a HUMAN opens.
@@ -3099,6 +3206,10 @@ async def create_enrollment(
     the decision about what counts as a retry. It is validated as an opaque id: it is ours, but
     it reaches a partner inside a header, and it must not be an email or anything else that
     identifies a person.
+
+    `email` is required (spec, 2026-09-25); the builder raises `ReapRequestError` on an empty
+    one BEFORE anything is sent, so a caller that cannot supply it must refuse earlier still --
+    see `_resolving_to_enrollment` in the purchase service.
 
     Fast path: the enrollment create is not talking to a merchant's commerce layer the way a
     quote is, so it keeps the default timeout rather than the 35 s quote bound.
@@ -3125,7 +3236,7 @@ async def revoke_enrollment(
 ) -> ReapResponse:
     """`POST /agentic/enrollments/{id}/revoke` — tell Reap to stop honouring this card.
 
-    WP4c ADDED THIS BECAUSE THE SPEC HAS IT. `tests/fixtures/reap_openapi_agentic_2026_09_17.json`
+    WP4c ADDED THIS BECAUSE THE SPEC HAS IT. `tests/fixtures/reap_openapi_agentic_2026_09_25.json`
     carries `revokeEnrollment_agentic` on this path, taking the id and the `Reap-Version` header
     and no body. Before WP4c the runbook's orphan section said flatly that "the enrollment at
     Reap is never revoked" — we stop using it and never tell Reap to stop honouring it. This is
@@ -3228,12 +3339,28 @@ async def create_checkout(
     timeout_seconds: Optional[float] = None,
 ) -> ReapResponse:
     """`POST /agentic/checkouts`. Already in the slow-path set: it is the leg that talks to the
-    merchant, and it carries the quote's 35 s bound rather than the 12 s default."""
+    merchant, and it carries the quote's 35 s bound rather than the 12 s default.
+
+    SANDBOX ONLY: when `REAP_AGENTIC_SIMULATE_CHECKOUT=COMPLETED` AND the base URL is a Reap
+    sandbox host, `X-Simulate-Checkout: COMPLETED` is added -- here and on no other request. See
+    `simulate_checkout_header`. The dial is read on every call.
+
+    When the header is sent it is ALSO idempotency material: a checkout opened with it and one
+    opened without are different requests to Reap. Keyed on the body alone, a replay after the
+    dial was toggled would either hit IDEMPOTENT_PARAMETER_MISMATCH or silently return the other
+    checkout. With the dial unset the material -- and so the key -- is exactly what it was.
+    """
     body = build_checkout_request(
         quote_id=quote_id, enrollment_id=enrollment_id, return_url=return_url
     )
+    simulate = simulate_checkout_header(base_url(), os.getenv(SIMULATE_CHECKOUT_DIAL))
     return _refuse_unsafe_hosted_url(
-        await _post("/agentic/checkouts", body, timeout_seconds=timeout_seconds)
+        await _post(
+            "/agentic/checkouts", body, timeout_seconds=timeout_seconds,
+            extra_headers=simulate,
+            idempotency_extra=(
+                {"simulate": simulate[SIMULATE_CHECKOUT_HEADER]} if simulate else None),
+        )
     )
 
 

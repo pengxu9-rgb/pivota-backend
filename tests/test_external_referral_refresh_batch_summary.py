@@ -12,6 +12,7 @@ real aggregation without a database.
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any, Dict, List
 
 import pytest
@@ -28,6 +29,8 @@ def _run(monkeypatch, rows: List[Dict[str, Any]], *, limit: int = 10) -> Dict[st
         err, "get_external_referral_refresh_candidate_seed_ids",
         lambda *a, **k: asyncio.sleep(0, result=seed_ids),
     )
+    # No hosts -> no breaker, and no database: these tests pin aggregation, not the breaker.
+    monkeypatch.setattr(err, "_fetch_refresh_candidate_hosts", lambda ids: asyncio.sleep(0, result={}))
     scripted = dict(zip(seed_ids, rows))
 
     async def fake_refresh(seed_id, **kwargs):
@@ -196,3 +199,147 @@ def test_pdp_outcomes_are_counted_separately_from_the_offer_write(monkeypatch):
     assert summary["pdp_skips"] == {"skipped_no_attached_key": 2, "skipped_no_content_key": 1}
     # The offer-side skip histogram is pinned at the seam too: `{}` used to survive.
     assert summary["projection_skips"] == {"no_mirror_product": 1}
+
+
+# ------------------------------------------------------ one host must not eat the budget
+
+import services.crawl_politeness as cp
+
+
+def _run_hosts(monkeypatch, hosts: List[str], answers: Dict[str, List[int]], *, trip: str = ""):
+    """Drive the real batch over rows on `hosts`, feeding each fetch's status into the REAL
+    pacing counter, exactly where `_fetch_html` does. Returns (summary, seed ids refreshed)."""
+    cp.reset_for_tests()
+    monkeypatch.setenv("EXTERNAL_REFERRAL_REFRESH_HOST_BLOCK_TRIP", trip)
+    seed_ids = [f"eps_{i}" for i in range(len(hosts))]
+    monkeypatch.setattr(
+        err, "get_external_referral_refresh_candidate_seed_ids",
+        lambda *a, **k: asyncio.sleep(0, result=seed_ids),
+    )
+    monkeypatch.setattr(
+        err, "_fetch_refresh_candidate_hosts",
+        lambda ids: asyncio.sleep(0, result=dict(zip(seed_ids, hosts))),
+    )
+    queues = {h: list(v) for h, v in answers.items()}
+    called: List[str] = []
+
+    async def fake_refresh(seed_id, **kwargs):
+        called.append(seed_id)
+        host = hosts[seed_ids.index(seed_id)]
+        code = queues[host].pop(0) if queues[host] else 200
+        cp.note_response(f"https://{host}/products/x", code)
+        if code == 200:
+            return _ok(price="unchanged", projected=0, attempted=0)
+        return {"status": "degraded", "error": f"destination_unavailable: http {code}", "domain": host}
+
+    summary = asyncio.run(
+        err.run_external_referral_refresh_batch(refresh_seed_by_id=fake_refresh, limit=len(hosts))
+    )
+    cp.reset_for_tests()
+    return summary, called
+
+
+def test_a_host_on_a_429_streak_is_skipped_for_the_rest_of_the_run(monkeypatch):
+    """The 09-20/21/22 shape: fentybeauty.com 429s on every request while other hosts answer.
+    Before, every fenty row waited out a hold that doubled to 300s and the night refreshed ~83
+    rows. Now the fifth fenty row onward is never requested, and the other hosts still are."""
+    hosts = ["fentybeauty.com", "a.com"] * 10
+    summary, called = _run_hosts(monkeypatch, hosts, {"fentybeauty.com": [429] * 20, "a.com": []})
+    fenty_called = [s for s in called if hosts[int(s.split("_")[1])] == "fentybeauty.com"]
+    assert len(fenty_called) == 4, "trips on the 4th consecutive 429, never asks a 5th time"
+    assert summary["skipped_for_host_backoff"] == 6
+    assert summary["host_backoff_skips"] == {"fentybeauty.com": 6}
+    # Skipped rows are NOT attempts: never handed to the refresher (so never stamped) and out
+    # of the yield denominator, like budget skips.
+    assert len(called) == 14
+    assert summary["attempted_count"] == 14
+    assert summary["refreshed"] == 10, "every a.com row was still read"
+    assert summary["host_breaker_armed"] is True
+
+
+def test_a_host_whose_streak_breaks_is_never_tripped(monkeypatch):
+    """The breaker counts CONSECUTIVE blocks, as the pacing layer does: a host that 429s three
+    times, answers, and 429s three more times is throttling, not refusing."""
+    hosts = ["b.com"] * 8
+    summary, called = _run_hosts(monkeypatch, hosts, {"b.com": [429, 429, 429, 200, 429, 429, 429, 200]})
+    assert len(called) == 8
+    assert summary["skipped_for_host_backoff"] == 0
+    assert summary["host_backoff_skips"] == {}
+
+
+def test_a_503_streak_trips_the_breaker_too(monkeypatch):
+    """`note_response` backs off on 503 exactly as on 429 (26 of 958 measured holds were 503s),
+    so the hold it earns costs the budget the same way."""
+    summary, called = _run_hosts(monkeypatch, ["c.com"] * 6, {"c.com": [503] * 6})
+    assert len(called) == 4 and summary["host_backoff_skips"] == {"c.com": 2}
+
+
+def test_the_breaker_can_be_disabled_without_a_deploy(monkeypatch):
+    summary, called = _run_hosts(monkeypatch, ["d.com"] * 6, {"d.com": [429] * 6}, trip="0")
+    assert len(called) == 6
+    assert summary["skipped_for_host_backoff"] == 0
+    assert summary["host_breaker_armed"] is False
+
+
+def test_the_trip_streak_is_tunable(monkeypatch):
+    summary, called = _run_hosts(monkeypatch, ["e.com"] * 6, {"e.com": [429] * 6}, trip="2")
+    assert len(called) == 2 and summary["host_block_trip"] == 2
+
+
+def test_the_host_lookup_fails_open_to_no_breaker(monkeypatch):
+    """A lookup error must not stop the refresh; it runs exactly as before the breaker."""
+    async def boom(*a, **k):
+        raise RuntimeError("db down")
+    monkeypatch.setattr(err.database, "fetch_all", boom)
+    assert asyncio.run(err._fetch_refresh_candidate_hosts(["eps_1"])) == {}
+
+
+def test_the_host_lookup_keys_on_the_url_host_not_the_domain_column(monkeypatch):
+    """`crawl_politeness` paces on `host_of(url)`; a breaker keyed on `domain` (which drops the
+    `www.`) would never see the streak on `www.cosrx.com`."""
+    seen: List[Dict[str, Any]] = []
+
+    async def fake_fetch_all(query, params):
+        seen.append(params)
+        return [
+            {"id": "eps_1", "destination_url": "https://WWW.Cosrx.com/products/snail?utm_source=x"},
+            {"id": "eps_2", "destination_url": ""},
+        ]
+    monkeypatch.setattr(err.database, "fetch_all", fake_fetch_all)
+    hosts = asyncio.run(err._fetch_refresh_candidate_hosts(["eps_1", "eps_2"]))
+    assert hosts == {"eps_1": "www.cosrx.com"}
+    assert seen == [{"id0": "eps_1", "id1": "eps_2"}]
+
+
+def test_a_starved_budget_stop_is_degraded_end_to_end(monkeypatch):
+    """09-23 at the batch seam: the budget runs out after a handful of rows. Every row it DID
+    reach read fine, so the yield rule is satisfied; only reach can call this night what it was."""
+    clock = {"t": 0.0}
+    # The module's `time`, not the global one: asyncio's own loop clock must keep running.
+    monkeypatch.setattr(err, "time", SimpleNamespace(monotonic=lambda: clock["t"]))
+    seed_ids = [f"eps_{i}" for i in range(10)]
+    monkeypatch.setattr(
+        err, "get_external_referral_refresh_candidate_seed_ids",
+        lambda *a, **k: asyncio.sleep(0, result=seed_ids),
+    )
+    monkeypatch.setattr(err, "_fetch_refresh_candidate_hosts", lambda ids: asyncio.sleep(0, result={}))
+
+    async def slow_refresh(seed_id, **kwargs):
+        clock["t"] += 100.0
+        return _ok(price="unchanged", projected=0, attempted=0)
+
+    summary = asyncio.run(err.run_external_referral_refresh_batch(
+        refresh_seed_by_id=slow_refresh, limit=10, budget_seconds=250,
+    ))
+    assert summary["stopped_early"] is True
+    assert summary["skipped_for_budget"] == 7
+    assert summary["budget_reach"] == 0.3
+    assert summary["origin_yield"] == 1.0
+    assert summary["status"] == "degraded"
+
+    clock["t"] = 0.0
+    summary = asyncio.run(err.run_external_referral_refresh_batch(
+        refresh_seed_by_id=slow_refresh, limit=10, budget_seconds=850,
+    ))
+    assert summary["stopped_early"] is True and summary["budget_reach"] == 0.9
+    assert summary["status"] == "success", "a steady-state budget stop stays green"

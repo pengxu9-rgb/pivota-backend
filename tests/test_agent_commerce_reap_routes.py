@@ -1842,6 +1842,162 @@ async def test_an_expired_hosted_url_is_not_shown(client):
     assert "hosted_url_expires_at" not in body
 
 
+# ── the approval deadline ────────────────────────────────────────────────────────────────────
+#
+# MEASURED 2026-09-25 in the Reap sandbox: an unapproved checkout is FAILED 1–10 s after the
+# QUOTE's `expiresAt` (created + 5 min), while the hosted page's own `expiresAt` says created +
+# 15 min. The buyer's real window is the earlier of the two, and the body says so explicitly.
+
+
+def _t(**delta) -> datetime:
+    return datetime.now(timezone.utc) + timedelta(**delta)
+
+
+@pytest.mark.parametrize(
+    "quote,hosted,expected",
+    [
+        pytest.param(_t(minutes=5), _t(minutes=15), "quote", id="quote earlier -> quote"),
+        pytest.param(_t(minutes=15), _t(minutes=5), "hosted", id="page earlier -> page"),
+        pytest.param(_t(minutes=5), None, "quote", id="quote only"),
+        pytest.param(None, _t(minutes=15), "hosted", id="page only"),
+        pytest.param(None, None, None, id="neither -> absent"),
+    ],
+)
+def test_the_approval_deadline_is_the_earlier_of_the_two_expiries(quote, hosted, expected):
+    got = routes_reap.approval_deadline(quote, hosted)
+    if expected is None:
+        assert got is None
+    else:
+        assert got == {"quote": quote, "hosted": hosted}[expected]
+        assert got.tzinfo is not None, "comparable with the route's aware `_now()`"
+
+
+def test_equal_expiries_give_that_instant():
+    """The two clocks agreeing is not a third case."""
+    same = _t(minutes=5)
+    assert routes_reap.approval_deadline(same, same.replace()) == same
+
+
+def test_the_deadline_reads_every_shape_a_timestamp_arrives_in():
+    """SQLite hands the column back as text and a naive datetime is UTC by the ledger's rule.
+    Either one skipped as "not a datetime" would be a deadline silently ignored, and an aware/
+    naive comparison would raise inside `min`."""
+    aware = datetime(2026, 9, 25, 12, 5, tzinfo=timezone.utc)
+    assert routes_reap.approval_deadline("2026-09-25 12:05:00", aware.replace(tzinfo=None) + timedelta(minutes=10)) == aware
+    assert routes_reap.approval_deadline(aware.replace(tzinfo=None), "2026-09-25 12:15:00") == aware
+    assert routes_reap.approval_deadline("", None) is None
+
+
+async def _awaiting_approval(purchase_id: str, *, quote, hosted) -> None:
+    await ledger.transition(purchase_id, from_states=("resolving",), to_state="quoting")
+    await ledger.transition(
+        purchase_id,
+        from_states=("quoting",),
+        to_state="awaiting_approval",
+        reap_quote_expires_at=quote,
+        hosted_url="https://pay.prava.space/checkout/chk_7f3a",
+        hosted_url_expires_at=hosted,
+    )
+
+
+async def test_an_awaiting_approval_row_names_the_quote_expiry_as_its_deadline(client):
+    purchase_id = await _open(client)
+    await _awaiting_approval(purchase_id, quote=_t(minutes=5), hosted=_t(minutes=15))
+    body = (await client.get(f"{BASE}/purchases/{purchase_id}")).json()
+    assert body["hosted_url"] == "https://pay.prava.space/checkout/chk_7f3a"
+    assert body["approval_deadline"] == body["reap_quote_expires_at"], (
+        "one spelling for one instant: the deadline is serialised exactly as the raw column is"
+    )
+    assert body["approval_deadline"] != body["hosted_url_expires_at"]
+    assert body["approval_deadline"].endswith("+00:00"), "ISO-8601 with an explicit UTC offset"
+    assert datetime.fromisoformat(body["approval_deadline"]).tzinfo is not None
+    # both raw columns are still there, untouched
+    assert body["reap_quote_expires_at"]
+    assert body["hosted_url_expires_at"]
+
+
+async def test_the_deadline_falls_back_to_the_page_when_nothing_was_quoted_with_an_expiry(client):
+    purchase_id = await _open(client)
+    await _awaiting_approval(purchase_id, quote=None, hosted=_t(minutes=15))
+    body = (await client.get(f"{BASE}/purchases/{purchase_id}")).json()
+    assert body["reap_quote_expires_at"] is None
+    assert body["approval_deadline"] == body["hosted_url_expires_at"]
+
+
+async def test_no_deadline_at_all_leaves_the_key_absent_and_the_link_live(client):
+    purchase_id = await _open(client)
+    await _awaiting_approval(purchase_id, quote=None, hosted=None)
+    body = (await client.get(f"{BASE}/purchases/{purchase_id}")).json()
+    assert "approval_deadline" not in body
+    assert body["hosted_url"] == "https://pay.prava.space/checkout/chk_7f3a"
+
+
+async def test_a_lapsed_quote_drops_the_link_even_while_the_page_is_still_live(client):
+    """THE DEFECT. The page says fifteen minutes; the checkout is FAILED at five. A link shown
+    for the ten minutes in between is a link to a page that will not take the approval."""
+    purchase_id = await _open(client)
+    await _awaiting_approval(purchase_id, quote=_t(minutes=-1), hosted=_t(minutes=9))
+    body = (await client.get(f"{BASE}/purchases/{purchase_id}")).json()
+    assert "hosted_url" not in body
+    assert "hosted_url_expires_at" not in body
+    assert body["state"] == "awaiting_approval"
+    assert body["approval_deadline"] == body["reap_quote_expires_at"], (
+        "surfaced even though it has passed: a past deadline beside a missing link is the honest "
+        "reading of a row the poller has not flipped yet"
+    )
+    assert datetime.fromisoformat(body["approval_deadline"]) < datetime.now(timezone.utc)
+    assert "prava.space" not in (await client.get(f"{BASE}/purchases/{purchase_id}")).text
+
+
+async def test_a_lapsed_quote_drops_the_link_on_the_list_too(client):
+    purchase_id = await _open(client)
+    await _awaiting_approval(purchase_id, quote=_t(minutes=-1), hosted=_t(minutes=9))
+    listed = (await client.get(f"{BASE}/purchases")).json()["purchases"]
+    row = next(item for item in listed if item["id"] == purchase_id)
+    assert "hosted_url" not in row
+    assert row["approval_deadline"] == row["reap_quote_expires_at"]
+
+
+async def test_a_live_quote_with_a_dead_page_still_drops_the_link(client):
+    """CONTROL for the min rule in the other direction: the page's clock is not ignored."""
+    purchase_id = await _open(client)
+    await _awaiting_approval(purchase_id, quote=_t(minutes=4), hosted=_t(minutes=-1))
+    body = (await client.get(f"{BASE}/purchases/{purchase_id}")).json()
+    assert "hosted_url" not in body
+    assert body["approval_deadline"] < body["reap_quote_expires_at"]
+
+
+async def test_the_deadline_is_an_awaiting_approval_field_only(client):
+    """'needs_enrollment' has nothing quoted — the row re-quotes after the card is added — so it
+    carries no approval deadline and does not consult the quote column at all."""
+    purchase_id = await _open(client)
+    await ledger.transition(
+        purchase_id,
+        from_states=("resolving",),
+        to_state="needs_enrollment",
+        hosted_url="https://pay.prava.space/enroll/abc",
+        hosted_url_expires_at=_t(hours=1),
+    )
+    await _set(purchase_id, reap_quote_expires_at=ledger._bind_dt(_t(minutes=-30)))
+    body = (await client.get(f"{BASE}/purchases/{purchase_id}")).json()
+    assert "approval_deadline" not in body
+    assert body["hosted_url"] == "https://pay.prava.space/enroll/abc"
+
+    await ledger.transition(purchase_id, from_states=("needs_enrollment",), to_state="quoting")
+    await ledger.transition(
+        purchase_id,
+        from_states=("quoting",),
+        to_state="awaiting_approval",
+        reap_quote_expires_at=_t(minutes=5),
+        hosted_url="https://pay.prava.space/checkout/chk_7f3a",
+        hosted_url_expires_at=_t(minutes=15),
+    )
+    await ledger.transition(purchase_id, from_states=("awaiting_approval",), to_state="processing")
+    body = (await client.get(f"{BASE}/purchases/{purchase_id}")).json()
+    assert "approval_deadline" not in body, "nothing left to approve on 'processing'"
+    assert body["reap_quote_expires_at"], "the raw column is still reported"
+
+
 async def test_a_hosted_url_is_not_shown_on_a_state_that_has_no_page(client):
     """A completed purchase whose approval link still worked would be a second charge waiting to
     happen."""

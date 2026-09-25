@@ -433,6 +433,17 @@ def note_response(url: str, status_code: int, *, retry_after: Optional[str] = No
     )
 
 
+def consecutive_blocks(host: str) -> int:
+    """How many 429/503s in a row this host has answered, as `note_response` counts them.
+
+    Read-only, and keyed by `host_of(url)` exactly as the pacing state is. Exists so a batch can
+    decide to STOP ASKING a host for the rest of its run; it never changes how any request is
+    paced. 0 for a host we have no state for.
+    """
+    state = _STATE.get(str(host or "").strip().lower())
+    return int(state.consecutive_blocks) if state else 0
+
+
 def _parse_retry_after(value: Optional[str]) -> Optional[float]:
     """`Retry-After` as seconds. Only the delta-seconds form; an HTTP-date returns None.
 

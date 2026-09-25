@@ -2,7 +2,7 @@
  "components": {
   "schemas": {
    "BinSponsorEnrollmentCreateResponse": {
-    "description": "Enrollment created from a BIN-sponsor card",
+    "description": "Coming soon. Enrollment created from a BIN-sponsor card.",
     "properties": {
      "id": {
       "allOf": [
@@ -43,7 +43,7 @@
     "description": "The client customer that owns this enrollment",
     "properties": {
      "email": {
-      "description": "Customer email address, prefilled on the hosted page",
+      "description": "Customer email address",
       "format": "email",
       "pattern": "^(?!\\.)(?!.*\\.\\.)([A-Za-z0-9_'+\\-\\.]*)[A-Za-z0-9_+-]@([A-Za-z0-9][A-Za-z0-9\\-]*\\.)+[A-Za-z]{2,}$",
       "type": "string"
@@ -60,7 +60,8 @@
     },
     "required": [
      "type",
-     "id"
+     "id",
+     "email"
     ],
     "title": "Client reference",
     "type": "object"
@@ -148,7 +149,7 @@
     "type": "object"
    },
    "ReapCardEnrollmentCreateResponse": {
-    "description": "Enrollment created from an existing card",
+    "description": "Coming soon. Enrollment created from an existing card.",
     "properties": {
      "id": {
       "allOf": [
@@ -242,6 +243,16 @@
        "description": "Unique key for safely retrying this request. Up to 255 characters; we recommend a UUIDv4. The first request executes and its response is cached; subsequent requests with the same key replay the cached response (24h retention).",
        "maxLength": 255,
        "minLength": 1,
+       "type": "string"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Simulate-Checkout",
+      "required": false,
+      "schema": {
+       "const": "COMPLETED",
+       "description": "Simulates a completed checkout in the sandbox. This header is rejected in production.",
        "type": "string"
       }
      }
@@ -488,45 +499,88 @@
       "content": {
        "application/json": {
         "schema": {
-         "properties": {
-          "error": {
+         "anyOf": [
+          {
+           "description": "The request was rejected",
            "properties": {
-            "code": {
-             "const": "AGENTIC_REQUEST_REJECTED",
-             "type": "string"
-            },
-            "detail": {
-             "anyOf": [
-              {
-               "additionalProperties": {},
-               "type": "object"
+            "error": {
+             "properties": {
+              "code": {
+               "const": "AGENTIC_REQUEST_REJECTED",
+               "type": "string"
               },
-              {
-               "type": "null"
+              "detail": {
+               "anyOf": [
+                {
+                 "additionalProperties": {},
+                 "type": "object"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
               }
-             ]
-            },
-            "message": {
-             "type": "string"
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
             }
            },
            "required": [
-            "code",
-            "message",
-            "detail"
+            "error"
            ],
+           "title": "AgenticRequestRejectedError",
+           "type": "object"
+          },
+          {
+           "description": "Idempotency-Key was previously used with different request parameters",
+           "properties": {
+            "error": {
+             "properties": {
+              "code": {
+               "const": "IDEMPOTENT_PARAMETER_MISMATCH",
+               "type": "string"
+              },
+              "detail": {
+               "anyOf": [
+                {
+                 "additionalProperties": {},
+                 "type": "object"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
+              }
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
+            }
+           },
+           "required": [
+            "error"
+           ],
+           "title": "IdempotentParameterMismatchError",
            "type": "object"
           }
-         },
-         "required": [
-          "error"
-         ],
-         "title": "AgenticRequestRejectedError",
-         "type": "object"
+         ]
         }
        }
       },
-      "description": "The request was rejected"
+      "description": "Response for status 400"
      },
      "403": {
       "content": {
@@ -576,45 +630,257 @@
       "content": {
        "application/json": {
         "schema": {
-         "properties": {
-          "error": {
+         "anyOf": [
+          {
+           "description": "Resource not found",
            "properties": {
-            "code": {
-             "const": "AGENTIC_RESOURCE_NOT_FOUND",
-             "type": "string"
-            },
-            "detail": {
-             "anyOf": [
-              {
-               "additionalProperties": {},
-               "type": "object"
+            "error": {
+             "properties": {
+              "code": {
+               "const": "AGENTIC_RESOURCE_NOT_FOUND",
+               "type": "string"
               },
-              {
-               "type": "null"
+              "detail": {
+               "anyOf": [
+                {
+                 "additionalProperties": {},
+                 "type": "object"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
               }
-             ]
-            },
-            "message": {
-             "type": "string"
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
             }
            },
            "required": [
-            "code",
-            "message",
-            "detail"
+            "error"
            ],
+           "title": "AgenticResourceNotFoundError",
+           "type": "object"
+          },
+          {
+           "description": "Enrollment not found.",
+           "properties": {
+            "error": {
+             "properties": {
+              "code": {
+               "const": "ENROLLMENT_NOT_FOUND",
+               "type": "string"
+              },
+              "detail": {
+               "anyOf": [
+                {
+                 "type": "null"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
+              }
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
+            }
+           },
+           "required": [
+            "error"
+           ],
+           "title": "EnrollmentNotFoundError",
+           "type": "object"
+          },
+          {
+           "description": "Quote not found.",
+           "properties": {
+            "error": {
+             "properties": {
+              "code": {
+               "const": "QUOTE_NOT_FOUND",
+               "type": "string"
+              },
+              "detail": {
+               "anyOf": [
+                {
+                 "type": "null"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
+              }
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
+            }
+           },
+           "required": [
+            "error"
+           ],
+           "title": "QuoteNotFoundError",
            "type": "object"
           }
-         },
-         "required": [
-          "error"
-         ],
-         "title": "AgenticResourceNotFoundError",
-         "type": "object"
+         ]
         }
        }
       },
-      "description": "Resource not found"
+      "description": "Response for status 404"
+     },
+     "409": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "anyOf": [
+          {
+           "description": "Enrollment is not active.",
+           "properties": {
+            "error": {
+             "properties": {
+              "code": {
+               "const": "ENROLLMENT_NOT_ACTIVE",
+               "type": "string"
+              },
+              "detail": {
+               "anyOf": [
+                {
+                 "additionalProperties": false,
+                 "properties": {
+                  "reason": {
+                   "const": "CARD_NOT_CAPTURED",
+                   "type": "string"
+                  }
+                 },
+                 "required": [
+                  "reason"
+                 ],
+                 "type": "object"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
+              }
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
+            }
+           },
+           "required": [
+            "error"
+           ],
+           "title": "EnrollmentNotActiveError",
+           "type": "object"
+          },
+          {
+           "description": "The quote has expired.",
+           "properties": {
+            "error": {
+             "properties": {
+              "code": {
+               "const": "QUOTE_EXPIRED",
+               "type": "string"
+              },
+              "detail": {
+               "anyOf": [
+                {
+                 "type": "null"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
+              }
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
+            }
+           },
+           "required": [
+            "error"
+           ],
+           "title": "QuoteExpiredError",
+           "type": "object"
+          },
+          {
+           "description": "A request with this idempotency key is currently in progress",
+           "properties": {
+            "error": {
+             "properties": {
+              "code": {
+               "const": "IDEMPOTENCY_REQUEST_IN_PROGRESS",
+               "type": "string"
+              },
+              "detail": {
+               "anyOf": [
+                {
+                 "additionalProperties": {},
+                 "type": "object"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
+              }
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
+            }
+           },
+           "required": [
+            "error"
+           ],
+           "title": "IdempotencyRequestInProgressError",
+           "type": "object"
+          }
+         ]
+        }
+       }
+      },
+      "description": "Response for status 409"
      },
      "503": {
       "content": {
@@ -915,45 +1181,87 @@
       "content": {
        "application/json": {
         "schema": {
-         "properties": {
-          "error": {
+         "anyOf": [
+          {
+           "description": "Resource not found",
            "properties": {
-            "code": {
-             "const": "AGENTIC_RESOURCE_NOT_FOUND",
-             "type": "string"
-            },
-            "detail": {
-             "anyOf": [
-              {
-               "additionalProperties": {},
-               "type": "object"
+            "error": {
+             "properties": {
+              "code": {
+               "const": "AGENTIC_RESOURCE_NOT_FOUND",
+               "type": "string"
               },
-              {
-               "type": "null"
+              "detail": {
+               "anyOf": [
+                {
+                 "additionalProperties": {},
+                 "type": "object"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
               }
-             ]
-            },
-            "message": {
-             "type": "string"
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
             }
            },
            "required": [
-            "code",
-            "message",
-            "detail"
+            "error"
            ],
+           "title": "AgenticResourceNotFoundError",
+           "type": "object"
+          },
+          {
+           "description": "Checkout not found.",
+           "properties": {
+            "error": {
+             "properties": {
+              "code": {
+               "const": "CHECKOUT_NOT_FOUND",
+               "type": "string"
+              },
+              "detail": {
+               "anyOf": [
+                {
+                 "type": "null"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
+              }
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
+            }
+           },
+           "required": [
+            "error"
+           ],
+           "title": "CheckoutNotFoundError",
            "type": "object"
           }
-         },
-         "required": [
-          "error"
-         ],
-         "title": "AgenticResourceNotFoundError",
-         "type": "object"
+         ]
         }
        }
       },
-      "description": "Resource not found"
+      "description": "Response for status 404"
      },
      "503": {
       "content": {
@@ -1457,7 +1765,7 @@
     ]
    },
    "post": {
-    "description": "Stores a card for later agentic purchases. An existing card is enrolled directly and is `ACTIVE` at once; an `EXTERNAL` source returns a redirect to a hosted card-entry page and becomes `ACTIVE` once the customer submits their card. Pass the enrollment id to `POST /agentic/checkouts` to charge it.",
+    "description": "Stores a card for later agentic purchases. `EXTERNAL` returns a redirect to a hosted card-entry page and becomes `ACTIVE` once the customer submits their card. `REAP_CARD` and `BIN_SPONSOR` are coming soon. Pass the enrollment id to `POST /agentic/checkouts` to charge it.",
     "operationId": "createEnrollment_agentic",
     "parameters": [
      {
@@ -1491,7 +1799,7 @@
        "schema": {
         "oneOf": [
          {
-          "description": "Enroll an existing card",
+          "description": "Coming soon. Enroll an existing card.",
           "properties": {
            "cardId": {
             "description": "Card identifier to enroll",
@@ -1511,7 +1819,7 @@
           "type": "object"
          },
          {
-          "description": "Enroll a BIN-sponsor card",
+          "description": "Coming soon. Enroll a BIN-sponsor card.",
           "properties": {
            "cardId": {
             "description": "BIN-sponsor card identifier to enroll",
@@ -1575,7 +1883,7 @@
        "schema": {
         "oneOf": [
          {
-          "description": "Enroll an existing card",
+          "description": "Coming soon. Enroll an existing card.",
           "properties": {
            "cardId": {
             "description": "Card identifier to enroll",
@@ -1595,7 +1903,7 @@
           "type": "object"
          },
          {
-          "description": "Enroll a BIN-sponsor card",
+          "description": "Coming soon. Enroll a BIN-sponsor card.",
           "properties": {
            "cardId": {
             "description": "BIN-sponsor card identifier to enroll",
@@ -1659,7 +1967,7 @@
        "schema": {
         "oneOf": [
          {
-          "description": "Enroll an existing card",
+          "description": "Coming soon. Enroll an existing card.",
           "properties": {
            "cardId": {
             "description": "Card identifier to enroll",
@@ -1679,7 +1987,7 @@
           "type": "object"
          },
          {
-          "description": "Enroll a BIN-sponsor card",
+          "description": "Coming soon. Enroll a BIN-sponsor card.",
           "properties": {
            "cardId": {
             "description": "BIN-sponsor card identifier to enroll",
@@ -1772,45 +2080,88 @@
       "content": {
        "application/json": {
         "schema": {
-         "properties": {
-          "error": {
+         "anyOf": [
+          {
+           "description": "The request was rejected",
            "properties": {
-            "code": {
-             "const": "AGENTIC_REQUEST_REJECTED",
-             "type": "string"
-            },
-            "detail": {
-             "anyOf": [
-              {
-               "additionalProperties": {},
-               "type": "object"
+            "error": {
+             "properties": {
+              "code": {
+               "const": "AGENTIC_REQUEST_REJECTED",
+               "type": "string"
               },
-              {
-               "type": "null"
+              "detail": {
+               "anyOf": [
+                {
+                 "additionalProperties": {},
+                 "type": "object"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
               }
-             ]
-            },
-            "message": {
-             "type": "string"
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
             }
            },
            "required": [
-            "code",
-            "message",
-            "detail"
+            "error"
            ],
+           "title": "AgenticRequestRejectedError",
+           "type": "object"
+          },
+          {
+           "description": "Idempotency-Key was previously used with different request parameters",
+           "properties": {
+            "error": {
+             "properties": {
+              "code": {
+               "const": "IDEMPOTENT_PARAMETER_MISMATCH",
+               "type": "string"
+              },
+              "detail": {
+               "anyOf": [
+                {
+                 "additionalProperties": {},
+                 "type": "object"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
+              }
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
+            }
+           },
+           "required": [
+            "error"
+           ],
+           "title": "IdempotentParameterMismatchError",
            "type": "object"
           }
-         },
-         "required": [
-          "error"
-         ],
-         "title": "AgenticRequestRejectedError",
-         "type": "object"
+         ]
         }
        }
       },
-      "description": "The request was rejected"
+      "description": "Response for status 400"
      },
      "403": {
       "content": {
@@ -1942,6 +2293,50 @@
        }
       },
       "description": "Response for status 404"
+     },
+     "409": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "properties": {
+          "error": {
+           "properties": {
+            "code": {
+             "const": "IDEMPOTENCY_REQUEST_IN_PROGRESS",
+             "type": "string"
+            },
+            "detail": {
+             "anyOf": [
+              {
+               "additionalProperties": {},
+               "type": "object"
+              },
+              {
+               "type": "null"
+              }
+             ]
+            },
+            "message": {
+             "type": "string"
+            }
+           },
+           "required": [
+            "code",
+            "message",
+            "detail"
+           ],
+           "type": "object"
+          }
+         },
+         "required": [
+          "error"
+         ],
+         "title": "IdempotencyRequestInProgressError",
+         "type": "object"
+        }
+       }
+      },
+      "description": "A request with this idempotency key is currently in progress"
      },
      "503": {
       "content": {
@@ -2298,45 +2693,87 @@
       "content": {
        "application/json": {
         "schema": {
-         "properties": {
-          "error": {
+         "anyOf": [
+          {
+           "description": "Resource not found",
            "properties": {
-            "code": {
-             "const": "AGENTIC_RESOURCE_NOT_FOUND",
-             "type": "string"
-            },
-            "detail": {
-             "anyOf": [
-              {
-               "additionalProperties": {},
-               "type": "object"
+            "error": {
+             "properties": {
+              "code": {
+               "const": "AGENTIC_RESOURCE_NOT_FOUND",
+               "type": "string"
               },
-              {
-               "type": "null"
+              "detail": {
+               "anyOf": [
+                {
+                 "additionalProperties": {},
+                 "type": "object"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
               }
-             ]
-            },
-            "message": {
-             "type": "string"
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
             }
            },
            "required": [
-            "code",
-            "message",
-            "detail"
+            "error"
            ],
+           "title": "AgenticResourceNotFoundError",
+           "type": "object"
+          },
+          {
+           "description": "Enrollment not found.",
+           "properties": {
+            "error": {
+             "properties": {
+              "code": {
+               "const": "ENROLLMENT_NOT_FOUND",
+               "type": "string"
+              },
+              "detail": {
+               "anyOf": [
+                {
+                 "type": "null"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
+              }
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
+            }
+           },
+           "required": [
+            "error"
+           ],
+           "title": "EnrollmentNotFoundError",
            "type": "object"
           }
-         },
-         "required": [
-          "error"
-         ],
-         "title": "AgenticResourceNotFoundError",
-         "type": "object"
+         ]
         }
        }
       },
-      "description": "Resource not found"
+      "description": "Response for status 404"
      },
      "503": {
       "content": {
@@ -2693,17 +3130,112 @@
       "content": {
        "application/json": {
         "schema": {
+         "anyOf": [
+          {
+           "description": "Resource not found",
+           "properties": {
+            "error": {
+             "properties": {
+              "code": {
+               "const": "AGENTIC_RESOURCE_NOT_FOUND",
+               "type": "string"
+              },
+              "detail": {
+               "anyOf": [
+                {
+                 "additionalProperties": {},
+                 "type": "object"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
+              }
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
+            }
+           },
+           "required": [
+            "error"
+           ],
+           "title": "AgenticResourceNotFoundError",
+           "type": "object"
+          },
+          {
+           "description": "Enrollment not found.",
+           "properties": {
+            "error": {
+             "properties": {
+              "code": {
+               "const": "ENROLLMENT_NOT_FOUND",
+               "type": "string"
+              },
+              "detail": {
+               "anyOf": [
+                {
+                 "type": "null"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
+              }
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
+            }
+           },
+           "required": [
+            "error"
+           ],
+           "title": "EnrollmentNotFoundError",
+           "type": "object"
+          }
+         ]
+        }
+       }
+      },
+      "description": "Response for status 404"
+     },
+     "409": {
+      "content": {
+       "application/json": {
+        "schema": {
          "properties": {
           "error": {
            "properties": {
             "code": {
-             "const": "AGENTIC_RESOURCE_NOT_FOUND",
+             "const": "ENROLLMENT_NOT_ACTIVE",
              "type": "string"
             },
             "detail": {
              "anyOf": [
               {
-               "additionalProperties": {},
+               "additionalProperties": false,
+               "properties": {
+                "reason": {
+                 "const": "CARD_NOT_CAPTURED",
+                 "type": "string"
+                }
+               },
+               "required": [
+                "reason"
+               ],
                "type": "object"
               },
               {
@@ -2726,12 +3258,12 @@
          "required": [
           "error"
          ],
-         "title": "AgenticResourceNotFoundError",
+         "title": "EnrollmentNotActiveError",
          "type": "object"
         }
        }
       },
-      "description": "Resource not found"
+      "description": "Enrollment is not active."
      },
      "503": {
       "content": {
@@ -5472,45 +6004,87 @@
       "content": {
        "application/json": {
         "schema": {
-         "properties": {
-          "error": {
+         "anyOf": [
+          {
+           "description": "The request was rejected",
            "properties": {
-            "code": {
-             "const": "AGENTIC_REQUEST_REJECTED",
-             "type": "string"
-            },
-            "detail": {
-             "anyOf": [
-              {
-               "additionalProperties": {},
-               "type": "object"
+            "error": {
+             "properties": {
+              "code": {
+               "const": "AGENTIC_REQUEST_REJECTED",
+               "type": "string"
               },
-              {
-               "type": "null"
+              "detail": {
+               "anyOf": [
+                {
+                 "additionalProperties": {},
+                 "type": "object"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
               }
-             ]
-            },
-            "message": {
-             "type": "string"
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
             }
            },
            "required": [
-            "code",
-            "message",
-            "detail"
+            "error"
            ],
+           "title": "AgenticRequestRejectedError",
+           "type": "object"
+          },
+          {
+           "description": "Merchant preference could not be resolved. Correct the merchant name or remove the restriction.",
+           "properties": {
+            "error": {
+             "properties": {
+              "code": {
+               "const": "MERCHANT_NOT_RESOLVED",
+               "type": "string"
+              },
+              "detail": {
+               "anyOf": [
+                {
+                 "type": "null"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
+              }
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
+            }
+           },
+           "required": [
+            "error"
+           ],
+           "title": "MerchantNotResolvedError",
            "type": "object"
           }
-         },
-         "required": [
-          "error"
-         ],
-         "title": "AgenticRequestRejectedError",
-         "type": "object"
+         ]
         }
        }
       },
-      "description": "The request was rejected"
+      "description": "Response for status 400"
      },
      "403": {
       "content": {
@@ -5830,45 +6404,87 @@
       "content": {
        "application/json": {
         "schema": {
-         "properties": {
-          "error": {
+         "anyOf": [
+          {
+           "description": "The request was rejected",
            "properties": {
-            "code": {
-             "const": "AGENTIC_REQUEST_REJECTED",
-             "type": "string"
-            },
-            "detail": {
-             "anyOf": [
-              {
-               "additionalProperties": {},
-               "type": "object"
+            "error": {
+             "properties": {
+              "code": {
+               "const": "AGENTIC_REQUEST_REJECTED",
+               "type": "string"
               },
-              {
-               "type": "null"
+              "detail": {
+               "anyOf": [
+                {
+                 "additionalProperties": {},
+                 "type": "object"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
               }
-             ]
-            },
-            "message": {
-             "type": "string"
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
             }
            },
            "required": [
-            "code",
-            "message",
-            "detail"
+            "error"
            ],
+           "title": "AgenticRequestRejectedError",
+           "type": "object"
+          },
+          {
+           "description": "Product variant could not be resolved.",
+           "properties": {
+            "error": {
+             "properties": {
+              "code": {
+               "const": "VARIANT_RESOLUTION_FAILED",
+               "type": "string"
+              },
+              "detail": {
+               "anyOf": [
+                {
+                 "type": "null"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
+              }
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
+            }
+           },
+           "required": [
+            "error"
+           ],
+           "title": "VariantResolutionFailedError",
            "type": "object"
           }
-         },
-         "required": [
-          "error"
-         ],
-         "title": "AgenticRequestRejectedError",
-         "type": "object"
+         ]
         }
        }
       },
-      "description": "The request was rejected"
+      "description": "Response for status 400"
      },
      "403": {
       "content": {
@@ -6560,45 +7176,194 @@
       "content": {
        "application/json": {
         "schema": {
-         "properties": {
-          "error": {
+         "anyOf": [
+          {
+           "description": "The request was rejected",
            "properties": {
-            "code": {
-             "const": "AGENTIC_REQUEST_REJECTED",
-             "type": "string"
-            },
-            "detail": {
-             "anyOf": [
-              {
-               "additionalProperties": {},
-               "type": "object"
+            "error": {
+             "properties": {
+              "code": {
+               "const": "AGENTIC_REQUEST_REJECTED",
+               "type": "string"
               },
-              {
-               "type": "null"
+              "detail": {
+               "anyOf": [
+                {
+                 "additionalProperties": {},
+                 "type": "object"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
               }
-             ]
-            },
-            "message": {
-             "type": "string"
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
             }
            },
            "required": [
-            "code",
-            "message",
-            "detail"
+            "error"
            ],
+           "title": "AgenticRequestRejectedError",
+           "type": "object"
+          },
+          {
+           "description": "The merchant cannot fulfill this quote as requested (for example, it cannot ship to the address).",
+           "properties": {
+            "error": {
+             "properties": {
+              "code": {
+               "const": "QUOTE_UNFULFILLABLE",
+               "type": "string"
+              },
+              "detail": {
+               "anyOf": [
+                {
+                 "oneOf": [
+                  {
+                   "additionalProperties": false,
+                   "properties": {
+                    "message": {
+                     "const": "Phone is invalid",
+                     "type": "string"
+                    },
+                    "reason": {
+                     "const": "INVALID_PHONE",
+                     "type": "string"
+                    }
+                   },
+                   "required": [
+                    "reason"
+                   ],
+                   "type": "object"
+                  },
+                  {
+                   "additionalProperties": false,
+                   "properties": {
+                    "message": {
+                     "const": "Select a state / province",
+                     "type": "string"
+                    },
+                    "reason": {
+                     "const": "STATE_OR_PROVINCE_REQUIRED",
+                     "type": "string"
+                    }
+                   },
+                   "required": [
+                    "reason"
+                   ],
+                   "type": "object"
+                  },
+                  {
+                   "additionalProperties": false,
+                   "properties": {
+                    "message": {
+                     "const": "Your cart has been updated and the items you added can't be shipped to your address. Remove the items to complete the order.",
+                     "type": "string"
+                    },
+                    "reason": {
+                     "const": "ITEMS_UNSHIPPABLE",
+                     "type": "string"
+                    }
+                   },
+                   "required": [
+                    "reason"
+                   ],
+                   "type": "object"
+                  },
+                  {
+                   "additionalProperties": false,
+                   "properties": {
+                    "message": {
+                     "const": "Address line 2 is required.",
+                     "type": "string"
+                    },
+                    "reason": {
+                     "const": "ADDRESS_LINE_2_REQUIRED",
+                     "type": "string"
+                    }
+                   },
+                   "required": [
+                    "reason"
+                   ],
+                   "type": "object"
+                  }
+                 ]
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
+              }
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
+            }
+           },
+           "required": [
+            "error"
+           ],
+           "title": "QuoteUnfulfillableError",
+           "type": "object"
+          },
+          {
+           "description": "Idempotency-Key was previously used with different request parameters",
+           "properties": {
+            "error": {
+             "properties": {
+              "code": {
+               "const": "IDEMPOTENT_PARAMETER_MISMATCH",
+               "type": "string"
+              },
+              "detail": {
+               "anyOf": [
+                {
+                 "additionalProperties": {},
+                 "type": "object"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
+              }
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
+            }
+           },
+           "required": [
+            "error"
+           ],
+           "title": "IdempotentParameterMismatchError",
            "type": "object"
           }
-         },
-         "required": [
-          "error"
-         ],
-         "title": "AgenticRequestRejectedError",
-         "type": "object"
+         ]
         }
        }
       },
-      "description": "The request was rejected"
+      "description": "Response for status 400"
      },
      "403": {
       "content": {
@@ -6687,6 +7452,129 @@
        }
       },
       "description": "Resource not found"
+     },
+     "409": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "anyOf": [
+          {
+           "description": "The quote has expired.",
+           "properties": {
+            "error": {
+             "properties": {
+              "code": {
+               "const": "QUOTE_EXPIRED",
+               "type": "string"
+              },
+              "detail": {
+               "anyOf": [
+                {
+                 "type": "null"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
+              }
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
+            }
+           },
+           "required": [
+            "error"
+           ],
+           "title": "QuoteExpiredError",
+           "type": "object"
+          },
+          {
+           "description": "The selected item is sold out. Choose another variant or product.",
+           "properties": {
+            "error": {
+             "properties": {
+              "code": {
+               "const": "VARIANT_UNAVAILABLE",
+               "type": "string"
+              },
+              "detail": {
+               "anyOf": [
+                {
+                 "type": "null"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
+              }
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
+            }
+           },
+           "required": [
+            "error"
+           ],
+           "title": "VariantUnavailableError",
+           "type": "object"
+          },
+          {
+           "description": "A request with this idempotency key is currently in progress",
+           "properties": {
+            "error": {
+             "properties": {
+              "code": {
+               "const": "IDEMPOTENCY_REQUEST_IN_PROGRESS",
+               "type": "string"
+              },
+              "detail": {
+               "anyOf": [
+                {
+                 "additionalProperties": {},
+                 "type": "object"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
+              }
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
+            }
+           },
+           "required": [
+            "error"
+           ],
+           "title": "IdempotencyRequestInProgressError",
+           "type": "object"
+          }
+         ]
+        }
+       }
+      },
+      "description": "Response for status 409"
      },
      "503": {
       "content": {
@@ -7105,45 +7993,87 @@
       "content": {
        "application/json": {
         "schema": {
-         "properties": {
-          "error": {
+         "anyOf": [
+          {
+           "description": "Resource not found",
            "properties": {
-            "code": {
-             "const": "AGENTIC_RESOURCE_NOT_FOUND",
-             "type": "string"
-            },
-            "detail": {
-             "anyOf": [
-              {
-               "additionalProperties": {},
-               "type": "object"
+            "error": {
+             "properties": {
+              "code": {
+               "const": "AGENTIC_RESOURCE_NOT_FOUND",
+               "type": "string"
               },
-              {
-               "type": "null"
+              "detail": {
+               "anyOf": [
+                {
+                 "additionalProperties": {},
+                 "type": "object"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
               }
-             ]
-            },
-            "message": {
-             "type": "string"
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
             }
            },
            "required": [
-            "code",
-            "message",
-            "detail"
+            "error"
            ],
+           "title": "AgenticResourceNotFoundError",
+           "type": "object"
+          },
+          {
+           "description": "Quote not found.",
+           "properties": {
+            "error": {
+             "properties": {
+              "code": {
+               "const": "QUOTE_NOT_FOUND",
+               "type": "string"
+              },
+              "detail": {
+               "anyOf": [
+                {
+                 "type": "null"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
+              }
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
+            }
+           },
+           "required": [
+            "error"
+           ],
+           "title": "QuoteNotFoundError",
            "type": "object"
           }
-         },
-         "required": [
-          "error"
-         ],
-         "title": "AgenticResourceNotFoundError",
-         "type": "object"
+         ]
         }
        }
       },
-      "description": "Resource not found"
+      "description": "Response for status 404"
      },
      "503": {
       "content": {
@@ -7518,45 +8448,156 @@
       "content": {
        "application/json": {
         "schema": {
-         "properties": {
-          "error": {
+         "anyOf": [
+          {
+           "description": "The request was rejected",
            "properties": {
-            "code": {
-             "const": "AGENTIC_REQUEST_REJECTED",
-             "type": "string"
-            },
-            "detail": {
-             "anyOf": [
-              {
-               "additionalProperties": {},
-               "type": "object"
+            "error": {
+             "properties": {
+              "code": {
+               "const": "AGENTIC_REQUEST_REJECTED",
+               "type": "string"
               },
-              {
-               "type": "null"
+              "detail": {
+               "anyOf": [
+                {
+                 "additionalProperties": {},
+                 "type": "object"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
               }
-             ]
-            },
-            "message": {
-             "type": "string"
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
             }
            },
            "required": [
-            "code",
-            "message",
-            "detail"
+            "error"
            ],
+           "title": "AgenticRequestRejectedError",
+           "type": "object"
+          },
+          {
+           "description": "Shipping option is not available.",
+           "properties": {
+            "error": {
+             "properties": {
+              "code": {
+               "const": "SHIPPING_OPTION_INVALID",
+               "type": "string"
+              },
+              "detail": {
+               "anyOf": [
+                {
+                 "oneOf": [
+                  {
+                   "additionalProperties": false,
+                   "properties": {
+                    "message": {
+                     "const": "Phone is invalid",
+                     "type": "string"
+                    },
+                    "reason": {
+                     "const": "INVALID_PHONE",
+                     "type": "string"
+                    }
+                   },
+                   "required": [
+                    "reason"
+                   ],
+                   "type": "object"
+                  },
+                  {
+                   "additionalProperties": false,
+                   "properties": {
+                    "message": {
+                     "const": "Select a state / province",
+                     "type": "string"
+                    },
+                    "reason": {
+                     "const": "STATE_OR_PROVINCE_REQUIRED",
+                     "type": "string"
+                    }
+                   },
+                   "required": [
+                    "reason"
+                   ],
+                   "type": "object"
+                  },
+                  {
+                   "additionalProperties": false,
+                   "properties": {
+                    "message": {
+                     "const": "Your cart has been updated and the items you added can't be shipped to your address. Remove the items to complete the order.",
+                     "type": "string"
+                    },
+                    "reason": {
+                     "const": "ITEMS_UNSHIPPABLE",
+                     "type": "string"
+                    }
+                   },
+                   "required": [
+                    "reason"
+                   ],
+                   "type": "object"
+                  },
+                  {
+                   "additionalProperties": false,
+                   "properties": {
+                    "message": {
+                     "const": "Address line 2 is required.",
+                     "type": "string"
+                    },
+                    "reason": {
+                     "const": "ADDRESS_LINE_2_REQUIRED",
+                     "type": "string"
+                    }
+                   },
+                   "required": [
+                    "reason"
+                   ],
+                   "type": "object"
+                  }
+                 ]
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
+              }
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
+            }
+           },
+           "required": [
+            "error"
+           ],
+           "title": "ShippingOptionInvalidError",
            "type": "object"
           }
-         },
-         "required": [
-          "error"
-         ],
-         "title": "AgenticRequestRejectedError",
-         "type": "object"
+         ]
         }
        }
       },
-      "description": "The request was rejected"
+      "description": "Response for status 400"
      },
      "403": {
       "content": {
@@ -7606,18 +8647,103 @@
       "content": {
        "application/json": {
         "schema": {
+         "anyOf": [
+          {
+           "description": "Resource not found",
+           "properties": {
+            "error": {
+             "properties": {
+              "code": {
+               "const": "AGENTIC_RESOURCE_NOT_FOUND",
+               "type": "string"
+              },
+              "detail": {
+               "anyOf": [
+                {
+                 "additionalProperties": {},
+                 "type": "object"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
+              }
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
+            }
+           },
+           "required": [
+            "error"
+           ],
+           "title": "AgenticResourceNotFoundError",
+           "type": "object"
+          },
+          {
+           "description": "Quote not found.",
+           "properties": {
+            "error": {
+             "properties": {
+              "code": {
+               "const": "QUOTE_NOT_FOUND",
+               "type": "string"
+              },
+              "detail": {
+               "anyOf": [
+                {
+                 "type": "null"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
+              }
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
+            }
+           },
+           "required": [
+            "error"
+           ],
+           "title": "QuoteNotFoundError",
+           "type": "object"
+          }
+         ]
+        }
+       }
+      },
+      "description": "Response for status 404"
+     },
+     "409": {
+      "content": {
+       "application/json": {
+        "schema": {
          "properties": {
           "error": {
            "properties": {
             "code": {
-             "const": "AGENTIC_RESOURCE_NOT_FOUND",
+             "const": "QUOTE_EXPIRED",
              "type": "string"
             },
             "detail": {
              "anyOf": [
               {
-               "additionalProperties": {},
-               "type": "object"
+               "type": "null"
               },
               {
                "type": "null"
@@ -7639,12 +8765,12 @@
          "required": [
           "error"
          ],
-         "title": "AgenticResourceNotFoundError",
+         "title": "QuoteExpiredError",
          "type": "object"
         }
        }
       },
-      "description": "Resource not found"
+      "description": "The quote has expired."
      },
      "503": {
       "content": {

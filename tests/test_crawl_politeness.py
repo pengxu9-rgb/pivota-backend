@@ -1567,3 +1567,16 @@ def test_a_non_numeric_crawl_delay_cannot_slip_past_the_cap(
     assert all(d == d for d in slept), f"a NaN must never reach a sleep: {slept}"
     reserved = cp._STATE["nan.com"].next_allowed
     assert reserved == reserved, "next_allowed is NaN — the host is now permanently unschedulable"
+
+
+def test_consecutive_blocks_reads_the_streak_note_response_keeps() -> None:
+    """The batch breaker reads this; it must be the SAME counter the backoff curve uses, keyed
+    the same way, and reset by any non-429/503 answer."""
+    assert cp.consecutive_blocks("fentybeauty.com") == 0
+    for _ in range(3):
+        cp.note_response("https://fentybeauty.com/products/x", 429)
+    assert cp.consecutive_blocks("fentybeauty.com") == 3
+    assert cp.consecutive_blocks(" FentyBeauty.com ") == 3
+    assert cp.consecutive_blocks("www.fentybeauty.com") == 0, "per host, as paced"
+    cp.note_response("https://fentybeauty.com/products/y", 200)
+    assert cp.consecutive_blocks("fentybeauty.com") == 0

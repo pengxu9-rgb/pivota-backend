@@ -1981,6 +1981,19 @@ async def _resolving_to_enrollment(
     if await _still_ours(row, worker_id) is None:
         return _lost(row)
 
+    # THE OWNER EMAIL IS REQUIRED BY THE PARTNER (spec, 2026-09-25: `ClientReferenceOwner`
+    # requires `email`). The purchase route refuses a purchase without one and the ledger keeps
+    # `buyer_email` while the purchase is in flight, so a row without it here is a row someone
+    # aged, migrated or edited. Refuse with our own code BEFORE minting an enrollment row and
+    # before the client's builder raises: a `ReapRequestError` out of `create_enrollment` would
+    # escape `advance` on every poll, and an enrollment row minted for a body we will never send
+    # is an attempt id spent on nothing.
+    if not str(row.get("buyer_email") or "").strip():
+        return await _move(
+            row, worker_id, ["resolving"], "failed",
+            last_error_code="buyer_email_missing", **evidence,
+        )
+
     # Mint OUR enrollment row FIRST: its id is the `attempt_id` the partner's idempotency key is
     # derived from, and without it a second attempt by the same buyer replays the first
     # enrollment — with its dead 15-minute link — for the rest of the day.
@@ -1991,7 +2004,7 @@ async def _resolving_to_enrollment(
         owner_id=str(row["buyer_ref"]),
         return_url=_stage_url(row.get("return_url"), "enroll"),
         attempt_id=str(ours["id"]),
-        email=row.get("buyer_email"),
+        email=str(row["buyer_email"]).strip(),
     )
     if not created.ok:
         code = str(created.error or "enrollment_create_failed")
@@ -2365,7 +2378,18 @@ async def _checkout_from_quote(
     )
     if not checkout.ok:
         detail = str(checkout.error_detail_code or "")
-        if detail == "ENROLLMENT_NOT_ACTIVE":
+        # Since the 2026-09-25 spec the checkout create's state conflicts are a 409 with the
+        # code at `error.code`; before it they were a 400 with the code at `error.detail.code`.
+        # Both spellings are read, because the partner moved the field without moving the
+        # version and a client that reads one of them is a client that stops classifying.
+        top = str(checkout.error_code or "")
+        if "QUOTE_EXPIRED" in (detail, top):
+            # The partner's word for what the P2-9 pre-check above catches on our clock: the
+            # quote died between the quote and the create. Same answer as the pre-check -- give
+            # the lease back and let the next step re-resolve and re-quote -- rather than the
+            # generic branch below, which would END the purchase over a five-minute timer.
+            return await _release(row, worker_id, error_code="quote_expired")
+        if "ENROLLMENT_NOT_ACTIVE" in (detail, top):
             # 'quoting' → 'needs_enrollment' is not a legal edge, so there is no way to send the
             # buyer back to the card page on THIS purchase. Fail with the partner's own code; the
             # owner starts a new purchase and enrolls again.
@@ -2489,7 +2513,8 @@ async def _step_checkout_poll(
         return await _complete(row, worker_id, from_state, read.data)
     if state == "failed":
         return await _move(
-            row, worker_id, [from_state], "failed", last_error_code="checkout_failed"
+            row, worker_id, [from_state], "failed",
+            last_error_code=_checkout_failed_code(row, from_state),
         )
     if state == "expired":
         if "expired" not in ledger.ALLOWED_TRANSITIONS[from_state]:
@@ -2509,6 +2534,42 @@ async def _step_checkout_poll(
         return await _release(row, worker_id, error_code=None)
     # unknown — never advances, in either state.
     return await _release(row, worker_id, error_code="unknown_checkout_status")
+
+
+#: `last_error_code` for a Reap FAILED that landed on an approval the buyer simply did not give in
+#: time. MEASURED 2026-09-25 in the sandbox: an unapproved checkout is FAILED — not EXPIRED, and
+#: never PROCESSING — 1–10 s after the QUOTE's `expiresAt` (created + 5 min), while the hosted
+#: page's own `expiresAt` still says created + 15 min. Without this code a buyer who took six
+#: minutes is reported as a failed purchase with no hint that the window lapsed.
+APPROVAL_WINDOW_LAPSED = "approval_window_lapsed"
+
+
+def _checkout_failed_code(row: Mapping[str, Any], from_state: str) -> str:
+    """The code a partner FAILED writes: `approval_window_lapsed` when the row was still waiting
+    for the buyer AND its quote had already expired at read time; `checkout_failed` otherwise.
+
+    ONLY 'awaiting_approval', and only on a quote that is genuinely in the past. A FAILED on
+    'processing' is a failure AFTER approval — the buyer did act in time — and stays
+    `checkout_failed` whatever the quote says; a quote with no recorded expiry, or one still in
+    the future, cannot be the reason the partner failed the checkout, so it is not named as one.
+    The clock is `_now()` (aware UTC) against the ledger's normalised aware value, through
+    `_parse_ts`, the same comparison the quoting step's P2-9 check makes.
+
+    A HEURISTIC, NOT A DIAGNOSIS, and the name should be read that way. The partner's FAILED
+    payload carries no reason field, so there is nothing in it to tell an unapproved checkout
+    from one the buyer approved late that then failed at the merchant. The machine already
+    admits PROCESSING can be skipped between two polls ('awaiting_approval' → 'completed' is an
+    edge), so a buyer who approves inside the last poll interval before the quote expires, whose
+    checkout then fails after it, is read here as a lapsed window. The ambiguity is one poll
+    interval wide (30 s, doubled per transport failure); the code says "most likely", never
+    "certainly".
+    """
+    if from_state != "awaiting_approval":
+        return "checkout_failed"
+    quote_expires = _parse_ts(row.get("reap_quote_expires_at"))
+    if quote_expires is None or quote_expires > _now():
+        return "checkout_failed"
+    return APPROVAL_WINDOW_LAPSED
 
 
 async def _step_awaiting_approval(row: Mapping[str, Any], worker_id: str) -> AdvanceResult:

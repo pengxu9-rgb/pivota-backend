@@ -27,6 +27,9 @@ async def test_catalog_sync_enqueues_quality_backfill(monkeypatch) -> None:
     async def _get_job(_job_id):
         return dict(job)
 
+    async def _claim(_job_id):
+        return dict(job, status="running")
+
     async def _upsert(*_a, **_k):
         return None
 
@@ -42,6 +45,7 @@ async def test_catalog_sync_enqueues_quality_backfill(monkeypatch) -> None:
         return {"job_id": "qbf_test"}
 
     monkeypatch.setattr(css, "get_catalog_sync_job", _get_job)
+    monkeypatch.setattr(css, "claim_catalog_sync_job", _claim)
     monkeypatch.setattr(css, "_upsert_by_pk", _upsert)
     monkeypatch.setattr(css, "sync_products_cache_to_catalog", _sync)
     monkeypatch.setattr(qbf, "create_quality_backfill_job", _create_quality_job)
@@ -61,6 +65,9 @@ async def test_quality_enqueue_failure_does_not_break_sync(monkeypatch) -> None:
     async def _get_job(_job_id):
         return dict(job)
 
+    async def _claim(_job_id):
+        return dict(job, status="running")
+
     async def _upsert(*_a, **_k):
         return None
 
@@ -71,6 +78,7 @@ async def test_quality_enqueue_failure_does_not_break_sync(monkeypatch) -> None:
         raise RuntimeError("quality queue down")
 
     monkeypatch.setattr(css, "get_catalog_sync_job", _get_job)
+    monkeypatch.setattr(css, "claim_catalog_sync_job", _claim)
     monkeypatch.setattr(css, "_upsert_by_pk", _upsert)
     monkeypatch.setattr(css, "sync_products_cache_to_catalog", _sync)
     monkeypatch.setattr(qbf, "create_quality_backfill_job", _boom)
@@ -84,3 +92,10 @@ def test_quality_drain_function_importable() -> None:
     # Guards the scheduler tick target (audit_scheduler imports this).
     from services.product_quality_backfill_service import process_next_quality_backfill_job
     assert callable(process_next_quality_backfill_job)
+
+
+def test_catalog_sync_drain_function_importable() -> None:
+    # The step BEFORE the quality drain: guards the other scheduler tick target,
+    # which is now the ONLY thing that runs a catalog ingest in production.
+    from services.catalog_sync_drain import run_catalog_sync_drain_tick
+    assert callable(run_catalog_sync_drain_tick)
