@@ -72,6 +72,8 @@ JWT_ROUTES = [
     "/agent/v1/analytics/queries",
     "/agent/metrics/summary",
     "/agent/metrics/timeline",
+    "/agent/metrics/recent",
+    "/agent/v1/metrics/recent",
     "/agent/debug/usage-logs",
     "/agent/debug/orders",
 ]
