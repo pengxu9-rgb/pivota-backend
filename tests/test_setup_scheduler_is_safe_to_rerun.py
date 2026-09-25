@@ -512,10 +512,10 @@ PROVEN_INGEST_ENV = {
     "CRAWL_BACKOFF_BASE_SECONDS": "15",
     "RETAILER_INGEST_LEASE_SECONDS": "4200",
     # The drain's shape, carried so a re-run cannot quietly downgrade it: back to back inside 1800s
-    # of a 3600s task, and the lane count (jobs/retailer_ingest_drain.py; 1 = one stage at a time).
+    # of a 3600s task, and the lane count (jobs/retailer_ingest_drain.py; armed at 2 on 2026-09-25).
     "RETAILER_INGEST_DRAIN_BUDGET_SECONDS": "1800",
     "RETAILER_INGEST_TASK_TIMEOUT_SECONDS": "3600",
-    "RETAILER_INGEST_MAX_LEASES": "1",
+    "RETAILER_INGEST_MAX_LEASES": "2",
     "PIVOTA_ENV": "production",
 }
 
