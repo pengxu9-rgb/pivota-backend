@@ -33,7 +33,7 @@ async def test_one_claimed_job_runs_exactly_one_stage(monkeypatch):
     async def one_job(**kw):
         return {"id": "rij_1", "status": "queued"}
 
-    async def stage(job, *, db):
+    async def stage(job, *, db, time_left_s=None):
         calls.append(job["id"])
         return {"job_id": job["id"], "outcome": "clean", "status": "apply_due"}
     monkeypatch.setattr(drain.ledger, "claim_due_job", one_job)
@@ -168,6 +168,34 @@ async def test_each_claim_leases_only_what_is_left_of_the_task(monkeypatch):
     await drain.drain_loop(lease_seconds=4200, budget_seconds=1800, db=object(), task_timeout_seconds=3600,
                            clock=Script([0, 0, 500, 1000, 1500]))
     assert leases == [4200, 2600 + drain.LEASE_SLACK_SECONDS]
+
+
+async def test_each_stage_is_told_the_time_left_in_the_task_the_lease_is_computed_from(monkeypatch):
+    seen = []
+
+    async def once(**kw):
+        seen.append((kw["time_left_s"], kw["lease_seconds"]))
+        return {"outcome": "clean", "jobs": {}}
+    monkeypatch.setattr(drain, "drain_once", once)
+    await drain.drain_loop(lease_seconds=4200, budget_seconds=1800, db=object(), task_timeout_seconds=3600,
+                           clock=Script([0, 0, 500, 1000, 1500]))
+    assert seen == [(3600, 4200), (2600, 2600 + drain.LEASE_SLACK_SECONDS)]
+
+
+async def test_the_time_left_reaches_the_stage(monkeypatch):
+    got = []
+
+    async def one_job(**kw):
+        return {"id": "rij_1", "status": "apply_due"}
+
+    async def stage(job, *, db, time_left_s=None):
+        got.append(time_left_s)
+        return {"job_id": job["id"], "outcome": "applied", "status": "done"}
+    monkeypatch.setattr(drain.ledger, "claim_due_job", one_job)
+    monkeypatch.setattr(drain.ledger, "status_counts", _counts)
+    monkeypatch.setattr(drain, "run_stage", stage)
+    await drain.drain_once(lease_seconds=60, db=object(), time_left_s=1234.5)
+    assert got == [1234.5]
 
 
 # ------------------------------------------------------------------ lanes (RETAILER_INGEST_MAX_LEASES)

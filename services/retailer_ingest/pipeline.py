@@ -9,18 +9,26 @@ Policy (Peng, 2026-09-23): a dry run with zero BLOCK flags is applied automatica
 holds the job until someone approves it (optionally excluding handles or accepting flag keys).
 The apply stage re-crawls and RE-RUNS every check before writing, so a store that changed between
 its dry run and its apply cannot slip a new row past the review.
+
+Applies at different hosts run in parallel lanes; only the catalog write (apply_ingest_plan) is
+serial, under db.retailer_ingest.catalog_write_lock. Every run records how long each phase took
+(checks.timings), so the lock wait and the write can be told apart from the crawl.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from db import retailer_ingest as ledger
+from db.retailer_ingest import CatalogWriteLockBusy, CatalogWriteLockUnavailable
 from services.retailer_ingest import detectors
+from utils.logger import logger  # prod keeps this logger's output; plain module loggers' INFO is dropped
 
 DRY_RUN = "dry_run"
 APPLY = "apply"
@@ -88,6 +96,26 @@ MAX_PDP_IDENTITY_FETCHES = 300
 DRAIN_PDP_INCI_FETCHES = 60
 MAX_PDP_INCI_FETCHES = 300
 DRAIN_PDP_INCI_BUDGET_S = 900
+# The catalog write lock (db.retailer_ingest.catalog_write_lock): an apply that has crawled and checked
+# waits at most WRITE_LOCK_WAIT_S for another apply's write to finish, polling every WRITE_LOCK_POLL_S.
+# On timeout it writes NOTHING and goes back to apply_due, retried after WRITE_LOCK_BUSY_RETRY_S without
+# spending an attempt (a busy lock is not the store's failure). The retry re-crawls and re-checks, as
+# every apply does.
+WRITE_LOCK_WAIT_S = 600
+WRITE_LOCK_POLL_S = 5
+WRITE_LOCK_BUSY_RETRY_S = 120
+# The write must finish inside the execution: the drain passes the seconds left in its task (the same
+# figure its lease is computed from), and the lock wait ends WRITE_MARGIN_S before that deadline. With
+# less than that left, the apply writes nothing and goes back to apply_due (a fresh execution retries
+# it with the whole task ahead of it) -- a write the task timeout kills is a partial cohort. A first
+# value, not a measurement: tune it from checks.timings.write_s.
+WRITE_MARGIN_S = 900
+# Outcomes that end an apply before its write with nothing written, retried quietly. After
+# WRITE_LOCK_STARVED_AFTER of them in a row the job is HELD (the held alert fires; approve re-queues it)
+# with a WARNING: a lock stuck on a dead holder, or an apply whose crawl always eats its write margin,
+# must reach a human instead of retrying unseen forever.
+WRITE_LOCK_RETRY_OUTCOMES = ("write_lock_busy", "write_lock_unavailable")
+WRITE_LOCK_STARVED_AFTER = 12
 # Integer options where 0 is meaningful ("fetch none"); every other integer option must be >= 1.
 _ZERO_ALLOWED_INT_OPTIONS = frozenset({"max_pdp_inci_fetches"})
 
@@ -572,23 +600,57 @@ async def _move(job: Dict[str, Any], *, db: Any, **fields: Any) -> bool:
     return moved
 
 
-async def run_stage(job: Dict[str, Any], *, db: Any) -> Dict[str, Any]:
+async def run_stage(job: Dict[str, Any], *, db: Any, time_left_s: Optional[float] = None) -> Dict[str, Any]:
     """Run the job's due stage and record it. Returns {job_id, stage, outcome, status, reason}
-    (+ superseded=True when an operator changed the job while the stage ran)."""
-    out = await _run_stage(job, db=db)
+    (+ superseded=True when an operator changed the job while the stage ran).
+
+    `time_left_s`: seconds left in the calling execution's task when the job was claimed (None = no
+    deadline). An apply starts its catalog write only with WRITE_MARGIN_S of it still left."""
+    deadline = None if time_left_s is None else time.monotonic() + float(time_left_s)
+    out = await _run_stage(job, db=db, deadline=deadline)
     if job.get("superseded"):
         out = {**out, "superseded": True}
     return out
 
 
-async def _run_stage(job: Dict[str, Any], *, db: Any) -> Dict[str, Any]:
+@contextlib.contextmanager
+def _timed(timings: Dict[str, float], key: str):
+    """Record the seconds the block took under `key`, also when it raised."""
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        timings[key] = round(time.monotonic() - started, 3)
+
+
+def _with_timings(checks: Any, timings: Dict[str, float], stage: str) -> Any:
+    """The run's checks with the phase timings in them (a stage that stopped before any check
+    returned records the timings alone). An apply that ends before its write keeps the
+    catalog_write=not_started evidence start_run wrote, instead of finish_run erasing it."""
+    if checks is None and (timings or stage == APPLY):
+        checks = {"timings": timings}
+    if isinstance(checks, dict):
+        checks.setdefault("timings", timings)
+        if stage == APPLY:
+            checks.setdefault("catalog_write", ledger.CATALOG_WRITE_NOT_STARTED)
+    return checks
+
+
+async def _run_stage(job: Dict[str, Any], *, db: Any, deadline: Optional[float] = None) -> Dict[str, Any]:
     stage = APPLY if job["status"] == "apply_due" else DRY_RUN
     # The previous execution was killed mid-stage (task timeout, OOM): its run never finished.
     interrupted = await ledger.unfinished_run(job["id"], db=db)
     if interrupted:
         note = "execution ended before the stage finished (task timeout or OOM)"
+        # An apply whose run was never marked write-started died in its crawl, checks or lock wait:
+        # nothing was written. Only the explicit "not_started" marker proves that; a run without any
+        # marker (started by an older image) may have been writing.
+        write_may_have_started = (interrupted["stage"] == APPLY
+                                  and interrupted.get("catalog_write") != ledger.CATALOG_WRITE_NOT_STARTED)
+        if interrupted["stage"] == APPLY and not write_may_have_started:
+            note += "; the catalog write had not started, nothing was written"
         await ledger.finish_run(interrupted["id"], outcome="interrupted", error=note, db=db)
-        if interrupted["stage"] == APPLY:
+        if write_may_have_started:
             # It may have written part of the cohort. Never re-apply blindly.
             reason = f"the previous apply was interrupted and may be partial; review before re-queueing"
             await _move(job, status="failed", run_id=interrupted["id"], reason=reason, db=db)
@@ -598,17 +660,24 @@ async def _run_stage(job: Dict[str, Any], *, db: Any) -> Dict[str, Any]:
         if attempts >= int(job.get("max_attempts") or 6):
             await _move(job, status="failed", run_id=interrupted["id"], count_attempt=True,
                         reason=f"retry budget spent: {note}", db=db)
-            return {"job_id": job["id"], "stage": DRY_RUN, "outcome": "interrupted", "status": "failed"}
+            return {"job_id": job["id"], "stage": interrupted["stage"], "outcome": "interrupted", "status": "failed"}
         await _move(job, status=job["status"], run_id=interrupted["id"], count_attempt=True,
                     next_run_at=ledger.backoff_until(attempts - 1), reason=f"retry later: {note}", db=db)
-        return {"job_id": job["id"], "stage": DRY_RUN, "outcome": "interrupted", "status": job["status"]}
+        return {"job_id": job["id"], "stage": interrupted["stage"], "outcome": "interrupted", "status": job["status"]}
     run_id = await ledger.start_run(job_id=job["id"], stage=stage,
                                     image_sha=os.getenv("PIVOTA_COMMIT_SHA") or os.getenv("IMAGE_SHA"),
                                     execution=os.getenv("CLOUD_RUN_EXECUTION"), db=db)
     result: Dict[str, Any] = {}
+    # Seconds per phase: crawl_s, check_s (every stage), write_lock_wait_s, write_s, readback_s (apply).
+    timings: Dict[str, float] = {}
     try:
-        records = await _crawl(job, stage)
-        result = await _check(job, records)
+        with _timed(timings, "crawl_s"):
+            records = await _crawl(job, stage)
+        with _timed(timings, "check_s"):
+            result = await _check(job, records)
+        result["checks"]["timings"] = timings
+        if stage == APPLY:
+            result["checks"].setdefault("catalog_write", ledger.CATALOG_WRITE_NOT_STARTED)
         summary = {"crawl": result["checks"].get("crawl"), "plan": result["checks"].get("plan"),
                    "checks": result["checks"], "flags": result["flags"]}
         if result["blocking"]:
@@ -624,9 +693,10 @@ async def _run_stage(job: Dict[str, Any], *, db: Any) -> Dict[str, Any]:
                                     reason="dry run clean; apply due", next_run_at=datetime.now(timezone.utc),
                                     db=db)
             return {"job_id": job["id"], "stage": stage, "outcome": "clean", "status": "apply_due"}
-        return await _apply(job, run_id, result, summary, db=db)
+        return await _apply(job, run_id, result, summary, timings, db=db, deadline=deadline)
     except _Stop as stop:
-        await ledger.finish_run(run_id, outcome=stop.outcome, checks=stop.checks or result.get("checks"),
+        await ledger.finish_run(run_id, outcome=stop.outcome,
+                                checks=_with_timings(stop.checks or result.get("checks"), timings, stage),
                                 flags=result.get("flags"), error=stop.reason, db=db)
         await _move(job, status=stop.status, run_id=run_id, reason=stop.reason,
                                 next_run_at=stop.next_run_at, count_attempt=stop.count_attempt, db=db)
@@ -634,23 +704,73 @@ async def _run_stage(job: Dict[str, Any], *, db: Any) -> Dict[str, Any]:
                 "reason": stop.reason}
     except Exception as exc:  # noqa: BLE001 -- recorded, then re-raised so the job execution fails loudly
         reason = f"{type(exc).__name__}: {exc}"
-        await ledger.finish_run(run_id, outcome="error", checks=result.get("checks"), error=reason, db=db)
+        await ledger.finish_run(run_id, outcome="error", checks=_with_timings(result.get("checks"), timings, stage),
+                                error=reason, db=db)
         await _move(job, status="failed", run_id=run_id, reason=reason[:2000], db=db)
         raise
 
 
+async def _write_not_started(job: Dict[str, Any], outcome: str, why: str, *, db: Any) -> _Stop:
+    """The stop for an apply that ends before its catalog write, nothing written: back to apply_due
+    shortly, no attempt spent -- unless this is the WRITE_LOCK_STARVED_AFTER-th such end in a row, which
+    holds the job for a human (and says so at WARNING)."""
+    streak = await ledger.consecutive_outcomes(job["id"], WRITE_LOCK_RETRY_OUTCOMES,
+                                               limit=WRITE_LOCK_STARVED_AFTER, db=db) + 1
+    if streak >= WRITE_LOCK_STARVED_AFTER:
+        logger.warning("retailer_ingest: job %s (%s) ended %d applies in a row before its catalog write "
+                       "(last: %s); held for review, nothing written", job["id"], job.get("domain"), streak, why)
+        return _Stop("write_lock_starved", "held",
+                     f"{streak} applies in a row ended before the catalog write, nothing written (last: {why}); "
+                     f"check for a stuck catalog write lock or a crawl that leaves no time to write, then approve "
+                     f"to retry", count_attempt=False)
+    return _Stop(outcome, "apply_due", f"{why}; nothing written, retry in {WRITE_LOCK_BUSY_RETRY_S}s",
+                 next_run_at=datetime.now(timezone.utc) + timedelta(seconds=WRITE_LOCK_BUSY_RETRY_S),
+                 count_attempt=False)
+
+
 async def _apply(job: Dict[str, Any], run_id: str, result: Dict[str, Any], summary: Dict[str, Any],
-                 *, db: Any) -> Dict[str, Any]:
+                 timings: Dict[str, float], *, db: Any, deadline: Optional[float] = None) -> Dict[str, Any]:
     from scripts.curated_apply_gate import evaluate_apply_log
     from services.catalog_enrichment_agent.apply import apply_ingest_plan
     from services.catalog_enrichment_agent.primary_ingestion import require_primary_apply, require_primary_plan
 
     plan = result["plan"]
     preflight = require_primary_plan(plan)
+    waiting = time.monotonic()
+    # Wait no longer than leaves WRITE_MARGIN_S of the task for the write itself.
+    wait_s = float(WRITE_LOCK_WAIT_S)
+    if deadline is not None:
+        wait_s = min(wait_s, deadline - waiting - WRITE_MARGIN_S)
+    if wait_s <= 0:
+        timings["write_lock_wait_s"] = 0.0
+        raise await _write_not_started(
+            job, "write_lock_busy",
+            f"no time left in this execution for the catalog write ({deadline - waiting:.0f}s left, "
+            f"{WRITE_MARGIN_S}s needed)", db=db)
     try:
-        counts = await apply_ingest_plan(plan, batch_label=f"retailer_ingest:{job['id']}", db=db,
-                                         primary_readiness=True)
+        # The ONLY catalog write of the stage, and the only part serialized across lanes: the crawl and
+        # checks above ran unlocked. The lock is released when this block exits, however it exits.
+        async with ledger.catalog_write_lock(wait_s=wait_s, poll_s=WRITE_LOCK_POLL_S) as waited:
+            timings["write_lock_wait_s"] = round(waited, 3)
+            # Durable BEFORE the first catalog write: an execution killed from here on is "may be
+            # partial"; one killed before it (crawl, checks, lock wait) is retried, nothing written.
+            await ledger.mark_write_started(run_id, db=db)
+            result["checks"]["catalog_write"] = ledger.CATALOG_WRITE_STARTED  # kept when the run finishes
+            with _timed(timings, "write_s"):
+                counts = await apply_ingest_plan(plan, batch_label=f"retailer_ingest:{job['id']}", db=db,
+                                                 primary_readiness=True)
         report = require_primary_apply(preflight, counts)
+    except CatalogWriteLockBusy as busy:
+        timings["write_lock_wait_s"] = round(time.monotonic() - waiting, 3)
+        raise await _write_not_started(
+            job, "write_lock_busy",
+            f"catalog write lock busy for {busy.waited_s:.0f}s (another apply is writing)", db=db) from busy
+    except CatalogWriteLockUnavailable as unavailable:
+        # Opening the lock connection or a try-lock failed: the lock was never held, nothing written.
+        timings["write_lock_wait_s"] = round(time.monotonic() - waiting, 3)
+        raise await _write_not_started(
+            job, "write_lock_unavailable",
+            f"catalog write lock unavailable ({unavailable.error_type})", db=db) from unavailable
     except ValueError as exc:
         # A refused apply may have written part of the cohort: failed, never retried blindly.
         report = getattr(exc, "report", None) or getattr(getattr(exc, "__cause__", None), "report", None)
@@ -664,8 +784,10 @@ async def _apply(job: Dict[str, Any], run_id: str, result: Dict[str, Any], summa
     gate = evaluate_apply_log("primary ingestion: " + json.dumps(report, default=str) + "\nJOB=pipeline RC=0",
                               domain=job["domain"])
     currency = (job.get("options") or {}).get("require_currency") or "USD"
-    readback = await _readback(gate.get("product_keys") or [], currency, db,
-                               planned_images={p.get("product_key"): bool(p.get("image_url")) for p in plan.get("pdps") or []})
+    with _timed(timings, "readback_s"):
+        readback = await _readback(gate.get("product_keys") or [], currency, db,
+                                   planned_images={p.get("product_key"): bool(p.get("image_url"))
+                                                   for p in plan.get("pdps") or []})
     ok = bool(gate.get("ok")) and readback["ok"]
     outcome = "applied" if ok else ("gate_failed" if not gate.get("ok") else "readback_failed")
     await ledger.finish_run(run_id, outcome=outcome, **summary, applied={"gate": gate}, readback=readback,

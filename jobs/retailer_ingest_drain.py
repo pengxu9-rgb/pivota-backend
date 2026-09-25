@@ -13,8 +13,12 @@ LANES, when RETAILER_INGEST_MAX_LEASES > 1 (default 1; ceiling db.retailer_inges
 2026-09-24: a K-beauty dry run spends 35 minutes on 200 paced PDP fetches at ONE host, and with a
 single lane every other store waited behind it (~2 stages/hour, 26 queued). The */10 executions
 already overlap (task timeout 3600s); a claim now lets up to N of them hold a lease at once, but
-never two at the same host (lowercased, "www." dropped, whatever the cohort shape) and never two
-applies (catalog writes stay serial). Each lane is its own execution with its own DB pool
+never two at the same host (lowercased, "www." dropped, whatever the cohort shape). Two applies at
+different hosts may run at once (2026-09-25: an apply's re-crawl + checks took 244-2310 s, and one
+apply at a time left 20 jobs waiting in apply_due); only their catalog WRITES are serial, under
+db.retailer_ingest.catalog_write_lock (an apply that cannot get it within
+pipeline.WRITE_LOCK_WAIT_S, or before pipeline.WRITE_MARGIN_S of this task is left, writes nothing and
+returns to apply_due, outcome write_lock_busy). Each lane is its own execution with its own DB pool
 (DB_POOL_MAX_SIZE, 3 in prod), so N lanes hold up to 3N connections. Host exclusivity does NOT bound
 the total request rate from the one crawl NAT (pacing is per host, per process): N lanes are N times
 the traffic, so arm at 2 and watch crawl_throttled before going higher. A throttled crawl ends only
@@ -43,7 +47,7 @@ import json
 import logging
 import os
 import time
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 from db.database import database
 from db import retailer_ingest as ledger
@@ -55,12 +59,15 @@ logger = logging.getLogger(__name__)
 SUMMARY_MARKER = "retailer_ingest_drain: "
 
 
-async def drain_once(*, lease_seconds: int, max_leases: int = 1, db: Any = None) -> Dict[str, Any]:
+async def drain_once(*, lease_seconds: int, max_leases: int = 1, db: Any = None,
+                     time_left_s: Optional[float] = None) -> Dict[str, Any]:
     """One stage, plus the lane's job counts by status on every execution -- including idle ones --
-    so a store held for review raises a signal even while nothing is being claimed."""
+    so a store held for review raises a signal even while nothing is being claimed. `time_left_s`
+    (seconds left in this task) reaches the stage, so an apply never starts a catalog write the task
+    timeout would cut short."""
     db = db or database
     job = await ledger.claim_due_job(lease_seconds=lease_seconds, max_leases=max_leases, db=db)
-    summary = {"outcome": "idle"} if not job else await run_stage(job, db=db)
+    summary = {"outcome": "idle"} if not job else await run_stage(job, db=db, time_left_s=time_left_s)
     summary["jobs"] = await ledger.status_counts(db=db)
     return summary
 
@@ -84,8 +91,10 @@ async def drain_loop(*, lease_seconds: int, budget_seconds: int, db: Any = None,
         began = clock()
         # The lease covers what is left of THIS task (+ slack), not a fixed 70 minutes from each claim:
         # a stage killed at the task timeout 50 minutes in must not block the lane for another hour.
-        lease = min(lease_seconds, int(max(0.0, task_timeout_seconds - (began - start))) + LEASE_SLACK_SECONDS)
-        summary = await drain_once(lease_seconds=lease, max_leases=max_leases, db=db)
+        # The time left in THIS task: the lease and the stage's catalog-write deadline both come from it.
+        time_left = max(0.0, task_timeout_seconds - (began - start))
+        lease = min(lease_seconds, int(time_left) + LEASE_SLACK_SECONDS)
+        summary = await drain_once(lease_seconds=lease, max_leases=max_leases, db=db, time_left_s=time_left)
         ended = clock()
         # Logged per stage so the budget/timeout margin can be tuned from data, not guessed.
         summary["duration_s"] = round(ended - began, 1)
