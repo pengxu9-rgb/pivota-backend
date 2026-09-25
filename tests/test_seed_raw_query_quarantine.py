@@ -31,7 +31,10 @@ import sqlite3
 
 import pytest
 
-from services.external_seed_search import build_seed_quarantine_anti_join
+from services.external_seed_search import (
+    EXTERNAL_SEED_SERVING_SELECT_LIST,
+    build_seed_quarantine_anti_join,
+)
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 
@@ -68,6 +71,11 @@ def _render_seed_queries(relpath: str) -> list[tuple[int, str]]:
                 src = ast.unparse(v.value)
                 if "_seed_quarantine_clause" in src:
                     parts.append(build_seed_quarantine_anti_join())
+                elif "_EXTERNAL_SEED_SERVING_SELECT_LIST" in src:
+                    # The shared serving column list is the SELECT list, not a
+                    # predicate: render it for real (the fixture table carries
+                    # every column it names), so `r[0]` is still the seed id.
+                    parts.append(EXTERNAL_SEED_SERVING_SELECT_LIST)
                 else:
                     # The route's own predicates (`' OR '.join(title_clauses)`,
                     # `brand_clause`, …). Neutralised to always-true rather than
@@ -89,7 +97,9 @@ def _sqlite_with(seed_domains, quarantines=()):
         " utm_template TEXT, partner_type TEXT, disclosure_text TEXT,"
         " destination_url TEXT, canonical_url TEXT, title TEXT, image_url TEXT,"
         " availability TEXT, notes TEXT, created_by_employee_id TEXT,"
-        " seller_ref TEXT, seed_kind TEXT, created_at TEXT, updated_at TEXT)"
+        " seller_ref TEXT, seed_kind TEXT,"
+        " destination_checked_at TEXT, destination_http_status INTEGER, destination_verdict TEXT,"
+        " destination_failure_streak INTEGER DEFAULT 0, created_at TEXT, updated_at TEXT)"
     )
     conn.execute(
         "CREATE TABLE catalog_source_quarantine (quarantine_id INTEGER, match_type TEXT,"
