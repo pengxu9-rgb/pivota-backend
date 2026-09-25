@@ -17,7 +17,7 @@ import logging
 import time
 import math
 import re
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 from urllib.parse import parse_qsl, urlencode, urlunparse
 from datetime import datetime, timezone, timedelta
 
@@ -4452,18 +4452,80 @@ async def update_external_seed(
     return {"status": "success", "projected": projected}
 
 
+def _destination_key(url: Optional[str]) -> Optional[Tuple[Any, ...]]:
+    text = str(url or "").strip().rstrip("/")
+    if not text:
+        return None
+    try:
+        parts = urlsplit(text)
+        port = parts.port
+    except ValueError:
+        return (text,)
+    host = (parts.hostname or "").lower()
+    if not host:
+        return (text,)
+    if host.startswith("www."):
+        host = host[len("www."):]
+    return (parts.scheme.lower(), host, port, parts.path.rstrip("/"), parts.query, parts.fragment)
+
+
 def _same_destination(fetched: Optional[str], served: Optional[str]) -> bool:
     """Is the URL this refresh fetched the same one the serving lane hands out?
 
     Compared after trimming and dropping a trailing slash — the two columns are written by
     different code paths and differ cosmetically far more often than they differ in substance.
-    Anything beyond that (query-string order, case) is deliberately NOT normalised: on a
-    storefront a differing query string can select a different variant, so treating those as
-    the same URL would reintroduce exactly the mis-attribution this guard exists to prevent.
+    The HOST is compared case-insensitively and without a leading `www.`: the refresh writes
+    `canonical_url` from the page it fetched, and a store whose canonical tag names `www.`
+    turned a bare-domain `destination_url` into a permanent mismatch -- every later refresh
+    was `not_read`, so the row could never be re-read again. Measured 2026-09-26: 200
+    gate-fresh seeds (all 182 dodoskin rows, 8 eyurs incl. the Round Lab sunscreen whose stale
+    16.0 started #2340). Everything else -- scheme, port, path, query, fragment -- is
+    deliberately NOT normalised: on a storefront a differing query string can select a
+    different variant, and a different path is a different product (fenty's canonical names a
+    sibling shade's handle), so treating those as the same URL would reintroduce exactly the
+    mis-attribution this guard exists to prevent.
     """
-    a = str(fetched or "").strip().rstrip("/")
-    b = str(served or "").strip().rstrip("/")
-    return bool(a) and a == b
+    a = _destination_key(fetched)
+    return a is not None and a == _destination_key(served)
+
+
+def _read_the_served_product(
+    row: Dict[str, Any], dest: Optional[str], observed: Dict[str, Any]
+) -> Tuple[Optional["destination_liveness.DestinationObservation"], bool]:
+    """(observation, did this fetch actually read the product page we serve?)
+
+    ONE RULE for the refresh and for anything that previews it
+    (`scripts/ops/refresh_seeds_with_unverified_variants.py --simulate`). The preview used to
+    fetch `canonical_url` and skip this check, so it reported writes the refresh then refused
+    (eyurs, fenty) -- a preview that disagrees with the thing it previews is worse than none.
+
+    `status_code is not None` ALONE IS NOT A READING, and three separate cases prove it:
+      * `from_cache` -- `_fetch_html` stamps `observed` BEFORE returning, so a failure after
+        the response (extractor, snapshot upsert, post-write re-read) hands back the CACHED
+        row with `status_code` set. `resolve_external_offer` now says so explicitly.
+      * `final_url` -- a 301 onto a collection, or onto a DIFFERENT product handle, answers
+        200 for a page that is not the one we serve. Only the verdict looks at where the
+        request ended; `_same_destination` compares two STORED urls and cannot see it.
+      * `bot_challenged` -- a cf-mitigated 200 is `unverifiable`, and the liveness writer
+        already refuses to stamp `destination_checked_at` for it. Anything claiming parity
+        with that column has to refuse for the same reason.
+    """
+    observation = None
+    if observed.get("status_code") is not None and _same_destination(
+        dest, destination_liveness.destination_of(row)
+    ):
+        observation = destination_liveness.classify_destination(
+            requested_url=str(dest),
+            status_code=int(observed["status_code"]),
+            final_url=observed.get("final_url"),
+            bot_challenged=bool(observed.get("bot_challenged")),
+        )
+    read = (
+        observation is not None
+        and observation.verdict == destination_liveness.VERDICT_LIVE
+        and not observed.get("from_cache")
+    )
+    return observation, read
 
 
 # A price reading that we actually STORED. `unavailable` means we read no price at all, and
@@ -5214,35 +5276,12 @@ async def _refresh_external_seed_by_id(
     # The success path then runs normally. `observed["status_code"]` is the only proof that
     # anything actually left the process -- and `_same_destination` is the only proof it went
     # to the URL we serve rather than a legacy `destination_url` we do not.
-    served_url = destination_liveness.destination_of(row)
     # ONE CLASSIFICATION, read three times: the freshness stamp, the staleness gate, and the
-    # liveness verdict below all derive from THIS. `classify_destination` is pure, so hoisting
-    # it costs nothing and removes the twin-implementation drift this file keeps paying for.
-    #
-    # `status_code is not None` ALONE IS NOT A READING, and three separate cases prove it:
-    #   * `from_cache` -- `_fetch_html` stamps `observed` BEFORE returning, so a failure after
-    #     the response (extractor, snapshot upsert, post-write re-read) hands back the CACHED
-    #     row with `status_code` set. `resolve_external_offer` now says so explicitly.
-    #   * `final_url` -- a 301 onto a collection, or onto a DIFFERENT product handle, answers
-    #     200 for a page that is not the one we serve. Only the verdict looks at where the
-    #     request ended; `_same_destination` compares two STORED urls and cannot see it.
-    #   * `bot_challenged` -- a cf-mitigated 200 is `unverifiable`, and the liveness writer
-    #     already refuses to stamp `destination_checked_at` for it. Anything claiming parity
-    #     with that column has to refuse for the same reason.
+    # liveness verdict below all derive from THIS (see `_read_the_served_product` for why a
+    # status code alone is not a reading). `classify_destination` is pure, so hoisting it costs
+    # nothing and removes the twin-implementation drift this file keeps paying for.
     served_url = destination_liveness.destination_of(row)
-    observation = None
-    if observed.get("status_code") is not None and _same_destination(dest, served_url):
-        observation = destination_liveness.classify_destination(
-            requested_url=dest,
-            status_code=int(observed["status_code"]),
-            final_url=observed.get("final_url"),
-            bot_challenged=bool(observed.get("bot_challenged")),
-        )
-    read_the_served_product = (
-        observation is not None
-        and observation.verdict == destination_liveness.VERDICT_LIVE
-        and not observed.get("from_cache")
-    )
+    observation, read_the_served_product = _read_the_served_product(row, dest, observed)
 
     # CLEAR THE BLOCKER THIS REFRESH IS THE RECOMMENDED FIX FOR.
     #

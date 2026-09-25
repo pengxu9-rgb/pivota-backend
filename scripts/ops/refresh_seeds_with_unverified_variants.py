@@ -26,8 +26,11 @@ THREE MODES, in the order to run them:
     SUBNET=pivota-crawl scripts/ops/run_oneoff_job.sh \
         scripts/ops/refresh_seeds_with_unverified_variants.py --cohort drift --apply
 
-`--simulate` approximates the column decision (a positive price in the row's own currency);
-the refresh's full rules live in `routes/employee_products._refresh_external_seed_by_id`.
+`--simulate` fetches the same URL the refresh does and applies the refresh's own "did we read
+the served product" rule (`_read_the_served_product`); a row it cannot read is `not_read`,
+exactly as `--apply` would leave it. It approximates only the column decision (a positive
+price in the row's own currency); the full rules live in
+`routes/employee_products._refresh_external_seed_by_id`.
 
 Must run on an image that CONTAINS the fix; on an older image `--apply` re-stamps the same
 unearned freshness. The script refuses to apply when the refresh it imports has no
@@ -101,8 +104,16 @@ async def _simulate(row_id: str) -> Dict[str, Any]:
     row = await database.fetch_one("SELECT * FROM external_product_seeds WHERE id = :id", {"id": row_id})
     row = dict(row)
     seed_data = ep._ensure_json_obj(row.get("seed_data"))
-    url = _normalize_url(str(row.get("canonical_url") or row.get("destination_url")))
-    html, _ = await _fetch_html(url, max_wait=0)
+    # The SAME url the refresh fetches (`destination_url`), and the SAME rule for whether that
+    # fetch read the product we serve. Fetching `canonical_url` instead made this preview
+    # report writes the refresh then refused (eyurs, fenty; see `_read_the_served_product`).
+    dest = row.get("destination_url")
+    url = _normalize_url(str(dest))
+    observed: Dict[str, Any] = {}
+    html, _ = await _fetch_html(url, observed=observed, max_wait=0)
+    _, read = ep._read_the_served_product(row, dest, observed)
+    if not read:
+        return {"status": "not_read", "replaced": [], "not_re_read_count": 0}
     extracted = _extract_from_html(url, html)
     fields = evidence_variant_fields(extracted)
     market = str(row.get("market") or "US").upper()
@@ -154,7 +165,10 @@ async def _run(args: argparse.Namespace) -> Dict[str, Any]:
                 except Exception as exc:  # noqa: BLE001 - one unreachable page must not end the preview
                     outcomes_sim[f"{row['cohort']}:error:{type(exc).__name__}"] += 1
                     continue
-                verdict = "all_re_read" if not report["not_re_read_count"] else "not_all_re_read"
+                verdict = (
+                    report.get("status")
+                    or ("all_re_read" if not report["not_re_read_count"] else "not_all_re_read")
+                )
                 outcomes_sim[f"{row['cohort']}:{verdict}:{'writes' if report['replaced'] else 'no_write'}"] += 1
                 if report["replaced"] and len(samples) < 40:
                     samples.append({"id": row["id"], "replaced": report["replaced"][:3]})
