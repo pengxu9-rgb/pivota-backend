@@ -46,7 +46,7 @@ NEXT_STEP_SENTENCE = (
     "Your assistant will confirm the next step \u2014 saving your card or placing the order "
     "\u2014 once it is settled; nothing is charged without your approval on Reap's page."
 )
-IGNORE_SENTENCE = "If you did not approve anything, you can ignore this page."
+IGNORE_SENTENCE = "If you did not approve or save anything, you can ignore this page."
 
 _HTML = f"""<!doctype html>
 <html lang="en">
@@ -80,10 +80,13 @@ p{{margin:0 0 1rem}}
 #: Encoded ONCE. The handler returns these bytes and nothing derived from the request.
 _BODY = _HTML.encode("utf-8")
 
-#: `frame-ancestors 'none'` on top of the brief's two directives: a route that sets its own CSP
-#: replaces SecurityHeadersMiddleware's default (`default-src 'none'; frame-ancestors 'none'`)
-#: rather than merging with it, so leaving it out would make this the one page on the API host
-#: that may be framed.
+#: `frame-ancestors 'none'` on top of the brief's two directives. A route that sets its own CSP
+#: REPLACES SecurityHeadersMiddleware's default (`default-src 'none'; frame-ancestors 'none'`)
+#: rather than merging with it. The middleware would still add `X-Frame-Options: DENY`, but that
+#: is not enough on its own: a CSP-aware browser that sees a CSP with a `frame-ancestors`
+#: directive lets it OVERRIDE X-Frame-Options, so this directive is the framing control that
+#: actually binds, and weakening it (dropping it, or `frame-ancestors *`) would matter even with
+#: DENY present. Pinned verbatim by tests/test_reap_return_page.py.
 CONTENT_SECURITY_POLICY = "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'"
 
 _HEADERS = {

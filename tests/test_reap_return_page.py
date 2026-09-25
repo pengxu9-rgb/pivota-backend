@@ -57,7 +57,7 @@ SENTENCES = (
     "Reap has received your response and you can close this window.",
     "Your assistant will confirm the next step \u2014 saving your card or placing the order "
     "\u2014 once it is settled; nothing is charged without your approval on Reap's page.",
-    "If you did not approve anything, you can ignore this page.",
+    "If you did not approve or save anything, you can ignore this page.",
 )
 
 #: Wording that is true after only ONE of the two steps. None of it may come back.
@@ -99,8 +99,22 @@ def app(request):
     return _router_app() if request.param == "router_app" else real_app
 
 
+#: THE EXACT CSP, written out rather than imported from the module (a test that took its
+#: expectation from the code under test could not notice both changing). Pinned verbatim on BOTH
+#: apps: on the real app SecurityHeadersMiddleware only sets a CSP when the route set none, so a
+#: route-level CSP is the whole policy the browser sees.
+EXPECTED_CSP = "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'"
+
+
 def _assert_css_only_csp(value: str) -> None:
+    assert value == EXPECTED_CSP, value
     directives = {d.strip() for d in value.split(";") if d.strip()}
+    # Named on its own as well as inside the exact string: a CSP-aware browser lets a CSP
+    # `frame-ancestors` OVERRIDE `X-Frame-Options: DENY`, so this directive is the framing
+    # control that binds. Dropped, or widened to `frame-ancestors *`, the page can be framed.
+    assert "frame-ancestors 'none'" in directives, value
+    assert not any(d.startswith("frame-ancestors") and d != "frame-ancestors 'none'"
+                   for d in directives), value
     assert "default-src 'none'" in directives, value
     assert "style-src 'unsafe-inline'" in directives, value
     # Nothing may re-open script, images, fonts, connections or forms.
