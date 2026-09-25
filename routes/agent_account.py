@@ -892,6 +892,26 @@ async def register_agent(data: AgentRegisterRequest, http_request: Request):
         )
 
 
+async def _is_active_staff_account(user) -> bool:
+    """Whether a non-agent users row is staff whose role an employee sync rewrote.
+
+    users holds ONE role per email, and an employee-portal login or reset rewrites it
+    to the employee role (routes/auth._sync_employee_auth_user), so an agent owner who
+    is also staff stops being role='agent' while still owning the agent. That is the
+    only rewrite admitted: the email must be a staff role AND an active employees row,
+    both of which only admins set. Owning the agents row alone is NOT enough, because a
+    merchant can move their own login email onto an unclaimed agent owner_email
+    (PUT /merchant/profile) and would then log in as that agent; and an admin moving
+    an email off role='agent' (admin_fix_merchant) must keep revoking the portal.
+    """
+    from routes.auth import EMPLOYEE_AUTH_ROLES, _fetch_active_employee_identity
+
+    role = (user["role"] or "").strip().lower()
+    if role not in EMPLOYEE_AUTH_ROLES:
+        return False
+    return bool(await _fetch_active_employee_identity(user["email"]))
+
+
 @router.post("/login", response_model=AgentLoginResponse)
 async def login_agent(data: AgentLoginRequest):
     """Agent login"""
@@ -905,17 +925,15 @@ async def login_agent(data: AgentLoginRequest):
         
         if not user:
             raise HTTPException(status_code=401, detail="Invalid email or password")
-        
-        if user["role"] != "agent":
-            raise HTTPException(status_code=403, detail="This login is for agents only")
-        
-        if not user["active"]:
-            raise HTTPException(status_code=403, detail="Account is deactivated")
-        
-        # 2. Verify password
+
+        # 2. Verify password before saying anything about the account, so a wrong
+        # password cannot learn its role or status.
         if not verify_password(data.password, user["password_hash"]):
             raise HTTPException(status_code=401, detail="Invalid email or password")
-        
+
+        if not user["active"]:
+            raise HTTPException(status_code=403, detail="Account is deactivated")
+
         # 3. Get agent record
         agent = await database.fetch_one(
             """
@@ -925,7 +943,9 @@ async def login_agent(data: AgentLoginRequest):
             """,
             {"email": email}
         )
-        
+
+        if user["role"] != "agent" and not (agent and await _is_active_staff_account(user)):
+            raise HTTPException(status_code=403, detail="This login is for agents only")
         if not agent:
             raise HTTPException(status_code=404, detail="Agent record not found")
         
