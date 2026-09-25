@@ -90,8 +90,9 @@ class FakeLedger:
         self.calls.append(("recent_runs", limit))
         return copy.deepcopy(self.recent[:limit])
 
-    async def approve(self, job_id, *, approved_by, exclude_handles, accepted_flags, db=None):
+    async def approve(self, job_id, *, approved_by, exclude_handles, accepted_flags, refile_handles=None, db=None):
         self.calls.append(("approve", job_id, approved_by, list(exclude_handles), list(accepted_flags)))
+        self.refiles = list(refile_handles or [])
         job = self.jobs.get(job_id)
         if not job or job["status"] != "held":
             return False
@@ -352,6 +353,10 @@ async def test_approving_an_unknown_job_is_404(fake):
     {"accepted_flags": [f"k{i}" for i in range(101)]},
     {"exclude_handles": ["x" * 513]},
     {"exclude_handles": [], "approve_everything": True},
+    {"refile_handles": [""]},
+    {"refile_handles": "one-handle"},
+    {"refile_handles": [f"h{i}" for i in range(101)]},
+    {"refile_handles": ["duo-set"], "exclude_handles": ["Duo-Set/"]},  # re-filed AND excluded
 ])
 async def test_approve_refuses_a_malformed_body(fake, body):
     resp = await _send(_app(), "POST", "/admin/retailer-ingest/jobs/rij_held/approve", body)
@@ -501,3 +506,12 @@ async def test_enqueue_uses_the_cli_validator_not_a_copy(fake, monkeypatch):
     monkeypatch.setitem(pipeline._OPTION_TYPES, "brand_new_option", int)
     monkeypatch.setattr(enqueue_script, "_ALLOWED", enqueue_script._ALLOWED | {"brand_new_option"})
     assert (await _send(_app(), "POST", "/admin/retailer-ingest/jobs", body)).status_code == 200
+
+
+async def test_approve_passes_refile_handles_to_the_ledger(fake):
+    _held_run(fake, "placed_by_lip_title:soft-matte")
+    resp = await _send(_app(), "POST", "/admin/retailer-ingest/jobs/rij_held/approve",
+                       {"refile_handles": [" cream-duo-gift-set "], "accepted_flags": []})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["refile_handles"] == ["cream-duo-gift-set"]
+    assert fake.refiles == ["cream-duo-gift-set"]

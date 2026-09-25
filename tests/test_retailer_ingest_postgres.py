@@ -71,7 +71,27 @@ async def test_reenqueueing_an_open_cohort_is_a_no_op(db):
 
 async def test_approval_bookkeeping_is_not_scope(db):
     assert ledger.scope_key(DOMAIN, "3CE", OPTIONS) == ledger.scope_key(
-        DOMAIN, "3CE", {**OPTIONS, "exclude_handles": ["x"], "accepted_flags": ["k"]})
+        DOMAIN, "3CE", {**OPTIONS, "exclude_handles": ["x"], "accepted_flags": ["k"], "refile_to_sets": ["s"]})
+
+
+async def test_approval_merges_refiles_next_to_exclusions(db):
+    job_id = await _enqueue(db, brand="REFILE", options={"vendors": ["X"], "refile_to_sets": ["a-set"]})
+    await ledger.transition(job_id, status="held", reason="flag", run_id=None, db=db)
+    assert await ledger.approve(job_id, approved_by="peng", exclude_handles=["x"], accepted_flags=[],
+                                refile_handles=["b-duo"], db=db)
+    row = await db.fetch_one("SELECT options FROM retailer_ingest_jobs WHERE id=:id", {"id": job_id})
+    import json as _json
+    options = row["options"] if isinstance(row["options"], dict) else _json.loads(row["options"])
+    assert options["refile_to_sets"] == ["a-set", "b-duo"] and options["exclude_handles"] == ["x"]
+    # an approval that names no re-file does not write the key (an older drain refuses it as unknown)
+    job2 = await _enqueue(db, brand="NOREFILE", options={"vendors": ["X"]})
+    await ledger.transition(job2, status="held", reason="flag", run_id=None, db=db)
+    assert await ledger.approve(job2, approved_by="peng", exclude_handles=[], accepted_flags=[], db=db)
+    row = await db.fetch_one("SELECT options FROM retailer_ingest_jobs WHERE id=:id", {"id": job2})
+    options = row["options"] if isinstance(row["options"], dict) else _json.loads(row["options"])
+    assert "refile_to_sets" not in options
+    with pytest.raises(ValueError):
+        await ledger.approve(job2, approved_by="peng", exclude_handles=[], accepted_flags=[], refile_handles=[" "], db=db)
 
 
 async def test_one_claim_per_due_job_and_an_expired_lease_is_reclaimed(db):

@@ -35,7 +35,7 @@ def scope_key(domain: str, brand: str, options: Dict[str, Any]) -> str:
     """One open job per (host, brand, scope). Operator bookkeeping (approvals, accepted flags,
     exclusions added at review) is NOT scope: approving a job must not let a duplicate enqueue."""
     scope = {k: v for k, v in (options or {}).items()
-             if k not in {"accepted_flags", "exclude_handles", "notes"}}
+             if k not in {"accepted_flags", "exclude_handles", "refile_to_sets", "notes"}}
     raw = json.dumps({"domain": domain.strip().lower(), "brand": brand.strip(), "scope": scope},
                      sort_keys=True, ensure_ascii=False, default=str)
     return f"rij:{domain.strip().lower()}:{hashlib.sha256(raw.encode()).hexdigest()[:24]}"
@@ -207,11 +207,15 @@ async def transition(job_id: str, *, status: str, reason: Optional[str], run_id:
 
 
 async def approve(job_id: str, *, approved_by: str, exclude_handles: List[str],
-                  accepted_flags: List[str], db: Any = None) -> bool:
+                  accepted_flags: List[str], refile_handles: Optional[List[str]] = None,
+                  db: Any = None) -> bool:
     """held -> apply_due, recording who approved and which rows/flags the approval covers.
     The apply re-runs every check; only the exclusions and accepted flag keys named here change
-    its verdict, so an approval cannot wave through a flag that appears later."""
-    for name, values in (("exclude_handles", exclude_handles), ("accepted_flags", accepted_flags)):
+    its verdict, so an approval cannot wave through a flag that appears later. `refile_handles` are
+    bundles re-filed to the gift-set shelf instead of excluded (options.refile_to_sets)."""
+    refile_handles = [] if refile_handles is None else refile_handles
+    for name, values in (("exclude_handles", exclude_handles), ("accepted_flags", accepted_flags),
+                         ("refile_handles", refile_handles)):
         if not isinstance(values, (list, tuple)) or not all(isinstance(v, str) and v.strip() for v in values):
             raise ValueError(f"{name} must be a list of non-empty strings")
     if not str(approved_by or "").strip():
@@ -227,13 +231,21 @@ async def approve(job_id: str, *, approved_by: str, exclude_handles: List[str],
                          THEN options->'exclude_handles' ELSE '[]'::jsonb END) || CAST(:excl AS jsonb))
               || jsonb_build_object('accepted_flags',
                    (CASE WHEN jsonb_typeof(options->'accepted_flags') = 'array'
-                         THEN options->'accepted_flags' ELSE '[]'::jsonb END) || CAST(:acc AS jsonb)),
+                         THEN options->'accepted_flags' ELSE '[]'::jsonb END) || CAST(:acc AS jsonb))
+              -- Only an approval that names a re-file writes the key: a drain image older than the
+              -- option refuses it as unknown, so an ordinary approval must not add it.
+              || (CASE WHEN CAST(:refile AS jsonb) = '[]'::jsonb THEN '{}'::jsonb
+                       ELSE jsonb_build_object('refile_to_sets',
+                              (CASE WHEN jsonb_typeof(options->'refile_to_sets') = 'array'
+                                    THEN options->'refile_to_sets' ELSE '[]'::jsonb END) || CAST(:refile AS jsonb))
+                  END),
             status_reason = 'approved', updated_at = NOW()
         WHERE id = :id AND status = 'held'
         RETURNING id
         """,
         {"id": job_id, "by": approved_by, "excl": _dumps([v.strip() for v in exclude_handles]),
-         "acc": _dumps([v.strip() for v in accepted_flags])},
+         "acc": _dumps([v.strip() for v in accepted_flags]),
+         "refile": _dumps([v.strip() for v in refile_handles])},
     )
     return bool(row)
 

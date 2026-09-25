@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, field_validator, model_validator
 
 from db import retailer_ingest as ledger
 from scripts.enqueue_retailer_ingest import _row_to_job  # the CLI's validator: ONE rule for a cohort
@@ -109,11 +109,21 @@ class ApproveBody(BaseModel):
 
     exclude_handles: List[StrictStr] = Field(default_factory=list, max_length=_MAX_LIST_ENTRIES)
     accepted_flags: List[StrictStr] = Field(default_factory=list, max_length=_MAX_LIST_ENTRIES)
+    # Bundles re-filed to the gift-set shelf instead of excluded (options.refile_to_sets).
+    refile_handles: List[StrictStr] = Field(default_factory=list, max_length=_MAX_LIST_ENTRIES)
 
-    @field_validator("exclude_handles", "accepted_flags")
+    @field_validator("exclude_handles", "accepted_flags", "refile_handles")
     @classmethod
     def _non_empty(cls, values: List[str]) -> List[str]:
         return _entries(values)
+
+    @model_validator(mode="after")
+    def _refile_or_exclude(self) -> "ApproveBody":
+        key = lambda h: h.strip().strip("/").casefold()
+        both = sorted({key(h) for h in self.refile_handles} & {key(h) for h in self.exclude_handles})
+        if both:
+            raise ValueError(f"a handle cannot be both re-filed and excluded: {both}")
+        return self
 
 
 class CancelBody(BaseModel):
@@ -192,13 +202,14 @@ async def approve_job(job_id: str, body: ApproveBody, admin: Dict[str, Any] = De
                 "not_acceptable": unknown, "acceptable": sorted(k for k in acceptable if k)})
     try:
         approved = await ledger.approve(job_id, approved_by=_actor(admin), exclude_handles=body.exclude_handles,
-                                        accepted_flags=body.accepted_flags)
+                                        accepted_flags=body.accepted_flags, refile_handles=body.refile_handles)
     except ValueError as exc:  # the ledger's own validation of the lists / identity
         raise HTTPException(status_code=422, detail=str(exc)) from None
     if not approved:  # moved out of held between the read and the conditional UPDATE
         return _not_in_state(await _job_or_404(job_id), "approve", ("held",))
     return {"job_id": job_id, "status": "apply_due", "approved_by": _actor(admin),
-            "exclude_handles": body.exclude_handles, "accepted_flags": body.accepted_flags}
+            "exclude_handles": body.exclude_handles, "accepted_flags": body.accepted_flags,
+            "refile_handles": body.refile_handles}
 
 
 @router.post("/jobs/{job_id}/cancel", response_model=None)

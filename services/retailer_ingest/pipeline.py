@@ -40,6 +40,11 @@ class _Stop(Exception):
 _OPTION_TYPES = {
     "vendors": list, "require_currency": str, "category_path": str, "only_category": str,
     "only_resolved_category": bool, "lip_title_evidence": bool, "exclude_handles": list,
+    # Reviewer decision (Peng 2026-09-25): a bundle of different products the store filed on a
+    # single-product shelf ("Cologne & Hand Cream Duo" under fragrance/perfume) is RE-FILED to the
+    # gift-set shelf, not dropped -- shoppers look for gift sets; the harm was the shelf. These handles
+    # are filed under REFILE_SETS_LEAF before any check runs.
+    "refile_to_sets": list,
     "accepted_flags": list, "max_scan_products": int, "max_products": int,
     "max_pdp_identity_fetches": int, "max_pdp_inci_fetches": int, "retailer_name": str, "notes": str,
     # "storefront" (default: crawl the retailer's /products.json) or "affiliate_feed" (the network's
@@ -64,6 +69,19 @@ _OPTION_TYPES = {
     "brands": dict,
 }
 SOURCES = ("storefront", "affiliate_feed")
+#: The one shelf a reviewed set is re-filed to: canonical in both taxonomies (pivota-backend
+#: category_path_aliases, PIVOTA-Agent beautyTaxonomy.js `gift_set`).
+REFILE_SETS_LEAF = "beauty/sets/gift-set"
+#: A reviewer's re-file writes this confidence, distinct from every other writer's value (0.3/0.7/0.78/
+#: 0.8/0.82/0.85/0.9/0.95), so a stored row placed this way can be found without the ledger.
+CATEGORY_CONFIDENCE_REVIEW_REFILE = 0.74
+#: The flags a re-file answers: the reviewer decided the row IS a set, so "a set on a single-product
+#: shelf" and "the title names another shelf" (its contents) are resolved. Every other flag still runs.
+REFILE_RESOLVES_RULES = frozenset({"set_filed_as_single_product", "title_contradicts_category"})
+
+
+def _handle_key(value: Any) -> str:
+    return str(value).strip().strip("/").casefold()
 MAX_PDP_IDENTITY_FETCHES = 300
 # PDP INCI enrichment in an unattended stage: the worker's default (300 fetches, no time limit) ran luxiface.com
 # past the 3600 s task timeout twice (2.2 s CPU per ~2 MB page). The drain fetches at most this many by default
@@ -139,6 +157,10 @@ def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
             raise ValueError("options.collections must be Shopify collection handles on a storefront cohort")
     if int(options.get("max_pdp_inci_fetches") or 0) > MAX_PDP_INCI_FETCHES:
         raise ValueError(f"options.max_pdp_inci_fetches must be at most {MAX_PDP_INCI_FETCHES}")
+    overlap = sorted({_handle_key(h) for h in options.get("refile_to_sets") or []}
+                     & {_handle_key(h) for h in options.get("exclude_handles") or []})
+    if overlap:
+        raise ValueError(f"a handle cannot be both re-filed and excluded: {overlap}")
     if int(options.get("max_pdp_identity_fetches") or 0) > MAX_PDP_IDENTITY_FETCHES:
         # Each fetch waits CRAWL_MIN_INTERVAL_SECONDS (4s): 300 is ~20 min of one stage already.
         raise ValueError(f"options.max_pdp_identity_fetches must be at most {MAX_PDP_IDENTITY_FETCHES}")
@@ -348,6 +370,31 @@ def _left_out_summary(left_out: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _refile_to_sets(records: List[Dict[str, Any]], handles: Any, checks: Dict[str, Any],
+                    flags: List[Dict[str, Any]]) -> set:
+    """File the reviewer-named bundles under REFILE_SETS_LEAF; returns the handles re-filed. A named
+    handle the crawl no longer carries blocks (like an unmatched exclusion) -- accept its key to go on."""
+    import scripts.onboard_curated_brands as cli
+    wanted = {_handle_key(h) for h in (handles or []) if str(h).strip()}
+    if not wanted:
+        return set()
+    matched = set()
+    for record in records:
+        handle = cli._record_handle(record)
+        pdp = record.get("pdp")
+        if handle in wanted and isinstance(pdp, dict):
+            pdp["category_path"] = REFILE_SETS_LEAF
+            pdp["category_resolution_status"] = "resolved"
+            pdp["category_confidence"] = CATEGORY_CONFIDENCE_REVIEW_REFILE
+            matched.add(handle)
+    checks["refiled_to_sets"] = sorted(matched)
+    for handle in sorted(wanted - matched):
+        flags.append({"key": f"refile_handle_unmatched:{handle}", "rule": "refile_handle_unmatched",
+                      "severity": detectors.BLOCK, "handle": handle,
+                      "detail": "an approved re-file to gift sets no longer matches any product"})
+    return matched
+
+
 async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Narrow, plan and run every check. Returns the plan plus a verdict; never writes."""
     import scripts.onboard_curated_brands as cli
@@ -370,6 +417,7 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
             flags.append({"key": f"exclude_handle_unmatched:{handle}", "rule": "exclude_handle_unmatched",
                           "severity": detectors.BLOCK, "handle": handle,
                           "detail": "an approved exclusion no longer matches any product"})
+    refiled = _refile_to_sets(records, o.get("refile_to_sets"), checks, flags)
     if o.get("only_category") or o.get("only_resolved_category"):
         selected = len(records)
         records, left_out = cli._partition_by_category(records, prefix=o.get("only_category"))
@@ -400,6 +448,10 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
                           "detail": json.dumps(report, default=str)[:600]})
 
     row_flags = detectors.detect(records)
+    if refiled:
+        answered = [f for f in row_flags if f.get("handle") in refiled and f.get("rule") in REFILE_RESOLVES_RULES]
+        row_flags = [f for f in row_flags if f not in answered]
+        checks["refile_resolved_flags"] = sorted(f["key"] for f in answered)
     # Name each row's brand on its flag: in a multi_brand cohort the reviewer must see whose row it is.
     brand_of = {detectors._handle(r): (r.get("pdp") or {}).get("brand") for r in records}
     for f in row_flags:
