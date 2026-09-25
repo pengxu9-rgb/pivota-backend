@@ -13,7 +13,12 @@ absent value as in stock. The rule now lives in `services/external_seed_stock`,
 reads every value through the shared availability vocabulary, and serves an
 unknown claim as `availability: "unknown"` with NO boolean — the shape the
 live-verification branch already serves. A variant with no signal of its own
-inherits the product claim.
+inherits a KNOWN product claim; with an unknown product it gets no boolean.
+
+A CONTRADICTED COLUMN SILENCES THE VARIANTS. The nightly refresh re-reads the
+column from the page but rewrites stored variants only sometimes, so when the
+two disagree the variants are the likelier-stale side (27 live seeds on
+2026-09-25, served an in-stock variant under an out_of_stock column).
 
 Parametrised over both builders: `routes/agent_sdk_fixed.py` holds a second
 copy and both are routed.
@@ -174,6 +179,9 @@ async def test_without_a_column_the_explicit_variants_decide(
     )
     product = await _build(module_path, seed, monkeypatch)
     assert _stock(product) == expected
+    if expected == UNKNOWN:
+        # A variant with no signal of an unknown product: no boolean, not in stock.
+        assert _stock(product["variants"][1]) == UNKNOWN
 
 
 @pytest.mark.parametrize("module_path", _MODULES)
@@ -194,6 +202,39 @@ async def test_a_column_the_variants_contradict_is_unknown(
     )
     product = await _build(module_path, seed, monkeypatch)
     assert _stock(product) == UNKNOWN
+    # The variants are withheld too, not served on their own (likely stale) signals.
+    assert [_stock(v) for v in product["variants"]] == [UNKNOWN] * len(variant_availability)
+
+
+@pytest.mark.parametrize("module_path", _MODULES)
+@pytest.mark.parametrize(
+    "seed_data_extra, variants",
+    [
+        # roundlab.com eps_0a5f2785ba840d9fb02ce4b4 as served 2026-09-25: the refresh
+        # re-read the page (column + snapshot out) but left the ingest-time variant and
+        # seed_data.availability at in_stock.
+        (
+            {"availability": "in_stock", "snapshot": {"availability": "out_of_stock"}},
+            [_variant("1", "in_stock")],
+        ),
+        # k-touch.us: one shade out, the rest in, column out.
+        (
+            {"availability": "out_of_stock", "snapshot": {"availability": "out_of_stock"}},
+            [_variant("1", "out_of_stock"), _variant("2", "in_stock"), _variant("3", "in_stock")],
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_stale_in_stock_variant_under_an_out_of_stock_column_is_not_served_in_stock(
+    module_path, seed_data_extra, variants, monkeypatch
+):
+    seed = _seed_row(availability="out_of_stock", variants=variants, seed_data_extra=seed_data_extra)
+    product = await _build(module_path, seed, monkeypatch)
+    assert _stock(product) == UNKNOWN
+    served = product["variants"]
+    assert served, "variants are still listed"
+    assert not any(v.get("in_stock") is True for v in served)
+    assert all(_stock(v) == UNKNOWN for v in served)
 
 
 @pytest.mark.parametrize("module_path", _MODULES)
@@ -302,3 +343,11 @@ async def test_snapshot_only_variants_give_both_lanes_the_same_claim(module_path
     )
     product = await _build(module_path, seed, monkeypatch)
     assert _stock(product) == UNKNOWN
+
+
+@pytest.mark.parametrize("availability", ["in_stock", "out_of_stock", None])
+def test_the_live_verification_path_gives_no_variant_a_boolean(availability):
+    from services.external_seed_stock import seed_variant_stock_fields
+
+    # stock=None is the live-verification path: nothing stored is trusted.
+    assert seed_variant_stock_fields(availability, None) == UNKNOWN
