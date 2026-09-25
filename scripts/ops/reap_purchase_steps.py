@@ -160,9 +160,15 @@ def _report_failure(rc, result) -> None:
     text = rc.explain_refusal(result.error)
     if text:
         print("\n  " + text.replace("\n", "\n  "))
-    detail = rc.explain_detail_code(result.error_detail_code)
-    if detail:
-        print("\n  " + detail.replace("\n", "\n  "))
+    # BOTH fields. Since the 2026-09-25 spec the 409 conflicts (QUOTE_EXPIRED,
+    # ENROLLMENT_NOT_ACTIVE, IDEMPOTENCY_REQUEST_IN_PROGRESS) carry their code at `error.code`,
+    # where the older 400s carried it at `error.detail.code`; asking for one of them is how the
+    # explanation an operator needs goes unprinted.
+    for code in (result.error_detail_code, result.error_code):
+        detail = rc.explain_detail_code(code)
+        if detail:
+            print("\n  " + detail.replace("\n", "\n  "))
+            break
     print("\nThe response BODY is deliberately not captured — only the two machine-readable\n"
           "codes above. A partner's error payload can echo the request, and the request can\n"
           "carry a buyer's address.")
@@ -412,7 +418,9 @@ def main() -> int:
     enroll.add_argument("--owner-id", required=True,
                         help="OUR opaque client reference for this buyer. Not an email, not a "
                              "name — it goes to a third party and comes back in a query string.")
-    enroll.add_argument("--email", help="optional, prefills the hosted page. Real buyer PII.")
+    enroll.add_argument("--email", required=True,
+                        help="REQUIRED by Reap's spec since 2026-09-25 (owner.email). Real buyer "
+                             "PII; the builder refuses an empty or malformed one before egress.")
     enroll.add_argument("--attempt-id",
                         help="opaque id for THIS attempt ([A-Za-z0-9_-]{1,64}); in production "
                              "our ledger's enrollment row id. Defaults to a timestamp, which is "

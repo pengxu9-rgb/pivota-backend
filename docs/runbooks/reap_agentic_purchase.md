@@ -707,7 +707,7 @@ audit below.
 
 **The enrollment at Reap is still a separate step.** We stop using it; the partner is not told to
 stop honouring it. Reap *does* offer `POST /agentic/enrollments/{id}/revoke`
-(`revokeEnrollment_agentic`, in `tests/fixtures/reap_openapi_agentic_2026_09_17.json`), wrapped as
+(`revokeEnrollment_agentic`, in `tests/fixtures/reap_openapi_agentic_2026_09_25.json`), wrapped as
 `services.reap_agentic_client.revoke_enrollment(<reap_enrollment_id>)`. It is deliberately **not**
 called from the repoint hook: that hook runs on the hosted checkout's save path with a human
 waiting, and a partner POST can take up to the client's 25-second timeout. Run it from a shell

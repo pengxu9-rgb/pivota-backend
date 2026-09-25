@@ -198,7 +198,8 @@ def test_the_header_is_on_the_checkout_and_on_no_other_request(wire, monkeypatch
     monkeypatch.setenv(DIAL, "COMPLETED")
     _checkout()
     _run(rc.request_quote(items=[{"variantId": "var_x", "quantity": 1}], email="b@example.com"))
-    _run(rc.create_enrollment(owner_id="cust_42", return_url=RETURN_URL, attempt_id="att-1"))
+    _run(rc.create_enrollment(owner_id="cust_42", return_url=RETURN_URL, attempt_id="att-1",
+                         email="buyer@example.com"))
     _run(rc.search_products(query="Fenty Eau de Parfum"))
     _run(rc.product_details(["prd_1"]))
     _run(rc.select_shipping_option(quote_id=QUOTE_ID, shipping_option_id="ship_std"))
@@ -224,7 +225,8 @@ def test_the_header_is_on_the_checkout_and_on_no_other_request(wire, monkeypatch
 
 @pytest.mark.parametrize("call", [
     lambda: rc.request_quote(items=[{"variantId": "var_x", "quantity": 1}], email="b@example.com"),
-    lambda: rc.create_enrollment(owner_id="cust_42", return_url=RETURN_URL, attempt_id="att-1"),
+    lambda: rc.create_enrollment(owner_id="cust_42", return_url=RETURN_URL, attempt_id="att-1",
+                         email="buyer@example.com"),
     lambda: rc.search_products(query="x"),
     lambda: rc.select_shipping_option(quote_id=QUOTE_ID, shipping_option_id="ship_std"),
 ], ids=["quote", "enrollment", "products_search", "shipping_option"])
