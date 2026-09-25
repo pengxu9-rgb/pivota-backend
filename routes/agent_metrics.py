@@ -397,6 +397,8 @@ async def get_metrics_timeline(
             "timestamp": datetime.now().isoformat()
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         return {
             "status": "error",

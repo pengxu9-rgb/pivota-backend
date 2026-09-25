@@ -13,6 +13,7 @@ from datetime import datetime
 
 from config.platform import pytest_bypass_allowed
 from db.agents import (
+    agent_is_active,
     get_agent_by_key,
     AgentAuthLookupTransientError,
     get_agent,
@@ -159,13 +160,7 @@ async def resolve_issuing_agent_id(api_key: Optional[str]) -> Optional[str]:
     except Exception as exc:  # noqa: BLE001 -- the link is still served; its click is agent-less
         logger.warning(f"[AgentAuth] issuing-agent lookup failed: {type(exc).__name__}")
         return None
-    if not agent:
-        return None
-    is_active = agent.get("is_active")
-    if is_active is None:
-        status = agent.get("status")
-        is_active = (str(status).lower() == "active") if status else True
-    if not is_active:
+    if not agent_is_active(agent):
         return None
     agent_id = str(agent.get("agent_id") or "").strip()
     if agent_id and agent_id in issuing_excluded_agent_ids():
@@ -211,14 +206,10 @@ async def _is_service_caller(api_key: Optional[str]) -> bool:
         agent = await get_agent_by_key(candidate)
     except Exception:  # noqa: BLE001 -- an unreadable caller vouches for no one
         return False
-    if not agent:
+    if not agent_is_active(agent):
         return False
-    is_active = agent.get("is_active")
-    if is_active is None:
-        status = agent.get("status")
-        is_active = (str(status).lower() == "active") if status else True
     agent_id = str(agent.get("agent_id") or "").strip()
-    return bool(is_active) and agent_id in issuing_voucher_agent_ids()
+    return agent_id in issuing_voucher_agent_ids()
 
 
 async def resolve_issuing_agent_for_request(
@@ -462,14 +453,8 @@ async def get_agent_context(
             detail="Invalid API Key"
         )
     
-    # 4. 检查是否激活 (support both is_active and status fields)
-    is_active = agent.get("is_active")
-    if is_active is None:
-        # Fallback to status field
-        status = agent.get("status")
-        is_active = (str(status).lower() == "active") if status else True
-    
-    if not is_active:
+    # 4. 检查是否激活 (db.agents.agent_is_active: is_active, else status; NULL is active)
+    if not agent_is_active(agent):
         raise HTTPException(
             status_code=403,
             detail="Agent is deactivated"
