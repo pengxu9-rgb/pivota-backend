@@ -191,9 +191,14 @@ async def _db():
     finally:
         engine.dispose()
     # The guard's `UPDATE merchant_stores` is not in a try of its own: on a database without
-    # the table it raises and abandons every heal after it, merchant_onboarding's included.
-    # Production has the table (main.py's bootstrap builds it); so does this fixture.
+    # the table, or with one lacking `connected_at`, it raises and abandons every heal after
+    # it, merchant_onboarding's included. Production has main.py's table; so does this
+    # fixture. Six sibling gate files build their own narrower merchant_stores, so the column
+    # the UPDATE orders by is added to whichever shape is already here (nullable: additive).
     await database.execute(_startup_ddl_for("merchant_stores"))
+    await database.execute(
+        "ALTER TABLE merchant_stores ADD COLUMN IF NOT EXISTS connected_at TIMESTAMPTZ"
+    )
     for table in ("merchant_audit_runs", "partner_send_log", "tierb_cart_link_eligibility"):
         await _make_needed(table)
     yield database
@@ -558,3 +563,72 @@ async def test_a_not_valid_check_with_the_right_text_is_still_re_added(_db):
     await ensure_required_schema_light()
 
     assert await _db.fetch_val(validated) is True
+
+
+# The same hazard off the boot path: self-heals a request runs, lazily once per process
+# (orders, quotes) or after any failed write (checkout_intents, acp_checkout_sessions).
+# (table, module, ensure function, the module's per-process "done" flag or None)
+_REQUEST_PATH_HEALS = [
+    ("orders", "db.orders", "_ensure_client_secret_storage_allows_long_values",
+     "_client_secret_storage_ready"),
+    ("quotes", "db.quotes", "ensure_quotes_table", "_QUOTES_DDL_READY"),
+    ("checkout_intents", "routes.agent_checkout_intents", "_ensure_checkout_intents_table", None),
+    ("acp_checkout_sessions", "services.acp_checkout_session_service",
+     "_ensure_acp_checkout_sessions_table", None),
+]
+
+
+# ACCESS SHARE (a reader) conflicts with the column heals' ACCESS EXCLUSIVE; ROW EXCLUSIVE (a
+# writer) also conflicts with the index builds' SHARE, which a reader does not.
+@pytest.mark.parametrize("mode", ["ACCESS SHARE", "ROW EXCLUSIVE"])
+@pytest.mark.parametrize("table, module_name, ensure, flag", _REQUEST_PATH_HEALS)
+async def test_a_request_path_self_heal_does_not_queue_behind_a_reader_or_writer(
+    _db, table, module_name, ensure, flag, mode, monkeypatch
+):
+    import importlib
+
+    import asyncpg
+
+    module = importlib.import_module(module_name)
+    if flag:
+        monkeypatch.setattr(module, flag, False)
+    await getattr(module, ensure)()  # the first call heals; every later call is this one
+    if flag:
+        assert getattr(module, flag) is True, "precondition: the first call healed"
+        monkeypatch.setattr(module, flag, False)
+
+    recording = _Recording(module.database)
+    monkeypatch.setattr(module, "database", recording)
+    holder = await asyncpg.connect(_asyncpg_dsn())
+    watcher = await asyncpg.connect(_asyncpg_dsn())
+    held = holder.transaction()
+    await held.start()
+    blocked: List[str] = []
+    call = None
+    try:
+        await holder.execute(f"LOCK TABLE {table} IN {mode} MODE")
+        holder_pid = await holder.fetchval("SELECT pg_backend_pid()")
+        started = time.monotonic()
+        call = asyncio.ensure_future(getattr(module, ensure)())
+        while not call.done() and time.monotonic() - started < _HOLDER_HOLDS_S:
+            rows = await watcher.fetch(
+                "SELECT query FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+                holder_pid,
+            )
+            blocked.extend(" ".join(r["query"].split()) for r in rows)
+            await asyncio.wait({call}, timeout=0.02)
+        finished_while_held = call.done()
+    finally:
+        await held.rollback()
+        await holder.close()
+        await watcher.close()
+        if call is not None:
+            await call
+
+    assert blocked == [], f"the self-heal queued behind a {mode} holder of {table}: {blocked}"
+    assert finished_while_held, f"the self-heal finished only once the holder let go of {table}"
+    heals = [(s, e) for s, e in recording.ran if s.startswith("DO $") and f"'{table}'" in s]
+    assert heals, f"positive control: the call ran its guarded {table} heals"
+    assert [e for _, e in heals] == [None] * len(heals), heals
+    if flag:
+        assert getattr(module, flag) is True
