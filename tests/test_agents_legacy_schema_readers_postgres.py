@@ -299,8 +299,10 @@ async def test_fix_agents_table_is_retired_and_keeps_the_table(client, db):
 
 @pytest.mark.parametrize("method,path", [("POST", "/admin/fix/agents-data"), ("GET", "/admin/fix/agents-status")])
 async def test_admin_fix_agents_routes_are_retired_and_write_nothing(client, db, method, path):
-    # An agent with no email is exactly what the old POST "fixed" with a made-up address.
+    # Agents with no email -- NULL or '' -- are exactly what the old POST "fixed" with a made-up
+    # address; it matched both.
     await db.execute("UPDATE agents SET email = NULL WHERE agent_id = :a", {"a": BRAVO})
+    await db.execute("UPDATE agents SET email = '' WHERE agent_id = :a", {"a": CHARLIE})
     before = await _agents_table_snapshot(db)
 
     resp = await client.request(method, path)
@@ -379,10 +381,10 @@ async def test_admin_fix_agent_orders_check_reads_the_real_columns(client, db):
 )
 async def test_admin_routes_refuse_a_non_admin_before_anything_else(client, db, user, role, method, path):
     user["role"] = role
-    before = await _counters(db)
+    before = await _agents_table_snapshot(db)
 
     resp = await client.request(method, path)
 
     assert resp.status_code == 403, resp.text
-    assert await _counters(db) == before
+    assert await _agents_table_snapshot(db) == before
     assert await _view_exists(db) is False
