@@ -34,8 +34,12 @@ WHAT THIS DOES, at the end of the session and after every report is written:
   2. Gives any other non-daemon thread a grace period to finish. A thread still
      running after that is a regression, so the guard prints its name and
      stack, fails the session, and exits the process so CI never sits silent
-     until the job cap. `concurrent.futures` workers are exempt, because
-     `threading._shutdown` itself signals and joins them.
+     until the job cap. IDLE `concurrent.futures` workers and process-pool
+     manager threads are exempt, because `threading._shutdown` itself signals
+     and joins them. A worker still running a work item is not exempt: that
+     one would hang exit too.
+  If aiosqlite changes the worker protocol this relies on, the stop is skipped
+  and its workers fall through to step 2, so the failure is still loud.
 
 Proven by tests/test_thread_exit_guard.py, which recreates the deadlocked worker
 state and runs pytest as a subprocess with and without this plugin.
@@ -46,6 +50,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import time
 import traceback
 from typing import List
 
@@ -74,20 +79,51 @@ def stop_orphaned_aiosqlite_workers(join_timeout: float = 5.0) -> List[str]:
         return []
     import aiosqlite.core as core
 
-    sentinel = core._STOP_RUNNING_SENTINEL
+    # Private aiosqlite 0.22 internals. If they move, stop nothing and let the
+    # generic survivor check report these threads with their stacks.
+    sentinel = getattr(core, "_STOP_RUNNING_SENTINEL", None)
+    if sentinel is None:
+        return []
+    stopping = []
     for worker in workers:
         # `_args` is `(tx,)`, the queue the worker blocks on. This is exactly
         # what `Connection.stop()` queues, minus closing the sqlite3 handle,
         # which must happen on the worker thread; the process is about to exit.
-        worker._args[0].put_nowait((None, lambda: sentinel))
-    for worker in workers:
-        worker.join(join_timeout)
-    return [w.name for w in workers if not w.is_alive()]
+        args = getattr(worker, "_args", ())
+        if args and hasattr(args[0], "put_nowait"):
+            args[0].put_nowait((None, lambda: sentinel))
+            stopping.append(worker)
+    _join_all(stopping, join_timeout)
+    return [w.name for w in stopping if not w.is_alive()]
+
+
+def _join_all(threads: List[threading.Thread], timeout: float) -> None:
+    deadline = time.monotonic() + timeout
+    for thread in threads:
+        thread.join(max(0.0, deadline - time.monotonic()))
+
+
+def _released_by_interpreter_shutdown(thread: threading.Thread) -> bool:
+    """True for threads `threading._shutdown` stops itself before joining them."""
+    import concurrent.futures.process as cf_process
+    import concurrent.futures.thread as cf_thread
+
+    if isinstance(thread, cf_process._ExecutorManagerThread):
+        return True
+    if getattr(thread, "_target", None) is not cf_thread._worker:
+        return False
+    # An executor worker is released at shutdown only if it is idle. One that is
+    # inside a work item keeps running, and `_python_exit` joins it forever.
+    frame = sys._current_frames().get(thread.ident)
+    while frame is not None:
+        if frame.f_code is cf_thread._WorkItem.run.__code__:
+            return False
+        frame = frame.f_back
+    return True
 
 
 def surviving_non_daemon_threads(grace: float) -> List[threading.Thread]:
     """Non-daemon threads that would block interpreter exit, after `grace` seconds to finish."""
-    import concurrent.futures.thread as cf_thread
 
     def blocking() -> List[threading.Thread]:
         return [
@@ -96,12 +132,10 @@ def surviving_non_daemon_threads(grace: float) -> List[threading.Thread]:
             if t.is_alive()
             and not t.daemon
             and t is not threading.main_thread()
-            and getattr(t, "_target", None) is not cf_thread._worker
+            and not _released_by_interpreter_shutdown(t)
         ]
 
-    threads = blocking()
-    for thread in threads:
-        thread.join(grace / max(len(threads), 1))
+    _join_all(blocking(), grace)
     return blocking()
 
 
