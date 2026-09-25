@@ -918,15 +918,28 @@ async def _holds_agent_membership(user, agent) -> bool:
     verified flows write an agent membership: agent registration/login, the
     password-verified agent->merchant conversion (which now keeps it), or an admin. A
     merchant who moved their login email onto an agent's owner_email gets none, so this
-    admits the real owner of a converted account without reopening that takeover. To
-    revoke agent access for such an account, set that membership inactive.
+    admits the real owner of a converted account without reopening that takeover. A
+    membership last written before this users row existed does not count: it belongs
+    to a deleted account whose email was re-registered.
+
+    Revocation: users.role alone no longer locks such an account out (admin_fix_merchant
+    changing the role leaves memberships alone); set the agent membership inactive or
+    users.active false.
     """
     from db.auth_identity import has_active_membership_for_entity
 
+    try:
+        user_created_at = user["created_at"]
+    except (KeyError, IndexError, TypeError):
+        user_created_at = None
+    if user_created_at is None:
+        # Without the row's age the membership cannot be shown to be this account's.
+        return False
     return await has_active_membership_for_entity(
         email=user["email"],
         membership_type="agent",
         entity_id=agent["agent_id"],
+        not_before=user_created_at,
     )
 
 
@@ -937,7 +950,7 @@ async def login_agent(data: AgentLoginRequest):
         email = _normalize_email(data.email)
         # 1. Find user
         user = await database.fetch_one(
-            "SELECT id, email, password_hash, full_name, role, active FROM users WHERE LOWER(email) = LOWER(:email)",
+            "SELECT id, email, password_hash, full_name, role, active, created_at FROM users WHERE LOWER(email) = LOWER(:email)",
             {"email": email}
         )
         

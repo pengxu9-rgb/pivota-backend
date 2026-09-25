@@ -21,6 +21,7 @@ Pinned here:
 
 import base64
 import json
+from datetime import datetime, timezone
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -38,6 +39,7 @@ def _client(
     employee: bool = True,
     agent_membership_for: str | None = None,
     membership_calls: list | None = None,
+    user_created_at=datetime(2026, 2, 27, 7, 26, 34, tzinfo=timezone.utc),
 ):
     import db.agents as agents_db
     import db.auth_identity as auth_identity
@@ -57,6 +59,7 @@ def _client(
                 "full_name": "Dual Role",
                 "role": role,
                 "active": active,
+                "created_at": user_created_at,
             }
         if "FROM agents" in q and "owner_email" in q:
             if not owns_agent:
@@ -82,9 +85,9 @@ def _client(
     monkeypatch.setattr(module.database, "fetch_one", fetch_one)
     monkeypatch.setattr(module.database, "execute", execute)
     monkeypatch.setattr(module, "_sync_agent_auth_membership", _no_membership)
-    async def has_membership(*, email, membership_type, entity_id):
+    async def has_membership(*, email, membership_type, entity_id, not_before=None):
         if membership_calls is not None:
-            membership_calls.append((email, membership_type, entity_id))
+            membership_calls.append((email, membership_type, entity_id, not_before))
         return membership_type == "agent" and entity_id == agent_membership_for
 
     monkeypatch.setattr(auth_module, "_fetch_active_employee_identity", fetch_employee)
@@ -200,7 +203,7 @@ def test_merchant_converted_from_this_agent_logs_in_through_its_membership(monke
     assert claims["role"] == "agent"
     assert claims["agent_id"] == "agent_dual"
     # the membership is asked about THIS agent, not "any agent membership"
-    assert calls == [(EMAIL, "agent", "agent_dual")]
+    assert calls == [(EMAIL, "agent", "agent_dual", datetime(2026, 2, 27, 7, 26, 34, tzinfo=timezone.utc))]
     assert not any("SET role" in q or "role =" in q for q in executed), executed
 
 
@@ -217,3 +220,16 @@ def test_a_membership_for_a_different_agent_does_not_admit(monkeypatch):
 
     assert resp.status_code == 403
     assert resp.json()["detail"] == "This login is for agents only"
+
+
+def test_membership_admission_fails_closed_without_the_users_row_age(monkeypatch):
+    client, _ = _client(
+        monkeypatch,
+        role="merchant",
+        owns_agent=True,
+        employee=False,
+        agent_membership_for="agent_dual",
+        user_created_at=None,
+    )
+
+    assert _login(client).status_code == 403

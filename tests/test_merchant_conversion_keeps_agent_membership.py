@@ -13,7 +13,8 @@ Pinned here:
 2. register_merchant calls it only for a conversion from 'agent', and BEFORE the role
    rewrite, so a failed membership write leaves an intact agent account;
 3. has_active_membership_for_entity filters on the exact entity, type and active status,
-   and never queries for an inactive identity.
+   never queries for an inactive identity, and refuses a membership last written before
+   the users row existed (a deleted account's identity inherited by a re-registration).
 """
 
 import pytest
@@ -201,3 +202,36 @@ async def test_membership_lookup_answers_false_without_a_row_or_an_active_identi
         email=EMAIL, membership_type="agent", entity_id="agent_one"
     )
     assert queried == []
+
+
+@pytest.mark.asyncio
+async def test_a_membership_older_than_the_users_row_does_not_count(monkeypatch):
+    """Admin merchant deletion drops the users row but keeps identity + memberships; a
+    stranger re-registering that email reuses the identity. Their users row is newer
+    than every membership write, so the stale agent membership must not vouch for it."""
+    from datetime import datetime, timezone
+
+    import db.auth_identity as auth_identity
+
+    async def get_identity(email):
+        return {"identity_id": "ident_1", "status": "active"}
+
+    written = datetime(2026, 3, 1, 12, 0, 0)  # naive, as upsert_membership writes utcnow()
+
+    async def fetch_one(query, values=None):
+        return {"membership_id": "m1", "created_at": written, "updated_at": written}
+
+    monkeypatch.setattr(auth_identity, "get_identity_by_email", get_identity)
+    monkeypatch.setattr(auth_identity.database, "fetch_one", fetch_one)
+
+    async def check(users_created_at):
+        return await auth_identity.has_active_membership_for_entity(
+            email=EMAIL, membership_type="agent", entity_id="agent_one", not_before=users_created_at
+        )
+
+    # hr@chydan.com shape: users row long before the membership write -> admitted
+    assert await check(datetime(2026, 2, 27, 7, 26, 34, tzinfo=timezone.utc))
+    # re-registered after deletion: users row newer than the membership -> refused
+    assert not await check(datetime(2026, 6, 1, tzinfo=timezone.utc))
+    # boundary: written in the same instant the row was created still counts
+    assert await check(datetime(2026, 3, 1, 12, 0, 0, tzinfo=timezone.utc))
