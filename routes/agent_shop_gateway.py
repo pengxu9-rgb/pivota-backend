@@ -58,6 +58,7 @@ from services.test_merchant_policy import (
     get_excluded_merchant_ids,
     filter_out_test_merchants,
 )
+from services.external_seed_stock import seed_stock, seed_variant_stock_fields
 from services.external_seed_search import (
     build_seed_quarantine_anti_join as _seed_quarantine_clause,
     fetch_external_seed_rows,
@@ -3883,9 +3884,11 @@ def _attach_eligible_serving_fields_to_items(
 def _offer_is_known_unavailable(offer: Dict[str, Any]) -> bool:
     """True only on an explicit statement that this seller cannot sell it now.
 
-    Reads the `in_stock` flag, which every lane emits (the catalog arm derives it from
-    OFFER_UNAVAILABLE_AVAILABILITIES). There is no separate `availability` check here on purpose:
-    no lane ships an unavailable `availability` beside a True flag, so one would be dead code.
+    Reads the `in_stock` flag, which every lane emits when it knows (the catalog arm derives it
+    from OFFER_UNAVAILABLE_AVAILABILITIES; the seed lane omits it and ships `availability:
+    "unknown"` when the seed's own claim is unknown, which ranks WITH in stock). There is no
+    separate `availability` check here on purpose: no lane ships an unavailable `availability`
+    beside a True flag, so one would be dead code.
 
     INTERNAL (buy-here) OFFERS ARE READ THE SAME WAY. They used to be exempt because their flag
     read `inventory_quantity` alone and so called an untracked / keep-selling variant
@@ -4559,6 +4562,16 @@ async def _handle_offers_resolve(
             used_market = str(row_dict.get("market") or market_hint or "US")
             used_tool = str(row_dict.get("tool") or tool_hint or "*")
 
+            # The seed's own stock claim, ONCE per seed: the rule the search builders serve
+            # (services/external_seed_stock), so a seed cannot be sold out on the card and in
+            # stock on its offer. This path used to read the variant's `availability` FIRST —
+            # the stale side: the nightly refresh rewrites the `availability` column from the
+            # page but replaces stored variants only under its overwrite predicates, so a
+            # sold-out seed with a variant still "in_stock" from ingest shipped an in-stock
+            # offer. It also read anything outside three spellings ("unknown", "Out of stock",
+            # schema.org URLs) as in stock.
+            _seed_stock = seed_stock(row_dict, seed_data)
+
             # ONCE per seed, not once per variant. This is an agent-facing
             # resolve path and matched_variants can be long; a lookup inside
             # the loop is a query per variant.
@@ -4624,15 +4637,11 @@ async def _handle_offers_resolve(
                 if price_amount is None:
                     price_amount = _coerce_float(row_dict.get("price_amount") or seed_data.get("price_amount") or 0) or 0.0
 
-                availability = (
-                    v.get("availability")
-                    or seed_data.get("availability")
-                    or row_dict.get("availability")
-                    or "unknown"
-                )
-                in_stock = True
-                if isinstance(availability, str):
-                    in_stock = availability.lower() not in {"out_of_stock", "outofstock", "sold_out"}
+                # The variant's own signal only while the fresh column does not contradict the
+                # stored variants; otherwise the seed's claim. None = unknown, and an unknown
+                # offer ships `availability: "unknown"` with NO `in_stock` key: a boolean would
+                # be a claim nobody made (the gateway reads an absent flag as null).
+                in_stock = seed_variant_stock_fields(v.get("availability"), _seed_stock).get("in_stock")
 
                 # RESOLVED ONCE and read twice — by the identity below and by the preflight
                 # gate under it. Two calls would count this hand-over twice in the coverage
@@ -5011,7 +5020,7 @@ async def _handle_offers_resolve(
                         "currency": currency,
                         **({"original_price": original_price} if original_price is not None else {}),
                         **({"shipping_days": shipping_days} if shipping_days is not None else {}),
-                        "in_stock": bool(in_stock),
+                        **({"in_stock": in_stock} if in_stock is not None else {"availability": "unknown"}),
                         "purchase_route": "affiliate_outbound",
                         "affiliate_url": redirect_url,
                         # EXECUTION SPEC v0, one field: what does following `affiliate_url`
