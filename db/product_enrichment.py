@@ -9,6 +9,7 @@ from sqlalchemy import Column, DateTime, Float, Index, JSON, String, Table, Text
 from sqlalchemy.sql import func
 
 from db.database import metadata, database
+from db.schema_guard import guarded_statements
 
 # Pivota-specific enrichment layer for products.
 # Acts as an overlay on top of products_cache / StandardProduct.
@@ -76,7 +77,14 @@ async def ensure_product_enrichment_table() -> None:
         if _PRODUCT_ENRICHMENT_DDL_READY:
             return
         try:
-            statements = [
+            # Guarded on Postgres (db/schema_guard.guarded_statements): bare, each
+            # ALTER took the table's ACCESS EXCLUSIVE lock (the index build its SHARE
+            # lock) with no lock_timeout, even with nothing to add, so the first call
+            # of every process queued behind any open transaction on the table and
+            # stalled every later one behind it. A guarded statement that cannot get
+            # its lock in time raises, which this pass already treats as "not ready,
+            # retry later".
+            statements = guarded_statements([
                 """
                 CREATE TABLE IF NOT EXISTS product_enrichment (
                   merchant_id VARCHAR(100) NOT NULL,
@@ -108,7 +116,7 @@ async def ensure_product_enrichment_table() -> None:
                 "ALTER TABLE product_enrichment ADD COLUMN IF NOT EXISTS updated_by_employee_id VARCHAR(64);",
                 "ALTER TABLE product_enrichment ADD COLUMN IF NOT EXISTS updated_by_email VARCHAR(255);",
                 "CREATE INDEX IF NOT EXISTS idx_enrichment_merchant_platform ON product_enrichment(merchant_id, platform);",
-            ]
+            ])
             for stmt in statements:
                 await database.execute(stmt)
         except Exception as exc:

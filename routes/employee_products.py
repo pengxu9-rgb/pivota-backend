@@ -26,6 +26,7 @@ from pydantic import BaseModel, Field
 import uuid
 
 from db._ddl_guard import apply_ddl_statements
+from db.schema_guard import guarded_statements, is_lock_timeout
 from db.database import database
 from db.products import products_cache
 from db.product_enrichment import get_enrichment, upsert_enrichment
@@ -105,7 +106,14 @@ _EXTERNAL_SEED_IMPORT_TASKS_TABLE_LOCK = asyncio.Lock()
 # `CREATE TABLE`/`CREATE INDEX ... IF NOT EXISTS` take the table lock BEFORE
 # evaluating IF NOT EXISTS. Inside the list they are paced by the guard's
 # cooldown and dropped from the retry set as soon as they succeed.
-_EXTERNAL_SEED_IMPORT_TASKS_DDL_STATEMENTS = [
+# Guarded on Postgres (db/schema_guard.guarded_statements). Bare, each ALTER took
+# its table's ACCESS EXCLUSIVE lock, and each index build its SHARE lock, BEFORE
+# finding the column or index already there, with no lock_timeout: the first call
+# of every process queued behind any open transaction on the table, and every
+# later reader and writer queued behind it. A guarded statement runs only while
+# its column or index is missing, and one that cannot get its lock within the
+# lock_timeout fails instead, so apply_ddl_statements retries it on a later pass.
+_EXTERNAL_SEED_IMPORT_TASKS_DDL_STATEMENTS = guarded_statements([
     """
     CREATE TABLE IF NOT EXISTS employee_external_seed_import_tasks (
       id TEXT PRIMARY KEY,
@@ -135,7 +143,7 @@ _EXTERNAL_SEED_IMPORT_TASKS_DDL_STATEMENTS = [
     "ALTER TABLE employee_external_seed_import_tasks ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ;",
     "CREATE INDEX IF NOT EXISTS idx_employee_external_seed_import_tasks_status ON employee_external_seed_import_tasks(status);",
     "CREATE INDEX IF NOT EXISTS idx_employee_external_seed_import_tasks_updated_at ON employee_external_seed_import_tasks(updated_at DESC);",
-]
+])
 
 _EMPLOYEE_PCI_KB_SCOPE_REVIEWS_TABLE_READY = False
 _EMPLOYEE_PCI_KB_SCOPE_REVIEWS_TABLE_LOCK = asyncio.Lock()
@@ -286,6 +294,20 @@ def _extract_product_summary(product_data: Dict[str, Any], platform_product_id: 
         "availability": availability,
     }
 
+async def _execute_heal(statement: str) -> bool:
+    """Run one guarded self-heal statement (db/schema_guard.py). False when it gave up on
+    its lock_timeout: the heal is deferred to a later call (the caller must not memoize),
+    where the bare statement would have waited on the lock. Any other failure raises."""
+    try:
+        await database.execute(statement)
+    except Exception as exc:
+        if not is_lock_timeout(exc):
+            raise
+        logger.warning("self-heal deferred to a later call: %s", exc)
+        return False
+    return True
+
+
 async def _ensure_external_seeds_table() -> None:
     """
     Minimal storage for employee-managed external seeds.
@@ -326,58 +348,56 @@ async def _ensure_external_seeds_table() -> None:
         );
         """
     )
+    # Guarded (db/schema_guard.py): bare, each ALTER below took the table's ACCESS EXCLUSIVE
+    # lock and each index build its SHARE lock with no lock_timeout, even with nothing to add,
+    # and every seed-serving read touches this table: the first call of every process (the
+    # external-referral refresh job's included) queued behind any open transaction on it, and
+    # every reader queued behind that. A guarded statement runs only while its column or index
+    # is missing; one that cannot get its lock in time is deferred (the table stays not-ready
+    # and a later call retries it) where the bare one waited. Any other failure raises as before.
+    deferred = False
+
     # Backfill new columns for older deployments (best-effort).
     try:
-        await database.execute(
+        for statement in guarded_statements([
             "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS seed_data JSONB NOT NULL DEFAULT '{}'::jsonb;"
-        )
-    except Exception:
-        # In case the DB doesn't support JSONB (unlikely in prod), keep the table usable.
-        try:
-            await database.execute(
-                "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS seed_data TEXT;"
-            )
-        except Exception:
-            pass
-    await database.execute(
-        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS utm_template TEXT;"
-    )
-    await database.execute(
-        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS partner_type TEXT;"
-    )
-    await database.execute(
-        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS disclosure_text TEXT;"
-    )
-    await database.execute(
-        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS external_product_id TEXT;"
-    )
-    # Content freshness (migration 202 / schema_guard). THIS FUNCTION IS THE ONLY THING THAT
-    # CREATES THIS TABLE -- it is absent from SQLAlchemy metadata -- so a column declared in the
-    # migration and in schema_guard but NOT here does not exist on any database bootstrapped
-    # through this path. `ALTER TABLE IF EXISTS ... ADD COLUMN` in the guard is a silent no-op
-    # when the table is missing, and the selector references `last_crawl_attempt_at`
-    # unconditionally, so omitting it here is a hard error on first boot, not a degraded sort.
-    # Migration 200's columns were added here for exactly this reason; 202's belong here too.
-    await database.execute(
-        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS last_crawled_at TIMESTAMPTZ;"
-    )
-    await database.execute(
-        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS last_crawl_attempt_at TIMESTAMPTZ;"
-    )
-    # Destination liveness (migration 200 / schema_guard). The refresh below writes
-    # these on every completed fetch, so this table cannot be usable without them.
-    await database.execute(
-        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS destination_checked_at TIMESTAMPTZ;"
-    )
-    await database.execute(
-        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS destination_http_status INTEGER;"
-    )
-    await database.execute(
-        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS destination_verdict TEXT;"
-    )
-    await database.execute(
-        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS destination_failure_streak INTEGER NOT NULL DEFAULT 0;"
-    )
+        ]):
+            await database.execute(statement)
+    except Exception as exc:
+        if is_lock_timeout(exc):
+            # Busy, not unsupported: a TEXT column here would be permanent.
+            deferred = True
+            logger.warning("self-heal deferred to a later call: %s", exc)
+        else:
+            # In case the DB doesn't support JSONB (unlikely in prod), keep the table usable.
+            try:
+                await database.execute(
+                    "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS seed_data TEXT;"
+                )
+            except Exception:
+                pass
+    for statement in guarded_statements([
+        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS utm_template TEXT;",
+        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS partner_type TEXT;",
+        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS disclosure_text TEXT;",
+        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS external_product_id TEXT;",
+        # Content freshness (migration 202 / schema_guard). THIS FUNCTION IS THE ONLY THING THAT
+        # CREATES THIS TABLE -- it is absent from SQLAlchemy metadata -- so a column declared in the
+        # migration and in schema_guard but NOT here does not exist on any database bootstrapped
+        # through this path. `ALTER TABLE IF EXISTS ... ADD COLUMN` in the guard is a silent no-op
+        # when the table is missing, and the selector references `last_crawl_attempt_at`
+        # unconditionally, so omitting it here is a hard error on first boot, not a degraded sort.
+        # Migration 200's columns were added here for exactly this reason; 202's belong here too.
+        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS last_crawled_at TIMESTAMPTZ;",
+        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS last_crawl_attempt_at TIMESTAMPTZ;",
+        # Destination liveness (migration 200 / schema_guard). The refresh below writes
+        # these on every completed fetch, so this table cannot be usable without them.
+        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS destination_checked_at TIMESTAMPTZ;",
+        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS destination_http_status INTEGER;",
+        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS destination_verdict TEXT;",
+        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS destination_failure_streak INTEGER NOT NULL DEFAULT 0;",
+    ]):
+        deferred |= not await _execute_heal(statement)
     # The CHECK and the two partial indexes travel WITH the columns. Migration 199 and
     # db/schema_guard.py both create all four things; a table bootstrapped only through this
     # runtime path used to get the columns and neither, which is a third and quietly different
@@ -413,33 +433,21 @@ async def _ensure_external_seeds_table() -> None:
         # SQLite (the test harness) has no DO blocks and no pg_constraint. The vocabulary is
         # additionally enforced in Python by `classify_destination`, which is the only producer.
         pass
-    await database.execute(
+    for statement in guarded_statements([
         "CREATE INDEX IF NOT EXISTS idx_external_product_seeds_destination_checked "
-        "ON external_product_seeds(destination_checked_at);"
-    )
-    await database.execute(
+        "ON external_product_seeds(destination_checked_at);",
         "CREATE INDEX IF NOT EXISTS idx_external_product_seeds_destination_verdict "
-        "ON external_product_seeds(destination_verdict);"
-    )
-    await database.execute(
-        "CREATE INDEX IF NOT EXISTS idx_external_product_seeds_status ON external_product_seeds(status);"
-    )
-    await database.execute(
-        "CREATE INDEX IF NOT EXISTS idx_external_product_seeds_attached ON external_product_seeds(attached_product_key, attached_variant_id);"
-    )
-    await database.execute(
-        "CREATE INDEX IF NOT EXISTS idx_external_product_seeds_domain ON external_product_seeds(domain);"
-    )
-    await database.execute(
-        "CREATE INDEX IF NOT EXISTS idx_external_product_seeds_created_at ON external_product_seeds(created_at DESC);"
-    )
-    await database.execute(
-        "CREATE INDEX IF NOT EXISTS idx_external_product_seeds_external_product_id ON external_product_seeds(external_product_id);"
-    )
-    await database.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_external_product_seeds_active_unique ON external_product_seeds(market, tool, external_product_id) WHERE status = 'active' AND external_product_id IS NOT NULL;"
-    )
-    _EXTERNAL_SEEDS_TABLE_READY = True
+        "ON external_product_seeds(destination_verdict);",
+        "CREATE INDEX IF NOT EXISTS idx_external_product_seeds_status ON external_product_seeds(status);",
+        "CREATE INDEX IF NOT EXISTS idx_external_product_seeds_attached ON external_product_seeds(attached_product_key, attached_variant_id);",
+        "CREATE INDEX IF NOT EXISTS idx_external_product_seeds_domain ON external_product_seeds(domain);",
+        "CREATE INDEX IF NOT EXISTS idx_external_product_seeds_created_at ON external_product_seeds(created_at DESC);",
+        "CREATE INDEX IF NOT EXISTS idx_external_product_seeds_external_product_id ON external_product_seeds(external_product_id);",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_external_product_seeds_active_unique ON external_product_seeds(market, tool, external_product_id) WHERE status = 'active' AND external_product_id IS NOT NULL;",
+    ]):
+        deferred |= not await _execute_heal(statement)
+    if not deferred:
+        _EXTERNAL_SEEDS_TABLE_READY = True
 
 
 async def _ensure_external_seed_import_tasks_table() -> None:
@@ -493,13 +501,16 @@ async def _ensure_employee_pci_kb_scope_reviews_table() -> None:
             );
             """
         )
-        await database.execute(
-            "CREATE INDEX IF NOT EXISTS idx_employee_pci_kb_scope_reviews_decision ON employee_pci_kb_scope_reviews(decision);"
-        )
-        await database.execute(
-            "CREATE INDEX IF NOT EXISTS idx_employee_pci_kb_scope_reviews_reviewed_at ON employee_pci_kb_scope_reviews(reviewed_at DESC);"
-        )
-        _EMPLOYEE_PCI_KB_SCOPE_REVIEWS_TABLE_READY = True
+        # Guarded on Postgres: bare, each build took the table's SHARE lock with no
+        # lock_timeout even with the index there. One that times out on its lock
+        # leaves the table not-ready, so the next call retries it.
+        deferred = False
+        for statement in guarded_statements([
+            "CREATE INDEX IF NOT EXISTS idx_employee_pci_kb_scope_reviews_decision ON employee_pci_kb_scope_reviews(decision);",
+            "CREATE INDEX IF NOT EXISTS idx_employee_pci_kb_scope_reviews_reviewed_at ON employee_pci_kb_scope_reviews(reviewed_at DESC);",
+        ]):
+            deferred |= not await _execute_heal(statement)
+        _EMPLOYEE_PCI_KB_SCOPE_REVIEWS_TABLE_READY = not deferred
 
 
 async def _ensure_primary_offers_table() -> None:
@@ -519,12 +530,13 @@ async def _ensure_primary_offers_table() -> None:
         );
         """
     )
-    await database.execute(
-        "CREATE INDEX IF NOT EXISTS idx_employee_product_primary_offers_type ON employee_product_primary_offers(offer_type);"
-    )
-    await database.execute(
-        "CREATE INDEX IF NOT EXISTS idx_employee_product_primary_offers_updated ON employee_product_primary_offers(updated_at DESC);"
-    )
+    # Guarded on Postgres: this runs on every call, and bare each build took the
+    # table's SHARE lock with no lock_timeout even with the index there.
+    for statement in guarded_statements([
+        "CREATE INDEX IF NOT EXISTS idx_employee_product_primary_offers_type ON employee_product_primary_offers(offer_type);",
+        "CREATE INDEX IF NOT EXISTS idx_employee_product_primary_offers_updated ON employee_product_primary_offers(updated_at DESC);",
+    ]):
+        await _execute_heal(statement)
 
 
 def _stable_external_product_id(url: str) -> str:

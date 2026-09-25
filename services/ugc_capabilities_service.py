@@ -9,6 +9,7 @@ from fastapi import HTTPException
 from sqlalchemy import and_, func, or_, select, text
 
 from db.database import database
+from db.schema_guard import constraint_exists, guarded_ddl, guarded_statements
 from db.orders import orders as orders_table
 from db.reviews_center import buyer_review_user_subject, product_reviews, ugc_question_replies, ugc_questions
 from services.review_moderation_policy import assess_review_text_risk_with_deepseek, merge_moderation_risk_flags
@@ -82,28 +83,27 @@ async def ensure_ugc_tables_exist() -> None:
             )
         )
     # Backward-compatible in-place hardening for environments with old schema.
+    # Guarded (db/schema_guard.py): this runs on EVERY call, and bare the ALTERs took
+    # the table's ACCESS EXCLUSIVE lock (each index build its SHARE lock) with no
+    # lock_timeout even with nothing to change. Each now runs only while it is still
+    # needed; a lock timeout is one more failure the except below already absorbs.
     try:
-        await database.execute(text("ALTER TABLE buyer_review_user_subject ADD COLUMN IF NOT EXISTS order_id TEXT"))
-        await database.execute(text("ALTER TABLE buyer_review_user_subject DROP CONSTRAINT IF EXISTS ux_buyer_review_user_subject"))
-        await database.execute(
-            text(
-                "CREATE INDEX IF NOT EXISTS idx_buyer_review_user_subject_order_id "
-                "ON buyer_review_user_subject(order_id)"
-            )
-        )
-        await database.execute(
-            text(
-                "CREATE UNIQUE INDEX IF NOT EXISTS ux_buyer_review_user_subject_order "
-                "ON buyer_review_user_subject(user_id, subject_type, subject_id, order_id)"
-            )
-        )
-        await database.execute(
-            text(
-                "CREATE UNIQUE INDEX IF NOT EXISTS ux_buyer_review_user_subject_legacy_null_order "
-                "ON buyer_review_user_subject(user_id, subject_type, subject_id) "
-                "WHERE order_id IS NULL"
-            )
-        )
+        for statement in guarded_statements([
+            "ALTER TABLE buyer_review_user_subject ADD COLUMN IF NOT EXISTS order_id TEXT",
+            guarded_ddl(
+                "buyer_review_user_subject",
+                constraint_exists("buyer_review_user_subject", "ux_buyer_review_user_subject"),
+                "ALTER TABLE buyer_review_user_subject DROP CONSTRAINT IF EXISTS ux_buyer_review_user_subject;",
+            ),
+            "CREATE INDEX IF NOT EXISTS idx_buyer_review_user_subject_order_id "
+            "ON buyer_review_user_subject(order_id)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_buyer_review_user_subject_order "
+            "ON buyer_review_user_subject(user_id, subject_type, subject_id, order_id)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_buyer_review_user_subject_legacy_null_order "
+            "ON buyer_review_user_subject(user_id, subject_type, subject_id) "
+            "WHERE order_id IS NULL",
+        ]):
+            await database.execute(text(statement))
     except Exception:
         # Best-effort only; callers can still proceed with degraded behavior.
         pass
@@ -132,7 +132,9 @@ async def ensure_ugc_tables_exist() -> None:
             )
         )
     try:
-        await database.execute(text("ALTER TABLE ugc_questions ADD COLUMN IF NOT EXISTS risk_flags JSONB"))
+        # Guarded, as above: bare, every call took the table's ACCESS EXCLUSIVE lock.
+        for statement in guarded_statements(["ALTER TABLE ugc_questions ADD COLUMN IF NOT EXISTS risk_flags JSONB"]):
+            await database.execute(text(statement))
     except Exception:
         pass
 
@@ -159,7 +161,9 @@ async def ensure_ugc_tables_exist() -> None:
             )
         )
     try:
-        await database.execute(text("ALTER TABLE ugc_question_replies ADD COLUMN IF NOT EXISTS risk_flags JSONB"))
+        # Guarded, as above: bare, every call took the table's ACCESS EXCLUSIVE lock.
+        for statement in guarded_statements(["ALTER TABLE ugc_question_replies ADD COLUMN IF NOT EXISTS risk_flags JSONB"]):
+            await database.execute(text(statement))
     except Exception:
         pass
 

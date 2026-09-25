@@ -110,6 +110,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 
 from db._ddl_guard import apply_ddl_statements
+from db.schema_guard import column_is_not_null, guarded_ddl, guarded_statements
 from db.database import database, metadata
 
 logger = logging.getLogger(__name__)
@@ -221,7 +222,14 @@ _DDL_READY = False
 _DDL_LOCK = asyncio.Lock()
 
 
-_DDL_STATEMENTS = [
+# Guarded on Postgres (db/schema_guard.guarded_statements). Bare, each ALTER took
+# its table's ACCESS EXCLUSIVE lock, and each index build its SHARE lock, BEFORE
+# finding the column or index already there, with no lock_timeout: the first call
+# of every process queued behind any open transaction on the table, and every
+# later reader and writer queued behind it. A guarded statement runs only while
+# its column or index is missing, and one that cannot get its lock within the
+# lock_timeout fails instead, so apply_ddl_statements retries it on a later pass.
+_DDL_STATEMENTS = guarded_statements([
     """
     CREATE TABLE IF NOT EXISTS merchant_audit_runs (
       run_id                        UUID PRIMARY KEY,
@@ -278,9 +286,16 @@ _DDL_STATEMENTS = [
     # backstop, so the constraint has to be dropped explicitly for any
     # database that already has the table. DROP NOT NULL is idempotent on
     # Postgres and fails-and-skips on SQLite, where create_all builds the
-    # table from the model (already nullable) instead.
-    "ALTER TABLE merchant_audit_runs "
-    "ALTER COLUMN merchant_id DROP NOT NULL;",
+    # table from the model (already nullable) instead (so does the guarded
+    # form: SQLite has no DO blocks). Guarded: it runs only while the column is
+    # still NOT NULL. Bare, it took ACCESS EXCLUSIVE on every process's first
+    # call although it changes nothing after its first run.
+    guarded_ddl(
+        "merchant_audit_runs",
+        column_is_not_null("merchant_audit_runs", "merchant_id"),
+        "ALTER TABLE merchant_audit_runs "
+        "ALTER COLUMN merchant_id DROP NOT NULL;",
+    ),
     "ALTER TABLE merchant_audit_runs "
     "ADD COLUMN IF NOT EXISTS merchant_claimed_at TIMESTAMPTZ;",
     "CREATE INDEX IF NOT EXISTS idx_merchant_audit_runs_unclaimed "
@@ -295,7 +310,7 @@ _DDL_STATEMENTS = [
     "WHERE idempotency_key IS NOT NULL "
     "AND stage IN ('queued', 'discovering', 'probing', 'scoring', "
     "'materializing', 'verifying');",
-]
+])
 
 
 async def ensure_merchant_audit_runs_table() -> None:

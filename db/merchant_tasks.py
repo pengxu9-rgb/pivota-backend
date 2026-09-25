@@ -37,6 +37,7 @@ from sqlalchemy.dialects.postgresql import JSONB, UUID
 
 from db._jsonb_safe import _json_safe
 from db.database import database, metadata
+from db.schema_guard import guarded_statements
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +115,14 @@ merchant_tasks = Table(
 _DDL_READY = False
 _DDL_LOCK = asyncio.Lock()
 
-_DDL_STATEMENTS = [
+# Guarded on Postgres (db/schema_guard.guarded_statements). Bare, each ALTER took
+# its table's ACCESS EXCLUSIVE lock, and each index build its SHARE lock, BEFORE
+# finding the column or index already there, with no lock_timeout: the first call
+# of every process queued behind any open transaction on the table, and every
+# later reader and writer queued behind it. A guarded statement runs only while
+# its column or index is missing, and one that cannot get its lock within the
+# lock_timeout fails instead, so the pass is not memoized and a later call retries.
+_DDL_STATEMENTS = guarded_statements([
     """
     CREATE TABLE IF NOT EXISTS merchant_tasks (
       task_id                  UUID PRIMARY KEY,
@@ -161,7 +169,7 @@ _DDL_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_merchant_tasks_superseded_by "
     "ON merchant_tasks (superseded_by_task_id) "
     "WHERE superseded_by_task_id IS NOT NULL;",
-]
+])
 
 
 async def ensure_merchant_tasks_table() -> None:
