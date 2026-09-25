@@ -57,6 +57,15 @@ async def _refresh_unbounded(seed_id: str) -> Dict[str, Any]:
     `CRAWL_MAX_ROBOTS_DELAY_SECONDS` now bounds what any ONE row here can cost, and
     `--budget-seconds` bounds the run. Both are prerequisites for ever putting this job on a
     schedule.
+
+    NOR IS IT PATIENCE FOR ONE HOST AT THE EXPENSE OF ALL THE OTHERS. The loop is serial, so every
+    second spent waiting out one host's hold is a second no other host is read. On 09-20/21/22
+    fentybeauty.com's 429 cycle (x9 up to the 300s cap, one request through, repeat) spent the
+    entire 3300s budget and the run refreshed 81-85 of 4,000 rows. The batch now stops asking a
+    host once it has answered `EXTERNAL_REFERRAL_REFRESH_HOST_BLOCK_TRIP` 429/503s in a row
+    (`services.external_referral_readiness.host_backoff_tripped`). That is strictly MORE polite,
+    not less — the host gets no further requests this run — and its rows stay unstamped at the
+    head of tomorrow's queue. Per-row patience is unchanged.
     """
     return await _refresh_external_seed_by_id(seed_id, max_wait=0)
 
@@ -114,10 +123,13 @@ def main() -> int:
     status = str(summary.get("status") or "").strip().lower()
     if status != "success":
         logger.warning(
-            "external referral refresh finished %s (stopped_early=%s origin_yield=%s reasons=%s)",
+            "external referral refresh finished %s (stopped_early=%s budget_reach=%s "
+            "origin_yield=%s host_backoff_skips=%s reasons=%s)",
             status,
             summary.get("stopped_early"),
+            summary.get("budget_reach"),
             summary.get("origin_yield"),
+            summary.get("host_backoff_skips"),
             summary.get("degraded_reason_counts"),
         )
         return 1
