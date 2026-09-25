@@ -8,10 +8,12 @@ that boolean as `offers[].availability.in_stock`, and the gateway lets a boolean
 `in_stock` outrank every other stock signal, so a seed stored `out_of_stock` was
 advertised in stock.
 
-UNKNOWN IS NOT IN STOCK. `_availability_to_in_stock` (the variant loop's parser)
-reads an absent value as in stock. The product level uses the explicit-signal
-parser instead and serves an unknown claim as `availability: "unknown"` with NO
-boolean — the shape the live-verification branch already serves.
+UNKNOWN IS NOT IN STOCK. The builders' old `_availability_to_in_stock` read an
+absent value as in stock. The rule now lives in `services/external_seed_stock`,
+reads every value through the shared availability vocabulary, and serves an
+unknown claim as `availability: "unknown"` with NO boolean — the shape the
+live-verification branch already serves. A variant with no signal of its own
+inherits the product claim.
 
 Parametrised over both builders: `routes/agent_sdk_fixed.py` holds a second
 copy and both are routed.
@@ -246,3 +248,57 @@ async def test_in_stock_only_and_agent_v2_read_the_seeds_own_claim(monkeypatch):
 
     assert [o["availability"]["in_stock"] for o in _canonicalize_search_product(out)["offers"]] == [False]
     assert [o["availability"]["in_stock"] for o in _canonicalize_search_product(in_)["offers"]] == [True]
+    # KNOWN GAP, pinned so changing it is deliberate: agent_v2 defaults a missing
+    # `in_stock` to True, exactly as it already does for every live-verification row.
+    # Publishing unknown as null is an agent_v2 contract change with its own blast radius.
+    assert [o["availability"]["in_stock"] for o in _canonicalize_search_product(unknown)["offers"]] == [True]
+
+
+@pytest.mark.parametrize("module_path", _MODULES)
+@pytest.mark.asyncio
+async def test_a_variant_with_no_signal_inherits_the_product_claim(module_path, monkeypatch):
+    seed = _seed_row(
+        availability="out_of_stock",
+        variants=[_variant("1", None), _variant("2", "")],
+    )
+    product = await _build(module_path, seed, monkeypatch)
+    assert _stock(product) == OUT
+    # The gateway's offer card reads the VARIANT's in_stock before the product's.
+    assert [(v["in_stock"], v["inventory_quantity"]) for v in product["variants"]] == [
+        (False, 0),
+        (False, 0),
+    ]
+
+
+@pytest.mark.parametrize("module_path", _MODULES)
+@pytest.mark.asyncio
+async def test_a_variants_own_explicit_signal_beats_the_product_claim(module_path, monkeypatch):
+    # "out of stock" with a space read as IN stock under the old variant parser.
+    seed = _seed_row(
+        availability="in_stock",
+        variants=[_variant("1", "in stock"), _variant("2", "out of stock")],
+    )
+    product = await _build(module_path, seed, monkeypatch)
+    assert _stock(product) == IN
+    assert [v["in_stock"] for v in product["variants"]] == [True, False]
+
+
+@pytest.mark.parametrize("module_path", _MODULES)
+@pytest.mark.parametrize("column", ["https://schema.org/OutOfStock", "OOS", "Sold Out"])
+@pytest.mark.asyncio
+async def test_any_out_of_stock_spelling_the_shared_vocabulary_knows(module_path, column, monkeypatch):
+    product = await _build(module_path, _seed_row(availability=column), monkeypatch)
+    assert _stock(product) == OUT
+
+
+@pytest.mark.parametrize("module_path", _MODULES)
+@pytest.mark.asyncio
+async def test_snapshot_only_variants_give_both_lanes_the_same_claim(module_path, monkeypatch):
+    # agent_sdk_fixed's own variant reader has no snapshot fallback; the claim must not
+    # depend on which routed builder served the seed.
+    seed = _seed_row(
+        availability="out_of_stock",
+        seed_data_extra={"variants": None, "snapshot": {"variants": [_variant("1", "in_stock")]}},
+    )
+    product = await _build(module_path, seed, monkeypatch)
+    assert _stock(product) == UNKNOWN

@@ -63,6 +63,11 @@ from services.outbound_links_service import (
     market_is_observed,
     TOKEN_MARKET_OBSERVED_KEY,
 )
+from services.external_seed_stock import (
+    seed_stock_fields,
+    seed_stock_state,
+    seed_variant_in_stock,
+)
 from services.external_seed_search import (
     build_seed_quarantine_anti_join as _seed_quarantine_clause,
     dedupe_external_seed_rows,
@@ -3557,17 +3562,6 @@ async def _search_products_fast_mode(
     }
 
 
-def _availability_to_in_stock(availability: Any) -> bool:
-    if availability is None:
-        return True
-    if isinstance(availability, bool):
-        return availability
-    raw = str(availability).strip().lower()
-    if not raw:
-        return True
-    return raw not in {"out_of_stock", "outofstock", "sold_out", "soldout", "unavailable"}
-
-
 def _known_product_stock_state(product: Dict[str, Any]) -> Optional[bool]:
     """Return a stock decision only when the row carries an explicit signal."""
     verification = product.get("commerce_verification")
@@ -3589,75 +3583,6 @@ def _known_product_stock_state(product: Dict[str, Any]) -> Optional[bool]:
         }:
             return False
     return None
-
-
-def _external_seed_stock_state(
-    seed_row: Dict[str, Any],
-    seed_data: Dict[str, Any],
-    seed_variants: List[Dict[str, Any]],
-) -> Optional[bool]:
-    """The seed's OWN product-level stock claim, or None when it makes none.
-
-    Until 2026-09-25 the builder hard-coded `in_stock: True` for every seed whose
-    catalog facts the gate accepts, so a seed stored `out_of_stock` was advertised
-    in stock (agent_v2 and the gateway both read the product-level boolean, and
-    the gateway lets it outrank every other signal).
-
-    Parsed with `_known_product_stock_state`, NOT `_availability_to_in_stock`:
-    the latter reads an absent/empty value as IN stock, which is a claim the
-    source never made. Unknown stays unknown (None) and the caller serves the
-    same `availability: "unknown"` shape the live-verification branch does.
-
-    Precedence: the `availability` column (every writer stamps it as the seed's
-    summary). An explicit variant that CONTRADICTS the column makes the claim
-    unknown rather than picking a side — measured 2026-09-25, 272 of 12,020
-    active seeds disagree (156 column-out/variant-in, 116 the reverse). With no
-    usable column, explicit variants decide (any in -> in, all out -> out), then
-    seed_data / snapshot `availability`.
-    """
-    def _state(value: Any) -> Optional[bool]:
-        return _known_product_stock_state({"availability": value})
-
-    variant_states = [
-        state
-        for state in (_state(v.get("availability")) for v in seed_variants)
-        if state is not None
-    ]
-    if True in variant_states:
-        variant_state: Optional[bool] = True
-    elif variant_states and len(variant_states) == len(seed_variants):
-        variant_state = False
-    else:
-        variant_state = None
-
-    column_state = _state(seed_row.get("availability"))
-    if column_state is not None:
-        if variant_state is not None and variant_state != column_state:
-            return None
-        return column_state
-    if variant_state is not None:
-        return variant_state
-    snapshot = seed_data.get("snapshot")
-    for value in (
-        seed_data.get("availability"),
-        snapshot.get("availability") if isinstance(snapshot, dict) else None,
-    ):
-        state = _state(value)
-        if state is not None:
-            return state
-    return None
-
-
-def _external_seed_stock_fields(stock_state: Optional[bool]) -> Dict[str, Any]:
-    """Product-level stock fields for a seed whose catalog facts are trusted."""
-    if stock_state is True:
-        return {"in_stock": True, "inventory_quantity": 999}
-    if stock_state is False:
-        return {"in_stock": False, "inventory_quantity": 0, "availability": "out_of_stock"}
-    # No boolean at all, never `in_stock: None`: agent_v2 reads None as False (a
-    # sold-out claim) while a missing key gets the same default it already gives
-    # live-verification rows, and the gateway falls through to the variants.
-    return {"availability": "unknown"}
 
 
 def _known_product_price(
@@ -3943,6 +3868,11 @@ async def _build_external_seed_product(
         price = 0.0
 
     seed_variants = _seed_variants(seed_data)
+    # The seed's own claim (services/external_seed_stock). Not computed on the
+    # live-verification path, which withholds stock and serves no variants.
+    stock_state = (
+        None if requires_live_verification else seed_stock_state(seed_row, seed_data)
+    )
     variants: List[Dict[str, Any]] = []
     seen_variant_ids: set[str] = set()
     for idx, v in enumerate(seed_variants):
@@ -3963,7 +3893,7 @@ async def _build_external_seed_product(
             variant_price = price
 
         availability = v.get("availability")
-        in_stock = _availability_to_in_stock(availability)
+        in_stock = seed_variant_in_stock(availability, stock_state)
         image_url = v.get("image_url") or v.get("image")
         if isinstance(image_url, str):
             image_url = image_url.strip() or None
@@ -3995,9 +3925,7 @@ async def _build_external_seed_product(
         if len(variants) >= 30:
             break
 
-    stock_fields = _external_seed_stock_fields(
-        _external_seed_stock_state(seed_row, seed_data, seed_variants)
-    )
+    stock_fields = seed_stock_fields(stock_state)
     if requires_live_verification:
         # Preserve recall without promoting stale or contradictory commerce
         # facts. The merchant checkout/live quote path owns verification.
