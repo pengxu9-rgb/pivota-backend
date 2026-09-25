@@ -2,7 +2,7 @@
 
 This is the fast, engine-free half of the fix. It runs on the default SQLite
 suite and covers the WRITER: the endpoint allowlist, and the agreement between
-that allowlist and migration 208's CHECK list.
+that allowlist and migration 242's CHECK list.
 
 It cannot see the constraint itself — SQLite does not enforce it, and a recorded-
 SQL double never reaches a database at all. The READER half, which executes a
@@ -31,7 +31,7 @@ from fastapi import HTTPException
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-MIGRATION_208 = REPO_ROOT / "db" / "migrations" / "208_orders_psp_used_valid_provider.sql"
+MIGRATION_242 = REPO_ROOT / "db" / "migrations" / "242_orders_psp_used_valid_provider.sql"
 
 
 def _startup_merchant_psps_ddl() -> str:
@@ -94,11 +94,11 @@ async def _merchant_lookup_table():
             await database.disconnect()
 
 
-def _migration_208_providers() -> tuple:
-    """The provider list migration 208 teaches orders.psp_used, read from the file."""
-    body = MIGRATION_208.read_text(encoding="utf-8")
+def _migration_242_providers() -> tuple:
+    """The provider list migration 242 teaches orders.psp_used, read from the file."""
+    body = MIGRATION_242.read_text(encoding="utf-8")
     in_list = re.search(r"psp_used IN \(([^)]*)\)", body, re.DOTALL)
-    assert in_list, "migration 208 no longer contains a `psp_used IN (...)` list"
+    assert in_list, "migration 242 no longer contains a `psp_used IN (...)` list"
     return tuple(re.findall(r"'([a-z_]+)'", in_list.group(1)))
 
 
@@ -121,14 +121,14 @@ def test_the_allowlist_is_the_canonical_set_plus_paypal() -> None:
 def test_the_endpoint_never_accepts_what_the_constraint_refuses() -> None:
     """THE invariant. Every provider the door takes, `orders` must be able to store.
 
-    This is the whole defect in one assertion. It reads migration 208's list from
+    This is the whole defect in one assertion. It reads migration 242's list from
     the file rather than restating it, so widening the endpoint without widening
     the constraint — the exact mistake that produced this bug — turns it red.
     """
     from routes.employee_store_psp_fixes import SETUP_PSP_ALLOWED_PROVIDERS
 
-    allowed_by_constraint = set(_migration_208_providers())
-    assert allowed_by_constraint, "parsed zero providers out of migration 208"
+    allowed_by_constraint = set(_migration_242_providers())
+    assert allowed_by_constraint, "parsed zero providers out of migration 242"
     unstorable = set(SETUP_PSP_ALLOWED_PROVIDERS) - allowed_by_constraint
     assert not unstorable, (
         f"setup-psp accepts {sorted(unstorable)}, which orders.psp_used refuses — "
@@ -141,7 +141,7 @@ def test_the_deferred_sentinel_is_storable_too() -> None:
     """The capability-gated lane's provider must also survive the constraint."""
     from routes.order_routes import CAPABILITY_DEFERRED_PSP_PROVIDER
 
-    assert CAPABILITY_DEFERRED_PSP_PROVIDER in _migration_208_providers()
+    assert CAPABILITY_DEFERRED_PSP_PROVIDER in _migration_242_providers()
 
 
 def test_the_deferred_sentinel_psp_id_matches_the_orders_format_rule() -> None:
@@ -173,7 +173,7 @@ async def test_the_route_rejects_an_unsupported_provider_before_touching_the_db(
     merchant lookup, so no database is needed here: if the guard were moved below
     that lookup this test would fail on the missing table rather than pass.
 
-    'braintree' is in the orders CHECK (migration 006 put it there and 208 keeps
+    'braintree' is in the orders CHECK (migration 006 put it there and 242 keeps
     it, because dropping a name is a narrowing) but has no adapter in this repo,
     so the door must still refuse it. The constraint list is a floor, not a menu.
     """

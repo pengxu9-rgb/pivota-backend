@@ -721,7 +721,7 @@ def _resolve_order_live_readiness_requirement(
 # latent rather than live — the same silent writer/reader disagreement as the
 # psp_id-format defect fixed in 20f4542c, one env var away.
 #
-# 'protocol_deferred' is admitted by the widened list in migration 208.
+# 'protocol_deferred' is admitted by the widened list in migration 242.
 CAPABILITY_DEFERRED_PSP_PROVIDER = "protocol_deferred"
 
 

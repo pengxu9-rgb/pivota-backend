@@ -29,7 +29,7 @@ Reproduced against Postgres 15 on 2026-09-01: setup-psp returned 200
 — the identical failure mode as the psp_id-format defect fixed in 20f4542c: the
 merchant saves, validates, sees "connected", and every order creation 500s. The
 two ends are fixed differently and both halves are asserted below: 'antom' is
-real, so migration 208 widens the constraint to admit it; 'square' is not, so the
+real, so migration 242 widens the constraint to admit it; 'square' is not, so the
 endpoint refuses it with a 400 at onboarding.
 
 A SECOND writer/reader disagreement on the same row, fixed here too: this route
@@ -61,7 +61,7 @@ MUTANTS THESE KILL:
      subsequent real INSERT dies with the production error verbatim.
 * add 'square' to SETUP_PSP_ALLOWED_PROVIDERS
   -> the same test fails at the INSERT, for the same reason.
-* drop 'antom' from migration 208's list
+* drop 'antom' from migration 242's list
   -> test_antom_onboards_and_then_really_sells fails at the real INSERT.
 * restore the inline `uuid.uuid4().hex[:8]` psp_id mint in
   routes/employee_store_psp_fixes.py
@@ -69,7 +69,7 @@ MUTANTS THESE KILL:
      production error verbatim.
 * revert _capability_deferred_psp_id to `f"{merchant_id}:protocol_deferred"`
   -> test_the_deferred_lane_sentinel_is_insertable fails on check_psp_id_format.
-* drop 'protocol_deferred' from migration 208's list
+* drop 'protocol_deferred' from migration 242's list
   -> the same test fails on check_psp_used_valid_provider.
 * let the fixture stand in for the constraint (build the tables but skip the
   migration) -> test_the_constraint_is_installed_and_widened fails, and every
@@ -121,9 +121,9 @@ _MERCHANT_ID = "merch_pspprov_gate"
 ORDERS_PROVIDER_CONSTRAINT = "check_psp_used_valid_provider"
 ORDERS_PSP_ID_CONSTRAINT = "check_psp_id_format"
 
-MIGRATION_208 = "208_orders_psp_used_valid_provider.sql"
+MIGRATION_242 = "242_orders_psp_used_valid_provider.sql"
 
-# The providers migration 208 teaches `orders`. Asserted below to be exactly the
+# The providers migration 242 teaches `orders`. Asserted below to be exactly the
 # list the migration file states, so this literal cannot drift away from the
 # constraint it claims to describe.
 WIDENED_PROVIDERS = (
@@ -202,7 +202,7 @@ async def _db():
 
     # The REAL constraints, from the REAL migration files, applied in the order a
     # real database sees them: 006 states the narrow list (a bare ADD, so drop
-    # first), then 208 widens it. Running 006 first is deliberate — it proves 208
+    # first), then 242 widens it. Running 006 first is deliberate — it proves 242
     # actually replaces the narrow constraint rather than merely being present on
     # a database that never had one.
     await database.execute(
@@ -214,8 +214,8 @@ async def _db():
     migration_006 = _migration("006_psp_fields_constraints.sql")
     await database.execute(_constraint_statement(migration_006, ORDERS_PROVIDER_CONSTRAINT))
     await database.execute(_constraint_statement(migration_006, ORDERS_PSP_ID_CONSTRAINT))
-    # 208 carries its own guard, so it is applied whole and is idempotent.
-    await database.execute(_migration(MIGRATION_208))
+    # 242 carries its own guard, so it is applied whole and is idempotent.
+    await database.execute(_migration(MIGRATION_242))
 
     await _cleanup()
     await database.execute(
@@ -237,7 +237,7 @@ async def _db():
         )
         # This file never ADDS merchant_psps' constraint — but
         # test_the_schema_guard_twin_really_installs_it runs the REAL
-        # ensure_required_schema_light(), which installs migration 207's as a side
+        # ensure_required_schema_light(), which installs migration 241's as a side
         # effect and does not remove it.
         #
         # HONESTLY: no sibling fails today without this line. Every merchant_psps
@@ -301,7 +301,7 @@ async def _run_self_service_onboarding(provider: str):
 def test_the_migration_states_exactly_the_list_this_file_asserts_on() -> None:
     # If the migration's list and this file's literal drift apart, the constraint
     # that fires in production is not the one the tests below reason about.
-    body = _migration(MIGRATION_208)
+    body = _migration(MIGRATION_242)
     statement = _constraint_statement(body, ORDERS_PROVIDER_CONSTRAINT)
     # Only the IN list — the surrounding DO block quotes constraint and table
     # names too, and those are not part of the vocabulary under test.
@@ -312,7 +312,7 @@ def test_the_migration_states_exactly_the_list_this_file_asserts_on() -> None:
 
 
 async def test_the_constraint_is_installed_and_widened() -> None:
-    # Non-vacuity: if the fixture built the tables but 208 did not land, every
+    # Non-vacuity: if the fixture built the tables but 242 did not land, every
     # acceptance assertion below would pass for the wrong reason.
     from db.database import database
 
@@ -339,7 +339,7 @@ async def test_widening_does_not_downgrade_a_validated_constraint() -> None:
     that satisfied the old constraint can fail the new one; the migration re-earns
     the flag instead of discarding it.
 
-    The fixture applies 006 then 208, which is exactly production's history.
+    The fixture applies 006 then 242, which is exactly production's history.
     """
     from db.database import database
 
@@ -376,7 +376,7 @@ async def test_the_widen_still_survives_a_row_no_list_ever_allowed() -> None:
     )
 
     # Must not raise, even though a row violates every version of the list.
-    await database.execute(_migration(MIGRATION_208))
+    await database.execute(_migration(MIGRATION_242))
 
     row = dict(
         await database.fetch_one(
@@ -402,7 +402,7 @@ async def test_the_widen_still_survives_a_row_no_list_ever_allowed() -> None:
     assert ORDERS_PROVIDER_CONSTRAINT in str(excinfo.value), str(excinfo.value)
 
 
-async def test_migration_208_is_idempotent() -> None:
+async def test_migration_242_is_idempotent() -> None:
     # schema_guard runs this same logic on EVERY boot. Applying it twice must not
     # error, and — because `orders` is the table every checkout writes — the
     # second application must not touch the constraint at all.
@@ -415,7 +415,7 @@ async def test_migration_208_is_idempotent() -> None:
             {"n": ORDERS_PROVIDER_CONSTRAINT},
         )
     )["oid"]
-    await database.execute(_migration(MIGRATION_208))
+    await database.execute(_migration(MIGRATION_242))
     after = dict(
         await database.fetch_one(
             "SELECT oid FROM pg_constraint WHERE conname = :n"
@@ -475,7 +475,7 @@ async def test_the_schema_guard_twin_really_installs_it() -> None:
         "downgrades the invariant production already had proven"
     )
 
-    # Migration 207's twin rides in the same function and is installed by the same
+    # Migration 241's twin rides in the same function and is installed by the same
     # call, so assert it here rather than leave it an unclaimed side effect. This
     # is deliberately belt-and-braces: tests/test_psp_id_format_constraint_postgres.py
     # also drives ensure_required_schema_light for that constraint, and goes
@@ -488,7 +488,7 @@ async def test_the_schema_guard_twin_really_installs_it() -> None:
         {"n": "check_merchant_psps_psp_id_format"},
     )
     assert psps_row is not None, (
-        "the startup guard did not install migration 207's merchant_psps constraint "
+        "the startup guard did not install migration 241's merchant_psps constraint "
         "— on a fast-mode deploy nothing else would"
     )
     assert dict(psps_row)["convalidated"] is False, (
@@ -681,7 +681,7 @@ async def test_every_provider_the_endpoint_accepts_the_constraint_accepts() -> N
 
     A per-provider list here would go stale the day someone adds a PSP; this
     iterates SETUP_PSP_ALLOWED_PROVIDERS itself, so widening the endpoint without
-    widening migration 208 turns this red.
+    widening migration 242 turns this red.
     """
     from db.database import database
     from db.orders import create_order

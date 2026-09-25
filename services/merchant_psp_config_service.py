@@ -54,7 +54,7 @@ def _generate_psp_id(provider: str) -> str:
     """Mint a psp_id that `orders` and `merchant_psps` will both accept.
 
     The rule, from db/migrations/006_psp_fields_constraints.sql and mirrored by
-    migration 207:
+    migration 241:
 
         ^psp_[a-z0-9]+_[a-z0-9]{12}$
 

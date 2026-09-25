@@ -3,7 +3,7 @@
 
 WHAT "UNACCEPTED" MEANS
     `orders` carries CHECK check_psp_used_valid_provider. Migration 006 froze its
-    list at five names; migration 208 widens it to every provider this code
+    list at five names; migration 242 widens it to every provider this code
     actually writes:
 
         stripe, adyen, checkout, paypal, braintree, antom, protocol_deferred
@@ -41,7 +41,7 @@ USAGE
     Report-only by default. Exits non-zero while any active row is unservable, so
     a scheduled run is visibly red.
 
-    Once the report is empty, promote migration 208's constraint from NOT VALID:
+    Once the report is empty, promote migration 242's constraint from NOT VALID:
 
         ALTER TABLE orders VALIDATE CONSTRAINT check_psp_used_valid_provider;
 """
@@ -59,25 +59,25 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-MIGRATION_208 = REPO_ROOT / "db" / "migrations" / "208_orders_psp_used_valid_provider.sql"
+MIGRATION_242 = REPO_ROOT / "db" / "migrations" / "242_orders_psp_used_valid_provider.sql"
 
 
 def accepted_providers() -> List[str]:
-    """Read the list out of migration 208 rather than restating it here.
+    """Read the list out of migration 242 rather than restating it here.
 
     A second copy of the vocabulary is a second thing to forget to update — which
     is the whole shape of the defect this script exists for.
     """
-    body = MIGRATION_208.read_text(encoding="utf-8")
+    body = MIGRATION_242.read_text(encoding="utf-8")
     match = re.search(r"psp_used IN \(([^)]*)\)", body, re.DOTALL)
     if not match:
         raise SystemExit(
-            f"{MIGRATION_208.name} no longer contains a `psp_used IN (...)` list — "
+            f"{MIGRATION_242.name} no longer contains a `psp_used IN (...)` list — "
             "this script cannot state the rule it is auditing against"
         )
     providers = re.findall(r"'([a-z_]+)'", match.group(1))
     if not providers:
-        raise SystemExit(f"parsed zero providers out of {MIGRATION_208.name}")
+        raise SystemExit(f"parsed zero providers out of {MIGRATION_242.name}")
     return providers
 
 
@@ -160,7 +160,7 @@ def main() -> int:
             findings = _rows(cursor)
 
             # Rows already IN orders that the constraint would refuse. Under
-            # migration 208's NOT VALID these are not rejected retroactively, so
+            # migration 242's NOT VALID these are not rejected retroactively, so
             # they are exactly what blocks the VALIDATE step named in the header.
             cursor.execute(
                 """
@@ -206,7 +206,7 @@ def main() -> int:
                 total = sum(int(r["n"]) for r in orphaned_orders)
                 print(
                     f"\n{total} existing orders row(s) hold a psp_used outside the list. "
-                    "Migration 208's constraint is NOT VALID, so these are not rejected "
+                    "Migration 242's constraint is NOT VALID, so these are not rejected "
                     "retroactively — but they must be resolved before VALIDATE:\n"
                 )
                 for row in orphaned_orders:
@@ -221,7 +221,7 @@ def main() -> int:
                 print("\n--deactivate: taking these rows out of runtime selection")
                 for row in active:
                     # ORDERING TRAP, verified on Postgres 15 against a real prod
-                    # row. Migration 207 puts CHECK check_merchant_psps_psp_id_format
+                    # row. Migration 241 puts CHECK check_merchant_psps_psp_id_format
                     # on this table. NOT VALID spares EXISTING rows at ADD time but
                     # enforces every subsequent UPDATE -- including one that does
                     # not touch psp_id at all. So a row whose psp_id is ALSO

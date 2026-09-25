@@ -1522,7 +1522,7 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
-            # Migration 207: merchant_psps.psp_id must satisfy the SAME regex
+            # Migration 241: merchant_psps.psp_id must satisfy the SAME regex
             # `orders.psp_id` has enforced since migration 006. Order creation
             # copies this column into orders.psp_id, so a malformed id written
             # here is a 500 the merchant only meets at their first sale. Prod
@@ -1600,12 +1600,12 @@ async def ensure_required_schema_light() -> None:
             # NOTE ON PLACEMENT: this block is deliberately NOT next to the
             # merchant_psps ADD COLUMN statements above, which is where it
             # naturally belongs by subject. That seam is where the sibling psp_id
-            # fix (20f4542c, migration 207) also inserts, and two independent
+            # fix (20f4542c, migration 241) also inserts, and two independent
             # additions at one anchor merge as a CONFLICT whose correct resolution
             # is a UNION -- precisely the resolution someone drops a block during.
             # Order does not matter here: the statement is self-guarding on
             # to_regclass('orders') and touches nothing else in this function.
-            # Migration 208: `orders.psp_used` must accept every provider this
+            # Migration 242: `orders.psp_used` must accept every provider this
             # code WRITES. Migration 006 froze the list at five names
             # ('stripe','adyen','checkout','paypal','braintree'); the code moved
             # on. `_resolve_active_order_psp` copies merchant_psps.provider into

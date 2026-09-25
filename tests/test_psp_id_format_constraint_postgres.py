@@ -36,7 +36,7 @@ MUTANTS THESE KILL:
      INSERT, with the production error verbatim.
 * widen `{12}` to `{8}` or `+` in _generate_psp_id
   -> the same test fails on the regex assertion pinned to migration 006's text.
-* delete migration 207's constraint
+* delete migration 241's constraint
   -> test_merchant_psps_rejects_a_malformed_id_at_write_time fails.
 * let the fixture stand in for the constraint (build the tables but skip the
   migrations) -> test_both_constraints_are_installed fails, and every rejection
@@ -160,14 +160,14 @@ async def _db():
     await database.execute(_startup_merchant_psps_ddl())
 
     # The REAL constraints, from the REAL migration files. Both are idempotent:
-    # 006's is a bare ADD, so drop first; 207's carries its own IF NOT EXISTS.
+    # 006's is a bare ADD, so drop first; 241's carries its own IF NOT EXISTS.
     await database.execute(
         f"ALTER TABLE orders DROP CONSTRAINT IF EXISTS {ORDERS_CONSTRAINT}"
     )
     await database.execute(
         _constraint_statement(_migration("006_psp_fields_constraints.sql"), ORDERS_CONSTRAINT)
     )
-    await database.execute(_migration("207_merchant_psps_psp_id_format.sql"))
+    await database.execute(_migration("241_merchant_psps_psp_id_format.sql"))
 
     await _cleanup()
     await database.execute(
@@ -180,7 +180,7 @@ async def _db():
         yield
     finally:
         await _cleanup()
-        # 207's constraint is dropped again on the way out. These gate files share
+        # 241's constraint is dropped again on the way out. These gate files share
         # ONE database and siblings insert merchant_psps rows with short, made-up
         # ids (tests/test_acp_checkout_sessions_postgres.py); leaving a live
         # constraint behind would make this file's result depend on collection
@@ -248,9 +248,9 @@ def test_the_two_migrations_state_the_same_rule() -> None:
     # any of the three drifts, the constraint that fires in production is not the
     # one the tests below assert on.
     orders_body = _migration("006_psp_fields_constraints.sql")
-    psps_body = _migration("207_merchant_psps_psp_id_format.sql")
+    psps_body = _migration("241_merchant_psps_psp_id_format.sql")
     assert PSP_ID_FORMAT_REGEX in orders_body, "migration 006 no longer states this regex"
-    assert PSP_ID_FORMAT_REGEX in psps_body, "migration 207 no longer states this regex"
+    assert PSP_ID_FORMAT_REGEX in psps_body, "migration 241 no longer states this regex"
 
 
 async def _constraint_present(name: str) -> bool:
@@ -319,7 +319,7 @@ async def test_the_pre_fix_id_shape_is_still_rejected_by_orders() -> None:
 async def test_merchant_psps_rejects_a_malformed_id_at_write_time() -> None:
     """The deeper fix: the writer refuses what the reader would refuse.
 
-    Before migration 207 this INSERT succeeded and the merchant only found out at
+    Before migration 241 this INSERT succeeded and the merchant only found out at
     their first sale.
     """
     from db.database import database
@@ -340,7 +340,7 @@ async def test_merchant_psps_rejects_a_malformed_id_at_write_time() -> None:
 async def test_startup_self_heal_installs_the_constraint_when_migrations_are_skipped() -> None:
     """The path production actually takes.
 
-    Prod fast-mode boot skips db/migrations/ entirely, so migration 207 alone is
+    Prod fast-mode boot skips db/migrations/ entirely, so migration 241 alone is
     not enough — db/schema_guard.ensure_required_schema_light() owns the apply
     there, exactly as it already does for the merchant_psps COLUMNS above it. A
     constraint that exists only in db/migrations/ would never reach the database

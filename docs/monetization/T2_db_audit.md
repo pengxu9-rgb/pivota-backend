@@ -146,7 +146,7 @@ Indexes and constraints:
 - SQLAlchemy metadata `index=True` columns create default `ix_orders_*` indexes for `merchant_id`, `status`, `payment_status`, `agent_id`, `agent_session_id`, `buyer_id`, `intent_id`, `agent_user_ref`, `agent_scoped_buyer_ref`, and `is_deleted`.
 - `006_psp_fields_constraints.sql` adds:
   - `check_psp_used_lowercase`: `psp_used IS NULL OR psp_used = LOWER(psp_used)`.
-  - `check_psp_used_valid_provider`: `psp_used IS NULL OR psp_used IN ('stripe','adyen','checkout','paypal','braintree')`. **Widened by `208_orders_psp_used_valid_provider.sql`** — see below.
+  - `check_psp_used_valid_provider`: `psp_used IS NULL OR psp_used IN ('stripe','adyen','checkout','paypal','braintree')`. **Widened by `242_orders_psp_used_valid_provider.sql`** — see below.
   - `check_psp_id_format`: `psp_id IS NULL OR psp_id ~* '^psp_[a-z0-9]+_[a-z0-9]{12}$'`.
   - `idx_orders_psp_used` on `(psp_used)`.
   - `idx_orders_psp_id` on `(psp_id)`.
@@ -154,7 +154,7 @@ Indexes and constraints:
   - `idx_orders_merchant_psp_used` on `(merchant_id, psp_used)`.
   - `idx_orders_psp_created_at` on `(psp_id, created_at DESC)`.
   - `idx_orders_psp_payment_status` on `(psp_used, payment_status)`.
-- `208_orders_psp_used_valid_provider.sql` replaces `check_psp_used_valid_provider` with a superset:
+- `242_orders_psp_used_valid_provider.sql` replaces `check_psp_used_valid_provider` with a superset:
   `psp_used IS NULL OR psp_used IN ('stripe','adyen','checkout','paypal','braintree','antom','protocol_deferred')`, `NOT VALID`.
   006's five names were narrower than what the code writes. `orders.psp_used` is fed from
   `merchant_psps.provider` (`routes/order_routes._resolve_active_order_psp` → `db.orders.create_order`),

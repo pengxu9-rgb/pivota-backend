@@ -50,7 +50,7 @@ router = APIRouter()
 # routes/universal_product_sync.py) — so a merchant who "connected" it had a row
 # that could never charge and an account that could never take an order.
 #
-# Keep this in sync with migration 208's CHECK list on orders.psp_used: a provider
+# Keep this in sync with migration 242's CHECK list on orders.psp_used: a provider
 # accepted here that the constraint refuses is exactly the bug above.
 SETUP_PSP_ALLOWED_PROVIDERS = frozenset(SUPPORTED_CANONICAL_PSPS | {"paypal"})
 

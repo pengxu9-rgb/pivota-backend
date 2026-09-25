@@ -1,4 +1,4 @@
--- Migration 207: reject a malformed merchant_psps.psp_id AT WRITE TIME.
+-- Migration 241: reject a malformed merchant_psps.psp_id AT WRITE TIME.
 --
 -- WHY THIS EXISTS
 -- ---------------

@@ -1,4 +1,4 @@
--- Migration 208: `orders.psp_used` must accept every provider this code WRITES.
+-- Migration 242: `orders.psp_used` must accept every provider this code WRITES.
 --
 -- WHY THIS EXISTS
 -- ---------------
@@ -162,6 +162,6 @@ BEGIN
     -- abort the file there.
     EXECUTE $c$
         COMMENT ON CONSTRAINT check_psp_used_valid_provider ON orders IS
-        'Provider vocabulary orders.psp_used may hold. Superset of migration 006''s; must cover every value merchant_psps.provider can carry plus routes/order_routes.CAPABILITY_DEFERRED_PSP_PROVIDER. Widened by migration 208; twinned in db/schema_guard.py because prod fast mode skips db/migrations/.'
+        'Provider vocabulary orders.psp_used may hold. Superset of migration 006''s; must cover every value merchant_psps.provider can carry plus routes/order_routes.CAPABILITY_DEFERRED_PSP_PROVIDER. Widened by migration 242; twinned in db/schema_guard.py because prod fast mode skips db/migrations/.'
     $c$;
 END $$;

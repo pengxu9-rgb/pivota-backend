@@ -155,10 +155,10 @@ async def run_migration_006_psp_constraints(dry_run: bool = True):
             try:
                 # Valid provider constraint.
                 #
-                # The list here is migration 208's, NOT migration 006's. This
+                # The list here is migration 242's, NOT migration 006's. This
                 # endpoint DROPs and re-ADDs the constraint on every invocation,
                 # so while it carried 006's five names it silently RE-NARROWED a
-                # constraint that migration 208 and db/schema_guard.py had
+                # constraint that migration 242 and db/schema_guard.py had
                 # widened — undoing, at the click of an admin button, the fix for
                 # a defect whose whole shape is "the writer accepts what the
                 # reader refuses". 'antom' is a supported provider
@@ -166,7 +166,7 @@ async def run_migration_006_psp_constraints(dry_run: bool = True):
                 # capability-gated deferred lane's sentinel; both are values this
                 # code writes to orders.psp_used.
                 #
-                # NOT VALID matches 208: this may be an ADD rather than a widen on
+                # NOT VALID matches 242: this may be an ADD rather than a widen on
                 # a database where 006 never ran, and a validating ADD would scan
                 # rows written across years of an unconstrained vocabulary.
                 await database.execute("""

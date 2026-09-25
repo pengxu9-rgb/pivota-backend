@@ -7,7 +7,7 @@ WHAT "MALFORMED" MEANS
         psp_id IS NULL OR psp_id ~* '^psp_[a-z0-9]+_[a-z0-9]{12}$'
 
     `merchant_psps` -- the table that mints the value -- enforced nothing until
-    migration 207, and order creation copies merchant_psps.psp_id straight into
+    migration 241, and order creation copies merchant_psps.psp_id straight into
     orders.psp_id. So a row that violates the regex is a merchant whose PSP saves,
     validates, looks connected in the portal, and 500s on EVERY order creation.
     Nothing surfaces the defect between onboarding and the first sale, which is
@@ -17,7 +17,7 @@ WHAT "MALFORMED" MEANS
     (`psp_stripe_30cc4106`) instead of 12. Fixed in
     routes/employee_store_psp_fixes.py. A second, admin-only path can still take
     a caller-supplied psp_id: POST /admin/psp/connect passes `payload["psp_id"]`
-    through when no row matches it. Migration 207's constraint now rejects both.
+    through when no row matches it. Migration 241's constraint now rejects both.
 
 WHY REPAIR IS SAFE
     `orders.psp_id` is the only other column in the schema that holds a
@@ -54,7 +54,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from services.merchant_psp_config_service import _generate_psp_id  # noqa: E402
 
-# Byte-identical to migration 006 (orders) and migration 207 (merchant_psps).
+# Byte-identical to migration 006 (orders) and migration 241 (merchant_psps).
 PSP_ID_FORMAT_REGEX = r"^psp_[a-z0-9]+_[a-z0-9]{12}$"
 
 FIND_SQL = f"""
