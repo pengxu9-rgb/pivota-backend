@@ -4,10 +4,19 @@ Allows running database migrations via API endpoint
 """
 import logging
 from pathlib import Path
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
+from utils.auth import require_admin_or_key
 from db.database import database
 
-router = APIRouter(prefix="/admin/migrations", tags=["Admin Migrations"])
+# AUTHENTICATION. Every route on this router was reachable with NO credentials
+# of any kind: no Depends, no header check, no role check. The guard is applied
+# at the ROUTER, not per-handler, so a route added here later inherits it
+# instead of having to remember it -- which is how this file got here.
+# require_admin_or_key accepts an X-ADMIN-KEY header or an admin/super_admin
+# JWT and fails closed (401) when neither is present.
+#
+# POST /admin/migrations/run/006-psp-constraints ran DDL anonymously.
+router = APIRouter(prefix="/admin/migrations", tags=["Admin Migrations"], dependencies=[Depends(require_admin_or_key)])
 logger = logging.getLogger(__name__)
 
 @router.post("/run/006-psp-constraints")

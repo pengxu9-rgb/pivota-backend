@@ -1,9 +1,27 @@
 """
-Admin endpoint to reset employee passwords
+Admin endpoints to reset employee passwords and list employees.
+
+Both routes were previously unauthenticated ("no auth required - for emergency
+access"). That made this a fourth anonymous privilege-escalation lane, worse
+than the `/auth/signup` one it sat next to: `reset-password` INSERTs an
+`employees` row with a hardcoded `role: "admin"` and `status: "active"` and a
+caller-chosen password, and `POST /auth/signin` then mints a `role: "admin"`
+JWT from that row. Its `ON CONFLICT (email) DO UPDATE` also let an anonymous
+caller take over ANY existing employee account and re-activate a disabled one,
+and `/list` handed out the roster to choose a target from.
+
+Both now require `require_admin_or_key`, which keeps the break-glass path
+alive: an operator can still authenticate with the `X-ADMIN-KEY` header when
+no admin can log in. That dependency fails closed -- with no key configured
+the header branch cannot match, so it falls through to the JWT branch and
+then to 401.
 """
-from fastapi import APIRouter, HTTPException
+from typing import Any, Dict
+
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from db.database import database
+from utils.auth import require_admin_or_key
 import hashlib
 import logging
 
@@ -15,9 +33,14 @@ class ResetPasswordRequest(BaseModel):
     new_password: str = "Admin123!"
 
 @router.post("/reset-password")
-async def reset_employee_password(request: ResetPasswordRequest):
+async def reset_employee_password(
+    request: ResetPasswordRequest,
+    _admin: Dict[str, Any] = Depends(require_admin_or_key),
+):
     """
-    Reset employee password (no auth required - for emergency access)
+    Reset an employee password, or create the employee if absent.
+
+    Requires an admin JWT or the `X-ADMIN-KEY` break-glass header.
     """
     try:
         # Hash password using employee salt
@@ -89,8 +112,8 @@ async def reset_employee_password(request: ResetPasswordRequest):
 
 
 @router.get("/list")
-async def list_all_employees():
-    """List all employees (no auth for debugging)"""
+async def list_all_employees(_admin: Dict[str, Any] = Depends(require_admin_or_key)):
+    """List all employees. Requires an admin JWT or the `X-ADMIN-KEY` header."""
     try:
         employees = await database.fetch_all(
             """SELECT employee_id, name, email, role, department, status, created_at 

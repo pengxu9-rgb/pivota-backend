@@ -6,6 +6,14 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from services.merchant_write_guardrails import (
+    KIND_STORE_CONTENT_WRITEBACK,
+    check_guardrails,
+    check_host_approval,
+    guardrail_block_message,
+    items_from_payload,
+)
+
 logger = logging.getLogger(__name__)
 
 # The app-owned metafield Pivota writes the AI-ready copy into. NEVER body_html.
@@ -72,11 +80,18 @@ async def publish_content_to_store(
     platform: str,
     platform_product_id: str,
     enrichment: Dict[str, Any],
+    actor_kind: str,
 ) -> Dict[str, Any]:
     """Write the AI-ready copy to an app-owned Shopify metafield (pivota/ai_pdp),
     GATED by the per-store content-writeback state machine. This is the first
     write to a merchant's live store: fail-closed everywhere, never writes
     body_html, never raises.
+
+    `actor_kind` is the HOST's statement about who asked for this write — one of
+    merchant_write_guardrails.ACTOR_HUMAN / ACTOR_SYSTEM / ACTOR_MODEL. It is
+    deliberately REQUIRED with no default: this is the only write to a merchant's live
+    store, and a caller that has not said who is asking must not inherit "approved" by
+    omission. It is never read out of `enrichment`, so model output cannot set it.
 
     Returns {status, ...} where status is one of:
       'written' | 'blocked' (+blocker, +gate) | 'needs_write_products'
@@ -88,6 +103,20 @@ async def publish_content_to_store(
     from services.shopify_graphql_client import shopify_admin_graphql
 
     plat = str(platform or "").strip().lower()
+
+    # 0. Host approval. Checked before anything is looked up, because an actor that
+    #    cannot approve this write should not cause a store lookup or a token resolve
+    #    either. `require_host_approval_store_writeback` defaults TRUE for this lane.
+    approval_block = check_host_approval(
+        KIND_STORE_CONTENT_WRITEBACK, actor_kind=actor_kind
+    )
+    if approval_block:
+        return {
+            "status": "blocked",
+            "blocker": "host_approval_required",
+            "violations": approval_block,
+            "message": guardrail_block_message(approval_block),
+        }
 
     # 1. Resolve the store (hydrated: api_key_raw, domain, content_writeback_*).
     try:
@@ -111,6 +140,27 @@ async def publish_content_to_store(
     value = _build_metafield_value(enrichment or {})
     if value is None:
         return {"status": "no_copy"}
+
+    # 3b. APPLY-time guardrails, against the config in force NOW and on the exact blob
+    #     we are about to send — not on the upstream enrichment, so what is checked is
+    #     what is written. A refusal is a `blocked` envelope like every other refusal
+    #     here; this function never raises.
+    violations = check_guardrails(
+        KIND_STORE_CONTENT_WRITEBACK,
+        items_from_payload(f"{plat}:{platform_product_id}", value),
+    )
+    if violations:
+        logger.warning(
+            "content_writeback: guardrails refused %s/%s: %s",
+            merchant_id, platform_product_id, "; ".join(violations)[:300],
+        )
+        return {
+            "status": "blocked",
+            "blocker": "write_guardrail",
+            "violations": violations,
+            "message": guardrail_block_message(violations),
+        }
+
     value["_provenance"] = {
         "written_by": "pivota",
         "executor": "content_writeback",

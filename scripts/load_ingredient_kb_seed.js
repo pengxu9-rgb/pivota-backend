@@ -16,7 +16,11 @@
  *
  * Run (borrows pg from the PIVOTA-Agent checkout; never prints the credential):
  *   cd <this repo>
- *   DBURL=$(cd ../PIVOTA-Agent && railway variables --json | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('DATABASE_PUBLIC_URL') or d.get('DATABASE_URL') or '')")
+ *   # Production is Cloud Run (pivota-prod/us-west1); DATABASE_URL is one of the
+ *   # few secrets WITHOUT the `env-` prefix. Note its DSN resolves to a PRIVATE
+ *   # IP, so this only connects from inside the VPC - from a laptop, point
+ *   # DBURL at a database you can actually reach.
+ *   DBURL=$(gcloud secrets versions access latest --secret=DATABASE_URL --project pivota-prod)
  *   NODE_PATH=../PIVOTA-Agent/node_modules DATABASE_URL="$DBURL" node scripts/load_ingredient_kb_seed.js
  *
  * Idempotent: ON CONFLICT (kb_key) DO UPDATE. Touches only rows whose kb_key is

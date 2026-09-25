@@ -3,7 +3,17 @@ set -euo pipefail
 
 # Periodically send buyer review invitation emails for eligible orders.
 #
-# This runs in a loop because Railway doesn't provide a cron service.
+# This runs in a loop because the original platform had no cron service.
+#
+# THAT IS NO LONGER TRUE, so check before you start it. Production is Cloud Run
+# (pivota-prod/us-west1) and Cloud Scheduler exists: `reviews-invitation-send-cron`
+# is ENABLED on a `* * * * *` schedule and triggers the `reviews-invitation-send`
+# Cloud Run job (verified 2026-08-25). That job runs a DIFFERENT entry point -
+# scripts/process_due_reviews_invitation_send_jobs.py, the due-jobs queue - rather
+# than the direct sender this loop calls, so the two are not simply duplicates.
+# But they touch the same invitation population, and buyer emails do not unsend.
+# Confirm the overlap before running this alongside the cron:
+#   gcloud scheduler jobs list --project pivota-prod --location us-west1
 #
 # Env:
 # - DATABASE_URL (required)

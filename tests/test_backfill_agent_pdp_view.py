@@ -30,6 +30,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from services import agent_pdp_view_assembler as backfill  # noqa: E402
 
 
+@pytest.mark.asyncio
+async def test_pdp_fetch_excludes_retired_synthetic_sku() -> None:
+    class DB:
+        async def fetch_all(self, sql: str, params: Dict[str, Any]):
+            assert "suppressed_at IS NULL" in sql
+            assert params == {"keys": ["product-1"]}
+            return [{"product_key": "product-1", "source_variant_id": "shopify-1"}]
+
+    skus = await backfill.fetch_skus_for_keys(["product-1"], db=DB())
+    assert [row["source_variant_id"] for row in skus] == ["shopify-1"]
+
+
 # ---------------------------------------------------------------------------
 # canonical row pick
 # ---------------------------------------------------------------------------

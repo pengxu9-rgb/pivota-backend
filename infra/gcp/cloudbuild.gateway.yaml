@@ -10,6 +10,12 @@ steps:
     args: ['build',
            '-t', '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:${COMMIT_SHA}',
            '-t', '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:latest',
+           # Stamps /app/.image_commit_sha inside the image. PIVOTA-Agent's src/config/platform.js
+           # prefers that file over PIVOTA_COMMIT_SHA, so /health cannot report a commit the image
+           # was not built from - see that repo's Dockerfile for the revision this happened to.
+           # Without this substitution the arg is empty and the reader falls back to the env chain,
+           # so a build that forgets it degrades to the old behaviour rather than lying.
+           '--build-arg', 'COMMIT_SHA=${COMMIT_SHA}',
            '.']
 images:
   - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:${COMMIT_SHA}'

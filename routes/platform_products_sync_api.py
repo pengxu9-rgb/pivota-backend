@@ -35,6 +35,10 @@ async def sync_platform_products_endpoint(
         force_refresh=True,
         limit=limit,
         platform=platform,
+        # Nobody is waiting on this request: it is the gateway's scheduled
+        # catalog auto-sync (X-ADMIN-KEY, server-to-server). Marks the
+        # quality-backfill enqueue as dedupable.
+        unattended=True,
     )
     result = await universal_product_sync(
         request=request,

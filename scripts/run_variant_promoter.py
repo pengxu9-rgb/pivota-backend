@@ -61,9 +61,17 @@ async def _drive(args: argparse.Namespace) -> dict:
         "totals": {
             "groups_considered": report.groups_considered,
             "groups_promoted": report.groups_promoted,
+            # Groups written on the redirect lane, where no tier can move. Groups
+            # WRITTEN is this plus groups_promoted.
+            "groups_tier_held": report.groups_tier_held,
             "groups_skipped_no_real_variants": report.groups_skipped_no_real_variants,
             "groups_skipped_no_primary": report.groups_skipped_no_primary,
             "skus_upserted_total": report.skus_upserted_total,
+            # Rows written on a lane whose offered tier is the ladder floor, so no
+            # tier moved. Rows WRITTEN is this plus skus_upserted_total; reporting
+            # only the latter on an external-seed corpus is the count this split
+            # exists to stop overstating. See GroupOutcome.variants_tier_held.
+            "skus_tier_held_total": report.skus_tier_held_total,
         },
         "per_group": [asdict(g) for g in report.per_group],
     }

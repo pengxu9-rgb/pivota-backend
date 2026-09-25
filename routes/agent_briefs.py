@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import json
-import os
 from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 
+from config.platform import pytest_bypass_allowed
 from db.briefs import insert_brief
 from models.brief import (
     BriefBuildRequest,
@@ -135,9 +135,14 @@ async def build_brief(
             }
         )
     except Exception as e:
-        # In production, brief persistence is required (durable join key).
-        # In unit tests, allow degraded mode so the suite can run without a DB.
-        if os.getenv("PYTEST_CURRENT_TEST"):
+        # On a deployed host, brief persistence is required (durable join
+        # key). In unit tests, allow degraded mode so the suite can run without
+        # a DB. Fails closed on ANY DEPLOYED host — staging included — as well
+        # as anything resolving to production; since #1900 the gate is `not
+        # (is_deployed() or is_production())`, and since the Cloud Run **Jobs**
+        # markers were added it covers job containers too. See
+        # config.platform.pytest_bypass_allowed.
+        if pytest_bypass_allowed(bypass_name="the brief-persist degraded mode"):
             pass
         else:
             raise HTTPException(

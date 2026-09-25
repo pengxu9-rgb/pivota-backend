@@ -74,6 +74,8 @@ def test_full_authorization_code_happy_path():
     claims = jwt.decode(tok["access_token"], key=key, algorithms=["RS256"], audience=RESOURCE, issuer=ISSUER)
     assert claims["sub"] == "buyer-1"
     assert claims["aud"] == RESOURCE
+    # RFC 9068 client_id: the gateway credits MCP links through it (ADR-025 D1).
+    assert claims["client_id"] == reg["client_id"]
 
 
 def test_code_is_single_use():
@@ -161,6 +163,8 @@ def test_refresh_rotation_and_reuse_revoked():
     rt = tok["refresh_token"]
     tok2 = run(exchange_refresh_token(store, params={"client_id": reg["client_id"], "refresh_token": rt}))
     assert tok2["access_token"] and tok2["refresh_token"] != rt
+    # A refreshed token names the same client as the one it replaced.
+    assert jwt.decode(tok2["access_token"], options={"verify_signature": False})["client_id"] == reg["client_id"]
     with pytest.raises(OAuthFlowError):  # old refresh revoked after rotation
         run(exchange_refresh_token(store, params={"client_id": reg["client_id"], "refresh_token": rt}))
 

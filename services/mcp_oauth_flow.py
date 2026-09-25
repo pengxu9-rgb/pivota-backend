@@ -254,7 +254,12 @@ async def exchange_refresh_token(
 
 async def _mint_grant(store, *, subject, resource, scope, client_id, now) -> Dict[str, Any]:
     scope_list = scope.split() if isinstance(scope, str) else list(scope or [])
-    access_token = core.mint_access_token(subject=subject, audience=resource, scope=scope_list)
+    # RFC 9068 `client_id`: which registered OAuth client this grant was issued to. The gateway reads
+    # it to credit links issued over MCP to the agent the client's redirect origin is registered to
+    # (ADR-025 D1; services/issuing_agent_assertion.py). Registered claims cannot be overridden.
+    access_token = core.mint_access_token(
+        subject=subject, audience=resource, scope=scope_list, extra_claims={"client_id": client_id}
+    )
     refresh_token = core.new_refresh_token()
     await store.save_refresh(
         core.hash_secret(refresh_token),

@@ -2,7 +2,7 @@
 Admin endpoint to fix agent protocols - replace REST v1.0 with Phase 4 protocols
 """
 from fastapi import APIRouter, Depends, HTTPException
-from utils.auth import get_current_user
+from utils.auth import ADMIN_ROLES, get_current_user
 from db.database import database
 
 router = APIRouter(prefix="/admin/agents", tags=["Admin Agent Protocols"])
@@ -18,7 +18,7 @@ async def fix_agent_protocols(
     2. Adding Phase 4 protocols (AP2, ACP)
     3. Optionally enabling X-402 (beta)
     """
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Admin only")
     
     try:
@@ -126,7 +126,7 @@ async def get_protocols_status(
     """
     Get current status of all agent protocols
     """
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Admin only")
     
     # Count by protocol and status

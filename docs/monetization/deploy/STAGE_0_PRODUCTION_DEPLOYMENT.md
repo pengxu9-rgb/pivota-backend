@@ -1,5 +1,14 @@
 # Stage 0 — Production Deployment of v1.3 Monetization
 
+> ⚠️ **Production is GCP Cloud Run (`pivota-prod`, `us-west1`) since 2026-08-22. Railway is the
+> ROLLBACK.** The `railway ...` commands below have NOT been rewritten — they were left as-is
+> rather than translated by guesswork, because the procedures here were never re-verified against
+> GCP. Running one changes the platform nobody is served from: the incident continues while the
+> dial reads as turned. Translate with
+> [operating_on_gcp_production.md](../../runbooks/operating_on_gcp_production.md) before acting, or treat this
+> document as a historical record of how the Railway rollout was done.
+
+
 Linear deployment plan. Every step has an exact command and an exact verification. Steps that modify prod data or money flow are tagged **AUTHORIZATION REQUIRED**.
 
 - **Deployment target**: Railway → `Pivota Infra` → `production` → service `web` (service id `17b7380b-d0e1-4ff5-8975-516c93cbdc93`, project id `9bdca959-cc79-413c-9f23-c8b5396eb5f0`).

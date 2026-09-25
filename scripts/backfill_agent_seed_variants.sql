@@ -11,7 +11,12 @@
 -- Idempotent: only touches rows where seed_data->'variants' is missing
 -- or empty. Safe to re-run.
 --
--- Run via Railway dashboard SQL console (works even when external
+-- Run against the production database. Production is Cloud Run
+-- (pivota-prod/us-west1) on Cloud SQL and its DATABASE_URL resolves to a PRIVATE
+-- IP, so there is no dashboard SQL console and no laptop route to it. Pipe this
+-- file in from inside the VPC instead, e.g. via a throwaway job on the
+-- production image (see docs/runbooks/operating_on_gcp_production.md).
+-- (Kept as a .sql file because it works even when external
 -- proxy throttles ad-hoc psql connections). Or via psql once external
 -- proxy recovers.
 

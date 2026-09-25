@@ -8,7 +8,10 @@ from typing import Dict, Any, Optional
 
 from db.database import database
 from services.protocol_adapter_service import ProtocolAdapterService
-from utils.auth import get_current_user
+from utils.auth import ADMIN_ROLES, get_current_user
+
+# `caller is the agent OR caller is an admin` -- only the admin conjunct is
+# corrected for super_admin; the ownership test is untouched.
 
 
 router = APIRouter(prefix="/agents", tags=["Agent Protocol Testing"])
@@ -45,7 +48,7 @@ async def test_protocol_call(
     Test a protocol call in sandbox mode
     """
     # Verify agent access
-    if current_user.get("user_id") != agent_id and current_user.get("role") != "admin":
+    if current_user.get("user_id") != agent_id and current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Access denied")
     
     # Verify agent has this protocol enabled

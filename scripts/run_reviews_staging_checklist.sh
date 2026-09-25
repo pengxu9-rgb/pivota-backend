@@ -117,7 +117,7 @@ if [[ -z "${PROOF_ISSUER_INTERNAL_KEY:-}" ]]; then
 fi
 
 if [[ -z "${EMPLOYEE_JWT_SECRET_KEY:-}" ]]; then
-  read -r -s -p "JWT_SECRET_KEY (reviews backend Railway env): " EMPLOYEE_JWT_SECRET_KEY
+  read -r -s -p "JWT_SECRET_KEY (gcloud secrets versions access latest --secret=env-JWT_SECRET_KEY --project pivota-prod): " EMPLOYEE_JWT_SECRET_KEY
   echo
 fi
 

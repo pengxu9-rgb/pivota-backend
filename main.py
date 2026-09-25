@@ -5,6 +5,7 @@ FastAPI application with comprehensive dashboard and real-time metrics
 """
 
 import asyncio
+import hmac
 import logging
 import time
 from contextlib import asynccontextmanager, suppress
@@ -12,27 +13,40 @@ from datetime import datetime, timezone
 from functools import lru_cache
 import uvicorn
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, BackgroundTasks, Depends, WebSocket, WebSocketDisconnect, Request, Response
+from fastapi import (
+    FastAPI, BackgroundTasks, Depends, HTTPException, WebSocket, WebSocketDisconnect,
+    Request, Response, status,
+)
+from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from fastapi.middleware.cors import CORSMiddleware
 from middleware.rate_limiter import RateLimitMiddleware
 from middleware.usage_logger import UsageLoggerMiddleware
-from middleware.structured_logging import StructuredLoggingMiddleware
+from middleware.structured_logging import (
+    StructuredLoggingMiddleware,
+    install_uvicorn_access_log_redaction,
+)
 from middleware.error_handler import ErrorHandlerMiddleware
 from middleware.ap2_security import AP2SecurityMiddleware
+from middleware.security_headers import SecurityHeadersMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 # Database
 from db.database import database, metadata, engine
 from db.startup_ddl import StartupDdlLock, startup_ddl_lock
+import db.agents  # noqa: F401  (register agents in metadata; startup() relies on create_all building it)
 import db.auth_identity  # noqa: F401  (register canonical auth identity tables in metadata)
 import db.pcs_tables  # noqa: F401  (register PCS v0.1 tables/constraints in metadata)
 import db.id_bridge  # noqa: F401  (register id_bridge table in metadata)
 import db.canonical_commerce  # noqa: F401  (register canonical commerce tables in metadata)
 import db.commerce_interactions  # noqa: F401  (register canonical interaction ledger tables in metadata)
+import db.merchant_collector_tokens  # noqa: F401  (register collector token registry tables in metadata)
 import db.commerce_attribution  # noqa: F401  (register commerce attribution tables in metadata)
+import db.agent_share  # noqa: F401  (register agent share rate + ledger tables in metadata)
+import db.agent_oauth_clients  # noqa: F401  (register the provisioned OAuth client -> agent table in metadata)
+import db.gmv_invoice_credits  # noqa: F401  (register the GMV invoice credit table in metadata)
 import db.merchant_commerce_readiness  # noqa: F401  (register merchant commerce readiness state in metadata)
 import db.surface_listing_registry  # noqa: F401  (register surface listing registry tables in metadata)
 try:
@@ -66,7 +80,9 @@ def _guard_single_order_routes_py() -> None:
     on deploy if a second copy is added.
     """
     repo_root = Path(__file__).resolve().parent
-    ignored_dirs = {".git", ".venv", "__pycache__", ".pytest_cache", ".mypy_cache"}
+    # `.claude` holds harness-managed worktrees (full repo copies) on dev machines only —
+    # scanning them makes every copy of order_routes.py look like a duplicate.
+    ignored_dirs = {".git", ".venv", "__pycache__", ".pytest_cache", ".mypy_cache", ".claude"}
     matches: list[str] = []
 
     for dirpath, dirnames, filenames in os.walk(repo_root):
@@ -84,6 +100,28 @@ def _guard_single_order_routes_py() -> None:
 
 # Core routers (only include what exists)
 _guard_single_order_routes_py()
+
+# AT IMPORT, before a single request can be served. `uvicorn.access` writes the
+# raw request line — `get_path_with_query_string(scope)` — at INFO on every
+# response, 200s and 401s alike, and infra/gcp/Dockerfile starts uvicorn with
+# neither `--no-access-log` nor a `--log-config`, so on Cloud Run that line goes
+# straight to Cloud Logging. `POST /webhooks/webflow/{store_id}/{url_secret}`
+# authenticates with a secret IN THE PATH (Webflow does not sign a site-token
+# webhook), so without this the credential is in the access line of every
+# delivery.
+#
+# It is installed here rather than only in the startup hook because uvicorn
+# imports `main:app` after it has configured logging and before it serves
+# anything: an import-time install is in place for the first request under
+# `uvicorn main:app`, under `uvicorn.run` below, and under `--reload`. The
+# lifespan calls it again, idempotently, to cover a deployment whose own
+# `--log-config` reconfigures logging in between.
+#
+# It cannot cover the LOAD BALANCER's `httpRequest.requestUrl`, which the
+# platform records regardless of this process — that surface is the argument for
+# configuring `WEBFLOW_CLIENT_SECRET`, and it is the ONLY one left.
+install_uvicorn_access_log_redaction()
+
 from routes.agent_routes import router as agent_router
 from routes.agent_briefs import router as agent_briefs_router
 from routes.quote_routes import router as quote_router
@@ -95,16 +133,15 @@ from routes.agent_checkout_intents import router as agent_checkout_intents_route
 from routes.employee_settlement_rules import employee_router as employee_settlement_router
 
 # Dashboard routers
-from routes.dashboard_routes import router as dashboard_router
 from routes.dashboard_api import router as dashboard_api_router
 # payment_routes already imported above, removed duplicate
 from routes.demo_data_routes import router as demo_data_router
-from routes.simple_ws_routes import router as simple_ws_router
 from routes.auth_routes import router as auth_router
 from routes.auth import router as auth_api_router  # API auth endpoints
 from routes.mcp_oauth_as import router as mcp_oauth_as_router  # MCP OAuth Authorization Server (flag-gated)
 from routes.agent_account import router as agent_account_router  # Agent account management
 from routes.agent_commerce import router as agent_commerce_router
+from routes.agent_commerce_reap import router as agent_commerce_reap_router
 from routes.admin_api import router as admin_api_router
 from routes.admin_partner_cohort import router as admin_partner_cohort_router
 from routes.admin_partner_comms import router as admin_partner_comms_router
@@ -321,6 +358,9 @@ except ModuleNotFoundError:
     )
 from routes.after_sales_cases import router as after_sales_cases_router
 from routes.agent_events import router as agent_events_router
+from routes.card_rail_outcomes import router as card_rail_outcomes_router
+from routes.agent_cards import router as agent_cards_router
+from routes.reap_webhooks import router as reap_webhooks_router
 from routes.agent_management import router as agent_management_router
 from routes.shopify_setup import router as shopify_setup_router
 from routes.shopify_manual import router as shopify_manual_router
@@ -332,6 +372,7 @@ from routes.fix_orders_table import router as fix_orders_table_router
 from routes.agent_metrics import router as agent_metrics_router
 from routes.agent_keys import router as agent_keys_router
 from routes.agent_identity_issuers import router as agent_identity_issuers_router, internal_router as agent_identity_issuers_internal_router
+from routes.payment_grant_issuers import router as payment_grant_issuers_router, internal_router as payment_grant_issuers_internal_router
 from routes.agent_webhooks import router as agent_webhooks_router
 from routes.init_agent_key import router as init_agent_key_router
 from routes.merchant_products import router as merchant_products_router
@@ -354,6 +395,11 @@ from routes.agent_shop_gateway import router as agent_shop_gateway_router
 from routes.agent_internal_auth import router as agent_internal_auth_router
 from routes.store_audit_probe_internal import router as store_audit_probe_internal_router
 from routes.store_audit_commerce_probe_internal import router as store_audit_commerce_probe_internal_router
+from routes.store_audit_ops import router as store_audit_ops_router
+from routes.merchant_purchasability_ops import router as merchant_purchasability_ops_router
+from routes.store_audit_public_intake import router as store_audit_public_intake_router
+from routes.store_audit_public_intake import claim_router as store_audit_claim_router
+from routes.store_readiness import router as store_readiness_router
 from routes.agent_internal_products import router as agent_internal_products_router
 from routes.subject_resolve import router as subject_resolve_router
 from routes.accounts_orders_api import router as accounts_orders_router
@@ -363,6 +409,21 @@ from routes.shopify_products_sync_api import router as shopify_products_sync_rou
 from routes.platform_products_sync_api import router as platform_products_sync_router
 from routes.outbound_links import router as outbound_links_router
 from routes.attribution_conversions import router as attribution_conversions_router
+from routes.merchant_events import router as merchant_events_router
+from routes.cafe24_integration import router as cafe24_integration_router
+from routes.magento_integration import router as magento_integration_router
+from routes.adobe_commerce_events import router as adobe_commerce_events_router
+from routes.cafe24_webhooks import router as cafe24_webhooks_router
+from routes.woocommerce_webhooks import router as woocommerce_webhooks_router
+from routes.bigcommerce_webhooks import router as bigcommerce_webhooks_router
+from routes.wix_webhooks import router as wix_webhooks_router
+from routes.squarespace_webhooks import router as squarespace_webhooks_router
+from routes.webflow_webhooks import router as webflow_webhooks_router
+from routes.sfcc_integration import router as sfcc_integration_router
+from routes.sfcc_events import router as sfcc_events_router
+from routes.prestashop_webhooks import router as prestashop_webhooks_router
+from routes.shopline_integrations import router as shopline_integrations_router
+from routes.shopline_family_webhooks import router as shopline_family_webhooks_router
 from routes.ap2_agent_registration import router as ap2_agent_registration_router
 from routes.ap2_trusted_issuers_admin import router as ap2_trusted_issuers_admin_router
 from routes.external_offers import router as external_offers_router
@@ -415,9 +476,14 @@ app = FastAPI(
     title="Pivota Infra Dashboard", 
     version="0.2.1-build-1762178331",  # Updated to verify Railway deployment
     description="Pivota Infrastructure API with comprehensive payment processing and agent SDK support",
-    docs_url="/docs",
-    redoc_url="/redoc",
-    openapi_url="/openapi.json"
+    # The built-ins are OFF so the same three paths can be re-mounted below behind a guard. They
+    # are not removed: /openapi.json is the full internal path list - 1,019 of them as measured on
+    # 2026-08-22 - and serving that anonymously hands an attacker the map. The curated,
+    # partner-facing spec is a different surface and stays public at /agent/docs/openapi.json;
+    # anonymous GET /openapi.json redirects there rather than 404ing (it is the published URL).
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
 )
 
 
@@ -561,6 +627,51 @@ def _guard_legacy_psp_maintenance_routes() -> None:
         )
 
 
+# Paths banned by `_guard_legacy_inmemory_auth_routes`. Module-level so tests
+# assert against this set itself rather than a hand-copy that silently drifts.
+LEGACY_INMEMORY_AUTH_PATHS = frozenset({
+    "/auth/signup",
+    "/auth/admin-token",
+    "/auth/admin/users",
+    "/auth/admin/users/{user_id}/approve",
+    "/auth/admin/users/{user_id}/role",
+})
+
+
+def _guard_legacy_inmemory_auth_routes() -> None:
+    """Fail startup if the removed in-memory auth fixtures are ever re-mounted.
+
+    These `/auth/*` endpoints were backed by module-level dicts and honoured a
+    caller-supplied `role`, so an anonymous caller could mint a JWT with
+    `role: "admin"` -- satisfying `require_admin`, `get_current_admin`,
+    `require_admin_or_key`, `ADMIN_ROLES`, and every route that checks
+    `role in ["admin", "super_admin"]`. `/auth/admin-token` handed out an admin
+    JWT to an anonymous GET with no credentials at all.
+
+    `auth_router` is mounted unconditionally (no env flag, no host gate, no
+    middleware), so nothing downstream would catch a re-introduction.
+
+    This is a ban on the PATHS, not on the implementation, and it is
+    exact-match (a near-miss like `/auth/signup/verify` does not trip it). A
+    legitimate, authenticated, DB-backed admin user list at
+    `/auth/admin/users` would therefore fail startup here -- that is
+    deliberate: reclaiming one of these paths should be a conscious edit to
+    this set in review, not something that happens by accident. The converse
+    also holds: re-adding a route with a renamed path parameter would slip
+    past, so this guard backs up the tests rather than replacing them.
+    """
+    mounted = sorted(
+        route.path
+        for route in app.routes
+        if getattr(route, "path", None) in LEGACY_INMEMORY_AUTH_PATHS
+    )
+    if mounted:
+        raise RuntimeError(
+            "Legacy in-memory auth routes must not be mounted "
+            "(anonymous privilege escalation):\n- " + "\n- ".join(mounted)
+        )
+
+
 def _settings_contract_payload() -> dict:
     rate_limit_rpm = getattr(settings, "rate_limit_rpm", None)
     reconciliation_mode_raw = str(os.getenv("SHOPIFY_DISCOUNT_RECONCILIATION_MODE", "observe") or "").strip().lower()
@@ -649,6 +760,112 @@ def custom_openapi():
 app.openapi = custom_openapi
 
 
+def docs_viewer_allowed(x_admin_key: Optional[str]) -> bool:
+    """Whether this caller may read the FULL internal spec; True everywhere outside production.
+
+    The spec is the full internal route list. Anonymously readable, it is a map of every path an
+    attacker might probe, which is worth more to them than any single one of those paths. This
+    predicate only answers "may they read it"; what a disallowed caller receives instead is
+    decided by the route handler (_guarded_openapi_spec).
+
+    Outside production this returns True: /docs is how people work, and a staging service that
+    behaves differently from the one you develop against is its own hazard. `is_production()`
+    fails CLOSED toward production when it cannot tell (config/platform.py), so an environment
+    that forgets PIVOTA_ENV gets the guard rather than the hole.
+
+    Compared with `hmac.compare_digest` ON BYTES. The sibling admin guards in routes/ use `!=`,
+    which leaks a timing signal proportional to the shared prefix; there is no reason for a new one
+    to inherit that. But the str form of compare_digest RAISES TypeError on any codepoint above
+    0x7F, and ASGI decodes header values as latin-1 - so a single byte >= 0x80 in X-ADMIN-KEY once
+    turned this guard into an unhandled 500: a remotely triggerable 5xx on a payments API, and -
+    because `expected and ...` short-circuits - one that fired only when a key was configured, a
+    free unauthenticated probe for "is an admin key mounted on this revision". Encoding both sides
+    first removes both.
+
+    It also fails closed when no key is configured at all - an empty expected value must never match
+    an empty header.
+    """
+    if not is_production():
+        return True
+    expected = (os.getenv("ADMIN_API_KEY") or os.getenv("PROMOTIONS_ADMIN_KEY") or "").strip()
+    supplied = (x_admin_key or "").strip()
+    return bool(expected and supplied and hmac.compare_digest(
+        supplied.encode("utf-8", "surrogateescape"),
+        expected.encode("utf-8", "surrogateescape"),
+    ))
+
+
+async def require_docs_ui_enabled() -> None:
+    """The HTML doc pages are not served in production at all.
+
+    They are shells that fetch /openapi.json FROM THE BROWSER, and a browser cannot attach an
+    X-ADMIN-KEY header to that fetch - so an admin-gated Swagger page in production renders
+    "Failed to load API definition". Serving a page that cannot work is worse than not serving
+    one: it reads as a broken API rather than a deliberate closure, and it still advertises that
+    the surface exists. Admins read the spec with curl and the key.
+    """
+    if is_production():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+
+
+# Every method, not just GET. Mounting GET alone left FastAPI answering 405 with `Allow: GET` on
+# anything else, so one `curl -X POST` proved /docs and /redoc exist - which is the very fact
+# their 404s exist to hide. /openapi.json no longer hides (its GET answers a public redirect by
+# design) but keeps the uniform non-GET 404 so the method channel is identical across all three.
+_DOC_ROUTE_METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"]
+
+
+@app.api_route(
+    "/openapi.json",
+    methods=_DOC_ROUTE_METHODS,
+    include_in_schema=False,
+)
+async def _guarded_openapi_spec(request: Request) -> Response:
+    if request.method not in ("GET", "HEAD"):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+    # no-store on BOTH branches: the response varies on X-ADMIN-KEY, and a shared cache that
+    # stored the keyed 200 would replay the full internal map to anonymous callers - while a
+    # cached redirect would hand keyed ops clients the wrong document with a clean 200.
+    if docs_viewer_allowed(request.headers.get("X-ADMIN-KEY")):
+        return JSONResponse(app.openapi(), headers={"Cache-Control": "no-store"})
+    # Everyone else is sent to the CURATED partner spec, which is public by design. /openapi.json
+    # is the URL the marketing site publishes and the conventional path agents probe first; a 404
+    # here read as "no public spec" when /agent/docs/openapi.json has been public all along. The
+    # redirect must be identical for a missing, empty, and wrong key - any difference is an
+    # oracle for whether an admin key is mounted. 307 rather than 308: clients cache a permanent
+    # redirect indefinitely, which would freeze the alias target (and this URL's keyed behavior)
+    # into every cache that ever saw an anonymous response.
+    return RedirectResponse(
+        url=app.url_path_for("agent_openapi_spec"),
+        status_code=status.HTTP_307_TEMPORARY_REDIRECT,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.api_route(
+    "/docs",
+    methods=_DOC_ROUTE_METHODS,
+    include_in_schema=False,
+    dependencies=[Depends(require_docs_ui_enabled)],
+)
+async def _guarded_swagger_ui(request: Request) -> HTMLResponse:
+    if request.method not in ("GET", "HEAD"):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+    return get_swagger_ui_html(openapi_url="/openapi.json", title=f"{app.title} - Swagger UI")
+
+
+@app.api_route(
+    "/redoc",
+    methods=_DOC_ROUTE_METHODS,
+    include_in_schema=False,
+    dependencies=[Depends(require_docs_ui_enabled)],
+)
+async def _guarded_redoc(request: Request) -> HTMLResponse:
+    if request.method not in ("GET", "HEAD"):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+    return get_redoc_html(openapi_url="/openapi.json", title=f"{app.title} - ReDoc")
+
+
 async def startup_event():
     """
     Initialize database connections and ensure core tables exist.
@@ -725,7 +942,21 @@ async def shutdown_event():
         await stop_scheduler()
     except Exception:
         pass
-    await database.disconnect()
+    finally:
+        # `finally`, not a bare next statement: stop_scheduler now contains an await (the
+        # shutdown drain), so a CancelledError landing inside it would propagate past an
+        # `except Exception` and skip the disconnect entirely. Cancellation still propagates
+        # -- swallowing it would break cancellation semantics -- but the pool is closed first.
+        #
+        # GUARDED, because the reorder made THIS the disconnect that actually runs. It is
+        # asyncpg's Pool.close(); if it raises, the exception escapes app_lifespan's own
+        # `finally` and `await shutdown()` never runs, which uvicorn reports as a failed
+        # lifespan shutdown. Previously the guarded copy in shutdown() ran first and this one
+        # hit databases' idempotent no-op path, so the raise had nowhere to go.
+        try:
+            await database.disconnect()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Error closing the database pool during shutdown: %s", exc)
 
 # CORS middleware - configurable allow list (supports Railway ALLOWED_ORIGINS env)
 dev_mode = os.getenv("DEV_MODE", "false").lower() == "true"
@@ -779,6 +1010,18 @@ app.add_middleware(StructuredLoggingMiddleware)
 
 # Add unified error handler middleware (formats errors + includes request id)
 app.add_middleware(ErrorHandlerMiddleware)
+
+# Security response headers on EVERY response, including the ones other middleware generate.
+#
+# Registered AFTER ErrorHandlerMiddleware, which in Starlette means it wraps it: add_middleware
+# prepends, so the last registered runs outermost. That ordering is the point - an error response
+# formatted by the handler below still leaves through here and still carries nosniff/HSTS. A
+# security header that is present on 200s and missing on 500s protects the requests that matter
+# least.
+#
+# CORSMiddleware is registered after this one and so stays outermost of all, which the comment
+# there explains: error responses must keep their CORS headers.
+app.add_middleware(SecurityHeadersMiddleware)
 
 # AP2 protocol security middleware. Enforces agent-consent / signature / nonce
 # headers on non-public /ap2/* routes. Inert unless ENABLE_AP2_ROUTES=true — the
@@ -885,11 +1128,20 @@ app.include_router(audit_runs_router)  # P2.3: async audit_runs lifecycle (POST/
 # log line never surfaces in log fetches; this endpoint provides direct state.
 from routes.scheduler_health import router as scheduler_health_router
 app.include_router(scheduler_health_router)
+from routes.pool_health import router as pool_health_router
+app.include_router(pool_health_router)  # GET /__pool_health: pool-vs-database partition during a wedge
 
 # Admin: resume/pause allowlisted settlement crons (T7/T8 + settlement-file
 # jobs) for Stage-4 promotion and rollback without a redeploy.
 from routes.admin_scheduler_jobs import router as admin_scheduler_jobs_router
 app.include_router(admin_scheduler_jobs_router)
+
+# Admin: read the retailer ingest ledger, approve/cancel a held job, queue a
+# cohort (migration 234). require_admin sits on the router itself.
+from routes.admin_retailer_ingest import router as admin_retailer_ingest_router
+app.include_router(admin_retailer_ingest_router)
+from routes.admin_gmv_invoice_credits import router as admin_gmv_invoice_credits_router
+app.include_router(admin_gmv_invoice_credits_router)  # GMV invoice credits: review/approve/issue (admin only)
 
 # C1 Phase 2d — read-only trust table health (total rows, decision distribution,
 # drift count, stale rows). Mirrors /__scheduler_health in naming convention.
@@ -914,6 +1166,12 @@ app.include_router(agent_pdp_v1_router)  # Agent PDP v1 denormalized read path (
 app.include_router(agent_citation_v1_router)  # External citation read API (/agent/v1/citation/*) — ADR-007 P0
 app.include_router(agent_account_router)  # Agent account management (/agent/account/*)
 app.include_router(agent_commerce_router)  # Agent v2 commerce execute contract
+# Agent v2 Reap agentic purchase rail (/agent/v2/commerce/reap/*). DARK: every route on it
+# answers 404 while REAP_AGENTIC_ENABLED is off or the Reap client is unconfigured, which is
+# the state of production. Mounted anyway, and deliberately: a router that is only mounted
+# when a dial is on is a router whose mounting is itself untested, and the dial is read per
+# request so flipping it must not need a redeploy.
+app.include_router(agent_commerce_reap_router)
 app.include_router(admin_api_router)  # Admin API endpoints
 app.include_router(admin_partner_cohort_router)  # Admin channel-partner cohort progress/evaluation
 app.include_router(admin_partner_comms_router)  # Admin channel-partner contact, send log, send settlement email
@@ -1097,6 +1355,21 @@ app.include_router(admin_cleanup_rebuild_router)  # Admin cleanup and rebuild
 app.include_router(admin_cleanup_stores_router)  # Admin cleanup stores
 app.include_router(outbound_links_router)  # Outbound links (resolve + redirect + ops config)
 app.include_router(attribution_conversions_router)  # Non-custodial conversion-report / receipt-ingest API (#1482)
+app.include_router(merchant_events_router)  # Platform-neutral Agent Commerce event ingestion
+app.include_router(cafe24_integration_router)  # Cafe24 OAuth/manual connection and catalog adapter
+app.include_router(magento_integration_router)  # Magento/Adobe Commerce native REST catalog adapter
+app.include_router(adobe_commerce_events_router)  # Signed Adobe I/O order/payment/refund events
+app.include_router(cafe24_webhooks_router)  # Cafe24 Data Bridge + order lifecycle events
+app.include_router(woocommerce_webhooks_router)  # Signed WooCommerce order lifecycle events
+app.include_router(bigcommerce_webhooks_router)  # Header-authenticated BigCommerce order lifecycle events
+app.include_router(wix_webhooks_router)  # JWT-verified Wix eCom order + transaction events (static, app-level)
+app.include_router(squarespace_webhooks_router)  # HMAC-signed Squarespace order notifications (OAuth-connected sites only)
+app.include_router(webflow_webhooks_router)  # Webflow Ecommerce order triggers, authenticated by a per-store URL secret (+ signature when an OAuth app is configured)
+app.include_router(sfcc_integration_router)  # Salesforce B2C Commerce SCAPI catalog adapter
+app.include_router(sfcc_events_router)  # Signed SFCC cartridge order/cart/payment events
+app.include_router(prestashop_webhooks_router)  # Signed PrestaShop module order/refund events (no native webhooks)
+app.include_router(shopline_integrations_router)  # SHOPLINE / Shoplazza native REST catalog adapters
+app.include_router(shopline_family_webhooks_router)  # Signed SHOPLINE / Shoplazza order lifecycle events
 app.include_router(ap2_agent_registration_router)  # AP2 agent signing-key ADMIN backfill (#1442) — pilot provisioning (ADR-012 carve-out)
 app.include_router(ap2_trusted_issuers_admin_router)  # AP2 trusted-issuer enrollment (#1495) — global tier + per-agent, proof-of-control
 app.include_router(external_offers_router)  # External offers (fetch/cache OG/JSON-LD for external-only products)
@@ -1138,10 +1411,18 @@ app.include_router(subject_resolve_router)  # Stable subject resolution contract
 app.include_router(after_sales_cases_router)  # After-sales Case API (refund/return_refund)
 app.include_router(agent_recommendations_router)  # Agent recommendations (proxy to internal service)
 app.include_router(agent_events_router)  # Agent events (click tracking etc.)
+app.include_router(card_rail_outcomes_router)  # POST /agent/v1/outcomes — handoff results
+app.include_router(agent_cards_router)  # POST /agent/v1/cards — Reap rail card minting (503 unless AGENT_CARD_ISSUANCE_ENABLED)
+app.include_router(reap_webhooks_router)  # POST /webhooks/reap — issuer reconciliation (503 unless REAP_WEBHOOK_SECRET); POST /webhooks/reap/authorize — live external authorization (503 unless REAP_EXTERNAL_AUTH_ENABLED + REAP_AUTH_WEBHOOK_SECRET)
 app.include_router(agent_shop_gateway_router)  # Agent shopping gateway (/agent/shop/v1/invoke)
 app.include_router(agent_internal_auth_router)  # Internal auth introspection (/agent/internal/auth/introspect)
 app.include_router(store_audit_probe_internal_router)  # Store Audit UCP worker receipt (flag + key gated)
 app.include_router(store_audit_commerce_probe_internal_router)  # Store Audit commerce receipt/capability (flag + key gated)
+app.include_router(store_audit_ops_router)  # Admin-only Store Audit lane diagnostics (no caller SQL; redacted)
+app.include_router(merchant_purchasability_ops_router)  # Admin-only merchant purchasability facts (no caller SQL; no buyer data)
+app.include_router(store_audit_public_intake_router)  # Public store-audit intake/teaser for the marketing funnel (flag gated, UCP lane only)
+app.include_router(store_audit_claim_router)  # AUTHENTICATED claim of an anonymous funnel run (same flag; not under /public/*)
+app.include_router(store_readiness_router)  # Merchant-triggered storefront journey: search -> PDP -> cart -> address -> checkout
 app.include_router(agent_internal_products_router)  # Thin internal search primitive (/agent/internal/products/search)
 app.include_router(agent_management_router)  # Agent management
 app.include_router(fulfillment_api_router)  # Fulfillment tracking for agents
@@ -1152,6 +1433,8 @@ app.include_router(agent_metrics_router)  # Agent API metrics and monitoring
 app.include_router(agent_keys_router)  # Agent API key management
 app.include_router(agent_identity_issuers_router)  # Federated buyer identity: per-agent user-token issuers (portal self-serve)
 app.include_router(agent_identity_issuers_internal_router)  # Internal registry the gateway polls (/agent/internal/identity-issuers)
+app.include_router(payment_grant_issuers_router)  # Which PSPs may authorize money — ADMIN-only registration (Antom lane)
+app.include_router(payment_grant_issuers_internal_router)  # Internal registry the gateway polls (/agent/internal/payment-issuers)
 app.include_router(agent_webhooks_router)  # Agent webhook management and deliveries
 app.include_router(init_agent_key_router)  # Initialize test agent key
 app.include_router(merchant_products_router)  # Merchant product optimization APIs
@@ -1175,12 +1458,10 @@ app.include_router(agent_metrics_v1_router)  # Stable /agent/v1/metrics aliases
 app.include_router(prometheus_metrics_router)  # /metrics (Prometheus scrape)
 app.include_router(shopify_setup_router)  # Shopify setup endpoints
 app.include_router(shopify_manual_router)  # Shopify manual trigger endpoints
-app.include_router(dashboard_router)  # Dashboard API
 app.include_router(dashboard_api_router)  # New Dashboard API
 # payment_routes_router is same as payment_router, already included above
 app.include_router(demo_data_router)  # Demo data management
 # [DELETED] test_data_router router registration removed (file not in Git)
-app.include_router(simple_ws_router)  # Simple WebSocket
 app.include_router(product_quality_router)  # Internal product quality preview (Merchant Portal)
 
 if OPERATIONS_AVAILABLE:
@@ -1188,6 +1469,7 @@ if OPERATIONS_AVAILABLE:
     logger.info("✅ Operations router included")
 
 _guard_legacy_psp_maintenance_routes()
+_guard_legacy_inmemory_auth_routes()
 
 @app.get("/version")
 async def get_version(request: Request):
@@ -1373,26 +1655,12 @@ async def startup():
         
         # Create integration tables
         try:
-            # Create agents table if not exists
-            await database.execute("""
-                CREATE TABLE IF NOT EXISTS agents (
-                    agent_id VARCHAR(50) PRIMARY KEY,
-                    name VARCHAR(255) NOT NULL,
-                    email VARCHAR(255) UNIQUE NOT NULL,
-                    company VARCHAR(255),
-                    use_case TEXT,
-                    api_key VARCHAR(255) UNIQUE,
-                    status VARCHAR(50) DEFAULT 'active',
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    last_active TIMESTAMP WITH TIME ZONE,
-                    last_key_rotation TIMESTAMP WITH TIME ZONE,
-                    deactivated_at TIMESTAMP WITH TIME ZONE,
-                    request_count INTEGER DEFAULT 0,
-                    success_rate FLOAT DEFAULT 0,
-                    rate_limit INTEGER DEFAULT 1000
-                )
-            """)
-            
+            # No agents DDL here: metadata.create_all above builds agents from the db/agents.py
+            # model (imported explicitly at the top of this file), so a raw CREATE TABLE IF NOT
+            # EXISTS at this point never creates anything. The one that stood here described a
+            # legacy table (name, company, use_case, status, request_count) that prod's table does
+            # not have (probe 2026-09-24; routes written against those columns: pivota-backend#2305).
+
             # Fix missing columns in agents table (2024-10-30)
             logger.info("🔧 Applying database fixes for agents table...")
             try:
@@ -1869,9 +2137,17 @@ async def app_lifespan(_app: FastAPI):
     # environment this is (a Cloud Run revision deployed without PIVOTA_ENV),
     # the shim answers "production" so the guards stay armed — but running on
     # that guess is not acceptable, so refuse to come up at all. Local dev and
-    # the test suite (no K_SERVICE, no RAILWAY_*) resolve "development" and
-    # pass straight through.
+    # the test suite (no Cloud Run marker of EITHER family -- K_* for a service,
+    # CLOUD_RUN_JOB/CLOUD_RUN_EXECUTION for a job -- and no RAILWAY_*) resolve
+    # "development" and pass straight through.
     resolved_env = require_platform_env()
+    # Again, idempotently: a deployment that hands uvicorn its own
+    # `--log-config` reconfigures logging AFTER this module was imported, and
+    # `dictConfig` on a named logger drops handlers. It does not drop filters,
+    # so this is belt and braces rather than the load-bearing call — but the
+    # channel it guards carries a live credential, and a second `addFilter` on
+    # an already-installed filter is a no-op by construction.
+    install_uvicorn_access_log_redaction()
     logger.info("🌍 Platform: %s", platform_metadata())
     logger.info("🌍 Resolved environment: %s", resolved_env)
 
@@ -1894,20 +2170,28 @@ async def app_lifespan(_app: FastAPI):
         # shutdown()/shutdown_event() entirely (review round 20).
         with suppress(asyncio.CancelledError, Exception):
             await reconnect_supervisor
-        await shutdown()
+        # ORDER IS LOAD-BEARING, and it was the wrong way round.
+        #
+        # `shutdown()` is `database.disconnect()`, which closes the asyncpg pool.
+        # `shutdown_event()` stops the webhook workers and the audit scheduler. Running the
+        # disconnect FIRST meant every still-running scheduler job was cut off from the pool
+        # while it was being asked to stop: `PostgresConnection.acquire` asserts
+        # "DatabaseBackend is not running", so a run that had already made its external call
+        # (settlement, refund) then FAILED ITS RECORDING WRITE rather than completing. Worse,
+        # once audit_scheduler grew a shutdown drain, that run got seconds of extra life in
+        # which to do it, and could reach its own end and be booked `ok` — a silent
+        # half-completed run on the money path, where the old behaviour was a prompt cancel.
+        #
+        # Stopping the producers before tearing down the resource they use is the right order
+        # regardless of the drain, and it also removes a pre-existing hazard: asyncpg's
+        # `Pool.close()` waits for every holder to be released (it only warns at 60s), and it
+        # was being called while every scheduler job still held connections and had not been
+        # told to stop.
         await shutdown_event()
+        await shutdown()
 
 
 app.router.lifespan_context = app_lifespan
-
-# Global event publisher function for easy access
-async def publish_event_to_ws(event: dict):
-    """Global function to publish events to WebSocket clients"""
-    from realtime.metrics_store import record_event
-    from realtime.ws_manager import publish_event_to_ws as ws_publish
-    
-    record_event(event)
-    await ws_publish(event)
 
 @app.get("/")
 async def root():
@@ -2157,14 +2441,38 @@ async def build_info():
 @app.get("/robots.txt", include_in_schema=False)
 async def robots_txt():
     """
-    Serve an explicit robots.txt. This is an API host with no indexable
-    content, so disallow all crawling. Without this, GET /robots.txt would 404
-    (which crawlers tolerate), but a real disallow-all response is cleaner and
-    stops crawlers from probing further. See cors_preflight_passthrough for why
-    we no longer 405 on unknown paths.
+    Serve an explicit robots.txt. Most of this host is keyed API surface with no
+    indexable content, so crawling stays disallowed - EXCEPT the discovery surface
+    this host deliberately publishes anonymously: the curated partner docs and
+    OpenAPI spec under /agent/docs/, the /openapi.json alias that redirects there,
+    and the OAuth/JWKS metadata under /.well-known/. The old blanket Disallow made
+    robots-respecting agent fetchers (Claude, GPTBot, Perplexity) refuse to read
+    the exact artifacts the marketing site advertises as proof the surface is
+    agent-readable. Keyed SDK clients never consult robots.txt, so nothing here
+    affects real integrations either way.
+
+    Allow lines come FIRST: Google resolves by longest-match (Allow wins), but
+    Python's urllib.robotparser is first-match-in-order - this ordering satisfies
+    both. See cors_preflight_passthrough for why unknown paths 404, not 405.
+
+    PRODUCTION ONLY. Outside production docs_viewer_allowed() serves the FULL
+    internal spec anonymously at /openapi.json, so the allowlist below would
+    invite crawlers straight to the route map the production guard exists to
+    hide. Staging keeps the blanket disallow.
     """
+    if not is_production():
+        return Response(
+            content="User-agent: *\nDisallow: /\n",
+            media_type="text/plain",
+        )
     return Response(
-        content="User-agent: *\nDisallow: /\n",
+        content=(
+            "User-agent: *\n"
+            "Allow: /agent/docs/\n"
+            "Allow: /openapi.json\n"
+            "Allow: /.well-known/\n"
+            "Disallow: /\n"
+        ),
         media_type="text/plain",
     )
 

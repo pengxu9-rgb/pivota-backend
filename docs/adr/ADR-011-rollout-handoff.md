@@ -1,5 +1,13 @@
 # ADR-011 Intake Identity — Rollout Handoff (2026-07-09)
 
+> ⚠️ **Production is GCP Cloud Run (`pivota-prod`, `us-west1`) since 2026-08-22. Railway is the
+> ROLLBACK.** This document is a rollout handoff, but §6 "How to operate / verify" is a LIVE
+> instruction set for work still marked incomplete — so the `railway` commands in it are not
+> historical record, they are steps someone may still follow. They were not translated by
+> guesswork. Translate with
+> [operating_on_gcp_production.md](../runbooks/operating_on_gcp_production.md) before acting.
+
+
 Status snapshot for review / fresh-session pickup. Companion to
 `docs/adr/ADR-011-intake-identity-contract.md`.
 

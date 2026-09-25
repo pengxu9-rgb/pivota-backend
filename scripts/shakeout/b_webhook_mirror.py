@@ -15,9 +15,28 @@ What this exercises:
   8. replay of an already-processed event → 200 + status=duplicate
 
 Usage:
-    STAGING_WEBHOOK_SECRET=$(railway variables --json -e staging -s web-staging \\
-      | jq -r '.STRIPE_BILLING_WEBHOOK_SECRET') \\
+    STAGING_WEBHOOK_SECRET=$(gcloud secrets versions access latest \\
+      --secret=env-STRIPE_BILLING_WEBHOOK_SECRET --project pivota-staging) \\
     .venv/bin/python scripts/shakeout/b_webhook_mirror.py
+
+STAGING PLATFORM — THERE IS NO WORKING DEFAULT TODAY. Read this before changing
+DEFAULT_BASE_URL. The secret above now comes from GCP (pivota-staging), where
+staging was rebuilt, but neither venue is usable from a laptop right now:
+
+  * GCP staging `web` runs with `ingress: internal` (verified 2026-08-25), so it
+    is unreachable from outside the VPC. Putting its Cloud Run URL below would
+    ship a command that always fails.
+  * The Railway staging host still named below is MID-TEARDOWN. Railway was
+    decommissioned on 2026-08-25 (#1872). It answers `/` with 200 but reports
+    `db_status: disconnected`, `/health` is 503, and `/` is served by a different
+    app banner entirely. Treat it as ephemeral: it is left here as the last known
+    value, NOT as a working default, and it will stop answering.
+
+So expect to set SHAKEOUT_BASE_URL yourself, and confirm the target actually
+serves this script's surface before trusting a run — a 401 from
+`/__shakeout/aggregate_daily` means the route exists; a 404 means you are pointed
+at something else. Production is Cloud Run in pivota-prod — never point this
+script there; it posts synthetic Stripe events.
 
 The script constructs Stripe-signature-compatible headers itself (HMAC-SHA256
 of `{timestamp}.{payload}` per Stripe docs) so no Stripe CLI dependency.
@@ -131,8 +150,8 @@ def main() -> int:
     if not secret:
         sys.stderr.write(
             "ERROR: STAGING_WEBHOOK_SECRET not set. Source:\n"
-            "    export STAGING_WEBHOOK_SECRET=$(railway variables --json "
-            "-e staging -s web-staging | jq -r '.STRIPE_BILLING_WEBHOOK_SECRET')\n"
+            "    export STAGING_WEBHOOK_SECRET=$(gcloud secrets versions access latest "
+            "--secret=env-STRIPE_BILLING_WEBHOOK_SECRET --project pivota-staging)\n"
         )
         return 2
 

@@ -1,5 +1,8 @@
 # `DB_COMMAND_TIMEOUT_SECONDS` on production `web`
 
+> **Production is GCP Cloud Run (`pivota-prod`, `us-west1`), not Railway.** Rewritten 2026-08-25.
+> See [operating_on_gcp_production.md](operating_on_gcp_production.md).
+
 Follow-up 1 of issue #1759 (out of #1754 / PR #1756).
 
 **Status: `DB_COMMAND_TIMEOUT_SECONDS=600` is LIVE on `web`/production, applied
@@ -196,16 +199,24 @@ seed-mirror query — see below.
 
 If a future backfill legitimately needs more than 600s in one statement, do
 **not** raise the clamp. Run that script with `DB_COMMAND_TIMEOUT_SECONDS=0`
-(unset/infinite) for that run. Note that `railway run` injects the service's
-variables, so ops scripts launched that way inherit whatever `web` is set to.
+(unset/infinite) for that run. On Cloud Run a one-off job inherits NOTHING — not
+env vars, not secrets — so a job launched for a backfill gets the default unless
+you pass `--set-env-vars DB_COMMAND_TIMEOUT_SECONDS=0` explicitly. That is the
+opposite of `railway run`, which injected the service's variables and meant such
+scripts silently inherited whatever `web` was set to.
 
 ## Applying / changing it
 
-Production change — Railway restarts the service when a variable changes.
+Production change — `gcloud run services update` creates a new revision and shifts
+traffic to it once healthy, so new processes pick the value up on their own.
 
 ```bash
-railway variables --set DB_COMMAND_TIMEOUT_SECONDS=600 --project 9bdca959-cc79-413c-9f23-c8b5396eb5f0 --service web --environment production
+gcloud run services update web --project pivota-prod --region us-west1 \
+  --update-env-vars DB_COMMAND_TIMEOUT_SECONDS=600
 ```
+
+`--update-env-vars` MERGES. `--set-env-vars` and `--env-vars-file` replace the whole
+set and would wipe the other ~250 variables on `web`.
 
 Afterwards, confirm the **pool** picked it up. Do not check `os.getenv` — it
 proves only that a variable exists, and `_env_float` silently turns a
@@ -213,9 +224,35 @@ malformed value into `0.0` (= no ceiling at all) and silently clamps `601` to
 `600`, so the env string and the effective ceiling can disagree with no log
 either way. Read the computed kwargs instead:
 
+Cloud Run has no `ssh`. Read the computed kwargs from a throwaway job on the same
+image — and note `--args` splits on COMMAS, so the Python one-liner needs the
+alternate-delimiter form or it is shredded into separate argv entries:
+
 ```bash
-railway ssh --project 9bdca959-cc79-413c-9f23-c8b5396eb5f0 --service web --environment production 'python -c "import db.database as d;print(d.database_kwargs.get(\"command_timeout\"))"'
+JOB="dbto-$$-$RANDOM"
+gcloud run jobs create "$JOB" --project pivota-prod --region us-west1 \
+  --image us-west1-docker.pkg.dev/pivota-shared/pivota/backend:latest \
+  --service-account sa-worker@pivota-prod.iam.gserviceaccount.com \
+  --network default --subnet default --vpc-egress all-traffic \
+  --set-secrets DATABASE_URL=DATABASE_URL:latest \
+  --set-env-vars DB_COMMAND_TIMEOUT_SECONDS=600 \
+  --max-retries 0 --task-timeout 120s --command python \
+  --args="^|^-c|import db.database as d;print('CT=' + str(d.database_kwargs.get('command_timeout')))"
+gcloud run jobs execute "$JOB" --project pivota-prod --region us-west1 --wait || {
+  echo "job FAILED - do not read the log for a verdict, the exit code already gave you one" >&2; }
+for i in 1 2 3 4 5 6; do
+  OUT=$(gcloud logging read "resource.labels.job_name=\"$JOB\"" --project pivota-prod \
+    --limit 20 --format='value(textPayload)' --freshness=10m)
+  [ -n "$OUT" ] && break
+  sleep 5
+done
+printf '%s\n' "$OUT" | grep CT=
+gcloud run jobs delete "$JOB" --project pivota-prod --region us-west1 --quiet
 ```
+
+The job must be given the same `DB_COMMAND_TIMEOUT_SECONDS` you just set on the
+service — it inherits nothing, so without that flag you are reading the DEFAULT
+and would conclude the change did not apply.
 
 Expect `600.0`. `None` means the value was rejected or the URL is not Postgres.
 Rollback is unsetting the variable.

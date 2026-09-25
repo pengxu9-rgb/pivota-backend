@@ -15,6 +15,7 @@ from sqlalchemy import and_, select, update
 from db.database import database
 from db.external_offers import external_offer_snapshots
 from services import crawl_politeness
+from utils.availability_vocabulary import normalize_availability
 
 
 MAX_BODY_BYTES = int(os.getenv("EXTERNAL_OFFER_MAX_BODY_BYTES") or "1200000")  # ~1.2MB
@@ -1115,14 +1116,15 @@ def _extract_jsonld_offer(parsed_objs: list[Any]) -> Dict[str, Any]:
 
 
 def _availability_from_raw(raw: Optional[str]) -> str:
-    if not raw:
-        return "unknown"
-    v = raw.lower()
-    if "instock" in v or "in_stock" in v or "in stock" in v:
-        return "in_stock"
-    if "outofstock" in v or "out_of_stock" in v or "out of stock" in v:
-        return "out_of_stock"
-    return "unknown"
+    """Map a raw availability signal (often a JSON-LD schema.org IRI) to our canonical token.
+
+    This previously matched only the InStock/OutOfStock substrings, so ten of the twelve
+    schema.org ItemAvailability values resolved to "unknown" — including SoldOut and
+    Reserved, which schema.org itself defines as not available. Plain "sold out",
+    "unavailable" and "oos" missed too.
+    """
+    canonical = normalize_availability(raw)
+    return canonical if canonical is not None else "unknown"
 
 
 def _normalize_description_text(raw: Optional[str]) -> Optional[str]:
@@ -1198,7 +1200,52 @@ def _extract_long_description_from_html(html: str) -> Optional[str]:
     return None
 
 
-async def _fetch_html(url: str, *, max_wait: Optional[float] = None) -> Tuple[str, str]:
+def _mark_from_cache(observed: Optional[Dict[str, Any]]) -> None:
+    """Record that the snapshot being returned came from the CACHE, not from this request.
+
+    `observed` is an out-parameter, and its `status_code` says only that a response arrived —
+    not that the snapshot the caller receives was built from it. Anything that needs to know
+    "did we actually re-read this page" (a freshness stamp, a gate that clears a serving
+    blocker) must consult this, because a post-response failure leaves `status_code` set and
+    still hands back the previous row.
+    """
+    if observed is not None:
+        observed["from_cache"] = True
+
+
+class ExternalOfferUnavailable(RuntimeError):
+    """The ORIGIN answered, and its answer was "not here".
+
+    Split out from the bare `httpx.HTTPStatusError` `raise_for_status()` used to raise
+    because callers could not tell it apart from a timeout, a TLS failure, or a bot
+    challenge — and the difference is the whole question. A 404 is a fact about the
+    product; a timeout is a fact about the network. `_refresh_external_seed_by_id`
+    swallowed both into `{"status": "degraded"}`, which is why a dead destination could
+    never become known (docs/external-seed-dead-pdp-link-audit.md §4.2).
+
+    `final_url` is the URL the request ENDED on, so a caller can tell a 200 that stayed
+    on the product from a 301 that dropped the shopper on a collection page.
+    """
+
+    def __init__(self, *, status_code: int, url: str, final_url: Optional[str] = None) -> None:
+        super().__init__(f"origin answered {status_code} for {url}")
+        self.status_code = int(status_code)
+        self.url = url
+        self.final_url = final_url or url
+
+
+async def _fetch_html(
+    url: str,
+    *,
+    max_wait: Optional[float] = None,
+    observed: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, str]:
+    # `observed` is an OUT-parameter, not a behaviour switch: pass a dict and it is filled with
+    # {"status_code", "final_url"} for the request that actually left. It exists because the
+    # return type is (text, content_type) and the FINAL url is the only way to tell a product
+    # page from a 301 that dropped the shopper on a collection — a distinction three existing
+    # callers do not need and must not have to care about. Adding it as a kwarg keeps every
+    # `html, ct = await _fetch_html(...)` call site working unchanged.
     # Every crawl now leaves from ONE reserved NAT address per environment
     # (infra/gcp/setup_crawl_egress.sh), so an unpaced loop earns a per-IP block that takes the
     # whole lane down rather than one worker. Robots + per-domain pacing are the prerequisites
@@ -1224,7 +1271,27 @@ async def _fetch_html(url: str, *, max_wait: Optional[float] = None) -> Tuple[st
         crawl_politeness.note_response(
             url, resp.status_code, retry_after=resp.headers.get("retry-after")
         )
-        resp.raise_for_status()
+        if observed is not None:
+            observed["status_code"] = resp.status_code
+            observed["final_url"] = str(resp.url)
+            observed["bot_challenged"] = bool(resp.headers.get("cf-mitigated"))
+        # WAS `resp.raise_for_status()`. Same control flow — every existing caller
+        # catches `Exception` — but the status and the final URL now survive the throw,
+        # which is what lets the refresh record "this product is gone" instead of
+        # "something went wrong". See ExternalOfferUnavailable.
+        #
+        # The 2xx RANGE, not `>= 400`, because those are NOT the same predicate and the
+        # difference is a silent behaviour change: `raise_for_status` throws for anything
+        # outside 2xx, which includes a 3xx that survived `follow_redirects=True` (a 302 with
+        # no Location has no redirect to follow). Under `>= 400` such a response would be
+        # parsed as if it were the product page, and its body written into the snapshot.
+        #
+        # Spelled out rather than using httpx's `resp.is_success`: the predicate is the point
+        # and it should not depend on an attribute every test double has to remember to grow.
+        if not (200 <= resp.status_code < 300):
+            raise ExternalOfferUnavailable(
+                status_code=resp.status_code, url=url, final_url=str(resp.url)
+            )
         content_type = (resp.headers.get("content-type") or "").lower()
         # Read up to MAX_BODY_BYTES to keep latency predictable.
         body = resp.content[:MAX_BODY_BYTES]
@@ -1446,7 +1513,25 @@ def _is_stale(last_checked_at: Optional[datetime]) -> bool:
     return last_checked_at < (_now() - timedelta(days=MAX_AGE_DAYS))
 
 
-async def resolve_external_offer(*, market: str, url: str, force_refresh: bool = False) -> ExternalOfferSnapshot:
+async def resolve_external_offer(
+    *,
+    market: str,
+    url: str,
+    force_refresh: bool = False,
+    raise_on_unavailable: bool = False,
+    observed: Optional[Dict[str, Any]] = None,
+    max_wait: Optional[float] = None,
+) -> ExternalOfferSnapshot:
+    """Resolve (and opportunistically refresh) the offer snapshot for a third-party URL.
+
+    `raise_on_unavailable` DEFAULTS TO FALSE, which is today's behaviour exactly: a failed
+    fetch silently returns the cached snapshot. That fallback is why a dead destination could
+    masquerade as a healthy one — the seed refresh got a snapshot back, wrote it, and bumped
+    `updated_at`, so a 404 actually made the row look FRESHER. A caller that is asking about
+    the LINK rather than the CONTENT passes True and gets the `ExternalOfferUnavailable`.
+
+    `observed` is an out-parameter forwarded to `_fetch_html`; see its note.
+    """
     market_norm = str(market or "US").upper()
     url_norm = _normalize_url(url)
     url_hash = _url_hash(url_norm)
@@ -1457,7 +1542,15 @@ async def resolve_external_offer(*, market: str, url: str, force_refresh: bool =
 
     # Try to refresh (best-effort). If refresh fails, return existing cached value.
     try:
-        html, _ct = await _fetch_html(url_norm)
+        # `max_wait` IS THE CALLER'S PATIENCE, and this function had no way to express it.
+        # `_fetch_html` documents the rule: the default ceiling exists for the LIVE route, and
+        # a BATCH job must pass 0 (unbounded) or the backoff curve above ~16s becomes
+        # unreachable -- `await_slot` refuses instead of waiting, the refusal is swallowed as
+        # a generic failure, and one throttled host voids the rest of its own rows in
+        # milliseconds while looking like the host was down. The sibling destination sweep
+        # passes 0 explicitly; until now the content refresh could not, because there was no
+        # parameter between it and here. Default None keeps the live route exactly as it was.
+        html, _ct = await _fetch_html(url_norm, observed=observed, max_wait=max_wait)
         extracted = _extract_from_html(url_norm, html)
 
         canonical_url = _normalize_url(extracted.get("canonical_url") or url_norm)
@@ -1529,12 +1622,31 @@ async def resolve_external_offer(*, market: str, url: str, force_refresh: bool =
         refreshed_row = await _get_snapshot_row(market_norm, url_hash)
         if refreshed_row:
             return _row_to_snapshot(refreshed_row)
+    except ExternalOfferUnavailable:
+        # The origin ANSWERED and said no. Serving still prefers the cached snapshot (that is
+        # what keeps a transient outage from blanking the catalogue), but a caller that asked
+        # to hear about it must not be handed a stale row as if the fetch had worked.
+        if raise_on_unavailable:
+            raise
+        if existing:
+            _mark_from_cache(observed)
+            return _row_to_snapshot(existing)
+        raise
     except Exception:
         if existing:
+            # A CACHED ROW IS NOT A READING, AND `observed` CANNOT SHOW THAT ON ITS OWN.
+            # `_fetch_html` stamps `observed["status_code"]` BEFORE it returns, so every
+            # failure AFTER the response — the extractor, the snapshot upsert, the post-write
+            # re-read — lands here with `observed` already populated and the CACHED snapshot
+            # going back to the caller. A caller checking only `status_code` would conclude it
+            # had just re-read a page it never parsed. Say so explicitly instead.
+            _mark_from_cache(observed)
             return _row_to_snapshot(existing)
         raise
 
-    # Fallback: should never happen, but keep function total.
+    # Fallback: should never happen, but keep function total. Same reasoning as above: the
+    # post-write re-read returning None reaches here with a populated `observed`.
     if existing:
+        _mark_from_cache(observed)
         return _row_to_snapshot(existing)
     raise ValueError("FETCH_FAILED")

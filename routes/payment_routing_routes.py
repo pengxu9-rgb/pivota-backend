@@ -10,7 +10,13 @@ import json
 
 from db.database import database
 from services.payment_routing_service import PaymentRoutingService
-from utils.auth import get_current_user, get_current_employee
+from utils.auth import ADMIN_ROLES, get_current_user, get_current_employee
+
+# The guards here are `caller is the agent OR caller is an admin`. Only the
+# second conjunct changes: the ownership test is untouched, so a caller who is
+# neither the owning agent nor an admin is refused exactly as before. Not
+# widened to staff -- an agent's payment-routing configuration is not a
+# general employee-portal read today, and making it one is a separate call.
 
 
 router = APIRouter(prefix="/agents", tags=["Payment Routing"])
@@ -87,7 +93,7 @@ async def execute_payment_with_routing(
     Execute payment with intelligent routing and automatic failover
     """
     # Verify agent access
-    if current_user.get("user_id") != agent_id and current_user.get("role") != "admin":
+    if current_user.get("user_id") != agent_id and current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Access denied")
     
     try:
@@ -123,7 +129,7 @@ async def get_agent_routes(
     Get routing configurations for an agent
     """
     # Verify agent access
-    if current_user.get("user_id") != agent_id and current_user.get("role") != "admin":
+    if current_user.get("user_id") != agent_id and current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Access denied")
     
     query = """
@@ -173,7 +179,7 @@ async def update_route_config(
     Update routing configuration
     """
     # Verify agent access
-    if current_user.get("user_id") != agent_id and current_user.get("role") != "admin":
+    if current_user.get("user_id") != agent_id and current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Access denied")
     
     # Check route exists and belongs to agent
@@ -288,7 +294,7 @@ async def create_route_config(
     Create a new routing configuration
     """
     # Verify agent access
-    if current_user.get("user_id") != agent_id and current_user.get("role") != "admin":
+    if current_user.get("user_id") != agent_id and current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Access denied")
     
     # Generate route ID
@@ -356,7 +362,7 @@ async def delete_route_config(
     Delete (deactivate) a routing configuration
     """
     # Verify agent access
-    if current_user.get("user_id") != agent_id and current_user.get("role") != "admin":
+    if current_user.get("user_id") != agent_id and current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Access denied")
     
     # Deactivate route instead of hard delete

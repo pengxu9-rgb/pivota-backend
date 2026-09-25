@@ -8,11 +8,21 @@ Confirms the four invariants of the seed-on-audit pipeline (PR #1105):
      pick_canonical guardrail must keep the REAL row canonical (eyeball the served PDP).
   4. Reports for these products would emit a pipe product_key (checked via a fresh audit).
 
-Read-only. Run against prod via Railway so you don't handle the secret:
-    railway run python scripts/verify_url_audit_canary.py            # scan all recent seeds
-    railway run python scripts/verify_url_audit_canary.py <merchant_id>   # scope to one merchant
+Read-only. Production is Cloud Run (pivota-prod/us-west1); Railway is the
+ROLLBACK, so `railway run` here would check the canary on a platform nobody is
+served from. There is no `railway run` equivalent — use a throwaway job on the
+production image, which also keeps you from handling the DB secret:
 
-Reads DATABASE_PUBLIC_URL (preferred) or DATABASE_URL from the environment.
+    scripts/ops/run_oneoff_job.sh scripts/verify_url_audit_canary.py            # all recent seeds
+    scripts/ops/run_oneoff_job.sh scripts/verify_url_audit_canary.py <merchant_id>  # one merchant
+
+The helper mounts the DATABASE_URL secret (a job inherits NO env and NO secrets)
+and takes its verdict from the job's EXIT CODE. Full pattern:
+docs/runbooks/operating_on_gcp_production.md.
+
+Reads DATABASE_PUBLIC_URL (preferred, if you have set one) or DATABASE_URL from
+the environment. DATABASE_PUBLIC_URL was the Railway public proxy and is set
+nowhere in production today; under the job above, DATABASE_URL is the one used.
 Requires asyncpg (already a backend dependency).
 """
 import asyncio
@@ -26,7 +36,12 @@ import asyncpg
 def _dsn_and_ssl():
     raw = os.getenv("DATABASE_PUBLIC_URL") or os.getenv("DATABASE_URL")
     if not raw:
-        sys.exit("ERROR: set DATABASE_PUBLIC_URL or DATABASE_URL (use `railway run ...`).")
+        sys.exit(
+            "ERROR: set DATABASE_PUBLIC_URL or DATABASE_URL "
+            "(in production use `scripts/ops/run_oneoff_job.sh "
+            "scripts/verify_url_audit_canary.py`, which mounts the "
+            "DATABASE_URL secret — a Cloud Run job inherits nothing)."
+        )
     parts = urlsplit(raw)
     # asyncpg doesn't parse sslmode from the URL — pull it out and pass ssl= kwarg.
     q = parse_qs(parts.query)

@@ -11,6 +11,10 @@ import httpx
 import json
 import logging
 from adapters.bigcommerce_adapter import normalize_bigcommerce_store_hash
+from adapters.magento_adapter import normalize_magento_store_url
+from adapters.sfcc_adapter import normalize_sfcc_short_code, normalize_sfcc_storefront_url
+from adapters.shopline_adapter import normalize_shopline_handle
+from adapters.shoplazza_adapter import normalize_shoplazza_store_url
 from adapters.woocommerce_adapter import normalize_woocommerce_store_url
 from adapters.product_adapters import fetch_merchant_products
 from routes.product_routes import upsert_product_cache
@@ -31,6 +35,11 @@ class UniversalSyncRequest(BaseModel):
     merchant_id: str
     force_refresh: bool = False
     limit: int = 50
+    # True for syncs no person is waiting on (the gateway's catalog auto-sync
+    # via routes/platform_products_sync_api). Only these are subject to the
+    # quality-backfill enqueue cooldown; a merchant's own Sync always enqueues.
+    # Honoured only when the caller is the admin/internal role — see the hook.
+    unattended: bool = False
     # Optional platform hint: shopify, wix, woocommerce, etc.
     # When provided, we will try to sync that specific platform first.
     platform: Optional[str] = None
@@ -176,6 +185,8 @@ async def universal_product_sync(
         
         # 4. Fetch products using the universal adapter
         # 4.1 Paginate through all pages (Shopify limit=250/page). Guard with max_pages.
+        # A guard hit is a partial traversal and must never drive stale deletion:
+        # ids beyond the visited window are unknown, not deleted upstream.
         synced_count = 0
         synced_platform_ids = set()
         catalog_payloads = []
@@ -227,22 +238,34 @@ async def universal_product_sync(
             else:
                 break
 
-        # 5. Cleanup products that no longer exist upstream for this merchant/platform
-        try:
-            deleted_stale = await delete_missing_products_from_cache(
-                merchant_id=request.merchant_id,
-                platform=platform,
-                valid_platform_product_ids=list(synced_platform_ids),
-            )
-            logger.info(
-                f"Universal sync cleanup: removed {deleted_stale} stale "
-                f"products for merchant={request.merchant_id}, platform={platform}"
-            )
-        except Exception as cleanup_error:
-            # 清理失败不应该影响整体同步结果，只记录日志以便后续排查
-            logger.error(
-                f"Failed to cleanup stale products after sync for "
-                f"merchant={request.merchant_id}, platform={platform}: {cleanup_error}"
+        # 5. Cleanup products only after a complete upstream traversal. If the
+        # last page still returned a token, max_pages truncated this sync.
+        pagination_complete = not bool(next_page_token)
+        if pagination_complete:
+            try:
+                deleted_stale = await delete_missing_products_from_cache(
+                    merchant_id=request.merchant_id,
+                    platform=platform,
+                    valid_platform_product_ids=list(synced_platform_ids),
+                )
+                logger.info(
+                    f"Universal sync cleanup: removed {deleted_stale} stale "
+                    f"products for merchant={request.merchant_id}, platform={platform}"
+                )
+            except Exception as cleanup_error:
+                # 清理失败不应该影响整体同步结果，只记录日志以便后续排查
+                logger.error(
+                    f"Failed to cleanup stale products after sync for "
+                    f"merchant={request.merchant_id}, platform={platform}: {cleanup_error}"
+                )
+        else:
+            logger.warning(
+                "Universal sync reached max_pages; stale cleanup skipped "
+                "merchant=%s platform=%s pages=%s next_page_token=%s",
+                request.merchant_id,
+                platform,
+                pages,
+                next_page_token,
             )
 
         catalog_synced = 0
@@ -276,9 +299,9 @@ async def universal_product_sync(
                 # the sync that just succeeded.
                 try:
                     from db.product_quality_backfill_jobs import (
-                        create_quality_backfill_job,
+                        enqueue_quality_backfill_if_needed,
                     )
-                    await create_quality_backfill_job(
+                    await enqueue_quality_backfill_if_needed(
                         merchant_id=request.merchant_id,
                         platform=platform,
                         requested_by="universal_product_sync",
@@ -303,6 +326,24 @@ async def universal_product_sync(
                         # force_refresh=True and were silently downgraded here.
                         force_refresh=bool(request.force_refresh),
                         missing_only=True,
+                        # The gateway's auto-sync arrives here with
+                        # force_refresh=True several times a day; unattended
+                        # requests are folded into a recent job instead of
+                        # rescoring an unchanged catalog every time.
+                        # ...and only an admin caller can say so (ADMIN_ROLES,
+                        # the same set the merchant-scope check above trusts):
+                        # the merchant-facing endpoint parses the same body,
+                        # and a client must not be able to opt its own Sync
+                        # out of being the delivery path for its edits. The
+                        # isinstance guard keeps a malformed current_user from
+                        # raising INSIDE the best-effort try, which would
+                        # delete the whole readiness enqueue rather than the
+                        # dedupe.
+                        unattended=(
+                            bool(request.unattended)
+                            and isinstance(current_user, dict)
+                            and current_user.get("role") in ADMIN_ROLES
+                        ),
                     )
                 except Exception as enqueue_error:  # noqa: BLE001 — best-effort
                     logger.warning(
@@ -529,12 +570,95 @@ def prepare_platform_credentials(platform: str, store_info: Dict) -> Optional[Di
                     "consumer_key": api_key_data,
                     "consumer_secret": ""
                 }
+
             except json.JSONDecodeError:
                 return {
                     "store_url": store_url,
                     "consumer_key": api_key_data,
                     "consumer_secret": ""
                 }
+
+    elif platform == "magento":
+        store_url = normalize_magento_store_url(store_info.get("domain"))
+        raw_credentials = store_info.get("api_key")
+        if not store_url or not raw_credentials:
+            return None
+        try:
+            parsed_credentials = (
+                json.loads(raw_credentials)
+                if isinstance(raw_credentials, str) and raw_credentials.strip().startswith("{")
+                else raw_credentials
+            )
+        except json.JSONDecodeError:
+            parsed_credentials = raw_credentials
+        credentials = (
+            dict(parsed_credentials)
+            if isinstance(parsed_credentials, dict)
+            else {"access_token": parsed_credentials}
+        )
+        access_token = str(credentials.get("access_token") or "").strip()
+        if not access_token:
+            return None
+        return {
+            "store_url": store_url,
+            "access_token": access_token,
+            "store_view_code": str(credentials.get("store_view_code") or "default"),
+            "currency": str(credentials.get("currency") or "USD").upper(),
+            "product_url_suffix": credentials.get("product_url_suffix"),
+        }
+
+    elif platform == "salesforce_commerce_cloud":
+        raw_credentials = store_info.get("api_key")
+        if not raw_credentials:
+            return None
+        try:
+            parsed = json.loads(raw_credentials) if isinstance(raw_credentials, str) else raw_credentials
+        except json.JSONDecodeError:
+            return None
+        credentials = dict(parsed) if isinstance(parsed, dict) else {}
+        short_code = normalize_sfcc_short_code(
+            credentials.get("short_code") or store_info.get("domain")
+        )
+        required = {
+            "short_code": short_code,
+            "organization_id": str(credentials.get("organization_id") or "").strip(),
+            "site_id": str(credentials.get("site_id") or "").strip(),
+            "client_id": str(credentials.get("client_id") or "").strip(),
+            "client_secret": str(credentials.get("client_secret") or "").strip(),
+        }
+        if not all(required.values()):
+            return None
+        return {
+            **required,
+            "currency": str(credentials.get("currency") or "USD").upper(),
+            "locale": str(credentials.get("locale") or "").strip() or None,
+            "storefront_url": normalize_sfcc_storefront_url(
+                credentials.get("storefront_url") or ""
+            ),
+        }
+
+    elif platform in {"shopline", "shoplazza"}:
+        raw_credentials = store_info.get("api_key")
+        if not raw_credentials:
+            return None
+        try:
+            parsed = json.loads(raw_credentials) if isinstance(raw_credentials, str) else raw_credentials
+        except json.JSONDecodeError:
+            parsed = {"access_token": raw_credentials}
+        credentials = dict(parsed) if isinstance(parsed, dict) else {"access_token": parsed}
+        access_token = str(credentials.get("access_token") or "").strip()
+        if not access_token:
+            return None
+        common = {
+            "access_token": access_token,
+            "api_version": str(credentials.get("api_version") or ("v20260601" if platform == "shopline" else "2026-01")),
+            "currency": str(credentials.get("currency") or "USD").upper(),
+        }
+        if platform == "shopline":
+            handle = normalize_shopline_handle(credentials.get("handle") or store_info.get("domain"))
+            return {**common, "handle": handle} if handle else None
+        store_url = normalize_shoplazza_store_url(store_info.get("domain"))
+        return {**common, "store_url": store_url} if store_url else None
     
     elif platform == "square":
         # Square uses location ID and access token
@@ -593,6 +717,27 @@ def prepare_platform_credentials(platform: str, store_info: Dict) -> Optional[Di
                     "access_token": api_key_data,
                     "client_id": ""
                 }
+
+    elif platform == "cafe24":
+        domain = store_info.get("domain")
+        api_key_data = (
+            store_info.get("api_credentials")
+            or store_info.get("api_key_raw")
+            or store_info.get("api_key")
+        )
+        if domain and api_key_data:
+            try:
+                credentials = (
+                    json.loads(api_key_data)
+                    if isinstance(api_key_data, str)
+                    else dict(api_key_data)
+                )
+            except (json.JSONDecodeError, TypeError, ValueError):
+                return None
+            credentials["mall_id"] = credentials.get("mall_id") or str(domain).split(".", 1)[0]
+            credentials["store_id"] = store_info.get("store_id")
+            if credentials.get("access_token"):
+                return credentials
     
     # Add more platforms as needed
     logger.warning(f"Platform {platform} not yet implemented in credential preparation")

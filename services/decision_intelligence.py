@@ -50,6 +50,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Set
 import httpx
 
 from config.settings import settings
+from services.llm_fence import PRODUCT_DATA_FENCE
 
 logger = logging.getLogger(__name__)
 
@@ -253,7 +254,10 @@ def build_source_corpus(
 ) -> str:
     """The ground-truth text a descriptive quote must come from. Owned inputs
     only: brand-authored description, canonical title, INCI + parsed actives,
-    taxonomy tags. No web, no priors."""
+    taxonomy tags. No web, no priors.
+
+    Every part is sanitized the way ``build_prompt`` sanitizes it, so a phrase
+    the model quotes verbatim from the fenced prompt is a phrase of this corpus."""
     parts: List[str] = []
     for v in (title, description, brand, category_path, raw_inci):
         if v and str(v).strip():
@@ -263,7 +267,7 @@ def build_source_corpus(
     elif isinstance(tags, str) and tags.strip():
         parts.append(tags)
     parts.extend(_active_labels(actives))
-    return " . ".join(parts)
+    return PRODUCT_DATA_FENCE.sanitize_text(" . ".join(parts))
 
 
 @dataclass
@@ -475,7 +479,8 @@ _SYSTEM_PROMPT = (
     "percentages, durations) or invert meaning (no 'with alcohol' for "
     "'alcohol-free'; no skin-type swaps). "
     "The system republishes source-truth and drops anything not verbatim. "
-    'Return JSON only: {"bullet_points": ["..."], "usage_scenarios": ["..."]}'
+    'Return JSON only: {"bullet_points": ["..."], "usage_scenarios": ["..."]} '
+    + PRODUCT_DATA_FENCE.notice
 )
 
 
@@ -489,25 +494,29 @@ def build_prompt(
     raw_inci: Optional[str] = None,
     substantiated_claims: Optional[Sequence[str]] = None,
 ) -> str:
-    active_labels = _active_labels(actives)
+    # Everything below is merchant or crawled text, the claims included (they are
+    # spans of it). The whole block goes inside one fence; the field labels are
+    # ours and stay, but a value cannot forge a label, a turn, or the fence.
+    clean = PRODUCT_DATA_FENCE.sanitize_text
+    active_labels = [clean(a) for a in _active_labels(actives)]
     lines = [
-        f"BRAND: {brand or ''}",
-        f"TITLE: {title or ''}",
-        f"CATEGORY: {category_path or ''}",
+        f"BRAND: {clean(brand or '')}",
+        f"TITLE: {clean(title or '')}",
+        f"CATEGORY: {clean(category_path or '')}",
     ]
     if active_labels:
         lines.append("KEY ACTIVES: " + ", ".join(active_labels))
     elif raw_inci:
-        lines.append("INGREDIENTS (INCI): " + str(raw_inci)[:800])
-    subs = [str(c).strip() for c in (substantiated_claims or []) if str(c).strip()]
+        lines.append("INGREDIENTS (INCI): " + clean(str(raw_inci)[:800]))
+    subs = [clean(str(c).strip()) for c in (substantiated_claims or []) if str(c).strip()]
     if subs:
         lines.append("SUBSTANTIATED CLAIMS (copy these verbatim for efficacy):")
         lines.extend(f"  - {c}" for c in subs[:12])
     else:
         lines.append("SUBSTANTIATED CLAIMS: (none — emit NO efficacy points)")
     lines.append("DESCRIPTION (quote verbatim for descriptive points):")
-    lines.append((description or "").strip()[:2400] or "(none)")
-    return "\n".join(lines)
+    lines.append(clean((description or "").strip()[:2400]) or "(none)")
+    return PRODUCT_DATA_FENCE.wrap("\n".join(lines))
 
 
 async def _call_deepseek(prompt: str, *, timeout_s: float = 30.0) -> Optional[Dict[str, Any]]:

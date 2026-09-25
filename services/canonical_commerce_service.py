@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, Iterable, List, Optional
 
-from sqlalchemy import and_, delete, desc, select
+from sqlalchemy import and_, delete, desc, func, select
 
 from adapters.product_adapters import ShopifyProductAdapter
 from db.canonical_commerce import (
@@ -19,6 +19,7 @@ from db.canonical_commerce import (
 )
 from db.database import database
 from db.products import get_cached_products
+from services.offer_buyability import IN_STOCK_AVAILABILITY
 from models.standard_product import StandardProduct, StandardProductVariant
 
 logger = logging.getLogger(__name__)
@@ -484,3 +485,115 @@ async def canonical_cache_parity(
         "missing_in_cache": [item for item in canonical_ids if item not in cache_ids],
         "matched": cache_ids == canonical_ids,
     }
+
+
+# =====================================================================
+# UCP probe variant selection
+# =====================================================================
+
+_PROBE_VARIANT_GID_PREFIX = "gid://shopify/ProductVariant/"
+
+# How many ordered rows to look at before giving up. Only exists so one
+# malformed id cannot hide an entire merchant's catalogue; the pick is still
+# the first USABLE row in the same deterministic order.
+_PROBE_VARIANT_SCAN_LIMIT = 25
+
+
+async def select_probe_variant_gid(merchant_id: str) -> Optional[str]:
+    """One Shopify variant GID for a merchant, for the Store Audit UCP probe.
+
+    WHY THIS EXISTS. services/ucpStoreAuditProbe.js (gateway) reaches its
+    `tested` tier — the one that records `priced_facts.checkout_status`, the
+    only signal in the lane that separates a store an agent can actually buy
+    from from one that merely advertises UCP — ONLY when the claim hands it a
+    variant_gid. That gid comes from verification_runs.product_key, and no
+    enqueue path has ever set it. So the tested tier has never executed in
+    production and every route in the system sits at `detected`.
+
+    DETERMINISTIC BY CONSTRUCTION. The probe's one sanctioned side effect is a
+    single create_checkout against the merchant's own store, so repeated
+    reprobes must keep landing on the SAME variant rather than spraying
+    abandoned checkouts across the catalogue. Do not make this "pick a
+    random/newest variant" — the stability is the point.
+
+    ORDER BY (length, value), NOT by the raw string. platform_variant_id is a
+    String column holding Shopify's monotonically increasing integer ids, and
+    plain lexicographic order is NOT stable as a catalogue grows: a newly
+    ingested 14-digit `41...` sorts before an existing 13-digit `42...` and
+    silently steals the pick. Ordering on length first makes this numeric order
+    for digit-only ids, so the choice is "the merchant's oldest variant" — which
+    new ingests cannot displace. func.length is the portable spelling; a numeric
+    CAST would be neither portable nor safe against the non-numeric ids the
+    guard below still has to reject.
+
+    Returns None whenever a purchasable Shopify variant cannot be named, which
+    puts the probe back on exactly today's behaviour (detected tier).
+    """
+    merchant = str(merchant_id or "").strip()
+    if not merchant:
+        return None
+
+    # Availability lives on canonical_offers, the variant identity on
+    # canonical_variants; a variant with no offer row has no availability to
+    # judge, so the join is inner on purpose.
+    query = (
+        select(canonical_variants.c.platform_variant_id)
+        .select_from(
+            canonical_variants.join(
+                canonical_offers,
+                and_(
+                    canonical_offers.c.canonical_variant_id
+                    == canonical_variants.c.canonical_variant_id,
+                    canonical_offers.c.merchant_id
+                    == canonical_variants.c.merchant_id,
+                ),
+            )
+        )
+        .where(
+            and_(
+                canonical_variants.c.merchant_id == merchant,
+                canonical_variants.c.platform == "shopify",
+                func.lower(func.trim(canonical_offers.c.availability)).in_(
+                    sorted(IN_STOCK_AVAILABILITY)
+                ),
+                # `orderable` is folded into availability on the write path
+                # (see upsert_canonical_product), but an offer that says
+                # outright that it cannot be ordered must not be handed to a
+                # probe that will try to check out with it. NULL is unknown,
+                # not False, and stays eligible.
+                canonical_offers.c.orderable.isnot(False),
+            )
+        )
+        .order_by(
+            func.length(canonical_variants.c.platform_variant_id).asc(),
+            canonical_variants.c.platform_variant_id.asc(),
+        )
+        # A SMALL WINDOW, NOT LIMIT 1. The numeric guard below runs in Python
+        # because neither engine spells "digits only" portably, so LIMIT 1 let a
+        # single malformed id at the front of the order blank the merchant
+        # entirely — the tier would go silent for their whole catalogue on one
+        # bad row. Scanning a few lets the ordering keep its meaning (still the
+        # oldest USABLE variant, deterministically) while tolerating junk.
+        .limit(_PROBE_VARIANT_SCAN_LIMIT)
+    )
+    try:
+        rows = await database.fetch_all(query)
+    except Exception:
+        # Never let a catalogue lookup fail an enqueue: no variant is a
+        # supported outcome (the probe stays on its detected tier), an
+        # unhandled exception here would drop the reprobe entirely.
+        logger.warning(
+            "select_probe_variant_gid: lookup failed for merchant=%s",
+            merchant, exc_info=True,
+        )
+        return None
+
+    # The claim endpoint only forwards a value that already starts with the GID
+    # prefix, and merchant_ucp_checkout rejects a non-numeric id upstream. A
+    # non-numeric platform_variant_id here would therefore travel as far as the
+    # merchant's door before being refused — reject it at the source instead.
+    for row in rows or []:
+        variant_id = str(row["platform_variant_id"] or "").strip()
+        if variant_id.isdigit():
+            return f"{_PROBE_VARIANT_GID_PREFIX}{variant_id}"
+    return None

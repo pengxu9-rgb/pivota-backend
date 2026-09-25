@@ -33,6 +33,7 @@ def test_evidence_taxonomy_constants_match_valid_set():
         EVIDENCE_TYPE_COMMERCE_INTEGRATION_AUTHORIZATION,
         EVIDENCE_TYPE_COMMERCE_RETURN_POLICY,
         EVIDENCE_TYPE_COMMERCE_AFTER_SALES_REVIEW,
+        EVIDENCE_TYPE_SELECTION_RESPONSE,
         EVIDENCE_TYPE_CUSTOM,
     )
     assert EVIDENCE_TYPE_GROUNDING_CHUNK in VALID_EVIDENCE_TYPES
@@ -48,7 +49,18 @@ def test_evidence_taxonomy_constants_match_valid_set():
     assert EVIDENCE_TYPE_COMMERCE_RETURN_POLICY in VALID_EVIDENCE_TYPES
     assert EVIDENCE_TYPE_COMMERCE_AFTER_SALES_REVIEW in VALID_EVIDENCE_TYPES
     assert EVIDENCE_TYPE_CUSTOM in VALID_EVIDENCE_TYPES
-    assert len(VALID_EVIDENCE_TYPES) == 13
+    # 14th type: `selection_response`, the response-level selection observation
+    # (product x provider x query x response). It is a REGISTERED type, not a
+    # test-only constant: services/audit_evidence_builder.extract_evidence_items
+    # emits one per observation returned by
+    # services.selection_measurement.report_observations, and
+    # _evidence_signature gives it its own `selection_response:<observation_id>`
+    # branch. Leaving it out of VALID_EVIDENCE_TYPES would not have failed here
+    # — _coerce_evidence_type would silently rewrite every one of them to
+    # `custom`, which is why this count is asserted at all.
+    assert EVIDENCE_TYPE_SELECTION_RESPONSE in VALID_EVIDENCE_TYPES
+    assert EVIDENCE_TYPE_SELECTION_RESPONSE == "selection_response"
+    assert len(VALID_EVIDENCE_TYPES) == 14
 
 
 def test_severity_constants_canonicalized():
@@ -109,21 +121,39 @@ def test_verifier_taxonomy_has_all_registered_verifiers():
     assert len(VALID_VERIFIERS) == 9
 
 
-def test_audience_taxonomy_has_all_5_projections():
-    """The 5-audience projection layer documented in the
-    implementation plan."""
+def test_audience_taxonomy_is_exactly_the_seven_projections():
+    """The 5-audience layer from the implementation plan, plus C2's two.
+
+    The exact-set assertion is the point: this frozenset is a permission
+    boundary, and a new audience appearing in it without a deliberate edit
+    here is a new shape someone can read. Note which list each one is on —
+    PUBLIC_ALLOWED_AUDIENCES is the unauthenticated surface.
+    """
     from db.audit_evidence import (
         VALID_AUDIENCES,
+        MERCHANT_ALLOWED_AUDIENCES, PUBLIC_ALLOWED_AUDIENCES,
         AUDIENCE_EMPLOYEE_BD, AUDIENCE_MERCHANT,
         AUDIENCE_INTERNAL_OPS, AUDIENCE_PIVOTA_PDP_FEED,
         AUDIENCE_FRONTEND_AGENT_FEED,
+        AUDIENCE_REVENUE_RECOVERY, AUDIENCE_PUBLIC_ANONYMOUS,
     )
     assert VALID_AUDIENCES == {
         AUDIENCE_EMPLOYEE_BD, AUDIENCE_MERCHANT,
         AUDIENCE_INTERNAL_OPS, AUDIENCE_PIVOTA_PDP_FEED,
         AUDIENCE_FRONTEND_AGENT_FEED,
+        AUDIENCE_REVENUE_RECOVERY, AUDIENCE_PUBLIC_ANONYMOUS,
     }
-    assert len(VALID_AUDIENCES) == 5
+    assert len(VALID_AUDIENCES) == 7
+    # Who may read what: merchants get two, anonymous readers get exactly one,
+    # and the four internal audiences are on neither list.
+    assert MERCHANT_ALLOWED_AUDIENCES == {
+        AUDIENCE_MERCHANT, AUDIENCE_REVENUE_RECOVERY,
+    }
+    assert PUBLIC_ALLOWED_AUDIENCES == {AUDIENCE_PUBLIC_ANONYMOUS}
+    assert not (MERCHANT_ALLOWED_AUDIENCES | PUBLIC_ALLOWED_AUDIENCES) & {
+        AUDIENCE_EMPLOYEE_BD, AUDIENCE_INTERNAL_OPS,
+        AUDIENCE_PIVOTA_PDP_FEED, AUDIENCE_FRONTEND_AGENT_FEED,
+    }
 
 
 # =====================================================================

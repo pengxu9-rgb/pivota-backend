@@ -2049,9 +2049,14 @@ def compute_import_dedupe_key(
 
 def _media_signing_secret() -> bytes:
     # Prefer dedicated secret; fall back to JWT secret for dev.
-    from config.settings import settings
+    from config.settings import require_jwt_secret
 
-    s = _as_text(os.getenv("REVIEWS_MEDIA_SIGNING_SECRET")) or _as_text(getattr(settings, "jwt_secret_key", ""))
+    # Only enforced when it actually FALLS BACK to the JWT secret — a
+    # deployment that sets REVIEWS_MEDIA_SIGNING_SECRET never reads the other
+    # one, so it should not be held to its strength.
+    s = _as_text(os.getenv("REVIEWS_MEDIA_SIGNING_SECRET"))
+    if not s:
+        s = _as_text(require_jwt_secret())
     if not s:
         s = "dev-insecure-secret"
     return s.encode("utf-8")

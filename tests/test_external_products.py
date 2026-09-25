@@ -202,6 +202,169 @@ async def test_agent_api_build_external_seed_product_skips_blocked_referral_seed
 
 
 @pytest.mark.asyncio
+async def test_agent_api_build_external_seed_product_degrades_untrusted_commerce_facts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import routes.agent_api as agent_api_module
+
+    gate_status = type(
+        "GateStatus",
+        (),
+        {
+            "status": "blocked",
+            "gating_policy_version": "external_referral_v1",
+            "blocker_anomaly_types": ["price_currency_mismatch", "zero_variants"],
+            "review_anomaly_types": [],
+        },
+    )()
+    monkeypatch.setattr(
+        agent_api_module,
+        "should_block_external_referral_runtime",
+        AsyncMock(return_value=(False, gate_status)),
+    )
+
+    product = await agent_api_module._build_external_seed_product(
+        req=type("Req", (), {"base_url": "https://agent.pivota.cc/"})(),
+        seed_row={
+            "id": "seed_untrusted",
+            "external_product_id": "ext_untrusted",
+            "market": "SG",
+            "tool": "*",
+            "destination_url": "https://example.com/p/untrusted",
+            "canonical_url": "https://example.com/p/untrusted",
+            "price_amount": "30.00",
+            "price_currency": "USD",
+            "seed_data": {
+                "title": "Recallable Product Requiring Live Quote",
+                "variants": [],
+            },
+        },
+        allowed_domains=[],
+        metrics_out={},
+    )
+
+    assert product is not None
+    assert product["title"] == "Recallable Product Requiring Live Quote"
+    assert product["commerce_verification"] == {
+        "required": True,
+        "status": "live_quote_required",
+        "reasons": ["price_currency_mismatch", "zero_variants"],
+        "price_trusted": False,
+        "availability_trusted": False,
+    }
+    assert product["external_referral_status"]["blocker_anomaly_types"] == [
+        "price_currency_mismatch",
+        "zero_variants",
+    ]
+    assert product["buyable"] is False
+    assert product["checkout_ready"] is False
+    assert product["availability"] == "unknown"
+    assert product["variants"] == []
+    for unsafe_field in ("price", "currency", "in_stock", "inventory_quantity", "seed_data"):
+        assert unsafe_field not in product
+
+
+def test_live_quote_required_product_does_not_satisfy_strict_commerce_filters() -> None:
+    import routes.agent_api as agent_api_module
+
+    discovery_only = {
+        "product_id": "external_unpriced_review",
+        "availability": "unknown",
+        "buyable": False,
+        "checkout_ready": False,
+        "commerce_verification": {
+            "required": True,
+            "status": "live_quote_required",
+        },
+    }
+
+    assert agent_api_module._passes_explicit_commerce_filters(
+        discovery_only,
+        in_stock_only=False,
+        min_price=None,
+        max_price=None,
+    )
+    assert not agent_api_module._passes_explicit_commerce_filters(
+        discovery_only,
+        in_stock_only=True,
+        min_price=None,
+        max_price=None,
+    )
+    assert not agent_api_module._passes_explicit_commerce_filters(
+        discovery_only,
+        in_stock_only=False,
+        min_price=None,
+        max_price=1,
+    )
+    assert not agent_api_module._passes_explicit_commerce_filters(
+        discovery_only,
+        in_stock_only=False,
+        min_price=0,
+        max_price=None,
+    )
+
+    verified = {"price": 30, "currency": "SGD", "in_stock": True}
+    assert agent_api_module._passes_explicit_commerce_filters(
+        verified,
+        in_stock_only=True,
+        min_price=29,
+        max_price=31,
+        expected_currency="SGD",
+    )
+    assert not agent_api_module._passes_explicit_commerce_filters(
+        verified,
+        in_stock_only=False,
+        min_price=None,
+        max_price=29,
+        expected_currency="SGD",
+    )
+
+    assert not agent_api_module._passes_explicit_commerce_filters(
+        {"price": 30, "in_stock": True},
+        in_stock_only=False,
+        min_price=29,
+        max_price=31,
+        expected_currency="SGD",
+    )
+    assert not agent_api_module._passes_explicit_commerce_filters(
+        {"price": 30, "currency": "USD", "in_stock": True},
+        in_stock_only=False,
+        min_price=29,
+        max_price=31,
+        expected_currency="SGD",
+    )
+    assert not agent_api_module._passes_explicit_commerce_filters(
+        {
+            "price": 30,
+            "currency": "SGD",
+            "availability": "in_stock",
+            "commerce_verification": {"required": True},
+        },
+        in_stock_only=False,
+        min_price=29,
+        max_price=31,
+        expected_currency="SGD",
+    )
+
+
+def test_strict_stock_filter_prefers_live_availability_over_stale_boolean() -> None:
+    import routes.agent_api as agent_api_module
+
+    assert not agent_api_module._passes_explicit_commerce_filters(
+        {"availability": "out_of_stock", "in_stock": True},
+        in_stock_only=True,
+        min_price=None,
+        max_price=None,
+    )
+    assert agent_api_module._passes_explicit_commerce_filters(
+        {"availability": "in_stock", "in_stock": False},
+        in_stock_only=True,
+        min_price=None,
+        max_price=None,
+    )
+
+
+@pytest.mark.asyncio
 async def test_agent_api_build_external_seed_product_uses_canonical_url_when_destination_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -230,8 +393,12 @@ async def test_agent_api_build_external_seed_product_uses_canonical_url_when_des
     )
 
     assert product is not None
-    assert product["destination_url"] == "https://example.com/p/2"
-    assert product["external_url"] == "https://example.com/p/2"
+    # The canonical URL is the fallback source, and the published destination is that URL
+    # ATTRIBUTED (utm + the referral click id the /r token signs) — see
+    # tests/test_mcp_lane_destination_carries_click_id.py for the join-key assertions.
+    assert product["destination_url"].startswith("https://example.com/p/2?")
+    assert product["external_url"] == product["destination_url"]
+    assert product["canonical_url"] == "https://example.com/p/2"
     assert "/r?token=" in product["external_redirect_url"]
     assert metrics.get("build_drop_reasons", {}) == {}
 
@@ -273,7 +440,7 @@ async def test_agent_api_build_external_seed_product_uses_snapshot_fields_when_t
 
     assert product is not None
     assert product["product_id"] == "ext_snapshot_1"
-    assert product["destination_url"] == "https://example.com/p/snapshot-1"
+    assert product["destination_url"].startswith("https://example.com/p/snapshot-1?")
     assert product["title"] == "Snapshot Product"
     assert product["product_type"] == "sunscreen"
 
@@ -355,6 +522,7 @@ async def test_shop_gateway_make_external_redirect_url_without_allowlist_gate(
 
     redirect = await agent_shop_gateway_module._make_external_redirect_url(
         market="US",
+        market_observed=True,
         tool="*",
         destination_url="https://example.com/p/1",
         utm_template=None,
@@ -3751,7 +3919,14 @@ async def test_shop_gateway_find_products_multi_delegate_to_upstream_when_enable
     )
 
     upstream_response = {
-        "products": [{"id": "p_upstream_1", "title": "Upstream Product"}],
+        "products": [
+            {
+                "id": "p_upstream_1",
+                "title": "Upstream Product",
+                "price": 24,
+                "currency": "USD",
+            }
+        ],
         "total": 1,
         "page": 1,
         "page_size": 1,
@@ -3947,7 +4122,14 @@ async def test_shop_gateway_find_products_multi_delegate_upstream_success_cached
     agent_shop_gateway_module._MULTI_SEARCH_UPSTREAM_CACHE.clear()
 
     upstream_response = {
-        "products": [{"id": "p_upstream_1", "title": "Upstream Product"}],
+        "products": [
+            {
+                "id": "p_upstream_1",
+                "title": "Upstream Product",
+                "price": 24,
+                "currency": "USD",
+            }
+        ],
         "total": 1,
         "page": 1,
         "page_size": 1,
@@ -5103,7 +5285,7 @@ async def test_agent_sdk_fixed_delegate_path_does_not_double_inject_external_see
     external_loader.assert_not_awaited()
 
 
-def test_agent_products_search_allow_external_seed_false_disables_external_merge(
+def test_agent_products_search_legacy_false_cannot_disable_external_merge(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:
     import routes.agent_api as agent_api_module
@@ -5158,11 +5340,11 @@ def test_agent_products_search_allow_external_seed_false_disables_external_merge
     payload = res.json()
     products = payload.get("products") or []
     assert products
-    assert all(p.get("merchant_id") != "external_seed" for p in products)
+    assert any(p.get("merchant_id") == "external_seed" for p in products)
     source_breakdown = ((payload.get("metadata") or {}).get("source_breakdown") or {})
-    assert source_breakdown.get("external_seed_count") == 0
-    assert source_breakdown.get("strategy_applied") == "external_seed_disabled"
-    assert external_loader.await_count == 0
+    assert source_breakdown.get("external_seed_count") == 1
+    assert source_breakdown.get("strategy_applied") == "unified_relevance"
+    assert external_loader.await_count == 1
 
 
 def test_agent_products_search_supplement_internal_first_keeps_internal_ahead(
@@ -8062,7 +8244,7 @@ async def test_shop_gateway_find_products_multi_generic_default_ui_keeps_high_co
 
 
 @pytest.mark.asyncio
-async def test_shop_gateway_find_products_multi_generic_default_ui_skips_external_seed_fallback(
+async def test_shop_gateway_find_products_multi_generic_default_ui_includes_external_seed_recall(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import routes.agent_shop_gateway as agent_shop_gateway_module
@@ -8075,22 +8257,25 @@ async def test_shop_gateway_find_products_multi_generic_default_ui_skips_externa
             return []
         return []
 
-    async def fail_fetch_external_seed_rows(**kwargs):
-        raise AssertionError("default generic ui/web queries should not execute external seed search")
+    seed_fetch_calls = {"n": 0}
 
-    async def fail_prefetched_external_seed_wrappers(request_metadata):
-        raise AssertionError("default generic ui/web queries should not load prefetched external seed wrappers")
+    async def recording_fetch_external_seed_rows(**kwargs):
+        seed_fetch_calls["n"] += 1
+        return {"rows": [], "query_timeout": False, "total_count": 0}
+
+    async def empty_prefetched_external_seed_wrappers(request_metadata):
+        return []
 
     monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
     monkeypatch.setattr(
         agent_shop_gateway_module,
         "fetch_external_seed_rows",
-        fail_fetch_external_seed_rows,
+        recording_fetch_external_seed_rows,
     )
     monkeypatch.setattr(
         agent_shop_gateway_module,
         "_build_prefetched_external_seed_wrappers",
-        fail_prefetched_external_seed_wrappers,
+        empty_prefetched_external_seed_wrappers,
     )
     monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_DELEGATE_SHOPPING_TO_UPSTREAM", False)
     monkeypatch.setattr(agent_shop_gateway_module, "MULTI_SEARCH_SKIP_HISTORY_SHOPPING", True)
@@ -8113,8 +8298,8 @@ async def test_shop_gateway_find_products_multi_generic_default_ui_skips_externa
     assert result.get("products") == []
     metadata = result.get("metadata") or {}
     assert metadata.get("query_semantic_class") == "default"
-    assert metadata.get("external_seed_executed") is False
-    assert metadata.get("external_seed_skip_reason") == "semantic_class_blocked"
+    assert seed_fetch_calls["n"] >= 1
+    assert metadata.get("external_seed_skip_reason") != "semantic_class_blocked"
 
 
 @pytest.mark.asyncio
@@ -8197,24 +8382,24 @@ async def test_shop_gateway_find_products_multi_catalog_brand_allows_external_se
 
 
 @pytest.mark.asyncio
-async def test_shop_gateway_find_products_multi_heuristic_brand_does_not_open_external_seed_gate(
+async def test_shop_gateway_find_products_multi_heuristic_brand_still_uses_unified_recall(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Only catalog/static brand detection opens the external-seed gate. The
-    looser suffix-pattern heuristic (mode='heuristic') must NOT — it is not a
-    proof the brand exists in the catalog, so a default-class query that merely
-    looks brand-like stays blocked (no junk widening)."""
+    """Brand confidence affects ranking, not source eligibility."""
     import routes.agent_shop_gateway as agent_shop_gateway_module
     import routes.agent_api as agent_api_module
 
     async def fake_fetch_all(query: str, values=None):
         return []
 
-    async def fail_fetch_external_seed_rows(**kwargs):
-        raise AssertionError("heuristic-only brand detection must not execute external seed search")
+    seed_fetch_calls = {"n": 0}
 
-    async def fail_prefetched_external_seed_wrappers(request_metadata):
-        raise AssertionError("heuristic-only brand detection must not load prefetched external seed wrappers")
+    async def recording_fetch_external_seed_rows(**kwargs):
+        seed_fetch_calls["n"] += 1
+        return {"rows": [], "query_timeout": False, "total_count": 0}
+
+    async def empty_prefetched_external_seed_wrappers(request_metadata):
+        return []
 
     async def fake_ensure_brand_dictionary_loaded():
         return None
@@ -8230,11 +8415,11 @@ async def test_shop_gateway_find_products_multi_heuristic_brand_does_not_open_ex
         }
 
     monkeypatch.setattr(agent_shop_gateway_module.database, "fetch_all", fake_fetch_all)
-    monkeypatch.setattr(agent_shop_gateway_module, "fetch_external_seed_rows", fail_fetch_external_seed_rows)
+    monkeypatch.setattr(agent_shop_gateway_module, "fetch_external_seed_rows", recording_fetch_external_seed_rows)
     monkeypatch.setattr(
         agent_shop_gateway_module,
         "_build_prefetched_external_seed_wrappers",
-        fail_prefetched_external_seed_wrappers,
+        empty_prefetched_external_seed_wrappers,
     )
     monkeypatch.setattr(agent_api_module, "_ensure_brand_dictionary_loaded", fake_ensure_brand_dictionary_loaded)
     monkeypatch.setattr(agent_api_module, "_detect_brand_query", fake_detect_brand_query)
@@ -8258,5 +8443,5 @@ async def test_shop_gateway_find_products_multi_heuristic_brand_does_not_open_ex
 
     metadata = result.get("metadata") or {}
     assert metadata.get("brand_query_detected") is False
-    assert metadata.get("external_seed_executed") is False
-    assert metadata.get("external_seed_skip_reason") == "semantic_class_blocked"
+    assert seed_fetch_calls["n"] >= 1
+    assert metadata.get("external_seed_skip_reason") != "semantic_class_blocked"

@@ -19,8 +19,20 @@ Two values:
 
 Usage:
 
+  # Runs LOCALLY against the public gateway. Point it at PRODUCTION, which is
+  # Cloud Run behind gateway.pivota.cc (/version reports the live gateway
+  # revision; verified 2026-08-25).
+  #
+  # The old pivota-agent-production.up.railway.app value that used to sit here is
+  # GONE, not merely the rollback: it now returns 404 on every path with
+  # `x-railway-fallback: true`, which is Railway's edge saying no service is
+  # bound to that domain. Earlier the same day it still answered 200 with its own
+  # build, so treat any measurement of it as perishable and re-probe before
+  # citing one. Either way this must not point there — a dead default fails the
+  # run outright, and a live rollback would be worse, quietly producing a
+  # baseline that looks valid for a platform nobody is served from.
   PROMOTIONS_ADMIN_KEY=...   \\
-  PIVOTA_AGENT_INTERNAL_URL=https://pivota-agent-production.up.railway.app \\
+  PIVOTA_AGENT_INTERNAL_URL=https://gateway.pivota.cc \\
   python scripts/agent_center_pivota_pdp_baseline.py \\
     --output reports/pivota-pdp-baseline-2026-05-06.md
 

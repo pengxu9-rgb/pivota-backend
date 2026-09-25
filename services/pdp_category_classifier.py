@@ -17,8 +17,18 @@ from __future__ import annotations
 import re
 from typing import List, Optional, Tuple
 
+# A base-makeup product that carries an SPF claim is FOUNDATION, not sunscreen:
+# "Foundation Broad Spectrum SPF 50+" is a foundation. The leading negative
+# lookahead declines those titles here so they fall through to the Foundation
+# pattern further down, which is what a3940018 set out to fix. Doing it this way
+# rather than hoisting Foundation to the top of CATEGORY_PATTERNS matters:
+# hoisting also lifted Foundation above Primer and Cleanser, which re-labelled
+# every "foundation primer" as a foundation. Only sunscreen is narrowed here, so
+# a real sunscreen is untouched.
 _SUNSCREEN_RE = re.compile(
-    r"\b(sunscreen|sun\s*screen|broad\s+spectrum|spf\s*\d{2,3}\+?|pa\s*\+{2,4}|"
+    r"^(?!.*\b(?:foundation|bb\s+cream|cc\s+cream|skin\s+tint|"
+    r"cushion|concealer|primer)\b)"
+    r".*\b(sunscreen|sun\s*screen|broad\s+spectrum|spf\s*\d{2,3}\+?|pa\s*\+{2,4}|"
     r"sun\s+(?:serum|fluid|cream|gel|milk|stick)|"
     r"uv\s*(?:protection|shield|defen[cs]e|lock))\b",
     re.IGNORECASE,
@@ -113,12 +123,75 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         r"\b(cleanser|cleansing|face wash|facial wash|"
         r"cleansing milk|cleansing foam|cleansing gel|face wipes?|cleansing wipes?|wipes?|wash)\b",
         re.IGNORECASE)),
-    ("Toner", "beauty/skincare/treat/toner", re.compile(
+    # TONER GETS ITS OWN BUCKET, not a slot inside `treat/`. Two reasons, and they agree:
+    #
+    # 1. INDUSTRY STANDARD. Google Product Taxonomy 5976 and Shopify's standard taxonomy
+    #    hb-3-2-9-17 both put `Toners & Astringents` as a DIRECT CHILD of Skin Care — a sibling of
+    #    Facial Cleansers, Lotion & Moisturizer, Sunscreen, Skin Care Masks & Peels and Acne
+    #    Treatments & Kits. Neither nests it under a treatments node; in both, "treatments",
+    #    "masks" and "toners" are three peers.
+    # 2. RECALL. PIVOTA-Agent measured it (src/services/beautyTaxonomy.js): folding toner into
+    #    `treat/` puts it in one bucket with serum(520) + mask(421) + exfoliant(123), which is the
+    #    broad-bucket shape behind the 2026-07-31 junk recall.
+    #
+    # ⚠️ THIS MATCHES THE GATEWAY ON PURPOSE. PIVOTA-Agent has declared `tone/toner` canonical
+    # since 2026-08-04 and its browse leg queries `category_path LIKE 'beauty/skincare/tone/%'`,
+    # while this file named `treat/toner` and nothing here could reach the 315 prod rows sitting on
+    # the gateway's path. Two taxonomies over one column, each calling the other's rows corrupt.
+    # Do not retarget this leaf without changing beautyTaxonomy.js in the same breath.
+    # An ACID or PEELING pad is an exfoliant, not a toner. The Toner entry below claims a bare
+    # "pad", which is right for the hydrating/soothing pads that dominate the shelf (Anua Heartleaf
+    # 77% Toner Pad, Torriden Multi Pad, NEOGEN Real Cica Pad) but wrong for an exfoliating one --
+    # measured on sokoglam's "Physical" and "Chemical" shelves, where SOME BY MI "AHA-BHA-PHA 30
+    # Days Miracle Truecica Clear Pad" and IOPE "Skin Booster Ampoule Peel Pad" both read as toners.
+    # This arm sits ABOVE Toner so first-match-wins reaches it, and it NARROWS nothing: a pad with
+    # no acid and no peel noun still falls through to Toner exactly as before. The acid list is the
+    # exfoliating acids only -- hyaluronic, azelaic and amino acids are NOT exfoliants, and a title
+    # naming an acid without a pad noun is left to the entries below; `lactic` declines "lactic acid
+    # BACTERIA ferment", which is a soothing ingredient. "Gauze" is deliberately NOT a noun here:
+    # prod holds a "Calming Gauze Pad" (a soothing pad), and NEOGEN's exfoliating gauzes all say
+    # "Bio-Peel ... Peeling" anyway. This DOES add a second path to the distinct-path count that
+    # services/curated_brand_feed._pattern_matches takes over a merchant product_type: a shelf
+    # literally named "BHA Pad" would read as ambiguous there. No host in the measured census files
+    # products under such a type.
+    ("Exfoliant", "beauty/skincare/treat/exfoliant", re.compile(
+        # \A + lookahead: a title that CALLS ITSELF a toner pad keeps the toner leaf, however many
+        # acids it lists ("Ji Woo Gae Cica BHA Blemish Toner Pad" is a BHA toner pad, measured in
+        # prod). The lookahead is DOTALL and takes one-or-more separators, so a line break or a
+        # double space inside the phrase cannot slip past it. "Toning pad" is NOT in the guard:
+        # unlike "toner pad" it names no product class on its own (the corpus holds no "toning pad"
+        # either way -- its one "toning" product is a lotion), and a toning pad with no acid never
+        # reaches this arm. A BUNDLE naming both ("AHA Peeling Pad + Toner Pad Set") stays a toner:
+        # the lookahead reads the whole title, which is the conservative answer and what main did.
+        # The rest scans the title for an exfoliating acid BEFORE a pad noun (an acid named after
+        # the noun -- "Clear Pad with AHA BHA" -- is left to Toner), or an explicit peel pad.
+        r"\A(?!(?s:.)*\btoner[-\s]+pads?\b)(?s:.)*?"
+        r"(?:\b(?:aha|bha|pha|glycolic|salicylic|mandelic|lactic(?![\s-]+acid[\s-]+bacteria))\b"
+        r"[^\n]{0,60}?\bpads?\b"
+        r"|\b(?:peel(?:ing)?|exfoliating|exfoliant)(?:-|[^\S\n\r])+pads?\b)",
+        re.IGNORECASE)),
+    ("Toner", "beauty/skincare/tone/toner", re.compile(
         r"\b(toner|tonic|mist|pad|skin booster)\b", re.IGNORECASE)),
+    # An acne / blemish patch is a TREATMENT, not a mask. Google Product Taxonomy 5976 and Shopify
+    # both file it under Acne Treatments, and the measured curated shelves (eyurs "Acne Pimple
+    # Patch", sokoglam "Spot") map it to treat/treatment -- so while these phrases sat in the Mask
+    # pattern one product class lived on two leaves, and a title saying "pimple patch" on one of
+    # those shelves named a different leaf than its shelf and stayed unresolved.
+    # It sits ABOVE Mask because Mask still claims the generic plural "patches": "Pimple Patches"
+    # must reach this entry first. Only a patch noun NAMED by its acne qualifier moves; eye patches,
+    # lip patches and a bare "patches" stay masks.
+    ("Treatment", "beauty/skincare/treat/treatment", re.compile(
+        r"\b(?:pimple|spot(?:\s+cover)?|acne|blemish)\s+patch(?:es)?\b",
+        re.IGNORECASE)),
+    # Mask is SPLIT in two. Everything here names an unambiguous mask FORM, so
+    # it wins over "essence" below: "Real Rice Essence Sheet Mask" is a mask.
+    # The bare "patches" arm declines the acne-qualified plural the entry above owns. First-match
+    # order alone is not enough: services/curated_brand_feed.py counts EVERY pattern that matches,
+    # and a merchant product_type "Pimple Patches" hitting both would read as ambiguous there.
     ("Mask", "beauty/skincare/treat/mask", re.compile(
-        r"\b(face mask|clay mask|charcoal mask|sheet mask|gel mask|sleeping mask|"
-        r"sleep mask|wash[-\s]?off mask|under eye patch|eye patch|pimple patch|"
-        r"spot cover patch|spot patch|patchs|patches|lip\s?patch|mask)\b",
+        r"\b(face mask|clay mask|charcoal mask|sheet mask|mask sheet|gel mask|"
+        r"sleeping mask|sleep mask|wash[-\s]?off mask|under eye patch|eye patch|"
+        r"patchs|(?<!\bpimple\s)(?<!\bspot\s)(?<!\bspot\scover\s)(?<!\bacne\s)(?<!\bblemish\s)patches|lip\s?patch)\b",
         re.IGNORECASE)),
     ("Exfoliant", "beauty/skincare/treat/exfoliant", re.compile(
         r"\b(exfoliant|exfoliating|exfoliation|peel|peeling|peeling gel|peel pads?|"
@@ -135,6 +208,11 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         re.IGNORECASE)),
     ("Serum", "beauty/skincare/treat/serum", re.compile(
         r"\b(serum|essence|ampoule|concentrate)\b", re.IGNORECASE)),
+    # Bare `mask` LAST among the skincare-treat family, so a line-name "Mask"
+    # ("Mask Fit Tone Up Essence") no longer beats the real form noun. A title
+    # whose only signal is the word "mask" still lands here.
+    ("Mask", "beauty/skincare/treat/mask", re.compile(
+        r"\bmask\b", re.IGNORECASE)),
     ("Tanning", "beauty/body/tanning", re.compile(
         r"\b(self[-\s]?tan|self[-\s]?tanning|sunless tan|gradual tanning|gradualglow)\b",
         re.IGNORECASE)),
@@ -144,12 +222,23 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         r"\b(concealer|corrector|correcting skinstick|skinstick|skin stick|"
         r"eye brightener|bright fix)\b",
         re.IGNORECASE)),
+    # Stays BELOW Primer and Cleanser: "foundation primer" is a primer and
+    # "foundation cleansing balm" is a cleanser. The SPF ordering this pattern
+    # used to be hoisted for is handled by _SUNSCREEN_RE's lookahead instead.
     ("Foundation", "beauty/makeup/face/foundation", re.compile(
-        r"\b(foundation|skin tint|tint stick|foundation stick|cushion foundation)\b",
+        r"\b(foundation|bb\s+cream|cc\s+cream|skin\s+tint|tint\s+stick|"
+        r"foundation\s+stick|cushion\s+foundation)\b",
         re.IGNORECASE)),
     ("Powder", "beauty/makeup/face/powder", re.compile(
         r"\b(powder|setting powder|pressed powder|loose powder|"
         r"blurring powder|finishing powder)\b",
+        re.IGNORECASE)),
+    # Lip Gloss before Highlighter: "Gloss Bomb Universal Lip Luminizer" contains
+    # "luminizer" which the Highlighter pattern would catch — but it's a lip gloss.
+    # Placing Lip Gloss here lets "gloss bomb" win before "luminizer" is seen.
+    ("Lip Gloss", "beauty/makeup/lip/gloss", re.compile(
+        r"\b(lip\s+gloss|gloss\s+bomb|gloss\s+luxe|gloss\s+drip|"
+        r"gloss\s+stick|gloss\s+stix|lip\s+luminizer|clear\s+gloss)\b",
         re.IGNORECASE)),
     ("Highlighter", "beauty/makeup/face/highlighter", re.compile(
         r"\b(highlighter|illuminator|luminizer|luminiser|killawatt|diamond bomb|"
@@ -173,15 +262,19 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         r"\b(lip balm|lip butter|lip treatment|lip care|lip serum|lipserum|"
         r"nightbalm|lip scrub|scrubstick)\b",
         re.IGNORECASE)),
+    ("Lip Oil", "beauty/makeup/lip/oil", re.compile(
+        r"\b(lip\s+oil)\b", re.IGNORECASE)),
+    ("Lip Liner", "beauty/makeup/lip/liner", re.compile(
+        r"\b(lip\s+liner|lip\s+pencil|pout\s+liner|precision\s+pout)\b",
+        re.IGNORECASE)),
+    ("Lip Tint", "beauty/makeup/lip/tint", re.compile(
+        r"\b(lip\s+tint|lip\s+stain)\b", re.IGNORECASE)),
     ("Lipstick", "beauty/makeup/lip/lipstick", re.compile(
-        # `lip[\s-]*stick` matches "lipstick", "lip stick", "lip-stick",
-        # and double-space variants. User typos like "lip stick" were
-        # silently classifying as None and falling back to a generic
-        # skincare term list, returning serums/cleansers for lipstick
-        # queries. See lipstick-recall regression 2026-05-09.
-        r"\b(lip[\s-]*stick|lip color|lip colour|liquid lip|lip luxe|lip lacquer|"
-        r"lip gloss|lip oil|lip liner|lip stain|lip tint|pout lip|gloss luxe|"
-        r"gloss drip|gloss bomb|gloss stick|gloss stix|lip combo|lip duo)\b",
+        # Narrowed: lip gloss/oil/liner/tint/stain each have their own patterns above.
+        # `lip[\s-]*stick` catches "lipstick", "lip stick", "lip-stick".
+        # See lipstick-recall regression 2026-05-09.
+        r"\b(lip[\s-]*stick|lip\s+color|lip\s+colour|liquid\s+lip|lip\s+luxe|"
+        r"lip\s+lacquer|pout\s+lip|lip\s+combo|lip\s+duo)\b",
         re.IGNORECASE)),
     ("Moisturizer", "beauty/skincare/moisturize/cream", re.compile(
         r"\b(moisturizer|moisturiser|cream|lotion|gel cream|gel-cream|"
@@ -214,7 +307,7 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         r"\b(skirt|mini\s+skirt|midi\s+skirt|maxi\s+skirt|pencil\s+skirt)\b",
         re.IGNORECASE)),
     ("Pants", "fashion/apparel/bottoms/pants", re.compile(
-        r"\b(pants|trousers|chinos|slacks|jogger\s+pants|cargo\s+pants|leggings)\b",
+        r"\b(pants|trousers|chinos|slacks|joggers?\s+pants|joggers\b|cargo\s+pants|leggings)\b",
         re.IGNORECASE)),
     ("Jeans", "fashion/apparel/bottoms/jeans", re.compile(
         r"\b(jeans|denim|skinny\s+jeans|straight\s+leg|boot[-\s]?cut)\b",
@@ -284,11 +377,55 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
     ("Apparel", "fashion/apparel/general", re.compile(
         r"\b(apparel|clothing|garment|womenswear|menswear|kidswear)\b",
         re.IGNORECASE)),
+    # ----- Electronics patterns -----
+    # Keyword-matchable subset only. Model-number-only products (WH-1000XM5,
+    # AirPods, etc.) have no keyword signal and go to the LLM backfill path.
+    ("Headphones", "electronics/audio/headphones", re.compile(
+        r"\b(headphones|over[-\s]?ear\s+headphones|on[-\s]?ear\s+headphones|"
+        r"wireless\s+headphones|noise[-\s]?cancell?ing\s+headphones)\b",
+        re.IGNORECASE)),
+    ("Earbuds", "electronics/audio/earbuds", re.compile(
+        r"\b(earbuds|ear\s+buds|true\s+wireless\s+earbuds|wireless\s+earbuds|"
+        r"in[-\s]?ear\s+(?:headphones|earphones))\b",
+        re.IGNORECASE)),
+    ("E-Reader", "electronics/ereader", re.compile(
+        r"\b(e[-\s]?reader|ebook\s+reader|e[-\s]?book\s+reader)\b",
+        re.IGNORECASE)),
+    ("Bluetooth Speaker", "electronics/audio/speaker", re.compile(
+        r"\b(bluetooth\s+speaker|wireless\s+speaker|portable\s+speaker|smart\s+speaker)\b",
+        re.IGNORECASE)),
     ("Gift Set", "beauty/sets/gift-set", re.compile(
         r"\b(skincare set|skin care set|gift set|holiday edition|routine|bundle|"
         r"essentials set|essentials|care set|duo|kit|collection|set)\b",
         re.IGNORECASE)),
 ]
+
+
+# THE ONE DEFINITION OF "THIS ROW HAS BEEN CATEGORISED".
+#
+# A path names a category only once it says something past the top-level domain. `beauty` is a
+# NAMESPACE, not an answer to "what is this" -- and treating it as an answer is what stranded an
+# entire cohort. Measured on the live index: of 50 rows returned for "eau de parfum", 16 sit on bare
+# `beauty`, including the whole Ariana Grande fragrance line, Cosmic Kylie Jenner and every
+# PixiPerfume. Serving drops them as `category_mismatch`, and the backfill below never revisits them
+# because `category_path IS NULL` reads them as already done. A useless answer counted as an answer
+# in both directions at once.
+#
+# It also explains why the cohort survived a taxonomy standardisation pass: `beauty` IS on the
+# taxonomy, so an off-taxonomy health check counts it healthy. Nothing was watching non-leaf paths.
+#
+# Exported so the backfill, the serving gate and any future writer share one rule rather than each
+# re-deciding what "categorised" means. PIVOTA-Agent's serving-side twin is
+# `categoryPathIsCategorised` in src/server.js; the drift test below pins them to the same rule.
+MIN_CATEGORISED_PATH_SEGMENTS = 2
+
+
+def is_categorised_path(category_path: Optional[str]) -> bool:
+    """True when the path names a category, not merely a top-level domain."""
+    if not category_path:
+        return False
+    segments = [seg for seg in str(category_path).strip().strip("/").split("/") if seg]
+    return len(segments) >= MIN_CATEGORISED_PATH_SEGMENTS
 
 
 def classify(text: Optional[str]) -> Optional[Tuple[str, str]]:
@@ -301,18 +438,108 @@ def classify(text: Optional[str]) -> Optional[Tuple[str, str]]:
     return None
 
 
+# FACE skincare leaves: the four shelves a face routine is built from. Sunscreen is deliberately
+# absent -- a body sunscreen IS a sunscreen, and sun/sunscreen names no body area.
+FACE_SKINCARE_LEAF = re.compile(r"^beauty/skincare/(?:cleanse|tone|treat|moisturize)/")
+
+# The body area a product names, and the leaf that area belongs to -- None where the taxonomy has
+# NO honest leaf (no lash/brow-care, nail-care or men's-grooming leaf; see TAXONOMY_GAPS), so the
+# row is left unresolved rather than filed under a face shelf it does not belong to.
+#
+# Why this exists: a pattern keeps only the noun it recognises and drops its qualifier. Measured
+# on ohlolly.com / eyurs.com 2026-09-22: type "Hand Cream" -> moisturize/cream, "Eye Lash Serum"
+# -> treat/serum, a "Body Wash" filed under "Cleanser" -> cleanse/cleanser; and in prod, 60 live
+# seed-mirror rows such as "Peel Off Nail Polish" -> treat/exfoliant (via "peel" / "polish").
+#
+# Whole words only: "Handmade", "Behind", "Splash", "Brown", "Bodied", "Hairline" are not areas,
+# nor is a craft word ("Hand-Picked", "Hand Poured", "Second hand"). "The Body Shop" is a brand.
+_NON_FACE_AREAS = (
+    ("hand", re.compile(r"(?<!second[- ])\bhand(?:s|cream|wash)?\b"
+                        r"(?![- ](?:picked|made|crafted|poured|selected|blended|harvested|tied))", re.I),
+     "beauty/body/care"),
+    ("body", re.compile(r"\bbody\b(?!\s+shop\b)", re.I), "beauty/body/care"),
+    ("foot", re.compile(r"\b(?:foot|feet)\b", re.I), "beauty/body/care"),
+    ("hair", re.compile(r"\b(?:hair|scalp)\b", re.I), "beauty/haircare/general"),
+    ("lash", re.compile(r"\b(?:eye\s?)?lash(?:es)?\b", re.I), None),
+    ("brow", re.compile(r"\b(?:eye)?brows?\b", re.I), None),
+    ("nail", re.compile(r"\b(?:nails?|cuticles?)\b", re.I), None),
+    ("beard", re.compile(r"\bbeards?\b", re.I), None),
+)
+# A title that ALSO names the face ("Face & Body Lotion") is face care too; the old answer stands.
+_FACE_WORD = re.compile(r"\b(?:face|facial)\b", re.I)
+# Phrases that contain an area word but name no product area: "crow's feet" are eye wrinkles
+# (measured in prod on an eye serum; Shopify titles often use a curly apostrophe), and a cleanser
+# "safe for lash extensions" / "gentle on lashes" is a face cleanser.
+_NOT_AN_AREA = re.compile(r"\bcrow[\u2019']?s?[\s-]+feet\b|\b(?:eye\s?)?lash[\s-]+extensions?\b"
+                          r"|\b(?:safe|gentle)\s+(?:for|on)\s+(?:the\s+)?(?:eye\s?)?lash(?:es)?\b", re.I)
+# Hair REMOVAL is body care, not hair care: "Hair Removal Aftercare Serum", "Ingrown Hair Serum".
+_HAIR_REMOVAL = re.compile(r"\b(?:hair[\s-]+removal|ingrown[\s-]+hairs?)\b", re.I)
+
+
+_AREA_LABELS = {"beauty/body/care": "Body Care", "beauty/haircare/general": "Hair Care"}
+
+
+def non_face_leaf(path: Optional[str], *texts: Optional[str]) -> Optional[str]:
+    """The leaf a FACE-leaf answer must become when the product names another body area.
+
+    `texts` are the row's own words (title, merchant product_type, category). Returns None when the
+    rule does not apply -- `path` is not a face skincare leaf, or no non-face area is named, or the
+    face is named too -- so the caller keeps its answer unchanged. Otherwise returns that area's
+    leaf, or "" (no honest leaf: the areas disagree, or the taxonomy has none for them).
+    """
+    if not FACE_SKINCARE_LEAF.match(path or ""):
+        return None
+    text = " ".join(str(v or "") for v in texts)
+    if _FACE_WORD.search(text):
+        return None
+    text = _HAIR_REMOVAL.sub(" body ", _NOT_AN_AREA.sub(" ", text))
+    areas = {name: leaf for name, pattern, leaf in _NON_FACE_AREAS if pattern.search(text)}
+    if not areas:
+        return None
+    # A "Hand & Nail Cream" is a hand cream: nail care is part of the hand shelf.
+    if "hand" in areas:
+        areas.pop("nail", None)
+    leaves = set(areas.values())
+    if len(leaves) == 1 and None not in leaves:
+        return leaves.pop()
+    return ""
+
+
 def resolve_path_from_row(
     *,
     category: Optional[str],
     product_type: Optional[str],
     title: Optional[str],
 ) -> Optional[Tuple[str, str]]:
-    """Try category, product_type, title in priority order. Used by the backfill."""
-    for candidate in (category, product_type, title):
+    """Try category, product_type, title in priority order. Used by the backfill.
+
+    A FACE skincare answer for a row that names another body area is refused, judged on ALL of the
+    row's words: it becomes that area's leaf, or no answer at all where the taxonomy has no honest
+    leaf (nails, lashes, brows, beards). No answer is what keeps the row out of the regex backfill:
+    it is counted as unmatched and left alone, rather than re-filed under a face shelf every run.
+    """
+    return _guard_face_leaf(_first_hit(category, product_type, title), title, product_type, category)
+
+
+def _first_hit(*candidates: Optional[str]) -> Optional[Tuple[str, str]]:
+    for candidate in candidates:
         hit = classify(candidate)
         if hit is not None:
             return hit
     return None
+
+
+def _guard_face_leaf(hit: Optional[Tuple[str, str]], *texts: Optional[str]) -> Optional[Tuple[str, str]]:
+    """`hit` unless it is a face skincare leaf for a product whose `texts` name another body area:
+    then that area's leaf, or None where the taxonomy has no honest leaf."""
+    if hit is None:
+        return None
+    area_leaf = non_face_leaf(hit[1], *texts)
+    if area_leaf is None:
+        return hit
+    if not area_leaf:
+        return None
+    return (_AREA_LABELS.get(area_leaf, hit[0]), area_leaf)
 
 
 # Provenance enum values written to catalog_products.category_label_source.
@@ -343,19 +570,23 @@ def fold_category_from_variants(
     platform_metadata.get("category") / platform_metadata.get("product_type").
 
     Returns ((label, path), source, confidence) or None.
+
+    A product-level answer REFUSED by the non-face rule ends the fold: the product's own words said
+    "nail polish" / "lash serum", and a variant titled "Serum 8ml" or "Top Coat" must not bring the
+    face leaf (or a fashion coat) back. A variant hit is judged on the product's words as well.
     """
-    hit = resolve_path_from_row(category=category, product_type=product_type, title=title)
-    if hit is not None:
-        return (hit, CATEGORY_SOURCE_MERCHANT, CATEGORY_CONFIDENCE_MERCHANT)
+    raw = _first_hit(category, product_type, title)
+    if raw is not None:
+        hit = _guard_face_leaf(raw, title, product_type, category)
+        return (hit, CATEGORY_SOURCE_MERCHANT, CATEGORY_CONFIDENCE_MERCHANT) if hit else None
     for variant in variants or []:
         v_category = _variant_field(variant, "category")
         v_product_type = _variant_field(variant, "product_type")
         v_title = _variant_field(variant, "title")
-        v_hit = resolve_path_from_row(
-            category=v_category, product_type=v_product_type, title=v_title,
-        )
-        if v_hit is not None:
-            return (v_hit, CATEGORY_SOURCE_VARIANT, CATEGORY_CONFIDENCE_VARIANT)
+        v_raw = _first_hit(v_category, v_product_type, v_title)
+        if v_raw is not None:
+            v_hit = _guard_face_leaf(v_raw, title, product_type, category, v_title, v_product_type, v_category)
+            return (v_hit, CATEGORY_SOURCE_VARIANT, CATEGORY_CONFIDENCE_VARIANT) if v_hit else None
     return None
 
 
@@ -392,7 +623,13 @@ async def fold_category_with_llm_fallback(
     if llm is None:
         return None
     label, path, confidence = llm
-    return ((label, path), CATEGORY_SOURCE_LLM, confidence)
+    # The LLM backfill selects `category_path IS NULL`, which is exactly where a row the regex
+    # refused lands; an unguarded LLM answer would re-file a cleared lash serum as a face serum.
+    # Judged on the same words as the regex (not the description, which says "face and hands").
+    guarded = _guard_face_leaf((label, path), title, product_type, category)
+    if guarded is None:
+        return None
+    return (guarded, CATEGORY_SOURCE_LLM, confidence)
 
 
 def _variant_field(variant, key: str) -> Optional[str]:

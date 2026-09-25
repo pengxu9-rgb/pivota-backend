@@ -23,6 +23,7 @@ def _sample_pivot_item(
     variant_id: str,
     sku: str,
     title: str,
+    brand: str = "Demo",
     product_id: str = "111",
     product_type: str = "serum",
     description: str = "A brightening serum",
@@ -30,6 +31,9 @@ def _sample_pivot_item(
     visible_attributes: dict | None = None,
     visible_option_labels: list[str] | None = None,
     ingredient_ids: list[str] | None = None,
+    signature_id: str | None = None,
+    inventory_quantity: int | None = 5,
+    offer_catalog_track: str = "internal_merchant",
 ) -> PivotResultItem:
     return PivotResultItem(
         merchant=MerchantNode(
@@ -39,10 +43,11 @@ def _sample_pivot_item(
         ),
         product=ProductNode(
             product_key=f"prod::merch_1::shopify::{product_id}",
+            pivota_signature_id=signature_id,
             source_product_id=product_id,
             title=title,
             description=description,
-            brand="Demo",
+            brand=brand,
             product_type=product_type,
             category=product_type,
             canonical_url=canonical_url,
@@ -60,13 +65,15 @@ def _sample_pivot_item(
         offers=[
             OfferNode(
                 offer_id=f"offer::{sku_key}",
-                catalog_track="internal_merchant",
+                merchant_id="seller_1",
+                merchant_name="Seller One",
+                catalog_track=offer_catalog_track,
                 truth_tier="primary",
                 readiness_tier="knowledge_ready",
                 offer_mode="merchant_checkout",
                 source_system="shopify_products_sync",
                 availability="in_stock",
-                inventory_quantity=5,
+                inventory_quantity=inventory_quantity,
                 pricing=PivotPricing(
                     currency="USD",
                     list_price=Decimal("32.00"),
@@ -123,6 +130,44 @@ def test_pivot_multi_rollout_allowed_is_guarded_by_source_and_page(monkeypatch: 
         page=1,
         mode="serve",
     ) is False
+
+
+def test_search_price_contract_requires_a_currency_qualified_price_or_offer() -> None:
+    assert gateway._has_canonical_price_or_offer(
+        {"price": {"current": {"amount": 24, "currency": "USD"}}}
+    ) is True
+    assert gateway._has_canonical_price_or_offer(
+        {
+            "price": 0,
+            "offers": [{"price": {"amount": 28, "currency": "EUR"}}],
+        }
+    ) is True
+    assert gateway._has_canonical_price_or_offer(
+        {"price": 28, "currency": None}
+    ) is False
+    assert gateway._has_canonical_price_or_offer(
+        {"price": 0, "currency": "USD"}
+    ) is False
+
+
+def test_search_price_contract_removes_unpriced_cards_and_records_the_drop() -> None:
+    result = {
+        "products": [
+            {"product_id": "priced", "price": 18, "currency": "USD"},
+            {"product_id": "unpriced", "price": 0, "currency": "USD"},
+        ],
+        "total": 2,
+    }
+
+    gateway._enforce_search_price_contract(result)
+
+    assert [product["product_id"] for product in result["products"]] == ["priced"]
+    assert result["page_size"] == 1
+    assert result["total"] == 1
+    assert result["metadata"]["price_contract"] == {
+        "canonical_price_or_offer_required": True,
+        "dropped_unpriced": 1,
+    }
 
 
 @pytest.mark.asyncio
@@ -190,6 +235,116 @@ async def test_handle_find_products_multi_can_serve_from_pivot_semantic_core(
     assert product["inventory_quantity"] == 10
     assert len(product["variants"]) == 2
     assert product["best_deal"]["estimated_best_price"] == Decimal("27.55")
+
+
+@pytest.mark.asyncio
+async def test_canonical_sig_mode_forces_catalog_recall_and_keeps_supply_in_offers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    async def fake_search(req):
+        observed["include_external"] = req.include_external
+        observed["canonical_entities_only"] = req.canonical_entities_only
+        return PivotQueryResponse(
+            query="ordinary",
+            total=1,
+            items=[
+                _sample_pivot_item(
+                    sku_key="sku::ordinary",
+                    variant_id="var_ordinary",
+                    sku="ORD-1",
+                    title="The Ordinary Niacinamide 10% + Zinc 1%",
+                    signature_id="sig_ordinary_niacinamide",
+                    inventory_quantity=None,
+                    offer_catalog_track="external_referral",
+                )
+            ],
+        )
+
+    monkeypatch.setattr(gateway, "PIVOT_MULTI_SERVE_ENABLED", False)
+    monkeypatch.setattr(gateway, "PIVOT_MULTI_SHADOW_ENABLED", False)
+    monkeypatch.setattr(gateway, "PIVOT_MULTI_SERVE_INCLUDE_EXTERNAL", True)
+    monkeypatch.setattr(gateway, "search_pivot_catalog", fake_search)
+
+    result = await gateway._handle_find_products_multi(
+        gateway.FindProductsMultiPayload(
+            search=gateway.MultiSearchFilters(
+                query="ordinary",
+                page=1,
+                limit=10,
+                in_stock_only=True,
+                catalog_entity_mode="canonical_sig",
+            ),
+            metadata=gateway.RequestMetadata(source="shopping_agent"),
+        ),
+        {"source": "shopping_agent"},
+        BackgroundTasks(),
+    )
+
+    assert observed == {
+        "include_external": False,
+        "canonical_entities_only": True,
+    }
+    assert result["metadata"]["query_source"] == "pivot_catalog_sig_multi"
+    assert result["metadata"]["direct_external_seed_lane"] is False
+    assert len(result["products"]) == 1
+    product = result["products"][0]
+    assert product["product_id"] == "sig_ordinary_niacinamide"
+    assert product["pivota_signature_id"] == "sig_ordinary_niacinamide"
+    assert product["merchant_id"] == "seller_1"
+    assert product["in_stock"] is True
+    assert product["offers"][0]["catalog_track"] == "external_referral"
+
+
+@pytest.mark.asyncio
+async def test_brand_category_query_prunes_unrelated_same_category_products(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_search(req):
+        return PivotQueryResponse(
+            query=req.query,
+            total=2,
+            items=[
+                _sample_pivot_item(
+                    sku_key="sku::generic",
+                    variant_id="var_generic",
+                    sku="GEN-1",
+                    title="Soft Liquid Blush",
+                    brand="Generic Beauty",
+                    product_id="generic",
+                    product_type="blush",
+                ),
+                _sample_pivot_item(
+                    sku_key="sku::knight",
+                    variant_id="var_knight",
+                    sku="KU-1",
+                    title="Knight Unicorn Satin Blush",
+                    brand="Knight Unicorn",
+                    product_id="knight",
+                    product_type="blush",
+                ),
+            ],
+        )
+
+    monkeypatch.setattr(gateway, "search_pivot_catalog", fake_search)
+
+    result = await gateway._handle_find_products_multi_via_pivot(
+        gateway.FindProductsMultiPayload(
+            search=gateway.MultiSearchFilters(
+                query="knight unicorn blush",
+                page=1,
+                limit=10,
+                in_stock_only=False,
+            ),
+            metadata=gateway.RequestMetadata(source="shopping_agent"),
+        ),
+        {"source": "shopping_agent"},
+    )
+
+    assert [product["product_id"] for product in result["products"]] == ["knight"]
+    assert result["products"][0]["brand"] == "Knight Unicorn"
+    assert result["metadata"]["brand_category_anchor_matched"] is True
 
 
 def test_build_pivot_multi_shadow_diff_summary_reports_overlap() -> None:

@@ -12,6 +12,7 @@ stamps into `seed_data.snapshot`:
     storefront_platform        = "shopify"          <- proves the is_shopify gate's predicate
     storefront_platform_source = "products_js_v1"   <- provenance, so the claim is auditable
     variants[].shopify_variant_id                   <- the numeric id the permalink needs
+    shopify_cart_proof                               <- same-fetch sole-live-variant attestation
 
 A successful `/products/<handle>.js` parse IS the proof of Shopify-ness: only Shopify serves
 that endpoint in that shape. So the same fetch that recovers variant ids also establishes
@@ -31,13 +32,25 @@ This file is selection, pacing, writes and the report. The SQL is exercised agai
 Postgres by tests/test_backfill_shopify_variant_ids_postgres.py, because three of this
 script's four historical P0s were SQL semantics no Python-level test could see.
 
-ONE-SHOT OPS SCRIPT, NOT A SCHEDULED JOB, DELIBERATELY. Every Cloud Run service and job
-egresses through ONE reserved Cloud NAT address (infra/gcp/setup_egress_nat.sh uses
---nat-all-subnet-ip-ranges with a single IP); on prod that is 8.231.167.230, the address
-given to Antom/Adyen for payment allowlisting. Crawl traffic there shares IP reputation and
-the NAT port pool with the payment path, on an address that cannot be rotated without a
-partner re-allowlisting cycle. Until crawl egress has its own subnet, this runs from an
-operator machine. Do not add it to infra/gcp/setup_scheduler.sh.
+ONE-SHOT OPS SCRIPT, NOT A SCHEDULED JOB, DELIBERATELY. Do not add it to
+infra/gcp/setup_scheduler.sh.
+
+RUN IT ON THE CRAWL SUBNET. prod egress is SPLIT, and an earlier version of this paragraph
+said otherwise — it claimed one NAT covering all subnet ranges and concluded "until crawl
+egress has its own subnet, this runs from an operator machine". All three claims are now
+false against live prod:
+
+    pivota-nat        subnet `default`        8.231.167.230   web, worker, gateway, proof-issuer
+    pivota-crawl-nat  subnet `pivota-crawl`   34.82.199.35    catalog-intelligence
+
+8.231.167.230 is the address given to Antom/Adyen for payment allowlisting, and it cannot be
+rotated without a partner re-allowlisting cycle. Crawl traffic there would share both its IP
+reputation and its NAT port pool with the payment path, and port exhaustion is per-IP, so a
+burst crawl can starve payment egress even with clean reputation. Both NATs are now
+LIST_OF_SUBNETWORKS, so the separation is real — but `scripts/ops/run_oneoff_job.sh`
+hardcoded the default subnet until it grew a SUBNET override, which is why the old advice was
+"use a laptop". Pass the override instead; a laptop is WORSE, because an office IP earns the
+same Cloudflare block with no reserved address behind it.
 
 PACING IS MEASURED, NOT DECORATIVE. On 2026-08-21, ~50 requests over 37 Cloudflare-fronted
 domains in about a minute tripped a CROSS-DOMAIN, IP-level 429 lasting ~15 minutes,
@@ -49,9 +62,47 @@ upserts `seed_data = COALESCE(...) || EXCLUDED.seed_data`, a SHALLOW merge that 
 whole `snapshot` object and therefore wipes everything this script stamps. Re-run this after
 any onboarding pass over the same brand. Fixing that merge is onboarding's change to make.
 
-USAGE
-    python -m scripts.backfill_shopify_variant_ids --limit 200            # dry run
-    python -m scripts.backfill_shopify_variant_ids --domain genabelle.com --limit 5 --apply
+USAGE — note SUBNET on every form that leaves this machine. A DRY RUN FETCHES TOO: `--apply`
+gates the write, not the crawl, so an unpinned dry run bursts just as hard as a real one.
+
+    # dry run, one storefront, through the job runner (the normal path)
+    SUBNET=pivota-crawl scripts/ops/run_oneoff_job.sh scripts/backfill_shopify_variant_ids.py \
+        --domain genabelle.com --limit 5
+
+    # apply, paced below the rate that tripped the 2026-08-21 block, resuming on a cursor
+    SUBNET=pivota-crawl TASK_TIMEOUT=2400s \
+    ENV_VARS="PIVOTA_ENV=production,DB_STATEMENT_TIMEOUT_SECONDS=30,DB_COMMAND_TIMEOUT_SECONDS=600,VARIANT_BACKFILL_GLOBAL_INTERVAL_S=1.5" \
+    scripts/ops/run_oneoff_job.sh scripts/backfill_shopify_variant_ids.py \
+        --limit 900 --after "$NEXT_CURSOR" --apply
+
+ENV_VARS REPLACES the runner's defaults rather than adding to them, so re-list PIVOTA_ENV and
+the DB timeouts whenever you set a pacing variable.
+
+RESUME FROM THE DATABASE WHEN THE LOG IS GONE — BUT KNOW WHAT YOU GET. `next_cursor` below is
+the real frontier: the last candidate WALKED, stamped or not. Prefer it. The problem is that the
+runner reads a job's output from Cloud Logging, which drops lines, and a sweep that parsed the
+cursor out of the log read a truncated report as a finished cohort and stopped with thousands of
+rows left. When that happens the table can still get you moving again:
+
+    SELECT max(id) FROM external_product_seeds
+     WHERE status='active'
+       AND seed_data->'snapshot'->>'storefront_platform_source' = 'products_js_v1';
+
+THAT IS NOT THE FRONTIER. It is the last row successfully STAMPED, because this column is
+written only by the UPDATE below and only when a variant actually matched. The two diverge
+whenever a batch's tail produced no stamps, which is routine at a 6.7% dead-handle rate plus
+every `no_confident_match`. So it is a conservative LOWER BOUND, and resuming from it re-fetches
+that run's unproductive tail from the merchants a second time.
+
+Two consequences worth stating plainly, because the second one loses rows:
+
+  * If the unstampable tail is ever as long as `--limit`, the value stops advancing and the
+    sweep re-crawls one dead window forever — the exact pathology `--after` was added to end
+    (see the ORDER BY comment: four consecutive runs, same three dead rows, zero stamped). A
+    driver using this query MUST stop when the value fails to advance rather than loop.
+  * It is only valid if nothing has stamped AHEAD of the sweep. A `--domain ... --apply` pass
+    stamps rows anywhere in the id space, so `max(id)` can land past rows the sweep never
+    walked and skip them silently. Do not interleave a domain-scoped apply with a cursor sweep.
 """
 
 from __future__ import annotations
@@ -59,6 +110,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+from datetime import datetime, timezone
 import os
 import sys
 import time
@@ -139,9 +191,9 @@ SELECT_CANDIDATES_SQL = f"""
       -- empty string and dropped rows whose destination_url was perfectly good.
       AND COALESCE(NULLIF(canonical_url, ''), destination_url) ~ '/products/'
       AND jsonb_array_length({_SNAPSHOT_VARIANTS_SAFE}) > 0
-      -- Not already covered: at least one variant still lacks a stamped id. Keeps a
-      -- partially-covered row eligible, and retires it once every variant is stamped.
-      AND EXISTS (
+      -- Unstamped variants need recovery; a sole stamped row without cart proof needs
+      -- same-fetch proof; a row with proof is revisited to refresh or revoke it.
+      AND (EXISTS (
             SELECT 1 FROM jsonb_array_elements({_SNAPSHOT_VARIANTS_SAFE}) AS v
             -- NUMERIC, not merely non-empty. A live writer lands unvalidated variant keys
             -- here (recover_seed_data_from_catalog_extract -> seed_data_writer), and junk like
@@ -149,6 +201,9 @@ SELECT_CANDIDATES_SQL = f"""
             -- permanently — unrepairable, and useless to the consumer, which requires numeric.
             WHERE COALESCE(v->>'shopify_variant_id', '') !~ '^[0-9]+$'
           )
+          OR (jsonb_array_length({_SNAPSHOT_VARIANTS_SAFE}) = 1
+              AND NOT (seed_data->'snapshot' ? 'shopify_cart_proof'))
+          OR seed_data->'snapshot' ? 'shopify_cart_proof')
       {{domain_clause}}
       {{cursor_clause}}
     -- ORDER BY id + a CURSOR, because eligibility alone is not progress. A row that can never
@@ -161,7 +216,7 @@ SELECT_CANDIDATES_SQL = f"""
     LIMIT :limit
 """
 
-# jsonb_set on two paths in one statement: the variants array and the platform evidence.
+# jsonb_set on the variant, platform and cart-proof paths in one statement.
 # `updated_at` is deliberately NOT bumped — get_last_extracted_at falls back to it, feeding
 # the 7-day stale_snapshot BLOCKER, and a variants-only .js fetch is not an extraction
 # event. The optimistic guard makes this safe against the refresh job, which rewrites the
@@ -171,10 +226,13 @@ STAMP_UPDATE_SQL = """
     UPDATE external_product_seeds
     SET seed_data = jsonb_set(
             jsonb_set(
-                jsonb_set(seed_data, '{snapshot,variants}', CAST(:variants AS jsonb), true),
-                '{snapshot,storefront_platform}', to_jsonb(CAST(:platform AS text)), true
+                jsonb_set(
+                    jsonb_set(seed_data, '{snapshot,variants}', CAST(:variants AS jsonb), true),
+                    '{snapshot,storefront_platform}', to_jsonb(CAST(:platform AS text)), true
+                ),
+                '{snapshot,storefront_platform_source}', to_jsonb(CAST(:platform_source AS text)), true
             ),
-            '{snapshot,storefront_platform_source}', to_jsonb(CAST(:platform_source AS text)), true
+            '{snapshot,shopify_cart_proof}', CAST(:cart_proof AS jsonb), true
         )
     WHERE id = :id
       -- THE LOAD-BEARING GUARD IS THE SNAPSHOT ONE (mutation-verified: dropping it is the
@@ -366,7 +424,22 @@ async def run(
         live = parse_product_js(payload)
         new_variants, report = stamp_variant_ids(variants, live)
         reasons[report["reason"]] += 1
-        if report["stamped"] <= 0:
+        raw_live = payload.get("variants") if isinstance(payload, dict) else None
+        live_count = len(raw_live) if isinstance(raw_live, list) else 0
+        cart_proof = None
+        if (
+            live_count == 1 and len(live) == 1 and len(new_variants) == 1
+            and new_variants[0].get("shopify_variant_id") == live[0]["shopify_variant_id"]
+        ):
+            cart_proof = {
+                "source": STOREFRONT_PLATFORM_SOURCE,
+                "product_js_url": js_url,
+                "live_variant_count": 1,
+                "variant_id": live[0]["shopify_variant_id"],
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+            }
+        prior_proof = (seed_data.get("snapshot") or {}).get("shopify_cart_proof")
+        if report["stamped"] <= 0 and not cart_proof and not prior_proof:
             continue
 
         stamped_total += report["stamped"]
@@ -379,6 +452,7 @@ async def run(
                     "variants": json.dumps(new_variants, ensure_ascii=False),
                     "platform": STOREFRONT_PLATFORM,
                     "platform_source": STOREFRONT_PLATFORM_SOURCE,
+                    "cart_proof": json.dumps(cart_proof),
                     "updated_at": row.get("updated_at"),
                 },
             )

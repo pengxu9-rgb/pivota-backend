@@ -14,6 +14,7 @@ import io
 import json
 import hashlib
 import logging
+import time
 import math
 import re
 from urllib.parse import urlparse
@@ -31,13 +32,16 @@ from db.product_enrichment import get_enrichment, upsert_enrichment
 from models.standard_product import StandardProduct
 from utils.auth import get_current_employee, require_employee_permissions
 
-from services.external_offers_service import resolve_external_offer
+from services import external_seed_destination_liveness as destination_liveness
+from services.external_offers_service import ExternalOfferUnavailable, resolve_external_offer
 from services.outbound_links_service import (
     DEFAULT_DISCLOSURE_TEXT,
     DEFAULT_UTM_TEMPLATE,
     _is_domain_allowed,
     apply_utm,
     make_redirect_token,
+    market_is_observed,
+    TOKEN_MARKET_OBSERVED_KEY,
 )
 from services.seed_content_audit import audit_seed_data
 from services.external_seed_audit import (
@@ -68,6 +72,7 @@ from services.pci_kb_scope_review import (
 )
 from db.reviews_center import product_reviews
 from services.reviews_service import GLOBAL_IMPORT_MERCHANT_ID, build_product_key, build_sku_key
+from utils.availability_vocabulary import normalize_availability
 
 router = APIRouter(prefix="/employee/products", tags=["employee-products"])
 
@@ -341,6 +346,76 @@ async def _ensure_external_seeds_table() -> None:
     )
     await database.execute(
         "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS external_product_id TEXT;"
+    )
+    # Content freshness (migration 202 / schema_guard). THIS FUNCTION IS THE ONLY THING THAT
+    # CREATES THIS TABLE -- it is absent from SQLAlchemy metadata -- so a column declared in the
+    # migration and in schema_guard but NOT here does not exist on any database bootstrapped
+    # through this path. `ALTER TABLE IF EXISTS ... ADD COLUMN` in the guard is a silent no-op
+    # when the table is missing, and the selector references `last_crawl_attempt_at`
+    # unconditionally, so omitting it here is a hard error on first boot, not a degraded sort.
+    # Migration 200's columns were added here for exactly this reason; 202's belong here too.
+    await database.execute(
+        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS last_crawled_at TIMESTAMPTZ;"
+    )
+    await database.execute(
+        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS last_crawl_attempt_at TIMESTAMPTZ;"
+    )
+    # Destination liveness (migration 200 / schema_guard). The refresh below writes
+    # these on every completed fetch, so this table cannot be usable without them.
+    await database.execute(
+        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS destination_checked_at TIMESTAMPTZ;"
+    )
+    await database.execute(
+        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS destination_http_status INTEGER;"
+    )
+    await database.execute(
+        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS destination_verdict TEXT;"
+    )
+    await database.execute(
+        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS destination_failure_streak INTEGER NOT NULL DEFAULT 0;"
+    )
+    # The CHECK and the two partial indexes travel WITH the columns. Migration 199 and
+    # db/schema_guard.py both create all four things; a table bootstrapped only through this
+    # runtime path used to get the columns and neither, which is a third and quietly different
+    # declaration of the same schema — and the one that decides whether an unknown verdict is
+    # rejected or silently stored.
+    try:
+        await database.execute(
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conname = 'ck_external_product_seeds_destination_verdict'
+                ) THEN
+                    ALTER TABLE external_product_seeds
+                        ADD CONSTRAINT ck_external_product_seeds_destination_verdict
+                        CHECK (
+                            destination_verdict IS NULL
+                            OR destination_verdict IN (
+                                'live',
+                                'live_delisted',
+                                'redirected_to_product',
+                                'redirected_off_product',
+                                'dead_404',
+                                'unverifiable'
+                            )
+                        );
+                END IF;
+            END $$;
+            """
+        )
+    except Exception:
+        # SQLite (the test harness) has no DO blocks and no pg_constraint. The vocabulary is
+        # additionally enforced in Python by `classify_destination`, which is the only producer.
+        pass
+    await database.execute(
+        "CREATE INDEX IF NOT EXISTS idx_external_product_seeds_destination_checked "
+        "ON external_product_seeds(destination_checked_at);"
+    )
+    await database.execute(
+        "CREATE INDEX IF NOT EXISTS idx_external_product_seeds_destination_verdict "
+        "ON external_product_seeds(destination_verdict);"
     )
     await database.execute(
         "CREATE INDEX IF NOT EXISTS idx_external_product_seeds_status ON external_product_seeds(status);"
@@ -1400,6 +1475,10 @@ async def _make_redirect_url(
         {
             "market": market,
             "tool": tool,
+            # `market` arrives here RAW (the seed row's / the request's own value), and is
+            # exactly what gets stamped — so its own emptiness is the provenance question.
+            # See the MARKET PROVENANCE note in `services/outbound_links_service`.
+            **({TOKEN_MARKET_OBSERVED_KEY: True} if market_is_observed(market) else {}),
             "dest": dest_with_utm,
             "ctx": ctx,
         }
@@ -1533,17 +1612,23 @@ def _normalize_seed_url_for_id(url: str) -> str:
 
 
 def _normalize_seed_availability(raw: Any) -> Optional[str]:
+    """Canonicalise a seed availability string, keeping this call site's passthrough contract.
+
+    The vocabulary itself now lives in utils.availability_vocabulary so every reader shares
+    one mapping — see that module for why four divergent copies was a defect. The PASSTHROUGH
+    for unrecognised values is preserved deliberately: the caller above treats a passthrough
+    value as "unknown" (leaves `available` as None), and collapsing those to None here would
+    instead make them read as AVAILABLE.
+    """
     if raw is None:
         return None
     s = str(raw).strip()
     if not s:
         return None
-    v = s.strip().lower()
-    if v in {"in stock", "in_stock", "instock"}:
-        return "in_stock"
-    if v in {"out of stock", "out_of_stock", "outofstock", "sold out", "sold_out", "unavailable"}:
-        return "out_of_stock"
-    return v.replace(" ", "_")
+    canonical = normalize_availability(s)
+    if canonical is not None:
+        return canonical
+    return s.lower().replace(" ", "_")
 
 
 _CURRENCY_TO_REFERRAL_MARKET = {
@@ -4330,10 +4415,191 @@ async def update_external_seed(
         f"UPDATE external_product_seeds SET {', '.join(set_clauses)} WHERE id = :id",
         updates,
     )
-    return {"status": "success"}
+
+    # An employee price edit has to reach the BUYER's surfaces, not just the seed.
+    # `_refresh_external_seed_by_id` already projects after a re-read; this manual
+    # edit path wrote external_product_seeds and stopped, so a corrected price sat
+    # in the seed while catalog_offers -- which the PDP and the serving gate read --
+    # kept the old one. Same split-brain, different door.
+    #
+    # Best-effort and post-write, exactly like the refresh path: the projection is
+    # a mirror, and failing to mirror must never fail the authorized edit the
+    # employee just made.
+    projected: Dict[str, int] = {}
+    if any(k in updates for k in ("price_amount", "price_currency", "availability")):
+        try:
+            projected = await _project_refreshed_seed_to_serving_surfaces(seed_id)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "employee seed edit: serving-surface projection failed for seed_id=%r",
+                seed_id, exc_info=True,
+            )
+
+    return {"status": "success", "projected": projected}
 
 
-async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
+def _same_destination(fetched: Optional[str], served: Optional[str]) -> bool:
+    """Is the URL this refresh fetched the same one the serving lane hands out?
+
+    Compared after trimming and dropping a trailing slash — the two columns are written by
+    different code paths and differ cosmetically far more often than they differ in substance.
+    Anything beyond that (query-string order, case) is deliberately NOT normalised: on a
+    storefront a differing query string can select a different variant, so treating those as
+    the same URL would reintroduce exactly the mis-attribution this guard exists to prevent.
+    """
+    a = str(fetched or "").strip().rstrip("/")
+    b = str(served or "").strip().rstrip("/")
+    return bool(a) and a == b
+
+
+# A price reading that we actually STORED. `unavailable` means we read no price at all, and
+# each `skipped_*` means we read something and REFUSED it (a 0-price broken-offer shape, an
+# amount with no currency, a currency that disagrees with the stored one). In every refused
+# case the row keeps its PREVIOUS amount, so the number we quote was not re-read and must not
+# be described as freshly extracted. `unchanged` counts: we read the page and it still says
+# what we store.
+_PRICE_STATUSES_THAT_RE_READ_THE_STORED_PRICE = frozenset({"applied", "filled", "unchanged"})
+
+
+async def _project_refreshed_seed_to_serving_surfaces(seed_id: str) -> Dict[str, int]:
+    """Push a freshly re-read seed onto the surfaces a BUYER reads.
+
+    THE BUG THIS CLOSES. `_refresh_external_seed_by_id` writes `external_product_seeds` and
+    nothing else. The search/offers lane reads the seed, so it saw fresh prices — but the PDP
+    (`agent_pdp_view`, via `agent_pdp_view_assembler.fetch_offers_for_keys`) and the index's
+    `serving_eligible.has_price` gate both read `catalog_offers`, and NOTHING re-projected a
+    seed that was already mirrored. Measured on prod 2026-09-06: 1,321 of 5,316 live products
+    (25%) served a different price on the PDP than in search, 917 with a seed read inside 7 days.
+
+    GATED AS A WHOLE, and that is a correction. The first version relied on
+    `sync_offer_for_seed` self-gating on EXTERNAL_OFFER_DUAL_WRITE_ENABLED and left
+    `refresh_agent_pdp_view_for_seed` UNGATED — which has no flag of its own. With the flag off
+    that meant every refreshed seed (~2,000/night) still ran `build_agent_pdp_view_row`
+    (~1s/key; the reconciler caps ITSELF at 300 keys/6h for that reason), the agent_pdp_view
+    upsert and `recompute_serving_eligibility` — inside the sequential 3,300s crawl budget,
+    while `catalog_offers` stayed untouched. All of the cost, none of the fix, and it would have
+    made `stopped_early` near-certain, slowing rotation and making prices STALER. The claim
+    "inert until armed" has to be true of the whole helper, so the flag is now checked here.
+
+    Called for `unchanged` as well as `applied`/`filled` ON PURPOSE: re-projecting a price that
+    did not move is what makes the nightly rotation self-healing for rows that already drifted,
+    instead of needing a separate backfill pass.
+
+    Returns counters so the batch can tell "healed 2,000" from "healed 0" — `sync_offer_for_seed`
+    has seven statuses and six of them mean "did nothing" (`no_mirror_product` is expected to be
+    common: the mirror is insert-only and matches on `source_ref = seed_id`). Dropping that dict
+    is how a run that projected nothing would still have reported success.
+
+    Best-effort and non-raising, mirroring the `seed_data_writer` hooks it stands in for: the
+    seed row is the committed source of truth, so a projection failure must never turn a good
+    price read into a failed refresh.
+    """
+    counts: Dict[str, Any] = {
+        "attempted": 0, "projected": 0, "skipped": 0, "errored": 0, "seconds": 0.0,
+    }
+    if not seed_id:
+        return counts
+    _started = time.monotonic()
+    from services.external_offer_dual_write import dual_write_enabled
+
+    if not dual_write_enabled():
+        # Inert, and cheap: no offer write AND no view rebuild. See the gating note above.
+        return counts
+
+    counts["attempted"] = 1
+    try:
+        from services.external_offer_dual_write import sync_offer_for_seed
+
+        from services.external_offer_dual_write import (
+            OFFER_SYNC_ERROR_STATUSES,
+            OFFER_SYNC_WRITTEN_STATUSES,
+        )
+
+        outcome = await sync_offer_for_seed(seed_id)
+        status = str((outcome or {}).get("status") or "").strip().lower()
+        # Derived from the writer, never restated here. The first version guessed
+        # {"synced","inserted","updated","ok"} — three statuses it cannot emit — and the tests
+        # stubbed "ok", so the whole positive path was calibrated against a value production
+        # never produces.
+        if status in OFFER_SYNC_WRITTEN_STATUSES:
+            counts["projected"] = 1
+        elif status in OFFER_SYNC_ERROR_STATUSES:
+            # The writer swallowed an exception. That is an error, not a skip: a skip means
+            # "nothing to do", and counting a failed write as one hides it from the summary.
+            counts["errored"] = 1
+            counts["skip_" + (status or "unknown")] = 1
+        else:
+            counts["skipped"] = 1
+            counts["skip_" + (status or "unknown")] = 1
+    except Exception as exc:  # noqa: BLE001 - a cache write must not break the source of truth
+        counts["errored"] = 1
+        logger.warning(
+            "external seed refresh: catalog_offers projection failed seed_id=%s err=%s",
+            seed_id, str(exc)[:200],
+        )
+    try:
+        from services.seed_data_writer import refresh_agent_pdp_view_for_seed
+
+        # THE PDP HALF REPORTS ITS OWN OUTCOME. `projected` means the OFFER was written; the
+        # view rebuild used to fold into nothing -- a raising or silently no-op'ing refresh (no
+        # attached_product_key, no content_key) left `projected: 1` and no skip, so the surface
+        # this hook is named for could fail on every row while the summary read healed.
+        pdp = await refresh_agent_pdp_view_for_seed(
+            seed_id=seed_id, proposal_id=None, refresh_source="external_referral_refresh",
+        )
+        if pdp == "refreshed":
+            counts["pdp_refreshed"] = 1
+        else:
+            counts["pdp_skipped"] = 1
+            counts["pdp_skip_" + str(pdp or "unknown")] = 1
+    except Exception as exc:  # noqa: BLE001 - same isolation the assembler documents
+        counts["errored"] = 1
+        counts["pdp_errored"] = 1
+        logger.warning(
+            "external seed refresh: agent_pdp_view projection failed seed_id=%s err=%s",
+            seed_id, str(exc)[:200],
+        )
+    # Measured AFTER both surfaces: the PDP rebuild is the ~1s/key half.
+    counts["seconds"] = round(time.monotonic() - _started, 4)
+    return counts
+
+
+async def _stamp_crawl_attempt(seed_id: str) -> None:
+    """Record that we TRIED to re-read this seed, whatever the outcome.
+
+    THIS IS NOT A FRESHNESS SIGNAL and must never be read as one -- that is `last_crawled_at`,
+    which only a fetch that reached the origin may set. This column exists solely to order the
+    refresh QUEUE, and the two questions genuinely differ for the rows that matter most.
+
+    Without it the queue deadlocks on its own failures. `get_external_referral_refresh_candidate_seed_ids`
+    orders `last_crawled_at ASC NULLS FIRST`, and a seed that 404s, is bot-challenged, or is
+    disallowed by robots never gets stamped -- so it stays NULL, stays first, and is retried
+    every single run, forever, in front of the rows that could actually be corrected. On the
+    dead-PDP audit's own numbers (10.4% of measurable seeds already broken) that is most of a
+    nightly batch spent re-fetching URLs we have already proven are gone.
+
+    Advancing the attempt clock on a failure does NOT claim the price is fresh. It claims only
+    that we have already spent this round's request on this row, which is true.
+    """
+    await _execute_seed_data_stmt(
+        "UPDATE external_product_seeds SET last_crawl_attempt_at = NOW() WHERE id = :id",
+        {"id": seed_id},
+    )
+
+
+async def _refresh_external_seed_by_id(
+    seed_id: str, *, max_wait: Optional[float] = None
+) -> Dict[str, Any]:
+    """Re-read one seed's price/availability from the origin.
+
+    `max_wait` is the CALLER'S PATIENCE and the two callers want opposite things. The employee
+    route behind this is interactive: a human is waiting, so the default ceiling
+    (CRAWL_MAX_WAIT_SECONDS) is right and a throttled host should fail fast. The nightly batch
+    is not: it must pass 0 (unbounded) or `crawl_politeness` refuses any slot beyond ~10s,
+    which is most of the backoff curve, and every remaining row on that host burns in
+    milliseconds looking like the host was down. Passing it per-call rather than reading an
+    env var keeps one function honest for both.
+    """
     await _ensure_external_seeds_table()
     row = await database.fetch_one("SELECT * FROM external_product_seeds WHERE id = :id", {"id": seed_id})
     if not row:
@@ -4343,15 +4609,86 @@ async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
     market = row.get("market")
     tool = row.get("tool")
     dest = row.get("destination_url")
+    # The host, resolved BEFORE any degraded return can fire. `domain` further down is read off
+    # the snapshot, which by definition does not exist on the paths that degrade — so the
+    # summary's `top_degraded_hosts` was structurally always {"unknown": N}. Prefer the seed's
+    # own column, fall back to the destination URL's netloc.
+    report_host = str(row.get("domain") or "").strip().lower()
+    if not report_host and dest:
+        try:
+            report_host = (urlparse(str(dest)).hostname or "").strip().lower()
+        except Exception:  # noqa: BLE001 - a malformed URL must not break the refresh
+            report_host = ""
     previous_canonical_url = row.get("canonical_url")
     if not dest:
+        # Stamp FIRST. The candidate query orders by `last_crawl_attempt_at ASC NULLS FIRST`,
+        # so a row that raises before the stamp keeps a null attempt time, heads the queue
+        # again tomorrow, and every night after — a permanent backlog that crowds out rows
+        # that could actually be read.
+        await _stamp_crawl_attempt(seed_id)
         raise HTTPException(status_code=400, detail="INVALID_URL")
 
+    # THE REFRESH USED TO BE BLIND TO A DEAD LINK, and worse than blind: `raise_for_status()`
+    # threw, `resolve_external_offer` caught it and returned the CACHED snapshot, this function
+    # wrote that snapshot and set `updated_at = NOW()` — so fetching a 404 made the row look
+    # FRESHER to the `stale_snapshot` gate. `raise_on_unavailable=True` is what stops that.
+    # `observed` carries the status and the FINAL url of the request that actually left, which
+    # is the only way to tell a product page from a 301 onto a collection.
+    # See docs/external-seed-dead-pdp-link-audit.md §4.2 and §5.2.
     snapshot = None
+    observed: Dict[str, Any] = {}
     try:
-        snapshot = await resolve_external_offer(market=market, url=dest, force_refresh=True)
+        snapshot = await resolve_external_offer(
+            market=market,
+            url=dest,
+            force_refresh=True,
+            raise_on_unavailable=True,
+            observed=observed,
+            max_wait=max_wait,
+        )
+    except ExternalOfferUnavailable as exc:
+        if not _same_destination(dest, destination_liveness.destination_of(row)):
+            # See the note at the success path: a verdict about a URL we do not serve is worse
+            # than no verdict at all.
+            await _stamp_crawl_attempt(seed_id)
+            return {
+                "status": "degraded",
+                "error": f"destination_unavailable: http {exc.status_code}",
+                "domain": report_host or None,
+                "destination_refresh": {"status": "not_observed", "reason": "not_the_served_url"},
+            }
+        observation = destination_liveness.classify_destination(
+            requested_url=dest,
+            status_code=exc.status_code,
+            final_url=exc.final_url,
+            bot_challenged=bool(observed.get("bot_challenged")),
+        )
+        destination_refresh = await destination_liveness.record_destination_observation(
+            seed_id, observation
+        )
+        # THIS PATH RECORDS, IT NEVER RETIRES. A refresh sees one URL and one status code;
+        # it has not read the brand's catalogue, so it cannot tell a deleted product from a
+        # WAF that answers 404 to an unfamiliar client. `record_destination_observation`
+        # enforces that (an uncorroborated verdict holds the streak), and the retirement call
+        # is deliberately absent here rather than left in behind a condition that cannot fire
+        # — an unreachable retirement reads like a live one to the next person.
+        # Retirement belongs to jobs/external_seed_destination_sweep, which has stage 1.
+        await _stamp_crawl_attempt(seed_id)
+        return {
+            "status": "degraded",
+            "error": f"destination_unavailable: http {exc.status_code}",
+            "domain": report_host or None,
+            "destination_refresh": destination_refresh,
+        }
     except Exception as exc:
-        return {"status": "degraded", "error": f"snapshot_failed: {str(exc)[:200]}"}
+        # We never reached the origin (timeout, TLS, DNS, robots). That is NOT evidence about
+        # the product, so no observation is recorded and the failure streak does not move.
+        await _stamp_crawl_attempt(seed_id)
+        return {
+            "status": "degraded",
+            "error": f"snapshot_failed: {str(exc)[:200]}",
+            "domain": report_host or None,
+        }
 
     canonical_url = getattr(snapshot, "canonical_url", None) if snapshot else None
     domain = getattr(snapshot, "domain", None) if snapshot else None
@@ -4390,7 +4727,13 @@ async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
             "price_amount": snap_price_amount,
             "price_currency": snap_price_currency,
             "availability": snap_availability,
-            "refreshed_at": _to_iso(getattr(snapshot, "fetched_at", None)) or None,
+            # `snapshot.fetched_at` DOES NOT EXIST. ExternalOfferSnapshot's fields are
+            # (..., last_checked_at, evidence, override_*) -- so this getattr has always
+            # returned None and this key has always been written as null. Nothing read it,
+            # which is why it went unnoticed; `extracted_at` below is the field the
+            # `stale_snapshot` gate actually reads. Use the real field, falling back to now.
+            "refreshed_at": _to_iso(getattr(snapshot, "last_checked_at", None))
+            or _to_iso(datetime.now(timezone.utc)),
         }
     )
     # Only overwrite curated fields if they are missing.
@@ -4576,6 +4919,70 @@ async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
         "currency": next_currency,
     }
 
+    # HOISTED so the stamp and the liveness observation below are gated on ONE decision.
+    # Deriving "did we reach the origin" twice is the twin-implementation drift this file
+    # keeps paying for, and here the two copies would disagree about whether a row is fresh.
+    #
+    # REACHING THIS LINE IS NOT EVIDENCE OF A FETCH. `resolve_external_offer` honours
+    # `raise_on_unavailable` only in its `except ExternalOfferUnavailable` arm; a timeout, a
+    # TLS/DNS error, a `RobotsDisallowed` (a bare RuntimeError) or a failure inside the
+    # extractor all land in its generic `except Exception`, which returns the CACHED snapshot.
+    # The success path then runs normally. `observed["status_code"]` is the only proof that
+    # anything actually left the process -- and `_same_destination` is the only proof it went
+    # to the URL we serve rather than a legacy `destination_url` we do not.
+    served_url = destination_liveness.destination_of(row)
+    # ONE CLASSIFICATION, read three times: the freshness stamp, the staleness gate, and the
+    # liveness verdict below all derive from THIS. `classify_destination` is pure, so hoisting
+    # it costs nothing and removes the twin-implementation drift this file keeps paying for.
+    #
+    # `status_code is not None` ALONE IS NOT A READING, and three separate cases prove it:
+    #   * `from_cache` -- `_fetch_html` stamps `observed` BEFORE returning, so a failure after
+    #     the response (extractor, snapshot upsert, post-write re-read) hands back the CACHED
+    #     row with `status_code` set. `resolve_external_offer` now says so explicitly.
+    #   * `final_url` -- a 301 onto a collection, or onto a DIFFERENT product handle, answers
+    #     200 for a page that is not the one we serve. Only the verdict looks at where the
+    #     request ended; `_same_destination` compares two STORED urls and cannot see it.
+    #   * `bot_challenged` -- a cf-mitigated 200 is `unverifiable`, and the liveness writer
+    #     already refuses to stamp `destination_checked_at` for it. Anything claiming parity
+    #     with that column has to refuse for the same reason.
+    served_url = destination_liveness.destination_of(row)
+    observation = None
+    if observed.get("status_code") is not None and _same_destination(dest, served_url):
+        observation = destination_liveness.classify_destination(
+            requested_url=dest,
+            status_code=int(observed["status_code"]),
+            final_url=observed.get("final_url"),
+            bot_challenged=bool(observed.get("bot_challenged")),
+        )
+    read_the_served_product = (
+        observation is not None
+        and observation.verdict == destination_liveness.VERDICT_LIVE
+        and not observed.get("from_cache")
+    )
+
+    # CLEAR THE BLOCKER THIS REFRESH IS THE RECOMMENDED FIX FOR.
+    #
+    # `stale_snapshot` (services/external_referral_readiness) is raised when the CONTENT is
+    # older than EXTERNAL_REFERRAL_STALE_DAYS, it is marked `auto_fixable: True`, and its
+    # `recommended_action` is literally "Refresh the seed snapshot". It reads
+    # `snapshot.extracted_at` via `get_content_extracted_at`, which has NO fallback by
+    # design -- and until now this function wrote only `snapshot.refreshed_at`. So the gate
+    # recommended an action that could not clear it, and `auto_fixable` was untrue: a seed
+    # could be refreshed successfully every night and stay blocked forever.
+    #
+    # GATED TWICE, because the failure mode of getting this wrong is the one this whole lane
+    # exists to prevent -- a stale price presented as freshly verified:
+    #   * `reached_served_origin` -- a cached-snapshot fallback (timeout, TLS, robots) runs
+    #     this same success path without contacting anyone, and must never clear a blocker;
+    #   * the price status -- we only claim an extraction when the amount we now STORE came
+    #     off the page. Refusing to write a reading and then calling the row fresh would
+    #     vouch for the previous price.
+    # A row we can never read a price from therefore stays blocked, which is the correct
+    # direction to be wrong in: it withholds a row rather than quoting a number we did not
+    # re-read.
+    if read_the_served_product and price_status in _PRICE_STATUSES_THAT_RE_READ_THE_STORED_PRICE:
+        seed_data["snapshot"]["extracted_at"] = _to_iso(datetime.now(timezone.utc))
+
     await _execute_seed_data_stmt(
         """
         UPDATE external_product_seeds
@@ -4587,11 +4994,26 @@ async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
             price_currency = :price_currency,
             availability = :availability,
             seed_data = :seed_data,
-            updated_at = NOW()
+            updated_at = NOW(),
+            -- WE SPENT THIS ROUND'S REQUEST ON THIS ROW. Advances on every terminal outcome
+            -- (see _stamp_crawl_attempt), which is what keeps a permanently-dead seed from
+            -- sitting at the head of the queue forever. Orders the queue; proves nothing.
+            last_crawl_attempt_at = NOW(),
+            -- WE ACTUALLY READ THE PRICE, FROM THE URL WE SERVE. Gated on exactly the
+            -- predicate `destination_checked_at` is gated on, because it is the same claim
+            -- about the same fetch. A cached-snapshot fallback keeps the OLD value rather
+            -- than taking NOW() -- if it took NOW(), the hosts we can never read would be
+            -- stamped fresh on every run and sorted to the BACK of the queue permanently,
+            -- which is the starvation this column exists to remove, wearing a new hat.
+            last_crawled_at = CASE
+                WHEN CAST(:read_the_served_product AS BOOLEAN) THEN NOW()
+                ELSE last_crawled_at
+            END
         WHERE id = :id
         """,
         {
             "id": seed_id,
+            "read_the_served_product": bool(read_the_served_product),
             "canonical_url": canonical_url,
             "domain": domain,
             "title": snap_title,
@@ -4602,8 +5024,56 @@ async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
             "seed_data": _seed_data_payload(seed_data),
         },
     )
+
+    # THE FETCH REACHED THE ORIGIN, so it is an observation and it may stamp the liveness
+    # columns — the ONLY writer allowed to, which is what makes `destination_checked_at`
+    # answerable ("when did we last see this URL") where `updated_at` never was.
+    #
+    # Classified from `observed`, the real HTTP status and FINAL url, NOT from
+    # `snapshot.canonical_url`: the page's self-declared canonical can point at a sibling
+    # handle for perfectly live products, and a `redirected_off_product` verdict is one of the
+    # two that can eventually retire a seed. A guess must never be able to do that.
+    destination_refresh: Dict[str, Any] = {"status": "not_observed"}
+    # ONLY JUDGE THE URL WE ACTUALLY SERVE. This function fetches `destination_url`, but the
+    # readiness gate and the sweep both resolve a seed to `canonical_url or destination_url`
+    # — and this very function writes `canonical_url` from the fetched page a few lines up, so
+    # the two drift apart by design. Recording a verdict from the wrong one is how a seed whose
+    # served link is healthy gets marked dead because a legacy `destination_url` 404s.
+    # When they differ, the sweep observes the served URL; saying nothing here is correct.
+    # `served_url` and `observation` are the HOISTED values from above; recomputing them here
+    # is what would let the stamp and the verdict disagree.
+    if observed.get("status_code") is None:
+        # The fetch never reached the origin (or came from the snapshot cache), so there is
+        # nothing to record. Distinct from the case below, and the drift report says which.
+        destination_refresh = {"status": "not_observed", "reason": "no_origin_response"}
+    elif not _same_destination(dest, served_url):
+        destination_refresh = {"status": "not_observed", "reason": "not_the_served_url"}
+    else:
+        assert observation is not None  # same branch conditions as the hoist above
+        destination_refresh = await destination_liveness.record_destination_observation(
+            seed_id, observation
+        )
+        # THIS PATH RECORDS, IT NEVER RETIRES. A refresh sees one URL and one status code;
+        # it has not read the brand's catalogue, so it cannot tell a deleted product from a
+        # WAF that answers 404 to an unfamiliar client. `record_destination_observation`
+        # enforces that (an uncorroborated verdict holds the streak), and the retirement call
+        # is deliberately absent here rather than left in behind a condition that cannot fire
+        # — an unreachable retirement reads like a live one to the next person.
+        # Retirement belongs to jobs/external_seed_destination_sweep, which has stage 1.
+
+    # The seed is committed; now make the buyer-facing surfaces agree with it. See the helper
+    # for why this is gated on a price we actually re-read, and why `unchanged` is included.
+    projection: Dict[str, int] = {}
+    # BOTH conjuncts, matching the `extracted_at` stamp above. A cache-served fallback (a quarter
+    # of rows on 09-05) also yields `unchanged`, and projecting it would stamp
+    # catalog_offers.updated_at = NOW() on a row nobody re-read — claiming a freshness we did not
+    # earn, which is exactly what the projection exists to stop.
+    if read_the_served_product and price_status in _PRICE_STATUSES_THAT_RE_READ_THE_STORED_PRICE:
+        projection = await _project_refreshed_seed_to_serving_surfaces(seed_id)
+
     return {
         "status": "success",
+        "projection": projection,
         "seed_id": seed_id,
         "market": market,
         "tool": tool,
@@ -4611,11 +5081,25 @@ async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
         "canonical_url": canonical_url,
         "domain": domain,
         "seed_data": seed_data,
+        # DID THIS "SUCCESS" ACTUALLY CONTACT THE ORIGIN? Often not, and the status alone
+        # cannot say. `resolve_external_offer` honours `raise_on_unavailable` ONLY in its
+        # `except ExternalOfferUnavailable` arm; anything else — a timeout, TLS, robots, and
+        # now a `CrawlDelayTooLong` skip — falls into its generic `except Exception`, which
+        # hands back the CACHED snapshot. This whole success path then runs having contacted
+        # nobody, and the batch counts the row as `refreshed`.
+        #
+        # The freshness guards already hold (`observed["status_code"] is None` withholds
+        # `last_crawled_at`, `destination_checked_at` and the verdict), so nothing is
+        # fabricated. What was missing is any signal an OPERATOR can see: a run in which a
+        # hostile robots.txt voided every row reported exactly like a complete one. Same
+        # reasoning as `stopped_early`/`skipped_for_budget` on the batch summary.
+        "snapshot_from_cache": bool(observed.get("from_cache")),
         # Drift report. The batch runner sums these so "we re-crawled N seeds" can
         # be stated as "N re-crawled, M prices actually moved" — the difference is
         # the whole point of the refresh existing.
         "price_refresh": price_refresh,
         "availability_refresh": availability_refresh,
+        "destination_refresh": destination_refresh,
         "attached_product_key": row.get("attached_product_key"),
         "attached_variant_id": row.get("attached_variant_id"),
         "disclosure_text": row.get("disclosure_text") or seed_data.get("disclosure_text") or DEFAULT_DISCLOSURE_TEXT,

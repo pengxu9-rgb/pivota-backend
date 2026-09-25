@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 from sqlalchemy import (
+    REAL,
     BigInteger,
     Boolean,
+    CheckConstraint,
     Column,
     DateTime,
-    Float,
+    ForeignKey,
     Index,
     Integer,
     Numeric,
     String,
     Table,
     Text,
+    text,
 )
 from sqlalchemy.sql import expression, func
 
@@ -38,13 +41,14 @@ catalog_merchants = Table(
     Column("metadata_json", JSONB_TYPE, nullable=True),
     # PR-1b — opt-in for the auto-re-audit scheduler. 'none' | 'weekly'
     # | 'monthly'. Migration 078_catalog_merchants_audit_schedule.sql
-    # adds the column with default 'none' to existing rows.
-    Column("audit_schedule", String(16), nullable=False, server_default="none"),
+    # adds the column with default 'none' to existing rows — as TEXT, not
+    # VARCHAR(16), so that is what this declares.
+    Column("audit_schedule", Text, nullable=False, server_default="none"),
     # Stage 2a (mig 084): timestamp of the merchant's most recent
     # successful Path A full sync. Used by the sweep to compare per-row
     # last_seen_in_sync_at — without it we couldn't tell "merchant
     # hasn't synced lately" from "row was deleted from upstream."
-    Column("last_full_sync_at", DateTime, nullable=True),
+    Column("last_full_sync_at", DateTime(timezone=True), nullable=True),
     Column("created_at", DateTime, server_default=func.now(), nullable=False),
     Column("updated_at", DateTime, server_default=func.now(), nullable=False),
 )
@@ -64,7 +68,7 @@ catalog_products = Table(
     Column("source_ref", String(255), nullable=True),
     Column("source_domain", Text, nullable=True),
     Column("suppression_reason", Text, nullable=True),
-    Column("suppressed_at", DateTime, nullable=True),
+    Column("suppressed_at", DateTime(timezone=True), nullable=True),
     Column("suppression_metadata", JSONB_TYPE, nullable=True),
     Column("title", Text, nullable=False),
     Column("description", Text, nullable=True),
@@ -74,7 +78,10 @@ catalog_products = Table(
     # Phase 2 / O-5 — hierarchical PDP taxonomy path. The sync path writes
     # these inline, so runtime metadata must match migration 069.
     Column("category_path", String(255), nullable=True),
-    Column("category_confidence", Float, nullable=True),
+    # Human-readable leaf label for category_path (mig 097). Also in
+    # schema_guard's REQUIRED_SCHEMA for catalog_products.
+    Column("category_label", String(255), nullable=True),
+    Column("category_confidence", REAL, nullable=True),
     Column("category_label_source", String(32), nullable=True),
     # Durable category_kind in {skincare, haircare, supplement} (mig 151).
     # Drives claim-safety / disclaimers / serving-gate; see services.category_kind.
@@ -113,7 +120,7 @@ catalog_products = Table(
     # stay aligned with the live schema.
     Column("pdp_scope", String(32), nullable=False, server_default="unverified"),
     Column("pdp_scope_source", String(32), nullable=True),
-    Column("pdp_scope_set_at", DateTime, nullable=True),
+    Column("pdp_scope_set_at", DateTime(timezone=True), nullable=True),
     # Phase O-4 — onboarding lifecycle stage (mig 077). Computed at
     # ingest by every path; recall (Phase O-5) filters on
     # validated|published. See docs/PDP_ONBOARDING_PLAYBOOK.md.
@@ -130,13 +137,14 @@ catalog_products = Table(
     # expected_steady) in merchant_view.diagnosis. See migration 073
     # + services/pivota_indexing_arc.py. Nullable for now because the
     # backfill sets pre-existing rows to their created_at.
-    Column("pivota_signature_minted_at", DateTime, nullable=True),
+    Column("pivota_signature_minted_at", DateTime(timezone=True), nullable=True),
     # Stage 1 of the PDP architecture roadmap (mig 083). Content-derived
     # product identity: same physical product across merchants/paths
     # produces the same content_key. See services/catalog_identity.py
     # + plans/rosy-mixing-bengio.md. Nullable for rows predating mig
-    # 083; backfilled by scripts/backfill_content_key.py.
-    Column("content_key", Text, nullable=True),
+    # 083; backfilled by scripts/backfill_content_key.py. VARCHAR(40), matching
+    # migration 083 and agent_pdp_view.content_key — not TEXT.
+    Column("content_key", String(40), nullable=True),
     # ADR-011 (mig 178): GS1-canonical GTIN-14 as a MATCH ATTRIBUTE on the
     # canonical identity — NOT folded into content_key. The SPU model
     # (Amazon ASIN / Dewu SPU): content_key is the merchant-agnostic
@@ -156,7 +164,7 @@ catalog_products = Table(
     # sets last_seen_in_sync_at=NOW() on every write. NULL on rows from
     # non-sync paths (external_seed mirror, enrichment agent) or rows
     # predating mig 084.
-    Column("last_seen_in_sync_at", DateTime, nullable=True),
+    Column("last_seen_in_sync_at", DateTime(timezone=True), nullable=True),
     # Stage 2a (mig 084): sync lifecycle. 'live' (default) | 'stale' |
     # 'archived'. Sweep flips to stale when last_seen falls behind
     # catalog_merchants.last_full_sync_at by GRACE_HOURS. Recall layer
@@ -170,16 +178,40 @@ catalog_products = Table(
     # column names" — surfaced via the 2026-05-18 E2E validation run.
     Column("material", Text, nullable=True),
     Column("material_source", String(32), nullable=True),
-    Column("material_confidence", Float, nullable=True),
+    Column("material_confidence", REAL, nullable=True),
     Column("care", Text, nullable=True),
     Column("care_source", String(32), nullable=True),
-    Column("care_confidence", Float, nullable=True),
+    Column("care_confidence", REAL, nullable=True),
     Column("size_guide", JSONB_TYPE, nullable=True),
     Column("size_guide_source", String(32), nullable=True),
-    Column("size_guide_confidence", Float, nullable=True),
+    Column("size_guide_confidence", REAL, nullable=True),
+    # Review signal lifted from a PDP's schema.org aggregateRating (mig 186).
+    # The decision-intelligence lane reads exactly these names, and
+    # services/agent_pdp_view_assembler.py SELECTs cp.rating_value when it
+    # builds agent_pdp_view — a schema built from this model without them
+    # fails that build (swallowed as a best-effort warning).
+    Column("rating_value", Numeric, nullable=True),
+    Column("rating_count", Integer, nullable=True),
+    # pdp_will_render / pdp_will_render_computed_at (mig 188) are DELIBERATELY
+    # ABSENT, and a drift audit that "helpfully" adds them is reverting a
+    # decision, not fixing an oversight. services/pdp_renderability_store.py
+    # documents why: the columns are referenced only BY NAME (a
+    # sa.literal_column predicate and a raw UPDATE), because adding them here
+    # makes every select(catalog_products) in the repo emit them, and a deploy
+    # that lands before the database grows the column turns each of those into
+    # an UndefinedColumn 500. The safeguard IS their absence from this Table.
     Column("content_changed_at", DateTime, server_default=func.now(), nullable=False),
     Column("created_at", DateTime, server_default=func.now(), nullable=False),
     Column("updated_at", DateTime, server_default=func.now(), nullable=False),
+    # mig 223. Mirror provenance lookup: the reconciler and sync_offer_for_seed
+    # both locate a seed's mirror row by (source_ref, source_system). See the
+    # catalog_offers twin below.
+    Index(
+        "idx_catalog_products_source_ref_system",
+        "source_ref",
+        "source_system",
+        postgresql_where=Column("source_ref").isnot(None),
+    ),
     Index(
         "idx_catalog_products_source_identity",
         "merchant_id",
@@ -233,7 +265,7 @@ catalog_skus = Table(
     Column("source_variant_id", String(128), nullable=False),
     Column("source_domain", Text, nullable=True),
     Column("suppression_reason", Text, nullable=True),
-    Column("suppressed_at", DateTime, nullable=True),
+    Column("suppressed_at", DateTime(timezone=True), nullable=True),
     Column("suppression_metadata", JSONB_TYPE, nullable=True),
     Column("sku", String(128), nullable=True, index=True),
     Column("barcode", String(128), nullable=True),
@@ -289,14 +321,35 @@ catalog_offers = Table(
     Column("source_domain", Text, nullable=True),
     Column("offer_payload", JSONB_TYPE, nullable=True),
     Column("suppression_reason", Text, nullable=True),
-    Column("suppressed_at", DateTime, nullable=True),
+    Column("suppressed_at", DateTime(timezone=True), nullable=True),
     Column("suppression_metadata", JSONB_TYPE, nullable=True),
     Column("created_at", DateTime, server_default=func.now(), nullable=False),
     Column("updated_at", DateTime, server_default=func.now(), nullable=False),
     Index("idx_catalog_offers_merchant_track", "merchant_id", "catalog_track"),
+    # mig 223. The external-seed mirror reconciler joins
+    # (source_ref, source_system) to find drifted / missing mirror offers.
+    # Without this the reconciler's first query was a seq scan and it timed out
+    # on prod, so the repair path had never run once. Partial because source_ref
+    # is null on every non-mirror row.
+    Index(
+        "idx_catalog_offers_source_ref_system",
+        "source_ref",
+        "source_system",
+        postgresql_where=Column("source_ref").isnot(None),
+    ),
 )
 
 
+# KNOWN MODEL/MIGRATION DISAGREEMENT, deliberately left as-is.
+# db/migrations/132 declares `applied_at TIMESTAMPTZ NOT NULL DEFAULT now()`,
+# but main.py runs metadata.create_all BEFORE the migrations, so on every
+# database the app has ever booted this table was created HERE, naive, and
+# 132's CREATE TABLE IF NOT EXISTS has no-opped ever since. The model is what
+# prod actually has; the migration is the one that never landed. Changing this
+# to timezone=True would make fresh migrations-first databases disagree with
+# prod rather than agree with it, so the fix belongs in a decision about which
+# of the two owns this table, not in a type swap here. Migration 132 also
+# indexes (writer_name, applied_at DESC); the Index below is ASC.
 writer_audit_log = Table(
     "writer_audit_log",
     metadata,
@@ -492,6 +545,54 @@ catalog_quote_snapshots = Table(
 )
 
 
+checkout_preflight_observations = Table(
+    "checkout_preflight_observations",
+    metadata,
+    Column("observation_id", String(64), primary_key=True),
+    # timezone=True, matching TIMESTAMPTZ in db/migrations/219. They must agree, and the MODEL
+    # is what decides: create_all runs BEFORE migrations, so it creates the table and the
+    # migration's CREATE TABLE IF NOT EXISTS then skips — a bare DateTime here would silently
+    # give production a naive column while the migration file claimed otherwise. Caught only by
+    # running the dialect gate in order, where another file's create_all builds this table
+    # first and a tz-aware bind then fails with "can't subtract offset-naive and offset-aware".
+    Column("created_at", DateTime(timezone=True), server_default=func.now(), nullable=False),
+    # WHERE the row came from, and WHICH run wrote it. Both live in the MODEL and not only in
+    # db/migrations/220, because `web` deploys with SKIP_HEAVY_STARTUP_INIT and never runs the
+    # migration directory at all — `metadata.create_all` above is what actually builds this table
+    # on production, exactly as the `created_at` note explains. A column added to the migration
+    # alone would not exist in prod, and `record()` swallows its own failures, so shadow mode
+    # would stop recording with nothing but a dropped log line to show for it.
+    Column("source", String(32), nullable=False, server_default="live"),
+    # Nullable and untagged for live traffic; a sweep stamps every row of one pass with the same
+    # value so a run that aborted part-way can be excluded from the window instead of poisoning
+    # it. Without it a partial sweep is indistinguishable from a good one.
+    Column("run_id", String(64), nullable=True, index=True),
+    Column("mode", String(16), nullable=False),
+    Column("outcome", String(16), nullable=False),
+    # The decision the ENFORCING gate WOULD have made, recorded while it is not enforcing.
+    # `outcome` only ever says "allow" in shadow, so this is the column the refusal rate is
+    # measured from. See db/migrations/219_checkout_preflight_observations.sql.
+    Column("would_block", Boolean, nullable=False),
+    Column("reason", String(64), nullable=False),
+    Column("merchant_id", String(64), nullable=True, index=True),
+    Column("product_key", String(255), nullable=True),
+    Column("sku_key", String(255), nullable=True, index=True),
+    Column("offer_id", String(255), nullable=True),
+    Column("live_status", String(32), nullable=True),
+    Column("in_stock", Boolean, nullable=True),
+    # Kept separate from `live_status` deliberately, exactly as live_offer_verification.Verdict
+    # does: a check can establish STOCK without establishing PRICE, and folding the two into one
+    # flag is what produced the yen-as-dollars bug there.
+    Column("price_verified", Boolean, nullable=False, server_default=expression.false()),
+    Column("quoted_price", Numeric(12, 2), nullable=True),
+    Column("quoted_currency", String(16), nullable=True),
+    Column("live_price", Numeric(12, 2), nullable=True),
+    Column("live_currency", String(16), nullable=True),
+    Column("latency_ms", Integer, nullable=True),
+    Column("detail", JSONB_TYPE, nullable=True),
+)
+
+
 beauty_product_profiles = Table(
     "beauty_product_profiles",
     metadata,
@@ -645,14 +746,23 @@ agent_pdp_view = Table(
     # merchant_authored > llm_extraction_v1 > external_seed.
     Column("material", Text, nullable=True),
     Column("material_source", String(32), nullable=True),
-    Column("material_confidence", Float, nullable=True),
+    Column("material_confidence", REAL, nullable=True),
     Column("care", Text, nullable=True),
     Column("care_source", String(32), nullable=True),
-    Column("care_confidence", Float, nullable=True),
+    Column("care_confidence", REAL, nullable=True),
     Column("size_guide", JSONB_TYPE, nullable=True),
     Column("size_guide_source", String(32), nullable=True),
-    Column("size_guide_confidence", Float, nullable=True),
-    Column("refreshed_at", DateTime, server_default=func.now(), nullable=False),
+    Column("size_guide_confidence", REAL, nullable=True),
+    # Provenance-backed evidence + disclaimers mirrored from
+    # beauty_product_profiles (mig 152).
+    Column("evidence_profile", JSONB_TYPE, nullable=True),
+    Column("required_disclaimers", JSONB_TYPE, nullable=True),
+    # Review signal mirrored from catalog_products for the serve path (mig 186).
+    Column("rating_value", Numeric, nullable=True),
+    Column("rating_count", Integer, nullable=True),
+    Column(
+        "refreshed_at", DateTime(timezone=True), server_default=func.now(), nullable=False
+    ),
     Column("refreshed_by_proposal_id", BigInteger, nullable=True),
     Column("refresh_source", Text, nullable=True),
     Index(
@@ -676,4 +786,53 @@ agent_pdp_view = Table(
         "brand",
         postgresql_where=Column("brand").isnot(None),
     ),
+)
+
+# --- category_taxonomy: ONE vocabulary, read by BOTH services ----------------------------------
+#
+# WHY A TABLE AND NOT A CONSTANT. `category_path` is written and read by two repositories over one
+# database — pivota-backend's CATEGORY_PATTERNS and PIVOTA-Agent's src/services/beautyTaxonomy.js.
+# Each held its own vocabulary, neither imported the other, and on 2026-09-10 they disagreed about
+# where a toner lives: the gateway wrote 315 rows to `beauty/skincare/tone/toner` on purpose while
+# this repo's taxonomy named `beauty/skincare/treat/toner` and could not reach any of them. This
+# repo's own invariant then counted those rows as corruption. Two vocabularies over one column
+# means every disagreement presents as data corruption to whichever side is reading.
+#
+# The rows are the shared place. Both services load and cache this table; nobody has to vendor a
+# copy of the other's file, and `serving_eligible_off_taxonomy_path` can join against it directly
+# instead of against one repo's opinion.
+#
+# SHAPE. Three kinds of row, distinguished without a type column:
+#   canonical leaf   alias_of IS NULL, is_leaf = true    a path recall builds a prefix for
+#   interior node    alias_of IS NULL, is_leaf = false    an ancestor; reachable only via #2122
+#   alias            alias_of IS NOT NULL                 a spelling that means another path
+#
+# The self-FK is what stops an alias pointing at nothing, which is exactly how the 117 orphan paths
+# came to exist. `alias_of` on a row whose target is itself an alias is refused by the CHECK below:
+# one hop only, so resolution cannot loop or need a recursive query on a hot path.
+#
+# ⚠️ IN THE MODEL, not only in db/migrations/221 — `web` deploys with SKIP_HEAVY_STARTUP_INIT and
+# never runs the migration directory, so `metadata.create_all` is what actually builds this on
+# production. See the note on checkout_preflight_observations.created_at above.
+category_taxonomy = Table(
+    "category_taxonomy",
+    metadata,
+    Column("path", String(255), primary_key=True),
+    Column("label", String(128), nullable=False),
+    Column("is_leaf", Boolean, nullable=False, server_default=text("false")),
+    # Self-referential: the canonical path this spelling resolves to. NULL means "this IS canonical".
+    Column("alias_of", String(255), ForeignKey("category_taxonomy.path"), nullable=True),
+    # Free text, because the reason a path was chosen is the part that gets lost. The toner row
+    # carries the Google/Shopify citation; without it the next person re-litigates it.
+    Column("note", Text, nullable=True),
+    Column("updated_at", DateTime(timezone=True), server_default=func.now(), nullable=False),
+    CheckConstraint(
+        "alias_of IS NULL OR is_leaf = false",
+        name="ck_category_taxonomy_alias_is_not_a_leaf",
+    ),
+    CheckConstraint(
+        "alias_of IS NULL OR alias_of <> path",
+        name="ck_category_taxonomy_alias_not_self",
+    ),
+    extend_existing=True,
 )

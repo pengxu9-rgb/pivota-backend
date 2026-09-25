@@ -7,6 +7,8 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
+from services import market_telemetry
+
 
 _EXTERNAL_SEED_QUERY_STOPWORDS = {
     "a",
@@ -413,6 +415,9 @@ async def fetch_external_seed_rows(
     if only_unattached:
         where.append("attached_product_key IS NULL")
     normalized_market = str(market or "").strip().upper()
+    # The value that decides the partition, recorded where it decides it -- every seed bind on the
+    # shop door goes through here, whichever lane made it (services/market_telemetry.py).
+    market_telemetry.record_seed_bind(normalized_market)
     if normalized_market:
         where.append("market = :market")
         values["market"] = normalized_market

@@ -98,6 +98,9 @@ async def _fetch_click_rows(
         FROM surface_click_events
         WHERE COALESCE(first_click_at, first_impression_at, created_at) >= :start_at
           AND COALESCE(first_click_at, first_impression_at, created_at) < :end_at
+          -- Exposure = a row /r touched. Since ADR-025 D1 a row also exists for a link that was
+          -- only ISSUED (click_count = impression_count = 0), which nobody saw.
+          AND (COALESCE(click_count, 0) > 0 OR COALESCE(impression_count, 0) > 0)
     """
     params: Dict[str, Any] = {"start_at": start_at, "end_at": end_at}
     if merchant_id:

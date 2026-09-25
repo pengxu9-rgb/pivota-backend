@@ -26,6 +26,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import Column, DateTime, JSON, String, Table
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.sql import func
 
 from db.database import IS_POSTGRES, database, metadata
@@ -41,9 +42,38 @@ product_evidence = Table(
     Column("merchant_id", String(100), nullable=True, index=True),
     # ProductClaim[] (claim_safety shape). Nullable to avoid a JSONB default cast
     # divergence between Postgres and the SQLite test DB; the writers always set it.
-    Column("claims", JSON, nullable=True),
+    # `jsonb` on Postgres (migration 157), `JSON` on SQLite.
+    #
+    # 🚨 DO NOT COPY THIS TO ANOTHER TABLE WITHOUT CHECKING WHO BUILDS IT.
+    # "A migration declares it JSONB" is NOT sufficient grounds. main.py runs
+    # `metadata.create_all(engine)` (1857) BEFORE `run_sql_migrations(engine)`
+    # (1880), so for any table registered in `metadata` the MODEL builds
+    # production and the migration's `CREATE TABLE IF NOT EXISTS` is a dead
+    # no-op. No migration anywhere converts a column type. So the real question
+    # is whether the table is in `metadata` at startup:
+    #
+    #   in metadata  -> create_all wins  -> prod is whatever the model says
+    #   absent       -> the migration wins -> prod is what the DDL says
+    #
+    # `product_evidence` and `evidence_artifact` are in the second group: nothing
+    # imports them during startup registration, so migration 157 genuinely built
+    # them and production really is jsonb. Their siblings are NOT — `orders`,
+    # `product_enrichment`, `amazon_feeds`, `connector_credentials`,
+    # `platform_orders` and `product_quality_backfill_jobs` all carry JSONB in
+    # their DDL and are all `json` in production, which is why
+    # scripts/recon_sentinel_orphans.py and routes/buyer_api.py cast defensively
+    # around them. Declaring those jsonb here would not fix anything; it would
+    # only teach the dialect gate to plan jsonb-only operators that then fail in
+    # production.
+    #
+    # What this one buys: `services/merchant_audit_readiness.py`'s
+    # `claims @> '[...]'` uses a jsonb-only operator. Against a create_all-built
+    # database that raised UndefinedFunctionError, which the gate's _FIXTURE_GAP
+    # set classifies as a fixture hole -- so the gate never checked it, while the
+    # caller's `except Exception: return 0` reported zero evidence.
+    Column("claims", JSON().with_variant(postgresql.JSONB, "postgresql"), nullable=True),
     Column("review_state", String(32), nullable=False, default="observed"),
-    Column("required_disclaimers", JSON, nullable=True),
+    Column("required_disclaimers", JSON().with_variant(postgresql.JSONB, "postgresql"), nullable=True),
     Column("created_at", DateTime, server_default=func.now()),
     Column("updated_at", DateTime, server_default=func.now(), onupdate=func.now()),
     extend_existing=True,
@@ -59,7 +89,7 @@ evidence_artifact = Table(
     Column("source", String(32), nullable=False),     # merchant_upload|web_crawl
     Column("url_or_blob_ref", String(2000), nullable=True),
     Column("captured_at", DateTime, server_default=func.now()),
-    Column("extracted_claim_keys", JSON, nullable=True),
+    Column("extracted_claim_keys", JSON().with_variant(postgresql.JSONB, "postgresql"), nullable=True),
     extend_existing=True,
 )
 

@@ -117,11 +117,22 @@ def test_dedupe_never_groups_empty_titles():
 
 
 class _FakeDB:
+    """Records EVERY accessor. Recording `execute` alone made this fake blind the
+    day the mirror suppression became `RETURNING product_key` — the assertion
+    below counted zero catalog_products statements while the real writer was
+    issuing one, and the offer cascade that now follows it was invisible."""
+
     def __init__(self):
         self.calls = []
 
     async def execute(self, sql, params=None):
         self.calls.append((sql, params or {}))
+
+    async def fetch_all(self, sql, params=None):
+        self.calls.append((sql, params or {}))
+        if "RETURNING" in str(sql).upper():
+            return [{"product_key": "prod::dropped", "offer_id": "offer::dropped"}]
+        return []
 
 
 async def test_suppress_dropped_deactivates_seed_and_mirror(monkeypatch):
@@ -137,6 +148,13 @@ async def test_suppress_dropped_deactivates_seed_and_mirror(monkeypatch):
     seed_calls = [c for c in db.calls if "external_product_seeds" in c[0]]
     mirror_calls = [c for c in db.calls if "catalog_products" in c[0]]
     assert len(seed_calls) == 2 and len(mirror_calls) == 2
+    # AND the offers. Suppressing the mirror row alone leaves the dropped
+    # listing's offer live — catalog_offers has its own suppressed_at, and that
+    # is the column every offer-grain read lane filters on.
+    offer_calls = [c for c in db.calls if "catalog_offers" in c[0]]
+    assert len(offer_calls) == 2
+    assert all("suppression_reason" in c[0] and "suppressed_at" in c[0]
+               for c in offer_calls)
 
     # seed deactivation targets the deterministic seed id, guarded on active
     assert seed_calls[0][1]["id"] == "external_brand_crawl::jumiso_us_9000000000001"

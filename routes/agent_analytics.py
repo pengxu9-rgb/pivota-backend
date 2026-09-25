@@ -6,7 +6,7 @@ from fastapi import APIRouter, Header, HTTPException, Query
 from typing import Dict, Any, Optional
 from datetime import datetime, timedelta
 from db.database import database
-from db.agents import resolve_agent_id_by_api_key
+from db.agents import resolve_active_agent_id, resolve_agent_id_by_api_key
 from utils.auth import decode_token
 
 router = APIRouter(prefix="/agent/v1", tags=["agent-analytics"])
@@ -22,7 +22,7 @@ async def resolve_agent_id(
     if authorization and authorization.startswith("Bearer "):
         try:
             payload = decode_token(authorization.split(" ")[1])
-            agent_id = payload.get("agent_id")
+            agent_id = await resolve_active_agent_id(payload.get("agent_id"))
         except:
             pass
     

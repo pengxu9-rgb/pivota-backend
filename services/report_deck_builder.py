@@ -83,6 +83,7 @@ def _as_list(value: Any) -> List[Any]:
 
 async def generate_executive_summary(
     summary: Mapping[str, Any],
+    *, measured: bool = False,
 ) -> Optional[Tuple[List[str], int, int]]:
     """LLM executive-summary bullets grounded ONLY in the contract JSON.
 
@@ -125,6 +126,16 @@ async def generate_executive_summary(
         ],
         "competitive_snapshot": _as_dict(summary.get("competitive_snapshot")),
     }
+    if measured:
+        from services.merchant_measured_generation import generate_measured_text
+        result, receipt = await generate_measured_text(
+            system_prompt=_EXEC_SUMMARY_SYSTEM + ' Return JSON {"answer":"bullet lines separated by newlines"}.',
+            user_message=json.dumps(grounding, ensure_ascii=False),
+        )
+        bullets = [line.strip().lstrip("-•*").strip() for line in result["answer"].splitlines() if line.strip()][:4]
+        if not bullets:
+            raise ValueError("No executive summary produced")
+        return {"bullets": bullets}, receipt
     payload = {
         "model": settings.deepseek_model,
         "messages": [
@@ -263,6 +274,10 @@ def build_report_deck(
         fill = slide.background.fill
         fill.solid()
         fill.fore_color.rgb = rgb(bg)
+        text_box(slide, 0.9, 7.1, 11.5, 0.25, [(
+            "Diagnostic record: product identity, excerpts and recommendations are unverified; not consumer answer measurement.",
+            9, False, _ICE if bg == _NAVY else _MUTED, 0,
+        )])
         return slide
 
     def text_box(

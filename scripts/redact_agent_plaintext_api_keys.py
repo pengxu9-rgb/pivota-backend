@@ -14,7 +14,17 @@ Dry-run by default; pass --apply to write. Prints one line per agent, never the 
 Requires the `api_keys` table (the default auth path). Refuses to run if it is missing,
 because legacy deployments authenticate against agents.api_key itself.
 
-Run in-cluster (railway ssh / run) — the prod DB is not reachable from a laptop.
+Run inside production — the prod DB is not reachable from a laptop. Production is
+Cloud Run (pivota-prod/us-west1); `railway ssh`/`railway run` have no equivalent
+and would in any case target the ROLLBACK, leaving the plaintext keys in place on
+the platform actually serving traffic. Use a throwaway job on the production image:
+
+    scripts/ops/run_oneoff_job.sh -m scripts.redact_agent_plaintext_api_keys           # dry run
+    scripts/ops/run_oneoff_job.sh -m scripts.redact_agent_plaintext_api_keys --apply   # writes
+
+The helper mounts the DATABASE_URL secret (a job inherits NO env and NO secrets)
+and takes its verdict from the job's EXIT CODE. Full pattern and footguns:
+docs/runbooks/operating_on_gcp_production.md.
 """
 
 from __future__ import annotations

@@ -64,15 +64,23 @@ async def test_stripe_webhook_psp_path_uses_merchant_specific_secret(
     import routes.webhook_routes as webhook_routes_module
 
     used_secrets: list[str] = []
+    owner_lookups: list[str] = []
 
     async def fake_fetch_one(query: str, values: Dict[str, Any]) -> Any:
-        if "FROM merchant_psps" in query:
+        # `merchant_psps` is read TWICE on a psp path — once for the endpoint
+        # secret (provider_config) and once for the cross-tenant guard's owner
+        # (merchant_id). Answering both with the secret row left the guard
+        # unarmed here, so model the real table and discriminate.
+        if "FROM merchant_psps" in query and "provider_config" in query:
             assert values["psp_id"] == "psp_stripe_live_123"
             return {
                 "provider_config": {
                     "webhook_endpoint_secret": "whsec_merchant_specific",
                 }
             }
+        if "FROM merchant_psps" in query and "merchant_id" in query:
+            owner_lookups.append(values["psp_id"])
+            return {"merchant_id": "m_psp_path_owner"}
         if values.get("payment_intent_id") == "pi_psp_path_secret":
             return None
         raise AssertionError(f"Unexpected query: {query}")
@@ -108,6 +116,7 @@ async def test_stripe_webhook_psp_path_uses_merchant_specific_secret(
     assert resp.status_code == 200
     assert resp.json() == {"status": "success", "event": "payment_intent.payment_failed"}
     assert used_secrets == ["whsec_merchant_specific"]
+    assert owner_lookups == ["psp_stripe_live_123"]
 
 
 @pytest.mark.asyncio
@@ -462,6 +471,8 @@ async def test_stripe_webhook_payment_intent_succeeded_marks_paid_and_creates_sh
     evidence_calls: list[tuple[str, str]] = []
     order_events: list[Dict[str, Any]] = []
     shopify_calls: list[str] = []
+    enqueued: list[Dict[str, Any]] = []
+    store_platform = {"value": "shopify"}
     merchant_webhook_calls: list[Dict[str, Any]] = []
 
     event = _stripe_event(
@@ -498,9 +509,9 @@ async def test_stripe_webhook_payment_intent_succeeded_marks_paid_and_creates_sh
     async def fake_create_order_snapshot_evidence_pack(order_id: str, triggered_by: str) -> None:
         evidence_calls.append((order_id, triggered_by))
 
-    async def fake_get_primary_store(merchant_id: str) -> Dict[str, Any]:
-        assert merchant_id == "m_stripe"
-        return {"platform": "shopify"}
+    async def fake_enqueue(*, order_id, merchant_id):
+        enqueued.append({"order_id": order_id, "merchant_id": merchant_id})
+        return "job-1"
 
     async def fake_get_merchant_onboarding(merchant_id: str) -> Dict[str, Any]:
         assert merchant_id == "m_stripe"
@@ -546,7 +557,17 @@ async def test_stripe_webhook_payment_intent_succeeded_marks_paid_and_creates_sh
         "create_order_snapshot_evidence_pack",
         fake_create_order_snapshot_evidence_pack,
     )
+    # The Stripe webhook no longer creates the merchant order inline (one
+    # attempt, failure swallowed, then a 200 that stopped Stripe retrying). It
+    # enqueues, and the worker makes the primary-store check.
+    async def fake_get_primary_store(merchant_id: str) -> Dict[str, Any]:
+        assert merchant_id == "m_stripe"
+        return {"platform": store_platform["value"]}
+
     monkeypatch.setattr(webhook_routes_module, "get_primary_store", fake_get_primary_store)
+    monkeypatch.setattr(
+        webhook_routes_module, "enqueue_merchant_order_create", fake_enqueue
+    )
     monkeypatch.setattr(
         merchant_onboarding_module,
         "get_merchant_onboarding",
@@ -571,7 +592,14 @@ async def test_stripe_webhook_payment_intent_succeeded_marks_paid_and_creates_sh
     assert resp.json() == {"status": "success", "event": "payment_intent.succeeded"}
     assert paid_calls == ["ORD_STRIPE_SUCCESS"]
     assert evidence_calls == [("ORD_STRIPE_SUCCESS", "stripe_webhook")]
-    assert shopify_calls == ["ORD_STRIPE_SUCCESS"]
+    # The merchant-order create is now DURABLE rather than an inline attempt
+    # whose failure was swallowed before a 200 that stopped Stripe retrying.
+    # The store guard stays at this call site.
+    assert shopify_calls == []
+    assert enqueued == [{
+        "order_id": "ORD_STRIPE_SUCCESS",
+        "merchant_id": "m_stripe",
+    }]
     assert len(order_events) == 1
     assert order_events[0]["event_type"] == "payment_confirmed_webhook"
     assert order_events[0]["order_id"] == "ORD_STRIPE_SUCCESS"
@@ -597,6 +625,173 @@ async def test_stripe_webhook_payment_intent_succeeded_marks_paid_and_creates_sh
         }
     ]
 
+
+@pytest.mark.asyncio
+async def test_stripe_webhook_does_not_enqueue_for_a_non_shopify_primary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import db.database as database_module
+    import routes.merchant_onboarding_routes as merchant_onboarding_module
+    import routes.order_routes as order_routes_module
+    import routes.webhook_routes as webhook_routes_module
+
+    paid_calls: list[str] = []
+    evidence_calls: list[tuple[str, str]] = []
+    order_events: list[Dict[str, Any]] = []
+    shopify_calls: list[str] = []
+    enqueued: list[Dict[str, Any]] = []
+    store_platform = {"value": "woocommerce"}
+    merchant_webhook_calls: list[Dict[str, Any]] = []
+
+    event = _stripe_event(
+        "payment_intent.succeeded",
+        {
+            "id": "pi_success_contract",
+            "amount": 4520,
+            "currency": "usd",
+        },
+    )
+
+    async def fake_fetch_one(query: str, values: Dict[str, Any]) -> Dict[str, Any] | None:
+        assert values["payment_intent_id"] == "pi_success_contract"
+        return {
+            "order_id": "ORD_STRIPE_SUCCESS",
+            "merchant_id": "m_stripe",
+            "payment_intent_id": "pi_success_contract",
+            # The signed event's amount (4520 minor) must match the order total
+            # for the integrity guard to finalize. usd factor=100 → 45.20.
+            "total": "45.20",
+            "currency": "usd",
+        }
+
+    async def fake_mark_order_paid(order_id: str) -> bool:
+        # mark_order_paid is now an atomic conditional transition returning True
+        # only when THIS call flipped the order to paid. The finalizer gates its
+        # one-time side effects (order event, shopify, merchant webhook) on it.
+        paid_calls.append(order_id)
+        return True
+
+    async def fake_log_order_event(**kwargs: Any) -> None:
+        order_events.append(kwargs)
+
+    async def fake_create_order_snapshot_evidence_pack(order_id: str, triggered_by: str) -> None:
+        evidence_calls.append((order_id, triggered_by))
+
+    async def fake_enqueue(*, order_id, merchant_id):
+        enqueued.append({"order_id": order_id, "merchant_id": merchant_id})
+        return "job-1"
+
+    async def fake_get_merchant_onboarding(merchant_id: str) -> Dict[str, Any]:
+        assert merchant_id == "m_stripe"
+        return {"merchant_id": merchant_id, "status": "active"}
+
+    async def fake_create_shopify_order(order_id: str) -> bool:
+        shopify_calls.append(order_id)
+        return True
+
+    async def fake_emit_merchant_webhook_event(
+        merchant_id: str,
+        *,
+        event_type: str,
+        payload: Dict[str, Any],
+        request_id: str | None = None,
+        force_delivery: bool = False,
+    ) -> Dict[str, Any]:
+        merchant_webhook_calls.append(
+            {
+                "merchant_id": merchant_id,
+                "event_type": event_type,
+                "payload": dict(payload),
+                "request_id": request_id,
+                "force_delivery": force_delivery,
+            }
+        )
+        return {"status": "delivered"}
+
+    def fake_construct_event(payload: bytes, signature: str | None, secret: str) -> Dict[str, Any]:
+        return event
+
+    monkeypatch.setattr(webhook_routes_module.settings, "stripe_webhook_secret", "whsec_test", raising=False)
+    monkeypatch.setattr(
+        webhook_routes_module.stripe.Webhook,
+        "construct_event",
+        staticmethod(fake_construct_event),
+    )
+    monkeypatch.setattr(database_module.database, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(webhook_routes_module, "mark_order_paid", fake_mark_order_paid)
+    monkeypatch.setattr(webhook_routes_module, "log_order_event", fake_log_order_event)
+    monkeypatch.setattr(
+        webhook_routes_module,
+        "create_order_snapshot_evidence_pack",
+        fake_create_order_snapshot_evidence_pack,
+    )
+    # The Stripe webhook no longer creates the merchant order inline (one
+    # attempt, failure swallowed, then a 200 that stopped Stripe retrying). It
+    # enqueues, and the worker makes the primary-store check.
+    async def fake_get_primary_store(merchant_id: str) -> Dict[str, Any]:
+        assert merchant_id == "m_stripe"
+        return {"platform": store_platform["value"]}
+
+    monkeypatch.setattr(webhook_routes_module, "get_primary_store", fake_get_primary_store)
+    monkeypatch.setattr(
+        webhook_routes_module, "enqueue_merchant_order_create", fake_enqueue
+    )
+    monkeypatch.setattr(
+        merchant_onboarding_module,
+        "get_merchant_onboarding",
+        fake_get_merchant_onboarding,
+    )
+    monkeypatch.setattr(order_routes_module, "create_shopify_order", fake_create_shopify_order)
+    monkeypatch.setattr(
+        webhook_routes_module,
+        "emit_merchant_webhook_event",
+        fake_emit_merchant_webhook_event,
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/webhooks/stripe",
+            content=b'{"id":"evt_success"}',
+            headers={"stripe-signature": "sig_success"},
+        )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "success", "event": "payment_intent.succeeded"}
+    assert paid_calls == ["ORD_STRIPE_SUCCESS"]
+    assert evidence_calls == [("ORD_STRIPE_SUCCESS", "stripe_webhook")]
+    # The merchant-order create is now DURABLE rather than an inline attempt
+    # whose failure was swallowed before a 200 that stopped Stripe retrying.
+    # The store guard stays at this call site.
+    # This path has only ever created merchant orders for a Shopify PRIMARY
+    # store, even though the sync it calls also dispatches WooCommerce,
+    # BigCommerce and Wix. Enqueuing regardless would silently widen it.
+    assert shopify_calls == []
+    assert enqueued == [], "a non-Shopify primary store must not be enqueued"
+    assert len(order_events) == 1
+    assert order_events[0]["event_type"] == "payment_confirmed_webhook"
+    assert order_events[0]["order_id"] == "ORD_STRIPE_SUCCESS"
+    assert order_events[0]["merchant_id"] == "m_stripe"
+    assert order_events[0]["metadata"]["payment_intent_id"] == "pi_success_contract"
+    assert merchant_webhook_calls == [
+        {
+            "merchant_id": "m_stripe",
+            "event_type": "payment.completed",
+            "payload": {
+                "order_id": "ORD_STRIPE_SUCCESS",
+                "merchant_id": "m_stripe",
+                "payment_id": "pi_success_contract",
+                "transaction_id": "pi_success_contract",
+                "amount": 45.2,
+                "currency": "usd",
+                "psp_used": "stripe",
+                "status": "paid",
+                "customer_email": None,
+            },
+            "request_id": None,
+            "force_delivery": False,
+        }
+    ]
 
 @pytest.mark.asyncio
 async def test_stripe_webhook_payment_intent_succeeded_falls_back_to_order_metadata_for_canary(
@@ -681,7 +876,7 @@ async def test_stripe_webhook_payment_intent_succeeded_falls_back_to_order_metad
         "create_order_snapshot_evidence_pack",
         fake_create_order_snapshot_evidence_pack,
     )
-    monkeypatch.setattr(webhook_routes_module, "get_primary_store", fail_if_called)
+    monkeypatch.setattr(webhook_routes_module, "enqueue_merchant_order_create", fail_if_called)
     monkeypatch.setattr(merchant_onboarding_module, "get_merchant_onboarding", fail_if_called)
     monkeypatch.setattr(order_routes_module, "create_shopify_order", fail_if_called)
 
@@ -756,7 +951,7 @@ async def test_stripe_webhook_payment_intent_succeeded_does_not_restore_paid_aft
     monkeypatch.setattr(webhook_routes_module, "mark_order_paid", fail_if_called)
     monkeypatch.setattr(webhook_routes_module, "log_order_event", fail_if_called)
     monkeypatch.setattr(webhook_routes_module, "create_order_snapshot_evidence_pack", fail_if_called)
-    monkeypatch.setattr(webhook_routes_module, "get_primary_store", fail_if_called)
+    monkeypatch.setattr(webhook_routes_module, "enqueue_merchant_order_create", fail_if_called)
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -942,8 +1137,11 @@ async def test_stripe_webhook_charge_refunded_reconciles_partial_refund(
     async def fake_log_order_event(**kwargs: Any) -> None:
         order_events.append(kwargs)
 
-    async def fake_attach_refund_to_attribution_edge(**kwargs: Any) -> None:
+    async def fake_apply_refund_total_to_attribution_edge(**kwargs: Any) -> None:
         attribution_calls.append(kwargs)
+
+    async def fail_additive_attach(**kwargs: Any) -> None:
+        raise AssertionError("a Stripe refund must not add to the edge per refund id")
 
     def fake_construct_event(payload: bytes, signature: str | None, secret: str) -> Dict[str, Any]:
         return event
@@ -958,7 +1156,12 @@ async def test_stripe_webhook_charge_refunded_reconciles_partial_refund(
     monkeypatch.setattr(database_module.database, "fetch_one", fake_fetch_one)
     monkeypatch.setattr(webhook_routes_module, "update_order_status", fake_update_order_status)
     monkeypatch.setattr(webhook_routes_module, "log_order_event", fake_log_order_event)
-    monkeypatch.setattr(attribution_module, "attach_refund_to_attribution_edge", fake_attach_refund_to_attribution_edge)
+    monkeypatch.setattr(
+        attribution_module,
+        "apply_refund_total_to_attribution_edge",
+        fake_apply_refund_total_to_attribution_edge,
+    )
+    monkeypatch.setattr(attribution_module, "attach_refund_to_attribution_edge", fail_additive_attach)
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -979,15 +1182,15 @@ async def test_stripe_webhook_charge_refunded_reconciles_partial_refund(
     assert order_events[0]["event_type"] == "refund_processed_webhook"
     assert order_events[0]["metadata"]["charge_id"] == "ch_refund_contract"
     assert order_events[0]["metadata"]["refund_amount"] == 1200
-    # MAJOR units. attach_refund_to_attribution_edge does `amount * 100`, so
-    # the 1200 this used to assert was a 100x refund. It was never caught
-    # because the statement it feeds could not PREPARE and so never ran — the
-    # assertion pinned the call shape, not a verified behaviour.
+    # MAJOR units, and the ORDER's reconciled total rather than the event's
+    # amount: the edge takes it as a ceiling, so the matching refund.updated
+    # (re_) cannot add the same $12 again. The edge arithmetic itself is
+    # measured on Postgres in tests/test_stripe_refund_attribution_edge_postgres.py.
     assert attribution_calls == [
         {
             "order_id": "ORD_STRIPE_REFUND",
             "refund_id": "ch_refund_contract",
-            "amount": Decimal("12"),
+            "total_refunded": Decimal("12"),
         }
     ]
 
@@ -1045,6 +1248,9 @@ async def test_stripe_webhook_charge_refunded_skips_attribution_when_disabled(
     monkeypatch.setattr(webhook_routes_module, "update_order_status", fake_update_order_status)
     monkeypatch.setattr(webhook_routes_module, "log_order_event", fake_log_order_event)
     monkeypatch.setattr(attribution_module, "attach_refund_to_attribution_edge", fail_attach_refund_to_attribution_edge)
+    monkeypatch.setattr(
+        attribution_module, "apply_refund_total_to_attribution_edge", fail_attach_refund_to_attribution_edge
+    )
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -1588,8 +1794,11 @@ async def test_stripe_webhook_dispute_event_upserts_record_without_mutating_orde
     async def fake_create_dispute_evidence_pack(**kwargs: Any) -> None:
         evidence_pack_calls.append(kwargs)
 
-    async def fake_attach_refund_to_attribution_edge(**kwargs: Any) -> None:
+    async def fake_attach_dispute_to_attribution_edge(**kwargs: Any) -> None:
         attribution_calls.append(kwargs)
+
+    async def fail_refund_writer(**kwargs: Any) -> None:
+        raise AssertionError("a chargeback must stay out of the refund writers")
 
     async def fake_log_order_event(**kwargs: Any) -> None:
         order_events.append(kwargs)
@@ -1613,7 +1822,11 @@ async def test_stripe_webhook_dispute_event_upserts_record_without_mutating_orde
         fake_upsert_stripe_dispute_record_best_effort,
     )
     monkeypatch.setattr(pcs_module, "create_dispute_evidence_pack", fake_create_dispute_evidence_pack)
-    monkeypatch.setattr(attribution_module, "attach_refund_to_attribution_edge", fake_attach_refund_to_attribution_edge)
+    monkeypatch.setattr(
+        attribution_module, "attach_dispute_to_attribution_edge", fake_attach_dispute_to_attribution_edge
+    )
+    monkeypatch.setattr(attribution_module, "attach_refund_to_attribution_edge", fail_refund_writer)
+    monkeypatch.setattr(attribution_module, "apply_refund_total_to_attribution_edge", fail_refund_writer)
     monkeypatch.setattr(webhook_routes_module, "mark_order_paid", fail_if_called)
     monkeypatch.setattr(webhook_routes_module, "update_order_status", fail_if_called)
     monkeypatch.setattr(webhook_routes_module, "log_order_event", fake_log_order_event)
@@ -1657,7 +1870,7 @@ async def test_stripe_webhook_dispute_event_upserts_record_without_mutating_orde
     assert attribution_calls == [
         {
             "order_id": "ORD_STRIPE_DISPUTE",
-            "refund_id": "dp_contract_1",
+            "dispute_id": "dp_contract_1",
             "amount": Decimal("15"),
         }
     ]

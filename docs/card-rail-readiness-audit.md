@@ -53,8 +53,8 @@ Effort: **S** ≤ 1 week · **M** 2–4 weeks · **L** > 4 weeks (one engineer).
 | **B3. Bot-management vendor** | **Does not exist.** No vendor detection anywhere. `external_offer_snapshots.evidence` stores only `{provider, fetchedAt, snapshotId, description, variants, image_urls}` — **no HTTP status, no response headers, no CDN identity**. Nothing is derivable without new probing. | Per-domain vendor + current block state | **Measured live: 90/90 cohort domains and 69/70 top index domains are Cloudflare-fronted; 1 is Akamai.** More important than the label: **~50 requests spread over 37 Cloudflare domains in about one minute tripped a *cross-domain* IP-level 429 that persisted ~15 minutes** — including on domains that had answered 200 moments earlier. A naive verification hop from one egress IP will throttle itself out of service — **and on GCP that one egress IP is the partner-allowlisted payment address** (§3.2). | S (probe) / M (egress isolation) | **Yes** |
 | **B4. Guest checkout** | **Does not exist**, and is **not derivable without executing a checkout** — Shopify exposes no public signal for it. | Known per domain | Only two honest paths: (a) resolve it via UCP `create_checkout` (which succeeds or fails on the merchant's real rules), or (b) accept it as unknown and let the outcome graph learn it. Recommend (a). | S via UCP | No |
 | **B5. Checkout field inventory / field-name map** | **Does not exist.** | A fill map per domain | Only needed if Key Entry is the pilot mode. **If the pilot uses the UCP lane instead, this whole row disappears** — the merchant prices and collects. Flagged per the brief: this is the single row where Key Entry vs API-based changes the answer most. | L (Key Entry) / — (UCP) | Only under Key Entry |
-| **B6. Promo/coupon field presence** | `services/promo_terms.py` + `catalog_payment_incentives` (incl. `card_network`, `issuer_name`, `wallet_type` — a card-network-aware incentive model, unexpectedly relevant here). No per-domain coupon-field detection. | Codes + application order | UCP advertises `dev.ucp.shopping.discount` as a first-class capability on 66/70 domains — apply codes through the protocol, don't scrape a field. | S via UCP | No |
-| **B7. Shipping + tax computable pre-checkout** | **Does not exist for crawled merchants.** A real landed-price engine *does* exist (`services/shopify_pricing_service.py` → `subtotal / discount_total / shipping_fee / tax / total` + `discount_evidence`), but it calls `POST /admin/api/{v}/checkouts.json` with `resolve_shopify_admin_access_token` — i.e. **it requires the merchant's OAuth token** and returns `"Shopify credentials missing"` for every crawled domain. | Landed total before handoff | The capability exists but is bound to the wrong precondition. **UCP `create_checkout` returns the same numbers anonymously** — and `dev.ucp.shopping.fulfillment` is advertised on 66/70 domains. Re-point, don't rebuild. | M | **Yes** |
+| **B6. Promo/coupon field presence** | `services/promo_terms.py` + `catalog_payment_incentives` (incl. `card_network`, `issuer_name`, `wallet_type` — a card-network-aware incentive model, unexpectedly relevant here). No per-domain coupon-field detection. | Codes + application order | ~~UCP advertises `dev.ucp.shopping.discount` as a first-class capability on 66/70 domains — apply codes through the protocol, don't scrape a field.~~ **CORRECTED 2026-08-26 — this row was wrong twice over, in the same shape as B7.** (a) The `services/promo_terms.py` citation is a FALSE POSITIVE: that module is a denylist of marketing *words* (`"sale"`, `"coupon"`, `"20% off"`) used to keep promo noise out of generated query axes and the SKU attribute graph. It stores no codes and never has. `catalog_payment_incentives` has no code column either — it models card/wallet-linked benefits (`card_network`, `issuer_name`, `wallet_type`) applied at PAYMENT, which need no code. **No LIVE table holds a discount code.** (Precisely: `catalog_promotions.code VARCHAR(128)` did exist in `db/migrations/058_catalog_core.sql:169`, alongside a `method` column defaulting to `'automatic'` — Shopify's automatic-vs-code distinction. `db/migrations/125_drop_promotions_tables.sql` **dropped it** under ADR-022, recording that prod held 17 rows, all Shopify-synced test fixtures for one merchant, with no readers. So the inventory is gone by decision, not absent by oversight — and reviving it is an ADR-022 reversal, not a new column.) (b) "Apply codes through the protocol" is right about the vehicle and wrong about what it buys: UCP APPLIES codes you already hold, it cannot DISCOVER them — the merchant's own schema says *"Only prompt if customer mentions having a discount code."* Advertising the capability does not mean the merchant will tell you what its codes are, exactly as advertising `dev.ucp.shopping.fulfillment` did not mean a quote comes back before an address. | S via UCP | No |
+| **B7. Shipping + tax computable pre-checkout** | **Does not exist for crawled merchants.** A real landed-price engine *does* exist (`services/shopify_pricing_service.py` → `subtotal / discount_total / shipping_fee / tax / total` + `discount_evidence`), but it calls `POST /admin/api/{v}/checkouts.json` with `resolve_shopify_admin_access_token` — i.e. **it requires the merchant's OAuth token** and returns `"Shopify credentials missing"` for every crawled domain. | Landed total before handoff | ~~The capability exists but is bound to the wrong precondition. **UCP `create_checkout` returns the same numbers anonymously**~~ — **CORRECTED 2026-08-26, and this was the load-bearing error in this row.** UCP `create_checkout` does **NOT** return shipping or tax. The live schema has no `shipping_address` field: Shopify collects the delivery address on the **storefront**, so quotes are not produced at this step at all (`PIVOTA-Agent/src/services/ucpBuyerAgentClient.js:1017,1253`, live-verified against cosrx 2026-07-13). On the real path `total === subtotal`, `shipping_options` is `[]`, `tax` is `null`, and the checkout returns `requires_escalation` **every time**. `dev.ucp.shopping.fulfillment` being advertised says the capability exists; it does not mean a quote is returned before an address. **A landed total is therefore NOT obtainable anonymously before the buyer supplies an address** — not from UCP, and not from the storefront `.js` endpoint either. What UCP *does* give, and `.js` does not, is a merchant-asserted **pre-shipping subtotal that names its currency** (in MINOR units). That is worth having — it is what unlocks the price verification item 6 had to defer — but it is not the thing this row promised. | M | **Yes** |
 | **B8. TAP support signals** | **Does not exist**, and the repo says so plainly: `docs/TARGET_ARCHITECTURE.md` — "x402 / Visa TAP / Mastercard Agent Pay: **Not implemented anywhere.** No placeholder code pretends otherwise." | Detect + record | But the adjacent signal is live and strong: `/.well-known/ucp` on **66/70 (94.3%)** of top index domains, all advertising `checkout`, `cart`, `discount`, `fulfillment`, `order`, `catalog.search`, `catalog.lookup` over `https://{shop}.myshopify.com/api/ucp/mcp`. Store the profile + capability set per domain. | S | No |
 | **B9. Cart-prefill URL** | **Exists and is production-proven.** `services/outbound_links_service.py` builds `https://{host}/cart/{numeric_variant}:{qty}` with `attributes[pivota_click_id]` (survives into Shopify `note_attributes`). Separately the **warm-handoff lane** (`services/outbound_warm_handoff.py` + gateway `src/services/ucpWarmHandoff.js`) turns a crawled product into a **pre-built cart on the brand's own checkout** via anonymous UCP `create_cart`, returning `continue_url`. **`OUTBOUND_WARM_HANDOFF_ENABLED=true` in prod**, allowlisted to `cosrx.com, beautyofjoseon.com, skin1004.com, anua.us, medicube.us, mixsoon.us`. | Cart-prefill for the pilot cohort | The mechanism works. The gap is **reach** (6 brands of ~200) and **the numeric variant id**, which we hold for only 28% of rows (A6). | S (widen allowlist) | No |
 | **B10. Derivable without re-crawling?** | **Almost nothing.** Stored artifacts carry no status, headers, or platform. | — | **Essentially 100% of B needs new probing.** Measured probe cost: 2 GETs/domain, ~1.3 s + ~1.6 s wall clock, plus 1 UCP well-known GET and 1 MCP `tools/list` POST (~0.5 s each). **≈4 requests and ~4 s per domain — but paced to ≤ ~1 req/s per egress IP** (see B3). ~200 domains ≈ 15 min single-threaded. Trivially cheap; the constraint is pacing, not compute. | S | — |
@@ -263,67 +263,194 @@ Cutover is **Sep 8–12**, soak **Sep 12–26**, first real charge late Septembe
 
 ## 4. Prioritized backlog
 
-> **Status reconciliation — re-measured 2026-08-24 against `origin/main` and against live GCP.**
+> **VERIFIED STATE — re-checked 2026-08-26 against `origin/main` @ `d5ae50cd`.**
+> Every line was confirmed by a POSITIVE check (the symbol exists, the flag's default reads,
+> the scheduler file contains the entry), never by the absence of a grep hit. The previous pass
+> was dated against `4459f88e` and had gone stale in both directions.
 >
-> **Correction to an earlier pass of this section:** it reported items 3a, 3 and 14 as "not
-> started" on the strength of a grep against `infra/gcp/setup_egress_nat.sh` and
-> `setup_scheduler.sh`. That was a scope error — the work landed in *new* files those greps
-> could not see (`setup_crawl_egress.sh`, `migrate_payment_nat_to_default_subnet.sh`,
-> `jobs/scheduled_ucp_reprobe_job.py`, `routes/store_audit_probe_internal.py`). The corrected
-> state is below. Where a row says "not started", it now means a positive check was run, not
-> that one filename lacked a match.
+> **7 complete · 3 built-but-dark · 2 partial · 1 closed-as-specified · 4 not done — 17 items, and the
+> buckets below must sum to 17.** (An earlier draft of this block summed to 16: item 3 had been
+> dropped silently, taking its findings with it. The denominator is stated so that cannot recur.)
 >
-> | Item | State | Evidence |
+> | | items | state |
 > |---|---|---|
-> | 3a — dedicated crawl egress | **DONE, provisioned and live in BOTH projects.** `pivota-crawl-nat` is `LIST_OF_SUBNETWORKS` on `pivota-crawl`, with reserved IPs `IN_USE`: staging `34.11.177.234`, prod `34.82.199.35`. The payment NAT was narrowed to `default` while retaining its address (staging `136.66.216.216`, prod `8.231.167.230`). Confirmed by the read-only guard `migrate_payment_nat_to_default_subnet.sh <env> --check` in both. The design also solves a constraint this audit missed: Cloud NAT permits only one `ALL_SUBNETWORKS_ALL_IP_RANGES` NAT per VPC/region, so the crawl script hard-fails until the payment NAT is narrowed first. | live `gcloud`, 2026-08-24 |
-> | 3 — per-domain UCP probe + stored profile | **built, shipped inert.** Isolated probe lane with its own least-privilege identity, migration 196 (`store_audit_execution_routes`), receipt endpoint closed unless `STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED` **and** a dedicated key are both set. Triggers created `PAUSED`. Not a stored capability table yet — it writes `execution_routes` + `acceptance_signal` evidence. | `routes/store_audit_probe_internal.py`, `docs/commerce-index-crawl-lane.md` |
-> | 14 — scheduled freshness / re-probe | **built, default-off selector.** `jobs/scheduled_ucp_reprobe_job.py` + `scripts/run_scheduled_ucp_reprobes.py`; `PAUSED=0` is deliberately *rejected* while Store Audit UCP is present, so arming it cannot resume unrelated Scheduler jobs. | same |
-> | 2 — refresh can correct a stale price | **shipped** | #1812 |
-> | 1 — `recommendation_id` | **half** — minted per item and per set (#2080), logged on lane outage (#2081). The accept-it-back half is item 10 and does not exist. | #2080, #2081 |
-> | 4 — numeric variant-id backfill | **in flight** — producer merged (#1813, #1820); 864 rows written. Cohort coverage **10.0%** (1,074 / 10,763 active rows whose URL contains `/products/`). | measured live |
-> | 5 — execution spec v0 | **shipped this pass.** `merchant_domain`, `pdp_url`, `cart_url`, `variant_id`, `rail`, `expires_at`, `tracking` now ride on every external offer, composed by the same function the redirect signs. `recommendation_id` is deliberately **not** in it: it is minted in the gateway's `recommend_products`, not at `offers.resolve`, and stamping a fabricated one would defeat the join it exists for. | this PR |
-> | 12 — attribution on the agent's own lane | **shipped this pass.** One click id now spans the signed token, `pdp_url` and `cart_url`. | this PR |
-> **Item 8 now covers every third-party crawl lane, not just the offers fetcher.** The reserved
-> crawl egress IP is shared, so a ban earned anywhere takes all of them down. All five remaining
-> merchant/web-crawling lanes now route through `services/crawl_politeness`:
+> | **Complete** | 1, 2, 3a, 5, 8, 10, 12 | `recommendation_id` mints and is accepted back (`routes/card_rail_outcomes.py`, mounted at `main.py:1322`); the refresh can correct a stale price; dedicated crawl egress live; every third-party crawl lane goes through the politeness gate; attribution rides the agent's own lane. **Item 5 is complete at its ORIGINAL scope only** — the backend composer still emits exactly the 7 fields the row specifies (`routes/agent_shop_gateway.py:4296`), and the gateway projects **11** top-level fields. An earlier draft claimed "7 → 14"; that counted `tracking`'s sub-keys on one side of the comparison and not the other, and it counted fields that do not populate — see the note under this table. |
+> | **Built, DARK** | 3, 6, 14 | **Item 3:** the UCP probe lane exists, but `store-audit-commerce-reprobe-enqueue-cron` reads **PAUSED** in prod with no staging counterpart. **Item 6:** `LIVE_OFFER_VERIFICATION_ENABLED` still defaults to `"false"`. **Item 14:** advanced a long way on 2026-08-26 — crawl-recency ordering with a separate attempt clock (#1884), a `stale_snapshot` gate the refresh can actually clear (#1890), batch pacing (#1898) — and `infra/gcp/setup_scheduler.sh` contains **no entry for `external_referral_refresh`** among the 12 jobs it provisions. ⚠️ *Inference, not a positive check:* "therefore nothing runs it" does not follow from one file, and **that same file records that jobs migrated in #1892/#1894/#1895 were provisioned BY HAND** because it could not be run. The positive check is `gcloud scheduler jobs list`, which was not available here. |
+> | **Partial** | 4, 7 | Variant coverage: **this document contradicts itself and the conflict is not resolved here.** A5/A6's census says **28.0%** (838/2,992, and "~72% … not a purchasable variant"), repeated at B9, at Wave-1 item 4, and in the provenance table. The status block has carried **60.5%** since a later backfill pass, sourced nowhere in either repo. Both are published; **treat 28.0% as the only figure with provenance** until a fresh count is run and recorded. Warm handoff is enabled in prod on the original **6** brands, not the Tier-1 cohort. |
+> | **Closed — NOT BUILDABLE *AS SPECIFIED*** | 11 | Promo codes. We hold no code inventory (`catalog_promotions.code` was dropped under ADR-022), and UCP applies codes but cannot discover them. The qualifier is load-bearing: the Wave-4 row records residual buildable work — a *request-contract* change letting a caller supply a code. See the note under Wave 4. |
+> | **Not done** | 9, 13, 15, 16 | Item 9's backend half was withdrawn, not shipped — `services/outbound_warm_handoff.py:**424**` still reads *"NO VARIANT HINT IS SENT, AND NONE CAN BE."* (The Wave-4 item-9 row cites `:457` for the same comment; **424 is the correct line** at `d5ae50cd`.) Item 13's `ranking_w_business` knob exists but is unset and unfed. |
 >
-> | lane | before | now |
-> |---|---|---|
-> | `services/brand_product_discovery.py` | robots asked about the site ROOT; no pacing | full-path robots (shared, cached) + pacing |
-> | `services/bd_cold_start_service.py` | inherited that root-only helper | same helper, now delegating |
-> | `services/co_occurrence_finder.py` | robots path-correct but UNCACHED (refetched per article) | shared cache + pacing |
-> | `services/curated_brand_feed.py` | none | both fetch sites gated |
-> | `services/executor_agents/sitemap_freshness.py` | none | sitemap + child indexes gated |
+> **What this means for the milestone.** The plumbing is done and the *correctness* work is not
+> switched on. §1 named index staleness as the real obstacle and A5 measured a **31.1%**
+> wrong-or-unexecutable spec rate; the two mechanisms that address it (item 6 live verification,
+> item 14 the freshness floor) are both dark. Arming either adds request-path or scheduled crawl
+> egress against third-party merchants, so it is a deliberate act — but until one of them runs,
+> nothing stops a wrong spec reaching a buyer.
 >
-> **Correction to the earlier version of this note**, which listed six lanes and described two of
-> them wrongly. It was built by grepping for robots/pacing without checking what each lane
-> actually fetches:
-> - `services/executor_agents/canonical_pdp_enrichment.py` is **not a crawl lane**. It POSTs to
->   Google's Vertex Gemini API (`vertex_gemini.generate_content_url`). Pacing a first-party API at
->   one request per second per host would be actively wrong, so it is deliberately excluded — and
->   a test now asserts that exclusion so nobody "fixes" it later.
-> - `co_occurrence_finder` was listed as root-only robots. It was in fact path-correct; its real
->   defect was the missing cache.
+> **THE HANDOFF MODEL DECIDES WHICH GAPS MATTER, and this audit had assumed the wrong one.**
+> Clarified 2026-08-26: Minds is an **orchestration layer** and Reap is the agent that **fills
+> shipping and card details on the merchant's own checkout page**. Pivota therefore does not need
+> to complete an order at all — it needs to hand over a prefilled, ready-to-checkout link plus a
+> spend cap. That reading changes the readiness verdict in both directions:
 >
-> Coverage is pinned by an EXACT per-lane gate count, because a presence check passes when a lane
-> with two fetch sites loses one of them — and even that only counts GATES, not FETCHES, which is
-> how an ungated fallback PDP fetch survived in an otherwise-covered file. Per-lane semantics
-> (which UA robots is asked about, bounded vs unbounded wait, whether `note_response` fires) are
-> asserted separately by driving each lane's real fetch function.
+> * **Better than recorded.** The whole `complete_checkout_session` / payment-authz analysis
+>   (`PAYMENT_ISSUERS_JSON` holding only a canary, `create_payment_link` having no `ucpTool`
+>   name) describes the **PSP rail, which this model does not use.** Those are not blockers here.
+>   What the model needs, Pivota already emits: `execution_spec.cart_url` is a Shopify cart
+>   permalink, and a live probe on 2026-08-26 confirmed it lands on a **real checkout, not a cart
+>   view**, while preserving `attributes[pivota_click_id]`. It takes **three** hops to get there
+>   (apex→www, then through **`shop.app`** carrying a Shop Pay token, then `…/checkouts/cn/<token>`),
+>   so a browser-driving agent traverses a third-party host on the way — measured on one host.
+>   Reap still lands where it needs to type.
+> * **Worse than recorded — A REAL ARCHITECTURAL GAP.** The card mint cannot serve that link.
+>   `CardIssueRequest` requires a **UCP `checkout_id`** and `resolve_merchant_quote` reads the
+>   total via `get_checkout` on the *merchant's own* UCP door. A cart permalink is a storefront
+>   URL and produces **no `checkout_id`**. But "two different worlds" would overstate it: the
+>   warm-handoff lane in `PIVOTA-Agent` already calls `create_checkout` on the merchant's own UCP
+>   door from the SAME variant identity the permalink is built from, and keeps the full response —
+>   the checkout id is simply never extracted. The gap is **a field extraction plus a flag**, not
+>   an architecture. See the execution-flow section below.
+> * **And the cap is derived wrongly for this model.** `routes/agent_cards.py:108` sets
+>   `amount_cap_minor = quote["total_minor"]` with the comment *"v1: cap == quote, exactly"*.
+>   B7 established that a pre-address UCP checkout returns `total === subtotal`, no shipping and
+>   `tax: null`. A card capped at exactly a pre-shipping subtotal is **declined at the moment
+>   Reap enters an address** — the one action this model exists to perform. Any cap for the
+>   storefront rail has to come from `expected_item_total` plus explicit shipping/tax headroom,
+>   because a landed total is not obtainable before an address.
 >
-> **Bounded vs unbounded wait is per-lane, and it matters.** Three of these lanes are reachable
-> from live authenticated routes (`POST /api/merchant-center/audit/url-readiness`,
-> `.../audit/ai-commerce-readiness`, `POST /api/agent-center/bd/cold-start-audit`), so they use
-> the bounded default — `max_wait=0` there would let a 300s backoff hold a real request open.
-> Only the two genuinely batch-only lanes (`curated_brand_feed`, `sitemap_freshness`) wait
-> unbounded.
+> **So the shortest path to a Minds→Reap transaction is not on the Wave-4 list at all:** derive
+> the cap from the execution spec with headroom, and accept a `cart_url` (or a
+> `recommendation_id`) where the mint currently demands a `checkout_id`.
+>
+> **One correction to an earlier finding.** The click-time warm-handoff interaction was recorded
+> as "latent, not live" because `OUTBOUND_WARM_HANDOFF_ENABLED` defaults to false. It reads
+> **true in prod** with the internal key set. A documented residual remains: widening the brand
+> allowlist invalidates `false` answers on tokens minted before the widening and still inside
+> their 7-day TTL. That matters for item 7.
 
-> | 8 — rate-limit + robots the fetcher | **shipped.** `services/crawl_politeness.py`: per-host pacing (`CRAWL_MIN_INTERVAL_SECONDS`, default 1/s), robots.txt obeyed on the FULL path with `Crawl-delay` honoured whenever it is slower than our floor, and exponential 429/503 backoff honouring `Retry-After` only ever to lengthen. `_fetch_html` is gated on it. Two things worth carrying: the wait is BOUNDED (`CrawlPaced`) because `POST /api/offers/external/resolve` has no auth dependency and is a live path — an unbounded stall there would be a new regression, not politeness; and the pre-existing `_robots_allows` (`services/brand_product_discovery.py:493`) asks about the site ROOT, so a `Disallow: /products/` never bit the paths it guards. That helper is UNCHANGED here and still has that defect. | this PR |
-> | 6 — live-verify top-3 | **not started.** Note the v2 index design partly supersedes the framing: public crawl carries authority 45 and "never auto-publishes checkout-sensitive facts", and checkout is specified to always live-validate. | `docs/commerce-index-v2.md` |
-> | 7, 10 (Wave 3) · 9, 11, 13, 15, 16 (Wave 4) | **not started** | verified by grep |
 
+### The Minds → Reap execution flow
 
-Ordered by (blocking × effort), then sequenced against the **Sep 8–12 cutover** (§3.4). The **Where** column is load-bearing: it is what keeps this work from being built twice.
+Recorded 2026-08-26 from a conversation with Reap (a Visa Intelligent Commerce issuer) plus the
+public [Trusted Agent Protocol specification](https://developer.visa.com/capabilities/trusted-agent-protocol/trusted-agent-protocol-specifications).
+**Roles:** Minds is an ORCHESTRATION layer; Reap is the agent that fills shipping and card
+details at the merchant's checkout. Pivota never completes an order — it supplies the offer, the
+link, and the numbers the cap is derived from.
+
+**TAP defines three ways credentials reach a merchant, and Reap named the first two:**
+Guest Checkout (Key Entry) — a hash of the credentials rides in the Agentic Payment Container and
+the merchant key-enters and compares hashes; Browser Automation — the agent drives the merchant's
+own checkout form with the payment data still encrypted in the container; and API/Direct, where an
+encrypted payload carries token objects, shipping and billing addresses in the request body.
+
+**The narrowing is real but NOT the one an earlier draft claimed.** That draft said "only Browser
+Automation reaches our cohort, because Key Entry requires the merchant to participate". The spec
+refutes the split: browser automation IS the guest-checkout key-entry case —
+
+> "if browser automation is being used to complete a web-based guest checkout, key entry
+> experience, this signature may contain a hash of the payment credential data that will be key
+> entered"
+
+— and the merchant side is the same either way: "The Merchant achieves this by using the same
+above key entered information to generate a hash and compares the hashes." A merchant that has not
+implemented TAP verifies no signature at all, so **every TAP mode requires merchant participation**,
+and the gate is explicit: a message whose `Signature-Input` carries neither `agent-browser-auth`
+nor `agent-payer-auth` "has not been signed by a trusted agent".
+
+**What actually reaches our cohort is PLAIN browser automation — outside TAP's trust model.** An
+agent can drive an unmodified Shopify checkout today; it simply does not get the accountable-agent
+recognition TAP exists to confer, and is subject to whatever bot management the host runs. That is
+a materially weaker position than "TAP mode 2 works here", and it is the honest one. Merchant TAP
+coverage across our cohort is **unmeasured** — B8 records that the field class does not exist, so
+there is no detector to measure with; `docs/TARGET_ARCHITECTURE.md:45` still reads "x402 / Visa TAP
+/ Mastercard Agent Pay | **Not implemented anywhere.** No placeholder code pretends otherwise".
+(Do not read the 94.3% `/.well-known/ucp` figure as TAP support: UCP is `ucp.dev`, a Shopify-hosted
+protocol from a different vendor. Conflating them would overstate readiness by the whole cohort.)
+
+| # | Step | Owner | What Pivota supplies |
+|---|---|---|---|
+| 1 | User states intent | Minds | — |
+| 2 | Find + rank offers | **Pivota** | `recommend_products` / `get_offers` |
+| 3 | Present options; user picks | Minds | `execution_spec`: `cart_url`, `variant_id`, `expires_at`. ⚠️ The `expected_*` money fields exist in the projection but are written **only** by `services/live_offer_verification.py`, reached only when item 6 is armed — so today they are `null` on every response |
+| 4 | **User authorizes an amount** | Minds / Visa | **the unresolved fork — see below** |
+| 5 | Mint the scoped card | Reap | the cap and its currency |
+| 6 | Open the link, land on checkout | Reap | `cart_url` — probed live: **three** hops (apex→www 301, then 302 through **`shop.app`** with a Shop Pay token, then to `…/checkouts/cn/<token>`), landing on a real checkout with `attributes[pivota_click_id]` intact. Not "straight": a browser-driving agent must traverse a third-party host. Measured on one host; others may differ |
+| 7 | Fill shipping | Reap | — (whose address? open) |
+| 8 | Fill card, submit | Reap | — |
+| 9 | Report the outcome | Minds / Reap | `POST /agent/v1/outcomes` keyed by `recommendation_id` |
+
+#### Step 4 is forced by physics, and it is the one that lands on our code
+
+Shipping and tax **cannot be known before an address is entered** — B7 verified that a pre-address
+UCP checkout returns `total === subtotal`, `shipping_options: []` and `tax: null`. The card cap is
+set at step 5, two steps before the address exists. So the flow must choose:
+
+**(a) Cap with headroom.** Mint at `expected_item_total` plus a shipping/tax allowance. One-shot
+and simple; the user authorizes "up to $62" for a $48 item. `routes/agent_cards.py:108` cannot do
+this today — it is `amount_cap_minor = quote["total_minor"]`, commented "v1: cap == quote,
+exactly", which declines the moment Reap enters an address.
+
+**(b) Two-phase.** Reap fills shipping first, reads the real total off the page, and only then
+mints for the exact amount. Better for trust — the user is told "$53.47", not a ceiling — but it
+needs a mid-flow mint, and the mint demands a UCP `checkout_id`.
+
+**How far apart the two rails actually are — corrected.** An earlier draft said "nothing bridges
+them … two different worlds". That is too strong. `PIVOTA-Agent`'s warm-handoff lane ALREADY creates
+a real UCP checkout on the merchant's own door (`ucpWarmHandoff.js:356` → `ucpBuyerAgentClient.js:1020`
+`createCheckoutPreview` → `create_checkout`), from the **same numeric variant identity the cart
+permalink is built from**, and it keeps the whole response (`raw: payload`, `tool_result: result`).
+The checkout id is present and simply never extracted — the normalizer's key list has no `id`. So
+the gap is **a field extraction plus a flag, not an architecture**, and the UCP checkout's
+`continue_url` is itself a storefront checkout URL. (Also: `recommendation_id` is ALREADY an
+accepted optional field on `CardIssueRequest`; only `checkout_id` needs relaxing.)
+
+**(c) Pre-quote the landed total.** Not available. B7 closed this: not obtainable anonymously
+before an address, from UCP or from the `.js` endpoint.
+
+**Both viable options need the same two changes**, which is what makes this worth writing down:
+accept a `cart_url` or `recommendation_id` where `CardIssueRequest` currently requires a
+`checkout_id`, and let the cap come from the execution spec rather than from
+`resolve_merchant_quote`'s `get_checkout` call against the merchant's UCP door. Note the second
+change makes `expected_item_total` **load-bearing on money**: in this model a stale spec price is
+a decline or an overspend, not merely a weak recommendation. That is the strongest argument on
+this page for arming item 6 and item 14.
+
+#### Open with Reap — flow questions, not protocol questions
+
+The protocol is public and settled; what is undetermined is the interaction sequence.
+
+1. **Whose shipping address, held where?** TAP's API mode carries shipping and billing inside the
+   encrypted payload, but the spec does not say who holds the address in Browser Automation mode.
+   If Reap holds the user profile, Pivota supplies nothing; if not, someone must.
+2. **Is the authorized amount fixed at intent time, or raisable mid-flow?** This single answer
+   picks (a) over (b).
+3. **On a decline at the final total, who retries, and does the user see it?** Determines whether
+   we owe a re-quote endpoint.
+4. **Headless or user-visible checkout?** Bears on whether `expires_at` on the spec — and the
+   cart token's own TTL — is generous enough for a human-in-the-loop pause.
+5. **Bot management — and note the axis, which an earlier draft got wrong.** The measurement is
+   **213 of 286 hosts unreadable from a NON-CRAWL-EGRESS client** (`docs/external-seed-dead-pdp-link-audit.md:85`),
+   and that source says explicitly it is *"not our user-agent — `PivotaAuditBot`, the httpx default,
+   and no UA at all are all refused."* The axis is **egress-IP reputation**, not browser-vs-bot.
+   Restating it as "non-browser client" inverts the mechanism the source rules out. So the question
+   to Reap is sharper than it first looked: **what egress does the Reap agent leave from, and what
+   is its reputation with Cloudflare?** TAP exists partly so a merchant recognises an agent as
+   accountable rather than blocking it — *(inference, not confirmed: TAP builds on Web Bot Auth, a
+   Cloudflare-led effort, so directory onboarding MAY propagate to Cloudflare-side recognition
+   without merchant action; I found no Visa statement using "co-developed")* — but on a merchant
+   that has not implemented TAP, whether Reap clears the WAF is unknown, and it decides whether our
+   crawled cohort is transactable at all.
+6. **Issuing jurisdiction.** Reap is a Visa Principal Issuer in Hong Kong and Mexico. What BIN and
+   currency apply to a USD cart at a US merchant, and does that move acceptance, 3DS or FX?
+
+#### What this does NOT change
+
+The cart-permalink handoff is agnostic to all of it — it is a URL that lands on a real checkout,
+and it works whether or not the merchant implements TAP. That is a genuine strength of what is
+already built. The reach limiter on it is item 4: at **60.5%** variant coverage, roughly 40% of
+rows have no numeric variant id, degrade to a PDP link, and leave Reap to choose the variant
+itself.
+
 
 ### Wave 1 — now → Sep 6. Code-only, platform-agnostic, rides the cutover for free
 
@@ -358,11 +485,88 @@ Ordered by (blocking × effort), then sequenced against the **Sep 8–12 cutover
 
 | # | Item | Effort | Where | Why |
 |---|---|---|---|---|
-| 9 | **Landed total via UCP `create_checkout`** (synthetic address, no PII) → `expected_item_total` / `expected_grand_total` in the spec. | M | Request path, 3a subnet | The agent has nothing to abort against until this exists. |
-| 11 | **Promo/discount codes in the spec**, in application order, via `dev.ucp.shopping.discount`. | M | Request path | 43% of live PDPs are running a markdown; ignoring this systematically overquotes. |
+| 9 | ~~**Landed total via UCP `create_checkout`**~~ → **RESCOPED 2026-08-26: a merchant-asserted PRE-SHIPPING SUBTOTAL, not a landed total** (see the correction in B7 — shipping and tax are not returned before an address). Gateway half **MERGED** (PIVOTA-Agent #2107): the priced preview the warm-handoff lane already computed is surfaced as `{subtotal_minor, currency, tax_minor, includes_shipping, includes_tax, requires_escalation}` — minor units, named in the key, exclusions stated rather than inferred. **Backend half NOT BUILT — the obvious vehicle does not work.** A first attempt reused `resolve_warm_handoff` and was measured 100% inert: that lane sends NO variant hint and *cannot* (`services/outbound_warm_handoff.py:457` — a prior review removed the read deliberately, because stamping a variant id into the token ctx cross-fills product↔variant grain in `surface_click_events`), so the gateway answered `no_variant_input` without a network call. Two further blockers stand behind that one: the click lane's 2000ms budget leaves ~46ms after a cart build, under the preview's 400ms floor, while the backend's own 2.5s `wait_for` caps any attempt to widen it — the two ceilings are mutually incompatible for a background price warm; and `toExecutionSpec` in PIVOTA-Agent is an allowlist that does not carry the new keys, so the payload would be dropped at the agent surface regardless. **A price warm needs its own gateway entry point taking `variant_id` as a top-level field, with its own budget — not the click lane.** | M | Request path, 3a subnet | **An agent still has nothing to abort a TOTAL against.** It can now abort on a subtotal mismatch, which catches the audit's 12.3% price-mismatch finding; shipping and tax remain unquotable pre-address by any anonymous source we have. |
+| 11 | ~~**Promo/discount codes in the spec**, in application order, via `dev.ucp.shopping.discount`.~~ → **NOT BUILDABLE AS SPECIFIED — verified live 2026-08-26. We hold no codes and cannot discover any; see the note under this table before building anything here.** The remaining buildable work is a *request-contract* change (let a caller supply a code), not a spec-emission change. | M | Request path | 43% of live PDPs are running a markdown (**A5**) — but **codes are not the remedy for a markdown**; live re-verification (item 6) is. | 
 | 13 | **`p_complete` into ranking**: set `w_business > 0`, feed the B-profile prior, then swap in measured outcomes. | S + M | App code | Turns the outcome graph into ranking lift. |
 | 15 | **Bring the reco lane under ~3 s.** | M | App code | 7.65 s + verification is not a shippable turn. Note the migration already bought some of this for free — staging Cloud Run answered `/__catalog_health` in **1.8 s vs 5.8 s on Railway**; re-measure the reco lane post-cutover before optimising. |
 | 16 | **3C / electronics cohort seeding.** | M–L | Pipeline | The milestone names beauty *and* 3C; today the corpus is beauty-dominant. |
+
+#### Item 11 — why it is not buildable as written (live-verified 2026-08-26)
+
+Item 11 asked for three things. Probed against a live merchant before writing any code — the same
+discipline that should have been applied to B7 and to item 9's backend half. **One premise holds, one
+is the blocker, and one is weaker than it first looked.** This note was itself corrected after an
+adversarial re-check; the corrections are marked, because the ones that were wrong were wrong in the
+direction of overstating the case.
+
+**1. The vehicle is REAL** ✅ — and it *is* the capability the row named. `https://cosrx.com/.well-known/ucp`
+advertises `dev.ucp.shopping.discount` verbatim under `ucp.capabilities`, versioned `2026-04-08`, with its
+own `spec` and `schema` and `extends: ["dev.ucp.shopping.checkout", "dev.ucp.shopping.cart"]` — which is
+exactly *why* the field appears nested on those two. (An earlier draft of this note claimed the capability
+did not exist and only a nested field did. That was wrong: it read `services["dev.ucp.shopping"][0].capabilities`,
+which is empty, instead of `ucp.capabilities`. The original B6 wording — "capability" — was right.) What does
+**not** exist is a *tool* by that name: `tools/list` on
+`https://cosrx-renewal.myshopify.com/api/ucp/mcp` returns 13 tools and none is a discount op. The field is
+`checkout.discounts.codes: string[]` on `create_checkout`, `update_checkout`, `create_cart`, `update_cart`.
+The storefront carries a second, independent channel: a cart permalink accepts `?discount=CODE`, which
+Shopify rewrites to `discount_code=` on the checkout redirect **while preserving
+`attributes[pivota_click_id]`** — verified live, both values survive into `cart.js`.
+
+**2. We have no codes, and cannot discover any** ❌ — **this is the blocker, and it is the one premise that
+is unconditionally solid.** No live table holds a discount code (see B6 for the dropped `catalog_promotions.code`
+and its ADR-022 history). `services/promo_terms.py` is a marketing-*word* denylist for query hygiene, and
+`catalog_payment_incentives` models card/wallet benefits with no code column. Nor can the protocol supply
+them: UCP **applies** codes, it cannot **enumerate** them — the merchant's own schema says *"Only prompt if
+customer mentions having a discount code."* A code can therefore only come from the buyer, and **no card-rail
+request accepts one today.** (`discount_codes` does exist on `preview_quote` and on the order path —
+`routes/order_routes.py`, with `normalize_discount_codes`, quote→order drift detection and a
+`multiple_applicable_discount_codes` blocker — but that is the **credentialed PSP rail**, the same one B7
+found returns *"Shopify credentials missing"* for every crawled domain. The only `discount_codes` on
+`routes/agent_shop_gateway.py` is a field on `OrderPayloadBody`, which also requires `merchant_id`,
+`quote_id` and `preferred_psp`. `services/outbound_warm_handoff.py` and `services/outbound_links_service.py`
+contain zero discount references.)
+
+**3. "In application order" is not expressible** ⚠️ — `codes` is an unordered array with REPLACE semantics
+(*"Replaces previously submitted codes. Send empty array to clear."*), and Shopify decides combination by its
+own product/order/shipping class rules, not by array position. That much is read straight off the live schema.
+**But the original form of this premise overreached and is corrected here.** It argued that because the tools
+publish no `outputSchema`, what actually applied is undeclared, and therefore any implementation would have to
+fabricate an "applied" claim. Both halves are weaker than stated: the tools' own descriptions say they return
+*"any applicable discounts or taxes"*, so a missing `outputSchema` is not an absent response; and the decisive
+test — a live `tools/call` — could not be run, because `tools/call` requires an agent-profile grant that
+`tools/list` does not (HTTP 422, `invalid_profile_url`). **What the UCP response reports for an applied or
+rejected code is therefore UNVERIFIED, not known-absent.** On the storefront rail it is verified and it is
+*good* news: an invalid code is accepted by the permalink without error, but `cart.js` then reports
+`discount_codes: [{"code": "TESTCODE123", "applicable": false}]` with `total_discount: 0`. **Applicability is
+machine-readable for the cost of one `cart.js` read** — so a truthful implementation is cheap, and "we could
+not tell whether it applied" is not a reason to skip this item.
+
+**On the motivation — the original claim here was too strong and is corrected.** The row cited *"43% of live
+PDPs are running a markdown; ignoring this systematically overquotes."* An earlier draft called that simply
+false, on the grounds that Shopify's `.js` `price` **is** the marked-down price (`compare_at_price` being the
+strikethrough) — verified end-to-end on cosrx: `price` 4250, `compare_at_price` 5000, real `cart.js`
+`total_price` 4250, `total_discount` 0, no cart-level discounts. That verification stands, but it only
+establishes the **crawl-time** contract, and **A5 measures a different mechanism: staleness.** A5 found 10/81
+price mismatches, *"two cases were index-high because a live promo was running"*, and describes the 43% as
+*"an active markdown the index does not model at all."* A markdown that begins after we crawl still overquotes.
+So the overquoting is **real**; what is false is only the implied remedy. **Codes are not the fix for a
+markdown** — a markdown needs no code, and no code would have caught those two cases. Live re-verification
+(item 6) is the fix. Two further caveats: `routes/agent_shop_gateway.py:9748` and `:10342` both do
+`price = product_data.get("price") or product_data.get("compare_at_price") or 0`, substituting the
+strikethrough price when `price` is falsy — so "the PDP price already carries the markdown" is true of the
+Shopify contract but **not uniformly true of every read path in this repo** (the external-seed card-rail lane
+at `:4299` is clean, keeping `compare_at_price` separate as `original_price`). And the markdown evidence is one
+merchant end-to-end plus the platform contract; a wider sample was attempted and abandoned at 429 — *cannot
+verify* is not evidence either way.
+
+**What is actually left.** The only real gap is a **request-contract** change, not a spec-emission one: decide
+whether the card rail should accept a buyer-supplied code, and if so (a) add it to the card-rail request,
+(b) teach `ucpBuyerAgentClient` to send `checkout.discounts.codes` — it currently has **zero** discount
+support across all 1,593 lines, so a code handed to it today is silently dropped — and (c) report what the
+merchant said applied rather than what we sent, which on the storefront rail means reading back
+`cart.js` `discount_codes[].applicable`. Note that both ends are missing: building either half alone is inert,
+which is precisely how item 9's backend half was lost. That is a product decision about the request contract,
+so it is **not** taken here.
 
 ### Explicitly deferred
 

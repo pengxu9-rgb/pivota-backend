@@ -12,8 +12,16 @@ intra-merchant dup keys=1,076; pg groups=8,500 (3,609 memberships in
 multi-member groups); active unattached seeds with an exact catalog URL
 twin=249 (the Tier-0 attach population).
 
-Usage (prod, via railway env — see repo runbooks):
-  python scripts/measure_identity_duplication.py
+Usage (prod is Cloud Run, pivota-prod/us-west1; Railway is RETIRED (#1872) and its
+database is a different one, so a duplication gauge read there measures a catalog
+nobody is served from). There is no `railway run` equivalent — run a throwaway
+job on the production image, which mounts the DATABASE_URL secret:
+  scripts/ops/run_oneoff_job.sh scripts/measure_identity_duplication.py
+
+Locally, against a database you already have a URL for:
+  DATABASE_URL=... python scripts/measure_identity_duplication.py
+
+Full pattern: docs/runbooks/operating_on_gcp_production.md.
 """
 
 from __future__ import annotations

@@ -7,7 +7,7 @@ from fastapi import APIRouter, HTTPException, Depends, Query, Path
 
 from db.database import database
 from services.agent_integration_bridge import AgentIntegrationBridge
-from utils.auth import get_current_user
+from utils.auth import EMPLOYEE_STAFF_ROLES, get_current_user
 
 router = APIRouter(
     prefix="/agents/{agent_id}/integration",
@@ -26,7 +26,7 @@ async def get_integration_overview(
     """[Phase 5.6] Integration overview - aggregates existing routing/protocol/revenue logs"""
     
     # Allow: agent accessing own data, or admin/employee
-    if current_user.get("agent_id") != agent_id and current_user.get("role") not in ["admin", "employee"]:
+    if current_user.get("agent_id") != agent_id and current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Access denied")
     
     try:
@@ -46,7 +46,7 @@ async def get_routing_trace(
     """[Phase 5.6] Routing trace - uses EXISTING routing_logs table"""
     
     # Allow: agent accessing own data, or admin/employee
-    if current_user.get("agent_id") != agent_id and current_user.get("role") not in ["admin", "employee"]:
+    if current_user.get("agent_id") != agent_id and current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Access denied")
     
     try:

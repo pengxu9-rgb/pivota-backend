@@ -229,26 +229,23 @@ def _score_block(
         subscores.append(
             {"key": key, "raw": value, "display": _display_score(value)}
         )
-    history = _as_dict(_as_dict(brand_rollup.get("tracking")).get("history"))
-    delta_map = _as_dict(history.get("delta_from_most_recent"))
-    delta = None
-    if delta_map.get("visibility") is not None:
-        delta = {
-            "raw": delta_map.get("visibility"),
-            "previous_audit_run_id": _as_dict(
-                history.get("most_recent_audit")
-            ).get("run_id"),
-            "days_since_last_audit": delta_map.get("days_since_last_audit"),
-        }
     out = _score_payload(raw)
     out["band_thresholds"] = [t / 10.0 for t in _BAND_THRESHOLDS]
     out["subscores"] = subscores
-    # The persisted run-over-run delta compares OLD-semantics numbers; once
-    # exclusions actually change the displayed score the comparison is
-    # apples-to-oranges, so it's dropped rather than shown wrong.
-    out["delta"] = (
-        None if (excluded_applied and raw != raw_persisted) else delta
-    )
+    # `score.delta` IS GONE, and it is `None` rather than absent because the
+    # key is a cross-repo contract field consumers still read (see
+    # docs/audits/revenue-recovery-contract.md).
+    #
+    # It used to be built here from brand_rollup.tracking.history's
+    # `delta_from_most_recent`. That number is an UNQUALIFIED before/after: it
+    # carries no measurement basis, so it cannot say whether the two runs were
+    # measured the same way, and it compares OLD-semantics scores against a
+    # displayed score that unmeasured-dimension exclusions may have changed.
+    # The qualified comparison lives in `since_last_audit`, which does carry
+    # the basis verdict. The computation that fed this stayed behind for a
+    # while after the value was hard-wired to None — dead code that read like
+    # a live feature.
+    out["delta"] = None
     out["weakest_dimension"] = weakest
     out["unmeasured_excluded"] = list(excluded_applied)
     out["explainer"] = _score_explainer(weakest, excluded_applied)
@@ -750,23 +747,66 @@ def _share_of_voice(
 
 
 def _since_last_audit(report: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
-    """Verbatim passthrough of the persisted reaudit_delta (wave-1 A1) —
-    movements already carry merchant-safe labels and the W2 materiality
-    verdicts; this layer never re-derives them. Absent on runs that predate
-    the per-SKU attach (presence-gated rendering, the 1.1/1.2 convention)."""
+    """Re-derive the persisted reaudit_delta's verdicts against the CURRENT
+    contract (wave-1 A1 + the W2/A3 measurement basis).
+
+    NOT a passthrough, and the docstring used to say it was. A delta persisted
+    into report_jsonb was decided by whatever contract was live when the run
+    completed, so a retained report can carry `is_material: True` /
+    `direction: "improved"` for a pair today's basis rule refuses to compare.
+    Movements are therefore recomputed here from `from`/`to` and the stored
+    `measurement_basis` — and, because they are, the HEADLINE has to be too:
+    passing `delta["headline"]` through verbatim rendered "Material change …
+    improved: AI visibility" directly beside movements that all read
+    `unknown` / `not_comparable`. Absent on runs that predate the per-SKU
+    attach (presence-gated rendering, the 1.1/1.2 convention)."""
     delta = report.get("reaudit_delta")
     if not isinstance(delta, dict):
         return None
-    movements = [m for m in _as_list(delta.get("movements")) if isinstance(m, dict)]
+    from services.audit_delta import (
+        MATERIAL_SCORE_DELTA, SCORE_SIGNALS, not_comparable_headline,
+    )
+    movements = [dict(m) for m in _as_list(delta.get("movements")) if isinstance(m, dict)]
+    basis = _as_dict(delta.get("measurement_basis"))
+    comparable = basis.get("contract_version") == "2" and basis.get("same") is True
+    for m in movements:
+        if m.get("signal") not in SCORE_SIGNALS:
+            # CATEGORICAL movements degrade too. They are exact string matches,
+            # which is why they were skipped here — but the label being exact
+            # does not make it basis-free: `verdict` is computed from the very
+            # scores this loop has just refused to compare, and primary_gap /
+            # controller_archetype / top_controller are model output. Left
+            # untouched, a persisted `verdict: changed, is_material: True`
+            # survived into `material_movements` and contradicted the
+            # not-comparable headline stamped ten lines below.
+            if not comparable:
+                m["is_material"] = False
+                m["direction"] = "unknown"
+                m["detection"] = {"verdict": "not_comparable"}
+            continue
+        before, after = m.get("from"), m.get("to")
+        numeric = type(before) in (int, float) and type(after) in (int, float)
+        resolved = comparable and numeric and abs(after - before) >= MATERIAL_SCORE_DELTA
+        m["is_material"] = bool(resolved)
+        m["direction"] = ("improved" if after > before else "regressed") if resolved else "unknown"
+        m["detection"] = {"verdict": "resolved" if resolved else "below_detection_floor" if comparable and numeric else "not_comparable", "threshold": MATERIAL_SCORE_DELTA}
+
+    # A first audit's headline ("Baseline established …") is already the
+    # honest one and has no pair to compare; every other non-comparable delta
+    # gets the shared not-comparable sentence rather than its persisted claim.
+    headline = delta.get("headline")
+    if not comparable and not delta.get("is_first_audit"):
+        headline = not_comparable_headline(basis, delta.get("days_since_last"))
+
     return {
         "is_first_audit": bool(delta.get("is_first_audit")),
         "days_since_last": delta.get("days_since_last"),
-        "headline": delta.get("headline"),
+        "headline": headline,
         "movements": movements,
         # Producer emits is_material (review P1: reading "material" made this
         # counter permanently zero on real passthrough data).
         "material_movements": sum(1 for m in movements if m.get("is_material")),
-        "basis_same": (_as_dict(delta.get("measurement_basis"))).get("same"),
+        "basis_same": True if comparable else None,
     }
 
 

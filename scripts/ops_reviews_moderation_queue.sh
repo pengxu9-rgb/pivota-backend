@@ -27,7 +27,7 @@ SET_REASON="${SET_REASON:-ops update}"
 command -v curl >/dev/null 2>&1 || { echo "ERROR: curl not found" >&2; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "ERROR: python3 not found" >&2; exit 1; }
 
-read -r -s -p "JWT_SECRET_KEY (reviews backend Railway env): " JWT_SECRET_KEY
+read -r -s -p "JWT_SECRET_KEY (gcloud secrets versions access latest --secret=env-JWT_SECRET_KEY --project pivota-prod): " JWT_SECRET_KEY
 echo
 
 EMP_TOKEN="$(

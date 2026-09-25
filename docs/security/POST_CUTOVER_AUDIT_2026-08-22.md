@@ -136,6 +136,36 @@ a trustworthy per-IP bucket is newly available.
 
 ### 2.3 Railway is a second live copy of every production secret
 
+**CLOSED 2026-08-25.** Executed per-service across all three Railway projects, in the safe order —
+archive, then repoint, then teardown, each step verified rather than assumed:
+
+- **Final archival dumps first**, from inside GCP (`cloudbuild.dump-railway.yaml`):
+  `gs://pivota-prod-migration/prod-final-20260825T1547Z.sql.gz` (**440MB** — sane for the 4.4GB
+  rollback DB) and `pcikb-final-20260825T1547Z.sql.gz` (2.1MB). Verified present and plausibly
+  sized before anything was torn down.
+- **The one live GCP→Railway dependency found and repointed**: `CATALOG_INTELLIGENCE_BASE_URL` on
+  `web` and `worker` pointed at `pivota-catalog-intelligence-production.up.railway.app`. The client
+  fails soft and prod logged zero calls in 3 days, so this was repointed to the GCP
+  `catalog-intelligence` service, verified on the new revisions, before its Railway host went down.
+- **All services taken down** — Pivota Infra (`web`, `invitation worker`, `reviews-proof-issuer`,
+  `relgraph-sync-routine`, `Redis`, `Postgres-xMr6`, and the ADR-021-retired `pivota-acp`), Pivota
+  Agent (`PIVOTA-Agent`), catalog-intelligence (app + `Postgres` + `Postgres-4hoG` + `Redis`; both
+  Postgres volumes were at the 0.2GB empty baseline, which also settles the orphaned
+  `Postgres-4hoG` question). Every `*.up.railway.app` URL now 404s **on a path that previously
+  served** — an earlier sweep wrongly declared the catalog-intelligence app dead by probing `/`,
+  which 404s on that app even when healthy; `/health` was still 200. Probe the path that serves.
+- **Both `railway-*` DSN secrets deleted from GCP** Secret Manager (held until the dumps verified,
+  per the note in `cloudbuild.dump-railway.yaml` — the dump build reads one of them).
+
+**Residue, deliberate:** the service SHELLS still exist in Railway (CLI removes deployments, not
+services) — delete them in the dashboard at leisure, which also removes volumes and any armed
+auto-deploy trigger (pivota-acp's was never disarmed; until its shell is deleted, a push to that
+repo could resurrect the service). Credential rotation (admin keys, `PIVOTA_API_KEY`, Stripe live
+keys) is the remaining human step and is not verifiable from here.
+
+The section below records what 2.3 looked like while open.
+
+
 Still serving on a valid certificate (`api.pivota.cc` via its direct IP → `200`, `environment:
 production`), with background sweeps **on** (`EXTERNAL_CONVERSION_POLLER_ENABLED`,
 `PAYMENT_RECONCILE_SWEEP_ENABLED`, `ENABLE_IDENTITY_RECONCILE_SWEEP`, `PDP_SCOPE_BACKFILL_ENABLED`).
@@ -293,10 +323,10 @@ from "silently lost" to "hard error".
 |---|---|---|
 | 3.1 | **Gateway's primary LLM provider is dead in production.** `/healthz/gemini` → `{"ok":false,"key_count":0,"reasons":["missing_keys"]}`. Neither `GEMINI_API_KEY` nor `GOOGLE_API_KEY` is mounted, yet the revision sets `AURORA_LLM_SINGLE_PROVIDER=gemini` and 25 Gemini tuning vars. The openai fallback covers intent and layer-2 only — **embeddings, skin vision and the Aurora single-provider lane have none.** A credential was dropped in the port. | measured |
 | 3.2 | **CONFIRMED, and worse than filed.** `PCI_KB_DATABASE_URL` is missing on GCP `web` — mounted on `worker` and `gateway`, and present on Railway `web`, so the port dropped it. `sa-backend` also has no accessor grant on the secret, so mounting alone is not enough. The filed impact was wrong in both directions: the employee route returns **503**, not 500 (both handlers catch the `RuntimeError`), but the audit missed the larger half — `services/attached_seed_runtime_evidence.py:358` swallows it as `kb_rows = []`, so `sync_shopify_products_for_merchant`, reached from `routes/webhook_routes.py` on **`web`**, has been writing catalog payloads with attached-seed runtime evidence **silently dropped**. Cause: `port_railway_env.py`'s `DROP_EXACT` strips every DSN (correctly — a ported Railway DSN would win the last-wins `--set-secrets` merge), and three of the four deploy paths re-mount it while `deploy_backend.sh` did not. Fix + regression test in the PR below; the live IAM grant and mount are a manual step. | measured |
-| 3.3 | Full API surface published anonymously — `/docs`, `/redoc`, `/openapi.json` → 200, handing an attacker the exact path list for §1.1. | measured |
+| 3.3 | **CONFIRMED and CLOSED (code).** `/docs`, `/redoc`, `/openapi.json` all returned 200 anonymously, exposing **1,019 paths** — the full internal route map. Now gated on the admin key in production only (`is_production()` fails closed), returning **404 rather than 401** so an anonymous caller cannot even confirm the endpoint exists. The curated partner-facing spec at `/agent/docs/openapi.json` is a different surface and deliberately stays public. Two ops scripts that read the spec in production were updated to send the key. **Amended 2026-08-26 (PR #1901):** anonymous GET `/openapi.json` now answers a `Cache-Control: no-store` **307 redirect** to the curated spec instead of 404 — existence-hiding on that one GET was deliberately traded for agent cold discovery (it is the URL the marketing site publishes). The full spec remains admin-keyed, non-GET methods still 404, `/docs`/`/redoc` are unchanged, and both ops scripts were updated again for the redirect (the canary skips the check without a key; the smoke now verifies WHICH document came back, since a wrong key silently lands the curated spec via the followed redirect). | measured |
 | 3.4 | `requireInternalKey` is one empty secret from open: `NODE_ENV`/`APP_ENV` are both unset, so `isProd` is false and the `CONFIG_MISSING` refusal is **unreachable**. Armed today only because the key is mounted non-empty. Comparison is `===`, not constant-time. | code |
-| 3.5 | `/api/links/resolve` enforcement off — `OUTBOUND_LINKS_RESOLVE_REQUIRE_KEY` unset, so unauthenticated callers mint signed redirect tokens with caller-chosen `ctx`. The file's own docstring names attribution stuffing and open-redirect laundering. | code + probe |
-| 3.6 | No security response headers on either host — no HSTS, `X-Content-Type-Options`, `X-Frame-Options`, CSP or `Referrer-Policy`. Without HSTS the first request of every session is downgradeable. | measured |
+| 3.5 | **CONFIRMED, and it is a safe one-variable flip.** `OUTBOUND_LINKS_RESOLVE_REQUIRE_KEY` is absent, so `require_links_resolve_caller` logs and allows. The rollout concern does not apply: `OUTBOUND_LINKS_SERVICE_KEY` is absent on **both** sides and the gateway has no `INFRA_API_BASE`, so nothing legitimate calls it — 7 days of logs show exactly one unauthenticated hit (2026-08-22, from a public IP, which 400'd) and no other traffic at all. `ADMIN_API_KEY` is mounted and stays a valid credential for ops. Flipping the flag therefore blocks only the abuse case. | measured |
+| 3.6 | **CONFIRMED and CLOSED (code).** No HSTS, `X-Content-Type-Options`, `X-Frame-Options`, CSP or `Referrer-Policy` on either host. `SecurityHeadersMiddleware` now adds all five, registered so it **wraps** the error handler — headers present on 200s and missing on 500s protect the requests that matter least. HSTS is sent only on HTTPS (read from `X-Forwarded-Proto`; the internal hop is http) and deliberately **without** `includeSubDomains` or `preload`, both of which are hard to walk back and need their own subdomain inventory. CSP is `default-src 'none'` for the JSON API and `frame-ancestors 'none'` on the doc pages, which would otherwise render blank. | measured |
 | 3.7 | Default-VPC firewall allows `0.0.0.0/0` on tcp:22 and tcp:3389. Zero instances today, so latent — but Cloud Run egresses through this same network and the first VM anyone creates is SSH-open to the world. | measured |
 | 3.8 | Old secret versions still enabled: `DATABASE_URL` (3), `DATABASE_URL_NOVERIFY` (2), `railway-pcikb-db-url` (2), `env-GOOGLE_OAUTH_CLIENT_SECRET` (2). Disable **only after** confirming no revision is pinned to them. | measured |
 | 3.9 | 8 orphan secrets mounted by nothing, including `railway-prod-db-url` and `railway-pcikb-db-url` — Railway DSNs stored in GCP prod. | measured |

@@ -9,7 +9,7 @@ import os
 import logging
 
 from db.database import database
-from utils.auth import get_current_user
+from utils.auth import ADMIN_ROLES, get_current_user
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +37,7 @@ async def run_migration_012a(current_user: dict = Depends(get_current_user)):
     - agent_revenue_summary view
     - Default policies for existing agents
     """
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Admin access required")
     
     steps = []
@@ -153,7 +153,7 @@ async def run_migration_012b(current_user: dict = Depends(get_current_user)):
     - routing_logs.revenue_calculated
     - agents.revenue_sharing_enabled
     """
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Admin access required")
     
     steps = []

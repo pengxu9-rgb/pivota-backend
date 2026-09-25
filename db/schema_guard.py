@@ -110,6 +110,7 @@ REQUIRED_SCHEMA: Sequence[RequiredTableColumns] = (
             # category_path + provenance inline; without these in both
             # schema_guard and db.catalog metadata, production sync fails.
             "category_path",
+            "category_label",
             "category_confidence",
             "category_label_source",
             # Phase O-4 — see migration 077. Onboarding lifecycle
@@ -162,6 +163,23 @@ REQUIRED_SCHEMA: Sequence[RequiredTableColumns] = (
             # legacy; never assumed 'self'.
             "seller_ref",
             "seed_kind",
+            # Destination liveness (migration 200). Written ONLY by a fetch that
+            # reached the origin, so the readiness gate can ask "is this link still
+            # there" instead of inferring it from `updated_at`, which any writer
+            # bumps. NULL destination_checked_at = never verified = blocked.
+            "destination_checked_at",
+            "destination_http_status",
+            "destination_verdict",
+            "destination_failure_streak",
+            # Content freshness (migration 202). Written ONLY by the success path of
+            # _refresh_external_seed_by_id, so the refresh queue can order by "when did
+            # we last re-read this PRICE" instead of `updated_at`, which an attach, a
+            # status flip or a governance write bumps without going near the origin.
+            # Two clocks: `last_crawl_attempt_at` orders the QUEUE (advances on every terminal
+            # outcome, so a dead seed cannot pin the head of it); `last_crawled_at` is the
+            # FRESHNESS signal (advances only on a fetch that reached the origin).
+            "last_crawled_at",
+            "last_crawl_attempt_at",
         },
     ),
     RequiredTableColumns(
@@ -247,6 +265,1239 @@ async def ensure_required_schema_light() -> None:
     await _ensure_database_connected()
     try:
         if IS_POSTGRES:
+            # mig 231: the MERCHANT PURCHASABILITY fact — the only thing that may
+            # let a merchant x market row carry a BUY affordance. See
+            # db/migrations/231_merchant_purchasability.sql for the incident it
+            # closes (flowerbeauty.com served as purchasable with a PayPal-only
+            # checkout at a price we did not hold).
+            #
+            # A CREATE TABLE, so the coverage gate (ADD COLUMN only) cannot see a
+            # missing heal here — the same hole the mig-224 and mig-230 blocks
+            # name. The catalog-parity test in
+            # tests/test_merchant_purchasability_postgres.py is what closes it.
+            #
+            # Its OWN try, and EARLY in the branch, for the reason the mig-207
+            # block below states at length: this whole IS_POSTGRES branch is one
+            # try-block, so a statement that raises abandons every statement after
+            # it. It fails SAFE either way — with the table missing,
+            # `is_purchasable` finds no fact and answers False, which refuses the
+            # purchase rather than opening it.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        CREATE TABLE IF NOT EXISTS merchant_purchasability (
+                            merchant_domain VARCHAR(255) NOT NULL,
+                            market_country VARCHAR(2) NOT NULL
+                                CONSTRAINT ck_merchant_purchasability_market
+                                CHECK (market_country ~ '^[A-Z]{2}$'),
+                            vantage VARCHAR(32) NOT NULL,
+                            checked_at TIMESTAMPTZ,
+                            verdict VARCHAR(32),
+                            card_available BOOLEAN,
+                            payment_methods JSONB,
+                            landed_price_minor BIGINT,
+                            landed_currency VARCHAR(8),
+                            expected_price_minor BIGINT,
+                            price_drift_minor BIGINT,
+                            variant_id VARCHAR(32),
+                            evidence JSONB,
+                            consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                            positive_until TIMESTAMPTZ,
+                            PRIMARY KEY (merchant_domain, market_country, vantage)
+                        );
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 231, second statement: the sweep's due-list index. Its OWN try —
+            # an index build that raises must not cost the table above it or the
+            # heals below.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        CREATE INDEX IF NOT EXISTS idx_merchant_purchasability_due
+                            ON merchant_purchasability (checked_at);
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 232: widen migration 228's verdict vocabulary for NO_CARD_PAYMENT and
+            # PRICE_DRIFT.
+            #
+            # THE CREATE TABLE IN db/tierb_cart_link_eligibility_schema.py ALREADY CARRIES THE
+            # WIDE LIST, and on a FRESH database that is the whole heal. It is NOT enough on a
+            # database that already holds a 228-shaped table: `CREATE TABLE IF NOT EXISTS` does
+            # nothing there, so the narrow CHECK survives and the first NO_CARD_PAYMENT write
+            # raises. Measured on a 228-only database, which is what production is.
+            #
+            # The constraint names are POSTGRES'S OWN (`<table>_<column>_check`): migration 228
+            # declared both CHECKs inline and unnamed. Dropped by that name and re-added under
+            # it, so this and the migration leave byte-identical catalogs — compared by
+            # tests/test_merchant_purchasability_postgres.py.
+            #
+            # IDEMPOTENT: DROP ... IF EXISTS then ADD, so a second arrival re-adds the same
+            # definition rather than duplicating or failing. Each statement pair in its own try,
+            # for the reason the mig-207 block below states: this branch is one try-block.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS tierb_cart_link_eligibility
+                            DROP CONSTRAINT IF EXISTS tierb_cart_link_eligibility_verdict_check;
+                        """
+                    )
+                )
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS tierb_cart_link_eligibility
+                            ADD CONSTRAINT tierb_cart_link_eligibility_verdict_check
+                            CHECK (verdict IS NULL OR verdict IN (
+                                'ELIGIBLE', 'LOGIN_REQUIRED', 'NOT_ACCEPTING_ORDERS',
+                                'VARIANT_GONE', 'VARIANT_UNAVAILABLE', 'PASSWORD_PAGE',
+                                'BLOCKED_UNKNOWN', 'CHECKOUT_PREFILL_MISSING',
+                                'CHECKOUT_MARKET_MISMATCH', 'NO_CARD_PAYMENT', 'PRICE_DRIFT'
+                            ));
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS tierb_cart_link_eligibility
+                            DROP CONSTRAINT IF EXISTS
+                                tierb_cart_link_eligibility_previous_verdict_check;
+                        """
+                    )
+                )
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS tierb_cart_link_eligibility
+                            ADD CONSTRAINT tierb_cart_link_eligibility_previous_verdict_check
+                            CHECK (previous_verdict IS NULL OR previous_verdict IN (
+                                'ELIGIBLE', 'LOGIN_REQUIRED', 'NOT_ACCEPTING_ORDERS',
+                                'VARIANT_GONE', 'VARIANT_UNAVAILABLE', 'PASSWORD_PAGE',
+                                'BLOCKED_UNKNOWN', 'CHECKOUT_PREFILL_MISSING',
+                                'CHECKOUT_MARKET_MISMATCH', 'NO_CARD_PAYMENT', 'PRICE_DRIFT'
+                            ));
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 207: the Reap EXTERNAL AUTHORIZATION ledger + merchant descriptor
+            # registry. Both tables are read on the FIRST authorization Reap sends,
+            # inside a 1.6-second budget, and a missing relation there is not a 500
+            # on a background job — it is a DECLINED CARD at a live checkout. Prod
+            # deploys skip db/migrations/, so the tables are born here too.
+            #
+            # The schema-guard-coverage gate only inspects ADD COLUMN, so nothing
+            # would have flagged these CREATE TABLEs; they are here because the
+            # runtime read exists, not because a test demanded them. Keep this DDL
+            # byte-identical to db/migrations/207_agent_card_auth_decisions.sql —
+            # a self-heal that disagrees with the migration makes prod behave
+            # unlike every environment where the migration ran.
+            #
+            # FIRST IN THE BRANCH, AND IN ITS OWN try/except. Both are deliberate,
+            # and both were measured rather than guessed.
+            #
+            # This whole IS_POSTGRES branch is ONE try-block: the first statement
+            # that raises abandons every statement after it. The mig-190 block
+            # names that hazard and answers it by moving LATER in the chain, which
+            # is the right trade for columns that only make /health fail closed.
+            # It is the WRONG trade here — a missing relation on this path is a
+            # declined card at a live checkout, inside Reap's 1.6s budget, not a
+            # background 500. Reproduced on an empty database 2026-09-02: the
+            # `CREATE INDEX ... ON commerce_interactions` further down carries no
+            # IF EXISTS guard on its table, raises, and starved these two tables
+            # completely when they sat at the end of the chain.
+            #
+            # So: first, so nothing upstream can starve them; and wrapped, so a
+            # failure HERE cannot starve the self-heals that follow. Isolated in
+            # both directions, which position alone cannot buy.
+            try:
+                await database.execute(
+                    text(
+                        """
+                    CREATE TABLE IF NOT EXISTS agent_card_auth_decisions (
+                        event_id VARCHAR(128) PRIMARY KEY,
+                        card_id VARCHAR(64),
+                        issuer_card_ref VARCHAR(128) NOT NULL,
+                        decision VARCHAR(8) NOT NULL
+                            CHECK (decision IN ('APPROVE', 'DECLINE')),
+                        reason VARCHAR(32),
+                        reason_code VARCHAR(48) NOT NULL,
+                        amount_minor BIGINT,
+                        currency VARCHAR(8),
+                        channel VARCHAR(16),
+                        merchant_name TEXT,
+                        merchant_city TEXT,
+                        merchant_country VARCHAR(2),
+                        mcc VARCHAR(4),
+                        merchant_verified BOOLEAN NOT NULL DEFAULT FALSE,
+                        latency_ms INTEGER NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                    );
+                        """
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS "
+                        "idx_agent_card_auth_decisions_card_decision "
+                        "ON agent_card_auth_decisions (card_id, decision);"
+                    )
+                )
+                await database.execute(
+                    text(
+                        """
+                    CREATE TABLE IF NOT EXISTS agent_card_merchant_descriptors (
+                        id BIGSERIAL PRIMARY KEY,
+                        merchant_domain VARCHAR(255) NOT NULL,
+                        name_norm TEXT NOT NULL,
+                        country VARCHAR(2),
+                        city_norm TEXT,
+                        source VARCHAR(16) NOT NULL,
+                        seen_count INTEGER NOT NULL DEFAULT 1,
+                        first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        UNIQUE (merchant_domain, name_norm, country)
+                    );
+                        """
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS "
+                        "idx_agent_card_merchant_descriptors_domain "
+                        "ON agent_card_merchant_descriptors (merchant_domain);"
+                    )
+                )
+                # mig 207 (F5): the composite the LIVE decision reads under its advisory lock.
+                # ALTER-free and on a table born in mig 201, so it heals independently of
+                # whether that migration ever ran here.
+                await database.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS "
+                        "idx_agent_issued_cards_issuer_ref_status "
+                        "ON agent_issued_cards (issuer_card_ref, status);"
+                    )
+                )
+            except Exception:
+                # Same best-effort contract as the enclosing block. The card-rail
+                # decision path is the loud one if this ever silently fails: the
+                # first authorization 500s inside Reap's 1.6s budget, which Reap
+                # renders as a declined card — not a silent wrong answer.
+                pass
+            # mig 224: the Reap AGENTIC rail's two tables — purchases and
+            # enrollments. A DIFFERENT rail from the card one above: the buyer
+            # enrols their OWN card on Reap's hosted page and approves each
+            # purchase there, so nothing here holds money or card data.
+            #
+            # SECOND IN THE BRANCH, AND IN ITS OWN try/except, for the two
+            # reasons the mig-207 block spells out at length. This branch is ONE
+            # try-block, so a statement that raises abandons every statement
+            # after it — being early means nothing downstream can starve these
+            # tables, and being wrapped means a failure HERE cannot starve the
+            # self-heals that follow. Both directions, which position alone
+            # cannot buy.
+            #
+            # These are the whole storage layer for the rail, not a column on an
+            # existing table: prod deploys skip db/migrations/, so without this
+            # block the tables do not exist in production at all and every call
+            # on the rail is an UndefinedTable 500.
+            #
+            # THE COVERAGE GATE CANNOT SEE THIS. tests/test_schema_guard_migration_
+            # coverage.py inspects ADD COLUMN only, so a missing CREATE TABLE
+            # self-heal is invisible to it — exactly the hole the mig-207 comment
+            # names. tests/test_reap_agentic_ledger.py::test_self_heal_* is the
+            # thing that actually checks it, on both dialects.
+            #
+            # THIS DDL MUST BUILD THE SAME SCHEMA AS
+            # db/migrations/224_reap_agentic_ledger.sql. Not "byte-identical" —
+            # that was the earlier wording here and it was a claim no test made,
+            # which is worse than a weaker claim that one does. What is actually
+            # enforced, by
+            # tests/test_reap_agentic_ledger_postgres.py::
+            # test_the_self_heal_builds_the_same_schema_as_the_migration, is that
+            # a database built by this block and one built by the migration agree
+            # on: every column (name, type, nullability, default, length), every
+            # index's `pg_indexes.indexdef` — so UNIQUE cannot quietly become
+            # non-unique — and every CHECK constraint's `pg_get_constraintdef`.
+            # Formatting and comments may differ; nothing the database acts on may.
+            #
+            # That test exists because the reviewer's mutant proved the old prose
+            # was load-bearing and unchecked: changing CREATE UNIQUE INDEX to
+            # CREATE INDEX in both branches here left the entire suite green.
+            try:
+                await database.execute(
+                    text(
+                        """
+                    CREATE TABLE IF NOT EXISTS reap_agentic_enrollments (
+                        id VARCHAR(64) PRIMARY KEY,
+                        buyer_ref VARCHAR(128) NOT NULL,
+                        agent_id VARCHAR(128),
+                        reap_enrollment_id VARCHAR(128),
+                        status VARCHAR(16) NOT NULL
+                            CHECK (status IN ('pending', 'active', 'dead')),
+                        reap_status VARCHAR(64),
+                        card_network VARCHAR(32),
+                        card_last4 VARCHAR(4)
+                            CHECK (card_last4 IS NULL OR length(card_last4) = 4),
+                        hosted_url TEXT,
+                        hosted_url_expires_at TIMESTAMPTZ,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                    );
+                        """
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS "
+                        "idx_reap_agentic_enrollments_buyer_status "
+                        "ON reap_agentic_enrollments (buyer_ref, status);"
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS "
+                        "uq_reap_agentic_enrollments_reap_id "
+                        "ON reap_agentic_enrollments (reap_enrollment_id) "
+                        "WHERE reap_enrollment_id IS NOT NULL;"
+                    )
+                )
+                # AT MOST ONE ACTIVE ENROLLMENT PER BUYER. With two, "which card
+                # did this buyer authorize?" has no answer. The ledger's
+                # mark_enrollment_active demotes the loser in the same
+                # transaction; this index is what makes that non-optional.
+                await database.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS "
+                        "uq_reap_agentic_enrollments_one_active "
+                        "ON reap_agentic_enrollments (buyer_ref) "
+                        "WHERE status = 'active';"
+                    )
+                )
+                await database.execute(
+                    text(
+                        """
+                    CREATE TABLE IF NOT EXISTS reap_agentic_purchases (
+                        id VARCHAR(64) PRIMARY KEY,
+                        buyer_ref VARCHAR(128) NOT NULL,
+                        agent_id VARCHAR(128),
+                        agent_user_ref_hash VARCHAR(64),
+                        enrollment_id VARCHAR(64),
+                        state VARCHAR(24) NOT NULL CHECK (state IN (
+                            'resolving', 'needs_enrollment', 'quoting', 'awaiting_approval',
+                            'processing', 'completed', 'failed', 'refused', 'expired'
+                        )),
+                        -- The clock the poll loop cannot reset: stamped at create and
+                        -- only by a statement that CHANGES state. `updated_at` is
+                        -- written by every claim/release/requeue, so an absolute
+                        -- waiting deadline measured from it never fires.
+                        state_entered_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        merchant_domain VARCHAR(255),
+                        product_key TEXT,
+                        variant_key TEXT,
+                        product_name TEXT,
+                        variant_title TEXT,
+                        brand TEXT,
+                        category TEXT,
+                        quantity INTEGER NOT NULL DEFAULT 1 CHECK (quantity > 0),
+                        currency VARCHAR(8),
+                        our_price_minor BIGINT,
+                        click_id VARCHAR(128),
+                        return_url TEXT,
+                        reap_product_id VARCHAR(128),
+                        reap_variant_id VARCHAR(128),
+                        reap_quote_id VARCHAR(128),
+                        reap_quote_expires_at TIMESTAMPTZ,
+                        reap_checkout_id VARCHAR(128),
+                        reap_order_id VARCHAR(128),
+                        quoted_total_minor BIGINT,
+                        final_total_minor BIGINT,
+                        shipping_minor BIGINT,
+                        tax_minor BIGINT,
+                        hosted_url TEXT,
+                        hosted_url_expires_at TIMESTAMPTZ,
+                        refusal_reason VARCHAR(64),
+                        queries_tried JSONB,
+                        last_error_code VARCHAR(64),
+                        attempts INTEGER NOT NULL DEFAULT 0,
+                        claimed_by VARCHAR(128),
+                        claimed_at TIMESTAMPTZ,
+                        next_poll_at TIMESTAMPTZ,
+                        shipping_address JSONB,
+                        buyer_email TEXT,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        terminal_at TIMESTAMPTZ
+                    );
+                        """
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS "
+                        "idx_reap_agentic_purchases_state_poll "
+                        "ON reap_agentic_purchases (state, next_poll_at);"
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS "
+                        "idx_reap_agentic_purchases_buyer_created "
+                        "ON reap_agentic_purchases (buyer_ref, created_at);"
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS "
+                        "idx_reap_agentic_purchases_owner_created "
+                        "ON reap_agentic_purchases "
+                        "(agent_id, agent_user_ref_hash, created_at);"
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS "
+                        "uq_reap_agentic_purchases_checkout "
+                        "ON reap_agentic_purchases (reap_checkout_id) "
+                        "WHERE reap_checkout_id IS NOT NULL;"
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                # Best-effort like every sibling, and it must not starve what
+                # follows. The rail itself is loud if this silently fails: every
+                # call against it is an UndefinedTable 500 rather than a wrong
+                # answer, so the failure is visible from the first request.
+                pass
+            # mig 225: the resolver's three hint columns.
+            #
+            # THIS DDL MUST BUILD THE SAME SCHEMA AS
+            # db/migrations/225_reap_agentic_purchase_hints.sql — not the same
+            # bytes. Leading whitespace differs and no test asserts otherwise;
+            # the same wording as the mig-224 block above, and for the same
+            # reason. What IS enforced, by
+            # tests/test_reap_agentic_ledger_postgres.py::
+            # test_the_self_heal_builds_the_hint_columns_identically_to_the_
+            # migration, is that the two builds agree on every column the
+            # catalog reports — name, type, nullability, default, length.
+            #
+            # ── ITS OWN try/except, AND THAT IS THE WHOLE POINT OF THIS BLOCK ──
+            #
+            # It used to be the LAST statement inside the mig-224 try above, and
+            # that was a real defect rather than a style question: every
+            # statement in that try can raise, and one of them raises on
+            # databases that exist. `CREATE UNIQUE INDEX
+            # uq_reap_agentic_enrollments_one_active` FAILS on a 224-shaped
+            # database that already holds two 'active' enrollments for one
+            # buyer_ref — reproduced by the reviewer. The raise abandoned every
+            # statement after it, so the three hint columns NEVER LANDED, and
+            # because production never runs db/migrations there was no other
+            # route: `create_purchase` then raised UndefinedColumnError on every
+            # call, forever, on exactly the databases that were already unwell.
+            #
+            # A failure of the CREATE TABLEs cannot starve this, and a failure
+            # HERE cannot starve the self-heals below. Both directions, which is
+            # what the mig-207 and mig-212 blocks buy the same way and for the
+            # same reason. Position alone buys neither.
+            #
+            # THIS IS ALSO THE SHAPE THE COVERAGE GATE CHECKS. The CREATE TABLEs
+            # above are invisible to tests/test_schema_guard_migration_coverage.py
+            # (it parses ADD COLUMN only) — an ALTER is not, so this one is gated
+            # at PR time as well as by the rail's own parity test.
+            #
+            # THE CREATE TABLE ABOVE DELIBERATELY DOES NOT CARRY THESE THREE, and
+            # this ALTER is what lands them on EVERY path. That keeps the two
+            # builds identical down to ordinal position: the migration route is
+            # `224 CREATE` then `225 ALTER`, and folding the columns into the
+            # CREATE here would make the self-heal's route `CREATE-with-them` —
+            # same column set, different order, and a needless second place to
+            # keep in step. On an empty database the CREATE runs and this ALTER
+            # adds three columns; on a 224-shaped database the CREATE is the
+            # no-op and this ALTER is the whole of the heal; on a 225-shaped one
+            # both are no-ops. All three arrivals end at one schema, which is
+            # what idempotent means here.
+            #
+            # The statement carries `IF EXISTS` on the table name, so on a
+            # database where the CREATE above genuinely failed this is a no-op
+            # rather than a second error.
+            #
+            # DO NOT WRITE THE TWO WORDS "A-L-T-E-R T-A-B-L-E" IN PROSE ANYWHERE
+            # IN THIS FILE. tests/test_schema_guard_migration_coverage.py scans
+            # this source with a regex that matches those words followed by a
+            # name and then captures everything up to the next `;` — a mention
+            # in a comment matches first, swallows the real statement below it
+            # into its body, and files these columns under a table called "if".
+            # The gate then reports migration 225 as uncovered. That happened,
+            # on this very comment.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS reap_agentic_purchases
+                            ADD COLUMN IF NOT EXISTS accept_variant_labels JSONB,
+                            ADD COLUMN IF NOT EXISTS also_accept_domains JSONB,
+                            ADD COLUMN IF NOT EXISTS market_country TEXT;
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 226: the three tables the agentic purchase ROUTES read —
+            # eligibility, the per-buyer opaque ref, and the idempotency keys.
+            # db/migrations/226_reap_agentic_routes.sql is the same schema; that
+            # file's header says what each one is for and why none of them could
+            # be a column on the purchase row.
+            #
+            # ITS OWN try/except, NOT folded into either block above. The mig-225
+            # comment records what folding cost last time: one statement in a
+            # shared try raised on databases that exist, and everything after it
+            # never landed. The failure modes here are not hypothetical either —
+            # `CREATE UNIQUE INDEX uq_reap_agentic_buyer_refs_ref` fails on a
+            # database that somehow holds two buyers with one ref, and if that
+            # raise could reach the mig-224 block it would take the whole rail's
+            # storage with it.
+            #
+            # AFTER the two blocks above rather than before them, which is the
+            # opposite of the mig-207 argument and deliberate: these three tables
+            # are read by a ROUTE that 404s while the dial is off, so a missing
+            # relation here is a refused purchase on a dark rail, not a declined
+            # card at a live checkout. The tables that ARE on the live path go
+            # first; this one takes its turn.
+            #
+            # THIS DDL MUST BUILD THE SAME SCHEMA AS THE MIGRATION — not the same
+            # bytes. What is enforced, by tests/test_agent_commerce_reap_routes_
+            # postgres.py::test_the_self_heal_builds_the_same_schema_as_migration
+            # _226, is that a database built from that file and one built by this
+            # block agree on every column, every index's `pg_indexes.indexdef`
+            # (so UNIQUE cannot quietly become non-unique), and every CHECK
+            # constraint's `pg_get_constraintdef`. Prose is not a test; that one
+            # is, and it was written because the reviewer's mutant on the mig-224
+            # pair proved the earlier wording was load-bearing and unchecked.
+            #
+            # The coverage gate cannot see any of this: tests/test_schema_guard_
+            # migration_coverage.py inspects one kind of statement only, and
+            # every statement here creates a relation rather than a column.
+            # ONE try PER STATEMENT, NOT ONE PER BLOCK. The first cut of this
+            # block shared a single try across all four statements, and its own
+            # comment named `CREATE UNIQUE INDEX uq_reap_agentic_buyer_refs_ref`
+            # as the realistic failure — on a database that already holds two
+            # buyers with one ref — while `CREATE TABLE
+            # reap_agentic_purchase_keys` sat AFTER it in the same try. That is
+            # exactly the mig-224/225 defect this file already carries a long
+            # comment about: the raise abandons every statement after it, so the
+            # keys table would never land, on precisely the databases that were
+            # already unwell, and production has no other route to it.
+            #
+            # Per statement, every arrival converges: each one is independently
+            # a no-op when its object exists, and a failure of any one cannot
+            # starve the others or the self-heals below.
+            try:
+                await database.execute(
+                    text(
+                        """
+                    CREATE TABLE IF NOT EXISTS reap_agentic_eligibility (
+                        merchant_domain VARCHAR(255) NOT NULL,
+                        product_key TEXT NOT NULL DEFAULT '',
+                        variant_key TEXT NOT NULL DEFAULT '',
+                        market_country VARCHAR(2) NOT NULL
+                            CHECK (market_country ~ '^[A-Z]{2}$'),
+                        enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                        accept_variant_labels JSONB,
+                        also_accept_domains JSONB,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        PRIMARY KEY (merchant_domain, market_country, product_key, variant_key)
+                    );
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                await database.execute(
+                    text(
+                        """
+                    CREATE TABLE IF NOT EXISTS reap_agentic_buyer_refs (
+                        buyer_id VARCHAR(50) PRIMARY KEY,
+                        reap_buyer_ref VARCHAR(128) NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                    );
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 227: the consent tag the buyer's enrollment hangs off.
+            #
+            # NOT FOLDED INTO THE CREATE ABOVE, DELIBERATELY. Folding it in
+            # would make this statement dead on a fresh database — the only
+            # kind CI builds — so deleting it would still pass every test while
+            # leaving the columns missing on exactly the databases that already
+            # hold a buyer_refs table, which is production. Kept separate, this
+            # statement is the whole of the heal on EVERY arrival: the CREATE
+            # builds the 226 shape and this brings it to 227, whether the table
+            # was born a second ago or a month ago.
+            #
+            # ITS OWN try, per the rule this block already follows. The columns
+            # are nullable with no default, so this cannot fail on data — but a
+            # raise here must not be able to starve the keys table below, which
+            # is the exact defect the comment above records.
+            #
+            # DO NOT WRITE THE TWO WORDS "A-L-T-E-R T-A-B-L-E" IN PROSE
+            # ANYWHERE IN THIS FILE — see the mig-225 comment above for the
+            # gate this breaks and how it broke it.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS reap_agentic_buyer_refs
+                            ADD COLUMN IF NOT EXISTS consent_version VARCHAR(32),
+                            ADD COLUMN IF NOT EXISTS consented_at TIMESTAMPTZ;
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                # THE STATEMENT THAT ACTUALLY FAILS IN THE FIELD. It cannot be
+                # created on a database that already holds two buyers sharing
+                # one ref, and that is the whole reason it has its own try.
+                await database.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS "
+                        "uq_reap_agentic_buyer_refs_ref "
+                        "ON reap_agentic_buyer_refs (reap_buyer_ref);"
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                await database.execute(
+                    text(
+                        """
+                    CREATE TABLE IF NOT EXISTS reap_agentic_purchase_keys (
+                        agent_id VARCHAR(128) NOT NULL,
+                        agent_user_ref_hash VARCHAR(64) NOT NULL,
+                        idempotency_key VARCHAR(128) NOT NULL,
+                        purchase_id VARCHAR(64) NOT NULL,
+                        request_hash VARCHAR(64) NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        PRIMARY KEY (agent_id, agent_user_ref_hash, idempotency_key)
+                    );
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 229: the purchase's ITEM SOURCE — 'reap_variant' (every row
+            # before this) or 'cart_link' (a Shopify cart permalink Reap quotes
+            # as received), plus the URL a cart_link row carries.
+            #
+            # THIS DDL MUST BUILD THE SAME SCHEMA AS
+            # db/migrations/229_reap_agentic_purchase_item_source.sql, CHECKs
+            # included — they carry the pairing rule (a cart_link row has a URL,
+            # a reap_variant row has none). Enforced through the catalog by
+            # tests/test_reap_agentic_cart_link_postgres.py and by the whole-
+            # table parity test in tests/test_reap_agentic_ledger_postgres.py.
+            #
+            # ITS OWN try/except, for the reason the mig-225 block above gives
+            # at length: a raise in a sibling must not starve these columns, and
+            # a raise here must not starve the heals that follow. The column
+            # constraints ride on `ADD COLUMN IF NOT EXISTS`, so a second run
+            # skips them with their columns rather than adding a duplicate.
+            #
+            # NOT folded into the CREATE TABLE above, same as mig 225: this is
+            # what lands the columns on EVERY path, in migration order.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS reap_agentic_purchases
+                            ADD COLUMN IF NOT EXISTS item_source TEXT NOT NULL DEFAULT 'reap_variant'
+                                CONSTRAINT ck_reap_agentic_purchases_item_source
+                                CHECK (item_source IN ('reap_variant', 'cart_link')),
+                            ADD COLUMN IF NOT EXISTS cart_url TEXT
+                                CONSTRAINT ck_reap_agentic_purchases_cart_url_pairing
+                                CHECK (
+                                    (item_source = 'reap_variant' AND cart_url IS NULL)
+                                    OR (item_source = 'cart_link' AND cart_url IS NOT NULL)
+                                );
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 236: the partner's settled amount and cut on an agent-share ledger row (ADR-025 D5,
+            # the agent's share is taken after a channel partner's). create_all built
+            # agent_share_ledger without them and never alters an existing table, so this is what
+            # lands them in prod. THIS DDL MUST MATCH db/migrations/236_agent_share_after_partner.sql
+            # and db/agent_share.py (pinned by tests/test_agent_share_accrual.py). Its OWN try, as
+            # above: a raise here must not starve the heals around it.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS agent_share_ledger
+                            ADD COLUMN IF NOT EXISTS partner_settled_minor BIGINT,
+                            ADD COLUMN IF NOT EXISTS merchant_billed_minor BIGINT,
+                            ADD COLUMN IF NOT EXISTS partner_cut_minor BIGINT;
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 229, second statement: one cart-link purchase per click. Its OWN try:
+            # on a database that already holds two cart-link rows for one click the
+            # build RAISES, and that must not cost the columns above or the heals below.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        CREATE UNIQUE INDEX IF NOT EXISTS uq_reap_agentic_purchases_cart_link_click
+                            ON reap_agentic_purchases (click_id)
+                            WHERE item_source = 'cart_link';
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 233: the consent that was in force when the purchase was OPENED,
+            # on the purchase row itself.
+            #
+            # WHY THE PURCHASE ROW AND NOT ONLY THE BUYER ROW (mig 227). WP4c
+            # deletes the `reap_agentic_buyer_refs` row when a buyer identity is
+            # repointed by a hosted-checkout sign-in, and that row was the sole
+            # carrier of the tag. These two columns are the copy nothing deletes;
+            # the refs row keeps its own pair as the LATEST consent, for re-use.
+            #
+            # ITS OWN try, per this block's rule. The columns are nullable with no
+            # default, so this cannot fail on data — but a raise here must not be
+            # able to starve the mig-230 heal below, which is the exact defect the
+            # mig-225 comment above records at length.
+            #
+            # NOT FOLDED INTO THE mig-224 CREATE TABLE ABOVE, deliberately and for
+            # the reason the mig-227 twin states: folded in, this would be dead on
+            # a fresh database — the only kind CI builds — so deleting it would
+            # pass every test while leaving the columns missing on exactly the
+            # databases that already hold a purchases table, which is production.
+            # Kept separate, this statement is the whole of the heal on EVERY
+            # arrival, and it lands the columns in migration order.
+            #
+            # DO NOT WRITE THE TWO WORDS "A-L-T-E-R T-A-B-L-E" IN PROSE ANYWHERE
+            # IN THIS FILE — see the mig-225 comment above for the gate this
+            # breaks and how it broke it.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS reap_agentic_purchases
+                            ADD COLUMN IF NOT EXISTS consent_version VARCHAR(32),
+                            ADD COLUMN IF NOT EXISTS consented_at TIMESTAMPTZ;
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 237: the chargeback part of commerce_attribution_edges.refund_amount_cents.
+            # Every refund and dispute write to the edge names this column
+            # (services/commerce_attribution_service.py _APPLY_REFUND_TOTAL_QUERY,
+            # _ATTRIBUTE_DISPUTE_QUERY), so without it those writes fail, and
+            # RefundService.create_refund makes its write INSIDE its own transaction.
+            # A constant default is a catalog-only change on PG11+, so this does not
+            # rewrite the table. Its OWN try, per this block's rule.
+            #
+            # LOCKING. `ADD COLUMN IF NOT EXISTS` takes the table's ACCESS EXCLUSIVE
+            # lock BEFORE it finds the column exists, so run bare it queued every
+            # read of commerce_attribution_edges behind it on EVERY boot. The
+            # information_schema check means the statement only runs while the
+            # column is missing, and the transaction-local 500ms lock_timeout means
+            # that one run gives up (and is retried next boot) instead of stalling
+            # the table, and the heals after it, for the guard's whole budget.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        DO $$
+                        BEGIN
+                            IF to_regclass('public.commerce_attribution_edges') IS NOT NULL
+                               AND NOT EXISTS (
+                                   SELECT 1 FROM information_schema.columns
+                                   WHERE table_name = 'commerce_attribution_edges'
+                                     AND column_name = 'dispute_amount_cents'
+                               ) THEN
+                                PERFORM set_config('lock_timeout', '500ms', true);
+                                ALTER TABLE IF EXISTS commerce_attribution_edges
+                                    ADD COLUMN IF NOT EXISTS dispute_amount_cents BIGINT NOT NULL DEFAULT 0;
+                            END IF;
+                        END $$;
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 237, second statement: the migration's >= 0 CHECK. Guarded on
+            # pg_constraint (as the apm_cadence_days heal is) so a boot does not
+            # re-validate the table every time, and bounded by the same 500ms
+            # lock_timeout as the column heal above. Its OWN try: a failure here
+            # must not undo, or be mistaken for, the column heal.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        DO $$
+                        BEGIN
+                            IF to_regclass('public.commerce_attribution_edges') IS NOT NULL
+                               AND EXISTS (
+                                   SELECT 1 FROM information_schema.columns
+                                   WHERE table_name = 'commerce_attribution_edges'
+                                     AND column_name = 'dispute_amount_cents'
+                               )
+                               AND NOT EXISTS (
+                                   SELECT 1 FROM pg_constraint
+                                   WHERE conname = 'ck_commerce_attribution_edges_dispute_amount_cents'
+                               ) THEN
+                                PERFORM set_config('lock_timeout', '500ms', true);
+                                ALTER TABLE commerce_attribution_edges
+                                    ADD CONSTRAINT ck_commerce_attribution_edges_dispute_amount_cents
+                                    CHECK (dispute_amount_cents >= 0);
+                            END IF;
+                        END $$;
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 230: the per-click attribution CLAIM for cart-link Reap purchases,
+            # and the index the merchant side needs to ask "is this click one of
+            # those?". THIS DDL MUST BUILD THE SAME SCHEMA AS
+            # db/migrations/230_conversion_click_claims.sql; compared through the
+            # catalog by tests/test_reap_agentic_cart_link_postgres.py
+            # (test_the_self_heal_builds_the_230_catalog_the_migration_builds).
+            #
+            # A CREATE TABLE, so the coverage gate (ADD COLUMN only) cannot see a
+            # missing heal here, the same hole the mig-224 block names. The parity
+            # test is what catches it.
+            #
+            # Best-effort like every sibling, and it fails SAFE: without the table
+            # the merchant side fails open (closes as before 230) and the Reap side
+            # fails closed (skips its edge), so a missing heal can never double an
+            # edge. The scope lookup's index is the item_source migration's partial
+            # unique index, healed with that migration.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        CREATE TABLE IF NOT EXISTS conversion_click_claims (
+                            click_id TEXT PRIMARY KEY,
+                            claimed_by TEXT NOT NULL
+                                CONSTRAINT ck_conversion_click_claims_claimed_by
+                                CHECK (claimed_by IN ('reap_agentic', 'merchant_order')),
+                            external_order_id TEXT,
+                            claimed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                        );
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 239 (ADR-025 D1): when a click id was ISSUED to an agent; NULL = legacy row
+            # first written by /r. The surface_click_events model names it, so every
+            # select(surface_click_events) needs it: its own try, and ADD COLUMN IF NOT EXISTS so
+            # the coverage gate sees it.
+            try:
+                # Guarded and bounded like the dispute heals (#2289): the ALTER runs only while
+                # the column is missing, and gives up after 500ms instead of queueing every read
+                # of surface_click_events behind it and eating the guard's startup budget.
+                await database.execute(
+                    text(
+                        """
+                        DO $$
+                        BEGIN
+                            IF to_regclass('public.surface_click_events') IS NOT NULL
+                               AND NOT EXISTS (
+                                   SELECT 1 FROM information_schema.columns
+                                   WHERE table_schema = 'public'
+                                     AND table_name = 'surface_click_events'
+                                     AND column_name = 'issued_at'
+                               ) THEN
+                                PERFORM set_config('lock_timeout', '500ms', true);
+                                ALTER TABLE IF EXISTS surface_click_events
+                                  ADD COLUMN IF NOT EXISTS issued_at TIMESTAMPTZ;
+                            END IF;
+                        END $$;
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 212: the recovery key — the join the Prove stage rests on.
+            # Early and wrapped for the same reason as mig 210 below: this
+            # branch is ONE try, and an unguarded CREATE INDEX further down
+            # abandons everything after it on a partial database.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS merchant_tasks
+                          ADD COLUMN IF NOT EXISTS recovery_key TEXT NULL;
+                        """
+                    )
+                )
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS commerce_interactions
+                          ADD COLUMN IF NOT EXISTS recovery_key VARCHAR(40) NULL;
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                # Best-effort like every sibling; must not starve what follows.
+                pass
+            # mig 228: Tier B cart-link eligibility. Early and in its own
+            # try, for the reasons the mig-207 block gives: this branch is ONE
+            # try, so being early means nothing upstream can starve it and
+            # being wrapped means a failure here cannot starve what follows.
+            # The DDL lives in db/tierb_cart_link_eligibility_schema (one
+            # definition, shared with the SQLite branch below); tests/
+            # test_tierb_cart_link_eligibility_postgres.py compares the schema
+            # it builds with db/migrations/228_* through the catalog.
+            try:
+                from db.tierb_cart_link_eligibility_schema import (
+                    ensure_schema as _ensure_tierb_cart_link_eligibility,
+                )
+
+                await _ensure_tierb_cart_link_eligibility()
+            except Exception:  # noqa: BLE001
+                # Loud elsewhere if it fails: the job's first write is an
+                # UndefinedTable error, and it exits non-zero.
+                pass
+            # mig 215: collector token registry. Early and wrapped like its
+            # siblings: the issue routes INSERT into these tables, so a deploy
+            # that skips db/migrations/ would fail every token provisioning
+            # until they exist. Both tables here, both in the migration.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        CREATE TABLE IF NOT EXISTS merchant_collector_tokens (
+                            jti VARCHAR(64) PRIMARY KEY,
+                            merchant_id VARCHAR(50) NOT NULL,
+                            store_id VARCHAR(128) NOT NULL,
+                            token_type VARCHAR(32) NOT NULL,
+                            token_version INTEGER NOT NULL,
+                            store_token_version INTEGER NOT NULL,
+                            allowed_origins JSONB NULL,
+                            issued_at TIMESTAMPTZ NOT NULL,
+                            expires_at TIMESTAMPTZ NOT NULL,
+                            revoked_at TIMESTAMPTZ NULL,
+                            revoked_reason VARCHAR(64) NULL,
+                            superseded_by VARCHAR(64) NULL,
+                            issued_by VARCHAR(128) NULL,
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                        );
+                        """
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS idx_merchant_collector_tokens_store "
+                        "ON merchant_collector_tokens (merchant_id, store_id);"
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS idx_merchant_collector_tokens_expiring "
+                        "ON merchant_collector_tokens (expires_at) WHERE revoked_at IS NULL;"
+                    )
+                )
+                await database.execute(
+                    text(
+                        """
+                        CREATE TABLE IF NOT EXISTS merchant_collector_token_policy (
+                            store_id VARCHAR(128) PRIMARY KEY,
+                            merchant_id VARCHAR(50) NOT NULL,
+                            min_token_version INTEGER NOT NULL DEFAULT 1,
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                        );
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                # Best-effort like every sibling; must not starve what follows.
+                pass
+            # mig 220: source + run_id on the preflight observations. `web` deploys
+            # with SKIP_HEAVY_STARTUP_INIT, so db/migrations/ never runs there and
+            # db/catalog.py's model is what builds the table — but only on a database
+            # that does not have it YET. An existing prod table predates these two
+            # columns and create_all will not alter it, so without this heal
+            # `record()` fails every INSERT on an unknown column and swallows the
+            # error, and shadow mode stops recording with only a dropped log line to
+            # show for it. Two columns in the migration, two here.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS checkout_preflight_observations
+                          ADD COLUMN IF NOT EXISTS source VARCHAR(32) NOT NULL DEFAULT 'live',
+                          ADD COLUMN IF NOT EXISTS run_id VARCHAR(64) NULL;
+                        """
+                    )
+                )
+                # The index too, or an existing prod table never gets it: create_all only
+                # builds indexes on a table it creates, and db/migrations/ does not run here.
+                await database.execute(
+                    text(
+                        """
+                        CREATE INDEX IF NOT EXISTS idx_checkout_preflight_obs_run
+                          ON checkout_preflight_observations (run_id);
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                # Best-effort like every sibling; must not starve what follows.
+                pass
+
+            # mig 213: trust provenance on the commerce ledger. Early and
+            # wrapped like mig 212: the SQLAlchemy INSERT names every modeled
+            # column, so a deploy that skips db/migrations/ would fail every
+            # canonical event write until these columns exist. Four columns in
+            # the migration, four here.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS commerce_interaction_events
+                          ADD COLUMN IF NOT EXISTS write_path VARCHAR(48) NULL,
+                          ADD COLUMN IF NOT EXISTS authority VARCHAR(16) NULL,
+                          ADD COLUMN IF NOT EXISTS agent_identity_confidence VARCHAR(24) NULL,
+                          ADD COLUMN IF NOT EXISTS synthetic BOOLEAN NOT NULL DEFAULT FALSE;
+                        """
+                    )
+                )
+                # The mig-214 partial index is deliberately absent here: it
+                # rolls out CONCURRENTLY, which this guard's transaction
+                # cannot do, and nothing on the write path needs it.
+            except Exception:  # noqa: BLE001
+                # Best-effort like every sibling; must not starve what follows.
+                pass
+            # mig 216: the canonical order_ref. Early and wrapped like mig 213
+            # for the same reason: the SQLAlchemy INSERT names every modeled
+            # column, so a deploy that skips db/migrations/ would fail every
+            # canonical event write until BOTH columns exist. Two columns in
+            # the migration, two here; and unlike mig 214's index this one is
+            # built normally (order_ref is new and all-NULL, so there is
+            # nothing to scan), so the guard carries it too.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS commerce_interactions
+                          ADD COLUMN IF NOT EXISTS order_ref VARCHAR(160) NULL;
+                        """
+                    )
+                )
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS commerce_interaction_events
+                          ADD COLUMN IF NOT EXISTS order_ref VARCHAR(160) NULL;
+                        """
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS ix_commerce_interactions_order_ref "
+                        "ON commerce_interactions (order_ref);"
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS ix_commerce_interaction_events_order_ref "
+                        "ON commerce_interaction_events (order_ref);"
+                    )
+                )
+                # The stitch rests on this one: without it two authorities can
+                # both insert an interaction for the same canonical order and
+                # neither insert raises.
+                await database.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS "
+                        "idx_commerce_interactions_order_ref_unique "
+                        "ON commerce_interactions (merchant_id, COALESCE(store_id, ''), order_ref) "
+                        "WHERE order_ref IS NOT NULL;"
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                # Best-effort like every sibling; must not starve what follows.
+                pass
+            # mig 210: anonymous audit runs. Position and wrapping are BOTH
+            # load-bearing, and neither alone is enough — measured, not assumed.
+            #
+            # Sitting at the end of the chain, this block NEVER RAN on a
+            # partial database: `CREATE INDEX ... ON commerce_interactions`
+            # ~1600 lines below has no IF EXISTS guard on its table, raises
+            # UndefinedTable, and abandons every statement after it. Reproduced
+            # 2026-09-03 on a database holding only merchant_audit_runs —
+            # merchant_id stayed NOT NULL and merchant_claimed_at was never
+            # added, i.e. the one deploy shape this self-heal exists for.
+            # Wrapping alone would not have fixed it: the abort happens
+            # UPSTREAM, so the block has to move too. Same answer the mig-207
+            # block above reaches, for the same reason.
+            #
+            # Both halves must be here. A deploy that skips db/migrations/
+            # would otherwise leave merchant_id NOT NULL with the column
+            # present, and every anonymous insert would fail. The
+            # schema-guard-coverage gate only inspects ADD COLUMN, so the
+            # DROP NOT NULL is carried deliberately, and the partial index
+            # with it — three statements in the migration, three here.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS merchant_audit_runs
+                          ADD COLUMN IF NOT EXISTS merchant_claimed_at TIMESTAMPTZ;
+                        """
+                    )
+                )
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS merchant_audit_runs
+                          ALTER COLUMN merchant_id DROP NOT NULL;
+                        """
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS "
+                        "idx_merchant_audit_runs_unclaimed "
+                        "ON merchant_audit_runs (requested_at DESC) "
+                        "WHERE merchant_id IS NULL;"
+                    )
+                )
+                # mig 211 (#2020): one unclaimed funnel run per domain. NOT
+                # CONCURRENTLY here — this path runs inside the guard's own
+                # transaction, where CONCURRENTLY is illegal. On a database
+                # that reaches this code the table is small or the index
+                # already exists; the migration carries the CONCURRENTLY form
+                # for the hot production table.
+                await database.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS "
+                        "idx_funnel_run_one_per_domain ON merchant_audit_runs "
+                        "((partial_result_jsonb->'funnel'->>'domain')) "
+                        "WHERE merchant_id IS NULL "
+                        "AND subject_type = 'public_funnel';"
+                    )
+                )
+            except Exception:
+                # Best-effort, like every sibling. Failing here is fail-CLOSED
+                # (anonymous inserts error); it must not starve what follows.
+                pass
+            # Universal commerce collector references (migration 204). Railway
+            # fast-mode skips migrations, while SQLAlchemy SELECTs materialize
+            # every modeled column; self-heal before the first event arrives.
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS commerce_interactions
+                      ADD COLUMN IF NOT EXISTS store_id VARCHAR(128),
+                      ADD COLUMN IF NOT EXISTS cart_id VARCHAR(128),
+                      ADD COLUMN IF NOT EXISTS payment_id VARCHAR(128),
+                      ADD COLUMN IF NOT EXISTS visitor_id VARCHAR(128);
+                    """
+                )
+            )
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS commerce_interactions
+                      ALTER COLUMN checkout_id TYPE VARCHAR(128),
+                      ALTER COLUMN order_id TYPE VARCHAR(128),
+                      ALTER COLUMN refund_id TYPE VARCHAR(128),
+                      ALTER COLUMN return_id TYPE VARCHAR(128);
+                    """
+                )
+            )
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS commerce_interaction_events
+                      ADD COLUMN IF NOT EXISTS store_id VARCHAR(128),
+                      ADD COLUMN IF NOT EXISTS cart_id VARCHAR(128),
+                      ADD COLUMN IF NOT EXISTS payment_id VARCHAR(128),
+                      ADD COLUMN IF NOT EXISTS visitor_id VARCHAR(128);
+                    """
+                )
+            )
+            for statement in (
+                "CREATE INDEX IF NOT EXISTS idx_commerce_interactions_store "
+                "ON commerce_interactions(merchant_id, platform, store_id)",
+                "CREATE INDEX IF NOT EXISTS idx_commerce_interactions_store_cart "
+                "ON commerce_interactions(merchant_id, store_id, cart_id) WHERE cart_id IS NOT NULL",
+                "CREATE INDEX IF NOT EXISTS idx_commerce_interactions_store_payment "
+                "ON commerce_interactions(merchant_id, store_id, payment_id) WHERE payment_id IS NOT NULL",
+                "CREATE INDEX IF NOT EXISTS idx_commerce_interactions_store_session "
+                "ON commerce_interactions(merchant_id, store_id, session_id) WHERE session_id IS NOT NULL",
+                "CREATE INDEX IF NOT EXISTS idx_commerce_interaction_events_store "
+                "ON commerce_interaction_events(merchant_id, platform, store_id)",
+                "CREATE INDEX IF NOT EXISTS idx_commerce_interaction_events_cart "
+                "ON commerce_interaction_events(merchant_id, cart_id) WHERE cart_id IS NOT NULL",
+                "CREATE INDEX IF NOT EXISTS idx_commerce_interaction_events_payment "
+                "ON commerce_interaction_events(merchant_id, payment_id) WHERE payment_id IS NOT NULL",
+            ):
+                await database.execute(text(statement))
+
+            # Migration 205: external platform references are local to a
+            # merchant/store. Replace only legacy global indexes; once the
+            # scoped definition is present this block performs no DDL.
+            await database.execute(
+                text(
+                    """
+                    DO $$
+                    DECLARE
+                      ref_col TEXT;
+                      idx_name TEXT;
+                      idx_def TEXT;
+                    BEGIN
+                      FOREACH ref_col IN ARRAY ARRAY[
+                        'click_id', 'quote_id', 'checkout_id',
+                        'order_id', 'refund_id', 'return_id'
+                      ] LOOP
+                        idx_name := 'idx_commerce_interactions_' || ref_col || '_unique';
+                        SELECT indexdef INTO idx_def
+                          FROM pg_indexes
+                         WHERE schemaname = current_schema()
+                           AND indexname = idx_name;
+                        IF idx_def IS NULL
+                           OR position('merchant_id' IN idx_def) = 0
+                           OR position('store_id' IN idx_def) = 0 THEN
+                          EXECUTE format('DROP INDEX IF EXISTS %I', idx_name);
+                          EXECUTE format(
+                            'CREATE UNIQUE INDEX %I ON commerce_interactions '
+                            || '(merchant_id, COALESCE(store_id, ''''), %I) '
+                            || 'WHERE %I IS NOT NULL',
+                            idx_name, ref_col, ref_col
+                          );
+                        END IF;
+                      END LOOP;
+                    END $$;
+                    """
+                )
+            )
+
             await database.execute(
                 text(
                     """
@@ -639,6 +1890,7 @@ async def ensure_required_schema_light() -> None:
                       ADD COLUMN IF NOT EXISTS lifestyle_tags JSONB,
                       ADD COLUMN IF NOT EXISTS demographic VARCHAR(16),
                       ADD COLUMN IF NOT EXISTS category_path VARCHAR(255),
+                      ADD COLUMN IF NOT EXISTS category_label VARCHAR(255),
                       ADD COLUMN IF NOT EXISTS category_confidence REAL,
                       ADD COLUMN IF NOT EXISTS category_label_source VARCHAR(32),
                       ADD COLUMN IF NOT EXISTS pdp_lifecycle_stage VARCHAR(16);
@@ -1047,6 +2299,88 @@ async def ensure_required_schema_light() -> None:
                     CREATE INDEX IF NOT EXISTS idx_external_product_seeds_seller_ref
                       ON external_product_seeds (seller_ref)
                       WHERE seller_ref IS NOT NULL;
+                    """
+                )
+            )
+            # Destination liveness (migration 200). Railway deploys skip
+            # db/migrations/, so self-heal here — and these columns are load-bearing
+            # for the readiness gate the moment the sweep starts writing them.
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS external_product_seeds
+                      ADD COLUMN IF NOT EXISTS destination_checked_at TIMESTAMPTZ,
+                      ADD COLUMN IF NOT EXISTS destination_http_status INTEGER,
+                      ADD COLUMN IF NOT EXISTS destination_verdict TEXT,
+                      ADD COLUMN IF NOT EXISTS destination_failure_streak INTEGER NOT NULL DEFAULT 0;
+                    """
+                )
+            )
+            await database.execute(
+                text(
+                    """
+                    DO $$
+                    BEGIN
+                        IF NOT EXISTS (
+                            SELECT 1 FROM pg_constraint
+                            WHERE conname = 'ck_external_product_seeds_destination_verdict'
+                        ) THEN
+                            ALTER TABLE external_product_seeds
+                                ADD CONSTRAINT ck_external_product_seeds_destination_verdict
+                                CHECK (
+                                    destination_verdict IS NULL
+                                    OR destination_verdict IN (
+                                        'live',
+                                        'live_delisted',
+                                        'redirected_to_product',
+                                        'redirected_off_product',
+                                        'dead_404',
+                                        'unverifiable'
+                                    )
+                                );
+                        END IF;
+                    END $$;
+                    """
+                )
+            )
+            await database.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_external_product_seeds_destination_checked
+                      ON external_product_seeds (destination_checked_at NULLS FIRST)
+                      WHERE status = 'active';
+                    """
+                )
+            )
+            # Content freshness (migration 202). Railway deploys skip db/migrations/,
+            # so self-heal here. The refresh queue orders on this column, and until it
+            # exists that ORDER BY is a hard error rather than a degraded ordering --
+            # `last_crawled_at` is referenced unconditionally by
+            # get_external_referral_refresh_candidate_seed_ids.
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS external_product_seeds
+                      ADD COLUMN IF NOT EXISTS last_crawled_at TIMESTAMPTZ,
+                      ADD COLUMN IF NOT EXISTS last_crawl_attempt_at TIMESTAMPTZ;
+                    """
+                )
+            )
+            await database.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_external_product_seeds_last_crawl_attempt
+                      ON external_product_seeds (last_crawl_attempt_at NULLS FIRST)
+                      WHERE status = 'active';
+                    """
+                )
+            )
+            await database.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_external_product_seeds_destination_verdict
+                      ON external_product_seeds (destination_verdict)
+                      WHERE destination_verdict IS NOT NULL;
                     """
                 )
             )
@@ -1685,6 +3019,55 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
+            # mig 202: Reap webhook reconciliation columns on agent_issued_cards. The
+            # webhook path UPDATEs these at runtime; a deploy that skipped migrations
+            # would 500 on the first issuer report. reap_webhook_events itself is
+            # CREATE TABLE IF NOT EXISTS in the migration and the table is only
+            # touched via explicit SQL here, but the COLUMNS ride on a table born in
+            # mig 201, so self-heal them the same way.
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS agent_issued_cards
+                      ADD COLUMN IF NOT EXISTS last_auth_at TIMESTAMPTZ,
+                      ADD COLUMN IF NOT EXISTS auth_count INTEGER NOT NULL DEFAULT 0,
+                      ADD COLUMN IF NOT EXISTS settled_amount_minor BIGINT;
+                    """
+                )
+            )
+            # mig 207: merchant_order_sync_jobs.progress — the durable queue for
+            # post-payment merchant-order sync. The TABLE is born in mig 207 and
+            # also self-heals via
+            # db/merchant_order_sync_jobs.ensure_merchant_order_sync_jobs_table(),
+            # which every accessor calls; this heals the one column added after
+            # that file's first cut, since CREATE TABLE IF NOT EXISTS is a no-op
+            # on a table that already exists. ALTER ... IF EXISTS so it no-ops
+            # harmlessly wherever the table has not been created yet.
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS merchant_order_sync_jobs
+                      ADD COLUMN IF NOT EXISTS progress TEXT;
+                    """
+                )
+            )
+            # mig 209: citation_observations.destination_rank +
+            # .is_primary_destination — B3's "where did the answer send the
+            # buyer?" columns. The audit deposit path INSERTs both on every
+            # citation it writes, and it builds that INSERT from the SQLAlchemy
+            # Table, so a deploy that skipped migrations would name a column the
+            # database does not have and fail every citation write in the run.
+            # db/audit_evidence.py carries the same two ALTERs in its own inline
+            # backstop; this is the startup half of the pair.
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS citation_observations
+                      ADD COLUMN IF NOT EXISTS destination_rank INTEGER,
+                      ADD COLUMN IF NOT EXISTS is_primary_destination BOOLEAN NOT NULL DEFAULT FALSE;
+                    """
+                )
+            )
             # mig 109: commerce_attribution_edges.net_attributed_gmv_cents — STORED generated column
             # (derived from refund_amount_cents, added above). Emitted LAST so this
             # lone potential table-rewrite can't block the lightweight self-heals;
@@ -1701,6 +3084,574 @@ async def ensure_required_schema_light() -> None:
             return
 
         if IS_SQLITE:
+            # mig 231: the merchant purchasability fact, SQLite twin.
+            #
+            # NOT byte-identical to the Postgres DDL, and the differences are the
+            # ones this branch always makes: TIMESTAMPTZ -> TIMESTAMP, JSONB ->
+            # TEXT (SQLite has no JSON affinity; the module encodes and decodes),
+            # and the regex CHECK -> the length/upper pair SQLite can evaluate,
+            # exactly as the mig-226 eligibility twin below writes it.
+            #
+            # SQL-ONLY, no SQLAlchemy Table, for the reason the mig-224 twin gives:
+            # a `Table` would make the model the source of truth because
+            # `metadata.create_all` runs BEFORE db/migrations in main.py, and then
+            # the SQLite half of this rail's tests would be testing a schema that
+            # exists nowhere. Its own try, so it cannot starve what follows.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        CREATE TABLE IF NOT EXISTS merchant_purchasability (
+                            merchant_domain VARCHAR(255) NOT NULL,
+                            market_country VARCHAR(2) NOT NULL
+                                CONSTRAINT ck_merchant_purchasability_market
+                                CHECK (length(market_country) = 2
+                                       AND market_country = upper(market_country)),
+                            vantage VARCHAR(32) NOT NULL,
+                            checked_at TIMESTAMP,
+                            verdict VARCHAR(32),
+                            card_available BOOLEAN,
+                            payment_methods TEXT,
+                            landed_price_minor BIGINT,
+                            landed_currency VARCHAR(8),
+                            expected_price_minor BIGINT,
+                            price_drift_minor BIGINT,
+                            variant_id VARCHAR(32),
+                            evidence TEXT,
+                            consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                            positive_until TIMESTAMP,
+                            PRIMARY KEY (merchant_domain, market_country, vantage)
+                        );
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 231, second statement: the due-list index, SQLite twin. Its own
+            # try, same reason as the Postgres half.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        CREATE INDEX IF NOT EXISTS idx_merchant_purchasability_due
+                            ON merchant_purchasability (checked_at);
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 232, SQLite twin: THERE IS NO STATEMENT HERE, AND THAT IS THE ANSWER.
+            #
+            # SQLite cannot alter a CHECK in place. There is no DROP CONSTRAINT and no ADD
+            # CONSTRAINT; widening one means rebuilding the table (create-new, copy, drop, rename)
+            # under `PRAGMA legacy_alter_table`, and doing that here — best-effort, inside a try
+            # that swallows everything, against a table another statement in this same branch may
+            # have just created — risks losing the rows on a partial failure. That trade is not
+            # worth taking for this table.
+            #
+            # IT IS SAFE TO OMIT because of where SQLite is used: dev machines and the test suite,
+            # both of which build the schema from scratch. `ensure_schema` below runs the
+            # `CREATE TABLE IF NOT EXISTS` in db/tierb_cart_link_eligibility_schema.py, whose
+            # verdict list ALREADY carries NO_CARD_PAYMENT and PRICE_DRIFT, so every SQLite
+            # database born after this change has the wide vocabulary. Only a SQLite file that
+            # predates it keeps the narrow one, and the fix for that file is to delete it.
+            #
+            # Production is Postgres, and the Postgres branch above does heal it in place.
+            # mig 228: Tier B cart-link eligibility, SQLite twin — the same
+            # function as the Postgres branch; it picks the dialect's DDL.
+            # SQL-only (no SQLAlchemy Table) for the reason the mig-224 block
+            # below gives. Its own try, so it cannot starve what follows.
+            try:
+                from db.tierb_cart_link_eligibility_schema import (
+                    ensure_schema as _ensure_tierb_cart_link_eligibility,
+                )
+
+                await _ensure_tierb_cart_link_eligibility()
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 224: the Reap AGENTIC rail's two tables, SQLite twin.
+            #
+            # THE SQLITE BRANCH HAS ONLY EVER DONE `ADD COLUMN` UNTIL NOW, and
+            # that is not an oversight to copy: every other table reached from a
+            # SQLite database is either in `metadata` (so create_all builds it)
+            # or is created on demand by its own module's `_ensure_*_table`.
+            # These two are neither. They are SQL-ONLY on purpose — a SQLAlchemy
+            # `Table` would make the model the source of truth, because
+            # `metadata.create_all` runs BEFORE db/migrations in main.py — so
+            # without this block a dev or test SQLite database never gets them
+            # at all, and the SQLite half of this rail's tests would be testing
+            # a schema that exists nowhere.
+            #
+            # WHY IT IS NOT BYTE-IDENTICAL TO THE POSTGRES DDL, unlike the two
+            # halves of the mig-224 self-heal above: `now()` is not a SQLite
+            # function (CURRENT_TIMESTAMP is), and JSONB is not a SQLite type
+            # name — declaring it would give the column NUMERIC affinity, which
+            # is the same trap as `CAST(:x AS JSONB)`. TIMESTAMPTZ -> TIMESTAMP
+            # follows the convention the `sqlite_type` map below already states.
+            # Everything that carries MEANING — the CHECK vocabularies, the
+            # NOT NULLs, the partial unique indexes — is identical, because
+            # those are what the tests and the invariants rest on.
+            #
+            # Its own try/except, same contract as the Postgres siblings: a
+            # failure here must not starve the ADD COLUMN heals below.
+            try:
+                await database.execute(
+                    text(
+                        """
+                    CREATE TABLE IF NOT EXISTS reap_agentic_enrollments (
+                        id VARCHAR(64) PRIMARY KEY,
+                        buyer_ref VARCHAR(128) NOT NULL,
+                        agent_id VARCHAR(128),
+                        reap_enrollment_id VARCHAR(128),
+                        status VARCHAR(16) NOT NULL
+                            CHECK (status IN ('pending', 'active', 'dead')),
+                        reap_status VARCHAR(64),
+                        card_network VARCHAR(32),
+                        card_last4 VARCHAR(4)
+                            CHECK (card_last4 IS NULL OR length(card_last4) = 4),
+                        hosted_url TEXT,
+                        hosted_url_expires_at TIMESTAMP,
+                        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                        """
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS "
+                        "idx_reap_agentic_enrollments_buyer_status "
+                        "ON reap_agentic_enrollments (buyer_ref, status);"
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS "
+                        "uq_reap_agentic_enrollments_reap_id "
+                        "ON reap_agentic_enrollments (reap_enrollment_id) "
+                        "WHERE reap_enrollment_id IS NOT NULL;"
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS "
+                        "uq_reap_agentic_enrollments_one_active "
+                        "ON reap_agentic_enrollments (buyer_ref) "
+                        "WHERE status = 'active';"
+                    )
+                )
+                await database.execute(
+                    text(
+                        """
+                    CREATE TABLE IF NOT EXISTS reap_agentic_purchases (
+                        id VARCHAR(64) PRIMARY KEY,
+                        buyer_ref VARCHAR(128) NOT NULL,
+                        agent_id VARCHAR(128),
+                        agent_user_ref_hash VARCHAR(64),
+                        enrollment_id VARCHAR(64),
+                        state VARCHAR(24) NOT NULL CHECK (state IN (
+                            'resolving', 'needs_enrollment', 'quoting', 'awaiting_approval',
+                            'processing', 'completed', 'failed', 'refused', 'expired'
+                        )),
+                        -- The clock the poll loop cannot reset: stamped at create and
+                        -- only by a statement that CHANGES state. `updated_at` is
+                        -- written by every claim/release/requeue, so an absolute
+                        -- waiting deadline measured from it never fires.
+                        state_entered_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        merchant_domain VARCHAR(255),
+                        product_key TEXT,
+                        variant_key TEXT,
+                        product_name TEXT,
+                        variant_title TEXT,
+                        brand TEXT,
+                        category TEXT,
+                        quantity INTEGER NOT NULL DEFAULT 1 CHECK (quantity > 0),
+                        currency VARCHAR(8),
+                        our_price_minor BIGINT,
+                        click_id VARCHAR(128),
+                        return_url TEXT,
+                        reap_product_id VARCHAR(128),
+                        reap_variant_id VARCHAR(128),
+                        reap_quote_id VARCHAR(128),
+                        reap_quote_expires_at TIMESTAMP,
+                        reap_checkout_id VARCHAR(128),
+                        reap_order_id VARCHAR(128),
+                        quoted_total_minor BIGINT,
+                        final_total_minor BIGINT,
+                        shipping_minor BIGINT,
+                        tax_minor BIGINT,
+                        hosted_url TEXT,
+                        hosted_url_expires_at TIMESTAMP,
+                        refusal_reason VARCHAR(64),
+                        queries_tried TEXT,
+                        last_error_code VARCHAR(64),
+                        attempts INTEGER NOT NULL DEFAULT 0,
+                        claimed_by VARCHAR(128),
+                        claimed_at TIMESTAMP,
+                        next_poll_at TIMESTAMP,
+                        shipping_address TEXT,
+                        buyer_email TEXT,
+                        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        terminal_at TIMESTAMP
+                    );
+                        """
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS "
+                        "idx_reap_agentic_purchases_state_poll "
+                        "ON reap_agentic_purchases (state, next_poll_at);"
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS "
+                        "idx_reap_agentic_purchases_buyer_created "
+                        "ON reap_agentic_purchases (buyer_ref, created_at);"
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS "
+                        "idx_reap_agentic_purchases_owner_created "
+                        "ON reap_agentic_purchases "
+                        "(agent_id, agent_user_ref_hash, created_at);"
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS "
+                        "uq_reap_agentic_purchases_checkout "
+                        "ON reap_agentic_purchases (reap_checkout_id) "
+                        "WHERE reap_checkout_id IS NOT NULL;"
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 225: the resolver's three hint columns, SQLite twin.
+            #
+            # ── TWO LAYERS OF try, AND EACH ONE ANSWERS A DIFFERENT FAILURE ──
+            #
+            # OUTER (here): this loop is OUTSIDE the mig-224 try above, for the
+            # reason the Postgres sibling spells out at length — every statement
+            # in that try can raise, one of them raises on databases that exist,
+            # and a raise there used to abandon these three columns forever on
+            # exactly the databases that were already unwell.
+            #
+            # INNER (per column): SQLite's ALTER TABLE has NO `IF NOT EXISTS`
+            # for ADD COLUMN and NO multi-clause ADD, so the Postgres statement
+            # cannot be reused verbatim. A duplicate column raises
+            # OperationalError("duplicate column name: …"), which is the no-op
+            # this branch has to spell with an except — and a SHARED try would
+            # make the FIRST already-present column abandon the two after it,
+            # leaving a partially-healed table permanently short. Per column,
+            # every run converges.
+            #
+            # The statement here cannot carry `IF EXISTS` on the table name
+            # (SQLite has no such form), so on a database where the CREATE above
+            # genuinely failed each one raises "no such table" and the inner
+            # except absorbs it — the same no-op, reached by a different error.
+            #
+            # JSONB IS NOT A SQLITE TYPE NAME: declaring it would give the column
+            # NUMERIC affinity and silently store 0 for a JSON payload, which is
+            # the same trap as `CAST(:x AS JSONB)` — see property 3 in
+            # db/reap_agentic_ledger.py's header. TEXT, like the queries_tried /
+            # shipping_address twins above.
+            try:
+                for _hint_column, _hint_type in (
+                    ("accept_variant_labels", "TEXT"),
+                    ("also_accept_domains", "TEXT"),
+                    ("market_country", "TEXT"),
+                ):
+                    try:
+                        await database.execute(
+                            text(
+                                f"ALTER TABLE reap_agentic_purchases "
+                                f"ADD COLUMN {_hint_column} {_hint_type};"
+                            )
+                        )
+                    except Exception:  # noqa: BLE001
+                        # Almost always "duplicate column name" — the column is
+                        # already there and this run had nothing to do. Continue
+                        # so the remaining columns still get their chance.
+                        continue
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 226, SQLite twin: eligibility, the per-buyer opaque ref, and
+            # the idempotency keys. Same argument as the mig-224 twin above for
+            # why these are here at all — they are SQL-only tables, absent from
+            # `metadata`, so without this block a dev or test SQLite database
+            # never gets them and the SQLite arm of the route tests would be
+            # testing a schema that exists nowhere.
+            #
+            # THREE DELIBERATE DIFFERENCES FROM THE POSTGRES DDL, and no others:
+            #   now()        -> CURRENT_TIMESTAMP   (not a SQLite function)
+            #   TIMESTAMPTZ  -> TIMESTAMP           (the convention the
+            #                                        `sqlite_type` map below
+            #                                        already states)
+            #   JSONB        -> TEXT                (JSONB is not a SQLite type
+            #                                        name; declaring it gives the
+            #                                        column NUMERIC affinity and
+            #                                        silently stores 0 for a JSON
+            #                                        payload — the same trap as
+            #                                        `CAST(:x AS JSONB)`)
+            #
+            # The `market_country` CHECK is the fourth difference and the only
+            # one that is not a type name. Postgres spells it with the regex
+            # operator, which SQLite does not have; the twin spells the same rule
+            # as a length-and-case test. Neither is the authority — the route
+            # uppercases and regex-checks the value before it is ever bound, and
+            # db/reap_agentic_ledger._require_country checks it again on the way
+            # into the purchase row. These CHECKs are the third line, kept
+            # because a table that can hold `usa` is a table somebody will
+            # eventually put `usa` in by hand.
+            #
+            # Everything that carries MEANING is identical: the PRIMARY KEYs, the
+            # NOT NULLs, the `enabled` default of FALSE (a half-configured row is
+            # not an authorization to spend), and the UNIQUE on reap_buyer_ref.
+            #
+            # Its own try/except, same contract as its Postgres sibling and as
+            # the mig-224 twin above: a failure here must not starve the ADD
+            # COLUMN heals below.
+            # ONE try PER STATEMENT, NOT ONE PER BLOCK. The first cut of this
+            # block shared a single try across all four statements, and its own
+            # comment named `CREATE UNIQUE INDEX uq_reap_agentic_buyer_refs_ref`
+            # as the realistic failure — on a database that already holds two
+            # buyers with one ref — while `CREATE TABLE
+            # reap_agentic_purchase_keys` sat AFTER it in the same try. That is
+            # exactly the mig-224/225 defect this file already carries a long
+            # comment about: the raise abandons every statement after it, so the
+            # keys table would never land, on precisely the databases that were
+            # already unwell, and production has no other route to it.
+            #
+            # Per statement, every arrival converges: each one is independently
+            # a no-op when its object exists, and a failure of any one cannot
+            # starve the others or the self-heals below.
+            try:
+                await database.execute(
+                    text(
+                        """
+                    CREATE TABLE IF NOT EXISTS reap_agentic_eligibility (
+                        merchant_domain VARCHAR(255) NOT NULL,
+                        product_key TEXT NOT NULL DEFAULT '',
+                        variant_key TEXT NOT NULL DEFAULT '',
+                        market_country VARCHAR(2) NOT NULL
+                            CHECK (length(market_country) = 2
+                                   AND market_country = upper(market_country)),
+                        enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                        accept_variant_labels TEXT,
+                        also_accept_domains TEXT,
+                        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (merchant_domain, market_country, product_key, variant_key)
+                    );
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                await database.execute(
+                    text(
+                        """
+                    CREATE TABLE IF NOT EXISTS reap_agentic_buyer_refs (
+                        buyer_id VARCHAR(50) PRIMARY KEY,
+                        reap_buyer_ref VARCHAR(128) NOT NULL,
+                        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 227, SQLite twin: the consent tag, one statement per column.
+            #
+            # PER COLUMN, for the reason the mig-225 twin above spells out:
+            # SQLite's ADD COLUMN has no `IF NOT EXISTS` and no multi-clause
+            # form, so a duplicate column raises and a SHARED try would let the
+            # first already-present column abandon the second. Per column,
+            # every run converges on the same table.
+            #
+            # TIMESTAMP, NOT TIMESTAMPTZ: SQLite has no such type name, and the
+            # column is written with a bound aware datetime either way.
+            #
+            # NOT FOLDED INTO THE CREATE ABOVE — same argument as the Postgres
+            # twin: folded in, it would be dead code on the only databases CI
+            # builds, and its deletion would pass every test.
+            try:
+                for _consent_column, _consent_type in (
+                    ("consent_version", "VARCHAR(32)"),
+                    ("consented_at", "TIMESTAMP"),
+                ):
+                    try:
+                        await database.execute(
+                            text(
+                                f"ALTER TABLE reap_agentic_buyer_refs "
+                                f"ADD COLUMN {_consent_column} {_consent_type};"
+                            )
+                        )
+                    except Exception:  # noqa: BLE001
+                        # Almost always "duplicate column name" — the column is
+                        # already there and this run had nothing to do.
+                        continue
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                # THE STATEMENT THAT ACTUALLY FAILS IN THE FIELD. It cannot be
+                # created on a database that already holds two buyers sharing
+                # one ref, and that is the whole reason it has its own try.
+                await database.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS "
+                        "uq_reap_agentic_buyer_refs_ref "
+                        "ON reap_agentic_buyer_refs (reap_buyer_ref);"
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                await database.execute(
+                    text(
+                        """
+                    CREATE TABLE IF NOT EXISTS reap_agentic_purchase_keys (
+                        agent_id VARCHAR(128) NOT NULL,
+                        agent_user_ref_hash VARCHAR(64) NOT NULL,
+                        idempotency_key VARCHAR(128) NOT NULL,
+                        purchase_id VARCHAR(64) NOT NULL,
+                        request_hash VARCHAR(64) NOT NULL,
+                        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (agent_id, agent_user_ref_hash, idempotency_key)
+                    );
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 229: item_source + cart_url, SQLite twin.
+            #
+            # Same two layers of try as the mig-225 twin above, for the same
+            # reasons: SQLite has no `IF NOT EXISTS` on ADD COLUMN and no
+            # multi-clause ADD, so each column is its own statement and a
+            # "duplicate column name" on one must not abandon the other.
+            #
+            # THE CHECKS ARE COLUMN CONSTRAINTS HERE TOO, byte-for-byte the
+            # Postgres ones, and SQLite enforces a column CHECK that names
+            # another column exactly as a table CHECK. ORDER MATTERS: item_source
+            # first, because cart_url's pairing CHECK names it. Since SQLite
+            # 3.37 an ADD COLUMN's CHECK is tested against the existing rows;
+            # every existing row takes the DEFAULT 'reap_variant' and a NULL
+            # URL, which the pairing admits.
+            try:
+                for _source_column, _source_decl in (
+                    (
+                        "item_source",
+                        "TEXT NOT NULL DEFAULT 'reap_variant' "
+                        "CONSTRAINT ck_reap_agentic_purchases_item_source "
+                        "CHECK (item_source IN ('reap_variant', 'cart_link'))",
+                    ),
+                    (
+                        "cart_url",
+                        "TEXT "
+                        "CONSTRAINT ck_reap_agentic_purchases_cart_url_pairing "
+                        "CHECK ("
+                        "(item_source = 'reap_variant' AND cart_url IS NULL) "
+                        "OR (item_source = 'cart_link' AND cart_url IS NOT NULL))",
+                    ),
+                ):
+                    try:
+                        await database.execute(
+                            text(
+                                f"ALTER TABLE reap_agentic_purchases "
+                                f"ADD COLUMN {_source_column} {_source_decl};"
+                            )
+                        )
+                    except Exception:  # noqa: BLE001
+                        continue
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 229, second statement, SQLite twin: one cart-link purchase per click.
+            # SQLite supports the same partial unique index verbatim. Own try, same reason.
+            try:
+                await database.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS "
+                        "uq_reap_agentic_purchases_cart_link_click "
+                        "ON reap_agentic_purchases (click_id) "
+                        "WHERE item_source = 'cart_link';"
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 233, SQLite twin: the consent in force when the purchase was
+            # opened, one statement per column.
+            #
+            # PER COLUMN, for the reason the mig-225 and mig-227 twins above spell
+            # out: SQLite's ADD COLUMN has no `IF NOT EXISTS` and no multi-clause
+            # form, so a duplicate column raises OperationalError and a SHARED try
+            # would let the first already-present column abandon the second —
+            # leaving a table permanently short of `consented_at` on exactly the
+            # databases a previous run half-healed. Per column, every arrival
+            # converges on the same table.
+            #
+            # TIMESTAMP, NOT TIMESTAMPTZ: SQLite has no such type name, and the
+            # column is written through `_bind_dt`, which hands SQLite the
+            # server's own text format either way.
+            #
+            # THE COVERAGE GATE CANNOT SEE THIS ONE. The column name is an
+            # f-string placeholder, and tests/test_schema_guard_migration_
+            # coverage.py reads SOURCE TEXT — so deleting this loop would not turn
+            # that gate red. What defends it is the runtime suite: every consent
+            # assertion in tests/test_reap_agentic_ledger.py builds its schema
+            # through this self-heal and fails without these columns. That is the
+            # check to keep working, exactly as the mig-227 twin says of its own.
+            try:
+                for _purchase_consent_column, _purchase_consent_type in (
+                    ("consent_version", "VARCHAR(32)"),
+                    ("consented_at", "TIMESTAMP"),
+                ):
+                    try:
+                        await database.execute(
+                            text(
+                                f"ALTER TABLE reap_agentic_purchases "
+                                f"ADD COLUMN {_purchase_consent_column} "
+                                f"{_purchase_consent_type};"
+                            )
+                        )
+                    except Exception:  # noqa: BLE001
+                        # Almost always "duplicate column name" — the column is
+                        # already there and this run had nothing to do. Continue
+                        # so the remaining column still gets its chance.
+                        continue
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 230: the per-click attribution claim, SQLite twin. Same CHECK and
+            # key as the Postgres statement; TIMESTAMPTZ -> TIMESTAMP and now() ->
+            # CURRENT_TIMESTAMP per this branch's convention.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        CREATE TABLE IF NOT EXISTS conversion_click_claims (
+                            click_id TEXT PRIMARY KEY,
+                            claimed_by TEXT NOT NULL
+                                CONSTRAINT ck_conversion_click_claims_claimed_by
+                                CHECK (claimed_by IN ('reap_agentic', 'merchant_order')),
+                            external_order_id TEXT,
+                            claimed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                        );
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 239, SQLite twin: one column, and an existing one raises, so its own try.
+            try:
+                await database.execute(
+                    text("ALTER TABLE surface_click_events ADD COLUMN issued_at TIMESTAMP")
+                )
+            except Exception:  # noqa: BLE001
+                pass
             # Self-heal EVERY table in REQUIRED_SCHEMA, not a hardcoded subset:
             # /health fails closed on any missing required column, so a spec
             # entry without a matching heal here leaves a fresh sqlite dev/test

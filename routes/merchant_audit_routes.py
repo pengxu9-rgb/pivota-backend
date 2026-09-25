@@ -98,16 +98,13 @@ from services.merchant_narrative_builder import (
 )
 from services.merchant_narrative_builder import repair_stored_narrative
 from services.report_summary_builder import build_report_summary
-from services.provider_credit_rates import credits_for_tokens
+from services.merchant_measured_generation import (generate_measured_text, run_measured_generation, MeteringTemporarilyUnavailable)
 from services.report_deck_builder import (
-    DECK_LLM_PROVIDER,
-    DECK_TOKEN_PRICE_MULTIPLE,
     build_report_deck,
     generate_executive_summary,
 )
 from services.llm_providers.deepseek_probe import (
     DeepseekProbeError,
-    answer_grounded_question,
 )
 from utils.auth import get_current_merchant
 from utils.logger import logger
@@ -1122,6 +1119,10 @@ class MerchantUrlAuditRequest(BaseModel):
     #1 source of bad audits). The merchant knows their catalog; nobody guesses.
     """
 
+    consumer_answer_queries: Optional[List[str]] = Field(default=None, max_length=8)
+    quote_only: bool = False
+    accepted_quote: Optional[str] = Field(default=None, max_length=64)
+
     product_urls: List[str] = Field(
         ...,
         min_length=1,
@@ -1554,6 +1555,12 @@ def _strip_actions_for_free_tier(shaped: Dict[str, Any]) -> Dict[str, Any]:
         "outreach_moves": 0,
         "pitch_targets": 0,
         "top_actions": 0,
+        # Number of catalogue gaps found, so the locked panel can say "6 gaps"
+        # instead of rendering as an empty section.
+        "selection_gap": 0,
+        # First moves in the per-product strategic brief the /ask context
+        # carries under `product.plan` (see the ask-context branch below).
+        "plan_moves": 0,
     }
     teaser_headline = None
 
@@ -1590,10 +1597,30 @@ def _strip_actions_for_free_tier(shaped: Dict[str, Any]) -> Dict[str, Any]:
     # The sideways-wedge recommendation ("where you can win") lives in three
     # places: the top-level key, brand_rollup, and the raw brand_report. The
     # top-level usually aliases brand_rollup's object, so strip every home.
-    wcw_homes = [shaped, shaped.get("brand_rollup"), shaped.get("brand_report")]
-    rollup_in_report = (shaped.get("brand_report") or {}).get("brand_rollup")
-    if isinstance(rollup_in_report, dict):
-        wcw_homes.append(rollup_in_report)
+    # `brand_report` is _shape_url_audit_response's envelope key; `report_jsonb`
+    # is the RAW ROW key, which is what audit_runs_routes serves. This helper
+    # now runs on both shapes, so it has to walk both — stripping only the
+    # envelope form left the whole paid layer intact inside report_jsonb.
+    wcw_homes = [
+        shaped,
+        shaped.get("brand_rollup"),
+        shaped.get("brand_report"),
+        shaped.get("report_jsonb"),
+    ]
+    for container_key in ("brand_report", "report_jsonb"):
+        nested = (shaped.get(container_key) or {})
+        if isinstance(nested, dict):
+            rollup_in_report = nested.get("brand_rollup")
+            if isinstance(rollup_in_report, dict):
+                wcw_homes.append(rollup_in_report)
+            narrative_in_report = nested.get("merchant_narrative")
+            if isinstance(narrative_in_report, dict):
+                _actions = narrative_in_report.get("prioritized_actions")
+                if isinstance(_actions, list) and _actions:
+                    counts["prioritized_actions"] = max(
+                        counts["prioritized_actions"], len(_actions)
+                    )
+                    narrative_in_report["prioritized_actions"] = []
     for home in wcw_homes:
         if isinstance(home, dict) and home.get("where_you_can_win") is not None:
             home["where_you_can_win"] = None
@@ -1602,12 +1629,39 @@ def _strip_actions_for_free_tier(shaped: Dict[str, Any]) -> Dict[str, Any]:
         # "what to do" layer when present.
         if isinstance(home, dict) and home.get("winning_products_not_carried") is not None:
             home["winning_products_not_carried"] = None
+        # C1 selection gap: the merchant's own catalogue joined against the
+        # queries it loses ("you sell X and you are absent from query Y").
+        # Same paid layer as where_you_can_win, and strictly more actionable.
+        # It reached the wire before this lock because brand_rollup is served
+        # wholesale and no inner-key allowlist filters it.
+        if isinstance(home, dict):
+            _sg = home.get("selection_gap")
+            if _sg is not None:
+                if isinstance(_sg, dict):
+                    # The section's OWN lost_queries, not len(gaps): a shape
+                    # with no matched products but a populated
+                    # lost_queries_without_product is routine (build_selection_
+                    # gap sets available=True for it), and counting only gaps
+                    # would stamp "0" — the empty-panel render this count
+                    # exists to prevent.
+                    _sg_counts = _sg.get("counts")
+                    if isinstance(_sg_counts, dict):
+                        _n = _sg_counts.get("lost_queries")
+                    else:
+                        _n = None
+                    if not isinstance(_n, int):
+                        _n = len(_sg.get("gaps") or []) + len(
+                            _sg.get("lost_queries_without_product") or []
+                        )
+                    counts["selection_gap"] = max(counts["selection_gap"], _n)
+                home["selection_gap"] = None
 
     # brand_report is the raw report dict — its narrative/per-SKU branches are
     # aliases (already stripped above), but the full win_plan is its own tree.
-    brand_report = shaped.get("brand_report")
-    if isinstance(brand_report, dict) and brand_report.get("win_plan") is not None:
-        brand_report["win_plan"] = None
+    for container_key in ("brand_report", "report_jsonb"):
+        container = shaped.get(container_key)
+        if isinstance(container, dict) and container.get("win_plan") is not None:
+            container["win_plan"] = None
 
     summary = shaped.get("report_summary")
     if isinstance(summary, dict):
@@ -1635,20 +1689,123 @@ def _strip_actions_for_free_tier(shaped: Dict[str, Any]) -> Dict[str, Any]:
             if sku.get(key) is not None:
                 sku[key] = None
 
+    # The revenue_recovery projection (C2) carries actions under
+    # stages[].actions — a shape that did not exist when this helper was
+    # written, and one audit_runs_routes serves. Findings stay: they are the
+    # "what's wrong" layer, which is free.
+    for stage in shaped.get("stages") or []:
+        if not isinstance(stage, dict):
+            continue
+        stage_actions = stage.get("actions")
+        if isinstance(stage_actions, list) and stage_actions:
+            counts["prioritized_actions"] = max(
+                counts["prioritized_actions"], len(stage_actions)
+            )
+            stage["actions"] = []
+
+    # THE /ask LLM CONTEXT is the fourth shape this helper is handed
+    # (`_build_ask_context` -> `_apply_actions_paywall`), and it carries the
+    # paid layer under two keys nothing above visits:
+    #
+    #   context["overview"]["top_actions"]        the prioritized-action
+    #                                             HEADLINES, verbatim
+    #   context["product"]["plan"]                the LLM strategic brief —
+    #                                             your_angle / the_call /
+    #                                             first_moves
+    #
+    # so /ask stamped `actions_locked: True` onto a context that still fed the
+    # entire plan to the model, which then answered the free-tier merchant's
+    # question out of it. The lock stamp is not the paywall; this is.
+    #
+    # The whole `plan` block goes, not three of its four keys. It exists only
+    # when `_ask_real_brief` accepted the run's REAL strategic brief (the
+    # deterministic fallback is already suppressed), so it is the paid
+    # artifact as a unit; keeping `why_you_lose` back out of it would leak the
+    # brief's framing of the fix while claiming the fix was locked.
+    #
+    # `product["what_ai_actually_said"]` STAYS FREE — a decision, not an
+    # oversight. `_ask_sku_slice` derives it from `opportunity.per_prompt`,
+    # and `opportunity` IS locked on the report envelope
+    # (_LOCKED_PER_SKU_ACTION_KEYS), so the asymmetry needs stating: the three
+    # fields the slice keeps are the buyer's QUERY TEXT, an EXCERPT of what
+    # the model answered, and the COMPETITOR it substituted. That is evidence
+    # — the same "what's wrong" layer this paywall leaves free everywhere else
+    # (scores, verdict, per-SKU findings, share-of-voice, revenue_recovery
+    # stage findings). None of it tells the merchant what to DO. `opportunity`
+    # is locked wholesale on the envelope because that object ALSO carries the
+    # derived recommendation the win plan is built from; the /ask slice
+    # already dropped that half and kept only the receipts. Locking the
+    # receipts too would paywall the diagnosis, which is the half we give away
+    # to sell the other one.
+    #
+    # And the whole /ask strip is DORMANT today: `_ACTIONS_PAYWALL_ENABLED`
+    # reads AUDIT_ACTIONS_PAYWALL_ENABLED and defaults to "false", and
+    # `_apply_actions_paywall` returns `shaped` untouched when the flag is
+    # off — so none of this runs until that env var is set to "true".
+    overview = shaped.get("overview")
+    if isinstance(overview, dict):
+        overview_actions = overview.get("top_actions")
+        if isinstance(overview_actions, list) and overview_actions:
+            counts["top_actions"] = max(
+                counts["top_actions"], len(overview_actions)
+            )
+            overview["top_actions"] = []
+
+    product = shaped.get("product")
+    if isinstance(product, dict):
+        plan = product.get("plan")
+        if isinstance(plan, dict) and plan:
+            counts["plan_moves"] = max(
+                counts["plan_moves"],
+                len([m for m in (plan.get("first_moves") or []) if m]),
+            )
+            product["plan"] = None
+
     shaped["actions_locked"] = True
     shaped["locked_counts"] = counts
     shaped["locked_teaser_headline"] = teaser_headline
     return shaped
 
 
+def _run_earned_paid_actions(run: Optional[Dict[str, Any]]) -> bool:
+    """Preserve access to actions earned when an audit was launched.
+
+    New URL audits persist an explicit entitlement. Older URL audits lack
+    that field, so only the paid-only dual-provider launch configuration from
+    June 24, 2026 onward is accepted as a historical marker. A free audit
+    allowance / zero credit debit says nothing about plan entitlement.
+    """
+    if not isinstance(run, dict) or run.get("subject_type") not in {
+        "merchant", "merchant_url"
+    }:
+        return False
+    partial = run.get("partial_result_jsonb")
+    launch = partial.get("launch") if isinstance(partial, dict) else None
+    if not isinstance(launch, dict):
+        return False
+    if "paid_actions_unlocked_at_launch" in launch:
+        return launch["paid_actions_unlocked_at_launch"] is True
+    if run.get("subject_type") != "merchant_url":
+        return False
+    if launch.get("audit_mode") != "per_sku":
+        return False
+    requested_at = str(run.get("requested_at") or "")
+    if requested_at[:10] < "2026-06-24":
+        return False
+    providers = launch.get("providers")
+    return isinstance(providers, list) and {
+        "gemini", "chatgpt"
+    }.issubset({str(p).strip().lower() for p in providers})
+
+
 async def _apply_actions_paywall(
-    shaped: Dict[str, Any], owner_merchant_id: str
+    shaped: Dict[str, Any], owner_merchant_id: str,
+    run: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Strip the paid action layer when the OWNING merchant is free-tier and
-    the paywall flag is on. Tier-lookup failures fail CLOSED (treated as
-    free): a paying merchant briefly seeing a lock beats an unauthenticated
-    surface leaking the paid layer on a billing-service hiccup."""
+    """Gate new paid actions by current tier, but retain earned report access."""
     if not _ACTIONS_PAYWALL_ENABLED:
+        return shaped
+    if _run_earned_paid_actions(run):
         return shaped
     try:
         balance = await get_balance(owner_merchant_id)
@@ -1701,6 +1858,10 @@ def _shape_url_audit_response(row: Dict[str, Any]) -> Dict[str, Any]:
     report = repair_stored_narrative(
         report, fallback_name=(base.get("merchant_name") if isinstance(base, dict) else None)
     )
+    from services.audit_content_repair import repair_report_content
+    report = repair_report_content(
+        report, merchant_name=base.get("merchant_name") if isinstance(base, dict) else None,
+    )
     brand_rollup = report.get("brand_rollup") or {}
     out: Dict[str, Any] = {
         "status": "succeeded",
@@ -1714,6 +1875,13 @@ def _shape_url_audit_response(row: Dict[str, Any]) -> Dict[str, Any]:
             brand_rollup.get("where_you_can_win")
             or report.get("where_you_can_win")
         ),
+        # C1 selection gap. Lifted out of brand_rollup so the portal reads one
+        # documented key rather than reaching into the rollup; the rollup keeps
+        # its copy, and the free-tier strip nulls BOTH homes. No report-level
+        # fallback: the only writer is brand_rollup["selection_gap"], so a
+        # `or report.get(...)` arm would be an uncovered defensive default that
+        # reads as a delivering line.
+        "selection_gap": brand_rollup.get("selection_gap"),
         "suggested_prompts": report.get("suggested_prompts"),
         # Merchant's own test prompts ("Your prompts"), probed once brand-level.
         "custom_prompts": report.get("custom_prompts") or [],
@@ -1850,6 +2018,19 @@ def _select_wedge_hero_product(
     hero = dict(audit_products[0])
     hero["_wedge_hero_index"] = 0
     return hero
+
+
+@router.post("/url-readiness/quote")
+async def quote_merchant_url_audit(
+    body: MerchantUrlAuditRequest,
+    merchant_id: str = Depends(get_current_merchant),
+) -> Dict[str, Any]:
+    # Dedicated route: a newer client talking to an older server gets 404,
+    # never an accidental audit from an ignored quote_only request field.
+    return await run_merchant_url_audit(
+        body=body.model_copy(update={"quote_only": True, "accepted_quote": None}),
+        merchant_id=merchant_id,
+    )
 
 
 @router.post("/url-readiness")
@@ -2174,7 +2355,7 @@ async def run_merchant_url_audit(
              for prov in (providers_for_launch or ["gemini"])]
         )
         available = int(balance.get("credits") or 0)
-        if metered_credits > available and not paid_tier:
+        if metered_credits > available and not paid_tier and not body.quote_only:
             raise HTTPException(
                 status_code=status.HTTP_402_PAYMENT_REQUIRED,
                 detail={
@@ -2344,6 +2525,49 @@ async def run_merchant_url_audit(
         "catalog_dimensions_available": False,
     }
 
+    # The URL lane shares the frozen consumer plan and settlement contract.
+    # Quoting may fetch public product pages, but must not debit or enqueue.
+    from services.consumer_capture_plan import plan_for_launch, quote_plan
+    from decimal import Decimal
+    try:
+        consumer_plan = plan_for_launch(
+            product_keys=[sp["product_key"] for sp in synthetic_products],
+            queries=body.consumer_answer_queries, providers=providers_for_launch,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    consumer_quote = quote_plan(consumer_plan) if consumer_plan else None
+    if consumer_plan and unresolved:
+        raise HTTPException(status_code=422, detail={"code": "consumer_products_unresolved",
+                            "message": "Resolve or remove failed product URLs before quoting answer capture.",
+                            "unresolved_urls": unresolved})
+    base_credits = metered_credits if over_free else 0
+    if consumer_quote:
+        metered_credits = base_credits + consumer_quote["credits"]
+        metered_cogs = Decimal(str(metered_cogs)) + consumer_quote["estimated_usd_cogs"]
+    quote_scope = {
+        "merchant_id": merchant_id, "request": body.model_dump(exclude={"quote_only", "accepted_quote"}),
+        "products": [sp["product_key"] for sp in synthetic_products],
+        "consumer": consumer_quote, "providers": providers_for_launch,
+        "total_credits": metered_credits, "base_credits": base_credits,
+        "brand": merchant_name, "domain": merchant_domain,
+    }
+    quote_id = hashlib.sha256(json.dumps(quote_scope, sort_keys=True, default=str).encode()).hexdigest()
+    if body.quote_only:
+        return {"status": "quoted", "quote_id": quote_id,
+                "credits": metered_credits, "base_credits": base_credits,
+                "consumer_capture": consumer_quote, "providers": providers_for_launch,
+                "product_count": len(synthetic_products), "unresolved_urls": unresolved}
+    if consumer_plan and body.accepted_quote != quote_id:
+        raise HTTPException(status_code=409, detail={"code": "quote_required",
+                            "message": "Review a fresh quote before starting this audit."})
+    if consumer_plan and metered_credits > int(balance.get("credits") or 0):
+        raise HTTPException(status_code=402, detail={"code": "insufficient_credits",
+                            "required": metered_credits, "available": int(balance.get("credits") or 0)})
+    base_payload["credits_charged"] = metered_credits
+    base_payload["billing_mode"] = "credits" if metered_credits else "free"
+    debit_result = {}
+
     # 6. Debit credits for a metered run BEFORE enqueue, keyed on the
     #    deterministic idempotency_key (NOT a run_id). Debiting before enqueue
     #    avoids a race where the worker claims the queued run and starts probing
@@ -2370,15 +2594,17 @@ async def run_merchant_url_audit(
     # Standard requests keep their pre-existing keys unchanged.
     if audit_tier != "standard":
         idem_product_keys = idem_product_keys + [f"tier:{audit_tier}"]
+    if consumer_plan:
+        idem_product_keys.append(f"consumer:{quote_id}")
     idempotency_key = compute_audit_idempotency_key(
         merchant_id=merchant_id,
         product_keys=idem_product_keys,
         subject_type="merchant_url",
     )
-    if over_free and metered_credits > 0:
+    if metered_credits > 0 and not consumer_plan:
         from services import credit_consumption_service as _ccs
         try:
-            await _ccs.consume(
+            debit_result = await _ccs.consume(
                 merchant_id,
                 "audit",
                 idempotency_key=f"url_wedge:{idempotency_key}",
@@ -2404,7 +2630,7 @@ async def run_merchant_url_audit(
     #    products from launch.synthetic_products, runs per-SKU citation probes
     #    (Gemini-only, prompts_per_sku), and finalizes via the minimal
     #    no-executor verify path.
-    run_id, was_existing = await enqueue_audit_run_with_replay(
+    enqueue_args = dict(
         merchant_id=merchant_id,
         product_keys=[sp["product_key"] for sp in synthetic_products],
         subject_type="merchant_url",
@@ -2414,6 +2640,7 @@ async def run_merchant_url_audit(
                 "audit_mode": "per_sku",
                 "coverage_profile": _WEDGE_COVERAGE_PROFILE,
                 "providers": providers_for_launch,
+                "paid_actions_unlocked_at_launch": paid_tier,
                 "verify_providers": list(_WEDGE_VERIFY_PROVIDERS),
                 # Depth tier: on deep the explicit count is OMITTED so the
                 # worker resolves the tier budget (a persisted default would
@@ -2447,16 +2674,37 @@ async def run_merchant_url_audit(
                 "synthetic_products": synthetic_products,
                 "merchant_name": merchant_name,
                 "merchant_domain": merchant_domain,
-                "billing_mode": "credits" if over_free else "free",
+                "billing_mode": "credits" if metered_credits else "free",
                 "estimated_audit_credits": int(metered_credits),
                 "wedge_base_payload": base_payload,
+                **({"consumer_capture_plan": consumer_plan, "consumer_capture_quote": consumer_quote,
+                    "debited": [{"kind": "audit", "amount": metered_credits,
+                                 "replay": bool(debit_result.get("replay")),
+                                 "purchased_credits": float((debit_result.get("debit") or {}).get("purchased_credits_debited") or 0)}]}
+                   if consumer_plan else {}),
             }
         },
     )
+    if consumer_plan:
+        from services.url_consumer_launch import (
+            launch_quoted_url_audit, UrlLaunchUnavailable, UrlLaunchInsufficientCredits,
+        )
+        try:
+            run_id, was_existing = await launch_quoted_url_audit(
+                **{key: value for key, value in enqueue_args.items() if key != "subject_type"},
+                credits=metered_credits, usd_cogs=metered_cogs,
+            )
+        except UrlLaunchInsufficientCredits as exc:
+            raise HTTPException(status_code=402, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.warning("quoted URL launch rolled back merchant_id=%s", merchant_id, exc_info=True)
+            raise HTTPException(status_code=503, detail="Could not start the audit. No new credits were charged.") from exc
+    else:
+        run_id, was_existing = await enqueue_audit_run_with_replay(**enqueue_args)
     if not run_id:
         # Couldn't persist the run — refund the debit so the merchant isn't
         # charged for an audit that never started.
-        if over_free and metered_credits > 0:
+        if metered_credits > 0:
             from services import credit_consumption_service as _ccs
             try:
                 await _ccs.refund(
@@ -2491,7 +2739,7 @@ async def _merchant_audit_context(merchant_id: str) -> Dict[str, Any]:
         tier = str(bal.get("plan_tier") or "free").lower()
         ctx["plan_tier"] = tier
         ctx["is_paid"] = tier != "free"
-        ctx["credits"] = int(bal.get("credits") or 0)
+        ctx["credits"] = float(bal.get("credits") or 0)
     except Exception:  # noqa: BLE001 - context is advisory; never block the GET
         logger.warning("merchant_audit_context: balance lookup failed", exc_info=True)
     try:
@@ -2536,7 +2784,7 @@ async def get_merchant_url_audit(
         # + authority_map). Reshape it into the URL-audit envelope the client
         # expects (status/run_id/per_sku_reports/methodology/…).
         shaped = _shape_url_audit_response(row)
-        shaped = await _apply_actions_paywall(shaped, merchant_id)
+        shaped = await _apply_actions_paywall(shaped, merchant_id, row)
         if summary_only:
             return {
                 "status": "succeeded",
@@ -2591,6 +2839,7 @@ _SHARE_ALLOWED_TOP_KEYS = (
     "brand_rollup",
     "authority_map",
     "where_you_can_win",
+    "selection_gap",
     "suggested_prompts",
     "where_youre_losing",
     "merchant_narrative",
@@ -2856,7 +3105,7 @@ async def read_shared_audit(token: str) -> Response:
     # must not hand out the paid action layer the merchant themselves can't
     # see. (Paid owners' shares keep the full report — e.g. the marketing
     # sample report from a paid demo account.)
-    shaped = await _apply_actions_paywall(shaped, run.get("merchant_id") or "")
+    shaped = await _apply_actions_paywall(shaped, run.get("merchant_id") or "", run)
     shaped.update(await _shared_momentum_payload(run))
     shaped = _redact_shared_report(shaped)
     import json as _json
@@ -2883,8 +3132,7 @@ async def export_url_audit_deck(
       - Free tier: a single watermarked preview slide (cover + score). No LLM
         runs and nothing is billed — the preview is the distribution hook.
       - Paid tier: the full deck. Its one LLM step (the executive-summary
-        slide) bills on ACTUAL token usage at DECK_TOKEN_PRICE_MULTIPLE (1.6x
-        measured token COGS -> credits, ceil, min 1). When the LLM is
+        slide) bills measured model cost × 1.6 as fractional credits. When the LLM is
         unavailable the deck ships without that slide and costs 0 credits —
         never charge for work that didn't run.
       - Idempotency: one charge per run (key report_deck:{run_id}); re-exports
@@ -2927,73 +3175,32 @@ async def export_url_audit_deck(
     paid = await merchant_is_paid_tier(merchant_id)
     billing_mode = "preview_only"
     credits_charged = 0
-    executive_bullets = None
-    llm_tokens = None
-
+    deck = None
     if paid:
         billing_mode = "included"
-        # The deck's only LLM step. Failure -> deck ships without the slide,
-        # nothing billed (never charge for work that didn't run).
+        def render_summary(result):
+            nonlocal deck
+            deck = build_report_deck(summary, executive_bullets=result["bullets"], preview_only=False)
+            if deck is None:
+                raise ValueError("Deck renderer unavailable")
         try:
-            generated = await generate_executive_summary(summary)
-        except Exception:  # noqa: BLE001
-            logger.warning("deck executive summary failed", exc_info=True)
-            generated = None
-        if generated:
-            executive_bullets, in_tok, out_tok = generated
-            llm_tokens = (in_tok, out_tok)
-
-    # Render BEFORE any debit: if python-pptx is missing this 503s with no
-    # money moved ("never charge for work that didn't run" applies to the
-    # deck itself, not just the LLM step — review fix, PR #1411 round 2).
-    deck = build_report_deck(
-        summary,
-        executive_bullets=executive_bullets,
-        preview_only=not paid,
-    )
-    if deck is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={
-                "code": "deck_renderer_unavailable",
-                "message": "Deck export isn't available on this deployment yet.",
-            },
-        )
-
-    if paid and llm_tokens:
-        in_tok, out_tok = llm_tokens
-        credits, usd_cogs = credits_for_tokens(
-            DECK_LLM_PROVIDER,
-            input_tokens=in_tok,
-            output_tokens=out_tok,
-            multiple=DECK_TOKEN_PRICE_MULTIPLE,
-        )
-        if credits > 0:
-            try:
-                result = await consume_credits(
-                    merchant_id,
-                    "report_deck_export",
-                    f"report_deck:{run_id}",
-                    credits=credits,
-                    usd_cogs=usd_cogs,
-                )
-            except InsufficientCreditsError:
-                # NOTE: fires for merchants the balance layer treats as
-                # non-overage; plan-tier merchants may instead accrue overage
-                # per the billing system's paid-tier semantics.
-                raise HTTPException(
-                    status_code=status.HTTP_402_PAYMENT_REQUIRED,
-                    detail={
-                        "code": "insufficient_credits",
-                        "message": (
-                            "Not enough credits to export the deck — top up "
-                            "or upgrade your plan."
-                        ),
-                        "credits_required": credits,
-                    },
-                )
+            result = await run_measured_generation(
+                merchant_id=merchant_id, operation_key=f"report_deck_v2:{run_id}",
+                operation_type="report_deck_export",
+                generate=lambda: generate_executive_summary(summary, measured=True),
+                prepare=render_summary,
+            )
             billing_mode = "metered"
-            credits_charged = int(result.get("credits") or 0)
+            credits_charged = result["credits_charged"]
+        except InsufficientCreditsError:
+            raise HTTPException(status_code=402, detail={"code": "insufficient_credits", "max_credits": 1, "message": "Not enough credits for the actual usage. No credits charged."})
+        except Exception:
+            logger.warning("Measured deck summary unavailable; exporting without AI summary", exc_info=True)
+            deck = None
+    if deck is None:
+        deck = build_report_deck(summary, executive_bullets=None, preview_only=not paid)
+    if deck is None:
+        raise HTTPException(status_code=503, detail={"code": "deck_renderer_unavailable", "message": "Deck export is unavailable. No credits charged."})
     filename = f"pivota-ai-readiness-{run_id}.pptx"
     return Response(
         content=deck,
@@ -3499,7 +3706,7 @@ async def list_merchant_tasks(
 
 
 class _TaskStatusUpdate(BaseModel):
-    status: str = Field(..., pattern="^(pending|in_progress|done|failed)$")
+    status: str = Field(..., pattern="^(pending|in_progress|done|failed|ready_for_retest|verifying|verified|regressed)$")
     assigned_to_human: Optional[str] = Field(None, max_length=200)
     evidence: Optional[Dict[str, Any]] = None
 
@@ -3683,9 +3890,9 @@ async def mark_outreach_pitch_sent(
 ) -> Dict[str, Any]:
     """Outreach lifecycle Step 1: a merchant marks a win-plan pitch SENT to an
     independent host. Persists a tracked outreach record (merchant_task,
-    lever='outreach_pitch') keyed to (host, query) so the NEXT audit can
+    lever='outreach_pitch') keyed to (host, query, product) so the NEXT audit can
     re-verify whether that host now cites the merchant — the closed loop that
-    proves the lift. Idempotent: a second mark on the same host+query returns the
+    proves the lift. Idempotent: a second mark on the same host+query+product returns the
     existing record. merchant_id is from the token, so a merchant only records its
     own outreach. The sent-state lives in evidence_jsonb.outreach.status (the task
     `status` enum has no 'sent'); created as a pending tracked row."""
@@ -3705,8 +3912,17 @@ async def mark_outreach_pitch_sent(
     existing = await find_pending_supersede_candidates(
         merchant_id=merchant_id, lever=lever, title=title,
     )
-    if existing:
-        return {"status": "exists", "task_id": existing[0].get("task_id"), "title": title}
+    # Title lookup is only a candidate search: titles are truncated and do
+    # not include the product. Match the retained identity before reusing it.
+    sku_key = (body.sku_key or "").strip() or None
+    for candidate in existing:
+        evidence = candidate.get("evidence_jsonb") or candidate.get("evidence") or {}
+        outreach = evidence.get("outreach") if isinstance(evidence, dict) else None
+        if not isinstance(outreach, dict):
+            continue
+        if (outreach.get("host") == host and outreach.get("query") == query
+                and ((outreach.get("sku_key") or "").strip() or None) == sku_key):
+            return {"status": "exists", "task_id": candidate.get("task_id"), "title": title}
 
     state = (body.state or "draft_ready").strip().lower()
     channel = body.channel or ("submission_form" if state == "submission_only" else "mailto")
@@ -3727,13 +3943,15 @@ async def mark_outreach_pitch_sent(
         assigned_to_human="merchant",
         evidence={
             "kind": "outreach_pitch",
+            "target_host": host,
+            "product_key": sku_key,
             "outreach": {
                 "host": host,
                 "tier": body.tier,
                 "recipient_email": body.recipient_email,
                 "submission_url": body.submission_url,
                 "query": query,
-                "sku_key": body.sku_key,
+                "sku_key": sku_key,
                 "sku_title": body.sku_title,
                 "state": state,
                 "channel": channel,
@@ -4014,6 +4232,29 @@ def _build_ask_context(report: Dict[str, Any], product_key: Optional[str]) -> Di
     return ctx
 
 
+def _recovery_has_content(recovery: Any) -> bool:
+    """Does the recovery projection actually say anything about this merchant?
+
+    A projection is ALWAYS a populated dict — it carries its audience, builder
+    version and three stage scaffolds even for an empty report. So "is this
+    truthy" answers yes on a report with nothing in it, which is why the /ask
+    409 went dead. What makes it answerable is a finding or an action in some
+    stage; a selection measurement with no observations is the module's own
+    "unavailable" shape and grounds nothing.
+    """
+    if not isinstance(recovery, dict):
+        return False
+    for stage in recovery.get("stages") or []:
+        if isinstance(stage, dict) and (
+            stage.get("findings") or stage.get("actions")
+        ):
+            return True
+    selection = recovery.get("selection")
+    if isinstance(selection, dict) and selection.get("observations"):
+        return True
+    return False
+
+
 _ASK_SYSTEM_PROMPT = (
     "You are Pivota's AI-commerce-readiness assistant, helping a merchant "
     "understand their audit. Answer the QUESTION using ONLY the facts in "
@@ -4059,82 +4300,54 @@ async def answer_merchant_audit_question(
             status_code=409,
             detail="This audit doesn't have a report to answer from yet.",
         )
+    from services.audit_content_repair import repair_report_content
+    report = repair_report_content(report)
 
+    # The recovery projection is EXTRA grounding, not a replacement. It carries
+    # no narrative overview, no whats_working / where_youre_losing, no honest
+    # limits and no per-SKU slice, and it ignores product_key entirely — so
+    # swapping it in for _build_ask_context dropped everything the merchant's
+    # `product_key` selects while that key still keyed the debit. It also made
+    # `if not context` dead (a projection is always a populated dict), so an
+    # audit that used to 409 for free began charging a credit for a contentless
+    # context. Merge the two, and gate the 409 on what they actually contain.
+    from services.revenue_recovery_report import recovery_from_report
     context = _build_ask_context(report, body.product_key)
-    if not context:
+    recovery = recovery_from_report(
+        report, run_id=body.run_id,
+        catalog_available=False if run.get("subject_type") == "merchant_url" else None,
+    )
+    if not context and not _recovery_has_content(recovery):
         raise HTTPException(
             status_code=409,
             detail="This audit doesn't have enough detail to answer questions yet.",
         )
-
-    # Cost gate. Price one ungrounded Deepseek probe; gate free tiers up-front so
-    # we never do the work for a merchant who can't pay. Paid tiers run on
-    # overage (like the audit path), so they skip the pre-flight block.
-    cost_credits, _ = estimate_probe_credits(_ASK_PROBE_SPEC)
-    is_paid = await merchant_is_paid_tier(merchant_id)
-    if cost_credits > 0 and not is_paid:
-        balance = await get_balance(merchant_id)
-        if int(balance.get("credits") or 0) < cost_credits:
-            raise HTTPException(
-                status_code=402,
-                detail="Not enough credits to ask a question. Top up to continue.",
-            )
+    # Flat merge, not a nested key: _strip_actions_for_free_tier reads
+    # `stages[].actions` and `selection_gap` at the TOP level of what it is
+    # handed, so nesting the projection would hide the paid layer from the
+    # paywall it was just wired through.
+    context.update(recovery)
+    context = await _apply_actions_paywall(context, merchant_id, run)
 
     context_json = json.dumps(context, default=str)[:_ASK_CONTEXT_MAX_CHARS]
     user_message = (
         f"CONTEXT:\n{context_json}\n\nQUESTION: {body.question.strip()}\n\n"
         'Answer as JSON: {"answer": "..."}.'
     )
-
+    idem = "ask_v2:" + hashlib.sha256(
+        json.dumps([merchant_id, body.run_id, body.product_key, body.question.strip()]).encode()
+    ).hexdigest()
     try:
-        answer = await answer_grounded_question(
-            system_prompt=_ASK_SYSTEM_PROMPT,
-            user_message=user_message,
+        result = await run_measured_generation(
+            merchant_id=merchant_id, operation_key=idem, operation_type="ask",
+            generate=lambda: generate_measured_text(system_prompt=_ASK_SYSTEM_PROMPT, user_message=user_message),
         )
-    except DeepseekProbeError as exc:
-        # No charge on failure — the merchant gets nothing, so they pay nothing.
-        logger.warning("merchant audit ask failed (run=%s): %s", body.run_id, exc)
-        raise HTTPException(
-            status_code=503,
-            detail="Couldn't generate an answer right now — please try again.",
-        )
-
-    if not answer:
-        answer = (
-            "I don't have enough in this audit to answer that confidently. Try "
-            "asking about your discovery results, the competitors AI named, or "
-            "where AI sends buyers — or re-run the audit for fresh data."
-        )
-
-    # Charge on success. Idempotent on (merchant, run, product, question) so a
-    # retry of the same question replays the debit rather than double-charging.
-    charged = 0
-    if cost_credits > 0:
-        idem = "ask:" + hashlib.sha256(
-            "|".join(
-                [
-                    merchant_id,
-                    body.run_id,
-                    body.product_key or "",
-                    body.question.strip(),
-                ]
-            ).encode("utf-8")
-        ).hexdigest()
-        try:
-            result = await consume_credits(
-                merchant_id, "prompt", idem, probes=_ASK_PROBE_SPEC,
-            )
-            charged = int(result.get("credits") or 0)
-        except InsufficientCreditsError:
-            # Rare race (balance dropped after the pre-flight gate, or a paid
-            # tier with no overage room). The answer is already produced — don't
-            # punish the merchant for our race; log and return it uncharged.
-            logger.warning(
-                "merchant audit ask: debit raced insufficient (merchant=%s run=%s)",
-                merchant_id, body.run_id,
-            )
-
-    return {"answer": answer, "grounded": True, "credits_charged": charged}
+    except InsufficientCreditsError:
+        raise HTTPException(status_code=402, detail="Not enough credits for the actual usage. No credits charged; top up to continue.")
+    except Exception:
+        logger.warning("merchant audit measured ask failed run=%s", body.run_id, exc_info=True)
+        raise HTTPException(status_code=503, detail="Couldn't generate an answer. No credits were charged; please try again.")
+    return {**result, "grounded": True}
 
 
 # ── "Start here" actions — turn a prioritized_actions move into a real follow-up ─
@@ -4142,7 +4355,7 @@ async def answer_merchant_audit_question(
 # visible in the plan, markable done — the hook a future service-connection picks
 # up to auto-distribute) and (2) best-effort drafts the deliverable via grounded
 # Deepseek (the comparison copy / outreach template), so Pivota does the "create"
-# part. Drafting is metered (category="prompt", ~1 credit, charge-on-success); the
+# part. Drafting is metered on actual usage (up to 1 credit, charge-on-success); the
 # task is always created even if drafting is skipped (no credits) or fails.
 
 _ACTION_DRAFT_SYSTEM_PROMPT = (
@@ -4278,6 +4491,8 @@ async def start_merchant_audit_action(
         raise HTTPException(
             status_code=409, detail="This audit doesn't have a report to act on yet.",
         )
+    from services.audit_content_repair import repair_report_content
+    report = repair_report_content(report)
 
     from db.merchant_tasks import (
         find_pending_supersede_candidates,
@@ -4288,127 +4503,121 @@ async def start_merchant_audit_action(
     lever = "outreach" if is_outreach else ((body.growth_phase or "audit_action").strip() or "audit_action")
     title = body.headline.strip()[:300]
 
-    existing = await find_pending_supersede_candidates(
-        merchant_id=merchant_id, lever=lever, title=title,
-    )
-    if existing:
-        ev = existing[0].get("evidence_jsonb") or existing[0].get("evidence") or {}
-        prior_draft = ev.get("draft") if isinstance(ev, dict) else None
-        return {
-            "status": "exists",
-            "task_id": existing[0].get("task_id"),
-            "draft": prior_draft,
-            "placement": (
-                ev.get("placement") if isinstance(ev, dict) else None
-            ) or _action_placement(
-                report,
-                _action_product_key_by_title(report, body.sku_title),
-                is_outreach=is_outreach, channel_host=body.channel_host,
-            ),
-            "credits_charged": 0,
-        }
+    async with database.transaction():
+        await database.execute("SELECT pg_advisory_xact_lock(hashtextextended(:key,0))", {
+            "key": "audit-action:" + json.dumps([merchant_id, lever, title]),
+        })
+        existing = await find_pending_supersede_candidates(
+            merchant_id=merchant_id, lever=lever, title=title,
+        )
+        existing_task_id = None
+        if existing:
+            ev = existing[0].get("evidence_jsonb") or existing[0].get("evidence") or {}
+            prior_draft = ev.get("draft") if isinstance(ev, dict) else None
+            existing_task_id = existing[0].get("task_id")
+            if prior_draft:
+                return {
+                    "status": "exists",
+                    "task_id": existing[0].get("task_id"),
+                    "draft": prior_draft,
+                    "placement": (
+                        ev.get("placement") if isinstance(ev, dict) else None
+                    ) or _action_placement(
+                        report,
+                        _action_product_key_by_title(report, body.sku_title),
+                        is_outreach=is_outreach, channel_host=body.channel_host,
+                    ),
+                    "credits_charged": 0,
+                }
 
-    # Metered draft of the deliverable, grounded in this action's SKU.
-    # Billing invariant (charged iff delivered): CHARGE FIRST, generate
-    # second, refund if generation fails. The previous order (generate →
-    # charge, swallowing InsufficientCreditsError) handed out free drafts
-    # whenever the balance moved between the pre-check and the charge.
-    draft: Optional[str] = None
-    charged = 0
-    product_key = _action_product_key_by_title(report, body.sku_title)
-    context = _build_ask_context(report, product_key)
-    placement = _action_placement(
-        report, product_key,
-        is_outreach=is_outreach, channel_host=body.channel_host,
-    )
-    cost_credits, _ = estimate_probe_credits(_ASK_PROBE_SPEC)
-    can_draft = bool(context)
-    draft_idem = "action_draft:" + hashlib.sha256(
-        "|".join([merchant_id, body.run_id, title, body.channel_host or ""]).encode("utf-8")
-    ).hexdigest()
-    if can_draft and cost_credits > 0:
-        try:
-            res = await consume_credits(
-                merchant_id, "prompt", draft_idem, probes=_ASK_PROBE_SPEC,
-            )
-            charged = int(res.get("credits") or 0)
-        except InsufficientCreditsError:
-            can_draft = False  # can't pay for a draft — still create the task
-
-    if can_draft:
-        ctx_json = json.dumps(context, default=str)[:_ASK_CONTEXT_MAX_CHARS]
-        if is_outreach:
-            system_prompt = _OUTREACH_SYSTEM_PROMPTS[
-                _outreach_kind(body.channel_lever, body.channel_type)
-            ]
-            user_message = (
-                f"CONTEXT (the merchant's audit):\n{ctx_json}\n\n"
-                + (f"TARGET CHANNEL: {body.channel_host}\n" if body.channel_host else "")
-                + (f"CHANNEL TYPE: {body.channel_type}\n" if body.channel_type else "")
-                + (f"SHOPPER QUERY: {body.query.strip()}\n" if body.query else "")
-                + 'Draft the outreach to send. Return JSON {"answer": "..."}.'
-            )
-        else:
-            system_prompt = _ACTION_DRAFT_SYSTEM_PROMPT
-            user_message = (
-                f"CONTEXT (the merchant's audit):\n{ctx_json}\n\nACTION: {title}\n"
-                + (f"FIRST MOVE: {body.first_move.strip()}\n" if body.first_move else "")
-                + 'Draft the deliverable to execute this action. Return JSON {"answer": "..."}.'
-            )
-        try:
-            draft = await answer_grounded_question(
-                system_prompt=system_prompt, user_message=user_message,
-            )
-        except DeepseekProbeError as exc:
-            logger.warning("action draft failed (run=%s): %s", body.run_id, exc)
-            draft = None
-        if not draft and charged > 0:
-            # Charged but nothing delivered — refund (idempotent per action).
+        # Persist the measured draft and debit together; failures need no refund.
+        draft: Optional[str] = None
+        charged = 0
+        product_key = _action_product_key_by_title(report, body.sku_title)
+        context = _build_ask_context(report, product_key)
+        placement = _action_placement(
+            report, product_key,
+            is_outreach=is_outreach, channel_host=body.channel_host,
+        )
+        can_draft = bool(context)
+        draft_idem = "action_draft_v2:" + hashlib.sha256(
+            "|".join([merchant_id, body.run_id, title, body.channel_host or ""]).encode("utf-8")
+        ).hexdigest()
+        if can_draft:
+            ctx_json = json.dumps(context, default=str)[:_ASK_CONTEXT_MAX_CHARS]
+            if is_outreach:
+                system_prompt = _OUTREACH_SYSTEM_PROMPTS[
+                    _outreach_kind(body.channel_lever, body.channel_type)
+                ]
+                user_message = (
+                    f"CONTEXT (the merchant's audit):\n{ctx_json}\n\n"
+                    + (f"TARGET CHANNEL: {body.channel_host}\n" if body.channel_host else "")
+                    + (f"CHANNEL TYPE: {body.channel_type}\n" if body.channel_type else "")
+                    + (f"SHOPPER QUERY: {body.query.strip()}\n" if body.query else "")
+                    + 'Draft the outreach to send. Return JSON {"answer": "..."}.'
+                )
+            else:
+                system_prompt = _ACTION_DRAFT_SYSTEM_PROMPT
+                user_message = (
+                    f"CONTEXT (the merchant's audit):\n{ctx_json}\n\nACTION: {title}\n"
+                    + (f"FIRST MOVE: {body.first_move.strip()}\n" if body.first_move else "")
+                    + 'Draft the deliverable to execute this action. Return JSON {"answer": "..."}.'
+                )
             try:
-                await refund_credits(
-                    merchant_id, "prompt", charged,
-                    source_event_id=f"refund:{draft_idem}",
+                result = await run_measured_generation(
+                    merchant_id=merchant_id, operation_key=draft_idem, operation_type="action_draft",
+                    generate=lambda: generate_measured_text(system_prompt=system_prompt, user_message=user_message),
                 )
-                charged = 0
-            except Exception:  # noqa: BLE001 — surface, don't mask the miss
-                logger.exception(
-                    "action draft refund failed merchant_id=%s run=%s — "
-                    "RECONCILE MANUALLY", merchant_id, body.run_id,
-                )
+                draft = result["answer"]
+                charged = result["credits_charged"]
+            except MeteringTemporarilyUnavailable:
+                raise HTTPException(status_code=503, detail="Billing is being updated. No credits charged; retry shortly.")
+            except InsufficientCreditsError:
+                draft = None  # The merchant can still create a follow-up without a draft.
+            except Exception:
+                logger.warning("measured action draft failed run=%s", body.run_id, exc_info=True)
+                draft = None
 
-    task_body = (body.first_move or "").strip() or title
-    if draft:
-        task_body = (f"{task_body}\n\n— Pivota draft —\n{draft}")[:4000]
+        task_body = (body.first_move or "").strip() or title
+        if draft:
+            task_body = (f"{task_body}\n\n— Pivota draft —\n{draft}")[:4000]
 
-    task_id = await record_task_created(
-        merchant_id=merchant_id,
-        title=title,
-        body=task_body,
-        severity="high",
-        lever=lever,
-        parent_audit_run_id=body.run_id,
-        evidence={
-            "kind": "outreach" if is_outreach else "audit_action",
-            "headline": title,
-            "first_move": body.first_move,
-            "growth_phase": body.growth_phase,
-            "primary_gap": body.primary_gap,
-            "sku_title": body.sku_title,
-            "product_key": product_key,
-            "channel_host": body.channel_host,
-            "channel_lever": body.channel_lever,
-            "channel_type": body.channel_type,
-            "query": body.query,
+        task_evidence = {
+                "kind": "outreach" if is_outreach else "audit_action",
+                "headline": title,
+                "first_move": body.first_move,
+                "growth_phase": body.growth_phase,
+                "primary_gap": body.primary_gap,
+                "sku_title": body.sku_title,
+                "product_key": product_key,
+                "channel_host": body.channel_host,
+                "channel_lever": body.channel_lever,
+                "channel_type": body.channel_type,
+                "query": body.query,
+                "draft": draft,
+                "placement": placement,
+            }
+        if existing_task_id:
+            task_id = existing_task_id
+            if draft:
+                updated = await database.fetch_one("""UPDATE merchant_tasks
+                    SET body=:body, evidence_jsonb=COALESCE(evidence_jsonb,'{}'::jsonb) || CAST(:evidence AS JSONB), updated_at=NOW()
+                    WHERE task_id=:task_id AND merchant_id=:merchant_id AND status='pending'
+                    RETURNING task_id""", {"body": task_body, "evidence": json.dumps(task_evidence, default=str),
+                    "task_id": task_id, "merchant_id": merchant_id})
+                if not updated:
+                    raise HTTPException(status_code=500, detail="Could not save the draft to the existing task.")
+        else:
+            task_id = await record_task_created(
+                merchant_id=merchant_id, title=title, body=task_body, severity="high",
+                lever=lever, parent_audit_run_id=body.run_id, evidence=task_evidence,
+            )
+        if not task_id:
+            raise HTTPException(status_code=500, detail="Could not create the follow-up task.")
+        return {
+            "status": "success",
+            "task_id": task_id,
             "draft": draft,
             "placement": placement,
-        },
-    )
-    if not task_id:
-        raise HTTPException(status_code=500, detail="Could not create the follow-up task.")
-    return {
-        "status": "success",
-        "task_id": task_id,
-        "draft": draft,
-        "placement": placement,
-        "credits_charged": charged,
-    }
+            "credits_charged": charged,
+        }

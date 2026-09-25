@@ -75,29 +75,6 @@ Postgres was not reachable from this session). The upper bound is "all cold rows
 six hosts"; the card-rail audit's finding that a numeric Shopify variant id exists for only
 ~28% of rows suggests the cold share on Shopify brands is the majority, not the tail.
 
-## Constraint 4 — `execution_spec.rail` has the same defect, and is NOT fixed
-
-PR #1846 shipped a fuller `execution_spec` beside `cart_prefilled`, and one of its fields
-carries the identical exposure:
-
-```python
-"rail": "shopify_cart" if composed_spec["cart_url"] else "referral",
-```
-
-`rail: "referral"` is emitted on exactly the cold population the warm lane targets, so an
-agent that hands the buyer off via `affiliate_url` can be told "referral" and have the buyer
-land in a Shopify cart — the same already-sent claim, contradicted the same way.
-
-It is deliberately left alone. `rail` is a two-value string vocabulary the gateway consumes;
-adding a third state (or a null) is a **contract change across two repos**, not a bug fix,
-and doing it silently inside a fix for a different field is how consumers break. Fixing it
-means agreeing the vocabulary with the gateway first.
-
-Narrower scope than `cart_prefilled`, worth knowing: `execution_spec.pdp_url` and `cart_url`
-are direct URLs that bypass `/r` entirely, so an agent that follows *those* never meets the
-warm lane. Only the `affiliate_url` path is exposed. `rail` is ambiguous about which it
-describes, which is part of why it needs a decision rather than a patch.
-
 ## Constraint 2 — a widening has a ~7-day tail of already-issued claims
 
 Redirect tokens are minted with a **7-day TTL** (`make_redirect_token`,
@@ -118,6 +95,61 @@ disappears from the API globally** — no code change, no deploy, no alarm. That
 behaviour (we genuinely could not promise a PDP landing any more), but it silently removes an
 execution-spec signal agents plan on. Widen the allowlist brand by brand rather than emptying
 it, or accept the loss deliberately.
+
+## Constraint 4 — `execution_spec.rail` had the same defect (FIXED)
+
+PR #1846 shipped a fuller `execution_spec` beside `cart_prefilled`, and one of its fields
+carried the identical exposure:
+
+```python
+"rail": "shopify_cart" if composed_spec["cart_url"] else "referral",
+```
+
+`rail: "referral"` was emitted on exactly the cold population the warm lane targets, so an
+agent handing the buyer `affiliate_url` — the attributed link we want it to use — could be told
+"referral" and have the buyer land in a Shopify cart.
+
+**Fixed the same way, and from the same decision.** `_cart_prefilled_claim` is now computed
+once per offer as `prefilled_claim` and read by BOTH fields, so `rail` is `null` exactly when
+`cart_prefilled` is `null`. They cannot disagree about one link in one payload — a test asserts
+the agreement across every configuration that moves the verdict, because two separate
+expressions answering the same question is precisely how they would drift.
+
+Safe to send: the gateway passes `rail` through as an opaque label rather than checking it
+against a known set (`PIVOTA-Agent src/agentSignals/offerToSignal.js::toExecutionSpec`, whose
+own comment says an unknown rail "is information the agent can ignore"). The earlier concern
+here — that a third state was a breaking cross-repo contract change — was wrong; that mapper
+was built to tolerate new rails.
+
+### What is deliberately NOT changed: `execution_spec.tracking.param`
+
+It looks like the same defect and is not — but state the reason carefully, because the obvious
+one is wrong.
+
+`param` names the carrier in the **static URLs we publish**: `pdp_url` and `cart_url`. The warm
+lane provably never rewrites those; it only replaces the 302 target. So the claim holds for the
+URLs it actually describes.
+
+It does **not** describe `affiliate_url`. That is `{base}/r?token={token}` — the click id rides
+*inside* the signed token, and the literal `pvt_click_id` never appears as a query parameter on
+it. An agent parsing `affiliate_url` for `tracking.param` finds nothing, warm lane or not.
+
+Do NOT justify this with "the agent never inspects the `continue_url`". That is the weak link:
+the 302 `Location` is returned to any client that follows `affiliate_url`, so the argument would
+rest on client behaviour rather than on what the field describes. (It happens to be true today —
+no consumer in either repo reads a post-`/r` landing URL, and the click event records only
+`handoff`/`warm_reason`, never the URL — but that is a fact about consumers, not a property of
+the contract.)
+
+`rail` differs because it claims where the **buyer** ends up, and that is precisely what the
+lane changes.
+
+Two smaller things in the same neighbourhood, both pre-existing from #1846 and neither fixed
+here: `param` is singular while the spec publishes two URLs with *different* carriers (a cart
+uses the attribute, `pdp_url` always uses the query param), so an agent showing the PDP while
+handing off to the cart is pointed at a string absent from the URL it used; and `expires_at` is
+glossed as "when `affiliate_url` stops resolving" when a validly-signed expired token still
+302s to `dest` — what stops is click logging and warm eligibility, not the link.
 
 ## Rollout checklist
 

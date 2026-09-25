@@ -1,0 +1,24 @@
+-- Reverse of 233_reap_agentic_purchase_consent.sql.
+--
+-- WHAT THIS DESTROYS. These two columns are the ONLY durable record of the terms each purchase
+-- was opened under. `reap_agentic_buyer_refs` holds the buyer's LATEST tag, not the one each
+-- purchase carried, and WP4c DELETES that row outright when a buyer identity is repointed — so
+-- after this runs there is nowhere left to read "under which version was this purchase opened".
+-- Nothing at Reap holds it either: their record is that a hosted page was approved, not which
+-- version of our terms was shown before it.
+--
+-- IT DOES NOT FAIL CLOSED AND IT REFUSES NOTHING. Dropping these columns makes
+-- `db/reap_agentic_ledger.create_purchase` raise UndefinedColumn on EVERY call — the INSERT
+-- names them — so the rail stops opening purchases rather than opening them without evidence.
+-- That is the loud failure, and it is the reason to roll the CODE back first: with the columns
+-- present and nothing writing them, they cost nothing.
+--
+-- So run this only on a database where the consent rail has never been armed, or after
+-- `db/reap_agentic_ledger.py` has been reverted to a build whose INSERT does not name them.
+--
+-- `IF EXISTS` on each column and on the table so a partial apply — the self-heal added one
+-- column, the migration never ran — reverses cleanly rather than aborting on the first absent
+-- column. Separate statements for the same reason: one statement with two DROPs is
+-- all-or-nothing, and there is nothing to be gained by coupling them.
+ALTER TABLE IF EXISTS reap_agentic_purchases DROP COLUMN IF EXISTS consented_at;
+ALTER TABLE IF EXISTS reap_agentic_purchases DROP COLUMN IF EXISTS consent_version;

@@ -52,8 +52,13 @@ from services.pdp_category_classifier import (  # noqa: E402
         ("gentle cleanser", "beauty/skincare/cleanse/"),
         ("face wipes", "beauty/skincare/cleanse/"),
         ("face wash", "beauty/skincare/cleanse/"),
-        ("glow tonic", "beauty/skincare/treat/"),
-        ("skin booster", "beauty/skincare/treat/"),
+        # A toner query browses `tone/`, not `treat/`. Google Product Taxonomy 5976 and Shopify
+        # hb-3-2-9-17 both make Toners & Astringents a direct child of Skin Care, a peer of
+        # cleansers and treatments; and `treat/` already holds serum + mask + exfoliant +
+        # treatment, the broad bucket a toner query must not land in.
+        ("glow tonic", "beauty/skincare/tone/"),
+        ("skin booster", "beauty/skincare/tone/"),
+        ("toner", "beauty/skincare/tone/"),
         ("face oil drops", "beauty/skincare/moisturize/"),
         ("self-tan drops", "beauty/body/"),
         ("barrier moisturizer", "beauty/skincare/moisturize/"),

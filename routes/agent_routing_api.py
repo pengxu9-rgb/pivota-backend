@@ -11,7 +11,7 @@ import json
 
 from db.database import database
 from services.payment_routing_service import PaymentRoutingService
-from utils.auth import get_current_user
+from utils.auth import EMPLOYEE_STAFF_ROLES, get_current_user
 
 # Initialize router
 router = APIRouter(
@@ -74,7 +74,7 @@ async def test_agent_routing(
     """
     # Verify agent access
     # Allow: agent accessing own data, or admin/employee
-    if current_user.get("agent_id") != agent_id and current_user.get("role") not in ["admin", "employee"]:
+    if current_user.get("agent_id") != agent_id and current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Access denied")
     
     try:
@@ -112,7 +112,7 @@ async def get_agent_routing_policy(
     [Phase 5] Get this agent's routing policies
     """
     # Allow: agent accessing own data, or admin/employee
-    if current_user.get("agent_id") != agent_id and current_user.get("role") not in ["admin", "employee"]:
+    if current_user.get("agent_id") != agent_id and current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Access denied")
     
     try:
@@ -156,7 +156,7 @@ async def create_agent_routing_policy(
     Note: Agent policies must respect merchant rules
     """
     # Allow: agent accessing own data, or admin/employee
-    if current_user.get("agent_id") != agent_id and current_user.get("role") not in ["admin", "employee"]:
+    if current_user.get("agent_id") != agent_id and current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Access denied")
     
     try:
@@ -236,7 +236,7 @@ async def delete_agent_routing_policy(
     [Phase 5] Delete specific routing policy
     """
     # Allow: agent accessing own data, or admin/employee
-    if current_user.get("agent_id") != agent_id and current_user.get("role") not in ["admin", "employee"]:
+    if current_user.get("agent_id") != agent_id and current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Access denied")
     
     try:
@@ -271,7 +271,7 @@ async def get_agent_routing_history(
     [Phase 5] Get routing decision history for this agent
     """
     # Allow: agent accessing own data, or admin/employee
-    if current_user.get("agent_id") != agent_id and current_user.get("role") not in ["admin", "employee"]:
+    if current_user.get("agent_id") != agent_id and current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Access denied")
     
     try:

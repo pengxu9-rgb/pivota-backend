@@ -1,0 +1,2 @@
+DROP INDEX CONCURRENTLY IF EXISTS idx_commerce_attribution_edges_updated_at;
+DROP INDEX CONCURRENTLY IF EXISTS idx_commerce_attribution_edges_merchant_created;

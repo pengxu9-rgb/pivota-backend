@@ -14,8 +14,11 @@ have caught), keep coverage, unsure/failed rate. The full per-group verdict
 list + gate summary is written next to the fixture, stamped with
 judge_version, so gate results accumulate per version.
 
-Needs GEMINI_API_KEY (run via railway, which carries it). ~250 calls; use
---limit for a smoke run.
+Runs LOCALLY against a fixture — it needs no database and no place in the
+cluster, only GEMINI_API_KEY in your environment. Note that no production secret
+carries that key: there is no GEMINI_API_KEY in pivota-prod Secret Manager and
+none mounted on the `web` service (checked 2026-08-25), so supply your own.
+~250 calls; use --limit for a smoke run.
 
   python3 scripts/run_identity_tier3_eval.py --limit 20
   python3 scripts/run_identity_tier3_eval.py            # full gate run
@@ -41,7 +44,7 @@ FIXTURE = "reports/step5/tier3_eval_fixture_2026-07-10.json"
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__,    formatter_class=argparse.RawDescriptionHelpFormatter,)
     parser.add_argument("--limit", type=int, default=0,
                         help="Judge only the first N of each label (smoke run)")
     parser.add_argument("--fixture", default=FIXTURE)

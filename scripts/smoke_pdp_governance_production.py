@@ -81,6 +81,7 @@ def _fetch(
     *,
     method: str = "GET",
     token: Optional[str] = None,
+    admin_key: Optional[str] = None,
     json_body: Optional[Dict[str, Any]] = None,
     timeout: int = 45,
 ) -> Tuple[int, Dict[str, str], bytes]:
@@ -91,6 +92,8 @@ def _fetch(
     }
     if token:
         headers["Authorization"] = f"Bearer {token}"
+    if admin_key:
+        headers["X-ADMIN-KEY"] = admin_key
     if json_body is not None:
         body = json.dumps(json_body).encode("utf-8")
         headers["Content-Type"] = "application/json"
@@ -319,10 +322,41 @@ def _check_portal_bundles(
 
 
 def _check_openapi(api_base: str, failures: List[str]) -> None:
-    status, _headers, data = _fetch(f"{api_base.rstrip('/')}/openapi.json", timeout=45)
+    # /openapi.json is admin-gated in production (it is the full internal route list). A missing
+    # or wrong key gets a 307 redirect to the CURATED public spec - and urllib follows redirects,
+    # so a bad key still lands a 200. Status alone proves nothing here; the check must verify
+    # WHICH document came back, or a rotated key silently validates the wrong spec.
+    admin_key = (os.environ.get("ADMIN_API_KEY") or os.environ.get("PROMOTIONS_ADMIN_KEY") or "").strip()
+    if not admin_key:
+        failures.append(
+            "no ADMIN_API_KEY set - the full spec is admin-gated in production and anonymous "
+            "/openapi.json redirects to the curated public spec; export ADMIN_API_KEY to run "
+            "this check"
+        )
+        return
+    status, _headers, data = _fetch(
+        f"{api_base.rstrip('/')}/openapi.json", admin_key=admin_key, timeout=45
+    )
     text = _decode(data)
     if status != 200:
         failures.append(f"openapi returned status={status}")
+        return
+    try:
+        paths = list(json.loads(text).get("paths") or {})
+    except ValueError:
+        failures.append("openapi response is not JSON")
+        return
+    if not paths:
+        failures.append("openapi spec has no paths")
+        return
+    # The curated spec documents ONLY the agent-facing prefixes; the internal spec always has
+    # more. All-agent paths means the redirect for non-admin callers was followed.
+    if all(p.startswith(("/agent/v1", "/agent/v2", "/agent/shop/v1")) for p in paths):
+        failures.append(
+            "openapi served the CURATED public spec, not the internal one - ADMIN_API_KEY is "
+            "wrong or rotated (the non-admin redirect was silently followed)"
+        )
+        return
     _fail_if_legacy_url(text, "openapi", failures)
     host = parse.urlparse(api_base).netloc
     if host and host not in text:
@@ -492,10 +526,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--api-base", default=env_or_default("PIVOTA_API_BASE_URL", "https://api.pivota.cc"))
     parser.add_argument("--employee-base", default=env_or_default("PIVOTA_EMPLOYEE_BASE_URL", "https://employee.pivota.cc"))
     parser.add_argument("--merchant-base", default=env_or_default("PIVOTA_MERCHANT_BASE_URL", "https://merchant.pivota.cc"))
-    parser.add_argument("--employee-email", default=env_or_default("PIVOTA_SMOKE_EMPLOYEE_EMAIL", "employee@pivota.com"))
-    parser.add_argument("--employee-password", default=env_or_default("PIVOTA_SMOKE_EMPLOYEE_PASSWORD", "Admin123!"))
-    parser.add_argument("--merchant-email", default=env_or_default("PIVOTA_SMOKE_MERCHANT_EMAIL", "merchant@test.com"))
-    parser.add_argument("--merchant-password", default=env_or_default("PIVOTA_SMOKE_MERCHANT_PASSWORD", "Admin123!"))
+    # Credentials have NO baked-in defaults: the demo login lane (employee@pivota.com /
+    # Admin123!) is gated off in production, and this script must never silently
+    # probe prod with demo creds. Each value must come from the flag or its env var.
+    parser.add_argument("--employee-email", default=env_or_default("PIVOTA_SMOKE_EMPLOYEE_EMAIL", ""))
+    parser.add_argument("--employee-password", default=env_or_default("PIVOTA_SMOKE_EMPLOYEE_PASSWORD", ""))
+    parser.add_argument("--merchant-email", default=env_or_default("PIVOTA_SMOKE_MERCHANT_EMAIL", ""))
+    parser.add_argument("--merchant-password", default=env_or_default("PIVOTA_SMOKE_MERCHANT_PASSWORD", ""))
     parser.add_argument(
         "--merchant-id",
         default=env_or_default("PIVOTA_SMOKE_MERCHANT_ID", ""),
@@ -512,7 +549,26 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--merchant-product-id",
         default=env_or_default("PDP_SMOKE_MERCHANT_PRODUCT_ID", "live_acceptance_merchant_pdp_1776996856"),
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+
+    missing = [
+        f"--{flag} (or {env})"
+        for flag, env, value in (
+            ("employee-email", "PIVOTA_SMOKE_EMPLOYEE_EMAIL", args.employee_email),
+            ("employee-password", "PIVOTA_SMOKE_EMPLOYEE_PASSWORD", args.employee_password),
+            ("merchant-email", "PIVOTA_SMOKE_MERCHANT_EMAIL", args.merchant_email),
+            ("merchant-password", "PIVOTA_SMOKE_MERCHANT_PASSWORD", args.merchant_password),
+        )
+        if not value.strip()
+    ]
+    if missing:
+        parser.error(
+            "missing smoke credentials: "
+            + ", ".join(missing)
+            + ". The demo login lane is gated off in production, so this script has no "
+            "credential defaults; provide a real smoke account explicitly."
+        )
+    return args
 
 
 if __name__ == "__main__":

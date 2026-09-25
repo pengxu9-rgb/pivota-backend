@@ -184,6 +184,138 @@ def _filter_relevance_terms(terms: List[str]) -> List[str]:
     return deduped
 
 
+_CATEGORY_REFINEMENT_TERMS = frozenset(
+    {
+        "blush",
+        "blushes",
+        "cleanser",
+        "cleansers",
+        "cosmetic",
+        "cosmetics",
+        "face",
+        "find",
+        "foundation",
+        "foundations",
+        "gloss",
+        "glosses",
+        "lip",
+        "lipstick",
+        "lipsticks",
+        "looking",
+        "makeup",
+        "need",
+        "moisturiser",
+        "moisturisers",
+        "moisturizer",
+        "moisturizers",
+        "only",
+        "please",
+        "product",
+        "products",
+        "recommend",
+        "search",
+        "searching",
+        "serum",
+        "serums",
+        "show",
+        "toner",
+        "toners",
+        "want",
+    }
+)
+
+
+# Word-boundary identity matching for brand anchors.
+#
+# Padding a field with spaces turns a plain LIKE into a word-delimited match: " murad " matches
+# "Murad" and "Murad Skin Care" but " lush " does not match " blush ". That is what makes an anchor
+# safe to ADMIT rows on rather than merely re-rank them.
+#
+# But padding alone only finds boundaries made of SPACES, and real brand strings separate tokens
+# with punctuation: "Murad, Inc.", "La Roche-Posay", "Kiehl's Since 1851". Measured against the raw
+# padded expression, each failed to match its own brand token. So separators are folded to spaces.
+#
+# Nested replace(), not translate(): translate() is Postgres-only and this suite runs the same SQL
+# against SQLite, where it is a syntax error. Not hypothetical — the first cut used translate() and
+# took an existing recall test down with `sqlite3.OperationalError: near "/"`, because the
+# punctuation set also contained an apostrophe that closed the SQL string literal. Keep this list
+# short: each entry is one more replace() per column per term, in a statement already spanning a
+# three-table join.
+#
+# Accents are deliberately NOT folded here. Anchor terms arrive accent-stripped so an accented brand
+# column cannot match — a real gap, but a PRE-EXISTING one (before this branch nothing was admitted
+# by brand at all), and closing it in SQL costs ~25 more replaces per column. It belongs in a
+# normalized column, not in the hot query.
+#
+# TRADEMARK GLYPHS ARE SEPARATORS, NOT LETTERS. A merchant writes the mark INTO the name —
+# "Stay All Day® Liquid Lipstick", "M·A·Cximal", "Pop™ Longwear Lipstick" — and the glyph
+# glues itself to the word beside it, so the space-padded LIKE below asks for " day " and the
+# column offers " day® ". Measured on prod 2026-09-07: the anchor for "Stila Stay All Day
+# Liquid Lipstick" matched 0 of Stila's 124 rows for exactly this reason, every one of whose
+# titles carries "Stay All Day®". These four fold to a space for the same reason "-" does:
+# they delimit words, they never spell one.
+_BRAND_IDENTITY_SEPARATORS = (
+    ".", ",", "-", "'", "+", "/", "&", "(", ")", "®", "™", "©", "·",
+)
+
+
+def _brand_identity_expr(column: str) -> str:
+    """`column`, lowered, separator-folded and space-padded for word-delimited LIKE matching."""
+    expr = "LOWER(COALESCE(" + column + ", ''))"
+    for sep in _BRAND_IDENTITY_SEPARATORS:
+        literal = "''''" if sep == "'" else "'" + sep + "'"
+        expr = "replace(" + expr + ", " + literal + ", ' ')"
+    return "(' ' || " + expr + " || ' ')"
+
+
+# Bounds for a caller-supplied brand anchor. See _fetch_canonical_search_rows for why.
+_BRAND_ANCHOR_TERM_MAX_COUNT = 8
+_BRAND_ANCHOR_TERM_MAX_LEN = 64
+# Letters, digits, and the separators real brand tokens carry. Deliberately excludes the LIKE
+# wildcards '%' and '_'.
+_BRAND_ANCHOR_TERM_RE = re.compile(r"[a-z0-9&+.'\-]+", re.IGNORECASE)
+
+
+def _category_brand_anchor_terms(query: str) -> List[str]:
+    """Return a conservative possible-brand anchor for category queries.
+
+    Category recall intentionally broadens the candidate WHERE.  Without a
+    separate anchor, that broad lane can fill the candidate limit with generic
+    category rows before a non-contiguous brand phrase (``knight unicorn
+    blush``) is ever ranked.  Two residual terms are required so common
+    one-word descriptors do not become accidental brand gates.
+    """
+    if not category_path_prefix_for_query(query):
+        return []
+    terms = _filter_relevance_terms(_tokenize_relevance(query))
+    residual = [term for term in terms if term not in _CATEGORY_REFINEMENT_TERMS]
+    return residual[:4] if len(residual) >= 2 else []
+
+
+def _category_evidence_phrases(lowered: str, category_prefix: str) -> List[str]:
+    """The query's OWN spans that, alone, resolve to `category_prefix`.
+
+    "stila stay all day liquid lipstick" -> ["liquid lipstick"] / ["lipstick"]. This is the
+    literal, whole-word evidence a row must carry in its own text before a taxonomy escape
+    admits it, and it is derived from the query rather than from a hardcoded word list so a
+    new category alias needs no change here.
+
+    Hoisted out of the brand-anchor branch so the ancestor-taxonomy escape and the
+    missing-taxonomy escape apply the SAME evidence standard. They were written to the same
+    standard by hand once; two copies of a rule is one copy too many.
+    """
+    query_words = re.findall(r"[a-z0-9]+", lowered)[:40]
+    phrases: List[str] = []
+    for width in range(1, 5):
+        for start in range(len(query_words) - width + 1):
+            phrase = " ".join(query_words[start:start + width])
+            if any(f" {known} " in f" {phrase} " for known in phrases):
+                continue
+            if category_path_prefix_for_query(phrase) == category_prefix:
+                phrases.append(phrase)
+    return phrases
+
+
 def _vertical_intent(query: str) -> bool:
     lowered = _normalize_query(query)
     if not lowered:
@@ -358,8 +490,18 @@ async def _fetch_beauty_vertical_payload(product_key: str, sku_key: Optional[str
             """
             SELECT how_to_use_text, steps_json
             FROM beauty_usage_guides
+            -- `sku_key IS NULL` is the PRODUCT-level marker: both writers
+            -- (catalog ingest and `beauty_field_authoring`) write one guide row
+            -- per product with a NULL sku_key. Testing only the PARAMETER for
+            -- NULL hid those rows from every per-SKU caller — which is all of
+            -- them here, since `_fetch_beauty_vertical_payload` is called with a
+            -- concrete sku_key. The equality arm still serves per-SKU rows.
             WHERE product_key = :product_key
-              AND (CAST(:sku_key AS text) IS NULL OR sku_key = CAST(:sku_key AS text))
+              AND (
+                sku_key IS NULL
+                OR CAST(:sku_key AS text) IS NULL
+                OR sku_key = CAST(:sku_key AS text)
+              )
             ORDER BY updated_at DESC
             LIMIT 1
             """,
@@ -385,8 +527,16 @@ async def _fetch_beauty_vertical_payload(product_key: str, sku_key: Optional[str
             """
             SELECT asset_id, asset_type, title, url, thumbnail_url, sort_order
             FROM beauty_content_assets
+            -- Same product-level marker as the usage-guide read above:
+            -- `platform_metadata.tutorials` describes the product, so ingest
+            -- writes ONE asset row with a NULL sku_key. Without the IS NULL arm
+            -- a per-SKU read returned that tutorial on no variant at all.
             WHERE product_key = :product_key
-              AND (CAST(:sku_key AS text) IS NULL OR sku_key = CAST(:sku_key AS text))
+              AND (
+                sku_key IS NULL
+                OR CAST(:sku_key AS text) IS NULL
+                OR sku_key = CAST(:sku_key AS text)
+              )
             ORDER BY sort_order ASC, updated_at DESC
             """,
             {"product_key": product_key, "sku_key": sku_key},
@@ -716,6 +866,8 @@ def _build_canonical_offer_node(
         )
     return OfferNode(
         offer_id=str(row.get("offer_id") or ""),
+        merchant_id=row.get("offer_merchant_id"),
+        merchant_name=row.get("offer_merchant_name"),
         catalog_track=catalog_track,
         truth_tier=str(row.get("offer_truth_tier") or row.get("truth_tier") or "primary"),
         readiness_tier=str(row.get("offer_readiness_tier") or row.get("readiness_tier") or "commerce_ready"),
@@ -792,11 +944,30 @@ def _canonical_match_reason(row: Dict[str, Any], query: str) -> Dict[str, Any]:
     }
 
 
+# RECALL DIVERSITY. The candidate CTE below matches at (product x SKU) grain and
+# then takes the top `candidate_limit` ROWS — 40 for a default limit=10 query.
+# Every curated/Path-C product carried exactly ONE catalog_skus row
+# (`<product_key>::canonical`) when that budget was chosen, so 40 rows meant 40
+# products. It stops meaning that the moment a lane writes one SKU per real
+# variant: a 60-shade lipstick's rows all share the same p.title / p.brand terms,
+# so they cluster together under the same ORDER BY and can occupy every slot,
+# returning ONE product where the query should return ~40.
+#
+# The fix is a per-product cap, NOT a dedupe: `_build_canonical_items` groups on
+# sku_key, so one result item IS one SKU, and collapsing to a single row per
+# product would drop the other variants of every ordinary multi-variant product
+# from search. The cap only bites the pathological tail — a product contributes
+# at most this many candidate rows, the rest of the budget goes to other products.
+RECALL_MAX_SKUS_PER_PRODUCT = max(1, int(os.getenv("RECALL_MAX_SKUS_PER_PRODUCT") or 12))
+
+
 async def _fetch_canonical_search_rows(
     *,
     query: str,
     merchant_id: Optional[str],
     limit: int,
+    require_signature: bool = False,
+    brand_anchor_terms: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     lowered = _normalize_query(query)
     if not lowered:
@@ -817,22 +988,29 @@ async def _fetch_canonical_search_rows(
         "query_like": f"%{lowered}%",
         "candidate_limit": candidate_limit,
         "row_limit": row_limit,
+        "per_product_sku_cap": RECALL_MAX_SKUS_PER_PRODUCT,
     }
     merchant_clause = ""
     if merchant_id:
         merchant_clause = "AND p.merchant_id = :merchant_id"
         params["merchant_id"] = merchant_id
-    # Phase O-5: hard-filter the global recall pool to live lifecycle
-    # stages so draft/candidate rows (no description, no taxonomy,
-    # not user-ready) don't surface in recall just because the title
-    # matched. The IS NULL clause is a grandfather for the rollout
-    # window between O-4 deploy and the O-6b backfill running — once
-    # backfill confirms 0 NULL rows in prod, the IS NULL branch can
-    # be removed in a follow-up PR. Merchant-scoped queries skip the
-    # filter: a merchant should always see their own products even
-    # while LabelAgent is still ramping their content quality.
+    # Phase O-5: hard-filter the broad, content-led global recall pool to
+    # live lifecycle stages so draft/candidate rows don't surface merely
+    # because their title matched. This is *not* a commerce-sellability
+    # property, though: a canonical SIG row with a live, unsuppressed offer
+    # is already governed by the product/SKU/offer and seller gates below.
+    #
+    # Merchant synchronisation writes those rows as ``candidate`` until a
+    # separate content-enrichment pass adds taxonomy. Applying this content
+    # workflow gate to ``canonical_entities_only`` therefore made immediately
+    # buyable SIG products disappear after every sync (for example, Knight
+    # Unicorn), despite a priced in-stock offer. Canonical product-card recall
+    # intentionally bypasses this clause; it still requires a sig identity,
+    # sync_status=live, non-suppressed product/SKU/offer and an active,
+    # indexable offer seller. Merchant-scoped queries also skip it so a
+    # merchant can see its own inventory while LabelAgent ramps.
     lifecycle_clause = ""
-    if not merchant_id:
+    if not merchant_id and not require_signature:
         lifecycle_clause = (
             "AND (p.pdp_lifecycle_stage IN ('validated', 'published') "
             "OR p.pdp_lifecycle_stage IS NULL)"
@@ -876,6 +1054,14 @@ async def _fetch_canonical_search_rows(
         suppression_clause = (
             "AND p.suppressed_at IS NULL AND p.suppression_reason IS NULL"
         )
+
+    signature_clause = ""
+    if require_signature:
+        # SUBSTR is supported by both production PostgreSQL and the SQLite
+        # integration harness. Keep the exact four-character test rather than
+        # LIKE 'sig_%': underscore is a wildcard in LIKE and would admit
+        # malformed non-SIG ids.
+        signature_clause = "AND SUBSTR(p.pivota_signature_id, 1, 4) = 'sig_'"
 
     # #1648: honor catalog_merchants.indexable in cross-merchant recall. It was
     # the ONE fence set correctly on the retired test rig (migration 139 set
@@ -965,6 +1151,222 @@ async def _fetch_canonical_search_rows(
             + CASE WHEN p.category_path IS NOT NULL AND p.category_path LIKE :category_path_prefix THEN 90 ELSE 0 END
         """
 
+        # ANCESTOR TAXONOMY — a path that STOPS SHORT of the query's category is missing
+        # depth, not evidence of a different category.
+        #
+        # The clause above asks for `category_path LIKE 'beauty/makeup/lip/%'`. A row whose
+        # path is 'beauty/makeup' fails it, and so does the `missing_taxonomy` escape further
+        # down, which fires only when the path IS NULL. The result is an inversion: a row that
+        # asserted a COARSE but CORRECT ancestor is strictly less recallable than a row that
+        # asserted nothing at all.
+        #
+        # Measured on prod 2026-09-07. The curated-brand lane (source_system
+        # 'catalog_enrichment_agent_v1') writes depth-2 paths for whole brands: Stila
+        # 124/124 rows at exactly 'beauty/makeup', Tarte 231/231, Flower Beauty 49/49 — 0
+        # rows with a 'beauty/makeup/lip/%' path between them. So "Stila Stay All Day Liquid
+        # Lipstick" admitted 0 Stila rows (the phrase door needs the literal phrase in one
+        # column; the brand-admit door reads brand/merchant_name only and no brand is named
+        # "Stila Stay All Day"), and the page came back Pixi/Fenty/Kylie — all of them
+        # seed-mirror rows that DO carry 'beauty/makeup/lip/%'. Not a ranking loss: a recall
+        # miss, with Stila's 123 live, priced, serving-eligible offers never a candidate.
+        #
+        # THE WIDENING IS BOUNDED BY TWO CONJUNCTS, not one:
+        #   1. the row's path must be a strict ANCESTOR of the query's prefix — 'beauty/makeup'
+        #      admits under 'beauty/makeup/lip/', 'beauty/skincare' never does, and a NULL path
+        #      still admits nothing here (that case keeps its existing brand-gated escape); and
+        #   2. the row's OWN text must carry a whole-word category phrase from the query, the
+        #      same evidence standard `missing_taxonomy` already applies.
+        # A bare ancestor test without (2) would admit every 'beauty/makeup' row — foundations,
+        # mascara, brushes — into every lip query, which is the failure the +90 category score
+        # exists to avoid.
+        #
+        # SUBSTR/LENGTH, not LIKE, for the ancestor test: `p.category_path` would be the LIKE
+        # PATTERN there, so a stored '_' (real: 'beauty/makeup/lip/lip_oil') would silently
+        # become a single-character wildcard. Both functions exist in production PostgreSQL and
+        # in the SQLite integration harness.
+        #
+        # The SCORE is deliberately unchanged: an ancestor-only row does not earn the +90 that
+        # a real depth match earns. It is admitted so it can compete, not promoted.
+        # PARAMS AND SQL IN THE SAME BRANCH. An unused bind is not ignored on this stack —
+        # text() raises ArgumentError("doesn't define a bound parameter named ...") and the
+        # whole query dies. Binding inside the branch that emits the clause referencing them
+        # is what makes that unreachable rather than merely absent today.
+        evidence_phrases = _category_evidence_phrases(lowered, category_prefix)[:8]
+        if evidence_phrases:
+            ancestor_evidence: List[str] = []
+            for index, phrase in enumerate(evidence_phrases):
+                param_name = f"category_evidence_{index}"
+                params[param_name] = f"% {phrase} %"
+                ancestor_evidence.extend(
+                    f"{_brand_identity_expr(field)} LIKE :{param_name}"
+                    for field in ("p.title", "p.product_type", "s.title")
+                )
+            params["category_path_exact"] = category_prefix
+            category_where += (
+                "\n            OR (NULLIF(TRIM(COALESCE(p.category_path, '')), '') IS NOT NULL"
+                "\n                AND SUBSTR(:category_path_exact, 1, LENGTH(p.category_path) + 1)"
+                "\n                    = p.category_path || '/'"
+                "\n                AND (" + " OR ".join(ancestor_evidence) + "))\n"
+            )
+
+    # A multi-token residual next to a known category is a possible brand
+    # anchor.  This is deliberately independent of the broad token-recall flag:
+    # it does not widen arbitrary queries, and category recall already admits
+    # these rows.  It only ensures a real brand match is not truncated behind a
+    # large set of same-category rows before the gateway can validate it.
+    # The caller's anchor wins when it supplied one. `_category_brand_anchor_terms`
+    # needs >= 2 residual tokens, so it can never boost a SINGLE-WORD brand — Murad,
+    # CeraVe, NARS. The gateway resolves those against the catalog brand dictionary
+    # and now threads the answer down, because a post-filter can only keep what recall
+    # already returned: with the boost missing, "show me Murad products" truncated
+    # every Murad row below the candidate limit and the gateway anchored on an empty
+    # set (`brand_category_anchor_matched: false`) while a LIZUSH bath bomb survived.
+    # None (no opinion from the caller) keeps the original behaviour for every other
+    # caller of this function.
+    brand_anchor_score = ""
+    brand_anchor_where = ""
+    brand_priority_score = "0"
+    brand_anchor_terms = (
+        brand_anchor_terms
+        if brand_anchor_terms is not None
+        else _category_brand_anchor_terms(query)
+    )
+    # The field is client-supplied on POST /v1/pivot/query, and every term becomes three more LIKE
+    # predicates over the catalog join. Unbounded, 2000 terms produced a 719KB statement with 12k
+    # predicates — a statement-timeout shaped exactly like the pool incidents this service has had.
+    # A term carrying LIKE wildcards is worse than useless: '%' alone becomes LIKE '%%%', which is
+    # true for every row and hands the entire candidate set +180, flattening the ranking. Terms are
+    # always BOUND (only the integer index is interpolated), so this is not an injection surface —
+    # it is a denial-of-service and ranking-distortion surface, and the sibling fields on this model
+    # are all bounded already.
+    brand_anchor_terms = [
+        t
+        for t in (brand_anchor_terms or [])
+        if isinstance(t, str) and 0 < len(t) <= _BRAND_ANCHOR_TERM_MAX_LEN and _BRAND_ANCHOR_TERM_RE.fullmatch(t)
+    ][:_BRAND_ANCHOR_TERM_MAX_COUNT]
+    if brand_anchor_terms:
+        # A SINGLE-token anchor matches identity fields ONLY, never the title.
+        #
+        # Every guard that lets a token become an anchor is an exact-span equality test — dictionary
+        # membership, the stopword list, `category_path_prefix_for_query(span)` — but the value they
+        # approve is consumed here as an UNANCHORED substring. For a 4-character brand those are not
+        # the same question. `lush` is a real catalog brand and `category_path_prefix_for_query`
+        # correctly refuses `blush`, and then `%lush%` matches "Soft Pinch Liquid B-LUSH", "Orgasm
+        # Powder B-LUSH", "Baked B-LUSH Luminoso" — six rows boosted, one of them actually LUSH.
+        # At +180 that outranks every legitimate text signal (exact title 100 + title LIKE 90), and
+        # under RECALL_RELEVANCE_V2 text_score IS the serving order, so "tula cleanser" would put a
+        # silicone spa-TULA at the top of a cleanser search: the same failure class this boost was
+        # extended to fix.
+        #
+        # Identity-only also makes recall agree with the gateway post-filter, which matches
+        # brand + merchant_name and nothing else. A title-only hit was being boosted into a 40-80 row
+        # candidate window and then discarded — spending the very slots real brand rows needed.
+        #
+        # MULTI-token anchors keep the title clause. They are ANDed, so "%knight% AND %unicorn%" is
+        # enormously more selective, and the title is where a two-word brand survives a missing
+        # `brand` column. That path is unchanged.
+        # Word-boundary on the identity fields here too. A review measured all three deciding
+        # paths and only the admit branch was padded: `%lush%` still scored "Blush Cosmetics" and
+        # "Plush Beauty" at +180, tying real LUSH rows so `updated_at` broke the tie arbitrarily.
+        # A guarantee enforced in one of three places is not a guarantee.
+        anchor_matches = []
+        for anchor_index, anchor_term in enumerate(brand_anchor_terms):
+            param_name = f"brand_anchor_{anchor_index}"
+            params[param_name] = f"% {anchor_term} %"
+            field_matches = [
+                f"{_brand_identity_expr(field)} LIKE :{param_name}"
+                for field in ("p.brand", "m.merchant_name")
+            ]
+            if len(brand_anchor_terms) > 1:
+                # Multi-token anchors keep the title: ANDed terms are far more selective, and the
+                # title is where a two-word brand survives a missing `brand` column.
+                field_matches.append(f"{_brand_identity_expr('p.title')} LIKE :{param_name}")
+            anchor_matches.append("(" + " OR ".join(field_matches) + ")")
+        anchor_expression = " AND ".join(anchor_matches)
+        brand_anchor_score = (
+            "\n                    + CASE WHEN ("
+            + anchor_expression
+            + ") THEN 180 ELSE 0 END\n"
+        )
+
+        # ADMIT the brand's rows, do not merely re-rank them.
+        #
+        # `brand_anchor_score` is a SCORE term — it appears in rank_score/text_score and never in
+        # the WHERE. A score reorders the candidate set; it cannot admit a row the WHERE excluded.
+        # That is why boosting alone did not fix a brand-only query. Measured in prod on 2026-09-02
+        # with the boost live (web-00278-tor): "I am looking for a Murad cleanser" returned 5 Murad
+        # products, because `cleanser` yields a category prefix and category recall admits Murad's
+        # cleansers for the anchor to find — while "show me Murad products", which has no category
+        # term, still returned one LIZUSH bath bomb with `brand_category_anchor_matched: false`.
+        # The phrase predicate looks for the literal "%show me murad products%" and matches nothing,
+        # so no Murad row was ever a candidate.
+        #
+        # WHOLE-WORD, and IDENTITY FIELDS ONLY. This branch ADMITS rows, so a substring hit here is
+        # far more expensive than one that merely re-ranks: `%lush%` inside "Blush" would pull every
+        # blush in the catalog into the candidate window. Comparing against a space-padded field
+        # makes the match word-delimited using plain LIKE with a bound parameter — " murad " matches
+        # "Murad" and "Murad Skin Care", and " lush " does not match " blush ". No regex, so a term
+        # carrying regex metacharacters cannot change the shape of the predicate.
+        padded_matches = []
+        for anchor_index, anchor_term in enumerate(brand_anchor_terms):
+            param_name = f"brand_admit_{anchor_index}"
+            params[param_name] = f"% {anchor_term} %"
+            padded_matches.append(
+                "("
+                + " OR ".join(
+                    f"{_brand_identity_expr(field)} LIKE :{param_name}"
+                    for field in ("p.brand", "m.merchant_name")
+                )
+                + ")"
+            )
+        admit_predicate = " AND ".join(padded_matches)
+        # THE ADMIT BRANCH MUST STAY RELEVANT TO THE QUERY.
+        #
+        # Unconditional, it admits EVERY row of the anchored brand, and the +180 anchor score beats
+        # the +90 category-path score — so the brand's off-category rows outrank other brands'
+        # on-category rows by 90 points, always. A review measured it on a Postgres fixture for
+        # "murad cleanser" (500 Murad products, 15 of them cleansers, against 3000 other cleansers):
+        # 65 of the 80 candidate slots flipped from cleansers to Murad NON-cleansers. With realistic
+        # offer sparsity the served page collapsed from 65 relevant rows to 3 irrelevant ones,
+        # because the offer join runs OUTSIDE this CTE's LIMIT — the slots were already spent.
+        #
+        # So when the query names a category, the brand's rows must satisfy it too. A brand-only
+        # query ("show me Murad products") has no category prefix and still admits the whole brand,
+        # which is exactly what that query asked for.
+        if category_where:
+            # A newly synced SIG can have an offer before taxonomy enrichment.
+            # Missing taxonomy is not evidence of a category mismatch. Admit
+            # such rows only with BOTH the brand identity above and a literal,
+            # whole-word category phrase in product evidence. Do not override
+            # an existing category path or admit the brand's entire inventory.
+            category_evidence = []
+            category_phrases = _category_evidence_phrases(lowered, category_prefix)
+            for index, phrase in enumerate(category_phrases[:8]):
+                param_name = f"brand_category_evidence_{index}"
+                params[param_name] = f"% {phrase} %"
+                category_evidence.extend(
+                    f"{_brand_identity_expr(field)} LIKE :{param_name}"
+                    for field in ("p.title", "p.product_type", "s.title")
+                )
+            missing_taxonomy = ""
+            if category_evidence:
+                missing_taxonomy = (
+                    " OR (NULLIF(TRIM(p.category_path), '') IS NULL AND ("
+                    + " OR ".join(category_evidence) + "))"
+                )
+            admit_predicate = (
+                "(" + admit_predicate + ")"
+                + " AND (p.category_path LIKE :category_path_prefix"
+                + missing_taxonomy + ")"
+            )
+        brand_anchor_where = (
+            "\n                OR (" + admit_predicate + ")\n"
+        )
+        # Preserve explicit brand/category evidence BEFORE both SQL limits.
+        # A published canonical's +260 structural score otherwise outweighs
+        # the +180 brand boost and can evict every newly synced brand row.
+        brand_priority_score = f"CASE WHEN ({admit_predicate}) THEN 1 ELSE 0 END"
+
     # Token-overlap recall (Part A). ADDITIVE: the whole-phrase `LIKE :query_like`
     # clause above only matches the verbatim phrase, so multi-word queries whose
     # words appear non-contiguously ("hydrating cleanser", "snail mucin essence")
@@ -998,12 +1400,15 @@ async def _fetch_canonical_search_rows(
 
     rows = await database.fetch_all(
         f"""
-        WITH candidate_skus AS (
+        WITH matched_skus AS (
             SELECT
                 m.merchant_id AS merchant_id,
                 m.merchant_name AS merchant_name,
                 m.primary_platform AS merchant_primary_platform,
                 p.product_key,
+                p.content_key,
+                p.pivota_signature_id,
+                p.pivota_canonical_url,
                 p.source_product_id,
                 p.title AS product_title,
                 p.description AS product_description,
@@ -1029,6 +1434,7 @@ async def _fetch_canonical_search_rows(
                 s.visible_option_labels,
                 s.ingredient_ids,
                 s.image_url AS sku_image_url,
+                s.updated_at AS sku_updated_at,
                 (
                     CASE WHEN LOWER(COALESCE(s.sku, '')) = :query_exact THEN 120 ELSE 0 END +
                     CASE WHEN LOWER(COALESCE(s.source_variant_id, '')) = :query_exact THEN 110 ELSE 0 END +
@@ -1059,9 +1465,11 @@ async def _fetch_canonical_search_rows(
                     CASE WHEN p.pdp_lifecycle_stage = 'published' THEN 60 ELSE 0 END +
                     CASE WHEN p.pdp_lifecycle_stage = 'validated' THEN 20 ELSE 0 END
                     {category_score}
+                    {brand_anchor_score}
                     {vertical_score}
                     {token_score}
                 ) AS rank_score,
+                {brand_priority_score} AS brand_priority,
                 -- RECALL_RELEVANCE_V2: TEXT relevance only (exact + partial LIKE
                 -- + vertical term hits), with NO structural/scope boost. Used to
                 -- order results when v2 is on so the +200 canonical boost can't
@@ -1081,6 +1489,7 @@ async def _fetch_canonical_search_rows(
                     CASE WHEN LOWER(COALESCE(s.title, '')) LIKE :query_like THEN 60 ELSE 0 END +
                     CASE WHEN LOWER(COALESCE(m.merchant_name, '')) LIKE :query_like THEN 50 ELSE 0 END +
                     CASE WHEN LOWER(COALESCE(p.source_product_id, '')) LIKE :query_like THEN 40 ELSE 0 END
+                    {brand_anchor_score}
                     {vertical_score}
                     {token_score}
                 ) AS text_score,
@@ -1106,15 +1515,39 @@ async def _fetch_canonical_search_rows(
                 {category_where}
                 {vertical_where}
                 {token_where}
+                {brand_anchor_where}
             )
             {merchant_clause}
             {lifecycle_clause}
             {sync_status_clause}
             {merchant_status_clause}
             {suppression_clause}
+            {signature_clause}
             {indexable_clause}
             {sku_suppression_clause}
-            ORDER BY rank_score DESC, p.updated_at DESC, s.updated_at DESC
+        ),
+        -- Cap each product's contribution BEFORE the budget is spent, then take
+        -- the top `candidate_limit` rows exactly as before. The window ordering
+        -- mirrors the budget ordering below — brand_priority first (#2063), then
+        -- rank — so the rows a product keeps are the ones it would have won
+        -- anyway: an exact-SKU match scores +120 and stays rank 1, so a SKU-code
+        -- lookup is unaffected. See RECALL_MAX_SKUS_PER_PRODUCT for why this is a
+        -- cap and not a DISTINCT ON (product_key).
+        candidate_skus AS (
+            SELECT *
+            FROM (
+                SELECT
+                    ms.*,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY ms.product_key
+                        ORDER BY ms.brand_priority DESC, ms.rank_score DESC,
+                                 ms.sku_updated_at DESC, ms.sku_key
+                    ) AS product_sku_rank
+                FROM matched_skus ms
+            ) ranked
+            WHERE ranked.product_sku_rank <= :per_product_sku_cap
+            ORDER BY brand_priority DESC, rank_score DESC,
+                     product_updated_at DESC, sku_updated_at DESC
             LIMIT :candidate_limit
         )
         SELECT
@@ -1122,6 +1555,9 @@ async def _fetch_canonical_search_rows(
             c.merchant_name,
             c.merchant_primary_platform,
             c.product_key,
+            c.content_key,
+            c.pivota_signature_id,
+            c.pivota_canonical_url,
             c.source_product_id,
             c.product_title,
             c.product_description,
@@ -1148,6 +1584,8 @@ async def _fetch_canonical_search_rows(
             c.ingredient_ids,
             c.sku_image_url,
             o.offer_id,
+            o.merchant_id AS offer_merchant_id,
+            bm.merchant_name AS offer_merchant_name,
             o.catalog_track AS offer_catalog_track,
             o.truth_tier AS offer_truth_tier,
             o.readiness_tier AS offer_readiness_tier,
@@ -1186,7 +1624,7 @@ async def _fetch_canonical_search_rows(
         LEFT JOIN catalog_merchants bm
           ON bm.merchant_id = o.merchant_id
         {offer_seller_where}
-        ORDER BY rank_score DESC, c.product_updated_at DESC, o.updated_at DESC
+        ORDER BY c.brand_priority DESC, rank_score DESC, c.product_updated_at DESC, o.updated_at DESC
         LIMIT :row_limit
         """,
         params,
@@ -1877,13 +2315,17 @@ async def _build_canonical_items(
                 ),
                 product=ProductNode(
                     product_key=first.get("product_key"),
+                    pivota_signature_id=first.get("pivota_signature_id"),
                     source_product_id=first.get("source_product_id"),
                     title=first.get("product_title"),
                     description=first.get("product_description"),
                     brand=first.get("brand"),
                     product_type=first.get("product_type"),
                     category=first.get("category"),
-                    canonical_url=first.get("canonical_url"),
+                    canonical_url=(
+                        first.get("pivota_canonical_url")
+                        or first.get("canonical_url")
+                    ),
                     image_url=first.get("product_image_url"),
                 ),
                 sku=SkuNode(
@@ -2084,8 +2526,7 @@ def _build_external_item(row: Dict[str, Any], query: str, *, source_order: int) 
 
 
 def _sort_items(items: List[PivotResultItem]) -> List[PivotResultItem]:
-    def sort_key(item: PivotResultItem) -> tuple[int, int, float, float, int, Decimal]:
-        internal_boost = 1 if item.catalog_track == "internal_merchant" else 0
+    def sort_key(item: PivotResultItem) -> tuple[int, float, float, int, Decimal]:
         exact_boost = 1 if item.match_explanation.get("exact_match") else 0
         relevance_boost = 0.0
         source_boost = 0.0
@@ -2126,7 +2567,6 @@ def _sort_items(items: List[PivotResultItem]) -> List[PivotResultItem]:
                 structure_boost = 0.0
         return (
             -exact_boost,
-            -internal_boost,
             -(relevance_boost + source_boost),
             -structure_boost,
             source_order,
@@ -2206,6 +2646,8 @@ async def search_pivot_catalog(request: PivotQueryRequest) -> PivotQueryResponse
         query=request.query,
         merchant_id=request.merchant_id,
         limit=request.limit,
+        require_signature=request.canonical_entities_only,
+        brand_anchor_terms=request.brand_anchor_terms,
     )
     canonical_items = await _build_canonical_items(
         canonical_rows,
@@ -2219,6 +2661,7 @@ async def search_pivot_catalog(request: PivotQueryRequest) -> PivotQueryResponse
     external_items: List[PivotResultItem] = []
     if (
         request.include_external
+        and not request.canonical_entities_only
         and query_semantic_class in {"beauty", "fragrance"}
         and len(canonical_items) < max(3, request.limit)
     ):

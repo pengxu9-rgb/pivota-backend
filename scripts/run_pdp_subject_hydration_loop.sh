@@ -3,7 +3,12 @@ set -euo pipefail
 
 # Periodically hydrate pdp_subject_index for the employee PDP dashboard.
 #
-# This runs in a loop because Railway does not provide a cron service.
+# This runs in a loop because the original platform had no cron service.
+#
+# Production is Cloud Run (pivota-prod/us-west1) now, where Cloud Scheduler does
+# exist - see infra/gcp/setup_scheduler.sh. No scheduler entry covers PDP subject
+# hydration today (checked 2026-08-25: the enabled crons are relgraph-sync-cron
+# and reviews-invitation-send-cron), so this loop is still the way it runs.
 #
 # Env:
 # - DATABASE_URL (required)

@@ -1,0 +1,378 @@
+"""The last copy of the Shopify host rule, and the one webhook site that spends a credential.
+
+`routes/webhook_routes.py:846` held a byte-identical private copy of `_canonicalize_shop_domain`,
+untouched by #2075 which unified the rule everywhere else. Two definitions of "which host may
+receive an Admin token" are free to drift, and this file pins the merge.
+
+WHAT IS AND IS NOT PINNED, because the distinction is the whole design:
+
+  * SIX call sites use the canonicaliser. FIVE of them COMPARE hosts -- the untrusted
+    `X-Shopify-Shop-Domain` header against the stores connected to a merchant, and an
+    `app/uninstalled` UPDATE keyed on the domain. Those are deliberately NOT pinned to
+    `*.myshopify.com`. Pinning the allowlist at webhook_routes.py:3714 would make any store whose
+    stored domain is not canonical stop matching its own webhooks -- Shopify would keep delivering
+    and we would keep 404ing, silently, which is a worse outcome than the thing being prevented and
+    is not what the credential guard is for. `test_allowlist_still_matches_a_non_canonical_store`
+    pins that non-pinning so a later "tighten everything" pass cannot quietly break deliveries.
+
+  * ONE call site turns a stored domain into an Admin API URL: the webhook registration loop POSTs
+    `X-Shopify-Access-Token` to `{domain}/admin/api/2025-10/webhooks.json` once per topic -- about
+    twenty requests -- and `resolve_shopify_admin_access_token` POSTs client credentials to
+    `{domain}/admin/oauth/access_token` before that. THAT one is pinned, and pinned above the
+    resolver, which previously received the raw column.
+
+REAL SOCKETS, AND WHERE THEY DO AND DO NOT CARRY THE KILL. A listening socket counts connection
+attempts whatever HTTP client made them, so these cannot be satisfied later by swapping clients.
+Bound on `::` -- a v4-only bind cannot observe a dial to `[::1]`, it just gets ECONNREFUSED, so an
+IPv6 case would assert `count == 0` against code that connected perfectly well.
+
+Stated precisely, because review showed the headline was thinner than it read:
+  * the `evil.example` and `shop.myshopify.com.evil.example` parameters never NAME the listener, so
+    their `count == 0` holds whatever the code does -- the status assertion is what kills there;
+  * `canonicalize_shop_domain("127.0.0.1:PORT")` drops the PORT, so a build that merely canonicalises
+    instead of pinning dials `127.0.0.1:443`, not the listener -- again killed by status;
+  * the one place the socket genuinely carries the kill is
+    `test_the_credential_exchange_itself_never_dials_a_hostile_stored_host`, because the resolver's
+    own `_normalize_shop_domain` PRESERVES the port and nothing between the handler and the socket is
+    stubbed there. Verified: against the pre-PR ordering it fails with `assert 1 == 0`.
+"""
+from __future__ import annotations
+
+import socket
+import threading
+from typing import Any, Dict, List, Optional
+
+import pytest
+from fastapi.testclient import TestClient
+
+from services.shopify_domain import canonicalize_shop_domain
+import routes.webhook_routes as wr
+
+MERCHANT = "merchant_webhookpin"
+
+
+class CountingListener:
+    def __init__(self) -> None:
+        self._sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(("::", 0))
+        self._sock.listen(16)
+        self.port = self._sock.getsockname()[1]
+        self.count = 0
+        self._stop = False
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self) -> None:
+        while not self._stop:
+            try:
+                conn, _ = self._sock.accept()
+            except OSError:
+                return
+            self.count += 1
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def close(self) -> None:
+        self._stop = True
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+
+
+@pytest.fixture()
+def listener():
+    lis = CountingListener()
+    try:
+        yield lis
+    finally:
+        lis.close()
+
+
+@pytest.fixture(scope="module")
+def client() -> TestClient:
+    import main
+
+    return TestClient(main.app)
+
+
+def _auth() -> Dict[str, str]:
+    """EMPLOYEE, not merchant. The route is gated on get_current_employee -- it points a store's
+    full-PII order webhooks at a caller-supplied callback_base_url, so it is ops-only by design."""
+    from utils.auth import create_access_token
+
+    return {
+        "Authorization": "Bearer "
+        + create_access_token({"sub": "u-ops", "email": "ops@example.com", "role": "employee"})
+    }
+
+
+# --------------------------------------------------------------------------------------
+# 1. One definition of the rule.
+# --------------------------------------------------------------------------------------
+
+def test_webhook_routes_uses_the_shared_canonicaliser():
+    """Not a style assertion. Two copies of the rule that decides where a credential may be sent is
+    the drift this merge exists to end, and identity is the only way to state that in a test."""
+    assert wr._canonicalize_shop_domain is canonicalize_shop_domain
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("shop.myshopify.com", "shop.myshopify.com"),
+        ("SHOP.MyShopify.Com", "shop.myshopify.com"),
+        ("https://shop.myshopify.com/admin", "shop.myshopify.com"),
+        # Canonicalising is NOT pinning: a non-myshopify host still canonicalises, because the
+        # comparison sites need it to. The pin lives at the one site that builds a URL.
+        ("shop.brand-example.com", "shop.brand-example.com"),
+        ("", None),
+        (None, None),
+    ],
+)
+def test_canonicaliser_behaviour_is_unchanged(raw, expected):
+    assert wr._canonicalize_shop_domain(raw) == expected
+
+
+# --------------------------------------------------------------------------------------
+# 2. The site that spends a credential.
+# --------------------------------------------------------------------------------------
+
+def _register_route(client, listener, stored, monkeypatch):
+    async def _fake_active_stores(_merchant_id):
+        return [{
+            "store_id": "store_x",
+            "platform": "shopify",
+            "domain": stored,
+            "status": "active",
+            "api_key": "shpat_TEST_TOKEN_SENTINEL",
+            "api_key_raw": "shpat_TEST_TOKEN_SENTINEL",
+        }]
+
+    async def _fake_onboarding(_merchant_id):
+        return {"merchant_id": MERCHANT, "business_name": "Test"}
+
+    monkeypatch.setattr(wr, "get_merchant_active_stores", _fake_active_stores, raising=True)
+    if hasattr(wr, "get_merchant_onboarding"):
+        monkeypatch.setattr(wr, "get_merchant_onboarding", _fake_onboarding, raising=True)
+
+    # callback_base_url is a bare `str` parameter on the handler, so FastAPI reads it from the
+    # QUERY STRING, not the body. Sending it as JSON yields a 422 before the handler ever runs.
+    return client.post(
+        f"/webhooks/register/shopify/{MERCHANT}",
+        params={"callback_base_url": "https://api.example"},
+        headers=_auth(),
+    )
+
+
+@pytest.mark.parametrize(
+    "stored_tpl",
+    ["127.0.0.1:{port}", "[::1]:{port}", "evil.example", "shop.myshopify.com.evil.example"],
+)
+def test_webhook_registration_refuses_a_hostile_stored_domain(
+    client, listener, monkeypatch, stored_tpl
+):
+    stored = stored_tpl.format(port=listener.port)
+    resp = _register_route(client, listener, stored, monkeypatch)
+
+    # THE SOCKET FIRST. Ordered after a status assertion this is never reached on a build that
+    # connects, and the connection -- the thing under test -- goes unreported.
+    assert listener.count == 0, "the registration loop dialled the stored host"
+    assert resp.status_code == 400
+    assert "myshopify.com" in str(resp.json().get("detail", ""))
+    # The untrusted value must not be echoed back to the caller.
+    assert stored not in str(resp.json())
+
+
+def test_webhook_registration_still_reaches_a_valid_shop(client, listener, monkeypatch):
+    """Positive counterpart. Without it every refusal above is satisfied by a route that refuses
+    everything, which would take webhook registration offline for every real merchant."""
+    seen: List[str] = []
+
+    class _Resp:
+        status_code = 201
+        # `.text` is read on every non-201 branch of the handler. Present so a mutant that changes
+        # the accepted status fails on an assertion rather than an AttributeError-driven 500.
+        text = ""
+
+        @staticmethod
+        def json():
+            return {"webhook": {"id": 1}}
+
+    async def _fake_post(self, url, *a, **k):  # noqa: ANN001
+        seen.append(url)
+        return _Resp()
+
+    async def _fake_resolve(**_kwargs):
+        return "shpat_TEST_TOKEN_SENTINEL", {}
+
+    monkeypatch.setattr("httpx.AsyncClient.post", _fake_post, raising=True)
+    monkeypatch.setattr(wr, "resolve_shopify_admin_access_token", _fake_resolve, raising=True)
+
+    resp = _register_route(client, listener, "cosrx-renewal.myshopify.com", monkeypatch)
+
+    assert resp.status_code == 200, resp.text
+    assert seen, "the validated domain never reached a Shopify request"
+    # Exact URL, not merely the host: a mutant keeping the host but moving the path would survive.
+    assert set(seen) == {"https://cosrx-renewal.myshopify.com/admin/api/2025-10/webhooks.json"}
+    # ...and the COUNT, because a set collapses every topic into one element: `break` after the
+    # first successful registration survived this test until the length was asserted.
+    assert len(seen) == 18, "every topic must be registered, not just the first"
+    # NOTE: no `listener.count == 0` here. It would be unconditionally vacuous -- the domain is
+    # valid and httpx.post is stubbed, so no path could reach the listener whatever the code did.
+
+
+def test_the_token_resolver_receives_the_pinned_host_not_the_raw_column(client, monkeypatch):
+    """The resolver POSTs client credentials to {domain}/admin/oauth/access_token, so it must be
+    handed the pinned value. Before this change it was called with the raw column and the
+    canonicalisation happened afterwards."""
+    got: Dict[str, Any] = {}
+
+    class _Resp:
+        status_code = 201
+
+        @staticmethod
+        def json():
+            return {"webhook": {"id": 1}}
+
+    async def _fake_post(self, url, *a, **k):  # noqa: ANN001
+        return _Resp()
+
+    async def _fake_resolve(**kwargs):
+        got.update(kwargs)
+        return "shpat_TEST_TOKEN_SENTINEL", {}
+
+    monkeypatch.setattr("httpx.AsyncClient.post", _fake_post, raising=True)
+    monkeypatch.setattr(wr, "resolve_shopify_admin_access_token", _fake_resolve, raising=True)
+
+    _register_route(client, None, "HTTPS://CosRx-Renewal.MyShopify.Com/admin", monkeypatch)
+
+    assert got.get("shop_domain") == "cosrx-renewal.myshopify.com"
+
+
+# --------------------------------------------------------------------------------------
+# 3. The non-pinning that has to stay non-pinned.
+# --------------------------------------------------------------------------------------
+
+def test_allowlist_still_matches_a_non_canonical_store():
+    """Guards the deliberate gap. If someone later "tightens" the comparison sites to
+    *.myshopify.com, a store connected under any other domain stops matching its own webhook
+    deliveries and we 404 Shopify silently. Canonicalising must keep accepting such a host."""
+    for host in ("shop.brand-example.com", "checkout.example.co.uk", "legacy-store.example"):
+        assert wr._canonicalize_shop_domain(host) == host
+        assert wr._canonicalize_shop_domain(f"https://{host}/") == host
+
+
+# --------------------------------------------------------------------------------------
+# 4. The allowlist short-circuit, found by review of this PR.
+#
+# The 401 above the check tests the RAW header; the 403 tests the CANONICALISED one, and it was
+# spelled `if got_canon and got_canon not in allowed_domains`. Several NON-EMPTY headers canonicalise
+# to None, so they cleared the 401 and then skipped the 403 entirely. That allowlist is the only
+# binding between the merchant_id in the URL path and the shop a payload came from -- the HMAC
+# covers the body alone -- so an app-secret-signed body could be replayed into any merchant's path.
+#
+# Pre-existing, not introduced here. Pinned in this PR because this PR is what certifies these
+# comparison sites as correct, and a test that blesses a site is how its defect survives the next
+# audit.
+# --------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "header",
+    ["/", "://", "https:///", "//victim.myshopify.com", "?", "#", " ", "\t", "https://#@evil.example"],
+)
+def test_a_header_that_canonicalises_to_nothing_is_refused_not_skipped(header):
+    """These are all NON-EMPTY, so the missing-header 401 does not cover them, and they all
+    canonicalise to None. The mismatch check must treat 'cannot canonicalise' as 'does not match'."""
+    assert wr._canonicalize_shop_domain(header) is None
+    assert header, "an empty header would be caught by the 401 instead; that is a different case"
+
+    # The predicate as it is now written, applied to the same inputs the route applies it to.
+    allowed = {"victim.myshopify.com"}
+    got_canon = wr._canonicalize_shop_domain(header)
+    refused = (not got_canon) or (got_canon not in allowed)
+    assert refused, "a header we cannot canonicalise reached the handler as if it matched"
+
+
+def test_a_matching_header_is_still_admitted():
+    """Positive counterpart: the fix must not refuse the shop that legitimately matches."""
+    allowed = {"victim.myshopify.com"}
+    got_canon = wr._canonicalize_shop_domain("VICTIM.myshopify.com")
+    refused = (not got_canon) or (got_canon not in allowed)
+    assert not refused
+
+
+def test_the_route_source_does_not_short_circuit_on_a_falsy_canonical_host():
+    """Pins the SPELLING, because the bug is a spelling: `got_canon and ...` skips the check for a
+    falsy value, `not got_canon or ...` refuses it. The behavioural test above cannot see which
+    form the route uses, and driving the full webhook path needs a valid HMAC over a signed body."""
+    import inspect
+
+    src = inspect.getsource(wr.handle_shopify_webhook)
+    assert "if not got_canon or got_canon not in allowed_domains:" in src
+    assert "if got_canon and got_canon not in allowed_domains:" not in src
+
+
+def test_an_uninstall_we_cannot_attribute_does_not_wipe_credentials():
+    """The store UPDATE is domain-scoped; the merchant_onboarding one is keyed on merchant_id alone.
+    An uninstall whose shop cannot be named must touch neither."""
+    import inspect
+
+    src = inspect.getsource(wr._process_shopify_webhook_event)
+    guard = src.index("if not canon_domain:")
+    onboarding = src.index("UPDATE merchant_onboarding")
+    early_return = src.index('"reason": "unidentifiable_shop"')
+    assert guard < early_return < onboarding, (
+        "the merchant_onboarding wipe must sit behind the unidentifiable-shop return"
+    )
+
+
+def test_the_credential_exchange_itself_never_dials_a_hostile_stored_host(client, listener, monkeypatch):
+    """The scenario this whole file is ABOUT, which every other test here stubs away.
+
+    `resolve_shopify_admin_access_token` POSTs client_id/client_secret to
+    {domain}/admin/oauth/access_token. It only does so when the stored api_key is a JSON blob
+    carrying client credentials -- with a plain `shpat_...` string it returns without a packet, so
+    the other tests cover that leg with a stub and the socket assertion there carries no weight.
+
+    Two details make this the strongest case in the file:
+      * the resolver's own `_normalize_shop_domain` PRESERVES the port, unlike the canonicaliser the
+        route used before this change -- so the pre-fix code dialled the listener EXACTLY, and this
+        assertion is load-bearing rather than incidental;
+      * httpx is left REAL here. Nothing is stubbed between the handler and the socket.
+    """
+    import json
+
+    blob = json.dumps({"client_id": "test_client_id", "client_secret": "test_client_secret"})
+
+    async def _fake_active_stores(_merchant_id):
+        return [{
+            "store_id": "store_x",
+            "platform": "shopify",
+            "domain": f"127.0.0.1:{listener.port}",
+            "status": "active",
+            # No access_token in the blob, so _token_needs_refresh() is True and the resolver
+            # actually performs the client-credentials exchange.
+            "api_key": blob,
+            "api_key_raw": blob,
+        }]
+
+    async def _fake_onboarding(_merchant_id):
+        return {"merchant_id": MERCHANT, "business_name": "Test"}
+
+    monkeypatch.setattr(wr, "get_merchant_active_stores", _fake_active_stores, raising=True)
+    monkeypatch.setattr(wr, "get_merchant_onboarding", _fake_onboarding, raising=True)
+
+    resp = client.post(
+        f"/webhooks/register/shopify/{MERCHANT}",
+        params={"callback_base_url": "https://api.example"},
+        headers=_auth(),
+    )
+
+    assert listener.count == 0, (
+        "the client-credentials exchange dialled the stored host; the client secret went to it"
+    )
+    assert resp.status_code == 400
+    assert "myshopify.com" in str(resp.json().get("detail", ""))

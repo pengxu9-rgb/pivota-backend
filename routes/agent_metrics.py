@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, Query, Request, Header, HTTPException
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 from db.database import database
-from db.agents import resolve_agent_id_by_api_key
+from db.agents import resolve_active_agent_id, resolve_agent_id_by_api_key
 from utils.auth import require_admin, decode_token
 
 router = APIRouter(prefix="/agent/metrics", tags=["Agent Metrics"])
@@ -38,7 +38,7 @@ async def get_metrics_summary(
                 role = payload.get("role")
                 if role in ["super_admin", "admin", "employee", "outsourced"]:
                     employee_context = True
-                agent_id = payload.get("agent_id")
+                agent_id = await resolve_active_agent_id(payload.get("agent_id"))
             except:
                 pass
         if not agent_id and x_api_key:
@@ -247,7 +247,7 @@ async def get_recent_activity(
         if authorization and authorization.startswith("Bearer "):
             try:
                 payload = decode_token(authorization.split(" ")[1])
-                agent_id = payload.get("agent_id")
+                agent_id = await resolve_active_agent_id(payload.get("agent_id"))
             except:
                 pass
         if not agent_id and x_api_key:
@@ -289,6 +289,9 @@ async def get_agent_metrics(current_user: dict = Depends(require_admin)) -> Dict
     """
     Get per-agent usage metrics
     """
+    # agents has agent_name / owner_email / is_active (db/agents.py); this read name, company and
+    # status, which it does not have, so every call answered {"status": "error"}. A NULL is_active
+    # is active, the same as the auth door (routes/agent_auth.py).
     try:
         last_24h = datetime.now() - timedelta(hours=24)
         
@@ -296,9 +299,8 @@ async def get_agent_metrics(current_user: dict = Depends(require_admin)) -> Dict
             """
             SELECT 
                 a.agent_id,
-                a.name,
-                a.company,
-                a.status,
+                a.agent_name,
+                a.owner_email,
                 COUNT(l.id) as request_count,
                 AVG(l.response_time_ms) as avg_response_time,
                 SUM(CASE WHEN l.status_code < 400 THEN 1 ELSE 0 END)::float / 
@@ -307,8 +309,8 @@ async def get_agent_metrics(current_user: dict = Depends(require_admin)) -> Dict
             FROM agents a
             LEFT JOIN agent_usage_logs l ON a.agent_id = l.agent_id 
                 AND l.timestamp >= :since
-            WHERE a.status = 'active'
-            GROUP BY a.agent_id, a.name, a.company, a.status
+            WHERE a.is_active IS NOT FALSE
+            GROUP BY a.agent_id, a.agent_name, a.owner_email
             ORDER BY request_count DESC
             """,
             {"since": last_24h}
@@ -318,9 +320,9 @@ async def get_agent_metrics(current_user: dict = Depends(require_admin)) -> Dict
             "agents": [
                 {
                     "agent_id": row["agent_id"],
-                    "name": row["name"],
-                    "company": row["company"],
-                    "status": row["status"],
+                    "name": row["agent_name"],
+                    "owner_email": row["owner_email"],
+                    "status": "active",
                     "metrics_24h": {
                         "request_count": row["request_count"],
                         "avg_response_time_ms": round(float(row["avg_response_time"] or 0), 2),
@@ -355,7 +357,7 @@ async def get_metrics_timeline(
         if authorization and authorization.startswith("Bearer "):
             try:
                 payload = decode_token(authorization.split(" ")[1])
-                agent_id = payload.get("agent_id")
+                agent_id = await resolve_active_agent_id(payload.get("agent_id"))
             except:
                 pass
         if not agent_id and x_api_key:
@@ -395,6 +397,8 @@ async def get_metrics_timeline(
             "timestamp": datetime.now().isoformat()
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         return {
             "status": "error",

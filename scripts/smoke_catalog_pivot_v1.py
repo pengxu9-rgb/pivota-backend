@@ -23,7 +23,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--sku-key", default=None)
     parser.add_argument("--skip-pivot-query", action="store_true")
     parser.add_argument("--timeout-seconds", type=float, default=20.0)
-    parser.add_argument("--header", action="append", default=[], help="Repeatable raw header in 'Name: Value' form.")
+    parser.add_argument("--header", action="append", default=[], help=(
+            "Repeatable raw header in 'Name: Value' form. The /v1/catalog/* steps "
+            "need an admin/super_admin JWT: those routes are tenant-scoped, so a "
+            "non-admin token may only name the merchant in its own merchant_id "
+            "claim and otherwise gets 403 'cannot run catalog jobs for another "
+            "merchant'. Mint one with scripts/mint_employee_jwt.py --role admin."
+        ))
     parser.add_argument("--catalog-migration-verify-smoke", action="store_true")
     parser.add_argument("--catalog-migration-run-smoke", action="store_true")
     parser.add_argument(

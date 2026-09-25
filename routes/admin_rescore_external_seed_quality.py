@@ -1,7 +1,13 @@
 """Admin route: run `backfill_external_seed_quality_rescore` IN-CLUSTER, in chunks.
 
 WHY THIS EXISTS. The rescore is a prod backfill that must reach the database, and
-the only two venues both failed (measured 2026-07-28):
+the only two venues both failed (measured 2026-07-28, before the 2026-08-22 GCP
+cutover — the venues named below are Railway's, and the conclusion is UNCHANGED
+on Cloud Run: production's DATABASE_URL now resolves to a private Cloud SQL IP,
+so there is no laptop route at all, and Cloud Run has no `ssh` to offer. The
+fourth venue that does exist today is a throwaway Cloud Run job —
+`scripts/ops/run_oneoff_job.sh` — which is in-VPC like this route but does not
+share the web process's pool):
 
   * over the Railway PUBLIC PROXY from a laptop — the script ran but managed only
     ~18 of 500 rows in ~8 minutes before the pool could not reconnect

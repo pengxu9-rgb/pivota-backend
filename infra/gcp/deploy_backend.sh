@@ -12,8 +12,8 @@ set -euo pipefail
 ENV="${1:-}"; TAG="${2:-}"
 [ -n "$ENV" ] && [ -n "$TAG" ] || { echo "usage: $0 staging|prod <image-tag>" >&2; exit 2; }
 case "$ENV" in
-  staging) PROJECT=pivota-staging; PIVOTA_ENV=staging;    MIN=1; MAX=4;  CPU=2; MEM=2Gi; POOL_MIN=2; POOL_MAX=8 ;;
-  prod)    PROJECT=pivota-prod;    PIVOTA_ENV=production; MIN=2; MAX=20; CPU=2; MEM=4Gi; POOL_MIN=2; POOL_MAX=6 ;;
+  staging) PROJECT=pivota-staging; PIVOTA_ENV=staging;    MIN=1; MAX=4;  CPU=2; MEM=2Gi; POOL_MIN=2; POOL_MAX=8;  CONCURRENCY=80 ;;
+  prod)    PROJECT=pivota-prod;    PIVOTA_ENV=production; MIN=2; MAX=10; CPU=2; MEM=4Gi; POOL_MIN=2; POOL_MAX=12; CONCURRENCY=20 ;;
   *) echo "bad env" >&2; exit 2 ;;
 esac
 
@@ -49,12 +49,26 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 case "$CONFIG" in apply|preserve) ;; *) echo "CONFIG must be apply or preserve (got '$CONFIG')" >&2; exit 2 ;; esac
 case "$STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED" in true|false) ;; *) echo "STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED must be exactly true or false (got '$STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED')" >&2; exit 2 ;; esac
 case "$STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED" in true|false) ;; *) echo "STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED must be exactly true or false (got '$STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED')" >&2; exit 2 ;; esac
+# PROD SHAPE IS A CONNECTION BUDGET, not a throughput guess. Cloud SQL `pivota-pg` runs
+# max_connections=300, shared with worker/catalog-intelligence/ops, so web's ceiling is
+# MAX x POOL_MAX = 10 x 12 = 120. The previous shape (MAX=20, POOL_MAX=6, --concurrency 80) wedged
+# production twice in one week: 80 concurrent requests against 6 connections is 13x oversubscription,
+# and with DB_COMMAND_TIMEOUT_SECONDS a stalled socket pins a slot for its full duration, so six
+# stalls take the instance out entirely. Every error in both outages was the same line —
+# `PoolCheckoutTimeout: timed out waiting 120.0s for a database connection` — while Cloud SQL sat
+# RUNNABLE at 28/300 backends with 23 of them IDLE: from the server a client blocked on a dead
+# socket is indistinguishable from an idle one, which is why the DATABASE looked innocent.
+# 2026-08-29: concurrency 20 and pool 12 is 1.7x, and 10 x 20 = 200 request slots against observed
+# traffic of ~28 requests per 15 minutes. Raise MAX or CONCURRENCY only together with the budget.
+#
 # WHAT `preserve` DOES NOT PRESERVE, said out loud so the name does not overpromise. It keeps env
 # vars, secret mounts and the entrypoint. It still reasserts the SHAPE of the service from the
 # constants at the top of this file: --cpu, --memory, --min/--max-instances, --concurrency,
-# --timeout, --ingress, --vpc-egress, --labels, --service-account. Those match live prod today so
-# nothing drifts - but an operator who widened --max-instances by hand during an incident will
-# have it pulled back silently by the next CI deploy.
+# --timeout, --ingress, --vpc-egress, --labels, --service-account. An operator who widened
+# --max-instances by hand during an incident will have it pulled back silently by the next CI
+# deploy. (The sentence here used to add "those match live prod today so nothing drifts"; that is
+# no longer true by design — 2026-08-29 deliberately changed --concurrency and --max-instances, so
+# the next deploy after that change reshapes the running service. The constants are the intent.)
 #
 # WORKERS and MOUNT_DB only take effect through the env/secret files, so under `preserve` they are
 # read and then ignored. Refuse rather than ignore: the cutover runbook's headline command is
@@ -114,6 +128,46 @@ fi
 #               with a different ASGI app, so it needs no image of its own)
 : "${IMAGE_NAME:=backend}"
 : "${ENV_PREFIX:=}"
+# ── SHAPE OVERRIDES, and why the other services need them ──────────────────────────────────────
+# The constants at the top of this file are WEB'S shape - specifically web's connection budget,
+# recomputed on 2026-08-29 (max-instances 20 -> 10, concurrency 80 -> 20) after two pool-exhaustion
+# outages. Every service deployed through this script silently adopts them, and for a service that
+# is NOT web that is not a tuning choice, it is an unreviewed capacity change riding along inside
+# an image roll.
+#
+# MEASURED 2026-09-05: prod `proof-issuer` is running concurrency 80 / maxScale 20, because it was
+# last deployed on 08-27 and has been frozen at the pre-08-29 constants ever since. Running the
+# runbook command in prod-deploy-drift.yml's footer today would cut it to concurrency 20 /
+# maxScale 10 - 1600 request slots down to 200, eightfold, as a side effect of shipping a commit.
+# That was survivable while every deploy was a human typing the command and watching it; it is not
+# something an automatic push-triggered deploy may do on its own.
+#
+# So a caller may pin what the service already has, and the deploy becomes what it claims to be:
+# an image roll. This mirrors MIN_INSTANCES/MAX_INSTANCES, which already existed for this reason.
+# NOT defaulted from the live service: reading the shape back and re-applying it would make this
+# script incapable of ever CORRECTING a hand-edit, which is the drift the preserve-mode pool guard
+# below exists to catch. The intent stays in the file; overriding it stays explicit.
+: "${CPU_LIMIT:=}"
+: "${MEMORY_LIMIT:=}"
+# ONE NAME, OPPOSITE MEANINGS, ONE FILE APART. In THIS script `CONCURRENCY_LIMIT` is the override
+# and the bare `CONCURRENCY` is the internal per-env CONSTANT set in the case block above. In
+# deploy_gateway.sh it is the other way round: there `CONCURRENCY` is an accepted ALIAS for the
+# override, because that is the spelling the 2026-09-15 incident runbook used.
+#
+# Nothing leaks between them: the case block assigns CONCURRENCY unconditionally, so an operator
+# who exported `CONCURRENCY=20` for a gateway deploy and then ran this script has it overwritten
+# with the per-env value rather than honoured. That is the SAFE direction - but it is silent, and
+# it is the reverse of what the same export just did one file over. Do not "fix" this by making
+# CONCURRENCY an alias here as well: that would let a stale export from a gateway deploy re-shape
+# the backend, which is the failure the unconditional assignment currently prevents.
+: "${CONCURRENCY_LIMIT:=}"
+# `0` is the trap here and is why this is not a plain digit check: Cloud Run reads
+# `--concurrency 0` as UNLIMITED, so the one value that looks like the tightest possible budget
+# is in fact the removal of the budget. A leading-zero form is refused too - gcloud accepts `007`
+# but it reads as octal to a human skimming a diff.
+[ -z "$CONCURRENCY_LIMIT" ] || case "$CONCURRENCY_LIMIT" in
+  *[!0-9]*|''|0|0*) echo "CONCURRENCY_LIMIT must be a positive integer with no leading zero (got '$CONCURRENCY_LIMIT'). Cloud Run reads 0 as UNLIMITED, not as a limit." >&2; exit 2 ;;
+esac
 # A prefix TYPO fails closed on the -f check below. A prefix OMISSION does not: it silently hands
 # another service the backend's entire env file and secret list. Require them to agree.
 case "$SERVICE" in
@@ -208,6 +262,91 @@ if [ "$CONFIG" = preserve ]; then
   # --update-env-vars MERGES one key. --set-env-vars / --env-vars-file REPLACE the whole set, and
   # would wipe the other 187.
   PRESERVE_ENV_UPDATES="PIVOTA_COMMIT_SHA=$TAG"
+
+  # DRIFT GUARD. preserve mode treats the LIVE service as the source of truth,
+  # which is correct — and it means this script's own POOL_MAX is not applied,
+  # so a hand edit to the running service silently becomes permanent and every
+  # later deploy propagates it.
+  #
+  # That is not hypothetical. Measured 2026-08-29: DB_POOL_MAX_SIZE went 6 -> 20
+  # in revision web-00067-jzz at 17:01:15Z, from something outside this repo (the
+  # same edit added WOOCOMMERCE_WEBHOOK_BASE_URL, which no file here defines).
+  # Three later preserve deploys carried it forward exactly as designed. Nobody
+  # noticed, because a service running at idle looks identical either way — it
+  # only bites on scale-out, and the failure it produces is pool exhaustion,
+  # which is the outage this codebase had that same morning.
+  #
+  # The arithmetic is the one in the comment further down this file: the pool is
+  # PER PROCESS, so the fleet's ceiling is pool x max-instances. At 20 x 20 = 400
+  # against a max_connections of 300, `web` alone can exhaust the server and take
+  # every other service and every ops session down with it.
+  #
+  # Budget rather than the raw ceiling: worker, gateway, catalog-intelligence and
+  # ~20 Cloud Run Jobs share the same 300, and an operator needs a session to
+  # diagnose whatever went wrong. 180 leaves 40% for them.
+  POOL_FLEET_BUDGET="${POOL_FLEET_BUDGET:-180}"
+  # `spec.template` IS THE RIGHT READ HERE, and it is deliberately not the serving revision.
+  # This guard predicts what THIS DEPLOY will apply, and `gcloud run deploy --update-env-vars`
+  # merges into the SERVICE TEMPLATE, so the template is the base the new revision inherits.
+  # Reading the serving revision would compute the ceiling for a configuration the deploy is
+  # about to replace. (Contrast infra/gcp/_serving_revision.sh, which answers the other
+  # question — "what is running" — for the callers that need it. Both questions are real; the
+  # bug is answering one with the other.)
+  #
+  # The variable is named LIVE_* and the messages below say "live", which is imprecise when a
+  # previous deploy left the template ahead of what serves. That is called out where it is
+  # printed rather than renamed, because the name appears in operator runbooks.
+  LIVE_POOL_MAX="$("$GCLOUD" run services describe "$SERVICE" --project "$PROJECT" \
+    --region "$REGION" --format='value(spec.template.spec.containers[0].env)' 2>/dev/null \
+    | tr ';' '\n' | grep "'DB_POOL_MAX_SIZE'" | grep -oE "'value': '[0-9]+'" \
+    | grep -oE '[0-9]+' | head -1 || true)"
+  LIVE_MAX_INSTANCES="$("$GCLOUD" run services describe "$SERVICE" --project "$PROJECT" \
+    --region "$REGION" \
+    --format='value(spec.template.metadata.annotations."autoscaling.knative.dev/maxScale")' \
+    2>/dev/null | head -1 || true)"
+  # `|| true` on both: under `set -e` a grep that matches nothing fails the whole
+  # command substitution and kills the script with a bare exit 1 and no message —
+  # which is a REFUSAL, but an unreadable one that looks like a crash. Let the
+  # empty value reach the explicit check below, which says what happened.
+  # Unreadable is NOT a pass. A describe that fails or a value this parser cannot
+  # find must not wave the deploy through — that is how a guard becomes theatre.
+  if [ -z "$LIVE_POOL_MAX" ] || [ -z "$LIVE_MAX_INSTANCES" ]; then
+    echo "could not read live DB_POOL_MAX_SIZE / maxScale for $SERVICE — refusing to" >&2
+    echo "deploy blind in preserve mode. Set POOL_FLEET_BUDGET=0 to bypass deliberately." >&2
+    [ "$POOL_FLEET_BUDGET" = 0 ] || exit 2
+  elif [ "$POOL_FLEET_BUDGET" != 0 ]; then
+    # Against the maxScale THIS DEPLOY WILL APPLY, not the live one. preserve mode reasserts
+    # shape, so the post-deploy ceiling is live-pool x applied-maxScale — and computing against the
+    # live maxScale made the printed remediation unable to converge: with live 20x20=400 it says
+    # "set DB_POOL_MAX_SIZE=$POOL_MAX", and the next run then computes POOL_MAX x live-20 and
+    # refuses again, forever, with no mention of maxScale. The operator loops or reaches for
+    # POOL_FLEET_BUDGET=0. Predicting the post-deploy state is both correct and self-consistent.
+    APPLIED_MAX_INSTANCES="${MAX_INSTANCES:-$MAX}"
+    FLEET_CEILING=$((LIVE_POOL_MAX * APPLIED_MAX_INSTANCES))
+    if [ "$FLEET_CEILING" -gt "$POOL_FLEET_BUDGET" ]; then
+      echo "REFUSING to deploy: the service would open up to $FLEET_CEILING database" >&2
+      echo "connections (configured DB_POOL_MAX_SIZE=$LIVE_POOL_MAX x maxScale=$APPLIED_MAX_INSTANCES" >&2
+      echo "as this deploy would apply it; the template's maxScale is $LIVE_MAX_INSTANCES)," >&2
+      echo "over the $POOL_FLEET_BUDGET budget and against a max_connections of 300 shared" >&2
+      echo "with worker/gateway/jobs. This script would set POOL_MAX=$POOL_MAX; preserve mode" >&2
+      echo "does not apply it, so the template drifted and every deploy has carried it." >&2
+      echo "Fix the service, then redeploy:" >&2
+      echo "  gcloud run services update $SERVICE --region $REGION --project $PROJECT \\" >&2
+      echo "    --update-env-vars DB_POOL_MAX_SIZE=$POOL_MAX" >&2
+      exit 2
+    fi
+    echo "   pool drift check: $LIVE_POOL_MAX x $APPLIED_MAX_INSTANCES = $FLEET_CEILING (budget $POOL_FLEET_BUDGET)"
+    # preserve mode does NOT apply POOL_MAX (env vars are the live service's to keep), so the
+    # script's intent and production can disagree silently and indefinitely. Say so on every
+    # deploy: this is exactly how the live pool sat at 6 while this file said otherwise.
+    if [ "$LIVE_POOL_MAX" != "$POOL_MAX" ]; then
+      echo "   WARNING: configured DB_POOL_MAX_SIZE=$LIVE_POOL_MAX (the service template, i.e." >&2
+      echo "   what the next revision inherits) but this script intends $POOL_MAX." >&2
+      echo "   preserve mode will NOT change it. To adopt the intended value:" >&2
+      echo "     gcloud run services update $SERVICE --region $REGION --project $PROJECT \\" >&2
+      echo "       --update-env-vars DB_POOL_MAX_SIZE=$POOL_MAX" >&2
+    fi
+  fi
   if [ "$STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED" = true ]; then
     # --update-* merges only these two keys.  It must not replace the active
     # service's configuration, which is now the production source of truth.
@@ -342,7 +481,8 @@ probe_health(){ # url -> echoes the status code
   --network default --subnet default --vpc-egress "$VPC_EGRESS" \
   ${CONFIG_ARGS[@]+"${CONFIG_ARGS[@]}"} \
   ${CMD_ARGS[@]+"${CMD_ARGS[@]}"} \
-  --port 8080 --cpu "$CPU" --memory "$MEM" --concurrency 80 --timeout 300 \
+  --port 8080 --cpu "${CPU_LIMIT:-$CPU}" --memory "${MEMORY_LIMIT:-$MEM}" \
+  --concurrency "${CONCURRENCY_LIMIT:-$CONCURRENCY}" --timeout 300 \
   --min-instances "${MIN_INSTANCES:-$MIN}" --max-instances "${MAX_INSTANCES:-$MAX}" \
   --no-cpu-throttling --cpu-boost \
   --execution-environment gen2 \

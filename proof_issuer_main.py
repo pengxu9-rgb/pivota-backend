@@ -36,8 +36,9 @@ from routes.reviews_proof_issuer import router as reviews_proof_issuer_router
 # "production" when it cannot resolve the environment on a managed host, and a
 # service that came up on that guess is a service whose every prod/staging
 # guard was decided by a guess. On Cloud Run without PIVOTA_ENV this raises
-# instead. Local dev and tests (no K_SERVICE, no Railway deployment marker)
-# resolve to "development" and pass straight through.
+# instead. Local dev and tests (no Cloud Run marker of EITHER family -- K_* for
+# a service, CLOUD_RUN_JOB/CLOUD_RUN_EXECUTION for a job -- and no Railway
+# deployment marker) resolve to "development" and pass straight through.
 #
 # It runs at import time rather than in a lifespan hook deliberately: this
 # module has no lifespan, and a misconfigured revision should die before the

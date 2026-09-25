@@ -347,12 +347,41 @@ async def _resolve_order_and_merchant_from_stripe_payload(
     order_id_hint: Optional[str],
     merchant_id_hint: Optional[str],
     db,
+    merchant_scope: Optional[str] = None,
 ) -> Tuple[Optional[str], Optional[str]]:
     """
     Returns (order_id, merchant_id) best-effort.
+
+    `merchant_scope`, when set, is the merchant that owns the webhook endpoint the
+    event arrived on. Every candidate identity here is otherwise derived from
+    attacker-controllable event metadata or from an UNSCOPED `orders` lookup, so
+    under a scope: the merchant is pinned to the scope, and an order is accepted
+    only if the DB confirms it belongs to that merchant. Callers that have no
+    endpoint owner (the bare platform-wide endpoint) pass None and keep the
+    historical best-effort behaviour.
     """
+    scope = (merchant_scope or "").strip() or None
     order_id = (order_id_hint or "").strip() or None
     merchant_id = (merchant_id_hint or "").strip() or None
+
+    if scope:
+        # The scope is authoritative; a metadata-supplied merchant never wins.
+        merchant_id = scope
+        if order_id:
+            row = await db.fetch_one(
+                "SELECT order_id FROM orders WHERE order_id = :order_id AND merchant_id = :merchant_id LIMIT 1",
+                {"order_id": order_id, "merchant_id": scope},
+            )
+            if not row:
+                order_id = None
+        if not order_id and payment_intent_id:
+            row = await db.fetch_one(
+                "SELECT order_id FROM orders WHERE payment_intent_id = :pi AND merchant_id = :merchant_id LIMIT 1",
+                {"pi": payment_intent_id, "merchant_id": scope},
+            )
+            if row:
+                order_id = str(_row_get(row, "order_id") or "") or None
+        return order_id, merchant_id
 
     if order_id and merchant_id:
         return order_id, merchant_id
@@ -388,10 +417,15 @@ async def upsert_stripe_dispute_record_best_effort(
     order_id_hint: Optional[str] = None,
     merchant_id_hint: Optional[str] = None,
     db=None,
+    merchant_scope: Optional[str] = None,
 ) -> None:
     """
     Best-effort upsert of a Stripe dispute snapshot into dispute_records.
     Never raises.
+
+    `merchant_scope` is the merchant owning the webhook endpoint the event came in
+    on; when set it pins the resolved merchant and confines every `orders` lookup
+    to that tenant. See `_resolve_order_and_merchant_from_stripe_payload`.
     """
     if db is None:
         try:
@@ -437,6 +471,7 @@ async def upsert_stripe_dispute_record_best_effort(
             order_id_hint=order_id_hint,
             merchant_id_hint=merchant_id_hint,
             db=db,
+            merchant_scope=merchant_scope,
         )
     except Exception:
         order_id, merchant_id = None, None

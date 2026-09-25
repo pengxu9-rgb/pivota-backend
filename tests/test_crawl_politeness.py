@@ -13,6 +13,7 @@ someone ran the suite.
 
 from __future__ import annotations
 
+from typing import Optional
 import asyncio
 from types import SimpleNamespace
 from typing import Any, Dict, List
@@ -30,6 +31,8 @@ def _clean_state(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("CRAWL_ROBOTS_ENABLED", raising=False)
     monkeypatch.delenv("CRAWL_MAX_BACKOFF_SECONDS", raising=False)
     monkeypatch.delenv("CRAWL_BACKOFF_BASE_SECONDS", raising=False)
+    monkeypatch.delenv("CRAWL_MAX_WAIT_SECONDS", raising=False)
+    monkeypatch.delenv("CRAWL_MAX_ROBOTS_DELAY_SECONDS", raising=False)
     yield
     cp.reset_for_tests()
 
@@ -449,9 +452,7 @@ def test_fetch_html_paces_and_feeds_the_429_back(monkeypatch: pytest.MonkeyPatch
         headers = {"content-type": "text/html", "retry-after": "77"}
         encoding = "utf-8"
         content = b"<html></html>"
-
-        def raise_for_status(self) -> None:
-            raise _httpx.HTTPStatusError("429", request=None, response=None)  # type: ignore[arg-type]
+        url = "https://brand.com/products/x"
 
     class _Client:
         def __init__(self, *a: Any, **kw: Any) -> None:
@@ -469,8 +470,12 @@ def test_fetch_html_paces_and_feeds_the_429_back(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(eos.httpx, "AsyncClient", _Client)
 
     async def go() -> None:
-        with pytest.raises(_httpx.HTTPStatusError):
+        # WAS `_httpx.HTTPStatusError` (from `raise_for_status`). It is now the typed
+        # `ExternalOfferUnavailable`, which carries the status and the final url — the seed
+        # refresh could not tell a 404 from a timeout while both arrived as bare exceptions.
+        with pytest.raises(eos.ExternalOfferUnavailable) as caught:
             await eos._fetch_html("https://brand.com/products/x")
+        assert caught.value.status_code == 429
 
     asyncio.run(go())
 
@@ -479,8 +484,8 @@ def test_fetch_html_paces_and_feeds_the_429_back(monkeypatch: pytest.MonkeyPatch
     )
     state = cp._STATE.get("brand.com")
     assert state is not None and state.consecutive_blocks == 1, (
-        "the 429 must be recorded even though raise_for_status raised — recording after it would "
-        "mean the backoff never sees a throttle"
+        "the 429 must be recorded even though the fetcher raised — recording after the throw "
+        "would mean the backoff never sees a throttle"
     )
     assert state.backoff_until > 0
 
@@ -530,6 +535,10 @@ def test_pacing_refuses_rather_than_stalling_a_request_indefinitely(
     _serve_robots(monkeypatch, {"slow.com": "User-agent: *\nCrawl-delay: 600\n"})
     _patch_sleep(monkeypatch)
     monkeypatch.setenv("CRAWL_MAX_WAIT_SECONDS", "10")
+    # 600 is over the default CRAWL_MAX_ROBOTS_DELAY_SECONDS (300), which would make this a
+    # `CrawlDelayTooLong` skip instead of the queue behaviour under test. Raised explicitly
+    # so the row keeps pinning what it was written to pin.
+    monkeypatch.setenv("CRAWL_MAX_ROBOTS_DELAY_SECONDS", "900")
 
     async def go() -> None:
         # First caller is free — nothing is queued yet.
@@ -551,6 +560,10 @@ def test_a_refused_caller_does_not_reserve_the_slot_it_abandoned(
     _serve_robots(monkeypatch, {"slow.com": "User-agent: *\nCrawl-delay: 600\n"})
     _patch_sleep(monkeypatch)
     monkeypatch.setenv("CRAWL_MAX_WAIT_SECONDS", "10")
+    # 600 is over the default CRAWL_MAX_ROBOTS_DELAY_SECONDS (300), which would make this a
+    # `CrawlDelayTooLong` skip instead of the queue behaviour under test. Raised explicitly
+    # so the row keeps pinning what it was written to pin.
+    monkeypatch.setenv("CRAWL_MAX_ROBOTS_DELAY_SECONDS", "900")
 
     async def go() -> float:
         await cp.await_slot("https://slow.com/a", user_agent="PivotaBot")
@@ -569,6 +582,10 @@ def test_a_batch_job_can_opt_into_waiting(monkeypatch: pytest.MonkeyPatch) -> No
     _serve_robots(monkeypatch, {"slow.com": "User-agent: *\nCrawl-delay: 600\n"})
     slept = _patch_sleep(monkeypatch)
     monkeypatch.setenv("CRAWL_MAX_WAIT_SECONDS", "10")
+    # 600 is over the default CRAWL_MAX_ROBOTS_DELAY_SECONDS (300), which would make this a
+    # `CrawlDelayTooLong` skip instead of the queue behaviour under test. Raised explicitly
+    # so the row keeps pinning what it was written to pin.
+    monkeypatch.setenv("CRAWL_MAX_ROBOTS_DELAY_SECONDS", "900")
 
     async def go() -> None:
         await cp.await_slot("https://slow.com/a", user_agent="PivotaBot", max_wait=0)
@@ -636,8 +653,10 @@ def test_a_negative_env_value_cannot_disable_pacing_or_the_wait_bound(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """`_f` clamps at 0. Without the clamp a negative `CRAWL_MIN_INTERVAL_SECONDS` walks
-    `next_allowed` BACKWARDS — pacing off entirely — and a negative `CRAWL_MAX_WAIT_SECONDS`
-    makes `ceiling > 0` false, restoring the unbounded stall on the live route. Operator error
+    `next_allowed` BACKWARDS — pacing off entirely. A negative `CRAWL_MAX_WAIT_SECONDS` also
+    clamps to 0, which now means "never wait" rather than the unbounded stall it used to mean
+    (see `test_an_env_ceiling_of_zero_does_not_silently_unbound_the_live_route`) — the clamp
+    still matters, but it now fails toward refusing rather than toward stalling. Operator error
     should not silently switch the gate off."""
     monkeypatch.setenv("CRAWL_MIN_INTERVAL_SECONDS", "-1")
     assert cp._min_interval() == 0.0
@@ -761,9 +780,20 @@ def test_the_batch_scripts_opt_into_waiting_rather_than_being_refused() -> None:
 # removed gate AND on a newly added fetch, which is the moment someone should be made to think.
 _GATED_CRAWL_LANES = {
     "services/external_offers_service.py": 1,
+    # products.json paging + the per-destination PDP probe. Both fetch brand storefronts.
+    "services/external_seed_destination_liveness.py": 2,
     "services/brand_product_discovery.py": 1,
     "services/co_occurrence_finder.py": 1,
-    "services/curated_brand_feed.py": 2,       # products.json paging + PDP INCI fetch
+    # products.json paging + PDP INCI fetch + meta.json (the storefront's own currency/market,
+    # added 2026-09-06 so a Singapore storefront is not ingested as USD) + the PDP meta
+    # description (added 2026-09-06: 158 of jsmbeauty.sg's 232 products publish no body_html
+    # text, so the copy the 50-char floor wants is only on the PDP itself) + the storefront
+    # homepage's own blurb (added 2026-09-06, one request per DOMAIN, so a theme substituting
+    # shop.description into a product's og tag can be recognised by comparison, not by guessing
+    # at the theme's markup).
+    # 6 since fetch_shop_description_from_meta (2026-09-08): the /meta.json blurb door, gated
+    # exactly like the homepage one it falls back from.
+    "services/curated_brand_feed.py": 7,  # includes optional bounded product identity recovery
     "services/bd_cold_start_service.py": 2,      # Shopify .json + the generic PDP-HTML fallback
     "services/executor_agents/sitemap_freshness.py": 2,  # sitemap + child indexes
 }
@@ -982,7 +1012,8 @@ def test_a_batch_only_lane_opts_into_waiting(monkeypatch: pytest.MonkeyPatch, la
     if lane == "curated_feed":
         from services import curated_brand_feed as m
         _http_stub(monkeypatch, m, status=404, text="")
-        asyncio.run(m.fetch_shopify_products("shop.example", max_products=1))
+        with pytest.raises(m.CrawlIncomplete):
+            asyncio.run(m.fetch_shopify_products("shop.example", max_products=1))
     else:
         from services.executor_agents import sitemap_freshness as m
         _http_stub(monkeypatch, m, status=404, text="")
@@ -1107,3 +1138,432 @@ def test_brand_discovery_robots_actually_consults_the_shared_gate(
 
     assert asyncio.run(bpd._robots_allows("https://brand.example/products/x")) is False
     assert asyncio.run(bpd._robots_allows("https://brand.example/pages/about")) is True
+
+
+def test_a_cancelled_robots_fetch_does_not_cache_no_restrictions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancelled fetch learned NOTHING and must not be recorded as "nothing to obey".
+
+    `_load_robots` is reachable from a request path whose deadline is shorter than this fetch
+    (the live-verification hop cancels at 1.5s while the robots timeout is 5s), so cancellation
+    is routine — and `_ROBOTS` is module-global, shared with every other crawl lane. Caching the
+    negative entry would silently disable robots compliance for that host for a full TTL, for
+    lanes that never had a deadline at all.
+    """
+    class _Hanging:
+        def __init__(self, *a: Any, **kw: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> "_Hanging":
+            return self
+
+        async def __aexit__(self, *a: Any) -> None:
+            return None
+
+        async def get(self, url: str) -> Any:
+            await asyncio.sleep(30)
+            raise AssertionError("should have been cancelled")
+
+    monkeypatch.setattr(cp, "httpx", SimpleNamespace(AsyncClient=_Hanging))
+
+    async def go() -> None:
+        task = asyncio.ensure_future(
+            cp.robots_allows("https://slowbots.example/products/x", user_agent="PivotaBot")
+        )
+        await asyncio.sleep(0.02)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(go())
+    assert "slowbots.example" not in cp._ROBOTS, (
+        "a cancelled robots fetch cached 'no restrictions' — robots is now off for this host "
+        "for a full TTL, across every lane that shares this cache"
+    )
+    assert "slowbots.example" not in cp._ROBOTS_INFLIGHT, "the in-flight entry leaked"
+
+
+# --------------------------------------------------------------- the `observed` out-param
+
+def _fetch_with_observed(
+    monkeypatch: "pytest.MonkeyPatch",
+    *,
+    status_code: int,
+    final_url: str,
+    headers: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """Drive the REAL `_fetch_html` and return what it stamped into `observed`."""
+    from services import external_offers_service as eos
+
+    class _Resp:
+        pass
+
+    resp = _Resp()
+    resp.status_code = status_code
+    resp.headers = {"content-type": "text/html", **(headers or {})}
+    resp.encoding = "utf-8"
+    resp.content = b"<html><title>t</title></html>"
+    resp.url = final_url
+
+    class _Client:
+        def __init__(self, *a: Any, **kw: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> "_Client":
+            return self
+
+        async def __aexit__(self, *a: Any) -> None:
+            return None
+
+        async def get(self, url: str) -> Any:
+            return resp
+
+    _serve_robots(monkeypatch, {"brand.com": ""})
+    monkeypatch.setattr(eos.httpx, "AsyncClient", _Client)
+    _patch_sleep(monkeypatch)
+
+    observed: Dict[str, Any] = {}
+
+    async def go() -> None:
+        try:
+            await eos._fetch_html("https://brand.com/products/x", observed=observed)
+        except eos.ExternalOfferUnavailable:
+            pass
+
+    asyncio.run(go())
+    return observed
+
+
+def test_fetch_html_reports_what_it_saw_on_a_200(monkeypatch: "pytest.MonkeyPatch") -> None:
+    """`observed` is the ONLY channel the live path has for a destination verdict.
+
+    Every refresh test stubs `resolve_external_offer` and hand-fills this dict, so deleting
+    the three lines that populate it left the whole suite green while
+    `_refresh_external_seed_by_id` would report `not_observed` forever in production.
+    """
+    observed = _fetch_with_observed(
+        monkeypatch, status_code=200, final_url="https://brand.com/products/x"
+    )
+    assert observed["status_code"] == 200
+    assert observed["final_url"] == "https://brand.com/products/x"
+    assert observed["bot_challenged"] is False
+
+
+def test_fetch_html_reports_the_FINAL_url_after_a_redirect(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> None:
+    """The final url is what separates a live product from a 301 onto a collection page."""
+    observed = _fetch_with_observed(
+        monkeypatch, status_code=200, final_url="https://brand.com/collections/all"
+    )
+    assert observed["final_url"] == "https://brand.com/collections/all"
+    assert observed["status_code"] == 200
+
+
+def test_fetch_html_reports_a_404_before_it_raises(monkeypatch: "pytest.MonkeyPatch") -> None:
+    """The stamp has to happen BEFORE the throw, or the dead-link path learns nothing."""
+    observed = _fetch_with_observed(
+        monkeypatch, status_code=404, final_url="https://brand.com/products/x"
+    )
+    assert observed["status_code"] == 404
+    assert observed["bot_challenged"] is False
+
+
+def test_fetch_html_flags_a_bot_challenge(monkeypatch: "pytest.MonkeyPatch") -> None:
+    """429 + `cf-mitigated` is a refusal; the refresh must not read it as a dead product."""
+    observed = _fetch_with_observed(
+        monkeypatch,
+        status_code=429,
+        final_url="https://brand.com/products/x",
+        headers={"cf-mitigated": "challenge"},
+    )
+    assert observed["status_code"] == 429
+    assert observed["bot_challenged"] is True
+
+
+def test_fetch_html_raises_on_a_3xx_that_was_not_followed(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> None:
+    """`raise_for_status` threw for any non-2xx; `>= 400` did not, and that is not the same.
+
+    A 302 with no Location survives `follow_redirects=True`. Under the old predicate its body
+    was parsed as the product page and written into the snapshot.
+    """
+    from services import external_offers_service as eos
+
+    observed = _fetch_with_observed(
+        monkeypatch, status_code=302, final_url="https://brand.com/products/x"
+    )
+    assert observed["status_code"] == 302
+
+    class _Resp:
+        pass
+
+    resp = _Resp()
+    resp.status_code = 302
+    resp.headers = {"content-type": "text/html"}
+    resp.encoding = "utf-8"
+    resp.content = b"<html></html>"
+    resp.url = "https://brand.com/products/x"
+
+    class _Client:
+        def __init__(self, *a: Any, **kw: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> "_Client":
+            return self
+
+        async def __aexit__(self, *a: Any) -> None:
+            return None
+
+        async def get(self, url: str) -> Any:
+            return resp
+
+    _serve_robots(monkeypatch, {"brand.com": ""})
+    monkeypatch.setattr(eos.httpx, "AsyncClient", _Client)
+    _patch_sleep(monkeypatch)
+
+    async def go() -> None:
+        with pytest.raises(eos.ExternalOfferUnavailable) as caught:
+            await eos._fetch_html("https://brand.com/products/x")
+        assert caught.value.status_code == 302
+
+    asyncio.run(go())
+
+
+# --- a host-stated Crawl-delay is bounded, and bounding it must not mean crawling faster -------
+#
+# THE DEFECT THESE PIN, reproduced by construction during review of #1898/#1899: `await_slot`
+# folded `robots_delay` into the effective interval with no ceiling, and `max_wait=0`
+# ("unbounded", which ten call sites pass) removed the only thing that had ever clamped
+# it. Measured against ff589e4e on a host serving `Crawl-delay: 86400`: row 2 slept
+# 86399.99998s and row 3 slept 172799.99999s, because every row also wrote `start + 86400` into
+# `next_allowed`. The sleep is the symptom; the INTERVAL is the defect.
+
+_ONE_DAY_ROBOTS = "User-agent: *\nCrawl-delay: 86400\n"
+
+
+def test_an_unbounded_caller_still_refuses_an_absurd_crawl_delay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`max_wait=0` buys patience for a BACKOFF, not a 24-hour standing rate limit."""
+    _serve_robots(monkeypatch, {"slow.com": _ONE_DAY_ROBOTS})
+    slept = _patch_sleep(monkeypatch)
+
+    with pytest.raises(cp.CrawlDelayTooLong):
+        asyncio.run(cp.await_slot("https://slow.com/a", user_agent="PivotaBot", max_wait=0))
+
+    assert slept == [], f"the refusal must happen instead of the sleep, slept {slept}"
+
+
+def test_the_cap_bounds_the_interval_not_merely_the_sleep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE ROW THAT MATTERS, and the one a sleep-only cap would leave failing.
+
+    Clamping the SLEEP would still leave `next_allowed` a full day out, because the reservation
+    is written from `interval`, not from the sleep. Every later row on the host would then be
+    refused for 24h — the same starvation, now silent. So the refusal has to come BEFORE the
+    reservation, and the host's state must be untouched afterwards.
+    """
+    import time as _time
+
+    _serve_robots(monkeypatch, {"slow.com": _ONE_DAY_ROBOTS})
+    _patch_sleep(monkeypatch)
+
+    async def go() -> None:
+        for _ in range(3):
+            with pytest.raises(cp.CrawlDelayTooLong):
+                await cp.await_slot("https://slow.com/a", user_agent="PivotaBot", max_wait=0)
+
+    asyncio.run(go())
+
+    assert "slow.com" not in cp._STATE, (
+        "a refused row must not reserve the slot it abandoned — asserting the host has NO "
+        "state entry rather than a past `next_allowed`, so this cannot be satisfied by a "
+        "stale reservation that merely happens to have expired"
+    )
+    # Belt and braces: if a future change legitimately creates state here, it still must not
+    # be a reservation pushed into the future.
+    reserved = getattr(cp._STATE.get("slow.com"), "next_allowed", 0.0)
+    assert reserved - _time.monotonic() <= 0, f"next_allowed is {reserved:.0f}"
+
+
+def test_the_cap_bites_on_the_bounded_live_route_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`max_wait` never protected the FIRST row on a host, which is how the state got poisoned.
+
+    On a fresh host `start == now`, so `start - now` is 0 and the `CrawlPaced` ceiling never
+    fires — the caller sails through, sleeps nothing, and writes `now + 86400` into
+    `next_allowed`. The unauthenticated `POST /api/offers/external/resolve` would then be refused
+    for that host for a day, on the strength of one line of someone else's robots.txt.
+    """
+    _serve_robots(monkeypatch, {"slow.com": _ONE_DAY_ROBOTS})
+    _patch_sleep(monkeypatch)
+    monkeypatch.setenv("CRAWL_MAX_WAIT_SECONDS", "10")
+
+    with pytest.raises(cp.CrawlDelayTooLong):
+        asyncio.run(cp.await_slot("https://slow.com/a", user_agent="PivotaBot"))
+
+    assert "slow.com" not in cp._STATE, "the refused host must leave no reservation behind"
+
+
+def test_the_cap_never_makes_us_crawl_a_host_faster_than_it_asked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cap that CLAMPED would be the wrong fix and would look identical in every row above.
+
+    Under the cap the host's own delay is still honoured in full — 200s stays 200s, it does not
+    become `min(200, cap)` or the 1s floor. The cap decides WHETHER we crawl this host, never
+    HOW FAST.
+    """
+    _serve_robots(monkeypatch, {"polite.com": "User-agent: *\nCrawl-delay: 200\n"})
+    slept = _patch_sleep(monkeypatch)
+    monkeypatch.setenv("CRAWL_MAX_ROBOTS_DELAY_SECONDS", "300")
+
+    async def go() -> None:
+        await cp.await_slot("https://polite.com/a", user_agent="PivotaBot", max_wait=0)
+        await cp.await_slot("https://polite.com/b", user_agent="PivotaBot", max_wait=0)
+
+    asyncio.run(go())
+
+    assert slept and slept[-1] > 199, (
+        f"the host asked for 200s between requests and must get it, slept {slept}"
+    )
+
+
+def test_a_capped_refusal_is_catchable_as_an_ordinary_pacing_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every existing caller handles `CrawlPaced` as "skip the row, record nothing about the
+    product". That is the correct handling here too, so the new type must not slip past those
+    handlers as a bare `RuntimeError` — while still being distinguishable for logging."""
+    assert issubclass(cp.CrawlDelayTooLong, cp.CrawlPaced)
+    assert cp.CrawlDelayTooLong is not cp.CrawlPaced
+
+    _serve_robots(monkeypatch, {"slow.com": _ONE_DAY_ROBOTS})
+    _patch_sleep(monkeypatch)
+    with pytest.raises(cp.CrawlPaced) as caught:
+        asyncio.run(cp.await_slot("https://slow.com/a", user_agent="PivotaBot", max_wait=0))
+    text = str(caught.value)
+    assert "Crawl-delay" in text, (
+        f"the refusal has to say WHY the host was skipped, got {caught.value!r}"
+    )
+    # This string is returned verbatim as `reason` to an ANONYMOUS caller by
+    # routes/external_offers.py's resolve endpoint. It may name the host and the delay the
+    # host itself published; it must not name our internal config knobs.
+    assert "CRAWL_MAX_ROBOTS_DELAY_SECONDS" not in text, (
+        f"the anonymous resolve route echoes this string; it must not leak env var names: {text!r}"
+    )
+
+
+def test_an_operator_can_raise_or_disable_the_crawl_delay_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cap is policy, so it has to be tunable — including all the way off, for an operator
+    who knowingly wants a lane to sit out a very long delay."""
+    _serve_robots(monkeypatch, {"slow.com": "User-agent: *\nCrawl-delay: 3600\n"})
+    slept = _patch_sleep(monkeypatch)
+
+    monkeypatch.setenv("CRAWL_MAX_ROBOTS_DELAY_SECONDS", "0")
+
+    async def go() -> None:
+        await cp.await_slot("https://slow.com/a", user_agent="PivotaBot", max_wait=0)
+        await cp.await_slot("https://slow.com/b", user_agent="PivotaBot", max_wait=0)
+
+    asyncio.run(go())
+    assert any(d > 3500 for d in slept), f"cap=0 must disable the ceiling, slept {slept}"
+
+
+def test_a_delay_exactly_at_the_cap_is_still_honoured(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`>` not `>=`. A boundary flipped the other way silently narrows the policy by one
+    second and no other row here would notice."""
+    _serve_robots(monkeypatch, {"edge.com": "User-agent: *\nCrawl-delay: 300\n"})
+    slept = _patch_sleep(monkeypatch)
+
+    async def go() -> None:
+        await cp.await_slot("https://edge.com/a", user_agent="PivotaBot", max_wait=0)
+        await cp.await_slot("https://edge.com/b", user_agent="PivotaBot", max_wait=0)
+
+    asyncio.run(go())
+    assert any(d > 299 for d in slept), f"300s is AT the 300s cap, not over it: {slept}"
+
+
+# --- CRAWL_MAX_WAIT_SECONDS=0 means "never wait", not "wait forever" ---------------------------
+
+def test_an_env_ceiling_of_zero_does_not_silently_unbound_the_live_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`max_wait=0` is the CALLER'S sentinel for unbounded, and the env used to be read through
+    the same `> 0` test. So an operator setting `CRAWL_MAX_WAIT_SECONDS=0` — which can only mean
+    "do not stall my request path" — got the exact opposite, on the unauthenticated
+    `POST /api/offers/external/resolve`. The sentinel's polarity is pre-existing and untouched;
+    the env reading, which no caller opted into, is not.
+    """
+    _serve_robots(monkeypatch, {"queue.com": 404})
+    slept = _patch_sleep(monkeypatch)
+    monkeypatch.setenv("CRAWL_MIN_INTERVAL_SECONDS", "5")
+    monkeypatch.setenv("CRAWL_MAX_WAIT_SECONDS", "0")
+
+    async def go() -> None:
+        # First row is free: "never wait" still allows a slot that is available right now.
+        await cp.await_slot("https://queue.com/a", user_agent="PivotaBot")
+        # The second is 5s out, and the operator said not to wait at all.
+        with pytest.raises(cp.CrawlPaced):
+            await cp.await_slot("https://queue.com/b", user_agent="PivotaBot")
+
+    asyncio.run(go())
+    assert slept == [], f"an env ceiling of 0 must never produce a wait, slept {slept}"
+
+
+def test_an_explicit_max_wait_of_zero_is_still_unbounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other half of the row above: fixing the ENV reading must not disarm the SENTINEL that
+    ten call sites pass. If this flipped, every batch lane would silently revert to
+    refusing anything past its default ceiling."""
+    _serve_robots(monkeypatch, {"queue.com": 404})
+    slept = _patch_sleep(monkeypatch)
+    monkeypatch.setenv("CRAWL_MIN_INTERVAL_SECONDS", "120")
+    monkeypatch.setenv("CRAWL_MAX_WAIT_SECONDS", "10")
+
+    async def go() -> None:
+        await cp.await_slot("https://queue.com/a", user_agent="PivotaBot", max_wait=0)
+        await cp.await_slot("https://queue.com/b", user_agent="PivotaBot", max_wait=0)
+
+    asyncio.run(go())
+    assert any(d > 119 for d in slept), f"max_wait=0 must still mean unbounded, slept {slept}"
+
+
+def test_a_non_numeric_crawl_delay_cannot_slip_past_the_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The `math.isnan` guard in `_load_robots`, which nothing else reaches.
+
+    A NaN delay defeats the cap SILENTLY — every comparison against NaN is False, so
+    `robots_delay > cap` never fires — and then poisons the host permanently, because
+    `start + nan` is nan and `max(now, nan)` is nan for every later caller.
+
+    Today's stdlib `RobotFileParser` gates `Crawl-delay` on `isdigit()`, so this is
+    unreachable through the parser and the guard is insurance on a value we do not own. That
+    is exactly why it needs a row: an unreachable guard with no test is indistinguishable from
+    a guard that does not work. Driven by stubbing `crawl_delay` directly.
+    """
+    _serve_robots(monkeypatch, {"nan.com": "User-agent: *\nCrawl-delay: 5\n"})
+    slept = _patch_sleep(monkeypatch)
+    monkeypatch.setattr(cp.RobotFileParser, "crawl_delay", lambda self, ua: float("nan"))
+
+    async def go() -> None:
+        await cp.await_slot("https://nan.com/a", user_agent="PivotaBot", max_wait=0)
+        await cp.await_slot("https://nan.com/b", user_agent="PivotaBot", max_wait=0)
+
+    asyncio.run(go())
+
+    _parser, delay = asyncio.run(cp._load_robots("nan.com", "PivotaBot"))
+    assert delay is None, f"a NaN Crawl-delay must be dropped, got {delay!r}"
+    # `x == x` is False only for NaN.
+    assert all(d == d for d in slept), f"a NaN must never reach a sleep: {slept}"
+    reserved = cp._STATE["nan.com"].next_allowed
+    assert reserved == reserved, "next_allowed is NaN — the host is now permanently unschedulable"

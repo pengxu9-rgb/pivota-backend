@@ -3,19 +3,33 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
+import os
+import re
+import time
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from threading import Lock
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from fastapi import HTTPException
 from urllib.parse import urlparse
 
 from db.database import database
 from db.merchant_onboarding import get_all_merchant_onboardings
 from services.external_seed_audit import (
     audit_external_seed_row,
+    get_content_extracted_at,
+    get_destination_failure_streak,
+    get_destination_verdict,
+    get_last_destination_check_at,
     get_last_extracted_at,
     get_snapshot,
+)
+from services.external_seed_destination_liveness import (
+    CONFIRMED_DEAD_VERDICTS,
+    RETIREMENT_STREAK,
 )
 from services.outbound_links_service import (
     DEFAULT_UTM_TEMPLATE,
@@ -29,6 +43,108 @@ logger = logging.getLogger(__name__)
 
 EXTERNAL_REFERRAL_GATING_POLICY_VERSION = "external_referral_v1"
 EXTERNAL_REFERRAL_STALE_DAYS = 7
+
+# Minimum share of a run's candidates that must actually reach the origin before the run counts
+# as a success. Measured on prod 2026-09-06 the nightly run sat at ~0.50 (2,647 refreshed minus
+# 654 cache-served, over 4,000 candidates), so this threshold is deliberately set AT the current
+# level: it is meant to fire now, because a night that reaches the origin for half its rows is
+# the failure we are trying to make visible. Tunable without a deploy while hosts are triaged.
+_MIN_ORIGIN_YIELD_DEFAULT = 0.5
+
+# The only two HTTPException details that mean "this seed can never be crawled", as opposed to
+# "something went wrong this time". Kept as an explicit set so a new 4xx cannot quietly join them.
+_UNPROCESSABLE_SEED_DETAILS = frozenset({"SEED_NOT_FOUND", "INVALID_URL"})
+
+
+def _min_origin_yield() -> float:
+    raw = os.getenv("EXTERNAL_REFERRAL_REFRESH_MIN_ORIGIN_YIELD", "").strip()
+    try:
+        value = float(raw) if raw else _MIN_ORIGIN_YIELD_DEFAULT
+    except ValueError:
+        return _MIN_ORIGIN_YIELD_DEFAULT
+    return min(max(value, 0.0), 1.0)
+
+
+def batch_run_status(
+    *,
+    failed: int,
+    stopped_early: bool,
+    attempted_count: int,
+    origin_reads: int,
+    price_changes: int = 0,
+    projections_attempted: int = 0,
+    projections_written: int = 0,
+    projections_errored: int = 0,
+) -> str:
+    """The run's health, as one word. Pure so it can be tested without a database.
+
+    Extracted rather than inlined in the summary dict BECAUSE a test that re-implements this
+    arithmetic proves nothing about the job — it passes whether or not the production path uses
+    it. Both the summary and the tests call this.
+
+    `failed` alone is the old rule and it is nearly always 0: a degraded read is not an
+    exception. The two ways a run silently does nothing are stopping on budget and reaching the
+    origin for too few of its candidates.
+    """
+    if failed:
+        return "degraded"
+    # `stopped_early` is REPORTED, not failed on. With --limit 4000 over 11,769 seeds the queue
+    # is designed to be drained across ~3 nights, so a budget stop is the steady state, not an
+    # incident. Conflating the two would make the alarm meaningless on night one. The yield
+    # below is the signal that actually distinguishes a short run from an empty one.
+    if attempted_count and (origin_reads / attempted_count) < _min_origin_yield():
+        return "degraded"
+    # Projection ran and healed nothing while prices were moving: the offers table is still
+    # drifting from the seed, which is the whole defect this hook exists to close. Silent
+    # before, because the outcome dicts were discarded — `no_mirror_product` x2,000 and
+    # `synced` x2,000 read identically.
+    if price_changes and projections_attempted and projections_written == 0:
+        return "degraded"
+    # Every projection that was attempted raised. Distinct from the rule above: prices may
+    # not have moved (so `price_changes` is 0) and the writer may still have blown up on
+    # every row -- the error count was previously collected and read by nothing.
+    if projections_attempted and projections_errored >= projections_attempted:
+        return "degraded"
+    return "success"
+
+
+def _bump(counter: Dict[str, int], key: str) -> None:
+    counter[key] = int(counter.get(key) or 0) + 1
+
+
+def _degraded_reason_bucket(error: Any) -> str:
+    """Collapse a degraded row's error into a small, readable bucket.
+
+    Buckets, not raw strings: the raw text carries URLs and per-host detail, which makes the
+    histogram unreadable and can leak a destination into a log line. An HTTP status keeps its
+    code because that is the actionable part (403/429 = blocked, 404 = gone, 5xx = their side).
+    """
+    text = str(error or "").strip().lower()
+    if not text:
+        return "unspecified"
+    # Keywords FIRST, and the status pattern anchored on an http-ish prefix. A bare
+    # `\b([45]\d{2})\b` run first turned `port=443` inside a timeout message into bucket
+    # `http_443` — a port number is not a status code, and the timeout was the real reason.
+    for needle, bucket in (
+        ("timeout", "timeout"), ("timed out", "timeout"),
+        ("robots", "robots"), ("crawl", "crawl_paced"),
+        ("ssl", "tls"), ("tls", "tls"), ("certificate", "tls"),
+        ("dns", "dns"), ("name or service", "dns"), ("getaddrinfo", "dns"),
+        ("connection", "connection"), ("refused", "connection"),
+        ("challenge", "bot_challenge"), ("captcha", "bot_challenge"),
+        ("snapshot_failed", "snapshot_failed"),
+    ):
+        if needle in text:
+            return bucket
+    # A status code is introduced by a word that means "status", never by `port=`. Keywords have
+    # already run, so a timeout carrying `port=443` never reaches here; this guards the residue.
+    match = re.search(
+        r"(?:http|https|status|code|returned|responded)[ _:=]*\s*([45]\d{2})(?!\d)", text
+    )
+    if match:
+        return f"http_{match.group(1)}"
+    return "other"
+
 EXTERNAL_REFERRAL_BLOCKER_ANOMALIES = {
     "locale_market_mismatch",
     "non_product_fallback_page",
@@ -37,7 +153,40 @@ EXTERNAL_REFERRAL_BLOCKER_ANOMALIES = {
     "stale_snapshot",
     "redirect_unavailable",
     "destination_domain_not_allowed",
+    # A FACT, not a clock. `stale_snapshot` says "we have not looked recently";
+    # `destination_dead` says "we looked, twice, a day apart, and the product was gone".
+    # Only the second one can be trusted enough to be worth acting on, which is why
+    # retirement hangs off it and not off age (docs/external-seed-dead-pdp-link-audit.md).
+    "destination_dead",
+    # Never verified at all. This used to be the FAIL-OPEN case: the staleness check was
+    # guarded on `extracted_dt is not None`, so a seed with no observation behind it passed.
+    "destination_never_verified",
+    # The LINK check has gone stale. Distinct from `stale_snapshot`, which is about the
+    # CONTENT: a sweep proves the URL resolves without reading a price, and a content refresh
+    # reads a price without proving the URL still resolves. One field cannot answer both.
+    "destination_stale",
 }
+# Recall only needs a real product destination that is safe to hand to the
+# merchant checkout.  The broader audit blocker set above still drives refresh
+# work and transaction-readiness reporting, but it must not remove an otherwise
+# usable offer from discovery merely because its cached content is old, its
+# local variant projection is incomplete, or its last liveness check is stale.
+EXTERNAL_REFERRAL_RUNTIME_BLOCKER_ANOMALIES = {
+    "non_product_fallback_page",
+    "redirect_unavailable",
+    "destination_domain_not_allowed",
+    "destination_dead",
+}
+
+
+def external_referral_live_verification_reasons(status: ExternalReferralStatus) -> List[str]:
+    """Audit blockers that require live commerce validation but allow recall."""
+    return sorted(
+        set(getattr(status, "blocker_anomaly_types", []) or [])
+        - EXTERNAL_REFERRAL_RUNTIME_BLOCKER_ANOMALIES
+    )
+
+
 EXTERNAL_REFERRAL_REVIEW_ANOMALIES = {
     "zero_images",
     "generic_template_description",
@@ -763,17 +912,88 @@ async def evaluate_external_referral_seed(
                 }
             )
 
-    last_extracted_at = get_last_extracted_at(normalized_row, snapshot)
-    extracted_dt = _parse_timestamp(last_extracted_at)
-    if extracted_dt is not None and extracted_dt < (datetime.now(timezone.utc) - timedelta(days=EXTERNAL_REFERRAL_STALE_DAYS)):
+    # IS THE LINK STILL THERE? — three answers, and "we don't know" is one of them.
+    #
+    # This block used to ask `get_last_extracted_at`, whose fallback chain ends at
+    # `row["updated_at"]`. That column moves whenever ANY writer touches the row, so it
+    # measured "when did we last write this" and called it freshness — and it was guarded on
+    # `extracted_dt is not None`, so a row with no timestamp at all passed. Both defects had
+    # the same effect: a seed could look fresh without anyone ever having loaded the page.
+    #
+    # `destination_checked_at` is written only by a fetch that reached the origin
+    # (services/external_seed_destination_liveness), so NULL genuinely means never verified
+    # and is a blocker rather than a pass.
+    verdict = get_destination_verdict(normalized_row)
+    streak = get_destination_failure_streak(normalized_row)
+    if verdict in CONFIRMED_DEAD_VERDICTS and streak >= RETIREMENT_STREAK:
+        findings.append(
+            {
+                "anomaly_type": "destination_dead",
+                "severity": "blocker",
+                "recommended_action": "The brand no longer serves this product page. Repoint the seed or retire it.",
+                "auto_fixable": False,
+                "evidence": {
+                    "destination_verdict": verdict,
+                    "destination_failure_streak": streak,
+                    "destination_http_status": normalized_row.get("destination_http_status"),
+                },
+            }
+        )
+
+    # TWO INDEPENDENT QUESTIONS, AND ONE FIELD CANNOT ANSWER BOTH.
+    #
+    # The first version of this block replaced the content-age check with the destination
+    # check, which reads as a strict improvement and is not one: the sweep stamps
+    # `destination_checked_at` from a catalogue read or a HEAD-shaped probe WITHOUT ever
+    # reading a price. So the day the first full pass completed, ~11.3k rows carrying a
+    # median-56-to-99-day-old price would have flipped from blocked to healthy — a serving
+    # regression created by the very change meant to close one, and invisible to any
+    # measurement taken before the sweep ran.
+    #
+    #   stale_snapshot     the CONTENT (price, availability) is old  -> the number we quote is wrong
+    #   destination_stale  the LINK has not been re-verified         -> it may be gone by now
+    #
+    # Both are blockers, both are separately clearable, and neither substitutes for the other.
+    extracted_at = get_content_extracted_at(normalized_row, snapshot)
+    extracted_dt = _parse_timestamp(extracted_at)
+    stale_cutoff = datetime.now(timezone.utc) - timedelta(days=EXTERNAL_REFERRAL_STALE_DAYS)
+    if extracted_dt is None or extracted_dt < stale_cutoff:
         findings.append(
             {
                 "anomaly_type": "stale_snapshot",
                 "severity": "blocker",
-                "recommended_action": f"Refresh the seed snapshot to keep referral data fresher than {EXTERNAL_REFERRAL_STALE_DAYS} days.",
+                "recommended_action": f"Refresh the seed snapshot to keep referral content fresher than {EXTERNAL_REFERRAL_STALE_DAYS} days.",
                 "auto_fixable": True,
                 "evidence": {
-                    "last_extracted_at": _to_iso(extracted_dt or last_extracted_at),
+                    "last_extracted_at": _to_iso(extracted_dt) if extracted_dt else None,
+                    "threshold_days": EXTERNAL_REFERRAL_STALE_DAYS,
+                },
+            }
+        )
+
+    last_checked_at = get_last_destination_check_at(normalized_row)
+    checked_dt = _parse_timestamp(last_checked_at)
+    if checked_dt is None:
+        findings.append(
+            {
+                "anomaly_type": "destination_never_verified",
+                "severity": "blocker",
+                "recommended_action": "Run the destination sweep (jobs/external_seed_destination_sweep) before serving this seed.",
+                "auto_fixable": True,
+                "evidence": {"destination_checked_at": None},
+            }
+        )
+    elif checked_dt < stale_cutoff:
+        findings.append(
+            {
+                "anomaly_type": "destination_stale",
+                "severity": "blocker",
+                "recommended_action": f"Re-verify the seed destination to keep the link check fresher than {EXTERNAL_REFERRAL_STALE_DAYS} days.",
+                "auto_fixable": True,
+                "evidence": {
+                    "destination_checked_at": _to_iso(checked_dt),
+                    # Kept for continuity with the dashboards that already read this key.
+                    "last_extracted_at": _to_iso(get_last_extracted_at(normalized_row, snapshot)),
                     "threshold_days": EXTERNAL_REFERRAL_STALE_DAYS,
                 },
             }
@@ -810,7 +1030,11 @@ async def evaluate_external_referral_seed(
         blocker_anomaly_types=blocker_anomaly_types,
         review_anomaly_types=review_anomaly_types,
         findings=findings,
-        last_extracted_at=_to_iso(extracted_dt or last_extracted_at),
+        # Still the CONTENT-extraction time: this field is what the employee dashboards
+        # render, and re-pointing it at `destination_checked_at` would silently change a
+        # column of dates people read as "when was this seed last extracted". The gate above
+        # deliberately no longer uses it.
+        last_extracted_at=_to_iso(get_last_extracted_at(normalized_row, snapshot)),
         tracked_destination_url=tracked_destination_url,
     )
 
@@ -1340,12 +1564,21 @@ async def should_block_external_referral_runtime(
     matched_via: str = "runtime",
     allowed_domains: Optional[List[str]] = None,
 ) -> Tuple[bool, ExternalReferralStatus]:
+    """Block recall only when the merchant handoff is unusable or unsafe.
+
+    ``status`` intentionally retains every audit blocker so operators and the
+    transaction path can require refresh or quote validation.  Recall is
+    source-neutral: nonterminal audit findings do not hide external offers.
+    """
     status = await evaluate_external_referral_seed(
         row,
         matched_via=matched_via,
         allowed_domains=allowed_domains,
     )
-    blocked = status.status == "blocked"
+    runtime_blockers = sorted(
+        set(status.blocker_anomaly_types) & EXTERNAL_REFERRAL_RUNTIME_BLOCKER_ANOMALIES
+    )
+    blocked = bool(runtime_blockers)
     if blocked:
         _record_metric("referral_runtime_filtered_total")
         logger.info(
@@ -1353,13 +1586,31 @@ async def should_block_external_referral_runtime(
             extra={
                 "seed_id": status.seed_id,
                 "matched_via": matched_via,
-                "blockers": list(status.blocker_anomaly_types),
+                "blockers": runtime_blockers,
+                "audit_blockers": list(status.blocker_anomaly_types),
             },
         )
     return blocked, status
 
 
 async def get_external_referral_refresh_candidate_seed_ids(limit: int = 500) -> List[str]:
+    """Pick the seeds we have spent a request on least recently.
+
+    ORDERED ON `last_crawl_attempt_at`, NOT `updated_at` and NOT `last_crawled_at`. The two are not the same question and
+    this function asked the wrong one until migration 202. `updated_at` answers "when was
+    this row last WRITTEN", and it is bumped by writers that never contact the origin:
+    `external_seed_servability` on attach, `identity_resolution` on a status flip,
+    `pdp_governance_service`, and any operator PATCH. Ordering the refresh queue by it
+    starves rows in proportion to how much OTHER attention they get — and the sharpest
+    case is the first query below, which selects `attached_product_key IS NOT NULL` while
+    the act of attaching is itself an `updated_at` bump. A seed becoming servable, the
+    moment its price starts being quoted, went to the back of the queue that keeps its
+    price honest.
+
+    `updated_at` is kept only as a tiebreak beneath the real signal, so rows that share a
+    `last_crawled_at` (notably the NULL cohort — today, all of them) still come out in a
+    stable, sensible order rather than whatever the index happens to return.
+    """
     normalized_limit = max(1, min(int(limit or 500), 5000))
     attached_rows = await database.fetch_all(
         """
@@ -1367,7 +1618,7 @@ async def get_external_referral_refresh_candidate_seed_ids(limit: int = 500) -> 
         FROM external_product_seeds
         WHERE status = 'active'
           AND attached_product_key IS NOT NULL
-        ORDER BY updated_at ASC NULLS FIRST, created_at ASC NULLS FIRST
+        ORDER BY last_crawl_attempt_at ASC NULLS FIRST, last_crawled_at ASC NULLS FIRST, updated_at ASC NULLS FIRST
         LIMIT :limit
         """,
         {"limit": normalized_limit},
@@ -1403,7 +1654,7 @@ async def get_external_referral_refresh_candidate_seed_ids(limit: int = 500) -> 
           AND attached_product_key IS NULL
           AND domain IS NOT NULL
           AND TRIM(domain) != ''
-        ORDER BY updated_at ASC NULLS FIRST, created_at ASC NULLS FIRST
+        ORDER BY last_crawl_attempt_at ASC NULLS FIRST, last_crawled_at ASC NULLS FIRST, updated_at ASC NULLS FIRST
         LIMIT :limit
         """,
         {"limit": normalized_limit * 4},
@@ -1421,12 +1672,75 @@ async def get_external_referral_refresh_candidate_seed_ids(limit: int = 500) -> 
     return (attached_ids + domain_unattached_ids)[:normalized_limit]
 
 
+# The wall-clock ceiling for one refresh run, and it is not a nicety. Every row here is a
+# politeness-gated fetch of a third-party storefront, and the gate can legitimately sleep for
+# minutes: `CRAWL_MAX_BACKOFF_SECONDS` alone is 300s, so `limit=500` rows against a
+# persistently-429ing host is a worst case near 41 hours WITHOUT any hostile robots.txt in the
+# picture. `crawl_politeness`'s `CRAWL_MAX_ROBOTS_DELAY_SECONDS` bounds what any ONE row can
+# cost; only a budget bounds what the RUN costs.
+#
+# Default sits under the 3600s Cloud Run task timeout its sibling sweep documents
+# (`services/external_seed_destination_liveness.SWEEP_HOST_CONCURRENCY`) so the run prints its
+# own summary instead of being killed mid-row with nothing to show for it.
+EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS = 3300.0
+
+
+def _refresh_budget_seconds(explicit: Optional[float]) -> float:
+    """Resolve the run's wall-clock budget. `<= 0` disables it (and says so in the summary).
+
+    NON-FINITE FALLS BACK TO THE DEFAULT rather than through. `argparse type=float` accepts
+    `nan` and `inf`, and either would (a) silently disable the budget, since `budget > 0` is
+    False for NaN, while the summary still reported `stopped_early: false`, and (b) reach
+    `json.dumps` in `jobs/external_referral_refresh.main`, which emits a bare `NaN` that is
+    not valid JSON for any downstream parser.
+    """
+    def _finite(value: Any) -> Optional[float]:
+        try:
+            out = float(value)
+        except (TypeError, ValueError):
+            return None
+        return out if math.isfinite(out) else None
+
+    if explicit is not None:
+        resolved = _finite(explicit)
+        return EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS if resolved is None else resolved
+    raw = os.getenv("EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS")
+    if raw is None or not str(raw).strip():
+        return EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS
+    resolved = _finite(raw)
+    return EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS if resolved is None else resolved
+
+
 async def run_external_referral_refresh_batch(
     *,
     refresh_seed_by_id: Callable[[str], Awaitable[Dict[str, Any]]],
     limit: int = 500,
+    budget_seconds: Optional[float] = None,
 ) -> Dict[str, Any]:
     candidate_seed_ids = await get_external_referral_refresh_candidate_seed_ids(limit=limit)
+    budget = _refresh_budget_seconds(budget_seconds)
+    started = time.monotonic()
+    skipped_for_budget = 0
+    degraded_reasons: Dict[str, int] = {}
+    unprocessable = 0
+    unprocessable_reasons: Dict[str, int] = {}
+    proj_attempted = 0
+    proj_written = 0
+    proj_errored = 0
+    proj_seconds = 0.0
+    proj_skips: Dict[str, int] = {}
+    pdp_refreshed = 0
+    pdp_errored = 0
+    pdp_skips: Dict[str, int] = {}
+    degraded_hosts: Dict[str, int] = {}
+    stopped_early = False
+    # A "success" that never contacted the origin. `resolve_external_offer` honours
+    # `raise_on_unavailable` only for `ExternalOfferUnavailable`; a timeout, TLS error,
+    # `RobotsDisallowed`, or a `CrawlDelayTooLong` skip returns the CACHED snapshot instead,
+    # and this loop counts that row as `refreshed`. Without this counter a run in which a
+    # hostile robots.txt voided every row is indistinguishable from a complete one — the same
+    # failure mode `stopped_early` exists to prevent.
+    refreshed_from_cache = 0
     refreshed = 0
     degraded = 0
     failed = 0
@@ -1454,12 +1768,29 @@ async def run_external_referral_refresh_batch(
     # offer shape — a different problem with a different fix.
     price_skipped_non_positive = 0
     availability_changed = 0
-    for seed_id in candidate_seed_ids:
+    for index, seed_id in enumerate(candidate_seed_ids):
+        # CHECKED BEFORE THE ROW, not after: the point is to stop STARTING work, and a check
+        # after the call would still pay one more full row past the budget. It cannot interrupt
+        # a row already in flight either, so the true ceiling is `budget` plus the cost of the
+        # single slowest row — bounded, since `crawl_politeness` now caps what one row can cost.
+        if budget > 0 and (time.monotonic() - started) >= budget:
+            stopped_early = True
+            skipped_for_budget = len(candidate_seed_ids) - index
+            # LOUD, because a silent truncation reads exactly like a completed sweep: the
+            # summary would otherwise show a smaller `refreshed` with no reason attached.
+            logger.warning(
+                "external referral refresh hit its %.0fs wall-clock budget after %d/%d rows; "
+                "%d candidates left unrefreshed this run",
+                budget, index, len(candidate_seed_ids), skipped_for_budget,
+            )
+            break
         try:
             result = await refresh_seed_by_id(seed_id)
             status = str(result.get("status") or "success")
             if status == "success":
                 refreshed += 1
+                if result.get("snapshot_from_cache"):
+                    refreshed_from_cache += 1
                 # isinstance, not truthiness: a truthy non-dict here used to raise
                 # INSIDE the try and land the same seed in BOTH `refreshed` and
                 # `failed`, which is a worse outcome than an uncounted drift report.
@@ -1479,22 +1810,127 @@ async def run_external_referral_refresh_batch(
                     price_skipped_non_positive += 1
                 elif price_status == "unavailable":
                     price_unavailable += 1
+                proj = result.get("projection")
+                if isinstance(proj, dict):
+                    proj_attempted += int(proj.get("attempted") or 0)
+                    proj_written += int(proj.get("projected") or 0)
+                    proj_errored += int(proj.get("errored") or 0)
+                    proj_seconds += float(proj.get("seconds") or 0.0)
+                    pdp_refreshed += int(proj.get("pdp_refreshed") or 0)
+                    pdp_errored += int(proj.get("pdp_errored") or 0)
+                    for _k, _v in proj.items():
+                        if _k.startswith("pdp_skip_"):
+                            _bump(pdp_skips, _k[len("pdp_skip_"):])
+                        elif _k.startswith("skip_"):
+                            _bump(proj_skips, _k[5:])
                 availability = result.get("availability_refresh")
                 if isinstance(availability, dict) and availability.get("status") == "applied":
                     availability_changed += 1
             elif status == "degraded":
                 degraded += 1
+                # THE REASON USED TO BE DROPPED HERE. `errors[]` is populated only on the
+                # `failed` branch below, and `failed` is structurally always 0 for a degraded
+                # read — so a night with 1,353 degraded rows reported a bare count and no way
+                # to tell a bot-challenge from a TLS error from a 404. Bucketed rather than
+                # raw so the histogram stays small enough to read in a log line.
+                _bump(degraded_reasons, _degraded_reason_bucket(result.get("error")))
+                _bump(degraded_hosts, str(result.get("domain") or "unknown"))
             else:
                 failed += 1
                 errors.append({"seed_id": seed_id, "status": status, "error": result.get("error")})
+        except HTTPException as exc:
+            # NARROW ON PURPOSE. Only the two permanent per-seed data conditions are absorbed:
+            # SEED_NOT_FOUND (404) and INVALID_URL (400). ~628 seeds carry no usable destination
+            # today, so counting those as `failed` would redden the exit code every night over a
+            # backlog the run cannot fix. Anything else — a 5xx from a helper, an auth failure —
+            # is a real fault and must stay in `failed`/`errors[]` where it can move the exit
+            # code; a broad `except HTTPException` would silently reclassify those as permanent.
+            detail = str(getattr(exc, "detail", "") or "").strip()
+            if getattr(exc, "status_code", None) in (400, 404) and detail in _UNPROCESSABLE_SEED_DETAILS:
+                unprocessable += 1
+                _bump(unprocessable_reasons, detail[:40])
+            else:
+                failed += 1
+                errors.append(
+                    {"seed_id": seed_id, "status": "failed", "error": f"http {getattr(exc, 'status_code', '?')}: {detail[:200]}"}
+                )
         except Exception as exc:
             failed += 1
             errors.append({"seed_id": seed_id, "status": "failed", "error": str(exc)[:300]})
+    # Real origin contact, not the success count: `refreshed` includes rows served from the
+    # cached snapshot because the gate refused, timed out or paced out. This ratio is the one
+    # number that says whether the run did its job.
+    origin_reads = max(0, refreshed - refreshed_from_cache)
+    # ATTEMPTED rows, not candidates. `skipped_for_budget` rows were never tried, so counting
+    # them in the denominator charges the run for work it deliberately deferred and sets the
+    # floor to flap: the 09-05 night reads 0.498 by candidates but ~0.596 by attempts.
+    # `unprocessable` rows leave the denominator too: a seed with no usable destination was
+    # never a candidate for an origin read, so charging the yield for it understates a healthy
+    # run by roughly the size of that permanent backlog (~628 today).
+    attempted_count = max(0, len(candidate_seed_ids) - skipped_for_budget - unprocessable)
+    origin_yield = (origin_reads / attempted_count) if attempted_count else 1.0
+    min_yield = _min_origin_yield()
+    low_yield = bool(attempted_count) and origin_yield < min_yield
+
+    if refreshed_from_cache:
+        logger.warning(
+            "external referral refresh: %d/%d rows counted as refreshed came from the cached "
+            "snapshot without reaching the origin (paced-out host, robots, timeout or TLS)",
+            refreshed_from_cache, refreshed,
+        )
     return {
-        "status": "success" if failed == 0 else "degraded",
+        # HONEST STATUS. This used to be `success if failed == 0`, and `failed` only counts
+        # exceptions — so a run that stopped on budget, or that served half its rows from cache
+        # without reaching a single origin, reported success. The job then exited 0 and Cloud
+        # Run showed a green tick over a night that refreshed almost nothing. `stopped_early`
+        # and `low_origin_yield` are the two ways that happens in practice.
+        "status": batch_run_status(
+            failed=failed,
+            stopped_early=stopped_early,
+            attempted_count=attempted_count,
+            origin_reads=origin_reads,
+            price_changes=price_changed,
+            projections_attempted=proj_attempted,
+            projections_written=proj_written,
+            projections_errored=proj_errored,
+        ),
+        # "healed 2,000" vs "healed 0" — the projection OUTCOME, not just that it was called.
+        "unprocessable": unprocessable,
+        "unprocessable_reasons": dict(sorted(unprocessable_reasons.items(), key=lambda kv: -kv[1])[:8]),
+        # How much of the budget the projection itself consumed. With the flag armed the PDP
+        # rebuild is ~1s/key, so this is the number that says whether arming it halved throughput.
+        "projection_seconds": round(proj_seconds, 2),
+        "projections_attempted": proj_attempted,
+        "projections_written": proj_written,
+        # Errors were counted in the helper and read NOWHERE: a projection that raised on every
+        # row summarised as healthy. The PDP half has its own counters because `projections_written`
+        # means the OFFER landed, and the view rebuild can silently no-op or fail independently.
+        "projections_errored": proj_errored,
+        "projection_skips": dict(sorted(proj_skips.items(), key=lambda kv: -kv[1])[:8]),
+        "pdp_refreshed": pdp_refreshed,
+        "pdp_errored": pdp_errored,
+        "pdp_skips": dict(sorted(pdp_skips.items(), key=lambda kv: -kv[1])[:8]),
+        "attempted_count": attempted_count,
+        "degraded_reason_counts": dict(sorted(degraded_reasons.items(), key=lambda kv: -kv[1])[:12]),
+        "top_degraded_hosts": dict(sorted(degraded_hosts.items(), key=lambda kv: -kv[1])[:10]),
+        "origin_reads": origin_reads,
+        "origin_yield": round(origin_yield, 4),
+        "min_origin_yield": min_yield,
+        "low_origin_yield": low_yield,
         "gating_policy_version": EXTERNAL_REFERRAL_GATING_POLICY_VERSION,
         "candidate_count": len(candidate_seed_ids),
+        # `candidate_count` is what we INTENDED to refresh, so on a budget stop it and
+        # `refreshed + degraded + failed` no longer agree. These three say why, rather than
+        # leaving a short run looking like a complete one.
+        "stopped_early": stopped_early,
+        "budget_seconds": budget,
+        "elapsed_seconds": round(time.monotonic() - started, 3),
+        "skipped_for_budget": skipped_for_budget,
         "refreshed": refreshed,
+        # SUBSET of `refreshed`, not a separate bucket: these rows took the success path on a
+        # cached snapshot without reaching the origin. `refreshed - refreshed_from_cache` is
+        # the number of seeds this run actually re-read.
+        "refreshed_from_cache": refreshed_from_cache,
         "degraded": degraded,
         "failed": failed,
         "price_changed": price_changed,

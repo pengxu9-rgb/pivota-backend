@@ -21,6 +21,11 @@ ALLOWED_FILES = {
 
 SKIP_DIRS = {
     ".git",
+    # `.claude` holds harness-managed worktrees (full repo copies) on dev
+    # machines only — each copy's config/settings.py etc. sits at a rel path
+    # not in ALLOWED_FILES, so every worktree fails the guard; same scanning
+    # problem the duplicate-order_routes.py guard in main.py had before #1906.
+    ".claude",
     ".mypy_cache",
     ".pytest_cache",
     "__pycache__",

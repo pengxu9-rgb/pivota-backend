@@ -43,7 +43,7 @@ def _calls(tree, name):
 def test_universal_sync_enqueues_a_quality_backfill_job():
     tree = ast.parse(ROUTE.read_text())
     ingest = _calls(tree, "ingest_standard_products")
-    enqueue = _calls(tree, "create_quality_backfill_job")
+    enqueue = _calls(tree, "enqueue_quality_backfill_if_needed")
     assert ingest, "the canonical ingest call disappeared — rewrite this guard"
     assert enqueue, (
         "universal_product_sync no longer enqueues quality scoring after ingest. "
@@ -52,6 +52,36 @@ def test_universal_sync_enqueues_a_quality_backfill_job():
     )
     kw = {k.arg for c in enqueue for k in c.keywords}
     assert "missing_only" in kw and "requested_by" in kw
+    # The enqueue goes through the cooldown-aware helper and tells it whether a
+    # person is waiting. Without `unattended` every request is treated as
+    # attended and the gateway's auto-sync churn (20 snapshots per sync, up to
+    # 16 syncs a day on one Wix store, measured 2026-09-02) comes straight back.
+    assert "unattended" in kw, "forward request.unattended to the enqueue helper"
+    # ...gated on the caller's role: the merchant-facing endpoint parses the
+    # same body, so `unattended` must not be honoured from the wire alone.
+    for c in enqueue:
+        node = next(k.value for k in c.keywords if k.arg == "unattended")
+        assert "role" in ast.dump(node), (
+            "unattended is forwarded straight from the request body; it must "
+            "also require the admin/internal caller role"
+        )
+
+
+def test_the_internal_platform_sync_api_marks_its_requests_unattended():
+    """routes/platform_products_sync_api is the gateway's scheduled auto-sync
+    door (X-ADMIN-KEY, server-to-server, force_refresh=True). It must say so, or
+    the cooldown never applies to the one caller it exists for."""
+    api = Path(__file__).resolve().parents[1] / "routes" / "platform_products_sync_api.py"
+    tree = ast.parse(api.read_text())
+    reqs = _calls(tree, "UniversalSyncRequest")
+    assert reqs, "the internal API no longer builds a UniversalSyncRequest — rewrite this guard"
+    for call in reqs:
+        kws = {k.arg: k.value for k in call.keywords}
+        assert "unattended" in kws, "unattended is not passed"
+        node = kws["unattended"]
+        assert isinstance(node, ast.Constant) and node.value is True, (
+            "the internal auto-sync API must construct its request with unattended=True"
+        )
 
 
 def test_enqueue_honours_the_caller_s_force_refresh():
@@ -70,7 +100,7 @@ def test_enqueue_honours_the_caller_s_force_refresh():
     landed, with every signal reporting success.
     """
     tree = ast.parse(ROUTE.read_text())
-    calls = _calls(tree, "create_quality_backfill_job")
+    calls = _calls(tree, "enqueue_quality_backfill_if_needed")
     assert calls, "the enqueue call disappeared — rewrite this guard"
     for call in calls:
         kws = {k.arg: k.value for k in call.keywords}
@@ -114,7 +144,7 @@ def test_enqueue_failure_cannot_fail_the_sync():
     for node in ast.walk(tree):
         if isinstance(node, ast.Try):
             body_src = ast.dump(node)
-            if "create_quality_backfill_job" in body_src:
+            if "enqueue_quality_backfill_if_needed" in body_src:
                 assert node.handlers, "enqueue try-block has no except handler"
                 return
     raise AssertionError("create_quality_backfill_job is not wrapped in try/except")

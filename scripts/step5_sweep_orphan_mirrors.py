@@ -38,11 +38,15 @@ Revert (by run):
   WHERE suppression_reason = 'step5_orphan_seed_mirror'
     AND suppression_metadata->>'run_id' = '<run_id printed at apply time>';
 
-Usage (prod via railway, same access notes as step5_working_set.py):
+Usage (prod is Cloud Run, pivota-prod/us-west1 — same access notes as
+step5_working_set.py; there is no `railway run` equivalent, and Railway is the
+ROLLBACK, so an apply cut taken there suppresses rows nobody is served from):
   Dry-run (default):
-    python3 scripts/step5_sweep_orphan_mirrors.py
+    scripts/ops/run_oneoff_job.sh scripts/step5_sweep_orphan_mirrors.py
   Apply:
-    python3 scripts/step5_sweep_orphan_mirrors.py --apply
+    scripts/ops/run_oneoff_job.sh scripts/step5_sweep_orphan_mirrors.py --apply
+  Locally, against a database you already have a URL for:
+    DATABASE_URL=... python3 scripts/step5_sweep_orphan_mirrors.py
 """
 
 from __future__ import annotations
@@ -161,7 +165,7 @@ async def _run(apply: bool) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__,    formatter_class=argparse.RawDescriptionHelpFormatter,)
     parser.add_argument(
         "--apply",
         action="store_true",
