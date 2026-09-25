@@ -350,6 +350,31 @@ async def get_active_membership_by_email(
     return None
 
 
+async def has_active_membership_for_entity(
+    *,
+    email: str,
+    membership_type: str,
+    entity_id: str,
+) -> bool:
+    """Whether `email`'s active identity holds an active `membership_type` membership
+    for exactly `entity_id`. Unlike get_active_membership_by_email this is bound to one
+    entity, so a membership for some other agent/merchant never answers for this one."""
+    if not entity_id:
+        return False
+    identity = await get_identity_by_email(email)
+    if not identity or identity.get("status") != AUTH_MEMBERSHIP_ACTIVE:
+        return False
+    row = await database.fetch_one(
+        auth_memberships.select().where(
+            (auth_memberships.c.identity_id == identity["identity_id"])
+            & (auth_memberships.c.membership_type == membership_type)
+            & (auth_memberships.c.entity_id == str(entity_id))
+            & (auth_memberships.c.status == AUTH_MEMBERSHIP_ACTIVE)
+        )
+    )
+    return row is not None
+
+
 async def record_identity_event(
     *,
     event_type: str,
