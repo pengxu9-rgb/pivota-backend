@@ -502,8 +502,8 @@ def test_agent_whose_address_lives_in_email_sees_its_own_record(client, legacy_a
 
     The employee create route (retired in pivota-backend#2305) wrote
     `INSERT INTO agents (agent_id, name, email, ...)` and never wrote
-    owner_email; prod's table does have `email`. An agent whose address lives there, holding a token with only the email
-    identity, matched nothing when the filter looked only at owner_email -- and
+    owner_email; prod's table does have `email`. An agent whose address lives
+    there, holding a token with only the email identity, matched nothing when the filter looked only at owner_email -- and
     got 200 with an EMPTY list, a silent lockout rather than the detail route's
     explicit 403. The earlier fixture was built from the SQLAlchemy model,
     which has no `email` column, so it could not represent such a row at all.
