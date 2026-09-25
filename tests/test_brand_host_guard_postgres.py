@@ -61,7 +61,7 @@ async def _row(db, key, *, url, source_domain=None, brand="BHG Brand", merchant=
         "INSERT INTO catalog_products (product_key, merchant_id, platform, source_product_id, title, brand,"
         " canonical_url, source_domain, pivota_signature_id) VALUES (:k, :m, 'external_seed', :k, 'Lipstick',"
         " :b, :u, :sd, :sig)",
-        {"k": PREFIX + key, "m": merchant, "b": brand, "u": url, "sd": source_domain, "sig": "sig-" + key})
+        {"k": PREFIX + key, "m": merchant, "b": brand, "u": url, "sd": source_domain, "sig": PREFIX + "sig-" + key})
 
 
 async def _find(db, host, merchant="bhg_new"):
@@ -89,6 +89,7 @@ async def test_a_look_alike_host_is_not_a_conflict(db, url):
     "https://PALACEBEAUTY-BHG.COM:443/products/lipstick",
     "https://palacebeauty-bhg.com",
     "https://palacebeauty-bhg.com?variant=1",
+    "https://us.palacebeauty-bhg.com/products/lipstick",   # a subdomain is the same site
 ])
 async def test_the_same_host_is_still_a_conflict(db, url):
     await _row(db, "same", url=url)
@@ -113,3 +114,11 @@ async def test_a_regex_metacharacter_in_the_host_is_literal(db):
 async def test_the_same_merchant_is_never_its_own_conflict(db):
     await _row(db, "own", url="https://palacebeauty-bhg.com/p", merchant="bhg_new")
     assert await _find(db, "palacebeauty-bhg.com") is None
+
+
+@pytest.mark.asyncio
+async def test_a_host_passed_with_its_scheme_still_matches(db):
+    # WooCommerce store domains are stored as `https://...` and reach the guard as source_domain.
+    await _row(db, "scheme", url="https://palacebeauty-bhg.com/products/lipstick")
+    assert (await _find(db, "https://palacebeauty-bhg.com"))["product_key"] == PREFIX + "scheme"
+    assert (await _find(db, "https://www.palacebeauty-bhg.com/"))["product_key"] == PREFIX + "scheme"

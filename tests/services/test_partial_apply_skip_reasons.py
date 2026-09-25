@@ -506,8 +506,17 @@ async def test_batch_row_rejected_before_bind_is_still_named(real_resolver):
     ("https://palacebeauty.com.evil.io/x", False),
     ("https://other.com/?r=palacebeauty.com", False),
     ("https://palacebeautyxcom/x", False),
+    ("https://us.palacebeauty.com/p", True),
+    ("https://a.b.palacebeauty.com", True),
+    ("https://user@evil.io/palacebeauty.com", False),
 ])
 def test_host_url_pattern_anchors_on_the_url_host(url, match):
     """Python's `re` agrees with a Postgres ARE on this subset; tests/test_brand_host_guard_postgres.py runs `~*`."""
     import re
     assert bool(re.search(aii.host_url_pattern("palacebeauty.com"), url, re.IGNORECASE)) is match
+
+
+@pytest.mark.parametrize("host", ["palacebeauty.com", "https://palacebeauty.com", "http://www.palacebeauty.com/",
+                                  "//palacebeauty.com", "  PalaceBeauty.com "])
+def test_host_url_pattern_reduces_a_host_given_with_a_scheme(host):
+    assert aii.host_url_pattern(host) == aii.host_url_pattern("palacebeauty.com")

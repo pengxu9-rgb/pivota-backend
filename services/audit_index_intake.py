@@ -450,15 +450,22 @@ def brand_host_guard_key(fields: Dict[str, Any]) -> tuple:
 
 
 def host_url_pattern(host: str) -> str:
-    """A Postgres regex matching a URL whose HOST is `host` (or `www.` + host), any scheme, port or path.
+    """A Postgres regex matching a URL on `host` or any subdomain of it, any scheme, port or path.
 
     The finder used `canonical_url ILIKE '%host%'`, a substring: `palacebeauty.com` matched every
     `shoppalacebeauty.com` URL, so a multi-brand ingest of palacebeauty.com was told its O HUI rows
-    conflict with another store's O HUI (2026-09-25, 25 rows at risk). Anchoring on the authority keeps
-    `www.` (which `_host` strips) and refuses suffix hosts and a host named only in a path or query.
+    conflict with another store's O HUI (2026-09-25, 25 rows at risk). This anchors on the URL
+    authority and on whole DNS labels: `www.x.com` and `us.x.com` are still the site `x.com` (the
+    substring caught them, and a brand split across merchants there is what ADR-008 guards), while
+    `shopx.com`, `x.com.evil.io` and `x.com` named only in a path or query are not.
+
+    A host carrying a scheme (`https://shop.x.com`, as WooCommerce store domains are stored and passed
+    as source_domain) is reduced to its hostname first; used raw it could never match a URL.
     Every non-alphanumeric character is backslash-escaped: in an ARE that is always a literal."""
-    escaped = "".join(ch if ch.isalnum() else "\\" + ch for ch in host.lower())
-    return rf"^https?://(www\.)?{escaped}([:/?#]|$)"
+    raw = str(host or "").strip()
+    bare = _host(raw if "://" in raw else ("https:" + raw if raw.startswith("//") else "https://" + raw))
+    escaped = "".join(ch if ch.isalnum() else "\\" + ch for ch in (bare or raw).lower())
+    return rf"^https?://([^/?#@]*\.)?{escaped}([:/?#]|$)"
 
 
 async def _existing_brand_canonical_conflict(
