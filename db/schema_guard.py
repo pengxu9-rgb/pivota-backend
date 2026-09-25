@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import logging
+import re
 from dataclasses import dataclass
 from typing import Dict, List, Sequence, Set
 
 from db.database import IS_POSTGRES, IS_SQLITE, database
+
+logger = logging.getLogger(__name__)
 
 
 def text(sql: str) -> str:
@@ -14,6 +18,275 @@ def text(sql: str) -> str:
     shape while ensuring startup self-heal statements execute as raw SQL.
     """
     return sql
+
+
+# The column heals below are ALTERs whose only clauses are column adds that
+# carry IF NOT EXISTS. Those words do not make the statement cheap: Postgres
+# takes the table's ACCESS EXCLUSIVE lock BEFORE it finds the column already
+# there, so run bare, every boot queued behind any open transaction on the table
+# and every later reader and writer queued behind the boot (orders: every
+# checkout). `_heal_add_columns` runs each ALTER only while one of its columns
+# is missing, and then with a transaction-local lock_timeout, so a busy table
+# costs the heal one retry next boot instead of stalling the table.
+HEAL_LOCK_TIMEOUT = "500ms"
+
+_HEAL_ALTER_RE = re.compile(
+    r"ALTER\s+TABLE\s+IF\s+EXISTS\s+(\w+)\s+(.*?);", re.IGNORECASE | re.DOTALL
+)
+_HEAL_CLAUSE_RE = re.compile(r"ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+(\w+)\s", re.IGNORECASE)
+
+
+def _top_level_clauses(body: str) -> List[str]:
+    """Split an ALTER body on the commas that separate its clauses (not the
+    ones inside a type modifier, an expression or a quoted literal)."""
+    clauses: List[str] = []
+    depth, quoted, start = 0, False, 0
+    for i, ch in enumerate(body):
+        if ch == "'":
+            quoted = not quoted
+        elif quoted:
+            continue
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            clauses.append(body[start:i])
+            start = i + 1
+    clauses.append(body[start:])
+    return [c.strip() for c in clauses]
+
+
+def guarded_add_columns(sql: str) -> List[str]:
+    """Return one guarded DO block per ALTER statement in `sql`.
+
+    Each ALTER is kept verbatim (the schema-guard-coverage gate reads this
+    file's source for its ADD COLUMN clauses) and runs only while its table
+    exists and at least one of the columns it adds does not. When one is
+    missing the whole ALTER runs, as it did bare; the columns already there
+    no-op on their IF NOT EXISTS.
+
+    Presence is read from pg_attribute for to_regclass(<table>), which resolves
+    the name through search_path exactly as the ALTER does, and reads the
+    catalog without taking a lock on the table.
+
+    Raises ValueError for any statement that is not purely column adds, so
+    the guard cannot swallow a clause that has to run on every boot.
+    """
+    statements: List[str] = []
+    rest = sql
+    for match in _HEAL_ALTER_RE.finditer(sql):
+        table, body = match.group(1).lower(), match.group(2)
+        # Every clause must be a column add with IF NOT EXISTS. Anything else
+        # (ALTER COLUMN, ADD CONSTRAINT, DROP ...) has to run on a boot where
+        # the columns exist too, which this guard would silently stop.
+        columns: List[str] = []
+        for clause in _top_level_clauses(re.sub(r"--[^\n]*", "", body)):
+            added = _HEAL_CLAUSE_RE.match(clause + " ")
+            if added is None or "$" in clause:
+                raise ValueError(f"heal for {table} is not only column adds: {clause[:60]!r}")
+            columns.append(added.group(1).lower())
+        wanted = ", ".join(f"'{c}'" for c in columns)
+        statements.append(
+            f"""
+            DO $heal$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1
+                    FROM unnest(ARRAY[{wanted}]::text[]) AS wanted(column_name)
+                    WHERE to_regclass('{table}') IS NOT NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM pg_attribute
+                          WHERE attrelid = to_regclass('{table}')
+                            AND attname = wanted.column_name
+                            AND attnum > 0
+                            AND NOT attisdropped
+                      )
+                ) THEN
+                    PERFORM set_config('lock_timeout', '{HEAL_LOCK_TIMEOUT}', true);
+                    {match.group(0).strip()}
+                END IF;
+            END $heal$;
+            """
+        )
+        rest = rest.replace(match.group(0), "", 1)
+    if not statements or rest.strip():
+        raise ValueError(f"not a column heal: {sql.strip()[:80]!r}")
+    return statements
+
+
+async def _heal_add_columns(sql: str) -> None:
+    """Run the guarded form of a column heal, each ALTER in its own try.
+
+    Best-effort like every heal in ensure_required_schema_light, but one that
+    fails (a lock timeout on a busy table included) must not abandon the
+    statements after it, and is logged so a column that keeps missing its
+    heal is visible.
+    """
+    for statement in guarded_add_columns(sql):
+        try:
+            await database.execute(text(statement))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("schema guard: column heal deferred to next boot: %s", exc)
+
+
+# The same hazard, for the heals that are not column adds: ALTER COLUMN ... TYPE,
+# ALTER COLUMN ... DROP NOT NULL, and the DROP + ADD CONSTRAINT pairs that re-widen
+# a CHECK. Each takes ACCESS EXCLUSIVE, and each used to run bare on every boot
+# although it changes nothing after its first run. `guarded_ddl` runs one only
+# while the catalog says it is still needed, and then with the same lock_timeout.
+
+
+def guarded_ddl(table: str, needed: str, ddl: str) -> str:
+    """Return a DO block that runs `ddl` only while `table` exists and `needed`
+    (a SQL boolean over the catalog) is true, under a transaction-local
+    lock_timeout.
+
+    `ddl` is kept verbatim and may be several statements: they run in one
+    transaction, so a DROP + ADD CONSTRAINT pair is never seen half-done and
+    takes the table's lock once.
+    """
+    if "$guard$" in ddl or "$guard$" in needed:
+        raise ValueError("guarded_ddl: the statement carries the block's own quote tag")
+    return f"""
+        DO $guard$
+        BEGIN
+            IF to_regclass('{table}') IS NOT NULL AND ({needed}) THEN
+                PERFORM set_config('lock_timeout', '{HEAL_LOCK_TIMEOUT}', true);
+                {ddl.strip()}
+            END IF;
+        END $guard$;
+        """
+
+
+def column_is_not_null(table: str, column: str) -> str:
+    """True while `table`.`column` exists and is NOT NULL (its DROP NOT NULL is needed)."""
+    return f"""EXISTS (
+                SELECT 1 FROM pg_attribute
+                WHERE attrelid = to_regclass('{table}')
+                  AND attname = '{column}'
+                  AND attnum > 0
+                  AND NOT attisdropped
+                  AND attnotnull
+            )"""
+
+
+def column_type_differs(table: str, columns: Sequence[str], sql_type: str) -> str:
+    """True while any existing column of `columns` is not `sql_type`, spelled as
+    format_type() spells it (e.g. 'character varying(128)')."""
+    wanted = ", ".join(f"'{c}'" for c in columns)
+    return f"""EXISTS (
+                SELECT 1 FROM pg_attribute
+                WHERE attrelid = to_regclass('{table}')
+                  AND attname = ANY(ARRAY[{wanted}]::text[])
+                  AND attnum > 0
+                  AND NOT attisdropped
+                  AND format_type(atttypid, atttypmod) <> '{sql_type}'
+            )"""
+
+
+def constraint_differs(table: str, name: str, definition: str) -> str:
+    """True unless `table` holds a validated constraint `name` whose
+    pg_get_constraintdef() is exactly `definition`.
+
+    Exact, not a token match: the bare DROP + ADD this guards reset the CHECK to
+    its one list on every boot, so any other list (narrower OR wider) is still a
+    boot that has to run it. A definition Postgres renders differently from
+    `definition` only costs the old behaviour, now bounded by the lock_timeout.
+    (`convalidated` is belt and braces: pg_get_constraintdef() already appends
+    NOT VALID to a check that is not validated, so the text would differ too.)
+    """
+    return f"""NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conrelid = to_regclass('{table}')
+                  AND conname = '{name}'
+                  AND convalidated
+                  AND pg_get_constraintdef(oid) = $def${definition}$def$
+            )"""
+
+
+# Mig 232's verdict vocabulary. The heal's CHECK and the definition its guard
+# compares against are both built from this one list, so they cannot drift apart.
+_TIERB_VERDICTS = (
+    "ELIGIBLE", "LOGIN_REQUIRED", "NOT_ACCEPTING_ORDERS", "VARIANT_GONE",
+    "VARIANT_UNAVAILABLE", "PASSWORD_PAGE", "BLOCKED_UNKNOWN", "CHECKOUT_PREFILL_MISSING",
+    "CHECKOUT_MARKET_MISMATCH", "NO_CARD_PAYMENT", "PRICE_DRIFT",
+)
+
+
+def _tierb_verdict_def(column: str) -> str:
+    """pg_get_constraintdef() of mig 232's CHECK on the VARCHAR(32) `column`."""
+    values = ", ".join(f"'{v}'::character varying" for v in _TIERB_VERDICTS)
+    return (
+        f"CHECK ((({column} IS NULL) OR (({column})::text = ANY "
+        f"((ARRAY[{values}])::text[]))))"
+    )
+
+
+_PARTNER_SEND_LOG_TEMPLATE_DEF = (
+    "CHECK ((template_id = ANY (ARRAY['settlement_monthly'::text, "
+    "'settlement_skipped'::text, 'settlement_failed_notice'::text, "
+    "'partner_invite'::text])))"
+)
+
+
+async def _heal_guarded(table: str, needed: str, ddl: str) -> None:
+    """Run `guarded_ddl` in its own try, like `_heal_add_columns`: a heal that
+    fails (a lock timeout on a busy table included) is retried next boot and must
+    not abandon the statements after it."""
+    try:
+        await database.execute(text(guarded_ddl(table, needed, ddl)))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("schema guard: %s heal deferred to next boot: %s", table, exc)
+
+
+# And for index builds. `CREATE INDEX IF NOT EXISTS` takes the table's SHARE lock
+# before it looks for the name, so run bare every boot it queued behind any open
+# writer of the table and blocked every later writer behind it. `_ensure_index`
+# builds only while the table's schema holds no relation of that name (the test
+# IF NOT EXISTS itself makes, read from pg_class without a lock), and a build that
+# cannot get the lock within the lock_timeout waits for the next boot instead.
+# Any other failure raises exactly as the bare statement did (a missing table
+# still raises UndefinedTable), so the callers that rely on a raise keep it.
+_INDEX_RE = re.compile(
+    r"^\s*CREATE\s+(?:UNIQUE\s+)?INDEX\s+IF\s+NOT\s+EXISTS\s+(\w+)\s+ON\s+(\w+)\s*\(",
+    re.IGNORECASE,
+)
+_LOCK_NOT_AVAILABLE = "55P03"
+
+
+def guarded_index(sql: str) -> str:
+    """Return the DO block that builds the index `sql` creates only while it is
+    missing. `sql` must be exactly one CREATE [UNIQUE] INDEX IF NOT EXISTS."""
+    match = _INDEX_RE.match(sql)
+    statement = sql.strip().rstrip(";").strip()
+    if match is None or ";" in statement or "$" in statement:
+        raise ValueError(f"not a single CREATE INDEX IF NOT EXISTS: {sql.strip()[:80]!r}")
+    name, table = match.group(1).lower(), match.group(2).lower()
+    return f"""
+        DO $index$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_class
+                WHERE relname = '{name}'
+                  AND relnamespace = (
+                      SELECT relnamespace FROM pg_class WHERE oid = to_regclass('{table}')
+                  )
+            ) THEN
+                PERFORM set_config('lock_timeout', '{HEAL_LOCK_TIMEOUT}', true);
+                {statement};
+            END IF;
+        END $index$;
+        """
+
+
+async def _ensure_index(sql: str) -> None:
+    try:
+        await database.execute(text(guarded_index(sql)))
+    except Exception as exc:
+        if getattr(exc, "sqlstate", None) != _LOCK_NOT_AVAILABLE:
+            raise
+        logger.warning("schema guard: index build deferred to next boot: %s", exc)
 
 
 @dataclass(frozen=True)
@@ -315,13 +588,11 @@ async def ensure_required_schema_light() -> None:
             # an index build that raises must not cost the table above it or the
             # heals below.
             try:
-                await database.execute(
-                    text(
-                        """
-                        CREATE INDEX IF NOT EXISTS idx_merchant_purchasability_due
-                            ON merchant_purchasability (checked_at);
-                        """
-                    )
+                await _ensure_index(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_merchant_purchasability_due
+                        ON merchant_purchasability (checked_at);
+                    """
                 )
             except Exception:  # noqa: BLE001
                 pass
@@ -339,60 +610,29 @@ async def ensure_required_schema_light() -> None:
             # it, so this and the migration leave byte-identical catalogs — compared by
             # tests/test_merchant_purchasability_postgres.py.
             #
-            # IDEMPOTENT: DROP ... IF EXISTS then ADD, so a second arrival re-adds the same
-            # definition rather than duplicating or failing. Each statement pair in its own try,
-            # for the reason the mig-207 block below states: this branch is one try-block.
-            try:
-                await database.execute(
-                    text(
-                        """
-                        ALTER TABLE IF EXISTS tierb_cart_link_eligibility
-                            DROP CONSTRAINT IF EXISTS tierb_cart_link_eligibility_verdict_check;
-                        """
-                    )
+            # IDEMPOTENT, and a no-op once widened. The DROP + ADD pair used to run bare on
+            # every boot: two ACCESS EXCLUSIVE locks with no lock_timeout, a validating scan,
+            # and a window with no CHECK at all. Now each pair runs in one DO block, only
+            # while the constraint is not already exactly the wide one, under the 500ms
+            # lock_timeout. Its own try each (inside _heal_guarded), for the reason the
+            # mig-207 block below states: this branch is one try-block.
+            verdicts = ", ".join(f"'{v}'" for v in _TIERB_VERDICTS)
+            for column in ("verdict", "previous_verdict"):
+                await _heal_guarded(
+                    "tierb_cart_link_eligibility",
+                    constraint_differs(
+                        "tierb_cart_link_eligibility",
+                        f"tierb_cart_link_eligibility_{column}_check",
+                        _tierb_verdict_def(column),
+                    ),
+                    f"""
+                    ALTER TABLE IF EXISTS tierb_cart_link_eligibility
+                        DROP CONSTRAINT IF EXISTS tierb_cart_link_eligibility_{column}_check;
+                    ALTER TABLE IF EXISTS tierb_cart_link_eligibility
+                        ADD CONSTRAINT tierb_cart_link_eligibility_{column}_check
+                        CHECK ({column} IS NULL OR {column} IN ({verdicts}));
+                    """,
                 )
-                await database.execute(
-                    text(
-                        """
-                        ALTER TABLE IF EXISTS tierb_cart_link_eligibility
-                            ADD CONSTRAINT tierb_cart_link_eligibility_verdict_check
-                            CHECK (verdict IS NULL OR verdict IN (
-                                'ELIGIBLE', 'LOGIN_REQUIRED', 'NOT_ACCEPTING_ORDERS',
-                                'VARIANT_GONE', 'VARIANT_UNAVAILABLE', 'PASSWORD_PAGE',
-                                'BLOCKED_UNKNOWN', 'CHECKOUT_PREFILL_MISSING',
-                                'CHECKOUT_MARKET_MISMATCH', 'NO_CARD_PAYMENT', 'PRICE_DRIFT'
-                            ));
-                        """
-                    )
-                )
-            except Exception:  # noqa: BLE001
-                pass
-            try:
-                await database.execute(
-                    text(
-                        """
-                        ALTER TABLE IF EXISTS tierb_cart_link_eligibility
-                            DROP CONSTRAINT IF EXISTS
-                                tierb_cart_link_eligibility_previous_verdict_check;
-                        """
-                    )
-                )
-                await database.execute(
-                    text(
-                        """
-                        ALTER TABLE IF EXISTS tierb_cart_link_eligibility
-                            ADD CONSTRAINT tierb_cart_link_eligibility_previous_verdict_check
-                            CHECK (previous_verdict IS NULL OR previous_verdict IN (
-                                'ELIGIBLE', 'LOGIN_REQUIRED', 'NOT_ACCEPTING_ORDERS',
-                                'VARIANT_GONE', 'VARIANT_UNAVAILABLE', 'PASSWORD_PAGE',
-                                'BLOCKED_UNKNOWN', 'CHECKOUT_PREFILL_MISSING',
-                                'CHECKOUT_MARKET_MISMATCH', 'NO_CARD_PAYMENT', 'PRICE_DRIFT'
-                            ));
-                        """
-                    )
-                )
-            except Exception:  # noqa: BLE001
-                pass
             # mig 207: the Reap EXTERNAL AUTHORIZATION ledger + merchant descriptor
             # registry. Both tables are read on the FIRST authorization Reap sends,
             # inside a 1.6-second budget, and a missing relation there is not a 500
@@ -449,12 +689,10 @@ async def ensure_required_schema_light() -> None:
                         """
                     )
                 )
-                await database.execute(
-                    text(
-                        "CREATE INDEX IF NOT EXISTS "
-                        "idx_agent_card_auth_decisions_card_decision "
-                        "ON agent_card_auth_decisions (card_id, decision);"
-                    )
+                await _ensure_index(
+                    "CREATE INDEX IF NOT EXISTS "
+                    "idx_agent_card_auth_decisions_card_decision "
+                    "ON agent_card_auth_decisions (card_id, decision);"
                 )
                 await database.execute(
                     text(
@@ -474,22 +712,18 @@ async def ensure_required_schema_light() -> None:
                         """
                     )
                 )
-                await database.execute(
-                    text(
-                        "CREATE INDEX IF NOT EXISTS "
-                        "idx_agent_card_merchant_descriptors_domain "
-                        "ON agent_card_merchant_descriptors (merchant_domain);"
-                    )
+                await _ensure_index(
+                    "CREATE INDEX IF NOT EXISTS "
+                    "idx_agent_card_merchant_descriptors_domain "
+                    "ON agent_card_merchant_descriptors (merchant_domain);"
                 )
                 # mig 207 (F5): the composite the LIVE decision reads under its advisory lock.
                 # ALTER-free and on a table born in mig 201, so it heals independently of
                 # whether that migration ever ran here.
-                await database.execute(
-                    text(
-                        "CREATE INDEX IF NOT EXISTS "
-                        "idx_agent_issued_cards_issuer_ref_status "
-                        "ON agent_issued_cards (issuer_card_ref, status);"
-                    )
+                await _ensure_index(
+                    "CREATE INDEX IF NOT EXISTS "
+                    "idx_agent_issued_cards_issuer_ref_status "
+                    "ON agent_issued_cards (issuer_card_ref, status);"
                 )
             except Exception:
                 # Same best-effort contract as the enclosing block. The card-rail
@@ -560,32 +794,26 @@ async def ensure_required_schema_light() -> None:
                         """
                     )
                 )
-                await database.execute(
-                    text(
-                        "CREATE INDEX IF NOT EXISTS "
-                        "idx_reap_agentic_enrollments_buyer_status "
-                        "ON reap_agentic_enrollments (buyer_ref, status);"
-                    )
+                await _ensure_index(
+                    "CREATE INDEX IF NOT EXISTS "
+                    "idx_reap_agentic_enrollments_buyer_status "
+                    "ON reap_agentic_enrollments (buyer_ref, status);"
                 )
-                await database.execute(
-                    text(
-                        "CREATE UNIQUE INDEX IF NOT EXISTS "
-                        "uq_reap_agentic_enrollments_reap_id "
-                        "ON reap_agentic_enrollments (reap_enrollment_id) "
-                        "WHERE reap_enrollment_id IS NOT NULL;"
-                    )
+                await _ensure_index(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS "
+                    "uq_reap_agentic_enrollments_reap_id "
+                    "ON reap_agentic_enrollments (reap_enrollment_id) "
+                    "WHERE reap_enrollment_id IS NOT NULL;"
                 )
                 # AT MOST ONE ACTIVE ENROLLMENT PER BUYER. With two, "which card
                 # did this buyer authorize?" has no answer. The ledger's
                 # mark_enrollment_active demotes the loser in the same
                 # transaction; this index is what makes that non-optional.
-                await database.execute(
-                    text(
-                        "CREATE UNIQUE INDEX IF NOT EXISTS "
-                        "uq_reap_agentic_enrollments_one_active "
-                        "ON reap_agentic_enrollments (buyer_ref) "
-                        "WHERE status = 'active';"
-                    )
+                await _ensure_index(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS "
+                    "uq_reap_agentic_enrollments_one_active "
+                    "ON reap_agentic_enrollments (buyer_ref) "
+                    "WHERE status = 'active';"
                 )
                 await database.execute(
                     text(
@@ -645,35 +873,27 @@ async def ensure_required_schema_light() -> None:
                         """
                     )
                 )
-                await database.execute(
-                    text(
-                        "CREATE INDEX IF NOT EXISTS "
-                        "idx_reap_agentic_purchases_state_poll "
-                        "ON reap_agentic_purchases (state, next_poll_at);"
-                    )
+                await _ensure_index(
+                    "CREATE INDEX IF NOT EXISTS "
+                    "idx_reap_agentic_purchases_state_poll "
+                    "ON reap_agentic_purchases (state, next_poll_at);"
                 )
-                await database.execute(
-                    text(
-                        "CREATE INDEX IF NOT EXISTS "
-                        "idx_reap_agentic_purchases_buyer_created "
-                        "ON reap_agentic_purchases (buyer_ref, created_at);"
-                    )
+                await _ensure_index(
+                    "CREATE INDEX IF NOT EXISTS "
+                    "idx_reap_agentic_purchases_buyer_created "
+                    "ON reap_agentic_purchases (buyer_ref, created_at);"
                 )
-                await database.execute(
-                    text(
-                        "CREATE INDEX IF NOT EXISTS "
-                        "idx_reap_agentic_purchases_owner_created "
-                        "ON reap_agentic_purchases "
-                        "(agent_id, agent_user_ref_hash, created_at);"
-                    )
+                await _ensure_index(
+                    "CREATE INDEX IF NOT EXISTS "
+                    "idx_reap_agentic_purchases_owner_created "
+                    "ON reap_agentic_purchases "
+                    "(agent_id, agent_user_ref_hash, created_at);"
                 )
-                await database.execute(
-                    text(
-                        "CREATE UNIQUE INDEX IF NOT EXISTS "
-                        "uq_reap_agentic_purchases_checkout "
-                        "ON reap_agentic_purchases (reap_checkout_id) "
-                        "WHERE reap_checkout_id IS NOT NULL;"
-                    )
+                await _ensure_index(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS "
+                    "uq_reap_agentic_purchases_checkout "
+                    "ON reap_agentic_purchases (reap_checkout_id) "
+                    "WHERE reap_checkout_id IS NOT NULL;"
                 )
             except Exception:  # noqa: BLE001
                 # Best-effort like every sibling, and it must not starve what
@@ -742,15 +962,13 @@ async def ensure_required_schema_light() -> None:
             # The gate then reports migration 225 as uncovered. That happened,
             # on this very comment.
             try:
-                await database.execute(
-                    text(
-                        """
-                        ALTER TABLE IF EXISTS reap_agentic_purchases
-                            ADD COLUMN IF NOT EXISTS accept_variant_labels JSONB,
-                            ADD COLUMN IF NOT EXISTS also_accept_domains JSONB,
-                            ADD COLUMN IF NOT EXISTS market_country TEXT;
-                        """
-                    )
+                await _heal_add_columns(
+                    """
+                    ALTER TABLE IF EXISTS reap_agentic_purchases
+                        ADD COLUMN IF NOT EXISTS accept_variant_labels JSONB,
+                        ADD COLUMN IF NOT EXISTS also_accept_domains JSONB,
+                        ADD COLUMN IF NOT EXISTS market_country TEXT;
+                    """
                 )
             except Exception:  # noqa: BLE001
                 pass
@@ -858,14 +1076,12 @@ async def ensure_required_schema_light() -> None:
             # ANYWHERE IN THIS FILE — see the mig-225 comment above for the
             # gate this breaks and how it broke it.
             try:
-                await database.execute(
-                    text(
-                        """
-                        ALTER TABLE IF EXISTS reap_agentic_buyer_refs
-                            ADD COLUMN IF NOT EXISTS consent_version VARCHAR(32),
-                            ADD COLUMN IF NOT EXISTS consented_at TIMESTAMPTZ;
-                        """
-                    )
+                await _heal_add_columns(
+                    """
+                    ALTER TABLE IF EXISTS reap_agentic_buyer_refs
+                        ADD COLUMN IF NOT EXISTS consent_version VARCHAR(32),
+                        ADD COLUMN IF NOT EXISTS consented_at TIMESTAMPTZ;
+                    """
                 )
             except Exception:  # noqa: BLE001
                 pass
@@ -873,12 +1089,10 @@ async def ensure_required_schema_light() -> None:
                 # THE STATEMENT THAT ACTUALLY FAILS IN THE FIELD. It cannot be
                 # created on a database that already holds two buyers sharing
                 # one ref, and that is the whole reason it has its own try.
-                await database.execute(
-                    text(
-                        "CREATE UNIQUE INDEX IF NOT EXISTS "
-                        "uq_reap_agentic_buyer_refs_ref "
-                        "ON reap_agentic_buyer_refs (reap_buyer_ref);"
-                    )
+                await _ensure_index(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS "
+                    "uq_reap_agentic_buyer_refs_ref "
+                    "ON reap_agentic_buyer_refs (reap_buyer_ref);"
                 )
             except Exception:  # noqa: BLE001
                 pass
@@ -920,21 +1134,19 @@ async def ensure_required_schema_light() -> None:
             # NOT folded into the CREATE TABLE above, same as mig 225: this is
             # what lands the columns on EVERY path, in migration order.
             try:
-                await database.execute(
-                    text(
-                        """
-                        ALTER TABLE IF EXISTS reap_agentic_purchases
-                            ADD COLUMN IF NOT EXISTS item_source TEXT NOT NULL DEFAULT 'reap_variant'
-                                CONSTRAINT ck_reap_agentic_purchases_item_source
-                                CHECK (item_source IN ('reap_variant', 'cart_link')),
-                            ADD COLUMN IF NOT EXISTS cart_url TEXT
-                                CONSTRAINT ck_reap_agentic_purchases_cart_url_pairing
-                                CHECK (
-                                    (item_source = 'reap_variant' AND cart_url IS NULL)
-                                    OR (item_source = 'cart_link' AND cart_url IS NOT NULL)
-                                );
-                        """
-                    )
+                await _heal_add_columns(
+                    """
+                    ALTER TABLE IF EXISTS reap_agentic_purchases
+                        ADD COLUMN IF NOT EXISTS item_source TEXT NOT NULL DEFAULT 'reap_variant'
+                            CONSTRAINT ck_reap_agentic_purchases_item_source
+                            CHECK (item_source IN ('reap_variant', 'cart_link')),
+                        ADD COLUMN IF NOT EXISTS cart_url TEXT
+                            CONSTRAINT ck_reap_agentic_purchases_cart_url_pairing
+                            CHECK (
+                                (item_source = 'reap_variant' AND cart_url IS NULL)
+                                OR (item_source = 'cart_link' AND cart_url IS NOT NULL)
+                            );
+                    """
                 )
             except Exception:  # noqa: BLE001
                 pass
@@ -945,15 +1157,13 @@ async def ensure_required_schema_light() -> None:
             # and db/agent_share.py (pinned by tests/test_agent_share_accrual.py). Its OWN try, as
             # above: a raise here must not starve the heals around it.
             try:
-                await database.execute(
-                    text(
-                        """
-                        ALTER TABLE IF EXISTS agent_share_ledger
-                            ADD COLUMN IF NOT EXISTS partner_settled_minor BIGINT,
-                            ADD COLUMN IF NOT EXISTS merchant_billed_minor BIGINT,
-                            ADD COLUMN IF NOT EXISTS partner_cut_minor BIGINT;
-                        """
-                    )
+                await _heal_add_columns(
+                    """
+                    ALTER TABLE IF EXISTS agent_share_ledger
+                        ADD COLUMN IF NOT EXISTS partner_settled_minor BIGINT,
+                        ADD COLUMN IF NOT EXISTS merchant_billed_minor BIGINT,
+                        ADD COLUMN IF NOT EXISTS partner_cut_minor BIGINT;
+                    """
                 )
             except Exception:  # noqa: BLE001
                 pass
@@ -961,14 +1171,12 @@ async def ensure_required_schema_light() -> None:
             # on a database that already holds two cart-link rows for one click the
             # build RAISES, and that must not cost the columns above or the heals below.
             try:
-                await database.execute(
-                    text(
-                        """
-                        CREATE UNIQUE INDEX IF NOT EXISTS uq_reap_agentic_purchases_cart_link_click
-                            ON reap_agentic_purchases (click_id)
-                            WHERE item_source = 'cart_link';
-                        """
-                    )
+                await _ensure_index(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS uq_reap_agentic_purchases_cart_link_click
+                        ON reap_agentic_purchases (click_id)
+                        WHERE item_source = 'cart_link';
+                    """
                 )
             except Exception:  # noqa: BLE001
                 pass
@@ -998,14 +1206,12 @@ async def ensure_required_schema_light() -> None:
             # IN THIS FILE — see the mig-225 comment above for the gate this
             # breaks and how it broke it.
             try:
-                await database.execute(
-                    text(
-                        """
-                        ALTER TABLE IF EXISTS reap_agentic_purchases
-                            ADD COLUMN IF NOT EXISTS consent_version VARCHAR(32),
-                            ADD COLUMN IF NOT EXISTS consented_at TIMESTAMPTZ;
-                        """
-                    )
+                await _heal_add_columns(
+                    """
+                    ALTER TABLE IF EXISTS reap_agentic_purchases
+                        ADD COLUMN IF NOT EXISTS consent_version VARCHAR(32),
+                        ADD COLUMN IF NOT EXISTS consented_at TIMESTAMPTZ;
+                    """
                 )
             except Exception:  # noqa: BLE001
                 pass
@@ -1146,21 +1352,17 @@ async def ensure_required_schema_light() -> None:
             # branch is ONE try, and an unguarded CREATE INDEX further down
             # abandons everything after it on a partial database.
             try:
-                await database.execute(
-                    text(
-                        """
-                        ALTER TABLE IF EXISTS merchant_tasks
-                          ADD COLUMN IF NOT EXISTS recovery_key TEXT NULL;
-                        """
-                    )
+                await _heal_add_columns(
+                    """
+                    ALTER TABLE IF EXISTS merchant_tasks
+                      ADD COLUMN IF NOT EXISTS recovery_key TEXT NULL;
+                    """
                 )
-                await database.execute(
-                    text(
-                        """
-                        ALTER TABLE IF EXISTS commerce_interactions
-                          ADD COLUMN IF NOT EXISTS recovery_key VARCHAR(40) NULL;
-                        """
-                    )
+                await _heal_add_columns(
+                    """
+                    ALTER TABLE IF EXISTS commerce_interactions
+                      ADD COLUMN IF NOT EXISTS recovery_key VARCHAR(40) NULL;
+                    """
                 )
             except Exception:  # noqa: BLE001
                 # Best-effort like every sibling; must not starve what follows.
@@ -1210,17 +1412,13 @@ async def ensure_required_schema_light() -> None:
                         """
                     )
                 )
-                await database.execute(
-                    text(
-                        "CREATE INDEX IF NOT EXISTS idx_merchant_collector_tokens_store "
-                        "ON merchant_collector_tokens (merchant_id, store_id);"
-                    )
+                await _ensure_index(
+                    "CREATE INDEX IF NOT EXISTS idx_merchant_collector_tokens_store "
+                    "ON merchant_collector_tokens (merchant_id, store_id);"
                 )
-                await database.execute(
-                    text(
-                        "CREATE INDEX IF NOT EXISTS idx_merchant_collector_tokens_expiring "
-                        "ON merchant_collector_tokens (expires_at) WHERE revoked_at IS NULL;"
-                    )
+                await _ensure_index(
+                    "CREATE INDEX IF NOT EXISTS idx_merchant_collector_tokens_expiring "
+                    "ON merchant_collector_tokens (expires_at) WHERE revoked_at IS NULL;"
                 )
                 await database.execute(
                     text(
@@ -1246,24 +1444,20 @@ async def ensure_required_schema_light() -> None:
             # error, and shadow mode stops recording with only a dropped log line to
             # show for it. Two columns in the migration, two here.
             try:
-                await database.execute(
-                    text(
-                        """
-                        ALTER TABLE IF EXISTS checkout_preflight_observations
-                          ADD COLUMN IF NOT EXISTS source VARCHAR(32) NOT NULL DEFAULT 'live',
-                          ADD COLUMN IF NOT EXISTS run_id VARCHAR(64) NULL;
-                        """
-                    )
+                await _heal_add_columns(
+                    """
+                    ALTER TABLE IF EXISTS checkout_preflight_observations
+                      ADD COLUMN IF NOT EXISTS source VARCHAR(32) NOT NULL DEFAULT 'live',
+                      ADD COLUMN IF NOT EXISTS run_id VARCHAR(64) NULL;
+                    """
                 )
                 # The index too, or an existing prod table never gets it: create_all only
                 # builds indexes on a table it creates, and db/migrations/ does not run here.
-                await database.execute(
-                    text(
-                        """
-                        CREATE INDEX IF NOT EXISTS idx_checkout_preflight_obs_run
-                          ON checkout_preflight_observations (run_id);
-                        """
-                    )
+                await _ensure_index(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_checkout_preflight_obs_run
+                      ON checkout_preflight_observations (run_id);
+                    """
                 )
             except Exception:  # noqa: BLE001
                 # Best-effort like every sibling; must not starve what follows.
@@ -1275,16 +1469,14 @@ async def ensure_required_schema_light() -> None:
             # canonical event write until these columns exist. Four columns in
             # the migration, four here.
             try:
-                await database.execute(
-                    text(
-                        """
-                        ALTER TABLE IF EXISTS commerce_interaction_events
-                          ADD COLUMN IF NOT EXISTS write_path VARCHAR(48) NULL,
-                          ADD COLUMN IF NOT EXISTS authority VARCHAR(16) NULL,
-                          ADD COLUMN IF NOT EXISTS agent_identity_confidence VARCHAR(24) NULL,
-                          ADD COLUMN IF NOT EXISTS synthetic BOOLEAN NOT NULL DEFAULT FALSE;
-                        """
-                    )
+                await _heal_add_columns(
+                    """
+                    ALTER TABLE IF EXISTS commerce_interaction_events
+                      ADD COLUMN IF NOT EXISTS write_path VARCHAR(48) NULL,
+                      ADD COLUMN IF NOT EXISTS authority VARCHAR(16) NULL,
+                      ADD COLUMN IF NOT EXISTS agent_identity_confidence VARCHAR(24) NULL,
+                      ADD COLUMN IF NOT EXISTS synthetic BOOLEAN NOT NULL DEFAULT FALSE;
+                    """
                 )
                 # The mig-214 partial index is deliberately absent here: it
                 # rolls out CONCURRENTLY, which this guard's transaction
@@ -1300,44 +1492,34 @@ async def ensure_required_schema_light() -> None:
             # built normally (order_ref is new and all-NULL, so there is
             # nothing to scan), so the guard carries it too.
             try:
-                await database.execute(
-                    text(
-                        """
-                        ALTER TABLE IF EXISTS commerce_interactions
-                          ADD COLUMN IF NOT EXISTS order_ref VARCHAR(160) NULL;
-                        """
-                    )
+                await _heal_add_columns(
+                    """
+                    ALTER TABLE IF EXISTS commerce_interactions
+                      ADD COLUMN IF NOT EXISTS order_ref VARCHAR(160) NULL;
+                    """
                 )
-                await database.execute(
-                    text(
-                        """
-                        ALTER TABLE IF EXISTS commerce_interaction_events
-                          ADD COLUMN IF NOT EXISTS order_ref VARCHAR(160) NULL;
-                        """
-                    )
+                await _heal_add_columns(
+                    """
+                    ALTER TABLE IF EXISTS commerce_interaction_events
+                      ADD COLUMN IF NOT EXISTS order_ref VARCHAR(160) NULL;
+                    """
                 )
-                await database.execute(
-                    text(
-                        "CREATE INDEX IF NOT EXISTS ix_commerce_interactions_order_ref "
-                        "ON commerce_interactions (order_ref);"
-                    )
+                await _ensure_index(
+                    "CREATE INDEX IF NOT EXISTS ix_commerce_interactions_order_ref "
+                    "ON commerce_interactions (order_ref);"
                 )
-                await database.execute(
-                    text(
-                        "CREATE INDEX IF NOT EXISTS ix_commerce_interaction_events_order_ref "
-                        "ON commerce_interaction_events (order_ref);"
-                    )
+                await _ensure_index(
+                    "CREATE INDEX IF NOT EXISTS ix_commerce_interaction_events_order_ref "
+                    "ON commerce_interaction_events (order_ref);"
                 )
                 # The stitch rests on this one: without it two authorities can
                 # both insert an interaction for the same canonical order and
                 # neither insert raises.
-                await database.execute(
-                    text(
-                        "CREATE UNIQUE INDEX IF NOT EXISTS "
-                        "idx_commerce_interactions_order_ref_unique "
-                        "ON commerce_interactions (merchant_id, COALESCE(store_id, ''), order_ref) "
-                        "WHERE order_ref IS NOT NULL;"
-                    )
+                await _ensure_index(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS "
+                    "idx_commerce_interactions_order_ref_unique "
+                    "ON commerce_interactions (merchant_id, COALESCE(store_id, ''), order_ref) "
+                    "WHERE order_ref IS NOT NULL;"
                 )
             except Exception:  # noqa: BLE001
                 # Best-effort like every sibling; must not starve what follows.
@@ -1363,29 +1545,27 @@ async def ensure_required_schema_light() -> None:
             # DROP NOT NULL is carried deliberately, and the partial index
             # with it — three statements in the migration, three here.
             try:
-                await database.execute(
-                    text(
-                        """
-                        ALTER TABLE IF EXISTS merchant_audit_runs
-                          ADD COLUMN IF NOT EXISTS merchant_claimed_at TIMESTAMPTZ;
-                        """
-                    )
+                await _heal_add_columns(
+                    """
+                    ALTER TABLE IF EXISTS merchant_audit_runs
+                      ADD COLUMN IF NOT EXISTS merchant_claimed_at TIMESTAMPTZ;
+                    """
                 )
-                await database.execute(
-                    text(
-                        """
-                        ALTER TABLE IF EXISTS merchant_audit_runs
-                          ALTER COLUMN merchant_id DROP NOT NULL;
-                        """
-                    )
+                # Only while merchant_id is still NOT NULL: bare, this took ACCESS
+                # EXCLUSIVE on every boot with no lock_timeout.
+                await _heal_guarded(
+                    "merchant_audit_runs",
+                    column_is_not_null("merchant_audit_runs", "merchant_id"),
+                    """
+                    ALTER TABLE IF EXISTS merchant_audit_runs
+                      ALTER COLUMN merchant_id DROP NOT NULL;
+                    """,
                 )
-                await database.execute(
-                    text(
-                        "CREATE INDEX IF NOT EXISTS "
-                        "idx_merchant_audit_runs_unclaimed "
-                        "ON merchant_audit_runs (requested_at DESC) "
-                        "WHERE merchant_id IS NULL;"
-                    )
+                await _ensure_index(
+                    "CREATE INDEX IF NOT EXISTS "
+                    "idx_merchant_audit_runs_unclaimed "
+                    "ON merchant_audit_runs (requested_at DESC) "
+                    "WHERE merchant_id IS NULL;"
                 )
                 # mig 211 (#2020): one unclaimed funnel run per domain. NOT
                 # CONCURRENTLY here — this path runs inside the guard's own
@@ -1393,14 +1573,12 @@ async def ensure_required_schema_light() -> None:
                 # that reaches this code the table is small or the index
                 # already exists; the migration carries the CONCURRENTLY form
                 # for the hot production table.
-                await database.execute(
-                    text(
-                        "CREATE UNIQUE INDEX IF NOT EXISTS "
-                        "idx_funnel_run_one_per_domain ON merchant_audit_runs "
-                        "((partial_result_jsonb->'funnel'->>'domain')) "
-                        "WHERE merchant_id IS NULL "
-                        "AND subject_type = 'public_funnel';"
-                    )
+                await _ensure_index(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS "
+                    "idx_funnel_run_one_per_domain ON merchant_audit_runs "
+                    "((partial_result_jsonb->'funnel'->>'domain')) "
+                    "WHERE merchant_id IS NULL "
+                    "AND subject_type = 'public_funnel';"
                 )
             except Exception:
                 # Best-effort, like every sibling. Failing here is fail-CLOSED
@@ -1409,38 +1587,42 @@ async def ensure_required_schema_light() -> None:
             # Universal commerce collector references (migration 204). Railway
             # fast-mode skips migrations, while SQLAlchemy SELECTs materialize
             # every modeled column; self-heal before the first event arrives.
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS commerce_interactions
-                      ADD COLUMN IF NOT EXISTS store_id VARCHAR(128),
-                      ADD COLUMN IF NOT EXISTS cart_id VARCHAR(128),
-                      ADD COLUMN IF NOT EXISTS payment_id VARCHAR(128),
-                      ADD COLUMN IF NOT EXISTS visitor_id VARCHAR(128);
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS commerce_interactions
+                  ADD COLUMN IF NOT EXISTS store_id VARCHAR(128),
+                  ADD COLUMN IF NOT EXISTS cart_id VARCHAR(128),
+                  ADD COLUMN IF NOT EXISTS payment_id VARCHAR(128),
+                  ADD COLUMN IF NOT EXISTS visitor_id VARCHAR(128);
+                """
             )
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS commerce_interactions
-                      ALTER COLUMN checkout_id TYPE VARCHAR(128),
-                      ALTER COLUMN order_id TYPE VARCHAR(128),
-                      ALTER COLUMN refund_id TYPE VARCHAR(128),
-                      ALTER COLUMN return_id TYPE VARCHAR(128);
-                    """
-                )
+            # Only while one of the four is not VARCHAR(128) yet. Bare, this took
+            # ACCESS EXCLUSIVE on the event ledger on every boot with no
+            # lock_timeout; and it sat in this branch's shared try, so a failure
+            # (a missing column) abandoned every heal after it.
+            await _heal_guarded(
+                "commerce_interactions",
+                column_type_differs(
+                    "commerce_interactions",
+                    ("checkout_id", "order_id", "refund_id", "return_id"),
+                    "character varying(128)",
+                ),
+                """
+                ALTER TABLE IF EXISTS commerce_interactions
+                  ALTER COLUMN checkout_id TYPE VARCHAR(128),
+                  ALTER COLUMN order_id TYPE VARCHAR(128),
+                  ALTER COLUMN refund_id TYPE VARCHAR(128),
+                  ALTER COLUMN return_id TYPE VARCHAR(128);
+                """,
             )
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS commerce_interaction_events
-                      ADD COLUMN IF NOT EXISTS store_id VARCHAR(128),
-                      ADD COLUMN IF NOT EXISTS cart_id VARCHAR(128),
-                      ADD COLUMN IF NOT EXISTS payment_id VARCHAR(128),
-                      ADD COLUMN IF NOT EXISTS visitor_id VARCHAR(128);
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS commerce_interaction_events
+                  ADD COLUMN IF NOT EXISTS store_id VARCHAR(128),
+                  ADD COLUMN IF NOT EXISTS cart_id VARCHAR(128),
+                  ADD COLUMN IF NOT EXISTS payment_id VARCHAR(128),
+                  ADD COLUMN IF NOT EXISTS visitor_id VARCHAR(128);
+                """
             )
             for statement in (
                 "CREATE INDEX IF NOT EXISTS idx_commerce_interactions_store "
@@ -1458,7 +1640,7 @@ async def ensure_required_schema_light() -> None:
                 "CREATE INDEX IF NOT EXISTS idx_commerce_interaction_events_payment "
                 "ON commerce_interaction_events(merchant_id, payment_id) WHERE payment_id IS NOT NULL",
             ):
-                await database.execute(text(statement))
+                await _ensure_index(statement)
 
             # Migration 205: external platform references are local to a
             # merchant/store. Replace only legacy global indexes; once the
@@ -1498,29 +1680,25 @@ async def ensure_required_schema_light() -> None:
                 )
             )
 
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS orders
-                      ADD COLUMN IF NOT EXISTS buyer_id TEXT,
-                      ADD COLUMN IF NOT EXISTS intent_id TEXT,
-                      ADD COLUMN IF NOT EXISTS agent_user_ref TEXT,
-                      ADD COLUMN IF NOT EXISTS agent_scoped_buyer_ref TEXT;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS orders
+                  ADD COLUMN IF NOT EXISTS buyer_id TEXT,
+                  ADD COLUMN IF NOT EXISTS intent_id TEXT,
+                  ADD COLUMN IF NOT EXISTS agent_user_ref TEXT,
+                  ADD COLUMN IF NOT EXISTS agent_scoped_buyer_ref TEXT;
+                """
             )
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS merchant_psps
-                      ADD COLUMN IF NOT EXISTS secret_key TEXT,
-                      ADD COLUMN IF NOT EXISTS environment VARCHAR(20) DEFAULT 'unknown',
-                      ADD COLUMN IF NOT EXISTS provider_config JSONB DEFAULT '{}'::jsonb,
-                      ADD COLUMN IF NOT EXISTS validation_status VARCHAR(20) DEFAULT 'unknown',
-                      ADD COLUMN IF NOT EXISTS validation_error TEXT,
-                      ADD COLUMN IF NOT EXISTS last_validated_at TIMESTAMP WITH TIME ZONE;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS merchant_psps
+                  ADD COLUMN IF NOT EXISTS secret_key TEXT,
+                  ADD COLUMN IF NOT EXISTS environment VARCHAR(20) DEFAULT 'unknown',
+                  ADD COLUMN IF NOT EXISTS provider_config JSONB DEFAULT '{}'::jsonb,
+                  ADD COLUMN IF NOT EXISTS validation_status VARCHAR(20) DEFAULT 'unknown',
+                  ADD COLUMN IF NOT EXISTS validation_error TEXT,
+                  ADD COLUMN IF NOT EXISTS last_validated_at TIMESTAMP WITH TIME ZONE;
+                """
             )
             # Migration 241: merchant_psps.psp_id must satisfy the SAME regex
             # `orders.psp_id` has enforced since migration 006. Order creation
@@ -1574,40 +1752,44 @@ async def ensure_required_schema_light() -> None:
             # service reads/writes (use_count, max_uses) exist at startup —
             # otherwise list_for_partner/issue/consume 500 on the missing
             # columns and the whole invite panel breaks.
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS partner_invite_tokens
-                      ADD COLUMN IF NOT EXISTS use_count INTEGER NOT NULL DEFAULT 0,
-                      ADD COLUMN IF NOT EXISTS max_uses INTEGER;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS partner_invite_tokens
+                  ADD COLUMN IF NOT EXISTS use_count INTEGER NOT NULL DEFAULT 0,
+                  ADD COLUMN IF NOT EXISTS max_uses INTEGER;
+                """
             )
             # Allow 'partner_invite' in partner_send_log so the invite auto-email
             # is recorded in "Recent sends" (migration 172). Prod fast mode skips
-            # db/migrations/, so widen the CHECK here on startup (DROP+ADD is
-            # idempotent). Without it the invite send-log INSERT violates the
-            # settlement-only template CHECK and is silently dropped.
-            await database.execute(
-                text(
-                    "ALTER TABLE IF EXISTS partner_send_log "
-                    "DROP CONSTRAINT IF EXISTS ck_partner_send_log_template;"
-                )
-            )
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS partner_send_log
-                      ADD CONSTRAINT ck_partner_send_log_template CHECK (
-                        template_id IN (
-                          'settlement_monthly',
-                          'settlement_skipped',
-                          'settlement_failed_notice',
-                          'partner_invite'
-                        )
-                      );
-                    """
-                )
+            # db/migrations/, so widen the CHECK here on startup. Without it the
+            # invite send-log INSERT violates the settlement-only template CHECK
+            # and is silently dropped.
+            #
+            # Only while the CHECK is not already exactly this one. Bare, the
+            # DROP + ADD ran on every boot: two ACCESS EXCLUSIVE locks with no
+            # lock_timeout, a validating scan, and a window with no CHECK at all
+            # (each statement committed on its own). Now one DO block, in its own
+            # try.
+            await _heal_guarded(
+                "partner_send_log",
+                constraint_differs(
+                    "partner_send_log",
+                    "ck_partner_send_log_template",
+                    _PARTNER_SEND_LOG_TEMPLATE_DEF,
+                ),
+                """
+                ALTER TABLE IF EXISTS partner_send_log
+                  DROP CONSTRAINT IF EXISTS ck_partner_send_log_template;
+                ALTER TABLE IF EXISTS partner_send_log
+                  ADD CONSTRAINT ck_partner_send_log_template CHECK (
+                    template_id IN (
+                      'settlement_monthly',
+                      'settlement_skipped',
+                      'settlement_failed_notice',
+                      'partner_invite'
+                    )
+                  );
+                """,
             )
             # NOTE ON PLACEMENT: this block is deliberately NOT next to the
             # merchant_psps ADD COLUMN statements above, which is where it
@@ -1715,19 +1897,17 @@ async def ensure_required_schema_light() -> None:
             # Merchant portal primary-store selection (migration 089).
             # Production fast mode skips db/migrations/, so keep the
             # critical column and invariant available at startup.
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS merchant_stores
-                      ADD COLUMN IF NOT EXISTS is_primary BOOLEAN NOT NULL DEFAULT FALSE,
-                      ADD COLUMN IF NOT EXISTS order_writeback_status TEXT NOT NULL DEFAULT 'disabled',
-                      ADD COLUMN IF NOT EXISTS order_writeback_enabled_at TIMESTAMPTZ NULL,
-                      ADD COLUMN IF NOT EXISTS order_writeback_canary_order_id TEXT NULL,
-                      ADD COLUMN IF NOT EXISTS order_writeback_last_canary_order_id TEXT NULL,
-                      ADD COLUMN IF NOT EXISTS order_writeback_last_verified_at TIMESTAMPTZ NULL,
-                      ADD COLUMN IF NOT EXISTS order_writeback_last_error TEXT NULL;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS merchant_stores
+                  ADD COLUMN IF NOT EXISTS is_primary BOOLEAN NOT NULL DEFAULT FALSE,
+                  ADD COLUMN IF NOT EXISTS order_writeback_status TEXT NOT NULL DEFAULT 'disabled',
+                  ADD COLUMN IF NOT EXISTS order_writeback_enabled_at TIMESTAMPTZ NULL,
+                  ADD COLUMN IF NOT EXISTS order_writeback_canary_order_id TEXT NULL,
+                  ADD COLUMN IF NOT EXISTS order_writeback_last_canary_order_id TEXT NULL,
+                  ADD COLUMN IF NOT EXISTS order_writeback_last_verified_at TIMESTAMPTZ NULL,
+                  ADD COLUMN IF NOT EXISTS order_writeback_last_error TEXT NULL;
+                """
             )
             await database.execute(
                 text(
@@ -1773,39 +1953,31 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
-            await database.execute(
-                text(
-                    """
-                    CREATE UNIQUE INDEX IF NOT EXISTS uniq_merchant_stores_primary_per_merchant
-                      ON merchant_stores (merchant_id)
-                      WHERE is_primary = TRUE;
-                    """
-                )
+            await _ensure_index(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS uniq_merchant_stores_primary_per_merchant
+                  ON merchant_stores (merchant_id)
+                  WHERE is_primary = TRUE;
+                """
             )
-            await database.execute(
-                text(
-                    """
-                    CREATE INDEX IF NOT EXISTS idx_merchant_stores_merchant_primary
-                      ON merchant_stores (merchant_id, is_primary, connected_at DESC);
-                    """
-                )
+            await _ensure_index(
+                """
+                CREATE INDEX IF NOT EXISTS idx_merchant_stores_merchant_primary
+                  ON merchant_stores (merchant_id, is_primary, connected_at DESC);
+                """
             )
-            await database.execute(
-                text(
-                    """
-                    CREATE INDEX IF NOT EXISTS idx_merchant_stores_order_writeback_status
-                      ON merchant_stores (platform, order_writeback_status, status);
-                    """
-                )
+            await _ensure_index(
+                """
+                CREATE INDEX IF NOT EXISTS idx_merchant_stores_order_writeback_status
+                  ON merchant_stores (platform, order_writeback_status, status);
+                """
             )
-            await database.execute(
-                text(
-                    """
-                    CREATE INDEX IF NOT EXISTS idx_merchant_stores_order_writeback_canary
-                      ON merchant_stores (order_writeback_canary_order_id)
-                      WHERE order_writeback_canary_order_id IS NOT NULL;
-                    """
-                )
+            await _ensure_index(
+                """
+                CREATE INDEX IF NOT EXISTS idx_merchant_stores_order_writeback_canary
+                  ON merchant_stores (order_writeback_canary_order_id)
+                  WHERE order_writeback_canary_order_id IS NOT NULL;
+                """
             )
             # PR-13 APM config columns on merchant_onboarding
             # (migration 089_merchant_onboarding_apm_config.sql).
@@ -1818,56 +1990,54 @@ async def ensure_required_schema_light() -> None:
             # because merchant_onboarding.select() materializes
             # apm_enabled + friends. This block self-heals on startup
             # so the outage cannot recur on any environment.
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS merchant_onboarding
-                      ADD COLUMN IF NOT EXISTS apm_enabled BOOLEAN NOT NULL DEFAULT FALSE,
-                      ADD COLUMN IF NOT EXISTS apm_cadence_days INTEGER NULL,
-                      ADD COLUMN IF NOT EXISTS apm_scope_jsonb JSONB NULL,
-                      ADD COLUMN IF NOT EXISTS apm_configured_at TIMESTAMPTZ NULL,
-                      ADD COLUMN IF NOT EXISTS apm_last_run_at TIMESTAMPTZ NULL,
-                      -- signup_source (migration 187), here for the same
-                      -- reason the paragraph above gives.
-                      --
-                      -- WARNING - NO SEMICOLONS ANYWHERE IN THIS COMMENT. The
-                      -- coverage gate matches an ALTER body non-greedily up to
-                      -- the FIRST semicolon, so one in prose truncates the
-                      -- statement and every column after it stops counting as
-                      -- covered. Two slipped into the first draft of this note
-                      -- and the gate went red on a change whose DDL was correct.
-                      -- A third slipped into the warning about the first two.
-                      -- The gate caught all three, which is the argument for it.
-                      --
-                      -- It DOES reach prod today, but only through a LAZY
-                      -- backstop: db/merchant_onboarding.py has its own
-                      -- idempotent add inside ensure_operating_mode_column(),
-                      -- called at the top of create_merchant_onboarding() - i.e.
-                      -- on the FIRST MERCHANT SIGNUP of a process, behind a
-                      -- module-level done-flag.
-                      --
-                      -- That covers the column by CALL ORDER. Two read paths
-                      -- escape it:
-                      --   * merchant_onboarding.select() materializes every
-                      --     column, and get_merchant_onboarding() sits on the
-                      --     ADR-018 connection-layer path, and
-                      --   * services/funnel_metrics_service.py issues a RAW
-                      --     "SELECT merchant_id, signup_source, ..." from the
-                      --     admin funnel-metrics router. That one never touches
-                      --     create_merchant_onboarding() at all, so NO call
-                      --     order saves it - a fresh process against a DB
-                      --     without the column returns a hard
-                      --     "column does not exist".
-                      --
-                      -- Honest about the strength of this fix: the whole guard
-                      -- is best-effort (one try/except around the body, a 12s
-                      -- startup timeout, failures downgraded to a warning), so
-                      -- it CANNOT fail a deploy - which is the right trade. It
-                      -- makes the column independent of call order. It does not
-                      -- make it guaranteed.
-                      ADD COLUMN IF NOT EXISTS signup_source VARCHAR(64);
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS merchant_onboarding
+                  ADD COLUMN IF NOT EXISTS apm_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                  ADD COLUMN IF NOT EXISTS apm_cadence_days INTEGER NULL,
+                  ADD COLUMN IF NOT EXISTS apm_scope_jsonb JSONB NULL,
+                  ADD COLUMN IF NOT EXISTS apm_configured_at TIMESTAMPTZ NULL,
+                  ADD COLUMN IF NOT EXISTS apm_last_run_at TIMESTAMPTZ NULL,
+                  -- signup_source (migration 187), here for the same
+                  -- reason the paragraph above gives.
+                  --
+                  -- WARNING - NO SEMICOLONS ANYWHERE IN THIS COMMENT. The
+                  -- coverage gate matches an ALTER body non-greedily up to
+                  -- the FIRST semicolon, so one in prose truncates the
+                  -- statement and every column after it stops counting as
+                  -- covered. Two slipped into the first draft of this note
+                  -- and the gate went red on a change whose DDL was correct.
+                  -- A third slipped into the warning about the first two.
+                  -- The gate caught all three, which is the argument for it.
+                  --
+                  -- It DOES reach prod today, but only through a LAZY
+                  -- backstop: db/merchant_onboarding.py has its own
+                  -- idempotent add inside ensure_operating_mode_column(),
+                  -- called at the top of create_merchant_onboarding() - i.e.
+                  -- on the FIRST MERCHANT SIGNUP of a process, behind a
+                  -- module-level done-flag.
+                  --
+                  -- That covers the column by CALL ORDER. Two read paths
+                  -- escape it:
+                  --   * merchant_onboarding.select() materializes every
+                  --     column, and get_merchant_onboarding() sits on the
+                  --     ADR-018 connection-layer path, and
+                  --   * services/funnel_metrics_service.py issues a RAW
+                  --     "SELECT merchant_id, signup_source, ..." from the
+                  --     admin funnel-metrics router. That one never touches
+                  --     create_merchant_onboarding() at all, so NO call
+                  --     order saves it - a fresh process against a DB
+                  --     without the column returns a hard
+                  --     "column does not exist".
+                  --
+                  -- Honest about the strength of this fix: the whole guard
+                  -- is best-effort (one try/except around the body, a 12s
+                  -- startup timeout, failures downgraded to a warning), so
+                  -- it CANNOT fail a deploy - which is the right trade. It
+                  -- makes the column independent of call order. It does not
+                  -- make it guaranteed.
+                  ADD COLUMN IF NOT EXISTS signup_source VARCHAR(64);
+                """
             )
             # Cadence check constraint (idempotent via DO block —
             # mirrors migration 089's pg_constraint guard).
@@ -1891,34 +2061,32 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
-            await database.execute(
-                text(
-                    """
-                    CREATE INDEX IF NOT EXISTS idx_merchant_onboarding_apm_due
-                      ON merchant_onboarding (apm_last_run_at, apm_cadence_days)
-                      WHERE apm_enabled = TRUE;
-                    """
-                )
+            await _ensure_index(
+                """
+                CREATE INDEX IF NOT EXISTS idx_merchant_onboarding_apm_due
+                  ON merchant_onboarding (apm_last_run_at, apm_cadence_days)
+                  WHERE apm_enabled = TRUE;
+                """
             )
             # Migration 164: store-less brand model — operating_mode discriminator.
             # store_url NOT NULL was relaxed and operating_mode added in the same
             # migration but the migration runner is skipped in prod.  Self-heal both
             # here so the column is present before any SELECT on merchant_onboarding.
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS merchant_onboarding
-                      ALTER COLUMN store_url DROP NOT NULL;
-                    """
-                )
+            # The DROP NOT NULL only while store_url is still NOT NULL: bare, it took
+            # ACCESS EXCLUSIVE on every boot with no lock_timeout.
+            await _heal_guarded(
+                "merchant_onboarding",
+                column_is_not_null("merchant_onboarding", "store_url"),
+                """
+                ALTER TABLE IF EXISTS merchant_onboarding
+                  ALTER COLUMN store_url DROP NOT NULL;
+                """,
             )
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS merchant_onboarding
-                      ADD COLUMN IF NOT EXISTS operating_mode VARCHAR(32) NOT NULL DEFAULT 'storefront';
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS merchant_onboarding
+                  ADD COLUMN IF NOT EXISTS operating_mode VARCHAR(32) NOT NULL DEFAULT 'storefront';
+                """
             )
             # P0-3: DB-enforced audit idempotency (migration 144).
             # Partial UNIQUE index scoped to active stages closes the
@@ -1943,19 +2111,17 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
-            await database.execute(
-                text(
-                    """
-                    CREATE UNIQUE INDEX IF NOT EXISTS
-                      uniq_merchant_audit_runs_active_idempotency_key
-                      ON merchant_audit_runs (merchant_id, idempotency_key)
-                      WHERE idempotency_key IS NOT NULL
-                        AND stage = ANY(ARRAY[
-                          'queued'::text, 'discovering'::text, 'probing'::text,
-                          'scoring'::text, 'materializing'::text, 'verifying'::text
-                        ]);
-                    """
-                )
+            await _ensure_index(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS
+                  uniq_merchant_audit_runs_active_idempotency_key
+                  ON merchant_audit_runs (merchant_id, idempotency_key)
+                  WHERE idempotency_key IS NOT NULL
+                    AND stage = ANY(ARRAY[
+                      'queued'::text, 'discovering'::text, 'probing'::text,
+                      'scoring'::text, 'materializing'::text, 'verifying'::text
+                    ]);
+                """
             )
             # Q-P0-2 / Q-P1-4: cross-audit task supersession
             # (migration 092). The task_queue_service marks prior
@@ -1964,99 +2130,83 @@ async def ensure_required_schema_light() -> None:
             # audit emits the same canonical action identity. Without
             # this column, supersession can't write back the pointer
             # and the merchant queue stays cluttered with stale rows.
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS merchant_tasks
-                      ADD COLUMN IF NOT EXISTS superseded_by_task_id UUID NULL;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS merchant_tasks
+                  ADD COLUMN IF NOT EXISTS superseded_by_task_id UUID NULL;
+                """
             )
             # Q-P1-5: executor-produced task child pointer
             # (migration 093). Lets the queue renderer group concrete
             # executor artifacts under the audit action that spawned
             # them while keeping the child rows actionable.
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS merchant_tasks
-                      ADD COLUMN IF NOT EXISTS parent_task_id UUID NULL;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS merchant_tasks
+                  ADD COLUMN IF NOT EXISTS parent_task_id UUID NULL;
+                """
             )
-            await database.execute(
-                text(
-                    """
-                    CREATE INDEX IF NOT EXISTS
-                      idx_merchant_tasks_identity_pending
-                      ON merchant_tasks (merchant_id, lever, title)
-                      WHERE status = 'pending';
-                    """
-                )
+            await _ensure_index(
+                """
+                CREATE INDEX IF NOT EXISTS
+                  idx_merchant_tasks_identity_pending
+                  ON merchant_tasks (merchant_id, lever, title)
+                  WHERE status = 'pending';
+                """
             )
-            await database.execute(
-                text(
-                    """
-                    CREATE INDEX IF NOT EXISTS
-                      idx_merchant_tasks_superseded_by
-                      ON merchant_tasks (superseded_by_task_id)
-                      WHERE superseded_by_task_id IS NOT NULL;
-                    """
-                )
+            await _ensure_index(
+                """
+                CREATE INDEX IF NOT EXISTS
+                  idx_merchant_tasks_superseded_by
+                  ON merchant_tasks (superseded_by_task_id)
+                  WHERE superseded_by_task_id IS NOT NULL;
+                """
             )
-            await database.execute(
-                text(
-                    """
-                    CREATE INDEX IF NOT EXISTS
-                      idx_merchant_tasks_parent_task
-                      ON merchant_tasks (parent_task_id)
-                      WHERE parent_task_id IS NOT NULL;
-                    """
-                )
+            await _ensure_index(
+                """
+                CREATE INDEX IF NOT EXISTS
+                  idx_merchant_tasks_parent_task
+                  ON merchant_tasks (parent_task_id)
+                  WHERE parent_task_id IS NOT NULL;
+                """
             )
             # Pivota canonical PDP columns (migration 071). Fast-mode
             # startup skips db/migrations/, so the schema guard owns
             # these in production. Mirrors what's already in db.catalog
             # (the SQLAlchemy model) — schema_guard is the runtime
             # safety net.
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS catalog_merchants
-                      ADD COLUMN IF NOT EXISTS indexable BOOLEAN NOT NULL DEFAULT TRUE;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS catalog_merchants
+                  ADD COLUMN IF NOT EXISTS indexable BOOLEAN NOT NULL DEFAULT TRUE;
+                """
             )
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS catalog_products
-                      ADD COLUMN IF NOT EXISTS pivota_signature_id TEXT,
-                      ADD COLUMN IF NOT EXISTS pivota_canonical_url TEXT,
-                      ADD COLUMN IF NOT EXISTS pivota_signature_minted_at TIMESTAMPTZ,
-                      ADD COLUMN IF NOT EXISTS tags JSONB,
-                      ADD COLUMN IF NOT EXISTS price_tier VARCHAR(16),
-                      ADD COLUMN IF NOT EXISTS use_case_tags JSONB,
-                      ADD COLUMN IF NOT EXISTS lifestyle_tags JSONB,
-                      ADD COLUMN IF NOT EXISTS demographic VARCHAR(16),
-                      ADD COLUMN IF NOT EXISTS category_path VARCHAR(255),
-                      ADD COLUMN IF NOT EXISTS category_label VARCHAR(255),
-                      ADD COLUMN IF NOT EXISTS category_confidence REAL,
-                      ADD COLUMN IF NOT EXISTS category_label_source VARCHAR(32),
-                      ADD COLUMN IF NOT EXISTS pdp_lifecycle_stage VARCHAR(16);
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS catalog_products
+                  ADD COLUMN IF NOT EXISTS pivota_signature_id TEXT,
+                  ADD COLUMN IF NOT EXISTS pivota_canonical_url TEXT,
+                  ADD COLUMN IF NOT EXISTS pivota_signature_minted_at TIMESTAMPTZ,
+                  ADD COLUMN IF NOT EXISTS tags JSONB,
+                  ADD COLUMN IF NOT EXISTS price_tier VARCHAR(16),
+                  ADD COLUMN IF NOT EXISTS use_case_tags JSONB,
+                  ADD COLUMN IF NOT EXISTS lifestyle_tags JSONB,
+                  ADD COLUMN IF NOT EXISTS demographic VARCHAR(16),
+                  ADD COLUMN IF NOT EXISTS category_path VARCHAR(255),
+                  ADD COLUMN IF NOT EXISTS category_label VARCHAR(255),
+                  ADD COLUMN IF NOT EXISTS category_confidence REAL,
+                  ADD COLUMN IF NOT EXISTS category_label_source VARCHAR(32),
+                  ADD COLUMN IF NOT EXISTS pdp_lifecycle_stage VARCHAR(16);
+                """
             )
             # Sitemap freshness signal (migration 138). The canonical
             # products sitemap list orders by and returns this column,
             # while updated_at keeps its internal row-touched meaning.
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS catalog_products
-                      ADD COLUMN IF NOT EXISTS content_changed_at TIMESTAMP NOT NULL DEFAULT NOW();
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS catalog_products
+                  ADD COLUMN IF NOT EXISTS content_changed_at TIMESTAMP NOT NULL DEFAULT NOW();
+                """
             )
             # Sitemap list pagination index (migration 175). GET
             # /api/canonical/products orders by this exact composite key
@@ -2065,19 +2215,17 @@ async def ensure_required_schema_light() -> None:
             # trip the 4s route timeout. Migration 138's single-column
             # content_changed_at index never got a schema_guard entry,
             # so prod had no index behind this sort until this one.
-            await database.execute(
-                text(
-                    """
-                    CREATE INDEX IF NOT EXISTS idx_catalog_products_sitemap_keyset
-                      ON catalog_products (
-                        content_changed_at DESC,
-                        pivota_signature_id ASC,
-                        content_key ASC,
-                        product_key ASC
-                      )
-                      WHERE pivota_signature_id LIKE 'sig_%' AND content_key IS NOT NULL;
-                    """
-                )
+            await _ensure_index(
+                """
+                CREATE INDEX IF NOT EXISTS idx_catalog_products_sitemap_keyset
+                  ON catalog_products (
+                    content_changed_at DESC,
+                    pivota_signature_id ASC,
+                    content_key ASC,
+                    product_key ASC
+                  )
+                  WHERE pivota_signature_id LIKE 'sig_%' AND content_key IS NOT NULL;
+                """
             )
             # Phase O-5b: structured fashion fields + per-field provenance
             # (migration 094_catalog_fashion_fields.sql). Production
@@ -2085,94 +2233,78 @@ async def ensure_required_schema_light() -> None:
             # the apply. Without this, the PIVOTA-Agent gateway SELECT
             # (PR #1393) fails with "column does not exist" the moment
             # any fashion-tagged product is requested.
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS catalog_products
-                      ADD COLUMN IF NOT EXISTS material TEXT,
-                      ADD COLUMN IF NOT EXISTS material_source VARCHAR(32),
-                      ADD COLUMN IF NOT EXISTS material_confidence REAL,
-                      ADD COLUMN IF NOT EXISTS care TEXT,
-                      ADD COLUMN IF NOT EXISTS care_source VARCHAR(32),
-                      ADD COLUMN IF NOT EXISTS care_confidence REAL,
-                      ADD COLUMN IF NOT EXISTS size_guide JSONB,
-                      ADD COLUMN IF NOT EXISTS size_guide_source VARCHAR(32),
-                      ADD COLUMN IF NOT EXISTS size_guide_confidence REAL;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS catalog_products
+                  ADD COLUMN IF NOT EXISTS material TEXT,
+                  ADD COLUMN IF NOT EXISTS material_source VARCHAR(32),
+                  ADD COLUMN IF NOT EXISTS material_confidence REAL,
+                  ADD COLUMN IF NOT EXISTS care TEXT,
+                  ADD COLUMN IF NOT EXISTS care_source VARCHAR(32),
+                  ADD COLUMN IF NOT EXISTS care_confidence REAL,
+                  ADD COLUMN IF NOT EXISTS size_guide JSONB,
+                  ADD COLUMN IF NOT EXISTS size_guide_source VARCHAR(32),
+                  ADD COLUMN IF NOT EXISTS size_guide_confidence REAL;
+                """
             )
             # Store-domain provenance (migration 133). This is additive and
             # nullable; legacy rows and legacy callers remain NULL.
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS catalog_products
-                      ADD COLUMN IF NOT EXISTS source_domain TEXT;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS catalog_products
+                  ADD COLUMN IF NOT EXISTS source_domain TEXT;
+                """
             )
             # Durable top-level vertical (migration 173). Railway fast-mode
             # startup skips db/migrations/, so schema_guard owns the apply.
             # catalog_sync_service's upsert NAMES this column, so without the
             # self-heal the first sync in prod crashes on "column does not
             # exist" (the PR #494/#501 apm_enabled outage shape).
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS catalog_products
-                      ADD COLUMN IF NOT EXISTS resolved_vertical VARCHAR(16);
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS catalog_products
+                  ADD COLUMN IF NOT EXISTS resolved_vertical VARCHAR(16);
+                """
             )
             # LLM attribute-extractor cache (migration 174). catalog_products is
             # SELECT *'d at audit context-build; a missing column would break the
             # read the moment the extractor flag is on. Railway skips migrations,
             # so self-heal it here.
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS catalog_products
-                      ADD COLUMN IF NOT EXISTS llm_attributes JSONB;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS catalog_products
+                  ADD COLUMN IF NOT EXISTS llm_attributes JSONB;
+                """
             )
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS catalog_skus
-                      ADD COLUMN IF NOT EXISTS source_domain TEXT;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS catalog_skus
+                  ADD COLUMN IF NOT EXISTS source_domain TEXT;
+                """
             )
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS catalog_offers
-                      ADD COLUMN IF NOT EXISTS source_domain TEXT;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS catalog_offers
+                  ADD COLUMN IF NOT EXISTS source_domain TEXT;
+                """
             )
-            await database.execute(
-                text(
-                    """
-                    CREATE UNIQUE INDEX IF NOT EXISTS idx_catalog_products_pivota_signature
-                      ON catalog_products (pivota_signature_id)
-                      WHERE pivota_signature_id IS NOT NULL;
-                    """
-                )
+            await _ensure_index(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_catalog_products_pivota_signature
+                  ON catalog_products (pivota_signature_id)
+                  WHERE pivota_signature_id IS NOT NULL;
+                """
             )
             # PDP / commerce-index repair PR-1: reversible offer
             # suppression primitive. Code paths filter suppressed offers,
             # so the runtime guard self-heals these additive columns in
             # environments where raw db/migrations/ are skipped.
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS catalog_offers
-                      ADD COLUMN IF NOT EXISTS suppression_reason TEXT NULL,
-                      ADD COLUMN IF NOT EXISTS suppressed_at TIMESTAMPTZ NULL;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS catalog_offers
+                  ADD COLUMN IF NOT EXISTS suppression_reason TEXT NULL,
+                  ADD COLUMN IF NOT EXISTS suppressed_at TIMESTAMPTZ NULL;
+                """
             )
             # Phase O-5b cross-PDP coalesce: agent_pdp_view aggregates
             # material/care/size_guide from all product_group_members +
@@ -2182,33 +2314,29 @@ async def ensure_required_schema_light() -> None:
             # Migration 096_agent_pdp_view_fashion_fields.sql carries the
             # same DDL for dev; schema_guard owns the prod-startup apply
             # since fast-mode skips db/migrations/.
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS agent_pdp_view
-                      ADD COLUMN IF NOT EXISTS material TEXT,
-                      ADD COLUMN IF NOT EXISTS material_source VARCHAR(32),
-                      ADD COLUMN IF NOT EXISTS material_confidence REAL,
-                      ADD COLUMN IF NOT EXISTS care TEXT,
-                      ADD COLUMN IF NOT EXISTS care_source VARCHAR(32),
-                      ADD COLUMN IF NOT EXISTS care_confidence REAL,
-                      ADD COLUMN IF NOT EXISTS size_guide JSONB,
-                      ADD COLUMN IF NOT EXISTS size_guide_source VARCHAR(32),
-                      ADD COLUMN IF NOT EXISTS size_guide_confidence REAL;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS agent_pdp_view
+                  ADD COLUMN IF NOT EXISTS material TEXT,
+                  ADD COLUMN IF NOT EXISTS material_source VARCHAR(32),
+                  ADD COLUMN IF NOT EXISTS material_confidence REAL,
+                  ADD COLUMN IF NOT EXISTS care TEXT,
+                  ADD COLUMN IF NOT EXISTS care_source VARCHAR(32),
+                  ADD COLUMN IF NOT EXISTS care_confidence REAL,
+                  ADD COLUMN IF NOT EXISTS size_guide JSONB,
+                  ADD COLUMN IF NOT EXISTS size_guide_source VARCHAR(32),
+                  ADD COLUMN IF NOT EXISTS size_guide_confidence REAL;
+                """
             )
             # Phase O-4: partial index covering only the live recall
             # stages so the recall-path WHERE clauses (Phase O-5) hit
             # an index instead of a heap scan.
-            await database.execute(
-                text(
-                    """
-                    CREATE INDEX IF NOT EXISTS idx_catalog_products_lifecycle_live
-                      ON catalog_products (pdp_lifecycle_stage)
-                      WHERE pdp_lifecycle_stage IN ('validated', 'published');
-                    """
-                )
+            await _ensure_index(
+                """
+                CREATE INDEX IF NOT EXISTS idx_catalog_products_lifecycle_live
+                  ON catalog_products (pdp_lifecycle_stage)
+                  WHERE pdp_lifecycle_stage IN ('validated', 'published');
+                """
             )
             # Phase D: GSC OAuth + URL submission tables (migration 074).
             # Fast-mode startup skips db/migrations/, so schema_guard
@@ -2249,13 +2377,11 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
-            await database.execute(
-                text(
-                    """
-                    CREATE INDEX IF NOT EXISTS idx_gsc_url_submissions_merchant_status
-                      ON gsc_url_submissions (merchant_id, last_status, last_status_at DESC);
-                    """
-                )
+            await _ensure_index(
+                """
+                CREATE INDEX IF NOT EXISTS idx_gsc_url_submissions_merchant_status
+                  ON gsc_url_submissions (merchant_id, last_status, last_status_at DESC);
+                """
             )
             # BD cold-start audit: prospect_products table (migration 075).
             # Stores discovered products from cold-target brand audits.
@@ -2283,51 +2409,43 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
-            await database.execute(
-                text(
-                    """
-                    CREATE INDEX IF NOT EXISTS idx_prospect_products_domain_discovered
-                      ON prospect_products (prospect_domain, discovered_at DESC);
-                    """
-                )
+            await _ensure_index(
+                """
+                CREATE INDEX IF NOT EXISTS idx_prospect_products_domain_discovered
+                  ON prospect_products (prospect_domain, discovered_at DESC);
+                """
             )
-            await database.execute(
-                text(
-                    """
-                    CREATE INDEX IF NOT EXISTS idx_prospect_products_unclaimed
-                      ON prospect_products (claimed_at)
-                      WHERE claimed_at IS NULL;
-                    """
-                )
+            await _ensure_index(
+                """
+                CREATE INDEX IF NOT EXISTS idx_prospect_products_unclaimed
+                  ON prospect_products (claimed_at)
+                  WHERE claimed_at IS NULL;
+                """
             )
             # PR #8 settlement files: snapshot settle markers. The full
             # settlement_files table and triggers are owned by migration 131,
             # but these ADD COLUMNs are mirrored here so startup self-heal
             # covers the runtime columns used by settlement_file_service.
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS settlement_snapshots
-                      ADD COLUMN IF NOT EXISTS settled_at TIMESTAMPTZ,
-                      ADD COLUMN IF NOT EXISTS settled_via_file_id BIGINT;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS settlement_snapshots
+                  ADD COLUMN IF NOT EXISTS settled_at TIMESTAMPTZ,
+                  ADD COLUMN IF NOT EXISTS settled_via_file_id BIGINT;
+                """
             )
             # Direct/self-serve merchant credit wallet top-ups and overage
             # state (migrations 141/142). The direct audit launch path reads
             # these columns before it can safely decide hard-stop vs overage.
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS merchant_credit_balance
-                      ADD COLUMN IF NOT EXISTS purchased_credits BIGINT NOT NULL DEFAULT 0,
-                      ADD COLUMN IF NOT EXISTS overage_pending_credits BIGINT NOT NULL DEFAULT 0,
-                      ADD COLUMN IF NOT EXISTS overage_charged_credits BIGINT NOT NULL DEFAULT 0,
-                      ADD COLUMN IF NOT EXISTS overage_blocked_until_payment BOOLEAN NOT NULL DEFAULT FALSE,
-                      ADD COLUMN IF NOT EXISTS overage_last_payment_intent_id TEXT,
-                      ADD COLUMN IF NOT EXISTS overage_last_failed_at TIMESTAMPTZ;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS merchant_credit_balance
+                  ADD COLUMN IF NOT EXISTS purchased_credits BIGINT NOT NULL DEFAULT 0,
+                  ADD COLUMN IF NOT EXISTS overage_pending_credits BIGINT NOT NULL DEFAULT 0,
+                  ADD COLUMN IF NOT EXISTS overage_charged_credits BIGINT NOT NULL DEFAULT 0,
+                  ADD COLUMN IF NOT EXISTS overage_blocked_until_payment BOOLEAN NOT NULL DEFAULT FALSE,
+                  ADD COLUMN IF NOT EXISTS overage_last_payment_intent_id TEXT,
+                  ADD COLUMN IF NOT EXISTS overage_last_failed_at TIMESTAMPTZ;
+                """
             )
             # T2-2 external-conversion representation (migration 167). These
             # columns are now in the SQLAlchemy Table model, so every runtime
@@ -2336,30 +2454,26 @@ async def ensure_required_schema_light() -> None:
             # of outage). Railway deploys skip db/migrations/, so self-heal here.
             # gross_attributed_gmv_cents predates this (migration 109) and is
             # already in prod; re-adding IF NOT EXISTS is a harmless no-op.
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS commerce_attribution_edges
-                      ADD COLUMN IF NOT EXISTS state TEXT,
-                      ADD COLUMN IF NOT EXISTS converted_at TIMESTAMPTZ,
-                      ADD COLUMN IF NOT EXISTS currency TEXT,
-                      ADD COLUMN IF NOT EXISTS external_order_id TEXT,
-                      ADD COLUMN IF NOT EXISTS source TEXT,
-                      ADD COLUMN IF NOT EXISTS click_id TEXT,
-                      ADD COLUMN IF NOT EXISTS gross_attributed_gmv_cents BIGINT;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS commerce_attribution_edges
+                  ADD COLUMN IF NOT EXISTS state TEXT,
+                  ADD COLUMN IF NOT EXISTS converted_at TIMESTAMPTZ,
+                  ADD COLUMN IF NOT EXISTS currency TEXT,
+                  ADD COLUMN IF NOT EXISTS external_order_id TEXT,
+                  ADD COLUMN IF NOT EXISTS source TEXT,
+                  ADD COLUMN IF NOT EXISTS click_id TEXT,
+                  ADD COLUMN IF NOT EXISTS gross_attributed_gmv_cents BIGINT;
+                """
             )
             # Idempotency guard for the external-conversion closure — one edge
             # per (merchant, external Shopify order). Internal edges keep
             # external_order_id NULL (distinct under multi-column NULL rules).
-            await database.execute(
-                text(
-                    """
-                    CREATE UNIQUE INDEX IF NOT EXISTS uq_commerce_attribution_edges_external_order
-                      ON commerce_attribution_edges (merchant_id, external_order_id);
-                    """
-                )
+            await _ensure_index(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_commerce_attribution_edges_external_order
+                  ON commerce_attribution_edges (merchant_id, external_order_id);
+                """
             )
             # T2-2b read_orders polling floor (migration 168): per-merchant
             # watermark so each poll only fetches new/updated Shopify orders.
@@ -2386,27 +2500,23 @@ async def ensure_required_schema_light() -> None:
             # as do-not-advertise (`IS TRUE`, never `IS NOT FALSE`). A DEFAULT
             # would erase the distinction between "computed false" and "never
             # computed", which is the one distinction keeping it fail-closed.
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS catalog_products
-                      ADD COLUMN IF NOT EXISTS pdp_will_render BOOLEAN,
-                      ADD COLUMN IF NOT EXISTS pdp_will_render_computed_at TIMESTAMPTZ;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS catalog_products
+                  ADD COLUMN IF NOT EXISTS pdp_will_render BOOLEAN,
+                  ADD COLUMN IF NOT EXISTS pdp_will_render_computed_at TIMESTAMPTZ;
+                """
             )
             # Partial index on the advertisable side only, keyed on
             # pivota_signature_id rather than the PK: the predicate is ~35%
             # selective, so a PK-keyed index would just be seq-scanned. The sig
             # is what the ACP lane looks rows up by.
-            await database.execute(
-                text(
-                    """
-                    CREATE INDEX IF NOT EXISTS idx_catalog_products_pdp_will_render_true
-                      ON catalog_products (pivota_signature_id)
-                      WHERE pdp_will_render IS TRUE;
-                    """
-                )
+            await _ensure_index(
+                """
+                CREATE INDEX IF NOT EXISTS idx_catalog_products_pdp_will_render_true
+                  ON catalog_products (pivota_signature_id)
+                  WHERE pdp_will_render IS TRUE;
+                """
             )
             # ADR-009 D3 seller-of-record threading (migration 169). external
             # seeds gain seller_ref (a catalog_merchants.merchant_id) + seed_kind
@@ -2414,14 +2524,12 @@ async def ensure_required_schema_light() -> None:
             # T2-2 closure keys the conversion subject by seller_ref. Railway
             # deploys skip db/migrations/, so self-heal here (167/168 idiom).
             # Additive + nullable: NULL = pre-A9-4 legacy (never assumed 'self').
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS external_product_seeds
-                      ADD COLUMN IF NOT EXISTS seller_ref TEXT,
-                      ADD COLUMN IF NOT EXISTS seed_kind TEXT;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS external_product_seeds
+                  ADD COLUMN IF NOT EXISTS seller_ref TEXT,
+                  ADD COLUMN IF NOT EXISTS seed_kind TEXT;
+                """
             )
             # Honesty guard for seed_kind (idempotent via DO block — mirrors the
             # migration-167 state constraint). Only the two derived kinds; NULL
@@ -2443,28 +2551,24 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
-            await database.execute(
-                text(
-                    """
-                    CREATE INDEX IF NOT EXISTS idx_external_product_seeds_seller_ref
-                      ON external_product_seeds (seller_ref)
-                      WHERE seller_ref IS NOT NULL;
-                    """
-                )
+            await _ensure_index(
+                """
+                CREATE INDEX IF NOT EXISTS idx_external_product_seeds_seller_ref
+                  ON external_product_seeds (seller_ref)
+                  WHERE seller_ref IS NOT NULL;
+                """
             )
             # Destination liveness (migration 200). Railway deploys skip
             # db/migrations/, so self-heal here — and these columns are load-bearing
             # for the readiness gate the moment the sweep starts writing them.
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS external_product_seeds
-                      ADD COLUMN IF NOT EXISTS destination_checked_at TIMESTAMPTZ,
-                      ADD COLUMN IF NOT EXISTS destination_http_status INTEGER,
-                      ADD COLUMN IF NOT EXISTS destination_verdict TEXT,
-                      ADD COLUMN IF NOT EXISTS destination_failure_streak INTEGER NOT NULL DEFAULT 0;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS external_product_seeds
+                  ADD COLUMN IF NOT EXISTS destination_checked_at TIMESTAMPTZ,
+                  ADD COLUMN IF NOT EXISTS destination_http_status INTEGER,
+                  ADD COLUMN IF NOT EXISTS destination_verdict TEXT,
+                  ADD COLUMN IF NOT EXISTS destination_failure_streak INTEGER NOT NULL DEFAULT 0;
+                """
             )
             await database.execute(
                 text(
@@ -2493,46 +2597,38 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
-            await database.execute(
-                text(
-                    """
-                    CREATE INDEX IF NOT EXISTS idx_external_product_seeds_destination_checked
-                      ON external_product_seeds (destination_checked_at NULLS FIRST)
-                      WHERE status = 'active';
-                    """
-                )
+            await _ensure_index(
+                """
+                CREATE INDEX IF NOT EXISTS idx_external_product_seeds_destination_checked
+                  ON external_product_seeds (destination_checked_at NULLS FIRST)
+                  WHERE status = 'active';
+                """
             )
             # Content freshness (migration 202). Railway deploys skip db/migrations/,
             # so self-heal here. The refresh queue orders on this column, and until it
             # exists that ORDER BY is a hard error rather than a degraded ordering --
             # `last_crawled_at` is referenced unconditionally by
             # get_external_referral_refresh_candidate_seed_ids.
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS external_product_seeds
-                      ADD COLUMN IF NOT EXISTS last_crawled_at TIMESTAMPTZ,
-                      ADD COLUMN IF NOT EXISTS last_crawl_attempt_at TIMESTAMPTZ;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS external_product_seeds
+                  ADD COLUMN IF NOT EXISTS last_crawled_at TIMESTAMPTZ,
+                  ADD COLUMN IF NOT EXISTS last_crawl_attempt_at TIMESTAMPTZ;
+                """
             )
-            await database.execute(
-                text(
-                    """
-                    CREATE INDEX IF NOT EXISTS idx_external_product_seeds_last_crawl_attempt
-                      ON external_product_seeds (last_crawl_attempt_at NULLS FIRST)
-                      WHERE status = 'active';
-                    """
-                )
+            await _ensure_index(
+                """
+                CREATE INDEX IF NOT EXISTS idx_external_product_seeds_last_crawl_attempt
+                  ON external_product_seeds (last_crawl_attempt_at NULLS FIRST)
+                  WHERE status = 'active';
+                """
             )
-            await database.execute(
-                text(
-                    """
-                    CREATE INDEX IF NOT EXISTS idx_external_product_seeds_destination_verdict
-                      ON external_product_seeds (destination_verdict)
-                      WHERE destination_verdict IS NOT NULL;
-                    """
-                )
+            await _ensure_index(
+                """
+                CREATE INDEX IF NOT EXISTS idx_external_product_seeds_destination_verdict
+                  ON external_product_seeds (destination_verdict)
+                  WHERE destination_verdict IS NOT NULL;
+                """
             )
             # Convergence P1.2 (migration 176): seller-of-record on the CANONICAL
             # product row. The audit intake door writes catalog_products with no
@@ -2540,14 +2636,12 @@ async def ensure_required_schema_light() -> None:
             # canonical row or attribution closure stamps seller_ref_missing.
             # Same column semantics + honesty guard as the 169 seed columns.
             # Railway deploys skip db/migrations/, so self-heal here.
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS catalog_products
-                      ADD COLUMN IF NOT EXISTS seller_ref TEXT,
-                      ADD COLUMN IF NOT EXISTS seed_kind TEXT;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS catalog_products
+                  ADD COLUMN IF NOT EXISTS seller_ref TEXT,
+                  ADD COLUMN IF NOT EXISTS seed_kind TEXT;
+                """
             )
             await database.execute(
                 text(
@@ -2588,17 +2682,13 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
-            await database.execute(
-                text(
-                    "CREATE INDEX IF NOT EXISTS idx_shopify_gdpr_requests_shop_domain "
-                    "ON shopify_gdpr_requests (shop_domain);"
-                )
+            await _ensure_index(
+                "CREATE INDEX IF NOT EXISTS idx_shopify_gdpr_requests_shop_domain "
+                "ON shopify_gdpr_requests (shop_domain);"
             )
-            await database.execute(
-                text(
-                    "CREATE INDEX IF NOT EXISTS idx_shopify_gdpr_requests_merchant "
-                    "ON shopify_gdpr_requests (merchant_id);"
-                )
+            await _ensure_index(
+                "CREATE INDEX IF NOT EXISTS idx_shopify_gdpr_requests_merchant "
+                "ON shopify_gdpr_requests (merchant_id);"
             )
             # ADR-011 intake identity contract: provenance for every
             # resolve-or-attach outcome at every intake door (services/
@@ -2622,34 +2712,26 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
-            await database.execute(
-                text(
-                    "CREATE INDEX IF NOT EXISTS idx_intake_identity_events_content_key "
-                    "ON intake_identity_events (content_key) WHERE content_key IS NOT NULL;"
-                )
+            await _ensure_index(
+                "CREATE INDEX IF NOT EXISTS idx_intake_identity_events_content_key "
+                "ON intake_identity_events (content_key) WHERE content_key IS NOT NULL;"
             )
-            await database.execute(
-                text(
-                    "CREATE INDEX IF NOT EXISTS idx_intake_identity_events_door_action "
-                    "ON intake_identity_events (door, action, created_at);"
-                )
+            await _ensure_index(
+                "CREATE INDEX IF NOT EXISTS idx_intake_identity_events_door_action "
+                "ON intake_identity_events (door, action, created_at);"
             )
             # ADR-011 (mig 178): GTIN as a match-attribute on catalog_products
             # (NOT folded into content_key). The resolve-or-attach primitive's
             # Tier-0 GTIN matcher keys on it; every intake door persists the
             # source barcode here. Additive + nullable — behavior byte-identical
             # until populated. Railway skips db/migrations/, so self-heal here.
-            await database.execute(
-                text(
-                    "ALTER TABLE IF EXISTS catalog_products "
-                    "ADD COLUMN IF NOT EXISTS gtin TEXT;"
-                )
+            await _heal_add_columns(
+                "ALTER TABLE IF EXISTS catalog_products "
+                "ADD COLUMN IF NOT EXISTS gtin TEXT;"
             )
-            await database.execute(
-                text(
-                    "CREATE INDEX IF NOT EXISTS idx_catalog_products_gtin "
-                    "ON catalog_products (gtin) WHERE gtin IS NOT NULL;"
-                )
+            await _ensure_index(
+                "CREATE INDEX IF NOT EXISTS idx_catalog_products_gtin "
+                "ON catalog_products (gtin) WHERE gtin IS NOT NULL;"
             )
             # ADR-010 D-2 (mig 179): identity-resolution spine — proposals,
             # append-only apply/revert events, provenance columns on
@@ -2683,24 +2765,18 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
-            await database.execute(
-                text(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_identity_resolution_proposals_key "
-                    "ON identity_resolution_proposals (proposal_key);"
-                )
+            await _ensure_index(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_identity_resolution_proposals_key "
+                "ON identity_resolution_proposals (proposal_key);"
             )
-            await database.execute(
-                text(
-                    "CREATE INDEX IF NOT EXISTS idx_identity_resolution_proposals_status "
-                    "ON identity_resolution_proposals (status, strategy);"
-                )
+            await _ensure_index(
+                "CREATE INDEX IF NOT EXISTS idx_identity_resolution_proposals_status "
+                "ON identity_resolution_proposals (status, strategy);"
             )
-            await database.execute(
-                text(
-                    "CREATE INDEX IF NOT EXISTS idx_identity_resolution_proposals_content_key "
-                    "ON identity_resolution_proposals (content_key) "
-                    "WHERE content_key IS NOT NULL;"
-                )
+            await _ensure_index(
+                "CREATE INDEX IF NOT EXISTS idx_identity_resolution_proposals_content_key "
+                "ON identity_resolution_proposals (content_key) "
+                "WHERE content_key IS NOT NULL;"
             )
             await database.execute(
                 text(
@@ -2716,28 +2792,22 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
-            await database.execute(
-                text(
-                    "CREATE INDEX IF NOT EXISTS idx_identity_resolution_events_run "
-                    "ON identity_resolution_events (run_id);"
-                )
+            await _ensure_index(
+                "CREATE INDEX IF NOT EXISTS idx_identity_resolution_events_run "
+                "ON identity_resolution_events (run_id);"
             )
-            await database.execute(
-                text(
-                    "CREATE INDEX IF NOT EXISTS idx_identity_resolution_events_proposal "
-                    "ON identity_resolution_events (proposal_id) "
-                    "WHERE proposal_id IS NOT NULL;"
-                )
+            await _ensure_index(
+                "CREATE INDEX IF NOT EXISTS idx_identity_resolution_events_proposal "
+                "ON identity_resolution_events (proposal_id) "
+                "WHERE proposal_id IS NOT NULL;"
             )
-            await database.execute(
-                text(
-                    "ALTER TABLE IF EXISTS product_group_members "
-                    "ADD COLUMN IF NOT EXISTS match_tier TEXT NULL, "
-                    "ADD COLUMN IF NOT EXISTS confidence NUMERIC NULL, "
-                    "ADD COLUMN IF NOT EXISTS evidence JSONB NULL, "
-                    "ADD COLUMN IF NOT EXISTS resolver_version TEXT NULL, "
-                    "ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ NULL;"
-                )
+            await _heal_add_columns(
+                "ALTER TABLE IF EXISTS product_group_members "
+                "ADD COLUMN IF NOT EXISTS match_tier TEXT NULL, "
+                "ADD COLUMN IF NOT EXISTS confidence NUMERIC NULL, "
+                "ADD COLUMN IF NOT EXISTS evidence JSONB NULL, "
+                "ADD COLUMN IF NOT EXISTS resolver_version TEXT NULL, "
+                "ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ NULL;"
             )
             # mig 186: product REVIEW signal (aggregateRating) on the canonical
             # record + served view. catalog_products and agent_pdp_view are both
@@ -2745,19 +2815,15 @@ async def ensure_required_schema_light() -> None:
             # Table.select() crashes on prod (Railway skips db/migrations/).
             # Additive + nullable; the decision-intelligence lane reads exactly
             # rating_value / rating_count. Never touches offer pricing.
-            await database.execute(
-                text(
-                    "ALTER TABLE IF EXISTS catalog_products "
-                    "ADD COLUMN IF NOT EXISTS rating_value NUMERIC, "
-                    "ADD COLUMN IF NOT EXISTS rating_count INTEGER;"
-                )
+            await _heal_add_columns(
+                "ALTER TABLE IF EXISTS catalog_products "
+                "ADD COLUMN IF NOT EXISTS rating_value NUMERIC, "
+                "ADD COLUMN IF NOT EXISTS rating_count INTEGER;"
             )
-            await database.execute(
-                text(
-                    "ALTER TABLE IF EXISTS agent_pdp_view "
-                    "ADD COLUMN IF NOT EXISTS rating_value NUMERIC, "
-                    "ADD COLUMN IF NOT EXISTS rating_count INTEGER;"
-                )
+            await _heal_add_columns(
+                "ALTER TABLE IF EXISTS agent_pdp_view "
+                "ADD COLUMN IF NOT EXISTS rating_value NUMERIC, "
+                "ADD COLUMN IF NOT EXISTS rating_count INTEGER;"
             )
             # mig 181: ONE canonical URL per content_key. 474 content_keys
             # carry >1 sitemap-eligible renderable sig; every sibling serves
@@ -2780,11 +2846,9 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
-            await database.execute(
-                text(
-                    "CREATE INDEX IF NOT EXISTS idx_content_canonical_election_sig "
-                    "ON content_canonical_election (canonical_sig_id);"
-                )
+            await _ensure_index(
+                "CREATE INDEX IF NOT EXISTS idx_content_canonical_election_sig "
+                "ON content_canonical_election (canonical_sig_id);"
             )
             # ---------------------------------------------------------------
             # schema-guard-coverage backfill (migrations 103-165).
@@ -2794,380 +2858,320 @@ async def ensure_required_schema_light() -> None:
             # on existing rows). Guarded per the schema-guard-coverage CI gate.
             # ---------------------------------------------------------------
             # mig 103: merchants
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS merchants
-                      ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT,
-                      ADD COLUMN IF NOT EXISTS subscription_id BIGINT,
-                      ADD COLUMN IF NOT EXISTS current_tier TEXT DEFAULT 'free',
-                      ADD COLUMN IF NOT EXISTS credits_balance BIGINT DEFAULT 0,
-                      ADD COLUMN IF NOT EXISTS current_period_credit_used BIGINT DEFAULT 0,
-                      ADD COLUMN IF NOT EXISTS promo_period_until TIMESTAMPTZ,
-                      ADD COLUMN IF NOT EXISTS billing_anchor_day SMALLINT DEFAULT 1;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS merchants
+                  ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT,
+                  ADD COLUMN IF NOT EXISTS subscription_id BIGINT,
+                  ADD COLUMN IF NOT EXISTS current_tier TEXT DEFAULT 'free',
+                  ADD COLUMN IF NOT EXISTS credits_balance BIGINT DEFAULT 0,
+                  ADD COLUMN IF NOT EXISTS current_period_credit_used BIGINT DEFAULT 0,
+                  ADD COLUMN IF NOT EXISTS promo_period_until TIMESTAMPTZ,
+                  ADD COLUMN IF NOT EXISTS billing_anchor_day SMALLINT DEFAULT 1;
+                """
             )
             # mig 109,128: commerce_attribution_edges — monetization + gmv-channel fields
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS commerce_attribution_edges
-                      ADD COLUMN IF NOT EXISTS channel_partner_id BIGINT,
-                      ADD COLUMN IF NOT EXISTS take_rate_applied_bp SMALLINT,
-                      ADD COLUMN IF NOT EXISTS refund_amount_cents BIGINT DEFAULT 0,
-                      ADD COLUMN IF NOT EXISTS refunded_at TIMESTAMPTZ,
-                      ADD COLUMN IF NOT EXISTS protocol_name TEXT,
-                      ADD COLUMN IF NOT EXISTS gmv_channel TEXT,
-                      ADD COLUMN IF NOT EXISTS third_party_platform TEXT,
-                      ADD COLUMN IF NOT EXISTS third_party_platform_fee_pct NUMERIC(5,4);
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS commerce_attribution_edges
+                  ADD COLUMN IF NOT EXISTS channel_partner_id BIGINT,
+                  ADD COLUMN IF NOT EXISTS take_rate_applied_bp SMALLINT,
+                  ADD COLUMN IF NOT EXISTS refund_amount_cents BIGINT DEFAULT 0,
+                  ADD COLUMN IF NOT EXISTS refunded_at TIMESTAMPTZ,
+                  ADD COLUMN IF NOT EXISTS protocol_name TEXT,
+                  ADD COLUMN IF NOT EXISTS gmv_channel TEXT,
+                  ADD COLUMN IF NOT EXISTS third_party_platform TEXT,
+                  ADD COLUMN IF NOT EXISTS third_party_platform_fee_pct NUMERIC(5,4);
+                """
             )
             # mig 116: agent_payouts
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS agent_payouts
-                      ADD COLUMN IF NOT EXISTS payee_type TEXT DEFAULT 'agent',
-                      ADD COLUMN IF NOT EXISTS payee_id BIGINT,
-                      ADD COLUMN IF NOT EXISTS comp_config_version INTEGER,
-                      ADD COLUMN IF NOT EXISTS snapshot_id BIGINT,
-                      ADD COLUMN IF NOT EXISTS billing_run_id BIGINT,
-                      ADD COLUMN IF NOT EXISTS subsidy_cap_remaining_cents BIGINT,
-                      ADD COLUMN IF NOT EXISTS clawback_amount_cents BIGINT DEFAULT 0;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS agent_payouts
+                  ADD COLUMN IF NOT EXISTS payee_type TEXT DEFAULT 'agent',
+                  ADD COLUMN IF NOT EXISTS payee_id BIGINT,
+                  ADD COLUMN IF NOT EXISTS comp_config_version INTEGER,
+                  ADD COLUMN IF NOT EXISTS snapshot_id BIGINT,
+                  ADD COLUMN IF NOT EXISTS billing_run_id BIGINT,
+                  ADD COLUMN IF NOT EXISTS subsidy_cap_remaining_cents BIGINT,
+                  ADD COLUMN IF NOT EXISTS clawback_amount_cents BIGINT DEFAULT 0;
+                """
             )
             # mig 117: credit_reservations
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS credit_reservations
-                      ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}'::jsonb;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS credit_reservations
+                  ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}'::jsonb;
+                """
             )
             # mig 117: credit_ledger
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS credit_ledger
-                      ADD COLUMN IF NOT EXISTS source_type TEXT;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS credit_ledger
+                  ADD COLUMN IF NOT EXISTS source_type TEXT;
+                """
             )
             # mig 118,119,129: invoices
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS invoices
-                      ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ,
-                      ADD COLUMN IF NOT EXISTS billing_run_id BIGINT,
-                      ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT,
-                      ADD COLUMN IF NOT EXISTS refunded_cents BIGINT DEFAULT 0;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS invoices
+                  ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ,
+                  ADD COLUMN IF NOT EXISTS billing_run_id BIGINT,
+                  ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT,
+                  ADD COLUMN IF NOT EXISTS refunded_cents BIGINT DEFAULT 0;
+                """
             )
             # mig 119: billing_run_items
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS billing_run_items
-                      ADD COLUMN IF NOT EXISTS voided_at TIMESTAMPTZ;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS billing_run_items
+                  ADD COLUMN IF NOT EXISTS voided_at TIMESTAMPTZ;
+                """
             )
             # mig 119: invoice_disputes
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS invoice_disputes
-                      ADD COLUMN IF NOT EXISTS disputed_line_items_jsonb JSONB DEFAULT '[]'::jsonb;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS invoice_disputes
+                  ADD COLUMN IF NOT EXISTS disputed_line_items_jsonb JSONB DEFAULT '[]'::jsonb;
+                """
             )
             # mig 124: subscription_plans
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS subscription_plans
-                      ADD COLUMN IF NOT EXISTS stripe_mode TEXT;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS subscription_plans
+                  ADD COLUMN IF NOT EXISTS stripe_mode TEXT;
+                """
             )
             # mig 125: channel_partners
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS channel_partners
-                      ADD COLUMN IF NOT EXISTS term_start_date DATE,
-                      ADD COLUMN IF NOT EXISTS term_months INTEGER DEFAULT 12,
-                      ADD COLUMN IF NOT EXISTS term_auto_renew BOOLEAN DEFAULT TRUE,
-                      ADD COLUMN IF NOT EXISTS per_brand_tail_months INTEGER DEFAULT 36,
-                      ADD COLUMN IF NOT EXISTS churn_clawback_days INTEGER DEFAULT 90,
-                      ADD COLUMN IF NOT EXISTS nonpayment_clawback_days INTEGER DEFAULT 60,
-                      ADD COLUMN IF NOT EXISTS per_brand_subsidy_cap_cents BIGINT,
-                      ADD COLUMN IF NOT EXISTS gmv_take_rate_bp INTEGER DEFAULT 1000,
-                      ADD COLUMN IF NOT EXISTS active_rate_scope TEXT DEFAULT 'B',
-                      ADD COLUMN IF NOT EXISTS gmv_take_definition TEXT DEFAULT 'net',
-                      ADD COLUMN IF NOT EXISTS prepaid_credits_supported BOOLEAN DEFAULT TRUE,
-                      ADD COLUMN IF NOT EXISTS monthly_overage_supported BOOLEAN DEFAULT TRUE;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS channel_partners
+                  ADD COLUMN IF NOT EXISTS term_start_date DATE,
+                  ADD COLUMN IF NOT EXISTS term_months INTEGER DEFAULT 12,
+                  ADD COLUMN IF NOT EXISTS term_auto_renew BOOLEAN DEFAULT TRUE,
+                  ADD COLUMN IF NOT EXISTS per_brand_tail_months INTEGER DEFAULT 36,
+                  ADD COLUMN IF NOT EXISTS churn_clawback_days INTEGER DEFAULT 90,
+                  ADD COLUMN IF NOT EXISTS nonpayment_clawback_days INTEGER DEFAULT 60,
+                  ADD COLUMN IF NOT EXISTS per_brand_subsidy_cap_cents BIGINT,
+                  ADD COLUMN IF NOT EXISTS gmv_take_rate_bp INTEGER DEFAULT 1000,
+                  ADD COLUMN IF NOT EXISTS active_rate_scope TEXT DEFAULT 'B',
+                  ADD COLUMN IF NOT EXISTS gmv_take_definition TEXT DEFAULT 'net',
+                  ADD COLUMN IF NOT EXISTS prepaid_credits_supported BOOLEAN DEFAULT TRUE,
+                  ADD COLUMN IF NOT EXISTS monthly_overage_supported BOOLEAN DEFAULT TRUE;
+                """
             )
             # mig 127: monthly_brand_statements
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS monthly_brand_statements
-                      ADD COLUMN IF NOT EXISTS merchant_id VARCHAR(50),
-                      ADD COLUMN IF NOT EXISTS calendar_month DATE,
-                      ADD COLUMN IF NOT EXISTS subscription_plan_id BIGINT,
-                      ADD COLUMN IF NOT EXISTS tier_name TEXT,
-                      ADD COLUMN IF NOT EXISTS subscription_revenue_usd_cents BIGINT DEFAULT 0,
-                      ADD COLUMN IF NOT EXISTS credits_consumed BIGINT DEFAULT 0,
-                      ADD COLUMN IF NOT EXISTS bundled_credits_consumed BIGINT DEFAULT 0,
-                      ADD COLUMN IF NOT EXISTS overage_credits BIGINT DEFAULT 0,
-                      ADD COLUMN IF NOT EXISTS overage_revenue_usd_cents BIGINT DEFAULT 0,
-                      ADD COLUMN IF NOT EXISTS gmv_usd_cents BIGINT DEFAULT 0,
-                      ADD COLUMN IF NOT EXISTS gmv_personal_usd_cents BIGINT DEFAULT 0,
-                      ADD COLUMN IF NOT EXISTS gmv_third_party_usd_cents BIGINT DEFAULT 0,
-                      ADD COLUMN IF NOT EXISTS pivota_gmv_take_usd_cents BIGINT DEFAULT 0,
-                      ADD COLUMN IF NOT EXISTS total_revenue_usd_cents BIGINT DEFAULT 0,
-                      ADD COLUMN IF NOT EXISTS total_cogs_usd_cents BIGINT DEFAULT 0,
-                      ADD COLUMN IF NOT EXISTS pivota_gross_margin_usd_cents BIGINT DEFAULT 0,
-                      ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'open',
-                      ADD COLUMN IF NOT EXISTS frozen_at TIMESTAMPTZ,
-                      ADD COLUMN IF NOT EXISTS invoiced_at TIMESTAMPTZ,
-                      ADD COLUMN IF NOT EXISTS overage_invoice_id BIGINT,
-                      ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}'::jsonb,
-                      ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW(),
-                      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS monthly_brand_statements
+                  ADD COLUMN IF NOT EXISTS merchant_id VARCHAR(50),
+                  ADD COLUMN IF NOT EXISTS calendar_month DATE,
+                  ADD COLUMN IF NOT EXISTS subscription_plan_id BIGINT,
+                  ADD COLUMN IF NOT EXISTS tier_name TEXT,
+                  ADD COLUMN IF NOT EXISTS subscription_revenue_usd_cents BIGINT DEFAULT 0,
+                  ADD COLUMN IF NOT EXISTS credits_consumed BIGINT DEFAULT 0,
+                  ADD COLUMN IF NOT EXISTS bundled_credits_consumed BIGINT DEFAULT 0,
+                  ADD COLUMN IF NOT EXISTS overage_credits BIGINT DEFAULT 0,
+                  ADD COLUMN IF NOT EXISTS overage_revenue_usd_cents BIGINT DEFAULT 0,
+                  ADD COLUMN IF NOT EXISTS gmv_usd_cents BIGINT DEFAULT 0,
+                  ADD COLUMN IF NOT EXISTS gmv_personal_usd_cents BIGINT DEFAULT 0,
+                  ADD COLUMN IF NOT EXISTS gmv_third_party_usd_cents BIGINT DEFAULT 0,
+                  ADD COLUMN IF NOT EXISTS pivota_gmv_take_usd_cents BIGINT DEFAULT 0,
+                  ADD COLUMN IF NOT EXISTS total_revenue_usd_cents BIGINT DEFAULT 0,
+                  ADD COLUMN IF NOT EXISTS total_cogs_usd_cents BIGINT DEFAULT 0,
+                  ADD COLUMN IF NOT EXISTS pivota_gross_margin_usd_cents BIGINT DEFAULT 0,
+                  ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'open',
+                  ADD COLUMN IF NOT EXISTS frozen_at TIMESTAMPTZ,
+                  ADD COLUMN IF NOT EXISTS invoiced_at TIMESTAMPTZ,
+                  ADD COLUMN IF NOT EXISTS overage_invoice_id BIGINT,
+                  ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}'::jsonb,
+                  ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW(),
+                  ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+                """
             )
             # mig 134: partner_invite_tokens
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS partner_invite_tokens
-                      ADD COLUMN IF NOT EXISTS channel_partner_id BIGINT,
-                      ADD COLUMN IF NOT EXISTS token_hash TEXT,
-                      ADD COLUMN IF NOT EXISTS token_prefix TEXT,
-                      ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ,
-                      ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active',
-                      ADD COLUMN IF NOT EXISTS issued_by TEXT,
-                      ADD COLUMN IF NOT EXISTS notes TEXT,
-                      ADD COLUMN IF NOT EXISTS consumed_at TIMESTAMPTZ,
-                      ADD COLUMN IF NOT EXISTS consumed_by_merchant_id VARCHAR(50),
-                      ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ,
-                      ADD COLUMN IF NOT EXISTS revoked_by TEXT,
-                      ADD COLUMN IF NOT EXISTS revoked_reason TEXT,
-                      ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW(),
-                      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS partner_invite_tokens
+                  ADD COLUMN IF NOT EXISTS channel_partner_id BIGINT,
+                  ADD COLUMN IF NOT EXISTS token_hash TEXT,
+                  ADD COLUMN IF NOT EXISTS token_prefix TEXT,
+                  ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ,
+                  ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active',
+                  ADD COLUMN IF NOT EXISTS issued_by TEXT,
+                  ADD COLUMN IF NOT EXISTS notes TEXT,
+                  ADD COLUMN IF NOT EXISTS consumed_at TIMESTAMPTZ,
+                  ADD COLUMN IF NOT EXISTS consumed_by_merchant_id VARCHAR(50),
+                  ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ,
+                  ADD COLUMN IF NOT EXISTS revoked_by TEXT,
+                  ADD COLUMN IF NOT EXISTS revoked_reason TEXT,
+                  ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW(),
+                  ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+                """
             )
             # mig 135,151,161: catalog_products
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS catalog_products
-                      ADD COLUMN IF NOT EXISTS suppression_reason TEXT,
-                      ADD COLUMN IF NOT EXISTS suppressed_at TIMESTAMPTZ,
-                      ADD COLUMN IF NOT EXISTS suppression_metadata JSONB,
-                      ADD COLUMN IF NOT EXISTS category_kind VARCHAR(16),
-                      ADD COLUMN IF NOT EXISTS claim_state VARCHAR(16) DEFAULT 'unclaimed';
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS catalog_products
+                  ADD COLUMN IF NOT EXISTS suppression_reason TEXT,
+                  ADD COLUMN IF NOT EXISTS suppressed_at TIMESTAMPTZ,
+                  ADD COLUMN IF NOT EXISTS suppression_metadata JSONB,
+                  ADD COLUMN IF NOT EXISTS category_kind VARCHAR(16),
+                  ADD COLUMN IF NOT EXISTS claim_state VARCHAR(16) DEFAULT 'unclaimed';
+                """
             )
             # mig 135: catalog_skus
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS catalog_skus
-                      ADD COLUMN IF NOT EXISTS suppression_reason TEXT,
-                      ADD COLUMN IF NOT EXISTS suppressed_at TIMESTAMPTZ,
-                      ADD COLUMN IF NOT EXISTS suppression_metadata JSONB;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS catalog_skus
+                  ADD COLUMN IF NOT EXISTS suppression_reason TEXT,
+                  ADD COLUMN IF NOT EXISTS suppressed_at TIMESTAMPTZ,
+                  ADD COLUMN IF NOT EXISTS suppression_metadata JSONB;
+                """
             )
             # mig 135,149: catalog_offers
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS catalog_offers
-                      ADD COLUMN IF NOT EXISTS suppression_metadata JSONB,
-                      ADD COLUMN IF NOT EXISTS offer_type VARCHAR(16),
-                      ADD COLUMN IF NOT EXISTS market VARCHAR(8) DEFAULT 'US',
-                      ADD COLUMN IF NOT EXISTS is_first_party BOOLEAN DEFAULT FALSE,
-                      ADD COLUMN IF NOT EXISTS why_buy_direct TEXT;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS catalog_offers
+                  ADD COLUMN IF NOT EXISTS suppression_metadata JSONB,
+                  ADD COLUMN IF NOT EXISTS offer_type VARCHAR(16),
+                  ADD COLUMN IF NOT EXISTS market VARCHAR(8) DEFAULT 'US',
+                  ADD COLUMN IF NOT EXISTS is_first_party BOOLEAN DEFAULT FALSE,
+                  ADD COLUMN IF NOT EXISTS why_buy_direct TEXT;
+                """
             )
             # mig 145: agent_decision_events
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS agent_decision_events
-                      ADD COLUMN IF NOT EXISTS protocol VARCHAR(32) DEFAULT 'pdp_direct';
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS agent_decision_events
+                  ADD COLUMN IF NOT EXISTS protocol VARCHAR(32) DEFAULT 'pdp_direct';
+                """
             )
             # mig 145: checkout_decisions
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS checkout_decisions
-                      ADD COLUMN IF NOT EXISTS protocol VARCHAR(32) DEFAULT 'pdp_direct';
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS checkout_decisions
+                  ADD COLUMN IF NOT EXISTS protocol VARCHAR(32) DEFAULT 'pdp_direct';
+                """
             )
             # mig 145: agent_decision_funnel_links
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS agent_decision_funnel_links
-                      ADD COLUMN IF NOT EXISTS protocol VARCHAR(32) DEFAULT 'pdp_direct';
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS agent_decision_funnel_links
+                  ADD COLUMN IF NOT EXISTS protocol VARCHAR(32) DEFAULT 'pdp_direct';
+                """
             )
             # mig 146,158: citation_targets
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS citation_targets
-                      ADD COLUMN IF NOT EXISTS merchant_brand TEXT,
-                      ADD COLUMN IF NOT EXISTS merchant_host TEXT,
-                      ADD COLUMN IF NOT EXISTS content_key VARCHAR(40);
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS citation_targets
+                  ADD COLUMN IF NOT EXISTS merchant_brand TEXT,
+                  ADD COLUMN IF NOT EXISTS merchant_host TEXT,
+                  ADD COLUMN IF NOT EXISTS content_key VARCHAR(40);
+                """
             )
             # mig 150: beauty_product_profiles
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS beauty_product_profiles
-                      ADD COLUMN IF NOT EXISTS evidence_profile JSONB,
-                      ADD COLUMN IF NOT EXISTS required_disclaimers JSONB;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS beauty_product_profiles
+                  ADD COLUMN IF NOT EXISTS evidence_profile JSONB,
+                  ADD COLUMN IF NOT EXISTS required_disclaimers JSONB;
+                """
             )
             # mig 152,162: agent_pdp_view
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS agent_pdp_view
-                      ADD COLUMN IF NOT EXISTS evidence_profile JSONB,
-                      ADD COLUMN IF NOT EXISTS required_disclaimers JSONB,
-                      ADD COLUMN IF NOT EXISTS bullet_points jsonb,
-                      ADD COLUMN IF NOT EXISTS usage_scenarios jsonb;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS agent_pdp_view
+                  ADD COLUMN IF NOT EXISTS evidence_profile JSONB,
+                  ADD COLUMN IF NOT EXISTS required_disclaimers JSONB,
+                  ADD COLUMN IF NOT EXISTS bullet_points jsonb,
+                  ADD COLUMN IF NOT EXISTS usage_scenarios jsonb;
+                """
             )
             # mig 156: merchant_stores
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS merchant_stores
-                      ADD COLUMN IF NOT EXISTS content_writeback_status TEXT DEFAULT 'disabled',
-                      ADD COLUMN IF NOT EXISTS content_writeback_enabled_at TIMESTAMPTZ,
-                      ADD COLUMN IF NOT EXISTS content_writeback_canary_product_id TEXT,
-                      ADD COLUMN IF NOT EXISTS content_writeback_last_canary_product_id TEXT,
-                      ADD COLUMN IF NOT EXISTS content_writeback_last_written_at TIMESTAMPTZ,
-                      ADD COLUMN IF NOT EXISTS content_writeback_last_error TEXT;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS merchant_stores
+                  ADD COLUMN IF NOT EXISTS content_writeback_status TEXT DEFAULT 'disabled',
+                  ADD COLUMN IF NOT EXISTS content_writeback_enabled_at TIMESTAMPTZ,
+                  ADD COLUMN IF NOT EXISTS content_writeback_canary_product_id TEXT,
+                  ADD COLUMN IF NOT EXISTS content_writeback_last_canary_product_id TEXT,
+                  ADD COLUMN IF NOT EXISTS content_writeback_last_written_at TIMESTAMPTZ,
+                  ADD COLUMN IF NOT EXISTS content_writeback_last_error TEXT;
+                """
             )
             # mig 158: merchant_audit_runs
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS merchant_audit_runs
-                      ADD COLUMN IF NOT EXISTS content_keys TEXT[],
-                      ADD COLUMN IF NOT EXISTS content_key_basis JSONB;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS merchant_audit_runs
+                  ADD COLUMN IF NOT EXISTS content_keys TEXT[],
+                  ADD COLUMN IF NOT EXISTS content_key_basis JSONB;
+                """
             )
             # mig 158: evidence_items
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS evidence_items
-                      ADD COLUMN IF NOT EXISTS content_key VARCHAR(40);
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS evidence_items
+                  ADD COLUMN IF NOT EXISTS content_key VARCHAR(40);
+                """
             )
             # mig 158: readiness_findings
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS readiness_findings
-                      ADD COLUMN IF NOT EXISTS content_key VARCHAR(40);
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS readiness_findings
+                  ADD COLUMN IF NOT EXISTS content_key VARCHAR(40);
+                """
             )
             # mig 158: niche_target_outcomes
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS niche_target_outcomes
-                      ADD COLUMN IF NOT EXISTS content_key VARCHAR(40);
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS niche_target_outcomes
+                  ADD COLUMN IF NOT EXISTS content_key VARCHAR(40);
+                """
             )
             # mig 158: citation_scan_runs
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS citation_scan_runs
-                      ADD COLUMN IF NOT EXISTS content_key VARCHAR(40);
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS citation_scan_runs
+                  ADD COLUMN IF NOT EXISTS content_key VARCHAR(40);
+                """
             )
             # mig 165: index_pipeline_state
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS index_pipeline_state
-                      ADD COLUMN IF NOT EXISTS index_eligible BOOLEAN DEFAULT FALSE;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS index_pipeline_state
+                  ADD COLUMN IF NOT EXISTS index_eligible BOOLEAN DEFAULT FALSE;
+                """
             )
             # mig 190: merchant_stores upstream-probe bookkeeping. Emitted near
             # the END of the chain on purpose: these four columns are in
             # REQUIRED_SCHEMA, so if an earlier ALTER in this single try-block
             # raises, /health fails closed (503) on columns that were never
             # reached. Later position = fewer statements that can starve it.
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS merchant_stores
-                      ADD COLUMN IF NOT EXISTS upstream_probe_at TIMESTAMPTZ,
-                      ADD COLUMN IF NOT EXISTS upstream_probe_status TEXT,
-                      ADD COLUMN IF NOT EXISTS upstream_probe_http_status INTEGER,
-                      ADD COLUMN IF NOT EXISTS upstream_probe_failures INTEGER NOT NULL DEFAULT 0,
-                      ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS merchant_stores
+                  ADD COLUMN IF NOT EXISTS upstream_probe_at TIMESTAMPTZ,
+                  ADD COLUMN IF NOT EXISTS upstream_probe_status TEXT,
+                  ADD COLUMN IF NOT EXISTS upstream_probe_http_status INTEGER,
+                  ADD COLUMN IF NOT EXISTS upstream_probe_failures INTEGER NOT NULL DEFAULT 0,
+                  ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
+                """
             )
             # mig 196: Store Audit route evidence is read through SQLAlchemy
             # Tables at runtime. Production deploys do not run migrations, so
             # keep the column subset used by the route/evidence workers alive.
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS execution_routes
-                      ADD COLUMN IF NOT EXISTS last_audit_run_id UUID;
-                    ALTER TABLE IF EXISTS evidence_items
-                      ADD COLUMN IF NOT EXISTS execution_route_id UUID,
-                      ADD COLUMN IF NOT EXISTS evidence_level TEXT,
-                      ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
-                    ALTER TABLE IF EXISTS verification_runs
-                      ADD COLUMN IF NOT EXISTS execution_route_id UUID;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS execution_routes
+                  ADD COLUMN IF NOT EXISTS last_audit_run_id UUID;
+                ALTER TABLE IF EXISTS evidence_items
+                  ADD COLUMN IF NOT EXISTS execution_route_id UUID,
+                  ADD COLUMN IF NOT EXISTS evidence_level TEXT,
+                  ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
+                ALTER TABLE IF EXISTS verification_runs
+                  ADD COLUMN IF NOT EXISTS execution_route_id UUID;
+                """
             )
             # mig 202: Reap webhook reconciliation columns on agent_issued_cards. The
             # webhook path UPDATEs these at runtime; a deploy that skipped migrations
@@ -3175,15 +3179,13 @@ async def ensure_required_schema_light() -> None:
             # CREATE TABLE IF NOT EXISTS in the migration and the table is only
             # touched via explicit SQL here, but the COLUMNS ride on a table born in
             # mig 201, so self-heal them the same way.
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS agent_issued_cards
-                      ADD COLUMN IF NOT EXISTS last_auth_at TIMESTAMPTZ,
-                      ADD COLUMN IF NOT EXISTS auth_count INTEGER NOT NULL DEFAULT 0,
-                      ADD COLUMN IF NOT EXISTS settled_amount_minor BIGINT;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS agent_issued_cards
+                  ADD COLUMN IF NOT EXISTS last_auth_at TIMESTAMPTZ,
+                  ADD COLUMN IF NOT EXISTS auth_count INTEGER NOT NULL DEFAULT 0,
+                  ADD COLUMN IF NOT EXISTS settled_amount_minor BIGINT;
+                """
             )
             # mig 207: merchant_order_sync_jobs.progress — the durable queue for
             # post-payment merchant-order sync. The TABLE is born in mig 207 and
@@ -3193,13 +3195,11 @@ async def ensure_required_schema_light() -> None:
             # that file's first cut, since CREATE TABLE IF NOT EXISTS is a no-op
             # on a table that already exists. ALTER ... IF EXISTS so it no-ops
             # harmlessly wherever the table has not been created yet.
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS merchant_order_sync_jobs
-                      ADD COLUMN IF NOT EXISTS progress TEXT;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS merchant_order_sync_jobs
+                  ADD COLUMN IF NOT EXISTS progress TEXT;
+                """
             )
             # mig 209: citation_observations.destination_rank +
             # .is_primary_destination — B3's "where did the answer send the
@@ -3209,26 +3209,22 @@ async def ensure_required_schema_light() -> None:
             # database does not have and fail every citation write in the run.
             # db/audit_evidence.py carries the same two ALTERs in its own inline
             # backstop; this is the startup half of the pair.
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS citation_observations
-                      ADD COLUMN IF NOT EXISTS destination_rank INTEGER,
-                      ADD COLUMN IF NOT EXISTS is_primary_destination BOOLEAN NOT NULL DEFAULT FALSE;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS citation_observations
+                  ADD COLUMN IF NOT EXISTS destination_rank INTEGER,
+                  ADD COLUMN IF NOT EXISTS is_primary_destination BOOLEAN NOT NULL DEFAULT FALSE;
+                """
             )
             # mig 109: commerce_attribution_edges.net_attributed_gmv_cents — STORED generated column
             # (derived from refund_amount_cents, added above). Emitted LAST so this
             # lone potential table-rewrite can't block the lightweight self-heals;
             # in prod the column already exists so IF NOT EXISTS no-ops.
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS commerce_attribution_edges
-                      ADD COLUMN IF NOT EXISTS net_attributed_gmv_cents BIGINT GENERATED ALWAYS AS ( CASE WHEN gross_attributed_gmv_cents IS NULL THEN NULL ELSE GREATEST(gross_attributed_gmv_cents - refund_amount_cents, 0) END ) STORED;
-                    """
-                )
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS commerce_attribution_edges
+                  ADD COLUMN IF NOT EXISTS net_attributed_gmv_cents BIGINT GENERATED ALWAYS AS ( CASE WHEN gross_attributed_gmv_cents IS NULL THEN NULL ELSE GREATEST(gross_attributed_gmv_cents - refund_amount_cents, 0) END ) STORED;
+                """
             )
 
             return
