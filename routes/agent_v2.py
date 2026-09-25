@@ -350,6 +350,10 @@ def _canonicalize_search_product(product: Dict[str, Any]) -> Dict[str, Any]:
     product_id = str(product.get("product_id") or product.get("id") or "").strip()
     variants = product.get("variants")
     normalized_variants: List[Dict[str, Any]] = []
+    # The raw variant behind each normalized one (None for the synthesized default),
+    # kept aside so its commerce facts price its own offer without widening the
+    # public `variants` shape.
+    raw_variants: List[Optional[Dict[str, Any]]] = []
     if isinstance(variants, list) and variants:
         for raw_variant in variants:
             if not isinstance(raw_variant, dict):
@@ -368,6 +372,7 @@ def _canonicalize_search_product(product: Dict[str, Any]) -> Dict[str, Any]:
                     "variant_attributes": _normalize_variant_attributes(raw_variant),
                 }
             )
+            raw_variants.append(raw_variant)
     else:
         normalized_variants.append(
             {
@@ -375,6 +380,7 @@ def _canonicalize_search_product(product: Dict[str, Any]) -> Dict[str, Any]:
                 "variant_attributes": {},
             }
         )
+        raw_variants.append(None)
 
     # A row whose commerce facts need live verification (the external-seed builder
     # in agent_api withholds price and stock on purpose) must stay UNKNOWN here.
@@ -386,13 +392,44 @@ def _canonicalize_search_product(product: Dict[str, Any]) -> Dict[str, Any]:
     verification = product.get("commerce_verification")
     verification = dict(verification) if isinstance(verification, dict) else None
     live_verification_required = bool(verification and verification.get("required") is True)
-    raw_price = product.get("price")
-    offer_price = None if (live_verification_required or raw_price is None) else _money_str(raw_price)
-    offer_in_stock = None if live_verification_required else bool(product.get("in_stock", True))
+    product_price = product.get("price")
+    product_currency = product.get("currency")
+    product_in_stock = bool(product.get("in_stock", True))
+    product_inventory_quantity = product.get("inventory_quantity")
 
     offers: List[Dict[str, Any]] = []
-    for variant in normalized_variants:
+    for variant, raw_variant in zip(normalized_variants, raw_variants):
         variant_id = variant["variant_id"]
+        # Each offer is priced from ITS OWN variant; the product-level value is only
+        # the fallback for a variant that carries none. This used to price every
+        # offer from the product (= the first variant for external seeds) --
+        # measured 2026-09-24, eyurs.com Round Lab variants [2.5, 18.0] served as
+        # two offers both at "2.5". Currency travels with whichever price is used.
+        raw = raw_variant or {}
+        variant_price = raw.get("price")
+        if variant_price is not None and variant_price != "":
+            raw_price = variant_price
+            currency = raw.get("currency") or raw.get("price_currency") or product_currency
+        else:
+            raw_price = product_price
+            currency = product_currency
+        # Stock is read only from an explicit variant `in_stock` bool (the external
+        # seed builder's key). Internal StandardProductVariant rows carry
+        # `inventory_quantity` defaulting to 0 even when untracked, so it is not a
+        # stock claim on its own; the quantity travels with the in_stock it matches.
+        if isinstance(raw.get("in_stock"), bool):
+            in_stock = raw["in_stock"]
+            inventory_quantity = raw.get("inventory_quantity", product_inventory_quantity)
+        else:
+            in_stock = product_in_stock
+            inventory_quantity = product_inventory_quantity
+        if live_verification_required:
+            # The mark wins over every per-variant fact too.
+            offer_price = None
+            in_stock = None
+            inventory_quantity = product_inventory_quantity
+        else:
+            offer_price = None if raw_price is None else _money_str(raw_price)
         offer_id = str(
             product.get("offer_id") or f"offer::{merchant_id or 'merchant_unknown'}::{variant_id}"
         )
@@ -403,10 +440,10 @@ def _canonicalize_search_product(product: Dict[str, Any]) -> Dict[str, Any]:
                 "variant_id": variant_id,
                 "merchant_sku": product.get("sku"),
                 "price": offer_price,
-                "currency": product.get("currency") or "USD",
+                "currency": currency or "USD",
                 "availability": {
-                    "in_stock": offer_in_stock,
-                    "inventory_quantity": product.get("inventory_quantity"),
+                    "in_stock": in_stock,
+                    "inventory_quantity": inventory_quantity,
                 },
                 "shipping_summary": _shipping_summary_from_product(product),
                 "source_type": product.get("source") or "catalog_cache",
