@@ -108,8 +108,10 @@ from urllib.parse import urlparse
 
 # Stdlib-only, like this module; the structural check `build_cart_link_quote_request` applies.
 from services.reap_cart_link import cart_link_line
-# The `pivota` logger (stdlib-only too): the only one whose INFO/WARNING reliably lands in prod
-# logs. Used for the sandbox-simulate dial, where a silently ignored setting must be visible.
+# The `pivota` logger (stdlib-only too) has its own stdout handler. Used for the sandbox-simulate
+# dial so its lines land WITH a level and logger prefix, and so INFO would land too. With no root
+# logging config, a module logger's WARNING still reaches stderr via Python's last-resort handler,
+# but as a bare unlabeled message; its INFO is dropped.
 from utils.logger import logger as _ops_logger
 
 logger = logging.getLogger("reap_agentic_client")
@@ -388,8 +390,9 @@ def simulate_checkout_header(
     `validate_base_url` AND its hostname is exactly one of `SIMULATE_CHECKOUT_SANDBOX_HOSTS`.
     Never raises: a base URL `validate_base_url` refuses is simply not the sandbox.
 
-    WARNINGs go through the `pivota` logger (the one whose WARNINGs reliably reach prod logs),
-    because a dial someone set that silently does nothing is a debugging session.
+    WARNINGs go through the `pivota` logger so they land with a level and logger prefix (a module
+    logger's WARNING would reach stderr only as a bare, unlabeled message via Python's last-resort
+    handler), because a dial someone set that silently does nothing is a debugging session.
     """
     if dial_value is None:
         return None
@@ -3322,6 +3325,11 @@ async def create_checkout(
     body = build_checkout_request(
         quote_id=quote_id, enrollment_id=enrollment_id, return_url=return_url
     )
+    if not is_configured():
+        # Before the simulate header is evaluated: with the dial set and no base URL, judging the
+        # header would log "base is not the Reap sandbox" on every checkout, which misnames the
+        # problem. `_post` would return this same result; returning it here skips that warning.
+        return ReapResponse(ok=False, error="reap_client_not_configured")
     simulate = simulate_checkout_header(base_url(), os.getenv(SIMULATE_CHECKOUT_DIAL))
     return _refuse_unsafe_hosted_url(
         await _post(

@@ -116,6 +116,10 @@ def _checkout():
     ("https://mx.sandbox.api.reap.global", "COMPLETED"),
     # Hostnames are case-insensitive; `.strip()` removes surrounding whitespace only.
     ("https://SANDBOX.API.REAP.GLOBAL/", " COMPLETED\n"),
+    # An explicit port: the comparison is on the parsed HOSTNAME, not the netloc. These kill a
+    # mutant comparing `urlparse(...).netloc`, which would see `sandbox.api.reap.global:443`.
+    ("https://sandbox.api.reap.global:443", "COMPLETED"),
+    ("https://mx.sandbox.api.reap.global:443", "COMPLETED"),
 ])
 def test_the_sandbox_hosts_with_the_exact_dial_get_the_header(base, dial, ops_log):
     assert rc.simulate_checkout_header(base, dial) == {HEADER: "COMPLETED"}
@@ -253,6 +257,25 @@ def test_a_production_base_never_gets_the_header_on_the_wire(wire, monkeypatch, 
     monkeypatch.setenv("REAP_API_BASE_URL", SANDBOX)
     _checkout()
     assert wire.calls[1]["headers"].get(HEADER) == "COMPLETED"
+
+
+def test_an_unconfigured_client_fails_as_unconfigured_without_the_sandbox_warning(
+        wire, monkeypatch, ops_log):
+    """Dial set, base URL unset: the answer is the existing not-configured result, and the
+    simulate header is never judged -- so no "not the Reap sandbox" warning misnames the problem.
+    THE CONTROL: the same dial with the base set to production DOES log that warning through the
+    same captured handler, so its absence above is measured against a live mechanism."""
+    monkeypatch.setenv(DIAL, "COMPLETED")
+    monkeypatch.delenv("REAP_API_BASE_URL")
+    got = _checkout()
+    assert got.ok is False
+    assert got.error == "reap_client_not_configured"
+    assert wire.calls == []
+    assert not any(HOST_REFUSAL in w for w in _pivota_warnings(ops_log))
+
+    monkeypatch.setenv("REAP_API_BASE_URL", "https://prod.api.reap.global")
+    _checkout()
+    assert HOST_REFUSAL in _pivota_warnings(ops_log)
 
 
 def test_the_dial_is_read_on_every_call_not_at_import(wire, monkeypatch):
