@@ -518,11 +518,30 @@ def _claims_for_membership(membership: dict) -> dict:
     return claims
 
 
+def _is_non_staff_account_role(role: Optional[str]) -> bool:
+    """A users row owned by another portal (merchant, agent, buyer, ...).
+
+    Its password_hash is that account's password, never evidence of who holds
+    the employees row at the same address: a merchant can move its login email
+    onto an address without proving it owns the mailbox.
+    """
+    role = (role or "").strip().lower()
+    return bool(role) and role not in EMPLOYEE_AUTH_ROLES
+
+
 async def _sync_employee_auth_user(
     *,
     employee: dict,
     plain_password: Optional[str] = None,
-) -> None:
+) -> bool:
+    """Make the users row at the employee's address a staff login.
+
+    With `plain_password` (a password proven for the employee) the row is
+    upserted with that password. Without one, the existing row keeps its
+    password_hash, so it may only be promoted if it is already a staff row: a
+    merchant/agent row would become staff while still opening with the
+    merchant/agent's own password. Returns False when it refuses.
+    """
     password_hash = hash_password(plain_password) if plain_password else None
     values = {
         "email": _normalize_email(employee["email"]),
@@ -531,6 +550,34 @@ async def _sync_employee_auth_user(
         "role": employee["role"],
     }
     if not password_hash:
+        existing = _record_to_dict(
+            await _auth_fetch_one(
+                "SELECT role FROM users WHERE LOWER(email) = LOWER(:email) LIMIT 1",
+                {"email": values["email"]},
+            )
+        )
+        if existing and _is_non_staff_account_role(existing.get("role")):
+            logger.warning(
+                "[Auth] Refused to promote %s users row at %s to employee role %s "
+                "without a password proven for the employee",
+                existing.get("role"),
+                values["email"],
+                employee["role"],
+            )
+            await _safe_record_identity_event(
+                event_type="employee_promotion_refused",
+                email=values["email"],
+                details={
+                    "users_role": existing.get("role"),
+                    "employee_id": str(employee.get("employee_id") or ""),
+                    "reason": "password_not_proven_for_employee",
+                },
+            )
+            return False
+        # The same refusal in the statement itself, so a row that becomes
+        # non-staff between the read above and this write is not promoted. The
+        # role list is EMPLOYEE_AUTH_ROLES spelled as a literal (so the static
+        # PREPARE sweep can plan it); a test pins the two equal.
         await _auth_execute(
             """
             UPDATE users
@@ -539,6 +586,7 @@ async def _sync_employee_auth_user(
                 active = TRUE,
                 merchant_id = NULL
             WHERE LOWER(email) = LOWER(:email)
+              AND LOWER(COALESCE(role, '')) IN ('', 'admin', 'employee', 'outsourced', 'super_admin')
             """,
             values,
         )
@@ -569,6 +617,7 @@ async def _sync_employee_auth_user(
         credential_source="employee_login" if password_hash else None,
         source="employees_login_sync",
     )
+    return True
 
 
 def _build_employee_login_response(
@@ -918,6 +967,37 @@ async def login(data: LoginRequest):
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid email or password"
             )
+
+        # An employees row is matched by email alone. When the users row at that
+        # address belongs to another portal (a merchant can move its login email
+        # onto any free address without proving the mailbox), the password that
+        # just verified is that account's password, not the employee's. Unless
+        # the password is the employee's own, or this identity already holds an
+        # active employee membership, the employees row is not this caller's:
+        # log in as the account the password belongs to, and do not promote it.
+        if (
+            employee_identity
+            and user
+            and _is_non_staff_account_role(user_role)
+            and not _verify_legacy_employee_password(data.password, employee_identity)
+            and not await _safe_get_active_membership(normalized_email, "employee")
+        ):
+            logger.warning(
+                "[Auth] Ignoring employees row at %s for a %s login: password not proven for the employee",
+                normalized_email,
+                user_role,
+            )
+            await _safe_record_identity_event(
+                event_type="employee_promotion_refused",
+                email=normalized_email,
+                details={
+                    "users_role": user_role,
+                    "employee_id": str(employee_identity.get("employee_id") or ""),
+                    "reason": "password_not_proven_for_employee",
+                    "source": "login",
+                },
+            )
+            employee_identity = None
 
         # Check if user is active. An active employee row can repair a stale or
         # deactivated users row created by another portal.

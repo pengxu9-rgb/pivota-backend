@@ -60,6 +60,15 @@ def module(monkeypatch: pytest.MonkeyPatch):
         events.append(kwargs)
 
     monkeypatch.setattr(auth_identity_module, "record_identity_event", fake_record_identity_event)
+
+    # The email-change availability check asks agent_management which agents
+    # email columns exist; this FakeDB is not a real table to probe.
+    import routes.agent_management as agent_management
+
+    async def fake_agent_email_columns():
+        return ("owner_email",)
+
+    monkeypatch.setattr(agent_management, "_agent_email_columns", fake_agent_email_columns)
     module._test_identity_events = events
     return module
 
