@@ -419,6 +419,13 @@ async def _build_external_seed_product(
         if len(variants) >= 30:
             break
 
+    # One rule for both routed builders: the seed's own availability, read the
+    # way routes/agent_api.py reads it (see `_external_seed_stock_state`).
+    from routes.agent_api import _external_seed_stock_fields, _external_seed_stock_state
+
+    stock_fields = _external_seed_stock_fields(
+        _external_seed_stock_state(seed_row, seed_data, seed_variants)
+    )
     if requires_live_verification:
         variants = []
     elif not variants:
@@ -429,8 +436,7 @@ async def _build_external_seed_product(
                 "title": "Default",
                 "price": price,
                 "currency": price_currency,
-                "inventory_quantity": 999,
-                "in_stock": True,
+                **stock_fields,
             }
         ]
 
@@ -448,7 +454,7 @@ async def _build_external_seed_product(
         "image_url": image_url,
         "image_urls": image_urls,
         **(
-            {"in_stock": True, "inventory_quantity": 999}
+            stock_fields
             if not requires_live_verification
             else {
                 "availability": "unknown",
