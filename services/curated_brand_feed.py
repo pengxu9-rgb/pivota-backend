@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import quote, urljoin, urlsplit
 
@@ -2563,6 +2564,7 @@ async def records_for_brand(
     # each of 300 fetches added ~90s of pure duplication. Left as a parameter rather than deleted
     # so a caller that wants extra slack on a specific brand can still ask for it.
     pdp_delay_s: float = 0.0,
+    pdp_inci_budget_s: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     """Fetch a curated brand's storefront and return Path-C validated records.
 
@@ -2716,16 +2718,29 @@ async def records_for_brand(
             handle = str((p or {}).get("handle") or "").strip()
             if handle:
                 pairs.append({"handle": handle, "rec": rec})
+    inci_report: Optional[Dict[str, Any]] = None
     if enrich_missing_inci and pairs:
+        # A wall-clock budget as well as a count: parsing a PDP for INCI is CPU-bound and scales with the page
+        # (measured 2026-09-25: 2.2 s per ~2 MB luxiface.com page), so 300 fetches ran one drain stage past its
+        # 3600 s task timeout -- twice -- with nothing logged. Stop early, and say so, rather than be killed.
         timeout = httpx.Timeout(15.0, connect=5.0)
         headers = {"User-Agent": _UA, "Accept": "text/html"}
+        started, attempted, found, stopped = time.monotonic(), 0, 0, False
         async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers=headers) as client:
             for i, pair in enumerate(pairs[:max_pdp_inci_fetches]):
+                if pdp_inci_budget_s is not None and time.monotonic() - started >= pdp_inci_budget_s:
+                    stopped = True
+                    break
+                attempted += 1
                 inci = await fetch_pdp_inci(domain, pair["handle"], client=client)
                 if inci:
                     pair["rec"]["pdp"]["raw_inci"] = inci
+                    found += 1
                 if pdp_delay_s and i + 1 < min(len(pairs), max_pdp_inci_fetches):
                     await asyncio.sleep(pdp_delay_s)
+        inci_report = {"candidates": len(pairs), "cap": max_pdp_inci_fetches, "attempted": attempted,
+                       "found": found, "stopped_on_budget": stopped,
+                       "seconds": round(time.monotonic() - started, 1)}
     # ONE spelling per brand. misshaus.com publishes both `APIEU` (16 products) and
     # `Apieu` (1); kept verbatim they are two brands to every consumer that groups by
     # the brand string, which splits a brand's catalogue for exactly the reason this
@@ -2752,6 +2767,8 @@ async def records_for_brand(
     report = {**crawl_report, "emitted_records": len(records),
               "gift_items_dropped": len(gifts_dropped),
               "gift_items_dropped_sample": gifts_dropped[:50]} if crawl_report is not None else None
+    if report is not None and inci_report is not None:
+        report["inci_enrichment"] = inci_report
     if report is not None and identity_report is not None:
         report["gtin_recovery"] = identity_report
     return CuratedRecordBatch(records, crawl_report=report)

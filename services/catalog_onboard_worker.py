@@ -115,6 +115,10 @@ def normalize_curated_brand_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         if type(value) is not int or value < (0 if name.startswith("max_pdp_") else 1):
             raise ValueError(f"{name} must be a {'nonnegative' if name.startswith('max_pdp_') else 'positive'} integer")
         normalized[name] = value
+    budget = payload.get("pdp_inci_budget_s")
+    if budget is not None and (isinstance(budget, bool) or not isinstance(budget, (int, float)) or budget <= 0):
+        raise ValueError("pdp_inci_budget_s must be a positive number of seconds")
+    normalized["pdp_inci_budget_s"] = budget
     return normalized
 
 
@@ -132,6 +136,9 @@ def curated_brand_work_key(payload: Dict[str, Any], *, source: str = "curated_li
     if not effective["enrich_missing_gtin"]:
         effective.pop("enrich_missing_gtin")
         effective.pop("max_pdp_identity_fetches")
+    # An unset INCI time budget is the pre-budget behaviour: keep every existing work key byte-identical.
+    if effective.get("pdp_inci_budget_s") is None:
+        effective.pop("pdp_inci_budget_s", None)
     effective["source"] = source
     encoded = json.dumps(effective, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     digest = hashlib.sha256(encoded.encode()).hexdigest()

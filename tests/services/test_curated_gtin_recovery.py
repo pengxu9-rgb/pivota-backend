@@ -204,6 +204,7 @@ def test_worker_keys_preserve_disabled_jobs_and_distinguish_enabled_budget():
     normalized = worker.normalize_curated_brand_payload(job)
     normalized.pop('enrich_missing_gtin')
     normalized.pop('max_pdp_identity_fetches')
+    normalized.pop('pdp_inci_budget_s')  # unset budget = pre-budget key (the function drops it the same way)
     for field in ('brand', 'retailer_name'):
         normalized[field] = (normalized[field] or '').casefold()
     normalized['source'] = 'curated_list'
